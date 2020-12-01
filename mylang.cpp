@@ -99,6 +99,16 @@ void pExpectOp(Context &c, Op exp)
         throw SyntaxErrorEx();
 }
 
+Op AcceptOneOf(Context &c, initializer_list<Op> list)
+{
+    for (auto op : list) {
+        if (pAcceptOp(c, op))
+            return op;
+    }
+
+    return Op::invalid;
+}
+
 Construct *pExpr01(Context &c)
 {
     Expr01 *ret = new Expr01;
@@ -119,16 +129,6 @@ Construct *pExpr01(Context &c)
     }
 
     return ret;
-}
-
-Op AcceptOneOf(Context &c, initializer_list<Op> list)
-{
-    for (auto op : list) {
-        if (pAcceptOp(c, op))
-            return op;
-    }
-
-    return Op::invalid;
 }
 
 template <class ExprT, bool allow_op_first = false>
@@ -262,6 +262,10 @@ int main(int argc, char **argv)
         cout << "--------------------------" << endl;
 
         Construct *root = pExprTop(ctx);
+
+        if (*ctx != TokType::invalid)
+            throw SyntaxErrorEx();
+
         cout << *root << endl;
 
         cout << endl;

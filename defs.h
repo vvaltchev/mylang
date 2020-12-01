@@ -97,16 +97,16 @@ public:
         return op == rhs;
     }
 
+    bool operator!=(Op rhs) const {
+        return op != rhs;
+    }
+
     bool operator==(TokType t) const {
         return type == t;
     }
 
-    bool operator==(const Tok &rhs) const {
-
-        if (type == TokType::op)
-            return op == rhs.op;
-
-        return type == rhs.type;
+    bool operator!=(TokType t) const {
+        return type != t;
     }
 };
 
