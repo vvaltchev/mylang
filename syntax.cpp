@@ -35,7 +35,7 @@ MultiOpConstruct::serialize(ostream &s, int level) const
 
         if (op != Op::invalid) {
             s << string((level + 1) * 2, ' ');
-            s << "Op '" << OpToString[(int)op] << "'";
+            s << "Op '" << OpString[(int)op] << "'";
             s << endl;
         }
 

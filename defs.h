@@ -2,12 +2,13 @@
 #pragma once
 
 #include <set>
+#include <array>
 #include <string>
 #include <vector>
 #include <iostream>
 #include <string_view>
 #include <sstream>
-
+#include <algorithm>
 #include <cassert>
 
 /*
@@ -17,31 +18,32 @@
 using namespace std;
 
 enum class TokType {
-    invalid = 0,
-    num = 1,
-    id = 2,
-    op = 3,
-    unknown = 4,
+
+    invalid = 0,   /* no token */
+
+    num = 1,       /* literal integer */
+    id = 2,        /* identifier (e.g. a, x, my_var) */
+    op = 3,        /* operator (e.g. +, -, *, /) */
+    unknown = 4,   /* something else (e.g. ?) */
 };
 
 enum class Op {
 
-    invalid,
+    invalid = 0,
 
-    plus,
-    minus,
-    times,
-    div,
-    parenL,
-    parenR,
-    lt,
-    gt,
-    le,
-    ge,
+    plus = 1,
+    minus = 2,
+    times = 3,
+    div = 4,
+    parenL = 5,
+    parenR = 6,
+    lt = 7,
+    gt = 8,
+    le = 9,
+    ge = 10,
 };
 
-/* OpToString is used just for serialization in human-friendly form */
-static const string OpToString[] =
+static const array<string, 11> OpString =
 {
     "invalid",
 
@@ -57,9 +59,12 @@ static const string OpToString[] =
     ">=",
 };
 
-static const set<string, less<>> operators = {
-    "+", "-", "*", "/", "(", ")", "<", ">", "<=", ">=",
-};
+static const set<string, less<>> operators = [] {
+    return set<string, less<>>(
+        OpString.begin() + 1, OpString.end()
+    );
+}();
+
 
 struct InvalidTokenEx {
     string_view val;
