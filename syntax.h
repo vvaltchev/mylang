@@ -3,6 +3,7 @@
 #pragma once
 #include "lexer.h"
 #include <variant>
+#include <unordered_map>
 
 class Literal;
 class LiteralInt;
@@ -14,22 +15,58 @@ class Expr04;
 class Expr06;
 class Stmt;
 class Block;
+class LValue;
+class Identifier;
 
 class EvalValue {
 
 public:
-    variant<nullptr_t, long> value;
+    variant<nullptr_t, long, LValue *> value;
 
     EvalValue() : value(nullptr) { }
-    EvalValue(long v) : value(v) { }
+    EvalValue(long val) : value(val) { }
+    explicit EvalValue(LValue *val) : value(val) { }
+
+    virtual ~EvalValue() = default;
 
     template <class T>
-    T get() {
+    T get() const {
         return std::get<T>(value);
     }
 
-    operator bool() {
-        return !holds_alternative<nullptr_t>(value);
+    template <class T>
+    bool is() const {
+        return holds_alternative<T>(value);
+    }
+
+    bool isLValueP() const {
+        return holds_alternative<LValue *>(value);
+    }
+};
+
+class LValue {
+
+public:
+    variant<long> value;
+
+    template <class T>
+    LValue(T &&arg) : value(forward<T>(arg)) { }
+
+    template <class T>
+    T get() const {
+        return std::get<T>(value);
+    }
+
+    void put(EvalValue v) {
+
+        if (v.is<long>())
+            value = v.get<long>();
+        else
+            throw TypeErrorEx();
+    }
+
+    EvalValue eval() const {
+        return EvalValue(std::get<long>(value));
     }
 };
 
@@ -39,7 +76,7 @@ class EvalContext {
 
 public:
 
-    /* TODO: add context variables */
+    unordered_map<string, LValue> vars;
 };
 
 class Construct {
@@ -183,6 +220,18 @@ class Expr06 : public MultiOpConstruct {
 public:
 
     Expr06() : MultiOpConstruct("Expr06") { }
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
+class Expr14 : public Construct {
+
+public:
+    unique_ptr<Construct> lvalue;
+    unique_ptr<Construct> rvalue;
+    Op op;
+
+    Expr14() : Construct("Expr14"), op(Op::invalid) { }
+    virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue eval(EvalContext *ctx) const;
 };
 

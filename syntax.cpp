@@ -93,3 +93,40 @@ void Identifier::serialize(ostream &s, int level) const
     s << value;
     s << "\")";
 }
+
+void CallExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    id->serialize(s, level + 1);
+    s << endl;
+    args->serialize(s, level + 1);
+    s << endl;
+
+    s << indent;
+    s << ")";
+}
+
+void Expr14::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    lvalue->serialize(s, level + 1);
+    s << endl;
+
+    s << string((level + 1) * 2, ' ');
+    s << "Op '" << OpString[(int)op] << "'";
+    s << endl;
+
+    rvalue->serialize(s, level + 1);
+    s << endl;
+
+    s << indent;
+    s << ")";
+}

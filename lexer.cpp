@@ -58,6 +58,9 @@ Op get_op_type(string_view val)
         case '!':
             return Op::opnot;
 
+        case '=':
+            return Op::assign;
+
         case '<':
 
             if (val.length() > 1 && val[1] == '=')

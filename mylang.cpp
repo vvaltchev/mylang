@@ -66,8 +66,9 @@ unique_ptr<Construct> pExpr02(Context &c); // ops: + (unary), - (unary), !
 unique_ptr<Construct> pExpr03(Context &c); // ops: *, /
 unique_ptr<Construct> pExpr04(Context &c); // ops: +, -
 unique_ptr<Construct> pExpr06(Context &c); // ops: <, >, <=, >=
+unique_ptr<Construct> pExpr14(Context &c); // ops: =
 
-inline unique_ptr<Construct> pExprTop(Context &c) { return pExpr06(c); }
+inline unique_ptr<Construct> pExprTop(Context &c) { return pExpr14(c); }
 
 bool pAcceptLiteralInt(Context &c, unique_ptr<Construct> &v)
 {
@@ -79,6 +80,18 @@ bool pAcceptLiteralInt(Context &c, unique_ptr<Construct> &v)
 
     return false;
 }
+
+bool pAcceptId(Context &c, unique_ptr<Construct> &v)
+{
+    if (*c == TokType::id) {
+        v.reset(new Identifier(c.get_str()));
+        c++;
+        return true;
+    }
+
+    return false;
+}
+
 
 bool pAcceptOp(Context &c, Op exp)
 {
@@ -131,6 +144,23 @@ pExprList(Context &c)
     return ret;
 }
 
+bool
+pAcceptCallExpr(Context &c, unique_ptr<Construct> &id, unique_ptr<Construct> &ret)
+{
+    if (pAcceptOp(c, Op::parenL)) {
+
+        unique_ptr<CallExpr> expr(new CallExpr);
+
+        expr->id.reset(static_cast<Identifier *>(id.release()));
+        expr->args = pExprList(c);
+        ret = move(expr);
+        pExpectOp(c, Op::parenR);
+        return true;
+    }
+
+    return false;
+}
+
 unique_ptr<Construct>
 pExpr01(Context &c)
 {
@@ -146,25 +176,10 @@ pExpr01(Context &c)
         ret->elem = pExprTop(c);
         pExpectOp(c, Op::parenR);
 
-    } else if (*c == TokType::id) {
+    } else if (pAcceptId(c, e)) {
 
-        e.reset(new Identifier(c.get_str()));
-        c++;
-
-        if (pAcceptOp(c, Op::parenL)) {
-
-            unique_ptr<CallExpr> callExpr(new CallExpr);
-
-            callExpr->id.reset(static_cast<Identifier *>(e.release()));
-            callExpr->args = pExprList(c);
-            ret->elem = move(callExpr);
-
-            pExpectOp(c, Op::parenR);
-
-        } else {
-
+        if (!pAcceptCallExpr(c, e, ret->elem))
             ret->elem = move(e);
-        }
 
     } else {
 
@@ -204,10 +219,7 @@ pExpr02(Context &c)
          * Note: using direct recursion.
          * It allows us to handle things like:
          *
-         *      --1
-         *      !+1
-         *      !-1
-         *      !!1
+         *      --1, !+1, !-1, !!1
          */
 
         elem = pExpr02(c);
@@ -243,6 +255,28 @@ pExpr06(Context &c)
     return pExprGeneric<Expr06>(
         c, pExpr04, {Op::lt, Op::gt, Op::le, Op::ge}
     );
+}
+
+unique_ptr<Construct> pExpr14(Context &c)
+{
+    unique_ptr<Construct> lside, e;
+    Op op = Op::invalid;
+
+    lside = pExpr06(c);
+
+    if ((op = AcceptOneOf(c, {Op::assign})) != Op::invalid) {
+
+        unique_ptr<Expr14> ret(new Expr14);
+
+        ret->lvalue = move(lside);
+        ret->rvalue = pExpr06(c);
+        ret->op = op;
+        return ret;
+
+    } else {
+
+        return lside;
+    }
 }
 
 unique_ptr<Construct>
@@ -384,7 +418,7 @@ int main(int argc, char **argv)
 
     } catch (UndefinedVariableEx e) {
 
-        cout << "Undefined variable '" << e.var << "'" << endl;
+        cout << "Undefined variable '" << e.name << "'" << endl;
     }
 
     return 0;

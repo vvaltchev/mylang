@@ -10,4 +10,5 @@ struct InvalidTokenEx { string_view val; };
 struct SyntaxErrorEx { };
 struct DivisionByZeroEx { };
 struct TypeErrorEx { };
-struct UndefinedVariableEx { string var; };
+struct UndefinedVariableEx { string name; };
+struct NotLValue { };

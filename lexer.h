@@ -43,9 +43,10 @@ enum class Op : int {
     comma = 12,
     mod = 13,
     opnot = 14,
+    assign = 15,
 };
 
-static const array<string, 15> OpString =
+static const array<string, 16> OpString =
 {
     "invalid",
 
@@ -63,6 +64,7 @@ static const array<string, 15> OpString =
     ",",
     "%",
     "!",
+    "=",
 };
 
 
