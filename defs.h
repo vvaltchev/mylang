@@ -75,8 +75,8 @@ class Tok {
 
 public:
 
-    const string_view value;
     const TokType type;
+    const string_view value;
     const Op op;
 
     Tok(TokType type = TokType::invalid, string_view value = string_view())

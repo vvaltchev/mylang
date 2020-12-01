@@ -65,12 +65,19 @@ inline ostream &operator<<(ostream &s, const Construct &c)
     return s;
 }
 
-class LiteralInt : public Construct {
+class Literal : public Construct {
 
 public:
     long value;
 
-    LiteralInt(long v) : value(v) { }
+    Literal(long v) : value(v) { }
+};
+
+class LiteralInt : public Literal {
+
+public:
+
+    LiteralInt(long v) : Literal(v) { }
 
     virtual EvalValue eval(EvalContext *ctx) const {
         return value;

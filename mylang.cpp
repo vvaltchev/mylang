@@ -43,7 +43,7 @@ public:
     string_view get_str() const { return ts.get().value; }
 
     /* token operations with side-effect */
-    Tok operator++(int dummy) { Tok val = ts.get(); ts.next(); return val; }
+    Tok operator++(int) { Tok val = ts.get(); ts.next(); return val; }
     void next() { ts.next(); }
 };
 

@@ -5,10 +5,21 @@
 void SingleChildConstruct::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
+    bool is_literal = dynamic_cast<Literal *>(elem) != nullptr;
 
     s << indent;
     s << "Expr(";
-    elem->serialize(s, 0);
+
+    if (!is_literal)
+        s << endl;
+
+    elem->serialize(s, is_literal ? 0 : level + 1);
+
+    if (!is_literal) {
+        s << endl;
+        s << indent;
+    }
+
     s << ")";
 }
 
@@ -49,25 +60,31 @@ void LiteralInt::serialize(ostream &s, int level) const
 EvalValue Expr03::eval(EvalContext *ctx) const
 {
     long val = 1;
+    long tmp;
 
     for (const auto &[op, e] : elems) {
 
-        if (op == Op::times) {
+        switch (op) {
 
-            val *= e->eval(ctx).value;
+            case Op::times:
+                val *= e->eval(ctx).value;
+                break;
 
-        } else if (op == Op::div) {
+            case Op::div:
+                tmp = e->eval(ctx).value;
 
-            long div = e->eval(ctx).value;
+                if (tmp == 0)
+                    throw DivisionByZeroEx();
 
-            if (div == 0)
-                throw DivisionByZeroEx();
+                val /= tmp;
+                break;
 
-            val /= div;
+            case Op::invalid:
+                val = e->eval(ctx).value;
+                break;
 
-        } else if (op == Op::invalid) {
-
-            val = e->eval(ctx).value;
+            default:
+                throw SyntaxErrorEx();
         }
     }
 
@@ -80,12 +97,19 @@ EvalValue Expr04::eval(EvalContext *ctx) const
 
     for (const auto &[op, e] : elems) {
 
-        if (op == Op::plus)
-            val += e->eval(ctx).value;
-        else if (op == Op::minus)
-            val -= e->eval(ctx).value;
-        else if (op == Op::invalid)
-            val = e->eval(ctx).value;
+        switch (op) {
+            case Op::plus:
+                val += e->eval(ctx).value;
+                break;
+            case Op::minus:
+                val -= e->eval(ctx).value;
+                break;
+            case Op::invalid:
+                val = e->eval(ctx).value;
+                break;
+            default:
+                SyntaxErrorEx();
+        }
     }
 
     return val;
@@ -114,6 +138,8 @@ EvalValue Expr06::eval(EvalContext *ctx) const
             case Op::invalid:
                 val = e->eval(ctx).value;
                 break;
+            default:
+                throw SyntaxErrorEx();
         }
     }
 

@@ -68,7 +68,7 @@ ostream &operator<<(ostream &s, TokType t)
 void
 lexer(string_view in_str, vector<Tok> &result)
 {
-    int i, tok_start = 0;
+    size_t i, tok_start = 0;
     TokType tok_type = TokType::invalid;
 
     for (i = 0; i < in_str.length(); i++) {
