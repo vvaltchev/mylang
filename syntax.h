@@ -17,6 +17,7 @@ class EvalValue {
 public:
     long value;
 
+    EvalValue() = default;
     EvalValue(long v) : value(v) { }
 };
 

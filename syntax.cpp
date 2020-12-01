@@ -164,9 +164,11 @@ EvalValue Expr06::eval(EvalContext *ctx) const
 
 EvalValue Block::eval(EvalContext *ctx) const
 {
+    EvalValue val;
+
     for (const auto &e : elems) {
-        e->eval(ctx);
+        val = e->eval(ctx);
     }
 
-    return 0;
+    return val;
 }

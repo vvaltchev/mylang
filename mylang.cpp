@@ -59,17 +59,17 @@ void pExpectOp(Context &c, Op exp);
  * Note: this simple language has just no operators for several levels.
  */
 
-Construct *pExpr01(Context &c); // ops: ()
-Construct *pExpr03(Context &c); // ops: *, /
-Construct *pExpr04(Context &c); // ops: +, -
-Construct *pExpr06(Context &c); // ops: <, >, <=, >=
+unique_ptr<Construct> pExpr01(Context &c); // ops: ()
+unique_ptr<Construct> pExpr03(Context &c); // ops: *, /
+unique_ptr<Construct> pExpr04(Context &c); // ops: +, -
+unique_ptr<Construct> pExpr06(Context &c); // ops: <, >, <=, >=
 
-inline Construct *pExprTop(Context &c) { return pExpr06(c); }
+inline unique_ptr<Construct> pExprTop(Context &c) { return pExpr06(c); }
 
-bool pAcceptLiteralInt(Context &c, Construct *&v)
+bool pAcceptLiteralInt(Context &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::num) {
-        v = new LiteralInt{ stol(string(c.get_str())) };
+        v.reset(new LiteralInt{ stol(string(c.get_str())) });
         c++;
         return true;
     }
@@ -87,7 +87,7 @@ bool pAcceptOp(Context &c, Op exp)
     return false;
 }
 
-void pExpectLiteralInt(Context &c, Construct *&v)
+void pExpectLiteralInt(Context &c, unique_ptr<Construct> &v)
 {
     if (!pAcceptLiteralInt(c, v))
         throw SyntaxErrorEx();
@@ -109,18 +109,19 @@ Op AcceptOneOf(Context &c, initializer_list<Op> list)
     return Op::invalid;
 }
 
-Construct *pExpr01(Context &c)
+unique_ptr<Construct>
+pExpr01(Context &c)
 {
-    Expr01 *ret = new Expr01;
-    Construct *e;
+    unique_ptr<Expr01> ret(new Expr01);
+    unique_ptr<Construct> e;
 
     if (pAcceptLiteralInt(c, e)) {
 
-        ret->elem.reset(e);
+        ret->elem = move(e);
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        ret->elem.reset(pExprTop(c));
+        ret->elem = pExprTop(c);
         pExpectOp(c, Op::parenR);
 
     } else {
@@ -132,60 +133,62 @@ Construct *pExpr01(Context &c)
 }
 
 template <class ExprT, bool allow_op_first = false>
-Construct *
+unique_ptr<Construct>
 pExprGeneric(Context &c,
-             Construct *(*lowerExpr)(Context&),
+             unique_ptr<Construct> (*lowerExpr)(Context&),
              initializer_list<Op> ops)
 {
-    ExprT *ret = new ExprT;
-    Construct *e;
+    unique_ptr<ExprT> ret(new ExprT);
     Op op = Op::invalid;
 
     if (allow_op_first)
         op = AcceptOneOf(c, ops);
 
-    e = lowerExpr(c);
-    ret->elems.emplace_back(op, e);
+    ret->elems.emplace_back(op, lowerExpr(c));
 
     while ((op = AcceptOneOf(c, ops)) != Op::invalid) {
-        e = lowerExpr(c);
-        ret->elems.emplace_back(op, e);
+        ret->elems.emplace_back(op, lowerExpr(c));
     }
 
     return ret;
 }
 
-Construct *pExpr03(Context &c)
+unique_ptr<Construct>
+pExpr03(Context &c)
 {
     return pExprGeneric<Expr03>(
         c, pExpr01, {Op::times, Op::div}
     );
 }
 
-Construct *pExpr04(Context &c)
+unique_ptr<Construct>
+pExpr04(Context &c)
 {
     return pExprGeneric<Expr04, true>(
         c, pExpr03, {Op::plus, Op::minus}
     );
 }
 
-Construct *pExpr06(Context &c)
+unique_ptr<Construct>
+pExpr06(Context &c)
 {
     return pExprGeneric<Expr06>(
         c, pExpr04, {Op::lt, Op::gt, Op::le, Op::ge}
     );
 }
 
-Construct *pStmt(Context &c)
+unique_ptr<Construct>
+pStmt(Context &c)
 {
-    Stmt *ret = new Stmt;
-    ret->elem.reset(pExprTop(c));
+    unique_ptr<Stmt> ret(new Stmt);
+    ret->elem = pExprTop(c);
     return ret;
 }
 
-Construct *pBlock(Context &c)
+unique_ptr<Construct>
+pBlock(Context &c)
 {
-    Block *ret = new Block;
+    unique_ptr<Block> ret(new Block);
 
     ret->elems.emplace_back(pStmt(c));
 
