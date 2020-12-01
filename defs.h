@@ -43,9 +43,10 @@ enum class Op : int {
     le = 9,
     ge = 10,
     semicolon = 11,
+    comma = 12,
 };
 
-static const array<string, 12> OpString =
+static const array<string, 13> OpString =
 {
     "invalid",
 
@@ -60,6 +61,7 @@ static const array<string, 12> OpString =
     "<=",
     ">=",
     ";",
+    ",",
 };
 
 static const set<string, less<>> operators = [] {

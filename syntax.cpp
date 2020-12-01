@@ -83,6 +83,16 @@ void LiteralInt::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void Identifier::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << string("Id(");
+    s << value;
+    s << ")";
+}
+
 template <class T>
 T EvalAs(EvalContext *ctx, Construct *c)
 {
@@ -94,6 +104,32 @@ T EvalAs(EvalContext *ctx, Construct *c)
 
         throw TypeErrorEx();
     }
+}
+
+void CallExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    id->serialize(s, level + 1);
+    s << endl;
+    args->serialize(s, level + 1);
+    s << endl;
+
+    s << indent;
+    s << ")";
+}
+
+EvalValue Identifier::eval(EvalContext *ctx) const
+{
+    return 123; // TODO: implement
+}
+
+EvalValue CallExpr::eval(EvalContext *ctx) const
+{
+    return 1001;
 }
 
 EvalValue Expr03::eval(EvalContext *ctx) const

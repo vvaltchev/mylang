@@ -110,6 +110,25 @@ Op AcceptOneOf(Context &c, initializer_list<Op> list)
     return Op::invalid;
 }
 
+unique_ptr<ExprList>
+pExprList(Context &c)
+{
+    unique_ptr<ExprList> ret(new ExprList);
+
+    if (*c == Op::parenR)
+        return ret;
+
+    ret->elems.emplace_back(pExprTop(c));
+
+    while (*c == Op::comma) {
+
+        c++;
+        ret->elems.emplace_back(pExprTop(c));
+    }
+
+    return ret;
+}
+
 unique_ptr<Construct>
 pExpr01(Context &c)
 {
@@ -124,6 +143,26 @@ pExpr01(Context &c)
 
         ret->elem = pExprTop(c);
         pExpectOp(c, Op::parenR);
+
+    } else if (*c == TokType::id) {
+
+        e.reset(new Identifier(c.get_str()));
+        c++;
+
+        if (pAcceptOp(c, Op::parenL)) {
+
+            unique_ptr<CallExpr> callExpr(new CallExpr);
+
+            callExpr->id.reset(static_cast<Identifier *>(e.release()));
+            callExpr->args = pExprList(c);
+            ret->elem = move(callExpr);
+
+            pExpectOp(c, Op::parenR);
+
+        } else {
+
+            ret->elem = move(e);
+        }
 
     } else {
 
@@ -279,7 +318,7 @@ int main(int argc, char **argv)
 
         Context ctx{TokenStream(tokens)};
 
-        if (0) {
+        if (1) {
             cout << "Tokens" << endl;
             cout << "--------------------------" << endl;
 

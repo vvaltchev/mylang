@@ -35,6 +35,9 @@ Op get_op_type(string_view val)
         case ';':
             return Op::semicolon;
 
+        case ',':
+            return Op::comma;
+
         case '<':
 
             if (val.length() > 1 && val[1] == '=')

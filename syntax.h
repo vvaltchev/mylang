@@ -6,6 +6,8 @@
 
 class Literal;
 class LiteralInt;
+class ExprList;
+class CallExpr;
 class Expr01;
 class Expr03;
 class Expr04;
@@ -102,6 +104,39 @@ public:
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
+class Identifier : public Construct {
+
+public:
+    string value;
+
+    template <class T>
+    Identifier(T &&arg) : Construct("Id"), value(forward<T>(arg)) { }
+
+    virtual void serialize(ostream &s, int level = 0) const;
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
+class ExprList : public MultiElemConstruct {
+
+public:
+
+    ExprList() : MultiElemConstruct("ExprList") { }
+
+    virtual EvalValue eval(EvalContext *ctx) const {
+        return EvalValue();
+    }
+};
+
+class CallExpr : public Construct {
+
+public:
+    unique_ptr<Identifier> id;
+    unique_ptr<ExprList> args;
+
+    CallExpr() : Construct("CallExpr") { }
+    virtual void serialize(ostream &s, int level = 0) const;
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
 
 class Expr01 : public SingleChildConstruct {
 
