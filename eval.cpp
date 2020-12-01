@@ -2,6 +2,7 @@
 
 #include "errors.h"
 #include "syntax.h"
+#include "lexer.h"
 
 template <class T>
 T EvalAs(EvalContext *ctx, Construct *c)
