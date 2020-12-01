@@ -33,17 +33,29 @@ void CallExpr::serialize(ostream &s, int level) const
 
 EvalValue Identifier::eval(EvalContext *ctx) const
 {
-    return 123; // TODO: implement
+    throw UndefinedVariableEx{value};
 }
 
 EvalValue CallExpr::eval(EvalContext *ctx) const
 {
-    return 1001;
+    if (id->value == "print") {
+
+        for (const auto &e: args->elems) {
+            cout << e->eval(ctx) << " ";
+        }
+
+        cout << endl;
+        return EvalValue();
+
+    } else {
+
+        throw UndefinedVariableEx{id->value};
+    }
 }
 
 EvalValue Expr03::eval(EvalContext *ctx) const
 {
-    long val = 1;
+    EvalValue val;
     long tmp;
 
     for (const auto &[op, e] : elems) {
@@ -51,7 +63,7 @@ EvalValue Expr03::eval(EvalContext *ctx) const
         switch (op) {
 
             case Op::times:
-                val *= EvalAs<long>(ctx, e.get());
+                val = val.get<long>() * EvalAs<long>(ctx, e.get());
                 break;
 
             case Op::div:
@@ -60,11 +72,11 @@ EvalValue Expr03::eval(EvalContext *ctx) const
                 if (tmp == 0)
                     throw DivisionByZeroEx();
 
-                val /= tmp;
+                val = val.get<long>() / tmp;
                 break;
 
             case Op::invalid:
-                val = EvalAs<long>(ctx, e.get());
+                val = e->eval(ctx);
                 break;
 
             default:
@@ -77,19 +89,19 @@ EvalValue Expr03::eval(EvalContext *ctx) const
 
 EvalValue Expr04::eval(EvalContext *ctx) const
 {
-    long val = 0;
+    EvalValue val;
 
     for (const auto &[op, e] : elems) {
 
         switch (op) {
             case Op::plus:
-                val += EvalAs<long>(ctx, e.get());
+                val = val.get<long>() + EvalAs<long>(ctx, e.get());
                 break;
             case Op::minus:
-                val -= EvalAs<long>(ctx, e.get());
+                val = val.get<long>() - EvalAs<long>(ctx, e.get());
                 break;
             case Op::invalid:
-                val = EvalAs<long>(ctx, e.get());
+                val = e->eval(ctx);
                 break;
             default:
                 SyntaxErrorEx();
@@ -101,26 +113,26 @@ EvalValue Expr04::eval(EvalContext *ctx) const
 
 EvalValue Expr06::eval(EvalContext *ctx) const
 {
-    long val = 0;
+    EvalValue val;
 
     for (const auto &[op, e] : elems) {
 
         switch (op) {
 
             case Op::lt:
-                val = val < EvalAs<long>(ctx, e.get());
+                val = val.get<long>() < EvalAs<long>(ctx, e.get());
                 break;
             case Op::gt:
-                val = val > EvalAs<long>(ctx, e.get());
+                val = val.get<long>() > EvalAs<long>(ctx, e.get());
                 break;
             case Op::le:
-                val = val <= EvalAs<long>(ctx, e.get());
+                val = val.get<long>() <= EvalAs<long>(ctx, e.get());
                 break;
             case Op::ge:
-                val = val >= EvalAs<long>(ctx, e.get());
+                val = val.get<long>() >= EvalAs<long>(ctx, e.get());
                 break;
             case Op::invalid:
-                val = EvalAs<long>(ctx, e.get());
+                val = e->eval(ctx);
                 break;
             default:
                 throw SyntaxErrorEx();

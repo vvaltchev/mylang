@@ -22,6 +22,11 @@ public:
 
     EvalValue() : value(nullptr) { }
     EvalValue(long v) : value(v) { }
+
+    template <class T>
+    T get() {
+        return std::get<T>(value);
+    }
 };
 
 ostream &operator<<(ostream &s, const EvalValue &c);

@@ -5,7 +5,7 @@
 ostream &operator<<(ostream &s, const EvalValue &c)
 {
     if (holds_alternative<nullptr_t>(c.value))
-        s << "<NoValue>";
+        s << "<None>";
     else if (holds_alternative<long>(c.value))
         s << get<long>(c.value);
 
@@ -88,7 +88,7 @@ void Identifier::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << string("Id(");
+    s << string("Id(\"");
     s << value;
-    s << ")";
+    s << "\")";
 }

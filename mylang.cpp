@@ -336,13 +336,11 @@ int main(int argc, char **argv)
             throw SyntaxErrorEx();
 
         cout << *root << endl;
-
         cout << endl;
-        cout << "Value" << endl;
-        cout << "--------------------------" << endl;
 
+        /* Eval the script */
         EvalContext evalCtx;
-        cout << root->eval(&evalCtx) << endl;
+        root->eval(&evalCtx);
 
     } catch (InvalidTokenEx e) {
 
@@ -355,6 +353,10 @@ int main(int argc, char **argv)
     } catch (DivisionByZeroEx e) {
 
         cout << "DivisionByZeroEx" << endl;
+
+    } catch (UndefinedVariableEx e) {
+
+        cout << "Undefined variable '" << e.var << "'" << endl;
     }
 
     return 0;

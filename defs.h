@@ -71,13 +71,11 @@ static const set<string, less<>> operators = [] {
 }();
 
 
-struct InvalidTokenEx {
-    string_view val;
-};
-
+struct InvalidTokenEx { string_view val; };
 struct SyntaxErrorEx { };
 struct DivisionByZeroEx { };
 struct TypeErrorEx { };
+struct UndefinedVariableEx { string var; };
 
 Op get_op_type(string_view val);
 ostream &operator<<(ostream &s, TokType t);
