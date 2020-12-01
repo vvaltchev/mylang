@@ -27,6 +27,10 @@ public:
     T get() {
         return std::get<T>(value);
     }
+
+    operator bool() {
+        return !holds_alternative<nullptr_t>(value);
+    }
 };
 
 ostream &operator<<(ostream &s, const EvalValue &c);
@@ -148,6 +152,15 @@ class Expr01 : public SingleChildConstruct {
 public:
     Expr01() : SingleChildConstruct("Expr01") { }
 };
+
+class Expr02 : public MultiOpConstruct {
+
+public:
+
+    Expr02() : MultiOpConstruct("Expr02") { }
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
 
 class Expr03 : public MultiOpConstruct {
 

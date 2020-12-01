@@ -42,9 +42,10 @@ enum class Op : int {
     semicolon = 11,
     comma = 12,
     mod = 13,
+    opnot = 14,
 };
 
-static const array<string, 14> OpString =
+static const array<string, 15> OpString =
 {
     "invalid",
 
@@ -61,6 +62,7 @@ static const array<string, 14> OpString =
     ";",
     ",",
     "%",
+    "!",
 };
 
 

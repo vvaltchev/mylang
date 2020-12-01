@@ -55,6 +55,31 @@ EvalValue CallExpr::eval(EvalContext *ctx) const
     }
 }
 
+EvalValue Expr02::eval(EvalContext *ctx) const
+{
+    EvalValue val = 0;
+    const auto &[op, e] = elems.at(0);
+
+    switch (op) {
+        case Op::plus:
+            val = EvalAs<long>(ctx, e.get());
+            break;
+        case Op::minus:
+            val = - EvalAs<long>(ctx, e.get());
+            break;
+        case Op::opnot:
+            val = !EvalAs<long>(ctx, e.get());
+            break;
+        case Op::invalid:
+            val = e->eval(ctx);
+            break;
+        default:
+            SyntaxErrorEx();
+    }
+
+    return val;
+}
+
 EvalValue Expr03::eval(EvalContext *ctx) const
 {
     EvalValue val;

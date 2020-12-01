@@ -62,6 +62,7 @@ void pExpectOp(Context &c, Op exp);
  */
 
 unique_ptr<Construct> pExpr01(Context &c); // ops: ()
+unique_ptr<Construct> pExpr02(Context &c); // ops: + (unary), - (unary), !
 unique_ptr<Construct> pExpr03(Context &c); // ops: *, /
 unique_ptr<Construct> pExpr04(Context &c); // ops: +, -
 unique_ptr<Construct> pExpr06(Context &c); // ops: <, >, <=, >=
@@ -173,7 +174,7 @@ pExpr01(Context &c)
     return ret;
 }
 
-template <class ExprT, bool allow_op_first = false>
+template <class ExprT>
 unique_ptr<Construct>
 pExprGeneric(Context &c,
              unique_ptr<Construct> (*lowerExpr)(Context&),
@@ -181,10 +182,6 @@ pExprGeneric(Context &c,
 {
     unique_ptr<ExprT> ret(new ExprT);
     Op op = Op::invalid;
-
-    if (allow_op_first)
-        op = AcceptOneOf(c, ops);
-
     ret->elems.emplace_back(op, lowerExpr(c));
 
     while ((op = AcceptOneOf(c, ops)) != Op::invalid) {
@@ -195,17 +192,47 @@ pExprGeneric(Context &c,
 }
 
 unique_ptr<Construct>
+pExpr02(Context &c)
+{
+    unique_ptr<Expr02> ret(new Expr02);
+    unique_ptr<Construct> elem;
+    Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::opnot});
+
+    if (op != Op::invalid) {
+
+        /*
+         * Note: using direct recursion.
+         * It allows us to handle things like:
+         *
+         *      --1
+         *      !+1
+         *      !-1
+         *      !!1
+         */
+
+        elem = pExpr02(c);
+
+    } else {
+
+        elem = pExpr01(c);
+    }
+
+    ret->elems.emplace_back(op, move(elem));
+    return ret;
+}
+
+unique_ptr<Construct>
 pExpr03(Context &c)
 {
     return pExprGeneric<Expr03>(
-        c, pExpr01, {Op::times, Op::div, Op::mod}
+        c, pExpr02, {Op::times, Op::div, Op::mod}
     );
 }
 
 unique_ptr<Construct>
 pExpr04(Context &c)
 {
-    return pExprGeneric<Expr04, true>(
+    return pExprGeneric<Expr04>(
         c, pExpr03, {Op::plus, Op::minus}
     );
 }
