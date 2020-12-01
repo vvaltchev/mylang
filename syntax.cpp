@@ -7,10 +7,8 @@ void SingleChildConstruct::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << "Expr(" << endl;
-    elem->serialize(s, level + 1);
-    s << endl;
-    s << string(level * 2, ' ');
+    s << "Expr(";
+    elem->serialize(s, 0);
     s << ")";
 }
 

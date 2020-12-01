@@ -34,6 +34,11 @@ class SingleChildConstruct : public Construct {
 
 public:
     Construct *elem;
+
+    virtual ~SingleChildConstruct() {
+        delete elem;
+    }
+
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -42,6 +47,14 @@ class MultiOpConstruct : public Construct {
 
 public:
     vector<pair<Op, Construct *>> elems;
+
+    virtual ~MultiOpConstruct() {
+
+        for (const auto &[op, e] : elems) {
+            delete e;
+        }
+    }
+
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -58,8 +71,6 @@ public:
 
     LiteralInt(long v) : value(v) { }
 
-    virtual ~LiteralInt() = default;
-
     virtual EvalValue eval(EvalContext *ctx) const {
         return value;
     }
@@ -71,8 +82,6 @@ public:
 class Expr01 : public SingleChildConstruct {
 
 public:
-    virtual ~Expr01() = default;
-
     virtual EvalValue eval(EvalContext *ctx) const {
         return elem->eval(ctx);
     }
@@ -81,13 +90,11 @@ public:
 class Expr03 : public MultiOpConstruct {
 
 public:
-    virtual ~Expr03() = default;
     virtual EvalValue eval(EvalContext *ctx) const;
 };
 
 class Expr04 : public MultiOpConstruct {
 
 public:
-    virtual ~Expr04() = default;
     virtual EvalValue eval(EvalContext *ctx) const;
 };

@@ -244,15 +244,16 @@ int main(int argc, char **argv)
         cout << "Syntax tree" << endl;
         cout << "--------------------------" << endl;
 
-        Construct *c = pExpr04(ctx);
-        cout << *c << endl;
+        Construct *root = pExpr04(ctx);
+        cout << *root << endl;
 
         cout << endl;
         cout << "Value" << endl;
         cout << "--------------------------" << endl;
 
-        cout << c->eval(nullptr).value << endl;
+        cout << root->eval(nullptr).value << endl;
 
+        delete root;
 
     } catch (InvalidTokenEx e) {
 
