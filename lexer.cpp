@@ -1,11 +1,25 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
+#include "errors.h"
 #include "defs.h"
 
+#include <set>
 #include <vector>
+
 #include <cctype>
 
 using namespace std;
+
+static const set<string, less<>> operators = [] {
+    return set<string, less<>>(
+        OpString.begin() + 1, OpString.end()
+    );
+}();
+
+inline bool is_operator(string_view s)
+{
+    return operators.find(s) != operators.end();
+}
 
 Op get_op_type(string_view val)
 {

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
+#include "errors.h"
 #include "syntax.h"
 
 ostream &operator<<(ostream &s, const EvalValue &c)

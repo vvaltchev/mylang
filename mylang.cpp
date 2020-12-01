@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
+#include "errors.h"
 #include "defs.h"
 #include "syntax.h"
 #include <initializer_list>

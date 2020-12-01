@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
+#include "errors.h"
 #include "syntax.h"
 
 template <class T>

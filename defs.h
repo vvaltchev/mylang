@@ -1,15 +1,12 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #pragma once
 
-#include <set>
 #include <array>
 #include <string>
 #include <vector>
 #include <memory>
 #include <iostream>
 #include <string_view>
-#include <sstream>
-#include <algorithm>
 #include <cassert>
 
 /*
@@ -64,18 +61,6 @@ static const array<string, 13> OpString =
     ",",
 };
 
-static const set<string, less<>> operators = [] {
-    return set<string, less<>>(
-        OpString.begin() + 1, OpString.end()
-    );
-}();
-
-
-struct InvalidTokenEx { string_view val; };
-struct SyntaxErrorEx { };
-struct DivisionByZeroEx { };
-struct TypeErrorEx { };
-struct UndefinedVariableEx { string var; };
 
 Op get_op_type(string_view val);
 ostream &operator<<(ostream &s, TokType t);
@@ -122,11 +107,6 @@ public:
 inline ostream &operator<<(ostream &s, const Tok &t)
 {
     return s << "Tok(" << t.type << "): '" << t.value << "'";
-}
-
-inline bool is_operator(string_view s)
-{
-    return operators.find(s) != operators.end();
 }
 
 void lexer(string_view in_str, vector<Tok> &result);
