@@ -34,8 +34,13 @@ enum class Op {
     div,
     parenL,
     parenR,
+    lt,
+    gt,
+    le,
+    ge,
 };
 
+/* OpToString is used just for serialization in human-friendly form */
 static const string OpToString[] =
 {
     "invalid",
@@ -46,6 +51,14 @@ static const string OpToString[] =
     "/",
     "(",
     ")",
+    "<",
+    ">",
+    "<=",
+    ">=",
+};
+
+static const set<string, less<>> operators = {
+    "+", "-", "*", "/", "(", ")", "<", ">", "<=", ">=",
 };
 
 struct InvalidTokenEx {
@@ -101,10 +114,6 @@ inline ostream &operator<<(ostream &s, const Tok &t)
 {
     return s << "Tok(" << t.type << "): '" << t.value << "'";
 }
-
-static const set<string, less<>> operators = {
-    "+", "-", "*", "/", "(", ")",
-};
 
 inline bool is_operator(string_view s)
 {

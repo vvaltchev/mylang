@@ -7,6 +7,7 @@ class LiteralInt;
 class Expr01;
 class Expr03;
 class Expr04;
+class Expr06;
 
 class EvalValue {
 
@@ -94,6 +95,12 @@ public:
 };
 
 class Expr04 : public MultiOpConstruct {
+
+public:
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
+class Expr06 : public MultiOpConstruct {
 
 public:
     virtual EvalValue eval(EvalContext *ctx) const;

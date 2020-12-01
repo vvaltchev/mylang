@@ -32,6 +32,20 @@ Op get_op_type(string_view val)
         case ')':
             return Op::parenR;
 
+        case '<':
+
+            if (val.length() > 1 && val[1] == '=')
+                return Op::le;
+
+            return Op::lt;
+
+        case '>':
+
+            if (val.length() > 1 && val[1] == '=')
+                return Op::ge;
+
+            return Op::gt;
+
         default:
             return Op::invalid;
     }

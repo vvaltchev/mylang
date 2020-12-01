@@ -58,12 +58,12 @@ EvalValue Expr03::eval(EvalContext *ctx) const
 
         } else if (op == Op::div) {
 
-            long val = e->eval(ctx).value;
+            long div = e->eval(ctx).value;
 
-            if (val == 0)
+            if (div == 0)
                 throw DivisionByZeroEx();
 
-            val /= val;
+            val /= div;
 
         } else if (op == Op::invalid) {
 
@@ -86,6 +86,35 @@ EvalValue Expr04::eval(EvalContext *ctx) const
             val -= e->eval(ctx).value;
         else if (op == Op::invalid)
             val = e->eval(ctx).value;
+    }
+
+    return val;
+}
+
+EvalValue Expr06::eval(EvalContext *ctx) const
+{
+    long val = 0;
+
+    for (const auto &[op, e] : elems) {
+
+        switch (op) {
+
+            case Op::lt:
+                val = val < e->eval(ctx).value;
+                break;
+            case Op::gt:
+                val = val > e->eval(ctx).value;
+                break;
+            case Op::le:
+                val = val <= e->eval(ctx).value;
+                break;
+            case Op::ge:
+                val = val >= e->eval(ctx).value;
+                break;
+            case Op::invalid:
+                val = e->eval(ctx).value;
+                break;
+        }
     }
 
     return val;

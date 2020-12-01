@@ -58,9 +58,12 @@ void pExpectOp(Context &c, Op exp);
  * Note: this simple language has just no operators for several levels.
  */
 
-Expr01 *pExpr01(Context &c); // ops: ()
-Expr03 *pExpr03(Context &c); // ops: *, /
-Expr04 *pExpr04(Context &c); // ops: +, -
+Construct *pExpr01(Context &c); // ops: ()
+Construct *pExpr03(Context &c); // ops: *, /
+Construct *pExpr04(Context &c); // ops: +, -
+Construct *pExpr06(Context &c); // ops: <, >, <=, >=
+
+inline Construct *pExprTop(Context &c) { return pExpr06(c); }
 
 bool pAcceptLiteralInt(Context &c, Construct *&v)
 {
@@ -95,7 +98,7 @@ void pExpectOp(Context &c, Op exp)
         throw SyntaxErrorEx();
 }
 
-Expr01 *pExpr01(Context &c)
+Construct *pExpr01(Context &c)
 {
     Expr01 *ret = new Expr01;
     Construct *e;
@@ -106,7 +109,7 @@ Expr01 *pExpr01(Context &c)
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        ret->elem = pExpr04(c);
+        ret->elem = pExprTop(c);
         pExpectOp(c, Op::parenR);
 
     } else {
@@ -117,29 +120,29 @@ Expr01 *pExpr01(Context &c)
     return ret;
 }
 
-Expr03 *pExpr03(Context &c)
+Construct *pExpr03(Context &c)
 {
     Expr03 *ret = new Expr03;
-    Expr01 *f;
+    Construct *e;
 
-    f = pExpr01(c);
-    ret->elems.emplace_back(Op::invalid, f);
+    e = pExpr01(c);
+    ret->elems.emplace_back(Op::invalid, e);
 
     while (*c == Op::times || *c == Op::div) {
         Op op = c.get_op();
         c++;
-        f = pExpr01(c);
-        ret->elems.emplace_back(op, f);
+        e = pExpr01(c);
+        ret->elems.emplace_back(op, e);
     }
 
     return ret;
 }
 
-Expr04 *pExpr04(Context &c)
+Construct *pExpr04(Context &c)
 {
     Expr04 *e = new Expr04();
     Op op = Op::invalid;
-    Expr03 *t;
+    Construct *t;
 
     if (*c == Op::plus || *c == Op::minus) {
         op = c.get_op();
@@ -157,6 +160,24 @@ Expr04 *pExpr04(Context &c)
     }
 
     return e;
+}
+
+Construct *pExpr06(Context &c)
+{
+    Expr06 *ret = new Expr06;
+    Construct *t;
+
+    t = pExpr04(c);
+    ret->elems.emplace_back(Op::invalid, t);
+
+    while (*c == Op::lt || *c == Op::gt || *c == Op::le || *c == Op::ge) {
+        Op op = c.get_op();
+        c++;
+        t = pExpr04(c);
+        ret->elems.emplace_back(op, t);
+    }
+
+    return ret;
 }
 
 // ----------- Recursive Descent Parser [end] -------------
@@ -232,7 +253,7 @@ int main(int argc, char **argv)
 
         Context ctx{TokenStream(tokens)};
 
-        if (0) {
+        if (1) {
             cout << "Tokens" << endl;
             cout << "--------------------------" << endl;
 
@@ -244,7 +265,7 @@ int main(int argc, char **argv)
         cout << "Syntax tree" << endl;
         cout << "--------------------------" << endl;
 
-        Construct *root = pExpr04(ctx);
+        Construct *root = pExpr06(ctx);
         cout << *root << endl;
 
         cout << endl;
