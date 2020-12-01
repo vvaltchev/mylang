@@ -10,6 +10,7 @@ class Expr03;
 class Expr04;
 class Expr06;
 class Stmt;
+class Block;
 
 class EvalValue {
 
@@ -50,6 +51,13 @@ class MultiOpConstruct : public Construct {
 
 public:
     vector<pair<Op, unique_ptr<Construct>>> elems;
+    virtual void serialize(ostream &s, int level = 0) const;
+};
+
+class MultiElemConstruct : public Construct {
+
+public:
+    vector<unique_ptr<Construct>> elems;
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -102,3 +110,9 @@ public:
 };
 
 class Stmt : public SingleChildConstruct { };
+
+class Block : public MultiElemConstruct {
+
+public:
+    virtual EvalValue eval(EvalContext *ctx) const;
+};

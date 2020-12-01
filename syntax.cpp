@@ -47,6 +47,22 @@ MultiOpConstruct::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void MultiElemConstruct::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "MultiElem(\n";
+
+    for (const auto &e: elems) {
+        e->serialize(s, level + 1);
+        s << endl;
+    }
+
+    s << indent;
+    s << ")";
+}
+
 void LiteralInt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
@@ -144,4 +160,13 @@ EvalValue Expr06::eval(EvalContext *ctx) const
     }
 
     return val;
+}
+
+EvalValue Block::eval(EvalContext *ctx) const
+{
+    for (const auto &e : elems) {
+        e->eval(ctx);
+    }
+
+    return 0;
 }

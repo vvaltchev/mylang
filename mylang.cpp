@@ -180,9 +180,18 @@ Construct *pStmt(Context &c)
 {
     Stmt *ret = new Stmt;
     ret->elem.reset(pExprTop(c));
+    return ret;
+}
 
-    if (*c != TokType::invalid)
-        pExpectOp(c, Op::semicolon);
+Construct *pBlock(Context &c)
+{
+    Block *ret = new Block;
+
+    ret->elems.emplace_back(pStmt(c));
+
+    while (pAcceptOp(c, Op::semicolon) && *c != TokType::invalid) {
+        ret->elems.emplace_back(pStmt(c));
+    }
 
     return ret;
 }
@@ -272,7 +281,7 @@ int main(int argc, char **argv)
         cout << "Syntax tree" << endl;
         cout << "--------------------------" << endl;
 
-        unique_ptr<Construct> root(pStmt(ctx));
+        unique_ptr<Construct> root(pBlock(ctx));
 
         if (*ctx != TokType::invalid)
             throw SyntaxErrorEx();
