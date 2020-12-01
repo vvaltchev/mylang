@@ -68,13 +68,18 @@ EvalValue Expr03::eval(EvalContext *ctx) const
                 val = val.get<long>() * EvalAs<long>(ctx, e.get());
                 break;
 
+            case Op::mod:
             case Op::div:
                 tmp = EvalAs<long>(ctx, e.get());
 
                 if (tmp == 0)
                     throw DivisionByZeroEx();
 
-                val = val.get<long>() / tmp;
+                if (op == Op::div)
+                    val = val.get<long>() / tmp;
+                else
+                    val = val.get<long>() % tmp;
+
                 break;
 
             case Op::invalid:

@@ -198,7 +198,7 @@ unique_ptr<Construct>
 pExpr03(Context &c)
 {
     return pExprGeneric<Expr03>(
-        c, pExpr01, {Op::times, Op::div}
+        c, pExpr01, {Op::times, Op::div, Op::mod}
     );
 }
 

@@ -52,6 +52,9 @@ Op get_op_type(string_view val)
         case ',':
             return Op::comma;
 
+        case '%':
+            return Op::mod;
+
         case '<':
 
             if (val.length() > 1 && val[1] == '=')
