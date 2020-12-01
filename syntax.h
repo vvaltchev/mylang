@@ -30,6 +30,21 @@ public:
     virtual void serialize(ostream &s, int level = 0) const = 0;
 };
 
+class SingleChildConstruct : public Construct {
+
+public:
+    Construct *elem;
+    virtual void serialize(ostream &s, int level = 0) const;
+};
+
+
+class MultiOpConstruct : public Construct {
+
+public:
+    vector<pair<Op, Construct *>> elems;
+    virtual void serialize(ostream &s, int level = 0) const;
+};
+
 inline ostream &operator<<(ostream &s, const Construct &c)
 {
     c.serialize(s);
@@ -53,36 +68,26 @@ public:
 };
 
 
-class Expr01 : public Construct {
+class Expr01 : public SingleChildConstruct {
 
 public:
-    Construct *value;
-
     virtual ~Expr01() = default;
 
     virtual EvalValue eval(EvalContext *ctx) const {
-        return value->eval(ctx);
+        return elem->eval(ctx);
     }
-
-    virtual void serialize(ostream &s, int level = 0) const;
 };
 
-class Expr03 : public Construct {
+class Expr03 : public MultiOpConstruct {
 
 public:
-    vector<pair<Op, Expr01 *>> elems;
-
     virtual ~Expr03() = default;
     virtual EvalValue eval(EvalContext *ctx) const;
-    virtual void serialize(ostream &s, int level = 0) const;
 };
 
-class Expr04 : public Construct {
+class Expr04 : public MultiOpConstruct {
 
 public:
-    vector<pair<Op, Expr03 *>> elems;
-
     virtual ~Expr04() = default;
     virtual EvalValue eval(EvalContext *ctx) const;
-    virtual void serialize(ostream &s, int level = 0) const;
 };

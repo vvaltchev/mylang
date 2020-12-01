@@ -2,19 +2,27 @@
 
 #include "syntax.h"
 
-template <class T>
-void generic_serialize(const T *obj,
-                       const char *name,
-                       ostream &s,
-                       int level)
+void SingleChildConstruct::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
 
     s << indent;
-    s << name;
-    s << "(\n";
+    s << "Expr(" << endl;
+    elem->serialize(s, level + 1);
+    s << endl;
+    s << string(level * 2, ' ');
+    s << ")";
+}
 
-    for (const auto &[op, e] : obj->elems) {
+void
+MultiOpConstruct::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "MultiOpExpr(\n";
+
+    for (const auto &[op, e] : elems) {
 
         if (op != Op::invalid) {
             s << string((level + 1) * 2, ' ');
@@ -37,18 +45,6 @@ void LiteralInt::serialize(ostream &s, int level) const
     s << indent;
     s << string("Int(");
     s << to_string(value);
-    s << ")";
-}
-
-void Expr01::serialize(ostream &s, int level) const
-{
-    string indent(level * 2, ' ');
-
-    s << indent;
-    s << "Expr01(" << endl;
-    value->serialize(s, level + 1);
-    s << endl;
-    s << string(level * 2, ' ');
     s << ")";
 }
 
@@ -80,11 +76,6 @@ EvalValue Expr03::eval(EvalContext *ctx) const
     return val;
 }
 
-void Expr03::serialize(ostream &s, int level) const
-{
-    generic_serialize(this, "Expr03", s, level);
-}
-
 EvalValue Expr04::eval(EvalContext *ctx) const
 {
     long val = 0;
@@ -100,9 +91,4 @@ EvalValue Expr04::eval(EvalContext *ctx) const
     }
 
     return val;
-}
-
-void Expr04::serialize(ostream &s, int level) const
-{
-    generic_serialize(this, "Expr04", s, level);
 }

@@ -98,15 +98,15 @@ void pExpectOp(Context &c, Op exp)
 Expr01 *pExpr01(Context &c)
 {
     Expr01 *ret = new Expr01;
-    Construct *v;
+    Construct *e;
 
-    if (pAcceptLiteralInt(c, v)) {
+    if (pAcceptLiteralInt(c, e)) {
 
-        ret->value = v;
+        ret->elem = e;
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        ret->value = pExpr04(c);
+        ret->elem = pExpr04(c);
         pExpectOp(c, Op::parenR);
 
     } else {

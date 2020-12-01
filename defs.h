@@ -95,12 +95,6 @@ public:
 
         return type == rhs.type;
     }
-
-    // operator string() const {
-    //     stringstream ss;
-    //     ss << "Tok(" << type << "): '" << value << "'";
-    //     return ss.str();
-    // }
 };
 
 inline ostream &operator<<(ostream &s, const Tok &t)
