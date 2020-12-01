@@ -28,7 +28,9 @@ public:
 class Construct {
 
 public:
-    Construct() = default;
+    const char *const name;
+
+    Construct(const char *name) : name(name) { }
     virtual ~Construct() = default;
     virtual EvalValue eval(EvalContext *) const = 0;
     virtual void serialize(ostream &s, int level = 0) const = 0;
@@ -38,6 +40,8 @@ class SingleChildConstruct : public Construct {
 
 public:
     unique_ptr<Construct> elem;
+
+    SingleChildConstruct(const char *name) : Construct(name) { }
 
     virtual EvalValue eval(EvalContext *ctx) const {
         return elem->eval(ctx);
@@ -51,6 +55,8 @@ class MultiOpConstruct : public Construct {
 
 public:
     vector<pair<Op, unique_ptr<Construct>>> elems;
+
+    MultiOpConstruct(const char *name) : Construct(name) { }
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -58,6 +64,8 @@ class MultiElemConstruct : public Construct {
 
 public:
     vector<unique_ptr<Construct>> elems;
+
+    MultiElemConstruct(const char *name) : Construct(name) { }
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -72,7 +80,7 @@ class Literal : public Construct {
 public:
     long value;
 
-    Literal(long v) : value(v) { }
+    Literal(long v) : Construct("Literal"), value(v) { }
 };
 
 class LiteralInt : public Literal {
@@ -89,30 +97,45 @@ public:
 };
 
 
-class Expr01 : public SingleChildConstruct { };
+class Expr01 : public SingleChildConstruct {
+
+public:
+    Expr01() : SingleChildConstruct("Expr01") { }
+};
 
 class Expr03 : public MultiOpConstruct {
 
 public:
+
+    Expr03() : MultiOpConstruct("Expr03") { }
     virtual EvalValue eval(EvalContext *ctx) const;
 };
 
 class Expr04 : public MultiOpConstruct {
 
 public:
+
+    Expr04() : MultiOpConstruct("Expr04") { }
     virtual EvalValue eval(EvalContext *ctx) const;
 };
 
 class Expr06 : public MultiOpConstruct {
 
 public:
+
+    Expr06() : MultiOpConstruct("Expr06") { }
     virtual EvalValue eval(EvalContext *ctx) const;
 };
 
-class Stmt : public SingleChildConstruct { };
+class Stmt : public SingleChildConstruct {
+
+public:
+    Stmt() : SingleChildConstruct("Stmt") { }
+};
 
 class Block : public MultiElemConstruct {
 
 public:
+    Block() : MultiElemConstruct("Block") { }
     virtual EvalValue eval(EvalContext *ctx) const;
 };

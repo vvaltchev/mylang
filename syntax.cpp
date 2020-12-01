@@ -8,7 +8,7 @@ void SingleChildConstruct::serialize(ostream &s, int level) const
     bool is_literal = dynamic_cast<Literal *>(elem.get()) != nullptr;
 
     s << indent;
-    s << "Expr(";
+    s << name << "(";
 
     if (!is_literal)
         s << endl;
@@ -29,7 +29,7 @@ MultiOpConstruct::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << "MultiOpExpr(\n";
+    s << name << "(\n";
 
     for (const auto &[op, e] : elems) {
 
@@ -52,7 +52,7 @@ void MultiElemConstruct::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << "MultiElem(\n";
+    s << name << "(\n";
 
     for (const auto &e: elems) {
         e->serialize(s, level + 1);
