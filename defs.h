@@ -75,6 +75,7 @@ struct InvalidTokenEx {
 
 struct SyntaxErrorEx { };
 struct DivisionByZeroEx { };
+struct TypeErrorEx { };
 
 Op get_op_type(string_view val);
 ostream &operator<<(ostream &s, TokType t);

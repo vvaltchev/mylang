@@ -41,6 +41,7 @@ public:
     Tok operator*() const { return ts.get(); }
     Op get_op() const { return ts.get().op; }
     string_view get_str() const { return ts.get().value; }
+    bool eoi() const { return ts.get() == TokType::invalid; }
 
     /* token operations with side-effect */
     Tok operator++(int) { Tok val = ts.get(); ts.next(); return val; }
@@ -190,9 +191,12 @@ pBlock(Context &c)
 {
     unique_ptr<Block> ret(new Block);
 
+    if (c.eoi())
+        return ret;
+
     ret->elems.emplace_back(pStmt(c));
 
-    while (pAcceptOp(c, Op::semicolon) && *c != TokType::invalid) {
+    while (pAcceptOp(c, Op::semicolon) && !c.eoi()) {
         ret->elems.emplace_back(pStmt(c));
     }
 
@@ -223,6 +227,9 @@ parse_args(int argc,
 
             lines.emplace_back(argv[2]);
             lexer(lines[0], tokens);
+
+            if (tokens.empty())
+                tokens.emplace_back();
 
         } else {
 
@@ -272,7 +279,7 @@ int main(int argc, char **argv)
 
         Context ctx{TokenStream(tokens)};
 
-        if (1) {
+        if (0) {
             cout << "Tokens" << endl;
             cout << "--------------------------" << endl;
 
@@ -286,7 +293,7 @@ int main(int argc, char **argv)
 
         unique_ptr<Construct> root(pBlock(ctx));
 
-        if (*ctx != TokType::invalid)
+        if (!ctx.eoi())
             throw SyntaxErrorEx();
 
         cout << *root << endl;
@@ -295,7 +302,8 @@ int main(int argc, char **argv)
         cout << "Value" << endl;
         cout << "--------------------------" << endl;
 
-        cout << root->eval(nullptr).value << endl;
+        EvalContext evalCtx;
+        cout << root->eval(&evalCtx) << endl;
 
     } catch (InvalidTokenEx e) {
 

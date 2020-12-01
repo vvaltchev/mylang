@@ -2,6 +2,7 @@
 
 #pragma once
 #include "defs.h"
+#include <variant>
 
 class Literal;
 class LiteralInt;
@@ -15,15 +16,19 @@ class Block;
 class EvalValue {
 
 public:
-    long value;
+    variant<nullptr_t, long> value;
 
-    EvalValue() = default;
+    EvalValue() : value(nullptr) { }
     EvalValue(long v) : value(v) { }
 };
+
+ostream &operator<<(ostream &s, const EvalValue &c);
 
 class EvalContext {
 
 public:
+
+    /* TODO: add context variables */
 };
 
 class Construct {

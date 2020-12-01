@@ -2,6 +2,16 @@
 
 #include "syntax.h"
 
+ostream &operator<<(ostream &s, const EvalValue &c)
+{
+    if (holds_alternative<nullptr_t>(c.value))
+        s << "<NoValue>";
+    else if (holds_alternative<long>(c.value))
+        s << get<long>(c.value);
+
+    return s;
+}
+
 void SingleChildConstruct::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
@@ -73,6 +83,19 @@ void LiteralInt::serialize(ostream &s, int level) const
     s << ")";
 }
 
+template <class T>
+T EvalAs(EvalContext *ctx, Construct *c)
+{
+    try {
+
+        return get<T>(c->eval(ctx).value);
+
+    } catch (bad_variant_access *) {
+
+        throw TypeErrorEx();
+    }
+}
+
 EvalValue Expr03::eval(EvalContext *ctx) const
 {
     long val = 1;
@@ -83,11 +106,11 @@ EvalValue Expr03::eval(EvalContext *ctx) const
         switch (op) {
 
             case Op::times:
-                val *= e->eval(ctx).value;
+                val *= EvalAs<long>(ctx, e.get());
                 break;
 
             case Op::div:
-                tmp = e->eval(ctx).value;
+                tmp = EvalAs<long>(ctx, e.get());
 
                 if (tmp == 0)
                     throw DivisionByZeroEx();
@@ -96,7 +119,7 @@ EvalValue Expr03::eval(EvalContext *ctx) const
                 break;
 
             case Op::invalid:
-                val = e->eval(ctx).value;
+                val = EvalAs<long>(ctx, e.get());
                 break;
 
             default:
@@ -115,13 +138,13 @@ EvalValue Expr04::eval(EvalContext *ctx) const
 
         switch (op) {
             case Op::plus:
-                val += e->eval(ctx).value;
+                val += EvalAs<long>(ctx, e.get());
                 break;
             case Op::minus:
-                val -= e->eval(ctx).value;
+                val -= EvalAs<long>(ctx, e.get());
                 break;
             case Op::invalid:
-                val = e->eval(ctx).value;
+                val = EvalAs<long>(ctx, e.get());
                 break;
             default:
                 SyntaxErrorEx();
@@ -140,19 +163,19 @@ EvalValue Expr06::eval(EvalContext *ctx) const
         switch (op) {
 
             case Op::lt:
-                val = val < e->eval(ctx).value;
+                val = val < EvalAs<long>(ctx, e.get());
                 break;
             case Op::gt:
-                val = val > e->eval(ctx).value;
+                val = val > EvalAs<long>(ctx, e.get());
                 break;
             case Op::le:
-                val = val <= e->eval(ctx).value;
+                val = val <= EvalAs<long>(ctx, e.get());
                 break;
             case Op::ge:
-                val = val >= e->eval(ctx).value;
+                val = val >= EvalAs<long>(ctx, e.get());
                 break;
             case Op::invalid:
-                val = e->eval(ctx).value;
+                val = EvalAs<long>(ctx, e.get());
                 break;
             default:
                 throw SyntaxErrorEx();
