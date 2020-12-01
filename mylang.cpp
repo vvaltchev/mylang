@@ -2,6 +2,7 @@
 
 #include "defs.h"
 #include "syntax.h"
+#include <initializer_list>
 
 class TokenStream {
 
@@ -120,64 +121,59 @@ Construct *pExpr01(Context &c)
     return ret;
 }
 
-Construct *pExpr03(Context &c)
+Op AcceptOneOf(Context &c, initializer_list<Op> list)
 {
-    Expr03 *ret = new Expr03;
+    for (auto op : list) {
+        if (pAcceptOp(c, op))
+            return op;
+    }
+
+    return Op::invalid;
+}
+
+template <class ExprT, bool allow_op_first = false>
+Construct *
+pExprGeneric(Context &c,
+             Construct *(*lowerExpr)(Context&),
+             initializer_list<Op> ops)
+{
+    ExprT *ret = new ExprT;
     Construct *e;
+    Op op = Op::invalid;
 
-    e = pExpr01(c);
-    ret->elems.emplace_back(Op::invalid, e);
+    if (allow_op_first)
+        op = AcceptOneOf(c, ops);
 
-    while (*c == Op::times || *c == Op::div) {
-        Op op = c.get_op();
-        c++;
-        e = pExpr01(c);
+    e = lowerExpr(c);
+    ret->elems.emplace_back(op, e);
+
+    while ((op = AcceptOneOf(c, ops)) != Op::invalid) {
+        e = lowerExpr(c);
         ret->elems.emplace_back(op, e);
     }
 
     return ret;
 }
 
+Construct *pExpr03(Context &c)
+{
+    return pExprGeneric<Expr03>(
+        c, pExpr01, {Op::times, Op::div}
+    );
+}
+
 Construct *pExpr04(Context &c)
 {
-    Expr04 *e = new Expr04();
-    Op op = Op::invalid;
-    Construct *t;
-
-    if (*c == Op::plus || *c == Op::minus) {
-        op = c.get_op();
-        c++;
-    }
-
-    t = pExpr03(c);
-    e->elems.emplace_back(op, t);
-
-    while (*c == Op::plus || *c == Op::minus) {
-        op = c.get_op();
-        c++;
-        t = pExpr03(c);
-        e->elems.emplace_back(op, t);
-    }
-
-    return e;
+    return pExprGeneric<Expr04, true>(
+        c, pExpr03, {Op::plus, Op::minus}
+    );
 }
 
 Construct *pExpr06(Context &c)
 {
-    Expr06 *ret = new Expr06;
-    Construct *t;
-
-    t = pExpr04(c);
-    ret->elems.emplace_back(Op::invalid, t);
-
-    while (*c == Op::lt || *c == Op::gt || *c == Op::le || *c == Op::ge) {
-        Op op = c.get_op();
-        c++;
-        t = pExpr04(c);
-        ret->elems.emplace_back(op, t);
-    }
-
-    return ret;
+    return pExprGeneric<Expr06>(
+        c, pExpr04, {Op::lt, Op::gt, Op::le, Op::ge}
+    );
 }
 
 // ----------- Recursive Descent Parser [end] -------------
@@ -265,7 +261,7 @@ int main(int argc, char **argv)
         cout << "Syntax tree" << endl;
         cout << "--------------------------" << endl;
 
-        Construct *root = pExpr06(ctx);
+        Construct *root = pExprTop(ctx);
         cout << *root << endl;
 
         cout << endl;
