@@ -53,9 +53,14 @@ bool pAcceptOp(Context &c, Op exp);
 void pExpectLiteralInt(Context &c, Construct *&v);
 void pExpectOp(Context &c, Op exp);
 
-Factor *pFactor(Context &c);
-Term *pTerm(Context &c);
-Expr *pExpr(Context &c);
+/*
+ * Parse functions using the C Operator Precedence.
+ * Note: this simple language has just no operators for several levels.
+ */
+
+Expr01 *pExpr01(Context &c); // ops: ()
+Expr03 *pExpr03(Context &c); // ops: *, /
+Expr04 *pExpr04(Context &c); // ops: +, -
 
 bool pAcceptLiteralInt(Context &c, Construct *&v)
 {
@@ -90,9 +95,9 @@ void pExpectOp(Context &c, Op exp)
         throw SyntaxErrorEx();
 }
 
-Factor *pFactor(Context &c)
+Expr01 *pExpr01(Context &c)
 {
-    Factor *ret = new Factor;
+    Expr01 *ret = new Expr01;
     Construct *v;
 
     if (pAcceptLiteralInt(c, v)) {
@@ -101,7 +106,7 @@ Factor *pFactor(Context &c)
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        ret->value = pExpr(c);
+        ret->value = pExpr04(c);
         pExpectOp(c, Op::parenR);
 
     } else {
@@ -112,43 +117,43 @@ Factor *pFactor(Context &c)
     return ret;
 }
 
-Term *pTerm(Context &c)
+Expr03 *pExpr03(Context &c)
 {
-    Term *ret = new Term;
-    Factor *f;
+    Expr03 *ret = new Expr03;
+    Expr01 *f;
 
-    f = pFactor(c);
-    ret->factors.emplace_back(Op::invalid, f);
+    f = pExpr01(c);
+    ret->elems.emplace_back(Op::invalid, f);
 
     while (*c == Op::times || *c == Op::div) {
         Op op = c.get_op();
         c++;
-        f = pFactor(c);
-        ret->factors.emplace_back(op, f);
+        f = pExpr01(c);
+        ret->elems.emplace_back(op, f);
     }
 
     return ret;
 }
 
-Expr *pExpr(Context &c)
+Expr04 *pExpr04(Context &c)
 {
-    Expr *e = new Expr();
+    Expr04 *e = new Expr04();
     Op op = Op::invalid;
-    Term *t;
+    Expr03 *t;
 
     if (*c == Op::plus || *c == Op::minus) {
         op = c.get_op();
         c++;
     }
 
-    t = pTerm(c);
-    e->terms.emplace_back(op, t);
+    t = pExpr03(c);
+    e->elems.emplace_back(op, t);
 
     while (*c == Op::plus || *c == Op::minus) {
         op = c.get_op();
         c++;
-        t = pTerm(c);
-        e->terms.emplace_back(op, t);
+        t = pExpr03(c);
+        e->elems.emplace_back(op, t);
     }
 
     return e;
@@ -239,7 +244,7 @@ int main(int argc, char **argv)
         cout << "Syntax tree" << endl;
         cout << "--------------------------" << endl;
 
-        Construct *c = pExpr(ctx);
+        Construct *c = pExpr04(ctx);
         cout << *c << endl;
 
         cout << endl;

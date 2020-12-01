@@ -4,9 +4,9 @@
 #include "defs.h"
 
 class LiteralInt;
-class Factor;
-class Term;
-class Expr;
+class Expr01;
+class Expr03;
+class Expr04;
 
 class EvalValue {
 
@@ -53,12 +53,12 @@ public:
 };
 
 
-class Factor : public Construct {
+class Expr01 : public Construct {
 
 public:
     Construct *value;
 
-    virtual ~Factor() = default;
+    virtual ~Expr01() = default;
 
     virtual EvalValue eval(EvalContext *ctx) const {
         return value->eval(ctx);
@@ -67,22 +67,22 @@ public:
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
-class Term : public Construct {
+class Expr03 : public Construct {
 
 public:
-    vector<pair<Op, Factor *>> factors;
+    vector<pair<Op, Expr01 *>> elems;
 
-    virtual ~Term() = default;
+    virtual ~Expr03() = default;
     virtual EvalValue eval(EvalContext *ctx) const;
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
-class Expr : public Construct {
+class Expr04 : public Construct {
 
 public:
-    vector<pair<Op, Term *>> terms;
+    vector<pair<Op, Expr03 *>> elems;
 
-    virtual ~Expr() = default;
+    virtual ~Expr04() = default;
     virtual EvalValue eval(EvalContext *ctx) const;
     virtual void serialize(ostream &s, int level = 0) const;
 };

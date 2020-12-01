@@ -2,6 +2,34 @@
 
 #include "syntax.h"
 
+template <class T>
+void generic_serialize(const T *obj,
+                       const char *name,
+                       ostream &s,
+                       int level)
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name;
+    s << "(\n";
+
+    for (const auto &[op, e] : obj->elems) {
+
+        if (op != Op::invalid) {
+            s << string((level + 1) * 2, ' ');
+            s << "Op '" << OpToString[(int)op] << "'";
+            s << endl;
+        }
+
+        e->serialize(s, level + 1);
+        s << endl;
+    }
+
+    s << indent;
+    s << ")";
+}
+
 void LiteralInt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
@@ -12,107 +40,69 @@ void LiteralInt::serialize(ostream &s, int level) const
     s << ")";
 }
 
-void Factor::serialize(ostream &s, int level) const
+void Expr01::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
 
     s << indent;
-    s << "Factor(" << endl;
+    s << "Expr01(" << endl;
     value->serialize(s, level + 1);
     s << endl;
     s << string(level * 2, ' ');
     s << ")";
 }
 
-EvalValue Term::eval(EvalContext *ctx) const
+EvalValue Expr03::eval(EvalContext *ctx) const
 {
     long val = 1;
 
-    for (const auto &[op, f] : factors) {
+    for (const auto &[op, e] : elems) {
 
         if (op == Op::times) {
 
-            val *= f->eval(ctx).value;
+            val *= e->eval(ctx).value;
 
         } else if (op == Op::div) {
 
-            long e = f->eval(ctx).value;
+            long val = e->eval(ctx).value;
 
-            if (e == 0)
+            if (val == 0)
                 throw DivisionByZeroEx();
 
-            val /= e;
+            val /= val;
 
-        } else {
+        } else if (op == Op::invalid) {
 
-            val = f->eval(ctx).value;
+            val = e->eval(ctx).value;
         }
     }
 
     return val;
 }
 
-void Term::serialize(ostream &s, int level) const
+void Expr03::serialize(ostream &s, int level) const
 {
-    string indent(level * 2, ' ');
-
-    s << indent;
-    s << "Term(\n";
-
-    for (const auto &[op, f] : factors) {
-
-        if (op != Op::invalid) {
-            s << string((level + 1) * 2, ' ');
-            s << "Op '" << OpToString[(int)op] << "'";
-            s << endl;
-        }
-
-        f->serialize(s, level + 1);
-        s << endl;
-    }
-
-    s << indent;
-    s << ")";
+    generic_serialize(this, "Expr03", s, level);
 }
 
-EvalValue Expr::eval(EvalContext *ctx) const
+EvalValue Expr04::eval(EvalContext *ctx) const
 {
     long val = 0;
 
-    for (const auto &[op, t] : terms) {
+    for (const auto &[op, e] : elems) {
 
         if (op == Op::plus)
-            val += t->eval(ctx).value;
+            val += e->eval(ctx).value;
         else if (op == Op::minus)
-            val -= t->eval(ctx).value;
+            val -= e->eval(ctx).value;
         else if (op == Op::invalid)
-            val = t->eval(ctx).value;
-
+            val = e->eval(ctx).value;
     }
 
     return val;
 }
 
-void Expr::serialize(ostream &s, int level) const
+void Expr04::serialize(ostream &s, int level) const
 {
-    string indent(level * 2, ' ');
-
-    s << indent;
-    s << "Expr(";
-    s << endl;
-
-    for (const auto &[op, t] : terms) {
-
-        if (op != Op::invalid) {
-            s << string((level + 1) * 2, ' ');
-            s << "Op '" << OpToString[(int)op] << "'";
-            s << endl;
-        }
-
-        t->serialize(s, level + 1);
-        s << endl;
-    }
-
-    s << indent;
-    s << ")";
+    generic_serialize(this, "Expr04", s, level);
 }
