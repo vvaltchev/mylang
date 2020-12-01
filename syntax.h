@@ -3,11 +3,13 @@
 #pragma once
 #include "defs.h"
 
+class Literal;
 class LiteralInt;
 class Expr01;
 class Expr03;
 class Expr04;
 class Expr06;
+class Stmt;
 
 class EvalValue {
 
@@ -35,6 +37,11 @@ class SingleChildConstruct : public Construct {
 
 public:
     unique_ptr<Construct> elem;
+
+    virtual EvalValue eval(EvalContext *ctx) const {
+        return elem->eval(ctx);
+    }
+
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -74,13 +81,7 @@ public:
 };
 
 
-class Expr01 : public SingleChildConstruct {
-
-public:
-    virtual EvalValue eval(EvalContext *ctx) const {
-        return elem->eval(ctx);
-    }
-};
+class Expr01 : public SingleChildConstruct { };
 
 class Expr03 : public MultiOpConstruct {
 
@@ -99,3 +100,5 @@ class Expr06 : public MultiOpConstruct {
 public:
     virtual EvalValue eval(EvalContext *ctx) const;
 };
+
+class Stmt : public SingleChildConstruct { };

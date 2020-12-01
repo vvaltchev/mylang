@@ -176,6 +176,17 @@ Construct *pExpr06(Context &c)
     );
 }
 
+Construct *pStmt(Context &c)
+{
+    Stmt *ret = new Stmt;
+    ret->elem.reset(pExprTop(c));
+
+    if (*c != TokType::invalid)
+        pExpectOp(c, Op::semicolon);
+
+    return ret;
+}
+
 // ----------- Recursive Descent Parser [end] -------------
 
 void help()
@@ -261,7 +272,7 @@ int main(int argc, char **argv)
         cout << "Syntax tree" << endl;
         cout << "--------------------------" << endl;
 
-        unique_ptr<Construct> root(pExprTop(ctx));
+        unique_ptr<Construct> root(pStmt(ctx));
 
         if (*ctx != TokType::invalid)
             throw SyntaxErrorEx();
