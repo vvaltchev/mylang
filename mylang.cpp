@@ -116,11 +116,11 @@ Construct *pExpr01(Context &c)
 
     if (pAcceptLiteralInt(c, e)) {
 
-        ret->elem = e;
+        ret->elem.reset(e);
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        ret->elem = pExprTop(c);
+        ret->elem.reset(pExprTop(c));
         pExpectOp(c, Op::parenR);
 
     } else {
@@ -261,7 +261,7 @@ int main(int argc, char **argv)
         cout << "Syntax tree" << endl;
         cout << "--------------------------" << endl;
 
-        Construct *root = pExprTop(ctx);
+        unique_ptr<Construct> root(pExprTop(ctx));
 
         if (*ctx != TokType::invalid)
             throw SyntaxErrorEx();
@@ -273,8 +273,6 @@ int main(int argc, char **argv)
         cout << "--------------------------" << endl;
 
         cout << root->eval(nullptr).value << endl;
-
-        delete root;
 
     } catch (InvalidTokenEx e) {
 

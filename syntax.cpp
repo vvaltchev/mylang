@@ -5,7 +5,7 @@
 void SingleChildConstruct::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
-    bool is_literal = dynamic_cast<Literal *>(elem) != nullptr;
+    bool is_literal = dynamic_cast<Literal *>(elem.get()) != nullptr;
 
     s << indent;
     s << "Expr(";

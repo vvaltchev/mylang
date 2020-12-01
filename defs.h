@@ -5,6 +5,7 @@
 #include <array>
 #include <string>
 #include <vector>
+#include <memory>
 #include <iostream>
 #include <string_view>
 #include <sstream>
@@ -17,7 +18,7 @@
  */
 using namespace std;
 
-enum class TokType {
+enum class TokType : int {
 
     invalid = 0,   /* no token */
 
@@ -27,7 +28,7 @@ enum class TokType {
     unknown = 4,   /* something else (e.g. ?) */
 };
 
-enum class Op {
+enum class Op : int {
 
     invalid = 0,
 

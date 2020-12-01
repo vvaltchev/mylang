@@ -34,12 +34,7 @@ public:
 class SingleChildConstruct : public Construct {
 
 public:
-    Construct *elem;
-
-    virtual ~SingleChildConstruct() {
-        delete elem;
-    }
-
+    unique_ptr<Construct> elem;
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -47,15 +42,7 @@ public:
 class MultiOpConstruct : public Construct {
 
 public:
-    vector<pair<Op, Construct *>> elems;
-
-    virtual ~MultiOpConstruct() {
-
-        for (const auto &[op, e] : elems) {
-            delete e;
-        }
-    }
-
+    vector<pair<Op, unique_ptr<Construct>>> elems;
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
