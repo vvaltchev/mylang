@@ -129,7 +129,7 @@ int main(int argc, char **argv)
             cout << "Syntax tree" << endl;
             cout << "--------------------------" << endl;
             cout << *root << endl;
-            cout << endl;
+            cout << "--------------------------" << endl;
         }
 
         if (!ctx.eoi())
@@ -146,18 +146,37 @@ int main(int argc, char **argv)
 
     } catch (const SyntaxErrorEx &e) {
 
+        cout << "SyntaxError";
+
         if (e.loc.line) {
 
-            cout << "SyntaxError at line "
+            cout << " at line "
                  << e.loc.line << ", col " << e.loc.col
-                 << ": " << e.msg;
+                 << ": ";
+
+        } else if (e.loc.col) {
+
+            cout << " at col " << e.loc.col << ": ";
 
         } else {
-            cout << "SyntaxError: " << e.msg;
+            cout << ": ";
         }
 
-        if (e.tok)
-            cout << " '" << e.tok->value << "'";
+        cout << e.msg;
+
+        if (e.tok) {
+
+            cout << " '";
+
+            if (e.tok->op != Op::invalid)
+                cout << OpString[(int)e.tok->op];
+            else if (e.tok->kw != Keyword::kw_invalid)
+                cout << KwString[(int)e.tok->kw];
+            else
+                cout << e.tok->value;
+
+            cout << "'";
+        }
 
         cout << endl;
         return 1;

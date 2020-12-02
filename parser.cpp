@@ -278,6 +278,10 @@ pBlock(ParseContext &c)
     ret->elems.emplace_back(pStmt(c));
 
     while (pAcceptOp(c, Op::semicolon) && !c.eoi()) {
+
+        if (pAcceptOp(c, Op::semicolon))
+            continue; /* skip multiple ';' */
+
         ret->elems.emplace_back(pStmt(c));
     }
 
