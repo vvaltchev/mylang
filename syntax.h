@@ -223,6 +223,14 @@ public:
     virtual EvalValue eval(EvalContext *ctx) const;
 };
 
+class Expr07 : public MultiOpConstruct {
+
+public:
+
+    Expr07() : MultiOpConstruct("Expr07") { }
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
 class Expr14 : public Construct {
 
 public:

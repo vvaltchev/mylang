@@ -66,7 +66,9 @@ unique_ptr<Construct> pExpr02(Context &c); // ops: + (unary), - (unary), !
 unique_ptr<Construct> pExpr03(Context &c); // ops: *, /
 unique_ptr<Construct> pExpr04(Context &c); // ops: +, -
 unique_ptr<Construct> pExpr06(Context &c); // ops: <, >, <=, >=
+unique_ptr<Construct> pExpr07(Context &c); // ops: ==, !=
 unique_ptr<Construct> pExpr14(Context &c); // ops: =
+
 
 inline unique_ptr<Construct> pExprTop(Context &c) { return pExpr14(c); }
 
@@ -274,19 +276,27 @@ pExpr06(Context &c)
     );
 }
 
+unique_ptr<Construct>
+pExpr07(Context &c)
+{
+    return pExprGeneric<Expr07>(
+        c, pExpr06, {Op::eq, Op::noteq}
+    );
+}
+
 unique_ptr<Construct> pExpr14(Context &c)
 {
     unique_ptr<Construct> lside, e;
     Op op = Op::invalid;
 
-    lside = pExpr06(c);
+    lside = pExpr07(c);
 
     if ((op = AcceptOneOf(c, {Op::assign})) != Op::invalid) {
 
         unique_ptr<Expr14> ret(new Expr14);
 
         ret->lvalue = move(lside);
-        ret->rvalue = pExpr06(c);
+        ret->rvalue = pExpr07(c);
         ret->op = op;
         return ret;
 

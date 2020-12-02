@@ -178,6 +178,31 @@ EvalValue Expr06::eval(EvalContext *ctx) const
     return val;
 }
 
+EvalValue Expr07::eval(EvalContext *ctx) const
+{
+    EvalValue val;
+
+    for (const auto &[op, e] : elems) {
+
+        switch (op) {
+
+            case Op::eq:
+                val = RValueAs<long>(val) == EvalAs<long>(ctx, e.get());
+                break;
+            case Op::noteq:
+                val = RValueAs<long>(val) != EvalAs<long>(ctx, e.get());
+                break;
+            case Op::invalid:
+                val = e->eval(ctx);
+                break;
+            default:
+                throw SyntaxErrorEx();
+        }
+    }
+
+    return val;
+}
+
 EvalValue Expr14::eval(EvalContext *ctx) const
 {
     EvalValue lval, rval = rvalue->eval(ctx);
