@@ -81,7 +81,7 @@ EvalValue Expr02::eval(EvalContext *ctx) const
             val = e->eval(ctx);
             break;
         default:
-            SyntaxErrorEx();
+            throw InternalErrorEx();
     }
 
     return val;
@@ -119,7 +119,7 @@ EvalValue Expr03::eval(EvalContext *ctx) const
                 break;
 
             default:
-                throw SyntaxErrorEx();
+                throw InternalErrorEx();
         }
     }
 
@@ -143,7 +143,7 @@ EvalValue Expr04::eval(EvalContext *ctx) const
                 val = e->eval(ctx);
                 break;
             default:
-                SyntaxErrorEx();
+                throw InternalErrorEx();
         }
     }
 
@@ -174,7 +174,7 @@ EvalValue Expr06::eval(EvalContext *ctx) const
                 val = e->eval(ctx);
                 break;
             default:
-                throw SyntaxErrorEx();
+                throw InternalErrorEx();
         }
     }
 
@@ -199,7 +199,7 @@ EvalValue Expr07::eval(EvalContext *ctx) const
                 val = e->eval(ctx);
                 break;
             default:
-                throw SyntaxErrorEx();
+                throw InternalErrorEx();
         }
     }
 
@@ -224,7 +224,7 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
     } else {
 
-        throw NotLValue();
+        throw NotLValueEx();
     }
 
     return rval;

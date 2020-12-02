@@ -108,13 +108,13 @@ bool pAcceptOp(Context &c, Op exp)
 void pExpectLiteralInt(Context &c, unique_ptr<Construct> &v)
 {
     if (!pAcceptLiteralInt(c, v))
-        throw SyntaxErrorEx();
+        throw SyntaxErrorEx("Expected integer literal");
 }
 
 void pExpectOp(Context &c, Op exp)
 {
     if (!pAcceptOp(c, exp))
-        throw SyntaxErrorEx();
+        throw SyntaxErrorEx("Expected operator");
 }
 
 Op AcceptOneOf(Context &c, initializer_list<Op> list)
@@ -189,7 +189,7 @@ pExpr01(Context &c)
 
     } else {
 
-        throw SyntaxErrorEx();
+        throw SyntaxErrorEx("Expected literal, (expr) or id");
     }
 
     return ret;
@@ -296,7 +296,7 @@ unique_ptr<Construct> pExpr14(Context &c)
         unique_ptr<Expr14> ret(new Expr14);
 
         ret->lvalue = move(lside);
-        ret->rvalue = pExpr07(c);
+        ret->rvalue = pExpr14(c);
         ret->op = op;
         return ret;
 
@@ -422,7 +422,7 @@ int main(int argc, char **argv)
         unique_ptr<Construct> root(pBlock(ctx));
 
         if (!ctx.eoi())
-            throw SyntaxErrorEx();
+            throw SyntaxErrorEx("Unexpected tokens at the end");
 
         cout << *root << endl;
         cout << endl;
@@ -437,7 +437,7 @@ int main(int argc, char **argv)
 
     } catch (const SyntaxErrorEx &e) {
 
-        cout << "SyntaxError" << endl;
+        cout << "SyntaxError: " << e.msg << endl;
 
     } catch (const DivisionByZeroEx &e) {
 
@@ -446,6 +446,10 @@ int main(int argc, char **argv)
     } catch (const UndefinedVariableEx &e) {
 
         cout << "Undefined variable '" << e.name << "'" << endl;
+
+    } catch (const InternalErrorEx &e) {
+
+        cout << "InternalErrorEx" << endl;
     }
 
     return 0;
