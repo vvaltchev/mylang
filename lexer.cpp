@@ -114,6 +114,10 @@ lexer(string_view in_str, int line, vector<Tok> &result)
             tok_start = i;
 
         const char c = in_str[i];
+
+        if (c == '#')
+            break; /* comment: stop the lexer, until the end of the line */
+
         string_view val = in_str.substr(tok_start, i - tok_start + 1);
         string_view val_until_prev = in_str.substr(tok_start, i - tok_start);
 
