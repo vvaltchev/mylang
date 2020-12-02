@@ -4,6 +4,10 @@
 #include "lexer.h"
 #include "syntax.h"
 #include <initializer_list>
+#include <cstring>
+
+static bool opt_show_tokens;
+static bool opt_show_syntax_tree;
 
 class TokenStream {
 
@@ -337,7 +341,7 @@ void help()
 {
     cout << "syntax:" << endl;
     cout << "   mylang < FILE" << endl;
-    cout << "   mylang -e EXPRESSION" << endl;
+    cout << "   mylang [-t] [-s] -e EXPRESSION" << endl;
     cout << endl;
 }
 
@@ -347,31 +351,58 @@ parse_args(int argc,
            vector<string> &lines,
            vector<Tok> &tokens)
 {
-    if (argc >= 3) {
+    string inline_text;
+    bool in_tokens = false;
 
-        string a1 = argv[1];
+    if (!argc) {
+        /* That should *never* happen */
+        cout << "Unexpected (system) error: zero arguments" << endl;
+        exit(1);
+    }
 
-        if (a1 == "-e") {
+    for (argc--, argv++; argc > 0; argc--, argv++) {
 
-            lines.emplace_back(argv[2]);
-            lexer(lines[0], tokens);
+        char *arg = argv[0];
 
-            if (tokens.empty())
-                tokens.emplace_back();
+        if (in_tokens) {
+            inline_text += arg;
+            continue;
+        }
+
+        if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
+
+            help(); exit(0);
+
+        } else if (!strcmp(arg, "-t")) {
+
+            opt_show_tokens = true;
+
+        } else if (!strcmp(arg, "-s")) {
+
+            opt_show_syntax_tree = true;
+
+        } else if (!strcmp(arg, "-e")) {
+
+            if (argc > 1) {
+                in_tokens = true;
+                continue;
+            }
+
+            help(); exit(1);
 
         } else {
 
-            help();
-            exit(1);
+            help(); exit(1);
         }
+    }
 
-    } else if (argc > 1) {
+    if (in_tokens) {
 
-        string a1 = argv[1];
-
-        if (a1 == "-h" || a1 == "--help") {
-            help();
-            exit(0);
+        if (inline_text.empty()) {
+            tokens.emplace_back();
+        } else {
+            lines.emplace_back(move(inline_text));
+            lexer(lines[0], tokens);
         }
     }
 }
@@ -407,27 +438,30 @@ int main(int argc, char **argv)
 
         Context ctx{TokenStream(tokens)};
 
-        if (1) {
+        if (opt_show_tokens) {
             cout << "Tokens" << endl;
             cout << "--------------------------" << endl;
 
             for (const auto &tok : tokens) {
                 cout << tok << endl;
             }
-        }
 
-        cout << "Syntax tree" << endl;
-        cout << "--------------------------" << endl;
+            cout << endl;
+        }
 
         unique_ptr<Construct> root(pBlock(ctx));
 
         if (!ctx.eoi())
             throw SyntaxErrorEx("Unexpected tokens at the end");
 
-        cout << *root << endl;
-        cout << endl;
+        if (opt_show_syntax_tree) {
+            cout << "Syntax tree" << endl;
+            cout << "--------------------------" << endl;
+            cout << *root << endl;
+            cout << endl;
+        }
 
-        /* Eval the script */
+        /* Run the script */
         EvalContext evalCtx;
         root->eval(&evalCtx);
 
