@@ -431,19 +431,19 @@ int main(int argc, char **argv)
         EvalContext evalCtx;
         root->eval(&evalCtx);
 
-    } catch (InvalidTokenEx e) {
+    } catch (const InvalidTokenEx &e) {
 
         cout << "Invalid token: " << e.val << endl;
 
-    } catch (SyntaxErrorEx e) {
+    } catch (const SyntaxErrorEx &e) {
 
         cout << "SyntaxError" << endl;
 
-    } catch (DivisionByZeroEx e) {
+    } catch (const DivisionByZeroEx &e) {
 
         cout << "DivisionByZeroEx" << endl;
 
-    } catch (UndefinedVariableEx e) {
+    } catch (const UndefinedVariableEx &e) {
 
         cout << "Undefined variable '" << e.name << "'" << endl;
     }

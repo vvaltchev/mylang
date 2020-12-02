@@ -7,8 +7,11 @@
 static inline EvalValue
 RValue(EvalValue v)
 {
-    if (v.isLValueP())
+    if (v.is<LValue *>())
         return v.get<LValue *>()->eval();
+
+    if (v.is<UndefinedId>())
+        throw UndefinedVariableEx{v.get<UndefinedId>().id};
 
     return v;
 }
@@ -37,7 +40,7 @@ EvalValue Identifier::eval(EvalContext *ctx) const
     auto it = ctx->vars.find(value);
 
     if (it == ctx->vars.end())
-        throw UndefinedVariableEx{value};
+        return UndefinedId{value};
 
     return EvalValue(&it->second);
 }
@@ -205,23 +208,17 @@ EvalValue Expr07::eval(EvalContext *ctx) const
 
 EvalValue Expr14::eval(EvalContext *ctx) const
 {
-    EvalValue lval, rval = rvalue->eval(ctx);
-    string new_id;
+    EvalValue lval = lvalue->eval(ctx);
+    EvalValue rval = rvalue->eval(ctx);
 
-    try {
-        lval = lvalue->eval(ctx);
-    } catch (UndefinedVariableEx e) {
-        new_id = e.name;
-    }
-
-    if (!new_id.empty()) {
+    if (lval.is<UndefinedId>()) {
 
         if (rval.is<long>())
-            ctx->vars.emplace(new_id, rval.get<long>());
+            ctx->vars.emplace(lval.get<UndefinedId>().id, rval.get<long>());
         else
             throw TypeErrorEx();
 
-    } else if (lval.isLValueP()) {
+    } else if (lval.is<LValue *>()) {
 
         lval.get<LValue *>()->put(rval);
 

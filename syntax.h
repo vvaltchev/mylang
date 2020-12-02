@@ -2,6 +2,7 @@
 
 #pragma once
 #include "lexer.h"
+#include <map>
 #include <variant>
 #include <unordered_map>
 
@@ -18,13 +19,16 @@ class Block;
 class LValue;
 class Identifier;
 
+struct UndefinedId { string_view id; };
+
 class EvalValue {
 
 public:
-    variant<nullptr_t, long, LValue *> value;
+    variant<nullptr_t, long, LValue *, UndefinedId> value;
 
     EvalValue() : value(nullptr) { }
     EvalValue(long val) : value(val) { }
+    EvalValue(const UndefinedId &val) : value(val) { }
     explicit EvalValue(LValue *val) : value(val) { }
 
     virtual ~EvalValue() = default;
@@ -37,10 +41,6 @@ public:
     template <class T>
     bool is() const {
         return holds_alternative<T>(value);
-    }
-
-    bool isLValueP() const {
-        return holds_alternative<LValue *>(value);
     }
 };
 
@@ -76,7 +76,7 @@ class EvalContext {
 
 public:
 
-    unordered_map<string, LValue> vars;
+    map<string, LValue, less<>> vars;
 };
 
 class Construct {
@@ -153,7 +153,7 @@ public:
 class Identifier : public Construct {
 
 public:
-    string value;
+    string_view value;
 
     template <class T>
     Identifier(T &&arg) : Construct("Id"), value(forward<T>(arg)) { }
