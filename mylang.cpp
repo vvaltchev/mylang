@@ -164,22 +164,26 @@ pAcceptCallExpr(Context &c, unique_ptr<Construct> &id, unique_ptr<Construct> &re
 unique_ptr<Construct>
 pExpr01(Context &c)
 {
-    unique_ptr<Expr01> ret(new Expr01);
-    unique_ptr<Construct> e;
+    unique_ptr<Construct> ret;
+    unique_ptr<Construct> e, e2;
 
     if (pAcceptLiteralInt(c, e)) {
 
-        ret->elem = move(e);
+        ret = move(e);
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        ret->elem = pExprTop(c);
+        unique_ptr<Expr01> expr(new Expr01);
+        expr->elem = pExprTop(c);
         pExpectOp(c, Op::parenR);
+        ret = move(expr);
 
     } else if (pAcceptId(c, e)) {
 
-        if (!pAcceptCallExpr(c, e, ret->elem))
-            ret->elem = move(e);
+        if (pAcceptCallExpr(c, e, e2))
+            ret = move(e2);
+        else
+            ret = move(e);
 
     } else {
 
@@ -195,13 +199,22 @@ pExprGeneric(Context &c,
              unique_ptr<Construct> (*lowerExpr)(Context&),
              initializer_list<Op> ops)
 {
-    unique_ptr<ExprT> ret(new ExprT);
-    Op op = Op::invalid;
-    ret->elems.emplace_back(op, lowerExpr(c));
+    Op op;
+    unique_ptr<ExprT> ret;
+    unique_ptr<Construct> lowerE = lowerExpr(c);
 
     while ((op = AcceptOneOf(c, ops)) != Op::invalid) {
+
+        if (!ret) {
+            ret.reset(new ExprT);
+            ret->elems.emplace_back(Op::invalid, move(lowerE));
+        }
+
         ret->elems.emplace_back(op, lowerExpr(c));
     }
+
+    if (!ret)
+        return lowerE;
 
     return ret;
 }
@@ -209,7 +222,7 @@ pExprGeneric(Context &c,
 unique_ptr<Construct>
 pExpr02(Context &c)
 {
-    unique_ptr<Expr02> ret(new Expr02);
+    unique_ptr<Expr02> ret;
     unique_ptr<Construct> elem;
     Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::opnot});
 
@@ -229,6 +242,10 @@ pExpr02(Context &c)
         elem = pExpr01(c);
     }
 
+    if (op == Op::invalid)
+        return elem;
+
+    ret.reset(new Expr02);
     ret->elems.emplace_back(op, move(elem));
     return ret;
 }
