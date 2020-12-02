@@ -16,7 +16,8 @@ unique_ptr<Construct> pExpr04(ParseContext &c); // ops: +, -
 unique_ptr<Construct> pExpr06(ParseContext &c); // ops: <, >, <=, >=
 unique_ptr<Construct> pExpr07(ParseContext &c); // ops: ==, !=
 unique_ptr<Construct> pExpr14(ParseContext &c); // ops: =
-
+unique_ptr<Construct> pStmt(ParseContext &c);   // expression statment e.g. "a = 3;"
+unique_ptr<Construct> pBlock(ParseContext &c);  // code block { }
 
 inline unique_ptr<Construct> pExprTop(ParseContext &c) { return pExpr14(c); }
 

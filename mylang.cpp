@@ -152,15 +152,14 @@ int main(int argc, char **argv)
                  << e.loc.line << ", col " << e.loc.col
                  << ": " << e.msg;
 
-            if (e.tok)
-                cout << " '" << e.tok->value << "'";
-
-            cout << endl;
-
         } else {
-            cout << "SyntaxError: " << e.msg << endl;
+            cout << "SyntaxError: " << e.msg;
         }
 
+        if (e.tok)
+            cout << " '" << e.tok->value << "'";
+
+        cout << endl;
         return 1;
 
     } catch (const DivisionByZeroEx &e) {

@@ -3,89 +3,67 @@
 #include "errors.h"
 #include "lexer.h"
 
-#include <set>
+#include <map>
 #include <vector>
 
 #include <cctype>
 
 using namespace std;
 
-static const set<string, less<>> operators = [] {
-    return set<string, less<>>(
-        OpString.begin() + 1, OpString.end()
-    );
+static const map<string, Op, less<>> operators = [] {
+
+    map<string, Op, less<>> ret;
+
+    for (size_t i = 1; i < OpString.size(); i++)
+        ret.emplace(OpString[i], (Op)i);
+
+    return ret;
 }();
+
+static const map<string, Keyword, less<>> keywords = [] {
+
+    map<string, Keyword, less<>> ret;
+
+    for (size_t i = 1; i < KwString.size(); i++)
+        ret.emplace(KwString[i], (Keyword)i);
+
+    return ret;
+}();
+
+static Keyword get_keyword(string_view val)
+{
+    if (!val.empty()) {
+
+        auto it = keywords.find(val);
+
+        if (it != keywords.end())
+            return it->second;
+    }
+
+    return Keyword::kw_invalid;
+}
+
+static Op get_op_type(string_view val)
+{
+    if (!val.empty()) {
+
+        auto it = operators.find(val);
+
+        if (it != operators.end())
+            return it->second;
+    }
+
+    return Op::invalid;
+}
 
 inline bool is_operator(string_view s)
 {
-    return operators.find(s) != operators.end();
+    return get_op_type(s) != Op::invalid;
 }
 
-Op get_op_type(string_view val)
+inline bool is_keyword(string_view s)
 {
-    if (val.empty())
-        return Op::invalid;
-
-    switch (val[0]) {
-
-        case '+':
-            return Op::plus;
-
-        case '-':
-            return Op::minus;
-
-        case '*':
-            return Op::times;
-
-        case '/':
-            return Op::div;
-
-        case '(':
-            return Op::parenL;
-
-        case ')':
-            return Op::parenR;
-
-        case ';':
-            return Op::semicolon;
-
-        case ',':
-            return Op::comma;
-
-        case '%':
-            return Op::mod;
-
-        case '!':
-
-            if (val.length() > 1 && val[1] == '=')
-                return Op::noteq;
-
-            return Op::opnot;
-
-        case '=':
-
-            if (val.length() > 1 && val[1] == '=')
-                return Op::eq;
-
-            return Op::assign;
-
-        case '<':
-
-            if (val.length() > 1 && val[1] == '=')
-                return Op::le;
-
-            return Op::lt;
-
-        case '>':
-
-            if (val.length() > 1 && val[1] == '=')
-                return Op::ge;
-
-            return Op::gt;
-
-        default:
-            return Op::invalid;
-    }
+    return get_keyword(s) != Keyword::kw_invalid;
 }
 
 ostream &operator<<(ostream &s, TokType t)
@@ -96,10 +74,46 @@ ostream &operator<<(ostream &s, TokType t)
         "num",
         "id_",
         "op_",
+        "kw_",
         "unk",
     };
 
     return s << tt_str[(int)t];
+}
+
+ostream &operator<<(ostream &s, const Tok &t)
+{
+    s << "Tok(" << t.type << "): '";
+
+    if (t.type == TokType::op)
+        s << OpString[(int)t.op];
+    else if (t.type == TokType::kw)
+        s << KwString[(int)t.kw];
+    else
+        s << t.value;
+
+    s << "'";
+    return s;
+}
+
+static void
+append_token(vector<Tok> &result, TokType tt, int ln, int start, string_view val)
+{
+    if (tt == TokType::id) {
+
+        Keyword kw = get_keyword(val);
+
+        if (kw != Keyword::kw_invalid) {
+            result.emplace_back(TokType::kw, Loc(ln, start + 1), kw);
+            return;
+        }
+    }
+
+    result.emplace_back(
+        tt,
+        Loc(ln, start + 1),
+        val
+    );
 }
 
 void
@@ -114,21 +128,21 @@ lexer(string_view in_str, int line, vector<Tok> &result)
             tok_start = i;
 
         const char c = in_str[i];
+        const string_view val = in_str.substr(tok_start, i - tok_start + 1);
 
         if (c == '#')
             break; /* comment: stop the lexer, until the end of the line */
 
-        string_view val = in_str.substr(tok_start, i - tok_start + 1);
-        string_view val_until_prev = in_str.substr(tok_start, i - tok_start);
-
         if (isspace(c) || is_operator(string_view(&c, 1))) {
 
             if (tok_type != TokType::invalid) {
-                result.emplace_back(
-                    tok_type,
-                    Loc(line, tok_start+1),
-                    val_until_prev
-                );
+
+                append_token(result,
+                             tok_type,
+                             line,
+                             tok_start,
+                             in_str.substr(tok_start, i - tok_start));
+
                 tok_type = TokType::invalid;
             }
 
@@ -136,8 +150,7 @@ lexer(string_view in_str, int line, vector<Tok> &result)
 
                 string_view op = in_str.substr(i, 1);
 
-                if (i + 1 < in_str.length() &&
-                    is_operator(in_str.substr(i, 2)))
+                if (i + 1 < in_str.length() && is_operator(in_str.substr(i, 2)))
                 {
                     /*
                      * Handle two-chars wide operators. Note: it is required,
@@ -153,7 +166,7 @@ lexer(string_view in_str, int line, vector<Tok> &result)
                     i++;
                 }
 
-                result.emplace_back(TokType::op, Loc(line, i+1), op);
+                result.emplace_back(TokType::op, Loc(line, i+1), get_op_type(op));
             }
 
         } else if (isalnum(c) || c == '_') {
@@ -183,10 +196,12 @@ lexer(string_view in_str, int line, vector<Tok> &result)
         }
     }
 
-    if (tok_type != TokType::invalid)
-        result.emplace_back(
-            tok_type,
-            Loc(line, tok_start+1),
-            in_str.substr(tok_start, i - tok_start)
-        );
+    if (tok_type != TokType::invalid) {
+
+        append_token(result,
+                     tok_type,
+                     line,
+                     tok_start,
+                     in_str.substr(tok_start, i - tok_start));
+    }
 }
