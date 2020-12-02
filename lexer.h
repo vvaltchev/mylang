@@ -118,9 +118,12 @@ public:
     }
 };
 
+static const Tok invalid_tok;
+
 inline ostream &operator<<(ostream &s, const Tok &t)
 {
     return s << "Tok(" << t.type << "): '" << t.value << "'";
 }
 
 void lexer(string_view in_str, int line, vector<Tok> &result);
+
