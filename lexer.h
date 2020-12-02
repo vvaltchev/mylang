@@ -59,9 +59,11 @@ enum class Keyword : int {
     kw_else     = 2,
     kw_while    = 3,
     kw_for      = 4,
+    kw_break    = 5,
+    kw_continue = 6,
 };
 
-static const array<string, 18> KwString =
+static const array<string, 7> KwString =
 {
     "invalid",
 
@@ -69,6 +71,8 @@ static const array<string, 18> KwString =
     "else",
     "while",
     "for",
+    "break",
+    "continue",
 };
 
 ostream &operator<<(ostream &s, TokType t);

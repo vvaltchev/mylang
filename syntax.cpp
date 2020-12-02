@@ -13,6 +13,13 @@ ostream &operator<<(ostream &s, const EvalValue &c)
     return s;
 }
 
+void ChildlessConstruct::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+    s << indent;
+    s << name;
+}
+
 void SingleChildConstruct::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
@@ -161,6 +168,30 @@ void IfStmt::serialize(ostream &s, int level) const
 
         s << string((level + 1) * 2, ' ');
         s << "<NoElseBlock>";
+    }
+
+    s << endl;
+    s << indent;
+    s << ")";
+}
+
+void WhileStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+    condExpr->serialize(s, level+1);
+    s << endl;
+
+    if (body) {
+
+        body->serialize(s, level+1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoBody>";
     }
 
     s << endl;

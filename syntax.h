@@ -91,6 +91,19 @@ public:
     virtual void serialize(ostream &s, int level = 0) const = 0;
 };
 
+class ChildlessConstruct : public Construct {
+
+public:
+
+    ChildlessConstruct(const char *name) : Construct(name) { }
+
+    virtual EvalValue eval(EvalContext *ctx) const {
+        return EvalValue();
+    }
+
+    virtual void serialize(ostream &s, int level = 0) const;
+};
+
 class SingleChildConstruct : public Construct {
 
 public:
@@ -104,7 +117,6 @@ public:
 
     virtual void serialize(ostream &s, int level = 0) const;
 };
-
 
 class MultiOpConstruct : public Construct {
 
@@ -266,5 +278,30 @@ class Block : public MultiElemConstruct {
 
 public:
     Block() : MultiElemConstruct("Block") { }
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
+class BreakStmt : public ChildlessConstruct {
+
+public:
+    BreakStmt(): ChildlessConstruct("BreakStmt") { }
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
+class ContinueStmt : public ChildlessConstruct {
+
+public:
+    ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
+    virtual EvalValue eval(EvalContext *ctx) const;
+};
+
+class WhileStmt : public Construct {
+
+public:
+    unique_ptr<Construct> condExpr;
+    unique_ptr<Construct> body;
+
+    WhileStmt() : Construct("WhileStmt") { }
+    virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue eval(EvalContext *ctx) const;
 };

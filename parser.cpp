@@ -16,8 +16,7 @@ unique_ptr<Construct> pExpr04(ParseContext &c); // ops: +, -
 unique_ptr<Construct> pExpr06(ParseContext &c); // ops: <, >, <=, >=
 unique_ptr<Construct> pExpr07(ParseContext &c); // ops: ==, !=
 unique_ptr<Construct> pExpr14(ParseContext &c); // ops: =
-unique_ptr<Construct> pStmt(ParseContext &c);   // expression statment e.g. "a = 3;"
-unique_ptr<Construct> pBlock(ParseContext &c);  // code block { }
+unique_ptr<Construct> pStmt(ParseContext &c, bool loop = false);
 
 inline unique_ptr<Construct> pExprTop(ParseContext &c) { return pExpr14(c); }
 
@@ -293,11 +292,31 @@ unique_ptr<Construct> pExpr14(ParseContext &c)
     }
 }
 
+unique_ptr<Construct>
+pBlock(ParseContext &c, bool loop)
+{
+    unique_ptr<Block> ret(new Block);
+    unique_ptr<Construct> stmt;
+
+    if (!c.eoi()) {
+
+        while ((stmt = pStmt(c, loop)))
+            ret->elems.emplace_back(move(stmt));
+
+        while (*c == Op::semicolon)
+            c++;    /* skip multiple ';' */
+    }
+
+    return ret;
+}
+
 bool
-pAcceptBracedBlock(ParseContext &c, unique_ptr<Construct> &ret)
+pAcceptBracedBlock(ParseContext &c,
+                   unique_ptr<Construct> &ret,
+                   bool loop)
 {
     if (pAcceptOp(c, Op::braceL)) {
-        ret = pBlock(c);
+        ret = pBlock(c, loop);
         pExpectOp(c, Op::braceR);
         return true;
     }
@@ -306,7 +325,7 @@ pAcceptBracedBlock(ParseContext &c, unique_ptr<Construct> &ret)
 }
 
 bool
-pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret)
+pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, bool loop)
 {
     if (pAcceptKeyword(c, Keyword::kw_if)) {
 
@@ -320,11 +339,11 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret)
 
         pExpectOp(c, Op::parenR);
 
-        if (!pAcceptBracedBlock(c, ifstmt->thenBlock))
+        if (!pAcceptBracedBlock(c, ifstmt->thenBlock, loop))
             ifstmt->thenBlock = pStmt(c);
 
         if (pAcceptKeyword(c, Keyword::kw_else)) {
-            if (!pAcceptBracedBlock(c, ifstmt->elseBlock))
+            if (!pAcceptBracedBlock(c, ifstmt->elseBlock, loop))
                 ifstmt->elseBlock = pStmt(c);
         }
 
@@ -335,12 +354,49 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret)
     return false;
 }
 
+bool
+pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret)
+{
+    if (pAcceptKeyword(c, Keyword::kw_while)) {
+
+        unique_ptr<WhileStmt> whileStmt(new WhileStmt);
+        pExpectOp(c, Op::parenL);
+
+        whileStmt->condExpr = pExprTop(c);
+
+        if (!whileStmt->condExpr)
+            noExprError(c);
+
+        pExpectOp(c, Op::parenR);
+
+        if (!pAcceptBracedBlock(c, whileStmt->body, true))
+            whileStmt->body = pStmt(c);
+
+        ret = move(whileStmt);
+        return true;
+    }
+
+    return false;
+}
+
 unique_ptr<Construct>
-pStmt(ParseContext &c)
+pStmt(ParseContext &c, bool loop)
 {
     unique_ptr<Construct> subStmt;
 
-    if (pAcceptIfStmt(c, subStmt)) {
+    if (loop) {
+
+        if (pAcceptKeyword(c, Keyword::kw_break))
+            return make_unique<BreakStmt>();
+        else if (pAcceptKeyword(c, Keyword::kw_continue))
+            return make_unique<ContinueStmt>();
+    }
+
+    if (pAcceptIfStmt(c, subStmt, loop)) {
+
+        return subStmt;
+
+    } if (pAcceptWhileStmt(c, subStmt)) {
 
         return subStmt;
 
@@ -356,22 +412,4 @@ pStmt(ParseContext &c)
         pExpectOp(c, Op::semicolon);
         return ret;
     }
-}
-
-unique_ptr<Construct>
-pBlock(ParseContext &c)
-{
-    unique_ptr<Block> ret(new Block);
-    unique_ptr<Construct> stmt;
-
-    if (!c.eoi()) {
-
-        while ((stmt = pStmt(c)))
-            ret->elems.emplace_back(move(stmt));
-
-        while (*c == Op::semicolon)
-            c++;    /* skip multiple ';' */
-    }
-
-    return ret;
 }

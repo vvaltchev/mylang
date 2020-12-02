@@ -2,7 +2,10 @@
 # Simple test script
 #
 
-a = 1 + 2 * 3;
-b = a * 2;
+i = 0;
 
-print(b + (b == 1));
+while (i < 10000000) {
+    i = i + 1;
+}
+
+print(i);

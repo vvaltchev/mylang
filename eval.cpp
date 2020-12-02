@@ -248,6 +248,19 @@ EvalValue IfStmt::eval(EvalContext *ctx) const
     return EvalValue();
 }
 
+struct LoopBreakEx { };
+struct LoopContinueEx { };
+
+EvalValue BreakStmt::eval(EvalContext *ctx) const
+{
+    throw LoopBreakEx();
+}
+
+EvalValue ContinueStmt::eval(EvalContext *ctx) const
+{
+    throw LoopContinueEx();
+}
+
 EvalValue Block::eval(EvalContext *ctx) const
 {
     EvalValue val;
@@ -257,4 +270,30 @@ EvalValue Block::eval(EvalContext *ctx) const
     }
 
     return val;
+}
+
+EvalValue WhileStmt::eval(EvalContext *ctx) const
+{
+    while (EvalAs<long>(ctx, condExpr.get())) {
+
+        try {
+
+            body->eval(ctx);
+
+        } catch (LoopBreakEx) {
+
+            break;
+
+        } catch (LoopContinueEx) {
+
+            /*
+             * Do nothing. Note: we cannot avoid this exception simply because
+             * we can have `continue` inside one or multiple levels of nested
+             * IF statements inside the loop, and we have to skip all of them
+             * to jump back here and restart the loop.
+             */
+        }
+    }
+
+    return EvalValue();
 }
