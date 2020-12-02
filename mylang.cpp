@@ -100,6 +100,53 @@ void read_input(vector<string>& lines, vector<Tok> &tokens)
     }
 }
 
+static void
+handleSyntaxError(const SyntaxErrorEx &e)
+{
+    cout << "SyntaxError";
+
+    if (e.loc.line) {
+
+        cout << " at line "
+                << e.loc.line << ", col " << e.loc.col
+                << ": ";
+
+    } else if (e.loc.col) {
+
+        cout << " at col " << e.loc.col << ": ";
+
+    } else {
+        cout << ": ";
+    }
+
+    cout << e.msg;
+
+    if (e.op != Op::invalid) {
+
+        cout << " '" << OpString[(int)e.op] << "'";
+
+        if (e.tok)
+            cout << ", got:";
+    }
+
+    if (e.tok) {
+
+        cout << " '";
+
+        if (e.tok->op != Op::invalid)
+            cout << OpString[(int)e.tok->op];
+        else if (e.tok->kw != Keyword::kw_invalid)
+            cout << KwString[(int)e.tok->kw];
+        else
+            cout << e.tok->value;
+
+        cout << "'";
+
+    }
+
+    cout << endl;
+}
+
 int main(int argc, char **argv)
 {
     vector<string> lines;
@@ -133,7 +180,7 @@ int main(int argc, char **argv)
         }
 
         if (!ctx.eoi())
-            throw SyntaxErrorEx(Loc(), "Unexpected tokens at the end");
+            throw SyntaxErrorEx(Loc(ctx.get_tok().loc), "Unexpected token at the end", &ctx.get_tok());
 
         /* Run the script */
         EvalContext evalCtx;
@@ -146,39 +193,7 @@ int main(int argc, char **argv)
 
     } catch (const SyntaxErrorEx &e) {
 
-        cout << "SyntaxError";
-
-        if (e.loc.line) {
-
-            cout << " at line "
-                 << e.loc.line << ", col " << e.loc.col
-                 << ": ";
-
-        } else if (e.loc.col) {
-
-            cout << " at col " << e.loc.col << ": ";
-
-        } else {
-            cout << ": ";
-        }
-
-        cout << e.msg;
-
-        if (e.tok) {
-
-            cout << " '";
-
-            if (e.tok->op != Op::invalid)
-                cout << OpString[(int)e.tok->op];
-            else if (e.tok->kw != Keyword::kw_invalid)
-                cout << KwString[(int)e.tok->kw];
-            else
-                cout << e.tok->value;
-
-            cout << "'";
-        }
-
-        cout << endl;
+        handleSyntaxError(e);
         return 1;
 
     } catch (const DivisionByZeroEx &e) {

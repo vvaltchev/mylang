@@ -4,6 +4,8 @@
 #include <string>
 #include <string_view>
 
+#include "operators.h"
+
 using namespace std;
 
 struct Loc {
@@ -29,10 +31,15 @@ struct SyntaxErrorEx {
     const Loc loc;
     const char *const msg;
     const Tok *const tok;
+    const Op op;
 
-    SyntaxErrorEx(Loc loc, const char *msg, const Tok *tok = nullptr)
+    SyntaxErrorEx(Loc loc,
+                  const char *msg,
+                  const Tok *tok = nullptr,
+                  Op op = Op::invalid)
         : loc(loc)
         , msg(msg)
         , tok(tok)
+        , op(op)
     { }
 };

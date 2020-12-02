@@ -26,30 +26,7 @@ enum class TokType : int {
     unknown = 5,   /* something else (e.g. ?) */
 };
 
-enum class Op : int {
-
-    invalid     = 0,
-
-    plus        = 1,
-    minus       = 2,
-    times       = 3,
-    div         = 4,
-    parenL      = 5,
-    parenR      = 6,
-    lt          = 7,
-    gt          = 8,
-    le          = 9,
-    ge          = 10,
-    semicolon   = 11,
-    comma       = 12,
-    mod         = 13,
-    opnot       = 14,
-    assign      = 15,
-    eq          = 16,
-    noteq       = 17,
-};
-
-static const array<string, 18> OpString =
+static const array<string, 20> OpString =
 {
     "invalid",
 
@@ -70,6 +47,8 @@ static const array<string, 18> OpString =
     "=",
     "==",
     "!=",
+    "{",
+    "}",
 };
 
 enum class Keyword : int {
@@ -145,6 +124,14 @@ public:
 
     bool operator!=(TokType t) const {
         return type != t;
+    }
+
+    bool operator==(Keyword rhs) const {
+        return kw == rhs;
+    }
+
+    bool operator!=(Keyword rhs) const {
+        return kw != rhs;
     }
 };
 

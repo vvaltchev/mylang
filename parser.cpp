@@ -54,6 +54,16 @@ bool pAcceptOp(ParseContext &c, Op exp)
     return false;
 }
 
+bool pAcceptKeyword(ParseContext &c, Keyword exp)
+{
+    if (*c == exp) {
+        c++;
+        return true;
+    }
+
+    return false;
+}
+
 void pExpectLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (!pAcceptLiteralInt(c, v))
@@ -63,7 +73,7 @@ void pExpectLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 void pExpectOp(ParseContext &c, Op exp)
 {
     if (!pAcceptOp(c, exp))
-        throw SyntaxErrorEx(c.get_loc(), "Expected operator");
+        throw SyntaxErrorEx(c.get_loc(), "Expected operator", &c.get_tok(), exp);
 }
 
 Op AcceptOneOf(ParseContext &c, initializer_list<Op> list)
@@ -112,6 +122,15 @@ pAcceptCallExpr(ParseContext &c, unique_ptr<Construct> &id, unique_ptr<Construct
     return false;
 }
 
+void noExprError(ParseContext &c)
+{
+    throw SyntaxErrorEx(
+        c.get_loc(),
+        "Expected expression, got",
+        &c.get_tok()
+    );
+}
+
 unique_ptr<Construct>
 pExpr01(ParseContext &c)
 {
@@ -138,11 +157,7 @@ pExpr01(ParseContext &c)
 
     } else {
 
-        throw SyntaxErrorEx(
-            c.get_loc(),
-            "Expected literal, (expr) or id, got",
-            &c.get_tok()
-        );
+        return nullptr;
     }
 
     return ret;
@@ -158,6 +173,9 @@ pExprGeneric(ParseContext &c,
     unique_ptr<ExprT> ret;
     unique_ptr<Construct> lowerE = lowerExpr(c);
 
+    if (!lowerE)
+        return nullptr;
+
     while ((op = AcceptOneOf(c, ops)) != Op::invalid) {
 
         if (!ret) {
@@ -165,7 +183,12 @@ pExprGeneric(ParseContext &c,
             ret->elems.emplace_back(Op::invalid, move(lowerE));
         }
 
-        ret->elems.emplace_back(op, lowerExpr(c));
+        lowerE = lowerExpr(c);
+
+        if (!lowerE)
+            noExprError(c);
+
+        ret->elems.emplace_back(op, move(lowerE));
     }
 
     if (!ret)
@@ -192,12 +215,16 @@ pExpr02(ParseContext &c)
 
         elem = pExpr02(c);
 
+        if (!elem)
+            noExprError(c);
+
+
     } else {
 
         elem = pExpr01(c);
     }
 
-    if (op == Op::invalid)
+    if (!elem || op == Op::invalid)
         return elem;
 
     ret.reset(new Expr02);
@@ -244,13 +271,20 @@ unique_ptr<Construct> pExpr14(ParseContext &c)
 
     lside = pExpr07(c);
 
+    if (!lside)
+        return nullptr;
+
     if ((op = AcceptOneOf(c, {Op::assign})) != Op::invalid) {
 
         unique_ptr<Expr14> ret(new Expr14);
 
+        ret->op = op;
         ret->lvalue = move(lside);
         ret->rvalue = pExpr14(c);
-        ret->op = op;
+
+        if (!ret->rvalue)
+            noExprError(c);
+
         return ret;
 
     } else {
@@ -259,34 +293,85 @@ unique_ptr<Construct> pExpr14(ParseContext &c)
     }
 }
 
+bool
+pAcceptBracedBlock(ParseContext &c, unique_ptr<Construct> &ret)
+{
+    if (pAcceptOp(c, Op::braceL)) {
+        ret = pBlock(c);
+        pExpectOp(c, Op::braceR);
+        return true;
+    }
+
+    return false;
+}
+
+bool
+pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret)
+{
+    if (pAcceptKeyword(c, Keyword::kw_if)) {
+
+        unique_ptr<IfStmt> ifstmt(new IfStmt);
+        pExpectOp(c, Op::parenL);
+
+        ifstmt->condExpr = pExprTop(c);
+
+        if (!ifstmt->condExpr)
+            noExprError(c);
+
+        pExpectOp(c, Op::parenR);
+
+        if (!pAcceptBracedBlock(c, ifstmt->thenBlock))
+            ifstmt->thenBlock = pStmt(c);
+
+        if (pAcceptKeyword(c, Keyword::kw_else)) {
+            if (!pAcceptBracedBlock(c, ifstmt->elseBlock))
+                ifstmt->elseBlock = pStmt(c);
+        }
+
+        ret = move(ifstmt);
+        return true;
+    }
+
+    return false;
+}
+
 unique_ptr<Construct>
 pStmt(ParseContext &c)
 {
-    unique_ptr<Stmt> ret(new Stmt);
-    ret->elem = pExprTop(c);
-    return ret;
+    unique_ptr<Construct> subStmt;
+
+    if (pAcceptIfStmt(c, subStmt)) {
+
+        return subStmt;
+
+    } else {
+
+        unique_ptr<Construct> lowerE = pExprTop(c);
+
+        if (!lowerE)
+            return nullptr;
+
+        unique_ptr<Stmt> ret(new Stmt);
+        ret->elem = move(lowerE);
+        pExpectOp(c, Op::semicolon);
+        return ret;
+    }
 }
 
 unique_ptr<Construct>
 pBlock(ParseContext &c)
 {
     unique_ptr<Block> ret(new Block);
+    unique_ptr<Construct> stmt;
 
-    if (c.eoi())
-        return ret;
+    if (!c.eoi()) {
 
-    ret->elems.emplace_back(pStmt(c));
+        while ((stmt = pStmt(c)))
+            ret->elems.emplace_back(move(stmt));
 
-    while (pAcceptOp(c, Op::semicolon) && !c.eoi()) {
-
-        if (pAcceptOp(c, Op::semicolon))
-            continue; /* skip multiple ';' */
-
-        ret->elems.emplace_back(pStmt(c));
+        while (*c == Op::semicolon)
+            c++;    /* skip multiple ';' */
     }
-
-    if (!c.eoi())
-        throw SyntaxErrorEx(c.get_loc(), "Unexpected token", &c.get_tok());
 
     return ret;
 }

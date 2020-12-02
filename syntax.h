@@ -15,6 +15,7 @@ class Expr03;
 class Expr04;
 class Expr06;
 class Stmt;
+class IfStmt;
 class Block;
 class LValue;
 class Identifier;
@@ -247,6 +248,18 @@ class Stmt : public SingleChildConstruct {
 
 public:
     Stmt() : SingleChildConstruct("Stmt") { }
+};
+
+class IfStmt : public Construct {
+
+public:
+    unique_ptr<Construct> condExpr;
+    unique_ptr<Construct> thenBlock;
+    unique_ptr<Construct> elseBlock;
+
+    IfStmt() : Construct("IfStmt") { }
+    virtual void serialize(ostream &s, int level = 0) const;
+    virtual EvalValue eval(EvalContext *ctx) const;
 };
 
 class Block : public MultiElemConstruct {

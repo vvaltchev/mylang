@@ -130,3 +130,40 @@ void Expr14::serialize(ostream &s, int level) const
     s << indent;
     s << ")";
 }
+
+void IfStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    condExpr->serialize(s, level+1);
+    s << endl;
+
+    if (thenBlock) {
+
+        thenBlock->serialize(s, level+1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoThenBlock>";
+    }
+
+    s << endl;
+
+    if (elseBlock) {
+
+        elseBlock->serialize(s, level+1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoElseBlock>";
+    }
+
+    s << endl;
+    s << indent;
+    s << ")";
+}

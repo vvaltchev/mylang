@@ -230,6 +230,24 @@ EvalValue Expr14::eval(EvalContext *ctx) const
     return rval;
 }
 
+EvalValue IfStmt::eval(EvalContext *ctx) const
+{
+    EvalValue cond_val = EvalAs<long>(ctx, condExpr.get());
+
+    if (cond_val.get<long>()) {
+
+        if (thenBlock)
+            thenBlock->eval(ctx);
+
+    } else {
+
+        if (elseBlock)
+            elseBlock->eval(ctx);
+    }
+
+    return EvalValue();
+}
+
 EvalValue Block::eval(EvalContext *ctx) const
 {
     EvalValue val;
