@@ -80,17 +80,21 @@ class Tok {
 public:
 
     const TokType type;
+    const Loc loc;
     const string_view value;
     const Op op;
 
-    Tok(TokType type = TokType::invalid, string_view value = string_view())
+    Tok(TokType type = TokType::invalid, Loc loc = Loc(), string_view value = string_view())
         : type(type)
+        , loc(loc)
         , value(value)
         , op(value.empty() ? Op::invalid : get_op_type(value))
+
     { }
 
-    Tok(Op op)
+    Tok(Op op, Loc loc)
         : type(TokType::op)
+        , loc(loc)
         , op(op)
     { }
 
@@ -119,4 +123,4 @@ inline ostream &operator<<(ostream &s, const Tok &t)
     return s << "Tok(" << t.type << "): '" << t.value << "'";
 }
 
-void lexer(string_view in_str, vector<Tok> &result);
+void lexer(string_view in_str, int line, vector<Tok> &result);

@@ -9,6 +9,8 @@
 static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
 
+static const Tok invalid_tok;
+
 class TokenStream {
 
 private:
@@ -22,12 +24,12 @@ public:
         : pos(tokens.cbegin())
         , end(tokens.cend()) { }
 
-    Tok get() const {
+    const Tok &get() const {
 
         if (pos != end)
             return *pos;
 
-        return Tok();
+        return invalid_tok;
     }
 
     void next() {
@@ -37,14 +39,16 @@ public:
     }
 };
 
-class Context {
+class ParseContext {
 
 public:
     TokenStream ts;
 
     /* token operations */
-    Tok operator*() const { return ts.get(); }
+    const Tok &operator*() const { return ts.get(); }
+    const Tok &get_tok() const { return ts.get(); }
     Op get_op() const { return ts.get().op; }
+    Loc get_loc() const { return ts.get().loc; }
     string_view get_str() const { return ts.get().value; }
     bool eoi() const { return ts.get() == TokType::invalid; }
 
@@ -55,28 +59,28 @@ public:
 
 // ----------- Recursive Descent Parser -------------------
 
-bool pAcceptLiteralInt(Context &c, Construct *&v);
-bool pAcceptOp(Context &c, Op exp);
-void pExpectLiteralInt(Context &c, Construct *&v);
-void pExpectOp(Context &c, Op exp);
+bool pAcceptLiteralInt(ParseContext &c, Construct *&v);
+bool pAcceptOp(ParseContext &c, Op exp);
+void pExpectLiteralInt(ParseContext &c, Construct *&v);
+void pExpectOp(ParseContext &c, Op exp);
 
 /*
  * Parse functions using the C Operator Precedence.
  * Note: this simple language has just no operators for several levels.
  */
 
-unique_ptr<Construct> pExpr01(Context &c); // ops: ()
-unique_ptr<Construct> pExpr02(Context &c); // ops: + (unary), - (unary), !
-unique_ptr<Construct> pExpr03(Context &c); // ops: *, /
-unique_ptr<Construct> pExpr04(Context &c); // ops: +, -
-unique_ptr<Construct> pExpr06(Context &c); // ops: <, >, <=, >=
-unique_ptr<Construct> pExpr07(Context &c); // ops: ==, !=
-unique_ptr<Construct> pExpr14(Context &c); // ops: =
+unique_ptr<Construct> pExpr01(ParseContext &c); // ops: ()
+unique_ptr<Construct> pExpr02(ParseContext &c); // ops: + (unary), - (unary), !
+unique_ptr<Construct> pExpr03(ParseContext &c); // ops: *, /
+unique_ptr<Construct> pExpr04(ParseContext &c); // ops: +, -
+unique_ptr<Construct> pExpr06(ParseContext &c); // ops: <, >, <=, >=
+unique_ptr<Construct> pExpr07(ParseContext &c); // ops: ==, !=
+unique_ptr<Construct> pExpr14(ParseContext &c); // ops: =
 
 
-inline unique_ptr<Construct> pExprTop(Context &c) { return pExpr14(c); }
+inline unique_ptr<Construct> pExprTop(ParseContext &c) { return pExpr14(c); }
 
-bool pAcceptLiteralInt(Context &c, unique_ptr<Construct> &v)
+bool pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::num) {
         v.reset(new LiteralInt{ stol(string(c.get_str())) });
@@ -87,7 +91,7 @@ bool pAcceptLiteralInt(Context &c, unique_ptr<Construct> &v)
     return false;
 }
 
-bool pAcceptId(Context &c, unique_ptr<Construct> &v)
+bool pAcceptId(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::id) {
         v.reset(new Identifier(c.get_str()));
@@ -99,7 +103,7 @@ bool pAcceptId(Context &c, unique_ptr<Construct> &v)
 }
 
 
-bool pAcceptOp(Context &c, Op exp)
+bool pAcceptOp(ParseContext &c, Op exp)
 {
     if (*c == exp) {
         c++;
@@ -109,19 +113,19 @@ bool pAcceptOp(Context &c, Op exp)
     return false;
 }
 
-void pExpectLiteralInt(Context &c, unique_ptr<Construct> &v)
+void pExpectLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (!pAcceptLiteralInt(c, v))
-        throw SyntaxErrorEx("Expected integer literal");
+        throw SyntaxErrorEx(c.get_loc(), "Expected integer literal");
 }
 
-void pExpectOp(Context &c, Op exp)
+void pExpectOp(ParseContext &c, Op exp)
 {
     if (!pAcceptOp(c, exp))
-        throw SyntaxErrorEx("Expected operator");
+        throw SyntaxErrorEx(c.get_loc(), "Expected operator");
 }
 
-Op AcceptOneOf(Context &c, initializer_list<Op> list)
+Op AcceptOneOf(ParseContext &c, initializer_list<Op> list)
 {
     for (auto op : list) {
         if (pAcceptOp(c, op))
@@ -132,7 +136,7 @@ Op AcceptOneOf(Context &c, initializer_list<Op> list)
 }
 
 unique_ptr<ExprList>
-pExprList(Context &c)
+pExprList(ParseContext &c)
 {
     unique_ptr<ExprList> ret(new ExprList);
 
@@ -151,7 +155,7 @@ pExprList(Context &c)
 }
 
 bool
-pAcceptCallExpr(Context &c, unique_ptr<Construct> &id, unique_ptr<Construct> &ret)
+pAcceptCallExpr(ParseContext &c, unique_ptr<Construct> &id, unique_ptr<Construct> &ret)
 {
     if (pAcceptOp(c, Op::parenL)) {
 
@@ -168,7 +172,7 @@ pAcceptCallExpr(Context &c, unique_ptr<Construct> &id, unique_ptr<Construct> &re
 }
 
 unique_ptr<Construct>
-pExpr01(Context &c)
+pExpr01(ParseContext &c)
 {
     unique_ptr<Construct> ret;
     unique_ptr<Construct> e, e2;
@@ -193,7 +197,11 @@ pExpr01(Context &c)
 
     } else {
 
-        throw SyntaxErrorEx("Expected literal, (expr) or id");
+        throw SyntaxErrorEx(
+            c.get_loc(),
+            "Expected literal, (expr) or id, got",
+            &c.get_tok()
+        );
     }
 
     return ret;
@@ -201,8 +209,8 @@ pExpr01(Context &c)
 
 template <class ExprT>
 unique_ptr<Construct>
-pExprGeneric(Context &c,
-             unique_ptr<Construct> (*lowerExpr)(Context&),
+pExprGeneric(ParseContext &c,
+             unique_ptr<Construct> (*lowerExpr)(ParseContext&),
              initializer_list<Op> ops)
 {
     Op op;
@@ -226,7 +234,7 @@ pExprGeneric(Context &c,
 }
 
 unique_ptr<Construct>
-pExpr02(Context &c)
+pExpr02(ParseContext &c)
 {
     unique_ptr<Expr02> ret;
     unique_ptr<Construct> elem;
@@ -257,7 +265,7 @@ pExpr02(Context &c)
 }
 
 unique_ptr<Construct>
-pExpr03(Context &c)
+pExpr03(ParseContext &c)
 {
     return pExprGeneric<Expr03>(
         c, pExpr02, {Op::times, Op::div, Op::mod}
@@ -265,7 +273,7 @@ pExpr03(Context &c)
 }
 
 unique_ptr<Construct>
-pExpr04(Context &c)
+pExpr04(ParseContext &c)
 {
     return pExprGeneric<Expr04>(
         c, pExpr03, {Op::plus, Op::minus}
@@ -273,7 +281,7 @@ pExpr04(Context &c)
 }
 
 unique_ptr<Construct>
-pExpr06(Context &c)
+pExpr06(ParseContext &c)
 {
     return pExprGeneric<Expr06>(
         c, pExpr04, {Op::lt, Op::gt, Op::le, Op::ge}
@@ -281,14 +289,14 @@ pExpr06(Context &c)
 }
 
 unique_ptr<Construct>
-pExpr07(Context &c)
+pExpr07(ParseContext &c)
 {
     return pExprGeneric<Expr07>(
         c, pExpr06, {Op::eq, Op::noteq}
     );
 }
 
-unique_ptr<Construct> pExpr14(Context &c)
+unique_ptr<Construct> pExpr14(ParseContext &c)
 {
     unique_ptr<Construct> lside, e;
     Op op = Op::invalid;
@@ -311,7 +319,7 @@ unique_ptr<Construct> pExpr14(Context &c)
 }
 
 unique_ptr<Construct>
-pStmt(Context &c)
+pStmt(ParseContext &c)
 {
     unique_ptr<Stmt> ret(new Stmt);
     ret->elem = pExprTop(c);
@@ -319,7 +327,7 @@ pStmt(Context &c)
 }
 
 unique_ptr<Construct>
-pBlock(Context &c)
+pBlock(ParseContext &c)
 {
     unique_ptr<Block> ret(new Block);
 
@@ -331,6 +339,9 @@ pBlock(Context &c)
     while (pAcceptOp(c, Op::semicolon) && !c.eoi()) {
         ret->elems.emplace_back(pStmt(c));
     }
+
+    if (!c.eoi())
+        throw SyntaxErrorEx(c.get_loc(), "Unexpected token", &c.get_tok());
 
     return ret;
 }
@@ -402,7 +413,7 @@ parse_args(int argc,
             tokens.emplace_back();
         } else {
             lines.emplace_back(move(inline_text));
-            lexer(lines[0], tokens);
+            lexer(lines[0], 0, tokens);
         }
     }
 }
@@ -416,8 +427,8 @@ void read_input(vector<string>& lines, vector<Tok> &tokens)
         while (getline(cin, line))
             lines.push_back(move(line));
 
-        for (const auto &s: lines)
-            lexer(s, tokens);
+        for (size_t i = 0; i < lines.size(); i++)
+            lexer(lines[i], i+1, tokens);
 
         if (tokens.empty()) {
             help();
@@ -436,7 +447,7 @@ int main(int argc, char **argv)
         parse_args(argc, argv, lines, tokens);
         read_input(lines, tokens);
 
-        Context ctx{TokenStream(tokens)};
+        ParseContext ctx{TokenStream(tokens)};
 
         if (opt_show_tokens) {
             cout << "Tokens" << endl;
@@ -451,15 +462,15 @@ int main(int argc, char **argv)
 
         unique_ptr<Construct> root(pBlock(ctx));
 
-        if (!ctx.eoi())
-            throw SyntaxErrorEx("Unexpected tokens at the end");
-
         if (opt_show_syntax_tree) {
             cout << "Syntax tree" << endl;
             cout << "--------------------------" << endl;
             cout << *root << endl;
             cout << endl;
         }
+
+        if (!ctx.eoi())
+            throw SyntaxErrorEx(Loc(), "Unexpected tokens at the end");
 
         /* Run the script */
         EvalContext evalCtx;
@@ -471,7 +482,20 @@ int main(int argc, char **argv)
 
     } catch (const SyntaxErrorEx &e) {
 
-        cout << "SyntaxError: " << e.msg << endl;
+        if (e.loc.line) {
+
+            cout << "SyntaxError at line "
+                 << e.loc.line << ", col " << e.loc.col
+                 << ": " << e.msg;
+
+            if (e.tok)
+                cout << " '" << e.tok->value << "'";
+
+            cout << endl;
+
+        } else {
+            cout << "SyntaxError: " << e.msg << endl;
+        }
 
     } catch (const DivisionByZeroEx &e) {
 

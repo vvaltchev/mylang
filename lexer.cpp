@@ -103,7 +103,7 @@ ostream &operator<<(ostream &s, TokType t)
 }
 
 void
-lexer(string_view in_str, vector<Tok> &result)
+lexer(string_view in_str, int line, vector<Tok> &result)
 {
     size_t i, tok_start = 0;
     TokType tok_type = TokType::invalid;
@@ -120,7 +120,11 @@ lexer(string_view in_str, vector<Tok> &result)
         if (isspace(c) || is_operator(string_view(&c, 1))) {
 
             if (tok_type != TokType::invalid) {
-                result.emplace_back(tok_type, val_until_prev);
+                result.emplace_back(
+                    tok_type,
+                    Loc(line, tok_start+1),
+                    val_until_prev
+                );
                 tok_type = TokType::invalid;
             }
 
@@ -145,7 +149,7 @@ lexer(string_view in_str, vector<Tok> &result)
                     i++;
                 }
 
-                result.emplace_back(TokType::op, op);
+                result.emplace_back(TokType::op, Loc(line, i+1), op);
             }
 
         } else if (isalnum(c) || c == '_') {
@@ -176,5 +180,9 @@ lexer(string_view in_str, vector<Tok> &result)
     }
 
     if (tok_type != TokType::invalid)
-        result.emplace_back(tok_type, in_str.substr(tok_start, i - tok_start));
+        result.emplace_back(
+            tok_type,
+            Loc(line, tok_start+1),
+            in_str.substr(tok_start, i - tok_start)
+        );
 }
