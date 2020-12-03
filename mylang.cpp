@@ -7,6 +7,7 @@
 #include "eval.h"
 
 #include <initializer_list>
+#include <fstream>
 #include <cstring>
 
 static bool opt_show_tokens;
@@ -15,9 +16,39 @@ static bool opt_show_syntax_tree;
 void help()
 {
     cout << "syntax:" << endl;
-    cout << "   mylang < FILE" << endl;
+    cout << "   mylang [-t] [-s] FILE" << endl;
     cout << "   mylang [-t] [-s] -e EXPRESSION" << endl;
     cout << endl;
+}
+
+void
+read_script(const char *filename, vector<string>& lines, vector<Tok> &tokens)
+{
+    {
+        string line;
+        ifstream filestream(filename);
+
+        if (filestream.is_open()) {
+
+            while (getline(filestream, line)) {
+                lines.push_back(move(line));
+                line.clear(); /* Put the string is a known state */
+            }
+
+        } else {
+
+            cout << "Failed to open file '" << filename << "'\n";
+            exit(1);
+        }
+    }
+
+    for (size_t i = 0; i < lines.size(); i++)
+        lexer(lines[i], i+1, tokens);
+
+    if (tokens.empty()) {
+        help();
+        exit(1);
+    }
 }
 
 void
@@ -67,7 +98,7 @@ parse_args(int argc,
 
         } else {
 
-            help(); exit(1);
+            read_script(arg, lines, tokens);
         }
     }
 
@@ -78,25 +109,6 @@ parse_args(int argc,
         } else {
             lines.emplace_back(move(inline_text));
             lexer(lines[0], 0, tokens);
-        }
-    }
-}
-
-void read_input(vector<string>& lines, vector<Tok> &tokens)
-{
-    if (tokens.empty()) {
-
-        string line;
-
-        while (getline(cin, line))
-            lines.push_back(move(line));
-
-        for (size_t i = 0; i < lines.size(); i++)
-            lexer(lines[i], i+1, tokens);
-
-        if (tokens.empty()) {
-            help();
-            exit(1);
         }
     }
 }
@@ -156,7 +168,6 @@ int main(int argc, char **argv)
     try {
 
         parse_args(argc, argv, lines, tokens);
-        read_input(lines, tokens);
 
         ParseContext ctx{TokenStream(tokens)};
 
