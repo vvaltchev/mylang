@@ -112,14 +112,30 @@ void TypeInt::noteq(EvalValue &a, EvalValue b)
     a.val.ival = a.val.ival != b.val.ival;
 }
 
-void TypeInt::opnot(EvalValue &a)
+void TypeInt::opneg(EvalValue &a)
+{
+    a.val.ival = -a.val.ival;
+}
+
+void TypeInt::lnot(EvalValue &a)
 {
     a.val.ival = !a.val.ival;
 }
 
-void TypeInt::opneg(EvalValue &a)
+void TypeInt::land(EvalValue &a, EvalValue b)
 {
-    a.val.ival = -a.val.ival;
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival && b.val.ival;
+}
+
+void TypeInt::lor(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival || b.val.ival;
 }
 
 bool TypeInt::is_true(EvalValue &a)
@@ -187,9 +203,9 @@ EvalValue Expr02::eval(EvalContext *ctx) const
             /* Unary operator '-': negate */
             val.type->opneg(val);
             break;
-        case Op::opnot:
+        case Op::lnot:
             /* Unary operator '!': logial not */
-            val.type->opnot(val);
+            val.type->lnot(val);
             break;
         default:
             throw InternalErrorEx();
@@ -290,6 +306,46 @@ EvalValue Expr07::eval(EvalContext *ctx) const
                 break;
             case Op::noteq:
                 val.type->noteq(val, RValue(e->eval(ctx)));
+                break;
+            default:
+                throw InternalErrorEx();
+        }
+    }
+
+    return val;
+}
+
+EvalValue Expr11::eval(EvalContext *ctx) const
+{
+    EvalValue val = eval_first_rvalue(ctx);
+
+    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
+
+        switch (op) {
+            case Op::land:
+                val.type->land(val, RValue(e->eval(ctx)));
+                break;
+            default:
+                throw InternalErrorEx();
+        }
+    }
+
+    return val;
+}
+
+EvalValue Expr12::eval(EvalContext *ctx) const
+{
+    EvalValue val = eval_first_rvalue(ctx);
+
+    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
+
+        switch (op) {
+            case Op::lor:
+                val.type->lor(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();

@@ -72,8 +72,10 @@ public:
     virtual void ge(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
     virtual void eq(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
     virtual void noteq(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void opnot(EvalValue &a) { throw TypeErrorEx(); }
     virtual void opneg(EvalValue &a) { throw TypeErrorEx(); }
+    virtual void lnot(EvalValue &a) { throw TypeErrorEx(); }
+    virtual void land(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
+    virtual void lor(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
 
     virtual bool is_true(EvalValue &a) { throw TypeErrorEx(); }
 };
@@ -95,8 +97,10 @@ public:
     virtual void ge(EvalValue &a, EvalValue b);
     virtual void eq(EvalValue &a, EvalValue b);
     virtual void noteq(EvalValue &a, EvalValue b);
-    virtual void opnot(EvalValue &a);
     virtual void opneg(EvalValue &a);
+    virtual void lnot(EvalValue &a);
+    virtual void land(EvalValue &a, EvalValue b);
+    virtual void lor(EvalValue &a, EvalValue b);
 
     virtual bool is_true(EvalValue &a);
 };

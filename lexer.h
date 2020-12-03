@@ -27,7 +27,7 @@ enum class TokType : int {
     unknown = 6,   /* something else (e.g. ?) */
 };
 
-static const array<string, 20> OpString =
+static const array<string, 25> OpString =
 {
     "invalid",
 
@@ -50,6 +50,11 @@ static const array<string, 20> OpString =
     "!=",
     "{",
     "}",
+    "&",
+    "|",
+    "~",
+    "&&",
+    "||",
 };
 
 enum class Keyword : int {

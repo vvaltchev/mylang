@@ -15,6 +15,8 @@ unique_ptr<Construct> pExpr03(ParseContext &c); // ops: *, /
 unique_ptr<Construct> pExpr04(ParseContext &c); // ops: +, -
 unique_ptr<Construct> pExpr06(ParseContext &c); // ops: <, >, <=, >=
 unique_ptr<Construct> pExpr07(ParseContext &c); // ops: ==, !=
+unique_ptr<Construct> pExpr11(ParseContext &c); // ops: &&
+unique_ptr<Construct> pExpr12(ParseContext &c); // ops: ||
 unique_ptr<Construct> pExpr14(ParseContext &c); // ops: =
 unique_ptr<Construct> pStmt(ParseContext &c, bool loop = false);
 
@@ -203,7 +205,7 @@ pExpr02(ParseContext &c)
 {
     unique_ptr<Expr02> ret;
     unique_ptr<Construct> elem;
-    Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::opnot});
+    Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::lnot});
 
     if (op != Op::invalid) {
 
@@ -265,12 +267,28 @@ pExpr07(ParseContext &c)
     );
 }
 
+unique_ptr<Construct>
+pExpr11(ParseContext &c)
+{
+    return pExprGeneric<Expr11>(
+        c, pExpr07, {Op::land}
+    );
+}
+
+unique_ptr<Construct>
+pExpr12(ParseContext &c)
+{
+    return pExprGeneric<Expr12>(
+        c, pExpr11, {Op::lor}
+    );
+}
+
 unique_ptr<Construct> pExpr14(ParseContext &c)
 {
     unique_ptr<Construct> lside, e;
     Op op = Op::invalid;
 
-    lside = pExpr07(c);
+    lside = pExpr12(c);
 
     if (!lside)
         return nullptr;
