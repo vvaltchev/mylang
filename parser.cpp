@@ -105,7 +105,9 @@ pExprList(ParseContext &c)
 }
 
 bool
-pAcceptCallExpr(ParseContext &c, unique_ptr<Construct> &id, unique_ptr<Construct> &ret)
+pAcceptCallExpr(ParseContext &c,
+                unique_ptr<Construct> &id,
+                unique_ptr<Construct> &ret)
 {
     if (pAcceptOp(c, Op::parenL)) {
 

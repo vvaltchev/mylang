@@ -75,6 +75,7 @@ ostream &operator<<(ostream &s, TokType t)
         "id_",
         "op_",
         "kw_",
+        "str",
         "unk",
     };
 
@@ -124,14 +125,48 @@ lexer(string_view in_str, int line, vector<Tok> &result)
 
     for (i = 0; i < in_str.length(); i++) {
 
-        if (tok_type == TokType::invalid)
-            tok_start = i;
-
         const char c = in_str[i];
-        const string_view val = in_str.substr(tok_start, i - tok_start + 1);
+
+        if (tok_type == TokType::str) {
+
+            if (c == '"') {
+
+                append_token(result,
+                             TokType::str,
+                             line,
+                             tok_start,
+                             in_str.substr(tok_start, i - tok_start));
+
+                tok_type = TokType::invalid;
+
+            } else if (c == '\\') {
+
+                if (i == in_str.length() - 1)
+                    throw InvalidTokenEx{in_str.substr(tok_start, 1 + i - tok_start)};
+
+                if (in_str[i + 1] == '"') {
+                    i++; /* ignore \" instead of ending the token */
+                }
+            }
+
+            continue;
+        }
 
         if (c == '#')
             break; /* comment: stop the lexer, until the end of the line */
+
+        if (tok_type == TokType::invalid) {
+
+            tok_start = i;
+
+            if (c == '"') {
+                tok_type = TokType::str;
+                tok_start++;
+                continue;
+            }
+        }
+
+        const string_view val = in_str.substr(tok_start, i - tok_start + 1);
 
         if (isspace(c) || is_operator(string_view(&c, 1))) {
 

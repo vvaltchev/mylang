@@ -23,7 +23,8 @@ enum class TokType : int {
     id      = 2,   /* identifier (e.g. a, x, my_var) */
     op      = 3,   /* operator (e.g. +, -, *, /) */
     kw      = 4,   /* keyword (e.g. if, else, while) */
-    unknown = 5,   /* something else (e.g. ?) */
+    str     = 5,   /* string literal (e.g. "hello") */
+    unknown = 6,   /* something else (e.g. ?) */
 };
 
 static const array<string, 20> OpString =
