@@ -2,6 +2,7 @@
 #pragma once
 
 #include <string>
+#include <memory>
 #include <string_view>
 
 #include "operators.h"
@@ -17,14 +18,15 @@ struct Loc {
     Loc(int line, int col): line(line), col(col) { }
 };
 
+class Tok;
+class Construct;
+
+struct InternalErrorEx { };
 struct InvalidTokenEx { string_view val; };
 struct DivisionByZeroEx { };
 struct TypeErrorEx { };
 struct UndefinedVariableEx { string_view name; };
-struct NotLValueEx { };
-struct InternalErrorEx { };
-
-class Tok;
+struct NotLValueEx { unique_ptr<Construct> expr; };
 
 struct SyntaxErrorEx {
 

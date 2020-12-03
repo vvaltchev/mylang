@@ -247,7 +247,8 @@ public:
 class Expr14 : public Construct {
 
 public:
-    unique_ptr<Construct> lvalue;
+    /* lvalue is mutable because it can be moved in case of NotLValueEx */
+    mutable unique_ptr<Construct> lvalue;
     unique_ptr<Construct> rvalue;
     Op op;
 

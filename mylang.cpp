@@ -206,6 +206,12 @@ int main(int argc, char **argv)
         cout << "TypeErrorEx" << endl;
         return 1;
 
+    } catch (const NotLValueEx &e) {
+
+        cout << "Expected lvalue, got: ";
+        cout << *e.expr << endl;
+        return 1;
+
     } catch (const UndefinedVariableEx &e) {
 
         cout << "Undefined variable '" << e.name << "'" << endl;
