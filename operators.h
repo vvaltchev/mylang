@@ -29,4 +29,9 @@ enum class Op : int {
     bnot        = 22,
     land        = 23,
     lor         = 24,
+    addeq       = 25,
+    subeq       = 26,
+    muleq       = 27,
+    diveq       = 28,
+    modeq       = 29,
 };

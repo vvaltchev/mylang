@@ -285,6 +285,10 @@ pExpr12(ParseContext &c)
 
 unique_ptr<Construct> pExpr14(ParseContext &c)
 {
+    static const initializer_list<Op> valid_ops = {
+        Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq
+    };
+
     unique_ptr<Construct> lside, e;
     Op op = Op::invalid;
 
@@ -293,7 +297,7 @@ unique_ptr<Construct> pExpr14(ParseContext &c)
     if (!lside)
         return nullptr;
 
-    if ((op = AcceptOneOf(c, {Op::assign})) != Op::invalid) {
+    if ((op = AcceptOneOf(c, valid_ops)) != Op::invalid) {
 
         unique_ptr<Expr14> ret(new Expr14);
 

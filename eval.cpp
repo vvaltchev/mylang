@@ -369,7 +369,38 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
     } else if (lval.is<LValue *>()) {
 
-        lval.get<LValue *>()->put(RValue(rval));
+        EvalValue newVal;
+
+        if (op == Op::assign) {
+
+            newVal = RValue(rval);
+
+        } else {
+
+            newVal = RValue(lval.get<LValue *>()->eval());
+
+            switch (op) {
+                case Op::addeq:
+                    newVal.type->add(newVal, RValue(rval));
+                    break;
+                case Op::subeq:
+                    newVal.type->sub(newVal, RValue(rval));
+                    break;
+                case Op::muleq:
+                    newVal.type->mul(newVal, RValue(rval));
+                    break;
+                case Op::diveq:
+                    newVal.type->div(newVal, RValue(rval));
+                    break;
+                case Op::modeq:
+                    newVal.type->mod(newVal, RValue(rval));
+                    break;
+                default:
+                    throw InternalErrorEx();
+            }
+        }
+
+        lval.get<LValue *>()->put(newVal);
 
     } else {
 
