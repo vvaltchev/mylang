@@ -4,6 +4,7 @@
 #include "errors.h"
 #include "lexer.h"
 #include "syntax.h"
+#include "eval.h"
 
 #include <initializer_list>
 #include <cstring>

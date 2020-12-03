@@ -2,6 +2,8 @@
 
 #pragma once
 #include "lexer.h"
+#include "evalvalue.h"
+
 #include <map>
 #include <variant>
 #include <unordered_map>
@@ -19,66 +21,7 @@ class IfStmt;
 class Block;
 class LValue;
 class Identifier;
-
-struct UndefinedId { string_view id; };
-
-class EvalValue {
-
-public:
-    variant<nullptr_t, long, LValue *, UndefinedId> value;
-
-    EvalValue() : value(nullptr) { }
-    EvalValue(long val) : value(val) { }
-    EvalValue(const UndefinedId &val) : value(val) { }
-    explicit EvalValue(LValue *val) : value(val) { }
-
-    virtual ~EvalValue() = default;
-
-    template <class T>
-    T get() const {
-        return std::get<T>(value);
-    }
-
-    template <class T>
-    bool is() const {
-        return holds_alternative<T>(value);
-    }
-};
-
-class LValue {
-
-public:
-    variant<long> value;
-
-    template <class T>
-    LValue(T &&arg) : value(forward<T>(arg)) { }
-
-    template <class T>
-    T get() const {
-        return std::get<T>(value);
-    }
-
-    void put(EvalValue v) {
-
-        if (v.is<long>())
-            value = v.get<long>();
-        else
-            throw TypeErrorEx();
-    }
-
-    EvalValue eval() const {
-        return EvalValue(std::get<long>(value));
-    }
-};
-
-ostream &operator<<(ostream &s, const EvalValue &c);
-
-class EvalContext {
-
-public:
-
-    map<string, LValue, less<>> vars;
-};
+class EvalContext;
 
 class Construct {
 
@@ -125,6 +68,9 @@ public:
 
     MultiOpConstruct(const char *name) : Construct(name) { }
     virtual void serialize(ostream &s, int level = 0) const;
+
+    /* Special methods */
+    EvalValue eval_first_rvalue(EvalContext *ctx) const;
 };
 
 class MultiElemConstruct : public Construct {

@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
+#include "eval.h"
 #include "errors.h"
 #include "syntax.h"
 #include "lexer.h"
 
-static inline EvalValue
+static EvalValue
 RValue(EvalValue v)
 {
     if (v.is<LValue *>())
@@ -16,23 +17,114 @@ RValue(EvalValue v)
     return v;
 }
 
-template <class T>
-inline T RValueAs(EvalValue v)
+static inline bool
+is_true(EvalValue v)
 {
-    return RValue(v).get<T>();
+    EvalValue val = RValue(v);
+    return val.type->is_true(val);
 }
 
-template <class T>
-inline T EvalAs(EvalContext *ctx, Construct *c)
+void TypeInt::add(EvalValue &a, EvalValue b)
 {
-    try {
-
-        return RValueAs<T>(c->eval(ctx));
-
-    } catch (bad_variant_access *) {
-
+    if (!b.is<long>())
         throw TypeErrorEx();
-    }
+
+    a.val.ival += b.val.ival;
+}
+
+void TypeInt::sub(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival -= b.val.ival;
+}
+
+void TypeInt::mul(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival *= b.val.ival;
+}
+
+void TypeInt::div(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival /= b.val.ival;
+}
+
+void TypeInt::mod(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival %= b.val.ival;
+}
+
+void TypeInt::lt(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival < b.val.ival;
+}
+
+void TypeInt::gt(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival > b.val.ival;
+}
+
+void TypeInt::le(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival <= b.val.ival;
+}
+
+void TypeInt::ge(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival >= b.val.ival;
+}
+
+void TypeInt::eq(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival == b.val.ival;
+}
+
+void TypeInt::noteq(EvalValue &a, EvalValue b)
+{
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    a.val.ival = a.val.ival != b.val.ival;
+}
+
+void TypeInt::opnot(EvalValue &a)
+{
+    a.val.ival = !a.val.ival;
+}
+
+void TypeInt::opneg(EvalValue &a)
+{
+    a.val.ival = -a.val.ival;
+}
+
+bool TypeInt::is_true(EvalValue &a)
+{
+    return a.val.ival != 0;
 }
 
 EvalValue Identifier::eval(EvalContext *ctx) const
@@ -62,23 +154,42 @@ EvalValue CallExpr::eval(EvalContext *ctx) const
     }
 }
 
+EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
+{
+    if (!elems.size() || elems[0].first != Op::invalid)
+        throw InternalErrorEx();
+
+    EvalValue val = elems[0].second->eval(ctx);
+
+    if (elems.size() > 1)
+        val = RValue(val);
+
+    return val;
+}
+
 EvalValue Expr02::eval(EvalContext *ctx) const
 {
-    EvalValue val = 0;
-    const auto &[op, e] = elems.at(0);
+    if (!(elems.size() == 1 || elems.size() == 2))
+        throw InternalErrorEx();
+
+    const auto &[op, e] = elems[0];
+
+    if (op == Op::invalid)
+        return e->eval(ctx);
+
+    EvalValue val = RValue(e->eval(ctx));
 
     switch (op) {
         case Op::plus:
-            val = EvalAs<long>(ctx, e.get());
+            /* Unary operator '+': do nothing */
             break;
         case Op::minus:
-            val = - EvalAs<long>(ctx, e.get());
+            /* Unary operator '-': negate */
+            val.type->opneg(val);
             break;
         case Op::opnot:
-            val = !EvalAs<long>(ctx, e.get());
-            break;
-        case Op::invalid:
-            val = e->eval(ctx);
+            /* Unary operator '!': logial not */
+            val.type->opnot(val);
             break;
         default:
             throw InternalErrorEx();
@@ -89,35 +200,22 @@ EvalValue Expr02::eval(EvalContext *ctx) const
 
 EvalValue Expr03::eval(EvalContext *ctx) const
 {
-    EvalValue val;
-    long tmp;
+    EvalValue val = eval_first_rvalue(ctx);
 
-    for (const auto &[op, e] : elems) {
+    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
 
         switch (op) {
-
             case Op::times:
-                val = RValueAs<long>(val) * EvalAs<long>(ctx, e.get());
+                val.type->mul(val, RValue(e->eval(ctx)));
                 break;
-
-            case Op::mod:   /* fall-through */
             case Op::div:
-                tmp = EvalAs<long>(ctx, e.get());
-
-                if (tmp == 0)
-                    throw DivisionByZeroEx();
-
-                if (op == Op::div)
-                    val = RValueAs<long>(val) / tmp;
-                else
-                    val = RValueAs<long>(val) % tmp;
-
+                val.type->div(val, RValue(e->eval(ctx)));
                 break;
-
-            case Op::invalid:
-                val = e->eval(ctx);
+            case Op::mod:
+                val.type->mod(val, RValue(e->eval(ctx)));
                 break;
-
             default:
                 throw InternalErrorEx();
         }
@@ -128,19 +226,18 @@ EvalValue Expr03::eval(EvalContext *ctx) const
 
 EvalValue Expr04::eval(EvalContext *ctx) const
 {
-    EvalValue val;
+    EvalValue val = eval_first_rvalue(ctx);
 
-    for (const auto &[op, e] : elems) {
+    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
 
         switch (op) {
             case Op::plus:
-                val = RValueAs<long>(val) + EvalAs<long>(ctx, e.get());
+                val.type->add(val, RValue(e->eval(ctx)));
                 break;
             case Op::minus:
-                val = RValueAs<long>(val) - EvalAs<long>(ctx, e.get());
-                break;
-            case Op::invalid:
-                val = e->eval(ctx);
+                val.type->sub(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -152,26 +249,24 @@ EvalValue Expr04::eval(EvalContext *ctx) const
 
 EvalValue Expr06::eval(EvalContext *ctx) const
 {
-    EvalValue val;
+    EvalValue val = eval_first_rvalue(ctx);
 
-    for (const auto &[op, e] : elems) {
+    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
 
         switch (op) {
-
             case Op::lt:
-                val = RValueAs<long>(val) < EvalAs<long>(ctx, e.get());
+                val.type->lt(val, RValue(e->eval(ctx)));
                 break;
             case Op::gt:
-                val = RValueAs<long>(val) > EvalAs<long>(ctx, e.get());
+                val.type->gt(val, RValue(e->eval(ctx)));
                 break;
             case Op::le:
-                val = RValueAs<long>(val) <= EvalAs<long>(ctx, e.get());
+                val.type->le(val, RValue(e->eval(ctx)));
                 break;
             case Op::ge:
-                val = RValueAs<long>(val) >= EvalAs<long>(ctx, e.get());
-                break;
-            case Op::invalid:
-                val = e->eval(ctx);
+                val.type->ge(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -183,20 +278,18 @@ EvalValue Expr06::eval(EvalContext *ctx) const
 
 EvalValue Expr07::eval(EvalContext *ctx) const
 {
-    EvalValue val;
+    EvalValue val = eval_first_rvalue(ctx);
 
-    for (const auto &[op, e] : elems) {
+    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
 
         switch (op) {
-
             case Op::eq:
-                val = RValueAs<long>(val) == EvalAs<long>(ctx, e.get());
+                val.type->eq(val, RValue(e->eval(ctx)));
                 break;
             case Op::noteq:
-                val = RValueAs<long>(val) != EvalAs<long>(ctx, e.get());
-                break;
-            case Op::invalid:
-                val = e->eval(ctx);
+                val.type->noteq(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -213,14 +306,14 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
     if (lval.is<UndefinedId>()) {
 
-        if (rval.is<long>())
-            ctx->vars.emplace(lval.get<UndefinedId>().id, rval.get<long>());
-        else
-            throw TypeErrorEx();
+        ctx->vars.emplace(
+            lval.get<UndefinedId>().id,
+            RValue(rval).get<long>()
+        );
 
     } else if (lval.is<LValue *>()) {
 
-        lval.get<LValue *>()->put(rval);
+        lval.get<LValue *>()->put(RValue(rval));
 
     } else {
 
@@ -232,9 +325,7 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
 EvalValue IfStmt::eval(EvalContext *ctx) const
 {
-    EvalValue cond_val = EvalAs<long>(ctx, condExpr.get());
-
-    if (cond_val.get<long>()) {
+    if (is_true(condExpr->eval(ctx))) {
 
         if (thenBlock)
             thenBlock->eval(ctx);
@@ -274,7 +365,7 @@ EvalValue Block::eval(EvalContext *ctx) const
 
 EvalValue WhileStmt::eval(EvalContext *ctx) const
 {
-    while (EvalAs<long>(ctx, condExpr.get())) {
+    while (is_true(condExpr->eval(ctx))) {
 
         try {
 

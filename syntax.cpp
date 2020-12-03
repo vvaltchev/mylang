@@ -5,10 +5,10 @@
 
 ostream &operator<<(ostream &s, const EvalValue &c)
 {
-    if (holds_alternative<nullptr_t>(c.value))
+    if (c.is<nullptr_t>())
         s << "<None>";
-    else if (holds_alternative<long>(c.value))
-        s << get<long>(c.value);
+    else if (c.is<long>())
+        s << c.get<long>();
 
     return s;
 }
