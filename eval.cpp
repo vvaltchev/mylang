@@ -6,7 +6,7 @@
 #include "lexer.h"
 #include "type_int.cpp.h"
 
-array<Type *, Type::t_count> AllTypes = {
+const array<Type *, Type::t_count> AllTypes = {
     new Type(Type::t_none),
     new Type(Type::t_lval),
     new Type(Type::t_undefid),

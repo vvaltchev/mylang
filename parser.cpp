@@ -138,11 +138,12 @@ unique_ptr<Construct>
 pExpr01(ParseContext &c)
 {
     unique_ptr<Construct> ret;
-    unique_ptr<Construct> e, e2;
+    unique_ptr<Construct> main;
+    unique_ptr<Construct> callExpr;
 
-    if (pAcceptLiteralInt(c, e)) {
+    if (pAcceptLiteralInt(c, main)) {
 
-        ret = move(e);
+        ret = move(main);
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
@@ -151,12 +152,12 @@ pExpr01(ParseContext &c)
         pExpectOp(c, Op::parenR);
         ret = move(expr);
 
-    } else if (pAcceptId(c, e)) {
+    } else if (pAcceptId(c, main)) {
 
-        if (pAcceptCallExpr(c, e, e2))
-            ret = move(e2);
+        if (pAcceptCallExpr(c, main, callExpr))
+            ret = move(callExpr);
         else
-            ret = move(e);
+            ret = move(main);
 
     } else {
 

@@ -84,7 +84,7 @@ public:
     virtual bool is_true(EvalValue &a) { throw TypeErrorEx(); }
 };
 
-extern array<Type *, Type::t_count> AllTypes;
+extern const array<Type *, Type::t_count> AllTypes;
 
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[(int)Type::t_none]) { }
