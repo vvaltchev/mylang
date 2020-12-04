@@ -4,8 +4,16 @@
 #include "errors.h"
 #include "syntax.h"
 #include "lexer.h"
+#include "type_int.cpp.h"
 
-static EvalValue
+array<Type *, Type::t_count> AllTypes = {
+    new Type(Type::t_none),
+    new Type(Type::t_lval),
+    new Type(Type::t_undefid),
+    new TypeInt(),
+};
+
+EvalValue
 RValue(EvalValue v)
 {
     if (v.is<LValue *>())
@@ -15,132 +23,6 @@ RValue(EvalValue v)
         throw UndefinedVariableEx{v.get<UndefinedId>().id};
 
     return v;
-}
-
-static inline bool
-is_true(EvalValue v)
-{
-    EvalValue val = RValue(v);
-    return val.type->is_true(val);
-}
-
-void TypeInt::add(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival += b.val.ival;
-}
-
-void TypeInt::sub(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival -= b.val.ival;
-}
-
-void TypeInt::mul(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival *= b.val.ival;
-}
-
-void TypeInt::div(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival /= b.val.ival;
-}
-
-void TypeInt::mod(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival %= b.val.ival;
-}
-
-void TypeInt::lt(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival < b.val.ival;
-}
-
-void TypeInt::gt(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival > b.val.ival;
-}
-
-void TypeInt::le(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival <= b.val.ival;
-}
-
-void TypeInt::ge(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival >= b.val.ival;
-}
-
-void TypeInt::eq(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival == b.val.ival;
-}
-
-void TypeInt::noteq(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival != b.val.ival;
-}
-
-void TypeInt::opneg(EvalValue &a)
-{
-    a.val.ival = -a.val.ival;
-}
-
-void TypeInt::lnot(EvalValue &a)
-{
-    a.val.ival = !a.val.ival;
-}
-
-void TypeInt::land(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival && b.val.ival;
-}
-
-void TypeInt::lor(EvalValue &a, EvalValue b)
-{
-    if (!b.is<long>())
-        throw TypeErrorEx();
-
-    a.val.ival = a.val.ival || b.val.ival;
-}
-
-bool TypeInt::is_true(EvalValue &a)
-{
-    return a.val.ival != 0;
 }
 
 EvalValue Identifier::eval(EvalContext *ctx) const

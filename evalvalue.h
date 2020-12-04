@@ -3,6 +3,7 @@
 #pragma once
 #include "errors.h"
 #include <string_view>
+#include <array>
 
 using namespace std;
 
@@ -52,10 +53,13 @@ class Type {
 public:
 
     enum TypeE : int {
-        t_none     = 0,
-        t_lval     = 1,
-        t_undefid  = 2,
-        t_int      = 3,
+
+        t_none,
+        t_lval,
+        t_undefid,
+        t_int,
+
+        t_count,
     };
 
     const TypeE t;
@@ -80,39 +84,7 @@ public:
     virtual bool is_true(EvalValue &a) { throw TypeErrorEx(); }
 };
 
-class TypeInt : public Type {
-
-public:
-
-    TypeInt() : Type(Type::t_int) { }
-
-    virtual void add(EvalValue &a, EvalValue b);
-    virtual void sub(EvalValue &a, EvalValue b);
-    virtual void mul(EvalValue &a, EvalValue b);
-    virtual void div(EvalValue &a, EvalValue b);
-    virtual void mod(EvalValue &a, EvalValue b);
-    virtual void lt(EvalValue &a, EvalValue b);
-    virtual void gt(EvalValue &a, EvalValue b);
-    virtual void le(EvalValue &a, EvalValue b);
-    virtual void ge(EvalValue &a, EvalValue b);
-    virtual void eq(EvalValue &a, EvalValue b);
-    virtual void noteq(EvalValue &a, EvalValue b);
-    virtual void opneg(EvalValue &a);
-    virtual void lnot(EvalValue &a);
-    virtual void land(EvalValue &a, EvalValue b);
-    virtual void lor(EvalValue &a, EvalValue b);
-
-    virtual bool is_true(EvalValue &a);
-};
-
-
-static Type *AllTypes[] = {
-
-    new Type(Type::t_none),
-    new Type(Type::t_lval),
-    new Type(Type::t_undefid),
-    new TypeInt(),
-};
+extern array<Type *, Type::t_count> AllTypes;
 
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[(int)Type::t_none]) { }
@@ -161,4 +133,13 @@ inline long EvalValue::get<long>() const {
         return val.ival;
 
     throw TypeErrorEx();
+}
+
+EvalValue RValue(EvalValue v);
+
+inline bool
+is_true(EvalValue v)
+{
+    EvalValue val = RValue(v);
+    return val.type->is_true(val);
 }
