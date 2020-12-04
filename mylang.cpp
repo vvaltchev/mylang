@@ -15,10 +15,12 @@ static bool opt_show_syntax_tree;
 
 void help()
 {
-    cout << "syntax:" << endl;
+    cout << "Syntax:" << endl;
     cout << "   mylang [-t] [-s] FILE" << endl;
     cout << "   mylang [-t] [-s] -e EXPRESSION" << endl;
     cout << endl;
+    cout << "   -t      Show all tokens" << endl;
+    cout << "   -s      Dump the syntax tree" << endl;
 }
 
 void
@@ -61,9 +63,15 @@ parse_args(int argc,
     bool in_tokens = false;
 
     if (!argc) {
+
         /* That should *never* happen */
         cout << "Unexpected (system) error: zero arguments" << endl;
         exit(1);
+
+    } else if (argc == 1) {
+
+        help();
+        exit(0);
     }
 
     for (argc--, argv++; argc > 0; argc--, argv++) {
