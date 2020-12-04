@@ -6,14 +6,6 @@
 #include "lexer.h"
 #include "type_int.cpp.h"
 
-const array<Type *, Type::t_count> AllTypes = {
-    new Type(Type::t_none),
-    new Type(Type::t_lval),
-    new Type(Type::t_undefid),
-    new TypeInt(),
-    new Type(Type::t_builtin),
-};
-
 EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 {
     for (const auto &e: exprList->elems) {
@@ -25,10 +17,55 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
     return EvalValue();
 }
 
+
+static const string &
+find_builtin_name(const Builtin &b)
+{
+    for (const auto &[k, v]: EvalContext::builtins) {
+
+        if (v->eval().val.bfunc.func == b.func)
+            return k;
+    }
+
+    throw InternalErrorEx();
+}
+
+class TypeNone : public Type {
+
+public:
+    TypeNone() : Type(Type::t_none) { }
+    virtual string to_string(const EvalValue &a) {
+        return "<none>";
+    }
+};
+
+class TypeBuiltin : public Type {
+
+public:
+    TypeBuiltin() : Type(Type::t_builtin) { }
+    virtual string to_string(const EvalValue &a) {
+        return "<builtin: " + find_builtin_name(a.val.bfunc) + ">";
+    }
+};
+
+const array<Type *, Type::t_count> AllTypes = {
+    new TypeNone(),
+    new Type(Type::t_lval),       /* internal type: not visible from outside */
+    new Type(Type::t_undefid),    /* internal type: not visible from outside */
+    new TypeInt(),
+    new TypeBuiltin(),
+};
+
+/*
+ * NOTE: this definition *MUST FOLLOW* the definition of `AllTypes`
+ * simply because the creation of LValue's contents does a lookup
+ * in AllTypes.
+ */
 const EvalContext::SymbolsType EvalContext::builtins =
 {
     make_pair("print", make_shared<LValue>(Builtin{builtin_print}))
 };
+
 
 EvalContext::EvalContext()
 {

@@ -9,10 +9,6 @@
 #include <string_view>
 #include <cassert>
 
-/*
- * For small C++ projects, often using std everywhere is better because
- * it reduces the clutter (no "std::") and makes the code look cleaner.
- */
 using namespace std;
 
 enum class TokType : int {

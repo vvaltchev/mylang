@@ -57,6 +57,8 @@ public:
     bool is() const;
 };
 
+ostream &operator<<(ostream &s, const EvalValue &c);
+
 class Type {
 
 public:
@@ -91,7 +93,8 @@ public:
     virtual void land(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
     virtual void lor(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
 
-    virtual bool is_true(EvalValue &a) { throw TypeErrorEx(); }
+    virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
+    virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
 };
 
 extern const array<Type *, Type::t_count> AllTypes;

@@ -4,6 +4,8 @@
 #include "evalvalue.h"
 #include <map>
 
+using namespace std;
+
 class LValue {
 
     EvalValue val;
@@ -27,8 +29,6 @@ public:
 
     EvalValue eval() const { return val; }
 };
-
-ostream &operator<<(ostream &s, const EvalValue &c);
 
 class EvalContext {
 

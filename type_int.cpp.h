@@ -30,7 +30,8 @@ public:
     virtual void land(EvalValue &a, EvalValue b);
     virtual void lor(EvalValue &a, EvalValue b);
 
-    virtual bool is_true(EvalValue &a);
+    virtual bool is_true(const EvalValue &a);
+    virtual string to_string(const EvalValue &a);
 };
 
 void TypeInt::add(EvalValue &a, EvalValue b)
@@ -147,7 +148,11 @@ void TypeInt::lor(EvalValue &a, EvalValue b)
     a.val.ival = a.val.ival || b.val.ival;
 }
 
-bool TypeInt::is_true(EvalValue &a)
+bool TypeInt::is_true(const EvalValue &a)
 {
     return a.val.ival != 0;
+}
+
+string TypeInt::to_string(const EvalValue &a) {
+    return std::to_string(a.val.ival);
 }

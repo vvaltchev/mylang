@@ -10,6 +10,12 @@
 #include <fstream>
 #include <cstring>
 
+/*
+ * For small C++ projects, often using std everywhere is better because
+ * it reduces the clutter (no "std::") and makes the code look cleaner.
+ */
+using namespace std;
+
 static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
 

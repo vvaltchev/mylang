@@ -5,12 +5,7 @@
 
 ostream &operator<<(ostream &s, const EvalValue &c)
 {
-    if (c.is<nullptr_t>())
-        s << "<None>";
-    else if (c.is<long>())
-        s << c.get<long>();
-
-    return s;
+    return s << c.type->to_string(c);
 }
 
 void ChildlessConstruct::serialize(ostream &s, int level) const
