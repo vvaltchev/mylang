@@ -13,6 +13,14 @@ const array<Type *, Type::t_count> AllTypes = {
     new TypeInt(),
 };
 
+const EvalContext::SymbolsType EvalContext::builtins;
+
+EvalContext::EvalContext()
+{
+    /* Copy the builtins in the current EvalContext */
+    symbols = builtins;
+}
+
 EvalValue
 RValue(EvalValue v)
 {
@@ -27,12 +35,12 @@ RValue(EvalValue v)
 
 EvalValue Identifier::eval(EvalContext *ctx) const
 {
-    auto it = ctx->vars.find(value);
+    auto it = ctx->symbols.find(value);
 
-    if (it == ctx->vars.end())
+    if (it == ctx->symbols.end())
         return UndefinedId{value};
 
-    return EvalValue(&it->second);
+    return EvalValue(it->second.get());
 }
 
 EvalValue CallExpr::eval(EvalContext *ctx) const
@@ -244,9 +252,9 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
     if (lval.is<UndefinedId>()) {
 
-        ctx->vars.emplace(
+        ctx->symbols.emplace(
             lval.get<UndefinedId>().id,
-            RValue(rval).get<long>()
+            make_shared<LValue>(RValue(rval))
         );
 
     } else if (lval.is<LValue *>()) {

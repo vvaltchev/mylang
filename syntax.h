@@ -4,10 +4,6 @@
 #include "lexer.h"
 #include "evalvalue.h"
 
-#include <map>
-#include <variant>
-#include <unordered_map>
-
 class Literal;
 class LiteralInt;
 class ExprList;

@@ -4,6 +4,7 @@
 #include "errors.h"
 #include <string_view>
 #include <array>
+#include <cassert>
 
 using namespace std;
 
@@ -63,7 +64,7 @@ public:
     };
 
     const TypeE t;
-    Type(TypeE t) : t(t) { }
+    Type(TypeE t) : t(t) { assert(t != t_count); }
 
     virtual void add(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
     virtual void sub(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
@@ -87,16 +88,16 @@ public:
 extern const array<Type *, Type::t_count> AllTypes;
 
 inline EvalValue::EvalValue()
-    : val(), type(AllTypes[(int)Type::t_none]) { }
+    : val(), type(AllTypes[Type::t_none]) { }
 
 inline EvalValue::EvalValue(long val)
-    : val(val), type(AllTypes[(int)Type::t_int]) { }
+    : val(val), type(AllTypes[Type::t_int]) { }
 
 inline EvalValue::EvalValue(LValue *val)
-    : val(val), type(AllTypes[(int)Type::t_lval]) { }
+    : val(val), type(AllTypes[Type::t_lval]) { }
 
 inline EvalValue::EvalValue(const UndefinedId &val)
-    : val(val), type(AllTypes[(int)Type::t_undefid]) { }
+    : val(val), type(AllTypes[Type::t_undefid]) { }
 
 
 template <>

@@ -2,34 +2,36 @@
 
 #pragma once
 #include "evalvalue.h"
-#include <variant>
 #include <map>
+
+class ExprList;
+
+struct Builtin {
+    EvalValue (*func)(ExprList *);
+};
 
 class LValue {
 
-    variant<long> value;
+    EvalValue val;
+
+    void type_checks() const {
+        assert(val.type->t != Type::t_lval);
+        assert(val.type->t != Type::t_undefid);
+    }
 
 public:
 
-    template <class T>
-    LValue(T &&arg) : value(forward<T>(arg)) { }
+    LValue(const EvalValue &val) : val(val) { type_checks(); }
+    LValue(EvalValue &&val) : val(forward<EvalValue>(val)) { type_checks(); }
+    LValue(const LValue &rhs) = delete;
+    LValue(LValue &&rhs) = delete;
+    LValue &operator=(const LValue &rhs) = delete;
+    LValue &operator=(LValue &&rhs) = delete;
 
-    template <class T>
-    T get() const {
-        return std::get<T>(value);
-    }
+    void put(const EvalValue &v) { val = v; type_checks(); }
+    void put(EvalValue &&v) { val = v; type_checks(); }
 
-    void put(EvalValue v) {
-
-        if (v.is<long>())
-            value = v.get<long>();
-        else
-            throw TypeErrorEx();
-    }
-
-    EvalValue eval() const {
-        return EvalValue(std::get<long>(value));
-    }
+    EvalValue eval() const { return val; }
 };
 
 ostream &operator<<(ostream &s, const EvalValue &c);
@@ -38,5 +40,10 @@ class EvalContext {
 
 public:
 
-    map<string, LValue, less<>> vars;
+    typedef map<string, shared_ptr<LValue>, less<>> SymbolsType;
+
+    EvalContext();
+    SymbolsType symbols;
+
+    static const SymbolsType builtins;
 };
