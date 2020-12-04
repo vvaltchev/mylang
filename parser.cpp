@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "parser.h"
+#include "evalvalue.h"
 
 /*
  * ----------------- Recursive Descent Parser -------------------
@@ -19,8 +20,7 @@ unique_ptr<Construct> pExpr11(ParseContext &c); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c); // ops: ||
 unique_ptr<Construct> pExpr14(ParseContext &c); // ops: =
 unique_ptr<Construct> pStmt(ParseContext &c, bool loop = false);
-
-inline unique_ptr<Construct> pExprTop(ParseContext &c) { return pExpr14(c); }
+unique_ptr<Construct> pExprTop(ParseContext &c);
 
 bool pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
@@ -144,6 +144,7 @@ pExpr01(ParseContext &c)
     if (pAcceptLiteralInt(c, main)) {
 
         ret = move(main);
+        ret->is_literal = true;
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
@@ -152,6 +153,9 @@ pExpr01(ParseContext &c)
 
         if (!expr->elem)
             noExprError(c);
+
+        if (expr->elem->is_literal)
+            expr->is_literal = true;
 
         pExpectOp(c, Op::parenR);
         ret = move(expr);
@@ -180,9 +184,12 @@ pExprGeneric(ParseContext &c,
     Op op;
     unique_ptr<ExprT> ret;
     unique_ptr<Construct> lowerE = lowerExpr(c);
+    bool is_literal;
 
     if (!lowerE)
         return nullptr;
+
+    is_literal = lowerE->is_literal;
 
     while ((op = AcceptOneOf(c, ops)) != Op::invalid) {
 
@@ -196,12 +203,14 @@ pExprGeneric(ParseContext &c,
         if (!lowerE)
             noExprError(c);
 
+        is_literal = is_literal && lowerE->is_literal;
         ret->elems.emplace_back(op, move(lowerE));
     }
 
     if (!ret)
         return lowerE;
 
+    ret->is_literal = is_literal;
     return ret;
 }
 
@@ -236,6 +245,7 @@ pExpr02(ParseContext &c)
         return elem;
 
     ret.reset(new Expr02);
+    ret->is_literal = elem->is_literal;
     ret->elems.emplace_back(op, move(elem));
     return ret;
 }
@@ -308,7 +318,7 @@ unique_ptr<Construct> pExpr14(ParseContext &c)
 
         ret->op = op;
         ret->lvalue = move(lside);
-        ret->rvalue = pExpr14(c);
+        ret->rvalue = pExprTop(c);
 
         if (!ret->rvalue)
             noExprError(c);
@@ -319,6 +329,21 @@ unique_ptr<Construct> pExpr14(ParseContext &c)
 
         return lside;
     }
+}
+
+unique_ptr<Construct> pExprTop(ParseContext &c) {
+
+    unique_ptr<Construct> e = pExpr14(c);
+
+    if (e && e->is_literal) {
+
+        EvalValue v = e->eval(nullptr);
+
+        if (v.is<long>())
+            return make_unique<LiteralInt>(v.get<long>());
+    }
+
+    return e;
 }
 
 unique_ptr<Construct>

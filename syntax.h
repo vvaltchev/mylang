@@ -23,8 +23,11 @@ class Construct {
 
 public:
     const char *const name;
+    bool is_literal;
 
-    Construct(const char *name) : name(name) { }
+    Construct(const char *name, bool literal = false)
+        : name(name), is_literal(literal) { }
+
     virtual ~Construct() = default;
     virtual EvalValue eval(EvalContext *) const = 0;
     virtual void serialize(ostream &s, int level = 0) const = 0;
@@ -87,9 +90,9 @@ inline ostream &operator<<(ostream &s, const Construct &c)
 class Literal : public Construct {
 
 public:
-    long value;
+    const long value;
 
-    Literal(long v) : Construct("Literal"), value(v) { }
+    Literal(long v) : Construct("Literal", true), value(v) { }
 };
 
 class LiteralInt : public Literal {
