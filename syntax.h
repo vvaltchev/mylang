@@ -23,10 +23,10 @@ class Construct {
 
 public:
     const char *const name;
-    bool is_literal;
+    bool is_const;
 
-    Construct(const char *name, bool literal = false)
-        : name(name), is_literal(literal) { }
+    Construct(const char *name, bool is_const = false)
+        : name(name), is_const(is_const) { }
 
     virtual ~Construct() = default;
     virtual EvalValue eval(EvalContext *) const = 0;

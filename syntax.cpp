@@ -18,17 +18,17 @@ void ChildlessConstruct::serialize(ostream &s, int level) const
 void SingleChildConstruct::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
-    bool is_literal = dynamic_cast<Literal *>(elem.get()) != nullptr;
+    bool is_const = dynamic_cast<Literal *>(elem.get()) != nullptr;
 
     s << indent;
     s << name << "(";
 
-    if (!is_literal)
+    if (!is_const)
         s << endl;
 
-    elem->serialize(s, is_literal ? 0 : level + 1);
+    elem->serialize(s, is_const ? 0 : level + 1);
 
-    if (!is_literal) {
+    if (!is_const) {
         s << endl;
         s << indent;
     }
