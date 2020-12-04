@@ -10,18 +10,25 @@ using namespace std;
 
 class Type;
 class LValue;
+class ExprList;
+class EvalValue;
+class EvalContext;
+
 struct UndefinedId { string_view id; };
+struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
 union ValueU {
 
     long ival;
     LValue *lval;
     UndefinedId undef;
+    Builtin bfunc;
 
     ValueU() : ival(0) { }
     ValueU(long val) : ival(val) { }
     ValueU(LValue *val) : lval(val) { }
     ValueU(const UndefinedId &val) : undef(val) { }
+    ValueU(const Builtin &val) : bfunc(val) { }
 };
 
 class EvalValue {
@@ -41,6 +48,7 @@ public:
     EvalValue(long val);
     EvalValue(LValue *val);
     EvalValue(const UndefinedId &val);
+    EvalValue(const Builtin &val);
 
     template <class T>
     T get() const;
@@ -59,6 +67,7 @@ public:
         t_lval,
         t_undefid,
         t_int,
+        t_builtin,
 
         t_count,
     };
@@ -90,14 +99,17 @@ extern const array<Type *, Type::t_count> AllTypes;
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[Type::t_none]) { }
 
-inline EvalValue::EvalValue(long val)
-    : val(val), type(AllTypes[Type::t_int]) { }
-
 inline EvalValue::EvalValue(LValue *val)
     : val(val), type(AllTypes[Type::t_lval]) { }
 
 inline EvalValue::EvalValue(const UndefinedId &val)
     : val(val), type(AllTypes[Type::t_undefid]) { }
+
+inline EvalValue::EvalValue(long val)
+    : val(val), type(AllTypes[Type::t_int]) { }
+
+inline EvalValue::EvalValue(const Builtin &val)
+    : val(val), type(AllTypes[Type::t_builtin]) { }
 
 
 template <>
@@ -108,6 +120,9 @@ template <>
 inline bool EvalValue::is<UndefinedId>() const { return type->t == Type::t_undefid; }
 template <>
 inline bool EvalValue::is<long>() const { return type->t == Type::t_int; }
+template <>
+inline bool EvalValue::is<Builtin>() const { return type->t == Type::t_builtin; }
+
 
 template <>
 inline LValue *EvalValue::get<LValue *>() const {
@@ -135,6 +150,16 @@ inline long EvalValue::get<long>() const {
 
     throw TypeErrorEx();
 }
+
+template <>
+inline Builtin EvalValue::get<Builtin>() const {
+
+    if (is<Builtin>())
+        return val.bfunc;
+
+    throw TypeErrorEx();
+}
+
 
 EvalValue RValue(EvalValue v);
 

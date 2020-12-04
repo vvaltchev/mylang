@@ -4,12 +4,6 @@
 #include "evalvalue.h"
 #include <map>
 
-class ExprList;
-
-struct Builtin {
-    EvalValue (*func)(ExprList *);
-};
-
 class LValue {
 
     EvalValue val;
@@ -29,7 +23,7 @@ public:
     LValue &operator=(LValue &&rhs) = delete;
 
     void put(const EvalValue &v) { val = v; type_checks(); }
-    void put(EvalValue &&v) { val = v; type_checks(); }
+    void put(EvalValue &&v) { val = forward<EvalValue>(v); type_checks(); }
 
     EvalValue eval() const { return val; }
 };

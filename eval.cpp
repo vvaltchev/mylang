@@ -11,9 +11,24 @@ const array<Type *, Type::t_count> AllTypes = {
     new Type(Type::t_lval),
     new Type(Type::t_undefid),
     new TypeInt(),
+    new Type(Type::t_builtin),
 };
 
-const EvalContext::SymbolsType EvalContext::builtins;
+EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
+{
+    for (const auto &e: exprList->elems) {
+        cout << RValue(e->eval(ctx)) << " ";
+    }
+
+    cout << endl;
+
+    return EvalValue();
+}
+
+const EvalContext::SymbolsType EvalContext::builtins =
+{
+    make_pair("print", make_shared<LValue>(Builtin{builtin_print}))
+};
 
 EvalContext::EvalContext()
 {
@@ -45,19 +60,15 @@ EvalValue Identifier::eval(EvalContext *ctx) const
 
 EvalValue CallExpr::eval(EvalContext *ctx) const
 {
-    if (id->value == "print") {
+    EvalValue callable = RValue(id->eval(ctx));
 
-        for (const auto &e: args->elems) {
-            cout << RValue(e->eval(ctx)) << " ";
-        }
-
-        cout << endl;
-        return EvalValue();
-
-    } else {
-
+    if (callable.is<UndefinedId>())
         throw UndefinedVariableEx{id->value};
-    }
+
+    if (callable.is<Builtin>())
+        return callable.get<Builtin>().func(ctx, args.get());
+
+    throw TypeErrorEx();
 }
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
