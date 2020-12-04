@@ -1,5 +1,5 @@
 #
-# Simple test script
+# Simple loop, useful for performance benchmarks
 #
 
 i = 0;
