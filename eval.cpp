@@ -73,8 +73,7 @@ EvalValue CallExpr::eval(EvalContext *ctx) const
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 {
-    if (!elems.size() || elems[0].first != Op::invalid)
-        throw InternalErrorEx();
+    assert(elems.size() >= 1 && elems[0].first == Op::invalid);
 
     EvalValue val = elems[0].second->eval(ctx);
 
@@ -86,9 +85,7 @@ EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 
 EvalValue Expr02::eval(EvalContext *ctx) const
 {
-    if (!(elems.size() == 1 || elems.size() == 2))
-        throw InternalErrorEx();
-
+    assert(elems.size() == 1 || elems.size() == 2);
     const auto &[op, e] = elems[0];
 
     if (op == Op::invalid)
