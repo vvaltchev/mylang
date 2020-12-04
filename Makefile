@@ -1,26 +1,48 @@
-#
-# Trivial Makefile for a simple educational project
-#
+# SPDX-License-Identifier: BSD-2-Clause
 
-BASE_CFLAGS ?= -std=c++17 -ggdb -Wall -Wextra -Wno-unused-parameter
+BUILD_DIR ?= build
+PROJ_ROOT:=$(shell pwd)
+
+FL_LANG ?= -std=c++17
+FL_DBG ?= -ggdb
+FL_WARN ?= -Wall -Wextra -Wno-unused-parameter
+FL_OTHER ?= -fwrapv
+FL_INC = -I$(PROJ_ROOT)
+BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
+
+
+DEPDIR := .d
+DEPFLAGS = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.Td
+POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d
+SOURCES:=$(wildcard *.cpp)
+OBJECTS=$(SOURCES:%.cpp=$(BUILD_DIR)/%.o)
+
+
 TARGET = mylang
 
-.PHONY: all clean
+$(shell mkdir -p $(DEPDIR) > /dev/null)
+$(shell mkdir -p $(BUILD_DIR) > /dev/null)
 
 # Default target
-all: $(TARGET)
+all: $(BUILD_DIR)/$(TARGET)
 
-OBJECTS = $(patsubst %.cpp, %.o, $(wildcard *.cpp))
-HEADERS = $(wildcard *.h)
+$(BUILD_DIR)/%.o : %.cpp
+$(BUILD_DIR)/%.o : %.cpp $(DEPDIR)/%.d
+	@echo Compiling $<...
+	@$(COMPILE) $(CXX) -o $@ $(DEPFLAGS) $(BASE_FLAGS) $(CFLAGS) -c $<
+	@$(POSTCOMPILE)
 
-%.o: %.cpp $(HEADERS)
-	$(CXX) $(BASE_CFLAGS) $(CFLAGS) -c $< -o $@
-
-.PRECIOUS: $(TARGET) $(OBJECTS)
-
-$(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) -o $@ $(LFLAGS)
+$(BUILD_DIR)/$(TARGET): $(OBJECTS)
+	@echo Linking $(TARGET)...
+	@$(CXX) $(OBJECTS) -o $@ $(LFLAGS)
 
 clean:
-	-rm -f *.o
-	-rm -f $(TARGET)
+	rm -f $(BUILD_DIR)/*.o
+	rm -f $(BUILD_DIR)/$(TARGET)
+	rm -rf $(DEPDIR)
+
+$(DEPDIR)/%.d: ;
+.PRECIOUS: $(DEPDIR)/%.d
+.PHONY: all clean
+
+-include $(patsubst %,$(DEPDIR)/%.d,$(basename $(SOURCES)))
