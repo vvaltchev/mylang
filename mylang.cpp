@@ -129,14 +129,15 @@ handleSyntaxError(const SyntaxErrorEx &e)
     if (e.loc.line) {
 
         cout << " at line "
-                << e.loc.line << ", col " << e.loc.col
-                << ": ";
+             << e.loc.line << ", col " << e.loc.col
+             << ": ";
 
     } else if (e.loc.col) {
 
         cout << " at col " << e.loc.col << ": ";
 
     } else {
+
         cout << ": ";
     }
 
@@ -200,7 +201,11 @@ int main(int argc, char **argv)
         }
 
         if (!ctx.eoi())
-            throw SyntaxErrorEx(Loc(ctx.get_tok().loc), "Unexpected token at the end", &ctx.get_tok());
+            throw SyntaxErrorEx(
+                Loc(ctx.get_tok().loc),
+                "Unexpected token at the end",
+                &ctx.get_tok()
+            );
 
         /* Run the script */
         EvalContext evalCtx;
