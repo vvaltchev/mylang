@@ -149,6 +149,10 @@ pExpr01(ParseContext &c)
 
         unique_ptr<Expr01> expr(new Expr01);
         expr->elem = pExprTop(c);
+
+        if (!expr->elem)
+            noExprError(c);
+
         pExpectOp(c, Op::parenR);
         ret = move(expr);
 
