@@ -17,6 +17,14 @@ ParseContext::ParseContext(const TokenStream &ts)
  * Note: this simple language has just no operators for several levels.
  */
 
+enum pFlags : unsigned {
+
+    pNone           = 1 << 0,
+    pInDecl         = 1 << 1,
+    pInConstDecl    = 1 << 2,
+    pInLoop         = 1 << 3,
+};
+
 unique_ptr<Construct> pExpr01(ParseContext &c); // ops: ()
 unique_ptr<Construct> pExpr02(ParseContext &c); // ops: + (unary), - (unary), !
 unique_ptr<Construct> pExpr03(ParseContext &c); // ops: *, /
@@ -25,12 +33,14 @@ unique_ptr<Construct> pExpr06(ParseContext &c); // ops: <, >, <=, >=
 unique_ptr<Construct> pExpr07(ParseContext &c); // ops: ==, !=
 unique_ptr<Construct> pExpr11(ParseContext &c); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c); // ops: ||
-unique_ptr<Construct> pExpr14(ParseContext &c, bool const_decl);  // ops: =
-unique_ptr<Construct> pExprTop(ParseContext &c, bool const_decl = false);
-unique_ptr<Construct> pStmt(ParseContext &c, bool loop = false);
+unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl);  // ops: =
+unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl = pFlags::pNone);
+unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl = pFlags::pNone);
 
 bool
-pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, bool loop);
+pAcceptIfStmt(ParseContext &c,
+              unique_ptr<Construct> &ret,
+              unsigned fl = pFlags::pNone);
 
 bool
 pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret);
@@ -339,7 +349,7 @@ pExpr12(ParseContext &c)
 }
 
 unique_ptr<Construct>
-pExpr14(ParseContext &c, bool const_decl)
+pExpr14(ParseContext &c, unsigned fl)
 {
     static const initializer_list<Op> valid_ops = {
         Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq
@@ -348,7 +358,7 @@ pExpr14(ParseContext &c, bool const_decl)
     unique_ptr<Construct> lside;
     Op op = Op::invalid;
 
-    if (const_decl) {
+    if (fl & pFlags::pInConstDecl) {
 
         if (!pAcceptId(c, lside, false /* resolve_const */)) {
 
@@ -393,7 +403,7 @@ pExpr14(ParseContext &c, bool const_decl)
         );
     }
 
-    if (const_decl) {
+    if (fl & pFlags::pInConstDecl) {
 
         if (op != Op::assign)
             throw ConstNotAllowedEx{c.get_loc()};
@@ -421,9 +431,9 @@ pExpr14(ParseContext &c, bool const_decl)
 }
 
 unique_ptr<Construct>
-pExprTop(ParseContext &c, bool const_decl)
+pExprTop(ParseContext &c, unsigned fl)
 {
-    unique_ptr<Construct> e = pExpr14(c, const_decl);
+    unique_ptr<Construct> e = pExpr14(c, fl);
 
     if (e && e->is_const) {
         EvalValue v = e->eval(c.const_ctx);
@@ -434,11 +444,11 @@ pExprTop(ParseContext &c, bool const_decl)
 }
 
 unique_ptr<Construct>
-pStmt(ParseContext &c, bool loop)
+pStmt(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> subStmt;
 
-    if (loop) {
+    if (fl & pFlags::pInLoop) {
 
         if (pAcceptKeyword(c, Keyword::kw_break))
             return make_unique<BreakStmt>();
@@ -446,7 +456,7 @@ pStmt(ParseContext &c, bool loop)
             return make_unique<ContinueStmt>();
     }
 
-    if (pAcceptIfStmt(c, subStmt, loop)) {
+    if (pAcceptIfStmt(c, subStmt, fl)) {
 
         return subStmt;
 
@@ -456,12 +466,10 @@ pStmt(ParseContext &c, bool loop)
 
     } else {
 
-        bool const_decl = false;
-
         if (pAcceptKeyword(c, Keyword::kw_const))
-            const_decl = true;
+            fl |= pFlags::pInDecl | pFlags::pInConstDecl;
 
-        unique_ptr<Construct> lowerE = pExprTop(c, const_decl);
+        unique_ptr<Construct> lowerE = pExprTop(c, fl);
 
         if (!lowerE)
             return nullptr;
@@ -474,14 +482,14 @@ pStmt(ParseContext &c, bool loop)
 }
 
 unique_ptr<Construct>
-pBlock(ParseContext &c, bool loop)
+pBlock(ParseContext &c, unsigned fl)
 {
     unique_ptr<Block> ret(new Block);
     unique_ptr<Construct> stmt;
 
     if (!c.eoi()) {
 
-        while ((stmt = pStmt(c, loop))) {
+        while ((stmt = pStmt(c, fl))) {
 
             ret->elems.emplace_back(move(stmt));
 
@@ -496,10 +504,10 @@ pBlock(ParseContext &c, bool loop)
 bool
 pAcceptBracedBlock(ParseContext &c,
                    unique_ptr<Construct> &ret,
-                   bool loop)
+                   unsigned fl = pFlags::pNone)
 {
     if (pAcceptOp(c, Op::braceL)) {
-        ret = pBlock(c, loop);
+        ret = pBlock(c, fl);
         pExpectOp(c, Op::braceR);
         return true;
     }
@@ -508,7 +516,7 @@ pAcceptBracedBlock(ParseContext &c,
 }
 
 bool
-pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, bool loop)
+pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 {
     if (pAcceptKeyword(c, Keyword::kw_if)) {
 
@@ -522,11 +530,11 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, bool loop)
 
         pExpectOp(c, Op::parenR);
 
-        if (!pAcceptBracedBlock(c, ifstmt->thenBlock, loop))
+        if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl))
             ifstmt->thenBlock = pStmt(c);
 
         if (pAcceptKeyword(c, Keyword::kw_else)) {
-            if (!pAcceptBracedBlock(c, ifstmt->elseBlock, loop))
+            if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl))
                 ifstmt->elseBlock = pStmt(c);
         }
 
@@ -552,7 +560,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret)
 
         pExpectOp(c, Op::parenR);
 
-        if (!pAcceptBracedBlock(c, whileStmt->body, true))
+        if (!pAcceptBracedBlock(c, whileStmt->body, pFlags::pInLoop))
             whileStmt->body = pStmt(c);
 
         ret = move(whileStmt);

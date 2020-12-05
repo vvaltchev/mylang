@@ -61,4 +61,4 @@ public:
 };
 
 unique_ptr<Construct>
-pBlock(ParseContext &c, bool loop = false);
+pBlock(ParseContext &c, unsigned fl = 0);
