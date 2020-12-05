@@ -357,6 +357,28 @@ EvalValue Expr14::eval(EvalContext *ctx) const
     return rval;
 }
 
+EvalValue Expr15::eval(EvalContext *ctx) const
+{
+    EvalValue val;
+    assert(elems.size() > 0);
+    val = elems[0].second->eval(ctx);
+
+    for (auto it = elems.begin()+1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
+
+        switch (op) {
+            case Op::comma:
+                val = e->eval(ctx);
+                break;
+            default:
+                throw InternalErrorEx();
+        }
+    }
+
+    return val;
+}
+
 EvalValue IfStmt::eval(EvalContext *ctx) const
 {
     if (is_true(condExpr->eval(ctx))) {

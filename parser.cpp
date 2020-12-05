@@ -17,25 +17,29 @@ ParseContext::ParseContext(const TokenStream &ts)
  * Note: this simple language has just no operators for several levels.
  */
 
-unique_ptr<Construct> pExpr01(ParseContext &c); // ops: ()
-unique_ptr<Construct> pExpr02(ParseContext &c); // ops: + (unary), - (unary), !
-unique_ptr<Construct> pExpr03(ParseContext &c); // ops: *, /
-unique_ptr<Construct> pExpr04(ParseContext &c); // ops: +, -
-unique_ptr<Construct> pExpr06(ParseContext &c); // ops: <, >, <=, >=
-unique_ptr<Construct> pExpr07(ParseContext &c); // ops: ==, !=
-unique_ptr<Construct> pExpr11(ParseContext &c); // ops: &&
-unique_ptr<Construct> pExpr12(ParseContext &c); // ops: ||
-unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl);  // ops: =
-unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl = pFlags::pNone);
+unique_ptr<Construct> pExpr01(ParseContext &c, unsigned fl); // ops: ()
+unique_ptr<Construct> pExpr02(ParseContext &c, unsigned fl); // ops: + (unary), - (unary), !
+unique_ptr<Construct> pExpr03(ParseContext &c, unsigned fl); // ops: *, /
+unique_ptr<Construct> pExpr04(ParseContext &c, unsigned fl); // ops: +, -
+unique_ptr<Construct> pExpr06(ParseContext &c, unsigned fl); // ops: <, >, <=, >=
+unique_ptr<Construct> pExpr07(ParseContext &c, unsigned fl); // ops: ==, !=
+unique_ptr<Construct> pExpr11(ParseContext &c, unsigned fl); // ops: &&
+unique_ptr<Construct> pExpr12(ParseContext &c, unsigned fl); // ops: ||
+unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl);  // ops: = (assignment)
+unique_ptr<Construct> pExpr15(ParseContext &c, unsigned fl);  // ops: , (comma operator)
+
+unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl);
 unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl);
 
 bool
 pAcceptIfStmt(ParseContext &c,
               unique_ptr<Construct> &ret,
-              unsigned fl = pFlags::pNone);
+              unsigned fl);
 
 bool
-pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret);
+pAcceptWhileStmt(ParseContext &c,
+                 unique_ptr<Construct> &ret,
+                 unsigned fl);
 
 unique_ptr<Construct>
 MakeConstructFromConstVal(EvalValue v);
@@ -132,12 +136,12 @@ noExprError(ParseContext &c)
 }
 
 unique_ptr<ExprList>
-pExprList(ParseContext &c)
+pExprList(ParseContext &c, unsigned fl)
 {
     unique_ptr<ExprList> ret(new ExprList);
     unique_ptr<Construct> subexpr;
 
-    subexpr = pExprTop(c);
+    subexpr = pExpr14(c, fl);
 
     if (subexpr) {
 
@@ -146,7 +150,7 @@ pExprList(ParseContext &c)
         while (*c == Op::comma) {
 
             c++;
-            subexpr = pExprTop(c);
+            subexpr = pExpr14(c, fl);
 
             if (!subexpr)
                 noExprError(c);
@@ -161,14 +165,15 @@ pExprList(ParseContext &c)
 bool
 pAcceptCallExpr(ParseContext &c,
                 unique_ptr<Construct> &id,
-                unique_ptr<Construct> &ret)
+                unique_ptr<Construct> &ret,
+                unsigned fl)
 {
     if (pAcceptOp(c, Op::parenL)) {
 
         unique_ptr<CallExpr> expr(new CallExpr);
 
         expr->id.reset(static_cast<Identifier *>(id.release()));
-        expr->args = pExprList(c);
+        expr->args = pExprList(c, fl);
         ret = move(expr);
         pExpectOp(c, Op::parenR);
         return true;
@@ -178,7 +183,7 @@ pAcceptCallExpr(ParseContext &c,
 }
 
 unique_ptr<Construct>
-pExpr01(ParseContext &c)
+pExpr01(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> ret;
     unique_ptr<Construct> main;
@@ -191,21 +196,16 @@ pExpr01(ParseContext &c)
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        unique_ptr<Expr01> expr(new Expr01);
-        expr->elem = pExprTop(c);
+        ret = pExprTop(c, fl);
 
-        if (!expr->elem)
+        if (!ret)
             noExprError(c);
 
-        if (expr->elem->is_const)
-            expr->is_const = true;
-
         pExpectOp(c, Op::parenR);
-        ret = move(expr);
 
     } else if (pAcceptId(c, main)) {
 
-        if (!main->is_const && pAcceptCallExpr(c, main, callExpr))
+        if (!main->is_const && pAcceptCallExpr(c, main, callExpr, fl))
             ret = move(callExpr);
         else
             ret = move(main);
@@ -221,12 +221,13 @@ pExpr01(ParseContext &c)
 template <class ExprT>
 unique_ptr<Construct>
 pExprGeneric(ParseContext &c,
-             unique_ptr<Construct> (*lowerExpr)(ParseContext&),
-             initializer_list<Op> ops)
+             unique_ptr<Construct> (*lowerExpr)(ParseContext&, unsigned),
+             initializer_list<Op> ops,
+             unsigned fl)
 {
     Op op;
     unique_ptr<ExprT> ret;
-    unique_ptr<Construct> lowerE = lowerExpr(c);
+    unique_ptr<Construct> lowerE = lowerExpr(c, fl);
     bool is_const;
 
     if (!lowerE)
@@ -241,7 +242,7 @@ pExprGeneric(ParseContext &c,
             ret->elems.emplace_back(Op::invalid, move(lowerE));
         }
 
-        lowerE = lowerExpr(c);
+        lowerE = lowerExpr(c, fl);
 
         if (!lowerE)
             noExprError(c);
@@ -258,7 +259,7 @@ pExprGeneric(ParseContext &c,
 }
 
 unique_ptr<Construct>
-pExpr02(ParseContext &c)
+pExpr02(ParseContext &c, unsigned fl)
 {
     unique_ptr<Expr02> ret;
     unique_ptr<Construct> elem;
@@ -273,14 +274,14 @@ pExpr02(ParseContext &c)
          *      --1, !+1, !-1, !!1
          */
 
-        elem = pExpr02(c);
+        elem = pExpr02(c, fl);
 
         if (!elem)
             noExprError(c);
 
     } else {
 
-        elem = pExpr01(c);
+        elem = pExpr01(c, fl);
     }
 
     if (!elem || op == Op::invalid)
@@ -293,50 +294,50 @@ pExpr02(ParseContext &c)
 }
 
 unique_ptr<Construct>
-pExpr03(ParseContext &c)
+pExpr03(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr03>(
-        c, pExpr02, {Op::times, Op::div, Op::mod}
+        c, pExpr02, {Op::times, Op::div, Op::mod}, fl
     );
 }
 
 unique_ptr<Construct>
-pExpr04(ParseContext &c)
+pExpr04(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr04>(
-        c, pExpr03, {Op::plus, Op::minus}
+        c, pExpr03, {Op::plus, Op::minus}, fl
     );
 }
 
 unique_ptr<Construct>
-pExpr06(ParseContext &c)
+pExpr06(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr06>(
-        c, pExpr04, {Op::lt, Op::gt, Op::le, Op::ge}
+        c, pExpr04, {Op::lt, Op::gt, Op::le, Op::ge}, fl
     );
 }
 
 unique_ptr<Construct>
-pExpr07(ParseContext &c)
+pExpr07(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr07>(
-        c, pExpr06, {Op::eq, Op::noteq}
+        c, pExpr06, {Op::eq, Op::noteq}, fl
     );
 }
 
 unique_ptr<Construct>
-pExpr11(ParseContext &c)
+pExpr11(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr11>(
-        c, pExpr07, {Op::land}
+        c, pExpr07, {Op::land}, fl
     );
 }
 
 unique_ptr<Construct>
-pExpr12(ParseContext &c)
+pExpr12(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr12>(
-        c, pExpr11, {Op::lor}
+        c, pExpr11, {Op::lor}, fl
     );
 }
 
@@ -368,7 +369,7 @@ pExpr14(ParseContext &c, unsigned fl)
 
     } else {
 
-        lside = pExpr12(c);
+        lside = pExpr12(c, fl & ~(pInDecl | pInConstDecl));
     }
 
     if (!lside)
@@ -385,6 +386,9 @@ pExpr14(ParseContext &c, unsigned fl)
 
     } else {
 
+        if (lside->is_const)
+            return MakeConstructFromConstVal(lside->eval(c.const_ctx));
+
         return lside;
     }
 
@@ -392,7 +396,7 @@ pExpr14(ParseContext &c, unsigned fl)
 
     ret->op = op;
     ret->lvalue = move(lside);
-    ret->rvalue = pExprTop(c);
+    ret->rvalue = pExpr14(c, fl & ~(pInDecl | pInConstDecl));
     ret->fl = fl & pFlags::pInDecl;
 
     if (!ret->rvalue)
@@ -429,13 +433,20 @@ pExpr14(ParseContext &c, unsigned fl)
 }
 
 unique_ptr<Construct>
+pExpr15(ParseContext &c, unsigned fl)
+{
+    return pExprGeneric<Expr15>(
+        c, pExpr14, {Op::comma}, fl
+    );
+}
+
+unique_ptr<Construct>
 pExprTop(ParseContext &c, unsigned fl)
 {
-    unique_ptr<Construct> e = pExpr14(c, fl);
+    unique_ptr<Construct> e = pExpr15(c, fl);
 
     if (e && e->is_const) {
-        EvalValue v = e->eval(c.const_ctx);
-        return MakeConstructFromConstVal(v);
+        return MakeConstructFromConstVal(e->eval(c.const_ctx));
     }
 
     return e;
@@ -458,7 +469,7 @@ pStmt(ParseContext &c, unsigned fl)
 
         return subStmt;
 
-    } if (pAcceptWhileStmt(c, subStmt)) {
+    } if (pAcceptWhileStmt(c, subStmt, fl)) {
 
         return subStmt;
 
@@ -504,7 +515,7 @@ pBlock(ParseContext &c, unsigned fl)
 bool
 pAcceptBracedBlock(ParseContext &c,
                    unique_ptr<Construct> &ret,
-                   unsigned fl = pFlags::pNone)
+                   unsigned fl)
 {
     if (pAcceptOp(c, Op::braceL)) {
         ret = pBlock(c, fl);
@@ -523,7 +534,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         unique_ptr<IfStmt> ifstmt(new IfStmt);
         pExpectOp(c, Op::parenL);
 
-        ifstmt->condExpr = pExprTop(c);
+        ifstmt->condExpr = pExprTop(c, fl);
 
         if (!ifstmt->condExpr)
             noExprError(c);
@@ -546,14 +557,14 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 }
 
 bool
-pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret)
+pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 {
     if (pAcceptKeyword(c, Keyword::kw_while)) {
 
         unique_ptr<WhileStmt> whileStmt(new WhileStmt);
         pExpectOp(c, Op::parenL);
 
-        whileStmt->condExpr = pExprTop(c);
+        whileStmt->condExpr = pExprTop(c, fl);
 
         if (!whileStmt->condExpr)
             noExprError(c);

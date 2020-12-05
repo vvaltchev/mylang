@@ -263,11 +263,6 @@ int main(int argc, char **argv)
 
         cout << "Undefined variable '" << e.name << "'" << endl;
         return 1;
-
-    } catch (const InternalErrorEx &e) {
-
-        cout << "InternalErrorEx" << endl;
-        return 1;
     }
 
     return 0;
