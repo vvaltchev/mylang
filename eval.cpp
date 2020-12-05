@@ -66,11 +66,13 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_pair("print", make_shared<LValue>(Builtin{builtin_print}))
 };
 
-
-EvalContext::EvalContext()
+EvalContext::EvalContext(bool const_ctx)
+    : const_ctx(const_ctx)
 {
-    /* Copy the builtins in the current EvalContext */
-    symbols = builtins;
+    if (!const_ctx) {
+        /* Copy the builtins in the current EvalContext */
+        symbols = builtins;
+    }
 }
 
 EvalValue
@@ -299,12 +301,15 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
         ctx->symbols.emplace(
             lval.get<UndefinedId>().id,
-            make_shared<LValue>(RValue(rval))
+            make_shared<LValue>(RValue(rval), ctx->const_ctx)
         );
 
     } else if (lval.is<LValue *>()) {
 
         EvalValue newVal;
+
+        if (ctx->const_ctx)
+            throw CannotRebindConstEx{Loc()};
 
         if (op == Op::assign) {
 

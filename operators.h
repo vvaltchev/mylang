@@ -34,4 +34,6 @@ enum class Op : int {
     muleq       = 27,
     diveq       = 28,
     modeq       = 29,
+
+    op_count    = 30,
 };

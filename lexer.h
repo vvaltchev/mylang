@@ -21,9 +21,11 @@ enum class TokType : int {
     kw      = 4,   /* keyword (e.g. if, else, while) */
     str     = 5,   /* string literal (e.g. "hello") */
     unknown = 6,   /* something else (e.g. ?) */
+
+    count   = 7,
 };
 
-static const array<string, 30> OpString =
+static const array<string, (int)Op::op_count> OpString =
 {
     "invalid",
 
@@ -68,9 +70,12 @@ enum class Keyword : int {
     kw_for      = 4,
     kw_break    = 5,
     kw_continue = 6,
+    kw_const    = 7,
+
+    kw_count    = 8,
 };
 
-static const array<string, 7> KwString =
+static const array<string, (int)Keyword::kw_count> KwString =
 {
     "invalid",
 
@@ -80,6 +85,7 @@ static const array<string, 7> KwString =
     "for",
     "break",
     "continue",
+    "const",
 };
 
 ostream &operator<<(ostream &s, TokType t);

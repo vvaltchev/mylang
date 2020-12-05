@@ -1,7 +1,14 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "parser.h"
-#include "evalvalue.h"
+#include "eval.h"
+
+ParseContext::ParseContext(const TokenStream &ts)
+    : ts(ts)
+    , const_ctx(new EvalContext(true))
+{
+
+}
 
 /*
  * ----------------- Recursive Descent Parser -------------------
@@ -18,11 +25,21 @@ unique_ptr<Construct> pExpr06(ParseContext &c); // ops: <, >, <=, >=
 unique_ptr<Construct> pExpr07(ParseContext &c); // ops: ==, !=
 unique_ptr<Construct> pExpr11(ParseContext &c); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c); // ops: ||
-unique_ptr<Construct> pExpr14(ParseContext &c); // ops: =
+unique_ptr<Construct> pExpr14(ParseContext &c, bool const_decl);  // ops: =
+unique_ptr<Construct> pExprTop(ParseContext &c, bool const_decl = false);
 unique_ptr<Construct> pStmt(ParseContext &c, bool loop = false);
-unique_ptr<Construct> pExprTop(ParseContext &c);
 
-bool pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
+bool
+pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, bool loop);
+
+bool
+pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret);
+
+unique_ptr<Construct>
+MakeConstructFromConstVal(EvalValue v);
+
+bool
+pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::num) {
         v.reset(new LiteralInt{ stol(string(c.get_str())) });
@@ -33,10 +50,22 @@ bool pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
     return false;
 }
 
-bool pAcceptId(ParseContext &c, unique_ptr<Construct> &v)
+bool
+pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 {
     if (*c == TokType::id) {
+
         v.reset(new Identifier(c.get_str()));
+
+        if (resolve_const) {
+
+            EvalValue const_value = v->eval(c.const_ctx);
+
+            if (const_value.type->t == Type::t_lval) {
+                v = MakeConstructFromConstVal(RValue(const_value));
+            }
+        }
+
         c++;
         return true;
     }
@@ -44,8 +73,8 @@ bool pAcceptId(ParseContext &c, unique_ptr<Construct> &v)
     return false;
 }
 
-
-bool pAcceptOp(ParseContext &c, Op exp)
+bool
+pAcceptOp(ParseContext &c, Op exp)
 {
     if (*c == exp) {
         c++;
@@ -55,7 +84,8 @@ bool pAcceptOp(ParseContext &c, Op exp)
     return false;
 }
 
-bool pAcceptKeyword(ParseContext &c, Keyword exp)
+bool
+pAcceptKeyword(ParseContext &c, Keyword exp)
 {
     if (*c == exp) {
         c++;
@@ -65,7 +95,8 @@ bool pAcceptKeyword(ParseContext &c, Keyword exp)
     return false;
 }
 
-void pExpectLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
+void
+pExpectLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (!pAcceptLiteralInt(c, v))
         throw SyntaxErrorEx(c.get_loc(), "Expected integer literal");
@@ -77,7 +108,8 @@ void pExpectOp(ParseContext &c, Op exp)
         throw SyntaxErrorEx(c.get_loc(), "Expected operator", &c.get_tok(), exp);
 }
 
-Op AcceptOneOf(ParseContext &c, initializer_list<Op> list)
+Op
+AcceptOneOf(ParseContext &c, initializer_list<Op> list)
 {
     for (auto op : list) {
         if (pAcceptOp(c, op))
@@ -87,20 +119,38 @@ Op AcceptOneOf(ParseContext &c, initializer_list<Op> list)
     return Op::invalid;
 }
 
+void
+noExprError(ParseContext &c)
+{
+    throw SyntaxErrorEx(
+        c.get_loc(),
+        "Expected expression, got",
+        &c.get_tok()
+    );
+}
+
 unique_ptr<ExprList>
 pExprList(ParseContext &c)
 {
     unique_ptr<ExprList> ret(new ExprList);
+    unique_ptr<Construct> subexpr;
 
-    if (*c == Op::parenR)
-        return ret;
+    subexpr = pExprTop(c);
 
-    ret->elems.emplace_back(pExprTop(c));
+    if (subexpr) {
 
-    while (*c == Op::comma) {
+        ret->elems.emplace_back(move(subexpr));
 
-        c++;
-        ret->elems.emplace_back(pExprTop(c));
+        while (*c == Op::comma) {
+
+            c++;
+            subexpr = pExprTop(c);
+
+            if (!subexpr)
+                noExprError(c);
+
+            ret->elems.emplace_back(move(subexpr));
+        }
     }
 
     return ret;
@@ -123,15 +173,6 @@ pAcceptCallExpr(ParseContext &c,
     }
 
     return false;
-}
-
-void noExprError(ParseContext &c)
-{
-    throw SyntaxErrorEx(
-        c.get_loc(),
-        "Expected expression, got",
-        &c.get_tok()
-    );
 }
 
 unique_ptr<Construct>
@@ -162,7 +203,7 @@ pExpr01(ParseContext &c)
 
     } else if (pAcceptId(c, main)) {
 
-        if (pAcceptCallExpr(c, main, callExpr))
+        if (!main->is_const && pAcceptCallExpr(c, main, callExpr))
             ret = move(callExpr);
         else
             ret = move(main);
@@ -235,7 +276,6 @@ pExpr02(ParseContext &c)
         if (!elem)
             noExprError(c);
 
-
     } else {
 
         elem = pExpr01(c);
@@ -298,52 +338,139 @@ pExpr12(ParseContext &c)
     );
 }
 
-unique_ptr<Construct> pExpr14(ParseContext &c)
+unique_ptr<Construct>
+pExpr14(ParseContext &c, bool const_decl)
 {
     static const initializer_list<Op> valid_ops = {
         Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq
     };
 
-    unique_ptr<Construct> lside, e;
+    unique_ptr<Construct> lside;
     Op op = Op::invalid;
 
-    lside = pExpr12(c);
+    if (const_decl) {
 
-    if (!lside)
-        return nullptr;
+        if (!pAcceptId(c, lside, false /* resolve_const */)) {
 
-    if ((op = AcceptOneOf(c, valid_ops)) != Op::invalid) {
+           /*
+            * If the current statement is a const declaration, require
+            * strictly an identifier instead of a generic expression.
+            */
 
-        unique_ptr<Expr14> ret(new Expr14);
-
-        ret->op = op;
-        ret->lvalue = move(lside);
-        ret->rvalue = pExprTop(c);
-
-        if (!ret->rvalue)
-            noExprError(c);
-
-        return ret;
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Expected identifier, got",
+                &c.get_tok()
+            );
+        }
 
     } else {
 
+        lside = pExpr12(c);
+    }
+
+    if (!lside || (op = AcceptOneOf(c, valid_ops)) == Op::invalid) {
+
+        /*
+         * An empty statement or any expression that's just not an
+         * assignment expression. Return the sub-expression.
+         */
         return lside;
     }
+
+    unique_ptr<Expr14> ret(new Expr14);
+
+    ret->op = op;
+    ret->lvalue = move(lside);
+    ret->rvalue = pExprTop(c);
+
+    if (!ret->rvalue)
+        noExprError(c);
+
+    if (ret->rvalue->is_const) {
+        ret->rvalue = MakeConstructFromConstVal(
+            RValue(ret->rvalue->eval(c.const_ctx))
+        );
+    }
+
+    if (const_decl) {
+
+        if (op != Op::assign)
+            throw ConstNotAllowedEx{c.get_loc()};
+
+        if (!ret->rvalue->is_const)
+            throw ExpressionIsNotConstEx{c.get_loc()};
+
+        try {
+
+            /*
+             * Save the const declaration by evaluating the assignment
+             * in our special `const_ctx` EvalContext. In case a const
+             * declaration related to the same symbol already exists,
+             * we'll get a CannotRebindConstEx exception.
+             */
+            ret->eval(c.const_ctx);
+            return move(ret->rvalue);
+
+        } catch (CannotRebindConstEx) {
+            throw CannotRebindConstEx{c.get_loc()};
+        }
+    }
+
+    return ret;
 }
 
-unique_ptr<Construct> pExprTop(ParseContext &c) {
-
-    unique_ptr<Construct> e = pExpr14(c);
+unique_ptr<Construct>
+pExprTop(ParseContext &c, bool const_decl)
+{
+    unique_ptr<Construct> e = pExpr14(c, const_decl);
 
     if (e && e->is_const) {
-
-        EvalValue v = e->eval(nullptr);
-
-        if (v.is<long>())
-            return make_unique<LiteralInt>(v.get<long>());
+        EvalValue v = e->eval(c.const_ctx);
+        return MakeConstructFromConstVal(v);
     }
 
     return e;
+}
+
+unique_ptr<Construct>
+pStmt(ParseContext &c, bool loop)
+{
+    unique_ptr<Construct> subStmt;
+
+    if (loop) {
+
+        if (pAcceptKeyword(c, Keyword::kw_break))
+            return make_unique<BreakStmt>();
+        else if (pAcceptKeyword(c, Keyword::kw_continue))
+            return make_unique<ContinueStmt>();
+    }
+
+    if (pAcceptIfStmt(c, subStmt, loop)) {
+
+        return subStmt;
+
+    } if (pAcceptWhileStmt(c, subStmt)) {
+
+        return subStmt;
+
+    } else {
+
+        bool const_decl = false;
+
+        if (pAcceptKeyword(c, Keyword::kw_const))
+            const_decl = true;
+
+        unique_ptr<Construct> lowerE = pExprTop(c, const_decl);
+
+        if (!lowerE)
+            return nullptr;
+
+        unique_ptr<Stmt> ret(new Stmt);
+        ret->elem = move(lowerE);
+        pExpectOp(c, Op::semicolon);
+        return ret;
+    }
 }
 
 unique_ptr<Construct>
@@ -354,11 +481,13 @@ pBlock(ParseContext &c, bool loop)
 
     if (!c.eoi()) {
 
-        while ((stmt = pStmt(c, loop)))
+        while ((stmt = pStmt(c, loop))) {
+
             ret->elems.emplace_back(move(stmt));
 
-        while (*c == Op::semicolon)
-            c++;    /* skip multiple ';' */
+            while (*c == Op::semicolon)
+                c++;    /* skip multiple ';' */
+        }
     }
 
     return ret;
@@ -434,36 +563,10 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret)
 }
 
 unique_ptr<Construct>
-pStmt(ParseContext &c, bool loop)
+MakeConstructFromConstVal(EvalValue v)
 {
-    unique_ptr<Construct> subStmt;
+    if (v.is<long>())
+        return make_unique<LiteralInt>(v.get<long>());
 
-    if (loop) {
-
-        if (pAcceptKeyword(c, Keyword::kw_break))
-            return make_unique<BreakStmt>();
-        else if (pAcceptKeyword(c, Keyword::kw_continue))
-            return make_unique<ContinueStmt>();
-    }
-
-    if (pAcceptIfStmt(c, subStmt, loop)) {
-
-        return subStmt;
-
-    } if (pAcceptWhileStmt(c, subStmt)) {
-
-        return subStmt;
-
-    } else {
-
-        unique_ptr<Construct> lowerE = pExprTop(c);
-
-        if (!lowerE)
-            return nullptr;
-
-        unique_ptr<Stmt> ret(new Stmt);
-        ret->elem = move(lowerE);
-        pExpectOp(c, Op::semicolon);
-        return ret;
-    }
+    throw InternalErrorEx();
 }

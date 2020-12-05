@@ -17,8 +17,22 @@ class LValue {
 
 public:
 
-    LValue(const EvalValue &val) : val(val) { type_checks(); }
-    LValue(EvalValue &&val) : val(forward<EvalValue>(val)) { type_checks(); }
+    const bool is_const;
+
+    LValue(const EvalValue &val, bool is_const = false)
+        : val(val)
+        , is_const(is_const)
+    {
+        type_checks();
+    }
+
+    LValue(EvalValue &&val, bool is_const = false)
+        : val(forward<EvalValue>(val))
+        , is_const(is_const)
+    {
+        type_checks();
+    }
+
     LValue(const LValue &rhs) = delete;
     LValue(LValue &&rhs) = delete;
     LValue &operator=(const LValue &rhs) = delete;
@@ -35,8 +49,9 @@ class EvalContext {
 public:
 
     typedef map<string, shared_ptr<LValue>, less<>> SymbolsType;
+    const bool const_ctx;
 
-    EvalContext();
+    EvalContext(bool const_ctx = false);
     SymbolsType symbols;
 
     static const SymbolsType builtins;

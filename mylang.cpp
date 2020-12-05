@@ -128,25 +128,27 @@ parse_args(int argc,
 }
 
 static void
+dumpLocInError(Loc loc)
+{
+    if (loc.line) {
+
+        cout << " at line "
+             << loc.line << ", col " << loc.col;
+
+    } else if (loc.col) {
+
+        cout << " at col " << loc.col;
+
+    }
+}
+
+static void
 handleSyntaxError(const SyntaxErrorEx &e)
 {
     cout << "SyntaxError";
 
-    if (e.loc.line) {
-
-        cout << " at line "
-             << e.loc.line << ", col " << e.loc.col
-             << ": ";
-
-    } else if (e.loc.col) {
-
-        cout << " at col " << e.loc.col << ": ";
-
-    } else {
-
-        cout << ": ";
-    }
-
+    dumpLocInError(e.loc);
+    cout << ": ";
     cout << e.msg;
 
     if (e.op != Op::invalid) {
@@ -225,6 +227,27 @@ int main(int argc, char **argv)
     } catch (const SyntaxErrorEx &e) {
 
         handleSyntaxError(e);
+        return 1;
+
+    } catch (const CannotRebindConstEx &e) {
+
+        cout << "Cannot rebind const";
+        dumpLocInError(e.loc);
+        cout << endl;
+        return 1;
+
+    } catch (const ConstNotAllowedEx &e) {
+
+        cout << "Operator not allowed while defining const";
+        dumpLocInError(e.loc);
+        cout << endl;
+        return 1;
+
+    } catch (const ExpressionIsNotConstEx &e) {
+
+        cout << "Expected a const expression";
+        dumpLocInError(e.loc);
+        cout << endl;
         return 1;
 
     } catch (const DivisionByZeroEx &e) {
