@@ -86,6 +86,15 @@ void LiteralInt::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void LiteralNone::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << string("None");
+}
+
+
 void Identifier::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

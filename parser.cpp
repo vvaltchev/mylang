@@ -195,6 +195,10 @@ pExpr01(ParseContext &c, unsigned fl)
         ret = move(main);
         ret->is_const = true;
 
+    } else if (pAcceptKeyword(c, Keyword::kw_none)) {
+
+        ret.reset(new LiteralNone());
+
     } else if (pAcceptOp(c, Op::parenL)) {
 
         ret = pExprTop(c, fl);
@@ -350,6 +354,7 @@ pExpr14(ParseContext &c, unsigned fl)
     };
 
     unique_ptr<Construct> lside;
+    unique_ptr<Expr14> ret;
     Op op = Op::invalid;
 
     if (fl & pFlags::pInDecl) {
@@ -387,17 +392,35 @@ pExpr14(ParseContext &c, unsigned fl)
 
     } else {
 
-        if (c.const_eval && lside->is_const)
-            return MakeConstructFromConstVal(lside->eval(c.const_ctx));
+        /* No valid operator: this is not an assignment expr */
 
-        return lside;
+        if (fl & pFlags::pInDecl) {
+
+            /* But we're in a decl (var or const): assume `none` as rvalue */
+
+            ret.reset(new Expr14);
+            ret->op = Op::assign;
+            ret->lvalue = move(lside);
+            ret->rvalue.reset(new LiteralNone());
+
+        } else {
+
+            /* Just return lside (doing const eval if possible) */
+
+            if (c.const_eval && lside->is_const)
+                return MakeConstructFromConstVal(lside->eval(c.const_ctx));
+
+            return lside;
+        }
     }
 
-    unique_ptr<Expr14> ret(new Expr14);
+    if (!ret) {
+        ret.reset(new Expr14);
+        ret->op = op;
+        ret->lvalue = move(lside);
+        ret->rvalue = pExpr14(c, fl & ~(pInDecl | pInConstDecl));
+    }
 
-    ret->op = op;
-    ret->lvalue = move(lside);
-    ret->rvalue = pExpr14(c, fl & ~(pInDecl | pInConstDecl));
     ret->fl = fl & pFlags::pInDecl;
 
     if (!ret->rvalue)
@@ -609,6 +632,8 @@ MakeConstructFromConstVal(EvalValue v)
 {
     if (v.is<long>())
         return make_unique<LiteralInt>(v.get<long>());
+    else if (v.is<nullptr_t>())
+        return make_unique<LiteralNone>();
 
     throw InternalErrorEx();
 }

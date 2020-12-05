@@ -98,19 +98,32 @@ inline ostream &operator<<(ostream &s, const Construct &c)
 class Literal : public Construct {
 
 public:
-    const long value;
 
-    Literal(long v) : Construct("Literal", true), value(v) { }
+    Literal() : Construct("Literal", true) { }
 };
 
 class LiteralInt : public Literal {
 
 public:
+    const long value;
 
-    LiteralInt(long v) : Literal(v) { }
+    LiteralInt(long v) : value(v) { }
 
     virtual EvalValue eval(EvalContext *ctx) const {
         return value;
+    }
+
+    virtual void serialize(ostream &s, int level = 0) const;
+};
+
+class LiteralNone : public Literal {
+
+public:
+
+    LiteralNone() : Literal() { }
+
+    virtual EvalValue eval(EvalContext *ctx) const {
+        return EvalValue();
     }
 
     virtual void serialize(ostream &s, int level = 0) const;
