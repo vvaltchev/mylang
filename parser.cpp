@@ -26,8 +26,8 @@ unique_ptr<Construct> pExpr06(ParseContext &c, unsigned fl); // ops: <, >, <=, >
 unique_ptr<Construct> pExpr07(ParseContext &c, unsigned fl); // ops: ==, !=
 unique_ptr<Construct> pExpr11(ParseContext &c, unsigned fl); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c, unsigned fl); // ops: ||
-unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl);  // ops: = (assignment)
-unique_ptr<Construct> pExpr15(ParseContext &c, unsigned fl);  // ops: , (comma operator)
+unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl); // ops: = (assignment)
+unique_ptr<Construct> pExpr15(ParseContext &c, unsigned fl); // ops: , (comma operator)
 
 unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl);
 unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl);

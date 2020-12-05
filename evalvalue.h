@@ -38,12 +38,6 @@ public:
     ValueU val;
     Type *type;
 
-    EvalValue(const EvalValue &rhs) = default;
-    EvalValue(EvalValue &&rhs) = default;
-    EvalValue &operator=(const EvalValue &rhs) = default;
-    EvalValue &operator=(EvalValue &&rhs) = default;
-    virtual ~EvalValue() = default;
-
     EvalValue();
     EvalValue(long val);
     EvalValue(LValue *val);
