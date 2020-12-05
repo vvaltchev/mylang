@@ -17,14 +17,6 @@ ParseContext::ParseContext(const TokenStream &ts)
  * Note: this simple language has just no operators for several levels.
  */
 
-enum pFlags : unsigned {
-
-    pNone           = 1 << 0,
-    pInDecl         = 1 << 1,
-    pInConstDecl    = 1 << 2,
-    pInLoop         = 1 << 3,
-};
-
 unique_ptr<Construct> pExpr01(ParseContext &c); // ops: ()
 unique_ptr<Construct> pExpr02(ParseContext &c); // ops: + (unary), - (unary), !
 unique_ptr<Construct> pExpr03(ParseContext &c); // ops: *, /
@@ -358,12 +350,12 @@ pExpr14(ParseContext &c, unsigned fl)
     unique_ptr<Construct> lside;
     Op op = Op::invalid;
 
-    if (fl & pFlags::pInConstDecl) {
+    if (fl & pFlags::pInDecl) {
 
         if (!pAcceptId(c, lside, false /* resolve_const */)) {
 
            /*
-            * If the current statement is a const declaration, require
+            * If the current statement is a declaration, require
             * strictly an identifier instead of a generic expression.
             */
 
@@ -379,12 +371,20 @@ pExpr14(ParseContext &c, unsigned fl)
         lside = pExpr12(c);
     }
 
-    if (!lside || (op = AcceptOneOf(c, valid_ops)) == Op::invalid) {
+    if (!lside)
+        return nullptr;
 
-        /*
-         * An empty statement or any expression that's just not an
-         * assignment expression. Return the sub-expression.
-         */
+    if ((op = AcceptOneOf(c, valid_ops)) != Op::invalid) {
+
+        if (fl & pInDecl && op != Op::assign) {
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Operator '=' is required when declaring a variable or a constant"
+            );
+        }
+
+    } else {
+
         return lside;
     }
 
@@ -393,6 +393,7 @@ pExpr14(ParseContext &c, unsigned fl)
     ret->op = op;
     ret->lvalue = move(lside);
     ret->rvalue = pExprTop(c);
+    ret->fl = fl & pFlags::pInDecl;
 
     if (!ret->rvalue)
         noExprError(c);
@@ -404,9 +405,6 @@ pExpr14(ParseContext &c, unsigned fl)
     }
 
     if (fl & pFlags::pInConstDecl) {
-
-        if (op != Op::assign)
-            throw ConstNotAllowedEx{c.get_loc()};
 
         if (!ret->rvalue->is_const)
             throw ExpressionIsNotConstEx{c.get_loc()};
@@ -466,7 +464,9 @@ pStmt(ParseContext &c, unsigned fl)
 
     } else {
 
-        if (pAcceptKeyword(c, Keyword::kw_const))
+        if (pAcceptKeyword(c, Keyword::kw_var))
+            fl |= pFlags::pInDecl;
+        else if (pAcceptKeyword(c, Keyword::kw_const))
             fl |= pFlags::pInDecl | pFlags::pInConstDecl;
 
         unique_ptr<Construct> lowerE = pExprTop(c, fl);

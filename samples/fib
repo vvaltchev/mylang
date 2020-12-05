@@ -2,9 +2,9 @@
 # Calculate the fibonacci sequence
 #
 
-a = 1; # previous term
-b = 1; # current term
-i = 0; # counter
+var a = 1; # previous term
+var b = 1; # current term
+var i = 0; # counter
 
 # Print the 1st two terms
 print(a);
@@ -12,7 +12,7 @@ print(b);
 
 while (i < 20) {
 
-    c = a + b;
+    var c = a + b;
     a = b;
     b = c;
 

@@ -236,13 +236,6 @@ int main(int argc, char **argv)
         cout << endl;
         return 1;
 
-    } catch (const ConstNotAllowedEx &e) {
-
-        cout << "Operator not allowed while defining const";
-        dumpLocInError(e.loc);
-        cout << endl;
-        return 1;
-
     } catch (const ExpressionIsNotConstEx &e) {
 
         cout << "Expected a const expression";

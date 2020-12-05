@@ -2,7 +2,7 @@
 # Simple loop, useful for performance benchmarks
 #
 
-i = 0;
+var i = 0;
 
 while (i < 1000000) {
     i += 1;

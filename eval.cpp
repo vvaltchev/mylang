@@ -299,10 +299,17 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
     if (lval.is<UndefinedId>()) {
 
-        ctx->symbols.emplace(
-            lval.get<UndefinedId>().id,
-            make_shared<LValue>(RValue(rval), ctx->const_ctx)
-        );
+        if (fl & pFlags::pInDecl) {
+
+            ctx->symbols.emplace(
+                lval.get<UndefinedId>().id,
+                make_shared<LValue>(RValue(rval), ctx->const_ctx)
+            );
+
+        } else {
+
+            throw UndefinedVariableEx{ lval.get<UndefinedId>().id };
+        }
 
     } else if (lval.is<LValue *>()) {
 

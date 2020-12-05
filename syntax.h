@@ -19,6 +19,14 @@ class LValue;
 class Identifier;
 class EvalContext;
 
+enum pFlags : unsigned {
+
+    pNone           = 1 << 0,
+    pInDecl         = 1 << 1,
+    pInConstDecl    = 1 << 2,
+    pInLoop         = 1 << 3,
+};
+
 class Construct {
 
 public:
@@ -212,8 +220,9 @@ public:
     mutable unique_ptr<Construct> lvalue;
     unique_ptr<Construct> rvalue;
     Op op;
+    unsigned fl;
 
-    Expr14() : Construct("Expr14"), op(Op::invalid) { }
+    Expr14() : Construct("Expr14"), op(Op::invalid), fl(pNone) { }
     virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue eval(EvalContext *ctx) const;
 };

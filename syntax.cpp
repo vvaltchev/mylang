@@ -117,8 +117,13 @@ void Expr14::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << name << "(\n";
 
+    if (fl & pFlags::pInDecl)
+        s << "VarDecl";
+    else
+        s << name;
+
+    s << "(\n";
     lvalue->serialize(s, level + 1);
     s << endl;
 

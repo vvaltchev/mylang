@@ -22,7 +22,6 @@ class Tok;
 class Construct;
 
 struct CannotRebindConstEx { const Loc loc; };
-struct ConstNotAllowedEx { const Loc loc; };
 struct ExpressionIsNotConstEx { const Loc loc; };
 struct InternalErrorEx { };
 struct InvalidTokenEx { string_view val; };
