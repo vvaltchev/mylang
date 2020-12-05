@@ -23,7 +23,7 @@ find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::builtins) {
 
-        if (v->eval().val.bfunc.func == b.func)
+        if (v->eval().get<Builtin>().func == b.func)
             return k;
     }
 
@@ -44,7 +44,7 @@ class TypeBuiltin : public Type {
 public:
     TypeBuiltin() : Type(Type::t_builtin) { }
     virtual string to_string(const EvalValue &a) {
-        return "<builtin: " + find_builtin_name(a.val.bfunc) + ">";
+        return "<builtin: " + find_builtin_name(a.get<Builtin>()) + ">";
     }
 };
 

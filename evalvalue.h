@@ -17,28 +17,24 @@ class EvalContext;
 struct UndefinedId { string_view id; };
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
-union ValueU {
-
-    long ival;
-    LValue *lval;
-    UndefinedId undef;
-    Builtin bfunc;
-
-    ValueU() : ival(0) { }
-    ValueU(long val) : ival(val) { }
-    ValueU(LValue *val) : lval(val) { }
-    ValueU(const UndefinedId &val) : undef(val) { }
-    ValueU(const Builtin &val) : bfunc(val) { }
-};
-
 class EvalValue {
 
-public:
+    union ValueU {
+
+        long ival;
+        LValue *lval;
+        UndefinedId undef;
+        Builtin bfunc;
+
+        ValueU() : ival(0) { }
+        ValueU(long val) : ival(val) { }
+        ValueU(LValue *val) : lval(val) { }
+        ValueU(const UndefinedId &val) : undef(val) { }
+        ValueU(const Builtin &val) : bfunc(val) { }
+    };
+
 
     ValueU val;
-
-private:
-
     Type *type;
 
 public:
@@ -54,7 +50,12 @@ public:
     }
 
     template <class T>
-    T get() const;
+    T &get();
+
+    template <class T>
+    T get() const {
+        return const_cast<EvalValue *>(this)->get<T>();
+    }
 
     template <class T>
     bool is() const;
@@ -131,7 +132,7 @@ inline bool EvalValue::is<Builtin>() const { return get_type()->t == Type::t_bui
 
 
 template <>
-inline LValue *EvalValue::get<LValue *>() const {
+inline LValue *&EvalValue::get<LValue *>() {
 
     if (is<LValue *>())
         return val.lval;
@@ -140,7 +141,7 @@ inline LValue *EvalValue::get<LValue *>() const {
 }
 
 template <>
-inline UndefinedId EvalValue::get<UndefinedId>() const {
+inline UndefinedId &EvalValue::get<UndefinedId>() {
 
     if (is<UndefinedId>())
         return val.undef;
@@ -149,7 +150,7 @@ inline UndefinedId EvalValue::get<UndefinedId>() const {
 }
 
 template <>
-inline long EvalValue::get<long>() const {
+inline long &EvalValue::get<long>() {
 
     if (is<long>())
         return val.ival;
@@ -158,14 +159,13 @@ inline long EvalValue::get<long>() const {
 }
 
 template <>
-inline Builtin EvalValue::get<Builtin>() const {
+inline Builtin &EvalValue::get<Builtin>() {
 
     if (is<Builtin>())
         return val.bfunc;
 
     throw TypeErrorEx();
 }
-
 
 EvalValue RValue(EvalValue v);
 
