@@ -35,7 +35,7 @@ unique_ptr<Construct> pExpr11(ParseContext &c); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c); // ops: ||
 unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl);  // ops: =
 unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl = pFlags::pNone);
-unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl = pFlags::pNone);
+unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl);
 
 bool
 pAcceptIfStmt(ParseContext &c,
@@ -531,11 +531,11 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         pExpectOp(c, Op::parenR);
 
         if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl))
-            ifstmt->thenBlock = pStmt(c);
+            ifstmt->thenBlock = pStmt(c, fl);
 
         if (pAcceptKeyword(c, Keyword::kw_else)) {
             if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl))
-                ifstmt->elseBlock = pStmt(c);
+                ifstmt->elseBlock = pStmt(c, fl);
         }
 
         ret = move(ifstmt);
@@ -561,7 +561,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret)
         pExpectOp(c, Op::parenR);
 
         if (!pAcceptBracedBlock(c, whileStmt->body, pFlags::pInLoop))
-            whileStmt->body = pStmt(c);
+            whileStmt->body = pStmt(c, pFlags::pInLoop);
 
         ret = move(whileStmt);
         return true;
