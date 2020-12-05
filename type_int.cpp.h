@@ -63,6 +63,9 @@ void TypeInt::div(EvalValue &a, EvalValue b)
     if (!b.is<long>())
         throw TypeErrorEx();
 
+    if (b.val.ival == 0)
+        throw DivisionByZeroEx();
+
     a.val.ival /= b.val.ival;
 }
 
