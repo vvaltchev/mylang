@@ -550,7 +550,19 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 ifstmt->elseBlock = pStmt(c, fl);
         }
 
-        ret = move(ifstmt);
+        if (c.const_eval && ifstmt->condExpr->is_const) {
+
+            EvalValue v = ifstmt->condExpr->eval(c.const_ctx);
+
+            if (v.type->is_true(v))
+                ret = move(ifstmt->thenBlock);
+            else
+                ret = move(ifstmt->elseBlock);
+
+        } else {
+            ret = move(ifstmt);
+        }
+
         return true;
     }
 
@@ -574,6 +586,16 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         if (!pAcceptBracedBlock(c, whileStmt->body, pFlags::pInLoop))
             whileStmt->body = pStmt(c, pFlags::pInLoop);
+
+        if (c.const_eval && whileStmt->condExpr->is_const) {
+
+            EvalValue v = whileStmt->condExpr->eval(c.const_ctx);
+
+            if (!v.type->is_true(v)) {
+                ret.reset();
+                return true;
+            }
+        }
 
         ret = move(whileStmt);
         return true;
