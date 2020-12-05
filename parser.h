@@ -43,9 +43,10 @@ class ParseContext {
 public:
 
     TokenStream ts;
+    const bool const_eval;
     EvalContext *const const_ctx;
 
-    ParseContext(const TokenStream &ts);
+    ParseContext(const TokenStream &ts, bool const_eval);
 
     /* token operations */
     const Tok &operator*() const { return ts.get(); }

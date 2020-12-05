@@ -18,15 +18,18 @@ using namespace std;
 
 static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
+static bool opt_no_const_eval;
+static bool opt_no_run;
 
 void help()
 {
     cout << "Syntax:" << endl;
-    cout << "   mylang [-t] [-s] FILE" << endl;
-    cout << "   mylang [-t] [-s] -e EXPRESSION" << endl;
+    cout << "   mylang [-t] [-s] [-nc] FILE | -e EXPR" << endl;
     cout << endl;
     cout << "   -t      Show all tokens" << endl;
     cout << "   -s      Dump the syntax tree" << endl;
+    cout << "  -nc      No const eval (debug)" << endl;
+    cout << "  -nr      Don't run, just validate" << endl;
 }
 
 void
@@ -100,6 +103,14 @@ parse_args(int argc,
         } else if (!strcmp(arg, "-s")) {
 
             opt_show_syntax_tree = true;
+
+        } else if (!strcmp(arg, "-nc")) {
+
+            opt_no_const_eval = true;
+
+        } else if (!strcmp(arg, "-nr")) {
+
+            opt_no_run = true;
 
         } else if (!strcmp(arg, "-e")) {
 
@@ -186,7 +197,7 @@ int main(int argc, char **argv)
 
         parse_args(argc, argv, lines, tokens);
 
-        ParseContext ctx{TokenStream(tokens)};
+        ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
 
         if (opt_show_tokens) {
             cout << "Tokens" << endl;
@@ -215,9 +226,11 @@ int main(int argc, char **argv)
                 &ctx.get_tok()
             );
 
-        /* Run the script */
-        EvalContext evalCtx;
-        root->eval(&evalCtx);
+        if (!opt_no_run) {
+            /* Run the script */
+            EvalContext evalCtx;
+            root->eval(&evalCtx);
+        }
 
     } catch (const InvalidTokenEx &e) {
 

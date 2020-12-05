@@ -3,8 +3,9 @@
 #include "parser.h"
 #include "eval.h"
 
-ParseContext::ParseContext(const TokenStream &ts)
+ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
     : ts(ts)
+    , const_eval(const_eval)
     , const_ctx(new EvalContext(true))
 {
 
@@ -63,7 +64,7 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 
         v.reset(new Identifier(c.get_str()));
 
-        if (resolve_const) {
+        if (c.const_eval && resolve_const) {
 
             EvalValue const_value = v->eval(c.const_ctx);
 
@@ -386,7 +387,7 @@ pExpr14(ParseContext &c, unsigned fl)
 
     } else {
 
-        if (lside->is_const)
+        if (c.const_eval && lside->is_const)
             return MakeConstructFromConstVal(lside->eval(c.const_ctx));
 
         return lside;
@@ -402,13 +403,13 @@ pExpr14(ParseContext &c, unsigned fl)
     if (!ret->rvalue)
         noExprError(c);
 
-    if (ret->rvalue->is_const) {
+    if (c.const_eval && ret->rvalue->is_const) {
         ret->rvalue = MakeConstructFromConstVal(
             RValue(ret->rvalue->eval(c.const_ctx))
         );
     }
 
-    if (fl & pFlags::pInConstDecl) {
+    if (c.const_eval && fl & pFlags::pInConstDecl) {
 
         if (!ret->rvalue->is_const)
             throw ExpressionIsNotConstEx{c.get_loc()};
@@ -445,7 +446,7 @@ pExprTop(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> e = pExpr15(c, fl);
 
-    if (e && e->is_const) {
+    if (c.const_eval && e && e->is_const) {
         return MakeConstructFromConstVal(e->eval(c.const_ctx));
     }
 
