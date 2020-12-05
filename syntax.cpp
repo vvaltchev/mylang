@@ -5,7 +5,7 @@
 
 ostream &operator<<(ostream &s, const EvalValue &c)
 {
-    return s << c.type->to_string(c);
+    return s << c.get_type()->to_string(c);
 }
 
 void ChildlessConstruct::serialize(ostream &s, int level) const

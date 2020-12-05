@@ -11,8 +11,8 @@ class LValue {
     EvalValue val;
 
     void type_checks() const {
-        assert(val.type->t != Type::t_lval);
-        assert(val.type->t != Type::t_undefid);
+        assert(val.get_type()->t != Type::t_lval);
+        assert(val.get_type()->t != Type::t_undefid);
     }
 
 public:

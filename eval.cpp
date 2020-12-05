@@ -138,11 +138,11 @@ EvalValue Expr02::eval(EvalContext *ctx) const
             break;
         case Op::minus:
             /* Unary operator '-': negate */
-            val.type->opneg(val);
+            val.get_type()->opneg(val);
             break;
         case Op::lnot:
             /* Unary operator '!': logial not */
-            val.type->lnot(val);
+            val.get_type()->lnot(val);
             break;
         default:
             throw InternalErrorEx();
@@ -161,13 +161,13 @@ EvalValue Expr03::eval(EvalContext *ctx) const
 
         switch (op) {
             case Op::times:
-                val.type->mul(val, RValue(e->eval(ctx)));
+                val.get_type()->mul(val, RValue(e->eval(ctx)));
                 break;
             case Op::div:
-                val.type->div(val, RValue(e->eval(ctx)));
+                val.get_type()->div(val, RValue(e->eval(ctx)));
                 break;
             case Op::mod:
-                val.type->mod(val, RValue(e->eval(ctx)));
+                val.get_type()->mod(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -187,10 +187,10 @@ EvalValue Expr04::eval(EvalContext *ctx) const
 
         switch (op) {
             case Op::plus:
-                val.type->add(val, RValue(e->eval(ctx)));
+                val.get_type()->add(val, RValue(e->eval(ctx)));
                 break;
             case Op::minus:
-                val.type->sub(val, RValue(e->eval(ctx)));
+                val.get_type()->sub(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -210,16 +210,16 @@ EvalValue Expr06::eval(EvalContext *ctx) const
 
         switch (op) {
             case Op::lt:
-                val.type->lt(val, RValue(e->eval(ctx)));
+                val.get_type()->lt(val, RValue(e->eval(ctx)));
                 break;
             case Op::gt:
-                val.type->gt(val, RValue(e->eval(ctx)));
+                val.get_type()->gt(val, RValue(e->eval(ctx)));
                 break;
             case Op::le:
-                val.type->le(val, RValue(e->eval(ctx)));
+                val.get_type()->le(val, RValue(e->eval(ctx)));
                 break;
             case Op::ge:
-                val.type->ge(val, RValue(e->eval(ctx)));
+                val.get_type()->ge(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -239,10 +239,10 @@ EvalValue Expr07::eval(EvalContext *ctx) const
 
         switch (op) {
             case Op::eq:
-                val.type->eq(val, RValue(e->eval(ctx)));
+                val.get_type()->eq(val, RValue(e->eval(ctx)));
                 break;
             case Op::noteq:
-                val.type->noteq(val, RValue(e->eval(ctx)));
+                val.get_type()->noteq(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -262,7 +262,7 @@ EvalValue Expr11::eval(EvalContext *ctx) const
 
         switch (op) {
             case Op::land:
-                val.type->land(val, RValue(e->eval(ctx)));
+                val.get_type()->land(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -282,7 +282,7 @@ EvalValue Expr12::eval(EvalContext *ctx) const
 
         switch (op) {
             case Op::lor:
-                val.type->lor(val, RValue(e->eval(ctx)));
+                val.get_type()->lor(val, RValue(e->eval(ctx)));
                 break;
             default:
                 throw InternalErrorEx();
@@ -328,19 +328,19 @@ EvalValue Expr14::eval(EvalContext *ctx) const
 
             switch (op) {
                 case Op::addeq:
-                    newVal.type->add(newVal, RValue(rval));
+                    newVal.get_type()->add(newVal, RValue(rval));
                     break;
                 case Op::subeq:
-                    newVal.type->sub(newVal, RValue(rval));
+                    newVal.get_type()->sub(newVal, RValue(rval));
                     break;
                 case Op::muleq:
-                    newVal.type->mul(newVal, RValue(rval));
+                    newVal.get_type()->mul(newVal, RValue(rval));
                     break;
                 case Op::diveq:
-                    newVal.type->div(newVal, RValue(rval));
+                    newVal.get_type()->div(newVal, RValue(rval));
                     break;
                 case Op::modeq:
-                    newVal.type->mod(newVal, RValue(rval));
+                    newVal.get_type()->mod(newVal, RValue(rval));
                     break;
                 default:
                     throw InternalErrorEx();

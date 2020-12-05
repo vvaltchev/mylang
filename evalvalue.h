@@ -36,13 +36,22 @@ class EvalValue {
 public:
 
     ValueU val;
+
+private:
+
     Type *type;
+
+public:
 
     EvalValue();
     EvalValue(long val);
     EvalValue(LValue *val);
     EvalValue(const UndefinedId &val);
     EvalValue(const Builtin &val);
+
+    Type *get_type() const {
+        return type;
+    }
 
     template <class T>
     T get() const;
@@ -110,15 +119,15 @@ inline EvalValue::EvalValue(const Builtin &val)
 
 
 template <>
-inline bool EvalValue::is<nullptr_t>() const { return type->t == Type::t_none; }
+inline bool EvalValue::is<nullptr_t>() const { return get_type()->t == Type::t_none; }
 template <>
-inline bool EvalValue::is<LValue *>() const { return type->t == Type::t_lval; }
+inline bool EvalValue::is<LValue *>() const { return get_type()->t == Type::t_lval; }
 template <>
-inline bool EvalValue::is<UndefinedId>() const { return type->t == Type::t_undefid; }
+inline bool EvalValue::is<UndefinedId>() const { return get_type()->t == Type::t_undefid; }
 template <>
-inline bool EvalValue::is<long>() const { return type->t == Type::t_int; }
+inline bool EvalValue::is<long>() const { return get_type()->t == Type::t_int; }
 template <>
-inline bool EvalValue::is<Builtin>() const { return type->t == Type::t_builtin; }
+inline bool EvalValue::is<Builtin>() const { return get_type()->t == Type::t_builtin; }
 
 
 template <>
@@ -164,5 +173,5 @@ inline bool
 is_true(EvalValue v)
 {
     EvalValue val = RValue(v);
-    return val.type->is_true(val);
+    return val.get_type()->is_true(val);
 }

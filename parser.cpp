@@ -68,7 +68,7 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 
             EvalValue const_value = v->eval(c.const_ctx);
 
-            if (const_value.type->t == Type::t_lval) {
+            if (const_value.get_type()->t == Type::t_lval) {
                 v = MakeConstructFromConstVal(RValue(const_value));
             }
         }
@@ -577,7 +577,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
             EvalValue v = ifstmt->condExpr->eval(c.const_ctx);
 
-            if (v.type->is_true(v))
+            if (v.get_type()->is_true(v))
                 ret = move(ifstmt->thenBlock);
             else
                 ret = move(ifstmt->elseBlock);
@@ -614,7 +614,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
             EvalValue v = whileStmt->condExpr->eval(c.const_ctx);
 
-            if (!v.type->is_true(v)) {
+            if (!v.get_type()->is_true(v)) {
                 ret.reset();
                 return true;
             }
