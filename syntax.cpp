@@ -3,6 +3,108 @@
 #include "errors.h"
 #include "syntax.h"
 
+static string
+escapeStr(const string_view &v)
+{
+    string s;
+    s.reserve(v.size() * 2);
+
+    for (char c : v) {
+
+        switch (c) {
+
+            case '\"':
+                s += "\\\"";
+                break;
+            case '\\':
+                s += "\\\\";
+                break;
+            case '\r':
+                s += "\\r";
+                break;
+            case '\n':
+                s += "\\n";
+                break;
+            case '\t':
+                s += "\\t";
+                break;
+            case '\v':
+                s += "\\v";
+                break;
+            case '\a':
+                s += "\\a";
+                break;
+            case '\b':
+                s += "\\b";
+                break;
+
+            default:
+                s += c;
+        }
+    }
+
+    return s;
+}
+
+static string
+unescapeString(const string_view &v)
+{
+    string s;
+    s.reserve(v.size());
+
+    for (size_t i = 0; i < v.size(); i++) {
+
+        if (v[i] == '\\') {
+
+            /*
+             * We know FOR SURE that '\' is NOT the last char in the
+             * literal simply because otherwise we'll have something like
+             * "xxx\" and the tokenize will accept < xxx" > instead of < xxx\ >.
+             */
+
+            switch (v[i + 1]) {
+
+                case '\\':
+                    s += '\\';
+                    break;
+                case '\"':
+                    s += '\"';
+                    break;
+                case 'r':
+                    s += '\r';
+                    break;
+                case 'n':
+                    s += '\n';
+                    break;
+                case 't':
+                    s += '\t';
+                    break;
+                case 'v':
+                    s += '\v';
+                    break;
+                case 'a':
+                    s += '\a';
+                    break;
+                case 'b':
+                    s += '\b';
+                    break;
+                default:
+                    s += v[i];
+                    s += v[i + 1];
+                    break;
+            }
+
+            i++;
+
+        } else {
+
+            s += v[i];
+        }
+    }
+
+    return s;
+}
+
 ostream &operator<<(ostream &s, const EvalValue &c)
 {
     return s << c.get_type()->to_string(c);
@@ -100,12 +202,12 @@ void LiteralStr::serialize(ostream &s, int level) const
 
     s << indent;
     s << "\"";
-    s << value;
+    s << escapeStr(value.get<SharedStrWrapper>().get());
     s << "\"";
 }
 
 LiteralStr::LiteralStr(string_view v)
-     : value (make_shared<string>(v))
+     : value (make_shared<string>(unescapeString(v)))
 {
 
 }
