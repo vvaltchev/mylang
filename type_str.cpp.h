@@ -17,6 +17,7 @@ public:
     TypeStr() : SharedType<SharedStrWrapper>(Type::t_str) { }
 
     virtual void add(EvalValue &a, const EvalValue &b);
+    virtual void mul(EvalValue &a, const EvalValue &b);
     virtual void lt(EvalValue &a, const EvalValue &b);
     virtual void gt(EvalValue &a, const EvalValue &b);
     virtual void le(EvalValue &a, const EvalValue &b);
@@ -54,6 +55,25 @@ void TypeStr::add(EvalValue &a, const EvalValue &b)
         else
             lval.get() += b.get_type()->to_string(b);
     }
+}
+
+void TypeStr::mul(EvalValue &a, const EvalValue &b)
+{
+    if (!a.is<SharedStrWrapper>())
+        throw TypeErrorEx();
+
+    if (!b.is<long>())
+        throw TypeErrorEx();
+
+    string new_str;
+    const string &s = a.get<SharedStrWrapper>().get();
+    const long n = b.get<long>();
+
+    for (long i = 0; i < n; i++) {
+        new_str += s;
+    }
+
+    a = SharedStrWrapper(make_shared<string>(move(new_str)));
 }
 
 void TypeStr::lt(EvalValue &a, const EvalValue &b)
