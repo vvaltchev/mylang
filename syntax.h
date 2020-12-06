@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #pragma once
-#include "lexer.h"
 #include "evalvalue.h"
+#include "parser.h"
 
 class Literal;
 class LiteralInt;

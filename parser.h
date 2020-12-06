@@ -3,12 +3,14 @@
 
 #include "errors.h"
 #include "lexer.h"
-#include "syntax.h"
 #include <vector>
 #include <memory>
 #include <string_view>
 
 using namespace std;
+
+class EvalContext;
+class Block;
 
 class TokenStream {
 

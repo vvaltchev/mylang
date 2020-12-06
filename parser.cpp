@@ -2,6 +2,7 @@
 
 #include "parser.h"
 #include "eval.h"
+#include "syntax.h"
 
 ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
     : ts(ts)
