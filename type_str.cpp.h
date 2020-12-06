@@ -25,6 +25,10 @@ public:
     virtual void eq(EvalValue &a, const EvalValue &b);
     virtual void noteq(EvalValue &a, const EvalValue &b);
 
+    virtual long len(const EvalValue &a) {
+        return a.get<SharedStrWrapper>().get().size();
+    }
+
     virtual string to_string(const EvalValue &a) {
         return a.get<SharedStrWrapper>().get();
     }

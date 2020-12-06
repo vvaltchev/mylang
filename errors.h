@@ -21,14 +21,15 @@ struct Loc {
 class Tok;
 class Construct;
 
+struct InternalErrorEx { };
 struct CannotRebindConstEx { const Loc loc; };
 struct ExpressionIsNotConstEx { const Loc loc; };
-struct InternalErrorEx { };
 struct InvalidTokenEx { string_view val; };
 struct DivisionByZeroEx { };
 struct TypeErrorEx { };
 struct UndefinedVariableEx { string_view name; };
 struct NotLValueEx { unique_ptr<Construct> expr; };
+struct InvalidArgument { };
 
 struct SyntaxErrorEx {
 

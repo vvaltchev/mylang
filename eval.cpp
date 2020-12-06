@@ -17,6 +17,14 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
     return EvalValue();
 }
 
+EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidArgument();
+
+    const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
+    return e.get_type()->len(e);
+}
 
 const string &
 find_builtin_name(const Builtin &b)
@@ -29,7 +37,6 @@ find_builtin_name(const Builtin &b)
 
     throw InternalErrorEx();
 }
-
 
 const array<Type *, Type::t_count> AllTypes = {
     new TypeNone(),
@@ -47,7 +54,8 @@ const array<Type *, Type::t_count> AllTypes = {
  */
 const EvalContext::SymbolsType EvalContext::builtins =
 {
-    make_pair("print", make_shared<LValue>(Builtin{builtin_print}))
+    make_pair("len", make_shared<LValue>(Builtin{builtin_len})),
+    make_pair("print", make_shared<LValue>(Builtin{builtin_print})),
 };
 
 EvalContext::EvalContext(bool const_ctx)

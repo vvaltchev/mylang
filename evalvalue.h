@@ -174,6 +174,7 @@ public:
 
     virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
     virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
+    virtual long len(const EvalValue &a) { throw TypeErrorEx(); }
 
     /* Helper functions for our custom variant */
 
