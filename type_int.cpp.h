@@ -15,27 +15,27 @@ public:
 
     TypeInt() : Type(Type::t_int) { }
 
-    virtual void add(EvalValue &a, EvalValue b);
-    virtual void sub(EvalValue &a, EvalValue b);
-    virtual void mul(EvalValue &a, EvalValue b);
-    virtual void div(EvalValue &a, EvalValue b);
-    virtual void mod(EvalValue &a, EvalValue b);
-    virtual void lt(EvalValue &a, EvalValue b);
-    virtual void gt(EvalValue &a, EvalValue b);
-    virtual void le(EvalValue &a, EvalValue b);
-    virtual void ge(EvalValue &a, EvalValue b);
-    virtual void eq(EvalValue &a, EvalValue b);
-    virtual void noteq(EvalValue &a, EvalValue b);
+    virtual void add(EvalValue &a, const EvalValue &b);
+    virtual void sub(EvalValue &a, const EvalValue &b);
+    virtual void mul(EvalValue &a, const EvalValue &b);
+    virtual void div(EvalValue &a, const EvalValue &b);
+    virtual void mod(EvalValue &a, const EvalValue &b);
+    virtual void lt(EvalValue &a, const EvalValue &b);
+    virtual void gt(EvalValue &a, const EvalValue &b);
+    virtual void le(EvalValue &a, const EvalValue &b);
+    virtual void ge(EvalValue &a, const EvalValue &b);
+    virtual void eq(EvalValue &a, const EvalValue &b);
+    virtual void noteq(EvalValue &a, const EvalValue &b);
     virtual void opneg(EvalValue &a);
     virtual void lnot(EvalValue &a);
-    virtual void land(EvalValue &a, EvalValue b);
-    virtual void lor(EvalValue &a, EvalValue b);
+    virtual void land(EvalValue &a, const EvalValue &b);
+    virtual void lor(EvalValue &a, const EvalValue &b);
 
     virtual bool is_true(const EvalValue &a);
     virtual string to_string(const EvalValue &a);
 };
 
-void TypeInt::add(EvalValue &a, EvalValue b)
+void TypeInt::add(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -43,7 +43,7 @@ void TypeInt::add(EvalValue &a, EvalValue b)
     a.get<long>() += b.get<long>();
 }
 
-void TypeInt::sub(EvalValue &a, EvalValue b)
+void TypeInt::sub(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -51,7 +51,7 @@ void TypeInt::sub(EvalValue &a, EvalValue b)
     a.get<long>() -= b.get<long>();
 }
 
-void TypeInt::mul(EvalValue &a, EvalValue b)
+void TypeInt::mul(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -59,7 +59,7 @@ void TypeInt::mul(EvalValue &a, EvalValue b)
     a.get<long>() *= b.get<long>();
 }
 
-void TypeInt::div(EvalValue &a, EvalValue b)
+void TypeInt::div(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -70,7 +70,7 @@ void TypeInt::div(EvalValue &a, EvalValue b)
     a.get<long>() /= b.get<long>();
 }
 
-void TypeInt::mod(EvalValue &a, EvalValue b)
+void TypeInt::mod(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -78,7 +78,7 @@ void TypeInt::mod(EvalValue &a, EvalValue b)
     a.get<long>() %= b.get<long>();
 }
 
-void TypeInt::lt(EvalValue &a, EvalValue b)
+void TypeInt::lt(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -86,7 +86,7 @@ void TypeInt::lt(EvalValue &a, EvalValue b)
     a.get<long>() = a.get<long>() < b.get<long>();
 }
 
-void TypeInt::gt(EvalValue &a, EvalValue b)
+void TypeInt::gt(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -94,7 +94,7 @@ void TypeInt::gt(EvalValue &a, EvalValue b)
     a.get<long>() = a.get<long>() > b.get<long>();
 }
 
-void TypeInt::le(EvalValue &a, EvalValue b)
+void TypeInt::le(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -102,7 +102,7 @@ void TypeInt::le(EvalValue &a, EvalValue b)
     a.get<long>() = a.get<long>() <= b.get<long>();
 }
 
-void TypeInt::ge(EvalValue &a, EvalValue b)
+void TypeInt::ge(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -110,7 +110,7 @@ void TypeInt::ge(EvalValue &a, EvalValue b)
     a.get<long>() = a.get<long>() >= b.get<long>();
 }
 
-void TypeInt::eq(EvalValue &a, EvalValue b)
+void TypeInt::eq(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -118,7 +118,7 @@ void TypeInt::eq(EvalValue &a, EvalValue b)
     a.get<long>() = a.get<long>() == b.get<long>();
 }
 
-void TypeInt::noteq(EvalValue &a, EvalValue b)
+void TypeInt::noteq(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -136,7 +136,7 @@ void TypeInt::lnot(EvalValue &a)
     a.get<long>() = !a.get<long>();
 }
 
-void TypeInt::land(EvalValue &a, EvalValue b)
+void TypeInt::land(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();
@@ -144,7 +144,7 @@ void TypeInt::land(EvalValue &a, EvalValue b)
     a.get<long>() = a.get<long>() && b.get<long>();
 }
 
-void TypeInt::lor(EvalValue &a, EvalValue b)
+void TypeInt::lor(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
         throw TypeErrorEx();

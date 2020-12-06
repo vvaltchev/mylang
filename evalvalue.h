@@ -156,21 +156,21 @@ public:
     const TypeE t;
     Type(TypeE t) : t(t) { assert(t != t_count); }
 
-    virtual void add(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void sub(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void mul(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void div(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void mod(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void lt(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void gt(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void le(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void ge(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void eq(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void noteq(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
+    virtual void add(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void sub(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void mul(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void div(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void mod(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void lt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void gt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void le(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void ge(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void eq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void noteq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
     virtual void opneg(EvalValue &a) { throw TypeErrorEx(); }
     virtual void lnot(EvalValue &a) { throw TypeErrorEx(); }
-    virtual void land(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
-    virtual void lor(EvalValue &a, EvalValue b) { throw TypeErrorEx(); }
+    virtual void land(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void lor(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
 
     virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
     virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
@@ -339,11 +339,11 @@ inline EvalValue::~EvalValue()
 
 // ---------------------------------------------------------------
 
-EvalValue RValue(EvalValue v);
+EvalValue RValue(const EvalValue &v);
 
 inline bool
-is_true(EvalValue v)
+is_true(const EvalValue &v)
 {
-    EvalValue val = RValue(v);
+    const EvalValue &val = RValue(v);
     return val.get_type()->is_true(val);
 }

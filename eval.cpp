@@ -60,7 +60,7 @@ EvalContext::EvalContext(bool const_ctx)
 }
 
 EvalValue
-RValue(EvalValue v)
+RValue(const EvalValue &v)
 {
     if (v.is<LValue *>())
         return v.get<LValue *>()->eval();
@@ -83,7 +83,7 @@ EvalValue Identifier::eval(EvalContext *ctx) const
 
 EvalValue CallExpr::eval(EvalContext *ctx) const
 {
-    EvalValue callable = RValue(id->eval(ctx));
+    const EvalValue &callable = RValue(id->eval(ctx));
 
     if (callable.is<UndefinedId>())
         throw UndefinedVariableEx{id->value};
@@ -278,8 +278,8 @@ EvalValue Expr12::eval(EvalContext *ctx) const
 
 EvalValue Expr14::eval(EvalContext *ctx) const
 {
-    EvalValue lval = lvalue->eval(ctx);
-    EvalValue rval = rvalue->eval(ctx);
+    const EvalValue &lval = lvalue->eval(ctx);
+    const EvalValue &rval = rvalue->eval(ctx);
 
     if (lval.is<UndefinedId>()) {
 

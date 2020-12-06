@@ -43,7 +43,7 @@ pAcceptWhileStmt(ParseContext &c,
                  unsigned fl);
 
 unique_ptr<Construct>
-MakeConstructFromConstVal(EvalValue v);
+MakeConstructFromConstVal(const EvalValue &v);
 
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
@@ -592,7 +592,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         if (c.const_eval && ifstmt->condExpr->is_const) {
 
-            EvalValue v = ifstmt->condExpr->eval(c.const_ctx);
+            const EvalValue &v = ifstmt->condExpr->eval(c.const_ctx);
 
             if (v.get_type()->is_true(v))
                 ret = move(ifstmt->thenBlock);
@@ -629,7 +629,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         if (c.const_eval && whileStmt->condExpr->is_const) {
 
-            EvalValue v = whileStmt->condExpr->eval(c.const_ctx);
+            const EvalValue &v = whileStmt->condExpr->eval(c.const_ctx);
 
             if (!v.get_type()->is_true(v)) {
                 ret.reset();
@@ -645,7 +645,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 }
 
 unique_ptr<Construct>
-MakeConstructFromConstVal(EvalValue v)
+MakeConstructFromConstVal(const EvalValue &v)
 {
     if (v.is<long>())
         return make_unique<LiteralInt>(v.get<long>());
