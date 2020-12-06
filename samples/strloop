@@ -1,0 +1,12 @@
+#
+# Test the performance of str concat
+#
+
+var s = "";
+var i = 0;
+
+while (i < 10000) {
+    s += i;
+    s += ",";
+    i += 1;
+}

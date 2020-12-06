@@ -1,3 +1,6 @@
+#
+# Simple loop, useful for performance benchmarks
+#
 
 i = 0
 
