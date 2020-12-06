@@ -58,6 +58,18 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 }
 
 bool
+pAcceptLiteralStr(ParseContext &c, unique_ptr<Construct> &v)
+{
+    if (*c == TokType::str) {
+        v.reset(new LiteralStr(c.get_str()));
+        c++;
+        return true;
+    }
+
+    return false;
+}
+
+bool
 pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 {
     if (*c == TokType::id) {
@@ -191,6 +203,11 @@ pExpr01(ParseContext &c, unsigned fl)
     unique_ptr<Construct> callExpr;
 
     if (pAcceptLiteralInt(c, main)) {
+
+        ret = move(main);
+        ret->is_const = true;
+
+    } else if (pAcceptLiteralStr(c, main)) {
 
         ret = move(main);
         ret->is_const = true;
@@ -632,8 +649,10 @@ MakeConstructFromConstVal(EvalValue v)
 {
     if (v.is<long>())
         return make_unique<LiteralInt>(v.get<long>());
-    else if (v.is<nullptr_t>())
+    else if (v.is<NoneVal>())
         return make_unique<LiteralNone>();
+    else if (v.is<SharedStrWrapper>())
+        return make_unique<LiteralStr>(v);
 
     throw InternalErrorEx();
 }

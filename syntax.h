@@ -104,8 +104,9 @@ public:
 
 class LiteralInt : public Literal {
 
-public:
     const long value;
+
+public:
 
     LiteralInt(long v) : value(v) { }
 
@@ -124,6 +125,24 @@ public:
 
     virtual EvalValue eval(EvalContext *ctx) const {
         return EvalValue();
+    }
+
+    virtual void serialize(ostream &s, int level = 0) const;
+};
+
+class LiteralStr : public Literal {
+
+    EvalValue value;
+
+public:
+
+    LiteralStr(string_view v);
+
+    LiteralStr(const EvalValue &v) : value(v) { }
+    LiteralStr(EvalValue &&v) : value(move(v)) { }
+
+    virtual EvalValue eval(EvalContext *ctx) const {
+        return value;
     }
 
     virtual void serialize(ostream &s, int level = 0) const;

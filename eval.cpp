@@ -5,6 +5,7 @@
 #include "syntax.h"
 #include "lexer.h"
 #include "type_int.cpp.h"
+#include "type_str.cpp.h"
 
 EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 {
@@ -13,12 +14,11 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
     }
 
     cout << endl;
-
     return EvalValue();
 }
 
 
-static const string &
+const string &
 find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::builtins) {
@@ -30,23 +30,6 @@ find_builtin_name(const Builtin &b)
     throw InternalErrorEx();
 }
 
-class TypeNone : public Type {
-
-public:
-    TypeNone() : Type(Type::t_none) { }
-    virtual string to_string(const EvalValue &a) {
-        return "<none>";
-    }
-};
-
-class TypeBuiltin : public Type {
-
-public:
-    TypeBuiltin() : Type(Type::t_builtin) { }
-    virtual string to_string(const EvalValue &a) {
-        return "<builtin: " + find_builtin_name(a.get<Builtin>()) + ">";
-    }
-};
 
 const array<Type *, Type::t_count> AllTypes = {
     new TypeNone(),
@@ -54,6 +37,7 @@ const array<Type *, Type::t_count> AllTypes = {
     new Type(Type::t_undefid),    /* internal type: not visible from outside */
     new TypeInt(),
     new TypeBuiltin(),
+    new TypeStr(),
 };
 
 /*

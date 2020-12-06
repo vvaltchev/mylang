@@ -94,6 +94,21 @@ void LiteralNone::serialize(ostream &s, int level) const
     s << string("None");
 }
 
+void LiteralStr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "\"";
+    s << value;
+    s << "\"";
+}
+
+LiteralStr::LiteralStr(string_view v)
+     : value (make_shared<string>(v))
+{
+
+}
 
 void Identifier::serialize(ostream &s, int level) const
 {

@@ -5,6 +5,7 @@
 #include <string_view>
 #include <array>
 #include <cassert>
+#include <cstddef>
 
 using namespace std;
 
@@ -14,28 +15,71 @@ class ExprList;
 class EvalValue;
 class EvalContext;
 
+struct NoneVal { };
 struct UndefinedId { string_view id; };
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
+
+template <class T>
+struct SharedVal {
+
+    typedef T type;
+
+    char data[sizeof(shared_ptr<T>)] alignas(shared_ptr<T>);
+
+    SharedVal() = default;
+
+    SharedVal(const shared_ptr<T> &s) {
+        new ((void *)data) shared_ptr<T>(s);
+    }
+
+    SharedVal(shared_ptr<T> &&s) {
+        new ((void *)data) shared_ptr<T>(move(s));
+    }
+
+    shared_ptr<T> &to_shared_ptr() {
+        return *reinterpret_cast<shared_ptr<T> *>(data);
+    }
+
+    T &get() {
+        return *to_shared_ptr().get();
+    }
+
+    T get() const {
+        /* Unfortunately, this const_cast is unavoidable */
+        return *const_cast<SharedVal<T> *>(this).get();
+    }
+
+    long use_count() {
+        return to_shared_ptr().use_count();
+    }
+};
+
+typedef SharedVal<string> SharedStrWrapper;
 
 class EvalValue {
 
     union ValueU {
 
-        long ival;
+        NoneVal none;
         LValue *lval;
         UndefinedId undef;
+        long ival;
         Builtin bfunc;
+        SharedStrWrapper str;
 
         ValueU() : ival(0) { }
-        ValueU(long val) : ival(val) { }
         ValueU(LValue *val) : lval(val) { }
         ValueU(const UndefinedId &val) : undef(val) { }
+        ValueU(long val) : ival(val) { }
         ValueU(const Builtin &val) : bfunc(val) { }
     };
 
 
     ValueU val;
     Type *type;
+
+    void create_val();
+    void destroy_val();
 
 public:
 
@@ -44,17 +88,43 @@ public:
     EvalValue(LValue *val);
     EvalValue(const UndefinedId &val);
     EvalValue(const Builtin &val);
+    EvalValue(const SharedStrWrapper &val);
+    EvalValue(SharedStrWrapper &&val);
+
+    EvalValue(const EvalValue &other);
+    EvalValue(EvalValue &&other);
+    EvalValue &operator=(const EvalValue &other);
+    EvalValue &operator=(EvalValue &&other);
+
+    ~EvalValue();
 
     Type *get_type() const {
         return type;
     }
 
     template <class T>
-    T &get();
+    T &get() {
+
+        static_assert(offsetof(ValueU, lval) == 0);
+        static_assert(offsetof(ValueU, undef) == 0);
+        static_assert(offsetof(ValueU, ival) == 0);
+        static_assert(offsetof(ValueU, bfunc) == 0);
+        static_assert(offsetof(ValueU, str) == 0);
+
+        if (is<T>())
+            return *reinterpret_cast<T *>(&val);
+
+        throw TypeErrorEx();
+    }
 
     template <class T>
     T get() const {
-        return const_cast<EvalValue *>(this)->get<T>();
+
+        if (is<T>())
+            return *reinterpret_cast<const T *>(&val);
+
+
+        throw TypeErrorEx();
     }
 
     template <class T>
@@ -69,12 +139,17 @@ public:
 
     enum TypeE : int {
 
+        /* Trivial types */
         t_none,
         t_lval,
         t_undefid,
         t_int,
         t_builtin,
 
+        /* Non-trivial types */
+        t_str,
+
+        /* Number of types */
         t_count,
     };
 
@@ -99,9 +174,31 @@ public:
 
     virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
     virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
+
+    /* Helper functions for our custom variant */
+
+    virtual void default_ctor(void *obj) { throw InternalErrorEx(); }
+    virtual void dtor(void *obj) { throw InternalErrorEx(); }
+    virtual void copy_ctor(void *obj, const void *other) { throw InternalErrorEx(); }
+    virtual void move_ctor(void *obj, void *other) { throw InternalErrorEx(); }
+    virtual void copy_assign(void *obj, const void *other) { throw InternalErrorEx(); }
+    virtual void move_assign(void *obj, void *other) { throw InternalErrorEx(); }
 };
 
 extern const array<Type *, Type::t_count> AllTypes;
+
+template <>
+inline bool EvalValue::is<NoneVal>() const { return type->t == Type::t_none; }
+template <>
+inline bool EvalValue::is<LValue *>() const { return type->t == Type::t_lval; }
+template <>
+inline bool EvalValue::is<UndefinedId>() const { return type->t == Type::t_undefid; }
+template <>
+inline bool EvalValue::is<long>() const { return type->t == Type::t_int; }
+template <>
+inline bool EvalValue::is<Builtin>() const { return type->t == Type::Type::t_builtin; }
+template <>
+inline bool EvalValue::is<SharedStrWrapper>() const { return type->t == Type::t_str; }
 
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[Type::t_none]) { }
@@ -116,56 +213,131 @@ inline EvalValue::EvalValue(long val)
     : val(val), type(AllTypes[Type::t_int]) { }
 
 inline EvalValue::EvalValue(const Builtin &val)
-    : val(val), type(AllTypes[Type::t_builtin]) { }
+    : val(val), type(AllTypes[Type::Type::t_builtin]) { }
 
-
-template <>
-inline bool EvalValue::is<nullptr_t>() const { return get_type()->t == Type::t_none; }
-template <>
-inline bool EvalValue::is<LValue *>() const { return get_type()->t == Type::t_lval; }
-template <>
-inline bool EvalValue::is<UndefinedId>() const { return get_type()->t == Type::t_undefid; }
-template <>
-inline bool EvalValue::is<long>() const { return get_type()->t == Type::t_int; }
-template <>
-inline bool EvalValue::is<Builtin>() const { return get_type()->t == Type::t_builtin; }
-
-
-template <>
-inline LValue *&EvalValue::get<LValue *>() {
-
-    if (is<LValue *>())
-        return val.lval;
-
-    throw TypeErrorEx();
+inline EvalValue::EvalValue(const SharedStrWrapper &v)
+    : type(AllTypes[Type::t_str])
+{
+    type->copy_ctor(
+        reinterpret_cast<void *>( &val ),
+        reinterpret_cast<const void *>( &v )
+    );
 }
 
-template <>
-inline UndefinedId &EvalValue::get<UndefinedId>() {
-
-    if (is<UndefinedId>())
-        return val.undef;
-
-    throw TypeErrorEx();
+inline EvalValue::EvalValue(SharedStrWrapper &&v)
+    : type(AllTypes[Type::t_str])
+{
+    type->move_ctor(
+        reinterpret_cast<void *>( &val ),
+        reinterpret_cast<void *>( &v )
+    );
 }
 
-template <>
-inline long &EvalValue::get<long>() {
+inline EvalValue::EvalValue(const EvalValue &other)
+    : type(other.type)
+{
+    if (type->t >= Type::t_str) {
 
-    if (is<long>())
-        return val.ival;
+        type->copy_ctor(
+            reinterpret_cast<void *>( &val ),
+            reinterpret_cast<const void *>( &other.val )
+        );
 
-    throw TypeErrorEx();
+    } else {
+
+        val = other.val;
+    }
 }
 
-template <>
-inline Builtin &EvalValue::get<Builtin>() {
+inline EvalValue::EvalValue(EvalValue &&other)
+    : type(other.type)
+{
+    if (type->t >= Type::t_str) {
 
-    if (is<Builtin>())
-        return val.bfunc;
+        type->move_ctor(
+            reinterpret_cast<void *>( &val ),
+            reinterpret_cast<void *>( &other.val )
+        );
 
-    throw TypeErrorEx();
+        other.type = AllTypes[Type::t_none];
+
+    } else {
+
+        val = other.val;
+    }
 }
+
+inline void EvalValue::create_val()
+{
+    if (type->t >= Type::t_str) {
+        type->default_ctor(&val);
+    }
+}
+
+inline void EvalValue::destroy_val()
+{
+    if (type->t >= Type::t_str) {
+        type->dtor(&val);
+    }
+
+    type = AllTypes[Type::t_none];
+}
+
+inline EvalValue &EvalValue::operator=(const EvalValue &other)
+{
+    if (type != other.type) {
+        destroy_val();
+        type = other.type;
+        create_val();
+    }
+
+    if (type->t >= Type::t_str) {
+
+        type->copy_assign(
+            reinterpret_cast<void *>( &val ),
+            reinterpret_cast<const void *>( &other.val )
+        );
+
+    } else {
+
+        val = other.val;
+    }
+
+    return *this;
+}
+
+inline EvalValue &EvalValue::operator=(EvalValue &&other)
+{
+    if (type != other.type) {
+        destroy_val();
+        type = other.type;
+        create_val();
+    }
+
+    if (type->t >= Type::t_str) {
+
+        type->move_assign(
+            reinterpret_cast<void *>( &val ),
+            reinterpret_cast<void *>( &other.val )
+        );
+
+        other.type = AllTypes[Type::t_none];
+
+    } else {
+
+        val = other.val;
+    }
+
+    return *this;
+}
+
+inline EvalValue::~EvalValue()
+{
+    destroy_val();
+}
+
+
+// ---------------------------------------------------------------
 
 EvalValue RValue(EvalValue v);
 

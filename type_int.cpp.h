@@ -6,6 +6,7 @@
  * way instead.
  */
 
+#pragma once
 #include "evalvalue.h"
 
 class TypeInt : public Type {
