@@ -4,6 +4,7 @@
 #include "errors.h"
 #include "syntax.h"
 #include "lexer.h"
+#include "evaltypes.cpp.h"
 #include "type_int.cpp.h"
 #include "type_str.cpp.h"
 

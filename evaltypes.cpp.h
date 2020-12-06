@@ -13,42 +13,47 @@ const string &
 find_builtin_name(const Builtin &b);
 
 template <class T>
-class SharedType : public Type {
-
-    /*
-     * T is our POD wrapper for shared_ptr<U>.
-     * U is the real data type wrapped by shared_ptr.
-     */
-    typedef typename T::type U;
-    typedef shared_ptr<U> S;
+class NonTrivialType : public Type {
 
 public:
 
-    SharedType(Type::TypeE e) : Type(e) { }
+    NonTrivialType(Type::TypeE e) : Type(e) { }
 
     virtual void default_ctor(void *obj) {
-        new (obj) S;
+        new (obj) T;
     }
 
     virtual void dtor(void *obj) {
-        reinterpret_cast<S *>(obj)->~S();
+        reinterpret_cast<T *>(obj)->~T();
     }
 
     virtual void copy_ctor(void *obj, const void *other) {
-        new (obj) S(*reinterpret_cast<const S *>(other));
+        new (obj) T(*reinterpret_cast<const T *>(other));
     }
 
     virtual void move_ctor(void *obj, void *other) {
-        new (obj) S(move(*reinterpret_cast<S *>(other)));
+        new (obj) T(move(*reinterpret_cast<T *>(other)));
     }
 
     virtual void copy_assign(void *obj, const void *other) {
-        *reinterpret_cast<S *>(obj) = *reinterpret_cast<const S *>(other);
+        *reinterpret_cast<T *>(obj) = *reinterpret_cast<const T *>(other);
     }
 
     virtual void move_assign(void *obj, void *other) {
-        *reinterpret_cast<S *>(obj) = move(*reinterpret_cast<S *>(other));
+        *reinterpret_cast<T *>(obj) = move(*reinterpret_cast<T *>(other));
     }
+};
+
+template <class T>
+class SharedType :
+    public NonTrivialType<
+        shared_ptr<typename T::type>
+    >
+{
+    typedef shared_ptr<typename T::type> S;
+
+public:
+    SharedType(Type::TypeE e) : NonTrivialType<S>(e) { }
 };
 
 class TypeNone : public Type {
