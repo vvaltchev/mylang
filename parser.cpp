@@ -42,6 +42,11 @@ pAcceptWhileStmt(ParseContext &c,
                  unique_ptr<Construct> &ret,
                  unsigned fl);
 
+bool
+pAcceptBracedBlock(ParseContext &c,
+                   unique_ptr<Construct> &ret,
+                   unsigned fl);
+
 unique_ptr<Construct>
 MakeConstructFromConstVal(const EvalValue &v);
 
@@ -559,18 +564,31 @@ unique_ptr<Construct>
 pBlock(ParseContext &c, unsigned fl)
 {
     unique_ptr<Block> ret(new Block);
-    unique_ptr<Construct> stmt;
+    unique_ptr<Construct> stmt, tmp;
+    bool added_elem;
 
-    if (!c.eoi()) {
+    if (c.eoi())
+        return ret;
+
+    do {
+
+        added_elem = false;
+
+        if (pAcceptBracedBlock(c, tmp, fl)) {
+            ret->elems.emplace_back(move(tmp));
+            added_elem = true;
+        }
 
         while ((stmt = pStmt(c, fl))) {
 
             ret->elems.emplace_back(move(stmt));
+            added_elem = true;
 
             while (*c == Op::semicolon)
                 c++;    /* skip multiple ';' */
         }
-    }
+
+    } while (added_elem);
 
     return ret;
 }

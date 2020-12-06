@@ -88,6 +88,7 @@ unescapeString(const string_view &v)
                 case 'b':
                     s += '\b';
                     break;
+
                 default:
                     s += v[i];
                     s += v[i + 1];
