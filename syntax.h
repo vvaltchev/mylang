@@ -37,7 +37,7 @@ public:
         : name(name), is_const(is_const) { }
 
     virtual ~Construct() = default;
-    virtual EvalValue eval(EvalContext *) const = 0;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const = 0;
     virtual void serialize(ostream &s, int level = 0) const = 0;
 };
 
@@ -47,7 +47,7 @@ public:
 
     ChildlessConstruct(const char *name) : Construct(name) { }
 
-    virtual EvalValue eval(EvalContext *ctx) const {
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const {
         return EvalValue();
     }
 
@@ -61,7 +61,7 @@ public:
 
     SingleChildConstruct(const char *name) : Construct(name) { }
 
-    virtual EvalValue eval(EvalContext *ctx) const {
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const {
         return elem->eval(ctx);
     }
 
@@ -110,7 +110,7 @@ public:
 
     LiteralInt(long v) : value(v) { }
 
-    virtual EvalValue eval(EvalContext *ctx) const {
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const {
         return value;
     }
 
@@ -123,7 +123,7 @@ public:
 
     LiteralNone() : Literal() { }
 
-    virtual EvalValue eval(EvalContext *ctx) const {
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const {
         return EvalValue();
     }
 
@@ -141,7 +141,7 @@ public:
     LiteralStr(const EvalValue &v) : value(v) { }
     LiteralStr(EvalValue &&v) : value(move(v)) { }
 
-    virtual EvalValue eval(EvalContext *ctx) const {
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const {
         return value;
     }
 
@@ -157,7 +157,7 @@ public:
     Identifier(T &&arg) : Construct("Id"), value(forward<T>(arg)) { }
 
     virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class ExprList : public MultiElemConstruct {
@@ -166,7 +166,7 @@ public:
 
     ExprList() : MultiElemConstruct("ExprList") { }
 
-    virtual EvalValue eval(EvalContext *ctx) const {
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const {
         return EvalValue();
     }
 };
@@ -179,7 +179,7 @@ public:
 
     CallExpr() : Construct("CallExpr") { }
     virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr01 : public SingleChildConstruct {
@@ -193,7 +193,7 @@ class Expr02 : public MultiOpConstruct {
 public:
 
     Expr02() : MultiOpConstruct("Expr02") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 
@@ -202,7 +202,7 @@ class Expr03 : public MultiOpConstruct {
 public:
 
     Expr03() : MultiOpConstruct("Expr03") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr04 : public MultiOpConstruct {
@@ -210,7 +210,7 @@ class Expr04 : public MultiOpConstruct {
 public:
 
     Expr04() : MultiOpConstruct("Expr04") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr06 : public MultiOpConstruct {
@@ -218,7 +218,7 @@ class Expr06 : public MultiOpConstruct {
 public:
 
     Expr06() : MultiOpConstruct("Expr06") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr07 : public MultiOpConstruct {
@@ -226,7 +226,7 @@ class Expr07 : public MultiOpConstruct {
 public:
 
     Expr07() : MultiOpConstruct("Expr07") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr11 : public MultiOpConstruct {
@@ -234,7 +234,7 @@ class Expr11 : public MultiOpConstruct {
 public:
 
     Expr11() : MultiOpConstruct("Expr11") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr12 : public MultiOpConstruct {
@@ -242,7 +242,7 @@ class Expr12 : public MultiOpConstruct {
 public:
 
     Expr12() : MultiOpConstruct("Expr12") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr14 : public Construct {
@@ -256,7 +256,7 @@ public:
 
     Expr14() : Construct("Expr14"), op(Op::invalid), fl(pNone) { }
     virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Expr15 : public MultiOpConstruct {
@@ -264,7 +264,7 @@ class Expr15 : public MultiOpConstruct {
 public:
 
     Expr15() : MultiOpConstruct("Expr15") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Stmt : public SingleChildConstruct {
@@ -282,28 +282,28 @@ public:
 
     IfStmt() : Construct("IfStmt") { }
     virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class Block : public MultiElemConstruct {
 
 public:
     Block() : MultiElemConstruct("Block") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class BreakStmt : public ChildlessConstruct {
 
 public:
     BreakStmt(): ChildlessConstruct("BreakStmt") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class ContinueStmt : public ChildlessConstruct {
 
 public:
     ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
 class WhileStmt : public Construct {
@@ -314,5 +314,5 @@ public:
 
     WhileStmt() : Construct("WhileStmt") { }
     virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue eval(EvalContext *ctx) const;
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };

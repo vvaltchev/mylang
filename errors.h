@@ -28,8 +28,9 @@ struct InvalidTokenEx { string_view val; };
 struct DivisionByZeroEx { };
 struct TypeErrorEx { };
 struct UndefinedVariableEx { string_view name; };
+struct AlreadyDefinedEx { };
 struct NotLValueEx { unique_ptr<Construct> expr; };
-struct InvalidArgument { };
+struct InvalidArgumentEx { };
 
 struct SyntaxErrorEx {
 
