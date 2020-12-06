@@ -49,9 +49,10 @@ class EvalContext {
 public:
 
     typedef map<string, shared_ptr<LValue>, less<>> SymbolsType;
+    EvalContext *const parent;
     const bool const_ctx;
 
-    EvalContext(bool const_ctx = false);
+    EvalContext(EvalContext *parent = nullptr, bool const_ctx = false);
     SymbolsType symbols;
 
     static const SymbolsType builtins;

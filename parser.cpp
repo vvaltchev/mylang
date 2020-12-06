@@ -7,7 +7,7 @@
 ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
     : ts(ts)
     , const_eval(const_eval)
-    , const_ctx(new EvalContext(true))
+    , const_ctx(new EvalContext(nullptr, true))
 {
 
 }

@@ -64,13 +64,16 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_pair("print", make_shared<LValue>(Builtin{builtin_print})),
 };
 
-EvalContext::EvalContext(bool const_ctx)
-    : const_ctx(const_ctx)
+EvalContext::EvalContext(EvalContext *parent, bool const_ctx)
+    : parent(parent)
+    , const_ctx(const_ctx)
 {
-    symbols.insert(const_builtins.begin(), const_builtins.end());
+    if (!parent) {
+        symbols.insert(const_builtins.begin(), const_builtins.end());
 
-    if (!const_ctx) {
-        symbols.insert(builtins.begin(), builtins.end());
+        if (!const_ctx) {
+            symbols.insert(builtins.begin(), builtins.end());
+        }
     }
 }
 
@@ -88,12 +91,17 @@ RValue(const EvalValue &v)
 
 EvalValue Identifier::eval(EvalContext *ctx) const
 {
-    auto it = ctx->symbols.find(value);
+    while (ctx) {
 
-    if (it == ctx->symbols.end())
-        return UndefinedId{value};
+        auto it = ctx->symbols.find(value);
 
-    return EvalValue(it->second.get());
+        if (it != ctx->symbols.end())
+            return EvalValue(it->second.get());
+
+        ctx = ctx->parent;
+    }
+
+    return UndefinedId{value};
 }
 
 EvalValue CallExpr::eval(EvalContext *ctx) const
@@ -409,13 +417,12 @@ EvalValue ContinueStmt::eval(EvalContext *ctx) const
 
 EvalValue Block::eval(EvalContext *ctx) const
 {
-    EvalValue val;
+    EvalContext curr(ctx);
 
-    for (const auto &e : elems) {
-        val = e->eval(ctx);
-    }
+    for (const auto &e: elems)
+        e->eval(&curr);
 
-    return val;
+    return EvalValue();
 }
 
 EvalValue WhileStmt::eval(EvalContext *ctx) const
