@@ -55,4 +55,5 @@ public:
     SymbolsType symbols;
 
     static const SymbolsType builtins;
+    static const SymbolsType const_builtins;
 };

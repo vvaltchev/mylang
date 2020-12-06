@@ -48,22 +48,28 @@ const array<Type *, Type::t_count> AllTypes = {
 };
 
 /*
- * NOTE: this definition *MUST FOLLOW* the definition of `AllTypes`
+ * NOTE: these definitions *MUST FOLLOW* the definition of `AllTypes`
  * simply because the creation of LValue's contents does a lookup
  * in AllTypes.
  */
-const EvalContext::SymbolsType EvalContext::builtins =
+
+const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     make_pair("len", make_shared<LValue>(Builtin{builtin_len})),
+};
+
+const EvalContext::SymbolsType EvalContext::builtins =
+{
     make_pair("print", make_shared<LValue>(Builtin{builtin_print})),
 };
 
 EvalContext::EvalContext(bool const_ctx)
     : const_ctx(const_ctx)
 {
+    symbols.insert(const_builtins.begin(), const_builtins.end());
+
     if (!const_ctx) {
-        /* Copy the builtins in the current EvalContext */
-        symbols = builtins;
+        symbols.insert(builtins.begin(), builtins.end());
     }
 }
 

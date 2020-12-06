@@ -78,10 +78,17 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 
         if (c.const_eval && resolve_const) {
 
-            EvalValue const_value = v->eval(c.const_ctx);
+            const EvalValue &const_value = v->eval(c.const_ctx);
 
             if (const_value.get_type()->t == Type::t_lval) {
-                v = MakeConstructFromConstVal(RValue(const_value));
+
+                const EvalValue &rval = RValue(const_value);
+
+                if (!rval.is<Builtin>()) {
+                    v = MakeConstructFromConstVal(rval);
+                } else {
+                    v->is_const = true;
+                }
             }
         }
 
@@ -153,11 +160,13 @@ pExprList(ParseContext &c, unsigned fl)
 {
     unique_ptr<ExprList> ret(new ExprList);
     unique_ptr<Construct> subexpr;
+    bool is_const = true;
 
     subexpr = pExpr14(c, fl);
 
     if (subexpr) {
 
+        is_const = is_const && subexpr->is_const;
         ret->elems.emplace_back(move(subexpr));
 
         while (*c == Op::comma) {
@@ -168,10 +177,12 @@ pExprList(ParseContext &c, unsigned fl)
             if (!subexpr)
                 noExprError(c);
 
+            is_const = is_const && subexpr->is_const;
             ret->elems.emplace_back(move(subexpr));
         }
     }
 
+    ret->is_const = is_const;
     return ret;
 }
 
@@ -187,7 +198,18 @@ pAcceptCallExpr(ParseContext &c,
 
         expr->id.reset(static_cast<Identifier *>(id.release()));
         expr->args = pExprList(c, fl);
-        ret = move(expr);
+
+        if (c.const_eval && expr->id->is_const && expr->args->is_const) {
+
+            EvalValue e = expr->eval(c.const_ctx);
+
+            ret = MakeConstructFromConstVal(e);
+
+        } else {
+
+            ret = move(expr);
+        }
+
         pExpectOp(c, Op::parenR);
         return true;
     }
@@ -227,7 +249,7 @@ pExpr01(ParseContext &c, unsigned fl)
 
     } else if (pAcceptId(c, main)) {
 
-        if (!main->is_const && pAcceptCallExpr(c, main, callExpr, fl))
+        if (pAcceptCallExpr(c, main, callExpr, fl))
             ret = move(callExpr);
         else
             ret = move(main);
