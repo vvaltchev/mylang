@@ -21,6 +21,8 @@ static bool opt_show_syntax_tree;
 static bool opt_no_const_eval;
 static bool opt_no_run;
 
+void run_tests();
+
 void help()
 {
     cout << "Syntax:" << endl;
@@ -30,6 +32,10 @@ void help()
     cout << "   -s      Dump the syntax tree" << endl;
     cout << "  -nc      No const eval (debug)" << endl;
     cout << "  -nr      Don't run, just validate" << endl;
+
+#ifdef TESTS
+    cout << "  -rt      Run unit tests" << endl;
+#endif
 }
 
 void
@@ -95,6 +101,10 @@ parse_args(int argc,
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
 
             help(); exit(0);
+
+        } else if (!strcmp(arg, "-rt")) {
+
+            run_tests(); exit(0);
 
         } else if (!strcmp(arg, "-t")) {
 

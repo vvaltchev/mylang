@@ -10,6 +10,17 @@ FL_OTHER ?= -fwrapv
 FL_INC = -I$(PROJ_ROOT)
 BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
 
+ifdef OPT
+	ifeq ($(OPT),1)
+		BASE_FLAGS += -O3
+	endif
+endif
+
+ifdef TESTS
+	ifeq ($(TESTS),1)
+		BASE_FLAGS += -DTESTS
+	endif
+endif
 
 DEPDIR := .d
 DEPFLAGS = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.Td

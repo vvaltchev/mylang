@@ -21,7 +21,9 @@ struct Loc {
 class Tok;
 class Construct;
 
-struct Exception { };
+struct Exception {
+    virtual ~Exception() = default;
+};
 
 struct InternalErrorEx : public Exception { };
 
