@@ -302,6 +302,43 @@ EvalValue Expr12::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
+static void
+doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
+{
+    EvalValue newVal;
+
+    if (op == Op::assign) {
+
+        newVal = RValue(rval);
+
+    } else {
+
+        newVal = RValue(lval.get<LValue *>()->eval());
+
+        switch (op) {
+            case Op::addeq:
+                newVal.get_type()->add(newVal, RValue(rval));
+                break;
+            case Op::subeq:
+                newVal.get_type()->sub(newVal, RValue(rval));
+                break;
+            case Op::muleq:
+                newVal.get_type()->mul(newVal, RValue(rval));
+                break;
+            case Op::diveq:
+                newVal.get_type()->div(newVal, RValue(rval));
+                break;
+            case Op::modeq:
+                newVal.get_type()->mod(newVal, RValue(rval));
+                break;
+            default:
+                throw InternalErrorEx();
+        }
+    }
+
+    lval.get<LValue *>()->put(newVal);
+}
+
 EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
 {
     const bool inDecl = fl & pFlags::pInDecl;
@@ -310,58 +347,39 @@ EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
 
     if (lval.is<UndefinedId>()) {
 
-        if (inDecl) {
-
-            ctx->symbols.emplace(
-                lval.get<UndefinedId>().id,
-                make_shared<LValue>(RValue(rval), ctx->const_ctx)
-            );
-
-        } else {
-
+        if (!inDecl)
             throw UndefinedVariableEx{ lval.get<UndefinedId>().id };
-        }
+
+        ctx->symbols.emplace(
+            lval.get<UndefinedId>().id,
+            make_shared<LValue>(RValue(rval), ctx->const_ctx)
+        );
 
     } else if (lval.is<LValue *>()) {
-
-        EvalValue newVal;
 
         if (ctx->const_ctx)
             throw CannotRebindConstEx{Loc()};
 
-        if (op == Op::assign) {
+        if (inDecl) {
 
-            newVal = RValue(rval);
+            const EvalValue &local_lval = lvalue->eval(ctx, false);
+
+            if (!local_lval.is<UndefinedId>()) {
+                /* We're re-defining the same variable, in the same block */
+                throw AlreadyDefinedEx();
+            }
+
+            /* We're re-declaring a symbol already declared outside */
+            ctx->symbols.emplace(
+                local_lval.get<UndefinedId>().id,
+                make_shared<LValue>(RValue(rval), ctx->const_ctx)
+            );
 
         } else {
-
-            newVal = RValue(lval.get<LValue *>()->eval());
-
-            switch (op) {
-                case Op::addeq:
-                    newVal.get_type()->add(newVal, RValue(rval));
-                    break;
-                case Op::subeq:
-                    newVal.get_type()->sub(newVal, RValue(rval));
-                    break;
-                case Op::muleq:
-                    newVal.get_type()->mul(newVal, RValue(rval));
-                    break;
-                case Op::diveq:
-                    newVal.get_type()->div(newVal, RValue(rval));
-                    break;
-                case Op::modeq:
-                    newVal.get_type()->mod(newVal, RValue(rval));
-                    break;
-                default:
-                    throw InternalErrorEx();
-            }
+            doAssign(lval, rval, op);
         }
 
-        lval.get<LValue *>()->put(newVal);
-
     } else {
-
         throw NotLValueEx{move(lvalue)};
     }
 
@@ -421,7 +439,7 @@ EvalValue ContinueStmt::eval(EvalContext *ctx, bool rec) const
 
 EvalValue Block::eval(EvalContext *ctx, bool rec) const
 {
-    EvalContext curr(ctx);
+    EvalContext curr(ctx, ctx->const_ctx);
 
     for (const auto &e: elems)
         e->eval(&curr);

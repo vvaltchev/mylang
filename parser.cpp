@@ -418,6 +418,20 @@ pExpr14(ParseContext &c, unsigned fl)
             );
         }
 
+        if (fl & ~pFlags::pInConstDecl) {
+
+            /*
+             * We're *NOT* in const decl, now check that we're not reusing a const
+             * identifier.
+             */
+
+            const EvalValue &e = lside->eval(c.const_ctx);
+
+            if (!e.is<UndefinedId>()) {
+                throw CannotRebindConstEx{c.get_loc()};
+            }
+        }
+
     } else {
 
         lside = pExpr12(c, fl & ~(pInDecl | pInConstDecl));
@@ -568,29 +582,34 @@ pBlock(ParseContext &c, unsigned fl)
     unique_ptr<Construct> stmt, tmp;
     bool added_elem;
 
-    if (c.eoi())
-        return ret;
+    EvalContext block_const_ctx(c.const_ctx, true);
+    c.const_ctx = &block_const_ctx;
 
-    do {
+    if (!c.eoi()) {
 
-        added_elem = false;
+        do {
 
-        if (pAcceptBracedBlock(c, tmp, fl)) {
-            ret->elems.emplace_back(move(tmp));
-            added_elem = true;
-        }
+            added_elem = false;
 
-        while ((stmt = pStmt(c, fl))) {
+            if (pAcceptBracedBlock(c, tmp, fl)) {
+                ret->elems.emplace_back(move(tmp));
+                added_elem = true;
+            }
 
-            ret->elems.emplace_back(move(stmt));
-            added_elem = true;
+            while ((stmt = pStmt(c, fl))) {
 
-            while (*c == Op::semicolon)
-                c++;    /* skip multiple ';' */
-        }
+                ret->elems.emplace_back(move(stmt));
+                added_elem = true;
 
-    } while (added_elem);
+                while (*c == Op::semicolon)
+                    c++;    /* skip multiple ';' */
+            }
 
+        } while (added_elem);
+
+    }
+
+    c.const_ctx = c.const_ctx->parent;
     return ret;
 }
 

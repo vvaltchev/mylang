@@ -46,7 +46,7 @@ public:
 
     TokenStream ts;
     const bool const_eval;
-    EvalContext *const const_ctx;
+    EvalContext *const_ctx;
 
     ParseContext(const TokenStream &ts, bool const_eval);
 
