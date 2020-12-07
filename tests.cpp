@@ -27,8 +27,18 @@ static const vector<test> tests =
     {
         "variable decl",
         {
-            "var a=1;",
+            "var a = 1;",
             "a += 1;",
+            "assert(a == 2);",
+        },
+    },
+
+    {
+        "const decl",
+        {
+            "const a = 1;",
+            "var b = a + 1;",
+            "assert(b == 2);",
         },
     },
 
@@ -40,6 +50,13 @@ static const vector<test> tests =
         &typeid(TypeErrorEx),
     }
 };
+
+static void
+dump_expected_ex(const type_info *ex, const type_info *got)
+{
+    cout << "  Expected EX: " << (ex ? ex->name() : "<none>") << endl;
+    cout << "  Got EX     : " << (got ? got->name() : "<none>") << endl;
+}
 
 static bool
 check(const test &t)
@@ -60,12 +77,8 @@ check(const test &t)
 
     } catch (const Exception &e) {
 
-        if (typeid(e) != *t.ex) {
-
-            cout << "TEST FAIL\n";
-            cout << "Expected exception: " << t.ex->name()
-                 << ", got: " << typeid(e).name() << endl;
-
+        if (!t.ex || &typeid(e) != t.ex) {
+            dump_expected_ex(t.ex, &typeid(e));
             return false;
         }
 
@@ -74,13 +87,12 @@ check(const test &t)
 
     if (t.ex) {
 
-        cout << "TEST FAIL\n";
-        cout << "Expected exception: " << t.ex->name() << ", got nothing" << endl;
+        dump_expected_ex(t.ex, nullptr);
 
         if (root) {
-            cout << "Syntax tree" << endl;
-            cout << "-------------------------------" << endl;
-            cout << *root << endl;
+            cout << "  Syntax tree:" << endl;
+            root->serialize(cout, 2);
+            cout << endl;
         }
 
         return false;
@@ -89,35 +101,50 @@ check(const test &t)
     return true;
 }
 
+static void
+dump_test_source(const test &t)
+{
+    cout << "  Source: ";
+
+    if (t.source.size() == 1) {
+
+        cout << t.source[0] << endl;
+
+    } else {
+
+        cout << endl;
+
+        for (const auto &e : t.source) {
+            cout << "    " << e << endl;
+        }
+    }
+}
+
 void run_tests()
 {
+    int pass_count = 0;
+
     for (const auto &test : tests) {
 
-        cout << "Test: '" << test.name << "'" << endl;
-        cout << "---------------------------------" << endl;
+        cout << "[ RUN  ] " << test.name << endl;
 
-        cout << "Source: ";
+        if (check(test)) {
 
-        if (test.source.size() == 1) {
-
-            cout << test.source[0] << endl;
+            cout << "[ PASS ]";
+            pass_count++;
 
         } else {
 
-            cout << endl;
-
-            for (const auto &e : test.source) {
-                cout << "   " << e << endl;
-            }
+            dump_test_source(test);
+            cout << "[ FAIL ]";
         }
 
-        if (test.ex)
-            cout << "Expected Ex: " << test.ex->name() << endl;
-
-        check(test);
-        cout << "---------------------------------" << endl;
-        cout << "TEST PASS\n\n";
+        cout << endl << endl;
     }
+
+    cout << "SUMMARY" << endl;
+    cout << "===========================================" << endl;
+    cout << "Tests passed: " << pass_count << "/" << tests.size() << endl;
 }
 
 #else
