@@ -30,8 +30,12 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 const string &
 find_builtin_name(const Builtin &b)
 {
-    for (const auto &[k, v]: EvalContext::builtins) {
+    for (const auto &[k, v]: EvalContext::const_builtins) {
+        if (v->eval().get<Builtin>().func == b.func)
+            return k;
+    }
 
+    for (const auto &[k, v]: EvalContext::builtins) {
         if (v->eval().get<Builtin>().func == b.func)
             return k;
     }

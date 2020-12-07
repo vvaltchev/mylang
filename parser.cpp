@@ -48,8 +48,8 @@ pAcceptBracedBlock(ParseContext &c,
                    unique_ptr<Construct> &ret,
                    unsigned fl);
 
-unique_ptr<Construct>
-MakeConstructFromConstVal(const EvalValue &v);
+bool
+MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out);
 
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
@@ -84,17 +84,28 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 
         if (c.const_eval && resolve_const) {
 
+            /*
+             * The const evaluation is enabled and we've been asked to resolve
+             * identifier, if possible. Steps:
+             *
+             *      1) Eval it in the const EvalContext
+             *
+             *      2) If we got an LValue, we've found a constant, which
+             *         can contain either a literal or point to a const builtin
+             *         function like len().
+             *
+             *      3) Call MakeConstructFromConstVal() to get a literal
+             *         construct for this ID's value and replace the current
+             *         identifier in `v`. If it fails, it just means that
+             *         it was a const builtin function: it will be const
+             *         evaluated later. For the moment, keep the ID, but mark
+             *         it as `const`.
+             */
             const EvalValue &const_value = v->eval(c.const_ctx);
 
             if (const_value.get_type()->t == Type::t_lval) {
-
-                const EvalValue &rval = RValue(const_value);
-
-                if (!rval.is<Builtin>()) {
-                    v = MakeConstructFromConstVal(rval);
-                } else {
-                    v->is_const = true;
-                }
+                MakeConstructFromConstVal(RValue(const_value), v);
+                v->is_const = true;
             }
         }
 
@@ -207,9 +218,18 @@ pAcceptCallExpr(ParseContext &c,
 
         if (c.const_eval && expr->id->is_const && expr->args->is_const) {
 
-            EvalValue e = expr->eval(c.const_ctx);
+            if (!MakeConstructFromConstVal(expr->eval(c.const_ctx), ret)) {
 
-            ret = MakeConstructFromConstVal(e);
+                /*
+                 * In general expressions, it's acceptable MakeConstructFromConstVal()
+                 * to fail, because the a constant ID might be a const builtin
+                 * and we CANNOT resolve them to literal constructs, BUT not in this
+                 * specific case. Here, we're in a full-formed call expression and
+                 * both the ID and the arguments are const. Here the evaluation
+                 * must return an EvalValue convertible to some kind of literal.
+                 */
+                throw InternalErrorEx();
+            }
 
         } else {
 
@@ -467,7 +487,7 @@ pExpr14(ParseContext &c, unsigned fl)
             /* Just return lside (doing const eval if possible) */
 
             if (c.const_eval && lside->is_const)
-                return MakeConstructFromConstVal(lside->eval(c.const_ctx));
+                MakeConstructFromConstVal(lside->eval(c.const_ctx), lside);
 
             return lside;
         }
@@ -486,8 +506,9 @@ pExpr14(ParseContext &c, unsigned fl)
         noExprError(c);
 
     if (c.const_eval && ret->rvalue->is_const) {
-        ret->rvalue = MakeConstructFromConstVal(
-            RValue(ret->rvalue->eval(c.const_ctx))
+        MakeConstructFromConstVal(
+            RValue(ret->rvalue->eval(c.const_ctx)),
+            ret->rvalue
         );
     }
 
@@ -524,9 +545,8 @@ pExprTop(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> e = pExpr15(c, fl);
 
-    if (c.const_eval && e && e->is_const && !e->is_nop) {
-        return MakeConstructFromConstVal(e->eval(c.const_ctx));
-    }
+    if (c.const_eval && e && e->is_const && !e->is_nop)
+        MakeConstructFromConstVal(e->eval(c.const_ctx), e);
 
     return e;
 }
@@ -713,15 +733,23 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     return false;
 }
 
-unique_ptr<Construct>
-MakeConstructFromConstVal(const EvalValue &v)
+bool
+MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out)
 {
-    if (v.is<long>())
-        return make_unique<LiteralInt>(v.get<long>());
-    else if (v.is<NoneVal>())
-        return make_unique<LiteralNone>();
-    else if (v.is<SharedStrWrapper>())
-        return make_unique<LiteralStr>(v);
+    if (v.is<long>()) {
+        out = make_unique<LiteralInt>(v.get<long>());
+        return true;
+    }
 
-    throw InternalErrorEx();
+    if (v.is<NoneVal>()) {
+        out = make_unique<LiteralNone>();
+        return true;
+    }
+
+    if (v.is<SharedStrWrapper>()) {
+        out = make_unique<LiteralStr>(v);
+        return true;
+    }
+
+    return false;
 }
