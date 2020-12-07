@@ -278,6 +278,12 @@ int main(int argc, char **argv)
         dumpLocInError(e.loc);
         return 1;
 
+    } catch (const AssertionFailureEx &e) {
+
+        cout << "AssertionFailureEx" << endl;
+        dumpLocInError(e.loc);
+        return 1;
+
     } catch (const NotLValueEx &e) {
 
         cout << "Expected lvalue";

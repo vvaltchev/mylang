@@ -27,6 +27,19 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
     return e.get_type()->len(e);
 }
 
+EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidArgumentEx();
+
+    const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
+
+    if (!e.get_type()->is_true(e))
+        throw AssertionFailureEx();
+
+    return EvalValue();
+}
+
 const string &
 find_builtin_name(const Builtin &b)
 {
@@ -61,6 +74,7 @@ const array<Type *, Type::t_count> AllTypes = {
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     make_pair("len", make_shared<LValue>(Builtin{builtin_len})),
+    make_pair("assert", make_shared<LValue>(Builtin{builtin_assert})),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
