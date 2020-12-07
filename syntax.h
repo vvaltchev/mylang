@@ -32,9 +32,10 @@ class Construct {
 public:
     const char *const name;
     bool is_const;
+    const bool is_nop;
 
-    Construct(const char *name, bool is_const = false)
-        : name(name), is_const(is_const) { }
+    Construct(const char *name, bool is_const = false, bool is_nop = false)
+        : name(name), is_const(is_const), is_nop(is_nop) { }
 
     virtual ~Construct() = default;
     virtual EvalValue eval(EvalContext *ctx, bool rec = true) const = 0;
@@ -129,6 +130,23 @@ public:
 
     virtual void serialize(ostream &s, int level = 0) const;
 };
+
+class NopConstruct : public Construct {
+
+public:
+
+    NopConstruct() : Construct("nop", true, true) { }
+
+    virtual EvalValue eval(EvalContext *ctx, bool rec = true) const {
+        return EvalValue();
+    }
+
+    virtual void serialize(ostream &s, int level = 0) const {
+        /* NopConstructs should never remain in the final syntax tree */
+        throw InternalErrorEx();
+    }
+};
+
 
 class LiteralStr : public Literal {
 

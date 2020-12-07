@@ -453,7 +453,8 @@ EvalValue WhileStmt::eval(EvalContext *ctx, bool rec) const
 
         try {
 
-            body->eval(ctx);
+            if (body)
+                body->eval(ctx);
 
         } catch (LoopBreakEx) {
 

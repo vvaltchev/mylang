@@ -280,8 +280,8 @@ pExprGeneric(ParseContext &c,
     unique_ptr<Construct> lowerE = lowerExpr(c, fl);
     bool is_const;
 
-    if (!lowerE)
-        return nullptr;
+    if (!lowerE || lowerE->is_nop)
+        return lowerE;
 
     is_const = lowerE->is_const;
 
@@ -505,7 +505,7 @@ pExpr14(ParseContext &c, unsigned fl)
          */
 
         ret->eval(c.const_ctx);
-        return move(ret->rvalue);
+        return make_unique<NopConstruct>();
     }
 
     return ret;
@@ -524,7 +524,7 @@ pExprTop(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> e = pExpr15(c, fl);
 
-    if (c.const_eval && e && e->is_const) {
+    if (c.const_eval && e && e->is_const && !e->is_nop) {
         return MakeConstructFromConstVal(e->eval(c.const_ctx));
     }
 
@@ -561,8 +561,8 @@ pStmt(ParseContext &c, unsigned fl)
 
         unique_ptr<Construct> lowerE = pExprTop(c, fl);
 
-        if (!lowerE)
-            return nullptr;
+        if (!lowerE || lowerE->is_nop)
+            return lowerE;
 
         unique_ptr<Stmt> ret(new Stmt);
         ret->elem = move(lowerE);
@@ -594,7 +594,9 @@ pBlock(ParseContext &c, unsigned fl)
 
             while ((stmt = pStmt(c, fl))) {
 
-                ret->elems.emplace_back(move(stmt));
+                if (!stmt->is_nop)
+                    ret->elems.emplace_back(move(stmt));
+
                 added_elem = true;
 
                 while (*c == Op::semicolon)
@@ -638,12 +640,23 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         pExpectOp(c, Op::parenR);
 
-        if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl))
-            ifstmt->thenBlock = pStmt(c, fl);
+        if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl)) {
+
+            unique_ptr<Construct> stmt = pStmt(c, fl);
+
+            if (stmt && !stmt->is_nop)
+                ifstmt->thenBlock = move(stmt);
+        }
 
         if (pAcceptKeyword(c, Keyword::kw_else)) {
-            if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl))
-                ifstmt->elseBlock = pStmt(c, fl);
+
+            if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl)) {
+
+                unique_ptr<Construct> stmt = pStmt(c, fl);
+
+                if (stmt && !stmt->is_nop)
+                    ifstmt->elseBlock = move(stmt);
+            }
         }
 
         if (c.const_eval && ifstmt->condExpr->is_const) {
