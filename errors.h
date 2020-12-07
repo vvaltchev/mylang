@@ -21,16 +21,61 @@ struct Loc {
 class Tok;
 class Construct;
 
-struct InternalErrorEx { };
-struct CannotRebindConstEx { const Loc loc; };
-struct ExpressionIsNotConstEx { const Loc loc; };
-struct InvalidTokenEx { string_view val; };
-struct DivisionByZeroEx { };
-struct TypeErrorEx { };
-struct UndefinedVariableEx { string_view name; };
-struct AlreadyDefinedEx { };
-struct NotLValueEx { unique_ptr<Construct> expr; };
-struct InvalidArgumentEx { };
+struct Exception { };
+
+struct InternalErrorEx : public Exception { };
+
+struct InvalidTokenEx : public Exception {
+    const string_view val;
+    InvalidTokenEx(const string_view &val) : val(val) { }
+};
+
+struct CannotRebindConstEx : public Exception {
+    const Loc loc;
+    CannotRebindConstEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct ExpressionIsNotConstEx : public Exception {
+    const Loc loc;
+    ExpressionIsNotConstEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct DivisionByZeroEx : public Exception {
+    const Loc loc;
+    DivisionByZeroEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct TypeErrorEx : public Exception {
+    const Loc loc;
+    TypeErrorEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct AlreadyDefinedEx : public Exception {
+    const Loc loc;
+    AlreadyDefinedEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct InvalidArgumentEx : public Exception {
+    const Loc loc;
+    InvalidArgumentEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct AssertionFailureEx : public Exception {
+    const Loc loc;
+    AssertionFailureEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct NotLValueEx : public Exception {
+    const Loc loc;
+    NotLValueEx(Loc loc = Loc()) : loc(loc) { }
+};
+
+struct UndefinedVariableEx : public Exception {
+    const string_view name;
+    const Loc loc;
+    UndefinedVariableEx(const string_view &name, Loc loc = Loc())
+        : name(name), loc(loc) { }
+};
 
 struct SyntaxErrorEx {
 

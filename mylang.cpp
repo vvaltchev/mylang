@@ -259,22 +259,25 @@ int main(int argc, char **argv)
     } catch (const DivisionByZeroEx &e) {
 
         cout << "DivisionByZeroEx" << endl;
+        dumpLocInError(e.loc);
         return 1;
 
     } catch (const TypeErrorEx &e) {
 
         cout << "TypeErrorEx" << endl;
+        dumpLocInError(e.loc);
         return 1;
 
     } catch (const NotLValueEx &e) {
 
-        cout << "Expected lvalue, got: ";
-        cout << *e.expr << endl;
+        cout << "Expected lvalue";
+        dumpLocInError(e.loc);
         return 1;
 
     } catch (const UndefinedVariableEx &e) {
 
         cout << "Undefined variable '" << e.name << "'" << endl;
+        dumpLocInError(e.loc);
         return 1;
     }
 

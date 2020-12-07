@@ -384,7 +384,7 @@ EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
         }
 
     } else {
-        throw NotLValueEx{move(lvalue)};
+        throw NotLValueEx();
     }
 
     return rval;
