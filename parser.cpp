@@ -400,7 +400,8 @@ pExpr14(ParseContext &c, unsigned fl)
 
     unique_ptr<Construct> lside;
     unique_ptr<Expr14> ret;
-    Op op = Op::invalid;
+    EvalValue lside_val;
+    Op op;
 
     if (fl & pFlags::pInDecl) {
 
@@ -418,18 +419,17 @@ pExpr14(ParseContext &c, unsigned fl)
             );
         }
 
+        /*
+         * lside is just an identifier, so it's fine to evaluate it even if
+         * we're not sure it's const: at most, it will evaluate to
+         * UndefinedId.
+         */
+
+        lside_val = lside->eval(c.const_ctx);
+
         if (fl & ~pFlags::pInConstDecl) {
-
-            /*
-             * We're *NOT* in const decl, now check that we're not reusing a const
-             * identifier.
-             */
-
-            const EvalValue &e = lside->eval(c.const_ctx);
-
-            if (!e.is<UndefinedId>()) {
+            if (!lside_val.is<UndefinedId>())
                 throw CannotRebindConstEx{c.get_loc()};
-            }
         }
 
     } else {
@@ -496,20 +496,16 @@ pExpr14(ParseContext &c, unsigned fl)
         if (!ret->rvalue->is_const)
             throw ExpressionIsNotConstEx{c.get_loc()};
 
-        try {
-
-            /*
-             * Save the const declaration by evaluating the assignment
-             * in our special `const_ctx` EvalContext. In case a const
-             * declaration related to the same symbol already exists,
-             * we'll get a CannotRebindConstEx exception.
-             */
-            ret->eval(c.const_ctx);
-            return move(ret->rvalue);
-
-        } catch (CannotRebindConstEx) {
+        if (!lside_val.is<UndefinedId>())
             throw CannotRebindConstEx{c.get_loc()};
-        }
+
+        /*
+         * Save the const declaration by evaluating the assignment
+         * in our special `const_ctx` EvalContext.
+         */
+
+        ret->eval(c.const_ctx);
+        return move(ret->rvalue);
     }
 
     return ret;

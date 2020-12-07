@@ -358,7 +358,7 @@ EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
     } else if (lval.is<LValue *>()) {
 
         if (ctx->const_ctx)
-            throw CannotRebindConstEx{Loc()};
+            throw InternalErrorEx();
 
         if (inDecl) {
 
