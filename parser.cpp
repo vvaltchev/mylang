@@ -55,10 +55,13 @@ bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::num) {
-        v.reset(new LiteralInt{ stol(string(c.get_str())) });
+
+        const string s(c.get_str());
+
+        v.reset(new LiteralInt{ stol(s) });
         v->start = c.get_loc();
+        v->end = c.get_loc() + (s.length() + 1);
         c++;
-        v->end = c.get_loc();
         return true;
     }
 
@@ -71,8 +74,8 @@ pAcceptLiteralStr(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::str) {
         v.reset(new LiteralStr(c.get_str()));
         v->start = c.get_loc();
+        v->end = c.get_loc() + (c.get_str().length() + 1);
         c++;
-        v->end = c.get_loc();
         return true;
     }
 
@@ -114,8 +117,8 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
         }
 
         v->start = c.get_loc();
+        v->end = c.get_loc() + (c.get_str().length() + 1);
         c++;
-        v->end = c.get_loc();
         return true;
     }
 
@@ -199,7 +202,7 @@ pExprList(ParseContext &c, unsigned fl)
         }
     }
 
-    ret->end = c.get_loc();
+    ret->end = c.get_loc() + 1;
     ret->is_const = is_const;
     return ret;
 }

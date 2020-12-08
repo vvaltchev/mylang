@@ -161,7 +161,6 @@ dumpLocInError(const Exception &e)
         if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
             cout << ":" << e.loc_end.col - 1;
 
-
         cout << endl << endl;
         cout << "    " << lines[e.loc_start.line - 1] << endl;
         cout << "    " << string(e.loc_start.col - 1, ' ');
@@ -261,7 +260,8 @@ int main(int argc, char **argv)
 
     } catch (const UndefinedVariableEx &e) {
 
-        cout << "Undefined variable '" << e.name << "'" << endl;
+        cout << "Undefined variable '" << e.name << "'";
+        dumpLocInError(e);
         return 1;
 
     } catch (const Exception &e) {

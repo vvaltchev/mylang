@@ -21,7 +21,7 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
-        throw InvalidArgumentEx(exprList->start, exprList->end);
+        throw TooManyArgsEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
     return e.get_type()->len(e);
@@ -30,7 +30,7 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
-        throw InvalidArgumentEx(exprList->start, exprList->end);
+        throw TooManyArgsEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
 
@@ -144,15 +144,32 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
-    const EvalValue &callable = RValue(id->eval(ctx));
+    const EvalValue &id_val = id->eval(ctx);
 
-    if (callable.is<UndefinedId>())
-        throw UndefinedVariableEx{id->value};
+    if (id_val.is<UndefinedId>())
+        throw UndefinedVariableEx(id->value, id->start, id->end);
 
-    if (callable.is<Builtin>())
-        return callable.get<Builtin>().func(ctx, args.get());
+    if (id_val.is<LValue *>()) {
 
-    throw TypeErrorEx(start, end);
+        const EvalValue &callable = id_val.get<LValue *>()->eval();
+
+        if (callable.is<UndefinedId>())
+            throw UndefinedVariableEx(id->value, id->start, id->end);
+
+        try {
+
+            if (callable.is<Builtin>())
+                return callable.get<Builtin>().func(ctx, args.get());
+
+        } catch (Exception &e) {
+
+            e.loc_start = args->start;
+            e.loc_end = args->end;
+            throw;
+        }
+    }
+
+    throw NotCallableEx(id->start, id->end);
 }
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const

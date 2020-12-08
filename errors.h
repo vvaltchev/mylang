@@ -20,6 +20,22 @@ struct Loc {
     operator bool() const {
         return col != 0;
     }
+
+    Loc operator+(size_t n) const {
+
+        if (!col)
+            return Loc();
+
+        return Loc(line, col + n);
+    }
+
+    Loc operator+(int n) const {
+
+        if (!col)
+            return Loc();
+
+        return Loc(line, col + n);
+    }
 };
 
 class Tok;
@@ -41,12 +57,12 @@ struct Exception {
 };
 
 
-#define DECL_SIMPLE_EX(name)                       \
+#define DECL_SIMPLE_EX(name, human_name)           \
                                                    \
     struct name : public Exception {               \
                                                    \
         name(Loc start = Loc(), Loc end = Loc())   \
-            : Exception(#name, start, end)         \
+            : Exception(human_name, start, end)    \
         { }                                        \
     };
 
@@ -60,22 +76,25 @@ struct InvalidTokenEx : public Exception {
     { }
 };
 
-DECL_SIMPLE_EX(InternalErrorEx)
-DECL_SIMPLE_EX(CannotRebindConstEx)
-DECL_SIMPLE_EX(ExpressionIsNotConstEx)
-DECL_SIMPLE_EX(DivisionByZeroEx)
-DECL_SIMPLE_EX(TypeErrorEx)
-DECL_SIMPLE_EX(AlreadyDefinedEx)
-DECL_SIMPLE_EX(InvalidArgumentEx)
-DECL_SIMPLE_EX(AssertionFailureEx)
-DECL_SIMPLE_EX(NotLValueEx)
+DECL_SIMPLE_EX(InternalErrorEx, "Internal error")
+DECL_SIMPLE_EX(CannotRebindConstEx, "Cannot rebind const")
+DECL_SIMPLE_EX(ExpressionIsNotConstEx, "The expression is not const")
+DECL_SIMPLE_EX(DivisionByZeroEx, "Division by zero")
+DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
+DECL_SIMPLE_EX(AssertionFailureEx, "Assertion failure")
+DECL_SIMPLE_EX(NotLValueEx, "Not an lvalue error")
+DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
+DECL_SIMPLE_EX(TooManyArgsEx, "Too many arguments error")
+DECL_SIMPLE_EX(TooFewArgsEx, "Too few arguments error")
+DECL_SIMPLE_EX(TypeErrorEx, "Type error")
+DECL_SIMPLE_EX(NotCallableEx, "Not a callable object")
 
 struct UndefinedVariableEx : public Exception {
 
     const string_view name;
 
     UndefinedVariableEx(const string_view &name, Loc start = Loc(), Loc end = Loc())
-        : Exception("UndefinedVariableEx")
+        : Exception("UndefinedVariableEx", start, end)
         , name(name)
     { }
 };
