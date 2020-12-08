@@ -139,7 +139,7 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 {
     while (ctx) {
 
-        auto it = ctx->symbols.find(value);
+        const auto &&it = ctx->symbols.find(value);
 
         if (it != ctx->symbols.end())
             return EvalValue(it->second.get());
@@ -203,7 +203,7 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
     if (op == Op::invalid)
         return e->eval(ctx);
 
-    EvalValue val = RValue(e->eval(ctx));
+    EvalValue &&val = RValue(e->eval(ctx));
 
     switch (op) {
         case Op::plus:
@@ -226,9 +226,9 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx);
 
-    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
         const auto &[op, e] = *it;
 
@@ -252,9 +252,9 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx);
 
-    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
         const auto &[op, e] = *it;
 
@@ -275,9 +275,9 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx);
 
-    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
         const auto &[op, e] = *it;
 
@@ -304,9 +304,9 @@ EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx);
 
-    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
         const auto &[op, e] = *it;
 
@@ -327,9 +327,9 @@ EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx);
 
-    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
         const auto &[op, e] = *it;
 
@@ -347,9 +347,9 @@ EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx);
 
-    for (auto it = elems.begin() + 1; it != elems.end(); it++) {
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
         const auto &[op, e] = *it;
 
@@ -456,7 +456,7 @@ EvalValue Expr15::do_eval(EvalContext *ctx, bool rec) const
     assert(elems.size() > 0);
     val = elems[0].second->eval(ctx);
 
-    for (auto it = elems.begin()+1; it != elems.end(); it++) {
+    for (auto &&it = elems.begin()+1; it != elems.end(); it++) {
 
         const auto &[op, e] = *it;
 
