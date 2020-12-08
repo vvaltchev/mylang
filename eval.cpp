@@ -27,6 +27,16 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
     return e.get_type()->len(e);
 }
 
+EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw TooManyArgsEx(exprList->start, exprList->end);
+
+    const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
+    string &&s = e.get_type()->to_string(e);
+    return SharedStrWrapper(make_shared<string>(s));
+}
+
 EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
@@ -74,6 +84,7 @@ const array<Type *, Type::t_count> AllTypes = {
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     make_pair("len", make_shared<LValue>(Builtin{builtin_len})),
+    make_pair("str", make_shared<LValue>(Builtin{builtin_str})),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

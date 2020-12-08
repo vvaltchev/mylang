@@ -160,12 +160,155 @@ static const vector<test> tests =
     },
 
     {
-        "len() with wrong type",
+        "scope of variables",
+        {
+            "var a = 1;",
+            "assert(a == 1);",
+            "{",
+            "   assert(a == 1);",
+            "   var a = 2;",        // shadowing
+            "   assert(a == 2);",
+            "}",
+            "assert(a == 1);",
+        },
+    },
+
+    {
+        "const shadowing a variable",
+        {
+            "var a = 1;",
+            "assert(a == 1);",
+            "{",
+            "   const a = 2;",
+            "   assert(a == 2);",
+            "}",
+            "assert(a == 1);",
+        },
+    },
+
+    {
+        "variable re-decl in the same scope fails",
+        {
+            "var a = 1; var a = 2;",
+        },
+        &typeid(AlreadyDefinedEx),
+    },
+
+    {
+        "const re-decl in the same scope fails",
+        {
+            "const a = 1; const a = 2;",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "const re-decl in nested scope fails",
+        {
+            "const a = 1; { const a = 2; }",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "variable shadowing a const fails",
+        {
+            "const a = 1;",
+            "assert(a == 1);",
+            "{",
+            "   var a = 2;",
+            "   assert(a == 2);",
+            "}",
+            "assert(a == 1);",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "len() works with literal",
+        {
+            "assert(len(\"hello\") == 5);"
+        },
+    },
+
+    {
+        "len() works with const",
+        {
+            "const a = \"hello\";",
+            "assert(len(a) == 5);"
+        },
+    },
+
+    {
+        "len() works with variable",
+        {
+            "var a = \"hello\";",
+            "assert(len(a) == 5);"
+        },
+    },
+
+    {
+        "len() with wrong type fails",
         {
             "len(3);",
         },
         &typeid(TypeErrorEx),
-    }
+    },
+
+    {
+        "literal str concat",
+        {
+            "assert(\"hello\" + \" world\" == \"hello world\");"
+        },
+    },
+
+    {
+        "var str concat",
+        {
+            "var a = \"hello\";",
+            "assert(a + \" world\" == \"hello world\");"
+        },
+    },
+
+    {
+        "var str += concat",
+        {
+            "var a = \"hello\";",
+            "a += \" world\";",
+            "assert(a == \"hello world\");"
+        },
+    },
+
+    {
+        "var str concat with integer",
+        {
+            "var a = \"hello\";",
+            "assert(a + 2 == \"hello2\");"
+        },
+    },
+
+    {
+        "str() builtin",
+        {
+            "var a = str(3);",
+            "assert(a == \"3\");",
+        },
+    },
+
+    {
+        "string repeat",
+        {
+            "assert(\"a\" * 3 == \"aaa\");",
+        },
+    },
+
+    {
+        "invalid string operators",
+        {
+            "\"a\" - 3;",
+        },
+        &typeid(TypeErrorEx),
+    },
 };
 
 static void
