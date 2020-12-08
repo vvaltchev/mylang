@@ -28,8 +28,7 @@ static const vector<test> tests =
         "variable decl",
         {
             "var a = 1;",
-            "a += 1;",
-            "assert(a == 2);",
+            "assert(a == 1);",
         },
     },
 
@@ -37,8 +36,126 @@ static const vector<test> tests =
         "const decl",
         {
             "const a = 1;",
-            "var b = a + 1;",
-            "assert(b == 2);",
+            "assert(a == 1);",
+        },
+    },
+
+    {
+        "expr with priority",
+        {
+            "var a = 2 * -3 + 1 < 0 && 2 >= 1;"
+            "var b = (((2 * -3) + 1) < 0) && (2 >= 1);"
+            "assert(a == 1);"
+            "assert(a == b);"
+        },
+    },
+
+    {
+        "if stmt",
+        {
+            "var a = 1;",
+            "if (a >= 1) {",
+            "   assert(1);",
+            "} else {",
+            "   assert(0);",
+            "}",
+        },
+    },
+
+    {
+        "if stmt with single stmts",
+        {
+            "var a = 1;",
+            "if (a >= 1)",
+            "   assert(1);",
+            "else",
+            "   assert(0);",
+        },
+    },
+
+    {
+        "if stmt with empty stmts",
+        {
+            "var a = 1;",
+            "if (a) {",
+            "} else {",
+            "}",
+        },
+    },
+
+    {
+        "if stmt with empty stmts 2",
+        {
+            "var a = 1;",
+            "if (a)",
+            "else {",
+            "}",
+        },
+    },
+
+    {
+        "if stmt with empty stmts 3",
+        {
+            "var a = 1;",
+            "if (a)",
+            "else",
+            "",
+        },
+    },
+
+    {
+        "if stmt with no stmts",
+        {
+            "var a = 1;",
+            "if (a);",
+        },
+    },
+
+    {
+        "assign as expr",
+        {
+            "var a = 1;",
+            "assert((a = 3) == 3);",
+            "assert(a == 3);",
+        },
+    },
+
+    {
+        "plus-assign as expr",
+        {
+            "var a = 1;",
+            "assert((a += 3) == 4);",
+            "assert(a == 4);",
+        },
+    },
+
+    {
+        "while stmt",
+        {
+            "var i = 0;",
+            "while (i < 10) {",
+            "   i += 1;",
+            "}",
+            "assert(i == 10);",
+        },
+    },
+
+    {
+        "while stmt, no brackets",
+        {
+            "var i = 0;",
+            "while (i < 10)",
+            "   i += 1;",
+            "assert(i == 10);",
+        },
+    },
+
+    {
+        "while stmt, no body",
+        {
+            "var i = 0;",
+            "while ((i += 1) < 10);",
+            "assert(i == 10);",
         },
     },
 

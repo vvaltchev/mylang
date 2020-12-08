@@ -74,12 +74,12 @@ const array<Type *, Type::t_count> AllTypes = {
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     make_pair("len", make_shared<LValue>(Builtin{builtin_len})),
-    make_pair("assert", make_shared<LValue>(Builtin{builtin_assert})),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
 {
     make_pair("print", make_shared<LValue>(Builtin{builtin_print})),
+    make_pair("assert", make_shared<LValue>(Builtin{builtin_assert})),
 };
 
 EvalContext::EvalContext(EvalContext *parent, bool const_ctx)
@@ -176,10 +176,10 @@ EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 {
     assert(elems.size() >= 1 && elems[0].first == Op::invalid);
 
-    EvalValue val = elems[0].second->eval(ctx);
+    const EvalValue &val = elems[0].second->eval(ctx);
 
     if (elems.size() > 1)
-        val = RValue(val);
+        return RValue(val);
 
     return val;
 }
@@ -354,7 +354,7 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-static void
+static EvalValue
 doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
 {
     EvalValue newVal;
@@ -389,6 +389,7 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
     }
 
     lval.get<LValue *>()->put(newVal);
+    return newVal;
 }
 
 EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
@@ -428,7 +429,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
             );
 
         } else {
-            doAssign(lval, rval, op);
+            return doAssign(lval, rval, op);
         }
 
     } else {

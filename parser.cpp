@@ -705,8 +705,8 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         }
     }
 
-    ret->start = start;
-    ret->end = c.get_loc();
+    ifstmt->start = start;
+    ifstmt->end = c.get_loc();
 
     if (c.const_eval && ifstmt->condExpr->is_const) {
 
@@ -745,8 +745,8 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     if (!pAcceptBracedBlock(c, whileStmt->body, pFlags::pInLoop))
         whileStmt->body = pStmt(c, pFlags::pInLoop);
 
-    ret->start = start;
-    ret->end = c.get_loc();
+    whileStmt->start = start;
+    whileStmt->end = c.get_loc();
 
     if (c.const_eval && whileStmt->condExpr->is_const) {
 
