@@ -25,6 +25,7 @@ enum pFlags : unsigned {
     pInDecl         = 1 << 1,
     pInConstDecl    = 1 << 2,
     pInLoop         = 1 << 3,
+    pInStmt         = 1 << 4,
 };
 
 class Construct {
@@ -90,14 +91,33 @@ public:
     EvalValue eval_first_rvalue(EvalContext *ctx) const;
 };
 
+template <class ElemT = Construct>
 class MultiElemConstruct : public Construct {
 
 public:
-    vector<unique_ptr<Construct>> elems;
+    typedef ElemT ElemType;
+    vector<unique_ptr<ElemType>> elems;
 
     MultiElemConstruct(const char *name) : Construct(name) { }
     virtual void serialize(ostream &s, int level = 0) const;
 };
+
+template <class T>
+void MultiElemConstruct<T>::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    for (const auto &e: elems) {
+        e->serialize(s, level + 1);
+        s << endl;
+    }
+
+    s << indent;
+    s << ")";
+}
 
 inline ostream &operator<<(ostream &s, const Construct &c)
 {
@@ -187,11 +207,22 @@ public:
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };
 
-class ExprList : public MultiElemConstruct {
+class ExprList : public MultiElemConstruct<> {
 
 public:
 
-    ExprList() : MultiElemConstruct("ExprList") { }
+    ExprList() : MultiElemConstruct<>("ExprList") { }
+
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
+        return EvalValue();
+    }
+};
+
+class IdList : public MultiElemConstruct<Identifier> {
+
+public:
+
+    IdList() : MultiElemConstruct<Identifier>("IdList") { }
 
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
         return EvalValue();
@@ -277,10 +308,10 @@ class Expr14 : public Construct {
 public:
     unique_ptr<Construct> lvalue;
     unique_ptr<Construct> rvalue;
-    Op op;
     unsigned fl;
+    Op op;
 
-    Expr14() : Construct("Expr14"), op(Op::invalid), fl(pNone) { }
+    Expr14() : Construct("Expr14"), fl(pNone), op(Op::invalid) { }
     virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };
@@ -311,7 +342,7 @@ public:
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };
 
-class Block : public MultiElemConstruct {
+class Block : public MultiElemConstruct<> {
 
 public:
     Block() : MultiElemConstruct("Block") { }
@@ -339,6 +370,19 @@ public:
     unique_ptr<Construct> body;
 
     WhileStmt() : Construct("WhileStmt") { }
+    virtual void serialize(ostream &s, int level = 0) const;
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+};
+
+class FuncDeclStmt : public Construct {
+
+public:
+    unique_ptr<Identifier> id;  /* NULL when the func is defined inside an expr */
+    unique_ptr<IdList> captures;
+    unique_ptr<IdList> args;
+    unique_ptr<Construct> body;
+
+    FuncDeclStmt() : Construct("FuncDeclStmt") { }
     virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };

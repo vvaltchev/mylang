@@ -162,22 +162,6 @@ MultiOpConstruct::serialize(ostream &s, int level) const
     s << ")";
 }
 
-void MultiElemConstruct::serialize(ostream &s, int level) const
-{
-    string indent(level * 2, ' ');
-
-    s << indent;
-    s << name << "(\n";
-
-    for (const auto &e: elems) {
-        e->serialize(s, level + 1);
-        s << endl;
-    }
-
-    s << indent;
-    s << ")";
-}
-
 void LiteralInt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
@@ -321,6 +305,45 @@ void WhileStmt::serialize(ostream &s, int level) const
     }
 
     s << endl;
+    s << indent;
+    s << ")";
+}
+
+void FuncDeclStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    if (id) {
+
+        id->serialize(s, level + 1);
+        cout << endl;
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoName>" << endl;
+    }
+
+    if (captures) {
+
+        captures->serialize(s, level + 1);
+        cout << endl;
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoCaptures>" << endl;
+    }
+
+    args->serialize(s, level + 1);
+    cout << endl;
+
+    body->serialize(s, level + 1);
+    s << endl;
+
     s << indent;
     s << ")";
 }

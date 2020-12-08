@@ -49,6 +49,11 @@ pAcceptBracedBlock(ParseContext &c,
                    unsigned fl);
 
 bool
+pAcceptFuncDecl(ParseContext &c,
+                unique_ptr<Construct> &ret,
+                unsigned fl);
+
+bool
 MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out);
 
 bool
@@ -174,15 +179,29 @@ noExprError(ParseContext &c)
     );
 }
 
-unique_ptr<ExprList>
-pExprList(ParseContext &c, unsigned fl)
+unique_ptr<Identifier>
+pIdentifier(ParseContext &c, unsigned fl)
 {
-    unique_ptr<ExprList> ret(new ExprList);
-    unique_ptr<Construct> subexpr;
+    unique_ptr<Construct> ret;
+
+    if (!pAcceptId(c, ret))
+        return nullptr;
+
+    return unique_ptr<Identifier>(static_cast<Identifier *>(ret.release()));
+}
+
+template <class T>
+unique_ptr<T>
+pList(ParseContext &c,
+      unsigned fl,
+      unique_ptr<typename T::ElemType> (*lowerE)(ParseContext&, unsigned))
+{
+    unique_ptr<T> ret(new T);
+    unique_ptr<typename T::ElemType> subexpr;
     bool is_const = true;
 
     ret->start = c.get_loc();
-    subexpr = pExpr14(c, fl);
+    subexpr = lowerE(c, fl);
 
     if (subexpr) {
 
@@ -192,7 +211,7 @@ pExprList(ParseContext &c, unsigned fl)
         while (*c == Op::comma) {
 
             c++;
-            subexpr = pExpr14(c, fl);
+            subexpr = lowerE(c, fl);
 
             if (!subexpr)
                 noExprError(c);
@@ -219,7 +238,7 @@ pAcceptCallExpr(ParseContext &c,
 
         expr->start = id->start;
         expr->id.reset(static_cast<Identifier *>(id.release()));
-        expr->args = pExprList(c, fl);
+        expr->args = pList<ExprList>(c, fl, pExpr14);
 
         if (c.const_eval && expr->id->is_const && expr->args->is_const) {
 
@@ -477,7 +496,10 @@ pExpr14(ParseContext &c, unsigned fl)
 
     } else {
 
-        lside = pExpr12(c, fl & ~(pInDecl | pInConstDecl));
+        if (pAcceptFuncDecl(c, lside, fl))
+            return lside;
+
+        lside = pExpr12(c, fl);
     }
 
     if (!lside)
@@ -540,10 +562,10 @@ pExpr14(ParseContext &c, unsigned fl)
     if (c.const_eval && fl & pFlags::pInConstDecl) {
 
         if (!ret->rvalue->is_const)
-            throw ExpressionIsNotConstEx{c.get_loc()};
+            throw ExpressionIsNotConstEx(ret->rvalue->start, ret->rvalue->end);
 
         if (!lside_val.is<UndefinedId>())
-            throw CannotRebindConstEx{c.get_loc()};
+            throw CannotRebindConstEx(lside->start, lside->end);
 
         /*
          * Save the const declaration by evaluating the assignment
@@ -594,7 +616,11 @@ pStmt(ParseContext &c, unsigned fl)
 
         return subStmt;
 
-    } if (pAcceptWhileStmt(c, subStmt, fl)) {
+    } else if (pAcceptWhileStmt(c, subStmt, fl)) {
+
+        return subStmt;
+
+    } else if (pAcceptFuncDecl(c, subStmt, fl | pFlags::pInStmt)) {
 
         return subStmt;
 
@@ -766,6 +792,47 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     }
 
     ret = move(whileStmt);
+    return true;
+}
+
+bool
+pAcceptFuncDecl(ParseContext &c,
+                unique_ptr<Construct> &ret,
+                unsigned fl)
+{
+    const Loc start = c.get_loc();
+
+    if (!pAcceptKeyword(c, Keyword::kw_func))
+        return false;
+
+    unique_ptr<FuncDeclStmt> func(new FuncDeclStmt);
+    func->start = start;
+
+    if (fl & pFlags::pInStmt) {
+
+        fl &= ~pFlags::pInStmt;
+        func->id = pIdentifier(c, fl);
+
+        if (!func->id)
+            throw SyntaxErrorEx(c.get_loc(), "Expected identifier, got", &c.get_tok());
+
+    } else {
+
+        if (pAcceptOp(c, Op::bracketL)) {
+            func->captures = pList<IdList>(c, fl, pIdentifier);
+            pExpectOp(c, Op::bracketR);
+        }
+    }
+
+    pExpectOp(c, Op::parenL);
+    func->args = pList<IdList>(c, fl, pIdentifier);
+    pExpectOp(c, Op::parenR);
+
+    if (!pAcceptBracedBlock(c, func->body, fl))
+        throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
+
+    func->end = c.get_loc() + 1;
+    ret = move(func);
     return true;
 }
 

@@ -556,3 +556,8 @@ EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 
     return EvalValue();
 }
+
+EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    return 1234;
+}

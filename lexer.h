@@ -58,6 +58,8 @@ static const array<string, (int)Op::op_count> OpString =
     "*=",
     "/=",
     "%=",
+    "[",
+    "]",
 };
 
 enum class Keyword : int {
@@ -73,8 +75,9 @@ enum class Keyword : int {
     kw_const    = 7,
     kw_var      = 8,
     kw_none     = 9,
+    kw_func     = 10,
 
-    kw_count    = 10,
+    kw_count    = 11,
 };
 
 static const array<string, (int)Keyword::kw_count> KwString =
@@ -90,6 +93,7 @@ static const array<string, (int)Keyword::kw_count> KwString =
     "const",
     "var",
     "none",
+    "func",
 };
 
 ostream &operator<<(ostream &s, TokType t);
