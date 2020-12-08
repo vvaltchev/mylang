@@ -160,6 +160,34 @@ static const vector<test> tests =
     },
 
     {
+        "break in while stmt",
+        {
+            "var i = 0;",
+            "while (i < 10) {",
+            "   if (i == 5) break;",
+            "   i += 1;",
+            "}",
+            "assert(i == 5);",
+        },
+    },
+
+    {
+        "continue in while stmt",
+        {
+            "var i = 0;",
+            "while (i < 10) {",
+            "   if (i == 5) {",
+            "       i += 1;",
+            "       continue;",
+            "       assert(0);",
+            "   }",
+            "   i += 1;",
+            "}",
+            "assert(i == 10);",
+        },
+    },
+
+    {
         "scope of variables",
         {
             "var a = 1;",
@@ -406,6 +434,22 @@ static const vector<test> tests =
             "{ const len = 5; assert(len == 5); }",
         },
         &typeid(CannotRebindBuiltinEx),
+    },
+
+    {
+        "undefined variable",
+        {
+            "assert(a == 1);",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "undefined as ID in CallExpr",
+        {
+            "a(1);",
+        },
+        &typeid(UndefinedVariableEx),
     },
 };
 
