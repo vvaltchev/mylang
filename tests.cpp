@@ -367,6 +367,46 @@ static const vector<test> tests =
             "assert(!(none != none));",
         },
     },
+
+    {
+        "assign builtins to vars",
+        {
+            "var a = len;\n",
+            "assert(a(\"hello\") == 5);",
+        },
+    },
+
+    {
+        "assign builtins to consts",
+        {
+            "const a = len;\n",
+            "assert(a(\"hello\") == 5);",
+        },
+    },
+
+    {
+        "rebind builtins is not allowed",
+        {
+            "len = 5;",
+        },
+        &typeid(CannotRebindBuiltinEx),
+    },
+
+    {
+        "vars shadowing builtins are not allowed",
+        {
+            "{ var len = 5; assert(len == 5); }",
+        },
+        &typeid(CannotRebindBuiltinEx),
+    },
+
+    {
+        "consts shadowing builtins are not allowed",
+        {
+            "{ const len = 5; assert(len == 5); }",
+        },
+        &typeid(CannotRebindBuiltinEx),
+    },
 };
 
 static void
@@ -440,7 +480,7 @@ dump_test_source(const test &t)
 
 void run_tests()
 {
-    int pass_count = 0;
+    size_t pass_count = 0;
 
     for (const auto &test : tests) {
 
@@ -463,6 +503,12 @@ void run_tests()
     cout << "SUMMARY" << endl;
     cout << "===========================================" << endl;
     cout << "Tests passed: " << pass_count << "/" << tests.size() << endl;
+
+
+    if (pass_count != tests.size())
+        exit(1);
+
+    exit(0);
 }
 
 #else

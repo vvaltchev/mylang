@@ -464,8 +464,15 @@ pExpr14(ParseContext &c, unsigned fl)
         lside_val = lside->eval(c.const_ctx);
 
         if (fl & ~pFlags::pInConstDecl) {
-            if (!lside_val.is<UndefinedId>())
-                throw CannotRebindConstEx{c.get_loc()};
+            if (!lside_val.is<UndefinedId>()) {
+
+                if (lside_val.is<LValue *>()) {
+                    if (lside_val.get<LValue *>()->eval().is<Builtin>())
+                        throw CannotRebindBuiltinEx(c.get_loc());
+                }
+
+                throw CannotRebindConstEx(c.get_loc());
+            }
         }
 
     } else {

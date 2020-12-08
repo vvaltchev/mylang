@@ -370,6 +370,9 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
 {
     EvalValue newVal;
 
+    if (lval.get<LValue *>()->eval().is<Builtin>())
+        throw CannotRebindBuiltinEx();
+
     if (op == Op::assign) {
 
         newVal = RValue(rval);

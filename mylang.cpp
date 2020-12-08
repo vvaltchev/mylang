@@ -169,9 +169,9 @@ dumpLocInError(const Exception &e)
             cout << string(e.loc_end.col - e.loc_start.col - 1, '^');
         else
             cout << "^";
-
-        cout << endl;
     }
+
+    cout << endl;
 }
 
 static void

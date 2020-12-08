@@ -78,6 +78,7 @@ struct InvalidTokenEx : public Exception {
 
 DECL_SIMPLE_EX(InternalErrorEx, "Internal error")
 DECL_SIMPLE_EX(CannotRebindConstEx, "Cannot rebind const")
+DECL_SIMPLE_EX(CannotRebindBuiltinEx, "Cannot rebind builtin")
 DECL_SIMPLE_EX(ExpressionIsNotConstEx, "The expression is not const")
 DECL_SIMPLE_EX(DivisionByZeroEx, "Division by zero")
 DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
