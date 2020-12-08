@@ -20,11 +20,26 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 
 EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 {
-    if (exprList->elems.size() != 1)
+    if (exprList->elems.size() == 0)
+        throw TooFewArgsEx(exprList->start, exprList->end);
+
+    if (exprList->elems.size() > 1)
         throw TooManyArgsEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
     return e.get_type()->len(e);
+}
+
+EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() == 0)
+        throw TooFewArgsEx(exprList->start, exprList->end);
+
+    if (exprList->elems.size() > 1)
+        throw TooManyArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    return !arg->eval(ctx).is<UndefinedId>();
 }
 
 EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
@@ -85,6 +100,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     make_pair("len", make_shared<LValue>(Builtin{builtin_len})),
     make_pair("str", make_shared<LValue>(Builtin{builtin_str})),
+    make_pair("defined", make_shared<LValue>(Builtin{builtin_defined})),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

@@ -451,6 +451,24 @@ static const vector<test> tests =
         },
         &typeid(UndefinedVariableEx),
     },
+
+    {
+        "defined() builtin",
+        {
+            "assert(defined(a) == 0);",
+            "assert(defined(len) == 1);",
+            "assert(defined(\"blah\") == 1);",
+            "assert(defined(defined) == 1);",
+            "assert(defined(none) == 1);",
+            "",
+            "var a;",
+            "assert(defined(a) == 1);",
+            "var b = 0;",
+            "assert(defined(b) == 1);",
+            "const c1 = \"val\";",
+            "assert(defined(c1) == 1);",
+        },
+    },
 };
 
 static void
