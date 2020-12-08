@@ -21,6 +21,9 @@ static bool opt_show_syntax_tree;
 static bool opt_no_const_eval;
 static bool opt_no_run;
 
+static vector<string> lines;
+static vector<Tok> tokens;
+
 void run_tests();
 
 void help()
@@ -39,7 +42,7 @@ void help()
 }
 
 void
-read_script(const char *filename, vector<string>& lines, vector<Tok> &tokens)
+read_script(const char *filename)
 {
     {
         string line;
@@ -69,10 +72,7 @@ read_script(const char *filename, vector<string>& lines, vector<Tok> &tokens)
 }
 
 void
-parse_args(int argc,
-           char **argv,
-           vector<string> &lines,
-           vector<Tok> &tokens)
+parse_args(int argc, char **argv)
 {
     string inline_text;
     bool in_tokens = false;
@@ -133,7 +133,7 @@ parse_args(int argc,
 
         } else {
 
-            read_script(arg, lines, tokens);
+            read_script(arg);
         }
     }
 
@@ -143,23 +143,35 @@ parse_args(int argc,
             tokens.emplace_back();
         } else {
             lines.emplace_back(move(inline_text));
-            lexer(lines[0], 0, tokens);
+            lexer(lines[0], 1, tokens);
         }
     }
 }
 
 static void
-dumpLocInError(Loc loc)
+dumpLocInError(const Exception &e)
 {
-    if (loc.line) {
+    if (e.loc_start.col) {
 
         cout << " at line "
-             << loc.line << ", col " << loc.col;
+             << e.loc_start.line
+             << ", col "
+             << e.loc_start.col;
 
-    } else if (loc.col) {
+        if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
+            cout << ":" << e.loc_end.col - 1;
 
-        cout << " at col " << loc.col;
 
+        cout << endl << endl;
+        cout << "    " << lines[e.loc_start.line - 1] << endl;
+        cout << "    " << string(e.loc_start.col - 1, ' ');
+
+        if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
+            cout << string(e.loc_end.col - e.loc_start.col - 1, '^');
+        else
+            cout << "^";
+
+        cout << endl;
     }
 }
 
@@ -167,9 +179,7 @@ static void
 handleSyntaxError(const SyntaxErrorEx &e)
 {
     cout << "SyntaxError";
-
-    dumpLocInError(e.loc);
-    cout << ": ";
+    dumpLocInError(e);
     cout << e.msg;
 
     if (e.op != Op::invalid) {
@@ -200,12 +210,9 @@ handleSyntaxError(const SyntaxErrorEx &e)
 
 int main(int argc, char **argv)
 {
-    vector<string> lines;
-    vector<Tok> tokens;
-
     try {
 
-        parse_args(argc, argv, lines, tokens);
+        parse_args(argc, argv);
 
         ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
 
@@ -260,8 +267,7 @@ int main(int argc, char **argv)
     } catch (const Exception &e) {
 
         cout << e.name;
-        dumpLocInError(e.loc_start);
-        cout << endl;
+        dumpLocInError(e);
         return 1;
     }
 

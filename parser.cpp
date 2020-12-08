@@ -144,13 +144,6 @@ pAcceptKeyword(ParseContext &c, Keyword exp)
     return false;
 }
 
-void
-pExpectLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
-{
-    if (!pAcceptLiteralInt(c, v))
-        throw SyntaxErrorEx(c.get_loc(), "Expected integer literal", &c.get_tok());
-}
-
 void pExpectOp(ParseContext &c, Op exp)
 {
     if (!pAcceptOp(c, exp))

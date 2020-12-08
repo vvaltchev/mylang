@@ -80,18 +80,17 @@ struct UndefinedVariableEx : public Exception {
     { }
 };
 
-struct SyntaxErrorEx {
+struct SyntaxErrorEx : public Exception {
 
-    const Loc loc;
     const char *const msg;
     const Tok *const tok;
     const Op op;
 
-    SyntaxErrorEx(Loc loc,
+    SyntaxErrorEx(Loc loc_start,
                   const char *msg,
                   const Tok *tok = nullptr,
                   Op op = Op::invalid)
-        : loc(loc)
+        : Exception("SyntaxError", loc_start)
         , msg(msg)
         , tok(tok)
         , op(op)
