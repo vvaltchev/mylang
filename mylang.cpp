@@ -252,48 +252,14 @@ int main(int argc, char **argv)
         handleSyntaxError(e);
         return 1;
 
-    } catch (const CannotRebindConstEx &e) {
-
-        cout << "Cannot rebind const";
-        dumpLocInError(e.loc);
-        cout << endl;
-        return 1;
-
-    } catch (const ExpressionIsNotConstEx &e) {
-
-        cout << "Expected a const expression";
-        dumpLocInError(e.loc);
-        cout << endl;
-        return 1;
-
-    } catch (const DivisionByZeroEx &e) {
-
-        cout << "DivisionByZeroEx" << endl;
-        dumpLocInError(e.loc);
-        return 1;
-
-    } catch (const TypeErrorEx &e) {
-
-        cout << "TypeErrorEx" << endl;
-        dumpLocInError(e.loc);
-        return 1;
-
-    } catch (const AssertionFailureEx &e) {
-
-        cout << "AssertionFailureEx" << endl;
-        dumpLocInError(e.loc);
-        return 1;
-
-    } catch (const NotLValueEx &e) {
-
-        cout << "Expected lvalue";
-        dumpLocInError(e.loc);
-        return 1;
-
     } catch (const UndefinedVariableEx &e) {
 
         cout << "Undefined variable '" << e.name << "'" << endl;
-        dumpLocInError(e.loc);
+        return 1;
+
+    } catch (const Exception &e) {
+
+        cout << e.name << endl;
         return 1;
     }
 

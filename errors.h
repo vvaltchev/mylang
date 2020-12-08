@@ -22,61 +22,58 @@ class Tok;
 class Construct;
 
 struct Exception {
+
+    const char *const name;
+    const Loc loc_start;
+    const Loc loc_end;
+
+    Exception(const char *name, Loc start = Loc(), Loc end = Loc())
+        : name(name)
+        , loc_start(start)
+        , loc_end(end)
+    { }
+
     virtual ~Exception() = default;
 };
 
-struct InternalErrorEx : public Exception { };
+
+#define DECL_SIMPLE_EX(name)                       \
+                                                   \
+    struct name : public Exception {               \
+                                                   \
+        name(Loc start = Loc(), Loc end = Loc())   \
+            : Exception(#name, start, end)         \
+        { }                                        \
+    };
 
 struct InvalidTokenEx : public Exception {
+
     const string_view val;
-    InvalidTokenEx(const string_view &val) : val(val) { }
+
+    InvalidTokenEx(const string_view &val)
+        : Exception("InvalidTokenEx")
+        , val(val)
+    { }
 };
 
-struct CannotRebindConstEx : public Exception {
-    const Loc loc;
-    CannotRebindConstEx(Loc loc = Loc()) : loc(loc) { }
-};
-
-struct ExpressionIsNotConstEx : public Exception {
-    const Loc loc;
-    ExpressionIsNotConstEx(Loc loc = Loc()) : loc(loc) { }
-};
-
-struct DivisionByZeroEx : public Exception {
-    const Loc loc;
-    DivisionByZeroEx(Loc loc = Loc()) : loc(loc) { }
-};
-
-struct TypeErrorEx : public Exception {
-    const Loc loc;
-    TypeErrorEx(Loc loc = Loc()) : loc(loc) { }
-};
-
-struct AlreadyDefinedEx : public Exception {
-    const Loc loc;
-    AlreadyDefinedEx(Loc loc = Loc()) : loc(loc) { }
-};
-
-struct InvalidArgumentEx : public Exception {
-    const Loc loc;
-    InvalidArgumentEx(Loc loc = Loc()) : loc(loc) { }
-};
-
-struct AssertionFailureEx : public Exception {
-    const Loc loc;
-    AssertionFailureEx(Loc loc = Loc()) : loc(loc) { }
-};
-
-struct NotLValueEx : public Exception {
-    const Loc loc;
-    NotLValueEx(Loc loc = Loc()) : loc(loc) { }
-};
+DECL_SIMPLE_EX(InternalErrorEx)
+DECL_SIMPLE_EX(CannotRebindConstEx)
+DECL_SIMPLE_EX(ExpressionIsNotConstEx)
+DECL_SIMPLE_EX(DivisionByZeroEx)
+DECL_SIMPLE_EX(TypeErrorEx)
+DECL_SIMPLE_EX(AlreadyDefinedEx)
+DECL_SIMPLE_EX(InvalidArgumentEx)
+DECL_SIMPLE_EX(AssertionFailureEx)
+DECL_SIMPLE_EX(NotLValueEx)
 
 struct UndefinedVariableEx : public Exception {
+
     const string_view name;
-    const Loc loc;
-    UndefinedVariableEx(const string_view &name, Loc loc = Loc())
-        : name(name), loc(loc) { }
+
+    UndefinedVariableEx(const string_view &name, Loc start = Loc(), Loc end = Loc())
+        : Exception("UndefinedVariableEx")
+        , name(name)
+    { }
 };
 
 struct SyntaxErrorEx {
