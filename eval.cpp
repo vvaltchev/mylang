@@ -70,12 +70,12 @@ const string &
 find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::const_builtins) {
-        if (v->eval().get<Builtin>().func == b.func)
+        if (v.eval().get<Builtin>().func == b.func)
             return k;
     }
 
     for (const auto &[k, v]: EvalContext::builtins) {
-        if (v->eval().get<Builtin>().func == b.func)
+        if (v.eval().get<Builtin>().func == b.func)
             return k;
     }
 
@@ -100,15 +100,15 @@ const array<Type *, Type::t_count> AllTypes = {
 
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
-    make_pair("len", make_shared<LValue>(Builtin{builtin_len})),
-    make_pair("str", make_shared<LValue>(Builtin{builtin_str})),
-    make_pair("defined", make_shared<LValue>(Builtin{builtin_defined})),
+    make_pair("len", LValue(Builtin{builtin_len})),
+    make_pair("str", LValue(Builtin{builtin_str})),
+    make_pair("defined", LValue(Builtin{builtin_defined})),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
 {
-    make_pair("print", make_shared<LValue>(Builtin{builtin_print})),
-    make_pair("assert", make_shared<LValue>(Builtin{builtin_assert})),
+    make_pair("print", LValue(Builtin{builtin_print})),
+    make_pair("assert", LValue(Builtin{builtin_assert})),
 };
 
 EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
@@ -161,7 +161,7 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
         const auto &&it = ctx->symbols.find(value);
 
         if (it != ctx->symbols.end())
-            return EvalValue(it->second.get());
+            return EvalValue(&it->second);
 
         ctx = ctx->parent;
 
@@ -177,7 +177,7 @@ struct ReturnEx { EvalValue value; };
 static EvalValue
 do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
 {
-    EvalContext args_ctx(obj.capture_ctx);
+    EvalContext args_ctx(&obj.capture_ctx);
 
     if (obj.func->params) {
 
@@ -194,7 +194,7 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
         for (size_t i = 0; i < args->elems.size(); i++) {
             args_ctx.symbols.emplace(
                 funcParams[i]->value,
-                make_shared<LValue>(RValue(args->elems[i]->eval(ctx)))
+                LValue(RValue(args->elems[i]->eval(ctx)))
             );
         }
     }
@@ -506,7 +506,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         ctx->symbols.emplace(
             lval.get<UndefinedId>().id,
-            make_shared<LValue>(RValue(rval), ctx->const_ctx)
+            LValue(RValue(rval), ctx->const_ctx)
         );
 
     } else if (lval.is<LValue *>()) {
@@ -526,7 +526,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
             /* We're re-declaring a symbol already declared outside */
             ctx->symbols.emplace(
                 local_lval.get<UndefinedId>().id,
-                make_shared<LValue>(RValue(rval), ctx->const_ctx)
+                LValue(RValue(rval), ctx->const_ctx)
             );
 
         } else {
@@ -646,7 +646,7 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
         ctx->symbols.emplace(
             id->value,
-            make_shared<LValue>(move(func), ctx->const_ctx)
+            LValue(move(func), ctx->const_ctx)
         );
 
         return EvalValue();

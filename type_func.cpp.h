@@ -37,7 +37,7 @@ public:
         for (const auto &capture : func->captures->elems) {
             capture_ctx.symbols.emplace(
                 capture->value,             // value means "name" here
-                make_shared<LValue>(RValue(capture->eval(ctx)))
+                RValue(capture->eval(ctx))
             );
         }
     }

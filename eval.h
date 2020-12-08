@@ -33,11 +33,6 @@ public:
         type_checks();
     }
 
-    LValue(const LValue &rhs) = delete;
-    LValue(LValue &&rhs) = delete;
-    LValue &operator=(const LValue &rhs) = delete;
-    LValue &operator=(LValue &&rhs) = delete;
-
     void put(const EvalValue &v) { val = v; type_checks(); }
     void put(EvalValue &&v) { val = forward<EvalValue>(v); type_checks(); }
 
@@ -48,11 +43,14 @@ class EvalContext {
 
 public:
 
-    typedef map<string, shared_ptr<LValue>, less<>> SymbolsType;
+    typedef map<string, LValue, less<>> SymbolsType;
     EvalContext *const parent;
     const bool const_ctx;
     const bool func_ctx;
     SymbolsType symbols;
+
+    EvalContext(const EvalContext &rhs) = delete;
+    EvalContext(EvalContext &&rhs) = delete;
 
     EvalContext(EvalContext *parent = nullptr,
                 bool const_ctx = false,
