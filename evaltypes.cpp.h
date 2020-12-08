@@ -59,9 +59,19 @@ public:
 class TypeNone : public Type {
 
 public:
+
     TypeNone() : Type(Type::t_none) { }
+
     virtual string to_string(const EvalValue &a) {
         return "<none>";
+    }
+
+    virtual void eq(EvalValue &a, const EvalValue &b) {
+        a = b.is<NoneVal>();
+    }
+
+    virtual void noteq(EvalValue &a, const EvalValue &b) {
+        a = !b.is<NoneVal>();
     }
 };
 

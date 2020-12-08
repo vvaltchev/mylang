@@ -309,6 +309,64 @@ static const vector<test> tests =
         },
         &typeid(TypeErrorEx),
     },
+
+    {
+        "var decl without init",
+        {
+            "var a;",
+        },
+    },
+
+    {
+        "var decl without init is none",
+        {
+            "var a;",
+            "assert(a == none);",
+        },
+    },
+
+    {
+        "assign none to variable",
+        {
+            "var a = 3;",
+            "assert(a == 3);",
+            "assert(a != none);",
+            "a = none;",
+            "assert(a == none);",
+        },
+    },
+
+    {
+        "compare different types with !=",
+        {
+            "assert(\"1\" != 1);",
+            "assert(\"1\" != 0);",
+            "assert(\"1\" != none);",
+            "assert(1 != \"1\");",
+            "assert(1 != \"0\");",
+            "assert(1 != none);",
+        },
+    },
+
+    {
+        "compare different types with ==",
+        {
+            "assert(!(\"1\" == 1));",
+            "assert(!(\"1\" == 0));",
+            "assert(!(\"1\" == none));",
+            "assert(!(1 == \"1\"));",
+            "assert(!(1 == \"0\"));",
+            "assert(!(1 == none));",
+        },
+    },
+
+    {
+        "none is none",
+        {
+            "assert(none == none);",
+            "assert(!(none != none));",
+        },
+    },
 };
 
 static void

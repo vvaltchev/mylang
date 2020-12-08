@@ -112,18 +112,26 @@ void TypeInt::ge(EvalValue &a, const EvalValue &b)
 
 void TypeInt::eq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
-        throw TypeErrorEx();
+    if (b.is<long>()) {
 
-    a.get<long>() = a.get<long>() == b.get<long>();
+        a.get<long>() = a.get<long>() == b.get<long>();
+
+    } else {
+
+        a = false;
+    }
 }
 
 void TypeInt::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
-        throw TypeErrorEx();
+    if (b.is<long>()) {
 
-    a.get<long>() = a.get<long>() != b.get<long>();
+        a.get<long>() = a.get<long>() != b.get<long>();
+
+    } else {
+
+        a = true;
+    }
 }
 
 void TypeInt::opneg(EvalValue &a)

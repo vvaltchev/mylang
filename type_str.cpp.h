@@ -36,9 +36,6 @@ public:
 
 void TypeStr::add(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>())
-        throw TypeErrorEx();
-
     SharedStrWrapper &lval = a.get<SharedStrWrapper>();
 
     if (lval.use_count() > 1) {
@@ -63,9 +60,6 @@ void TypeStr::add(EvalValue &a, const EvalValue &b)
 
 void TypeStr::mul(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>())
-        throw TypeErrorEx();
-
     if (!b.is<long>())
         throw TypeErrorEx();
 
@@ -82,7 +76,7 @@ void TypeStr::mul(EvalValue &a, const EvalValue &b)
 
 void TypeStr::lt(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>() || !b.is<SharedStrWrapper>())
+    if (!b.is<SharedStrWrapper>())
         throw TypeErrorEx();
 
     a = EvalValue(
@@ -92,7 +86,7 @@ void TypeStr::lt(EvalValue &a, const EvalValue &b)
 
 void TypeStr::gt(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>() || !b.is<SharedStrWrapper>())
+    if (!b.is<SharedStrWrapper>())
         throw TypeErrorEx();
 
     a = EvalValue(
@@ -102,7 +96,7 @@ void TypeStr::gt(EvalValue &a, const EvalValue &b)
 
 void TypeStr::le(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>() || !b.is<SharedStrWrapper>())
+    if (!b.is<SharedStrWrapper>())
         throw TypeErrorEx();
 
     a = EvalValue(
@@ -112,7 +106,7 @@ void TypeStr::le(EvalValue &a, const EvalValue &b)
 
 void TypeStr::ge(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>() || !b.is<SharedStrWrapper>())
+    if (!b.is<SharedStrWrapper>())
         throw TypeErrorEx();
 
     a = EvalValue(
@@ -122,20 +116,24 @@ void TypeStr::ge(EvalValue &a, const EvalValue &b)
 
 void TypeStr::eq(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>() || !b.is<SharedStrWrapper>())
-        throw TypeErrorEx();
+    if (b.is<SharedStrWrapper>()) {
 
-    a = EvalValue(
-        a.get<SharedStrWrapper>().get() == b.get<SharedStrWrapper>().get()
-    );
+        a = a.get<SharedStrWrapper>().get() == b.get<SharedStrWrapper>().get();
+
+    } else {
+
+        a = false;
+    }
 }
 
 void TypeStr::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (!a.is<SharedStrWrapper>() || !b.is<SharedStrWrapper>())
-        throw TypeErrorEx();
+    if (b.is<SharedStrWrapper>()) {
 
-    a = EvalValue(
-        a.get<SharedStrWrapper>().get() != b.get<SharedStrWrapper>().get()
-    );
+        a = a.get<SharedStrWrapper>().get() != b.get<SharedStrWrapper>().get();
+
+    } else {
+
+        a = true;
+    }
 }
