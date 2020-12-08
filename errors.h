@@ -16,6 +16,10 @@ struct Loc {
 
     Loc() : line(0), col(0) { }
     Loc(int line, int col): line(line), col(col) { }
+
+    operator bool() const {
+        return col != 0;
+    }
 };
 
 class Tok;
@@ -24,8 +28,8 @@ class Construct;
 struct Exception {
 
     const char *const name;
-    const Loc loc_start;
-    const Loc loc_end;
+    Loc loc_start;
+    Loc loc_end;
 
     Exception(const char *name, Loc start = Loc(), Loc end = Loc())
         : name(name)

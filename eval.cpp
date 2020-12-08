@@ -107,7 +107,24 @@ RValue(const EvalValue &v)
     return v;
 }
 
-EvalValue Identifier::eval(EvalContext *ctx, bool rec) const
+EvalValue Construct::eval(EvalContext *ctx, bool rec) const
+{
+    try {
+
+        return do_eval(ctx, rec);
+
+    } catch (Exception &e) {
+
+        if (!e.loc_start) {
+            e.loc_start = start;
+            e.loc_end = end;
+        }
+
+        throw;
+    }
+}
+
+EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 {
     while (ctx) {
 
@@ -125,7 +142,7 @@ EvalValue Identifier::eval(EvalContext *ctx, bool rec) const
     return UndefinedId{value};
 }
 
-EvalValue CallExpr::eval(EvalContext *ctx, bool rec) const
+EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue &callable = RValue(id->eval(ctx));
 
@@ -150,7 +167,7 @@ EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
     return val;
 }
 
-EvalValue Expr02::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
 {
     assert(elems.size() == 1 || elems.size() == 2);
     const auto &[op, e] = elems[0];
@@ -179,7 +196,7 @@ EvalValue Expr02::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-EvalValue Expr03::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue val = eval_first_rvalue(ctx);
 
@@ -205,7 +222,7 @@ EvalValue Expr03::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-EvalValue Expr04::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue val = eval_first_rvalue(ctx);
 
@@ -228,7 +245,7 @@ EvalValue Expr04::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-EvalValue Expr06::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue val = eval_first_rvalue(ctx);
 
@@ -257,7 +274,7 @@ EvalValue Expr06::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-EvalValue Expr07::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue val = eval_first_rvalue(ctx);
 
@@ -280,7 +297,7 @@ EvalValue Expr07::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-EvalValue Expr11::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue val = eval_first_rvalue(ctx);
 
@@ -300,7 +317,7 @@ EvalValue Expr11::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-EvalValue Expr12::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue val = eval_first_rvalue(ctx);
 
@@ -357,7 +374,7 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
     lval.get<LValue *>()->put(newVal);
 }
 
-EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 {
     const bool inDecl = fl & pFlags::pInDecl;
     const EvalValue &lval = lvalue->eval(ctx);
@@ -404,7 +421,7 @@ EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
     return rval;
 }
 
-EvalValue Expr15::eval(EvalContext *ctx, bool rec) const
+EvalValue Expr15::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue val;
     assert(elems.size() > 0);
@@ -426,7 +443,7 @@ EvalValue Expr15::eval(EvalContext *ctx, bool rec) const
     return val;
 }
 
-EvalValue IfStmt::eval(EvalContext *ctx, bool rec) const
+EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     if (is_true(condExpr->eval(ctx))) {
 
@@ -445,17 +462,17 @@ EvalValue IfStmt::eval(EvalContext *ctx, bool rec) const
 struct LoopBreakEx { };
 struct LoopContinueEx { };
 
-EvalValue BreakStmt::eval(EvalContext *ctx, bool rec) const
+EvalValue BreakStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     throw LoopBreakEx();
 }
 
-EvalValue ContinueStmt::eval(EvalContext *ctx, bool rec) const
+EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     throw LoopContinueEx();
 }
 
-EvalValue Block::eval(EvalContext *ctx, bool rec) const
+EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalContext curr(ctx, ctx->const_ctx);
 
@@ -465,7 +482,7 @@ EvalValue Block::eval(EvalContext *ctx, bool rec) const
     return EvalValue();
 }
 
-EvalValue WhileStmt::eval(EvalContext *ctx, bool rec) const
+EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     while (is_true(condExpr->eval(ctx))) {
 
