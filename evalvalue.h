@@ -123,7 +123,6 @@ public:
         if (is<T>())
             return *reinterpret_cast<const T *>(&val);
 
-
         throw TypeErrorEx();
     }
 

@@ -21,7 +21,7 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
-        throw InvalidArgumentEx();
+        throw InvalidArgumentEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
     return e.get_type()->len(e);
@@ -30,12 +30,12 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
-        throw InvalidArgumentEx();
+        throw InvalidArgumentEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
 
     if (!e.get_type()->is_true(e))
-        throw AssertionFailureEx();
+        throw AssertionFailureEx(exprList->start, exprList->end);
 
     return EvalValue();
 }
@@ -135,7 +135,7 @@ EvalValue CallExpr::eval(EvalContext *ctx, bool rec) const
     if (callable.is<Builtin>())
         return callable.get<Builtin>().func(ctx, args.get());
 
-    throw TypeErrorEx();
+    throw TypeErrorEx(start, end);
 }
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
@@ -384,7 +384,7 @@ EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
 
             if (!local_lval.is<UndefinedId>()) {
                 /* We're re-defining the same variable, in the same block */
-                throw AlreadyDefinedEx();
+                throw AlreadyDefinedEx(lvalue->start, lvalue->end);
             }
 
             /* We're re-declaring a symbol already declared outside */
@@ -398,7 +398,7 @@ EvalValue Expr14::eval(EvalContext *ctx, bool rec) const
         }
 
     } else {
-        throw NotLValueEx();
+        throw NotLValueEx(lvalue->start, lvalue->end);
     }
 
     return rval;

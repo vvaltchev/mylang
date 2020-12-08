@@ -31,11 +31,18 @@ class Construct {
 
 public:
     const char *const name;
-    bool is_const;
     const bool is_nop;
+    bool is_const;
+    Loc start;
+    Loc end;
 
     Construct(const char *name, bool is_const = false, bool is_nop = false)
-        : name(name), is_const(is_const), is_nop(is_nop) { }
+        : name(name)
+        , is_nop(is_nop)
+        , is_const(is_const)
+        , start(Loc())
+        , end(Loc())
+    { }
 
     virtual ~Construct() = default;
     virtual EvalValue eval(EvalContext *ctx, bool rec = true) const = 0;

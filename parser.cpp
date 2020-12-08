@@ -56,7 +56,9 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::num) {
         v.reset(new LiteralInt{ stol(string(c.get_str())) });
+        v->start = c.get_loc();
         c++;
+        v->end = c.get_loc();
         return true;
     }
 
@@ -68,7 +70,9 @@ pAcceptLiteralStr(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::str) {
         v.reset(new LiteralStr(c.get_str()));
+        v->start = c.get_loc();
         c++;
+        v->end = c.get_loc();
         return true;
     }
 
@@ -109,7 +113,9 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
             }
         }
 
+        v->start = c.get_loc();
         c++;
+        v->end = c.get_loc();
         return true;
     }
 
@@ -142,7 +148,7 @@ void
 pExpectLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (!pAcceptLiteralInt(c, v))
-        throw SyntaxErrorEx(c.get_loc(), "Expected integer literal");
+        throw SyntaxErrorEx(c.get_loc(), "Expected integer literal", &c.get_tok());
 }
 
 void pExpectOp(ParseContext &c, Op exp)
@@ -179,6 +185,7 @@ pExprList(ParseContext &c, unsigned fl)
     unique_ptr<Construct> subexpr;
     bool is_const = true;
 
+    ret->start = c.get_loc();
     subexpr = pExpr14(c, fl);
 
     if (subexpr) {
@@ -199,6 +206,7 @@ pExprList(ParseContext &c, unsigned fl)
         }
     }
 
+    ret->end = c.get_loc();
     ret->is_const = is_const;
     return ret;
 }
@@ -213,6 +221,7 @@ pAcceptCallExpr(ParseContext &c,
 
         unique_ptr<CallExpr> expr(new CallExpr);
 
+        expr->start = id->start;
         expr->id.reset(static_cast<Identifier *>(id.release()));
         expr->args = pExprList(c, fl);
 
@@ -233,6 +242,7 @@ pAcceptCallExpr(ParseContext &c,
 
         } else {
 
+            expr->end = c.get_loc();
             ret = move(expr);
         }
 
@@ -249,6 +259,7 @@ pExpr01(ParseContext &c, unsigned fl)
     unique_ptr<Construct> ret;
     unique_ptr<Construct> main;
     unique_ptr<Construct> callExpr;
+    const Loc start = c.get_loc();
 
     if (pAcceptLiteralInt(c, main)) {
 
@@ -263,6 +274,8 @@ pExpr01(ParseContext &c, unsigned fl)
     } else if (pAcceptKeyword(c, Keyword::kw_none)) {
 
         ret.reset(new LiteralNone());
+        ret->start = start;
+        ret->end = c.get_loc();
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
@@ -296,8 +309,9 @@ pExprGeneric(ParseContext &c,
              unsigned fl)
 {
     Op op;
-    unique_ptr<ExprT> ret;
+    const Loc start = c.get_loc();
     unique_ptr<Construct> lowerE = lowerExpr(c, fl);
+    unique_ptr<ExprT> ret;
     bool is_const;
 
     if (!lowerE || lowerE->is_nop)
@@ -324,6 +338,8 @@ pExprGeneric(ParseContext &c,
     if (!ret)
         return lowerE;
 
+    ret->start = start;
+    ret->end = c.get_loc();
     ret->is_const = is_const;
     return ret;
 }
@@ -333,6 +349,7 @@ pExpr02(ParseContext &c, unsigned fl)
 {
     unique_ptr<Expr02> ret;
     unique_ptr<Construct> elem;
+    const Loc start = c.get_loc();
     Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::lnot});
 
     if (op != Op::invalid) {
@@ -358,6 +375,8 @@ pExpr02(ParseContext &c, unsigned fl)
         return elem;
 
     ret.reset(new Expr02);
+    ret->start = start;
+    ret->end = c.get_loc();
     ret->is_const = elem->is_const;
     ret->elems.emplace_back(op, move(elem));
     return ret;
@@ -418,6 +437,7 @@ pExpr14(ParseContext &c, unsigned fl)
         Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq
     };
 
+    const Loc start = c.get_loc();
     unique_ptr<Construct> lside;
     unique_ptr<Expr14> ret;
     EvalValue lside_val;
@@ -501,6 +521,8 @@ pExpr14(ParseContext &c, unsigned fl)
     }
 
     ret->fl = fl & pFlags::pInDecl;
+    ret->start = start;
+    ret->end = c.get_loc();
 
     if (!ret->rvalue)
         noExprError(c);
@@ -555,6 +577,7 @@ unique_ptr<Construct>
 pStmt(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> subStmt;
+    const Loc start = c.get_loc();
 
     if (fl & pFlags::pInLoop) {
 
@@ -587,6 +610,8 @@ pStmt(ParseContext &c, unsigned fl)
         unique_ptr<Stmt> ret(new Stmt);
         ret->elem = move(lowerE);
         pExpectOp(c, Op::semicolon);
+        ret->start = start;
+        ret->end = c.get_loc();
         return ret;
     }
 }
@@ -598,6 +623,7 @@ pBlock(ParseContext &c, unsigned fl)
     unique_ptr<Construct> stmt, tmp;
     bool added_elem;
 
+    ret->start = c.get_loc();
     EvalContext block_const_ctx(c.const_ctx, true);
     c.const_ctx = &block_const_ctx;
 
@@ -627,6 +653,7 @@ pBlock(ParseContext &c, unsigned fl)
 
     }
 
+    ret->end = c.get_loc();
     c.const_ctx = c.const_ctx->parent;
     return ret;
 }
@@ -648,89 +675,95 @@ pAcceptBracedBlock(ParseContext &c,
 bool
 pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 {
-    if (pAcceptKeyword(c, Keyword::kw_if)) {
+    const Loc start = c.get_loc();
 
-        unique_ptr<IfStmt> ifstmt(new IfStmt);
-        pExpectOp(c, Op::parenL);
+    if (!pAcceptKeyword(c, Keyword::kw_if))
+        return false;
 
-        ifstmt->condExpr = pExprTop(c, fl);
+    unique_ptr<IfStmt> ifstmt(new IfStmt);
+    pExpectOp(c, Op::parenL);
 
-        if (!ifstmt->condExpr)
-            noExprError(c);
+    ifstmt->condExpr = pExprTop(c, fl);
 
-        pExpectOp(c, Op::parenR);
+    if (!ifstmt->condExpr)
+        noExprError(c);
 
-        if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl)) {
+    pExpectOp(c, Op::parenR);
+
+    if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl)) {
+
+        unique_ptr<Construct> stmt = pStmt(c, fl);
+
+        if (stmt && !stmt->is_nop)
+            ifstmt->thenBlock = move(stmt);
+    }
+
+    if (pAcceptKeyword(c, Keyword::kw_else)) {
+
+        if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl)) {
 
             unique_ptr<Construct> stmt = pStmt(c, fl);
 
             if (stmt && !stmt->is_nop)
-                ifstmt->thenBlock = move(stmt);
+                ifstmt->elseBlock = move(stmt);
         }
-
-        if (pAcceptKeyword(c, Keyword::kw_else)) {
-
-            if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl)) {
-
-                unique_ptr<Construct> stmt = pStmt(c, fl);
-
-                if (stmt && !stmt->is_nop)
-                    ifstmt->elseBlock = move(stmt);
-            }
-        }
-
-        if (c.const_eval && ifstmt->condExpr->is_const) {
-
-            const EvalValue &v = ifstmt->condExpr->eval(c.const_ctx);
-
-            if (v.get_type()->is_true(v))
-                ret = move(ifstmt->thenBlock);
-            else
-                ret = move(ifstmt->elseBlock);
-
-        } else {
-            ret = move(ifstmt);
-        }
-
-        return true;
     }
 
-    return false;
+    ret->start = start;
+    ret->end = c.get_loc();
+
+    if (c.const_eval && ifstmt->condExpr->is_const) {
+
+        const EvalValue &v = ifstmt->condExpr->eval(c.const_ctx);
+
+        if (v.get_type()->is_true(v))
+            ret = move(ifstmt->thenBlock);
+        else
+            ret = move(ifstmt->elseBlock);
+
+    } else {
+        ret = move(ifstmt);
+    }
+
+    return true;
 }
 
 bool
 pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 {
-    if (pAcceptKeyword(c, Keyword::kw_while)) {
+    const Loc start = c.get_loc();
 
-        unique_ptr<WhileStmt> whileStmt(new WhileStmt);
-        pExpectOp(c, Op::parenL);
+    if (!pAcceptKeyword(c, Keyword::kw_while))
+        return false;
 
-        whileStmt->condExpr = pExprTop(c, fl);
+    unique_ptr<WhileStmt> whileStmt(new WhileStmt);
+    pExpectOp(c, Op::parenL);
 
-        if (!whileStmt->condExpr)
-            noExprError(c);
+    whileStmt->condExpr = pExprTop(c, fl);
 
-        pExpectOp(c, Op::parenR);
+    if (!whileStmt->condExpr)
+        noExprError(c);
 
-        if (!pAcceptBracedBlock(c, whileStmt->body, pFlags::pInLoop))
-            whileStmt->body = pStmt(c, pFlags::pInLoop);
+    pExpectOp(c, Op::parenR);
 
-        if (c.const_eval && whileStmt->condExpr->is_const) {
+    if (!pAcceptBracedBlock(c, whileStmt->body, pFlags::pInLoop))
+        whileStmt->body = pStmt(c, pFlags::pInLoop);
 
-            const EvalValue &v = whileStmt->condExpr->eval(c.const_ctx);
+    ret->start = start;
+    ret->end = c.get_loc();
 
-            if (!v.get_type()->is_true(v)) {
-                ret.reset();
-                return true;
-            }
+    if (c.const_eval && whileStmt->condExpr->is_const) {
+
+        const EvalValue &v = whileStmt->condExpr->eval(c.const_ctx);
+
+        if (!v.get_type()->is_true(v)) {
+            ret.reset();
+            return true;
         }
-
-        ret = move(whileStmt);
-        return true;
     }
 
-    return false;
+    ret = move(whileStmt);
+    return true;
 }
 
 bool

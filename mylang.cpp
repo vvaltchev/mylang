@@ -259,7 +259,9 @@ int main(int argc, char **argv)
 
     } catch (const Exception &e) {
 
-        cout << e.name << endl;
+        cout << e.name;
+        dumpLocInError(e.loc_start);
+        cout << endl;
         return 1;
     }
 
