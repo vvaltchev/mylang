@@ -51,9 +51,12 @@ public:
     typedef map<string, shared_ptr<LValue>, less<>> SymbolsType;
     EvalContext *const parent;
     const bool const_ctx;
-
-    EvalContext(EvalContext *parent = nullptr, bool const_ctx = false);
+    const bool func_ctx;
     SymbolsType symbols;
+
+    EvalContext(EvalContext *parent = nullptr,
+                bool const_ctx = false,
+                bool func_ctx = false);
 
     static const SymbolsType builtins;
     static const SymbolsType const_builtins;

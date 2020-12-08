@@ -825,7 +825,7 @@ pAcceptFuncDecl(ParseContext &c,
     }
 
     pExpectOp(c, Op::parenL);
-    func->args = pList<IdList>(c, fl, pIdentifier);
+    func->params = pList<IdList>(c, fl, pIdentifier);
     pExpectOp(c, Op::parenR);
 
     if (!pAcceptBracedBlock(c, func->body, fl))

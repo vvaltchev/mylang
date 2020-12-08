@@ -379,7 +379,7 @@ class FuncDeclStmt : public Construct {
 public:
     unique_ptr<Identifier> id;  /* NULL when the func is defined inside an expr */
     unique_ptr<IdList> captures;
-    unique_ptr<IdList> args;
+    unique_ptr<IdList> params;
     unique_ptr<Construct> body;
 
     FuncDeclStmt() : Construct("FuncDeclStmt") { }

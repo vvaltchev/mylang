@@ -7,6 +7,7 @@
 #include "evaltypes.cpp.h"
 #include "type_int.cpp.h"
 #include "type_str.cpp.h"
+#include "type_func.cpp.h"
 
 EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 {
@@ -88,6 +89,7 @@ const array<Type *, Type::t_count> AllTypes = {
     new TypeInt(),
     new TypeBuiltin(),
     new TypeStr(),
+    new TypeFunc(),
 };
 
 /*
@@ -109,9 +111,10 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_pair("assert", make_shared<LValue>(Builtin{builtin_assert})),
 };
 
-EvalContext::EvalContext(EvalContext *parent, bool const_ctx)
+EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     : parent(parent)
     , const_ctx(const_ctx)
+    , func_ctx(func_ctx)
 {
     if (!parent) {
         symbols.insert(const_builtins.begin(), const_builtins.end());
@@ -169,6 +172,30 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
     return UndefinedId{value};
 }
 
+static EvalValue
+do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
+{
+    EvalContext args_ctx(obj.capture_ctx);
+    const auto &funcParams = obj.func->params->elems;
+
+    if (args->elems.size() != funcParams.size()) {
+
+        if (args->elems.size() < funcParams.size())
+            throw TooFewArgsEx();
+        else
+            throw TooManyArgsEx();
+    }
+
+    for (size_t i = 0; i < args->elems.size(); i++) {
+        args_ctx.symbols.emplace(
+            funcParams[i]->value,
+            make_shared<LValue>(RValue(args->elems[i]->eval(ctx)))
+        );
+    }
+
+    return obj.func->body->eval(&args_ctx);
+}
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue &id_val = id->eval(ctx);
@@ -178,7 +205,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
     if (id_val.is<LValue *>()) {
 
-        const EvalValue &callable = id_val.get<LValue *>()->eval();
+        EvalValue &&callable = id_val.get<LValue *>()->eval();
 
         if (callable.is<UndefinedId>())
             throw UndefinedVariableEx(id->value, id->start, id->end);
@@ -188,10 +215,20 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
             if (callable.is<Builtin>())
                 return callable.get<Builtin>().func(ctx, args.get());
 
+            if (callable.is<SharedFuncObjWrapper>()) {
+                return do_func_call(
+                    ctx,
+                    callable.get<SharedFuncObjWrapper>().get(),
+                    args.get()
+                );
+            }
+
         } catch (Exception &e) {
 
-            e.loc_start = args->start;
-            e.loc_end = args->end;
+            if (!e.loc_start) {
+                e.loc_start = args->start;
+                e.loc_end = args->end;
+            }
             throw;
         }
     }
@@ -559,5 +596,22 @@ EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    return 1234;
+    EvalValue func(
+        SharedFuncObjWrapper(make_shared<FuncObject>(this, ctx))
+    );
+
+    if (id) {
+
+        if (!id->eval(ctx).is<UndefinedId>())
+            throw AlreadyDefinedEx(id->start, id->end);
+
+        ctx->symbols.emplace(
+            id->value,
+            make_shared<LValue>(move(func), ctx->const_ctx)
+        );
+
+        return EvalValue();
+    }
+
+    return func;
 }

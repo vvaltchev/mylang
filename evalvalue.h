@@ -12,12 +12,14 @@ using namespace std;
 class Type;
 class LValue;
 class ExprList;
+class FuncDeclStmt;
 class EvalValue;
 class EvalContext;
 
 struct NoneVal { };
 struct UndefinedId { string_view id; };
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
+class FuncObject;
 
 template <class T>
 struct SharedVal {
@@ -55,6 +57,7 @@ struct SharedVal {
 };
 
 typedef SharedVal<string> SharedStrWrapper;
+typedef SharedVal<FuncObject> SharedFuncObjWrapper;
 
 class EvalValue {
 
@@ -66,6 +69,7 @@ class EvalValue {
         long ival;
         Builtin bfunc;
         SharedStrWrapper str;
+        SharedFuncObjWrapper func;
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }
@@ -90,6 +94,8 @@ public:
     EvalValue(const Builtin &val);
     EvalValue(const SharedStrWrapper &val);
     EvalValue(SharedStrWrapper &&val);
+    EvalValue(const SharedFuncObjWrapper &val);
+    EvalValue(SharedFuncObjWrapper &&val);
 
     EvalValue(const EvalValue &other);
     EvalValue(EvalValue &&other);
@@ -110,6 +116,7 @@ public:
         static_assert(offsetof(ValueU, ival) == 0);
         static_assert(offsetof(ValueU, bfunc) == 0);
         static_assert(offsetof(ValueU, str) == 0);
+        static_assert(offsetof(ValueU, func) == 0);
 
         if (is<T>())
             return *reinterpret_cast<T *>(&val);
@@ -147,6 +154,7 @@ public:
 
         /* Non-trivial types */
         t_str,
+        t_func,
 
         /* Number of types */
         t_count,
@@ -199,6 +207,9 @@ template <>
 inline bool EvalValue::is<Builtin>() const { return type->t == Type::Type::t_builtin; }
 template <>
 inline bool EvalValue::is<SharedStrWrapper>() const { return type->t == Type::t_str; }
+template <>
+inline bool EvalValue::is<SharedFuncObjWrapper>() const { return type->t == Type::t_func; }
+
 
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[Type::t_none]) { }
@@ -232,6 +243,25 @@ inline EvalValue::EvalValue(SharedStrWrapper &&v)
         reinterpret_cast<void *>( &v )
     );
 }
+
+inline EvalValue::EvalValue(const SharedFuncObjWrapper &v)
+    : type(AllTypes[Type::t_func])
+{
+    type->copy_ctor(
+        reinterpret_cast<void *>( &val ),
+        reinterpret_cast<const void *>( &v )
+    );
+}
+
+inline EvalValue::EvalValue(SharedFuncObjWrapper &&v)
+    : type(AllTypes[Type::t_func])
+{
+    type->move_ctor(
+        reinterpret_cast<void *>( &val ),
+        reinterpret_cast<void *>( &v )
+    );
+}
+
 
 inline EvalValue::EvalValue(const EvalValue &other)
     : type(other.type)

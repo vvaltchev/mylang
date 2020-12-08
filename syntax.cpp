@@ -338,7 +338,7 @@ void FuncDeclStmt::serialize(ostream &s, int level) const
         s << "<NoCaptures>" << endl;
     }
 
-    args->serialize(s, level + 1);
+    params->serialize(s, level + 1);
     cout << endl;
 
     body->serialize(s, level + 1);
