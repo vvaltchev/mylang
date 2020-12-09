@@ -2,6 +2,8 @@
 
 #pragma once
 #include "errors.h"
+#include "sharedval.h"
+
 #include <string_view>
 #include <string>
 #include <memory>
@@ -22,41 +24,6 @@ struct NoneVal { };
 struct UndefinedId { string_view id; };
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 class FuncObject;
-
-template <class T>
-struct SharedVal {
-
-    typedef T type;
-
-    char data[sizeof(shared_ptr<T>)] alignas(shared_ptr<T>);
-
-    SharedVal() = default;
-
-    SharedVal(const shared_ptr<T> &s) {
-        new ((void *)data) shared_ptr<T>(s);
-    }
-
-    SharedVal(shared_ptr<T> &&s) {
-        new ((void *)data) shared_ptr<T>(move(s));
-    }
-
-    shared_ptr<T> &to_shared_ptr() {
-        return *reinterpret_cast<shared_ptr<T> *>(data);
-    }
-
-    T &get() {
-        return *to_shared_ptr().get();
-    }
-
-    T get() const {
-        /* Unfortunately, this const_cast is unavoidable */
-        return *const_cast<SharedVal<T> *>(this).get();
-    }
-
-    long use_count() {
-        return to_shared_ptr().use_count();
-    }
-};
 
 typedef SharedVal<string> SharedStrWrapper;
 typedef SharedVal<FuncObject> SharedFuncObjWrapper;
