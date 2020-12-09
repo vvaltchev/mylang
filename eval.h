@@ -27,16 +27,19 @@ public:
     }
 
     LValue(EvalValue &&val, bool is_const = false)
-        : val(forward<EvalValue>(val))
+        : val(move(val))
         , is_const(is_const)
     {
         type_checks();
     }
 
     void put(const EvalValue &v) { val = v; type_checks(); }
-    void put(EvalValue &&v) { val = forward<EvalValue>(v); type_checks(); }
+    void put(EvalValue &&v) { val = move(v); type_checks(); }
 
-    EvalValue eval() const { return val; }
+    const EvalValue &get() const { return val; }
+
+    template <class T>
+    bool is() const { return val.is<T>(); }
 };
 
 class EvalContext {

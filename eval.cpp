@@ -70,12 +70,12 @@ const string &
 find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::const_builtins) {
-        if (v.eval().get<Builtin>().func == b.func)
+        if (v.get().get<Builtin>().func == b.func)
             return k;
     }
 
     for (const auto &[k, v]: EvalContext::builtins) {
-        if (v.eval().get<Builtin>().func == b.func)
+        if (v.get().get<Builtin>().func == b.func)
             return k;
     }
 
@@ -129,7 +129,7 @@ EvalValue
 RValue(const EvalValue &v)
 {
     if (v.is<LValue *>())
-        return v.get<LValue *>()->eval();
+        return v.get<LValue *>()->get();
 
     if (v.is<UndefinedId>())
         throw UndefinedVariableEx{v.get<UndefinedId>().id};
@@ -239,7 +239,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
     if (id_val.is<LValue *>()) {
 
-        EvalValue &&callable = id_val.get<LValue *>()->eval();
+        const EvalValue &callable = id_val.get<LValue *>()->get();
 
         if (callable.is<UndefinedId>())
             throw UndefinedVariableEx(id->value, id->start, id->end);
@@ -457,7 +457,7 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
 {
     EvalValue newVal;
 
-    if (lval.get<LValue *>()->eval().is<Builtin>())
+    if (lval.get<LValue *>()->is<Builtin>())
         throw CannotRebindBuiltinEx();
 
     if (op == Op::assign) {
@@ -466,7 +466,7 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
 
     } else {
 
-        newVal = RValue(lval.get<LValue *>()->eval());
+        newVal = lval.get<LValue *>()->get();
 
         switch (op) {
             case Op::addeq:

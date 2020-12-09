@@ -486,7 +486,7 @@ pExpr14(ParseContext &c, unsigned fl)
             if (!lside_val.is<UndefinedId>()) {
 
                 if (lside_val.is<LValue *>()) {
-                    if (lside_val.get<LValue *>()->eval().is<Builtin>())
+                    if (lside_val.get<LValue *>()->is<Builtin>())
                         throw CannotRebindBuiltinEx(c.get_loc());
                 }
 
