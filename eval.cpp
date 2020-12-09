@@ -79,13 +79,8 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
 
         const auto &funcParams = obj.func->params->elems;
 
-        if (args->elems.size() != funcParams.size()) {
-
-            if (args->elems.size() < funcParams.size())
-                throw TooFewArgsEx();
-            else
-                throw TooManyArgsEx();
-        }
+        if (args->elems.size() != funcParams.size())
+            throw InvalidNumberOfArgsEx();
 
         for (size_t i = 0; i < args->elems.size(); i++) {
             args_ctx.symbols.emplace(

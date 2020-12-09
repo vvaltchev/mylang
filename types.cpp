@@ -18,11 +18,8 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 
 EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 {
-    if (exprList->elems.size() == 0)
-        throw TooFewArgsEx(exprList->start, exprList->end);
-
-    if (exprList->elems.size() > 1)
-        throw TooManyArgsEx(exprList->start, exprList->end);
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
     return e.get_type()->len(e);
@@ -30,11 +27,8 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 
 EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
 {
-    if (exprList->elems.size() == 0)
-        throw TooFewArgsEx(exprList->start, exprList->end);
-
-    if (exprList->elems.size() > 1)
-        throw TooManyArgsEx(exprList->start, exprList->end);
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
     return !arg->eval(ctx).is<UndefinedId>();
@@ -43,7 +37,7 @@ EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
 EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
-        throw TooManyArgsEx(exprList->start, exprList->end);
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
     string &&s = e.get_type()->to_string(e);
@@ -53,7 +47,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
 EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
-        throw TooManyArgsEx(exprList->start, exprList->end);
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
 
