@@ -178,26 +178,49 @@ static EvalValue
 do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
 {
     EvalContext args_ctx(obj.capture_ctx);
-    const auto &funcParams = obj.func->params->elems;
 
-    if (args->elems.size() != funcParams.size()) {
+    if (obj.func->params) {
 
-        if (args->elems.size() < funcParams.size())
-            throw TooFewArgsEx();
-        else
-            throw TooManyArgsEx();
-    }
+        const auto &funcParams = obj.func->params->elems;
 
-    for (size_t i = 0; i < args->elems.size(); i++) {
-        args_ctx.symbols.emplace(
-            funcParams[i]->value,
-            make_shared<LValue>(RValue(args->elems[i]->eval(ctx)))
-        );
+        if (args->elems.size() != funcParams.size()) {
+
+            if (args->elems.size() < funcParams.size())
+                throw TooFewArgsEx();
+            else
+                throw TooManyArgsEx();
+        }
+
+        for (size_t i = 0; i < args->elems.size(); i++) {
+            args_ctx.symbols.emplace(
+                funcParams[i]->value,
+                make_shared<LValue>(RValue(args->elems[i]->eval(ctx)))
+            );
+        }
     }
 
     try {
 
-        obj.func->body->eval(&args_ctx);
+        Block *block = dynamic_cast<Block *>(obj.func->body.get());
+
+        if (block) {
+
+            for (const auto &e: block->elems) {
+
+                if (e->is_ret) {
+                    /* Optimization: skip ReturnEx and eval the result directly */
+                    ReturnStmt *ret = dynamic_cast<ReturnStmt *>(e.get());
+                    assert(ret != nullptr);
+                    return ret->elem->eval(&args_ctx);
+                }
+
+                e->eval(&args_ctx);
+            }
+
+        } else {
+
+            return obj.func->body->eval(&args_ctx);
+        }
 
     } catch (ReturnEx &ret) {
 

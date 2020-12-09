@@ -33,14 +33,19 @@ class Construct {
 
 public:
     const char *const name;
-    const bool is_nop;
+    const bool is_nop;      // Purpose: avoid dynamic_cast<NopConstruct *>
+    const bool is_ret;      // Purpose: avoid dynamic_cast<ReturnStmt *>
     bool is_const;
     Loc start;
     Loc end;
 
-    Construct(const char *name, bool is_const = false, bool is_nop = false)
+    Construct(const char *name,
+              bool is_const = false,
+              bool is_nop = false,
+              bool is_ret = false)
         : name(name)
         , is_nop(is_nop)
+        , is_ret(is_ret)
         , is_const(is_const)
         , start(Loc())
         , end(Loc())
@@ -339,8 +344,8 @@ public:
     unique_ptr<Construct> elseBlock;
 
     IfStmt() : Construct("IfStmt") { }
-    virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    virtual void serialize(ostream &s, int level = 0) const;
 };
 
 class Block : public MultiElemConstruct<> {
@@ -364,11 +369,15 @@ public:
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };
 
-class ReturnStmt : public SingleChildConstruct {
+class ReturnStmt : public Construct {
 
 public:
-    ReturnStmt(): SingleChildConstruct("ReturnStmt") { }
+    unique_ptr<Construct> elem;
+
+    ReturnStmt(): Construct("ReturnStmt", false, false, true) { }
+
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    virtual void serialize(ostream &s, int level = 0) const;
 };
 
 class WhileStmt : public Construct {
@@ -378,8 +387,8 @@ public:
     unique_ptr<Construct> body;
 
     WhileStmt() : Construct("WhileStmt") { }
-    virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    virtual void serialize(ostream &s, int level = 0) const;
 };
 
 class FuncDeclStmt : public Construct {
@@ -391,6 +400,6 @@ public:
     unique_ptr<Construct> body;
 
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
-    virtual void serialize(ostream &s, int level = 0) const;
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    virtual void serialize(ostream &s, int level = 0) const;
 };

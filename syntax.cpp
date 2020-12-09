@@ -118,7 +118,11 @@ void ChildlessConstruct::serialize(ostream &s, int level) const
     s << name;
 }
 
-void SingleChildConstruct::serialize(ostream &s, int level) const
+static void
+generic_single_child_serialize(const char *name,
+                               const unique_ptr<Construct> &elem,
+                               ostream &s,
+                               int level)
 {
     string indent(level * 2, ' ');
 
@@ -136,6 +140,11 @@ void SingleChildConstruct::serialize(ostream &s, int level) const
     }
 
     s << ")";
+}
+
+void SingleChildConstruct::serialize(ostream &s, int level) const
+{
+    generic_single_child_serialize(name, elem, s, level);
 }
 
 void
@@ -338,12 +347,25 @@ void FuncDeclStmt::serialize(ostream &s, int level) const
         s << "<NoCaptures>" << endl;
     }
 
-    params->serialize(s, level + 1);
-    cout << endl;
+    if (params) {
+
+        params->serialize(s, level + 1);
+        cout << endl;
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoParams>" << endl;
+    }
 
     body->serialize(s, level + 1);
     s << endl;
 
     s << indent;
     s << ")";
+}
+
+void ReturnStmt::serialize(ostream &s, int level) const
+{
+    generic_single_child_serialize(name, elem, s, level);
 }

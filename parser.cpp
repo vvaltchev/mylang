@@ -854,12 +854,23 @@ pAcceptFuncDecl(ParseContext &c,
         }
     }
 
-    pExpectOp(c, Op::parenL);
-    func->params = pList<IdList>(c, fl, pIdentifier);
-    pExpectOp(c, Op::parenR);
+    if (pAcceptOp(c, Op::parenL)) {
+        func->params = pList<IdList>(c, fl, pIdentifier);
+        pExpectOp(c, Op::parenR);
+    }
 
-    if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody))
-        throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
+    if (pAcceptOp(c, Op::arrow)) {
+
+        func->body = pExprTop(c, fl);
+
+    } else if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody)) {
+
+        throw SyntaxErrorEx(
+            c.get_loc(),
+            "Expected { } block or => expr, got",
+            &c.get_tok()
+        );
+    }
 
     func->end = c.get_loc() + 1;
     ret = move(func);
