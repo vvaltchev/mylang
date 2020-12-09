@@ -20,7 +20,8 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
     return e.get_type()->len(e);
 }
 
@@ -50,9 +51,12 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
-    string &&s = e.get_type()->to_string(e);
-    return SharedStrWrapper(make_shared<string>(s));
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    return SharedStrWrapper(
+        make_shared<string>(e.get_type()->to_string(e))
+    );
 }
 
 EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
@@ -70,12 +74,27 @@ EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
 
     if (!e.get_type()->is_true(e))
         throw AssertionFailureEx(exprList->start, exprList->end);
 
     return EvalValue();
+}
+
+EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    if (!e.is<long>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    exit(e.get<long>());
 }
 
 const string &
@@ -122,4 +141,5 @@ const EvalContext::SymbolsType EvalContext::builtins =
 {
     make_pair("print", LValue(Builtin{builtin_print})),
     make_pair("assert", LValue(Builtin{builtin_assert})),
+    make_pair("exit", LValue(Builtin{builtin_exit})),
 };
