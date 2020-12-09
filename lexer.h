@@ -76,8 +76,9 @@ enum class Keyword : int {
     kw_var      = 8,
     kw_none     = 9,
     kw_func     = 10,
+    kw_return   = 11,
 
-    kw_count    = 11,
+    kw_count    = 12,
 };
 
 static const array<string, (int)Keyword::kw_count> KwString =
@@ -94,6 +95,7 @@ static const array<string, (int)Keyword::kw_count> KwString =
     "var",
     "none",
     "func",
+    "return",
 };
 
 ostream &operator<<(ostream &s, TokType t);

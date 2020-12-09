@@ -172,6 +172,8 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
     return UndefinedId{value};
 }
 
+struct ReturnEx { EvalValue value; };
+
 static EvalValue
 do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
 {
@@ -193,7 +195,16 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
         );
     }
 
-    return obj.func->body->eval(&args_ctx);
+    try {
+
+        obj.func->body->eval(&args_ctx);
+
+    } catch (ReturnEx &ret) {
+
+        return move(ret.value);
+    }
+
+    return EvalValue();
 }
 
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
@@ -555,6 +566,11 @@ EvalValue BreakStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     throw LoopContinueEx();
+}
+
+EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    throw ReturnEx{ elem->eval(ctx) };
 }
 
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const

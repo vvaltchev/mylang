@@ -26,6 +26,7 @@ enum pFlags : unsigned {
     pInConstDecl    = 1 << 2,
     pInLoop         = 1 << 3,
     pInStmt         = 1 << 4,
+    pInFuncBody     = 1 << 5,
 };
 
 class Construct {
@@ -360,6 +361,13 @@ class ContinueStmt : public ChildlessConstruct {
 
 public:
     ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+};
+
+class ReturnStmt : public SingleChildConstruct {
+
+public:
+    ReturnStmt(): SingleChildConstruct("ReturnStmt") { }
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };
 

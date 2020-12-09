@@ -598,6 +598,32 @@ pExprTop(ParseContext &c, unsigned fl)
     return e;
 }
 
+bool
+pAcceptReturnStmt(ParseContext &c,
+                  unique_ptr<Construct> &ret,
+                  unsigned fl)
+{
+    const Loc start = c.get_loc();
+
+    if (fl & pFlags::pInFuncBody && pAcceptKeyword(c, Keyword::kw_return)) {
+
+        unique_ptr<ReturnStmt> stmt(new ReturnStmt);
+
+        stmt->elem = pExpr14(c, fl);
+
+        if (!stmt->elem)
+            noExprError(c);
+
+        pExpectOp(c, Op::semicolon);
+        stmt->start = start;
+        stmt->end = c.get_loc();
+        ret = move(stmt);
+        return true;
+    }
+
+    return false;
+}
+
 unique_ptr<Construct>
 pStmt(ParseContext &c, unsigned fl)
 {
@@ -621,6 +647,10 @@ pStmt(ParseContext &c, unsigned fl)
         return subStmt;
 
     } else if (pAcceptFuncDecl(c, subStmt, fl | pFlags::pInStmt)) {
+
+        return subStmt;
+
+    } else if (pAcceptReturnStmt(c, subStmt, fl)) {
 
         return subStmt;
 
@@ -828,7 +858,7 @@ pAcceptFuncDecl(ParseContext &c,
     func->params = pList<IdList>(c, fl, pIdentifier);
     pExpectOp(c, Op::parenR);
 
-    if (!pAcceptBracedBlock(c, func->body, fl))
+    if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody))
         throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
 
     func->end = c.get_loc() + 1;
