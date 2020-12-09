@@ -404,6 +404,12 @@ public:
     const EvalValue &get() const { return val; }
 
     template <class T>
+    T &getval() { return val.get<T>(); }
+
+    template <class T>
+    T getval() const { return val.get<T>(); }
+
+    template <class T>
     bool is() const { return val.is<T>(); }
 };
 

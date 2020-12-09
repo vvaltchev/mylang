@@ -70,12 +70,12 @@ const string &
 find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::const_builtins) {
-        if (v.get().get<Builtin>().func == b.func)
+        if (v.getval<Builtin>().func == b.func)
             return k;
     }
 
     for (const auto &[k, v]: EvalContext::builtins) {
-        if (v.get().get<Builtin>().func == b.func)
+        if (v.getval<Builtin>().func == b.func)
             return k;
     }
 
