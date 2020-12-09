@@ -469,6 +469,65 @@ static const vector<test> tests =
             "assert(defined(c1) == 1);",
         },
     },
+
+    {
+        "simple func",
+        {
+            "func add(a, b) {",
+            "   return a+b;",
+            "}",
+            "",
+            "assert(add(3,4) == 7);",
+        },
+    },
+
+    {
+        "simple func (short syntax)",
+        {
+            "func add(a, b) => a+b;",
+            "assert(add(3,4) == 7);",
+        },
+    },
+
+    {
+        "func accessing globals",
+        {
+            "var g1 = 34;",
+            "func add(a) => g1 + a;",
+            "assert(add(1) == 35);",
+        },
+    },
+
+    {
+        "func accessing global consts",
+        {
+            "const g1 = 34;",
+            "func add(a) => g1 + a;",
+            "assert(add(1) == 35);",
+        },
+    },
+
+    {
+        "function objects",
+        {
+            "var f = func (a,b) => a+b;",
+            "assert(f(1,2) == 3);",
+        },
+    },
+
+    {
+        "function objects with capture",
+        {
+            "{",
+            "   var local=1;",
+            "   var f = func [local] { local+=1; return local; };",
+            "   assert(f() == 2);",
+            "   assert(f() == 3);",
+            "   assert(f() == 4);",
+            "   assert(local == 1);",
+            "}",
+        },
+    },
 };
 
 static void
@@ -490,10 +549,9 @@ check(const test &t)
             lexer(t.source[i], i+1, tokens);
 
         ParseContext pCtx(TokenStream(tokens), true /* const eval */);
-        EvalContext eCtx;
 
         root = pBlock(pCtx);
-        root->eval(&eCtx);
+        root->eval(nullptr);
 
     } catch (const Exception &e) {
 

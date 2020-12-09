@@ -598,7 +598,7 @@ EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalContext curr(ctx, ctx->const_ctx);
+    EvalContext curr(ctx, ctx ? ctx->const_ctx : false);
 
     for (const auto &e: elems)
         e->eval(&curr);

@@ -244,8 +244,7 @@ int main(int argc, char **argv)
 
         if (!opt_no_run) {
             /* Run the script */
-            EvalContext evalCtx;
-            root->eval(&evalCtx);
+            root->eval(nullptr);
         }
 
     } catch (const InvalidTokenEx &e) {
