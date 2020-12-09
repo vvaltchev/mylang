@@ -28,6 +28,62 @@ class FuncObject;
 typedef SharedVal<string> SharedStrWrapper;
 typedef SharedVal<FuncObject> SharedFuncObjWrapper;
 
+class Type {
+
+public:
+
+    enum TypeE : int {
+
+        /* Trivial types */
+        t_none,
+        t_lval,
+        t_undefid,
+        t_int,
+        t_builtin,
+
+        /* Non-trivial types */
+        t_str,
+        t_func,
+
+        /* Number of types */
+        t_count,
+    };
+
+    const TypeE t;
+    Type(TypeE t) : t(t) { assert(t != t_count); }
+
+    virtual void add(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void sub(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void mul(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void div(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void mod(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void lt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void gt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void le(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void ge(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void eq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void noteq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void opneg(EvalValue &a) { throw TypeErrorEx(); }
+    virtual void lnot(EvalValue &a) { throw TypeErrorEx(); }
+    virtual void land(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+    virtual void lor(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
+
+    virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
+    virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
+    virtual long len(const EvalValue &a) { throw TypeErrorEx(); }
+
+    /* Helper functions for our custom variant */
+
+    virtual void default_ctor(void *obj) { throw InternalErrorEx(); }
+    virtual void dtor(void *obj) { throw InternalErrorEx(); }
+    virtual void copy_ctor(void *obj, const void *other) { throw InternalErrorEx(); }
+    virtual void move_ctor(void *obj, void *other) { throw InternalErrorEx(); }
+    virtual void copy_assign(void *obj, const void *other) { throw InternalErrorEx(); }
+    virtual void move_assign(void *obj, void *other) { throw InternalErrorEx(); }
+};
+
+extern const array<Type *, Type::t_count> AllTypes;
+
 class EvalValue {
 
     union ValueU {
@@ -108,61 +164,6 @@ public:
 
 ostream &operator<<(ostream &s, const EvalValue &c);
 
-class Type {
-
-public:
-
-    enum TypeE : int {
-
-        /* Trivial types */
-        t_none,
-        t_lval,
-        t_undefid,
-        t_int,
-        t_builtin,
-
-        /* Non-trivial types */
-        t_str,
-        t_func,
-
-        /* Number of types */
-        t_count,
-    };
-
-    const TypeE t;
-    Type(TypeE t) : t(t) { assert(t != t_count); }
-
-    virtual void add(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void sub(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void mul(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void div(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void mod(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void lt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void gt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void le(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void ge(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void eq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void noteq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void opneg(EvalValue &a) { throw TypeErrorEx(); }
-    virtual void lnot(EvalValue &a) { throw TypeErrorEx(); }
-    virtual void land(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void lor(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-
-    virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
-    virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
-    virtual long len(const EvalValue &a) { throw TypeErrorEx(); }
-
-    /* Helper functions for our custom variant */
-
-    virtual void default_ctor(void *obj) { throw InternalErrorEx(); }
-    virtual void dtor(void *obj) { throw InternalErrorEx(); }
-    virtual void copy_ctor(void *obj, const void *other) { throw InternalErrorEx(); }
-    virtual void move_ctor(void *obj, void *other) { throw InternalErrorEx(); }
-    virtual void copy_assign(void *obj, const void *other) { throw InternalErrorEx(); }
-    virtual void move_assign(void *obj, void *other) { throw InternalErrorEx(); }
-};
-
-extern const array<Type *, Type::t_count> AllTypes;
 
 template <>
 inline bool EvalValue::is<NoneVal>() const { return type->t == Type::t_none; }
