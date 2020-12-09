@@ -528,6 +528,71 @@ static const vector<test> tests =
             "}",
         },
     },
+
+    {
+        "functions don't see outer scope except global (short expr)",
+        {
+            "{",
+            "   var g = 1;",
+            "   var f = func () => g;",
+            "   f();",  // We must fail here
+            "}",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "functions don't see outer scope except global (direct return)",
+        {
+            "{",
+            "   var g = 1;",
+            "   var f = func () { return g; };",
+            "   f();",  // We must fail here
+            "}",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "functions don't see outer scope except global (generic return)",
+        {
+            "{",
+            "   var g = 1;",
+            "   var f = func () { { return g; } };",
+            "   f();",  // We must fail here
+            "}",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "function return (direct)",
+        {
+            "{",
+            "   var f = func () { return 123; };",
+            "   assert(f() == 123);",
+            "}",
+        },
+    },
+
+    {
+        "function return (generic)",
+        {
+            "{",
+            "   var f = func () { { return 123; } };",
+            "   assert(f() == 123);",
+            "}",
+        },
+    },
+
+    {
+        "Undefined (and unused) variable",
+        {
+            "a;"
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
 };
 
 static void

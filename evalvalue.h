@@ -369,7 +369,55 @@ inline EvalValue::~EvalValue()
 
 // ---------------------------------------------------------------
 
-EvalValue RValue(const EvalValue &v);
+
+
+class LValue {
+
+    EvalValue val;
+
+    void type_checks() const {
+        assert(val.get_type()->t != Type::t_lval);
+        assert(val.get_type()->t != Type::t_undefid);
+    }
+
+public:
+
+    const bool is_const;
+
+    LValue(const EvalValue &val, bool is_const = false)
+        : val(val)
+        , is_const(is_const)
+    {
+        type_checks();
+    }
+
+    LValue(EvalValue &&val, bool is_const = false)
+        : val(move(val))
+        , is_const(is_const)
+    {
+        type_checks();
+    }
+
+    void put(const EvalValue &v) { val = v; type_checks(); }
+    void put(EvalValue &&v) { val = move(v); type_checks(); }
+
+    const EvalValue &get() const { return val; }
+
+    template <class T>
+    bool is() const { return val.is<T>(); }
+};
+
+inline EvalValue
+RValue(const EvalValue &v)
+{
+    if (v.is<LValue *>())
+        return v.get<LValue *>()->get();
+
+    if (v.is<UndefinedId>())
+        throw UndefinedVariableEx(v.get<UndefinedId>().id);
+
+    return v;
+}
 
 inline bool
 is_true(const EvalValue &v)

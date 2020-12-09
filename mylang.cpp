@@ -166,7 +166,7 @@ dumpLocInError(const Exception &e)
         cout << "    " << string(e.loc_start.col - 1, ' ');
 
         if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
-            cout << string(e.loc_end.col - e.loc_start.col - 1, '^');
+            cout << string(max(1, e.loc_end.col - e.loc_start.col - 1), '^');
         else
             cout << "^";
     }

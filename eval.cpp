@@ -125,18 +125,6 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     }
 }
 
-EvalValue
-RValue(const EvalValue &v)
-{
-    if (v.is<LValue *>())
-        return v.get<LValue *>()->get();
-
-    if (v.is<UndefinedId>())
-        throw UndefinedVariableEx{v.get<UndefinedId>().id};
-
-    return v;
-}
-
 EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 {
     try {
@@ -173,6 +161,20 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 }
 
 struct ReturnEx { EvalValue value; };
+
+static inline EvalValue
+do_func_return(EvalValue &&tmp, Construct *retExpr)
+{
+    if (tmp.is<UndefinedId>()) {
+        throw UndefinedVariableEx(
+            tmp.get<UndefinedId>().id,
+            retExpr->start,
+            retExpr->end
+        );
+    }
+
+    return RValue(tmp);
+}
 
 static EvalValue
 do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
@@ -211,7 +213,11 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
                     /* Optimization: skip ReturnEx and eval the result directly */
                     ReturnStmt *ret = dynamic_cast<ReturnStmt *>(e.get());
                     assert(ret != nullptr);
-                    return ret->elem->eval(&args_ctx);
+
+                    return do_func_return(
+                        ret->elem->eval(&args_ctx),
+                        ret->elem.get()
+                    );
                 }
 
                 e->eval(&args_ctx);
@@ -219,7 +225,10 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
 
         } else {
 
-            return obj.func->body->eval(&args_ctx);
+            return do_func_return(
+                obj.func->body->eval(&args_ctx),
+                obj.func->body.get()
+            );
         }
 
     } catch (ReturnEx &ret) {
@@ -593,15 +602,20 @@ EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw ReturnEx{ elem->eval(ctx) };
+    throw ReturnEx{ RValue(elem->eval(ctx)) };
 }
 
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalContext curr(ctx, ctx ? ctx->const_ctx : false);
 
-    for (const auto &e: elems)
-        e->eval(&curr);
+    for (const auto &e: elems) {
+
+        EvalValue &&tmp = e->eval(&curr);
+
+        if (tmp.is<UndefinedId>())
+            throw UndefinedVariableEx(tmp.get<UndefinedId>().id, e->start, e->end);
+    }
 
     return EvalValue();
 }

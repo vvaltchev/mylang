@@ -6,42 +6,6 @@
 
 using namespace std;
 
-class LValue {
-
-    EvalValue val;
-
-    void type_checks() const {
-        assert(val.get_type()->t != Type::t_lval);
-        assert(val.get_type()->t != Type::t_undefid);
-    }
-
-public:
-
-    const bool is_const;
-
-    LValue(const EvalValue &val, bool is_const = false)
-        : val(val)
-        , is_const(is_const)
-    {
-        type_checks();
-    }
-
-    LValue(EvalValue &&val, bool is_const = false)
-        : val(move(val))
-        , is_const(is_const)
-    {
-        type_checks();
-    }
-
-    void put(const EvalValue &v) { val = v; type_checks(); }
-    void put(EvalValue &&v) { val = move(v); type_checks(); }
-
-    const EvalValue &get() const { return val; }
-
-    template <class T>
-    bool is() const { return val.is<T>(); }
-};
-
 class EvalContext {
 
 public:
