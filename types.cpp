@@ -6,14 +6,13 @@
 #include "type_str.cpp.h"
 #include "type_func.cpp.h"
 
-EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
 {
-    for (const auto &e: exprList->elems) {
-        cout << RValue(e->eval(ctx)) << " ";
-    }
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    cout << endl;
-    return EvalValue();
+    Construct *arg = exprList->elems[0].get();
+    return !arg->eval(ctx).is<UndefinedId>();
 }
 
 EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
@@ -25,13 +24,25 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
     return e.get_type()->len(e);
 }
 
-EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    return !arg->eval(ctx).is<UndefinedId>();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (!val.is<SharedStrWrapper>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    try {
+
+        return stol(val.get<SharedStrWrapper>().get());
+
+    } catch (...) {
+
+        throw TypeErrorEx(arg->start, arg->end);
+    }
 }
 
 EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
@@ -42,6 +53,16 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
     string &&s = e.get_type()->to_string(e);
     return SharedStrWrapper(make_shared<string>(s));
+}
+
+EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
+{
+    for (const auto &e: exprList->elems) {
+        cout << RValue(e->eval(ctx)) << " ";
+    }
+
+    cout << endl;
+    return EvalValue();
 }
 
 EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
@@ -91,9 +112,10 @@ const array<Type *, Type::t_count> AllTypes = {
 
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
+    make_pair("defined", LValue(Builtin{builtin_defined})),
     make_pair("len", LValue(Builtin{builtin_len})),
     make_pair("str", LValue(Builtin{builtin_str})),
-    make_pair("defined", LValue(Builtin{builtin_defined})),
+    make_pair("int", LValue(Builtin{builtin_int})),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
