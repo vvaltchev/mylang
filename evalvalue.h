@@ -3,6 +3,8 @@
 #pragma once
 #include "errors.h"
 #include <string_view>
+#include <string>
+#include <memory>
 #include <array>
 #include <cassert>
 #include <cstddef>

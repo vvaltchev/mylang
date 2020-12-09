@@ -26,3 +26,22 @@ public:
     static const SymbolsType builtins;
     static const SymbolsType const_builtins;
 };
+
+inline EvalContext *
+get_root_ctx(EvalContext *ctx)
+{
+    while (ctx->parent)
+        ctx = ctx->parent;
+
+    return ctx;
+}
+
+class FuncObject {
+
+public:
+
+    const FuncDeclStmt *const func;
+    EvalContext capture_ctx;
+
+    FuncObject(const FuncDeclStmt *func, EvalContext *ctx);
+};
