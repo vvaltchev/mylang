@@ -130,42 +130,31 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
 
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
-    const EvalValue &id_val = id->eval(ctx);
+    const EvalValue &callable = RValue(what->eval(ctx));
 
-    if (id_val.is<UndefinedId>())
-        throw UndefinedVariableEx(id->value, id->start, id->end);
+    try {
 
-    if (id_val.is<LValue *>()) {
+        if (callable.is<Builtin>())
+            return callable.get<Builtin>().func(ctx, args.get());
 
-        const EvalValue &callable = id_val.get<LValue *>()->get();
-
-        if (callable.is<UndefinedId>())
-            throw UndefinedVariableEx(id->value, id->start, id->end);
-
-        try {
-
-            if (callable.is<Builtin>())
-                return callable.get<Builtin>().func(ctx, args.get());
-
-            if (callable.is<SharedFuncObjWrapper>()) {
-                return do_func_call(
-                    ctx,
-                    callable.get<SharedFuncObjWrapper>().get(),
-                    args.get()
-                );
-            }
-
-        } catch (Exception &e) {
-
-            if (!e.loc_start) {
-                e.loc_start = args->start;
-                e.loc_end = args->end;
-            }
-            throw;
+        if (callable.is<SharedFuncObjWrapper>()) {
+            return do_func_call(
+                ctx,
+                callable.get<SharedFuncObjWrapper>().get(),
+                args.get()
+            );
         }
+
+    } catch (Exception &e) {
+
+        if (!e.loc_start) {
+            e.loc_start = args->start;
+            e.loc_end = args->end;
+        }
+        throw;
     }
 
-    throw NotCallableEx(id->start, id->end);
+    throw NotCallableEx(what->start, what->end);
 }
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const

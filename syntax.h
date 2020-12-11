@@ -238,7 +238,7 @@ public:
 class CallExpr : public Construct {
 
 public:
-    unique_ptr<Identifier> id;
+    unique_ptr<Construct> what;
     unique_ptr<ExprList> args;
 
     CallExpr() : Construct("CallExpr") { }

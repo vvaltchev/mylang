@@ -593,6 +593,24 @@ static const vector<test> tests =
         &typeid(UndefinedVariableEx),
     },
 
+    {
+        "Use expressions as callable objects",
+        {
+            "assert((func (a) => a+1)(2) == 3);",
+        },
+    },
+
+    {
+        "Call function returned by other function in expr",
+        {
+            "func getfunc(v) {",
+            "   var f = func [v] (a) => a+v;",
+            "   return f;",
+            "}",
+            "",
+            "assert((getfunc(3))(2) == 5);",
+        },
+    },
 };
 
 static void

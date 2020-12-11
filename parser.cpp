@@ -228,7 +228,7 @@ pList(ParseContext &c,
 
 bool
 pAcceptCallExpr(ParseContext &c,
-                unique_ptr<Construct> &id,
+                unique_ptr<Construct> &what,
                 unique_ptr<Construct> &ret,
                 unsigned fl)
 {
@@ -236,11 +236,11 @@ pAcceptCallExpr(ParseContext &c,
 
         unique_ptr<CallExpr> expr(new CallExpr);
 
-        expr->start = id->start;
-        expr->id.reset(static_cast<Identifier *>(id.release()));
+        expr->start = what->start;
+        expr->what = move(what);
         expr->args = pList<ExprList>(c, fl, pExpr14);
 
-        if (c.const_eval && expr->id->is_const && expr->args->is_const) {
+        if (c.const_eval && expr->what->is_const && expr->args->is_const) {
 
             if (!MakeConstructFromConstVal(expr->eval(c.const_ctx), ret)) {
 
@@ -273,45 +273,49 @@ pExpr01(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> ret;
     unique_ptr<Construct> main;
-    unique_ptr<Construct> callExpr;
+    unique_ptr<Construct> otherExpr;
     const Loc start = c.get_loc();
 
     if (pAcceptLiteralInt(c, main)) {
 
         ret = move(main);
         ret->is_const = true;
-
-    } else if (pAcceptLiteralStr(c, main)) {
-
-        ret = move(main);
-        ret->is_const = true;
+        return ret;
 
     } else if (pAcceptKeyword(c, Keyword::kw_none)) {
 
         ret.reset(new LiteralNone());
         ret->start = start;
         ret->end = c.get_loc();
+        return ret;
+    }
+
+    if (pAcceptLiteralStr(c, main)) {
+
+        main->is_const = true;
 
     } else if (pAcceptOp(c, Op::parenL)) {
 
-        ret = pExprTop(c, fl);
+        main = pExprTop(c, fl);
 
-        if (!ret)
+        if (!main)
             noExprError(c);
 
         pExpectOp(c, Op::parenR);
 
     } else if (pAcceptId(c, main)) {
 
-        if (pAcceptCallExpr(c, main, callExpr, fl))
-            ret = move(callExpr);
-        else
-            ret = move(main);
+        /* Do nothing */
 
     } else {
 
         return nullptr;
     }
+
+    if (pAcceptCallExpr(c, main, otherExpr, fl))
+        ret = move(otherExpr);
+    else
+        ret = move(main);
 
     return ret;
 }

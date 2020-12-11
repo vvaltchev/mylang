@@ -222,7 +222,7 @@ void CallExpr::serialize(ostream &s, int level) const
     s << indent;
     s << name << "(\n";
 
-    id->serialize(s, level + 1);
+    what->serialize(s, level + 1);
     s << endl;
     args->serialize(s, level + 1);
     s << endl;
