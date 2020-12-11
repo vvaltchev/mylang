@@ -268,6 +268,30 @@ pAcceptCallExpr(ParseContext &c,
     return false;
 }
 
+bool
+pAcceptSubscript(ParseContext &c,
+                 unique_ptr<Construct> &what,
+                 unique_ptr<Construct> &ret,
+                 unsigned fl)
+{
+    if (pAcceptOp(c, Op::bracketL)) {
+
+        unique_ptr<Subscript> s(new Subscript);
+
+        s->what = move(what);
+        s->index = pExprTop(c, fl);
+
+        if (!s->index)
+            noExprError(c);
+
+        pExpectOp(c, Op::bracketR);
+        ret = move(s);
+        return true;
+    }
+
+    return false;
+}
+
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
@@ -279,15 +303,14 @@ pExpr01(ParseContext &c, unsigned fl)
     if (pAcceptLiteralInt(c, main)) {
 
         ret = move(main);
-        ret->is_const = true;
-        return ret;
+        return ret;     /* Not subscriptable, nor callable */
 
     } else if (pAcceptKeyword(c, Keyword::kw_none)) {
 
         ret.reset(new LiteralNone());
         ret->start = start;
         ret->end = c.get_loc();
-        return ret;
+        return ret;     /* Not subscriptable, nor callable */
     }
 
     if (pAcceptLiteralStr(c, main)) {
@@ -313,6 +336,8 @@ pExpr01(ParseContext &c, unsigned fl)
     }
 
     if (pAcceptCallExpr(c, main, otherExpr, fl))
+        ret = move(otherExpr);
+    else if (pAcceptSubscript(c, main, otherExpr, fl))
         ret = move(otherExpr);
     else
         ret = move(main);

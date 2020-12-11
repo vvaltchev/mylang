@@ -37,6 +37,7 @@ enum class Op : int {
     bracketL    = 30,
     bracketR    = 31,
     arrow       = 32, // =>
+    colon       = 33,
 
-    op_count    = 33,
+    op_count    = 34,
 };

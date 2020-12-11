@@ -61,6 +61,7 @@ static const array<string, (int)Op::op_count> OpString =
     "[",
     "]",
     "=>",
+    ":",
 };
 
 enum class Keyword : int {

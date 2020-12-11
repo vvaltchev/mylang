@@ -546,3 +546,8 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
     return func;
 }
+
+EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
+{
+    return 1234;
+}

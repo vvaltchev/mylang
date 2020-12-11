@@ -369,3 +369,17 @@ void ReturnStmt::serialize(ostream &s, int level) const
 {
     generic_single_child_serialize(name, elem, s, level);
 }
+
+void Subscript::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+    what->serialize(s, level+1);
+    s << endl;
+    index->serialize(s, level+1);
+    s << endl;
+    s << indent;
+    s << ")";
+}

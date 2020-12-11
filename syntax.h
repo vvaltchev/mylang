@@ -403,3 +403,15 @@ public:
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
     virtual void serialize(ostream &s, int level = 0) const;
 };
+
+class Subscript : public Construct {
+
+public:
+
+    unique_ptr<Construct> what;
+    unique_ptr<Construct> index;
+
+    Subscript() : Construct("Subscript") { }
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    virtual void serialize(ostream &s, int level = 0) const;
+};
