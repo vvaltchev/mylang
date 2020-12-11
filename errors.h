@@ -85,6 +85,7 @@ DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
 DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_SIMPLE_EX(TypeErrorEx, "Type error")
 DECL_SIMPLE_EX(NotCallableEx, "Not a callable object")
+DECL_SIMPLE_EX(OutOfBoundsEx, "Out of bounds error")
 
 struct UndefinedVariableEx : public Exception {
 

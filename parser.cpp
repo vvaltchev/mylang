@@ -284,6 +284,9 @@ pAcceptSubscript(ParseContext &c,
         if (!s->index)
             noExprError(c);
 
+        if (s->what->is_const && s->index->is_const)
+            s->is_const = true;
+
         pExpectOp(c, Op::bracketR);
         ret = move(s);
         return true;

@@ -611,6 +611,51 @@ static const vector<test> tests =
             "assert((getfunc(3))(2) == 5);",
         },
     },
+
+    {
+        "String subscript operator",
+        {
+            "var s=\"abc\";",
+            "assert(s[0] == \"a\");",
+            "assert(s[1] == \"b\");",
+            "assert(s[2] == \"c\");",
+        }
+    },
+
+    {
+        "String subscript operator (neg index)",
+        {
+            "var s=\"abc\";",
+            "assert(s[-1] == \"c\");",
+            "assert(s[-2] == \"b\");",
+            "assert(s[-3] == \"a\");",
+        }
+    },
+
+    {
+        "String subscript operator, out of bounds",
+        {
+            "var s=\"abc\";",
+            "s[3];",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
+        "String subscript operator, out of bounds, neg",
+        {
+            "var s=\"abc\";",
+            "s[-4];",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
+        "String subscript operator, literal string",
+        {
+            "assert(\"abc\"[1] == \"b\");"
+        },
+    },
 };
 
 static void

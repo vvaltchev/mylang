@@ -71,6 +71,7 @@ public:
     virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
     virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
     virtual long len(const EvalValue &a) { throw TypeErrorEx(); }
+    virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
 
     /* Helper functions for our custom variant */
 
@@ -164,6 +165,10 @@ public:
 
 ostream &operator<<(ostream &s, const EvalValue &c);
 
+inline EvalValue Type::subscript(const EvalValue &what, const EvalValue &idx)
+{
+    throw TypeErrorEx();
+}
 
 template <>
 inline bool EvalValue::is<NoneVal>() const { return type->t == Type::t_none; }

@@ -28,11 +28,11 @@ class SharedStr {
         return const_cast<SharedStr *>(this)->str.use_count();
     }
 
+public:
+
     SharedVal<string> str;
     unsigned off;   /* NOTE: cannot be const because we're using this in a union */
-    unsigned len;  /* NOTE: cannot be const because we're using this in a union */
-
-public:
+    unsigned len;   /* NOTE: cannot be const because we're using this in a union */
 
     typedef string inner_type;
 
@@ -50,7 +50,7 @@ public:
         return string_view(get_ref().data() + off, len);
     }
 
-    size_t size() const {
+    unsigned size() const {
         return const_cast<SharedStr *>(this)->len;
     }
 

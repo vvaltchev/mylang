@@ -549,5 +549,6 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
 {
-    return 1234;
+    const EvalValue &what_val = RValue(what->eval(ctx));
+    return what_val.get_type()->subscript(what_val, RValue(index->eval(ctx)));
 }

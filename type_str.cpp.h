@@ -50,6 +50,7 @@ public:
     virtual void ge(EvalValue &a, const EvalValue &b);
     virtual void eq(EvalValue &a, const EvalValue &b);
     virtual void noteq(EvalValue &a, const EvalValue &b);
+    virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
 
     virtual long len(const EvalValue &a) {
         return a.get<SharedStr>().size();
@@ -149,4 +150,31 @@ void TypeStr::noteq(EvalValue &a, const EvalValue &b)
 
         a = true;
     }
+}
+
+EvalValue TypeStr::subscript(const EvalValue &what, const EvalValue &idx_val)
+{
+    if (!idx_val.is<long>())
+        throw TypeErrorEx();
+
+    const SharedStr &s = what.get<SharedStr>();
+    long idx = idx_val.get<long>();
+
+    if (idx < 0)
+        idx += s.size();
+
+    if (idx < 0 || idx >= s.size())
+        throw OutOfBoundsEx();
+
+    SharedStr s2;
+
+    /*
+     * Of course, we have to manually call the copy ctor because SharedStr is
+     * POD type, contaning the data of a non-trivial C++ type.
+     */
+    copy_ctor(&s2, &s);
+
+    s2.off = idx;
+    s2.len = 1;
+    return s2;
 }
