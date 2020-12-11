@@ -687,12 +687,15 @@ void run_tests()
 
     cout << "SUMMARY" << endl;
     cout << "===========================================" << endl;
-    cout << "Tests passed: " << pass_count << "/" << tests.size() << endl;
+    cout << "Tests passed: " << pass_count << "/" << tests.size() << " ";
 
 
-    if (pass_count != tests.size())
+    if (pass_count != tests.size()) {
+        cout << "[ FAIL ]" << endl;
         exit(1);
+    }
 
+    cout << "[ PASS ]" << endl;
     exit(0);
 }
 

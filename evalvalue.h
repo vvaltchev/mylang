@@ -3,6 +3,7 @@
 #pragma once
 #include "errors.h"
 #include "sharedval.h"
+#include "sharedstr.h"
 
 #include <string_view>
 #include <string>
@@ -20,12 +21,11 @@ class FuncDeclStmt;
 class EvalValue;
 class EvalContext;
 
+class FuncObject;
 struct NoneVal { };
 struct UndefinedId { string_view id; };
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
-class FuncObject;
 
-typedef SharedVal<string> SharedStrWrapper;
 typedef SharedVal<FuncObject> SharedFuncObjWrapper;
 
 class Type {
@@ -93,7 +93,7 @@ class EvalValue {
         UndefinedId undef;
         long ival;
         Builtin bfunc;
-        SharedStrWrapper str;
+        SharedStr str;
         SharedFuncObjWrapper func;
 
         ValueU() : ival(0) { }
@@ -117,8 +117,8 @@ public:
     EvalValue(LValue *val);
     EvalValue(const UndefinedId &val);
     EvalValue(const Builtin &val);
-    EvalValue(const SharedStrWrapper &val);
-    EvalValue(SharedStrWrapper &&val);
+    EvalValue(const SharedStr &val);
+    EvalValue(SharedStr &&val);
     EvalValue(const SharedFuncObjWrapper &val);
     EvalValue(SharedFuncObjWrapper &&val);
 
@@ -176,7 +176,7 @@ inline bool EvalValue::is<long>() const { return type->t == Type::t_int; }
 template <>
 inline bool EvalValue::is<Builtin>() const { return type->t == Type::Type::t_builtin; }
 template <>
-inline bool EvalValue::is<SharedStrWrapper>() const { return type->t == Type::t_str; }
+inline bool EvalValue::is<SharedStr>() const { return type->t == Type::t_str; }
 template <>
 inline bool EvalValue::is<SharedFuncObjWrapper>() const { return type->t == Type::t_func; }
 
@@ -196,7 +196,7 @@ inline EvalValue::EvalValue(long val)
 inline EvalValue::EvalValue(const Builtin &val)
     : val(val), type(AllTypes[Type::Type::t_builtin]) { }
 
-inline EvalValue::EvalValue(const SharedStrWrapper &v)
+inline EvalValue::EvalValue(const SharedStr &v)
     : type(AllTypes[Type::t_str])
 {
     type->copy_ctor(
@@ -205,7 +205,7 @@ inline EvalValue::EvalValue(const SharedStrWrapper &v)
     );
 }
 
-inline EvalValue::EvalValue(SharedStrWrapper &&v)
+inline EvalValue::EvalValue(SharedStr &&v)
     : type(AllTypes[Type::t_str])
 {
     type->move_ctor(

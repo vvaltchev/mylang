@@ -33,12 +33,12 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &val = RValue(arg->eval(ctx));
 
-    if (!val.is<SharedStrWrapper>())
+    if (!val.is<SharedStr>())
         throw TypeErrorEx(arg->start, arg->end);
 
     try {
 
-        return stol(val.get<SharedStrWrapper>().get());
+        return stol(string(val.get<SharedStr>().get_view()));
 
     } catch (...) {
 
@@ -54,9 +54,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    return SharedStrWrapper(
-        make_shared<string>(e.get_type()->to_string(e))
-    );
+    return SharedStr(e.get_type()->to_string(e));
 }
 
 EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)

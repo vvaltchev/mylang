@@ -10,11 +10,37 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-class TypeStr : public SharedType<SharedStrWrapper> {
+SharedStr::SharedStr(string &&s)
+    : str(make_shared<string>(move(s)))
+    , off(0)
+    , len(get_ref().size())
+{
+}
+
+void SharedStr::append(const string_view &s)
+{
+    if (use_count() == 1 && off == 0 && len == get_ref().size()) {
+
+        get_ref() += s;
+        len += s.length();
+
+    } else {
+
+        string new_str;
+        new_str.reserve(len + s.size());
+        new_str += get_view();
+        new_str += s;
+
+        str = SharedVal<string>(make_shared<string>(move(new_str)));
+        len = get_ref().size();
+    }
+}
+
+class TypeStr : public SharedType<SharedStr> {
 
 public:
 
-    TypeStr() : SharedType<SharedStrWrapper>(Type::t_str) { }
+    TypeStr() : SharedType<SharedStr>(Type::t_str) { }
 
     virtual void add(EvalValue &a, const EvalValue &b);
     virtual void mul(EvalValue &a, const EvalValue &b);
@@ -26,36 +52,22 @@ public:
     virtual void noteq(EvalValue &a, const EvalValue &b);
 
     virtual long len(const EvalValue &a) {
-        return a.get<SharedStrWrapper>().get().size();
+        return a.get<SharedStr>().size();
     }
 
     virtual string to_string(const EvalValue &a) {
-        return a.get<SharedStrWrapper>().get();
+        return string(a.get<SharedStr>().get_view());
     }
 };
 
 void TypeStr::add(EvalValue &a, const EvalValue &b)
 {
-    SharedStrWrapper &lval = a.get<SharedStrWrapper>();
+    SharedStr &lval = a.get<SharedStr>();
 
-    if (lval.use_count() > 1) {
-
-        string new_str;
-
-        if (b.is<SharedStrWrapper>())
-            new_str = lval.get() + b.get<SharedStrWrapper>().get();
-        else
-            new_str = lval.get() + b.get_type()->to_string(b);
-
-        a = SharedStrWrapper(make_shared<string>(move(new_str)));
-
-    } else {
-
-        if (b.is<SharedStrWrapper>())
-            lval.get() += b.get<SharedStrWrapper>().get();
-        else
-            lval.get() += b.get_type()->to_string(b);
-    }
+    if (b.is<SharedStr>())
+        lval.append(b.get<SharedStr>().get_view());
+    else
+        lval.append(b.get_type()->to_string(b));
 }
 
 void TypeStr::mul(EvalValue &a, const EvalValue &b)
@@ -64,61 +76,62 @@ void TypeStr::mul(EvalValue &a, const EvalValue &b)
         throw TypeErrorEx();
 
     string new_str;
-    const string &s = a.get<SharedStrWrapper>().get();
+    const string_view &s = a.get<SharedStr>().get_view();
     const long n = b.get<long>();
+    new_str.reserve(s.size() * n);
 
     for (long i = 0; i < n; i++) {
         new_str += s;
     }
 
-    a = SharedStrWrapper(make_shared<string>(move(new_str)));
+    a = SharedStr(move(new_str));
 }
 
 void TypeStr::lt(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStrWrapper>())
+    if (!b.is<SharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStrWrapper>().get() < b.get<SharedStrWrapper>().get()
+        a.get<SharedStr>().get_view() < b.get<SharedStr>().get_view()
     );
 }
 
 void TypeStr::gt(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStrWrapper>())
+    if (!b.is<SharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStrWrapper>().get() > b.get<SharedStrWrapper>().get()
+        a.get<SharedStr>().get_view() > b.get<SharedStr>().get_view()
     );
 }
 
 void TypeStr::le(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStrWrapper>())
+    if (!b.is<SharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStrWrapper>().get() <= b.get<SharedStrWrapper>().get()
+        a.get<SharedStr>().get_view() <= b.get<SharedStr>().get_view()
     );
 }
 
 void TypeStr::ge(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStrWrapper>())
+    if (!b.is<SharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStrWrapper>().get() >= b.get<SharedStrWrapper>().get()
+        a.get<SharedStr>().get_view() >= b.get<SharedStr>().get_view()
     );
 }
 
 void TypeStr::eq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<SharedStrWrapper>()) {
+    if (b.is<SharedStr>()) {
 
-        a = a.get<SharedStrWrapper>().get() == b.get<SharedStrWrapper>().get();
+        a = a.get<SharedStr>().get_view() == b.get<SharedStr>().get_view();
 
     } else {
 
@@ -128,9 +141,9 @@ void TypeStr::eq(EvalValue &a, const EvalValue &b)
 
 void TypeStr::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<SharedStrWrapper>()) {
+    if (b.is<SharedStr>()) {
 
-        a = a.get<SharedStrWrapper>().get() != b.get<SharedStrWrapper>().get();
+        a = a.get<SharedStr>().get_view() != b.get<SharedStr>().get_view();
 
     } else {
 

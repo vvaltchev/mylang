@@ -29,7 +29,7 @@ class SharedVal {
 
 public:
 
-    typedef T type;
+    typedef T inner_type;
 
     char data[sizeof(shared_ptr<T>)] alignas(shared_ptr<T>);
 

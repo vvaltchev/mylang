@@ -890,7 +890,7 @@ MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out)
         return true;
     }
 
-    if (v.is<SharedStrWrapper>()) {
+    if (v.is<SharedStr>()) {
         out = make_unique<LiteralStr>(v);
         return true;
     }
