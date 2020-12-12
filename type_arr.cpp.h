@@ -28,8 +28,8 @@ public:
     virtual void noteq(EvalValue &a, const EvalValue &b);
     virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
     virtual EvalValue slice(const EvalValue &what,
-                             const EvalValue &start,
-                             const EvalValue &end);
+                            const EvalValue &start,
+                            const EvalValue &end);
 
     virtual long len(const EvalValue &a) {
         return a.get<SharedArray>().size();

@@ -772,6 +772,79 @@ static const vector<test> tests =
             "assert(sub == \"hello john\");",
         },
     },
+
+    {
+        "Simple array",
+        {
+            "var s = [1,2,3,\"a\",\"b\",\"c\"];",
+            "assert(s[0] == 1);",
+            "assert(s[-1] == \"c\");",
+        },
+    },
+
+    {
+        "Simple array, const",
+        {
+            "const s = [1,2,3,\"a\",\"b\",\"c\"];",
+            "assert(s[0] == 1);",
+            "assert(s[-1] == \"c\");",
+        },
+    },
+
+    {
+        "Array slices",
+        {
+            "var s = [1,2,3,\"a\",\"b\",\"c\"];",
+            "assert(s[1:3] == [2,3]);",
+            "assert(s[-2:] == [\"b\", \"c\"]);",
+        },
+    },
+
+    {
+        "Slices of array slices",
+        {
+            "var s = [1,2,3,\"a\",\"b\",\"c\"];",
+            "var sub = s[1:5];",
+            "assert(sub == [2,3,\"a\",\"b\"]);",
+            "assert(sub[0] == 2);",
+            "assert(sub[-1] == \"b\");",
+            "assert(sub[2:] == [\"a\", \"b\"]);",
+            "assert(sub[-3:] == [3,\"a\",\"b\"]);",
+            "assert(sub[1:2] == [3]);",
+        },
+    },
+
+    {
+        "Array append",
+        {
+            "var s = [1,2,3];",
+            "s += [4];",
+            "assert(s == [1,2,3,4]);",
+        },
+    },
+
+    {
+        "Append in slice of array",
+        {
+            "var s = [1,2,3];",
+            "var sub = s[1:];",
+            "sub += [99,100];",
+            "assert(sub == [2,3,99,100]);",
+            "assert(s == [1,2,3]);",
+        },
+    },
+
+    {
+        "Modify elements of array",
+        {
+            "var s = [1,2,3,4];",
+            "var sub = s[1:3];",
+            "assert(sub == [2,3]);",
+            "s[1] = 20;",
+            "assert(s == [1,20,3,4]);",
+            "assert(sub == [20,3]);",   // side effect: should be keep it?
+        },
+    },
 };
 
 static void
