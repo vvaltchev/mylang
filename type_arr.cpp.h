@@ -24,8 +24,8 @@ public:
     TypeArr() : SharedType<SharedArray>(Type::t_arr) { }
 
     virtual void add(EvalValue &a, const EvalValue &b);
-    // virtual void eq(EvalValue &a, const EvalValue &b);
-    // virtual void noteq(EvalValue &a, const EvalValue &b);
+    virtual void eq(EvalValue &a, const EvalValue &b);
+    virtual void noteq(EvalValue &a, const EvalValue &b);
     virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
     virtual EvalValue slice(const EvalValue &what,
                              const EvalValue &start,
@@ -81,6 +81,49 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
         lval.off = 0;
         lval.len = lval.get_ref().size();
     }
+}
+
+void TypeArr::eq(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<SharedArray>()) {
+        a = false;
+        return;
+    }
+
+    const SharedArray &lhs = a.get<SharedArray>();
+    const SharedArray &rhs = b.get<SharedArray>();
+
+    if (lhs.len != rhs.len) {
+        a = false;
+        return;
+    }
+
+    if (&lhs.get_ref() == &rhs.get_ref()) {
+        /* Same vector, now just check the offsets */
+        a = lhs.off == rhs.off;
+        return;
+    }
+
+    for (unsigned i = 0; i < lhs.len; i++) {
+
+        EvalValue &&obj_a = lhs.get_ref()[lhs.off + i].get_rval();
+        const EvalValue &obj_b = rhs.get_ref()[rhs.off + i].get();
+
+        obj_a.get_type()->eq(obj_a, obj_b);
+
+        if (!obj_a.get<long>()) {
+            a = false;
+            return;
+        }
+    }
+
+    a = true;
+}
+
+void TypeArr::noteq(EvalValue &a, const EvalValue &b)
+{
+    eq(a, b);
+    a = !a.get<long>();
 }
 
 string TypeArr::to_string(const EvalValue &a)

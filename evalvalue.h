@@ -452,6 +452,7 @@ public:
     void put(EvalValue &&v) { val = move(v); type_checks(); }
 
     const EvalValue &get() const { return val; }
+    EvalValue get_rval() const { return val; }
 
     template <class T>
     T &getval() { return val.get<T>(); }
