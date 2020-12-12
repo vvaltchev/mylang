@@ -31,7 +31,7 @@ public:
 
     typedef T inner_type;
 
-    char data[sizeof(shared_ptr<T>)] alignas(shared_ptr<T>);
+    alignas(shared_ptr<T>) char data[sizeof(shared_ptr<T>)];
 
     SharedVal() = default;
 

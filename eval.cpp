@@ -195,7 +195,7 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
             throw InternalErrorEx();
     }
 
-    return val;
+    return move(val);
 }
 
 EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
@@ -221,7 +221,7 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return val;
+    return move(val);
 }
 
 EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
@@ -244,7 +244,7 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return val;
+    return move(val);
 }
 
 EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
@@ -273,7 +273,7 @@ EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return val;
+    return move(val);
 }
 
 EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
@@ -296,7 +296,7 @@ EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return val;
+    return move(val);
 }
 
 EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
@@ -316,7 +316,7 @@ EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return val;
+    return move(val);
 }
 
 EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
@@ -336,7 +336,7 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return val;
+    return move(val);
 }
 
 static EvalValue
