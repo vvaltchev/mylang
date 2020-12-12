@@ -175,11 +175,13 @@ EvalValue TypeStr::subscript(const EvalValue &what, const EvalValue &idx_val)
 
     /*
      * Of course, we have to manually call the copy ctor because SharedStr is
-     * POD type, contaning the data of a non-trivial C++ type.
+     * a POD type, contaning the data of a non-trivial C++ type and, we cannot
+     * implement the copy ctor, move ctor etc. in SharedStr, otherwise it won't
+     * be a POD type anymore, so it won't be accepted in EvalValue's union.
      */
     copy_ctor(&s2, &s);
 
-    s2.off = idx;
+    s2.off += idx;
     s2.len = 1;
     return s2;
 }
@@ -230,8 +232,8 @@ EvalValue TypeStr::slice(const EvalValue &what,
     }
 
     SharedStr s2;
-    copy_ctor(&s2, &s);
-    s2.off = start;
+    copy_ctor(&s2, &s); /* See TypeStr::subscript */
+    s2.off += start;
     s2.len = end - start;
     return s2;
 }

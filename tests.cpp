@@ -656,6 +656,110 @@ static const vector<test> tests =
             "assert(\"abc\"[1] == \"b\");"
         },
     },
+
+    {
+        "Slice operator, regular",
+        {
+            "const s=\"abc\";",
+            "assert(s[1:2] == \"b\");"
+        },
+    },
+
+    {
+        "Slice operator, just start",
+        {
+            "const s=\"abc\";",
+            "assert(s[1:] == \"bc\");"
+        },
+    },
+
+    {
+        "Slice operator, just end",
+        {
+            "const s=\"abc\";",
+            "assert(s[:2] == \"ab\");"
+        },
+    },
+
+    {
+        "Slice operator, neg start, no end",
+        {
+            "const s=\"abc\";",
+            "assert(s[-2:] == \"bc\");"
+        },
+    },
+
+    {
+        "Slice operator, neg start, neg end",
+        {
+            "const s=\"abc\";",
+            "assert(s[-3:-1] == \"ab\");"
+        },
+    },
+
+    {
+        "Slice operator, out of bounds, stop",
+        {
+            "const s=\"abc\";",
+            "assert(s[0:10] == \"abc\");"
+        },
+    },
+
+    {
+        "Slice operator, out of bounds, start",
+        {
+            "const s=\"abc\";",
+            "assert(s[-10:10] == \"abc\");"
+        },
+    },
+
+    {
+        "Slice operator, out of bounds, start and end",
+        {
+            "const s=\"abc\";",
+            "assert(s[10:20] == \"\");"
+        },
+    },
+
+    {
+        "Slice operator, out of bounds, neg start, neg end",
+        {
+            "const s=\"abc\";",
+            "assert(s[-10:-20] == \"\");"
+        },
+    },
+
+    {
+        "Slice operator, out of bounds, start == end",
+        {
+            "const s=\"abc\";",
+            "assert(s[1:1] == \"\");"
+        },
+    },
+
+    {
+        "Slice operator, out of bounds, start > end",
+        {
+            "const s=\"abc\";",
+            "assert(s[2:1] == \"\");"
+        },
+    },
+
+    {
+        "Subscript and splice over slice of string",
+        {
+            "const s=\"hello world, john!\";",
+            "const sub=s[6:11];",
+            "assert(sub == \"world\");",
+            "assert(len(sub) == 5);",
+            "assert(sub[0] == \"w\");",
+            "assert(sub[4] == \"d\");",
+            "assert(sub[-1] == \"d\");",
+            "assert(sub[-100:] == \"world\");",
+            "assert(sub[1:] == \"orld\");",
+            "assert(sub[:2] == \"wo\");",
+        },
+    },
 };
 
 static void
