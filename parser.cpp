@@ -276,19 +276,41 @@ pAcceptSubscript(ParseContext &c,
 {
     if (pAcceptOp(c, Op::bracketL)) {
 
-        unique_ptr<Subscript> s(new Subscript);
+        unique_ptr<Construct> start = pExprTop(c, fl);
 
-        s->what = move(what);
-        s->index = pExprTop(c, fl);
+        if (pAcceptOp(c, Op::colon)) {
 
-        if (!s->index)
-            noExprError(c);
+            unique_ptr<Slice> s(new Slice);
 
-        if (s->what->is_const && s->index->is_const)
-            s->is_const = true;
+            s->what = move(what);
+            s->start_idx = move(start);
+            s->end_idx = pExprTop(c, fl);
+
+            if (s->what->is_const) {
+                if (s->start_idx && s->start_idx->is_const)
+                    if (s->end_idx && s->end_idx->is_const)
+                        s->is_const = true;
+            }
+
+            ret = move(s);
+
+        } else {
+
+            unique_ptr<Subscript> s(new Subscript);
+
+            if (!start)
+                noExprError(c);
+
+            s->what = move(what);
+            s->index = move(start);
+
+            if (s->what->is_const && s->index->is_const)
+                s->is_const = true;
+
+            ret = move(s);
+        }
 
         pExpectOp(c, Op::bracketR);
-        ret = move(s);
         return true;
     }
 

@@ -383,3 +383,38 @@ void Subscript::serialize(ostream &s, int level) const
     s << indent;
     s << ")";
 }
+
+void Slice::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+    what->serialize(s, level+1);
+    s << endl;
+
+    if (start_idx) {
+
+        start_idx->serialize(s, level+1);
+        s << endl;
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoStartIndex>" << endl;
+    }
+
+    if (end_idx) {
+
+        end_idx->serialize(s, level+1);
+        s << endl;
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoEndIndex>" << endl;
+    }
+
+    s << indent;
+    s << ")";
+}

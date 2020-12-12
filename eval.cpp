@@ -552,3 +552,14 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
     const EvalValue &what_val = RValue(what->eval(ctx));
     return what_val.get_type()->subscript(what_val, RValue(index->eval(ctx)));
 }
+
+EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
+{
+    const EvalValue &what_val = RValue(what->eval(ctx));
+
+    return what_val.get_type()->slice(
+        what_val,
+        start_idx ? RValue(start_idx->eval(ctx)) : EvalValue(),
+        end_idx ? RValue(end_idx->eval(ctx)) : EvalValue()
+    );
+}

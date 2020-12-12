@@ -127,6 +127,8 @@ const array<Type *, Type::t_count> AllTypes = {
  * in AllTypes.
  */
 
+const EvalValue EvalValue::empty_str = SharedStr(string());
+
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     make_pair("defined", LValue(Builtin{builtin_defined})),

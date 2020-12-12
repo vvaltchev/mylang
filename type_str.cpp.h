@@ -51,6 +51,9 @@ public:
     virtual void eq(EvalValue &a, const EvalValue &b);
     virtual void noteq(EvalValue &a, const EvalValue &b);
     virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
+    virtual EvalValue slice(const EvalValue &what,
+                            const EvalValue &start,
+                            const EvalValue &end);
 
     virtual long len(const EvalValue &a) {
         return a.get<SharedStr>().size();
@@ -178,5 +181,57 @@ EvalValue TypeStr::subscript(const EvalValue &what, const EvalValue &idx_val)
 
     s2.off = idx;
     s2.len = 1;
+    return s2;
+}
+
+EvalValue TypeStr::slice(const EvalValue &what,
+                         const EvalValue &start_val,
+                         const EvalValue &end_val)
+{
+    const SharedStr &s = what.get<SharedStr>();
+    long start = 0, end = s.size();
+
+    if (start_val.is<long>()) {
+
+        start = start_val.get<long>();
+
+        if (start < 0) {
+
+            start += s.size();
+
+            if (start < 0)
+                start = 0;
+        }
+
+        if (start >= s.size())
+            return EvalValue::empty_str;
+
+    } else if (!start_val.is<NoneVal>()) {
+
+        throw TypeErrorEx();
+    }
+
+    if (end_val.is<long>()) {
+
+        end = end_val.get<long>();
+
+        if (end < 0)
+            end += s.size();
+
+        if (end <= start)
+            return EvalValue::empty_str;
+
+        if (end > s.size())
+            end = s.size();
+
+    } else if (!end_val.is<NoneVal>()) {
+
+        throw TypeErrorEx();
+    }
+
+    SharedStr s2;
+    copy_ctor(&s2, &s);
+    s2.off = start;
+    s2.len = end - start;
     return s2;
 }

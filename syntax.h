@@ -415,3 +415,16 @@ public:
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
     virtual void serialize(ostream &s, int level = 0) const;
 };
+
+class Slice : public Construct {
+
+public:
+
+    unique_ptr<Construct> what;
+    unique_ptr<Construct> start_idx;
+    unique_ptr<Construct> end_idx;
+
+    Slice() : Construct("Slice") { }
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    virtual void serialize(ostream &s, int level = 0) const;
+};

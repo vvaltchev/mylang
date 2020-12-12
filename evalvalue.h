@@ -72,6 +72,9 @@ public:
     virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
     virtual long len(const EvalValue &a) { throw TypeErrorEx(); }
     virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
+    virtual EvalValue slice(const EvalValue &what,
+                            const EvalValue &start,
+                            const EvalValue &end);
 
     /* Helper functions for our custom variant */
 
@@ -161,11 +164,20 @@ public:
 
     template <class T>
     bool is() const;
+
+    static const EvalValue empty_str;
 };
 
 ostream &operator<<(ostream &s, const EvalValue &c);
 
 inline EvalValue Type::subscript(const EvalValue &what, const EvalValue &idx)
+{
+    throw TypeErrorEx();
+}
+
+inline EvalValue Type::slice(const EvalValue &what,
+                             const EvalValue &start,
+                             const EvalValue &end)
 {
     throw TypeErrorEx();
 }
