@@ -49,7 +49,7 @@ public:
     virtual void copy_ctor(void *obj, const void *other) {
 
         if (S > sizeof(T)) {
-            memcpy(obj, other, S);
+            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 
         new (obj) T(*reinterpret_cast<const T *>(other));
@@ -58,7 +58,7 @@ public:
     virtual void move_ctor(void *obj, void *other) {
 
         if (S > sizeof(T)) {
-            memcpy(obj, other, S);
+            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 
         new (obj) T(move(*reinterpret_cast<T *>(other)));
@@ -67,7 +67,7 @@ public:
     virtual void copy_assign(void *obj, const void *other) {
 
         if (S > sizeof(T)) {
-            memcpy(obj, other, S);
+            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 
         *reinterpret_cast<T *>(obj) = *reinterpret_cast<const T *>(other);
@@ -76,7 +76,7 @@ public:
     virtual void move_assign(void *obj, void *other) {
 
         if (S > sizeof(T)) {
-            memcpy(obj, other, S);
+            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 
         *reinterpret_cast<T *>(obj) = move(*reinterpret_cast<T *>(other));
