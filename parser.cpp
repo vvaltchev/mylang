@@ -318,6 +318,12 @@ pAcceptSubscript(ParseContext &c,
 }
 
 unique_ptr<Construct>
+pArray(ParseContext &c, unsigned fl)
+{
+    return pList<LiteralArray>(c, fl, pExpr14);
+}
+
+unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> ret;
@@ -350,6 +356,11 @@ pExpr01(ParseContext &c, unsigned fl)
             noExprError(c);
 
         pExpectOp(c, Op::parenR);
+
+    } else if (pAcceptOp(c, Op::bracketL)) {
+
+        main = pArray(c, fl);
+        pExpectOp(c, Op::bracketR);
 
     } else if (pAcceptId(c, main)) {
 

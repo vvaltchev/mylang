@@ -182,7 +182,6 @@ public:
     }
 };
 
-
 class LiteralStr : public Literal {
 
     EvalValue value;
@@ -199,6 +198,17 @@ public:
     }
 
     virtual void serialize(ostream &s, int level = 0) const;
+};
+
+class LiteralArray : public MultiElemConstruct<> {
+
+public:
+
+    LiteralArray() : MultiElemConstruct<>("LiteralArray") { }
+
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
+        return EvalValue(1234);
+    }
 };
 
 class Identifier : public Construct {
