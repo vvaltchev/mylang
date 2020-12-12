@@ -6,6 +6,12 @@
 
 class SharedStr {
 
+public:
+
+    typedef string inner_type;
+
+private:
+
     /*
      * This method is `const` despite accesses the non-const
      * SharedVal<T>::get() method, simply because that method always
@@ -20,7 +26,7 @@ class SharedStr {
      * in Dlang which allows the programmer to "bless" a given unsafe
      * function and treat it as safe.
      */
-    string &get_ref() const {
+    inner_type &get_ref() const {
         return const_cast<SharedStr *>(this)->str.get();
     }
 
@@ -30,11 +36,9 @@ class SharedStr {
 
 public:
 
-    SharedVal<string> str;
+    SharedVal<inner_type> str;
     unsigned off;   /* NOTE: cannot be const because we're using this in a union */
     unsigned len;   /* NOTE: cannot be const because we're using this in a union */
-
-    typedef string inner_type;
 
     SharedStr() = default;
 
@@ -42,9 +46,9 @@ public:
      * That's not really necessary, just it helps knowing that we won't
      * copy strings, but just move them.
      */
-    SharedStr(const string &s) = delete;
+    SharedStr(const inner_type &s) = delete;
 
-    SharedStr(string &&s);
+    SharedStr(inner_type &&s);
 
     string_view get_view() const {
         return string_view(get_ref().data() + off, len);

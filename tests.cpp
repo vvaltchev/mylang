@@ -746,7 +746,7 @@ static const vector<test> tests =
     },
 
     {
-        "Subscript and splice over slice of string",
+        "Subscript and slice over slice of string",
         {
             "const s=\"hello world, john!\";",
             "const sub=s[6:11];",

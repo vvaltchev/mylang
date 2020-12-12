@@ -5,6 +5,7 @@
 #include "type_int.cpp.h"
 #include "type_str.cpp.h"
 #include "type_func.cpp.h"
+#include "type_arr.cpp.h"
 
 EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
 {
@@ -119,6 +120,7 @@ const array<Type *, Type::t_count> AllTypes = {
     new TypeBuiltin(),
     new TypeStr(),
     new TypeFunc(),
+    new TypeArr(),
 };
 
 /*

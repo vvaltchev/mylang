@@ -157,6 +157,18 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
     throw NotCallableEx(what->start, what->end);
 }
 
+EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
+{
+    vector<LValue> vec;
+    vec.reserve(elems.size());
+
+    for (const auto &e : elems) {
+        vec.emplace_back(e->eval(ctx));
+    }
+
+    return SharedArray(move(vec));
+}
+
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 {
     assert(elems.size() >= 1 && elems[0].first == Op::invalid);

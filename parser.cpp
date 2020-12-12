@@ -54,7 +54,9 @@ pAcceptFuncDecl(ParseContext &c,
                 unsigned fl);
 
 bool
-MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out);
+MakeConstructFromConstVal(const EvalValue &v,
+                          unique_ptr<Construct> &out,
+                          bool process_arrays = false);
 
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
@@ -287,8 +289,8 @@ pAcceptSubscript(ParseContext &c,
             s->end_idx = pExprTop(c, fl);
 
             if (s->what->is_const) {
-                if (s->start_idx && s->start_idx->is_const)
-                    if (s->end_idx && s->end_idx->is_const)
+                if (!s->start_idx || s->start_idx->is_const)
+                    if (!s->end_idx || s->end_idx->is_const)
                         s->is_const = true;
             }
 
@@ -311,6 +313,15 @@ pAcceptSubscript(ParseContext &c,
         }
 
         pExpectOp(c, Op::bracketR);
+
+        if (c.const_eval && ret->is_const) {
+
+            unique_ptr<Construct> const_val;
+
+            if (MakeConstructFromConstVal(RValue(ret->eval(c.const_ctx)), const_val, true))
+                ret = move(const_val);
+        }
+
         return true;
     }
 
@@ -943,7 +954,9 @@ pAcceptFuncDecl(ParseContext &c,
 }
 
 bool
-MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out)
+MakeConstructFromConstVal(const EvalValue &v,
+                          unique_ptr<Construct> &out,
+                          bool process_arrays)
 {
     if (v.is<long>()) {
         out = make_unique<LiteralInt>(v.get<long>());
@@ -957,6 +970,27 @@ MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out)
 
     if (v.is<SharedStr>()) {
         out = make_unique<LiteralStr>(v);
+        return true;
+    }
+
+    if (v.is<SharedArray>() && process_arrays) {
+
+        SharedArray &&arr = v.get<SharedArray>();
+        const SharedArray::inner_type &vec = arr.vec.get();
+        unique_ptr<LiteralArray> litarr(new LiteralArray);
+
+        for (unsigned i = arr.off; i < arr.off + arr.len; i++) {
+
+            unique_ptr<Construct> elem_construct;
+
+            if (!MakeConstructFromConstVal(vec[i].get(), elem_construct))
+                return false;
+
+            litarr->elems.push_back(move(elem_construct));
+        }
+
+        litarr->is_const = true;
+        out = move(litarr);
         return true;
     }
 
