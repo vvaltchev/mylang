@@ -79,10 +79,12 @@ void TypeStr::mul(EvalValue &a, const EvalValue &b)
     string new_str;
     const string_view &s = a.get<SharedStr>().get_view();
     const long n = b.get<long>();
-    new_str.reserve(s.size() * n);
 
-    for (long i = 0; i < n; i++) {
-        new_str += s;
+    if (n >= 0) {
+        new_str.reserve(s.size() * n);
+
+        for (long i = 0; i < n; i++)
+            new_str += s;
     }
 
     a = SharedStr(move(new_str));
