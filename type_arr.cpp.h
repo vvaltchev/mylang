@@ -17,14 +17,13 @@ SharedArray::SharedArray(vector<LValue> &&arr)
 {
 }
 
-
 class TypeArr : public SharedType<SharedArray> {
 
 public:
 
     TypeArr() : SharedType<SharedArray>(Type::t_arr) { }
 
-    // virtual void add(EvalValue &a, const EvalValue &b);
+    virtual void add(EvalValue &a, const EvalValue &b);
     // virtual void eq(EvalValue &a, const EvalValue &b);
     // virtual void noteq(EvalValue &a, const EvalValue &b);
     virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
@@ -38,6 +37,51 @@ public:
 
     virtual string to_string(const EvalValue &a);
 };
+
+void TypeArr::add(EvalValue &a, const EvalValue &b)
+{
+    SharedArray &lval = a.get<SharedArray>();
+
+    if (!b.is<SharedArray>())
+        throw TypeErrorEx();
+
+    const SharedArray &rhs = b.get<SharedArray>();
+
+    if (lval.off == 0 && lval.len == lval.get_ref().size()) {
+
+        lval.get_ref().reserve(lval.len + rhs.size());
+
+        lval.get_ref().insert(
+            lval.get_ref().end(),
+            rhs.get_ref().cbegin() + rhs.off,
+            rhs.get_ref().cbegin() + rhs.off + rhs.len
+        );
+
+        lval.len += rhs.size();
+
+    } else {
+
+        SharedArray::inner_type new_arr;
+        new_arr.reserve(lval.len + rhs.len);
+
+        new_arr.insert(
+            new_arr.end(),
+            lval.get_ref().begin() + lval.off,
+            lval.get_ref().begin() + lval.off + lval.len
+        );
+
+        new_arr.insert(
+            new_arr.end(),
+            rhs.get_ref().cbegin() + rhs.off,
+            rhs.get_ref().cbegin() + rhs.off + rhs.len
+        );
+
+        dtor(&lval.vec); /* We have to manually destroy our fake "trivial" object */
+        lval.vec = make_shared<SharedArray::inner_type>(move(new_arr));
+        lval.off = 0;
+        lval.len = lval.get_ref().size();
+    }
+}
 
 string TypeArr::to_string(const EvalValue &a)
 {

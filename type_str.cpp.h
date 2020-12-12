@@ -17,26 +17,9 @@ SharedStr::SharedStr(string &&s)
 {
 }
 
-void SharedStr::append(const string_view &s)
-{
-    if (use_count() == 1 && off == 0 && len == get_ref().size()) {
-
-        get_ref() += s;
-        len += s.length();
-
-    } else {
-
-        string new_str;
-        new_str.reserve(len + s.size());
-        new_str += get_view();
-        new_str += s;
-
-        str = SharedVal<string>(make_shared<string>(move(new_str)));
-        len = get_ref().size();
-    }
-}
-
 class TypeStr : public SharedType<SharedStr> {
+
+    void append(SharedStr &lval, const string_view &s);
 
 public:
 
@@ -64,14 +47,35 @@ public:
     }
 };
 
+void TypeStr::append(SharedStr &lval, const string_view &s)
+{
+    if (lval.off == 0 && lval.len == lval.get_ref().size()) {
+
+        lval.get_ref() += s;
+        lval.len += s.length();
+
+    } else {
+
+        string new_str;
+        new_str.reserve(lval.len + s.size());
+        new_str += lval.get_view();
+        new_str += s;
+
+        dtor(&lval.str); /* We have to manually destroy our fake "trivial" object */
+        lval.str = make_shared<string>(move(new_str));
+        lval.off = 0;
+        lval.len = lval.get_ref().size();
+    }
+}
+
 void TypeStr::add(EvalValue &a, const EvalValue &b)
 {
     SharedStr &lval = a.get<SharedStr>();
 
     if (b.is<SharedStr>())
-        lval.append(b.get<SharedStr>().get_view());
+        append(lval, b.get<SharedStr>().get_view());
     else
-        lval.append(b.get_type()->to_string(b));
+        append(lval, b.get_type()->to_string(b));
 }
 
 void TypeStr::mul(EvalValue &a, const EvalValue &b)

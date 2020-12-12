@@ -6,6 +6,8 @@
 
 class SharedStr {
 
+    friend class TypeStr;
+
 public:
 
     typedef string inner_type;
@@ -57,6 +59,4 @@ public:
     unsigned size() const {
         return const_cast<SharedStr *>(this)->len;
     }
-
-    void append(const string_view &s);
 };

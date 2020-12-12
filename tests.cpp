@@ -760,6 +760,18 @@ static const vector<test> tests =
             "assert(sub[:2] == \"wo\");",
         },
     },
+
+    {
+        "Append to slice of string",
+        {
+            "var s=\"hello world\";",
+            "var sub = s[:5];",
+            "assert(sub == \"hello\");",
+            "sub += \" john\";",
+            "assert(s == \"hello world\");",
+            "assert(sub == \"hello john\");",
+        },
+    },
 };
 
 static void

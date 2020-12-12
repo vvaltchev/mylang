@@ -32,6 +32,8 @@ typedef SharedVal<FuncObject> SharedFuncObjWrapper;
 
 class SharedArray {
 
+    friend class TypeArr;
+
 public:
 
     typedef vector<LValue> inner_type;
@@ -55,8 +57,8 @@ public:
     unsigned len;   /* NOTE: cannot be const because we're using this in a union */
 
     SharedArray() = default;
-    SharedArray(const inner_type &s) = delete;
-    SharedArray(inner_type &&s);
+    SharedArray(const inner_type &arr) = delete;
+    SharedArray(inner_type &&arr);
 
     unsigned size() const {
         return const_cast<SharedArray *>(this)->len;
@@ -426,9 +428,9 @@ class LValue {
         assert(val.get_type()->t != Type::t_undefid);
     }
 
-public:
+    bool is_const;
 
-    const bool is_const;
+public:
 
     LValue(const EvalValue &val, bool is_const = false)
         : val(val)
@@ -443,6 +445,8 @@ public:
     {
         type_checks();
     }
+
+    bool is_const_var() const { return is_const; }
 
     void put(const EvalValue &v) { val = v; type_checks(); }
     void put(EvalValue &&v) { val = move(v); type_checks(); }
