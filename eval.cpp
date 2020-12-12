@@ -85,7 +85,7 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
         for (size_t i = 0; i < args->elems.size(); i++) {
             args_ctx.symbols.emplace(
                 funcParams[i]->value,
-                LValue(RValue(args->elems[i]->eval(ctx)))
+                LValue(RValue(args->elems[i]->eval(ctx)), ctx->const_ctx)
             );
         }
     }
@@ -163,7 +163,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     vec.reserve(elems.size());
 
     for (const auto &e : elems) {
-        vec.emplace_back(e->eval(ctx));
+        vec.emplace_back(e->eval(ctx), ctx->const_ctx);
     }
 
     return SharedArray(move(vec));

@@ -33,7 +33,7 @@ FuncObject::FuncObject(const FuncDeclStmt *func, EvalContext *ctx)
     for (const auto &capture : func->captures->elems) {
         capture_ctx.symbols.emplace(
             capture->value,             // value means "name" here
-            RValue(capture->eval(ctx))
+            LValue(RValue(capture->eval(ctx)), ctx->const_ctx)
         );
     }
 }

@@ -133,15 +133,15 @@ const EvalValue EvalValue::empty_str = SharedStr(string());
 
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
-    make_pair("defined", LValue(Builtin{builtin_defined})),
-    make_pair("len", LValue(Builtin{builtin_len})),
-    make_pair("str", LValue(Builtin{builtin_str})),
-    make_pair("int", LValue(Builtin{builtin_int})),
+    make_pair("defined", LValue(Builtin{builtin_defined}, true)),
+    make_pair("len", LValue(Builtin{builtin_len}, true)),
+    make_pair("str", LValue(Builtin{builtin_str}, true)),
+    make_pair("int", LValue(Builtin{builtin_int}, true)),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
 {
-    make_pair("print", LValue(Builtin{builtin_print})),
-    make_pair("assert", LValue(Builtin{builtin_assert})),
-    make_pair("exit", LValue(Builtin{builtin_exit})),
+    make_pair("print", LValue(Builtin{builtin_print}, false)),
+    make_pair("assert", LValue(Builtin{builtin_assert}, false)),
+    make_pair("exit", LValue(Builtin{builtin_exit}, false)),
 };

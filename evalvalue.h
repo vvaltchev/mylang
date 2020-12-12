@@ -432,14 +432,14 @@ class LValue {
 
 public:
 
-    LValue(const EvalValue &val, bool is_const = false)
+    LValue(const EvalValue &val, bool is_const)
         : val(val)
         , is_const(is_const)
     {
         type_checks();
     }
 
-    LValue(EvalValue &&val, bool is_const = false)
+    LValue(EvalValue &&val, bool is_const)
         : val(move(val))
         , is_const(is_const)
     {
