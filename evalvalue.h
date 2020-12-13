@@ -10,6 +10,7 @@
 #include <string>
 #include <memory>
 #include <array>
+#include <type_traits>
 #include <cassert>
 #include <cstddef>
 
@@ -130,6 +131,18 @@ public:
 
 extern const array<Type *, Type::t_count> AllTypes;
 
+template <class T>
+struct TypeToEnum;
+
+template <> struct TypeToEnum<NoneVal> { enum { val = Type::t_none }; };
+template <> struct TypeToEnum<LValue *> { enum { val = Type::t_lval }; };
+template <> struct TypeToEnum<UndefinedId> { enum { val = Type::t_undefid }; };
+template <> struct TypeToEnum<long> { enum { val = Type::t_int }; };
+template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
+template <> struct TypeToEnum<SharedStr> { enum { val = Type::t_str }; };
+template <> struct TypeToEnum<SharedFuncObjWrapper> { enum { val = Type::t_func }; };
+template <> struct TypeToEnum<SharedArray> { enum { val = Type::t_arr }; };
+
 class EvalValue {
 
     union ValueU {
@@ -163,16 +176,16 @@ class EvalValue {
 public:
 
     EvalValue();
-    EvalValue(long val);
-    EvalValue(LValue *val);
-    EvalValue(const UndefinedId &val);
-    EvalValue(const Builtin &val);
-    EvalValue(const SharedStr &val);
-    EvalValue(SharedStr &&val);
-    EvalValue(const SharedFuncObjWrapper &val);
-    EvalValue(SharedFuncObjWrapper &&val);
-    EvalValue(const SharedArray &val);
-    EvalValue(SharedArray &&val);
+    EvalValue(bool val);
+
+    template <
+        class T,                            /* real template param */
+        class U = typename remove_const<    /* helper template param */
+            typename remove_reference<T>::type
+        >::type
+    >
+    EvalValue(T &&val, Type::TypeE te = (Type::TypeE)TypeToEnum<U>::val);
+
 
     EvalValue(const EvalValue &other);
     EvalValue(EvalValue &&other);
@@ -212,28 +225,15 @@ public:
     }
 
     template <class T>
-    bool is() const;
+    bool is() const {
+        return type->t == static_cast<Type::TypeE>(TypeToEnum<T>::val);
+    }
 
     static const EvalValue empty_str;
 };
 
 ostream &operator<<(ostream &s, const EvalValue &c);
 
-
-#define DEFINE_EVALVALUE_IS(type_class, type_enum)    \
-    template <>                                       \
-    inline bool EvalValue::is<type_class>() const {   \
-        return type->t == Type::type_enum;            \
-    }
-
-DEFINE_EVALVALUE_IS(NoneVal, t_none)
-DEFINE_EVALVALUE_IS(LValue *, t_lval)
-DEFINE_EVALVALUE_IS(UndefinedId, t_undefid)
-DEFINE_EVALVALUE_IS(long, t_int)
-DEFINE_EVALVALUE_IS(Builtin, t_builtin)
-DEFINE_EVALVALUE_IS(SharedStr, t_str)
-DEFINE_EVALVALUE_IS(SharedFuncObjWrapper, t_func)
-DEFINE_EVALVALUE_IS(SharedArray, t_arr)
 
 inline EvalValue Type::subscript(const EvalValue &what, const EvalValue &idx)
 {
@@ -266,70 +266,34 @@ inline EvalValue Type::intptr(const EvalValue &a)
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[Type::t_none]) { }
 
-inline EvalValue::EvalValue(LValue *val)
-    : val(val), type(AllTypes[Type::t_lval]) { }
-
-inline EvalValue::EvalValue(const UndefinedId &val)
-    : val(val), type(AllTypes[Type::t_undefid]) { }
-
-inline EvalValue::EvalValue(long val)
+inline EvalValue::EvalValue(bool val)
     : val(val), type(AllTypes[Type::t_int]) { }
 
-inline EvalValue::EvalValue(const Builtin &val)
-    : val(val), type(AllTypes[Type::Type::t_builtin]) { }
-
-inline EvalValue::EvalValue(const SharedStr &v)
-    : type(AllTypes[Type::t_str])
+template <class T, class U>
+inline EvalValue::EvalValue(T &&new_val, Type::TypeE)
+    : type(AllTypes[TypeToEnum<U>::val])
 {
-    type->copy_ctor(
-        reinterpret_cast<void *>( &val ),
-        reinterpret_cast<const void *>( &v )
-    );
-}
+    if constexpr(static_cast<Type::TypeE>(TypeToEnum<U>::val) >= Type::t_str) {
 
-inline EvalValue::EvalValue(SharedStr &&v)
-    : type(AllTypes[Type::t_str])
-{
-    type->move_ctor(
-        reinterpret_cast<void *>( &val ),
-        reinterpret_cast<void *>( &v )
-    );
-}
+        if constexpr(is_lvalue_reference<T>::value) {
 
-inline EvalValue::EvalValue(const SharedFuncObjWrapper &v)
-    : type(AllTypes[Type::t_func])
-{
-    type->copy_ctor(
-        reinterpret_cast<void *>( &val ),
-        reinterpret_cast<const void *>( &v )
-    );
-}
+            type->copy_ctor(
+                reinterpret_cast<void *>( &val ),
+                reinterpret_cast<const void *>( &new_val )
+            );
 
-inline EvalValue::EvalValue(SharedFuncObjWrapper &&v)
-    : type(AllTypes[Type::t_func])
-{
-    type->move_ctor(
-        reinterpret_cast<void *>( &val ),
-        reinterpret_cast<void *>( &v )
-    );
-}
+        } else {
 
-inline EvalValue::EvalValue(const SharedArray &v)
-    : type(AllTypes[Type::t_arr])
-{
-    type->copy_ctor(
-        reinterpret_cast<void *>( &val ),
-        reinterpret_cast<const void *>( &v )
-    );
-}
+            type->move_ctor(
+                reinterpret_cast<void *>( &val ),
+                reinterpret_cast<void *>( &new_val )
+            );
+        }
 
-inline EvalValue::EvalValue(SharedArray &&v)
-    : type(AllTypes[Type::t_arr])
-{
-    type->move_ctor(
-        reinterpret_cast<void *>( &val ),
-        reinterpret_cast<void *>( &v )
-    );
+    } else {
+
+        val = ValueU(new_val);
+    }
 }
 
 inline EvalValue::EvalValue(const EvalValue &other)

@@ -200,7 +200,7 @@ void LiteralStr::serialize(ostream &s, int level) const
 }
 
 LiteralStr::LiteralStr(string_view v)
-     : value (unescapeString(v))
+     : value(SharedStr(unescapeString(v)))
 {
 
 }
