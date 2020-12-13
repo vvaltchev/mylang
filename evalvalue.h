@@ -5,6 +5,7 @@
 #include "sharedval.h"
 #include "sharedstr.h"
 #include "sharedarray.h"
+#include "type.h"
 
 #include <string_view>
 #include <vector>
@@ -17,7 +18,6 @@
 
 using namespace std;
 
-class Type;
 class LValue;
 class ExprList;
 class FuncDeclStmt;
@@ -25,75 +25,11 @@ class EvalValue;
 class EvalContext;
 
 class FuncObject;
-struct NoneVal { };
-struct UndefinedId { string_view id; };
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
 typedef SharedVal<FuncObject> SharedFuncObjWrapper;
 typedef SharedArrayTemplate<LValue> SharedArray;
-
-class Type {
-
-public:
-
-    enum TypeE : int {
-
-        /* Trivial types */
-        t_none,
-        t_lval,
-        t_undefid,
-        t_int,
-        t_builtin,
-
-        /* Non-trivial types */
-        t_str,
-        t_func,
-        t_arr,
-
-        /* Number of types */
-        t_count,
-    };
-
-    const TypeE t;
-    Type(TypeE t) : t(t) { assert(t != t_count); }
-
-    virtual void add(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void sub(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void mul(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void div(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void mod(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void lt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void gt(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void le(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void ge(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void eq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void noteq(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void opneg(EvalValue &a) { throw TypeErrorEx(); }
-    virtual void lnot(EvalValue &a) { throw TypeErrorEx(); }
-    virtual void land(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-    virtual void lor(EvalValue &a, const EvalValue &b) { throw TypeErrorEx(); }
-
-    virtual bool is_true(const EvalValue &a) { throw TypeErrorEx(); }
-    virtual string to_string(const EvalValue &a) { throw TypeErrorEx(); }
-    virtual long len(const EvalValue &a) { throw TypeErrorEx(); }
-    virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
-    virtual EvalValue slice(const EvalValue &what,
-                            const EvalValue &start,
-                            const EvalValue &end);
-
-    virtual long use_count(const EvalValue &a);
-    virtual EvalValue clone(const EvalValue &a);
-    virtual EvalValue intptr(const EvalValue &a);
-
-    /* Helper functions for our custom variant */
-
-    virtual void default_ctor(void *obj) { throw InternalErrorEx(); }
-    virtual void dtor(void *obj) { throw InternalErrorEx(); }
-    virtual void copy_ctor(void *obj, const void *other) { throw InternalErrorEx(); }
-    virtual void move_ctor(void *obj, void *other) { throw InternalErrorEx(); }
-    virtual void copy_assign(void *obj, const void *other) { throw InternalErrorEx(); }
-    virtual void move_assign(void *obj, void *other) { throw InternalErrorEx(); }
-};
+typedef TypeTemplate<EvalValue> Type;
 
 extern const array<Type *, Type::t_count> AllTypes;
 
@@ -199,35 +135,6 @@ public:
 };
 
 ostream &operator<<(ostream &s, const EvalValue &c);
-
-
-inline EvalValue Type::subscript(const EvalValue &what, const EvalValue &idx)
-{
-    throw TypeErrorEx();
-}
-
-inline EvalValue Type::slice(const EvalValue &what,
-                             const EvalValue &start,
-                             const EvalValue &end)
-{
-    throw TypeErrorEx();
-}
-
-inline long Type::use_count(const EvalValue &a)
-{
-    return 1;
-}
-
-inline EvalValue Type::clone(const EvalValue &a)
-{
-    return a;
-}
-
-inline EvalValue Type::intptr(const EvalValue &a)
-{
-    assert(!a.is<LValue *>() && !a.is<UndefinedId>());
-    return reinterpret_cast<long>(&a);
-}
 
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[Type::t_none]) { }
