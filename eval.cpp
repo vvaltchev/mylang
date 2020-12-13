@@ -561,8 +561,13 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
 {
-    const EvalValue &what_val = RValue(what->eval(ctx));
-    return what_val.get_type()->subscript(what_val, RValue(index->eval(ctx)));
+    const EvalValue &lval = what->eval(ctx);
+
+    Type *t = lval.is<LValue *>()
+        ? lval.get<LValue *>()->get().get_type()
+        : lval.get_type();
+
+    return t->subscript(lval, RValue(index->eval(ctx)));
 }
 
 EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const

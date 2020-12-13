@@ -180,11 +180,12 @@ void TypeStr::noteq(EvalValue &a, const EvalValue &b)
     }
 }
 
-EvalValue TypeStr::subscript(const EvalValue &what, const EvalValue &idx_val)
+EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
 {
     if (!idx_val.is<long>())
         throw TypeErrorEx();
 
+    const EvalValue &what = RValue(what_lval);
     const SharedStr &s = what.get<SharedStr>();
     long idx = idx_val.get<long>();
 

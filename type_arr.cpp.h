@@ -172,11 +172,12 @@ string TypeArr::to_string(const EvalValue &a)
     return res;
 }
 
-EvalValue TypeArr::subscript(const EvalValue &what, const EvalValue &idx_val)
+EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
 {
     if (!idx_val.is<long>())
         throw TypeErrorEx();
 
+    const EvalValue &what = RValue(what_lval);
     SharedArray &&arr = what.get<SharedArray>();
     SharedArray::inner_type &vec = arr.vec.get();
     long idx = idx_val.get<long>();
@@ -187,7 +188,12 @@ EvalValue TypeArr::subscript(const EvalValue &what, const EvalValue &idx_val)
     if (idx < 0 || idx >= arr.size())
         throw OutOfBoundsEx();
 
-    return &vec[arr.off + idx];
+    LValue *ret = &vec[arr.off + idx];
+
+    if (what_lval.is<LValue *>())
+        ret->container = what_lval.get<LValue *>();
+
+    return ret;
 }
 
 EvalValue TypeArr::slice(const EvalValue &what,

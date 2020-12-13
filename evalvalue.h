@@ -430,8 +430,6 @@ inline EvalValue::~EvalValue()
 
 // ---------------------------------------------------------------
 
-
-
 class LValue {
 
     EvalValue val;
@@ -445,9 +443,13 @@ class LValue {
 
 public:
 
+    /* Used only by TypeArr::subscript() */
+    LValue *container;
+
     LValue(const EvalValue &val, bool is_const)
         : val(val)
         , is_const(is_const)
+        , container(nullptr)
     {
         type_checks();
     }
@@ -455,6 +457,7 @@ public:
     LValue(EvalValue &&val, bool is_const)
         : val(move(val))
         , is_const(is_const)
+        , container(nullptr)
     {
         type_checks();
     }
