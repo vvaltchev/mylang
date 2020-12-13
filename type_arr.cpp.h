@@ -190,9 +190,14 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
 
     LValue *ret = &vec[arr.off + idx];
 
-    if (what_lval.is<LValue *>())
-        ret->container = what_lval.get<LValue *>();
+    if (!what_lval.is<LValue *>()) {
+        /* The input array was not an LValue, so return a simple RValue */
+        return ret->get();
+    }
 
+    /* We deferenced a LValue array, so return element's LValue */
+    ret->container = what_lval.get<LValue *>();
+    ret->container_idx = arr.off + idx;
     return ret;
 }
 

@@ -580,3 +580,34 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
         end_idx ? RValue(end_idx->eval(ctx)) : EvalValue()
     );
 }
+
+LValue LValue::clone()
+{
+    LValue nl(val.get_type()->clone(val), is_const);
+    nl.container = container;
+    nl.container_idx = container_idx;
+    return nl;
+}
+
+EvalValue &LValue::get_value_for_put()
+{
+    if (!container || container->val.get_type()->use_count(container->val) == 1)
+        return val;
+
+    *container = container->clone();
+
+    assert(container->val.is<SharedArray>());
+    return container->val.get<SharedArray>().vec.get()[container_idx].val;
+}
+
+void LValue::put(const EvalValue &v)
+{
+    get_value_for_put() = v;
+    type_checks();
+}
+
+void LValue::put(EvalValue &&v)
+{
+    get_value_for_put() = move(v);
+    type_checks();
+}

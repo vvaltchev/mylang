@@ -433,18 +433,21 @@ inline EvalValue::~EvalValue()
 class LValue {
 
     EvalValue val;
+    bool is_const;
+
+    LValue clone();
+    EvalValue &get_value_for_put();
 
     void type_checks() const {
         assert(val.get_type()->t != Type::t_lval);
         assert(val.get_type()->t != Type::t_undefid);
     }
 
-    bool is_const;
-
 public:
 
     /* Used only by TypeArr::subscript() */
     LValue *container;
+    unsigned container_idx;
 
     LValue(const EvalValue &val, bool is_const)
         : val(val)
@@ -462,11 +465,10 @@ public:
         type_checks();
     }
 
+    void put(const EvalValue &v);
+    void put(EvalValue &&v);
+
     bool is_const_var() const { return is_const; }
-
-    void put(const EvalValue &v) { val = v; type_checks(); }
-    void put(EvalValue &&v) { val = move(v); type_checks(); }
-
     const EvalValue &get() const { return val; }
     EvalValue get_rval() const { return val; }
 

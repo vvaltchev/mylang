@@ -864,10 +864,7 @@ static const vector<test> tests =
             "assert(sub == [2,3]);",
             "s[1] = 20;",
             "assert(s == [1,20,3,4]);",
-            "assert(sub == [20,3]);",   // side effect: should be keep it?
-            "s = clone(s);",
-            "s[1] = 20000;",
-            "assert(sub == [20,3]);",
+            "assert(sub == [2,3]);",   // Note: no side effect
         },
     },
 };
