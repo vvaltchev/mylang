@@ -835,6 +835,28 @@ static const vector<test> tests =
     },
 
     {
+        "Clone function objects",
+        {
+            "func genfunc(v) => func [v] { v+=1; return v; };",
+            "var f = genfunc(0);",
+            "assert(f() == 1);",
+            "assert(f() == 2);",
+            "assert(f() == 3);",
+            "",
+            "var g = f;",
+            "assert(g() == 4);", // `f` and `g` point to the same func object
+            "assert(g() == 5);", // `f` and `g` point to the same func object
+            "",
+            "g = clone(g);",     // now, the counters will diverge
+            "assert(g() == 6);",
+            "assert(g() == 7);",
+            "assert(g() == 8);",
+            "",
+            "assert(f() == 6);", // proof that g != f
+        },
+    },
+
+    {
         "Modify elements of array",
         {
             "var s = [1,2,3,4];",
@@ -843,6 +865,9 @@ static const vector<test> tests =
             "s[1] = 20;",
             "assert(s == [1,20,3,4]);",
             "assert(sub == [20,3]);",   // side effect: should be keep it?
+            "s = clone(s);",
+            "s[1] = 20000;",
+            "assert(sub == [20,3]);",
         },
     },
 };

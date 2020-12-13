@@ -47,7 +47,11 @@ public:
         return *to_shared_ptr().get();
     }
 
-    long use_count() {
-        return to_shared_ptr().use_count();
+    const T &get() const {
+        return *const_cast<SharedVal<T> *>(this)->to_shared_ptr().get();
+    }
+
+    long use_count() const {
+        return const_cast<SharedVal<T> *>(this)->to_shared_ptr().use_count();
     }
 };

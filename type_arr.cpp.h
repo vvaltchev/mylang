@@ -31,12 +31,35 @@ public:
                             const EvalValue &start,
                             const EvalValue &end);
 
+    virtual long use_count(const EvalValue &a);
+    virtual EvalValue clone(const EvalValue &a);
+
     virtual long len(const EvalValue &a) {
         return a.get<SharedArray>().size();
     }
 
     virtual string to_string(const EvalValue &a);
 };
+
+long TypeArr::use_count(const EvalValue &a)
+{
+    return a.get<SharedArray>().use_count();
+}
+
+EvalValue TypeArr::clone(const EvalValue &a)
+{
+    const SharedArray &lval = a.get<SharedArray>();
+    SharedArray::inner_type new_arr;
+    new_arr.reserve(lval.len);
+
+    new_arr.insert(
+        new_arr.end(),
+        lval.get_ref().begin() + lval.off,
+        lval.get_ref().begin() + lval.off + lval.len
+    );
+
+    return SharedArray(move(new_arr));
+}
 
 void TypeArr::add(EvalValue &a, const EvalValue &b)
 {

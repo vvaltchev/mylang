@@ -114,6 +114,9 @@ public:
                             const EvalValue &start,
                             const EvalValue &end);
 
+    virtual long use_count(const EvalValue &a);
+    virtual EvalValue clone(const EvalValue &a);
+
     /* Helper functions for our custom variant */
 
     virtual void default_ctor(void *obj) { throw InternalErrorEx(); }
@@ -225,6 +228,16 @@ inline EvalValue Type::slice(const EvalValue &what,
                              const EvalValue &end)
 {
     throw TypeErrorEx();
+}
+
+inline long Type::use_count(const EvalValue &a)
+{
+    return 1;
+}
+
+inline EvalValue Type::clone(const EvalValue &a)
+{
+    return a;
 }
 
 #define DEFINE_EVALVALUE_IS(type_class, type_enum)    \

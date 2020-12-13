@@ -44,4 +44,5 @@ public:
     EvalContext capture_ctx;
 
     FuncObject(const FuncDeclStmt *func, EvalContext *ctx);
+    FuncObject(const FuncObject &rhs);
 };

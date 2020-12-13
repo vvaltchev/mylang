@@ -58,6 +58,16 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
     return SharedStr(e.get_type()->to_string(e));
 }
 
+EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+    return e.get_type()->clone(e);
+}
+
 EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
 {
     for (const auto &e: exprList->elems) {
@@ -137,6 +147,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_pair("len", LValue(Builtin{builtin_len}, true)),
     make_pair("str", LValue(Builtin{builtin_str}, true)),
     make_pair("int", LValue(Builtin{builtin_int}, true)),
+    make_pair("clone", LValue(Builtin{builtin_clone}, true)),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

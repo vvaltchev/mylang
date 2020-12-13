@@ -18,10 +18,38 @@ public:
 
     TypeFunc() : SharedType<SharedFuncObjWrapper>(Type::t_func) { }
 
+    virtual long use_count(const EvalValue &a);
+    virtual EvalValue clone(const EvalValue &a);
+
     virtual string to_string(const EvalValue &a) {
         return "<function>";
     }
 };
+
+long TypeFunc::use_count(const EvalValue &a)
+{
+    return a.get<SharedFuncObjWrapper>().use_count();
+}
+
+EvalValue TypeFunc::clone(const EvalValue &a)
+{
+    const SharedFuncObjWrapper &wrapper = a.get<SharedFuncObjWrapper>();
+    const FuncObject &func = wrapper.get();
+
+    if (!func.capture_ctx.symbols.size())
+        return a;
+
+    return SharedFuncObjWrapper(make_shared<FuncObject>(func));
+}
+
+FuncObject::FuncObject(const FuncObject &rhs)
+    : func(rhs.func)
+    , capture_ctx(rhs.capture_ctx.parent,
+                  rhs.capture_ctx.const_ctx,
+                  rhs.capture_ctx.func_ctx)
+{
+    capture_ctx.symbols = rhs.capture_ctx.symbols;
+}
 
 FuncObject::FuncObject(const FuncDeclStmt *func, EvalContext *ctx)
     : func(func)

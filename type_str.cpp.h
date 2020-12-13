@@ -38,6 +38,9 @@ public:
                             const EvalValue &start,
                             const EvalValue &end);
 
+    virtual long use_count(const EvalValue &a);
+    virtual EvalValue clone(const EvalValue &a);
+
     virtual long len(const EvalValue &a) {
         return a.get<SharedStr>().size();
     }
@@ -46,6 +49,22 @@ public:
         return string(a.get<SharedStr>().get_view());
     }
 };
+
+EvalValue TypeStr::clone(const EvalValue &a)
+{
+    /*
+     * Don't implement a real clone() for strings, simply because at the
+     * moment, we're following Python's model in which strings are immutable.
+     * In other words, `str[i]` returns just a slice, NOT an LValue to the N-th
+     * character in the string.
+     */
+    return a;
+}
+
+long TypeStr::use_count(const EvalValue &a)
+{
+    return a.get<SharedStr>().use_count();
+}
 
 void TypeStr::append(SharedStr &lval, const string_view &s)
 {
