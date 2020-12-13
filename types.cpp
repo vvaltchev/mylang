@@ -106,6 +106,21 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     exit(e.get<long>());
 }
 
+EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &lval = arg->eval(ctx);
+
+    if (!lval.is<LValue *>())
+        throw NotLValueEx(arg->start, arg->end);
+
+    const EvalValue &e = lval.get<LValue *>()->get();
+    return e.get_type()->intptr(e);
+}
+
 const string &
 find_builtin_name(const Builtin &b)
 {
@@ -155,4 +170,5 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_pair("print", LValue(Builtin{builtin_print}, false)),
     make_pair("assert", LValue(Builtin{builtin_assert}, false)),
     make_pair("exit", LValue(Builtin{builtin_exit}, false)),
+    make_pair("intptr", LValue(Builtin{builtin_intptr}, false)),
 };

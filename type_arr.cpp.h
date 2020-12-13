@@ -33,6 +33,7 @@ public:
 
     virtual long use_count(const EvalValue &a);
     virtual EvalValue clone(const EvalValue &a);
+    virtual EvalValue intptr(const EvalValue &a);
 
     virtual long len(const EvalValue &a) {
         return a.get<SharedArray>().size();
@@ -59,6 +60,11 @@ EvalValue TypeArr::clone(const EvalValue &a)
     );
 
     return SharedArray(move(new_arr));
+}
+
+EvalValue TypeArr::intptr(const EvalValue &a)
+{
+    return reinterpret_cast<long>(&a.get<SharedArray>().get_ref());
 }
 
 void TypeArr::add(EvalValue &a, const EvalValue &b)

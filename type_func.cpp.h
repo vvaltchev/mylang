@@ -20,6 +20,7 @@ public:
 
     virtual long use_count(const EvalValue &a);
     virtual EvalValue clone(const EvalValue &a);
+    virtual EvalValue intptr(const EvalValue &a);
 
     virtual string to_string(const EvalValue &a) {
         return "<function>";
@@ -29,6 +30,11 @@ public:
 long TypeFunc::use_count(const EvalValue &a)
 {
     return a.get<SharedFuncObjWrapper>().use_count();
+}
+
+EvalValue TypeFunc::intptr(const EvalValue &a)
+{
+    return reinterpret_cast<long>(&a.get<SharedFuncObjWrapper>().get());
 }
 
 EvalValue TypeFunc::clone(const EvalValue &a)

@@ -40,6 +40,7 @@ public:
 
     virtual long use_count(const EvalValue &a);
     virtual EvalValue clone(const EvalValue &a);
+    virtual EvalValue intptr(const EvalValue &a);
 
     virtual long len(const EvalValue &a) {
         return a.get<SharedStr>().size();
@@ -64,6 +65,11 @@ EvalValue TypeStr::clone(const EvalValue &a)
 long TypeStr::use_count(const EvalValue &a)
 {
     return a.get<SharedStr>().use_count();
+}
+
+EvalValue TypeStr::intptr(const EvalValue &a)
+{
+    return reinterpret_cast<long>(&a.get<SharedStr>().get_ref());
 }
 
 void TypeStr::append(SharedStr &lval, const string_view &s)

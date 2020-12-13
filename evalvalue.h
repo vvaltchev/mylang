@@ -116,6 +116,7 @@ public:
 
     virtual long use_count(const EvalValue &a);
     virtual EvalValue clone(const EvalValue &a);
+    virtual EvalValue intptr(const EvalValue &a);
 
     /* Helper functions for our custom variant */
 
@@ -218,6 +219,22 @@ public:
 
 ostream &operator<<(ostream &s, const EvalValue &c);
 
+
+#define DEFINE_EVALVALUE_IS(type_class, type_enum)    \
+    template <>                                       \
+    inline bool EvalValue::is<type_class>() const {   \
+        return type->t == Type::type_enum;            \
+    }
+
+DEFINE_EVALVALUE_IS(NoneVal, t_none)
+DEFINE_EVALVALUE_IS(LValue *, t_lval)
+DEFINE_EVALVALUE_IS(UndefinedId, t_undefid)
+DEFINE_EVALVALUE_IS(long, t_int)
+DEFINE_EVALVALUE_IS(Builtin, t_builtin)
+DEFINE_EVALVALUE_IS(SharedStr, t_str)
+DEFINE_EVALVALUE_IS(SharedFuncObjWrapper, t_func)
+DEFINE_EVALVALUE_IS(SharedArray, t_arr)
+
 inline EvalValue Type::subscript(const EvalValue &what, const EvalValue &idx)
 {
     throw TypeErrorEx();
@@ -240,20 +257,11 @@ inline EvalValue Type::clone(const EvalValue &a)
     return a;
 }
 
-#define DEFINE_EVALVALUE_IS(type_class, type_enum)    \
-    template <>                                       \
-    inline bool EvalValue::is<type_class>() const {   \
-        return type->t == Type::type_enum;            \
-    }
-
-DEFINE_EVALVALUE_IS(NoneVal, t_none)
-DEFINE_EVALVALUE_IS(LValue *, t_lval)
-DEFINE_EVALVALUE_IS(UndefinedId, t_undefid)
-DEFINE_EVALVALUE_IS(long, t_int)
-DEFINE_EVALVALUE_IS(Builtin, t_builtin)
-DEFINE_EVALVALUE_IS(SharedStr, t_str)
-DEFINE_EVALVALUE_IS(SharedFuncObjWrapper, t_func)
-DEFINE_EVALVALUE_IS(SharedArray, t_arr)
+inline EvalValue Type::intptr(const EvalValue &a)
+{
+    assert(!a.is<LValue *>() && !a.is<UndefinedId>());
+    return reinterpret_cast<long>(&a);
+}
 
 inline EvalValue::EvalValue()
     : val(), type(AllTypes[Type::t_none]) { }

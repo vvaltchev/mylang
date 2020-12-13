@@ -846,8 +846,10 @@ static const vector<test> tests =
             "var g = f;",
             "assert(g() == 4);", // `f` and `g` point to the same func object
             "assert(g() == 5);", // `f` and `g` point to the same func object
+            "assert(intptr(g) == intptr(f));",
             "",
             "g = clone(g);",     // now, the counters will diverge
+            "assert(intptr(g) != intptr(f));",
             "assert(g() == 6);",
             "assert(g() == 7);",
             "assert(g() == 8);",
@@ -862,9 +864,11 @@ static const vector<test> tests =
             "var s = [1,2,3,4];",
             "var sub = s[1:3];",
             "assert(sub == [2,3]);",
-            "s[1] = 20;",
-            "assert(s == [1,20,3,4]);",
-            "assert(sub == [2,3]);",   // Note: no side effect
+            "assert(intptr(s) == intptr(sub));", // both vars must point to the same obj
+            "s[1] = 20;",                        // change an element of `s`
+            "assert(intptr(s) != intptr(sub));", // `s` now must point to a different obj
+            "assert(s == [1,20,3,4]);",          // check that now `s` is updated
+            "assert(sub == [2,3]);",             // check that `sub` contains the old value
         },
     },
 };
