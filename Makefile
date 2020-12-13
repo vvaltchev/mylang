@@ -25,9 +25,8 @@ endif
 DEPDIR := .d
 DEPFLAGS = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.Td
 POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d
-SOURCES:=$(wildcard *.cpp)
-OBJECTS=$(SOURCES:%.cpp=$(BUILD_DIR)/%.o)
-
+SOURCES:=$(wildcard src/*.cpp)
+OBJECTS=$(SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)
 
 TARGET = mylang
 
@@ -37,9 +36,9 @@ $(shell mkdir -p $(BUILD_DIR) > /dev/null)
 # Default target
 all: $(BUILD_DIR)/$(TARGET)
 
-$(BUILD_DIR)/%.o : %.cpp
-$(BUILD_DIR)/%.o : %.cpp $(DEPDIR)/%.d
-	@echo Compiling $<...
+$(BUILD_DIR)/%.o : src/%.cpp
+$(BUILD_DIR)/%.o : src/%.cpp $(DEPDIR)/%.d
+	@echo Compiling $(<:src/%.cpp=%.cpp)...
 	@$(COMPILE) $(CXX) -o $@ $(DEPFLAGS) $(BASE_FLAGS) $(CFLAGS) -c $<
 	@$(POSTCOMPILE)
 
@@ -56,4 +55,4 @@ $(DEPDIR)/%.d: ;
 .PRECIOUS: $(DEPDIR)/%.d
 .PHONY: all clean
 
--include $(patsubst %,$(DEPDIR)/%.d,$(basename $(SOURCES)))
+-include $(patsubst src/%,$(DEPDIR)/%.d,$(basename $(SOURCES)))
