@@ -871,6 +871,68 @@ static const vector<test> tests =
             "assert(sub == [2,3]);",             // check that `sub` contains the old value
         },
     },
+
+    {
+        "Multi-dimentional arrays",
+        {
+            "var arr = [[11, 22], 3, 4];",
+            "assert(arr[0] == [11,22]);",
+            "assert(arr[0][0] == 11);",
+            "assert(arr[0][1] == 22);",
+            "assert(len(arr[0]) == 2);",
+            "assert(len(arr) == 3);",
+        },
+    },
+
+    {
+        "Subscript of literal arrays",
+        {
+            "assert([11,22,33][0] == 11);",
+            "assert([11,22,33][1] == 22);",
+        },
+    },
+
+    {
+        "Subscript of arrays returned by funcs",
+        {
+            "func f1 => [11,22,33];",
+            "assert(f1() == [11,22,33]);",
+            "assert(f1()[0] == 11);",
+            "assert(f1()[1] == 22);",
+        },
+    },
+
+    {
+        "Slices of arrays returned by funcs",
+        {
+            "func f1 => [11,22,33,44];",
+            "assert(f1() == [11,22,33,44]);",
+            "assert(f1()[2:] == [33,44]);",
+        },
+    },
+
+    {
+        "Call funcs returned by funcs, directly",
+        {
+            "func get_adder(v) => func [v] => v+1;",
+            "assert(get_adder(1)() == 2);",
+            "assert(get_adder(25)() == 26);",
+            "assert(get_adder(1)() == 2);",
+        },
+    },
+
+    {
+        "Array of functions",
+        {
+            "var arr = [",
+            "   (func (v) => v+1),",
+            "   (func (v) => v+2)",
+            "];",
+            "",
+            "assert(arr[0](1) == 2);",
+            "assert(arr[1](1) == 3);",
+        },
+    },
 };
 
 static void

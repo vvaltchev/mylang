@@ -337,22 +337,20 @@ pArray(ParseContext &c, unsigned fl)
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
-    unique_ptr<Construct> ret;
     unique_ptr<Construct> main;
     unique_ptr<Construct> otherExpr;
     const Loc start = c.get_loc();
 
     if (pAcceptLiteralInt(c, main)) {
 
-        ret = move(main);
-        return ret;     /* Not subscriptable, nor callable */
+        return main;     /* Not subscriptable, nor callable */
 
     } else if (pAcceptKeyword(c, Keyword::kw_none)) {
 
-        ret.reset(new LiteralNone());
-        ret->start = start;
-        ret->end = c.get_loc();
-        return ret;     /* Not subscriptable, nor callable */
+        main.reset(new LiteralNone());
+        main->start = start;
+        main->end = c.get_loc();
+        return main;     /* Not subscriptable, nor callable */
     }
 
     if (pAcceptLiteralStr(c, main)) {
@@ -382,14 +380,13 @@ pExpr01(ParseContext &c, unsigned fl)
         return nullptr;
     }
 
-    if (pAcceptCallExpr(c, main, otherExpr, fl))
-        ret = move(otherExpr);
-    else if (pAcceptSubscript(c, main, otherExpr, fl))
-        ret = move(otherExpr);
-    else
-        ret = move(main);
+    while (pAcceptCallExpr(c, main, otherExpr, fl)  ||
+           pAcceptSubscript(c, main, otherExpr, fl))
+    {
+        main = move(otherExpr);
+    }
 
-    return ret;
+    return main;
 }
 
 template <class ExprT>
