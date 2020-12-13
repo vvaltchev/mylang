@@ -10,7 +10,8 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-SharedArray::SharedArray(vector<LValue> &&arr)
+template <>
+SharedArrayTemplate<LValue>::SharedArrayTemplate(vector<LValue> &&arr)
     : vec(make_shared<vector<LValue>>(move(arr)))
     , off(0)
     , len(get_ref().size())

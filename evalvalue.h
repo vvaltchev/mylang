@@ -4,6 +4,7 @@
 #include "errors.h"
 #include "sharedval.h"
 #include "sharedstr.h"
+#include "sharedarray.h"
 
 #include <string_view>
 #include <vector>
@@ -24,47 +25,12 @@ class EvalValue;
 class EvalContext;
 
 class FuncObject;
-class SharedArray;
 struct NoneVal { };
 struct UndefinedId { string_view id; };
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
 typedef SharedVal<FuncObject> SharedFuncObjWrapper;
-
-class SharedArray {
-
-    friend class TypeArr;
-
-public:
-
-    typedef vector<LValue> inner_type;
-
-private:
-
-    /* See SharedStr */
-    inner_type &get_ref() const {
-        return const_cast<SharedArray *>(this)->vec.get();
-    }
-
-    /* See SharedStr */
-    long use_count() const {
-        return const_cast<SharedArray *>(this)->vec.use_count();
-    }
-
-public:
-
-    SharedVal<inner_type> vec;
-    unsigned off;   /* NOTE: cannot be const because we're using this in a union */
-    unsigned len;   /* NOTE: cannot be const because we're using this in a union */
-
-    SharedArray() = default;
-    SharedArray(const inner_type &arr) = delete;
-    SharedArray(inner_type &&arr);
-
-    unsigned size() const {
-        return const_cast<SharedArray *>(this)->len;
-    }
-};
+typedef SharedArrayTemplate<LValue> SharedArray;
 
 class Type {
 
