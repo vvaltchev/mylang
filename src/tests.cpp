@@ -964,6 +964,51 @@ static const vector<test> tests =
             "assert(a == 42);",
         },
     },
+
+    {
+        "split() builtin, simple case",
+        {
+            "var s = \"a->b->c\";",
+            "var arr = split(s, \"->\");",
+            "assert(arr == [\"a\",\"b\",\"c\"]);",
+        },
+    },
+
+    {
+        "split() builtin, first elem empty",
+        {
+            "var s = \"->a->b->c\";",
+            "var arr = split(s, \"->\");",
+            "assert(arr == [\"\",\"a\",\"b\",\"c\"]);",
+        },
+    },
+
+    {
+        "split() builtin, last elem empty",
+        {
+            "var s = \"a->b->c->\";",
+            "var arr = split(s, \"->\");",
+            "assert(arr == [\"a\",\"b\",\"c\",\"\"]);",
+        },
+    },
+
+    {
+        "split() builtin, no delim in string",
+        {
+            "var s = \"abc\";",
+            "var arr = split(s, \"->\");",
+            "assert(arr == [\"abc\"]);",
+        },
+    },
+
+    {
+        "split() builtin, const case",
+        {
+            "const s = \"a->b->c\";",
+            "const arr = split(s, \"->\");",
+            "assert(arr == [\"a\",\"b\",\"c\"]);",
+        },
+    },
 };
 
 static void

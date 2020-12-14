@@ -244,7 +244,7 @@ pAcceptCallExpr(ParseContext &c,
 
         if (c.const_eval && expr->what->is_const && expr->args->is_const) {
 
-            if (!MakeConstructFromConstVal(expr->eval(c.const_ctx), ret)) {
+            if (!MakeConstructFromConstVal(expr->eval(c.const_ctx), ret, true)) {
 
                 /*
                  * In general expressions, it's acceptable MakeConstructFromConstVal()
