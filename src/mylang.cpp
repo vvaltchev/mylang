@@ -24,7 +24,7 @@ static bool opt_no_run;
 static vector<string> lines;
 static vector<Tok> tokens;
 
-void run_tests();
+void run_tests(bool dump_syntax_tree);
 
 void help()
 {
@@ -104,7 +104,7 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "-rt")) {
 
-            run_tests(); exit(0);
+            run_tests(opt_show_syntax_tree); exit(0);
 
         } else if (!strcmp(arg, "-t")) {
 

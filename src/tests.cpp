@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include <iostream>
+#include <iomanip>
 #include <cstdlib>
+
 using namespace std;
 
 #ifdef TESTS
@@ -1055,7 +1057,7 @@ dump_expected_ex(const type_info *ex, const type_info *got)
 }
 
 static bool
-check(const test &t)
+check(const test &t, int &err_line, bool dump_syntax_tree)
 {
     vector<Tok> tokens;
     unique_ptr<Construct> root;
@@ -1073,7 +1075,15 @@ check(const test &t)
     } catch (const Exception &e) {
 
         if (!t.ex || &typeid(e) != t.ex) {
+
             dump_expected_ex(t.ex, &typeid(e));
+            err_line = e.loc_start.line;
+
+            if (dump_syntax_tree && root) {
+                cout << "  Syntax tree:" << endl;
+                root->serialize(cout, 2);
+                cout << endl;
+            }
             return false;
         }
 
@@ -1084,7 +1094,7 @@ check(const test &t)
 
         dump_expected_ex(t.ex, nullptr);
 
-        if (root) {
+        if (dump_syntax_tree && root) {
             cout << "  Syntax tree:" << endl;
             root->serialize(cout, 2);
             cout << endl;
@@ -1097,7 +1107,7 @@ check(const test &t)
 }
 
 static void
-dump_test_source(const test &t)
+dump_test_source(const test &t, int err_line)
 {
     cout << "  Source: ";
 
@@ -1109,28 +1119,37 @@ dump_test_source(const test &t)
 
         cout << endl;
 
-        for (const auto &e : t.source) {
-            cout << "    " << e << endl;
+        for (unsigned i = 0; i < t.source.size(); i++) {
+            cout << "    ";
+            cout << setfill(' ') << setw(3) << i+1;
+            cout << "    " << t.source[i];
+
+            if ((int)i+1 == err_line)
+                cout << "   <----- GOT EXCEPTION HERE";
+
+            cout << endl;
         }
     }
 }
 
-void run_tests()
+void run_tests(bool dump_syntax_tree)
 {
     size_t pass_count = 0;
+    int err_line;
 
     for (const auto &test : tests) {
 
         cout << "[ RUN  ] " << test.name << endl;
 
-        if (check(test)) {
+        err_line = 0;
+        if (check(test, err_line, dump_syntax_tree)) {
 
             cout << "[ PASS ]";
             pass_count++;
 
         } else {
 
-            dump_test_source(test);
+            dump_test_source(test, err_line);
             cout << "[ FAIL ]";
         }
 
@@ -1153,7 +1172,7 @@ void run_tests()
 
 #else
 
-void run_tests()
+void run_tests(bool)
 {
     cout << "Tests NOT compiled in. Build with TESTS=1" << endl;
     exit(1);
