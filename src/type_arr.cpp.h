@@ -211,10 +211,11 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
     return ret;
 }
 
-EvalValue TypeArr::slice(const EvalValue &what,
+EvalValue TypeArr::slice(const EvalValue &what_lval,
                          const EvalValue &start_val,
                          const EvalValue &end_val)
 {
+    const EvalValue &what = RValue(what_lval);
     const SharedArray &arr = what.get<SharedArray>();
     long start = 0, end = arr.size();
 
