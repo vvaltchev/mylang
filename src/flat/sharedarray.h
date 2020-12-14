@@ -17,34 +17,57 @@ using namespace std;
 template <class LValueType>
 class FlatSharedArrayTempl {
 
+    template <class LValueT>
+    class SharedArrayObj {
+
+    public:
+
+        typedef vector<LValueT> inner_type;
+
+        shared_ptr<inner_type> shvec;
+
+        unsigned off = 0;
+        unsigned len = 0;
+        bool slice = false;
+
+        SharedArrayObj() = default;
+
+        SharedArrayObj(const inner_type &arr) = delete;
+
+        SharedArrayObj(inner_type &&arr)
+            : shvec(make_shared<inner_type>(move(arr)))
+            , off(0)
+            , len(shvec->size())
+            , slice(false)
+        { }
+    };
+
 public:
-    typedef vector<LValueType> inner_type;
+    typedef SharedArrayObj<LValueType> inner_type;
+    typedef typename inner_type::inner_type vec_type;
 
 private:
 
-    FlatSharedVal<inner_type> shval;
-    unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
-    unsigned len = 0;   /* NOTE: cannot be const because we're using this in a union */
-    bool slice = false;
+    FlatVal<inner_type> flat;
 
 public:
     FlatSharedArrayTempl() = default;
-    FlatSharedArrayTempl(const inner_type &arr) = delete;
-    FlatSharedArrayTempl(inner_type &&arr);
+    FlatSharedArrayTempl(const vec_type &arr) = delete;
+    FlatSharedArrayTempl(vec_type &&arr)
+        : flat(move(arr))
+    { }
 
-    inner_type &get_ref() { return shval.get(); }
-    const inner_type &get_ref() const { return shval.get(); }
-    FlatSharedVal<inner_type> &get_shval() { return shval; }
-    const FlatSharedVal<inner_type> &get_shval() const { return shval; }
-    long use_count() const { return shval.use_count(); }
+    vec_type &get_ref() { return *flat->shvec.get(); }
+    const vec_type &get_ref() const { return *flat->shvec.get(); }
+    long use_count() const { return flat->shvec.use_count(); }
 
     void set_slice(unsigned off_val, unsigned len_val) {
-        off = off_val;
-        len = len_val;
-        slice = true;
+        flat->off = off_val;
+        flat->len = len_val;
+        flat->slice = true;
     }
 
-    bool is_slice() const { return slice; }
-    unsigned offset() const { return slice ? off : 0; }
-    unsigned size() const { return slice ? len : get_ref().size(); }
+    bool is_slice() const { return flat->slice; }
+    unsigned offset() const { return flat->slice ? flat->off : 0; }
+    unsigned size() const { return flat->slice ? flat->len : get_ref().size(); }
 };

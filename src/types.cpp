@@ -161,7 +161,7 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     const string_view &str = val_str.get<FlatSharedStr>().get_view();
     const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
 
-    FlatSharedArray::inner_type vec;
+    FlatSharedArray::vec_type vec;
     size_t last = 0, next = 0;
 
     while ((next = str.find(delim, last)) != string::npos) {
@@ -201,7 +201,7 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
 
     const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
     const FlatSharedArray &arr = val_arr.get<FlatSharedArray>();
-    const FlatSharedArray::inner_type &vec = arr.get_shval().get();
+    const FlatSharedArray::vec_type &vec = arr.get_ref();
     string result;
 
     for (size_t i = 0; i < arr.size(); i++) {

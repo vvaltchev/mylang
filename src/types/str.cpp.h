@@ -10,13 +10,6 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-FlatSharedStr::FlatSharedStr(string &&s)
-    : shval(make_shared<string>(move(s)))
-    , off(0)
-    , len(get_ref().size())
-{
-}
-
 class TypeStr : public SharedType<FlatSharedStr> {
 
     void append(FlatSharedStr &lval, const string_view &s);

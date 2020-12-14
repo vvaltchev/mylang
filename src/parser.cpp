@@ -973,7 +973,7 @@ MakeConstructFromConstVal(const EvalValue &v,
     if (v.is<FlatSharedArray>() && process_arrays) {
 
         FlatSharedArray &&arr = v.get<FlatSharedArray>();
-        const FlatSharedArray::inner_type &vec = arr.get_shval().get();
+        const FlatSharedArray::vec_type &vec = arr.get_ref();
         unique_ptr<LiteralArray> litarr(new LiteralArray);
 
         for (unsigned i = arr.offset(); i < arr.offset() + arr.size(); i++) {

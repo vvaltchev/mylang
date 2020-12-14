@@ -159,7 +159,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
-    FlatSharedArray::inner_type vec;
+    FlatSharedArray::vec_type vec;
     vec.reserve(elems.size());
 
     for (const auto &e : elems) {
@@ -601,7 +601,7 @@ EvalValue &LValue::get_value_for_put()
     *container = container->clone();
 
     assert(container->val.is<FlatSharedArray>());
-    return container->val.get<FlatSharedArray>().get_shval().get()[container_idx].val;
+    return container->val.get<FlatSharedArray>().get_ref()[container_idx].val;
 }
 
 void LValue::put(const EvalValue &v)

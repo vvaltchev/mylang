@@ -10,20 +10,13 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-template <>
-FlatSharedArrayTempl<LValue>::FlatSharedArrayTempl(inner_type &&arr)
-    : shval(make_shared<inner_type>(move(arr)))
-    , off(0)
-    , len(get_ref().size())
-    , slice(false)
-{
-}
-
-class TypeArr : public SharedType<FlatSharedArray> {
+class TypeArr : public NonTrivialType<FlatSharedArray::inner_type> {
 
 public:
 
-    TypeArr() : SharedType<FlatSharedArray>(Type::t_arr) { }
+    TypeArr()
+        : NonTrivialType<FlatSharedArray::inner_type>(Type::t_arr)
+    { }
 
     virtual void add(EvalValue &a, const EvalValue &b);
     virtual void eq(EvalValue &a, const EvalValue &b);
@@ -58,7 +51,7 @@ bool TypeArr::is_slice(const EvalValue &a)
 EvalValue TypeArr::clone(const EvalValue &a)
 {
     const FlatSharedArray &lval = a.get<FlatSharedArray>();
-    FlatSharedArray::inner_type new_arr;
+    FlatSharedArray::vec_type new_arr;
     new_arr.reserve(lval.size());
 
     new_arr.insert(
@@ -96,7 +89,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
 
     } else {
 
-        FlatSharedArray::inner_type new_arr;
+        FlatSharedArray::vec_type new_arr;
         new_arr.reserve(lval.size() + rhs.size());
 
         new_arr.insert(
@@ -111,8 +104,8 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
             rhs.get_ref().cbegin() + rhs.offset() + rhs.size()
         );
 
-        dtor(&lval.get_shval()); /* We have to manually destroy our fake "trivial" object */
-        new (&lval.get_shval()) FlatSharedArray(move(new_arr));
+        dtor(&lval); /* We have to manually destroy our fake "trivial" object */
+        new (&lval) FlatSharedArray(move(new_arr));
     }
 }
 
@@ -167,7 +160,7 @@ string TypeArr::to_string(const EvalValue &a)
     res.reserve(arr.size() * 32);
     res += "[";
 
-    const FlatSharedArray::inner_type &vec = arr.get_ref();
+    const FlatSharedArray::vec_type &vec = arr.get_ref();
 
     for (unsigned i = 0; i < arr.size(); i++) {
 
@@ -189,7 +182,7 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
 
     const EvalValue &what = RValue(what_lval);
     FlatSharedArray &&arr = what.get<FlatSharedArray>();
-    FlatSharedArray::inner_type &vec = arr.get_ref();
+    FlatSharedArray::vec_type &vec = arr.get_ref();
     long idx = idx_val.get<long>();
 
     if (idx < 0)

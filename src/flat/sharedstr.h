@@ -11,18 +11,18 @@ public:
 
 private:
 
-    FlatSharedVal<inner_type> shval;
+    FlatSharedVal<inner_type> flat;
     unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
     unsigned len = 0;   /* NOTE: cannot be const because we're using this in a union */
     bool slice = false;
 
 public:
 
-    inner_type &get_ref() { return shval.get(); }
-    const inner_type &get_ref() const { return shval.get(); }
-    FlatSharedVal<inner_type> &get_shval() { return shval; }
-    const FlatSharedVal<inner_type> &get_shval() const { return shval; }
-    long use_count() const { return shval.use_count(); }
+    inner_type &get_ref() { return flat.get(); }
+    const inner_type &get_ref() const { return flat.get(); }
+    FlatSharedVal<inner_type> &get_shval() { return flat; }
+    const FlatSharedVal<inner_type> &get_shval() const { return flat; }
+    long use_count() const { return flat.use_count(); }
 
     FlatSharedStr() = default;
 
@@ -32,10 +32,14 @@ public:
      */
     FlatSharedStr(const inner_type &s) = delete;
 
-    FlatSharedStr(inner_type &&s);
+    FlatSharedStr(inner_type &&s)
+        : flat(make_shared<string>(move(s)))
+        , off(0)
+        , len(get_ref().size())
+    { }
 
     string_view get_view() const {
-        return string_view(shval.get().data() + offset(), size());
+        return string_view(flat->data() + offset(), size());
     }
 
     void set_slice(unsigned off_val, unsigned len_val) {

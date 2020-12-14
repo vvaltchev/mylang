@@ -46,6 +46,10 @@ public:
     const T &get() const {
         return *reinterpret_cast<T *>(const_cast<FlatVal<T> *>(this)->data);
     }
+
+    T *operator->() { return &get(); }
+
+    const T *operator->() const { return &get(); }
 };
 
 template <class T>
@@ -67,7 +71,9 @@ public:
         : flat(move(s))
     { }
 
-    T &get() { return *flat.get().get(); }
-    const T &get() const { return *flat.get().get(); }
-    long use_count() const { return flat.get().use_count(); }
+    T &get() { return *flat->get(); }
+    const T &get() const { return *flat->get(); }
+    long use_count() const { return flat->use_count(); }
+    T *operator->() { return &get(); }
+    const T *operator->() const { return &get(); }
 };
