@@ -925,8 +925,8 @@ static const vector<test> tests =
         "Array of functions",
         {
             "var arr = [",
-            "   (func (v) => v+1),",
-            "   (func (v) => v+2)",
+            "   func (v) => v+1,",
+            "   func (v) => v+2",
             "];",
             "",
             "assert(arr[0](1) == 2);",

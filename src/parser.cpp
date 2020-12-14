@@ -934,7 +934,7 @@ pAcceptFuncDecl(ParseContext &c,
 
     if (pAcceptOp(c, Op::arrow)) {
 
-        func->body = pExprTop(c, fl);
+        func->body = pExpr14(c, fl);
 
     } else if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody)) {
 
