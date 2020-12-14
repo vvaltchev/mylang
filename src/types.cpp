@@ -182,6 +182,44 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     return EvalValue(SharedArray(move(vec)));
 }
 
+EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg_arr = exprList->elems[0].get();
+    Construct *arg_delim = exprList->elems[1].get();
+
+    const EvalValue &val_arr = RValue(arg_arr->eval(ctx));
+    const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
+
+    if (!val_arr.is<SharedArray>())
+        throw TypeErrorEx(arg_arr->start, arg_arr->end);
+
+    if (!val_delim.is<SharedStr>())
+        throw TypeErrorEx(arg_delim->start, arg_delim->end);
+
+    const string_view &delim = val_delim.get<SharedStr>().get_view();
+    const SharedArray &arr = val_arr.get<SharedArray>();
+    const SharedArray::inner_type &vec = arr.vec.get();
+    string result;
+
+    for (size_t i = 0; i < arr.len; i++) {
+
+        const EvalValue &val = vec[arr.off + i].get();
+
+        if (!val.is<SharedStr>())
+            throw TypeErrorEx(arg_arr->start, arg_arr->end);
+
+        result += val.get<SharedStr>().get_view();
+
+        if (i != arr.len - 1)
+            result += delim;
+    }
+
+    return EvalValue(SharedStr(move(result)));
+}
+
 const string &
 find_builtin_name(const Builtin &b)
 {
@@ -225,6 +263,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_pair("int", LValue(Builtin{builtin_int}, true)),
     make_pair("clone", LValue(Builtin{builtin_clone}, true)),
     make_pair("split", LValue(Builtin{builtin_split}, true)),
+    make_pair("join", LValue(Builtin{builtin_join}, true)),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

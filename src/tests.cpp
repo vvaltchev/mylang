@@ -1009,6 +1009,42 @@ static const vector<test> tests =
             "assert(arr == [\"a\",\"b\",\"c\"]);",
         },
     },
+
+    {
+        "join() builtin, base case",
+        {
+            "var a = [\"a\", \"b\"];",
+            "var s = join(a, \",\");",
+            "assert(s == \"a,b\");",
+        },
+    },
+
+    {
+        "join() builtin, const case",
+        {
+            "const a = [\"a\", \"b\"];",
+            "const s = join(a, \",\");",
+            "assert(s == \"a,b\");",
+        },
+    },
+
+    {
+        "join() builtin, single elem case",
+        {
+            "var a = [\"a\"];",
+            "var s = join(a, \",\");",
+            "assert(s == \"a\");",
+        },
+    },
+
+    {
+        "join() builtin, no elems case",
+        {
+            "var a = [];",
+            "var s = join(a, \",\");",
+            "assert(s == \"\");",
+        },
+    },
 };
 
 static void
