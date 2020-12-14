@@ -25,14 +25,14 @@ public:
 private:
 
     inner_type &get_ref() const {
-        return const_cast<SharedArrayTemplate *>(this)->vec.get();
+        return const_cast<SharedArrayTemplate *>(this)->shval.get();
     }
 
     long use_count() const {
-        return const_cast<SharedArrayTemplate *>(this)->vec.use_count();
+        return const_cast<SharedArrayTemplate *>(this)->shval.use_count();
     }
 
-    SharedVal<inner_type> vec;
+    SharedVal<inner_type> shval;
     unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
     unsigned len = 0;   /* NOTE: cannot be const because we're using this in a union */
     bool slice = false;
@@ -43,8 +43,8 @@ public:
     SharedArrayTemplate(const inner_type &arr) = delete;
     SharedArrayTemplate(inner_type &&arr);
 
-    SharedVal<inner_type> &get_shval() { return vec; }
-    const SharedVal<inner_type> &get_shval() const { return vec; }
+    SharedVal<inner_type> &get_shval() { return shval; }
+    const SharedVal<inner_type> &get_shval() const { return shval; }
 
     void set_slice(unsigned off_val, unsigned len_val) {
         off = off_val;

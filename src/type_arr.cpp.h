@@ -12,7 +12,7 @@
 
 template <>
 SharedArrayTemplate<LValue>::SharedArrayTemplate(vector<LValue> &&arr)
-    : vec(make_shared<vector<LValue>>(move(arr)))
+    : shval(make_shared<vector<LValue>>(move(arr)))
     , off(0)
     , len(get_ref().size())
     , slice(false)
@@ -167,7 +167,7 @@ string TypeArr::to_string(const EvalValue &a)
     res.reserve(arr.size() * 32);
     res += "[";
 
-    const SharedArray::inner_type &vec = arr.vec.get();
+    const SharedArray::inner_type &vec = arr.shval.get();
 
     for (unsigned i = 0; i < arr.size(); i++) {
 
@@ -189,7 +189,7 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
 
     const EvalValue &what = RValue(what_lval);
     SharedArray &&arr = what.get<SharedArray>();
-    SharedArray::inner_type &vec = arr.vec.get();
+    SharedArray::inner_type &vec = arr.shval.get();
     long idx = idx_val.get<long>();
 
     if (idx < 0)

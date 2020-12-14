@@ -11,7 +11,7 @@
 #include "evaltypes.cpp.h"
 
 SharedStr::SharedStr(string &&s)
-    : str(make_shared<string>(move(s)))
+    : shval(make_shared<string>(move(s)))
     , off(0)
     , len(get_ref().size())
 {
