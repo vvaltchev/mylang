@@ -11,8 +11,8 @@
 #include "evaltypes.cpp.h"
 
 template <>
-SharedArrayTemplate<LValue>::SharedArrayTemplate(vector<LValue> &&arr)
-    : shval(make_shared<vector<LValue>>(move(arr)))
+SharedArrayTemplate<LValue>::SharedArrayTemplate(inner_type &&arr)
+    : shval(make_shared<inner_type>(move(arr)))
     , off(0)
     , len(get_ref().size())
     , slice(false)

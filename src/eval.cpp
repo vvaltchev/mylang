@@ -159,7 +159,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
-    vector<LValue> vec;
+    SharedArray::inner_type vec;
     vec.reserve(elems.size());
 
     for (const auto &e : elems) {

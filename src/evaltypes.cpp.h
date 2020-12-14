@@ -35,7 +35,7 @@ public:
 
         static_assert(S >= sizeof(T));
 
-        if (S > sizeof(T)) {
+        if constexpr(S > sizeof(T)) {
             memset(obj, 0, S);
         }
 
@@ -48,7 +48,7 @@ public:
 
     virtual void copy_ctor(void *obj, const void *other) {
 
-        if (S > sizeof(T)) {
+        if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 
@@ -57,7 +57,7 @@ public:
 
     virtual void move_ctor(void *obj, void *other) {
 
-        if (S > sizeof(T)) {
+        if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 
@@ -66,7 +66,7 @@ public:
 
     virtual void copy_assign(void *obj, const void *other) {
 
-        if (S > sizeof(T)) {
+        if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 
@@ -75,7 +75,7 @@ public:
 
     virtual void move_assign(void *obj, void *other) {
 
-        if (S > sizeof(T)) {
+        if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
         }
 

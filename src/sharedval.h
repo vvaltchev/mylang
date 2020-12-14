@@ -21,37 +21,53 @@ using namespace std;
  */
 
 template <class T>
-class SharedVal {
-
-    shared_ptr<T> &to_shared_ptr() {
-        return *reinterpret_cast<shared_ptr<T> *>(data);
-    }
+class FlatVal {
 
 public:
 
     typedef T inner_type;
 
-    alignas(shared_ptr<T>) char data[sizeof(shared_ptr<T>)];
+    alignas(T) char data[sizeof(T)];
 
-    SharedVal() = default;
+    FlatVal() = default;
 
-    SharedVal(const shared_ptr<T> &s) {
-        new ((void *)data) shared_ptr<T>(s);
+    FlatVal(const T &s) {
+        new ((void *)data) T(s);
     }
 
-    SharedVal(shared_ptr<T> &&s) {
-        new ((void *)data) shared_ptr<T>(move(s));
+    FlatVal(T &&s) {
+        new ((void *)data) T(move(s));
     }
 
     T &get() {
-        return *to_shared_ptr().get();
+        return *reinterpret_cast<T *>(data);
     }
 
     const T &get() const {
-        return *const_cast<SharedVal<T> *>(this)->to_shared_ptr().get();
+        return *reinterpret_cast<T *>(const_cast<FlatVal<T> *>(this)->data);
     }
+};
 
-    long use_count() const {
-        return const_cast<SharedVal<T> *>(this)->to_shared_ptr().use_count();
-    }
+template <class T>
+class SharedVal {
+
+    FlatVal<shared_ptr<T>> flat;
+
+public:
+
+    typedef T inner_type;
+
+    SharedVal() = default;
+
+    SharedVal(const shared_ptr<T> &s)
+        : flat(s)
+    { }
+
+    SharedVal(shared_ptr<T> &&s)
+        : flat(move(s))
+    { }
+
+    T &get() { return *flat.get().get(); }
+    const T &get() const { return *flat.get().get(); }
+    long use_count() const { return flat.get().use_count(); }
 };
