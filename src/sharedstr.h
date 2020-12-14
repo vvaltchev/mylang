@@ -7,33 +7,9 @@
 class SharedStr {
 
 public:
-
-    friend class TypeStr;
     typedef string inner_type;
 
 private:
-
-    /*
-     * This method is `const` despite accesses the non-const
-     * SharedVal<T>::get() method, simply because that method always
-     * return a T&, for performance reasons. SharedVal<T> has no way
-     * to know about string_view because it's generic and it cannot offer
-     * a T get() const method, because that will require a string copy.
-     *
-     * Therefore, we always call a non-const method, even inside `const`
-     * functions here but just allow only const operations like getting
-     * a string_view, inside `const` methods. This way of breaking strict
-     * constness is NOT a hack. It's more like the `@trusted` attribute
-     * in Dlang which allows the programmer to "bless" a given unsafe
-     * function and treat it as safe.
-     */
-    inner_type &get_ref() const {
-        return const_cast<SharedStr *>(this)->shval.get();
-    }
-
-    long use_count() const {
-        return const_cast<SharedStr *>(this)->shval.use_count();
-    }
 
     SharedVal<inner_type> shval;
     unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
@@ -41,6 +17,12 @@ private:
     bool slice = false;
 
 public:
+
+    inner_type &get_ref() { return shval.get(); }
+    const inner_type &get_ref() const { return shval.get(); }
+    SharedVal<inner_type> &get_shval() { return shval; }
+    const SharedVal<inner_type> &get_shval() const { return shval; }
+    long use_count() const { return shval.use_count(); }
 
     SharedStr() = default;
 
@@ -53,11 +35,8 @@ public:
     SharedStr(inner_type &&s);
 
     string_view get_view() const {
-        return string_view(get_ref().data() + offset(), size());
+        return string_view(shval.get().data() + offset(), size());
     }
-
-    SharedVal<inner_type> &get_shval() { return shval; }
-    const SharedVal<inner_type> &get_shval() const { return shval; }
 
     void set_slice(unsigned off_val, unsigned len_val) {
         off = off_val;
@@ -66,12 +45,6 @@ public:
     }
 
     bool is_slice() const { return slice; }
-
-    unsigned offset() const {
-        return slice ? off : 0;
-    }
-
-    unsigned size() const {
-        return slice ? const_cast<SharedStr *>(this)->len : get_ref().size();
-    }
+    unsigned offset() const { return slice ? off : 0; }
+    unsigned size() const { return slice ? len : get_ref().size(); }
 };

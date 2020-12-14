@@ -59,12 +59,12 @@ EvalValue TypeArr::clone(const EvalValue &a)
 {
     const SharedArray &lval = a.get<SharedArray>();
     SharedArray::inner_type new_arr;
-    new_arr.reserve(lval.len);
+    new_arr.reserve(lval.size());
 
     new_arr.insert(
         new_arr.end(),
-        lval.get_ref().begin() + lval.off,
-        lval.get_ref().begin() + lval.off + lval.len
+        lval.get_ref().begin() + lval.offset(),
+        lval.get_ref().begin() + lval.offset() + lval.size()
     );
 
     return SharedArray(move(new_arr));
@@ -167,7 +167,7 @@ string TypeArr::to_string(const EvalValue &a)
     res.reserve(arr.size() * 32);
     res += "[";
 
-    const SharedArray::inner_type &vec = arr.shval.get();
+    const SharedArray::inner_type &vec = arr.get_ref();
 
     for (unsigned i = 0; i < arr.size(); i++) {
 
@@ -189,7 +189,7 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
 
     const EvalValue &what = RValue(what_lval);
     SharedArray &&arr = what.get<SharedArray>();
-    SharedArray::inner_type &vec = arr.shval.get();
+    SharedArray::inner_type &vec = arr.get_ref();
     long idx = idx_val.get<long>();
 
     if (idx < 0)
@@ -198,7 +198,7 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
     if (idx < 0 || idx >= arr.size())
         throw OutOfBoundsEx();
 
-    LValue *ret = &vec[arr.off + idx];
+    LValue *ret = &vec[arr.offset() + idx];
 
     if (!what_lval.is<LValue *>()) {
         /* The input array was not an LValue, so return a simple RValue */

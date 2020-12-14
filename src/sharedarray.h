@@ -18,19 +18,9 @@ template <class LValueType>
 class SharedArrayTemplate {
 
 public:
-
-    friend class TypeArr;
     typedef vector<LValueType> inner_type;
 
 private:
-
-    inner_type &get_ref() const {
-        return const_cast<SharedArrayTemplate *>(this)->shval.get();
-    }
-
-    long use_count() const {
-        return const_cast<SharedArrayTemplate *>(this)->shval.use_count();
-    }
 
     SharedVal<inner_type> shval;
     unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
@@ -38,13 +28,15 @@ private:
     bool slice = false;
 
 public:
-
     SharedArrayTemplate() = default;
     SharedArrayTemplate(const inner_type &arr) = delete;
     SharedArrayTemplate(inner_type &&arr);
 
+    inner_type &get_ref() { return shval.get(); }
+    const inner_type &get_ref() const { return shval.get(); }
     SharedVal<inner_type> &get_shval() { return shval; }
     const SharedVal<inner_type> &get_shval() const { return shval; }
+    long use_count() const { return shval.use_count(); }
 
     void set_slice(unsigned off_val, unsigned len_val) {
         off = off_val;
@@ -53,14 +45,6 @@ public:
     }
 
     bool is_slice() const { return slice; }
-
-    unsigned offset() const {
-        return slice ? off : 0;
-    }
-
-    unsigned size() const {
-        return slice
-            ? const_cast<SharedArrayTemplate *>(this)->len
-            : get_ref().size();
-    }
+    unsigned offset() const { return slice ? off : 0; }
+    unsigned size() const { return slice ? len : get_ref().size(); }
 };
