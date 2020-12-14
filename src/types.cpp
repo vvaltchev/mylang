@@ -121,6 +121,26 @@ EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList)
     return e.get_type()->intptr(e);
 }
 
+EvalValue builtin_undef(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    Identifier *id = dynamic_cast<Identifier *>(arg);
+
+    if (!id)
+        throw TypeErrorEx(arg->start, arg->end);
+
+    const auto &it = ctx->symbols.find(id->value);
+
+    if (it == ctx->symbols.end())
+        return false;
+
+    ctx->symbols.erase(it);
+    return true;
+}
+
 const string &
 find_builtin_name(const Builtin &b)
 {
@@ -171,4 +191,5 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_pair("assert", LValue(Builtin{builtin_assert}, false)),
     make_pair("exit", LValue(Builtin{builtin_exit}, false)),
     make_pair("intptr", LValue(Builtin{builtin_intptr}, false)),
+    make_pair("undef", LValue(Builtin{builtin_undef}, false)),
 };

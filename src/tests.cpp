@@ -933,6 +933,37 @@ static const vector<test> tests =
             "assert(arr[1](1) == 3);",
         },
     },
+
+    {
+        "Undef builtin",
+        {
+            "var a = \"hello\";",
+            "assert(a == \"hello\");",
+            "assert(undef(a));",
+            "assert(a == \"hello\");",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "Undef builtin, undefined var",
+        {
+            "assert(!undef(abc));",
+        }
+    },
+
+    {
+        "undef() builtin, variable shadowing another",
+        {
+            "var a = 42;",
+            "{",
+            "   var a = 10;",
+            "   assert(a == 10);",
+            "   undef(a);",
+            "}",
+            "assert(a == 42);",
+        },
+    },
 };
 
 static void
