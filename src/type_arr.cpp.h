@@ -15,6 +15,7 @@ SharedArrayTemplate<LValue>::SharedArrayTemplate(vector<LValue> &&arr)
     : vec(make_shared<vector<LValue>>(move(arr)))
     , off(0)
     , len(get_ref().size())
+    , slice(false)
 {
 }
 
@@ -33,6 +34,7 @@ public:
                             const EvalValue &end);
 
     virtual long use_count(const EvalValue &a);
+    virtual bool is_slice(const EvalValue &a);
     virtual EvalValue clone(const EvalValue &a);
     virtual EvalValue intptr(const EvalValue &a);
 
@@ -46,6 +48,11 @@ public:
 long TypeArr::use_count(const EvalValue &a)
 {
     return a.get<SharedArray>().use_count();
+}
+
+bool TypeArr::is_slice(const EvalValue &a)
+{
+    return a.get<SharedArray>().is_slice();
 }
 
 EvalValue TypeArr::clone(const EvalValue &a)
@@ -77,39 +84,35 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
 
     const SharedArray &rhs = b.get<SharedArray>();
 
-    if (lval.off == 0 && lval.len == lval.get_ref().size()) {
+    if (!lval.is_slice()) {
 
-        lval.get_ref().reserve(lval.len + rhs.size());
+        lval.get_ref().reserve(lval.size() + rhs.size());
 
         lval.get_ref().insert(
             lval.get_ref().end(),
-            rhs.get_ref().cbegin() + rhs.off,
-            rhs.get_ref().cbegin() + rhs.off + rhs.len
+            rhs.get_ref().cbegin() + rhs.offset(),
+            rhs.get_ref().cbegin() + rhs.offset() + rhs.size()
         );
-
-        lval.len += rhs.size();
 
     } else {
 
         SharedArray::inner_type new_arr;
-        new_arr.reserve(lval.len + rhs.len);
+        new_arr.reserve(lval.size() + rhs.size());
 
         new_arr.insert(
             new_arr.end(),
-            lval.get_ref().begin() + lval.off,
-            lval.get_ref().begin() + lval.off + lval.len
+            lval.get_ref().begin() + lval.offset(),
+            lval.get_ref().begin() + lval.offset() + lval.size()
         );
 
         new_arr.insert(
             new_arr.end(),
-            rhs.get_ref().cbegin() + rhs.off,
-            rhs.get_ref().cbegin() + rhs.off + rhs.len
+            rhs.get_ref().cbegin() + rhs.offset(),
+            rhs.get_ref().cbegin() + rhs.offset() + rhs.size()
         );
 
-        dtor(&lval.vec); /* We have to manually destroy our fake "trivial" object */
-        lval.vec = make_shared<SharedArray::inner_type>(move(new_arr));
-        lval.off = 0;
-        lval.len = lval.get_ref().size();
+        dtor(&lval.get_shval()); /* We have to manually destroy our fake "trivial" object */
+        new (&lval.get_shval()) SharedArray(move(new_arr));
     }
 }
 
@@ -123,21 +126,21 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
     const SharedArray &lhs = a.get<SharedArray>();
     const SharedArray &rhs = b.get<SharedArray>();
 
-    if (lhs.len != rhs.len) {
+    if (lhs.size() != rhs.size()) {
         a = false;
         return;
     }
 
     if (&lhs.get_ref() == &rhs.get_ref()) {
         /* Same vector, now just check the offsets */
-        a = lhs.off == rhs.off;
+        a = lhs.offset() == rhs.offset();
         return;
     }
 
-    for (unsigned i = 0; i < lhs.len; i++) {
+    for (unsigned i = 0; i < lhs.size(); i++) {
 
-        EvalValue &&obj_a = lhs.get_ref()[lhs.off + i].get_rval();
-        const EvalValue &obj_b = rhs.get_ref()[rhs.off + i].get();
+        EvalValue &&obj_a = lhs.get_ref()[lhs.offset() + i].get_rval();
+        const EvalValue &obj_b = rhs.get_ref()[rhs.offset() + i].get();
 
         obj_a.get_type()->eq(obj_a, obj_b);
 
@@ -166,12 +169,12 @@ string TypeArr::to_string(const EvalValue &a)
 
     const SharedArray::inner_type &vec = arr.vec.get();
 
-    for (unsigned i = 0; i < arr.len; i++) {
+    for (unsigned i = 0; i < arr.size(); i++) {
 
-        const EvalValue &val = vec[arr.off + i].get();
+        const EvalValue &val = vec[arr.offset() + i].get();
         res += val.get_type()->to_string(val);
 
-        if (i != arr.len - 1)
+        if (i != arr.size() - 1)
             res += ", ";
     }
 
@@ -204,7 +207,7 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
 
     /* We deferenced a LValue array, so return element's LValue */
     ret->container = what_lval.get<LValue *>();
-    ret->container_idx = arr.off + idx;
+    ret->container_idx = arr.offset() + idx;
     return ret;
 }
 
@@ -255,7 +258,6 @@ EvalValue TypeArr::slice(const EvalValue &what,
 
     SharedArray arr2;
     copy_ctor(&arr2, &arr); /* See TypeStr::subscript */
-    arr2.off += start;
-    arr2.len = end - start;
+    arr2.set_slice(arr.offset() + start, end - start);
     return arr2;
 }

@@ -17,35 +17,50 @@ using namespace std;
 template <class LValueType>
 class SharedArrayTemplate {
 
-    friend class TypeArr;
-
 public:
 
+    friend class TypeArr;
     typedef vector<LValueType> inner_type;
 
 private:
 
-    /* See SharedStr */
     inner_type &get_ref() const {
         return const_cast<SharedArrayTemplate *>(this)->vec.get();
     }
 
-    /* See SharedStr */
     long use_count() const {
         return const_cast<SharedArrayTemplate *>(this)->vec.use_count();
     }
 
-public:
-
     SharedVal<inner_type> vec;
-    unsigned off;   /* NOTE: cannot be const because we're using this in a union */
-    unsigned len;   /* NOTE: cannot be const because we're using this in a union */
+    unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
+    unsigned len = 0;   /* NOTE: cannot be const because we're using this in a union */
+    bool slice = false;
+
+public:
 
     SharedArrayTemplate() = default;
     SharedArrayTemplate(const inner_type &arr) = delete;
     SharedArrayTemplate(inner_type &&arr);
 
+    SharedVal<inner_type> &get_shval() { return vec; }
+    const SharedVal<inner_type> &get_shval() const { return vec; }
+
+    void set_slice(unsigned off_val, unsigned len_val) {
+        off = off_val;
+        len = len_val;
+        slice = true;
+    }
+
+    bool is_slice() const { return slice; }
+
+    unsigned offset() const {
+        return slice ? off : 0;
+    }
+
     unsigned size() const {
-        return const_cast<SharedArrayTemplate *>(this)->len;
+        return slice
+            ? const_cast<SharedArrayTemplate *>(this)->len
+            : get_ref().size();
     }
 };

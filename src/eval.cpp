@@ -597,7 +597,7 @@ EvalValue &LValue::get_value_for_put()
     *container = container->clone();
 
     assert(container->val.is<SharedArray>());
-    return container->val.get<SharedArray>().vec.get()[container_idx].val;
+    return container->val.get<SharedArray>().get_shval().get()[container_idx].val;
 }
 
 void LValue::put(const EvalValue &v)

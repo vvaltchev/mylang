@@ -201,19 +201,19 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
 
     const string_view &delim = val_delim.get<SharedStr>().get_view();
     const SharedArray &arr = val_arr.get<SharedArray>();
-    const SharedArray::inner_type &vec = arr.vec.get();
+    const SharedArray::inner_type &vec = arr.get_shval().get();
     string result;
 
-    for (size_t i = 0; i < arr.len; i++) {
+    for (size_t i = 0; i < arr.size(); i++) {
 
-        const EvalValue &val = vec[arr.off + i].get();
+        const EvalValue &val = vec[arr.offset() + i].get();
 
         if (!val.is<SharedStr>())
             throw TypeErrorEx(arg_arr->start, arg_arr->end);
 
         result += val.get<SharedStr>().get_view();
 
-        if (i != arr.len - 1)
+        if (i != arr.size() - 1)
             result += delim;
     }
 

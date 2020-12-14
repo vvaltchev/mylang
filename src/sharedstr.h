@@ -6,10 +6,9 @@
 
 class SharedStr {
 
-    friend class TypeStr;
-
 public:
 
+    friend class TypeStr;
     typedef string inner_type;
 
 private:
@@ -36,11 +35,12 @@ private:
         return const_cast<SharedStr *>(this)->str.use_count();
     }
 
-public:
-
     SharedVal<inner_type> str;
-    unsigned off;   /* NOTE: cannot be const because we're using this in a union */
-    unsigned len;   /* NOTE: cannot be const because we're using this in a union */
+    unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
+    unsigned len = 0;   /* NOTE: cannot be const because we're using this in a union */
+    bool slice = false;
+
+public:
 
     SharedStr() = default;
 
@@ -53,10 +53,25 @@ public:
     SharedStr(inner_type &&s);
 
     string_view get_view() const {
-        return string_view(get_ref().data() + off, len);
+        return string_view(get_ref().data() + offset(), size());
+    }
+
+    SharedVal<inner_type> &get_shval() { return str; }
+    const SharedVal<inner_type> &get_shval() const { return str; }
+
+    void set_slice(unsigned off_val, unsigned len_val) {
+        off = off_val;
+        len = len_val;
+        slice = true;
+    }
+
+    bool is_slice() const { return slice; }
+
+    unsigned offset() const {
+        return slice ? off : 0;
     }
 
     unsigned size() const {
-        return const_cast<SharedStr *>(this)->len;
+        return slice ? const_cast<SharedStr *>(this)->len : get_ref().size();
     }
 };

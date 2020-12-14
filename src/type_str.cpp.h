@@ -40,6 +40,7 @@ public:
 
     virtual long use_count(const EvalValue &a);
     virtual EvalValue clone(const EvalValue &a);
+    virtual bool is_slice(const EvalValue &a);
     virtual EvalValue intptr(const EvalValue &a);
 
     virtual long len(const EvalValue &a) {
@@ -67,6 +68,11 @@ long TypeStr::use_count(const EvalValue &a)
     return a.get<SharedStr>().use_count();
 }
 
+bool TypeStr::is_slice(const EvalValue &a)
+{
+    return a.get<SharedStr>().is_slice();
+}
+
 EvalValue TypeStr::intptr(const EvalValue &a)
 {
     return reinterpret_cast<long>(&a.get<SharedStr>().get_ref());
@@ -74,22 +80,19 @@ EvalValue TypeStr::intptr(const EvalValue &a)
 
 void TypeStr::append(SharedStr &lval, const string_view &s)
 {
-    if (lval.off == 0 && lval.len == lval.get_ref().size()) {
+    if (!lval.is_slice()) {
 
         lval.get_ref() += s;
-        lval.len += s.length();
 
     } else {
 
         string new_str;
-        new_str.reserve(lval.len + s.size());
+        new_str.reserve(lval.size() + s.size());
         new_str += lval.get_view();
         new_str += s;
 
-        dtor(&lval.str); /* We have to manually destroy our fake "trivial" object */
-        lval.str = make_shared<string>(move(new_str));
-        lval.off = 0;
-        lval.len = lval.get_ref().size();
+        dtor(&lval.get_shval()); /* We have to manually destroy our fake "trivial" object */
+        new (&lval.get_shval()) SharedStr(move(new_str));
     }
 }
 
@@ -207,12 +210,10 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
      * Of course, we have to manually call the copy ctor because SharedStr is
      * a POD type, contaning the data of a non-trivial C++ type and, we cannot
      * implement the copy ctor, move ctor etc. in SharedStr, otherwise it won't
-     * be a POD type anymore, so it won't be accepted in EvalValue's union.
+     * be a POD type anymore, and it won't be accepted in EvalValue's union.
      */
     copy_ctor(&s2, &s);
-
-    s2.off += idx;
-    s2.len = 1;
+    s2.set_slice(s.offset() + idx, 1);
     return s2;
 }
 
@@ -263,7 +264,6 @@ EvalValue TypeStr::slice(const EvalValue &what,
 
     SharedStr s2;
     copy_ctor(&s2, &s); /* See TypeStr::subscript */
-    s2.off += start;
-    s2.len = end - start;
+    s2.set_slice(s.offset() + start, end - start);
     return s2;
 }

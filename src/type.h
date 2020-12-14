@@ -97,6 +97,11 @@ public:
         return 1;
     }
 
+    virtual bool is_slice(const EvalValueT &a)
+    {
+        return false;
+    }
+
     virtual EvalValueT clone(const EvalValueT &a)
     {
         return a;

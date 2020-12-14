@@ -973,10 +973,10 @@ MakeConstructFromConstVal(const EvalValue &v,
     if (v.is<SharedArray>() && process_arrays) {
 
         SharedArray &&arr = v.get<SharedArray>();
-        const SharedArray::inner_type &vec = arr.vec.get();
+        const SharedArray::inner_type &vec = arr.get_shval().get();
         unique_ptr<LiteralArray> litarr(new LiteralArray);
 
-        for (unsigned i = arr.off; i < arr.off + arr.len; i++) {
+        for (unsigned i = arr.offset(); i < arr.offset() + arr.size(); i++) {
 
             unique_ptr<Construct> elem_construct;
 
