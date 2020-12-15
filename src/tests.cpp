@@ -1106,6 +1106,19 @@ static const vector<test> tests =
             "assert(splitlines(\"\\r\\nb\") == [\"\",\"b\"]);",
         },
     },
+
+    {
+        "Builtins chr() and ord()",
+        {
+            "assert(ord(\"A\") == 65);",
+            "assert(chr(65) == \"A\");",
+            "var i = 0;",
+            "while (i < 256) {",
+            "   assert(ord(chr(i)) == i);",
+            "   i += 1;",
+            "}",
+        },
+    },
 };
 
 static void

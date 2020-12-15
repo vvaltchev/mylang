@@ -175,3 +175,38 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
 
     return FlatSharedArray(move(vec));
 }
+
+EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (!val.is<FlatSharedStr>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
+    const string_view &str = flat_str.get_view();
+
+    if (str.size() != 1)
+         throw TypeErrorEx(arg->start, arg->end);
+
+    return static_cast<long>(static_cast<unsigned char>(str[0]));
+}
+
+EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (!val.is<long>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    char c = static_cast<char>(val.get<long>());
+    return FlatSharedStr(string(&c, 1));
+}

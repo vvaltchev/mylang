@@ -85,6 +85,8 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_pair("join", LValue(Builtin{builtin_join}, true)),
     make_pair("splitlines", LValue(Builtin{builtin_splitlines}, true)),
     make_pair("abs", LValue(Builtin{builtin_abs}, true)),
+    make_pair("ord", LValue(Builtin{builtin_ord}, true)),
+    make_pair("chr", LValue(Builtin{builtin_chr}, true)),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
