@@ -21,20 +21,21 @@ class FlatSharedArrayTempl {
     class SharedArrayObj {
 
     public:
+        typedef vector<LValueT> vec_type;
 
-        typedef vector<LValueT> inner_type;
+    private:
+        shared_ptr<vec_type> shvec;
 
-        shared_ptr<inner_type> shvec;
-
+    public:
         unsigned off;
         unsigned len;
         bool slice;
 
         SharedArrayObj() : off(0), len(0), slice(false) { }
-        SharedArrayObj(const inner_type &arr) = delete;
+        SharedArrayObj(const vec_type &arr) = delete;
 
-        SharedArrayObj(inner_type &&arr)
-            : shvec(make_shared<inner_type>(move(arr)))
+        SharedArrayObj(vec_type &&arr)
+            : shvec(make_shared<vec_type>(move(arr)))
             , off(0)
             , len(shvec->size())
             , slice(false)
@@ -46,11 +47,15 @@ class FlatSharedArrayTempl {
             , len(len)
             , slice(true)
         { }
+
+        vec_type &get_vec() { return *shvec.get(); }
+        const vec_type &get_vec() const { return *shvec.get(); }
+        long use_count() const { return shvec.use_count(); }
     };
 
 public:
     typedef SharedArrayObj<LValueType> inner_type;
-    typedef typename inner_type::inner_type vec_type;
+    typedef typename inner_type::vec_type vec_type;
 
 private:
     FlatVal<inner_type> flat;
@@ -63,9 +68,9 @@ public:
         : flat(flatWrapper.flat.get(), off, len)
     { }
 
-    vec_type &get_ref() { return *flat->shvec.get(); }
-    const vec_type &get_ref() const { return *flat->shvec.get(); }
-    long use_count() const { return flat->shvec.use_count(); }
+    vec_type &get_ref() { return flat->get_vec(); }
+    const vec_type &get_ref() const { return flat->get_vec(); }
+    long use_count() const { return flat->use_count(); }
 
     bool is_slice() const { return flat->slice; }
     unsigned offset() const { return flat->slice ? flat->off : 0; }
