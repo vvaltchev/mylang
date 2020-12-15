@@ -31,12 +31,14 @@ public:
 
     FlatVal() = default;
 
-    FlatVal(const T &s) {
-        new ((void *)data) T(s);
+    template<typename... Args>
+    FlatVal(const T &s, Args&&... args) {
+        new ((void *)data) T(s, forward<Args>(args)...);
     }
 
-    FlatVal(T &&s) {
-        new ((void *)data) T(move(s));
+    template<typename... Args>
+    FlatVal(T &&s, Args&&... args) {
+        new ((void *)data) T(move(s), forward<Args>(args)...);
     }
 
     T &get() {

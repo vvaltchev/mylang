@@ -250,8 +250,5 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
         throw TypeErrorEx();
     }
 
-    FlatSharedArray arr2;
-    copy_ctor(&arr2, &arr); /* See TypeStr::subscript */
-    arr2.set_slice(arr.offset() + start, end - start);
-    return arr2;
+    return FlatSharedArray(arr, arr.offset() + start, end - start);
 }
