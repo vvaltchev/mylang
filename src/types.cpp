@@ -24,6 +24,21 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     exit(e.get<long>());
 }
 
+EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    if (!e.is<long>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    const long val = e.get<long>();
+    return val >= 0 ? val : -val;
+}
+
 const string &
 find_builtin_name(const Builtin &b)
 {
@@ -69,6 +84,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_pair("split", LValue(Builtin{builtin_split}, true)),
     make_pair("join", LValue(Builtin{builtin_join}, true)),
     make_pair("splitlines", LValue(Builtin{builtin_splitlines}, true)),
+    make_pair("abs", LValue(Builtin{builtin_abs}, true)),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
