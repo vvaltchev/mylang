@@ -8,16 +8,7 @@
 #include "types/arr.cpp.h"
 #include "builtins/str.cpp.h"
 #include "builtins/generic.cpp.h"
-
-EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
-{
-    for (const auto &e: exprList->elems) {
-        cout << RValue(e->eval(ctx)) << " ";
-    }
-
-    cout << endl;
-    return EvalValue();
-}
+#include "builtins/io.cpp.h"
 
 EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
 {
@@ -81,9 +72,15 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
 
 const EvalContext::SymbolsType EvalContext::builtins =
 {
-    make_pair("print", LValue(Builtin{builtin_print}, false)),
     make_pair("assert", LValue(Builtin{builtin_assert}, false)),
     make_pair("exit", LValue(Builtin{builtin_exit}, false)),
     make_pair("intptr", LValue(Builtin{builtin_intptr}, false)),
     make_pair("undef", LValue(Builtin{builtin_undef}, false)),
+    make_pair("print", LValue(Builtin{builtin_print}, false)),
+    make_pair("write", LValue(Builtin{builtin_write}, false)),
+    make_pair("writeln", LValue(Builtin{builtin_writeln}, false)),
+    make_pair("read", LValue(Builtin{builtin_read}, false)),
+    make_pair("readln", LValue(Builtin{builtin_readln}, false)),
+    make_pair("readlines", LValue(Builtin{builtin_readlines}, false)),
+    make_pair("writelines", LValue(Builtin{builtin_writelines}, false)),
 };
