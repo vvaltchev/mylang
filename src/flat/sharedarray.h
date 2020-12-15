@@ -3,6 +3,8 @@
 #pragma once
 #include "flatval.h"
 #include <vector>
+#include <unordered_set>
+#include <cassert>
 
 using namespace std;
 
@@ -27,6 +29,7 @@ class FlatSharedArrayTempl {
         struct SharedObject {
 
             vec_type vec;
+            unordered_set<SharedArrayObj *> slices;
 
             SharedObject() = default;
             SharedObject(vec_type &&arr)
@@ -41,7 +44,8 @@ class FlatSharedArrayTempl {
         unsigned len;
         bool slice;
 
-        SharedArrayObj() : off(0), len(0), slice(false) { }
+        /* Special constructors */
+
         SharedArrayObj(const vec_type &arr) = delete;
 
         SharedArrayObj(vec_type &&arr)
@@ -56,7 +60,69 @@ class FlatSharedArrayTempl {
             , off(off)
             , len(len)
             , slice(true)
-        { }
+        {
+            shobj->slices.insert(this);
+        }
+
+        /* Regular constructors */
+
+        SharedArrayObj() : off(0), len(0), slice(false) { }
+
+        SharedArrayObj(const SharedArrayObj &obj)
+            : shobj(obj.shobj)
+            , off(obj.off)
+            , len(obj.len)
+            , slice(obj.slice)
+        {
+            if (slice)
+                shobj->slices.insert(this);
+        }
+
+        SharedArrayObj(SharedArrayObj &&obj)
+            : shobj(move(obj.shobj))
+            , off(obj.off)
+            , len(obj.len)
+            , slice(obj.slice)
+        {
+            if (slice) {
+                shobj->slices.erase(&obj);
+                shobj->slices.insert(this);
+            }
+        }
+
+        SharedArrayObj &operator=(const SharedArrayObj &obj)
+        {
+            shobj = obj.shobj;
+            off = obj.off;
+            len = obj.len;
+            slice = obj.slice;
+
+            if (slice)
+                shobj->slices.insert(this);
+
+            return *this;
+        }
+
+        SharedArrayObj &operator=(SharedArrayObj &&obj)
+        {
+            shobj = move(obj.shobj);
+            off = obj.off;
+            len = obj.len;
+            slice = obj.slice;
+
+            if (slice) {
+                shobj->slices.erase(&obj);
+                shobj->slices.insert(this);
+            }
+
+            return *this;
+        }
+
+        ~SharedArrayObj() {
+
+            if (slice)
+                shobj->slices.erase(this);
+        }
 
         vec_type &get_vec() { return shobj->vec; }
         const vec_type &get_vec() const { return shobj->vec; }
