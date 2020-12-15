@@ -1082,6 +1082,13 @@ static const vector<test> tests =
             "assert(b == [1,2,3]);",
         },
     },
+
+    {
+        "Split string, char by char",
+        {
+            "assert(split(\"abc\", \"\") == [\"a\",\"b\",\"c\"]);"
+        },
+    },
 };
 
 static void

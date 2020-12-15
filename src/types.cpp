@@ -7,6 +7,8 @@
 #include "types/func.cpp.h"
 #include "types/arr.cpp.h"
 
+#include <algorithm>
+
 EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
@@ -158,26 +160,40 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     if (!val_delim.is<FlatSharedStr>())
         throw TypeErrorEx(arg_delim->start, arg_delim->end);
 
-    const string_view &str = val_str.get<FlatSharedStr>().get_view();
+    const FlatSharedStr &flat_str = val_str.get<FlatSharedStr>();
+    const string_view &str = flat_str.get_view();
     const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
 
     FlatSharedArray::vec_type vec;
-    size_t last = 0, next = 0;
 
-    while ((next = str.find(delim, last)) != string::npos) {
+    if (delim.size()) {
+
+        size_t last = 0, next = 0;
+
+        while ((next = str.find(delim, last)) != string::npos) {
+
+            vec.emplace_back(
+                EvalValue(FlatSharedStr(flat_str, last, next-last)),
+                ctx->const_ctx
+            );
+
+            last = next + delim.size();
+        }
 
         vec.emplace_back(
-            EvalValue(FlatSharedStr(string(str.substr(last, next-last)))),
+            EvalValue(FlatSharedStr(flat_str, last, str.size() - last)),
             ctx->const_ctx
         );
 
-        last = next + delim.size();
-    }
+    } else {
 
-    vec.emplace_back(
-        EvalValue(FlatSharedStr(string(str.substr(last)))),
-        ctx->const_ctx
-    );
+        for (size_t i = 0; i < str.size(); i++) {
+            vec.emplace_back(
+                EvalValue(FlatSharedStr(flat_str, i, 1)),
+                ctx->const_ctx
+            );
+        }
+    }
 
     return EvalValue(FlatSharedArray(move(vec)));
 }
