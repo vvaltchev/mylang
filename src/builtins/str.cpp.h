@@ -62,7 +62,7 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
         while ((next = str.find(delim, last)) != string::npos) {
 
             vec.emplace_back(
-                EvalValue(FlatSharedStr(flat_str, last, next-last)),
+                FlatSharedStr(flat_str, last, next-last),
                 ctx->const_ctx
             );
 
@@ -70,7 +70,7 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
         }
 
         vec.emplace_back(
-            EvalValue(FlatSharedStr(flat_str, last, str.size() - last)),
+            FlatSharedStr(flat_str, last, str.size() - last),
             ctx->const_ctx
         );
 
@@ -78,13 +78,13 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
 
         for (size_t i = 0; i < str.size(); i++) {
             vec.emplace_back(
-                EvalValue(FlatSharedStr(flat_str, i, 1)),
+                FlatSharedStr(flat_str, i, 1),
                 ctx->const_ctx
             );
         }
     }
 
-    return EvalValue(FlatSharedArray(move(vec)));
+    return FlatSharedArray(move(vec));
 }
 
 EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
@@ -122,5 +122,56 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
             result += delim;
     }
 
-    return EvalValue(FlatSharedStr(move(result)));
+    return FlatSharedStr(move(result));
+}
+
+EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (!val.is<FlatSharedStr>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
+    const string_view &str = flat_str.get_view();
+    FlatSharedArray::vec_type vec;
+    unsigned i, start = 0;
+
+    for (i = 0; i < str.size(); i++) {
+
+        if (str[i] == '\r') {
+
+            vec.emplace_back(
+                FlatSharedStr(flat_str, start, i - start),
+                ctx->const_ctx
+            );
+
+            if (i + 1 < str.size() && str[i + 1] == '\n')
+                i++;
+
+            start = i + 1;
+
+        } else if (str[i] == '\n') {
+
+            vec.emplace_back(
+                FlatSharedStr(flat_str, start, i - start),
+                ctx->const_ctx
+            );
+
+            start = i + 1;
+        }
+    }
+
+    if (!str.empty()) {
+        vec.emplace_back(
+            FlatSharedStr(flat_str, start, i - start),
+            ctx->const_ctx
+        );
+    }
+
+    return FlatSharedArray(move(vec));
 }

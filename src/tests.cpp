@@ -1089,6 +1089,23 @@ static const vector<test> tests =
             "assert(split(\"abc\", \"\") == [\"a\",\"b\",\"c\"]);"
         },
     },
+
+    {
+        "Builtin splitlines()",
+        {
+            "assert(splitlines(\"\") == []);",
+            "assert(splitlines(\"a\") == [\"a\"]);",
+            "assert(splitlines(\"a\\n\") == [\"a\",\"\"]);",
+            "assert(splitlines(\"a\\r\") == [\"a\",\"\"]);",
+            "assert(splitlines(\"a\\r\\n\") == [\"a\",\"\"]);",
+            "assert(splitlines(\"a\\nb\") == [\"a\",\"b\"]);",
+            "assert(splitlines(\"a\\rb\") == [\"a\",\"b\"]);",
+            "assert(splitlines(\"a\\r\\nb\") == [\"a\",\"b\"]);",
+            "assert(splitlines(\"\\nb\") == [\"\",\"b\"]);",
+            "assert(splitlines(\"\\rb\") == [\"\",\"b\"]);",
+            "assert(splitlines(\"\\r\\nb\") == [\"\",\"b\"]);",
+        },
+    },
 };
 
 static void

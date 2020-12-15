@@ -68,6 +68,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_pair("clone", LValue(Builtin{builtin_clone}, true)),
     make_pair("split", LValue(Builtin{builtin_split}, true)),
     make_pair("join", LValue(Builtin{builtin_join}, true)),
+    make_pair("splitlines", LValue(Builtin{builtin_splitlines}, true)),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
