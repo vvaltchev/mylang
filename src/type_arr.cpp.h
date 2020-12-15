@@ -11,7 +11,7 @@
 #include "evaltypes.cpp.h"
 
 template <>
-SharedArrayTemplate<LValue>::SharedArrayTemplate(inner_type &&arr)
+FlatSharedArrayTempl<LValue>::FlatSharedArrayTempl(inner_type &&arr)
     : shval(make_shared<inner_type>(move(arr)))
     , off(0)
     , len(get_ref().size())
@@ -19,11 +19,11 @@ SharedArrayTemplate<LValue>::SharedArrayTemplate(inner_type &&arr)
 {
 }
 
-class TypeArr : public SharedType<SharedArray> {
+class TypeArr : public SharedType<FlatSharedArray> {
 
 public:
 
-    TypeArr() : SharedType<SharedArray>(Type::t_arr) { }
+    TypeArr() : SharedType<FlatSharedArray>(Type::t_arr) { }
 
     virtual void add(EvalValue &a, const EvalValue &b);
     virtual void eq(EvalValue &a, const EvalValue &b);
@@ -39,7 +39,7 @@ public:
     virtual EvalValue intptr(const EvalValue &a);
 
     virtual long len(const EvalValue &a) {
-        return a.get<SharedArray>().size();
+        return a.get<FlatSharedArray>().size();
     }
 
     virtual string to_string(const EvalValue &a);
@@ -47,18 +47,18 @@ public:
 
 long TypeArr::use_count(const EvalValue &a)
 {
-    return a.get<SharedArray>().use_count();
+    return a.get<FlatSharedArray>().use_count();
 }
 
 bool TypeArr::is_slice(const EvalValue &a)
 {
-    return a.get<SharedArray>().is_slice();
+    return a.get<FlatSharedArray>().is_slice();
 }
 
 EvalValue TypeArr::clone(const EvalValue &a)
 {
-    const SharedArray &lval = a.get<SharedArray>();
-    SharedArray::inner_type new_arr;
+    const FlatSharedArray &lval = a.get<FlatSharedArray>();
+    FlatSharedArray::inner_type new_arr;
     new_arr.reserve(lval.size());
 
     new_arr.insert(
@@ -67,22 +67,22 @@ EvalValue TypeArr::clone(const EvalValue &a)
         lval.get_ref().begin() + lval.offset() + lval.size()
     );
 
-    return SharedArray(move(new_arr));
+    return FlatSharedArray(move(new_arr));
 }
 
 EvalValue TypeArr::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<long>(&a.get<SharedArray>().get_ref());
+    return reinterpret_cast<long>(&a.get<FlatSharedArray>().get_ref());
 }
 
 void TypeArr::add(EvalValue &a, const EvalValue &b)
 {
-    SharedArray &lval = a.get<SharedArray>();
+    FlatSharedArray &lval = a.get<FlatSharedArray>();
 
-    if (!b.is<SharedArray>())
+    if (!b.is<FlatSharedArray>())
         throw TypeErrorEx();
 
-    const SharedArray &rhs = b.get<SharedArray>();
+    const FlatSharedArray &rhs = b.get<FlatSharedArray>();
 
     if (!lval.is_slice()) {
 
@@ -96,7 +96,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
 
     } else {
 
-        SharedArray::inner_type new_arr;
+        FlatSharedArray::inner_type new_arr;
         new_arr.reserve(lval.size() + rhs.size());
 
         new_arr.insert(
@@ -112,19 +112,19 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
         );
 
         dtor(&lval.get_shval()); /* We have to manually destroy our fake "trivial" object */
-        new (&lval.get_shval()) SharedArray(move(new_arr));
+        new (&lval.get_shval()) FlatSharedArray(move(new_arr));
     }
 }
 
 void TypeArr::eq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedArray>()) {
+    if (!b.is<FlatSharedArray>()) {
         a = false;
         return;
     }
 
-    const SharedArray &lhs = a.get<SharedArray>();
-    const SharedArray &rhs = b.get<SharedArray>();
+    const FlatSharedArray &lhs = a.get<FlatSharedArray>();
+    const FlatSharedArray &rhs = b.get<FlatSharedArray>();
 
     if (lhs.size() != rhs.size()) {
         a = false;
@@ -161,13 +161,13 @@ void TypeArr::noteq(EvalValue &a, const EvalValue &b)
 
 string TypeArr::to_string(const EvalValue &a)
 {
-    SharedArray &&arr = a.get<SharedArray>();
+    FlatSharedArray &&arr = a.get<FlatSharedArray>();
     string res;
 
     res.reserve(arr.size() * 32);
     res += "[";
 
-    const SharedArray::inner_type &vec = arr.get_ref();
+    const FlatSharedArray::inner_type &vec = arr.get_ref();
 
     for (unsigned i = 0; i < arr.size(); i++) {
 
@@ -188,8 +188,8 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
         throw TypeErrorEx();
 
     const EvalValue &what = RValue(what_lval);
-    SharedArray &&arr = what.get<SharedArray>();
-    SharedArray::inner_type &vec = arr.get_ref();
+    FlatSharedArray &&arr = what.get<FlatSharedArray>();
+    FlatSharedArray::inner_type &vec = arr.get_ref();
     long idx = idx_val.get<long>();
 
     if (idx < 0)
@@ -216,7 +216,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
                          const EvalValue &end_val)
 {
     const EvalValue &what = RValue(what_lval);
-    const SharedArray &arr = what.get<SharedArray>();
+    const FlatSharedArray &arr = what.get<FlatSharedArray>();
     long start = 0, end = arr.size();
 
     if (start_val.is<long>()) {
@@ -257,7 +257,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
         throw TypeErrorEx();
     }
 
-    SharedArray arr2;
+    FlatSharedArray arr2;
     copy_ctor(&arr2, &arr); /* See TypeStr::subscript */
     arr2.set_slice(arr.offset() + start, end - start);
     return arr2;

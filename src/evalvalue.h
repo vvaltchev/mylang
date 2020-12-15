@@ -2,9 +2,9 @@
 
 #pragma once
 #include "errors.h"
-#include "flatval.h"
-#include "sharedstr.h"
-#include "sharedarray.h"
+#include "flat/flatval.h"
+#include "flat/sharedstr.h"
+#include "flat/sharedarray.h"
 #include "type.h"
 
 #include <string_view>
@@ -27,8 +27,8 @@ class EvalContext;
 class FuncObject;
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
-typedef FlatSharedVal<FuncObject> SharedFuncObjWrapper;
-typedef SharedArrayTemplate<LValue> SharedArray;
+typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
+typedef FlatSharedArrayTempl<LValue> FlatSharedArray;
 typedef TypeTemplate<EvalValue> Type;
 
 extern const array<Type *, Type::t_count> AllTypes;
@@ -41,9 +41,9 @@ template <> struct TypeToEnum<LValue *> { enum { val = Type::t_lval }; };
 template <> struct TypeToEnum<UndefinedId> { enum { val = Type::t_undefid }; };
 template <> struct TypeToEnum<long> { enum { val = Type::t_int }; };
 template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
-template <> struct TypeToEnum<SharedStr> { enum { val = Type::t_str }; };
-template <> struct TypeToEnum<SharedFuncObjWrapper> { enum { val = Type::t_func }; };
-template <> struct TypeToEnum<SharedArray> { enum { val = Type::t_arr }; };
+template <> struct TypeToEnum<FlatSharedStr> { enum { val = Type::t_str }; };
+template <> struct TypeToEnum<FlatSharedFuncObj> { enum { val = Type::t_func }; };
+template <> struct TypeToEnum<FlatSharedArray> { enum { val = Type::t_arr }; };
 
 class EvalValue {
 
@@ -57,9 +57,9 @@ class EvalValue {
         Builtin bfunc;
 
         /* non-trivial types */
-        SharedStr str;
-        SharedFuncObjWrapper func;
-        SharedArray arr;
+        FlatSharedStr str;
+        FlatSharedFuncObj func;
+        FlatSharedArray arr;
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }

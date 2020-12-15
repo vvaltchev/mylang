@@ -12,11 +12,11 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
-class TypeFunc : public SharedType<SharedFuncObjWrapper> {
+class TypeFunc : public SharedType<FlatSharedFuncObj> {
 
 public:
 
-    TypeFunc() : SharedType<SharedFuncObjWrapper>(Type::t_func) { }
+    TypeFunc() : SharedType<FlatSharedFuncObj>(Type::t_func) { }
 
     virtual long use_count(const EvalValue &a);
     virtual EvalValue clone(const EvalValue &a);
@@ -29,23 +29,23 @@ public:
 
 long TypeFunc::use_count(const EvalValue &a)
 {
-    return a.get<SharedFuncObjWrapper>().use_count();
+    return a.get<FlatSharedFuncObj>().use_count();
 }
 
 EvalValue TypeFunc::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<long>(&a.get<SharedFuncObjWrapper>().get());
+    return reinterpret_cast<long>(&a.get<FlatSharedFuncObj>().get());
 }
 
 EvalValue TypeFunc::clone(const EvalValue &a)
 {
-    const SharedFuncObjWrapper &wrapper = a.get<SharedFuncObjWrapper>();
+    const FlatSharedFuncObj &wrapper = a.get<FlatSharedFuncObj>();
     const FuncObject &func = wrapper.get();
 
     if (!func.capture_ctx.symbols.size())
         return a;
 
-    return SharedFuncObjWrapper(make_shared<FuncObject>(func));
+    return FlatSharedFuncObj(make_shared<FuncObject>(func));
 }
 
 FuncObject::FuncObject(const FuncObject &rhs)

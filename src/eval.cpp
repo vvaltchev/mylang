@@ -137,10 +137,10 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
         if (callable.is<Builtin>())
             return callable.get<Builtin>().func(ctx, args.get());
 
-        if (callable.is<SharedFuncObjWrapper>()) {
+        if (callable.is<FlatSharedFuncObj>()) {
             return do_func_call(
                 ctx,
-                callable.get<SharedFuncObjWrapper>().get(),
+                callable.get<FlatSharedFuncObj>().get(),
                 args.get()
             );
         }
@@ -159,14 +159,14 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
-    SharedArray::inner_type vec;
+    FlatSharedArray::inner_type vec;
     vec.reserve(elems.size());
 
     for (const auto &e : elems) {
         vec.emplace_back(e->eval(ctx), ctx->const_ctx);
     }
 
-    return SharedArray(move(vec));
+    return FlatSharedArray(move(vec));
 }
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
@@ -540,7 +540,7 @@ EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue func(
-        SharedFuncObjWrapper(make_shared<FuncObject>(this, ctx))
+        FlatSharedFuncObj(make_shared<FuncObject>(this, ctx))
     );
 
     if (id) {
@@ -600,8 +600,8 @@ EvalValue &LValue::get_value_for_put()
 
     *container = container->clone();
 
-    assert(container->val.is<SharedArray>());
-    return container->val.get<SharedArray>().get_shval().get()[container_idx].val;
+    assert(container->val.is<FlatSharedArray>());
+    return container->val.get<FlatSharedArray>().get_shval().get()[container_idx].val;
 }
 
 void LValue::put(const EvalValue &v)

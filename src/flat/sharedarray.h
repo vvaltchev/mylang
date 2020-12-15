@@ -2,12 +2,23 @@
 
 #pragma once
 #include "flatval.h"
-#include <string>
+#include <vector>
 
-class SharedStr {
+using namespace std;
+
+/*
+ * This class is a template simply because otherwise this header wouldn't be
+ * able to compile if included independently (it requires LValue, which requires
+ * EvalValue which requires FlatSharedArray). In this case, it wouldn't be a big
+ * deal, but in general it's an anti-pattern to have headers requiring a specific
+ * include order.
+ */
+
+template <class LValueType>
+class FlatSharedArrayTempl {
 
 public:
-    typedef string inner_type;
+    typedef vector<LValueType> inner_type;
 
 private:
 
@@ -17,26 +28,15 @@ private:
     bool slice = false;
 
 public:
+    FlatSharedArrayTempl() = default;
+    FlatSharedArrayTempl(const inner_type &arr) = delete;
+    FlatSharedArrayTempl(inner_type &&arr);
 
     inner_type &get_ref() { return shval.get(); }
     const inner_type &get_ref() const { return shval.get(); }
     FlatSharedVal<inner_type> &get_shval() { return shval; }
     const FlatSharedVal<inner_type> &get_shval() const { return shval; }
     long use_count() const { return shval.use_count(); }
-
-    SharedStr() = default;
-
-    /*
-     * That's not really necessary, just it helps knowing that we won't
-     * copy strings, but just move them.
-     */
-    SharedStr(const inner_type &s) = delete;
-
-    SharedStr(inner_type &&s);
-
-    string_view get_view() const {
-        return string_view(shval.get().data() + offset(), size());
-    }
 
     void set_slice(unsigned off_val, unsigned len_val) {
         off = off_val;

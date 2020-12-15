@@ -34,12 +34,12 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &val = RValue(arg->eval(ctx));
 
-    if (!val.is<SharedStr>())
+    if (!val.is<FlatSharedStr>())
         throw TypeErrorEx(arg->start, arg->end);
 
     try {
 
-        return stol(string(val.get<SharedStr>().get_view()));
+        return stol(string(val.get<FlatSharedStr>().get_view()));
 
     } catch (...) {
 
@@ -55,7 +55,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    return SharedStr(e.get_type()->to_string(e));
+    return FlatSharedStr(e.get_type()->to_string(e));
 }
 
 EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
@@ -152,22 +152,22 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val_str = RValue(arg_str->eval(ctx));
     const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
 
-    if (!val_str.is<SharedStr>())
+    if (!val_str.is<FlatSharedStr>())
         throw TypeErrorEx(arg_str->start, arg_str->end);
 
-    if (!val_delim.is<SharedStr>())
+    if (!val_delim.is<FlatSharedStr>())
         throw TypeErrorEx(arg_delim->start, arg_delim->end);
 
-    const string_view &str = val_str.get<SharedStr>().get_view();
-    const string_view &delim = val_delim.get<SharedStr>().get_view();
+    const string_view &str = val_str.get<FlatSharedStr>().get_view();
+    const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
 
-    SharedArray::inner_type vec;
+    FlatSharedArray::inner_type vec;
     size_t last = 0, next = 0;
 
     while ((next = str.find(delim, last)) != string::npos) {
 
         vec.emplace_back(
-            EvalValue(SharedStr(string(str.substr(last, next-last)))),
+            EvalValue(FlatSharedStr(string(str.substr(last, next-last)))),
             ctx->const_ctx
         );
 
@@ -175,11 +175,11 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     }
 
     vec.emplace_back(
-        EvalValue(SharedStr(string(str.substr(last)))),
+        EvalValue(FlatSharedStr(string(str.substr(last)))),
         ctx->const_ctx
     );
 
-    return EvalValue(SharedArray(move(vec)));
+    return EvalValue(FlatSharedArray(move(vec)));
 }
 
 EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
@@ -193,31 +193,31 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val_arr = RValue(arg_arr->eval(ctx));
     const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
 
-    if (!val_arr.is<SharedArray>())
+    if (!val_arr.is<FlatSharedArray>())
         throw TypeErrorEx(arg_arr->start, arg_arr->end);
 
-    if (!val_delim.is<SharedStr>())
+    if (!val_delim.is<FlatSharedStr>())
         throw TypeErrorEx(arg_delim->start, arg_delim->end);
 
-    const string_view &delim = val_delim.get<SharedStr>().get_view();
-    const SharedArray &arr = val_arr.get<SharedArray>();
-    const SharedArray::inner_type &vec = arr.get_shval().get();
+    const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
+    const FlatSharedArray &arr = val_arr.get<FlatSharedArray>();
+    const FlatSharedArray::inner_type &vec = arr.get_shval().get();
     string result;
 
     for (size_t i = 0; i < arr.size(); i++) {
 
         const EvalValue &val = vec[arr.offset() + i].get();
 
-        if (!val.is<SharedStr>())
+        if (!val.is<FlatSharedStr>())
             throw TypeErrorEx(arg_arr->start, arg_arr->end);
 
-        result += val.get<SharedStr>().get_view();
+        result += val.get<FlatSharedStr>().get_view();
 
         if (i != arr.size() - 1)
             result += delim;
     }
 
-    return EvalValue(SharedStr(move(result)));
+    return EvalValue(FlatSharedStr(move(result)));
 }
 
 const string &
@@ -253,7 +253,7 @@ const array<Type *, Type::t_count> AllTypes = {
  * in AllTypes.
  */
 
-const EvalValue EvalValue::empty_str = SharedStr(string());
+const EvalValue EvalValue::empty_str = FlatSharedStr(string());
 
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {

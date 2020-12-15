@@ -10,20 +10,20 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-SharedStr::SharedStr(string &&s)
+FlatSharedStr::FlatSharedStr(string &&s)
     : shval(make_shared<string>(move(s)))
     , off(0)
     , len(get_ref().size())
 {
 }
 
-class TypeStr : public SharedType<SharedStr> {
+class TypeStr : public SharedType<FlatSharedStr> {
 
-    void append(SharedStr &lval, const string_view &s);
+    void append(FlatSharedStr &lval, const string_view &s);
 
 public:
 
-    TypeStr() : SharedType<SharedStr>(Type::t_str) { }
+    TypeStr() : SharedType<FlatSharedStr>(Type::t_str) { }
 
     virtual void add(EvalValue &a, const EvalValue &b);
     virtual void mul(EvalValue &a, const EvalValue &b);
@@ -44,11 +44,11 @@ public:
     virtual EvalValue intptr(const EvalValue &a);
 
     virtual long len(const EvalValue &a) {
-        return a.get<SharedStr>().size();
+        return a.get<FlatSharedStr>().size();
     }
 
     virtual string to_string(const EvalValue &a) {
-        return string(a.get<SharedStr>().get_view());
+        return string(a.get<FlatSharedStr>().get_view());
     }
 };
 
@@ -65,20 +65,20 @@ EvalValue TypeStr::clone(const EvalValue &a)
 
 long TypeStr::use_count(const EvalValue &a)
 {
-    return a.get<SharedStr>().use_count();
+    return a.get<FlatSharedStr>().use_count();
 }
 
 bool TypeStr::is_slice(const EvalValue &a)
 {
-    return a.get<SharedStr>().is_slice();
+    return a.get<FlatSharedStr>().is_slice();
 }
 
 EvalValue TypeStr::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<long>(&a.get<SharedStr>().get_ref());
+    return reinterpret_cast<long>(&a.get<FlatSharedStr>().get_ref());
 }
 
-void TypeStr::append(SharedStr &lval, const string_view &s)
+void TypeStr::append(FlatSharedStr &lval, const string_view &s)
 {
     if (!lval.is_slice()) {
 
@@ -92,16 +92,16 @@ void TypeStr::append(SharedStr &lval, const string_view &s)
         new_str += s;
 
         dtor(&lval.get_shval()); /* We have to manually destroy our fake "trivial" object */
-        new (&lval.get_shval()) SharedStr(move(new_str));
+        new (&lval.get_shval()) FlatSharedStr(move(new_str));
     }
 }
 
 void TypeStr::add(EvalValue &a, const EvalValue &b)
 {
-    SharedStr &lval = a.get<SharedStr>();
+    FlatSharedStr &lval = a.get<FlatSharedStr>();
 
-    if (b.is<SharedStr>())
-        append(lval, b.get<SharedStr>().get_view());
+    if (b.is<FlatSharedStr>())
+        append(lval, b.get<FlatSharedStr>().get_view());
     else
         append(lval, b.get_type()->to_string(b));
 }
@@ -112,7 +112,7 @@ void TypeStr::mul(EvalValue &a, const EvalValue &b)
         throw TypeErrorEx();
 
     string new_str;
-    const string_view &s = a.get<SharedStr>().get_view();
+    const string_view &s = a.get<FlatSharedStr>().get_view();
     const long n = b.get<long>();
 
     if (n >= 0) {
@@ -122,54 +122,54 @@ void TypeStr::mul(EvalValue &a, const EvalValue &b)
             new_str += s;
     }
 
-    a = SharedStr(move(new_str));
+    a = FlatSharedStr(move(new_str));
 }
 
 void TypeStr::lt(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStr>())
+    if (!b.is<FlatSharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() < b.get<SharedStr>().get_view()
+        a.get<FlatSharedStr>().get_view() < b.get<FlatSharedStr>().get_view()
     );
 }
 
 void TypeStr::gt(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStr>())
+    if (!b.is<FlatSharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() > b.get<SharedStr>().get_view()
+        a.get<FlatSharedStr>().get_view() > b.get<FlatSharedStr>().get_view()
     );
 }
 
 void TypeStr::le(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStr>())
+    if (!b.is<FlatSharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() <= b.get<SharedStr>().get_view()
+        a.get<FlatSharedStr>().get_view() <= b.get<FlatSharedStr>().get_view()
     );
 }
 
 void TypeStr::ge(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<SharedStr>())
+    if (!b.is<FlatSharedStr>())
         throw TypeErrorEx();
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() >= b.get<SharedStr>().get_view()
+        a.get<FlatSharedStr>().get_view() >= b.get<FlatSharedStr>().get_view()
     );
 }
 
 void TypeStr::eq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<SharedStr>()) {
+    if (b.is<FlatSharedStr>()) {
 
-        a = a.get<SharedStr>().get_view() == b.get<SharedStr>().get_view();
+        a = a.get<FlatSharedStr>().get_view() == b.get<FlatSharedStr>().get_view();
 
     } else {
 
@@ -179,9 +179,9 @@ void TypeStr::eq(EvalValue &a, const EvalValue &b)
 
 void TypeStr::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<SharedStr>()) {
+    if (b.is<FlatSharedStr>()) {
 
-        a = a.get<SharedStr>().get_view() != b.get<SharedStr>().get_view();
+        a = a.get<FlatSharedStr>().get_view() != b.get<FlatSharedStr>().get_view();
 
     } else {
 
@@ -195,7 +195,7 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
         throw TypeErrorEx();
 
     const EvalValue &what = RValue(what_lval);
-    const SharedStr &s = what.get<SharedStr>();
+    const FlatSharedStr &s = what.get<FlatSharedStr>();
     long idx = idx_val.get<long>();
 
     if (idx < 0)
@@ -204,12 +204,12 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
     if (idx < 0 || idx >= s.size())
         throw OutOfBoundsEx();
 
-    SharedStr s2;
+    FlatSharedStr s2;
 
     /*
-     * Of course, we have to manually call the copy ctor because SharedStr is
+     * Of course, we have to manually call the copy ctor because FlatSharedStr is
      * a POD type, contaning the data of a non-trivial C++ type and, we cannot
-     * implement the copy ctor, move ctor etc. in SharedStr, otherwise it won't
+     * implement the copy ctor, move ctor etc. in FlatSharedStr, otherwise it won't
      * be a POD type anymore, and it won't be accepted in EvalValue's union.
      */
     copy_ctor(&s2, &s);
@@ -222,7 +222,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
                          const EvalValue &end_val)
 {
     const EvalValue &what = RValue(what_lval);
-    const SharedStr &s = what.get<SharedStr>();
+    const FlatSharedStr &s = what.get<FlatSharedStr>();
     long start = 0, end = s.size();
 
     if (start_val.is<long>()) {
@@ -263,7 +263,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
         throw TypeErrorEx();
     }
 
-    SharedStr s2;
+    FlatSharedStr s2;
     copy_ctor(&s2, &s); /* See TypeStr::subscript */
     s2.set_slice(s.offset() + start, end - start);
     return s2;

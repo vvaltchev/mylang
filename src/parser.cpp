@@ -965,15 +965,15 @@ MakeConstructFromConstVal(const EvalValue &v,
         return true;
     }
 
-    if (v.is<SharedStr>()) {
+    if (v.is<FlatSharedStr>()) {
         out = make_unique<LiteralStr>(v);
         return true;
     }
 
-    if (v.is<SharedArray>() && process_arrays) {
+    if (v.is<FlatSharedArray>() && process_arrays) {
 
-        SharedArray &&arr = v.get<SharedArray>();
-        const SharedArray::inner_type &vec = arr.get_shval().get();
+        FlatSharedArray &&arr = v.get<FlatSharedArray>();
+        const FlatSharedArray::inner_type &vec = arr.get_shval().get();
         unique_ptr<LiteralArray> litarr(new LiteralArray);
 
         for (unsigned i = arr.offset(); i < arr.offset() + arr.size(); i++) {

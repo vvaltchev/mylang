@@ -195,12 +195,12 @@ void LiteralStr::serialize(ostream &s, int level) const
 
     s << indent;
     s << "\"";
-    s << escapeStr(value.get<SharedStr>().get_view());
+    s << escapeStr(value.get<FlatSharedStr>().get_view());
     s << "\"";
 }
 
 LiteralStr::LiteralStr(string_view v)
-     : value(SharedStr(unescapeString(v)))
+     : value(FlatSharedStr(unescapeString(v)))
 {
 
 }
