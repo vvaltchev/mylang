@@ -7,7 +7,7 @@ FL_LANG ?= -std=c++17
 FL_DBG ?= -ggdb
 FL_WARN ?= -Wall -Wextra -Wno-unused-parameter
 FL_OTHER ?= -fwrapv
-FL_INC = -I$(PROJ_ROOT)
+FL_INC = -I$(PROJ_ROOT)/src
 BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
 
 ifdef OPT

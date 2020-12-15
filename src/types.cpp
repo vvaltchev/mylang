@@ -2,10 +2,10 @@
 
 #include "eval.h"
 #include "evaltypes.cpp.h"
-#include "type_int.cpp.h"
-#include "type_str.cpp.h"
-#include "type_func.cpp.h"
-#include "type_arr.cpp.h"
+#include "types/int.cpp.h"
+#include "types/str.cpp.h"
+#include "types/func.cpp.h"
+#include "types/arr.cpp.h"
 
 EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
 {
