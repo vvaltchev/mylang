@@ -36,16 +36,18 @@ public:
         : flat(make_shared<string>(move(s)))
         , off(0)
         , len(get_ref().size())
+        , slice(false)
+    { }
+
+    FlatSharedStr(const FlatSharedStr &s, unsigned off, unsigned len)
+        : flat(s.flat.get_shared_ptr())
+        , off(off)
+        , len(len)
+        , slice(true)
     { }
 
     string_view get_view() const {
         return string_view(flat->data() + offset(), size());
-    }
-
-    void set_slice(unsigned off_val, unsigned len_val) {
-        off = off_val;
-        len = len_val;
-        slice = true;
     }
 
     bool is_slice() const { return slice; }

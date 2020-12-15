@@ -84,8 +84,8 @@ void TypeStr::append(FlatSharedStr &lval, const string_view &s)
         new_str += lval.get_view();
         new_str += s;
 
-        dtor(&lval.get_shval()); /* We have to manually destroy our fake "trivial" object */
-        new (&lval.get_shval()) FlatSharedStr(move(new_str));
+        dtor(&lval); /* We have to manually destroy our fake "trivial" object */
+        new (&lval) FlatSharedStr(move(new_str));
     }
 }
 
@@ -197,17 +197,7 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
     if (idx < 0 || idx >= s.size())
         throw OutOfBoundsEx();
 
-    FlatSharedStr s2;
-
-    /*
-     * Of course, we have to manually call the copy ctor because FlatSharedStr is
-     * a POD type, contaning the data of a non-trivial C++ type and, we cannot
-     * implement the copy ctor, move ctor etc. in FlatSharedStr, otherwise it won't
-     * be a POD type anymore, and it won't be accepted in EvalValue's union.
-     */
-    copy_ctor(&s2, &s);
-    s2.set_slice(s.offset() + idx, 1);
-    return s2;
+    return FlatSharedStr(s, s.offset() + idx, 1);
 }
 
 EvalValue TypeStr::slice(const EvalValue &what_lval,
@@ -256,8 +246,5 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
         throw TypeErrorEx();
     }
 
-    FlatSharedStr s2;
-    copy_ctor(&s2, &s); /* See TypeStr::subscript */
-    s2.set_slice(s.offset() + start, end - start);
-    return s2;
+    return FlatSharedStr(s, s.offset() + start, end - start);
 }
