@@ -24,7 +24,17 @@ class FlatSharedArrayTempl {
         typedef vector<LValueT> vec_type;
 
     private:
-        shared_ptr<vec_type> shvec;
+        struct SharedObject {
+
+            vec_type vec;
+
+            SharedObject() = default;
+            SharedObject(vec_type &&arr)
+                : vec(move(arr))
+            { }
+        };
+
+        shared_ptr<SharedObject> shobj;
 
     public:
         unsigned off;
@@ -35,22 +45,22 @@ class FlatSharedArrayTempl {
         SharedArrayObj(const vec_type &arr) = delete;
 
         SharedArrayObj(vec_type &&arr)
-            : shvec(make_shared<vec_type>(move(arr)))
+            : shobj(make_shared<SharedObject>(move(arr)))
             , off(0)
-            , len(shvec->size())
+            , len(shobj->vec.size())
             , slice(false)
         { }
 
         SharedArrayObj(const SharedArrayObj &obj, unsigned off, unsigned len)
-            : shvec(obj.shvec)
+            : shobj(obj.shobj)
             , off(off)
             , len(len)
             , slice(true)
         { }
 
-        vec_type &get_vec() { return *shvec.get(); }
-        const vec_type &get_vec() const { return *shvec.get(); }
-        long use_count() const { return shvec.use_count(); }
+        vec_type &get_vec() { return shobj->vec; }
+        const vec_type &get_vec() const { return shobj->vec; }
+        long use_count() const { return shobj.use_count(); }
     };
 
 public:
