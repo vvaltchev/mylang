@@ -44,6 +44,28 @@ class FlatSharedArrayTempl {
         unsigned len;
         bool slice;
 
+        void clone_internal_vec()
+        {
+            vec_type new_vec;
+            new_vec.reserve(len);
+
+            new_vec.insert(
+                new_vec.end(),
+                shobj->vec.cbegin() + off,
+                shobj->vec.cbegin() + off + len
+            );
+
+            this->~SharedArrayObj();
+            new (this) SharedArrayObj(move(new_vec));
+        }
+
+        void clone_aliased_slices(unsigned index)
+        {
+            for (SharedArrayObj *obj : shobj->slices)
+                if (obj->off <= index && index < obj->off + obj->len)
+                    obj->clone_internal_vec();
+        }
+
         /* Special constructors */
 
         SharedArrayObj(const vec_type &arr) = delete;
@@ -118,8 +140,8 @@ class FlatSharedArrayTempl {
             return *this;
         }
 
-        ~SharedArrayObj() {
-
+        ~SharedArrayObj()
+        {
             if (slice)
                 shobj->slices.erase(this);
         }
@@ -151,4 +173,7 @@ public:
     bool is_slice() const { return flat->slice; }
     unsigned offset() const { return flat->slice ? flat->off : 0; }
     unsigned size() const { return flat->slice ? flat->len : get_ref().size(); }
+
+    void clone_internal_vec() { flat->clone_internal_vec(); }
+    void clone_aliased_slices(unsigned index) { flat->clone_aliased_slices(index); }
 };

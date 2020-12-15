@@ -861,20 +861,6 @@ static const vector<test> tests =
     },
 
     {
-        "Modify elements of array",
-        {
-            "var s = [1,2,3,4];",
-            "var sub = s[1:3];",
-            "assert(sub == [2,3]);",
-            "assert(intptr(s) == intptr(sub));", // both vars must point to the same obj
-            "s[1] = 20;",                        // change an element of `s`
-            "assert(intptr(s) != intptr(sub));", // `s` now must point to a different obj
-            "assert(s == [1,20,3,4]);",          // check that now `s` is updated
-            "assert(sub == [2,3]);",             // check that `sub` contains the old value
-        },
-    },
-
-    {
         "Multi-dimentional arrays",
         {
             "var arr = [[11, 22], 3, 4];",
@@ -1045,6 +1031,55 @@ static const vector<test> tests =
             "var a = [];",
             "var s = join(a, \",\");",
             "assert(s == \"\");",
+        },
+    },
+
+    {
+        "Array: modify elements of array with slices",
+        {
+            "var s = [1,2,3,4];",
+            "var sub = s[1:3];",
+            "assert(sub == [2,3]);",
+            "assert(intptr(s) == intptr(sub));", // both vars must point to the same obj
+            "s[1] = 20;",                        // change an element of `s`
+            "assert(intptr(s) != intptr(sub));", // `s` now must point to a different obj
+            "assert(s == [1,20,3,4]);",          // check that now `s` is updated
+            "assert(sub == [2,3]);",             // check that `sub` contains the old value
+        },
+    },
+
+    {
+        "Array: modify elements of array WITHOUT slices",
+        {
+            "var arr = [1,2,3];",
+            "var oldptr = intptr(arr);",
+            "arr[1] = 99;",
+            "assert(arr == [1,99,3]);",
+            "assert(intptr(arr) == oldptr);",
+        },
+    },
+
+    {
+        "Array: non-slice assign has reference semantics",
+        {
+            "var a = [1,2,3];",
+            "var b = a;",
+            "assert(intptr(a) == intptr(b));",
+            "a[0] = 99;",
+            "assert(a == [99,2,3]);",
+            "assert(b == [99,2,3]);",
+        },
+    },
+
+    {
+        "Array: clone",
+        {
+            "var a = [1,2,3];",
+            "var b = clone(a);",
+            "assert(intptr(a) != intptr(b));",
+            "a[1] = 99;",
+            "assert(a == [1,99,3]);",
+            "assert(b == [1,2,3]);",
         },
     },
 };

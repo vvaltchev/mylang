@@ -50,17 +50,10 @@ bool TypeArr::is_slice(const EvalValue &a)
 
 EvalValue TypeArr::clone(const EvalValue &a)
 {
-    const FlatSharedArray &lval = a.get<FlatSharedArray>();
-    FlatSharedArray::vec_type new_arr;
-    new_arr.reserve(lval.size());
-
-    new_arr.insert(
-        new_arr.end(),
-        lval.get_ref().begin() + lval.offset(),
-        lval.get_ref().begin() + lval.offset() + lval.size()
-    );
-
-    return FlatSharedArray(move(new_arr));
+    /* The ONLY way to get a copy of the internal SharedArrayObj */
+    EvalValue new_val = a;
+    new_val.get<FlatSharedArray>().clone_internal_vec();
+    return new_val;
 }
 
 EvalValue TypeArr::intptr(const EvalValue &a)

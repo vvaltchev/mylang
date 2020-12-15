@@ -316,6 +316,7 @@ public:
     bool is_const_var() const { return is_const; }
     const EvalValue &get() const { return val; }
     EvalValue get_rval() const { return val; }
+    Type *valtype() const { return val.get_type(); }
 
     template <class T>
     T &getval() { return val.get<T>(); }

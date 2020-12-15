@@ -587,7 +587,7 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
 
 LValue LValue::clone()
 {
-    LValue nl(val.get_type()->clone(val), is_const);
+    LValue nl(valtype()->clone(val), is_const);
     nl.container = container;
     nl.container_idx = container_idx;
     return nl;
@@ -595,13 +595,21 @@ LValue LValue::clone()
 
 EvalValue &LValue::get_value_for_put()
 {
-    if (!container || container->val.get_type()->use_count(container->val) == 1)
+    if (!container)
         return val;
 
-    *container = container->clone();
+    assert(container->is<FlatSharedArray>());
 
-    assert(container->val.is<FlatSharedArray>());
-    return container->val.get<FlatSharedArray>().get_ref()[container_idx].val;
+    if (container->valtype()->is_slice(container->val)) {
+
+        *container = container->clone();
+        return container->getval<FlatSharedArray>().get_ref()[container_idx].val;
+    }
+
+    if (container->valtype()->use_count(container->val) > 1)
+        container->getval<FlatSharedArray>().clone_aliased_slices(container_idx);
+
+    return val;
 }
 
 void LValue::put(const EvalValue &v)
