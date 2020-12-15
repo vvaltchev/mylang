@@ -7,7 +7,7 @@ using namespace std;
 /*
  * This special class allows us to store a non-trivial type in a union.
  * Of course, in order to everything to work, the owner class (EvalValue)
- * containing an instance of SharedVal<T> inside a union, has to manually
+ * containing an instance of FlatSharedVal<T> inside a union, has to manually
  * call: the copy ctor, the move ctor, the copy assign and the move assign
  * methods, specific for this type. This happens in part in EvalValue and
  * in part in the specific Type instance. See NonTrivialType<T> and SharedType<T>
@@ -49,7 +49,7 @@ public:
 };
 
 template <class T>
-class SharedVal {
+class FlatSharedVal {
 
     FlatVal<shared_ptr<T>> flat;
 
@@ -57,13 +57,13 @@ public:
 
     typedef T inner_type;
 
-    SharedVal() = default;
+    FlatSharedVal() = default;
 
-    SharedVal(const shared_ptr<T> &s)
+    FlatSharedVal(const shared_ptr<T> &s)
         : flat(s)
     { }
 
-    SharedVal(shared_ptr<T> &&s)
+    FlatSharedVal(shared_ptr<T> &&s)
         : flat(move(s))
     { }
 

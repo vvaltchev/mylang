@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #pragma once
-#include "sharedval.h"
+#include "flatval.h"
 #include <string>
 
 class SharedStr {
@@ -11,7 +11,7 @@ public:
 
 private:
 
-    SharedVal<inner_type> shval;
+    FlatSharedVal<inner_type> shval;
     unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
     unsigned len = 0;   /* NOTE: cannot be const because we're using this in a union */
     bool slice = false;
@@ -20,8 +20,8 @@ public:
 
     inner_type &get_ref() { return shval.get(); }
     const inner_type &get_ref() const { return shval.get(); }
-    SharedVal<inner_type> &get_shval() { return shval; }
-    const SharedVal<inner_type> &get_shval() const { return shval; }
+    FlatSharedVal<inner_type> &get_shval() { return shval; }
+    const FlatSharedVal<inner_type> &get_shval() const { return shval; }
     long use_count() const { return shval.use_count(); }
 
     SharedStr() = default;

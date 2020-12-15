@@ -2,7 +2,7 @@
 
 #pragma once
 #include "errors.h"
-#include "sharedval.h"
+#include "flatval.h"
 #include "sharedstr.h"
 #include "sharedarray.h"
 #include "type.h"
@@ -27,7 +27,7 @@ class EvalContext;
 class FuncObject;
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
-typedef SharedVal<FuncObject> SharedFuncObjWrapper;
+typedef FlatSharedVal<FuncObject> SharedFuncObjWrapper;
 typedef SharedArrayTemplate<LValue> SharedArray;
 typedef TypeTemplate<EvalValue> Type;
 
