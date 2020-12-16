@@ -72,13 +72,16 @@ public:
     virtual void eq(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
     virtual void noteq(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
     virtual void opneg(EvalValueT &a) { throw TypeErrorEx(); }
-    virtual void lnot(EvalValueT &a) { throw TypeErrorEx(); }
     virtual void land(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
     virtual void lor(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
 
     virtual bool is_true(const EvalValueT &a) { throw TypeErrorEx(); }
     virtual string to_string(const EvalValueT &a) { throw TypeErrorEx(); }
     virtual long len(const EvalValueT &a) { throw TypeErrorEx(); }
+
+    virtual void lnot(EvalValueT &a) {
+        a = EvalValueT(!is_true(a));
+    }
 
     virtual EvalValueT subscript(const EvalValueT &what, const EvalValueT &idx)
     {

@@ -34,7 +34,6 @@ public:
     long len(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
     bool is_true(const EvalValue &a) override;
-    void lnot(EvalValue &a) override;
 };
 
 long TypeArr::len(const EvalValue &a)
@@ -175,11 +174,6 @@ string TypeArr::to_string(const EvalValue &a)
 bool TypeArr::is_true(const EvalValue &a)
 {
     return a.get<FlatSharedArray>().size() > 0;
-}
-
-void TypeArr::lnot(EvalValue &a)
-{
-    a = EvalValue(!is_true(a));
 }
 
 EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)

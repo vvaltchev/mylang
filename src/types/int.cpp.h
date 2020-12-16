@@ -27,7 +27,6 @@ public:
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
     void opneg(EvalValue &a) override;
-    void lnot(EvalValue &a) override;
     void land(EvalValue &a, const EvalValue &b) override;
     void lor(EvalValue &a, const EvalValue &b) override;
 
@@ -137,11 +136,6 @@ void TypeInt::noteq(EvalValue &a, const EvalValue &b)
 void TypeInt::opneg(EvalValue &a)
 {
     a.get<long>() = -a.get<long>();
-}
-
-void TypeInt::lnot(EvalValue &a)
-{
-    a.get<long>() = !a.get<long>();
 }
 
 void TypeInt::land(EvalValue &a, const EvalValue &b)
