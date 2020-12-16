@@ -44,34 +44,44 @@ const array<Type *, Type::t_count> AllTypes = {
 
 const EvalValue EvalValue::empty_str = FlatSharedStr(string());
 
+inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
+{
+    return make_pair(name, LValue(Builtin{f}, true));
+}
+
+inline auto make_builtin(const char *name, decltype(Builtin::func) f)
+{
+    return make_pair(name, LValue(Builtin{f}, false));
+}
+
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
-    make_pair("defined", LValue(Builtin{builtin_defined}, true)),
-    make_pair("len", LValue(Builtin{builtin_len}, true)),
-    make_pair("str", LValue(Builtin{builtin_str}, true)),
-    make_pair("int", LValue(Builtin{builtin_int}, true)),
-    make_pair("clone", LValue(Builtin{builtin_clone}, true)),
-    make_pair("split", LValue(Builtin{builtin_split}, true)),
-    make_pair("join", LValue(Builtin{builtin_join}, true)),
-    make_pair("splitlines", LValue(Builtin{builtin_splitlines}, true)),
-    make_pair("abs", LValue(Builtin{builtin_abs}, true)),
-    make_pair("ord", LValue(Builtin{builtin_ord}, true)),
-    make_pair("chr", LValue(Builtin{builtin_chr}, true)),
-    make_pair("min", LValue(Builtin{builtin_min}, true)),
-    make_pair("max", LValue(Builtin{builtin_max}, true)),
+    make_const_builtin("defined", builtin_defined),
+    make_const_builtin("len", builtin_len),
+    make_const_builtin("str", builtin_str),
+    make_const_builtin("int", builtin_int),
+    make_const_builtin("clone", builtin_clone),
+    make_const_builtin("split", builtin_split),
+    make_const_builtin("join", builtin_join),
+    make_const_builtin("splitlines", builtin_splitlines),
+    make_const_builtin("abs", builtin_abs),
+    make_const_builtin("ord", builtin_ord),
+    make_const_builtin("chr", builtin_chr),
+    make_const_builtin("min", builtin_min),
+    make_const_builtin("max", builtin_max),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
 {
-    make_pair("assert", LValue(Builtin{builtin_assert}, false)),
-    make_pair("exit", LValue(Builtin{builtin_exit}, false)),
-    make_pair("intptr", LValue(Builtin{builtin_intptr}, false)),
-    make_pair("undef", LValue(Builtin{builtin_undef}, false)),
-    make_pair("print", LValue(Builtin{builtin_print}, false)),
-    make_pair("write", LValue(Builtin{builtin_write}, false)),
-    make_pair("writeln", LValue(Builtin{builtin_writeln}, false)),
-    make_pair("read", LValue(Builtin{builtin_read}, false)),
-    make_pair("readln", LValue(Builtin{builtin_readln}, false)),
-    make_pair("readlines", LValue(Builtin{builtin_readlines}, false)),
-    make_pair("writelines", LValue(Builtin{builtin_writelines}, false)),
+    make_builtin("assert", builtin_assert),
+    make_builtin("exit", builtin_exit),
+    make_builtin("intptr", builtin_intptr),
+    make_builtin("undef", builtin_undef),
+    make_builtin("print", builtin_print),
+    make_builtin("write", builtin_write),
+    make_builtin("writeln", builtin_writeln),
+    make_builtin("read", builtin_read),
+    make_builtin("readln", builtin_readln),
+    make_builtin("readlines", builtin_readlines),
+    make_builtin("writelines", builtin_writelines),
 };
