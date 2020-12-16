@@ -1153,6 +1153,21 @@ static const vector<test> tests =
             "assert(array(3) == [none,none,none]);",
         },
     },
+
+    {
+        "Builtin append() (or push())",
+        {
+            "var arr = [1,2,3];",
+            "assert(arr == [1,2,3]);",
+            "append(arr, 99);",
+            "assert(arr == [1,2,3,99]);",
+            "var s = arr[2:];",
+            "assert(s == [3,99]);",
+            "append(s, 100);",
+            "assert(s == [3,99,100]);",
+            "assert(arr == [1,2,3,99]);",
+        },
+    },
 };
 
 static void

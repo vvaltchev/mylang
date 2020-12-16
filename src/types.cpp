@@ -87,4 +87,6 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("readln", builtin_readln),
     make_builtin("readlines", builtin_readlines),
     make_builtin("writelines", builtin_writelines),
+    make_builtin("append", builtin_append),
+    make_builtin("push", builtin_append), /* push() in an alias for append() */
 };

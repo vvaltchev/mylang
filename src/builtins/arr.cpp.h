@@ -34,3 +34,30 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
 
     return FlatSharedArray(move(vec));
 }
+
+EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &arr_lval = arg0->eval(ctx);
+    const EvalValue &elem = RValue(arg1->eval(ctx));
+
+    if (!arr_lval.is<LValue *>())
+        throw NotLValueEx(arg0->start, arg0->end);
+
+    LValue *lval = arr_lval.get<LValue *>();
+
+    if (!lval->is<FlatSharedArray>())
+        throw NotLValueEx(arg0->start, arg0->end);
+
+    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
+
+    if (arr.is_slice())
+        arr.clone_internal_vec();
+
+    arr.get_ref().emplace_back(elem, ctx->const_ctx);
+    return lval->get();
+}
