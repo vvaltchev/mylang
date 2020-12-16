@@ -1119,6 +1119,24 @@ static const vector<test> tests =
             "}",
         },
     },
+
+    {
+        "Min and Max builtins",
+        {
+            "assert(min(1,2) == 1);",
+            "assert(max(1,2) == 2);",
+            "assert(min(34,52,3) == 3);",
+            "assert(max(34,52,3) == 52);",
+            "const ar = [34];",
+            "assert(min(ar) == 34);",
+            "assert(max(ar) == 34);",
+            "assert(min([]) == none);",
+            "assert(max([]) == none);",
+            "const ar2 = [34, 52, 3];",
+            "assert(min(ar2) == 3);",
+            "assert(max(ar2) == 52);",
+        },
+    },
 };
 
 static void

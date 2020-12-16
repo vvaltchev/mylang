@@ -9,6 +9,7 @@
 #include "builtins/str.cpp.h"
 #include "builtins/generic.cpp.h"
 #include "builtins/io.cpp.h"
+#include "builtins/num.cpp.h"
 
 EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
 {
@@ -22,21 +23,6 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx(arg->start, arg->end);
 
     exit(e.get<long>());
-}
-
-EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
-{
-    if (exprList->elems.size() != 1)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
-
-    if (!e.is<long>())
-        throw TypeErrorEx(arg->start, arg->end);
-
-    const long val = e.get<long>();
-    return val >= 0 ? val : -val;
 }
 
 const string &
@@ -87,6 +73,8 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_pair("abs", LValue(Builtin{builtin_abs}, true)),
     make_pair("ord", LValue(Builtin{builtin_ord}, true)),
     make_pair("chr", LValue(Builtin{builtin_chr}, true)),
+    make_pair("min", LValue(Builtin{builtin_min}, true)),
+    make_pair("max", LValue(Builtin{builtin_max}, true)),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
