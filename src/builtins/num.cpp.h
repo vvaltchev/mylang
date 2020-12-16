@@ -30,27 +30,30 @@ template <bool is_max>
 EvalValue b_min_max_arr(const FlatSharedArray &arr)
 {
     const FlatSharedArray::vec_type &vec = arr.get_ref();
-    EvalValue right;
+    EvalValue val;
 
     if (arr.size() > 0) {
 
-        right = vec[arr.offset()].get();
+        val = vec[arr.offset()].get();
 
         for (unsigned i = 1; i < arr.size(); i++) {
 
-            EvalValue left = vec[arr.offset() + i].get();
+            const EvalValue &other = vec[arr.offset() + i].get();
 
-            if constexpr(is_max)
-                left.get_type()->gt(left, right);   /* left = left > right */
-            else
-                left.get_type()->lt(left, right);   /* left = left < right */
+            if constexpr(is_max) {
 
-            if (left.get<long>())
-                right = vec[arr.offset() + i].get();
+                if (other > val)
+                    val = other;
+
+            } else {
+
+                if (other < val)
+                    val = other;
+            }
         }
     }
 
-    return right;
+    return val;
 }
 
 template <bool is_max>
@@ -60,32 +63,34 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *first_arg = exprList->elems[0].get();
-    EvalValue right = RValue(first_arg->eval(ctx));
+    EvalValue val = RValue(first_arg->eval(ctx));
     const auto &vec = exprList->elems;
 
     if (vec.size() == 1) {
 
-        if (!right.is<FlatSharedArray>())
+        if (!val.is<FlatSharedArray>())
             throw TypeErrorEx(first_arg->start, first_arg->end);
 
-        return b_min_max_arr<is_max>(right.get<FlatSharedArray>());
+        return b_min_max_arr<is_max>(val.get<FlatSharedArray>());
     }
 
     for (unsigned i = 1; i < vec.size(); i++) {
 
-        EvalValue left_orig = RValue(vec[i]->eval(ctx));
-        EvalValue left = left_orig;
+        const EvalValue &other = RValue(vec[i]->eval(ctx));
 
-        if constexpr(is_max)
-            left.get_type()->gt(left, right);   /* left = left > right */
-        else
-            left.get_type()->lt(left, right);   /* left = left < right */
+        if constexpr(is_max) {
 
-        if (left.get<long>())
-            right = move(left_orig);
+            if (other > val)
+                val = other;
+
+        } else {
+
+            if (other < val)
+                val = other;
+        }
     }
 
-    return right;
+    return val;
 }
 
 EvalValue builtin_min(EvalContext *ctx, ExprList *exprList)

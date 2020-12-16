@@ -137,6 +137,56 @@ public:
     bool is() const {
         return type->t == static_cast<Type::TypeE>(TypeToEnum<T>::val);
     }
+
+    bool is_true() const {
+        return type->is_true(*this);
+    }
+
+    bool operator!() const {
+        return !is_true();
+    }
+
+    bool operator==(const EvalValue &rhs) const {
+
+        EvalValue tmp = *this;
+        tmp.type->eq(tmp, rhs);
+        return tmp.get<long>() != 0;
+    }
+
+    bool operator!=(const EvalValue &rhs) const {
+
+        EvalValue tmp = *this;
+        tmp.type->noteq(tmp, rhs);
+        return tmp.get<long>() != 0;
+    }
+
+    bool operator<(const EvalValue &rhs) const {
+
+        EvalValue tmp = *this;
+        tmp.type->lt(tmp, rhs);
+        return tmp.get<long>() != 0;
+    }
+
+    bool operator<=(const EvalValue &rhs) const {
+
+        EvalValue tmp = *this;
+        tmp.type->le(tmp, rhs);
+        return tmp.get<long>() != 0;
+    }
+
+    bool operator>(const EvalValue &rhs) const {
+
+        EvalValue tmp = *this;
+        tmp.type->gt(tmp, rhs);
+        return tmp.get<long>() != 0;
+    }
+
+    bool operator>=(const EvalValue &rhs) const {
+
+        EvalValue tmp = *this;
+        tmp.type->ge(tmp, rhs);
+        return tmp.get<long>() != 0;
+    }
 };
 
 extern const EvalValue empty_str;
