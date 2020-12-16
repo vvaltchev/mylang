@@ -25,22 +25,6 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     exit(e.get<long>());
 }
 
-const string &
-find_builtin_name(const Builtin &b)
-{
-    for (const auto &[k, v]: EvalContext::const_builtins) {
-        if (v.getval<Builtin>().func == b.func)
-            return k;
-    }
-
-    for (const auto &[k, v]: EvalContext::builtins) {
-        if (v.getval<Builtin>().func == b.func)
-            return k;
-    }
-
-    throw InternalErrorEx();
-}
-
 const array<Type *, Type::t_count> AllTypes = {
     new TypeNone(),
     new Type(Type::t_lval),       /* internal type: not visible from outside */

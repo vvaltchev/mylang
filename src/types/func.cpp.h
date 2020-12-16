@@ -18,11 +18,11 @@ public:
 
     TypeFunc() : SharedType<FlatSharedFuncObj>(Type::t_func) { }
 
-    virtual long use_count(const EvalValue &a);
-    virtual EvalValue clone(const EvalValue &a);
-    virtual EvalValue intptr(const EvalValue &a);
+    long use_count(const EvalValue &a) override;
+    EvalValue clone(const EvalValue &a) override;
+    EvalValue intptr(const EvalValue &a) override;
 
-    virtual string to_string(const EvalValue &a) {
+    string to_string(const EvalValue &a) override {
         return "<function>";
     }
 };

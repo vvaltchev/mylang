@@ -18,27 +18,29 @@ public:
         : NonTrivialType<FlatSharedArray::inner_type>(Type::t_arr)
     { }
 
-    virtual void add(EvalValue &a, const EvalValue &b);
-    virtual void eq(EvalValue &a, const EvalValue &b);
-    virtual void noteq(EvalValue &a, const EvalValue &b);
-    virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
-    virtual EvalValue slice(const EvalValue &what,
-                            const EvalValue &start,
-                            const EvalValue &end);
+    void add(EvalValue &a, const EvalValue &b) override;
+    void eq(EvalValue &a, const EvalValue &b) override;
+    void noteq(EvalValue &a, const EvalValue &b) override;
+    EvalValue subscript(const EvalValue &what, const EvalValue &idx) override;
+    EvalValue slice(const EvalValue &what,
+                    const EvalValue &start,
+                    const EvalValue &end) override;
 
-    virtual long use_count(const EvalValue &a);
-    virtual bool is_slice(const EvalValue &a);
-    virtual EvalValue clone(const EvalValue &a);
-    virtual EvalValue intptr(const EvalValue &a);
+    long use_count(const EvalValue &a) override;
+    bool is_slice(const EvalValue &a) override;
+    EvalValue clone(const EvalValue &a) override;
+    EvalValue intptr(const EvalValue &a) override;
 
-    virtual long len(const EvalValue &a) {
-        return a.get<FlatSharedArray>().size();
-    }
-
-    virtual string to_string(const EvalValue &a);
-    virtual bool is_true(const EvalValue &a);
-    virtual void lnot(EvalValue &a);
+    long len(const EvalValue &a) override;
+    string to_string(const EvalValue &a) override;
+    bool is_true(const EvalValue &a) override;
+    void lnot(EvalValue &a) override;
 };
+
+long TypeArr::len(const EvalValue &a)
+{
+    return a.get<FlatSharedArray>().size();
+}
 
 long TypeArr::use_count(const EvalValue &a)
 {

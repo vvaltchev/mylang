@@ -18,29 +18,29 @@ public:
 
     TypeStr() : SharedType<FlatSharedStr>(Type::t_str) { }
 
-    virtual void add(EvalValue &a, const EvalValue &b);
-    virtual void mul(EvalValue &a, const EvalValue &b);
-    virtual void lt(EvalValue &a, const EvalValue &b);
-    virtual void gt(EvalValue &a, const EvalValue &b);
-    virtual void le(EvalValue &a, const EvalValue &b);
-    virtual void ge(EvalValue &a, const EvalValue &b);
-    virtual void eq(EvalValue &a, const EvalValue &b);
-    virtual void noteq(EvalValue &a, const EvalValue &b);
-    virtual EvalValue subscript(const EvalValue &what, const EvalValue &idx);
-    virtual EvalValue slice(const EvalValue &what,
-                            const EvalValue &start,
-                            const EvalValue &end);
+    void add(EvalValue &a, const EvalValue &b) override;
+    void mul(EvalValue &a, const EvalValue &b) override;
+    void lt(EvalValue &a, const EvalValue &b) override;
+    void gt(EvalValue &a, const EvalValue &b) override;
+    void le(EvalValue &a, const EvalValue &b) override;
+    void ge(EvalValue &a, const EvalValue &b) override;
+    void eq(EvalValue &a, const EvalValue &b) override;
+    void noteq(EvalValue &a, const EvalValue &b) override;
+    EvalValue subscript(const EvalValue &what, const EvalValue &idx) override;
+    EvalValue slice(const EvalValue &what,
+                    const EvalValue &start,
+                    const EvalValue &end) override;
 
-    virtual long use_count(const EvalValue &a);
-    virtual EvalValue clone(const EvalValue &a);
-    virtual bool is_slice(const EvalValue &a);
-    virtual EvalValue intptr(const EvalValue &a);
+    long use_count(const EvalValue &a) override;
+    EvalValue clone(const EvalValue &a) override;
+    bool is_slice(const EvalValue &a) override;
+    EvalValue intptr(const EvalValue &a) override;
 
-    virtual long len(const EvalValue &a) {
+    long len(const EvalValue &a) override {
         return a.get<FlatSharedStr>().size();
     }
 
-    virtual string to_string(const EvalValue &a) {
+    string to_string(const EvalValue &a) override {
         return string(a.get<FlatSharedStr>().get_view());
     }
 };

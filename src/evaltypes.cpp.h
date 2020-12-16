@@ -31,7 +31,7 @@ public:
 
     NonTrivialType(Type::TypeE e) : Type(e) { }
 
-    virtual void default_ctor(void *obj) {
+    void default_ctor(void *obj) override {
 
         static_assert(S >= sizeof(T));
 
@@ -42,11 +42,11 @@ public:
         new (obj) T;
     }
 
-    virtual void dtor(void *obj) {
+    void dtor(void *obj) override {
         reinterpret_cast<T *>(obj)->~T();
     }
 
-    virtual void copy_ctor(void *obj, const void *other) {
+    void copy_ctor(void *obj, const void *other) override {
 
         if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
@@ -55,7 +55,7 @@ public:
         new (obj) T(*reinterpret_cast<const T *>(other));
     }
 
-    virtual void move_ctor(void *obj, void *other) {
+    void move_ctor(void *obj, void *other) override {
 
         if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
@@ -64,7 +64,7 @@ public:
         new (obj) T(move(*reinterpret_cast<T *>(other)));
     }
 
-    virtual void copy_assign(void *obj, const void *other) {
+    void copy_assign(void *obj, const void *other) override {
 
         if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
@@ -73,7 +73,7 @@ public:
         *reinterpret_cast<T *>(obj) = *reinterpret_cast<const T *>(other);
     }
 
-    virtual void move_assign(void *obj, void *other) {
+    void move_assign(void *obj, void *other) override {
 
         if constexpr(S > sizeof(T)) {
             memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
@@ -101,24 +101,40 @@ public:
 
     TypeNone() : Type(Type::t_none) { }
 
-    virtual string to_string(const EvalValue &a) {
+    string to_string(const EvalValue &a) override {
         return "<none>";
     }
 
-    virtual void eq(EvalValue &a, const EvalValue &b) {
+    void eq(EvalValue &a, const EvalValue &b) override {
         a = b.is<NoneVal>();
     }
 
-    virtual void noteq(EvalValue &a, const EvalValue &b) {
+    void noteq(EvalValue &a, const EvalValue &b) override {
         a = !b.is<NoneVal>();
     }
 };
+
+const string &
+find_builtin_name(const Builtin &b)
+{
+    for (const auto &[k, v]: EvalContext::const_builtins) {
+        if (v.getval<Builtin>().func == b.func)
+            return k;
+    }
+
+    for (const auto &[k, v]: EvalContext::builtins) {
+        if (v.getval<Builtin>().func == b.func)
+            return k;
+    }
+
+    throw InternalErrorEx();
+}
 
 class TypeBuiltin : public Type {
 
 public:
     TypeBuiltin() : Type(Type::t_builtin) { }
-    virtual string to_string(const EvalValue &a) {
+    string to_string(const EvalValue &a) override {
         return "<builtin: " + find_builtin_name(a.get<Builtin>()) + ">";
     }
 };

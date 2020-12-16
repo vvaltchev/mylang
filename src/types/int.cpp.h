@@ -15,24 +15,24 @@ public:
 
     TypeInt() : Type(Type::t_int) { }
 
-    virtual void add(EvalValue &a, const EvalValue &b);
-    virtual void sub(EvalValue &a, const EvalValue &b);
-    virtual void mul(EvalValue &a, const EvalValue &b);
-    virtual void div(EvalValue &a, const EvalValue &b);
-    virtual void mod(EvalValue &a, const EvalValue &b);
-    virtual void lt(EvalValue &a, const EvalValue &b);
-    virtual void gt(EvalValue &a, const EvalValue &b);
-    virtual void le(EvalValue &a, const EvalValue &b);
-    virtual void ge(EvalValue &a, const EvalValue &b);
-    virtual void eq(EvalValue &a, const EvalValue &b);
-    virtual void noteq(EvalValue &a, const EvalValue &b);
-    virtual void opneg(EvalValue &a);
-    virtual void lnot(EvalValue &a);
-    virtual void land(EvalValue &a, const EvalValue &b);
-    virtual void lor(EvalValue &a, const EvalValue &b);
+    void add(EvalValue &a, const EvalValue &b) override;
+    void sub(EvalValue &a, const EvalValue &b) override;
+    void mul(EvalValue &a, const EvalValue &b) override;
+    void div(EvalValue &a, const EvalValue &b) override;
+    void mod(EvalValue &a, const EvalValue &b) override;
+    void lt(EvalValue &a, const EvalValue &b) override;
+    void gt(EvalValue &a, const EvalValue &b) override;
+    void le(EvalValue &a, const EvalValue &b) override;
+    void ge(EvalValue &a, const EvalValue &b) override;
+    void eq(EvalValue &a, const EvalValue &b) override;
+    void noteq(EvalValue &a, const EvalValue &b) override;
+    void opneg(EvalValue &a) override;
+    void lnot(EvalValue &a) override;
+    void land(EvalValue &a, const EvalValue &b) override;
+    void lor(EvalValue &a, const EvalValue &b) override;
 
-    virtual bool is_true(const EvalValue &a);
-    virtual string to_string(const EvalValue &a);
+    bool is_true(const EvalValue &a) override;
+    string to_string(const EvalValue &a) override;
 };
 
 void TypeInt::add(EvalValue &a, const EvalValue &b)
