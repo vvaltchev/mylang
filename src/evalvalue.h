@@ -81,12 +81,16 @@ public:
     EvalValue(bool val);
 
     template <
-        class T,                            /* real template param */
-        class U = typename remove_const<    /* helper template param */
+        class T,                                  /* actual template param */
+        class U = typename remove_const<          /* helper template param */
             typename remove_reference<T>::type
+        >::type,
+        class S = typename enable_if<             /* SFINAE template param */
+            !is_same<U, EvalValue>::value &&      /* disallow EvalValue */
+            TypeToEnum<U>::val != Type::t_count   /* disallow types not in TypeToEnum */
         >::type
     >
-    EvalValue(T &&val, Type::TypeE te = (Type::TypeE)TypeToEnum<U>::val);
+    EvalValue(T &&val);
 
 
     EvalValue(const EvalValue &other);
@@ -142,8 +146,8 @@ inline EvalValue::EvalValue()
 inline EvalValue::EvalValue(bool val)
     : val(val), type(AllTypes[Type::t_int]) { }
 
-template <class T, class U>
-inline EvalValue::EvalValue(T &&new_val, Type::TypeE)
+template <class T, class U, class S>
+inline EvalValue::EvalValue(T &&new_val)
     : type(AllTypes[TypeToEnum<U>::val])
 {
     if constexpr(static_cast<Type::TypeE>(TypeToEnum<U>::val) >= Type::t_str) {
