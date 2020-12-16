@@ -77,8 +77,11 @@ class EvalValue {
 
 public:
 
-    EvalValue();
-    EvalValue(bool val);
+    EvalValue()
+        : val(), type(AllTypes[Type::t_none]) { }
+
+    EvalValue(bool val)
+        : val(val), type(AllTypes[Type::t_int]) { }
 
     template <
         class T,                                  /* actual template param */
@@ -134,17 +137,12 @@ public:
     bool is() const {
         return type->t == static_cast<Type::TypeE>(TypeToEnum<T>::val);
     }
-
-    static const EvalValue empty_str;
 };
 
+extern const EvalValue empty_str;
+extern const EvalValue empty_arr;
+
 ostream &operator<<(ostream &s, const EvalValue &c);
-
-inline EvalValue::EvalValue()
-    : val(), type(AllTypes[Type::t_none]) { }
-
-inline EvalValue::EvalValue(bool val)
-    : val(val), type(AllTypes[Type::t_int]) { }
 
 template <class T, class U, class S>
 inline EvalValue::EvalValue(T &&new_val)

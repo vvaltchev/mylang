@@ -42,7 +42,8 @@ const array<Type *, Type::t_count> AllTypes = {
  * in AllTypes.
  */
 
-const EvalValue EvalValue::empty_str = FlatSharedStr(string());
+const EvalValue empty_str = FlatSharedStr(string());
+const EvalValue empty_arr = FlatSharedArray(vector<LValue>());
 
 inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
 {

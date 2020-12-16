@@ -232,7 +232,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
         }
 
         if (start >= arr.size())
-            return EvalValue::empty_str;
+            return empty_arr;
 
     } else if (!start_val.is<NoneVal>()) {
 
@@ -247,7 +247,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
             end += arr.size();
 
         if (end <= start)
-            return EvalValue::empty_str;
+            return empty_arr;
 
         if (end > arr.size())
             end = arr.size();

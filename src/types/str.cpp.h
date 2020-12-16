@@ -221,7 +221,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
         }
 
         if (start >= s.size())
-            return EvalValue::empty_str;
+            return empty_str;
 
     } else if (!start_val.is<NoneVal>()) {
 
@@ -236,7 +236,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
             end += s.size();
 
         if (end <= start)
-            return EvalValue::empty_str;
+            return empty_str;
 
         if (end > s.size())
             end = s.size();
