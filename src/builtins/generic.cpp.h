@@ -11,7 +11,6 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
-
 EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
@@ -30,7 +29,6 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
     return e.get_type()->len(e);
 }
-
 
 EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
 {
@@ -52,7 +50,6 @@ EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
     return e.get_type()->clone(e);
 }
-
 
 EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList)
 {

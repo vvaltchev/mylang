@@ -1145,6 +1145,14 @@ static const vector<test> tests =
             "if (\"a\") assert(1); else assert(0);",
         },
     },
+
+    {
+        "Builtin array(N)",
+        {
+            "assert(array(0) == []);",
+            "assert(array(3) == [none,none,none]);",
+        },
+    },
 };
 
 static void

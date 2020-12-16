@@ -10,6 +10,7 @@
 #include "builtins/generic.cpp.h"
 #include "builtins/io.cpp.h"
 #include "builtins/num.cpp.h"
+#include "builtins/arr.cpp.h"
 
 EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
 {
@@ -70,6 +71,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("chr", builtin_chr),
     make_const_builtin("min", builtin_min),
     make_const_builtin("max", builtin_max),
+    make_const_builtin("array", builtin_array),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
