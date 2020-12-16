@@ -36,6 +36,8 @@ public:
     }
 
     virtual string to_string(const EvalValue &a);
+    virtual bool is_true(const EvalValue &a);
+    virtual void lnot(EvalValue &a);
 };
 
 long TypeArr::use_count(const EvalValue &a)
@@ -166,6 +168,16 @@ string TypeArr::to_string(const EvalValue &a)
 
     res += "]";
     return res;
+}
+
+bool TypeArr::is_true(const EvalValue &a)
+{
+    return a.get<FlatSharedArray>().size() > 0;
+}
+
+void TypeArr::lnot(EvalValue &a)
+{
+    a = EvalValue(!is_true(a));
 }
 
 EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
