@@ -36,6 +36,10 @@ public:
     bool is_slice(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
 
+    bool is_true(const EvalValue &a) override {
+        return a.get<FlatSharedStr>().size() > 0;
+    }
+
     long len(const EvalValue &a) override {
         return a.get<FlatSharedStr>().size();
     }

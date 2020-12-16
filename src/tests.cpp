@@ -1137,6 +1137,14 @@ static const vector<test> tests =
             "assert(max(ar2) == 52);",
         },
     },
+
+    {
+        "String as boolean",
+        {
+            "if (\"\") assert(0); else assert(1);",
+            "if (\"a\") assert(1); else assert(0);",
+        },
+    },
 };
 
 static void
