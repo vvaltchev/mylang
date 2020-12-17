@@ -5,6 +5,7 @@
 #include "flat/flatval.h"
 #include "flat/sharedstr.h"
 #include "flat/sharedarray.h"
+#include "flat/sharedexception.h"
 #include "type.h"
 
 #include <string_view>
@@ -31,6 +32,8 @@ typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
 typedef FlatSharedArrayTempl<LValue> FlatSharedArray;
 typedef TypeTemplate<EvalValue> Type;
 typedef ArrayConstViewTempl<LValue> ArrayConstView;
+typedef FlatSharedExceptionTempl<EvalValue> FlatSharedException;
+typedef ExceptionObjectTempl<EvalValue> ExceptionObject;
 
 extern const array<Type *, Type::t_count> AllTypes;
 
@@ -45,6 +48,7 @@ template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
 template <> struct TypeToEnum<FlatSharedStr> { enum { val = Type::t_str }; };
 template <> struct TypeToEnum<FlatSharedFuncObj> { enum { val = Type::t_func }; };
 template <> struct TypeToEnum<FlatSharedArray> { enum { val = Type::t_arr }; };
+template <> struct TypeToEnum<FlatSharedException> { enum { val = Type::t_ex }; };
 
 class EvalValue {
 
@@ -61,6 +65,7 @@ class EvalValue {
         FlatSharedStr str;
         FlatSharedFuncObj func;
         FlatSharedArray arr;
+        FlatSharedException ex;
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }
@@ -118,6 +123,7 @@ public:
         static_assert(offsetof(ValueU, str) == 0);
         static_assert(offsetof(ValueU, func) == 0);
         static_assert(offsetof(ValueU, arr) == 0);
+        static_assert(offsetof(ValueU, ex) == 0);
 
         if (is<T>())
             return *reinterpret_cast<T *>(&val);

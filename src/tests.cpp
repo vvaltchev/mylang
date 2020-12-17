@@ -1470,6 +1470,51 @@ static const vector<test> tests =
             "assert(c2 == 1);",
         },
     },
+
+    {
+        "Throw (custom) exception",
+        {
+            "var c = 0;",
+            "try {",
+            "   throw exception(\"myerr\");",
+            "} catch (myerr) {",
+            "   c=1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Throw (custom) exception with data",
+        {
+            "var c = 0;",
+            "try {",
+            "   throw exception(\"myerr\", 1234);",
+            "} catch (myerr as e) {",
+            "   c = exdata(e);",
+            "}",
+            "assert(c == 1234);",
+        },
+    },
+
+    {
+        "Re-throw (custom) exception with data",
+        {
+            "var c1 = 0, c2 = 0;",
+            "try {",
+            "   try {",
+            "       throw ex(\"myerr\", 1234);",
+            "   } catch (myerr as e1) {",
+            "       c1 = exdata(e1);",
+            "       rethrow;",
+            "   }",
+            "} catch (myerr as e2) {",
+            "   c2 = exdata(e2);",
+            "}",
+            "assert(c1 == 1234);",
+            "assert(c2 == 1234);",
+        },
+    },
 };
 
 static void

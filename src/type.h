@@ -33,6 +33,7 @@ public:
         t_str,
         t_func,
         t_arr,
+        t_ex,
 
         /* Number of types */
         t_count,

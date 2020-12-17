@@ -263,6 +263,11 @@ int main(int argc, char **argv)
         dumpLocInError(e);
         return 1;
 
+    } catch (const ExceptionObject &e) {
+
+        cout << "Uncaught dynamic exception: '" << e.get_name() << "'" << endl;
+        return 1;
+
     } catch (const Exception &e) {
 
         cout << e.name;

@@ -702,6 +702,30 @@ pAcceptReturnStmt(ParseContext &c,
     return false;
 }
 
+bool
+pAcceptThrowStmt(ParseContext &c,
+                 unique_ptr<Construct> &ret,
+                 unsigned fl)
+{
+    const Loc start = c.get_loc();
+
+    if (pAcceptKeyword(c, Keyword::kw_throw)) {
+
+        unique_ptr<ThrowStmt> t(new ThrowStmt);
+        t->elem = pExprTop(c, fl);
+
+        if (!t->elem)
+            noExprError(c);
+
+        t->start = start;
+        t->end = c.get_loc();
+        ret = move(t);
+        return true;
+    }
+
+    return false;
+}
+
 unique_ptr<Construct>
 pStmt(ParseContext &c, unsigned fl)
 {
@@ -719,7 +743,7 @@ pStmt(ParseContext &c, unsigned fl)
     if (fl & pFlags::pInCatchBody) {
 
         if (pAcceptKeyword(c, Keyword::kw_rethrow))
-            return make_unique<RethrowStmt>();
+            return make_unique<RethrowStmt>(start, c.get_loc());
     }
 
     if (pAcceptIfStmt(c, subStmt, fl)) {
@@ -739,6 +763,10 @@ pStmt(ParseContext &c, unsigned fl)
         return subStmt;
 
     } else if (pAcceptTryCatchStmt(c, subStmt, fl)) {
+
+        return subStmt;
+
+    } else if (pAcceptThrowStmt(c, subStmt, fl)) {
 
         return subStmt;
 
@@ -1024,6 +1052,7 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     while (pAcceptKeyword(c, Keyword::kw_catch)) {
 
         unique_ptr<IdList> exList;
+        unique_ptr<Identifier> asId;
         unique_ptr<Construct> body;
 
         if (have_catch_anything) {
@@ -1046,6 +1075,21 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 );
             }
 
+            if (pAcceptKeyword(c, Keyword::kw_as)) {
+
+                unique_ptr<Construct> id;
+
+                if (!pAcceptId(c, id, false)) {
+                    throw SyntaxErrorEx(
+                        c.get_loc(),
+                        "Expected identifier, got",
+                        &c.get_tok()
+                    );
+                }
+
+                asId.reset(static_cast<Identifier *>(id.release()));
+            }
+
             pExpectOp(c, Op::parenR);
 
         } else {
@@ -1056,7 +1100,10 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         if (!pAcceptBracedBlock(c, body, fl | pFlags::pInCatchBody))
             throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
 
-        stmt->catchStmts.emplace_back(move(exList), move(body));
+        stmt->catchStmts.emplace_back(
+            AllowedExList{move(exList), move(asId)},
+            move(body)
+        );
     };
 
     if (pAcceptKeyword(c, Keyword::kw_finally)) {

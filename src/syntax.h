@@ -63,7 +63,12 @@ class ChildlessConstruct : public Construct {
 
 public:
 
-    ChildlessConstruct(const char *name) : Construct(name) { }
+    ChildlessConstruct(const char *name, Loc start = Loc(), Loc end = Loc())
+        : Construct(name)
+    {
+        this->start = start;
+        this->end = end;
+    }
 
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
         return EvalValue();
@@ -437,13 +442,19 @@ public:
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
+struct AllowedExList {
+
+    unique_ptr<IdList> exList;
+    unique_ptr<Identifier> asId;
+};
+
 class TryCatchStmt : public Construct {
 
 public:
 
     unique_ptr<Construct> tryBody;
     unique_ptr<Construct> finallyBody;
-    vector<pair<unique_ptr<IdList>, unique_ptr<Construct>>> catchStmts;
+    vector<pair<AllowedExList, unique_ptr<Construct>>> catchStmts;
 
     TryCatchStmt() : Construct("TryCatchStmt") { }
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
@@ -453,6 +464,16 @@ public:
 class RethrowStmt : public ChildlessConstruct {
 
 public:
-    RethrowStmt(): ChildlessConstruct("RethrowStmt") { }
+
+    RethrowStmt(Loc start = Loc(), Loc end = Loc())
+        : ChildlessConstruct("RethrowStmt", start, end) { }
+
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+};
+
+class ThrowStmt : public SingleChildConstruct {
+
+public:
+    ThrowStmt(): SingleChildConstruct("ThrowStmt") { }
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };

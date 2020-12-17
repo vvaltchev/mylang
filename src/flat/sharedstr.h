@@ -33,7 +33,7 @@ public:
     FlatSharedStr(const inner_type &s) = delete;
 
     FlatSharedStr(inner_type &&s)
-        : flat(make_shared<string>(move(s)))
+        : flat(make_shared<inner_type>(move(s)))
         , off(0)
         , len(get_ref().size())
         , slice(false)

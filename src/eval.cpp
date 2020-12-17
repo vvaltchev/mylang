@@ -57,7 +57,7 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 struct LoopBreakEx { };
 struct LoopContinueEx { };
 struct ReturnEx { EvalValue value; };
-struct RethrowEx { };
+struct RethrowEx { Loc start; Loc end; };
 
 static inline EvalValue
 do_func_return(EvalValue &&tmp, Construct *retExpr)
@@ -497,7 +497,17 @@ EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue RethrowStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw RethrowEx();
+    throw RethrowEx{start, end};
+}
+
+EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    const EvalValue &e = RValue(elem->eval(ctx));
+
+    if (!e.is<FlatSharedException>())
+        throw TypeErrorEx(elem->start, elem->end);
+
+    throw e.get<FlatSharedException>().get_ref();
 }
 
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
@@ -590,6 +600,67 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
     );
 }
 
+static bool
+do_catch(EvalContext *ctx,
+         RuntimeException *saved_ex,
+         IdList *exList,
+         Identifier *asId,
+         Construct *catchBody)
+{
+    if (!exList) {
+
+        /* Catch-anything block */
+        try {
+            catchBody->eval(ctx);
+        } catch (const RethrowEx &re) {
+            saved_ex->loc_start = re.start;
+            saved_ex->loc_end = re.end;
+            saved_ex->rethrow();
+        }
+
+        return true;
+    }
+
+    ExceptionObject *exObj = dynamic_cast<ExceptionObject *>(saved_ex);
+    string_view ex_name = exObj ? exObj->get_name() : saved_ex->name;
+
+    for (const unique_ptr<Identifier> &id : exList->elems) {
+
+        if (id->value != ex_name)
+            continue;
+
+        try {
+
+            EvalContext catch_ctx(ctx);
+
+            if (asId) {
+
+                FlatSharedException flatEx(
+                    exObj
+                        ? *exObj
+                        : ExceptionObject(saved_ex->name)
+                );
+
+                catch_ctx.symbols.emplace(
+                    asId->value,
+                    LValue(move(flatEx), ctx->const_ctx)
+                );
+            }
+
+            catchBody->eval(&catch_ctx);
+
+        } catch (const RethrowEx &re) {
+            saved_ex->loc_start = re.start;
+            saved_ex->loc_end = re.end;
+            saved_ex->rethrow();
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     struct trivial_scope_guard {
@@ -608,7 +679,6 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
     };
 
     trivial_scope_guard on_exit(ctx, finallyBody.get());
-
     unique_ptr<RuntimeException> saved_ex;
 
     try {
@@ -625,33 +695,12 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 
     for (const auto &p : catchStmts) {
 
-        IdList *exList = p.first.get();
+        IdList *exList = p.first.exList.get();
+        Identifier *asId = p.first.asId.get();
         Construct *catchBody = p.second.get();
 
-        if (exList) {
-
-            for (const unique_ptr<Identifier> &id : exList->elems) {
-                if (id->value == saved_ex->name) {
-
-                    try {
-                        catchBody->eval(ctx);
-                    } catch (const RethrowEx &) {
-                        saved_ex->rethrow();
-                    }
-                    return EvalValue();
-                }
-            }
-
-        } else {
-
-            /* Catch-anything block */
-            try {
-                catchBody->eval(ctx);
-            } catch (const RethrowEx &) {
-                saved_ex->rethrow();
-            }
+        if (do_catch(ctx, saved_ex.get(), exList, asId, catchBody))
             return EvalValue();
-        }
     }
 
     saved_ex->rethrow();

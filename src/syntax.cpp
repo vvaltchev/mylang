@@ -431,7 +431,8 @@ void TryCatchStmt::serialize(ostream &s, int level) const
 
     for (const auto &p : catchStmts) {
 
-        IdList *exList = p.first.get();
+        IdList *exList = p.first.exList.get();
+        Identifier *asId = p.first.asId.get();
         Construct *body = p.second.get();
 
         s << string((level + 1) * 2, ' ');
@@ -443,13 +444,19 @@ void TryCatchStmt::serialize(ostream &s, int level) const
                 cout << e->value << " ";
             }
 
+            if (asId) {
+                cout << "as " << asId->value << " ";
+            }
+
         } else {
             s << "<anything>";
         }
 
-        s << ")\n";
+        s << ") (\n";
         body->serialize(s, level+2);
         s << endl;
+        s << string((level + 1) * 2, ' ');
+        s << ")\n";
     }
 
     if (finallyBody) {

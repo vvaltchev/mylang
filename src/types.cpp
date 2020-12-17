@@ -6,6 +6,7 @@
 #include "types/str.cpp.h"
 #include "types/func.cpp.h"
 #include "types/arr.cpp.h"
+#include "types/exception.cpp.h"
 #include "builtins/str.cpp.h"
 #include "builtins/generic.cpp.h"
 #include "builtins/io.cpp.h"
@@ -22,6 +23,7 @@ static const array<FlatSharedStr, Type::t_count> TypeNames =
     string("str"),
     string("func"),
     string("arr"),
+    string("exception"),
 };
 
 EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
@@ -49,6 +51,40 @@ EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)
     return TypeNames[e.get_type()->t];
 }
 
+EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() < 1 || exprList->elems.size() > 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    const EvalValue &name_val = RValue(exprList->elems[0]->eval(ctx));
+
+    if (!name_val.is<FlatSharedStr>())
+        throw TypeErrorEx(exprList->elems[0]->start, exprList->elems[0]->end);
+
+    return FlatSharedException(
+        ExceptionObject(
+            name_val.get<FlatSharedStr>().get_ref(),
+            exprList->elems.size() == 2
+                ? RValue(exprList->elems[1]->eval(ctx))
+                : EvalValue()
+        )
+    );
+}
+
+EvalValue builtin_exdata(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    if (!e.is<FlatSharedException>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    return e.get<FlatSharedException>().get_ref().get_data();
+}
+
 const array<Type *, Type::t_count> AllTypes =
 {
     new TypeNone(),
@@ -59,6 +95,7 @@ const array<Type *, Type::t_count> AllTypes =
     new TypeStr(),
     new TypeFunc(),
     new TypeArr(),
+    new TypeException(),
 };
 
 
@@ -117,4 +154,7 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("append", builtin_append),
     make_builtin("push", builtin_append), /* push() is an alias for append() */
     make_builtin("pop", builtin_pop),
+    make_builtin("exception", builtin_exception),
+    make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */
+    make_builtin("exdata", builtin_exdata),
 };
