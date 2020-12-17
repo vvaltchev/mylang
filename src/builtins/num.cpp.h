@@ -29,16 +29,16 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
 template <bool is_max>
 EvalValue b_min_max_arr(const FlatSharedArray &arr)
 {
-    const FlatSharedArray::vec_type &vec = arr.get_ref();
+    const ArrayConstView &arr_view = arr.get_view();
     EvalValue val;
 
     if (arr.size() > 0) {
 
-        val = vec[arr.offset()].get();
+        val = arr_view[0].get();
 
-        for (unsigned i = 1; i < arr.size(); i++) {
+        for (unsigned i = 1; i < arr_view.size(); i++) {
 
-            const EvalValue &other = vec[arr.offset() + i].get();
+            const EvalValue &other = arr_view[i].get();
 
             if constexpr(is_max) {
 

@@ -30,6 +30,7 @@ struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
 typedef FlatSharedArrayTempl<LValue> FlatSharedArray;
 typedef TypeTemplate<EvalValue> Type;
+typedef ArrayConstViewTempl<LValue> ArrayConstView;
 
 extern const array<Type *, Type::t_count> AllTypes;
 

@@ -156,14 +156,14 @@ string TypeArr::to_string(const EvalValue &a)
     res.reserve(arr.size() * 32);
     res += "[";
 
-    const FlatSharedArray::vec_type &vec = arr.get_ref();
+    const ArrayConstView &arr_view = arr.get_view();
 
-    for (unsigned i = 0; i < arr.size(); i++) {
+    for (unsigned i = 0; i < arr_view.size(); i++) {
 
-        const EvalValue &val = vec[arr.offset() + i].get();
+        const EvalValue &val = arr_view[i].get();
         res += val.get_type()->to_string(val);
 
-        if (i != arr.size() - 1)
+        if (i != arr_view.size() - 1)
             res += ", ";
     }
 

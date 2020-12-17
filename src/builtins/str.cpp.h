@@ -105,20 +105,19 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx(arg_delim->start, arg_delim->end);
 
     const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
-    const FlatSharedArray &arr = val_arr.get<FlatSharedArray>();
-    const FlatSharedArray::vec_type &vec = arr.get_ref();
+    const ArrayConstView &arr_view = val_arr.get<FlatSharedArray>().get_view();
     string result;
 
-    for (size_t i = 0; i < arr.size(); i++) {
+    for (size_t i = 0; i < arr_view.size(); i++) {
 
-        const EvalValue &val = vec[arr.offset() + i].get();
+        const EvalValue &val = arr_view[i].get();
 
         if (!val.is<FlatSharedStr>())
             throw TypeErrorEx(arg_arr->start, arg_arr->end);
 
         result += val.get<FlatSharedStr>().get_view();
 
-        if (i != arr.size() - 1)
+        if (i != arr_view.size() - 1)
             result += delim;
     }
 

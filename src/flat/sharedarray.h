@@ -9,12 +9,34 @@
 using namespace std;
 
 /*
- * This class is a template simply because otherwise this header wouldn't be
+ * These classes are templates simply because otherwise this header wouldn't be
  * able to compile if included independently (it requires LValue, which requires
  * EvalValue which requires FlatSharedArray). In this case, it wouldn't be a big
  * deal, but in general it's an anti-pattern to have headers requiring a specific
  * include order.
  */
+
+template <class LValueT>
+class ArrayConstViewTempl {
+
+    const vector<LValueT> &vec;
+    const unsigned off;
+    const unsigned len;
+
+public:
+
+    ArrayConstViewTempl(const vector<LValueT> &vec, unsigned off, unsigned len)
+        : vec(vec), off(off), len(len)
+    { }
+
+    const LValueT &operator[](size_t index) const {
+        return vec[off + index];
+    }
+
+    unsigned size() const {
+        return len;
+    }
+};
 
 template <class LValueType>
 class FlatSharedArrayTempl {
@@ -176,4 +198,8 @@ public:
 
     void clone_internal_vec() { flat->clone_internal_vec(); }
     void clone_aliased_slices(unsigned index) { flat->clone_aliased_slices(index); }
+
+    ArrayConstViewTempl<LValueType> get_view() const {
+        return ArrayConstViewTempl<LValueType>(get_ref(), offset(), size());
+    };
 };
