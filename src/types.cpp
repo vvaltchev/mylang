@@ -72,6 +72,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("min", builtin_min),
     make_const_builtin("max", builtin_max),
     make_const_builtin("array", builtin_array),
+    make_const_builtin("top", builtin_top),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

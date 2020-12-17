@@ -98,3 +98,22 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
 
     return last;
 }
+
+EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    if (!e.is<FlatSharedArray>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    const ArrayConstView &view = e.get<FlatSharedArray>().get_view();
+
+    if (!view.size())
+        throw OutOfBoundsEx(arg->start, arg->end);
+
+    return view[view.size() - 1].get();
+}

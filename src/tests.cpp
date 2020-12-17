@@ -1208,6 +1208,30 @@ static const vector<test> tests =
             "assert(s == [2,3]);",
         },
     },
+
+    {
+        "Append() does not work on temp objects",
+        {
+            "append([1,2,3], 4);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "Pop() does not work on temp objects",
+        {
+            "pop([1,2,3]);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "Builtin top()",
+        {
+            "assert(top([1,2,3]) == 3);",
+            "assert(top([1]) == 1);",
+        },
+    },
 };
 
 static void
