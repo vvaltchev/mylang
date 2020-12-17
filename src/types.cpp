@@ -12,6 +12,18 @@
 #include "builtins/num.cpp.h"
 #include "builtins/arr.cpp.h"
 
+static const array<FlatSharedStr, Type::t_count> TypeNames =
+{
+    string("none"),
+    string(),
+    string(),
+    string("int"),
+    string("builtin"),
+    string("str"),
+    string("func"),
+    string("arr"),
+};
+
 EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
@@ -26,7 +38,19 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     exit(e.get<long>());
 }
 
-const array<Type *, Type::t_count> AllTypes = {
+EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    return TypeNames[e.get_type()->t];
+}
+
+const array<Type *, Type::t_count> AllTypes =
+{
     new TypeNone(),
     new Type(Type::t_lval),       /* internal type: not visible from outside */
     new Type(Type::t_undefid),    /* internal type: not visible from outside */
@@ -36,6 +60,7 @@ const array<Type *, Type::t_count> AllTypes = {
     new TypeFunc(),
     new TypeArr(),
 };
+
 
 /*
  * NOTE: these definitions *MUST FOLLOW* the definition of `AllTypes`
@@ -73,6 +98,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("max", builtin_max),
     make_const_builtin("array", builtin_array),
     make_const_builtin("top", builtin_top),
+    make_const_builtin("type", builtin_type),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =
