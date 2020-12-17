@@ -418,3 +418,49 @@ void Slice::serialize(ostream &s, int level) const
     s << indent;
     s << ")";
 }
+
+void TryCatchStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    tryBody->serialize(s, level+1);
+    s << endl;
+
+    for (const auto &p : catchStmts) {
+
+        IdList *exList = p.first.get();
+        Construct *body = p.second.get();
+
+        s << string((level + 1) * 2, ' ');
+        s << "Catch( ";
+
+        if (exList) {
+
+            for (const unique_ptr<Identifier> &e : exList->elems) {
+                cout << e->value << " ";
+            }
+
+        } else {
+            s << "<anything>";
+        }
+
+        s << ")\n";
+        body->serialize(s, level+2);
+        s << endl;
+    }
+
+    if (finallyBody) {
+        s << string((level + 1) * 2, ' ');
+        s << "Finally( ";
+
+        finallyBody->serialize(s, level+2);
+        s << endl;
+        s << ")\n";
+    }
+
+    s << indent;
+    s << ")";
+}

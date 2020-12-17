@@ -27,6 +27,7 @@ enum pFlags : unsigned {
     pInLoop         = 1 << 3,
     pInStmt         = 1 << 4,
     pInFuncBody     = 1 << 5,
+    pInCatchBody    = 1 << 6,
 };
 
 class Construct {
@@ -434,4 +435,24 @@ public:
     Slice() : Construct("Slice") { }
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
     virtual void serialize(ostream &s, int level = 0) const;
+};
+
+class TryCatchStmt : public Construct {
+
+public:
+
+    unique_ptr<Construct> tryBody;
+    unique_ptr<Construct> finallyBody;
+    vector<pair<unique_ptr<IdList>, unique_ptr<Construct>>> catchStmts;
+
+    TryCatchStmt() : Construct("TryCatchStmt") { }
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    virtual void serialize(ostream &s, int level = 0) const;
+};
+
+class RethrowStmt : public ChildlessConstruct {
+
+public:
+    RethrowStmt(): ChildlessConstruct("RethrowStmt") { }
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };

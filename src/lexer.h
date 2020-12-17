@@ -79,8 +79,12 @@ enum class Keyword : int {
     kw_none     = 9,
     kw_func     = 10,
     kw_return   = 11,
+    kw_try      = 12,
+    kw_catch    = 13,
+    kw_finally  = 14,
+    kw_rethrow  = 15,
 
-    kw_count    = 12,
+    kw_count    = 16,
 };
 
 static const array<string, (int)Keyword::kw_count> KwString =
@@ -98,6 +102,10 @@ static const array<string, (int)Keyword::kw_count> KwString =
     "none",
     "func",
     "return",
+    "try",
+    "catch",
+    "finally",
+    "rethrow",
 };
 
 ostream &operator<<(ostream &s, TokType t);

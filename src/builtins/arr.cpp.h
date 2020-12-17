@@ -51,7 +51,7 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     LValue *lval = arr_lval.get<LValue *>();
 
     if (!lval->is<FlatSharedArray>())
-        throw NotLValueEx(arg0->start, arg0->end);
+        throw TypeErrorEx(arg0->start, arg0->end);
 
     FlatSharedArray &arr = lval->getval<FlatSharedArray>();
 
@@ -76,7 +76,7 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
     LValue *lval = arr_lval.get<LValue *>();
 
     if (!lval->is<FlatSharedArray>())
-        throw NotLValueEx(arg->start, arg->end);
+        throw TypeErrorEx(arg->start, arg->end);
 
     FlatSharedArray &arr = lval->getval<FlatSharedArray>();
     const ArrayConstView &view = arr.get_view();

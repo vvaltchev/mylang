@@ -54,7 +54,10 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
     return UndefinedId{value};
 }
 
+struct LoopBreakEx { };
+struct LoopContinueEx { };
 struct ReturnEx { EvalValue value; };
+struct RethrowEx { };
 
 static inline EvalValue
 do_func_return(EvalValue &&tmp, Construct *retExpr)
@@ -477,9 +480,6 @@ EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
     return EvalValue();
 }
 
-struct LoopBreakEx { };
-struct LoopContinueEx { };
-
 EvalValue BreakStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     throw LoopBreakEx();
@@ -493,6 +493,11 @@ EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     throw ReturnEx{ RValue(elem->eval(ctx)) };
+}
+
+EvalValue RethrowStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    throw RethrowEx();
 }
 
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
@@ -583,6 +588,74 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
         start_idx ? RValue(start_idx->eval(ctx)) : EvalValue(),
         end_idx ? RValue(end_idx->eval(ctx)) : EvalValue()
     );
+}
+
+EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    struct trivial_scope_guard {
+
+        EvalContext *ctx;
+        Construct *finallyBody;
+
+        trivial_scope_guard(EvalContext *ctx, Construct *body)
+            : ctx(ctx), finallyBody(body) { }
+
+        ~trivial_scope_guard() {
+
+            if (finallyBody)
+                finallyBody->eval(ctx);
+        }
+    };
+
+    trivial_scope_guard on_exit(ctx, finallyBody.get());
+
+    unique_ptr<RuntimeException> saved_ex;
+
+    try {
+
+        tryBody->eval(ctx);
+
+    } catch (const RuntimeException &e) {
+
+        saved_ex.reset(e.clone());
+    }
+
+    if (!saved_ex)
+        return EvalValue();
+
+    for (const auto &p : catchStmts) {
+
+        IdList *exList = p.first.get();
+        Construct *catchBody = p.second.get();
+
+        if (exList) {
+
+            for (const unique_ptr<Identifier> &id : exList->elems) {
+                if (id->value == saved_ex->name) {
+
+                    try {
+                        catchBody->eval(ctx);
+                    } catch (const RethrowEx &) {
+                        saved_ex->rethrow();
+                    }
+                    return EvalValue();
+                }
+            }
+
+        } else {
+
+            /* Catch-anything block */
+            try {
+                catchBody->eval(ctx);
+            } catch (const RethrowEx &) {
+                saved_ex->rethrow();
+            }
+            return EvalValue();
+        }
+    }
+
+    saved_ex->rethrow();
+    return EvalValue(); /* Make compilers unaware of [[noreturn]] happy */
 }
 
 LValue LValue::clone()

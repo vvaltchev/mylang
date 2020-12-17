@@ -45,10 +45,10 @@ static const vector<test> tests =
     {
         "expr with priority",
         {
-            "var a = 2 * -3 + 1 < 0 && 2 >= 1;"
-            "var b = (((2 * -3) + 1) < 0) && (2 >= 1);"
-            "assert(a == 1);"
-            "assert(a == b);"
+            "var a = 2 * -3 + 1 < 0 && 2 >= 1;",
+            "var b = (((2 * -3) + 1) < 0) && (2 >= 1);",
+            "assert(a == 1);",
+            "assert(a == b);",
         },
     },
 
@@ -257,7 +257,7 @@ static const vector<test> tests =
     {
         "len() works with literal",
         {
-            "assert(len(\"hello\") == 5);"
+            "assert(len(\"hello\") == 5);",
         },
     },
 
@@ -265,7 +265,7 @@ static const vector<test> tests =
         "len() works with const",
         {
             "const a = \"hello\";",
-            "assert(len(a) == 5);"
+            "assert(len(a) == 5);",
         },
     },
 
@@ -273,7 +273,7 @@ static const vector<test> tests =
         "len() works with variable",
         {
             "var a = \"hello\";",
-            "assert(len(a) == 5);"
+            "assert(len(a) == 5);",
         },
     },
 
@@ -288,7 +288,7 @@ static const vector<test> tests =
     {
         "literal str concat",
         {
-            "assert(\"hello\" + \" world\" == \"hello world\");"
+            "assert(\"hello\" + \" world\" == \"hello world\");",
         },
     },
 
@@ -296,7 +296,7 @@ static const vector<test> tests =
         "var str concat",
         {
             "var a = \"hello\";",
-            "assert(a + \" world\" == \"hello world\");"
+            "assert(a + \" world\" == \"hello world\");",
         },
     },
 
@@ -305,7 +305,7 @@ static const vector<test> tests =
         {
             "var a = \"hello\";",
             "a += \" world\";",
-            "assert(a == \"hello world\");"
+            "assert(a == \"hello world\");",
         },
     },
 
@@ -313,7 +313,7 @@ static const vector<test> tests =
         "var str concat with integer",
         {
             "var a = \"hello\";",
-            "assert(a + 2 == \"hello2\");"
+            "assert(a + 2 == \"hello2\");",
         },
     },
 
@@ -590,7 +590,7 @@ static const vector<test> tests =
     {
         "Undefined (and unused) variable",
         {
-            "a;"
+            "a;",
         },
         &typeid(UndefinedVariableEx),
     },
@@ -655,7 +655,7 @@ static const vector<test> tests =
     {
         "String subscript operator, literal string",
         {
-            "assert(\"abc\"[1] == \"b\");"
+            "assert(\"abc\"[1] == \"b\");",
         },
     },
 
@@ -663,7 +663,7 @@ static const vector<test> tests =
         "Slice operator, regular",
         {
             "const s=\"abc\";",
-            "assert(s[1:2] == \"b\");"
+            "assert(s[1:2] == \"b\");",
         },
     },
 
@@ -671,7 +671,7 @@ static const vector<test> tests =
         "Slice operator, just start",
         {
             "const s=\"abc\";",
-            "assert(s[1:] == \"bc\");"
+            "assert(s[1:] == \"bc\");",
         },
     },
 
@@ -679,7 +679,7 @@ static const vector<test> tests =
         "Slice operator, just end",
         {
             "const s=\"abc\";",
-            "assert(s[:2] == \"ab\");"
+            "assert(s[:2] == \"ab\");",
         },
     },
 
@@ -687,7 +687,7 @@ static const vector<test> tests =
         "Slice operator, neg start, no end",
         {
             "const s=\"abc\";",
-            "assert(s[-2:] == \"bc\");"
+            "assert(s[-2:] == \"bc\");",
         },
     },
 
@@ -695,7 +695,7 @@ static const vector<test> tests =
         "Slice operator, neg start, neg end",
         {
             "const s=\"abc\";",
-            "assert(s[-3:-1] == \"ab\");"
+            "assert(s[-3:-1] == \"ab\");",
         },
     },
 
@@ -703,7 +703,7 @@ static const vector<test> tests =
         "Slice operator, out of bounds, stop",
         {
             "const s=\"abc\";",
-            "assert(s[0:10] == \"abc\");"
+            "assert(s[0:10] == \"abc\");",
         },
     },
 
@@ -711,7 +711,7 @@ static const vector<test> tests =
         "Slice operator, out of bounds, start",
         {
             "const s=\"abc\";",
-            "assert(s[-10:10] == \"abc\");"
+            "assert(s[-10:10] == \"abc\");",
         },
     },
 
@@ -719,7 +719,7 @@ static const vector<test> tests =
         "Slice operator, out of bounds, start and end",
         {
             "const s=\"abc\";",
-            "assert(s[10:20] == \"\");"
+            "assert(s[10:20] == \"\");",
         },
     },
 
@@ -727,7 +727,7 @@ static const vector<test> tests =
         "Slice operator, out of bounds, neg start, neg end",
         {
             "const s=\"abc\";",
-            "assert(s[-10:-20] == \"\");"
+            "assert(s[-10:-20] == \"\");",
         },
     },
 
@@ -735,7 +735,7 @@ static const vector<test> tests =
         "Slice operator, out of bounds, start == end",
         {
             "const s=\"abc\";",
-            "assert(s[1:1] == \"\");"
+            "assert(s[1:1] == \"\");",
         },
     },
 
@@ -743,7 +743,7 @@ static const vector<test> tests =
         "Slice operator, out of bounds, start > end",
         {
             "const s=\"abc\";",
-            "assert(s[2:1] == \"\");"
+            "assert(s[2:1] == \"\");",
         },
     },
 
@@ -1086,7 +1086,7 @@ static const vector<test> tests =
     {
         "Split string, char by char",
         {
-            "assert(split(\"abc\", \"\") == [\"a\",\"b\",\"c\"]);"
+            "assert(split(\"abc\", \"\") == [\"a\",\"b\",\"c\"]);",
         },
     },
 
@@ -1177,7 +1177,7 @@ static const vector<test> tests =
             "var ptr = arr;",
             "var e = pop(arr);",
             "assert(e == 3);",
-            "assert(arr == [1,2]);"
+            "assert(arr == [1,2]);",
             "assert(intptr(arr) == intptr(ptr));",
         },
     },
@@ -1230,6 +1230,244 @@ static const vector<test> tests =
         {
             "assert(top([1,2,3]) == 3);",
             "assert(top([1]) == 1);",
+        },
+    },
+
+    {
+        "Exceptions, uncaught",
+        {
+            "var a=3; append(a, 4);",
+        },
+        &typeid(TypeErrorEx)
+    },
+
+    {
+        "Exceptions, single catch TypeErrorEx",
+        {
+            "var c = 0;",
+            "try {",
+            "   var t = 3;",
+            "   append(t, 4);",
+            "   assert(0);",     // We should NEVER get here
+            "} catch (TypeErrorEx) {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Exceptions, single catch DivisionByZeroEx",
+        {
+            "var c = 0;",
+            "try {",
+            "   var t = 3;",
+            "   var d = 0;",
+            "   print(t/d);",
+            "   assert(0);",     // We should NEVER get here
+            "} catch (DivisionByZeroEx) {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Exceptions, single catch other ex type",
+        {
+            "var c = 0;",
+            "try {",
+            "   var t = 3;",
+            "   var d = 0;",
+            "   print(t/d);",
+            "   assert(0);",     // We should NEVER get here
+            "} catch (TypeErrorEx) {",
+            "   c = 1;",         // We should NEVER get here
+            "}",
+            "assert(0);",
+        },
+        &typeid(DivisionByZeroEx),
+    },
+
+    {
+        "Exceptions, multiple catch, ex: DivisionByZeroEx",
+        {
+            "var c = 0;",
+            "try {",
+            "   var t = 3;",
+            "   var d = 0;",
+            "   print(t/d);",
+            "   assert(0);",     // We should NEVER get here
+            "} catch (TypeErrorEx) {",
+            "   assert(0);",     // We should NEVER get here
+            "} catch (DivisionByZeroEx) {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Exceptions, multiple catch, ex: TypeErrorEx",
+        {
+            "var c = 0;",
+            "try {",
+            "   var t = 3;",
+            "   append(t, 34);",
+            "   assert(0);",     // We should NEVER get here
+            "} catch (TypeErrorEx) {",
+            "   c = 1;",
+            "} catch (DivisionByZeroEx) {",
+            "   assert(0);",     // We should NEVER get here
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Nested try-catch blocks, catch in outer block",
+        {
+            "var c = 0;",
+            "try {",
+            "   try {",
+            "       var t = 3;",
+            "       append(t, 34);",
+            "   } catch (DivisionByZeroEx) {",
+            "       assert(0);",    // We should NEVER get here
+            "   }",
+            "} catch (TypeErrorEx) {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Finally, without catch",
+        {
+            "var c = 0, f = 0;",
+            "try {",
+            "   try {",
+            "       var a=3; append(a, 10);",
+            "       assert(0);",     // We should NEVER get here
+            "   } finally {",
+            "       f = 1;",
+            "   }",
+            "} catch (TypeErrorEx) {",
+            "   c=1;",
+            "}",
+            "assert(f == 1);",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Finally after catch",
+        {
+            "var c = 0, f = 0;",
+            "try {",
+            "   var a=3; append(a, 10);",
+            "} catch (TypeErrorEx) {",
+            "   c = 1;",
+            "} finally {",
+            "   assert(c == 1);",
+            "   f = 1;",
+            "}",
+            "assert(f == 1);",
+        },
+    },
+
+    {
+        "Finally gets executed in the no-exception case",
+        {
+            "var f = 0;",
+            "try {",
+            "   assert(1);",
+            "} finally {",
+            "   f = 1;",
+            "}",
+            "assert(f == 1);",
+        }
+    },
+
+    {
+        "Finally gets executed in case of return",
+        {
+            "var g = 0;",
+            "func myfunc {",
+            "   try {",
+            "       return 42;",
+            "   } finally {",
+            "       g = 1;",
+            "   }",
+            "}",
+            "var r = myfunc();",
+            "assert(r == 42);",
+            "assert(g == 1);",
+        },
+    },
+
+    {
+        "Catch anything: TypeErrorEx",
+        {
+            "var c = 0;",
+            "try {",
+            "   var a=3; append(a, 4);",
+            "} catch {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "Catch single ex + anything: catch anything runs",
+        {
+            "var c1 = 0, c2 = 0;",
+            "try {",
+            "   var a=3; append(a, 4);",
+            "} catch (DivisionByZeroEx) {",
+            "   c1 = 1;",
+            "} catch {",
+            "   c2 = 1;",
+            "}",
+            "assert(c1 == 0);",
+            "assert(c2 == 1);",
+        },
+    },
+
+    {
+        "Catch single ex + anything: single catch runs",
+        {
+            "var c1 = 0, c2 = 0;",
+            "try {",
+            "   var a=3; append(a, 4);",
+            "} catch (TypeErrorEx) {",
+            "   c1 = 1;",
+            "} catch {",
+            "   c2 = 1;",
+            "}",
+            "assert(c1 == 1);",
+            "assert(c2 == 0);",
+        },
+    },
+
+    {
+        "Rethrow",
+        {
+            "var c1=0, c2=0;",
+            "try {",
+            "   try {",
+            "       var a=3; append(a, 4);",
+            "   } catch {",
+            "       c1 = 1;",
+            "       rethrow;",
+            "   }",
+            "} catch {",
+            "   c2 = 1;",
+            "}",
+            "assert(c1 == 1);",
+            "assert(c2 == 1);",
         },
     },
 };

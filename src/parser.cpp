@@ -54,6 +54,11 @@ pAcceptFuncDecl(ParseContext &c,
                 unsigned fl);
 
 bool
+pAcceptTryCatchStmt(ParseContext &c,
+                    unique_ptr<Construct> &ret,
+                    unsigned fl);
+
+bool
 MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
                           bool process_arrays = false);
@@ -711,6 +716,12 @@ pStmt(ParseContext &c, unsigned fl)
             return make_unique<ContinueStmt>();
     }
 
+    if (fl & pFlags::pInCatchBody) {
+
+        if (pAcceptKeyword(c, Keyword::kw_rethrow))
+            return make_unique<RethrowStmt>();
+    }
+
     if (pAcceptIfStmt(c, subStmt, fl)) {
 
         return subStmt;
@@ -724,6 +735,10 @@ pStmt(ParseContext &c, unsigned fl)
         return subStmt;
 
     } else if (pAcceptReturnStmt(c, subStmt, fl)) {
+
+        return subStmt;
+
+    } else if (pAcceptTryCatchStmt(c, subStmt, fl)) {
 
         return subStmt;
 
@@ -992,4 +1007,71 @@ MakeConstructFromConstVal(const EvalValue &v,
     }
 
     return false;
+}
+
+bool
+pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
+{
+    if (!pAcceptKeyword(c, Keyword::kw_try))
+        return false;
+
+    unique_ptr<TryCatchStmt> stmt(new TryCatchStmt);
+    bool have_catch_anything = false;
+
+    if (!pAcceptBracedBlock(c, stmt->tryBody, fl))
+        throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
+
+    while (pAcceptKeyword(c, Keyword::kw_catch)) {
+
+        unique_ptr<IdList> exList;
+        unique_ptr<Construct> body;
+
+        if (have_catch_anything) {
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "At most one catch-anything block is allowed"
+            );
+        }
+
+        if (pAcceptOp(c, Op::parenL)) {
+
+            exList = pList<IdList>(c, fl, pIdentifier);
+
+            if (exList->elems.size() == 0) {
+
+                throw SyntaxErrorEx(
+                    c.get_loc(),
+                    "Expected non-empty exception list, got",
+                    &c.get_tok()
+                );
+            }
+
+            pExpectOp(c, Op::parenR);
+
+        } else {
+
+            have_catch_anything = true;
+        }
+
+        if (!pAcceptBracedBlock(c, body, fl | pFlags::pInCatchBody))
+            throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
+
+        stmt->catchStmts.emplace_back(move(exList), move(body));
+    };
+
+    if (pAcceptKeyword(c, Keyword::kw_finally)) {
+
+        if (!pAcceptBracedBlock(c, stmt->finallyBody, fl))
+            throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
+    }
+
+    if (!stmt->catchStmts.size() && !stmt->finallyBody) {
+        throw SyntaxErrorEx(
+            c.get_loc(),
+            "At least one catch block or a finally block is required"
+        );
+    }
+
+    ret = move(stmt);
+    return true;
 }
