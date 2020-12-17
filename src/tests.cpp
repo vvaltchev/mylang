@@ -1163,9 +1163,49 @@ static const vector<test> tests =
             "assert(arr == [1,2,3,99]);",
             "var s = arr[2:];",
             "assert(s == [3,99]);",
-            "append(s, 100);",
+            "assert(append(s, 100) == [3,99,100]);",
             "assert(s == [3,99,100]);",
             "assert(arr == [1,2,3,99]);",
+        },
+    },
+
+    {
+        "Builtin pop(), base case",
+        {
+            "var arr = [1,2,3];",
+            "assert(arr == [1,2,3]);",
+            "var ptr = arr;",
+            "var e = pop(arr);",
+            "assert(e == 3);",
+            "assert(arr == [1,2]);"
+            "assert(intptr(arr) == intptr(ptr));",
+        },
+    },
+
+    {
+        "Builtin pop(), slices",
+        {
+            "var arr = [1,2,3];",
+            "var s = arr[1:];",
+            "assert(intptr(arr) == intptr(s));",
+            "assert(pop(s) == 3);",
+            "assert(s == [2]);",
+            "assert(intptr(arr) == intptr(s));", // The slice still shares the same data
+            "assert(arr == [1,2,3]);",
+        },
+    },
+
+    {
+        "Builtin pop(), slices (2)",
+        {
+            "var arr = [1,2,3];",
+            "var s = arr[1:];",
+            "assert(s == [2,3]);",
+            "assert(intptr(arr) == intptr(s));",
+            "assert(pop(arr) == 3);",
+            "assert(intptr(arr) != intptr(s));", // The slice has its own copy now
+            "assert(arr == [1,2]);",
+            "assert(s == [2,3]);",
         },
     },
 };

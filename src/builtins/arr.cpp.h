@@ -61,3 +61,40 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     arr.get_ref().emplace_back(elem, ctx->const_ctx);
     return lval->get();
 }
+
+EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &arr_lval = arg->eval(ctx);
+
+    if (!arr_lval.is<LValue *>())
+        throw NotLValueEx(arg->start, arg->end);
+
+    LValue *lval = arr_lval.get<LValue *>();
+
+    if (!lval->is<FlatSharedArray>())
+        throw NotLValueEx(arg->start, arg->end);
+
+    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
+    const ArrayConstView &view = arr.get_view();
+
+    if (!view.size())
+        throw OutOfBoundsEx(arg->start, arg->end);
+
+    EvalValue last = view[view.size() - 1].get();
+
+    if (arr.is_slice()) {
+
+        lval->put(FlatSharedArray(arr, arr.offset(), arr.size() - 1));
+
+    } else {
+
+        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
+        arr.get_ref().pop_back();
+    }
+
+    return last;
+}
