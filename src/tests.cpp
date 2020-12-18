@@ -1584,6 +1584,16 @@ static const vector<test> tests =
             "assert(a == [1,2,3,4,5]);",
         },
     },
+
+    {
+        "Builtin range()",
+        {
+            "assert(range(5) == [0,1,2,3,4]);",
+            "assert(range(2,5) == [2,3,4]);",
+            "assert(range(2,10,2) == [2,4,6,8]);",
+            "assert(range(20,5,-2) == [20,18,16,14,12,10,8,6]);",
+        },
+    },
 };
 
 static void

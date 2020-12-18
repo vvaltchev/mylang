@@ -154,3 +154,61 @@ EvalValue builtin_erase_arr(LValue *lval, long index)
 
     return EvalValue();
 }
+
+EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() < 1 || exprList->elems.size() > 3)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    long end, start = 0, step = 1;
+    Construct *arg0 = exprList->elems[0].get();
+    const EvalValue &val0 = RValue(arg0->eval(ctx));
+
+    if (!val0.is<long>())
+        throw TypeErrorEx(arg0->start, arg0->end);
+
+    if (exprList->elems.size() >= 2) {
+
+        Construct *arg1 = exprList->elems[1].get();
+        const EvalValue &val1 = RValue(arg1->eval(ctx));
+
+        if (!val1.is<long>())
+            throw TypeErrorEx(arg1->start, arg1->end);
+
+        start = val0.get<long>();
+        end = val1.get<long>();
+
+        if (exprList->elems.size() == 3) {
+
+            Construct *arg2 = exprList->elems[2].get();
+            const EvalValue &val2 = RValue(arg2->eval(ctx));
+
+            if (!val2.is<long>())
+                throw TypeErrorEx(arg2->start, arg2->end);
+
+            step = val2.get<long>();
+
+            if (step == 0)
+                throw TypeErrorEx(arg2->start, arg2->end);
+        }
+
+    } else {
+
+        end = val0.get<long>();
+    }
+
+    FlatSharedArray::vec_type vec;
+
+    if (step > 0) {
+
+        for (long i = start; i < end; i += step)
+            vec.emplace_back(EvalValue(i), ctx->const_ctx);
+
+    } else {
+
+        for (long i = start; i > end; i += step)
+            vec.emplace_back(EvalValue(i), ctx->const_ctx);
+    }
+
+    return FlatSharedArray(move(vec));
+}
