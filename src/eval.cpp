@@ -73,24 +73,86 @@ do_func_return(EvalValue &&tmp, Construct *retExpr)
     return RValue(tmp);
 }
 
-static EvalValue
-do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
+static void
+do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+                    const vector<unique_ptr<Construct>> &args,
+                    EvalContext *ctx,
+                    EvalContext *args_ctx)
+{
+    if (args.size() != funcParams.size())
+        throw InvalidNumberOfArgsEx();
+
+    for (size_t i = 0; i < args.size(); i++) {
+        args_ctx->symbols.emplace(
+            funcParams[i]->value,
+            LValue(RValue(args[i]->eval(ctx)), ctx->const_ctx)
+        );
+    }
+}
+
+static void
+do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+                    const vector<EvalValue> &args,
+                    EvalContext *ctx,
+                    EvalContext *args_ctx)
+{
+    if (args.size() != funcParams.size())
+        throw InvalidNumberOfArgsEx();
+
+    for (size_t i = 0; i < args.size(); i++) {
+        args_ctx->symbols.emplace(
+            funcParams[i]->value,
+            LValue(args[i], ctx->const_ctx)
+        );
+    }
+}
+
+static void
+do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+                    const EvalValue &arg,
+                    EvalContext *ctx,
+                    EvalContext *args_ctx)
+{
+    if (funcParams.size() != 1)
+        throw InvalidNumberOfArgsEx();
+
+    args_ctx->symbols.emplace(
+        funcParams[0]->value,
+        LValue(arg, ctx->const_ctx)
+    );
+}
+
+
+static void
+do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+                    const pair<EvalValue, EvalValue> &args,
+                    EvalContext *ctx,
+                    EvalContext *args_ctx)
+{
+    if (funcParams.size() != 2)
+        throw InvalidNumberOfArgsEx();
+
+    args_ctx->symbols.emplace(
+        funcParams[0]->value,
+        LValue(args.first, ctx->const_ctx)
+    );
+
+    args_ctx->symbols.emplace(
+        funcParams[1]->value,
+        LValue(args.second, ctx->const_ctx)
+    );
+}
+
+template <class ArgsVecT> static
+EvalValue do_func_call(EvalContext *ctx,
+                       FuncObject &obj,
+                       const ArgsVecT &args)
 {
     EvalContext args_ctx(&obj.capture_ctx);
 
     if (obj.func->params) {
-
         const auto &funcParams = obj.func->params->elems;
-
-        if (args->elems.size() != funcParams.size())
-            throw InvalidNumberOfArgsEx();
-
-        for (size_t i = 0; i < args->elems.size(); i++) {
-            args_ctx.symbols.emplace(
-                funcParams[i]->value,
-                LValue(RValue(args->elems[i]->eval(ctx)), ctx->const_ctx)
-            );
-        }
+        do_func_bind_params(funcParams, args, ctx, &args_ctx);
     }
 
     try {
@@ -131,6 +193,27 @@ do_func_call(EvalContext *ctx, FuncObject &obj, const ExprList *args)
     return EvalValue();
 }
 
+EvalValue eval_func(EvalContext *ctx,
+                    FuncObject &obj,
+                    const vector<EvalValue> &args)
+{
+    return do_func_call(ctx, obj, args);
+}
+
+EvalValue eval_func(EvalContext *ctx,
+                    FuncObject &obj,
+                    const EvalValue &arg)
+{
+    return do_func_call(ctx, obj, arg);
+}
+
+EvalValue eval_func(EvalContext *ctx,
+                    FuncObject &obj,
+                    const pair<EvalValue, EvalValue> &args)
+{
+    return do_func_call(ctx, obj, args);
+}
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue &callable = RValue(what->eval(ctx));
@@ -144,7 +227,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
             return do_func_call(
                 ctx,
                 callable.get<FlatSharedFuncObj>().get(),
-                args.get()
+                args->elems
             );
         }
 

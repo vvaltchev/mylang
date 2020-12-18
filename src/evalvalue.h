@@ -405,3 +405,15 @@ is_true(const EvalValue &v)
     const EvalValue &val = RValue(v);
     return val.get_type()->is_true(val);
 }
+
+EvalValue eval_func(EvalContext *ctx,
+                    FuncObject &obj,
+                    const vector<EvalValue> &args);
+
+EvalValue eval_func(EvalContext *ctx,
+                    FuncObject &obj,
+                    const EvalValue &arg);
+
+EvalValue eval_func(EvalContext *ctx,
+                    FuncObject &obj,
+                    const pair<EvalValue, EvalValue> &args);
