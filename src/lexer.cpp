@@ -71,7 +71,7 @@ ostream &operator<<(ostream &s, TokType t)
     static const char *tt_str[] =
     {
         "inv",
-        "num",
+        "integer",
         "id_",
         "op_",
         "kw_",
@@ -211,11 +211,11 @@ lexer(string_view in_str, int line, vector<Tok> &result)
                 tok_start = i;
 
                 if (isdigit(c))
-                    tok_type = TokType::num;
+                    tok_type = TokType::integer;
                 else
                     tok_type = TokType::id;
 
-            } else if (tok_type == TokType::num) {
+            } else if (tok_type == TokType::integer) {
 
                 if (!isdigit(c))
                     throw InvalidTokenEx{val};

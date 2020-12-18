@@ -13,16 +13,16 @@ using namespace std;
 
 enum class TokType : int {
 
-    invalid = 0,   /* no token */
+    invalid     = 0,   /* no token */
 
-    num     = 1,   /* literal integer */
-    id      = 2,   /* identifier (e.g. a, x, my_var) */
-    op      = 3,   /* operator (e.g. +, -, *, /) */
-    kw      = 4,   /* keyword (e.g. if, else, while) */
-    str     = 5,   /* string literal (e.g. "hello") */
-    unknown = 6,   /* something else (e.g. ?) */
+    integer     = 1,   /* literal integer */
+    id          = 2,   /* identifier (e.g. a, x, my_var) */
+    op          = 3,   /* operator (e.g. +, -, *, /) */
+    kw          = 4,   /* keyword (e.g. if, else, while) */
+    str         = 5,   /* string literal (e.g. "hello") */
+    unknown     = 6,   /* something else (e.g. ?) */
 
-    count   = 7,
+    count       = 7,
 };
 
 static const array<string, (int)Op::op_count> OpString =

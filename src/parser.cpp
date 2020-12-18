@@ -66,7 +66,7 @@ MakeConstructFromConstVal(const EvalValue &v,
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
-    if (*c == TokType::num) {
+    if (*c == TokType::integer) {
 
         const string s(c.get_str());
 
