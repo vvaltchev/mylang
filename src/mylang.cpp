@@ -153,58 +153,58 @@ dumpLocInError(const Exception &e)
 {
     if (e.loc_start.col) {
 
-        cout << " at line "
+        cerr << " at line "
              << e.loc_start.line
              << ", col "
              << e.loc_start.col;
 
         if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
-            cout << ":" << e.loc_end.col - 1;
+            cerr << ":" << e.loc_end.col - 1;
 
-        cout << endl << endl;
-        cout << "    " << lines[e.loc_start.line - 1] << endl;
-        cout << "    " << string(e.loc_start.col - 1, ' ');
+        cerr << endl << endl;
+        cerr << "    " << lines[e.loc_start.line - 1] << endl;
+        cerr << "    " << string(e.loc_start.col - 1, ' ');
 
         if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
-            cout << string(max(1, e.loc_end.col - e.loc_start.col - 1), '^');
+            cerr << string(max(1, e.loc_end.col - e.loc_start.col - 1), '^');
         else
-            cout << "^";
+            cerr << "^";
     }
 
-    cout << endl;
+    cerr << endl;
 }
 
 static void
 handleSyntaxError(const SyntaxErrorEx &e)
 {
-    cout << "SyntaxError";
+    cerr << "SyntaxError";
     dumpLocInError(e);
-    cout << e.msg;
+    cerr << e.msg;
 
     if (e.op != Op::invalid) {
 
-        cout << " '" << OpString[(int)e.op] << "'";
+        cerr << " '" << OpString[(int)e.op] << "'";
 
         if (e.tok)
-            cout << ", got:";
+            cerr << ", got:";
     }
 
     if (e.tok) {
 
-        cout << " '";
+        cerr << " '";
 
         if (e.tok->op != Op::invalid)
-            cout << OpString[(int)e.tok->op];
+            cerr << OpString[(int)e.tok->op];
         else if (e.tok->kw != Keyword::kw_invalid)
-            cout << KwString[(int)e.tok->kw];
+            cerr << KwString[(int)e.tok->kw];
         else
-            cout << e.tok->value;
+            cerr << e.tok->value;
 
-        cout << "'";
+        cerr << "'";
 
     }
 
-    cout << endl;
+    cerr << endl;
 }
 
 int main(int argc, char **argv)
@@ -249,7 +249,7 @@ int main(int argc, char **argv)
 
     } catch (const InvalidTokenEx &e) {
 
-        cout << "Invalid token: " << e.val << endl;
+        cerr << "Invalid token: " << e.val << endl;
         return 1;
 
     } catch (const SyntaxErrorEx &e) {
@@ -259,18 +259,18 @@ int main(int argc, char **argv)
 
     } catch (const UndefinedVariableEx &e) {
 
-        cout << "Undefined variable '" << e.name << "'";
+        cerr << "Undefined variable '" << e.name << "'";
         dumpLocInError(e);
         return 1;
 
     } catch (const ExceptionObject &e) {
 
-        cout << "Uncaught dynamic exception: '" << e.get_name() << "'" << endl;
+        cerr << "Uncaught dynamic exception: '" << e.get_name() << "'" << endl;
         return 1;
 
     } catch (const Exception &e) {
 
-        cout << e.name;
+        cerr << e.name;
         dumpLocInError(e);
         return 1;
     }
