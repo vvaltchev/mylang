@@ -34,6 +34,15 @@ unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl);
 unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl);
 
 bool
+pAcceptKeyword(ParseContext &c, Keyword exp);
+
+bool
+pAcceptOp(ParseContext &c, Op exp);
+
+void
+pExpectOp(ParseContext &c, Op exp);
+
+bool
 pAcceptIfStmt(ParseContext &c,
               unique_ptr<Construct> &ret,
               unsigned fl);
@@ -66,14 +75,30 @@ MakeConstructFromConstVal(const EvalValue &v,
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
+    const Loc start = c.get_loc();
+
     if (*c == TokType::integer) {
 
         const string s(c.get_str());
 
-        v.reset(new LiteralInt{ stol(s) });
-        v->start = c.get_loc();
+        v.reset(new LiteralInt(stol(s)));
+        v->start = start;
         v->end = c.get_loc() + (s.length() + 1);
         c++;
+        return true;
+
+    } else if (pAcceptKeyword(c, Keyword::kw_true)) {
+
+        v.reset(new LiteralInt(1));
+        v->start = start;
+        v->end = c.get_loc() + 5;
+        return true;
+
+    } else if (pAcceptKeyword(c, Keyword::kw_false)) {
+
+        v.reset(new LiteralInt(0));
+        v->start = start;
+        v->end = c.get_loc() + 6;
         return true;
     }
 

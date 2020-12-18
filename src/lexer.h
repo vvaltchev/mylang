@@ -85,8 +85,10 @@ enum class Keyword : int {
     kw_rethrow  = 15,
     kw_throw    = 16,
     kw_as       = 17,
+    kw_true     = 18,
+    kw_false    = 19,
 
-    kw_count    = 18,
+    kw_count    = 20,
 };
 
 static const array<string, (int)Keyword::kw_count> KwString =
@@ -110,6 +112,8 @@ static const array<string, (int)Keyword::kw_count> KwString =
     "rethrow",
     "throw",
     "as",
+    "true",
+    "false",
 };
 
 ostream &operator<<(ostream &s, TokType t);
