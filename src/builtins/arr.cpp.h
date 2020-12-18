@@ -118,36 +118,16 @@ EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
     return view[view.size() - 1].get();
 }
 
-EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_erase_arr(LValue *lval, long index)
 {
-    if (exprList->elems.size() != 2)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &arr_lval = arg0->eval(ctx);
-    const EvalValue &index_val = RValue(arg1->eval(ctx));
-
-    if (!arr_lval.is<LValue *>())
-        throw NotLValueEx(arg0->start, arg0->end);
-
-    LValue *lval = arr_lval.get<LValue *>();
-
-    if (!lval->is<FlatSharedArray>())
-        throw TypeErrorEx(arg0->start, arg0->end);
-
-    if (!index_val.is<long>())
-        throw TypeErrorEx(arg1->start, arg1->end);
-
     FlatSharedArray &arr = lval->getval<FlatSharedArray>();
     const ArrayConstView &view = arr.get_view();
-    const long index = index_val.get<long>();
 
     if (!view.size())
-        throw OutOfBoundsEx(arg1->start, arg1->end);
+        throw OutOfBoundsEx();
 
     if (index < 0)
-        throw OutOfBoundsEx(arg1->start, arg1->end);
+        throw OutOfBoundsEx();
 
     if (arr.is_slice()) {
 

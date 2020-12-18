@@ -99,3 +99,33 @@ EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
 
     return EvalValue();
 }
+
+EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &arr_lval = arg0->eval(ctx);
+    const EvalValue &index_val = RValue(arg1->eval(ctx));
+
+    if (!arr_lval.is<LValue *>())
+        throw NotLValueEx(arg0->start, arg0->end);
+
+    LValue *lval = arr_lval.get<LValue *>();
+
+    if (lval->is<FlatSharedArray>()) {
+
+        if (!index_val.is<long>())
+            throw TypeErrorEx(arg1->start, arg1->end);
+
+        builtin_erase_arr(lval, index_val.get<long>());
+
+    } else {
+
+        throw TypeErrorEx(arg0->start, arg0->end);
+    }
+
+    return EvalValue();
+}
