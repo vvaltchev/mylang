@@ -1614,7 +1614,98 @@ static const vector<test> tests =
             "assert(find(s, \"hello\") == 0);",
             "assert(find(s, \"wor\") == 6);",
         },
-    }
+    },
+
+    {
+        "Sort, default compare func",
+        {
+            "var arr = [3,2,1];",
+            "var res = sort(arr);", // NOTE: sort() works IN PLACE
+            "assert(intptr(arr) == intptr(res));",
+            "assert(arr == [1,2,3]);",
+        },
+    },
+
+    {
+        "Sort, default compare func, reverse",
+        {
+            "var arr = [1,2,3];",
+            "var res = rev_sort(arr);", // NOTE: sort() works IN PLACE
+            "assert(intptr(arr) == intptr(res));",
+            "assert(arr == [3,2,1]);",
+        },
+    },
+
+    {
+        "Sort works with temp arrays as well",
+        {
+            "var res = sort([3,2,1]);",
+            "assert(res == [1,2,3]);",
+        },
+    },
+
+    {
+        "Sort on slice",
+        {
+            "var arr = [5,4,3,2,1];",
+            "var s = arr[1:4];",
+            "assert(s == [4,3,2]);",
+            "assert(intptr(arr) == intptr(s));",
+            "sort(s);",
+            "assert(intptr(arr) != intptr(s));",
+            "assert(arr == [5,4,3,2,1]);",
+            "assert(s == [2,3,4]);",
+        },
+    },
+
+    {
+        "Sort array with slices",
+        {
+            "var arr = [1,2,3,4,5];",
+            "var s = arr[1:4];",
+            "assert(intptr(arr) == intptr(s));",
+            "rev_sort(arr);",
+            "assert(intptr(arr) != intptr(s));",
+            "assert(arr == [5,4,3,2,1]);",
+            "assert(s == [2,3,4]);",
+        },
+    },
+
+    {
+        "Sort with custom comparison function 1",
+        {
+            "var arr = [3,2,1];",
+            "sort(arr, func (a,b) => a < b);",
+            "assert(arr == [1,2,3]);",
+        },
+    },
+
+    {
+        "Sort with custom comparison function 2",
+        {
+            "var arr = [[3, \"str3\"], [2, \"str2\"], [1, \"str1\"]];",
+            "sort(arr, func (a,b) => a[0] < b[0]);",
+            "assert(arr == [[1, \"str1\"], [2, \"str2\"], [3, \"str3\"]]);",
+        },
+    },
+
+    {
+        "Sort array of strings",
+        {
+            "var arr = [\"c\", \"b\", \"a\"];",
+            "sort(arr);",
+            "assert(arr == [\"a\", \"b\", \"c\"]);",
+        },
+    },
+
+    {
+        "Sort const array",
+        {
+            "const arr = [3,2,1];",
+            "const s = sort(arr);",
+            "assert(s == [1,2,3]);",
+        },
+    },
 };
 
 static void

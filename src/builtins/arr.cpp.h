@@ -11,6 +11,8 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
+#include <algorithm>
+
 EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
@@ -224,4 +226,85 @@ builtin_find_arr(const FlatSharedArray &arr, const EvalValue &v)
     }
 
     return EvalValue();
+}
+
+static EvalValue
+sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
+{
+    if (exprList->elems.size() == 0)
+        throw InvalidArgumentEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    const EvalValue &val0_lval = arg0->eval(ctx);
+    EvalValue val0 = RValue(val0_lval);
+
+    if (!val0.is<FlatSharedArray>())
+        throw TypeErrorEx(arg0->start, arg0->end);
+
+    FlatSharedArray &arr = val0.get<FlatSharedArray>();
+
+    if (arr.is_slice()) {
+
+        arr.clone_internal_vec();
+
+        if (val0_lval.is<LValue *>())
+            val0_lval.get<LValue *>()->put(arr);
+
+    } else {
+
+        arr.clone_all_slices();
+    }
+
+    auto &vec = arr.get_ref();
+
+    if (exprList->elems.size() == 1) {
+
+        if (!reverse) {
+
+            sort(vec.begin(), vec.end(), [](const auto &a, const auto &b) {
+                return a.get() < b.get();
+            });
+
+        } else {
+
+            sort(vec.begin(), vec.end(), [](const auto &a, const auto &b) {
+                return a.get() > b.get();
+            });
+        }
+
+    } else {
+
+        Construct *arg1 = exprList->elems[1].get();
+        const EvalValue &val1 = RValue(arg1->eval(ctx));
+
+        if (!val1.is<FlatSharedFuncObj>())
+            throw TypeErrorEx(arg1->start, arg1->end);
+
+        FuncObject &funcObj = val1.get<FlatSharedFuncObj>().get();
+
+        if (!reverse) {
+
+            sort(vec.begin(), vec.end(), [&](const auto &a, const auto &b) {
+                return eval_func(ctx, funcObj, make_pair(a.get(),b.get())).is_true();
+            });
+
+        } else {
+
+            sort(vec.begin(), vec.end(), [&](const auto &a, const auto &b) {
+                return !eval_func(ctx, funcObj, make_pair(a.get(),b.get())).is_true();
+            });
+        }
+    }
+
+    return arr;
+}
+
+EvalValue builtin_sort(EvalContext *ctx, ExprList *exprList)
+{
+    return sort_arr(ctx, exprList, false);
+}
+
+EvalValue builtin_rev_sort(EvalContext *ctx, ExprList *exprList)
+{
+    return sort_arr(ctx, exprList, true);
 }

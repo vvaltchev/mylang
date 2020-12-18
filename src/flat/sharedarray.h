@@ -48,6 +48,8 @@ class FlatSharedArrayTempl {
         typedef vector<LValueT> vec_type;
 
     private:
+        static const unsigned all_slices = static_cast<unsigned>(-1);
+
         struct SharedObject {
 
             vec_type vec;
@@ -68,11 +70,7 @@ class FlatSharedArrayTempl {
 
         void clone_internal_vec()
         {
-            vec_type new_vec;
-            new_vec.reserve(len);
-
-            new_vec.insert(
-                new_vec.end(),
+            vec_type new_vec(
                 shobj->vec.cbegin() + off,
                 shobj->vec.cbegin() + off + len
             );
@@ -83,9 +81,39 @@ class FlatSharedArrayTempl {
 
         void clone_aliased_slices(unsigned index)
         {
-            for (SharedArrayObj *obj : shobj->slices)
-                if (obj->off <= index && index < obj->off + obj->len)
+            auto &slices = shobj->slices;
+
+            for (auto it = slices.begin(); it != slices.end(); /* no inc */) {
+
+                auto obj = *it;
+
+                if (index == all_slices ||
+                    (obj->off <= index && index < obj->off + obj->len))
+                {
+                    /*
+                     * Erase the object from here and get an iterator for the next
+                     * object in the container.
+                     */
+                    it = shobj->slices.erase(it);
+                    assert(obj->slice);
+
+                    /* Prevent the dtor from trying to erase the object */
+                    obj->slice = false;
+
+                    /* Do clone the internal vector */
                     obj->clone_internal_vec();
+
+                } else {
+
+                    /* Just move to the next slice */
+                    ++it;
+                }
+            }
+        }
+
+        void clone_all_slices()
+        {
+            clone_aliased_slices(all_slices);
         }
 
         /* Special constructors */
@@ -198,6 +226,7 @@ public:
 
     void clone_internal_vec() { flat->clone_internal_vec(); }
     void clone_aliased_slices(unsigned index) { flat->clone_aliased_slices(index); }
+    void clone_all_slices() { flat->clone_all_slices(); }
 
     ArrayConstViewTempl<LValueType> get_view() const {
         return ArrayConstViewTempl<LValueType>(get_ref(), offset(), size());
