@@ -137,6 +137,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("top", builtin_top),
     make_const_builtin("type", builtin_type),
     make_const_builtin("range", builtin_range),
+    make_const_builtin("find", builtin_find),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

@@ -209,3 +209,14 @@ EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
     char c = static_cast<char>(val.get<long>());
     return FlatSharedStr(string(&c, 1));
 }
+
+EvalValue
+builtin_find_str(const FlatSharedStr &str, const FlatSharedStr &substr)
+{
+    const size_t pos = str.get_view().find(substr.get_view());
+
+    if (pos == string::npos)
+        return EvalValue();
+
+    return static_cast<long>(pos);
+}

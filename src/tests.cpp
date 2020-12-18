@@ -1594,6 +1594,27 @@ static const vector<test> tests =
             "assert(range(20,5,-2) == [20,18,16,14,12,10,8,6]);",
         },
     },
+
+    {
+        "Builtin find() in array",
+        {
+            "const arr = [5,8,10];",
+            "assert(find(arr, 5) == 0);",
+            "assert(find(arr, 8) == 1);",
+            "assert(find(arr, 10) == 2);",
+            "assert(find(arr, 11) == none);",
+        },
+    },
+
+    {
+        "Builtin find() in string",
+        {
+            "const s = \"hello world\";",
+            "assert(find(s, \"blah\") == none);",
+            "assert(find(s, \"hello\") == 0);",
+            "assert(find(s, \"wor\") == 6);",
+        },
+    }
 };
 
 static void

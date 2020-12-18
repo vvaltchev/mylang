@@ -212,3 +212,16 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
 
     return FlatSharedArray(move(vec));
 }
+
+EvalValue
+builtin_find_arr(const FlatSharedArray &arr, const EvalValue &v)
+{
+    const ArrayConstView &view = arr.get_view();
+
+    for (unsigned i = 0; i < view.size(); i++) {
+        if (view[i].get() == v)
+            return static_cast<long>(i);
+    }
+
+    return EvalValue();
+}

@@ -129,3 +129,33 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
 
     return EvalValue();
 }
+
+EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &container_val = RValue(arg0->eval(ctx));
+    const EvalValue &elem_val = RValue(arg1->eval(ctx));
+
+    if (container_val.is<FlatSharedArray>()) {
+
+        return builtin_find_arr(container_val.get<FlatSharedArray>(), elem_val);
+
+    } else if (container_val.is<FlatSharedStr>()) {
+
+        if (!elem_val.is<FlatSharedStr>())
+            throw TypeErrorEx(arg1->start, arg1->end);
+
+        return builtin_find_str(
+            container_val.get<FlatSharedStr>(),
+            elem_val.get<FlatSharedStr>()
+        );
+
+    } else {
+
+        throw TypeErrorEx(arg0->start, arg0->end);
+    }
+}
