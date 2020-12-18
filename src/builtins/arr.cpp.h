@@ -117,3 +117,60 @@ EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
 
     return view[view.size() - 1].get();
 }
+
+EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &arr_lval = arg0->eval(ctx);
+    const EvalValue &index_val = RValue(arg1->eval(ctx));
+
+    if (!arr_lval.is<LValue *>())
+        throw NotLValueEx(arg0->start, arg0->end);
+
+    LValue *lval = arr_lval.get<LValue *>();
+
+    if (!lval->is<FlatSharedArray>())
+        throw TypeErrorEx(arg0->start, arg0->end);
+
+    if (!index_val.is<long>())
+        throw TypeErrorEx(arg1->start, arg1->end);
+
+    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
+    const ArrayConstView &view = arr.get_view();
+    const long index = index_val.get<long>();
+
+    if (!view.size())
+        throw OutOfBoundsEx(arg1->start, arg1->end);
+
+    if (index < 0)
+        throw OutOfBoundsEx(arg1->start, arg1->end);
+
+    if (arr.is_slice()) {
+
+        if (index == 0) {
+
+            lval->put(FlatSharedArray(arr, arr.offset() + 1, arr.size() - 1));
+
+        } else if (index == view.size() - 1) {
+
+            lval->put(FlatSharedArray(arr, arr.offset(), arr.size() - 1));
+
+        } else {
+
+            arr.clone_internal_vec();
+            arr.get_ref().erase(arr.get_ref().begin() + arr.offset() + index);
+            lval->put(FlatSharedArray(arr));
+        }
+
+    } else {
+
+        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
+        arr.get_ref().erase(arr.get_ref().begin() + arr.offset() + index);
+    }
+
+    return EvalValue();
+}

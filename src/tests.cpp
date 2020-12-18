@@ -1515,6 +1515,75 @@ static const vector<test> tests =
             "assert(c2 == 1234);",
         },
     },
+
+    {
+        "Erase 1st element, no slice",
+        {
+            "var a = [1,2,3];",
+            "erase(a, 0);",
+            "assert(a == [2,3]);",
+        },
+    },
+
+    {
+        "Erase last element, no slice",
+        {
+            "var a = [1,2,3];",
+            "erase(a, len(a)-1);",
+            "assert(a == [1,2]);",
+        },
+    },
+
+    {
+        "Erase middle element, no slice",
+        {
+            "var a = [1,2,3];",
+            "erase(a, 1);",
+            "assert(a == [1,3]);",
+        },
+    },
+
+    {
+        "Erase 1st elem, slice",
+        {
+            "var a = [1,2,3,4,5];",
+            "var s = a[1:4];",
+            "assert(s == [2,3,4]);",
+            "assert(intptr(a) == intptr(s));",
+            "erase(s, 0);",
+            "assert(intptr(a) == intptr(s));",
+            "assert(s == [3,4]);",
+            "assert(a == [1,2,3,4,5]);",
+        },
+    },
+
+    {
+        "Erase last elem, slice",
+        {
+            "var a = [1,2,3,4,5];",
+            "var s = a[1:4];",
+            "assert(s == [2,3,4]);",
+            "assert(intptr(a) == intptr(s));",
+            "erase(s, len(s) - 1);",
+            "assert(intptr(a) == intptr(s));",
+            "assert(s == [2,3]);",
+            "assert(a == [1,2,3,4,5]);",
+        },
+    },
+
+    {
+        "Erase middle elem, slice",
+        {
+            "var a = [1,2,3,4,5];",
+            "var s = a[1:4];",
+            "assert(s == [2,3,4]);",
+            "assert(intptr(a) == intptr(s));",
+            "erase(s, 1);",
+            "assert(intptr(a) != intptr(s));",
+            "assert(s == [2,4]);",
+            "assert(a == [1,2,3,4,5]);",
+        },
+    },
 };
 
 static void

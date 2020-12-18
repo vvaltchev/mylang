@@ -8,10 +8,10 @@
 #include "types/arr.cpp.h"
 #include "types/exception.cpp.h"
 #include "builtins/str.cpp.h"
-#include "builtins/generic.cpp.h"
 #include "builtins/io.cpp.h"
 #include "builtins/num.cpp.h"
 #include "builtins/arr.cpp.h"
+#include "builtins/generic.cpp.h"
 
 static const array<FlatSharedStr, Type::t_count> TypeNames =
 {
@@ -157,4 +157,5 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("exception", builtin_exception),
     make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */
     make_builtin("exdata", builtin_exdata),
+    make_builtin("erase", builtin_erase),
 };
