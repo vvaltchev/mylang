@@ -10,6 +10,8 @@
 
 using namespace std;
 
+const Tok invalid_tok;
+
 static const map<string, Op, less<>> operators = [] {
 
     map<string, Op, less<>> ret;

@@ -133,13 +133,8 @@ parse_args(int argc, char **argv)
     }
 
     if (in_tokens) {
-
-        if (inline_text.empty()) {
-            tokens.emplace_back();
-        } else {
-            lines.emplace_back(move(inline_text));
-            lexer(lines[0], 1, tokens);
-        }
+        lines.emplace_back(move(inline_text));
+        lexer(lines[0], 1, tokens);
     }
 }
 
@@ -170,8 +165,13 @@ dumpLocInError(const Exception &e)
 }
 
 static void
-handleSyntaxError(const SyntaxErrorEx &e)
+handleSyntaxError(SyntaxErrorEx e)
 {
+    if (e.tok == &invalid_tok) {
+        e.loc_start = tokens.back().loc + 1;
+        e.loc_end = tokens.back().loc + 2;
+    }
+
     cerr << "SyntaxError";
     dumpLocInError(e);
     cerr << e.msg;

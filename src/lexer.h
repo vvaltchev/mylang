@@ -180,7 +180,7 @@ public:
     }
 };
 
-static const Tok invalid_tok;
+extern const Tok invalid_tok;
 
 ostream &operator<<(ostream &s, const Tok &t);
 void lexer(string_view in_str, int line, vector<Tok> &result);
