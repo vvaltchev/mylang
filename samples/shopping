@@ -1,0 +1,111 @@
+#
+# A simple interactive program
+#
+
+var products =
+[
+    ["Egg", 2],
+    ["Milk", 3],
+    ["Yogurt", 1],
+    ["Tea", 10],
+    ["Coffee", 15]
+];
+
+var shopping_list = [];
+
+func dump_products() {
+
+    var i = 0;
+    while (i < len(products)) {
+
+        var p = products[i];
+        var name = p[0];
+        var price = p[1];
+        var pad = " " * max(0, 15 - len(name));
+        print(str(i) + ") " + name + pad + " " + price);
+        i += 1;
+    }
+}
+
+func read_quantity(pnum) {
+
+    while (true) {
+
+        write("How many " + products[pnum][0] + "? ");
+        var input = readln();
+
+        try {
+
+            return int(input);
+
+        } catch {
+
+            print("Invalid quantity");
+            continue;
+        }
+    }
+}
+
+print("Shopping list");
+print("-" * 40);
+
+while (true) {
+
+    print();
+    dump_products();
+
+    print();
+    write("Enter product number ('q' to quit): ");
+    var input = readln();
+    var pnum;
+
+    if (input == "q") {
+        print();
+        print("Quit");
+        break;
+    }
+
+    try {
+
+        pnum = int(input);
+
+    } catch (TypeErrorEx) {
+
+        print("Invalid number");
+        continue;
+    }
+
+    if (pnum < 0 || pnum > len(products)-1) {
+
+        print("Invalid number");
+        continue;
+    }
+
+    var q = read_quantity(pnum);
+    append(shopping_list, [pnum, q]);
+
+} # while (true)
+
+print();
+print("Shopping list");
+print("-" * 40);
+
+var i = 0;
+var total = 0;
+
+while (i < len(shopping_list)) {
+
+    var pnum = shopping_list[i][0];
+    var name = products[pnum][0];
+    var price = products[pnum][1];
+    var q = shopping_list[i][1];
+    var subtotal = price * q;
+    print(name + ": $" + price + " x " + q + " = $" + subtotal);
+    total += subtotal;
+    i += 1;
+}
+
+print("-" * 40);
+print("$" + total);
+
+
