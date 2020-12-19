@@ -1816,6 +1816,22 @@ static const vector<test> tests =
             "assert(f() == 42);",
         },
     },
+
+    {
+        "Subscript with undefined variable",
+        {
+            "aa[3];",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "Slice with undefined variable",
+        {
+            "aa[3:5];",
+        },
+        &typeid(UndefinedVariableEx),
+    },
 };
 
 static void

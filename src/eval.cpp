@@ -665,6 +665,12 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
         ? lval.get<LValue *>()->get().get_type()
         : lval.get_type();
 
+    if (t->t == Type::t_undefid) {
+        throw UndefinedVariableEx(
+            lval.get<UndefinedId>().id, what->start, what->end
+        );
+    }
+
     return t->subscript(lval, RValue(index->eval(ctx)));
 }
 
@@ -675,6 +681,12 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
     Type *t = lval.is<LValue *>()
         ? lval.get<LValue *>()->get().get_type()
         : lval.get_type();
+
+    if (t->t == Type::t_undefid) {
+        throw UndefinedVariableEx(
+            lval.get<UndefinedId>().id, what->start, what->end
+        );
+    }
 
     return t->slice(
         lval,
