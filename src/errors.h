@@ -114,6 +114,7 @@ DECL_SIMPLE_EX(ExpressionIsNotConstEx, "The expression is not const")
 DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
 DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
 DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
+DECL_SIMPLE_EX(CannotChangeConstEx, "Cannot change constant")
 
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")

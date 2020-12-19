@@ -121,6 +121,9 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
 
     LValue *lval = arr_lval.get<LValue *>();
 
+    if (lval->is_const_var())
+        throw CannotChangeConstEx(arg0->start, arg0->end);
+
     if (lval->is<FlatSharedArray>()) {
 
         if (!index_val.is<long>())

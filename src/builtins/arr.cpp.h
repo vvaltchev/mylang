@@ -55,6 +55,9 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     if (!lval->is<FlatSharedArray>())
         throw TypeErrorEx(arg0->start, arg0->end);
 
+    if (lval->is_const_var())
+        throw CannotChangeConstEx(arg0->start, arg0->end);
+
     FlatSharedArray &arr = lval->getval<FlatSharedArray>();
 
     if (arr.is_slice())
@@ -79,6 +82,9 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
 
     if (!lval->is<FlatSharedArray>())
         throw TypeErrorEx(arg->start, arg->end);
+
+    if (lval->is_const_var())
+        throw CannotChangeConstEx(arg->start, arg->end);
 
     FlatSharedArray &arr = lval->getval<FlatSharedArray>();
     const ArrayConstView &view = arr.get_view();

@@ -160,8 +160,8 @@ const EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("append", builtin_append),
     make_builtin("push", builtin_append), /* push() is an alias for append() */
     make_builtin("pop", builtin_pop),
+    make_builtin("erase", builtin_erase),
     make_builtin("exception", builtin_exception),
     make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */
     make_builtin("exdata", builtin_exdata),
-    make_builtin("erase", builtin_erase),
 };

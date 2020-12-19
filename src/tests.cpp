@@ -1772,7 +1772,7 @@ static const vector<test> tests =
         "Builtin sum() on array of arrays",
         {
             "const arr = [[1,2],[3,4]];",
-            "const s = sum(arr);"
+            "const s = sum(arr);",
             "assert(s == [1,2,3,4]);",
         },
     },
@@ -1831,6 +1831,33 @@ static const vector<test> tests =
             "aa[3:5];",
         },
         &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "Cannot modify const array, append",
+        {
+            "const arr = [1,2,3];",
+            "append(arr, 99);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Cannot modify const array, pop",
+        {
+            "const arr = [1,2,3];",
+            "pop(arr);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Cannot modify const array, erase",
+        {
+            "const arr = [1,2,3];",
+            "erase(arr, 0);",
+        },
+        &typeid(CannotChangeConstEx),
     },
 };
 

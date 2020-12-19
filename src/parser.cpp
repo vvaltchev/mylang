@@ -148,7 +148,7 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
             const EvalValue &const_value = v->eval(c.const_ctx);
 
             if (const_value.get_type()->t == Type::t_lval) {
-                MakeConstructFromConstVal(RValue(const_value), v, true);
+                MakeConstructFromConstVal(RValue(const_value), v);
                 v->is_const = true;
             }
         }
@@ -268,27 +268,20 @@ pAcceptCallExpr(ParseContext &c,
 
         unique_ptr<CallExpr> expr(new CallExpr);
 
+        ret.reset();
         expr->start = what->start;
         expr->what = move(what);
         expr->args = pList<ExprList>(c, fl, pExpr14);
 
         if (c.const_eval && expr->what->is_const && expr->args->is_const) {
+            MakeConstructFromConstVal(
+                expr->eval(c.const_ctx),
+                ret,
+                fl & pFlags::pInConstDecl
+            );
+        }
 
-            if (!MakeConstructFromConstVal(expr->eval(c.const_ctx), ret, true)) {
-
-                /*
-                 * In general expressions, it's acceptable MakeConstructFromConstVal()
-                 * to fail, because the a constant ID might be a const builtin
-                 * and we CANNOT resolve them to literal constructs, BUT not in this
-                 * specific case. Here, we're in a full-formed call expression and
-                 * both the ID and the arguments are const. Here the evaluation
-                 * must return an EvalValue convertible to some kind of literal.
-                 */
-                throw InternalErrorEx();
-            }
-
-        } else {
-
+        if (!ret) {
             expr->end = c.get_loc();
             ret = move(expr);
         }
@@ -309,6 +302,7 @@ pAcceptSubscript(ParseContext &c,
     if (pAcceptOp(c, Op::bracketL)) {
 
         unique_ptr<Construct> start = pExprTop(c, fl);
+        bool in_slice = false;
 
         if (pAcceptOp(c, Op::colon)) {
 
@@ -325,6 +319,7 @@ pAcceptSubscript(ParseContext &c,
             }
 
             ret = move(s);
+            in_slice = true;
 
         } else {
 
@@ -342,16 +337,19 @@ pAcceptSubscript(ParseContext &c,
             ret = move(s);
         }
 
-        pExpectOp(c, Op::bracketR);
-
         if (c.const_eval && ret->is_const) {
 
-            unique_ptr<Construct> const_val;
+            if (!in_slice || fl & pFlags::pInConstDecl) {
 
-            if (MakeConstructFromConstVal(RValue(ret->eval(c.const_ctx)), const_val, true))
-                ret = move(const_val);
+                unique_ptr<Construct> const_construct;
+                const EvalValue &v = RValue(ret->eval(c.const_ctx));
+
+                if (MakeConstructFromConstVal(v, const_construct, true))
+                    ret = move(const_construct);
+            }
         }
 
+        pExpectOp(c, Op::bracketR);
         return true;
     }
 
@@ -585,16 +583,14 @@ pExpr14(ParseContext &c, unsigned fl)
 
         lside_val = lside->eval(c.const_ctx);
 
-        if (fl & ~pFlags::pInConstDecl) {
-            if (!lside_val.is<UndefinedId>()) {
+        if (!lside_val.is<UndefinedId>()) {
 
-                if (lside_val.is<LValue *>()) {
-                    if (lside_val.get<LValue *>()->is<Builtin>())
-                        throw CannotRebindBuiltinEx(c.get_loc());
-                }
-
-                throw CannotRebindConstEx(c.get_loc());
+            if (lside_val.is<LValue *>()) {
+                if (lside_val.get<LValue *>()->is<Builtin>())
+                    throw CannotRebindBuiltinEx(c.get_loc());
             }
+
+            throw CannotRebindConstEx(c.get_loc());
         }
 
     } else {
@@ -645,7 +641,7 @@ pExpr14(ParseContext &c, unsigned fl)
         ret.reset(new Expr14);
         ret->op = op;
         ret->lvalue = move(lside);
-        ret->rvalue = pExpr14(c, fl & ~(pInDecl | pInConstDecl));
+        ret->rvalue = pExpr14(c, fl & ~pInDecl);
     }
 
     ret->fl = fl & pFlags::pInDecl;
@@ -658,7 +654,8 @@ pExpr14(ParseContext &c, unsigned fl)
     if (c.const_eval && ret->rvalue->is_const) {
         MakeConstructFromConstVal(
             RValue(ret->rvalue->eval(c.const_ctx)),
-            ret->rvalue
+            ret->rvalue,
+            true
         );
     }
 
@@ -667,16 +664,17 @@ pExpr14(ParseContext &c, unsigned fl)
         if (!ret->rvalue->is_const)
             throw ExpressionIsNotConstEx(ret->rvalue->start, ret->rvalue->end);
 
-        if (!lside_val.is<UndefinedId>())
-            throw CannotRebindConstEx(lside->start, lside->end);
-
         /*
          * Save the const declaration by evaluating the assignment
          * in our special `const_ctx` EvalContext.
          */
 
-        ret->eval(c.const_ctx);
-        return make_unique<NopConstruct>();
+        const EvalValue &rvalue = ret->eval(c.const_ctx);
+
+        if (!rvalue.is<FlatSharedArray>())
+            return make_unique<NopConstruct>();
+
+        ret->lvalue->is_const = true;
     }
 
     return ret;

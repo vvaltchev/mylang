@@ -491,7 +491,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         ctx->symbols.emplace(
             lval.get<UndefinedId>().id,
-            LValue(RValue(rval), ctx->const_ctx)
+            LValue(RValue(rval), ctx->const_ctx || lvalue->is_const)
         );
 
     } else if (lval.is<LValue *>()) {
