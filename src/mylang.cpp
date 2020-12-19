@@ -64,11 +64,6 @@ read_script(const char *filename)
 
     for (size_t i = 0; i < lines.size(); i++)
         lexer(lines[i], i+1, tokens);
-
-    if (tokens.empty()) {
-        help();
-        exit(1);
-    }
 }
 
 void
