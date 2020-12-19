@@ -308,3 +308,34 @@ EvalValue builtin_rev_sort(EvalContext *ctx, ExprList *exprList)
 {
     return sort_arr(ctx, exprList, true);
 }
+
+EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidArgumentEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    const EvalValue &val0_lval = arg0->eval(ctx);
+    EvalValue val0 = RValue(val0_lval);
+
+    if (!val0.is<FlatSharedArray>())
+        throw TypeErrorEx(arg0->start, arg0->end);
+
+    FlatSharedArray &arr = val0.get<FlatSharedArray>();
+
+    if (arr.is_slice()) {
+
+        arr.clone_internal_vec();
+
+        if (val0_lval.is<LValue *>())
+            val0_lval.get<LValue *>()->put(arr);
+
+    } else {
+
+        arr.clone_all_slices();
+    }
+
+    auto &vec = arr.get_ref();
+    reverse(vec.begin(), vec.end());
+    return arr;
+}

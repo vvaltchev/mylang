@@ -1706,6 +1706,42 @@ static const vector<test> tests =
             "assert(s == [1,2,3]);",
         },
     },
+
+    {
+        "Reverse array",
+        {
+            "var arr = [1,2,3];",
+            "var r = reverse(arr);",
+            "assert(intptr(arr) == intptr(r));",
+            "assert(arr == [3,2,1]);",
+            "assert(r == [3,2,1]);",
+        },
+    },
+
+    {
+        "Reverse slice of array",
+        {
+            "var arr = [1,2,3,4,5];",
+            "var s = arr[1:4];",
+            "assert(s == [2,3,4]);",
+            "reverse(s);",
+            "assert(arr == [1,2,3,4,5]);",
+            "assert(s == [4,3,2]);",
+        },
+    },
+
+    {
+        "Reverse array with slices",
+        {
+            "var arr = [1,2,3,4,5];",
+            "var s = arr[1:4];",
+            "assert(intptr(arr) == intptr(s));",
+            "reverse(arr);",
+            "assert(intptr(arr) != intptr(s));",
+            "assert(arr == [5,4,3,2,1]);",
+            "assert(s == [2,3,4]);",
+        },
+    },
 };
 
 static void
