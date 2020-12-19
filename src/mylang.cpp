@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <fstream>
 #include <cstring>
+#include <cctype>
 
 /*
  * For small C++ projects, often using std everywhere is better because
@@ -151,9 +152,15 @@ dumpLocInError(const Exception &e)
         if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
             cerr << ":" << e.loc_end.col - 1;
 
+        const string &ln = lines[e.loc_start.line - 1];
+
         cerr << endl << endl;
-        cerr << "    " << lines[e.loc_start.line - 1] << endl;
-        cerr << "    " << string(e.loc_start.col - 1, ' ');
+        cerr << "    " << ln << endl;
+        cerr << "    ";
+
+        for (int i = 0; i < e.loc_start.col - 1; i++) {
+            cerr << (isspace(ln[i]) ? ln[i] : ' ');
+        }
 
         if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
             cerr << string(max(1, e.loc_end.col - e.loc_start.col - 1), '^');
