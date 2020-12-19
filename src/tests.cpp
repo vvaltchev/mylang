@@ -1796,6 +1796,14 @@ static const vector<test> tests =
             "assert(a == [1,2,3]);",
         },
     },
+
+    {
+        "Literal arrays containing non-const variables",
+        {
+            "var a = 42;",
+            "var arr = [a];",
+        },
+    },
 };
 
 static void

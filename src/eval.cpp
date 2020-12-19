@@ -249,7 +249,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     vec.reserve(elems.size());
 
     for (const auto &e : elems) {
-        vec.emplace_back(e->eval(ctx), ctx->const_ctx);
+        vec.emplace_back(RValue(e->eval(ctx)), ctx->const_ctx);
     }
 
     return FlatSharedArray(move(vec));
