@@ -946,8 +946,8 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
     pExpectOp(c, Op::parenR);
 
-    if (!pAcceptBracedBlock(c, whileStmt->body, pFlags::pInLoop))
-        whileStmt->body = pStmt(c, pFlags::pInLoop);
+    if (!pAcceptBracedBlock(c, whileStmt->body, fl | pFlags::pInLoop))
+        whileStmt->body = pStmt(c, fl | pFlags::pInLoop);
 
     whileStmt->start = start;
     whileStmt->end = c.get_loc();

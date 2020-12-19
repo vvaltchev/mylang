@@ -1804,6 +1804,18 @@ static const vector<test> tests =
             "var arr = [a];",
         },
     },
+
+    {
+        "Return in while loop works",
+        {
+            "func f() {",
+            "   while (true) {",
+            "       return 42;"
+            "   }",
+            "}",
+            "assert(f() == 42);",
+        },
+    },
 };
 
 static void
