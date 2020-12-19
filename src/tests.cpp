@@ -1776,6 +1776,26 @@ static const vector<test> tests =
             "assert(s == [1,2,3,4]);",
         },
     },
+
+    {
+        "Operator + cannot modify strings",
+        {
+            "var a = \"hello\";",
+            "var b = a + \" world\";",
+            "assert(b == \"hello world\");",
+            "assert(a == \"hello\");",
+        }
+    },
+
+    {
+        "Operator + cannot modify arrays",
+        {
+            "var a = [1,2,3];",
+            "var b = a + [4];",
+            "assert(b == [1,2,3,4]);",
+            "assert(a == [1,2,3]);",
+        },
+    },
 };
 
 static void

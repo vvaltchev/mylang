@@ -48,6 +48,12 @@ EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
 
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
+
+    if (e.is<FlatSharedStr>()) {
+        /* Strings are immutable */
+        return e;
+    }
+
     return e.get_type()->clone(e);
 }
 

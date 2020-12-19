@@ -275,7 +275,7 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
     if (op == Op::invalid)
         return e->eval(ctx);
 
-    EvalValue &&val = RValue(e->eval(ctx));
+    EvalValue &&val = RValue(e->eval(ctx)).clone();
 
     switch (op) {
         case Op::plus:
@@ -298,7 +298,7 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue &&val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx).clone();
 
     for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
@@ -324,7 +324,7 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue &&val = eval_first_rvalue(ctx);
+    EvalValue &&val = eval_first_rvalue(ctx).clone();
 
     for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 

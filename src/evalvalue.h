@@ -145,6 +145,10 @@ public:
         return type->t == static_cast<Type::TypeE>(TypeToEnum<T>::val);
     }
 
+    EvalValue clone() const {
+        return type->clone(*this);
+    }
+
     bool is_true() const {
         return type->is_true(*this);
     }

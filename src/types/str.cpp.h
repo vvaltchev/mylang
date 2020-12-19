@@ -51,13 +51,7 @@ public:
 
 EvalValue TypeStr::clone(const EvalValue &a)
 {
-    /*
-     * Don't implement a real clone() for strings, simply because at the
-     * moment, we're following Python's model in which strings are immutable.
-     * In other words, `str[i]` returns just a slice, NOT an LValue to the N-th
-     * character in the string.
-     */
-    return a;
+    return FlatSharedStr(string(a.get<FlatSharedStr>().get_ref()));
 }
 
 long TypeStr::use_count(const EvalValue &a)
