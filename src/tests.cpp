@@ -1742,6 +1742,40 @@ static const vector<test> tests =
             "assert(s == [2,3,4]);",
         },
     },
+
+    {
+        "Builtin sum()",
+        {
+            "const arr = [1,2,3];",
+            "const v = sum(arr);",
+            "assert(v == 6);",
+        },
+    },
+
+    {
+        "Builtin sum() with key func",
+        {
+            "const arr = [[1, 323], [2, 123], [3, 999]];",
+            "var v = sum(arr, func (e) => e[0]);",
+            "assert(v == 6);",
+        },
+    },
+
+    {
+        "Builtin sum() on array of strings",
+        {
+            "assert(sum([\"a\", \"b\"]) == \"ab\");"
+        },
+    },
+
+    {
+        "Builtin sum() on array of arrays",
+        {
+            "const arr = [[1,2],[3,4]];",
+            "const s = sum(arr);"
+            "assert(s == [1,2,3,4]);",
+        },
+    },
 };
 
 static void

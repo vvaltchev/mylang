@@ -339,3 +339,49 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
     reverse(vec.begin(), vec.end());
     return arr;
 }
+
+EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() < 1 || exprList->elems.size() > 2)
+        throw InvalidArgumentEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    const EvalValue &val0 = RValue(arg0->eval(ctx));
+
+    if (!val0.is<FlatSharedArray>())
+        throw TypeErrorEx(arg0->start, arg0->end);
+
+    const FlatSharedArray &arr = val0.get<FlatSharedArray>();
+    const ArrayConstView &view = arr.get_view();
+
+    if (exprList->elems.size() == 1) {
+
+        EvalValue val = view[0].get();
+
+        for (unsigned i = 1; i < view.size(); i++) {
+            val.get_type()->add(val, view[i].get());
+        }
+
+        return val;
+
+    } else {
+
+        Construct *arg1 = exprList->elems[1].get();
+        const EvalValue &val1 = RValue(arg1->eval(ctx));
+
+        if (!val1.is<FlatSharedFuncObj>())
+            throw TypeErrorEx(arg1->start, arg1->end);
+
+        FuncObject &funcObj = val1.get<FlatSharedFuncObj>().get();
+        EvalValue val = eval_func(ctx, funcObj, view[0].get());
+
+        for (unsigned i = 1; i < view.size(); i++) {
+            val.get_type()->add(
+                val,
+                eval_func(ctx, funcObj, view[i].get())
+            );
+        }
+
+        return val;
+    }
+}

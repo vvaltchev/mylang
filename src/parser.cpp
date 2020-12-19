@@ -148,7 +148,7 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
             const EvalValue &const_value = v->eval(c.const_ctx);
 
             if (const_value.get_type()->t == Type::t_lval) {
-                MakeConstructFromConstVal(RValue(const_value), v);
+                MakeConstructFromConstVal(RValue(const_value), v, true);
                 v->is_const = true;
             }
         }
@@ -1040,18 +1040,17 @@ MakeConstructFromConstVal(const EvalValue &v,
 
     if (v.is<FlatSharedArray>() && process_arrays) {
 
-        FlatSharedArray &&arr = v.get<FlatSharedArray>();
-        const FlatSharedArray::vec_type &vec = arr.get_ref();
+        const ArrayConstView &view = v.get<FlatSharedArray>().get_view();
         unique_ptr<LiteralArray> litarr(new LiteralArray);
 
-        for (unsigned i = arr.offset(); i < arr.offset() + arr.size(); i++) {
+        for (unsigned i = 0; i < view.size(); i++) {
 
-            unique_ptr<Construct> elem_construct;
+            unique_ptr<Construct> construct;
 
-            if (!MakeConstructFromConstVal(vec[i].get(), elem_construct))
+            if (!MakeConstructFromConstVal(view[i].get(), construct, true))
                 return false;
 
-            litarr->elems.push_back(move(elem_construct));
+            litarr->elems.push_back(move(construct));
         }
 
         litarr->is_const = true;
