@@ -467,3 +467,19 @@ public:
     ThrowStmt(): SingleChildConstruct("ThrowStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
+
+class ForeachStmt final: public Construct {
+
+    bool do_iter(EvalContext *ctx, unsigned index, const EvalValue &elem) const;
+
+public:
+    unique_ptr<IdList> ids;
+    unique_ptr<Construct> container;
+    unique_ptr<Construct> body;
+    bool idsVarDecl;
+    bool indexed;
+
+    ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+};

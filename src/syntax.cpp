@@ -471,3 +471,31 @@ void TryCatchStmt::serialize(ostream &s, int level) const
     s << indent;
     s << ")";
 }
+
+void ForeachStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    ids->serialize(s, level + 1);
+    s << endl;
+
+    container->serialize(s, level + 1);
+    s << endl;
+
+    if (body) {
+
+        body->serialize(s, level + 1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoBody>";
+    }
+
+    s << endl;
+    s << indent;
+    s << ")";
+}

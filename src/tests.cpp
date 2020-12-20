@@ -1965,6 +1965,79 @@ static const vector<test> tests =
             "assert(b == 12);",
         },
     },
+
+    {
+        "Foreach loop",
+        {
+            "var res = 0;",
+            "foreach(var e in [1,2,3]) {",
+            "   res += e;",
+            "}",
+            "assert(res == 6);",
+        },
+    },
+
+    {
+        "Foreach loop, single statement body",
+        {
+            "var res = 0;",
+            "foreach(var e in [1,2,3])",
+            "   res += e;",
+            "assert(res == 6);",
+        },
+    },
+
+    {
+        "Foreach loop with elems expansion",
+        {
+            "const arr = [[11, \"hello\"], [22, \"world\"]];",
+            "var tmp = [];",
+            "foreach (var idx, word in arr) {",
+            "   append(tmp, word + \"_\" + str(idx));",
+            "}",
+            "assert(tmp[0] == \"hello_11\");",
+            "assert(tmp[1] == \"world_22\");",
+        },
+    },
+
+    {
+        "Foreach loop with index",
+        {
+            "var res = [];",
+            "foreach (var i, val in indexed [10, 20, 30]) {",
+            "   append(res, i * val);",
+            "}",
+            "assert(res[0] == 0);",
+            "assert(res[1] == 20);",
+            "assert(res[2] == 60);",
+        },
+    },
+
+    {
+        "Foreach with extern variable",
+        {
+            "var e;",
+            "foreach (e in [1,2,3,4,5]) {",
+            "   if (e == 3) continue;",
+            "   if (e >= 4) break;",
+            "}",
+            "assert(e == 4);",
+        },
+    },
+
+    {
+        "Foreach in string",
+        {
+            "var res = \"\";",
+            "var input = \"hello\";",
+            "foreach (var i, c in indexed input) {",
+            "   res += c;",
+            "   if (i < len(input)-1)",
+            "       res += \"_\";",
+            "}",
+            "assert(res == \"h_e_l_l_o\");",
+        },
+    },
 };
 
 static void

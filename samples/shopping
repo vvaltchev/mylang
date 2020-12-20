@@ -15,12 +15,8 @@ var shopping_list = [];
 
 func dump_products() {
 
-    var i = 0;
-    while (i < len(products)) {
-
-        var name, price = products[i];
+    foreach(var i, name, price in indexed products) {
         print(str(i) + ") " + rpad(name, 15) + " " + price);
-        i += 1;
     }
 }
 
@@ -87,17 +83,13 @@ print();
 print("Shopping list");
 print("-" * 40);
 
-var i = 0;
 var total = 0;
 
-while (i < len(shopping_list)) {
-
-    var pnum, q = shopping_list[i];
+foreach (var pnum, q in shopping_list) {
     var name, price = products[pnum];
     var subtotal = price * q;
     print(rpad(name, 15) + ": $" + price + " x " + q + " = $" + subtotal);
     total += subtotal;
-    i += 1;
 }
 
 print("-" * 40);

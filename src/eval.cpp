@@ -864,3 +864,101 @@ void LValue::put(EvalValue &&v)
     get_value_for_put() = move(v);
     type_checks();
 }
+
+bool
+ForeachStmt::do_iter(EvalContext *ctx, unsigned index, const EvalValue &elem) const
+{
+    const bool decl = index == 0 ? idsVarDecl : false;
+    unsigned id_start = 0;
+
+    if (indexed) {
+
+        handle_single_expr14(
+            ctx,
+            decl,
+            Op::assign,
+            ids->elems[0].get(),
+            static_cast<long>(index)
+        );
+
+        id_start++;
+    }
+
+    if (elem.is<FlatSharedArray>()) {
+
+        const ArrayConstView &view = elem.get<FlatSharedArray>().get_view();
+
+        for (unsigned i = id_start; i < ids->elems.size(); i++) {
+
+            const unsigned val_i = i - id_start;
+
+            handle_single_expr14(
+                ctx,
+                decl,
+                Op::assign,
+                ids->elems[i].get(),
+                val_i < view.size() ? view[val_i].get() : EvalValue()
+            );
+        }
+
+    } else {
+
+        handle_single_expr14(ctx, decl, Op::assign, ids->elems[id_start].get(), elem);
+
+        for (unsigned i = id_start+1; i < ids->elems.size(); i++)
+            handle_single_expr14(ctx, decl, Op::assign, ids->elems[i].get(), EvalValue());
+    }
+
+    try {
+
+        if (body)
+            body->eval(ctx);
+
+    } catch (LoopBreakEx) {
+
+        return false;
+
+    } catch (LoopContinueEx) {
+
+        /*
+        * Do nothing. Note: we cannot avoid this exception simply because
+        * we can have `continue` inside one or multiple levels of nested
+        * IF statements inside the loop, and we have to skip all of them
+        * to jump back here and restart the loop.
+        */
+    }
+
+    return true;
+}
+
+EvalValue
+ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalContext loopCtx(ctx, ctx->const_ctx);
+    const EvalValue &cval = RValue(container->eval(ctx));
+
+    if (cval.is<FlatSharedArray>()) {
+
+        const ArrayConstView &view = cval.get<FlatSharedArray>().get_view();
+
+        for (unsigned i = 0; i < view.size(); i++) {
+            if (!do_iter(&loopCtx, i, view[i].get()))
+                break;
+        }
+
+    } else if (cval.is<FlatSharedStr>()) {
+
+        const string_view &view = cval.get<FlatSharedStr>().get_view();
+
+        for (unsigned i = 0; i < view.size(); i++) {
+            if (!do_iter(&loopCtx, i, FlatSharedStr(string(&view[i], 1))))
+                break;
+        }
+
+    } else {
+
+        throw TypeErrorEx(container->start, container->end);
+    }
+
+    return EvalValue();
+}

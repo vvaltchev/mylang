@@ -52,6 +52,11 @@ pAcceptWhileStmt(ParseContext &c,
                  unsigned fl);
 
 bool
+pAcceptForeachStmt(ParseContext &c,
+                   unique_ptr<Construct> &ret,
+                   unsigned fl);
+
+bool
 pAcceptBracedBlock(ParseContext &c,
                    unique_ptr<Construct> &ret,
                    unsigned fl);
@@ -826,6 +831,10 @@ pStmt(ParseContext &c, unsigned fl)
 
         return subStmt;
 
+    } else if (pAcceptForeachStmt(c, subStmt, fl)) {
+
+        return subStmt;
+
     } else {
 
         fl |= pFlags::pInStmt;
@@ -1174,6 +1183,60 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             c.get_loc(),
             "At least one catch block or a finally block is required"
         );
+    }
+
+    ret = move(stmt);
+    return true;
+}
+
+bool
+pAcceptForeachStmt(ParseContext &c,
+                   unique_ptr<Construct> &ret,
+                   unsigned fl)
+{
+    const Loc start = c.get_loc();
+
+    if (!pAcceptKeyword(c, Keyword::kw_foreach))
+        return false;
+
+    unique_ptr<ForeachStmt> stmt(new ForeachStmt);
+
+    pExpectOp(c, Op::parenL);
+
+    if (pAcceptKeyword(c, Keyword::kw_var))
+        stmt->idsVarDecl = true;
+
+    stmt->ids = pList<IdList>(c, fl, pIdentifier);
+
+    if (stmt->ids->elems.size() == 0)
+        throw SyntaxErrorEx(c.get_loc(), "Expected at least one identifier");
+
+    if (!pAcceptKeyword(c, Keyword::kw_in))
+        throw SyntaxErrorEx(c.get_loc(), "Expected keyword `in`, got", &c.get_tok());
+
+    if (pAcceptKeyword(c, Keyword::kw_indexed))
+        stmt->indexed = true;
+
+    stmt->container = pExpr01(c, fl);
+
+    if (!stmt->container)
+        noExprError(c);
+
+    pExpectOp(c, Op::parenR);
+    stmt->start = start;
+    stmt->end = c.get_loc();
+
+    if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
+        stmt->body = pStmt(c, fl | pFlags::pInLoop);
+
+    if (c.const_eval && stmt->container->is_const) {
+
+        const EvalValue &v = RValue(stmt->container->eval(c.const_ctx));
+
+        if (v.get_type()->len(v) == 0) {
+            ret.reset();
+            return true;
+        }
     }
 
     ret = move(stmt);
