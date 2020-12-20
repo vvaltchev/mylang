@@ -1859,6 +1859,21 @@ static const vector<test> tests =
         },
         &typeid(CannotChangeConstEx),
     },
+
+    {
+        "Builtins lpad() and rpad()",
+        {
+            "assert(lpad(\"a\", 5) == \"    a\");",
+            "assert(rpad(\"a\", 5) == \"a    \");",
+            "assert(lpad(\"a\", 0) == \"a\");",
+            "assert(lpad(\"abcde\", 5) == \"abcde\");",
+            "assert(lpad(\"abcdef\", 5) == \"abcdef\");",
+            "assert(rpad(\"abcde\", 5) == \"abcde\");",
+            "assert(rpad(\"abcdef\", 5) == \"abcdef\");",
+            "assert(lpad(\"a\", 5, \"0\") == \"0000a\");",
+            "assert(rpad(\"a\", 5, \"0\") == \"a0000\");",
+        },
+    },
 };
 
 static void

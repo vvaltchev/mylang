@@ -220,3 +220,70 @@ builtin_find_str(const FlatSharedStr &str, const FlatSharedStr &substr)
 
     return static_cast<long>(pos);
 }
+
+template <bool leftpad>
+static EvalValue
+generic_pad(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() < 2 || exprList->elems.size() > 3)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &strval = RValue(arg0->eval(ctx));
+    const EvalValue &nval = RValue(arg1->eval(ctx));
+    char pad_char = ' ';
+
+    if (!strval.is<FlatSharedStr>())
+        throw TypeErrorEx(arg0->start, arg0->end);
+
+    if (!nval.is<long>())
+        throw TypeErrorEx(arg1->start, arg1->end);
+
+    if (exprList->elems.size() == 3) {
+
+        Construct *arg2 = exprList->elems[2].get();
+        const EvalValue &padc = RValue(arg2->eval(ctx));
+
+        if (!padc.is<FlatSharedStr>())
+            throw TypeErrorEx(arg2->start, arg2->end);
+
+        const string_view &padstr = padc.get<FlatSharedStr>().get_view();
+
+        if (padstr.size() > 1)
+            throw TypeErrorEx(arg2->start, arg2->end);
+
+        pad_char = padstr[0];
+    }
+
+    const string_view &str = strval.get<FlatSharedStr>().get_view();
+    const long n_orig = nval.get<long>();
+
+    if (n_orig < 0)
+        throw TypeErrorEx(arg1->start, arg1->end);
+
+    const size_t n = static_cast<size_t>(n_orig);
+
+    if constexpr(leftpad) {
+
+        if (str.size() < n)
+            return FlatSharedStr(string(n - str.size(), pad_char) + string(str));
+
+    } else {
+
+        if (str.size() < n)
+            return FlatSharedStr(string(str) + string(n - str.size(), pad_char));
+    }
+
+    return strval;
+}
+
+EvalValue builtin_lpad(EvalContext *ctx, ExprList *exprList)
+{
+    return generic_pad<true>(ctx, exprList);
+}
+
+EvalValue builtin_rpad(EvalContext *ctx, ExprList *exprList)
+{
+    return generic_pad<false>(ctx, exprList);
+}

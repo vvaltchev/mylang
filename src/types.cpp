@@ -142,6 +142,8 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("rev_sort", builtin_rev_sort),
     make_const_builtin("reverse", builtin_reverse),
     make_const_builtin("sum", builtin_sum),
+    make_const_builtin("lpad", builtin_lpad),
+    make_const_builtin("rpad", builtin_rpad),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

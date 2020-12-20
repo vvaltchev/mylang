@@ -2,7 +2,7 @@
 # A simple interactive program
 #
 
-var products =
+const products =
 [
     ["Egg", 2],
     ["Milk", 3],
@@ -21,8 +21,7 @@ func dump_products() {
         var p = products[i];
         var name = p[0];
         var price = p[1];
-        var pad = " " * max(0, 15 - len(name));
-        print(str(i) + ") " + name + pad + " " + price);
+        print(str(i) + ") " + rpad(name, 15) + " " + price);
         i += 1;
     }
 }
@@ -100,12 +99,12 @@ while (i < len(shopping_list)) {
     var price = products[pnum][1];
     var q = shopping_list[i][1];
     var subtotal = price * q;
-    print(name + ": $" + price + " x " + q + " = $" + subtotal);
+    print(rpad(name, 15) + ": $" + price + " x " + q + " = $" + subtotal);
     total += subtotal;
     i += 1;
 }
 
 print("-" * 40);
-print("$" + total);
+print(rpad("Total", 15) + ": $" + total);
 
 
