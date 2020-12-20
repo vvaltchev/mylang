@@ -20,9 +20,10 @@ enum class TokType : int {
     op          = 3,   /* operator (e.g. +, -, *, /) */
     kw          = 4,   /* keyword (e.g. if, else, while) */
     str         = 5,   /* string literal (e.g. "hello") */
-    unknown     = 6,   /* something else (e.g. ?) */
+    floatnum    = 6,   /* literal real number (floating point, e.g. 1.23) */
+    unknown     = 7,   /* something else (e.g. ?) */
 
-    count       = 7,
+    count       = 8,
 };
 
 static const array<string, (int)Op::op_count> OpString =

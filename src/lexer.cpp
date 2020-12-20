@@ -73,11 +73,12 @@ ostream &operator<<(ostream &s, TokType t)
     static const char *tt_str[] =
     {
         "inv",
-        "integer",
+        "int",
         "id_",
         "op_",
         "kw_",
         "str",
+        "flt",
         "unk",
     };
 
@@ -124,6 +125,7 @@ lexer(string_view in_str, int line, vector<Tok> &result)
 {
     size_t i, tok_start = 0;
     TokType tok_type = TokType::invalid;
+    bool float_exp;
 
     for (i = 0; i < in_str.length(); i++) {
 
@@ -206,7 +208,7 @@ lexer(string_view in_str, int line, vector<Tok> &result)
                 result.emplace_back(TokType::op, Loc(line, i+1), get_op_type(op));
             }
 
-        } else if (isalnum(c) || c == '_') {
+        } else if (isalnum(c) || c == '_' || c == '.') {
 
             if (tok_type == TokType::invalid) {
 
@@ -214,19 +216,48 @@ lexer(string_view in_str, int line, vector<Tok> &result)
 
                 if (isdigit(c))
                     tok_type = TokType::integer;
+                else if (c == '.')
+                    tok_type = TokType::floatnum;
                 else
                     tok_type = TokType::id;
 
             } else if (tok_type == TokType::integer) {
 
-                if (!isdigit(c))
-                    throw InvalidTokenEx{val};
+                if (c == '.' || c == 'e') {
+
+                    tok_type = TokType::floatnum;
+                    float_exp = c == 'e';
+
+                } else {
+
+                    if (!isdigit(c))
+                        throw InvalidTokenEx(val);
+                }
+
+            } else if (tok_type == TokType::floatnum) {
+
+                if (c == 'e') {
+
+                    if (!float_exp) {
+
+                        float_exp = true;
+
+                    } else {
+
+                        throw InvalidTokenEx(val);
+                    }
+
+                } else {
+
+                    if (!isdigit(c))
+                        throw InvalidTokenEx(val);
+                }
             }
 
         } else {
 
             if (tok_type != TokType::invalid)
-                throw InvalidTokenEx{val};
+                throw InvalidTokenEx(val);
 
             tok_start = i;
             tok_type = TokType::unknown;
