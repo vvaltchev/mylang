@@ -158,7 +158,7 @@ public:
     Literal() : Construct("Literal", true) { }
 };
 
-class LiteralInt : public Literal {
+class LiteralInt final: public Literal {
 
     const long value;
 
@@ -173,7 +173,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class LiteralNone : public Literal {
+class LiteralNone final: public Literal {
 
 public:
 
@@ -181,7 +181,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class NopConstruct : public Construct {
+class NopConstruct final: public Construct {
 
 public:
 
@@ -193,7 +193,7 @@ public:
     }
 };
 
-class LiteralStr : public Literal {
+class LiteralStr final: public Literal {
 
     EvalValue value;
 
@@ -211,7 +211,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class LiteralArray : public MultiElemConstruct<> {
+class LiteralArray final: public MultiElemConstruct<> {
 
 public:
 
@@ -219,7 +219,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Identifier : public Construct {
+class Identifier final: public Construct {
 
 public:
     string_view value;
@@ -231,14 +231,14 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class ExprList : public MultiElemConstruct<> {
+class ExprList final: public MultiElemConstruct<> {
 
 public:
 
     ExprList() : MultiElemConstruct<>("ExprList") { }
 };
 
-class IdList : public MultiElemConstruct<Identifier> {
+class IdList final: public MultiElemConstruct<Identifier> {
 
 public:
 
@@ -247,7 +247,7 @@ public:
     { }
 };
 
-class CallExpr : public Construct {
+class CallExpr final: public Construct {
 
 public:
     unique_ptr<Construct> what;
@@ -258,13 +258,13 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Expr01 : public SingleChildConstruct {
+class Expr01 final: public SingleChildConstruct {
 
 public:
     Expr01() : SingleChildConstruct("Expr01") { }
 };
 
-class Expr02 : public MultiOpConstruct {
+class Expr02 final: public MultiOpConstruct {
 
 public:
 
@@ -273,7 +273,7 @@ public:
 };
 
 
-class Expr03 : public MultiOpConstruct {
+class Expr03 final: public MultiOpConstruct {
 
 public:
 
@@ -281,7 +281,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Expr04 : public MultiOpConstruct {
+class Expr04 final: public MultiOpConstruct {
 
 public:
 
@@ -289,7 +289,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Expr06 : public MultiOpConstruct {
+class Expr06 final: public MultiOpConstruct {
 
 public:
 
@@ -297,7 +297,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Expr07 : public MultiOpConstruct {
+class Expr07 final: public MultiOpConstruct {
 
 public:
 
@@ -305,7 +305,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Expr11 : public MultiOpConstruct {
+class Expr11 final: public MultiOpConstruct {
 
 public:
 
@@ -313,7 +313,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Expr12 : public MultiOpConstruct {
+class Expr12 final: public MultiOpConstruct {
 
 public:
 
@@ -321,7 +321,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Expr14 : public Construct {
+class Expr14 final: public Construct {
 
 public:
     unique_ptr<Construct> lvalue;
@@ -334,13 +334,13 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Stmt : public SingleChildConstruct {
+class Stmt final: public SingleChildConstruct {
 
 public:
     Stmt() : SingleChildConstruct("Stmt") { }
 };
 
-class IfStmt : public Construct {
+class IfStmt final: public Construct {
 
 public:
     unique_ptr<Construct> condExpr;
@@ -352,28 +352,28 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class Block : public MultiElemConstruct<> {
+class Block final: public MultiElemConstruct<> {
 
 public:
     Block() : MultiElemConstruct("Block", ConstructType::block) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class BreakStmt : public ChildlessConstruct {
+class BreakStmt final: public ChildlessConstruct {
 
 public:
     BreakStmt(): ChildlessConstruct("BreakStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class ContinueStmt : public ChildlessConstruct {
+class ContinueStmt final: public ChildlessConstruct {
 
 public:
     ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class ReturnStmt : public Construct {
+class ReturnStmt final: public Construct {
 
 public:
     unique_ptr<Construct> elem;
@@ -383,7 +383,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class WhileStmt : public Construct {
+class WhileStmt final: public Construct {
 
 public:
     unique_ptr<Construct> condExpr;
@@ -394,7 +394,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class FuncDeclStmt : public Construct {
+class FuncDeclStmt final: public Construct {
 
 public:
     unique_ptr<Identifier> id;  /* NULL when the func is defined inside an expr */
@@ -407,7 +407,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class Subscript : public Construct {
+class Subscript final: public Construct {
 
 public:
 
@@ -419,7 +419,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class Slice : public Construct {
+class Slice final: public Construct {
 
 public:
 
@@ -438,7 +438,7 @@ struct AllowedExList {
     unique_ptr<Identifier> asId;
 };
 
-class TryCatchStmt : public Construct {
+class TryCatchStmt final: public Construct {
 
 public:
 
@@ -451,7 +451,7 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
-class RethrowStmt : public ChildlessConstruct {
+class RethrowStmt final: public ChildlessConstruct {
 
 public:
 
@@ -461,7 +461,7 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class ThrowStmt : public SingleChildConstruct {
+class ThrowStmt final: public SingleChildConstruct {
 
 public:
     ThrowStmt(): SingleChildConstruct("ThrowStmt") { }

@@ -50,7 +50,7 @@ template <> struct TypeToEnum<FlatSharedFuncObj> { enum { val = Type::t_func }; 
 template <> struct TypeToEnum<FlatSharedArray> { enum { val = Type::t_arr }; };
 template <> struct TypeToEnum<FlatSharedException> { enum { val = Type::t_ex }; };
 
-class EvalValue {
+class EvalValue final {
 
     union ValueU {
 
@@ -338,7 +338,7 @@ inline EvalValue::~EvalValue()
 
 // ---------------------------------------------------------------
 
-class LValue {
+class LValue final {
 
     EvalValue val;
     bool is_const;

@@ -4,7 +4,7 @@
 #include "flatval.h"
 #include <string>
 
-class FlatSharedStr {
+class FlatSharedStr final {
 
 public:
     typedef string inner_type;

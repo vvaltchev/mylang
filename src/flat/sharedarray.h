@@ -39,10 +39,10 @@ public:
 };
 
 template <class LValueType>
-class FlatSharedArrayTempl {
+class FlatSharedArrayTempl final {
 
     template <class LValueT>
-    class SharedArrayObj {
+    class SharedArrayObj final {
 
     public:
         typedef vector<LValueT> vec_type;
@@ -50,7 +50,7 @@ class FlatSharedArrayTempl {
     private:
         static const unsigned all_slices = static_cast<unsigned>(-1);
 
-        struct SharedObject {
+        struct SharedObject final {
 
             vec_type vec;
             unordered_set<SharedArrayObj *> slices;

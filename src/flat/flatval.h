@@ -21,7 +21,7 @@ using namespace std;
  */
 
 template <class T>
-class FlatVal {
+class FlatVal final {
 
 public:
 
@@ -55,7 +55,7 @@ public:
 };
 
 template <class T>
-class FlatSharedVal {
+class FlatSharedVal final {
 
     FlatVal<shared_ptr<T>> flat;
 

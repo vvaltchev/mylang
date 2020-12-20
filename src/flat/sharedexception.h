@@ -38,7 +38,7 @@ public:
 };
 
 template <class EvalValueT>
-class FlatSharedExceptionTempl {
+class FlatSharedExceptionTempl final {
 
 public:
     typedef ExceptionObjectTempl<EvalValueT> inner_type;
