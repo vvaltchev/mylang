@@ -65,9 +65,12 @@ public:
     bool is_block() const { return ct == ConstructType::block; }
 
     virtual ~Construct() = default;
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const = 0;
-    virtual void serialize(ostream &s, int level = 0) const = 0;
 
+    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
+        return EvalValue();
+    }
+
+    virtual void serialize(ostream &s, int level = 0) const = 0;
     virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 };
 
@@ -82,11 +85,7 @@ public:
         this->end = end;
     }
 
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
-        return EvalValue();
-    }
-
-    virtual void serialize(ostream &s, int level = 0) const;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class SingleChildConstruct : public Construct {
@@ -96,11 +95,11 @@ public:
 
     SingleChildConstruct(const char *name) : Construct(name) { }
 
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return elem->do_eval(ctx);
     }
 
-    virtual void serialize(ostream &s, int level = 0) const;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class MultiOpConstruct : public Construct {
@@ -109,7 +108,7 @@ public:
     vector<pair<Op, unique_ptr<Construct>>> elems;
 
     MultiOpConstruct(const char *name) : Construct(name) { }
-    virtual void serialize(ostream &s, int level = 0) const;
+    void serialize(ostream &s, int level = 0) const override;
 
     /* Special methods */
     EvalValue eval_first_rvalue(EvalContext *ctx) const;
@@ -126,7 +125,7 @@ public:
         : Construct(name, false, ct)
     { }
 
-    virtual void serialize(ostream &s, int level = 0) const;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 template <class T>
@@ -167,11 +166,11 @@ public:
 
     LiteralInt(long v) : value(v) { }
 
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;
     }
 
-    virtual void serialize(ostream &s, int level = 0) const;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class LiteralNone : public Literal {
@@ -179,12 +178,7 @@ class LiteralNone : public Literal {
 public:
 
     LiteralNone() : Literal() { }
-
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
-        return EvalValue();
-    }
-
-    virtual void serialize(ostream &s, int level = 0) const;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class NopConstruct : public Construct {
@@ -192,10 +186,6 @@ class NopConstruct : public Construct {
 public:
 
     NopConstruct() : Construct("nop", true, ConstructType::nop) { }
-
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
-        return EvalValue();
-    }
 
     virtual void serialize(ostream &s, int level = 0) const {
         /* NopConstructs should never remain in the final syntax tree */
@@ -214,11 +204,11 @@ public:
     LiteralStr(const EvalValue &v) : value(v) { }
     LiteralStr(EvalValue &&v) : value(move(v)) { }
 
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;
     }
 
-    virtual void serialize(ostream &s, int level = 0) const;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class LiteralArray : public MultiElemConstruct<> {
@@ -226,7 +216,7 @@ class LiteralArray : public MultiElemConstruct<> {
 public:
 
     LiteralArray() : MultiElemConstruct<>("LiteralArray") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Identifier : public Construct {
@@ -237,8 +227,8 @@ public:
     template <class T>
     Identifier(T &&arg) : Construct("Id"), value(forward<T>(arg)) { }
 
-    virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    void serialize(ostream &s, int level = 0) const override;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class ExprList : public MultiElemConstruct<> {
@@ -246,10 +236,6 @@ class ExprList : public MultiElemConstruct<> {
 public:
 
     ExprList() : MultiElemConstruct<>("ExprList") { }
-
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
-        return EvalValue();
-    }
 };
 
 class IdList : public MultiElemConstruct<Identifier> {
@@ -259,10 +245,6 @@ public:
     IdList()
         : MultiElemConstruct<Identifier>("IdList", ConstructType::idlist)
     { }
-
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
-        return EvalValue();
-    }
 };
 
 class CallExpr : public Construct {
@@ -272,8 +254,8 @@ public:
     unique_ptr<ExprList> args;
 
     CallExpr() : Construct("CallExpr") { }
-    virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    void serialize(ostream &s, int level = 0) const override;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Expr01 : public SingleChildConstruct {
@@ -287,7 +269,7 @@ class Expr02 : public MultiOpConstruct {
 public:
 
     Expr02() : MultiOpConstruct("Expr02") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 
@@ -296,7 +278,7 @@ class Expr03 : public MultiOpConstruct {
 public:
 
     Expr03() : MultiOpConstruct("Expr03") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Expr04 : public MultiOpConstruct {
@@ -304,7 +286,7 @@ class Expr04 : public MultiOpConstruct {
 public:
 
     Expr04() : MultiOpConstruct("Expr04") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Expr06 : public MultiOpConstruct {
@@ -312,7 +294,7 @@ class Expr06 : public MultiOpConstruct {
 public:
 
     Expr06() : MultiOpConstruct("Expr06") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Expr07 : public MultiOpConstruct {
@@ -320,7 +302,7 @@ class Expr07 : public MultiOpConstruct {
 public:
 
     Expr07() : MultiOpConstruct("Expr07") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Expr11 : public MultiOpConstruct {
@@ -328,7 +310,7 @@ class Expr11 : public MultiOpConstruct {
 public:
 
     Expr11() : MultiOpConstruct("Expr11") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Expr12 : public MultiOpConstruct {
@@ -336,7 +318,7 @@ class Expr12 : public MultiOpConstruct {
 public:
 
     Expr12() : MultiOpConstruct("Expr12") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Expr14 : public Construct {
@@ -348,8 +330,8 @@ public:
     Op op;
 
     Expr14() : Construct("Expr14"), fl(pNone), op(Op::invalid) { }
-    virtual void serialize(ostream &s, int level = 0) const;
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    void serialize(ostream &s, int level = 0) const override;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class Stmt : public SingleChildConstruct {
@@ -366,29 +348,29 @@ public:
     unique_ptr<Construct> elseBlock;
 
     IfStmt() : Construct("IfStmt") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-    virtual void serialize(ostream &s, int level = 0) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class Block : public MultiElemConstruct<> {
 
 public:
     Block() : MultiElemConstruct("Block", ConstructType::block) { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class BreakStmt : public ChildlessConstruct {
 
 public:
     BreakStmt(): ChildlessConstruct("BreakStmt") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class ContinueStmt : public ChildlessConstruct {
 
 public:
     ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class ReturnStmt : public Construct {
@@ -397,9 +379,8 @@ public:
     unique_ptr<Construct> elem;
 
     ReturnStmt(): Construct("ReturnStmt", false, ConstructType::ret) { }
-
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-    virtual void serialize(ostream &s, int level = 0) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class WhileStmt : public Construct {
@@ -409,8 +390,8 @@ public:
     unique_ptr<Construct> body;
 
     WhileStmt() : Construct("WhileStmt") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-    virtual void serialize(ostream &s, int level = 0) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class FuncDeclStmt : public Construct {
@@ -422,8 +403,8 @@ public:
     unique_ptr<Construct> body;
 
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-    virtual void serialize(ostream &s, int level = 0) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class Subscript : public Construct {
@@ -434,8 +415,8 @@ public:
     unique_ptr<Construct> index;
 
     Subscript() : Construct("Subscript") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-    virtual void serialize(ostream &s, int level = 0) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class Slice : public Construct {
@@ -447,8 +428,8 @@ public:
     unique_ptr<Construct> end_idx;
 
     Slice() : Construct("Slice") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-    virtual void serialize(ostream &s, int level = 0) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 struct AllowedExList {
@@ -466,8 +447,8 @@ public:
     vector<pair<AllowedExList, unique_ptr<Construct>>> catchStmts;
 
     TryCatchStmt() : Construct("TryCatchStmt") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-    virtual void serialize(ostream &s, int level = 0) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
 };
 
 class RethrowStmt : public ChildlessConstruct {
@@ -477,12 +458,12 @@ public:
     RethrowStmt(Loc start = Loc(), Loc end = Loc())
         : ChildlessConstruct("RethrowStmt", start, end) { }
 
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
 class ThrowStmt : public SingleChildConstruct {
 
 public:
     ThrowStmt(): SingleChildConstruct("ThrowStmt") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
