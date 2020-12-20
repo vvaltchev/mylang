@@ -478,11 +478,14 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
     return newVal;
 }
 
-EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
+static EvalValue
+handle_single_expr14(EvalContext *ctx,
+                     bool inDecl,
+                     Op op,
+                     Construct *lvalue,
+                     const EvalValue &rval)
 {
-    const bool inDecl = fl & pFlags::pInDecl;
     const EvalValue &lval = lvalue->eval(ctx);
-    const EvalValue &rval = rvalue->eval(ctx);
 
     if (lval.is<UndefinedId>()) {
 
@@ -525,26 +528,41 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
     return rval;
 }
 
-EvalValue Expr15::do_eval(EvalContext *ctx, bool rec) const
+EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 {
-    EvalValue val;
-    assert(elems.size() > 0);
-    val = elems[0].second->eval(ctx);
+    const bool inDecl = fl & pFlags::pInDecl;
+    const EvalValue &rval = RValue(rvalue->eval(ctx));
+    IdList *idlist = dynamic_cast<IdList *>(lvalue.get());
 
-    for (auto &&it = elems.begin()+1; it != elems.end(); it++) {
+    if (idlist) {
 
-        const auto &[op, e] = *it;
+        if (!rval.is<FlatSharedArray>()) {
 
-        switch (op) {
-            case Op::comma:
-                val = e->eval(ctx);
-                break;
-            default:
-                throw InternalErrorEx();
+            for (const auto &e: idlist->elems)
+                handle_single_expr14(ctx, inDecl, op, e.get(), rval);
+
+        } else {
+
+            const ArrayConstView &view = rval.get<FlatSharedArray>().get_view();
+
+            for (unsigned i = 0; i < idlist->elems.size(); i++) {
+
+                handle_single_expr14(
+                    ctx,
+                    inDecl,
+                    op,
+                    idlist->elems[i].get(),
+                    i < view.size() ? view[i].get() : EvalValue()
+                );
+            }
         }
-    }
 
-    return val;
+        return EvalValue();
+
+    } else {
+
+        return handle_single_expr14(ctx, inDecl, op, lvalue.get(), rval);
+    }
 }
 
 EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const

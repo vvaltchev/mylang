@@ -1345,7 +1345,7 @@ static const vector<test> tests =
     {
         "Finally, without catch",
         {
-            "var c = 0, f = 0;",
+            "var c, f = 0;",
             "try {",
             "   try {",
             "       var a=3; append(a, 10);",
@@ -1364,7 +1364,7 @@ static const vector<test> tests =
     {
         "Finally after catch",
         {
-            "var c = 0, f = 0;",
+            "var c, f = 0;",
             "try {",
             "   var a=3; append(a, 10);",
             "} catch (TypeErrorEx) {",
@@ -1423,7 +1423,7 @@ static const vector<test> tests =
     {
         "Catch single ex + anything: catch anything runs",
         {
-            "var c1 = 0, c2 = 0;",
+            "var c1, c2 = 0;",
             "try {",
             "   var a=3; append(a, 4);",
             "} catch (DivisionByZeroEx) {",
@@ -1439,7 +1439,7 @@ static const vector<test> tests =
     {
         "Catch single ex + anything: single catch runs",
         {
-            "var c1 = 0, c2 = 0;",
+            "var c1, c2 = 0;",
             "try {",
             "   var a=3; append(a, 4);",
             "} catch (TypeErrorEx) {",
@@ -1455,7 +1455,7 @@ static const vector<test> tests =
     {
         "Rethrow",
         {
-            "var c1=0, c2=0;",
+            "var c1, c2 = 0;",
             "try {",
             "   try {",
             "       var a=3; append(a, 4);",
@@ -1500,7 +1500,7 @@ static const vector<test> tests =
     {
         "Re-throw (custom) exception with data",
         {
-            "var c1 = 0, c2 = 0;",
+            "var c1, c2 = 0;",
             "try {",
             "   try {",
             "       throw ex(\"myerr\", 1234);",
@@ -1872,6 +1872,97 @@ static const vector<test> tests =
             "assert(rpad(\"abcdef\", 5) == \"abcdef\");",
             "assert(lpad(\"a\", 5, \"0\") == \"0000a\");",
             "assert(rpad(\"a\", 5, \"0\") == \"a0000\");",
+        },
+    },
+
+    {
+        "Decl multi-id assignments",
+        {
+            "var a,b = [1,2];",
+            "assert(a == 1);",
+            "assert(b == 2);",
+        },
+    },
+
+    {
+        "Non-decl multi-id assignments",
+        {
+            "var a,b;",
+            "a,b = [1,2];",
+            "assert(a == 1);",
+            "assert(b == 2);",
+        },
+    },
+
+    {
+        "Const-decl multi-id assignments",
+        {
+            "const a,b = [1,2];",
+            "assert(a == 1);",
+            "assert(b == 2);",
+        }
+    },
+
+    {
+        "Multi-id assignments with more IDs than elems",
+        {
+            "var a,b,c = [1,2];",
+            "assert(a == 1);",
+            "assert(b == 2);",
+            "assert(c == none);",
+        },
+    },
+
+    {
+        "Multi-id assignments with more elems than IDs",
+        {
+            "var a,b = [1,2,3];",
+            "assert(a == 1);",
+            "assert(b == 2);",
+        },
+    },
+
+    {
+        "Decl multi-id assignments with re-defines",
+        {
+            "var a = 3;",
+            "var a,b = [5,6];",
+        },
+        &typeid(AlreadyDefinedEx),
+    },
+
+    {
+        "Decl multi-id assignments with re-defines of consts",
+        {
+            "const a = 3;",
+            "var a,b = [5,6];",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "Decl multi-id assignments to `none`",
+        {
+            "var a,b;",
+            "assert(a == none && b == none);",
+        },
+    },
+
+    {
+        "Decl multi-id assignments to single value",
+        {
+            "var a,b = \"abc\";",
+            "assert(a == \"abc\" && b == \"abc\");",
+        },
+    },
+
+    {
+        "Multi-id assignments with operator +=",
+        {
+            "var a,b = [1,2];",
+            "a,b += [3,10];",
+            "assert(a == 4);",
+            "assert(b == 12);",
         },
     },
 };

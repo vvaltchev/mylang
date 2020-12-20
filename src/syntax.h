@@ -335,14 +335,6 @@ public:
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };
 
-class Expr15 : public MultiOpConstruct {
-
-public:
-
-    Expr15() : MultiOpConstruct("Expr15") { }
-    virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
-};
-
 class Stmt : public SingleChildConstruct {
 
 public:

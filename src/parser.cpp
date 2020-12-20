@@ -28,7 +28,6 @@ unique_ptr<Construct> pExpr07(ParseContext &c, unsigned fl); // ops: ==, !=
 unique_ptr<Construct> pExpr11(ParseContext &c, unsigned fl); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c, unsigned fl); // ops: ||
 unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl); // ops: = (assignment)
-unique_ptr<Construct> pExpr15(ParseContext &c, unsigned fl); // ops: , (comma operator)
 
 unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl);
 unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl);
@@ -401,7 +400,7 @@ pExpr01(ParseContext &c, unsigned fl)
 
     } else if (pAcceptId(c, main)) {
 
-        /* Do nothing */
+        /* do nothing */
 
     } else {
 
@@ -546,6 +545,22 @@ pExpr12(ParseContext &c, unsigned fl)
     );
 }
 
+static void
+declExprCheckId(ParseContext &c, Construct *id)
+{
+    const EvalValue &val = id->eval(c.const_ctx);
+
+    if (!val.is<UndefinedId>()) {
+
+        if (val.is<LValue *>()) {
+            if (val.get<LValue *>()->is<Builtin>())
+                throw CannotRebindBuiltinEx(c.get_loc());
+        }
+
+        throw CannotRebindConstEx(c.get_loc());
+    }
+}
+
 unique_ptr<Construct>
 pExpr14(ParseContext &c, unsigned fl)
 {
@@ -556,7 +571,7 @@ pExpr14(ParseContext &c, unsigned fl)
     const Loc start = c.get_loc();
     unique_ptr<Construct> lside;
     unique_ptr<Expr14> ret;
-    EvalValue lside_val;
+    bool in_idlist = false;
     Op op;
 
     if (fl & pFlags::pInDecl) {
@@ -581,28 +596,47 @@ pExpr14(ParseContext &c, unsigned fl)
          * UndefinedId.
          */
 
-        lside_val = lside->eval(c.const_ctx);
-
-        if (!lside_val.is<UndefinedId>()) {
-
-            if (lside_val.is<LValue *>()) {
-                if (lside_val.get<LValue *>()->is<Builtin>())
-                    throw CannotRebindBuiltinEx(c.get_loc());
-            }
-
-            throw CannotRebindConstEx(c.get_loc());
-        }
+        declExprCheckId(c, lside.get());
 
     } else {
 
-        if (pAcceptFuncDecl(c, lside, fl))
+        if (pAcceptFuncDecl(c, lside, fl & ~pFlags::pInStmt))
             return lside;
 
-        lside = pExpr12(c, fl);
+
+        lside = pExpr12(c, fl & ~pFlags::pInStmt);
     }
 
     if (!lside)
         return nullptr;
+
+    if (fl & pFlags::pInStmt) {
+
+        Identifier *first_id = dynamic_cast<Identifier *>(lside.get());
+
+        if (first_id && pAcceptOp(c, Op::comma)) {
+
+            unique_ptr<IdList> idlist(new IdList);
+            lside.release();
+            idlist->elems.emplace_back(first_id);
+
+            unique_ptr<IdList> tmp = pList<IdList>(c, fl, pIdentifier);
+
+            idlist->elems.insert(
+                idlist->elems.end(),
+                make_move_iterator(tmp->elems.begin()),
+                make_move_iterator(tmp->elems.end())
+            );
+
+            if (fl & pFlags::pInDecl) {
+                for (const auto &e : idlist->elems)
+                    declExprCheckId(c, e.get());
+            }
+
+            lside = move(idlist);
+            in_idlist = true;
+        }
+    }
 
     if ((op = AcceptOneOf(c, valid_ops)) != Op::invalid) {
 
@@ -626,6 +660,13 @@ pExpr14(ParseContext &c, unsigned fl)
             ret->lvalue = move(lside);
             ret->rvalue.reset(new LiteralNone());
 
+        } else if (in_idlist) {
+
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Operator '=' is required when the left side is an ID list"
+            );
+
         } else {
 
             /* Just return lside (doing const eval if possible) */
@@ -641,7 +682,7 @@ pExpr14(ParseContext &c, unsigned fl)
         ret.reset(new Expr14);
         ret->op = op;
         ret->lvalue = move(lside);
-        ret->rvalue = pExpr14(c, fl & ~pInDecl);
+        ret->rvalue = pExpr14(c, fl & ~pFlags::pInDecl);
     }
 
     ret->fl = fl & pFlags::pInDecl;
@@ -681,17 +722,9 @@ pExpr14(ParseContext &c, unsigned fl)
 }
 
 unique_ptr<Construct>
-pExpr15(ParseContext &c, unsigned fl)
-{
-    return pExprGeneric<Expr15>(
-        c, pExpr14, {Op::comma}, fl
-    );
-}
-
-unique_ptr<Construct>
 pExprTop(ParseContext &c, unsigned fl)
 {
-    unique_ptr<Construct> e = pExpr15(c, fl);
+    unique_ptr<Construct> e = pExpr14(c, fl);
 
     if (c.const_eval && e && e->is_const && !e->is_nop)
         MakeConstructFromConstVal(e->eval(c.const_ctx), e);
@@ -794,6 +827,8 @@ pStmt(ParseContext &c, unsigned fl)
         return subStmt;
 
     } else {
+
+        fl |= pFlags::pInStmt;
 
         if (pAcceptKeyword(c, Keyword::kw_var))
             fl |= pFlags::pInDecl;

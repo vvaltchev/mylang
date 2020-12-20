@@ -18,9 +18,7 @@ func dump_products() {
     var i = 0;
     while (i < len(products)) {
 
-        var p = products[i];
-        var name = p[0];
-        var price = p[1];
+        var name, price = products[i];
         print(str(i) + ") " + rpad(name, 15) + " " + price);
         i += 1;
     }
@@ -94,10 +92,8 @@ var total = 0;
 
 while (i < len(shopping_list)) {
 
-    var pnum = shopping_list[i][0];
-    var name = products[pnum][0];
-    var price = products[pnum][1];
-    var q = shopping_list[i][1];
+    var pnum, q = shopping_list[i];
+    var name, price = products[pnum];
     var subtotal = price * q;
     print(rpad(name, 15) + ": $" + price + " x " + q + " = $" + subtotal);
     total += subtotal;

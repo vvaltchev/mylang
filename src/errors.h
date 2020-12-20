@@ -116,6 +116,7 @@ DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
 DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_SIMPLE_EX(CannotChangeConstEx, "Cannot change constant")
 
+
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")
