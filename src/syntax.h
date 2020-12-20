@@ -30,27 +30,39 @@ enum pFlags : unsigned {
     pInCatchBody    = 1 << 6,
 };
 
+enum class ConstructType {
+
+    other,
+    nop,
+    ret,
+    idlist,
+    block,
+};
+
 class Construct {
 
 public:
     const char *const name;
-    const bool is_nop;      // Purpose: avoid dynamic_cast<NopConstruct *>
-    const bool is_ret;      // Purpose: avoid dynamic_cast<ReturnStmt *>
+    const ConstructType ct;     /* Purpose: avoid dynamic_cast in some cases */
+
     bool is_const;
     Loc start;
     Loc end;
 
     Construct(const char *name,
               bool is_const = false,
-              bool is_nop = false,
-              bool is_ret = false)
+              ConstructType ct = ConstructType::other)
         : name(name)
-        , is_nop(is_nop)
-        , is_ret(is_ret)
+        , ct(ct)
         , is_const(is_const)
         , start(Loc())
         , end(Loc())
     { }
+
+    bool is_nop() const { return ct == ConstructType::nop; }
+    bool is_ret() const { return ct == ConstructType::ret; }
+    bool is_idlist() const { return ct == ConstructType::idlist; }
+    bool is_block() const { return ct == ConstructType::block; }
 
     virtual ~Construct() = default;
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const = 0;
@@ -110,7 +122,10 @@ public:
     typedef ElemT ElemType;
     vector<unique_ptr<ElemType>> elems;
 
-    MultiElemConstruct(const char *name) : Construct(name) { }
+    MultiElemConstruct(const char *name, ConstructType ct = ConstructType::other)
+        : Construct(name, false, ct)
+    { }
+
     virtual void serialize(ostream &s, int level = 0) const;
 };
 
@@ -176,7 +191,7 @@ class NopConstruct : public Construct {
 
 public:
 
-    NopConstruct() : Construct("nop", true, true) { }
+    NopConstruct() : Construct("nop", true, ConstructType::nop) { }
 
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
         return EvalValue();
@@ -241,7 +256,9 @@ class IdList : public MultiElemConstruct<Identifier> {
 
 public:
 
-    IdList() : MultiElemConstruct<Identifier>("IdList") { }
+    IdList()
+        : MultiElemConstruct<Identifier>("IdList", ConstructType::idlist)
+    { }
 
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
         return EvalValue();
@@ -356,7 +373,7 @@ public:
 class Block : public MultiElemConstruct<> {
 
 public:
-    Block() : MultiElemConstruct("Block") { }
+    Block() : MultiElemConstruct("Block", ConstructType::block) { }
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
 };
 
@@ -379,7 +396,7 @@ class ReturnStmt : public Construct {
 public:
     unique_ptr<Construct> elem;
 
-    ReturnStmt(): Construct("ReturnStmt", false, false, true) { }
+    ReturnStmt(): Construct("ReturnStmt", false, ConstructType::ret) { }
 
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const;
     virtual void serialize(ostream &s, int level = 0) const;

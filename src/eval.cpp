@@ -157,16 +157,19 @@ EvalValue do_func_call(EvalContext *ctx,
 
     try {
 
-        Block *block = dynamic_cast<Block *>(obj.func->body.get());
+        Block *block = nullptr;
+
+        if (obj.func->body->is_block())
+            block = static_cast<Block *>(obj.func->body.get());
 
         if (block) {
 
             for (const auto &e: block->elems) {
 
-                if (e->is_ret) {
+                if (e->is_ret()) {
+
                     /* Optimization: skip ReturnEx and eval the result directly */
-                    ReturnStmt *ret = dynamic_cast<ReturnStmt *>(e.get());
-                    assert(ret != nullptr);
+                    ReturnStmt *ret = static_cast<ReturnStmt *>(e.get());
 
                     return do_func_return(
                         ret->elem->eval(&args_ctx),
@@ -532,7 +535,10 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 {
     const bool inDecl = fl & pFlags::pInDecl;
     const EvalValue &rval = RValue(rvalue->eval(ctx));
-    IdList *idlist = dynamic_cast<IdList *>(lvalue.get());
+    IdList *idlist = nullptr;
+
+    if (lvalue->is_idlist())
+        idlist = static_cast<IdList *>(lvalue.get());
 
     if (idlist) {
 

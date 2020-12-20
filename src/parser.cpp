@@ -429,7 +429,7 @@ pExprGeneric(ParseContext &c,
     unique_ptr<ExprT> ret;
     bool is_const;
 
-    if (!lowerE || lowerE->is_nop)
+    if (!lowerE || lowerE->is_nop())
         return lowerE;
 
     is_const = lowerE->is_const;
@@ -726,7 +726,7 @@ pExprTop(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> e = pExpr14(c, fl);
 
-    if (c.const_eval && e && e->is_const && !e->is_nop)
+    if (c.const_eval && e && e->is_const && !e->is_nop())
         MakeConstructFromConstVal(e->eval(c.const_ctx), e);
 
     return e;
@@ -837,7 +837,7 @@ pStmt(ParseContext &c, unsigned fl)
 
         unique_ptr<Construct> lowerE = pExprTop(c, fl);
 
-        if (!lowerE || lowerE->is_nop)
+        if (!lowerE || lowerE->is_nop())
             return lowerE;
 
         unique_ptr<Stmt> ret(new Stmt);
@@ -873,7 +873,7 @@ pBlock(ParseContext &c, unsigned fl)
 
             while ((stmt = pStmt(c, fl))) {
 
-                if (!stmt->is_nop)
+                if (!stmt->is_nop())
                     ret->elems.emplace_back(move(stmt));
 
                 added_elem = true;
@@ -927,7 +927,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         unique_ptr<Construct> stmt = pStmt(c, fl);
 
-        if (stmt && !stmt->is_nop)
+        if (stmt && !stmt->is_nop())
             ifstmt->thenBlock = move(stmt);
     }
 
@@ -937,7 +937,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
             unique_ptr<Construct> stmt = pStmt(c, fl);
 
-            if (stmt && !stmt->is_nop)
+            if (stmt && !stmt->is_nop())
                 ifstmt->elseBlock = move(stmt);
         }
     }
