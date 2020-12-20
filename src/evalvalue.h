@@ -146,6 +146,10 @@ public:
     }
 
     EvalValue clone() const {
+
+        if (type->t < Type::t_str)
+            return *this;
+
         return type->clone(*this);
     }
 
