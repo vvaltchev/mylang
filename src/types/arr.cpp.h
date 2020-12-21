@@ -69,7 +69,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     FlatSharedArray &lval = a.get<FlatSharedArray>();
 
     if (!b.is<FlatSharedArray>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected array on the right side of +");
 
     const FlatSharedArray &rhs = b.get<FlatSharedArray>();
 
@@ -179,7 +179,7 @@ bool TypeArr::is_true(const EvalValue &a)
 EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
 {
     if (!idx_val.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer as subscript");
 
     const EvalValue &what = RValue(what_lval);
     FlatSharedArray &&arr = what.get<FlatSharedArray>();
@@ -230,7 +230,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
 
     } else if (!start_val.is<NoneVal>()) {
 
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer as range start");
     }
 
     if (end_val.is<long>()) {
@@ -248,7 +248,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
 
     } else if (!end_val.is<NoneVal>()) {
 
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer as range end");
     }
 
     return FlatSharedArray(arr, arr.offset() + start, end - start);

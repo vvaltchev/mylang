@@ -611,8 +611,13 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue &e = RValue(elem->eval(ctx));
 
-    if (!e.is<FlatSharedException>())
-        throw TypeErrorEx(elem->start, elem->end);
+    if (!e.is<FlatSharedException>()) {
+        throw TypeErrorEx(
+            "Expected an exception object",
+            elem->start,
+            elem->end
+        );
+    }
 
     throw e.get<FlatSharedException>().get_ref();
 }
@@ -957,7 +962,11 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
     } else {
 
-        throw TypeErrorEx(container->start, container->end);
+        throw TypeErrorEx(
+            "Unsupported container type by foreach()",
+            container->start,
+            container->end
+        );
     }
 
     return EvalValue();

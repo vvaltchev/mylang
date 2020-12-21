@@ -62,24 +62,73 @@ public:
     const TypeE t;
     TypeTemplate(TypeE t) : t(t) { assert(t != t_count); }
 
-    virtual void add(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void sub(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void mul(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void div(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void mod(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void lt(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void gt(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void le(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void ge(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void eq(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void noteq(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void opneg(EvalValueT &a) { throw TypeErrorEx(); }
-    virtual void land(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
-    virtual void lor(EvalValueT &a, const EvalValueT &b) { throw TypeErrorEx(); }
+    virtual void add(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator +");
+    }
 
-    virtual bool is_true(const EvalValueT &a) { throw TypeErrorEx(); }
-    virtual string to_string(const EvalValueT &a) { throw TypeErrorEx(); }
-    virtual long len(const EvalValueT &a) { throw TypeErrorEx(); }
+    virtual void sub(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator -");
+    }
+
+    virtual void mul(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator *");
+    }
+
+    virtual void div(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator /");
+    }
+
+    virtual void mod(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator %");
+    }
+
+    virtual void lt(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator <");
+    }
+
+    virtual void gt(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator >");
+    }
+
+    virtual void le(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator <=");
+    }
+
+    virtual void ge(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator >=");
+    }
+
+    virtual void eq(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator ==");
+    }
+
+    virtual void noteq(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator !=");
+    }
+
+    virtual void opneg(EvalValueT &a) {
+        throw TypeErrorEx("The object does NOT support unary operator - (negation)");
+    }
+
+    virtual void land(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator &&");
+    }
+
+    virtual void lor(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator ||");
+    }
+
+    virtual bool is_true(const EvalValueT &a) {
+        throw TypeErrorEx("The object does NOT support conversion to bool");
+    }
+
+    virtual string to_string(const EvalValueT &a) {
+        throw TypeErrorEx("The object does NOT support conversion to string");
+    }
+
+    virtual long len(const EvalValueT &a) {
+        throw TypeErrorEx("The object does NOT support len()");
+    }
 
     virtual void lnot(EvalValueT &a) {
         a = EvalValueT(!is_true(a));
@@ -87,14 +136,14 @@ public:
 
     virtual EvalValueT subscript(const EvalValueT &what, const EvalValueT &idx)
     {
-        throw TypeErrorEx();
+        throw TypeErrorEx("The object does NOT support subscript operator []");
     }
 
     virtual EvalValueT slice(const EvalValueT &what,
                              const EvalValueT &start,
                              const EvalValueT &end)
     {
-        throw TypeErrorEx();
+        throw TypeErrorEx("The object does NOT support slice operator []");
     }
 
     virtual long use_count(const EvalValueT &a)

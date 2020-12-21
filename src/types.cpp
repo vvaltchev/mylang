@@ -39,7 +39,7 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
 
     if (!e.is<long>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
     exit(e.get<long>());
 }
@@ -63,7 +63,7 @@ EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
     const EvalValue &name_val = RValue(exprList->elems[0]->eval(ctx));
 
     if (!name_val.is<FlatSharedStr>())
-        throw TypeErrorEx(exprList->elems[0]->start, exprList->elems[0]->end);
+        throw TypeErrorEx("Expected string", exprList->elems[0]->start, exprList->elems[0]->end);
 
     return FlatSharedException(
         ExceptionObject(
@@ -84,7 +84,7 @@ EvalValue builtin_exdata(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
 
     if (!e.is<FlatSharedException>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected exception object", arg->start, arg->end);
 
     return e.get<FlatSharedException>().get_ref().get_data();
 }

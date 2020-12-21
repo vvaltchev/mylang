@@ -37,12 +37,12 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 
         } catch (...) {
 
-            throw TypeErrorEx(arg->start, arg->end);
+            throw TypeErrorEx("The string cannot be converted to integer", arg->start, arg->end);
         }
 
     } else {
 
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Unsupported type for int()", arg->start, arg->end);
     }
 }
 
@@ -70,12 +70,12 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
 
         } catch (...) {
 
-            throw TypeErrorEx(arg->start, arg->end);
+            throw TypeErrorEx("The string cannot be converted to float", arg->start, arg->end);
         }
 
     } else {
 
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Unsupported type for float()", arg->start, arg->end);
     }
 }
 
@@ -98,7 +98,7 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
 
     } else {
 
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Unsupported type for abs()", arg->start, arg->end);
     }
 }
 
@@ -144,8 +144,13 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
 
     if (vec.size() == 1) {
 
-        if (!val.is<FlatSharedArray>())
-            throw TypeErrorEx(first_arg->start, first_arg->end);
+        if (!val.is<FlatSharedArray>()) {
+            throw TypeErrorEx(
+                "When a single argument is provided, it must be an array",
+                first_arg->start,
+                first_arg->end
+            );
+        }
 
         return b_min_max_arr<is_max>(val.get<FlatSharedArray>());
     }

@@ -81,7 +81,7 @@ EvalValue builtin_undef(EvalContext *ctx, ExprList *exprList)
     Identifier *id = dynamic_cast<Identifier *>(arg);
 
     if (!id)
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected identifier", arg->start, arg->end);
 
     const auto &it = ctx->symbols.find(id->value);
 
@@ -127,13 +127,13 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
     if (lval->is<FlatSharedArray>()) {
 
         if (!index_val.is<long>())
-            throw TypeErrorEx(arg1->start, arg1->end);
+            throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
         builtin_erase_arr(lval, index_val.get<long>());
 
     } else {
 
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Unsupported container type by erase()", arg0->start, arg0->end);
     }
 
     return EvalValue();
@@ -156,7 +156,7 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
     } else if (container_val.is<FlatSharedStr>()) {
 
         if (!elem_val.is<FlatSharedStr>())
-            throw TypeErrorEx(arg1->start, arg1->end);
+            throw TypeErrorEx("Expected string", arg1->start, arg1->end);
 
         return builtin_find_str(
             container_val.get<FlatSharedStr>(),
@@ -165,6 +165,6 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
 
     } else {
 
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Unsupported container type by find()", arg0->start, arg0->end);
     }
 }

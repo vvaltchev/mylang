@@ -23,10 +23,10 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
 
     if (!val_str.is<FlatSharedStr>())
-        throw TypeErrorEx(arg_str->start, arg_str->end);
+        throw TypeErrorEx("Expected string", arg_str->start, arg_str->end);
 
     if (!val_delim.is<FlatSharedStr>())
-        throw TypeErrorEx(arg_delim->start, arg_delim->end);
+        throw TypeErrorEx("Expected string", arg_delim->start, arg_delim->end);
 
     const FlatSharedStr &flat_str = val_str.get<FlatSharedStr>();
     const string_view &str = flat_str.get_view();
@@ -78,10 +78,10 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
 
     if (!val_arr.is<FlatSharedArray>())
-        throw TypeErrorEx(arg_arr->start, arg_arr->end);
+        throw TypeErrorEx("Expected array", arg_arr->start, arg_arr->end);
 
     if (!val_delim.is<FlatSharedStr>())
-        throw TypeErrorEx(arg_delim->start, arg_delim->end);
+        throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
 
     const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
     const ArrayConstView &arr_view = val_arr.get<FlatSharedArray>().get_view();
@@ -92,7 +92,7 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
         const EvalValue &val = arr_view[i].get();
 
         if (!val.is<FlatSharedStr>())
-            throw TypeErrorEx(arg_arr->start, arg_arr->end);
+            throw TypeErrorEx("Expected string", arg_arr->start, arg_arr->end);
 
         result += val.get<FlatSharedStr>().get_view();
 
@@ -112,7 +112,7 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val = RValue(arg->eval(ctx));
 
     if (!val.is<FlatSharedStr>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
     const string_view &str = flat_str.get_view();
@@ -163,13 +163,13 @@ EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val = RValue(arg->eval(ctx));
 
     if (!val.is<FlatSharedStr>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
     const string_view &str = flat_str.get_view();
 
     if (str.size() != 1)
-         throw TypeErrorEx(arg->start, arg->end);
+         throw TypeErrorEx("Expected 1-char string", arg->start, arg->end);
 
     return static_cast<long>(static_cast<unsigned char>(str[0]));
 }
@@ -183,7 +183,7 @@ EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val = RValue(arg->eval(ctx));
 
     if (!val.is<long>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
     char c = static_cast<char>(val.get<long>());
     return FlatSharedStr(string(&c, 1));
@@ -214,10 +214,10 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
     char pad_char = ' ';
 
     if (!strval.is<FlatSharedStr>())
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Expected string", arg0->start, arg0->end);
 
     if (!nval.is<long>())
-        throw TypeErrorEx(arg1->start, arg1->end);
+        throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
     if (exprList->elems.size() == 3) {
 
@@ -225,12 +225,12 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
         const EvalValue &padc = RValue(arg2->eval(ctx));
 
         if (!padc.is<FlatSharedStr>())
-            throw TypeErrorEx(arg2->start, arg2->end);
+            throw TypeErrorEx("Expected string", arg2->start, arg2->end);
 
         const string_view &padstr = padc.get<FlatSharedStr>().get_view();
 
         if (padstr.size() > 1)
-            throw TypeErrorEx(arg2->start, arg2->end);
+            throw TypeErrorEx("Expected 1-char string", arg2->start, arg2->end);
 
         pad_char = padstr[0];
     }
@@ -239,7 +239,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
     const long n_orig = nval.get<long>();
 
     if (n_orig < 0)
-        throw TypeErrorEx(arg1->start, arg1->end);
+        throw TypeErrorEx("Expected non-negative integer", arg1->start, arg1->end);
 
     const size_t n = static_cast<size_t>(n_orig);
 

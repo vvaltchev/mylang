@@ -40,7 +40,7 @@ inline long double internal_val_to_float(const EvalValue &b)
     if (b.is<long>())
         return b.get<long>();
 
-    throw TypeErrorEx();
+    throw TypeErrorEx("Cannot convert right-side value to float");
 }
 
 void TypeFloat::add(EvalValue &a, const EvalValue &b)

@@ -1261,9 +1261,17 @@ pAcceptForeachStmt(ParseContext &c,
 
         const EvalValue &v = RValue(stmt->container->eval(c.const_ctx));
 
-        if (v.get_type()->len(v) == 0) {
-            ret.reset();
-            return true;
+        try {
+
+            if (v.get_type()->len(v) == 0) {
+                ret.reset();
+                return true;
+            }
+
+        } catch (Exception &e) {
+            e.loc_start = stmt->container->start;
+            e.loc_end = stmt->container->end;
+            throw;
         }
     }
 

@@ -22,12 +22,12 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
 
     if (!e.is<long>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
     const long n = e.get<long>();
 
     if (n < 0)
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected non-negative integer", arg->start, arg->end);
 
     FlatSharedArray::vec_type vec;
 
@@ -53,7 +53,7 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     LValue *lval = arr_lval.get<LValue *>();
 
     if (!lval->is<FlatSharedArray>())
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg0->start, arg0->end);
@@ -81,7 +81,7 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
     LValue *lval = arr_lval.get<LValue *>();
 
     if (!lval->is<FlatSharedArray>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected array", arg->start, arg->end);
 
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg->start, arg->end);
@@ -116,7 +116,7 @@ EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
 
     if (!e.is<FlatSharedArray>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected array", arg->start, arg->end);
 
     const ArrayConstView &view = e.get<FlatSharedArray>().get_view();
 
@@ -173,7 +173,7 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val0 = RValue(arg0->eval(ctx));
 
     if (!val0.is<long>())
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Expected integer", arg0->start, arg0->end);
 
     if (exprList->elems.size() >= 2) {
 
@@ -181,7 +181,7 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
         if (!val1.is<long>())
-            throw TypeErrorEx(arg1->start, arg1->end);
+            throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
         start = val0.get<long>();
         end = val1.get<long>();
@@ -192,12 +192,12 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
             const EvalValue &val2 = RValue(arg2->eval(ctx));
 
             if (!val2.is<long>())
-                throw TypeErrorEx(arg2->start, arg2->end);
+                throw TypeErrorEx("Expected integer", arg2->start, arg2->end);
 
             step = val2.get<long>();
 
             if (step == 0)
-                throw TypeErrorEx(arg2->start, arg2->end);
+                throw TypeErrorEx("Expected integer != 0", arg2->start, arg2->end);
         }
 
     } else {
@@ -245,7 +245,7 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
     EvalValue val0 = RValue(val0_lval);
 
     if (!val0.is<FlatSharedArray>())
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     FlatSharedArray &arr = val0.get<FlatSharedArray>();
 
@@ -284,7 +284,7 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
         if (!val1.is<FlatSharedFuncObj>())
-            throw TypeErrorEx(arg1->start, arg1->end);
+            throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
         FuncObject &funcObj = val1.get<FlatSharedFuncObj>().get();
 
@@ -325,7 +325,7 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
     EvalValue val0 = RValue(val0_lval);
 
     if (!val0.is<FlatSharedArray>())
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     FlatSharedArray &arr = val0.get<FlatSharedArray>();
 
@@ -355,7 +355,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val0 = RValue(arg0->eval(ctx));
 
     if (!val0.is<FlatSharedArray>())
-        throw TypeErrorEx(arg0->start, arg0->end);
+        throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     const FlatSharedArray &arr = val0.get<FlatSharedArray>();
     const ArrayConstView &view = arr.get_view();
@@ -376,7 +376,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
         if (!val1.is<FlatSharedFuncObj>())
-            throw TypeErrorEx(arg1->start, arg1->end);
+            throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
         FuncObject &funcObj = val1.get<FlatSharedFuncObj>().get();
         EvalValue val = eval_func(ctx, funcObj, view[0].get());

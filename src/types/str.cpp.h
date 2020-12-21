@@ -100,7 +100,7 @@ void TypeStr::add(EvalValue &a, const EvalValue &b)
 void TypeStr::mul(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected an integer on the right side");
 
     string new_str;
     const string_view &s = a.get<FlatSharedStr>().get_view();
@@ -119,7 +119,7 @@ void TypeStr::mul(EvalValue &a, const EvalValue &b)
 void TypeStr::lt(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<FlatSharedStr>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
         a.get<FlatSharedStr>().get_view() < b.get<FlatSharedStr>().get_view()
@@ -129,7 +129,7 @@ void TypeStr::lt(EvalValue &a, const EvalValue &b)
 void TypeStr::gt(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<FlatSharedStr>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
         a.get<FlatSharedStr>().get_view() > b.get<FlatSharedStr>().get_view()
@@ -139,7 +139,7 @@ void TypeStr::gt(EvalValue &a, const EvalValue &b)
 void TypeStr::le(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<FlatSharedStr>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
         a.get<FlatSharedStr>().get_view() <= b.get<FlatSharedStr>().get_view()
@@ -149,7 +149,7 @@ void TypeStr::le(EvalValue &a, const EvalValue &b)
 void TypeStr::ge(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<FlatSharedStr>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
         a.get<FlatSharedStr>().get_view() >= b.get<FlatSharedStr>().get_view()
@@ -183,7 +183,7 @@ void TypeStr::noteq(EvalValue &a, const EvalValue &b)
 EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
 {
     if (!idx_val.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected an integer as subscript");
 
     const EvalValue &what = RValue(what_lval);
     const FlatSharedStr &s = what.get<FlatSharedStr>();
@@ -223,7 +223,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
 
     } else if (!start_val.is<NoneVal>()) {
 
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer as range start");
     }
 
     if (end_val.is<long>()) {
@@ -241,7 +241,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
 
     } else if (!end_val.is<NoneVal>()) {
 
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer as range end");
     }
 
     return FlatSharedStr(s, s.offset() + start, end - start);

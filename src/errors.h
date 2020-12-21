@@ -88,6 +88,11 @@ struct RuntimeException : public Exception {
             : RuntimeException(#name, msg, start, end)    \
         { }                                               \
                                                           \
+        name(const char *custom_msg,                      \
+             Loc s = Loc(), Loc e = Loc())                \
+            : RuntimeException(#name, custom_msg, s, e)   \
+        { }                                               \
+                                                          \
         name *clone() const override {                    \
             return new name(*this);                       \
         }                                                 \

@@ -37,7 +37,7 @@ public:
 void TypeInt::add(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() += b.get<long>();
 }
@@ -45,7 +45,7 @@ void TypeInt::add(EvalValue &a, const EvalValue &b)
 void TypeInt::sub(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() -= b.get<long>();
 }
@@ -53,7 +53,7 @@ void TypeInt::sub(EvalValue &a, const EvalValue &b)
 void TypeInt::mul(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() *= b.get<long>();
 }
@@ -61,7 +61,7 @@ void TypeInt::mul(EvalValue &a, const EvalValue &b)
 void TypeInt::div(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     if (b.get<long>() == 0)
         throw DivisionByZeroEx();
@@ -72,7 +72,7 @@ void TypeInt::div(EvalValue &a, const EvalValue &b)
 void TypeInt::mod(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() %= b.get<long>();
 }
@@ -80,7 +80,7 @@ void TypeInt::mod(EvalValue &a, const EvalValue &b)
 void TypeInt::lt(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() = a.get<long>() < b.get<long>();
 }
@@ -88,7 +88,7 @@ void TypeInt::lt(EvalValue &a, const EvalValue &b)
 void TypeInt::gt(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() = a.get<long>() > b.get<long>();
 }
@@ -96,7 +96,7 @@ void TypeInt::gt(EvalValue &a, const EvalValue &b)
 void TypeInt::le(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() = a.get<long>() <= b.get<long>();
 }
@@ -104,7 +104,7 @@ void TypeInt::le(EvalValue &a, const EvalValue &b)
 void TypeInt::ge(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() = a.get<long>() >= b.get<long>();
 }
@@ -141,7 +141,7 @@ void TypeInt::opneg(EvalValue &a)
 void TypeInt::land(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() = a.get<long>() && b.get<long>();
 }
@@ -149,7 +149,7 @@ void TypeInt::land(EvalValue &a, const EvalValue &b)
 void TypeInt::lor(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<long>())
-        throw TypeErrorEx();
+        throw TypeErrorEx("Expected integer on the right side");
 
     a.get<long>() = a.get<long>() || b.get<long>();
 }

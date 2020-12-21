@@ -30,7 +30,7 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
 
     if (!e.is<FlatSharedStr>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     cout << e;
     cout.flush();
@@ -87,7 +87,7 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val = RValue(arg->eval(ctx));
 
     if (!val.is<FlatSharedArray>())
-        throw TypeErrorEx(arg->start, arg->end);
+        throw TypeErrorEx("Expected array", arg->start, arg->end);
 
     const FlatSharedArray::vec_type &vec = val.get<FlatSharedArray>().get_ref();
 

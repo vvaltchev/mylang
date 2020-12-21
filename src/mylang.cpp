@@ -216,6 +216,7 @@ int main(int argc, char **argv)
         parse_args(argc, argv);
 
         ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
+        unique_ptr<Construct> root;
 
         if (opt_show_tokens) {
             cout << "Tokens" << endl;
@@ -228,7 +229,7 @@ int main(int argc, char **argv)
             cout << endl;
         }
 
-        unique_ptr<Construct> root(pBlock(ctx));
+        root = pBlock(ctx);
 
         if (opt_show_syntax_tree) {
             cout << "Syntax tree" << endl;
@@ -272,7 +273,7 @@ int main(int argc, char **argv)
 
     } catch (const Exception &e) {
 
-        cerr << e.name;
+        cerr << e.name << ": " << e.msg;
         dumpLocInError(e);
         return 1;
     }
