@@ -2038,6 +2038,34 @@ static const vector<test> tests =
             "assert(res == \"h_e_l_l_o\");",
         },
     },
+
+    {
+        "Float types work",
+        {
+            "const a = 3.4;",
+            "const b = 1.2;",
+            "const c = a + b;",
+            "assert(str(c, 1) == \"4.6\");",
+            "assert(str(math_pi, 2) == \"3.14\");",
+        },
+    },
+
+    {
+        "Float builtins work",
+        {
+            "const myEPS = 0.000000001;",
+            "assert(sin(0.0) == 0.0);",
+            "assert(cos(0.0) == 1.0);",
+            "assert(str(sin(math_pi/2),3) == \"1.000\");",
+            "assert(str(cos(math_pi/2),3) == \"0.000\");",
+            "assert(abs(sin(math_pi/2) - 1.0) < myEPS);",
+            "assert(abs(cos(math_pi/2) - 0.0) < myEPS);",
+            "assert(abs(round(0.123456789, 0) - 0.0) < myEPS);",
+            "assert(abs(round(0.123456789, 1) - 0.1) < myEPS);",
+            "assert(abs(round(0.123456789, 2) - 0.12) < myEPS);",
+            "assert(abs(round(0.123456789, 3) - 0.123) < myEPS);",
+        },
+    },
 };
 
 static void

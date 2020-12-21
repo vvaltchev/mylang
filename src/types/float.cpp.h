@@ -20,6 +20,7 @@ public:
     void sub(EvalValue &a, const EvalValue &b) override;
     void mul(EvalValue &a, const EvalValue &b) override;
     void div(EvalValue &a, const EvalValue &b) override;
+    void mod(EvalValue &a, const EvalValue &b) override;
     void lt(EvalValue &a, const EvalValue &b) override;
     void gt(EvalValue &a, const EvalValue &b) override;
     void le(EvalValue &a, const EvalValue &b) override;
@@ -66,6 +67,16 @@ void TypeFloat::div(EvalValue &a, const EvalValue &b)
         throw DivisionByZeroEx();
 
     a.get<long double>() /= rhs;
+}
+
+void TypeFloat::mod(EvalValue &a, const EvalValue &b)
+{
+    long double rhs = internal_val_to_float(b);
+
+    if (rhs == 0)
+        throw DivisionByZeroEx();
+
+    a = fmodl(a.get<long double>(), rhs);
 }
 
 void TypeFloat::lt(EvalValue &a, const EvalValue &b)

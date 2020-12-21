@@ -15,6 +15,7 @@
 #include "builtins/generic.cpp.h"
 
 #include <cmath>
+#include <limits>
 
 static const array<FlatSharedStr, Type::t_count> TypeNames =
 {
@@ -159,6 +160,30 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("rpad", builtin_rpad),
     make_const_builtin("float", builtin_float),
 
+    /* Float math funcs */
+    make_const_builtin("exp", builtin_exp),
+    make_const_builtin("exp2", builtin_exp2),
+    make_const_builtin("log", builtin_log),
+    make_const_builtin("log2", builtin_log2),
+    make_const_builtin("log10", builtin_log10),
+    make_const_builtin("sqrt", builtin_sqrt),
+    make_const_builtin("cbrt", builtin_cbrt),
+    make_const_builtin("pow", builtin_pow),
+    make_const_builtin("sin", builtin_sin),
+    make_const_builtin("cos", builtin_cos),
+    make_const_builtin("tan", builtin_tan),
+    make_const_builtin("asin", builtin_asin),
+    make_const_builtin("acos", builtin_acos),
+    make_const_builtin("atan", builtin_atan),
+    make_const_builtin("ceil", builtin_ceil),
+    make_const_builtin("floor", builtin_floor),
+    make_const_builtin("trunc", builtin_trunc),
+    make_const_builtin("isinf", builtin_isinf),
+    make_const_builtin("isfinite", builtin_isfinite),
+    make_const_builtin("isnormal", builtin_isnormal),
+    make_const_builtin("isnan", builtin_isnan),
+    make_const_builtin("round", builtin_round),
+
     /* Numeric constants */
     make_const_builtin("math_e", M_E), /* e */
     make_const_builtin("math_log2e", M_LOG2E), /* log_2 e */
@@ -173,6 +198,9 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("math_2_sqrt_pi", M_2_SQRTPI), /* 2/sqrt(pi) */
     make_const_builtin("math_sqrt2", M_SQRT2), /* sqrt(2) */
     make_const_builtin("math_1_sqrt2", M_SQRT1_2), /* 1/sqrt(2) */
+    make_const_builtin("nan", NAN), /* 1/sqrt(2) */
+    make_const_builtin("inf", INFINITY), /* 1/sqrt(2) */
+    make_const_builtin("eps", numeric_limits<long double>::epsilon()),
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

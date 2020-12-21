@@ -96,7 +96,8 @@ public:
     template <
         class T,
         class = enable_if_t<                      /* SFINAE template param */
-            is_same_v<decay_t<T>, bool>           /* disallow for T != bool */
+            is_same_v<T, bool> ||                 /* disallow for T != bool, int */
+            is_same_v<T, int>
         >
     >
     EvalValue(T val)
