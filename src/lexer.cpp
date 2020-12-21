@@ -100,176 +100,238 @@ ostream &operator<<(ostream &s, const Tok &t)
     return s;
 }
 
-static void
-append_token(vector<Tok> &result, TokType tt, int ln, int start, string_view val)
+struct lexer_ctx {
+
+    /* Input params */
+    const string_view in_str;
+    vector<Tok> &result;
+    const int line;
+
+    /* State variables */
+    unsigned i = 0;
+    unsigned tok_start = 0;
+    bool float_exp = false;
+    TokType tok_type = TokType::invalid;
+
+    lexer_ctx(const string_view &in_str, int line, vector<Tok> &result)
+        : in_str(in_str)
+        , result(result)
+        , line(line)
+    { }
+
+    void accept_token();
+    void invalid_token();
+
+    void handle_in_str();
+    void handle_space_or_op();
+    void handle_alphanum();
+    void handle_other();
+};
+
+void
+lexer_ctx::invalid_token()
 {
-    if (tt == TokType::id) {
+    throw InvalidTokenEx(in_str.substr(tok_start, i - tok_start + 1));
+}
+
+void
+lexer_ctx::accept_token()
+{
+    const string_view &val = in_str.substr(tok_start, i - tok_start);
+
+    if (tok_type == TokType::id) {
 
         Keyword kw = get_keyword(val);
 
         if (kw != Keyword::kw_invalid) {
-            result.emplace_back(TokType::kw, Loc(ln, start + 1), kw);
+            result.emplace_back(TokType::kw, Loc(line, tok_start + 1), kw);
             return;
         }
     }
 
     result.emplace_back(
-        tt,
-        Loc(ln, start + 1),
+        tok_type,
+        Loc(line, tok_start + 1),
         val
     );
 }
 
 void
-lexer(string_view in_str, int line, vector<Tok> &result)
+lexer_ctx::handle_in_str()
 {
-    size_t i, tok_start = 0;
-    TokType tok_type = TokType::invalid;
-    bool float_exp;
+    const char c = in_str[i];
 
-    for (i = 0; i < in_str.length(); i++) {
+    if (c == '"') {
 
-        const char c = in_str[i];
+        accept_token();
+        tok_type = TokType::invalid;
 
-        if (tok_type == TokType::str) {
+    } else if (c == '\\') {
 
-            if (c == '"') {
+        if (i == in_str.length() - 1)
+            invalid_token();
 
-                append_token(result,
-                             TokType::str,
-                             line,
-                             tok_start,
-                             in_str.substr(tok_start, i - tok_start));
+        if (in_str[i + 1] == '"')
+            i++; /* ignore \" instead of ending the token */
+    }
+}
 
-                tok_type = TokType::invalid;
+void
+lexer_ctx::handle_space_or_op()
+{
+    const char c = in_str[i];
 
-            } else if (c == '\\') {
+    if (tok_type != TokType::invalid) {
 
-                if (i == in_str.length() - 1)
-                    throw InvalidTokenEx{in_str.substr(tok_start, 1 + i - tok_start)};
+        accept_token();
+        tok_type = TokType::invalid;
+    }
 
-                if (in_str[i + 1] == '"') {
-                    i++; /* ignore \" instead of ending the token */
-                }
-            }
+    if (!isspace(c)) {
 
-            continue;
+        string_view op = in_str.substr(i, 1);
+
+        if (i + 1 < in_str.length() && is_operator(in_str.substr(i, 2)))
+        {
+            /*
+                * Handle two-chars wide operators. Note: it is required,
+                * with the current implementation, an 1-char prefix operator to
+                * exist for each one of them. For example:
+                *
+                *      <= requires '<' to exist independently
+                *      += requires '+' to exist independently
+                *
+                * Reason: the check `is_operator(string_view(&c, 1))` above.
+                */
+            op = in_str.substr(i, 2);
+            i++;
         }
 
-        if (c == '#')
-            break; /* comment: stop the lexer, until the end of the line */
+        result.emplace_back(TokType::op, Loc(line, i+1), get_op_type(op));
+    }
+}
 
-        if (tok_type == TokType::invalid) {
+void
+lexer_ctx::handle_alphanum()
+{
+    const char c = in_str[i];
 
-            tok_start = i;
+    if (tok_type == TokType::invalid) {
 
-            if (c == '"') {
-                tok_type = TokType::str;
-                tok_start++;
-                continue;
-            }
+        tok_start = i;
+
+        if (isdigit(c))
+            tok_type = TokType::integer;
+        else if (c == '.')
+            tok_type = TokType::floatnum;
+        else
+            tok_type = TokType::id;
+
+    } else if (tok_type == TokType::integer) {
+
+        if (c == '.' || c == 'e') {
+
+            tok_type = TokType::floatnum;
+            float_exp = c == 'e';
+
+        } else {
+
+            if (!isdigit(c))
+                invalid_token();
         }
 
-        const string_view val = in_str.substr(tok_start, i - tok_start + 1);
+    } else if (tok_type == TokType::floatnum) {
 
-        if (isspace(c) || is_operator(string_view(&c, 1))) {
+        if (c == 'e') {
 
-            if (tok_type != TokType::invalid) {
+            if (!float_exp) {
 
-                append_token(result,
-                             tok_type,
-                             line,
-                             tok_start,
-                             in_str.substr(tok_start, i - tok_start));
+                float_exp = true;
 
-                tok_type = TokType::invalid;
-            }
+            } else {
 
-            if (!isspace(c)) {
-
-                string_view op = in_str.substr(i, 1);
-
-                if (i + 1 < in_str.length() && is_operator(in_str.substr(i, 2)))
-                {
-                    /*
-                     * Handle two-chars wide operators. Note: it is required,
-                     * with the current implementation, an 1-char prefix operator to
-                     * exist for each one of them. For example:
-                     *
-                     *      <= requires '<' to exist independently
-                     *      += requires '+' to exist independently
-                     *
-                     * Reason: the check `is_operator(string_view(&c, 1))` above.
-                     */
-                    op = in_str.substr(i, 2);
-                    i++;
-                }
-
-                result.emplace_back(TokType::op, Loc(line, i+1), get_op_type(op));
-            }
-
-        } else if (isalnum(c) || c == '_' || c == '.') {
-
-            if (tok_type == TokType::invalid) {
-
-                tok_start = i;
-
-                if (isdigit(c))
-                    tok_type = TokType::integer;
-                else if (c == '.')
-                    tok_type = TokType::floatnum;
-                else
-                    tok_type = TokType::id;
-
-            } else if (tok_type == TokType::integer) {
-
-                if (c == '.' || c == 'e') {
-
-                    tok_type = TokType::floatnum;
-                    float_exp = c == 'e';
-
-                } else {
-
-                    if (!isdigit(c))
-                        throw InvalidTokenEx(val);
-                }
-
-            } else if (tok_type == TokType::floatnum) {
-
-                if (c == 'e') {
-
-                    if (!float_exp) {
-
-                        float_exp = true;
-
-                    } else {
-
-                        throw InvalidTokenEx(val);
-                    }
-
-                } else {
-
-                    if (!isdigit(c))
-                        throw InvalidTokenEx(val);
-                }
+                invalid_token();
             }
 
         } else {
 
-            if (tok_type != TokType::invalid)
-                throw InvalidTokenEx(val);
+            if (!isdigit(c))
+                invalid_token();
+        }
+    }
+}
 
+void
+lexer_ctx::handle_other()
+{
+    const char c = in_str[i];
+
+    if (tok_type == TokType::invalid) {
+
+        if (c == '"') {
+
+            /* Start a string token */
+            tok_type = TokType::str;
+            tok_start++;
+
+        } else {
+
+            /* Start token of unknown type */
             tok_start = i;
             tok_type = TokType::unknown;
         }
+
+    } else {
+
+        /*
+         * When we have a valid token, we should never get here in valid
+         * programs. When this happens, it means that we hit an invalid token
+         * (e.g. abc$): until the prev. char (abc) it was a valid ID, then we
+         * hit "$" and that's made the whole token invalid.
+         */
+        invalid_token();
+    }
+}
+
+void
+lexer(string_view in_str, int line, vector<Tok> &result)
+{
+    lexer_ctx ctx(in_str, line, result);
+
+    for (ctx.i = 0; ctx.i < in_str.length(); ctx.i++) {
+
+        const char c = in_str[ctx.i];
+
+        if (ctx.tok_type == TokType::str) {
+
+            ctx.handle_in_str();
+
+        } else {
+
+            if (c == '#')
+                break; /* comment: stop the lexer, until the end of the line */
+
+            if (ctx.tok_type == TokType::invalid)
+                ctx.tok_start = ctx.i;
+
+            if (isspace(c) || is_operator(string_view(&c, 1)))
+                ctx.handle_space_or_op();
+            else if (isalnum(c) || c == '_' || c == '.')
+                ctx.handle_alphanum();
+            else
+                ctx.handle_other();
+        }
     }
 
-    if (tok_type != TokType::invalid) {
+    if (ctx.tok_type != TokType::invalid) {
 
-        append_token(result,
-                     tok_type,
-                     line,
-                     tok_start,
-                     in_str.substr(tok_start, i - tok_start));
+        if (ctx.tok_type == TokType::str) {
+            /* This happens in case of an unterminated string literal */
+            assert(ctx.tok_start > 0);
+            ctx.tok_start--; /* Include " in the invalid token */
+            ctx.invalid_token();
+        }
+
+        ctx.accept_token();
     }
 }
