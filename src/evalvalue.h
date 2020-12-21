@@ -89,18 +89,31 @@ public:
     EvalValue()
         : val(), type(AllTypes[Type::t_none]) { }
 
-    EvalValue(bool val)
+    /*
+     * Constructor accepting bool. SFINAE is used to prevent implicit
+     * conversions from pointer types.
+     */
+    template <
+        class T,
+        class = enable_if_t<                      /* SFINAE template param */
+            is_same_v<decay_t<T>, bool>           /* disallow for T != bool */
+        >
+    >
+    EvalValue(T val)
         : val(static_cast<long>(val)), type(AllTypes[Type::t_int]) { }
 
+    /*
+     * Constructor accepting ONLY known types defined in enum TypeE.
+     */
     template <
         class T,                                  /* actual template param */
-        class U = typename remove_const<          /* helper template param */
-            typename remove_reference<T>::type
-        >::type,
-        class S = typename enable_if<             /* SFINAE template param */
-            !is_same<U, EvalValue>::value &&      /* disallow EvalValue */
+        class U = remove_const_t<                 /* helper template param */
+            remove_reference_t<T>
+        >,
+        class = enable_if_t<                      /* SFINAE template param */
+            !is_same_v<U, EvalValue> &&           /* disallow EvalValue */
             TypeToEnum<U>::val != Type::t_count   /* disallow types not in TypeToEnum */
-        >::type
+        >
     >
     EvalValue(T &&val);
 
@@ -123,6 +136,7 @@ public:
         static_assert(offsetof(ValueU, undef) == 0);
         static_assert(offsetof(ValueU, ival) == 0);
         static_assert(offsetof(ValueU, bfunc) == 0);
+        static_assert(offsetof(ValueU, ldval) == 0);
         static_assert(offsetof(ValueU, str) == 0);
         static_assert(offsetof(ValueU, func) == 0);
         static_assert(offsetof(ValueU, arr) == 0);
@@ -218,7 +232,7 @@ inline EvalValue::EvalValue(T &&new_val)
 {
     if constexpr(static_cast<Type::TypeE>(TypeToEnum<U>::val) >= Type::t_str) {
 
-        if constexpr(is_lvalue_reference<T>::value) {
+        if constexpr(is_lvalue_reference_v<T>) {
 
             type->copy_ctor(
                 reinterpret_cast<void *>( &val ),
