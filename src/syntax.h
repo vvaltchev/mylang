@@ -173,6 +173,21 @@ public:
     void serialize(ostream &s, int level = 0) const override;
 };
 
+class LiteralFloat final: public Literal {
+
+    const long double value;
+
+public:
+
+    LiteralFloat(long double v) : value(v) { }
+
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
+        return value;
+    }
+
+    void serialize(ostream &s, int level = 0) const override;
+};
+
 class LiteralNone final: public Literal {
 
 public:

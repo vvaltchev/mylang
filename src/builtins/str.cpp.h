@@ -11,27 +11,6 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
-EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
-{
-    if (exprList->elems.size() != 1)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
-
-    if (!val.is<FlatSharedStr>())
-        throw TypeErrorEx(arg->start, arg->end);
-
-    try {
-
-        return stol(string(val.get<FlatSharedStr>().get_view()));
-
-    } catch (...) {
-
-        throw TypeErrorEx(arg->start, arg->end);
-    }
-}
-
 EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 2)

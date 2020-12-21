@@ -7,11 +7,14 @@
 #include "types/func.cpp.h"
 #include "types/arr.cpp.h"
 #include "types/exception.cpp.h"
+#include "types/float.cpp.h"
 #include "builtins/str.cpp.h"
 #include "builtins/io.cpp.h"
 #include "builtins/num.cpp.h"
 #include "builtins/arr.cpp.h"
 #include "builtins/generic.cpp.h"
+
+#include <cmath>
 
 static const array<FlatSharedStr, Type::t_count> TypeNames =
 {
@@ -20,6 +23,7 @@ static const array<FlatSharedStr, Type::t_count> TypeNames =
     string(),
     string("int"),
     string("builtin"),
+    string("float"),
     string("str"),
     string("func"),
     string("arr"),
@@ -87,11 +91,15 @@ EvalValue builtin_exdata(EvalContext *ctx, ExprList *exprList)
 
 const array<Type *, Type::t_count> AllTypes =
 {
+    /* Trivial types */
     new TypeNone(),
     new Type(Type::t_lval),       /* internal type: not visible from outside */
     new Type(Type::t_undefid),    /* internal type: not visible from outside */
     new TypeInt(),
     new TypeBuiltin(),
+    new TypeFloat(),
+
+    /* Non-trivial types */
     new TypeStr(),
     new TypeFunc(),
     new TypeArr(),
@@ -111,6 +119,11 @@ const EvalValue empty_arr = FlatSharedArray(vector<LValue>());
 inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
 {
     return make_pair(name, LValue(Builtin{f}, true));
+}
+
+inline auto make_const_builtin(const char *name, long double val)
+{
+    return make_pair(name, LValue(val, true));
 }
 
 inline auto make_builtin(const char *name, decltype(Builtin::func) f)
@@ -144,6 +157,22 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("sum", builtin_sum),
     make_const_builtin("lpad", builtin_lpad),
     make_const_builtin("rpad", builtin_rpad),
+    make_const_builtin("float", builtin_float),
+
+    /* Numeric constants */
+    make_const_builtin("math_e", M_E), /* e */
+    make_const_builtin("math_log2e", M_LOG2E), /* log_2 e */
+    make_const_builtin("math_log10e", M_LOG10E), /* log_10 e */
+    make_const_builtin("math_ln2", M_LN2), /* log_e 2 */
+    make_const_builtin("math_ln10", M_LN10), /* log_e 10 */
+    make_const_builtin("math_pi", M_PI), /* pi */
+    make_const_builtin("math_pi2", M_PI_2), /* pi/2 */
+    make_const_builtin("math_pi4", M_PI_4), /* pi/4 */
+    make_const_builtin("math_1_pi", M_1_PI), /* 1/pi */
+    make_const_builtin("math_2_pi", M_2_PI), /* 2/pi */
+    make_const_builtin("math_2_sqrt_pi", M_2_SQRTPI), /* 2/sqrt(pi) */
+    make_const_builtin("math_sqrt2", M_SQRT2), /* sqrt(2) */
+    make_const_builtin("math_1_sqrt2", M_SQRT1_2), /* 1/sqrt(2) */
 };
 
 const EvalContext::SymbolsType EvalContext::builtins =

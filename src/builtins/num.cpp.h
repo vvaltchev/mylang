@@ -11,6 +11,74 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
+#include <cmath>
+
+EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (val.is<long>()) {
+
+        return val;
+
+    } else if (val.is<long double>()) {
+
+        return static_cast<long>(val.get<long double>());
+
+    } else if (val.is<FlatSharedStr>()) {
+
+        try {
+
+            return stol(string(val.get<FlatSharedStr>().get_view()));
+
+        } catch (...) {
+
+            throw TypeErrorEx(arg->start, arg->end);
+        }
+
+    } else {
+
+        throw TypeErrorEx(arg->start, arg->end);
+    }
+}
+
+EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (val.is<long double>()) {
+
+        return val;
+
+    } else if (val.is<long>()) {
+
+        return static_cast<long double>(val.get<long>());
+
+    } else if (val.is<FlatSharedStr>()) {
+
+        try {
+
+            return stold(string(val.get<FlatSharedStr>().get_view()));
+
+        } catch (...) {
+
+            throw TypeErrorEx(arg->start, arg->end);
+        }
+
+    } else {
+
+        throw TypeErrorEx(arg->start, arg->end);
+    }
+}
+
 EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
@@ -19,11 +87,19 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (!e.is<long>())
-        throw TypeErrorEx(arg->start, arg->end);
+    if (e.is<long>()) {
 
-    const long val = e.get<long>();
-    return val >= 0 ? val : -val;
+        const long val = e.get<long>();
+        return val >= 0 ? val : -val;
+
+    } else if (e.is<long double>()) {
+
+        return fabsl(e.get<long double>());
+
+    } else {
+
+        throw TypeErrorEx(arg->start, arg->end);
+    }
 }
 
 template <bool is_max>

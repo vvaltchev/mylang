@@ -28,6 +28,7 @@ public:
         t_undefid,
         t_int,
         t_builtin,
+        t_float,
 
         /* Non-trivial types */
         t_str,

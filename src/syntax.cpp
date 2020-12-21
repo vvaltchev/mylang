@@ -181,6 +181,16 @@ void LiteralInt::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void LiteralFloat::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << string("Float(");
+    s << to_string(value);
+    s << ")";
+}
+
 void LiteralNone::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

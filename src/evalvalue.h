@@ -45,6 +45,7 @@ template <> struct TypeToEnum<LValue *> { enum { val = Type::t_lval }; };
 template <> struct TypeToEnum<UndefinedId> { enum { val = Type::t_undefid }; };
 template <> struct TypeToEnum<long> { enum { val = Type::t_int }; };
 template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
+template <> struct TypeToEnum<long double> { enum { val = Type::t_float }; };
 template <> struct TypeToEnum<FlatSharedStr> { enum { val = Type::t_str }; };
 template <> struct TypeToEnum<FlatSharedFuncObj> { enum { val = Type::t_func }; };
 template <> struct TypeToEnum<FlatSharedArray> { enum { val = Type::t_arr }; };
@@ -60,6 +61,7 @@ class EvalValue final {
         UndefinedId undef;
         long ival;
         Builtin bfunc;
+        long double ldval;
 
         /* non-trivial types */
         FlatSharedStr str;
@@ -72,6 +74,7 @@ class EvalValue final {
         ValueU(const UndefinedId &val) : undef(val) { }
         ValueU(long val) : ival(val) { }
         ValueU(const Builtin &val) : bfunc(val) { }
+        ValueU(long double val) : ldval(val) { }
     };
 
 
@@ -87,7 +90,7 @@ public:
         : val(), type(AllTypes[Type::t_none]) { }
 
     EvalValue(bool val)
-        : val(val), type(AllTypes[Type::t_int]) { }
+        : val(static_cast<long>(val)), type(AllTypes[Type::t_int]) { }
 
     template <
         class T,                                  /* actual template param */

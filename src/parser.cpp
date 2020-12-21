@@ -110,6 +110,25 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 }
 
 bool
+pAcceptLiteralFloat(ParseContext &c, unique_ptr<Construct> &v)
+{
+    const Loc start = c.get_loc();
+
+    if (*c == TokType::floatnum) {
+
+        const string s(c.get_str());
+
+        v.reset(new LiteralFloat(stold(s)));
+        v->start = start;
+        v->end = c.get_loc() + (s.length() + 1);
+        c++;
+        return true;
+    }
+
+    return false;
+}
+
+bool
 pAcceptLiteralStr(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::str) {
@@ -376,6 +395,10 @@ pExpr01(ParseContext &c, unsigned fl)
     if (pAcceptLiteralInt(c, main)) {
 
         return main;     /* Not subscriptable, nor callable */
+
+    } else if (pAcceptLiteralFloat(c, main)) {
+
+        return main;
 
     } else if (pAcceptKeyword(c, Keyword::kw_none)) {
 
@@ -1067,6 +1090,11 @@ MakeConstructFromConstVal(const EvalValue &v,
 {
     if (v.is<long>()) {
         out = make_unique<LiteralInt>(v.get<long>());
+        return true;
+    }
+
+    if (v.is<long double>()) {
+        out = make_unique<LiteralFloat>(v.get<long double>());
         return true;
     }
 
