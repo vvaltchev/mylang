@@ -107,9 +107,9 @@ public:
 
     EvalValue(const EvalValue &other);
     EvalValue(EvalValue &&other);
+
     EvalValue &operator=(const EvalValue &other);
     EvalValue &operator=(EvalValue &&other);
-
     ~EvalValue();
 
     Type *get_type() const {

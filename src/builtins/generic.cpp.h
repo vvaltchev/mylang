@@ -32,11 +32,46 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
 
 EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
 {
-    if (exprList->elems.size() != 1)
+    if (exprList->elems.size() < 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    Construct *arg0 = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg0->eval(ctx));
+
+    if (e.is<FlatSharedStr>()) {
+
+        return e;
+
+    } else if (e.is<long double>()) {
+
+        if (exprList->elems.size() > 2)
+            throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+        if (exprList->elems.size() == 2) {
+
+            Construct *arg1 = exprList->elems[1].get();
+            const EvalValue &p = RValue(arg1->eval(ctx));
+
+            if (!p.is<long>() || p.get<long>() < 0 || p.get<long>() > 64) {
+
+                throw TypeErrorEx(
+                    "Expected an integer in the range [0, 64]",
+                    arg1->start,
+                    arg1->end
+                );
+            }
+
+            char buf[80];
+            const int precision = static_cast<int>(p.get<long>());
+            snprintf(buf, sizeof(buf), "%.*Lf", precision, e.get<long double>());
+            return FlatSharedStr(string(buf));
+        }
+
+    } else {
+
+        if (exprList->elems.size() > 1)
+            throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+    }
 
     return FlatSharedStr(e.get_type()->to_string(e));
 }
