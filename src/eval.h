@@ -23,7 +23,7 @@ public:
                 bool const_ctx = false,
                 bool func_ctx = false);
 
-    static const SymbolsType builtins;
+    static SymbolsType builtins;
     static const SymbolsType const_builtins;
 };
 

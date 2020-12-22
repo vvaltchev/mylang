@@ -205,7 +205,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("eps", numeric_limits<long double>::epsilon()),
 };
 
-const EvalContext::SymbolsType EvalContext::builtins =
+EvalContext::SymbolsType EvalContext::builtins =
 {
     make_builtin("assert", builtin_assert),
     make_builtin("exit", builtin_exit),
