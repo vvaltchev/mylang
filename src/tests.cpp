@@ -2066,6 +2066,16 @@ static const vector<test> tests =
             "assert(abs(round(0.123456789, 3) - 0.123) < myEPS);",
         },
     },
+
+    {
+        "Allow sorting of const arrays without side-effect",
+        {
+            "const a = [3,2,1];",
+            "const b = sort(a);",
+            "assert(a == [3,2,1]);",
+            "assert(b == [1,2,3]);",
+        },
+    },
 };
 
 static void

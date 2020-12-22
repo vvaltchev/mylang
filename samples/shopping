@@ -2,22 +2,23 @@
 # A simple interactive program
 #
 
-const products =
+const unsorted_products =
 [
-    ["Egg", 2],
-    ["Milk", 3],
-    ["Yogurt", 1],
-    ["Tea", 10],
-    ["Coffee", 15]
+    ["Milk", 3.0],
+    ["Egg", 2.0],
+    ["Yogurt", 1.0],
+    ["Tea", 10.0],
+    ["Coffee", 15.0],
+    ["Banana", 4.0]
 ];
 
+var products = sort(unsorted_products, func (a, b) => a[0] < b[0]);
 var shopping_list = [];
 
 func dump_products() {
 
-    foreach(var i, name, price in indexed products) {
-        print(str(i) + ") " + rpad(name, 15) + " " + price);
-    }
+    foreach(var i, name, price in indexed products)
+        print(str(i) + ") " + rpad(name, 15) + " " + lpad(str(price, 2), 5));
 }
 
 func read_quantity(pnum) {
@@ -29,7 +30,7 @@ func read_quantity(pnum) {
 
         try {
 
-            return int(input);
+            return float(input);
 
         } catch {
 
@@ -83,16 +84,24 @@ print();
 print("Shopping list");
 print("-" * 40);
 
-var total = 0;
+var total = 0.0;
 
 foreach (var pnum, q in shopping_list) {
+
     var name, price = products[pnum];
     var subtotal = price * q;
-    print(rpad(name, 15) + ": $" + price + " x " + q + " = $" + subtotal);
+
+    print(
+        rpad(name, 15)
+        + ": $" + str(price, 2)
+        + " x " + str(q, 2)
+        + " = $" + str(subtotal, 2)
+    );
+
     total += subtotal;
 }
 
 print("-" * 40);
-print(rpad("Total", 15) + ": $" + total);
+print(rpad("Total", 15) + ": $" + str(total, 2));
 
 

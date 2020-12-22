@@ -247,6 +247,11 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
     if (!val0.is<FlatSharedArray>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
+    if (val0_lval.is<LValue *>()) {
+        if (val0_lval.get<LValue *>()->is_const_var())
+            val0 = val0.clone();
+    }
+
     FlatSharedArray &arr = val0.get<FlatSharedArray>();
 
     if (arr.is_slice()) {
