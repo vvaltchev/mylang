@@ -397,7 +397,6 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
     }
 }
 
-
 EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 2)
@@ -425,6 +424,36 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
             eval_func(ctx, funcObj, view[i].get()),
             ctx->const_ctx
         );
+    }
+
+    return FlatSharedArray(move(result));
+}
+
+EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidArgumentEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue &val1 = RValue(arg1->eval(ctx));
+
+    if (!val0.is<FlatSharedFuncObj>())
+        throw TypeErrorEx("Expected function", arg0->start, arg0->end);
+
+    if (!val1.is<FlatSharedArray>())
+        throw TypeErrorEx("Expected array", arg1->start, arg1->end);
+
+    FuncObject &funcObj = val0.get<FlatSharedFuncObj>().get();
+    const ArrayConstView &view = val1.get<FlatSharedArray>().get_view();
+
+    FlatSharedArray::vec_type result;
+
+    for (unsigned i = 0; i < view.size(); i++) {
+
+        if (eval_func(ctx, funcObj, view[i].get()).is_true())
+            result.emplace_back(view[i].get(), ctx->const_ctx);
     }
 
     return FlatSharedArray(move(result));

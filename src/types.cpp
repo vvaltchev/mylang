@@ -160,6 +160,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("rpad", builtin_rpad),
     make_const_builtin("float", builtin_float),
     make_const_builtin("map", builtin_map),
+    make_const_builtin("filter", builtin_filter),
 
     /* Float math funcs */
     make_const_builtin("exp", builtin_exp),

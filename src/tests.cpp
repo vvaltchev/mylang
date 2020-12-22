@@ -2126,11 +2126,20 @@ static const vector<test> tests =
     },
 
     {
-        "Builtin() map",
+        "Builtin map()",
         {
             "const a = [1,2,3];",
             "const b = map(pure func(x) => x*2, a);",
             "assert(b == [2,4,6]);",
+        }
+    },
+
+    {
+        "Builtin filter()",
+        {
+            "const a = [1,2,3,4,5];",
+            "const b = filter(pure func(x) => !(x%2), a);",
+            "assert(b == [2,4]);",
         }
     },
 };
