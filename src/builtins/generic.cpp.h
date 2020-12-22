@@ -148,13 +148,13 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &arr_lval = arg0->eval(ctx);
+    const EvalValue &container_lval = arg0->eval(ctx);
     const EvalValue &index_val = RValue(arg1->eval(ctx));
 
-    if (!arr_lval.is<LValue *>())
+    if (!container_lval.is<LValue *>())
         throw NotLValueEx(arg0->start, arg0->end);
 
-    LValue *lval = arr_lval.get<LValue *>();
+    LValue *lval = container_lval.get<LValue *>();
 
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg0->start, arg0->end);
@@ -169,6 +169,47 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
         return builtin_erase_arr(lval, index_val.get<long>());
+
+    } else {
+
+        throw TypeErrorEx(
+            "Unsupported container type by erase()",
+            arg0->start,
+            arg0->end
+        );
+    }
+}
+
+EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 3)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    Construct *arg2 = exprList->elems[2].get();
+    const EvalValue &container_lval = arg0->eval(ctx);
+    const EvalValue &index_val = RValue(arg1->eval(ctx));
+    const EvalValue &val = RValue(arg2->eval(ctx));
+
+    if (!container_lval.is<LValue *>())
+        throw NotLValueEx(arg0->start, arg0->end);
+
+    LValue *lval = container_lval.get<LValue *>();
+
+    if (lval->is_const_var())
+        throw CannotChangeConstEx(arg0->start, arg0->end);
+
+    if (lval->is<FlatSharedDictObj>()) {
+
+        return builtin_insert_dict(lval, index_val, val);
+
+    } else if (lval->is<FlatSharedArray>()) {
+
+        if (!index_val.is<long>())
+            throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
+
+        return builtin_insert_arr(lval, index_val.get<long>(), val);
 
     } else {
 

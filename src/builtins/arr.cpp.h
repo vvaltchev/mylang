@@ -137,6 +137,9 @@ EvalValue builtin_erase_arr(LValue *lval, long index)
     if (index < 0)
         throw OutOfBoundsEx();
 
+    if (index >= view.size())
+        throw OutOfBoundsEx();
+
     if (arr.is_slice()) {
 
         if (index == 0) {
@@ -158,6 +161,32 @@ EvalValue builtin_erase_arr(LValue *lval, long index)
 
         arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
         arr.get_ref().erase(arr.get_ref().begin() + arr.offset() + index);
+    }
+
+    return true;
+}
+
+EvalValue builtin_insert_arr(LValue *lval, long index, const EvalValue &val)
+{
+    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
+    const ArrayConstView &view = arr.get_view();
+
+    if (index < 0)
+        throw OutOfBoundsEx();
+
+    if (index > view.size())
+        throw OutOfBoundsEx();
+
+    if (arr.is_slice()) {
+
+        arr.clone_internal_vec();
+        arr.get_ref().insert(arr.get_ref().begin() + index, LValue(val, false));
+        lval->put(FlatSharedArray(arr));
+
+    } else {
+
+        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
+        arr.get_ref().insert(arr.get_ref().begin() + index, LValue(val, false));
     }
 
     return true;

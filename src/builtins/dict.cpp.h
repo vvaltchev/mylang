@@ -33,6 +33,15 @@ builtin_erase_dict(LValue *lval, const EvalValue &key)
     return data.erase(key) > 0;
 }
 
+EvalValue
+builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
+{
+    DictObject &dictObj = lval->getval<FlatSharedDictObj>().get();
+    DictObject::inner_type &data = dictObj.get_ref();
+    const auto &it = data.insert(make_pair(key, LValue(val, false)));
+    return it.second;
+}
+
 static EvalValue
 dict_keys(const DictObject::inner_type &data)
 {

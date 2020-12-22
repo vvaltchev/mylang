@@ -2200,6 +2200,66 @@ static const vector<test> tests =
             "assert(r == {\"a\" : 3});",
         },
     },
+
+    {
+        "insert() builtin on arrays, begin",
+        {
+            "var arr = [1,2,3];",
+            "insert(arr, 0, 99);",
+            "assert(arr == [99,1,2,3]);",
+        },
+    },
+
+    {
+        "insert() builtin on arrays, middle",
+        {
+            "var arr = [1,2,3];",
+            "insert(arr, 1, 99);",
+            "assert(arr == [1,99,2,3]);",
+        },
+    },
+
+    {
+        "insert() builtin on arrays, end",
+        {
+            "var arr = [1,2,3];",
+            "insert(arr, 2, 99);",
+            "assert(arr == [1,2,99,3]);",
+        },
+    },
+
+    {
+        "insert() builtin on arrays, past-end",
+        {
+            "var arr = [1,2,3];",
+            "insert(arr, 3, 99);",
+            "assert(arr == [1,2,3,99]);",
+        },
+    },
+
+    {
+        "insert() builtin on arrays, past-end + 1",
+        {
+            "var arr = [1,2,3];",
+            "insert(arr, 4, 99);",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
+        "insert() builtin on dict",
+        {
+            "var d = {\"a\": 3, \"b\": 5};",
+            "var r = insert(d, \"a\", 99);",
+            "assert(!r);",
+            "assert(len(d) == 2);",
+            "r = insert(d, \"c\", 99);",
+            "assert(len(d) == 3);",
+            "var p = kvpairs(d);",
+            "sort(p, func(a,b) => a[0] < b[0]);",
+            "assert(p == [[\"a\",3],[\"b\",5],[\"c\",99]]);",
+        },
+    },
 };
 
 static void
