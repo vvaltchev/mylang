@@ -2124,6 +2124,15 @@ static const vector<test> tests =
         },
         &typeid(UndefinedVariableEx)
     },
+
+    {
+        "Builtin() map",
+        {
+            "const a = [1,2,3];",
+            "const b = map(pure func(x) => x*2, a);",
+            "assert(b == [2,4,6]);",
+        }
+    },
 };
 
 static void
