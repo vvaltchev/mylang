@@ -2142,6 +2142,64 @@ static const vector<test> tests =
             "assert(b == [2,4]);",
         }
     },
+
+    {
+        "Dict type",
+        {
+            "var e = {};",
+            "assert(len(e) == 0);",
+            "var d = {\"a\": 3, \"b\": 5};",
+            "assert(len(d) == 2);",
+            "assert(d[\"a\"] == 3);",
+            "assert(d[\"b\"] == 5);",
+            "d[\"a\"] = 33;",
+            "assert(d == {\"a\": 33, \"b\": 5});",
+            "var d2 = d;",
+            "assert(intptr(d) == intptr(d2));",
+            "var r = erase(d, \"aaa\");",
+            "assert(!r);",
+            "r = erase(d, \"a\");",
+            "assert(r);",
+            "assert(d == {\"b\": 5});",
+        },
+    },
+
+    {
+        "Dict keys(), values() and kvpairs()",
+        {
+            "var d = {\"a\": 3, \"b\": 5};",
+            "var k = keys(d);",
+            "assert(len(k) == 2);",
+            "sort(k);",
+            "assert(k == [\"a\", \"b\"]);",
+            "var v = values(d);",
+            "sort(v);",
+            "assert(v == [3,5]);",
+            "var kv = kvpairs(d);",
+            "assert(len(kv) == 2);",
+            "sort(kv, func (a, b) => a[0] < b[0]);",
+            "assert(kv == [[\"a\", 3], [\"b\", 5]]);",
+        },
+    },
+
+    {
+        "map() on dict",
+        {
+            "var d = {\"a\": 3, \"b\": 5};",
+            "var r = map(func (k,v) => str(k)+str(v), d);",
+            "sort(r);",
+            "assert(r == [\"a3\", \"b5\"]);",
+        },
+    },
+
+    {
+        "filter() on dict",
+        {
+            "var d = {\"a\": 3, \"b\": 5};",
+            "var r = filter(func (k,v) => v <= 3, d);",
+            "assert(r == {\"a\" : 3});",
+        },
+    },
 };
 
 static void

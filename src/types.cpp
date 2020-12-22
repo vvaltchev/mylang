@@ -8,10 +8,12 @@
 #include "types/arr.cpp.h"
 #include "types/exception.cpp.h"
 #include "types/float.cpp.h"
+#include "types/dict.cpp.h"
 #include "builtins/str.cpp.h"
 #include "builtins/io.cpp.h"
 #include "builtins/num.cpp.h"
 #include "builtins/arr.cpp.h"
+#include "builtins/dict.cpp.h"
 #include "builtins/generic.cpp.h"
 
 #include <cmath>
@@ -29,6 +31,7 @@ static const array<FlatSharedStr, Type::t_count> TypeNames =
     string("func"),
     string("arr"),
     string("exception"),
+    string("dict"),
 };
 
 EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
@@ -105,6 +108,7 @@ const array<Type *, Type::t_count> AllTypes =
     new TypeFunc(),
     new TypeArr(),
     new TypeException(),
+    new TypeDict(),
 };
 
 
@@ -161,6 +165,10 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("float", builtin_float),
     make_const_builtin("map", builtin_map),
     make_const_builtin("filter", builtin_filter),
+    make_const_builtin("hash", builtin_hash),
+    make_const_builtin("keys", builtin_keys),
+    make_const_builtin("values", builtin_values),
+    make_const_builtin("kvpairs", builtin_kvpairs),
 
     /* Float math funcs */
     make_const_builtin("exp", builtin_exp),

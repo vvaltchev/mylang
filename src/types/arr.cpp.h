@@ -114,8 +114,10 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
 
     const FlatSharedArray &lhs = a.get<FlatSharedArray>();
     const FlatSharedArray &rhs = b.get<FlatSharedArray>();
+    const ArrayConstView &lhs_view = lhs.get_view();
+    const ArrayConstView &rhs_view = rhs.get_view();
 
-    if (lhs.size() != rhs.size()) {
+    if (lhs_view.size() != rhs_view.size()) {
         a = false;
         return;
     }
@@ -128,12 +130,7 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
 
     for (unsigned i = 0; i < lhs.size(); i++) {
 
-        EvalValue &&obj_a = lhs.get_ref()[lhs.offset() + i].get_rval();
-        const EvalValue &obj_b = rhs.get_ref()[rhs.offset() + i].get();
-
-        obj_a.get_type()->eq(obj_a, obj_b);
-
-        if (!obj_a.get<long>()) {
+        if (lhs_view[i].get() != rhs_view[i].get()) {
             a = false;
             return;
         }
@@ -150,18 +147,17 @@ void TypeArr::noteq(EvalValue &a, const EvalValue &b)
 
 string TypeArr::to_string(const EvalValue &a)
 {
-    FlatSharedArray &&arr = a.get<FlatSharedArray>();
+    const FlatSharedArray &arr = a.get<FlatSharedArray>();
+    const ArrayConstView &arr_view = arr.get_view();
     string res;
 
     res.reserve(arr.size() * 32);
     res += "[";
 
-    const ArrayConstView &arr_view = arr.get_view();
-
     for (unsigned i = 0; i < arr_view.size(); i++) {
 
         const EvalValue &val = arr_view[i].get();
-        res += val.get_type()->to_string(val);
+        res += val.to_string();
 
         if (i != arr_view.size() - 1)
             res += ", ";

@@ -108,7 +108,7 @@ unescapeString(const string_view &v)
 
 ostream &operator<<(ostream &s, const EvalValue &c)
 {
-    return s << c.get_type()->to_string(c);
+    return s << c.to_string();
 }
 
 void ChildlessConstruct::serialize(ostream &s, int level) const
@@ -213,6 +213,23 @@ LiteralStr::LiteralStr(string_view v)
      : value(FlatSharedStr(unescapeString(v)))
 {
 
+}
+
+void LiteralDictKVPair::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "KVPair(\n";
+
+    key->serialize(s, level + 1);
+    s << endl;
+
+    value->serialize(s, level + 1);
+    s << endl;
+
+    s << indent;
+    s << ")";
 }
 
 void Identifier::serialize(ostream &s, int level) const

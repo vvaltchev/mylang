@@ -47,6 +47,8 @@ public:
     string to_string(const EvalValue &a) override {
         return string(a.get<FlatSharedStr>().get_view());
     }
+
+    size_t hash(const EvalValue &a) override;
 };
 
 EvalValue TypeStr::clone(const EvalValue &a)
@@ -94,7 +96,7 @@ void TypeStr::add(EvalValue &a, const EvalValue &b)
     if (b.is<FlatSharedStr>())
         append(lval, b.get<FlatSharedStr>().get_view());
     else
-        append(lval, b.get_type()->to_string(b));
+        append(lval, b.to_string());
 }
 
 void TypeStr::mul(EvalValue &a, const EvalValue &b)
@@ -245,4 +247,9 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
     }
 
     return FlatSharedStr(s, s.offset() + start, end - start);
+}
+
+size_t TypeStr::hash(const EvalValue &a)
+{
+    return std::hash<string_view>()(a.get<FlatSharedStr>().get_view());
 }

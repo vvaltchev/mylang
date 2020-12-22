@@ -394,6 +394,40 @@ pArray(ParseContext &c, unsigned fl)
     return pList<LiteralArray>(c, fl, pExpr14);
 }
 
+unique_ptr<LiteralDictKVPair>
+pDictKVPair(ParseContext &c, unsigned fl)
+{
+    unique_ptr<LiteralDictKVPair> p(new LiteralDictKVPair);
+
+    p->key = pExpr14(c, fl);
+
+    if (!p->key) {
+
+        if (*c == Op::braceR)
+            return nullptr;
+
+        noExprError(c);
+    }
+
+    pExpectOp(c, Op::colon);
+
+    p->value = pExpr14(c, fl);
+
+    if (!p->value)
+        noExprError(c);
+
+    if (p->key->is_const && p->value->is_const)
+        p->is_const = true;
+
+    return p;
+}
+
+unique_ptr<Construct>
+pDict(ParseContext &c, unsigned fl)
+{
+    return pList<LiteralDict>(c, fl, pDictKVPair);
+}
+
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
@@ -434,6 +468,11 @@ pExpr01(ParseContext &c, unsigned fl)
 
         main = pArray(c, fl);
         pExpectOp(c, Op::bracketR);
+
+    } else if (pAcceptOp(c, Op::braceL)) {
+
+        main = pDict(c, fl);
+        pExpectOp(c, Op::braceR);
 
     } else if (pAcceptId(c, main)) {
 
@@ -749,12 +788,10 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const EvalValue &rvalue = ret->eval(c.const_ctx);
 
-        if (!rvalue.is<FlatSharedArray>()) {
-
-            // TODO: check for is<FlatSharedMap> as well
+        if (!rvalue.is<FlatSharedArray>() && !rvalue.is<FlatSharedDictObj>()) {
 
             /*
-             * In all the cases, except FlatSharedArray and FlatSharedMap,
+             * In all the cases, except FlatSharedArray and FlatSharedDictObj,
              * we just return a NopConstruct. Note: we cannot return nullptr,
              * otherwise it would seem that we matched nothing and pAcceptBracedBlock()
              * will expect "}".
@@ -874,6 +911,10 @@ pStmt(ParseContext &c, unsigned fl)
         return subStmt;
 
     } else if (pAcceptForeachStmt(c, subStmt, fl)) {
+
+        return subStmt;
+
+    } else if (pAcceptBracedBlock(c, subStmt, fl)) {
 
         return subStmt;
 

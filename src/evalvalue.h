@@ -6,6 +6,7 @@
 #include "flat/sharedstr.h"
 #include "flat/sharedarray.h"
 #include "flat/sharedexception.h"
+#include "flat/shareddict.h"
 #include "type.h"
 
 #include <string_view>
@@ -34,6 +35,8 @@ typedef TypeTemplate<EvalValue> Type;
 typedef ArrayConstViewTempl<LValue> ArrayConstView;
 typedef FlatSharedExceptionTempl<EvalValue> FlatSharedException;
 typedef ExceptionObjectTempl<EvalValue> ExceptionObject;
+typedef DictObjectTempl<EvalValue, LValue> DictObject;
+typedef FlatSharedVal<DictObject> FlatSharedDictObj;
 
 extern const array<Type *, Type::t_count> AllTypes;
 
@@ -50,6 +53,7 @@ template <> struct TypeToEnum<FlatSharedStr> { enum { val = Type::t_str }; };
 template <> struct TypeToEnum<FlatSharedFuncObj> { enum { val = Type::t_func }; };
 template <> struct TypeToEnum<FlatSharedArray> { enum { val = Type::t_arr }; };
 template <> struct TypeToEnum<FlatSharedException> { enum { val = Type::t_ex }; };
+template <> struct TypeToEnum<FlatSharedDictObj> { enum { val = Type::t_dict }; };
 
 class EvalValue final {
 
@@ -68,6 +72,7 @@ class EvalValue final {
         FlatSharedFuncObj func;
         FlatSharedArray arr;
         FlatSharedException ex;
+        FlatSharedDictObj dict;
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }
@@ -142,6 +147,7 @@ public:
         static_assert(offsetof(ValueU, func) == 0);
         static_assert(offsetof(ValueU, arr) == 0);
         static_assert(offsetof(ValueU, ex) == 0);
+        static_assert(offsetof(ValueU, dict) == 0);
 
         if (is<T>())
             return *reinterpret_cast<T *>(&val);
@@ -220,7 +226,25 @@ public:
         tmp.type->ge(tmp, rhs);
         return tmp.get<long>() != 0;
     }
+
+    string to_string() const {
+        return type->to_string(*this);
+    };
+
+    size_t hash() const {
+        return type->hash(*this);
+    };
 };
+
+namespace std {
+    template<> struct hash<EvalValue>
+    {
+        size_t operator()(EvalValue const& e) const
+        {
+            return e.hash();
+        }
+    };
+}
 
 extern const EvalValue empty_str;
 extern const EvalValue empty_arr;
@@ -411,6 +435,14 @@ public:
 
     template <class T>
     bool is() const { return val.is<T>(); }
+
+    bool operator==(const LValue &rhs) const {
+        return val == rhs.val;
+    }
+
+    bool operator!=(const LValue &rhs) const {
+        return val != rhs.val;
+    }
 };
 
 inline EvalValue

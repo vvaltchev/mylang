@@ -8,6 +8,7 @@
 
 #pragma once
 #include "evalvalue.h"
+#include <functional>
 
 class TypeInt : public Type {
 
@@ -32,6 +33,7 @@ public:
 
     bool is_true(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
+    size_t hash(const EvalValue &a) override;
 };
 
 void TypeInt::add(EvalValue &a, const EvalValue &b)
@@ -162,6 +164,12 @@ bool TypeInt::is_true(const EvalValue &a)
     return a.get<long>() != 0;
 }
 
-string TypeInt::to_string(const EvalValue &a) {
+string TypeInt::to_string(const EvalValue &a)
+{
     return std::to_string(a.get<long>());
+}
+
+size_t TypeInt::hash(const EvalValue &a)
+{
+    return std::hash<long>()(a.get<long>());
 }

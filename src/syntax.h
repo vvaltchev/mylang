@@ -234,6 +234,27 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
+class LiteralDictKVPair final: public Construct {
+
+public:
+    unique_ptr<Construct> key;
+    unique_ptr<Construct> value;
+
+    LiteralDictKVPair() : Construct("LiteralDictKVPair") { }
+    void serialize(ostream &s, int level = 0) const override;
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
+        throw InternalErrorEx(); /* Construct not meant to be evaluated directly */
+    }
+};
+
+class LiteralDict final: public MultiElemConstruct<LiteralDictKVPair> {
+
+public:
+
+    LiteralDict() : MultiElemConstruct<LiteralDictKVPair>("LiteralDict") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+};
+
 class Identifier final: public Construct {
 
 public:
@@ -485,7 +506,10 @@ public:
 
 class ForeachStmt final: public Construct {
 
-    bool do_iter(EvalContext *ctx, unsigned index, const EvalValue &elem) const;
+    bool do_iter(EvalContext *ctx,
+                 unsigned index,
+                 const EvalValue *elems,
+                 unsigned count) const;
 
 public:
     unique_ptr<IdList> ids;

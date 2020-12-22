@@ -917,7 +917,10 @@ void LValue::put(EvalValue &&v)
 }
 
 bool
-ForeachStmt::do_iter(EvalContext *ctx, unsigned index, const EvalValue &elem) const
+ForeachStmt::do_iter(EvalContext *ctx,
+                     unsigned index,
+                     const EvalValue *elems,
+                     unsigned count) const
 {
     const bool decl = index == 0 ? idsVarDecl : false;
     unsigned id_start = 0;
@@ -935,9 +938,40 @@ ForeachStmt::do_iter(EvalContext *ctx, unsigned index, const EvalValue &elem) co
         id_start++;
     }
 
-    if (elem.is<FlatSharedArray>()) {
+    if (count == 1) {
 
-        const ArrayConstView &view = elem.get<FlatSharedArray>().get_view();
+        if (elems[0].is<FlatSharedArray>()) {
+
+            const ArrayConstView &view =
+                elems[0].get<FlatSharedArray>().get_view();
+
+            for (unsigned i = id_start; i < ids->elems.size(); i++) {
+
+                const unsigned val_i = i - id_start;
+
+                handle_single_expr14(
+                    ctx,
+                    decl,
+                    Op::assign,
+                    ids->elems[i].get(),
+                    val_i < view.size() ? view[val_i].get() : EvalValue()
+                );
+            }
+
+        } else {
+
+            handle_single_expr14(
+                ctx, decl, Op::assign, ids->elems[id_start].get(), elems[0]
+            );
+
+            for (unsigned i = id_start+1; i < ids->elems.size(); i++) {
+                handle_single_expr14(
+                    ctx, decl, Op::assign, ids->elems[i].get(), EvalValue()
+                );
+            }
+        }
+
+    } else {
 
         for (unsigned i = id_start; i < ids->elems.size(); i++) {
 
@@ -948,16 +982,9 @@ ForeachStmt::do_iter(EvalContext *ctx, unsigned index, const EvalValue &elem) co
                 decl,
                 Op::assign,
                 ids->elems[i].get(),
-                val_i < view.size() ? view[val_i].get() : EvalValue()
+                val_i < count ? elems[val_i] : EvalValue()
             );
         }
-
-    } else {
-
-        handle_single_expr14(ctx, decl, Op::assign, ids->elems[id_start].get(), elem);
-
-        for (unsigned i = id_start+1; i < ids->elems.size(); i++)
-            handle_single_expr14(ctx, decl, Op::assign, ids->elems[i].get(), EvalValue());
     }
 
     try {
@@ -993,7 +1020,10 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
         const ArrayConstView &view = cval.get<FlatSharedArray>().get_view();
 
         for (unsigned i = 0; i < view.size(); i++) {
-            if (!do_iter(&loopCtx, i, view[i].get()))
+
+            const EvalValue &elem = view[i].get();
+
+            if (!do_iter(&loopCtx, i, &elem, 1))
                 break;
         }
 
@@ -1002,8 +1032,28 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
         const string_view &view = cval.get<FlatSharedStr>().get_view();
 
         for (unsigned i = 0; i < view.size(); i++) {
-            if (!do_iter(&loopCtx, i, FlatSharedStr(string(&view[i], 1))))
+
+            const EvalValue &elem = FlatSharedStr(string(&view[i], 1));
+
+            if (!do_iter(&loopCtx, i, &elem, 1))
                 break;
+        }
+
+    } else if (cval.is<FlatSharedDictObj>()) {
+
+        const DictObject::inner_type &data
+            = cval.get<FlatSharedDictObj>()->get_ref();
+
+        unsigned i = 0;
+
+        for (const auto &p : data) {
+
+            const EvalValue elems[2] = { p.first, p.second.get() };
+
+            if (!do_iter(&loopCtx, i, elems, 2))
+                break;
+
+            i++;
         }
 
     } else {
@@ -1016,4 +1066,19 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
     }
 
     return EvalValue();
+}
+
+EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
+{
+    DictObject::inner_type data;
+
+    for (const auto &e : elems) {
+
+        data.emplace(
+            RValue(e->key->eval(ctx)),
+            LValue(RValue(e->value->eval(ctx)), ctx->const_ctx)
+        );
+    }
+
+    return FlatSharedDictObj(make_shared<DictObject>(move(data)));
 }

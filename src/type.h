@@ -35,6 +35,7 @@ public:
         t_func,
         t_arr,
         t_ex,
+        t_dict,
 
         /* Number of types */
         t_count,
@@ -165,6 +166,11 @@ public:
     {
         assert(!a.template is<LValue *>() && !a.template is<UndefinedId>());
         return reinterpret_cast<long>(&a);
+    }
+
+    virtual size_t hash(const EvalValueT &a)
+    {
+        throw TypeErrorEx("The object does NOT support hash()");
     }
 };
 

@@ -31,6 +31,7 @@ public:
 
     bool is_true(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
+    size_t hash(const EvalValue &a) override;
 };
 
 inline long double internal_val_to_float(const EvalValue &b)
@@ -143,4 +144,9 @@ bool TypeFloat::is_true(const EvalValue &a)
 
 string TypeFloat::to_string(const EvalValue &a) {
     return std::to_string(a.get<long double>());
+}
+
+size_t TypeFloat::hash(const EvalValue &a)
+{
+    return std::hash<long double>()(a.get<long double>());
 }
