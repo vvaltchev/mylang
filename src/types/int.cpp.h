@@ -74,6 +74,9 @@ void TypeInt::mod(EvalValue &a, const EvalValue &b)
     if (!b.is<long>())
         throw TypeErrorEx("Expected integer on the right side");
 
+    if (b.get<long>() == 0)
+        throw DivisionByZeroEx();
+
     a.get<long>() %= b.get<long>();
 }
 

@@ -63,7 +63,7 @@ void TypeFloat::div(EvalValue &a, const EvalValue &b)
 {
     long double rhs = internal_val_to_float(b);
 
-    if (rhs == 0)
+    if (iszero(rhs))
         throw DivisionByZeroEx();
 
     a.get<long double>() /= rhs;
@@ -73,7 +73,7 @@ void TypeFloat::mod(EvalValue &a, const EvalValue &b)
 {
     long double rhs = internal_val_to_float(b);
 
-    if (rhs == 0)
+    if (iszero(rhs))
         throw DivisionByZeroEx();
 
     a = fmodl(a.get<long double>(), rhs);
