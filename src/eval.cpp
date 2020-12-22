@@ -1082,3 +1082,19 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
 
     return FlatSharedDictObj(make_shared<DictObject>(move(data)));
 }
+
+EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalValue &&dval = RValue(what->eval(ctx));
+
+    if (!dval.is<FlatSharedDictObj>())
+        throw TypeErrorEx("Expected dict object", what->start, what->end);
+
+    DictObject::inner_type &data = dval.get<FlatSharedDictObj>()->get_ref();
+
+    return &(
+        *data.emplace(
+            memId, LValue(EvalValue(), false)
+        ).first
+    ).second;
+}

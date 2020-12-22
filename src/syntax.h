@@ -522,3 +522,15 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 };
+
+class MemberExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> what;
+    EvalValue memId;
+
+    MemberExpr() : Construct("MemberExpr") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+};

@@ -2260,6 +2260,31 @@ static const vector<test> tests =
             "assert(p == [[\"a\",3],[\"b\",5],[\"c\",99]]);",
         },
     },
+
+    {
+        "Object member-access syntax for dict",
+        {
+            "var d = {\"a\": 42};",
+            "assert(d.a == 42);",
+            "d.a = 11;",
+            "assert(d.a == 11);",
+            "d.p2 = \"hello\";",
+            "var p = kvpairs(d);",
+            "sort(p, func(a,b) => a[0] < b[0]);",
+            "assert(p == [[\"a\", 11], [\"p2\", \"hello\"]]);",
+        },
+    },
+
+    {
+        "Object member-access syntax for dict: composition with other ops",
+        {
+            "var d = {\"a\": [{}, 3, 4]};",
+            "assert(d.a[0] == {});",
+            "d.a[0].f1 = 3;",
+            "d.a[0].f2 = [11,22];",
+            "assert(d.a[0].f2[1] == 22);",
+        },
+    },
 };
 
 static void

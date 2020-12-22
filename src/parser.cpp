@@ -428,6 +428,37 @@ pDict(ParseContext &c, unsigned fl)
     return pList<LiteralDict>(c, fl, pDictKVPair);
 }
 
+bool
+pAcceptMember(ParseContext &c,
+              unique_ptr<Construct> &what,
+              unique_ptr<Construct> &ret,
+              unsigned fl)
+{
+    if (!pAcceptOp(c, Op::dot))
+        return false;
+
+    unique_ptr<MemberExpr> mem(new MemberExpr);
+    mem->is_const = what->is_const;
+    mem->start = what->start;
+    mem->what = move(what);
+
+    unique_ptr<Construct> tmpId;
+
+    if (!pAcceptId(c, tmpId, false)) {
+        throw SyntaxErrorEx(c.get_loc(), "Expected identifier, got", &c.get_tok());
+    }
+
+    mem->end = c.get_loc();
+    unique_ptr<Identifier> id(dynamic_cast<Identifier *>(tmpId.release()));
+
+    if (!id)
+        throw InternalErrorEx(mem->start, mem->end);
+
+    mem->memId = FlatSharedStr(string(id->value));
+    ret = move(mem);
+    return true;
+}
+
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
@@ -484,7 +515,8 @@ pExpr01(ParseContext &c, unsigned fl)
     }
 
     while (pAcceptCallExpr(c, main, otherExpr, fl)  ||
-           pAcceptSubscript(c, main, otherExpr, fl))
+           pAcceptSubscript(c, main, otherExpr, fl) ||
+           pAcceptMember(c, main, otherExpr, fl))
     {
         main = move(otherExpr);
     }

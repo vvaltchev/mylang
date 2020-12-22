@@ -76,7 +76,11 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key)
     if (it != data.end())
         return &it->second;
 
-    return &(*(data.emplace(key, LValue(EvalValue(), false)).first)).second;
+    return &(
+        *data.emplace(
+            key, LValue(EvalValue(), false)
+        ).first
+    ).second;
 }
 
 string TypeDict::to_string(const EvalValue &a)

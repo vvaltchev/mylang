@@ -232,6 +232,24 @@ void LiteralDictKVPair::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void MemberExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "MemberExpr(\n";
+
+    what->serialize(s, level + 1);
+    s << endl;
+
+    s << string((level + 1) * 2, ' ');
+    s << "Id(\"" << memId << "\")";
+    s << endl;
+
+    s << indent;
+    s << ")";
+}
+
 void Identifier::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

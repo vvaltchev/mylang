@@ -314,7 +314,10 @@ lexer(string_view in_str, int line, vector<Tok> &result)
             if (ctx.tok_type == TokType::invalid)
                 ctx.tok_start = ctx.i;
 
-            if (isspace(c) || is_operator(string_view(&c, 1)))
+            const bool is_op = is_operator(string_view(&c, 1));
+            const bool in_integer = ctx.tok_type == TokType::integer;
+
+            if (isspace(c) || (is_op && (!in_integer || c != '.')))
                 ctx.handle_space_or_op();
             else if (isalnum(c) || c == '_' || c == '.')
                 ctx.handle_alphanum();
