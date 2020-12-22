@@ -2076,6 +2076,54 @@ static const vector<test> tests =
             "assert(b == [1,2,3]);",
         },
     },
+
+    {
+        "Named pure funcs",
+        {
+            "pure func cmp(a,b) => a > b;",
+            "const a = [1,2,3];",
+            "const b = sort(a, cmp);",
+            "assert(a == [1,2,3]);",
+            "assert(b == [3,2,1]);",
+        },
+    },
+
+    {
+        "Temporary pure funcs",
+        {
+            "const a = [1,2,3];",
+            "const b = sort(a, pure func (x,y) => x > y);",
+            "assert(a == [1,2,3]);",
+            "assert(b == [3,2,1]);",
+        }
+    },
+
+    {
+        "Cannot bind temporary pure func to const",
+        {
+            "const f = pure func(x) => x+1;",
+        },
+        &typeid(CannotBindPureFuncToConstEx),
+    },
+
+    {
+        "Named pure funcs cannot see global symbols",
+        {
+            "var g = 3;",
+            "pure func pf() => g+1;",
+            "pf();",
+        },
+        &typeid(UndefinedVariableEx)
+    },
+
+    {
+        "Temp. pure funcs cannot see non-const global symbols",
+        {
+            "var g = 3;",
+            "print((pure func(x) => g+x)(3));",
+        },
+        &typeid(UndefinedVariableEx)
+    },
 };
 
 static void

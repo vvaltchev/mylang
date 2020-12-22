@@ -171,8 +171,17 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
             const EvalValue &const_value = v->eval(c.const_ctx);
 
             if (const_value.get_type()->t == Type::t_lval) {
+
                 MakeConstructFromConstVal(RValue(const_value), v);
                 v->is_const = true;
+
+            } else if (const_value.is<FlatSharedFuncObj>()) {
+
+                const FuncObject &obj =
+                    const_value.get<FlatSharedFuncObj>().get();
+
+                if (obj.func->is_const)
+                    v->is_const = true;
             }
         }
 
@@ -740,8 +749,18 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const EvalValue &rvalue = ret->eval(c.const_ctx);
 
-        if (!rvalue.is<FlatSharedArray>())
+        if (!rvalue.is<FlatSharedArray>()) {
+
+            // TODO: check for is<FlatSharedMap> as well
+
+            /*
+             * In all the cases, except FlatSharedArray and FlatSharedMap,
+             * we just return a NopConstruct. Note: we cannot return nullptr,
+             * otherwise it would seem that we matched nothing and pAcceptBracedBlock()
+             * will expect "}".
+             */
             return make_unique<NopConstruct>();
+        }
 
         ret->lvalue->is_const = true;
     }
@@ -1037,12 +1056,27 @@ pAcceptFuncDecl(ParseContext &c,
                 unsigned fl)
 {
     const Loc start = c.get_loc();
+    bool is_pure = false;
 
-    if (!pAcceptKeyword(c, Keyword::kw_func))
+    if (pAcceptKeyword(c, Keyword::kw_pure))
+        is_pure = true;
+
+    if (!pAcceptKeyword(c, Keyword::kw_func)) {
+
+        if (is_pure) {
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Expected keyword `func` after `pure`, got",
+                &c.get_tok()
+            );
+        }
+
         return false;
+    }
 
     unique_ptr<FuncDeclStmt> func(new FuncDeclStmt);
     func->start = start;
+    func->is_const = is_pure;
 
     if (fl & pFlags::pInStmt) {
 
@@ -1055,6 +1089,14 @@ pAcceptFuncDecl(ParseContext &c,
     } else {
 
         if (pAcceptOp(c, Op::bracketL)) {
+
+            if (is_pure) {
+                throw SyntaxErrorEx(
+                    c.get_loc(),
+                    "Capture list NOT allowed in PURE functions"
+                );
+            }
+
             func->captures = pList<IdList>(c, fl, pIdentifier);
             pExpectOp(c, Op::bracketR);
         }
@@ -1079,6 +1121,10 @@ pAcceptFuncDecl(ParseContext &c,
     }
 
     func->end = c.get_loc() + 1;
+
+    if (c.const_eval && is_pure && func->id)
+        func->eval(c.const_ctx);
+
     ret = move(func);
     return true;
 }

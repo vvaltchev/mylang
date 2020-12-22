@@ -91,8 +91,9 @@ enum class Keyword : int {
     kw_foreach  = 20,
     kw_in       = 21,
     kw_indexed  = 22,
+    kw_pure     = 23,
 
-    kw_count    = 23,
+    kw_count    = 24,
 };
 
 static const array<string, (int)Keyword::kw_count> KwString =
@@ -121,6 +122,7 @@ static const array<string, (int)Keyword::kw_count> KwString =
     "foreach",
     "in",
     "indexed",
+    "pure",
 };
 
 ostream &operator<<(ostream &s, TokType t);

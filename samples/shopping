@@ -12,7 +12,11 @@ const unsorted_products =
     ["Banana", 4.0]
 ];
 
-var products = sort(unsorted_products, func (a, b) => a[0] < b[0]);
+const products = sort(
+    unsorted_products,
+    pure func (a, b) => a[0] < b[0]    # The pure func allows the whole expr to be const
+);
+
 var shopping_list = [];
 
 func dump_products() {

@@ -120,7 +120,7 @@ DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
 DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
 DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_SIMPLE_EX(CannotChangeConstEx, "Cannot change constant")
-
+DECL_SIMPLE_EX(CannotBindPureFuncToConstEx, "Cannot bind pure func to const")
 
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
@@ -133,10 +133,12 @@ DECL_RUNTIME_EX(OutOfBoundsEx, "Out of bounds error")
 struct UndefinedVariableEx : public Exception {
 
     const string_view name;
+    bool in_pure_func;
 
     UndefinedVariableEx(const string_view &name, Loc start = Loc(), Loc end = Loc())
         : Exception("UndefinedVariable", nullptr, start, end)
         , name(name)
+        , in_pure_func(false)
     { }
 };
 

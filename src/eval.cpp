@@ -143,10 +143,11 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
     );
 }
 
-template <class ArgsVecT> static
-EvalValue do_func_call(EvalContext *ctx,
-                       FuncObject &obj,
-                       const ArgsVecT &args)
+template <class ArgsVecT>
+static EvalValue
+do_func_call(EvalContext *ctx,
+             FuncObject &obj,
+             const ArgsVecT &args)
 {
     EvalContext args_ctx(&obj.capture_ctx);
 
@@ -191,6 +192,13 @@ EvalValue do_func_call(EvalContext *ctx,
     } catch (ReturnEx &ret) {
 
         return move(ret.value);
+
+    } catch (UndefinedVariableEx &undefEx) {
+
+        if (obj.func->is_const)
+            undefEx.in_pure_func = true;
+
+        throw;
     }
 
     return EvalValue();
@@ -536,6 +544,44 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
     const bool inDecl = fl & pFlags::pInDecl;
     const EvalValue &rval = RValue(rvalue->eval(ctx));
     IdList *idlist = nullptr;
+
+    if (inDecl && ctx->const_ctx && rval.is<FlatSharedFuncObj>()) {
+
+        const FuncObject &obj = rval.get<FlatSharedFuncObj>().get();
+
+        if (obj.func->is_const) {
+
+            /*
+            * We cannot allow this because of an ownership problem:function
+            * objects do NOT own their FuncDeclStmt object: it's owned by the
+            * statement construct where it has been declared. In this case instead,
+            * there's no "permanent" FuncDeclStmt that will live past this const
+            * decl statement, so the FuncObject will have to take ownership of the
+            * FuncDeclStmt, otherwise it will be destroyed after the current const
+            * decl stmt. Implementing that ownership is tricky because unique_ptr<T>s
+            * are used everywhere and, while in this case we could transfer
+            * the ownership of the FuncDeclStmt to the FuncObject, in general
+            * case we cannot do that.
+            *
+            * A naive solution might be to use shared_ptr<T> everywhere, but that
+            * will have a much higher price at runtime and it will also destroy the
+            * simple linear ownership model we currently use for syntax constructs.
+            *
+            * A much better solution would be to make pExpr14() return a construct
+            * which will own the FuncDeclStmt object. But that's tricky to implement
+            * in the general case: we don't know where in the `rvalue` syntax tree is
+            * located the unique_ptr of the FuncDeclStmt that we'll need to move.
+            * A way to overcome this issue is to add a virtual deep_clone() method in
+            * the Construct interface and force all the constructs to implement it.
+            * With it, we'll clone the FuncDeclStmt and store a unique_ptr of it in
+            * our special func-owning const decl statement.
+            *
+            * But, it is really worth?
+            */
+
+           throw CannotBindPureFuncToConstEx(rvalue->start, rvalue->end);
+        }
+    }
 
     if (lvalue->is_idlist())
         idlist = static_cast<IdList *>(lvalue.get());
