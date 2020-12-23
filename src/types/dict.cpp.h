@@ -26,6 +26,7 @@ public:
     EvalValue clone(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
+    bool is_true(const EvalValue &a) override;
 };
 
 long TypeDict::len(const EvalValue &a)
@@ -108,6 +109,11 @@ string TypeDict::to_string(const EvalValue &a)
 
     res += "}";
     return res;
+}
+
+bool TypeDict::is_true(const EvalValue &a)
+{
+    return a.get<FlatSharedDictObj>()->get_ref().size() > 0;
 }
 
 long TypeDict::use_count(const EvalValue &a)

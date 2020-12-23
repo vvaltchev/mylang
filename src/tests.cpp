@@ -2042,11 +2042,23 @@ static const vector<test> tests =
     {
         "Float types work",
         {
+            "const myEps = 0.000000001;",
             "const a = 3.4;",
             "const b = 1.2;",
             "const c = a + b;",
             "assert(str(c, 1) == \"4.6\");",
             "assert(str(math_pi, 2) == \"3.14\");",
+            "assert(abs((2.0 * 3.0) - 6.0) < myEps);",
+            "assert(abs((5.0 / 2) - 2.5) < myEps);",
+            "assert(abs((5.0 % 2) - 1.0) < myEps);",
+            "assert(abs((5.0 - 2) - 3.0) < myEps);",
+            "assert(-1.0 + 1 < myEps);",
+            "assert(float(str(1.23)) - 1.23 < myEps);",
+            "assert(5.0 > 3.0);",
+            "assert(5.0 >= 5.0);",
+            "assert(5.0 != 3.0);",
+            "assert(2.0 <= 2.0);",
+            "assert(2.0 <= 3.0);",
         },
     },
 
@@ -2295,6 +2307,187 @@ static const vector<test> tests =
             "const gen_a = kvpairs(d);",
             "const sorted_gen_a = sort(gen_a, pure func (a,b) => a[0] < b[0]);",
             "assert(orig_a == sorted_gen_a);",
+        },
+    },
+
+    {
+        "Initialization of multiple vars to single value",
+        {
+            "var a,b,c = 123;",
+            "assert(a == 123);",
+            "assert(b == 123);",
+            "assert(c == 123);",
+        }
+    },
+
+    {
+        "Dict foreach",
+        {
+            "var d = {\"a\": 3, \"b\": 4};",
+            "var arr = [];",
+            "foreach (var k, v, nn in d) {",
+            "   assert(nn == none);",
+            "   append(arr, [k,v]);",
+            "}",
+            "assert(dict(arr) == d);",
+        },
+    },
+
+    {
+        "Set item in slice of array",
+        {
+            "var a = [1,2,3,4,5];",
+            "var s = a[1:4];",
+            "assert(s == [2,3,4]);",
+            "s[1] = 99;",
+            "assert(a == [1,2,3,4,5]);",
+            "assert(s == [2,99,4]);",
+        },
+    },
+
+    {
+        "Op-assign operators",
+        {
+            "var a = +10;",
+            "a += 1;",
+            "assert(a == 11);",
+            "a -= 3;",
+            "assert(a == 8);",
+            "a *= 2;",
+            "assert(a == 16);",
+            "a /= 3;",
+            "assert(a == 5);",
+            "a %= 4;",
+            "assert(a == 1);",
+        },
+    },
+
+    {
+        "Precedence between && and ||",
+        {
+            "assert((  1 ||  1  && 0  ) == 1);",
+            "assert((  1 || (1  && 0) ) == 1);",
+            "assert(( (1 ||  1) && 0  ) == 0);",
+        },
+    },
+
+    {
+        "Clone dict",
+        {
+            "var d = {\"a\": 3};",
+            "assert(d[\"a\"] == 3);",
+            "var d2 = clone(d);",
+            "d2[\"a\"] = 99;",
+            "assert(d[\"a\"] == 3);",
+            "assert(d2[\"a\"] == 99);",
+        },
+    },
+
+    {
+        "Dict to string",
+        {
+            "assert(str({\"a\":3}) == \"{a: 3}\");",
+        },
+    },
+
+    {
+        "Array to string",
+        {
+            "assert(str([1,2,3]) == \"[1, 2, 3]\");",
+        },
+    },
+
+    {
+        "Accessing a non-existent member of dict",
+        {
+            "var d = {};",
+            "assert(len(d) == 0);",
+            "d[\"a\"] = 5;",
+            "assert(len(d) == 1);",
+            "assert(d[\"a\"] == 5);",
+            "assert(d != {});",
+        },
+    },
+
+    {
+        "Compare dict to other type",
+        {
+            "assert(({} == 3) == 0);",
+        },
+    },
+
+    {
+        "String compare operators",
+        {
+            "assert(\"a\" < \"b\");",
+            "assert(\"a\" <= \"a\");",
+            "assert(\"b\" > \"a\");",
+            "assert(\"b\" >= \"a\");",
+        },
+    },
+
+    {
+        "Dict with integer keys",
+        {
+            "var d = {5: 10, 100: 11};",
+            "assert(d == {5:10, 100:11});",
+            "assert(d[5] == 10);",
+            "assert(d[100] == 11);",
+        },
+    },
+
+    {
+        "Array slice without start",
+        {
+            "const a = [1,2,3];",
+            "assert(a[:2] == [1,2]);",
+            "assert(a[1:] == [2,3]);"
+        },
+    },
+
+    {
+        "Array slice without end",
+        {
+            "const a = [1,2,3];",
+            "assert(a[1:] == [2,3]);"
+        },
+    },
+
+    {
+        "Array slice without start nor end",
+        {
+            "const a = [1,2,3];",
+            "assert(a[:2] == [1,2]);",
+            "assert(a[1:] == [2,3]);"
+        },
+    },
+
+    {
+        "Array and dict to bool",
+        {
+            "if ([]) {",
+            "   assert(0);",
+            "} else {",
+            "   assert(1);",
+            "}",
+
+            "if ([1]) {",
+            "   assert(1);",
+            "} else {",
+            "   assert(0);",
+            "}",
+
+            "if ({}) {",
+            "   assert(0);",
+            "} else {",
+            "   assert(1);",
+            "}",
+
+            "if ({2: 3}) {",
+            "   assert(1);",
+            "} else {",
+            "   assert(0);",
+            "}",
         },
     },
 };

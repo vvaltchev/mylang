@@ -893,8 +893,9 @@ EvalValue &LValue::get_value_for_put()
     assert(container->is<FlatSharedArray>());
 
     if (container->valtype()->is_slice(container->val)) {
-
+        const unsigned off = container->getval<FlatSharedArray>().offset();
         *container = container->clone();
+        container_idx -= off;
         return container->getval<FlatSharedArray>().get_ref()[container_idx].val;
     }
 
