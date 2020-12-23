@@ -13,6 +13,8 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
+#include <cctype>
+
 EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 2)
@@ -267,4 +269,87 @@ EvalValue builtin_lpad(EvalContext *ctx, ExprList *exprList)
 EvalValue builtin_rpad(EvalContext *ctx, ExprList *exprList)
 {
     return generic_pad<false>(ctx, exprList);
+}
+
+EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (!val.is<FlatSharedStr>())
+        throw TypeErrorEx("Expected string", arg->start, arg->end);
+
+    const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
+    const string_view &str = flat_str.get_view();
+    size_type s;
+
+    if (!str.size())
+        return flat_str;
+
+    for (s = 0; s < str.size(); s++) {
+        if (!isspace(str[s]))
+            break;
+    }
+
+    return FlatSharedStr(flat_str, flat_str.offset() + s, str.size() - s);
+}
+
+EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (!val.is<FlatSharedStr>())
+        throw TypeErrorEx("Expected string", arg->start, arg->end);
+
+    const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
+    const string_view &str = flat_str.get_view();
+    size_type l;
+
+    if (!str.size())
+        return flat_str;
+
+    for (l = str.size(); l > 0; l--) {
+        if (!isspace(str[l-1]))
+            break;
+    }
+
+    return FlatSharedStr(flat_str, flat_str.offset(), l);
+}
+
+EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &val = RValue(arg->eval(ctx));
+
+    if (!val.is<FlatSharedStr>())
+        throw TypeErrorEx("Expected string", arg->start, arg->end);
+
+    const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
+    const string_view &str = flat_str.get_view();
+    size_type s, l;
+
+    if (!str.size())
+        return flat_str;
+
+    for (s = 0; s < str.size(); s++) {
+        if (!isspace(str[s]))
+            break;
+    }
+
+    for (l = str.size(); l > 0; l--) {
+        if (!isspace(str[l-1]))
+            break;
+    }
+
+    return FlatSharedStr(flat_str, flat_str.offset() + s, l - s);
 }

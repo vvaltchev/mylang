@@ -2514,6 +2514,18 @@ static const std::vector<test> tests =
             "assert(find(a, \"world\", deref0) == 1);",
         },
     },
+
+    {
+        "lstrip(), rstrip() and strip()",
+        {
+            "var orig = \"something  abc   other\";",
+            "var s = orig[9:17];",
+            "assert(s == \"  abc   \");",
+            "assert(lstrip(s) == \"abc   \");",
+            "assert(rstrip(s) == \"  abc\");",
+            "assert(strip(s) == \"abc\");",
+        },
+    },
 };
 
 static void
