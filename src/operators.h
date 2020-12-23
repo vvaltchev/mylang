@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #pragma once
 
+#include "defs.h"
+
 enum class Op : int {
 
     invalid     = 0,

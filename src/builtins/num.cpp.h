@@ -7,6 +7,8 @@
  */
 
 #pragma once
+
+#include "defs.h"
 #include "eval.h"
 #include "evaltypes.cpp.h"
 #include "syntax.h"

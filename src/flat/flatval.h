@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #pragma once
+
+#include "defs.h"
 #include <memory>
 using namespace std;
 

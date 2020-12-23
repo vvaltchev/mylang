@@ -7,6 +7,8 @@
  */
 
 #pragma once
+
+#include "defs.h"
 #include "evalvalue.h"
 #include <cmath>
 
