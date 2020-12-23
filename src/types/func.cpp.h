@@ -44,7 +44,7 @@ EvalValue TypeFunc::clone(const EvalValue &a)
     const FlatSharedFuncObj &wrapper = a.get<FlatSharedFuncObj>();
     const FuncObject &func = wrapper.get();
 
-    if (!func.capture_ctx.symbols.size())
+    if (func.capture_ctx.empty())
         return a;
 
     return FlatSharedFuncObj(make_shared<FuncObject>(func));
@@ -56,7 +56,7 @@ FuncObject::FuncObject(const FuncObject &rhs)
                   rhs.capture_ctx.const_ctx,
                   rhs.capture_ctx.func_ctx)
 {
-    capture_ctx.symbols = rhs.capture_ctx.symbols;
+    capture_ctx.copy_symbols_from(rhs.capture_ctx);
 }
 
 FuncObject::FuncObject(const FuncDeclStmt *func, EvalContext *ctx)
@@ -67,9 +67,10 @@ FuncObject::FuncObject(const FuncDeclStmt *func, EvalContext *ctx)
         return;
 
     for (const auto &capture : func->captures->elems) {
-        capture_ctx.symbols.emplace(
-            capture->value,             // value means "name" here
-            LValue(RValue(capture->eval(ctx)), ctx->const_ctx)
+        capture_ctx.emplace(
+            capture.get(),
+            RValue(capture->eval(ctx)),
+            ctx->const_ctx
         );
     }
 }

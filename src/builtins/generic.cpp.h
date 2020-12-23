@@ -120,13 +120,7 @@ EvalValue builtin_undef(EvalContext *ctx, ExprList *exprList)
     if (!id)
         throw TypeErrorEx("Expected identifier", arg->start, arg->end);
 
-    const auto &it = ctx->symbols.find(id->value);
-
-    if (it == ctx->symbols.end())
-        return false;
-
-    ctx->symbols.erase(it);
-    return true;
+    return ctx->erase(id);
 }
 
 EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)

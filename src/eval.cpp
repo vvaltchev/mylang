@@ -24,6 +24,43 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     }
 }
 
+LValue *EvalContext::lookup(const Identifier *id)
+{
+    auto &&it = symbols.find(id->value);
+
+    if (it != symbols.end())
+        return &it->second;
+
+    return nullptr;
+}
+
+bool EvalContext::erase(const Identifier *id)
+{
+    const auto &it = symbols.find(id->value);
+
+    if (it == symbols.end())
+        return false;
+
+    symbols.erase(it);
+    return true;
+}
+
+void EvalContext::emplace(const Identifier *id, const EvalValue &val, bool is_const)
+{
+    symbols.emplace(id->value, LValue(val, is_const));
+}
+
+void EvalContext::emplace(const Identifier *id, EvalValue &&val, bool is_const)
+{
+    symbols.emplace(id->value, LValue(move(val), is_const));
+}
+
+void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_const)
+{
+    symbols.emplace(id, LValue(move(val), is_const));
+}
+
+
 EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 {
     try {
@@ -45,10 +82,10 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 {
     while (ctx) {
 
-        const auto &&it = ctx->symbols.find(value);
+        LValue *lval = ctx->lookup(this);
 
-        if (it != ctx->symbols.end())
-            return EvalValue(&it->second);
+        if (lval)
+            return EvalValue(lval);
 
         ctx = ctx->parent;
 
@@ -88,9 +125,10 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < args.size(); i++) {
-        args_ctx->symbols.emplace(
-            funcParams[i]->value,
-            LValue(RValue(args[i]->eval(ctx)), ctx->const_ctx)
+        args_ctx->emplace(
+            funcParams[i].get(),
+            RValue(args[i]->eval(ctx)),
+            ctx->const_ctx
         );
     }
 }
@@ -105,9 +143,10 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < args.size(); i++) {
-        args_ctx->symbols.emplace(
-            funcParams[i]->value,
-            LValue(args[i], ctx->const_ctx)
+        args_ctx->emplace(
+            funcParams[i].get(),
+            args[i],
+            ctx->const_ctx
         );
     }
 }
@@ -121,9 +160,10 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
     if (funcParams.size() != 1)
         throw InvalidNumberOfArgsEx();
 
-    args_ctx->symbols.emplace(
-        funcParams[0]->value,
-        LValue(arg, ctx->const_ctx)
+    args_ctx->emplace(
+        funcParams[0].get(),
+        arg,
+        ctx->const_ctx
     );
 }
 
@@ -137,14 +177,16 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
     if (funcParams.size() != 2)
         throw InvalidNumberOfArgsEx();
 
-    args_ctx->symbols.emplace(
-        funcParams[0]->value,
-        LValue(args.first, ctx->const_ctx)
+    args_ctx->emplace(
+        funcParams[0].get(),
+        args.first,
+        ctx->const_ctx
     );
 
-    args_ctx->symbols.emplace(
-        funcParams[1]->value,
-        LValue(args.second, ctx->const_ctx)
+    args_ctx->emplace(
+        funcParams[1].get(),
+        args.second,
+        ctx->const_ctx
     );
 }
 
@@ -508,9 +550,10 @@ handle_single_expr14(EvalContext *ctx,
         if (!inDecl)
             throw UndefinedVariableEx{ lval.get<UndefinedId>().id };
 
-        ctx->symbols.emplace(
+        ctx->emplace(
             lval.get<UndefinedId>().id,
-            LValue(RValue(rval), ctx->const_ctx || lvalue->is_const)
+            RValue(rval),
+            ctx->const_ctx || lvalue->is_const
         );
 
     } else if (lval.is<LValue *>()) {
@@ -528,9 +571,10 @@ handle_single_expr14(EvalContext *ctx,
             }
 
             /* We're re-declaring a symbol already declared outside */
-            ctx->symbols.emplace(
+            ctx->emplace(
                 local_lval.get<UndefinedId>().id,
-                LValue(RValue(rval), ctx->const_ctx)
+                RValue(rval),
+                ctx->const_ctx
             );
 
         } else {
@@ -726,9 +770,10 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
         if (!id->eval(ctx).is<UndefinedId>())
             throw AlreadyDefinedEx(id->start, id->end);
 
-        ctx->symbols.emplace(
-            id->value,
-            LValue(move(func), ctx->const_ctx)
+        ctx->emplace(
+            id.get(),
+            move(func),
+            ctx->const_ctx
         );
 
         return EvalValue();
@@ -816,9 +861,10 @@ do_catch(EvalContext *ctx,
                         : ExceptionObject(saved_ex->name)
                 );
 
-                catch_ctx.symbols.emplace(
-                    asId->value,
-                    LValue(move(flatEx), ctx->const_ctx)
+                catch_ctx.emplace(
+                    asId,
+                    move(flatEx),
+                    ctx->const_ctx
                 );
             }
 

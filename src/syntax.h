@@ -263,7 +263,10 @@ public:
     const std::string value;
 
     template <class T>
-    Identifier(T &&arg) : Construct("Id"), value(forward<T>(arg)) { }
+    Identifier(T &&arg)
+        : Construct("Id")
+        , value(forward<T>(arg))
+    { }
 
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
