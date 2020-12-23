@@ -63,14 +63,19 @@ while (true) {
         break;
     }
 
-    try {
+    pnum = find(products, input, func(x) => x[0]);
 
-        pnum = int(input);
+    if (!pnum) {
 
-    } catch (TypeErrorEx) {
+        try {
 
-        print("Invalid number");
-        continue;
+            pnum = int(input);
+
+        } catch (TypeErrorEx) {
+
+            print("Invalid number");
+            continue;
+        }
     }
 
     if (pnum < 0 || pnum > len(products)-1) {

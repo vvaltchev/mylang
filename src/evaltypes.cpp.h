@@ -103,6 +103,10 @@ public:
 
     TypeNone() : Type(Type::t_none) { }
 
+    bool is_true(const EvalValue &a) override {
+        return false;
+    }
+
     string to_string(const EvalValue &a) override {
         return "<none>";
     }
