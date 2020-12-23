@@ -306,6 +306,9 @@ pAcceptCallExpr(ParseContext &c,
         expr->args = pList<ExprList>(c, fl, pExpr14);
 
         if (c.const_eval && expr->what->is_const && expr->args->is_const) {
+
+            expr->is_const = true;
+
             MakeConstructFromConstVal(
                 expr->eval(c.const_ctx),
                 ret,
@@ -1227,24 +1230,51 @@ MakeConstructFromConstVal(const EvalValue &v,
         return true;
     }
 
-    if (v.is<FlatSharedArray>() && process_arrays) {
+    if (process_arrays) {
 
-        const ArrayConstView &view = v.get<FlatSharedArray>().get_view();
-        unique_ptr<LiteralArray> litarr(new LiteralArray);
+        if (v.is<FlatSharedArray>()) {
 
-        for (unsigned i = 0; i < view.size(); i++) {
+            const ArrayConstView &view = v.get<FlatSharedArray>().get_view();
+            unique_ptr<LiteralArray> litarr(new LiteralArray);
 
-            unique_ptr<Construct> construct;
+            for (unsigned i = 0; i < view.size(); i++) {
 
-            if (!MakeConstructFromConstVal(view[i].get(), construct, true))
-                return false;
+                unique_ptr<Construct> construct;
 
-            litarr->elems.push_back(move(construct));
+                if (!MakeConstructFromConstVal(view[i].get(), construct, true))
+                    return false;
+
+                litarr->elems.push_back(move(construct));
+            }
+
+            litarr->is_const = true;
+            out = move(litarr);
+            return true;
+
+        } else if (v.is<FlatSharedDictObj>()) {
+
+            const DictObject::inner_type &data =
+                v.get<FlatSharedDictObj>()->get_ref();
+
+            unique_ptr<LiteralDict> litDict(new LiteralDict);
+
+            for (const auto &p : data) {
+
+                unique_ptr<LiteralDictKVPair> kvpair(new LiteralDictKVPair);
+
+                if (!MakeConstructFromConstVal(p.first, kvpair->key, true))
+                    return false;
+
+                if (!MakeConstructFromConstVal(p.second.get(), kvpair->value, true))
+                    return false;
+
+                litDict->elems.push_back(move(kvpair));
+            }
+
+            litDict->is_const = true;
+            out = move(litDict);
+            return true;
         }
-
-        litarr->is_const = true;
-        out = move(litarr);
-        return true;
     }
 
     return false;

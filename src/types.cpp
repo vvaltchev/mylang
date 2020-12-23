@@ -169,6 +169,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("keys", builtin_keys),
     make_const_builtin("values", builtin_values),
     make_const_builtin("kvpairs", builtin_kvpairs),
+    make_const_builtin("dict", builtin_dict),
 
     /* Float math funcs */
     make_const_builtin("exp", builtin_exp),

@@ -2285,6 +2285,18 @@ static const vector<test> tests =
             "assert(d.a[0].f2[1] == 22);",
         },
     },
+
+    {
+        "Builtin dict(): convert array of [k,v] pairs to dict",
+        {
+            "const orig_a = [[\"a\", 3], [\"b\", 4]];",
+            "const d = dict(orig_a);",
+            "assert(d == {\"a\":3, \"b\":4});",
+            "const gen_a = kvpairs(d);",
+            "const sorted_gen_a = sort(gen_a, pure func (a,b) => a[0] < b[0]);",
+            "assert(orig_a == sorted_gen_a);",
+        },
+    },
 };
 
 static void

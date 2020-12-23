@@ -119,3 +119,48 @@ builtin_kvpairs(EvalContext *ctx, ExprList *exprList)
 {
     return dict_1arg_func(ctx, exprList, &dict_kvpairs);
 }
+
+EvalValue
+builtin_dict(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+    DictObject::inner_type data;
+
+    if (!e.is<FlatSharedArray>()) {
+        throw TypeErrorEx(
+            "Expected array of [key, value] pairs", arg->start, arg->end
+        );
+    }
+
+    const ArrayConstView &view = e.get<FlatSharedArray>().get_view();
+
+    for (unsigned i = 0; i < view.size(); i++) {
+
+        const EvalValue &e = view[i].get();
+
+        if (!e.is<FlatSharedArray>()) {
+            throw TypeErrorEx(
+                "Expected array of [key, value] pairs", arg->start, arg->end
+            );
+        }
+
+        const ArrayConstView &pair_view = e.get<FlatSharedArray>().get_view();
+
+        if (pair_view.size() != 2) {
+            throw TypeErrorEx(
+                "Expected array of [key, value] pairs", arg->start, arg->end
+            );
+        }
+
+        data.emplace(
+            pair_view[0].get(),
+            LValue(pair_view[1].get(), false)
+        );
+    }
+
+    return FlatSharedDictObj(make_shared<DictObject>(move(data)));
+}
