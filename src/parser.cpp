@@ -1211,8 +1211,8 @@ MakeConstructFromConstVal(const EvalValue &v,
         return true;
     }
 
-    if (v.is<long double>()) {
-        out = make_unique<LiteralFloat>(v.get<long double>());
+    if (v.is<float_type>()) {
+        out = make_unique<LiteralFloat>(v.get<float_type>());
         return true;
     }
 

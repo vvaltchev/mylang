@@ -27,9 +27,9 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 
         return val;
 
-    } else if (val.is<long double>()) {
+    } else if (val.is<float_type>()) {
 
-        return static_cast<long>(val.get<long double>());
+        return static_cast<long>(val.get<float_type>());
 
     } else if (val.is<FlatSharedStr>()) {
 
@@ -56,13 +56,13 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &val = RValue(arg->eval(ctx));
 
-    if (val.is<long double>()) {
+    if (val.is<float_type>()) {
 
         return val;
 
     } else if (val.is<long>()) {
 
-        return static_cast<long double>(val.get<long>());
+        return static_cast<float_type>(val.get<long>());
 
     } else if (val.is<FlatSharedStr>()) {
 
@@ -94,9 +94,9 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
         const long val = e.get<long>();
         return val >= 0 ? val : -val;
 
-    } else if (e.is<long double>()) {
+    } else if (e.is<float_type>()) {
 
-        return fabsl(e.get<long double>());
+        return fabsl(e.get<float_type>());
 
     } else {
 
@@ -193,20 +193,20 @@ float_func(EvalContext *ctx, ExprList *exprList, funcT f)
     if (exprList->elems.size() != N)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
-    long double x[N];
+    float_type x[N];
 
     for (unsigned i = 0; i < N; i++) {
 
         Construct *arg = exprList->elems[i].get();
         const EvalValue &v = RValue(arg->eval(ctx));
 
-        if (v.is<long double>())
+        if (v.is<float_type>())
 
-            x[i] = v.get<long double>();
+            x[i] = v.get<float_type>();
 
         else if (v.is<long>())
 
-            x[i] = static_cast<long double>(v.get<long>());
+            x[i] = static_cast<float_type>(v.get<long>());
 
         else
 
@@ -254,9 +254,9 @@ INST_FLOAT_BUILTIN_1(atan);
 INST_FLOAT_BUILTIN_1(ceil);
 INST_FLOAT_BUILTIN_1(floor);
 INST_FLOAT_BUILTIN_1(trunc);
-INST_FLOAT_BUILTIN_1_ex(isinf, int (*)(long double), isinfl);
-INST_FLOAT_BUILTIN_1_ex(isfinite, bool (*)(long double), std::isfinite);
-INST_FLOAT_BUILTIN_1_ex(isnormal, bool (*)(long double), std::isnormal);
+INST_FLOAT_BUILTIN_1_ex(isinf, int (*)(float_type), isinfl);
+INST_FLOAT_BUILTIN_1_ex(isfinite, bool (*)(float_type), std::isfinite);
+INST_FLOAT_BUILTIN_1_ex(isnormal, bool (*)(float_type), std::isnormal);
 
 EvalValue builtin_isnan(EvalContext *ctx, ExprList *exprList)
 {
@@ -277,7 +277,7 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
 
     if (exprList->elems.size() == 1) {
 
-        return roundl(v0.get<long double>());
+        return roundl(v0.get<float_type>());
 
     } else {
 
@@ -293,7 +293,7 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
             );
         }
 
-        const long double base10exp = powl(10.0, v1.get<long>());
-        return roundl(v0.get<long double>() * base10exp) / base10exp;
+        const float_type base10exp = powl(10.0, v1.get<long>());
+        return roundl(v0.get<float_type>() * base10exp) / base10exp;
     }
 }

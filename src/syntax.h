@@ -177,11 +177,11 @@ public:
 
 class LiteralFloat final: public Literal {
 
-    const long double value;
+    const float_type value;
 
 public:
 
-    LiteralFloat(long double v) : value(v) { }
+    LiteralFloat(float_type v) : value(v) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;

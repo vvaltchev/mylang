@@ -36,10 +36,10 @@ public:
     size_t hash(const EvalValue &a) override;
 };
 
-inline long double internal_val_to_float(const EvalValue &b)
+inline float_type internal_val_to_float(const EvalValue &b)
 {
-    if (b.is<long double>())
-        return b.get<long double>();
+    if (b.is<float_type>())
+        return b.get<float_type>();
 
     if (b.is<long>())
         return b.get<long>();
@@ -49,68 +49,68 @@ inline long double internal_val_to_float(const EvalValue &b)
 
 void TypeFloat::add(EvalValue &a, const EvalValue &b)
 {
-    a.get<long double>() += internal_val_to_float(b);
+    a.get<float_type>() += internal_val_to_float(b);
 }
 
 void TypeFloat::sub(EvalValue &a, const EvalValue &b)
 {
-    a.get<long double>() -= internal_val_to_float(b);
+    a.get<float_type>() -= internal_val_to_float(b);
 }
 
 void TypeFloat::mul(EvalValue &a, const EvalValue &b)
 {
-    a.get<long double>() *= internal_val_to_float(b);
+    a.get<float_type>() *= internal_val_to_float(b);
 }
 
 void TypeFloat::div(EvalValue &a, const EvalValue &b)
 {
-    long double rhs = internal_val_to_float(b);
+    float_type rhs = internal_val_to_float(b);
 
     if (iszero(rhs))
         throw DivisionByZeroEx();
 
-    a.get<long double>() /= rhs;
+    a.get<float_type>() /= rhs;
 }
 
 void TypeFloat::mod(EvalValue &a, const EvalValue &b)
 {
-    long double rhs = internal_val_to_float(b);
+    float_type rhs = internal_val_to_float(b);
 
     if (iszero(rhs))
         throw DivisionByZeroEx();
 
-    a = fmodl(a.get<long double>(), rhs);
+    a = fmodl(a.get<float_type>(), rhs);
 }
 
 void TypeFloat::lt(EvalValue &a, const EvalValue &b)
 {
-    a = a.get<long double>() < internal_val_to_float(b);
+    a = a.get<float_type>() < internal_val_to_float(b);
 }
 
 void TypeFloat::gt(EvalValue &a, const EvalValue &b)
 {
-    a = a.get<long double>() > internal_val_to_float(b);
+    a = a.get<float_type>() > internal_val_to_float(b);
 }
 
 void TypeFloat::le(EvalValue &a, const EvalValue &b)
 {
-    a = a.get<long double>() <= internal_val_to_float(b);
+    a = a.get<float_type>() <= internal_val_to_float(b);
 }
 
 void TypeFloat::ge(EvalValue &a, const EvalValue &b)
 {
-    a = a.get<long double>() >= internal_val_to_float(b);
+    a = a.get<float_type>() >= internal_val_to_float(b);
 }
 
 void TypeFloat::eq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<long double>()) {
+    if (b.is<float_type>()) {
 
-        a = a.get<long double>() == b.get<long double>();
+        a = a.get<float_type>() == b.get<float_type>();
 
     } else if (b.is<long>()) {
 
-        a = a.get<long double>() == b.get<long>();
+        a = a.get<float_type>() == b.get<long>();
 
     } else {
 
@@ -120,13 +120,13 @@ void TypeFloat::eq(EvalValue &a, const EvalValue &b)
 
 void TypeFloat::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<long double>()) {
+    if (b.is<float_type>()) {
 
-        a = a.get<long double>() != b.get<long double>();
+        a = a.get<float_type>() != b.get<float_type>();
 
     } else if (b.is<long>()) {
 
-        a = a.get<long double>() != b.get<long>();
+        a = a.get<float_type>() != b.get<long>();
 
     } else {
 
@@ -136,19 +136,19 @@ void TypeFloat::noteq(EvalValue &a, const EvalValue &b)
 
 void TypeFloat::opneg(EvalValue &a)
 {
-    a.get<long double>() = -a.get<long double>();
+    a.get<float_type>() = -a.get<float_type>();
 }
 
 bool TypeFloat::is_true(const EvalValue &a)
 {
-    return a.get<long double>() != 0.0;
+    return a.get<float_type>() != 0.0;
 }
 
 string TypeFloat::to_string(const EvalValue &a) {
-    return std::to_string(a.get<long double>());
+    return std::to_string(a.get<float_type>());
 }
 
 size_t TypeFloat::hash(const EvalValue &a)
 {
-    return std::hash<long double>()(a.get<long double>());
+    return std::hash<float_type>()(a.get<float_type>());
 }

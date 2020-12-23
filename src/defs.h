@@ -24,3 +24,8 @@ using std::shared_ptr;
 using std::make_pair;
 using std::make_shared;
 using std::make_unique;
+
+
+/* Custom type defs */
+
+typedef long double float_type;

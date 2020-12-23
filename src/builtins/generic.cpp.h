@@ -44,7 +44,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
 
         return e;
 
-    } else if (e.is<long double>()) {
+    } else if (e.is<float_type>()) {
 
         if (exprList->elems.size() > 2)
             throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
@@ -65,7 +65,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
 
             char buf[80];
             const int precision = static_cast<int>(p.get<long>());
-            snprintf(buf, sizeof(buf), "%.*Lf", precision, e.get<long double>());
+            snprintf(buf, sizeof(buf), "%.*Lf", precision, e.get<float_type>());
             return FlatSharedStr(string(buf));
         }
 

@@ -126,7 +126,7 @@ inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
     return make_pair(name, LValue(Builtin{f}, true));
 }
 
-inline auto make_const_builtin(const char *name, long double val)
+inline auto make_const_builtin(const char *name, float_type val)
 {
     return make_pair(name, LValue(val, true));
 }
@@ -211,7 +211,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("math_1_sqrt2", M_SQRT1_2), /* 1/sqrt(2) */
     make_const_builtin("nan", NAN), /* 1/sqrt(2) */
     make_const_builtin("inf", INFINITY), /* 1/sqrt(2) */
-    make_const_builtin("eps", std::numeric_limits<long double>::epsilon()),
+    make_const_builtin("eps", std::numeric_limits<float_type>::epsilon()),
 };
 
 EvalContext::SymbolsType EvalContext::builtins =
