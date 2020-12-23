@@ -906,6 +906,7 @@ pStmt(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> subStmt;
     const Loc start = c.get_loc();
+    fl |= pFlags::pInStmt;
 
     if (fl & pFlags::pInLoop) {
 
@@ -929,7 +930,7 @@ pStmt(ParseContext &c, unsigned fl)
 
         return subStmt;
 
-    } else if (pAcceptFuncDecl(c, subStmt, fl | pFlags::pInStmt)) {
+    } else if (pAcceptFuncDecl(c, subStmt, fl)) {
 
         return subStmt;
 
@@ -955,8 +956,6 @@ pStmt(ParseContext &c, unsigned fl)
 
     } else {
 
-        fl |= pFlags::pInStmt;
-
         if (pAcceptKeyword(c, Keyword::kw_var))
             fl |= pFlags::pInDecl;
         else if (pAcceptKeyword(c, Keyword::kw_const))
@@ -964,15 +963,10 @@ pStmt(ParseContext &c, unsigned fl)
 
         unique_ptr<Construct> lowerE = pExprTop(c, fl);
 
-        if (!lowerE || lowerE->is_nop())
-            return lowerE;
+        if (lowerE)
+           pExpectOp(c, Op::semicolon);
 
-        unique_ptr<Stmt> ret(new Stmt);
-        ret->elem = move(lowerE);
-        pExpectOp(c, Op::semicolon);
-        ret->start = start;
-        ret->end = c.get_loc();
-        return ret;
+        return lowerE;
     }
 }
 

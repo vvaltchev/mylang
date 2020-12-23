@@ -370,12 +370,6 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Stmt final: public SingleChildConstruct {
-
-public:
-    Stmt() : SingleChildConstruct("Stmt") { }
-};
-
 class IfStmt final: public Construct {
 
 public:
