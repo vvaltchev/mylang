@@ -2,10 +2,15 @@
 # Simple loop, useful for performance benchmarks
 #
 
-var i = 0;
+func do_loop() {
 
-while (i < 1000000) {
-    i += 1;
+    var i = 0;
+
+    while (i < 1000000) {
+        i += 1;
+    }
+
+    print(i);
 }
 
-print(i);
+do_loop();
