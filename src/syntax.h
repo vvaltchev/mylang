@@ -162,11 +162,11 @@ public:
 
 class LiteralInt final: public Literal {
 
-    const long value;
+    const int_type value;
 
 public:
 
-    LiteralInt(long v) : value(v) { }
+    LiteralInt(int_type v) : value(v) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;

@@ -79,7 +79,7 @@ public:
     const shared_ptr<T> &get_shared_ptr() const { return flat.get(); }
     T &get() { return *flat->get(); }
     const T &get() const { return *flat->get(); }
-    long use_count() const { return flat->use_count(); }
+    int_type use_count() const { return flat->use_count(); }
     T *operator->() { return &get(); }
     const T *operator->() const { return &get(); }
 };

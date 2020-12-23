@@ -938,7 +938,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
             decl,
             Op::assign,
             ids->elems[0].get(),
-            static_cast<long>(index)
+            static_cast<int_type>(index)
         );
 
         id_start++;

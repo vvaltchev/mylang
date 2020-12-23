@@ -199,7 +199,7 @@ class FlatSharedArrayTempl final {
 
         vec_type &get_vec() { return shobj->vec; }
         const vec_type &get_vec() const { return shobj->vec; }
-        long use_count() const { return shobj.use_count(); }
+        int_type use_count() const { return shobj.use_count(); }
     };
 
 public:
@@ -219,7 +219,7 @@ public:
 
     vec_type &get_ref() { return flat->get_vec(); }
     const vec_type &get_ref() const { return flat->get_vec(); }
-    long use_count() const { return flat->use_count(); }
+    int_type use_count() const { return flat->use_count(); }
 
     bool is_slice() const { return flat->slice; }
     unsigned offset() const { return flat->slice ? flat->off : 0; }

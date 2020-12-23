@@ -33,7 +33,7 @@ public:
                     const EvalValue &start,
                     const EvalValue &end) override;
 
-    long use_count(const EvalValue &a) override;
+    int_type use_count(const EvalValue &a) override;
     EvalValue clone(const EvalValue &a) override;
     bool is_slice(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
@@ -42,7 +42,7 @@ public:
         return a.get<FlatSharedStr>().size() > 0;
     }
 
-    long len(const EvalValue &a) override {
+    int_type len(const EvalValue &a) override {
         return a.get<FlatSharedStr>().size();
     }
 
@@ -58,7 +58,7 @@ EvalValue TypeStr::clone(const EvalValue &a)
     return FlatSharedStr(string(a.get<FlatSharedStr>().get_ref()));
 }
 
-long TypeStr::use_count(const EvalValue &a)
+int_type TypeStr::use_count(const EvalValue &a)
 {
     return a.get<FlatSharedStr>().use_count();
 }
@@ -70,7 +70,7 @@ bool TypeStr::is_slice(const EvalValue &a)
 
 EvalValue TypeStr::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<long>(&a.get<FlatSharedStr>().get_ref());
+    return reinterpret_cast<int_type>(&a.get<FlatSharedStr>().get_ref());
 }
 
 void TypeStr::append(FlatSharedStr &lval, const string_view &s)
@@ -103,17 +103,17 @@ void TypeStr::add(EvalValue &a, const EvalValue &b)
 
 void TypeStr::mul(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected an integer on the right side");
 
     string new_str;
     const string_view &s = a.get<FlatSharedStr>().get_view();
-    const long n = b.get<long>();
+    const int_type n = b.get<int_type>();
 
     if (n >= 0) {
         new_str.reserve(s.size() * n);
 
-        for (long i = 0; i < n; i++)
+        for (int_type i = 0; i < n; i++)
             new_str += s;
     }
 
@@ -186,12 +186,12 @@ void TypeStr::noteq(EvalValue &a, const EvalValue &b)
 
 EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
 {
-    if (!idx_val.is<long>())
+    if (!idx_val.is<int_type>())
         throw TypeErrorEx("Expected an integer as subscript");
 
     const EvalValue &what = RValue(what_lval);
     const FlatSharedStr &s = what.get<FlatSharedStr>();
-    long idx = idx_val.get<long>();
+    int_type idx = idx_val.get<int_type>();
 
     if (idx < 0)
         idx += s.size();
@@ -208,11 +208,11 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
 {
     const EvalValue &what = RValue(what_lval);
     const FlatSharedStr &s = what.get<FlatSharedStr>();
-    long start = 0, end = s.size();
+    int_type start = 0, end = s.size();
 
-    if (start_val.is<long>()) {
+    if (start_val.is<int_type>()) {
 
-        start = start_val.get<long>();
+        start = start_val.get<int_type>();
 
         if (start < 0) {
 
@@ -230,9 +230,9 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
         throw TypeErrorEx("Expected integer as range start");
     }
 
-    if (end_val.is<long>()) {
+    if (end_val.is<int_type>()) {
 
-        end = end_val.get<long>();
+        end = end_val.get<int_type>();
 
         if (end < 0)
             end += s.size();

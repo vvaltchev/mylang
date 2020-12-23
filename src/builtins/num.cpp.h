@@ -23,13 +23,13 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &val = RValue(arg->eval(ctx));
 
-    if (val.is<long>()) {
+    if (val.is<int_type>()) {
 
         return val;
 
     } else if (val.is<float_type>()) {
 
-        return static_cast<long>(val.get<float_type>());
+        return static_cast<int_type>(val.get<float_type>());
 
     } else if (val.is<FlatSharedStr>()) {
 
@@ -60,9 +60,9 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
 
         return val;
 
-    } else if (val.is<long>()) {
+    } else if (val.is<int_type>()) {
 
-        return static_cast<float_type>(val.get<long>());
+        return static_cast<float_type>(val.get<int_type>());
 
     } else if (val.is<FlatSharedStr>()) {
 
@@ -89,9 +89,9 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (e.is<long>()) {
+    if (e.is<int_type>()) {
 
-        const long val = e.get<long>();
+        const int_type val = e.get<int_type>();
         return val >= 0 ? val : -val;
 
     } else if (e.is<float_type>()) {
@@ -204,9 +204,9 @@ float_func(EvalContext *ctx, ExprList *exprList, funcT f)
 
             x[i] = v.get<float_type>();
 
-        else if (v.is<long>())
+        else if (v.is<int_type>())
 
-            x[i] = static_cast<float_type>(v.get<long>());
+            x[i] = static_cast<float_type>(v.get<int_type>());
 
         else
 
@@ -264,7 +264,7 @@ EvalValue builtin_isnan(EvalContext *ctx, ExprList *exprList)
      * isnan() returns a non-zero value in case of NaN instead just returning
      * a boolean [0, 1]. Therefore, we need to manually convert it to a bool.
      */
-    return !!float_func<1>(ctx, exprList, &isnanl).get<long>();
+    return !!float_func<1>(ctx, exprList, &isnanl).get<int_type>();
 }
 
 EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
@@ -287,13 +287,13 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &v1 = RValue(arg1->eval(ctx));
 
-        if (!v1.is<long>() || v1.get<long>() < 0) {
+        if (!v1.is<int_type>() || v1.get<int_type>() < 0) {
             throw TypeErrorEx(
                 "Expected a non-negative integer", arg1->start, arg1->end
             );
         }
 
-        const float_type base10exp = powl(10.0, v1.get<long>());
+        const float_type base10exp = powl(10.0, v1.get<int_type>());
         return roundl(v0.get<float_type>() * base10exp) / base10exp;
     }
 }

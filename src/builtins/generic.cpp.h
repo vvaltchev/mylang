@@ -54,7 +54,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
             Construct *arg1 = exprList->elems[1].get();
             const EvalValue &p = RValue(arg1->eval(ctx));
 
-            if (!p.is<long>() || p.get<long>() < 0 || p.get<long>() > 64) {
+            if (!p.is<int_type>() || p.get<int_type>() < 0 || p.get<int_type>() > 64) {
 
                 throw TypeErrorEx(
                     "Expected an integer in the range [0, 64]",
@@ -64,7 +64,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
             }
 
             char buf[80];
-            const int precision = static_cast<int>(p.get<long>());
+            const int precision = static_cast<int>(p.get<int_type>());
             snprintf(buf, sizeof(buf), "%.*Lf", precision, e.get<float_type>());
             return FlatSharedStr(string(buf));
         }
@@ -167,10 +167,10 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
 
     } else if (lval->is<FlatSharedArray>()) {
 
-        if (!index_val.is<long>())
+        if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
-        return builtin_erase_arr(lval, index_val.get<long>());
+        return builtin_erase_arr(lval, index_val.get<int_type>());
 
     } else {
 
@@ -208,10 +208,10 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
 
     } else if (lval->is<FlatSharedArray>()) {
 
-        if (!index_val.is<long>())
+        if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
-        return builtin_insert_arr(lval, index_val.get<long>(), val);
+        return builtin_insert_arr(lval, index_val.get<int_type>(), val);
 
     } else {
 
@@ -264,7 +264,7 @@ EvalValue builtin_hash(EvalContext *ctx, ExprList *exprList)
 
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
-    return static_cast<long>(e.hash());
+    return static_cast<int_type>(e.hash());
 }
 
 EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)

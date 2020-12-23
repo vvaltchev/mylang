@@ -1206,8 +1206,8 @@ MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
                           bool process_arrays)
 {
-    if (v.is<long>()) {
-        out = make_unique<LiteralInt>(v.get<long>());
+    if (v.is<int_type>()) {
+        out = make_unique<LiteralInt>(v.get<int_type>());
         return true;
     }
 

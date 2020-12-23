@@ -20,7 +20,7 @@ public:
 
     TypeFunc() : SharedType<FlatSharedFuncObj>(Type::t_func) { }
 
-    long use_count(const EvalValue &a) override;
+    int_type use_count(const EvalValue &a) override;
     EvalValue clone(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
 
@@ -29,14 +29,14 @@ public:
     }
 };
 
-long TypeFunc::use_count(const EvalValue &a)
+int_type TypeFunc::use_count(const EvalValue &a)
 {
     return a.get<FlatSharedFuncObj>().use_count();
 }
 
 EvalValue TypeFunc::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<long>(&a.get<FlatSharedFuncObj>().get());
+    return reinterpret_cast<int_type>(&a.get<FlatSharedFuncObj>().get());
 }
 
 EvalValue TypeFunc::clone(const EvalValue &a)

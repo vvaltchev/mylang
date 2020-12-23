@@ -23,17 +23,17 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (!e.is<long>())
+    if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
-    const long n = e.get<long>();
+    const int_type n = e.get<int_type>();
 
     if (n < 0)
         throw TypeErrorEx("Expected non-negative integer", arg->start, arg->end);
 
     FlatSharedArray::vec_type vec;
 
-    for (long i = 0; i < n; i++)
+    for (int_type i = 0; i < n; i++)
         vec.emplace_back(EvalValue(), ctx->const_ctx);
 
     return FlatSharedArray(move(vec));
@@ -128,7 +128,7 @@ EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
     return view[view.size() - 1].get();
 }
 
-EvalValue builtin_erase_arr(LValue *lval, long index)
+EvalValue builtin_erase_arr(LValue *lval, int_type index)
 {
     FlatSharedArray &arr = lval->getval<FlatSharedArray>();
     const ArrayConstView &view = arr.get_view();
@@ -168,7 +168,7 @@ EvalValue builtin_erase_arr(LValue *lval, long index)
     return true;
 }
 
-EvalValue builtin_insert_arr(LValue *lval, long index, const EvalValue &val)
+EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
 {
     FlatSharedArray &arr = lval->getval<FlatSharedArray>();
     const ArrayConstView &view = arr.get_view();
@@ -199,11 +199,11 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
     if (exprList->elems.size() < 1 || exprList->elems.size() > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    long end, start = 0, step = 1;
+    int_type end, start = 0, step = 1;
     Construct *arg0 = exprList->elems[0].get();
     const EvalValue &val0 = RValue(arg0->eval(ctx));
 
-    if (!val0.is<long>())
+    if (!val0.is<int_type>())
         throw TypeErrorEx("Expected integer", arg0->start, arg0->end);
 
     if (exprList->elems.size() >= 2) {
@@ -211,21 +211,21 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
-        if (!val1.is<long>())
+        if (!val1.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
-        start = val0.get<long>();
-        end = val1.get<long>();
+        start = val0.get<int_type>();
+        end = val1.get<int_type>();
 
         if (exprList->elems.size() == 3) {
 
             Construct *arg2 = exprList->elems[2].get();
             const EvalValue &val2 = RValue(arg2->eval(ctx));
 
-            if (!val2.is<long>())
+            if (!val2.is<int_type>())
                 throw TypeErrorEx("Expected integer", arg2->start, arg2->end);
 
-            step = val2.get<long>();
+            step = val2.get<int_type>();
 
             if (step == 0)
                 throw TypeErrorEx("Expected integer != 0", arg2->start, arg2->end);
@@ -233,19 +233,19 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
 
     } else {
 
-        end = val0.get<long>();
+        end = val0.get<int_type>();
     }
 
     FlatSharedArray::vec_type vec;
 
     if (step > 0) {
 
-        for (long i = start; i < end; i += step)
+        for (int_type i = start; i < end; i += step)
             vec.emplace_back(EvalValue(i), ctx->const_ctx);
 
     } else {
 
-        for (long i = start; i > end; i += step)
+        for (int_type i = start; i > end; i += step)
             vec.emplace_back(EvalValue(i), ctx->const_ctx);
     }
 
@@ -259,7 +259,7 @@ builtin_find_arr(const FlatSharedArray &arr, const EvalValue &v)
 
     for (unsigned i = 0; i < view.size(); i++) {
         if (view[i].get() == v)
-            return static_cast<long>(i);
+            return static_cast<int_type>(i);
     }
 
     return EvalValue();

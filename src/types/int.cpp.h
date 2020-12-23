@@ -40,87 +40,87 @@ public:
 
 void TypeInt::add(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() += b.get<long>();
+    a.get<int_type>() += b.get<int_type>();
 }
 
 void TypeInt::sub(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() -= b.get<long>();
+    a.get<int_type>() -= b.get<int_type>();
 }
 
 void TypeInt::mul(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() *= b.get<long>();
+    a.get<int_type>() *= b.get<int_type>();
 }
 
 void TypeInt::div(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    if (b.get<long>() == 0)
+    if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
 
-    a.get<long>() /= b.get<long>();
+    a.get<int_type>() /= b.get<int_type>();
 }
 
 void TypeInt::mod(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    if (b.get<long>() == 0)
+    if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
 
-    a.get<long>() %= b.get<long>();
+    a.get<int_type>() %= b.get<int_type>();
 }
 
 void TypeInt::lt(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() = a.get<long>() < b.get<long>();
+    a.get<int_type>() = a.get<int_type>() < b.get<int_type>();
 }
 
 void TypeInt::gt(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() = a.get<long>() > b.get<long>();
+    a.get<int_type>() = a.get<int_type>() > b.get<int_type>();
 }
 
 void TypeInt::le(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() = a.get<long>() <= b.get<long>();
+    a.get<int_type>() = a.get<int_type>() <= b.get<int_type>();
 }
 
 void TypeInt::ge(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() = a.get<long>() >= b.get<long>();
+    a.get<int_type>() = a.get<int_type>() >= b.get<int_type>();
 }
 
 void TypeInt::eq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<long>()) {
+    if (b.is<int_type>()) {
 
-        a.get<long>() = a.get<long>() == b.get<long>();
+        a.get<int_type>() = a.get<int_type>() == b.get<int_type>();
 
     } else {
 
@@ -130,9 +130,9 @@ void TypeInt::eq(EvalValue &a, const EvalValue &b)
 
 void TypeInt::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (b.is<long>()) {
+    if (b.is<int_type>()) {
 
-        a.get<long>() = a.get<long>() != b.get<long>();
+        a.get<int_type>() = a.get<int_type>() != b.get<int_type>();
 
     } else {
 
@@ -142,36 +142,36 @@ void TypeInt::noteq(EvalValue &a, const EvalValue &b)
 
 void TypeInt::opneg(EvalValue &a)
 {
-    a.get<long>() = -a.get<long>();
+    a.get<int_type>() = -a.get<int_type>();
 }
 
 void TypeInt::land(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() = a.get<long>() && b.get<long>();
+    a.get<int_type>() = a.get<int_type>() && b.get<int_type>();
 }
 
 void TypeInt::lor(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<long>())
+    if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
-    a.get<long>() = a.get<long>() || b.get<long>();
+    a.get<int_type>() = a.get<int_type>() || b.get<int_type>();
 }
 
 bool TypeInt::is_true(const EvalValue &a)
 {
-    return a.get<long>() != 0;
+    return a.get<int_type>() != 0;
 }
 
 string TypeInt::to_string(const EvalValue &a)
 {
-    return std::to_string(a.get<long>());
+    return std::to_string(a.get<int_type>());
 }
 
 size_t TypeInt::hash(const EvalValue &a)
 {
-    return std::hash<long>()(a.get<long>());
+    return std::hash<int_type>()(a.get<int_type>());
 }

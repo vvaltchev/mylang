@@ -173,7 +173,7 @@ EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)
     if (str.size() != 1)
          throw TypeErrorEx("Expected 1-char string", arg->start, arg->end);
 
-    return static_cast<long>(static_cast<unsigned char>(str[0]));
+    return static_cast<int_type>(static_cast<unsigned char>(str[0]));
 }
 
 EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
@@ -184,10 +184,10 @@ EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &val = RValue(arg->eval(ctx));
 
-    if (!val.is<long>())
+    if (!val.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
-    char c = static_cast<char>(val.get<long>());
+    char c = static_cast<char>(val.get<int_type>());
     return FlatSharedStr(string(&c, 1));
 }
 
@@ -199,7 +199,7 @@ builtin_find_str(const FlatSharedStr &str, const FlatSharedStr &substr)
     if (pos == string::npos)
         return EvalValue();
 
-    return static_cast<long>(pos);
+    return static_cast<int_type>(pos);
 }
 
 template <bool leftpad>
@@ -218,7 +218,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
     if (!strval.is<FlatSharedStr>())
         throw TypeErrorEx("Expected string", arg0->start, arg0->end);
 
-    if (!nval.is<long>())
+    if (!nval.is<int_type>())
         throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
     if (exprList->elems.size() == 3) {
@@ -238,7 +238,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
     }
 
     const string_view &str = strval.get<FlatSharedStr>().get_view();
-    const long n_orig = nval.get<long>();
+    const int_type n_orig = nval.get<int_type>();
 
     if (n_orig < 0)
         throw TypeErrorEx("Expected non-negative integer", arg1->start, arg1->end);

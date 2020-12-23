@@ -41,8 +41,8 @@ inline float_type internal_val_to_float(const EvalValue &b)
     if (b.is<float_type>())
         return b.get<float_type>();
 
-    if (b.is<long>())
-        return b.get<long>();
+    if (b.is<int_type>())
+        return b.get<int_type>();
 
     throw TypeErrorEx("Cannot convert right-side value to float");
 }
@@ -108,9 +108,9 @@ void TypeFloat::eq(EvalValue &a, const EvalValue &b)
 
         a = a.get<float_type>() == b.get<float_type>();
 
-    } else if (b.is<long>()) {
+    } else if (b.is<int_type>()) {
 
-        a = a.get<float_type>() == b.get<long>();
+        a = a.get<float_type>() == b.get<int_type>();
 
     } else {
 
@@ -124,9 +124,9 @@ void TypeFloat::noteq(EvalValue &a, const EvalValue &b)
 
         a = a.get<float_type>() != b.get<float_type>();
 
-    } else if (b.is<long>()) {
+    } else if (b.is<int_type>()) {
 
-        a = a.get<float_type>() != b.get<long>();
+        a = a.get<float_type>() != b.get<int_type>();
 
     } else {
 

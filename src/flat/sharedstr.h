@@ -24,7 +24,7 @@ public:
     const inner_type &get_ref() const { return flat.get(); }
     FlatSharedVal<inner_type> &get_shval() { return flat; }
     const FlatSharedVal<inner_type> &get_shval() const { return flat; }
-    long use_count() const { return flat.use_count(); }
+    int_type use_count() const { return flat.use_count(); }
 
     FlatSharedStr() = default;
 

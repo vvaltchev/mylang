@@ -23,15 +23,15 @@ public:
     void noteq(EvalValue &a, const EvalValue &b) override;
     EvalValue subscript(const EvalValue &what_lval, const EvalValue &idx_val);
 
-    long len(const EvalValue &a) override;
-    long use_count(const EvalValue &a) override;
+    int_type len(const EvalValue &a) override;
+    int_type use_count(const EvalValue &a) override;
     EvalValue clone(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
     bool is_true(const EvalValue &a) override;
 };
 
-long TypeDict::len(const EvalValue &a)
+int_type TypeDict::len(const EvalValue &a)
 {
     return a.get<FlatSharedDictObj>().get().get_ref().size();
 }
@@ -118,14 +118,14 @@ bool TypeDict::is_true(const EvalValue &a)
     return a.get<FlatSharedDictObj>()->get_ref().size() > 0;
 }
 
-long TypeDict::use_count(const EvalValue &a)
+int_type TypeDict::use_count(const EvalValue &a)
 {
     return a.get<FlatSharedFuncObj>().use_count();
 }
 
 EvalValue TypeDict::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<long>(
+    return reinterpret_cast<int_type>(
         &a.get<FlatSharedDictObj>().get().get_ref()
     );
 }

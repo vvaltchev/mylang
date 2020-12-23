@@ -28,22 +28,22 @@ public:
                     const EvalValue &start,
                     const EvalValue &end) override;
 
-    long use_count(const EvalValue &a) override;
+    int_type use_count(const EvalValue &a) override;
     bool is_slice(const EvalValue &a) override;
     EvalValue clone(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
 
-    long len(const EvalValue &a) override;
+    int_type len(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
     bool is_true(const EvalValue &a) override;
 };
 
-long TypeArr::len(const EvalValue &a)
+int_type TypeArr::len(const EvalValue &a)
 {
     return a.get<FlatSharedArray>().size();
 }
 
-long TypeArr::use_count(const EvalValue &a)
+int_type TypeArr::use_count(const EvalValue &a)
 {
     return a.get<FlatSharedArray>().use_count();
 }
@@ -63,7 +63,7 @@ EvalValue TypeArr::clone(const EvalValue &a)
 
 EvalValue TypeArr::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<long>(&a.get<FlatSharedArray>().get_ref());
+    return reinterpret_cast<int_type>(&a.get<FlatSharedArray>().get_ref());
 }
 
 void TypeArr::add(EvalValue &a, const EvalValue &b)
@@ -144,7 +144,7 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
 void TypeArr::noteq(EvalValue &a, const EvalValue &b)
 {
     eq(a, b);
-    a = !a.get<long>();
+    a = !a.get<int_type>();
 }
 
 string TypeArr::to_string(const EvalValue &a)
@@ -176,13 +176,13 @@ bool TypeArr::is_true(const EvalValue &a)
 
 EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
 {
-    if (!idx_val.is<long>())
+    if (!idx_val.is<int_type>())
         throw TypeErrorEx("Expected integer as subscript");
 
     const EvalValue &what = RValue(what_lval);
     FlatSharedArray &&arr = what.get<FlatSharedArray>();
     FlatSharedArray::vec_type &vec = arr.get_ref();
-    long idx = idx_val.get<long>();
+    int_type idx = idx_val.get<int_type>();
 
     if (idx < 0)
         idx += arr.size();
@@ -209,11 +209,11 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
 {
     const EvalValue &what = RValue(what_lval);
     const FlatSharedArray &arr = what.get<FlatSharedArray>();
-    long start = 0, end = arr.size();
+    int_type start = 0, end = arr.size();
 
-    if (start_val.is<long>()) {
+    if (start_val.is<int_type>()) {
 
-        start = start_val.get<long>();
+        start = start_val.get<int_type>();
 
         if (start < 0) {
 
@@ -231,9 +231,9 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
         throw TypeErrorEx("Expected integer as range start");
     }
 
-    if (end_val.is<long>()) {
+    if (end_val.is<int_type>()) {
 
-        end = end_val.get<long>();
+        end = end_val.get<int_type>();
 
         if (end < 0)
             end += arr.size();

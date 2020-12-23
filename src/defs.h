@@ -29,3 +29,4 @@ using std::make_unique;
 /* Custom type defs */
 
 typedef long double float_type;
+typedef long int int_type;

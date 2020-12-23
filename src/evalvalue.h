@@ -48,7 +48,7 @@ struct TypeToEnum;
 template <> struct TypeToEnum<NoneVal> { enum { val = Type::t_none }; };
 template <> struct TypeToEnum<LValue *> { enum { val = Type::t_lval }; };
 template <> struct TypeToEnum<UndefinedId> { enum { val = Type::t_undefid }; };
-template <> struct TypeToEnum<long> { enum { val = Type::t_int }; };
+template <> struct TypeToEnum<int_type> { enum { val = Type::t_int }; };
 template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
 template <> struct TypeToEnum<float_type> { enum { val = Type::t_float }; };
 template <> struct TypeToEnum<FlatSharedStr> { enum { val = Type::t_str }; };
@@ -65,7 +65,7 @@ class EvalValue final {
         NoneVal none;
         LValue *lval;
         UndefinedId undef;
-        long ival;
+        int_type ival;
         Builtin bfunc;
         float_type ldval;
 
@@ -79,7 +79,7 @@ class EvalValue final {
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }
         ValueU(const UndefinedId &val) : undef(val) { }
-        ValueU(long val) : ival(val) { }
+        ValueU(int_type val) : ival(val) { }
         ValueU(const Builtin &val) : bfunc(val) { }
         ValueU(float_type val) : ldval(val) { }
     };
@@ -108,7 +108,7 @@ public:
         >
     >
     EvalValue(T val)
-        : val(static_cast<long>(val)), type(AllTypes[Type::t_int]) { }
+        : val(static_cast<int_type>(val)), type(AllTypes[Type::t_int]) { }
 
     /*
      * Constructor accepting ONLY known types defined in enum TypeE.
@@ -191,42 +191,42 @@ public:
 
         EvalValue tmp = *this;
         tmp.type->eq(tmp, rhs);
-        return tmp.get<long>() != 0;
+        return tmp.get<int_type>() != 0;
     }
 
     bool operator!=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         tmp.type->noteq(tmp, rhs);
-        return tmp.get<long>() != 0;
+        return tmp.get<int_type>() != 0;
     }
 
     bool operator<(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         tmp.type->lt(tmp, rhs);
-        return tmp.get<long>() != 0;
+        return tmp.get<int_type>() != 0;
     }
 
     bool operator<=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         tmp.type->le(tmp, rhs);
-        return tmp.get<long>() != 0;
+        return tmp.get<int_type>() != 0;
     }
 
     bool operator>(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         tmp.type->gt(tmp, rhs);
-        return tmp.get<long>() != 0;
+        return tmp.get<int_type>() != 0;
     }
 
     bool operator>=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         tmp.type->ge(tmp, rhs);
-        return tmp.get<long>() != 0;
+        return tmp.get<int_type>() != 0;
     }
 
     std::string to_string() const {

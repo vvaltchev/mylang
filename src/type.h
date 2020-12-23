@@ -129,7 +129,7 @@ public:
         throw TypeErrorEx("The object does NOT support conversion to string");
     }
 
-    virtual long len(const EvalValueT &a) {
+    virtual int_type len(const EvalValueT &a) {
         throw TypeErrorEx("The object does NOT support len()");
     }
 
@@ -149,7 +149,7 @@ public:
         throw TypeErrorEx("The object does NOT support slice operator []");
     }
 
-    virtual long use_count(const EvalValueT &a)
+    virtual int_type use_count(const EvalValueT &a)
     {
         return 1;
     }
@@ -167,7 +167,7 @@ public:
     virtual EvalValueT intptr(const EvalValueT &a)
     {
         assert(!a.template is<LValue *>() && !a.template is<UndefinedId>());
-        return reinterpret_cast<long>(&a);
+        return reinterpret_cast<int_type>(&a);
     }
 
     virtual size_t hash(const EvalValueT &a)

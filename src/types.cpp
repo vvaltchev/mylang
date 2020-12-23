@@ -42,10 +42,10 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (!e.is<long>())
+    if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
-    exit(e.get<long>());
+    exit(e.get<int_type>());
 }
 
 EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)
