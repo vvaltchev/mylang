@@ -20,8 +20,6 @@
 #include <cassert>
 #include <cstddef>
 
-
-
 class LValue;
 class ExprList;
 class FuncDeclStmt;
@@ -31,14 +29,19 @@ class EvalContext;
 class FuncObject;
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
+/* Base typedefs */
+typedef DictObjectTempl<EvalValue, LValue> DictObject;
+typedef ExceptionObjectTempl<EvalValue> ExceptionObject;
+
+/* Flat type wrapper */
 typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
 typedef FlatSharedArrayTempl<LValue> FlatSharedArray;
+typedef FlatSharedExceptionTempl<EvalValue> FlatSharedException;
+typedef FlatSharedVal<DictObject> FlatSharedDictObj;
+
+/* Other types */
 typedef TypeTemplate<EvalValue> Type;
 typedef ArrayConstViewTempl<LValue> ArrayConstView;
-typedef FlatSharedExceptionTempl<EvalValue> FlatSharedException;
-typedef ExceptionObjectTempl<EvalValue> ExceptionObject;
-typedef DictObjectTempl<EvalValue, LValue> DictObject;
-typedef FlatSharedVal<DictObject> FlatSharedDictObj;
 
 extern const std::array<Type *, Type::t_count> AllTypes;
 
@@ -59,6 +62,10 @@ template <> struct TypeToEnum<FlatSharedDictObj> { enum { val = Type::t_dict }; 
 
 class EvalValue final {
 
+    /*
+     * Why not just using std::variant? Because it's much slower.
+     * See flatval.h.
+     */
     union ValueU {
 
         /* trivial types */
