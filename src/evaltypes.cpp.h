@@ -10,9 +10,6 @@
 #include "evalvalue.h"
 #include <cstring>
 
-const string &
-find_builtin_name(const Builtin &b);
-
 /*
  * Special base class for any Type class related to non-trivial C++ type.
  * Typically, the object is just a shared_ptr<T> and in that case it's enough
@@ -114,7 +111,7 @@ public:
     }
 };
 
-const string &
+string_view
 find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::const_builtins) {
@@ -135,6 +132,6 @@ class TypeBuiltin : public Type {
 public:
     TypeBuiltin() : Type(Type::t_builtin) { }
     string to_string(const EvalValue &a) override {
-        return "<builtin: " + find_builtin_name(a.get<Builtin>()) + ">";
+        return "<builtin: " + string(find_builtin_name(a.get<Builtin>())) + ">";
     }
 };
