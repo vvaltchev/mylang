@@ -10,19 +10,19 @@
 template <class EvalValueT>
 class ExceptionObjectTempl : public RuntimeException {
 
-    string dyn_name;
+    std::string dyn_name;
     EvalValueT data;
 
 public:
 
-    ExceptionObjectTempl(const string &name,
+    ExceptionObjectTempl(const std::string &name,
                          const EvalValueT &data = EvalValueT())
         : RuntimeException("DynamicExceptionEx", nullptr)
         , dyn_name(name)
         , data(data)
     { }
 
-    string_view get_name() const {
+    std::string_view get_name() const {
         return dyn_name;
     };
 

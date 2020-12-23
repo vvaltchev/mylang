@@ -9,8 +9,6 @@
 #include <memory>
 #include <string_view>
 
-using namespace std;
-
 class EvalContext;
 class Block;
 
@@ -18,12 +16,12 @@ class TokenStream {
 
 private:
 
-    typename vector<Tok>::const_iterator pos;
-    typename vector<Tok>::const_iterator end;
+    typename std::vector<Tok>::const_iterator pos;
+    typename std::vector<Tok>::const_iterator end;
 
 public:
 
-    TokenStream(const vector<Tok> &tokens)
+    TokenStream(const std::vector<Tok> &tokens)
         : pos(tokens.cbegin())
         , end(tokens.cend()) { }
 
@@ -57,7 +55,7 @@ public:
     const Tok &get_tok() const { return ts.get(); }
     Op get_op() const { return ts.get().op; }
     Loc get_loc() const { return ts.get().loc; }
-    string_view get_str() const { return ts.get().value; }
+    std::string_view get_str() const { return ts.get().value; }
     bool eoi() const { return ts.get() == TokType::invalid; }
 
     /* token operations with side-effect */

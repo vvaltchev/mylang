@@ -11,8 +11,6 @@
 #include <string_view>
 #include <cassert>
 
-using namespace std;
-
 enum class TokType : int {
 
     invalid     = 0,   /* no token */
@@ -28,7 +26,7 @@ enum class TokType : int {
     count       = 8,
 };
 
-static const array<string, (int)Op::op_count> OpString =
+static const std::array<std::string, (int)Op::op_count> OpString =
 {
     "invalid",
 
@@ -99,7 +97,7 @@ enum class Keyword : int {
     kw_count    = 24,
 };
 
-static const array<string, (int)Keyword::kw_count> KwString =
+static const std::array<std::string, (int)Keyword::kw_count> KwString =
 {
     "invalid",
 
@@ -128,7 +126,7 @@ static const array<string, (int)Keyword::kw_count> KwString =
     "pure",
 };
 
-ostream &operator<<(ostream &s, TokType t);
+std::ostream &operator<<(std::ostream &s, TokType t);
 
 class Tok {
 
@@ -136,13 +134,13 @@ public:
 
     const TokType type;
     const Loc loc;
-    const string_view value;
+    const std::string_view value;
     const Op op;
     const Keyword kw;
 
     Tok() : type(TokType::invalid), op(Op::invalid), kw(Keyword::kw_invalid) { }
 
-    Tok(TokType type, Loc loc, string_view value)
+    Tok(TokType type, Loc loc, std::string_view value)
         : type(type)
         , loc(loc)
         , value(value)
@@ -194,6 +192,6 @@ public:
 
 extern const Tok invalid_tok;
 
-ostream &operator<<(ostream &s, const Tok &t);
-void lexer(string_view in_str, int line, vector<Tok> &result);
+std::ostream &operator<<(std::ostream &s, const Tok &t);
+void lexer(std::string_view in_str, int line, std::vector<Tok> &result);
 

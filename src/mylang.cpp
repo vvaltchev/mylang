@@ -11,19 +11,15 @@
 #include <cstring>
 #include <cctype>
 
-/*
- * For small C++ projects, often using std everywhere is better because
- * it reduces the clutter (no "std::") and makes the code look cleaner.
- */
-using namespace std;
+using std::string;
 
 static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
 static bool opt_no_const_eval;
 static bool opt_no_run;
 
-static vector<string> lines;
-static vector<Tok> tokens;
+static std::vector<string> lines;
+static std::vector<Tok> tokens;
 
 void run_tests(bool dump_syntax_tree);
 
@@ -47,7 +43,7 @@ read_script(const char *filename)
 {
     {
         string line;
-        ifstream filestream(filename);
+        std::ifstream filestream(filename);
 
         if (filestream.is_open()) {
 
@@ -181,7 +177,7 @@ dumpLocInError(const Exception &e)
         }
 
         if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
-            cerr << string(max(1, e.loc_end.col - e.loc_start.col - 1), '^');
+            cerr << string(std::max(1, e.loc_end.col - e.loc_start.col - 1), '^');
         else
             cerr << "^";
     }

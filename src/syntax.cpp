@@ -3,6 +3,9 @@
 #include "errors.h"
 #include "syntax.h"
 
+using std::string;
+using std::string_view;
+
 static string
 escapeStr(const string_view &v)
 {
@@ -177,7 +180,7 @@ void LiteralInt::serialize(ostream &s, int level) const
 
     s << indent;
     s << string("Int(");
-    s << to_string(value);
+    s << std::to_string(value);
     s << ")";
 }
 
@@ -187,7 +190,7 @@ void LiteralFloat::serialize(ostream &s, int level) const
 
     s << indent;
     s << string("Float(");
-    s << to_string(value);
+    s << std::to_string(value);
     s << ")";
 }
 

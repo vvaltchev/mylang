@@ -6,8 +6,6 @@
 #include <string_view>
 #include "operators.h"
 
-using namespace std;
-
 struct Loc {
 
     int line;
@@ -106,9 +104,9 @@ struct RuntimeException : public Exception {
 
 struct InvalidTokenEx : public Exception {
 
-    const string_view val;
+    const std::string_view val;
 
-    InvalidTokenEx(const string_view &val)
+    InvalidTokenEx(const std::string_view &val)
         : Exception("InvalidTokenEx", "Invalid token error")
         , val(val)
     { }
@@ -134,10 +132,10 @@ DECL_RUNTIME_EX(OutOfBoundsEx, "Out of bounds error")
 
 struct UndefinedVariableEx : public Exception {
 
-    const string_view name;
+    const std::string_view name;
     bool in_pure_func;
 
-    UndefinedVariableEx(const string_view &name, Loc start = Loc(), Loc end = Loc())
+    UndefinedVariableEx(const std::string_view &name, Loc start = Loc(), Loc end = Loc())
         : Exception("UndefinedVariable", nullptr, start, end)
         , name(name)
         , in_pure_func(false)

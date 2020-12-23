@@ -12,6 +12,9 @@
 #include "evalvalue.h"
 #include <cstring>
 
+using std::string;
+using std::string_view;
+
 /*
  * Special base class for any Type class related to non-trivial C++ type.
  * Typically, the object is just a shared_ptr<T> and in that case it's enough

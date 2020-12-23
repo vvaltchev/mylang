@@ -4,6 +4,8 @@
 #include "eval.h"
 #include "syntax.h"
 
+using std::string;
+
 ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
     : ts(ts)
     , const_eval(const_eval)
@@ -223,7 +225,7 @@ void pExpectOp(ParseContext &c, Op exp)
 }
 
 Op
-AcceptOneOf(ParseContext &c, initializer_list<Op> list)
+AcceptOneOf(ParseContext &c, std::initializer_list<Op> list)
 {
     for (auto op : list) {
         if (pAcceptOp(c, op))
@@ -531,7 +533,7 @@ template <class ExprT>
 unique_ptr<Construct>
 pExprGeneric(ParseContext &c,
              unique_ptr<Construct> (*lowerExpr)(ParseContext&, unsigned),
-             initializer_list<Op> ops,
+             std::initializer_list<Op> ops,
              unsigned fl)
 {
     Op op;
@@ -675,7 +677,7 @@ declExprCheckId(ParseContext &c, Construct *id)
 unique_ptr<Construct>
 pExpr14(ParseContext &c, unsigned fl)
 {
-    static const initializer_list<Op> valid_ops = {
+    static const std::initializer_list<Op> valid_ops = {
         Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq
     };
 

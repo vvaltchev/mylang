@@ -5,6 +5,11 @@
 #include "syntax.h"
 #include "lexer.h"
 
+using std::pair;
+using std::vector;
+using std::string;
+using std::string_view;
+
 EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     : parent(parent)
     , const_ctx(const_ctx)

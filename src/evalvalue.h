@@ -20,7 +20,7 @@
 #include <cassert>
 #include <cstddef>
 
-using namespace std;
+
 
 class LValue;
 class ExprList;
@@ -40,7 +40,7 @@ typedef ExceptionObjectTempl<EvalValue> ExceptionObject;
 typedef DictObjectTempl<EvalValue, LValue> DictObject;
 typedef FlatSharedVal<DictObject> FlatSharedDictObj;
 
-extern const array<Type *, Type::t_count> AllTypes;
+extern const std::array<Type *, Type::t_count> AllTypes;
 
 template <class T>
 struct TypeToEnum;
@@ -102,9 +102,9 @@ public:
      */
     template <
         class T,
-        class = enable_if_t<                      /* SFINAE template param */
-            is_same_v<T, bool> ||                 /* disallow for T != bool, int */
-            is_same_v<T, int>
+        class = std::enable_if_t<                      /* SFINAE template param */
+            std::is_same_v<T, bool> ||                 /* disallow for T != bool, int */
+            std::is_same_v<T, int>
         >
     >
     EvalValue(T val)
@@ -114,13 +114,13 @@ public:
      * Constructor accepting ONLY known types defined in enum TypeE.
      */
     template <
-        class T,                                  /* actual template param */
-        class U = remove_const_t<                 /* helper template param */
-            remove_reference_t<T>
+        class T,                                       /* actual template param */
+        class U = std::remove_const_t<                 /* helper template param */
+            std::remove_reference_t<T>
         >,
-        class = enable_if_t<                      /* SFINAE template param */
-            !is_same_v<U, EvalValue> &&           /* disallow EvalValue */
-            TypeToEnum<U>::val != Type::t_count   /* disallow types not in TypeToEnum */
+        class = std::enable_if_t<                      /* SFINAE template param */
+            !std::is_same_v<U, EvalValue> &&           /* disallow EvalValue */
+            TypeToEnum<U>::val != Type::t_count        /* disallow types not in TypeToEnum */
         >
     >
     EvalValue(T &&val);
@@ -229,7 +229,7 @@ public:
         return tmp.get<long>() != 0;
     }
 
-    string to_string() const {
+    std::string to_string() const {
         return type->to_string(*this);
     };
 
@@ -259,7 +259,7 @@ inline EvalValue::EvalValue(T &&new_val)
 {
     if constexpr(static_cast<Type::TypeE>(TypeToEnum<U>::val) >= Type::t_str) {
 
-        if constexpr(is_lvalue_reference_v<T>) {
+        if constexpr(std::is_lvalue_reference_v<T>) {
 
             type->copy_ctor(
                 reinterpret_cast<void *>( &val ),
@@ -468,7 +468,7 @@ is_true(const EvalValue &v)
 
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
-                    const vector<EvalValue> &args);
+                    const std::vector<EvalValue> &args);
 
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
@@ -476,4 +476,4 @@ EvalValue eval_func(EvalContext *ctx,
 
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
-                    const pair<EvalValue, EvalValue> &args);
+                    const std::pair<EvalValue, EvalValue> &args);

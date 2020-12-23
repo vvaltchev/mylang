@@ -5,14 +5,13 @@
 #include "defs.h"
 #include "evalvalue.h"
 #include <map>
-
-using namespace std;
+#include <string>
 
 class EvalContext {
 
 public:
 
-    typedef map<string, LValue, less<>> SymbolsType;
+    typedef std::map<std::string, LValue, std::less<>> SymbolsType;
     EvalContext *const parent;
     const bool const_ctx;
     const bool func_ctx;

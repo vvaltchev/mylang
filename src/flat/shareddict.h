@@ -4,17 +4,13 @@
 
 #include "defs.h"
 #include "flatval.h"
-#include <vector>
 #include <unordered_map>
-#include <cassert>
-
-using namespace std;
 
 template <class EvalValueT, class LValueT>
 class DictObjectTempl {
 
 public:
-    typedef unordered_map<EvalValueT, LValueT> inner_type;
+    typedef std::unordered_map<EvalValueT, LValueT> inner_type;
 
 private:
     inner_type data;

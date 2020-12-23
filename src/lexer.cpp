@@ -5,16 +5,16 @@
 
 #include <map>
 #include <vector>
-
 #include <cctype>
-
-using namespace std;
 
 const Tok invalid_tok;
 
-static const map<string, Op, less<>> operators = [] {
+using std::string;
+using std::string_view;
 
-    map<string, Op, less<>> ret;
+static const std::map<string, Op, std::less<>> operators = [] {
+
+    std::map<string, Op, std::less<>> ret;
 
     for (size_t i = 1; i < OpString.size(); i++)
         ret.emplace(OpString[i], (Op)i);
@@ -22,9 +22,9 @@ static const map<string, Op, less<>> operators = [] {
     return ret;
 }();
 
-static const map<string, Keyword, less<>> keywords = [] {
+static const std::map<string, Keyword, std::less<>> keywords = [] {
 
-    map<string, Keyword, less<>> ret;
+    std::map<string, Keyword, std::less<>> ret;
 
     for (size_t i = 1; i < KwString.size(); i++)
         ret.emplace(KwString[i], (Keyword)i);
@@ -104,7 +104,7 @@ struct lexer_ctx {
 
     /* Input params */
     const string_view in_str;
-    vector<Tok> &result;
+    std::vector<Tok> &result;
     const int line;
 
     /* State variables */
@@ -113,7 +113,7 @@ struct lexer_ctx {
     bool float_exp = false;
     TokType tok_type = TokType::invalid;
 
-    lexer_ctx(const string_view &in_str, int line, vector<Tok> &result)
+    lexer_ctx(const string_view &in_str, int line, std::vector<Tok> &result)
         : in_str(in_str)
         , result(result)
         , line(line)
@@ -294,7 +294,7 @@ lexer_ctx::handle_other()
 }
 
 void
-lexer(string_view in_str, int line, vector<Tok> &result)
+lexer(string_view in_str, int line, std::vector<Tok> &result)
 {
     lexer_ctx ctx(in_str, line, result);
 

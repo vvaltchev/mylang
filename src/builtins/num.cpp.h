@@ -255,8 +255,8 @@ INST_FLOAT_BUILTIN_1(ceil);
 INST_FLOAT_BUILTIN_1(floor);
 INST_FLOAT_BUILTIN_1(trunc);
 INST_FLOAT_BUILTIN_1_ex(isinf, int (*)(long double), isinfl);
-INST_FLOAT_BUILTIN_1_ex(isfinite, bool (*)(long double), isfinite);
-INST_FLOAT_BUILTIN_1_ex(isnormal, bool (*)(long double), isnormal);
+INST_FLOAT_BUILTIN_1_ex(isfinite, bool (*)(long double), std::isfinite);
+INST_FLOAT_BUILTIN_1_ex(isnormal, bool (*)(long double), std::isnormal);
 
 EvalValue builtin_isnan(EvalContext *ctx, ExprList *exprList)
 {

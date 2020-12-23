@@ -51,7 +51,7 @@ EvalValue builtin_read(EvalContext *ctx, ExprList *exprList)
     if (exprList->elems.size() != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    return FlatSharedStr(string(istreambuf_iterator<char>(cin), {}));
+    return FlatSharedStr(string(std::istreambuf_iterator<char>(cin), {}));
 }
 
 EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList)

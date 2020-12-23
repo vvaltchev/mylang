@@ -19,7 +19,7 @@
 #include <cmath>
 #include <limits>
 
-static const array<FlatSharedStr, Type::t_count> TypeNames =
+static const std::array<FlatSharedStr, Type::t_count> TypeNames =
 {
     string("none"),
     string(),
@@ -93,7 +93,7 @@ EvalValue builtin_exdata(EvalContext *ctx, ExprList *exprList)
     return e.get<FlatSharedException>().get_ref().get_data();
 }
 
-const array<Type *, Type::t_count> AllTypes =
+const std::array<Type *, Type::t_count> AllTypes =
 {
     /* Trivial types */
     new TypeNone(),
@@ -119,7 +119,7 @@ const array<Type *, Type::t_count> AllTypes =
  */
 
 const EvalValue empty_str = FlatSharedStr(string());
-const EvalValue empty_arr = FlatSharedArray(vector<LValue>());
+const EvalValue empty_arr = FlatSharedArray(std::vector<LValue>());
 
 inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
 {
@@ -211,7 +211,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("math_1_sqrt2", M_SQRT1_2), /* 1/sqrt(2) */
     make_const_builtin("nan", NAN), /* 1/sqrt(2) */
     make_const_builtin("inf", INFINITY), /* 1/sqrt(2) */
-    make_const_builtin("eps", numeric_limits<long double>::epsilon()),
+    make_const_builtin("eps", std::numeric_limits<long double>::epsilon()),
 };
 
 EvalContext::SymbolsType EvalContext::builtins =

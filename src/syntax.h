@@ -107,7 +107,7 @@ public:
 class MultiOpConstruct : public Construct {
 
 public:
-    vector<pair<Op, unique_ptr<Construct>>> elems;
+    std::vector<std::pair<Op, unique_ptr<Construct>>> elems;
 
     MultiOpConstruct(const char *name) : Construct(name) { }
     void serialize(ostream &s, int level = 0) const override;
@@ -121,7 +121,7 @@ class MultiElemConstruct : public Construct {
 
 public:
     typedef ElemT ElemType;
-    vector<unique_ptr<ElemType>> elems;
+    std::vector<unique_ptr<ElemType>> elems;
 
     MultiElemConstruct(const char *name, ConstructType ct = ConstructType::other)
         : Construct(name, false, ct)
@@ -133,7 +133,7 @@ public:
 template <class T>
 void MultiElemConstruct<T>::serialize(ostream &s, int level) const
 {
-    string indent(level * 2, ' ');
+    std::string indent(level * 2, ' ');
 
     s << indent;
     s << name << "(\n";
@@ -216,7 +216,7 @@ class LiteralStr final: public Literal {
 
 public:
 
-    LiteralStr(string_view v);
+    LiteralStr(std::string_view v);
 
     LiteralStr(const EvalValue &v) : value(v) { }
     LiteralStr(EvalValue &&v) : value(move(v)) { }
@@ -260,7 +260,7 @@ public:
 class Identifier final: public Construct {
 
 public:
-    string_view value;
+    std::string_view value;
 
     template <class T>
     Identifier(T &&arg) : Construct("Id"), value(forward<T>(arg)) { }
@@ -476,7 +476,7 @@ public:
 
     unique_ptr<Construct> tryBody;
     unique_ptr<Construct> finallyBody;
-    vector<pair<AllowedExList, unique_ptr<Construct>>> catchStmts;
+    std::vector<std::pair<AllowedExList, unique_ptr<Construct>>> catchStmts;
 
     TryCatchStmt() : Construct("TryCatchStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;

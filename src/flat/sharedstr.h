@@ -9,7 +9,7 @@
 class FlatSharedStr final {
 
 public:
-    typedef string inner_type;
+    typedef std::string inner_type;
 
 private:
 
@@ -48,8 +48,8 @@ public:
         , slice(true)
     { }
 
-    string_view get_view() const {
-        return string_view(flat->data() + offset(), size());
+    std::string_view get_view() const {
+        return std::string_view(flat->data() + offset(), size());
     }
 
     bool is_slice() const { return slice; }

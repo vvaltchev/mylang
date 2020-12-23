@@ -8,7 +8,6 @@
 #include <unordered_set>
 #include <cassert>
 
-using namespace std;
 
 /*
  * These classes are templates simply because otherwise this header wouldn't be
@@ -21,13 +20,13 @@ using namespace std;
 template <class LValueT>
 class ArrayConstViewTempl {
 
-    const vector<LValueT> &vec;
+    const std::vector<LValueT> &vec;
     const unsigned off;
     const unsigned len;
 
 public:
 
-    ArrayConstViewTempl(const vector<LValueT> &vec, unsigned off, unsigned len)
+    ArrayConstViewTempl(const std::vector<LValueT> &vec, unsigned off, unsigned len)
         : vec(vec), off(off), len(len)
     { }
 
@@ -47,7 +46,7 @@ class FlatSharedArrayTempl final {
     class SharedArrayObj final {
 
     public:
-        typedef vector<LValueT> vec_type;
+        typedef std::vector<LValueT> vec_type;
 
     private:
         static const unsigned all_slices = static_cast<unsigned>(-1);
@@ -55,7 +54,7 @@ class FlatSharedArrayTempl final {
         struct SharedObject final {
 
             vec_type vec;
-            unordered_set<SharedArrayObj *> slices;
+            std::unordered_set<SharedArrayObj *> slices;
 
             SharedObject() = default;
             SharedObject(vec_type &&arr)

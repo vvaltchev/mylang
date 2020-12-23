@@ -4,7 +4,7 @@
 #include <iomanip>
 #include <cstdlib>
 
-using namespace std;
+
 
 #ifdef TESTS
 
@@ -17,14 +17,17 @@ using namespace std;
 #include <typeinfo>
 #include <vector>
 
+using std::setw;
+using std::setfill;
+
 struct test {
 
     const char *name;
-    vector<const char *> source;
-    const type_info *ex = nullptr;
+    std::vector<const char *> source;
+    const std::type_info *ex = nullptr;
 };
 
-static const vector<test> tests =
+static const std::vector<test> tests =
 {
     {
         "variable decl",
@@ -2493,7 +2496,7 @@ static const vector<test> tests =
 };
 
 static void
-dump_expected_ex(const type_info *ex, const type_info *got)
+dump_expected_ex(const std::type_info *ex, const std::type_info *got)
 {
     cout << "  Expected EX: " << (ex ? ex->name() : "<none>") << endl;
     cout << "  Got EX     : " << (got ? got->name() : "<none>") << endl;
@@ -2502,7 +2505,7 @@ dump_expected_ex(const type_info *ex, const type_info *got)
 static bool
 check(const test &t, int &err_line, bool dump_syntax_tree)
 {
-    vector<Tok> tokens;
+    std::vector<Tok> tokens;
     unique_ptr<Construct> root;
 
     try {

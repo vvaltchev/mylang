@@ -4,7 +4,7 @@
 
 #include "defs.h"
 #include <memory>
-using namespace std;
+
 
 /*
  * This special class allows us to store a non-trivial type in a union.

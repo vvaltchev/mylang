@@ -9,7 +9,7 @@
 
 class LValue;
 struct NoneVal { };
-struct UndefinedId { string_view id; };
+struct UndefinedId { std::string_view id; };
 
 /*
  * This class is a template simply because otherwise this header wouldn't be
@@ -125,7 +125,7 @@ public:
         throw TypeErrorEx("The object does NOT support conversion to bool");
     }
 
-    virtual string to_string(const EvalValueT &a) {
+    virtual std::string to_string(const EvalValueT &a) {
         throw TypeErrorEx("The object does NOT support conversion to string");
     }
 
