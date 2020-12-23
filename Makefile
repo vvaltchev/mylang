@@ -44,7 +44,7 @@ $(BUILD_DIR)/%.o : src/%.cpp $(DEPDIR)/%.d
 
 $(BUILD_DIR)/$(TARGET): $(OBJECTS)
 	@echo Linking $(TARGET)...
-	@$(CXX) $(OBJECTS) -o $@ $(LFLAGS)
+	@$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)
 
 clean:
 	rm -f $(BUILD_DIR)/*.o

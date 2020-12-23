@@ -1,0 +1,8 @@
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+- script: make -j TESTS=1
+  displayName: Build the project
+- script: ./build/mylang -rt
+  displayName: Run the unit tests

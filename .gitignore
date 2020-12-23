@@ -31,5 +31,6 @@
 *.out
 *.app
 
-# Specific files to ignore
+# Specific files and directories to ignore
 mylang
+build
