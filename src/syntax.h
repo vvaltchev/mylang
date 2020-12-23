@@ -260,7 +260,7 @@ public:
 class Identifier final: public Construct {
 
 public:
-    std::string_view value;
+    const std::string value;
 
     template <class T>
     Identifier(T &&arg) : Construct("Id"), value(forward<T>(arg)) { }
