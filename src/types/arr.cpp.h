@@ -130,7 +130,7 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
         return;
     }
 
-    for (unsigned i = 0; i < lhs.size(); i++) {
+    for (size_type i = 0; i < lhs.size(); i++) {
 
         if (lhs_view[i].get() != rhs_view[i].get()) {
             a = false;
@@ -156,7 +156,7 @@ string TypeArr::to_string(const EvalValue &a)
     res.reserve(arr.size() * 32);
     res += "[";
 
-    for (unsigned i = 0; i < arr_view.size(); i++) {
+    for (size_type i = 0; i < arr_view.size(); i++) {
 
         const EvalValue &val = arr_view[i].get();
         res += val.to_string();

@@ -21,12 +21,12 @@ template <class LValueT>
 class ArrayConstViewTempl {
 
     const std::vector<LValueT> &vec;
-    const unsigned off;
-    const unsigned len;
+    const size_type off;
+    const size_type len;
 
 public:
 
-    ArrayConstViewTempl(const std::vector<LValueT> &vec, unsigned off, unsigned len)
+    ArrayConstViewTempl(const std::vector<LValueT> &vec, size_type off, size_type len)
         : vec(vec), off(off), len(len)
     { }
 
@@ -34,7 +34,7 @@ public:
         return vec[off + index];
     }
 
-    unsigned size() const {
+    size_type size() const {
         return len;
     }
 };
@@ -49,7 +49,7 @@ class FlatSharedArrayTempl final {
         typedef std::vector<LValueT> vec_type;
 
     private:
-        static const unsigned all_slices = static_cast<unsigned>(-1);
+        static const size_type all_slices = static_cast<size_type>(-1);
 
         struct SharedObject final {
 
@@ -65,8 +65,8 @@ class FlatSharedArrayTempl final {
         shared_ptr<SharedObject> shobj;
 
     public:
-        unsigned off;
-        unsigned len;
+        size_type off;
+        size_type len;
         bool slice;
 
         void clone_internal_vec()
@@ -80,7 +80,7 @@ class FlatSharedArrayTempl final {
             new (this) SharedArrayObj(move(new_vec));
         }
 
-        void clone_aliased_slices(unsigned index)
+        void clone_aliased_slices(size_type index)
         {
             auto &slices = shobj->slices;
 
@@ -128,7 +128,7 @@ class FlatSharedArrayTempl final {
             , slice(false)
         { }
 
-        SharedArrayObj(const SharedArrayObj &obj, unsigned off, unsigned len)
+        SharedArrayObj(const SharedArrayObj &obj, size_type off, size_type len)
             : shobj(obj.shobj)
             , off(off)
             , len(len)
@@ -213,7 +213,7 @@ public:
     FlatSharedArrayTempl() = default;
     FlatSharedArrayTempl(const vec_type &arr) = delete;
     FlatSharedArrayTempl(vec_type &&arr) : flat(move(arr)) { }
-    FlatSharedArrayTempl(const FlatSharedArrayTempl &flatWrapper, unsigned off, unsigned len)
+    FlatSharedArrayTempl(const FlatSharedArrayTempl &flatWrapper, size_type off, size_type len)
         : flat(flatWrapper.flat.get(), off, len)
     { }
 
@@ -222,11 +222,11 @@ public:
     int_type use_count() const { return flat->use_count(); }
 
     bool is_slice() const { return flat->slice; }
-    unsigned offset() const { return flat->slice ? flat->off : 0; }
-    unsigned size() const { return flat->slice ? flat->len : get_ref().size(); }
+    size_type offset() const { return flat->slice ? flat->off : 0; }
+    size_type size() const { return flat->slice ? flat->len : get_ref().size(); }
 
     void clone_internal_vec() { flat->clone_internal_vec(); }
-    void clone_aliased_slices(unsigned index) { flat->clone_aliased_slices(index); }
+    void clone_aliased_slices(size_type index) { flat->clone_aliased_slices(index); }
     void clone_all_slices() { flat->clone_all_slices(); }
 
     ArrayConstViewTempl<LValueType> get_view() const {

@@ -140,7 +140,7 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
 
     const ArrayConstView &view = e.get<FlatSharedArray>().get_view();
 
-    for (unsigned i = 0; i < view.size(); i++) {
+    for (size_type i = 0; i < view.size(); i++) {
 
         const EvalValue &e = view[i].get();
 

@@ -119,7 +119,7 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
     const string_view &str = flat_str.get_view();
     FlatSharedArray::vec_type vec;
-    unsigned i, start = 0;
+    size_type i, start = 0;
 
     for (i = 0; i < str.size(); i++) {
 

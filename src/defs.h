@@ -25,8 +25,18 @@ using std::make_pair;
 using std::make_shared;
 using std::make_unique;
 
-
 /* Custom type defs */
-
-typedef long double float_type;
+typedef long double float_type; /* Note: replace %Lf if you change this! */
 typedef long int int_type;
+
+/*
+ * Using 32-bit unsigned as size/offset type is slightly more efficient
+ * than using size_t on 64-bit machines because:
+ *
+ *      1. Makes the structures smaller (4 bytes vs. 8 bytes)
+ *      2. On x86_64, it doesn't require the extra REX.W prefix
+ *
+ * Overall, we don't really need to handle arrays or strings larger than 4 GB
+ * in this simple language. Better take advantage of that.
+ */
+typedef unsigned int size_type;

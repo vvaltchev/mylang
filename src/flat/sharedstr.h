@@ -14,8 +14,8 @@ public:
 private:
 
     FlatSharedVal<inner_type> flat;
-    unsigned off = 0;   /* NOTE: cannot be const because we're using this in a union */
-    unsigned len = 0;   /* NOTE: cannot be const because we're using this in a union */
+    size_type off = 0;   /* NOTE: cannot be const because we're using this in a union */
+    size_type len = 0;   /* NOTE: cannot be const because we're using this in a union */
     bool slice = false;
 
 public:
@@ -41,7 +41,7 @@ public:
         , slice(false)
     { }
 
-    FlatSharedStr(const FlatSharedStr &s, unsigned off, unsigned len)
+    FlatSharedStr(const FlatSharedStr &s, size_type off, size_type len)
         : flat(s.flat.get_shared_ptr())
         , off(off)
         , len(len)
@@ -53,6 +53,6 @@ public:
     }
 
     bool is_slice() const { return slice; }
-    unsigned offset() const { return slice ? off : 0; }
-    unsigned size() const { return slice ? len : get_ref().size(); }
+    size_type offset() const { return slice ? off : 0; }
+    size_type size() const { return slice ? len : get_ref().size(); }
 };

@@ -2565,7 +2565,7 @@ dump_test_source(const test &t, int err_line)
 
         cout << endl;
 
-        for (unsigned i = 0; i < t.source.size(); i++) {
+        for (size_type i = 0; i < t.source.size(); i++) {
             cout << "    ";
             cout << setfill(' ') << setw(3) << i+1;
             cout << "    " << t.source[i];

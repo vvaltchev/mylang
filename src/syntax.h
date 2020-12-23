@@ -503,9 +503,9 @@ public:
 class ForeachStmt final: public Construct {
 
     bool do_iter(EvalContext *ctx,
-                 unsigned index,
+                 size_type index,
                  const EvalValue *elems,
-                 unsigned count) const;
+                 size_type count) const;
 
 public:
     unique_ptr<IdList> ids;

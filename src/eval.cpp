@@ -602,7 +602,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
             const ArrayConstView &view = rval.get<FlatSharedArray>().get_view();
 
-            for (unsigned i = 0; i < idlist->elems.size(); i++) {
+            for (size_type i = 0; i < idlist->elems.size(); i++) {
 
                 handle_single_expr14(
                     ctx,
@@ -898,7 +898,7 @@ EvalValue &LValue::get_value_for_put()
     assert(container->is<FlatSharedArray>());
 
     if (container->valtype()->is_slice(container->val)) {
-        const unsigned off = container->getval<FlatSharedArray>().offset();
+        const size_type off = container->getval<FlatSharedArray>().offset();
         *container = container->clone();
         container_idx -= off;
         return container->getval<FlatSharedArray>().get_ref()[container_idx].val;
@@ -924,12 +924,12 @@ void LValue::put(EvalValue &&v)
 
 bool
 ForeachStmt::do_iter(EvalContext *ctx,
-                     unsigned index,
+                     size_type index,
                      const EvalValue *elems,
-                     unsigned count) const
+                     size_type count) const
 {
     const bool decl = index == 0 ? idsVarDecl : false;
-    unsigned id_start = 0;
+    size_type id_start = 0;
 
     if (indexed) {
 
@@ -951,9 +951,9 @@ ForeachStmt::do_iter(EvalContext *ctx,
             const ArrayConstView &view =
                 elems[0].get<FlatSharedArray>().get_view();
 
-            for (unsigned i = id_start; i < ids->elems.size(); i++) {
+            for (size_type i = id_start; i < ids->elems.size(); i++) {
 
-                const unsigned val_i = i - id_start;
+                const size_type val_i = i - id_start;
 
                 handle_single_expr14(
                     ctx,
@@ -970,7 +970,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
                 ctx, decl, Op::assign, ids->elems[id_start].get(), elems[0]
             );
 
-            for (unsigned i = id_start+1; i < ids->elems.size(); i++) {
+            for (size_type i = id_start+1; i < ids->elems.size(); i++) {
                 handle_single_expr14(
                     ctx, decl, Op::assign, ids->elems[i].get(), EvalValue()
                 );
@@ -979,9 +979,9 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
     } else {
 
-        for (unsigned i = id_start; i < ids->elems.size(); i++) {
+        for (size_type i = id_start; i < ids->elems.size(); i++) {
 
-            const unsigned val_i = i - id_start;
+            const size_type val_i = i - id_start;
 
             handle_single_expr14(
                 ctx,
@@ -1025,7 +1025,7 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
         const ArrayConstView &view = cval.get<FlatSharedArray>().get_view();
 
-        for (unsigned i = 0; i < view.size(); i++) {
+        for (size_type i = 0; i < view.size(); i++) {
 
             const EvalValue &elem = view[i].get();
 
@@ -1037,7 +1037,7 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
         const string_view &view = cval.get<FlatSharedStr>().get_view();
 
-        for (unsigned i = 0; i < view.size(); i++) {
+        for (size_type i = 0; i < view.size(); i++) {
 
             const EvalValue &elem = FlatSharedStr(string(&view[i], 1));
 
@@ -1050,7 +1050,7 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
         const DictObject::inner_type &data
             = cval.get<FlatSharedDictObj>()->get_ref();
 
-        unsigned i = 0;
+        size_type i = 0;
 
         for (const auto &p : data) {
 

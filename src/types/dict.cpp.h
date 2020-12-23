@@ -92,7 +92,7 @@ string TypeDict::to_string(const EvalValue &a)
     const DictObject::inner_type &data = obj.get_ref();
 
     string res;
-    unsigned i = 0;
+    size_type i = 0;
 
     res.reserve(48 * data.size());
     res += "{";

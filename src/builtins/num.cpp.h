@@ -114,7 +114,7 @@ EvalValue b_min_max_arr(const FlatSharedArray &arr)
 
         val = arr_view[0].get();
 
-        for (unsigned i = 1; i < arr_view.size(); i++) {
+        for (size_type i = 1; i < arr_view.size(); i++) {
 
             const EvalValue &other = arr_view[i].get();
 
@@ -157,7 +157,7 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
         return b_min_max_arr<is_max>(val.get<FlatSharedArray>());
     }
 
-    for (unsigned i = 1; i < vec.size(); i++) {
+    for (size_type i = 1; i < vec.size(); i++) {
 
         const EvalValue &other = RValue(vec[i]->eval(ctx));
 
@@ -186,7 +186,7 @@ EvalValue builtin_max(EvalContext *ctx, ExprList *exprList)
     return b_min_max<true>(ctx, exprList);
 }
 
-template <unsigned N, typename funcT>
+template <size_type N, typename funcT>
 static EvalValue
 float_func(EvalContext *ctx, ExprList *exprList, funcT f)
 {
@@ -195,7 +195,7 @@ float_func(EvalContext *ctx, ExprList *exprList, funcT f)
 
     float_type x[N];
 
-    for (unsigned i = 0; i < N; i++) {
+    for (size_type i = 0; i < N; i++) {
 
         Construct *arg = exprList->elems[i].get();
         const EvalValue &v = RValue(arg->eval(ctx));

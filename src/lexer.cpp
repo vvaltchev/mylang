@@ -108,8 +108,8 @@ struct lexer_ctx {
     const int line;
 
     /* State variables */
-    unsigned i = 0;
-    unsigned tok_start = 0;
+    size_type i = 0;
+    size_type tok_start = 0;
     bool float_exp = false;
     TokType tok_type = TokType::invalid;
 

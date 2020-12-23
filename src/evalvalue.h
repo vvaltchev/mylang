@@ -403,7 +403,7 @@ public:
 
     /* Used only by TypeArr::subscript() */
     LValue *container;
-    unsigned container_idx;
+    size_type container_idx;
 
     LValue(const EvalValue &val, bool is_const)
         : val(val)

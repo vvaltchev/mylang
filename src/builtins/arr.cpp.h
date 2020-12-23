@@ -257,7 +257,7 @@ builtin_find_arr(const FlatSharedArray &arr, const EvalValue &v)
 {
     const ArrayConstView &view = arr.get_view();
 
-    for (unsigned i = 0; i < view.size(); i++) {
+    for (size_type i = 0; i < view.size(); i++) {
         if (view[i].get() == v)
             return static_cast<int_type>(i);
     }
@@ -400,7 +400,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
 
         EvalValue val = view[0].get();
 
-        for (unsigned i = 1; i < view.size(); i++) {
+        for (size_type i = 1; i < view.size(); i++) {
             val.get_type()->add(val, view[i].get());
         }
 
@@ -417,7 +417,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
         FuncObject &funcObj = val1.get<FlatSharedFuncObj>().get();
         EvalValue val = eval_func(ctx, funcObj, view[0].get());
 
-        for (unsigned i = 1; i < view.size(); i++) {
+        for (size_type i = 1; i < view.size(); i++) {
             val.get_type()->add(
                 val,
                 eval_func(ctx, funcObj, view[i].get())

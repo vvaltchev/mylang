@@ -286,7 +286,7 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 
         const ArrayConstView &view = val1.get<FlatSharedArray>().get_view();
 
-        for (unsigned i = 0; i < view.size(); i++) {
+        for (size_type i = 0; i < view.size(); i++) {
 
             result.emplace_back(
                 eval_func(ctx, funcObj, view[i].get()),
@@ -338,7 +338,7 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
         const ArrayConstView &view = val1.get<FlatSharedArray>().get_view();
         FlatSharedArray::vec_type result;
 
-        for (unsigned i = 0; i < view.size(); i++) {
+        for (size_type i = 0; i < view.size(); i++) {
 
             if (eval_func(ctx, funcObj, view[i].get()).is_true())
                 result.emplace_back(view[i].get(), ctx->const_ctx);
