@@ -2,7 +2,16 @@ pool:
   vmImage: 'ubuntu-latest'
 
 steps:
-- script: make -j TESTS=1
+
+- script: >
+    make -j
+    CFLAGS='-fprofile-arcs -ftest-coverage'
+    LDFLAGS='-fprofile-arcs -ftest-coverage'
+    TESTS=1
   displayName: Build the project
+
 - script: ./build/mylang -rt
   displayName: Run the unit tests
+
+- script: bash <(curl -s https://codecov.io/bash)
+  displayName: Upload data to CodeCov

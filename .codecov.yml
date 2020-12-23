@@ -1,0 +1,12 @@
+
+comment: false
+
+coverage:
+  range: 0..90
+  round: nearest
+  precision: 1
+
+ignore:
+  - src/syntax.cpp  # Excluded because it's used only for dumping the syntax tree
+  - src/mylang.cpp  # Excluded because it contains just arg-parse logic and error reporting
+  - src/tests.cpp   # Excluded because it contains test failure logic
