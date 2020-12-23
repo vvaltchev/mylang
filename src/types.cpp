@@ -121,19 +121,21 @@ const std::array<Type *, Type::t_count> AllTypes =
 const EvalValue empty_str = FlatSharedStr(string());
 const EvalValue empty_arr = FlatSharedArray(std::vector<LValue>());
 
+std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
+
 inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
 {
-    return make_pair(name, LValue(Builtin{f}, true));
+    return make_pair(UniqueId::get(name), LValue(Builtin{f}, true));
 }
 
 inline auto make_const_builtin(const char *name, float_type val)
 {
-    return make_pair(name, LValue(val, true));
+    return make_pair(UniqueId::get(name), LValue(val, true));
 }
 
 inline auto make_builtin(const char *name, decltype(Builtin::func) f)
 {
-    return make_pair(name, LValue(Builtin{f}, false));
+    return make_pair(UniqueId::get(name), LValue(Builtin{f}, false));
 }
 
 const EvalContext::SymbolsType EvalContext::const_builtins =

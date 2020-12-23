@@ -121,12 +121,12 @@ find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::const_builtins) {
         if (v.getval<Builtin>().func == b.func)
-            return k;
+            return k->val;
     }
 
     for (const auto &[k, v]: EvalContext::builtins) {
         if (v.getval<Builtin>().func == b.func)
-            return k;
+            return k->val;
     }
 
     throw InternalErrorEx();

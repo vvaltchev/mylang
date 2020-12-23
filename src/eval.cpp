@@ -10,6 +10,8 @@ using std::vector;
 using std::string;
 using std::string_view;
 
+/* ------------------ EvalContext ------------------ */
+
 EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     : parent(parent)
     , const_ctx(const_ctx)
@@ -26,7 +28,7 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
 
 LValue *EvalContext::lookup(const Identifier *id)
 {
-    auto &&it = symbols.find(id->get_str());
+    auto &&it = symbols.find(id->uid);
 
     if (it != symbols.end())
         return &it->second;
@@ -36,7 +38,7 @@ LValue *EvalContext::lookup(const Identifier *id)
 
 bool EvalContext::erase(const Identifier *id)
 {
-    const auto &it = symbols.find(id->get_str());
+    const auto &it = symbols.find(id->uid);
 
     if (it == symbols.end())
         return false;
@@ -47,19 +49,20 @@ bool EvalContext::erase(const Identifier *id)
 
 void EvalContext::emplace(const Identifier *id, const EvalValue &val, bool is_const)
 {
-    symbols.emplace(id->get_str(), LValue(val, is_const));
+    symbols.emplace(id->uid, LValue(val, is_const));
 }
 
 void EvalContext::emplace(const Identifier *id, EvalValue &&val, bool is_const)
 {
-    symbols.emplace(id->get_str(), LValue(move(val), is_const));
+    symbols.emplace(id->uid, LValue(move(val), is_const));
 }
 
 void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_const)
 {
-    symbols.emplace(id, LValue(move(val), is_const));
+    symbols.emplace(UniqueId::get(id), LValue(move(val), is_const));
 }
 
+/* ------------------ Constructs ------------------ */
 
 EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 {
@@ -93,7 +96,7 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
             break;
     }
 
-    return UndefinedId{value};
+    return UndefinedId{get_str()};
 }
 
 struct LoopBreakEx { };

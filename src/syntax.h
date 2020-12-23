@@ -5,6 +5,7 @@
 #include "defs.h"
 #include "evalvalue.h"
 #include "parser.h"
+#include "uniqueid.h"
 
 class Literal;
 class LiteralInt;
@@ -257,19 +258,19 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
-class Identifier final: public Construct {
 
-    const std::string value;
+class Identifier final: public Construct {
 
 public:
 
-    template <class T>
-    Identifier(T &&arg)
+    const UniqueId *uid;
+
+    Identifier(const std::string_view &str)
         : Construct("Id")
-        , value(forward<T>(arg))
+        , uid(UniqueId::get(str))
     { }
 
-    std::string_view get_str() const { return value; }
+    std::string_view get_str() const { return uid->val; }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };

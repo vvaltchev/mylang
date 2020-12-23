@@ -4,14 +4,16 @@
 
 #include "defs.h"
 #include "evalvalue.h"
+#include "uniqueid.h"
+
 #include <map>
-#include <string>
+#include <string_view>
 
 class Identifier;
 
 class EvalContext {
 
-    typedef std::map<std::string, LValue, std::less<>> SymbolsType;
+    typedef std::map<const UniqueId *, LValue> SymbolsType;
     SymbolsType symbols;
 
 public:

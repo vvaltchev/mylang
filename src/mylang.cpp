@@ -135,7 +135,7 @@ parse_args(int argc, char **argv)
             EvalContext::builtins.emplace(
 
                 make_pair(
-                    "argv",
+                    UniqueId::get("argv"),
                     LValue(
                         EvalValue(FlatSharedArray(move(vec))),
                         false

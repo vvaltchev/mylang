@@ -259,7 +259,7 @@ void Identifier::serialize(ostream &s, int level) const
 
     s << indent;
     s << string("Id(\"");
-    s << value;
+    s << get_str();
     s << "\")";
 }
 
