@@ -459,7 +459,7 @@ pAcceptMember(ParseContext &c,
     if (!id)
         throw InternalErrorEx(mem->start, mem->end);
 
-    mem->memId = FlatSharedStr(string(id->value));
+    mem->memId = FlatSharedStr(string(id->get_str()));
     ret = move(mem);
     return true;
 }

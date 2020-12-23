@@ -259,8 +259,9 @@ public:
 
 class Identifier final: public Construct {
 
-public:
     const std::string value;
+
+public:
 
     template <class T>
     Identifier(T &&arg)
@@ -268,6 +269,7 @@ public:
         , value(forward<T>(arg))
     { }
 
+    std::string_view get_str() const { return value; }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };

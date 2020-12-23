@@ -489,11 +489,11 @@ void TryCatchStmt::serialize(ostream &s, int level) const
         if (exList) {
 
             for (const unique_ptr<Identifier> &e : exList->elems) {
-                cout << e->value << " ";
+                cout << e->get_str() << " ";
             }
 
             if (asId) {
-                cout << "as " << asId->value << " ";
+                cout << "as " << asId->get_str() << " ";
             }
 
         } else {

@@ -26,7 +26,7 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
 
 LValue *EvalContext::lookup(const Identifier *id)
 {
-    auto &&it = symbols.find(id->value);
+    auto &&it = symbols.find(id->get_str());
 
     if (it != symbols.end())
         return &it->second;
@@ -36,7 +36,7 @@ LValue *EvalContext::lookup(const Identifier *id)
 
 bool EvalContext::erase(const Identifier *id)
 {
-    const auto &it = symbols.find(id->value);
+    const auto &it = symbols.find(id->get_str());
 
     if (it == symbols.end())
         return false;
@@ -47,12 +47,12 @@ bool EvalContext::erase(const Identifier *id)
 
 void EvalContext::emplace(const Identifier *id, const EvalValue &val, bool is_const)
 {
-    symbols.emplace(id->value, LValue(val, is_const));
+    symbols.emplace(id->get_str(), LValue(val, is_const));
 }
 
 void EvalContext::emplace(const Identifier *id, EvalValue &&val, bool is_const)
 {
-    symbols.emplace(id->value, LValue(move(val), is_const));
+    symbols.emplace(id->get_str(), LValue(move(val), is_const));
 }
 
 void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_const)
@@ -846,7 +846,7 @@ do_catch(EvalContext *ctx,
 
     for (const unique_ptr<Identifier> &id : exList->elems) {
 
-        if (id->value != ex_name)
+        if (id->get_str() != ex_name)
             continue;
 
         try {
