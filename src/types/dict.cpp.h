@@ -133,10 +133,6 @@ EvalValue TypeDict::intptr(const EvalValue &a)
 EvalValue TypeDict::clone(const EvalValue &a)
 {
     const FlatSharedDictObj &wrapper = a.get<FlatSharedDictObj>();
-    const DictObject &func = wrapper.get();
-
-    if (!func.get_ref().size())
-        return a;
-
-    return FlatSharedDictObj(make_shared<DictObject>(func));
+    const DictObject &dict = wrapper.get();
+    return FlatSharedDictObj(make_shared<DictObject>(dict));
 }

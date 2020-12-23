@@ -2493,6 +2493,17 @@ static const std::vector<test> tests =
             "}",
         },
     },
+
+    {
+        "Clone() of empty dictionaries work as expected",
+        {
+            "var d = {};",
+            "var d2 = clone(d);",
+            "d2.a = 42;",
+            "assert(len(d2) == 1);",
+            "assert(len(d) == 0);",
+        },
+    },
 };
 
 static void
