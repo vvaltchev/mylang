@@ -253,13 +253,27 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
 }
 
 EvalValue
-builtin_find_arr(const FlatSharedArray &arr, const EvalValue &v)
+builtin_find_arr(const FlatSharedArray &arr,
+                 const EvalValue &v,
+                 FuncObject *key,
+                 EvalContext *ctx)
 {
     const ArrayConstView &view = arr.get_view();
 
-    for (size_type i = 0; i < view.size(); i++) {
-        if (view[i].get() == v)
-            return static_cast<int_type>(i);
+    if (key) {
+
+        for (size_type i = 0; i < view.size(); i++) {
+
+            if (eval_func(ctx, *key, view[i].get()) == v)
+                return static_cast<int_type>(i);
+        }
+
+    } else {
+
+        for (size_type i = 0; i < view.size(); i++) {
+            if (view[i].get() == v)
+                return static_cast<int_type>(i);
+        }
     }
 
     return EvalValue();

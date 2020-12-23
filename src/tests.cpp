@@ -2504,6 +2504,16 @@ static const std::vector<test> tests =
             "assert(len(d) == 0);",
         },
     },
+
+    {
+        "The find() builtin supports a key func param for arrays",
+        {
+            "var a = [[\"hello\", 42], [\"world\", 11]];",
+            "pure func deref0(x) => x[0];",
+            "assert(find(a, \"hello\", deref0) == 0);",
+            "assert(find(a, \"world\", deref0) == 1);",
+        },
+    },
 };
 
 static void

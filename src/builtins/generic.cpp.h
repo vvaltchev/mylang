@@ -219,7 +219,7 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
 
 EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
 {
-    if (exprList->elems.size() != 2)
+    if (exprList->elems.size() < 2 || exprList->elems.size() > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
@@ -233,7 +233,20 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
 
     } else if (container_val.is<FlatSharedArray>()) {
 
-        return builtin_find_arr(container_val.get<FlatSharedArray>(), elem_val);
+        FuncObject *key = nullptr;
+
+        if (exprList->elems.size() == 3) {
+
+            Construct *arg2 = exprList->elems[2].get();
+            const EvalValue &keyval = RValue(arg2->eval(ctx));
+
+            if (!keyval.is<FlatSharedFuncObj>())
+                throw TypeErrorEx("Expected function object", arg2->start, arg2->end);
+
+            key = &keyval.get<FlatSharedFuncObj>().get();
+        }
+
+        return builtin_find_arr(container_val.get<FlatSharedArray>(), elem_val, key, ctx);
 
     } else if (container_val.is<FlatSharedStr>()) {
 
