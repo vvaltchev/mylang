@@ -13,7 +13,12 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
+#include <random>
 #include <cmath>
+
+static std::random_device rdev;
+static std::mt19937_64 mt_engine(rdev());
+
 
 EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 {
@@ -296,4 +301,50 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
         const float_type base10exp = powl(10.0, v1.get<int_type>());
         return roundl(v0.get<float_type>() * base10exp) / base10exp;
     }
+}
+
+EvalValue builtin_rand(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &v0 = RValue(arg0->eval(ctx));
+    const EvalValue &v1 = RValue(arg1->eval(ctx));
+
+    if (!v0.is<int_type>())
+        throw TypeErrorEx("Expected integer", arg0->start, arg0->end);
+
+    if (!v1.is<int_type>())
+        throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
+
+    std::uniform_int_distribution<int_type> distrib(
+        v0.get<int_type>(), v1.get<int_type>()
+    );
+
+    return distrib(mt_engine);
+}
+
+EvalValue builtin_randf(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &v0 = RValue(arg0->eval(ctx));
+    const EvalValue &v1 = RValue(arg1->eval(ctx));
+
+    if (!v0.is<float_type>())
+        throw TypeErrorEx("Expected float", arg0->start, arg0->end);
+
+    if (!v1.is<float_type>())
+        throw TypeErrorEx("Expected float", arg1->start, arg1->end);
+
+    std::uniform_real_distribution<float_type> distrib(
+        v0.get<float_type>(), v1.get<float_type>()
+    );
+
+    return distrib(mt_engine);
 }

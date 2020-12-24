@@ -248,4 +248,6 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("exception", builtin_exception),
     make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */
     make_builtin("exdata", builtin_exdata),
+    make_builtin("rand", builtin_rand),
+    make_builtin("randf", builtin_randf),
 };
