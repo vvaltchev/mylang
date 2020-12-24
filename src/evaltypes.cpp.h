@@ -124,12 +124,12 @@ string_view
 find_builtin_name(const Builtin &b)
 {
     for (const auto &[k, v]: EvalContext::const_builtins) {
-        if (v.getval<Builtin>().func == b.func)
+        if (v.is<Builtin>() && v.getval<Builtin>().func == b.func)
             return k->val;
     }
 
     for (const auto &[k, v]: EvalContext::builtins) {
-        if (v.getval<Builtin>().func == b.func)
+        if (v.is<Builtin>() && v.getval<Builtin>().func == b.func)
             return k->val;
     }
 
@@ -141,6 +141,6 @@ class TypeBuiltin : public Type {
 public:
     TypeBuiltin() : Type(Type::t_builtin) { }
     string to_string(const EvalValue &a) override {
-        return "<builtin: " + string(find_builtin_name(a.get<Builtin>())) + ">";
+        return "<Builtin(" + string(find_builtin_name(a.get<Builtin>())) + ")>";
     }
 };

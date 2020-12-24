@@ -1711,6 +1711,15 @@ static const std::vector<test> tests =
     },
 
     {
+        "Reverse sort",
+        {
+            "const arr = [1,2,3];",
+            "const s = rev_sort(arr);",
+            "assert(s == [3,2,1]);",
+        },
+    },
+
+    {
         "Reverse array",
         {
             "var arr = [1,2,3];",
@@ -2079,7 +2088,61 @@ static const std::vector<test> tests =
             "assert(abs(round(0.123456789, 1) - 0.1) < myEPS);",
             "assert(abs(round(0.123456789, 2) - 0.12) < myEPS);",
             "assert(abs(round(0.123456789, 3) - 0.123) < myEPS);",
+            "assert(isinf(inf) == 1);",
+            "assert(isinf(-inf) == -1);",
+            "assert(isnan(nan) == 1);",
+            "assert(floor(0.9) == 0);",
+            "assert(ceil(0.1) == 1.0);",
+            "assert(.1 == 0.1);",
         },
+    },
+
+    {
+        "Float comparison with integers",
+        {
+            "assert(3.0 == 3);",
+            "assert(3.0 != 2);",
+        },
+    },
+
+    {
+        "Float to bool",
+        {
+            "if (3.0) { assert(1); } else { assert(0); }",
+            "if (0.0) { assert(0); } else { assert(1); }",
+        },
+    },
+
+    {
+        "int() builtin works",
+        {
+            "assert(int(\"123\") == 123);",
+            "assert(int(3.4) == 3);",
+            "assert(int(3.99) == 3);",
+        },
+    },
+
+    {
+        "int() builtin throws in case of invalid string",
+        {
+            "int(\"abc\");",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "int() builtin trucates in case of float string",
+        {
+            "assert(int(\"4.5\") == 4);",
+        },
+    },
+
+    {
+        "float() builtin throws in case of invalid string",
+        {
+            "float(\"abc\");",
+        },
+        &typeid(TypeErrorEx),
     },
 
     {
@@ -2198,6 +2261,15 @@ static const std::vector<test> tests =
     },
 
     {
+        "find() on dict",
+        {
+            "var d = {\"a\": 3, \"b\": 5};",
+            "assert(find(d, \"a\") == 3);",
+            "assert(find(d, \"x\") == none);",
+        },
+    },
+
+    {
         "map() on dict",
         {
             "var d = {\"a\": 3, \"b\": 5};",
@@ -2259,6 +2331,26 @@ static const std::vector<test> tests =
             "insert(arr, 4, 99);",
         },
         &typeid(OutOfBoundsEx),
+    },
+
+    {
+        "insert() builtin on slices of arrays",
+        {
+            "var arr = [1,2,3,4,5];",
+            "var s = arr[1:4];",
+            "assert(s == [2,3,4]);",
+            "insert(s, 0, 99);",
+            "assert(s == [99,2,3,4]);",
+            "s = arr[1:4];",
+            "insert(s, 1, 99);",
+            "assert(s == [2,99,3,4]);",
+            "s = arr[1:4];",
+            "insert(s, 2, 99);",
+            "assert(s == [2,3,99,4]);",
+            "s = arr[1:4];",
+            "insert(s, 3, 99);",
+            "assert(s == [2,3,4,99]);",
+        },
     },
 
     {
@@ -2547,6 +2639,27 @@ static const std::vector<test> tests =
             "assert(endswith(s, \"abc\"));",
             "assert(endswith(s, \"abcd\") == false);",
             "assert(endswith(s, \"x\") == false);",
+        },
+    },
+
+    {
+        "Exception to string",
+        {
+            "assert(str(exception(\"abc\")) == \"<Exception(abc)>\");",
+        },
+    },
+
+    {
+        "str() of builtin",
+        {
+            "assert(str(print) == \"<Builtin(print)>\");",
+        },
+    },
+
+    {
+        "str() of builtin",
+        {
+            "assert(str(none) == \"<none>\");",
         },
     },
 };

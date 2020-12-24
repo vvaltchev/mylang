@@ -187,28 +187,42 @@ lexer_ctx::handle_space_or_op()
         tok_type = TokType::invalid;
     }
 
-    if (!isspace(c)) {
+    if (isspace(c))
+        return;
 
-        string_view op = in_str.substr(i, 1);
+    string_view op = in_str.substr(i, 1);
 
-        if (i + 1 < in_str.length() && is_operator(in_str.substr(i, 2)))
-        {
+    if (i + 1 < in_str.length()) {
+
+        if (c == '.') {
+
+            if (isdigit(in_str[i + 1])) {
+
+                tok_start = i;
+                tok_type = TokType::floatnum;
+                i++;
+                return;
+            }
+        }
+
+        if (is_operator(in_str.substr(i, 2))) {
+
             /*
-                * Handle two-chars wide operators. Note: it is required,
-                * with the current implementation, an 1-char prefix operator to
-                * exist for each one of them. For example:
-                *
-                *      <= requires '<' to exist independently
-                *      += requires '+' to exist independently
-                *
-                * Reason: the check `is_operator(string_view(&c, 1))` above.
-                */
+            * Handle two-chars wide operators. Note: it is required,
+            * with the current implementation, an 1-char prefix operator to
+            * exist for each one of them. For example:
+            *
+            *      <= requires '<' to exist independently
+            *      += requires '+' to exist independently
+            *
+            * Reason: the check `is_operator(string_view(&c, 1))` above.
+            */
             op = in_str.substr(i, 2);
             i++;
         }
-
-        result.emplace_back(TokType::op, Loc(line, i+1), get_op_type(op));
     }
+
+    result.emplace_back(TokType::op, Loc(line, i+1), get_op_type(op));
 }
 
 void
