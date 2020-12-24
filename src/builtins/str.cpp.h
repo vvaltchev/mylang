@@ -353,3 +353,55 @@ EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList)
 
     return FlatSharedStr(flat_str, flat_str.offset() + s, l - s);
 }
+
+EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue &val1 = RValue(arg1->eval(ctx));
+
+    if (!val0.is<FlatSharedStr>())
+        throw TypeErrorEx("Expected string", arg0->start, arg0->end);
+
+    if (!val1.is<FlatSharedStr>())
+        throw TypeErrorEx("Expected string", arg1->start, arg1->end);
+
+    const string_view &str = val0.get<FlatSharedStr>().get_view();
+    const string_view &substr = val1.get<FlatSharedStr>().get_view();
+
+    if (str.size() >= substr.size())
+        if (str.substr(0, substr.size()) == substr)
+            return true;
+
+    return false;
+}
+
+EvalValue builtin_endswith(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue &val1 = RValue(arg1->eval(ctx));
+
+    if (!val0.is<FlatSharedStr>())
+        throw TypeErrorEx("Expected string", arg0->start, arg0->end);
+
+    if (!val1.is<FlatSharedStr>())
+        throw TypeErrorEx("Expected string", arg1->start, arg1->end);
+
+    const string_view &str = val0.get<FlatSharedStr>().get_view();
+    const string_view &substr = val1.get<FlatSharedStr>().get_view();
+
+    if (str.size() >= substr.size())
+        if (str.substr(str.size() - substr.size()) == substr)
+            return true;
+
+    return false;
+}

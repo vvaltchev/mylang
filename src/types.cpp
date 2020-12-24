@@ -175,6 +175,8 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("lstrip", builtin_lstrip),
     make_const_builtin("rstrip", builtin_rstrip),
     make_const_builtin("strip", builtin_strip),
+    make_const_builtin("startswith", builtin_startswith),
+    make_const_builtin("endswith", builtin_endswith),
 
     /* Float math funcs */
     make_const_builtin("exp", builtin_exp),

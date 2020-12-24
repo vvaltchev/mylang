@@ -2526,6 +2526,29 @@ static const std::vector<test> tests =
             "assert(strip(s) == \"abc\");",
         },
     },
+
+    {
+        "startswith(), endswith() builtins",
+        {
+            "var a = \"123abc456\";",
+            "var s = a[3:6];",
+            "assert(s == \"abc\");",
+            "assert(startswith(\"\", \"\"));",
+            "assert(startswith(s, \"\"));",
+            "assert(startswith(s, \"a\"));",
+            "assert(startswith(s, \"ab\"));",
+            "assert(startswith(s, \"abc\"));",
+            "assert(startswith(s, \"abcd\") == false);",
+            "assert(startswith(s, \"x\") == false);",
+            "assert(endswith(\"\", \"\"));",
+            "assert(endswith(s, \"\"));",
+            "assert(endswith(s, \"c\"));",
+            "assert(endswith(s, \"bc\"));",
+            "assert(endswith(s, \"abc\"));",
+            "assert(endswith(s, \"abcd\") == false);",
+            "assert(endswith(s, \"x\") == false);",
+        },
+    },
 };
 
 static void
