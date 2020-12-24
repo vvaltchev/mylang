@@ -74,6 +74,11 @@ pAcceptTryCatchStmt(ParseContext &c,
                     unsigned fl);
 
 bool
+pAcceptForStmt(ParseContext &c,
+               unique_ptr<Construct> &ret,
+               unsigned fl);
+
+bool
 MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
                           bool process_arrays = false);
@@ -956,6 +961,10 @@ pStmt(ParseContext &c, unsigned fl)
 
         return subStmt;
 
+    } else if (pAcceptForStmt(c, subStmt, fl)) {
+
+        return subStmt;
+
     } else {
 
         if (pAcceptKeyword(c, Keyword::kw_var))
@@ -1419,6 +1428,40 @@ pAcceptForeachStmt(ParseContext &c,
             throw;
         }
     }
+
+    ret = move(stmt);
+    return true;
+}
+
+bool
+pAcceptForStmt(ParseContext &c,
+               unique_ptr<Construct> &ret,
+               unsigned fl)
+{
+    if (!pAcceptKeyword(c, Keyword::kw_for))
+        return false;
+
+    unique_ptr<ForStmt> stmt(new ForStmt);
+    pExpectOp(c, Op::parenL);
+
+    {
+        unsigned init_fl = fl;
+
+        if (pAcceptKeyword(c, Keyword::kw_var))
+            init_fl |= pFlags::pInDecl;
+
+        stmt->init = pExprTop(c, init_fl);
+        pExpectOp(c, Op::semicolon);
+    }
+
+    stmt->cond = pExprTop(c, fl);
+    pExpectOp(c, Op::semicolon);
+
+    stmt->inc = pExprTop(c, fl);
+    pExpectOp(c, Op::parenR);
+
+    if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
+        stmt->body = pStmt(c, fl);
 
     ret = move(stmt);
     return true;

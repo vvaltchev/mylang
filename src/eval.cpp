@@ -741,7 +741,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    if (is_true(condExpr->eval(ctx))) {
+    if (RValue(condExpr->eval(ctx)).is_true()) {
 
         if (thenBlock)
             thenBlock->eval(ctx);
@@ -807,7 +807,7 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    while (is_true(condExpr->eval(ctx))) {
+    while (RValue(condExpr->eval(ctx)).is_true()) {
 
         try {
 
@@ -1222,4 +1222,42 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
             memId, LValue(EvalValue(), false)
         ).first
     ).second;
+}
+
+EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalContext loop_ctx(ctx, ctx->const_ctx);
+
+    if (init)
+        init->eval(&loop_ctx);
+
+    while (true) {
+
+        if (cond && !RValue(cond->eval(&loop_ctx)).is_true())
+            break;
+
+        try {
+
+            if (body)
+                body->eval(&loop_ctx);
+
+        } catch (LoopBreakEx) {
+
+            break;
+
+        } catch (LoopContinueEx) {
+
+            /*
+             * Do nothing. Note: we cannot avoid this exception simply because
+             * we can have `continue` inside one or multiple levels of nested
+             * IF statements inside the loop, and we have to skip all of them
+             * to jump back here and restart the loop.
+             */
+        }
+
+        if (inc)
+            inc->eval(&loop_ctx);
+    }
+
+    return EvalValue();
 }

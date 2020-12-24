@@ -481,3 +481,61 @@ void ForeachStmt::serialize(ostream &s, int level) const
     s << indent;
     s << ")";
 }
+
+void ForStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    if (init) {
+
+        init->serialize(s, level + 1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoInit>";
+    }
+
+    s << endl;
+
+    if (cond) {
+
+        cond->serialize(s, level + 1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoCond>";
+    }
+
+    s << endl;
+
+    if (inc) {
+
+        inc->serialize(s, level + 1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoInc>";
+    }
+
+    s << endl;
+
+    if (body) {
+
+        body->serialize(s, level + 1);
+
+    } else {
+
+        s << string((level + 1) * 2, ' ');
+        s << "<NoBody>";
+    }
+
+    s << endl;
+    s << indent;
+    s << ")";
+}

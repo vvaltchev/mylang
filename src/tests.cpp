@@ -2694,6 +2694,31 @@ static const std::vector<test> tests =
             "assert(intptr(e1) == intptr(c));",
         },
     },
+
+    {
+        "Classic for-loop",
+        {
+            "var ext = \"\";",
+            "",
+            "for (var i = 0; i < 3; i += 1)",
+            "   ext += str(i);",
+            "",
+            "assert(ext == \"012\");",
+            "",
+            "ext = \"\";",
+            "for (var i = 0; i < 10; i += 1) {",
+            "",
+            "   if (i == 2)",
+            "       continue;",
+            "",
+            "   if (i == 5)",
+            "       break;",
+            "",
+            "   ext += str(i);",
+            "}",
+            "assert(ext == \"0134\");",
+        },
+    },
 };
 
 static void

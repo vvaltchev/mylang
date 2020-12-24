@@ -7,21 +7,6 @@
 #include "parser.h"
 #include "uniqueid.h"
 
-class Literal;
-class LiteralInt;
-class ExprList;
-class CallExpr;
-class Expr01;
-class Expr03;
-class Expr04;
-class Expr06;
-class Stmt;
-class IfStmt;
-class Block;
-class LValue;
-class Identifier;
-class EvalContext;
-
 enum pFlags : unsigned {
 
     pNone           = 1 << 0,
@@ -532,6 +517,20 @@ public:
     EvalValue memId;
 
     MemberExpr() : Construct("MemberExpr") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+};
+
+class ForStmt final: public Construct {
+
+public:
+
+    unique_ptr<Construct> init;
+    unique_ptr<Construct> cond;
+    unique_ptr<Construct> inc;
+    unique_ptr<Construct> body;
+
+    ForStmt() : Construct("ForStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 };

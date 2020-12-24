@@ -466,13 +466,6 @@ RValue(const EvalValue &v)
     return v;
 }
 
-inline bool
-is_true(const EvalValue &v)
-{
-    const EvalValue &val = RValue(v);
-    return val.get_type()->is_true(val);
-}
-
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const std::vector<EvalValue> &args);
