@@ -3,6 +3,7 @@
 BUILD_DIR ?= build
 PROJ_ROOT:=$(shell pwd)
 
+OPT ?= 1
 FL_LANG ?= -std=c++17
 FL_DBG ?= -ggdb
 FL_WARN ?= -Wall -Wextra -Wno-unused-parameter

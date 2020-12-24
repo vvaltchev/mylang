@@ -8,6 +8,7 @@ steps:
     CFLAGS='-fprofile-arcs -ftest-coverage'
     LDFLAGS='-fprofile-arcs -ftest-coverage'
     TESTS=1
+    OPT=0
   displayName: Build the project
 
 - script: ./build/mylang -rt
