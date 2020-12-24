@@ -21,7 +21,7 @@ public:
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
-    EvalValue subscript(const EvalValue &what_lval, const EvalValue &idx_val);
+    EvalValue subscript(const EvalValue &what_lval, const EvalValue &idx_val) override;
 
     int_type len(const EvalValue &a) override;
     int_type use_count(const EvalValue &a) override;

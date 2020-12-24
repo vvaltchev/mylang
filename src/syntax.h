@@ -217,8 +217,7 @@ class LiteralStr final: public Literal {
 
 public:
 
-    LiteralStr(std::string_view v);
-
+    LiteralStr(const std::string_view &v);
     LiteralStr(const EvalValue &v) : value(v) { }
     LiteralStr(EvalValue &&v) : value(move(v)) { }
 

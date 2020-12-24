@@ -10,6 +10,68 @@ using std::vector;
 using std::string;
 using std::string_view;
 
+/* ------------------ string un-escaping -------------- */
+
+string
+unescape_str(const string_view &v)
+{
+    string s;
+    s.reserve(v.size());
+
+    for (size_t i = 0; i < v.size(); i++) {
+
+        if (v[i] == '\\') {
+
+            /*
+             * We know FOR SURE that '\' is NOT the last char in the
+             * literal simply because otherwise we'll have something like
+             * "xxx\" and the tokenize will accept < xxx" > instead of < xxx\ >.
+             */
+
+            switch (v[i + 1]) {
+
+                case '\\':
+                    s += '\\';
+                    break;
+                case '\"':
+                    s += '\"';
+                    break;
+                case 'r':
+                    s += '\r';
+                    break;
+                case 'n':
+                    s += '\n';
+                    break;
+                case 't':
+                    s += '\t';
+                    break;
+                case 'v':
+                    s += '\v';
+                    break;
+                case 'a':
+                    s += '\a';
+                    break;
+                case 'b':
+                    s += '\b';
+                    break;
+
+                default:
+                    s += v[i];
+                    s += v[i + 1];
+                    break;
+            }
+
+            i++;
+
+        } else {
+
+            s += v[i];
+        }
+    }
+
+    return s;
+}
+
 /* ------------------ EvalContext ------------------ */
 
 EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
@@ -62,7 +124,7 @@ void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_c
     symbols.emplace(UniqueId::get(id), LValue(move(val), is_const));
 }
 
-/* ------------------ Constructs ------------------ */
+/* ------------------ Constructs ------------------- */
 
 EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 {
@@ -80,6 +142,10 @@ EvalValue Construct::eval(EvalContext *ctx, bool rec) const
         throw;
     }
 }
+
+LiteralStr::LiteralStr(const std::string_view &v)
+    : value(v.empty() ? empty_str : FlatSharedStr(unescape_str(v)))
+{ }
 
 EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 {
@@ -307,6 +373,10 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
     FlatSharedArray::vec_type vec;
+
+    if (!elems.size())
+        return empty_arr;
+
     vec.reserve(elems.size());
 
     for (const auto &e : elems) {

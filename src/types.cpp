@@ -113,13 +113,19 @@ const std::array<Type *, Type::t_count> AllTypes =
 
 
 /*
- * NOTE: these definitions *MUST FOLLOW* the definition of `AllTypes`
+ * NOTE[1]: these definitions *MUST FOLLOW* the definition of `AllTypes`
  * simply because the creation of LValue's contents does a lookup
  * in AllTypes.
+ *
+ * NOTE[2]: (( ... )) used to initialize empty_*_actual to avoid syntactic
+ * ambiguity with function declaration.
  */
 
-const EvalValue empty_str = FlatSharedStr(string());
-const EvalValue empty_arr = FlatSharedArray(std::vector<LValue>());
+static const FlatSharedStr empty_str_actual((string()));
+static const FlatSharedArray empty_arr_actual((std::vector<LValue>()));
+
+const EvalValue empty_str(FlatSharedStr(empty_str_actual, 0, 0));
+const EvalValue empty_arr(FlatSharedArray(empty_arr_actual, 0, 0));
 
 std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
 

@@ -2662,6 +2662,38 @@ static const std::vector<test> tests =
             "assert(str(none) == \"<none>\");",
         },
     },
+
+    {
+        "The empty_arr optimization works as expected",
+        {
+            "var a=[1];",
+            "var b=a[5:];",
+            "b+=[99];",
+            "assert(b == [99]);",
+            "var c = a[5:];",
+            "assert(c == []);",
+            "",
+            "var e1 = []; var e2 = [];",
+            "assert(intptr(e1) == intptr(e2));",
+            "assert(intptr(e1) == intptr(c));",
+        },
+    },
+
+    {
+        "The empty_str optimization works as expected",
+        {
+            "var a = \"h\";",
+            "var b = a[5:];",
+            "b += \"blah\";",
+            "assert(a == \"h\");",
+            "assert(b == \"blah\");",
+            "var c = a[5:];",
+            "assert(c == \"\");",
+            "var e1 = \"\"; var e2 = \"\";",
+            "assert(intptr(e1) == intptr(e2));",
+            "assert(intptr(e1) == intptr(c));",
+        },
+    },
 };
 
 static void

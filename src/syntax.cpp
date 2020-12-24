@@ -6,8 +6,8 @@
 using std::string;
 using std::string_view;
 
-static string
-escapeStr(const string_view &v)
+string
+escape_str(const string_view &v)
 {
     string s;
     s.reserve(v.size() * 2);
@@ -43,66 +43,6 @@ escapeStr(const string_view &v)
 
             default:
                 s += c;
-        }
-    }
-
-    return s;
-}
-
-static string
-unescapeString(const string_view &v)
-{
-    string s;
-    s.reserve(v.size());
-
-    for (size_t i = 0; i < v.size(); i++) {
-
-        if (v[i] == '\\') {
-
-            /*
-             * We know FOR SURE that '\' is NOT the last char in the
-             * literal simply because otherwise we'll have something like
-             * "xxx\" and the tokenize will accept < xxx" > instead of < xxx\ >.
-             */
-
-            switch (v[i + 1]) {
-
-                case '\\':
-                    s += '\\';
-                    break;
-                case '\"':
-                    s += '\"';
-                    break;
-                case 'r':
-                    s += '\r';
-                    break;
-                case 'n':
-                    s += '\n';
-                    break;
-                case 't':
-                    s += '\t';
-                    break;
-                case 'v':
-                    s += '\v';
-                    break;
-                case 'a':
-                    s += '\a';
-                    break;
-                case 'b':
-                    s += '\b';
-                    break;
-
-                default:
-                    s += v[i];
-                    s += v[i + 1];
-                    break;
-            }
-
-            i++;
-
-        } else {
-
-            s += v[i];
         }
     }
 
@@ -208,14 +148,8 @@ void LiteralStr::serialize(ostream &s, int level) const
 
     s << indent;
     s << "\"";
-    s << escapeStr(value.get<FlatSharedStr>().get_view());
+    s << escape_str(value.get<FlatSharedStr>().get_view());
     s << "\"";
-}
-
-LiteralStr::LiteralStr(string_view v)
-     : value(FlatSharedStr(unescapeString(v)))
-{
-
 }
 
 void LiteralDictKVPair::serialize(ostream &s, int level) const
