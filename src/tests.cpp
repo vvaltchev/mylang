@@ -2719,6 +2719,30 @@ static const std::vector<test> tests =
             "assert(ext == \"0134\");",
         },
     },
+
+    {
+        "rand() builtin",
+        {
+            "for (var i = 0; i < 1000; i += 1) {",
+            "   var val = rand(0, 100);",
+            "   assert(0 <= val && val <= 100);",
+            "}",
+            "for (var i = 0; i < 1000; i += 1) {",
+            "   var val = rand(-20, 20);",
+            "   assert(-20 <= val && val <= 20);",
+            "}",
+        },
+    },
+
+    {
+        "randf() builtin",
+        {
+            "for (var i = 0; i < 1000; i += 1) {",
+            "   var val = randf(-20.0, 100.0);",
+            "   assert(-20.0 <= val && val <= 100.0);",
+            "}",
+        },
+    },
 };
 
 static void

@@ -1,0 +1,17 @@
+
+const N = 100 * 1000;
+const rangeB = 0;
+const rangeE = 1000 * 1000 * 1000;
+
+# Pre-alloc the array
+var ar = array(N);
+
+for (var i = 0; i < len(ar); i += 1) {
+    ar[i] = rand(rangeB, rangeE);
+}
+
+# Sort the whole array
+sort(ar);
+
+# Print the first 10 elements
+print(ar[:10]);
