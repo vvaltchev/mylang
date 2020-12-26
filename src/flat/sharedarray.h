@@ -69,48 +69,8 @@ class FlatSharedArrayTempl final {
         size_type len;
         bool slice;
 
-        void clone_internal_vec()
-        {
-            vec_type new_vec(
-                shobj->vec.cbegin() + off,
-                shobj->vec.cbegin() + off + len
-            );
-
-            this->~SharedArrayObj();
-            new (this) SharedArrayObj(move(new_vec));
-        }
-
-        void clone_aliased_slices(size_type index)
-        {
-            auto &slices = shobj->slices;
-
-            for (auto it = slices.begin(); it != slices.end(); /* no inc */) {
-
-                auto obj = *it;
-
-                if (index == all_slices ||
-                    (obj->off <= index && index < obj->off + obj->len))
-                {
-                    /*
-                     * Erase the object from here and get an iterator for the next
-                     * object in the container.
-                     */
-                    it = shobj->slices.erase(it);
-                    assert(obj->slice);
-
-                    /* Prevent the dtor from trying to erase the object */
-                    obj->slice = false;
-
-                    /* Do clone the internal vector */
-                    obj->clone_internal_vec();
-
-                } else {
-
-                    /* Just move to the next slice */
-                    ++it;
-                }
-            }
-        }
+        void clone_internal_vec();
+        void clone_aliased_slices(size_type index);
 
         void clone_all_slices()
         {
