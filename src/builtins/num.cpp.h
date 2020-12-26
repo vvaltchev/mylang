@@ -319,6 +319,12 @@ EvalValue builtin_rand(EvalContext *ctx, ExprList *exprList)
     if (!v1.is<int_type>())
         throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
+    if (v1.get<int_type>() < v0.get<int_type>())
+        return EvalValue();
+
+    if (v0.get<int_type>() == v1.get<int_type>())
+        return v0;
+
     std::uniform_int_distribution<int_type> distrib(
         v0.get<int_type>(), v1.get<int_type>()
     );
@@ -341,6 +347,12 @@ EvalValue builtin_randf(EvalContext *ctx, ExprList *exprList)
 
     if (!v1.is<float_type>())
         throw TypeErrorEx("Expected float", arg1->start, arg1->end);
+
+    if (v1.get<float_type>() < v0.get<float_type>())
+        return EvalValue();
+
+    if (v0.get<float_type>() == v1.get<float_type>())
+        return v0;
 
     std::uniform_real_distribution<float_type> distrib(
         v0.get<float_type>(), v1.get<float_type>()
