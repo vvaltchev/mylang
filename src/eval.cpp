@@ -1065,7 +1065,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
     if (count == 1) {
 
-        if (elems[0].is<FlatSharedArray>()) {
+        if (elems[0].is<FlatSharedArray>() && ids->elems.size() > (1 + id_start)) {
 
             const ArrayConstView &view =
                 elems[0].get<FlatSharedArray>().get_view();

@@ -2013,6 +2013,19 @@ static const std::vector<test> tests =
     },
 
     {
+        "Foreach loop without elems expansion",
+        {
+            "const arr = [[11, \"hello\"], [22, \"world\"]];",
+            "var tmp = [];",
+            "foreach (var e in arr) {",
+            "   append(tmp, str(e));",
+            "}",
+            "assert(tmp[0] == \"[11, hello]\");",
+            "assert(tmp[1] == \"[22, world]\");",
+        }
+    },
+
+    {
         "Foreach loop with index",
         {
             "var res = [];",
@@ -2023,6 +2036,19 @@ static const std::vector<test> tests =
             "assert(res[1] == 20);",
             "assert(res[2] == 60);",
         },
+    },
+
+    {
+        "Foreach loop with index, but without elems expansion",
+        {
+            "const arr = [[11, \"hello\"], [22, \"world\"]];",
+            "var tmp = [];",
+            "foreach (var i, e in indexed arr) {",
+            "   append(tmp, str(i)+str(e));",
+            "}",
+            "assert(tmp[0] == \"0[11, hello]\");",
+            "assert(tmp[1] == \"1[22, world]\");",
+        }
     },
 
     {
