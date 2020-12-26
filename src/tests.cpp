@@ -2683,7 +2683,7 @@ static const std::vector<test> tests =
     },
 
     {
-        "str() of builtin",
+        "str() of none",
         {
             "assert(str(none) == \"<none>\");",
         },
@@ -2767,6 +2767,39 @@ static const std::vector<test> tests =
             "   var val = randf(-20.0, 100.0);",
             "   assert(-20.0 <= val && val <= 100.0);",
             "}",
+        },
+    },
+
+    {
+        "Insert() is slice-safe on arrays (1)",
+        {
+            "var a = [1,2,3];",
+            "var slices = [a[0:1], a[1:2], a[2:3]];",
+            "assert(slices == [[1],[2],[3]]);",
+            "assert(intptr(slices[0]) == intptr(a));",
+            "assert(intptr(slices[1]) == intptr(a));",
+            "assert(intptr(slices[2]) == intptr(a));",
+            "insert(a, 1, 99);",
+            "assert(slices == [[1],[2],[3]]);",
+            "assert(a == [1, 99, 2, 3]);",
+        },
+    },
+
+    {
+        "Insert() is slice-safe on arrays (2)",
+        {
+            "var a = [1,2,3];",
+            "var slices = [a[0:1], a[1:2], a[2:3]];",
+            "assert(slices == [[1],[2],[3]]);",
+            "assert(intptr(slices[0]) == intptr(a));",
+            "assert(intptr(slices[1]) == intptr(a));",
+            "assert(intptr(slices[2]) == intptr(a));",
+            "insert(a, len(a), 99);",
+            "assert(intptr(slices[0]) == intptr(a));",
+            "assert(intptr(slices[1]) == intptr(a));",
+            "assert(intptr(slices[2]) == intptr(a));",
+            "assert(slices == [[1],[2],[3]]);",
+            "assert(a == [1, 2, 3, 99]);",
         },
     },
 };

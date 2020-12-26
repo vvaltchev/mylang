@@ -187,7 +187,9 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
 
     } else {
 
-        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
+        if (index != view.size())
+            arr.clone_all_slices();
+
         arr.get_ref().insert(arr.get_ref().begin() + index, LValue(val, false));
     }
 
