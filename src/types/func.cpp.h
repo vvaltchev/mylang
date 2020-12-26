@@ -20,6 +20,10 @@ public:
 
     TypeFunc() : SharedType<FlatSharedFuncObj>(Type::t_func) { }
 
+    void eq(EvalValue &a, const EvalValue &b) override;
+    void noteq(EvalValue &a, const EvalValue &b) override;
+
+    bool is_true(const EvalValue &a) override { return true; }
     int_type use_count(const EvalValue &a) override;
     EvalValue clone(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
@@ -28,6 +32,28 @@ public:
         return "<function>";
     }
 };
+
+void TypeFunc::eq(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<FlatSharedFuncObj>()) {
+        a = false;
+        return;
+    }
+
+    FuncObject &obj = a.get<FlatSharedFuncObj>().get();
+    a = &obj == &b.get<FlatSharedFuncObj>().get();
+}
+
+void TypeFunc::noteq(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<FlatSharedFuncObj>()) {
+        a = true;
+        return;
+    }
+
+    FuncObject &obj = a.get<FlatSharedFuncObj>().get();
+    a = &obj != &b.get<FlatSharedFuncObj>().get();
+}
 
 int_type TypeFunc::use_count(const EvalValue &a)
 {
