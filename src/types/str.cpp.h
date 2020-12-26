@@ -55,7 +55,12 @@ public:
 
 EvalValue TypeStr::clone(const EvalValue &a)
 {
-    return FlatSharedStr(string(a.get<FlatSharedStr>().get_ref()));
+    const FlatSharedStr &s = a.get<FlatSharedStr>();
+
+    if (s.is_slice())
+        return s;
+
+    return FlatSharedStr(string(s.get_view()));
 }
 
 int_type TypeStr::use_count(const EvalValue &a)
