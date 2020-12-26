@@ -72,14 +72,21 @@ generic_single_child_serialize(const char *name,
     s << indent;
     s << name << "(";
 
-    if (!elem->is_const)
-        s << endl;
+    if (elem) {
 
-    elem->serialize(s, elem->is_const ? 0 : level + 1);
+        if (!elem->is_const)
+            s << endl;
 
-    if (!elem->is_const) {
-        s << endl;
-        s << indent;
+        elem->serialize(s, elem->is_const ? 0 : level + 1);
+
+        if (!elem->is_const) {
+            s << endl;
+            s << indent;
+        }
+
+    } else {
+
+        s << "<NoElem>";
     }
 
     s << ")";

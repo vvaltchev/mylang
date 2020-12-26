@@ -870,10 +870,6 @@ pAcceptReturnStmt(ParseContext &c,
         unique_ptr<ReturnStmt> stmt(new ReturnStmt);
 
         stmt->elem = pExpr14(c, fl);
-
-        if (!stmt->elem)
-            noExprError(c);
-
         pExpectOp(c, Op::semicolon);
         stmt->start = start;
         stmt->end = c.get_loc();

@@ -767,7 +767,9 @@ EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw ReturnEx{ RValue(elem->eval(ctx)) };
+    throw ReturnEx{
+        elem ? RValue(elem->eval(ctx)) : EvalValue()
+    };
 }
 
 EvalValue RethrowStmt::do_eval(EvalContext *ctx, bool rec) const
