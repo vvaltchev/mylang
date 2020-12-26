@@ -1,0 +1,181 @@
+#
+# A simple phonebook application
+#
+
+# Global variables
+var input_file;
+
+func load_data(data, file_name) {
+
+    var raw_data;
+    input_file = file_name;
+    raw_data = readlines(input_file);
+
+    foreach (var ln in raw_data) {
+        var tmp = split(ln, ",");
+        data[tmp[0]] = tmp[1:];
+    }
+}
+
+func cmd_add(data) {
+
+    write("Name: ");
+    var n = readln();
+
+    if (!n) {
+        print("ERROR: no name");
+        return;
+    }
+
+    if (find(data, n) != none) {
+        print("Already exists");
+        return;
+    }
+
+    write("Phones: ");
+    var phones_str = readln();
+
+    if (!phones_str) {
+        print("ERROR: No phones");
+        return;
+    }
+
+    data[n] = split(phones_str, ",");
+}
+
+func cmd_view(data) {
+
+    print();
+    print("Contacts");
+    print("-" * 40);
+
+    foreach (var k, v in data)
+        print(k+":", join(v, ","));
+}
+
+func cmd_save(data) {
+
+    write("File name: ");
+    var input = strip(readln());
+    var file;
+
+    if (input) {
+
+        file = input;
+
+    } else {
+
+        if (input_file) {
+            print("Using '" + input_file + "' as file");
+            file = input_file;
+        } else {
+            print("Invalid file name");
+            return;
+        }
+    }
+
+    var raw_data = map(func(k,v) => join([k] + v, ","), data);
+
+    try {
+
+        writelines(raw_data, file);
+
+    } catch (CannotOpenFileEx) {
+        print("ERROR: Cannot open file for writing.");
+        return;
+    }
+
+    print("Data saved in file.");
+}
+
+func cmd_delete(data) {
+
+    write("Enter name: ");
+    var n = readln();
+    var success = erase(data, n);
+
+    if (success)
+        print("Deleted.");
+    else
+        print("ERROR: no such contact");
+}
+
+func cmd_find(data) {
+
+    write("Enter name: ");
+    var n = readln();
+
+    var phones = find(data, n);
+
+    if (phones) {
+
+        print(n + ":", join(phones, ","));
+
+    } else {
+
+        print("No such contact");
+    }
+}
+
+var cmds = {
+
+    "a": cmd_add,
+    "add": cmd_add,
+    "d": cmd_delete,
+    "f": cmd_find,
+    "v": cmd_view,
+    "view": cmd_view,
+    "s": cmd_save,
+    "save": cmd_save
+};
+
+func show_menu(data) {
+    print("Menu");
+    print("-" * 40);
+    print("a: add contact");
+    print("d: delete contact");
+    print("f: find contact");
+    print("v: view contacts (" + len(data) + ")");
+    print("s: save to file");
+    print("q: quit");
+}
+
+func main() {
+
+    var data = {};
+
+    if (len(argv) >= 1) {
+        load_data(data, argv[0]);
+    }
+
+    while (true) {
+
+        print();
+        show_menu(data);
+
+        print();
+        write("Enter command: ");
+        var input = readln();
+
+        if (input == "q")
+            break;
+
+        var cmdfunc = find(cmds, input);
+
+        if (cmdfunc) {
+
+            cmdfunc(data);
+            print();
+
+        } else {
+
+            print("ERROR: Invalid command");
+        }
+
+        write("Press ENTER to continue");
+        readln();
+    }
+}
+
+################
+main();
