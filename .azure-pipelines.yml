@@ -1,18 +1,23 @@
 pool:
   vmImage: 'ubuntu-latest'
 
-steps:
+jobs:
 
-- script: >
-    make -j
-    CFLAGS='-fprofile-arcs -ftest-coverage'
-    LDFLAGS='-fprofile-arcs -ftest-coverage'
-    TESTS=1
-    OPT=0
-  displayName: Build the project
+  - job: default
+    steps:
+      - script: make -j
+        displayName: Build the project
 
-- script: ./build/mylang -rt
-  displayName: Run the unit tests
-
-- script: bash <(curl -s https://codecov.io/bash)
-  displayName: Upload data to CodeCov
+  - job: coverage
+    steps:
+      - script: >
+          make -j
+          CFLAGS='-fprofile-arcs -ftest-coverage'
+          LDFLAGS='-fprofile-arcs -ftest-coverage'
+          TESTS=1
+          OPT=0
+        displayName: Build the project
+      - script: ./build/mylang -rt
+        displayName: Run the unit tests
+      - script: bash <(curl -s https://codecov.io/bash)
+        displayName: Upload data to CodeCov
