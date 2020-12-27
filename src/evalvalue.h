@@ -257,6 +257,7 @@ namespace std {
 
 extern const EvalValue empty_str;
 extern const EvalValue empty_arr;
+extern const EvalValue none;
 
 ostream &operator<<(ostream &s, const EvalValue &c);
 

@@ -55,7 +55,7 @@ public:
     virtual ~Construct() = default;
 
     virtual EvalValue do_eval(EvalContext *ctx, bool rec = true) const {
-        return EvalValue();
+        return none;
     }
 
     virtual void serialize(ostream &s, int level = 0) const = 0;

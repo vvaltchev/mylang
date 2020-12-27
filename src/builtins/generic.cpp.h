@@ -134,7 +134,7 @@ EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
     if (!e.get_type()->is_true(e))
         throw AssertionFailureEx(exprList->start, exprList->end);
 
-    return EvalValue();
+    return none;
 }
 
 EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)

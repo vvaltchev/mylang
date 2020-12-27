@@ -34,7 +34,7 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
     FlatSharedArray::vec_type vec;
 
     for (int_type i = 0; i < n; i++)
-        vec.emplace_back(EvalValue(), ctx->const_ctx);
+        vec.emplace_back(none, ctx->const_ctx);
 
     return FlatSharedArray(move(vec));
 }
@@ -278,7 +278,7 @@ builtin_find_arr(const FlatSharedArray &arr,
         }
     }
 
-    return EvalValue();
+    return none;
 }
 
 static EvalValue

@@ -74,7 +74,7 @@ EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
             name_val.get<FlatSharedStr>().get_ref(),
             exprList->elems.size() == 2
                 ? RValue(exprList->elems[1]->eval(ctx))
-                : EvalValue()
+                : none
         )
     );
 }
@@ -126,6 +126,7 @@ static const FlatSharedArray empty_arr_actual((std::vector<LValue>()));
 
 const EvalValue empty_str(FlatSharedStr(empty_str_actual, 0, 0));
 const EvalValue empty_arr(FlatSharedArray(empty_arr_actual, 0, 0));
+const EvalValue none;
 
 std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
 

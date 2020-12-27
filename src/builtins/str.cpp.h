@@ -199,7 +199,7 @@ builtin_find_str(const FlatSharedStr &str, const FlatSharedStr &substr)
     const size_t pos = str.get_view().find(substr.get_view());
 
     if (pos == string::npos)
-        return EvalValue();
+        return none;
 
     return static_cast<int_type>(pos);
 }

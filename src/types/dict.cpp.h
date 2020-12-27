@@ -81,7 +81,7 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key)
 
     return &(
         *data.emplace(
-            key, LValue(EvalValue(), false)
+            key, LValue(none, false)
         ).first
     ).second;
 }

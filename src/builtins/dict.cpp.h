@@ -22,7 +22,7 @@ builtin_find_dict(const FlatSharedDictObj &obj, const EvalValue &key)
     const auto &it = data.find(key);
 
     if (it == data.end())
-        return EvalValue();
+        return none;
 
     return it->second.get();
 }

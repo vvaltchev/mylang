@@ -317,7 +317,7 @@ do_func_call(EvalContext *ctx,
         throw;
     }
 
-    return EvalValue();
+    return none;
 }
 
 EvalValue eval_func(EvalContext *ctx,
@@ -726,12 +726,12 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
                     inDecl,
                     op,
                     idlist->elems[i].get(),
-                    i < view.size() ? view[i].get() : EvalValue()
+                    i < view.size() ? view[i].get() : none
                 );
             }
         }
 
-        return EvalValue();
+        return none;
 
     } else {
 
@@ -752,7 +752,7 @@ EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
             elseBlock->eval(ctx);
     }
 
-    return EvalValue();
+    return none;
 }
 
 EvalValue BreakStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -768,7 +768,7 @@ EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     throw ReturnEx{
-        elem ? RValue(elem->eval(ctx)) : EvalValue()
+        elem ? RValue(elem->eval(ctx)) : none
     };
 }
 
@@ -804,7 +804,7 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
             throw UndefinedVariableEx(tmp.get<UndefinedId>().id, e->start, e->end);
     }
 
-    return EvalValue();
+    return none;
 }
 
 EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -831,7 +831,7 @@ EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return EvalValue();
+    return none;
 }
 
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -851,7 +851,7 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
             ctx->const_ctx
         );
 
-        return EvalValue();
+        return none;
     }
 
     return func;
@@ -890,8 +890,8 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
 
     return t->slice(
         lval,
-        start_idx ? RValue(start_idx->eval(ctx)) : EvalValue(),
-        end_idx ? RValue(end_idx->eval(ctx)) : EvalValue()
+        start_idx ? RValue(start_idx->eval(ctx)) : none,
+        end_idx ? RValue(end_idx->eval(ctx)) : none
     );
 }
 
@@ -987,7 +987,7 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
     }
 
     if (!saved_ex)
-        return EvalValue();
+        return none;
 
     for (const auto &p : catchStmts) {
 
@@ -996,11 +996,11 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
         Construct *catchBody = p.second.get();
 
         if (do_catch(ctx, saved_ex.get(), exList, asId, catchBody))
-            return EvalValue();
+            return none;
     }
 
     saved_ex->rethrow();
-    return EvalValue(); /* Make compilers unaware of [[noreturn]] happy */
+    return none; /* Make compilers unaware of [[noreturn]] happy */
 }
 
 LValue LValue::clone()
@@ -1081,7 +1081,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
                     decl,
                     Op::assign,
                     ids->elems[i].get(),
-                    val_i < view.size() ? view[val_i].get() : EvalValue()
+                    val_i < view.size() ? view[val_i].get() : none
                 );
             }
 
@@ -1093,7 +1093,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
             for (size_type i = id_start+1; i < ids->elems.size(); i++) {
                 handle_single_expr14(
-                    ctx, decl, Op::assign, ids->elems[i].get(), EvalValue()
+                    ctx, decl, Op::assign, ids->elems[i].get(), none
                 );
             }
         }
@@ -1109,7 +1109,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
                 decl,
                 Op::assign,
                 ids->elems[i].get(),
-                val_i < count ? elems[val_i] : EvalValue()
+                val_i < count ? elems[val_i] : none
             );
         }
     }
@@ -1192,7 +1192,7 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return EvalValue();
+    return none;
 }
 
 EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
@@ -1221,7 +1221,7 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 
     return &(
         *data.emplace(
-            memId, LValue(EvalValue(), false)
+            memId, LValue(none, false)
         ).first
     ).second;
 }
@@ -1261,5 +1261,5 @@ EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const
             inc->eval(&loop_ctx);
     }
 
-    return EvalValue();
+    return none;
 }

@@ -22,7 +22,7 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
     }
 
     cout << endl;
-    return EvalValue();
+    return none;
 }
 
 EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
@@ -57,14 +57,14 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
 
     *s << e;
     s->flush();
-    return EvalValue();
+    return none;
 }
 
 EvalValue builtin_writeln(EvalContext *ctx, ExprList *exprList)
 {
     builtin_write(ctx, exprList);
     cout << endl;
-    return EvalValue();
+    return none;
 }
 
 EvalValue builtin_read(EvalContext *ctx, ExprList *exprList)
@@ -174,5 +174,5 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
         *s << e.get() << endl;
     }
 
-    return EvalValue();
+    return none;
 }
