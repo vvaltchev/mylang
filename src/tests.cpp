@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
+#include "defs.h"
 #include <iostream>
 #include <iomanip>
 #include <cstdlib>
