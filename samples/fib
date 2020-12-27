@@ -2,7 +2,7 @@
 # Calculate the fibonacci sequence
 #
 
-var a=1, b=1, i=0; # previous term, current term, counter
+var a, b, i = [1, 1, 0]; # previous term, current term, counter
 
 # Print the 1st two terms
 print(a);
