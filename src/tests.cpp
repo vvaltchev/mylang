@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
+#include "defs.h"
 #include <iostream>
 #include <iomanip>
 #include <cstdlib>
@@ -2926,8 +2927,6 @@ void run_tests(bool dump_syntax_tree)
 }
 
 #else
-
-using namespace std;
 
 void run_tests(bool)
 {
