@@ -1329,6 +1329,21 @@ static const std::vector<test> tests =
     },
 
     {
+        "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
+        {
+            "var c = 0;",
+            "try {",
+            "   var t = 3;",
+            "   append(t, 34);",
+            "   assert(0);",     // We should NEVER get here
+            "} catch (DivisionByZeroEx, TypeErrorEx) {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
         "Nested try-catch blocks, catch in outer block",
         {
             "var c = 0;",
