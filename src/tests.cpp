@@ -2927,6 +2927,8 @@ void run_tests(bool dump_syntax_tree)
 
 #else
 
+using namespace std;
+
 void run_tests(bool)
 {
     cout << "Tests NOT compiled in. Build with TESTS=1" << endl;
