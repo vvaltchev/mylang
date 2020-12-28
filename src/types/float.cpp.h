@@ -66,7 +66,7 @@ void TypeFloat::div(EvalValue &a, const EvalValue &b)
 {
     float_type rhs = internal_val_to_float(b);
 
-    if (iszero(rhs))
+    if (std::fpclassify(rhs) == FP_ZERO)
         throw DivisionByZeroEx();
 
     a.get<float_type>() /= rhs;
@@ -76,7 +76,7 @@ void TypeFloat::mod(EvalValue &a, const EvalValue &b)
 {
     float_type rhs = internal_val_to_float(b);
 
-    if (iszero(rhs))
+    if (std::fpclassify(rhs) == FP_ZERO)
         throw DivisionByZeroEx();
 
     a = fmodl(a.get<float_type>(), rhs);

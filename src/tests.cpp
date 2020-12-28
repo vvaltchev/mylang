@@ -5,8 +5,6 @@
 #include <iomanip>
 #include <cstdlib>
 
-
-
 #ifdef TESTS
 
 #include "parser.h"
@@ -2131,7 +2129,7 @@ static const std::vector<test> tests =
             "assert(abs(round(0.123456789, 2) - 0.12) < myEPS);",
             "assert(abs(round(0.123456789, 3) - 0.123) < myEPS);",
             "assert(isinf(inf) == 1);",
-            "assert(isinf(-inf) == -1);",
+            "assert(isinf(-inf) == 1);",
             "assert(isnan(nan) == 1);",
             "assert(floor(0.9) == 0);",
             "assert(ceil(0.1) == 1.0);",

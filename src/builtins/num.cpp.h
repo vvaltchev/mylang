@@ -259,18 +259,10 @@ INST_FLOAT_BUILTIN_1(atan);
 INST_FLOAT_BUILTIN_1(ceil);
 INST_FLOAT_BUILTIN_1(floor);
 INST_FLOAT_BUILTIN_1(trunc);
-INST_FLOAT_BUILTIN_1_ex(isinf, int (*)(float_type), isinfl);
+INST_FLOAT_BUILTIN_1_ex(isinf, bool (*)(float_type), std::isinf);
 INST_FLOAT_BUILTIN_1_ex(isfinite, bool (*)(float_type), std::isfinite);
 INST_FLOAT_BUILTIN_1_ex(isnormal, bool (*)(float_type), std::isnormal);
-
-EvalValue builtin_isnan(EvalContext *ctx, ExprList *exprList)
-{
-    /*
-     * isnan() returns a non-zero value in case of NaN instead just returning
-     * a boolean [0, 1]. Therefore, we need to manually convert it to a bool.
-     */
-    return !!float_func<1>(ctx, exprList, &isnanl).get<int_type>();
-}
+INST_FLOAT_BUILTIN_1_ex(isnan, bool (*)(float_type), std::isnan);
 
 EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
 {
