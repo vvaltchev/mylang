@@ -66,12 +66,38 @@ EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue &name_val = RValue(exprList->elems[0]->eval(ctx));
 
-    if (!name_val.is<FlatSharedStr>())
-        throw TypeErrorEx("Expected string", exprList->elems[0]->start, exprList->elems[0]->end);
+    if (!name_val.is<FlatSharedStr>()) {
+        throw TypeErrorEx(
+            "Expected string",
+            exprList->elems[0]->start,
+            exprList->elems[0]->end
+        );
+    }
+
+    const string_view &ex_name = name_val.get<FlatSharedStr>().get_view();
+
+    if (isdigit(ex_name[0])) {
+        throw InvalidValueEx(
+            "Expected an identifier-like string",
+            exprList->elems[0]->start,
+            exprList->elems[0]->end
+        );
+    }
+
+    for (char c : ex_name) {
+
+        if (c != '_' && !isdigit(c) && !isalnum(c)) {
+            throw InvalidValueEx(
+                "Expected an identifier-like string",
+                exprList->elems[0]->start,
+                exprList->elems[0]->end
+            );
+        }
+    }
 
     return FlatSharedException(
         ExceptionObject(
-            name_val.get<FlatSharedStr>().get_ref(),
+            string(ex_name),
             exprList->elems.size() == 2
                 ? RValue(exprList->elems[1]->eval(ctx))
                 : none
