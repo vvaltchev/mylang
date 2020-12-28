@@ -173,45 +173,52 @@ inline auto make_builtin(const char *name, decltype(Builtin::func) f)
 
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
+    /* Generic builtins */
     make_const_builtin("defined", builtin_defined),
     make_const_builtin("len", builtin_len),
     make_const_builtin("str", builtin_str),
     make_const_builtin("int", builtin_int),
+    make_const_builtin("float", builtin_float),
     make_const_builtin("clone", builtin_clone),
-    make_const_builtin("split", builtin_split),
-    make_const_builtin("join", builtin_join),
-    make_const_builtin("splitlines", builtin_splitlines),
-    make_const_builtin("abs", builtin_abs),
-    make_const_builtin("ord", builtin_ord),
-    make_const_builtin("chr", builtin_chr),
-    make_const_builtin("min", builtin_min),
-    make_const_builtin("max", builtin_max),
+    make_const_builtin("type", builtin_type),
+    make_const_builtin("hash", builtin_hash),
+
+    /* Array or container builtins */
     make_const_builtin("array", builtin_array),
     make_const_builtin("top", builtin_top),
-    make_const_builtin("type", builtin_type),
     make_const_builtin("range", builtin_range),
     make_const_builtin("find", builtin_find),
     make_const_builtin("sort", builtin_sort),
     make_const_builtin("rev_sort", builtin_rev_sort),
     make_const_builtin("reverse", builtin_reverse),
     make_const_builtin("sum", builtin_sum),
-    make_const_builtin("lpad", builtin_lpad),
-    make_const_builtin("rpad", builtin_rpad),
-    make_const_builtin("float", builtin_float),
     make_const_builtin("map", builtin_map),
     make_const_builtin("filter", builtin_filter),
-    make_const_builtin("hash", builtin_hash),
+
+    /* Dictionary builtins */
     make_const_builtin("keys", builtin_keys),
     make_const_builtin("values", builtin_values),
     make_const_builtin("kvpairs", builtin_kvpairs),
     make_const_builtin("dict", builtin_dict),
+
+    /* String builtins */
+    make_const_builtin("split", builtin_split),
+    make_const_builtin("join", builtin_join),
+    make_const_builtin("ord", builtin_ord),
+    make_const_builtin("chr", builtin_chr),
+    make_const_builtin("splitlines", builtin_splitlines),
+    make_const_builtin("lpad", builtin_lpad),
+    make_const_builtin("rpad", builtin_rpad),
     make_const_builtin("lstrip", builtin_lstrip),
     make_const_builtin("rstrip", builtin_rstrip),
     make_const_builtin("strip", builtin_strip),
     make_const_builtin("startswith", builtin_startswith),
     make_const_builtin("endswith", builtin_endswith),
 
-    /* Float math funcs */
+    /* Numeric builtins */
+    make_const_builtin("abs", builtin_abs),
+    make_const_builtin("min", builtin_min),
+    make_const_builtin("max", builtin_max),
     make_const_builtin("exp", builtin_exp),
     make_const_builtin("exp2", builtin_exp2),
     make_const_builtin("log", builtin_log),

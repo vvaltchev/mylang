@@ -13,7 +13,43 @@ libraries and frameworks ready for production use. However, `MyLang` has
 a minimal set of builtins and, it *could* be used for practical purposes
 as well.
 
-## Building MyLang
+## Contents
+
+  * [Maintainance](#maintainance)
+    * [Building MyLang](#building-mylang)
+    * [Testing MyLang](#testing-mylang)
+  * [Syntax](#syntax)
+    * [Core concepts](#core-concepts)
+    * [Declaring variables](#declaring-variables)
+    * [Declaring constants](#declaring-constants)
+    * [Type system](#type-system)
+    * [Conditional statements](#conditional-statements)
+      - [Const evaluation](#const-evaluation-of-conditional-statements)
+    * [Classic loop statements](#classic-loop-statements)
+    * [The foreach loop](#the-foreach-loop)
+      - [The "indexed" keyword](#extra-features-the-indexed-keyword)
+      - [Array expansion](#extra-features-array-expansion)
+    * [Functions and lambdas](#functions-and-lambdas)
+      - [Lambda captures](#lambda-captures)
+      - [Calling functions during const-evaluation](#calling-functions-during-const-evaluation)
+      - [Pure functions](#pure-functions)
+    * [Exceptions](#exceptions)
+      - [Custom exceptions](#custom-exceptions)
+      - [Re-throwing an exception](#re-throwing-an-exception)
+      - [The finally clause](#the-finally-clause)
+  * [Builtins](#builtins)
+    * [Const builtins](#const-builtins)
+      - [Generic builtins](#generic-builtins)
+      - [Array or container builtins](#array-or-container-builtins)
+      - [Dictionary builtins](#dictionary-builtins)
+      - [String builtins](#string-builtins)
+      - [Numeric builtins](#numeric-builtins)
+      - [Numeric constants](#numeric-constants)
+    * [Non-const builtins](#non-const-builtins)
+
+## Maintainance
+
+### Building MyLang
 
 MyLang is written in *portable* C++17: at the moment, the project has no
 dependencies other than the standard C++ library. To build it, if you have
@@ -28,7 +64,15 @@ directory to the include search path. One of the nicest things about *not*
 having dependecies is that there's no need for a *build system* for one-time
 builds.
 
-#### Testing MyLang
+#### Out-of-tree builds
+
+Just pass the `BUILD_DIR` option to `make`:
+
+```
+$ make -j BUILD_DIR=other_build_directory
+```
+
+### Testing MyLang
 
 If you want to run MyLang's tests as well, you need to just compile with TESTS=1
 and disable the optimizations with OPT=0, for a better debugging experience:
@@ -51,41 +95,12 @@ better, right? :-)
 [GoogleTest]: https://github.com/google/googletest
 [Boost.Test]: https://www.boost.org/doc/libs/1_75_0/libs/test/doc/html/index.html
 
-#### Out-of-tree builds
-
-Just pass the `BUILD_DIR` option to `make`:
-
-```
-$ make -j BUILD_DIR=other_build_directory
-```
-
 ## Syntax
 
 The shortest way to describe `MyLang` is: *a C-looking dynamic python-ish
 language*. Probably, the fastest way to learn this language is to check
 out the scripts in the `samples/` directory while taking a look at the short
 documentation below.
-
-### Contents
-
-  * [Core concepts](#core-concepts)
-  * [Declaring variables](#declaring-variables)
-  * [Declaring constants](#declaring-constants)
-  * [Type system](#type-system)
-  * [Conditional statements](#conditional-statements)
-    - [Const evaluation](#const-evaluation-of-conditional-statements)
-  * [Classic loop statements](#classic-loop-statements)
-  * [The foreach loop](#the-foreach-loop)
-    - [The "indexed" keyword](#extra-features-the-indexed-keyword)
-    - [Array expansion](#extra-features-array-expansion)
-  * [Functions and lambdas](#functions-and-lambdas)
-    - [Lambda captures](#lambda-captures)
-    - [Calling functions during const-evaluation](#calling-functions-during-const-evaluation)
-    - [Pure functions](#pure-functions)
-  * [Exceptions](#exceptions)
-    - [Custom exceptions](#custom-exceptions)
-    - [Re-throwing an exception](#re-throwing-an-exception)
-    - [The finally clause](#the-finally-clause)
 
 ### Core concepts
 
@@ -850,3 +865,293 @@ try {
 
 It's worth noting that `try-finally` constructs (without any `catch` clause) are
 allowed as well.
+
+## Builtins
+
+### Const builtins
+The following built-in functions will be evaluated during *parse-time* when
+const arguments are passed to them.
+
+### Generic builtins
+
+#### `defined(symbol)`
+Check if `symbol` is defined. Returns 1 if the symbol is defined, 0 otherwise.
+
+#### `len(container)`
+Return the number of elements in the given container.
+
+#### `str(value, [decimal_digits])`
+Convert the given value to a string. If `value` is a float, the 2nd parameter
+indicates the desired number of decimal digits in the output string.
+
+#### `int(value)`
+Convert the given string to an integer. If the value is a float, it will be
+trucated. If the value is a string, it will be parsed and converted to an integer,
+if possible. If the value is already an integer, it will be returned as-it-is.
+
+#### `float(value)`
+Convert the given value to float. If the value is an integer, it will be
+converted to a floating-point number. If the value is a string, it will parsed
+and converted to float, if possible. If the value is already a float, it will be
+returned as-it-is.
+
+#### `clone(obj)`
+Clone the given object. Useful for non-trivial objects as arrays,
+dictionaries and lambda with captures.
+
+#### `type(value)`
+Return the name of the type of the given value in string-form.
+Useful for debugging.
+
+#### `hash(value)`
+Return the hash value used by dictionaries internally when `value` is used
+as a key. At the moment, only integers, floats and strings support `hash()`.
+
+### Array or container builtins
+
+#### `array(N)`
+Return an array of `none` values with `N` elements.
+
+#### `top(array)`
+Return the last element of the array. This is an alias for `array[-1]`.
+It is useful when a given array is used as a stack, in combination with
+other builtins like `push()` and `pop()`.
+
+
+#### `range(n, [end, [step]])`
+When only one parameter is provided, it returns an array with numbers
+from 0 to `n`. When `end` is passed to the function, the array goes from
+`n` to `end-1`. When `step` is passed too, the array goes from `n` to
+`end-step` with each element being `step` bigger than the previous. `step`
+can be negative as well. This is equivalent to `Python 2.x`'s range() function.
+In `Python 3.x`, this is equivalent to: `list(range(...))`. Warning: while
+it might look pretty in foreach loops, that's typically not a good idea
+because it returns a whole array, not a generator object like in `Python 3.x`.
+Therefore, for small ranges is fine, but for larger ranges it's better to
+use the classic for-loop.
+
+#### `find(container, what, [key_func])`
+Generic *find* function working with strings, arrays and dictionaries.
+When `container` is a string, it returns the index of the first occurrence
+of the `what` substring in `container` or `none`.
+
+When `container` is an array, it returns the index of the first element equal
+to `what`. Also, when `container` is an array, a 3rd parameter (`key_func`) is
+supported: it's a function object accepting a value (element of the array) and
+returning the value that must be compared to `what`. It's useful when we're
+searching something in an array of composite elements (e.g. tuples).
+
+When `container` is a dictionary, it returns the value associated with the
+given key (`what`) or `none` otherwise.
+
+#### `sort(array, [compare_func])`
+Sorts the given array *in-place* and returns the same array. Optionally,
+it supports a `compare_func` parameter: when passed, it's used to compare
+any two elements and it's supposed to return the logical value of `a < b`.
+
+Note: while `sort()` works in-place, it still can be used to sort arrays
+without altering them and to sort const arrays as well: in the first case,
+it's possible by calling it as `sort(clone(arr))` and storing its return
+value to a new variable, while in the second case (const arrays), not even
+`clone()` is required: in case of const arrays, it will just sort and return
+a clone of the given array.
+
+#### `rev_sort(array, [compare_func])`
+Behaves exactly like `sort()`, but sorts the array in descending order.
+
+#### `reverse(array)`
+Reverse the given array in-place and returns it. Like `sort()`, if the given
+argument is const, it will be cloned before reversing. Therefore, it can used
+during const-evaluation.
+
+#### `sum(array, [key_func])`
+Apply the `+` operator sequentially to all elements in the given array and
+return the result. In case the optional argument `key_func` is passed to `sum()`,
+the operator `+` is applied to the result of `key_func(elem)`, for each element
+instead.
+
+#### `map(func, container)`
+Map each element in `container` through `func(elem)` and return the resulting
+array. For example, the following identity holds:
+
+```
+map(func(x) => x+1, [1, 2, 3]) == [2, 3, 4]
+```
+
+In case the container is a dictionary, `func` is required to accept two arguments,
+a key and a value, but the result will still be an array. For example:
+
+```
+map(func(k, v) => [k, v+1], {"a": 3, "b": 4}) == [["a",4],["b",5]]
+```
+
+#### `filter(func, container)`
+Filter the elements of `container` through `func(elem)` and return a container
+of the same type with only the elements for which `func(elem)` returned true.
+For example:
+
+```
+filter(func(x) => x > 3, [1, 2, 3, 4, 5]) == [4, 5]
+```
+
+In case the container is a dictionary, `func` is required to accept two parameters,
+a key and a value, but the behavior will be semantically the same (a dictionary will
+be returned).
+
+### Dictionary builtins
+
+#### `keys(dictionary)`
+Return an array containing all the keys of the given dictionary.
+
+#### `values(dictionary)`
+Return an array containing all the values of the given dictionary.
+
+#### `kvpairs(dictionary)`
+Return the contents of the given dictionary, in the form of an array of
+[key, value] arrays.
+
+#### `dict(array)`
+Build a dictionary from an array of [key, value] arrays. This is the counter-part
+function of `kvpairs()`.
+
+### String builtins
+
+#### `split(string, delim)`
+Split the given string by the given delimiter. Returns an array.
+
+#### `join(array_of_strings, delim)`
+Join the given array of strings with the given delimiter. Returns a string.
+
+#### `ord(string)`
+Return the numeric value of the given 1-char string.
+Note: in MyLang chars are 8-bit wide and there's no Unicode support,
+because this is a small educational project.
+
+#### `chr(num)`
+Return a 1-char string containing the string representation of the given
+number in the range [0, 255]. Note: in MyLang chars are 8-bit wide and there's
+no Unicode support, because this is a small educational project.
+
+#### `splitlines(string)`
+Split the given string, line by line. Returns an array. It's different
+from `split(string, "\n")` because it handles multiple types of line ending
+sequences.
+
+#### `lpad(string, n, [char])`
+Add left-padding to the given string to make it long `n` chars.
+If len(string) >= n, return the input string as it is. If a 3rd argument
+is passed to `lpad()`, it will be used as padding-character. By default,
+the padding character is space.
+
+#### `rpad(string, n, [char])`
+The counter-part of `lpad()`: pad the string on the right.
+
+#### `lstrip(string)`
+Return a slice of the given string skipping any leading whitespace.
+
+#### `rstrip(string)`
+Return a slice of the given string skipping any trailing whitespace.
+
+#### `strip(string)`
+Return a slice of the given string skipping any leading or trailing
+whitespace.
+
+#### `startswith(string, sub_string)`
+Return true (1) if the given string starts with the given sub_string and
+false (0), otherwise.
+
+#### `endswith(string, sub_string)`
+Return true (1) if the given string ends with the given sub_string and
+false (0), otherwise.
+
+### Numeric builtins
+
+#### `abs(num)`
+Return the absolute value of the given number.
+
+#### `min(a, b, [c, [...]])`
+Return the smallest value among the ones passed to it. All values must have a
+numeric type.
+
+#### `min(array)`
+Return the smallest value among in the ones in the given array.
+
+#### `max(a, b, [c, [...]])`
+Return the largest value among the ones passed to it. All values must have a
+numeric type.
+
+#### `max(array)`
+Return the largest value among in the ones in the given array.
+
+#### `exp(x)`
+Return e^x.
+
+#### `exp2(x)`
+Return 2^x.
+
+#### `log(x)`
+Return the natural logarithm of `x`.
+
+#### `log2(x)`
+Return the base-2 logarithm of `x`.
+
+#### `log10(x)`
+Return the base-10 logarithm of `x`.
+
+#### `sqrt(x)`
+Return the square root of `x`.
+
+#### `cbrt(x)`
+Return the cube root of `x`.
+
+#### `pow(x, y)`
+Return x^y.
+
+#### `sin(x)`
+Return `sin(x)`.
+
+#### `cos(x)`
+Return `cos(x)`.
+
+#### `tan(x)`
+Return `tan(x)`.
+
+#### `asin(x)`
+Return the arc sine of `x`.
+
+#### `acos(x)`
+Return the arc cosine of `x`.
+
+#### `atan(x)`
+Return the arc tangent of `x`.
+
+#### `ceil(x)`
+Return the smallest integral value that is not less than `x`.
+
+#### `floor(x)`
+Return the largest integral value that is not greater than `x`.
+
+#### `trunc(x)`
+Return the rounded integer value of `x` as float.
+
+#### `isinf(x)`
+Return true if `x` is `inf` or `-inf`.
+
+#### `isfinite(x)`
+Return true if `x` is a finite value.
+
+#### `isnormal(x)`
+Return true if `x` is a normal floating-point number.
+
+#### `isnan(x)`
+Return true if `x` is "Not a Number".
+
+#### `round(x, [precision])`
+Round `x` to the nearest integer or to a floating-point number with
+`precision` digits.
+
+### Numeric constants
+(Incomplete, at the moment)
+
+### Non-const builtins
+(Incomplete, at the moment)
