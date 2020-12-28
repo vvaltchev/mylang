@@ -173,7 +173,7 @@ EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)
     const string_view &str = flat_str.get_view();
 
     if (str.size() != 1)
-         throw TypeErrorEx("Expected 1-char string", arg->start, arg->end);
+         throw InvalidValueEx("Expected 1-char string", arg->start, arg->end);
 
     return static_cast<int_type>(static_cast<unsigned char>(str[0]));
 }
@@ -234,7 +234,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
         const string_view &padstr = padc.get<FlatSharedStr>().get_view();
 
         if (padstr.size() > 1)
-            throw TypeErrorEx("Expected 1-char string", arg2->start, arg2->end);
+            throw InvalidValueEx("Expected 1-char string", arg2->start, arg2->end);
 
         pad_char = padstr[0];
     }
@@ -243,7 +243,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
     const int_type n_orig = nval.get<int_type>();
 
     if (n_orig < 0)
-        throw TypeErrorEx("Expected non-negative integer", arg1->start, arg1->end);
+        throw InvalidValueEx("Expected non-negative integer", arg1->start, arg1->end);
 
     const size_t n = static_cast<size_t>(n_orig);
 

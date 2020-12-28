@@ -29,7 +29,7 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
     const int_type n = e.get<int_type>();
 
     if (n < 0)
-        throw TypeErrorEx("Expected non-negative integer", arg->start, arg->end);
+        throw InvalidValueEx("Expected non-negative integer", arg->start, arg->end);
 
     FlatSharedArray::vec_type vec;
 
@@ -230,7 +230,7 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
             step = val2.get<int_type>();
 
             if (step == 0)
-                throw TypeErrorEx("Expected integer != 0", arg2->start, arg2->end);
+                throw InvalidValueEx("Expected integer != 0", arg2->start, arg2->end);
         }
 
     } else {
