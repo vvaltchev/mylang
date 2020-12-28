@@ -234,7 +234,7 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
     if (idx < 0)
         idx += arr.size();
 
-    if (idx < 0 || idx >= arr.size())
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
         throw OutOfBoundsEx();
 
     LValue *ret = &vec[arr.offset() + idx];
@@ -270,7 +270,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
                 start = 0;
         }
 
-        if (start >= arr.size())
+        if (static_cast<size_t>(start) >= arr.size())
             return empty_arr;
 
     } else if (!start_val.is<NoneVal>()) {
@@ -288,7 +288,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
         if (end <= start)
             return empty_arr;
 
-        if (end > arr.size())
+        if (static_cast<size_t>(end) > arr.size())
             end = arr.size();
 
     } else if (!end_val.is<NoneVal>()) {

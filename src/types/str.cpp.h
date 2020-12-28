@@ -201,7 +201,7 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
     if (idx < 0)
         idx += s.size();
 
-    if (idx < 0 || idx >= s.size())
+    if (idx < 0 || static_cast<size_t>(idx) >= s.size())
         throw OutOfBoundsEx();
 
     return FlatSharedStr(s, s.offset() + idx, 1);
@@ -227,7 +227,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
                 start = 0;
         }
 
-        if (start >= s.size())
+        if (static_cast<size_t>(start) >= s.size())
             return empty_str;
 
     } else if (!start_val.is<NoneVal>()) {
@@ -245,7 +245,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
         if (end <= start)
             return empty_str;
 
-        if (end > s.size())
+        if (static_cast<size_t>(end) > s.size())
             end = s.size();
 
     } else if (!end_val.is<NoneVal>()) {

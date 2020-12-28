@@ -139,7 +139,7 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
     if (index < 0)
         throw OutOfBoundsEx();
 
-    if (index >= view.size())
+    if (static_cast<size_t>(index) >= view.size())
         throw OutOfBoundsEx();
 
     if (arr.is_slice()) {
@@ -177,7 +177,7 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     if (index < 0)
         throw OutOfBoundsEx();
 
-    if (index > view.size())
+    if (static_cast<size_t>(index) > view.size())
         throw OutOfBoundsEx();
 
     if (arr.is_slice()) {
