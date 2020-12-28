@@ -13,6 +13,52 @@ libraries and frameworks ready for production use. However, `MyLang` has
 a minimal set of builtins and, it *could* be used for practical purposes
 as well.
 
+## Building MyLang
+
+MyLang is written in *portable* C++17: at the moment, the project has no
+dependencies other than the standard C++ library. To build it, if you have
+`GNU make` installed, just run:
+
+```
+$ make -j
+```
+
+Otherwise, just pass all the .cpp files to your compiler and add the `src/`
+directory to the include search path. One of the nicest things about *not*
+having dependecies is that there's no need for a *build system* for one-time
+builds.
+
+#### Testing MyLang
+
+If you want to run MyLang's tests as well, you need to just compile with TESTS=1
+and disable the optimizations with OPT=0, for a better debugging experience:
+
+```
+$ make -j TESTS=1 OPT=0
+```
+
+Then, run all the tests with:
+
+```
+$ ./build/mylang -rt
+```
+
+It's worth noticing that, while test frameworks like [GoogleTest] and [Boost.Test]
+are infinitely much more powerful and flexible than the trivial test engine we have
+in `src/tests.cpp`, they are *external* dependencies. The less dependencies, the
+better, right? :-)
+
+[GoogleTest]: https://github.com/google/googletest
+[Boost.Test]: https://www.boost.org/doc/libs/1_75_0/libs/test/doc/html/index.html
+
+#### Out-of-tree builds
+
+Just pass the `BUILD_DIR` option to `make`:
+
+```
+$ make -j BUILD_DIR=other_build_directory
+```
+
 ## Syntax
 
 The shortest way to describe `MyLang` is: *a C-looking dynamic python-ish
