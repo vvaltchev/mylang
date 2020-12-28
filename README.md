@@ -15,10 +15,10 @@ as well.
 
 ## Syntax
 
-The shortest way to describe `MyLang` is: a C-looking dynamic *python-ish*
-language like. Probably, the fastest way to learn this language is to check
-out the scripts in the `samples/` directory while reading the short documentation
-below.
+The shortest way to describe `MyLang` is: *a C-looking dynamic python-ish
+language*. Probably, the fastest way to learn this language is to check
+out the scripts in the `samples/` directory while taking a look at the short
+documentation below.
 
 ### Contents
 
@@ -111,7 +111,7 @@ var a,b,c = 42;
 
 In this case, instead of just declaring `a` and `b` and initializing to `c` to 42,
 we're initializing *all* the three variables to the value 42. To initialize each
-variable to different value, use the array-expansion syntax:
+variable to a different value, use the array-expansion syntax:
 
 ```C#
 var a,b,c = [1,2,3];
@@ -266,7 +266,7 @@ to be const-evaluated.
     Dictionaries are hash-maps defined using `Python`'s syntax: `{"a": 3, "b": 4}`.
     Elements are accessed with the familiar syntax `d["key-string"]` or `d[23]`, can
     be looked-up with `find()` and deleted with `erase()`. At the moment, only strings,
-    integers and floats can be used as keys of a dictionary. **Perks**: identifier-like
+    integers, and floats can be used as keys of a dictionary. **Perks**: identifier-like
     string-keys can be accessed also with the "member of" syntax: `d.key`.
 
   * **Function**
@@ -360,7 +360,7 @@ for (var i = 0; i < 10; i += 1) {
 }
 ```
 
-Also in this case, the `{ }` braces can be omitted. Probably, there are only
+Here, the `{ }` braces can be omitted as in the case above. There are only
 a few difference from `C` worth pointing out:
 
   - The `++` and `--` operators do not exist in `MyLang`, at the moment.
@@ -703,7 +703,7 @@ try {
 }
 ```
 
-Exceptions might contain data, but none of the builtin exceptions
+Exceptions might contain data, but none of the built-in exceptions
 currently do. The list of builtin *runtime* exceptions that can be
 caught with `try-catch` blocks is:
 
@@ -734,7 +734,7 @@ try {
 
 This language does not support custom types, at the moment. Therefore,
 it's not possible to *throw* any kind of object like in some other languages.
-To throw an exception, it's necessary to use the special builtin function
+To throw an exception, it's necessary to use the special built-in function
 `exception()` or its shortcut, `ex()`. Consider the following example:
 
 ```C#
@@ -752,7 +752,7 @@ As intuition suggests, with `ex()` we've created and later thrown an exception
 object called `MyError`, having `1234` as payload data. Later, in the `catch` block,
 we caught the exception and, we extracted the payload data using the `exdata()` builtin.
 
-In case a given exception has no need to have a payload, it's possible to just
+In case a given exception doesn't need to have a payload, it's possible to just
 save the result of `ex()` in a variable and throw it later using a probably more
 pleasant syntax:
 
