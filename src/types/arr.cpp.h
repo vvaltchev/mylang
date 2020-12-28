@@ -21,8 +21,7 @@ void FlatSharedArray::inner_type::clone_internal_vec()
         shobj->vec.cbegin() + off + len
     );
 
-    this->~SharedArrayObj();
-    new (this) SharedArrayObj(move(new_vec));
+    *this = SharedArrayObj(move(new_vec));
 }
 
 template <>

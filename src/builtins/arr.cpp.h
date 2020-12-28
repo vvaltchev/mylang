@@ -155,8 +155,9 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
         } else {
 
             arr.clone_internal_vec();
-            arr.get_ref().erase(arr.get_ref().begin() + arr.offset() + index);
-            lval->put(FlatSharedArray(arr));
+            auto &vec = arr.get_ref();
+            vec.erase(vec.begin() + arr.offset() + index);
+            lval->put(FlatSharedArray(move(vec)));
         }
 
     } else {
@@ -182,8 +183,9 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     if (arr.is_slice()) {
 
         arr.clone_internal_vec();
-        arr.get_ref().insert(arr.get_ref().begin() + index, LValue(val, false));
-        lval->put(FlatSharedArray(arr));
+        auto &vec = arr.get_ref();
+        vec.insert(vec.begin() + index, LValue(val, false));
+        lval->put(FlatSharedArray(move(vec)));
 
     } else {
 

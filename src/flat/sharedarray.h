@@ -173,8 +173,8 @@ public:
     FlatSharedArrayTempl() = default;
     FlatSharedArrayTempl(const vec_type &arr) = delete;
     FlatSharedArrayTempl(vec_type &&arr) : flat(move(arr)) { }
-    FlatSharedArrayTempl(const FlatSharedArrayTempl &flatWrapper, size_type off, size_type len)
-        : flat(flatWrapper.flat.get(), off, len)
+    FlatSharedArrayTempl(const FlatSharedArrayTempl &wrapper, size_type off, size_type len)
+        : flat(wrapper.flat.get(), off, len)
     { }
 
     vec_type &get_ref() { return flat->get_vec(); }
