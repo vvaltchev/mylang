@@ -42,7 +42,7 @@ inline float_type internal_val_to_float(const EvalValue &b)
         return b.get<float_type>();
 
     if (b.is<int_type>())
-        return b.get<int_type>();
+        return static_cast<float_type>(b.get<int_type>());
 
     throw TypeErrorEx("Cannot convert right-side value to float");
 }

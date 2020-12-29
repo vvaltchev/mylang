@@ -40,7 +40,11 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 
         try {
 
+#ifndef _MSC_VER
             return stol(string(val.get<FlatSharedStr>().get_view()));
+#else
+            return stoll(string(val.get<FlatSharedStr>().get_view()));
+#endif
 
         } catch (...) {
 
@@ -290,7 +294,10 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
             );
         }
 
-        const float_type base10exp = powl(10.0, v1.get<int_type>());
+        const float_type base10exp = powl(
+            10.0,
+            static_cast<float_type>(v1.get<int_type>())
+        );
         return roundl(v0.get<float_type>() * base10exp) / base10exp;
     }
 }

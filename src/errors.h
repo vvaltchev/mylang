@@ -12,7 +12,12 @@ struct Loc {
     int col;
 
     Loc() : line(0), col(0) { }
-    Loc(int line, int col): line(line), col(col) { }
+
+    template <class T, class U>
+    Loc(T line, U col)
+        : line(static_cast<int>(line))
+        , col(static_cast<int>(col))
+    { }
 
     operator bool() const {
         return col != 0;
@@ -23,7 +28,7 @@ struct Loc {
         if (!col)
             return Loc();
 
-        return Loc(line, col + n);
+        return Loc(line, col + static_cast<int>(n));
     }
 
     Loc operator+(int n) const {

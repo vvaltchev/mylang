@@ -45,7 +45,7 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
-    exit(e.get<int_type>());
+    exit(static_cast<int>(e.get<int_type>()));
 }
 
 EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)

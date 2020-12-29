@@ -60,7 +60,7 @@ read_script(const char *filename)
     }
 
     for (size_t i = 0; i < lines.size(); i++)
-        lexer(lines[i], i+1, tokens);
+        lexer(lines[i], static_cast<int>(i+1), tokens);
 }
 
 void
