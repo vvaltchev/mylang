@@ -256,8 +256,8 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("math_2_sqrt_pi", M_2_SQRTPI), /* 2/sqrt(pi) */
     make_const_builtin("math_sqrt2", M_SQRT2), /* sqrt(2) */
     make_const_builtin("math_1_sqrt2", M_SQRT1_2), /* 1/sqrt(2) */
-    make_const_builtin("nan", NAN), /* 1/sqrt(2) */
-    make_const_builtin("inf", INFINITY), /* 1/sqrt(2) */
+    make_const_builtin("nan", NAN), /* Not a Number */
+    make_const_builtin("inf", INFINITY), /* Infinity */
     make_const_builtin("eps", std::numeric_limits<float_type>::epsilon()),
 };
 

@@ -39,10 +39,11 @@ as well.
       - [The finally clause](#the-finally-clause)
   * [Builtins](#builtins)
     * [Const builtins](#const-builtins)
-      - [Generic builtins](#generic-builtins)
-      - [Array or container builtins](#array-or-container-builtins)
+      - [General builtins](#general-builtins)
+      - [Array builtins](#array-builtins)
       - [Dictionary builtins](#dictionary-builtins)
       - [String builtins](#string-builtins)
+      - [Generic-container builtins](#generic-container-builtins)
       - [Numeric builtins](#numeric-builtins)
       - [Numeric constants](#numeric-constants)
     * [Non-const builtins](#non-const-builtins)
@@ -872,7 +873,7 @@ allowed as well.
 The following built-in functions will be evaluated during *parse-time* when
 const arguments are passed to them.
 
-### Generic builtins
+### General builtins
 
 #### `defined(symbol)`
 Check if `symbol` is defined. Returns 1 if the symbol is defined, 0 otherwise.
@@ -907,7 +908,7 @@ Useful for debugging.
 Return the hash value used by dictionaries internally when `value` is used
 as a key. At the moment, only integers, floats and strings support `hash()`.
 
-### Array or container builtins
+### Array builtins
 
 #### `array(N)`
 Return an array of `none` values with `N` elements.
@@ -916,7 +917,6 @@ Return an array of `none` values with `N` elements.
 Return the last element of the array. This is an alias for `array[-1]`.
 It is useful when a given array is used as a stack, in combination with
 other builtins like `push()` and `pop()`.
-
 
 #### `range(n, [end, [step]])`
 When only one parameter is provided, it returns an array with numbers
@@ -929,20 +929,6 @@ it might look pretty in foreach loops, that's typically not a good idea
 because it returns a whole array, not a generator object like in `Python 3.x`.
 Therefore, for small ranges is fine, but for larger ranges it's better to
 use the classic for-loop.
-
-#### `find(container, what, [key_func])`
-Generic *find* function working with strings, arrays and dictionaries.
-When `container` is a string, it returns the index of the first occurrence
-of the `what` substring in `container` or `none`.
-
-When `container` is an array, it returns the index of the first element equal
-to `what`. Also, when `container` is an array, a 3rd parameter (`key_func`) is
-supported: it's a function object accepting a value (element of the array) and
-returning the value that must be compared to `what`. It's useful when we're
-searching something in an array of composite elements (e.g. tuples).
-
-When `container` is a dictionary, it returns the value associated with the
-given key (`what`) or `none` otherwise.
 
 #### `sort(array, [compare_func])`
 Sorts the given array *in-place* and returns the same array. Optionally,
@@ -969,34 +955,6 @@ Apply the `+` operator sequentially to all elements in the given array and
 return the result. In case the optional argument `key_func` is passed to `sum()`,
 the operator `+` is applied to the result of `key_func(elem)`, for each element
 instead.
-
-#### `map(func, container)`
-Map each element in `container` through `func(elem)` and return the resulting
-array. For example, the following identity holds:
-
-```
-map(func(x) => x+1, [1, 2, 3]) == [2, 3, 4]
-```
-
-In case the container is a dictionary, `func` is required to accept two arguments,
-a key and a value, but the result will still be an array. For example:
-
-```
-map(func(k, v) => [k, v+1], {"a": 3, "b": 4}) == [["a",4],["b",5]]
-```
-
-#### `filter(func, container)`
-Filter the elements of `container` through `func(elem)` and return a container
-of the same type with only the elements for which `func(elem)` returned true.
-For example:
-
-```
-filter(func(x) => x > 3, [1, 2, 3, 4, 5]) == [4, 5]
-```
-
-In case the container is a dictionary, `func` is required to accept two parameters,
-a key and a value, but the behavior will be semantically the same (a dictionary will
-be returned).
 
 ### Dictionary builtins
 
@@ -1063,6 +1021,50 @@ false (0), otherwise.
 #### `endswith(string, sub_string)`
 Return true (1) if the given string ends with the given sub_string and
 false (0), otherwise.
+
+
+#### Generic-container builtins
+
+#### `find(container, what, [key_func])`
+Generic *find* function working with strings, arrays and dictionaries.
+When `container` is a string, it returns the index of the first occurrence
+of the `what` substring in `container` or `none`.
+
+When `container` is an array, it returns the index of the first element equal
+to `what`. Also, when `container` is an array, a 3rd parameter (`key_func`) is
+supported: it's a function object accepting a value (element of the array) and
+returning the value that must be compared to `what`. It's useful when we're
+searching something in an array of composite elements (e.g. tuples).
+
+When `container` is a dictionary, it returns the value associated with the
+given key (`what`) or `none` otherwise.
+
+#### `map(func, container)`
+Map each element in `container` through `func(elem)` and return the resulting
+array. For example, the following identity holds:
+
+```
+map(func(x) => x+1, [1, 2, 3]) == [2, 3, 4]
+```
+
+In case the container is a dictionary, `func` is required to accept two arguments,
+a key and a value, but the result will still be an array. For example:
+
+```
+map(func(k, v) => [k, v+1], {"a": 3, "b": 4}) == [["a",4],["b",5]]
+```
+
+#### `filter(func, container)`
+Filter the elements of `container` through `func(elem)` and return a container
+of the same type. For example:
+
+```
+filter(func(x) => x > 3, [1, 2, 3, 4, 5]) == [4, 5]
+```
+
+In case the container is a dictionary, `func` is required to accept two parameters,
+a key and a value, but the behavior will be semantically the same (a dictionary will
+be returned).
 
 ### Numeric builtins
 
@@ -1151,7 +1153,26 @@ Round `x` to the nearest integer or to a floating-point number with
 `precision` digits.
 
 ### Numeric constants
-(Incomplete, at the moment)
+
+ Constant name         | Value
+-----------------------|-------------------------
+ math_e                | Euler's number
+ math_log2e            | log2(e)
+ math_log10e           | log10(e)
+ math_ln2              | log(2)
+ math_ln10             | log(10)
+ math_pi               | pi
+ math_pi2              | pi/2
+ math_pi4              | pi/4
+ math_1_pi             | 1/pi
+ math_2_pi             | 2/pi
+ math_2_sqrt_pi        | 2/sqrt(pi)
+ math_sqrt2            | sqrt(2)
+ math_1_sqrt2          | 1/sqrt(2)
+ nan                   | Not a Number
+ inf                   | Infinity
+ eps                   | Floating-point's epsilon
+
 
 ### Non-const builtins
 (Incomplete, at the moment)
