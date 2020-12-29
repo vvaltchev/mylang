@@ -1,6 +1,16 @@
 pool:
   vmImage: 'ubuntu-latest'
 
+trigger:
+
+  branches:
+    exclude:
+      - readme*
+
+  paths:
+    exclude:
+      - README.md
+
 jobs:
 
   - job: default
