@@ -263,25 +263,34 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
 
 EvalContext::SymbolsType EvalContext::builtins =
 {
+    /* Misc builtins */
     make_builtin("assert", builtin_assert),
     make_builtin("exit", builtin_exit),
     make_builtin("intptr", builtin_intptr),
     make_builtin("undef", builtin_undef),
-    make_builtin("print", builtin_print),
-    make_builtin("write", builtin_write),
-    make_builtin("writeln", builtin_writeln),
-    make_builtin("read", builtin_read),
-    make_builtin("readln", builtin_readln),
-    make_builtin("readlines", builtin_readlines),
-    make_builtin("writelines", builtin_writelines),
-    make_builtin("append", builtin_append),
-    make_builtin("push", builtin_append), /* push() is an alias for append() */
-    make_builtin("pop", builtin_pop),
-    make_builtin("erase", builtin_erase),
-    make_builtin("insert", builtin_insert),
     make_builtin("exception", builtin_exception),
     make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */
     make_builtin("exdata", builtin_exdata),
+
+    /* Array builtins */
+    make_builtin("append", builtin_append),
+    make_builtin("push", builtin_append), /* push() is an alias for append() */
+    make_builtin("pop", builtin_pop),
+
+    /* Generic-container builtins */
+    make_builtin("erase", builtin_erase),
+    make_builtin("insert", builtin_insert),
+
+    /* Numeric builtins */
     make_builtin("rand", builtin_rand),
     make_builtin("randf", builtin_randf),
+
+    /* I/O builtins */
+    make_builtin("print", builtin_print),
+    make_builtin("readln", builtin_readln),
+    make_builtin("writeln", builtin_writeln),
+    make_builtin("read", builtin_read),
+    make_builtin("write", builtin_write),
+    make_builtin("readlines", builtin_readlines),
+    make_builtin("writelines", builtin_writelines),
 };

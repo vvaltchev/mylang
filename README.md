@@ -47,6 +47,12 @@ as well.
       - [Numeric builtins](#numeric-builtins)
       - [Numeric constants](#numeric-constants)
     * [Non-const builtins](#non-const-builtins)
+      - [Misc builtins](#non-const-misc-builtins)
+      - [Array builtins](#non-const-array-builtins)
+      - [Generic-container builtins](#non-const-generic-container-builtins)
+      - [Numeric builtins](#non-const-numeric-builtins)
+      - [I/O builtins](#non-const-io-builtins)
+
 
 ## Maintainance
 
@@ -947,8 +953,8 @@ Behaves exactly like `sort()`, but sorts the array in descending order.
 
 #### `reverse(array)`
 Reverse the given array in-place and returns it. Like `sort()`, if the given
-argument is const, it will be cloned before reversing. Therefore, it can used
-during const-evaluation.
+argument is const, it will be cloned before reversing. Therefore, it can be
+used during const-evaluation.
 
 #### `sum(array, [key_func])`
 Apply the `+` operator sequentially to all elements in the given array and
@@ -983,12 +989,12 @@ Join the given array of strings with the given delimiter. Returns a string.
 #### `ord(string)`
 Return the numeric value of the given 1-char string.
 Note: in MyLang chars are 8-bit wide and there's no Unicode support,
-because this is a small educational project.
+to keep this educational project smaller and simpler.
 
 #### `chr(num)`
 Return a 1-char string containing the string representation of the given
 number in the range [0, 255]. Note: in MyLang chars are 8-bit wide and there's
-no Unicode support, because this is a small educational project.
+no Unicode support, to keep this educational project smaller and simpler.
 
 #### `splitlines(string)`
 Split the given string, line by line. Returns an array. It's different
@@ -1026,7 +1032,7 @@ false (0), otherwise.
 #### Generic-container builtins
 
 #### `find(container, what, [key_func])`
-Generic *find* function working with strings, arrays and dictionaries.
+Generic *find* function working with strings, arrays, and dictionaries.
 When `container` is a string, it returns the index of the first occurrence
 of the `what` substring in `container` or `none`.
 
@@ -1072,18 +1078,16 @@ be returned).
 Return the absolute value of the given number.
 
 #### `min(a, b, [c, [...]])`
-Return the smallest value among the ones passed to it. All values must have a
-numeric type.
+Return the smallest value among the ones passed to it.
 
 #### `min(array)`
-Return the smallest value among in the ones in the given array.
+Return the smallest value among the ones in the given array.
 
 #### `max(a, b, [c, [...]])`
-Return the largest value among the ones passed to it. All values must have a
-numeric type.
+Return the largest value among the ones passed to it.
 
 #### `max(array)`
-Return the largest value among in the ones in the given array.
+Return the largest value among the ones in the given array.
 
 #### `exp(x)`
 Return e^x.
@@ -1175,4 +1179,96 @@ Round `x` to the nearest integer or to a floating-point number with
 
 
 ### Non-const builtins
-(Incomplete, at the moment)
+The following built-in functions will *not* be evaluated during *parse-time*,
+no matter if const arguments are passed to them or not.
+
+### Non-const misc builtins
+
+#### `assert(expr)`
+Check `expr` and throw AssertionFailureEx if it's false.
+
+#### `exit(code)`
+Exit the program with the given numeric code
+
+#### `intptr(symbol)`
+Get the internal shared object pointer referred by `symbol`.
+It's currently used in tests to check if two array slices refer internally
+to the same object.
+
+#### `undef(symbol)`
+Undefine the given symbol from the current scope. Return true if the given
+symbol was actually defined in the given scope.
+
+#### `exception(type_string, [payload_data])`
+Create an exception object having the given type plus the optional
+payload data.
+
+#### `ex(type_string, [data])`
+A shortcut for `exception()`.
+
+#### `exdata(ex)`
+Get the payload data from the given exception object.
+
+### Non-const array builtins
+
+#### `append(array, value)`
+Append `value` to the given array.
+
+#### `push(array, value)`
+An alias for `append()`. Useful for symmetry when used with `pop()`.
+
+#### `pop(array)`
+Pop (and return) the last element from the given array.
+
+### Non-const generic-container builtins
+
+#### `erase(container, key_or_index)`
+Erase the element at the given index or the element indexed by the given key
+from the given container (array or dictionary). Return true (1) if the key
+existed. For arrays, it always returns true or throws `OutOfBoundsEx` in
+case of an invalid index.
+
+#### `insert(container, key_or_index, value)`
+Insert the given value in the given container at the given index or key,
+depending on the type of the container. As `erase()`, it returns true if
+the insertion was successful, in the case `container` is a dictionary.
+In the case `container` was an array, always return true or throws
+`OutOfBoundsEx`.
+
+### Non-const numeric builtins
+
+#### `rand(a, b)`
+Generate a random integer in the range [a, b].
+
+#### `randf(a, b)`
+Generate a random floating-point number in the range [a, b].
+
+### Non-const I/O builtins
+
+#### `print(a, [b, [c, [...]]])`
+Write to the standard output the string-versions of the given
+arguments, separated by a single space and terminated by a line ending.
+
+#### `readln()`
+Read a single line from the standard input.
+
+#### `writeln(string)`
+Write the given string to the standard output, plus a line ending
+sequence.
+
+#### `read([filename])`
+If no arguments were given to `read()`, it returns the whole data in the
+standard input. Otherwise, read the whole given file and returns it as a
+string.
+
+#### `write(string, [filename])`
+Write the given string to the standard output as it is, without a line ending.
+If the optional parameter `filename` is given, write the given string to the
+given file, as it is.
+
+#### `readlines([filename])`
+Similar to `read()`, but read line by line and return an array.
+
+#### `writelines(array_of_strings, [filename])`
+Similar to `write()`, but accept an array of strings and write them one
+per line.
