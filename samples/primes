@@ -1,0 +1,25 @@
+# Find the first N primes using the square-root method
+
+func is_prime(n) {
+
+    for (var f = 2; f * f <= n; f += 1)
+        if (n % f == 0)
+            return false;
+
+    return true;
+}
+
+# ---------------- MAIN ------------------
+var N = 100;
+
+if (len(argv) > 0)
+    N = int(argv[0]);
+
+for (var n, tot = [2, 0]; tot < N; n += 1) {
+    if (is_prime(n)) {
+        write(str(n) + " ");
+        tot += 1;
+    }
+}
+
+print();
