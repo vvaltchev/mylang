@@ -12,6 +12,7 @@ if (NOT ${CMAKE_VERSION} VERSION_LESS "3.12.0")
 endif()
 
 set(TESTS         OFF CACHE BOOL   "Compile-in unit tests")
+set(GCOV          OFF CACHE BOOL   "Prepare a coverage build")
 
 file(GLOB SOURCES ${GLOB_CONF_DEP} "src/*.cpp")
 add_executable(mylang ${SOURCES})

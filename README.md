@@ -1,6 +1,8 @@
 # MyLang
 
-[![Build Status](https://dev.azure.com/vkvaltchev/MyLang/_apis/build/status/vvaltchev.mylang?branchName=master)](https://dev.azure.com/vkvaltchev/MyLang/_build/latest?definitionId=5&branchName=master)
+![Linux](https://github.com/vvaltchev/mylang/workflows/Linux/badge.svg)
+![Windows](https://github.com/vvaltchev/mylang/workflows/Windows/badge.svg)
+![MacOSX](https://github.com/vvaltchev/mylang/workflows/MacOSX/badge.svg)
 [![codecov](https://codecov.io/gh/vvaltchev/mylang/branch/master/graph/badge.svg?token=B3L5Z6T6PR)](https://codecov.io/gh/vvaltchev/mylang)
 
 ## What is MyLang?
