@@ -2834,7 +2834,7 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
     try {
 
         for (size_t i = 0; i < t.source.size(); i++)
-            lexer(t.source[i], i+1, tokens);
+            lexer(t.source[i], static_cast<int>(i+1), tokens);
 
         ParseContext pCtx(TokenStream(tokens), true /* const eval */);
 
