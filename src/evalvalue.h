@@ -111,7 +111,7 @@ public:
         class T,
         class = std::enable_if_t<                      /* SFINAE template param */
             std::is_same_v<T, bool> ||                 /* disallow for T != bool, int */
-            std::is_same_v<T, int>
+            std::is_same_v<T, int_type>
         >
     >
     EvalValue(T val)
@@ -127,6 +127,7 @@ public:
         >,
         class = std::enable_if_t<                      /* SFINAE template param */
             !std::is_same_v<U, EvalValue> &&           /* disallow EvalValue */
+            !std::is_same_v<U, int_type> &&            /* disallow int_type */
             TypeToEnum<U>::val != Type::t_count        /* disallow types not in TypeToEnum */
         >
     >

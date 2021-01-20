@@ -38,13 +38,18 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 
     } else if (val.is<FlatSharedStr>()) {
 
+        const string &strval = string(val.get<FlatSharedStr>().get_view());
+
         try {
 
-#ifndef _MSC_VER
-            return stol(string(val.get<FlatSharedStr>().get_view()));
-#else
-            return stoll(string(val.get<FlatSharedStr>().get_view()));
-#endif
+            if constexpr (sizeof(int_type) == sizeof(int))
+               return static_cast<int_type>(stoi(strval));
+            else if constexpr(sizeof(int_type) == sizeof(long))
+               return static_cast<int_type>(stol(strval));
+            else if constexpr(sizeof(int_type) == sizeof(long long))
+               return static_cast<int_type>(stoll(strval));
+            else
+               assert(0);
 
         } catch (...) {
 
