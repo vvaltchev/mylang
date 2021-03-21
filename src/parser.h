@@ -42,11 +42,13 @@ public:
 
 class ParseContext {
 
+    unique_ptr<EvalContext> const_ctx_owner;
+
 public:
 
     TokenStream ts;
     const bool const_eval;
-    EvalContext *const_ctx;
+    EvalContext *const_ctx; // points to const_ctx_owner's object
 
     ParseContext(const TokenStream &ts, bool const_eval);
 

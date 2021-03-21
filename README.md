@@ -655,7 +655,7 @@ need during const evaluation. For example, to generate `sorted_people` during co
 evaluation it's enough to write:
 
 ```C#
-const sorted_people = sort(people, pure func(a, y) => a[0] < b[0]);
+const sorted_people = sort(people, pure func(a, b) => a[0] < b[0]);
 ```
 
 Pure functions can be defined as standalone functions and *can* be used with

@@ -7,9 +7,10 @@
 using std::string;
 
 ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
-    : ts(ts)
+    : const_ctx_owner(new EvalContext(nullptr, true))
+    , ts(ts)
     , const_eval(const_eval)
-    , const_ctx(new EvalContext(nullptr, true))
+    , const_ctx(const_ctx_owner.get())
 {
 
 }
@@ -986,7 +987,7 @@ pBlock(ParseContext &c, unsigned fl)
 
     ret->start = c.get_loc();
     EvalContext block_const_ctx(c.const_ctx, true);
-    c.const_ctx = &block_const_ctx;
+    c.const_ctx = &block_const_ctx; // push a new const eval context
 
     if (!c.eoi()) {
 
@@ -1011,11 +1012,10 @@ pBlock(ParseContext &c, unsigned fl)
             }
 
         } while (added_elem);
-
     }
 
     ret->end = c.get_loc();
-    c.const_ctx = c.const_ctx->parent;
+    c.const_ctx = c.const_ctx->parent; // restore the previous const ctx
     return ret;
 }
 
