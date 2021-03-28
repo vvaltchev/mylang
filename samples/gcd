@@ -1,0 +1,68 @@
+# Calculate GCD (greatest common divisor) and LCM (lowest common multiple)
+#
+# The original GCD Euclidean algorithm could be implemented as:
+#
+# func gcd(a, b) {
+#
+#     while (a != b) {
+#         if (a > b)
+#             a = a - b;
+#         else
+#             b = b - a;
+#     }
+#
+#     return a; # note: a == b
+# }
+#
+# And it's based on the idea that the GCD does NOT change if the larger
+# number is replaced by its difference with the smaller number.
+#
+# The problem with original's algorithm is that it's inefficient. A better
+# algorithm is to replace the larger number with its reminder with the smaller
+# and stop when the reminder is zero.
+#
+# How it works. Let's assume a > b. If first save 'b' into a temporary variable. Then,
+# we make b = a % b; so 'b' will become much smaller. Finally, we put into 'a' the
+# previous value of 'b'. We repeat until a % b is > 0. When a % b == 0, we've found a value
+# that divided 'a' successfully and that now it's stored in 'a'.
+#
+# What happens when b > a? Consider this:
+#
+#   a % <value greater than a> = a.
+#
+# Therefore, "b = a" and "a = <previous value of b>". In other words,
+# when b > a, we swap them.
+#
+func gcd(a, b) {
+
+    while (b != 0) {
+
+        var t = b;   # Save "b" in "t". Like in swap(a, b)
+        b = a % b;   # Almost like swap(a, b), but it is "a % b" instead.
+        a = t;       # Restore in "a", the previous value of "b".
+    }
+
+    return a;
+}
+
+# Calculating the lowest common multiple is easy:
+# just take |a * b| and divide it by the GCD(a, b).
+
+func lcm(a, b) {
+    return abs(a * b) / gcd(a, b);
+}
+
+# ---------- main -------------
+
+if (len(argv) < 2) {
+
+    print("Syntax:");
+    print("     gcd <a> <b>");
+    exit(1);
+}
+
+var a = int(argv[0]);
+var b = int(argv[1]);
+
+print("GCD: " + gcd(a, b));
+print("LCM: " + lcm(a, b));
