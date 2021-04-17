@@ -19,7 +19,7 @@
 #include <cmath>
 #include <limits>
 
-static const std::array<FlatSharedStr, Type::t_count> TypeNames =
+static const std::array<SharedStr, Type::t_count> TypeNames =
 {
     string("none"),
     string(),
@@ -66,7 +66,7 @@ EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue &name_val = RValue(exprList->elems[0]->eval(ctx));
 
-    if (!name_val.is<FlatSharedStr>()) {
+    if (!name_val.is<SharedStr>()) {
         throw TypeErrorEx(
             "Expected string",
             exprList->elems[0]->start,
@@ -74,7 +74,7 @@ EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
         );
     }
 
-    const string_view &ex_name = name_val.get<FlatSharedStr>()->get_view();
+    const string_view &ex_name = name_val.get<SharedStr>().get_view();
 
     if (isdigit(ex_name[0])) {
         throw InvalidValueEx(
@@ -147,10 +147,10 @@ const std::array<Type *, Type::t_count> AllTypes =
  * ambiguity with function declaration.
  */
 
-static const FlatSharedStr empty_str_actual((string()));
+static const SharedStr empty_str_actual((string()));
 static const FlatSharedArray empty_arr_actual((std::vector<LValue>()));
 
-const EvalValue empty_str(FlatSharedStr(empty_str_actual, 0, 0));
+const EvalValue empty_str(SharedStr(empty_str_actual, 0, 0));
 const EvalValue empty_arr(FlatSharedArray(empty_arr_actual, 0, 0));
 const EvalValue none;
 

@@ -40,7 +40,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     const EvalValue &e = RValue(arg0->eval(ctx));
 
-    if (e.is<FlatSharedStr>()) {
+    if (e.is<SharedStr>()) {
 
         return e;
 
@@ -66,7 +66,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
             char buf[80];
             const int precision = static_cast<int>(p.get<int_type>());
             snprintf(buf, sizeof(buf), "%.*Lf", precision, e.get<float_type>());
-            return FlatSharedStr(string(buf));
+            return SharedStr(string(buf));
         }
 
     } else {
@@ -75,7 +75,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
             throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
     }
 
-    return FlatSharedStr(e.to_string());
+    return SharedStr(e.to_string());
 }
 
 EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
@@ -86,7 +86,7 @@ EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (e.is<FlatSharedStr>()) {
+    if (e.is<SharedStr>()) {
         /* Strings are immutable */
         return e;
     }
@@ -248,14 +248,14 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
 
         return builtin_find_arr(container_val.get<FlatSharedArray>(), elem_val, key, ctx);
 
-    } else if (container_val.is<FlatSharedStr>()) {
+    } else if (container_val.is<SharedStr>()) {
 
-        if (!elem_val.is<FlatSharedStr>())
+        if (!elem_val.is<SharedStr>())
             throw TypeErrorEx("Expected string", arg1->start, arg1->end);
 
         return builtin_find_str(
-            container_val.get<FlatSharedStr>(),
-            elem_val.get<FlatSharedStr>()
+            container_val.get<SharedStr>(),
+            elem_val.get<SharedStr>()
         );
 
     } else {

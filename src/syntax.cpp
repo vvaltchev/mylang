@@ -155,7 +155,7 @@ void LiteralStr::serialize(ostream &s, int level) const
 
     s << indent;
     s << "\"";
-    s << escape_str(value.get<FlatSharedStr>()->get_view());
+    s << escape_str(value.get<SharedStr>().get_view());
     s << "\"";
 }
 

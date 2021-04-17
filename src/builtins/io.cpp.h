@@ -33,7 +33,7 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     const EvalValue &e = RValue(arg0->eval(ctx));
 
-    if (!e.is<FlatSharedStr>())
+    if (!e.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg0->start, arg0->end);
 
     ostream *s = &cout;
@@ -44,10 +44,10 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &fstr = RValue(arg1->eval(ctx));
 
-        if (!fstr.is<FlatSharedStr>())
+        if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg1->start, arg1->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
+        fs.open(string(fstr.get<SharedStr>().get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg1->start, arg1->end);
@@ -80,10 +80,10 @@ EvalValue builtin_read(EvalContext *ctx, ExprList *exprList)
         Construct *arg0 = exprList->elems[0].get();
         const EvalValue &fstr = RValue(arg0->eval(ctx));
 
-        if (!fstr.is<FlatSharedStr>())
+        if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg0->start, arg0->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
+        fs.open(string(fstr.get<SharedStr>().get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg0->start, arg0->end);
@@ -91,7 +91,7 @@ EvalValue builtin_read(EvalContext *ctx, ExprList *exprList)
         s = &fs;
     }
 
-    return FlatSharedStr(string(std::istreambuf_iterator<char>(*s), {}));
+    return SharedStr(string(std::istreambuf_iterator<char>(*s), {}));
 }
 
 EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList)
@@ -101,7 +101,7 @@ EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList)
 
     string str;
     getline(cin, str);
-    return FlatSharedStr(move(str));
+    return SharedStr(move(str));
 }
 
 EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
@@ -119,10 +119,10 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
         Construct *arg0 = exprList->elems[0].get();
         const EvalValue &fstr = RValue(arg0->eval(ctx));
 
-        if (!fstr.is<FlatSharedStr>())
+        if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg0->start, arg0->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
+        fs.open(string(fstr.get<SharedStr>().get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg0->start, arg0->end);
@@ -131,7 +131,7 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
     }
 
     while (getline(*s, tmp)) {
-        vec.emplace_back(EvalValue(FlatSharedStr(move(tmp))), false);
+        vec.emplace_back(EvalValue(SharedStr(move(tmp))), false);
         tmp.clear();
     }
 
@@ -157,10 +157,10 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &fstr = RValue(arg1->eval(ctx));
 
-        if (!fstr.is<FlatSharedStr>())
+        if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg1->start, arg1->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
+        fs.open(string(fstr.get<SharedStr>().get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg1->start, arg1->end);

@@ -130,7 +130,7 @@ parse_args(int argc, char **argv)
             SharedArrayObj::vec_type vec;
 
             for (int i = 1; i < argc; i++)
-                vec.emplace_back(FlatSharedStr(string(argv[i])), false);
+                vec.emplace_back(SharedStr(string(argv[i])), false);
 
             EvalContext::builtins.emplace(
 

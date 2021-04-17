@@ -19,11 +19,11 @@ using std::string_view;
  * Special base class for any Type class related to non-trivial C++ type.
  * Typically, the object is just a shared_ptr<T> and in that case it's enough
  * to derive the custom Type from NonTrivialType<shared_ptr<T>>. But, in some
- * special cases, like FlatSharedStr, there are additional trivial members related
+ * special cases, like SharedStr, there are additional trivial members related
  * to the non-trivial object that must be copied as well. Therefore NonTrivialType
  * has an additional non-type template param (S) which allows to specify the real
  * size of the container object. NOTE: the non-trivial object MUST BE at offset 0
- * in the wrapper type (e.g. FlatSharedStr).
+ * in the wrapper type (e.g. SharedStr).
  */
 
 template <class T, size_t S = sizeof(T)>

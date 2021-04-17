@@ -465,7 +465,7 @@ pAcceptMember(ParseContext &c,
     if (!id)
         throw InternalErrorEx(mem->start, mem->end);
 
-    mem->memId = FlatSharedStr(string(id->get_str()));
+    mem->memId = SharedStr(string(id->get_str()));
     ret = move(mem);
     return true;
 }
@@ -1226,7 +1226,7 @@ MakeConstructFromConstVal(const EvalValue &v,
         return true;
     }
 
-    if (v.is<FlatSharedStr>()) {
+    if (v.is<SharedStr>()) {
         out = make_unique<LiteralStr>(v);
         return true;
     }

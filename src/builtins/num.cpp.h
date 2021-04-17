@@ -36,9 +36,9 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 
         return static_cast<int_type>(val.get<float_type>());
 
-    } else if (val.is<FlatSharedStr>()) {
+    } else if (val.is<SharedStr>()) {
 
-        const string &strval = string(val.get<FlatSharedStr>()->get_view());
+        const string &strval = string(val.get<SharedStr>().get_view());
 
         try {
 
@@ -78,11 +78,11 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
 
         return static_cast<float_type>(val.get<int_type>());
 
-    } else if (val.is<FlatSharedStr>()) {
+    } else if (val.is<SharedStr>()) {
 
         try {
 
-            return stold(string(val.get<FlatSharedStr>()->get_view()));
+            return stold(string(val.get<SharedStr>().get_view()));
 
         } catch (...) {
 
