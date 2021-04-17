@@ -284,14 +284,14 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val0 = RValue(arg0->eval(ctx));
     const EvalValue &val1 = RValue(arg1->eval(ctx));
     FuncObject &funcObj = val0.get<FlatSharedFuncObj>().get();
-    FlatSharedArray::vec_type result;
+    SharedArrayObj::vec_type result;
 
     if (!val0.is<FlatSharedFuncObj>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
 
     if (val1.is<FlatSharedArray>()) {
 
-        const ArrayConstView &view = val1.get<FlatSharedArray>().get_view();
+        const ArrayConstView &view = val1.get<FlatSharedArray>()->get_view();
 
         for (size_type i = 0; i < view.size(); i++) {
 
@@ -342,8 +342,8 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
 
     if (val1.is<FlatSharedArray>()) {
 
-        const ArrayConstView &view = val1.get<FlatSharedArray>().get_view();
-        FlatSharedArray::vec_type result;
+        const ArrayConstView &view = val1.get<FlatSharedArray>()->get_view();
+        SharedArrayObj::vec_type result;
 
         for (size_type i = 0; i < view.size(); i++) {
 

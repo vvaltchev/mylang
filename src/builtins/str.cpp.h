@@ -36,7 +36,7 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     const string_view &str = flat_str->get_view();
     const string_view &delim = val_delim.get<FlatSharedStr>()->get_view();
 
-    FlatSharedArray::vec_type vec;
+    SharedArrayObj::vec_type vec;
 
     if (delim.size()) {
 
@@ -88,7 +88,7 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
 
     const string_view &delim = val_delim.get<FlatSharedStr>()->get_view();
-    const ArrayConstView &arr_view = val_arr.get<FlatSharedArray>().get_view();
+    const ArrayConstView &arr_view = val_arr.get<FlatSharedArray>()->get_view();
     string result;
 
     for (size_t i = 0; i < arr_view.size(); i++) {
@@ -120,7 +120,7 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
     const string_view &str = flat_str->get_view();
-    FlatSharedArray::vec_type vec;
+    SharedArrayObj::vec_type vec;
     size_type i, start = 0;
 
     for (i = 0; i < str.size(); i++) {

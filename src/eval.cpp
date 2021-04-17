@@ -372,7 +372,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
-    FlatSharedArray::vec_type vec;
+    SharedArrayObj::vec_type vec;
 
     if (!elems.size())
         return empty_arr;
@@ -717,7 +717,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         } else {
 
-            const ArrayConstView &view = rval.get<FlatSharedArray>().get_view();
+            const ArrayConstView &view = rval.get<FlatSharedArray>()->get_view();
 
             for (size_type i = 0; i < idlist->elems.size(); i++) {
 
@@ -1019,14 +1019,14 @@ EvalValue &LValue::get_value_for_put()
     assert(container->is<FlatSharedArray>());
 
     if (container->valtype()->is_slice(container->val)) {
-        const size_type off = container->getval<FlatSharedArray>().offset();
+        const size_type off = container->getval<FlatSharedArray>()->offset();
         *container = container->clone();
         container_idx -= off;
-        return container->getval<FlatSharedArray>().get_ref()[container_idx].val;
+        return container->getval<FlatSharedArray>()->get_vec()[container_idx].val;
     }
 
     if (container->valtype()->use_count(container->val) > 1)
-        container->getval<FlatSharedArray>().clone_aliased_slices(container_idx);
+        container->getval<FlatSharedArray>()->clone_aliased_slices(container_idx);
 
     return val;
 }
@@ -1070,7 +1070,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
         if (elems[0].is<FlatSharedArray>() && ids->elems.size() > (1 + id_start)) {
 
             const ArrayConstView &view =
-                elems[0].get<FlatSharedArray>().get_view();
+                elems[0].get<FlatSharedArray>()->get_view();
 
             for (size_type i = id_start; i < ids->elems.size(); i++) {
 
@@ -1144,7 +1144,7 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
     if (cval.is<FlatSharedArray>()) {
 
-        const ArrayConstView &view = cval.get<FlatSharedArray>().get_view();
+        const ArrayConstView &view = cval.get<FlatSharedArray>()->get_view();
 
         for (size_type i = 0; i < view.size(); i++) {
 

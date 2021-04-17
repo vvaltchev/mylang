@@ -121,10 +121,10 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
 template <bool is_max>
 EvalValue b_min_max_arr(const FlatSharedArray &arr)
 {
-    const ArrayConstView &arr_view = arr.get_view();
+    const ArrayConstView &arr_view = arr->get_view();
     EvalValue val;
 
-    if (arr.size() > 0) {
+    if (arr->size() > 0) {
 
         val = arr_view[0].get();
 

@@ -127,7 +127,7 @@ parse_args(int argc, char **argv)
 
             read_script(arg);
 
-            FlatSharedArray::vec_type vec;
+            SharedArrayObj::vec_type vec;
 
             for (int i = 1; i < argc; i++)
                 vec.emplace_back(FlatSharedStr(string(argv[i])), false);

@@ -47,7 +47,7 @@ builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
 static EvalValue
 dict_keys(const DictObject::inner_type &data)
 {
-    FlatSharedArray::vec_type result;
+    SharedArrayObj::vec_type result;
 
     for (auto const &e : data) {
         result.emplace_back(e.first, false);
@@ -59,7 +59,7 @@ dict_keys(const DictObject::inner_type &data)
 static EvalValue
 dict_values(const DictObject::inner_type &data)
 {
-    FlatSharedArray::vec_type result;
+    SharedArrayObj::vec_type result;
 
     for (auto const &e : data) {
         result.emplace_back(e.second.get(), false);
@@ -71,11 +71,11 @@ dict_values(const DictObject::inner_type &data)
 static EvalValue
 dict_kvpairs(const DictObject::inner_type &data)
 {
-    FlatSharedArray::vec_type result;
+    SharedArrayObj::vec_type result;
 
     for (auto const &e : data) {
 
-        FlatSharedArray::vec_type pair_arr;
+        SharedArrayObj::vec_type pair_arr;
         pair_arr.emplace_back(e.first, false);
         pair_arr.emplace_back(e.second.get(), false);
         result.emplace_back(FlatSharedArray(move(pair_arr)), false);
@@ -138,7 +138,7 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
         );
     }
 
-    const ArrayConstView &view = e.get<FlatSharedArray>().get_view();
+    const ArrayConstView &view = e.get<FlatSharedArray>()->get_view();
 
     for (size_type i = 0; i < view.size(); i++) {
 
@@ -150,7 +150,7 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
             );
         }
 
-        const ArrayConstView &pair_view = e.get<FlatSharedArray>().get_view();
+        const ArrayConstView &pair_view = e.get<FlatSharedArray>()->get_view();
 
         if (pair_view.size() != 2) {
             throw TypeErrorEx(

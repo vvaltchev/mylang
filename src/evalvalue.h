@@ -29,15 +29,16 @@ class EvalContext;
 class FuncObject;
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
-/* Base typedefs */
+/* Base typedefs for non-generic template types */
 typedef DictObjectTempl<EvalValue, LValue> DictObject;
 typedef ExceptionObjectTempl<EvalValue> ExceptionObject;
+typedef SharedArrayObjTempl<LValue> SharedArrayObj;
 
 /* Flat type wrapper */
 typedef FlatVal<SharedStr> FlatSharedStr;
 typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
 typedef FlatSharedVal<DictObject> FlatSharedDictObj;
-typedef FlatSharedArrayTempl<LValue> FlatSharedArray;
+typedef FlatVal<SharedArrayObj> FlatSharedArray;
 typedef FlatSharedVal<ExceptionObject> FlatSharedException;
 
 /* Other types */

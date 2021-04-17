@@ -109,7 +109,7 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
     if (exprList->elems.size() > 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    FlatSharedArray::vec_type vec;
+    SharedArrayObj::vec_type vec;
     std::istream *s = &cin;
     std::ifstream fs;
     string tmp;
@@ -168,7 +168,7 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
         s = &fs;
     }
 
-    const FlatSharedArray::vec_type &vec = val.get<FlatSharedArray>().get_ref();
+    const SharedArrayObj::vec_type &vec = val.get<FlatSharedArray>()->get_vec();
 
     for (const auto &e : vec) {
         *s << e.get() << endl;

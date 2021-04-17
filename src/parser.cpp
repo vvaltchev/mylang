@@ -1235,7 +1235,7 @@ MakeConstructFromConstVal(const EvalValue &v,
 
         if (v.is<FlatSharedArray>()) {
 
-            const ArrayConstView &view = v.get<FlatSharedArray>().get_view();
+            const ArrayConstView &view = v.get<FlatSharedArray>()->get_view();
             unique_ptr<LiteralArray> litarr(new LiteralArray);
 
             for (unsigned i = 0; i < view.size(); i++) {
