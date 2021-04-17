@@ -144,7 +144,7 @@ EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 }
 
 LiteralStr::LiteralStr(const std::string_view &v)
-    : value(v.empty() ? empty_str : FlatSharedStr(unescape_str(v)))
+    : value(v.empty() ? empty_str : EvalValue(FlatSharedStr(unescape_str(v))))
 { }
 
 EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
@@ -1156,7 +1156,7 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
     } else if (cval.is<FlatSharedStr>()) {
 
-        const string_view &view = cval.get<FlatSharedStr>().get_view();
+        const string_view &view = cval.get<FlatSharedStr>()->get_view();
 
         for (size_type i = 0; i < view.size(); i++) {
 

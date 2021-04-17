@@ -43,6 +43,11 @@ public:
         new ((void *)data) T(move(s), forward<Args>(args)...);
     }
 
+    template<typename... Args>
+    FlatVal(Args&&... args) {
+        new ((void *)data) T(forward<Args>(args)...);
+    }
+
     T &get() {
         return *reinterpret_cast<T *>(data);
     }

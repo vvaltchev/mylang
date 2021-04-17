@@ -47,7 +47,7 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
         if (!fstr.is<FlatSharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg1->start, arg1->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>().get_view()));
+        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg1->start, arg1->end);
@@ -83,7 +83,7 @@ EvalValue builtin_read(EvalContext *ctx, ExprList *exprList)
         if (!fstr.is<FlatSharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg0->start, arg0->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>().get_view()));
+        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg0->start, arg0->end);
@@ -122,7 +122,7 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
         if (!fstr.is<FlatSharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg0->start, arg0->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>().get_view()));
+        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg0->start, arg0->end);
@@ -160,7 +160,7 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
         if (!fstr.is<FlatSharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg1->start, arg1->end);
 
-        fs.open(string(fstr.get<FlatSharedStr>().get_view()));
+        fs.open(string(fstr.get<FlatSharedStr>()->get_view()));
 
         if (!fs)
             throw CannotOpenFileEx(arg1->start, arg1->end);

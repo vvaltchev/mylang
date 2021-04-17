@@ -33,8 +33,8 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected string", arg_delim->start, arg_delim->end);
 
     const FlatSharedStr &flat_str = val_str.get<FlatSharedStr>();
-    const string_view &str = flat_str.get_view();
-    const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
+    const string_view &str = flat_str->get_view();
+    const string_view &delim = val_delim.get<FlatSharedStr>()->get_view();
 
     FlatSharedArray::vec_type vec;
 
@@ -87,7 +87,7 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
     if (!val_delim.is<FlatSharedStr>())
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
 
-    const string_view &delim = val_delim.get<FlatSharedStr>().get_view();
+    const string_view &delim = val_delim.get<FlatSharedStr>()->get_view();
     const ArrayConstView &arr_view = val_arr.get<FlatSharedArray>().get_view();
     string result;
 
@@ -98,7 +98,7 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
         if (!val.is<FlatSharedStr>())
             throw TypeErrorEx("Expected string", arg_arr->start, arg_arr->end);
 
-        result += val.get<FlatSharedStr>().get_view();
+        result += val.get<FlatSharedStr>()->get_view();
 
         if (i != arr_view.size() - 1)
             result += delim;
@@ -119,7 +119,7 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
-    const string_view &str = flat_str.get_view();
+    const string_view &str = flat_str->get_view();
     FlatSharedArray::vec_type vec;
     size_type i, start = 0;
 
@@ -170,7 +170,7 @@ EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
-    const string_view &str = flat_str.get_view();
+    const string_view &str = flat_str->get_view();
 
     if (str.size() != 1)
          throw InvalidValueEx("Expected 1-char string", arg->start, arg->end);
@@ -196,7 +196,7 @@ EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
 EvalValue
 builtin_find_str(const FlatSharedStr &str, const FlatSharedStr &substr)
 {
-    const size_t pos = str.get_view().find(substr.get_view());
+    const size_t pos = str->get_view().find(substr->get_view());
 
     if (pos == string::npos)
         return none;
@@ -231,7 +231,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
         if (!padc.is<FlatSharedStr>())
             throw TypeErrorEx("Expected string", arg2->start, arg2->end);
 
-        const string_view &padstr = padc.get<FlatSharedStr>().get_view();
+        const string_view &padstr = padc.get<FlatSharedStr>()->get_view();
 
         if (padstr.size() > 1)
             throw InvalidValueEx("Expected 1-char string", arg2->start, arg2->end);
@@ -239,7 +239,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
         pad_char = padstr[0];
     }
 
-    const string_view &str = strval.get<FlatSharedStr>().get_view();
+    const string_view &str = strval.get<FlatSharedStr>()->get_view();
     const int_type n_orig = nval.get<int_type>();
 
     if (n_orig < 0)
@@ -283,7 +283,7 @@ EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
-    const string_view &str = flat_str.get_view();
+    const string_view &str = flat_str->get_view();
     size_type s;
 
     if (!str.size())
@@ -294,7 +294,7 @@ EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList)
             break;
     }
 
-    return FlatSharedStr(flat_str, flat_str.offset() + s, str.size() - s);
+    return FlatSharedStr(flat_str, flat_str->offset() + s, str.size() - s);
 }
 
 EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList)
@@ -309,7 +309,7 @@ EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
-    const string_view &str = flat_str.get_view();
+    const string_view &str = flat_str->get_view();
     size_type l;
 
     if (!str.size())
@@ -320,7 +320,7 @@ EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList)
             break;
     }
 
-    return FlatSharedStr(flat_str, flat_str.offset(), l);
+    return FlatSharedStr(flat_str, flat_str->offset(), l);
 }
 
 EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList)
@@ -335,7 +335,7 @@ EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected string", arg->start, arg->end);
 
     const FlatSharedStr &flat_str = val.get<FlatSharedStr>();
-    const string_view &str = flat_str.get_view();
+    const string_view &str = flat_str->get_view();
     size_type s, l;
 
     if (!str.size())
@@ -351,7 +351,7 @@ EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList)
             break;
     }
 
-    return FlatSharedStr(flat_str, flat_str.offset() + s, l - s);
+    return FlatSharedStr(flat_str, flat_str->offset() + s, l - s);
 }
 
 EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList)
@@ -370,8 +370,8 @@ EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList)
     if (!val1.is<FlatSharedStr>())
         throw TypeErrorEx("Expected string", arg1->start, arg1->end);
 
-    const string_view &str = val0.get<FlatSharedStr>().get_view();
-    const string_view &substr = val1.get<FlatSharedStr>().get_view();
+    const string_view &str = val0.get<FlatSharedStr>()->get_view();
+    const string_view &substr = val1.get<FlatSharedStr>()->get_view();
 
     if (str.size() >= substr.size())
         if (str.substr(0, substr.size()) == substr)
@@ -396,8 +396,8 @@ EvalValue builtin_endswith(EvalContext *ctx, ExprList *exprList)
     if (!val1.is<FlatSharedStr>())
         throw TypeErrorEx("Expected string", arg1->start, arg1->end);
 
-    const string_view &str = val0.get<FlatSharedStr>().get_view();
-    const string_view &substr = val1.get<FlatSharedStr>().get_view();
+    const string_view &str = val0.get<FlatSharedStr>()->get_view();
+    const string_view &substr = val1.get<FlatSharedStr>()->get_view();
 
     if (str.size() >= substr.size())
         if (str.substr(str.size() - substr.size()) == substr)

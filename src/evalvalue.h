@@ -34,10 +34,11 @@ typedef DictObjectTempl<EvalValue, LValue> DictObject;
 typedef ExceptionObjectTempl<EvalValue> ExceptionObject;
 
 /* Flat type wrapper */
+typedef FlatVal<SharedStr> FlatSharedStr;
 typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
+typedef FlatSharedVal<DictObject> FlatSharedDictObj;
 typedef FlatSharedArrayTempl<LValue> FlatSharedArray;
 typedef FlatSharedExceptionTempl<EvalValue> FlatSharedException;
-typedef FlatSharedVal<DictObject> FlatSharedDictObj;
 
 /* Other types */
 typedef TypeTemplate<EvalValue> Type;
