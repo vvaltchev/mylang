@@ -38,7 +38,7 @@ typedef FlatVal<SharedStr> FlatSharedStr;
 typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
 typedef FlatSharedVal<DictObject> FlatSharedDictObj;
 typedef FlatSharedArrayTempl<LValue> FlatSharedArray;
-typedef FlatSharedExceptionTempl<EvalValue> FlatSharedException;
+typedef FlatSharedVal<ExceptionObject> FlatSharedException;
 
 /* Other types */
 typedef TypeTemplate<EvalValue> Type;

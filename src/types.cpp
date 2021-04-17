@@ -116,7 +116,7 @@ EvalValue builtin_exdata(EvalContext *ctx, ExprList *exprList)
     if (!e.is<FlatSharedException>())
         throw TypeErrorEx("Expected exception object", arg->start, arg->end);
 
-    return e.get<FlatSharedException>().get_ref().get_data();
+    return e.get<FlatSharedException>().get().get_data();
 }
 
 const std::array<Type *, Type::t_count> AllTypes =

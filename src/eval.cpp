@@ -789,7 +789,7 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    throw e.get<FlatSharedException>().get_ref();
+    throw e.get<FlatSharedException>().get();
 }
 
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const

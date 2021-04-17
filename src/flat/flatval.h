@@ -80,6 +80,14 @@ public:
         : flat(move(s))
     { }
 
+    FlatSharedVal(const T &s)
+        : flat(make_shared<T>(s))
+    { }
+
+    FlatSharedVal(T &&s)
+        : flat(make_shared<T>(move(s)))
+    { }
+
     shared_ptr<T> &get_shared_ptr() { return flat.get(); }
     const shared_ptr<T> &get_shared_ptr() const { return flat.get(); }
     T &get() { return *flat->get(); }

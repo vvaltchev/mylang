@@ -38,27 +38,3 @@ public:
         throw *this;
     }
 };
-
-template <class EvalValueT>
-class FlatSharedExceptionTempl final {
-
-public:
-    typedef ExceptionObjectTempl<EvalValueT> inner_type;
-
-private:
-    FlatSharedVal<inner_type> flat;
-
-public:
-    inner_type &get_ref() { return flat.get(); }
-    const inner_type &get_ref() const { return flat.get(); }
-
-    FlatSharedExceptionTempl() = default;
-
-    FlatSharedExceptionTempl(const inner_type &s)
-        : flat(make_shared<inner_type>(s))
-    { }
-
-    FlatSharedExceptionTempl(inner_type &&s)
-        : flat(make_shared<inner_type>(move(s)))
-    { }
-};

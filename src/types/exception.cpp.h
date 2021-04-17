@@ -20,7 +20,7 @@ public:
 
     string to_string(const EvalValue &a) override {
 
-        const ExceptionObject &ex = a.get<FlatSharedException>().get_ref();
+        const ExceptionObject &ex = a.get<FlatSharedException>().get();
         string res = "<Exception(";
         res += ex.get_name();
         res += ")>";
