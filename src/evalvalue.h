@@ -7,7 +7,7 @@
 #include "flat/flatval.h"
 #include "flat/sharedstr.h"
 #include "flat/sharedarray.h"
-#include "flat/sharedexception.h"
+#include "flat/exceptionobj.h"
 #include "flat/shareddict.h"
 #include "type.h"
 
