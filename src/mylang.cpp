@@ -137,7 +137,7 @@ parse_args(int argc, char **argv)
                 make_pair(
                     UniqueId::get("argv"),
                     LValue(
-                        EvalValue(FlatSharedArray(move(vec))),
+                        EvalValue(SharedArrayObj(move(vec))),
                         false
                     )
                 )

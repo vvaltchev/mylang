@@ -119,12 +119,12 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
 }
 
 template <bool is_max>
-EvalValue b_min_max_arr(const FlatSharedArray &arr)
+EvalValue b_min_max_arr(const SharedArrayObj &arr)
 {
-    const ArrayConstView &arr_view = arr->get_view();
+    const ArrayConstView &arr_view = arr.get_view();
     EvalValue val;
 
-    if (arr->size() > 0) {
+    if (arr_view.size() > 0) {
 
         val = arr_view[0].get();
 
@@ -160,7 +160,7 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
 
     if (vec.size() == 1) {
 
-        if (!val.is<FlatSharedArray>()) {
+        if (!val.is<SharedArrayObj>()) {
             throw TypeErrorEx(
                 "When a single argument is provided, it must be an array",
                 first_arg->start,
@@ -168,7 +168,7 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
             );
         }
 
-        return b_min_max_arr<is_max>(val.get<FlatSharedArray>());
+        return b_min_max_arr<is_max>(val.get<SharedArrayObj>());
     }
 
     for (size_type i = 1; i < vec.size(); i++) {

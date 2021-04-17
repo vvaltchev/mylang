@@ -831,10 +831,10 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const EvalValue &rvalue = ret->eval(c.const_ctx);
 
-        if (!rvalue.is<FlatSharedArray>() && !rvalue.is<FlatSharedDictObj>()) {
+        if (!rvalue.is<SharedArrayObj>() && !rvalue.is<FlatSharedDictObj>()) {
 
             /*
-             * In all the cases, except FlatSharedArray and FlatSharedDictObj,
+             * In all the cases, except SharedArrayObj and FlatSharedDictObj,
              * we just return a NopConstruct. Note: we cannot return nullptr,
              * otherwise it would seem that we matched nothing and pAcceptBracedBlock()
              * will expect "}".
@@ -1233,9 +1233,9 @@ MakeConstructFromConstVal(const EvalValue &v,
 
     if (process_arrays) {
 
-        if (v.is<FlatSharedArray>()) {
+        if (v.is<SharedArrayObj>()) {
 
-            const ArrayConstView &view = v.get<FlatSharedArray>()->get_view();
+            const ArrayConstView &view = v.get<SharedArrayObj>().get_view();
             unique_ptr<LiteralArray> litarr(new LiteralArray);
 
             for (unsigned i = 0; i < view.size(); i++) {

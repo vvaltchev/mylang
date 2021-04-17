@@ -67,7 +67,7 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
         }
     }
 
-    return FlatSharedArray(move(vec));
+    return SharedArrayObj(move(vec));
 }
 
 EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
@@ -81,14 +81,14 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val_arr = RValue(arg_arr->eval(ctx));
     const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
 
-    if (!val_arr.is<FlatSharedArray>())
+    if (!val_arr.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg_arr->start, arg_arr->end);
 
     if (!val_delim.is<SharedStr>())
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
 
     const string_view &delim = val_delim.get<SharedStr>().get_view();
-    const ArrayConstView &arr_view = val_arr.get<FlatSharedArray>()->get_view();
+    const ArrayConstView &arr_view = val_arr.get<SharedArrayObj>().get_view();
     string result;
 
     for (size_t i = 0; i < arr_view.size(); i++) {
@@ -155,7 +155,7 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
         );
     }
 
-    return FlatSharedArray(move(vec));
+    return SharedArrayObj(move(vec));
 }
 
 EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)

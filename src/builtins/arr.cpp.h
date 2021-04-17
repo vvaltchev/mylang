@@ -36,7 +36,7 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
     for (int_type i = 0; i < n; i++)
         vec.emplace_back(none, ctx->const_ctx);
 
-    return FlatSharedArray(move(vec));
+    return SharedArrayObj(move(vec));
 }
 
 EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
@@ -54,18 +54,18 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
 
     LValue *lval = arr_lval.get<LValue *>();
 
-    if (!lval->is<FlatSharedArray>())
+    if (!lval->is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg0->start, arg0->end);
 
-    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
+    SharedArrayObj &arr = lval->getval<SharedArrayObj>();
 
-    if (arr->is_slice())
-        arr->clone_internal_vec();
+    if (arr.is_slice())
+        arr.clone_internal_vec();
 
-    arr->get_vec().emplace_back(elem, ctx->const_ctx);
+    arr.get_vec().emplace_back(elem, ctx->const_ctx);
     return lval->get();
 }
 
@@ -82,28 +82,28 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
 
     LValue *lval = arr_lval.get<LValue *>();
 
-    if (!lval->is<FlatSharedArray>())
+    if (!lval->is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
 
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg->start, arg->end);
 
-    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
-    const ArrayConstView &view = arr->get_view();
+    SharedArrayObj &arr = lval->getval<SharedArrayObj>();
+    const ArrayConstView &view = arr.get_view();
 
     if (!view.size())
         throw OutOfBoundsEx(arg->start, arg->end);
 
     EvalValue last = view[view.size() - 1].get();
 
-    if (arr->is_slice()) {
+    if (arr.is_slice()) {
 
-        lval->put(FlatSharedArray(arr, arr->offset(), arr->size() - 1));
+        lval->put(SharedArrayObj(arr, arr.offset(), arr.size() - 1));
 
     } else {
 
-        arr->clone_aliased_slices(arr->offset() + arr->size() - 1);
-        arr->get_vec().pop_back();
+        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
+        arr.get_vec().pop_back();
     }
 
     return last;
@@ -117,10 +117,10 @@ EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (!e.is<FlatSharedArray>())
+    if (!e.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
 
-    const ArrayConstView &view = e.get<FlatSharedArray>()->get_view();
+    const ArrayConstView &view = e.get<SharedArrayObj>().get_view();
 
     if (!view.size())
         throw OutOfBoundsEx(arg->start, arg->end);
@@ -130,8 +130,8 @@ EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
 
 EvalValue builtin_erase_arr(LValue *lval, int_type index)
 {
-    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
-    const ArrayConstView &view = arr->get_view();
+    SharedArrayObj &arr = lval->getval<SharedArrayObj>();
+    const ArrayConstView &view = arr.get_view();
 
     if (!view.size())
         throw OutOfBoundsEx();
@@ -142,28 +142,28 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
     if (static_cast<size_t>(index) >= view.size())
         throw OutOfBoundsEx();
 
-    if (arr->is_slice()) {
+    if (arr.is_slice()) {
 
         if (index == 0) {
 
-            lval->put(FlatSharedArray(arr, arr->offset() + 1, arr->size() - 1));
+            lval->put(SharedArrayObj(arr, arr.offset() + 1, arr.size() - 1));
 
         } else if (index == view.size() - 1) {
 
-            lval->put(FlatSharedArray(arr, arr->offset(), arr->size() - 1));
+            lval->put(SharedArrayObj(arr, arr.offset(), arr.size() - 1));
 
         } else {
 
-            arr->clone_internal_vec();
-            auto &vec = arr->get_vec();
-            vec.erase(vec.begin() + arr->offset() + index);
-            lval->put(FlatSharedArray(move(vec)));
+            arr.clone_internal_vec();
+            auto &vec = arr.get_vec();
+            vec.erase(vec.begin() + arr.offset() + index);
+            lval->put(SharedArrayObj(move(vec)));
         }
 
     } else {
 
-        arr->clone_aliased_slices(arr->offset() + arr->size() - 1);
-        arr->get_vec().erase(arr->get_vec().begin() + arr->offset() + index);
+        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
+        arr.get_vec().erase(arr.get_vec().begin() + arr.offset() + index);
     }
 
     return true;
@@ -171,8 +171,8 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
 
 EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
 {
-    FlatSharedArray &arr = lval->getval<FlatSharedArray>();
-    const ArrayConstView &view = arr->get_view();
+    SharedArrayObj &arr = lval->getval<SharedArrayObj>();
+    const ArrayConstView &view = arr.get_view();
 
     if (index < 0)
         throw OutOfBoundsEx();
@@ -180,19 +180,19 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     if (static_cast<size_t>(index) > view.size())
         throw OutOfBoundsEx();
 
-    if (arr->is_slice()) {
+    if (arr.is_slice()) {
 
-        arr->clone_internal_vec();
-        auto &vec = arr->get_vec();
+        arr.clone_internal_vec();
+        auto &vec = arr.get_vec();
         vec.insert(vec.begin() + index, LValue(val, false));
-        lval->put(FlatSharedArray(move(vec)));
+        lval->put(SharedArrayObj(move(vec)));
 
     } else {
 
         if (index != view.size())
-            arr->clone_all_slices();
+            arr.clone_all_slices();
 
-        arr->get_vec().insert(arr->get_vec().begin() + index, LValue(val, false));
+        arr.get_vec().insert(arr.get_vec().begin() + index, LValue(val, false));
     }
 
     return true;
@@ -253,16 +253,16 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
             vec.emplace_back(EvalValue(i), ctx->const_ctx);
     }
 
-    return FlatSharedArray(move(vec));
+    return SharedArrayObj(move(vec));
 }
 
 EvalValue
-builtin_find_arr(const FlatSharedArray &arr,
+builtin_find_arr(const SharedArrayObj &arr,
                  const EvalValue &v,
                  FuncObject *key,
                  EvalContext *ctx)
 {
-    const ArrayConstView &view = arr->get_view();
+    const ArrayConstView &view = arr.get_view();
 
     if (key) {
 
@@ -293,7 +293,7 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
     const EvalValue &val0_lval = arg0->eval(ctx);
     EvalValue val0 = RValue(val0_lval);
 
-    if (!val0.is<FlatSharedArray>())
+    if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     if (val0_lval.is<LValue *>()) {
@@ -301,21 +301,21 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
             val0 = val0.clone();
     }
 
-    FlatSharedArray &arr = val0.get<FlatSharedArray>();
+    SharedArrayObj &arr = val0.get<SharedArrayObj>();
 
-    if (arr->is_slice()) {
+    if (arr.is_slice()) {
 
-        arr->clone_internal_vec();
+        arr.clone_internal_vec();
 
         if (val0_lval.is<LValue *>())
             val0_lval.get<LValue *>()->put(arr);
 
     } else {
 
-        arr->clone_all_slices();
+        arr.clone_all_slices();
     }
 
-    auto &vec = arr->get_vec();
+    auto &vec = arr.get_vec();
 
     if (exprList->elems.size() == 1) {
 
@@ -378,24 +378,24 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
     const EvalValue &val0_lval = arg0->eval(ctx);
     EvalValue val0 = RValue(val0_lval);
 
-    if (!val0.is<FlatSharedArray>())
+    if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
-    FlatSharedArray &arr = val0.get<FlatSharedArray>();
+    SharedArrayObj &arr = val0.get<SharedArrayObj>();
 
-    if (arr->is_slice()) {
+    if (arr.is_slice()) {
 
-        arr->clone_internal_vec();
+        arr.clone_internal_vec();
 
         if (val0_lval.is<LValue *>())
             val0_lval.get<LValue *>()->put(arr);
 
     } else {
 
-        arr->clone_all_slices();
+        arr.clone_all_slices();
     }
 
-    auto &vec = arr->get_vec();
+    auto &vec = arr.get_vec();
     reverse(vec.begin(), vec.end());
     return arr;
 }
@@ -408,11 +408,11 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     const EvalValue &val0 = RValue(arg0->eval(ctx));
 
-    if (!val0.is<FlatSharedArray>())
+    if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
-    const FlatSharedArray &arr = val0.get<FlatSharedArray>();
-    const ArrayConstView &view = arr->get_view();
+    const SharedArrayObj &arr = val0.get<SharedArrayObj>();
+    const ArrayConstView &view = arr.get_view();
 
     if (exprList->elems.size() == 1) {
 

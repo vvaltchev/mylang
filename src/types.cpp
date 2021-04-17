@@ -148,10 +148,10 @@ const std::array<Type *, Type::t_count> AllTypes =
  */
 
 static const SharedStr empty_str_actual((string()));
-static const FlatSharedArray empty_arr_actual((std::vector<LValue>()));
+static const SharedArrayObj empty_arr_actual((std::vector<LValue>()));
 
 const EvalValue empty_str(SharedStr(empty_str_actual, 0, 0));
-const EvalValue empty_arr(FlatSharedArray(empty_arr_actual, 0, 0));
+const EvalValue empty_arr(SharedArrayObj(empty_arr_actual, 0, 0));
 const EvalValue none;
 
 std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;

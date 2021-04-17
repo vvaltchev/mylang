@@ -159,7 +159,7 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
 
         return builtin_erase_dict(lval, index_val);
 
-    } else if (lval->is<FlatSharedArray>()) {
+    } else if (lval->is<SharedArrayObj>()) {
 
         if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
@@ -200,7 +200,7 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
 
         return builtin_insert_dict(lval, index_val, val);
 
-    } else if (lval->is<FlatSharedArray>()) {
+    } else if (lval->is<SharedArrayObj>()) {
 
         if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
@@ -231,7 +231,7 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
 
         return builtin_find_dict(container_val.get<FlatSharedDictObj>(), elem_val);
 
-    } else if (container_val.is<FlatSharedArray>()) {
+    } else if (container_val.is<SharedArrayObj>()) {
 
         FuncObject *key = nullptr;
 
@@ -246,7 +246,7 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
             key = &keyval.get<FlatSharedFuncObj>().get();
         }
 
-        return builtin_find_arr(container_val.get<FlatSharedArray>(), elem_val, key, ctx);
+        return builtin_find_arr(container_val.get<SharedArrayObj>(), elem_val, key, ctx);
 
     } else if (container_val.is<SharedStr>()) {
 
@@ -289,9 +289,9 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
     if (!val0.is<FlatSharedFuncObj>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
 
-    if (val1.is<FlatSharedArray>()) {
+    if (val1.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = val1.get<FlatSharedArray>()->get_view();
+        const ArrayConstView &view = val1.get<SharedArrayObj>().get_view();
 
         for (size_type i = 0; i < view.size(); i++) {
 
@@ -323,7 +323,7 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
         );
     }
 
-    return FlatSharedArray(move(result));
+    return SharedArrayObj(move(result));
 }
 
 EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
@@ -340,9 +340,9 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
     if (!val0.is<FlatSharedFuncObj>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
 
-    if (val1.is<FlatSharedArray>()) {
+    if (val1.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = val1.get<FlatSharedArray>()->get_view();
+        const ArrayConstView &view = val1.get<SharedArrayObj>().get_view();
         SharedArrayObj::vec_type result;
 
         for (size_type i = 0; i < view.size(); i++) {
@@ -351,7 +351,7 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
                 result.emplace_back(view[i].get(), ctx->const_ctx);
         }
 
-        return FlatSharedArray(move(result));
+        return SharedArrayObj(move(result));
 
     } else if (val1.is<FlatSharedDictObj>()) {
 

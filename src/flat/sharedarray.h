@@ -12,7 +12,7 @@
 /*
  * These classes are templates simply because otherwise this header wouldn't be
  * able to compile if included independently (it requires LValue, which requires
- * EvalValue which requires FlatSharedArray). In this case, it wouldn't be a big
+ * EvalValue which requires SharedArrayObj). In this case, it wouldn't be a big
  * deal, but in general it's an anti-pattern to have headers requiring a specific
  * include order.
  */
@@ -46,7 +46,7 @@ public:
     typedef std::vector<LValueT> vec_type;
 
 private:
-    static const size_type all_slices = static_cast<size_type>(-1);
+    static constexpr size_type all_slices = static_cast<size_type>(-1);
 
     struct SharedObject final {
 

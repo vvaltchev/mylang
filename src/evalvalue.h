@@ -37,7 +37,6 @@ typedef SharedArrayObjTempl<LValue> SharedArrayObj;
 /* Flat type wrapper */
 typedef FlatSharedVal<FuncObject> FlatSharedFuncObj;
 typedef FlatSharedVal<DictObject> FlatSharedDictObj;
-typedef FlatVal<SharedArrayObj> FlatSharedArray;
 typedef FlatSharedVal<ExceptionObject> FlatSharedException;
 
 /* Other types */
@@ -57,7 +56,7 @@ template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
 template <> struct TypeToEnum<float_type> { enum { val = Type::t_float }; };
 template <> struct TypeToEnum<SharedStr> { enum { val = Type::t_str }; };
 template <> struct TypeToEnum<FlatSharedFuncObj> { enum { val = Type::t_func }; };
-template <> struct TypeToEnum<FlatSharedArray> { enum { val = Type::t_arr }; };
+template <> struct TypeToEnum<SharedArrayObj> { enum { val = Type::t_arr }; };
 template <> struct TypeToEnum<FlatSharedException> { enum { val = Type::t_ex }; };
 template <> struct TypeToEnum<FlatSharedDictObj> { enum { val = Type::t_dict }; };
 
@@ -80,7 +79,7 @@ class EvalValue final {
         /* non-trivial types */
         FlatVal<SharedStr> str;
         FlatSharedFuncObj func;
-        FlatSharedArray arr;
+        FlatVal<SharedArrayObj> arr;
         FlatSharedException ex;
         FlatSharedDictObj dict;
 

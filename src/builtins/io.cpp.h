@@ -135,7 +135,7 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
         tmp.clear();
     }
 
-    return FlatSharedArray(move(vec));
+    return SharedArrayObj(move(vec));
 }
 
 EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
@@ -146,7 +146,7 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &val = RValue(arg->eval(ctx));
 
-    if (!val.is<FlatSharedArray>())
+    if (!val.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
 
     ostream *s = &cout;
@@ -168,7 +168,7 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
         s = &fs;
     }
 
-    const SharedArrayObj::vec_type &vec = val.get<FlatSharedArray>()->get_vec();
+    const SharedArrayObj::vec_type &vec = val.get<SharedArrayObj>().get_vec();
 
     for (const auto &e : vec) {
         *s << e.get() << endl;

@@ -383,7 +383,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         vec.emplace_back(RValue(e->eval(ctx)), ctx->const_ctx);
     }
 
-    return FlatSharedArray(move(vec));
+    return SharedArrayObj(move(vec));
 }
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
@@ -710,14 +710,14 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
     if (idlist) {
 
-        if (!rval.is<FlatSharedArray>()) {
+        if (!rval.is<SharedArrayObj>()) {
 
             for (const auto &e: idlist->elems)
                 handle_single_expr14(ctx, inDecl, op, e.get(), rval);
 
         } else {
 
-            const ArrayConstView &view = rval.get<FlatSharedArray>()->get_view();
+            const ArrayConstView &view = rval.get<SharedArrayObj>().get_view();
 
             for (size_type i = 0; i < idlist->elems.size(); i++) {
 
@@ -1016,17 +1016,17 @@ EvalValue &LValue::get_value_for_put()
     if (!container)
         return val;
 
-    assert(container->is<FlatSharedArray>());
+    assert(container->is<SharedArrayObj>());
 
     if (container->valtype()->is_slice(container->val)) {
-        const size_type off = container->getval<FlatSharedArray>()->offset();
+        const size_type off = container->getval<SharedArrayObj>().offset();
         *container = container->clone();
         container_idx -= off;
-        return container->getval<FlatSharedArray>()->get_vec()[container_idx].val;
+        return container->getval<SharedArrayObj>().get_vec()[container_idx].val;
     }
 
     if (container->valtype()->use_count(container->val) > 1)
-        container->getval<FlatSharedArray>()->clone_aliased_slices(container_idx);
+        container->getval<SharedArrayObj>().clone_aliased_slices(container_idx);
 
     return val;
 }
@@ -1067,10 +1067,10 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
     if (count == 1) {
 
-        if (elems[0].is<FlatSharedArray>() && ids->elems.size() > (1 + id_start)) {
+        if (elems[0].is<SharedArrayObj>() && ids->elems.size() > (1 + id_start)) {
 
             const ArrayConstView &view =
-                elems[0].get<FlatSharedArray>()->get_view();
+                elems[0].get<SharedArrayObj>().get_view();
 
             for (size_type i = id_start; i < ids->elems.size(); i++) {
 
@@ -1142,9 +1142,9 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
     EvalContext loopCtx(ctx, ctx->const_ctx);
     const EvalValue &cval = RValue(container->eval(ctx));
 
-    if (cval.is<FlatSharedArray>()) {
+    if (cval.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = cval.get<FlatSharedArray>()->get_view();
+        const ArrayConstView &view = cval.get<SharedArrayObj>().get_view();
 
         for (size_type i = 0; i < view.size(); i++) {
 
