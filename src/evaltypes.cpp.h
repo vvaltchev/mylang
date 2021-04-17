@@ -88,10 +88,10 @@ public:
 template <class T>
 class SharedType :
     public NonTrivialType<
-        shared_ptr<typename T::inner_type>, sizeof(T)
+        typename T::shared_ptr_type, sizeof(T)
     >
 {
-    typedef shared_ptr<typename T::inner_type> S;
+    typedef typename T::shared_ptr_type S;
 
 public:
     SharedType(Type::TypeE e) : NonTrivialType<S, sizeof(T)>(e) { }

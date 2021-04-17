@@ -69,6 +69,7 @@ class FlatSharedVal final {
 public:
 
     typedef T inner_type;
+    typedef shared_ptr<T> shared_ptr_type;
 
     FlatSharedVal() = default;
 

@@ -12,13 +12,13 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-class TypeStr : public SharedType<SharedStr> {
+class TypeStr : public NonTrivialType<SharedStr> {
 
     void append(SharedStr &lval, const string_view &s);
 
 public:
 
-    TypeStr() : SharedType<SharedStr>(Type::t_str) { }
+    TypeStr() : NonTrivialType<SharedStr>(Type::t_str) { }
 
     void add(EvalValue &a, const EvalValue &b) override;
     void mul(EvalValue &a, const EvalValue &b) override;
