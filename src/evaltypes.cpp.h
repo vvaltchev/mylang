@@ -15,18 +15,7 @@
 using std::string;
 using std::string_view;
 
-/*
- * Special base class for any Type class related to non-trivial C++ type.
- * Typically, the object is just a shared_ptr<T> and in that case it's enough
- * to derive the custom Type from NonTrivialType<shared_ptr<T>>. But, in some
- * special cases, like SharedStr, there are additional trivial members related
- * to the non-trivial object that must be copied as well. Therefore NonTrivialType
- * has an additional non-type template param (S) which allows to specify the real
- * size of the container object. NOTE: the non-trivial object MUST BE at offset 0
- * in the wrapper type (e.g. SharedStr).
- */
-
-template <class T, size_t S = sizeof(T)>
+template <class T>
 class NonTrivialType : public Type {
 
 public:
@@ -34,13 +23,6 @@ public:
     NonTrivialType(Type::TypeE e) : Type(e) { }
 
     void default_ctor(void *obj) override {
-
-        static_assert(S >= sizeof(T));
-
-        if constexpr(S > sizeof(T)) {
-            memset(obj, 0, S);
-        }
-
         new (obj) T;
     }
 
@@ -49,38 +31,18 @@ public:
     }
 
     void copy_ctor(void *obj, const void *other) override {
-
-        if constexpr(S > sizeof(T)) {
-            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
-        }
-
         new (obj) T(*reinterpret_cast<const T *>(other));
     }
 
     void move_ctor(void *obj, void *other) override {
-
-        if constexpr(S > sizeof(T)) {
-            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
-        }
-
         new (obj) T(move(*reinterpret_cast<T *>(other)));
     }
 
     void copy_assign(void *obj, const void *other) override {
-
-        if constexpr(S > sizeof(T)) {
-            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
-        }
-
         *reinterpret_cast<T *>(obj) = *reinterpret_cast<const T *>(other);
     }
 
     void move_assign(void *obj, void *other) override {
-
-        if constexpr(S > sizeof(T)) {
-            memcpy((char *)obj + sizeof(T), (char *)other + sizeof(T), S - sizeof(T));
-        }
-
         *reinterpret_cast<T *>(obj) = move(*reinterpret_cast<T *>(other));
     }
 };
@@ -88,13 +50,13 @@ public:
 template <class T>
 class SharedType :
     public NonTrivialType<
-        typename T::shared_ptr_type, sizeof(T)
+        typename T::shared_ptr_type
     >
 {
     typedef typename T::shared_ptr_type S;
 
 public:
-    SharedType(Type::TypeE e) : NonTrivialType<S, sizeof(T)>(e) { }
+    SharedType(Type::TypeE e) : NonTrivialType<S>(e) { }
 };
 
 class TypeNone : public Type {
