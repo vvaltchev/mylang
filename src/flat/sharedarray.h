@@ -86,10 +86,6 @@ public:
         shobj->slices.insert(this);
     }
 
-    SharedArrayObjTempl(const FlatVal<SharedArrayObjTempl> &flat, size_type off, size_type len)
-        : SharedArrayObjTempl(flat.get(), off, len)
-    { }
-
     /* Regular constructors */
 
     SharedArrayObjTempl() : off(0), len(0), slice(false) { }
@@ -113,6 +109,7 @@ public:
         if (slice) {
             shobj->slices.erase(&obj);
             shobj->slices.insert(this);
+            obj.slice = false;
         }
     }
 
@@ -139,6 +136,7 @@ public:
         if (slice) {
             shobj->slices.erase(&obj);
             shobj->slices.insert(this);
+            obj.slice = false;
         }
 
         return *this;
