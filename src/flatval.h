@@ -12,8 +12,7 @@
  * containing an instance of FlatSharedVal<T> inside a union, has to manually
  * call: the copy ctor, the move ctor, the copy assign and the move assign
  * methods, specific for this type. This happens in part in EvalValue and
- * in part in the specific Type instance. See NonTrivialType<T> and SharedType<T>
- * in evaltypes.cpp.h.
+ * in part in the specific Type instance. See TypeImpl<T> in evaltypes.cpp.h.
  *
  * Q: Why not just using std::variant?
  * A: Because it's much slower. By just switching to std::variant, even with the

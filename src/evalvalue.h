@@ -59,7 +59,7 @@ class EvalValue final {
 
     /*
      * Why not just using std::variant? Because it's much slower.
-     * See flatval.h.
+     * See the comments in flatval.h.
      */
     union ValueU {
 

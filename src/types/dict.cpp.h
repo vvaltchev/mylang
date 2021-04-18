@@ -13,11 +13,11 @@
 #include "eval.h"
 #include "evaltypes.cpp.h"
 
-class TypeDict : public NonTrivialType<shared_ptr<DictObject>> {
+class TypeDict : public TypeImpl<shared_ptr<DictObject>> {
 
 public:
 
-    TypeDict() : NonTrivialType<shared_ptr<DictObject>>(Type::t_dict) { }
+    TypeDict() : TypeImpl<shared_ptr<DictObject>>(Type::t_dict) { }
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;

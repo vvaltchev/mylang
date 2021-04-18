@@ -16,11 +16,11 @@ using std::string;
 using std::string_view;
 
 template <class T>
-class NonTrivialType : public Type {
+class TypeImpl : public Type {
 
 public:
 
-    NonTrivialType(Type::TypeE e) : Type(e) { }
+    TypeImpl(Type::TypeE e) : Type(e) { }
 
     void default_ctor(void *obj) override {
         new (obj) T;

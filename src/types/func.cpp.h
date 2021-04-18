@@ -14,11 +14,11 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
-class TypeFunc : public NonTrivialType<shared_ptr<FuncObject>> {
+class TypeFunc : public TypeImpl<shared_ptr<FuncObject>> {
 
 public:
 
-    TypeFunc() : NonTrivialType<shared_ptr<FuncObject>>(Type::t_func) { }
+    TypeFunc() : TypeImpl<shared_ptr<FuncObject>>(Type::t_func) { }
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;

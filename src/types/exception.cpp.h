@@ -12,11 +12,11 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-class TypeException : public NonTrivialType<shared_ptr<ExceptionObject>> {
+class TypeException : public TypeImpl<shared_ptr<ExceptionObject>> {
 
 public:
 
-    TypeException() : NonTrivialType<shared_ptr<ExceptionObject>>(Type::t_ex) { }
+    TypeException() : TypeImpl<shared_ptr<ExceptionObject>>(Type::t_ex) { }
 
     string to_string(const EvalValue &a) override {
 

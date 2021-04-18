@@ -57,12 +57,12 @@ void SharedArrayObjTempl<LValueT>::clone_aliased_slices(size_type index)
 }
 
 
-class TypeArr : public NonTrivialType<SharedArrayObj> {
+class TypeArr : public TypeImpl<SharedArrayObj> {
 
 public:
 
     TypeArr()
-        : NonTrivialType<SharedArrayObj>(Type::t_arr)
+        : TypeImpl<SharedArrayObj>(Type::t_arr)
     { }
 
     void add(EvalValue &a, const EvalValue &b) override;
