@@ -337,10 +337,10 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
-        if (!val1.is<FlatSharedFuncObj>())
+        if (!val1.is<shared_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
-        FuncObject &funcObj = val1.get<FlatSharedFuncObj>().get();
+        FuncObject &funcObj = *val1.get<shared_ptr<FuncObject>>().get();
 
         if (!reverse) {
 
@@ -429,10 +429,10 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
-        if (!val1.is<FlatSharedFuncObj>())
+        if (!val1.is<shared_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
-        FuncObject &funcObj = val1.get<FlatSharedFuncObj>().get();
+        FuncObject &funcObj = *val1.get<shared_ptr<FuncObject>>().get();
         EvalValue val = eval_func(ctx, funcObj, view[0].get());
 
         for (size_type i = 1; i < view.size(); i++) {

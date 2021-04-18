@@ -183,10 +183,10 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
                 MakeConstructFromConstVal(RValue(const_value), v);
                 v->is_const = true;
 
-            } else if (const_value.is<FlatSharedFuncObj>()) {
+            } else if (const_value.is<shared_ptr<FuncObject>>()) {
 
                 const FuncObject &obj =
-                    const_value.get<FlatSharedFuncObj>().get();
+                    *const_value.get<shared_ptr<FuncObject>>().get();
 
                 if (obj.func->is_const)
                     v->is_const = true;

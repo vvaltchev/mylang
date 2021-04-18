@@ -14,11 +14,11 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
-class TypeFunc : public SharedType<FlatSharedFuncObj> {
+class TypeFunc : public NonTrivialType<shared_ptr<FuncObject>> {
 
 public:
 
-    TypeFunc() : SharedType<FlatSharedFuncObj>(Type::t_func) { }
+    TypeFunc() : NonTrivialType<shared_ptr<FuncObject>>(Type::t_func) { }
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
@@ -35,45 +35,44 @@ public:
 
 void TypeFunc::eq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<FlatSharedFuncObj>()) {
+    if (!b.is<shared_ptr<FuncObject>>()) {
         a = false;
         return;
     }
 
-    FuncObject &obj = a.get<FlatSharedFuncObj>().get();
-    a = &obj == &b.get<FlatSharedFuncObj>().get();
+    FuncObject *objp = a.get<shared_ptr<FuncObject>>().get();
+    a = (objp == b.get<shared_ptr<FuncObject>>().get());
 }
 
 void TypeFunc::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<FlatSharedFuncObj>()) {
+    if (!b.is<shared_ptr<FuncObject>>()) {
         a = true;
         return;
     }
 
-    FuncObject &obj = a.get<FlatSharedFuncObj>().get();
-    a = &obj != &b.get<FlatSharedFuncObj>().get();
+    FuncObject *objp = a.get<shared_ptr<FuncObject>>().get();
+    a = (objp != b.get<shared_ptr<FuncObject>>().get());
 }
 
 int_type TypeFunc::use_count(const EvalValue &a)
 {
-    return a.get<FlatSharedFuncObj>().use_count();
+    return a.get<shared_ptr<FuncObject>>().use_count();
 }
 
 EvalValue TypeFunc::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<int_type>(&a.get<FlatSharedFuncObj>().get());
+    return reinterpret_cast<int_type>(a.get<shared_ptr<FuncObject>>().get());
 }
 
 EvalValue TypeFunc::clone(const EvalValue &a)
 {
-    const FlatSharedFuncObj &wrapper = a.get<FlatSharedFuncObj>();
-    const FuncObject &func = wrapper.get();
+    const FuncObject &func = *a.get<shared_ptr<FuncObject>>().get();
 
     if (func.capture_ctx.empty())
         return a;
 
-    return FlatSharedFuncObj(make_shared<FuncObject>(func));
+    return shared_ptr<FuncObject>(make_shared<FuncObject>(func));
 }
 
 FuncObject::FuncObject(const FuncObject &rhs)

@@ -89,8 +89,6 @@ public:
         : flat(make_shared<T>(move(s)))
     { }
 
-    shared_ptr<T> &get_shared_ptr() { return flat.get(); }
-    const shared_ptr<T> &get_shared_ptr() const { return flat.get(); }
     T &get() { return *flat->get(); }
     const T &get() const { return *flat->get(); }
     int_type use_count() const { return flat->use_count(); }

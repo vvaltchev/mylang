@@ -350,10 +350,10 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
         if (callable.is<Builtin>())
             return callable.get<Builtin>().func(ctx, args.get());
 
-        if (callable.is<FlatSharedFuncObj>()) {
+        if (callable.is<shared_ptr<FuncObject>>()) {
             return do_func_call(
                 ctx,
-                callable.get<FlatSharedFuncObj>().get(),
+                *callable.get<shared_ptr<FuncObject>>().get(),
                 args->elems
             );
         }
@@ -667,9 +667,9 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
     const EvalValue &rval = RValue(rvalue->eval(ctx));
     IdList *idlist = nullptr;
 
-    if (inDecl && ctx->const_ctx && rval.is<FlatSharedFuncObj>()) {
+    if (inDecl && ctx->const_ctx && rval.is<shared_ptr<FuncObject>>()) {
 
-        const FuncObject &obj = rval.get<FlatSharedFuncObj>().get();
+        const FuncObject &obj = *rval.get<shared_ptr<FuncObject>>().get();
 
         if (obj.func->is_const) {
 
@@ -837,7 +837,7 @@ EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue func(
-        FlatSharedFuncObj(make_shared<FuncObject>(this, ctx))
+        shared_ptr<FuncObject>(make_shared<FuncObject>(this, ctx))
     );
 
     if (id) {
