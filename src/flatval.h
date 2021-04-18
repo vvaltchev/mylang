@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #pragma once
-
 #include "defs.h"
-#include <memory>
-
 
 /*
  * This special class allows us to store a non-trivial type in a union.
@@ -46,16 +43,4 @@ public:
     FlatVal(Args&&... args) {
         new ((void *)data) T(forward<Args>(args)...);
     }
-
-    T &get() {
-        return *reinterpret_cast<T *>(data);
-    }
-
-    const T &get() const {
-        return *reinterpret_cast<T *>(const_cast<FlatVal<T> *>(this)->data);
-    }
-
-    T *operator->() { return &get(); }
-
-    const T *operator->() const { return &get(); }
 };

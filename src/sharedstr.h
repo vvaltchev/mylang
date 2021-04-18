@@ -34,8 +34,8 @@ public:
         , slice(false)
     { }
 
-    SharedStr(const FlatVal<SharedStr> &s, size_type off, size_type len)
-        : obj(s.get().obj)
+    SharedStr(const SharedStr &s, size_type off, size_type len)
+        : obj(s.obj)
         , off(off)
         , len(len)
         , slice(true)
