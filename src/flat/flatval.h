@@ -60,38 +60,3 @@ public:
 
     const T *operator->() const { return &get(); }
 };
-
-template <class T>
-class FlatSharedVal final {
-
-    FlatVal<shared_ptr<T>> flat;
-
-public:
-
-    typedef T inner_type;
-    typedef shared_ptr<T> shared_ptr_type;
-
-    FlatSharedVal() = default;
-
-    FlatSharedVal(const shared_ptr<T> &s)
-        : flat(s)
-    { }
-
-    FlatSharedVal(shared_ptr<T> &&s)
-        : flat(move(s))
-    { }
-
-    FlatSharedVal(const T &s)
-        : flat(make_shared<T>(s))
-    { }
-
-    FlatSharedVal(T &&s)
-        : flat(make_shared<T>(move(s)))
-    { }
-
-    T &get() { return *flat->get(); }
-    const T &get() const { return *flat->get(); }
-    int_type use_count() const { return flat->use_count(); }
-    T *operator->() { return &get(); }
-    const T *operator->() const { return &get(); }
-};

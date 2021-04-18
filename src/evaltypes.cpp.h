@@ -47,18 +47,6 @@ public:
     }
 };
 
-template <class T>
-class SharedType :
-    public NonTrivialType<
-        typename T::shared_ptr_type
-    >
-{
-    typedef typename T::shared_ptr_type S;
-
-public:
-    SharedType(Type::TypeE e) : NonTrivialType<S>(e) { }
-};
-
 class TypeNone : public Type {
 
 public:
