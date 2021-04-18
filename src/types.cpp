@@ -95,7 +95,7 @@ EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
         }
     }
 
-    return FlatSharedException(
+    return make_shared<ExceptionObject>(
         ExceptionObject(
             string(ex_name),
             exprList->elems.size() == 2
@@ -113,10 +113,10 @@ EvalValue builtin_exdata(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (!e.is<FlatSharedException>())
+    if (!e.is<shared_ptr<ExceptionObject>>())
         throw TypeErrorEx("Expected exception object", arg->start, arg->end);
 
-    return e.get<FlatSharedException>().get().get_data();
+    return e.get<shared_ptr<ExceptionObject>>().get()->get_data();
 }
 
 const std::array<Type *, Type::t_count> AllTypes =

@@ -12,15 +12,15 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-class TypeException : public SharedType<FlatSharedException> {
+class TypeException : public NonTrivialType<shared_ptr<ExceptionObject>> {
 
 public:
 
-    TypeException() : SharedType<FlatSharedException>(Type::t_ex) { }
+    TypeException() : NonTrivialType<shared_ptr<ExceptionObject>>(Type::t_ex) { }
 
     string to_string(const EvalValue &a) override {
 
-        const ExceptionObject &ex = a.get<FlatSharedException>().get();
+        const ExceptionObject &ex = *a.get<shared_ptr<ExceptionObject>>().get();
         string res = "<Exception(";
         res += ex.get_name();
         res += ")>";

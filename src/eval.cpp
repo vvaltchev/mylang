@@ -781,7 +781,7 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue &e = RValue(elem->eval(ctx));
 
-    if (!e.is<FlatSharedException>()) {
+    if (!e.is<shared_ptr<ExceptionObject>>()) {
         throw TypeErrorEx(
             "Expected an exception object",
             elem->start,
@@ -789,7 +789,7 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    throw e.get<FlatSharedException>().get();
+    throw *e.get<shared_ptr<ExceptionObject>>().get();
 }
 
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
@@ -930,15 +930,16 @@ do_catch(EvalContext *ctx,
 
             if (asId) {
 
-                FlatSharedException flatEx(
-                    exObj
-                        ? *exObj
-                        : ExceptionObject(saved_ex->name)
-                );
+                shared_ptr<ExceptionObject> shared_ex =
+                    make_shared<ExceptionObject>(
+                        exObj
+                            ? *exObj
+                            : ExceptionObject(saved_ex->name)
+                    );
 
                 catch_ctx.emplace(
                     asId,
-                    move(flatEx),
+                    move(shared_ex),
                     ctx->const_ctx
                 );
             }
