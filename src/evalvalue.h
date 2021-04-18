@@ -4,11 +4,11 @@
 
 #include "defs.h"
 #include "errors.h"
-#include "flat/flatval.h"
-#include "flat/sharedstr.h"
-#include "flat/sharedarray.h"
-#include "flat/exceptionobj.h"
-#include "flat/shareddict.h"
+#include "flatval.h"
+#include "sharedstr.h"
+#include "sharedarray.h"
+#include "exceptionobj.h"
+#include "shareddict.h"
 #include "type.h"
 
 #include <string_view>
