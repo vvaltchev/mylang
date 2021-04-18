@@ -14,9 +14,9 @@
 #include "syntax.h"
 
 EvalValue
-builtin_find_dict(const FlatSharedDictObj &obj, const EvalValue &key)
+builtin_find_dict(const shared_ptr<DictObject> &obj, const EvalValue &key)
 {
-    const DictObject &dictObj = obj.get();
+    const DictObject &dictObj = *obj.get();
     const DictObject::inner_type &data = dictObj.get_ref();
 
     const auto &it = data.find(key);
@@ -30,7 +30,7 @@ builtin_find_dict(const FlatSharedDictObj &obj, const EvalValue &key)
 EvalValue
 builtin_erase_dict(LValue *lval, const EvalValue &key)
 {
-    DictObject &dictObj = lval->getval<FlatSharedDictObj>().get();
+    DictObject &dictObj = *lval->getval<shared_ptr<DictObject>>().get();
     DictObject::inner_type &data = dictObj.get_ref();
     return data.erase(key) > 0;
 }
@@ -38,7 +38,7 @@ builtin_erase_dict(LValue *lval, const EvalValue &key)
 EvalValue
 builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
 {
-    DictObject &dictObj = lval->getval<FlatSharedDictObj>().get();
+    DictObject &dictObj = *lval->getval<shared_ptr<DictObject>>().get();
     DictObject::inner_type &data = dictObj.get_ref();
     const auto &it = data.insert(make_pair(key, LValue(val, false)));
     return it.second;
@@ -95,11 +95,11 @@ dict_1arg_func(EvalContext *ctx,
     Construct *arg0 = exprList->elems[0].get();
     const EvalValue &val0 = RValue(arg0->eval(ctx));
 
-    if (!val0.is<FlatSharedDictObj>())
+    if (!val0.is<shared_ptr<DictObject>>())
         throw TypeErrorEx("Expected dict object", arg0->start, arg0->end);
 
     const DictObject::inner_type &data
-        = val0.get<FlatSharedDictObj>()->get_ref();
+        = val0.get<shared_ptr<DictObject>>()->get_ref();
 
     return f(data);
 }
@@ -164,5 +164,5 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
         );
     }
 
-    return FlatSharedDictObj(make_shared<DictObject>(move(data)));
+    return shared_ptr<DictObject>(make_shared<DictObject>(move(data)));
 }

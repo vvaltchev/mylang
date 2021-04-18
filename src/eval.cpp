@@ -1166,10 +1166,10 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
                 break;
         }
 
-    } else if (cval.is<FlatSharedDictObj>()) {
+    } else if (cval.is<shared_ptr<DictObject>>()) {
 
         const DictObject::inner_type &data
-            = cval.get<FlatSharedDictObj>()->get_ref();
+            = cval.get<shared_ptr<DictObject>>()->get_ref();
 
         size_type i = 0;
 
@@ -1207,17 +1207,17 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return FlatSharedDictObj(make_shared<DictObject>(move(data)));
+    return shared_ptr<DictObject>(make_shared<DictObject>(move(data)));
 }
 
 EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue &&dval = RValue(what->eval(ctx));
 
-    if (!dval.is<FlatSharedDictObj>())
+    if (!dval.is<shared_ptr<DictObject>>())
         throw TypeErrorEx("Expected dict object", what->start, what->end);
 
-    DictObject::inner_type &data = dval.get<FlatSharedDictObj>()->get_ref();
+    DictObject::inner_type &data = dval.get<shared_ptr<DictObject>>()->get_ref();
 
     return &(
         *data.emplace(

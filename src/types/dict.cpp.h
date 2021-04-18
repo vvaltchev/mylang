@@ -13,11 +13,11 @@
 #include "eval.h"
 #include "evaltypes.cpp.h"
 
-class TypeDict : public SharedType<FlatSharedDictObj> {
+class TypeDict : public NonTrivialType<shared_ptr<DictObject>> {
 
 public:
 
-    TypeDict() : SharedType<FlatSharedDictObj>(Type::t_dict) { }
+    TypeDict() : NonTrivialType<shared_ptr<DictObject>>(Type::t_dict) { }
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
@@ -33,37 +33,37 @@ public:
 
 int_type TypeDict::len(const EvalValue &a)
 {
-    return a.get<FlatSharedDictObj>().get().get_ref().size();
+    return a.get<shared_ptr<DictObject>>().get()->get_ref().size();
 }
 
 void TypeDict::eq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<FlatSharedDictObj>()) {
+    if (!b.is<shared_ptr<DictObject>>()) {
         a = false;
         return;
     }
 
     const DictObject::inner_type &dataA
-        = a.get<FlatSharedDictObj>()->get_ref();
+        = a.get<shared_ptr<DictObject>>()->get_ref();
 
     const DictObject::inner_type &dataB
-        = b.get<FlatSharedDictObj>()->get_ref();
+        = b.get<shared_ptr<DictObject>>()->get_ref();
 
     a = dataA == dataB;
 }
 
 void TypeDict::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<FlatSharedDictObj>()) {
+    if (!b.is<shared_ptr<DictObject>>()) {
         a = false;
         return;
     }
 
     const DictObject::inner_type &dataA
-        = a.get<FlatSharedDictObj>()->get_ref();
+        = a.get<shared_ptr<DictObject>>()->get_ref();
 
     const DictObject::inner_type &dataB
-        = b.get<FlatSharedDictObj>()->get_ref();
+        = b.get<shared_ptr<DictObject>>()->get_ref();
 
     a = dataA != dataB;
 }
@@ -71,8 +71,8 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
 EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key)
 {
     const EvalValue &what = RValue(what_lval);
-    FlatSharedDictObj &&flatObj = what.get<FlatSharedDictObj>();
-    DictObject::inner_type &data = flatObj.get().get_ref();
+    shared_ptr<DictObject> &&flatObj = what.get<shared_ptr<DictObject>>();
+    DictObject::inner_type &data = flatObj.get()->get_ref();
 
     const auto &it = data.find(key);
 
@@ -88,7 +88,7 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key)
 
 string TypeDict::to_string(const EvalValue &a)
 {
-    const DictObject &obj = a.get<FlatSharedDictObj>().get();
+    const DictObject &obj = *a.get<shared_ptr<DictObject>>().get();
     const DictObject::inner_type &data = obj.get_ref();
 
     string res;
@@ -115,7 +115,7 @@ string TypeDict::to_string(const EvalValue &a)
 
 bool TypeDict::is_true(const EvalValue &a)
 {
-    return a.get<FlatSharedDictObj>()->get_ref().size() > 0;
+    return a.get<shared_ptr<DictObject>>()->get_ref().size() > 0;
 }
 
 int_type TypeDict::use_count(const EvalValue &a)
@@ -126,13 +126,13 @@ int_type TypeDict::use_count(const EvalValue &a)
 EvalValue TypeDict::intptr(const EvalValue &a)
 {
     return reinterpret_cast<int_type>(
-        &a.get<FlatSharedDictObj>().get().get_ref()
+        &a.get<shared_ptr<DictObject>>().get()->get_ref()
     );
 }
 
 EvalValue TypeDict::clone(const EvalValue &a)
 {
-    const FlatSharedDictObj &wrapper = a.get<FlatSharedDictObj>();
-    const DictObject &dict = wrapper.get();
-    return FlatSharedDictObj(make_shared<DictObject>(dict));
+    const shared_ptr<DictObject> &wrapper = a.get<shared_ptr<DictObject>>();
+    const DictObject &dict = *wrapper.get();
+    return shared_ptr<DictObject>(make_shared<DictObject>(dict));
 }

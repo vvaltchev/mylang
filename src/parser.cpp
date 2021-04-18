@@ -831,10 +831,10 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const EvalValue &rvalue = ret->eval(c.const_ctx);
 
-        if (!rvalue.is<SharedArrayObj>() && !rvalue.is<FlatSharedDictObj>()) {
+        if (!rvalue.is<SharedArrayObj>() && !rvalue.is<shared_ptr<DictObject>>()) {
 
             /*
-             * In all the cases, except SharedArrayObj and FlatSharedDictObj,
+             * In all the cases, except SharedArrayObj and shared_ptr<DictObject>,
              * we just return a NopConstruct. Note: we cannot return nullptr,
              * otherwise it would seem that we matched nothing and pAcceptBracedBlock()
              * will expect "}".
@@ -1252,10 +1252,10 @@ MakeConstructFromConstVal(const EvalValue &v,
             out = move(litarr);
             return true;
 
-        } else if (v.is<FlatSharedDictObj>()) {
+        } else if (v.is<shared_ptr<DictObject>>()) {
 
             const DictObject::inner_type &data =
-                v.get<FlatSharedDictObj>()->get_ref();
+                v.get<shared_ptr<DictObject>>()->get_ref();
 
             unique_ptr<LiteralDict> litDict(new LiteralDict);
 
