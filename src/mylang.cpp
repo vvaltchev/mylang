@@ -289,14 +289,6 @@ int main(int argc, char **argv)
         cerr << "Uncaught dynamic exception: '" << e.get_name() << "'" << endl;
         return 1;
 
-    } catch (const CannotBindPureFuncToConstEx &e) {
-
-        cerr << e.name << ": " << e.msg;
-        dumpLocInError(e);
-
-        cerr << endl;
-        cerr << "Solution: just declare a *named* pure function instead." << endl;
-
     } catch (const Exception &e) {
 
         cerr << e.name << ": " << e.msg;
