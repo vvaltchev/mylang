@@ -842,6 +842,7 @@ pExpr14(ParseContext &c, unsigned fl)
             return make_unique<NopConstruct>();
         }
 
+        ret->fl |= pInConstDecl;
         ret->lvalue->is_const = true;
     }
 
