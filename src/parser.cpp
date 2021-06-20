@@ -680,6 +680,53 @@ declExprCheckId(ParseContext &c, Construct *id)
     }
 }
 
+/*
+ * ShouldConstSymbolExistAtRuntime(rvalue)
+ *      Given an rvalue, supposed to the bound to a const symbol, returns true
+ *      if we should keep the symbol in the runtime AST and false otherwise.
+ *
+ * Rationale
+ * ----------------
+ *
+ * While it would look like that no const symbol should exist in the
+ * "runtime AST", it is convenient for some symbols to still exist.
+ * Consider the following example:
+ *
+ *      const huge_arr = [ 1, 2, 3, 34, 34, 23, 123, 23 ];  # Big array
+ *
+ *      print(huge_arr);
+ *      some_something(huge_arr);
+ *
+ *      foreach (var e in huge_arr) {
+ *          do_something_with_elem(e);
+ *      }
+ *
+ * If we force ALL the const symbols to be translated to literals in
+ * the runtime AST, we'll have (duplicated) literals representing the
+ * whole huge_arr, for every expression that uses it as if we wrote:
+ *
+ *      print([ 1, 2, 3, 34, 34, 23, 123, 23 ]);
+ *      some_something([ 1, 2, 3, 34, 34, 23, 123, 23 ]);
+ *
+ *      foreach (var e in [ 1, 2, 3, 34, 34, 23, 123, 23 ]) {
+ *          do_something_with_elem(e);
+ *      }
+ *
+ * Imagine now if "huge_arr" had a million elements. It would be a waste.
+ * Therefore, while that's convenient to completely inline some types of
+ * constants like integers and strings, that's not always the best action
+ * to take.
+ */
+
+static inline bool
+ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
+{
+    return
+        rvalue.is<SharedArrayObj>()           ||
+        rvalue.is<shared_ptr<DictObject>>()   ||
+        rvalue.is<shared_ptr<FuncObject>>();
+}
+
 unique_ptr<Construct>
 pExpr14(ParseContext &c, unsigned fl)
 {
@@ -831,15 +878,14 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const EvalValue &rvalue = ret->eval(c.const_ctx);
 
-        if (!rvalue.is<SharedArrayObj>() &&
-            !rvalue.is<shared_ptr<DictObject>>() &&
-            !rvalue.is<shared_ptr<FuncObject>>())
-        {
+        if (!ShouldConstSymbolExistAtRuntime(rvalue)) {
+
             /*
-             * In all the cases except the ones checked here, we just return
-             * a NopConstruct. NOTE: we cannot return nullptr, otherwise it
-             * would seem that we matched nothing and pAcceptBracedBlock()
-             * will expect "}".
+             * In this case, the const symbol is supposed to not exist at all
+             * in the runtime AST so, we just return a NopConstruct.
+             *
+             * NOTE: we cannot return nullptr, otherwise the caller would believe
+             * that we matched nothing.
              */
             return make_unique<NopConstruct>();
         }
