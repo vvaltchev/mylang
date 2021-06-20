@@ -268,7 +268,7 @@ $ ./build/mylang -s -e 'const ar=range(4); const s=ar[2:]; print(ar, s, s[0]);'
 Syntax tree
 --------------------------
 Block(
-  VarDecl(
+  ConstDecl(
     Id("ar")
     Op '='
     LiteralArray(
@@ -278,7 +278,7 @@ Block(
       Int(3)
     )
   )
-  VarDecl(
+  ConstDecl(
     Id("s")
     Op '='
     LiteralArray(
@@ -648,11 +648,12 @@ custom `compare func` parameter, that's not possible anymore.
 
 To overcome the just-described limitation, `MyLang` has a special syntax for
 *pure* functions. When a function is declared with the `pure` keyword preceding
-`func`, the interpreter treats it in a special way: it *can* be called during const
-evaluation *but* the function cannot see global variables, nor capture anything:
-it can only use constants and the value of its parameters: that's exactly what we
-need during const evaluation. For example, to generate `sorted_people` during const
-evaluation it's enough to write:
+`func`, the interpreter treats it in a special way: it *can* be called anytime,
+*both* during const evaluation and during runtime *but* the function cannot
+see global variables, nor capture anything: it can only use constants and the
+value of its parameters: that's exactly what we need during const evaluation.
+For example, to generate `sorted_people` during const evaluation it's enough to
+write:
 
 ```C#
 const sorted_people = sort(people, pure func(a, b) => a[0] < b[0]);
