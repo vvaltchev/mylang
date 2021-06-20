@@ -631,8 +631,23 @@ handle_single_expr14(EvalContext *ctx,
 
     } else if (lval.is<LValue *>()) {
 
-        if (ctx->const_ctx)
+        if (ctx->const_ctx) {
+
+            /*
+             * We're in const ctx, and we're trying to change the value of a
+             * symbol. That should not be possible. The parser won't try to evaluate
+             * an assignment statement during const evaluation. If that happens,
+             * a bug has been just introduced, in a recent changed.
+             */
             throw InternalErrorEx();
+
+        } else if (lval.get<LValue *>()->is_const_var()) {
+
+            if (lval.get<LValue *>()->is<Builtin>())
+                throw CannotRebindBuiltinEx(lvalue->start, lvalue->end);
+
+            throw CannotRebindConstEx(lvalue->start, lvalue->end);
+        }
 
         if (inDecl) {
 
