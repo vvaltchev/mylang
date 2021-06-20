@@ -235,6 +235,33 @@ static const std::vector<test> tests =
     },
 
     {
+        "cannot rebind consts existing at runtime 1",
+        {
+            "const arr = [1,2,3];",
+            "arr = 42;",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "cannot rebind consts existing at runtime 2",
+        {
+            "const x = pure func (x, y) => x < y;",
+            "x = 42;",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "cannot rebind consts existing at runtime 3",
+        {
+            "const x = { 3 : 10, 4: 20 };",
+            "x = 42;",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
         "const re-decl in nested scope fails",
         {
             "const a = 1; { const a = 2; }",
@@ -417,9 +444,17 @@ static const std::vector<test> tests =
     },
 
     {
-        "rebind builtins is not allowed",
+        "rebind of const builtins is not allowed",
         {
             "len = 5;",
+        },
+        &typeid(CannotRebindBuiltinEx),
+    },
+
+    {
+        "rebind of non-const builtins is not allowed",
+        {
+            "print = 5;",
         },
         &typeid(CannotRebindBuiltinEx),
     },
