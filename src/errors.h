@@ -125,7 +125,6 @@ DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
 DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
 DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_SIMPLE_EX(CannotChangeConstEx, "Cannot change constant")
-DECL_SIMPLE_EX(CannotBindPureFuncToConstEx, "Cannot bind pure func to const")
 
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")

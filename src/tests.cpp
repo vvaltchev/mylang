@@ -2242,6 +2242,18 @@ static const std::vector<test> tests =
     },
 
     {
+        "Const-bound pure funcs",
+        {
+            "const cmp = pure func(a, b) => a < b;",
+            "assert(cmp(1,2) == 1);",
+            "assert(cmp(2,1) == 0);",
+            "var a, b = [1,2];",
+            "assert(cmp(a,b) == 1);",
+            "assert(cmp(b,a) == 0);",
+        },
+    },
+
+    {
         "Temporary pure funcs",
         {
             "const a = [1,2,3];",
@@ -2249,14 +2261,6 @@ static const std::vector<test> tests =
             "assert(a == [1,2,3]);",
             "assert(b == [3,2,1]);",
         }
-    },
-
-    {
-        "Cannot bind temporary pure func to const",
-        {
-            "const f = pure func(x) => x+1;",
-        },
-        &typeid(CannotBindPureFuncToConstEx),
     },
 
     {

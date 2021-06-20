@@ -831,12 +831,14 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const EvalValue &rvalue = ret->eval(c.const_ctx);
 
-        if (!rvalue.is<SharedArrayObj>() && !rvalue.is<shared_ptr<DictObject>>()) {
-
+        if (!rvalue.is<SharedArrayObj>() &&
+            !rvalue.is<shared_ptr<DictObject>>() &&
+            !rvalue.is<shared_ptr<FuncObject>>())
+        {
             /*
-             * In all the cases, except SharedArrayObj and shared_ptr<DictObject>,
-             * we just return a NopConstruct. Note: we cannot return nullptr,
-             * otherwise it would seem that we matched nothing and pAcceptBracedBlock()
+             * In all the cases except the ones checked here, we just return
+             * a NopConstruct. NOTE: we cannot return nullptr, otherwise it
+             * would seem that we matched nothing and pAcceptBracedBlock()
              * will expect "}".
              */
             return make_unique<NopConstruct>();
