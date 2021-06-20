@@ -226,10 +226,16 @@ void Expr14::serialize(ostream &s, int level) const
 
     s << indent;
 
-    if (fl & pFlags::pInDecl)
-        s << "VarDecl";
-    else
+    if (fl & pFlags::pInDecl) {
+
+        if (fl & pFlags::pInConstDecl)
+            s << "ConstDecl";
+        else
+            s << "VarDecl";
+
+    } else {
         s << name;
+    }
 
     s << "(\n";
     lvalue->serialize(s, level + 1);
