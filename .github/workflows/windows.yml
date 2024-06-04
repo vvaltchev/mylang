@@ -14,7 +14,7 @@ jobs:
       BUILD_TYPE: ${{ matrix.bt }}
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Create Build Environment
       run: cmake -E make_directory ${{github.workspace}}/build
