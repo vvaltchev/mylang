@@ -63,10 +63,22 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
                 );
             }
 
-            char buf[80];
             const int precision = static_cast<int>(p.get<int_type>());
-            snprintf(buf, sizeof(buf), "%.*Lf", precision, e.get<float_type>());
-            return SharedStr(string(buf));
+            const float_type fval = e.get<float_type>();
+
+            /*
+             * Size the buffer to the exact length: a fixed buffer would
+             * silently truncate for large-magnitude values at high precision
+             * (e.g. str(1e30, 64) needs ~96 chars).
+             */
+            const int n = snprintf(nullptr, 0, "%.*Lf", precision, fval);
+
+            if (n < 0)
+                throw InternalErrorEx(arg0->start, arg0->end);
+
+            std::vector<char> buf(static_cast<size_t>(n) + 1);
+            snprintf(buf.data(), buf.size(), "%.*Lf", precision, fval);
+            return SharedStr(string(buf.data(), static_cast<size_t>(n)));
         }
 
     } else {

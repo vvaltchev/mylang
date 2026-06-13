@@ -3032,6 +3032,18 @@ static const std::vector<test> tests =
         &typeid(SyntaxErrorEx),
         7,
     },
+
+    {
+        "str() of a float is not truncated at high precision",
+        {
+            /* 1e30 needs 31 integer digits + '.' + 64 fractional = 96 chars,
+               which a fixed 80-byte buffer would silently truncate. */
+            "var s = str(1e30, 64);",
+            "assert(len(s) == 96);",
+            "assert(str(3.5, 2) == \"3.50\");",
+            "assert(str(2.0, 0) == \"2\");",
+        },
+    },
 };
 
 static void
