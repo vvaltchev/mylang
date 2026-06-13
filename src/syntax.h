@@ -269,6 +269,16 @@ public:
     const UniqueId *uid;
     ResolvedSym sym;        /* filled in by the name-resolution pass */
 
+    /*
+     * Only meaningful when this Identifier is a function parameter (an element
+     * of FuncDeclStmt::params). `const_param` is set by the parser for a param
+     * declared `const` (e.g. `func f(const x, y)`); `auto_const_param` is set
+     * by the resolver when a (non-const-declared) param is never reassigned in
+     * the body, so it is effectively const. Both make isconst() true for it.
+     */
+    bool const_param = false;
+    bool auto_const_param = false;
+
     Identifier(const std::string_view &str)
         : Construct("Id")
         , uid(UniqueId::get(str))

@@ -278,6 +278,34 @@ pIdentifier(ParseContext &c, unsigned fl)
     return unique_ptr<Identifier>(static_cast<Identifier *>(ret.release()));
 }
 
+/*
+ * A function parameter: an identifier optionally preceded by `const`, e.g.
+ * `func f(const x, y)`. A const parameter cannot be reassigned in the body
+ * (enforced by the resolver and, as a safety net, at runtime). The identifier
+ * is NOT const-resolved (resolve_const=false): a param shadows any outer const
+ * of the same name, so it must stay a plain identifier.
+ */
+unique_ptr<Identifier>
+pFuncParam(ParseContext &c, unsigned fl)
+{
+    const bool is_const = pAcceptKeyword(c, Keyword::kw_const);
+    unique_ptr<Construct> ret;
+
+    if (!pAcceptId(c, ret, false /* resolve_const */)) {
+        if (is_const)
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Expected parameter name after `const`, got",
+                &c.get_tok()
+            );
+        return nullptr;
+    }
+
+    unique_ptr<Identifier> id(static_cast<Identifier *>(ret.release()));
+    id->const_param = is_const;
+    return id;
+}
+
 template <class T>
 unique_ptr<T>
 pList(ParseContext &c,
@@ -1245,7 +1273,7 @@ pAcceptFuncDecl(ParseContext &c,
     }
 
     if (pAcceptOp(c, Op::parenL)) {
-        func->params = pList<IdList>(c, fl, pIdentifier);
+        func->params = pList<IdList>(c, fl, pFuncParam);
         pExpectOp(c, Op::parenR);
     }
 

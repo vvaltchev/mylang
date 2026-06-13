@@ -706,6 +706,27 @@ Resolver::process_function(FuncDeclStmt *fd)
     if (fd->body)
         walk(fd->body.get(), &st);
 
+    /*
+     * Param const-ness. st.writes[i] for a param counts body reassignments
+     * (0 == never reassigned). A `const` param that is reassigned is a
+     * compile-time error; a plain param that is never reassigned is effectively
+     * const, so mark it auto_const_param (used by isconst()).
+     */
+    if (st.slottable) {
+        for (int i = 0; i < nparams; i++) {
+            Identifier *p = fd->params->elems[i].get();
+            const bool reassigned =
+                i < static_cast<int>(st.writes.size()) && st.writes[i] > 0;
+
+            if (p->const_param) {
+                if (reassigned)
+                    throw CannotRebindConstEx(p->start, p->end);
+            } else if (!reassigned) {
+                p->auto_const_param = true;
+            }
+        }
+    }
+
     if (st.slottable && st.next_slot > 0) {
         fd->resolved = true;
         fd->frame_size = st.next_slot;
