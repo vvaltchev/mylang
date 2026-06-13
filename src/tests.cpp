@@ -2930,6 +2930,34 @@ static const std::vector<test> tests =
             "assert(\"\\n\" != \"n\");",          /* mylang: "\n" != "n"     */
         },
     },
+
+    {
+        "scientific notation with signed exponent",
+        {
+            "assert(1e3 == 1000.0);",
+            "assert(1e+3 == 1000.0);",
+            "assert(5e-1 == 0.5);",       /* negative exponent; 0.5 is exact */
+            "assert(25e-2 == 0.25);",
+            "assert(2.5e2 == 250.0);",
+            "assert(5e2 - 3 == 497.0);",  /* digit after exponent: '-' subtracts */
+        },
+    },
+
+    {
+        "float exponent with no digits is invalid",
+        {
+            "var x = 1e;",
+        },
+        &typeid(InvalidTokenEx),
+    },
+
+    {
+        "float exponent with a sign but no digits is invalid",
+        {
+            "var x = 1e-;",
+        },
+        &typeid(InvalidTokenEx),
+    },
 };
 
 static void

@@ -110,7 +110,9 @@ struct lexer_ctx {
     /* State variables */
     size_type i = 0;
     size_type tok_start = 0;
-    bool float_exp = false;
+    bool float_exp = false;       /* an 'e' has been seen in the current float */
+    bool exp_sign_ok = false;     /* next char may be the exponent's +/- sign */
+    bool exp_need_digit = false;  /* the exponent still needs at least one digit */
     TokType tok_type = TokType::invalid;
 
     lexer_ctx(const string_view &in_str, int line, std::vector<Tok> &result)
@@ -137,6 +139,9 @@ lexer_ctx::invalid_token()
 void
 lexer_ctx::accept_token()
 {
+    if (tok_type == TokType::floatnum && exp_need_digit)
+        invalid_token(); /* float exponent with no digits, e.g. "1e" or "1e-" */
+
     const string_view &val = in_str.substr(tok_start, i - tok_start);
 
     if (tok_type == TokType::id) {
@@ -239,6 +244,9 @@ lexer_ctx::handle_alphanum()
     if (tok_type == TokType::invalid) {
 
         tok_start = i;
+        float_exp = false;
+        exp_sign_ok = false;
+        exp_need_digit = false;
 
         if (isdigit(c))
             tok_type = TokType::integer;
@@ -249,34 +257,46 @@ lexer_ctx::handle_alphanum()
 
     } else if (tok_type == TokType::integer) {
 
-        if (c == '.' || c == 'e') {
+        if (c == '.') {
 
             tok_type = TokType::floatnum;
-            float_exp = c == 'e';
 
-        } else {
+        } else if (c == 'e') {
 
-            if (!isdigit(c))
-                invalid_token();
+            tok_type = TokType::floatnum;
+            float_exp = true;
+            exp_sign_ok = true;
+            exp_need_digit = true;
+
+        } else if (!isdigit(c)) {
+
+            invalid_token();
         }
 
     } else if (tok_type == TokType::floatnum) {
 
         if (c == 'e') {
 
-            if (!float_exp) {
+            if (float_exp)
+                invalid_token(); /* a second 'e' in the same float */
 
-                float_exp = true;
+            float_exp = true;
+            exp_sign_ok = true;
+            exp_need_digit = true;
 
-            } else {
+        } else if (exp_sign_ok && (c == '+' || c == '-')) {
 
-                invalid_token();
-            }
+            /* a +/- sign is allowed only right after the exponent's 'e' */
+            exp_sign_ok = false;
+
+        } else if (isdigit(c)) {
+
+            exp_sign_ok = false;
+            exp_need_digit = false;
 
         } else {
 
-            if (!isdigit(c))
-                invalid_token();
+            invalid_token();
         }
     }
 }
@@ -336,10 +356,11 @@ lexer(string_view in_str, int line, std::vector<Tok> &result)
 
             const bool is_op = is_operator(string_view(&c, 1));
             const bool in_integer = ctx.tok_type == TokType::integer;
+            const bool exp_sign = ctx.exp_sign_ok && (c == '+' || c == '-');
 
-            if (isspace(c) || (is_op && (!in_integer || c != '.')))
+            if (!exp_sign && (isspace(c) || (is_op && (!in_integer || c != '.'))))
                 ctx.handle_space_or_op();
-            else if (isalnum(c) || c == '_' || c == '.')
+            else if (exp_sign || isalnum(c) || c == '_' || c == '.')
                 ctx.handle_alphanum();
             else
                 ctx.handle_other();
