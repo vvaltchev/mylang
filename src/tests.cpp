@@ -14,6 +14,7 @@
 #include "syntax.h"
 #include "eval.h"
 #include "resolver.h"
+#include "backtrace.h"
 
 #include <typeinfo>
 #include <vector>
@@ -3580,9 +3581,182 @@ serialize_writes_to_given_stream()
            out.find("TryCatchStmt") != std::string::npos;
 }
 
+/* Build a formatted backtrace from synthetic frames (innermost first). */
+static std::string
+fmt_bt(int err_line, std::vector<BacktraceFrame> frames)
+{
+    DivisionByZeroEx ex;
+    ex.loc_start = Loc(err_line, 1);
+    ex.backtrace = std::move(frames);
+    return format_backtrace(ex);
+}
+
+static std::vector<std::string>
+bt_frame_lines(const std::string &s)
+{
+    std::vector<std::string> out;
+    std::istringstream is(s);
+
+    for (std::string ln; std::getline(is, ln); )
+        if (ln.size() > 2 && ln[0] == ' ' && ln[2] == '[')
+            out.push_back(ln);
+
+    return out;
+}
+
+/*
+ * Backtrace formatting: param names shown, most-recent on top with "main" at
+ * the bottom, single-digit [N] frame numbers, line attribution (error site for
+ * the top frame, call site otherwise), and the "at line" column aligned.
+ */
+static bool
+backtrace_format_basic()
+{
+    const std::string s = fmt_bt(15, {
+        { "inner", { "x" }, Loc(12, 1) },
+        { "middle", { "a", "b" }, Loc(7, 1) },
+    });
+
+    const auto npos = std::string::npos;
+    bool ok = true;
+
+    ok = ok && s.find("Backtrace (most recent call first):") != npos;
+    ok = ok && s.find("[0] inner(x)") != npos;
+    ok = ok && s.find("[1] middle(a, b)") != npos;
+    ok = ok && s.find("[2] main()") != npos;
+    ok = ok && s.find("at line 15") != npos;   /* inner: error site */
+    ok = ok && s.find("at line 12") != npos;   /* middle: call to inner */
+    ok = ok && s.find("at line 7") != npos;    /* main: call to middle */
+    ok = ok && s.find("[0] inner") < s.find("[1] middle");
+    ok = ok && s.find("[1] middle") < s.find("[2] main");
+
+    const auto fr = bt_frame_lines(s);
+    ok = ok && fr.size() == 3;
+
+    if (!fr.empty()) {
+        const size_t col = fr[0].find(" at line ");
+        for (const auto &ln : fr)
+            ok = ok && ln.find(" at line ") == col;   /* aligned */
+    }
+
+    if (!ok)
+        cout << "  got:\n" << s;
+
+    return ok;
+}
+
+/* >9 frames: numbers are zero-padded to a common width ([00]..[10]). */
+static bool
+backtrace_zero_padding()
+{
+    std::vector<BacktraceFrame> frames;
+
+    for (int i = 0; i < 10; i++)   /* 10 recorded + main == 11 frames */
+        frames.push_back({ "f" + std::to_string(i), {}, Loc(i + 1, 1) });
+
+    const std::string s = fmt_bt(99, std::move(frames));
+    const auto npos = std::string::npos;
+    bool ok = true;
+
+    ok = ok && s.find("[00] f0()") != npos;
+    ok = ok && s.find("[09] f9()") != npos;
+    ok = ok && s.find("[10] main()") != npos;
+    ok = ok && s.find("[0] ") == npos;   /* never a 1-digit number here */
+
+    if (!ok)
+        cout << "  got:\n" << s;
+
+    return ok;
+}
+
+/* Long frames truncate the param list to ~60 chars; the name is never cut. */
+static bool
+backtrace_truncation()
+{
+    const auto npos = std::string::npos;
+    bool ok = true;
+
+    std::vector<std::string> many;
+    for (int i = 0; i < 30; i++)
+        many.push_back("param" + std::to_string(i));
+
+    const std::string s1 = fmt_bt(1, { { "f", many, Loc(2, 1) } });
+    ok = ok && s1.find("f(param0") != npos;   /* leading params kept */
+    ok = ok && s1.find(", ...)") != npos;     /* and a "..." tail */
+
+    const auto fr1 = bt_frame_lines(s1);
+    if (!fr1.empty()) {
+        const size_t at = fr1[0].find(" at line ");
+        const size_t nameStart = fr1[0].find("] ") + 2;
+        ok = ok && (at - nameStart) <= 60;    /* name column within budget */
+    }
+
+    /* a single oversized param collapses to "f(...)" */
+    const std::string s2 = fmt_bt(1, { { "f", { std::string(80, 'z') },
+                                         Loc(2, 1) } });
+    ok = ok && s2.find("f(...)") != npos;
+
+    /* an oversized function name is kept (alignment just grows) */
+    const std::string longname(70, 'g');
+    const std::string s3 = fmt_bt(1, { { longname, { "x" }, Loc(2, 1) } });
+    ok = ok && s3.find(longname + "(...)") != npos;
+
+    if (!ok)
+        cout << "  got:\n" << s1 << s2 << s3;
+
+    return ok;
+}
+
+/* End to end: a real error through a -> b -> main yields the right frames. */
+static bool
+backtrace_end_to_end()
+{
+    static const char *src[] = {
+        "func a(x) { return x + oops; }",
+        "func b(x) { return a(x); }",
+        "print(b(10));",
+    };
+
+    std::vector<Tok> tokens;
+    for (size_t i = 0; i < sizeof(src) / sizeof(src[0]); i++)
+        lexer(src[i], static_cast<int>(i + 1), tokens);
+
+    ParseContext pctx(TokenStream(tokens), true);
+    unique_ptr<Construct> root = pBlock(pctx);
+    resolve_names(root.get());
+
+    std::string bt;
+
+    try {
+        root->eval(nullptr);
+        return false;   /* should have thrown */
+    } catch (const Exception &e) {
+        bt = format_backtrace(e);
+    }
+
+    const auto npos = std::string::npos;
+    bool ok = true;
+
+    ok = ok && bt.find("[0] a(x)") != npos;     /* error in a, line 1 */
+    ok = ok && bt.find("[1] b(x)") != npos;     /* b called a, line 2 */
+    ok = ok && bt.find("[2] main()") != npos;   /* main called b, line 3 */
+    ok = ok && bt.find("at line 1") != npos;
+    ok = ok && bt.find("at line 2") != npos;
+    ok = ok && bt.find("at line 3") != npos;
+
+    if (!ok)
+        cout << "  got:\n" << bt;
+
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
+    { "backtrace: basic format & alignment", backtrace_format_basic },
+    { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
+    { "backtrace: long-frame truncation", backtrace_truncation },
+    { "backtrace: end-to-end call chain", backtrace_end_to_end },
 };
 
 void run_tests(bool dump_syntax_tree)

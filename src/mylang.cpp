@@ -6,6 +6,7 @@
 #include "syntax.h"
 #include "eval.h"
 #include "resolver.h"
+#include "backtrace.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -319,6 +320,7 @@ int main(int argc, char **argv)
             cerr << " while evaluating a PURE function";
 
         dumpLocInError(e);
+        cerr << format_backtrace(e);
         return 1;
 
     } catch (const ExceptionObject &e) {
@@ -331,12 +333,14 @@ int main(int argc, char **argv)
             cerr << ", data: " << data.get_type()->to_string(data);
 
         dumpLocInError(e);
+        cerr << format_backtrace(e);
         return 1;
 
     } catch (const Exception &e) {
 
         cerr << e.name << ": " << e.msg;
         dumpLocInError(e);
+        cerr << format_backtrace(e);
         return 1;
     }
 
