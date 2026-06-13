@@ -247,9 +247,15 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
 
     if (lval->is<shared_ptr<DictObject>>()) {
 
+        if (lval->getval<shared_ptr<DictObject>>()->is_readonly())
+            throw CannotChangeConstEx(arg0->start, arg0->end);
+
         return builtin_erase_dict(lval, index_val);
 
     } else if (lval->is<SharedArrayObj>()) {
+
+        if (lval->getval<SharedArrayObj>().is_readonly())
+            throw CannotChangeConstEx(arg0->start, arg0->end);
 
         if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
@@ -288,9 +294,15 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
 
     if (lval->is<shared_ptr<DictObject>>()) {
 
+        if (lval->getval<shared_ptr<DictObject>>()->is_readonly())
+            throw CannotChangeConstEx(arg0->start, arg0->end);
+
         return builtin_insert_dict(lval, index_val, val);
 
     } else if (lval->is<SharedArrayObj>()) {
+
+        if (lval->getval<SharedArrayObj>().is_readonly())
+            throw CannotChangeConstEx(arg0->start, arg0->end);
 
         if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);

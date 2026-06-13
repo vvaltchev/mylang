@@ -76,6 +76,16 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key)
 
     const auto &it = data.find(key);
 
+    if (flatObj->is_readonly()) {
+
+        /*
+         * Read-only dict (a `const` value): never hand out an assignable
+         * lvalue and never auto-vivify. A read of a missing key yields `none`;
+         * a write (`d[k] = ...`) sees an rvalue and fails with NotLValueEx.
+         */
+        return it != data.end() ? it->second.get() : none;
+    }
+
     if (it != data.end())
         return &it->second;
 
@@ -134,5 +144,9 @@ EvalValue TypeDict::clone(const EvalValue &a)
 {
     const shared_ptr<DictObject> &wrapper = a.get<shared_ptr<DictObject>>();
     const DictObject &dict = *wrapper.get();
-    return shared_ptr<DictObject>(make_shared<DictObject>(dict));
+    auto copy = make_shared<DictObject>(dict);
+
+    /* A clone is an independent, mutable copy even of a read-only dict. */
+    copy->clear_readonly();
+    return shared_ptr<DictObject>(copy);
 }

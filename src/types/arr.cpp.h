@@ -124,6 +124,9 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
 {
     SharedArrayObj &lval = a.get<SharedArrayObj>();
 
+    if (lval.is_readonly())
+        throw CannotChangeConstEx();
+
     if (!b.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array on the right side of +");
 
@@ -251,8 +254,12 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
 
     LValue *ret = &vec[arr.offset() + idx];
 
-    if (!what_lval.is<LValue *>()) {
-        /* The input array was not an LValue, so return a simple RValue */
+    if (!what_lval.is<LValue *>() || arr.is_readonly()) {
+        /*
+         * Return a simple RValue when the input array was not an LValue, or
+         * when it is read-only (a `const` value): a read still works, but an
+         * assignment target is an rvalue, so `a[i] = x` fails with NotLValueEx.
+         */
         return ret->get();
     }
 

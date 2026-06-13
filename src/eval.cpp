@@ -520,9 +520,65 @@ make_mutable_clone(const EvalValue &v)
     return v;
 }
 
+/*
+ * Produce a deep, read-only copy of a const-evaluated container value: every
+ * array/dict in the result (recursively) is flagged read-only, so writing
+ * through ANY alias of it - including a non-const function parameter bound to a
+ * const argument - is rejected. This is what makes `const` deep read-only at
+ * runtime; previously const-ness was enforced only by parse-time folding of
+ * direct reads, leaving the runtime value mutable through aliasing. Scalars and
+ * strings are returned as-is (already immutable). An empty array gets its own
+ * read-only object (not the shared empty_arr singleton, which must stay
+ * mutable).
+ */
+static EvalValue
+make_const_clone(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>()) {
+
+        const ArrayConstView &view = v.get<SharedArrayObj>().get_view();
+
+        SharedArrayObj::vec_type vec;
+        vec.reserve(view.size());
+
+        for (unsigned i = 0; i < view.size(); i++)
+            vec.emplace_back(make_const_clone(view[i].get()), false);
+
+        SharedArrayObj arr(move(vec));
+        arr.set_readonly();
+        return arr;
+    }
+
+    if (v.is<shared_ptr<DictObject>>()) {
+
+        DictObject::inner_type data;
+        const DictObject::inner_type &src =
+            v.get<shared_ptr<DictObject>>()->get_ref();
+
+        for (const auto &p : src) {
+            data.emplace(
+                p.first,
+                LValue(make_const_clone(p.second.get()), false)
+            );
+        }
+
+        auto obj = make_shared<DictObject>(move(data));
+        obj->set_readonly();
+        return shared_ptr<DictObject>(obj);
+    }
+
+    return v;
+}
+
 EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
 {
-    return make_mutable_clone(value);
+    /*
+     * A const-decl target gets a deep read-only value (immutable); any other
+     * target (a `var`, or a read-only consumer) gets a fresh mutable copy.
+     * Both are produced fresh each evaluation so re-entry never observes a
+     * prior mutation.
+     */
+    return immutable ? make_const_clone(value) : make_mutable_clone(value);
 }
 
 /*
@@ -1496,7 +1552,19 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
     if (!dval.is<shared_ptr<DictObject>>())
         throw TypeErrorEx("Expected dict object", what->start, what->end);
 
-    DictObject::inner_type &data = dval.get<shared_ptr<DictObject>>()->get_ref();
+    const shared_ptr<DictObject> &obj = dval.get<shared_ptr<DictObject>>();
+    DictObject::inner_type &data = obj->get_ref();
+
+    if (obj->is_readonly()) {
+
+        /*
+         * Read-only dict: never hand out an assignable lvalue and never
+         * auto-vivify. A read of a missing member yields `none`; a write
+         * (`d.k = ...`) sees an rvalue and fails with NotLValueEx.
+         */
+        const auto &it = data.find(memId);
+        return it != data.end() ? it->second.get() : none;
+    }
 
     return &(
         *data.emplace(

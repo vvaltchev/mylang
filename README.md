@@ -306,6 +306,31 @@ small values like integers, floats, and strings become literals during the
 read-only symbols at runtime, but still allowing some operations on them (like
 `[index]` and `len(arr)`) to be const-evaluated.
 
+A `const` array or dictionary is **deeply read-only**: there is no shallow
+const, so a const container and every element nested inside it are immutable.
+The read-only-ness is a property of the *value*, not just the name — so it holds
+even when the value is aliased through a non-const binding, in particular a
+function parameter:
+
+```C#
+func g(p) {
+    p = [9, 9];   # OK: rebinding the parameter is allowed
+    p[0] = 1;     # OK: p now refers to g's own fresh array
+    return p;
+}
+
+const y = [1, 2, 3];
+print(g(y));      # [1, 9]
+print(y);         # [1, 2, 3] — untouched
+```
+
+Trying to *mutate* the value of a const (rather than rebind a name to a new
+value) is an error: `p[0] = x`, `p.k = x` and inserting a missing dict key fail
+with `NotLValueEx`, while `p += [...]`, `append`/`insert`/`pop`/`erase` fail
+with `CannotChangeConstEx`. `sort()` of a const returns a sorted *copy* and
+leaves the original alone. To get a mutable copy, use `clone()` (or assign into
+a fresh `var`).
+
 #### Automatic const promotion
 
 You don't have to write `const` to get most of these benefits. A variable

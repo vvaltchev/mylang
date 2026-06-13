@@ -51,7 +51,7 @@
  * holding the constant value `v`. Reused by the auto-const folder below.
  */
 bool MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out,
-                               bool process_arrays);
+                               bool process_arrays, bool immutable = false);
 
 namespace {
 
