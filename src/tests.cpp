@@ -3064,6 +3064,31 @@ static const std::vector<test> tests =
         },
         &typeid(TypeErrorEx),
     },
+
+    {
+        "chr() round-trips across the [0, 255] range",
+        {
+            "assert(chr(65) == \"A\");",
+            "assert(ord(chr(0)) == 0);",
+            "assert(ord(chr(255)) == 255);",
+        },
+    },
+
+    {
+        "chr() rejects values above 255",
+        {
+            "chr(256);",
+        },
+        &typeid(InvalidValueEx),
+    },
+
+    {
+        "chr() rejects negative values",
+        {
+            "chr(-1);",
+        },
+        &typeid(InvalidValueEx),
+    },
 };
 
 static void

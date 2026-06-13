@@ -189,7 +189,15 @@ EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
     if (!val.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
-    char c = static_cast<char>(val.get<int_type>());
+    const int_type n = val.get<int_type>();
+
+    if (n < 0 || n > 255) {
+        throw InvalidValueEx(
+            "Expected an integer in the range [0, 255]", arg->start, arg->end
+        );
+    }
+
+    char c = static_cast<char>(n);
     return SharedStr(string(&c, 1));
 }
 
