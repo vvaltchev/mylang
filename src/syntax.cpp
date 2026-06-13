@@ -323,7 +323,7 @@ void FuncDeclStmt::serialize(ostream &s, int level) const
     if (id) {
 
         id->serialize(s, level + 1);
-        cout << endl;
+        s << endl;
 
     } else {
 
@@ -334,7 +334,7 @@ void FuncDeclStmt::serialize(ostream &s, int level) const
     if (captures) {
 
         captures->serialize(s, level + 1);
-        cout << endl;
+        s << endl;
 
     } else {
 
@@ -345,7 +345,7 @@ void FuncDeclStmt::serialize(ostream &s, int level) const
     if (params) {
 
         params->serialize(s, level + 1);
-        cout << endl;
+        s << endl;
 
     } else {
 
@@ -436,11 +436,11 @@ void TryCatchStmt::serialize(ostream &s, int level) const
         if (exList) {
 
             for (const unique_ptr<Identifier> &e : exList->elems) {
-                cout << e->get_str() << " ";
+                s << e->get_str() << " ";
             }
 
             if (asId) {
-                cout << "as " << asId->get_str() << " ";
+                s << "as " << asId->get_str() << " ";
             }
 
         } else {

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cstdlib>
+#include <sstream>
 
 #ifdef TESTS
 
@@ -3137,6 +3138,48 @@ dump_test_source(const test &t, int err_line)
     }
 }
 
+/*
+ * Some properties cannot be exercised through a source snippet in the table
+ * above (e.g. they involve C++-level APIs). They are checked here instead.
+ */
+struct extra_check {
+    const char *name;
+    bool (*fn)();
+};
+
+/*
+ * Regression check: a Construct must serialize into the stream it is given,
+ * not into cout. FuncDeclStmt and TryCatchStmt used to write to cout, so
+ * their output would be missing from a different target stream.
+ */
+static bool
+serialize_writes_to_given_stream()
+{
+    std::vector<Tok> tokens;
+    static const char *src[] = {
+        "func f(x) => x + 1;",
+        "try { f(1); } catch { }",
+    };
+
+    for (size_t i = 0; i < sizeof(src) / sizeof(src[0]); i++)
+        lexer(src[i], static_cast<int>(i + 1), tokens);
+
+    ParseContext pctx(TokenStream(tokens), true /* const eval */);
+    unique_ptr<Construct> root = pBlock(pctx);
+
+    std::ostringstream ss;
+    root->serialize(ss, 0);
+    const std::string out = ss.str();
+
+    return out.find("FuncDeclStmt") != std::string::npos &&
+           out.find("TryCatchStmt") != std::string::npos;
+}
+
+static const std::vector<extra_check> extra_checks =
+{
+    { "serialize() writes to the given stream", serialize_writes_to_given_stream },
+};
+
 void run_tests(bool dump_syntax_tree)
 {
     size_t pass_count = 0;
@@ -3161,12 +3204,31 @@ void run_tests(bool dump_syntax_tree)
         cout << endl << endl;
     }
 
+    for (const auto &ec : extra_checks) {
+
+        cout << "[ RUN  ] " << ec.name << endl;
+
+        if (ec.fn()) {
+
+            cout << "[ PASS ]";
+            pass_count++;
+
+        } else {
+
+            cout << "[ FAIL ]";
+        }
+
+        cout << endl << endl;
+    }
+
+    const size_t total = tests.size() + extra_checks.size();
+
     cout << "SUMMARY" << endl;
     cout << "===========================================" << endl;
-    cout << "Tests passed: " << pass_count << "/" << tests.size() << " ";
+    cout << "Tests passed: " << pass_count << "/" << total << " ";
 
 
-    if (pass_count != tests.size()) {
+    if (pass_count != total) {
         cout << "[ FAIL ]" << endl;
         exit(1);
     }
