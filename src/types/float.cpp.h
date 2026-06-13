@@ -11,6 +11,7 @@
 #include "defs.h"
 #include "evalvalue.h"
 #include <cmath>
+#include <limits>
 
 class TypeFloat : public Type {
 
@@ -150,5 +151,20 @@ string TypeFloat::to_string(const EvalValue &a) {
 
 size_t TypeFloat::hash(const EvalValue &a)
 {
-    return std::hash<float_type>()(a.get<float_type>());
+    const float_type v = a.get<float_type>();
+    const float_type int_min = static_cast<float_type>(
+        std::numeric_limits<int_type>::min()
+    );
+
+    /*
+     * An integer-valued float compares equal to the corresponding int
+     * (e.g. 1.0 == 1), so it must hash the same; otherwise the two would
+     * behave as distinct dictionary keys. int_min is -2^N (exactly
+     * representable in floating point), so [int_min, -int_min) is exactly
+     * the set of integral floats that fit in int_type.
+     */
+    if (std::isfinite(v) && v == truncl(v) && v >= int_min && v < -int_min)
+        return std::hash<int_type>()(static_cast<int_type>(v));
+
+    return std::hash<float_type>()(v);
 }

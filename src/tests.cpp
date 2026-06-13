@@ -2958,6 +2958,36 @@ static const std::vector<test> tests =
         },
         &typeid(InvalidTokenEx),
     },
+
+    {
+        "int and float compare equal symmetrically",
+        {
+            "assert(1 == 1.0);",
+            "assert(1.0 == 1);",
+            "assert((1 != 1.0) == 0);",
+            "assert((1.0 != 1) == 0);",
+            "assert(2 == 2.0);",
+            "assert(1 != 1.5);",
+            "assert(3.0 != 4);",
+            "assert((1 == 2.0) == 0);",
+        },
+    },
+
+    {
+        "int and float dict keys are unified",
+        {
+            "var d = {};",
+            "d[1] = 10;",
+            "d[1.0] = 20;",         /* same key as 1 */
+            "assert(len(d) == 1);",
+            "assert(d[1] == 20);",
+            "assert(d[1.0] == 20);",
+            "d[2.0] = 99;",
+            "d[2] = 7;",            /* same key as 2.0 */
+            "assert(len(d) == 2);",
+            "assert(d[2.0] == 7);",
+        },
+    },
 };
 
 static void

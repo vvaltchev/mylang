@@ -122,6 +122,11 @@ void TypeInt::eq(EvalValue &a, const EvalValue &b)
 
         a.get<int_type>() = a.get<int_type>() == b.get<int_type>();
 
+    } else if (b.is<float_type>()) {
+
+        /* Compare numerically, symmetrically with TypeFloat::eq */
+        a = static_cast<float_type>(a.get<int_type>()) == b.get<float_type>();
+
     } else {
 
         a = false;
@@ -133,6 +138,10 @@ void TypeInt::noteq(EvalValue &a, const EvalValue &b)
     if (b.is<int_type>()) {
 
         a.get<int_type>() = a.get<int_type>() != b.get<int_type>();
+
+    } else if (b.is<float_type>()) {
+
+        a = static_cast<float_type>(a.get<int_type>()) != b.get<float_type>();
 
     } else {
 
