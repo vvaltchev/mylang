@@ -4,6 +4,8 @@
 #include "eval.h"
 #include "syntax.h"
 
+#include <stdexcept>
+
 using std::string;
 
 ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
@@ -92,8 +94,15 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::integer) {
 
         const string s(c.get_str());
+        int_type ival;
 
-        v.reset(new LiteralInt(stol(s)));
+        try {
+            ival = stol(s);
+        } catch (const std::out_of_range &) {
+            throw SyntaxErrorEx(start, "Integer literal out of range");
+        }
+
+        v.reset(new LiteralInt(ival));
         v->start = start;
         v->end = c.get_loc() + (s.length() + 1);
         c++;
@@ -125,8 +134,15 @@ pAcceptLiteralFloat(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::floatnum) {
 
         const string s(c.get_str());
+        float_type fval;
 
-        v.reset(new LiteralFloat(stold(s)));
+        try {
+            fval = stold(s);
+        } catch (const std::out_of_range &) {
+            throw SyntaxErrorEx(start, "Float literal out of range");
+        }
+
+        v.reset(new LiteralFloat(fval));
         v->start = start;
         v->end = c.get_loc() + (s.length() + 1);
         c++;

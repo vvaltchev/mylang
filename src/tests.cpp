@@ -2877,6 +2877,22 @@ static const std::vector<test> tests =
             "assert(sum([], pure func(x) => x) == none);",
         },
     },
+
+    {
+        "integer literal out of range is a syntax error",
+        {
+            "var x = 99999999999999999999999999;",
+        },
+        &typeid(SyntaxErrorEx),
+    },
+
+    {
+        "float literal out of range is a syntax error",
+        {
+            "var x = 1e999999;",
+        },
+        &typeid(SyntaxErrorEx),
+    },
 };
 
 static void
