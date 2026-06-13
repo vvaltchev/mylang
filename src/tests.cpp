@@ -2893,6 +2893,19 @@ static const std::vector<test> tests =
         },
         &typeid(SyntaxErrorEx),
     },
+
+    {
+        "dict != non-dict is true (and == is false)",
+        {
+            "var d = {\"a\": 1};",
+            "assert(d != 5);",
+            "assert((d == 5) == 0);",
+            "assert(d != [1, 2]);",
+            "assert(d != \"x\");",
+            "assert((d != {\"a\": 1}) == 0);",
+            "assert(d != {\"a\": 2});",
+        },
+    },
 };
 
 static void

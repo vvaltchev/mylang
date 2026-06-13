@@ -55,7 +55,7 @@ void TypeDict::eq(EvalValue &a, const EvalValue &b)
 void TypeDict::noteq(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<shared_ptr<DictObject>>()) {
-        a = false;
+        a = true;
         return;
     }
 
