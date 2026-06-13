@@ -2988,6 +2988,26 @@ static const std::vector<test> tests =
             "assert(d[2.0] == 7);",
         },
     },
+
+    {
+        "equal-content slices of one array compare equal",
+        {
+            "var a = [7, 7, 7];",
+            "var s1 = a[0:2];",
+            "var s2 = a[1:3];",
+            /* Both slices share a's backing vector but have different offsets. */
+            "assert(intptr(s1) == intptr(a));",
+            "assert(intptr(s2) == intptr(a));",
+            "assert(s1 == s2);",
+            "assert((s1 != s2) == 0);",
+            /* Same backing vector, same offset: still equal. */
+            "assert(a[0:2] == a[0:2]);",
+            /* Different content at different offsets: not equal. */
+            "var b = [1, 2, 3];",
+            "assert(b[0:2] != b[1:3]);",
+            "assert((b[0:2] == b[1:3]) == 0);",
+        },
+    },
 };
 
 static void

@@ -168,9 +168,15 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
         return;
     }
 
-    if (&lhs.get_vec() == &rhs.get_vec()) {
-        /* Same vector, now just check the offsets */
-        a = lhs.offset() == rhs.offset();
+    if (&lhs.get_vec() == &rhs.get_vec() && lhs.offset() == rhs.offset()) {
+        /*
+         * Same vector AND same offset (sizes are already known equal): the two
+         * views cover the very same region, so they are necessarily equal.
+         * A different offset does NOT imply inequality, though: two slices of
+         * the same array can hold equal elements at different offsets, so in
+         * that case we must fall through to the element-by-element comparison.
+         */
+        a = true;
         return;
     }
 
