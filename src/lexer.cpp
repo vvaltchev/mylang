@@ -201,6 +201,12 @@ lexer_ctx::handle_space_or_op()
     if (isspace(c))
         return;
 
+    /*
+     * Capture the operator's starting column now: for a two-char operator
+     * `i` is advanced below, so computing the Loc afterwards would point at
+     * the operator's second char instead of its first.
+     */
+    const size_type op_col = i + 1;
     string_view op = in_str.substr(i, 1);
 
     if (i + 1 < in_str.length()) {
@@ -233,7 +239,7 @@ lexer_ctx::handle_space_or_op()
         }
     }
 
-    result.emplace_back(TokType::op, Loc(line, i+1), get_op_type(op));
+    result.emplace_back(TokType::op, Loc(line, op_col), get_op_type(op));
 }
 
 void

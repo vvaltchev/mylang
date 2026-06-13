@@ -24,6 +24,7 @@ struct test {
     const char *name;
     std::vector<const char *> source;
     const std::type_info *ex = nullptr;
+    int ex_col = 0; /* if non-zero, the expected column of the thrown exception */
 };
 
 static const std::vector<test> tests =
@@ -3020,6 +3021,17 @@ static const std::vector<test> tests =
             "assert(round(n) == 7.0);",
         },
     },
+
+    {
+        /* The error must point at the first char of the `==` operator
+           (col 7), not its second char. */
+        "two-char operator reports its first column",
+        {
+            "var x == 5;",
+        },
+        &typeid(SyntaxErrorEx),
+        7,
+    },
 };
 
 static void
@@ -3057,6 +3069,14 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
                 root->serialize(cout, 2);
                 cout << endl;
             }
+            return false;
+        }
+
+        if (t.ex_col && e.loc_start.col != t.ex_col) {
+
+            cout << "  Expected col: " << t.ex_col
+                 << ", got: " << e.loc_start.col << endl;
+            err_line = e.loc_start.line;
             return false;
         }
 
