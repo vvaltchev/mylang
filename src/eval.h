@@ -7,6 +7,7 @@
 #include "uniqueid.h"
 
 #include <map>
+#include <new>
 #include <string_view>
 
 class Identifier;
@@ -44,10 +45,57 @@ struct FlowState {
  * bitmask of which slots are currently defined - needed because undef() can
  * remove a binding and slots cannot hold the UndefinedId sentinel (LValue
  * forbids it). Slot count is capped at 64 so the mask fits a single word.
+ *
+ * The Frame lives on do_func_call's C++ stack. For the common case
+ * (frame_size <= INLINE_SLOTS) its slots are placement-constructed into an
+ * inline raw buffer, so a resolved call allocates nothing on the heap; only an
+ * unusually large frame spills to the heap vector. Crucially init() constructs
+ * EXACTLY frame_size slots (not INLINE_SLOTS), so a 1-slot frame pays for one
+ * slot, not eight - the unused inline capacity is just stack bytes. `slots`
+ * always points at whichever storage is active, so callers just index slots[i].
  */
 struct Frame {
-    std::vector<LValue> slots;
+    static constexpr int INLINE_SLOTS = 8;
+
+    alignas(LValue) char inline_buf[INLINE_SLOTS * sizeof(LValue)];
+    std::vector<LValue> heap_buf;        /* used only when frame_size > INLINE_SLOTS */
+    LValue *slots = nullptr;
+    int inline_count = 0;                /* # of slots placement-constructed in inline_buf */
     uint64_t live = 0;
+
+    Frame() = default;
+    Frame(const Frame &) = delete;       /* never copied; `slots` would dangle */
+    Frame(Frame &&) = delete;
+
+    /* Make `slots` point at storage holding exactly `frame_size` live slots. */
+    void init(int frame_size)
+    {
+        if (frame_size > INLINE_SLOTS) {
+
+            /* Rare: too big to fit inline, one heap allocation. */
+            heap_buf.resize(frame_size);
+            slots = heap_buf.data();
+
+        } else {
+
+            slots = reinterpret_cast<LValue *>(inline_buf);
+
+            for (int i = 0; i < frame_size; i++) {
+                new (&slots[i]) LValue();
+            }
+
+            inline_count = frame_size;
+        }
+    }
+
+    ~Frame()
+    {
+        /* Destroy only the inline slots we placement-constructed; heap_buf
+         * (if used) destroys its own elements. */
+        for (int i = 0; i < inline_count; i++) {
+            slots[i].~LValue();
+        }
+    }
 };
 
 class EvalContext {

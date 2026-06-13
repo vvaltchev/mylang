@@ -323,7 +323,7 @@ do_func_call(EvalContext *ctx,
     Frame frame;
 
     if (obj.func->resolved) {
-        frame.slots.assign(obj.func->frame_size, LValue(none, false));
+        frame.init(obj.func->frame_size);
         args_ctx.frame = &frame;
     }
 
