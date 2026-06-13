@@ -3089,6 +3089,19 @@ static const std::vector<test> tests =
         },
         &typeid(InvalidValueEx),
     },
+
+    {
+        "dict() keeps the last value for duplicate keys",
+        {
+            "var d = dict([[1, \"a\"], [1, \"b\"]]);",
+            "assert(len(d) == 1);",
+            "assert(d[1] == \"b\");",
+            "var d2 = dict([[\"x\", 1], [\"x\", 2], [\"y\", 3]]);",
+            "assert(len(d2) == 2);",
+            "assert(d2.x == 2);",
+            "assert(d2.y == 3);",
+        },
+    },
 };
 
 static void

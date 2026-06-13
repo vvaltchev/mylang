@@ -158,7 +158,11 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
             );
         }
 
-        data.emplace(
+        /*
+         * insert_or_assign (not emplace) so that on a duplicate key the
+         * later [key, value] pair wins, matching Python's dict().
+         */
+        data.insert_or_assign(
             pair_view[0].get(),
             LValue(pair_view[1].get(), false)
         );
