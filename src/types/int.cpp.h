@@ -39,43 +39,40 @@ public:
 };
 
 /*
- * For a float right-hand side, promote this integer to float and re-dispatch
- * to the float implementation of the same operation. This keeps int-OP-float
- * symmetric with float-OP-int and reuses TypeFloat's logic (including the
- * division-by-zero and fmod handling) instead of duplicating it.
+ * Note: these operators only ever see an int right-hand side. Mixed int/float
+ * operands are handled one level up by num_bin_op() (evalvalue.h), which
+ * promotes an int left operand to float before dispatching, so int-OP-float
+ * lands in TypeFloat. That keeps these methods purely about integers.
  */
-#define INT_PROMOTE_IF_FLOAT(a, b, op)                          \
-    do {                                                        \
-        if ((b).is<float_type>()) {                             \
-            (a) = static_cast<float_type>((a).get<int_type>()); \
-            (a).get_type()->op((a), (b));                       \
-            return;                                             \
-        }                                                       \
-        if (!(b).is<int_type>())                                \
-            throw TypeErrorEx("Expected numeric on the right side"); \
-    } while (0)
 
 void TypeInt::add(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, add);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
     a.get<int_type>() += b.get<int_type>();
 }
 
 void TypeInt::sub(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, sub);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
     a.get<int_type>() -= b.get<int_type>();
 }
 
 void TypeInt::mul(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, mul);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
     a.get<int_type>() *= b.get<int_type>();
 }
 
 void TypeInt::div(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, div);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
 
     if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
@@ -85,7 +82,8 @@ void TypeInt::div(EvalValue &a, const EvalValue &b)
 
 void TypeInt::mod(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, mod);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
 
     if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
@@ -95,40 +93,41 @@ void TypeInt::mod(EvalValue &a, const EvalValue &b)
 
 void TypeInt::lt(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, lt);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
     a.get<int_type>() = a.get<int_type>() < b.get<int_type>();
 }
 
 void TypeInt::gt(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, gt);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
     a.get<int_type>() = a.get<int_type>() > b.get<int_type>();
 }
 
 void TypeInt::le(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, le);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
     a.get<int_type>() = a.get<int_type>() <= b.get<int_type>();
 }
 
 void TypeInt::ge(EvalValue &a, const EvalValue &b)
 {
-    INT_PROMOTE_IF_FLOAT(a, b, ge);
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
     a.get<int_type>() = a.get<int_type>() >= b.get<int_type>();
 }
-
-#undef INT_PROMOTE_IF_FLOAT
 
 void TypeInt::eq(EvalValue &a, const EvalValue &b)
 {
     if (b.is<int_type>()) {
 
         a.get<int_type>() = a.get<int_type>() == b.get<int_type>();
-
-    } else if (b.is<float_type>()) {
-
-        /* Compare numerically, symmetrically with TypeFloat::eq */
-        a = static_cast<float_type>(a.get<int_type>()) == b.get<float_type>();
 
     } else {
 
@@ -141,10 +140,6 @@ void TypeInt::noteq(EvalValue &a, const EvalValue &b)
     if (b.is<int_type>()) {
 
         a.get<int_type>() = a.get<int_type>() != b.get<int_type>();
-
-    } else if (b.is<float_type>()) {
-
-        a = static_cast<float_type>(a.get<int_type>()) != b.get<float_type>();
 
     } else {
 

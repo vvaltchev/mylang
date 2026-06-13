@@ -3132,6 +3132,18 @@ static const std::vector<test> tests =
         },
         &typeid(DivisionByZeroEx),
     },
+
+    {
+        /* Exercises mixed int/float promotion via EvalValue's comparison
+           operators (sort/min/max), not just the expression evaluator. */
+        "mixed int/float ordering via sort/min/max",
+        {
+            "var a = [3, 1.5, 2, 0];",
+            "assert(min(a) == 0);",
+            "assert(max(a) == 3);",
+            "assert(sort(clone(a)) == [0, 1.5, 2, 3]);",
+        },
+    },
 };
 
 static void

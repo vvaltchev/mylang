@@ -440,13 +440,13 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::times:
-                val.get_type()->mul(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::mul);
                 break;
             case Op::div:
-                val.get_type()->div(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::div);
                 break;
             case Op::mod:
-                val.get_type()->mod(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::mod);
                 break;
             default:
                 throw InternalErrorEx();
@@ -466,10 +466,10 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::plus:
-                val.get_type()->add(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::add);
                 break;
             case Op::minus:
-                val.get_type()->sub(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::sub);
                 break;
             default:
                 throw InternalErrorEx();
@@ -489,16 +489,16 @@ EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::lt:
-                val.get_type()->lt(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::lt);
                 break;
             case Op::gt:
-                val.get_type()->gt(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::gt);
                 break;
             case Op::le:
-                val.get_type()->le(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::le);
                 break;
             case Op::ge:
-                val.get_type()->ge(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::ge);
                 break;
             default:
                 throw InternalErrorEx();
@@ -518,10 +518,10 @@ EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::eq:
-                val.get_type()->eq(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::eq);
                 break;
             case Op::noteq:
-                val.get_type()->noteq(val, RValue(e->eval(ctx)));
+                num_bin_op(val, RValue(e->eval(ctx)), &Type::noteq);
                 break;
             default:
                 throw InternalErrorEx();
@@ -589,19 +589,19 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
 
         switch (op) {
             case Op::addeq:
-                newVal.get_type()->add(newVal, RValue(rval));
+                num_bin_op(newVal, RValue(rval), &Type::add);
                 break;
             case Op::subeq:
-                newVal.get_type()->sub(newVal, RValue(rval));
+                num_bin_op(newVal, RValue(rval), &Type::sub);
                 break;
             case Op::muleq:
-                newVal.get_type()->mul(newVal, RValue(rval));
+                num_bin_op(newVal, RValue(rval), &Type::mul);
                 break;
             case Op::diveq:
-                newVal.get_type()->div(newVal, RValue(rval));
+                num_bin_op(newVal, RValue(rval), &Type::div);
                 break;
             case Op::modeq:
-                newVal.get_type()->mod(newVal, RValue(rval));
+                num_bin_op(newVal, RValue(rval), &Type::mod);
                 break;
             default:
                 throw InternalErrorEx();

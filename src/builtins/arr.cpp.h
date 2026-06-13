@@ -422,7 +422,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
         EvalValue val = view[0].get();
 
         for (size_type i = 1; i < view.size(); i++) {
-            val.get_type()->add(val, view[i].get());
+            num_bin_op(val, view[i].get(), &Type::add);
         }
 
         return val;
@@ -439,9 +439,10 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
         EvalValue val = eval_func(ctx, funcObj, view[0].get());
 
         for (size_type i = 1; i < view.size(); i++) {
-            val.get_type()->add(
+            num_bin_op(
                 val,
-                eval_func(ctx, funcObj, view[i].get())
+                eval_func(ctx, funcObj, view[i].get()),
+                &Type::add
             );
         }
 

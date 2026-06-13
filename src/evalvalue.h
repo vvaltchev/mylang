@@ -55,6 +55,23 @@ template <> struct TypeToEnum<SharedArrayObj> { enum { val = Type::t_arr }; };
 template <> struct TypeToEnum<shared_ptr<ExceptionObject>> { enum { val = Type::t_ex }; };
 template <> struct TypeToEnum<shared_ptr<DictObject>> { enum { val = Type::t_dict }; };
 
+/*
+ * Binary-operation dispatch with int -> float promotion.
+ *
+ * Binary ops dispatch on the LEFT operand's type, and TypeFloat already
+ * accepts an int right operand, so the only combination the type classes do
+ * not handle themselves is an int left operand with a float right operand:
+ * promote the left to float so the call lands in TypeFloat and int-OP-float
+ * behaves exactly like float-OP-int. This is the single place mixed int/float
+ * promotion happens; it is used for arithmetic and for comparison (including
+ * == / !=). It is a no-op for any non-(int,float) operand pair, so string,
+ * array, dict, etc. comparisons are dispatched unchanged.
+ *
+ * Defined out-of-line below, once EvalValue is a complete type.
+ */
+using NumBinOp = void (Type::*)(EvalValue &, const EvalValue &);
+void num_bin_op(EvalValue &a, const EvalValue &b, NumBinOp op);
+
 class EvalValue final {
 
     /*
@@ -193,42 +210,42 @@ public:
     bool operator==(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
-        tmp.type->eq(tmp, rhs);
+        num_bin_op(tmp, rhs, &Type::eq);
         return tmp.get<int_type>() != 0;
     }
 
     bool operator!=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
-        tmp.type->noteq(tmp, rhs);
+        num_bin_op(tmp, rhs, &Type::noteq);
         return tmp.get<int_type>() != 0;
     }
 
     bool operator<(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
-        tmp.type->lt(tmp, rhs);
+        num_bin_op(tmp, rhs, &Type::lt);
         return tmp.get<int_type>() != 0;
     }
 
     bool operator<=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
-        tmp.type->le(tmp, rhs);
+        num_bin_op(tmp, rhs, &Type::le);
         return tmp.get<int_type>() != 0;
     }
 
     bool operator>(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
-        tmp.type->gt(tmp, rhs);
+        num_bin_op(tmp, rhs, &Type::gt);
         return tmp.get<int_type>() != 0;
     }
 
     bool operator>=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
-        tmp.type->ge(tmp, rhs);
+        num_bin_op(tmp, rhs, &Type::ge);
         return tmp.get<int_type>() != 0;
     }
 
@@ -385,6 +402,15 @@ inline EvalValue &EvalValue::operator=(EvalValue &&other)
 inline EvalValue::~EvalValue()
 {
     destroy_val();
+}
+
+inline void
+num_bin_op(EvalValue &a, const EvalValue &b, NumBinOp op)
+{
+    if (a.is<int_type>() && b.is<float_type>())
+        a = static_cast<float_type>(a.get<int_type>());
+
+    (a.get_type()->*op)(a, b);
 }
 
 
