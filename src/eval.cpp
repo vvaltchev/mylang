@@ -288,6 +288,9 @@ do_func_call(EvalContext *ctx,
                     /* Optimization: skip ReturnEx and eval the result directly */
                     ReturnStmt *ret = static_cast<ReturnStmt *>(e.get());
 
+                    if (!ret->elem)
+                        return none; /* A value-less `return;` returns none */
+
                     return do_func_return(
                         ret->elem->eval(&args_ctx),
                         ret->elem.get()

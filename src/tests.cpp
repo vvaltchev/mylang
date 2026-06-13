@@ -2855,6 +2855,17 @@ static const std::vector<test> tests =
             "assert(a == [1, 2, 3, 99]);",
         },
     },
+
+    {
+        "value-less return statement returns none",
+        {
+            "func f() { return; }",
+            "assert(f() == none);",
+            "func g(x) { if (x) return 10; return; }",
+            "assert(g(1) == 10);",
+            "assert(g(0) == none);",
+        },
+    },
 };
 
 static void
