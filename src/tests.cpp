@@ -2919,6 +2919,17 @@ static const std::vector<test> tests =
             "assert(rstrip(lines[1]) == \"cc\");",
         },
     },
+
+    {
+        /* The C++ literals below encode mylang source with backslash escapes. */
+        "escaped backslash in string literals",
+        {
+            "assert(len(\"\\\\\") == 1);",        /* mylang: len("\\") == 1  */
+            "assert(len(\"a\\\\b\") == 3);",      /* mylang: len("a\\b") == 3 */
+            "assert(len(\"\\\"\") == 1);",        /* mylang: len("\"") == 1  */
+            "assert(\"\\n\" != \"n\");",          /* mylang: "\n" != "n"     */
+        },
+    },
 };
 
 static void

@@ -171,8 +171,14 @@ lexer_ctx::handle_in_str()
         if (i == in_str.length() - 1)
             invalid_token();
 
-        if (in_str[i + 1] == '"')
-            i++; /* ignore \" instead of ending the token */
+        /*
+         * Skip the escaped char, whatever it is, so it cannot end the
+         * string. In particular `\\` must consume the second backslash,
+         * otherwise it would later be treated as an escape and could
+         * swallow the closing quote. This matches unescape_str(), which
+         * treats `\X` as a 2-char unit for every X.
+         */
+        i++;
     }
 }
 
