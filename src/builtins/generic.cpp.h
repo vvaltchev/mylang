@@ -108,6 +108,66 @@ EvalValue builtin_runtime(EvalContext *ctx, ExprList *exprList)
     return RValue(exprList->elems[0]->eval(ctx));
 }
 
+/*
+ * isconst(expr) / isconstdecl(expr): compile-time introspection, normally
+ * resolved (folded to a literal) by the auto-const pass - see resolver.cpp.
+ * isconst() is true when `expr` is *effectively* constant (a literal, an
+ * explicit `const`, a const expression, an auto-const var, or a const /
+ * auto-const param); isconstdecl() is true only when `expr` is const by *decl*
+ * (explicit `const`/const expression), i.e. NOT merely via auto-const. These
+ * runtime bodies are conservative fallbacks for the rare case the call survives
+ * to runtime (e.g. inside an unresolved function): they report the parse-time
+ * const flag of the argument.
+ */
+EvalValue builtin_isconst(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    return exprList->elems[0]->is_const;
+}
+
+EvalValue builtin_isconstdecl(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    return exprList->elems[0]->is_const;
+}
+
+/*
+ * ispure(func) / ispuredecl(func): true if `func` evaluates to a function
+ * object that is effectively pure (explicitly `pure`, OR proven pure by the
+ * resolver), resp. *explicitly* declared `pure`. The arg is evaluated.
+ */
+EvalValue builtin_ispure(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &v = RValue(arg->eval(ctx));
+
+    if (!v.is<shared_ptr<FuncObject>>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    return v.get<shared_ptr<FuncObject>>()->func->effective_pure;
+}
+
+EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &v = RValue(arg->eval(ctx));
+
+    if (!v.is<shared_ptr<FuncObject>>())
+        throw TypeErrorEx(arg->start, arg->end);
+
+    return v.get<shared_ptr<FuncObject>>()->func->explicit_pure;
+}
+
 EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)

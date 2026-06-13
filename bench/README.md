@@ -179,6 +179,11 @@ both languages on the inputs used. These are straight speed comparisons.
   folding. These are among the cases where MyLang is several times *faster* than
   CPython (~0.3–0.4× here). `runtime(x)` opts an expression back out of folding.
 
+- **Auto-pure folding** (`51_purefunc_fold`). Plain `func`s with no side effects
+  are auto-promoted to *pure*, so their constant-argument calls fold to
+  literals; the loop-invariant result collapses to one literal while CPython
+  actually calls the functions every iteration. ~0.38× here.
+
 (The reverse case — Python-only constructs — is deliberately *not* benchmarked,
 since the goal is to measure MyLang's constructs, not Python's.)
 
@@ -241,8 +246,9 @@ Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 | 48_const_fold | 0.125 | — | — | MyLang-only (parse-time folding) |
 | 49_autoconst_fold | 0.30 | 0.82 | 0.37× | write-once `var`s folded away |
 | 50_autoconst_dce | 0.32 | 1.03 | 0.31× | constant guard + dead branch gone |
+| 51_purefunc_fold | 0.27 | 0.70 | 0.38× | auto-pure const-arg calls folded |
 
-**geomean: ~1.3× slower** across the 49 paired benchmarks (this box, CPython
+**geomean: ~1.3× slower** across the 50 paired benchmarks (this box, CPython
 3.14). MyLang is *faster* on several (`28_str_concat` 0.01×,
 `50_autoconst_dce` 0.31×, `15_array_slice_readonly` 0.37×, `49_autoconst_fold`
 0.37×, `39_find_builtin` 0.52×, `26_dict_iterate` 0.74×, `01_while_loop` 0.90×)

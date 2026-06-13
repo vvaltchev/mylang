@@ -474,12 +474,22 @@ public:
      * `slot_writes[i]` counts how many times slot i is written in the body: for
      * a param that's body reassignments only (so 0 == never reassigned); for a
      * local it includes the declaration (so 1 == declared once, never
-     * reassigned == write-once). Slots 0..params-1 are the params. This is
-     * groundwork for the planned auto-const detection pass.
+     * reassigned == write-once). Slots 0..params-1 are the params. Used by the
+     * auto-const folder and to detect auto-const parameters.
      */
     bool resolved = false;
     int frame_size = 0;
     std::vector<int> slot_writes;
+
+    /*
+     * Purity. `explicit_pure` is set by the parser for a `pure func`.
+     * `effective_pure` is `explicit_pure` OR a function the resolver proves
+     * effectively pure (reads only consts + its params, calls only const
+     * builtins / pure funcs, no captures). isconst()/ispure() read these; an
+     * effectively-pure function's calls fold when given constant arguments.
+     */
+    bool explicit_pure = false;
+    bool effective_pure = false;
 
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
