@@ -438,7 +438,7 @@ public:
     /*
      * Default: an unbound `none` slot. Needed so Frame (eval.h) can hold an
      * inline array of slots; the value is always `none` here, so type_checks()
-     * would trivially pass and is skipped to keep this cheap (it runs per slot).
+     * would trivially pass and is skipped to keep this cheap (runs per slot).
      */
     LValue() : val(), is_const(false), container(nullptr) { }
 
