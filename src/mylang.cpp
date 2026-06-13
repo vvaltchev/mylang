@@ -5,6 +5,7 @@
 #include "lexer.h"
 #include "syntax.h"
 #include "eval.h"
+#include "resolver.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -267,7 +268,8 @@ int main(int argc, char **argv)
             );
 
         if (!opt_no_run) {
-            /* Run the script */
+            /* Resolve names to slots, then run the script */
+            resolve_names(root.get());
             root->eval(nullptr);
         }
 
