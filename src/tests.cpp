@@ -26,7 +26,17 @@ struct test {
     const char *name;
     std::vector<const char *> source;
     const std::type_info *ex = nullptr;
-    int ex_col = 0; /* if non-zero, the expected column of the thrown exception */
+
+    /*
+     * Expected source location of the thrown exception. Each field is checked
+     * only when non-zero, so tests can pin as much of the caret span as they
+     * care about. ex_col/ex_line are loc_start; ex_col_end/ex_line_end are
+     * loc_end (the column one past the last marked char + 1).
+     */
+    int ex_col = 0;
+    int ex_line = 0;
+    int ex_col_end = 0;
+    int ex_line_end = 0;
 };
 
 static const std::vector<test> tests =
@@ -1562,6 +1572,90 @@ static const std::vector<test> tests =
             "func loud(x) { print(x); return x; }",
             "assert(!ispure(usesg) && !ispure(loud));",
         },
+    },
+
+    /*
+     * Error-reporting / caret precision. The ex_col/ex_col_end fields pin the
+     * exact source span the error points at (the "^^^" run); ex_line/
+     * ex_line_end pin multi-line spans. See the `test` struct.
+     */
+    {
+        "err loc: undefined var marks the variable, not the `=`",
+        { "var y = foobar;" },
+        &typeid(UndefinedVariableEx), 9, 0, 16, 0,
+    },
+    {
+        "err loc: undefined operand inside a binary expression",
+        { "var z = 10 + missing + 20;" },
+        &typeid(UndefinedVariableEx), 14, 0, 22, 0,
+    },
+    {
+        "err loc: type error marks the offending operand",
+        { "var s = 5; var c = s + runtime(\"x\");" },
+        &typeid(TypeErrorEx), 24, 0, 37, 0,
+    },
+    {
+        "err loc: division by zero marks the divisor",
+        { "var s = 100; var c = s / runtime(0);" },
+        &typeid(DivisionByZeroEx), 26, 0, 37, 0,
+    },
+    {
+        "err loc: calling a defined non-function is NotCallable",
+        { "var x = 5; x(1, 2);" },
+        &typeid(NotCallableEx), 12, 0, 14, 0,
+    },
+    {
+        "err loc: undefined callee marks the callee, not the whole call",
+        { "var z = undefined_fn(1, 2);" },
+        &typeid(UndefinedVariableEx), 9, 0, 22, 0,
+    },
+    {
+        "err loc: out-of-bounds marks the subscript, not the assignment",
+        { "var a = [1, 2, 3]; var x = a[runtime(5)];" },
+        &typeid(OutOfBoundsEx), 28, 0, 42, 0,
+    },
+    {
+        "err loc: a var passed to append stays an lvalue (TypeError there)",
+        { "var a = 3; append(a, 10);" },
+        &typeid(TypeErrorEx), 19, 0, 21, 0,
+    },
+    {
+        "err loc: uncaught user exception points at the throw",
+        { "throw ex(\"Boom\", 42);" },
+        &typeid(ExceptionObject), 1, 0, 21, 0,
+    },
+    {
+        "err loc: multi-line - undefined var on a continuation line",
+        {
+            "var total =",
+            "    10 +",
+            "    missing_var +",
+            "    20;",
+        },
+        &typeid(UndefinedVariableEx), 5, 3, 17, 3,
+    },
+    {
+        "err loc: multi-line - an operand spanning lines",
+        {
+            "var c = 5 + [10,",
+            "             20];",
+        },
+        &typeid(TypeErrorEx), 13, 1, 18, 2,
+    },
+    {
+        "err loc: break outside a loop is a clear parse error",
+        { "break;" },
+        &typeid(SyntaxErrorEx), 1, 0, 0, 0,
+    },
+    {
+        "err loc: return outside a function is a clear parse error",
+        { "return 5;" },
+        &typeid(SyntaxErrorEx), 1, 0, 0, 0,
+    },
+    {
+        "err loc: rethrow outside a catch is a clear parse error",
+        { "rethrow;" },
+        &typeid(SyntaxErrorEx), 1, 0, 0, 0,
     },
 
     {
@@ -3386,12 +3480,22 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
             return false;
         }
 
-        if (t.ex_col && e.loc_start.col != t.ex_col) {
+        const struct {
+            const char *what; int expected; int got;
+        } locChecks[] = {
+            { "loc_start.col",  t.ex_col,      e.loc_start.col  },
+            { "loc_start.line", t.ex_line,     e.loc_start.line },
+            { "loc_end.col",    t.ex_col_end,  e.loc_end.col    },
+            { "loc_end.line",   t.ex_line_end, e.loc_end.line   },
+        };
 
-            cout << "  Expected col: " << t.ex_col
-                 << ", got: " << e.loc_start.col << endl;
-            err_line = e.loc_start.line;
-            return false;
+        for (const auto &lc : locChecks) {
+            if (lc.expected && lc.got != lc.expected) {
+                cout << "  Expected " << lc.what << ": " << lc.expected
+                     << ", got: " << lc.got << endl;
+                err_line = e.loc_start.line;
+                return false;
+            }
         }
 
         return true;

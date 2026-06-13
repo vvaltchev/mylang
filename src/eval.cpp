@@ -399,9 +399,21 @@ EvalValue eval_func(EvalContext *ctx,
     return do_func_call(ctx, obj, args);
 }
 
+static void stamp_operand_loc(const Construct *c, Exception &e);
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
-    const EvalValue &callable = RValue(what->eval(ctx));
+    EvalValue callable_storage;
+
+    /* Point an undefined-callee error at the callee, not the whole call. */
+    try {
+        callable_storage = RValue(what->eval(ctx));
+    } catch (Exception &e) {
+        stamp_operand_loc(what.get(), e);
+        throw;
+    }
+
+    const EvalValue &callable = callable_storage;
 
     try {
 
@@ -444,16 +456,63 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     return SharedArrayObj(move(vec));
 }
 
+/*
+ * Attach `c`'s source location to an in-flight exception that has none, so a
+ * caret points at the offending sub-expression (operand) instead of the whole
+ * enclosing expression. Used wherever an operand's RValue or operator
+ * application can throw (undefined variable, type mismatch, division by zero).
+ */
+static void
+stamp_operand_loc(const Construct *c, Exception &e)
+{
+    if (!e.loc_start) {
+        e.loc_start = c->start;
+        e.loc_end = c->end;
+    }
+}
+
+/* `acc OP= operand`, with operand-precise error locations. */
+static void
+num_binop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx,
+              NumBinOp op)
+{
+    try {
+        num_bin_op(acc, RValue(operand->eval(ctx)), op);
+    } catch (Exception &e) {
+        stamp_operand_loc(operand, e);
+        throw;
+    }
+}
+
+/* Same, for the short-circuiting logical operators (&& and ||). */
+static void
+logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx, Op op)
+{
+    try {
+        if (op == Op::land)
+            acc.get_type()->land(acc, RValue(operand->eval(ctx)));
+        else
+            acc.get_type()->lor(acc, RValue(operand->eval(ctx)));
+    } catch (Exception &e) {
+        stamp_operand_loc(operand, e);
+        throw;
+    }
+}
+
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 {
     assert(elems.size() >= 1 && elems[0].first == Op::invalid);
 
-    const EvalValue &val = elems[0].second->eval(ctx);
+    if (elems.size() == 1)
+        return elems[0].second->eval(ctx);
 
-    if (elems.size() > 1)
-        return RValue(val);
-
-    return val;
+    /* Stamp the first operand's loc on an undefined-variable error. */
+    try {
+        return RValue(elems[0].second->eval(ctx));
+    } catch (Exception &e) {
+        stamp_operand_loc(elems[0].second.get(), e);
+        throw;
+    }
 }
 
 EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
@@ -464,25 +523,32 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
     if (op == Op::invalid)
         return e->eval(ctx);
 
-    EvalValue &&val = RValue(e->eval(ctx)).clone();
+    try {
 
-    switch (op) {
-        case Op::plus:
-            /* Unary operator '+': do nothing */
-            break;
-        case Op::minus:
-            /* Unary operator '-': negate */
-            val.get_type()->opneg(val);
-            break;
-        case Op::lnot:
-            /* Unary operator '!': logial not */
-            val.get_type()->lnot(val);
-            break;
-        default:
-            throw InternalErrorEx();
+        EvalValue &&val = RValue(e->eval(ctx)).clone();
+
+        switch (op) {
+            case Op::plus:
+                /* Unary operator '+': do nothing */
+                break;
+            case Op::minus:
+                /* Unary operator '-': negate */
+                val.get_type()->opneg(val);
+                break;
+            case Op::lnot:
+                /* Unary operator '!': logial not */
+                val.get_type()->lnot(val);
+                break;
+            default:
+                throw InternalErrorEx();
+        }
+
+        return move(val);
+
+    } catch (Exception &ex) {
+        stamp_operand_loc(e.get(), ex);
+        throw;
     }
-
-    return move(val);
 }
 
 EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
@@ -495,13 +561,13 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::times:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::mul);
+                num_binop_loc(val, e.get(), ctx, &Type::mul);
                 break;
             case Op::div:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::div);
+                num_binop_loc(val, e.get(), ctx, &Type::div);
                 break;
             case Op::mod:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::mod);
+                num_binop_loc(val, e.get(), ctx, &Type::mod);
                 break;
             default:
                 throw InternalErrorEx();
@@ -521,10 +587,10 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::plus:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::add);
+                num_binop_loc(val, e.get(), ctx, &Type::add);
                 break;
             case Op::minus:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::sub);
+                num_binop_loc(val, e.get(), ctx, &Type::sub);
                 break;
             default:
                 throw InternalErrorEx();
@@ -544,16 +610,16 @@ EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::lt:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::lt);
+                num_binop_loc(val, e.get(), ctx, &Type::lt);
                 break;
             case Op::gt:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::gt);
+                num_binop_loc(val, e.get(), ctx, &Type::gt);
                 break;
             case Op::le:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::le);
+                num_binop_loc(val, e.get(), ctx, &Type::le);
                 break;
             case Op::ge:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::ge);
+                num_binop_loc(val, e.get(), ctx, &Type::ge);
                 break;
             default:
                 throw InternalErrorEx();
@@ -573,10 +639,10 @@ EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::eq:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::eq);
+                num_binop_loc(val, e.get(), ctx, &Type::eq);
                 break;
             case Op::noteq:
-                num_bin_op(val, RValue(e->eval(ctx)), &Type::noteq);
+                num_binop_loc(val, e.get(), ctx, &Type::noteq);
                 break;
             default:
                 throw InternalErrorEx();
@@ -596,7 +662,7 @@ EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::land:
-                val.get_type()->land(val, RValue(e->eval(ctx)));
+                logop_loc(val, e.get(), ctx, op);
                 break;
             default:
                 throw InternalErrorEx();
@@ -616,7 +682,7 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::lor:
-                val.get_type()->lor(val, RValue(e->eval(ctx)));
+                logop_loc(val, e.get(), ctx, op);
                 break;
             default:
                 throw InternalErrorEx();
@@ -767,7 +833,17 @@ handle_single_expr14(EvalContext *ctx,
 EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 {
     const bool inDecl = fl & pFlags::pInDecl;
-    const EvalValue &rval = RValue(rvalue->eval(ctx));
+
+    /* Evaluate the rhs first; point errors (undefined var, ...) at the rhs
+     * itself, not at the whole `lhs = rhs` assignment. */
+    EvalValue rval_storage;
+    try {
+        rval_storage = RValue(rvalue->eval(ctx));
+    } catch (Exception &e) {
+        stamp_operand_loc(rvalue.get(), e);
+        throw;
+    }
+    const EvalValue &rval = rval_storage;
     IdList *idlist = nullptr;
 
     if (lvalue->is_idlist())

@@ -161,36 +161,63 @@ parse_args(int argc, char **argv)
     }
 }
 
+/*
+ * Print one source line with a caret row underneath marking columns [from, to]
+ * (1-based, inclusive). Leading whitespace is reproduced verbatim so tabs line
+ * up. `to == 0` means "to the end of the line".
+ */
+static void
+dumpLineWithCaret(const string &ln, int from, int to)
+{
+    if (from < 1)
+        from = 1;
+    if (to == 0 || to > static_cast<int>(ln.length()))
+        to = static_cast<int>(ln.length());
+
+    cerr << "    " << ln << endl << "    ";
+
+    for (int i = 1; i < from; i++)
+        cerr << (i - 1 < static_cast<int>(ln.length()) && isspace(ln[i - 1])
+                     ? ln[i - 1] : ' ');
+
+    cerr << string(std::max(1, to - from + 1), '^') << endl;
+}
+
 static void
 dumpLocInError(const Exception &e)
 {
-    if (e.loc_start.col) {
-
-        cerr << " at line "
-             << e.loc_start.line
-             << ", col "
-             << e.loc_start.col;
-
-        if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
-            cerr << ":" << e.loc_end.col - 1;
-
-        const string &ln = lines[e.loc_start.line - 1];
-
-        cerr << endl << endl;
-        cerr << "    " << ln << endl;
-        cerr << "    ";
-
-        for (int i = 0; i < e.loc_start.col - 1; i++) {
-            cerr << (isspace(ln[i]) ? ln[i] : ' ');
-        }
-
-        if (e.loc_end.col && e.loc_end.line == e.loc_start.line)
-            cerr << string(std::max(1, e.loc_end.col - e.loc_start.col - 1), '^');
-        else
-            cerr << "^";
+    if (!e.loc_start.col) {
+        cerr << endl;
+        return;
     }
 
-    cerr << endl;
+    cerr << " at line " << e.loc_start.line << ", col " << e.loc_start.col;
+
+    /* loc_end.col is one past the last char + 1, so the last char is at
+     * loc_end.col - 2 and the printed end column is loc_end.col - 1. */
+    const bool have_end =
+        e.loc_end.col != 0 && e.loc_end.line >= e.loc_start.line;
+    const int end_line = have_end ? e.loc_end.line : e.loc_start.line;
+    const int end_col = have_end ? e.loc_end.col - 2 : 0;
+
+    if (have_end) {
+        if (e.loc_end.line == e.loc_start.line)
+            cerr << ":" << e.loc_end.col - 1;
+        else
+            cerr << " to line " << e.loc_end.line
+                 << ", col " << e.loc_end.col - 1;
+    }
+
+    cerr << endl << endl;
+
+    for (int ln = e.loc_start.line;
+         ln <= end_line && ln <= static_cast<int>(lines.size());
+         ln++) {
+
+        const int from = (ln == e.loc_start.line) ? e.loc_start.col : 1;
+        const int to = (ln == end_line) ? end_col : 0;   /* 0 == end of line */
+        dumpLineWithCaret(lines[ln - 1], from, to);
+    }
 }
 
 static void
@@ -296,7 +323,14 @@ int main(int argc, char **argv)
 
     } catch (const ExceptionObject &e) {
 
-        cerr << "Uncaught dynamic exception: '" << e.get_name() << "'" << endl;
+        cerr << "Uncaught exception '" << e.get_name() << "'";
+
+        const EvalValue &data = e.get_data();
+
+        if (!data.is<NoneVal>())
+            cerr << ", data: " << data.get_type()->to_string(data);
+
+        dumpLocInError(e);
         return 1;
 
     } catch (const Exception &e) {

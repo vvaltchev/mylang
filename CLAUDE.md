@@ -625,6 +625,39 @@ and two macros:
 - Always pass `Loc start, end` to thrown exceptions where you can, so
   `mylang.cpp` can render the caret.
 
+### Error location & caret rendering
+
+- **A `Loc`'s `end` is "last-char-column + 2"**, so the caret width is
+  `loc_end.col - loc_start.col - 1` (and the printed end column is
+  `loc_end.col - 1`). A construct that ends with a closing token sets
+  `end = <that token's loc> + 2` (e.g. `CallExpr`/`Subscript`/`Slice` through
+  their `)`/`]`, array/dict literals through `]`/`}`). Keep this convention when
+  adding constructs, or carets will be off by one or two.
+- **`Construct::eval`** stamps a node's `start`/`end` onto any escaping
+  exception that has no loc yet — so an error gets the loc of the *innermost*
+  node whose `eval` it traversed. Because `RValue()` and the type ops throw with
+  *no* loc, that used to be the whole enclosing expression. The operator ladder
+  (`eval.cpp`) now routes operand evaluation through `num_binop_loc` /
+  `logop_loc` / `stamp_operand_loc`, and `Expr14`/`CallExpr` wrap their
+  rhs/callee evals, so undefined-variable / type / division errors point at the
+  **offending operand** (e.g. `var y = foobar` marks `foobar`, not `y =`).
+- **Multi-line spans**: `dumpLocInError` (`mylang.cpp`) renders every source
+  line in `[loc_start.line, loc_end.line]` with a caret row per line (start from
+  `loc_start.col` to EOL, full middle lines, end line up to `loc_end`).
+- **Context keywords**: `break`/`continue`/`return`/`rethrow` outside their
+  valid context (gated by `pFlags` in `pStmt`) raise a clear `SyntaxErrorEx`
+  ("... only allowed in a loop", etc.), not a generic "unexpected token".
+- **Not-callable vs undefined**: a var used as a callee is excluded from
+  auto-const promotion (`prescan_blocked` blocks `CallExpr::what`), so calling a
+  defined non-function reports `NotCallableEx`, not a bogus "undefined var".
+- **Uncaught user exceptions** print their throw-site loc + caret and their
+  payload (`mylang.cpp`'s `ExceptionObject` handler uses `get_data()`).
+- **Tests** pin caret spans via the `test` struct's
+  `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
+  see the "err loc:" tests in `tests.cpp`). There is **no backtrace** yet — see
+  the planned-inlining note (error reporting for inlined/called frames is the
+  open question to settle before adding one).
+
 ## Recipes
 
 ### Adding a builtin
