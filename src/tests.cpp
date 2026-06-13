@@ -2906,6 +2906,19 @@ static const std::vector<test> tests =
             "assert(d != {\"a\": 2});",
         },
     },
+
+    {
+        "writelines() respects array slice bounds",
+        {
+            "var a = [\"aa\", \"bb\", \"cc\", \"dd\", \"ee\"];",
+            "var s = a[1:3];",
+            "writelines(s, \"test_io_writelines.tmp\");",
+            "var lines = readlines(\"test_io_writelines.tmp\");",
+            "assert(len(lines) == 2);",
+            "assert(rstrip(lines[0]) == \"bb\");",
+            "assert(rstrip(lines[1]) == \"cc\");",
+        },
+    },
 };
 
 static void

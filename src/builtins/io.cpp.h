@@ -168,10 +168,10 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
         s = &fs;
     }
 
-    const SharedArrayObj::vec_type &vec = val.get<SharedArrayObj>().get_vec();
+    const ArrayConstView &view = val.get<SharedArrayObj>().get_view();
 
-    for (const auto &e : vec) {
-        *s << e.get() << endl;
+    for (size_type i = 0; i < view.size(); i++) {
+        *s << view[i].get() << endl;
     }
 
     return none;
