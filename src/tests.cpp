@@ -3045,6 +3045,25 @@ static const std::vector<test> tests =
             "assert(str(2.0, 0) == \"2\");",
         },
     },
+
+    {
+        /* The function arg must be validated before the container is
+           evaluated: with a bad func and an undefined container, the
+           "Expected function" TypeErrorEx must win over UndefinedVariable. */
+        "map() validates its function argument first",
+        {
+            "map(5, undefined_var);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "filter() validates its function argument first",
+        {
+            "filter(5, undefined_var);",
+        },
+        &typeid(TypeErrorEx),
+    },
 };
 
 static void

@@ -294,12 +294,13 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
     const EvalValue &val0 = RValue(arg0->eval(ctx));
-    const EvalValue &val1 = RValue(arg1->eval(ctx));
-    FuncObject &funcObj = *val0.get<shared_ptr<FuncObject>>().get();
-    SharedArrayObj::vec_type result;
 
     if (!val0.is<shared_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
+
+    const EvalValue &val1 = RValue(arg1->eval(ctx));
+    FuncObject &funcObj = *val0.get<shared_ptr<FuncObject>>().get();
+    SharedArrayObj::vec_type result;
 
     if (val1.is<SharedArrayObj>()) {
 
@@ -346,11 +347,12 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
     const EvalValue &val0 = RValue(arg0->eval(ctx));
-    const EvalValue &val1 = RValue(arg1->eval(ctx));
-    FuncObject &funcObj = *val0.get<shared_ptr<FuncObject>>().get();
 
     if (!val0.is<shared_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
+
+    const EvalValue &val1 = RValue(arg1->eval(ctx));
+    FuncObject &funcObj = *val0.get<shared_ptr<FuncObject>>().get();
 
     if (val1.is<SharedArrayObj>()) {
 
