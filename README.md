@@ -262,8 +262,8 @@ hello world a,b,c
 ```
 
 Now, everything should make sense. Almost the same thing happens with arrays
-and dictionaries with the exception that the latter ones are instanted as at
-runtime as well, in order to avoid having potentially huge literals everywhere.
+and dictionaries with the exception that the latter ones exist at runtime as
+well, in order to avoid having potentially huge literals everywhere.
 Consider the following example:
 
 ```
@@ -274,20 +274,12 @@ Block(
   ConstDecl(
     Id("ar")
     Op '='
-    LiteralArray(
-      Int(0)
-      Int(1)
-      Int(2)
-      Int(3)
-    )
+    Obj([0, 1, 2, 3])
   )
   ConstDecl(
     Id("s")
     Op '='
-    LiteralArray(
-      Int(2)
-      Int(3)
-    )
+    Obj([2, 3])
   )
   CallExpr(
     Id("print")
@@ -302,14 +294,17 @@ Block(
 [0, 1, 2, 3] [2, 3] 2
 ```
 
-As you can see, the *slice* operation has been evaluated at *parse-time* while
-initializing the constant `s`, but both the arrays exist at runtime as well.
-The subscript operations on const expressions, instead, are converted to
-literals. That looks like a good trade-off for performance: small values like
-integers, floats, and strings are converted to literals during the *const evaluation*,
-while arrays and dictionaries (potentially big) are left as read-only symbols at
-runtime, but still allowing some operations on them (like `[index]` and `len(arr)`)
-to be const-evaluated.
+As you can see, the *slice* operation `ar[2:]` has been evaluated at
+*parse-time* while initializing the constant `s`, but both arrays still exist
+at runtime. A
+const array/dict value is baked into a single `Obj(...)` node holding the value
+(not one literal per element), so even a large result stays one node in the
+tree. By contrast, a *scalar* result — like the subscript `s[0]` — folds all the
+way to a plain literal (here `Int(2)`). That's a good trade-off for performance:
+small values like integers, floats, and strings become literals during the
+*const evaluation*, while arrays and dictionaries (potentially big) are kept as
+read-only symbols at runtime, but still allowing some operations on them (like
+`[index]` and `len(arr)`) to be const-evaluated.
 
 #### Automatic const promotion
 

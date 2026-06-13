@@ -473,6 +473,59 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 }
 
 /*
+ * Produce a fresh, fully-mutable deep copy of a const-evaluated container
+ * value. This is what LiteralObj::do_eval hands out (see syntax.h): each
+ * evaluation gets an independent, mutable array/dict - exactly what the old
+ * per-element LiteralArray/LiteralDict produced at runtime - so writing through
+ * a `var` bound to it works (no const element flags) and re-evaluating the node
+ * never observes a prior mutation (nested containers are copied too). Scalars
+ * and strings are returned as-is (trivially immutable / copy-on-write). Empty
+ * arrays collapse to the shared empty_arr singleton, matching LiteralArray.
+ */
+static EvalValue
+make_mutable_clone(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>()) {
+
+        const ArrayConstView &view = v.get<SharedArrayObj>().get_view();
+
+        if (!view.size())
+            return empty_arr;
+
+        SharedArrayObj::vec_type vec;
+        vec.reserve(view.size());
+
+        for (unsigned i = 0; i < view.size(); i++)
+            vec.emplace_back(make_mutable_clone(view[i].get()), false);
+
+        return SharedArrayObj(move(vec));
+    }
+
+    if (v.is<shared_ptr<DictObject>>()) {
+
+        DictObject::inner_type data;
+        const DictObject::inner_type &src =
+            v.get<shared_ptr<DictObject>>()->get_ref();
+
+        for (const auto &p : src) {
+            data.emplace(
+                p.first,
+                LValue(make_mutable_clone(p.second.get()), false)
+            );
+        }
+
+        return shared_ptr<DictObject>(make_shared<DictObject>(move(data)));
+    }
+
+    return v;
+}
+
+EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
+{
+    return make_mutable_clone(value);
+}
+
+/*
  * Attach `c`'s source location to an in-flight exception that has none, so a
  * caret points at the offending sub-expression (operand) instead of the whole
  * enclosing expression. Used wherever an operand's RValue or operator

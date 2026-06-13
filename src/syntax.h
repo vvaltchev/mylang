@@ -240,6 +240,43 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
 
+/*
+ * A const array/dict *value* baked into the tree as a single node, the way
+ * LiteralStr bakes a string. The const-folder produces this (instead of
+ * expanding the value into one Construct per element) when an operation over
+ * const objects yields an array/dict - so `const y = x[1:3]` stores one node
+ * holding the result, not N element literals. The stored `value` is standalone
+ * (cloned at bake time, so a small slice of a huge const array does not pin the
+ * huge buffer).
+ *
+ * do_eval hands out a *fresh, fully-mutable deep copy* of `value` on every
+ * evaluation - exactly what the old per-element LiteralArray/LiteralDict
+ * produced at runtime (see make_mutable_clone in eval.cpp). That freshness is
+ * required: a `var` bound to it must be writable, and re-evaluating the node (a
+ * loop body, a function called twice) must never observe a prior mutation.
+ * Const immutability is enforced earlier, by folding const reads to literals,
+ * not by runtime element flags.
+ *
+ * It is const (is_const = true) but deliberately NOT a `Literal`: in this
+ * codebase `Literal` means a *scalar* literal (auto-const's is_scalar_literal
+ * keys off it), and an array/dict value must not be mistaken for a promotable
+ * scalar - just as LiteralArray/LiteralDict are not Literals either.
+ */
+class LiteralObj final: public Construct {
+
+    EvalValue value;
+
+public:
+
+    LiteralObj(const EvalValue &v)
+        : Construct("LiteralObj", true), value(v) { }
+    LiteralObj(EvalValue &&v)
+        : Construct("LiteralObj", true), value(move(v)) { }
+
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+};
+
 class LiteralDictKVPair final: public Construct {
 
 public:

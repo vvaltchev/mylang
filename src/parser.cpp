@@ -1358,47 +1358,15 @@ MakeConstructFromConstVal(const EvalValue &v,
 
     if (process_arrays) {
 
-        if (v.is<SharedArrayObj>()) {
+        if (v.is<SharedArrayObj>() || v.is<shared_ptr<DictObject>>()) {
 
-            const ArrayConstView &view = v.get<SharedArrayObj>().get_view();
-            unique_ptr<LiteralArray> litarr(new LiteralArray);
-
-            for (unsigned i = 0; i < view.size(); i++) {
-
-                unique_ptr<Construct> construct;
-
-                if (!MakeConstructFromConstVal(view[i].get(), construct, true))
-                    return false;
-
-                litarr->elems.push_back(move(construct));
-            }
-
-            litarr->is_const = true;
-            out = move(litarr);
-            return true;
-
-        } else if (v.is<shared_ptr<DictObject>>()) {
-
-            const DictObject::inner_type &data =
-                v.get<shared_ptr<DictObject>>()->get_ref();
-
-            unique_ptr<LiteralDict> litDict(new LiteralDict);
-
-            for (const auto &p : data) {
-
-                unique_ptr<LiteralDictKVPair> kvpair(new LiteralDictKVPair);
-
-                if (!MakeConstructFromConstVal(p.first, kvpair->key, true))
-                    return false;
-
-                if (!MakeConstructFromConstVal(p.second.get(), kvpair->value, true))
-                    return false;
-
-                litDict->elems.push_back(move(kvpair));
-            }
-
-            litDict->is_const = true;
-            out = move(litDict);
+            /*
+             * Materialize the const array/dict as ONE node holding the value,
+             * not one Construct per element (which exploded the tree for large
+             * results). clone() makes it standalone, so a small slice of a huge
+             * const array doesn't pin the huge buffer.
+             */
+            out = make_unique<LiteralObj>(v.clone());
             return true;
         }
     }

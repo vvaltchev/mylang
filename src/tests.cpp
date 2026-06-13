@@ -1135,6 +1135,80 @@ static const std::vector<test> tests =
     },
 
     {
+        "Array: clone of an array grown in place (+=)",
+        {
+            /* clone() must copy the array's *current* length, not the stale
+             * len from construction (a non-slice grows via += in place). */
+            "var a = [1,2];",
+            "a += [3,4];",
+            "var b = clone(a);",
+            "assert(b == [1,2,3,4]);",
+            "a[0] = 99;",
+            "assert(b == [1,2,3,4]);",
+        },
+    },
+
+    {
+        "Const slice result is materialized and usable",
+        {
+            "const x = [10,20,30,40,50];",
+            "const y = x[1:4];",
+            "assert(y == [20,30,40]);",
+            "assert(y[0] == 20);",
+            "assert(len(y) == 3);",
+        },
+    },
+
+    {
+        "Const object result copied to a var is fresh and mutable",
+        {
+            /* The materialized value must hand out a fresh, mutable copy: the
+             * var is writable and the const source is untouched. */
+            "const x = [1,2,3,4];",
+            "var z = x[0:3];",
+            "z[0] = 99;",
+            "assert(z == [99,2,3]);",
+            "assert(x == [1,2,3,4]);",
+        },
+    },
+
+    {
+        "Var bound to a const-foldable array literal is deeply mutable",
+        {
+            "var a = [[1,2],[3,4]];",
+            "a[0][0] = 9;",
+            "assert(a == [[9,2],[3,4]]);",
+        },
+    },
+
+    {
+        "Materialized const value is fresh on each evaluation",
+        {
+            /* A function body bound to a const-foldable literal must get an
+             * independent array each call (no leak across invocations). */
+            "func f() {",
+            "   var a = [1,2,3];",
+            "   a[0] = a[0] + 1;",
+            "   return a;",
+            "}",
+            "assert(f() == [2,2,3]);",
+            "assert(f() == [2,2,3]);",
+        },
+    },
+
+    {
+        "Materialized const dict is usable and copies are independent",
+        {
+            "const d = {\"a\": 1, \"b\": 2};",
+            "assert(d[\"a\"] == 1);",
+            "var e = d;",
+            "e[\"a\"] = 9;",
+            "assert(e[\"a\"] == 9);",
+            "assert(d[\"a\"] == 1);",
+        },
+    },
+
+    {
         "Split string, char by char",
         {
             "assert(split(\"abc\", \"\") == [\"a\",\"b\",\"c\"]);",

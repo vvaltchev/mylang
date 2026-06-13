@@ -262,7 +262,20 @@ and it lives *inside the parser*. Mechanics:
   **`MakeConstructFromConstVal()`** to replace the subtree with a literal node.
   That function inlines
   `int`/`float`/`none`/`str` unconditionally, and `arr`/`dict` only when
-  `process_arrays` is set.
+  `process_arrays` is set — in which case it bakes the whole value into **one
+  `LiteralObj` node** (`syntax.h`), not one literal per element. (It stores
+  `v.clone()` so a small slice of a huge const array doesn't pin the huge
+  buffer.) `LiteralObj::do_eval` hands out a *fresh, fully-mutable deep copy* of
+  the baked value on every evaluation — via `make_mutable_clone()` in
+  `eval.cpp`, which is exactly what the old per-element
+  `LiteralArray`/`LiteralDict` produced at runtime: a `var` bound to it must be
+  writable, and re-evaluating the node (loop body, function called twice) must
+  not see a prior mutation. Const *immutability* is enforced separately, by
+  folding const reads (`y[k]`, `len(y)`) to literals, not by runtime element
+  flags. `LiteralObj` is `is_const` but deliberately **not** a `Literal` (which
+  in this codebase means a *scalar* literal — see auto-const's
+  `is_scalar_literal`), so an array/dict value is never mistaken for a
+  promotable scalar.
 - **Scalars vs. containers (`ShouldConstSymbolExistAtRuntime`).** Const scalars
   are inlined
   everywhere and their declaration is dropped from the runtime AST entirely (the
@@ -592,6 +605,14 @@ via COW:
   triggers COW: if the container is a slice, or is aliased (`use_count > 1` /
   has live slices), it is
   cloned first so the write doesn't bleed across logically-distinct arrays.
+  **Length invariant:** for a *non-slice*, `len` is only the size at
+  construction and goes stale once `+=`/`append`/`insert`/... grow the vector in
+  place — a non-slice reports its length via `size()` (= `vec.size()`), and
+  `offset()`/`size()` are the only correct way to read its range. (Bug to avoid:
+  `clone_internal_vec` must use `offset()`/`size()`, not the raw `off`/`len`, or
+  it truncates a grown array. `clone_aliased_slices` therefore clones each slice
+  while its `slice` flag is still set, so `offset()`/`size()` report the slice
+  range.)
 - **`DictObject`** (`shareddict.h`) is analogous (`shared_ptr` wrapper).
 - The non-const `intptr(symbol)` builtin exposes the underlying object pointer;
   the test suite uses it
