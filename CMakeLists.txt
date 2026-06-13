@@ -29,3 +29,10 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
       target_link_options(mylang PUBLIC  -fprofile-arcs -ftest-coverage)
    endif()
 endif()
+
+# The codebase intentionally calls `move`/`forward` unqualified (see
+# `using std::move;` in defs.h), which recent clang reports under
+# -Wunqualified-std-cast-call. Silence it for clang only.
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+   target_compile_options(mylang PUBLIC -Wno-unqualified-std-cast-call)
+endif()
