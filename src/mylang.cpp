@@ -86,6 +86,13 @@ parse_args(int argc, char **argv)
         char *arg = argv[0];
 
         if (in_tokens) {
+            /*
+             * Join multiple arguments after -e with a space, so that an
+             * unquoted expression split by the shell (e.g. -e var x = 5)
+             * is not glued back into a single mangled token (varx=5).
+             */
+            if (!inline_text.empty())
+                inline_text += ' ';
             inline_text += arg;
             continue;
         }
