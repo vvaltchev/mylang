@@ -280,10 +280,18 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
 
     Construct *arg0 = exprList->elems[0].get();
     const EvalValue &v0 = RValue(arg0->eval(ctx));
+    float_type x;
+
+    if (v0.is<float_type>())
+        x = v0.get<float_type>();
+    else if (v0.is<int_type>())
+        x = static_cast<float_type>(v0.get<int_type>());
+    else
+        throw TypeErrorEx("Expected numeric type", arg0->start, arg0->end);
 
     if (exprList->elems.size() == 1) {
 
-        return roundl(v0.get<float_type>());
+        return roundl(x);
 
     } else {
 
@@ -303,7 +311,7 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
             10.0,
             static_cast<float_type>(v1.get<int_type>())
         );
-        return roundl(v0.get<float_type>() * base10exp) / base10exp;
+        return roundl(x * base10exp) / base10exp;
     }
 }
 

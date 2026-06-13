@@ -3008,6 +3008,18 @@ static const std::vector<test> tests =
             "assert((b[0:2] == b[1:3]) == 0);",
         },
     },
+
+    {
+        "round() accepts integer arguments",
+        {
+            "assert(round(5) == 5.0);",
+            "assert(round(5, 2) == 5.0);",
+            "assert(round(2.5) == 3.0);",
+            "assert(round(2.4) == 2.0);",
+            "var n = 7;",
+            "assert(round(n) == 7.0);",
+        },
+    },
 };
 
 static void
