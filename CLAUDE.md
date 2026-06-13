@@ -196,6 +196,17 @@ and it lives *inside the parser*. Mechanics:
   `type` pointer. The base implementations throw `TypeErrorEx`; a type "gains" a behavior purely by
   overriding the relevant virtual (see `src/types/int.cpp.h` for the canonical example). Binary ops
   **mutate the left operand in place** (`void add(EvalValue &a, const EvalValue &b)` does `a += b`).
+- **Mixed int/float promotion is centralized in `num_bin_op()`** (`evalvalue.h`), not in the type
+  classes. The type virtuals are single-type: `TypeInt::add` only handles an int RHS, `TypeFloat::add`
+  also accepts an int RHS (promoting it). `num_bin_op(a, b, &Type::op)` is the dispatch chokepoint:
+  when `a` is int and `b` is float it promotes `a` to float first, so `int OP float` lands in
+  `TypeFloat` and behaves identically to `float OP int`. **Dispatch binary arithmetic/comparison
+  through `num_bin_op`, never by calling `a.get_type()->add(...)` directly** — every call site does
+  (the `ExprNN::do_eval` ladder and compound-assign in `eval.cpp`, `EvalValue`'s `== != < <= > >=`
+  operators, `builtin_sum`). It is a no-op for any non-`(int,float)` operand pair, so string/array/etc.
+  comparisons pass through unchanged. (Logical `&&`/`||` and unary ops are *not* routed through it.)
+  Note for dict keys: an integer-valued float hashes as the equal int (`TypeFloat::hash`) so that
+  `1` and `1.0`, which compare equal, are the same key.
 - **The trivial / non-trivial boundary is `t_str`.** `TypeE` order matters:
   `t_none, t_lval, t_undefid, t_int, t_builtin, t_float` (`< t_str`, trivial, stored inline,
   bit-copyable) then `t_str, t_func, t_arr, t_ex, t_dict` (`>= t_str`, non-trivial, need the
