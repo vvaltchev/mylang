@@ -3102,6 +3102,36 @@ static const std::vector<test> tests =
             "assert(d2.y == 3);",
         },
     },
+
+    {
+        "mixed int/float arithmetic and comparison are symmetric",
+        {
+            /* arithmetic: int-OP-float matches float-OP-int and yields float */
+            "assert(1 + 2.0 == 3.0);",
+            "assert(2.0 + 1 == 3.0);",
+            "assert(5 - 1.5 == 3.5);",
+            "assert(2 * 1.5 == 3.0);",
+            "assert(5 / 2.0 == 2.5);",
+            "assert(5 % 2.0 == 1.0);",
+            "assert(type(1 + 2.0) == \"float\");",
+            /* relational works in both orders */
+            "assert(1 < 2.0);",
+            "assert(2.0 > 1);",
+            "assert(2 <= 2.0);",
+            "assert(2.0 >= 2);",
+            "assert((3 < 2.0) == 0);",
+            /* int/int division stays integer */
+            "assert(5 / 2 == 2);",
+        },
+    },
+
+    {
+        "int divided by float zero throws",
+        {
+            "var x = 1 / 0.0;",
+        },
+        &typeid(DivisionByZeroEx),
+    },
 };
 
 static void
