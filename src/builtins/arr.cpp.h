@@ -414,6 +414,9 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
     const SharedArrayObj &arr = val0.get<SharedArrayObj>();
     const ArrayConstView &view = arr.get_view();
 
+    if (view.size() == 0)
+        return none; /* sum of an empty array is none, like min()/max() */
+
     if (exprList->elems.size() == 1) {
 
         EvalValue val = view[0].get();

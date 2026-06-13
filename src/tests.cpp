@@ -2866,6 +2866,17 @@ static const std::vector<test> tests =
             "assert(g(0) == none);",
         },
     },
+
+    {
+        "sum() of an empty array returns none",
+        {
+            "assert(sum([]) == none);",
+            "var a = [1, 2, 3];",
+            "var e = a[1:1];",
+            "assert(sum(e) == none);",
+            "assert(sum([], pure func(x) => x) == none);",
+        },
+    },
 };
 
 static void
