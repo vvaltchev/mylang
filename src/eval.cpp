@@ -859,6 +859,21 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
     EvalContext curr(ctx, ctx ? ctx->const_ctx : false);
 
     /*
+     * The root block (ctx == nullptr) is the program's implicit "main": build
+     * its Frame here so slotted top-level variables get O(1) slots. curr IS the
+     * root context, so unslotted globals still live in curr's map where
+     * functions reach them (via get_root_ctx). The Frame lives for the whole
+     * program (this do_eval spans it).
+     */
+    unique_ptr<Frame> root_frame;
+
+    if (!ctx && slot_count) {
+        root_frame = make_unique<Frame>();
+        root_frame->init(slot_count);
+        curr.frame = root_frame.get();
+    }
+
+    /*
      * Reset this block's resolved locals to "undefined" on entry. The slots
      * persist for the whole call, so without this a re-entered block (a loop
      * body, say) would still see the previous iteration's bindings live. The
