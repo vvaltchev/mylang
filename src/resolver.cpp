@@ -3,6 +3,7 @@
 #include "syntax.h"
 #include "resolver.h"
 #include "errors.h"
+#include "eval.h"
 
 #include <functional>
 #include <unordered_set>
@@ -45,10 +46,19 @@
  * is only an earlier-and-always failure for genuinely duplicate code.
  */
 
+/*
+ * Defined (non-static) in parser.cpp: replace `out` with a literal Construct
+ * holding the constant value `v`. Reused by the auto-const folder below.
+ */
+bool MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out,
+                               bool process_arrays);
+
 namespace {
 
 /* Max slots per frame: Frame::live is one 64-bit word, one bit per slot. */
 constexpr int MAX_SLOTS = 64;
+
+void for_each_child(Construct *c, const std::function<void(Construct *)> &fn);
 
 /*
  * A lexical scope (a function's param scope, a block, a for/foreach header, or
@@ -76,6 +86,371 @@ struct FuncState {
     std::unordered_set<const UniqueId *> captures;   /* capture names */
 };
 
+/*
+ * Auto-const folding pass, run after slot resolution. Within each function (and
+ * the top-level "main") it promotes write-once scalar variables - a `var`
+ * assigned exactly once, with a constant scalar initializer, never reassigned,
+ * captured or undef'd - to compile-time constants, propagates them into
+ * expressions, folds the resulting constant arithmetic to literals, drops the
+ * now-dead declarations, and removes statically-dead `if`/`while` branches.
+ *
+ * This is the optimization CPython lacks: a loop-invariant constant built from
+ * named `var` constants collapses to one literal here, instead of being
+ * recomputed every iteration. It keys off the resolver's per-slot write counts
+ * (FuncDeclStmt::slot_writes + the top-level frame's) and slot identity, so a
+ * reference's binding is unambiguous - no scope tracking is needed here: every
+ * Identifier with the same sym.slot in a function is the same variable.
+ */
+class AutoConst {
+
+    EvalContext cctx;   /* const context for evaluating folded constants */
+
+public:
+
+    AutoConst() : cctx(nullptr, true) { }
+
+    void run(Block *root, const std::vector<int> &main_writes)
+    {
+        fold_function(root, main_writes);
+    }
+
+private:
+
+    struct FCtx {
+        const std::vector<int> &writes;   /* per-slot write counts */
+        std::unordered_map<int, EvalValue> consts;  /* promoted: slot->value */
+        std::unordered_set<int> blocked;  /* slots that can't be promoted */
+    };
+
+    bool promotable(const FCtx &fc, int slot) const
+    {
+        return slot >= 0 && slot < static_cast<int>(fc.writes.size())
+            && fc.writes[slot] == 1 && !fc.blocked.count(slot);
+    }
+
+    /* A scalar literal (int/float/str/none); arrays/dicts are not Literals. */
+    static bool is_scalar_literal(const Construct *c)
+    {
+        return dynamic_cast<const Literal *>(c) != nullptr;
+    }
+
+    /* Fold one function body. Only block bodies are folded; a `=> expr` body is
+     * a single expression and is left as-is (minor missed optimization). */
+    void fold_function(Construct *body, const std::vector<int> &writes)
+    {
+        Block *b = dynamic_cast<Block *>(body);
+
+        if (!b)
+            return;
+
+        FCtx fc{ writes, {}, {} };
+        prescan_blocked(b, fc.blocked);
+        fold_block(b, fc);
+    }
+
+    /*
+     * Collect slots that must NOT be promoted, because replacing the variable
+     * with its literal value there would change behavior. A slot is blocked if
+     * it appears as:
+     *   - a nested function's capture (a capture must stay an identifier);
+     *   - a DIRECT identifier argument of a call - a builtin may take it as an
+     *     lvalue (append/push/sort/.../undef), so a literal there would throw
+     *     NotLValueEx instead. (Expression args like `f(a + 0)` are already
+     *     non-lvalues, so those fold safely and aren't blocked.)
+     *   - a subscript or member base (`a[i]`, `a.k`), which needs an lvalue
+     *     when assigned and a container when read;
+     *   - a foreach loop variable, which is implicitly reassigned every
+     *     iteration (so it is not really write-once despite its write count).
+     * Does not descend into nested function bodies (a separate slot frame).
+     */
+    void prescan_blocked(Construct *c, std::unordered_set<int> &blocked)
+    {
+        if (!c)
+            return;
+
+        auto block = [&](Construct *x) {
+            if (auto *id = dynamic_cast<Identifier *>(x))
+                if (id->sym.kind == SymKind::local)
+                    blocked.insert(id->sym.slot);
+        };
+
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+            if (fd->captures)
+                for (auto &cap : fd->captures->elems)
+                    block(cap.get());
+            return;                    /* separate slot frame: don't descend */
+        }
+
+        if (auto *ce = dynamic_cast<CallExpr *>(c)) {
+            if (ce->args)
+                for (auto &a : ce->args->elems)
+                    block(a.get());
+        } else if (auto *sub = dynamic_cast<Subscript *>(c)) {
+            block(sub->what.get());
+        } else if (auto *me = dynamic_cast<MemberExpr *>(c)) {
+            block(me->what.get());
+        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+            if (fe->ids)
+                for (auto &id : fe->ids->elems)
+                    block(id.get());
+        }
+
+        /* Complete recursion. for_each_child intentionally skips the nodes the
+         * resolver's walk() handles itself (Block/for/foreach/try), so descend
+         * into those explicitly here. */
+        auto rec = [&](Construct *ch) { prescan_blocked(ch, blocked); };
+
+        if (auto *b = dynamic_cast<Block *>(c)) {
+            for (auto &e : b->elems)
+                rec(e.get());
+        } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+            rec(f->init.get());
+            rec(f->cond.get());
+            rec(f->inc.get());
+            rec(f->body.get());
+        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+            rec(fe->container.get());
+            rec(fe->body.get());
+        } else if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+            rec(tc->tryBody.get());
+            for (auto &p : tc->catchStmts)
+                rec(p.second.get());
+            rec(tc->finallyBody.get());
+        } else if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+            rec(e14->lvalue.get());        /* reaches `a[i]=`/`a.k=` bases */
+            rec(e14->rvalue.get());        /* reaches a func-expr's captures */
+        } else {
+            for_each_child(c, rec);
+        }
+    }
+
+    /* A block's statements: promote const decls, fold, drop dead code. */
+    void fold_block(Block *b, FCtx &fc)
+    {
+        std::vector<unique_ptr<Construct>> kept;
+
+        for (auto &e : b->elems) {
+
+            if (auto *e14 = dynamic_cast<Expr14 *>(e.get())) {
+
+                if (e14->fl & pFlags::pInDecl) {
+
+                    fold_reads(e14->rvalue, fc);
+                    auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
+
+                    if (id && id->sym.kind == SymKind::local
+                           && is_scalar_literal(e14->rvalue.get())
+                           && promotable(fc, id->sym.slot)) {
+                        /* write-once scalar const: record it and drop the decl;
+                         * all uses fold to the literal. */
+                        fc.consts[id->sym.slot] = e14->rvalue->eval(&cctx);
+                        continue;
+                    }
+
+                    kept.push_back(move(e));
+                    continue;
+                }
+
+                fold_reads(e14->rvalue, fc);   /* assignment: fold rhs only */
+                kept.push_back(move(e));
+                continue;
+            }
+
+            if (fold_child(e, fc))
+                kept.push_back(move(e));
+        }
+
+        b->elems = move(kept);
+    }
+
+    /*
+     * Fold a statement/child in place. Returns false if the enclosing block
+     * should drop it (a statically-dead branch).
+     */
+    bool fold_child(unique_ptr<Construct> &slot, FCtx &fc)
+    {
+        Construct *c = slot.get();
+
+        if (!c)
+            return false;
+
+        if (auto *b = dynamic_cast<Block *>(c)) {
+            fold_block(b, fc);
+            return true;
+        }
+
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+            fold_function(fd->body.get(), fd->slot_writes);   /* nested func */
+            return true;
+        }
+
+        if (auto *iff = dynamic_cast<IfStmt *>(c)) {
+
+            fold_reads(iff->condExpr, fc);
+
+            if (is_scalar_literal(iff->condExpr.get())) {
+                /* Const condition: this is dead-code elimination. We proved
+                 * one branch unreachable, so we DROP it without folding it (no
+                 * point analyzing code we just proved can't run) and keep+fold
+                 * only the live branch. Errors in dead code are not surfaced
+                 * here - that's the parser's job for const/literal exprs. */
+                const EvalValue v = iff->condExpr->eval(&cctx);
+                unique_ptr<Construct> taken =
+                    v.get_type()->is_true(v) ? move(iff->thenBlock)
+                                             : move(iff->elseBlock);
+                if (!taken || !fold_child(taken, fc))
+                    return false;          /* no live branch (or folds away) */
+                slot = move(taken);        /* replace if with its live branch */
+                return true;
+            }
+
+            /* Non-const condition: both branches may run - fold both. */
+            if (iff->thenBlock && !fold_child(iff->thenBlock, fc))
+                iff->thenBlock.reset();
+            if (iff->elseBlock && !fold_child(iff->elseBlock, fc))
+                iff->elseBlock.reset();
+            return true;
+        }
+
+        if (auto *w = dynamic_cast<WhileStmt *>(c)) {
+            fold_reads(w->condExpr, fc);
+            if (is_scalar_literal(w->condExpr.get())) {
+                const EvalValue v = w->condExpr->eval(&cctx);
+                if (!v.get_type()->is_true(v))
+                    return false;          /* while (false): dead, drop it
+                                            * without folding the body */
+            }
+            if (w->body && !fold_child(w->body, fc))   /* live / maybe-live */
+                w->body.reset();
+            return true;
+        }
+
+        if (auto *f = dynamic_cast<ForStmt *>(c)) {
+            if (f->init && !fold_child(f->init, fc)) f->init.reset();
+            fold_reads(f->cond, fc);
+            if (f->inc && !fold_child(f->inc, fc)) f->inc.reset();
+            if (f->body && !fold_child(f->body, fc)) f->body.reset();
+            return true;
+        }
+
+        if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+            fold_reads(fe->container, fc);
+            if (fe->body && !fold_child(fe->body, fc)) fe->body.reset();
+            return true;
+        }
+
+        if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+            if (tc->tryBody && !fold_child(tc->tryBody, fc))
+                tc->tryBody.reset();
+            for (auto &p : tc->catchStmts)
+                if (p.second && !fold_child(p.second, fc)) p.second.reset();
+            if (tc->finallyBody && !fold_child(tc->finallyBody, fc))
+                tc->finallyBody.reset();
+            return true;
+        }
+
+        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+            fold_reads(e14->rvalue, fc);   /* assignment as a statement */
+            return true;
+        }
+
+        fold_reads(slot, fc);              /* expression statement */
+        return true;
+    }
+
+    /*
+     * Fold a read-position expression: propagate promoted consts into it and
+     * collapse all-literal arithmetic to a single literal (bottom-up). Never
+     * touches write targets (assignment lvalues), capture lists, or callees.
+     */
+    void fold_reads(unique_ptr<Construct> &slot, FCtx &fc)
+    {
+        Construct *c = slot.get();
+
+        if (!c)
+            return;
+
+        if (auto *id = dynamic_cast<Identifier *>(c)) {
+            if (id->sym.kind == SymKind::local) {
+                auto it = fc.consts.find(id->sym.slot);
+                if (it != fc.consts.end())
+                    MakeConstructFromConstVal(it->second, slot, false);
+            }
+            return;
+        }
+
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+            fold_function(fd->body.get(), fd->slot_writes);  /* func expr */
+            return;                    /* leave capture list / name alone */
+        }
+
+        if (auto *mo = dynamic_cast<MultiOpConstruct *>(c)) {
+            bool all_lit = true;
+            for (auto &p : mo->elems) {
+                fold_reads(p.second, fc);
+                if (!is_scalar_literal(p.second.get()))
+                    all_lit = false;
+            }
+            if (all_lit) {
+                /* Fold the constant op to a literal. If evaluating it raises an
+                 * exception (x/0, a type mismatch, ...), we DON'T swallow it: a
+                 * value we can fully compute at compile time that always fails
+                 * is a program that can never run correctly, so the error
+                 * propagates out of name resolution and aborts before run -
+                 * like the parser's const-folding. try/catch is for *runtime*
+                 * exceptions and does not (and should not) catch these; see the
+                 * const-eval / auto-const notes in CLAUDE.md and README.md. */
+                MakeConstructFromConstVal(RValue(mo->eval(&cctx)), slot, false);
+            }
+            return;
+        }
+
+        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+            fold_reads(e14->rvalue, fc);   /* embedded assignment: rhs only */
+            return;
+        }
+
+        if (auto *sc = dynamic_cast<SingleChildConstruct *>(c)) {
+            fold_reads(sc->elem, fc);
+            return;
+        }
+        if (auto *ce = dynamic_cast<CallExpr *>(c)) {
+            if (ce->args)
+                for (auto &a : ce->args->elems)
+                    fold_reads(a, fc);     /* not the callee or result */
+            return;
+        }
+        if (auto *sub = dynamic_cast<Subscript *>(c)) {
+            fold_reads(sub->what, fc);
+            fold_reads(sub->index, fc);
+            return;
+        }
+        if (auto *sl = dynamic_cast<Slice *>(c)) {
+            fold_reads(sl->what, fc);
+            fold_reads(sl->start_idx, fc);
+            fold_reads(sl->end_idx, fc);
+            return;
+        }
+        if (auto *me = dynamic_cast<MemberExpr *>(c)) {
+            fold_reads(me->what, fc);
+            return;
+        }
+        if (auto *la = dynamic_cast<LiteralArray *>(c)) {
+            for (auto &el : la->elems)
+                fold_reads(el, fc);
+            return;
+        }
+        if (auto *ld = dynamic_cast<LiteralDict *>(c)) {
+            for (auto &kv : ld->elems) {
+                fold_reads(kv->key, fc);
+                fold_reads(kv->value, fc);
+            }
+            return;
+        }
+        /* literals and childless constructs: nothing to fold */
+    }
+};
+
 class Resolver {
 
 public:
@@ -97,6 +472,11 @@ public:
         main_st.slottable = true;
         main_st.is_main = true;
         walk(root, &main_st);
+
+        /* Promote write-once scalar vars to constants and fold (uses the write
+         * counts just collected; the top-level frame's in main_st.writes). */
+        if (auto *rb = dynamic_cast<Block *>(root))
+            AutoConst().run(rb, main_st.writes);
     }
 
 private:

@@ -170,6 +170,15 @@ both languages on the inputs used. These are straight speed comparisons.
   `./build/mylang -s bench/ml/48_const_fold.ml` to see the heavy computation
   replaced by a single integer literal in the tree.
 
+- **Auto-const folding & dead-code elimination** (`49_autoconst_fold`,
+  `50_autoconst_dce`). Unlike `48`, these *do* have Python counterparts, and
+  that's the point: the scripts use plain `var` (no `const`), but because those
+  variables are written exactly once MyLang promotes them to constants, folds
+  the loop-invariant computation to a single literal, and eliminates dead
+  branches — work CPython repeats on every iteration since it has no comparable
+  folding. These are among the cases where MyLang is several times *faster* than
+  CPython (~0.3–0.4× here). `runtime(x)` opts an expression back out of folding.
+
 (The reverse case — Python-only constructs — is deliberately *not* benchmarked,
 since the goal is to measure MyLang's constructs, not Python's.)
 
@@ -230,9 +239,12 @@ Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 | 46_matrix_mult | 0.057 | 0.035 | 1.63× | nested subscripting |
 | 47_wordcount | 0.143 | 0.074 | 1.93× | split + dict |
 | 48_const_fold | 0.125 | — | — | MyLang-only (parse-time folding) |
+| 49_autoconst_fold | 0.30 | 0.82 | 0.37× | write-once `var`s folded away |
+| 50_autoconst_dce | 0.32 | 1.03 | 0.31× | constant guard + dead branch gone |
 
-**geomean: ~1.5× slower** across the 47 paired benchmarks (this box, CPython
-3.14). MyLang is *faster* on 5 (`28_str_concat` 0.01×, `15_array_slice_readonly`
+**geomean: ~1.3× slower** across the 49 paired benchmarks (this box, CPython
+3.14). MyLang is *faster* on several (`28_str_concat` 0.01×,
+`50_autoconst_dce` 0.31×, `15_array_slice_readonly` 0.37×, `49_autoconst_fold`
 0.37×, `39_find_builtin` 0.52×, `26_dict_iterate` 0.74×, `01_while_loop` 0.90×)
 and within 2× on the large majority. The lone real blow-out is per-iteration
 *genuine* exceptions (`42` ~22×).
