@@ -245,10 +245,21 @@ and it lives *inside the parser*. Mechanics:
 
 ## Evaluation specifics worth knowing before editing `eval.cpp`
 
-- **Control flow is implemented with C++ exceptions** (defined locally in `eval.cpp`): `LoopBreakEx`,
-  `LoopContinueEx`, `ReturnEx`, `RethrowEx`. Loops catch break/continue; `continue` *must* unwind via
-  exception because it can fire from inside arbitrarily nested `if`s. `do_func_call` has an
-  optimization: a top-level `return` statement is evaluated directly without throwing `ReturnEx`.
+- **`return`/`break`/`continue` are signaled via `FlowState`, NOT C++ exceptions.** Each
+  `EvalContext` carries a `FlowState *flow` (`eval.h`) pointing at one `FlowState { Type type; EvalValue
+  value; }` per *function invocation*: function-boundary contexts (`func_ctx`) and the root own theirs,
+  nested blocks/loops inherit the parent's pointer (so a fresh one per call — recursion never shares).
+  `BreakStmt`/`ContinueStmt`/`ReturnStmt::do_eval` just set `ctx->flow->type` (and `->value` for ret)
+  and return; `Block::do_eval` stops its statement loop the moment `flow->type != none`; the loop
+  evaluators (`While`/`For`/`Foreach::do_iter`) consume `brk`/`cont` (resetting to `none`, with `for`
+  still running its `inc` on `cont`) and let `ret` pass through; `do_func_call` reads `flow` after the
+  body and returns `flow->value`. `finally` (the scope guard in `TryCatchStmt::do_eval`) *suspends* an
+  in-flight signal around the finally body, then resumes it (unless finally raises its own). This
+  replaced exception-based control flow because a C++ `throw` costs ~1.6µs here (heap alloc + DWARF
+  unwinding, irreducible by build flags) and `return` fires constantly — see `bench/` for the ~9×
+  speedup on recursion. **Only genuinely exceptional control flow still throws C++ exceptions:**
+  runtime errors (`RuntimeException` subclasses), user `throw` (`ExceptionObject`), and `rethrow`
+  (`RethrowEx`, defined locally in `eval.cpp`) — caught by `do_catch`/`TryCatchStmt`.
 - **`Construct::eval()` wraps `do_eval()`** to attach the node's source `Loc` to any in-flight
   `Exception` that doesn't already carry one — this is how runtime errors get pointed at source.
   Override `do_eval`, not `eval`.

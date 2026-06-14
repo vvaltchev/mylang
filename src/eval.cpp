@@ -78,6 +78,7 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     : parent(parent)
     , const_ctx(const_ctx)
     , func_ctx(func_ctx)
+    , flow((parent && !func_ctx) ? parent->flow : &flow_state)
 {
     if (!parent) {
         symbols.insert(const_builtins.begin(), const_builtins.end());
@@ -165,9 +166,12 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
     return UndefinedId{get_str()};
 }
 
-struct LoopBreakEx { };
-struct LoopContinueEx { };
-struct ReturnEx { EvalValue value; };
+/*
+ * return / break / continue no longer use C++ exceptions: they set the
+ * EvalContext's FlowState (see eval.h) and unwind via ordinary returns.
+ * rethrow is genuinely exceptional (it re-throws a real exception object from
+ * inside a catch block) and stays an exception.
+ */
 struct RethrowEx { Loc start; Loc end; };
 
 static inline EvalValue
@@ -265,7 +269,8 @@ do_func_call(EvalContext *ctx,
              FuncObject &obj,
              const ArgsVecT &args)
 {
-    EvalContext args_ctx(&obj.capture_ctx);
+    /* func_ctx == true gives this call its own FlowState (see eval.h) */
+    EvalContext args_ctx(&obj.capture_ctx, false, true);
 
     if (obj.func->params) {
         const auto &funcParams = obj.func->params->elems;
@@ -274,43 +279,20 @@ do_func_call(EvalContext *ctx,
 
     try {
 
-        Block *block = nullptr;
+        if (!obj.func->body->is_block()) {
 
-        if (obj.func->body->is_block())
-            block = static_cast<Block *>(obj.func->body.get());
-
-        if (block) {
-
-            for (const auto &e: block->elems) {
-
-                if (e->is_ret()) {
-
-                    /* Optimization: skip ReturnEx and eval the result directly */
-                    ReturnStmt *ret = static_cast<ReturnStmt *>(e.get());
-
-                    if (!ret->elem)
-                        return none; /* A value-less `return;` returns none */
-
-                    return do_func_return(
-                        ret->elem->eval(&args_ctx),
-                        ret->elem.get()
-                    );
-                }
-
-                e->eval(&args_ctx);
-            }
-
-        } else {
-
+            /* Single-expression body: `func f(...) => expr;` */
             return do_func_return(
                 obj.func->body->eval(&args_ctx),
                 obj.func->body.get()
             );
         }
 
-    } catch (ReturnEx &ret) {
-
-        return move(ret.value);
+        /*
+         * Block body: statements run until one sets the FlowState to `ret`
+         * (Block::do_eval stops there). No exception is thrown for `return`.
+         */
+        obj.func->body->eval(&args_ctx);
 
     } catch (UndefinedVariableEx &undefEx) {
 
@@ -319,6 +301,11 @@ do_func_call(EvalContext *ctx,
 
         throw;
     }
+
+    FlowState &fs = *args_ctx.flow;
+
+    if (fs.type == FlowState::ret)
+        return move(fs.value);
 
     return none;
 }
@@ -737,19 +724,22 @@ EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue BreakStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw LoopBreakEx();
+    ctx->flow->type = FlowState::brk;
+    return none;
 }
 
 EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw LoopContinueEx();
+    ctx->flow->type = FlowState::cont;
+    return none;
 }
 
 EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw ReturnEx{
-        elem ? RValue(elem->eval(ctx)) : none
-    };
+    /* RValue() throws UndefinedVariableEx (with this stmt's loc) if needed */
+    ctx->flow->value = elem ? RValue(elem->eval(ctx)) : none;
+    ctx->flow->type = FlowState::ret;
+    return none;
 }
 
 EvalValue RethrowStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -782,6 +772,14 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 
         if (tmp.is<UndefinedId>())
             throw UndefinedVariableEx(tmp.get<UndefinedId>().id, e->start, e->end);
+
+        /*
+         * A return/break/continue fired in this statement (possibly nested in
+         * ifs): stop running the block and let the signal propagate upward to
+         * the enclosing loop or function boundary.
+         */
+        if (curr.flow->type != FlowState::none)
+            break;
     }
 
     return none;
@@ -789,26 +787,23 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 {
+    FlowState &fs = *ctx->flow;
+
     while (RValue(condExpr->eval(ctx)).is_true()) {
 
-        try {
+        if (body)
+            body->eval(ctx);
 
-            if (body)
-                body->eval(ctx);
+        if (fs.type == FlowState::ret)
+            break;                              /* propagate to the function */
 
-        } catch (LoopBreakEx) {
-
+        if (fs.type == FlowState::brk) {
+            fs.type = FlowState::none;
             break;
-
-        } catch (LoopContinueEx) {
-
-            /*
-             * Do nothing. Note: we cannot avoid this exception simply because
-             * we can have `continue` inside one or multiple levels of nested
-             * IF statements inside the loop, and we have to skip all of them
-             * to jump back here and restart the loop.
-             */
         }
+
+        if (fs.type == FlowState::cont)
+            fs.type = FlowState::none;          /* consume; loop again */
     }
 
     return none;
@@ -950,8 +945,27 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 
         ~trivial_scope_guard() {
 
-            if (finallyBody)
-                finallyBody->eval(ctx);
+            if (!finallyBody)
+                return;
+
+            FlowState &fs = *ctx->flow;
+
+            /*
+             * A return/break/continue may be in flight out of the try or catch
+             * block. Suspend it so the finally body runs to completion, then
+             * resume it - unless finally raised its own control-flow signal,
+             * which then takes over (as in C#/Java).
+             */
+            const FlowState::Type saved_type = fs.type;
+            EvalValue saved_val = move(fs.value);
+            fs.type = FlowState::none;
+
+            finallyBody->eval(ctx);
+
+            if (fs.type == FlowState::none) {
+                fs.type = saved_type;
+                fs.value = move(saved_val);
+            }
         }
     };
 
@@ -1095,24 +1109,21 @@ ForeachStmt::do_iter(EvalContext *ctx,
         }
     }
 
-    try {
+    if (body)
+        body->eval(ctx);
 
-        if (body)
-            body->eval(ctx);
+    FlowState &fs = *ctx->flow;
 
-    } catch (LoopBreakEx) {
+    if (fs.type == FlowState::ret)
+        return false;                       /* stop; propagate to the function */
 
-        return false;
-
-    } catch (LoopContinueEx) {
-
-        /*
-        * Do nothing. Note: we cannot avoid this exception simply because
-        * we can have `continue` inside one or multiple levels of nested
-        * IF statements inside the loop, and we have to skip all of them
-        * to jump back here and restart the loop.
-        */
+    if (fs.type == FlowState::brk) {
+        fs.type = FlowState::none;
+        return false;                       /* stop iterating */
     }
+
+    if (fs.type == FlowState::cont)
+        fs.type = FlowState::none;          /* consume; advance to next item */
 
     return true;
 }
@@ -1214,29 +1225,26 @@ EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const
     if (init)
         init->eval(&loop_ctx);
 
+    FlowState &fs = *loop_ctx.flow;
+
     while (true) {
 
         if (cond && !RValue(cond->eval(&loop_ctx)).is_true())
             break;
 
-        try {
+        if (body)
+            body->eval(&loop_ctx);
 
-            if (body)
-                body->eval(&loop_ctx);
+        if (fs.type == FlowState::ret)
+            break;                              /* propagate to the function */
 
-        } catch (LoopBreakEx) {
-
+        if (fs.type == FlowState::brk) {
+            fs.type = FlowState::none;
             break;
-
-        } catch (LoopContinueEx) {
-
-            /*
-             * Do nothing. Note: we cannot avoid this exception simply because
-             * we can have `continue` inside one or multiple levels of nested
-             * IF statements inside the loop, and we have to skip all of them
-             * to jump back here and restart the loop.
-             */
         }
+
+        if (fs.type == FlowState::cont)
+            fs.type = FlowState::none;          /* consume; still run `inc` */
 
         if (inc)
             inc->eval(&loop_ctx);

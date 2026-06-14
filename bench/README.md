@@ -5,12 +5,16 @@ interpreter) and **CPython**, plus a small runner that times both and prints a
 table.
 
 > **TL;DR** — built `-O3`, MyLang holds up remarkably well for a tree-walking
-> interpreter: **geomean ~1.6× slower than CPython** across the paired
+> interpreter: **geomean ~1.5× slower than CPython** across the paired
 > benchmarks, and actually *faster* on several (lazy slices, naive string `+=`,
 > linear `find`, dict iteration, the plain counting loop). Most everyday
-> constructs land within **0.8–2×**. The real weak spots are
-> **call-heavy recursion** (`fib` ~31×) and **per-iteration exceptions**
-> (~23×) — the costs a tree-walker pays that a bytecode VM doesn't.
+> constructs land within **0.8–2×**. The one real outlier left is
+> **per-iteration *genuine* exceptions** (`42_exceptions` ~22×) — and that's by
+> design (real `throw`/`catch` still uses C++ exceptions). Recursion *used* to
+> be the worst case (`fib` ~31×) until `return`/`break`/`continue` were moved
+> off C++ exceptions onto a flag (`FlowState`); that alone took fib to ~3.5×.
+> See the investigation in the git history for why C++ `throw` is ~1.6µs and
+> irreducible by build flags.
 >
 > ⚠️ **These numbers are only valid for an optimized build.** A debug /
 > `TESTS` / no-`-O` build runs ~7× slower and makes the whole comparison
@@ -186,7 +190,7 @@ Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 | 06_if_branch | 0.194 | 0.099 | 1.96× | |
 | 07_nested_loops | 0.159 | 0.127 | 1.25× | |
 | 08_func_call | 0.170 | 0.115 | 1.48× | |
-| 09_fib_recursive | 1.415 | 0.045 | **31.3×** | call overhead — worst case |
+| 09_fib_recursive | 0.149 | 0.042 | 3.53× | was **31×** before the FlowState refactor |
 | 10_recursion_deep | 0.248 | 0.237 | 1.05× | |
 | 11_closure_counter | 0.091 | 0.089 | 1.03× | captured mutable state |
 | 12_higher_order | 0.213 | 0.141 | 1.52× | |
@@ -219,19 +223,19 @@ Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 | **39_find_builtin** | 0.059 | 0.113 | **0.52×** | MyLang faster |
 | 40_math_builtins | 0.179 | 0.088 | 2.04× | long double vs double |
 | 41_str_int_conv | 0.104 | 0.066 | 1.57× | |
-| 42_exceptions | 1.375 | 0.059 | **23.4×** | throw/catch per iteration |
+| 42_exceptions | 1.468 | 0.065 | **22.5×** | genuine throw/catch per iteration |
 | 43_sieve | 0.420 | 0.101 | 4.17× | |
-| 44_primes_sqrt | 0.523 | 0.108 | 4.85× | |
+| 44_primes_sqrt | 0.300 | 0.120 | 2.49× | `return` in loop, was 4.9× before refactor |
 | 45_gcd | 0.308 | 0.088 | 3.50× | |
 | 46_matrix_mult | 0.057 | 0.035 | 1.63× | nested subscripting |
 | 47_wordcount | 0.143 | 0.074 | 1.93× | split + dict |
 | 48_const_fold | 0.125 | — | — | MyLang-only (parse-time folding) |
 
-**geomean: ~1.6× slower** across the 47 paired benchmarks (this box, CPython
+**geomean: ~1.5× slower** across the 47 paired benchmarks (this box, CPython
 3.14). MyLang is *faster* on 5 (`28_str_concat` 0.01×, `15_array_slice_readonly`
-0.37×, `39_find_builtin` 0.52×, `26_dict_iterate` 0.73×, `01_while_loop` 0.92×)
-and within 2× on the large majority. Only recursion (`09` 31×) and per-iteration
-exceptions (`42` 23×) blow out.
+0.37×, `39_find_builtin` 0.52×, `26_dict_iterate` 0.74×, `01_while_loop` 0.90×)
+and within 2× on the large majority. The lone real blow-out is per-iteration
+*genuine* exceptions (`42` ~22×).
 
 ### How to read the outliers
 
@@ -239,15 +243,20 @@ exceptions (`42` 23×) blow out.
   (amortized O(1)) vs CPython's O(n²) `+=` in this configuration — see the note
   above. The single biggest gap in the suite, in MyLang's favor.
 - **`15_array_slice_readonly` (0.37×), `39_find_builtin` (0.52×),
-  `26_dict_iterate` (0.73×):** MyLang does less or tighter work — an O(1)
+  `26_dict_iterate` (0.74×):** MyLang does less or tighter work — an O(1)
   copy-on-write view instead of an O(k) list copy; a C++ `std::find`/`==` scan
   and `unordered_map` walk instead of per-element Python object dispatch.
-- **`09_fib_recursive` (31×), `42_exceptions` (23×):** the tree-walker's true
-  weak spots. Every call builds a fresh `EvalContext` and every `throw` unwinds
-  a real C++ exception — both far heavier than CPython's frame/`raise` handling.
-  The trial-division / sieve / gcd benchmarks (`43`–`45`, ~3.5–5×) are milder
-  versions of the same call-and-per-op overhead.
-- **`27_dict_keys_values` (8.2×):** allocates two fresh arrays every iteration;
+- **`42_exceptions` (~22×):** the remaining weak spot, and it's fundamental —
+  every `throw` heap-allocates an exception object and unwinds the C++ stack via
+  DWARF tables (~1.6µs, irreducible by build flags). This is the *right*
+  tradeoff: C++ "zero-cost" EH is free until thrown, so it's reserved for rare
+  events.
+- **`09_fib_recursive` (3.5×), `44_primes_sqrt` (2.5×):** these were ~31× and
+  ~4.9× when `return`/`break`/`continue` rode on C++ exceptions (a base-case
+  `return` fired millions of times). Moving them onto a `FlowState` flag — so
+  only real errors and user `throw` use exceptions — collapsed the gap to
+  ordinary tree-walk overhead (fresh `EvalContext` per call + dynamic dispatch).
+- **`27_dict_keys_values` (8.0×):** allocates two fresh arrays every iteration;
   array materialization is comparatively expensive.
 
 ## Adding a benchmark
