@@ -1,6 +1,6 @@
 # Executable proof that MyLang's container semantics match Python's, so the
 # performance comparison in this directory is apples-to-apples. Run with:
-#     ./build/mylang bench/verify_semantics.ml
+#     ./build/mylang bench/verify_semantics.my
 # and compare against:  python3 bench/verify_semantics.py
 # Both must print "all semantics checks passed". Each assert below has the
 # identical assertion in the .py file.
