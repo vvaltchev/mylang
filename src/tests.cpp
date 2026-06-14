@@ -1469,6 +1469,39 @@ static const std::vector<test> tests =
     },
 
     {
+        "const param: basic, value is usable",
+        {
+            "func f(const x, y) { return x + y; }",
+            "assert(f(3, 4) == 7);",
+        },
+    },
+
+    {
+        "const param: reassigning it is a compile-time error",
+        {
+            "func f(const x) { x = 9; return x; }",
+            "print(f(1));",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "const param: a non-const param next to it stays mutable",
+        {
+            "func f(const x, y) { y = y + x; return y; }",
+            "assert(f(10, 5) == 15);",
+        },
+    },
+
+    {
+        "const param: a pure func may reassign its own (non-const) param",
+        {
+            "pure func f(x) { x = x * 2; return x + 1; }",
+            "assert(f(10) == 21);",
+        },
+    },
+
+    {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
         {
             "var c = 0;",

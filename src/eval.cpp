@@ -249,9 +249,15 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < args.size(); i++) {
+        /*
+         * A param's binding is const iff it was declared `const` - NOT merely
+         * because we are const-evaluating. This lets a (pure) function reassign
+         * its own by-value parameters during const-eval, while a `const` param
+         * stays immutable everywhere.
+         */
         bind_param(
             args_ctx, frame, i, funcParams[i].get(),
-            RValue(args[i]->eval(ctx)), ctx->const_ctx
+            RValue(args[i]->eval(ctx)), funcParams[i]->const_param
         );
     }
 }

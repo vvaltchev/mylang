@@ -34,6 +34,7 @@ as well.
       - [The "indexed" keyword](#extra-features-the-indexed-keyword)
       - [Array expansion](#extra-features-array-expansion)
     * [Functions and lambdas](#functions-and-lambdas)
+      - [Const parameters](#const-parameters)
       - [Lambda captures](#lambda-captures)
       - [Calling functions during const-evaluation](#calling-functions-during-const-evaluation)
       - [Pure functions](#pure-functions)
@@ -604,6 +605,23 @@ var add = func (x, y) => x + y;
 
 Note: when creating function objects in expressions, we're not allowed to assign
 them a name.
+
+#### Const parameters
+
+A parameter can be declared `const`, which forbids reassigning it in the body:
+
+```C#
+func f(const x, y) {
+  y = y + 1;     # OK: `y` is an ordinary (mutable) parameter
+  return x + y;  # `x` may be read but never reassigned
+}
+```
+
+Reassigning a `const` parameter is a compile-time error. A non-const parameter
+stays mutable, and - since parameters are passed by value - a function (even a
+`pure` one) may freely reassign its own non-const parameters without affecting
+the caller. A plain parameter that is never reassigned anywhere in the body is
+treated as *effectively const* automatically.
 
 #### Lambda captures
 

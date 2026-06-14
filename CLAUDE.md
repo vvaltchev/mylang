@@ -503,6 +503,15 @@ omits the nodes `walk()` handles itself (Block/for/foreach/try/`Expr14`), so
   consts + params).
   Builtins are different: they receive the **caller's `ctx`** and the
   **unevaluated** `ExprList`.
+- **Const parameters.** A param declared `const` (`func f(const x, y)`, parsed
+  by `pFuncParam`, flagged `Identifier::const_param`) is bound as a const
+  `LValue`, so reassigning it throws — caught at compile time by the resolver
+  (a `const` param with a nonzero body write count → `CannotRebindConstEx`) and,
+  as a fallback, at runtime. Params are otherwise bound **mutable** — even
+  during const-eval — so a (pure) function may reassign its own by-value params;
+  binding const-ness is keyed off `const_param`, *not* `ctx->const_ctx`. A plain
+  param the resolver finds is never reassigned (`slot_writes == 0`) is tagged
+  `auto_const_param` (effectively const; used by `isconst()`).
 - **`clone()` semantics differ by capture.** A non-capturing `FuncObject` clones
   to *itself* (shared
   `shared_ptr`); a capturing one is deep-copied so each clone has independent
