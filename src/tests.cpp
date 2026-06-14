@@ -1965,6 +1965,27 @@ static const std::vector<test> tests =
     { "int division by zero",           { "5 / 0;" }, &typeid(DivisionByZeroEx) },
     { "int modulo by zero",             { "5 % 0;" }, &typeid(DivisionByZeroEx) },
 
+    /* ---- base Type virtuals (type.h): unsupported-operation errors ---- */
+    { "none + x is unsupported", { "var n=none; var y=n+1;" }, &typeid(TypeErrorEx) },
+    { "none - x is unsupported", { "var n=none; var y=n-1;" }, &typeid(TypeErrorEx) },
+    { "none * x is unsupported", { "var n=none; var y=n*1;" }, &typeid(TypeErrorEx) },
+    { "none / x is unsupported", { "var n=none; var y=n/1;" }, &typeid(TypeErrorEx) },
+    { "none % x is unsupported", { "var n=none; var y=n%1;" }, &typeid(TypeErrorEx) },
+    { "none < x is unsupported", { "var n=none; var y=n<1;" }, &typeid(TypeErrorEx) },
+    { "none > x is unsupported", { "var n=none; var y=n>1;" }, &typeid(TypeErrorEx) },
+    { "none <= x is unsupported",{ "var n=none; var y=n<=1;" }, &typeid(TypeErrorEx) },
+    { "none >= x is unsupported",{ "var n=none; var y=n>=1;" }, &typeid(TypeErrorEx) },
+    { "unary - on none is unsupported",
+      { "var n=none; var y=-n;" }, &typeid(TypeErrorEx) },
+    { "subscript on a non-container is unsupported",
+      { "var x=5; var y=x[0];" }, &typeid(TypeErrorEx) },
+    { "slice on a non-container is unsupported",
+      { "var x=5; var y=x[0:1];" }, &typeid(TypeErrorEx) },
+    { "hash() of an array is unsupported",
+      { "hash([1,2]);" }, &typeid(TypeErrorEx) },
+    { "hash() of none is unsupported",
+      { "hash(none);" }, &typeid(TypeErrorEx) },
+
     /* ---- float operators (float.cpp.h) ---- */
     { "float + non-numeric is a type error",
       { "2.5 + \"x\";" }, &typeid(TypeErrorEx) },
