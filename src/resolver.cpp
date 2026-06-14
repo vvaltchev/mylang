@@ -5,13 +5,14 @@
 #include "errors.h"
 
 #include <functional>
+#include <unordered_set>
 #include <vector>
 
 /*
- * Name-resolution pass (slice 2a): resolve a function's PARAMETERS and its
- * LOCAL variables (var/const, for-init, foreach variables, catch variables) to
- * fixed Frame slots, so that references become O(1) slot reads at runtime
- * instead of std::map lookups walking the scope chain.
+ * Name-resolution pass: resolve a function's PARAMETERS and LOCAL variables
+ * (var/const, for-init, foreach variables, catch variables), plus eligible
+ * TOP-LEVEL variables, to fixed Frame slots, so references become O(1) slot
+ * reads at runtime instead of std::map lookups walking the scope chain.
  *
  * What is and isn't resolved:
  *
@@ -19,12 +20,13 @@
  *   - function NAMES (FuncDeclStmt::id)                -> NOT slotted; kept in
  *         the map. They are forward-reference-able (mutual recursion), and a
  *         forward reference necessarily resolves to "unresolved" in this
- *         single forward pass; a name in a slot would then not be found.
+ *         forward pass; a name in a slot would then not be found.
  *         A function-name declaration still creates a scope entry so it
  *         correctly SHADOWS an outer slotted binding of the same name.
- *   - top-level (module-scope) variables              -> NOT slotted here; that
- *         is slice 2b. The top-level walk only descends to find and resolve
- *         nested functions.
+ *   - top-level (module-scope) vars -> slotted in an implicit "main" frame,
+ *         EXCEPT any a function reads: functions reach globals through the
+ *         scope-chain map walk (not slots), so a function-read global must
+ *         stay in the map. See run()'s two passes and `escaped`.
  *   - builtins, captures, anything unresolved         -> map fallback.
  *
  * Resolution is a forward walk with a lexical scope stack: a ref resolves
@@ -66,20 +68,44 @@ struct Scope {
  */
 struct FuncState {
     bool slottable = false;
+    bool is_main = false;           /* the implicit top-level "main" frame */
     FuncDeclStmt *fd = nullptr;
     int next_slot = 0;
     std::vector<Scope> scopes;
     std::vector<int> writes;        /* per slot -> fd->slot_writes */
+    std::unordered_set<const UniqueId *> captures;   /* capture names */
 };
 
 class Resolver {
 
 public:
 
-    /* Resolve the whole tree, outside any function (cur == nullptr). */
-    void run(Construct *root) { walk(root, nullptr); }
+    /*
+     * Resolve the whole tree. Two passes: first resolve every function body
+     * (collecting the globals functions read into `escaped`), then slot the
+     * top-level variables that aren't in `escaped`. The root Block records its
+     * own slot range (slot_count == top-level frame size), and Block::do_eval
+     * builds the "main" Frame from it - so nothing needs to be returned here.
+     */
+    void run(Construct *root)
+    {
+        top_level_only = false;
+        walk(root, nullptr);            /* pass 1: functions; fill `escaped` */
+
+        top_level_only = true;          /* pass 2: top level as "main" */
+        FuncState main_st;
+        main_st.slottable = true;
+        main_st.is_main = true;
+        walk(root, &main_st);
+    }
 
 private:
+
+    /* Names a function reads from outer scope: kept in the map, not slotted. */
+    std::unordered_set<const UniqueId *> escaped;
+
+    /* Pass 2: function bodies are already resolved, so don't re-enter them. */
+    bool top_level_only = false;
 
     void walk(Construct *c, FuncState *cur);
     void process_function(FuncDeclStmt *fd);
@@ -97,7 +123,12 @@ private:
 
         check_no_redecl(cur, id);
 
-        if (cur->next_slot >= MAX_SLOTS) {
+        /* A top-level variable that some function reads must stay in the map
+         * (functions reach globals via the scope-chain map walk, not slots),
+         * so add it as a masking entry instead of slotting it. */
+        const bool keep_in_map = cur->is_main && escaped.count(id->uid);
+
+        if (keep_in_map || cur->next_slot >= MAX_SLOTS) {
             cur->scopes.back().decls.push_back({ id->uid, -1 });
             return;
         }
@@ -132,24 +163,31 @@ private:
     }
 
     /*
-     * Resolve a reference: search scopes innermost-out. A slotted match
-     * stamps the identifier; a masking match (-1) leaves it unresolved (map);
-     * no match also leaves it unresolved (builtin / capture / global).
+     * Resolve a reference: search scopes innermost-out. A slotted match stamps
+     * the identifier; a masking match (-1) leaves it unresolved (map); no match
+     * also leaves it unresolved (builtin / capture / global). A non-captured
+     * free name in a function is recorded in `escaped` so the top-level pass
+     * keeps that global in the map (functions read globals via the map).
      */
-    void resolve_ref(FuncState *cur, Identifier *id) const
+    void resolve_ref(FuncState *cur, Identifier *id)
     {
-        if (!cur || !cur->slottable || !id)
+        if (!cur || !id)
             return;
 
-        for (auto s = cur->scopes.rbegin(); s != cur->scopes.rend(); ++s) {
-            for (const auto &d : s->decls) {
-                if (d.first == id->uid) {
-                    if (d.second >= 0)
-                        id->sym = ResolvedSym{ SymKind::local, d.second };
-                    return;     /* found (slotted or masked) */
+        if (cur->slottable) {
+            for (auto s = cur->scopes.rbegin(); s != cur->scopes.rend(); ++s) {
+                for (const auto &d : s->decls) {
+                    if (d.first == id->uid) {
+                        if (d.second >= 0)
+                            id->sym = ResolvedSym{ SymKind::local, d.second };
+                        return;     /* found (slotted or masked) */
+                    }
                 }
             }
         }
+
+        if (!cur->is_main && !cur->captures.count(id->uid))
+            escaped.insert(id->uid);
     }
 
     /* Count an assignment to a resolved-local lvalue as a write of its slot. */
@@ -259,6 +297,13 @@ Resolver::process_function(FuncDeclStmt *fd)
     FuncState st;
     st.fd = fd;
 
+    /* Capture names are bound via capture_ctx (the map), not slotted; a body
+     * reference to one is not a "free global" - exclude them from `escaped`. */
+    if (fd->captures) {
+        for (auto &cap : fd->captures->elems)
+            st.captures.insert(cap->uid);
+    }
+
     const int nparams =
         fd->params ? static_cast<int>(fd->params->elems.size()) : 0;
     st.slottable = nparams <= MAX_SLOTS;
@@ -314,7 +359,11 @@ Resolver::walk(Construct *c, FuncState *cur)
         if (fd->id)
             declare_masking(cur, fd->id.get());
 
-        process_function(fd);
+        /* In the top-level pass the body was already resolved (pass 1); here we
+         * only needed its capture list and name re-resolved at top level. */
+        if (!top_level_only)
+            process_function(fd);
+
         return;
     }
 
@@ -442,7 +491,9 @@ Resolver::walk(Construct *c, FuncState *cur)
 } // anonymous namespace
 
 /*
- * Public entry point: run the name-resolution pass over the parsed tree.
+ * Public entry point: run the name-resolution pass over the parsed tree. The
+ * top-level frame size is recorded on the root Block (its slot_count); the
+ * runtime builds the "main" Frame from it in Block::do_eval.
  */
 void
 resolve_names(Construct *root)

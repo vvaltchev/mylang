@@ -386,13 +386,17 @@ and it lives *inside the parser*. Mechanics:
   `Identifier::do_eval` for a resolved local is an O(1) read of
   `EvalContext::frame->slots[slot]` instead of the `map`+parent-chain walk. A
   call's `Frame` (an inline slot buffer + heap spill past 8, plus a `uint64_t
-  live` bitmask; created in `do_func_call` when `FuncDeclStmt::resolved`) is
-  shared by the call's nested blocks (the `frame` pointer is inherited).
-  **Slotted: a function's params and its locals** — `var`/`const`, `for`-init,
-  `foreach` and `catch` variables. **Not slotted (stay in the map):** function
-  *names* (so forward references / mutual recursion work), top-level variables
-  (a later slice), builtins and captures. Anything unresolved falls back to the
-  map, so the pass is purely an optimization. The resolver does a forward
+  live` bitmask) is created in `do_func_call` when `FuncDeclStmt::resolved`, and
+  for the program's implicit "main" by `Block::do_eval` on the root block;
+  nested blocks inherit the `frame` pointer.
+  **Slotted: a function's params and its locals** (`var`/`const`, `for`-init,
+  `foreach`, `catch` variables) **and top-level variables.** **Not slotted (stay
+  in the map):** function *names* (so forward references / mutual recursion
+  work), builtins, captures, and any **top-level variable a function reads** —
+  functions reach globals through the scope-chain map walk, not slots, so the
+  resolver's first pass collects those names (`escaped`) and its second pass
+  keeps them in the map. Anything unresolved falls back to the map, so the pass
+  is purely an optimization. The resolver does a forward
   lexical walk (no hoisting, so `var x = x + 1` reads the outer `x`); each
   `Block` records its slot range and `Block::do_eval` clears those `live` bits
   on entry, so a re-entered loop body's locals start undefined again. Slots

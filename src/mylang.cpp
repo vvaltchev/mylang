@@ -268,7 +268,8 @@ int main(int argc, char **argv)
             );
 
         if (!opt_no_run) {
-            /* Resolve names to slots, then run the script */
+            /* Resolve names to slots, then run the script. The root block
+             * builds its own "main" Frame for slotted top-level variables. */
             resolve_names(root.get());
             root->eval(nullptr);
         }
