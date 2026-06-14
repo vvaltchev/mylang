@@ -66,9 +66,10 @@ a tolerance so cosmetic float-formatting differences don't register as
 mismatches).
 
 On a terminal, the `my/py` ratio is colored on a 256-color gradient — brightest
-green for the biggest wins (ratio ≤ 0.35) fading to dark green near break-even,
-then dark red just past 1.0 brightening to red for the worst regressions (ratio
-≥ 3.0). Output that isn't a TTY (a pipe, or `--csv`) stays plain.
+green for the biggest wins (ratio ≤ 0.35), smoothly fading to a neutral grey
+across the break-even band (0.95–1.05), then to brightest red for the worst
+regressions (ratio ≥ 3.0). Output that isn't a TTY (a pipe, or `--csv`) stays
+plain.
 
 ## Are MyLang and Python semantically the same? (read this first)
 
