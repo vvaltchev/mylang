@@ -1414,6 +1414,298 @@ static const std::vector<test> tests =
         },
     },
 
+    /* More read-only / clone / deepclone coverage. */
+    {
+        "Const array: pop through a param is rejected",
+        {
+            "func g(p) { pop(p); }",
+            "const y = [1,2,3];",
+            "g(y);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Const array: erase through a param is rejected",
+        {
+            "func g(p) { erase(p, 0); }",
+            "const y = [1,2,3];",
+            "g(y);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Const array: insert through a param is rejected",
+        {
+            "func g(p) { insert(p, 0, 9); }",
+            "const y = [1,2,3];",
+            "g(y);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Const dict: insert through a param is rejected",
+        {
+            "func g(p) { insert(p, \"k\", 9); }",
+            "const d = {\"a\": 1};",
+            "g(d);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Const empty array is read-only",
+        {
+            "func g(p) { append(p, 1); }",
+            "const e = [];",
+            "g(e);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Read a const dict's keys at runtime: existing and missing",
+        {
+            /* k is a runtime param, so the subscript is not const-folded and
+             * hits the read-only dict's runtime subscript path. */
+            "func get(p, k) { return p[k]; }",
+            "const d = {\"a\": 1};",
+            "assert(get(d, \"a\") == 1);",
+            "assert(get(d, \"zzz\") == none);",  /* missing: none, no vivify */
+            "assert(len(d) == 1);",
+        },
+    },
+
+    {
+        "Read a const dict's members at runtime: existing and missing",
+        {
+            "func ga(p) { return p.a; }",
+            "func gz(p) { return p.zzz; }",
+            "const d = {\"a\": 1};",
+            "assert(ga(d) == 1);",
+            "assert(gz(d) == none);",            /* missing: none, no vivify */
+            "assert(len(d) == 1);",
+        },
+    },
+
+    {
+        "Const dict nested in a fresh array stays read-only",
+        {
+            "const d = {\"a\": 1};",
+            "var a = [d];",
+            "assert(a[0][\"a\"] == 1);",
+            "a[0][\"a\"] = 9;",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "deepclone() of a deeply nested const is fully mutable",
+        {
+            "const y = [[[1]]];",
+            "var c = deepclone(y);",
+            "c[0][0][0] = 9;",
+            "assert(c == [[[9]]]);",
+            "assert(y == [[[1]]]);",
+        },
+    },
+
+    {
+        "clone() of a string returns it unchanged",
+        {
+            "assert(clone(\"hi\") == \"hi\");",
+        },
+    },
+
+    {
+        "deepclone() with the wrong number of arguments is rejected",
+        {
+            "deepclone(1, 2);",
+        },
+        &typeid(InvalidNumberOfArgsEx),
+    },
+
+    {
+        "Array + non-array is a type error",
+        {
+            "func f(a) { return a + 5; }",
+            "f([1,2]);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "Array equality: equal, length mismatch, type mismatch",
+        {
+            "func eq2(a, b) { return a == b; }",
+            "assert(eq2([1,2], [1,2]));",
+            "assert(eq2([1,2], [1,2,3]) == false);",
+            "assert(eq2([1,2], 5) == false);",
+        },
+    },
+
+    {
+        "Array subscript with a non-integer is a type error",
+        {
+            "func f(a) { return a[\"x\"]; }",
+            "f([1,2,3]);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "Array slice edge cases",
+        {
+            "func sl(a) {",
+            "   assert(a[1:] == [2,3]);",         /* open end */
+            "   assert(a[:2] == [1,2]);",         /* open start */
+            "   assert(a[-10:] == [1,2,3]);",     /* start clamped to 0 */
+            "   assert(a[:-1] == [1,2]);",        /* negative end */
+            "   assert(a[:100] == [1,2,3]);",     /* end clamped to size */
+            "   assert(a[5:] == []);",            /* start past end */
+            "   assert(a[2:1] == []);",           /* end <= start */
+            "}",
+            "sl([1,2,3]);",
+        },
+    },
+
+    {
+        "Array slice with a non-integer start is a type error",
+        {
+            "func sl(a) { return a[\"x\":]; }",
+            "sl([1,2,3]);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "Array slice with a non-integer end is a type error",
+        {
+            "func sl(a) { return a[1:\"x\"]; }",
+            "sl([1,2,3]);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "Writing outside a live slice doesn't detach it",
+        {
+            /* The write at index 3 is outside s's [0:2] range, so the COW pass
+             * skips s (it keeps sharing) and the in-place write is visible. */
+            "var a = [1,2,3,4];",
+            "var s = a[0:2];",
+            "a[3] = 99;",
+            "assert(a == [1,2,3,99]);",
+            "assert(s == [1,2]);",
+        },
+    },
+
+    {
+        "str() of a multi-element dict",
+        {
+            "assert(str({\"a\":1, \"b\":2}) != \"\");",
+        },
+    },
+
+    {
+        "clone() with the wrong number of arguments is rejected",
+        {
+            "clone(1, 2);",
+        },
+        &typeid(InvalidNumberOfArgsEx),
+    },
+
+    /* erase()/insert() error paths. */
+    {
+        "erase() with the wrong number of arguments is rejected",
+        {
+            "var a = [1,2,3];",
+            "erase(a);",
+        },
+        &typeid(InvalidNumberOfArgsEx),
+    },
+
+    {
+        "erase() on a non-lvalue is rejected",
+        {
+            "erase([1,2,3], 0);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "erase() on a const-declared variable is rejected",
+        {
+            "const y = [1,2,3];",
+            "erase(y, 0);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "erase() on an array with a non-integer index is a type error",
+        {
+            "var a = [1,2,3];",
+            "erase(a, \"x\");",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "erase() on an unsupported container type is a type error",
+        {
+            "var x = 5;",
+            "erase(x, 0);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "insert() with the wrong number of arguments is rejected",
+        {
+            "var a = [1,2,3];",
+            "insert(a, 0);",
+        },
+        &typeid(InvalidNumberOfArgsEx),
+    },
+
+    {
+        "insert() on a non-lvalue is rejected",
+        {
+            "insert([1,2,3], 0, 9);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "insert() on a const-declared variable is rejected",
+        {
+            "const y = [1,2,3];",
+            "insert(y, 0, 9);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "insert() on an array with a non-integer index is a type error",
+        {
+            "var a = [1,2,3];",
+            "insert(a, \"x\", 9);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "insert() on an unsupported container type is a type error",
+        {
+            "var x = 5;",
+            "insert(x, 0, 9);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
     {
         "Split string, char by char",
         {
