@@ -435,6 +435,13 @@ public:
     LValue *container;
     size_type container_idx;
 
+    /*
+     * Default: an unbound `none` slot. Needed so Frame (eval.h) can hold an
+     * inline array of slots; the value is always `none` here, so type_checks()
+     * would trivially pass and is skipped to keep this cheap (it runs per slot).
+     */
+    LValue() : val(), is_const(false), container(nullptr) { }
+
     LValue(const EvalValue &val, bool is_const)
         : val(val)
         , is_const(is_const)
