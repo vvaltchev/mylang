@@ -1,5 +1,5 @@
 # Python has no const-folding of user variables, so the constant `k`
-# sub-expression is recomputed every iteration (see the .ml file).
+# sub-expression is recomputed every iteration (see the .my file).
 import sys
 scale = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 

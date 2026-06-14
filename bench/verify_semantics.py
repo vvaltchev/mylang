@@ -1,9 +1,9 @@
-# Python mirror of verify_semantics.ml: every assertion below is identical to
+# Python mirror of verify_semantics.my: every assertion below is identical to
 # the MyLang one, demonstrating that the two languages agree on container
 # semantics (aliasing, slice independence, clone, by-reference arguments,
 # immutable-string slices, shared inner arrays). Run:
 #     python3 bench/verify_semantics.py
-# Must print "all semantics checks passed", same as the .ml version.
+# Must print "all semantics checks passed", same as the .my version.
 
 # --- plain assignment ALIASES (reference semantics) ------------------------
 x = [1, 2, 3]

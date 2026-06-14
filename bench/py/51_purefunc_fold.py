@@ -1,5 +1,5 @@
 # Python has no auto-pure / const-folding of user functions, so sq()/cube() are
-# actually called every iteration (see the .ml file).
+# actually called every iteration (see the .my file).
 import sys
 scale = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 

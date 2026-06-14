@@ -3,7 +3,7 @@
 #
 # MyLang vs CPython benchmark runner.
 #
-# Pairs every script in bench/ml/<name>.ml with bench/py/<name>.py (when one
+# Pairs every script in bench/my/<name>.my with bench/py/<name>.py (when one
 # exists), runs each a few times, keeps the best wall-clock time, and prints a
 # comparison table. Benchmarks without a Python counterpart (a MyLang-only
 # feature, e.g. parse-time const folding) are still timed; their Python column
@@ -26,8 +26,36 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ML_DIR = os.path.join(HERE, "ml")
+MY_DIR = os.path.join(HERE, "my")
 PY_DIR = os.path.join(HERE, "py")
+
+# Color the my/py ratio on a TTY only (never when redirected / into the CSV).
+USE_COLOR = sys.stdout.isatty()
+
+
+def ratio_xterm_color(ratio):
+    """xterm-256 color for a my/py ratio: a gradient from brightest green at
+    ratio <= 0.35 (best improvement) through dark green / dark red around the
+    1.0 break-even point up to brightest red at ratio >= 3.0 (worst
+    regression). Returns a 256-color palette index."""
+    if ratio <= 0.35:
+        return 46                       # brightest green (cube 0,5,0)
+    if ratio < 1.0:
+        # bright green at 0.35 -> dark green at 1.0
+        frac = (1.0 - ratio) / (1.0 - 0.35)         # 1.0 .. 0.0
+        return 16 + 6 * (1 + round(4 * frac))       # 46 .. 22
+    if ratio >= 3.0:
+        return 196                      # brightest red (cube 5,0,0)
+    # dark red just above 1.0 -> bright red at 3.0
+    frac = (ratio - 1.0) / (3.0 - 1.0)              # 0.0 .. 1.0
+    return 16 + 36 * (1 + round(4 * frac))          # 52 .. 196
+
+
+def colorize_ratio(ratio, text):
+    """Wrap `text` (already padded) in the ratio's color, on a TTY only."""
+    if not USE_COLOR or ratio is None:
+        return text
+    return "\x1b[38;5;%dm%s\x1b[0m" % (ratio_xterm_color(ratio), text)
 
 
 def find_mylang(explicit):
@@ -133,7 +161,7 @@ def main():
     if not mylang:
         sys.exit("error: mylang binary not found; build it (make -j) or pass --mylang")
 
-    names = sorted(f[:-3] for f in os.listdir(ML_DIR) if f.endswith(".ml"))
+    names = sorted(f[:-3] for f in os.listdir(MY_DIR) if f.endswith(".my"))
     if args.filter:
         names = [n for n in names if args.filter in n]
     if not names:
@@ -149,18 +177,18 @@ def main():
         print(warn + "\n")
 
     hdr = "%-24s %10s %10s %8s  %s" % (
-        "benchmark", "mylang(s)", "python(s)", "ml/py", "result")
+        "benchmark", "mylang(s)", "python(s)", "my/py", "result")
     print(hdr)
     print("-" * len(hdr))
 
     rows = []
     ratios = []
     for name in names:
-        ml_path = os.path.join(ML_DIR, name + ".ml")
+        my_path = os.path.join(MY_DIR, name + ".my")
         py_path = os.path.join(PY_DIR, name + ".py")
 
-        ml_t, ml_out, ml_err = time_cmd(
-            [mylang, ml_path, scale_arg], args.repeat, args.timeout)
+        my_t, my_out, my_err = time_cmd(
+            [mylang, my_path, scale_arg], args.repeat, args.timeout)
 
         if os.path.isfile(py_path):
             py_t, py_out, py_err = time_cmd(
@@ -168,44 +196,54 @@ def main():
         else:
             py_t, py_out, py_err = (None, None, "no-py")
 
-        if ml_err:
-            status = "ML " + ml_err
+        if my_err:
+            status = "MY " + my_err
         elif py_err == "no-py":
-            status = "ml-only"
+            status = "my-only"
         elif py_err:
             status = "PY " + py_err
-        elif results_match(ml_out, py_out):
+        elif results_match(my_out, py_out):
             status = "ok"
         else:
-            status = "DIFF: ml=%r py=%r" % (ml_out, py_out)
+            status = "DIFF: my=%r py=%r" % (my_out, py_out)
 
-        ml_s = "%.3f" % ml_t if ml_t is not None else "-"
+        my_s = "%.3f" % my_t if my_t is not None else "-"
         py_s = "%.3f" % py_t if py_t is not None else "-"
-        if ml_t and py_t:
-            ratio = ml_t / py_t
+        ratio = None
+        if my_t and py_t:
+            ratio = my_t / py_t
             ratios.append(ratio)
             ratio_s = "%.2fx" % ratio
         else:
             ratio_s = "-"
 
-        print("%-24s %10s %10s %8s  %s" % (name, ml_s, py_s, ratio_s, status))
-        rows.append((name, ml_s, py_s, ratio_s, status))
+        # Pad to width first, then color, so the ANSI escapes don't throw off
+        # column alignment. CSV/rows keep the plain string.
+        ratio_field = colorize_ratio(ratio, "%8s" % ratio_s)
+        print("%-24s %10s %10s %s  %s" %
+              (name, my_s, py_s, ratio_field, status))
+        rows.append((name, my_s, py_s, ratio_s, status))
 
     if ratios:
         prod = 1.0
         for r in ratios:
             prod *= r
         geomean = prod ** (1.0 / len(ratios))
+        gm = colorize_ratio(geomean, "%.2fx" % geomean)
+        if geomean >= 1.0:
+            tail = "MyLang is ~%.1fx slower" % geomean
+        else:
+            tail = "MyLang is ~%.1fx faster" % (1.0 / geomean)
         print("-" * len(hdr))
-        print("geomean ml/py over %d paired benchmarks: %.2fx "
-              "(MyLang is ~%.1fx slower)" % (len(ratios), geomean, geomean))
+        print("geomean my/py over %d paired benchmarks: %s (%s)"
+              % (len(ratios), gm, tail))
 
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("benchmark,mylang_s,python_s,ml_over_py,status\n")
-            for name, ml_s, py_s, ratio_s, status in rows:
+            f.write("benchmark,mylang_s,python_s,my_over_py,status\n")
+            for name, my_s, py_s, ratio_s, status in rows:
                 f.write("%s,%s,%s,%s,%s\n" %
-                        (name, ml_s, py_s, ratio_s.rstrip("x"),
+                        (name, my_s, py_s, ratio_s.rstrip("x"),
                          status.replace(",", ";")))
         print("\nwrote %s" % args.csv)
 

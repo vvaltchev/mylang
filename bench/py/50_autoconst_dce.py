@@ -1,6 +1,6 @@
 # Python computes the whole constant guard every iteration (the big arithmetic
 # is on the left of `and DEBUG`, so it can't be short-circuited away) and cannot
-# remove the branch (see the .ml file).
+# remove the branch (see the .my file).
 import sys
 scale = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 

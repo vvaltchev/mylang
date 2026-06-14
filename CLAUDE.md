@@ -117,10 +117,12 @@ distinct C++ type.
 
 `bench/` is a standalone performance suite comparing MyLang against CPython,
 construct by construct
-(`bench/ml/NN_name.ml` paired with `bench/py/NN_name.py`; a few MyLang-only
+(`bench/my/NN_name.my` paired with `bench/py/NN_name.py`; a few MyLang-only
 features like const-folding
-have no `.py`). `python3 bench/run.py` times every pair (best of N), prints an
-`ml/py` ratio table, and
+have no `.py`). MyLang scripts use the `.my` extension. `python3 bench/run.py`
+times every pair (best of N), prints a
+`my/py` ratio table (the ratio number is colored on a TTY — a green→red
+gradient, plain when piped or `--csv`), and
 checks the two implementations printed matching results. Each script takes a
 `scale` multiplier as its
 first argv. It is *not* wired into `make`/CI and has no third-party deps.
@@ -129,11 +131,12 @@ written answer to "do MyLang and Python behave the same?": they do *observably*
 — assignment aliases,
 slices act like independent copies (MyLang via lazy copy-on-write, so read-only
 slicing is far cheaper),
-`clone()` deep-copies — with the divergences (64-bit wrapping vs bignum,
+`clone()` makes a shallow copy and `deepclone()` a deep one — with the
+divergences (64-bit wrapping vs bignum,
 `long double` vs double,
 truncating vs flooring division, unordered vs insertion-ordered dicts)
 enumerated there.
-`bench/verify_semantics.{ml,py}` assert that equivalence and must both print the
+`bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
 ## Source layout & compilation model
