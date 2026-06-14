@@ -473,21 +473,34 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 }
 
 /*
- * Produce a fresh, fully-mutable deep copy of a const-evaluated container
- * value. This is what LiteralObj::do_eval hands out (see syntax.h): each
- * evaluation gets an independent, mutable array/dict - exactly what the old
- * per-element LiteralArray/LiteralDict produced at runtime - so writing through
- * a `var` bound to it works (no const element flags) and re-evaluating the node
- * never observes a prior mutation (nested containers are copied too). Scalars
- * and strings are returned as-is (trivially immutable / copy-on-write). Empty
- * arrays collapse to the shared empty_arr singleton, matching LiteralArray.
+ * Produce a fresh, mutable copy of a const-evaluated container value.
+ *
+ * `through_readonly` controls how read-only (const-backed) sub-objects are
+ * handled:
+ *   - false (make_mutable_clone): a read-only sub-object is *shared* as-is, not
+ *     copied. So a fresh mutable top is built, but const sub-objects stay const
+ *     and shared. This keeps clone() shallow (a const inside the result remains
+ *     read-only) and makes const-ness propagate into fresh literals
+ *     (`var a = [y]` with `y` const keeps `a[0]` read-only). Mutable
+ *     sub-objects are still copied fresh, so re-evaluating the node never
+ *     observes a prior mutation.
+ *   - true (make_deep_mutable_clone): every level is copied and made mutable
+ *     (read-only dropped), yielding a fully independent, writable value. This
+ *     backs deepclone().
+ * Scalars and strings are returned as-is. An empty array collapses to the
+ * shared empty_arr singleton, matching LiteralArray.
  */
 static EvalValue
-make_mutable_clone(const EvalValue &v)
+clone_to_mutable(const EvalValue &v, bool through_readonly)
 {
     if (v.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = v.get<SharedArrayObj>().get_view();
+        const SharedArrayObj &arr = v.get<SharedArrayObj>();
+
+        if (arr.is_readonly() && !through_readonly)
+            return v;   /* share the const sub-object, don't copy it */
+
+        const ArrayConstView &view = arr.get_view();
 
         if (!view.size())
             return empty_arr;
@@ -495,22 +508,31 @@ make_mutable_clone(const EvalValue &v)
         SharedArrayObj::vec_type vec;
         vec.reserve(view.size());
 
-        for (unsigned i = 0; i < view.size(); i++)
-            vec.emplace_back(make_mutable_clone(view[i].get()), false);
+        for (unsigned i = 0; i < view.size(); i++) {
+            vec.emplace_back(
+                clone_to_mutable(view[i].get(), through_readonly), false
+            );
+        }
 
         return SharedArrayObj(move(vec));
     }
 
     if (v.is<shared_ptr<DictObject>>()) {
 
-        DictObject::inner_type data;
-        const DictObject::inner_type &src =
-            v.get<shared_ptr<DictObject>>()->get_ref();
+        const shared_ptr<DictObject> &obj = v.get<shared_ptr<DictObject>>();
 
-        for (const auto &p : src) {
+        if (obj->is_readonly() && !through_readonly)
+            return v;   /* share the const sub-object, don't copy it */
+
+        DictObject::inner_type data;
+
+        for (const auto &p : obj->get_ref()) {
             data.emplace(
                 p.first,
-                LValue(make_mutable_clone(p.second.get()), false)
+                LValue(
+                    clone_to_mutable(p.second.get(), through_readonly),
+                    false
+                )
             );
         }
 
@@ -518,6 +540,16 @@ make_mutable_clone(const EvalValue &v)
     }
 
     return v;
+}
+
+EvalValue make_mutable_clone(const EvalValue &v)
+{
+    return clone_to_mutable(v, false);
+}
+
+EvalValue make_deep_mutable_clone(const EvalValue &v)
+{
+    return clone_to_mutable(v, true);
 }
 
 /*

@@ -645,6 +645,20 @@ via COW:
   read-folding alone didn't. (Aside: `builtin_sum` must seed its accumulator
   with a `clone()` of the first element, since `+=` mutates it in place — it
   would otherwise mutate, or be rejected on, a read-only argument.)
+- **Getting a mutable copy of a const: `clone()` vs `deepclone()`.** Two helpers
+  in `eval.cpp` make mutable copies (scalars/strings returned as-is):
+  `make_mutable_clone` builds a fresh mutable *top* but **shares** any read-only
+  sub-object as-is, while `make_deep_mutable_clone` copies every level and drops
+  `readonly` (a fully independent writable value). `make_mutable_clone` backs
+  the per-eval copy a `var`-bound materialized value needs, and its
+  share-the-const behavior is what keeps **`clone()` shallow** (a const nested
+  in the result stays read-only) and makes const-ness propagate into fresh
+  literals (`var a = [y]` with `y` const keeps `a[0]` read-only). The `clone()`
+  builtin is the type's own shallow `clone` (one level); `deepclone()` (a
+  runtime builtin, `make_deep_mutable_clone`) is the deep one — the way to
+  obtain a fully mutable version of a const. (`deepclone` is *not* a const
+  builtin: it yields a mutable value that must be copied fresh per eval anyway,
+  so folding it would only bloat the tree.)
 - The non-const `intptr(symbol)` builtin exposes the underlying object pointer;
   the test suite uses it
   to assert exactly when two slices do/don't share storage. If you change COW
