@@ -111,7 +111,8 @@ public:
 
     void run(Block *root, const std::vector<int> &main_writes)
     {
-        fold_function(root, main_writes);
+        register_pure_funcs(root);
+        fold_function(root, main_writes, nullptr);
     }
 
 private:
@@ -120,6 +121,7 @@ private:
         const std::vector<int> &writes;   /* per-slot write counts */
         std::unordered_map<int, EvalValue> consts;  /* promoted: slot->value */
         std::unordered_set<int> blocked;  /* slots that can't be promoted */
+        const IdList *params = nullptr;   /* params (slots 0..n-1) */
     };
 
     bool promotable(const FCtx &fc, int slot) const
@@ -134,16 +136,112 @@ private:
         return dynamic_cast<const Literal *>(c) != nullptr;
     }
 
+    /*
+     * Builtins that take their FIRST argument as an lvalue or identifier (and
+     * throw NotLValueEx / require an identifier otherwise). Folding a variable
+     * passed there would change behavior, so such a variable is not promoted.
+     * Args to every other call - pure/user functions and read-only builtins -
+     * are safe to fold, which is what enables isconst() and pure-call folding.
+     */
+    static bool is_lvalue_arg_builtin(std::string_view name)
+    {
+        return name == "append" || name == "push" || name == "pop"
+            || name == "insert" || name == "erase" || name == "intptr"
+            || name == "undef";
+    }
+
+    /*
+     * Resolve isconst(arg) / isconstdecl(arg) to a literal 0/1. isconstdecl is
+     * true only for things constant by DECLARATION (a parse-time const - a
+     * literal, explicit `const`, or const expression - or a `const` param);
+     * isconst is also true for an auto-const var (foldable here) or auto-const
+     * param.
+     */
+    void fold_isconst(unique_ptr<Construct> &slot, CallExpr *ce, FCtx &fc,
+                      bool decl_only)
+    {
+        unique_ptr<Construct> &arg = ce->args->elems[0];
+        bool result;
+        auto *id = dynamic_cast<Identifier *>(arg.get());
+
+        if (id && id->sym.kind == SymKind::local && fc.params
+                && id->sym.slot >= 0
+                && id->sym.slot < static_cast<int>(fc.params->elems.size())) {
+            const Identifier *p = fc.params->elems[id->sym.slot].get();
+            result = decl_only ? p->const_param
+                               : (p->const_param || p->auto_const_param);
+        } else if (decl_only) {
+            result = arg->is_const;     /* parse-time const, not auto-const */
+        } else {
+            fold_reads(arg, fc);        /* effective: try to auto-const it */
+            result = arg->is_const;
+        }
+
+        MakeConstructFromConstVal(
+            EvalValue(static_cast<int_type>(result)), slot, false);
+    }
+
+    /*
+     * Register every effectively-pure NAMED function into `cctx`, so that
+     * fold_reads can evaluate their constant-argument calls at compile time.
+     * Does not descend into function bodies (a pure func contains no funcs, and
+     * cctx is flat). Duplicate names across sibling scopes are skipped. This
+     * mirrors what the parser already does for explicit `pure` funcs in its own
+     * const context; here we rebuild it for the (post-parse) auto-const pass so
+     * auto-pure funcs - and pure calls whose args only become const via
+     * auto-const - can fold too.
+     */
+    void register_pure_funcs(Construct *c)
+    {
+        if (!c)
+            return;
+
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+            if (fd->effective_pure && fd->id) {
+                try {
+                    fd->eval(&cctx);
+                } catch (const Exception &) {
+                    /* already defined / not registerable: just skip it */
+                }
+            }
+            return;
+        }
+
+        auto rec = [&](Construct *ch) { register_pure_funcs(ch); };
+
+        if (auto *b = dynamic_cast<Block *>(c)) {
+            for (auto &e : b->elems)
+                rec(e.get());
+        } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+            rec(f->init.get()); rec(f->cond.get());
+            rec(f->inc.get());  rec(f->body.get());
+        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+            rec(fe->container.get()); rec(fe->body.get());
+        } else if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+            rec(tc->tryBody.get());
+            for (auto &p : tc->catchStmts)
+                rec(p.second.get());
+            rec(tc->finallyBody.get());
+        } else if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+            rec(e14->lvalue.get()); rec(e14->rvalue.get());
+        } else {
+            for_each_child(c, rec);
+        }
+    }
+
     /* Fold one function body. Only block bodies are folded; a `=> expr` body is
-     * a single expression and is left as-is (minor missed optimization). */
-    void fold_function(Construct *body, const std::vector<int> &writes)
+     * a single expression and is left as-is (minor missed optimization).
+     * `params` is the function's parameter list (nullptr for top-level main),
+     * used to answer isconst()/isconstdecl() on parameter references. */
+    void fold_function(Construct *body, const std::vector<int> &writes,
+                       const IdList *params)
     {
         Block *b = dynamic_cast<Block *>(body);
 
         if (!b)
             return;
 
-        FCtx fc{ writes, {}, {} };
+        FCtx fc{ writes, {}, {}, params };
         prescan_blocked(b, fc.blocked);
         fold_block(b, fc);
     }
@@ -182,9 +280,12 @@ private:
         }
 
         if (auto *ce = dynamic_cast<CallExpr *>(c)) {
-            if (ce->args)
-                for (auto &a : ce->args->elems)
-                    block(a.get());
+            /* Block only the first arg of a builtin that takes it as an lvalue
+             * or identifier; all other call arguments are safe to fold. */
+            auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+            if (callee && ce->args && !ce->args->elems.empty()
+                    && is_lvalue_arg_builtin(callee->get_str()))
+                block(ce->args->elems[0].get());
         } else if (auto *sub = dynamic_cast<Subscript *>(c)) {
             block(sub->what.get());
         } else if (auto *me = dynamic_cast<MemberExpr *>(c)) {
@@ -280,7 +381,8 @@ private:
         }
 
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
-            fold_function(fd->body.get(), fd->slot_writes);   /* nested func */
+            fold_function(fd->body.get(), fd->slot_writes,     /* nested func */
+                          fd->params.get());
             return true;
         }
 
@@ -380,7 +482,8 @@ private:
         }
 
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
-            fold_function(fd->body.get(), fd->slot_writes);  /* func expr */
+            fold_function(fd->body.get(), fd->slot_writes,   /* func expr */
+                          fd->params.get());
             return;                    /* leave capture list / name alone */
         }
 
@@ -415,9 +518,40 @@ private:
             return;
         }
         if (auto *ce = dynamic_cast<CallExpr *>(c)) {
+            auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+            if (callee && ce->args && ce->args->elems.size() == 1
+                    && (callee->get_str() == "isconst"
+                        || callee->get_str() == "isconstdecl")) {
+                fold_isconst(slot, ce, fc,
+                             callee->get_str() == "isconstdecl");
+                return;
+            }
+
+            bool all_const = ce->args != nullptr;
             if (ce->args)
-                for (auto &a : ce->args->elems)
-                    fold_reads(a, fc);     /* not the callee or result */
+                for (auto &a : ce->args->elems) {
+                    fold_reads(a, fc);     /* not the callee */
+                    if (!a->is_const)
+                        all_const = false;
+                }
+
+            /*
+             * A call to an (effectively) pure function or const builtin with
+             * all constant arguments folds to its result. We evaluate it vs
+             * cctx, which holds the const builtins + the registered pure funcs:
+             * if the callee isn't there (a non-pure func, runtime(), print...)
+             * the lookup throws UndefinedVariableEx and we leave the call for
+             * runtime. Any OTHER exception is a real error in fully-constant
+             * code and propagates (a build error), per the auto-const rule.
+             */
+            if (all_const && callee) {
+                try {
+                    MakeConstructFromConstVal(RValue(ce->eval(&cctx)),
+                                              slot, false);
+                } catch (const UndefinedVariableEx &) {
+                    /* not a const-foldable callee: keep the runtime call */
+                }
+            }
             return;
         }
         if (auto *sub = dynamic_cast<Subscript *>(c)) {
@@ -663,6 +797,59 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
 }
 
 /*
+ * Auto-pure test: true if a function body is "effectively pure" - every free
+ * identifier (sym.kind != local, i.e. not a param/local) is a compile-time
+ * const (is_const: a const global, const builtin, or explicitly-pure func), and
+ * the body declares no nested function. Reads the resolver's sym.kind, so it
+ * must run AFTER the body is walked. Conservative: self-recursion (the func's
+ * own name is a free, non-const reference) and calls to other auto-pure (not
+ * explicitly-pure) functions are not recognized, so such functions stay impure.
+ */
+bool
+func_body_is_pure(const Construct *c)
+{
+    if (!c)
+        return true;
+
+    if (auto *id = dynamic_cast<const Identifier *>(c))
+        return id->sym.kind == SymKind::local || id->is_const;
+
+    if (dynamic_cast<const FuncDeclStmt *>(c))
+        return false;   /* a nested function: be conservative */
+
+    if (auto *b = dynamic_cast<const Block *>(c)) {
+        for (auto &e : b->elems)
+            if (!func_body_is_pure(e.get()))
+                return false;
+        return true;
+    }
+    if (auto *f = dynamic_cast<const ForStmt *>(c))
+        return func_body_is_pure(f->init.get())
+            && func_body_is_pure(f->cond.get())
+            && func_body_is_pure(f->inc.get())
+            && func_body_is_pure(f->body.get());
+    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+        return func_body_is_pure(fe->container.get())
+            && func_body_is_pure(fe->body.get());
+    if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+        if (!func_body_is_pure(tc->tryBody.get()))
+            return false;
+        for (auto &p : tc->catchStmts)
+            if (!func_body_is_pure(p.second.get()))
+                return false;
+        return func_body_is_pure(tc->finallyBody.get());
+    }
+    if (auto *e14 = dynamic_cast<const Expr14 *>(c))
+        return func_body_is_pure(e14->lvalue.get())
+            && func_body_is_pure(e14->rvalue.get());
+
+    bool ok = true;
+    for_each_child(const_cast<Construct *>(c),
+                   [&](Construct *ch) { ok = ok && func_body_is_pure(ch); });
+    return ok;
+}
+
+/*
  * Set up `fd`'s slotting and resolve its body. Params take slots 0..n-1 in the
  * function's outermost scope; body locals are slotted as the walk encounters
  * their declarations. Afterwards, if anything was slotted, the FuncDeclStmt is
@@ -725,6 +912,16 @@ Resolver::process_function(FuncDeclStmt *fd)
                 p->auto_const_param = true;
             }
         }
+    }
+
+    /* Auto-pure: a non-pure function with no captures whose body is effectively
+     * pure is promoted, so ispure() sees it and its const-arg calls can fold
+     * (in the auto-const pass). */
+    if (!fd->effective_pure
+            && (!fd->captures || fd->captures->elems.empty())
+            && fd->body
+            && func_body_is_pure(fd->body.get())) {
+        fd->effective_pure = true;
     }
 
     if (st.slottable && st.next_slot > 0) {

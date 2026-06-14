@@ -267,6 +267,10 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("assert", builtin_assert),
     make_builtin("exit", builtin_exit),
     make_builtin("runtime", builtin_runtime), /* optimization barrier */
+    make_builtin("isconst", builtin_isconst),
+    make_builtin("isconstdecl", builtin_isconstdecl),
+    make_builtin("ispure", builtin_ispure),
+    make_builtin("ispuredecl", builtin_ispuredecl),
     make_builtin("intptr", builtin_intptr),
     make_builtin("undef", builtin_undef),
     make_builtin("exception", builtin_exception),

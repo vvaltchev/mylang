@@ -1247,6 +1247,8 @@ pAcceptFuncDecl(ParseContext &c,
     unique_ptr<FuncDeclStmt> func(new FuncDeclStmt);
     func->start = start;
     func->is_const = is_pure;
+    func->explicit_pure = is_pure;
+    func->effective_pure = is_pure;
 
     if (fl & pFlags::pInStmt) {
 

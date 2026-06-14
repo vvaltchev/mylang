@@ -38,6 +38,7 @@ as well.
       - [Lambda captures](#lambda-captures)
       - [Calling functions during const-evaluation](#calling-functions-during-const-evaluation)
       - [Pure functions](#pure-functions)
+      - [Automatic pure promotion](#automatic-pure-promotion)
     * [Exceptions](#exceptions)
       - [Custom exceptions](#custom-exceptions)
       - [Re-throwing an exception](#re-throwing-an-exception)
@@ -788,6 +789,34 @@ As you can see, in the first case an actual function call happens because
 `non_const` is not a constant, while in the second case it's AS IF we passed
 a literal integer to `print()`.
 
+#### Automatic pure promotion
+
+You don't always have to write `pure`. The interpreter promotes a function to
+*effectively pure* automatically when it can prove the function is pure: it has
+no capture list, reads only constants (and its own parameters), and calls only
+const builtins or pure functions. Such a function reports `ispure() == true`
+(but `ispuredecl() == false`), and its calls with constant arguments fold to
+their result:
+
+```C#
+func add2(x) => x + 2;       # effectively pure -> auto-promoted
+var k = add2(5);             # folds to 7
+```
+
+There is a subtlety in *when* the folding happens. An **explicit** `pure func`
+is recognized during parsing, so its const-argument calls fold at parse time and
+may even initialize a `const` (`const k = add2(5)`). An **auto-promoted**
+function is recognized only after parsing, so its calls fold as part of
+[auto-const](#automatic-const-promotion) — which rewrites `var` uses, not a
+`const` initializer. So `const k = add2(5)` requires `add2` to be declared
+`pure`; with a plain `func`, write `var k = add2(5)`.
+
+The detection is conservative: a function that reads a non-const global, calls a
+non-const builtin (`print`, `rand`, I/O, ...) or a non-pure function, captures
+anything, recurses, or nests another function is left impure. When in doubt,
+declare the function `pure` explicitly — that also turns "this is not pure" into
+a hard error instead of a silent missed optimization.
+
 ### Exceptions
 
 Like for other constructs, `MyLang` has an exception handling similar to
@@ -1269,6 +1298,24 @@ folded normally, so `runtime(1/0)` fails at compile time (the error is *inside*
 the expression, before it is "runtime-ized"), whereas `1 / runtime(0)` throws a
 catchable `DivisionByZeroEx` at runtime. Useful for tests and to deliberately
 opt a specific expression out of folding.
+
+#### `isconst(expr)` / `isconstdecl(expr)`
+Compile-time introspection (mainly handy in tests). `isconst()` is true when
+`expr` is *effectively* a compile-time constant: a literal, an explicit `const`,
+a constant expression, a variable promoted by
+[auto-const](#automatic-const-promotion), or a `const`/auto-const parameter.
+`isconstdecl()` is stricter — true only when `expr` is constant by
+*declaration*: an explicit `const`, a `const` parameter, or a
+literal/constant expression, but NOT a variable that is constant merely via
+auto-const. So `const c = 1` gives `isconstdecl(c) == true`, while a write-once
+`var v = 1` gives `isconst(v) == true` but `isconstdecl(v) == false`.
+
+#### `ispure(func)` / `ispuredecl(func)`
+`ispure()` is true when `func` evaluates to a function object that is
+*effectively* pure — declared `pure`, or proven pure by the interpreter (see
+[Automatic pure promotion](#automatic-pure-promotion)). `ispuredecl()` is true
+only when the function was *explicitly* declared `pure`. The argument is
+evaluated, so it must be a function object.
 
 #### `intptr(symbol)`
 Get the internal shared object pointer referred by `symbol`.

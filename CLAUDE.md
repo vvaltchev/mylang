@@ -313,25 +313,51 @@ slot identity). For each function (and the top-level "main"), it:
   the *parser's* behavior for explicit `const`/literals, not auto-const's).
 - **Safety (`prescan_blocked`)**: a slot is *not* promoted if the variable is
   captured by a nested function (the capture must stay an identifier), passed as
-  a **direct identifier arg** to a call (a builtin may take it as an lvalue,
-  e.g. `append`/`sort`/`intptr` — a literal there would change the error to
-  `NotLValueEx`), used as a subscript/member base (`a[i]`, `a.k`), or is a
-  `foreach` loop variable (implicitly reassigned each iteration despite its
-  write count). Args like `f(a + 0)` are already non-lvalues, so they fold.
+  the **first arg** of a builtin that takes it as an lvalue/identifier
+  (`append`/`push`/`pop`/`insert`/`erase`/`intptr`/`undef`, listed in
+  `is_lvalue_arg_builtin` — a literal there throws `NotLValueEx` or breaks
+  `undef`), used as a subscript/member base (`a[i]`, `a.k`), or is a `foreach`
+  loop variable (implicitly reassigned each iteration despite its write count).
+  Args to pure/user functions and read-only builtins are **not** blocked, so
+  they fold — this is what lets pure-call folding and `isconst()` work.
 - **Same early-failure rule as the parser:** a fully-constant expression in
   *reachable* code that throws when evaluated (e.g. `6/0`, a type mismatch) is
   **not** deferred to runtime — the exception propagates out of `resolve_names`
   and aborts before execution. `try/catch` does not catch it. The `runtime()`
-  builtin is the documented opt-out: because it is a non-const builtin and
-  auto-const never folds a call result, any expression containing `runtime(x)`
-  stays a runtime computation (its *argument* is still folded, so `runtime(1/0)`
-  still fails at compile time).
+  builtin is the documented opt-out: it is a non-const builtin, so it is not in
+  the folder's const context and a call to it never folds; the containing
+  expression stays a runtime computation (its *argument* is still folded, so
+  `runtime(1/0)` still fails at compile time).
+- **Pure-call folding.** `register_pure_funcs` first registers every
+  effectively-pure NAMED function (`FuncDeclStmt::effective_pure`) into the
+  folder's const `EvalContext` (`cctx`), which already holds the const builtins.
+  Then a `CallExpr` with all-const arguments folds by simply `eval`-ing it
+  against `cctx`: a pure func / const builtin runs and yields a literal;
+  anything else (a non-pure func, `runtime()`, `print`, ...) is absent, the
+  lookup throws `UndefinedVariableEx`, it's caught, and the call is left for
+  runtime. This is how an auto-pure func's const-arg calls fold even though
+  auto-pure is decided *after* parsing (explicit `pure` funcs already fold at
+  parse time via the parser's const-eval).
 
 Implementation notes: slots are never reused across sibling scopes
 (`FuncState::next_slot` is monotonic), so the slot-keyed map can't collide.
 The pass needs a *complete* tree traversal, but `for_each_child` deliberately
 omits the nodes `walk()` handles itself (Block/for/foreach/try/`Expr14`), so
-`prescan_blocked` and the folders descend into those explicitly.
+`prescan_blocked`, `register_pure_funcs` and the folders descend into those
+explicitly.
+
+**Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
+run after a function body is resolved, promotes a non-pure, capture-free func to
+`effective_pure` when every free identifier (`sym.kind != local`) is
+`is_const` (a const global/builtin/explicit-pure func) and it nests no function.
+Conservative: self-recursion and calls to *other* auto-pure (non-explicit) funcs
+are not recognized. `FuncDeclStmt::{explicit_pure, effective_pure}` back the
+runtime builtins `ispuredecl()`/`ispure()` (they evaluate the arg to a
+`FuncObject` and read its `FuncDeclStmt`). `isconst()`/`isconstdecl()` are
+resolved in the auto-const pass (`fold_isconst`): `isconstdecl` is true for
+parse-time consts and `const` params; `isconst` also accepts auto-const vars and
+auto-const params. All four are registered as runtime builtins (with fallback
+bodies) so the names resolve even when the pass doesn't fold them.
 
 ## The value & type model (the subtle part)
 

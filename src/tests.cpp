@@ -1502,6 +1502,69 @@ static const std::vector<test> tests =
     },
 
     {
+        "isconst/isconstdecl: explicit const, auto-const var, runtime barrier",
+        {
+            "const c = 5;",
+            "var v = 7;",              // write-once -> auto-const
+            "var r = runtime(9);",     // barrier -> not const
+            "assert(isconst(c) && isconstdecl(c));",
+            "assert(isconst(v) && !isconstdecl(v));",
+            "assert(!isconst(r) && !isconstdecl(r));",
+            "assert(isconst(2 + 3) && isconstdecl(2 + 3));",
+        },
+    },
+
+    {
+        "isconst/isconstdecl: const param vs auto-const param vs mutable param",
+        {
+            "func f(const a, b, c) {",
+            "  b = b + 1;",
+            "  assert(isconst(a) && isconstdecl(a));",   // const param
+            "  assert(!isconst(b) && !isconstdecl(b));", // reassigned
+            "  assert(isconst(c) && !isconstdecl(c));",  // auto-const param
+            "  return a + b + c;",
+            "}",
+            "assert(f(1, 2, 3) == 7);",
+        },
+    },
+
+    {
+        "ispure/ispuredecl: explicit pure",
+        {
+            "pure func p(x) => x + 1;",
+            "assert(ispure(p) && ispuredecl(p));",
+        },
+    },
+
+    {
+        "ispure: an effectively-pure func is auto-promoted (not declared pure)",
+        {
+            "func q(x) => x * 2;",
+            "assert(ispure(q) && !ispuredecl(q));",
+        },
+    },
+
+    {
+        "ispure: a func reading a const global / const builtin is pure",
+        {
+            "const k = 10;",
+            "func usesk(x) => x + k;",
+            "func mylen(a) => len(a);",
+            "assert(ispure(usesk) && ispure(mylen));",
+        },
+    },
+
+    {
+        "ispure: reading a non-const global or calling print is impure",
+        {
+            "var g = 10;",
+            "func usesg(x) => x + g;",
+            "func loud(x) { print(x); return x; }",
+            "assert(!ispure(usesg) && !ispure(loud));",
+        },
+    },
+
+    {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
         {
             "var c = 0;",
