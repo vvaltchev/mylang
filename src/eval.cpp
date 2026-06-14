@@ -531,7 +531,7 @@ make_mutable_clone(const EvalValue &v)
  * read-only object (not the shared empty_arr singleton, which must stay
  * mutable).
  */
-static EvalValue
+EvalValue
 make_const_clone(const EvalValue &v)
 {
     if (v.is<SharedArrayObj>()) {
@@ -573,12 +573,14 @@ make_const_clone(const EvalValue &v)
 EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
 {
     /*
-     * A const-decl target gets a deep read-only value (immutable); any other
-     * target (a `var`, or a read-only consumer) gets a fresh mutable copy.
-     * Both are produced fresh each evaluation so re-entry never observes a
-     * prior mutation.
+     * A const-decl target (immutable) shares the baked value directly: it was
+     * baked deep read-only (make_const_clone, in the parser), so it can't be
+     * mutated and re-entry can safely observe the same object - no per-eval
+     * copy, and the const symbol and this node hold one buffer, not two. Any
+     * other target (a `var` or a read-only consumer) gets a fresh mutable deep
+     * copy, so writes work and re-entry never sees a prior mutation.
      */
-    return immutable ? make_const_clone(value) : make_mutable_clone(value);
+    return immutable ? value : make_mutable_clone(value);
 }
 
 /*

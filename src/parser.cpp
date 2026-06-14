@@ -1373,11 +1373,17 @@ MakeConstructFromConstVal(const EvalValue &v,
             /*
              * Materialize the const array/dict as ONE node holding the value,
              * not one Construct per element (which exploded the tree for large
-             * results). clone() makes it standalone, so a small slice of a huge
-             * const array doesn't pin the huge buffer. `immutable` (set for a
-             * const-decl target) makes do_eval hand out a deep read-only value.
+             * results). For an `immutable` (const-decl) target we bake a deep
+             * read-only value: do_eval then *shares* it (it can't be mutated),
+             * so the const symbol and this node hold one buffer, not two. For a
+             * mutable target we bake a standalone clone (do_eval copies it per
+             * eval). Either way the baked value is self-contained, so a small
+             * slice of a huge const array doesn't pin the huge buffer.
              */
-            out = make_unique<LiteralObj>(v.clone(), immutable);
+            out = make_unique<LiteralObj>(
+                immutable ? make_const_clone(v) : v.clone(),
+                immutable
+            );
             return true;
         }
     }

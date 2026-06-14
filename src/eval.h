@@ -167,3 +167,10 @@ public:
     FuncObject(const FuncDeclStmt *func, EvalContext *ctx);
     FuncObject(const FuncObject &rhs);
 };
+
+/*
+ * Deep, read-only copy of a const-evaluated array/dict value (see eval.cpp).
+ * Used by the parser to bake a `const`-decl target into a LiteralObj that can
+ * be shared (it can't be mutated) instead of deep-copied on every evaluation.
+ */
+EvalValue make_const_clone(const EvalValue &v);
