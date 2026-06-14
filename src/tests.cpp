@@ -5440,12 +5440,41 @@ inliner_backtrace_identical()
     return ok;
 }
 
+/*
+ * The -it threshold gates inlining: the same program resolved with a tiny
+ * threshold keeps the call (body too big), while a large threshold inlines it.
+ */
+static bool
+inliner_threshold_gates()
+{
+    const std::vector<const char *> src = {
+        "func big(x) => x + 1 + 2 + 3;",   /* body is ~5 nodes */
+        "func g(n) { return big(n); }",
+        "assert(g(0) == 6);",
+    };
+
+    unique_ptr<Construct> big = parse_lines(src);
+    unique_ptr<Construct> small = big->clone();
+
+    resolve_names(big.get(), true, 24);    /* big enough: inline big() */
+    resolve_names(small.get(), true, 2);   /* too small: keep big() call */
+
+    bool ok = count_substr(serialize_tree(small.get()), "CallExpr")
+                  > count_substr(serialize_tree(big.get()), "CallExpr");
+
+    try { big->eval(nullptr); }   catch (const Exception &) { ok = false; }
+    try { small->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
     { "AST deep-clone round-trips", ast_clone_roundtrip },
     { "inliner splices an expr-func call", inliner_splices_call },
     { "inlined-call backtrace == non-inlined", inliner_backtrace_identical },
+    { "inline threshold (-it) gates inlining", inliner_threshold_gates },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

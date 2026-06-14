@@ -235,7 +235,8 @@ Two properties that make this cheap and safe:
 
 ## Open questions
 
-- Exact thresholds (need `bench/` data).
+- Exact default thresholds (need `bench/` data). The body-size cap is tunable at
+  runtime via `-it N` (default 24), which makes measuring easy.
 - Whether `InlineCtx` lives as a node field or a side table (closure body-clone
   argues for a field).
 - How `-s` should annotate inlined regions (cheap, useful — like the const-fold

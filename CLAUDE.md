@@ -100,6 +100,7 @@ Running scripts:
 ./build/mylang -t FILE           # dump tokens
 ./build/mylang -nc FILE          # disable const-eval (compare -s with/without)
 ./build/mylang -ni FILE          # disable function inlining (debug)
+./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -nr FILE          # parse/validate only, don't run
 ```
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
@@ -464,7 +465,8 @@ errors). **Status:** the `InlineCtx` backtrace foundation exists (a
 **AST deep-clone** (`Construct::clone()`, all node types), and the **size-only
 inliner** (`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
 It splices eligible direct calls — top-level, expression-bodied, non-capturing,
-non-recursive, no nested function, arity match, body ≤ 24 nodes, sound arg use
+non-recursive, no nested function, arity match, body ≤ a node threshold (`-it
+N`, default 24), sound arg use
 (an arg is evaluated as often as the param is used; side-effecting args neither
 dropped nor duplicated). The spliced body's params are replaced by the args
 (which inherit the parameter occurrence's loc), the whole splice is tagged with

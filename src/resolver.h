@@ -18,6 +18,9 @@ class Construct;
  *
  * When `enable_inline` is true (the default), a final pass also inlines
  * eligible expression-bodied function calls (see the Inliner in resolver.cpp /
- * plans/function-inlining.md). The CLI's `-ni` disables it.
+ * plans/function-inlining.md). The CLI's `-ni` disables it; `inline_threshold`
+ * (CLI `-it N`) caps the inlined body size in nodes.
  */
-void resolve_names(Construct *root, bool enable_inline = true);
+void resolve_names(Construct *root,
+                   bool enable_inline = true,
+                   int inline_threshold = 24);
