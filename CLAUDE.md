@@ -64,9 +64,18 @@ is what compiles the
 `-std=c++17 -ggdb -Wall -Wextra -Wno-unused-parameter
 -fwrapv`. The Makefile auto-generates header dependencies under `.d/`.
 
+**LTO is on by default for optimized builds.** `LTO` defaults to `OPT`, so a
+release build links with `-flto=auto` (added to `BASE_FLAGS`, which the link
+line passes too) — ~7% smaller binary and ~8-9% faster on `bench/`. It works on
+both GCC and clang and is verified to keep `-rt` green. Build with `LTO=0` to
+disable (e.g. for a faster/debuggable link); an `OPT=0` build is non-LTO anyway.
+
 CMake is also supported (used by CI):
 `cmake -DTESTS=1 -DCMAKE_BUILD_TYPE=Debug .. && cmake --build .`
-(`-DGCOV=ON` for a coverage build, GCC only). CI (`.github/workflows/`) builds
+(`-DGCOV=ON` for a coverage build, GCC only). It enables LTO via
+`INTERPROCEDURAL_OPTIMIZATION` for the `Release`/`RelWithDebInfo` configs (so
+Debug and coverage builds are untouched), portable across GCC/clang/MSVC;
+configure with `-DLTO=OFF` to disable. CI (`.github/workflows/`) builds
 Debug+Release × g+++clang
 on Linux, plus macOS and Windows, and runs `./mylang -rt`.
 
