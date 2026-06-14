@@ -5214,6 +5214,60 @@ backtrace_end_to_end()
     return ok;
 }
 
+/*
+ * Inlined-frame backtrace reconstruction (flush_inline_frames). No inliner
+ * emits InlineCtx yet, so this drives the flush helper directly, in the two
+ * positions the real hooks use: flushed into an empty backtrace (error inside
+ * inlined code), and flushed after a physical frame (a real call made from
+ * inlined code).
+ */
+static bool
+backtrace_inline_frames()
+{
+    const auto npos = std::string::npos;
+    bool ok = true;
+
+    /* (1) error inside g, inlined into f (both virtual). Empty bt -> flush. */
+    {
+        InlineCtx f_ctx{ "f", { "b" }, Loc(30, 1), nullptr };
+        InlineCtx g_ctx{ "g", { "a" }, Loc(12, 1), &f_ctx };
+
+        DivisionByZeroEx ex;
+        ex.loc_start = Loc(5, 1);
+        flush_inline_frames(&g_ctx, ex);
+        const std::string s = format_backtrace(ex);
+
+        ok = ok && s.find("[0] g(a)") != npos;     /* error site, line 5 */
+        ok = ok && s.find("[1] f(b)") != npos;     /* f called g, line 12 */
+        ok = ok && s.find("[2] main()") != npos;   /* main called f, line 30 */
+        ok = ok && s.find("at line 5") != npos;
+        ok = ok && s.find("at line 12") != npos;
+        ok = ok && s.find("at line 30") != npos;
+        ok = ok && s.find("[0] g") < s.find("[1] f");
+        if (!ok) cout << "  (1) got:\n" << s;
+    }
+
+    /* (2) physical frame P called from inlined g: push P, then flush g. */
+    {
+        InlineCtx g_ctx{ "g", { "a" }, Loc(15, 1), nullptr };
+
+        DivisionByZeroEx ex;
+        ex.loc_start = Loc(5, 1);
+        ex.backtrace.push_back({ "P", {}, Loc(8, 1) });   /* physical frame */
+        flush_inline_frames(&g_ctx, ex);
+        const std::string s = format_backtrace(ex);
+
+        ok = ok && s.find("[0] P()") != npos;      /* error site, line 5 */
+        ok = ok && s.find("[1] g(a)") != npos;     /* g called P, line 8 */
+        ok = ok && s.find("[2] main()") != npos;   /* main called g, line 15 */
+        ok = ok && s.find("at line 8") != npos;
+        ok = ok && s.find("at line 15") != npos;
+        if (!ok) cout << "  (2) got:\n" << s;
+    }
+
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
@@ -5221,6 +5275,7 @@ static const std::vector<extra_check> extra_checks =
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },
     { "backtrace: end-to-end call chain", backtrace_end_to_end },
+    { "backtrace: inlined virtual frames", backtrace_inline_frames },
 };
 
 void run_tests(bool dump_syntax_tree)

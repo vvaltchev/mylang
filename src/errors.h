@@ -58,6 +58,21 @@ struct BacktraceFrame {
     Loc call_site;
 };
 
+/*
+ * A virtual ("inlined-at") backtrace frame. When a function is inlined, every
+ * node spliced from its body points to one of these; the chain (innermost
+ * callee first, outer callers via `parent`) lets the backtrace reconstruct the
+ * call frames that have no physical do_func_call frame. Each element maps 1:1
+ * to a BacktraceFrame. See flush_inline_frames() in backtrace.cpp and the
+ * plans/function-inlining.md design. (No inliner emits these yet.)
+ */
+struct InlineCtx {
+    std::string callee_name;
+    std::vector<std::string> params;
+    Loc call_site;
+    const InlineCtx *parent = nullptr;
+};
+
 struct Exception {
 
     const char *const name;

@@ -4,6 +4,7 @@
 #include "errors.h"
 #include "syntax.h"
 #include "lexer.h"
+#include "backtrace.h"
 
 using std::pair;
 using std::vector;
@@ -149,6 +150,14 @@ EvalValue Construct::eval(EvalContext *ctx, bool rec) const
         if (!e.loc_start) {
             e.loc_start = start;
             e.loc_end = end;
+
+            /*
+             * Innermost node to see this exception: if it was spliced in by
+             * inlining, emit its virtual ("inlined-at") frames now, so the
+             * physically-absent inlined calls still show in the backtrace.
+             */
+            if (inline_ctx)
+                flush_inline_frames(inline_ctx, e);
         }
 
         throw;

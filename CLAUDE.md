@@ -437,20 +437,27 @@ parse-time consts and `const` params; `isconst` also accepts auto-const vars and
 auto-const params. All four are registered as runtime builtins (with fallback
 bodies) so the names resolve even when the pass doesn't fold them.
 
-**Planned (NOT yet implemented): function inlining.** The author intends to add
-function inlining, for two reasons: (1) *specialization* - propagating a const
-argument into a `const`-parameter function's body at the call site, which is the
-missing half of const-parameter const-propagation for *non-pure* functions
-(today only pure/auto-pure whole-call folding propagates consts across a call);
-and (2) *short bodies* — inlining tiny functions such as comparators
-(`func(a,b) => a < b`). Two design questions are deliberately left open and must
-be settled first: (a) the **inlining criterion** — how much benefit must
-inlining bring to be worth it (body size, call-site count, whether args are
-const, ...)? and (b) **error reporting / debugging** - an inlined call no longer
-pushes a `do_func_call` frame, so it would vanish from (or misreport in) the
-backtrace; inlining must decide how an inlined frame appears there. The
-error-reporting polish it was waiting on (caret accuracy, expression `Loc`
-boundaries, multi-line spans, and the backtrace itself) is now done.
+**In progress: function inlining & specialization.** Designed and being built;
+see `plans/function-inlining.md` for the full plan and task order. Three aims:
+(1) *specialization* — propagate a const/auto-const argument into a (possibly
+non-pure) function and fold (the missing half of const-parameter propagation,
+since today only pure/auto-pure whole-call folding crosses a call); (2) *inline
+trivial bodies even with no const args* (`func f(x) => x+1` called `f(y)` folds
+to `y+1` in place — removes call overhead and exposes the body to the caller's
+const-folder); (3) keep backtraces identical with inlining on/off. The two
+formerly-open questions are settled: the **criterion** is "specialize→fold→
+measure→decide" (inline if tiny-after-fold; else emit a shared specialized clone
+if it folded a lot; else leave the call), and the **backtrace** uses
+"inlined-at" chains (`InlineCtx`, `errors.h`) flushed by `flush_inline_frames`
+(`backtrace.cpp`) at two error-path points (`Construct::eval`'s loc-stamp and
+`do_func_call`'s catch), leaving `format_backtrace` unchanged. *General*
+algebraic simplification of non-constant operands (`x+1-1 -> x`) is deliberately
+out of scope — unsound in a dynamically-typed language without type narrowing
+(float non-associativity, `+`-overloading on strings/arrays, preserved type
+errors). **Status:** the `InlineCtx` backtrace foundation exists (a
+`Construct::inline_ctx` field, the flush helper + the `Construct::eval` hook, a
+synthetic test) but is dormant — no inliner emits it yet. Next: AST deep-clone
+(none exists today), then the size-only inliner.
 
 ## The value & type model (the subtle part)
 
@@ -782,11 +789,19 @@ and two macros:
   the widest; pass 2 zero-pads frame numbers to a common width (only when >9
   frames) and right-pads the name column so `at line N` aligns. It is a plain
   function so tests can format synthetic/real backtraces and assert on them.
+- **Inlined (virtual) frames.** For function inlining (in progress), a node
+  spliced from an inlined body carries an `InlineCtx` "inlined-at" chain
+  (`Construct::inline_ctx`); `flush_inline_frames` (`backtrace.cpp`) appends one
+  `BacktraceFrame` per chain element so the physically-absent inlined calls
+  appear. It is flushed at two error-path points: `Construct::eval`'s loc-stamp
+  (the innermost node, an error *inside* inlined code) and, once the inliner
+  lands, `do_func_call`'s catch (for a real call made *from* inlined code).
+  `format_backtrace` is untouched. No inliner emits chains yet; see
+  `plans/function-inlining.md`.
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
   see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`
-  cover the formatter. (Inlining, when added, must decide how an inlined call
-  appears in this backtrace — see the planned-inlining note.)
+  cover the formatter (including synthetic inlined-frame reconstruction).
 
 ## Recipes
 

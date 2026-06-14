@@ -46,6 +46,8 @@ struct ResolvedSym {
     int slot = -1;          /* index into Frame::slots when kind == local */
 };
 
+struct InlineCtx;
+
 class Construct {
 
 public:
@@ -55,6 +57,14 @@ public:
     bool is_const;
     Loc start;
     Loc end;
+
+    /*
+     * Set on nodes spliced in by function inlining: the "inlined-at" chain used
+     * to rebuild virtual backtrace frames for the (physically absent) inlined
+     * call. Null for the vast majority of nodes; consulted only on the error
+     * path (see Construct::eval / flush_inline_frames). No inliner sets it yet.
+     */
+    const InlineCtx *inline_ctx = nullptr;
 
     Construct(const char *name,
               bool is_const = false,

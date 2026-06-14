@@ -56,6 +56,13 @@ num_digits(size_t n)
     return d;
 }
 
+void
+flush_inline_frames(const InlineCtx *ic, Exception &e)
+{
+    for (; ic; ic = ic->parent)
+        e.backtrace.push_back({ ic->callee_name, ic->params, ic->call_site });
+}
+
 string
 format_backtrace(const Exception &e)
 {
