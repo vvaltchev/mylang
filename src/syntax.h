@@ -27,6 +27,25 @@ enum class ConstructType {
     block,
 };
 
+/*
+ * Result of the name-resolution pass (resolver.cpp) for an Identifier.
+ *
+ * `local` means the identifier was resolved to a fixed slot in the current
+ * function call's Frame (see eval.h), so it's an O(1) array index instead of a
+ * scope-chain map lookup. `unresolved` (the default) means "fall back to the
+ * runtime EvalContext map walk" - used for everything the resolver doesn't
+ * (yet) handle: top-level symbols, captures, builtins, globals.
+ */
+enum class SymKind : unsigned char {
+    unresolved,
+    local,
+};
+
+struct ResolvedSym {
+    SymKind kind = SymKind::unresolved;
+    int slot = -1;          /* index into Frame::slots when kind == local */
+};
+
 class Construct {
 
 public:
@@ -248,6 +267,7 @@ class Identifier final: public Construct {
 public:
 
     const UniqueId *uid;
+    ResolvedSym sym;        /* filled in by the name-resolution pass */
 
     Identifier(const std::string_view &str)
         : Construct("Id")
@@ -423,6 +443,17 @@ public:
     unique_ptr<IdList> captures;
     unique_ptr<IdList> params;
     unique_ptr<Construct> body;
+
+    /*
+     * Filled in by the name-resolution pass (resolver.cpp). When `resolved` is
+     * true, do_func_call binds params into a Frame of `frame_size` slots instead
+     * of an EvalContext map, and body references to params are O(1) slot reads.
+     * `param_writes[i]` counts how many times param i is assigned in the body
+     * (it stays 0 for a write-once param) - groundwork for auto-const detection.
+     */
+    bool resolved = false;
+    int frame_size = 0;
+    std::vector<int> param_writes;
 
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;

@@ -34,6 +34,22 @@ struct FlowState {
     EvalValue value;    /* the return value, meaningful when type == ret */
 };
 
+/*
+ * Per-call storage for resolved local variables (currently: function params).
+ *
+ * The name-resolution pass assigns each resolved local a fixed slot index, so
+ * access is an O(1) array index here instead of a scope-chain map lookup. A
+ * call's Frame is created in do_func_call and shared by every nested block of
+ * that call (EvalContext::frame is inherited from the parent). `live` is a
+ * bitmask of which slots are currently defined - needed because undef() can
+ * remove a binding and slots cannot hold the UndefinedId sentinel (LValue
+ * forbids it). Slot count is capped at 64 so the mask fits a single word.
+ */
+struct Frame {
+    std::vector<LValue> slots;
+    uint64_t live = 0;
+};
+
 class EvalContext {
 
     typedef std::map<const UniqueId *, LValue> SymbolsType;
@@ -45,6 +61,13 @@ public:
     EvalContext *const parent;
     const bool const_ctx;
     const bool func_ctx;
+
+    /*
+     * The current call's slot Frame, or nullptr outside any resolved call.
+     * Inherited from the parent on construction; do_func_call points a resolved
+     * call's args context at a fresh Frame.
+     */
+    Frame *frame;
 
     /*
      * Points at the FlowState shared by every context within the current

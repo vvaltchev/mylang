@@ -91,8 +91,9 @@ truncating vs flooring division, unordered vs insertion-ordered dicts) enumerate
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — seven translation units:
-`lexer.cpp`, `parser.cpp`, `syntax.cpp`, `eval.cpp`, `types.cpp`, `mylang.cpp`, `tests.cpp`.
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — eight translation units:
+`lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `eval.cpp`, `types.cpp`, `mylang.cpp`,
+`tests.cpp`.
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that turns thrown
   `Exception`s into formatted error output (`dumpLocInError` prints the source line + a `^` caret).
@@ -102,6 +103,9 @@ truncating vs flooring division, unordered vs insertion-ordered dicts) enumerate
   entry point.
 - `syntax.h` / `syntax.cpp` — the `Construct` AST node hierarchy and its `serialize()` (what `-s`
   prints).
+- `resolver.cpp` / `resolver.h` — `resolve_names(root)`, a post-parse pass that assigns function
+  params slot indices for O(1) access at runtime (see the value model section). Optional and always
+  safe: anything it leaves unresolved falls back to the runtime map lookup.
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins together (see next section).
 
@@ -120,7 +124,8 @@ instantiates them with concrete types via typedefs (`typedef TypeTemplate<EvalVa
 
 ## The pipeline
 
-**lexer → recursive-descent parser (with const-folding woven in) → tree-walking evaluator.**
+**lexer → recursive-descent parser (with const-folding woven in) → name-resolution pass →
+tree-walking evaluator.**
 
 ### Lexer
 
@@ -239,6 +244,18 @@ and it lives *inside the parser*. Mechanics:
 - **`EvalContext`** (`eval.h`) is a lexical scope: `map<const UniqueId *, LValue>` + `parent` pointer
   + `const_ctx`/`func_ctx` flags. The root context auto-loads `const_builtins` (always) and `builtins`
   (only when not a const ctx). Each `Block` evaluates in a fresh child `EvalContext`.
+- **Slot resolution (`resolver.cpp`) bypasses the map for resolved locals.** The post-parse
+  `resolve_names()` pass assigns slot indices so an `Identifier::do_eval` for a resolved local is an
+  O(1) read of `EvalContext::frame->slots[slot]` instead of the `map`+parent-chain walk. A call's
+  `Frame` (a `vector<LValue>` + a `uint64_t live` bitmask; created in `do_func_call` when
+  `FuncDeclStmt::resolved`) is shared by the call's nested blocks (the `frame` pointer is inherited).
+  **Currently only function *parameters* are slotted, and only when no local shadows a param** (the
+  resolver's conservative all-or-nothing rule); everything else stays unresolved and uses the map, so
+  the pass is purely an optimization. `Identifier::sym`, `FuncDeclStmt::{resolved,frame_size,
+  param_writes}` carry the results; `param_writes` (per-param assignment counts) is groundwork for a
+  future auto-const pass. The const-eval path runs before resolution, so pure funcs invoked at
+  parse time use the map (`resolved` is still false then). Slots can't hold the `UndefinedId` sentinel
+  (`LValue` forbids it), hence the `live` bitmask for `undef()`/undeclared state.
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable state lives in
   `types.cpp`: `UniqueId::unique_set`, `EvalContext::builtins`, `AllTypes`, `empty_str/empty_arr/none`.)

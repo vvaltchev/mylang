@@ -13,6 +13,7 @@
 #include "lexer.h"
 #include "syntax.h"
 #include "eval.h"
+#include "resolver.h"
 
 #include <typeinfo>
 #include <vector>
@@ -3167,6 +3168,7 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
         ParseContext pCtx(TokenStream(tokens), true /* const eval */);
 
         root = pBlock(pCtx);
+        resolve_names(root.get());
         root->eval(nullptr);
 
     } catch (const Exception &e) {

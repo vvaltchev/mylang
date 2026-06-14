@@ -78,6 +78,7 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     : parent(parent)
     , const_ctx(const_ctx)
     , func_ctx(func_ctx)
+    , frame(parent ? parent->frame : nullptr)
     , flow((parent && !func_ctx) ? parent->flow : &flow_state)
 {
     if (!parent) {
@@ -101,6 +102,16 @@ LValue *EvalContext::lookup(const Identifier *id)
 
 bool EvalContext::erase(const Identifier *id)
 {
+    if (id->sym.kind == SymKind::local && frame) {
+
+        /* undef() on a resolved local: clear its live bit (cannot store the
+         * UndefinedId sentinel in a slot - LValue forbids it). */
+        const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
+        const bool was_defined = frame->live & bit;
+        frame->live &= ~bit;
+        return was_defined;
+    }
+
     const auto &it = symbols.find(id->uid);
 
     if (it == symbols.end())
@@ -150,6 +161,17 @@ LiteralStr::LiteralStr(const std::string_view &v)
 
 EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 {
+    if (sym.kind == SymKind::local && ctx->frame) {
+
+        /* Resolved local: an O(1) slot read instead of a scope-chain walk. */
+        const uint64_t bit = static_cast<uint64_t>(1) << sym.slot;
+
+        if (ctx->frame->live & bit)
+            return EvalValue(&ctx->frame->slots[sym.slot]);
+
+        return UndefinedId{get_str()};   /* slot exists but was undef()'d */
+    }
+
     while (ctx) {
 
         LValue *lval = ctx->lookup(this);
@@ -188,20 +210,48 @@ do_func_return(EvalValue &&tmp, Construct *retExpr)
     return RValue(tmp);
 }
 
+/*
+ * Bind one parameter. When `frame` is set (the function was resolved), the
+ * value goes into its fixed slot and the slot is marked live; otherwise it is
+ * emplaced into the args context map (the unresolved / const-eval path).
+ */
+static inline void
+bind_param(EvalContext *args_ctx,
+           Frame *frame,
+           int idx,
+           const Identifier *param,
+           EvalValue val,
+           bool is_const)
+{
+    if (frame) {
+        frame->slots[idx] = LValue(move(val), is_const);
+        frame->live |= static_cast<uint64_t>(1) << idx;
+    } else {
+        args_ctx->emplace(param, move(val), is_const);
+    }
+}
+
+/*
+ * Bind call arguments to the function's parameters. There is one overload per
+ * argument representation - unevaluated argument expressions (the normal call
+ * path), an already-evaluated value vector, a single value, and a pair (used by
+ * builtins that invoke a callback). Each evaluates/forwards the args and hands
+ * the actual storage to bind_param (the slot Frame when resolved, else the map).
+ */
 static void
 do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const vector<unique_ptr<Construct>> &args,
                     EvalContext *ctx,
-                    EvalContext *args_ctx)
+                    EvalContext *args_ctx,
+                    Frame *frame)
 {
     if (args.size() != funcParams.size())
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < args.size(); i++) {
-        args_ctx->emplace(
-            funcParams[i].get(),
-            RValue(args[i]->eval(ctx)),
-            ctx->const_ctx
+        bind_param(
+            args_ctx, frame, i, funcParams[i].get(),
+            RValue(args[i]->eval(ctx)), ctx->const_ctx
         );
     }
 }
@@ -210,17 +260,14 @@ static void
 do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const vector<EvalValue> &args,
                     EvalContext *ctx,
-                    EvalContext *args_ctx)
+                    EvalContext *args_ctx,
+                    Frame *frame)
 {
     if (args.size() != funcParams.size())
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < args.size(); i++) {
-        args_ctx->emplace(
-            funcParams[i].get(),
-            args[i],
-            ctx->const_ctx
-        );
+        bind_param(args_ctx, frame, i, funcParams[i].get(), args[i], ctx->const_ctx);
     }
 }
 
@@ -228,16 +275,13 @@ static void
 do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const EvalValue &arg,
                     EvalContext *ctx,
-                    EvalContext *args_ctx)
+                    EvalContext *args_ctx,
+                    Frame *frame)
 {
     if (funcParams.size() != 1)
         throw InvalidNumberOfArgsEx();
 
-    args_ctx->emplace(
-        funcParams[0].get(),
-        arg,
-        ctx->const_ctx
-    );
+    bind_param(args_ctx, frame, 0, funcParams[0].get(), arg, ctx->const_ctx);
 }
 
 
@@ -245,24 +289,23 @@ static void
 do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const pair<EvalValue, EvalValue> &args,
                     EvalContext *ctx,
-                    EvalContext *args_ctx)
+                    EvalContext *args_ctx,
+                    Frame *frame)
 {
     if (funcParams.size() != 2)
         throw InvalidNumberOfArgsEx();
 
-    args_ctx->emplace(
-        funcParams[0].get(),
-        args.first,
-        ctx->const_ctx
-    );
-
-    args_ctx->emplace(
-        funcParams[1].get(),
-        args.second,
-        ctx->const_ctx
-    );
+    bind_param(args_ctx, frame, 0, funcParams[0].get(), args.first, ctx->const_ctx);
+    bind_param(args_ctx, frame, 1, funcParams[1].get(), args.second, ctx->const_ctx);
 }
 
+/*
+ * Invoke `obj` with `args`. Builds the callee's argument context (its own
+ * FlowState and, when the function was resolved, a flat slot Frame), binds the
+ * params, evaluates the body, and returns whatever the body returned through the
+ * FlowState (or none). An UndefinedVariableEx escaping a pure func is tagged so
+ * the error message can point at the pure-func restriction.
+ */
 template <class ArgsVecT>
 static EvalValue
 do_func_call(EvalContext *ctx,
@@ -272,9 +315,24 @@ do_func_call(EvalContext *ctx,
     /* func_ctx == true gives this call its own FlowState (see eval.h) */
     EvalContext args_ctx(&obj.capture_ctx, false, true);
 
+    /*
+     * When the function was resolved, params live in a flat slot Frame (O(1)
+     * access) instead of the args context map. The Frame lives on this stack
+     * frame for the whole call; nested blocks inherit the pointer.
+     */
+    Frame frame;
+
+    if (obj.func->resolved) {
+        frame.slots.assign(obj.func->frame_size, LValue(none, false));
+        args_ctx.frame = &frame;
+    }
+
     if (obj.func->params) {
         const auto &funcParams = obj.func->params->elems;
-        do_func_bind_params(funcParams, args, ctx, &args_ctx);
+        do_func_bind_params(
+            funcParams, args, ctx, &args_ctx,
+            obj.func->resolved ? &frame : nullptr
+        );
     }
 
     try {
