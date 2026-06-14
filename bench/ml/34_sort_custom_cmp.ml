@@ -1,0 +1,25 @@
+# sort with a custom comparison function (called for every comparison).
+# MyLang's compare_func returns the truth value of `a < b`.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var SZ = 50000;
+var R = 2 * scale;
+var checksum = 0;
+
+for (var k = 0; k < R; k += 1) {
+
+    var a = array(SZ);
+    var x = 987654321;
+
+    for (var i = 0; i < SZ; i += 1) {
+        x = (x * 1103515245 + 12345) % 2147483647;
+        a[i] = x;
+    }
+
+    sort(a, func(p, q) => p < q);
+    checksum += a[0] + a[SZ - 1];
+}
+
+print("result:", checksum);

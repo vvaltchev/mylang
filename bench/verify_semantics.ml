@@ -1,0 +1,70 @@
+# Executable proof that MyLang's container semantics match Python's, so the
+# performance comparison in this directory is apples-to-apples. Run with:
+#     ./build/mylang bench/verify_semantics.ml
+# and compare against:  python3 bench/verify_semantics.py
+# Both must print "all semantics checks passed". Each assert below has the
+# identical assertion in the .py file.
+
+# --- plain assignment ALIASES (reference semantics, like Python) ------------
+var x = [1, 2, 3];
+var y = x;
+y[0] = 99;
+assert(x == [99, 2, 3]);        # x changed too: x and y are the same object
+assert(y == [99, 2, 3]);
+
+push(y, 7);
+assert(x == [99, 2, 3, 7]);     # append through the alias is visible on x
+
+# --- a SLICE behaves like an independent copy (copy-on-write under the hood) -
+var a = [1, 2, 3, 4, 5];
+var s = a[1:4];                 # O(1) view in MyLang, but observably a copy
+assert(s == [2, 3, 4]);
+s[0] = 99;                      # writing the slice clones it...
+assert(a == [1, 2, 3, 4, 5]);  # ...so the parent is untouched
+assert(s == [99, 3, 4]);
+
+# writing the PARENT after slicing does not disturb the slice either
+var a2 = [1, 2, 3, 4, 5];
+var s2 = a2[1:4];
+a2[1] = 99;
+assert(a2 == [1, 99, 3, 4, 5]);
+assert(s2 == [2, 3, 4]);
+
+# a full-length slice is independent, exactly like Python's x[:]
+var f = [1, 2, 3];
+var g = f[0:3];
+g[0] = 99;
+assert(f == [1, 2, 3]);
+assert(g == [99, 2, 3]);
+
+# --- clone() is an explicit deep copy --------------------------------------
+var c1 = [1, 2, 3];
+var c2 = clone(c1);
+c2[0] = 99;
+assert(c1 == [1, 2, 3]);
+assert(c2 == [99, 2, 3]);
+
+# --- arrays are passed to functions by reference (like Python) -------------
+func mutate(arr) {
+    arr[0] = 99;
+    push(arr, 7);
+}
+var p = [1, 2, 3];
+mutate(p);
+assert(p == [99, 2, 3, 7]);
+
+# --- strings are immutable; a slice equals the substring (value semantics) --
+var str1 = "hello world";
+var sub = str1[0:5];
+assert(sub == "hello");
+assert(str1 == "hello world");  # original is unchanged, strings never mutate
+assert(str1[6:] == "world");
+assert(str1[-5:] == "world");
+
+# --- nested arrays: element writes are isolated per logical object ----------
+var m = [[1, 2], [3, 4]];
+var row = m[0];                 # alias of the inner array
+row[0] = 99;
+assert(m == [[99, 2], [3, 4]]); # inner array is shared (reference), like Python
+
+print("all semantics checks passed");

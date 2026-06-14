@@ -1,0 +1,16 @@
+# string building by repeated `+=`.
+# MyLang appends in place when the string is not aliased; CPython has an
+# analogous refcount==1 optimization. Both are amortized O(n) here.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 50000 * scale;
+var s = "";
+
+for (var i = 0; i < N; i += 1) {
+    s += str(i);
+    s += ",";
+}
+
+print("result:", len(s));

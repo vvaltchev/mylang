@@ -1,0 +1,26 @@
+# READ-ONLY array slicing in a loop.
+#
+# This is the headline copy-on-write case. In MyLang `base[1:999]` is an O(1)
+# view that shares storage with `base`; nothing is copied until something is
+# written through the view. In Python the same slice eagerly copies 998
+# elements every iteration. The OBSERVABLE result is identical (value
+# semantics) - only the cost differs - so the comparison is fair, but expect
+# MyLang to win big here purely because of the lazy slice.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var base = array(1000);
+for (var i = 0; i < 1000; i += 1)
+    base[i] = i;
+
+var N = 200000 * scale;
+var s = 0;
+
+for (var i = 0; i < N; i += 1) {
+    var sl = base[1:999];
+    s += sl[0] + sl[len(sl) - 1];
+    s = s % 1000000007;
+}
+
+print("result:", s);

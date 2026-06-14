@@ -1,0 +1,31 @@
+# MyLang-ONLY feature: parse-time const evaluation (no Python counterpart, so
+# there is intentionally no 48_const_fold.py).
+#
+# `heavy(data)` runs ONCE at parse time over a const array and is replaced by a
+# literal in the runtime AST (verify with: ./build/mylang -s bench/ml/48_const_fold.ml).
+# The runtime loop below therefore never recomputes it - each use of `folded`
+# is just an integer literal. This is the defining feature of the language: the
+# work is shifted from runtime into the parser.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+pure func heavy(arr) {
+    var s = 0;
+    foreach (var e in arr)
+        s = (s + e * e) % 1000003;
+    return s;
+}
+
+const data = range(50000);
+const folded = heavy(data);
+
+var N = 1000000 * scale;
+var s = 0;
+
+for (var i = 0; i < N; i += 1) {
+    s += folded;
+    s = s % 1000000007;
+}
+
+print("result:", s, "folded:", folded);

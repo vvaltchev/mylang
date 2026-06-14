@@ -1,0 +1,22 @@
+# foreach over a dictionary's <key, value> pairs.
+# Checksum sums the VALUES so it is independent of iteration order
+# (MyLang uses an unordered_map; Python preserves insertion order).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var M = 100000;
+var d = {};
+for (var i = 0; i < M; i += 1)
+    d[i] = i * 2;
+
+var R = 5 * scale;
+var s = 0;
+
+for (var k = 0; k < R; k += 1) {
+    foreach (var key, val in d)
+        s += val;
+    s = s % 1000000007;
+}
+
+print("result:", s);

@@ -1,0 +1,23 @@
+# throw/catch user exceptions in a loop (exceptions as control flow)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 200000 * scale;
+var caught = 0;
+
+for (var i = 0; i < N; i += 1) {
+    try {
+        if (i % 2 == 0) {
+            throw ex("Even", i);
+        } else {
+            throw ex("Odd", i);
+        }
+    } catch (Even) {
+        caught += 1;
+    } catch (Odd) {
+        caught += 2;
+    }
+}
+
+print("result:", caught);

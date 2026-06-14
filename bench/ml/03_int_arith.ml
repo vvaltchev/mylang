@@ -1,0 +1,16 @@
+# integer arithmetic mix: + - * / %  (kept inside int64 via the modulo)
+# NOTE: `/` is truncating integer division here, matching Python's `//`.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+var acc = 1;
+
+for (var i = 1; i < N; i += 1) {
+    acc = (acc + i) * 3;
+    acc = acc % 1000000007;
+    acc = acc + i / 2 - i % 7;
+}
+
+print("result:", acc);

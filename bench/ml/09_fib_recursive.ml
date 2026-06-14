@@ -1,0 +1,17 @@
+# recursive fibonacci: tree recursion, ~1.7M calls for fib(29).
+# fib(29) = 514229 fits in int64, so no overflow divergence with Python.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func fib(n) {
+    if (n < 2)
+        return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+var r = 0;
+for (var k = 0; k < scale; k += 1)
+    r = fib(29);
+
+print("result:", r);

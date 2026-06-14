@@ -1,0 +1,17 @@
+# mixed int/float arithmetic: exercises the int->float promotion path
+# (num_bin_op) on every iteration. Both languages promote int to float here.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+var x = 0.0;
+
+for (var i = 0; i < N; i += 1) {
+    x = x + i * 0.5;     # int * float -> float
+    x = x - i;           # float - int -> float
+    if (x > 1000000.0)
+        x = 0.0;
+}
+
+print("result:", str(x, 4));

@@ -1,0 +1,15 @@
+# while loop: counter increment + accumulate (tree-walk loop overhead)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 3000000 * scale;
+var i = 0;
+var s = 0;
+
+while (i < N) {
+    s += i;
+    i += 1;
+}
+
+print("result:", s);

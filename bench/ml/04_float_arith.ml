@@ -1,0 +1,18 @@
+# floating-point arithmetic loop.
+# NOTE: MyLang float is `long double` (80-bit on x86); Python float is IEEE double.
+# The result therefore differs slightly in the low digits between the two.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+var x = 1.0;
+
+for (var i = 0; i < N; i += 1) {
+    x = x * 1.0000001 + 0.5;
+    x = x - 0.4999999;
+    if (x > 1000000.0)
+        x = x / 3.0;
+}
+
+print("result:", str(x, 4));

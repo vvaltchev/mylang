@@ -76,6 +76,19 @@ any fail. Add a test by appending an entry to that table (no registration needed
 exception is matched against the *static* C++ type; user-level `throw ex("Foo")` always surfaces as
 `ExceptionObject` (a.k.a. `DynamicExceptionEx`), not a distinct C++ type.
 
+## Benchmarks
+
+`bench/` is a standalone performance suite comparing MyLang against CPython, construct by construct
+(`bench/ml/NN_name.ml` paired with `bench/py/NN_name.py`; a few MyLang-only features like const-folding
+have no `.py`). `python3 bench/run.py` times every pair (best of N), prints an `ml/py` ratio table, and
+checks the two implementations printed matching results. Each script takes a `scale` multiplier as its
+first argv. It is *not* wired into `make`/CI and has no third-party deps. `bench/README.md` is also the
+written answer to "do MyLang and Python behave the same?": they do *observably* — assignment aliases,
+slices act like independent copies (MyLang via lazy copy-on-write, so read-only slicing is far cheaper),
+`clone()` deep-copies — with the divergences (64-bit wrapping vs bignum, `long double` vs double,
+truncating vs flooring division, unordered vs insertion-ordered dicts) enumerated there.
+`bench/verify_semantics.{ml,py}` assert that equivalence and must both print the same line.
+
 ## Source layout & compilation model
 
 **Only `src/*.cpp` are compiled** (the Makefile globs them) — seven translation units:

@@ -1,0 +1,17 @@
+# dictionary member access with the `d.key` sugar (== d["key"]).
+# (Keys already exist, so the read-auto-vivification quirk does not fire.)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var d = {"alpha": 1, "beta": 2, "gamma": 3, "delta": 4};
+
+var N = 500000 * scale;
+var s = 0;
+
+for (var i = 0; i < N; i += 1) {
+    s += d.alpha + d.beta + d.gamma + d.delta;
+    s = s % 1000000007;
+}
+
+print("result:", s);

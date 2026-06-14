@@ -1,0 +1,12 @@
+# grow an array element-by-element via push() (amortized O(1) like list.append)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+var a = [];
+
+for (var i = 0; i < N; i += 1)
+    push(a, i);
+
+print("result:", len(a));

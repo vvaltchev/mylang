@@ -1,0 +1,12 @@
+# dictionary insertion (integer keys, to isolate hashing/insert cost)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 300000 * scale;
+var d = {};
+
+for (var i = 0; i < N; i += 1)
+    d[i] = i * 2;
+
+print("result:", len(d));

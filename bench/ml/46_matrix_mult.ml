@@ -1,0 +1,45 @@
+# naive O(n^3) matrix multiply over arrays-of-arrays (nested subscripting)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func mk(n, seed) {
+    var m = array(n);
+    var x = seed;
+    for (var i = 0; i < n; i += 1) {
+        var row = array(n);
+        for (var j = 0; j < n; j += 1) {
+            x = (x * 1103515245 + 12345) % 1000;
+            row[j] = x;
+        }
+        m[i] = row;
+    }
+    return m;
+}
+
+func matmul(a, b, n) {
+    var c = array(n);
+    for (var i = 0; i < n; i += 1) {
+        var row = array(n);
+        for (var j = 0; j < n; j += 1) {
+            var s = 0;
+            for (var k = 0; k < n; k += 1)
+                s += a[i][k] * b[k][j];
+            row[j] = s;
+        }
+        c[i] = row;
+    }
+    return c;
+}
+
+var n = 70;
+var a = mk(n, 1);
+var b = mk(n, 2);
+
+var checksum = 0;
+for (var r = 0; r < scale; r += 1) {
+    var c = matmul(a, b, n);
+    checksum += c[0][0] + c[n - 1][n - 1];
+}
+
+print("result:", checksum);

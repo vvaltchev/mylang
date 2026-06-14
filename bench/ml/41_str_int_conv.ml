@@ -1,0 +1,15 @@
+# str()/int() round-trip conversions in a loop
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 300000 * scale;
+var s = 0;
+
+for (var i = 0; i < N; i += 1) {
+    var str_i = str(i);
+    var back = int(str_i);
+    s += back - i;            # always 0; keeps the work from being optimized away
+}
+
+print("result:", s);

@@ -41,3 +41,6 @@ build
 
 # Temp files produced by the I/O builtin tests
 *.tmp
+
+# Machine-specific benchmark output (regenerate with: bench/run.py --csv)
+bench/results.csv

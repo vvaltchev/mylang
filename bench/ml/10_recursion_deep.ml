@@ -1,0 +1,16 @@
+# deep linear recursion: exercises call/return stack depth (depth 900).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func sumto(n) {
+    if (n == 0)
+        return 0;
+    return n + sumto(n - 1);
+}
+
+var r = 0;
+for (var k = 0; k < 3000 * scale; k += 1)
+    r = sumto(900);
+
+print("result:", r);

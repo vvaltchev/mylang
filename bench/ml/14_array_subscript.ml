@@ -1,0 +1,16 @@
+# preallocated array, random-access write then read (subscript hot path)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+var a = array(N);
+
+for (var i = 0; i < N; i += 1)
+    a[i] = i * 2;
+
+var s = 0;
+for (var i = 0; i < N; i += 1)
+    s += a[i];
+
+print("result:", s);
