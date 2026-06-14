@@ -265,15 +265,21 @@ and it lives *inside the parser*. Mechanics:
   `process_arrays` is set — in which case it bakes the whole value into **one
   `LiteralObj` node** (`syntax.h`), not one literal per element. (It stores
   `v.clone()` so a small slice of a huge const array doesn't pin the huge
-  buffer.) `LiteralObj` carries an **`immutable`** flag, set when the
-  materialization target is a `const` decl (`fl & pInConstDecl` at the call
-  site). `LiteralObj::do_eval` (`eval.cpp`) then either:
-  - for a `const` target (`immutable`): hands out a **deep read-only** value via
-    `make_const_clone()` — every array/dict in it (recursively) is flagged
-    read-only, so the value is immutable through *any* alias (e.g. a non-const
-    function parameter bound to a const argument); or
-  - for a `var` target / read-only consumer: a *fresh, fully-mutable deep copy*
-    via `make_mutable_clone()`, exactly what the old per-element
+  buffer.) `LiteralObj` carries an **`immutable`** flag. The materializer sets
+  it when **either** the target is a `const` decl (`fl & pInConstDecl`) **or the
+  value itself is already read-only** (`is_readonly_value()`). The second case
+  is how **const-ness propagates**: a slice/element/result derived from a const
+  is read-only, so `var s = y[1:3]` (with `y` const) keeps `s` read-only —
+  `var` only makes the *name* rebindable, not the value mutable. (This mirrors
+  runtime, where the value carries the flag; a *fresh* literal isn't read-only,
+  so `var a = [1,2,3]` stays mutable.) `LiteralObj::do_eval` (`eval.cpp`) then
+  either:
+  - for an `immutable` result: hands out the **deep read-only** value (baked via
+    `make_const_clone()` — every array/dict in it, recursively, is flagged
+    read-only — and shared, since it can't be mutated), so it is immutable
+    through *any* alias (e.g. a non-const function parameter, or a `var`); or
+  - for a mutable result: a *fresh, fully-mutable deep copy* via
+    `make_mutable_clone()`, exactly what the old per-element
     `LiteralArray`/`LiteralDict` produced at runtime — a `var` bound to it must
     be writable, and re-evaluating the node (loop body, function called twice)
     must not see a prior mutation.

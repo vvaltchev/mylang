@@ -1340,6 +1340,19 @@ pAcceptFuncDecl(ParseContext &c,
     return true;
 }
 
+/* True if `v` is a read-only (const-backed) array or dict value. */
+static bool
+is_readonly_value(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>())
+        return v.get<SharedArrayObj>().is_readonly();
+
+    if (v.is<shared_ptr<DictObject>>())
+        return v.get<shared_ptr<DictObject>>()->is_readonly();
+
+    return false;
+}
+
 bool
 MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
@@ -1373,16 +1386,29 @@ MakeConstructFromConstVal(const EvalValue &v,
             /*
              * Materialize the const array/dict as ONE node holding the value,
              * not one Construct per element (which exploded the tree for large
-             * results). For an `immutable` (const-decl) target we bake a deep
-             * read-only value: do_eval then *shares* it (it can't be mutated),
-             * so the const symbol and this node hold one buffer, not two. For a
-             * mutable target we bake a standalone clone (do_eval copies it per
-             * eval). Either way the baked value is self-contained, so a small
-             * slice of a huge const array doesn't pin the huge buffer.
+             * results).
+             *
+             * The result is read-only iff the *target* is a const decl
+             * (`immutable`) OR the *value itself* is already read-only - the
+             * latter is how const-ness propagates: a slice/element/result
+             * derived from a const is read-only, so binding it to a `var` keeps
+             * it read-only (just as it would at runtime, where the value
+             * carries the flag). A fresh literal is not read-only, so
+             * `var a = [1,2,3]` stays mutable. Use clone()/deepclone() to get a
+             * mutable copy of a const.
+             *
+             * For a read-only result we bake a deep read-only value: do_eval
+             * then *shares* it (it can't be mutated), so the symbol and this
+             * node hold one buffer, not two. For a mutable result we bake a
+             * standalone clone (do_eval copies it per eval). Either way the
+             * baked value is self-contained, so a small slice of a huge const
+             * array doesn't pin the huge buffer.
              */
+            const bool ro = immutable || is_readonly_value(v);
+
             out = make_unique<LiteralObj>(
-                immutable ? make_const_clone(v) : v.clone(),
-                immutable
+                ro ? make_const_clone(v) : v.clone(),
+                ro
             );
             return true;
         }
