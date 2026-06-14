@@ -70,13 +70,26 @@ line passes too) — ~7% smaller binary and ~8-9% faster on `bench/`. It works o
 both GCC and clang and is verified to keep `-rt` green. Build with `LTO=0` to
 disable (e.g. for a faster/debuggable link); an `OPT=0` build is non-LTO anyway.
 
+**Sanitizers default on for debug builds.** `ASAN` and `UBSAN` (AddressSanitizer
+/ UndefinedBehaviorSanitizer) both default to **on when `OPT=0`** and **off when
+`OPT=1`**, and either can be forced: `make ASAN=0` (debug, no ASan),
+`make OPT=1 UBSAN=1` (sanitized release). The flags go into `BASE_FLAGS` so they
+reach the compile and link lines. UBSan is configured `-fno-sanitize=signed-
+integer-overflow`, because the codebase relies on `-fwrapv` wraparound (that
+overflow is *defined* here, not a bug). `-fno-omit-frame-pointer` is added
+whenever either sanitizer is on. `-rt` is verified green under both.
+
 CMake is also supported (used by CI):
 `cmake -DTESTS=1 -DCMAKE_BUILD_TYPE=Debug .. && cmake --build .`
 (`-DGCOV=ON` for a coverage build, GCC only). It enables LTO via
 `INTERPROCEDURAL_OPTIMIZATION` for the `Release`/`RelWithDebInfo` configs (so
 Debug and coverage builds are untouched), portable across GCC/clang/MSVC;
-configure with `-DLTO=OFF` to disable. CI (`.github/workflows/`) builds
-Debug+Release × g+++clang
+configure with `-DLTO=OFF` to disable. The same `ASAN`/`UBSAN` options exist
+(`-DASAN=ON/OFF`), defaulting **on for a `Debug` build** and off otherwise — the
+analog of `OPT=0` vs `OPT=1` — and are applied on GCC/clang only (skipped on
+MSVC). CMake now also passes `-fwrapv` (non-MSVC), matching the Makefile so the
+relied-upon signed wraparound is defined in CMake builds too. CI
+(`.github/workflows/`) builds Debug+Release × g+++clang
 on Linux, plus macOS and Windows, and runs `./mylang -rt`.
 
 Running scripts:
