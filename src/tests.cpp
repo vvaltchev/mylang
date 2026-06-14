@@ -1706,6 +1706,276 @@ static const std::vector<test> tests =
         &typeid(TypeErrorEx),
     },
 
+    /* ---- function value type (func.cpp.h) ---- */
+    {
+        "function value: to_string / equality / truthiness / clone",
+        {
+            "var f = func() { };",
+            "var g = func() { };",
+            "assert(str(f) == \"<function>\");",
+            "assert(f == f);",
+            "assert((f == g) == false);",
+            "assert(f != g);",
+            "assert((f == 5) == false);",
+            "assert((f != 5) == true);",
+            "if (f) { assert(true); } else { assert(false); }",  /* is_true */
+            "var h = clone(f);",
+        },
+    },
+
+    /* ---- string operators (str.cpp.h) type errors ---- */
+    { "string * non-integer is a type error",
+      { "\"ab\" * \"x\";" }, &typeid(TypeErrorEx) },
+    { "string < non-string is a type error",
+      { "\"a\" < 5;" }, &typeid(TypeErrorEx) },
+    { "string > non-string is a type error",
+      { "\"a\" > 5;" }, &typeid(TypeErrorEx) },
+    { "string <= non-string is a type error",
+      { "\"a\" <= 5;" }, &typeid(TypeErrorEx) },
+    { "string >= non-string is a type error",
+      { "\"a\" >= 5;" }, &typeid(TypeErrorEx) },
+    { "string subscript with non-integer is a type error",
+      { "\"abc\"[\"x\"];" }, &typeid(TypeErrorEx) },
+    { "string slice with non-integer start is a type error",
+      { "\"abc\"[\"x\":];" }, &typeid(TypeErrorEx) },
+    { "string slice with non-integer end is a type error",
+      { "\"abc\"[1:\"y\"];" }, &typeid(TypeErrorEx) },
+
+    /* ---- int operators (int.cpp.h) type errors / div-by-zero ---- */
+    { "int + non-int is a type error",  { "5 + \"x\";" }, &typeid(TypeErrorEx) },
+    { "int - non-int is a type error",  { "5 - \"x\";" }, &typeid(TypeErrorEx) },
+    { "int * non-int is a type error",  { "5 * \"x\";" }, &typeid(TypeErrorEx) },
+    { "int / non-int is a type error",  { "5 / \"x\";" }, &typeid(TypeErrorEx) },
+    { "int % non-int is a type error",  { "5 % \"x\";" }, &typeid(TypeErrorEx) },
+    { "int < non-int is a type error",  { "5 < \"x\";" }, &typeid(TypeErrorEx) },
+    { "int > non-int is a type error",  { "5 > \"x\";" }, &typeid(TypeErrorEx) },
+    { "int <= non-int is a type error", { "5 <= \"x\";" }, &typeid(TypeErrorEx) },
+    { "int >= non-int is a type error", { "5 >= \"x\";" }, &typeid(TypeErrorEx) },
+    { "int division by zero",           { "5 / 0;" }, &typeid(DivisionByZeroEx) },
+    { "int modulo by zero",             { "5 % 0;" }, &typeid(DivisionByZeroEx) },
+
+    /* ---- float operators (float.cpp.h) ---- */
+    { "float + non-numeric is a type error",
+      { "2.5 + \"x\";" }, &typeid(TypeErrorEx) },
+    { "float / 0.0 is division by zero",
+      { "2.5 / 0.0;" }, &typeid(DivisionByZeroEx) },
+    {
+        "float equality / hashing with non-numerics",
+        {
+            "assert((2.5 == \"x\") == false);",
+            "assert((2.5 != \"x\") == true);",
+            "assert(hash(2.5) == hash(2.5));",
+        },
+    },
+
+    /* ---- generic builtins (generic.cpp.h) error & runtime paths ---- */
+    { "len() with no args is rejected",
+      { "len();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "defined() with no args is rejected",
+      { "defined();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "str() with no args is rejected",
+      { "str();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "str() of a float with negative precision is a type error",
+      { "str(3.5, -1);" }, &typeid(TypeErrorEx) },
+    { "str() of a float with too-high precision is a type error",
+      { "str(3.5, 99);" }, &typeid(TypeErrorEx) },
+    { "runtime() with no args is rejected",
+      { "runtime();" }, &typeid(InvalidNumberOfArgsEx) },
+    {
+        "isconst() / isconstdecl() runtime fallback on a non-const param",
+        {
+            "func f(x) { return isconst(x); }",
+            "func g(x) { return isconstdecl(x); }",
+            "assert(f(5) == false);",
+            "assert(g(5) == false);",
+        },
+    },
+    {
+        "ispure() / ispuredecl() report on a function value",
+        {
+            "pure func p() => 1;",
+            "func q() => 1;",
+            "assert(ispuredecl(p));",
+            "assert(ispuredecl(q) == false);",
+            "assert(ispure(p));",
+        },
+    },
+    { "ispure() of a non-function is a type error",
+      { "ispure(5);" }, &typeid(TypeErrorEx) },
+    { "ispure() with no args is rejected",
+      { "ispure();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "ispuredecl() of a non-function is a type error",
+      { "ispuredecl(5);" }, &typeid(TypeErrorEx) },
+    { "intptr() with no args is rejected",
+      { "intptr();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "intptr() of a non-lvalue is rejected",
+      { "intptr(5);" }, &typeid(NotLValueEx) },
+    { "undef() with no args is rejected",
+      { "undef();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "undef() of a non-identifier is a type error",
+      { "undef(5);" }, &typeid(TypeErrorEx) },
+    { "assert(false) fails",
+      { "assert(false);" }, &typeid(AssertionFailureEx) },
+    { "assert() with no args is rejected",
+      { "assert();" }, &typeid(InvalidNumberOfArgsEx) },
+    {
+        "find() / hash() value forms",
+        {
+            "assert(find([1,2,3], 2) == 1);",
+            "assert(find([1,2,3], 9) == none);",
+            "assert(find(\"abcd\", \"cd\") == 2);",
+            "assert(hash(5) == hash(5));",
+            "assert(hash(\"x\") == hash(\"x\"));",
+        },
+    },
+    { "find() with no args is rejected",
+      { "find();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "find() with a non-function key is a type error",
+      { "find([1,2], 1, 5);" }, &typeid(TypeErrorEx) },
+    { "find() in a string with a non-string needle is a type error",
+      { "find(\"abc\", 5);" }, &typeid(TypeErrorEx) },
+    { "find() in an unsupported container is a type error",
+      { "find(5, 1);" }, &typeid(TypeErrorEx) },
+    { "hash() with no args is rejected",
+      { "hash();" }, &typeid(InvalidNumberOfArgsEx) },
+
+    /* ---- numeric / math builtins (num.cpp.h) ---- */
+    {
+        "int() / float() / abs() conversions",
+        {
+            "assert(int(3.9) == 3);",
+            "assert(int(\"42\") == 42);",
+            "assert(int(7) == 7);",
+            "assert(float(3) == 3.0);",
+            "assert(float(\"3.5\") == 3.5);",
+            "assert(float(2.5) == 2.5);",
+            "assert(abs(-5) == 5);",
+            "assert(abs(5) == 5);",
+            "assert(abs(-2.5) == 2.5);",
+        },
+    },
+    { "int() of a non-numeric string is a type error",
+      { "int(\"abc\");" }, &typeid(TypeErrorEx) },
+    { "int() of an unsupported type is a type error",
+      { "int([1]);" }, &typeid(TypeErrorEx) },
+    { "int() with no args is rejected",
+      { "int();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "float() of a non-numeric string is a type error",
+      { "float(\"xyz\");" }, &typeid(TypeErrorEx) },
+    { "float() of an unsupported type is a type error",
+      { "float([1]);" }, &typeid(TypeErrorEx) },
+    { "abs() of an unsupported type is a type error",
+      { "abs(\"x\");" }, &typeid(TypeErrorEx) },
+    { "float() with no args is rejected",
+      { "float();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "abs() with no args is rejected",
+      { "abs();" }, &typeid(InvalidNumberOfArgsEx) },
+
+    {
+        "min() / max() over arrays and varargs",
+        {
+            "assert(min([3,1,2]) == 1);",
+            "assert(max([3,1,2]) == 3);",
+            "assert(min(3,1,2) == 1);",
+            "assert(max(3,1,2) == 3);",
+        },
+    },
+    { "min() with no args is rejected",
+      { "min();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "max() with no args is rejected",
+      { "max();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "min() of a single non-array is a type error",
+      { "min(5);" }, &typeid(TypeErrorEx) },
+    { "max() of a single non-array is a type error",
+      { "max(5);" }, &typeid(TypeErrorEx) },
+
+    {
+        "math float builtins (int args accepted)",
+        {
+            /* Transcendental results are compared with an epsilon: a libm is
+               not required to round them to the mathematically exact value, so
+               `log10(1000.0) == 3.0` etc. are not portable (they're const-
+               folded with whatever libm compiles the test). Only sqrt of a
+               perfect square and ceil/floor/trunc are IEEE-exact. */
+            "assert(sqrt(16.0) == 4.0);",
+            "assert(sqrt(16) == 4.0);",           /* int arg is promoted */
+            "assert(ceil(2.1) == 3.0);",
+            "assert(floor(2.9) == 2.0);",
+            "assert(trunc(2.9) == 2.0);",
+            "assert(abs(cbrt(27.0) - 3.0) < 1e-9);",
+            "assert(abs(exp(0.0) - 1.0) < 1e-9);",
+            "assert(abs(exp2(10.0) - 1024.0) < 1e-9);",
+            "assert(abs(log(1.0) - 0.0) < 1e-9);",
+            "assert(abs(log2(8.0) - 3.0) < 1e-9);",
+            "assert(abs(log10(1000.0) - 3.0) < 1e-9);",
+            "assert(abs(pow(2.0, 10.0) - 1024.0) < 1e-9);",
+            "assert(abs(sin(0.0) - 0.0) < 1e-9);",
+            "assert(abs(cos(0.0) - 1.0) < 1e-9);",
+            "assert(abs(tan(0.0) - 0.0) < 1e-9);",
+            "assert(abs(asin(0.0) - 0.0) < 1e-9);",
+            "assert(abs(acos(1.0) - 0.0) < 1e-9);",
+            "assert(abs(atan(0.0) - 0.0) < 1e-9);",
+        },
+    },
+    { "a math builtin on a non-numeric is a type error",
+      { "sqrt(\"x\");" }, &typeid(TypeErrorEx) },
+    { "a math builtin with the wrong arity is rejected",
+      { "sqrt();" }, &typeid(InvalidArgumentEx) },
+    { "pow() with one argument is rejected",
+      { "pow(2.0);" }, &typeid(InvalidArgumentEx) },
+
+    {
+        "isnan / isinf / isfinite / isnormal",
+        {
+            "assert(isfinite(1.0));",
+            "assert(isnan(sqrt(-1.0)));",
+            "assert(isinf(log(0.0)));",
+            "assert(isnan(1.0) == false);",
+            "assert(isinf(1.0) == false);",
+            "assert(isnormal(1.0));",
+        },
+    },
+
+    {
+        "round() value forms",
+        {
+            "assert(round(2.5) == 3.0);",     /* integer results are exact */
+            "assert(round(2.4) == 2.0);",
+            "assert(round(-2.5) == -3.0);",
+            "assert(round(5) == 5.0);",
+            /* the digits form divides by a power of 10 -> not exact */
+            "assert(abs(round(2.567, 1) - 2.6) < 1e-9);",
+        },
+    },
+    { "round() with no args is rejected",
+      { "round();" }, &typeid(InvalidArgumentEx) },
+    { "round() of a non-numeric is a type error",
+      { "round(\"x\");" }, &typeid(TypeErrorEx) },
+    { "round() with negative digits is a type error",
+      { "round(2.5, -1);" }, &typeid(TypeErrorEx) },
+    { "round() with too many args is rejected",
+      { "round(1.0, 2, 3);" }, &typeid(InvalidArgumentEx) },
+
+    {
+        "rand() / randf() basics",
+        {
+            "assert(rand(5, 5) == 5);",       /* lo == hi */
+            "assert(rand(9, 1) == none);",    /* lo > hi  */
+            "var r = rand(1, 3);",
+            "assert(r >= 1 && r <= 3);",
+            "assert(randf(2.0, 2.0) == 2.0);",
+            "assert(randf(5.0, 1.0) == none);",
+            "var f = randf(0.0, 1.0);",
+            "assert(f >= 0.0 && f <= 1.0);",
+        },
+    },
+    { "rand() with a non-integer is a type error",
+      { "rand(\"x\", 5);" }, &typeid(TypeErrorEx) },
+    { "rand() with the wrong arity is rejected",
+      { "rand(1);" }, &typeid(InvalidNumberOfArgsEx) },
+    { "randf() with a non-float is a type error",
+      { "randf(1.0, \"y\");" }, &typeid(TypeErrorEx) },
+
     {
         "Split string, char by char",
         {
@@ -3789,6 +4059,61 @@ static const std::vector<test> tests =
             "assert(rstrip(lines[1]) == \"cc\");",
         },
     },
+
+    /* ---- file I/O builtins (io.cpp.h). stdin forms (read()/readln()/
+       readlines() with no file) need external input, so they aren't covered. */
+    {
+        "I/O: write / writeln / read a file round-trip",
+        {
+            "write(\"hello\\n\", \"test_io_rw.tmp\");",
+            /* writeln's newline goes to stdout, not the file, so the file
+               holds just the value. */
+            "writeln(\"world\", \"test_io_rw2.tmp\");",
+            "assert(read(\"test_io_rw.tmp\") == \"hello\\n\");",
+            "assert(read(\"test_io_rw2.tmp\") == \"world\");",
+            "var L = readlines(\"test_io_rw.tmp\");",
+            "assert(len(L) == 1 && L[0] == \"hello\");",
+        },
+    },
+    {
+        "I/O: print / writeln to stdout",
+        {
+            "print(\"io-coverage\", 42);",
+            "writeln(\"io-writeln\");",
+        },
+    },
+    { "write() with a non-string value is a type error",
+      { "write(123);" }, &typeid(TypeErrorEx) },
+    { "write() with a non-string filename is a type error",
+      { "write(\"x\", 123);" }, &typeid(TypeErrorEx) },
+    { "write() with no args is rejected",
+      { "write();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "write() with too many args is rejected",
+      { "write(\"a\", \"b\", \"c\");" }, &typeid(InvalidNumberOfArgsEx) },
+    { "write() to an unopenable path fails",
+      { "write(\"x\", \"/no_such_dir_xyz123/f.tmp\");" },
+      &typeid(CannotOpenFileEx) },
+    { "read() of a non-string filename is a type error",
+      { "read(123);" }, &typeid(TypeErrorEx) },
+    { "read() of a missing file fails",
+      { "read(\"no_such_file_xyz123.tmp\");" }, &typeid(CannotOpenFileEx) },
+    { "read() with too many args is rejected",
+      { "read(\"a\", \"b\");" }, &typeid(InvalidNumberOfArgsEx) },
+    { "readlines() of a non-string filename is a type error",
+      { "readlines(123);" }, &typeid(TypeErrorEx) },
+    { "readlines() of a missing file fails",
+      { "readlines(\"no_such_file_xyz456.tmp\");" }, &typeid(CannotOpenFileEx) },
+    { "readlines() with too many args is rejected",
+      { "readlines(\"a\", \"b\");" }, &typeid(InvalidNumberOfArgsEx) },
+    { "writelines() of a non-array is a type error",
+      { "writelines(123, \"f.tmp\");" }, &typeid(TypeErrorEx) },
+    { "writelines() with a non-string filename is a type error",
+      { "writelines([\"a\"], 123);" }, &typeid(TypeErrorEx) },
+    { "writelines() with no args is rejected",
+      { "writelines();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "writelines() to an unopenable path fails",
+      { "writelines([\"a\"], \"/no_such_dir_xyz123/f.tmp\");" },
+      &typeid(CannotOpenFileEx) },
 
     {
         /* The C++ literals below encode mylang source with backslash escapes. */
