@@ -236,7 +236,7 @@ bind_param(EvalContext *args_ctx,
  * argument representation - unevaluated argument expressions (the normal call
  * path), an already-evaluated value vector, a single value, and a pair (used by
  * builtins that invoke a callback). Each evaluates/forwards the args and hands
- * the actual storage to bind_param (the slot Frame when resolved, else the map).
+ * the actual storage to bind_param (slot Frame when resolved, else the map).
  */
 static void
 do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
@@ -267,7 +267,9 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < args.size(); i++) {
-        bind_param(args_ctx, frame, i, funcParams[i].get(), args[i], ctx->const_ctx);
+        bind_param(
+            args_ctx, frame, i, funcParams[i].get(), args[i], ctx->const_ctx
+        );
     }
 }
 
@@ -295,14 +297,16 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
     if (funcParams.size() != 2)
         throw InvalidNumberOfArgsEx();
 
-    bind_param(args_ctx, frame, 0, funcParams[0].get(), args.first, ctx->const_ctx);
-    bind_param(args_ctx, frame, 1, funcParams[1].get(), args.second, ctx->const_ctx);
+    bind_param(args_ctx, frame, 0, funcParams[0].get(), args.first,
+               ctx->const_ctx);
+    bind_param(args_ctx, frame, 1, funcParams[1].get(), args.second,
+               ctx->const_ctx);
 }
 
 /*
  * Invoke `obj` with `args`. Builds the callee's argument context (its own
  * FlowState and, when the function was resolved, a flat slot Frame), binds the
- * params, evaluates the body, and returns whatever the body returned through the
+ * params, evaluates the body, and returns what the body returned via the
  * FlowState (or none). An UndefinedVariableEx escaping a pure func is tagged so
  * the error message can point at the pure-func restriction.
  */
@@ -657,6 +661,14 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
     return newVal;
 }
 
+/* Return `lvalue` as an Identifier resolved to a slot, or nullptr otherwise. */
+static inline const Identifier *
+as_resolved_local(const Construct *lvalue)
+{
+    const Identifier *id = dynamic_cast<const Identifier *>(lvalue);
+    return (id && id->sym.kind == SymKind::local) ? id : nullptr;
+}
+
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,
@@ -664,6 +676,28 @@ handle_single_expr14(EvalContext *ctx,
                      Construct *lvalue,
                      const EvalValue &rval)
 {
+    /*
+     * Fast path: declaring a resolved local. Write its slot and mark it live.
+     * The resolver already rejected illegal same-block redeclarations and the
+     * enclosing block cleared this slot's live bit on entry, so we just
+     * (over)write - which is also exactly what a loop re-entry needs. The
+     * dynamic_cast is gated on inDecl so plain assignments (the hot path, e.g.
+     * `s += i`) never pay for it; an assignment to a resolved local instead
+     * flows through the normal lvalue->eval() -> LValue* -> doAssign path
+     * below.
+     */
+    if (inDecl) {
+
+        if (const Identifier *id = as_resolved_local(lvalue)) {
+
+            Frame *f = ctx->frame;
+            f->slots[id->sym.slot] =
+                LValue(RValue(rval), ctx->const_ctx || lvalue->is_const);
+            f->live |= static_cast<uint64_t>(1) << id->sym.slot;
+            return rval;
+        }
+    }
+
     const EvalValue &lval = lvalue->eval(ctx);
 
     if (lval.is<UndefinedId>()) {
@@ -824,6 +858,24 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalContext curr(ctx, ctx ? ctx->const_ctx : false);
 
+    /*
+     * Reset this block's resolved locals to "undefined" on entry. The slots
+     * persist for the whole call, so without this a re-entered block (a loop
+     * body, say) would still see the previous iteration's bindings live. The
+     * resolver guarantees a block's slots are a contiguous range, so one mask
+     * op clears them; slot_count == 0 (no slotted locals / unresolved function)
+     * makes this a no-op. Params live below the body block's range, so they are
+     * never cleared here.
+     */
+    if (curr.frame && slot_count) {
+
+        const uint64_t range = slot_count >= 64
+            ? ~static_cast<uint64_t>(0)
+            : (((static_cast<uint64_t>(1) << slot_count) - 1) << slot_start);
+
+        curr.frame->live &= ~range;
+    }
+
     for (const auto &e: elems) {
 
         EvalValue &&tmp = e->eval(&curr);
@@ -970,11 +1022,22 @@ do_catch(EvalContext *ctx,
                             : ExceptionObject(saved_ex->name)
                     );
 
-                catch_ctx.emplace(
-                    asId,
-                    move(shared_ex),
-                    ctx->const_ctx
-                );
+                if (asId->sym.kind == SymKind::local && catch_ctx.frame) {
+
+                    /* Resolved catch variable: bind it into its slot. */
+                    Frame *f = catch_ctx.frame;
+                    f->slots[asId->sym.slot] =
+                        LValue(move(shared_ex), ctx->const_ctx);
+                    f->live |= static_cast<uint64_t>(1) << asId->sym.slot;
+
+                } else {
+
+                    catch_ctx.emplace(
+                        asId,
+                        move(shared_ex),
+                        ctx->const_ctx
+                    );
+                }
             }
 
             catchBody->eval(&catch_ctx);
@@ -1173,7 +1236,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
     FlowState &fs = *ctx->flow;
 
     if (fs.type == FlowState::ret)
-        return false;                       /* stop; propagate to the function */
+        return false;                       /* stop; propagate up */
 
     if (fs.type == FlowState::brk) {
         fs.type = FlowState::none;

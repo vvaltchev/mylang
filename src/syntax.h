@@ -397,6 +397,17 @@ public:
 class Block final: public MultiElemConstruct<> {
 
 public:
+    /*
+     * Slot range [slot_start, slot_start + slot_count) of the resolved locals
+     * declared inside this block (assigned by the resolver; 0/0 when the block
+     * has no slotted locals or its function isn't resolved). Block::do_eval
+     * clears these slots' live bits on entry so a re-entered block (e.g. a loop
+     * body) starts with its locals undefined again - matching the old
+     * fresh-EvalContext-per-iteration semantics.
+     */
+    int slot_start = 0;
+    int slot_count = 0;
+
     Block() : MultiElemConstruct("Block", ConstructType::block) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 };
@@ -446,14 +457,19 @@ public:
 
     /*
      * Filled in by the name-resolution pass (resolver.cpp). When `resolved` is
-     * true, do_func_call binds params into a Frame of `frame_size` slots instead
-     * of an EvalContext map, and body references to params are O(1) slot reads.
-     * `param_writes[i]` counts how many times param i is assigned in the body
-     * (it stays 0 for a write-once param) - groundwork for auto-const detection.
+     * true, do_func_call builds a Frame of `frame_size` slots (params first,
+     * then locals) instead of an EvalContext map, and body references to those
+     * symbols are O(1) slot reads.
+     *
+     * `slot_writes[i]` counts how many times slot i is written in the body: for
+     * a param that's body reassignments only (so 0 == never reassigned); for a
+     * local it includes the declaration (so 1 == declared once, never
+     * reassigned == write-once). Slots 0..params-1 are the params. This is
+     * groundwork for the planned auto-const detection pass.
      */
     bool resolved = false;
     int frame_size = 0;
-    std::vector<int> param_writes;
+    std::vector<int> slot_writes;
 
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;

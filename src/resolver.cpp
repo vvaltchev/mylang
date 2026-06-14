@@ -2,78 +2,193 @@
 
 #include "syntax.h"
 #include "resolver.h"
+#include "errors.h"
 
 #include <functional>
-#include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 /*
- * Slice 1 of the slot-indexing optimization: resolve function PARAMETERS to
- * Frame slots. The strategy is deliberately conservative and all-or-nothing per
- * function: a function's params are slotted only if no local variable anywhere
- * in its body re-declares a param name (no shadowing) and there are no duplicate
- * params. Under that condition any body reference whose name matches a param is
- * unambiguously that param, so resolution is a trivial name match with no need
- * to track block-by-block scope. Functions that don't qualify are simply left
- * unresolved and keep using the runtime map (correct, just not optimized).
+ * Name-resolution pass (slice 2a): resolve a function's PARAMETERS and its
+ * LOCAL variables (var/const, for-init, foreach variables, catch variables) to
+ * fixed Frame slots, so that references become O(1) slot reads at runtime
+ * instead of std::map lookups walking the scope chain.
  *
- * Locals, top-level symbols, captures and builtins are intentionally NOT slotted
- * here; they remain unresolved and fall back to the EvalContext map walk. Later
- * slices can extend coverage on top of this same pass.
+ * What is and isn't resolved:
+ *
+ *   - params, var/const, for/foreach/catch variables  -> slotted
+ *   - function NAMES (FuncDeclStmt::id)                -> NOT slotted; kept in
+ *         the map. They are forward-reference-able (mutual recursion), and a
+ *         forward reference necessarily resolves to "unresolved" in this
+ *         single forward pass; a name in a slot would then not be found.
+ *         A function-name declaration still creates a scope entry so it
+ *         correctly SHADOWS an outer slotted binding of the same name.
+ *   - top-level (module-scope) variables              -> NOT slotted here; that
+ *         is slice 2b. The top-level walk only descends to find and resolve
+ *         nested functions.
+ *   - builtins, captures, anything unresolved         -> map fallback.
+ *
+ * Resolution is a forward walk with a lexical scope stack: a ref resolves
+ * only against declarations seen earlier (no hoisting), which is what makes
+ * `var x = x + 1;` in a nested block read the OUTER x for its RHS. Shadowing
+ * falls out of searching the scope stack innermost-out. Frame slots persist for
+ * the whole call, so Block::do_eval clears a block's slots on entry (see eval.h
+ * Frame / eval.cpp Block::do_eval) to restore fresh-per-iteration semantics.
+ * The resolver records each block's contiguous slot range for that.
+ *
+ * The pass is purely an optimization: anything it leaves unresolved still works
+ * via the runtime map. The one behavior it MOVES rather than preserves is
+ * duplicate-declaration detection: a same-block redeclaration now raises
+ * AlreadyDefinedEx here (before execution) instead of when the second
+ * declaration would have run. AlreadyDefinedEx is not script-catchable, so this
+ * is only an earlier-and-always failure for genuinely duplicate code.
  */
 
 namespace {
 
-typedef std::unordered_set<const UniqueId *> NameSet;
+/* Max slots per frame: Frame::live is one 64-bit word, one bit per slot. */
+constexpr int MAX_SLOTS = 64;
 
 /*
- * Per-function resolution state, threaded through the walk. It is only
- * meaningful while `slottable` is true; for a non-slottable function `params`
- * stays empty and every identifier in the body is left unresolved.
+ * A lexical scope (a function's param scope, a block, a for/foreach header, or
+ * catch clause). `decls` maps each declared name to its slot, or to -1 for a
+ * "masking" entry: a name that is in scope but NOT slotted (a function name, or
+ * a local that overflowed the slot budget). A masking entry shadows an outer
+ * slotted binding while still resolving to a runtime map lookup.
+ */
+struct Scope {
+    std::vector<std::pair<const UniqueId *, int>> decls;
+};
+
+/*
+ * Resolution state for one function (or, eventually, the top level). Only
+ * meaningful while `slottable`; otherwise declare/resolve_ref are no-ops and
+ * every identifier in the function is left unresolved.
  */
 struct FuncState {
     bool slottable = false;
     FuncDeclStmt *fd = nullptr;
-    std::unordered_map<const UniqueId *, int> params;   /* param name -> slot */
+    int next_slot = 0;
+    std::vector<Scope> scopes;
+    std::vector<int> writes;        /* per slot -> fd->slot_writes */
 };
-
-/* Max params we slot: Frame::live is a single 64-bit word, one bit per slot. */
-constexpr int MAX_SLOTS = 64;
 
 class Resolver {
 
 public:
 
-    /* Resolve the whole tree, starting outside any function (cur == nullptr). */
+    /* Resolve the whole tree, outside any function (cur == nullptr). */
     void run(Construct *root) { walk(root, nullptr); }
 
 private:
 
     void walk(Construct *c, FuncState *cur);
     void process_function(FuncDeclStmt *fd);
-    void count_param_writes(Construct *lvalue, FuncState *cur);
 
     /*
-     * Stamp an identifier reference with its param slot when it names a param of
-     * the current (slottable) function. Everything else is left unresolved, so
-     * it falls back to the runtime EvalContext map lookup.
+     * Declare `id` in the current innermost scope and slot it. Raises
+     * AlreadyDefinedEx on a same-scope redeclaration. If the slot budget is
+     * exhausted the name is added as a masking entry (resolves to the map) so
+     * shadowing still works. No-op when the function isn't slottable.
+     */
+    void declare(FuncState *cur, Identifier *id)
+    {
+        if (!cur || !cur->slottable || !id)
+            return;
+
+        check_no_redecl(cur, id);
+
+        if (cur->next_slot >= MAX_SLOTS) {
+            cur->scopes.back().decls.push_back({ id->uid, -1 });
+            return;
+        }
+
+        const int slot = cur->next_slot++;
+        cur->scopes.back().decls.push_back({ id->uid, slot });
+        cur->writes.push_back(1);   /* the declaration is write #1 */
+        id->sym = ResolvedSym{ SymKind::local, slot };
+    }
+
+    /*
+     * Declare a name that is in scope but stays in the map (function names).
+     * Like declare() it rejects same-scope duplicates and shadows outer slots,
+     * but assigns no slot and stamps nothing.
+     */
+    void declare_masking(FuncState *cur, Identifier *id)
+    {
+        if (!cur || !cur->slottable || !id)
+            return;
+
+        check_no_redecl(cur, id);
+        cur->scopes.back().decls.push_back({ id->uid, -1 });
+    }
+
+    /* Throw AlreadyDefinedEx if `id` is already declared in this scope. */
+    void check_no_redecl(FuncState *cur, Identifier *id) const
+    {
+        for (const auto &d : cur->scopes.back().decls) {
+            if (d.first == id->uid)
+                throw AlreadyDefinedEx(id->start, id->end);
+        }
+    }
+
+    /*
+     * Resolve a reference: search scopes innermost-out. A slotted match
+     * stamps the identifier; a masking match (-1) leaves it unresolved (map);
+     * no match also leaves it unresolved (builtin / capture / global).
      */
     void resolve_ref(FuncState *cur, Identifier *id) const
     {
         if (!cur || !cur->slottable || !id)
             return;
 
-        auto it = cur->params.find(id->uid);
+        for (auto s = cur->scopes.rbegin(); s != cur->scopes.rend(); ++s) {
+            for (const auto &d : s->decls) {
+                if (d.first == id->uid) {
+                    if (d.second >= 0)
+                        id->sym = ResolvedSym{ SymKind::local, d.second };
+                    return;     /* found (slotted or masked) */
+                }
+            }
+        }
+    }
 
-        if (it != cur->params.end())
-            id->sym = ResolvedSym{ SymKind::local, it->second };
+    /* Count an assignment to a resolved-local lvalue as a write of its slot. */
+    void count_write(FuncState *cur, Construct *lvalue)
+    {
+        if (!cur || !cur->slottable)
+            return;
+
+        auto bump = [&](Identifier *id) {
+            if (id && id->sym.kind == SymKind::local)
+                cur->writes[id->sym.slot]++;
+        };
+
+        if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
+            bump(id);
+        } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
+            for (auto &id : il->elems) {
+                bump(id.get());
+            }
+        }
+    }
+
+    /* Declare the name(s) a declaration's lvalue introduces (Id/IdList). */
+    void declare_lvalue(FuncState *cur, Construct *lvalue)
+    {
+        if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
+            declare(cur, id);
+        } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
+            for (auto &id : il->elems) {
+                declare(cur, id.get());
+            }
+        }
     }
 };
 
 /*
- * Invoke `fn` on every direct child Construct of `c`. This covers the generic,
- * scope-neutral nodes; the few nodes that introduce names or scopes (Expr14
- * declarations, FuncDeclStmt) are handled explicitly by the callers, not here.
+ * Invoke `fn` on every direct child Construct of `c`. Used for the generic,
+ * scope-neutral nodes (if/while/call/subscript/...); the nodes that introduce
+ * names or scopes are handled in Resolver::walk and never reach here.
  * Children may be null (e.g. an `if` with no else), so callers tolerate null.
  */
 void
@@ -95,15 +210,6 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
     } else if (auto *n = dynamic_cast<WhileStmt *>(c)) {
         fn(n->condExpr.get());
         fn(n->body.get());
-    } else if (auto *n = dynamic_cast<ForStmt *>(c)) {
-        fn(n->init.get());
-        fn(n->cond.get());
-        fn(n->inc.get());
-        fn(n->body.get());
-    } else if (auto *n = dynamic_cast<ForeachStmt *>(c)) {
-        fn(n->ids.get());
-        fn(n->container.get());
-        fn(n->body.get());
     } else if (auto *n = dynamic_cast<Subscript *>(c)) {
         fn(n->what.get());
         fn(n->index.get());
@@ -118,16 +224,8 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
     } else if (auto *n = dynamic_cast<LiteralDictKVPair *>(c)) {
         fn(n->key.get());
         fn(n->value.get());
-    } else if (auto *n = dynamic_cast<TryCatchStmt *>(c)) {
-        fn(n->tryBody.get());
-        for (auto &p : n->catchStmts) {
-            fn(p.first.exList.get());
-            fn(p.first.asId.get());
-            fn(p.second.get());
-        }
-        fn(n->finallyBody.get());
     } else if (auto *n = dynamic_cast<MultiElemConstruct<Construct> *>(c)) {
-        /* Block, ExprList, LiteralArray */
+        /* ExprList, LiteralArray (Block is handled in walk) */
         for (auto &e : n->elems) {
             fn(e.get());
         }
@@ -136,7 +234,8 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
         for (auto &e : n->elems) {
             fn(e.get());
         }
-    } else if (auto *n = dynamic_cast<MultiElemConstruct<LiteralDictKVPair> *>(c)) {
+    } else if (auto *n =
+                   dynamic_cast<MultiElemConstruct<LiteralDictKVPair> *>(c)) {
         /* LiteralDict */
         for (auto &e : n->elems) {
             fn(e.get());
@@ -146,114 +245,13 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
 }
 
 /*
- * Record the names introduced by a declaration's lvalue into `out`. The lvalue
- * is either a single Identifier (`var x = ...`) or an IdList for a multiple
- * declaration (`var a, b = ...`).
- */
-void
-add_lvalue_names(Construct *lvalue, NameSet &out)
-{
-    if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
-        out.insert(id->uid);
-    } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
-        for (auto &id : il->elems) {
-            out.insert(id->uid);
-        }
-    }
-}
-
-/*
- * Collect every name a function body declares as a local: var/const decls,
- * foreach loop variables, catch variables and nested function names. It does
- * NOT descend into nested function bodies - those names belong to their own
- * scope. The result is used to decide whether any local shadows a param.
- */
-void
-collect_decl_names(Construct *c, NameSet &out)
-{
-    if (!c)
-        return;
-
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
-
-        /* The nested function's NAME is a local here, but its params/body are
-         * a separate scope, so don't descend into them. */
-        if (fd->id)
-            out.insert(fd->id->uid);
-
-        return;
-    }
-
-    if (auto *e = dynamic_cast<Expr14 *>(c)) {
-
-        /* Only a declaration introduces names; a plain assignment does not. */
-        if (e->fl & pFlags::pInDecl)
-            add_lvalue_names(e->lvalue.get(), out);
-
-        collect_decl_names(e->rvalue.get(), out);   /* rvalue may hold func exprs */
-        return;
-    }
-
-    if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
-
-        if (fe->idsVarDecl && fe->ids) {
-            for (auto &id : fe->ids->elems) {
-                out.insert(id->uid);
-            }
-        }
-
-        collect_decl_names(fe->container.get(), out);
-        collect_decl_names(fe->body.get(), out);
-        return;
-    }
-
-    if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
-
-        collect_decl_names(tc->tryBody.get(), out);
-
-        for (auto &p : tc->catchStmts) {
-            if (p.first.asId)
-                out.insert(p.first.asId->uid);
-            collect_decl_names(p.second.get(), out);
-        }
-
-        collect_decl_names(tc->finallyBody.get(), out);
-        return;
-    }
-
-    /* Generic node: recurse into all children. */
-    for_each_child(c, [&](Construct *ch) { collect_decl_names(ch, out); });
-}
-
-/*
- * Bump the write count for any param assigned by `lvalue` (an Identifier, or an
- * IdList for multiple assignment). Only resolved params are counted; the count
- * staying 0 means the param is never reassigned in the body (write-once), which
- * is the signal a future auto-const pass will use.
- */
-void
-Resolver::count_param_writes(Construct *lvalue, FuncState *cur)
-{
-    auto bump = [&](Identifier *id) {
-        if (id && id->sym.kind == SymKind::local)
-            cur->fd->param_writes[id->sym.slot]++;
-    };
-
-    if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
-        bump(id);
-    } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
-        for (auto &id : il->elems) {
-            bump(id.get());
-        }
-    }
-}
-
-/*
- * Decide whether `fd`'s params can be slotted and, if so, set it up: mark the
- * FuncDeclStmt resolved, size its Frame, allocate the per-param write counters,
- * and build the name->slot map. Then walk the body so param references get
- * stamped. Params are slotted only when there are no duplicates and no local
- * shadows a param (see the file header for why that makes resolution trivial).
+ * Set up `fd`'s slotting and resolve its body. Params take slots 0..n-1 in the
+ * function's outermost scope; body locals are slotted as the walk encounters
+ * their declarations. Afterwards, if anything was slotted, the FuncDeclStmt is
+ * marked resolved with its final frame_size and per-slot write counts. A
+ * function with no slottable symbols (or a pathological >64 params) is left
+ * unresolved and uses the map, but its body is still walked to slot any nested
+ * functions.
  */
 void
 Resolver::process_function(FuncDeclStmt *fd)
@@ -261,54 +259,40 @@ Resolver::process_function(FuncDeclStmt *fd)
     FuncState st;
     st.fd = fd;
 
-    const int nparams = fd->params ? static_cast<int>(fd->params->elems.size()) : 0;
+    const int nparams =
+        fd->params ? static_cast<int>(fd->params->elems.size()) : 0;
+    st.slottable = nparams <= MAX_SLOTS;
 
-    NameSet declNames;
-    if (fd->body)
-        collect_decl_names(fd->body.get(), declNames);
+    if (st.slottable) {
 
-    bool ok = nparams > 0 && nparams <= MAX_SLOTS;
-
-    if (ok) {
-
-        /* Reject duplicate params and params shadowed by a body-local decl. */
-        NameSet seen;
+        st.scopes.emplace_back();   /* the function's outermost (param) scope */
 
         for (int i = 0; i < nparams; i++) {
-
-            const UniqueId *p = fd->params->elems[i]->uid;
-
-            if (!seen.insert(p).second || declNames.count(p)) {
-                ok = false;
-                break;
-            }
-        }
-    }
-
-    if (ok) {
-
-        st.slottable = true;
-
-        for (int i = 0; i < nparams; i++) {
-            st.params[fd->params->elems[i]->uid] = i;
+            Identifier *p = fd->params->elems[i].get();
+            check_no_redecl(&st, p);   /* duplicate param -> error */
+            st.scopes.back().decls.push_back({ p->uid, i });
+            st.writes.push_back(0);   /* binding isn't a body write */
+            p->sym = ResolvedSym{ SymKind::local, i };
         }
 
-        fd->resolved = true;
-        fd->frame_size = nparams;
-        fd->param_writes.assign(nparams, 0);
+        st.next_slot = nparams;
     }
 
-    /* Even a non-slottable function is walked: its body may contain nested
-     * functions that are themselves slottable. */
     if (fd->body)
         walk(fd->body.get(), &st);
+
+    if (st.slottable && st.next_slot > 0) {
+        fd->resolved = true;
+        fd->frame_size = st.next_slot;
+        fd->slot_writes = move(st.writes);
+    }
 }
 
 /*
- * Recursive driver of the pass. `cur` is the function whose params are in scope
- * for plain identifier references (nullptr at top level). FuncDeclStmt and
- * Expr14 are special-cased because they introduce scopes / declarations; every
- * other node is traversed generically via for_each_child.
+ * Recursive driver. `cur` is the function whose scope is being resolved
+ * (nullptr at top level, where nothing is slotted but nested functions are
+ * still found). Nodes that introduce names or scopes are handled here; the rest
+ * are traversed generically.
  */
 void
 Resolver::walk(Construct *c, FuncState *cur)
@@ -316,39 +300,142 @@ Resolver::walk(Construct *c, FuncState *cur)
     if (!c)
         return;
 
+    /* --- nested function: own scope; its captures see the enclosing one --- */
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
 
-        /* The capture list is evaluated in the ENCLOSING scope, so resolve it
-         * against `cur` (this is what lets a closure read an enclosing param
-         * slot at creation time). */
         if (fd->captures) {
             for (auto &cap : fd->captures->elems) {
                 resolve_ref(cur, cap.get());
             }
         }
 
+        /* The function NAME is a local of the enclosing scope (masking entry:
+         * stays in the map so forward references / mutual recursion work). */
+        if (fd->id)
+            declare_masking(cur, fd->id.get());
+
         process_function(fd);
         return;
     }
 
+    /* --- identifier reference --- */
     if (auto *id = dynamic_cast<Identifier *>(c)) {
         resolve_ref(cur, id);
         return;
     }
 
+    /* --- assignment / declaration --- */
     if (auto *e = dynamic_cast<Expr14 *>(c)) {
 
+        /* The rvalue is evaluated first, so it must see the scope BEFORE this
+         * declaration (so `var x = x + 1` reads the outer x). */
         walk(e->rvalue.get(), cur);
-        walk(e->lvalue.get(), cur);
 
-        /* A non-decl Expr14 is an assignment: count writes to any param it
-         * targets (declarations introduce new locals, never write a param). */
-        if (!(e->fl & pFlags::pInDecl) && cur && cur->slottable)
-            count_param_writes(e->lvalue.get(), cur);
+        if (e->fl & pFlags::pInDecl) {
+            declare_lvalue(cur, e->lvalue.get());
+        } else {
+            walk(e->lvalue.get(), cur);     /* assignment: resolve the target */
+            count_write(cur, e->lvalue.get());
+        }
 
         return;
     }
 
+    /* --- block: own scope; record slot range for live-bit clearing --- */
+    if (auto *b = dynamic_cast<Block *>(c)) {
+
+        const bool track = cur && cur->slottable;
+        const int start = track ? cur->next_slot : 0;
+
+        if (track)
+            cur->scopes.emplace_back();
+
+        for (auto &e : b->elems) {
+            walk(e.get(), cur);
+        }
+
+        if (track) {
+            b->slot_start = start;
+            /* contiguous range: includes nested blocks' slots too */
+            b->slot_count = cur->next_slot - start;
+            cur->scopes.pop_back();
+        }
+
+        return;
+    }
+
+    /* --- for: a scope for the loop variable spanning cond/inc/body --- */
+    if (auto *f = dynamic_cast<ForStmt *>(c)) {
+
+        const bool track = cur && cur->slottable;
+
+        if (track)
+            cur->scopes.emplace_back();
+
+        walk(f->init.get(), cur);   /* may declare the loop variable */
+        walk(f->cond.get(), cur);
+        walk(f->inc.get(), cur);
+        walk(f->body.get(), cur);   /* body is a Block -> own scope */
+
+        if (track)
+            cur->scopes.pop_back();
+
+        return;
+    }
+
+    /* --- foreach: container evaluated before the loop vars exist --- */
+    if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+
+        walk(fe->container.get(), cur);
+
+        const bool track = cur && cur->slottable;
+
+        if (track)
+            cur->scopes.emplace_back();
+
+        if (fe->ids) {
+            for (auto &id : fe->ids->elems) {
+                if (fe->idsVarDecl)
+                    declare(cur, id.get());  /* `foreach (var a, b in ...)` */
+                else
+                    resolve_ref(cur, id.get()); /* existing vars */
+            }
+        }
+
+        walk(fe->body.get(), cur);
+
+        if (track)
+            cur->scopes.pop_back();
+
+        return;
+    }
+
+    /* --- try/catch/finally: each catch clause scopes its `as` variable --- */
+    if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+
+        walk(tc->tryBody.get(), cur);
+
+        for (auto &p : tc->catchStmts) {
+
+            const bool track = cur && cur->slottable;
+
+            if (track)
+                cur->scopes.emplace_back();
+
+            if (p.first.asId)
+                declare(cur, p.first.asId.get());
+
+            walk(p.second.get(), cur);          /* catch body */
+
+            if (track)
+                cur->scopes.pop_back();
+        }
+
+        walk(tc->finallyBody.get(), cur);
+        return;
+    }
+
+    /* --- everything else: generic traversal --- */
     for_each_child(c, [&](Construct *ch) { walk(ch, cur); });
 }
 

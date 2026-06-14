@@ -20,7 +20,8 @@ class Identifier;
  * because `return` was an exception. Statements set the FlowState, and
  * Block / loops / do_func_call check it and unwind via ordinary C++ returns.
  * Genuinely exceptional paths (runtime errors, user `throw`, `rethrow`) still
- * use C++ exceptions, where the zero-cost-when-not-thrown model is the right fit.
+ * use C++ exceptions, where the zero-cost-when-not-thrown model is the right
+ * fit.
  */
 struct FlowState {
 
@@ -36,7 +37,7 @@ struct FlowState {
 };
 
 /*
- * Per-call storage for resolved local variables (currently: function params).
+ * Per-call storage for resolved local variables (function params and locals).
  *
  * The name-resolution pass assigns each resolved local a fixed slot index, so
  * access is an O(1) array index here instead of a scope-chain map lookup. A
@@ -58,13 +59,13 @@ struct Frame {
     static constexpr int INLINE_SLOTS = 8;
 
     alignas(LValue) char inline_buf[INLINE_SLOTS * sizeof(LValue)];
-    std::vector<LValue> heap_buf;        /* used only when frame_size > INLINE_SLOTS */
+    std::vector<LValue> heap_buf;   /* spill when frame_size > INLINE_SLOTS */
     LValue *slots = nullptr;
-    int inline_count = 0;                /* # of slots placement-constructed in inline_buf */
+    int inline_count = 0;           /* # slots placement-built in inline_buf */
     uint64_t live = 0;
 
     Frame() = default;
-    Frame(const Frame &) = delete;       /* never copied; `slots` would dangle */
+    Frame(const Frame &) = delete;  /* never copied; slots would dangle */
     Frame(Frame &&) = delete;
 
     /* Make `slots` point at storage holding exactly `frame_size` live slots. */
