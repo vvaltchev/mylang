@@ -205,6 +205,10 @@ Two properties that make this cheap and safe:
    the `InlineCtx` type, the node field, the flush helper, the `Construct::eval`
    hook, a synthetic test. No inliner yet, so all tests stay green. *(done)*
 2. **AST deep-clone** (`Construct::clone()` across the hierarchy) + test.
+   *(done)* — pure-virtual `clone()` on every concrete node (faithful copy:
+   children, locs, `is_const`, `inline_ctx`, resolved/slot state), via the
+   `clone_as`/`copy_base_fields`/`clone_ops_into`/`clone_elems_into` helpers; a
+   round-trip test asserts serialize-equality + correct independent eval.
 3. **Size-only inliner** for expression-bodied direct calls + the `do_func_call`
    flush hook + `-ni` toggle + the identical-backtrace test. Safe arg
    substitution per the rules above; spliced locals left map-resolved at first.
