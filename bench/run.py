@@ -229,8 +229,13 @@ def main():
             [mylang, my_path, scale_arg], args.repeat, args.timeout)
 
         if os.path.isfile(py_path):
+            # -B: don't read/write __pycache__. MyLang re-parses its source on
+            # every run (it has no bytecode cache), so letting CPython reuse a
+            # cached .pyc across the repeat runs would be an unfair head start.
+            # With -B both re-parse every run.
             py_t, py_out, py_err = time_cmd(
-                [args.python, py_path, scale_arg], args.repeat, args.timeout)
+                [args.python, "-B", py_path, scale_arg],
+                args.repeat, args.timeout)
         else:
             py_t, py_out, py_err = (None, None, "no-py")
 

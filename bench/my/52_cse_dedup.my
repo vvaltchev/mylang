@@ -1,0 +1,27 @@
+# Const folding + common-subexpression de-duplication (CSE), vs a language with
+# neither. Two heavy constant expressions -- `sum(sort(base))` and
+# `sum(base + base)` -- each appear twice in the loop body. MyLang:
+#   * evaluates each one ONCE at parse time (CSE shares the `sort(base)` /
+#     `base + base` array across both occurrences -- see `mylang -s`),
+#   * folds the whole `sum(...)` to a single integer literal,
+# so the runtime loop is just `s = (s + L1 + L1 + L2 + L2) % m` -- no sorting,
+# no summing, no allocation.
+#
+# Python has neither feature, so every iteration re-sorts, re-concatenates and
+# re-sums from scratch, for each occurrence. Same result, wildly different work.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+const SZ = 3000;
+const base = reverse(range(SZ));
+
+var N = 1500 * scale;
+var s = 0;
+
+for (var i = 0; i < N; i += 1) {
+    s = (s + sum(sort(base)) + sum(sort(base))
+           + sum(base + base) + sum(base + base)) % 1000000007;
+}
+
+print("result:", s);

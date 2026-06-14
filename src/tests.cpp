@@ -4635,6 +4635,237 @@ static const std::vector<test> tests =
             "assert(sort(clone(a)) == [0, 1.5, 2, 3]);",
         },
     },
+
+    /*
+     * Parse-time common-subexpression de-duplication (CSE). Identical const
+     * array/dict expressions are evaluated once at parse time and the
+     * resulting deep read-only value is shared, asserted here via intptr().
+     */
+
+    {
+        "CSE: identical const slices share storage",
+        {
+            "const big = range(1000);",
+            "const a = big[0:500];",
+            "const b = big[0:500];",
+            "assert(intptr(a) == intptr(b));",
+            "assert(a == b);",
+            "assert(len(a) == 500);",
+            "assert(a[0] == 0 && a[499] == 499);",
+        },
+    },
+
+    {
+        "CSE: identical const builtin call (sort) shares",
+        {
+            "const base = [3, 1, 2, 5, 4];",
+            "const s1 = sort(base);",
+            "const s2 = sort(base);",
+            "assert(intptr(s1) == intptr(s2));",
+            "assert(s1 == [1, 2, 3, 4, 5]);",
+        },
+    },
+
+    {
+        "CSE: identical const range() call shares",
+        {
+            "const r1 = range(100);",
+            "const r2 = range(100);",
+            "assert(intptr(r1) == intptr(r2));",
+            "assert(len(r1) == 100);",
+        },
+    },
+
+    {
+        "CSE: identical keys() of a const dict shares",
+        {
+            "const d = {\"a\": 1, \"b\": 2, \"c\": 3};",
+            "const k1 = keys(d);",
+            "const k2 = keys(d);",
+            "assert(intptr(k1) == intptr(k2));",
+            "assert(sort(k1) == [\"a\", \"b\", \"c\"]);",
+        },
+    },
+
+    {
+        "CSE: identical user pure-func call shares",
+        {
+            "pure func head2(a) => a[0:2];",
+            "const base = range(50);",
+            "const p1 = head2(base);",
+            "const p2 = head2(base);",
+            "assert(intptr(p1) == intptr(p2));",
+            "assert(p1 == [0, 1]);",
+        },
+    },
+
+    {
+        "CSE: different slice bounds do NOT share",
+        {
+            "const big = range(1000);",
+            "const a = big[0:500];",
+            "const c = big[0:400];",
+            "assert(intptr(a) != intptr(c));",
+            "assert(len(a) == 500 && len(c) == 400);",
+        },
+    },
+
+    {
+        "CSE: subscript returning a sub-array dedups",
+        {
+            "const grid = [[1, 2], [3, 4], [5, 6]];",
+            "const r1 = grid[1];",
+            "const r2 = grid[1];",
+            "assert(intptr(r1) == intptr(r2));",
+            "assert(r1 == [3, 4]);",
+        },
+    },
+
+    {
+        "CSE: nested block reuses an outer-scope cache entry",
+        {
+            "const big = range(100);",
+            "const a = big[10:20];",
+            "{",
+            "    const b = big[10:20];",
+            "    assert(intptr(a) == intptr(b));",
+            "    assert(b == a);",
+            "}",
+        },
+    },
+
+    {
+        /* The crux of the per-block cache: a sibling block reuses the freed
+         * block's stack addresses, so a flat cache keyed on LValue pointers
+         * would false-hit. The cache is popped with its block, so it can't. */
+        "CSE: sibling blocks with reused local const stay correct",
+        {
+            "{",
+            "    const local = [1, 2, 3, 4];",
+            "    const x = local[0:2];",
+            "    assert(x == [1, 2]);",
+            "}",
+            "{",
+            "    const local = [7, 8, 9, 10];",
+            "    const x = local[0:2];",
+            "    assert(x == [7, 8]);",
+            "}",
+        },
+    },
+
+    {
+        "CSE: var-bound const-derived slices share (const-propagation)",
+        {
+            "const big = range(10);",
+            "var s = big[0:3];",
+            "var t = big[0:3];",
+            "assert(intptr(s) == intptr(t));",
+            "assert(s == [0, 1, 2]);",
+        },
+    },
+
+    {
+        "CSE: clone() of a dedup'd const is independent and mutable",
+        {
+            "const big = range(10);",
+            "const a = big[0:3];",
+            "const b = big[0:3];",
+            "assert(intptr(a) == intptr(b));",
+            "var c = clone(a);",
+            "assert(intptr(c) != intptr(a));",
+            "c[0] = 99;",
+            "assert(c == [99, 1, 2]);",
+            "assert(a == [0, 1, 2]);",
+        },
+    },
+
+    {
+        "CSE: mutable var literals are NOT shared",
+        {
+            "var a = [1, 2, 3];",
+            "var b = [1, 2, 3];",
+            "assert(intptr(a) != intptr(b));",
+            "a[0] = 99;",
+            "assert(a == [99, 2, 3]);",
+            "assert(b == [1, 2, 3]);",
+        },
+    },
+
+    {
+        "CSE: subscript-assign through a shared const slice is rejected",
+        {
+            "const big = range(10);",
+            "const a = big[0:3];",
+            "const b = big[0:3];",
+            "a[0] = 99;",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        /* CSE must not defer or swallow a const-eval error: an out-of-bounds
+         * read in a const subexpression still fails at parse time. */
+        "CSE: out-of-bounds in a const subexpr fails at parse",
+        {
+            "const big = range(10);",
+            "const a = big[5] + big[50000];",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
+        /* A const compound expression (array concatenation) whose operands
+         * are const-array identifiers is keyable, so it de-dups. */
+        "CSE: identical const array concatenation shares",
+        {
+            "const base = range(5);",
+            "const c = base + base;",
+            "const d = base + base;",
+            "assert(intptr(c) == intptr(d));",
+            "assert(c == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);",
+        },
+    },
+
+    {
+        /* Concatenation of already-materialized slices: the operands are
+         * LiteralObj (not keyable), so the result is correct but not shared.
+         * Exercises the key builder's bail-out on an unkeyable operand. */
+        "CSE: concat of materialized slices stays correct",
+        {
+            "const big = range(10);",
+            "const c = big[0:3] + big[5:8];",
+            "assert(c == [0, 1, 2, 5, 6, 7]);",
+        },
+    },
+
+    {
+        /* An unkeyable subnode (a bare literal array) makes the whole
+         * expression unkeyable; it still materializes correctly. These cover
+         * the key builder's bail-out paths for subscript/slice/call bases. */
+        "CSE: unkeyable subnodes still materialize correctly",
+        {
+            "const x1 = [[1, 2], [3, 4]][0];",
+            "assert(x1 == [1, 2]);",
+            "const x2 = [[1, 2], [3, 4]][0:1];",
+            "assert(x2 == [[1, 2]]);",
+            "const s = sort([3, 1, 2]);",
+            "assert(s == [1, 2, 3]);",
+        },
+    },
+
+    {
+        /* A key that would exceed the size cap is abandoned (the expression
+         * just isn't de-duplicated); the result is still correct. */
+        "CSE: over-cap key is abandoned, result still correct",
+        {
+            "const base = range(2);",
+            "const c = base + base + base + base + base + base + base +",
+            "          base + base + base + base + base + base + base +",
+            "          base + base + base + base + base + base;",
+            "assert(len(c) == 40);",
+            "assert(c[0] == 0 && c[39] == 1);",
+        },
+    },
 };
 
 static void

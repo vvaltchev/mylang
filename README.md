@@ -350,6 +350,39 @@ literal is not derived from a const, so `var a = [1, 2, 3]` is mutable as usual
 (though an element that is itself a const stays read-only — `var a = [y]` with
 `y` const keeps `a[0]` read-only).
 
+#### De-duplication of const expressions
+
+Identical constant array/dictionary expressions are **evaluated only once**. The
+first time the parser bakes such a value it remembers it (keyed by the
+expression's shape, with identifiers resolved to the exact constant they refer
+to, so shadowing never aliases); a later identical const expression reuses that
+same read-only value instead of recomputing and re-allocating it. This is
+standard *common-subexpression elimination*, done at parse time. Because the
+shared value is deeply read-only, aliasing it is always safe.
+
+```C#
+const big = range(1000);
+const a = big[0:500];
+const b = big[0:500];     # same expression
+assert(intptr(a) == intptr(b));   # a and b are the *same* buffer
+
+const c = big[0:400];     # a different expression
+assert(intptr(a) != intptr(c));
+```
+
+It works for any const array/dict result whose subexpressions are all
+de-duplicable — slices, subscripts, concatenations of const identifiers, and
+`pure`/const-builtin calls such as `sort(base)` — and it is purely an
+optimization: the program behaves exactly as if each occurrence were computed
+independently (only `intptr()` reveals the sharing). The payoff is **compile
+time** (a heavy const expression written *N* times is computed once, not *N*
+times) and **memory** (*N* const tables derived the same way share one buffer
+instead of *N*). The de-duplication is scoped to the lexical block, so values
+keyed against a block's constants are released when that block's parsing ends.
+A read-only value is required, so a mutable `var a = [1, 2, 3]` is never shared
+with another — each `var` gets its own writable copy. (See
+`bench/52_cse_dedup` and `bench/README.md` for the measured effect.)
+
 #### Automatic const promotion
 
 You don't have to write `const` to get most of these benefits. A variable

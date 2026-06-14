@@ -12,6 +12,13 @@
 class EvalContext;
 class Block;
 
+/*
+ * Parse-time common-subexpression cache (de-duplication of const array/dict
+ * results). PIMPL'd so this header need not pull in the value model; defined
+ * in parser.cpp. See cse_materialize() there.
+ */
+struct CseCache;
+
 class TokenStream {
 
 private:
@@ -49,8 +56,10 @@ public:
     TokenStream ts;
     const bool const_eval;
     EvalContext *const_ctx; // points to const_ctx_owner's object
+    unique_ptr<CseCache> cse; // const-expr de-dup cache (per-block scopes)
 
     ParseContext(const TokenStream &ts, bool const_eval);
+    ~ParseContext(); // out-of-line: CseCache is incomplete here (PIMPL)
 
     /* token operations */
     const Tok &operator*() const { return ts.get(); }

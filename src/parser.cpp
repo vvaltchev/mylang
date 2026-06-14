@@ -5,17 +5,59 @@
 #include "syntax.h"
 
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 using std::string;
+
+/*
+ * Parse-time common-subexpression cache: a stack of scopes mirroring the
+ * const EvalContext stack (one scope per lexical block, pushed/popped by
+ * pBlock). Each scope maps a canonical expression key (see cse_key) to the
+ * already-baked, deep read-only value that materializing that expression
+ * produced. A later identical const expression reuses that value instead of
+ * recomputing and re-cloning it. Only read-only (const-backed) array/dict
+ * results are cached, since only those can be safely shared.
+ *
+ * Lookups walk every active scope (all are alive, so their keyed LValue
+ * pointers are valid); inserts go into the innermost scope. Popping a scope
+ * with its block is what keeps a freed block's reused stack addresses from
+ * ever colliding with a live key.
+ */
+struct CseCache {
+
+    std::vector<std::unordered_map<string, EvalValue>> stack;
+
+    void push() { stack.emplace_back(); }
+    void pop() { stack.pop_back(); }
+
+    const EvalValue *lookup(const string &key) const {
+        for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+            auto f = it->find(key);
+            if (f != it->end())
+                return &f->second;
+        }
+        return nullptr;
+    }
+
+    void insert(const string &key, const EvalValue &v) {
+        if (!stack.empty())
+            stack.back().emplace(key, v);
+    }
+};
 
 ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
     : const_ctx_owner(new EvalContext(nullptr, true))
     , ts(ts)
     , const_eval(const_eval)
     , const_ctx(const_ctx_owner.get())
+    , cse(new CseCache)
 {
 
 }
+
+ParseContext::~ParseContext() = default;
 
 /*
  * ----------------- Recursive Descent Parser -------------------
@@ -86,6 +128,13 @@ MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
                           bool process_arrays = false,
                           bool immutable = false);
+
+static bool
+cse_materialize(ParseContext &c,
+                Construct *node,
+                unique_ptr<Construct> &out,
+                bool process_arrays,
+                bool immutable);
 
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
@@ -362,10 +411,11 @@ pAcceptCallExpr(ParseContext &c,
 
             expr->is_const = true;
 
-            MakeConstructFromConstVal(
-                expr->eval(c.const_ctx),
+            cse_materialize(
+                c,
+                expr.get(),
                 ret,
-                fl & pFlags::pInConstDecl,
+                (fl & pFlags::pInConstDecl) != 0,
                 (fl & pFlags::pInConstDecl) != 0
             );
         }
@@ -439,10 +489,10 @@ pAcceptSubscript(ParseContext &c,
             if (!in_slice || fl & pFlags::pInConstDecl) {
 
                 unique_ptr<Construct> const_construct;
-                const EvalValue &v = RValue(ret->eval(c.const_ctx));
 
-                if (MakeConstructFromConstVal(
-                        v,
+                if (cse_materialize(
+                        c,
+                        ret.get(),
                         const_construct,
                         true,
                         (fl & pFlags::pInConstDecl) != 0))
@@ -922,13 +972,26 @@ pExpr14(ParseContext &c, unsigned fl)
     if (!ret->rvalue)
         noExprError(c);
 
-    if (c.const_eval && ret->rvalue->is_const) {
-        MakeConstructFromConstVal(
-            RValue(ret->rvalue->eval(c.const_ctx)),
-            ret->rvalue,
-            true,
-            (fl & pFlags::pInConstDecl) != 0
-        );
+    /*
+     * Materialize a const rvalue - unless it is ALREADY a LiteralObj, i.e. a
+     * subscript/slice/call result that pAcceptSubscript/pAcceptCallExpr already
+     * baked (and de-duplicated). Re-baking it here would just deep-clone the
+     * value a second time and break that sharing; skip it.
+     */
+    if (c.const_eval && ret->rvalue->is_const
+        && !dynamic_cast<LiteralObj *>(ret->rvalue.get()))
+    {
+        unique_ptr<Construct> cc;
+
+        if (cse_materialize(
+                c,
+                ret->rvalue.get(),
+                cc,
+                true,
+                (fl & pFlags::pInConstDecl) != 0))
+        {
+            ret->rvalue = move(cc);
+        }
     }
 
     if (c.const_eval && fl & pFlags::pInConstDecl) {
@@ -1120,6 +1183,7 @@ pBlock(ParseContext &c, unsigned fl)
     ret->start = c.get_loc();
     EvalContext block_const_ctx(c.const_ctx, true);
     c.const_ctx = &block_const_ctx; // push a new const eval context
+    c.cse->push();                  // matching CSE cache scope
 
     if (!c.eoi()) {
 
@@ -1147,6 +1211,7 @@ pBlock(ParseContext &c, unsigned fl)
     }
 
     ret->end = c.get_loc();
+    c.cse->pop();                      // pop the CSE cache scope
     c.const_ctx = c.const_ctx->parent; // restore the previous const ctx
     return ret;
 }
@@ -1415,6 +1480,198 @@ MakeConstructFromConstVal(const EvalValue &v,
     }
 
     return false;
+}
+
+/*
+ * Cap on the canonical key length. Bounds key-building to O(1) per node and
+ * naturally excludes huge literals from de-dup (whose key cost would not pay
+ * for itself) while still catching the win case: a small expression -
+ * `big[a:b]`, `sort(big)`, `f(big)` - that yields a big value.
+ */
+static const size_t CSE_KEY_CAP = 256;
+
+/*
+ * Build a canonical key for a const expression into `out`; return false if the
+ * expression isn't one we de-duplicate, or the key would exceed CSE_KEY_CAP.
+ *
+ * Identifiers are keyed by the *pointer* of the const LValue they resolve to,
+ * not their name, so shadowing never aliases (an inner `const x` is a different
+ * LValue than an outer one). Only cheap, side-effect-free leaves are eval'd
+ * here (identifiers and scalar literals); structural nodes recurse WITHOUT
+ * being evaluated, which is what keeps key-building from doing the very work
+ * the cache exists to avoid.
+ */
+static bool
+cse_key_rec(ParseContext &c, const Construct *node, string &out)
+{
+    if (out.size() > CSE_KEY_CAP)
+        return false;
+
+    if (const Subscript *s = dynamic_cast<const Subscript *>(node)) {
+        out += "S(";
+        if (!cse_key_rec(c, s->what.get(), out))
+            return false;
+        out += ",";
+        if (!cse_key_rec(c, s->index.get(), out))
+            return false;
+        out += ")";
+        return out.size() <= CSE_KEY_CAP;
+    }
+
+    if (const Slice *s = dynamic_cast<const Slice *>(node)) {
+        out += "L(";
+        if (!cse_key_rec(c, s->what.get(), out))
+            return false;
+        out += ",";
+        if (s->start_idx && !cse_key_rec(c, s->start_idx.get(), out))
+            return false;
+        out += ",";
+        if (s->end_idx && !cse_key_rec(c, s->end_idx.get(), out))
+            return false;
+        out += ")";
+        return out.size() <= CSE_KEY_CAP;
+    }
+
+    if (const CallExpr *ce = dynamic_cast<const CallExpr *>(node)) {
+        out += "C(";
+        if (!cse_key_rec(c, ce->what.get(), out))
+            return false;
+        out += ";";
+        for (const auto &e : ce->args->elems) {
+            if (!cse_key_rec(c, e.get(), out))
+                return false;
+            out += ",";
+        }
+        out += ")";
+        return out.size() <= CSE_KEY_CAP;
+    }
+
+    if (const MultiOpConstruct *mo =
+            dynamic_cast<const MultiOpConstruct *>(node))
+    {
+        out += "M(";
+        for (const auto &pr : mo->elems) {
+            out += std::to_string(static_cast<int>(pr.first));
+            out += ":";
+            if (!cse_key_rec(c, pr.second.get(), out))
+                return false;
+            out += ",";
+        }
+        out += ")";
+        return out.size() <= CSE_KEY_CAP;
+    }
+
+    if (dynamic_cast<const Identifier *>(node)) {
+        const EvalValue ev = node->eval(c.const_ctx);
+        if (!ev.is<LValue *>())
+            return false;
+        out += "@";
+        out += std::to_string(
+            reinterpret_cast<uintptr_t>(ev.get<LValue *>()));
+        return out.size() <= CSE_KEY_CAP;
+    }
+
+    if (dynamic_cast<const Literal *>(node)) {
+        const EvalValue ev = node->eval(c.const_ctx);
+        if (ev.is<int_type>()) {
+            out += "i";
+            out += std::to_string(ev.get<int_type>());
+        } else if (ev.is<float_type>()) {
+            out += "f";
+            out += std::to_string(static_cast<double>(ev.get<float_type>()));
+        } else if (ev.is<NoneVal>()) {
+            out += "z";
+        } else if (ev.is<SharedStr>()) {
+            const std::string_view sv = ev.get<SharedStr>().get_view();
+            out += "s";
+            out += std::to_string(sv.size());
+            out += ":";
+            out.append(sv.data(), sv.size());
+        } else {
+            return false;
+        }
+        return out.size() <= CSE_KEY_CAP;
+    }
+
+    return false;
+}
+
+static string
+cse_key(ParseContext &c, const Construct *node)
+{
+    string out;
+
+    if (!cse_key_rec(c, node, out))
+        return string();
+
+    return out;
+}
+
+/*
+ * Materialize a const expression's value into `out`, de-duplicating identical
+ * const array/dict results across the parse. A drop-in for the
+ * `MakeConstructFromConstVal(node->eval(...), out, ...)` pattern at the three
+ * sites that bake arrays/dicts (call, subscript/slice, decl rvalue): on a cache
+ * hit it returns a LiteralObj SHARING the previously-baked value (no re-eval,
+ * no re-clone); otherwise it behaves exactly like that pattern, and caches the
+ * result when it is a read-only (shareable) array/dict.
+ */
+static bool
+cse_materialize(ParseContext &c,
+                Construct *node,
+                unique_ptr<Construct> &out,
+                bool process_arrays,
+                bool immutable)
+{
+    /*
+     * Only read-only array/dict results are cacheable, and those arise only
+     * when process_arrays is set. An empty key means "don't touch the cache"
+     * (unkeyable expression, or over the size cap).
+     */
+    string key;
+
+    if (process_arrays)
+        key = cse_key(c, node);
+
+    if (!key.empty()) {
+
+        if (const EvalValue *hit = c.cse->lookup(key)) {
+            /*
+             * An identical const expression already produced this deep
+             * read-only value: share it. It is immutable, so aliasing it
+             * across const symbols is safe (and is the whole point).
+             */
+            out = make_unique<LiteralObj>(*hit, true);
+            return true;
+        }
+    }
+
+    const EvalValue &v = RValue(node->eval(c.const_ctx));
+
+    /*
+     * Read-only array/dict: bake the deep read-only clone once, cache it, and
+     * hand out a LiteralObj sharing it. Mirrors the read-only branch of
+     * MakeConstructFromConstVal (keep the two in sync) but caches the baked
+     * value so the next identical expression hits above.
+     */
+    if (process_arrays
+        && (v.is<SharedArrayObj>() || v.is<shared_ptr<DictObject>>())
+        && (immutable || is_readonly_value(v)))
+    {
+        EvalValue baked = make_const_clone(v);
+
+        if (!key.empty())
+            c.cse->insert(key, baked);
+
+        out = make_unique<LiteralObj>(move(baked), true);
+        return true;
+    }
+
+    /*
+     * Everything else (scalars, strings, mutable arrays, non-materializable):
+     * identical to the non-cached path.
+     */
+    return MakeConstructFromConstVal(v, out, process_arrays, immutable);
 }
 
 bool
