@@ -3189,6 +3189,44 @@ static const std::vector<test> tests =
     },
 
     {
+        /*
+         * A user comparator may not be a valid strict weak ordering. It must
+         * still be MEMORY-SAFE: sort uses heapsort for custom comparators,
+         * which stays in bounds whatever the comparator returns (introsort's
+         * unguarded partition would read off the buffer here). Big enough to
+         * leave insertion-sort territory. A crash here would take down the
+         * whole -rt run, so this passing is the regression guard.
+         */
+        "Sort with an invalid (non-ordering) comparator stays memory-safe",
+        {
+            "var arr = range(2000);",
+            "var r = sort(arr, func (a, b) => a != b);",  // not an ordering
+            "assert(len(r) == 2000);",
+            "assert(sum(r) == 1999000);",                 // elements preserved
+        },
+    },
+
+    {
+        "Sort with an always-true comparator stays memory-safe",
+        {
+            "var arr = range(1000);",
+            "var r = sort(arr, func (a, b) => true);",
+            "assert(len(r) == 1000);",
+            "assert(sum(r) == 499500);",
+        },
+    },
+
+    {
+        /* Same hazard reachable at parse time via a pure comparator. */
+        "Const sort with an invalid comparator stays memory-safe",
+        {
+            "const r = sort(range(2000), pure func (a, b) => a != b);",
+            "assert(len(r) == 2000);",
+            "assert(sum(r) == 1999000);",
+        },
+    },
+
+    {
         "Sort const array",
         {
             "const arr = [3,2,1];",

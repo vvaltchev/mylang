@@ -356,17 +356,51 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 
         FuncObject &funcObj = *val1.get<shared_ptr<FuncObject>>().get();
 
-        if (!reverse) {
+        auto cmp = [&](const auto &a, const auto &b) {
+            const bool lt =
+                eval_func(ctx, funcObj, make_pair(a.get(), b.get())).is_true();
+            return reverse ? !lt : lt;
+        };
 
-            sort(vec.begin(), vec.end(), [&](const auto &a, const auto &b) {
-                return eval_func(ctx, funcObj, make_pair(a.get(),b.get())).is_true();
-            });
+        /*
+         * A user comparator is arbitrary script code, so it need NOT be a valid
+         * strict weak ordering (e.g. `func(a, b) => a != b`, or one that varies
+         * with call order). std::sort's introsort would run its *unguarded*
+         * partition/insertion past the ends of the buffer once that assumption
+         * breaks - a heap-buffer-overflow reachable straight from a script. We
+         * therefore hand-roll a heapsort: `sift_down`'s root index strictly
+         * descends, so it terminates for ANY comparator, and it only ever
+         * indexes within [0, n), so a bogus comparator yields an
+         * unspecified-but-memory-safe order instead of UB. (We do NOT use
+         * std::make_heap/std::sort_heap: MSVC's debug STL wraps them in
+         * comparator-validity instrumentation that hangs on a non-ordering
+         * comparator. Same O(n log n) comparisons; for a valid comparator the
+         * result is identical - neither is stable.)
+         */
+        const size_t n = vec.size();
 
-        } else {
+        auto sift_down = [&](size_t root, size_t end) {
+            for (;;) {
+                size_t child = 2 * root + 1;
+                if (child >= end)
+                    break;
+                if (child + 1 < end && cmp(vec[child], vec[child + 1]))
+                    child++;                 /* the larger of the children */
+                if (!cmp(vec[root], vec[child]))
+                    break;                   /* root already >= its children */
+                std::swap(vec[root], vec[child]);
+                root = child;                /* strictly increases -> bounded */
+            }
+        };
 
-            sort(vec.begin(), vec.end(), [&](const auto &a, const auto &b) {
-                return !eval_func(ctx, funcObj, make_pair(a.get(),b.get())).is_true();
-            });
+        for (size_t i = n / 2; i > 0; ) {    /* build a max-heap */
+            --i;
+            sift_down(i, n);
+        }
+        for (size_t end = n; end > 1; ) {    /* pop the max, n-1 times */
+            --end;
+            std::swap(vec[0], vec[end]);
+            sift_down(0, end);
         }
     }
 

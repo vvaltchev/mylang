@@ -158,7 +158,12 @@ both languages on the inputs used. These are straight speed comparisons.
 - **`sort` with a comparator.** MyLang `sort(arr, cmp)` calls a `cmp(a,b)->bool`
   for each comparison. Python's `list.sort` is key-based; the apples-to-apples
   mapping for a per-comparison callback is `functools.cmp_to_key`, which
-  `34_sort_custom_cmp.py` uses.
+  `34_sort_custom_cmp.py` uses. With a *custom* comparator MyLang sorts via
+  heapsort rather than introsort (a comparator is arbitrary script code and may
+  not be a valid ordering; heapsort stays in bounds regardless, so a bad
+  comparator can't read off the buffer). Heapsort does somewhat more
+  comparisons, but each is a script call that dominates, so the algorithm
+  choice is in the noise here.
 
 - **String `+=` (`28_str_concat`).** Both produce the same string, but the cost
   profile is different and **MyLang is actually faster here**. MyLang appends in

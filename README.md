@@ -1119,6 +1119,11 @@ use the classic for-loop.
 Sorts the given array *in-place* and returns the same array. Optionally,
 it supports a `compare_func` parameter: when passed, it's used to compare
 any two elements and it's supposed to return the logical value of `a < b`.
+The comparator should be a *strict weak ordering* (return `a < b`, not a
+qsort-style numeric difference like `a - b`). A comparator that isn't one
+yields an **unspecified but well-defined, memory-safe** ordering — never a
+crash: with a custom comparator `sort()` uses a heapsort that stays within the
+array's bounds regardless of what the comparator returns.
 
 Note: while `sort()` works in-place, it still can be used to sort arrays
 without altering them and to sort const arrays as well: in the first case,
