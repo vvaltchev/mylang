@@ -130,7 +130,7 @@ bool TypeDict::is_true(const EvalValue &a)
 
 int_type TypeDict::use_count(const EvalValue &a)
 {
-    return a.get<shared_ptr<FuncObject>>().use_count();
+    return a.get<shared_ptr<DictObject>>().use_count();
 }
 
 EvalValue TypeDict::intptr(const EvalValue &a)
