@@ -90,6 +90,24 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
     return SharedStr(e.to_string());
 }
 
+/*
+ * runtime(expr): an optimization barrier. Returns its single argument's value
+ * unchanged at run time but - because it is a *non-const* builtin - the call is
+ * opaque to const-folding and auto-const: any expression that contains
+ * runtime(x) is never folded and is therefore evaluated (and any error it
+ * raises thrown) at run time rather than at "compile" time. The ARGUMENT is
+ * still folded normally, so runtime(1/0) fails at compile time (the error is
+ * inside the expression, before it is "runtime-ized"), while 1/runtime(0)
+ * throws at run time. Useful in tests, and to opt an expression out of folding.
+ */
+EvalValue builtin_runtime(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    return RValue(exprList->elems[0]->eval(ctx));
+}
+
 EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)

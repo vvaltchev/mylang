@@ -1302,8 +1302,8 @@ static const std::vector<test> tests =
             "var c = 0;",
             "try {",
             "   var t = 3;",
-            "   var d = 0;",
-            "   print(t/d);",
+            "   var d = 1; d = 0;",   // reassigned -> runtime value, so
+            "   print(t/d);",         // t/d is a runtime (catchable) error
             "   assert(0);",     // We should NEVER get here
             "} catch (DivisionByZeroEx) {",
             "   c = 1;",
@@ -1318,7 +1318,7 @@ static const std::vector<test> tests =
             "var c = 0;",
             "try {",
             "   var t = 3;",
-            "   var d = 0;",
+            "   var d = 1; d = 0;",   // runtime value (see above)
             "   print(t/d);",
             "   assert(0);",     // We should NEVER get here
             "} catch (TypeErrorEx) {",
@@ -1335,7 +1335,7 @@ static const std::vector<test> tests =
             "var c = 0;",
             "try {",
             "   var t = 3;",
-            "   var d = 0;",
+            "   var d = 1; d = 0;",   // runtime value (see above)
             "   print(t/d);",
             "   assert(0);",     // We should NEVER get here
             "} catch (TypeErrorEx) {",
@@ -1361,6 +1361,110 @@ static const std::vector<test> tests =
             "   assert(0);",     // We should NEVER get here
             "}",
             "assert(c == 1);",
+        },
+    },
+
+    {
+        // auto-const promotes write-once scalar `var`s to constants, so a/b is
+        // fully known at "compile" time: 6/0 always fails. A program that can
+        // never run correctly is rejected before execution (like the parser's
+        // const-folding), rather than deferred to a runtime exception.
+        "auto-const: provably-constant div-by-zero fails at compile time",
+        {
+            "var a = 6;",
+            "var b = 0;",
+            "var c = a / b;",
+        },
+        &typeid(DivisionByZeroEx),
+    },
+
+    {
+        // try/catch is for RUNTIME exceptions; a provable compile-time error
+        // still aborts before the script runs and is NOT caught here.
+        "auto-const: compile-time error is not caught by try/catch",
+        {
+            "var a = 6;",
+            "var b = 0;",
+            "try { var c = a / b; } catch (DivisionByZeroEx) { }",
+        },
+        &typeid(DivisionByZeroEx),
+    },
+
+    {
+        // An always-wrong constant in a LIVE branch fails the build. (`on` is a
+        // promoted var, so the parser keeps the if; auto-const folds the live
+        // branch and hits 6/0.)
+        "auto-const: compile-time error in a live branch",
+        {
+            "var a = 6;",
+            "var b = 0;",
+            "var on = 1;",
+            "if (on) { var c = a / b; }",
+        },
+        &typeid(DivisionByZeroEx),
+    },
+
+    {
+        // Dual of the above: a branch auto-const proves DEAD is eliminated, not
+        // analyzed - so the (unreachable) 6/0 inside it is never folded and the
+        // program runs cleanly. (off is a promoted var, so the parser can't
+        // drop the branch first; auto-const's own DCE does.)
+        "auto-const: a provably-dead branch is eliminated, not folded",
+        {
+            "var a = 6;",
+            "var b = 0;",
+            "var off = 0;",
+            "if (off) { var c = a / b; }",
+            "assert(1);",
+        },
+    },
+
+    {
+        // Safety: `a` is a direct call argument, so it stays an lvalue (append
+        // may mutate it) and is NOT folded to a literal. append() on an int is
+        // therefore a normal runtime TypeErrorEx, not a folded compile error.
+        "auto-const: write-once var passed to a mutating builtin is not folded",
+        {
+            "var a = 3;",
+            "append(a, 10);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        // runtime() barrier: same div-by-zero, but the divisor is wrapped so
+        // the expression can't be folded. It is therefore a RUNTIME error that
+        // try/catch CAN handle - the dual of the compile-time test above.
+        "auto-const: runtime() forces a catchable runtime div-by-zero",
+        {
+            "var a = 6;",
+            "var b = 0;",
+            "var ok = 0;",
+            "try { var c = a / runtime(b); assert(0); }",
+            "catch (DivisionByZeroEx) { ok = 1; }",
+            "assert(ok == 1);",
+        },
+    },
+
+    {
+        // runtime() only "runtime-izes" its result: an error INSIDE the
+        // argument is folded first, so this still fails at compile time.
+        "auto-const: error inside runtime()'s arg fails at compile time",
+        {
+            "var a = 6;",
+            "var b = 0;",
+            "var c = runtime(a / b);",
+        },
+        &typeid(DivisionByZeroEx),
+    },
+
+    {
+        // runtime() returns its argument unchanged at run time (identity).
+        "auto-const: runtime() is the identity at run time",
+        {
+            "assert(runtime(5) == 5);",
+            "var a = runtime(3) + 4;",
+            "assert(a == 7);",
         },
     },
 

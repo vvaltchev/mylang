@@ -1,0 +1,25 @@
+# auto-const + constant folding: A..D are declared with `var` but never
+# reassigned, so the interpreter promotes them to constants. The big loop-body
+# sub-expression `k` is then entirely constant and folds to a single literal at
+# "compile" time -- the loop never recomputes it. Python has no such folding, so
+# it re-evaluates the whole expression every iteration. Same result, very
+# different work per iteration.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var A = 7;
+var B = 13;
+var C = 5;
+var D = 3;
+
+var N = 3000000 * scale;
+var s = 0;
+
+for (var i = 0; i < N; i += 1) {
+    var k = (A * B + C) * (D + A) - B * C + A * B * C * D % 100 + (A - D) * (B + C);
+    s += k + i;
+    s = s % 1000000007;
+}
+
+print("result:", s);

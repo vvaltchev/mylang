@@ -266,6 +266,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* Misc builtins */
     make_builtin("assert", builtin_assert),
     make_builtin("exit", builtin_exit),
+    make_builtin("runtime", builtin_runtime), /* optimization barrier */
     make_builtin("intptr", builtin_intptr),
     make_builtin("undef", builtin_undef),
     make_builtin("exception", builtin_exception),

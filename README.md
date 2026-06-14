@@ -25,6 +25,7 @@ as well.
     * [Core concepts](#core-concepts)
     * [Declaring variables](#declaring-variables)
     * [Declaring constants](#declaring-constants)
+      - [Automatic const promotion](#automatic-const-promotion)
     * [Type system](#type-system)
     * [Conditional statements](#conditional-statements)
       - [Const evaluation](#const-evaluation-of-conditional-statements)
@@ -307,6 +308,51 @@ integers, floats, and strings are converted to literals during the *const evalua
 while arrays and dictionaries (potentially big) are left as read-only symbols at
 runtime, but still allowing some operations on them (like `[index]` and `len(arr)`)
 to be const-evaluated.
+
+#### Automatic const promotion
+
+You don't have to write `const` to get most of these benefits. A variable
+declared with `var` that is *written exactly once* (its declaration) with a
+constant scalar initializer — and is never reassigned, captured, `undef()`-ed,
+or used in a position that needs an lvalue — is automatically promoted to a
+constant. Its uses are then folded just like a `const` and its decl disappears.
+This *auto-const* pass runs after parsing, so it also handles values *derived*
+from other auto-consts:
+
+```C#
+var A = 7;             # write-once -> auto-const
+var B = A * 3 + 1;     # = 22, folded at "compile" time -> auto-const too
+for (var i = 0; i < n; i += 1) {
+    var k = A * B - 5; # constant; folded to a single literal, not recomputed
+    s += k + i;
+}
+```
+
+Auto-const also performs *dead-code elimination*: an `if`/`while` whose
+condition folds to a constant has its dead branch dropped (and a `while (false)`
+removed). Unlike literal/`const` expressions (which the parser folds eagerly,
+everywhere), auto-const only analyzes code it proves *reachable*: a branch it
+proves dead is eliminated, not checked.
+
+Because folding evaluates the expression at "compile" time, a fully-constant
+expression that *always* fails is rejected **before the script runs**, exactly
+like a `const`:
+
+```
+$ ./build/mylang -e 'var a = 6; var b = 0; print(a / b);'
+DivisionByZeroEx: Division by zero at line 1, col 30:32
+
+    var a = 6; var b = 0; print(a / b);
+                                ^^^^^
+```
+
+This is intentional: a value we can fully compute at compile time that can never
+succeed is a program that can never run correctly, so it is a build error, not a
+runtime exception. `try`/`catch` is for *runtime* exceptions and does **not**
+catch these. If you want such an expression to stay a (catchable) runtime error
+— for tests, or to opt out of folding — wrap the runtime-varying part in
+[`runtime()`](#runtimeexpr): `a / runtime(b)` throws `DivisionByZeroEx` at
+runtime instead.
 
 ### Type system
 
@@ -1193,6 +1239,18 @@ Check `expr` and throw AssertionFailureEx if it's false.
 
 #### `exit(code)`
 Exit the program with the given numeric code
+
+#### `runtime(expr)`
+An *optimization barrier*. Returns the value of its single argument unchanged at
+runtime, but because it is a non-const builtin, the call is opaque to
+const-folding and *auto-const* (see [Declaring
+constants](#declaring-constants)): any expression that contains `runtime(x)` is
+never folded and is therefore evaluated — and any exception it raises thrown —
+at runtime instead of at "compile" time. Note that the *argument* is still
+folded normally, so `runtime(1/0)` fails at compile time (the error is *inside*
+the expression, before it is "runtime-ized"), whereas `1 / runtime(0)` throws a
+catchable `DivisionByZeroEx` at runtime. Useful for tests and to deliberately
+opt a specific expression out of folding.
 
 #### `intptr(symbol)`
 Get the internal shared object pointer referred by `symbol`.

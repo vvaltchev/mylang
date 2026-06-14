@@ -152,7 +152,9 @@ units:
   assigns function
   params slot indices for O(1) access at runtime (see the value model section).
   Optional and always
-  safe: anything it leaves unresolved falls back to the runtime map lookup.
+  safe: anything it leaves unresolved falls back to the runtime map lookup. The
+  same file also hosts the **auto-const** folder (the `AutoConst` class), run at
+  the end of `resolve_names` (see the const-evaluation section).
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
@@ -292,6 +294,45 @@ and it lives *inside the parser*. Mechanics:
 
 `-s` (with vs. without `-nc`) is the way to *see* all of the above happening.
 
+**Auto-const (`AutoConst` in `resolver.cpp`).** A post-parse folding pass that
+does for plain `var`s what the parser does for `const`. It runs at the end of
+`resolve_names()` (so it can use the resolver's per-slot write counts and
+slot identity). For each function (and the top-level "main"), it:
+- **promotes** a `var` that is *write-once* (`slot_writes[slot] == 1`, i.e. only
+  the declaration writes it) with a constant **scalar** initializer into a
+  compile-time constant (keyed by slot), drops the declaration, and folds every
+  use to the literal — cascading in declaration order, so a `var` derived from
+  earlier auto-consts also promotes;
+- **folds** all-literal arithmetic/logic/comparison (`MultiOpConstruct`) to a
+  single literal, reusing the interpreter (`mo->eval(&cctx)` against a const
+  `EvalContext`);
+- performs **dead-code elimination**: an `if`/`while` whose condition folds to a
+  literal has its dead branch dropped (`while (false)` removed). Crucially, a
+  branch it proves dead is *eliminated, not folded* — auto-const only analyzes
+  code it proves reachable (this is its DCE; eager fail-on-error in dead code is
+  the *parser's* behavior for explicit `const`/literals, not auto-const's).
+- **Safety (`prescan_blocked`)**: a slot is *not* promoted if the variable is
+  captured by a nested function (the capture must stay an identifier), passed as
+  a **direct identifier arg** to a call (a builtin may take it as an lvalue,
+  e.g. `append`/`sort`/`intptr` — a literal there would change the error to
+  `NotLValueEx`), used as a subscript/member base (`a[i]`, `a.k`), or is a
+  `foreach` loop variable (implicitly reassigned each iteration despite its
+  write count). Args like `f(a + 0)` are already non-lvalues, so they fold.
+- **Same early-failure rule as the parser:** a fully-constant expression in
+  *reachable* code that throws when evaluated (e.g. `6/0`, a type mismatch) is
+  **not** deferred to runtime — the exception propagates out of `resolve_names`
+  and aborts before execution. `try/catch` does not catch it. The `runtime()`
+  builtin is the documented opt-out: because it is a non-const builtin and
+  auto-const never folds a call result, any expression containing `runtime(x)`
+  stays a runtime computation (its *argument* is still folded, so `runtime(1/0)`
+  still fails at compile time).
+
+Implementation notes: slots are never reused across sibling scopes
+(`FuncState::next_slot` is monotonic), so the slot-keyed map can't collide.
+The pass needs a *complete* tree traversal, but `for_each_child` deliberately
+omits the nodes `walk()` handles itself (Block/for/foreach/try/`Expr14`), so
+`prescan_blocked` and the folders descend into those explicitly.
+
 ## The value & type model (the subtle part)
 
 - **`EvalValue`** (`evalvalue.h`) is a hand-rolled tagged union: a `ValueU`
@@ -405,8 +446,9 @@ and it lives *inside the parser*. Mechanics:
   are caught here (`AlreadyDefinedEx`) so the runtime decl path can just
   overwrite. `Identifier::sym` and `FuncDeclStmt::{resolved, frame_size,
   slot_writes}` carry the results; `slot_writes` (per-slot write counts:
-  write-once == 1 for a local, 0 for a never-reassigned param) is groundwork for
-  a future auto-const pass. The const-eval path runs before resolution, so pure
+  write-once == 1 for a local, 0 for a never-reassigned param) is what the
+  auto-const folder uses to find promotable write-once vars (see the
+  const-evaluation section). The const-eval path runs before resolution, so pure
   funcs invoked at parse time use the map (`resolved` is still false then).
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
