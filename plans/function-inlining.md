@@ -210,8 +210,22 @@ Two properties that make this cheap and safe:
    `clone_as`/`copy_base_fields`/`clone_ops_into`/`clone_elems_into` helpers; a
    round-trip test asserts serialize-equality + correct independent eval.
 3. **Size-only inliner** for expression-bodied direct calls + the `do_func_call`
-   flush hook + `-ni` toggle + the identical-backtrace test. Safe arg
-   substitution per the rules above; spliced locals left map-resolved at first.
+   flush hook + `-ni` toggle + the identical-backtrace test. *(done)* — the
+   `Inliner` in resolver.cpp runs after `AutoConst`, splicing eligible calls
+   (top-level, expression-bodied, non-capturing, non-recursive, no nested
+   function, arity match, body <= 24 nodes, sound arg use). Args inherit the
+   parameter occurrence's loc and the whole splice is tagged with `InlineCtx`;
+   chain rebasing handles a body itself inlined-into. `stamp_operand_loc` now
+   also flushes inline frames (operator-ladder errors are stamped at the operand
+   before reaching its `Construct::eval`). Verified: behavior identical with and
+   without inlining across the suite, and the backtrace for a **body** error is
+   byte-identical. **Known limitation:** an error while evaluating an *argument*
+   (e.g. passing an undefined variable) is attributed to the inlined callee
+   (`[f, main]` at the param position) rather than the call site (`[main]`) -
+   inherent to expression-context direct substitution, where the arg node is
+   both the call-site value and the in-body operand. Faithful separation would
+   need temp-binding in a block (only possible in statement position). Re-fold
+   and specialization come next.
 4. **Cross-boundary re-fold** (run `AutoConst` over spliced regions) -> the
    `f(2*3) -> 7` wins.
 5. **Const-arg specialization**: inline-if-tiny-after-fold; else clone + dedup +
