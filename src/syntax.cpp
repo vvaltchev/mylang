@@ -159,6 +159,16 @@ void LiteralStr::serialize(ostream &s, int level) const
     s << "\"";
 }
 
+void LiteralObj::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "Obj(";
+    s << value.get_type()->to_string(value);
+    s << ")";
+}
+
 void LiteralDictKVPair::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

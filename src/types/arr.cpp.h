@@ -15,9 +15,15 @@
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_internal_vec()
 {
+    /*
+     * Use offset()/size(), not the raw off/len fields: for a non-slice, `len`
+     * is only the size at construction and goes stale when `+=` appends to the
+     * vector in place (a non-slice tracks its length via vec.size(), see
+     * size()). offset()/size() are correct for both slices and non-slices.
+     */
     vec_type new_vec(
-        shobj->vec.cbegin() + off,
-        shobj->vec.cbegin() + off + len
+        shobj->vec.cbegin() + offset(),
+        shobj->vec.cbegin() + offset() + size()
     );
 
     *this = SharedArrayObjTempl(move(new_vec));
@@ -42,10 +48,13 @@ void SharedArrayObjTempl<LValueT>::clone_aliased_slices(size_type index)
             it = shobj->slices.erase(it);
             assert(obj->slice);
 
-            /* Prevent the dtor from trying to erase the object */
-            obj->slice = false;
-
-            /* Do clone the internal vector */
+            /*
+             * Clone the slice's range into its own vector. We leave obj->slice
+             * set so clone_internal_vec's offset()/size() report the slice
+             * range; the move-assign it does turns obj into a standalone
+             * non-slice, and obj was already removed from the slices set above,
+             * so nothing tries to erase it again.
+             */
             obj->clone_internal_vec();
 
         } else {
