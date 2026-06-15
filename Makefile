@@ -7,6 +7,15 @@ OPT ?= 1
 FL_LANG ?= -std=c++17
 FL_DBG ?= -ggdb
 FL_WARN ?= -Wall -Wextra -Wno-unused-parameter
+
+# The codebase intentionally calls `move`/`forward` unqualified (see
+# `using std::move;` in defs.h), which recent clang reports under
+# -Wunqualified-std-cast-call. Silence it for clang only: GCC has no such
+# option and would note an unrecognized flag.
+ifneq (,$(findstring clang,$(shell $(CXX) --version 2>/dev/null)))
+	FL_WARN += -Wno-unqualified-std-cast-call
+endif
+
 FL_OTHER ?= -fwrapv
 FL_INC = -I$(PROJ_ROOT)/src
 BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
