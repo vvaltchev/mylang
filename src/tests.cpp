@@ -5786,6 +5786,95 @@ inliner_fixpoint_deep_backtrace()
 }
 
 /*
+ * Tail-call inlining of a BLOCK-bodied function with locals: `return helper(.)`
+ * splices helper's body in place, RE-RESOLVING helper's locals to a fresh range
+ * at the top of the caller's frame. The scenario is sharp: helper writes a
+ * local (`t`) and then reads arg `b` (= caller local `c2`); if the local
+ * weren't remapped above the caller's slots it would clobber `c2` and the
+ * result would change. Args are runtime (no specialization), so only tail
+ * inlining removes the call.
+ */
+static bool
+inliner_tail_inlines_block_body()
+{
+    const std::vector<const char *> src = {
+        "func helper(a, b) {",
+        "    var t = a + 100;",       /* writes a fresh local */
+        "    return t + b;",          /* reads arg b (caller's c2) afterward */
+        "}",
+        "func caller(p) {",
+        "    var c1 = p;",            /* caller locals: must not be clobbered */
+        "    var c2 = p * 1000;",
+        "    return helper(c1, c2);", /* tail call -> spliced */
+        "}",
+        "var n = 1;",
+        "n = 3;",                     /* runtime: no specialization */
+        "assert(caller(n) == 3103);", /* (3+100) + 3000 */
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);
+    resolve_names(off.get(), false);
+
+    const std::string s_on = serialize_tree(on.get());
+    const std::string s_off = serialize_tree(off.get());
+
+    bool ok = true;
+    /* helper's call is gone from caller's body (spliced in). */
+    ok = ok && count_substr(s_on, "CallExpr") < count_substr(s_off, "CallExpr");
+
+    /* correctness (the assert fails -> throws -> ok=false if slots aliased). */
+    try { on->eval(nullptr); } catch (const Exception &) { ok = false; }
+    try { off->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  on CallExpr=" << count_substr(s_on, "CallExpr")
+                  << " off=" << count_substr(s_off, "CallExpr")
+                  << "\n  resolved tree (on):\n" << s_on;
+    return ok;
+}
+
+/*
+ * A runtime error inside a tail-inlined BLOCK body still backtraces identically
+ * to the non-inlined run: the spliced body carries helper's InlineCtx, so the
+ * virtual `helper` frame shows above the real `caller` frame.
+ */
+static bool
+inliner_tail_block_backtrace()
+{
+    const std::vector<const char *> src = {
+        "func helper(a) { var t = 100 / a; return t; }",
+        "func caller(x) { return helper(x); }",    /* tail -> spliced */
+        "var n = 1;",
+        "n = 0;",                                  /* helper(0) -> 100 / 0 */
+        "var r = caller(n);",                      /* caller(n) is NOT tail */
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);
+    resolve_names(off.get(), false);
+
+    std::string bt_on, bt_off;
+    try { on->eval(nullptr); }
+    catch (const Exception &e) { bt_on = format_backtrace(e); }
+    try { off->eval(nullptr); }
+    catch (const Exception &e) { bt_off = format_backtrace(e); }
+
+    bool ok = true;
+    ok = ok && !bt_on.empty();
+    ok = ok && bt_on == bt_off;
+    ok = ok && bt_on.find("[0] helper(a)") != std::string::npos;
+    ok = ok && bt_on.find("[1] caller(x)") != std::string::npos;
+    ok = ok && bt_on.find("[2] main()") != std::string::npos;
+
+    if (!ok) cout << "  bt_on:\n" << bt_on << "\n  bt_off:\n" << bt_off;
+    return ok;
+}
+
+/*
  * Re-fold of NON-MultiOp const ops in a spliced body: a substituted array arg
  * makes `a[0]` and `len(a)` self-contained constants, which fold to literals
  * (subscript and const-builtin call), not just arithmetic. The function is
@@ -5872,6 +5961,10 @@ static const std::vector<extra_check> extra_checks =
       inliner_fixpoint_collapses_chain },
     { "inliner fixpoint deep backtrace == non-inlined",
       inliner_fixpoint_deep_backtrace },
+    { "inliner tail-inlines a block body (re-resolved locals)",
+      inliner_tail_inlines_block_body },
+    { "tail-inlined block backtrace == non-inlined",
+      inliner_tail_block_backtrace },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

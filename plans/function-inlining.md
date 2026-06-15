@@ -314,16 +314,35 @@ Two properties that make this cheap and safe:
   calls (single-level left one), a 5-level chain and a const chain fold through,
   mutual-recursion / breadth-doubling terminate, an inlined+physical+recursive
   chain backtraces identically to `-ni`, and every `bench/` script matches.
+- **Re-resolution of spliced block bodies** (slot remapping). A tail call to a
+  block-bodied function (`return f(args);` where f's body always returns) is now
+  inlined directly by `try_inline_tail`: f's body block replaces the return
+  statement (sound because f's returns become the caller's returns and f never
+  falls through). A single `splice_tail` pass decides each identifier by its
+  ORIGINAL slot - `< nparams` is a param (substitute the value-stable arg, per
+  `tail_arg_ok`: a caller local or const literal, never a global/side-effecting
+  expr), `>= nparams` is a local (remap by `caller_fsize - nparams` into a fresh
+  range at the top of the caller's frame). The caller's frame size
+  (`FuncDeclStmt::frame_size`, or the root block's `slot_count` for main,
+  threaded through `walk` as `fsize`) grows by f's local count, capped at 64
+  (`Frame::live` is one 64-bit word); over that, the call is left as-is. Self-
+  recursion is excluded; the spliced body carries an `InlineCtx` so a runtime
+  error shows f's virtual frame. Verified byte-identical to `-ni` for the sharp
+  slot-aliasing case (a body local that would clobber a caller slot read by a
+  later arg), a param shadowed by a same-name local (slot-based substitution),
+  loops/foreach/control-flow with locals, re-entry, caller recursion, nested
+  tail calls, `caller_fsize < nparams`, array mutation through a param, and
+  every `bench/` script. Not yet inlined directly (left to specialization or a
+  call): non-tail calls, reassigned params, and global/side-effecting args -
+  all would need an args-as-locals form that binds args once up front.
+- **Specialization keeps the original frame** (no re-resolution), so it is
+  unaffected by the above and remains the fallback for non-tail const-arg calls.
 
 ## Remaining / tracked tasks
 
 Not yet done; roughly in priority order:
 
-1. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
-   current scope (expression-body inlining has no locals; specialization keeps
-   the original frame), but would be required to inline *block* bodies (with
-   locals) directly instead of via a shared clone.
-2. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
+1. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
    Unsound on unknown dynamic types (float non-associativity, `+` overloading,
    preserved type errors); needs a "provably-int" analysis first. Inlining
    already leaves spliced expressions with original locs + full structure so

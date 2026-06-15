@@ -529,9 +529,25 @@ in a kept `var t = a[0]+a[1]` rvalue is visible). If it shrinks, a shared clone
 by its `intptr` identity in `value_repr`, so the same const object shares one
 clone — inserted at the root block's front) and the call redirected; the clone
 keeps the same frame (no re-resolution) and a `FuncDeclStmt::display_name` makes
-backtraces show the original name, not `$specN`. Still **not done** (see
-`plans/function-inlining.md` "Remaining"): a rebasing fixpoint for deeper
-nesting, and the deferred type-narrowing/algebraic pass.
+backtraces show the original name, not `$specN`. A **tail call to a block-bodied
+function** (`return f(args);` where f's body always returns — its last statement
+is a `ReturnStmt`) is inlined *directly* (`try_inline_tail`): f's body block
+replaces the return statement, sound because f's own returns become the caller's
+returns and f never falls through. f's params are substituted (so they must be
+non-reassigned and value-stable — `tail_arg_ok`: a caller local or a const
+literal, never a global or side-effecting expr, since the body reads the param
+at its use points rather than once up front), and f's locals are
+**re-resolved**: a single `splice_tail` pass decides each identifier by its
+ORIGINAL slot — a slot `< nparams` is a param (substitute the arg), a slot `>=
+nparams` is a local (remap by `caller_fsize - nparams` into a fresh range at the
+top of the caller's frame). The caller's frame (`FuncDeclStmt::frame_size`, or
+the root block's `slot_count` for "main", threaded through `walk` as `fsize`)
+grows by f's local count, capped at 64 (`Frame::live` is one 64-bit word); over
+that, the call is left as-is. The spliced body is tagged with an `InlineCtx`
+like an expression splice, so a runtime error shows f's virtual frame above the
+caller's real one. Still **not done** (see `plans/function-inlining.md`
+"Remaining"): the deferred type-narrowing/algebraic pass; block-tail inlining of
+non-tail calls or reassigned/global args would need an args-as-locals form.
 
 ## The value & type model (the subtle part)
 
