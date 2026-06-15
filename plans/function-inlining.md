@@ -226,8 +226,16 @@ Two properties that make this cheap and safe:
    both the call-site value and the in-body operand. Faithful separation would
    need temp-binding in a block (only possible in statement position). Re-fold
    and specialization come next.
-4. **Cross-boundary re-fold** (run `AutoConst` over spliced regions) -> the
-   `f(2*3) -> 7` wins.
+4. **Cross-boundary re-fold** *(done)* — the inliner runs a focused bottom-up
+   constant folder (`Inliner::refold`) on each spliced body, collapsing an all-
+   const `MultiOpConstruct` (over scalar literals) to a literal against a const
+   `EvalContext`. A const argument substituted into a NON-pure expression
+   function now propagates and folds (`f(3)` with `f(x) => x*10+g` -> `30+g`) -
+   the const-propagation half AutoConst's whole-call folding misses (a pure
+   call already folded earlier, before inlining). A subexpression that would
+   throw (e.g. `6/0`) is left for runtime, matching the un-inlined call. (Only
+   `MultiOpConstruct` is re-folded for now; const subscript/slice/builtin-call
+   results in spliced bodies are not yet.)
 5. **Const-arg specialization**: inline-if-tiny-after-fold; else clone + dedup +
    redirect.
 6. **Re-resolution of spliced bodies** (slot remapping) for speed.

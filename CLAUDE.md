@@ -475,9 +475,13 @@ an `InlineCtx`, and `stamp_operand_loc` (`eval.cpp`) flushes inline frames too
 runs). Backtraces for **body** errors are byte-identical with/without inlining;
 **known limitation** — an error *evaluating an argument* (e.g. an undefined var)
 is attributed to the inlined callee rather than the call site (the arg node is
-both the call-site value and the in-body operand). Still **not done**:
-cross-boundary re-fold (`f(2*3) -> 7`), const-arg specialization, a rebasing
-fixpoint for deeper nesting, and the deferred algebraic pass. See
+both the call-site value and the in-body operand). After splicing, the inliner
+**re-folds** (`Inliner::refold`): an all-const `MultiOpConstruct` in the spliced
+body folds to a literal, so a const arg propagates into a *non-pure* expression
+function (`f(3)` with `f(x) => x*10+g` -> `30+g`) — the half AutoConst's
+whole-call folding misses. Still **not done**: const-arg *specialization*
+(shared clones), re-folding non-`MultiOp` const ops, a rebasing fixpoint for
+deeper nesting, and the deferred algebraic pass. See
 `plans/function-inlining.md`.
 
 ## The value & type model (the subtle part)
