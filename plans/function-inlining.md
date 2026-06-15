@@ -233,9 +233,17 @@ Two properties that make this cheap and safe:
    function now propagates and folds (`f(3)` with `f(x) => x*10+g` -> `30+g`) -
    the const-propagation half AutoConst's whole-call folding misses (a pure
    call already folded earlier, before inlining). A subexpression that would
-   throw (e.g. `6/0`) is left for runtime, matching the un-inlined call. (Only
-   `MultiOpConstruct` is re-folded for now; const subscript/slice/builtin-call
-   results in spliced bodies are not yet.)
+   throw (e.g. `6/0`) is left for runtime, matching the un-inlined call.
+   **Extended** to non-`MultiOp` ops: `refold` now also folds a subscript,
+   slice, member access, or const-builtin call whose operands are self-contained
+   constants (`is_const_literal`: a scalar, a `LiteralObj`, or an array/dict
+   literal of constants) - e.g. a substituted array arg makes `a[0]` -> `10` and
+   `len(a)` -> `3`. It only evaluates nodes with literal operands (never a
+   slotted local), so it is also run on specialized clones safely (no frame).
+   `sub_ok` correspondingly lets a const literal (not just a scalar) be
+   duplicated/dropped. **Not folded:** subscript/slice of a const *global*
+   (`tbl[0]`) - the global isn't a literal in the body and there's no const-
+   global value context here (see Remaining).
 5. **Const-arg specialization** *(done)* — a non-inlined call to a block-bodied,
    non-capturing function with scalar-const arg(s) (on never-reassigned,
    non-blocked params) clones it, binds those params and folds the body
@@ -251,8 +259,36 @@ Two properties that make this cheap and safe:
    identical output and a div-by-zero inside a clone shows `f`, not `$spec0`.
    (Scalar consts only; array/dict const args and recursion-into-clones are not
    specialized.)
-6. **Re-resolution of spliced bodies** (slot remapping) for speed.
-7. (deferred) type-narrowing pass -> algebraic simplification.
+## Remaining / tracked tasks
+
+Not yet done; roughly in priority order:
+
+1. **Const-global subscript/slice/member folding** in spliced/specialized
+   bodies. `refold` only folds self-contained literals, so `tbl[0]` (a const
+   array *global*) stays a runtime read. Needs a fold context seeded with the
+   const-array/dict globals (scan the top-level `const` decls, eval their
+   `LiteralObj` rvalues into an `EvalContext`), then fold against it. Subtlety:
+   must not deref a missing frame for slotted locals - only fold when operands
+   reference const globals/builtins, not runtime locals (catch
+   `UndefinedVariableEx` and leave).
+2. **Array/dict const args in specialization.** Today only *scalar* const args
+   seed a specialization (`scalar_repr` / the seed loop). Allow const
+   array/dict args too (key them by value, e.g. via the CSE-style canonical key
+   or a deep hash), so `f([1,2,3], x)` specializes.
+3. **Rebasing fixpoint for deeper inline nesting.** The inliner is single level
+   per pass: a freshly-spliced body is not re-scanned for further inlining in
+   the same pass (chain rebasing already keeps backtraces correct for the one
+   level that does nest). Running the pass to a fixpoint would inline g-into-f-
+   into-h in one go; needs a depth cap + AST-growth budget.
+4. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
+   current scope (expression-body inlining has no locals; specialization keeps
+   the original frame), but would be required to inline *block* bodies (with
+   locals) directly instead of via a shared clone.
+5. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
+   Unsound on unknown dynamic types (float non-associativity, `+` overloading,
+   preserved type errors); needs a "provably-int" analysis first. Inlining
+   already leaves spliced expressions with original locs + full structure so
+   such a pass can run over them later.
 
 ## Open questions
 

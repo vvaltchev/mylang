@@ -5578,6 +5578,39 @@ inliner_spec_backtrace_identical()
     return ok;
 }
 
+/*
+ * Re-fold of NON-MultiOp const ops in a spliced body: a substituted array arg
+ * makes `a[0]` and `len(a)` self-contained constants, which fold to literals
+ * (subscript and const-builtin call), not just arithmetic. The function is
+ * non-pure (reads a runtime global) so AutoConst's whole-call folding didn't
+ * already handle it.
+ */
+static bool
+inliner_refolds_non_multiop()
+{
+    const std::vector<const char *> src = {
+        "var g = 1;",
+        "g = 2;",                              /* g runtime */
+        "func f(a) => a[0] + len(a) + g;",     /* not pure (reads g) */
+        "var r = f([10, 20, 30]);",            /* -> 10 + 3 + g */
+        "assert(r == 15);",
+    };
+
+    unique_ptr<Construct> root = parse_lines(src);
+    resolve_names(root.get(), true, 24);
+
+    const std::string s = serialize_tree(root.get());
+
+    bool ok = true;
+    ok = ok && s.find("Int(10)") != std::string::npos;   /* a[0] folded */
+    ok = ok && s.find("Int(3)") != std::string::npos;     /* len(a) folded */
+
+    try { root->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  resolved tree:\n" << s;
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
@@ -5586,6 +5619,8 @@ static const std::vector<extra_check> extra_checks =
     { "inlined-call backtrace == non-inlined", inliner_backtrace_identical },
     { "inline threshold (-it) gates inlining", inliner_threshold_gates },
     { "inliner re-folds a const subexpression", inliner_refolds_const_subexpr },
+    { "inliner re-folds subscript/len in a splice",
+      inliner_refolds_non_multiop },
     { "inliner specializes a block func (deduped)",
       inliner_specializes_block_func },
     { "specialized-clone backtrace == non-spec",

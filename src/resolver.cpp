@@ -1403,20 +1403,20 @@ private:
     }
 
     /* Sound iff the argument is evaluated as often as the param is used and a
-     * side-effecting arg is neither dropped nor duplicated. */
+     * side-effecting arg is neither dropped nor duplicated. An identifier or a
+     * self-contained constant (scalar, or array/dict literal of constants) is
+     * side-effect-free, so it can be duplicated; a constant can also be dropped
+     * (an identifier cannot - that would skip an undefined-variable error). */
     static bool sub_ok(int uses, const Construct *arg)
     {
         if (uses == 1)
             return true;       /* single evaluation: any argument is fine */
 
-        const bool trivial = dynamic_cast<const Identifier *>(arg)
-                          || dynamic_cast<const Literal *>(arg);
-
         if (uses >= 2)
-            return trivial;    /* duplicate only side-effect-free args */
+            return dynamic_cast<const Identifier *>(arg)
+                || is_const_literal(arg);
 
-        /* uses == 0: only a literal may be dropped (no eval / error lost). */
-        return dynamic_cast<const Literal *>(arg) != nullptr;
+        return is_const_literal(arg);     /* uses == 0: drop a const only */
     }
 
     static std::vector<std::string> param_names(const FuncDeclStmt *f)
@@ -1452,48 +1452,101 @@ private:
     }
 
     /*
-     * Bottom-up constant folding of a spliced body: fold an all-const
-     * arithmetic/logic/comparison node (MultiOpConstruct over scalar literals)
-     * to a single literal. Returns true if `slot` is now a scalar literal. A
-     * node whose evaluation throws (e.g. 6/0) is left for runtime - matching
-     * the un-inlined call, which would also error at runtime.
+     * A self-contained constant value node: a scalar literal, a baked const
+     * value (LiteralObj), or an array/dict literal whose elements are all
+     * themselves such values. These can be evaluated with no scope context, so
+     * folding an op over them never needs a frame or const-global lookup (which
+     * keeps it safe on a specialized clone, whose body still has slotted locals
+     * that have no frame here).
      */
-    bool refold(unique_ptr<Construct> &slot)
+    static bool is_const_literal(const Construct *c)
+    {
+        if (!c)
+            return false;
+        if (dynamic_cast<const Literal *>(c)
+                || dynamic_cast<const LiteralObj *>(c))
+            return true;
+        if (auto *la = dynamic_cast<const LiteralArray *>(c)) {
+            for (auto &e : la->elems)
+                if (!is_const_literal(e.get()))
+                    return false;
+            return true;
+        }
+        if (auto *ld = dynamic_cast<const LiteralDict *>(c)) {
+            for (auto &kv : ld->elems)
+                if (!is_const_literal(kv->key.get())
+                        || !is_const_literal(kv->value.get()))
+                    return false;
+            return true;
+        }
+        return false;
+    }
+
+    /* Are all of a node's value-operands self-contained constants? (For a call
+     * the operands are its args; the callee is checked separately.) */
+    static bool operands_const(const Construct *c)
+    {
+        if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+            for (auto &p : mo->elems)
+                if (!is_const_literal(p.second.get()))
+                    return false;
+            return true;
+        }
+        if (auto *sub = dynamic_cast<const Subscript *>(c))
+            return is_const_literal(sub->what.get())
+                && is_const_literal(sub->index.get());
+        if (auto *sl = dynamic_cast<const Slice *>(c))
+            return is_const_literal(sl->what.get())
+                && (!sl->start_idx || is_const_literal(sl->start_idx.get()))
+                && (!sl->end_idx || is_const_literal(sl->end_idx.get()));
+        if (auto *me = dynamic_cast<const MemberExpr *>(c))
+            return is_const_literal(me->what.get());
+        if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
+            if (!dynamic_cast<const Identifier *>(ce->what.get()))
+                return false;          /* callee resolved via cctx */
+            if (ce->args)
+                for (auto &a : ce->args->elems)
+                    if (!is_const_literal(a.get()))
+                        return false;
+            return true;
+        }
+        return false;
+    }
+
+    /*
+     * Bottom-up constant folding of a spliced/specialized body. Folds an
+     * operator, subscript, slice, member access, or const-builtin call whose
+     * operands are all self-contained constants (see operands_const) to a
+     * literal - evaluated against `cctx` (const builtins only). The folded
+     * value's read-only-ness is preserved (a slice of a const stays read-only;
+     * a fresh result stays mutable). A node whose evaluation throws (6/0, an
+     * out-of-bounds index, a type mismatch) or whose callee isn't a const
+     * builtin is left for runtime - matching the un-inlined call.
+     */
+    void refold(unique_ptr<Construct> &slot)
     {
         if (!slot)
-            return false;
+            return;
 
-        if (dynamic_cast<Literal *>(slot.get()))
-            return true;            /* already a scalar literal */
+        for_each_child_slot(slot.get(),
+            [&](unique_ptr<Construct> &ch) { refold(ch); });
 
-        bool all_const = true, any = false;
-        for_each_child_slot(slot.get(), [&](unique_ptr<Construct> &ch) {
-            any = true;
-            if (!refold(ch))
-                all_const = false;
-        });
-
-        if (!any || !all_const)
-            return false;
-
-        if (!dynamic_cast<MultiOpConstruct *>(slot.get()))
-            return false;           /* only fold operator expressions here */
+        Construct *c = slot.get();
+        if (is_const_literal(c) || !operands_const(c))
+            return;
 
         try {
             unique_ptr<Construct> lit;
             if (MakeConstructFromConstVal(
-                    RValue(slot->eval(&cctx)), lit, false, false)) {
-                lit->start = slot->start;
-                lit->end = slot->end;
-                lit->inline_ctx = slot->inline_ctx;
+                    RValue(c->eval(&cctx)), lit, true, false)) {
+                lit->start = c->start;
+                lit->end = c->end;
+                lit->inline_ctx = c->inline_ctx;
                 slot = move(lit);
-                return true;
             }
         } catch (const Exception &) {
-            /* not foldable / would throw: leave it for runtime */
+            /* not const-foldable / would throw: leave it for runtime */
         }
-
-        return false;
     }
 
     /*
@@ -1579,6 +1632,10 @@ private:
 
         if (!ac.fold_specialized(body, fc->slot_writes, fc->params.get(), seed))
             return nullptr;        /* const error: keep the ordinary call */
+
+        /* AutoConst folds operators + scalar const-builtin calls; this also
+         * folds self-contained subscript/slice/member/array-call results. */
+        refold(fc->body);
 
         if (node_count(fc->body.get()) >= before)
             return nullptr;        /* folding didn't shrink it: not worth it */
