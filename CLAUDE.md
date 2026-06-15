@@ -129,10 +129,10 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — eight translation
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — nine translation
 units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `eval.cpp`,
-`types.cpp`, `mylang.cpp`,
+`types.cpp`, `backtrace.cpp`, `mylang.cpp`,
 `tests.cpp`.
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
@@ -158,6 +158,8 @@ units:
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
+- `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
+  `Exception`'s captured call-stack (see the error model section).
 
 **The `.cpp.h` convention.** Files under `src/types/` and `src/builtins/` are
 named `*.cpp.h` and are
@@ -368,11 +370,11 @@ and (2) *short bodies* — inlining tiny functions such as comparators
 (`func(a,b) => a < b`). Two design questions are deliberately left open and must
 be settled first: (a) the **inlining criterion** — how much benefit must
 inlining bring to be worth it (body size, call-site count, whether args are
-const, ...)? and (b) **error reporting / debugging** - how should an error
-raised inside an inlined body be reported (the call site, the original function
-location, or a synthesized "backtrace")? This is on hold; error-reporting polish
-(caret accuracy, expression `Loc` boundaries, multi-line expressions, and
-possibly backtraces) is being done first.
+const, ...)? and (b) **error reporting / debugging** - an inlined call no longer
+pushes a `do_func_call` frame, so it would vanish from (or misreport in) the
+backtrace; inlining must decide how an inlined frame appears there. The
+error-reporting polish it was waiting on (caret accuracy, expression `Loc`
+boundaries, multi-line spans, and the backtrace itself) is now done.
 
 ## The value & type model (the subtle part)
 
@@ -652,11 +654,24 @@ and two macros:
   defined non-function reports `NotCallableEx`, not a bogus "undefined var".
 - **Uncaught user exceptions** print their throw-site loc + caret and their
   payload (`mylang.cpp`'s `ExceptionObject` handler uses `get_data()`).
+- **Backtrace.** `Exception::backtrace` (a `vector<BacktraceFrame>`, `errors.h`)
+  is filled as the exception unwinds: `do_func_call`'s `catch (Exception &)`
+  records each frame innermost-first, capturing the function's name+params **as
+  strings** (the AST is torn down during unwinding, before the top-level handler
+  runs) plus the *call site* (the `CallExpr`'s loc, passed as `do_func_call`'s
+  `call_site`). `format_backtrace` (`backtrace.cpp` / `backtrace.h`) renders it:
+  frame `[0]` is the innermost (its line = the error site, `loc_start`), each
+  deeper frame's line is where it called the next, and a synthetic `main()` is
+  the bottom. Two passes: pass 1 builds each `name(params)` (param list
+  truncated to ~60 cols as `name(p1, ..., ...)`, the name never cut) and finds
+  the widest; pass 2 zero-pads frame numbers to a common width (only when >9
+  frames) and right-pads the name column so `at line N` aligns. It is a plain
+  function so tests can format synthetic/real backtraces and assert on them.
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
-  see the "err loc:" tests in `tests.cpp`). There is **no backtrace** yet — see
-  the planned-inlining note (error reporting for inlined/called frames is the
-  open question to settle before adding one).
+  see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`
+  cover the formatter. (Inlining, when added, must decide how an inlined call
+  appears in this backtrace — see the planned-inlining note.)
 
 ## Recipes
 

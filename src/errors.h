@@ -3,7 +3,9 @@
 
 #include "defs.h"
 
+#include <string>
 #include <string_view>
+#include <vector>
 #include "operators.h"
 
 struct Loc {
@@ -43,12 +45,26 @@ struct Loc {
 class Tok;
 class Construct;
 
+/*
+ * One frame of a runtime backtrace, captured (as self-contained strings, since
+ * the AST is torn down while the exception unwinds) when an exception passes
+ * through do_func_call (see eval.cpp), innermost first. `name`/`params` are the
+ * function's name and parameter names; `call_site` is where it called the
+ * next, deeper one.
+ */
+struct BacktraceFrame {
+    std::string name;
+    std::vector<std::string> params;
+    Loc call_site;
+};
+
 struct Exception {
 
     const char *const name;
     const char *const msg;
     Loc loc_start;
     Loc loc_end;
+    std::vector<BacktraceFrame> backtrace;
 
     Exception(const char *name,
               const char *msg,

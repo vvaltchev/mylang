@@ -314,13 +314,15 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
  * FlowState and, when the function was resolved, a flat slot Frame), binds the
  * params, evaluates the body, and returns what the body returned via the
  * FlowState (or none). An UndefinedVariableEx escaping a pure func is tagged so
- * the error message can point at the pure-func restriction.
+ * the error message can point at the pure-func restriction. `call_site` (the
+ * CallExpr's loc) is recorded into an unwinding exception's backtrace.
  */
 template <class ArgsVecT>
 static EvalValue
 do_func_call(EvalContext *ctx,
              FuncObject &obj,
-             const ArgsVecT &args)
+             const ArgsVecT &args,
+             Loc call_site = Loc())
 {
     /* func_ctx == true gives this call its own FlowState (see eval.h) */
     EvalContext args_ctx(&obj.capture_ctx, false, true);
@@ -362,11 +364,24 @@ do_func_call(EvalContext *ctx,
          */
         obj.func->body->eval(&args_ctx);
 
-    } catch (UndefinedVariableEx &undefEx) {
+    } catch (Exception &e) {
 
         if (obj.func->is_const)
-            undefEx.in_pure_func = true;
+            if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
+                undefEx->in_pure_func = true;
 
+        /*
+         * Record this frame as the exception unwinds (innermost first). Capture
+         * the name/params as strings now: the AST is destroyed during unwinding
+         * before the top-level handler builds the backtrace.
+         */
+        BacktraceFrame bf;
+        bf.name = obj.func->id ? string(obj.func->id->get_str()) : "<lambda>";
+        if (obj.func->params)
+            for (const auto &p : obj.func->params->elems)
+                bf.params.push_back(string(p->get_str()));
+        bf.call_site = call_site;
+        e.backtrace.push_back(move(bf));
         throw;
     }
 
@@ -424,7 +439,8 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
             return do_func_call(
                 ctx,
                 *callable.get<shared_ptr<FuncObject>>().get(),
-                args->elems
+                args->elems,
+                start            /* call site = this CallExpr's location */
             );
         }
 
