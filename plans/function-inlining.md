@@ -280,25 +280,40 @@ Two properties that make this cheap and safe:
   unconditional (multi-level inlined call sites all appear). Verified
   byte-identical to `-ni` for builtin errors, member-assign errors, multi-level
   inlining, and physical-call-from-inlined chains, across every `bench/` script.
+- **Array/dict const args in specialization.** A block-bodied function called
+  with a deep read-only (const) array/dict arg is now specialized: its element/
+  member reads fold in the clone. Sound because a read-only value is only ever
+  substituted in read positions (`fold_reads` never rewrites an lvalue or an
+  lvalue-builtin first arg) and any mutation throws the same error at runtime as
+  the un-specialized call. Mechanism: `try_specialize` seeds an arg whose value
+  `is_readonly_value`; `prescan_blocked` gained a `block_subscript_bases` flag
+  so the relaxed (array) seed set keeps every block except subscript/member READ
+  bases (the param decl is kept, so an lvalue base can't dangle); `fold_reads`
+  bakes a seeded array/dict const into a read-only `LiteralObj` so `refold`
+  folds its reads; the shrink check uses `count_all_nodes` (a full pass, so a
+  fold inside a kept `var t = a[0]+a[1]` rvalue counts); the cache keys array/
+  dict args by `intptr` identity (`value_repr`). Also fixed a pre-existing bug
+  this exposed: a promoted/folded `var` used only in a `return` expression had
+  its decl dropped but the use left dangling (undefined variable) — `fold_child`
+  now folds a `ReturnStmt`'s expression. Verified byte-identical to `-ni` for
+  mutation-of-const-arg, subscript-assign, `intptr`, foreach over a const arg,
+  member access, mutable (non-const) array args, and reassigned params, plus
+  every `bench/` script.
 
 ## Remaining / tracked tasks
 
 Not yet done; roughly in priority order:
 
-1. **Array/dict const args in specialization.** Today only *scalar* const args
-   seed a specialization (`scalar_repr` / the seed loop). Allow const
-   array/dict args too (key them by value, e.g. via the CSE-style canonical key
-   or a deep hash), so `f([1,2,3], x)` specializes.
-2. **Rebasing fixpoint for deeper inline nesting.** The inliner is single level
+1. **Rebasing fixpoint for deeper inline nesting.** The inliner is single level
    per pass: a freshly-spliced body is not re-scanned for further inlining in
    the same pass (chain rebasing already keeps backtraces correct for the one
    level that does nest). Running the pass to a fixpoint would inline g-into-f-
    into-h in one go; needs a depth cap + AST-growth budget.
-3. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
+2. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
    current scope (expression-body inlining has no locals; specialization keeps
    the original frame), but would be required to inline *block* bodies (with
    locals) directly instead of via a shared clone.
-4. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
+3. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
    Unsound on unknown dynamic types (float non-associativity, `+` overloading,
    preserved type errors); needs a "provably-int" analysis first. Inlining
    already leaves spliced expressions with original locs + full structure so

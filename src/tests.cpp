@@ -1751,6 +1751,19 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* Regression: a promoted write-once var used ONLY in a `return` must be
+         * folded there too. ReturnStmt is a plain Construct (not a
+         * SingleChildConstruct), so without an explicit fold_child case its
+         * decl was dropped but the use left dangling ("undefined variable"). */
+        "auto-const: a write-once var used only in a return is folded",
+        {
+            "func f() { var x = 5; return x; }",
+            "func g() { var y = 6; return y + 1; }",
+            "assert(f() == 5);",
+            "assert(g() == 7);",
+        },
+    },
+    {
         "auto-pure analysis descends into for-loop and try/catch bodies",
         {
             "func f() { var s = 0;",
@@ -2014,12 +2027,18 @@ static const std::vector<test> tests =
     { "runtime() with no args is rejected",
       { "runtime();" }, &typeid(InvalidNumberOfArgsEx) },
     {
-        "isconst() / isconstdecl() runtime fallback on a non-const param",
+        "isconst() / isconstdecl() on params (auto-const vs reassigned)",
         {
+            /* A never-reassigned param is auto-const: isconst true (per the
+             * README), isconstdecl false (not const by declaration). The fold
+             * is consistent in a `return` as anywhere else. */
             "func f(x) { return isconst(x); }",
             "func g(x) { return isconstdecl(x); }",
-            "assert(f(5) == false);",
+            /* A reassigned param is genuinely non-const: isconst false. */
+            "func h(x) { x = x + 1; return isconst(x); }",
+            "assert(f(5) == true);",
             "assert(g(5) == false);",
+            "assert(h(5) == false);",
         },
     },
     {
@@ -5550,6 +5569,58 @@ inliner_refolds_const_subexpr()
 }
 
 /*
+ * Const ARRAY/DICT arg specialization: a block-bodied function called with a
+ * const array (and a const dict) arg has its element/member reads folded in the
+ * clone. The const value is read-only, so this is sound: reads fold, the
+ * runtime result is unchanged. Compared against the non-inlined run to prove
+ * the fold happened (the constant 60/30 only appears when specialization ran).
+ */
+static bool
+inliner_specializes_array_const_arg()
+{
+    const std::vector<const char *> src = {
+        "const tbl = [10, 20, 30];",
+        "const dct = {1: 100, 2: 200};",
+        "func pick(a, k) {",
+        "    var t = a[0] + a[1] + a[2];",     /* folds to 60 in the clone */
+        "    return t + k;",
+        "}",
+        "func get(m, k) {",
+        "    var s = m[1] + m[2];",            /* dict reads fold to 300 */
+        "    return s + k;",
+        "}",
+        "var n = 1;",
+        "n = 5;",                              /* k is runtime */
+        "var r = pick(tbl, n) + get(dct, n);",
+        "assert(r == 65 + 305);",
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true, 24);
+    resolve_names(off.get(), false);
+
+    const std::string s_on = serialize_tree(on.get());
+    const std::string s_off = serialize_tree(off.get());
+
+    bool ok = true;
+    ok = ok && s_on.find("$spec0") != std::string::npos;   /* specialized */
+    ok = ok && s_on.find("$spec1") != std::string::npos;   /* both funcs */
+    ok = ok && s_on.find("Int(60)") != std::string::npos;  /* a[..] folded */
+    ok = ok && s_on.find("Int(300)") != std::string::npos; /* m[..] folded */
+    /* off never folds these: no specialization without inlining. */
+    ok = ok && s_off.find("$spec0") == std::string::npos;
+    ok = ok && s_off.find("Int(60)") == std::string::npos;
+
+    try { on->eval(nullptr); } catch (const Exception &) { ok = false; }
+    try { off->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  resolved tree (on):\n" << s_on;
+    return ok;
+}
+
+/*
  * Const-arg specialization: a block-bodied function called with a const arg
  * that gates control flow is cloned and folded (DCE) for that constant, and the
  * call is redirected to the shared clone. Two calls with the SAME const share
@@ -5703,6 +5774,8 @@ static const std::vector<extra_check> extra_checks =
     { "inliner folds a const-global subscript", inliner_folds_const_global },
     { "inliner specializes a block func (deduped)",
       inliner_specializes_block_func },
+    { "inliner specializes on a const array/dict arg",
+      inliner_specializes_array_const_arg },
     { "specialized-clone backtrace == non-spec",
       inliner_spec_backtrace_identical },
     { "backtrace: basic format & alignment", backtrace_format_basic },
