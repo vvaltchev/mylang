@@ -280,6 +280,10 @@ private:
         }
 
         if (auto *ce = dynamic_cast<CallExpr *>(c)) {
+            /* Block the callee: it isn't folded, so promoting a var used there
+             * would drop its decl and leave a dangling reference (a misleading
+             * "undefined variable" instead of not-callable). */
+            block(ce->what.get());
             /* Block only the first arg of a builtin that takes it as an lvalue
              * or identifier; all other call arguments are safe to fold. */
             auto *callee = dynamic_cast<Identifier *>(ce->what.get());

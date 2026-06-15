@@ -369,7 +369,9 @@ pAcceptCallExpr(ParseContext &c,
         }
 
         if (!ret) {
-            expr->end = c.get_loc();
+            /* end spans through the closing ')': the caret convention is
+             * loc_end = last-char-column + 2, and get_loc() is the ')' here. */
+            expr->end = c.get_loc() + 2;
             ret = move(expr);
         }
 
@@ -388,6 +390,7 @@ pAcceptSubscript(ParseContext &c,
 {
     if (pAcceptOp(c, Op::bracketL)) {
 
+        const Loc wstart = what->start;   /* subscripted expr's start */
         unique_ptr<Construct> start = pExprTop(c, fl);
         bool in_slice = false;
 
@@ -423,6 +426,11 @@ pAcceptSubscript(ParseContext &c,
 
             ret = move(s);
         }
+
+        /* Set the node's own span (start of the subscripted expr, through ']'),
+         * so errors point here and not at an enclosing construct. */
+        ret->start = wstart;
+        ret->end = c.get_loc() + 2;   /* get_loc() is the ']' */
 
         if (c.const_eval && ret->is_const) {
 
@@ -553,11 +561,15 @@ pExpr01(ParseContext &c, unsigned fl)
     } else if (pAcceptOp(c, Op::bracketL)) {
 
         main = pArray(c, fl);
+        main->start = start;            /* the '[' */
+        main->end = c.get_loc() + 2;    /* span through the ']' */
         pExpectOp(c, Op::bracketR);
 
     } else if (pAcceptOp(c, Op::braceL)) {
 
         main = pDict(c, fl);
+        main->start = start;            /* the '{' */
+        main->end = c.get_loc() + 2;    /* span through the '}' */
         pExpectOp(c, Op::braceR);
 
     } else if (pAcceptId(c, main)) {
@@ -1018,6 +1030,24 @@ pStmt(ParseContext &c, unsigned fl)
         if (pAcceptKeyword(c, Keyword::kw_rethrow))
             return make_unique<RethrowStmt>(start, c.get_loc());
     }
+
+    /*
+     * These keywords are only valid in specific contexts (gated above by the
+     * pFlags). If we see one here, the context is wrong - report it precisely
+     * instead of letting it fall through to a generic "unexpected token".
+     */
+    if (!(fl & pFlags::pInLoop)
+            && (*c == Keyword::kw_break || *c == Keyword::kw_continue))
+        throw SyntaxErrorEx(
+            c.get_loc(), "'break' and 'continue' are only allowed in a loop");
+
+    if (!(fl & pFlags::pInFuncBody) && *c == Keyword::kw_return)
+        throw SyntaxErrorEx(
+            c.get_loc(), "'return' is only allowed inside a function");
+
+    if (!(fl & pFlags::pInCatchBody) && *c == Keyword::kw_rethrow)
+        throw SyntaxErrorEx(
+            c.get_loc(), "'rethrow' is only allowed inside a catch block");
 
     if (pAcceptIfStmt(c, subStmt, fl)) {
 
