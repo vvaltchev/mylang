@@ -475,7 +475,20 @@ N`, default 24), sound arg use
 (an arg is evaluated as often as the param is used; side-effecting args neither
 dropped nor duplicated). The spliced body's params are replaced by the args
 (which inherit the parameter occurrence's loc), and the whole splice is tagged
-with an `InlineCtx`. The inlined-frame flush is keyed off
+with an `InlineCtx`. **The inliner re-scans each splice** (`walk(slot, depth+1)`
+after splicing), so a g-into-f-into-h chain collapses in one pass even when
+declaration order defeats the bottom-up walk (h declared before the callees it
+transitively reaches) or a call is newly exposed by the re-fold — this is the
+"fixpoint." Two bounds keep it finite: `MAX_INLINE_DEPTH` (16) caps nesting so
+mutual recursion (`a()=>b(); b()=>a()`) terminates, and `inline_budget`
+(`max(4096, 8 * program nodes)`) caps total nodes added so breadth-doubling
+(`f()=>g()+g()`) can't blow the tree up; hitting either bound just leaves the
+remaining calls in place (still correct — they run at runtime). A re-scanned
+splice's call site already carries an `InlineCtx`, so the new frame's parent is
+that existing chain (not null) and `rebase` (in `tag_inline`) re-roots the
+body's own chains under it — arbitrarily deep nesting renders correctly, and a
+chain mixing inlined and physical/recursive frames shows them in order. The
+inlined-frame flush is keyed off
 `Exception::inline_origin_emitted` (a bool), **not** the loc once-guard: the
 innermost inlined node's `Construct::eval` emits its frames once and sets the
 flag, so an error that arrives with a loc already set (a builtin like
