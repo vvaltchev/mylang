@@ -359,6 +359,21 @@ parse-time consts and `const` params; `isconst` also accepts auto-const vars and
 auto-const params. All four are registered as runtime builtins (with fallback
 bodies) so the names resolve even when the pass doesn't fold them.
 
+**Planned (NOT yet implemented): function inlining.** The author intends to add
+function inlining, for two reasons: (1) *specialization* - propagating a const
+argument into a `const`-parameter function's body at the call site, which is the
+missing half of const-parameter const-propagation for *non-pure* functions
+(today only pure/auto-pure whole-call folding propagates consts across a call);
+and (2) *short bodies* — inlining tiny functions such as comparators
+(`func(a,b) => a < b`). Two design questions are deliberately left open and must
+be settled first: (a) the **inlining criterion** — how much benefit must
+inlining bring to be worth it (body size, call-site count, whether args are
+const, ...)? and (b) **error reporting / debugging** - how should an error
+raised inside an inlined body be reported (the call site, the original function
+location, or a synthesized "backtrace")? This is on hold; error-reporting polish
+(caret accuracy, expression `Loc` boundaries, multi-line expressions, and
+possibly backtraces) is being done first.
+
 ## The value & type model (the subtle part)
 
 - **`EvalValue`** (`evalvalue.h`) is a hand-rolled tagged union: a `ValueU`
