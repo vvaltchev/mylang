@@ -666,6 +666,14 @@ non-tail calls or reassigned/global args would need an args-as-locals form.
   auto-const folder uses to find promotable write-once vars (see the
   const-evaluation section). The const-eval path runs before resolution, so pure
   funcs invoked at parse time use the map (`resolved` is still false then).
+  **Slots also bypass the map on the WRITE side:** `handle_single_expr14`
+  (`eval.cpp`) fast-paths an assignment / compound-assignment to a resolved,
+  live, non-const local — it read-modify-writes `frame->slots[slot]` in place,
+  skipping the `lvalue->eval()` → `LValue*` → `doAssign()` round-trip (it falls
+  through to that general path when the slot is undefined or const, so the same
+  errors still fire). `foreach` binds a resolved-local loop var the same way via
+  `bind_loop_var`. Both use `as_resolved_local`, which is a cheap `is_id()` tag
+  check (`ConstructType::id`), not a `dynamic_cast`.
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable
@@ -788,9 +796,13 @@ via COW:
   builtins (`append`/`pop`/`insert`/`erase`) throw `CannotChangeConstEx`;
   `sort()` clones instead of sorting in place. This is what makes a const
   immutable through a non-const alias (e.g. a function parameter) — parse-time
-  read-folding alone didn't. (Aside: `builtin_sum` must seed its accumulator
-  with a `clone()` of the first element, since `+=` mutates it in place — it
-  would otherwise mutate, or be rejected on, a read-only argument.)
+  read-folding alone didn't. (Aside: `builtin_sum`'s general path must seed its
+  accumulator with a `clone()` of the first element, since `+=` mutates it in
+  place — it would otherwise mutate, or be rejected on, a read-only argument.
+  `builtin_sum` also has an all-int fast path that accumulates a raw `int_type`
+  in a tight loop — skipping `num_bin_op`'s promotion check and the per-element
+  virtual `TypeInt::add` — and falls back to the general loop at the first
+  non-int element, so a mixed int/float array still promotes correctly.)
 - **Getting a mutable copy of a const: `clone()` vs `deepclone()`.** Two helpers
   in `eval.cpp` make mutable copies (scalars/strings returned as-is):
   `make_mutable_clone` builds a fresh mutable *top* but **shares** any read-only

@@ -25,6 +25,7 @@ enum class ConstructType {
     ret,
     idlist,
     block,
+    id,
 };
 
 /*
@@ -80,6 +81,7 @@ public:
     bool is_ret() const { return ct == ConstructType::ret; }
     bool is_idlist() const { return ct == ConstructType::idlist; }
     bool is_block() const { return ct == ConstructType::block; }
+    bool is_id() const { return ct == ConstructType::id; }
 
     virtual ~Construct() = default;
 
@@ -439,7 +441,7 @@ public:
     bool auto_const_param = false;
 
     Identifier(const std::string_view &str)
-        : Construct("Id")
+        : Construct("Id", false, ConstructType::id)
         , uid(UniqueId::get(str))
     { }
 

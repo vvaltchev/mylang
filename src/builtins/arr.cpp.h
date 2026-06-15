@@ -467,13 +467,44 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
 
     if (exprList->elems.size() == 1) {
 
+        const EvalValue &first = view[0].get();
+
         /*
-         * Seed the accumulator with a *copy* of the first element: num_bin_op
-         * with Type::add mutates the accumulator in place (array `+=` appends
-         * to it), so aliasing view[0] would mutate the input array - and would
-         * be rejected outright when the input is a read-only `const`.
+         * Fast path for an all-int array: accumulate raw int_type in a tight
+         * loop, skipping num_bin_op's promotion check and the per-element
+         * virtual TypeInt::add dispatch. Overflow wraps (-fwrapv), exactly as
+         * TypeInt::add does. The first non-int (a float, say) breaks out and
+         * the general loop below resumes from there, so a mixed array still
+         * promotes correctly (int accumulator -> float via num_bin_op).
          */
-        EvalValue val = view[0].get().clone();
+        if (first.is<int_type>()) {
+
+            int_type acc = first.get<int_type>();
+            size_type i = 1;
+
+            for (; i < view.size(); i++) {
+                const EvalValue &e = view[i].get();
+                if (!e.is<int_type>())
+                    break;
+                acc += e.get<int_type>();
+            }
+
+            if (i == view.size())
+                return EvalValue(acc);
+
+            EvalValue val(acc);
+            for (; i < view.size(); i++)
+                num_bin_op(val, view[i].get(), &Type::add);
+            return val;
+        }
+
+        /*
+         * General path. Seed the accumulator with a *copy* of the first elem:
+         * num_bin_op with Type::add mutates the accumulator in place (array
+         * `+=` appends to it), so aliasing view[0] would mutate the input array
+         * - and would be rejected outright when the input is a read-only const.
+         */
+        EvalValue val = first.clone();
 
         for (size_type i = 1; i < view.size(); i++) {
             num_bin_op(val, view[i].get(), &Type::add);
