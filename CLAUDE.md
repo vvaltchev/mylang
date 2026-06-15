@@ -477,22 +477,29 @@ runs). Backtraces for **body** errors are byte-identical with/without inlining;
 is attributed to the inlined callee rather than the call site (the arg node is
 both the call-site value and the in-body operand). After splicing, the inliner
 **re-folds** (`Inliner::refold`): a `MultiOpConstruct`, subscript, slice, member
-access, or const-builtin call whose operands are self-contained constants
-(`is_const_literal`: scalar, `LiteralObj`, or array/dict literal of constants)
-folds to a literal. So a const arg propagates into a *non-pure* expression
-function (`f(3)` with `f(x) => x*10+g` -> `30+g`; a substituted array arg makes
-`a[0]` -> `10`, `len(a)` -> `3`) — the half AutoConst's whole-call folding
-misses. A non-inlined call to a **block-bodied** function with scalar-const
-arg(s) is instead **specialized**: the body is cloned, those params bound, and
-folded with DCE via `AutoConst::fold_specialized` (which *catches* const errors
-and discards, so a runtime error never becomes a compile one) then `refold`. If
-it shrinks, a shared clone `$specN` is registered (deduped by (func, const-arg
-tuple), inserted at the root block's front) and the call redirected; the clone
-keeps the same frame (no re-resolution) and a `FuncDeclStmt::display_name` makes
-backtraces show the original name, not `$specN`. Still **not done** (see
-`plans/function-inlining.md` "Remaining"): const-*global* subscript folding,
-array/dict const args in specialization, a rebasing fixpoint for deeper nesting,
-and the deferred type-narrowing/algebraic pass.
+access, or const-builtin call folds to a literal when its operands are
+compile-time constants — scalar/array/dict literals *and* const globals (the
+top-level const array/dict decls are seeded into `cctx` by
+`seed_const_globals`). A `has_slotted_local` guard keeps it from dereffing a
+missing frame (it never evaluates a node referencing a runtime local), and it
+skips lvalue positions (an assignment target, an lvalue builtin's first arg) so
+a write target is never turned into a value. So a const arg propagates into a
+*non-pure* expression function (`f(3)` with `f(x) => x*10+g` -> `30+g`;
+`a[0]` -> `10`, `len(a)` -> `3`, `tbl[0]` -> the element) — the half AutoConst's
+whole-call folding misses. A non-inlined call to a **block-bodied** function
+with scalar-const arg(s) is instead **specialized**: the body is cloned, those
+params bound, and folded with DCE via `AutoConst::fold_specialized` (which
+*catches* const errors and discards, so a runtime error never becomes a compile
+one) then `refold`. If it shrinks, a shared clone `$specN` is registered
+(deduped by (func, const-arg tuple), inserted at the root block's front) and
+the call redirected;
+the clone keeps the same frame (no re-resolution) and a
+`FuncDeclStmt::display_name` makes backtraces show the original name, not
+`$specN`. Still **not done** (see `plans/function-inlining.md` "Remaining"):
+inlined *builtin*-call errors lose the inline frame in the backtrace
+(pre-existing; builtins bypass the `do_func_call` flush), array/dict const args
+in specialization, a rebasing fixpoint for deeper nesting, and the deferred
+type-narrowing/algebraic pass.
 
 ## The value & type model (the subtle part)
 
