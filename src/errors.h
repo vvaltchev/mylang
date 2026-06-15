@@ -81,6 +81,16 @@ struct Exception {
     Loc loc_end;
     std::vector<BacktraceFrame> backtrace;
 
+    /*
+     * Set once the inlined-at frames for the error's innermost inlined node
+     * have been emitted. The flush is keyed off this rather than the loc-stamp
+     * once-guard, because many errors arrive with a loc already set (a builtin
+     * call, a not-an-lvalue assignment) and would otherwise lose their frames.
+     * `do_func_call` also sets it after its call-site flush so the enclosing
+     * CallExpr doesn't re-emit. See Construct::eval / do_func_call (eval.cpp).
+     */
+    bool inline_origin_emitted = false;
+
     Exception(const char *name,
               const char *msg,
               Loc start = Loc(),

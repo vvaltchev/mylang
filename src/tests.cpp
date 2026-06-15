@@ -5441,6 +5441,52 @@ inliner_backtrace_identical()
 }
 
 /*
+ * Regression: an error thrown by a BUILTIN inside an inlined body must still
+ * carry the inlined frames in the backtrace. Builtins bypass do_func_call (the
+ * usual flush point) and stamp their own error loc, so the flush can't be keyed
+ * off the loc once-guard - it's keyed off inline_origin_emitted instead. Also
+ * covers the multi-level case (b inlined into a): both virtual frames appear,
+ * exactly once each, identical to the non-inlined run.
+ */
+static bool
+inliner_builtin_error_backtrace_identical()
+{
+    /* append() on a const array throws CannotChangeConstEx at RUN time; it is
+     * a non-const builtin, so it is never folded away, and tbl's first-arg
+     * lvalue position keeps it out of re-folding too. */
+    const std::vector<const char *> src = {
+        "const tbl = [1, 2, 3];",
+        "func b() => append(tbl, 9);",
+        "func a() => b();",
+        "a();",
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);
+    resolve_names(off.get(), false);
+
+    std::string bt_on, bt_off;
+    try { on->eval(nullptr); }
+    catch (const Exception &e) { bt_on = format_backtrace(e); }
+    try { off->eval(nullptr); }
+    catch (const Exception &e) { bt_off = format_backtrace(e); }
+
+    bool ok = true;
+    ok = ok && !bt_on.empty();
+    ok = ok && bt_on == bt_off;                  /* identical with/without */
+    ok = ok && bt_on.find("[0] b()") != std::string::npos;
+    ok = ok && bt_on.find("[1] a()") != std::string::npos;
+    ok = ok && bt_on.find("[2] main()") != std::string::npos;
+    /* the inlined frame must appear exactly once (no double flush). */
+    ok = ok && count_substr(bt_on, "[0] b()") == 1;
+
+    if (!ok) cout << "  bt_on:\n" << bt_on << "\n  bt_off:\n" << bt_off;
+    return ok;
+}
+
+/*
  * The -it threshold gates inlining: the same program resolved with a tiny
  * threshold keeps the call (body too big), while a large threshold inlines it.
  */
@@ -5648,6 +5694,8 @@ static const std::vector<extra_check> extra_checks =
     { "AST deep-clone round-trips", ast_clone_roundtrip },
     { "inliner splices an expr-func call", inliner_splices_call },
     { "inlined-call backtrace == non-inlined", inliner_backtrace_identical },
+    { "inlined builtin-error backtrace == non-inlined",
+      inliner_builtin_error_backtrace_identical },
     { "inline threshold (-it) gates inlining", inliner_threshold_gates },
     { "inliner re-folds a const subexpression", inliner_refolds_const_subexpr },
     { "inliner re-folds subscript/len in a splice",

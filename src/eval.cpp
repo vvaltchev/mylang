@@ -150,14 +150,21 @@ EvalValue Construct::eval(EvalContext *ctx, bool rec) const
         if (!e.loc_start) {
             e.loc_start = start;
             e.loc_end = end;
+        }
 
-            /*
-             * Innermost node to see this exception: if it was spliced in by
-             * inlining, emit its virtual ("inlined-at") frames now, so the
-             * physically-absent inlined calls still show in the backtrace.
-             */
-            if (inline_ctx)
-                flush_inline_frames(inline_ctx, e);
+        /*
+         * If this node was spliced in by inlining, emit its virtual
+         * ("inlined-at") frames now, so the physically-absent inlined calls
+         * still show in the backtrace. This is keyed off
+         * `inline_origin_emitted` rather than the loc-stamp above, because many
+         * errors arrive with a loc already set (a builtin call, a not-an-lvalue
+         * assignment, ...) and would otherwise slip past the loc once-guard and
+         * lose their frames. The innermost inlined node wins; `do_func_call`
+         * sets the same flag for a real call so the CallExpr doesn't re-emit.
+         */
+        if (inline_ctx && !e.inline_origin_emitted) {
+            flush_inline_frames(inline_ctx, e);
+            e.inline_origin_emitted = true;
         }
 
         throw;
@@ -398,10 +405,15 @@ do_func_call(EvalContext *ctx,
 
         /*
          * If this call was physically made from inside inlined code, emit the
-         * virtual frames for the inlined call(s) right above it.
+         * virtual frames for the inlined call(s) right above it. Setting the
+         * flag stops the enclosing CallExpr::eval from emitting this same chain
+         * again; a deeper physical call's own flush still runs (this is
+         * unconditional), so multi-level inlined call sites all show up.
          */
-        if (call_site_inl)
+        if (call_site_inl) {
             flush_inline_frames(call_site_inl, e);
+            e.inline_origin_emitted = true;
+        }
 
         throw;
     }
@@ -649,16 +661,14 @@ stamp_operand_loc(const Construct *c, Exception &e)
     if (!e.loc_start) {
         e.loc_start = c->start;
         e.loc_end = c->end;
-
-        /*
-         * Operator-ladder errors are stamped here (at the offending operand)
-         * before they reach the operand's own Construct::eval, so flush its
-         * inlined-at frames here too. No-op for non-inlined nodes (inline_ctx
-         * is null), so normal code is unaffected.
-         */
-        if (c->inline_ctx)
-            flush_inline_frames(c->inline_ctx, e);
     }
+
+    /*
+     * Operator-ladder errors are stamped at the offending operand, but the
+     * inlined-at frames are emitted by the enclosing node's Construct::eval
+     * (keyed off inline_origin_emitted, which the loc-stamp above does not
+     * gate), so there's nothing to flush here.
+     */
 }
 
 /* `acc OP= operand`, with operand-precise error locations. */
