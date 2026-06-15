@@ -236,8 +236,21 @@ Two properties that make this cheap and safe:
    throw (e.g. `6/0`) is left for runtime, matching the un-inlined call. (Only
    `MultiOpConstruct` is re-folded for now; const subscript/slice/builtin-call
    results in spliced bodies are not yet.)
-5. **Const-arg specialization**: inline-if-tiny-after-fold; else clone + dedup +
-   redirect.
+5. **Const-arg specialization** *(done)* — a non-inlined call to a block-bodied,
+   non-capturing function with scalar-const arg(s) (on never-reassigned,
+   non-blocked params) clones it, binds those params and folds the body
+   via `AutoConst::fold_specialized` (full folding + DCE; it *catches* const
+   errors and discards, so a runtime error never becomes a compile error). If
+   folding shrinks the body it registers a shared clone `$specN` (deduped by
+   (func, const-arg tuple), inserted at the root block's front so it exists
+   before any call) and redirects the call. The clone keeps the same
+   signature/frame, so no re-resolution is needed (the const args are still
+   passed but ignored). The clone's synthetic `id` resolves the redirected call;
+   a `FuncDeclStmt::display_name` carries the original name so backtraces are
+   identical with specialization on/off. Verified: all `bench/` scripts produce
+   identical output and a div-by-zero inside a clone shows `f`, not `$spec0`.
+   (Scalar consts only; array/dict const args and recursion-into-clones are not
+   specialized.)
 6. **Re-resolution of spliced bodies** (slot remapping) for speed.
 7. (deferred) type-narrowing pass -> algebraic simplification.
 
