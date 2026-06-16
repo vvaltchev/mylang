@@ -65,6 +65,11 @@ two implementations printed matching results (numeric tokens are compared with
 a tolerance so cosmetic float-formatting differences don't register as
 mismatches).
 
+Python is run with **`-B`** (don't read or write `__pycache__`). MyLang has no
+bytecode cache — it re-parses its source on every run — so letting CPython
+reuse a compiled `.pyc` across the repeated timing runs would be an unfair head
+start. With `-B` both sides re-parse every run.
+
 On a terminal, the `my/py` ratio is colored on a 256-color gradient — brightest
 green for the biggest wins (ratio ≤ 0.35), smoothly fading to a neutral grey
 across the break-even band (0.95–1.05), then to brightest red for the worst
@@ -190,6 +195,22 @@ both languages on the inputs used. These are straight speed comparisons.
   literals; the loop-invariant result collapses to one literal while CPython
   actually calls the functions every iteration. ~0.38× here.
 
+- **Const-expression de-duplication** (`52_cse_dedup`). Builds on `48`: the same
+  heavy const expression (`sum(sort(base))`, `sum(base + base)`) appears twice
+  in the loop body. MyLang evaluates each *once* at parse time —
+  common-subexpression elimination shares the `sort(base)`/`base + base` array
+  across the two occurrences — and folds the whole thing to two literals, so the
+  loop is pure literal arithmetic. CPython, lacking both const-folding and CSE,
+  re-sorts, re-concatenates and re-sums on every iteration. ~0.03× here (≈40×
+  faster). CSE's *own* contribution (separate from plain const-folding) is
+  **compile time and memory**, not runtime speed — folding already turns each
+  use into a literal. To see it in isolation, compile *N* identical heavy const
+  array decls (`const t0 = sort(base); ... const t23 = sort(base);`) and compare
+  a build with CSE against one without: parse time drops from O(*N*) evaluations
+  to one (≈10× faster to *compile* the file for N=24 here, via `mylang -nr`),
+  and because the *N* read-only tables then share one buffer instead of *N*
+  copies, peak RSS drops the same way (~620 MB → ~95 MB for N=24 × 300k ints).
+
 (The reverse case — Python-only constructs — is deliberately *not* benchmarked,
 since the goal is to measure MyLang's constructs, not Python's.)
 
@@ -253,13 +274,14 @@ Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 | 49_autoconst_fold | 0.30 | 0.82 | 0.37× | write-once `var`s folded away |
 | 50_autoconst_dce | 0.32 | 1.03 | 0.31× | constant guard + dead branch gone |
 | 51_purefunc_fold | 0.27 | 0.70 | 0.38× | auto-pure const-arg calls folded |
+| **52_cse_dedup** | 0.003 | 0.120 | **0.03×** | const fold + CSE precompute |
 
-**geomean: ~1.3× slower** across the 50 paired benchmarks (this box, CPython
-3.14). MyLang is *faster* on several (`28_str_concat` 0.01×,
-`50_autoconst_dce` 0.31×, `15_array_slice_readonly` 0.37×, `49_autoconst_fold`
-0.37×, `39_find_builtin` 0.52×, `26_dict_iterate` 0.74×, `01_while_loop` 0.90×)
-and within 2× on the large majority. The lone real blow-out is per-iteration
-*genuine* exceptions (`42` ~22×).
+**geomean: ~1.3× slower** across the paired benchmarks (this box, CPython
+3.14). MyLang is *faster* on several (`52_cse_dedup` 0.03×, `28_str_concat`
+0.01×, `50_autoconst_dce` 0.31×, `15_array_slice_readonly` 0.37×,
+`49_autoconst_fold` 0.37×, `39_find_builtin` 0.52×, `26_dict_iterate` 0.74×,
+`01_while_loop` 0.90×) and within 2× on the large majority. The lone real
+blow-out is per-iteration *genuine* exceptions (`42` ~22×).
 
 ### How to read the outliers
 

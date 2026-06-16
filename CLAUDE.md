@@ -313,6 +313,30 @@ and it lives *inside the parser*. Mechanics:
   at every use site would be wasteful; operations on them like `arr[2]` or
   `len(arr)` still get
   const-folded to literals though.
+- **Const-expression de-duplication (CSE).** The three sites that bake an
+  array/dict (`pAcceptCallExpr`, `pAcceptSubscript`, the `pExpr14` decl-rvalue)
+  go through **`cse_materialize()`** (`parser.cpp`) instead of calling
+  `MakeConstructFromConstVal` directly. It builds a canonical string key for the
+  expression (`cse_key`/`cse_key_rec`: identifiers resolved to their const
+  `LValue *` so shadowing can't alias; only cheap leaves — ids and scalar
+  literals — are eval'd, structural nodes recurse without evaluating; a
+  `CSE_KEY_CAP`-byte cap bounds key cost and skips huge literals) and looks it
+  up in **`CseCache`** (`parser.cpp`), a stack of `unordered_map<string,
+  EvalValue>`
+  scopes pushed/popped by `pBlock` in lockstep with `const_ctx`. On a hit it
+  shares the already-baked **deep read-only** value (no re-eval, no re-clone) —
+  this is why two identical const exprs report equal `intptr()`. On a miss it
+  bakes via `make_const_clone` and caches the value *only when it is read-only*
+  (the sole safely-shareable case; mutable `var`-bound literals are never
+  cached/shared). Popping a scope with its block is what stops a freed block's
+  reused stack addresses from colliding with a live key. `pExpr14` skips
+  re-materializing an rvalue that is *already* a `LiteralObj` (a subscript/call
+  result baked at its own site), so the de-dup lives at one layer and no double
+  clone happens. CSE is a pure optimization (miss == old behavior); its win is
+  compile time + memory, not runtime speed (folding already makes each use a
+  literal). `bench/52_cse_dedup` and the `CSE:` tests cover it.
+  `cse_materialize` is PIMPL-friendly: `CseCache` is forward-declared in
+  `parser.h` with an out-of-line `~ParseContext()`.
 - **Statement folding:** an `if` with a const condition is replaced by just its
   taken branch; a
   `while`/`foreach` proven to never execute (const-false condition / const-empty
