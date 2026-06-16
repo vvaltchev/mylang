@@ -2,7 +2,7 @@
 # there is intentionally no 48_const_fold.py).
 #
 # `heavy(data)` runs ONCE at parse time over a const array and is replaced by a
-# literal in the runtime AST (verify with: ./build/mylang -s bench/ml/48_const_fold.ml).
+# literal in the runtime AST (to verify, run this file under `mylang -s`).
 # The runtime loop below therefore never recomputes it - each use of `folded`
 # is just an integer literal. This is the defining feature of the language: the
 # work is shifted from runtime into the parser.
