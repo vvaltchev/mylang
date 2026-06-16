@@ -33,22 +33,60 @@ PY_DIR = os.path.join(HERE, "py")
 USE_COLOR = sys.stdout.isatty()
 
 
+def rgb_to_xterm256(r, g, b):
+    """Nearest xterm-256 palette index for an RGB triple - picks the closer of
+    the 6x6x6 color cube and the 24-step grey ramp, so true greys stay grey."""
+    cube = (0, 95, 135, 175, 215, 255)
+
+    def level(v):
+        return min(range(6), key=lambda i: abs(cube[i] - v))
+
+    cl = (level(r), level(g), level(b))
+    cube_rgb = tuple(cube[i] for i in cl)
+    cube_idx = 16 + 36 * cl[0] + 6 * cl[1] + cl[2]
+
+    gi = max(0, min(23, round(((r + g + b) / 3 - 8) / 10)))
+    grey_rgb = (8 + 10 * gi,) * 3
+
+    def dist2(a, b):
+        return sum((x - y) ** 2 for x, y in zip(a, b))
+
+    rgb = (r, g, b)
+    if dist2(rgb, cube_rgb) <= dist2(rgb, grey_rgb):
+        return cube_idx
+    return 232 + gi
+
+
+# my/py ratio gradient: brightest green for the best wins, a neutral grey across
+# the break-even band, brightest red for the worst regressions. We interpolate
+# in RGB *through grey* so the transition is smooth and small differences near
+# 1.0 read as grey rather than faint green/red.
+_GREEN = (0, 255, 0)
+_GREY = (150, 150, 150)
+_RED = (255, 0, 0)
+_NEUTRAL_LO = 0.95
+_NEUTRAL_HI = 1.05
+
+
+def _lerp(a, b, t):
+    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
 def ratio_xterm_color(ratio):
-    """xterm-256 color for a my/py ratio: a gradient from brightest green at
-    ratio <= 0.35 (best improvement) through dark green / dark red around the
-    1.0 break-even point up to brightest red at ratio >= 3.0 (worst
-    regression). Returns a 256-color palette index."""
+    """xterm-256 color for a my/py ratio: brightest green at ratio <= 0.35,
+    smoothly fading to neutral grey across the 0.95-1.05 break-even band, then
+    to brightest red at ratio >= 3.0."""
     if ratio <= 0.35:
-        return 46                       # brightest green (cube 0,5,0)
-    if ratio < 1.0:
-        # bright green at 0.35 -> dark green at 1.0
-        frac = (1.0 - ratio) / (1.0 - 0.35)         # 1.0 .. 0.0
-        return 16 + 6 * (1 + round(4 * frac))       # 46 .. 22
-    if ratio >= 3.0:
-        return 196                      # brightest red (cube 5,0,0)
-    # dark red just above 1.0 -> bright red at 3.0
-    frac = (ratio - 1.0) / (3.0 - 1.0)              # 0.0 .. 1.0
-    return 16 + 36 * (1 + round(4 * frac))          # 52 .. 196
+        rgb = _GREEN
+    elif ratio < _NEUTRAL_LO:
+        rgb = _lerp(_GREY, _GREEN, (_NEUTRAL_LO - ratio) / (_NEUTRAL_LO - 0.35))
+    elif ratio <= _NEUTRAL_HI:
+        rgb = _GREY
+    elif ratio < 3.0:
+        rgb = _lerp(_GREY, _RED, (ratio - _NEUTRAL_HI) / (3.0 - _NEUTRAL_HI))
+    else:
+        rgb = _RED
+    return rgb_to_xterm256(*rgb)
 
 
 def colorize_ratio(ratio, text):
