@@ -35,6 +35,33 @@ ifeq ($(LTO),1)
 	BASE_FLAGS += -flto=auto
 endif
 
+# AddressSanitizer / UndefinedBehaviorSanitizer. Both default ON for a debug
+# build (OPT=0) and OFF for an optimized build (OPT=1); override either
+# explicitly, e.g. `make ASAN=0` (debug without ASan) or `make OPT=1 UBSAN=1`.
+# The flags live in BASE_FLAGS so they reach both the compile and link lines.
+# UBSan excludes signed-integer-overflow: the project builds with -fwrapv and
+# *relies* on signed wraparound (see defs.h / the README), so that overflow is
+# defined behavior here, not a bug to flag.
+ifeq ($(OPT),0)
+	ASAN ?= 1
+	UBSAN ?= 1
+else
+	ASAN ?= 0
+	UBSAN ?= 0
+endif
+
+ifeq ($(ASAN),1)
+	BASE_FLAGS += -fsanitize=address
+endif
+
+ifeq ($(UBSAN),1)
+	BASE_FLAGS += -fsanitize=undefined -fno-sanitize=signed-integer-overflow
+endif
+
+ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
+	BASE_FLAGS += -fno-omit-frame-pointer
+endif
+
 ifdef TESTS
 	ifeq ($(TESTS),1)
 		BASE_FLAGS += -DTESTS

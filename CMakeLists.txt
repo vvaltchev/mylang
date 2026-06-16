@@ -22,6 +22,18 @@ set(TESTS         OFF CACHE BOOL   "Compile-in unit tests")
 set(GCOV          OFF CACHE BOOL   "Prepare a coverage build")
 set(LTO           ON  CACHE BOOL   "Link-time optimization (optimized configs)")
 
+# AddressSanitizer / UndefinedBehaviorSanitizer (GCC/Clang). Both default ON for
+# a Debug build and OFF otherwise - the analog of the Makefile's OPT=0 vs OPT=1.
+# Override either explicitly, e.g. -DASAN=OFF or -DUBSAN=ON. (No effect on MSVC,
+# whose sanitizer flag spelling differs and which has no UBSan.)
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+   set(_san_default ON)
+else()
+   set(_san_default OFF)
+endif()
+set(ASAN  ${_san_default} CACHE BOOL "AddressSanitizer (GCC/Clang)")
+set(UBSAN ${_san_default} CACHE BOOL "UndefinedBehaviorSanitizer (GCC/Clang)")
+
 file(GLOB SOURCES ${GLOB_CONF_DEP} "src/*.cpp")
 add_executable(mylang ${SOURCES})
 
@@ -43,6 +55,30 @@ endif()
 # -Wunqualified-std-cast-call. Silence it for clang only.
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
    target_compile_options(mylang PUBLIC -Wno-unqualified-std-cast-call)
+endif()
+
+if (NOT MSVC)
+   # The codebase relies on signed-overflow wraparound; mirror the Makefile's
+   # -fwrapv so signed overflow is defined here too (see defs.h / README). MSVC
+   # wraps by default and has no -fwrapv.
+   target_compile_options(mylang PUBLIC -fwrapv)
+
+   # Apply the sanitizers selected above, on the compile AND link lines. UBSan
+   # excludes signed-integer-overflow: with -fwrapv that overflow is defined, so
+   # the intentional wraparound is not a bug to flag.
+   set(SAN_OPTS "")
+   if (ASAN)
+      list(APPEND SAN_OPTS -fsanitize=address)
+   endif()
+   if (UBSAN)
+      list(APPEND SAN_OPTS -fsanitize=undefined
+                           -fno-sanitize=signed-integer-overflow)
+   endif()
+   if (SAN_OPTS)
+      list(APPEND SAN_OPTS -fno-omit-frame-pointer)
+      target_compile_options(mylang PUBLIC ${SAN_OPTS})
+      target_link_options(mylang PUBLIC ${SAN_OPTS})
+   endif()
 endif()
 
 # Whole-program (link-time) optimization for optimized configs, on by default:
