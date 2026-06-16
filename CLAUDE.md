@@ -795,6 +795,22 @@ and two macros:
 3. Document it in `README.md` (const vs. non-const section) and add a test in
    `src/tests.cpp`.
 
+**Memory safety with user callbacks.** A builtin that drives a sort/search with
+a *user-supplied* callback must not assume the callback is well-behaved — it is
+arbitrary script code. In particular `sort(arr, cmp)` (`builtins/arr.cpp.h`)
+uses a **hand-rolled iterative heapsort**, not `std::sort`, for the
+custom-comparator path: `std::sort`'s unguarded partition/insertion reads off
+the ends of the buffer when the comparator isn't a strict weak ordering (a
+heap-buffer-overflow reachable straight from a script), whereas the heapsort's
+`sift_down` index strictly descends — so it terminates for *any* comparator —
+and only ever indexes within `[0, n)`. It is hand-rolled rather than
+`std::make_heap`/`std::sort_heap` because MSVC's debug STL wraps those in
+comparator-validity instrumentation that *hangs* on a non-ordering comparator.
+The default (no-comparator) path keeps `std::sort` — its `operator<` is a valid
+ordering for homogeneous types and throws `TypeErrorEx` for incomparable ones.
+Keep this distinction if you touch sorting or add another callback-driven
+algorithm.
+
 ### Adding a value type
 Touch all of: the `TypeE` enum (`type.h`) — mind the trivial/non-trivial
 position vs. `t_str`; the
