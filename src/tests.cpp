@@ -1736,6 +1736,73 @@ static const std::vector<test> tests =
     { "lexer: a malformed number is a syntax error",
       { "var x = 1.2.3;" }, &typeid(SyntaxErrorEx) },
 
+    /* ---- resolver (resolver.cpp): auto-const DCE & auto-pure analysis ---- */
+    {
+        "auto-const DCE: dead branches dropped after promotion",
+        {
+            /* c/d/w are write-once -> auto-promoted, so the conditions fold and
+               the dead branch is dropped by the resolver's DCE. */
+            "var c = 0; var r = 0;  if (c) { r = 1; } else { r = 2; }",
+            "assert(r == 2);",
+            "var d = 1; var r2 = 0; if (d) { r2 = 1; } else { r2 = 2; }",
+            "assert(r2 == 1);",
+            "var w = 0; var cnt = 0; while (w) { cnt += 1; }",
+            "assert(cnt == 0);",
+        },
+    },
+    {
+        "auto-pure analysis descends into for-loop and try/catch bodies",
+        {
+            "func f() { var s = 0;",
+            "           for (var i = 0; i < 3; i += 1) { s += i; }",
+            "           return s; }",
+            "func g() { try { return 1; } catch (Foo) { return 2; } }",
+            "assert(ispure(f));",
+            "assert(ispure(g));",
+            "assert(f() == 3);",
+            "assert(g() == 1);",
+        },
+    },
+    {
+        "runtime if/else (non-const condition) takes the else branch",
+        {
+            "var c = rand(0, 0);",   /* runtime 0: condition is not folded */
+            "var r = 0;",
+            "if (c) { r = 1; } else { r = 2; }",
+            "assert(r == 2);",
+        },
+    },
+
+    /* ---- exit / exception / exdata / type builtins (types.cpp) ---- */
+    {
+        "exception() / exdata() / type() value forms",
+        {
+            "var e = ex(\"MyErr\", 42);",
+            "assert(exdata(e) == 42);",
+            "assert(type(5) == \"int\");",
+            "assert(type(2.5) == \"float\");",
+            "assert(type(\"s\") == \"str\");",
+            "assert(type([1]) == \"arr\");",
+            "assert(type({1:2}) == \"dict\");",
+        },
+    },
+    { "exit() with no args is rejected",
+      { "exit();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "exit() with a non-integer is a type error",
+      { "exit(\"x\");" }, &typeid(TypeErrorEx) },
+    { "ex() with no args is rejected",
+      { "ex();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "ex() with a non-string name is a type error",
+      { "ex(123);" }, &typeid(TypeErrorEx) },
+    { "ex() with a digit-leading name is an invalid value",
+      { "ex(\"1bad\");" }, &typeid(InvalidValueEx) },
+    { "ex() with a non-identifier name is an invalid value",
+      { "ex(\"a-b\");" }, &typeid(InvalidValueEx) },
+    { "exdata() of a non-exception is a type error",
+      { "exdata(5);" }, &typeid(TypeErrorEx) },
+    { "exdata() with no args is rejected",
+      { "exdata();" }, &typeid(InvalidNumberOfArgsEx) },
+
     /* ---- evaluator (eval.cpp) ---- */
     {
         "string escape sequences (\\t \\v \\a \\b and unknown)",
