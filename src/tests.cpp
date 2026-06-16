@@ -1160,12 +1160,24 @@ static const std::vector<test> tests =
     },
 
     {
-        "Const object result copied to a var is fresh and mutable",
+        "Const-ness propagates: a const slice bound to a var stays read-only",
         {
-            /* The materialized value must hand out a fresh, mutable copy: the
-             * var is writable and the const source is untouched. */
+            /* Binding a const-derived value to a `var` keeps it read-only -
+             * `var` only grants rebindability of the name, not mutability of
+             * the value. clone() is the way to get a mutable copy. */
             "const x = [1,2,3,4];",
             "var z = x[0:3];",
+            "assert(z == [1,2,3]);",
+            "z[0] = 99;",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "clone() of a const slice yields a mutable, independent copy",
+        {
+            "const x = [1,2,3,4];",
+            "var z = clone(x[0:3]);",
             "z[0] = 99;",
             "assert(z == [99,2,3]);",
             "assert(x == [1,2,3,4]);",
@@ -1197,11 +1209,21 @@ static const std::vector<test> tests =
     },
 
     {
-        "Materialized const dict is usable and copies are independent",
+        "Const dict bound to a var stays read-only",
         {
             "const d = {\"a\": 1, \"b\": 2};",
-            "assert(d[\"a\"] == 1);",
             "var e = d;",
+            "assert(e[\"a\"] == 1);",   /* reads are fine */
+            "e[\"a\"] = 9;",            /* writes are not */
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "clone() of a const dict yields a mutable, independent copy",
+        {
+            "const d = {\"a\": 1, \"b\": 2};",
+            "var e = clone(d);",
             "e[\"a\"] = 9;",
             "assert(e[\"a\"] == 9);",
             "assert(d[\"a\"] == 1);",

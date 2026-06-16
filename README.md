@@ -328,8 +328,22 @@ Trying to *mutate* the value of a const (rather than rebind a name to a new
 value) is an error: `p[0] = x`, `p.k = x` and inserting a missing dict key fail
 with `NotLValueEx`, while `p += [...]`, `append`/`insert`/`pop`/`erase` fail
 with `CannotChangeConstEx`. `sort()` of a const returns a sorted *copy* and
-leaves the original alone. To get a mutable copy, use `clone()` (or assign into
-a fresh `var`).
+leaves the original alone.
+
+Read-only-ness **propagates**: a value *derived* from a const — a slice
+`y[1:3]`, a sub-object, a function result that returns part of a const — is
+itself read-only, and binding it to a `var` keeps it read-only. `var` only makes
+the *name* rebindable; it does not make a const value mutable:
+
+```C#
+const y = [1, 2, 3];
+var s = y[1:3];   # s is a read-only slice of a const
+s[0] = 9;         # error: NotLValueEx
+s = [9, 9];       # OK: rebinding the name s is allowed
+```
+
+To get a mutable copy you must ask for one explicitly with `clone(x)`. A *fresh*
+literal is not derived from a const, so `var a = [1, 2, 3]` is mutable as usual.
 
 #### Automatic const promotion
 
