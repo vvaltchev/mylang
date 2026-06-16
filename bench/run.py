@@ -18,6 +18,8 @@
 #   python3 bench/run.py --filter slice  # only benchmarks whose name matches
 #   python3 bench/run.py --mylang ./build/mylang
 #   python3 bench/run.py --csv out.csv   # also write the table as CSV
+#   python3 bench/run.py -s              # also re-dump sorted by ratio (wins
+#                                        # first, regressions last)
 
 import argparse
 import os
@@ -94,6 +96,13 @@ def colorize_ratio(ratio, text):
     if not USE_COLOR or ratio is None:
         return text
     return "\x1b[38;5;%dm%s\x1b[0m" % (ratio_xterm_color(ratio), text)
+
+
+def render_row(name, my_s, py_s, ratio_s, status, ratio):
+    """One formatted table line; the ratio field is colored on a TTY. Used for
+    both the streaming run and the --sorted re-dump, so they stay identical."""
+    ratio_field = colorize_ratio(ratio, "%8s" % ratio_s)
+    return "%-24s %10s %10s %s  %s" % (name, my_s, py_s, ratio_field, status)
 
 
 def find_mylang(explicit):
@@ -193,6 +202,10 @@ def main():
                     help="per-run timeout in seconds (default 120)")
     ap.add_argument("--csv", default="",
                     help="also write the results table to this CSV file")
+    ap.add_argument("-s", "--sorted", action="store_true",
+                    help="after the run, re-dump the table sorted by my/py "
+                         "ratio ascending (biggest win first, worst regression "
+                         "last)")
     args = ap.parse_args()
 
     mylang = find_mylang(args.mylang)
@@ -260,12 +273,11 @@ def main():
         else:
             ratio_s = "-"
 
-        # Pad to width first, then color, so the ANSI escapes don't throw off
-        # column alignment. CSV/rows keep the plain string.
-        ratio_field = colorize_ratio(ratio, "%8s" % ratio_s)
-        print("%-24s %10s %10s %s  %s" %
-              (name, my_s, py_s, ratio_field, status))
-        rows.append((name, my_s, py_s, ratio_s, status))
+        # render_row pads to width before coloring, so the ANSI escapes don't
+        # throw off column alignment. We keep the numeric `ratio` in the row so
+        # --sorted can order by it (CSV still uses only the plain fields).
+        print(render_row(name, my_s, py_s, ratio_s, status, ratio))
+        rows.append((name, my_s, py_s, ratio_s, status, ratio))
 
     if ratios:
         prod = 1.0
@@ -281,10 +293,22 @@ def main():
         print("geomean my/py over %d paired benchmarks: %s (%s)"
               % (len(ratios), gm, tail))
 
+    if args.sorted:
+        # Ascending by ratio: biggest win (smallest ratio) first, worst
+        # regression (largest ratio) last. Rows without a ratio (my-only or a
+        # failed run) have nothing to compare, so they trail at the end.
+        ordered = sorted(
+            rows, key=lambda r: (r[5] is None, r[5] if r[5] is not None else 0))
+        print("\nsorted by my/py ratio (biggest win first):")
+        print(hdr)
+        print("-" * len(hdr))
+        for row in ordered:
+            print(render_row(*row))
+
     if args.csv:
         with open(args.csv, "w") as f:
             f.write("benchmark,mylang_s,python_s,my_over_py,status\n")
-            for name, my_s, py_s, ratio_s, status in rows:
+            for name, my_s, py_s, ratio_s, status, _ratio in rows:
                 f.write("%s,%s,%s,%s,%s\n" %
                         (name, my_s, py_s, ratio_s.rstrip("x"),
                          status.replace(",", ";")))
