@@ -4,6 +4,7 @@
 
 #include "defs.h"
 #include "flatval.h"
+#include "intrusiveptr.h"
 #include <vector>
 #include <unordered_set>
 #include <cassert>
@@ -48,7 +49,7 @@ public:
 private:
     static constexpr size_type all_slices = static_cast<size_type>(-1);
 
-    struct SharedObject final {
+    struct SharedObject final : RefCounted {
 
         vec_type vec;
         std::unordered_set<SharedArrayObjTempl *> slices;
@@ -68,7 +69,7 @@ private:
         { }
     };
 
-    shared_ptr<SharedObject> shobj;
+    intrusive_ptr<SharedObject> shobj;
 
 public:
     size_type off;
@@ -80,7 +81,7 @@ public:
     SharedArrayObjTempl(const vec_type &arr) = delete;
 
     SharedArrayObjTempl(vec_type &&arr)
-        : shobj(make_shared<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(move(arr)))
         , off(0)
         , len(shobj->vec.size())
         , slice(false)

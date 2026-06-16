@@ -761,15 +761,26 @@ non-tail calls or reassigned/global args would need an args-as-locals form.
 ## Copy-on-write containers
 
 Strings, arrays, and dicts are reference-counted with value semantics preserved
-via COW:
+via COW. The handle is **`intrusive_ptr<T>`** (`intrusiveptr.h`), not
+`std::shared_ptr`: a single-threaded interpreter doesn't need shared_ptr's
+two-word layout (object + separate control block) or its *atomic* refcount ops,
+so the count lives in the pointee (which inherits `RefCounted`) and retain/
+release are plain `++`/`--`. This is what keeps `SharedArrayObj`/`SharedStr` at
+24 bytes (so `EvalValue` is 32 and the array element `LValue` is 48) and removes
+the atomic-refcount churn from copy-heavy array/dict code. **Gotcha:**
+`RefCounted`'s copy/move ctors reset the count to 0 — a cloned object owns a
+fresh count, never the original's (else it would never be freed). `use_count()`
+keeps shared_ptr's meaning (handles sharing the pointee), so the `> 1` COW tests
+are unchanged.
 
-- **`SharedStr`** (`sharedstr.h`): immutable `shared_ptr<string>` + `off`/`len`
-  slice view. Slices are
+- **`SharedStr`** (`sharedstr.h`): immutable `intrusive_ptr<StrObj{string}>` +
+  `off`/`len` slice view (StrObj just wraps the string so it can carry the
+  count). Slices are
   cheap views; strings are never mutated in place. Copies are forbidden
   (`= delete`), only moves —
   enforcing the no-accidental-copy intent.
 - **`SharedArrayObj`** (`sharedarray.h`):
-  `shared_ptr<SharedObject{ vec, set<live slices> }>` +
+  `intrusive_ptr<SharedObject{ vec, set<live slices> }>` +
   `off`/`len`/`slice`. A slice registers itself in the parent's `slices` set
   (and unregisters on
   move/destroy). Writing through an array-element `LValue`
@@ -785,7 +796,9 @@ via COW:
   it truncates a grown array. `clone_aliased_slices` therefore clones each slice
   while its `slice` flag is still set, so `offset()`/`size()` report the slice
   range.)
-- **`DictObject`** (`shareddict.h`) is analogous (`shared_ptr` wrapper).
+- **`DictObject`** (`shareddict.h`): the value handle is
+  `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map lives
+  inside it.
 - **Deep-const read-only flag.** Both `SharedObject` (arrays) and `DictObject`
   carry a `readonly` bool (`is_readonly()`/`set_readonly()`). It backs `const`
   values: `make_const_clone()` (`eval.cpp`) sets it on every array/dict in the

@@ -53,7 +53,7 @@ template <> struct TypeToEnum<SharedStr> { enum { val = Type::t_str }; };
 template <> struct TypeToEnum<shared_ptr<FuncObject>> { enum { val = Type::t_func }; };
 template <> struct TypeToEnum<SharedArrayObj> { enum { val = Type::t_arr }; };
 template <> struct TypeToEnum<shared_ptr<ExceptionObject>> { enum { val = Type::t_ex }; };
-template <> struct TypeToEnum<shared_ptr<DictObject>> { enum { val = Type::t_dict }; };
+template <> struct TypeToEnum<intrusive_ptr<DictObject>> { enum { val = Type::t_dict }; };
 
 /*
  * Binary-operation dispatch with int -> float promotion.
@@ -93,7 +93,7 @@ class EvalValue final {
         FlatVal<shared_ptr<FuncObject>> func;
         FlatVal<SharedArrayObj> arr;
         FlatVal<shared_ptr<ExceptionObject>> ex;
-        FlatVal<shared_ptr<DictObject>> dict;
+        FlatVal<intrusive_ptr<DictObject>> dict;
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }
