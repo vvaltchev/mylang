@@ -2073,6 +2073,48 @@ static const std::vector<test> tests =
             "assert(hit == 2);",
         },
     },
+    {
+        /* Each must be triggered at RUNTIME (rand keeps the operand unfolded),
+           else it would throw at parse and escape the try. */
+        "clone/rethrow for the catchable runtime exceptions",
+        {
+            "var n = 0; var z = rand(0, 0);",
+            "try { try { var q = 5 / z; }",
+            "  catch (DivisionByZeroEx as e) { n += 1; rethrow; } }",
+            "catch (DivisionByZeroEx) { n += 1; }",
+            "assert(n == 2);",
+
+            "n = 0; var a = [1, 2]; var i = 10;",
+            "try { try { var q = a[i]; }",
+            "  catch (OutOfBoundsEx as e) { n += 1; rethrow; } }",
+            "catch (OutOfBoundsEx) { n += 1; }",
+            "assert(n == 2);",
+
+            "n = 0; var s = str(rand(0, 0));",
+            "try { try { var q = 5 + s; }",
+            "  catch (TypeErrorEx as e) { n += 1; rethrow; } }",
+            "catch (TypeErrorEx) { n += 1; }",
+            "assert(n == 2);",
+
+            "n = 0; var f = false;",
+            "try { try { assert(f); }",
+            "  catch (AssertionFailureEx as e) { n += 1; rethrow; } }",
+            "catch (AssertionFailureEx) { n += 1; }",
+            "assert(n == 2);",
+
+            "n = 0;",
+            "try { try { var q = range(0, 5, rand(0, 0)); }",
+            "  catch (InvalidValueEx as e) { n += 1; rethrow; } }",
+            "catch (InvalidValueEx) { n += 1; }",
+            "assert(n == 2);",
+
+            "n = 0;",
+            "try { try { read(\"no_such_file_clone.tmp\"); }",
+            "  catch (CannotOpenFileEx as e) { n += 1; rethrow; } }",
+            "catch (CannotOpenFileEx) { n += 1; }",
+            "assert(n == 2);",
+        },
+    },
 
     /* ---- numeric / math builtins (num.cpp.h) ---- */
     {
