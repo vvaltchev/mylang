@@ -1706,6 +1706,36 @@ static const std::vector<test> tests =
         &typeid(TypeErrorEx),
     },
 
+    /* ---- lexer (lexer.cpp): number / string / comment paths ---- */
+    {
+        "lexer: valid float forms (exponent, leading dot)",
+        {
+            "assert(1.5e3 == 1500.0);",
+            "assert(.5 == 0.5);",
+            "assert(2e2 == 200.0);",
+        },
+    },
+    {
+        "lexer: line comments are skipped",
+        {
+            "# this is a comment",
+            "var x = 1; # trailing comment",
+            "assert(x == 1);",
+        },
+    },
+    { "lexer: malformed float exponent is an invalid token",
+      { "var x = 1e;" }, &typeid(InvalidTokenEx) },
+    { "lexer: a second exponent in a float is an invalid token",
+      { "var x = 1e2e3;" }, &typeid(InvalidTokenEx) },
+    { "lexer: a hex-looking literal is an invalid token",
+      { "var x = 0x;" }, &typeid(InvalidTokenEx) },
+    { "lexer: an unterminated string is an invalid token",
+      { "var x = \"abc;" }, &typeid(InvalidTokenEx) },
+    { "lexer: an unknown character is a syntax error",
+      { "var x = @;" }, &typeid(SyntaxErrorEx) },
+    { "lexer: a malformed number is a syntax error",
+      { "var x = 1.2.3;" }, &typeid(SyntaxErrorEx) },
+
     /* ---- function value type (func.cpp.h) ---- */
     {
         "function value: to_string / equality / truthiness / clone",
@@ -1838,6 +1868,30 @@ static const std::vector<test> tests =
       { "find(5, 1);" }, &typeid(TypeErrorEx) },
     { "hash() with no args is rejected",
       { "hash();" }, &typeid(InvalidNumberOfArgsEx) },
+
+    /* ---- runtime-exception clone()/rethrow() (errors.h) via try/catch ---- */
+    {
+        "NotLValueEx can be caught (as), rethrown, and re-caught",
+        {
+            "var hit = 0;",
+            "try {",
+            "   try { append([1,2], 3); }",
+            "   catch (NotLValueEx as e) { hit += 1; rethrow; }",
+            "} catch (NotLValueEx) { hit += 1; }",
+            "assert(hit == 2);",
+        },
+    },
+    {
+        "NotCallableEx can be caught (as), rethrown, and re-caught",
+        {
+            "var hit = 0;",
+            "try {",
+            "   try { var x = 5; x(); }",
+            "   catch (NotCallableEx as e) { hit += 1; rethrow; }",
+            "} catch (NotCallableEx) { hit += 1; }",
+            "assert(hit == 2);",
+        },
+    },
 
     /* ---- numeric / math builtins (num.cpp.h) ---- */
     {
