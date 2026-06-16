@@ -285,6 +285,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* Generic-container builtins */
     make_builtin("erase", builtin_erase),
     make_builtin("insert", builtin_insert),
+    make_builtin("deepclone", builtin_deepclone), /* deep mutable copy */
 
     /* Numeric builtins */
     make_builtin("rand", builtin_rand),

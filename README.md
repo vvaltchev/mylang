@@ -342,8 +342,13 @@ s[0] = 9;         # error: NotLValueEx
 s = [9, 9];       # OK: rebinding the name s is allowed
 ```
 
-To get a mutable copy you must ask for one explicitly with `clone(x)`. A *fresh*
-literal is not derived from a const, so `var a = [1, 2, 3]` is mutable as usual.
+To get a mutable copy you must ask for one explicitly: `clone(x)` makes a
+**shallow** mutable copy (only the top level is copied; nested objects are
+shared, so nested objects of a const stay read-only), while `deepclone(x)` makes
+a **fully mutable deep copy** that you can change at any depth. A *fresh*
+literal is not derived from a const, so `var a = [1, 2, 3]` is mutable as usual
+(though an element that is itself a const stays read-only — `var a = [y]` with
+`y` const keeps `a[0]` read-only).
 
 #### Automatic const promotion
 
@@ -1034,8 +1039,18 @@ and converted to float, if possible. If the value is already a float, it will be
 returned as-it-is.
 
 #### `clone(obj)`
-Clone the given object. Useful for non-trivial objects as arrays,
-dictionaries and lambda with captures.
+Clone the given object, **shallowly**: a non-trivial object (array, dictionary,
+lambda with captures) gets a fresh top-level copy, but nested objects are
+*shared* with the original. Because a nested object of a `const` is itself
+read-only, `clone(constObj)[k]` can be reassigned but `clone(constObj)[k][...]`
+cannot — use `deepclone()` to mutate at any depth.
+
+#### `deepclone(obj)`
+Like `clone()`, but produces a **fully mutable, deep copy**: every nested array
+and dictionary is copied too, so the result is completely independent of the
+original and writable at any depth. This is the way to obtain a mutable version
+of a `const` (or of any object you want to change deeply without affecting the
+source). Scalars and strings are returned unchanged.
 
 #### `type(value)`
 Return the name of the type of the given value in string-form.

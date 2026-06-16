@@ -174,3 +174,14 @@ public:
  * be shared (it can't be mutated) instead of deep-copied on every evaluation.
  */
 EvalValue make_const_clone(const EvalValue &v);
+
+/*
+ * Mutable copies of an array/dict value (scalars/strings returned as-is):
+ *  - make_mutable_clone: fresh mutable top, but read-only (const-backed)
+ *    sub-objects are shared as-is. Backs the per-eval copy a `var`-bound
+ *    materialized value needs, and keeps clone() shallow w.r.t. consts.
+ *  - make_deep_mutable_clone: every level copied and made mutable (read-only
+ *    dropped) - a fully independent writable value. Backs deepclone().
+ */
+EvalValue make_mutable_clone(const EvalValue &v);
+EvalValue make_deep_mutable_clone(const EvalValue &v);

@@ -184,6 +184,22 @@ EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
     return e.get_type()->clone(e);
 }
 
+/*
+ * deepclone(x): a fully-mutable deep copy - unlike clone(), which copies only
+ * the top level and shares (read-only, for a const) the nested objects. Use it
+ * to get a mutable version of a const you need to mutate at any depth. It is a
+ * runtime (non-const) builtin: it produces a mutable value that must be copied
+ * fresh per evaluation anyway, so folding it would only bloat the tree.
+ */
+EvalValue builtin_deepclone(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    return make_deep_mutable_clone(RValue(arg->eval(ctx)));
+}
+
 EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)

@@ -1357,6 +1357,64 @@ static const std::vector<test> tests =
     },
 
     {
+        "deepclone() of a const yields a fully-mutable deep copy",
+        {
+            "const y = [[1,2],[3,4]];",
+            "var c = deepclone(y);",
+            "c[0][0] = 99;",            /* nested mutation works */
+            "append(c, [5,6]);",
+            "assert(c == [[99,2],[3,4],[5,6]]);",
+            "assert(y == [[1,2],[3,4]]);",  /* original untouched */
+        },
+    },
+
+    {
+        "deepclone() of a const dict is fully mutable and independent",
+        {
+            "const d = {\"a\": [1,2]};",
+            "var e = deepclone(d);",
+            "e[\"a\"][0] = 99;",
+            "assert(e[\"a\"] == [99,2]);",
+            "assert(d[\"a\"] == [1,2]);",
+        },
+    },
+
+    {
+        "clone() is shallow: a nested const stays read-only",
+        {
+            /* clone() copies only the top level; nested objects are shared, and
+             * a shared const stays read-only. Use deepclone() to mutate deeply.
+             */
+            "const y = [[1,2],[3,4]];",
+            "var c = clone(y);",
+            "c[0] = [9,9];",   /* OK: top level is mutable */
+            "c[1][0] = 9;",    /* error: c[1] is a shared const */
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "Const-ness propagates into a fresh literal element",
+        {
+            /* `a` is a fresh, mutable array, but its element is the const `y`,
+             * which stays read-only. */
+            "const y = [1,2];",
+            "var a = [y, 3];",
+            "assert(a[0] == [1,2]);",
+            "a[0][0] = 9;",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "deepclone() of a scalar / string is a no-op",
+        {
+            "assert(deepclone(5) == 5);",
+            "assert(deepclone(\"hi\") == \"hi\");",
+        },
+    },
+
+    {
         "Split string, char by char",
         {
             "assert(split(\"abc\", \"\") == [\"a\",\"b\",\"c\"]);",
