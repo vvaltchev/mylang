@@ -1097,6 +1097,15 @@ Resolver::walk(Construct *c, FuncState *cur)
             b->slot_start = start;
             /* contiguous range: includes nested blocks' slots too */
             b->slot_count = cur->next_slot - start;
+
+            /* Scope-free iff every direct decl got a slot (none stayed in the
+             * map: no capture, no nested-func name, no slot-budget overflow).
+             * Then do_eval needs no EvalContext of its own. */
+            bool all_slotted = true;
+            for (const auto &d : cur->scopes.back().decls)
+                if (d.second < 0) { all_slotted = false; break; }
+            b->scope_free = all_slotted;
+
             cur->scopes.pop_back();
         }
 

@@ -636,8 +636,13 @@ non-tail calls or reassigned/global args would need an args-as-locals form.
   `map<const UniqueId *, LValue>` + `parent` pointer
   + `const_ctx`/`func_ctx` flags. The root context auto-loads `const_builtins`
     (always) and `builtins`
-  (only when not a const ctx). Each `Block` evaluates in a fresh child
-  `EvalContext`.
+  (only when not a const ctx). A `Block` evaluates in a fresh child
+  `EvalContext` — **except** a `scope_free` block (the resolver sets the flag
+  when every declaration in it is a frame slot: no capture, nested-func name, or
+  slot-budget overflow), which never touches the map and so runs its statements
+  directly in the parent context, skipping the per-entry `EvalContext`
+  build/teardown (a measurable win for loop/if/function bodies, re-entered every
+  iteration/call). The root block always builds its context.
 - **Slot resolution (`resolver.cpp`) bypasses the map for resolved locals.**
   The post-parse `resolve_names()` pass assigns slot indices so an
   `Identifier::do_eval` for a resolved local is an O(1) read of

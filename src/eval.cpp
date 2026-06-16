@@ -1174,8 +1174,45 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
     throw *e.get<shared_ptr<ExceptionObject>>().get();
 }
 
+/* Live-bit mask for a block's contiguous slot range [start, start+count). */
+static inline uint64_t
+block_slot_mask(int slot_start, int slot_count)
+{
+    if (slot_count >= 64)
+        return ~static_cast<uint64_t>(0);
+    return ((static_cast<uint64_t>(1) << slot_count) - 1) << slot_start;
+}
+
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
+    /*
+     * Scope-free fast path: this block declares only frame slots, so it never
+     * uses the EvalContext map. Run its statements directly in the parent
+     * context, skipping the per-entry EvalContext construction/destruction.
+     * Only the slot range still needs clearing on entry (re-entry semantics).
+     * The root block (ctx == nullptr) always takes the full path below, since
+     * it owns the program's context and frame.
+     */
+    if (scope_free && ctx) {
+
+        if (ctx->frame && slot_count)
+            ctx->frame->live &= ~block_slot_mask(slot_start, slot_count);
+
+        for (const auto &e : elems) {
+
+            EvalValue &&tmp = e->eval(ctx);
+
+            if (tmp.is<UndefinedId>())
+                throw UndefinedVariableEx(
+                    tmp.get<UndefinedId>().id, e->start, e->end);
+
+            if (ctx->flow->type != FlowState::none)
+                break;
+        }
+
+        return none;
+    }
+
     EvalContext curr(ctx, ctx ? ctx->const_ctx : false);
 
     /*
@@ -1204,11 +1241,7 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
      */
     if (curr.frame && slot_count) {
 
-        const uint64_t range = slot_count >= 64
-            ? ~static_cast<uint64_t>(0)
-            : (((static_cast<uint64_t>(1) << slot_count) - 1) << slot_start);
-
-        curr.frame->live &= ~range;
+        curr.frame->live &= ~block_slot_mask(slot_start, slot_count);
     }
 
     for (const auto &e: elems) {
