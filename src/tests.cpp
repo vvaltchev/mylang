@@ -1736,6 +1736,86 @@ static const std::vector<test> tests =
     { "lexer: a malformed number is a syntax error",
       { "var x = 1.2.3;" }, &typeid(SyntaxErrorEx) },
 
+    /* ---- evaluator (eval.cpp) ---- */
+    {
+        "string escape sequences (\\t \\v \\a \\b and unknown)",
+        {
+            "var s = \"\\t\\v\\a\\b\";",
+            "assert(len(s) == 4);",
+            "assert(s[0] == \"\\t\");",
+            "var u = \"\\q\";",          /* unknown escape keeps both chars */
+            "assert(len(u) == 2);",
+        },
+    },
+    {
+        "runtime recursion (non-folded function calls)",
+        {
+            "func fib(n) {",
+            "   if (n < 2) { return n; }",
+            "   return fib(n - 1) + fib(n - 2);",
+            "}",
+            "var k = 10;",            /* runtime arg, so fib() isn't folded */
+            "assert(fib(k) == 55);",
+        },
+    },
+    {
+        "arrow-body function at runtime",
+        {
+            "func sq(a) => a * a;",
+            "var k = 7;",
+            "assert(sq(k) == 49);",
+        },
+    },
+    {
+        "closure capturing state at runtime",
+        {
+            "func make_counter() {",
+            "   var n = 0;",
+            "   return func [n]() { n += 1; return n; };",
+            "}",
+            "var c = make_counter();",
+            "assert(c() == 1);",
+            "assert(c() == 2);",
+        },
+    },
+    { "calling a function with too many args is rejected",
+      { "func f(a) { return a; } var k=1; f(k, 2);" },
+      &typeid(InvalidNumberOfArgsEx) },
+    { "calling a function with too few args is rejected",
+      { "func f(a, b) { return a; } var k=1; f(k);" },
+      &typeid(InvalidNumberOfArgsEx) },
+    { "assigning to an undefined variable is an error",
+      { "nonexistent = 5;" }, &typeid(UndefinedVariableEx) },
+    { "foreach over a non-iterable is a type error",
+      { "var n = 5; foreach (var x in n) { }" }, &typeid(TypeErrorEx) },
+    { "member access on a non-dict is a type error",
+      { "var x = 5; var y = x.foo;" }, &typeid(TypeErrorEx) },
+    { "duplicate declaration in the same block is rejected",
+      { "var x = 1; var x = 2;" }, &typeid(AlreadyDefinedEx) },
+    {
+        "if/else with the else branch taken at runtime",
+        {
+            "var c = 0; var r = 0;",
+            "if (c) { r = 1; } else { r = 2; }",
+            "assert(r == 2);",
+        },
+    },
+    {
+        "block scoping: an inner var shadows an outer one",
+        {
+            "var x = 1;",
+            "{ var x = 2; assert(x == 2); }",
+            "assert(x == 1);",
+        },
+    },
+    {
+        "multiple-assignment spreads a scalar to each target",
+        {
+            "var a, b, c = 7;",
+            "assert(a == 7 && b == 7 && c == 7);",
+        },
+    },
+
     /* ---- parser (parser.cpp) syntax-error paths ---- */
     { "binary + with no rhs",  { "var x = 1 +;" }, &typeid(SyntaxErrorEx) },
     { "binary * with no rhs",  { "var x = 1 *;" }, &typeid(SyntaxErrorEx) },
