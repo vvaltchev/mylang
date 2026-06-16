@@ -1,5 +1,5 @@
 # READ-ONLY list slicing in a loop. Python copies the slice eagerly (O(k));
-# MyLang takes an O(1) view. Same result, very different cost - see the .ml file.
+# MyLang takes an O(1) view. Same result, very different cost - see the .my file.
 import sys
 scale = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 

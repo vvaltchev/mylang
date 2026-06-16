@@ -44,3 +44,7 @@ build
 
 # Machine-specific benchmark output (regenerate with: bench/run.py --csv)
 bench/results.csv
+
+# Python bytecode cache (e.g. from importing the bench runner)
+__pycache__/
+*.pyc

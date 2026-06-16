@@ -25,13 +25,13 @@ table.
 
 ```
 bench/
-  ml/NN_name.ml     # the MyLang benchmark
+  my/NN_name.my     # the MyLang benchmark
   py/NN_name.py     # the equivalent Python benchmark (omitted if MyLang-only)
   run.py            # the runner / comparison harness
   results.csv       # last recorded run (regenerate with --csv)
 ```
 
-Each `ml`/`py` pair implements the *same* algorithm on the *same* data and
+Each `my`/`py` pair implements the *same* algorithm on the *same* data and
 prints a `result:` line so the harness can confirm the two agree.
 
 ## Running
@@ -60,10 +60,15 @@ python3 bench/run.py --repeat 5 --csv bench/results.csv
 Every script takes an optional integer **scale** argument (the harness passes
 it through) that multiplies the base workload, so you can dial total runtime up
 or down without editing anything. The harness reports the **best** wall-clock
-time of `--repeat` runs for each side and the `ml/py` ratio, and verifies the
+time of `--repeat` runs for each side and the `my/py` ratio, and verifies the
 two implementations printed matching results (numeric tokens are compared with
 a tolerance so cosmetic float-formatting differences don't register as
 mismatches).
+
+On a terminal, the `my/py` ratio is colored on a 256-color gradient — brightest
+green for the biggest wins (ratio ≤ 0.35) fading to dark green near break-even,
+then dark red just past 1.0 brightening to red for the worst regressions (ratio
+≥ 3.0). Output that isn't a TTY (a pipe, or `--csv`) stays plain.
 
 ## Are MyLang and Python semantically the same? (read this first)
 
@@ -86,7 +91,7 @@ Python slices semantically — they just don't copy eagerly.**
   `clone_internal_vec`) so the write never bleeds across the two. **The net
   effect a script can observe is identical to Python's** — writing to a slice
   never changes the parent and vice-versa (verified in
-  `verify_semantics.ml`). Only the performance differs:
+  `verify_semantics.my`). Only the performance differs:
   - `15_array_slice_readonly` — take a slice and only read it. MyLang does O(1)
     work, Python pays the full O(k) copy every time. **MyLang wins big here**,
     and it's not because it's a faster interpreter — it's doing asymptotically
@@ -163,11 +168,11 @@ both languages on the inputs used. These are straight speed comparisons.
 
 ### MyLang features with no Python equivalent (Python side intentionally omitted)
 
-- **Parse-time const evaluation** (`48_const_fold.ml`). `const` values and
+- **Parse-time const evaluation** (`48_const_fold.my`). `const` values and
   `pure func` calls over const data are evaluated *by the parser* and inlined as
   literals into the runtime AST — the language's defining feature. There is no
   Python counterpart, so per the brief there is no `48_const_fold.py`. Run
-  `./build/mylang -s bench/ml/48_const_fold.ml` to see the heavy computation
+  `./build/mylang -s bench/my/48_const_fold.my` to see the heavy computation
   replaced by a single integer literal in the tree.
 
 - **Auto-const folding & dead-code elimination** (`49_autoconst_fold`,
@@ -191,10 +196,10 @@ since the goal is to measure MyLang's constructs, not Python's.)
 
 Measured on this machine with an **`-O3` release build** (`build_rel/mylang`),
 `--repeat 3` (best of 3), `--scale 1`, CPython 3.14. Your absolute numbers will
-differ; the **ratio** column is the portable takeaway. `ml/py` is MyLang time ÷
+differ; the **ratio** column is the portable takeaway. `my/py` is MyLang time ÷
 Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 
-| benchmark | mylang (s) | python (s) | ml/py | note |
+| benchmark | mylang (s) | python (s) | my/py | note |
 |-----------|-----------:|-----------:|------:|------|
 | 01_while_loop | 0.183 | 0.200 | 0.92× | MyLang faster |
 | 02_for_loop | 0.147 | 0.136 | 1.08× | |
@@ -279,7 +284,7 @@ and within 2× on the large majority. The lone real blow-out is per-iteration
 
 ## Adding a benchmark
 
-1. Drop `ml/NN_name.ml` and (if Python has the feature) `py/NN_name.py`. Read
+1. Drop `my/NN_name.my` and (if Python has the feature) `py/NN_name.py`. Read
    `scale` from `argv[0]` (MyLang) / `sys.argv[1]` (Python), default 1.
 2. Make both print a single `result:` line with an order-independent,
    within-64-bit checksum so the harness can confirm they agree.
