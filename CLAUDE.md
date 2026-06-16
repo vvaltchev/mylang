@@ -148,9 +148,8 @@ slices act like independent copies (MyLang via lazy copy-on-write, so read-only
 slicing is far cheaper),
 `clone()` makes a shallow copy and `deepclone()` a deep one — with the
 divergences (64-bit wrapping vs bignum,
-`long double` vs double,
 truncating vs flooring division, unordered vs insertion-ordered dicts)
-enumerated there.
+enumerated there. (Floats match: both are 64-bit IEEE `double`.)
 `bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
@@ -982,10 +981,13 @@ omitting it is a compile error.
   overflow wraps — and
   is *relied upon*; don't "fix" wrap-dependent arithmetic).
 - Every file starts with `/* SPDX-License-Identifier: BSD-2-Clause */`.
-- Core typedefs (`defs.h`): `int_type = intptr_t`, `float_type = long double`
-  (printf with `%Lf` — the
-  comment warns to update format strings if you change it),
-  `size_type = uint32_t` (`size_t` on MSVC).
+- Core typedefs (`defs.h`): `int_type = intptr_t`, `float_type = double`
+  (printf/snprintf with `%f`/`%.*f`; the comment warns to update the format
+  strings and math builtins if you change it). `double` (not `long double`)
+  keeps `EvalValue` small — long double's 16-byte alignment padded it from 40
+  to 48 bytes, inflating array memory traffic and every value copy — matches
+  Python's float, and uses the faster double libm. `size_type = uint32_t`
+  (`size_t` on MSVC).
 - No third-party dependencies, ever — that's a hard design constraint of the
   project, including for the
   test harness. Don't introduce one.

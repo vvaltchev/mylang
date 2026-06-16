@@ -144,11 +144,12 @@ both languages on the inputs used. These are straight speed comparisons.
   benchmarks use `//` and keep operands ≥ 0. (`-7/3` is `-2` in MyLang but
   `-7//3` is `-3` in Python — avoided on purpose.)
 
-- **Float width.** MyLang `float` is C `long double` (80-bit extended on x86);
-  Python `float` is IEEE-754 double. Results of `04_float_arith`,
-  `05_mixed_arith`, and `40_math_builtins` therefore differ in the low digits.
-  This is expected and the harness's tolerance absorbs it; the *work* is
-  comparable.
+- **Float width.** MyLang `float` and Python `float` are both 64-bit IEEE-754
+  `double`, so float results now match exactly (no low-digit divergence). One
+  formatting caveat remains: MyLang's default `str(x)` of a float uses C
+  `%f`-style fixed notation (e.g. `-249999750000.000000`) where Python prints
+  the shortest round-trippable form (`-249999750000.0`), so the harness
+  normalizes float text before comparing.
 
 - **`range()`.** MyLang `range(n)` eagerly builds a full array (like Python 2).
   Idiomatic Python 3 `range` is a lazy generator. To compare the *same work*,
@@ -231,7 +232,7 @@ Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 | 01_while_loop | 0.183 | 0.200 | 0.92× | MyLang faster |
 | 02_for_loop | 0.147 | 0.136 | 1.08× | |
 | 03_int_arith | 0.180 | 0.150 | 1.20× | |
-| 04_float_arith | 0.148 | 0.078 | 1.90× | long double vs double |
+| 04_float_arith | 0.148 | 0.078 | 1.90× | interpreter overhead |
 | 05_mixed_arith | 0.148 | 0.093 | 1.60× | int→float promotion |
 | 06_if_branch | 0.194 | 0.099 | 1.96× | |
 | 07_nested_loops | 0.159 | 0.127 | 1.25× | |
@@ -267,7 +268,7 @@ Python time, so higher = MyLang relatively slower and **< 1 = MyLang faster**.
 | 37_range_builtin | 0.118 | 0.089 | 1.32× | eager array both sides |
 | 38_min_max | 0.331 | 0.324 | 1.02× | |
 | **39_find_builtin** | 0.059 | 0.113 | **0.52×** | MyLang faster |
-| 40_math_builtins | 0.179 | 0.088 | 2.04× | long double vs double |
+| 40_math_builtins | 0.179 | 0.088 | 2.04× | (stale: now faster, double libm) |
 | 41_str_int_conv | 0.104 | 0.066 | 1.57× | |
 | 42_exceptions | 1.468 | 0.065 | **22.5×** | genuine throw/catch per iteration |
 | 43_sieve | 0.420 | 0.101 | 4.17× | |

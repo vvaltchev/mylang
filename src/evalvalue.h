@@ -419,6 +419,20 @@ num_bin_op(EvalValue &a, const EvalValue &b, NumBinOp op)
 class LValue final {
 
     EvalValue val;
+
+public:
+
+    /* Used only by TypeArr::subscript() */
+    LValue *container;
+    size_type container_idx;
+
+private:
+    /*
+     * Declared AFTER container_idx so this bool packs into the value's tail
+     * padding, instead of sitting between `val` and `container` and forcing the
+     * pointer to a fresh 8-byte boundary (7 bytes wasted). Read via
+     * is_const_var().
+     */
     bool is_const;
 
     LValue clone();
@@ -431,29 +445,25 @@ class LValue final {
 
 public:
 
-    /* Used only by TypeArr::subscript() */
-    LValue *container;
-    size_type container_idx;
-
     /*
      * Default: an unbound `none` slot. Needed so Frame (eval.h) can hold an
      * inline array of slots; the value is always `none` here, so type_checks()
      * would trivially pass and is skipped to keep this cheap (runs per slot).
      */
-    LValue() : val(), is_const(false), container(nullptr) { }
+    LValue() : val(), container(nullptr), is_const(false) { }
 
     LValue(const EvalValue &val, bool is_const)
         : val(val)
-        , is_const(is_const)
         , container(nullptr)
+        , is_const(is_const)
     {
         type_checks();
     }
 
     LValue(EvalValue &&val, bool is_const)
         : val(move(val))
-        , is_const(is_const)
         , container(nullptr)
+        , is_const(is_const)
     {
         type_checks();
     }

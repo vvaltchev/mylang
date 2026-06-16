@@ -80,7 +80,7 @@ void TypeFloat::mod(EvalValue &a, const EvalValue &b)
     if (std::fpclassify(rhs) == FP_ZERO)
         throw DivisionByZeroEx();
 
-    a = fmodl(a.get<float_type>(), rhs);
+    a = std::fmod(a.get<float_type>(), rhs);
 }
 
 void TypeFloat::lt(EvalValue &a, const EvalValue &b)
@@ -163,7 +163,7 @@ size_t TypeFloat::hash(const EvalValue &a)
      * representable in floating point), so [int_min, -int_min) is exactly
      * the set of integral floats that fit in int_type.
      */
-    if (std::isfinite(v) && v == truncl(v) && v >= int_min && v < -int_min)
+    if (std::isfinite(v) && v == std::trunc(v) && v >= int_min && v < -int_min)
         return std::hash<int_type>()(static_cast<int_type>(v));
 
     return std::hash<float_type>()(v);

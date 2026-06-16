@@ -82,7 +82,7 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
 
         try {
 
-            return stold(string(val.get<SharedStr>().get_view()));
+            return stod(string(val.get<SharedStr>().get_view()));
 
         } catch (...) {
 
@@ -110,7 +110,7 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
 
     } else if (e.is<float_type>()) {
 
-        return fabsl(e.get<float_type>());
+        return std::fabs(e.get<float_type>());
 
     } else {
 
@@ -236,9 +236,12 @@ float_func(EvalContext *ctx, ExprList *exprList, funcT f)
         assert(0);
 }
 
+/* The std::<name> overload for float_type (double), selected by an explicit
+ * function-pointer cast (the name is overloaded for float/double/long dbl). */
 #define INST_FLOAT_BUILTIN_1(name)                                      \
     EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList) {    \
-        return float_func<1>(ctx, exprList, &name##l);                  \
+        return float_func<1>(ctx, exprList,                            \
+            static_cast<float_type (*)(float_type)>(std::name));        \
     }
 
 #define INST_FLOAT_BUILTIN_1_ex(name, funcT, funcName)                  \
@@ -248,7 +251,8 @@ float_func(EvalContext *ctx, ExprList *exprList, funcT f)
 
 #define INST_FLOAT_BUILTIN_2(name)                                      \
     EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList) {    \
-        return float_func<2>(ctx, exprList, &name##l);                  \
+        return float_func<2>(ctx, exprList,                            \
+            static_cast<float_type (*)(float_type, float_type)>(std::name)); \
     }
 
 INST_FLOAT_BUILTIN_1(exp);
@@ -291,7 +295,7 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
 
     if (exprList->elems.size() == 1) {
 
-        return roundl(x);
+        return std::round(x);
 
     } else {
 
@@ -307,11 +311,11 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
             );
         }
 
-        const float_type base10exp = powl(
+        const float_type base10exp = std::pow(
             10.0,
             static_cast<float_type>(v1.get<int_type>())
         );
-        return roundl(x * base10exp) / base10exp;
+        return std::round(x * base10exp) / base10exp;
     }
 }
 
