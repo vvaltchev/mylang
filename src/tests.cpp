@@ -1208,6 +1208,132 @@ static const std::vector<test> tests =
         },
     },
 
+    /* Deep-const read-only: a const array/dict cannot be mutated even when
+     * aliased through a non-const function parameter. */
+    {
+        "Const array: element write through a param is rejected",
+        {
+            "func g(p) { p[0] = 9; }",
+            "const y = [1,2,3];",
+            "g(y);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "Const array: += through a param is rejected",
+        {
+            "func g(p) { p += [4]; }",
+            "const y = [1,2,3];",
+            "g(y);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Const array: append through a param is rejected",
+        {
+            "func g(p) { append(p, 4); }",
+            "const y = [1,2,3];",
+            "g(y);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Const array: nested element write through a param is rejected",
+        {
+            "func g(p) { p[0][0] = 9; }",
+            "const y = [[1,2],[3,4]];",
+            "g(y);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "Const dict: element write through a param is rejected",
+        {
+            "func g(p) { p[\"a\"] = 9; }",
+            "const d = {\"a\": 1};",
+            "g(d);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "Const dict: member write through a param is rejected",
+        {
+            "func g(p) { p.a = 9; }",
+            "const d = {\"a\": 1};",
+            "g(d);",
+        },
+        &typeid(NotLValueEx),
+    },
+
+    {
+        "Const dict: erase through a param is rejected",
+        {
+            "func g(p) { erase(p, \"a\"); }",
+            "const d = {\"a\": 1, \"b\": 2};",
+            "g(d);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+
+    {
+        "Const param is rebindable, only mutation is rejected",
+        {
+            /* g rebinds its own param to a fresh array and mutates that; the
+             * const argument is left untouched. */
+            "func g(p) { p = [9,9]; p[0] = 1; return p; }",
+            "const y = [1,2,3];",
+            "assert(g(y) == [1,9]);",
+            "assert(y == [1,2,3]);",
+        },
+    },
+
+    {
+        "clone() of a const yields a mutable, independent copy",
+        {
+            "const y = [1,2,3];",
+            "var z = clone(y);",
+            "z[0] = 9;",
+            "append(z, 4);",
+            "assert(z == [9,2,3,4]);",
+            "assert(y == [1,2,3]);",
+        },
+    },
+
+    {
+        "Reading a const through a function works",
+        {
+            "func sumit(p) { var t = 0; foreach (var e in p) { t += e; }",
+            "                return t; }",
+            "const y = [1,2,3];",
+            "assert(sumit(y) == 6);",
+        },
+    },
+
+    {
+        "sort() of a const returns a sorted copy, original untouched",
+        {
+            "func g(p) { return sort(p); }",
+            "const y = [3,1,2];",
+            "assert(g(y) == [1,2,3]);",
+            "assert(y == [3,1,2]);",
+        },
+    },
+
+    {
+        "sum() does not mutate its argument",
+        {
+            "var arr = [[1,2],[3,4]];",
+            "var s = sum(arr);",
+            "assert(s == [1,2,3,4]);",
+            "assert(arr == [[1,2],[3,4]]);",
+        },
+    },
+
     {
         "Split string, char by char",
         {

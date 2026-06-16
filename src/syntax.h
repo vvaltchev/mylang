@@ -266,12 +266,23 @@ class LiteralObj final: public Construct {
 
     EvalValue value;
 
+    /*
+     * True when this value materializes a `const`-decl target: do_eval then
+     * hands out a deep read-only copy (see make_const_clone in eval.cpp).
+     * False for a `var` target / read-only consumer: a fresh mutable copy.
+     */
+    bool immutable;
+
 public:
 
-    LiteralObj(const EvalValue &v)
-        : Construct("LiteralObj", true), value(v) { }
-    LiteralObj(EvalValue &&v)
-        : Construct("LiteralObj", true), value(move(v)) { }
+    LiteralObj(const EvalValue &v, bool immutable = false)
+        : Construct("LiteralObj", true)
+        , value(v)
+        , immutable(immutable) { }
+    LiteralObj(EvalValue &&v, bool immutable = false)
+        : Construct("LiteralObj", true)
+        , value(move(v))
+        , immutable(immutable) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;

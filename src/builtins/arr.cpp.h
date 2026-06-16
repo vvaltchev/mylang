@@ -62,6 +62,9 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
 
     SharedArrayObj &arr = lval->getval<SharedArrayObj>();
 
+    if (arr.is_readonly())
+        throw CannotChangeConstEx(arg0->start, arg0->end);
+
     if (arr.is_slice())
         arr.clone_internal_vec();
 
@@ -89,6 +92,10 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
         throw CannotChangeConstEx(arg->start, arg->end);
 
     SharedArrayObj &arr = lval->getval<SharedArrayObj>();
+
+    if (arr.is_readonly())
+        throw CannotChangeConstEx(arg->start, arg->end);
+
     const ArrayConstView &view = arr.get_view();
 
     if (!view.size())
@@ -296,7 +303,14 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
-    if (val0_lval.is<LValue *>()) {
+    /*
+     * Sorting a `const` (a read-only value, or a const-declared variable)
+     * sorts a fresh copy and returns it, leaving the original untouched -
+     * rather than mutating it in place. clone() yields a mutable copy.
+     */
+    if (val0.get<SharedArrayObj>().is_readonly()) {
+        val0 = val0.clone();
+    } else if (val0_lval.is<LValue *>()) {
         if (val0_lval.get<LValue *>()->is_const_var())
             val0 = val0.clone();
     }
@@ -419,7 +433,13 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
 
     if (exprList->elems.size() == 1) {
 
-        EvalValue val = view[0].get();
+        /*
+         * Seed the accumulator with a *copy* of the first element: num_bin_op
+         * with Type::add mutates the accumulator in place (array `+=` appends
+         * to it), so aliasing view[0] would mutate the input array - and would
+         * be rejected outright when the input is a read-only `const`.
+         */
+        EvalValue val = view[0].get().clone();
 
         for (size_type i = 1; i < view.size(); i++) {
             num_bin_op(val, view[i].get(), &Type::add);

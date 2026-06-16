@@ -84,7 +84,8 @@ pAcceptForStmt(ParseContext &c,
 bool
 MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
-                          bool process_arrays = false);
+                          bool process_arrays = false,
+                          bool immutable = false);
 
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
@@ -364,7 +365,8 @@ pAcceptCallExpr(ParseContext &c,
             MakeConstructFromConstVal(
                 expr->eval(c.const_ctx),
                 ret,
-                fl & pFlags::pInConstDecl
+                fl & pFlags::pInConstDecl,
+                (fl & pFlags::pInConstDecl) != 0
             );
         }
 
@@ -439,8 +441,14 @@ pAcceptSubscript(ParseContext &c,
                 unique_ptr<Construct> const_construct;
                 const EvalValue &v = RValue(ret->eval(c.const_ctx));
 
-                if (MakeConstructFromConstVal(v, const_construct, true))
+                if (MakeConstructFromConstVal(
+                        v,
+                        const_construct,
+                        true,
+                        (fl & pFlags::pInConstDecl) != 0))
+                {
                     ret = move(const_construct);
+                }
             }
         }
 
@@ -918,7 +926,8 @@ pExpr14(ParseContext &c, unsigned fl)
         MakeConstructFromConstVal(
             RValue(ret->rvalue->eval(c.const_ctx)),
             ret->rvalue,
-            true
+            true,
+            (fl & pFlags::pInConstDecl) != 0
         );
     }
 
@@ -1334,7 +1343,8 @@ pAcceptFuncDecl(ParseContext &c,
 bool
 MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
-                          bool process_arrays)
+                          bool process_arrays,
+                          bool immutable)
 {
     if (v.is<int_type>()) {
         out = make_unique<LiteralInt>(v.get<int_type>());
@@ -1364,9 +1374,10 @@ MakeConstructFromConstVal(const EvalValue &v,
              * Materialize the const array/dict as ONE node holding the value,
              * not one Construct per element (which exploded the tree for large
              * results). clone() makes it standalone, so a small slice of a huge
-             * const array doesn't pin the huge buffer.
+             * const array doesn't pin the huge buffer. `immutable` (set for a
+             * const-decl target) makes do_eval hand out a deep read-only value.
              */
-            out = make_unique<LiteralObj>(v.clone());
+            out = make_unique<LiteralObj>(v.clone(), immutable);
             return true;
         }
     }

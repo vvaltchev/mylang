@@ -53,6 +53,15 @@ private:
         vec_type vec;
         std::unordered_set<SharedArrayObjTempl *> slices;
 
+        /*
+         * When set, this array's data is read-only: it backs a `const` value,
+         * so element writes, `+=`, append/insert/erase/pop and sort-in-place
+         * are rejected. The flag lives on the shared object so it travels with
+         * every alias and slice; clone() builds a fresh object and is therefore
+         * always mutable. See make_const_clone() in eval.cpp.
+         */
+        bool readonly = false;
+
         SharedObject() = default;
         SharedObject(vec_type &&arr)
             : vec(move(arr))
@@ -155,6 +164,9 @@ public:
     vec_type &get_vec() { return shobj->vec; }
     const vec_type &get_vec() const { return shobj->vec; }
     int_type use_count() const { return shobj.use_count(); }
+
+    bool is_readonly() const { return shobj && shobj->readonly; }
+    void set_readonly() { shobj->readonly = true; }
 
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }

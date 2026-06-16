@@ -265,17 +265,25 @@ and it lives *inside the parser*. Mechanics:
   `process_arrays` is set — in which case it bakes the whole value into **one
   `LiteralObj` node** (`syntax.h`), not one literal per element. (It stores
   `v.clone()` so a small slice of a huge const array doesn't pin the huge
-  buffer.) `LiteralObj::do_eval` hands out a *fresh, fully-mutable deep copy* of
-  the baked value on every evaluation — via `make_mutable_clone()` in
-  `eval.cpp`, which is exactly what the old per-element
-  `LiteralArray`/`LiteralDict` produced at runtime: a `var` bound to it must be
-  writable, and re-evaluating the node (loop body, function called twice) must
-  not see a prior mutation. Const *immutability* is enforced separately, by
-  folding const reads (`y[k]`, `len(y)`) to literals, not by runtime element
-  flags. `LiteralObj` is `is_const` but deliberately **not** a `Literal` (which
-  in this codebase means a *scalar* literal — see auto-const's
-  `is_scalar_literal`), so an array/dict value is never mistaken for a
-  promotable scalar.
+  buffer.) `LiteralObj` carries an **`immutable`** flag, set when the
+  materialization target is a `const` decl (`fl & pInConstDecl` at the call
+  site). `LiteralObj::do_eval` (`eval.cpp`) then either:
+  - for a `const` target (`immutable`): hands out a **deep read-only** value via
+    `make_const_clone()` — every array/dict in it (recursively) is flagged
+    read-only, so the value is immutable through *any* alias (e.g. a non-const
+    function parameter bound to a const argument); or
+  - for a `var` target / read-only consumer: a *fresh, fully-mutable deep copy*
+    via `make_mutable_clone()`, exactly what the old per-element
+    `LiteralArray`/`LiteralDict` produced at runtime — a `var` bound to it must
+    be writable, and re-evaluating the node (loop body, function called twice)
+    must not see a prior mutation.
+
+  Direct reads of a const symbol (`y[k]`, `len(y)`) still fold to literals at
+  parse time; the runtime read-only flag is what additionally enforces
+  immutability through aliasing (see the copy-on-write section). `LiteralObj` is
+  `is_const` but deliberately **not** a `Literal` (which in this codebase means
+  a *scalar* literal — see auto-const's `is_scalar_literal`), so an array/dict
+  value is never mistaken for a promotable scalar.
 - **Scalars vs. containers (`ShouldConstSymbolExistAtRuntime`).** Const scalars
   are inlined
   everywhere and their declaration is dropped from the runtime AST entirely (the
@@ -614,6 +622,23 @@ via COW:
   while its `slice` flag is still set, so `offset()`/`size()` report the slice
   range.)
 - **`DictObject`** (`shareddict.h`) is analogous (`shared_ptr` wrapper).
+- **Deep-const read-only flag.** Both `SharedObject` (arrays) and `DictObject`
+  carry a `readonly` bool (`is_readonly()`/`set_readonly()`). It backs `const`
+  values: `make_const_clone()` (`eval.cpp`) sets it on every array/dict in the
+  value, recursively, so `const` is *deep* read-only. The flag lives on the
+  shared object, so it travels with every alias and slice; `clone()` builds a
+  fresh object and is therefore always mutable (`TypeDict::clone` clears it
+  explicitly; `TypeArr::clone` gets a new `SharedObject` for free). Write paths
+  check it: `TypeArr::subscript`, `TypeDict::subscript` and `MemberExpr` return
+  an *rvalue* (and don't auto-vivify) for a read-only container, so the
+  element/member
+  assignment fails with `NotLValueEx`; `TypeArr::add` (`+=`) and the mutating
+  builtins (`append`/`pop`/`insert`/`erase`) throw `CannotChangeConstEx`;
+  `sort()` clones instead of sorting in place. This is what makes a const
+  immutable through a non-const alias (e.g. a function parameter) — parse-time
+  read-folding alone didn't. (Aside: `builtin_sum` must seed its accumulator
+  with a `clone()` of the first element, since `+=` mutates it in place — it
+  would otherwise mutate, or be rejected on, a read-only argument.)
 - The non-const `intptr(symbol)` builtin exposes the underlying object pointer;
   the test suite uses it
   to assert exactly when two slices do/don't share storage. If you change COW
