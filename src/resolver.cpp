@@ -425,7 +425,8 @@ private:
                     continue;
                 }
 
-                fold_reads(e14->rvalue, fc);   /* assignment: fold rhs only */
+                fold_reads(e14->rvalue, fc);   /* assignment: rhs ... */
+                fold_lvalue_reads(e14->lvalue, fc);   /* ... and lvalue reads */
                 kept.push_back(move(e));
                 continue;
             }
@@ -535,12 +536,28 @@ private:
         }
 
         if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
-            fold_reads(e14->rvalue, fc);   /* assignment as a statement */
+            fold_reads(e14->rvalue, fc);   /* assignment as a statement: rhs */
+            fold_lvalue_reads(e14->lvalue, fc);   /* ... and lvalue reads */
             return true;
         }
 
         fold_reads(slot, fc);              /* expression statement */
         return true;
+    }
+
+    /*
+     * Fold the read subexpressions of an assignment lvalue - a subscript index
+     * or a subscript/member base - so a promoted const used there folds like
+     * any other read (without this, `a[i] = v` keeps `i` after its decl is
+     * dropped -> "undefined variable" at runtime). A bare identifier or id-list
+     * IS the write target, never a read, so it is skipped (a reassigned target
+     * isn't write-once and so is never promoted anyway). A blocked base (every
+     * subscript/member base is blocked from promotion) simply doesn't fold.
+     */
+    void fold_lvalue_reads(unique_ptr<Construct> &lvalue, FCtx &fc)
+    {
+        if (lvalue && !lvalue->is_id() && !lvalue->is_idlist())
+            fold_reads(lvalue, fc);
     }
 
     /*
