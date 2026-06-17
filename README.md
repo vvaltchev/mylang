@@ -471,6 +471,78 @@ runtime instead.
     The only type of objects that can be thrown. To create them, use the `exception()`
     builtin or its shortcut `ex()`.
 
+### Static type inference
+
+Even though MyLang has no type annotations, the whole program is type-checked
+**at compile time**, before it runs. The compiler infers a single fixed type for
+every variable, parameter, and function return by analyzing the entire source
+(it's one file, so nothing is hidden), and reports a **compile-time error** for
+any type violation. These errors are *not* catchable with `try/catch` — like a
+syntax error, they fail the build. Type checking can be disabled with the `-nti`
+flag (e.g. while migrating old code).
+
+What this catches before running:
+
+```C#
+var x = 5;
+x = "hi";              # error: x is int, cannot be assigned a str
+
+func add(a, b) => a + b;
+add(1, 2, 3);          # error: add expects 2 arguments, got 3
+
+func sq(n) => n * n;
+sq(4);                 # ok: n inferred as int from this call
+sq("z");               # error: n would have to be both int and str
+```
+
+Key rules:
+
+  * A variable's type is the **join** of everything assigned to it. Assigning an
+    incompatible type on any path is an error. `int` automatically widens to
+    `float` (so `var x = 1; x = 2.5;` is fine, and `x` becomes a `float`).
+  * A **function's parameter and return types are inferred from how it is called
+    and what it returns**, across the whole program (recursion and forward
+    references included). A function called with conflicting argument types for
+    the same parameter is an error.
+  * Arrays and dicts are typed by their contents (`[1,2,3]` is an array of int).
+    A genuinely mixed container is allowed — its element type just becomes `dyn`
+    (see below), so you don't get the speed/safety benefits but it still works.
+  * **Null safety.** A plain value is *non-nullable*: passing `none` where a
+    non-`none` value is required — a non-`opt` parameter, an arithmetic operand,
+    a subscript base — is a compile error. Mark a parameter `opt` to allow
+    `none` (see below). A local that might be `none` (e.g. just `var x;`, or
+    assigned only on some branches) is treated as nullable, so using it directly
+    where a value is required is rejected — initialize it (`var x = 0;`) or use
+    `opt`/`dyn`.
+  * `==` and `!=` work between any two values (they never error, returning a
+    bool); ordering operators `< <= > >=` need two numbers or two strings.
+
+#### The `opt` and `dyn` modifiers
+
+Two keywords opt out of the strict defaults, usable on a parameter or a
+`var`/`const` declaration:
+
+```C#
+func greet(opt name) {           # `name` may be none
+    if (name == none) return "hi";
+    return "hi " + name;
+}
+
+func generic(dyn x) => x;        # `x` is dynamically typed (anything goes)
+
+var dyn slot = 5;                # `slot` behaves like a classic dynamic var
+slot = "now a string";           # ok, because it's dyn
+```
+
+  * **`opt`** — *nullable*: the value may be `none`. A non-`opt` parameter is
+    guaranteed never to receive `none`, which is what makes the null-safety
+    check above possible.
+  * **`dyn`** — *dynamically typed*: the value behaves exactly as in untyped
+    MyLang. Inference places no constraints on it, operations on it are checked
+    at runtime (as before), and it may even change type. Use it for genuinely
+    polymorphic code (e.g. a generic equality helper) or to keep a known type
+    error catchable at runtime with `try/catch`.
+
 ### Conditional statements
 
 Conditional statements work exactly like in `C`. The syntax is:
