@@ -1197,10 +1197,12 @@ class Inliner {
     std::unordered_map<const UniqueId *, FuncDeclStmt *> funcs;
 
     const int max_nodes;   /* inline only when the body is at most this big */
+    EvalContext cctx;      /* const context for re-folding spliced bodies */
 
 public:
 
-    explicit Inliner(int max_nodes) : max_nodes(max_nodes) { }
+    explicit Inliner(int max_nodes)
+        : max_nodes(max_nodes), cctx(nullptr, true) { }
 
     void run(Block *root)
     {
@@ -1310,6 +1312,16 @@ private:
 
         /* Replaces (frees) the old CallExpr; its args were already cloned. */
         slot = move(body);
+
+        /*
+         * Re-fold: a const argument substituted into the body can make a
+         * subexpression all-const that AutoConst (which ran before this pass)
+         * never saw - e.g. `f(3)` with `f(x) => x * 10 + g` splices to
+         * `3 * 10 + g`, and `3 * 10` folds to `30`. This is the const-
+         * propagation half for non-pure functions (a pure one's whole call
+         * already folded earlier).
+         */
+        refold(slot);
     }
 
     /* Sound iff the argument is evaluated as often as the param is used and a
@@ -1359,6 +1371,51 @@ private:
         for_each_child(const_cast<Construct *>(c),
             [&](Construct *ch) { n += count_uses(ch, uid); });
         return n;
+    }
+
+    /*
+     * Bottom-up constant folding of a spliced body: fold an all-const
+     * arithmetic/logic/comparison node (MultiOpConstruct over scalar literals)
+     * to a single literal. Returns true if `slot` is now a scalar literal. A
+     * node whose evaluation throws (e.g. 6/0) is left for runtime - matching
+     * the un-inlined call, which would also error at runtime.
+     */
+    bool refold(unique_ptr<Construct> &slot)
+    {
+        if (!slot)
+            return false;
+
+        if (dynamic_cast<Literal *>(slot.get()))
+            return true;            /* already a scalar literal */
+
+        bool all_const = true, any = false;
+        for_each_child_slot(slot.get(), [&](unique_ptr<Construct> &ch) {
+            any = true;
+            if (!refold(ch))
+                all_const = false;
+        });
+
+        if (!any || !all_const)
+            return false;
+
+        if (!dynamic_cast<MultiOpConstruct *>(slot.get()))
+            return false;           /* only fold operator expressions here */
+
+        try {
+            unique_ptr<Construct> lit;
+            if (MakeConstructFromConstVal(
+                    RValue(slot->eval(&cctx)), lit, false, false)) {
+                lit->start = slot->start;
+                lit->end = slot->end;
+                lit->inline_ctx = slot->inline_ctx;
+                slot = move(lit);
+                return true;
+            }
+        } catch (const Exception &) {
+            /* not foldable / would throw: leave it for runtime */
+        }
+
+        return false;
     }
 
     void substitute(unique_ptr<Construct> &slot, const UniqueId *uid,

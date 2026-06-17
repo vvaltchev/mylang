@@ -5468,6 +5468,41 @@ inliner_threshold_gates()
     return ok;
 }
 
+/*
+ * Cross-boundary re-fold: a const argument substituted into a NON-pure function
+ * (so AutoConst did not fold the whole call) makes a body subexpression all-
+ * const, which the inliner's re-fold collapses to a literal. `f(3)` with
+ * `f(x) => x * 10 + gv` (gv runtime) splices to `3 * 10 + gv`, and `3 * 10`
+ * folds to `30`.
+ */
+static bool
+inliner_refolds_const_subexpr()
+{
+    const std::vector<const char *> src = {
+        "var gv = 1;",
+        "gv = gv + 1;",                  /* gv reassigned -> runtime, == 2 */
+        "func f(x) => x * 10 + gv;",     /* not pure (reads gv) */
+        "var r = f(3);",
+        "assert(r == 32);",
+    };
+
+    unique_ptr<Construct> root = parse_lines(src);
+    resolve_names(root.get(), true, 24);
+
+    const std::string s = serialize_tree(root.get());
+
+    /*
+     * The inlined `var r` body holds Int(30) (3 * 10 folded). f's own
+     * declaration is kept and still reads `x * 10`, so don't assert on that.
+     */
+    bool ok = s.find("Int(30)") != std::string::npos;
+
+    try { root->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  resolved tree:\n" << s;
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
@@ -5475,6 +5510,7 @@ static const std::vector<extra_check> extra_checks =
     { "inliner splices an expr-func call", inliner_splices_call },
     { "inlined-call backtrace == non-inlined", inliner_backtrace_identical },
     { "inline threshold (-it) gates inlining", inliner_threshold_gates },
+    { "inliner re-folds a const subexpression", inliner_refolds_const_subexpr },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },
