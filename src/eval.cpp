@@ -1107,8 +1107,10 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         if (const Identifier *id = as_resolved_local(lvalue.get())) {
 
-            if (const auto *lit =
-                    dynamic_cast<const LiteralInt *>(rvalue.get())) {
+            if (rvalue->is_lit_int()) {
+
+                const auto *lit =
+                    static_cast<const LiteralInt *>(rvalue.get());
 
                 Frame *f = ctx->frame;
                 const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;

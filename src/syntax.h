@@ -26,6 +26,7 @@ enum class ConstructType {
     idlist,
     block,
     id,
+    lit_int,
 };
 
 /*
@@ -82,6 +83,7 @@ public:
     bool is_idlist() const { return ct == ConstructType::idlist; }
     bool is_block() const { return ct == ConstructType::block; }
     bool is_id() const { return ct == ConstructType::id; }
+    bool is_lit_int() const { return ct == ConstructType::lit_int; }
 
     virtual ~Construct() = default;
 
@@ -218,6 +220,11 @@ class Literal : public Construct {
 public:
 
     Literal() : Construct("Literal", true) { }
+
+protected:
+    /* Lets a concrete literal carry a ConstructType tag (LiteralInt uses it to
+     * be recognized without a dynamic_cast on the hot compound-assign path). */
+    Literal(ConstructType ct) : Construct("Literal", true, ct) { }
 };
 
 class LiteralInt final: public Literal {
@@ -226,7 +233,7 @@ class LiteralInt final: public Literal {
 
 public:
 
-    LiteralInt(int_type v) : value(v) { }
+    LiteralInt(int_type v) : Literal(ConstructType::lit_int), value(v) { }
 
     int_type ival() const { return value; }
 

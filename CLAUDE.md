@@ -680,10 +680,13 @@ non-tail calls or reassigned/global args would need an args-as-locals form.
   no `num_bin_op` PMF dispatch, no copy in/out (`div`/`mod` stay general, for
   the zero check). And `Expr14::do_eval` has a sibling fast path for `local
   += N` with an **int-literal** rhs: it skips evaluating the literal node too
-  (what an `i++` would compile to — there is no `++` operator). `foreach`
-  binds a resolved-local loop var the same way via `bind_loop_var`. All use
-  `as_resolved_local`, a cheap `is_id()` tag check (`ConstructType::id`), not a
-  `dynamic_cast`.
+  (what an `i++` would compile to — there is no `++` operator). The literal is
+  recognized by a cheap `is_lit_int()` tag check (`ConstructType::lit_int`),
+  **not** a `dynamic_cast` — this path runs on every `i += 1`, so an RTTI
+  lookup there is a measurable tax (it dominated tight `while`/`for` loops).
+  `foreach` binds a resolved-local loop var the same way via `bind_loop_var`.
+  All use `as_resolved_local`, a cheap `is_id()` tag check (`ConstructType::id`),
+  not a `dynamic_cast`.
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable
