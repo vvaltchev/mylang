@@ -5,6 +5,15 @@
 #include <string>
 
 struct Exception;
+struct InlineCtx;
+
+/*
+ * Append the virtual frames of an inlined-at chain to e.backtrace, innermost
+ * first (each InlineCtx maps to one BacktraceFrame). Called on the error path
+ * for an inlined node so its physically-absent call frames still appear. The
+ * name/params strings are copied out now, while the chain is still alive.
+ */
+void flush_inline_frames(const InlineCtx *ic, Exception &e);
 
 /*
  * Render an exception's call-stack backtrace (Exception::backtrace) as a
