@@ -228,6 +228,8 @@ public:
 
     LiteralInt(int_type v) : value(v) { }
 
+    int_type ival() const { return value; }
+
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;
     }
