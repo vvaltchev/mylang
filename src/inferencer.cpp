@@ -1,0 +1,1469 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+#include "syntax.h"
+#include "stype.h"
+#include "errors.h"
+#include "inferencer.h"
+#include "evalvalue.h"
+#include "eval.h"
+
+#include <unordered_map>
+#include <vector>
+#include <memory>
+#include <string>
+#include <deque>
+#include <functional>
+
+/*
+ * Whole-program static type inference + checking. See plans/type-inference.md
+ * and plans/type-inference-questions.md for the design and decisions.
+ *
+ * Pipeline (Inferencer::run):
+ *   1. structural  - build scopes; one TypeSym per declaration; resolve every
+ *                    Identifier use to its TypeSym; one FuncInfo per function.
+ *   2. fixpoint    - Jacobi iteration: each round recomputes every var/param/
+ *                    return type into `acc` (join of all contributions) while
+ *                    reading the previous round's stable `type`; commit acc->
+ *                    type; repeat until stable. Reading stable values keeps the
+ *                    round order-independent; kinds only ever climb the lattice,
+ *                    so a join conflict (e.g. int vs str) is a real, stable
+ *                    error and is raised immediately.
+ *   3. check       - with final types, validate every operation/call/assign/
+ *                    return and throw on a violation.
+ */
+
+/* Compile errors are terminal; interning their messages into a leaked static
+ * pool keeps Exception::msg a stable const char*. */
+static const char *intern_msg(const std::string &s)
+{
+    static std::deque<std::string> pool;
+    pool.push_back(s);
+    return pool.back().c_str();
+}
+
+namespace {
+
+struct FuncInfo;
+
+struct TypeSym {
+    const UniqueId *name = nullptr;
+    STyRef type = nullptr;     /* stable type read by type_of() */
+    STyRef acc = nullptr;      /* accumulator written during the current round */
+    bool dyn_decl = false;
+    bool opt_decl = false;
+    bool is_param = false;
+    Loc decl_loc;
+    FuncInfo *func = nullptr;  /* non-null when this name is a function */
+};
+
+struct FuncInfo {
+    FuncDeclStmt *decl = nullptr;
+    std::vector<TypeSym *> params;
+    STyRef ret = nullptr;        /* stable return type */
+    STyRef ret_acc = nullptr;    /* return accumulator (current round) */
+    bool falls_through = false;
+};
+
+struct Scope {
+    std::unordered_map<const UniqueId *, TypeSym *> syms;
+    Scope *parent = nullptr;
+};
+
+class Inferencer {
+
+public:
+
+    explicit Inferencer(Construct *root) : root(root) { }
+    void run();
+
+private:
+
+    STyArena A;
+    Construct *root;
+    STyRef bottom = nullptr;     /* the shared Unknown identity for join */
+
+    std::vector<std::unique_ptr<TypeSym>> all_syms;
+    std::vector<std::unique_ptr<FuncInfo>> all_funcs;
+    std::vector<std::unique_ptr<Scope>> all_scopes;
+
+    std::unordered_map<const Construct *, TypeSym *> id_sym;
+    std::unordered_map<const Construct *, FuncInfo *> func_of_decl;
+
+    Scope *global = nullptr;
+    bool changed = false;
+    FuncInfo *cur_func = nullptr;
+
+    /* helpers */
+    Scope *new_scope(Scope *parent);
+    TypeSym *new_sym(const UniqueId *name, Scope *s, Loc loc);
+    static TypeSym *lookup(Scope *s, const UniqueId *name);
+    FuncInfo *callee_funcinfo(Construct *e);   /* named func or inline lambda */
+    static bool is_builtin(const UniqueId *name);
+    void for_each_child(Construct *n, const std::function<void(Construct *)> &fn);
+    static bool always_exits(const Construct *n);
+
+    /* structural pass */
+    void hoist_globals(Block *root);
+    void walk_struct(Construct *n, Scope *s);
+    void declare_funcdecl(FuncDeclStmt *fd, Scope *s);
+    void declare_target(Construct *lvalue, Scope *s);
+
+    /* type computation (reads stable `type`) */
+    STyRef type_of(const Construct *e);
+    STyRef func_sty(FuncInfo *fi);
+    STyRef binop_result(Op op, STyRef a, STyRef b);
+    STyRef unary_result(Op op, STyRef a);
+    STyRef builtin_result(const UniqueId *name, ExprList *args);
+    STyRef sty_from_value(const EvalValue &v);
+    static Op compound_binop(Op op);
+
+    /* fixpoint */
+    void reset_round();
+    void commit_round();
+    void accumulate(Construct *n);
+    void contribute(TypeSym *s, STyRef t, Loc loc);
+    void contribute_arg(TypeSym *param, STyRef argT, Loc loc);
+    void contribute_ret(STyRef t);
+    void accumulate_assign(Expr14 *e);
+    void accumulate_call(CallExpr *call);
+    void accumulate_foreach(ForeachStmt *fe);
+    void spread_idlist(IdList *idl, Construct *rvalue);
+
+    /* check pass */
+    void check(Construct *n);
+    void check_call(CallExpr *call);
+    void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
+                      bool arith);
+    void require_nonopt(STyRef t, Loc s, Loc e, const char *what);
+    [[noreturn]] void mismatch(const std::string &m, Loc s, Loc e);
+    [[noreturn]] void nullability(const std::string &m, Loc s, Loc e);
+    [[noreturn]] void argcount(const std::string &m, Loc s, Loc e);
+
+    /* small predicates */
+    STyRef strip(STyRef t) { return A.with_opt(t, false); }
+    static bool is_num(STyRef t) {
+        t = sty_resolve(t);
+        return t->kind == STyKind::Int || t->kind == STyKind::Float;
+    }
+    static bool is_dyn(STyRef t)  { return sty_resolve(t)->kind == STyKind::Dyn; }
+    static bool is_none(STyRef t) { return sty_resolve(t)->kind == STyKind::None;}
+    static bool is_unknown(STyRef t) {
+        return sty_resolve(t)->kind == STyKind::Unknown;
+    }
+    static bool is_optish(STyRef t) {
+        t = sty_resolve(t);
+        return t->opt || t->kind == STyKind::None;
+    }
+    static bool is_func(STyRef t) { return sty_resolve(t)->kind == STyKind::Func;}
+};
+
+/* ------------------------------- helpers --------------------------------- */
+
+Scope *Inferencer::new_scope(Scope *parent)
+{
+    all_scopes.push_back(std::make_unique<Scope>());
+    Scope *s = all_scopes.back().get();
+    s->parent = parent;
+    return s;
+}
+
+TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc)
+{
+    all_syms.push_back(std::make_unique<TypeSym>());
+    TypeSym *sym = all_syms.back().get();
+    sym->name = name;
+    sym->type = bottom;
+    sym->acc = bottom;
+    sym->decl_loc = loc;
+    s->syms[name] = sym;
+    return sym;
+}
+
+TypeSym *Inferencer::lookup(Scope *s, const UniqueId *name)
+{
+    for (; s; s = s->parent) {
+        auto it = s->syms.find(name);
+        if (it != s->syms.end())
+            return it->second;
+    }
+    return nullptr;
+}
+
+/* The FuncInfo a callee expression denotes, if statically a specific function:
+ * an identifier bound to a function (named func, or a var initialized with a
+ * lambda), or an inline lambda. */
+FuncInfo *Inferencer::callee_funcinfo(Construct *e)
+{
+    if (auto *id = dynamic_cast<Identifier *>(e)) {
+        auto it = id_sym.find(id);
+        if (it != id_sym.end() && it->second && it->second->func)
+            return it->second->func;
+        return nullptr;
+    }
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(e)) {
+        auto it = func_of_decl.find(fd);
+        return it != func_of_decl.end() ? it->second : nullptr;
+    }
+    return nullptr;
+}
+
+bool Inferencer::is_builtin(const UniqueId *name)
+{
+    return EvalContext::builtins.find(name) != EvalContext::builtins.end() ||
+           EvalContext::const_builtins.find(name) !=
+               EvalContext::const_builtins.end();
+}
+
+Op Inferencer::compound_binop(Op op)
+{
+    switch (op) {
+        case Op::addeq: return Op::plus;
+        case Op::subeq: return Op::minus;
+        case Op::muleq: return Op::times;
+        case Op::diveq: return Op::div;
+        case Op::modeq: return Op::mod;
+        default:        return Op::invalid;
+    }
+}
+
+/* True when control cannot fall off the end of `n` (it always returns/throws).
+ * Used to decide whether a block-bodied function contributes a `none` return. */
+bool Inferencer::always_exits(const Construct *n)
+{
+    if (!n)
+        return false;
+
+    if (dynamic_cast<const ReturnStmt *>(n) ||
+        dynamic_cast<const ThrowStmt *>(n) ||
+        dynamic_cast<const RethrowStmt *>(n))
+        return true;
+
+    if (auto *b = dynamic_cast<const Block *>(n))
+        return !b->elems.empty() && always_exits(b->elems.back().get());
+
+    if (auto *i = dynamic_cast<const IfStmt *>(n))
+        return i->elseBlock && always_exits(i->thenBlock.get()) &&
+               always_exits(i->elseBlock.get());
+
+    return false;
+}
+
+void Inferencer::for_each_child(Construct *n,
+                                const std::function<void(Construct *)> &fn)
+{
+    if (!n)
+        return;
+
+    if (auto *e = dynamic_cast<Expr14 *>(n)) {
+        fn(e->lvalue.get()); fn(e->rvalue.get()); return;
+    }
+    if (auto *c = dynamic_cast<CallExpr *>(n)) {
+        fn(c->what.get()); fn(c->args.get()); return;
+    }
+    if (auto *m = dynamic_cast<MemberExpr *>(n)) {
+        fn(m->what.get()); return;
+    }
+    if (auto *s = dynamic_cast<Subscript *>(n)) {
+        fn(s->what.get()); fn(s->index.get()); return;
+    }
+    if (auto *s = dynamic_cast<Slice *>(n)) {
+        fn(s->what.get()); fn(s->start_idx.get()); fn(s->end_idx.get()); return;
+    }
+    if (auto *i = dynamic_cast<IfStmt *>(n)) {
+        fn(i->condExpr.get()); fn(i->thenBlock.get()); fn(i->elseBlock.get());
+        return;
+    }
+    if (auto *w = dynamic_cast<WhileStmt *>(n)) {
+        fn(w->condExpr.get()); fn(w->body.get()); return;
+    }
+    if (auto *f = dynamic_cast<ForStmt *>(n)) {
+        fn(f->init.get()); fn(f->cond.get()); fn(f->inc.get()); fn(f->body.get());
+        return;
+    }
+    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+        fn(fe->container.get()); fn(fe->body.get()); return;
+    }
+    if (auto *t = dynamic_cast<TryCatchStmt *>(n)) {
+        fn(t->tryBody.get());
+        for (auto &cs : t->catchStmts)
+            fn(cs.second.get());
+        fn(t->finallyBody.get());
+        return;
+    }
+    if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
+        fn(r->elem.get()); return;
+    }
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        fn(fd->body.get()); return;
+    }
+    if (auto *ld = dynamic_cast<LiteralDict *>(n)) {
+        for (auto &kv : ld->elems) {
+            fn(kv->key.get()); fn(kv->value.get());
+        }
+        return;
+    }
+    if (auto *sc = dynamic_cast<SingleChildConstruct *>(n)) {
+        fn(sc->elem.get()); return;
+    }
+    if (auto *mo = dynamic_cast<MultiOpConstruct *>(n)) {
+        for (auto &pr : mo->elems)
+            fn(pr.second.get());
+        return;
+    }
+    /* MultiElemConstruct<>: Block, LiteralArray, ExprList */
+    if (auto *me = dynamic_cast<MultiElemConstruct<> *>(n)) {
+        for (auto &e : me->elems)
+            fn(e.get());
+        return;
+    }
+    /* leaves: literals, Identifier, Break/Continue/Rethrow/Nop */
+}
+
+/* ------------------------------ run / passes ----------------------------- */
+
+void Inferencer::run()
+{
+    Block *rootBlock = dynamic_cast<Block *>(root);
+    if (!rootBlock)
+        return;
+
+    bottom = A.fresh_var();
+    global = new_scope(nullptr);
+
+    hoist_globals(rootBlock);
+    for (auto &e : rootBlock->elems)
+        walk_struct(e.get(), global);
+
+    /* fixpoint */
+    for (int iter = 0; iter < 1000; iter++) {
+        reset_round();
+        cur_func = nullptr;
+        for (auto &e : rootBlock->elems)
+            accumulate(e.get());
+        changed = false;
+        commit_round();          /* sets `changed` if any type moved */
+        if (!changed)
+            break;
+    }
+
+    /* finalize. An unconstrained value is `none` for a local ("only-none /
+     * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called
+     * function's parameter could be anything, so its body must still type-check
+     * (this covers uncalled funcs, callbacks folded at parse time, and HO uses
+     * we don't model precisely). dyn/opt declarations win as written. */
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        if (s->func)
+            continue;
+        if (s->dyn_decl)
+            s->type = A.dyn_ty();
+        else if (is_unknown(s->type))
+            s->type = s->is_param ? A.dyn_ty() : A.none_ty();
+        if (s->opt_decl && !s->dyn_decl)
+            s->type = A.with_opt(s->type, true);
+    }
+    for (auto &up : all_funcs) {
+        if (is_unknown(up->ret))
+            up->ret = A.none_ty();
+    }
+
+    cur_func = nullptr;
+    for (auto &e : rootBlock->elems)
+        check(e.get());
+}
+
+void Inferencer::hoist_globals(Block *rootBlock)
+{
+    for (auto &e : rootBlock->elems) {
+        Construct *n = e.get();
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+            declare_funcdecl(fd, global);
+        } else if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+            if (e14->fl & pFlags::pInDecl)
+                declare_target(e14->lvalue.get(), global);
+        }
+    }
+}
+
+void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
+{
+    if (func_of_decl.count(fd))
+        return;
+
+    all_funcs.push_back(std::make_unique<FuncInfo>());
+    FuncInfo *fi = all_funcs.back().get();
+    fi->decl = fd;
+    fi->ret = bottom;
+    fi->ret_acc = bottom;
+    fi->falls_through =
+        fd->body && fd->body->is_block() && !always_exits(fd->body.get());
+    func_of_decl[fd] = fi;
+
+    if (fd->id) {
+        const UniqueId *nm = fd->id->uid;
+        TypeSym *sym;
+        auto it = s->syms.find(nm);
+        sym = (it != s->syms.end()) ? it->second : new_sym(nm, s, fd->start);
+        sym->func = fi;
+        id_sym[fd->id.get()] = sym;
+    }
+}
+
+void Inferencer::declare_target(Construct *lvalue, Scope *s)
+{
+    auto decl_one = [&](Identifier *id) {
+        const UniqueId *nm = id->uid;
+        auto it = s->syms.find(nm);
+        TypeSym *sym = (it != s->syms.end()) ? it->second
+                                             : new_sym(nm, s, id->start);
+        sym->opt_decl = sym->opt_decl || id->opt_mod;
+        sym->dyn_decl = sym->dyn_decl || id->dyn_mod;
+        id_sym[id] = sym;
+    };
+
+    if (auto *id = dynamic_cast<Identifier *>(lvalue))
+        decl_one(id);
+    else if (auto *idl = dynamic_cast<IdList *>(lvalue))
+        for (auto &up : idl->elems)
+            decl_one(up.get());
+}
+
+void Inferencer::walk_struct(Construct *n, Scope *s)
+{
+    if (!n)
+        return;
+
+    if (auto *blk = dynamic_cast<Block *>(n)) {
+        Scope *inner = new_scope(s);
+        for (auto &e : blk->elems)
+            walk_struct(e.get(), inner);
+        return;
+    }
+
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        declare_funcdecl(fd, s);
+        FuncInfo *fi = func_of_decl[fd];
+        Scope *fscope = new_scope(global);   /* funcs see globals, not callers */
+
+        if (fd->captures)
+            for (auto &cap : fd->captures->elems) {
+                TypeSym *outer = lookup(s, cap->uid);
+                if (outer)
+                    fscope->syms[cap->uid] = outer;
+                id_sym[cap.get()] = outer;
+            }
+
+        if (fd->params)
+            for (auto &p : fd->params->elems) {
+                TypeSym *psym = new_sym(p->uid, fscope, p->start);
+                psym->is_param = true;
+                psym->opt_decl = p->opt_mod;
+                psym->dyn_decl = p->dyn_mod;
+                id_sym[p.get()] = psym;
+                fi->params.push_back(psym);
+            }
+
+        walk_struct(fd->body.get(), fscope);
+        return;
+    }
+
+    if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+        walk_struct(e14->rvalue.get(), s);   /* RHS before the new name exists */
+        if (e14->fl & pFlags::pInDecl) {
+            declare_target(e14->lvalue.get(), s);
+            /* `var f = <lambda>`: bind f to the lambda's FuncInfo so calls to f
+             * type the lambda's params and check its arity. */
+            if (auto *id = dynamic_cast<Identifier *>(e14->lvalue.get()))
+                if (auto *fd = dynamic_cast<FuncDeclStmt *>(e14->rvalue.get())) {
+                    TypeSym *sym = id_sym[id];
+                    if (sym && !sym->func)
+                        sym->func = func_of_decl[fd];
+                }
+        } else {
+            walk_struct(e14->lvalue.get(), s);
+        }
+        return;
+    }
+
+    if (auto *fs = dynamic_cast<ForStmt *>(n)) {
+        Scope *inner = new_scope(s);
+        walk_struct(fs->init.get(), inner);
+        walk_struct(fs->cond.get(), inner);
+        walk_struct(fs->inc.get(), inner);
+        walk_struct(fs->body.get(), inner);
+        return;
+    }
+
+    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+        Scope *inner = new_scope(s);
+        walk_struct(fe->container.get(), s);
+        if (fe->ids)
+            for (auto &id : fe->ids->elems) {
+                if (fe->idsVarDecl)
+                    id_sym[id.get()] = new_sym(id->uid, inner, id->start);
+                else
+                    id_sym[id.get()] = lookup(s, id->uid);
+            }
+        walk_struct(fe->body.get(), inner);
+        return;
+    }
+
+    if (auto *tc = dynamic_cast<TryCatchStmt *>(n)) {
+        walk_struct(tc->tryBody.get(), s);
+        for (auto &cs : tc->catchStmts) {
+            Scope *inner = new_scope(s);
+            if (cs.first.asId) {
+                TypeSym *sym = new_sym(cs.first.asId->uid, inner,
+                                       cs.first.asId->start);
+                sym->type = A.exc_ty();
+                sym->dyn_decl = true;   /* exception payload is dynamic */
+                id_sym[cs.first.asId.get()] = sym;
+            }
+            walk_struct(cs.second.get(), inner);
+        }
+        walk_struct(tc->finallyBody.get(), s);
+        return;
+    }
+
+    if (auto *id = dynamic_cast<Identifier *>(n)) {
+        if (!id_sym.count(id))
+            id_sym[id] = lookup(s, id->uid);
+        return;
+    }
+
+    for_each_child(n, [&](Construct *c) { walk_struct(c, s); });
+}
+
+/* --------------------------- type computation ---------------------------- */
+
+STyRef Inferencer::func_sty(FuncInfo *fi)
+{
+    std::vector<STyRef> ps;
+    std::vector<bool> popt;
+    for (TypeSym *p : fi->params) {
+        ps.push_back(p->dyn_decl ? A.dyn_ty() : p->type);
+        popt.push_back(p->opt_decl);
+    }
+    return A.func_of(ps, popt, fi->ret);
+}
+
+STyRef Inferencer::sty_from_value(const EvalValue &v)
+{
+    Type *t = v.get_type();
+    switch (t->t) {
+        case Type::t_int:   return A.int_ty();
+        case Type::t_float: return A.float_ty();
+        case Type::t_str:   return A.str_ty();
+        case Type::t_none:  return A.none_ty();
+        case Type::t_arr:   return A.array_of(A.dyn_ty());
+        case Type::t_dict:  return A.dict_of(A.dyn_ty(), A.dyn_ty());
+        default:            return A.dyn_ty();
+    }
+}
+
+STyRef Inferencer::type_of(const Construct *e)
+{
+    if (!e)
+        return A.none_ty();
+
+    if (dynamic_cast<const LiteralInt *>(e))   return A.int_ty();
+    if (dynamic_cast<const LiteralFloat *>(e)) return A.float_ty();
+    if (dynamic_cast<const LiteralStr *>(e))   return A.str_ty();
+    if (dynamic_cast<const LiteralNone *>(e))  return A.none_ty();
+
+    if (auto *la = dynamic_cast<const LiteralArray *>(e)) {
+        if (la->elems.empty())
+            return A.array_of(A.none_ty());
+        STyRef el = type_of(la->elems[0].get());
+        for (size_t i = 1; i < la->elems.size(); i++) {
+            STyRef j = A.join(el, type_of(la->elems[i].get()));
+            el = j ? j : A.dyn_ty();
+        }
+        return A.array_of(el);
+    }
+
+    if (auto *ld = dynamic_cast<const LiteralDict *>(e)) {
+        if (ld->elems.empty())
+            return A.dict_of(A.none_ty(), A.none_ty());
+        STyRef k = type_of(ld->elems[0]->key.get());
+        STyRef val = type_of(ld->elems[0]->value.get());
+        for (size_t i = 1; i < ld->elems.size(); i++) {
+            STyRef jk = A.join(k, type_of(ld->elems[i]->key.get()));
+            STyRef jv = A.join(val, type_of(ld->elems[i]->value.get()));
+            k = jk ? jk : A.dyn_ty();
+            val = jv ? jv : A.dyn_ty();
+        }
+        return A.dict_of(k, val);
+    }
+
+    if (auto *lo = dynamic_cast<const LiteralObj *>(e))
+        return sty_from_value(lo->literal_value());
+
+    if (auto *id = dynamic_cast<const Identifier *>(e)) {
+        auto it = id_sym.find(id);
+        if (it != id_sym.end() && it->second) {
+            TypeSym *s = it->second;
+            return s->func ? func_sty(s->func) : s->type;
+        }
+        return A.dyn_ty();    /* builtin used as value, or unresolved (Q4) */
+    }
+
+    if (auto *e1 = dynamic_cast<const Expr01 *>(e))
+        return type_of(e1->elem.get());
+
+    if (auto *e2 = dynamic_cast<const Expr02 *>(e)) {
+        const auto &pr = e2->elems[0];
+        return unary_result(pr.first, type_of(pr.second.get()));
+    }
+
+    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
+        /* Expr03/04/06/07/11/12 */
+        STyRef t = type_of(mo->elems[0].second.get());
+        for (size_t i = 1; i < mo->elems.size(); i++)
+            t = binop_result(mo->elems[i].first, t,
+                             type_of(mo->elems[i].second.get()));
+        return t;
+    }
+
+    if (auto *e14 = dynamic_cast<const Expr14 *>(e)) {
+        if (e14->op == Op::assign)
+            return type_of(e14->rvalue.get());
+        return binop_result(compound_binop(e14->op),
+                            type_of(e14->lvalue.get()),
+                            type_of(e14->rvalue.get()));
+    }
+
+    if (auto *call = dynamic_cast<const CallExpr *>(e)) {
+        Construct *callee = call->what.get();
+        if (auto *cid = dynamic_cast<const Identifier *>(callee)) {
+            auto it = id_sym.find(cid);
+            TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
+            if (s && s->func)
+                return s->func->ret;
+            if (s && is_func(s->type))
+                return sty_resolve(s->type)->ret;
+            if (s && is_dyn(s->type))
+                return A.dyn_ty();
+            if (!s && is_builtin(cid->uid))
+                return builtin_result(cid->uid, call->args.get());
+            return A.dyn_ty();
+        }
+        STyRef ct = type_of(callee);
+        return is_func(ct) ? sty_resolve(ct)->ret : A.dyn_ty();
+    }
+
+    if (auto *sub = dynamic_cast<const Subscript *>(e)) {
+        STyRef w = sty_resolve(type_of(sub->what.get()));
+        if (w->kind == STyKind::Array) return w->elem;
+        if (w->kind == STyKind::Dict)  return w->val;
+        if (w->kind == STyKind::Str)   return A.str_ty();
+        return A.dyn_ty();
+    }
+
+    if (auto *sl = dynamic_cast<const Slice *>(e)) {
+        STyRef w = sty_resolve(type_of(sl->what.get()));
+        if (w->kind == STyKind::Array || w->kind == STyKind::Str)
+            return w;
+        return A.dyn_ty();
+    }
+
+    if (auto *mem = dynamic_cast<const MemberExpr *>(e)) {
+        STyRef w = sty_resolve(type_of(mem->what.get()));
+        if (w->kind == STyKind::Dict)
+            return w->val;
+        return A.dyn_ty();
+    }
+
+    if (auto *fd = dynamic_cast<const FuncDeclStmt *>(e)) {
+        auto it = func_of_decl.find(fd);
+        if (it != func_of_decl.end())
+            return func_sty(it->second);
+        return A.dyn_ty();
+    }
+
+    return A.dyn_ty();
+}
+
+STyRef Inferencer::unary_result(Op op, STyRef a)
+{
+    if (op == Op::invalid)
+        return a;
+    if (op == Op::lnot)
+        return A.int_ty();
+    if (op == Op::plus || op == Op::minus) {
+        STyRef u = strip(sty_resolve(a));
+        if (u->kind == STyKind::Int || u->kind == STyKind::Float)
+            return u;
+        return A.dyn_ty();
+    }
+    return A.dyn_ty();
+}
+
+STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
+{
+    a = sty_resolve(a);
+    b = sty_resolve(b);
+
+    /* comparisons / equality / logical always yield int */
+    if (op == Op::eq || op == Op::noteq || op == Op::lt || op == Op::gt ||
+        op == Op::le || op == Op::ge || op == Op::land || op == Op::lor)
+        return A.int_ty();
+
+    if (is_dyn(a) || is_dyn(b))
+        return A.dyn_ty();
+
+    STyRef au = strip(a), bu = strip(b);
+    const bool an = is_num(au), bn = is_num(bu);
+
+    switch (op) {
+        case Op::plus:
+            /* str + anything -> str (the RHS is stringified); but int/float +
+             * str is an error (handled by falling through to dyn). */
+            if (au->kind == STyKind::Str)
+                return A.str_ty();
+            if (an && bn) {
+                STyRef j = A.join(au, bu);
+                return j ? j : A.dyn_ty();
+            }
+            if (au->kind == STyKind::Array && bu->kind == STyKind::Array) {
+                STyRef j = A.join(au, bu);
+                return j ? j : A.array_of(A.dyn_ty());
+            }
+            return A.dyn_ty();
+
+        case Op::times:
+            if (au->kind == STyKind::Str && bu->kind == STyKind::Int)
+                return A.str_ty();
+            if (an && bn) { STyRef j = A.join(au, bu); return j ? j : A.dyn_ty();}
+            return A.dyn_ty();
+
+        case Op::minus:
+        case Op::div:
+        case Op::mod:
+            if (an && bn) { STyRef j = A.join(au, bu); return j ? j : A.dyn_ty();}
+            return A.dyn_ty();
+
+        default:
+            return A.dyn_ty();
+    }
+}
+
+/*
+ * Result type of a builtin call. Precise where it matters for downstream typing;
+ * `dyn` otherwise (sound - the runtime still type-checks the call). See
+ * plans/type-inference-questions.md Q8.
+ */
+STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
+{
+    const std::string n(name->val);
+    auto arg = [&](size_t i) -> STyRef {
+        return i < args->elems.size() ? type_of(args->elems[i].get())
+                                      : A.dyn_ty();
+    };
+    auto elem_of = [&](STyRef c) -> STyRef {
+        c = sty_resolve(c);
+        if (c->kind == STyKind::Array) return c->elem;
+        if (c->kind == STyKind::Str)   return A.str_ty();
+        if (c->kind == STyKind::Dict)  return c->key;
+        return A.dyn_ty();
+    };
+
+    /* int-returning */
+    if (n == "len" || n == "hash" || n == "ord" || n == "rand" ||
+        n == "intptr" || n == "defined" || n == "isconst" ||
+        n == "isconstdecl" || n == "ispure" || n == "ispuredecl" ||
+        n == "startswith" || n == "endswith" || n == "isinf" ||
+        n == "isfinite" || n == "isnormal" || n == "isnan")
+        return A.int_ty();
+
+    /* float-returning */
+    if (n == "float" || n == "exp" || n == "log" || n == "sqrt" ||
+        n == "cbrt" || n == "pow" || n == "sin" || n == "cos" || n == "tan" ||
+        n == "asin" || n == "acos" || n == "atan" || n == "ceil" ||
+        n == "floor" || n == "trunc" || n == "round" || n == "randf" ||
+        n == "math_e" || n == "math_pi" || n == "nan" || n == "inf" ||
+        n == "eps")
+        return A.float_ty();
+
+    if (n == "int")    return A.int_ty();
+    if (n == "str" || n == "type" || n == "chr" || n == "join" ||
+        n == "lpad" || n == "rpad" || n == "lstrip" || n == "rstrip" ||
+        n == "strip" || n == "readln" || n == "read")
+        return A.str_ty();
+
+    if (n == "split" || n == "splitlines" || n == "readlines")
+        return A.array_of(A.str_ty());
+
+    if (n == "range")  return A.array_of(A.int_ty());
+    if (n == "array")  return A.array_of(A.dyn_ty());
+    if (n == "dict")   return A.dict_of(A.dyn_ty(), A.dyn_ty());
+
+    if (n == "abs" || n == "clone" || n == "deepclone")
+        return arg(0);
+    if (n == "runtime")
+        return A.dyn_ty();   /* the documented opt-out: defer to runtime (Q) */
+    if (n == "min" || n == "max") {
+        STyRef t = arg(0);
+        for (size_t i = 1; i < args->elems.size(); i++) {
+            STyRef j = A.join(t, arg(i));
+            t = j ? j : A.dyn_ty();
+        }
+        return t;
+    }
+
+    if (n == "sum" || n == "top" || n == "pop")
+        return elem_of(arg(0));
+
+    if (n == "map") {
+        /* map(func, container) -> array of the callback's return type */
+        STyRef f = sty_resolve(arg(0));
+        return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
+    }
+    if (n == "filter")              /* filter(func, container) -> container */
+        return arg(1);
+    if (n == "sort" || n == "rev_sort" || n == "reverse")
+        return arg(0);             /* sort(array, [func]) -> array */
+
+    if (n == "keys") {
+        STyRef d = sty_resolve(arg(0));
+        return A.array_of(d->kind == STyKind::Dict ? d->key : A.dyn_ty());
+    }
+    if (n == "values") {
+        STyRef d = sty_resolve(arg(0));
+        return A.array_of(d->kind == STyKind::Dict ? d->val : A.dyn_ty());
+    }
+    if (n == "find") {
+        STyRef d = sty_resolve(arg(0));
+        return A.with_opt(d->kind == STyKind::Dict ? d->val : A.dyn_ty(), true);
+    }
+
+    if (n == "exception" || n == "ex")
+        return A.exc_ty();
+
+    if (n == "print" || n == "writeln" || n == "assert" || n == "append" ||
+        n == "push" || n == "insert" || n == "exit" || n == "write" ||
+        n == "writelines" || n == "undef" || n == "erase")
+        return A.none_ty();
+
+    return A.dyn_ty();
+}
+
+/* ------------------------------- fixpoint -------------------------------- */
+
+void Inferencer::reset_round()
+{
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        if (s->func)
+            continue;
+        s->acc = s->dyn_decl ? A.dyn_ty() : bottom;
+    }
+    for (auto &up : all_funcs)
+        up->ret_acc = bottom;
+}
+
+void Inferencer::commit_round()
+{
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        if (s->func)
+            continue;
+        if (!sty_equal(s->acc, s->type))
+            changed = true;
+        s->type = s->acc;
+    }
+    for (auto &up : all_funcs) {
+        if (!sty_equal(up->ret_acc, up->ret))
+            changed = true;
+        up->ret = up->ret_acc;
+    }
+}
+
+void Inferencer::contribute(TypeSym *s, STyRef t, Loc loc)
+{
+    /* func-name syms derive their type from func_sty(); never accumulated. */
+    if (!s || s->dyn_decl || s->func)
+        return;
+    STyRef nw = A.join(s->acc, t);
+    if (!nw)
+        mismatch("'" + std::string(s->name->val) + "' has type '" +
+                     sty_to_string(s->acc) + "' but is assigned '" +
+                     sty_to_string(t) + "'",
+                 loc, Loc());
+    s->acc = nw;
+}
+
+void Inferencer::contribute_arg(TypeSym *param, STyRef argT, Loc loc)
+{
+    if (!param || param->dyn_decl)
+        return;
+    argT = sty_resolve(argT);
+    if (!param->opt_decl) {
+        if (argT->kind == STyKind::None)
+            return;                       /* none -> non-opt: flagged in check */
+        argT = strip(argT);
+    }
+    contribute(param, argT, loc);
+}
+
+void Inferencer::contribute_ret(STyRef t)
+{
+    if (!cur_func)
+        return;
+    STyRef nw = A.join(cur_func->ret_acc, t);
+    cur_func->ret_acc = nw ? nw : A.dyn_ty();   /* return conflict -> dyn */
+}
+
+void Inferencer::accumulate(Construct *n)
+{
+    if (!n)
+        return;
+
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        FuncInfo *prev = cur_func;
+        cur_func = func_of_decl[fd];
+        if (fd->body && !fd->body->is_block()) {
+            accumulate(fd->body.get());
+            contribute_ret(type_of(fd->body.get()));
+        } else {
+            accumulate(fd->body.get());
+            if (cur_func->falls_through)
+                contribute_ret(A.none_ty());
+        }
+        cur_func = prev;
+        return;
+    }
+
+    if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+        accumulate_assign(e14);
+        return;
+    }
+
+    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+        accumulate_call(call);
+        return;
+    }
+
+    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+        accumulate_foreach(fe);
+        return;
+    }
+
+    if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
+        accumulate(r->elem.get());
+        contribute_ret(r->elem ? type_of(r->elem.get()) : A.none_ty());
+        return;
+    }
+
+    for_each_child(n, [&](Construct *c) { accumulate(c); });
+}
+
+void Inferencer::accumulate_call(CallExpr *call)
+{
+    accumulate(call->what.get());
+    for (auto &a : call->args->elems)
+        accumulate(a.get());
+
+    ExprList *args = call->args.get();
+
+    /* direct call to a known function (named, func-var, or inline lambda): feed
+     * the argument types into its parameters */
+    if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
+        size_t n = std::min(fi->params.size(), args->elems.size());
+        for (size_t i = 0; i < n; i++)
+            contribute_arg(fi->params[i], type_of(args->elems[i].get()),
+                           args->elems[i]->start);
+        return;
+    }
+
+    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    if (!cid)
+        return;
+
+    auto it = id_sym.find(cid);
+    TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
+    if (s)
+        return;   /* a non-function symbol; not a builtin */
+
+    /* element-contributing builtins: append/push(arr, x), insert(arr|dict, k,
+     * x). Contribute only when the base kind is already known, and match it:
+     * insert on a dict feeds dict<key,val>, on an array feeds array<val>. */
+    const std::string nm(cid->uid->val);
+    auto contribute_container = [&](size_t base_i, int key_i, size_t val_i) {
+        if (base_i >= args->elems.size() || val_i >= args->elems.size())
+            return;
+        auto *bid = dynamic_cast<Identifier *>(args->elems[base_i].get());
+        if (!bid)
+            return;
+        auto bit = id_sym.find(bid);
+        TypeSym *bs = (bit != id_sym.end()) ? bit->second : nullptr;
+        if (!bs)
+            return;
+        STyRef vt = type_of(args->elems[val_i].get());
+        STyRef bt = sty_resolve(bs->type);
+        if (bt->kind == STyKind::Dict) {
+            STyRef kt = (key_i >= 0 && (size_t)key_i < args->elems.size())
+                            ? type_of(args->elems[key_i].get()) : A.dyn_ty();
+            contribute(bs, A.dict_of(kt, vt), bid->start);
+        } else if (bt->kind == STyKind::Array) {
+            contribute(bs, A.array_of(vt), bid->start);
+        }
+        /* unknown/other base kind: skip (don't guess) */
+    };
+    if (nm == "append" || nm == "push")
+        contribute_container(0, -1, 1);
+    else if (nm == "insert")
+        contribute_container(0, 1, 2);
+    else {
+        /* Higher-order builtins: feed the container's element type to the
+         * callback's parameter(s). map/filter are (func, container); sort and
+         * rev_sort are (array, [comparator]). */
+        size_t func_i, cont_i;
+        bool comparator = false;
+        if (nm == "map" || nm == "filter") {
+            func_i = 0; cont_i = 1;
+        } else if (nm == "sort" || nm == "rev_sort") {
+            func_i = 1; cont_i = 0; comparator = true;
+        } else {
+            return;
+        }
+        if (func_i >= args->elems.size() || cont_i >= args->elems.size())
+            return;
+        FuncInfo *cb = callee_funcinfo(args->elems[func_i].get());
+        if (!cb)
+            return;
+        STyRef ct = sty_resolve(type_of(args->elems[cont_i].get()));
+        STyRef el = ct->kind == STyKind::Array ? ct->elem
+                  : ct->kind == STyKind::Dict  ? ct->key : A.dyn_ty();
+        Loc fl = args->elems[func_i]->start;
+        auto &ps = cb->params;
+        if (!ps.empty())
+            contribute_arg(ps[0], el, fl);
+        if (comparator && ps.size() >= 2)
+            contribute_arg(ps[1], el, fl);
+    }
+}
+
+void Inferencer::spread_idlist(IdList *idl, Construct *rvalue)
+{
+    STyRef rt = sty_resolve(type_of(rvalue));
+
+    if (auto *la = dynamic_cast<LiteralArray *>(rvalue)) {
+        if (la->elems.size() == idl->elems.size()) {
+            for (size_t i = 0; i < idl->elems.size(); i++)
+                contribute(id_sym[idl->elems[i].get()],
+                           type_of(la->elems[i].get()), idl->elems[i]->start);
+            return;
+        }
+    }
+
+    STyRef each = rt->kind == STyKind::Array ? rt->elem : rt;
+    for (auto &id : idl->elems)
+        contribute(id_sym[id.get()], each, id->start);
+}
+
+void Inferencer::accumulate_assign(Expr14 *e)
+{
+    accumulate(e->rvalue.get());
+    if (!(e->fl & pFlags::pInDecl))
+        accumulate(e->lvalue.get());
+
+    STyRef ct;
+    if (e->op == Op::assign) {
+        ct = type_of(e->rvalue.get());
+    } else {
+        STyRef l = type_of(e->lvalue.get());
+        STyRef r = type_of(e->rvalue.get());
+        ct = binop_result(compound_binop(e->op), l, r);
+        /* An invalid compound op (e.g. str -= int) yields dyn; don't let that
+         * widen the target to dyn and hide the error - keep its type so the
+         * check pass reports the mismatch. */
+        if (is_dyn(ct) && !is_dyn(strip(l)) && !is_dyn(strip(r)))
+            ct = l;
+    }
+
+    Construct *lv = e->lvalue.get();
+
+    if (auto *id = dynamic_cast<Identifier *>(lv)) {
+        auto it = id_sym.find(id);
+        if (it != id_sym.end())
+            contribute(it->second, ct, e->start);
+        return;
+    }
+
+    if (auto *idl = dynamic_cast<IdList *>(lv)) {
+        spread_idlist(idl, e->rvalue.get());
+        return;
+    }
+
+    if (auto *sub = dynamic_cast<Subscript *>(lv)) {
+        if (auto *bid = dynamic_cast<Identifier *>(sub->what.get())) {
+            auto it = id_sym.find(bid);
+            if (it != id_sym.end() && it->second) {
+                /* Only contribute once the base kind is known (from a prior
+                 * literal/assignment); guessing array for an as-yet-Unknown
+                 * base would spuriously conflict with a dict (and vice versa).*/
+                STyRef bt = sty_resolve(it->second->type);
+                if (bt->kind == STyKind::Dict)
+                    contribute(it->second,
+                               A.dict_of(type_of(sub->index.get()), ct),
+                               bid->start);
+                else if (bt->kind == STyKind::Array)
+                    contribute(it->second, A.array_of(ct), bid->start);
+            }
+        }
+        return;
+    }
+
+    if (auto *mem = dynamic_cast<MemberExpr *>(lv)) {
+        if (auto *bid = dynamic_cast<Identifier *>(mem->what.get())) {
+            auto it = id_sym.find(bid);
+            if (it != id_sym.end())
+                contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start);
+        }
+        return;
+    }
+}
+
+void Inferencer::accumulate_foreach(ForeachStmt *fe)
+{
+    accumulate(fe->container.get());
+    accumulate(fe->body.get());
+
+    if (!fe->ids || fe->ids->elems.empty())
+        return;
+
+    STyRef c = sty_resolve(type_of(fe->container.get()));
+    auto &ids = fe->ids->elems;
+
+    auto sym_of = [&](size_t i) { return id_sym[ids[i].get()]; };
+
+    if (fe->indexed) {
+        /* enumerate-style: first id is the int index, the rest the element */
+        contribute(sym_of(0), A.int_ty(), ids[0]->start);
+        STyRef el = c->kind == STyKind::Array ? c->elem
+                    : c->kind == STyKind::Str ? A.str_ty()
+                    : c->kind == STyKind::Dict ? c->key : A.dyn_ty();
+        for (size_t i = 1; i < ids.size(); i++)
+            contribute(sym_of(i), el, ids[i]->start);
+        return;
+    }
+
+    if (c->kind == STyKind::Dict && ids.size() >= 2) {
+        contribute(sym_of(0), c->key, ids[0]->start);
+        contribute(sym_of(1), c->val, ids[1]->start);
+        return;
+    }
+
+    STyRef el = c->kind == STyKind::Array ? c->elem
+                : c->kind == STyKind::Str ? A.str_ty()
+                : c->kind == STyKind::Dict ? c->key : A.dyn_ty();
+
+    if (ids.size() == 1) {
+        contribute(sym_of(0), el, ids[0]->start);
+    } else {
+        /* tuple-unpack each element (an array) into the ids */
+        STyRef inner = sty_resolve(el)->kind == STyKind::Array
+                           ? sty_resolve(el)->elem : el;
+        for (size_t i = 0; i < ids.size(); i++)
+            contribute(sym_of(i), inner, ids[i]->start);
+    }
+}
+
+/* -------------------------------- check ---------------------------------- */
+
+void Inferencer::mismatch(const std::string &m, Loc s, Loc e)
+{
+    throw TypeMismatchEx(intern_msg(m), s, e ? e : s);
+}
+void Inferencer::nullability(const std::string &m, Loc s, Loc e)
+{
+    throw NullabilityEx(intern_msg(m), s, e ? e : s);
+}
+void Inferencer::argcount(const std::string &m, Loc s, Loc e)
+{
+    throw WrongArgCountEx(intern_msg(m), s, e ? e : s);
+}
+
+void Inferencer::require_nonopt(STyRef t, Loc s, Loc e, const char *what)
+{
+    if (is_dyn(t))
+        return;
+    if (is_optish(t))
+        nullability(std::string("possibly-none value used ") + what +
+                        " (type '" + sty_to_string(t) + "')",
+                    s, e);
+}
+
+void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
+                              bool logical, bool arith)
+{
+    for (auto &pr : mo->elems)
+        check(pr.second.get());
+
+    STyRef left = type_of(mo->elems[0].second.get());
+
+    for (size_t i = 1; i < mo->elems.size(); i++) {
+        Op op = mo->elems[i].first;
+        Construct *rnode = mo->elems[i].second.get();
+        STyRef right = type_of(rnode);
+
+        if (logical) {
+            /* && / || require int operands (verified runtime behaviour) */
+            require_nonopt(left, mo->start, mo->end, "with operator &&/||");
+            require_nonopt(right, rnode->start, rnode->end, "with operator &&/||");
+        } else if (comparison) {
+            Op o = op;
+            if (o != Op::eq && o != Op::noteq) {
+                /* ordering: numeric or string only, non-opt */
+                require_nonopt(left, mo->start, mo->end, "in a comparison");
+                require_nonopt(right, rnode->start, rnode->end,
+                               "in a comparison");
+                STyRef l = strip(sty_resolve(left)), r = strip(sty_resolve(right));
+                if (!is_dyn(l) && !is_dyn(r)) {
+                    bool ok = (is_num(l) && is_num(r)) ||
+                              (l->kind == STyKind::Str && r->kind == STyKind::Str);
+                    if (!ok)
+                        mismatch("cannot compare '" + sty_to_string(left) +
+                                     "' with '" + sty_to_string(right) + "'",
+                                 mo->start, rnode->end);
+                }
+            }
+        } else if (arith) {
+            require_nonopt(left, mo->start, mo->end, "in an arithmetic operation");
+            require_nonopt(right, rnode->start, rnode->end,
+                           "in an arithmetic operation");
+            STyRef res = binop_result(op, left, right);
+            STyRef l = strip(sty_resolve(left)), r = strip(sty_resolve(right));
+            if (!is_dyn(l) && !is_dyn(r) && is_dyn(res)) {
+                /* binop_result returns dyn for an invalid combination */
+                mismatch("operator does not apply to '" + sty_to_string(left) +
+                             "' and '" + sty_to_string(right) + "'",
+                         mo->start, rnode->end);
+            }
+        }
+        left = binop_result(op, left, right);
+    }
+}
+
+void Inferencer::check(Construct *n)
+{
+    if (!n)
+        return;
+
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        FuncInfo *prev = cur_func;
+        auto it = func_of_decl.find(fd);
+        cur_func = (it != func_of_decl.end()) ? it->second : nullptr;
+        check(fd->body.get());
+        cur_func = prev;
+        return;
+    }
+
+    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+        check_call(call);
+        return;
+    }
+
+    if (dynamic_cast<Expr03 *>(n) || dynamic_cast<Expr04 *>(n)) {
+        check_binops(static_cast<MultiOpConstruct *>(n), false, false, true);
+        return;
+    }
+    if (dynamic_cast<Expr06 *>(n) || dynamic_cast<Expr07 *>(n)) {
+        check_binops(static_cast<MultiOpConstruct *>(n), true, false, false);
+        return;
+    }
+    if (dynamic_cast<Expr11 *>(n) || dynamic_cast<Expr12 *>(n)) {
+        check_binops(static_cast<MultiOpConstruct *>(n), false, true, false);
+        return;
+    }
+
+    if (auto *e2 = dynamic_cast<Expr02 *>(n)) {
+        check(e2->elems[0].second.get());
+        Op op = e2->elems[0].first;
+        if (op == Op::plus || op == Op::minus) {
+            STyRef t = type_of(e2->elems[0].second.get());
+            require_nonopt(t, n->start, n->end, "with a unary +/-");
+            STyRef u = strip(sty_resolve(t));
+            if (!is_dyn(u) && !is_num(u))
+                mismatch("unary +/- needs a number, got '" + sty_to_string(t) +
+                             "'", n->start, n->end);
+        }
+        return;
+    }
+
+    if (auto *sub = dynamic_cast<Subscript *>(n)) {
+        check(sub->what.get());
+        check(sub->index.get());
+        STyRef w = type_of(sub->what.get());
+        require_nonopt(w, sub->what->start, sub->what->end, "as a subscript base");
+        STyRef wr = strip(sty_resolve(w));
+        if (!is_dyn(wr) && wr->kind != STyKind::Array &&
+            wr->kind != STyKind::Dict && wr->kind != STyKind::Str)
+            mismatch("type '" + sty_to_string(w) + "' is not subscriptable",
+                     sub->what->start, sub->what->end);
+        return;
+    }
+
+    if (auto *sl = dynamic_cast<Slice *>(n)) {
+        check(sl->what.get());
+        check(sl->start_idx.get());
+        check(sl->end_idx.get());
+        STyRef w = type_of(sl->what.get());
+        require_nonopt(w, sl->what->start, sl->what->end, "as a slice base");
+        STyRef wr = strip(sty_resolve(w));
+        if (!is_dyn(wr) && wr->kind != STyKind::Array && wr->kind != STyKind::Str)
+            mismatch("type '" + sty_to_string(w) + "' is not sliceable",
+                     sl->what->start, sl->what->end);
+        return;
+    }
+
+    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+        check(fe->container.get());
+        check(fe->body.get());
+        STyRef c = type_of(fe->container.get());
+        require_nonopt(c, fe->container->start, fe->container->end,
+                       "as a foreach container");
+        return;
+    }
+
+    if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+        check(e14->rvalue.get());
+        if (!(e14->fl & pFlags::pInDecl))
+            check(e14->lvalue.get());
+        if (e14->op != Op::assign) {
+            /* compound assign: validate the implied binary op */
+            STyRef l = type_of(e14->lvalue.get());
+            STyRef r = type_of(e14->rvalue.get());
+            require_nonopt(l, e14->lvalue->start, e14->lvalue->end,
+                           "in a compound assignment");
+            require_nonopt(r, e14->rvalue->start, e14->rvalue->end,
+                           "in a compound assignment");
+            STyRef res = binop_result(compound_binop(e14->op), l, r);
+            STyRef ls = strip(sty_resolve(l)), rs = strip(sty_resolve(r));
+            if (!is_dyn(ls) && !is_dyn(rs) && is_dyn(res))
+                mismatch("operator does not apply to '" + sty_to_string(l) +
+                             "' and '" + sty_to_string(r) + "'",
+                         e14->start, e14->end);
+        }
+        return;
+    }
+
+    if (auto *th = dynamic_cast<ThrowStmt *>(n)) {
+        check(th->elem.get());
+        STyRef t = strip(sty_resolve(type_of(th->elem.get())));
+        if (!is_dyn(t) && t->kind != STyKind::Exception &&
+            t->kind != STyKind::Unknown && t->kind != STyKind::None)
+            mismatch("can only throw an exception, got '" +
+                         sty_to_string(type_of(th->elem.get())) + "'",
+                     th->elem->start, th->elem->end);
+        return;
+    }
+
+    for_each_child(n, [&](Construct *c) { check(c); });
+}
+
+void Inferencer::check_call(CallExpr *call)
+{
+    check(call->what.get());
+    for (auto &a : call->args->elems)
+        check(a.get());
+
+    ExprList *args = call->args.get();
+
+    /* resolve the callee to a parameter list (FuncInfo or a Func STy) */
+    std::vector<TypeSym *> *fparams = nullptr;
+    const STy *fsty = nullptr;
+    bool callable_known = false;
+
+    if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
+        fparams = &fi->params;
+        callable_known = true;
+    } else if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+        auto it = id_sym.find(cid);
+        TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
+        if (s && s->func) {
+            fparams = &s->func->params;
+            callable_known = true;
+        } else if (s && is_func(s->type)) {
+            fsty = sty_resolve(s->type);
+            callable_known = true;
+        } else if (s && is_dyn(s->type)) {
+            return;                       /* dyn callee: no checks */
+        } else if (!s && is_builtin(cid->uid)) {
+            return;                       /* builtin arity checked at runtime */
+        } else if (s) {
+            mismatch("'" + std::string(cid->uid->val) +
+                         "' is not callable (type '" + sty_to_string(s->type) +
+                         "')", call->what->start, call->what->end);
+        } else {
+            return;                       /* unresolved -> dyn (Q4) */
+        }
+    } else {
+        STyRef ct = type_of(call->what.get());
+        if (is_dyn(ct))
+            return;
+        if (is_func(ct)) {
+            fsty = sty_resolve(ct);
+            callable_known = true;
+        } else {
+            mismatch("expression of type '" + sty_to_string(ct) +
+                         "' is not callable", call->what->start,
+                     call->what->end);
+        }
+    }
+
+    if (!callable_known)
+        return;
+
+    size_t nparams = fparams ? fparams->size() : fsty->params.size();
+    size_t nargs = args->elems.size();
+
+    if (nargs != nparams)
+        argcount("function expects " + std::to_string(nparams) +
+                     " argument(s), got " + std::to_string(nargs),
+                 call->start, call->end);
+
+    for (size_t i = 0; i < nargs && i < nparams; i++) {
+        Construct *anode = args->elems[i].get();
+        STyRef at = type_of(anode);
+
+        bool p_dyn, p_opt;
+        STyRef ptype;
+        if (fparams) {
+            p_dyn = (*fparams)[i]->dyn_decl;
+            p_opt = (*fparams)[i]->opt_decl;
+            ptype = (*fparams)[i]->type;
+        } else {
+            p_dyn = sty_resolve(fsty->params[i])->kind == STyKind::Dyn;
+            p_opt = i < fsty->param_opt.size() && fsty->param_opt[i];
+            ptype = fsty->params[i];
+        }
+
+        if (p_dyn || is_dyn(at))
+            continue;
+
+        if (!p_opt && is_optish(at))
+            nullability("argument " + std::to_string(i + 1) +
+                            " may be none but the parameter is not 'opt'",
+                        anode->start, anode->end);
+
+        STyRef src = p_opt ? at : strip(at);
+        if (!sty_assignable(src, ptype))
+            mismatch("argument " + std::to_string(i + 1) + " has type '" +
+                         sty_to_string(at) + "' but the parameter is '" +
+                         sty_to_string(ptype) + "'",
+                     anode->start, anode->end);
+    }
+}
+
+}  /* anonymous namespace */
+
+void infer_types(Construct *root, bool enable)
+{
+    if (!enable || !root)
+        return;
+
+    Inferencer inf(root);
+    inf.run();
+}

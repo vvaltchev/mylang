@@ -167,6 +167,31 @@ DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
 DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_SIMPLE_EX(CannotChangeConstEx, "Cannot change constant")
 
+/*
+ * Compile-time type-inference errors (see plans/type-inference.md). They are
+ * plain Exceptions (NOT RuntimeExceptions), so script `try/catch` cannot catch
+ * them: a type violation fails the build, like a SyntaxError. Each takes a
+ * custom message (the inferencer interns it so it outlives the throw) and the
+ * offending node's Loc for the caret.
+ */
+struct TypeMismatchEx : public Exception {
+    TypeMismatchEx(const char *m = "Type mismatch",
+                   Loc start = Loc(), Loc end = Loc())
+        : Exception("TypeMismatchEx", m, start, end) { }
+};
+
+struct NullabilityEx : public Exception {
+    NullabilityEx(const char *m = "Nullability error",
+                  Loc start = Loc(), Loc end = Loc())
+        : Exception("NullabilityEx", m, start, end) { }
+};
+
+struct WrongArgCountEx : public Exception {
+    WrongArgCountEx(const char *m = "Wrong number of arguments",
+                    Loc start = Loc(), Loc end = Loc())
+        : Exception("WrongArgCountEx", m, start, end) { }
+};
+
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")

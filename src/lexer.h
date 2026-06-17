@@ -93,8 +93,10 @@ enum class Keyword : int {
     kw_in       = 21,
     kw_indexed  = 22,
     kw_pure     = 23,
+    kw_opt      = 24,
+    kw_dyn      = 25,
 
-    kw_count    = 24,
+    kw_count    = 26,
 };
 
 static const std::array<std::string, (int)Keyword::kw_count> KwString =
@@ -124,6 +126,8 @@ static const std::array<std::string, (int)Keyword::kw_count> KwString =
     "in",
     "indexed",
     "pure",
+    "opt",
+    "dyn",
 };
 
 std::ostream &operator<<(std::ostream &s, TokType t);

@@ -16,6 +16,8 @@ enum pFlags : unsigned {
     pInStmt         = 1 << 4,
     pInFuncBody     = 1 << 5,
     pInCatchBody    = 1 << 6,
+    pInOptDecl      = 1 << 7,   /* `var opt`/`const opt`: declared nullable */
+    pInDynDecl      = 1 << 8,   /* `var dyn`/`const dyn`: declared dynamic */
 };
 
 enum class ConstructType {
@@ -388,6 +390,10 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
+    /* The baked const value (read-only). Used by the type inferencer to derive
+     * the static type of a folded const array/dict literal. */
+    const EvalValue &literal_value() const { return value; }
+
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<LiteralObj>(value, immutable);
         copy_base_fields(*c);
@@ -449,6 +455,15 @@ public:
     bool const_param = false;
     bool auto_const_param = false;
 
+    /*
+     * Type-inference modifiers (see plans/type-inference.md). Set by the parser
+     * for a param or a var/const declared `opt` (nullable: may hold `none`) or
+     * `dyn` (dynamically typed: behaves as today, inference does not constrain
+     * it). Only meaningful on a declaration / parameter identifier.
+     */
+    bool opt_mod = false;
+    bool dyn_mod = false;
+
     Identifier(const std::string_view &str)
         : Construct("Id", false, ConstructType::id)
         , uid(UniqueId::get(str))
@@ -464,6 +479,8 @@ public:
         c->sym = sym;
         c->const_param = const_param;
         c->auto_const_param = auto_const_param;
+        c->opt_mod = opt_mod;
+        c->dyn_mod = dyn_mod;
         return c;
     }
 };

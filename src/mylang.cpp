@@ -7,6 +7,7 @@
 #include "eval.h"
 #include "resolver.h"
 #include "backtrace.h"
+#include "inferencer.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -22,6 +23,7 @@ static bool opt_no_const_eval;
 static bool opt_no_inline;
 static int opt_inline_threshold = 24;  /* max inlined body size (nodes) */
 static bool opt_no_run;
+static bool opt_no_type_infer;
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
@@ -40,6 +42,7 @@ void help()
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
+    cout << " -nti      No type inference / checking (debug)" << endl;
 
 #ifdef TESTS
     cout << "  -rt      Run unit tests" << endl;
@@ -143,6 +146,10 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-nr")) {
 
             opt_no_run = true;
+
+        } else if (!strcmp(arg, "-nti")) {
+
+            opt_no_type_infer = true;
 
         } else if (!strcmp(arg, "-e")) {
 
@@ -315,6 +322,11 @@ int main(int argc, char **argv)
                 "Unexpected token at the end",
                 &ctx.get_tok()
             );
+
+        /* Static type inference + checking (compile-time). Runs before
+         * resolve_names, on the clean source tree. A type violation throws a
+         * compile-time exception here. Validation-only (-nr) still runs it. */
+        infer_types(root.get(), !opt_no_type_infer);
 
         if (!opt_no_run) {
             /* Resolve names to slots, then run the script. The root block
