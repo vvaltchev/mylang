@@ -119,6 +119,17 @@ static bool is_lvalue_arg_builtin(std::string_view name)
         || name == "undef";
 }
 
+/* True if `v` is a read-only (const-backed) array or dict value. Mirrors the
+ * static helper of the same name in parser.cpp; scalars are never read-only. */
+static bool is_readonly_value(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>())
+        return v.get<SharedArrayObj>().is_readonly();
+    if (v.is<shared_ptr<DictObject>>())
+        return v.get<shared_ptr<DictObject>>()->is_readonly();
+    return false;
+}
+
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
@@ -151,9 +162,20 @@ public:
         FCtx fc{ writes, {}, {}, params };
         prescan_blocked(b, fc.blocked);
 
-        for (const auto &kv : seed)
-            if (!fc.blocked.count(kv.first))
+        /* A read-only array/dict const may also be substituted as a
+         * subscript/member READ base, which the strict set blocks; the relaxed
+         * set keeps every other block (capture, lvalue-builtin first arg,
+         * callee, foreach var). Scalars stay on the strict set. */
+        std::unordered_set<int> arr_blocked;
+        prescan_blocked(b, arr_blocked, /*block_subscript_bases=*/false);
+
+        for (const auto &kv : seed) {
+            const bool arr = kv.second.is<SharedArrayObj>()
+                          || kv.second.is<shared_ptr<DictObject>>();
+            const std::unordered_set<int> &blk = arr ? arr_blocked : fc.blocked;
+            if (!blk.count(kv.first))
                 fc.consts.emplace(kv.first, kv.second);
+        }
 
         try {
             fold_block(b, fc);
@@ -295,8 +317,16 @@ private:
      *   - a foreach loop variable, which is implicitly reassigned every
      *     iteration (so it is not really write-once despite its write count).
      * Does not descend into nested function bodies (a separate slot frame).
+     *
+     * `block_subscript_bases` (default true) gates the subscript/member-base
+     * rule. Specialization passes false: a read-only array/dict const is sound
+     * to substitute as a subscript/member base (the param decl is kept, so an
+     * lvalue base doesn't dangle, and fold_reads never rewrites an lvalue
+     * position anyway), so only the genuinely-unsafe blocks (capture, lvalue
+     * builtin first arg, callee, foreach var) should apply to it.
      */
-    void prescan_blocked(Construct *c, std::unordered_set<int> &blocked)
+    void prescan_blocked(Construct *c, std::unordered_set<int> &blocked,
+                         bool block_subscript_bases = true)
     {
         if (!c)
             return;
@@ -326,9 +356,11 @@ private:
                     && is_lvalue_arg_builtin(callee->get_str()))
                 block(ce->args->elems[0].get());
         } else if (auto *sub = dynamic_cast<Subscript *>(c)) {
-            block(sub->what.get());
+            if (block_subscript_bases)
+                block(sub->what.get());
         } else if (auto *me = dynamic_cast<MemberExpr *>(c)) {
-            block(me->what.get());
+            if (block_subscript_bases)
+                block(me->what.get());
         } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
             if (fe->ids)
                 for (auto &id : fe->ids->elems)
@@ -338,7 +370,9 @@ private:
         /* Complete recursion. for_each_child intentionally skips the nodes the
          * resolver's walk() handles itself (Block/for/foreach/try), so descend
          * into those explicitly here. */
-        auto rec = [&](Construct *ch) { prescan_blocked(ch, blocked); };
+        auto rec = [&](Construct *ch) {
+            prescan_blocked(ch, blocked, block_subscript_bases);
+        };
 
         if (auto *b = dynamic_cast<Block *>(c)) {
             for (auto &e : b->elems)
@@ -490,6 +524,16 @@ private:
             return true;
         }
 
+        if (auto *r = dynamic_cast<ReturnStmt *>(c)) {
+            /* fold the returned expression. ReturnStmt is a plain Construct
+             * (not a SingleChildConstruct), so fold_reads doesn't recurse into
+             * it - without this a promoted const used only in a `return` would
+             * have its decl dropped but the use left dangling (undefined var),
+             * and a specialized clone couldn't fold its return expression. */
+            fold_reads(r->elem, fc);
+            return true;
+        }
+
         if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
             fold_reads(e14->rvalue, fc);   /* assignment as a statement */
             return true;
@@ -514,8 +558,17 @@ private:
         if (auto *id = dynamic_cast<Identifier *>(c)) {
             if (id->sym.kind == SymKind::local) {
                 auto it = fc.consts.find(id->sym.slot);
-                if (it != fc.consts.end())
-                    MakeConstructFromConstVal(it->second, slot, false);
+                if (it != fc.consts.end()) {
+                    /* Scalars inline as a literal. A seeded array/dict const
+                     * (specialization only) bakes into a read-only LiteralObj
+                     * so refold can fold reads of it - process_arrays and
+                     * immutable both on. The value is already read-only, so any
+                     * mutation of it still throws the same error at runtime. */
+                    const bool arr =
+                        it->second.is<SharedArrayObj>()
+                        || it->second.is<shared_ptr<DictObject>>();
+                    MakeConstructFromConstVal(it->second, slot, arr, arr);
+                }
             }
             return;
         }
@@ -1464,6 +1517,45 @@ private:
         return n;
     }
 
+    /*
+     * A COMPLETE node count: unlike node_count (which uses for_each_child, and
+     * so stops at Block/Expr14/for/foreach/try the way the resolver's walk()
+     * handles them itself), this descends into those too. Needed by the
+     * specialization shrink check, whose win is often deep inside a kept
+     * statement (a folded `var t = a[0]+a[1]` rvalue) node_count can't see.
+     */
+    static int count_all_nodes(const Construct *c)
+    {
+        if (!c)
+            return 0;
+        int n = 1;
+
+        if (auto *b = dynamic_cast<const Block *>(c)) {
+            for (auto &e : b->elems)
+                n += count_all_nodes(e.get());
+        } else if (auto *e14 = dynamic_cast<const Expr14 *>(c)) {
+            n += count_all_nodes(e14->lvalue.get());
+            n += count_all_nodes(e14->rvalue.get());
+        } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+            n += count_all_nodes(f->init.get());
+            n += count_all_nodes(f->cond.get());
+            n += count_all_nodes(f->inc.get());
+            n += count_all_nodes(f->body.get());
+        } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+            n += count_all_nodes(fe->container.get());
+            n += count_all_nodes(fe->body.get());
+        } else if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+            n += count_all_nodes(tc->tryBody.get());
+            for (auto &p : tc->catchStmts)
+                n += count_all_nodes(p.second.get());
+            n += count_all_nodes(tc->finallyBody.get());
+        } else {
+            for_each_child(const_cast<Construct *>(c),
+                [&](Construct *ch) { n += count_all_nodes(ch); });
+        }
+        return n;
+    }
+
     static int count_uses(const Construct *c, const UniqueId *uid)
     {
         if (!c)
@@ -1618,14 +1710,35 @@ private:
         if (ce->args->elems.size() != nparams)
             return;
 
-        /* Scalar-const args on never-reassigned params -> the binding seed. */
+        /* Const args on never-reassigned params -> the binding seed. Scalars
+         * bind directly; a const (deep read-only) array/dict binds too, so its
+         * reads fold in the clone. Binding a read-only value is sound: it is
+         * only ever substituted in read positions, and any mutation throws the
+         * same error at runtime as the un-specialized call would. */
         std::unordered_map<int, EvalValue> seed;
         for (size_t i = 0; i < nparams; i++) {
-            if (!dynamic_cast<Literal *>(ce->args->elems[i].get()))
-                continue;
             if (i >= f->slot_writes.size() || f->slot_writes[i] != 0)
                 continue;          /* unknown or reassigned: don't bind it */
-            seed[static_cast<int>(i)] = ce->args->elems[i]->eval(&cctx);
+
+            Construct *arg = ce->args->elems[i].get();
+
+            if (dynamic_cast<Literal *>(arg)) {
+                seed[static_cast<int>(i)] = arg->eval(&cctx);
+                continue;
+            }
+
+            /* A baked const array/dict literal, or an identifier bound to a
+             * const global; bind only when its value is deep read-only. */
+            if (dynamic_cast<LiteralObj *>(arg)
+                    || dynamic_cast<Identifier *>(arg)) {
+                try {
+                    EvalValue v = RValue(arg->eval(&cctx));
+                    if (is_readonly_value(v))
+                        seed[static_cast<int>(i)] = move(v);
+                } catch (const Exception &) {
+                    /* not const-evaluable (a runtime local/global): skip */
+                }
+            }
         }
 
         if (seed.empty())
@@ -1655,7 +1768,7 @@ private:
     FuncDeclStmt *build_specialization(
         FuncDeclStmt *f, const std::unordered_map<int, EvalValue> &seed)
     {
-        const int before = node_count(f->body.get());
+        const int before = count_all_nodes(f->body.get());
 
         unique_ptr<Construct> clone = f->clone();
         auto *fc = static_cast<FuncDeclStmt *>(clone.get());
@@ -1677,7 +1790,7 @@ private:
          * folds self-contained subscript/slice/member/array-call results. */
         refold(fc->body);
 
-        if (node_count(fc->body.get()) >= before)
+        if (count_all_nodes(fc->body.get()) >= before)
             return nullptr;        /* folding didn't shrink it: not worth it */
 
         FuncDeclStmt *raw = fc;
@@ -1700,12 +1813,12 @@ private:
             k += ";";
             k += std::to_string(s);
             k += "=";
-            k += scalar_repr(seed.at(s));
+            k += value_repr(seed.at(s));
         }
         return k;
     }
 
-    static std::string scalar_repr(const EvalValue &v)
+    static std::string value_repr(const EvalValue &v)
     {
         if (v.is<int_type>())
             return "i" + std::to_string(v.get<int_type>());
@@ -1718,6 +1831,13 @@ private:
             const std::string_view sv = v.get<SharedStr>().get_view();
             return "s" + std::to_string(sv.size()) + ":" + std::string(sv);
         }
+        /* An array/dict const: key by the shared object's identity (intptr).
+         * The same const object (e.g. a const global passed at several sites)
+         * keys once and shares one clone; two structurally-equal but distinct
+         * literals key apart (a missed de-dup, never a wrong reuse). */
+        if (v.is<SharedArrayObj>() || v.is<shared_ptr<DictObject>>())
+            return "p" + std::to_string(v.get_type()->intptr(v)
+                                            .get<int_type>());
         return "?";
     }
 
