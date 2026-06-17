@@ -89,7 +89,38 @@ public:
 
     virtual void serialize(ostream &s, int level = 0) const = 0;
     virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
+
+    /*
+     * Deep-clone this subtree: a faithful copy (children, locs, is_const,
+     * inline_ctx, and any resolved/slot state). Pure virtual, so every concrete
+     * node MUST implement it - a missing one is a compile error. Leaf clones
+     * use clone_as() for children and copy_base_fields()/clone_ops_into()/
+     * clone_elems_into() for the shared parts. Used by function inlining /
+     * specialization to copy a callee body before splicing it.
+     */
+    virtual unique_ptr<Construct> clone() const = 0;
+
+protected:
+
+    void copy_base_fields(Construct &d) const {
+        d.is_const = is_const;
+        d.start = start;
+        d.end = end;
+        d.inline_ctx = inline_ctx;
+    }
 };
+
+/*
+ * Clone a child pointer, preserving its static type: c->clone() returns a
+ * unique_ptr<Construct> whose dynamic type is exactly T, so the downcast is
+ * safe. Null in -> null out.
+ */
+template <class T>
+inline unique_ptr<T> clone_as(const unique_ptr<T> &c)
+{
+    return c ? unique_ptr<T>(static_cast<T *>(c->clone().release()))
+             : nullptr;
+}
 
 class ChildlessConstruct : public Construct {
 
@@ -129,6 +160,12 @@ public:
 
     /* Special methods */
     EvalValue eval_first_rvalue(EvalContext *ctx) const;
+
+protected:
+    void clone_ops_into(MultiOpConstruct &d) const {
+        for (const auto &pr : elems)
+            d.elems.emplace_back(pr.first, clone_as(pr.second));
+    }
 };
 
 template <class ElemT = Construct>
@@ -143,6 +180,12 @@ public:
     { }
 
     void serialize(ostream &s, int level = 0) const override;
+
+protected:
+    void clone_elems_into(MultiElemConstruct &d) const {
+        for (const auto &e : elems)
+            d.elems.push_back(clone_as(e));
+    }
 };
 
 template <class T>
@@ -188,6 +231,12 @@ public:
     }
 
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralInt>(value);
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class LiteralFloat final: public Literal {
@@ -203,6 +252,12 @@ public:
     }
 
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralFloat>(value);
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class LiteralNone final: public Literal {
@@ -211,6 +266,12 @@ public:
 
     LiteralNone() : Literal() { }
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralNone>();
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class NopConstruct final: public Construct {
@@ -222,6 +283,12 @@ public:
     virtual void serialize(ostream &s, int level = 0) const {
         /* NopConstructs should never remain in the final syntax tree */
         throw InternalErrorEx();
+    }
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<NopConstruct>();
+        copy_base_fields(*c);
+        return c;
     }
 };
 
@@ -240,6 +307,12 @@ public:
     }
 
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralStr>(value);
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class LiteralArray final: public MultiElemConstruct<> {
@@ -248,6 +321,13 @@ public:
 
     LiteralArray() : MultiElemConstruct<>("LiteralArray") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralArray>();
+        copy_base_fields(*c);
+        clone_elems_into(*c);
+        return c;
+    }
 };
 
 /*
@@ -296,6 +376,12 @@ public:
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralObj>(value, immutable);
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class LiteralDictKVPair final: public Construct {
@@ -309,6 +395,14 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         throw InternalErrorEx(); /* Construct not meant to be evaluated directly */
     }
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralDictKVPair>();
+        copy_base_fields(*c);
+        c->key = clone_as(key);
+        c->value = clone_as(value);
+        return c;
+    }
 };
 
 class LiteralDict final: public MultiElemConstruct<LiteralDictKVPair> {
@@ -317,6 +411,13 @@ public:
 
     LiteralDict() : MultiElemConstruct<LiteralDictKVPair>("LiteralDict") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralDict>();
+        copy_base_fields(*c);
+        clone_elems_into(*c);
+        return c;
+    }
 };
 
 
@@ -345,6 +446,15 @@ public:
     std::string_view get_str() const { return uid->val; }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Identifier>(get_str());
+        copy_base_fields(*c);
+        c->sym = sym;
+        c->const_param = const_param;
+        c->auto_const_param = auto_const_param;
+        return c;
+    }
 };
 
 class ExprList final: public MultiElemConstruct<> {
@@ -352,6 +462,13 @@ class ExprList final: public MultiElemConstruct<> {
 public:
 
     ExprList() : MultiElemConstruct<>("ExprList") { }
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<ExprList>();
+        copy_base_fields(*c);
+        clone_elems_into(*c);
+        return c;
+    }
 };
 
 class IdList final: public MultiElemConstruct<Identifier> {
@@ -361,6 +478,13 @@ public:
     IdList()
         : MultiElemConstruct<Identifier>("IdList", ConstructType::idlist)
     { }
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<IdList>();
+        copy_base_fields(*c);
+        clone_elems_into(*c);
+        return c;
+    }
 };
 
 class CallExpr final: public Construct {
@@ -372,12 +496,27 @@ public:
     CallExpr() : Construct("CallExpr") { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<CallExpr>();
+        copy_base_fields(*c);
+        c->what = clone_as(what);
+        c->args = clone_as(args);
+        return c;
+    }
 };
 
 class Expr01 final: public SingleChildConstruct {
 
 public:
     Expr01() : SingleChildConstruct("Expr01") { }
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr01>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        return c;
+    }
 };
 
 class Expr02 final: public MultiOpConstruct {
@@ -386,6 +525,13 @@ public:
 
     Expr02() : MultiOpConstruct("Expr02") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr02>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
 };
 
 
@@ -395,6 +541,13 @@ public:
 
     Expr03() : MultiOpConstruct("Expr03") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr03>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
 };
 
 class Expr04 final: public MultiOpConstruct {
@@ -403,6 +556,13 @@ public:
 
     Expr04() : MultiOpConstruct("Expr04") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr04>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
 };
 
 class Expr06 final: public MultiOpConstruct {
@@ -411,6 +571,13 @@ public:
 
     Expr06() : MultiOpConstruct("Expr06") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr06>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
 };
 
 class Expr07 final: public MultiOpConstruct {
@@ -419,6 +586,13 @@ public:
 
     Expr07() : MultiOpConstruct("Expr07") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr07>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
 };
 
 class Expr11 final: public MultiOpConstruct {
@@ -427,6 +601,13 @@ public:
 
     Expr11() : MultiOpConstruct("Expr11") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr11>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
 };
 
 class Expr12 final: public MultiOpConstruct {
@@ -435,6 +616,13 @@ public:
 
     Expr12() : MultiOpConstruct("Expr12") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr12>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
 };
 
 class Expr14 final: public Construct {
@@ -448,6 +636,16 @@ public:
     Expr14() : Construct("Expr14"), fl(pNone), op(Op::invalid) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr14>();
+        copy_base_fields(*c);
+        c->lvalue = clone_as(lvalue);
+        c->rvalue = clone_as(rvalue);
+        c->fl = fl;
+        c->op = op;
+        return c;
+    }
 };
 
 class IfStmt final: public Construct {
@@ -460,6 +658,15 @@ public:
     IfStmt() : Construct("IfStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<IfStmt>();
+        copy_base_fields(*c);
+        c->condExpr = clone_as(condExpr);
+        c->thenBlock = clone_as(thenBlock);
+        c->elseBlock = clone_as(elseBlock);
+        return c;
+    }
 };
 
 class Block final: public MultiElemConstruct<> {
@@ -478,6 +685,15 @@ public:
 
     Block() : MultiElemConstruct("Block", ConstructType::block) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Block>();
+        copy_base_fields(*c);
+        clone_elems_into(*c);
+        c->slot_start = slot_start;
+        c->slot_count = slot_count;
+        return c;
+    }
 };
 
 class BreakStmt final: public ChildlessConstruct {
@@ -485,6 +701,12 @@ class BreakStmt final: public ChildlessConstruct {
 public:
     BreakStmt(): ChildlessConstruct("BreakStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<BreakStmt>();
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class ContinueStmt final: public ChildlessConstruct {
@@ -492,6 +714,12 @@ class ContinueStmt final: public ChildlessConstruct {
 public:
     ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<ContinueStmt>();
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class ReturnStmt final: public Construct {
@@ -502,6 +730,13 @@ public:
     ReturnStmt(): Construct("ReturnStmt", false, ConstructType::ret) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<ReturnStmt>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        return c;
+    }
 };
 
 class WhileStmt final: public Construct {
@@ -513,6 +748,14 @@ public:
     WhileStmt() : Construct("WhileStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<WhileStmt>();
+        copy_base_fields(*c);
+        c->condExpr = clone_as(condExpr);
+        c->body = clone_as(body);
+        return c;
+    }
 };
 
 class FuncDeclStmt final: public Construct {
@@ -552,6 +795,21 @@ public:
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<FuncDeclStmt>();
+        copy_base_fields(*c);
+        c->id = clone_as(id);
+        c->captures = clone_as(captures);
+        c->params = clone_as(params);
+        c->body = clone_as(body);
+        c->resolved = resolved;
+        c->frame_size = frame_size;
+        c->slot_writes = slot_writes;
+        c->explicit_pure = explicit_pure;
+        c->effective_pure = effective_pure;
+        return c;
+    }
 };
 
 class Subscript final: public Construct {
@@ -564,6 +822,14 @@ public:
     Subscript() : Construct("Subscript") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Subscript>();
+        copy_base_fields(*c);
+        c->what = clone_as(what);
+        c->index = clone_as(index);
+        return c;
+    }
 };
 
 class Slice final: public Construct {
@@ -577,6 +843,15 @@ public:
     Slice() : Construct("Slice") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Slice>();
+        copy_base_fields(*c);
+        c->what = clone_as(what);
+        c->start_idx = clone_as(start_idx);
+        c->end_idx = clone_as(end_idx);
+        return c;
+    }
 };
 
 struct AllowedExList {
@@ -596,6 +871,20 @@ public:
     TryCatchStmt() : Construct("TryCatchStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<TryCatchStmt>();
+        copy_base_fields(*c);
+        c->tryBody = clone_as(tryBody);
+        c->finallyBody = clone_as(finallyBody);
+        for (const auto &cs : catchStmts) {
+            AllowedExList ael;
+            ael.exList = clone_as(cs.first.exList);
+            ael.asId = clone_as(cs.first.asId);
+            c->catchStmts.emplace_back(move(ael), clone_as(cs.second));
+        }
+        return c;
+    }
 };
 
 class RethrowStmt final: public ChildlessConstruct {
@@ -606,6 +895,12 @@ public:
         : ChildlessConstruct("RethrowStmt", start, end) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<RethrowStmt>();
+        copy_base_fields(*c);
+        return c;
+    }
 };
 
 class ThrowStmt final: public SingleChildConstruct {
@@ -613,6 +908,13 @@ class ThrowStmt final: public SingleChildConstruct {
 public:
     ThrowStmt(): SingleChildConstruct("ThrowStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<ThrowStmt>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        return c;
+    }
 };
 
 class ForeachStmt final: public Construct {
@@ -632,6 +934,17 @@ public:
     ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<ForeachStmt>();
+        copy_base_fields(*c);
+        c->ids = clone_as(ids);
+        c->container = clone_as(container);
+        c->body = clone_as(body);
+        c->idsVarDecl = idsVarDecl;
+        c->indexed = indexed;
+        return c;
+    }
 };
 
 class MemberExpr final: public Construct {
@@ -644,6 +957,14 @@ public:
     MemberExpr() : Construct("MemberExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<MemberExpr>();
+        copy_base_fields(*c);
+        c->what = clone_as(what);
+        c->memId = memId;
+        return c;
+    }
 };
 
 class ForStmt final: public Construct {
@@ -658,4 +979,14 @@ public:
     ForStmt() : Construct("ForStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<ForStmt>();
+        copy_base_fields(*c);
+        c->init = clone_as(init);
+        c->cond = clone_as(cond);
+        c->inc = clone_as(inc);
+        c->body = clone_as(body);
+        return c;
+    }
 };

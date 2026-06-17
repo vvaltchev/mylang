@@ -5268,9 +5268,72 @@ backtrace_inline_frames()
     return ok;
 }
 
+/*
+ * AST deep-clone (Construct::clone): cloning a parsed + resolved program must
+ * produce a structurally identical tree (same serialization) that is a separate
+ * object graph and still evaluates correctly on its own (its internal assert
+ * holds). Exercises many node types: funcs, pure funcs, arrays, dicts, foreach,
+ * for, if/else, try/catch, while.
+ */
+static bool
+ast_clone_roundtrip()
+{
+    static const char *src[] = {
+        "var total = 0;",
+        "func add(a, b) { return a + b; }",
+        "pure func sq(x) => x * x;",
+        "const arr = [1, 2, 3, 4, 5];",
+        "const d = {\"a\": 1, \"b\": 2};",
+        "foreach (var e in arr) total = total + e;",          /* 15 */
+        "for (var i = 0; i < 3; i += 1) {",
+        "    if (i % 2 == 0) total = total + sq(i);",         /* +0, +4 */
+        "    else total = total - i;",                        /* -1 */
+        "}",
+        "try { total = total + add(d.a, d.b); }",             /* +3 -> 21 */
+        "catch (Exception as ex) { total = -1; }",
+        "while (total > 1000) total = total - 1;",
+        "assert(total == 21);",
+    };
+
+    std::vector<Tok> tokens;
+    for (size_t i = 0; i < sizeof(src) / sizeof(src[0]); i++)
+        lexer(src[i], static_cast<int>(i + 1), tokens);
+
+    ParseContext pctx(TokenStream(tokens), true);
+    unique_ptr<Construct> root = pBlock(pctx);
+    resolve_names(root.get());
+
+    unique_ptr<Construct> cloned = root->clone();
+    bool ok = true;
+
+    /* (1) separate object graph */
+    ok = ok && cloned.get() != root.get();
+
+    /* (2) structurally identical: same serialization */
+    std::ostringstream a, b;
+    root->serialize(a, 0);
+    cloned->serialize(b, 0);
+    if (a.str() != b.str()) {
+        ok = false;
+        cout << "  serialize mismatch\n  orig:\n" << a.str()
+             << "\n  clone:\n" << b.str();
+    }
+
+    /* (3) the clone evaluates on its own; its assert(total == 21) must hold */
+    try {
+        cloned->eval(nullptr);
+    } catch (const Exception &e) {
+        ok = false;
+        cout << "  clone eval threw: " << e.name << "\n";
+    }
+
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
+    { "AST deep-clone round-trips", ast_clone_roundtrip },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

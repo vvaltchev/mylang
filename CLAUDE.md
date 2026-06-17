@@ -170,9 +170,11 @@ units:
 - `parser.cpp` / `parser.h` — recursive-descent parser, const-folding woven in.
   `pBlock()` is the
   entry point.
-- `syntax.h` / `syntax.cpp` — the `Construct` AST node hierarchy and its
-  `serialize()` (what `-s`
-  prints).
+- `syntax.h` / `syntax.cpp` — the `Construct` AST node hierarchy, its
+  `serialize()` (what `-s` prints), and `clone()` (a deep copy of a subtree,
+  used by inlining; pure virtual so every concrete node must provide one — see
+  the `clone_as`/`copy_base_fields`/`clone_ops_into`/`clone_elems_into`
+  helpers).
 - `resolver.cpp` / `resolver.h` — `resolve_names(root)`, a post-parse pass that
   assigns function
   params slot indices for O(1) access at runtime (see the value model section).
@@ -456,8 +458,9 @@ out of scope — unsound in a dynamically-typed language without type narrowing
 (float non-associativity, `+`-overloading on strings/arrays, preserved type
 errors). **Status:** the `InlineCtx` backtrace foundation exists (a
 `Construct::inline_ctx` field, the flush helper + the `Construct::eval` hook, a
-synthetic test) but is dormant — no inliner emits it yet. Next: AST deep-clone
-(none exists today), then the size-only inliner.
+synthetic test), and **AST deep-clone** (`Construct::clone()`, all node types,
+round-trip test) — but both are dormant: no inliner emits inline contexts or
+calls `clone()` yet. Next: the size-only inliner.
 
 ## The value & type model (the subtle part)
 
@@ -857,7 +860,9 @@ wire it into the right `pExprNN` level (or `pStmt`) in `parser.cpp`, add the
 `do_eval` behavior (a new
 `Type` virtual for an operator, or a new node in
 `syntax.h`/`syntax.cpp`+`eval.cpp` for a statement),
-and cover it in `tests.cpp`.
+and cover it in `tests.cpp`. A **new `Construct` node must also implement
+`clone()`** (pure virtual) — usually a few lines using the shared helpers;
+omitting it is a compile error.
 
 ## Conventions
 
