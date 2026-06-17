@@ -155,10 +155,10 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — nine translation
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — ten translation
 units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `eval.cpp`,
-`types.cpp`, `backtrace.cpp`, `mylang.cpp`,
+`types.cpp`, `stype.cpp`, `backtrace.cpp`, `mylang.cpp`,
 `tests.cpp`.
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
@@ -188,6 +188,12 @@ units:
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
+- `stype.cpp` / `stype.h` — the **static-type lattice** for the in-progress
+  type-inference feature (`STy`/`STyArena`: `resolve`/`unify`/`assignable`/
+  `join`/`equal`/`to_string`). Distinct from the runtime `Type *` ops table —
+  this is what the compile-time inferencer reasons over (type variables,
+  nullability `opt`, structural array/dict/func shapes). M0 only; no AST wiring
+  yet. See `plans/type-inference.md`.
 - `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
   `Exception`'s captured call-stack (see the error model section).
 
