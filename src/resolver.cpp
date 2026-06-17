@@ -105,6 +105,20 @@ struct FuncState {
  * reference's binding is unambiguous - no scope tracking is needed here: every
  * Identifier with the same sym.slot in a function is the same variable.
  */
+
+/*
+ * Builtins that take their FIRST argument as an lvalue or identifier (and throw
+ * NotLValueEx / require an identifier otherwise). A value substituted/folded
+ * there would change behavior, so neither auto-const nor the inliner folds it.
+ * Every other call's arguments are safe to fold.
+ */
+static bool is_lvalue_arg_builtin(std::string_view name)
+{
+    return name == "append" || name == "push" || name == "pop"
+        || name == "insert" || name == "erase" || name == "intptr"
+        || name == "undef";
+}
+
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
@@ -169,20 +183,6 @@ private:
     static bool is_scalar_literal(const Construct *c)
     {
         return dynamic_cast<const Literal *>(c) != nullptr;
-    }
-
-    /*
-     * Builtins that take their FIRST argument as an lvalue or identifier (and
-     * throw NotLValueEx / require an identifier otherwise). Folding a variable
-     * passed there would change behavior, so such a variable is not promoted.
-     * Args to every other call - pure/user functions and read-only builtins -
-     * are safe to fold, which is what enables isconst() and pure-call folding.
-     */
-    static bool is_lvalue_arg_builtin(std::string_view name)
-    {
-        return name == "append" || name == "push" || name == "pop"
-            || name == "insert" || name == "erase" || name == "intptr"
-            || name == "undef";
     }
 
     /*
@@ -1262,6 +1262,8 @@ public:
                 add_unique(spec_funcs, fd);
         }
 
+        seed_const_globals(root);
+
         for (auto &e : root->elems)
             walk(e);
 
@@ -1275,6 +1277,30 @@ public:
     }
 
 private:
+
+    /*
+     * Register top-level const array/dict globals into cctx so refold can fold
+     * reads of them (e.g. `tbl[0]`). Their rvalues are self-contained baked
+     * values (LiteralObj), so order doesn't matter and eval needs no other
+     * context. Scalar consts are already inlined everywhere (no decl remains);
+     * const funcs are skipped (not foldable as a value here).
+     */
+    void seed_const_globals(Block *root)
+    {
+        for (auto &e : root->elems) {
+            auto *e14 = dynamic_cast<Expr14 *>(e.get());
+            if (!e14 || !(e14->fl & pFlags::pInConstDecl))
+                continue;
+            auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
+            if (!id || !dynamic_cast<LiteralObj *>(e14->rvalue.get()))
+                continue;
+            try {
+                cctx.emplace(id, RValue(e14->rvalue->eval(&cctx)), true);
+            } catch (const Exception &) {
+                /* unexpected: just don't seed it */
+            }
+        }
+    }
 
     static bool inlinable_decl(const FuncDeclStmt *fd)
     {
@@ -1482,57 +1508,71 @@ private:
         return false;
     }
 
-    /* Are all of a node's value-operands self-contained constants? (For a call
-     * the operands are its args; the callee is checked separately.) */
-    static bool operands_const(const Construct *c)
+    /* A read-expression node we may try to evaluate-and-fold. */
+    static bool is_foldable_expr(const Construct *c)
     {
-        if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
-            for (auto &p : mo->elems)
-                if (!is_const_literal(p.second.get()))
-                    return false;
-            return true;
-        }
-        if (auto *sub = dynamic_cast<const Subscript *>(c))
-            return is_const_literal(sub->what.get())
-                && is_const_literal(sub->index.get());
-        if (auto *sl = dynamic_cast<const Slice *>(c))
-            return is_const_literal(sl->what.get())
-                && (!sl->start_idx || is_const_literal(sl->start_idx.get()))
-                && (!sl->end_idx || is_const_literal(sl->end_idx.get()));
-        if (auto *me = dynamic_cast<const MemberExpr *>(c))
-            return is_const_literal(me->what.get());
-        if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
-            if (!dynamic_cast<const Identifier *>(ce->what.get()))
-                return false;          /* callee resolved via cctx */
-            if (ce->args)
-                for (auto &a : ce->args->elems)
-                    if (!is_const_literal(a.get()))
-                        return false;
-            return true;
-        }
-        return false;
+        return dynamic_cast<const MultiOpConstruct *>(c)
+            || dynamic_cast<const Subscript *>(c)
+            || dynamic_cast<const Slice *>(c)
+            || dynamic_cast<const MemberExpr *>(c)
+            || dynamic_cast<const CallExpr *>(c);
+    }
+
+    /*
+     * Does the subtree reference a slotted local (a runtime param/local)? That
+     * read would deref the frame, which `cctx` doesn't have, so we must not try
+     * to evaluate a node that contains one. (A const global / builtin is a map
+     * lookup, sym.kind != local, and lives in cctx - safe.)
+     */
+    static bool has_slotted_local(const Construct *c)
+    {
+        if (!c)
+            return false;
+        if (auto *id = dynamic_cast<const Identifier *>(c))
+            return id->sym.kind == SymKind::local;
+        bool found = false;
+        for_each_child(const_cast<Construct *>(c),
+            [&](Construct *ch) { if (has_slotted_local(ch)) found = true; });
+        return found;
     }
 
     /*
      * Bottom-up constant folding of a spliced/specialized body. Folds an
      * operator, subscript, slice, member access, or const-builtin call whose
-     * operands are all self-contained constants (see operands_const) to a
-     * literal - evaluated against `cctx` (const builtins only). The folded
-     * value's read-only-ness is preserved (a slice of a const stays read-only;
-     * a fresh result stays mutable). A node whose evaluation throws (6/0, an
-     * out-of-bounds index, a type mismatch) or whose callee isn't a const
-     * builtin is left for runtime - matching the un-inlined call.
+     * operands are compile-time constants - scalar/array/dict literals AND
+     * const globals (seeded into `cctx` from the top-level const decls) - to a
+     * literal. The folded value's read-only-ness is preserved (a slice of a
+     * const stays read-only; a fresh result stays mutable). A node that throws
+     * (6/0, an out-of-bounds index, a type mismatch) or references a runtime
+     * value (a slotted local, or a global not in cctx) is left for runtime,
+     * matching the un-inlined call. Lvalue positions are NOT folded (an
+     * assignment target or an lvalue builtin's first arg), so folding never
+     * turns a write target into a value (changing a const-mutation error type).
      */
     void refold(unique_ptr<Construct> &slot)
     {
         if (!slot)
             return;
 
-        for_each_child_slot(slot.get(),
-            [&](unique_ptr<Construct> &ch) { refold(ch); });
+        /* Recurse, skipping lvalue positions. */
+        Construct *cc = slot.get();
+        if (auto *e14 = dynamic_cast<Expr14 *>(cc)) {
+            refold(e14->rvalue);                 /* skip assignment target */
+        } else if (auto *ce = dynamic_cast<CallExpr *>(cc)) {
+            refold(ce->what);
+            auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+            const bool lval0 = callee && ce->args && !ce->args->elems.empty()
+                            && is_lvalue_arg_builtin(callee->get_str());
+            for (size_t i = 0; i < ce->args->elems.size(); i++)
+                if (!(lval0 && i == 0))          /* skip the lvalue first arg */
+                    refold(ce->args->elems[i]);
+        } else {
+            for_each_child_slot(cc,
+                [&](unique_ptr<Construct> &ch) { refold(ch); });
+        }
 
         Construct *c = slot.get();
-        if (is_const_literal(c) || !operands_const(c))
+        if (is_const_literal(c) || !is_foldable_expr(c) || has_slotted_local(c))
             return;
 
         try {

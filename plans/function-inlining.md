@@ -259,18 +259,30 @@ Two properties that make this cheap and safe:
    identical output and a div-by-zero inside a clone shows `f`, not `$spec0`.
    (Scalar consts only; array/dict const args and recursion-into-clones are not
    specialized.)
+## Done since the milestones
+
+- **Const-global subscript/slice/member/call folding** in spliced/specialized
+  bodies. `refold` now seeds the const array/dict globals (from the top-level
+  `const` decls) into `cctx` and folds a read whose operands reference only
+  literals + const globals/builtins (no slotted local - `has_slotted_local`
+  guards against a missing-frame deref). It skips lvalue positions (an
+  assignment target, an lvalue builtin's first arg) so a write target is never
+  turned into a value. `tbl[0]` (const global) now folds to its element.
+
 ## Remaining / tracked tasks
 
 Not yet done; roughly in priority order:
 
-1. **Const-global subscript/slice/member folding** in spliced/specialized
-   bodies. `refold` only folds self-contained literals, so `tbl[0]` (a const
-   array *global*) stays a runtime read. Needs a fold context seeded with the
-   const-array/dict globals (scan the top-level `const` decls, eval their
-   `LiteralObj` rvalues into an `EvalContext`), then fold against it. Subtlety:
-   must not deref a missing frame for slotted locals - only fold when operands
-   reference const globals/builtins, not runtime locals (catch
-   `UndefinedVariableEx` and leave).
+1. **Inlined *builtin*-call errors lose the inline frame in the backtrace.**
+   Pre-existing since the size-only inliner: a non-pure inlined body calling a
+   *builtin* which throws (e.g. `func f() => append(tbl, 9)`, or `len(x)` on a
+   bad type) drops the enclosing function's frame, because builtins bypass
+   `do_func_call` (where the call-site flush lives) and the builtin stamps the
+   error loc, defeating the loc-based once-guard in `Construct::eval`. Fix:
+   flush the call's `inline_ctx` in `CallExpr::do_eval`'s builtin path, guarded
+   by a dedicated `Exception` flag (so it fires once even when the loc is
+   already set), and switch the error-origin flushes to that flag. Only the
+   error TYPE/loc are currently right; the frame is missing.
 2. **Array/dict const args in specialization.** Today only *scalar* const args
    seed a specialization (`scalar_repr` / the seed loop). Allow const
    array/dict args too (key them by value, e.g. via the CSE-style canonical key

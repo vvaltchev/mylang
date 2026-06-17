@@ -5611,6 +5611,37 @@ inliner_refolds_non_multiop()
     return ok;
 }
 
+/*
+ * Const-global folding: a read of a const array/dict GLOBAL with a const index
+ * folds in a spliced body. `tbl[0]` (tbl a const global) folds to `100` after a
+ * non-pure `pick(0)` is inlined - the global's value is seeded into the fold
+ * context from its top-level decl.
+ */
+static bool
+inliner_folds_const_global()
+{
+    const std::vector<const char *> src = {
+        "const tbl = [100, 200, 300];",
+        "var g = 1;",
+        "g = 2;",
+        "func pick(i) => tbl[i] + g;",       /* not pure (reads g) */
+        "var r = pick(0);",                  /* -> tbl[0] + g -> 100 + g */
+        "assert(r == 102);",
+    };
+
+    unique_ptr<Construct> root = parse_lines(src);
+    resolve_names(root.get(), true, 24);
+
+    const std::string s = serialize_tree(root.get());
+
+    bool ok = s.find("Int(100)") != std::string::npos;   /* tbl[0] folded */
+
+    try { root->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  resolved tree:\n" << s;
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
@@ -5621,6 +5652,7 @@ static const std::vector<extra_check> extra_checks =
     { "inliner re-folds a const subexpression", inliner_refolds_const_subexpr },
     { "inliner re-folds subscript/len in a splice",
       inliner_refolds_non_multiop },
+    { "inliner folds a const-global subscript", inliner_folds_const_global },
     { "inliner specializes a block func (deduped)",
       inliner_specializes_block_func },
     { "specialized-clone backtrace == non-spec",
