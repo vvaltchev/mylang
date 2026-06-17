@@ -455,8 +455,9 @@ formerly-open questions are settled: the **criterion** is "specialize→fold→
 measure→decide" (inline if tiny-after-fold; else emit a shared specialized clone
 if it folded a lot; else leave the call), and the **backtrace** uses
 "inlined-at" chains (`InlineCtx`, `errors.h`) flushed by `flush_inline_frames`
-(`backtrace.cpp`) at two error-path points (`Construct::eval`'s loc-stamp and
-`do_func_call`'s catch), leaving `format_backtrace` unchanged. *General*
+(`backtrace.cpp`) at two error-path points (`Construct::eval` and
+`do_func_call`'s catch), keyed off `Exception::inline_origin_emitted` (see the
+re-fold paragraph), leaving `format_backtrace` unchanged. *General*
 algebraic simplification of non-constant operands (`x+1-1 -> x`) is deliberately
 out of scope — unsound in a dynamically-typed language without type narrowing
 (float non-associativity, `+`-overloading on strings/arrays, preserved type
@@ -469,10 +470,16 @@ non-recursive, no nested function, arity match, body ≤ a node threshold (`-it
 N`, default 24), sound arg use
 (an arg is evaluated as often as the param is used; side-effecting args neither
 dropped nor duplicated). The spliced body's params are replaced by the args
-(which inherit the parameter occurrence's loc), the whole splice is tagged with
-an `InlineCtx`, and `stamp_operand_loc` (`eval.cpp`) flushes inline frames too
-(operator-ladder errors are stamped at the operand before its `Construct::eval`
-runs). Backtraces for **body** errors are byte-identical with/without inlining;
+(which inherit the parameter occurrence's loc), and the whole splice is tagged
+with an `InlineCtx`. The inlined-frame flush is keyed off
+`Exception::inline_origin_emitted` (a bool), **not** the loc once-guard: the
+innermost inlined node's `Construct::eval` emits its frames once and sets the
+flag, so an error that arrives with a loc already set (a builtin like
+`append(tbl, 9)`, a not-an-lvalue assignment `d.k = v`) still keeps its frames.
+`do_func_call` sets the same flag after its own call-site flush so the enclosing
+`CallExpr` doesn't re-emit, while each physical call's flush stays unconditional
+(multi-level inlined call sites all show). Backtraces for **body** errors are
+byte-identical with/without inlining;
 **known limitation** — an error *evaluating an argument* (e.g. an undefined var)
 is attributed to the inlined callee rather than the call site (the arg node is
 both the call-site value and the in-body operand). After splicing, the inliner
@@ -496,10 +503,8 @@ the call redirected;
 the clone keeps the same frame (no re-resolution) and a
 `FuncDeclStmt::display_name` makes backtraces show the original name, not
 `$specN`. Still **not done** (see `plans/function-inlining.md` "Remaining"):
-inlined *builtin*-call errors lose the inline frame in the backtrace
-(pre-existing; builtins bypass the `do_func_call` flush), array/dict const args
-in specialization, a rebasing fixpoint for deeper nesting, and the deferred
-type-narrowing/algebraic pass.
+array/dict const args in specialization, a rebasing fixpoint for deeper nesting,
+and the deferred type-narrowing/algebraic pass.
 
 ## The value & type model (the subtle part)
 
@@ -833,15 +838,17 @@ and two macros:
   the widest; pass 2 zero-pads frame numbers to a common width (only when >9
   frames) and right-pads the name column so `at line N` aligns. It is a plain
   function so tests can format synthetic/real backtraces and assert on them.
-- **Inlined (virtual) frames.** For function inlining (in progress), a node
-  spliced from an inlined body carries an `InlineCtx` "inlined-at" chain
+- **Inlined (virtual) frames.** For function inlining, a node spliced from an
+  inlined body carries an `InlineCtx` "inlined-at" chain
   (`Construct::inline_ctx`); `flush_inline_frames` (`backtrace.cpp`) appends one
   `BacktraceFrame` per chain element so the physically-absent inlined calls
-  appear. It is flushed at two error-path points: `Construct::eval`'s loc-stamp
-  (the innermost node, an error *inside* inlined code) and, once the inliner
-  lands, `do_func_call`'s catch (for a real call made *from* inlined code).
-  `format_backtrace` is untouched. No inliner emits chains yet; see
-  `plans/function-inlining.md`.
+  appear. It is flushed at two error-path points, both keyed off
+  `Exception::inline_origin_emitted` (not the loc once-guard, which many errors
+  pre-satisfy): `Construct::eval` at the innermost node (an error *inside*
+  inlined code) emits the chain once and sets the flag, and `do_func_call`'s
+  catch (a real call made *from* inlined code) flushes the call-site chain
+  unconditionally and sets the flag so the enclosing `CallExpr` doesn't re-emit.
+  `format_backtrace` is untouched. See `plans/function-inlining.md`.
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
   see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`

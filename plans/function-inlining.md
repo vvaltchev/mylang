@@ -268,35 +268,37 @@ Two properties that make this cheap and safe:
   guards against a missing-frame deref). It skips lvalue positions (an
   assignment target, an lvalue builtin's first arg) so a write target is never
   turned into a value. `tbl[0]` (const global) now folds to its element.
+- **Inlined errors with a pre-set loc keep their virtual frames.** Was: a
+  non-`do_func_call` error thrown *with* a loc inside an inlined body (a builtin
+  like `append(tbl, 9)`, a not-an-lvalue assignment `d.k = v`, ...) dropped the
+  inlined frames, because the flush was gated by `Construct::eval`'s loc
+  once-guard and that guard was already satisfied. Fix: the flush is now keyed
+  off a dedicated `Exception::inline_origin_emitted` flag instead of the loc
+  guard, so the innermost inlined node always emits its frames once;
+  `do_func_call` sets the same flag after its call-site flush so the enclosing
+  `CallExpr` doesn't re-emit, while each physical call's flush stays
+  unconditional (multi-level inlined call sites all appear). Verified
+  byte-identical to `-ni` for builtin errors, member-assign errors, multi-level
+  inlining, and physical-call-from-inlined chains, across every `bench/` script.
 
 ## Remaining / tracked tasks
 
 Not yet done; roughly in priority order:
 
-1. **Inlined *builtin*-call errors lose the inline frame in the backtrace.**
-   Pre-existing since the size-only inliner: a non-pure inlined body calling a
-   *builtin* which throws (e.g. `func f() => append(tbl, 9)`, or `len(x)` on a
-   bad type) drops the enclosing function's frame, because builtins bypass
-   `do_func_call` (where the call-site flush lives) and the builtin stamps the
-   error loc, defeating the loc-based once-guard in `Construct::eval`. Fix:
-   flush the call's `inline_ctx` in `CallExpr::do_eval`'s builtin path, guarded
-   by a dedicated `Exception` flag (so it fires once even when the loc is
-   already set), and switch the error-origin flushes to that flag. Only the
-   error TYPE/loc are currently right; the frame is missing.
-2. **Array/dict const args in specialization.** Today only *scalar* const args
+1. **Array/dict const args in specialization.** Today only *scalar* const args
    seed a specialization (`scalar_repr` / the seed loop). Allow const
    array/dict args too (key them by value, e.g. via the CSE-style canonical key
    or a deep hash), so `f([1,2,3], x)` specializes.
-3. **Rebasing fixpoint for deeper inline nesting.** The inliner is single level
+2. **Rebasing fixpoint for deeper inline nesting.** The inliner is single level
    per pass: a freshly-spliced body is not re-scanned for further inlining in
    the same pass (chain rebasing already keeps backtraces correct for the one
    level that does nest). Running the pass to a fixpoint would inline g-into-f-
    into-h in one go; needs a depth cap + AST-growth budget.
-4. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
+3. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
    current scope (expression-body inlining has no locals; specialization keeps
    the original frame), but would be required to inline *block* bodies (with
    locals) directly instead of via a shared clone.
-5. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
+4. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
    Unsound on unknown dynamic types (float non-associativity, `+` overloading,
    preserved type errors); needs a "provably-int" analysis first. Inlining
    already leaves spliced expressions with original locs + full structure so
