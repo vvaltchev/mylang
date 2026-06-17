@@ -11,6 +11,7 @@
 #include <initializer_list>
 #include <fstream>
 #include <cstring>
+#include <cstdlib>
 #include <cctype>
 
 using std::string;
@@ -19,6 +20,7 @@ static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
 static bool opt_no_const_eval;
 static bool opt_no_inline;
+static int opt_inline_threshold = 24;  /* max inlined body size (nodes) */
 static bool opt_no_run;
 
 static std::vector<string> lines;
@@ -35,6 +37,8 @@ void help()
     cout << "   -s      Dump the syntax tree" << endl;
     cout << "  -nc      No const eval (debug)" << endl;
     cout << "  -ni      No function inlining (debug)" << endl;
+    cout << "  -it N    Inline threshold: max inlined body size (default 24)"
+         << endl;
     cout << "  -nr      Don't run, just validate" << endl;
 
 #ifdef TESTS
@@ -124,6 +128,17 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-ni")) {
 
             opt_no_inline = true;
+
+        } else if (!strcmp(arg, "-it")) {
+
+            if (argc < 2) {
+                cout << "error: -it requires a value (max inlined body size)"
+                     << endl;
+                exit(1);
+            }
+
+            opt_inline_threshold = atoi(argv[1]);
+            argc--; argv++;   /* consume the value; the loop skips it too */
 
         } else if (!strcmp(arg, "-nr")) {
 
@@ -304,7 +319,7 @@ int main(int argc, char **argv)
         if (!opt_no_run) {
             /* Resolve names to slots, then run the script. The root block
              * builds its own "main" Frame for slotted top-level variables. */
-            resolve_names(root.get(), !opt_no_inline);
+            resolve_names(root.get(), !opt_no_inline, opt_inline_threshold);
             root->eval(nullptr);
         }
 

@@ -1196,9 +1196,11 @@ class Inliner {
      * name is ambiguous (declared more than once) and thus not inlinable. */
     std::unordered_map<const UniqueId *, FuncDeclStmt *> funcs;
 
-    static const int INLINE_MAX_NODES = 24;
+    const int max_nodes;   /* inline only when the body is at most this big */
 
 public:
+
+    explicit Inliner(int max_nodes) : max_nodes(max_nodes) { }
 
     void run(Block *root)
     {
@@ -1276,7 +1278,7 @@ private:
         if (ce->args->elems.size() != nparams)
             return;
 
-        if (node_count(f->body.get()) > INLINE_MAX_NODES)
+        if (node_count(f->body.get()) > max_nodes)
             return;
 
         for (size_t i = 0; i < nparams; i++) {
@@ -1408,11 +1410,11 @@ private:
  * the inlining pass.
  */
 void
-resolve_names(Construct *root, bool enable_inline)
+resolve_names(Construct *root, bool enable_inline, int inline_threshold)
 {
     Resolver().run(root);
 
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))
-            Inliner().run(rb);
+            Inliner(inline_threshold).run(rb);
 }
