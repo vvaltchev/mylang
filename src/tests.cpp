@@ -5503,6 +5503,81 @@ inliner_refolds_const_subexpr()
     return ok;
 }
 
+/*
+ * Const-arg specialization: a block-bodied function called with a const arg
+ * that gates control flow is cloned and folded (DCE) for that constant, and the
+ * call is redirected to the shared clone. Two calls with the SAME const share
+ * one clone (dedup). Behavior is unchanged.
+ */
+static bool
+inliner_specializes_block_func()
+{
+    const std::vector<const char *> src = {
+        "func f(mode, x) {",
+        "    if (mode == 0) return x;",
+        "    else return 0 - x;",
+        "}",
+        "var a = 1;",
+        "a = 7;",                            /* a is runtime (reassigned) */
+        "var r = f(0, a) + f(0, a);",        /* same const 0 twice -> 1 clone */
+        "assert(r == 14);",
+    };
+
+    unique_ptr<Construct> root = parse_lines(src);
+    resolve_names(root.get(), true, 24);
+
+    const std::string s = serialize_tree(root.get());
+
+    bool ok = true;
+    ok = ok && s.find("$spec0") != std::string::npos;    /* specialized */
+    ok = ok && s.find("$spec1") == std::string::npos;    /* deduped to one */
+
+    try { root->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  resolved tree:\n" << s;
+    return ok;
+}
+
+/*
+ * A runtime error inside a specialized clone must report the ORIGINAL function
+ * name (via display_name), not the synthetic clone name - so the backtrace is
+ * identical with specialization on vs off.
+ */
+static bool
+inliner_spec_backtrace_identical()
+{
+    const std::vector<const char *> src = {
+        "func f(mode, x) {",
+        "    if (mode == 0) return 100 / x;",
+        "    else return x;",
+        "}",
+        "var n = 1;",
+        "n = 0;",
+        "var z = f(0, n);",     /* specialized; x==0 -> div by zero at run */
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);
+    resolve_names(off.get(), false);
+
+    std::string bt_on, bt_off;
+    try { on->eval(nullptr); }
+    catch (const Exception &e) { bt_on = format_backtrace(e); }
+    try { off->eval(nullptr); }
+    catch (const Exception &e) { bt_off = format_backtrace(e); }
+
+    bool ok = true;
+    ok = ok && !bt_on.empty();
+    ok = ok && bt_on == bt_off;                              /* identical */
+    ok = ok && bt_on.find("[0] f(mode, x)") != std::string::npos;
+    ok = ok && bt_on.find("$spec") == std::string::npos;    /* no synthetic */
+
+    if (!ok) cout << "  bt_on:\n" << bt_on << "\n  bt_off:\n" << bt_off;
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
@@ -5511,6 +5586,10 @@ static const std::vector<extra_check> extra_checks =
     { "inlined-call backtrace == non-inlined", inliner_backtrace_identical },
     { "inline threshold (-it) gates inlining", inliner_threshold_gates },
     { "inliner re-folds a const subexpression", inliner_refolds_const_subexpr },
+    { "inliner specializes a block func (deduped)",
+      inliner_specializes_block_func },
+    { "specialized-clone backtrace == non-spec",
+      inliner_spec_backtrace_identical },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

@@ -792,6 +792,14 @@ public:
     bool explicit_pure = false;
     bool effective_pure = false;
 
+    /*
+     * Name to show in a backtrace, when it should differ from `id`. Empty for
+     * normal functions (the backtrace uses `id`). A specialization clone has a
+     * synthetic `id` (so its call resolves to the clone) but sets this to the
+     * original function's name, so errors still report the user's name.
+     */
+    std::string display_name;
+
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
@@ -808,6 +816,7 @@ public:
         c->slot_writes = slot_writes;
         c->explicit_pure = explicit_pure;
         c->effective_pure = effective_pure;
+        c->display_name = display_name;
         return c;
     }
 };

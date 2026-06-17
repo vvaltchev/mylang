@@ -479,10 +479,17 @@ both the call-site value and the in-body operand). After splicing, the inliner
 **re-folds** (`Inliner::refold`): an all-const `MultiOpConstruct` in the spliced
 body folds to a literal, so a const arg propagates into a *non-pure* expression
 function (`f(3)` with `f(x) => x*10+g` -> `30+g`) — the half AutoConst's
-whole-call folding misses. Still **not done**: const-arg *specialization*
-(shared clones), re-folding non-`MultiOp` const ops, a rebasing fixpoint for
-deeper nesting, and the deferred algebraic pass. See
-`plans/function-inlining.md`.
+whole-call folding misses. A non-inlined call to a **block-bodied** function
+with scalar-const arg(s) is instead **specialized**: the body is cloned, those
+params bound, and folded with DCE via `AutoConst::fold_specialized` (which
+*catches* const errors and discards, so a runtime error never becomes a compile
+one). If it shrinks, a shared clone `$specN` is registered (deduped by (func,
+const-arg tuple), inserted at the root block's front) and the call redirected;
+the clone keeps the same frame (no re-resolution) and a
+`FuncDeclStmt::display_name` makes backtraces show the original name, not
+`$specN`. Still **not done**: re-folding non-`MultiOp` const ops, array/dict
+const args, a rebasing fixpoint for deeper nesting, and the deferred algebraic
+pass. See `plans/function-inlining.md`.
 
 ## The value & type model (the subtle part)
 
@@ -805,7 +812,9 @@ and two macros:
   is filled as the exception unwinds: `do_func_call`'s `catch (Exception &)`
   records each frame innermost-first, capturing the function's name+params **as
   strings** (the AST is torn down during unwinding, before the top-level handler
-  runs) plus the *call site* (the `CallExpr`'s loc, passed as `do_func_call`'s
+  runs; the name is `FuncDeclStmt::display_name` when set — a specialization
+  clone's original name — else `id`) plus the *call site* (the `CallExpr`'s loc,
+  passed as `do_func_call`'s
   `call_site`). `format_backtrace` (`backtrace.cpp` / `backtrace.h`) renders it:
   frame `[0]` is the innermost (its line = the error site, `loc_start`), each
   deeper frame's line is where it called the next, and a synthetic `main()` is

@@ -11,6 +11,7 @@
 #include <vector>
 #include <deque>
 #include <string>
+#include <algorithm>
 
 /*
  * Name-resolution pass: resolve a function's PARAMETERS and LOCAL variables
@@ -116,6 +117,37 @@ public:
     {
         register_pure_funcs(root);
         fold_function(root, main_writes, nullptr);
+    }
+
+    /*
+     * Specialization fold (used by the Inliner): like fold_function, but with
+     * parameter slots pre-bound to constant values (`seed`). Reads of those
+     * params fold to literals and everything that becomes const folds too, with
+     * dead-code elimination. A seeded slot that is "blocked" (used as an
+     * lvalue: subscript/member base, lvalue builtin arg, capture, foreach var)
+     * is NOT bound, so such a use is never folded unsoundly. Returns false if
+     * folding raised a const error (e.g. 6/0 reachable): the caller then keeps
+     * the ordinary call, so a runtime error is never turned into a compile one.
+     */
+    bool fold_specialized(Block *b,
+                          const std::vector<int> &writes,
+                          const IdList *params,
+                          const std::unordered_map<int, EvalValue> &seed)
+    {
+        FCtx fc{ writes, {}, {}, params };
+        prescan_blocked(b, fc.blocked);
+
+        for (const auto &kv : seed)
+            if (!fc.blocked.count(kv.first))
+                fc.consts.emplace(kv.first, kv.second);
+
+        try {
+            fold_block(b, fc);
+        } catch (const Exception &) {
+            return false;
+        }
+
+        return true;
     }
 
 private:
@@ -1192,12 +1224,26 @@ for_each_child_slot(Construct *c,
 
 class Inliner {
 
-    /* uid -> the unique top-level expression-bodied func, or nullptr if the
-     * name is ambiguous (declared more than once) and thus not inlinable. */
+    /* uid -> the unique top-level expression-bodied func to inline, or nullptr
+     * if the name is ambiguous (declared more than once). */
     std::unordered_map<const UniqueId *, FuncDeclStmt *> funcs;
+
+    /* uid -> the unique top-level block-bodied func to specialize (clone for a
+     * given const-arg tuple), or nullptr if ambiguous. */
+    std::unordered_map<const UniqueId *, FuncDeclStmt *> spec_funcs;
 
     const int max_nodes;   /* inline only when the body is at most this big */
     EvalContext cctx;      /* const context for re-folding spliced bodies */
+    AutoConst ac;          /* used to fold specialized clones */
+
+    /* (func, const-arg tuple) -> the specialized clone, or nullptr if building
+     * it was not beneficial (cached so it isn't retried). */
+    std::unordered_map<std::string, FuncDeclStmt *> spec_cache;
+
+    /* specialized clones to register (inserted at the root block's front after
+     * the walk, so they exist before any call reaches them). */
+    std::vector<unique_ptr<Construct>> new_funcs;
+    int spec_counter = 0;
 
 public:
 
@@ -1208,15 +1254,24 @@ public:
     {
         for (auto &e : root->elems) {
             auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
-            if (!fd || !fd->id || !inlinable_decl(fd))
+            if (!fd || !fd->id)
                 continue;
-            auto res = funcs.emplace(fd->id->uid, fd);
-            if (!res.second)
-                res.first->second = nullptr;   /* duplicate name: ambiguous */
+            if (inlinable_decl(fd))
+                add_unique(funcs, fd);
+            else if (specializable_decl(fd))
+                add_unique(spec_funcs, fd);
         }
 
         for (auto &e : root->elems)
             walk(e);
+
+        /* Register clones at the front: ready before any call reaches one. */
+        if (!new_funcs.empty()) {
+            root->elems.insert(root->elems.begin(),
+                std::make_move_iterator(new_funcs.begin()),
+                std::make_move_iterator(new_funcs.end()));
+            new_funcs.clear();
+        }
     }
 
 private:
@@ -1245,6 +1300,28 @@ private:
         return found;
     }
 
+    /*
+     * A block-bodied function we may clone+specialize for a const-arg tuple. No
+     * captures or nested function (a closure could capture this function's
+     * params). Recursion is allowed: the clone's self-calls go to the original.
+     */
+    static bool specializable_decl(const FuncDeclStmt *fd)
+    {
+        return fd->body
+            && fd->body->is_block()
+            && (!fd->captures || fd->captures->elems.empty())
+            && !contains_func(fd->body.get());
+    }
+
+    static void add_unique(
+        std::unordered_map<const UniqueId *, FuncDeclStmt *> &map,
+        FuncDeclStmt *fd)
+    {
+        auto res = map.emplace(fd->id->uid, fd);
+        if (!res.second)
+            res.first->second = nullptr;   /* duplicate name: ambiguous */
+    }
+
     void walk(unique_ptr<Construct> &slot)
     {
         if (!slot)
@@ -1255,6 +1332,7 @@ private:
             [&](unique_ptr<Construct> &ch) { walk(ch); });
 
         try_inline(slot);
+        try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
     void try_inline(unique_ptr<Construct> &slot)
@@ -1416,6 +1494,134 @@ private:
         }
 
         return false;
+    }
+
+    /*
+     * Try to redirect a call to a block-bodied function to a specialized clone
+     * (built once per (function, const-arg tuple) and shared). The clone keeps
+     * the same signature/frame - the const args are still passed but ignored,
+     * so no re-resolution is needed - and its body is folded with those params
+     * bound to their constants. Only built when folding actually shrinks it.
+     */
+    void try_specialize(unique_ptr<Construct> &slot)
+    {
+        auto *ce = dynamic_cast<CallExpr *>(slot.get());
+        if (!ce)
+            return;
+
+        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        if (!callee || callee->sym.kind == SymKind::local)
+            return;
+
+        auto it = spec_funcs.find(callee->uid);
+        if (it == spec_funcs.end() || !it->second)
+            return;
+
+        FuncDeclStmt *f = it->second;
+        if (!f->resolved)
+            return;
+
+        const size_t nparams = f->params ? f->params->elems.size() : 0;
+        if (ce->args->elems.size() != nparams)
+            return;
+
+        /* Scalar-const args on never-reassigned params -> the binding seed. */
+        std::unordered_map<int, EvalValue> seed;
+        for (size_t i = 0; i < nparams; i++) {
+            if (!dynamic_cast<Literal *>(ce->args->elems[i].get()))
+                continue;
+            if (i >= f->slot_writes.size() || f->slot_writes[i] != 0)
+                continue;          /* unknown or reassigned: don't bind it */
+            seed[static_cast<int>(i)] = ce->args->elems[i]->eval(&cctx);
+        }
+
+        if (seed.empty())
+            return;
+
+        const std::string key = spec_key(f, seed);
+        FuncDeclStmt *clone;
+        auto cit = spec_cache.find(key);
+
+        if (cit != spec_cache.end()) {
+            clone = cit->second;               /* may be nullptr: not built */
+        } else {
+            clone = build_specialization(f, seed);
+            spec_cache.emplace(key, clone);
+        }
+
+        if (!clone)
+            return;
+
+        /* Redirect to the clone (same args; the const ones are now ignored). */
+        auto what = make_unique<Identifier>(clone->id->get_str());
+        what->start = ce->what->start;
+        what->end = ce->what->end;
+        ce->what = move(what);
+    }
+
+    FuncDeclStmt *build_specialization(
+        FuncDeclStmt *f, const std::unordered_map<int, EvalValue> &seed)
+    {
+        const int before = node_count(f->body.get());
+
+        unique_ptr<Construct> clone = f->clone();
+        auto *fc = static_cast<FuncDeclStmt *>(clone.get());
+
+        /* Synthetic name so the redirected call resolves to the clone, but keep
+         * the original name for backtraces. */
+        fc->display_name = std::string(f->id->get_str());
+        fc->id = make_unique<Identifier>(
+            "$spec" + std::to_string(spec_counter++));
+
+        auto *body = dynamic_cast<Block *>(fc->body.get());
+        if (!body)
+            return nullptr;
+
+        if (!ac.fold_specialized(body, fc->slot_writes, fc->params.get(), seed))
+            return nullptr;        /* const error: keep the ordinary call */
+
+        if (node_count(fc->body.get()) >= before)
+            return nullptr;        /* folding didn't shrink it: not worth it */
+
+        FuncDeclStmt *raw = fc;
+        new_funcs.push_back(move(clone));
+        return raw;
+    }
+
+    std::string spec_key(const FuncDeclStmt *f,
+                         const std::unordered_map<int, EvalValue> &seed)
+    {
+        std::string k = "F";
+        k += std::to_string(reinterpret_cast<uintptr_t>(f->id->uid));
+
+        std::vector<int> slots;
+        for (const auto &kv : seed)
+            slots.push_back(kv.first);
+        std::sort(slots.begin(), slots.end());
+
+        for (int s : slots) {
+            k += ";";
+            k += std::to_string(s);
+            k += "=";
+            k += scalar_repr(seed.at(s));
+        }
+        return k;
+    }
+
+    static std::string scalar_repr(const EvalValue &v)
+    {
+        if (v.is<int_type>())
+            return "i" + std::to_string(v.get<int_type>());
+        if (v.is<float_type>())
+            return "f" + std::to_string(
+                static_cast<double>(v.get<float_type>()));
+        if (v.is<NoneVal>())
+            return "z";
+        if (v.is<SharedStr>()) {
+            const std::string_view sv = v.get<SharedStr>().get_view();
+            return "s" + std::to_string(sv.size()) + ":" + std::string(sv);
+        }
+        return "?";
     }
 
     void substitute(unique_ptr<Construct> &slot, const UniqueId *uid,

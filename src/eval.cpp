@@ -386,7 +386,10 @@ do_func_call(EvalContext *ctx,
          * before the top-level handler builds the backtrace.
          */
         BacktraceFrame bf;
-        bf.name = obj.func->id ? string(obj.func->id->get_str()) : "<lambda>";
+        bf.name = !obj.func->display_name.empty()
+                      ? obj.func->display_name        /* e.g. a spec. clone */
+                      : obj.func->id ? string(obj.func->id->get_str())
+                                     : "<lambda>";
         if (obj.func->params)
             for (const auto &p : obj.func->params->elems)
                 bf.params.push_back(string(p->get_str()));
