@@ -99,6 +99,7 @@ Running scripts:
 ./build/mylang -s FILE           # dump syntax tree (const-folding) then run
 ./build/mylang -t FILE           # dump tokens
 ./build/mylang -nc FILE          # disable const-eval (compare -s with/without)
+./build/mylang -ni FILE          # disable function inlining (debug)
 ./build/mylang -nr FILE          # parse/validate only, don't run
 ```
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
@@ -181,7 +182,9 @@ units:
   Optional and always
   safe: anything it leaves unresolved falls back to the runtime map lookup. The
   same file also hosts the **auto-const** folder (the `AutoConst` class), run at
-  the end of `resolve_names` (see the const-evaluation section).
+  the end of `resolve_names` (see the const-evaluation section), and the
+  **inliner** (the `Inliner` class), run after it (gated by `-ni`; see the value
+  model section / `plans/function-inlining.md`).
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
@@ -457,10 +460,23 @@ algebraic simplification of non-constant operands (`x+1-1 -> x`) is deliberately
 out of scope — unsound in a dynamically-typed language without type narrowing
 (float non-associativity, `+`-overloading on strings/arrays, preserved type
 errors). **Status:** the `InlineCtx` backtrace foundation exists (a
-`Construct::inline_ctx` field, the flush helper + the `Construct::eval` hook, a
-synthetic test), and **AST deep-clone** (`Construct::clone()`, all node types,
-round-trip test) — but both are dormant: no inliner emits inline contexts or
-calls `clone()` yet. Next: the size-only inliner.
+`Construct::inline_ctx` field, the flush helper + the `Construct::eval` hook),
+**AST deep-clone** (`Construct::clone()`, all node types), and the **size-only
+inliner** (`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
+It splices eligible direct calls — top-level, expression-bodied, non-capturing,
+non-recursive, no nested function, arity match, body ≤ 24 nodes, sound arg use
+(an arg is evaluated as often as the param is used; side-effecting args neither
+dropped nor duplicated). The spliced body's params are replaced by the args
+(which inherit the parameter occurrence's loc), the whole splice is tagged with
+an `InlineCtx`, and `stamp_operand_loc` (`eval.cpp`) flushes inline frames too
+(operator-ladder errors are stamped at the operand before its `Construct::eval`
+runs). Backtraces for **body** errors are byte-identical with/without inlining;
+**known limitation** — an error *evaluating an argument* (e.g. an undefined var)
+is attributed to the inlined callee rather than the call site (the arg node is
+both the call-site value and the in-body operand). Still **not done**:
+cross-boundary re-fold (`f(2*3) -> 7`), const-arg specialization, a rebasing
+fixpoint for deeper nesting, and the deferred algebraic pass. See
+`plans/function-inlining.md`.
 
 ## The value & type model (the subtle part)
 

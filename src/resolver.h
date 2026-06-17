@@ -15,5 +15,9 @@ class Construct;
  * the runtime builds that Frame in Block::do_eval. Anything unresolved is left
  * as-is and falls back to the runtime EvalContext map lookup, so the pass is
  * purely an optimization and is always safe to run.
+ *
+ * When `enable_inline` is true (the default), a final pass also inlines
+ * eligible expression-bodied function calls (see the Inliner in resolver.cpp /
+ * plans/function-inlining.md). The CLI's `-ni` disables it.
  */
-void resolve_names(Construct *root);
+void resolve_names(Construct *root, bool enable_inline = true);

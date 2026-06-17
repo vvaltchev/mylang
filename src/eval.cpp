@@ -331,7 +331,8 @@ static EvalValue
 do_func_call(EvalContext *ctx,
              FuncObject &obj,
              const ArgsVecT &args,
-             Loc call_site = Loc())
+             Loc call_site = Loc(),
+             const InlineCtx *call_site_inl = nullptr)
 {
     /* func_ctx == true gives this call its own FlowState (see eval.h) */
     EvalContext args_ctx(&obj.capture_ctx, false, true);
@@ -391,6 +392,14 @@ do_func_call(EvalContext *ctx,
                 bf.params.push_back(string(p->get_str()));
         bf.call_site = call_site;
         e.backtrace.push_back(move(bf));
+
+        /*
+         * If this call was physically made from inside inlined code, emit the
+         * virtual frames for the inlined call(s) right above it.
+         */
+        if (call_site_inl)
+            flush_inline_frames(call_site_inl, e);
+
         throw;
     }
 
@@ -449,7 +458,8 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
                 ctx,
                 *callable.get<shared_ptr<FuncObject>>().get(),
                 args->elems,
-                start            /* call site = this CallExpr's location */
+                start,           /* call site = this CallExpr's location */
+                inline_ctx       /* virtual frames if this call is inlined */
             );
         }
 
@@ -636,6 +646,15 @@ stamp_operand_loc(const Construct *c, Exception &e)
     if (!e.loc_start) {
         e.loc_start = c->start;
         e.loc_end = c->end;
+
+        /*
+         * Operator-ladder errors are stamped here (at the offending operand)
+         * before they reach the operand's own Construct::eval, so flush its
+         * inlined-at frames here too. No-op for non-inlined nodes (inline_ctx
+         * is null), so normal code is unaffected.
+         */
+        if (c->inline_ctx)
+            flush_inline_frames(c->inline_ctx, e);
     }
 }
 

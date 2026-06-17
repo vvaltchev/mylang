@@ -5330,10 +5330,122 @@ ast_clone_roundtrip()
     return ok;
 }
 
+/* Parse `lines` into a fresh tree (caller resolves/evals it). */
+static unique_ptr<Construct>
+parse_lines(const std::vector<const char *> &lines)
+{
+    std::vector<Tok> tokens;
+    for (size_t i = 0; i < lines.size(); i++)
+        lexer(lines[i], static_cast<int>(i + 1), tokens);
+
+    ParseContext pctx(TokenStream(tokens), true);
+    return pBlock(pctx);
+}
+
+static size_t
+count_substr(const std::string &s, const std::string &sub)
+{
+    size_t n = 0, pos = 0;
+    while ((pos = s.find(sub, pos)) != std::string::npos) {
+        n++;
+        pos += sub.size();
+    }
+    return n;
+}
+
+static std::string
+serialize_tree(const Construct *c)
+{
+    std::ostringstream ss;
+    c->serialize(ss, 0);
+    return ss.str();
+}
+
+/*
+ * The inliner actually splices: resolving the SAME parsed program with inlining
+ * on vs off differs only by the inliner, so a difference proves it ran. Here
+ * `f(n)` in g's body is inlined away (one fewer CallExpr), and both versions
+ * still evaluate correctly.
+ */
+static bool
+inliner_splices_call()
+{
+    const std::vector<const char *> src = {
+        "func f(x) => x + 1;",
+        "func g(n) { return f(n); }",
+        "assert(g(5) == 6);",
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);    /* inline */
+    resolve_names(off.get(), false);  /* no inline */
+
+    const std::string s_on = serialize_tree(on.get());
+    const std::string s_off = serialize_tree(off.get());
+
+    bool ok = true;
+    ok = ok && s_on != s_off;                            /* inliner ran */
+    ok = ok && count_substr(s_on, "CallExpr")
+                   < count_substr(s_off, "CallExpr");    /* a call removed */
+
+    /* both still evaluate (their assert holds) */
+    try { on->eval(nullptr); } catch (const Exception &) { ok = false; }
+    try { off->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  s_on:\n" << s_on << "\n  s_off:\n" << s_off;
+    return ok;
+}
+
+/*
+ * The invariant that makes inlining acceptable: a runtime error inside an
+ * inlined call produces a backtrace IDENTICAL to the non-inlined one (the
+ * InlineCtx flush rebuilds the virtual frame).
+ */
+static bool
+inliner_backtrace_identical()
+{
+    /*
+     * The divisor is a runtime, reassigned (so non-const, non-folded) variable
+     * that becomes 0, so the error happens at RUN time through the inlined call
+     * - not at parse time via const folding.
+     */
+    const std::vector<const char *> src = {
+        "func bad(x) => 100 / x;",
+        "var n = 1;",
+        "n = 0;",
+        "var z = bad(n);",
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);
+    resolve_names(off.get(), false);
+
+    std::string bt_on, bt_off;
+    try { on->eval(nullptr); }
+    catch (const Exception &e) { bt_on = format_backtrace(e); }
+    try { off->eval(nullptr); }
+    catch (const Exception &e) { bt_off = format_backtrace(e); }
+
+    bool ok = true;
+    ok = ok && !bt_on.empty();
+    ok = ok && bt_on == bt_off;                  /* identical with/without */
+    ok = ok && bt_on.find("[0] bad(x)") != std::string::npos;
+    ok = ok && bt_on.find("[1] main()") != std::string::npos;
+
+    if (!ok) cout << "  bt_on:\n" << bt_on << "\n  bt_off:\n" << bt_off;
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
     { "AST deep-clone round-trips", ast_clone_roundtrip },
+    { "inliner splices an expr-func call", inliner_splices_call },
+    { "inlined-call backtrace == non-inlined", inliner_backtrace_identical },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

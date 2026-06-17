@@ -18,6 +18,7 @@ using std::string;
 static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
 static bool opt_no_const_eval;
+static bool opt_no_inline;
 static bool opt_no_run;
 
 static std::vector<string> lines;
@@ -33,6 +34,7 @@ void help()
     cout << "   -t      Show all tokens" << endl;
     cout << "   -s      Dump the syntax tree" << endl;
     cout << "  -nc      No const eval (debug)" << endl;
+    cout << "  -ni      No function inlining (debug)" << endl;
     cout << "  -nr      Don't run, just validate" << endl;
 
 #ifdef TESTS
@@ -118,6 +120,10 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-nc")) {
 
             opt_no_const_eval = true;
+
+        } else if (!strcmp(arg, "-ni")) {
+
+            opt_no_inline = true;
 
         } else if (!strcmp(arg, "-nr")) {
 
@@ -298,7 +304,7 @@ int main(int argc, char **argv)
         if (!opt_no_run) {
             /* Resolve names to slots, then run the script. The root block
              * builds its own "main" Frame for slotted top-level variables. */
-            resolve_names(root.get());
+            resolve_names(root.get(), !opt_no_inline);
             root->eval(nullptr);
         }
 

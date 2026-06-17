@@ -7,7 +7,10 @@
 
 #include <functional>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
+#include <deque>
+#include <string>
 
 /*
  * Name-resolution pass: resolve a function's PARAMETERS and LOCAL variables
@@ -1092,13 +1095,324 @@ Resolver::walk(Construct *c, FuncState *cur)
 
 } // anonymous namespace
 
+/* ----------------------- Function inlining ------------------------ */
+
 /*
- * Public entry point: run the name-resolution pass over the parsed tree. The
- * top-level frame size is recorded on the root Block (its slot_count); the
- * runtime builds the "main" Frame from it in Block::do_eval.
+ * Size-only inlining of expression-bodied, top-level, non-capturing,
+ * non-recursive functions at direct call sites (plans/function-inlining.md).
+ * Splices the callee body in place of the call, substituting parameters with
+ * the arguments. Spliced nodes carry an InlineCtx so the backtrace is identical
+ * with inlining on or off (the Construct::eval / do_func_call flush points
+ * rebuild the virtual frame from it).
+ *
+ * Expression bodies have no locals, so after param substitution the spliced
+ * expression contains only the caller's argument subtrees (already resolved)
+ * and free identifiers (map-resolved, scope-independent) - no re-resolution is
+ * needed. A body that was itself inlined-into keeps correct frames via chain
+ * rebasing. Argument substitution is sound: an argument is evaluated exactly as
+ * often as the parameter is used, and side-effecting args are never dropped or
+ * duplicated.
+ */
+
+/*
+ * InlineCtx objects outlive the inliner (the AST references them; their strings
+ * are copied into a BacktraceFrame only on error). Pooled here and never freed,
+ * like UniqueId's interned strings - there are only a few of them. A deque
+ * keeps element addresses stable as it grows.
+ */
+static std::deque<InlineCtx> inline_ctx_pool;
+
+static const InlineCtx *
+alloc_inline_ctx(InlineCtx ic)
+{
+    inline_ctx_pool.push_back(std::move(ic));
+    return &inline_ctx_pool.back();
+}
+
+/*
+ * Enumerate the Construct-typed child *slots* of `c` (the slots an inlined
+ * expression may replace, and the ones to recurse through to reach nested
+ * calls). Identifier / IdList children (params, captures, foreach ids) cannot
+ * hold a call and are skipped. Mirrors for_each_child but yields replaceable
+ * unique_ptr<Construct>& slots.
+ */
+static void
+for_each_child_slot(Construct *c,
+                    const std::function<void(unique_ptr<Construct> &)> &fn)
+{
+    if (auto *n = dynamic_cast<SingleChildConstruct *>(c)) {
+        fn(n->elem);
+    } else if (auto *n = dynamic_cast<MultiOpConstruct *>(c)) {
+        for (auto &p : n->elems) fn(p.second);
+    } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
+        fn(n->what);
+        for (auto &e : n->args->elems) fn(e);
+    } else if (auto *n = dynamic_cast<IfStmt *>(c)) {
+        fn(n->condExpr);
+        if (n->thenBlock) fn(n->thenBlock);
+        if (n->elseBlock) fn(n->elseBlock);
+    } else if (auto *n = dynamic_cast<WhileStmt *>(c)) {
+        fn(n->condExpr); fn(n->body);
+    } else if (auto *n = dynamic_cast<ForStmt *>(c)) {
+        if (n->init) fn(n->init);
+        if (n->cond) fn(n->cond);
+        if (n->inc) fn(n->inc);
+        fn(n->body);
+    } else if (auto *n = dynamic_cast<ForeachStmt *>(c)) {
+        fn(n->container); fn(n->body);
+    } else if (auto *n = dynamic_cast<Subscript *>(c)) {
+        fn(n->what); fn(n->index);
+    } else if (auto *n = dynamic_cast<Slice *>(c)) {
+        fn(n->what);
+        if (n->start_idx) fn(n->start_idx);
+        if (n->end_idx) fn(n->end_idx);
+    } else if (auto *n = dynamic_cast<MemberExpr *>(c)) {
+        fn(n->what);
+    } else if (auto *n = dynamic_cast<ReturnStmt *>(c)) {
+        if (n->elem) fn(n->elem);
+    } else if (auto *n = dynamic_cast<Expr14 *>(c)) {
+        if (n->lvalue) fn(n->lvalue);
+        if (n->rvalue) fn(n->rvalue);
+    } else if (auto *n = dynamic_cast<LiteralDictKVPair *>(c)) {
+        fn(n->key); fn(n->value);
+    } else if (auto *n = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (n->body) fn(n->body);
+    } else if (auto *n = dynamic_cast<TryCatchStmt *>(c)) {
+        fn(n->tryBody);
+        for (auto &p : n->catchStmts) fn(p.second);
+        if (n->finallyBody) fn(n->finallyBody);
+    } else if (auto *n = dynamic_cast<MultiElemConstruct<Construct> *>(c)) {
+        for (auto &e : n->elems) fn(e);   /* Block, ExprList, LiteralArray */
+    } else if (auto *n =
+                   dynamic_cast<MultiElemConstruct<LiteralDictKVPair> *>(c)) {
+        for (auto &e : n->elems) { fn(e->key); fn(e->value); }
+    }
+    /* literals, Identifier, IdList, childless: nothing inlinable */
+}
+
+class Inliner {
+
+    /* uid -> the unique top-level expression-bodied func, or nullptr if the
+     * name is ambiguous (declared more than once) and thus not inlinable. */
+    std::unordered_map<const UniqueId *, FuncDeclStmt *> funcs;
+
+    static const int INLINE_MAX_NODES = 24;
+
+public:
+
+    void run(Block *root)
+    {
+        for (auto &e : root->elems) {
+            auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
+            if (!fd || !fd->id || !inlinable_decl(fd))
+                continue;
+            auto res = funcs.emplace(fd->id->uid, fd);
+            if (!res.second)
+                res.first->second = nullptr;   /* duplicate name: ambiguous */
+        }
+
+        for (auto &e : root->elems)
+            walk(e);
+    }
+
+private:
+
+    static bool inlinable_decl(const FuncDeclStmt *fd)
+    {
+        return fd->body
+            && !fd->body->is_block()                       /* => expr body */
+            && (!fd->captures || fd->captures->elems.empty())
+            /* No nested function: a closure in the body may capture this
+             * function's parameters, which substitution would break. */
+            && !contains_func(fd->body.get())
+            /* not recursive / does not reference its own name */
+            && count_uses(fd->body.get(), fd->id->uid) == 0;
+    }
+
+    static bool contains_func(const Construct *c)
+    {
+        if (!c)
+            return false;
+        if (dynamic_cast<const FuncDeclStmt *>(c))
+            return true;
+        bool found = false;
+        for_each_child(const_cast<Construct *>(c),
+            [&](Construct *ch) { if (contains_func(ch)) found = true; });
+        return found;
+    }
+
+    void walk(unique_ptr<Construct> &slot)
+    {
+        if (!slot)
+            return;
+
+        /* Recurse first; do NOT re-scan a spliced result (single level). */
+        for_each_child_slot(slot.get(),
+            [&](unique_ptr<Construct> &ch) { walk(ch); });
+
+        try_inline(slot);
+    }
+
+    void try_inline(unique_ptr<Construct> &slot)
+    {
+        auto *ce = dynamic_cast<CallExpr *>(slot.get());
+        if (!ce)
+            return;
+
+        /* The callee must be a plain name that is NOT a resolved local (a local
+         * could shadow a same-named top-level function). */
+        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        if (!callee || callee->sym.kind == SymKind::local)
+            return;
+
+        auto it = funcs.find(callee->uid);
+        if (it == funcs.end() || !it->second)
+            return;
+
+        FuncDeclStmt *f = it->second;
+        const size_t nparams = f->params ? f->params->elems.size() : 0;
+
+        /* Arg count must match, else the runtime arity error must survive. */
+        if (ce->args->elems.size() != nparams)
+            return;
+
+        if (node_count(f->body.get()) > INLINE_MAX_NODES)
+            return;
+
+        for (size_t i = 0; i < nparams; i++) {
+            const int uses = count_uses(f->body.get(),
+                                        f->params->elems[i]->uid);
+            if (!sub_ok(uses, ce->args->elems[i].get()))
+                return;
+        }
+
+        /*
+         * Eligible: clone the body, substitute params with the args, then tag
+         * the whole result as inlined. Substitution happens first and copies
+         * each parameter occurrence's source loc onto the arg, so an error in
+         * the spliced body points where it would in the un-inlined callee (the
+         * operator ladder stamps the operand loc) - keeping the backtrace
+         * identical. Tagging last covers body and args alike.
+         */
+        const InlineCtx *ic = alloc_inline_ctx(
+            { std::string(f->id->get_str()), param_names(f),
+              ce->start, nullptr });
+
+        unique_ptr<Construct> body = f->body->clone();
+
+        for (size_t i = 0; i < nparams; i++)
+            substitute(body, f->params->elems[i]->uid,
+                       ce->args->elems[i].get());
+
+        tag_inline(body.get(), ic);
+
+        /* Replaces (frees) the old CallExpr; its args were already cloned. */
+        slot = move(body);
+    }
+
+    /* Sound iff the argument is evaluated as often as the param is used and a
+     * side-effecting arg is neither dropped nor duplicated. */
+    static bool sub_ok(int uses, const Construct *arg)
+    {
+        if (uses == 1)
+            return true;       /* single evaluation: any argument is fine */
+
+        const bool trivial = dynamic_cast<const Identifier *>(arg)
+                          || dynamic_cast<const Literal *>(arg);
+
+        if (uses >= 2)
+            return trivial;    /* duplicate only side-effect-free args */
+
+        /* uses == 0: only a literal may be dropped (no eval / error lost). */
+        return dynamic_cast<const Literal *>(arg) != nullptr;
+    }
+
+    static std::vector<std::string> param_names(const FuncDeclStmt *f)
+    {
+        std::vector<std::string> out;
+        if (f->params)
+            for (auto &p : f->params->elems)
+                out.push_back(std::string(p->get_str()));
+        return out;
+    }
+
+    static int node_count(const Construct *c)
+    {
+        if (!c)
+            return 0;
+        int n = 1;
+        for_each_child(const_cast<Construct *>(c),
+            [&](Construct *ch) { n += node_count(ch); });
+        return n;
+    }
+
+    static int count_uses(const Construct *c, const UniqueId *uid)
+    {
+        if (!c)
+            return 0;
+        int n = 0;
+        if (auto *id = dynamic_cast<const Identifier *>(c))
+            if (id->uid == uid)
+                n = 1;
+        for_each_child(const_cast<Construct *>(c),
+            [&](Construct *ch) { n += count_uses(ch, uid); });
+        return n;
+    }
+
+    void substitute(unique_ptr<Construct> &slot, const UniqueId *uid,
+                    const Construct *arg)
+    {
+        if (!slot)
+            return;
+
+        if (auto *id = dynamic_cast<Identifier *>(slot.get())) {
+            if (id->uid == uid) {
+                unique_ptr<Construct> a = arg->clone();  /* fresh per use */
+                a->start = slot->start;   /* keep the param's source position */
+                a->end = slot->end;       /* so errors point as in the callee */
+                slot = move(a);
+                return;
+            }
+        }
+
+        for_each_child_slot(slot.get(),
+            [&](unique_ptr<Construct> &ch) { substitute(ch, uid, arg); });
+    }
+
+    /* Copy an existing inlined-at chain, rooting it at `root` (used when the
+     * cloned body was itself inlined-into). Fresh copies leave the original
+     * (shared by the un-inlined source) untouched. */
+    static const InlineCtx *rebase(const InlineCtx *chain,
+                                   const InlineCtx *root)
+    {
+        if (!chain)
+            return root;
+        return alloc_inline_ctx({ chain->callee_name, chain->params,
+                                  chain->call_site,
+                                  rebase(chain->parent, root) });
+    }
+
+    static void tag_inline(Construct *c, const InlineCtx *ic)
+    {
+        if (!c)
+            return;
+        c->inline_ctx = rebase(c->inline_ctx, ic);
+        for_each_child(c, [&](Construct *ch) { tag_inline(ch, ic); });
+    }
+};
+
+/*
+ * Public entry point: run the name-resolution pass over the parsed tree (the
+ * top-level frame size is recorded on the root Block's slot_count; the runtime
+ * builds the "main" Frame from it in Block::do_eval), then - unless disabled -
+ * the inlining pass.
  */
 void
-resolve_names(Construct *root)
+resolve_names(Construct *root, bool enable_inline)
 {
     Resolver().run(root);
+
+    if (enable_inline)
+        if (auto *rb = dynamic_cast<Block *>(root))
+            Inliner().run(rb);
 }
