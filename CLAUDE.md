@@ -1103,6 +1103,12 @@ omitting it is a compile error.
 
 ## Conventions
 
+- **Interactive `git rebase -i` is permitted in this repo** (the environment's
+  general "no interactive flags" restriction is waived here by the maintainer) —
+  use it to keep history clean / bisectable, e.g. squashing a fix into the
+  commit that introduced the bug. Drive it non-interactively from an agent with
+  `GIT_SEQUENCE_EDITOR` (rewrite the todo) and `GIT_EDITOR` (supply messages).
+  `exp-work` is a topic branch whose history may be rewritten freely.
 - **Every line stays within 80 columns** — code, comments, and the Markdown
   docs (`CLAUDE.md` included). Wrap long expressions; put a comment that would
   overflow on its own line above the code instead of trailing it. (A few legacy
