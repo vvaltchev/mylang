@@ -10,7 +10,7 @@ var checksum = 0;
 
 for (var k = 0; k < R; k += 1) {
 
-    var a = array(SZ);
+    var a = array(SZ, 0);
     var x = 123456789;
 
     for (var i = 0; i < SZ; i += 1) {

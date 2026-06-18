@@ -3,7 +3,7 @@ import sys
 scale = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
 N = 1000000 * scale
-a = [None] * N
+a = [0] * N
 
 for i in range(N):
     a[i] = i * 2

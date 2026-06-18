@@ -245,13 +245,21 @@ workloads, complementing M8.
   producer (e.g. an all-float `[1.0, 2.0]` literal, or `array(N)` in a float
   context) to exercise it. No current benchmark builds a float array, so this is
   unmeasured until M3.
-- **M3 — `array(N)` typed creation** (`0`/`0.0`-default, §3) so `array<int>`/
-  `array<float>` allocations are flat, **+ the flat subscript-*store* path**
-  (`a[i] = int` writes `flat_ints()[i]` directly; a non-matching element type
-  promotes) + mutating builtins on flat (`append`/`insert`/`pop`/`erase`) +
-  `map`/`filter`/`find`/`min`/`max`. This is what unlocks the `array(N)`-based
-  benchmarks (`14_array_subscript`, `33_sort_ints`, `38_min_max`) — they stay
-  general today because `array(N)` is general.
+- **M3 — value-driven typed creation + mutation. MOSTLY DONE.** Done:
+  `array(N, value)` (value-driven flat: int/float fill -> flat, else general),
+  `make_array(N, gen)` (optimistic-flat by callback result kind), the flat
+  subscript-*store* (`try_flat_subscript_store` in `eval.cpp` - `a[i]=v`/`OP=`
+  writes the unboxed slot, mismatched type promotes), flat `append`/`pop`,
+  flat `min`/`max`, flat read paths for `TypeArr::subscript` (rvalue), `eq`,
+  `to_string`, and the `array_storage()` introspection builtin + regression
+  tests. **Measured:** `14_array_subscript` 0.85x->0.48x, `33_sort_ints`
+  0.85x->0.49x, `38_min_max` 0.95x->0.43x; geomean 0.63x->0.58x. (Fixed an
+  existing unfairness: 33/38 had MyLang on `array(N)`=none vs Python `[0]*N`;
+  now both int-zeros.) **Remaining:** the `array(N)` *one-arg* type-driven
+  default (`0`/`0.0`/`none` by inference, §3 - deferred with type-driven
+  representation, see below), flat `insert`/`erase`/`map`/`filter`/`find`, and a
+  flat empty array (build-via-append from `[]` stays general because the empty
+  array collapses to the shared general `empty_arr` singleton, losing its kind).
 - **M4 — promotion polish + dyn-boundary audit**: confirm every general-array
   site is either flat-aware or reached only after `promote_to_general()`; fuzz the
   dyn-escape paths (a flat array flowing into `dyn`/`print`/`append("s")`).

@@ -291,6 +291,24 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     }
 }
 
+/*
+ * Read element `i` (slice-relative) of an array as a boxed EvalValue WITHOUT
+ * promoting flat storage. For general storage this is the existing element read
+ * (get_vec() doesn't promote a general array).
+ */
+static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i)
+{
+    const size_type at = arr.offset() + i;
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints:
+            return EvalValue(arr.flat_ints()[at]);
+        case SharedArrayObj::Storage::floats:
+            return EvalValue(arr.flat_floats()[at]);
+        default:
+            return arr.get_vec()[at].get();
+    }
+}
+
 void TypeArr::eq(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<SharedArrayObj>()) {
@@ -300,29 +318,33 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
 
     const SharedArrayObj &lhs = a.get<SharedArrayObj>();
     const SharedArrayObj &rhs = b.get<SharedArrayObj>();
-    const ArrayConstView &lhs_view = lhs.get_view();
-    const ArrayConstView &rhs_view = rhs.get_view();
+    const size_type n = lhs.size();
 
-    if (lhs_view.size() != rhs_view.size()) {
+    if (n != rhs.size()) {
         a = false;
         return;
     }
 
-    if (&lhs.get_vec() == &rhs.get_vec() && lhs.offset() == rhs.offset()) {
-        /*
-         * Same vector AND same offset (sizes are already known equal): the two
-         * views cover the very same region, so they are necessarily equal.
-         * A different offset does NOT imply inequality, though: two slices of
-         * the same array can hold equal elements at different offsets, so in
-         * that case we must fall through to the element-by-element comparison.
-         */
+    /*
+     * Identity shortcut: only safe (and only worth it) when both are general -
+     * the same vector AND same offset means the two views cover the exact same
+     * region, hence equal. Reading get_vec() here doesn't promote a general
+     * array. Flat arrays skip this and use the element loop below.
+     */
+    if (lhs.skind() == SharedArrayObj::Storage::general &&
+        rhs.skind() == SharedArrayObj::Storage::general &&
+        &lhs.get_vec() == &rhs.get_vec() && lhs.offset() == rhs.offset())
+    {
         a = true;
         return;
     }
 
-    for (size_type i = 0; i < lhs.size(); i++) {
+    /* Element-wise compare, reading each side without promoting (so two flat
+     * arrays - or a flat and a general one - compare equal element by element,
+     * with the usual 1 == 1.0 numeric equality via EvalValue::operator!=). */
+    for (size_type i = 0; i < n; i++) {
 
-        if (lhs_view[i].get() != rhs_view[i].get()) {
+        if (arr_elem_at(lhs, i) != arr_elem_at(rhs, i)) {
             a = false;
             return;
         }
@@ -340,11 +362,30 @@ void TypeArr::noteq(EvalValue &a, const EvalValue &b)
 string TypeArr::to_string(const EvalValue &a)
 {
     const SharedArrayObj &arr = a.get<SharedArrayObj>();
-    const ArrayConstView &arr_view = arr.get_view();
+    const size_type n = arr.size();
     string res;
 
-    res.reserve(arr.size() * 32);
+    res.reserve(n * 32);
     res += "[";
+
+    /* Flat fast path: stringify the unboxed vector directly, no promotion. */
+    if (arr.skind() != SharedArrayObj::Storage::general) {
+
+        const bool kind_int = arr.skind() == SharedArrayObj::Storage::ints;
+        const size_type off = arr.offset();
+
+        for (size_type i = 0; i < n; i++) {
+            res += kind_int ? EvalValue(arr.flat_ints()[off + i]).to_string()
+                            : EvalValue(arr.flat_floats()[off + i]).to_string();
+            if (i != n - 1)
+                res += ", ";
+        }
+
+        res += "]";
+        return res;
+    }
+
+    const ArrayConstView &arr_view = arr.get_view();
 
     for (size_type i = 0; i < arr_view.size(); i++) {
 
@@ -371,7 +412,6 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
 
     const EvalValue &what = RValue(what_lval);
     SharedArrayObj &&arr = what.get<SharedArrayObj>();
-    SharedArrayObj::vec_type &vec = arr.get_vec();
     int_type idx = idx_val.get<int_type>();
 
     if (idx < 0)
@@ -380,6 +420,22 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_va
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
         throw OutOfBoundsEx();
 
+    /*
+     * Flat (unboxed) storage: return the scalar as an rvalue, without promoting
+     * to vector<LValue>. A flat element has no LValue to point at, but it never
+     * needs one: `a[i] = v` on a flat array is intercepted upstream by
+     * try_flat_subscript_store (eval.cpp), and a flat element is a scalar, so
+     * it can't be a mutate-in-place container target either. So every read that
+     * reaches here (print(a[i]), a dyn context, a builtin arg, ...) stays flat.
+     */
+    if (arr.skind() != SharedArrayObj::Storage::general) {
+        const size_type at = arr.offset() + idx;
+        return arr.skind() == SharedArrayObj::Storage::ints
+            ? EvalValue(arr.flat_ints()[at])
+            : EvalValue(arr.flat_floats()[at]);
+    }
+
+    SharedArrayObj::vec_type &vec = arr.get_vec();
     LValue *ret = &vec[arr.offset() + idx];
 
     if (!what_lval.is<LValue *>() || arr.is_readonly()) {

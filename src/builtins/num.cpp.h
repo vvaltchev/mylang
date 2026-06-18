@@ -121,6 +121,36 @@ EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
 template <bool is_max>
 EvalValue b_min_max_arr(const SharedArrayObj &arr)
 {
+    /* Flat fast path: scan the unboxed int/float vector directly, no promotion
+     * and no per-element virtual compare (see plans/typed-arrays.md). */
+    if (arr.skind() != SharedArrayObj::Storage::general) {
+
+        const size_type n = arr.size(), off = arr.offset();
+
+        if (n == 0)
+            return EvalValue();
+
+        if (arr.skind() == SharedArrayObj::Storage::ints) {
+            const auto &iv = arr.flat_ints();
+            int_type best = iv[off];
+            for (size_type i = 1; i < n; i++) {
+                const int_type x = iv[off + i];
+                if (is_max ? (x > best) : (x < best))
+                    best = x;
+            }
+            return EvalValue(best);
+        }
+
+        const auto &fv = arr.flat_floats();
+        float_type best = fv[off];
+        for (size_type i = 1; i < n; i++) {
+            const float_type x = fv[off + i];
+            if (is_max ? (x > best) : (x < best))
+                best = x;
+        }
+        return EvalValue(best);
+    }
+
     const ArrayConstView &arr_view = arr.get_view();
     EvalValue val;
 

@@ -1194,8 +1194,19 @@ as a key. At the moment, only integers, floats and strings support `hash()`.
 
 ### Array builtins
 
-#### `array(N)`
-Return an array of `none` values with `N` elements.
+#### `array(N, [value])`
+Return an array with `N` elements. With one argument, every element is
+`none`. With a second argument, every element is `value` (a fixed value, not
+a callback). The fill value also picks the array's internal storage: an `int`
+or `float` fill gives a compact *flat* array (see `array_storage()`), anything
+else (including the one-argument `none` form) gives a general array. To build
+each element from its index, use `make_array()`.
+
+#### `make_array(N, gen_func)`
+Return `[gen_func(0), gen_func(1), ..., gen_func(N-1)]` — the callback form of
+`array()`. `gen_func` is called once per index with that index. The result is
+flat (`int`/`float`) when every element the callback returns is that one
+scalar kind, otherwise general.
 
 #### `top(array)`
 Return the last element of the array. This is an alias for `array[-1]`.
@@ -1507,6 +1518,17 @@ evaluated, so it must be a function object.
 Get the internal shared object pointer referred by `symbol`.
 It's currently used in tests to check if two array slices refer internally
 to the same object.
+
+#### `array_storage(array)`
+Return the array's internal storage as a string: `"ints"` or `"floats"` for a
+compact *flat* (unboxed) array, or `"general"` otherwise. This is purely an
+introspection aid (mainly for tests) — flat and general arrays behave
+identically; the only observable difference is speed and memory. A homogeneous
+`int`/`float` array produced by `range()`, `array(N, 0)`, `make_array()`, etc.
+stays flat through reads, slices, element writes, `append`/`pop`, `sum`, `sort`,
+`reverse`, `min`/`max`, and `foreach`; storing or appending an element of a
+different type (only possible via a `dyn`-typed alias) transparently converts it
+to a general array.
 
 #### `undef(symbol)`
 Undefine the given symbol from the current scope. Return true if the given

@@ -1158,6 +1158,121 @@ as_resolved_local(const Construct *lvalue)
     return id->sym.kind == SymKind::local ? id : nullptr;
 }
 
+/*
+ * Fast path for `a[i] = v` / `a[i] OP= v` when `a` is a flat (unboxed) int or
+ * float array: write the scalar straight into the unboxed vector, with no
+ * promotion to vector<LValue> and no element-LValue round-trip. Without this,
+ * the first store into a flat array (e.g. filling an array(N, 0)) would promote
+ * it and undo the whole specialization.
+ *
+ * Returns true (and sets `out` to the stored value) when it handled the store;
+ * false to fall through to the general lvalue->eval() -> doAssign() path. To
+ * keep the fall-through sound it commits to the flat path only after deciding
+ * on the BASE alone (which must be a side-effect-free identifier, so re-eval on
+ * the general path is harmless); the index is evaluated once, inside.
+ *
+ * A value that doesn't fit the flat kind (a string into an int array, only
+ * reachable through `dyn`) promotes the array and stores generally - same
+ * result as the un-specialized path, just slower for that one cold write.
+ */
+static bool
+try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
+                         const EvalValue &rval, EvalValue &out)
+{
+    if (!lvalue->is_subscript())
+        return false;
+
+    Subscript *sub = static_cast<Subscript *>(lvalue);
+
+    /* Base must be side-effect-free (a bare id) - see the note above. */
+    if (!sub->what->is_id())
+        return false;
+
+    const EvalValue base_lv = sub->what->eval(ctx);
+    if (!base_lv.is<LValue *>())
+        return false;
+
+    LValue *blv = base_lv.get<LValue *>();
+    if (!blv->is<SharedArrayObj>())
+        return false;
+
+    SharedArrayObj &arr = blv->getval<SharedArrayObj>();
+
+    if (arr.skind() == SharedArrayObj::Storage::general)
+        return false;            /* not flat: let the general path handle it */
+
+    /* A const/read-only array: defer so the general path raises the right error
+     * (CannotChangeConstEx / NotLValueEx) with the proper loc. */
+    if (blv->is_const_var() || arr.is_readonly())
+        return false;
+
+    const bool kind_int = arr.skind() == SharedArrayObj::Storage::ints;
+
+    /* Committed to the flat path now: evaluate the index exactly once. */
+    const EvalValue idx_v = RValue(sub->index->eval(ctx));
+    if (!idx_v.is<int_type>())
+        throw TypeErrorEx("Expected integer as subscript",
+                          sub->index->start, sub->index->end);
+
+    int_type idx = idx_v.get<int_type>();
+    if (idx < 0)
+        idx += arr.size();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+        throw OutOfBoundsEx(sub->start, sub->end);
+
+    const size_type at0 = arr.offset() + idx;
+    const EvalValue r = RValue(rval);
+
+    /* Compute the value to store (compound ops read the current element). */
+    EvalValue newval;
+    if (op == Op::assign) {
+        newval = r;
+    } else {
+        newval = kind_int ? EvalValue(arr.flat_ints()[at0])
+                          : EvalValue(arr.flat_floats()[at0]);
+        apply_compound_op(newval, r, op);
+    }
+
+    const bool fits = kind_int
+        ? newval.is<int_type>()
+        : (newval.is<float_type>() || newval.is<int_type>());
+
+    if (!fits) {
+        /* Cold path: the new element type doesn't fit. Promote and store
+         * generally (COW via the element LValue's get_value_for_put). */
+        arr.get_vec();                       /* promote in place */
+        SharedArrayObj &g = blv->getval<SharedArrayObj>();
+        LValue *elem = &g.get_vec()[g.offset() + idx];
+        elem->container = blv;
+        elem->container_idx = g.offset() + idx;
+        out = doAssign(EvalValue(elem), newval, Op::assign);
+        return true;
+    }
+
+    /*
+     * COW, matching the general element-write semantics (get_value_for_put):
+     * a slice clones itself; a non-slice that is aliased clones any live slices
+     * so they don't observe the write, but writes in place otherwise (plain
+     * handle aliases share the mutation - MyLang assignment aliases).
+     */
+    if (arr.is_slice())
+        arr.clone_internal_vec();            /* keep-flat; now standalone */
+    else if (arr.use_count() > 1)
+        arr.clone_aliased_slices(at0);
+
+    const size_type at = arr.offset() + idx;
+    if (kind_int) {
+        arr.flat_ints()[at] = newval.get<int_type>();
+    } else {
+        arr.flat_floats()[at] = newval.is<int_type>()
+            ? static_cast<float_type>(newval.get<int_type>())
+            : newval.get<float_type>();
+    }
+
+    out = newval;
+    return true;
+}
+
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,
@@ -1246,6 +1361,14 @@ handle_single_expr14(EvalContext *ctx,
                 }
             }
         }
+
+        /*
+         * Fast path: `a[i] = v` / `a[i] OP= v` into a flat (unboxed) int/float
+         * array - write the scalar straight into the flat vector, no promotion.
+         */
+        EvalValue flat_out;
+        if (try_flat_subscript_store(ctx, lvalue, op, rval, flat_out))
+            return flat_out;
     }
 
     const EvalValue &lval = lvalue->eval(ctx);

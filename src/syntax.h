@@ -29,6 +29,7 @@ enum class ConstructType {
     block,
     id,
     lit_int,
+    subscript,
 };
 
 /*
@@ -103,6 +104,7 @@ public:
     bool is_block() const { return ct == ConstructType::block; }
     bool is_id() const { return ct == ConstructType::id; }
     bool is_lit_int() const { return ct == ConstructType::lit_int; }
+    bool is_subscript() const { return ct == ConstructType::subscript; }
 
     virtual ~Construct() = default;
 
@@ -940,7 +942,7 @@ public:
     unique_ptr<Construct> what;
     unique_ptr<Construct> index;
 
-    Subscript() : Construct("Subscript") { }
+    Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     int_type eval_int(EvalContext *ctx) const override;
     float_type eval_float(EvalContext *ctx) const override;

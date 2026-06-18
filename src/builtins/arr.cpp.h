@@ -15,9 +15,18 @@
 
 #include <algorithm>
 
+/*
+ * array(N)        -> N elements of `none` (general storage).
+ * array(N, value) -> N elements all equal to `value`. The fill value drives the
+ *                    storage (value-driven, see plans/typed-arrays.md): an int
+ *                    -> flat int, a float -> flat float, else general. For a
+ *                    callback-built array use make_array().
+ */
 EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
 {
-    if (exprList->elems.size() != 1)
+    const size_t nargs = exprList->elems.size();
+
+    if (nargs < 1 || nargs > 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
@@ -29,14 +38,150 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
     const int_type n = e.get<int_type>();
 
     if (n < 0)
-        throw InvalidValueEx("Expected non-negative integer", arg->start, arg->end);
+        throw InvalidValueEx("Expected non-negative integer",
+                             arg->start, arg->end);
 
+    if (nargs == 1) {
+
+        /* No fill value: a general array of `none`. */
+        SharedArrayObj::vec_type vec;
+        vec.reserve(n);
+
+        for (int_type i = 0; i < n; i++)
+            vec.emplace_back(none, ctx->const_ctx);
+
+        return SharedArrayObj(move(vec));
+    }
+
+    const EvalValue &v = RValue(exprList->elems[1]->eval(ctx));
+
+    /* Value-driven flat storage for a scalar fill value. */
+    if (v.is<int_type>())
+        return SharedArrayObj(
+            SharedArrayObj::ivec_type(n, v.get<int_type>()));
+
+    if (v.is<float_type>())
+        return SharedArrayObj(
+            SharedArrayObj::fvec_type(n, v.get<float_type>()));
+
+    /* General fill: every element is (a copy of) the value. */
     SharedArrayObj::vec_type vec;
+    vec.reserve(n);
 
     for (int_type i = 0; i < n; i++)
-        vec.emplace_back(none, ctx->const_ctx);
+        vec.emplace_back(v, ctx->const_ctx);
 
     return SharedArrayObj(move(vec));
+}
+
+/*
+ * make_array(N, gen) -> [gen(0), gen(1), ..., gen(N-1)]. The callback form of
+ * array(): each element is produced by calling `gen` with its index. The
+ * representation is value-driven (optimistic flat): elements accumulate in an
+ * unboxed int/float vector while they stay that one scalar kind, and the array
+ * promotes to general the moment a callback returns something else.
+ */
+EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg0->eval(ctx));
+
+    if (!e.is<int_type>())
+        throw TypeErrorEx("Expected integer", arg0->start, arg0->end);
+
+    const int_type n = e.get<int_type>();
+
+    if (n < 0)
+        throw InvalidValueEx("Expected non-negative integer",
+                             arg0->start, arg0->end);
+
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &fval = RValue(arg1->eval(ctx));
+
+    if (!fval.is<shared_ptr<FuncObject>>())
+        throw TypeErrorEx("Expected function", arg1->start, arg1->end);
+
+    FuncObject &funcObj = *fval.get<shared_ptr<FuncObject>>().get();
+
+    /*
+     * Optimistic flat: stay in `ivec`/`fvec` while every element matches that
+     * scalar kind; on the first mismatch, spill what we have into a general
+     * `vec` and continue there. `mode`: 0 = empty/undecided, 1 = ints,
+     * 2 = floats, 3 = general.
+     */
+    SharedArrayObj::ivec_type ivec;
+    SharedArrayObj::fvec_type fvec;
+    SharedArrayObj::vec_type  gvec;
+    int mode = 0;
+
+    auto spill_to_general = [&]() {
+        gvec.reserve(n);
+        if (mode == 1)
+            for (int_type x : ivec) gvec.emplace_back(EvalValue(x), false);
+        else if (mode == 2)
+            for (float_type x : fvec) gvec.emplace_back(EvalValue(x), false);
+        ivec.clear();
+        fvec.clear();
+        mode = 3;
+    };
+
+    for (int_type i = 0; i < n; i++) {
+
+        const EvalValue r = eval_func(ctx, funcObj, EvalValue(i));
+
+        if (mode == 0) {
+            if (r.is<int_type>()) {
+                mode = 1; ivec.push_back(r.get<int_type>());
+            } else if (r.is<float_type>()) {
+                mode = 2; fvec.push_back(r.get<float_type>());
+            } else {
+                mode = 3; gvec.reserve(n); gvec.emplace_back(r, false);
+            }
+        } else if (mode == 1 && r.is<int_type>()) {
+            ivec.push_back(r.get<int_type>());
+        } else if (mode == 2 && r.is<float_type>()) {
+            fvec.push_back(r.get<float_type>());
+        } else {
+            if (mode != 3)
+                spill_to_general();
+            gvec.emplace_back(r, false);
+        }
+    }
+
+    if (mode == 1) return SharedArrayObj(move(ivec));
+    if (mode == 2) return SharedArrayObj(move(fvec));
+    return SharedArrayObj(move(gvec));
+}
+
+/*
+ * Introspection: report an array's backing-storage specialization as a string -
+ * "ints" / "floats" for flat (unboxed) storage, "general" for vector<LValue>.
+ * type() can't express this (flat and general are the same t_arr); this exists
+ * mainly so tests can pin the representation and catch regressions. Not const:
+ * it reflects a runtime fact and must not fold.
+ */
+EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    if (!e.is<SharedArrayObj>())
+        throw TypeErrorEx("Expected array", arg->start, arg->end);
+
+    switch (e.get<SharedArrayObj>().skind()) {
+        case SharedArrayObj::Storage::ints:
+            return SharedStr(string("ints"));
+        case SharedArrayObj::Storage::floats:
+            return SharedStr(string("floats"));
+        default:
+            return SharedStr(string("general"));
+    }
 }
 
 EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
@@ -68,6 +213,24 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     if (arr.is_slice())
         arr.clone_internal_vec();
 
+    /*
+     * Flat fast path: append a matching scalar straight into the unboxed
+     * vector, no promotion. A mismatched element type falls through to the
+     * general append below (which promotes). Growing in place is sound for
+     * aliases (they share the mutation) and slices (they keep their off/len).
+     */
+    if (arr.skind() == SharedArrayObj::Storage::ints && elem.is<int_type>()) {
+        arr.flat_ints().push_back(elem.get<int_type>());
+        return lval->get();
+    }
+    if (arr.skind() == SharedArrayObj::Storage::floats &&
+        (elem.is<float_type>() || elem.is<int_type>())) {
+        arr.flat_floats().push_back(elem.is<int_type>()
+            ? static_cast<float_type>(elem.get<int_type>())
+            : elem.get<float_type>());
+        return lval->get();
+    }
+
     arr.get_vec().emplace_back(elem, ctx->const_ctx);
     return lval->get();
 }
@@ -96,21 +259,39 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
     if (arr.is_readonly())
         throw CannotChangeConstEx(arg->start, arg->end);
 
-    const ArrayConstView &view = arr.get_view();
+    const size_type n = arr.size();
 
-    if (!view.size())
+    if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
 
-    EvalValue last = view[view.size() - 1].get();
+    /* Read the last element without promoting flat storage. */
+    const size_type last_i = arr.offset() + n - 1;
+    EvalValue last;
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints:
+            last = EvalValue(arr.flat_ints()[last_i]);   break;
+        case SharedArrayObj::Storage::floats:
+            last = EvalValue(arr.flat_floats()[last_i]); break;
+        default:
+            last = arr.get_vec()[last_i].get();          break;
+    }
 
     if (arr.is_slice()) {
 
+        /* Shrink the view by one (shares the parent storage, stays flat). */
         lval->put(SharedArrayObj(arr, arr.offset(), arr.size() - 1));
 
     } else {
 
-        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
-        arr.get_vec().pop_back();
+        arr.clone_aliased_slices(last_i);
+        switch (arr.skind()) {
+            case SharedArrayObj::Storage::ints:
+                arr.flat_ints().pop_back();   break;
+            case SharedArrayObj::Storage::floats:
+                arr.flat_floats().pop_back(); break;
+            default:
+                arr.get_vec().pop_back();     break;
+        }
     }
 
     return last;

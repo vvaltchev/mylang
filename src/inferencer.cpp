@@ -902,7 +902,17 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.array_of(A.str_ty());
 
     if (n == "range")  return A.array_of(A.int_ty());
-    if (n == "array")  return A.array_of(A.dyn_ty());
+    if (n == "array") {
+        /* array(N, value) -> array<typeof value>; array(N) -> array<dyn>. */
+        if (args->elems.size() >= 2)
+            return A.array_of(arg(1));
+        return A.array_of(A.dyn_ty());
+    }
+    if (n == "make_array") {
+        /* make_array(N, gen) -> array of the callback's return type. */
+        STyRef f = sty_resolve(arg(1));
+        return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
+    }
     if (n == "dict")   return A.dict_of(A.dyn_ty(), A.dyn_ty());
 
     if (n == "abs" || n == "clone" || n == "deepclone")
@@ -1131,6 +1141,16 @@ void Inferencer::accumulate_call(CallExpr *call)
             func_i = 0; cont_i = 1;
         } else if (nm == "sort" || nm == "rev_sort") {
             func_i = 1; cont_i = 0; comparator = true;
+        } else if (nm == "make_array") {
+            /* make_array(N, gen): the callback's param is the int index, not a
+             * container element - type it int directly and return. */
+            if (args->elems.size() >= 2) {
+                FuncInfo *cb = callee_funcinfo(args->elems[1].get());
+                if (cb && !cb->params.empty())
+                    contribute_arg(cb->params[0], A.int_ty(),
+                                   args->elems[1]->start);
+            }
+            return;
         } else {
             return;
         }
