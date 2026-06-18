@@ -87,11 +87,19 @@ Delivered M0-M7: the inferencer is **on by default** and the whole suite
   subscript/slice/member, multiple-assignment/IdList spread, builtin signatures.
 - 51 new inference tests (accept + reject); existing tests migrated.
 
-**Not done (deferred, documented):** flow-sensitive nullability narrowing
-(`if (x != none) {...}`); precise const-container element types (const
-arrays/dicts are typed `array<dyn>`/`dict<dyn,dyn>`); the speed-specialization
-phase (typed/monomorphic AST nodes — M8). So inference currently buys
-**compile-time safety, not speed** (the tree-walker still boxes every value).
+**M8 (speed) DONE**, plus the formerly-deferred items:
+- **Typed scalar specialization** (`specialize_types` + `TypedScalarExpr` +
+  `eval_int`/`eval_float`): int/float arithmetic/comparison/logical/unary and
+  array-element/slot reads evaluate unboxed, with no `num_bin_op` dispatch.
+  ~2.8x on primes_sqrt; float-heavy numeric loops now beat CPython.
+- **Flow-sensitive null narrowing** (`if (x != none)`, `if (x)`, `if (x==none)
+  return; ...` guard).
+- **Exact const-container element types** (`sty_from_value` recurses;
+  heterogeneous -> `array<dyn>`; element joins absorb None; empty/`dyn` element
+  fits any array).
+
+Still deferred (minor): deep function subtyping (assignability is arity-only);
+narrowing patterns beyond the above.
 
 ### Important review items (things you may want to change)
 1. **Strict bare-`var` nullability.** Per your AskUserQuestion choice, a bare
