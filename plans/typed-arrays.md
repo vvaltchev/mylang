@@ -9,7 +9,7 @@ delicacy to the type-inference feature itself.
 **Possible, and type inference is exactly what makes it sound.** Today an array
 is a `vector<LValue>` with **48-byte** element slots (`EvalValue` 32 + the
 `container`/`container_idx`/`is_const` COW back-pointer fields). Bulk operations
-(`reverse`, `sort`, `sum`, `foreach`, subscript-heavy loops) are memory-bandwidth
+(`reverse`, `sort`, `sum`, `foreach`, subscript loops) are memory-bandwidth
 bound on that slot size — the root cause of `21_array_reverse` etc. being ~6×
 Python (see the perf analysis: Python moves 8-byte pointers, we move 48-byte
 slots).
@@ -22,8 +22,8 @@ arithmetic loops we'd likely **beat CPython** (raw `int64` vs CPython's boxed
 `PyObject*` + small-int deref). This is the payoff M8 set up for scalars,
 extended to arrays.
 
-**Why it needs type inference:** the flat representation can only be used when we
-*know* every element is (and stays) int/float. Before inference there was no such
+**Why it needs type inference:** the flat representation is usable only when we
+*know* every element is (and stays) int/float. Before, there was no such
 proof; now `infer_types` proves `array<int>` / `array<float>` whole-program, so
 we can pick the representation safely and reject the operations that would break
 it at compile time.
@@ -33,7 +33,7 @@ it at compile time.
 Two new runtime types, alongside the existing `t_arr`. The **value handle** is
 `FlatArrayObj<int_type>` / `FlatArrayObj<float_type>` — a small slice-view
 wrapper that *contains* an `intrusive_ptr` to the storage (exactly as
-`SharedArrayObj` contains `intrusive_ptr<SharedObject>`); it is **not** itself an
+`SharedArrayObj` holds `intrusive_ptr<SharedObject>`); it is **not** itself an
 `intrusive_ptr`.
 
 - `t_int_arr` — value handle `FlatArrayObj<int_type>`.
@@ -45,7 +45,7 @@ Both **non-trivial** (`>= t_str`), appended after `t_dict` in `TypeE`.
 have non-trivial ctors/dtors, so every non-trivial `ValueU` member is wrapped in
 `FlatVal<T>` (an `alignas(T) char[sizeof(T)]` buffer; see `flatval.h`), and the
 lifecycle (ctor/dtor/copy/move) is driven by type-erased ops
-(`TypeErasureOps`/`TypeImpl<T>`) via reinterpret-cast, *not* by the union. So the
+(`TypeErasureOps`/`TypeImpl<T>`) via reinterpret-cast, not the union. So the
 new members mirror the existing `FlatVal<SharedArrayObj> arr;` /
 `FlatVal<intrusive_ptr<DictObject>> dict;` exactly:
 
@@ -70,7 +70,7 @@ stays 32 bytes and `LValue` stays 48 — no size regression.
 `SharedArrayObjTempl<LValue>` cannot be reused with `T = int_type`: its
 COW/slice machinery (`clone_aliased_slices`, the per-element `container`
 back-pointers, `get_value_for_put`) assumes elements are `LValue`s. A flat array
-needs none of that per element — COW happens at the *array* level only. So a new,
+needs none of that per element — COW is at the *array* level only. So a new,
 simpler class:
 
 ```cpp
@@ -96,7 +96,7 @@ copy, lazy slices) but with raw `T` storage and no per-element bookkeeping.
 `LValue*`; for a flat array, `vec[i]` is a raw `T`, not an `LValue`. Per the
 proposal, generalize the element back-reference: instead of `LValue *container`,
 the element lvalue records *(which array, which index, which backing kind)*. The
-kind tag rides in the padding next to `is_const` (free bits). The two write paths
+kind tag rides in the padding by `is_const` (free bits). The two write paths
 then diverge in `LValue::get_value_for_put`/`put` (`eval.cpp`):
 
 - general (`vector<LValue>`): today's path (COW the `SharedObject`, write the
@@ -118,7 +118,7 @@ known at compile time, but a value is *created* at runtime by a literal,
 form when the inferred type is `array<int>`/`array<float>`.
 
 Solution: extend the M8 machinery. `TypeHint` already tags nodes int/float; add
-`ai`/`af` (array-of-int/float). The **specializer** then rewrites array-producing
+`ai`/`af` (array of int/float). The **specializer** rewrites array-producing
 nodes in a typed-array context to a flat-producing form:
 - `[1,2,3]` (LiteralArray, all-int) -> build a `FlatArrayObj<int_type>`.
 - `range(N)` -> flat int directly (it already produces 0..N-1).
@@ -131,7 +131,7 @@ inferred type, so every value that flows into it has the same representation
 
 ### 2. The `dyn` boundary + promote-to-general fallback (the surface-area tamer)
 
-A flat array can flow into a `dyn` context (a `dyn` var, `print`, a `dyn` param),
+A flat array can flow into a `dyn` context (`dyn` var, `print`, `dyn` param),
 where static type is lost. Two rules keep this sound *without* reimplementing
 every array operation for flat types:
 
@@ -192,7 +192,7 @@ workloads, complementing M8.
   const int arrays. **Everything else promotes.** Subscript-*store* (`a[i]=v`)
   via the flat `LValue` path. Measure `21`/`36`/`18`/`14`/`43`.
 - **M2 — float arrays.** Mirror M1 for `t_float_arr`.
-- **M3 — `array(N)` typed creation** (the `0`-default, §3) + mutating builtins on
+- **M3 — `array(N)` typed creation** (`0`-default, §3) + mutating builtins on
   flat (`append`/`insert`/`pop`/`erase` with growth + COW) + `map`/`filter`/
   `find`.
 - **M4 — promotion polish + dyn-boundary audit**: ensure every general-array
@@ -209,7 +209,7 @@ workloads, complementing M8.
 - **The value model is the most delicate, perf-critical, most-tested code.** A
   third array representation is a permanent maintenance cost and a regression
   risk for the existing fast paths.
-- **The `dyn` boundary is a soundness surface** (a flat array must never silently
+- **The `dyn` boundary is a soundness surface** (a flat array must not silently
   accept a non-`T` element). Mitigated by compile-time checks (non-`dyn`) +
   promote-on-violation (`dyn`).
 - **`array(N)` `0`-default** is an observable behavior change (bounded to typed
