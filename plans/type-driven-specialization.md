@@ -119,17 +119,23 @@ Once `array<int>`/`array<float>` is trustworthy, route representation off it:
   stays flat unless its destination is `dyn`.
 - Promotion remains only as the `dyn`-escape safety net.
 
-## Open questions (confirm before autonomous work)
+## Resolved decisions (confirmed with the user)
 
-1. **`array<dyn>` under plain `var`:** does a genuinely heterogeneous array
-   (`array<dyn>`) require explicit `dyn`, or is `array<dyn>` an acceptable
-   concrete type for plain `var` (only a whole-value/scalar `dyn` triggers the
-   rule)? Affects whether the rule is "no `dyn` at the top level" vs "no `dyn`
-   anywhere in the type tree". (Leaning: require `dyn` — maximizes
-   specialization and matches "this also applies to arrays".)
-2. **Enforcement = hard compile error**, on by default, off under `-nti`;
-   `opt T`/`array<T>`/etc. are fine, only `dyn` triggers it. (Leaning: yes.)
-3. **Function returns:** there is no return-type annotation syntax. A function
-   whose return is genuinely `dyn` is handled at the *caller's* `var` (which
-   then needs `dyn`); functions themselves get no new annotation. (Leaning:
-   yes.)
+1. **`array<dyn>` under plain `var` → STRICT.** Any `dyn` *anywhere* in the
+   inferred type (`array<dyn>`, `dict<_,dyn>`, nested, or a bare `dyn`) makes a
+   plain `var`/`const` an error; the user must declare it `dyn`/`var dyn`. So
+   every plain-`var` array is guaranteed monomorphic `array<T>` (flat-eligible).
+2. **Enforcement = HARD compile error, on by default**, disabled by `-nti`.
+   `opt T`/`array<T>`/`dict<K,V>`/etc. (any fully-concrete type) are fine; only a
+   `dyn` somewhere in the type triggers it. The error is an uncatchable
+   compile-time `Exception` (like the other inferencer diagnostics). The corpus
+   (tests/bench/samples) gets `dyn` added where genuinely needed.
+3. **Function returns:** no return-type annotation syntax. A function whose
+   return is genuinely `dyn` is handled at the *caller's* `var` (which then needs
+   `dyn`); functions themselves get no new annotation.
+
+## Implementation sequencing
+
+Build the rule behind the inference pass but **flip the default on only after**
+`--debug-ti` exists and the corpus is audited+annotated, so development isn't
+blocked by a corpus-wide break. End state: on by default.

@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <iosfwd>
+
 class Construct;
 
 /*
@@ -19,7 +21,15 @@ class Construct;
  * owns its own type arena and side tables and stores nothing on the AST, so it
  * leaves the tree untouched for resolve_names / evaluation.
  */
-void infer_types(Construct *root, bool enable = true);
+void infer_types(Construct *root, bool enable = true, bool strict = false);
+
+/*
+ * --debug-ti: run inference (non-strict) and dump every declared identifier's
+ * inferred type + use sites (machine-readable, tab-separated) to `os`. Used to
+ * audit the corpus for spurious `dyn`s. See
+ * plans/type-driven-specialization.md.
+ */
+void dump_type_info(Construct *root, std::ostream &os);
 
 /*
  * M8 specialization pass: rewrite hot scalar expression nodes (int/float

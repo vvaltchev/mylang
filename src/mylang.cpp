@@ -24,6 +24,7 @@ static bool opt_no_inline;
 static int opt_inline_threshold = 24;  /* max inlined body size (nodes) */
 static bool opt_no_run;
 static bool opt_no_type_infer;
+static bool opt_debug_ti;
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
@@ -43,6 +44,8 @@ void help()
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
+    cout << " --debug-ti  Dump inferred types of all identifiers, then exit"
+         << endl;
 
 #ifdef TESTS
     cout << "  -rt      Run unit tests" << endl;
@@ -150,6 +153,10 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-nti")) {
 
             opt_no_type_infer = true;
+
+        } else if (!strcmp(arg, "--debug-ti")) {
+
+            opt_debug_ti = true;
 
         } else if (!strcmp(arg, "-e")) {
 
@@ -322,6 +329,13 @@ int main(int argc, char **argv)
                 "Unexpected token at the end",
                 &ctx.get_tok()
             );
+
+        /* --debug-ti: dump the inferred type of every identifier + its use
+         * sites (machine-readable) and exit, without running. */
+        if (opt_debug_ti) {
+            dump_type_info(root.get(), cout);
+            return 0;
+        }
 
         /* Static type inference + checking (compile-time). Runs before
          * resolve_names, on the clean source tree. A type violation throws a
