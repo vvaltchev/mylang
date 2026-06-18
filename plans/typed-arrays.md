@@ -1,8 +1,17 @@
 # Flat typed arrays (`array<int>` / `array<float>` unboxed storage)
 
-Status: **planning.** A large, value-model-level optimization enabled by the new
-type inferencer. Read this in full before starting; it is comparable in size and
-delicacy to the type-inference feature itself.
+Status: **M1 (flat int arrays) DONE.** A large, value-model-level optimization
+enabled by the type inferencer. Read this in full before continuing.
+
+**Chosen design: approach B (tagged storage in `SharedObject`), NOT approach A
+(separate `t_int_arr`/`t_float_arr` types).** The original draft below the
+"Data model (approach A — rejected)" heading is kept for the rationale; the live
+design is "Data model (approach B — chosen)". Approach B is far less invasive:
+one array type (`t_arr`), one value handle (`SharedArrayObj`), no new `TypeE`
+entries, no `ValueU` members, no second COW/slice implementation. The storage
+*kind* is an internal detail of `SharedObject`; every operation that doesn't have
+a flat fast path transparently `promote_to_general()`s and reuses the existing
+`vector<LValue>` code. That capped the M1 change to ~a dozen call sites.
 
 ## Verdict
 
@@ -28,13 +37,46 @@ proof; now `infer_types` proves `array<int>` / `array<float>` whole-program, so
 we can pick the representation safely and reject the operations that would break
 it at compile time.
 
-## Data model
+## Data model (approach B — chosen)
 
-Two new runtime types, alongside the existing `t_arr`. The **value handle** is
-`FlatArrayObj<int_type>` / `FlatArrayObj<float_type>` — a small slice-view
-wrapper that *contains* an `intrusive_ptr` to the storage (exactly as
-`SharedArrayObj` holds `intrusive_ptr<SharedObject>`); it is **not** itself an
-`intrusive_ptr`.
+No new types. `SharedArrayObj`'s pointee `SharedObject` gains a `Storage kind`
+discriminator and an **anonymous union** of the three backing vectors
+(`sharedarray.h`):
+
+```cpp
+enum class Storage : unsigned char { general, ints, floats };
+struct SharedObject final : RefCounted {
+    Storage kind;
+    union {
+        vec_type  vec;     // kind == general : vector<LValue>  (48-byte slots)
+        ivec_type ivec;    // kind == ints    : vector<int_type>   (8-byte)
+        fvec_type fvec;    // kind == floats  : vector<float_type> (8-byte)
+    };
+    std::unordered_set<SharedArrayObjTempl *> slices;
+    bool readonly = false;
+    // manual placement-new ctors per kind + a kind-switching dtor (a union
+    // can't run its members' non-trivial ctors/dtors).
+};
+```
+
+The `off`/`len`/`slice` slice-view fields and the whole COW/slice machinery are
+**unchanged** — a slice shares the parent `shobj` regardless of kind, so slicing
+a flat array is still a cheap view that stays flat. `size()` is kind-aware (reads
+the live vector's `size()`); `skind()`, `flat_ints()`, `flat_floats()` expose the
+unboxed vectors to the hot paths.
+
+**The promotion hook.** `get_vec()` (the general `vector<LValue>&` accessor) calls
+`promote_to_general()` on first use: it converts the flat vector to
+`vector<LValue>` in place (destroy the flat union member, placement-new the
+general one), value-preserving, so it is sound even when the object is shared or
+sliced. Every operation that lacks a flat fast path calls `get_vec()` and so
+**just works** (paying a one-time O(N) conversion). The const overload promotes
+too — promotion preserves the value, only the representation changes.
+
+### Data model (approach A — rejected; kept for rationale)
+
+The original plan added two **new** runtime types alongside `t_arr`, with a
+separate `FlatArrayObj<T>` value handle:
 
 - `t_int_arr` — value handle `FlatArrayObj<int_type>`.
 - `t_float_arr` — value handle `FlatArrayObj<float_type>`.
@@ -185,21 +227,37 @@ workloads, complementing M8.
 
 ## Milestones (phased; measure after each)
 
-- **M1 — int arrays, read-fast-path only.** `t_int_arr` + `FlatArrayObj<int>` +
-  lifecycle wiring + `TypeIntArr` with subscript-get/`len`/`to_string`/`clone`/
-  `==`/`is_true`/`use_count` + `foreach` + `Subscript::eval_int` flat branch +
-  `sum`/`reverse`/`sort`/`+`. Representation routing for `[ints]`, `range()`,
-  const int arrays. **Everything else promotes.** Subscript-*store* (`a[i]=v`)
-  via the flat `LValue` path. Measure `21`/`36`/`18`/`14`/`43`.
-- **M2 — float arrays.** Mirror M1 for `t_float_arr`.
-- **M3 — `array(N)` typed creation** (`0`-default, §3) + mutating builtins on
-  flat (`append`/`insert`/`pop`/`erase` with growth + COW) + `map`/`filter`/
-  `find`.
-- **M4 — promotion polish + dyn-boundary audit**: ensure every general-array
-  site either handles the flat types or is reached only after `promote()`; fuzz
-  the dyn-escape paths.
-- **M5 — docs + the full `-rt` suite green + bench**. README (value model note),
-  CLAUDE.md (the new types, `FlatArrayObj`, the routing, promotion).
+- **M1 — int arrays. DONE.** Approach B: `SharedObject` gains `Storage kind` + the
+  anonymous union + `promote_to_general()` (M1a); `range()` produces flat int
+  storage (M1b); the hot ops read the unboxed vector directly (M1c): `sum`,
+  `reverse`, `sort` (no-comparator), `foreach`, `Subscript::eval_int`/`eval_float`,
+  `TypeArr::add` (flat+flat concat), and `clone_internal_vec` (clone/COW keep
+  flat). **Crucially, the const path keeps flat:** `make_const_clone` /
+  `clone_to_mutable` bake/copy flat int/float arrays without promoting, and the
+  inferencer's `sty_from_value` reads the element type from `skind()` instead of
+  `get_view()` — *that get_view() was silently promoting every const array during
+  type inference and defeating the whole feature.* Everything else promotes.
+  **Measured:** `17_array_concat` 2.7x→0.21x, `21_array_reverse` 1.1x→0.37x,
+  `18_foreach_array` 1.0x→0.51x, `36_sum_builtin` 0.25x; geomean 0.69x→0.63x.
+- **M2 — float arrays.** The storage, union, accessors, promotion, and every flat
+  branch already handle `Storage::floats` — but *nothing creates a flat float
+  array yet* (range is int-only; `array(N)` is general). Needs a flat-float
+  producer (e.g. an all-float `[1.0, 2.0]` literal, or `array(N)` in a float
+  context) to exercise it. No current benchmark builds a float array, so this is
+  unmeasured until M3.
+- **M3 — `array(N)` typed creation** (`0`/`0.0`-default, §3) so `array<int>`/
+  `array<float>` allocations are flat, **+ the flat subscript-*store* path**
+  (`a[i] = int` writes `flat_ints()[i]` directly; a non-matching element type
+  promotes) + mutating builtins on flat (`append`/`insert`/`pop`/`erase`) +
+  `map`/`filter`/`find`/`min`/`max`. This is what unlocks the `array(N)`-based
+  benchmarks (`14_array_subscript`, `33_sort_ints`, `38_min_max`) — they stay
+  general today because `array(N)` is general.
+- **M4 — promotion polish + dyn-boundary audit**: confirm every general-array
+  site is either flat-aware or reached only after `promote_to_general()`; fuzz the
+  dyn-escape paths (a flat array flowing into `dyn`/`print`/`append("s")`).
+- **M5 — docs + the full `-rt` suite green + bench**. README (only if behavior
+  changes — M3's `array(N)` `0`-default does), CLAUDE.md (the storage kind, the
+  routing, promotion). *M1 already updated CLAUDE.md's COW section and this plan.*
 
 ## Risks / why this is big
 

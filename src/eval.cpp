@@ -577,10 +577,31 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
         if (arr.is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
 
-        const ArrayConstView &view = arr.get_view();
-
-        if (!view.size())
+        if (!arr.size())
             return empty_arr;
+
+        /*
+         * Flat homogeneous array: copy into fresh mutable unboxed storage. The
+         * elements are scalars (nothing to recurse into), so this is sound for
+         * both make_mutable_clone and make_deep_mutable_clone.
+         */
+        if (arr.skind() == SharedArrayObj::Storage::ints) {
+            const auto &iv = arr.flat_ints();
+            return SharedArrayObj(SharedArrayObj::ivec_type(
+                iv.cbegin() + arr.offset(),
+                iv.cbegin() + arr.offset() + arr.size()
+            ));
+        }
+
+        if (arr.skind() == SharedArrayObj::Storage::floats) {
+            const auto &fv = arr.flat_floats();
+            return SharedArrayObj(SharedArrayObj::fvec_type(
+                fv.cbegin() + arr.offset(),
+                fv.cbegin() + arr.offset() + arr.size()
+            ));
+        }
+
+        const ArrayConstView &view = arr.get_view();
 
         SharedArrayObj::vec_type vec;
         vec.reserve(view.size());
@@ -645,7 +666,37 @@ make_const_clone(const EvalValue &v)
 {
     if (v.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = v.get<SharedArrayObj>().get_view();
+        const SharedArrayObj &src = v.get<SharedArrayObj>();
+
+        /*
+         * Flat homogeneous array: bake a flat read-only copy, keeping the
+         * unboxed storage. The elements are scalars, so there is nothing to
+         * recurse into - a const flat int/float array stays flat (and so does
+         * everything cloned from it, since clone_internal_vec is kind-aware).
+         */
+        if (src.skind() == SharedArrayObj::Storage::ints) {
+            const auto &iv = src.flat_ints();
+            SharedArrayObj::ivec_type nv(
+                iv.cbegin() + src.offset(),
+                iv.cbegin() + src.offset() + src.size()
+            );
+            SharedArrayObj arr(move(nv));
+            arr.set_readonly();
+            return arr;
+        }
+
+        if (src.skind() == SharedArrayObj::Storage::floats) {
+            const auto &fv = src.flat_floats();
+            SharedArrayObj::fvec_type nv(
+                fv.cbegin() + src.offset(),
+                fv.cbegin() + src.offset() + src.size()
+            );
+            SharedArrayObj arr(move(nv));
+            arr.set_readonly();
+            return arr;
+        }
+
+        const ArrayConstView &view = src.get_view();
 
         SharedArrayObj::vec_type vec;
         vec.reserve(view.size());
@@ -1576,7 +1627,10 @@ int_type Subscript::eval_int(EvalContext *ctx) const
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
             throw OutOfBoundsEx(start, end);
-        return arr.get_vec()[arr.offset() + idx].getval<int_type>();
+        const size_type at = arr.offset() + idx;
+        if (arr.skind() == SharedArrayObj::Storage::ints)
+            return arr.flat_ints()[at];     /* unboxed: no promotion */
+        return arr.get_vec()[at].getval<int_type>();
     }
     return Construct::eval_int(ctx);
 }
@@ -1594,7 +1648,12 @@ float_type Subscript::eval_float(EvalContext *ctx) const
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
             throw OutOfBoundsEx(start, end);
-        const LValue &el = arr.get_vec()[arr.offset() + idx];
+        const size_type at = arr.offset() + idx;
+        if (arr.skind() == SharedArrayObj::Storage::floats)
+            return arr.flat_floats()[at];   /* unboxed: no promotion */
+        if (arr.skind() == SharedArrayObj::Storage::ints)
+            return static_cast<float_type>(arr.flat_ints()[at]);
+        const LValue &el = arr.get_vec()[at];
         if (el.is<int_type>())
             return static_cast<float_type>(el.getval<int_type>());
         return el.getval<float_type>();
@@ -1911,14 +1970,46 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
     if (cval.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = cval.get<SharedArrayObj>().get_view();
+        const SharedArrayObj &arr = cval.get<SharedArrayObj>();
 
-        for (size_type i = 0; i < view.size(); i++) {
+        /*
+         * Flat fast path: iterate the unboxed int/float vector directly, with
+         * no promotion to vector<LValue>. Each element is materialized into a
+         * scalar EvalValue per iteration (cheap, trivially-copyable).
+         */
+        if (arr.skind() == SharedArrayObj::Storage::ints) {
 
-            const EvalValue &elem = view[i].get();
+            const auto &iv = arr.flat_ints();
+            const size_type off = arr.offset(), n = arr.size();
 
-            if (!do_iter(&loopCtx, i, &elem, 1))
-                break;
+            for (size_type i = 0; i < n; i++) {
+                const EvalValue elem(iv[off + i]);
+                if (!do_iter(&loopCtx, i, &elem, 1))
+                    break;
+            }
+
+        } else if (arr.skind() == SharedArrayObj::Storage::floats) {
+
+            const auto &fv = arr.flat_floats();
+            const size_type off = arr.offset(), n = arr.size();
+
+            for (size_type i = 0; i < n; i++) {
+                const EvalValue elem(fv[off + i]);
+                if (!do_iter(&loopCtx, i, &elem, 1))
+                    break;
+            }
+
+        } else {
+
+            const ArrayConstView &view = arr.get_view();
+
+            for (size_type i = 0; i < view.size(); i++) {
+
+                const EvalValue &elem = view[i].get();
+
+                if (!do_iter(&loopCtx, i, &elem, 1))
+                    break;
+            }
         }
 
     } else if (cval.is<SharedStr>()) {
