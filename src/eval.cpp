@@ -551,9 +551,9 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
         return SharedArrayObj(move(vec));
     }
 
-    if (v.is<shared_ptr<DictObject>>()) {
+    if (v.is<intrusive_ptr<DictObject>>()) {
 
-        const shared_ptr<DictObject> &obj = v.get<shared_ptr<DictObject>>();
+        const auto &obj = v.get<intrusive_ptr<DictObject>>();
 
         if (obj->is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
@@ -570,7 +570,7 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
             );
         }
 
-        return shared_ptr<DictObject>(make_shared<DictObject>(move(data)));
+        return make_intrusive<DictObject>(move(data));
     }
 
     return v;
@@ -615,11 +615,11 @@ make_const_clone(const EvalValue &v)
         return arr;
     }
 
-    if (v.is<shared_ptr<DictObject>>()) {
+    if (v.is<intrusive_ptr<DictObject>>()) {
 
         DictObject::inner_type data;
         const DictObject::inner_type &src =
-            v.get<shared_ptr<DictObject>>()->get_ref();
+            v.get<intrusive_ptr<DictObject>>()->get_ref();
 
         for (const auto &p : src) {
             data.emplace(
@@ -628,9 +628,9 @@ make_const_clone(const EvalValue &v)
             );
         }
 
-        auto obj = make_shared<DictObject>(move(data));
+        auto obj = make_intrusive<DictObject>(move(data));
         obj->set_readonly();
-        return shared_ptr<DictObject>(obj);
+        return intrusive_ptr<DictObject>(obj);
     }
 
     return v;
@@ -1658,10 +1658,10 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
                 break;
         }
 
-    } else if (cval.is<shared_ptr<DictObject>>()) {
+    } else if (cval.is<intrusive_ptr<DictObject>>()) {
 
         const DictObject::inner_type &data
-            = cval.get<shared_ptr<DictObject>>()->get_ref();
+            = cval.get<intrusive_ptr<DictObject>>()->get_ref();
 
         size_type i = 0;
 
@@ -1699,17 +1699,17 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return shared_ptr<DictObject>(make_shared<DictObject>(move(data)));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
 }
 
 EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue &&dval = RValue(what->eval(ctx));
 
-    if (!dval.is<shared_ptr<DictObject>>())
+    if (!dval.is<intrusive_ptr<DictObject>>())
         throw TypeErrorEx("Expected dict object", what->start, what->end);
 
-    const shared_ptr<DictObject> &obj = dval.get<shared_ptr<DictObject>>();
+    const auto &obj = dval.get<intrusive_ptr<DictObject>>();
     DictObject::inner_type &data = obj->get_ref();
 
     if (obj->is_readonly()) {

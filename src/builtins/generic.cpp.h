@@ -261,9 +261,9 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg0->start, arg0->end);
 
-    if (lval->is<shared_ptr<DictObject>>()) {
+    if (lval->is<intrusive_ptr<DictObject>>()) {
 
-        if (lval->getval<shared_ptr<DictObject>>()->is_readonly())
+        if (lval->getval<intrusive_ptr<DictObject>>()->is_readonly())
             throw CannotChangeConstEx(arg0->start, arg0->end);
 
         return builtin_erase_dict(lval, index_val);
@@ -308,9 +308,9 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg0->start, arg0->end);
 
-    if (lval->is<shared_ptr<DictObject>>()) {
+    if (lval->is<intrusive_ptr<DictObject>>()) {
 
-        if (lval->getval<shared_ptr<DictObject>>()->is_readonly())
+        if (lval->getval<intrusive_ptr<DictObject>>()->is_readonly())
             throw CannotChangeConstEx(arg0->start, arg0->end);
 
         return builtin_insert_dict(lval, index_val, val);
@@ -345,9 +345,10 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
     const EvalValue &container_val = RValue(arg0->eval(ctx));
     const EvalValue &elem_val = RValue(arg1->eval(ctx));
 
-    if (container_val.is<shared_ptr<DictObject>>()) {
+    if (container_val.is<intrusive_ptr<DictObject>>()) {
 
-        return builtin_find_dict(container_val.get<shared_ptr<DictObject>>(), elem_val);
+        return builtin_find_dict(
+            container_val.get<intrusive_ptr<DictObject>>(), elem_val);
 
     } else if (container_val.is<SharedArrayObj>()) {
 
@@ -420,10 +421,10 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
             );
         }
 
-    } else if (val1.is<shared_ptr<DictObject>>()) {
+    } else if (val1.is<intrusive_ptr<DictObject>>()) {
 
         const DictObject::inner_type &data
-            = val1.get<shared_ptr<DictObject>>()->get_ref();
+            = val1.get<intrusive_ptr<DictObject>>()->get_ref();
 
         for (auto const &e : data) {
 
@@ -473,10 +474,10 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
 
         return SharedArrayObj(move(result));
 
-    } else if (val1.is<shared_ptr<DictObject>>()) {
+    } else if (val1.is<intrusive_ptr<DictObject>>()) {
 
         const DictObject::inner_type &data
-            = val1.get<shared_ptr<DictObject>>()->get_ref();
+            = val1.get<intrusive_ptr<DictObject>>()->get_ref();
 
         DictObject::inner_type result;
 
@@ -485,7 +486,7 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
                 result.insert(e);
         }
 
-        return shared_ptr<DictObject>(make_shared<DictObject>(move(result)));
+        return make_intrusive<DictObject>(move(result));
 
     } else {
 

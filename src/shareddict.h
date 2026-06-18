@@ -4,10 +4,11 @@
 
 #include "defs.h"
 #include "flatval.h"
+#include "intrusiveptr.h"
 #include <unordered_map>
 
 template <class EvalValueT, class LValueT>
-class DictObjectTempl {
+class DictObjectTempl : public RefCounted {
 
 public:
     typedef std::unordered_map<EvalValueT, LValueT> inner_type;

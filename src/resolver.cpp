@@ -125,8 +125,8 @@ static bool is_readonly_value(const EvalValue &v)
 {
     if (v.is<SharedArrayObj>())
         return v.get<SharedArrayObj>().is_readonly();
-    if (v.is<shared_ptr<DictObject>>())
-        return v.get<shared_ptr<DictObject>>()->is_readonly();
+    if (v.is<intrusive_ptr<DictObject>>())
+        return v.get<intrusive_ptr<DictObject>>()->is_readonly();
     return false;
 }
 
@@ -171,7 +171,7 @@ public:
 
         for (const auto &kv : seed) {
             const bool arr = kv.second.is<SharedArrayObj>()
-                          || kv.second.is<shared_ptr<DictObject>>();
+                          || kv.second.is<intrusive_ptr<DictObject>>();
             const std::unordered_set<int> &blk = arr ? arr_blocked : fc.blocked;
             if (!blk.count(kv.first))
                 fc.consts.emplace(kv.first, kv.second);
@@ -566,7 +566,7 @@ private:
                      * mutation of it still throws the same error at runtime. */
                     const bool arr =
                         it->second.is<SharedArrayObj>()
-                        || it->second.is<shared_ptr<DictObject>>();
+                        || it->second.is<intrusive_ptr<DictObject>>();
                     MakeConstructFromConstVal(it->second, slot, arr, arr);
                 }
             }
@@ -2187,7 +2187,7 @@ private:
          * The same const object (e.g. a const global passed at several sites)
          * keys once and shares one clone; two structurally-equal but distinct
          * literals key apart (a missed de-dup, never a wrong reuse). */
-        if (v.is<SharedArrayObj>() || v.is<shared_ptr<DictObject>>())
+        if (v.is<SharedArrayObj>() || v.is<intrusive_ptr<DictObject>>())
             return "p" + std::to_string(v.get_type()->intptr(v)
                                             .get<int_type>());
         return "?";

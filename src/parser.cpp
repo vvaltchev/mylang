@@ -837,7 +837,7 @@ ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
 {
     return
         rvalue.is<SharedArrayObj>()           ||
-        rvalue.is<shared_ptr<DictObject>>()   ||
+        rvalue.is<intrusive_ptr<DictObject>>()   ||
         rvalue.is<shared_ptr<FuncObject>>();
 }
 
@@ -1412,8 +1412,8 @@ is_readonly_value(const EvalValue &v)
     if (v.is<SharedArrayObj>())
         return v.get<SharedArrayObj>().is_readonly();
 
-    if (v.is<shared_ptr<DictObject>>())
-        return v.get<shared_ptr<DictObject>>()->is_readonly();
+    if (v.is<intrusive_ptr<DictObject>>())
+        return v.get<intrusive_ptr<DictObject>>()->is_readonly();
 
     return false;
 }
@@ -1446,7 +1446,7 @@ MakeConstructFromConstVal(const EvalValue &v,
 
     if (process_arrays) {
 
-        if (v.is<SharedArrayObj>() || v.is<shared_ptr<DictObject>>()) {
+        if (v.is<SharedArrayObj>() || v.is<intrusive_ptr<DictObject>>()) {
 
             /*
              * Materialize the const array/dict as ONE node holding the value,
@@ -1655,7 +1655,7 @@ cse_materialize(ParseContext &c,
      * value so the next identical expression hits above.
      */
     if (process_arrays
-        && (v.is<SharedArrayObj>() || v.is<shared_ptr<DictObject>>())
+        && (v.is<SharedArrayObj>() || v.is<intrusive_ptr<DictObject>>())
         && (immutable || is_readonly_value(v)))
     {
         EvalValue baked = make_const_clone(v);
