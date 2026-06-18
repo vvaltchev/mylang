@@ -1764,6 +1764,30 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* Regression: a promoted write-once var used as a subscript/member
+         * INDEX in an assignment LVALUE must be folded there too. fold_block
+         * folded only the rvalue, so the index's decl was dropped but its use
+         * was left
+         * dangling -> "undefined variable" on `a[i] = v`, `a[i] += v`,
+         * `d[k] = v`, `m[i][j] = v`. (A reassigned index like a loop's `j` is
+         * never promoted, which is why the sieve never hit this.) */
+        "auto-const: write-once var as an assignment subscript index is folded",
+        {
+            "func t() {",
+            "    var a = [10, 20, 30];",
+            "    var i = 0;",            /* write-once -> promoted */
+            "    a[i] = 5;",             /* index in a plain-assign lvalue */
+            "    var j = 1;",
+            "    a[j] += 100;",          /* index in a compound-assign lvalue */
+            "    var d = {};",
+            "    var k = 7;",
+            "    d[k] = 99;",            /* dict key in an assign lvalue */
+            "    return a[0] + a[1] + d[7];",
+            "}",
+            "assert(t() == 5 + 120 + 99);",
+        },
+    },
+    {
         "auto-pure analysis descends into for-loop and try/catch bodies",
         {
             "func f() { var s = 0;",
