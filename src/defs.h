@@ -28,7 +28,14 @@ using std::make_shared;
 using std::make_unique;
 
 /* Custom type defs */
-typedef long double float_type; /* Note: replace %Lf if you change this! */
+/*
+ * The script float type. `double` (not `long double`): it keeps EvalValue small
+ * (long double's 16-byte alignment padded EvalValue from 40 to 48 bytes, which
+ * dominated array memory traffic and every value copy), matches Python's float
+ * exactly, and uses the much faster double libm. If you change this, update the
+ * printf/snprintf format strings (currently "%f"/"%.*f") and the math builtins.
+ */
+typedef double float_type;
 typedef intptr_t int_type;
 
 #ifndef _MSC_VER

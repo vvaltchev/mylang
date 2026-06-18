@@ -71,13 +71,13 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
              * silently truncate for large-magnitude values at high precision
              * (e.g. str(1e30, 64) needs ~96 chars).
              */
-            const int n = snprintf(nullptr, 0, "%.*Lf", precision, fval);
+            const int n = snprintf(nullptr, 0, "%.*f", precision, fval);
 
             if (n < 0)
                 throw InternalErrorEx(arg0->start, arg0->end);
 
             std::vector<char> buf(static_cast<size_t>(n) + 1);
-            snprintf(buf.data(), buf.size(), "%.*Lf", precision, fval);
+            snprintf(buf.data(), buf.size(), "%.*f", precision, fval);
             return SharedStr(string(buf.data(), static_cast<size_t>(n)));
         }
 

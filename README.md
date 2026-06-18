@@ -442,7 +442,8 @@ runtime instead.
     A *signed* pointer-size integer (e.g. `3`).
 
   * **Float**
-    A floating-point number (e.g. `1.23`). Internally, it's a long double.
+    A floating-point number (e.g. `1.23`). Internally, it's a C `double`
+    (64-bit IEEE 754), exactly like Python's `float`.
 
   * **String**
     A string like "hello". Strings are immutable and support slices (e.g.

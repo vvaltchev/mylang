@@ -187,7 +187,7 @@ pAcceptLiteralFloat(ParseContext &c, unique_ptr<Construct> &v)
         float_type fval;
 
         try {
-            fval = stold(s);
+            fval = stod(s);
         } catch (const std::out_of_range &) {
             throw SyntaxErrorEx(start, "Float literal out of range");
         }
