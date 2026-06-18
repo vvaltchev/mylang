@@ -381,10 +381,24 @@ STyRef STyArena::join(STyRef a, STyRef b)
             return dict_of(kj, vj, anyopt);
         }
 
-        case STyKind::Func:
-            /* Two differing function signatures have no useful LUB here; treat
-             * as a conflict (the caller can require an explicit `dyn`). */
-            return nullptr;
+        case STyKind::Func: {
+            /* Same arity: join componentwise (Unknown children fill in, mixed
+             * concretes fall to dyn) so a func-valued var assigned the "same"
+             * function across fixpoint rounds does not spuriously conflict.
+             * Different arity: a real conflict. */
+            if (a->params.size() != b->params.size())
+                return nullptr;
+            std::vector<STyRef> ps;
+            std::vector<bool> popt;
+            for (size_t i = 0; i < a->params.size(); i++) {
+                STyRef pj = join(a->params[i], b->params[i]);
+                ps.push_back(pj ? pj : g_dyn);
+                popt.push_back((i < a->param_opt.size() && a->param_opt[i]) ||
+                               (i < b->param_opt.size() && b->param_opt[i]));
+            }
+            STyRef rj = join(a->ret, b->ret);
+            return func_of(ps, popt, rj ? rj : g_dyn, anyopt);
+        }
 
         default:
             return nullptr;

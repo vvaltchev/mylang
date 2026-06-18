@@ -16,6 +16,7 @@
 #include "resolver.h"
 #include "backtrace.h"
 #include "stype.h"
+#include "inferencer.h"
 
 #include <typeinfo>
 #include <vector>
@@ -253,7 +254,7 @@ static const std::vector<test> tests =
         "cannot rebind consts existing at runtime 1",
         {
             "const arr = [1,2,3];",
-            "arr = 42;",
+            "arr = [9];",   /* same type: still a const-rebind, not a type error */
         },
         &typeid(CannotRebindConstEx),
     },
@@ -271,7 +272,7 @@ static const std::vector<test> tests =
         "cannot rebind consts existing at runtime 3",
         {
             "const x = { 3 : 10, 4: 20 };",
-            "x = 42;",
+            "x = {};",   /* same type: still a const-rebind, not a type error */
         },
         &typeid(CannotRebindConstEx),
     },
@@ -1534,13 +1535,14 @@ static const std::vector<test> tests =
             "func f(a) { return a + 5; }",
             "f([1,2]);",
         },
-        &typeid(TypeErrorEx),
+        &typeid(TypeMismatchEx),    /* compile-time now: a is array, a + 5 */
     },
 
     {
         "Array equality: equal, length mismatch, type mismatch",
         {
-            "func eq2(a, b) { return a == b; }",
+            /* eq2 compares values of differing types, so its params are dyn. */
+            "func eq2(dyn a, dyn b) { return a == b; }",
             "assert(eq2([1,2], [1,2]));",
             "assert(eq2([1,2], [1,2,3]) == false);",
             "assert(eq2([1,2], 5) == false);",
@@ -1885,10 +1887,10 @@ static const std::vector<test> tests =
     },
     { "calling a function with too many args is rejected",
       { "func f(a) { return a; } var k=1; f(k, 2);" },
-      &typeid(InvalidNumberOfArgsEx) },
+      &typeid(WrongArgCountEx) },
     { "calling a function with too few args is rejected",
       { "func f(a, b) { return a; } var k=1; f(k);" },
-      &typeid(InvalidNumberOfArgsEx) },
+      &typeid(WrongArgCountEx) },
     { "assigning to an undefined variable is an error",
       { "nonexistent = 5;" }, &typeid(UndefinedVariableEx) },
     { "foreach over a non-iterable is a type error",
@@ -2004,21 +2006,24 @@ static const std::vector<test> tests =
     { "int modulo by zero",             { "5 % 0;" }, &typeid(DivisionByZeroEx) },
 
     /* ---- base Type virtuals (type.h): unsupported-operation errors ---- */
-    { "none + x is unsupported", { "var n=none; var y=n+1;" }, &typeid(TypeErrorEx) },
-    { "none - x is unsupported", { "var n=none; var y=n-1;" }, &typeid(TypeErrorEx) },
-    { "none * x is unsupported", { "var n=none; var y=n*1;" }, &typeid(TypeErrorEx) },
-    { "none / x is unsupported", { "var n=none; var y=n/1;" }, &typeid(TypeErrorEx) },
-    { "none % x is unsupported", { "var n=none; var y=n%1;" }, &typeid(TypeErrorEx) },
-    { "none < x is unsupported", { "var n=none; var y=n<1;" }, &typeid(TypeErrorEx) },
-    { "none > x is unsupported", { "var n=none; var y=n>1;" }, &typeid(TypeErrorEx) },
-    { "none <= x is unsupported",{ "var n=none; var y=n<=1;" }, &typeid(TypeErrorEx) },
-    { "none >= x is unsupported",{ "var n=none; var y=n>=1;" }, &typeid(TypeErrorEx) },
+    /* With type inference, `none <op> x` on a none-typed value is caught at
+     * compile time as a NullabilityEx (was a runtime TypeErrorEx). */
+    { "none + x is unsupported", { "var n=none; var y=n+1;" }, &typeid(NullabilityEx) },
+    { "none - x is unsupported", { "var n=none; var y=n-1;" }, &typeid(NullabilityEx) },
+    { "none * x is unsupported", { "var n=none; var y=n*1;" }, &typeid(NullabilityEx) },
+    { "none / x is unsupported", { "var n=none; var y=n/1;" }, &typeid(NullabilityEx) },
+    { "none % x is unsupported", { "var n=none; var y=n%1;" }, &typeid(NullabilityEx) },
+    { "none < x is unsupported", { "var n=none; var y=n<1;" }, &typeid(NullabilityEx) },
+    { "none > x is unsupported", { "var n=none; var y=n>1;" }, &typeid(NullabilityEx) },
+    { "none <= x is unsupported",{ "var n=none; var y=n<=1;" }, &typeid(NullabilityEx) },
+    { "none >= x is unsupported",{ "var n=none; var y=n>=1;" }, &typeid(NullabilityEx) },
     { "unary - on none is unsupported",
-      { "var n=none; var y=-n;" }, &typeid(TypeErrorEx) },
+      { "var n=none; var y=-n;" }, &typeid(NullabilityEx) },
+    /* subscripting/slicing a non-container is now a compile-time TypeMismatch. */
     { "subscript on a non-container is unsupported",
-      { "var x=5; var y=x[0];" }, &typeid(TypeErrorEx) },
+      { "var x=5; var y=x[0];" }, &typeid(TypeMismatchEx) },
     { "slice on a non-container is unsupported",
-      { "var x=5; var y=x[0:1];" }, &typeid(TypeErrorEx) },
+      { "var x=5; var y=x[0:1];" }, &typeid(TypeMismatchEx) },
     { "hash() of an array is unsupported",
       { "hash([1,2]);" }, &typeid(TypeErrorEx) },
     { "hash() of none is unsupported",
@@ -2132,7 +2137,9 @@ static const std::vector<test> tests =
         {
             "var hit = 0;",
             "try {",
-            "   try { var x = 5; x(); }",
+            /* `dyn` so the not-callable is a runtime (catchable) error, not a
+             * compile-time type error. */
+            "   try { var dyn x = 5; x(); }",
             "   catch (NotCallableEx as e) { hit += 1; rethrow; }",
             "} catch (NotCallableEx) { hit += 1; }",
             "assert(hit == 2);",
@@ -2155,7 +2162,7 @@ static const std::vector<test> tests =
             "catch (OutOfBoundsEx) { n += 1; }",
             "assert(n == 2);",
 
-            "n = 0; var s = str(rand(0, 0));",
+            "n = 0; var dyn s = str(rand(0, 0));",
             "try { try { var q = 5 + s; }",
             "  catch (TypeErrorEx as e) { n += 1; rethrow; } }",
             "catch (TypeErrorEx) { n += 1; }",
@@ -2785,9 +2792,9 @@ static const std::vector<test> tests =
         &typeid(DivisionByZeroEx), 26, 0, 37, 0,
     },
     {
-        "err loc: calling a defined non-function is NotCallable",
+        "err loc: calling a defined non-function is a type error",
         { "var x = 5; x(1, 2);" },
-        &typeid(NotCallableEx), 12, 0, 14, 0,
+        &typeid(TypeMismatchEx), 12, 0, 14, 0,
     },
     {
         "err loc: undefined callee marks the callee, not the whole call",
@@ -3623,7 +3630,7 @@ static const std::vector<test> tests =
     {
         "Foreach with extern variable",
         {
-            "var e;",
+            "var e = 0;",   /* non-null: used in comparisons below */
             "foreach (e in [1,2,3,4,5]) {",
             "   if (e == 3) continue;",
             "   if (e >= 4) break;",
@@ -4948,6 +4955,122 @@ static const std::vector<test> tests =
             "assert(c[0] == 0 && c[39] == 1);",
         },
     },
+
+    /* =========================================================== *
+     *  Type inference + checking (plans/type-inference.md)         *
+     * =========================================================== */
+
+    /* ---- MUST ACCEPT: well-typed programs run without error ---- */
+    { "ti: scalar inference", { "var x = 5; var y = x + 3; assert(y == 8);" } },
+    { "ti: int->float promote in a var",
+      { "var x = 1; x = 2.5; assert(x > 2.0);" } },
+    { "ti: int->float promote across calls",
+      { "func f(x) => x + 1; assert(f(2) == 3); assert(f(2.5) == 3.5);" } },
+    { "ti: str concat with int/float/array",
+      { "var s = \"a\"; assert(s + 1 == \"a1\");",
+        "assert(s + 2.5 == \"a2.500000\"); assert(s + [1] == \"a[1]\");" } },
+    { "ti: param inferred from a single call",
+      { "func sq(n) => n * n; assert(sq(4) == 16);" } },
+    { "ti: recursion (factorial)",
+      { "func fact(n) { if (n <= 1) return 1; return n * fact(n-1); }",
+        "assert(fact(5) == 120);" } },
+    { "ti: mutual recursion",
+      { "func ev(n) { if (n==0) return 1; return od(n-1); }",
+        "func od(n) { if (n==0) return 0; return ev(n-1); }",
+        "assert(ev(10) == 1); assert(od(7) == 1);" } },
+    { "ti: function returning a function (closure typed)",
+      { "func adder(n) => func [n] (x) => x + n;",
+        "var add10 = adder(10); assert(add10(5) == 15);" } },
+    { "ti: map with a named function",
+      { "func dbl(x) => x * 2; assert(map(dbl, [1,2,3]) == [2,4,6]);" } },
+    { "ti: map with an inline lambda",
+      { "assert(map(func(x) => x + 1, [1,2,3]) == [2,3,4]);" } },
+    { "ti: filter typed", { "assert(filter(func(x) => x > 2, [1,2,3,4]) == [3,4]);" } },
+    { "ti: sort with named comparator",
+      { "func cmp(a,b) => a < b; var arr = [3,1,2]; sort(arr, cmp);",
+        "assert(arr == [1,2,3]);" } },
+    { "ti: sort with inline comparator",
+      { "var arr = [3,1,2]; sort(arr, func(a,b) => a < b); assert(arr==[1,2,3]);" } },
+    { "ti: sum over an int array", { "assert(sum([1,2,3,4]) == 10);" } },
+    { "ti: array element inference + append same type",
+      { "var a = [1,2]; append(a, 3); assert(a == [1,2,3]);" } },
+    { "ti: append of a mixed type degrades to dyn (no error)",
+      { "var dyn x = 1; var a = [1,2]; append(a, \"s\"); assert(len(a) == 3);" } },
+    { "ti: dict typed and subscripted",
+      { "var d = {\"a\": 1, \"b\": 2}; assert(d[\"a\"] + d[\"b\"] == 3);" } },
+    { "ti: dict member access typed",
+      { "var d = {\"a\": 1}; assert(d.a == 1);" } },
+    { "ti: foreach over an array",
+      { "var s = 0; foreach (var x in [1,2,3]) s += x; assert(s == 6);" } },
+    { "ti: foreach over a dict (k, v)",
+      { "var s = 0; foreach (var k, v in {\"a\":1,\"b\":2}) s += v; assert(s==3);" } },
+    { "ti: foreach indexed (index first)",
+      { "var t = 0; foreach (var i, x in indexed [10,20,30]) t += i;",
+        "assert(t == 3);" } },
+    { "ti: foreach over a string",
+      { "var n = 0; foreach (var c in \"abc\") n += 1; assert(n == 3);" } },
+    { "ti: nested arrays and subscript chains",
+      { "var a = [[1,2],[3,4]]; assert(a[1][0] == 3);" } },
+    { "ti: == / != across types is allowed (returns int)",
+      { "var a = 5; assert((a == \"x\") == false); assert((a != \"x\") == true);" } },
+    { "ti: opt param accepts none and a value",
+      { "func f(opt x) => 1; assert(f(none) == 1); assert(f(5) == 1);" } },
+    { "ti: dyn param accepts differing types",
+      { "func id(dyn x) => x; assert(id(3) == 3); assert(id(\"s\") == \"s\");" } },
+    { "ti: dyn var allows reassignment to a different type",
+      { "var dyn d = 5; d = \"hi\"; d = [1,2]; assert(len(d) == 2);" } },
+    { "ti: const array used in an expression",
+      { "const a = [1,2,3]; assert(sum(a) == 6);" } },
+    { "ti: if/else branches join to a common type",
+      { "var c = 1; var r = 0; if (c) r = 1; else r = 2; assert(r + 1 == 2);" } },
+    { "ti: global visible inside a function",
+      { "var g = 10; func f() => g + 1; assert(f() == 11);" } },
+    { "ti: forward reference to a function",
+      { "func a() => b() + 1; func b() => 41; assert(a() == 42);" } },
+    { "ti: unary minus on int / float",
+      { "var i = 5; var f = 2.5; assert(-i == -5); assert(-f < 0.0);" } },
+    { "ti: compound assignment (int, float, str)",
+      { "var i = 1; i += 2; var f = 1.0; f += 1; var s = \"a\"; s += \"b\";",
+        "assert(i == 3); assert(f == 2.0); assert(s == \"ab\");" } },
+    { "ti: while/for loops with typed vars",
+      { "var s = 0; for (var i = 0; i < 5; i += 1) s += i; assert(s == 10);" } },
+
+    /* ---- MUST REJECT: type violations fail at compile time ---- */
+    { "ti reject: type change of a var",
+      { "var x = 5; x = \"s\";" }, &typeid(TypeMismatchEx) },
+    { "ti reject: type change in a loop",
+      { "var x = 0; while (x < 1) { x = \"s\"; }" }, &typeid(TypeMismatchEx) },
+    { "ti reject: conflicting param types across calls",
+      { "func f(x) => x + 1; f(3); f([1,2]);" }, &typeid(TypeMismatchEx) },
+    { "ti reject: too many arguments",
+      { "func f(a) => a; f(1, 2);" }, &typeid(WrongArgCountEx) },
+    { "ti reject: too few arguments",
+      { "func f(a, b) => a + b; f(1);" }, &typeid(WrongArgCountEx) },
+    { "ti reject: none passed to a non-opt param",
+      { "func f(x) => 1; var n = none; f(n);" }, &typeid(NullabilityEx) },
+    { "ti reject: opt value used in arithmetic",
+      { "func f(opt x) => x + 1; f(3);" }, &typeid(NullabilityEx) },
+    { "ti reject: bare-declared (none) local in arithmetic",
+      { "var n; var y = n + 1;" }, &typeid(NullabilityEx) },
+    { "ti reject: maybe-none (inferred opt) local used as non-opt",
+      { "var x; var c = 1; if (c) x = 5; var y = x + 1;" },
+      &typeid(NullabilityEx) },
+    { "ti reject: ordering across types",
+      { "var s = \"a\"; var b = 1 < s;" }, &typeid(TypeMismatchEx) },
+    { "ti reject: calling a non-function",
+      { "var x = 5; x();" }, &typeid(TypeMismatchEx) },
+    { "ti reject: subscripting a non-container",
+      { "var x = 5; var y = x[0];" }, &typeid(TypeMismatchEx) },
+    { "ti reject: int + str (through a param)",
+      { "func f(x) => 1 + x; f(\"a\");" }, &typeid(TypeMismatchEx) },
+    { "ti reject: array + non-array",
+      { "var a = [1,2]; var b = a + 5;" }, &typeid(TypeMismatchEx) },
+    { "ti reject: invalid compound assignment (str -= int)",
+      { "var s = \"x\"; s -= 1;" }, &typeid(TypeMismatchEx) },
+    { "ti reject: throwing a non-exception",
+      { "var dyn d = 5; throw 5;" }, &typeid(TypeMismatchEx) },
+    { "ti reject: assigning an incompatible type to an inferred var",
+      { "var x = [1,2]; x = 5;" }, &typeid(TypeMismatchEx) },
 };
 
 static void
@@ -4971,6 +5094,7 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
         ParseContext pCtx(TokenStream(tokens), true /* const eval */);
 
         root = pBlock(pCtx);
+        infer_types(root.get());
         resolve_names(root.get());
         root->eval(nullptr);
 

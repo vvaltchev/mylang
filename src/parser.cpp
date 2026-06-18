@@ -338,14 +338,25 @@ pIdentifier(ParseContext &c, unsigned fl)
 unique_ptr<Identifier>
 pFuncParam(ParseContext &c, unsigned fl)
 {
-    const bool is_const = pAcceptKeyword(c, Keyword::kw_const);
+    /* A param may carry modifiers in any order: `const`, `opt` (nullable), and
+     * `dyn` (dynamically typed). See plans/type-inference.md. */
+    bool is_const = false, is_opt = false, is_dyn = false;
+    bool got_mod;
+
+    do {
+        got_mod = false;
+        if (pAcceptKeyword(c, Keyword::kw_const)) { is_const = true; got_mod = true; }
+        if (pAcceptKeyword(c, Keyword::kw_opt))   { is_opt = true;   got_mod = true; }
+        if (pAcceptKeyword(c, Keyword::kw_dyn))   { is_dyn = true;   got_mod = true; }
+    } while (got_mod);
+
     unique_ptr<Construct> ret;
 
     if (!pAcceptId(c, ret, false /* resolve_const */)) {
-        if (is_const)
+        if (is_const || is_opt || is_dyn)
             throw SyntaxErrorEx(
                 c.get_loc(),
-                "Expected parameter name after `const`, got",
+                "Expected parameter name after modifier, got",
                 &c.get_tok()
             );
         return nullptr;
@@ -353,6 +364,8 @@ pFuncParam(ParseContext &c, unsigned fl)
 
     unique_ptr<Identifier> id(static_cast<Identifier *>(ret.release()));
     id->const_param = is_const;
+    id->opt_mod = is_opt;
+    id->dyn_mod = is_dyn;
     return id;
 }
 
@@ -969,6 +982,25 @@ pExpr14(ParseContext &c, unsigned fl)
     ret->start = start;
     ret->end = c.get_loc();
 
+    /* Propagate a `var opt`/`var dyn` modifier onto the declared identifier(s),
+     * so the type inferencer (which reads Identifier::opt_mod/dyn_mod) sees it. */
+    if ((fl & pFlags::pInDecl) &&
+        (fl & (pFlags::pInOptDecl | pFlags::pInDynDecl))) {
+
+        const bool opt_f = (fl & pFlags::pInOptDecl) != 0;
+        const bool dyn_f = (fl & pFlags::pInDynDecl) != 0;
+
+        if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
+            id->opt_mod = opt_f;
+            id->dyn_mod = dyn_f;
+        } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
+            for (auto &e : idl->elems) {
+                e->opt_mod = opt_f;
+                e->dyn_mod = dyn_f;
+            }
+        }
+    }
+
     if (!ret->rvalue)
         noExprError(c);
 
@@ -1163,6 +1195,14 @@ pStmt(ParseContext &c, unsigned fl)
             fl |= pFlags::pInDecl;
         else if (pAcceptKeyword(c, Keyword::kw_const))
             fl |= pFlags::pInDecl | pFlags::pInConstDecl;
+
+        /* `var`/`const` may be followed by an `opt` or `dyn` type modifier. */
+        if (fl & pFlags::pInDecl) {
+            if (pAcceptKeyword(c, Keyword::kw_opt))
+                fl |= pFlags::pInOptDecl;
+            else if (pAcceptKeyword(c, Keyword::kw_dyn))
+                fl |= pFlags::pInDynDecl;
+        }
 
         unique_ptr<Construct> lowerE = pExprTop(c, fl);
 
