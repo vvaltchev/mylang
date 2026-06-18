@@ -892,6 +892,20 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
     return move(val);
 }
 
+/* Apply a compound-assignment op (`+=`, `-=`, ...) to `acc` in place. */
+static inline void
+apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op)
+{
+    switch (op) {
+        case Op::addeq: num_bin_op(acc, rhs, &Type::add); break;
+        case Op::subeq: num_bin_op(acc, rhs, &Type::sub); break;
+        case Op::muleq: num_bin_op(acc, rhs, &Type::mul); break;
+        case Op::diveq: num_bin_op(acc, rhs, &Type::div); break;
+        case Op::modeq: num_bin_op(acc, rhs, &Type::mod); break;
+        default:        throw InternalErrorEx();
+    }
+}
+
 static EvalValue
 doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
 {
@@ -907,38 +921,23 @@ doAssign(const EvalValue &lval, const EvalValue &rval, Op op)
     } else {
 
         newVal = lval.get<LValue *>()->get();
-
-        switch (op) {
-            case Op::addeq:
-                num_bin_op(newVal, RValue(rval), &Type::add);
-                break;
-            case Op::subeq:
-                num_bin_op(newVal, RValue(rval), &Type::sub);
-                break;
-            case Op::muleq:
-                num_bin_op(newVal, RValue(rval), &Type::mul);
-                break;
-            case Op::diveq:
-                num_bin_op(newVal, RValue(rval), &Type::div);
-                break;
-            case Op::modeq:
-                num_bin_op(newVal, RValue(rval), &Type::mod);
-                break;
-            default:
-                throw InternalErrorEx();
-        }
+        apply_compound_op(newVal, RValue(rval), op);
     }
 
     lval.get<LValue *>()->put(newVal);
     return newVal;
 }
 
-/* Return `lvalue` as an Identifier resolved to a slot, or nullptr otherwise. */
+/* Return `lvalue` as an Identifier resolved to a slot, or nullptr otherwise.
+ * The cheap ct tag (is_id) avoids a dynamic_cast on the hot assignment path. */
 static inline const Identifier *
 as_resolved_local(const Construct *lvalue)
 {
-    const Identifier *id = dynamic_cast<const Identifier *>(lvalue);
-    return (id && id->sym.kind == SymKind::local) ? id : nullptr;
+    if (!lvalue->is_id())
+        return nullptr;
+
+    const Identifier *id = static_cast<const Identifier *>(lvalue);
+    return id->sym.kind == SymKind::local ? id : nullptr;
 }
 
 static EvalValue
@@ -967,6 +966,45 @@ handle_single_expr14(EvalContext *ctx,
                 LValue(RValue(rval), ctx->const_ctx || lvalue->is_const);
             f->live |= static_cast<uint64_t>(1) << id->sym.slot;
             return rval;
+        }
+
+    } else if (!ctx->const_ctx) {
+
+        /*
+         * Fast path: an assignment / compound-assignment to a resolved, live,
+         * non-const local. The slot's LValue has no `container` (only array
+         * elements do), so we read-modify-write it in place, skipping the
+         * lvalue->eval() -> LValue* wrapping and the doAssign() dispatch the
+         * general path below would run. Falls through to that path when the
+         * slot is not live (so an undefined-variable error is still raised) or
+         * is const (so the rebind error is still raised), keeping behavior
+         * identical. The same in-place op (apply_compound_op / RValue) is used.
+         */
+        if (const Identifier *id = as_resolved_local(lvalue)) {
+
+            Frame *f = ctx->frame;
+            const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
+
+            if (f && (f->live & bit)) {
+
+                LValue &lv = f->slots[id->sym.slot];
+
+                if (!lv.is_const_var()) {
+
+                    if (op == Op::assign) {
+
+                        lv.put(RValue(rval));
+
+                    } else {
+
+                        EvalValue nv = lv.get();
+                        apply_compound_op(nv, RValue(rval), op);
+                        lv.put(move(nv));
+                    }
+
+                    return lv.get();
+                }
+            }
         }
     }
 
@@ -1456,6 +1494,28 @@ void LValue::put(EvalValue &&v)
     type_checks();
 }
 
+/*
+ * Bind a foreach loop variable to `val`. Fast path: a resolved-local loop var
+ * is a plain frame slot, so write it directly (mark live), skipping the general
+ * lvalue->eval() + doAssign() machinery handle_single_expr14 would run on every
+ * iteration. Correct for every iteration (not just the decl): the loop var is a
+ * fresh `var` each pass, so overwriting the slot is exactly the semantics. The
+ * loop var elements (`ids->elems`) are Identifiers, so no dynamic_cast is
+ * needed. Non-resolved (map-based) loop vars fall back to the general path.
+ */
+static inline void
+bind_loop_var(EvalContext *ctx, bool decl, Identifier *id, const EvalValue &val)
+{
+    if (id->sym.kind == SymKind::local && ctx->frame) {
+        Frame *f = ctx->frame;
+        f->slots[id->sym.slot] = LValue(val, id->is_const);
+        f->live |= static_cast<uint64_t>(1) << id->sym.slot;
+        return;
+    }
+
+    handle_single_expr14(ctx, decl, Op::assign, id, val);
+}
+
 bool
 ForeachStmt::do_iter(EvalContext *ctx,
                      size_type index,
@@ -1467,12 +1527,8 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
     if (indexed) {
 
-        handle_single_expr14(
-            ctx,
-            decl,
-            Op::assign,
-            ids->elems[0].get(),
-            static_cast<int_type>(index)
+        bind_loop_var(
+            ctx, decl, ids->elems[0].get(), static_cast<int_type>(index)
         );
 
         id_start++;
@@ -1489,10 +1545,9 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
                 const size_type val_i = i - id_start;
 
-                handle_single_expr14(
+                bind_loop_var(
                     ctx,
                     decl,
-                    Op::assign,
                     ids->elems[i].get(),
                     val_i < view.size() ? view[val_i].get() : none
                 );
@@ -1500,15 +1555,10 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
         } else {
 
-            handle_single_expr14(
-                ctx, decl, Op::assign, ids->elems[id_start].get(), elems[0]
-            );
+            bind_loop_var(ctx, decl, ids->elems[id_start].get(), elems[0]);
 
-            for (size_type i = id_start+1; i < ids->elems.size(); i++) {
-                handle_single_expr14(
-                    ctx, decl, Op::assign, ids->elems[i].get(), none
-                );
-            }
+            for (size_type i = id_start+1; i < ids->elems.size(); i++)
+                bind_loop_var(ctx, decl, ids->elems[i].get(), none);
         }
 
     } else {
@@ -1517,10 +1567,9 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
             const size_type val_i = i - id_start;
 
-            handle_single_expr14(
+            bind_loop_var(
                 ctx,
                 decl,
-                Op::assign,
                 ids->elems[i].get(),
                 val_i < count ? elems[val_i] : none
             );
