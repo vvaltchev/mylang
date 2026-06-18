@@ -1298,6 +1298,18 @@ class Inliner {
     std::vector<unique_ptr<Construct>> new_funcs;
     int spec_counter = 0;
 
+    /*
+     * Fixpoint bounds. Re-scanning a spliced body can expose more inlining (a
+     * forward-declared callee, a call revealed by const-folding), so the
+     * inliner iterates by re-walking each splice. MAX_INLINE_DEPTH caps the
+     * nesting so mutual recursion (`a()=>b(); b()=>a()`) terminates;
+     * `inline_budget` caps the total nodes added so breadth-doubling
+     * (`f()=>g()+g()`) can't blow the tree up. Either bound just leaves the
+     * remaining calls in place (still correct - they run at runtime).
+     */
+    static const int MAX_INLINE_DEPTH = 16;
+    long inline_budget = 0;
+
 public:
 
     explicit Inliner(int max_nodes)
@@ -1316,6 +1328,13 @@ public:
         }
 
         seed_const_globals(root);
+
+        /* Budget for the re-scan fixpoint: generous (so a normal program never
+         * hits it - it's a runaway guard), but proportional so a pathological
+         * expansion is bounded by program size. */
+        inline_budget = std::max<long>(4096,
+                                       static_cast<long>(count_all_nodes(root))
+                                           * 8);
 
         for (auto &e : root->elems)
             walk(e);
@@ -1401,20 +1420,20 @@ private:
             res.first->second = nullptr;   /* duplicate name: ambiguous */
     }
 
-    void walk(unique_ptr<Construct> &slot)
+    void walk(unique_ptr<Construct> &slot, int depth = 0)
     {
         if (!slot)
             return;
 
-        /* Recurse first; do NOT re-scan a spliced result (single level). */
+        /* Recurse into children at the same splice depth. */
         for_each_child_slot(slot.get(),
-            [&](unique_ptr<Construct> &ch) { walk(ch); });
+            [&](unique_ptr<Construct> &ch) { walk(ch, depth); });
 
-        try_inline(slot);
+        try_inline(slot, depth);   /* re-scans its own splice (depth + 1) */
         try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
-    void try_inline(unique_ptr<Construct> &slot)
+    void try_inline(unique_ptr<Construct> &slot, int depth)
     {
         auto *ce = dynamic_cast<CallExpr *>(slot.get());
         if (!ce)
@@ -1437,7 +1456,8 @@ private:
         if (ce->args->elems.size() != nparams)
             return;
 
-        if (node_count(f->body.get()) > max_nodes)
+        const int bsz = node_count(f->body.get());
+        if (bsz > max_nodes)
             return;
 
         for (size_t i = 0; i < nparams; i++) {
@@ -1447,6 +1467,13 @@ private:
                 return;
         }
 
+        /* Fixpoint bounds: stop nesting at the depth cap (terminates mutual
+         * recursion) and once the growth budget is spent (bounds expansion).
+         * Either way the call is left for runtime - still correct. */
+        if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
+            return;
+        inline_budget -= bsz;
+
         /*
          * Eligible: clone the body, substitute params with the args, then tag
          * the whole result as inlined. Substitution happens first and copies
@@ -1454,10 +1481,16 @@ private:
          * the spliced body points where it would in the un-inlined callee (the
          * operator ladder stamps the operand loc) - keeping the backtrace
          * identical. Tagging last covers body and args alike.
+         *
+         * The new frame's parent is THIS call's existing inline_ctx, not null:
+         * when the call site is itself a node spliced in by an outer inline
+         * (the re-scan below), the inlined-at chain must stack (g inside f
+         * shows [g, f]). `rebase` in tag_inline then re-roots the body's own
+         * chains under it, so arbitrarily deep nesting renders correctly.
          */
         const InlineCtx *ic = alloc_inline_ctx(
             { std::string(f->id->get_str()), param_names(f),
-              ce->start, nullptr });
+              ce->start, ce->inline_ctx });
 
         unique_ptr<Construct> body = f->body->clone();
 
@@ -1479,6 +1512,15 @@ private:
          * already folded earlier).
          */
         refold(slot);
+
+        /*
+         * The fixpoint: re-scan the spliced result one level deeper. A call
+         * inside the body that is now reachable - a forward-declared callee
+         * whose own decl wasn't inlined yet, or a call newly exposed by the
+         * re-fold above - gets inlined too, so a g-into-f-into-h chain
+         * collapses in one pass regardless of decl order. depth+1 bounds it.
+         */
+        walk(slot, depth + 1);
     }
 
     /* Sound iff the argument is evaluated as often as the param is used and a

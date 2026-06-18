@@ -5696,6 +5696,96 @@ inliner_spec_backtrace_identical()
 }
 
 /*
+ * Fixpoint: a g-into-f-into-h chain collapses fully in one pass even when
+ * declaration order defeats the bottom-up walk (h is declared before the
+ * functions it transitively calls, so when h's body is inlined the inner calls
+ * weren't inlined yet). Re-scanning each splice inlines them. The funcs are
+ * non-pure (read a runtime global) so they CAN'T fold - only inlining removes
+ * the calls. After the pass every chain call is gone; single-level inlining
+ * would leave the innermost g() behind (so == 1 below, the assert call only,
+ * proves the fixpoint, not just one level).
+ */
+static bool
+inliner_fixpoint_collapses_chain()
+{
+    const std::vector<const char *> src = {
+        "var c = 0;",
+        "c = 1;",                          /* c is runtime -> g is non-pure */
+        "func h(z) => f(z) - 3;",
+        "func f(y) => g(y) * 2;",
+        "func g(x) => x + c;",
+        "var n = 1;",
+        "n = 10;",
+        "assert(h(n) == 19);",             /* ((10+1)*2)-3 = 19 */
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);
+    resolve_names(off.get(), false);
+
+    const std::string s_on = serialize_tree(on.get());
+    const std::string s_off = serialize_tree(off.get());
+
+    bool ok = true;
+    /* ON: chain fully collapsed -> only the assert() call remains. */
+    ok = ok && count_substr(s_on, "CallExpr") == 1;
+    /* OFF: nothing inlined -> assert + h(n) + f(z) + g(y) = 4 calls. */
+    ok = ok && count_substr(s_off, "CallExpr") > 1;
+
+    try { on->eval(nullptr); } catch (const Exception &) { ok = false; }
+    try { off->eval(nullptr); } catch (const Exception &) { ok = false; }
+
+    if (!ok) cout << "  on CallExpr=" << count_substr(s_on, "CallExpr")
+                  << " off=" << count_substr(s_off, "CallExpr")
+                  << "\n  resolved tree (on):\n" << s_on;
+    return ok;
+}
+
+/*
+ * Fixpoint backtraces: an error in the DEEPEST link of a chain that only
+ * collapses via re-scanning must still show every virtual frame, identical to
+ * the non-inlined run. This exercises rebase's parent-stacking (the spliced
+ * call site already carries an inline_ctx when its inner call is inlined).
+ */
+static bool
+inliner_fixpoint_deep_backtrace()
+{
+    const std::vector<const char *> src = {
+        "var d = 1;",
+        "d = 0;",                          /* runtime 0 -> g divides by it */
+        "func h(a) => f(a);",
+        "func f(b) => g(b);",
+        "func g(c) => 100 / c;",
+        "var r = h(d);",
+    };
+
+    unique_ptr<Construct> on = parse_lines(src);
+    unique_ptr<Construct> off = on->clone();
+
+    resolve_names(on.get(), true);
+    resolve_names(off.get(), false);
+
+    std::string bt_on, bt_off;
+    try { on->eval(nullptr); }
+    catch (const Exception &e) { bt_on = format_backtrace(e); }
+    try { off->eval(nullptr); }
+    catch (const Exception &e) { bt_off = format_backtrace(e); }
+
+    bool ok = true;
+    ok = ok && !bt_on.empty();
+    ok = ok && bt_on == bt_off;                  /* identical with/without */
+    ok = ok && bt_on.find("[0] g(c)") != std::string::npos;
+    ok = ok && bt_on.find("[1] f(b)") != std::string::npos;
+    ok = ok && bt_on.find("[2] h(a)") != std::string::npos;
+    ok = ok && bt_on.find("[3] main()") != std::string::npos;
+
+    if (!ok) cout << "  bt_on:\n" << bt_on << "\n  bt_off:\n" << bt_off;
+    return ok;
+}
+
+/*
  * Re-fold of NON-MultiOp const ops in a spliced body: a substituted array arg
  * makes `a[0]` and `len(a)` self-contained constants, which fold to literals
  * (subscript and const-builtin call), not just arithmetic. The function is
@@ -5778,6 +5868,10 @@ static const std::vector<extra_check> extra_checks =
       inliner_specializes_array_const_arg },
     { "specialized-clone backtrace == non-spec",
       inliner_spec_backtrace_identical },
+    { "inliner fixpoint collapses a forward-decl chain",
+      inliner_fixpoint_collapses_chain },
+    { "inliner fixpoint deep backtrace == non-inlined",
+      inliner_fixpoint_deep_backtrace },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

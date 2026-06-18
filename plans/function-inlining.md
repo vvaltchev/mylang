@@ -299,21 +299,31 @@ Two properties that make this cheap and safe:
   mutation-of-const-arg, subscript-assign, `intptr`, foreach over a const arg,
   member access, mutable (non-const) array args, and reassigned params, plus
   every `bench/` script.
+- **Rebasing fixpoint for deeper inline nesting.** The inliner now re-scans each
+  splice (`walk(slot, depth+1)` after the splice in `try_inline`), so a
+  g-into-f-into-h chain collapses in one pass even when declaration order
+  defeats the bottom-up walk (h declared before the callees it transitively
+  reaches) or a call is newly exposed by the re-fold. Bounds: `MAX_INLINE_DEPTH`
+  (16) caps nesting so mutual recursion terminates; `inline_budget`
+  (`max(4096, 8 × program nodes)`, spent per inlined body) caps total growth so
+  breadth-doubling can't blow up the tree — hitting either just leaves the
+  remaining calls in place (still correct). Backtraces stay exact at any depth:
+  a re-scanned splice's call site already carries an `InlineCtx`, so the new
+  frame's parent is that chain (not null) and `rebase` re-roots the body's own
+  chains under it. Verified: a forward-decl chain collapses to zero surviving
+  calls (single-level left one), a 5-level chain and a const chain fold through,
+  mutual-recursion / breadth-doubling terminate, an inlined+physical+recursive
+  chain backtraces identically to `-ni`, and every `bench/` script matches.
 
 ## Remaining / tracked tasks
 
 Not yet done; roughly in priority order:
 
-1. **Rebasing fixpoint for deeper inline nesting.** The inliner is single level
-   per pass: a freshly-spliced body is not re-scanned for further inlining in
-   the same pass (chain rebasing already keeps backtraces correct for the one
-   level that does nest). Running the pass to a fixpoint would inline g-into-f-
-   into-h in one go; needs a depth cap + AST-growth budget.
-2. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
+1. **Re-resolution of spliced bodies** (slot remapping). Not needed by the
    current scope (expression-body inlining has no locals; specialization keeps
    the original frame), but would be required to inline *block* bodies (with
    locals) directly instead of via a shared clone.
-3. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
+2. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
    Unsound on unknown dynamic types (float non-associativity, `+` overloading,
    preserved type errors); needs a "provably-int" analysis first. Inlining
    already leaves spliced expressions with original locs + full structure so
