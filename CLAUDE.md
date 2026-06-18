@@ -675,9 +675,15 @@ non-tail calls or reassigned/global args would need an args-as-locals form.
   live, non-const local — it read-modify-writes `frame->slots[slot]` in place,
   skipping the `lvalue->eval()` → `LValue*` → `doAssign()` round-trip (it falls
   through to that general path when the slot is undefined or const, so the same
-  errors still fire). `foreach` binds a resolved-local loop var the same way via
-  `bind_loop_var`. Both use `as_resolved_local`, which is a cheap `is_id()` tag
-  check (`ConstructType::id`), not a `dynamic_cast`.
+  errors still fire). When both the slot and the rhs are ints, a
+  compound-assign (`+=`/`-=`/`*=`) does the op **directly** on the slot's int —
+  no `num_bin_op` PMF dispatch, no copy in/out (`div`/`mod` stay general, for
+  the zero check). And `Expr14::do_eval` has a sibling fast path for `local
+  += N` with an **int-literal** rhs: it skips evaluating the literal node too
+  (what an `i++` would compile to — there is no `++` operator). `foreach`
+  binds a resolved-local loop var the same way via `bind_loop_var`. All use
+  `as_resolved_local`, a cheap `is_id()` tag check (`ConstructType::id`), not a
+  `dynamic_cast`.
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable

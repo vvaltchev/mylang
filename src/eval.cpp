@@ -997,9 +997,31 @@ handle_single_expr14(EvalContext *ctx,
 
                     } else {
 
-                        EvalValue nv = lv.get();
-                        apply_compound_op(nv, RValue(rval), op);
-                        lv.put(move(nv));
+                        const EvalValue r = RValue(rval);
+
+                        /* Direct int compound-assign (e.g. `j += i`): mutate
+                         * the slot's int in place, skipping the copy in/out and
+                         * the num_bin_op PMF dispatch. add/sub/mul can't fault;
+                         * div/mod (and any non-int operand) take the general
+                         * path, which keeps the zero check and int->float
+                         * promotion. */
+                        if (lv.is<int_type>() && r.is<int_type>() &&
+                            (op == Op::addeq || op == Op::subeq ||
+                             op == Op::muleq)) {
+
+                            int_type &v = lv.getval<int_type>();
+                            const int_type n = r.get<int_type>();
+
+                            if (op == Op::addeq)      v += n;
+                            else if (op == Op::subeq) v -= n;
+                            else                      v *= n;
+
+                        } else {
+
+                            EvalValue nv = lv.get();
+                            apply_compound_op(nv, r, op);
+                            lv.put(move(nv));
+                        }
                     }
 
                     return lv.get();
@@ -1071,6 +1093,45 @@ handle_single_expr14(EvalContext *ctx,
 EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 {
     const bool inDecl = fl & pFlags::pInDecl;
+
+    /*
+     * Fast path for `local += N` / `-= N` / `*= N` where N is an int literal
+     * and the slot currently holds a live, non-const int. Mutates the slot's
+     * int in place, skipping both the rvalue-node eval (the literal) and the
+     * num_bin_op dispatch. add/sub/mul can't fault (they wrap, -fwrapv), so no
+     * check is needed; div/mod fall through to the general path (zero check).
+     * This is what an `i++` / `i += 1` increment would compile to.
+     */
+    if (!inDecl && !ctx->const_ctx &&
+        (op == Op::addeq || op == Op::subeq || op == Op::muleq)) {
+
+        if (const Identifier *id = as_resolved_local(lvalue.get())) {
+
+            if (const auto *lit =
+                    dynamic_cast<const LiteralInt *>(rvalue.get())) {
+
+                Frame *f = ctx->frame;
+                const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
+
+                if (f && (f->live & bit)) {
+
+                    LValue &lv = f->slots[id->sym.slot];
+
+                    if (!lv.is_const_var() && lv.is<int_type>()) {
+
+                        int_type &v = lv.getval<int_type>();
+                        const int_type n = lit->ival();
+
+                        if (op == Op::addeq)      v += n;
+                        else if (op == Op::subeq) v -= n;
+                        else                      v *= n;
+
+                        return v;
+                    }
+                }
+            }
+        }
+    }
 
     /* Evaluate the rhs first; point errors (undefined var, ...) at the rhs
      * itself, not at the whole `lhs = rhs` assignment. */
