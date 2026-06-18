@@ -270,14 +270,15 @@ static bool sty_same_underlying(STyRef a, STyRef b)
             return sty_equal(a->key, b->key) && sty_equal(a->val, b->val);
 
         case STyKind::Func:
-            if (a->params.size() != b->params.size())
-                return false;
-            if (a->param_opt != b->param_opt)
-                return false;
-            for (size_t i = 0; i < a->params.size(); i++)
-                if (!sty_equal(a->params[i], b->params[i]))
-                    return false;
-            return sty_equal(a->ret, b->ret);
+            /* Assignability between function types checks ARITY only. Deep
+             * function subtyping over *inferred* signatures is fragile (a
+             * callback's own param/return types are themselves inferred and may
+             * finalize to dyn after the type that captured them was frozen) and
+             * yields false positives on ordinary higher-order code (e.g.
+             * apply(sq, i)). Calls made through the function are still checked at
+             * their own site, and the body type-checks independently. Precise
+             * function subtyping is deferred (plans/type-inference.md). */
+            return a->params.size() == b->params.size();
 
         case STyKind::Struct:
             return a->struct_def == b->struct_def;
