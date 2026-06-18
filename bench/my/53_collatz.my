@@ -5,7 +5,7 @@ var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
 
-var N = 300000 * scale;
+var N = 30000 * scale;
 var total = 0;
 
 for (var i = 1; i < N; i += 1) {
