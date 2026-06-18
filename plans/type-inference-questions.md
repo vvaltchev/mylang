@@ -72,6 +72,44 @@ Per D5. `func f(opt x, dyn y)`, `var dyn z = ...;`, `var opt w;`. Implemented as
 parser modifiers alongside `const` (Identifier flags + a var-decl flag). `const`
 + `opt`/`dyn` combine. (`const` already exists.)
 
+## As-built status (autonomous session)
+
+Delivered M0-M7: the inferencer is **on by default** and the whole suite
+(635/635) + all benchmarks pass under it. Implemented:
+- `src/stype.{h,cpp}` (lattice) and `src/inferencer.{h,cpp}` (the pass).
+- `opt`/`dyn` keywords (params + var/const decls).
+- Whole-program Jacobi fixpoint inference + a separate check pass; compile-time
+  `TypeMismatchEx`/`NullabilityEx`/`WrongArgCountEx`.
+- Inference for: scalars, arithmetic/comparison/logical operators, var/const
+  decls + assignment, if/while/for/foreach, functions (params + returns from
+  call sites, recursion, mutual recursion), higher-order callbacks (map/filter/
+  sort, named + inline), closures/captures, arrays/dicts (element/key/value),
+  subscript/slice/member, multiple-assignment/IdList spread, builtin signatures.
+- 51 new inference tests (accept + reject); existing tests migrated.
+
+**Not done (deferred, documented):** flow-sensitive nullability narrowing
+(`if (x != none) {...}`); precise const-container element types (const
+arrays/dicts are typed `array<dyn>`/`dict<dyn,dyn>`); the speed-specialization
+phase (typed/monomorphic AST nodes — M8). So inference currently buys
+**compile-time safety, not speed** (the tree-walker still boxes every value).
+
+### Important review items (things you may want to change)
+1. **Strict bare-`var` nullability.** Per your AskUserQuestion choice, a bare
+   `var x;` (or one assigned `none`) is nullable, so using it where a value is
+   required errors until you initialize it (`var x = 0;`) or use `opt`. This
+   broke the `var e; foreach (e in ...)` pattern (one test migrated to
+   `var e = 0;`). If you'd rather a bare decl NOT force nullability (matching
+   your earlier "pin x as int" examples), that's a one-line change to the
+   None-join rule — say the word.
+2. **Uncalled-function params are `dyn`** (so a never-concretely-called
+   function's body still type-checks; e.g. a `pure` comparator only used in a
+   const-folded `sort`). Precise alternative would need callback modeling for
+   every builtin.
+3. **Calling a statically-known non-function is now a compile `TypeMismatchEx`**
+   (was a runtime `NotCallableEx`); a statically-known bad op is a compile error
+   (was runtime `TypeErrorEx`). To keep such an error catchable at runtime, the
+   value must be `dyn` (a couple of catch-tests were migrated this way).
+
 ## Open questions for the user (proceeding with the noted choice)
 
 1. **Strictness of the rollout.** I default inference ON and migrate the

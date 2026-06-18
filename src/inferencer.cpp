@@ -25,7 +25,7 @@
  *                    return type into `acc` (join of all contributions) while
  *                    reading the previous round's stable `type`; commit acc->
  *                    type; repeat until stable. Reading stable values keeps the
- *                    round order-independent; kinds only ever climb the lattice,
+ *                    round order-independent; kinds only climb the lattice,
  *                    so a join conflict (e.g. int vs str) is a real, stable
  *                    error and is raised immediately.
  *   3. check       - with final types, validate every operation/call/assign/
@@ -48,7 +48,7 @@ struct FuncInfo;
 struct TypeSym {
     const UniqueId *name = nullptr;
     STyRef type = nullptr;     /* stable type read by type_of() */
-    STyRef acc = nullptr;      /* accumulator written during the current round */
+    STyRef acc = nullptr;      /* accumulator built during a round */
     bool dyn_decl = false;
     bool opt_decl = false;
     bool is_param = false;
@@ -99,7 +99,8 @@ private:
     static TypeSym *lookup(Scope *s, const UniqueId *name);
     FuncInfo *callee_funcinfo(Construct *e);   /* named func or inline lambda */
     static bool is_builtin(const UniqueId *name);
-    void for_each_child(Construct *n, const std::function<void(Construct *)> &fn);
+    void for_each_child(Construct *n,
+                        const std::function<void(Construct *)> &fn);
     static bool always_exits(const Construct *n);
 
     /* structural pass */
@@ -145,8 +146,12 @@ private:
         t = sty_resolve(t);
         return t->kind == STyKind::Int || t->kind == STyKind::Float;
     }
-    static bool is_dyn(STyRef t)  { return sty_resolve(t)->kind == STyKind::Dyn; }
-    static bool is_none(STyRef t) { return sty_resolve(t)->kind == STyKind::None;}
+    static bool is_dyn(STyRef t) {
+        return sty_resolve(t)->kind == STyKind::Dyn;
+    }
+    static bool is_none(STyRef t) {
+        return sty_resolve(t)->kind == STyKind::None;
+    }
     static bool is_unknown(STyRef t) {
         return sty_resolve(t)->kind == STyKind::Unknown;
     }
@@ -154,7 +159,9 @@ private:
         t = sty_resolve(t);
         return t->opt || t->kind == STyKind::None;
     }
-    static bool is_func(STyRef t) { return sty_resolve(t)->kind == STyKind::Func;}
+    static bool is_func(STyRef t) {
+        return sty_resolve(t)->kind == STyKind::Func;
+    }
 };
 
 /* ------------------------------- helpers --------------------------------- */
@@ -227,7 +234,7 @@ Op Inferencer::compound_binop(Op op)
 }
 
 /* True when control cannot fall off the end of `n` (it always returns/throws).
- * Used to decide whether a block-bodied function contributes a `none` return. */
+ * Used to decide if a block-bodied function contributes a `none` return. */
 bool Inferencer::always_exits(const Construct *n)
 {
     if (!n)
@@ -277,7 +284,8 @@ void Inferencer::for_each_child(Construct *n,
         fn(w->condExpr.get()); fn(w->body.get()); return;
     }
     if (auto *f = dynamic_cast<ForStmt *>(n)) {
-        fn(f->init.get()); fn(f->cond.get()); fn(f->inc.get()); fn(f->body.get());
+        fn(f->init.get()); fn(f->cond.get());
+        fn(f->inc.get()); fn(f->body.get());
         return;
     }
     if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
@@ -443,7 +451,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
         declare_funcdecl(fd, s);
         FuncInfo *fi = func_of_decl[fd];
-        Scope *fscope = new_scope(global);   /* funcs see globals, not callers */
+        Scope *fscope = new_scope(global);   /* funcs see globals only */
 
         if (fd->captures)
             for (auto &cap : fd->captures->elems) {
@@ -468,17 +476,18 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
     }
 
     if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
-        walk_struct(e14->rvalue.get(), s);   /* RHS before the new name exists */
+        walk_struct(e14->rvalue.get(), s);   /* RHS before name exists */
         if (e14->fl & pFlags::pInDecl) {
             declare_target(e14->lvalue.get(), s);
             /* `var f = <lambda>`: bind f to the lambda's FuncInfo so calls to f
              * type the lambda's params and check its arity. */
-            if (auto *id = dynamic_cast<Identifier *>(e14->lvalue.get()))
-                if (auto *fd = dynamic_cast<FuncDeclStmt *>(e14->rvalue.get())) {
-                    TypeSym *sym = id_sym[id];
-                    if (sym && !sym->func)
-                        sym->func = func_of_decl[fd];
-                }
+            auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
+            auto *fd = dynamic_cast<FuncDeclStmt *>(e14->rvalue.get());
+            if (id && fd) {
+                TypeSym *sym = id_sym[id];
+                if (sym && !sym->func)
+                    sym->func = func_of_decl[fd];
+            }
         } else {
             walk_struct(e14->lvalue.get(), s);
         }
@@ -734,13 +743,19 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
         case Op::times:
             if (au->kind == STyKind::Str && bu->kind == STyKind::Int)
                 return A.str_ty();
-            if (an && bn) { STyRef j = A.join(au, bu); return j ? j : A.dyn_ty();}
+            if (an && bn) {
+                STyRef j = A.join(au, bu);
+                return j ? j : A.dyn_ty();
+            }
             return A.dyn_ty();
 
         case Op::minus:
         case Op::div:
         case Op::mod:
-            if (an && bn) { STyRef j = A.join(au, bu); return j ? j : A.dyn_ty();}
+            if (an && bn) {
+                STyRef j = A.join(au, bu);
+                return j ? j : A.dyn_ty();
+            }
             return A.dyn_ty();
 
         default:
@@ -749,7 +764,7 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
 }
 
 /*
- * Result type of a builtin call. Precise where it matters for downstream typing;
+ * Result type of a builtin call. Precise where it matters downstream;
  * `dyn` otherwise (sound - the runtime still type-checks the call). See
  * plans/type-inference-questions.md Q8.
  */
@@ -900,7 +915,7 @@ void Inferencer::contribute_arg(TypeSym *param, STyRef argT, Loc loc)
     argT = sty_resolve(argT);
     if (!param->opt_decl) {
         if (argT->kind == STyKind::None)
-            return;                       /* none -> non-opt: flagged in check */
+            return;                  /* none->non-opt: flagged in check */
         argT = strip(argT);
     }
     contribute(param, argT, loc);
@@ -1102,7 +1117,7 @@ void Inferencer::accumulate_assign(Expr14 *e)
             if (it != id_sym.end() && it->second) {
                 /* Only contribute once the base kind is known (from a prior
                  * literal/assignment); guessing array for an as-yet-Unknown
-                 * base would spuriously conflict with a dict (and vice versa).*/
+                 * base would spuriously conflict with a dict. */
                 STyRef bt = sty_resolve(it->second->type);
                 if (bt->kind == STyKind::Dict)
                     contribute(it->second,
@@ -1211,7 +1226,8 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
         if (logical) {
             /* && / || require int operands (verified runtime behaviour) */
             require_nonopt(left, mo->start, mo->end, "with operator &&/||");
-            require_nonopt(right, rnode->start, rnode->end, "with operator &&/||");
+            require_nonopt(right, rnode->start, rnode->end,
+                           "with operator &&/||");
         } else if (comparison) {
             Op o = op;
             if (o != Op::eq && o != Op::noteq) {
@@ -1219,10 +1235,12 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                 require_nonopt(left, mo->start, mo->end, "in a comparison");
                 require_nonopt(right, rnode->start, rnode->end,
                                "in a comparison");
-                STyRef l = strip(sty_resolve(left)), r = strip(sty_resolve(right));
+                STyRef l = strip(sty_resolve(left));
+                STyRef r = strip(sty_resolve(right));
                 if (!is_dyn(l) && !is_dyn(r)) {
                     bool ok = (is_num(l) && is_num(r)) ||
-                              (l->kind == STyKind::Str && r->kind == STyKind::Str);
+                              (l->kind == STyKind::Str &&
+                               r->kind == STyKind::Str);
                     if (!ok)
                         mismatch("cannot compare '" + sty_to_string(left) +
                                      "' with '" + sty_to_string(right) + "'",
@@ -1230,7 +1248,8 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                 }
             }
         } else if (arith) {
-            require_nonopt(left, mo->start, mo->end, "in an arithmetic operation");
+            require_nonopt(left, mo->start, mo->end,
+                           "in an arithmetic operation");
             require_nonopt(right, rnode->start, rnode->end,
                            "in an arithmetic operation");
             STyRef res = binop_result(op, left, right);
@@ -1296,7 +1315,8 @@ void Inferencer::check(Construct *n)
         check(sub->what.get());
         check(sub->index.get());
         STyRef w = type_of(sub->what.get());
-        require_nonopt(w, sub->what->start, sub->what->end, "as a subscript base");
+        require_nonopt(w, sub->what->start, sub->what->end,
+                       "as a subscript base");
         STyRef wr = strip(sty_resolve(w));
         if (!is_dyn(wr) && wr->kind != STyKind::Array &&
             wr->kind != STyKind::Dict && wr->kind != STyKind::Str)
@@ -1312,7 +1332,8 @@ void Inferencer::check(Construct *n)
         STyRef w = type_of(sl->what.get());
         require_nonopt(w, sl->what->start, sl->what->end, "as a slice base");
         STyRef wr = strip(sty_resolve(w));
-        if (!is_dyn(wr) && wr->kind != STyKind::Array && wr->kind != STyKind::Str)
+        if (!is_dyn(wr) && wr->kind != STyKind::Array &&
+            wr->kind != STyKind::Str)
             mismatch("type '" + sty_to_string(w) + "' is not sliceable",
                      sl->what->start, sl->what->end);
         return;

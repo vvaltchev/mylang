@@ -102,6 +102,7 @@ Running scripts:
 ./build/mylang -ni FILE          # disable function inlining (debug)
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -nr FILE          # parse/validate only, don't run
+./build/mylang -nti FILE         # disable static type inference / checking
 ```
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
 what survived
@@ -155,10 +156,10 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — ten translation
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — eleven translation
 units:
-`lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `eval.cpp`,
-`types.cpp`, `stype.cpp`, `backtrace.cpp`, `mylang.cpp`,
+`lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
+`eval.cpp`, `types.cpp`, `stype.cpp`, `backtrace.cpp`, `mylang.cpp`,
 `tests.cpp`.
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
@@ -188,12 +189,13 @@ units:
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
-- `stype.cpp` / `stype.h` — the **static-type lattice** for the in-progress
-  type-inference feature (`STy`/`STyArena`: `resolve`/`unify`/`assignable`/
-  `join`/`equal`/`to_string`). Distinct from the runtime `Type *` ops table —
-  this is what the compile-time inferencer reasons over (type variables,
-  nullability `opt`, structural array/dict/func shapes). M0 only; no AST wiring
-  yet. See `plans/type-inference.md`.
+- `stype.cpp` / `stype.h` — the **static-type lattice** for type inference
+  (`STy`/`STyArena`: `resolve`/`unify`/`assignable`/`join`/`equal`/
+  `to_string`). Distinct from the runtime `Type *` ops table — this is what the
+  compile-time inferencer reasons over (type variables, nullability `opt`,
+  structural array/dict/func shapes). See `plans/type-inference.md`.
+- `inferencer.cpp` / `inferencer.h` — `infer_types(root)`, the **whole-program
+  static type inference + checking** pass (see the dedicated section below).
 - `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
   `Exception`'s captured call-stack (see the error model section).
 
@@ -223,8 +225,11 @@ as the real types.
 ## The pipeline
 
 **lexer → recursive-descent parser (with const-folding woven in) →
-name-resolution pass →
-tree-walking evaluator.**
+type-inference + checking → name-resolution pass → tree-walking evaluator.**
+
+Type inference runs *between* parsing and `resolve_names` (on the clean,
+un-inlined tree); it is gated by the CLI's `-nti` and on by default. See "Static
+type inference" below.
 
 ### Lexer
 
@@ -554,6 +559,65 @@ caller's real one. Still **not done** (see `plans/function-inlining.md`
 "Remaining"): the deferred type-narrowing/algebraic pass; block-tail inlining of
 non-tail calls or reassigned/global args would need an args-as-locals form.
 
+## Static type inference (`inferencer.cpp`)
+
+A **whole-program, compile-time** pass (`infer_types(root)`) that gives every
+variable, parameter, and function return a fixed static type and **rejects type
+violations before the program runs**. Gated by `-nti` (default ON; also runs
+under `-nr`, since type-checking is validation). It runs *after* parsing but
+*before* `resolve_names`, on the clean tree (not the inlined one), and stores
+nothing on the AST — it owns an `STyArena` (`stype.h`) and side tables, so it
+leaves the tree untouched for the later passes. Full design + the decisions
+behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
+
+- **Static types** are `STy` (`stype.h`), distinct from the runtime `Type *`:
+  `None` (the only-none / not-yet-pinned unit), `Int`, `Float`, `Str`,
+  `Array<elem>`, `Dict<k,v>`, `Func(params)->ret`, `Exception`, `Dyn` (explicit
+  top), each with an `opt` (nullable) flag. The lattice ops are
+  `assignable`/`join`/`unify`/`equal` (`int <= float` promotion; `None`/`opt`
+  nullability; mixed container elements fall to `Dyn`; a scalar/kind conflict is
+  an error).
+- **Three passes**: (1) *structural* — build scopes, one `TypeSym` per
+  declaration, resolve every `Identifier` to its `TypeSym`, one `FuncInfo` per
+  function; (2) *fixpoint* — **Jacobi** iteration: each round recomputes every
+  symbol/return type into `acc` (the `join` of all contributions) while reading
+  the previous round's stable `type`, then commits; reading stable values makes
+  rounds order-independent, and since kinds only climb the lattice a `join`
+  conflict (e.g. `int` vs `str`) is a real, stable error raised immediately;
+  (3) *check* — with final types, validate every operator, call, assignment, and
+  return, throwing on a violation.
+- **Inference rules of note** (the non-obvious ones): a never-(concretely-)
+  called function's parameter finalizes to `Dyn` (its body must still
+  type-check), while an unconstrained *local* finalizes to `None`. Param
+  nullability is *declared* (`opt`); local/return nullability is *inferred*
+  (`None` joined with a concrete `T` is `opt T`). `runtime(x)` returns `Dyn`
+  (its documented opt-out: it defers to runtime). `==`/`!=` are always
+  well-typed (→ int); ordering is numeric-or-string. `str + anything` → str.
+  Higher-order builtins (`map(func,c)`, `filter(func,c)`, `sort(c,func)`,...)
+  feed the container's element type into the callback's params (named **or**
+  inline lambda; `callee_funcinfo`). A `var f = <lambda>` binds `f`'s `TypeSym`
+  to the lambda's `FuncInfo`, so calls to `f` type its params and check arity.
+- **New surface syntax**: the `opt` and `dyn` keywords, usable as modifiers on a
+  parameter (`func f(opt x, dyn y)`) or a var/const decl (`var dyn z = ...;`,
+  `var opt w;`). `opt` = nullable (may hold `none`); `dyn` = dynamically typed
+  (behaves as today; inference does not constrain it — the escape hatch for
+  genuinely polymorphic code). Implemented as `Identifier::{opt_mod,dyn_mod}`
+  (params, via `pFuncParam`) and `pFlags::{pInOptDecl,pInDynDecl}` (decls).
+- **Errors** are compile-time (`DECL`-style plain `Exception`s, **not**
+  `RuntimeException`s, so script `try/catch` cannot catch them; `errors.h`):
+  `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),
+  `NullabilityEx` (`none`/`opt` used where a non-opt value is required),
+  `WrongArgCountEx` (arity). Each carries an interned custom message + a `Loc`.
+- **Interaction**: const scalars are already inlined to literals before this
+  pass runs, so it never sees them as symbols; const arrays/dicts (kept as
+  `LiteralObj` decls) are typed `array<dyn>`/`dict<dyn,dyn>`. A statically-known
+  type error that used to surface as a runtime `TypeErrorEx`/`NotCallableEx` is
+  now a compile error — to keep such an error catchable at runtime, make the
+  value `dyn`. **Not yet done** (deferred): flow-sensitive nullability narrowing
+  (`if (x != none) {...}`); precise const-container element types; the
+  speed-specialization phase (typed/monomorphic nodes) — see
+  `plans/type-inference.md` §9/M8.
+
 ## The value & type model (the subtle part)
 
 - **`EvalValue`** (`evalvalue.h`) is a hand-rolled tagged union: a `ValueU`
@@ -864,6 +928,11 @@ and two macros:
   `InternalErrorEx`,
   `CannotRebindConstEx`, `ExpressionIsNotConstEx`, …). **Not catchable** from
   script.
+- **Compile-time type errors** (`TypeMismatchEx`, `NullabilityEx`,
+  `WrongArgCountEx`) — thrown by the type inferencer (see "Static type
+  inference"). Plain `Exception`s (not `RuntimeException`s), so **not catchable**
+  from script; each carries a custom interned message + `Loc`. A statically
+  provable type error is reported here, before the program runs.
 - `DECL_RUNTIME_EX` — subclasses of `RuntimeException` (adds `clone()` +
   `[[noreturn]] rethrow()`):
   `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `NotLValueEx`,

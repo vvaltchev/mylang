@@ -73,7 +73,7 @@ public:
     STyRef int_ty(bool opt = false)   { return ground(STyKind::Int, opt); }
     STyRef float_ty(bool opt = false) { return ground(STyKind::Float, opt); }
     STyRef str_ty(bool opt = false)   { return ground(STyKind::Str, opt); }
-    STyRef exc_ty(bool opt = false)   { return ground(STyKind::Exception, opt); }
+    STyRef exc_ty(bool opt = false) { return ground(STyKind::Exception, opt); }
     STyRef none_ty()                  { return g_none; }
     STyRef dyn_ty()                   { return g_dyn; }
 
