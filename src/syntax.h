@@ -685,6 +685,16 @@ public:
     int slot_start = 0;
     int slot_count = 0;
 
+    /*
+     * Set by the resolver when every declaration in this block is a frame slot
+     * (no map-bound decl: no capture, no nested-func name, no slot-budget
+     * overflow). Such a block never touches the EvalContext map, so do_eval can
+     * run its statements in the parent context and skip building (and tearing
+     * down) a per-entry EvalContext - a real win for loop/if bodies, which
+     * re-enter every iteration. Default false (keep the scope) is always safe.
+     */
+    bool scope_free = false;
+
     Block() : MultiElemConstruct("Block", ConstructType::block) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
@@ -694,6 +704,7 @@ public:
         clone_elems_into(*c);
         c->slot_start = slot_start;
         c->slot_count = slot_count;
+        c->scope_free = scope_free;
         return c;
     }
 };
