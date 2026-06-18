@@ -299,4 +299,6 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("write", builtin_write),
     make_builtin("readlines", builtin_readlines),
     make_builtin("writelines", builtin_writelines),
+    make_builtin("remove", builtin_remove),
+    make_builtin("tmpdir", builtin_tmpdir),
 };

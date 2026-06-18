@@ -1585,3 +1585,13 @@ Similar to `read()`, but read line by line and return an array.
 #### `writelines(array_of_strings, [filename])`
 Similar to `write()`, but accept an array of strings and write them one
 per line.
+
+#### `remove(filename)`
+Delete a file. Returns `true` if a file was removed, `false` otherwise (e.g. it
+did not exist), so it is safe to call for cleanup without checking first. Throws
+only on a bad argument (a non-string, or the wrong number of arguments).
+
+#### `tmpdir()`
+Return the OS temporary directory as a string, with no trailing separator (so
+you can append `"/name"`). Portable: honors `$TMPDIR` / `%TEMP%` / `%TMP%`,
+falling back to `/tmp`. Like Python's `tempfile.gettempdir()`.
