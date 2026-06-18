@@ -4,13 +4,8 @@ if (len(argv) > 0)
     scale = int(argv[0]);
 
 var SZ = 20000;
-var a = array(SZ);
-for (var i = 0; i < SZ; i += 1)
-    a[i] = i;
-
-var hay = "";
-for (var i = 0; i < 1000; i += 1)
-    hay += "abcdefghi.";          # 10000 chars, "z" appears nowhere until appended
+var a = range(SZ);                 # [0..SZ-1] - matches list(range(SZ))
+var hay = "abcdefghi." * 1000;     # 10000 chars - matches "abcdefghi." * 1000
 
 var R = 1000 * scale;
 var s = 0;
