@@ -225,11 +225,13 @@ as the real types.
 ## The pipeline
 
 **lexer → recursive-descent parser (with const-folding woven in) →
-type-inference + checking → name-resolution pass → tree-walking evaluator.**
+type-inference + checking → name-resolution pass → typed specialization →
+tree-walking evaluator.**
 
 Type inference runs *between* parsing and `resolve_names` (on the clean,
-un-inlined tree); it is gated by the CLI's `-nti` and on by default. See "Static
-type inference" below.
+un-inlined tree); the typed-node *specialization* it enables runs *after*
+`resolve_names`. Both are gated by the CLI's `-nti` and on by default. See
+"Static type inference" below.
 
 ### Lexer
 
@@ -608,15 +610,46 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),
   `NullabilityEx` (`none`/`opt` used where a non-opt value is required),
   `WrongArgCountEx` (arity). Each carries an interned custom message + a `Loc`.
+- **Null narrowing** (`check_if`/`narrow_target`, check pass only): inside a
+  proven branch a nullable var reads as non-opt — `if (x != none)` / `if (x)`
+  (then), `if (x == none) ... else` (else), and the guard clause
+  `if (x == none) return/throw; ...` (rest of the block). Sound (the branch
+  guarantees non-none). Not flow-narrowed elsewhere.
+- **Const-container types are exact** (`sty_from_value` recurses): a folded
+  const array/dict is typed `array<T>`/`dict<K,V>` from its actual elements
+  (heterogeneous -> `array<dyn>`; individual elements stay exact via const-fold
+  of a constant-index access). Container element joins absorb `None`
+  (`join_elem`) so `array(N)`-then-fill stays `array<int>`, not opt-element;
+  an empty `[]` (`array<none>`) or a `dyn`-element container fits any
+  `array<T>` (`sty_elem_compat` — invariance relaxed at the bottom/top element).
 - **Interaction**: const scalars are already inlined to literals before this
-  pass runs, so it never sees them as symbols; const arrays/dicts (kept as
-  `LiteralObj` decls) are typed `array<dyn>`/`dict<dyn,dyn>`. A statically-known
-  type error that used to surface as a runtime `TypeErrorEx`/`NotCallableEx` is
-  now a compile error — to keep such an error catchable at runtime, make the
-  value `dyn`. **Not yet done** (deferred): flow-sensitive nullability narrowing
-  (`if (x != none) {...}`); precise const-container element types; the
-  speed-specialization phase (typed/monomorphic nodes) — see
-  `plans/type-inference.md` §9/M8.
+  pass runs, so it never sees them as symbols. A statically-known type error
+  that used to surface as a runtime `TypeErrorEx`/`NotCallableEx` is now a
+  compile error — to keep such an error catchable at runtime, make the value
+  `dyn`. **Not yet done** (deferred): function subtyping is arity-only;
+  cross-statement narrowing beyond the patterns above.
+
+### M8 — typed scalar specialization (`specialize_types`, the speed payoff)
+
+After inference, `infer_types` stamps a `TypeHint` (`th`: `i`/`f`) on every node
+it proved is a non-null int/float. After `resolve_names`, `specialize_types`
+(`inferencer.cpp`, called from `mylang.cpp` + the test harness, gated by `-nti`)
+rewrites hot scalar nodes — `Expr03/04` (arith), `Expr06/07` (compare),
+`Expr11/12` (logical), `Expr02` (unary) — over typed operands into a single
+**`TypedScalarExpr`** node (`syntax.h`). It computes via **`eval_int()` /
+`eval_float()`** — typed (unboxed) eval virtuals on `Construct` (default boxes
+through `eval()`/`RValue`, so a typed node may call them on any child) — with no
+`num_bin_op` promotion dispatch, no PMF virtual call, and no intermediate
+`EvalValue` boxing. `Identifier`/`Subscript` override `eval_int`/`eval_float`
+to read a resolved-local slot / an array element's scalar directly
+(`EvalValue::get_ref<T>()` avoids a refcount bump); loop/if conditions take the
+unboxed path via `eval_cond` when the condition is a known int. The specializer
+recurses bottom-up so nested typed subtrees chain `eval_int` calls with no
+boxing between them. **Effect:** ~2.8x on `bench/44_primes_sqrt`, ~2x on
+float-heavy reductions; the once-slower-than-Python primes benchmark is now
+faster. `th` is copied by `copy_base_fields` (clones/inliner preserve it), and
+the typed eval's `get<int_type>()` throws `TypeError` if inference were ever
+wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
 
 ## The value & type model (the subtle part)
 

@@ -543,6 +543,32 @@ slot = "now a string";           # ok, because it's dyn
     polymorphic code (e.g. a generic equality helper) or to keep a known type
     error catchable at runtime with `try/catch`.
 
+#### Null-checks are understood (narrowing)
+
+After you check a nullable value against `none`, it is treated as non-`none` in
+the guarded code, so these all type-check:
+
+```C#
+func f(opt x) {
+    if (x == none) return 0;     # guard clause
+    return x + 1;                # x is known non-none here
+}
+func g(opt x) {
+    if (x != none) return x * 2; # x is known non-none in this branch
+    return -1;
+}
+```
+
+#### Speed
+
+Type inference is not only about safety: knowing a variable is an `int` or a
+`float` lets the interpreter evaluate arithmetic, comparisons and loop
+conditions over it **without** the per-operation type dispatch and value-boxing
+a dynamic language normally pays. On numeric code this is a large win — e.g.
+`bench/my/44_primes_sqrt.my` runs ~2.8x faster with inference on than off, and
+float-heavy loops (`bench/my/54_mandelbrot.my`, `55_float_sum.my`) run **faster
+than CPython**. Code typed `dyn` keeps the original dynamic behavior and speed.
+
 ### Conditional statements
 
 Conditional statements work exactly like in `C`. The syntax is:
