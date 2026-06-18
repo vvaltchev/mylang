@@ -942,6 +942,8 @@ public:
 
     Subscript() : Construct("Subscript") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    int_type eval_int(EvalContext *ctx) const override;
+    float_type eval_float(EvalContext *ctx) const override;
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {

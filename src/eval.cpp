@@ -1557,6 +1557,51 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
     return t->subscript(lval, RValue(index->eval(ctx)));
 }
 
+/*
+ * Typed array element read: skip the virtual subscript dispatch and the
+ * EvalValue result construction, reading the element's scalar directly. Only
+ * for an array base (the inferencer proved array<int>/array<float>); anything
+ * else (dict, str, dyn) falls back to the boxed path.
+ */
+int_type Subscript::eval_int(EvalContext *ctx) const
+{
+    const EvalValue &lval = what->eval(ctx);
+    const EvalValue &base = lval.is<LValue *>()
+        ? lval.get<LValue *>()->get() : lval;
+
+    if (base.is<SharedArrayObj>()) {
+        const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+        int_type idx = index->eval_int(ctx);
+        if (idx < 0)
+            idx += arr.size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+            throw OutOfBoundsEx(start, end);
+        return arr.get_vec()[arr.offset() + idx].getval<int_type>();
+    }
+    return Construct::eval_int(ctx);
+}
+
+float_type Subscript::eval_float(EvalContext *ctx) const
+{
+    const EvalValue &lval = what->eval(ctx);
+    const EvalValue &base = lval.is<LValue *>()
+        ? lval.get<LValue *>()->get() : lval;
+
+    if (base.is<SharedArrayObj>()) {
+        const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+        int_type idx = index->eval_int(ctx);
+        if (idx < 0)
+            idx += arr.size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+            throw OutOfBoundsEx(start, end);
+        const LValue &el = arr.get_vec()[arr.offset() + idx];
+        if (el.is<int_type>())
+            return static_cast<float_type>(el.getval<int_type>());
+        return el.getval<float_type>();
+    }
+    return Construct::eval_float(ctx);
+}
+
 EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue &lval = what->eval(ctx);

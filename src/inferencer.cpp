@@ -577,17 +577,58 @@ STyRef Inferencer::func_sty(FuncInfo *fi)
     return A.func_of(ps, popt, fi->ret);
 }
 
+/*
+ * Derive the exact static type of a baked const value (a folded const array/
+ * dict literal), recursing into its elements. A const value is immutable and
+ * fully known at compile time, so element types are not discarded: a
+ * homogeneous const array is array<T>, a heterogeneous one array<dyn> (its
+ * individual elements are still exact via const-folding of any constant-index
+ * access at parse time). Same for dict keys/values.
+ */
 STyRef Inferencer::sty_from_value(const EvalValue &v)
 {
     Type *t = v.get_type();
     switch (t->t) {
+
         case Type::t_int:   return A.int_ty();
         case Type::t_float: return A.float_ty();
         case Type::t_str:   return A.str_ty();
         case Type::t_none:  return A.none_ty();
-        case Type::t_arr:   return A.array_of(A.dyn_ty());
-        case Type::t_dict:  return A.dict_of(A.dyn_ty(), A.dyn_ty());
-        default:            return A.dyn_ty();
+
+        case Type::t_arr: {
+            ArrayConstView view = v.get<SharedArrayObj>().get_view();
+            if (view.size() == 0)
+                return A.array_of(A.none_ty());
+            STyRef el = sty_from_value(view[0].get());
+            for (size_type i = 1; i < view.size(); i++) {
+                STyRef j = A.join(el, sty_from_value(view[i].get()));
+                el = j ? j : A.dyn_ty();
+            }
+            return A.array_of(el);
+        }
+
+        case Type::t_dict: {
+            const auto &m = v.get<intrusive_ptr<DictObject>>()->get_ref();
+            if (m.empty())
+                return A.dict_of(A.none_ty(), A.none_ty());
+            STyRef k = nullptr, val = nullptr;
+            for (const auto &kv : m) {
+                STyRef kt = sty_from_value(kv.first);
+                STyRef vt = sty_from_value(kv.second.get());
+                if (!k) {
+                    k = kt; val = vt;
+                } else {
+                    STyRef jk = A.join(k, kt);
+                    STyRef jv = A.join(val, vt);
+                    k = jk ? jk : A.dyn_ty();
+                    val = jv ? jv : A.dyn_ty();
+                }
+            }
+            return A.dict_of(k, val);
+        }
+
+        default:
+            return A.dyn_ty();
     }
 }
 

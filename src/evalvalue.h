@@ -186,6 +186,17 @@ public:
         throw TypeErrorEx();
     }
 
+    /* Like get<T>() const, but returns a const reference (no copy / no refcount
+     * bump for handle types). Valid as long as this value is. */
+    template <class T>
+    const T &get_ref() const {
+
+        if (is<T>())
+            return *reinterpret_cast<const T *>(&val);
+
+        throw TypeErrorEx();
+    }
+
     template <class T>
     bool is() const {
         return type->t == static_cast<Type::TypeE>(TypeToEnum<T>::val);
