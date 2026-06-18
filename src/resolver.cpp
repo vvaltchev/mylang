@@ -1336,8 +1336,11 @@ public:
                                        static_cast<long>(count_all_nodes(root))
                                            * 8);
 
+        /* Top-level statements run in "main", whose frame is the root block's
+         * slot_count (Block::do_eval builds it); pass that as the frame to grow
+         * when a top-level tail call is inlined. */
         for (auto &e : root->elems)
-            walk(e);
+            walk(e, 0, &root->slot_count);
 
         /* Register clones at the front: ready before any call reaches one. */
         if (!new_funcs.empty()) {
@@ -1420,20 +1423,38 @@ private:
             res.first->second = nullptr;   /* duplicate name: ambiguous */
     }
 
-    void walk(unique_ptr<Construct> &slot, int depth = 0)
+    /*
+     * `fsize` points at the frame size of the function (or the root block's
+     * slot_count for "main") whose body we are walking - the frame that block-
+     * body tail inlining grows when it remaps a callee's locals into it.
+     * nullptr means the enclosing function is unresolved (no frame), so block-
+     * body inlining is skipped there.
+     */
+    void walk(unique_ptr<Construct> &slot, int depth, int *fsize)
     {
         if (!slot)
             return;
 
+        /* A nested function owns a separate frame: walk its body with that
+         * function's frame size (or no frame if unresolved). Its name, params
+         * and capture list hold no calls. */
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(slot.get())) {
+            if (fd->body)
+                walk(fd->body, depth,
+                     fd->resolved ? &fd->frame_size : nullptr);
+            return;
+        }
+
         /* Recurse into children at the same splice depth. */
         for_each_child_slot(slot.get(),
-            [&](unique_ptr<Construct> &ch) { walk(ch, depth); });
+            [&](unique_ptr<Construct> &ch) { walk(ch, depth, fsize); });
 
-        try_inline(slot, depth);   /* re-scans its own splice (depth + 1) */
+        try_inline(slot, depth, fsize);   /* re-scans its splice (depth + 1) */
+        try_inline_tail(slot, depth, fsize);   /* tail call to a block func */
         try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
-    void try_inline(unique_ptr<Construct> &slot, int depth)
+    void try_inline(unique_ptr<Construct> &slot, int depth, int *fsize)
     {
         auto *ce = dynamic_cast<CallExpr *>(slot.get());
         if (!ce)
@@ -1520,7 +1541,260 @@ private:
          * re-fold above - gets inlined too, so a g-into-f-into-h chain
          * collapses in one pass regardless of decl order. depth+1 bounds it.
          */
-        walk(slot, depth + 1);
+        walk(slot, depth + 1, fsize);
+    }
+
+    /* Frame::live is a 64-bit word, so a frame holds at most 64 slots. */
+    static const int MAX_FRAME_SLOTS = 64;
+
+    /*
+     * Conservative "this block always returns": its last statement is an
+     * unconditional ReturnStmt, so control can never fall off the end. A
+     * block-bodied function with this property is safe to splice in tail
+     * position - it never falls through to whatever followed the call.
+     */
+    static bool block_always_returns(const Block *b)
+    {
+        return b && !b->elems.empty()
+            && dynamic_cast<const ReturnStmt *>(b->elems.back().get());
+    }
+
+    /*
+     * A COMPLETE count of Identifier nodes matching `pred` (unlike count_uses,
+     * whose for_each_child stops at Block/Expr14/for/foreach/try - fine for the
+     * expression bodies it serves, but a block body hides uses inside those).
+     * Used to (1) reject a self-recursive callee and (2) count a param's uses
+     * by SLOT, so a local that shadows a param's name isn't miscounted.
+     */
+    static int count_matching(
+        const Construct *c,
+        const std::function<bool(const Identifier *)> &pred)
+    {
+        if (!c)
+            return 0;
+        if (auto *id = dynamic_cast<const Identifier *>(c))
+            return pred(id) ? 1 : 0;
+
+        int n = 0;
+        if (auto *b = dynamic_cast<const Block *>(c)) {
+            for (auto &e : b->elems)
+                n += count_matching(e.get(), pred);
+        } else if (auto *e14 = dynamic_cast<const Expr14 *>(c)) {
+            n += count_matching(e14->lvalue.get(), pred);
+            n += count_matching(e14->rvalue.get(), pred);
+        } else if (auto *fs = dynamic_cast<const ForStmt *>(c)) {
+            n += count_matching(fs->init.get(), pred);
+            n += count_matching(fs->cond.get(), pred);
+            n += count_matching(fs->inc.get(), pred);
+            n += count_matching(fs->body.get(), pred);
+        } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+            if (fe->ids)
+                for (auto &id : fe->ids->elems)
+                    n += count_matching(id.get(), pred);
+            n += count_matching(fe->container.get(), pred);
+            n += count_matching(fe->body.get(), pred);
+        } else if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+            n += count_matching(tc->tryBody.get(), pred);
+            for (auto &p : tc->catchStmts) {
+                if (p.first.asId)
+                    n += count_matching(p.first.asId.get(), pred);
+                n += count_matching(p.second.get(), pred);
+            }
+            n += count_matching(tc->finallyBody.get(), pred);
+        } else {
+            for_each_child(const_cast<Construct *>(c),
+                [&](Construct *ch) { n += count_matching(ch, pred); });
+        }
+        return n;
+    }
+
+    /*
+     * Splice a (cloned) block body for tail inlining, in ONE pass: substitute
+     * each param use (a local Identifier whose ORIGINAL slot < nparams) with
+     * the matching arg, and remap every body LOCAL (slot >= nparams) and Block
+     * slot range by `off` so they land in the caller's frame at
+     * [caller_fsize, ...). Deciding by the original slot in one pass avoids any
+     * transient collision between f's locals and the caller's slots. The
+     * substituted arg's own identifiers (caller slots) are left untouched.
+     * Loop-var / catch-var / multi-assign-target identifiers are declarations
+     * (always locals, never params), so they are remapped, never substituted.
+     */
+    static void splice_tail(unique_ptr<Construct> &ref,
+                            const std::vector<Construct *> &args,
+                            int nparams, int off)
+    {
+        Construct *c = ref.get();
+        if (!c)
+            return;
+
+        if (auto *id = dynamic_cast<Identifier *>(c)) {
+            if (id->sym.kind == SymKind::local) {
+                if (id->sym.slot < nparams) {
+                    unique_ptr<Construct> a = args[id->sym.slot]->clone();
+                    a->start = id->start;     /* keep the param's source loc */
+                    a->end = id->end;
+                    ref = move(a);
+                } else {
+                    id->sym.slot += off;
+                }
+            }
+            return;
+        }
+
+        auto remap_id = [&](Identifier *id) {
+            if (id && id->sym.kind == SymKind::local && id->sym.slot >= nparams)
+                id->sym.slot += off;
+        };
+
+        if (auto *il = dynamic_cast<IdList *>(c)) {
+            for (auto &id : il->elems)
+                remap_id(id.get());
+            return;
+        }
+        if (auto *b = dynamic_cast<Block *>(c)) {
+            if (b->slot_count > 0)
+                b->slot_start += off;
+            for (auto &e : b->elems)
+                splice_tail(e, args, nparams, off);
+            return;
+        }
+        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+            splice_tail(e14->lvalue, args, nparams, off);
+            splice_tail(e14->rvalue, args, nparams, off);
+            return;
+        }
+        if (auto *fs = dynamic_cast<ForStmt *>(c)) {
+            splice_tail(fs->init, args, nparams, off);
+            splice_tail(fs->cond, args, nparams, off);
+            splice_tail(fs->inc, args, nparams, off);
+            splice_tail(fs->body, args, nparams, off);
+            return;
+        }
+        if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+            if (fe->ids)
+                for (auto &id : fe->ids->elems)
+                    remap_id(id.get());
+            splice_tail(fe->container, args, nparams, off);
+            splice_tail(fe->body, args, nparams, off);
+            return;
+        }
+        if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+            splice_tail(tc->tryBody, args, nparams, off);
+            for (auto &p : tc->catchStmts) {
+                remap_id(p.first.asId.get());
+                splice_tail(p.second, args, nparams, off);
+            }
+            splice_tail(tc->finallyBody, args, nparams, off);
+            return;
+        }
+
+        for_each_child_slot(c,
+            [&](unique_ptr<Construct> &ch) {
+                splice_tail(ch, args, nparams, off);
+            });
+    }
+
+    /*
+     * Inline a TAIL call to a block-bodied function: `return f(args);` where
+     * f's body always returns. Splicing f's body in place of the return is
+     * sound because f's own `return`s become the caller's returns (it was a
+     * tail call) and f never falls through. f's params are substituted (so they
+     * must be non-reassigned and substitutable), and f's locals are RE-RESOLVED
+     * - remapped to a fresh range at the top of the caller's frame (which grows
+     * by f's local count, capped at 64 slots). This is the block-body analogue
+     * of expression-body inlining; specialization (a shared clone) stays the
+     * fallback for non-tail or non-substitutable calls.
+     */
+    void try_inline_tail(unique_ptr<Construct> &slot, int depth, int *fsize)
+    {
+        if (!fsize)
+            return;       /* the enclosing function has no frame to grow */
+
+        auto *ret = dynamic_cast<ReturnStmt *>(slot.get());
+        if (!ret)
+            return;
+        auto *ce = dynamic_cast<CallExpr *>(ret->elem.get());
+        if (!ce)
+            return;
+
+        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        if (!callee || callee->sym.kind == SymKind::local)
+            return;
+
+        auto it = spec_funcs.find(callee->uid);   /* block-bodied, no capture/
+                                                   * nested func */
+        if (it == spec_funcs.end() || !it->second)
+            return;
+        FuncDeclStmt *f = it->second;
+
+        if (!f->resolved)
+            return;       /* its locals aren't slotted: nothing to remap into */
+
+        auto *body = dynamic_cast<const Block *>(f->body.get());
+        if (!body || !block_always_returns(body))
+            return;
+
+        const int nparams = f->params
+            ? static_cast<int>(f->params->elems.size()) : 0;
+        if (static_cast<int>(ce->args->elems.size()) != nparams)
+            return;
+
+        const int bsz = node_count(f->body.get());
+        if (bsz > max_nodes)
+            return;
+
+        /* Exclude a self-recursive callee (else it re-expands to the cap). */
+        const UniqueId *fid = f->id->uid;
+        if (count_matching(f->body.get(),
+                [&](const Identifier *id) { return id->uid == fid; }) != 0)
+            return;
+
+        /*
+         * Every param must be substitutable (see tail_arg_ok): never reassigned
+         * in the body, and an arg whose value the body reads identically no
+         * matter when or how often. Use count is by SLOT so a same-named
+         * shadowing local doesn't mislead.
+         */
+        for (int i = 0; i < nparams; i++) {
+            if (i < static_cast<int>(f->slot_writes.size())
+                    && f->slot_writes[i] != 0)
+                return;
+            const int uses = count_matching(f->body.get(),
+                [&](const Identifier *id) {
+                    return id->sym.kind == SymKind::local
+                        && id->sym.slot == i;
+                });
+            if (!tail_arg_ok(uses, ce->args->elems[i].get()))
+                return;
+        }
+
+        const int nlocals = f->frame_size - nparams;
+        if (*fsize + nlocals > MAX_FRAME_SLOTS)
+            return;       /* would overflow the 64-slot frame */
+        if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
+            return;
+        inline_budget -= bsz;
+
+        /* Splice: substitute params, remap locals into [caller_fsize, ...). */
+        const int off = *fsize - nparams;
+
+        std::vector<Construct *> args;
+        for (auto &a : ce->args->elems)
+            args.push_back(a.get());
+
+        unique_ptr<Construct> spliced = f->body->clone();
+        splice_tail(spliced, args, nparams, off);
+
+        *fsize += nlocals;   /* the caller's frame absorbed f's locals */
+
+        const InlineCtx *ic = alloc_inline_ctx(
+            { std::string(f->id->get_str()), param_names(f),
+              ce->start, ce->inline_ctx });
+        tag_inline(spliced.get(), ic);
+
+        slot = move(spliced);   /* the ReturnStmt becomes f's (spliced) body */
+        refold(slot);
+        walk(slot, depth + 1, fsize);   /* re-scan: nested tail/expr calls */
     }
 
     /* Sound iff the argument is evaluated as often as the param is used and a
@@ -1538,6 +1812,33 @@ private:
                 || is_const_literal(arg);
 
         return is_const_literal(arg);     /* uses == 0: drop a const only */
+    }
+
+    /*
+     * Substitutability of a tail-inline arg, stricter than sub_ok because a
+     * block body may read the param after statements that change shared state.
+     * The arg must be VALUE-STABLE - read identically whenever the body reads
+     * it: a caller LOCAL (the spliced body can't reach the caller's frame, so
+     * it can't reassign it) or a const literal. A global is excluded (the body
+     * might reassign it before the use); so is any side-effecting expression.
+     * For 0 or >=2 uses (drop / duplicate) it must also be identical and
+     * immutable per copy: a scalar literal always, or - for >=2 - an identifier
+     * (reads the one slot each time). A mutable array/dict literal would split
+     * into independent objects, so it is only allowed for a single use.
+     */
+    static bool tail_arg_ok(int uses, const Construct *arg)
+    {
+        auto *id = dynamic_cast<const Identifier *>(arg);
+        const bool local = id && id->sym.kind == SymKind::local;
+
+        if (!local && !is_const_literal(arg))
+            return false;     /* global / side-effecting: not value-stable */
+
+        if (uses == 1)
+            return true;      /* one copy: any value-stable arg is fine */
+
+        return dynamic_cast<const Literal *>(arg)   /* scalar: drop or dup ok */
+            || (uses >= 2 && local);                /* identifier: same slot */
     }
 
     static std::vector<std::string> param_names(const FuncDeclStmt *f)
