@@ -1,0 +1,439 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+#include "stype.h"
+
+/*
+ * M0 of the type-inference feature: the static-type lattice and its operations.
+ * See stype.h for the data model and plans/type-inference.md sections 2 & 4 for
+ * the rules these implement.
+ */
+
+/* ---------------- STyArena: allocation & ground singletons --------------- */
+
+STyArena::STyArena()
+{
+    for (int o = 0; o < 2; o++) {
+        g_int[o]   = alloc(STyKind::Int);       g_int[o]->opt   = o;
+        g_float[o] = alloc(STyKind::Float);     g_float[o]->opt = o;
+        g_str[o]   = alloc(STyKind::Str);       g_str[o]->opt   = o;
+        g_exc[o]   = alloc(STyKind::Exception); g_exc[o]->opt   = o;
+    }
+
+    g_none = alloc(STyKind::None);
+    g_dyn  = alloc(STyKind::Dyn);
+}
+
+STyRef STyArena::alloc(STyKind k)
+{
+    nodes.push_back(std::make_unique<STy>(k));
+    return nodes.back().get();
+}
+
+STyRef STyArena::ground(STyKind k, bool opt)
+{
+    const int i = opt ? 1 : 0;
+
+    switch (k) {
+        case STyKind::Int:       return g_int[i];
+        case STyKind::Float:     return g_float[i];
+        case STyKind::Str:       return g_str[i];
+        case STyKind::Exception: return g_exc[i];
+        default:                 return nullptr;   /* not a cached ground */
+    }
+}
+
+STyRef STyArena::fresh_var()
+{
+    return alloc(STyKind::Unknown);
+}
+
+STyRef STyArena::array_of(STyRef elem, bool opt)
+{
+    STyRef t = alloc(STyKind::Array);
+    t->elem = elem;
+    t->opt = opt;
+    return t;
+}
+
+STyRef STyArena::dict_of(STyRef key, STyRef val, bool opt)
+{
+    STyRef t = alloc(STyKind::Dict);
+    t->key = key;
+    t->val = val;
+    t->opt = opt;
+    return t;
+}
+
+STyRef STyArena::func_of(std::vector<STyRef> params,
+                         std::vector<bool> param_opt,
+                         STyRef ret,
+                         bool opt)
+{
+    STyRef t = alloc(STyKind::Func);
+    t->params = std::move(params);
+    t->param_opt = std::move(param_opt);
+    t->ret = ret;
+    t->opt = opt;
+    return t;
+}
+
+STyRef STyArena::with_opt(STyRef t, bool optflag)
+{
+    t = sty_resolve(t);
+
+    /* none is inherently nullable, dyn subsumes everything, and an unbound
+     * variable carries its nullability only once it is resolved. */
+    if (t->kind == STyKind::None || t->kind == STyKind::Dyn ||
+        t->kind == STyKind::Unknown)
+        return t;
+
+    if (t->opt == optflag)
+        return t;
+
+    switch (t->kind) {
+        case STyKind::Int:
+        case STyKind::Float:
+        case STyKind::Str:
+        case STyKind::Exception:
+            return ground(t->kind, optflag);
+        default:
+            break;
+    }
+
+    STyRef c = alloc(t->kind);
+    c->opt = optflag;
+    c->elem = t->elem;
+    c->key = t->key;
+    c->val = t->val;
+    c->params = t->params;
+    c->param_opt = t->param_opt;
+    c->ret = t->ret;
+    c->struct_def = t->struct_def;
+    return c;
+}
+
+/* ----------------------------- resolve ----------------------------------- */
+
+STyRef sty_resolve(STyRef t)
+{
+    if (!t)
+        return t;
+
+    STyRef r = t;
+    while (r->kind == STyKind::Unknown && r->link)
+        r = r->link;
+
+    /* path compression */
+    while (t->kind == STyKind::Unknown && t->link && t->link != r) {
+        STyRef next = t->link;
+        t->link = r;
+        t = next;
+    }
+
+    return r;
+}
+
+/* ------------------------------ equality --------------------------------- */
+
+bool sty_equal(STyRef a, STyRef b)
+{
+    a = sty_resolve(a);
+    b = sty_resolve(b);
+
+    if (a == b)
+        return true;
+
+    if (a->kind != b->kind || a->opt != b->opt)
+        return false;
+
+    switch (a->kind) {
+
+        case STyKind::Unknown:
+            return false;                 /* distinct unbound variables */
+
+        case STyKind::Array:
+            return sty_equal(a->elem, b->elem);
+
+        case STyKind::Dict:
+            return sty_equal(a->key, b->key) && sty_equal(a->val, b->val);
+
+        case STyKind::Func:
+            if (a->params.size() != b->params.size())
+                return false;
+            if (a->param_opt != b->param_opt)
+                return false;
+            for (size_t i = 0; i < a->params.size(); i++)
+                if (!sty_equal(a->params[i], b->params[i]))
+                    return false;
+            return sty_equal(a->ret, b->ret);
+
+        case STyKind::Struct:
+            return a->struct_def == b->struct_def;
+
+        default:
+            return true;                  /* grounds with matching kind+opt */
+    }
+}
+
+/* ------------------------------- unify ----------------------------------- */
+
+static bool sty_occurs(STyRef var, STyRef t)
+{
+    t = sty_resolve(t);
+
+    if (t == var)
+        return true;
+
+    switch (t->kind) {
+        case STyKind::Array:
+            return sty_occurs(var, t->elem);
+        case STyKind::Dict:
+            return sty_occurs(var, t->key) || sty_occurs(var, t->val);
+        case STyKind::Func:
+            for (STyRef p : t->params)
+                if (sty_occurs(var, p))
+                    return true;
+            return sty_occurs(var, t->ret);
+        default:
+            return false;
+    }
+}
+
+bool sty_unify(STyRef a, STyRef b)
+{
+    a = sty_resolve(a);
+    b = sty_resolve(b);
+
+    if (a == b)
+        return true;
+
+    if (a->kind == STyKind::Unknown) {
+        if (sty_occurs(a, b))
+            return false;                 /* infinite type */
+        a->link = b;
+        return true;
+    }
+
+    if (b->kind == STyKind::Unknown) {
+        if (sty_occurs(b, a))
+            return false;
+        b->link = a;
+        return true;
+    }
+
+    /* unify is strict equality: no promotion, opt must match (promotion and
+     * nullability widening are the job of assignable()/join(), not unify()). */
+    if (a->kind != b->kind || a->opt != b->opt)
+        return false;
+
+    switch (a->kind) {
+
+        case STyKind::Array:
+            return sty_unify(a->elem, b->elem);
+
+        case STyKind::Dict:
+            return sty_unify(a->key, b->key) && sty_unify(a->val, b->val);
+
+        case STyKind::Func:
+            if (a->params.size() != b->params.size())
+                return false;
+            if (a->param_opt != b->param_opt)
+                return false;
+            for (size_t i = 0; i < a->params.size(); i++)
+                if (!sty_unify(a->params[i], b->params[i]))
+                    return false;
+            return sty_unify(a->ret, b->ret);
+
+        case STyKind::Struct:
+            return a->struct_def == b->struct_def;
+
+        default:
+            return true;
+    }
+}
+
+/* ---------------------------- assignable --------------------------------- */
+
+/* Underlying-kind compatibility, ignoring the opt flag. a and b are resolved
+ * and neither is Unknown, None, or Dyn. */
+static bool sty_same_underlying(STyRef a, STyRef b)
+{
+    if (a->kind != b->kind)
+        return false;
+
+    switch (a->kind) {
+
+        case STyKind::Array:
+            return sty_equal(a->elem, b->elem);
+
+        case STyKind::Dict:
+            return sty_equal(a->key, b->key) && sty_equal(a->val, b->val);
+
+        case STyKind::Func:
+            if (a->params.size() != b->params.size())
+                return false;
+            if (a->param_opt != b->param_opt)
+                return false;
+            for (size_t i = 0; i < a->params.size(); i++)
+                if (!sty_equal(a->params[i], b->params[i]))
+                    return false;
+            return sty_equal(a->ret, b->ret);
+
+        case STyKind::Struct:
+            return a->struct_def == b->struct_def;
+
+        default:
+            return true;                  /* Int/Float/Str/Exception */
+    }
+}
+
+bool sty_assignable(STyRef src, STyRef dst)
+{
+    src = sty_resolve(src);
+    dst = sty_resolve(dst);
+
+    if (src == dst)
+        return true;
+
+    if (dst->kind == STyKind::Dyn)
+        return true;                      /* anything fits dyn */
+
+    if (src->kind == STyKind::Dyn)
+        return false;                     /* dyn does not implicitly narrow */
+
+    /* An unconstrained variable on either side: defer to constraint solving. */
+    if (src->kind == STyKind::Unknown || dst->kind == STyKind::Unknown)
+        return true;
+
+    if (src->kind == STyKind::None)
+        return dst->opt || dst->kind == STyKind::None;
+
+    if (src->opt && !dst->opt)
+        return false;                     /* maybe-none into a non-null slot */
+
+    if (sty_same_underlying(src, dst))
+        return true;
+
+    if (src->kind == STyKind::Int && dst->kind == STyKind::Float)
+        return true;                      /* int promotes to float */
+
+    return false;
+}
+
+/* -------------------------------- join ----------------------------------- */
+
+STyRef STyArena::join(STyRef a, STyRef b)
+{
+    a = sty_resolve(a);
+    b = sty_resolve(b);
+
+    if (sty_equal(a, b))
+        return a;
+
+    if (a->kind == STyKind::Dyn || b->kind == STyKind::Dyn)
+        return g_dyn;
+
+    if (a->kind == STyKind::Unknown)
+        return b;
+    if (b->kind == STyKind::Unknown)
+        return a;
+
+    if (a->kind == STyKind::None)
+        return with_opt(b, true);
+    if (b->kind == STyKind::None)
+        return with_opt(a, true);
+
+    const bool anyopt = a->opt || b->opt;
+
+    const bool a_num = a->kind == STyKind::Int || a->kind == STyKind::Float;
+    const bool b_num = b->kind == STyKind::Int || b->kind == STyKind::Float;
+
+    if (a_num && b_num) {
+        const STyKind k =
+            (a->kind == STyKind::Float || b->kind == STyKind::Float)
+                ? STyKind::Float : STyKind::Int;
+        return ground(k, anyopt);
+    }
+
+    if (a->kind != b->kind)
+        return nullptr;                   /* irreconcilable conflict */
+
+    switch (a->kind) {
+
+        case STyKind::Str:
+        case STyKind::Exception:
+            return ground(a->kind, anyopt);
+
+        case STyKind::Array: {
+            STyRef ej = join(a->elem, b->elem);
+            if (!ej)
+                ej = g_dyn;               /* D1: mixed elements -> dyn */
+            return array_of(ej, anyopt);
+        }
+
+        case STyKind::Dict: {
+            STyRef kj = join(a->key, b->key);
+            if (!kj)
+                kj = g_dyn;
+            STyRef vj = join(a->val, b->val);
+            if (!vj)
+                vj = g_dyn;
+            return dict_of(kj, vj, anyopt);
+        }
+
+        case STyKind::Func:
+            /* Two differing function signatures have no useful LUB here; treat
+             * as a conflict (the caller can require an explicit `dyn`). */
+            return nullptr;
+
+        default:
+            return nullptr;
+    }
+}
+
+/* ----------------------------- to_string --------------------------------- */
+
+std::string sty_to_string(STyRef t)
+{
+    t = sty_resolve(t);
+
+    std::string s;
+    if (t->opt && t->kind != STyKind::None && t->kind != STyKind::Dyn)
+        s = "opt ";
+
+    switch (t->kind) {
+
+        case STyKind::Unknown:   return s + "?";
+        case STyKind::None:      return "none";
+        case STyKind::Int:       return s + "int";
+        case STyKind::Float:     return s + "float";
+        case STyKind::Str:       return s + "str";
+        case STyKind::Exception: return s + "exception";
+        case STyKind::Dyn:       return "dyn";
+
+        case STyKind::Array:
+            return s + "array<" + sty_to_string(t->elem) + ">";
+
+        case STyKind::Dict:
+            return s + "dict<" + sty_to_string(t->key) + "," +
+                   sty_to_string(t->val) + ">";
+
+        case STyKind::Func: {
+            std::string r = s + "func(";
+            for (size_t i = 0; i < t->params.size(); i++) {
+                if (i)
+                    r += ",";
+                if (i < t->param_opt.size() && t->param_opt[i])
+                    r += "opt ";
+                r += sty_to_string(t->params[i]);
+            }
+            r += ")->" + sty_to_string(t->ret);
+            return r;
+        }
+
+        case STyKind::Struct:
+            return s + "struct";
+    }
+
+    return s;
+}
