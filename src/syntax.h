@@ -32,6 +32,15 @@ enum class ConstructType {
 };
 
 /*
+ * Static-type hint stamped on an expression node by the type inferencer
+ * (inferencer.cpp) when its value is statically a non-null int or float. The
+ * specializer (specialize_types) uses it to rewrite hot scalar nodes into
+ * TypedScalarExpr and to drive typed-condition fast paths. `none` means "not a
+ * known non-null scalar" (the default; treated dynamically).
+ */
+enum class TypeHint : unsigned char { none, i, f };
+
+/*
  * Result of the name-resolution pass (resolver.cpp) for an Identifier.
  *
  * `local` means the identifier was resolved to a fixed slot in the current
@@ -61,6 +70,14 @@ public:
     bool is_const;
     Loc start;
     Loc end;
+
+    /*
+     * Set by the type inferencer when this expression is statically a non-null
+     * int/float; consumed by the specializer and typed-condition fast paths.
+     * Default `none`. Copied by copy_base_fields() so clones (the inliner)
+     * preserve it.
+     */
+    TypeHint th = TypeHint::none;
 
     /*
      * Set on nodes spliced in by function inlining: the "inlined-at" chain used
@@ -97,6 +114,17 @@ public:
     virtual EvalValue eval(EvalContext *ctx, bool rec = true) const;
 
     /*
+     * Typed (unboxed) evaluation, used by the M8 specializer. The default
+     * implementations box through eval()/RValue (and so work for any node), so
+     * a typed node may call eval_int()/eval_float() on an arbitrary child; the
+     * specialized nodes override them to compute directly, avoiding num_bin_op
+     * dispatch and intermediate EvalValue boxing. Only ever called on a node the
+     * inferencer proved is int/float (a get<>() mismatch otherwise throws).
+     */
+    virtual int_type eval_int(EvalContext *ctx) const;
+    virtual float_type eval_float(EvalContext *ctx) const;
+
+    /*
      * Deep-clone this subtree: a faithful copy (children, locs, is_const,
      * inline_ctx, and any resolved/slot state). Pure virtual, so every concrete
      * node MUST implement it - a missing one is a compile error. Leaf clones
@@ -113,6 +141,7 @@ protected:
         d.start = start;
         d.end = end;
         d.inline_ctx = inline_ctx;
+        d.th = th;
     }
 };
 
@@ -243,6 +272,11 @@ public:
         return value;
     }
 
+    int_type eval_int(EvalContext *ctx) const override { return value; }
+    float_type eval_float(EvalContext *ctx) const override {
+        return static_cast<float_type>(value);
+    }
+
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -263,6 +297,8 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;
     }
+
+    float_type eval_float(EvalContext *ctx) const override { return value; }
 
     void serialize(ostream &s, int level = 0) const override;
 
@@ -472,6 +508,8 @@ public:
     std::string_view get_str() const { return uid->val; }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    int_type eval_int(EvalContext *ctx) const override;
+    float_type eval_float(EvalContext *ctx) const override;
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<Identifier>(get_str());
@@ -649,6 +687,41 @@ public:
         auto c = make_unique<Expr12>();
         copy_base_fields(*c);
         clone_ops_into(*c);
+        return c;
+    }
+};
+
+/*
+ * A specialized scalar expression, produced by the M8 type specializer
+ * (specialize_types, inferencer.cpp) from a generic Expr03/04/06/07/11/12/02
+ * whose operands the inferencer proved are int/float. It evaluates through
+ * eval_int()/eval_float() with no num_bin_op promotion dispatch, no PMF virtual
+ * call, and no intermediate EvalValue boxing - the tree-walker's speed payoff.
+ * `kind` is the operand/result kind (i or f). `cat` selects the operation
+ * family; `elems` mirrors MultiOpConstruct (the leading op is Op::invalid).
+ */
+class TypedScalarExpr final: public Construct {
+
+public:
+    enum class Cat : unsigned char { arith, cmp, logical, neg, lnot };
+
+    Cat cat;
+    TypeHint kind;     /* operand kind (i/f); result is `kind` except cmp/lnot */
+    std::vector<std::pair<Op, unique_ptr<Construct>>> elems;
+
+    TypedScalarExpr(Cat cat, TypeHint kind)
+        : Construct("TypedScalarExpr"), cat(cat), kind(kind) { }
+
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    int_type eval_int(EvalContext *ctx) const override;
+    float_type eval_float(EvalContext *ctx) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<TypedScalarExpr>(cat, kind);
+        copy_base_fields(*c);
+        for (const auto &pr : elems)
+            c->elems.emplace_back(pr.first, clone_as(pr.second));
         return c;
     }
 };

@@ -5096,6 +5096,7 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
         root = pBlock(pCtx);
         infer_types(root.get());
         resolve_names(root.get());
+        specialize_types(root.get());
         root->eval(nullptr);
 
     } catch (const Exception &e) {

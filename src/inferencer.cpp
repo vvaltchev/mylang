@@ -132,6 +132,7 @@ private:
 
     /* check pass */
     void check(Construct *n);
+    void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
     void check_call(CallExpr *call);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
                       bool arith);
@@ -378,6 +379,26 @@ void Inferencer::run()
     cur_func = nullptr;
     for (auto &e : rootBlock->elems)
         check(e.get());
+
+    /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
+    for (auto &e : rootBlock->elems)
+        annotate_hints(e.get());
+}
+
+void Inferencer::annotate_hints(Construct *n)
+{
+    if (!n)
+        return;
+
+    STyRef t = sty_resolve(type_of(n));
+    if (!t->opt) {
+        if (t->kind == STyKind::Int)
+            n->th = TypeHint::i;
+        else if (t->kind == STyKind::Float)
+            n->th = TypeHint::f;
+    }
+
+    for_each_child(n, [&](Construct *c) { annotate_hints(c); });
 }
 
 void Inferencer::hoist_globals(Block *rootBlock)
@@ -1478,6 +1499,203 @@ void Inferencer::check_call(CallExpr *call)
     }
 }
 
+/* ============================ M8 specializer ============================= */
+
+/* All operands of a MultiOpConstruct are statically scalar? `allow_float` also
+ * accepts float operands (for a float-result op / a float comparison). */
+static bool ops_scalar(const MultiOpConstruct *mo, bool allow_float)
+{
+    for (const auto &pr : mo->elems) {
+        const TypeHint t = pr.second->th;
+        if (t == TypeHint::i)
+            continue;
+        if (t == TypeHint::f && allow_float)
+            continue;
+        return false;
+    }
+    return true;
+}
+
+/* Build a TypedScalarExpr, moving `mo`'s operands in, copying loc/th. */
+static unique_ptr<Construct>
+make_typed(TypedScalarExpr::Cat cat, TypeHint kind, TypeHint result_th,
+           MultiOpConstruct *mo)
+{
+    auto t = std::make_unique<TypedScalarExpr>(cat, kind);
+    t->start = mo->start;
+    t->end = mo->end;
+    t->is_const = mo->is_const;
+    t->th = result_th;
+    t->elems = std::move(mo->elems);
+    return t;
+}
+
+/* Rewrite a single node into a TypedScalarExpr when its operands are statically
+ * int/float; else return it unchanged. Children are already specialized. */
+static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
+{
+    /* arithmetic: Expr03 (* / %), Expr04 (+ -) */
+    if (dynamic_cast<Expr03 *>(n.get()) || dynamic_cast<Expr04 *>(n.get())) {
+        auto *mo = static_cast<MultiOpConstruct *>(n.get());
+        if (n->th == TypeHint::i && ops_scalar(mo, false))
+            return make_typed(TypedScalarExpr::Cat::arith, TypeHint::i,
+                              TypeHint::i, mo);
+        if (n->th == TypeHint::f && ops_scalar(mo, true))
+            return make_typed(TypedScalarExpr::Cat::arith, TypeHint::f,
+                              TypeHint::f, mo);
+        return n;
+    }
+
+    /* comparison: Expr06 (< > <= >=), Expr07 (== !=). Only the simple
+     * two-operand form (the overwhelmingly common case). Result is int. */
+    if (dynamic_cast<Expr06 *>(n.get()) || dynamic_cast<Expr07 *>(n.get())) {
+        auto *mo = static_cast<MultiOpConstruct *>(n.get());
+        if (mo->elems.size() == 2 && ops_scalar(mo, true)) {
+            const bool anyf = mo->elems[0].second->th == TypeHint::f ||
+                              mo->elems[1].second->th == TypeHint::f;
+            return make_typed(TypedScalarExpr::Cat::cmp,
+                              anyf ? TypeHint::f : TypeHint::i,
+                              TypeHint::i, mo);
+        }
+        return n;
+    }
+
+    /* logical: Expr11 (&&), Expr12 (||). Int operands, int result. */
+    if (dynamic_cast<Expr11 *>(n.get()) || dynamic_cast<Expr12 *>(n.get())) {
+        auto *mo = static_cast<MultiOpConstruct *>(n.get());
+        if (ops_scalar(mo, false))
+            return make_typed(TypedScalarExpr::Cat::logical, TypeHint::i,
+                              TypeHint::i, mo);
+        return n;
+    }
+
+    /* unary: Expr02 (+ - !), exactly one operand (elems[0]). */
+    if (dynamic_cast<Expr02 *>(n.get())) {
+        auto *mo = static_cast<MultiOpConstruct *>(n.get());
+        if (mo->elems.size() != 1)
+            return n;
+        const Op op = mo->elems[0].first;
+        const TypeHint ot = mo->elems[0].second->th;
+
+        if (op == Op::invalid || op == Op::plus) {
+            /* pass-through / unary + : unwrap to the operand */
+            if (ot == TypeHint::i || ot == TypeHint::f)
+                return std::move(mo->elems[0].second);
+            return n;
+        }
+        if (op == Op::minus && (ot == TypeHint::i || ot == TypeHint::f))
+            return make_typed(TypedScalarExpr::Cat::neg, ot, ot, mo);
+        if (op == Op::lnot && ot == TypeHint::i)
+            return make_typed(TypedScalarExpr::Cat::lnot, TypeHint::i,
+                              TypeHint::i, mo);
+        return n;
+    }
+
+    return n;
+}
+
+static unique_ptr<Construct> specialize(unique_ptr<Construct> n);
+
+/* Recurse into every unique_ptr<Construct> child, specializing it in place. */
+static void specialize_children(Construct *n)
+{
+    if (auto *e = dynamic_cast<Expr14 *>(n)) {
+        e->lvalue = specialize(std::move(e->lvalue));
+        e->rvalue = specialize(std::move(e->rvalue));
+        return;
+    }
+    if (auto *c = dynamic_cast<CallExpr *>(n)) {
+        c->what = specialize(std::move(c->what));
+        for (auto &a : c->args->elems)
+            a = specialize(std::move(a));
+        return;
+    }
+    if (auto *m = dynamic_cast<MemberExpr *>(n)) {
+        m->what = specialize(std::move(m->what));
+        return;
+    }
+    if (auto *s = dynamic_cast<Subscript *>(n)) {
+        s->what = specialize(std::move(s->what));
+        s->index = specialize(std::move(s->index));
+        return;
+    }
+    if (auto *s = dynamic_cast<Slice *>(n)) {
+        s->what = specialize(std::move(s->what));
+        if (s->start_idx) s->start_idx = specialize(std::move(s->start_idx));
+        if (s->end_idx)   s->end_idx = specialize(std::move(s->end_idx));
+        return;
+    }
+    if (auto *i = dynamic_cast<IfStmt *>(n)) {
+        i->condExpr = specialize(std::move(i->condExpr));
+        i->thenBlock = specialize(std::move(i->thenBlock));
+        if (i->elseBlock) i->elseBlock = specialize(std::move(i->elseBlock));
+        return;
+    }
+    if (auto *w = dynamic_cast<WhileStmt *>(n)) {
+        w->condExpr = specialize(std::move(w->condExpr));
+        if (w->body) w->body = specialize(std::move(w->body));
+        return;
+    }
+    if (auto *f = dynamic_cast<ForStmt *>(n)) {
+        if (f->init) f->init = specialize(std::move(f->init));
+        if (f->cond) f->cond = specialize(std::move(f->cond));
+        if (f->inc)  f->inc = specialize(std::move(f->inc));
+        if (f->body) f->body = specialize(std::move(f->body));
+        return;
+    }
+    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+        fe->container = specialize(std::move(fe->container));
+        if (fe->body) fe->body = specialize(std::move(fe->body));
+        return;
+    }
+    if (auto *t = dynamic_cast<TryCatchStmt *>(n)) {
+        if (t->tryBody) t->tryBody = specialize(std::move(t->tryBody));
+        for (auto &cs : t->catchStmts)
+            if (cs.second) cs.second = specialize(std::move(cs.second));
+        if (t->finallyBody)
+            t->finallyBody = specialize(std::move(t->finallyBody));
+        return;
+    }
+    if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
+        if (r->elem) r->elem = specialize(std::move(r->elem));
+        return;
+    }
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        if (fd->body) fd->body = specialize(std::move(fd->body));
+        return;
+    }
+    if (auto *ld = dynamic_cast<LiteralDict *>(n)) {
+        for (auto &kv : ld->elems) {
+            kv->key = specialize(std::move(kv->key));
+            kv->value = specialize(std::move(kv->value));
+        }
+        return;
+    }
+    if (auto *sc = dynamic_cast<SingleChildConstruct *>(n)) {
+        if (sc->elem) sc->elem = specialize(std::move(sc->elem));
+        return;
+    }
+    if (auto *mo = dynamic_cast<MultiOpConstruct *>(n)) {
+        for (auto &pr : mo->elems)
+            pr.second = specialize(std::move(pr.second));
+        return;
+    }
+    if (auto *me = dynamic_cast<MultiElemConstruct<> *>(n)) {
+        /* Block, LiteralArray, ExprList */
+        for (auto &e : me->elems)
+            e = specialize(std::move(e));
+        return;
+    }
+}
+
+static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
+{
+    if (!n)
+        return n;
+    specialize_children(n.get());     /* bottom-up: children first */
+    return try_specialize(std::move(n));
+}
+
 }  /* anonymous namespace */
 
 void infer_types(Construct *root, bool enable)
@@ -1487,4 +1705,17 @@ void infer_types(Construct *root, bool enable)
 
     Inferencer inf(root);
     inf.run();
+}
+
+void specialize_types(Construct *root, bool enable)
+{
+    if (!enable || !root)
+        return;
+
+    auto *blk = dynamic_cast<Block *>(root);
+    if (!blk)
+        return;
+
+    for (auto &e : blk->elems)
+        e = specialize(std::move(e));
 }
