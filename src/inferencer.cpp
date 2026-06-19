@@ -55,6 +55,7 @@ struct TypeSym {
     bool opt_decl = false;
     bool is_param = false;
     bool const_decl = false;   /* declared `const` (vs `var`) */
+    bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
     Loc decl_loc;
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
 };
@@ -383,24 +384,42 @@ void Inferencer::run()
         if (s->dyn_decl)
             s->type = A.dyn_ty();
         else if (is_unknown(s->type))
-            s->type = s->is_param ? A.dyn_ty() : A.none_ty();
+            /* An unconstrained PARAM (never concretely called) or foreach
+             * loop var (container was Unknown/dyn) is `dyn` - it could be
+             * anything. A plain unconstrained local is `none`. */
+            s->type = (s->is_param || s->is_loopvar) ? A.dyn_ty()
+                                                     : A.none_ty();
         if (s->opt_decl && !s->dyn_decl)
             s->type = A.with_opt(s->type, true);
     }
     for (auto &up : all_funcs) {
+        /*
+         * An Unknown return means the function has return statement(s) whose
+         * value never resolved to a concrete type - it depends on unconstrained
+         * (effectively dyn) inputs, e.g. a function only ever passed as a value
+         * (never directly called, so its params stay Unknown). That is `dyn`,
+         * not `none`. A function with no value-returning path contributes
+         * `none` to ret_acc, so its return is `none` here, not Unknown - this
+         * branch doesn't touch it.
+         */
         if (is_unknown(up->ret))
-            up->ret = A.none_ty();
+            up->ret = A.dyn_ty();
     }
-
-    /* Mandatory-`dyn` rule: a plain var/const must have a concrete type. */
-    if (strict_dyn)
-        enforce_concrete_decls();
 
     cur_func = nullptr;
     narrowing_on = true;
     for (auto &e : rootBlock->elems)
         check(e.get());
     narrowing_on = false;
+
+    /*
+     * Mandatory-`dyn` rule: a plain var/const must have a concrete type. Run it
+     * AFTER the check pass so that a var which is dyn *because of* a real type
+     * error (e.g. `-none`, subscripting a non-container) surfaces that error
+     * first, instead of being masked by DynRequiredEx.
+     */
+    if (strict_dyn)
+        enforce_concrete_decls();
 
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
     for (auto &e : rootBlock->elems)
@@ -446,9 +465,11 @@ void Inferencer::enforce_concrete_decls()
         TypeSym *s = up.get();
 
         /* Skip: explicitly `dyn`, function names, params (a never-called func's
-         * param is legitimately `dyn` and has no `var` to annotate), and
-         * builtins (no decl loc). */
-        if (s->dyn_decl || s->func || s->is_param || !s->decl_loc)
+         * param is legitimately `dyn` and has no `var` to annotate), foreach
+         * loop vars (their type is derived from the container, which carries
+         * any `dyn`), and builtins (no decl loc). */
+        if (s->dyn_decl || s->func || s->is_param || s->is_loopvar ||
+            !s->decl_loc)
             continue;
 
         if (!type_has_dyn(s->type, strict_deep))
@@ -668,10 +689,13 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         walk_struct(fe->container.get(), s);
         if (fe->ids)
             for (auto &id : fe->ids->elems) {
-                if (fe->idsVarDecl)
-                    id_sym[id.get()] = new_sym(id->uid, inner, id->start);
-                else
+                if (fe->idsVarDecl) {
+                    TypeSym *sym = new_sym(id->uid, inner, id->start);
+                    sym->is_loopvar = true;   /* type derived from container */
+                    id_sym[id.get()] = sym;
+                } else {
                     id_sym[id.get()] = lookup(s, id->uid);
+                }
             }
         walk_struct(fe->body.get(), inner);
         return;
@@ -835,7 +859,16 @@ STyRef Inferencer::type_of(const Construct *e)
             }
             return s->type;
         }
-        return A.dyn_ty();    /* builtin used as value, or unresolved (Q4) */
+        /*
+         * Not a declared symbol: a builtin used as a value is genuinely dynamic
+         * (a function-ish handle), but a truly-undefined identifier defers to
+         * Unknown - it is an UndefinedVariableEx at runtime, and typing it dyn
+         * would make the enclosing `var` spuriously require `dyn` and mask that
+         * runtime error.
+         */
+        if (is_builtin(id->uid))
+            return A.dyn_ty();
+        return bottom;
     }
 
     if (auto *e1 = dynamic_cast<const Expr01 *>(e))
@@ -878,7 +911,9 @@ STyRef Inferencer::type_of(const Construct *e)
                 return A.dyn_ty();
             if (!s && is_builtin(cid->uid))
                 return builtin_result(cid->uid, call->args.get());
-            return A.dyn_ty();
+            /* unresolved callee: defer (an UndefinedVariableEx at runtime), so
+             * the enclosing var isn't forced to `dyn`, masking that error. */
+            return bottom;
         }
         STyRef ct = type_of(callee);
         if (is_unknown(sty_resolve(ct))) return bottom;   /* defer */
@@ -948,6 +983,12 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
     if (op == Op::eq || op == Op::noteq || op == Op::lt || op == Op::gt ||
         op == Op::le || op == Op::ge || op == Op::land || op == Op::lor)
         return A.int_ty();
+
+    /* `str + anything` stringifies the RHS and yields str - even a dyn/none RHS
+     * (so a `s = s + e` accumulator over a dyn element stays str). Handle it
+     * before the dyn short-circuit below. */
+    if (op == Op::plus && strip(a)->kind == STyKind::Str)
+        return A.str_ty();
 
     if (is_dyn(a) || is_dyn(b))
         return A.dyn_ty();
@@ -1128,6 +1169,14 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         STyRef d = sty_resolve(arg(0));
         if (is_unknown(d)) return bottom;   /* defer */
         return A.array_of(d->kind == STyKind::Dict ? d->val : A.dyn_ty());
+    }
+    if (n == "kvpairs") {
+        /* dict<k,v> -> array of [k, v] pairs, i.e. array<array<join(k,v)>>. */
+        STyRef d = sty_resolve(arg(0));
+        if (is_unknown(d)) return bottom;   /* defer */
+        if (d->kind != STyKind::Dict) return A.array_of(A.dyn_ty());
+        STyRef pair = A.join(d->key, d->val);
+        return A.array_of(A.array_of(pair ? pair : A.dyn_ty()));
     }
     if (n == "find") {
         /*
@@ -1713,7 +1762,7 @@ void Inferencer::check(Construct *n)
             STyRef t = type_of(e2->elems[0].second.get());
             require_nonopt(t, n->start, n->end, "with a unary +/-");
             STyRef u = strip(sty_resolve(t));
-            if (!is_dyn(u) && !is_num(u))
+            if (!is_dyn(u) && !is_unknown(u) && !is_num(u))
                 mismatch("unary +/- needs a number, got '" + sty_to_string(t) +
                              "'", n->start, n->end);
         }
@@ -1727,7 +1776,7 @@ void Inferencer::check(Construct *n)
         require_nonopt(w, sub->what->start, sub->what->end,
                        "as a subscript base");
         STyRef wr = strip(sty_resolve(w));
-        if (!is_dyn(wr) && wr->kind != STyKind::Array &&
+        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != STyKind::Array &&
             wr->kind != STyKind::Dict && wr->kind != STyKind::Str)
             mismatch("type '" + sty_to_string(w) + "' is not subscriptable",
                      sub->what->start, sub->what->end);
@@ -1741,10 +1790,23 @@ void Inferencer::check(Construct *n)
         STyRef w = type_of(sl->what.get());
         require_nonopt(w, sl->what->start, sl->what->end, "as a slice base");
         STyRef wr = strip(sty_resolve(w));
-        if (!is_dyn(wr) && wr->kind != STyKind::Array &&
+        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != STyKind::Array &&
             wr->kind != STyKind::Str)
             mismatch("type '" + sty_to_string(w) + "' is not sliceable",
                      sl->what->start, sl->what->end);
+        return;
+    }
+
+    if (auto *mem = dynamic_cast<MemberExpr *>(n)) {
+        check(mem->what.get());
+        STyRef w = type_of(mem->what.get());
+        require_nonopt(w, mem->what->start, mem->what->end,
+                       "as a member-access base");
+        STyRef wr = strip(sty_resolve(w));
+        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != STyKind::Dict)
+            mismatch("type '" + sty_to_string(w) +
+                         "' has no members (only a dict does)",
+                     mem->what->start, mem->what->end);
         return;
     }
 

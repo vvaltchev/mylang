@@ -446,7 +446,7 @@ static const std::vector<test> tests =
     {
         "assign builtins to vars",
         {
-            "var a = len;\n",
+            "var dyn a = len;\n",   /* a builtin handle is dynamically typed */
             "assert(a(\"hello\") == 5);",
         },
     },
@@ -1896,7 +1896,7 @@ static const std::vector<test> tests =
     { "foreach over a non-iterable is a type error",
       { "var n = 5; foreach (var x in n) { }" }, &typeid(TypeErrorEx) },
     { "member access on a non-dict is a type error",
-      { "var x = 5; var y = x.foo;" }, &typeid(TypeErrorEx) },
+      { "var x = 5; var y = x.foo;" }, &typeid(TypeMismatchEx) },
     { "duplicate declaration in the same block is rejected",
       { "var x = 1; var x = 2;" }, &typeid(AlreadyDefinedEx) },
     {
@@ -2163,7 +2163,7 @@ static const std::vector<test> tests =
             "assert(n == 2);",
 
             "n = 0; var dyn s = str(rand(0, 0));",
-            "try { try { var q = 5 + s; }",
+            "try { try { var dyn q = 5 + s; }",
             "  catch (TypeErrorEx as e) { n += 1; rethrow; } }",
             "catch (TypeErrorEx) { n += 1; }",
             "assert(n == 2);",
@@ -2745,7 +2745,7 @@ static const std::vector<test> tests =
             "var a = 6;",
             "var b = 0;",
             "var ok = 0;",
-            "try { var c = a / runtime(b); assert(0); }",
+            "try { var dyn c = a / runtime(b); assert(0); }",
             "catch (DivisionByZeroEx) { ok = 1; }",
             "assert(ok == 1);",
         },
@@ -2758,7 +2758,7 @@ static const std::vector<test> tests =
         {
             "var a = 6;",
             "var b = 0;",
-            "var c = runtime(a / b);",
+            "var dyn c = runtime(a / b);",
         },
         &typeid(DivisionByZeroEx),
     },
@@ -2768,7 +2768,7 @@ static const std::vector<test> tests =
         "auto-const: runtime() is the identity at run time",
         {
             "assert(runtime(5) == 5);",
-            "var a = runtime(3) + 4;",
+            "var dyn a = runtime(3) + 4;",
             "assert(a == 7);",
         },
     },
@@ -2811,7 +2811,7 @@ static const std::vector<test> tests =
         {
             "const c = 5;",
             "var v = 7;",              // write-once -> auto-const
-            "var r = runtime(9);",     // barrier -> not const
+            "var dyn r = runtime(9);", // barrier -> not const (and dynamic)
             "assert(isconst(c) && isconstdecl(c));",
             "assert(isconst(v) && !isconstdecl(v));",
             "assert(!isconst(r) && !isconstdecl(r));",
@@ -2886,13 +2886,15 @@ static const std::vector<test> tests =
     },
     {
         "err loc: type error marks the offending operand",
-        { "var s = 5; var c = s + runtime(\"x\");" },
-        &typeid(TypeErrorEx), 24, 0, 37, 0,
+        /* `c` is dynamic (a runtime() result), so it must be declared `dyn`;
+         * that shifts the caret columns right by 4. */
+        { "var s = 5; var dyn c = s + runtime(\"x\");" },
+        &typeid(TypeErrorEx), 28, 0, 41, 0,
     },
     {
         "err loc: division by zero marks the divisor",
-        { "var s = 100; var c = s / runtime(0);" },
-        &typeid(DivisionByZeroEx), 26, 0, 37, 0,
+        { "var s = 100; var dyn c = s / runtime(0);" },
+        &typeid(DivisionByZeroEx), 30, 0, 41, 0,
     },
     {
         "err loc: calling a defined non-function is a type error",
@@ -3131,7 +3133,7 @@ static const std::vector<test> tests =
     {
         "Throw (custom) exception with data",
         {
-            "var c = 0;",
+            "var dyn c = 0;",   /* exdata() yields a dynamic payload */
             "try {",
             "   throw exception(\"myerr\", 1234);",
             "} catch (myerr as e) {",
@@ -3144,7 +3146,7 @@ static const std::vector<test> tests =
     {
         "Re-throw (custom) exception with data",
         {
-            "var c1, c2 = 0;",
+            "var dyn c1, c2 = 0;",   /* exdata() payloads are dynamic */
             "try {",
             "   try {",
             "       throw ex(\"myerr\", 1234);",
@@ -5221,6 +5223,25 @@ static const std::vector<test> tests =
         "var s=0; foreach (var x in a) s += x; assert(s == 10);" } },
     { "ti reject: typed-int use of an un-narrowed opt is still caught",
       { "func f(opt x) => x + 1; f(3);" }, &typeid(NullabilityEx) },
+
+    /* ---- mandatory `dyn`: a plain var/const must infer a concrete type -- */
+    { "ti: mandatory dyn - a plain var inferred dyn is rejected",
+      { "var x = runtime(5);" }, &typeid(DynRequiredEx) },
+    { "ti: mandatory dyn - declaring it `dyn` is accepted",
+      { "var dyn x = runtime(5); assert(x == 5);" } },
+    { "ti: mandatory dyn - a var reassigned to a conflicting type is rejected",
+      /* the join conflict surfaces as a TypeMismatchEx, not DynRequiredEx */
+      { "var x = 1; x = \"s\";" }, &typeid(TypeMismatchEx) },
+    { "ti: mandatory dyn - `dyn` allows the conflicting reassignment",
+      { "var dyn x = 1; x = \"s\"; assert(x == \"s\");" } },
+    { "ti: mandatory dyn - an int accumulator stays concrete (no dyn needed)",
+      { "var s = 0; var a = range(5);",
+        "foreach (var e in a) s += e; assert(s == 10);" } },
+    { "ti: mandatory dyn - array<dyn> is tolerated under plain var (Phase A)",
+      { "var a = [1, \"x\"]; assert(len(a) == 2);" } },
+    { "ti: mandatory dyn - a foreach loop var is exempt (type is derived)",
+      { "var dyn d = [1, \"x\"]; var n = 0;",
+        "foreach (var e in d) n += 1; assert(n == 2);" } },
 };
 
 static void

@@ -21,7 +21,7 @@ class Construct;
  * owns its own type arena and side tables and stores nothing on the AST, so it
  * leaves the tree untouched for resolve_names / evaluation.
  */
-void infer_types(Construct *root, bool enable = true, bool strict = false);
+void infer_types(Construct *root, bool enable = true, bool strict = true);
 
 /*
  * --debug-ti: run inference (non-strict) and dump every declared identifier's
