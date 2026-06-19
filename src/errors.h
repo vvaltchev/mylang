@@ -204,6 +204,17 @@ struct DynRequiredEx : public Exception {
         : Exception("DynRequiredEx", m, start, end) { }
 };
 
+/*
+ * A parameter that can receive `none` must be declared `opt` (the param
+ * analogue of the mandatory-`dyn` rule; see the inferencer's
+ * enforce_nonnull_params). Compile-time, uncatchable.
+ */
+struct OptRequiredEx : public Exception {
+    OptRequiredEx(const char *m = "Parameter requires an explicit 'opt'",
+                  Loc start = Loc(), Loc end = Loc())
+        : Exception("OptRequiredEx", m, start, end) { }
+};
+
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")

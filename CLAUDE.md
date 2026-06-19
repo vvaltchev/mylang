@@ -628,7 +628,9 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
 - **Inference rules of note** (the non-obvious ones): a never-(concretely-)
   called function's parameter finalizes to `Dyn` (its body must still
   type-check), while an unconstrained *local* finalizes to `None`. Param
-  nullability is *declared* (`opt`); local/return nullability is *inferred*
+  nullability is *declared* (`opt`) **and enforced**: the mandatory-`opt` rule
+  errors if a non-opt param can actually receive `none` (see below).
+  Local/return nullability is *inferred*
   (`None` joined with a concrete `T` is `opt T`). `runtime(x)` returns `Dyn`
   (its documented opt-out: it defers to runtime). `==`/`!=` are always
   well-typed (→ int); ordering is numeric-or-string. `str + anything` → str.
@@ -646,7 +648,8 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   `RuntimeException`s, so script `try/catch` cannot catch them; `errors.h`):
   `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),
   `NullabilityEx` (`none`/`opt` used where a non-opt value is required),
-  `WrongArgCountEx` (arity), `DynRequiredEx` (the mandatory-`dyn` rule below).
+  `WrongArgCountEx` (arity), `DynRequiredEx` (the mandatory-`dyn` rule below),
+  `OptRequiredEx` (the mandatory-`opt` rule for params, below).
   Each carries an interned custom message + a `Loc`.
 - **Mandatory `dyn`** (`enforce_concrete_decls`, ON by default via
   `infer_types(strict=true)`, off under `-nti`): a plain `var`/`const` must
@@ -657,6 +660,22 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   `dyn`), foreach loop vars (type derived from the container), and func names.
   Runs **after** the check pass, so a var that is `dyn` *because of* a real type
   error surfaces that error first. See `plans/type-driven-specialization.md`.
+- **Mandatory `opt` for params** (`enforce_nonnull_params`, same gate/timing as
+  mandatory-`dyn`): a parameter that can receive `none` from *some* call path,
+  if not declared `opt` (and not `dyn`), throws `OptRequiredEx` **at the param's
+  declaration** ("declare it 'opt'"). The check pass sets `TypeSym::
+  received_optish` when a possibly-none argument reaches a non-opt, non-dyn
+  param (`check_call`), and this rule turns that into the declaration-site error
+  — so nullability is *proven* (a non-opt param is guaranteed never `none`, body
+  uses it without a check), not merely checked per call site. A call to a
+  function *value* (no decl to point at) still reports the old per-call
+  `NullabilityEx`. The nullability analogue of mandatory-`dyn`; see
+  `[[nullability-opt-roadmap]]`. **A dict read is nullable:** `type_of` types
+  `d[k]` / `d.k` (Subscript/MemberExpr on a `Dict`) as **`opt V`** — a dict read
+  can miss (auto-vivifies to `none`); a `const` dict with a known key already
+  folded to a literal before inference, so a *surviving* dict read is genuinely
+  nullable and must be narrowed. (Auto-vivification is slated for removal with
+  user-defined types; a future `get(dict,key)` builtin will return `opt V` too.)
 - **The defer-on-Unknown/None invariant (soundness of the fixpoint).** Any type
   computation (`binop_result`, `unary_result`, `elem_of`, `type_of` of
   Subscript/Slice/Member/CallExpr-callee, `accumulate_foreach`) that meets an
@@ -1089,7 +1108,8 @@ and two macros:
   `CannotRebindConstEx`, `ExpressionIsNotConstEx`, …). **Not catchable** from
   script.
 - **Compile-time type errors** (`TypeMismatchEx`, `NullabilityEx`,
-  `WrongArgCountEx`, `DynRequiredEx`) — thrown by the type inferencer (see
+  `WrongArgCountEx`, `DynRequiredEx`, `OptRequiredEx`) — from the inferencer
+  (see
   "Static type inference"). Plain `Exception`s (not `RuntimeException`s), so
   **not catchable** from script; each carries a custom interned message + `Loc`.
   A statically provable type error is reported here, before the program runs.

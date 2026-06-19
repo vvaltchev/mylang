@@ -12,7 +12,10 @@ var N = 1000000 * scale;
 var s = 0;
 
 for (var i = 0; i < N; i += 1) {
-    s += d[i % M];
+    # a dict read is statically nullable (opt); narrow before using it
+    var v = d[i % M];
+    if (v != none)
+        s += v;
     s = s % 1000000007;
 }
 

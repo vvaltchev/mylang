@@ -57,6 +57,11 @@ struct TypeSym {
     bool is_param = false;
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
+    /* A param that received a possibly-none (opt/none) argument at some call
+     * site (set in the check pass). With strict_dyn on, a non-opt non-dyn param
+     * with this set is a compile error demanding `opt` (enforce_nonnull_params,
+     * the param analogue of the mandatory-`dyn` rule). */
+    bool received_optish = false;
     Loc decl_loc;
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
 };
@@ -124,6 +129,7 @@ private:
     void declare_funcdecl(FuncDeclStmt *fd, Scope *s);
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
+    void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(STyRef t, bool deep);
 
     /* type computation (reads stable `type`) */
@@ -421,8 +427,10 @@ void Inferencer::run()
      * error (e.g. `-none`, subscripting a non-container) surfaces that error
      * first, instead of being masked by DynRequiredEx.
      */
-    if (strict_dyn)
+    if (strict_dyn) {
         enforce_concrete_decls();
+        enforce_nonnull_params();
+    }
 
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
     for (auto &e : rootBlock->elems)
@@ -486,6 +494,35 @@ void Inferencer::enforce_concrete_decls()
                 "'; declare it 'dyn' (e.g. '" +
                 (s->const_decl ? "const dyn " : "var dyn ") +
                 std::string(s->name->val) + " = ...')"),
+            s->decl_loc, s->decl_loc);
+    }
+}
+
+/*
+ * Mandatory-`opt` rule for parameters (the nullability analogue of
+ * enforce_concrete_decls): a parameter that can receive `none` from some call
+ * path must be declared `opt`. `received_optish` was set in the check pass when
+ * a possibly-none argument reached a non-opt, non-dyn parameter; here we turn
+ * that into a compile error at the param's declaration, so nullability is
+ * *proven* (a non-opt param is guaranteed never none) rather than only
+ * checked per call site. Skips `dyn` params (the opt-out) and params with no
+ * decl loc. Runs after the check pass so a genuine type error surfaces first.
+ */
+void Inferencer::enforce_nonnull_params()
+{
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+
+        if (!s->is_param || s->opt_decl || s->dyn_decl || !s->decl_loc)
+            continue;
+        if (!s->received_optish)
+            continue;
+
+        throw OptRequiredEx(
+            intern_msg(
+                "parameter '" + std::string(s->name->val) +
+                "' may be none; declare it 'opt' (e.g. 'opt " +
+                std::string(s->name->val) + "')"),
             s->decl_loc, s->decl_loc);
     }
 }
@@ -1007,7 +1044,10 @@ STyRef Inferencer::type_of(const Construct *e)
          * non-subscriptable base is caught in the check pass. */
         if (is_unknown(w) || is_none(w)) return bottom;
         if (w->kind == STyKind::Array) return w->elem;
-        if (w->kind == STyKind::Dict)  return w->val;
+        /* A dict read can miss (returns none); a const dict with a known key
+         * already folded to a literal before inference, so a surviving dict
+         * subscript is genuinely nullable -> opt val. */
+        if (w->kind == STyKind::Dict)  return A.with_opt(w->val, true);
         if (w->kind == STyKind::Str)   return A.str_ty();
         return A.dyn_ty();
     }
@@ -1023,8 +1063,11 @@ STyRef Inferencer::type_of(const Construct *e)
     if (auto *mem = dynamic_cast<const MemberExpr *>(e)) {
         STyRef w = sty_resolve(type_of(mem->what.get()));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
+        /* `d.key` can miss (auto-vivifies to none); a const dict with a known
+         * key already folded to a literal before inference, so a surviving
+         * member read is genuinely nullable -> opt val. */
         if (w->kind == STyKind::Dict)
-            return w->val;
+            return A.with_opt(w->val, true);
         return A.dyn_ty();
     }
 
@@ -2020,10 +2063,21 @@ void Inferencer::check_call(CallExpr *call)
         if (p_dyn || is_dyn(at))
             continue;
 
-        if (!p_opt && is_optish(at))
-            nullability("argument " + std::to_string(i + 1) +
-                            " may be none but the parameter is not 'opt'",
-                        anode->start, anode->end);
+        if (!p_opt && is_optish(at)) {
+            /*
+             * A possibly-none argument reaches a non-opt parameter. For a named
+             * function we have the param's decl: record it and report the
+             * forcing error at the declaration ("declare it opt"), like the
+             * mandatory-`dyn` rule (enforce_nonnull_params). For a function
+             * *value* (fsty) there is no decl to point at, so flag the call.
+             */
+            if (fparams)
+                (*fparams)[i]->received_optish = true;
+            else
+                nullability("argument " + std::to_string(i + 1) +
+                                " may be none but the parameter is not 'opt'",
+                            anode->start, anode->end);
+        }
 
         STyRef src = p_opt ? at : strip(at);
         if (!sty_assignable(src, ptype))

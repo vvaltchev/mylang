@@ -177,6 +177,11 @@ both languages on the inputs used. These are straight speed comparisons.
 - **Dictionary ordering.** MyLang dicts are `unordered_map` (no defined order);
   Python dicts preserve insertion order. The dict-iteration benchmarks use
   order-independent checksums (sum of values) so the results still match.
+- **Nullable dict reads.** A MyLang dict read (`d[k]` / `d.k`) is statically
+  *nullable* (`opt V`, since the key might be absent), so the dict-lookup /
+  member benchmarks narrow each read (`var v = d[k]; if (v != none) ...`) before
+  using it — a null-check Python doesn't do, which is why those rows are a bit
+  slower than the raw lookup cost. Results are identical (the keys all exist).
 
 ### MyLang features with no Python equivalent (Python side intentionally omitted)
 
