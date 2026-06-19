@@ -15,16 +15,12 @@ for (var i = 0; i < n; i += 1) {
 }
 var text = join(sb, " ");
 
-var counts = {};
+# a default dict: a missing key reads as 0, so `counts[w] += 1` just works
+var counts = dict(0);
 var toks = split(text, " ");
 
-foreach (var w in toks) {
-    var cur = find(counts, w);
-    if (cur == none)
-        counts[w] = 1;
-    else
-        counts[w] = cur + 1;
-}
+foreach (var w in toks)
+    counts[w] += 1;
 
 var total = 0;
 foreach (var k, v in counts)

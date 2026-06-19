@@ -137,7 +137,13 @@ public:
         a = EvalValueT(!is_true(a));
     }
 
-    virtual EvalValueT subscript(const EvalValueT &what, const EvalValueT &idx)
+    /*
+     * `for_write` is true only when the subscript is the target of a plain
+     * assignment (`a[i] = v`); a dict uses it to auto-vivify a missing key
+     * instead of throwing. Other types ignore it.
+     */
+    virtual EvalValueT subscript(const EvalValueT &what, const EvalValueT &idx,
+                                 bool for_write = false)
     {
         throw TypeErrorEx("The object does NOT support subscript operator []");
     }

@@ -1044,10 +1044,10 @@ STyRef Inferencer::type_of(const Construct *e)
          * non-subscriptable base is caught in the check pass. */
         if (is_unknown(w) || is_none(w)) return bottom;
         if (w->kind == STyKind::Array) return w->elem;
-        /* A dict read can miss (returns none); a const dict with a known key
-         * already folded to a literal before inference, so a surviving dict
-         * subscript is genuinely nullable -> opt val. */
-        if (w->kind == STyKind::Dict)  return A.with_opt(w->val, true);
+        /* A dict read is non-opt: `d[k]` yields the value, the dict's default
+         * (a default dict), or throws on a missing key - never none. Use
+         * get()/get!() for explicit nullable / fail-fast lookup. */
+        if (w->kind == STyKind::Dict)  return w->val;
         if (w->kind == STyKind::Str)   return A.str_ty();
         return A.dyn_ty();
     }
@@ -1063,11 +1063,9 @@ STyRef Inferencer::type_of(const Construct *e)
     if (auto *mem = dynamic_cast<const MemberExpr *>(e)) {
         STyRef w = sty_resolve(type_of(mem->what.get()));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
-        /* `d.key` can miss (auto-vivifies to none); a const dict with a known
-         * key already folded to a literal before inference, so a surviving
-         * member read is genuinely nullable -> opt val. */
+        /* `d.key` mirrors `d[key]`: non-opt (value / default / throws). */
         if (w->kind == STyKind::Dict)
-            return A.with_opt(w->val, true);
+            return w->val;
         return A.dyn_ty();
     }
 
@@ -1248,7 +1246,18 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
     }
-    if (n == "dict")   return A.dict_of(A.dyn_ty(), A.dyn_ty());
+    if (n == "dict") {
+        /* dict(default_value) -> dict<dyn, typeof default> (a default dict, so
+         * d[k] is non-opt). dict(pairs) -> dict<dyn,dyn>. A non-array arg is
+         * the default value, which becomes the dict's value type. */
+        if (args && args->elems.size() == 1) {
+            STyRef a0 = sty_resolve(arg(0));
+            if (is_unknown(a0)) return bottom;
+            if (a0->kind != STyKind::Array && a0->kind != STyKind::None)
+                return A.dict_of(A.dyn_ty(), a0);
+        }
+        return A.dict_of(A.dyn_ty(), A.dyn_ty());
+    }
 
     /* get(d,key) -> opt V (nullable lookup); get!(d,key) -> V (or throws, so
      * the result is non-opt). */

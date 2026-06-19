@@ -177,10 +177,23 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
     DictObject::inner_type data;
 
+    /*
+     * dict(default_value): a non-array argument is a *default value*, producing
+     * an empty "default dict" - reading a missing key returns (and inserts) the
+     * default instead of throwing, so `d[k] += 1` works without a none-check.
+     * `none` is not a valid default (it would make d[k] yield none yet be typed
+     * non-opt). An array argument is the array-of-[k,v]-pairs form below.
+     */
     if (!e.is<SharedArrayObj>()) {
-        throw TypeErrorEx(
-            "Expected array of [key, value] pairs", arg->start, arg->end
-        );
+
+        if (e.is<NoneVal>())
+            throw InvalidValueEx(
+                "dict() default value cannot be none", arg->start, arg->end
+            );
+
+        auto obj = make_intrusive<DictObject>();
+        obj->set_default(e);
+        return intrusive_ptr<DictObject>(obj);
     }
 
     /* Read both the outer array and each [k, v] pair via arr_elem_at, so a flat

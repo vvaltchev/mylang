@@ -110,7 +110,8 @@ public:
     void add(EvalValue &a, const EvalValue &b) override;
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
-    EvalValue subscript(const EvalValue &what, const EvalValue &idx) override;
+    EvalValue subscript(const EvalValue &what, const EvalValue &idx,
+                        bool for_write = false) override;
     EvalValue slice(const EvalValue &what,
                     const EvalValue &start,
                     const EvalValue &end) override;
@@ -386,7 +387,8 @@ bool TypeArr::is_true(const EvalValue &a)
     return a.get<SharedArrayObj>().size() > 0;
 }
 
-EvalValue TypeArr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
+EvalValue TypeArr::subscript(const EvalValue &what_lval,
+                             const EvalValue &idx_val, bool for_write)
 {
     if (!idx_val.is<int_type>())
         throw TypeErrorEx("Expected integer as subscript");

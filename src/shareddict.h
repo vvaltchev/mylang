@@ -24,6 +24,15 @@ private:
      */
     bool readonly = false;
 
+    /*
+     * Default value for a missing key (a "default dict", from
+     * dict(default_value)). When `has_default` is set, reading a missing key
+     * returns (and inserts) `default_val` instead of throwing - so `d[k] += 1`
+     * works without a none-check. Copied by the default copy/move ctors.
+     */
+    bool has_default = false;
+    EvalValueT default_val;
+
 public:
 
     DictObjectTempl() = default;
@@ -41,4 +50,9 @@ public:
     bool is_readonly() const { return readonly; }
     void set_readonly() { readonly = true; }
     void clear_readonly() { readonly = false; }
+
+    bool get_has_default() const { return has_default; }
+    const EvalValueT &get_default() const { return default_val; }
+    void set_default(const EvalValueT &v)
+        { has_default = true; default_val = v; }
 };
