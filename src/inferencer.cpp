@@ -150,6 +150,7 @@ private:
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
+    void maybe_autofill_array(Expr14 *e);   /* array(N) -> array(N, 0/0.0) */
     void check_call(CallExpr *call);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
                       bool arith);
@@ -555,7 +556,62 @@ void Inferencer::annotate_hints(Construct *n)
             n->th = TypeHint::f;
     }
 
+    if (auto *e = dynamic_cast<Expr14 *>(n))
+        maybe_autofill_array(e);
+
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });
+}
+
+/*
+ * `var/const a = array(N)` (1-arg) whose inferred element type is a non-null
+ * int/float becomes `array(N, 0)` / `array(N, 0.0)` by appending the literal
+ * fill arg. So unfilled slots are 0/0.0 (not none) and the array gets flat
+ * (unboxed) storage - the type-driven array(N). An array<dyn> / array<none> /
+ * opt-element / non-decl array(N) is left as-is (general none).
+ * Runs in annotate_hints (after inference, types final), the inferencer's one
+ * AST-mutation point.
+ */
+void Inferencer::maybe_autofill_array(Expr14 *e)
+{
+    if (!(e->fl & pFlags::pInDecl) || e->op != Op::assign)
+        return;
+
+    auto *id = dynamic_cast<Identifier *>(e->lvalue.get());
+    if (!id)
+        return;
+
+    auto *call = dynamic_cast<CallExpr *>(e->rvalue.get());
+    if (!call || !call->args || call->args->elems.size() != 1)
+        return;
+
+    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    if (!cid || std::string(cid->uid->val) != "array")
+        return;
+    /* must be the builtin array(), not a user-defined function of that name */
+    auto sit = id_sym.find(cid);
+    if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
+        return;
+
+    auto it = id_sym.find(id);
+    if (it == id_sym.end() || !it->second)
+        return;
+    STyRef ty = sty_resolve(it->second->type);
+    if (ty->kind != STyKind::Array)
+        return;
+    STyRef el = sty_resolve(ty->elem);
+    if (el->opt)
+        return;   /* nullable element: keep the none fill */
+
+    const Loc loc = call->start;
+    if (el->kind == STyKind::Int) {
+        auto lit = std::make_unique<LiteralInt>(0);
+        lit->start = loc; lit->end = loc;
+        call->args->elems.push_back(std::move(lit));
+    } else if (el->kind == STyKind::Float) {
+        auto lit = std::make_unique<LiteralFloat>(0.0);
+        lit->start = loc; lit->end = loc;
+        call->args->elems.push_back(std::move(lit));
+    }
 }
 
 void Inferencer::hoist_globals(Block *rootBlock)

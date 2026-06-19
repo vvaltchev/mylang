@@ -184,7 +184,6 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("hash", builtin_hash),
 
     /* Array or container builtins */
-    make_const_builtin("array", builtin_array),
     make_const_builtin("make_array", builtin_make_array),
     make_const_builtin("top", builtin_top),
     make_const_builtin("range", builtin_range),
@@ -274,6 +273,10 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("ispuredecl", builtin_ispuredecl),
     make_builtin("intptr", builtin_intptr),
     make_builtin("array_storage", builtin_array_storage),
+    /* array() is non-const: it never folds to a baked literal, so array(N) is
+     * always a runtime call (uniform const/runtime type-driven fill) and a huge
+     * array(1000000) isn't baked into the AST. */
+    make_builtin("array", builtin_array),
     make_builtin("undef", builtin_undef),
     make_builtin("exception", builtin_exception),
     make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */
