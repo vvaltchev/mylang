@@ -914,20 +914,35 @@ are unchanged.
   (`vector<float_type>`) — the latter two are 8-byte unboxed slots, so a
   homogeneous int/float array moves ~6× less memory in bulk ops. A `union`
   member can't have non-trivial ctors/dtors, so `SharedObject` placement-news the
-  live member per kind and the dtor switches on `kind`. `range()` produces flat
-  int storage; the hot ops (`sum`/`reverse`/`sort`/`foreach`/
-  `Subscript::eval_int`/`eval_float`/`TypeArr::add`) branch on `skind()` and read
-  `flat_ints()`/`flat_floats()` directly; `clone_internal_vec`,
-  `make_const_clone`, and `clone_to_mutable` are kind-aware so clone/COW/const
-  keep flat. **Anything without a flat fast path calls `get_vec()`, which
-  `promote_to_general()`s in place (flat → `vector<LValue>`, value-preserving,
-  sound even when shared/sliced) and reuses the general code** — so the feature is
-  incremental and correct by construction. `size()` is kind-aware and does *not*
-  promote. **Gotcha:** any pass that inspects a const array's element type must
-  read it from `skind()`, not `get_view()`/`get_vec()` — those promote the const
-  value (this bit the inferencer's `sty_from_value`, which promoted every const
-  array and defeated the whole optimization). See `plans/typed-arrays.md`
-  (approach B); `array(N)` is still general (M3).
+  live member per kind and the dtor switches on `kind`. Flat storage is produced
+  by `range()`, `array(N, value)` (value-driven: an int/float fill picks
+  `ints`/`floats`, else general; `array(N)` with no fill stays general `none`),
+  and `make_array(N, gen)` (optimistic-flat by the callback's result kind). The
+  flat fast paths (each branches on `skind()`, reads `flat_ints()`/
+  `flat_floats()` directly, no promotion): `sum`/`reverse`/`sort`
+  (no-comparator)/`min`/`max`/`append`/`pop`/`foreach`,
+  `TypeArr::{subscript (rvalue read),
+  to_string, eq, add}`, `Subscript::eval_int`/`eval_float`, and the flat
+  subscript-store `try_flat_subscript_store` (`eval.cpp`: `a[i] = v` /
+  `a[i] OP= v` writes the scalar straight into the flat vector — gated on a
+  side-effect-free id base so the general fall-through can re-eval it; a
+  non-fitting element type promotes). `clone_internal_vec`, `make_const_clone`,
+  and `clone_to_mutable` are kind-aware so clone/COW/const keep flat. **Anything
+  without a flat fast path calls `get_vec()`, which `promote_to_general()`s in
+  place (flat → `vector<LValue>`, value-preserving, sound even when shared/
+  sliced) and reuses the general code** — so the feature is incremental and
+  correct by construction. `size()` is kind-aware and does *not* promote.
+  `array_storage(a)` reports `"ints"`/`"floats"`/`"general"` (tests pin it).
+  **Representation is value-driven, NOT type-driven** (the inferred type does
+  not gate it yet): a flat array whose true static type is `array<dyn>` (e.g. a
+  mixed `append` widened it via `contribute_container`) is still made flat, then
+  promotes on the non-fitting element — a deferred refinement. **Gotcha:** any
+  pass that inspects a const array's element type must read it from `skind()`,
+  not `get_view()`/`get_vec()` — those promote the const value (this bit the
+  inferencer's `sty_from_value`, which had promoted every const array and
+  defeated the whole optimization). See `plans/typed-arrays.md` (approach B);
+  remaining: float-array producers (M2), the `array(N)` 1-arg type-driven
+  default, and flat `insert`/`erase`/`map`/`filter`.
 - **`DictObject`** (`shareddict.h`): the value handle is
   `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map lives
   inside it.

@@ -2424,6 +2424,109 @@ static const std::vector<test> tests =
         },
     },
 
+    /*
+     * Flat (unboxed) typed-array storage (plans/typed-arrays.md).
+     * array_storage() exposes the representation so these pin it.
+     */
+    {
+        "Typed arrays: range()/array(N,v)/make_array pick flat storage",
+        {
+            "assert(array_storage(range(5)) == \"ints\");",
+            "assert(array_storage(range(0, 10, 2)) == \"ints\");",
+            "assert(array_storage(array(4, 0)) == \"ints\");",
+            "assert(array_storage(array(4, 1.5)) == \"floats\");",
+            "assert(array_storage(array(4, \"x\")) == \"general\");",
+            "assert(array_storage(array(4)) == \"general\");",
+            "assert(array_storage([1,2,3]) == \"general\");",
+            "assert(array(4, 0) == [0,0,0,0]);",
+            "assert(array(3, 2) == [2,2,2]);",
+            "assert(array_storage(make_array(5, func(i) => i*i)) == \"ints\");",
+            "assert(make_array(5, func(i) => i*i) == [0,1,4,9,16]);",
+            "assert(array_storage(make_array(3, func(i) => i*1.0))"
+                " == \"floats\");",
+            "assert(array_storage(make_array(2, func(i) => \"v\"))"
+                " == \"general\");",
+            "assert(make_array(0, func(i) => i) == []);",
+        },
+    },
+    {
+        "Typed arrays: flat subscript store + compound keep storage flat",
+        {
+            "var a = range(5);",
+            "a[2] = 99; a[-1] = 7;",
+            "assert(a == [0,1,99,3,7]);",
+            "assert(array_storage(a) == \"ints\");",
+            "a[0] += 100;",
+            "assert(a[0] == 100 && array_storage(a) == \"ints\");",
+            "var f = array(3, 0.0);",
+            "f[1] = 2.5; f[0] += 1;",
+            "assert(array_storage(f) == \"floats\");",
+        },
+    },
+    {
+        "Typed arrays: storing/appending a mismatched type promotes",
+        {
+            "var a = array(3, 0);",
+            "assert(array_storage(a) == \"ints\");",
+            "a[1] = \"hello\";",
+            "assert(a == [0, \"hello\", 0]);",
+            "assert(array_storage(a) == \"general\");",
+            "var b = range(3);",
+            "append(b, 9);",
+            "assert(b == [0,1,2,9] && array_storage(b) == \"ints\");",
+            "assert(pop(b) == 9 && array_storage(b) == \"ints\");",
+            "append(b, \"x\");",
+            "assert(array_storage(b) == \"general\");",
+        },
+    },
+    {
+        "Typed arrays: flat reads (sum/min/max/reverse/sort/foreach)",
+        {
+            "assert(sum(range(1, 6)) == 15);",
+            "assert(min(range(3, 9)) == 3 && max(range(3, 9)) == 8);",
+            "assert(reverse(range(1, 6)) == [5,4,3,2,1]);",
+            "var b = range(5);",
+            "reverse(b);",
+            "assert(array_storage(b) == \"ints\" && b == [4,3,2,1,0]);",
+            "sort(b);",
+            "assert(array_storage(b) == \"ints\" && b == [0,1,2,3,4]);",
+            "var t = 0;",
+            "foreach (var x in range(5)) t += x;",
+            "assert(t == 10);",
+        },
+    },
+    {
+        "Typed arrays: slices share flat storage, COW on write, clones flat",
+        {
+            "var a = range(5);",
+            "var s = a[1:4];",
+            "assert(array_storage(s) == \"ints\" && s == [1,2,3]);",
+            "a[1] = 100;",
+            "assert(s == [1,2,3]);",
+            "assert(a == [0,100,2,3,4]);",
+            "var c = clone(range(4));",
+            "assert(array_storage(c) == \"ints\");",
+            "var d = deepclone(range(4));",
+            "assert(array_storage(d) == \"ints\");",
+        },
+    },
+    {
+        "Typed arrays: a flat array laundered through dyn promotes on a "
+        "non-fitting element",
+        {
+            "var a = range(3);",
+            "assert(array_storage(a) == \"ints\");",
+            "var dyn d = a;",
+            "append(d, \"hi\");",
+            "assert(array_storage(a) == \"general\");",
+        },
+    },
+    {
+        "array_storage() rejects a non-array",
+        { "array_storage(42);" },
+        &typeid(TypeErrorEx),
+    },
+
     {
         "Builtin pop(), slices",
         {

@@ -185,6 +185,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
 
     /* Array or container builtins */
     make_const_builtin("array", builtin_array),
+    make_const_builtin("make_array", builtin_make_array),
     make_const_builtin("top", builtin_top),
     make_const_builtin("range", builtin_range),
     make_const_builtin("find", builtin_find),
@@ -272,6 +273,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("ispure", builtin_ispure),
     make_builtin("ispuredecl", builtin_ispuredecl),
     make_builtin("intptr", builtin_intptr),
+    make_builtin("array_storage", builtin_array_storage),
     make_builtin("undef", builtin_undef),
     make_builtin("exception", builtin_exception),
     make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */

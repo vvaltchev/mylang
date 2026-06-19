@@ -4,7 +4,7 @@ if (len(argv) > 0)
     scale = int(argv[0]);
 
 var SZ = 1000000;
-var a = array(SZ);
+var a = array(SZ, 0);
 var x = 42;
 for (var i = 0; i < SZ; i += 1) {
     x = (x * 1103515245 + 12345) % 2147483647;
