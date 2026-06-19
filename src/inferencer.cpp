@@ -13,6 +13,8 @@
 #include <string>
 #include <deque>
 #include <functional>
+#include <algorithm>
+#include <ostream>
 
 /*
  * Whole-program static type inference + checking. See plans/type-inference.md
@@ -52,6 +54,7 @@ struct TypeSym {
     bool dyn_decl = false;
     bool opt_decl = false;
     bool is_param = false;
+    bool const_decl = false;   /* declared `const` (vs `var`) */
     Loc decl_loc;
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
 };
@@ -75,6 +78,10 @@ public:
 
     explicit Inferencer(Construct *root) : root(root) { }
     void run();
+    void dump_debug_ti(std::ostream &os);   /* --debug-ti */
+
+    bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
+    bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
 
 private:
 
@@ -112,7 +119,9 @@ private:
     void hoist_globals(Block *root);
     void walk_struct(Construct *n, Scope *s);
     void declare_funcdecl(FuncDeclStmt *fd, Scope *s);
-    void declare_target(Construct *lvalue, Scope *s);
+    void declare_target(Construct *lvalue, Scope *s, bool is_const);
+    void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
+    static bool type_has_dyn(STyRef t, bool deep);
 
     /* type computation (reads stable `type`) */
     STyRef type_of(const Construct *e);
@@ -383,6 +392,10 @@ void Inferencer::run()
             up->ret = A.none_ty();
     }
 
+    /* Mandatory-`dyn` rule: a plain var/const must have a concrete type. */
+    if (strict_dyn)
+        enforce_concrete_decls();
+
     cur_func = nullptr;
     narrowing_on = true;
     for (auto &e : rootBlock->elems)
@@ -392,6 +405,120 @@ void Inferencer::run()
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
     for (auto &e : rootBlock->elems)
         annotate_hints(e.get());
+}
+
+/*
+ * True if `t` is dynamic. `deep` recurses into container element/key/value
+ * types (so array<dyn>/dict<_,dyn> count) - the Phase-B (strict) sense; with
+ * `deep` false only a bare top-level `dyn` counts (Phase A, tolerating
+ * dynamic-element arrays). Function types are NOT recursed into: a var holding
+ * a `func(dyn)->int` holds a concrete function value.
+ */
+bool Inferencer::type_has_dyn(STyRef t, bool deep)
+{
+    t = sty_resolve(t);
+
+    if (t->kind == STyKind::Dyn)
+        return true;
+
+    if (!deep)
+        return false;
+
+    if (t->kind == STyKind::Array)
+        return type_has_dyn(t->elem, true);
+
+    if (t->kind == STyKind::Dict)
+        return type_has_dyn(t->key, true) || type_has_dyn(t->val, true);
+
+    return false;
+}
+
+/*
+ * Enforce that every plain `var`/`const` declaration infers to a concrete
+ * static type. A genuinely dynamic one must be declared `dyn`. `strict_deep`
+ * selects the Phase: false (Phase A) enforces only a bare top-level `dyn`
+ * (dynamic-element arrays are tolerated); true (Phase B) recurses into
+ * containers.
+ */
+void Inferencer::enforce_concrete_decls()
+{
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+
+        /* Skip: explicitly `dyn`, function names, params (a never-called func's
+         * param is legitimately `dyn` and has no `var` to annotate), and
+         * builtins (no decl loc). */
+        if (s->dyn_decl || s->func || s->is_param || !s->decl_loc)
+            continue;
+
+        if (!type_has_dyn(s->type, strict_deep))
+            continue;
+
+        const std::string what = s->const_decl ? "const" : "variable";
+        throw DynRequiredEx(
+            intern_msg(
+                std::string(s->name->val) + ": " + what +
+                " has dynamic type '" + sty_to_string(s->type) +
+                "'; declare it 'dyn' (e.g. '" +
+                (s->const_decl ? "const dyn " : "var dyn ") +
+                std::string(s->name->val) + " = ...')"),
+            s->decl_loc, s->decl_loc);
+    }
+}
+
+/*
+ * --debug-ti: dump every declared identifier's inferred type and use sites in a
+ * machine-readable, tab-separated form. Used to audit the corpus for spurious
+ * `dyn`s (plans/type-driven-specialization.md). One `ti` record per symbol:
+ *   ti<TAB>name<TAB>kind<TAB>line<TAB>col<TAB>const<TAB>type<TAB>uses
+ * where kind is var|const|param|func, const is 0|1, type is the rendered static
+ * type (int, opt float, array<int>, array<dyn>, func(int)->int, dyn, ...), and
+ * uses is a comma-separated list of line:col occurrences (decl + reads/writes).
+ */
+void Inferencer::dump_debug_ti(std::ostream &os)
+{
+    std::unordered_map<const TypeSym *, std::vector<Loc>> uses;
+    for (const auto &kv : id_sym) {
+        if (kv.second && kv.first)
+            uses[kv.second].push_back(kv.first->start);
+    }
+
+    os << "# ti\tname\tkind\tline\tcol\tconst\ttype\tuses(line:col,...)\n";
+
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        if (!s->name)
+            continue;
+
+        const char *kind = s->func    ? "func"
+                         : s->is_param ? "param"
+                         : s->const_decl ? "const"
+                         : "var";
+
+        STyRef ty = s->func ? func_sty(s->func) : s->type;
+
+        os << "ti\t" << std::string(s->name->val)
+           << "\t" << kind
+           << "\t" << s->decl_loc.line
+           << "\t" << s->decl_loc.col
+           << "\t" << (s->const_decl ? 1 : 0)
+           << "\t" << sty_to_string(ty)
+           << "\t";
+
+        auto it = uses.find(s);
+        if (it != uses.end()) {
+            std::vector<Loc> &v = it->second;
+            std::sort(v.begin(), v.end(), [](const Loc &a, const Loc &b) {
+                return a.line != b.line ? a.line < b.line : a.col < b.col;
+            });
+            for (size_t i = 0; i < v.size(); i++) {
+                if (i)
+                    os << ",";
+                os << v[i].line << ":" << v[i].col;
+            }
+        }
+        os << "\n";
+    }
 }
 
 void Inferencer::annotate_hints(Construct *n)
@@ -418,7 +545,8 @@ void Inferencer::hoist_globals(Block *rootBlock)
             declare_funcdecl(fd, global);
         } else if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
             if (e14->fl & pFlags::pInDecl)
-                declare_target(e14->lvalue.get(), global);
+                declare_target(e14->lvalue.get(), global,
+                               e14->fl & pFlags::pInConstDecl);
         }
     }
 }
@@ -447,7 +575,7 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
     }
 }
 
-void Inferencer::declare_target(Construct *lvalue, Scope *s)
+void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
 {
     auto decl_one = [&](Identifier *id) {
         const UniqueId *nm = id->uid;
@@ -456,6 +584,7 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s)
                                              : new_sym(nm, s, id->start);
         sym->opt_decl = sym->opt_decl || id->opt_mod;
         sym->dyn_decl = sym->dyn_decl || id->dyn_mod;
+        sym->const_decl = sym->const_decl || is_const;
         id_sym[id] = sym;
     };
 
@@ -508,7 +637,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
     if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
         walk_struct(e14->rvalue.get(), s);   /* RHS before name exists */
         if (e14->fl & pFlags::pInDecl) {
-            declare_target(e14->lvalue.get(), s);
+            declare_target(e14->lvalue.get(), s,
+                           e14->fl & pFlags::pInConstDecl);
             /* `var f = <lambda>`: bind f to the lambda's FuncInfo so calls to f
              * type the lambda's params and check its arity. */
             auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
@@ -1887,13 +2017,26 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
 
 }  /* anonymous namespace */
 
-void infer_types(Construct *root, bool enable)
+void infer_types(Construct *root, bool enable, bool strict)
 {
     if (!enable || !root)
         return;
 
     Inferencer inf(root);
+    inf.strict_dyn = strict;
     inf.run();
+}
+
+void dump_type_info(Construct *root, std::ostream &os)
+{
+    if (!root)
+        return;
+
+    /* Non-strict: we want to SEE the dyn identifiers, not fail on them. */
+    Inferencer inf(root);
+    inf.strict_dyn = false;
+    inf.run();
+    inf.dump_debug_ti(os);
 }
 
 void specialize_types(Construct *root, bool enable)

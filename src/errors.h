@@ -192,6 +192,18 @@ struct WrongArgCountEx : public Exception {
         : Exception("WrongArgCountEx", m, start, end) { }
 };
 
+/*
+ * A plain `var`/`const` whose type the inferencer could only conclude is `dyn`.
+ * Under the mandatory-dyn rule a plain declaration must have a concrete static
+ * type; a genuinely dynamic one must be declared `dyn` (see
+ * plans/type-driven-specialization.md). Compile-time, uncatchable.
+ */
+struct DynRequiredEx : public Exception {
+    DynRequiredEx(const char *m = "Declaration requires an explicit 'dyn'",
+                  Loc start = Loc(), Loc end = Loc())
+        : Exception("DynRequiredEx", m, start, end) { }
+};
+
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")

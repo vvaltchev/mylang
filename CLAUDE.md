@@ -103,7 +103,15 @@ Running scripts:
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -nr FILE          # parse/validate only, don't run
 ./build/mylang -nti FILE         # disable static type inference / checking
+./build/mylang --debug-ti FILE   # dump every identifier's inferred type + uses
 ```
+`--debug-ti` runs inference (non-strict) and prints one tab-separated `ti`
+record per declared identifier — `name, kind (var|const|param|func), line, col,
+const, type, uses(line:col,...)` — then exits without running. It is the audit
+tool for the mandatory-`dyn` / type-driven work (see
+`plans/type-driven-specialization.md`): used to find identifiers inferred `dyn`
+/ `array<dyn>` and decide whether each is justified (annotate with `dyn`) or an
+inference gap (fix the inferencer).
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
 what survived
 const-folding, and `-nc` lets you see the tree as written before folding. Reach
@@ -913,10 +921,11 @@ are unchanged.
   `vector<LValue>`, 48-byte slots), `ivec` (`vector<int_type>`), and `fvec`
   (`vector<float_type>`) — the latter two are 8-byte unboxed slots, so a
   homogeneous int/float array moves ~6× less memory in bulk ops. A `union`
-  member can't have non-trivial ctors/dtors, so `SharedObject` placement-news the
-  live member per kind and the dtor switches on `kind`. Flat storage is produced
-  by `range()`, `array(N, value)` (value-driven: an int/float fill picks
-  `ints`/`floats`, else general; `array(N)` with no fill stays general `none`),
+  member can't have non-trivial ctors/dtors, so `SharedObject` placement-news
+  the live member per kind and the dtor switches on `kind`. Flat storage is
+  produced by `range()`, `array(N, value)` (value-driven: an int/float fill
+  picks `ints`/`floats`, else general; `array(N)` with no fill stays general
+  `none`),
   and `make_array(N, gen)` (optimistic-flat by the callback's result kind). The
   flat fast paths (each branches on `skind()`, reads `flat_ints()`/
   `flat_floats()` directly, no promotion): `sum`/`reverse`/`sort`
