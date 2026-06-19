@@ -7,9 +7,8 @@ var input_file;
 
 func load_data(data, file_name) {
 
-    var raw_data;
     input_file = file_name;
-    raw_data = readlines(input_file);
+    var raw_data = readlines(input_file);
 
     foreach (var ln in raw_data) {
         var tmp = split(ln, ",");

@@ -859,6 +859,9 @@ STyRef Inferencer::type_of(const Construct *e)
             }
             return s->type;
         }
+        /* `argv` is a runtime-injected global: script args, array<str>. */
+        if (std::string(id->uid->val) == "argv")
+            return A.array_of(A.str_ty());
         /*
          * Not a declared symbol: a builtin used as a value is genuinely dynamic
          * (a function-ish handle), but a truly-undefined identifier defers to
