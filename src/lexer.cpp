@@ -357,6 +357,16 @@ lexer(string_view in_str, int line, std::vector<Tok> &result)
             if (c == '#')
                 break; /* comment: stop the lexer, until the end of the line */
 
+            /*
+             * A trailing '!' is part of an identifier (Ruby/Scheme "bang"
+             * convention, e.g. `get!`), but only when it is not the start of
+             * `!=` - so `x!=y` still lexes as `x != y`. The '!' is the last
+             * char of the id; the next char ends the token.
+             */
+            if (ctx.tok_type == TokType::id && c == '!' &&
+                (ctx.i + 1 >= in_str.length() || in_str[ctx.i + 1] != '='))
+                continue;
+
             if (ctx.tok_type == TokType::invalid)
                 ctx.tok_start = ctx.i;
 

@@ -1250,6 +1250,15 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     }
     if (n == "dict")   return A.dict_of(A.dyn_ty(), A.dyn_ty());
 
+    /* get(d,key) -> opt V (nullable lookup); get!(d,key) -> V (or throws, so
+     * the result is non-opt). */
+    if (n == "get" || n == "get!") {
+        STyRef d = sty_resolve(arg(0));
+        if (is_unknown(d)) return bottom;   /* defer */
+        STyRef v = d->kind == STyKind::Dict ? d->val : A.dyn_ty();
+        return n == "get!" ? v : A.with_opt(v, true);
+    }
+
     if (n == "abs" || n == "clone" || n == "deepclone")
         return arg(0);
     /* dynarray(a) -> array<dyn>: a polymorphic (general) copy. Typed array<dyn>

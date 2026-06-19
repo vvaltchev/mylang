@@ -1470,16 +1470,19 @@ static const std::vector<test> tests =
     },
 
     {
-        "Read a const dict's keys at runtime: existing and missing",
+        "Builtin get() / get!() on a const dict: existing and missing",
         {
-            /* k is a runtime param, so the subscript is not const-folded and
-             * hits the read-only dict's runtime subscript path. */
-            "func get(p, k) { return p[k]; }",
             "const d = {\"a\": 1};",
-            "assert(get(d, \"a\") == 1);",
-            "assert(get(d, \"zzz\") == none);",  /* missing: none, no vivify */
-            "assert(len(d) == 1);",
+            "assert(get(d, \"a\") == 1);",       /* present -> value */
+            "assert(get(d, \"zzz\") == none);",  /* missing -> none */
+            "assert(get!(d, \"a\") == 1);",      /* present -> value (non-opt) */
+            "assert(len(d) == 1);",              /* nothing was inserted */
         },
+    },
+    {
+        "Builtin get!() on a missing key throws",
+        { "const d = {\"a\": 1}; get!(d, \"zzz\");" },
+        &typeid(KeyNotFoundEx),
     },
 
     {
@@ -5969,13 +5972,13 @@ inliner_specializes_array_const_arg()
         "    var t = a[0] + a[1] + a[2];",     /* folds to 60 in the clone */
         "    return t + k;",
         "}",
-        "func get(m, k) {",
+        "func myget(m, k) {",
         "    var s = m[1] + m[2];",            /* dict reads fold to 300 */
         "    return s + k;",
         "}",
         "var n = 1;",
         "n = 5;",                              /* k is runtime */
-        "var r = pick(tbl, n) + get(dct, n);",
+        "var r = pick(tbl, n) + myget(dct, n);",
         "assert(r == 65 + 305);",
     };
 
