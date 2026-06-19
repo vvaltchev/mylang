@@ -10,8 +10,11 @@ var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
 
+# `heavy` is only ever called in a const context (folded away), so the
+# inferencer never sees a concrete call: its `arr` parameter is dynamic, hence
+# `s` is too. (At parse time it still runs and produces a concrete int.)
 pure func heavy(arr) {
-    var s = 0;
+    var dyn s = 0;
     foreach (var e in arr)
         s = (s + e * e) % 1000003;
     return s;
