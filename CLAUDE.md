@@ -630,10 +630,12 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
 - **Inference rules of note** (the non-obvious ones): a never-(concretely-)
   called function's parameter finalizes to `Dyn` (its body must still
   type-check), while an unconstrained *local* finalizes to `None`. Param
-  nullability is *declared* (`opt`) **and enforced**: the mandatory-`opt` rule
-  errors if a non-opt param can actually receive `none` (see below).
-  Local/return nullability is *inferred*
-  (`None` joined with a concrete `T` is `opt T`). `runtime(x)` returns `Dyn`
+  nullability is *declared* (`opt`/`opt dyn`) **and enforced**: the
+  mandatory-`opt` rule errors if a non-opt param can actually receive `none`
+  (see below) — this holds for `dyn` params too (a nullable dyn must be
+  `opt dyn`; nullability is orthogonal to dyn). Local/return nullability is
+  *inferred* (`None` joined with a concrete `T` is `opt T`; a `dyn` var that
+  gets `none` becomes `opt dyn`). `runtime(x)` returns `Dyn`
   (its documented opt-out: it defers to runtime). `==`/`!=` are always
   well-typed (→ int); ordering is numeric-or-string. `str + anything` → str.
   Higher-order builtins (`map(func,c)`, `filter(func,c)`, `sort(c,func)`,...)
@@ -642,10 +644,16 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   to the lambda's `FuncInfo`, so calls to `f` type its params and check arity.
 - **New surface syntax**: the `opt` and `dyn` keywords, usable as modifiers on a
   parameter (`func f(opt x, dyn y)`) or a var/const decl (`var dyn z = ...;`,
-  `var opt w;`). `opt` = nullable (may hold `none`); `dyn` = dynamically typed
-  (behaves as today; inference does not constrain it — the escape hatch for
-  genuinely polymorphic code). Implemented as `Identifier::{opt_mod,dyn_mod}`
-  (params, via `pFuncParam`) and `pFlags::{pInOptDecl,pInDynDecl}` (decls).
+  `var opt w;`), and **combinable as `opt dyn`** (in that order) on either.
+  `opt` = nullable (may hold `none`); `dyn` = dynamically *typed* (variant — any
+  type; type ops are runtime-checked). **Nullability is orthogonal to `dyn`
+  (Phase B):** a bare `dyn` is *non-null*, `opt dyn` is nullable — so the four
+  combinations are `T` / `opt T` / `dyn` / `opt dyn`. Implemented as
+  `Identifier::{opt_mod,dyn_mod}` (params, via `pFuncParam`) and
+  `pFlags::{pInOptDecl,pInDynDecl}` (decls; both can be set, for `opt dyn`).
+  In `STy`, `opt dyn` is `g_dyn[1]` (the opt-`Dyn` ground); `with_opt` carries
+  the opt bit onto a `Dyn` kind, and `join` keeps it when a mix collapses to dyn
+  (`dyn | none` → `opt dyn`).
 - **Errors** are compile-time (`DECL`-style plain `Exception`s, **not**
   `RuntimeException`s, so script `try/catch` cannot catch them; `errors.h`):
   `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),
@@ -664,14 +672,16 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   error surfaces that error first. See `plans/type-driven-specialization.md`.
 - **Mandatory `opt` for params** (`enforce_nonnull_params`, same gate/timing as
   mandatory-`dyn`): a parameter that can receive `none` from *some* call path,
-  if not declared `opt` (and not `dyn`), throws `OptRequiredEx` **at the param's
-  declaration** ("declare it 'opt'"). The check pass sets `TypeSym::
-  received_optish` when a possibly-none argument reaches a non-opt, non-dyn
-  param (`check_call`), and this rule turns that into the declaration-site error
-  — so nullability is *proven* (a non-opt param is guaranteed never `none`, body
-  uses it without a check), not merely checked per call site. A call to a
-  function *value* (no decl to point at) still reports the old per-call
-  `NullabilityEx`. The nullability analogue of mandatory-`dyn`; see
+  if not declared `opt`, throws `OptRequiredEx` **at the param's declaration**
+  ("declare it 'opt'", or **"'opt dyn'" for a `dyn` param** — Phase B: even dyn
+  params are null-checked). The check pass sets `TypeSym::received_optish` when
+  a possibly-none argument reaches a non-opt param (`check_call`, where the
+  nullability check now runs *before* the dyn type-escape, so it applies to dyn
+  too), and this rule turns that into the declaration-site error — so
+  nullability is *proven* (a non-opt param, dyn or not, is guaranteed never
+  `none`, body uses it without a check), not merely checked per call site. A
+  call to a function *value* (no decl to point at) still reports the old
+  per-call `NullabilityEx`. The nullability analogue of mandatory-`dyn`; see
   `[[nullability-opt-roadmap]]`. **A dict read is non-`opt`:** `type_of` types
   `d[k]` / `d.k` (Subscript/MemberExpr on a `Dict`) as **`V`** (the value type):
   a missing key *throws* `KeyNotFoundEx` at runtime (or returns the default of a

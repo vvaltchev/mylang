@@ -20,7 +20,8 @@ STyArena::STyArena()
     }
 
     g_none = alloc(STyKind::None);
-    g_dyn  = alloc(STyKind::Dyn);
+    g_dyn[0] = alloc(STyKind::Dyn);
+    g_dyn[1] = alloc(STyKind::Dyn);  g_dyn[1]->opt = true;
 }
 
 STyRef STyArena::alloc(STyKind k)
@@ -38,6 +39,7 @@ STyRef STyArena::ground(STyKind k, bool opt)
         case STyKind::Float:     return g_float[i];
         case STyKind::Str:       return g_str[i];
         case STyKind::Exception: return g_exc[i];
+        case STyKind::Dyn:       return g_dyn[i];   /* dyn / opt dyn */
         default:                 return nullptr;   /* not a cached ground */
     }
 }
@@ -81,10 +83,10 @@ STyRef STyArena::with_opt(STyRef t, bool optflag)
 {
     t = sty_resolve(t);
 
-    /* none is inherently nullable, dyn subsumes everything, and an unbound
-     * variable carries its nullability only once it is resolved. */
-    if (t->kind == STyKind::None || t->kind == STyKind::Dyn ||
-        t->kind == STyKind::Unknown)
+    /* none is inherently nullable, and an unbound variable carries its
+     * nullability only once it is resolved. dyn, however, CAN carry an opt bit
+     * (Phase B: nullability is orthogonal to dyn - `dyn` vs `opt dyn`). */
+    if (t->kind == STyKind::None || t->kind == STyKind::Unknown)
         return t;
 
     if (t->opt == optflag)
@@ -95,6 +97,7 @@ STyRef STyArena::with_opt(STyRef t, bool optflag)
         case STyKind::Float:
         case STyKind::Str:
         case STyKind::Exception:
+        case STyKind::Dyn:
             return ground(t->kind, optflag);
         default:
             break;
@@ -345,7 +348,12 @@ STyRef STyArena::join(STyRef a, STyRef b)
         return a;
 
     if (a->kind == STyKind::Dyn || b->kind == STyKind::Dyn)
-        return g_dyn;
+        /* Nullability is orthogonal to dyn (Phase B): collapsing a mix to dyn
+         * keeps the opt bit, so `dyn | none` / `dyn | opt T` is `opt dyn`. */
+        return with_opt(g_dyn[0],
+                        a->opt || b->opt ||
+                        a->kind == STyKind::None ||
+                        b->kind == STyKind::None);
 
     if (a->kind == STyKind::Unknown)
         return b;
@@ -381,17 +389,17 @@ STyRef STyArena::join(STyRef a, STyRef b)
         case STyKind::Array: {
             STyRef ej = join_elem(a->elem, b->elem);
             if (!ej)
-                ej = g_dyn;               /* D1: mixed elements -> dyn */
+                ej = g_dyn[0];               /* D1: mixed elements -> dyn */
             return array_of(ej, anyopt);
         }
 
         case STyKind::Dict: {
             STyRef kj = join_elem(a->key, b->key);
             if (!kj)
-                kj = g_dyn;
+                kj = g_dyn[0];
             STyRef vj = join_elem(a->val, b->val);
             if (!vj)
-                vj = g_dyn;
+                vj = g_dyn[0];
             return dict_of(kj, vj, anyopt);
         }
 
@@ -406,12 +414,12 @@ STyRef STyArena::join(STyRef a, STyRef b)
             std::vector<bool> popt;
             for (size_t i = 0; i < a->params.size(); i++) {
                 STyRef pj = join(a->params[i], b->params[i]);
-                ps.push_back(pj ? pj : g_dyn);
+                ps.push_back(pj ? pj : g_dyn[0]);
                 popt.push_back((i < a->param_opt.size() && a->param_opt[i]) ||
                                (i < b->param_opt.size() && b->param_opt[i]));
             }
             STyRef rj = join(a->ret, b->ret);
-            return func_of(ps, popt, rj ? rj : g_dyn, anyopt);
+            return func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
         }
 
         default:
@@ -437,7 +445,7 @@ std::string sty_to_string(STyRef t)
     t = sty_resolve(t);
 
     std::string s;
-    if (t->opt && t->kind != STyKind::None && t->kind != STyKind::Dyn)
+    if (t->opt && t->kind != STyKind::None)
         s = "opt ";
 
     switch (t->kind) {
@@ -448,7 +456,7 @@ std::string sty_to_string(STyRef t)
         case STyKind::Float:     return s + "float";
         case STyKind::Str:       return s + "str";
         case STyKind::Exception: return s + "exception";
-        case STyKind::Dyn:       return "dyn";
+        case STyKind::Dyn:       return s + "dyn";   /* `dyn` / `opt dyn` */
 
         case STyKind::Array:
             return s + "array<" + sty_to_string(t->elem) + ">";

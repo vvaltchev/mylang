@@ -75,7 +75,7 @@ public:
     STyRef str_ty(bool opt = false)   { return ground(STyKind::Str, opt); }
     STyRef exc_ty(bool opt = false) { return ground(STyKind::Exception, opt); }
     STyRef none_ty()                  { return g_none; }
-    STyRef dyn_ty()                   { return g_dyn; }
+    STyRef dyn_ty()                   { return g_dyn[0]; }
 
     /* Constructors for compound / variable types (always freshly allocated). */
     STyRef fresh_var();
@@ -100,7 +100,7 @@ private:
     STyRef g_str[2];
     STyRef g_exc[2];
     STyRef g_none;
-    STyRef g_dyn;
+    STyRef g_dyn[2];   /* [0] = dyn (non-null), [1] = opt dyn (Phase B) */
 
     STyRef alloc(STyKind k);
     STyRef ground(STyKind k, bool opt);

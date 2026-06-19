@@ -1205,11 +1205,12 @@ pStmt(ParseContext &c, unsigned fl)
         else if (pAcceptKeyword(c, Keyword::kw_const))
             fl |= pFlags::pInDecl | pFlags::pInConstDecl;
 
-        /* `var`/`const` may be followed by an `opt` or `dyn` type modifier. */
+        /* `var`/`const` may be followed by the `opt` and/or `dyn` type
+         * modifiers, in order (`opt dyn` = nullable, dynamically typed). */
         if (fl & pFlags::pInDecl) {
             if (pAcceptKeyword(c, Keyword::kw_opt))
                 fl |= pFlags::pInOptDecl;
-            else if (pAcceptKeyword(c, Keyword::kw_dyn))
+            if (pAcceptKeyword(c, Keyword::kw_dyn))
                 fl |= pFlags::pInDynDecl;
         }
 

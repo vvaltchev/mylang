@@ -523,12 +523,13 @@ Key rules:
     non-`none` value is required — an arithmetic operand, a subscript base — is
     a compile error. A local that might be `none` (e.g. `var x;`, or assigned
     only on some branches) is treated as nullable, so using it directly where a
-    value is required is rejected — initialize it (`var x = 0;`) or use
-    `opt`/`dyn`.
+    value is required is rejected — initialize it (`var x = 0;`) or declare it
+    `opt` (or `opt dyn`). Note `dyn` alone is **non-null** (see below).
   * **A parameter that can receive `none` must be declared `opt`.** If any call
     (transitively, across the whole program) could pass `none` to a parameter
-    that is not `opt` (and not `dyn`), it is a compile error *at the param's
-    declaration* asking you to mark it `opt`. So a non-`opt` parameter is
+    that is not `opt`, it is a compile error *at the param's declaration* asking
+    you to mark it `opt` (or `opt dyn` for a dynamically-typed one). So a
+    non-`opt` parameter is
     *guaranteed* never to be `none` — the body can use it without a check. This
     is the nullability analogue of the mandatory-`dyn` rule.
   * **A dict read is non-`opt` — it throws on a missing key.** `d[k]` / `d.k`
@@ -562,14 +563,22 @@ slot = "now a string";           # ok, because it's dyn
     check above possible. Like `dyn`, `opt` is **required**, not optional, on a
     parameter that can actually receive `none` from some call path — otherwise
     you get a compile error at the param's declaration telling you to add it.
-  * **`dyn`** — *dynamically typed*: the value behaves exactly as in untyped
-    MyLang. Inference places no constraints on it, operations on it are checked
-    at runtime (as before), and it may even change type. Use it for genuinely
-    polymorphic code (e.g. a generic equality helper) or to keep a known type
-    error catchable at runtime with `try/catch`. `dyn` is **required**, not
-    optional, wherever a plain declaration would otherwise infer `dyn` (see the
-    first key rule above) — so `var x = someBuiltin;` or `var x = runtime(v);`
-    must be written `var dyn x = ...`.
+  * **`dyn`** — *dynamically typed*: the value may hold any **type** and may
+    change type; *type* operations on it are checked at runtime, not at compile
+    time. Use it for variant values — a variable or an array element that
+    genuinely holds different types (`var dyn a = [1, "two", 3.0]`), without the
+    manual tagged-union bookkeeping a fixed-type language needs. `dyn` is
+    **required**, not optional, wherever a plain declaration would otherwise
+    infer `dyn` (see the first key rule above) — so `var x = someBuiltin;` or
+    `var x = runtime(v);` must be written `var dyn x = ...`.
+
+    **Nullability is orthogonal to `dyn`.** A bare `dyn` is *non-null* (proven
+    never `none`, so usable without a check); `none` is allowed only with
+    `opt dyn`. The four combinations: `x` (typed, non-null), `opt x` (typed,
+    nullable), `dyn x` (dynamic, non-null), `opt dyn x` (dynamic, nullable). So
+    `dyn` opts out of *type* checking but **not** null-safety — passing `none`
+    to a non-`opt` `dyn` parameter is still a compile error asking for
+    `opt dyn`.
 
 #### Null-checks are understood (narrowing)
 
