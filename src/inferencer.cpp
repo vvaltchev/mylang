@@ -1109,9 +1109,17 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.array_of(d->kind == STyKind::Dict ? d->val : A.dyn_ty());
     }
     if (n == "find") {
+        /*
+         * find(dict, key) -> opt val; find(array, x) / find(str, sub) -> the
+         * opt int index of the first match (or none). Only a fully-unknown,
+         * non-container base stays opt dyn.
+         */
         STyRef d = sty_resolve(arg(0));
         if (is_unknown(d)) return bottom;   /* defer */
-        return A.with_opt(d->kind == STyKind::Dict ? d->val : A.dyn_ty(), true);
+        if (d->kind == STyKind::Dict) return A.with_opt(d->val, true);
+        if (d->kind == STyKind::Array || d->kind == STyKind::Str)
+            return A.with_opt(A.int_ty(), true);
+        return A.with_opt(A.dyn_ty(), true);
     }
 
     if (n == "exception" || n == "ex")
@@ -1421,6 +1429,16 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
         return;
 
     STyRef c = sty_resolve(type_of(fe->container.get()));
+
+    /*
+     * Defer if the container type isn't known yet: contributing `dyn` to the
+     * loop var(s) now would be a transient that a downstream accumulator
+     * (`s += e`) latches onto permanently. A later round, once the container is
+     * a known kind, contributes the real element type.
+     */
+    if (is_unknown(c))
+        return;
+
     auto &ids = fe->ids->elems;
 
     auto sym_of = [&](size_t i) { return id_sym[ids[i].get()]; };
