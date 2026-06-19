@@ -247,20 +247,22 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
         end = val0.get<int_type>();
     }
 
-    SharedArrayObj::vec_type vec;
+    /* range() is all-int by construction, so build flat (unboxed) int storage
+     * directly - see plans/typed-arrays.md. */
+    SharedArrayObj::ivec_type ivec;
 
     if (step > 0) {
 
         for (int_type i = start; i < end; i += step)
-            vec.emplace_back(EvalValue(i), ctx->const_ctx);
+            ivec.push_back(i);
 
     } else {
 
         for (int_type i = start; i > end; i += step)
-            vec.emplace_back(EvalValue(i), ctx->const_ctx);
+            ivec.push_back(i);
     }
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(move(ivec));
 }
 
 EvalValue
@@ -329,9 +331,37 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
         arr.clone_all_slices();
     }
 
-    auto &vec = arr.get_vec();
-
     if (exprList->elems.size() == 1) {
+
+        /*
+         * Flat fast path: sort the unboxed int/float vector directly with the
+         * native <. std::sort is safe here - the default ordering on a
+         * homogeneous scalar type is a valid strict weak ordering (the
+         * unguarded-partition hazard only applies to the user-comparator path
+         * below).
+         */
+        switch (arr.skind()) {
+            case SharedArrayObj::Storage::ints: {
+                auto &v = arr.flat_ints();
+                if (!reverse)
+                    sort(v.begin(), v.end());
+                else
+                    sort(v.begin(), v.end(), std::greater<int_type>());
+                return arr;
+            }
+            case SharedArrayObj::Storage::floats: {
+                auto &v = arr.flat_floats();
+                if (!reverse)
+                    sort(v.begin(), v.end());
+                else
+                    sort(v.begin(), v.end(), std::greater<float_type>());
+                return arr;
+            }
+            default:
+                break;
+        }
+
+        auto &vec = arr.get_vec();
 
         if (!reverse) {
 
@@ -348,6 +378,7 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 
     } else {
 
+        auto &vec = arr.get_vec();
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
@@ -443,8 +474,25 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
         arr.clone_all_slices();
     }
 
-    auto &vec = arr.get_vec();
-    reverse(vec.begin(), vec.end());
+    /* Flat fast path: reverse the unboxed vector in place (8-byte swaps). */
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints: {
+            auto &v = arr.flat_ints();
+            reverse(v.begin(), v.end());
+            break;
+        }
+        case SharedArrayObj::Storage::floats: {
+            auto &v = arr.flat_floats();
+            reverse(v.begin(), v.end());
+            break;
+        }
+        default: {
+            auto &vec = arr.get_vec();
+            reverse(vec.begin(), vec.end());
+            break;
+        }
+    }
+
     return arr;
 }
 
@@ -460,6 +508,35 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     const SharedArrayObj &arr = val0.get<SharedArrayObj>();
+
+    /*
+     * Flat (unboxed) fast path: sum the int/float vector directly, with no
+     * promotion to vector<LValue> and no per-element virtual dispatch. Only the
+     * 1-arg (no callback) form - a user reducer needs boxed EvalValues.
+     */
+    if (exprList->elems.size() == 1 &&
+        arr.skind() != SharedArrayObj::Storage::general)
+    {
+        const size_type off = arr.offset(), n = arr.size();
+
+        if (n == 0)
+            return none;
+
+        if (arr.skind() == SharedArrayObj::Storage::ints) {
+            const auto &iv = arr.flat_ints();
+            int_type acc = 0;
+            for (size_type i = 0; i < n; i++)
+                acc += iv[off + i];           /* wraps (-fwrapv), like += */
+            return EvalValue(acc);
+        }
+
+        const auto &fv = arr.flat_floats();
+        float_type acc = 0;
+        for (size_type i = 0; i < n; i++)
+            acc += fv[off + i];
+        return EvalValue(acc);
+    }
+
     const ArrayConstView &view = arr.get_view();
 
     if (view.size() == 0)

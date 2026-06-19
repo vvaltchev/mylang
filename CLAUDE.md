@@ -908,6 +908,26 @@ are unchanged.
   it truncates a grown array. `clone_aliased_slices` therefore clones each slice
   while its `slice` flag is still set, so `offset()`/`size()` report the slice
   range.)
+- **Flat (unboxed) int/float storage.** `SharedObject` carries a `Storage kind`
+  (`general`/`ints`/`floats`) and an **anonymous union** of `vec` (the
+  `vector<LValue>`, 48-byte slots), `ivec` (`vector<int_type>`), and `fvec`
+  (`vector<float_type>`) — the latter two are 8-byte unboxed slots, so a
+  homogeneous int/float array moves ~6× less memory in bulk ops. A `union`
+  member can't have non-trivial ctors/dtors, so `SharedObject` placement-news the
+  live member per kind and the dtor switches on `kind`. `range()` produces flat
+  int storage; the hot ops (`sum`/`reverse`/`sort`/`foreach`/
+  `Subscript::eval_int`/`eval_float`/`TypeArr::add`) branch on `skind()` and read
+  `flat_ints()`/`flat_floats()` directly; `clone_internal_vec`,
+  `make_const_clone`, and `clone_to_mutable` are kind-aware so clone/COW/const
+  keep flat. **Anything without a flat fast path calls `get_vec()`, which
+  `promote_to_general()`s in place (flat → `vector<LValue>`, value-preserving,
+  sound even when shared/sliced) and reuses the general code** — so the feature is
+  incremental and correct by construction. `size()` is kind-aware and does *not*
+  promote. **Gotcha:** any pass that inspects a const array's element type must
+  read it from `skind()`, not `get_view()`/`get_vec()` — those promote the const
+  value (this bit the inferencer's `sty_from_value`, which promoted every const
+  array and defeated the whole optimization). See `plans/typed-arrays.md`
+  (approach B); `array(N)` is still general (M3).
 - **`DictObject`** (`shareddict.h`): the value handle is
   `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map lives
   inside it.

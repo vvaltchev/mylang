@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_set>
 #include <cassert>
+#include <new>
 
 
 /*
@@ -44,14 +45,38 @@ template <class LValueT>
 class SharedArrayObjTempl final {
 
 public:
-    typedef std::vector<LValueT> vec_type;
+    typedef std::vector<LValueT>    vec_type;
+    typedef std::vector<int_type>   ivec_type;
+    typedef std::vector<float_type> fvec_type;
+
+    /*
+     * Backing-storage kind (see plans/typed-arrays.md). A homogeneous int/float
+     * array keeps an *unboxed* vector<int_type>/<float_type> (8-byte slots)
+     * instead of vector<LValue> (48-byte slots), which makes bulk ops
+     * (reverse/sort/sum/foreach) move ~6x less memory. get_vec() promotes a
+     * flat array to `general` on demand (any code needing LValue access); the
+     * hot ops branch on the kind and touch the flat vector directly.
+     */
+    enum class Storage : unsigned char { general, ints, floats };
 
 private:
     static constexpr size_type all_slices = static_cast<size_type>(-1);
 
     struct SharedObject final : RefCounted {
 
-        vec_type vec;
+        Storage kind;
+
+        /*
+         * Exactly one member is live, per `kind`. It is a union, so its
+         * non-trivial vector members get explicit placement-new in the ctors
+         * and an explicit destructor call in ~SharedObject.
+         */
+        union {
+            vec_type  vec;     /* kind == general */
+            ivec_type ivec;    /* kind == ints */
+            fvec_type fvec;    /* kind == floats */
+        };
+
         std::unordered_set<SharedArrayObjTempl *> slices;
 
         /*
@@ -63,13 +88,35 @@ private:
          */
         bool readonly = false;
 
-        SharedObject() = default;
-        SharedObject(vec_type &&arr)
-            : vec(move(arr))
-        { }
+        SharedObject() : kind(Storage::general) { new (&vec) vec_type(); }
+        SharedObject(vec_type &&a) : kind(Storage::general) {
+            new (&vec) vec_type(move(a));
+        }
+        SharedObject(ivec_type &&a) : kind(Storage::ints) {
+            new (&ivec) ivec_type(move(a));
+        }
+        SharedObject(fvec_type &&a) : kind(Storage::floats) {
+            new (&fvec) fvec_type(move(a));
+        }
+
+        ~SharedObject() {
+            switch (kind) {
+                case Storage::general: vec.~vec_type();   break;
+                case Storage::ints:    ivec.~ivec_type(); break;
+                case Storage::floats:  fvec.~fvec_type(); break;
+            }
+        }
+
+        SharedObject(const SharedObject &) = delete;
+        SharedObject &operator=(const SharedObject &) = delete;
     };
 
     intrusive_ptr<SharedObject> shobj;
+
+    /* Convert flat int/float storage to general vector<LValue> in place.
+     * Defined out-of-line (needs EvalValue/LValue) in types/arr.cpp.h. No-op if
+     * already general. */
+    void promote_to_general();
 
 public:
     size_type off;
@@ -84,6 +131,21 @@ public:
         : shobj(make_intrusive<SharedObject>(move(arr)))
         , off(0)
         , len(shobj->vec.size())
+        , slice(false)
+    { }
+
+    /* Flat (unboxed) int/float storage - see plans/typed-arrays.md. */
+    SharedArrayObjTempl(ivec_type &&arr)
+        : shobj(make_intrusive<SharedObject>(move(arr)))
+        , off(0)
+        , len(shobj->ivec.size())
+        , slice(false)
+    { }
+
+    SharedArrayObjTempl(fvec_type &&arr)
+        : shobj(make_intrusive<SharedObject>(move(arr)))
+        , off(0)
+        , len(shobj->fvec.size())
         , slice(false)
     { }
 
@@ -162,8 +224,30 @@ public:
     void clone_aliased_slices(size_type index);
     void clone_all_slices() { clone_aliased_slices(all_slices); }
 
-    vec_type &get_vec() { return shobj->vec; }
-    const vec_type &get_vec() const { return shobj->vec; }
+    /*
+     * General (vector<LValue>) access. Promotes flat int/float storage to
+     * general on demand - so any code that needs LValue elements just works,
+     * paying a one-time O(n) conversion. The hot paths instead check skind()
+     * and use flat_ints()/flat_floats() to read the unboxed vector directly.
+     * Promotion is value-preserving, so the const overload promotes too.
+     */
+    vec_type &get_vec() {
+        if (shobj->kind != Storage::general)
+            promote_to_general();
+        return shobj->vec;
+    }
+    const vec_type &get_vec() const {
+        if (shobj->kind != Storage::general)
+            const_cast<SharedArrayObjTempl *>(this)->promote_to_general();
+        return shobj->vec;
+    }
+
+    Storage skind() const { return shobj->kind; }
+    ivec_type &flat_ints()   { return shobj->ivec; }   /* skind()==ints */
+    fvec_type &flat_floats() { return shobj->fvec; }   /* skind()==floats */
+    const ivec_type &flat_ints()   const { return shobj->ivec; }
+    const fvec_type &flat_floats() const { return shobj->fvec; }
+
     int_type use_count() const { return shobj.use_count(); }
 
     bool is_readonly() const { return shobj && shobj->readonly; }
@@ -171,7 +255,17 @@ public:
 
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }
-    size_type size() const { return slice ? len : get_vec().size(); }
+
+    /* Element count without promoting (kind-aware). */
+    size_type size() const {
+        if (slice)
+            return len;
+        switch (shobj->kind) {
+            case Storage::ints:   return shobj->ivec.size();
+            case Storage::floats: return shobj->fvec.size();
+            default:              return shobj->vec.size();
+        }
+    }
 
     ArrayConstViewTempl<LValueT> get_view() const {
         return ArrayConstViewTempl<LValueT>(get_vec(), offset(), size());

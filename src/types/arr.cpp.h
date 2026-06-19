@@ -20,7 +20,36 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
      * is only the size at construction and goes stale when `+=` appends to the
      * vector in place (a non-slice tracks its length via vec.size(), see
      * size()). offset()/size() are correct for both slices and non-slices.
+     *
+     * Kind-aware: a flat int/float array clones into a fresh *flat* array, so
+     * the cheap representation survives clone() and copy-on-write (a const flat
+     * array stays flat, `a.clone()` keeps it flat). Only a general array clones
+     * into vector<LValue>.
      */
+    switch (shobj->kind) {
+
+        case Storage::ints: {
+            ivec_type nv(
+                shobj->ivec.cbegin() + offset(),
+                shobj->ivec.cbegin() + offset() + size()
+            );
+            *this = SharedArrayObjTempl(move(nv));
+            return;
+        }
+
+        case Storage::floats: {
+            fvec_type nv(
+                shobj->fvec.cbegin() + offset(),
+                shobj->fvec.cbegin() + offset() + size()
+            );
+            *this = SharedArrayObjTempl(move(nv));
+            return;
+        }
+
+        default:
+            break;
+    }
+
     vec_type new_vec(
         shobj->vec.cbegin() + offset(),
         shobj->vec.cbegin() + offset() + size()
@@ -63,6 +92,38 @@ void SharedArrayObjTempl<LValueT>::clone_aliased_slices(size_type index)
             ++it;
         }
     }
+}
+
+/*
+ * Convert unboxed int/float storage into the general vector<LValue> form, in
+ * place (destroy the flat union member, construct the general one). Value-
+ * preserving, so it is sound even when the object is shared/sliced. Called by
+ * get_vec() the first time something needs LValue access (see plans/
+ * typed-arrays.md). Defined here, not in sharedarray.h, because it constructs
+ * EvalValue/LValue.
+ */
+template <class LValueT>
+void SharedArrayObjTempl<LValueT>::promote_to_general()
+{
+    if (shobj->kind == Storage::general)
+        return;
+
+    vec_type gv;
+
+    if (shobj->kind == Storage::ints) {
+        gv.reserve(shobj->ivec.size());
+        for (int_type x : shobj->ivec)
+            gv.emplace_back(EvalValue(x), false);
+        shobj->ivec.~ivec_type();
+    } else {
+        gv.reserve(shobj->fvec.size());
+        for (float_type x : shobj->fvec)
+            gv.emplace_back(EvalValue(x), false);
+        shobj->fvec.~fvec_type();
+    }
+
+    new (&shobj->vec) vec_type(move(gv));
+    shobj->kind = Storage::general;
 }
 
 
@@ -131,6 +192,73 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
         throw TypeErrorEx("Expected array on the right side of +");
 
     const SharedArrayObj &rhs = b.get<SharedArrayObj>();
+
+    /*
+     * Flat homogeneous fast path: int+int / float+float concatenate in unboxed
+     * storage, with no promotion (8-byte appends). A mismatched or general
+     * operand falls through to the boxed path below, which promotes both via
+     * get_vec(). A non-slice lhs appends in place (same alias semantics as the
+     * general path); a slice lhs builds a fresh flat array.
+     */
+    if (lval.skind() == rhs.skind() &&
+        lval.skind() == SharedArrayObj::Storage::ints)
+    {
+        const auto &rv = rhs.flat_ints();
+
+        if (!lval.is_slice()) {
+
+            auto &lv = lval.flat_ints();
+            lv.reserve(lval.size() + rhs.size());
+            lv.insert(lv.end(),
+                      rv.cbegin() + rhs.offset(),
+                      rv.cbegin() + rhs.offset() + rhs.size());
+
+        } else {
+
+            const auto &lv = lval.flat_ints();
+            SharedArrayObj::ivec_type nv;
+            nv.reserve(lval.size() + rhs.size());
+            nv.insert(nv.end(),
+                      lv.cbegin() + lval.offset(),
+                      lv.cbegin() + lval.offset() + lval.size());
+            nv.insert(nv.end(),
+                      rv.cbegin() + rhs.offset(),
+                      rv.cbegin() + rhs.offset() + rhs.size());
+            lval = SharedArrayObj(move(nv));
+        }
+
+        return;
+    }
+
+    if (lval.skind() == rhs.skind() &&
+        lval.skind() == SharedArrayObj::Storage::floats)
+    {
+        const auto &rv = rhs.flat_floats();
+
+        if (!lval.is_slice()) {
+
+            auto &lv = lval.flat_floats();
+            lv.reserve(lval.size() + rhs.size());
+            lv.insert(lv.end(),
+                      rv.cbegin() + rhs.offset(),
+                      rv.cbegin() + rhs.offset() + rhs.size());
+
+        } else {
+
+            const auto &lv = lval.flat_floats();
+            SharedArrayObj::fvec_type nv;
+            nv.reserve(lval.size() + rhs.size());
+            nv.insert(nv.end(),
+                      lv.cbegin() + lval.offset(),
+                      lv.cbegin() + lval.offset() + lval.size());
+            nv.insert(nv.end(),
+                      rv.cbegin() + rhs.offset(),
+                      rv.cbegin() + rhs.offset() + rhs.size());
+            lval = SharedArrayObj(move(nv));
+        }
+
+        return;
+    }
 
     if (!lval.is_slice()) {
 

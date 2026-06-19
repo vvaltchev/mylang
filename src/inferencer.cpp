@@ -605,7 +605,19 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
         case Type::t_none:  return A.none_ty();
 
         case Type::t_arr: {
-            ArrayConstView view = v.get<SharedArrayObj>().get_view();
+            const SharedArrayObj &arr = v.get<SharedArrayObj>();
+
+            /*
+             * Flat (unboxed) storage already pins the element type, so read it
+             * from the kind - crucially WITHOUT get_view(), which would promote
+             * the const value to general (see plans/typed-arrays.md).
+             */
+            if (arr.skind() == SharedArrayObj::Storage::ints)
+                return A.array_of(A.int_ty());
+            if (arr.skind() == SharedArrayObj::Storage::floats)
+                return A.array_of(A.float_ty());
+
+            ArrayConstView view = arr.get_view();
             if (view.size() == 0)
                 return A.array_of(A.none_ty());
             STyRef el = sty_from_value(view[0].get());
