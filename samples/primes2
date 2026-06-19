@@ -36,7 +36,7 @@ func compute_primes(n)
 
 func main()
 {
-    var n;
+    var n = 0;
 
     try {
 

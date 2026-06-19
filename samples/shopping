@@ -55,7 +55,7 @@ while (true) {
     print();
     write("Enter product number ('q' to quit): ");
     var input = readln();
-    var pnum;
+    var dyn pnum;   # holds a find() result (opt int) or a parsed int
 
     if (input == "q") {
         print();
@@ -93,12 +93,14 @@ print();
 print("Shopping list");
 print("-" * 40);
 
-var total = 0.0;
+# products hold heterogeneous [name, price] pairs (str + float), so a price and
+# anything derived from it is dynamically typed.
+var dyn total = 0.0;
 
 foreach (var pnum, q in shopping_list) {
 
-    var name, price = products[pnum];
-    var subtotal = price * q;
+    var dyn name, price = products[pnum];
+    var dyn subtotal = price * q;
 
     print(
         rpad(name, 15)
