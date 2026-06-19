@@ -93,6 +93,11 @@ private:
     bool changed = false;
     FuncInfo *cur_func = nullptr;
 
+    /* Flow-sensitive null narrowing (check pass only): inside the proven branch
+     * of `if (x != none)` / `if (x)`, x reads as non-opt. */
+    std::unordered_map<const TypeSym *, STyRef> narrowed;
+    bool narrowing_on = false;
+
     /* helpers */
     Scope *new_scope(Scope *parent);
     TypeSym *new_sym(const UniqueId *name, Scope *s, Loc loc);
@@ -132,6 +137,8 @@ private:
 
     /* check pass */
     void check(Construct *n);
+    void check_if(IfStmt *i);
+    TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
     void check_call(CallExpr *call);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
@@ -377,8 +384,10 @@ void Inferencer::run()
     }
 
     cur_func = nullptr;
+    narrowing_on = true;
     for (auto &e : rootBlock->elems)
         check(e.get());
+    narrowing_on = false;
 
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
     for (auto &e : rootBlock->elems)
@@ -674,7 +683,15 @@ STyRef Inferencer::type_of(const Construct *e)
         auto it = id_sym.find(id);
         if (it != id_sym.end() && it->second) {
             TypeSym *s = it->second;
-            return s->func ? func_sty(s->func) : s->type;
+            if (s->func)
+                return func_sty(s->func);
+            /* flow narrowing: in an `if (x != none)` branch, x is non-opt */
+            if (narrowing_on) {
+                auto nit = narrowed.find(s);
+                if (nit != narrowed.end())
+                    return nit->second;
+            }
+            return s->type;
         }
         return A.dyn_ty();    /* builtin used as value, or unresolved (Q4) */
     }
@@ -1327,6 +1344,78 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
     }
 }
 
+/*
+ * If `cond` proves a single variable non-none in one branch, return its
+ * TypeSym and set in_then. Recognizes `x != none` / `none != x` (then),
+ * `x == none` / `none == x` (else), and a bare `x` (then). Only narrows a
+ * symbol whose type is actually nullable.
+ */
+TypeSym *Inferencer::narrow_target(Construct *cond, bool &in_then)
+{
+    auto sym_of = [&](Construct *c) -> TypeSym * {
+        auto *id = dynamic_cast<Identifier *>(c);
+        if (!id)
+            return nullptr;
+        auto it = id_sym.find(id);
+        TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
+        if (s && !s->func && is_optish(s->type) && !is_dyn(s->type))
+            return s;
+        return nullptr;
+    };
+
+    /* bare `if (x)` */
+    if (TypeSym *s = sym_of(cond)) {
+        in_then = true;
+        return s;
+    }
+
+    /* `x != none` / `x == none` (Expr07, two operands) */
+    auto *mo = dynamic_cast<MultiOpConstruct *>(cond);
+    if (mo && (dynamic_cast<Expr07 *>(cond)) && mo->elems.size() == 2) {
+        const Op op = mo->elems[1].first;
+        if (op != Op::eq && op != Op::noteq)
+            return nullptr;
+        Construct *a = mo->elems[0].second.get();
+        Construct *b = mo->elems[1].second.get();
+        TypeSym *s = nullptr;
+        if (dynamic_cast<LiteralNone *>(b))
+            s = sym_of(a);
+        else if (dynamic_cast<LiteralNone *>(a))
+            s = sym_of(b);
+        if (!s)
+            return nullptr;
+        in_then = (op == Op::noteq);    /* != none -> non-none in then */
+        return s;
+    }
+
+    return nullptr;
+}
+
+void Inferencer::check_if(IfStmt *i)
+{
+    check(i->condExpr.get());
+
+    bool in_then = false;
+    TypeSym *nsym = narrow_target(i->condExpr.get(), in_then);
+
+    auto with_narrow = [&](Construct *branch, bool active) {
+        if (!branch)
+            return;
+        if (nsym && active) {
+            const bool had = narrowed.count(nsym) != 0;
+            STyRef old = had ? narrowed[nsym] : nullptr;
+            narrowed[nsym] = strip(nsym->type);
+            check(branch);
+            if (had) narrowed[nsym] = old; else narrowed.erase(nsym);
+        } else {
+            check(branch);
+        }
+    };
+
+    with_narrow(i->thenBlock.get(), in_then);
+    with_narrow(i->elseBlock.get(), !in_then);
+}
+
 void Inferencer::check(Construct *n)
 {
     if (!n)
@@ -1338,6 +1427,32 @@ void Inferencer::check(Construct *n)
         cur_func = (it != func_of_decl.end()) ? it->second : nullptr;
         check(fd->body.get());
         cur_func = prev;
+        return;
+    }
+
+    if (auto *i = dynamic_cast<IfStmt *>(n)) {
+        check_if(i);
+        return;
+    }
+
+    if (auto *b = dynamic_cast<Block *>(n)) {
+        /* guard-clause narrowing: after `if (x == none) <return/throw>`, x is
+         * non-none for the rest of this block. */
+        std::vector<const TypeSym *> added;
+        for (auto &st : b->elems) {
+            check(st.get());
+            auto *gi = dynamic_cast<IfStmt *>(st.get());
+            if (!gi || gi->elseBlock || !always_exits(gi->thenBlock.get()))
+                continue;
+            bool in_then = false;
+            TypeSym *s = narrow_target(gi->condExpr.get(), in_then);
+            if (s && !in_then && !narrowed.count(s)) {
+                narrowed[s] = strip(s->type);
+                added.push_back(s);
+            }
+        }
+        for (const TypeSym *s : added)
+            narrowed.erase(s);
         return;
     }
 

@@ -5071,6 +5071,30 @@ static const std::vector<test> tests =
       { "var dyn d = 5; throw 5;" }, &typeid(TypeMismatchEx) },
     { "ti reject: assigning an incompatible type to an inferred var",
       { "var x = [1,2]; x = 5;" }, &typeid(TypeMismatchEx) },
+
+    /* ---- flow-sensitive null narrowing (accept) ---- */
+    { "ti narrow: if (x != none) then-branch",
+      { "func f(opt x) { if (x != none) return x + 1; return 0; }",
+        "assert(f(5) == 6); assert(f(none) == 0);" } },
+    { "ti narrow: if (x) truthy then-branch",
+      { "func f(opt x) { if (x) return x * 2; return -1; }",
+        "assert(f(5) == 10);" } },
+    { "ti narrow: if (x == none) else-branch",
+      { "func f(opt x) { if (x == none) return 0; else return x + 1; }",
+        "assert(f(7) == 8); assert(f(none) == 0);" } },
+    { "ti narrow: guard clause `if (x == none) return`",
+      { "func f(opt x) { if (x == none) return -1; return x * 10; }",
+        "assert(f(4) == 40); assert(f(none) == -1);" } },
+
+    /* ---- precise const-container element types (accept) ---- */
+    { "ti: heterogeneous const array is array<dyn> (no error)",
+      { "const a = [1, \"x\", 3.0]; var s = \"\"; foreach (var e in a) s = s+e;",
+        "assert(len(s) > 0);" } },
+    { "ti: array(N) then fill is array<int> (foreach sums)",
+      { "var a = array(5); for (var i=0;i<5;i+=1) a[i]=i;",
+        "var s=0; foreach (var x in a) s += x; assert(s == 10);" } },
+    { "ti reject: typed-int use of an un-narrowed opt is still caught",
+      { "func f(opt x) => x + 1; f(3);" }, &typeid(NullabilityEx) },
 };
 
 static void
