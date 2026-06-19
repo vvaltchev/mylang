@@ -420,6 +420,10 @@ private:
                            && promotable(fc, id->sym.slot)) {
                         /* write-once scalar const: record it and drop the decl;
                          * all uses fold to the literal. */
+                        if (analysis)
+                            analysis->mark(id->start,
+                                static_cast<int>(id->get_str().length()),
+                                AnnoKind::auto_const);
                         fc.consts[id->sym.slot] = e14->rvalue->eval(&cctx);
                         continue;
                     }
@@ -474,9 +478,17 @@ private:
                  * only the live branch. Errors in dead code are not surfaced
                  * here - that's the parser's job for const/literal exprs. */
                 const EvalValue v = iff->condExpr->eval(&cctx);
+                const bool t = v.get_type()->is_true(v);
+                /* -a: the not-taken branch is dead - dim it (capture its span
+                 * before it's dropped). */
+                if (analysis) {
+                    Construct *dead = t ? iff->elseBlock.get()
+                                        : iff->thenBlock.get();
+                    if (dead)
+                        analysis->mark_dead(dead->start, dead->end);
+                }
                 unique_ptr<Construct> taken =
-                    v.get_type()->is_true(v) ? move(iff->thenBlock)
-                                             : move(iff->elseBlock);
+                    t ? move(iff->thenBlock) : move(iff->elseBlock);
                 if (!taken || !fold_child(taken, fc))
                     return false;          /* no live branch (or folds away) */
                 slot = move(taken);        /* replace if with its live branch */
@@ -495,9 +507,13 @@ private:
             fold_reads(w->condExpr, fc);
             if (is_scalar_literal(w->condExpr.get())) {
                 const EvalValue v = w->condExpr->eval(&cctx);
-                if (!v.get_type()->is_true(v))
-                    return false;          /* while (false): dead, drop it
-                                            * without folding the body */
+                if (!v.get_type()->is_true(v)) {
+                    /* while (false): the whole loop is dead - dim it and drop
+                     * it without folding the body. */
+                    if (analysis)
+                        analysis->mark_dead(w->start, w->end);
+                    return false;
+                }
             }
             if (w->body && !fold_child(w->body, fc))   /* live / maybe-live */
                 w->body.reset();
@@ -579,6 +595,12 @@ private:
             if (id->sym.kind == SymKind::local) {
                 auto it = fc.consts.find(id->sym.slot);
                 if (it != fc.consts.end()) {
+                    /* A use of an auto-const var folds to its literal here -
+                     * color the original identifier yellow before it's gone. */
+                    if (analysis)
+                        analysis->mark(id->start,
+                            static_cast<int>(id->get_str().length()),
+                            AnnoKind::auto_const);
                     /* Scalars inline as a literal. A seeded array/dict const
                      * (specialization only) bakes into a read-only LiteralObj
                      * so refold can fold reads of it - process_arrays and
@@ -1343,7 +1365,10 @@ class Inliner {
 public:
 
     explicit Inliner(int max_nodes, AnalysisInfo *a = nullptr)
-        : max_nodes(max_nodes), cctx(nullptr, true), ac(a), analysis(a) { }
+        /* `ac` folds specialization *clones*, not the original source, so it
+         * must NOT record analysis (that would color the original body for one
+         * specialized call). The Inliner records inline/specialize itself. */
+        : max_nodes(max_nodes), cctx(nullptr, true), ac(), analysis(a) { }
 
     void run(Block *root)
     {
