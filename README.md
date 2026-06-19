@@ -1557,8 +1557,17 @@ Because the representation is fixed, the *only* way to ask a flat
 (statically-typed) array to hold a value of a different type is to launder it
 through a `dyn` alias and mutate that (e.g. `var dyn d = int_array;
 append(d, "x")`). The array's shared storage stays int-typed, so this raises a
-`TypeError` rather than promoting — declare the array `dyn` from the start
-(`var dyn a = [...]`) if you want a polymorphic (general) array.
+`TypeError` rather than promoting.
+
+To get a polymorphic (general) array on purpose:
+
+  * **Declare it `dyn`.** `var dyn a = [1, 2, 3];` builds a general array from
+    the start, so `a[0] = "x";` just works. (`runtime()` does **not** do this —
+    it only changes the array's *static type* as the compiler sees it, not how
+    it is stored, so the value stays flat and a mixed write still throws.)
+  * **Promote an existing array with `dynarray()`** (below) — `clone()` /
+    `deepclone()` deliberately preserve the layout, so a clone of a flat array
+    is still flat.
 
 #### `undef(symbol)`
 Undefine the given symbol from the current scope. Return true if the given
@@ -1584,6 +1593,17 @@ An alias for `append()`. Useful for symmetry when used with `pop()`.
 
 #### `pop(array)`
 Pop (and return) the last element from the given array.
+
+#### `dynarray(array)`
+Return a fresh, **general (polymorphic) copy** of `array` — its static type is
+`array<dyn>`, so the copy can hold elements of any type. This is the explicit,
+manual way to "promote" a flat (`int`/`float`) array into one you can store
+mixed types into; there is no automatic runtime promotion (see
+[`array_storage()`](#array_storagearray)). The original is left untouched and
+keeps its compact layout, and the copy is independent of it (unlike a plain
+`var d = a`, which aliases). The copy is shallow (top-level): nested arrays keep
+their own representation. Compare `var dyn a = [...]`, which builds a general
+array from the start.
 
 ### Non-const generic-container builtins
 

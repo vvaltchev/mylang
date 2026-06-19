@@ -273,6 +273,9 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("ispuredecl", builtin_ispuredecl),
     make_builtin("intptr", builtin_intptr),
     make_builtin("array_storage", builtin_array_storage),
+    /* dynarray(a): manual promotion - a fresh general (polymorphic) copy of an
+     * array. Non-const (fresh mutable value). See builtin_dynarray. */
+    make_builtin("dynarray", builtin_dynarray),
     /* array() is non-const: it never folds to a baked literal, so array(N) is
      * always a runtime call (uniform const/runtime type-driven fill) and a huge
      * array(1000000) isn't baked into the AST. */

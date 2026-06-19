@@ -962,8 +962,11 @@ are unchanged.
   `set_array_repr_hint` (in `annotate_hints`, runs on `a = <rvalue>` decls and
   assigns) stamps an **`ArrHint`** (`syntax.h`: `dflt`/`general`/`flat_i`/
   `flat_f`) on the rvalue — on a `range()`/`array()`/`make_array()` call's args
-  `ExprList`, or directly on an array literal / folded `LiteralObj`. The
-  creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f` → flat
+  `ExprList`, or directly on an array literal / folded `LiteralObj`. A
+  `dyn`-typed destination (`var dyn d = [1,2,3]`) also gets `general`, so
+  declaring `dyn` builds a polymorphic array from the start (else a later
+  `d[0]="x"` would wrongly hit the flat-array error on an already-`dyn` var).
+  Creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f` → flat
   `0`/`0.0` fill, replacing the old `array(N)` rewrite; `general` → general),
   `make_array`, `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
   literal bound to an `array<dyn>` dest is made general via
@@ -990,8 +993,12 @@ are unchanged.
   mutating it (`var dyn d = int_array; append(d, "x")` / `d[0]="x"` / `insert`).
   Since the storage stays int-typed and an alias-affecting write can't change
   its representation without promotion, that **throws a `TypeErrorEx`** (message
-  `flat_array_violation_msg`) — declare the array `dyn` from the start for a
-  (general) polymorphic array. `array_storage(a)` reports
+  `flat_array_violation_msg`) — declare the array `dyn` from the start, or
+  promote an existing one with the **`dynarray(a)`** builtin
+  (`builtin_dynarray`: a fresh general copy, typed `array<dyn>`, usable in any
+  position; `clone`/`deepclone` deliberately preserve the layout). `runtime()`
+  does *not* promote — it only relabels the static type, not the storage.
+  `array_storage(a)` reports
   `"ints"`/`"floats"`/`"general"` (tests pin it). **Gotcha:** any pass that
   inspects a const array's element type must read from `skind()`, not
   `get_view()`/`get_vec()` (now they'd throw on flat anyway). `array()` is a

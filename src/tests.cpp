@@ -2535,6 +2535,43 @@ static const std::vector<test> tests =
         { "array_storage(42);" },
         &typeid(TypeErrorEx),
     },
+    {
+        /* `var dyn` declares a polymorphic array, so it is built general from
+         * the start - a later mixed write does not hit the flat-array error. */
+        "Typed arrays: var dyn builds a general (polymorphic) array",
+        {
+            "var dyn d = [1,2,3];",
+            "assert(array_storage(d) == \"general\");",
+            "d[0] = \"x\";",
+            "assert(d == [\"x\", 2, 3]);",
+            "var dyn e = array(3, 0);",
+            "e[1] = \"y\";",
+            "assert(e == [0, \"y\", 0]);",
+        },
+    },
+    {
+        /* dynarray(a) is the manual promotion: a fresh general copy of a flat
+         * array. The original stays flat/typed; the copy is independent and
+         * polymorphic, typed array<dyn> so a plain `var` is fine. */
+        "Typed arrays: dynarray() promotes a flat array to a general copy",
+        {
+            "var a = range(3);",
+            "var d = dynarray(a);",
+            "assert(array_storage(a) == \"ints\");",
+            "assert(array_storage(d) == \"general\");",
+            "d[0] = \"x\";",
+            "append(d, 9.5);",
+            "assert(d == [\"x\", 1, 2, 9.5]);",
+            "assert(a == [0, 1, 2]);",      /* original untouched */
+            "var f = dynarray([1.0, 2.0]);", /* also works on float arrays */
+            "assert(array_storage(f) == \"general\");",
+        },
+    },
+    {
+        "dynarray() rejects a non-array",
+        { "dynarray(42);" },
+        &typeid(TypeErrorEx),
+    },
 
     {
         "Builtin pop(), slices",
