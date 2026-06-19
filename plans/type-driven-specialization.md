@@ -1,10 +1,17 @@
 # Type-driven specialization + mandatory `dyn`
 
-Status: **Phase A DONE** (`--debug-ti`, the mandatory-`dyn` rule ON by default,
-and the inference-completeness audit of the whole corpus). Phase B (array
-element-type strictness + type-driven representation) is next. The end goal is
-to make array (and later, scalar) representation choices driven by the *static
-type the inferencer proved*, not by the runtime value.
+Status: **Phase A + Phase B DONE.** Phase A: `--debug-ti`, the mandatory-`dyn`
+rule ON by default, and the inference-completeness audit of the whole corpus.
+Phase B: type-driven flat-array representation — flat int/float array literals,
+`array(N)` one-arg auto-fill (0/0.0/none by inference), and the nested
+flat-subscript-store fix; `array()` made non-const. **Array element-type
+strictness (`array<dyn>` requires `dyn`) was deliberately NOT done** — the user
+chose tolerant arrays: it forced `dyn` on every heterogeneous container
+(literals, mixed dicts, all `kvpairs()` results, ~21 core tests) and was *not*
+needed for the payoff, since inference already computes the exact element type.
+The end goal — representation driven by the proven static type, not the runtime
+value — is met: a literal/`array(N)`'s element type drives flat-vs-general, and
+a genuinely `array<dyn>` value is made general (no specialize-then-promote).
 
 **Phase A results:** every identifier in `bench/my/*` and `samples/*` infers a
 concrete type (zero spurious `dyn`); the completeness fixes are the
