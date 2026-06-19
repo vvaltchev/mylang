@@ -535,18 +535,63 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
-    SharedArrayObj::vec_type vec;
-
     if (!elems.size())
         return empty_arr;
 
-    vec.reserve(elems.size());
+    /*
+     * Build flat (unboxed) int/float storage when every element is that one
+     * scalar kind - a literal's element types ARE its type, so this
+     * value-driven check yields exactly the type-driven representation (plans/
+     * type-driven-specialization.md). Optimistic: accumulate into the unboxed
+     * vector while the kind holds, spilling to a general vector<LValue> at the
+     * first off-kind element. A mixed literal is general.
+     */
+    const size_t n = elems.size();
+    SharedArrayObj::ivec_type ivec;
+    SharedArrayObj::fvec_type fvec;
+    SharedArrayObj::vec_type  gvec;
+    int mode = 0;   /* 0 = empty, 1 = ints, 2 = floats, 3 = general */
+
+    auto spill_to_general = [&]() {
+        gvec.reserve(n);
+        if (mode == 1)
+            for (int_type x : ivec)
+                gvec.emplace_back(EvalValue(x), ctx->const_ctx);
+        else if (mode == 2)
+            for (float_type x : fvec)
+                gvec.emplace_back(EvalValue(x), ctx->const_ctx);
+        ivec.clear();
+        fvec.clear();
+        mode = 3;
+    };
 
     for (const auto &e : elems) {
-        vec.emplace_back(RValue(e->eval(ctx)), ctx->const_ctx);
+
+        EvalValue v = RValue(e->eval(ctx));
+
+        if (mode == 0) {
+            if (v.is<int_type>()) {
+                mode = 1; ivec.push_back(v.get<int_type>());
+            } else if (v.is<float_type>()) {
+                mode = 2; fvec.push_back(v.get<float_type>());
+            } else {
+                mode = 3; gvec.reserve(n);
+                gvec.emplace_back(v, ctx->const_ctx);
+            }
+        } else if (mode == 1 && v.is<int_type>()) {
+            ivec.push_back(v.get<int_type>());
+        } else if (mode == 2 && v.is<float_type>()) {
+            fvec.push_back(v.get<float_type>());
+        } else {
+            if (mode != 3)
+                spill_to_general();
+            gvec.emplace_back(v, ctx->const_ctx);
+        }
     }
 
-    return SharedArrayObj(move(vec));
+    if (mode == 1) return SharedArrayObj(move(ivec));
+    if (mode == 2) return SharedArrayObj(move(fvec));
+    return SharedArrayObj(move(gvec));
 }
 
 /*
@@ -1168,13 +1213,45 @@ as_resolved_local(const Construct *lvalue)
  * Returns true (and sets `out` to the stored value) when it handled the store;
  * false to fall through to the general lvalue->eval() -> doAssign() path. To
  * keep the fall-through sound it commits to the flat path only after deciding
- * on the BASE alone (which must be a side-effect-free identifier, so re-eval on
- * the general path is harmless); the index is evaluated once, inside.
+ * on the BASE alone (which must be a side-effect-free lvalue - an id or a
+ * nested subscript/member chain like `a[0][0]`, so re-eval on the general path
+ * is harmless); the index is evaluated once, inside. Handling nested bases is
+ * essential: a flat array nested in a general one (e.g. `[[1,2],[3,4]]`) has no
+ * element LValue, so `a[0][0] = v` can only be written here.
  *
  * A value that doesn't fit the flat kind (a string into an int array, only
  * reachable through `dyn`) promotes the array and stores generally - same
  * result as the un-specialized path, just slower for that one cold write.
  */
+static bool
+no_side_effects(const Construct *c)
+{
+    if (c->is_id())
+        return true;
+    if (dynamic_cast<const Literal *>(c))   /* scalar literals are pure */
+        return true;
+    if (c->is_subscript()) {
+        auto *s = static_cast<const Subscript *>(c);
+        return no_side_effects(s->what.get()) &&
+               no_side_effects(s->index.get());
+    }
+    if (auto *m = dynamic_cast<const MemberExpr *>(c))
+        return no_side_effects(m->what.get());
+    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+        for (const auto &pr : mo->elems)
+            if (!no_side_effects(pr.second.get()))
+                return false;
+        return true;          /* pure arithmetic/comparison index, e.g. i+1 */
+    }
+    if (auto *t = dynamic_cast<const TypedScalarExpr *>(c)) {
+        for (const auto &pr : t->elems)
+            if (!no_side_effects(pr.second.get()))
+                return false;
+        return true;          /* specialized form of the above */
+    }
+    return false;
+}
+
 static bool
 try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
                          const EvalValue &rval, EvalValue &out)
@@ -1184,8 +1261,8 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
 
     Subscript *sub = static_cast<Subscript *>(lvalue);
 
-    /* Base must be side-effect-free (a bare id) - see the note above. */
-    if (!sub->what->is_id())
+    /* Base must be a side-effect-free lvalue - see the note above. */
+    if (!no_side_effects(sub->what.get()))
         return false;
 
     const EvalValue base_lv = sub->what->eval(ctx);
