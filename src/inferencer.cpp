@@ -942,6 +942,17 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
     if (is_dyn(a) || is_dyn(b))
         return A.dyn_ty();
 
+    /*
+     * An operand the fixpoint hasn't refined yet (Unknown / bottom) must NOT
+     * collapse the result to `dyn` - that `dyn` would be sticky and poison a
+     * self-referential accumulator (`acc = (acc + i) * 3` reads `acc` as Unknown
+     * in round 0). Defer instead: return Unknown so a later round refines it
+     * once the operand's real type is known. (Comparisons above already yield
+     * int regardless.)
+     */
+    if (is_unknown(a) || is_unknown(b))
+        return bottom;
+
     STyRef au = strip(a), bu = strip(b);
     const bool an = is_num(au), bn = is_num(bu);
 
