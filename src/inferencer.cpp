@@ -872,6 +872,8 @@ STyRef Inferencer::type_of(const Construct *e)
                 return s->func->ret;
             if (s && is_func(s->type))
                 return sty_resolve(s->type)->ret;
+            if (s && is_unknown(s->type))
+                return bottom;          /* defer: callee not yet known */
             if (s && is_dyn(s->type))
                 return A.dyn_ty();
             if (!s && is_builtin(cid->uid))
@@ -879,11 +881,13 @@ STyRef Inferencer::type_of(const Construct *e)
             return A.dyn_ty();
         }
         STyRef ct = type_of(callee);
+        if (is_unknown(sty_resolve(ct))) return bottom;   /* defer */
         return is_func(ct) ? sty_resolve(ct)->ret : A.dyn_ty();
     }
 
     if (auto *sub = dynamic_cast<const Subscript *>(e)) {
         STyRef w = sty_resolve(type_of(sub->what.get()));
+        if (is_unknown(w)) return bottom;   /* defer: container not yet known */
         if (w->kind == STyKind::Array) return w->elem;
         if (w->kind == STyKind::Dict)  return w->val;
         if (w->kind == STyKind::Str)   return A.str_ty();
@@ -892,6 +896,7 @@ STyRef Inferencer::type_of(const Construct *e)
 
     if (auto *sl = dynamic_cast<const Slice *>(e)) {
         STyRef w = sty_resolve(type_of(sl->what.get()));
+        if (is_unknown(w)) return bottom;   /* defer */
         if (w->kind == STyKind::Array || w->kind == STyKind::Str)
             return w;
         return A.dyn_ty();
@@ -899,6 +904,7 @@ STyRef Inferencer::type_of(const Construct *e)
 
     if (auto *mem = dynamic_cast<const MemberExpr *>(e)) {
         STyRef w = sty_resolve(type_of(mem->what.get()));
+        if (is_unknown(w)) return bottom;   /* defer */
         if (w->kind == STyKind::Dict)
             return w->val;
         return A.dyn_ty();
@@ -922,6 +928,7 @@ STyRef Inferencer::unary_result(Op op, STyRef a)
         return A.int_ty();
     if (op == Op::plus || op == Op::minus) {
         STyRef u = strip(sty_resolve(a));
+        if (is_unknown(u)) return bottom;   /* defer: operand not yet known */
         if (u->kind == STyKind::Int || u->kind == STyKind::Float)
             return u;
         return A.dyn_ty();
@@ -1009,6 +1016,7 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     };
     auto elem_of = [&](STyRef c) -> STyRef {
         c = sty_resolve(c);
+        if (is_unknown(c))             return bottom;   /* defer */
         if (c->kind == STyKind::Array) return c->elem;
         if (c->kind == STyKind::Str)   return A.str_ty();
         if (c->kind == STyKind::Dict)  return c->key;
@@ -1052,6 +1060,7 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "make_array") {
         /* make_array(N, gen) -> array of the callback's return type. */
         STyRef f = sty_resolve(arg(1));
+        if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
     }
     if (n == "dict")   return A.dict_of(A.dyn_ty(), A.dyn_ty());
@@ -1061,8 +1070,14 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "runtime")
         return A.dyn_ty();   /* the documented opt-out: defer to runtime (Q) */
     if (n == "min" || n == "max") {
+        /* min(array) -> the element type; min(a, b, ...) -> the join of args. */
+        if (args->elems.size() == 1)
+            return elem_of(arg(0));
         STyRef t = arg(0);
         for (size_t i = 1; i < args->elems.size(); i++) {
+            if (is_unknown(sty_resolve(t)) ||
+                is_unknown(sty_resolve(arg(i))))
+                return bottom;          /* defer */
             STyRef j = A.join(t, arg(i));
             t = j ? j : A.dyn_ty();
         }
@@ -1075,6 +1090,7 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "map") {
         /* map(func, container) -> array of the callback's return type */
         STyRef f = sty_resolve(arg(0));
+        if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
     }
     if (n == "filter")              /* filter(func, container) -> container */
@@ -1084,14 +1100,17 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "keys") {
         STyRef d = sty_resolve(arg(0));
+        if (is_unknown(d)) return bottom;   /* defer */
         return A.array_of(d->kind == STyKind::Dict ? d->key : A.dyn_ty());
     }
     if (n == "values") {
         STyRef d = sty_resolve(arg(0));
+        if (is_unknown(d)) return bottom;   /* defer */
         return A.array_of(d->kind == STyKind::Dict ? d->val : A.dyn_ty());
     }
     if (n == "find") {
         STyRef d = sty_resolve(arg(0));
+        if (is_unknown(d)) return bottom;   /* defer */
         return A.with_opt(d->kind == STyKind::Dict ? d->val : A.dyn_ty(), true);
     }
 
