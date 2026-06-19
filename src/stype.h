@@ -104,6 +104,11 @@ private:
 
     STyRef alloc(STyKind k);
     STyRef ground(STyKind k, bool opt);
+
+    /* join for a *container element* (array elem / dict value): treats None as
+     * bottom (absorbed, not nullable) so array(N)-then-fill or a default-none
+     * slot does not make the element type `opt`. */
+    STyRef join_elem(STyRef a, STyRef b);
 };
 
 /* Free functions: pure (no allocation) given the nodes they are handed. */

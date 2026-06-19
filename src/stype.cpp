@@ -254,8 +254,20 @@ bool sty_unify(STyRef a, STyRef b)
 
 /* ---------------------------- assignable --------------------------------- */
 
-/* Underlying-kind compatibility, ignoring the opt flag. a and b are resolved
- * and neither is Unknown, None, or Dyn. */
+/* Two container component types are compatible for assignment when they are
+ * equal, or when either is None (an empty container - the bottom element type)
+ * or Dyn (a heterogeneous container). Keeps arrays/dicts practically usable
+ * despite invariance: an empty [] fits any array<T>, a dyn array fits any. */
+static bool sty_elem_compat(STyRef a, STyRef b)
+{
+    a = sty_resolve(a);
+    b = sty_resolve(b);
+    if (a->kind == STyKind::None || b->kind == STyKind::None ||
+        a->kind == STyKind::Dyn  || b->kind == STyKind::Dyn)
+        return true;
+    return sty_equal(a, b);
+}
+
 static bool sty_same_underlying(STyRef a, STyRef b)
 {
     if (a->kind != b->kind)
@@ -264,10 +276,11 @@ static bool sty_same_underlying(STyRef a, STyRef b)
     switch (a->kind) {
 
         case STyKind::Array:
-            return sty_equal(a->elem, b->elem);
+            return sty_elem_compat(a->elem, b->elem);
 
         case STyKind::Dict:
-            return sty_equal(a->key, b->key) && sty_equal(a->val, b->val);
+            return sty_elem_compat(a->key, b->key) &&
+                   sty_elem_compat(a->val, b->val);
 
         case STyKind::Func:
             /* Assignability between function types checks ARITY only. Deep
@@ -275,7 +288,7 @@ static bool sty_same_underlying(STyRef a, STyRef b)
              * callback's own param/return types are themselves inferred and may
              * finalize to dyn after the type that captured them was frozen) and
              * yields false positives on ordinary higher-order code (e.g.
-             * apply(sq, i)). Calls made through the function are still checked at
+             * apply(sq, i)). Calls through the function are still checked at
              * their own site, and the body type-checks independently. Precise
              * function subtyping is deferred (plans/type-inference.md). */
             return a->params.size() == b->params.size();
@@ -366,17 +379,17 @@ STyRef STyArena::join(STyRef a, STyRef b)
             return ground(a->kind, anyopt);
 
         case STyKind::Array: {
-            STyRef ej = join(a->elem, b->elem);
+            STyRef ej = join_elem(a->elem, b->elem);
             if (!ej)
                 ej = g_dyn;               /* D1: mixed elements -> dyn */
             return array_of(ej, anyopt);
         }
 
         case STyKind::Dict: {
-            STyRef kj = join(a->key, b->key);
+            STyRef kj = join_elem(a->key, b->key);
             if (!kj)
                 kj = g_dyn;
-            STyRef vj = join(a->val, b->val);
+            STyRef vj = join_elem(a->val, b->val);
             if (!vj)
                 vj = g_dyn;
             return dict_of(kj, vj, anyopt);
@@ -404,6 +417,17 @@ STyRef STyArena::join(STyRef a, STyRef b)
         default:
             return nullptr;
     }
+}
+
+STyRef STyArena::join_elem(STyRef a, STyRef b)
+{
+    a = sty_resolve(a);
+    b = sty_resolve(b);
+    if (a->kind == STyKind::None)
+        return b;                 /* absorbed: an uninitialized/none slot */
+    if (b->kind == STyKind::None)
+        return a;
+    return join(a, b);
 }
 
 /* ----------------------------- to_string --------------------------------- */
