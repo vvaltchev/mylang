@@ -617,7 +617,38 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   `RuntimeException`s, so script `try/catch` cannot catch them; `errors.h`):
   `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),
   `NullabilityEx` (`none`/`opt` used where a non-opt value is required),
-  `WrongArgCountEx` (arity). Each carries an interned custom message + a `Loc`.
+  `WrongArgCountEx` (arity), `DynRequiredEx` (the mandatory-`dyn` rule below).
+  Each carries an interned custom message + a `Loc`.
+- **Mandatory `dyn`** (`enforce_concrete_decls`, ON by default via
+  `infer_types(strict=true)`, off under `-nti`): a plain `var`/`const` must
+  infer a *concrete* type; if its type is `dyn` it throws `DynRequiredEx`
+  demanding an explicit `dyn`/`var dyn`. Phase A (`strict_deep=false`) flags a
+  top-level `dyn` — `array<dyn>` is tolerated; Phase B (the flag) would recurse
+  into containers. Skips params (a never-called func's param is legitimately
+  `dyn`), foreach loop vars (type derived from the container), and func names.
+  Runs **after** the check pass, so a var that is `dyn` *because of* a real type
+  error surfaces that error first. See `plans/type-driven-specialization.md`.
+- **The defer-on-Unknown/None invariant (soundness of the fixpoint).** Any type
+  computation (`binop_result`, `unary_result`, `elem_of`, `type_of` of
+  Subscript/Slice/Member/CallExpr-callee, `accumulate_foreach`) that meets an
+  operand the fixpoint hasn't pinned yet — `Unknown` (bottom) **or** a transient
+  `None` (an `array(N)` element before a write pins it) — must return
+  Unknown/defer, **never `dyn`**. A premature `dyn` is sticky (it climbs the
+  lattice and never comes back) and permanently poisons a self-referential
+  accumulator (`acc = (acc+i)*3`, `s += sum(a)`, a foreach loop var). The check
+  pass re-validates genuine errors (`require_nonopt`, not-subscriptable) with
+  the final types, so deferring during accumulate hides nothing. **When
+  touching the inferencer, audit any new `return A.dyn_ty()` for this.**
+  `--debug-ti` dumps
+  every identifier's inferred type + uses to find spurious `dyn`s.
+- **Finalization of unconstrained symbols.** An unconstrained *param* or
+  *foreach loop var* → `dyn` (could be anything); a plain local → `none`. A func
+  with an Unknown *return* → `dyn` (it returns a value that depends on
+  unconstrained inputs, e.g. a func only ever passed as a value); a func with no
+  value-returning path → `none` (it contributed `none` to `ret_acc`). An
+  unresolved identifier / callee defers to Unknown (so the enclosing var isn't
+  forced to `dyn`, and the runtime `UndefinedVariableEx` surfaces); a *builtin*
+  used as a value is genuinely `dyn`.
 - **Null narrowing** (`check_if`/`narrow_target`, check pass only): inside a
   proven branch a nullable var reads as non-opt — `if (x != none)` / `if (x)`
   (then), `if (x == none) ... else` (else), and the guard clause
@@ -1006,10 +1037,10 @@ and two macros:
   `CannotRebindConstEx`, `ExpressionIsNotConstEx`, …). **Not catchable** from
   script.
 - **Compile-time type errors** (`TypeMismatchEx`, `NullabilityEx`,
-  `WrongArgCountEx`) — thrown by the type inferencer (see "Static type
-  inference"). Plain `Exception`s (not `RuntimeException`s), so **not catchable**
-  from script; each carries a custom interned message + `Loc`. A statically
-  provable type error is reported here, before the program runs.
+  `WrongArgCountEx`, `DynRequiredEx`) — thrown by the type inferencer (see
+  "Static type inference"). Plain `Exception`s (not `RuntimeException`s), so
+  **not catchable** from script; each carries a custom interned message + `Loc`.
+  A statically provable type error is reported here, before the program runs.
 - `DECL_RUNTIME_EX` — subclasses of `RuntimeException` (adds `clone()` +
   `[[noreturn]] rethrow()`):
   `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `NotLValueEx`,
