@@ -887,7 +887,10 @@ STyRef Inferencer::type_of(const Construct *e)
 
     if (auto *sub = dynamic_cast<const Subscript *>(e)) {
         STyRef w = sty_resolve(type_of(sub->what.get()));
-        if (is_unknown(w)) return bottom;   /* defer: container not yet known */
+        /* Defer on Unknown OR None: a None base is a fixpoint transient (the
+         * element of an array(N) before its element type is pinned); a genuine
+         * non-subscriptable base is caught in the check pass. */
+        if (is_unknown(w) || is_none(w)) return bottom;
         if (w->kind == STyKind::Array) return w->elem;
         if (w->kind == STyKind::Dict)  return w->val;
         if (w->kind == STyKind::Str)   return A.str_ty();
@@ -896,7 +899,7 @@ STyRef Inferencer::type_of(const Construct *e)
 
     if (auto *sl = dynamic_cast<const Slice *>(e)) {
         STyRef w = sty_resolve(type_of(sl->what.get()));
-        if (is_unknown(w)) return bottom;   /* defer */
+        if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
         if (w->kind == STyKind::Array || w->kind == STyKind::Str)
             return w;
         return A.dyn_ty();
@@ -904,7 +907,7 @@ STyRef Inferencer::type_of(const Construct *e)
 
     if (auto *mem = dynamic_cast<const MemberExpr *>(e)) {
         STyRef w = sty_resolve(type_of(mem->what.get()));
-        if (is_unknown(w)) return bottom;   /* defer */
+        if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
         if (w->kind == STyKind::Dict)
             return w->val;
         return A.dyn_ty();
@@ -958,6 +961,18 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
      * int regardless.)
      */
     if (is_unknown(a) || is_unknown(b))
+        return bottom;
+
+    /*
+     * A bare `None` operand also defers here. None arises transiently in the
+     * fixpoint as the element of an array(N) before a later write pins the
+     * element type (`a[i]` reads None until then); collapsing `None + x` to dyn
+     * would poison a downstream accumulator the same way Unknown did. A
+     * genuinely-none arithmetic operand is still rejected by require_nonopt in
+     * the check pass (which runs before binop_result there), so deferring here
+     * only affects the accumulate phase.
+     */
+    if (is_none(a) || is_none(b))
         return bottom;
 
     STyRef au = strip(a), bu = strip(b);
@@ -1016,7 +1031,7 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     };
     auto elem_of = [&](STyRef c) -> STyRef {
         c = sty_resolve(c);
-        if (is_unknown(c))             return bottom;   /* defer */
+        if (is_unknown(c) || is_none(c)) return bottom;   /* defer */
         if (c->kind == STyKind::Array) return c->elem;
         if (c->kind == STyKind::Str)   return A.str_ty();
         if (c->kind == STyKind::Dict)  return c->key;
@@ -1052,10 +1067,16 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "range")  return A.array_of(A.int_ty());
     if (n == "array") {
-        /* array(N, value) -> array<typeof value>; array(N) -> array<dyn>. */
+        /*
+         * array(N, value) -> array<typeof value>. array(N) -> array<none>: an
+         * uninitialized array whose element type is pinned by later writes
+         * (join_elem absorbs None, so array(N)-then-fill with ints is
+         * array<int>); if never written, it stays array<none>. NOT array<dyn> -
+         * that would defeat fill-based typing (see plans/type-driven-*.md).
+         */
         if (args->elems.size() >= 2)
             return A.array_of(arg(1));
-        return A.array_of(A.dyn_ty());
+        return A.array_of(A.none_ty());
     }
     if (n == "make_array") {
         /* make_array(N, gen) -> array of the callback's return type. */
