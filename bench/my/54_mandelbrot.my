@@ -1,0 +1,28 @@
+# Mandelbrot: sum of escape-iteration counts over a fixed grid (float arithmetic
+# in the inner loop: z = z*z + c). A showcase for the typed float fast path.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var SIZE = 200;
+var MAXIT = 80 * scale;
+var total = 0;
+
+for (var py = 0; py < SIZE; py += 1) {
+    var y0 = (py * 1.0 / SIZE) * 2.0 - 1.0;       # imaginary part: -1 .. 1
+    for (var px = 0; px < SIZE; px += 1) {
+        var x0 = (px * 1.0 / SIZE) * 3.0 - 2.0;   # real part: -2 .. 1
+        var zr = 0.0;
+        var zi = 0.0;
+        var it = 0;
+        while (it < MAXIT && zr * zr + zi * zi <= 4.0) {
+            var nzr = zr * zr - zi * zi + x0;
+            zi = 2.0 * zr * zi + y0;
+            zr = nzr;
+            it += 1;
+        }
+        total += it;
+    }
+}
+
+print("result:", total);
