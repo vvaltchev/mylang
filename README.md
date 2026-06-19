@@ -1207,12 +1207,18 @@ as a key. At the moment, only integers, floats and strings support `hash()`.
 ### Array builtins
 
 #### `array(N, [value])`
-Return an array with `N` elements. With one argument, every element is
-`none`. With a second argument, every element is `value` (a fixed value, not
-a callback). The fill value also picks the array's internal storage: an `int`
-or `float` fill gives a compact *flat* array (see `array_storage()`), anything
-else (including the one-argument `none` form) gives a general array. To build
-each element from its index, use `make_array()`.
+Return an array with `N` elements. With a second argument, every element is
+`value` (a fixed value, not a callback). With **one** argument the fill is
+chosen by *type inference*: if the array's inferred element type is `int` or
+`float` (e.g. you later fill it with ints), unfilled elements are `0` / `0.0`;
+otherwise they are `none`. So `var a = array(3); a[0] = 5;` yields
+`[5, 0, 0]`, while an array that stays untyped/dynamic yields all `none`. The
+element type also picks the internal storage: an `int`/`float` array is a
+compact *flat* array (see `array_storage()`), anything else is general. To
+build each element from its index, use `make_array()`.
+
+(`array()` is a *non-const* builtin: a call like `array(1000000)` is never
+folded into a baked literal at parse time, it always allocates at run time.)
 
 #### `make_array(N, gen_func)`
 Return `[gen_func(0), gen_func(1), ..., gen_func(N-1)]` — the callback form of
