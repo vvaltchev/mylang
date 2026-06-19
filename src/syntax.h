@@ -42,6 +42,16 @@ enum class ConstructType {
 enum class TypeHint : unsigned char { none, i, f };
 
 /*
+ * Representation hint for an array-producing node (a literal, a folded
+ * LiteralObj, or the args of a range()/array()/make_array() call), stamped by
+ * the inferencer from the DESTINATION's inferred type so the array is built in
+ * its final representation at creation - no runtime promotion. `dflt` =
+ * value-driven (build flat iff the elements are homogeneous int/float). See
+ * plans/type-driven-specialization.md.
+ */
+enum class ArrHint : unsigned char { dflt, general, flat_i, flat_f };
+
+/*
  * Result of the name-resolution pass (resolver.cpp) for an Identifier.
  *
  * `local` means the identifier was resolved to a fixed slot in the current
@@ -79,6 +89,16 @@ public:
      * preserve it.
      */
     TypeHint th = TypeHint::none;
+
+    /*
+     * Representation hint for an array-producing node, set by the inferencer
+     * from the destination type so the array is built in its final
+     * representation (type-driven creation, no promotion). On a CallExpr's args
+     * ExprList for range()/array()/make_array(); on the node itself for an
+     * array literal / folded LiteralObj. Default `dflt`. Copied by
+     * copy_base_fields().
+     */
+    ArrHint arr_hint = ArrHint::dflt;
 
     /*
      * Set on nodes spliced in by function inlining: the "inlined-at" chain used
@@ -144,6 +164,7 @@ protected:
         d.end = end;
         d.inline_ctx = inline_ctx;
         d.th = th;
+        d.arr_hint = arr_hint;
     }
 };
 

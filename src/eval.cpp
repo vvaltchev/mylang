@@ -550,7 +550,17 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     SharedArrayObj::ivec_type ivec;
     SharedArrayObj::fvec_type fvec;
     SharedArrayObj::vec_type  gvec;
-    int mode = 0;   /* 0 = empty, 1 = ints, 2 = floats, 3 = general */
+    /*
+     * 0 = empty, 1 = ints, 2 = floats, 3 = general. Type-driven: a literal
+     * bound to a dynamically-typed destination (arr_hint general, set by the
+     * inferencer) is built general from the start, so a later mixed write to it
+     * never has to promote. (The flat_i/flat_f hints need no special case - the
+     * value-driven scan already produces flat for an all-int/all-float literal,
+     * which is exactly when those hints are set.)
+     */
+    int mode = arr_hint == ArrHint::general ? 3 : 0;
+    if (mode == 3)
+        gvec.reserve(n);
 
     auto spill_to_general = [&]() {
         gvec.reserve(n);
@@ -775,6 +785,53 @@ make_const_clone(const EvalValue &v)
     return v;
 }
 
+/*
+ * Build a fresh, mutable GENERAL array from a flat (unboxed int/float) array,
+ * reading its scalar elements directly (no promotion of the source). Used to
+ * materialize a folded array literal whose destination is dynamically typed
+ * (arr_hint general): the array is born general so a later mixed write to it
+ * never has to promote. Only a flat source reaches here - an already-general
+ * baked value is handled by make_mutable_clone, which keeps it general.
+ */
+static EvalValue
+make_general_array_clone(const SharedArrayObj &src)
+{
+    const size_type m = src.size();
+    SharedArrayObj::vec_type gv;
+    gv.reserve(m);
+
+    if (src.skind() == SharedArrayObj::Storage::ints) {
+        const auto &iv = src.flat_ints();
+        for (size_type i = 0; i < m; i++)
+            gv.emplace_back(EvalValue(iv[src.offset() + i]), false);
+    } else {
+        const auto &fv = src.flat_floats();
+        for (size_type i = 0; i < m; i++)
+            gv.emplace_back(EvalValue(fv[src.offset() + i]), false);
+    }
+
+    return SharedArrayObj(move(gv));
+}
+
+/*
+ * Read array element i (slice-relative) as a boxed value without promoting flat
+ * (unboxed int/float) storage - the eval.cpp counterpart of types/arr.cpp.h's
+ * arr_elem_at (a separate translation unit). For a general array get_view()
+ * doesn't promote.
+ */
+static EvalValue
+arr_elem_boxed(const SharedArrayObj &a, size_type i)
+{
+    switch (a.skind()) {
+        case SharedArrayObj::Storage::ints:
+            return EvalValue(a.flat_ints()[a.offset() + i]);
+        case SharedArrayObj::Storage::floats:
+            return EvalValue(a.flat_floats()[a.offset() + i]);
+        default:
+            return a.get_view()[i].get();
+    }
+}
+
 EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
 {
     /*
@@ -784,7 +841,17 @@ EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
      * copy, and the const symbol and this node hold one buffer, not two. Any
      * other target (a `var` or a read-only consumer) gets a fresh mutable deep
      * copy, so writes work and re-entry never sees a prior mutation.
+     *
+     * Type-driven: when the destination is dynamically typed (arr_hint general)
+     * but the baked array is flat (a homogeneous literal like [1,2,3] later
+     * widened to array<dyn> by a mixed write), materialize it general from the
+     * start so that write never promotes.
      */
+    if (!immutable && arr_hint == ArrHint::general && value.is<SharedArrayObj>()
+        && value.get<SharedArrayObj>().skind()
+               != SharedArrayObj::Storage::general)
+        return make_general_array_clone(value.get<SharedArrayObj>());
+
     return immutable ? value : make_mutable_clone(value);
 }
 
@@ -1315,15 +1382,18 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
         : (newval.is<float_type>() || newval.is<int_type>());
 
     if (!fits) {
-        /* Cold path: the new element type doesn't fit. Promote and store
-         * generally (COW via the element LValue's get_value_for_put). */
-        arr.get_vec();                       /* promote in place */
-        SharedArrayObj &g = blv->getval<SharedArrayObj>();
-        LValue *elem = &g.get_vec()[g.offset() + idx];
-        elem->container = blv;
-        elem->container_idx = g.offset() + idx;
-        out = doAssign(EvalValue(elem), newval, Op::assign);
-        return true;
+        /*
+         * The new element type doesn't fit the flat array's scalar kind. mylang
+         * does not promote (flat->general) in place - the representation is
+         * fixed at creation from the proven static type. This is reachable only
+         * by laundering a typed array through `dyn` (declare it dyn from the
+         * start for a polymorphic array). Same message as arr.cpp.h's
+         * flat_array_violation_msg (a separate translation unit).
+         */
+        throw TypeErrorEx(
+            "Cannot store a value of a different type in a flat (typed) array; "
+            "declare the array dyn for a polymorphic array",
+            sub->start, sub->end);
     }
 
     /*
@@ -1577,7 +1647,8 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         } else {
 
-            const ArrayConstView &view = rval.get<SharedArrayObj>().get_view();
+            const SharedArrayObj &arr = rval.get<SharedArrayObj>();
+            const size_type asz = arr.size();
 
             for (size_type i = 0; i < idlist->elems.size(); i++) {
 
@@ -1586,7 +1657,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
                     inDecl,
                     op,
                     idlist->elems[i].get(),
-                    i < view.size() ? view[i].get() : none
+                    i < asz ? arr_elem_boxed(arr, i) : none
                 );
             }
         }
@@ -2105,8 +2176,8 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
         if (elems[0].is<SharedArrayObj>() && ids->elems.size() > (1 + id_start)) {
 
-            const ArrayConstView &view =
-                elems[0].get<SharedArrayObj>().get_view();
+            const SharedArrayObj &arr = elems[0].get<SharedArrayObj>();
+            const size_type asz = arr.size();
 
             for (size_type i = id_start; i < ids->elems.size(); i++) {
 
@@ -2116,7 +2187,7 @@ ForeachStmt::do_iter(EvalContext *ctx,
                     ctx,
                     decl,
                     ids->elems[i].get(),
-                    val_i < view.size() ? view[val_i].get() : none
+                    val_i < asz ? arr_elem_boxed(arr, val_i) : none
                 );
             }
 

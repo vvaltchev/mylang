@@ -1541,12 +1541,24 @@ to the same object.
 Return the array's internal storage as a string: `"ints"` or `"floats"` for a
 compact *flat* (unboxed) array, or `"general"` otherwise. This is purely an
 introspection aid (mainly for tests) — flat and general arrays behave
-identically; the only observable difference is speed and memory. A homogeneous
-`int`/`float` array produced by `range()`, `array(N, 0)`, `make_array()`, etc.
-stays flat through reads, slices, element writes, `append`/`pop`, `sum`, `sort`,
-`reverse`, `min`/`max`, and `foreach`; storing or appending an element of a
-different type (only possible via a `dyn`-typed alias) transparently converts it
-to a general array.
+identically; the only observable difference is speed and memory.
+
+An array's storage is **decided once, at creation, from its proven static
+type** — it is never converted afterward (no runtime "promotion", so no
+GC-stutter-like latency spikes). The compiler infers an array's type from *all*
+its uses: an array you only ever fill with ints is `array<int>` and is born
+flat; an array you also store a string into is `array<dyn>` and is born general
+from the very first element — even if its initializer looked like all ints (so
+`var a = [1,2,3]; a[0] = "x";` makes `a` general from the start). Every
+operation (`append`/`pop`/`insert`/`erase`/`sort`/`map`/`filter`/slicing/…)
+preserves the representation.
+
+Because the representation is fixed, the *only* way to ask a flat
+(statically-typed) array to hold a value of a different type is to launder it
+through a `dyn` alias and mutate that (e.g. `var dyn d = int_array;
+append(d, "x")`). The array's shared storage stays int-typed, so this raises a
+`TypeError` rather than promoting — declare the array `dyn` from the start
+(`var dyn a = [...]`) if you want a polymorphic (general) array.
 
 #### `undef(symbol)`
 Undefine the given symbol from the current scope. Return true if the given

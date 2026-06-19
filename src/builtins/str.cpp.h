@@ -88,19 +88,22 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
 
     const string_view &delim = val_delim.get<SharedStr>().get_view();
-    const ArrayConstView &arr_view = val_arr.get<SharedArrayObj>().get_view();
+    /* Read kind-aware (arr_elem_at) so a flat int/float array doesn't promote -
+     * its elements aren't strings, so each one is a clean TypeError below. */
+    const SharedArrayObj &arr = val_arr.get<SharedArrayObj>();
+    const size_type n = arr.size();
     string result;
 
-    for (size_t i = 0; i < arr_view.size(); i++) {
+    for (size_type i = 0; i < n; i++) {
 
-        const EvalValue &val = arr_view[i].get();
+        const EvalValue val = arr_elem_at(arr, i);
 
         if (!val.is<SharedStr>())
             throw TypeErrorEx("Expected string", arg_arr->start, arg_arr->end);
 
         result += val.get<SharedStr>().get_view();
 
-        if (i != arr_view.size() - 1)
+        if (i != n - 1)
             result += delim;
     }
 

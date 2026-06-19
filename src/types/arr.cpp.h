@@ -94,38 +94,6 @@ void SharedArrayObjTempl<LValueT>::clone_aliased_slices(size_type index)
     }
 }
 
-/*
- * Convert unboxed int/float storage into the general vector<LValue> form, in
- * place (destroy the flat union member, construct the general one). Value-
- * preserving, so it is sound even when the object is shared/sliced. Called by
- * get_vec() the first time something needs LValue access (see plans/
- * typed-arrays.md). Defined here, not in sharedarray.h, because it constructs
- * EvalValue/LValue.
- */
-template <class LValueT>
-void SharedArrayObjTempl<LValueT>::promote_to_general()
-{
-    if (shobj->kind == Storage::general)
-        return;
-
-    vec_type gv;
-
-    if (shobj->kind == Storage::ints) {
-        gv.reserve(shobj->ivec.size());
-        for (int_type x : shobj->ivec)
-            gv.emplace_back(EvalValue(x), false);
-        shobj->ivec.~ivec_type();
-    } else {
-        gv.reserve(shobj->fvec.size());
-        for (float_type x : shobj->fvec)
-            gv.emplace_back(EvalValue(x), false);
-        shobj->fvec.~fvec_type();
-    }
-
-    new (&shobj->vec) vec_type(move(gv));
-    shobj->kind = Storage::general;
-}
-
 /* Read element `i` (slice-relative) as a boxed EvalValue WITHOUT promoting flat
  * storage (defined below). */
 static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i);

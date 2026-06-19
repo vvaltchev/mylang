@@ -16,6 +16,21 @@
 #include <algorithm>
 
 /*
+ * A flat (unboxed) array<int>/array<float> holds exactly one scalar kind, fixed
+ * at creation from the proven static type. Storing a different type would need
+ * an in-place flat->general conversion (promotion), which mylang deliberately
+ * does NOT do - that is what type-driven representation buys (no GC-like
+ * latency spikes; the representation is decided once, at creation). This is
+ * reachable only by laundering a typed array through `dyn` and then mutating it
+ * (`var dyn d = int_array; append(d, "x")`): the shared storage stays int-typed
+ * even through the dyn alias, and an alias-affecting write can't change it.
+ * Declare the array `dyn` from the start for a (general) polymorphic array.
+ */
+static const char *const flat_array_violation_msg =
+    "Cannot store a value of a different type in a flat (typed) array; "
+    "declare the array dyn for a polymorphic array";
+
+/*
  * array(N)        -> N elements of `none` (general storage).
  * array(N, value) -> N elements all equal to `value`. The fill value drives the
  *                    storage (value-driven, see plans/typed-arrays.md): an int
@@ -41,9 +56,21 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
         throw InvalidValueEx("Expected non-negative integer",
                              arg->start, arg->end);
 
+    const ArrHint hint = exprList->arr_hint;
+
     if (nargs == 1) {
 
-        /* No fill value: a general array of `none`. */
+        /*
+         * No fill value. Type-driven: the inferencer stamps flat_i/flat_f when
+         * the destination is array<int>/array<float>, so the array is born flat
+         * with a 0 / 0.0 fill (never promoted). Otherwise a general array of
+         * `none`.
+         */
+        if (hint == ArrHint::flat_i)
+            return SharedArrayObj(SharedArrayObj::ivec_type(n, 0));
+        if (hint == ArrHint::flat_f)
+            return SharedArrayObj(SharedArrayObj::fvec_type(n, 0.0));
+
         SharedArrayObj::vec_type vec;
         vec.reserve(n);
 
@@ -55,14 +82,21 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue &v = RValue(exprList->elems[1]->eval(ctx));
 
-    /* Value-driven flat storage for a scalar fill value. */
-    if (v.is<int_type>())
-        return SharedArrayObj(
-            SharedArrayObj::ivec_type(n, v.get<int_type>()));
+    /*
+     * Flat storage for a scalar fill value, unless the destination is
+     * dynamically typed (hint == general), in which case build general from the
+     * start so a later mixed write never has to promote.
+     */
+    if (hint != ArrHint::general) {
 
-    if (v.is<float_type>())
-        return SharedArrayObj(
-            SharedArrayObj::fvec_type(n, v.get<float_type>()));
+        if (v.is<int_type>())
+            return SharedArrayObj(
+                SharedArrayObj::ivec_type(n, v.get<int_type>()));
+
+        if (v.is<float_type>())
+            return SharedArrayObj(
+                SharedArrayObj::fvec_type(n, v.get<float_type>()));
+    }
 
     /* General fill: every element is (a copy of) the value. */
     SharedArrayObj::vec_type vec;
@@ -115,7 +149,11 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
     SharedArrayObj::ivec_type ivec;
     SharedArrayObj::fvec_type fvec;
     SharedArrayObj::vec_type  gvec;
-    int mode = 0;
+    /* Type-driven: a dynamically-typed destination (hint general) builds
+     * general from the start; otherwise optimistic flat. */
+    int mode = exprList->arr_hint == ArrHint::general ? 3 : 0;
+    if (mode == 3)
+        gvec.reserve(n);
 
     auto spill_to_general = [&]() {
         gvec.reserve(n);
@@ -215,9 +253,10 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
 
     /*
      * Flat fast path: append a matching scalar straight into the unboxed
-     * vector, no promotion. A mismatched element type falls through to the
-     * general append below (which promotes). Growing in place is sound for
-     * aliases (they share the mutation) and slices (they keep their off/len).
+     * vector, no promotion. Growing in place is sound for aliases (they share
+     * the mutation) and slices (they keep their off/len). A non-fitting element
+     * on a flat array is the dyn-laundering case - it errors rather than
+     * promoting (see flat_array_violation_msg).
      */
     if (arr.skind() == SharedArrayObj::Storage::ints && elem.is<int_type>()) {
         arr.flat_ints().push_back(elem.get<int_type>());
@@ -230,6 +269,9 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
             : elem.get<float_type>());
         return lval->get();
     }
+
+    if (arr.skind() != SharedArrayObj::Storage::general)
+        throw TypeErrorEx(flat_array_violation_msg, arg0->start, arg1->end);
 
     arr.get_vec().emplace_back(elem, ctx->const_ctx);
     return lval->get();
@@ -375,8 +417,8 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     const size_type at = arr.offset() + index;
 
     /* Flat in-place insert when the value matches the kind. A non-fitting value
-     * means the array's static type is array<dyn> (so it was built general by
-     * type-driven creation): the general path below handles it. */
+     * on a flat array is the dyn-laundering case - it errors below rather than
+     * promoting (an array<dyn> was built general by type-driven creation). */
     if (arr.skind() == SharedArrayObj::Storage::ints && val.is<int_type>()) {
         auto &v = arr.flat_ints();
         v.insert(v.begin() + at, val.get<int_type>());
@@ -390,6 +432,9 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
             : val.get<float_type>());
         return true;
     }
+
+    if (arr.skind() != SharedArrayObj::Storage::general)
+        throw TypeErrorEx(flat_array_violation_msg);
 
     auto &v = arr.get_vec();
     v.insert(v.begin() + at, LValue(val, false));
@@ -438,8 +483,24 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
         end = val0.get<int_type>();
     }
 
-    /* range() is all-int by construction, so build flat (unboxed) int storage
-     * directly - see plans/typed-arrays.md. */
+    /*
+     * range() is all-int, so flat int by default. If the destination is
+     * dynamically typed (arr_hint == general, set by the inferencer), build a
+     * general array instead - it is created in its final representation, never
+     * promoted later.
+     */
+    if (exprList->arr_hint == ArrHint::general) {
+
+        SharedArrayObj::vec_type vec;
+        if (step > 0)
+            for (int_type i = start; i < end; i += step)
+                vec.emplace_back(EvalValue(i), false);
+        else
+            for (int_type i = start; i > end; i += step)
+                vec.emplace_back(EvalValue(i), false);
+        return SharedArrayObj(move(vec));
+    }
+
     SharedArrayObj::ivec_type ivec;
 
     if (step > 0) {
