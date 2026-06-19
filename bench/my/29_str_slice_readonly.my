@@ -5,9 +5,7 @@ var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
 
-var base = "";
-for (var i = 0; i < 100; i += 1)
-    base += "0123456789";          # 1000-char string
+var base = "0123456789" * 100;     # 1000-char string (matches Python's * 100)
 
 var N = 200000 * scale;
 var s = 0;

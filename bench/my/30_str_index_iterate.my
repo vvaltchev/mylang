@@ -3,9 +3,7 @@ var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
 
-var s2 = "";
-for (var i = 0; i < 500; i += 1)
-    s2 += "0123456789";            # 5000 chars
+var s2 = "0123456789" * 500;       # 5000 chars (matches Python's * 500)
 
 var R = 200 * scale;
 var total = 0;

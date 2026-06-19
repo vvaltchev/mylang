@@ -3,9 +3,7 @@ var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
 
-var a = array(1000000);
-for (var i = 0; i < len(a); i += 1)
-    a[i] = i;
+var a = range(1000000);   # [0..999999] - matches Python's list(range(...))
 
 var R = 3 * scale;
 var s = 0;
