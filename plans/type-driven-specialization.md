@@ -1,8 +1,18 @@
 # Type-driven specialization + mandatory `dyn`
 
-Status: **planning.** Large, multi-phase. The end goal is to make array (and
-later, scalar) representation choices driven by the *static type the inferencer
-proved*, not by the runtime value. That is only sound once the inferencer is
+Status: **Phase A DONE** (`--debug-ti`, the mandatory-`dyn` rule ON by default,
+and the inference-completeness audit of the whole corpus). Phase B (array
+element-type strictness + type-driven representation) is next. The end goal is
+to make array (and later, scalar) representation choices driven by the *static
+type the inferencer proved*, not by the runtime value.
+
+**Phase A results:** every identifier in `bench/my/*` and `samples/*` infers a
+concrete type (zero spurious `dyn`); the completeness fixes are the
+defer-on-Unknown/None invariant (see CLAUDE.md "Static type inference"), Unknown
+func-return/loopvar -> `dyn` finalization, find()->`opt int`, kvpairs typing,
+and `str + dyn -> str`. The test corpus gained `dyn` only where genuinely
+dynamic. 661/661 tests; bench geomean 0.58x -> 0.50x (more precise types ->
+more M8 scalar specialization). That is only sound once the inferencer is
 **provably correct in both directions**, so the bulk of the work is hardening
 and auditing type inference — gated behind a hard rule that forces the issue.
 

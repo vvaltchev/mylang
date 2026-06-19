@@ -497,6 +497,15 @@ sq("z");               # error: n would have to be both int and str
 
 Key rules:
 
+  * **A plain `var`/`const` must infer a concrete type.** If the only type the
+    compiler can give a plain declaration is *dynamic* (`dyn`), that is a
+    compile error: you must declare it `dyn` (e.g. `var dyn x = ...`) to opt
+    into dynamic typing explicitly. There is no implicit `dyn` — a value that is
+    genuinely polymorphic (a builtin used as a value, a `runtime(...)` result,
+    an exception payload, a variable that holds different unrelated types) must
+    say so. (A *container* with mixed elements is `array<dyn>` / `dict<_,dyn>`
+    and is still accepted under a plain `var` — only a bare top-level `dyn`
+    requires the keyword.)
   * A variable's type is the **join** of everything assigned to it. Assigning an
     incompatible type on any path is an error. `int` automatically widens to
     `float` (so `var x = 1; x = 2.5;` is fine, and `x` becomes a `float`).
@@ -541,7 +550,10 @@ slot = "now a string";           # ok, because it's dyn
     MyLang. Inference places no constraints on it, operations on it are checked
     at runtime (as before), and it may even change type. Use it for genuinely
     polymorphic code (e.g. a generic equality helper) or to keep a known type
-    error catchable at runtime with `try/catch`.
+    error catchable at runtime with `try/catch`. `dyn` is **required**, not
+    optional, wherever a plain declaration would otherwise infer `dyn` (see the
+    first key rule above) — so `var x = someBuiltin;` or `var x = runtime(v);`
+    must be written `var dyn x = ...`.
 
 #### Null-checks are understood (narrowing)
 
