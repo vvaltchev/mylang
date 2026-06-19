@@ -6,6 +6,8 @@
 #include "lexer.h"
 #include "backtrace.h"
 
+#include <cmath>
+
 using std::pair;
 using std::vector;
 using std::string;
@@ -174,6 +176,47 @@ EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 LiteralStr::LiteralStr(const std::string_view &v)
     : value(v.empty() ? empty_str : EvalValue(SharedStr(unescape_str(v))))
 { }
+
+/*
+ * Default typed evaluation: box through eval()/RValue. Works for any node (a
+ * function call, a `dyn` value, ...), so a specialized node may call them on an
+ * arbitrary child. eval()'s wrapper still stamps the source loc on errors.
+ */
+int_type Construct::eval_int(EvalContext *ctx) const
+{
+    return RValue(eval(ctx)).get<int_type>();
+}
+
+float_type Construct::eval_float(EvalContext *ctx) const
+{
+    const EvalValue v = RValue(eval(ctx));
+    if (v.is<int_type>())
+        return static_cast<float_type>(v.get<int_type>());
+    return v.get<float_type>();
+}
+
+/* Resolved-local fast paths: read the slot's scalar directly, skipping the
+ * LValue wrapper and the EvalValue copy. Falls back to the default (map walk /
+ * undefined-variable error) for non-slotted or undefined symbols. */
+int_type Identifier::eval_int(EvalContext *ctx) const
+{
+    if (sym.kind == SymKind::local && ctx->frame &&
+        (ctx->frame->live & (static_cast<uint64_t>(1) << sym.slot)))
+        return ctx->frame->slots[sym.slot].getval<int_type>();
+    return Construct::eval_int(ctx);
+}
+
+float_type Identifier::eval_float(EvalContext *ctx) const
+{
+    if (sym.kind == SymKind::local && ctx->frame &&
+        (ctx->frame->live & (static_cast<uint64_t>(1) << sym.slot))) {
+        const LValue &lv = ctx->frame->slots[sym.slot];
+        if (lv.is<int_type>())
+            return static_cast<float_type>(lv.getval<int_type>());
+        return lv.getval<float_type>();
+    }
+    return Construct::eval_float(ctx);
+}
 
 EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 {
@@ -892,6 +935,130 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
     return move(val);
 }
 
+/*
+ * Evaluate a condition to a boolean. When the inferencer proved the condition
+ * is a (non-null) int, take the unboxed eval_int() path - no LValue wrapper, no
+ * EvalValue copy, no is_true() virtual. Otherwise the general path.
+ */
+static inline bool eval_cond(const Construct *c, EvalContext *ctx)
+{
+    if (c->th == TypeHint::i)
+        return c->eval_int(ctx) != 0;
+    return RValue(c->eval(ctx)).is_true();
+}
+
+/* --------------- TypedScalarExpr (M8 specialized scalar eval) ------------- */
+
+template <class T>
+static inline int_type typed_cmp(Op op, T a, T b)
+{
+    switch (op) {
+        case Op::lt:    return a <  b;
+        case Op::gt:    return a >  b;
+        case Op::le:    return a <= b;
+        case Op::ge:    return a >= b;
+        case Op::eq:    return a == b;
+        case Op::noteq: return a != b;
+        default:        throw InternalErrorEx();
+    }
+}
+
+int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
+{
+    switch (cat) {
+
+        case Cat::neg:
+            if (kind == TypeHint::f)
+                return static_cast<int_type>(-elems[0].second->eval_float(ctx));
+            return -elems[0].second->eval_int(ctx);
+
+        case Cat::lnot:
+            return elems[0].second->eval_int(ctx) == 0 ? 1 : 0;
+
+        case Cat::arith: {
+            if (kind == TypeHint::f)
+                return static_cast<int_type>(eval_float(ctx));
+            int_type acc = elems[0].second->eval_int(ctx);
+            for (size_t i = 1; i < elems.size(); i++) {
+                const int_type r = elems[i].second->eval_int(ctx);
+                switch (elems[i].first) {
+                    case Op::plus:  acc += r; break;
+                    case Op::minus: acc -= r; break;
+                    case Op::times: acc *= r; break;
+                    case Op::div:
+                        if (r == 0) throw DivisionByZeroEx(start, end);
+                        acc /= r; break;
+                    case Op::mod:
+                        if (r == 0) throw DivisionByZeroEx(start, end);
+                        acc %= r; break;
+                    default: throw InternalErrorEx();
+                }
+            }
+            return acc;
+        }
+
+        case Cat::cmp:
+            if (kind == TypeHint::f)
+                return typed_cmp<float_type>(elems[1].first,
+                                             elems[0].second->eval_float(ctx),
+                                             elems[1].second->eval_float(ctx));
+            return typed_cmp<int_type>(elems[1].first,
+                                       elems[0].second->eval_int(ctx),
+                                       elems[1].second->eval_int(ctx));
+
+        case Cat::logical: {
+            int_type acc = elems[0].second->eval_int(ctx);
+            for (size_t i = 1; i < elems.size(); i++) {
+                /* both sides always evaluated (no short-circuit) */
+                const int_type r = elems[i].second->eval_int(ctx);
+                acc = (elems[i].first == Op::land) ? (acc && r) : (acc || r);
+            }
+            return acc;
+        }
+    }
+
+    return 0;
+}
+
+float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
+{
+    switch (cat) {
+
+        case Cat::neg:
+            return -elems[0].second->eval_float(ctx);
+
+        case Cat::arith: {
+            float_type acc = elems[0].second->eval_float(ctx);
+            for (size_t i = 1; i < elems.size(); i++) {
+                const float_type r = elems[i].second->eval_float(ctx);
+                switch (elems[i].first) {
+                    case Op::plus:  acc += r; break;
+                    case Op::minus: acc -= r; break;
+                    case Op::times: acc *= r; break;
+                    case Op::div:
+                        if (r == 0.0) throw DivisionByZeroEx(start, end);
+                        acc /= r; break;
+                    case Op::mod:
+                        if (r == 0.0) throw DivisionByZeroEx(start, end);
+                        acc = fmod(acc, r); break;
+                    default: throw InternalErrorEx();
+                }
+            }
+            return acc;
+        }
+
+        default:   /* cmp / logical / lnot yield int */
+            return static_cast<float_type>(eval_int(ctx));
+    }
+}
+
+EvalValue TypedScalarExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    if ((cat == Cat::arith || cat == Cat::neg) && kind == TypeHint::f)
+        return EvalValue(eval_float(ctx));
+    return EvalValue(eval_int(ctx));
+}
+
 /* Apply a compound-assignment op (`+=`, `-=`, ...) to `acc` in place. */
 static inline void
 apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op)
@@ -1183,7 +1350,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    if (RValue(condExpr->eval(ctx)).is_true()) {
+    if (eval_cond(condExpr.get(), ctx)) {
 
         if (thenBlock)
             thenBlock->eval(ctx);
@@ -1330,7 +1497,7 @@ EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     FlowState &fs = *ctx->flow;
 
-    while (RValue(condExpr->eval(ctx)).is_true()) {
+    while (eval_cond(condExpr.get(), ctx)) {
 
         if (body)
             body->eval(ctx);
@@ -1804,7 +1971,7 @@ EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const
 
     while (true) {
 
-        if (cond && !RValue(cond->eval(&loop_ctx)).is_true())
+        if (cond && !eval_cond(cond.get(), &loop_ctx))
             break;
 
         if (body)

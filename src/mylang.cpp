@@ -332,6 +332,7 @@ int main(int argc, char **argv)
             /* Resolve names to slots, then run the script. The root block
              * builds its own "main" Frame for slotted top-level variables. */
             resolve_names(root.get(), !opt_no_inline, opt_inline_threshold);
+            specialize_types(root.get(), !opt_no_type_infer);
             root->eval(nullptr);
         }
 

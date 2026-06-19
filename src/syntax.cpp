@@ -121,6 +121,35 @@ MultiOpConstruct::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void
+TypedScalarExpr::serialize(ostream &s, int level) const
+{
+    static const char *cat_name[] = {
+        "arith", "cmp", "logical", "neg", "lnot"
+    };
+
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "TypedScalarExpr<" << cat_name[(int)cat]
+      << "," << (kind == TypeHint::f ? 'f' : 'i') << ">(\n";
+
+    for (const auto &[op, e] : elems) {
+
+        if (op != Op::invalid) {
+            s << string((level + 1) * 2, ' ');
+            s << "Op '" << OpString[(int)op] << "'";
+            s << endl;
+        }
+
+        e->serialize(s, level + 1);
+        s << endl;
+    }
+
+    s << indent;
+    s << ")";
+}
+
 void LiteralInt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

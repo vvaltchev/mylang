@@ -20,3 +20,13 @@ class Construct;
  * leaves the tree untouched for resolve_names / evaluation.
  */
 void infer_types(Construct *root, bool enable = true);
+
+/*
+ * M8 specialization pass: rewrite hot scalar expression nodes (int/float
+ * arithmetic, comparison, logical, unary) that infer_types proved are typed
+ * into TypedScalarExpr, which evaluates without num_bin_op dispatch or
+ * intermediate EvalValue boxing. Run AFTER resolve_names (it benefits from
+ * resolved slots via Identifier's typed fast paths). A no-op when inference is
+ * disabled (no TypeHints are set). See plans/type-inference.md M8.
+ */
+void specialize_types(Construct *root, bool enable = true);
