@@ -508,10 +508,12 @@ private:
             if (is_scalar_literal(w->condExpr.get())) {
                 const EvalValue v = w->condExpr->eval(&cctx);
                 if (!v.get_type()->is_true(v)) {
-                    /* while (false): the whole loop is dead - dim it and drop
-                     * it without folding the body. */
+                    /* while (false): the loop is dead - dim it (the body's end,
+                     * not w->end, which points at the next token) and drop it
+                     * without folding the body. */
                     if (analysis)
-                        analysis->mark_dead(w->start, w->end);
+                        analysis->mark_dead(w->start,
+                            w->body ? w->body->end : w->end);
                     return false;
                 }
             }
@@ -679,9 +681,16 @@ private:
              * code and propagates (a build error), per the auto-const rule.
              */
             if (all_const && callee) {
+                /* Capture the callee's loc before the node may be freed. */
+                const Loc cloc = callee->start;
+                const int clen =
+                    static_cast<int>(callee->get_str().length());
                 try {
                     MakeConstructFromConstVal(RValue(ce->eval(&cctx)),
                                               slot, false);
+                    /* -a: an auto-pure call folded away - color it magenta. */
+                    if (analysis)
+                        analysis->mark(cloc, clen, AnnoKind::folded);
                 } catch (const UndefinedVariableEx &) {
                     /* not a const-foldable callee: keep the runtime call */
                 }

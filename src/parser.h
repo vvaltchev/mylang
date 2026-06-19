@@ -11,6 +11,7 @@
 
 class EvalContext;
 class Block;
+struct AnalysisInfo;
 
 /*
  * Parse-time common-subexpression cache (de-duplication of const array/dict
@@ -57,6 +58,14 @@ public:
     const bool const_eval;
     EvalContext *const_ctx; // points to const_ctx_owner's object
     unique_ptr<CseCache> cse; // const-expr de-dup cache (per-block scopes)
+
+    /*
+     * -a/--analyze only: when set, the parser records parse-time optimizations
+     * it would otherwise erase silently - a const CallExpr folded to a literal
+     * (magenta) and a dead branch dropped by const-condition DCE (dim). Null in
+     * a normal run, so it costs nothing. See analyzer.h / mylang.cpp.
+     */
+    AnalysisInfo *analysis = nullptr;
 
     ParseContext(const TokenStream &ts, bool const_eval);
     ~ParseContext(); // out-of-line: CseCache is incomplete here (PIMPL)
