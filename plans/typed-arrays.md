@@ -30,17 +30,40 @@ it at compile time.
 
 ## Data model
 
-Two new runtime types, alongside the existing `t_arr`:
+Two new runtime types, alongside the existing `t_arr`. The **value handle** is
+`FlatArrayObj<int_type>` / `FlatArrayObj<float_type>` — a small slice-view
+wrapper that *contains* an `intrusive_ptr` to the storage (exactly as
+`SharedArrayObj` contains `intrusive_ptr<SharedObject>`); it is **not** itself an
+`intrusive_ptr`.
 
-- `t_int_arr` — value handle `intrusive_ptr<FlatArrayObj<int_type>>`.
-- `t_float_arr` — value handle `intrusive_ptr<FlatArrayObj<float_type>>`.
+- `t_int_arr` — value handle `FlatArrayObj<int_type>`.
+- `t_float_arr` — value handle `FlatArrayObj<float_type>`.
 
-Both **non-trivial** (`>= t_str`), appended after `t_dict` in `TypeE`. Wiring
-(same recipe as adding any value type): `TypeE` enum + `TypeNames` + `AllTypes`
-(`types.cpp`), a `TypeToEnum` specialization + a `ValueU` union member
-(`evalvalue.h`), and a `TypeIntArr`/`TypeFloatArr` class (`src/types/`). The
-handles are 24 bytes (intrusive_ptr + `off`/`len`/`slice`), so `EvalValue` stays
-32 bytes and `LValue` stays 48 — no size regression.
+Both **non-trivial** (`>= t_str`), appended after `t_dict` in `TypeE`.
+
+**Union placement (important — the `FlatVal` wrapper).** A `union` member cannot
+have non-trivial ctors/dtors, so every non-trivial `ValueU` member is wrapped in
+`FlatVal<T>` (an `alignas(T) char[sizeof(T)]` buffer; see `flatval.h`), and the
+lifecycle (ctor/dtor/copy/move) is driven by type-erased ops
+(`TypeErasureOps`/`TypeImpl<T>`) via reinterpret-cast, *not* by the union. So the
+new members mirror the existing `FlatVal<SharedArrayObj> arr;` /
+`FlatVal<intrusive_ptr<DictObject>> dict;` exactly:
+
+```cpp
+// in ValueU (evalvalue.h), alongside the other non-trivial members:
+FlatVal<FlatArrayObj<int_type>>   iarr;
+FlatVal<FlatArrayObj<float_type>> farr;
+```
+
+Wiring (same recipe as any value type): `TypeE` enum + `TypeNames` + `AllTypes`
+(`types.cpp`); `TypeToEnum<FlatArrayObj<int_type>>` /
+`TypeToEnum<FlatArrayObj<float_type>>` + the `FlatVal` `ValueU` members above
+(`evalvalue.h`); a `TypeIntArr : TypeImpl<FlatArrayObj<int_type>>` /
+`TypeFloatArr : TypeImpl<FlatArrayObj<float_type>>` class (`src/types/`) which
+inherits the type-erased lifecycle ops from `TypeImpl<T>` (so `FlatArrayObj`
+just needs the usual value-type ctors/dtor/copy/move, like `SharedArrayObj`).
+The handle is ~24 bytes (`intrusive_ptr` + `off`/`len`/`slice`), so `EvalValue`
+stays 32 bytes and `LValue` stays 48 — no size regression.
 
 ### `FlatArrayObj<T>` — a new container (NOT the existing template)
 
