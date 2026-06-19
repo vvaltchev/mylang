@@ -2,6 +2,7 @@
 
 #include "syntax.h"
 #include "resolver.h"
+#include "analyzer.h"
 #include "errors.h"
 #include "eval.h"
 
@@ -133,10 +134,12 @@ static bool is_readonly_value(const EvalValue &v)
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
+    AnalysisInfo *analysis;   /* -a: record auto-const/dead/folded, or null */
 
 public:
 
-    AutoConst() : cctx(nullptr, true) { }
+    explicit AutoConst(AnalysisInfo *a = nullptr)
+        : cctx(nullptr, true), analysis(a) { }
 
     void run(Block *root, const std::vector<int> &main_writes)
     {
@@ -705,7 +708,7 @@ public:
      * own slot range (slot_count == top-level frame size), and Block::do_eval
      * builds the "main" Frame from it - so nothing needs to be returned here.
      */
-    void run(Construct *root)
+    void run(Construct *root, AnalysisInfo *analysis = nullptr)
     {
         top_level_only = false;
         walk(root, nullptr);            /* pass 1: functions; fill `escaped` */
@@ -719,7 +722,7 @@ public:
         /* Promote write-once scalar vars to constants and fold (uses the write
          * counts just collected; the top-level frame's in main_st.writes). */
         if (auto *rb = dynamic_cast<Block *>(root))
-            AutoConst().run(rb, main_st.writes);
+            AutoConst(analysis).run(rb, main_st.writes);
     }
 
 private:
@@ -1314,6 +1317,7 @@ class Inliner {
     const int max_nodes;   /* inline only when the body is at most this big */
     EvalContext cctx;      /* const context for re-folding spliced bodies */
     AutoConst ac;          /* used to fold specialized clones */
+    AnalysisInfo *analysis;   /* -a: record inlined / specialized; or null */
 
     /* (func, const-arg tuple) -> the specialized clone, or nullptr if building
      * it was not beneficial (cached so it isn't retried). */
@@ -1338,8 +1342,8 @@ class Inliner {
 
 public:
 
-    explicit Inliner(int max_nodes)
-        : max_nodes(max_nodes), cctx(nullptr, true) { }
+    explicit Inliner(int max_nodes, AnalysisInfo *a = nullptr)
+        : max_nodes(max_nodes), cctx(nullptr, true), ac(a), analysis(a) { }
 
     void run(Block *root)
     {
@@ -2259,11 +2263,71 @@ private:
  * the inlining pass.
  */
 void
-resolve_names(Construct *root, bool enable_inline, int inline_threshold)
+resolve_names(Construct *root, bool enable_inline, int inline_threshold,
+              AnalysisInfo *analysis)
 {
-    Resolver().run(root);
+    Resolver().run(root, analysis);
 
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))
-            Inliner(inline_threshold).run(rb);
+            Inliner(inline_threshold, analysis).run(rb);
+}
+
+/*
+ * Post-resolve walk that records the resolver-decided optimizations still
+ * readable on the tree: an auto-pure function (effective_pure but not written
+ * `pure`) and an auto-const parameter (never reassigned, not `const`) - both
+ * yellow. A complete traversal: for_each_child skips Block/for/foreach/try/
+ * Expr14/FuncDeclStmt (the resolver's own walk handles those), so descend into
+ * them here, including nested function bodies.
+ */
+void collect_resolver_analysis(Construct *root, AnalysisInfo &out)
+{
+    if (!root)
+        return;
+
+    std::function<void(Construct *)> walk = [&](Construct *c) {
+
+        if (!c)
+            return;
+
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+
+            if (fd->id && fd->effective_pure && !fd->explicit_pure)
+                out.mark(fd->id->start,
+                         static_cast<int>(fd->id->get_str().length()),
+                         AnnoKind::auto_const);
+
+            if (fd->params)
+                for (auto &p : fd->params->elems)
+                    if (p->auto_const_param && !p->const_param)
+                        out.mark(p->start,
+                                 static_cast<int>(p->get_str().length()),
+                                 AnnoKind::auto_const);
+
+            walk(fd->body.get());
+            return;
+        }
+
+        if (auto *b = dynamic_cast<Block *>(c)) {
+            for (auto &e : b->elems)
+                walk(e.get());
+        } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+            walk(f->init.get()); walk(f->cond.get());
+            walk(f->inc.get());  walk(f->body.get());
+        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+            walk(fe->container.get()); walk(fe->body.get());
+        } else if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+            walk(tc->tryBody.get());
+            for (auto &p : tc->catchStmts)
+                walk(p.second.get());
+            walk(tc->finallyBody.get());
+        } else if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+            walk(e14->lvalue.get()); walk(e14->rvalue.get());
+        } else {
+            for_each_child(c, walk);
+        }
+    };
+
+    walk(root);
 }

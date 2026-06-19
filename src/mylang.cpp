@@ -8,6 +8,7 @@
 #include "resolver.h"
 #include "backtrace.h"
 #include "inferencer.h"
+#include "analyzer.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -25,6 +26,8 @@ static int opt_inline_threshold = 24;  /* max inlined body size (nodes) */
 static bool opt_no_run;
 static bool opt_no_type_infer;
 static bool opt_debug_ti;
+static bool opt_analyze;
+static bool opt_no_color;
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
@@ -45,6 +48,10 @@ void help()
     cout << "  -nr      Don't run, just validate" << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
     cout << " --debug-ti  Dump inferred types of all identifiers, then exit"
+         << endl;
+    cout << "  -a       Analyze: reprint the source with colors showing which"
+         << endl;
+    cout << "           optimizations fired (--analyze; --no-color for plain)"
          << endl;
 
 #ifdef TESTS
@@ -157,6 +164,14 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "--debug-ti")) {
 
             opt_debug_ti = true;
+
+        } else if (!strcmp(arg, "-a") || !strcmp(arg, "--analyze")) {
+
+            opt_analyze = true;
+
+        } else if (!strcmp(arg, "--no-color")) {
+
+            opt_no_color = true;
 
         } else if (!strcmp(arg, "-e")) {
 
@@ -294,6 +309,103 @@ handleSyntaxError(SyntaxErrorEx e)
     cerr << endl;
 }
 
+/* ANSI color escape for an annotation kind (see analyzer.h's legend). */
+static const char *
+anno_code(AnnoKind k)
+{
+    switch (k) {
+        case AnnoKind::auto_const:  return "\033[33m";   /* yellow  */
+        case AnnoKind::flat_array:  return "\033[32m";   /* green   */
+        case AnnoKind::dyn_array:   return "\033[31m";   /* red     */
+        case AnnoKind::inlined:     return "\033[94m";   /* blue    */
+        case AnnoKind::specialized: return "\033[36m";   /* cyan    */
+        case AnnoKind::folded:      return "\033[35m";   /* magenta */
+        default:                    return "";
+    }
+}
+
+/*
+ * -a/--analyze: reprint the source verbatim, coloring each annotated identifier
+ * / call-site and dimming dead (DCE'd) code. Rendering is column-based over the
+ * raw source line so spacing and comments are preserved exactly; a dead range
+ * dims its columns (and wins over a color span, since dead code won't run).
+ */
+static void
+render_analysis(const std::vector<string> &src, const AnalysisInfo &info,
+                bool color)
+{
+    static const char *const RESET = "\033[0m";
+    static const char *const DIM = "\033[2m";
+
+    if (color) {
+        cout << "Legend: "
+             << "\033[33mauto-const/pure\033[0m  "
+             << "\033[32mflat array\033[0m  "
+             << "\033[31mdyn array\033[0m  "
+             << "\033[94minlined\033[0m  "
+             << "\033[36mspecialized\033[0m  "
+             << "\033[35mfolded call\033[0m  "
+             << DIM << "dead code" << RESET << "\n";
+        cout << "--------------------------\n";
+    }
+
+    for (size_t li = 0; li < src.size(); li++) {
+
+        const int line = static_cast<int>(li) + 1;
+        const string &text = src[li];
+        const int n = static_cast<int>(text.length());
+
+        if (!color) {
+            cout << text << "\n";
+            continue;
+        }
+
+        /* per-column state: -1 default, -2 dim, else (int)AnnoKind color. */
+        std::vector<int> attr(n, -1);
+
+        for (const auto &d : info.dead) {
+            if (line < d.l1 || line > d.l2)
+                continue;
+            const int from = (line == d.l1) ? d.c1 : 1;
+            const int to   = (line == d.l2) ? d.c2 : n;
+            for (int c = from; c <= to && c <= n; c++)
+                if (c >= 1)
+                    attr[c - 1] = -2;
+        }
+
+        /* color spans override dim (an annotated identifier still shows) */
+        auto lo = info.spans.lower_bound({line, 0});
+        auto hi = info.spans.lower_bound({line + 1, 0});
+        for (auto it = lo; it != hi; ++it) {
+            const int col = it->first.second;
+            const int len = it->second.len;
+            for (int c = col; c < col + len && c <= n; c++)
+                if (c >= 1)
+                    attr[c - 1] = static_cast<int>(it->second.kind);
+        }
+
+        string out;
+        int cur = -1;   /* currently-open attribute (-1 == default/none open) */
+
+        for (int c = 0; c < n; c++) {
+            if (attr[c] != cur) {
+                if (cur != -1)
+                    out += RESET;
+                if (attr[c] == -2)
+                    out += DIM;
+                else if (attr[c] != -1)
+                    out += anno_code(static_cast<AnnoKind>(attr[c]));
+                cur = attr[c];
+            }
+            out += text[c];
+        }
+        if (cur != -1)
+            out += RESET;
+
+        cout << out << "\n";
+    }
+}
+
 int main(int argc, char **argv)
 {
     try {
@@ -334,6 +446,20 @@ int main(int argc, char **argv)
          * sites (machine-readable) and exit, without running. */
         if (opt_debug_ti) {
             dump_type_info(root.get(), cout);
+            return 0;
+        }
+
+        /* -a/--analyze: collect optimization decisions and reprint the source
+         * with colors, then exit. Array-storage colors come from inference (on
+         * the clean tree); the resolver passes run next and record auto-const /
+         * dead-code / inlined / specialized / folded as the tree mutates. */
+        if (opt_analyze) {
+            AnalysisInfo info;
+            collect_array_analysis(root.get(), info);
+            resolve_names(root.get(), !opt_no_inline, opt_inline_threshold,
+                          &info);
+            collect_resolver_analysis(root.get(), info);
+            render_analysis(lines, info, !opt_no_color);
             return 0;
         }
 

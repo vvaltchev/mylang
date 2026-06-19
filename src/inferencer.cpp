@@ -4,6 +4,7 @@
 #include "stype.h"
 #include "errors.h"
 #include "inferencer.h"
+#include "analyzer.h"
 #include "evalvalue.h"
 #include "eval.h"
 
@@ -80,6 +81,7 @@ public:
     explicit Inferencer(Construct *root) : root(root) { }
     void run();
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
+    void collect_arrays(AnalysisInfo &out); /* -a: array storage colors */
 
     bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
     bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
@@ -2241,6 +2243,41 @@ void infer_types(Construct *root, bool enable, bool strict)
     inf.run();
 }
 
+/*
+ * -a/--analyze: record an array-storage color for every resolved identifier
+ * whose static type is an array - green for a flat (unboxed) array<int>/
+ * array<float>, red for array<dyn> (dynamic). Other general arrays (array<str>,
+ * nested, opt-element) are left default: they genuinely cannot be flat, so
+ * there is no "missed optimization" to flag. Every occurrence is colored
+ * (id_sym maps each Identifier, decl and use, to its TypeSym).
+ */
+void Inferencer::collect_arrays(AnalysisInfo &out)
+{
+    for (const auto &kv : id_sym) {
+
+        const Identifier *id = dynamic_cast<const Identifier *>(kv.first);
+        TypeSym *s = kv.second;
+        if (!id || !s)
+            continue;
+
+        STyRef ty = sty_resolve(s->type);
+        if (ty->kind != STyKind::Array)
+            continue;
+
+        STyRef el = sty_resolve(ty->elem);
+        AnnoKind k;
+        if (!el->opt && (el->kind == STyKind::Int ||
+                         el->kind == STyKind::Float))
+            k = AnnoKind::flat_array;
+        else if (el->kind == STyKind::Dyn)
+            k = AnnoKind::dyn_array;
+        else
+            continue;   /* a general but non-dynamic array: leave default */
+
+        out.mark(id->start, static_cast<int>(id->get_str().length()), k);
+    }
+}
+
 void dump_type_info(Construct *root, std::ostream &os)
 {
     if (!root)
@@ -2251,6 +2288,18 @@ void dump_type_info(Construct *root, std::ostream &os)
     inf.strict_dyn = false;
     inf.run();
     inf.dump_debug_ti(os);
+}
+
+void collect_array_analysis(Construct *root, AnalysisInfo &out)
+{
+    if (!root)
+        return;
+
+    /* Non-strict: analyze whatever the code is, don't fail on a `dyn`. */
+    Inferencer inf(root);
+    inf.strict_dyn = false;
+    inf.run();
+    inf.collect_arrays(out);
 }
 
 void specialize_types(Construct *root, bool enable)
