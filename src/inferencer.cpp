@@ -867,7 +867,8 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         n == "intptr" || n == "defined" || n == "isconst" ||
         n == "isconstdecl" || n == "ispure" || n == "ispuredecl" ||
         n == "startswith" || n == "endswith" || n == "isinf" ||
-        n == "isfinite" || n == "isnormal" || n == "isnan")
+        n == "isfinite" || n == "isnormal" || n == "isnan" ||
+        n == "remove")
         return A.int_ty();
 
     /* float-returning */
@@ -882,7 +883,7 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "int")    return A.int_ty();
     if (n == "str" || n == "type" || n == "chr" || n == "join" ||
         n == "lpad" || n == "rpad" || n == "lstrip" || n == "rstrip" ||
-        n == "strip" || n == "readln" || n == "read")
+        n == "strip" || n == "readln" || n == "read" || n == "tmpdir")
         return A.str_ty();
 
     if (n == "split" || n == "splitlines" || n == "readlines")

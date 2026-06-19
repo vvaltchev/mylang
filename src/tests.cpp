@@ -4439,8 +4439,10 @@ static const std::vector<test> tests =
         {
             "var a = [\"aa\", \"bb\", \"cc\", \"dd\", \"ee\"];",
             "var s = a[1:3];",
-            "writelines(s, \"test_io_writelines.tmp\");",
-            "var lines = readlines(\"test_io_writelines.tmp\");",
+            "var f = tmpdir() + \"/mylang_test_io_writelines.tmp\";",
+            "writelines(s, f);",
+            "var lines = readlines(f);",
+            "assert(remove(f));",   /* clean up the temp file */
             "assert(len(lines) == 2);",
             "assert(rstrip(lines[0]) == \"bb\");",
             "assert(rstrip(lines[1]) == \"cc\");",
@@ -4452,13 +4454,17 @@ static const std::vector<test> tests =
     {
         "I/O: write / writeln / read a file round-trip",
         {
-            "write(\"hello\\n\", \"test_io_rw.tmp\");",
+            "var d = tmpdir();",
+            "var f1 = d + \"/mylang_test_io_rw.tmp\";",
+            "var f2 = d + \"/mylang_test_io_rw2.tmp\";",
+            "write(\"hello\\n\", f1);",
             /* writeln's newline goes to stdout, not the file, so the file
                holds just the value. */
-            "writeln(\"world\", \"test_io_rw2.tmp\");",
-            "assert(read(\"test_io_rw.tmp\") == \"hello\\n\");",
-            "assert(read(\"test_io_rw2.tmp\") == \"world\");",
-            "var L = readlines(\"test_io_rw.tmp\");",
+            "writeln(\"world\", f2);",
+            "assert(read(f1) == \"hello\\n\");",
+            "assert(read(f2) == \"world\");",
+            "var L = readlines(f1);",
+            "assert(remove(f1)); assert(remove(f2));",   /* clean up */
             "assert(len(L) == 1 && L[0] == \"hello\");",
         },
     },
@@ -4469,6 +4475,23 @@ static const std::vector<test> tests =
             "writeln(\"io-writeln\");",
         },
     },
+    {
+        "I/O: remove() deletes a file and reports success/failure",
+        {
+            "var f = tmpdir() + \"/mylang_test_remove.tmp\";",
+            "write(\"x\", f);",
+            "assert(remove(f) == true);",   /* existed -> removed */
+            "assert(remove(f) == false);",  /* gone now -> false, no throw */
+        },
+    },
+    { "remove() with a non-string arg is a type error",
+      { "remove(123);" }, &typeid(TypeErrorEx) },
+    { "remove() with wrong arity is an error",
+      { "remove();" }, &typeid(InvalidNumberOfArgsEx) },
+    { "tmpdir() returns a non-empty path",
+      { "var d = tmpdir(); assert(len(d) > 0);" } },
+    { "tmpdir() with an argument is an error",
+      { "tmpdir(1);" }, &typeid(InvalidNumberOfArgsEx) },
     { "write() with a non-string value is a type error",
       { "write(123);" }, &typeid(TypeErrorEx) },
     { "write() with a non-string filename is a type error",
