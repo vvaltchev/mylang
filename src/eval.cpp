@@ -602,19 +602,28 @@ static EvalValue
 construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
 {
     const size_t nfields = def->fields.size();
+    const size_t nargs = args->elems.size();
 
-    if (args->elems.size() != nfields)
+    /* A trailing opt field may be omitted (binds to none); an interior skipped
+     * one was already filled with an explicit `none` by the desugar. */
+    size_t min_args = 0;
+    for (size_t i = 0; i < nfields; i++)
+        if (!def->fields[i].is_opt)
+            min_args = i + 1;
+
+    if (nargs < min_args || nargs > nfields)
         throw InvalidNumberOfArgsEx(args->start, args->end);
 
     auto obj = make_intrusive<StructObject>(def);
     obj->fields.reserve(nfields);
 
     for (size_t i = 0; i < nfields; i++) {
-        EvalValue v = RValue(args->elems[i]->eval(ctx));
-        obj->fields.emplace_back(
-            coerce_struct_field(def->fields[i], move(v),
-                                args->elems[i]->start, args->elems[i]->end),
-            false);
+        const FieldDef &fd = def->fields[i];
+        const Loc s = i < nargs ? args->elems[i]->start : args->start;
+        const Loc e = i < nargs ? args->elems[i]->end : args->end;
+        EvalValue v = i < nargs ? RValue(args->elems[i]->eval(ctx))
+                                : EvalValue();   /* omitted trailing opt: none */
+        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e), false);
     }
 
     return intrusive_ptr<StructObject>(obj);
@@ -2652,6 +2661,20 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
     return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
 }
 
+/* True if `c` is rooted at a variable (an identifier, or a member/subscript
+ * chain ending at one), so an lvalue derived from it outlives this evaluation;
+ * a temporary (a call/literal result) is not. */
+static bool is_lvalue_rooted(const Construct *c)
+{
+    if (c->is_id())
+        return true;
+    if (auto *m = dynamic_cast<const MemberExpr *>(c))
+        return is_lvalue_rooted(m->what.get());
+    if (auto *s = dynamic_cast<const Subscript *>(c))
+        return is_lvalue_rooted(s->what.get());
+    return false;
+}
+
 EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     /* Consume the plain-assignment-target flag (see Subscript::do_eval). */
@@ -2672,7 +2695,15 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
         const int slot = obj->def->slot_of(memUid);
 
         if (slot >= 0) {
-            if (obj->is_readonly())
+            /*
+             * Hand out an assignable field lvalue ONLY when the base is rooted
+             * at a variable (so the StructObject outlives this call). For a
+             * read-only instance, or a *temporary* base (`Point(1,2).x`, a call
+             * result), return the value by copy - a field lvalue into a
+             * soon-freed temporary would dangle, and a temporary's field isn't
+             * assignable anyway.
+             */
+            if (obj->is_readonly() || !is_lvalue_rooted(what.get()))
                 return obj->fields[slot].get();
             return &obj->fields[slot];
         }
