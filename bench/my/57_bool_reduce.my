@@ -1,0 +1,20 @@
+# Repeatedly reduce a flat array<bool>: count the `true`s, many passes.
+# Showcases the typed (unboxed) flat-bool element read in a tight loop and the
+# bool condition fast path, vs Python's per-element pointer chase + truthiness.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 200000 * scale;
+var flags = make_array(N, func(i) => i % 2 == 0);   # array<bool>
+
+var total = 0;
+for (var r = 0; r < 50; r += 1) {
+    var c = 0;
+    for (var i = 0; i < N; i += 1)
+        if (flags[i])
+            c += 1;
+    total += c;
+}
+
+print("result:", total);

@@ -49,6 +49,7 @@ template <> struct TypeToEnum<UndefinedId> { enum { val = Type::t_undefid }; };
 template <> struct TypeToEnum<int_type> { enum { val = Type::t_int }; };
 template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
 template <> struct TypeToEnum<float_type> { enum { val = Type::t_float }; };
+template <> struct TypeToEnum<bool> { enum { val = Type::t_bool }; };
 template <> struct TypeToEnum<SharedStr> { enum { val = Type::t_str }; };
 template <> struct TypeToEnum<shared_ptr<FuncObject>> { enum { val = Type::t_func }; };
 template <> struct TypeToEnum<SharedArrayObj> { enum { val = Type::t_arr }; };
@@ -87,6 +88,7 @@ class EvalValue final {
         int_type ival;
         Builtin bfunc;
         float_type ldval;
+        bool bval;          /* t_bool; aliases ival's low byte */
 
         /* non-trivial types */
         FlatVal<SharedStr> str;
@@ -126,8 +128,18 @@ public:
             std::is_same_v<T, int_type>
         >
     >
-    EvalValue(T val)
-        : val(static_cast<int_type>(val)), type(AllTypes[Type::t_int]) { }
+    EvalValue(T v)
+        : type(AllTypes[std::is_same_v<T, bool> ? Type::t_bool : Type::t_int])
+    {
+        /* `true`/`false` are the bool type; an int_type is `int`. The bool is
+         * stored in `bval` (low byte), the rest of `ival` is zeroed by the
+         * union's default ctor, so reading it as bool or as the int 0/1 both
+         * work (a bool promotes to int 0/1 via num_bin_op). */
+        if constexpr (std::is_same_v<T, bool>)
+            val.bval = v;
+        else
+            val.ival = v;
+    }
 
     /*
      * Constructor accepting ONLY known types defined in enum TypeE.
@@ -140,6 +152,7 @@ public:
         class = std::enable_if_t<                      /* SFINAE template param */
             !std::is_same_v<U, EvalValue> &&           /* disallow EvalValue */
             !std::is_same_v<U, int_type> &&            /* disallow int_type */
+            !std::is_same_v<U, bool> &&                /* disallow bool (above) */
             TypeToEnum<U>::val != Type::t_count        /* disallow types not in TypeToEnum */
         >
     >
@@ -165,6 +178,7 @@ public:
         static_assert(offsetof(ValueU, ival) == 0);
         static_assert(offsetof(ValueU, bfunc) == 0);
         static_assert(offsetof(ValueU, ldval) == 0);
+        static_assert(offsetof(ValueU, bval) == 0);
         static_assert(offsetof(ValueU, str) == 0);
         static_assert(offsetof(ValueU, func) == 0);
         static_assert(offsetof(ValueU, arr) == 0);
@@ -222,42 +236,42 @@ public:
 
         EvalValue tmp = *this;
         num_bin_op(tmp, rhs, &Type::eq);
-        return tmp.get<int_type>() != 0;
+        return tmp.is_true();
     }
 
     bool operator!=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         num_bin_op(tmp, rhs, &Type::noteq);
-        return tmp.get<int_type>() != 0;
+        return tmp.is_true();
     }
 
     bool operator<(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         num_bin_op(tmp, rhs, &Type::lt);
-        return tmp.get<int_type>() != 0;
+        return tmp.is_true();
     }
 
     bool operator<=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         num_bin_op(tmp, rhs, &Type::le);
-        return tmp.get<int_type>() != 0;
+        return tmp.is_true();
     }
 
     bool operator>(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         num_bin_op(tmp, rhs, &Type::gt);
-        return tmp.get<int_type>() != 0;
+        return tmp.is_true();
     }
 
     bool operator>=(const EvalValue &rhs) const {
 
         EvalValue tmp = *this;
         num_bin_op(tmp, rhs, &Type::ge);
-        return tmp.get<int_type>() != 0;
+        return tmp.is_true();
     }
 
     std::string to_string() const {
@@ -418,6 +432,22 @@ inline EvalValue::~EvalValue()
 inline void
 num_bin_op(EvalValue &a, const EvalValue &b, NumBinOp op)
 {
+    /*
+     * bool promotes to int (the bottom of the numeric chain bool <= int <=
+     * float), so `true + 1 == 2`, `true < 3`, `true == 1` all behave like the
+     * int 0/1. The left operand is promoted in place; for a bool right operand
+     * we recurse once with an int copy (b is const). After this, neither
+     * operand is bool, so the existing int->float promotion runs.
+     */
+    if (a.is<bool>())
+        a = static_cast<int_type>(a.get<bool>() ? 1 : 0);
+
+    if (b.is<bool>()) {
+        const EvalValue bi = static_cast<int_type>(b.get<bool>() ? 1 : 0);
+        num_bin_op(a, bi, op);
+        return;
+    }
+
     if (a.is<int_type>() && b.is<float_type>())
         a = static_cast<float_type>(a.get<int_type>());
 

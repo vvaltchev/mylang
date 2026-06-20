@@ -49,7 +49,20 @@ enum class TypeHint : unsigned char { none, i, f };
  * value-driven (build flat iff the elements are homogeneous int/float). See
  * plans/type-driven-specialization.md.
  */
-enum class ArrHint : unsigned char { dflt, general, flat_i, flat_f };
+enum class ArrHint : unsigned char { dflt, general, flat_i, flat_f, flat_b };
+
+/*
+ * Explicit type annotation on a declaration / parameter (e.g. `int x = 5;`,
+ * `func f(str s)`). `none` = no annotation (plain `var`/inferred). The scalar
+ * kinds pin the symbol's static type and check assignability (with bool<=int<=
+ * float coercion); `arr`/`dict` are generic kind constraints whose element/key/
+ * value types are still inferred. Set by the parser onto the decl/param
+ * Identifier; read by the inferencer (typing/checking) and the runtime
+ * (coercion + zero-value default-init). See the README "explicit types".
+ */
+enum class DeclType : unsigned char {
+    none, b, i, f, s, arr, dict
+};
 
 /*
  * Result of the name-resolution pass (resolver.cpp) for an Identifier.
@@ -309,6 +322,37 @@ public:
     }
 };
 
+/* The `true` / `false` literals - the two values of the bool type. */
+class LiteralBool final: public Literal {
+
+    const bool value;
+
+public:
+
+    LiteralBool(bool v) : value(v) { }
+
+    bool bval() const { return value; }
+
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
+        return EvalValue(value);
+    }
+
+    /* a bool is 0/1 in the unboxed numeric path (bool <= int <= float) */
+    int_type eval_int(EvalContext *ctx) const override { return value; }
+    float_type eval_float(EvalContext *ctx) const override { return value; }
+
+    void serialize(ostream &s, int level = 0) const override {
+        s << std::string(level * 2, ' ')
+          << (value ? "Bool(true)" : "Bool(false)");
+    }
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<LiteralBool>(value);
+        copy_base_fields(*c);
+        return c;
+    }
+};
+
 class LiteralFloat final: public Literal {
 
     const float_type value;
@@ -523,6 +567,13 @@ public:
     bool opt_mod = false;
     bool dyn_mod = false;
 
+    /*
+     * Explicit type annotation (`int x = ...`, `func f(str s)`). `none` when the
+     * declaration is a plain `var`/`const`/inferred param. Propagated by the
+     * resolver from a declaration to every use, so an assignment can coerce.
+     */
+    DeclType decl_type = DeclType::none;
+
     Identifier(const std::string_view &str)
         : Construct("Id", false, ConstructType::id)
         , uid(UniqueId::get(str))
@@ -542,6 +593,7 @@ public:
         c->auto_const_param = auto_const_param;
         c->opt_mod = opt_mod;
         c->dyn_mod = dyn_mod;
+        c->decl_type = decl_type;
         return c;
     }
 };

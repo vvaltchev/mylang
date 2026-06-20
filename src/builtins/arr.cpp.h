@@ -70,6 +70,8 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
             return SharedArrayObj(SharedArrayObj::ivec_type(n, 0));
         if (hint == ArrHint::flat_f)
             return SharedArrayObj(SharedArrayObj::fvec_type(n, 0.0));
+        if (hint == ArrHint::flat_b)
+            return SharedArrayObj(SharedArrayObj::bvec_type(n, 0));
 
         SharedArrayObj::vec_type vec;
         vec.reserve(n);
@@ -96,6 +98,10 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
         if (v.is<float_type>())
             return SharedArrayObj(
                 SharedArrayObj::fvec_type(n, v.get<float_type>()));
+
+        if (v.is<bool>())
+            return SharedArrayObj(
+                SharedArrayObj::bvec_type(n, v.get<bool>() ? 1 : 0));
     }
 
     /* General fill: every element is (a copy of) the value. */
@@ -148,9 +154,11 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
      */
     SharedArrayObj::ivec_type ivec;
     SharedArrayObj::fvec_type fvec;
+    SharedArrayObj::bvec_type bvec;
     SharedArrayObj::vec_type  gvec;
     /* Type-driven: a dynamically-typed destination (hint general) builds
-     * general from the start; otherwise optimistic flat. */
+     * general from the start; otherwise optimistic flat. mode: 0 = empty,
+     * 1 = ints, 2 = floats, 4 = bools, 3 = general. */
     int mode = exprList->arr_hint == ArrHint::general ? 3 : 0;
     if (mode == 3)
         gvec.reserve(n);
@@ -161,8 +169,12 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
             for (int_type x : ivec) gvec.emplace_back(EvalValue(x), false);
         else if (mode == 2)
             for (float_type x : fvec) gvec.emplace_back(EvalValue(x), false);
+        else if (mode == 4)
+            for (unsigned char x : bvec)
+                gvec.emplace_back(EvalValue(static_cast<bool>(x)), false);
         ivec.clear();
         fvec.clear();
+        bvec.clear();
         mode = 3;
     };
 
@@ -175,6 +187,8 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
                 mode = 1; ivec.push_back(r.get<int_type>());
             } else if (r.is<float_type>()) {
                 mode = 2; fvec.push_back(r.get<float_type>());
+            } else if (r.is<bool>()) {
+                mode = 4; bvec.push_back(r.get<bool>() ? 1 : 0);
             } else {
                 mode = 3; gvec.reserve(n); gvec.emplace_back(r, false);
             }
@@ -182,6 +196,8 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
             ivec.push_back(r.get<int_type>());
         } else if (mode == 2 && r.is<float_type>()) {
             fvec.push_back(r.get<float_type>());
+        } else if (mode == 4 && r.is<bool>()) {
+            bvec.push_back(r.get<bool>() ? 1 : 0);
         } else {
             if (mode != 3)
                 spill_to_general();
@@ -191,6 +207,7 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
 
     if (mode == 1) return SharedArrayObj(move(ivec));
     if (mode == 2) return SharedArrayObj(move(fvec));
+    if (mode == 4) return SharedArrayObj(move(bvec));
     return SharedArrayObj(move(gvec));
 }
 
@@ -217,6 +234,8 @@ EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList)
             return SharedStr(string("ints"));
         case SharedArrayObj::Storage::floats:
             return SharedStr(string("floats"));
+        case SharedArrayObj::Storage::bools:
+            return SharedStr(string("bools"));
         default:
             return SharedStr(string("general"));
     }
@@ -302,6 +321,10 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
             : elem.get<float_type>());
         return lval->get();
     }
+    if (arr.skind() == SharedArrayObj::Storage::bools && elem.is<bool>()) {
+        arr.flat_bools().push_back(elem.get<bool>() ? 1 : 0);
+        return lval->get();
+    }
 
     if (arr.skind() != SharedArrayObj::Storage::general)
         throw TypeErrorEx(flat_array_violation_msg, arg0->start, arg1->end);
@@ -347,6 +370,9 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
             last = EvalValue(arr.flat_ints()[last_i]);   break;
         case SharedArrayObj::Storage::floats:
             last = EvalValue(arr.flat_floats()[last_i]); break;
+        case SharedArrayObj::Storage::bools:
+            last = EvalValue(static_cast<bool>(arr.flat_bools()[last_i]));
+            break;
         default:
             last = arr.get_vec()[last_i].get();          break;
     }
@@ -364,6 +390,8 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
                 arr.flat_ints().pop_back();   break;
             case SharedArrayObj::Storage::floats:
                 arr.flat_floats().pop_back(); break;
+            case SharedArrayObj::Storage::bools:
+                arr.flat_bools().pop_back();  break;
             default:
                 arr.get_vec().pop_back();     break;
         }
@@ -427,6 +455,9 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
         case SharedArrayObj::Storage::floats: {
             auto &v = arr.flat_floats(); v.erase(v.begin() + at); break;
         }
+        case SharedArrayObj::Storage::bools: {
+            auto &v = arr.flat_bools();  v.erase(v.begin() + at); break;
+        }
         default: {
             auto &v = arr.get_vec();     v.erase(v.begin() + at); break;
         }
@@ -463,6 +494,11 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
         v.insert(v.begin() + at, val.is<int_type>()
             ? static_cast<float_type>(val.get<int_type>())
             : val.get<float_type>());
+        return true;
+    }
+    if (arr.skind() == SharedArrayObj::Storage::bools && val.is<bool>()) {
+        auto &v = arr.flat_bools();
+        v.insert(v.begin() + at, val.get<bool>() ? 1 : 0);
         return true;
     }
 
@@ -680,6 +716,14 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
                     sort(v.begin(), v.end(), std::greater<float_type>());
                 return arr;
             }
+            case SharedArrayObj::Storage::bools: {
+                auto &v = arr.flat_bools();   /* 0/1 sorts as false<true */
+                if (!reverse)
+                    sort(v.begin(), v.end());
+                else
+                    sort(v.begin(), v.end(), std::greater<unsigned char>());
+                return arr;
+            }
             default:
                 break;
         }
@@ -730,6 +774,16 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
                 comparator_heapsort(v, [&](float_type a, float_type b) {
                     const bool lt = eval_func(ctx, funcObj,
                         make_pair(EvalValue(a), EvalValue(b))).is_true();
+                    return reverse ? !lt : lt;
+                });
+                break;
+            }
+            case SharedArrayObj::Storage::bools: {
+                auto &v = arr.flat_bools();
+                comparator_heapsort(v, [&](unsigned char a, unsigned char b) {
+                    const bool lt = eval_func(ctx, funcObj,
+                        make_pair(EvalValue(static_cast<bool>(a)),
+                                  EvalValue(static_cast<bool>(b)))).is_true();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -797,6 +851,11 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
             reverse(v.begin(), v.end());
             break;
         }
+        case SharedArrayObj::Storage::bools: {
+            auto &v = arr.flat_bools();
+            reverse(v.begin(), v.end());
+            break;
+        }
         default: {
             auto &vec = arr.get_vec();
             reverse(vec.begin(), vec.end());
@@ -838,6 +897,15 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
             int_type acc = 0;
             for (size_type i = 0; i < n; i++)
                 acc += iv[off + i];           /* wraps (-fwrapv), like += */
+            return EvalValue(acc);
+        }
+
+        if (arr.skind() == SharedArrayObj::Storage::bools) {
+            /* bool promotes to int: sum counts the `true`s, as an int. */
+            const auto &bv = arr.flat_bools();
+            int_type acc = 0;
+            for (size_type i = 0; i < n; i++)
+                acc += bv[off + i] ? 1 : 0;
             return EvalValue(acc);
         }
 

@@ -13,6 +13,7 @@
 STyArena::STyArena()
 {
     for (int o = 0; o < 2; o++) {
+        g_bool[o]  = alloc(STyKind::Bool);      g_bool[o]->opt  = o;
         g_int[o]   = alloc(STyKind::Int);       g_int[o]->opt   = o;
         g_float[o] = alloc(STyKind::Float);     g_float[o]->opt = o;
         g_str[o]   = alloc(STyKind::Str);       g_str[o]->opt   = o;
@@ -35,6 +36,7 @@ STyRef STyArena::ground(STyKind k, bool opt)
     const int i = opt ? 1 : 0;
 
     switch (k) {
+        case STyKind::Bool:      return g_bool[i];
         case STyKind::Int:       return g_int[i];
         case STyKind::Float:     return g_float[i];
         case STyKind::Str:       return g_str[i];
@@ -93,6 +95,7 @@ STyRef STyArena::with_opt(STyRef t, bool optflag)
         return t;
 
     switch (t->kind) {
+        case STyKind::Bool:
         case STyKind::Int:
         case STyKind::Float:
         case STyKind::Str:
@@ -331,8 +334,12 @@ bool sty_assignable(STyRef src, STyRef dst)
     if (sty_same_underlying(src, dst))
         return true;
 
+    /* The numeric promotion chain: bool <= int <= float. */
     if (src->kind == STyKind::Int && dst->kind == STyKind::Float)
-        return true;                      /* int promotes to float */
+        return true;
+    if (src->kind == STyKind::Bool &&
+        (dst->kind == STyKind::Int || dst->kind == STyKind::Float))
+        return true;
 
     return false;
 }
@@ -367,13 +374,26 @@ STyRef STyArena::join(STyRef a, STyRef b)
 
     const bool anyopt = a->opt || b->opt;
 
-    const bool a_num = a->kind == STyKind::Int || a->kind == STyKind::Float;
-    const bool b_num = b->kind == STyKind::Int || b->kind == STyKind::Float;
+    /* Numeric promotion chain bool < int < float: the join climbs to the
+     * higher-ranked numeric kind. join(bool,int)=int, join(int,float)=float,
+     * join(bool,bool)=bool (distinct opt reaches here). */
+    auto num_rank = [](STyKind k) -> int {
+        switch (k) {
+            case STyKind::Bool:  return 0;
+            case STyKind::Int:   return 1;
+            case STyKind::Float: return 2;
+            default:             return -1;
+        }
+    };
 
-    if (a_num && b_num) {
-        const STyKind k =
-            (a->kind == STyKind::Float || b->kind == STyKind::Float)
-                ? STyKind::Float : STyKind::Int;
+    const int ar = num_rank(a->kind);
+    const int br = num_rank(b->kind);
+
+    if (ar >= 0 && br >= 0) {
+        const int r = ar > br ? ar : br;
+        const STyKind k = r == 2 ? STyKind::Float
+                        : r == 1 ? STyKind::Int
+                                 : STyKind::Bool;
         return ground(k, anyopt);
     }
 
@@ -452,6 +472,7 @@ std::string sty_to_string(STyRef t)
 
         case STyKind::Unknown:   return s + "?";
         case STyKind::None:      return "none";
+        case STyKind::Bool:      return s + "bool";
         case STyKind::Int:       return s + "int";
         case STyKind::Float:     return s + "float";
         case STyKind::Str:       return s + "str";

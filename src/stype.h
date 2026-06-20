@@ -31,6 +31,7 @@
 enum class STyKind {
     Unknown,      /* a fresh type variable (union-find); no type yet */
     None,         /* the only-none / not-yet-pinned unit type */
+    Bool,         /* bool <= int <= float promotion chain */
     Int,
     Float,
     Str,
@@ -70,6 +71,7 @@ public:
     STyArena();
 
     /* Ground singletons (cached per opt-flag). */
+    STyRef bool_ty(bool opt = false)  { return ground(STyKind::Bool, opt); }
     STyRef int_ty(bool opt = false)   { return ground(STyKind::Int, opt); }
     STyRef float_ty(bool opt = false) { return ground(STyKind::Float, opt); }
     STyRef str_ty(bool opt = false)   { return ground(STyKind::Str, opt); }
@@ -95,6 +97,7 @@ public:
 private:
 
     std::vector<std::unique_ptr<STy>> nodes;
+    STyRef g_bool[2];
     STyRef g_int[2];
     STyRef g_float[2];
     STyRef g_str[2];

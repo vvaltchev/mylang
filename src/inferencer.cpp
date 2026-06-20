@@ -54,6 +54,10 @@ struct TypeSym {
     STyRef acc = nullptr;      /* accumulator built during a round */
     bool dyn_decl = false;
     bool opt_decl = false;
+    /* Explicit type annotation (`int x`, `func f(str s)`, `array a`); `none`
+     * for an inferred `var`/`const`/param. A scalar annotation pins the type
+     * (with assignability checked); `arr`/`dict` constrain only the kind. */
+    DeclType ann = DeclType::none;
     bool is_param = false;
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
@@ -128,6 +132,7 @@ private:
     void walk_struct(Construct *n, Scope *s);
     void declare_funcdecl(FuncDeclStmt *fd, Scope *s);
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
+    void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(STyRef t, bool deep);
@@ -167,11 +172,25 @@ private:
     [[noreturn]] void nullability(const std::string &m, Loc s, Loc e);
     [[noreturn]] void argcount(const std::string &m, Loc s, Loc e);
 
+    /* An explicit SCALAR annotation (bool/int/float/str) as an STy, with the
+     * symbol's opt flag applied; nullptr for none/array/dict (not pinned). */
+    STyRef ann_scalar_sty(const TypeSym *s) {
+        const bool o = s->opt_decl;
+        switch (s->ann) {
+            case DeclType::b: return A.bool_ty(o);
+            case DeclType::i: return A.int_ty(o);
+            case DeclType::f: return A.float_ty(o);
+            case DeclType::s: return A.str_ty(o);
+            default:          return nullptr;
+        }
+    }
+
     /* small predicates */
     STyRef strip(STyRef t) { return A.with_opt(t, false); }
     static bool is_num(STyRef t) {
         t = sty_resolve(t);
-        return t->kind == STyKind::Int || t->kind == STyKind::Float;
+        return t->kind == STyKind::Bool || t->kind == STyKind::Int ||
+               t->kind == STyKind::Float;
     }
     static bool is_dyn(STyRef t) {
         return sty_resolve(t)->kind == STyKind::Dyn;
@@ -440,6 +459,7 @@ void Inferencer::run()
      * first, instead of being masked by DynRequiredEx.
      */
     if (strict_dyn) {
+        enforce_decl_types();
         enforce_concrete_decls();
         enforce_nonnull_params();
     }
@@ -473,6 +493,41 @@ bool Inferencer::type_has_dyn(STyRef t, bool deep)
         return type_has_dyn(t->key, true) || type_has_dyn(t->val, true);
 
     return false;
+}
+
+/*
+ * Enforce the generic `array`/`dict` explicit-type annotations: the symbol must
+ * actually be an array / dict (its element/key/value types are inferred, so only
+ * the kind is constrained here). The scalar annotations (bool/int/float/str) are
+ * enforced inline in contribute() by pinning + assignability; this post-pass
+ * covers the container kinds, whose element types only settle after the fixpoint.
+ * `none`/`opt` of the right kind is accepted (an `opt array` may be none).
+ */
+void Inferencer::enforce_decl_types()
+{
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+
+        if (s->ann != DeclType::arr && s->ann != DeclType::dict)
+            continue;
+        if (s->func || !s->decl_loc)
+            continue;
+
+        STyRef t = sty_resolve(s->type);
+        /* Defer on a not-yet-pinned/none/dyn type (a never-written `array a;` is
+         * array<none> which IS an array; an unresolved one is tolerated). */
+        if (t->kind == STyKind::None || t->kind == STyKind::Unknown ||
+            t->kind == STyKind::Dyn)
+            continue;
+
+        const STyKind want = s->ann == DeclType::arr ? STyKind::Array
+                                                     : STyKind::Dict;
+        if (t->kind != want)
+            mismatch("'" + std::string(s->name->val) + "' is declared '" +
+                         (s->ann == DeclType::arr ? "array" : "dict") +
+                         "' but has type '" + sty_to_string(s->type) + "'",
+                     s->decl_loc, s->decl_loc);
+    }
 }
 
 /*
@@ -603,7 +658,12 @@ void Inferencer::annotate_hints(Construct *n)
 
     STyRef t = sty_resolve(type_of(n));
     if (!t->opt) {
-        if (t->kind == STyKind::Int)
+        /* bool is evaluated through the int (eval_int) path: it promotes to
+         * 0/1, so a typed scalar over bool operands computes unboxed exactly
+         * like int. The boxing in TypedScalarExpr::do_eval / LiteralBool keeps
+         * the value bool where it must (a comparison/logical result, a bool
+         * literal); arithmetic over bool correctly yields int. */
+        if (t->kind == STyKind::Int || t->kind == STyKind::Bool)
             n->th = TypeHint::i;
         else if (t->kind == STyKind::Float)
             n->th = TypeHint::f;
@@ -656,6 +716,8 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
             hint = ArrHint::flat_i;
         else if (!el->opt && el->kind == STyKind::Float)
             hint = ArrHint::flat_f;
+        else if (!el->opt && el->kind == STyKind::Bool)
+            hint = ArrHint::flat_b;
         else
             hint = ArrHint::general;
     } else if (ty->kind == STyKind::Dyn) {
@@ -734,6 +796,8 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
         sym->opt_decl = sym->opt_decl || id->opt_mod;
         sym->dyn_decl = sym->dyn_decl || id->dyn_mod;
         sym->const_decl = sym->const_decl || is_const;
+        if (id->decl_type != DeclType::none)
+            sym->ann = id->decl_type;
         id_sym[id] = sym;
     };
 
@@ -775,6 +839,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                 psym->is_param = true;
                 psym->opt_decl = p->opt_mod;
                 psym->dyn_decl = p->dyn_mod;
+                psym->ann = p->decl_type;
                 id_sym[p.get()] = psym;
                 fi->params.push_back(psym);
             }
@@ -881,6 +946,7 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
     Type *t = v.get_type();
     switch (t->t) {
 
+        case Type::t_bool:  return A.bool_ty();
         case Type::t_int:   return A.int_ty();
         case Type::t_float: return A.float_ty();
         case Type::t_str:   return A.str_ty();
@@ -894,6 +960,8 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
              * from the kind - crucially WITHOUT get_view(), which would promote
              * the const value to general (see plans/typed-arrays.md).
              */
+            if (arr.skind() == SharedArrayObj::Storage::bools)
+                return A.array_of(A.bool_ty());
             if (arr.skind() == SharedArrayObj::Storage::ints)
                 return A.array_of(A.int_ty());
             if (arr.skind() == SharedArrayObj::Storage::floats)
@@ -940,6 +1008,7 @@ STyRef Inferencer::type_of(const Construct *e)
     if (!e)
         return A.none_ty();
 
+    if (dynamic_cast<const LiteralBool *>(e))  return A.bool_ty();
     if (dynamic_cast<const LiteralInt *>(e))   return A.int_ty();
     if (dynamic_cast<const LiteralFloat *>(e)) return A.float_ty();
     if (dynamic_cast<const LiteralStr *>(e))   return A.str_ty();
@@ -1098,12 +1167,15 @@ STyRef Inferencer::unary_result(Op op, STyRef a)
     if (op == Op::invalid)
         return a;
     if (op == Op::lnot)
-        return A.int_ty();
+        return A.bool_ty();
     if (op == Op::plus || op == Op::minus) {
         STyRef u = strip(sty_resolve(a));
         if (is_unknown(u)) return bottom;   /* defer: operand not yet known */
-        if (u->kind == STyKind::Int || u->kind == STyKind::Float)
-            return u;
+        /* unary +/- promotes bool to int (`-true` is int -1). */
+        if (u->kind == STyKind::Bool || u->kind == STyKind::Int)
+            return A.int_ty();
+        if (u->kind == STyKind::Float)
+            return A.float_ty();
         return A.dyn_ty();
     }
     return A.dyn_ty();
@@ -1114,10 +1186,10 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
     a = sty_resolve(a);
     b = sty_resolve(b);
 
-    /* comparisons / equality / logical always yield int */
+    /* comparisons / equality / logical always yield bool */
     if (op == Op::eq || op == Op::noteq || op == Op::lt || op == Op::gt ||
         op == Op::le || op == Op::ge || op == Op::land || op == Op::lor)
-        return A.int_ty();
+        return A.bool_ty();
 
     /* `str + anything` stringifies the RHS and yields str - even a dyn/none RHS
      * (so a `s = s + e` accumulator over a dyn element stays str). Handle it
@@ -1154,6 +1226,16 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
     STyRef au = strip(a), bu = strip(b);
     const bool an = is_num(au), bn = is_num(bu);
 
+    /* Arithmetic over numeric operands promotes bool to int first (so
+     * `true + true` is int 2, never bool), then joins along bool < int <
+     * float. Comparisons/logical are handled above and stay bool. */
+    auto arith_join = [&](STyRef x, STyRef y) -> STyRef {
+        STyRef j = A.join(x, y);
+        if (j && sty_resolve(j)->kind == STyKind::Bool)
+            j = A.int_ty(j->opt);
+        return j;
+    };
+
     switch (op) {
         case Op::plus:
             /* str + anything -> str (the RHS is stringified); but int/float +
@@ -1161,7 +1243,7 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
             if (au->kind == STyKind::Str)
                 return A.str_ty();
             if (an && bn) {
-                STyRef j = A.join(au, bu);
+                STyRef j = arith_join(au, bu);
                 return j ? j : A.dyn_ty();
             }
             if (au->kind == STyKind::Array && bu->kind == STyKind::Array) {
@@ -1174,7 +1256,7 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
             if (au->kind == STyKind::Str && bu->kind == STyKind::Int)
                 return A.str_ty();
             if (an && bn) {
-                STyRef j = A.join(au, bu);
+                STyRef j = arith_join(au, bu);
                 return j ? j : A.dyn_ty();
             }
             return A.dyn_ty();
@@ -1183,7 +1265,7 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
         case Op::div:
         case Op::mod:
             if (an && bn) {
-                STyRef j = A.join(au, bu);
+                STyRef j = arith_join(au, bu);
                 return j ? j : A.dyn_ty();
             }
             return A.dyn_ty();
@@ -1216,12 +1298,15 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     /* int-returning */
     if (n == "len" || n == "hash" || n == "ord" || n == "rand" ||
-        n == "intptr" || n == "defined" || n == "isconst" ||
-        n == "isconstdecl" || n == "ispure" || n == "ispuredecl" ||
-        n == "startswith" || n == "endswith" || n == "isinf" ||
-        n == "isfinite" || n == "isnormal" || n == "isnan" ||
-        n == "remove")
+        n == "intptr" || n == "remove")
         return A.int_ty();
+
+    /* bool-returning predicates */
+    if (n == "defined" || n == "isconst" || n == "isconstdecl" ||
+        n == "ispure" || n == "ispuredecl" || n == "startswith" ||
+        n == "endswith" || n == "isinf" || n == "isfinite" ||
+        n == "isnormal" || n == "isnan")
+        return A.bool_ty();
 
     /* float-returning */
     if (n == "float" || n == "exp" || n == "log" || n == "sqrt" ||
@@ -1306,8 +1391,17 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return t;
     }
 
-    if (n == "sum" || n == "top" || n == "pop")
+    if (n == "top" || n == "pop")
         return elem_of(arg(0));
+
+    if (n == "sum") {
+        /* sum returns the element type, except a bool array sums to an int
+         * (it counts the `true`s; bool promotes to int in arithmetic). */
+        STyRef el = elem_of(arg(0));
+        if (is_unknown(el))
+            return bottom;
+        return sty_resolve(el)->kind == STyKind::Bool ? A.int_ty() : el;
+    }
 
     if (n == "map") {
         /* map(func, container) -> array of the callback's return type */
@@ -1371,7 +1465,13 @@ void Inferencer::reset_round()
         TypeSym *s = up.get();
         if (s->func)
             continue;
-        s->acc = s->dyn_decl ? A.dyn_ty() : bottom;
+        /* A scalar annotation pins the type: seed the accumulator with the
+         * declared type so it stays fixed (contribute() keeps it and checks
+         * assignability). dyn next, else bottom. */
+        if (STyRef d = ann_scalar_sty(s))
+            s->acc = d;
+        else
+            s->acc = s->dyn_decl ? A.dyn_ty() : bottom;
     }
     for (auto &up : all_funcs)
         up->ret_acc = bottom;
@@ -1404,6 +1504,31 @@ void Inferencer::contribute(TypeSym *s, STyRef t, Loc loc)
      */
     if (!s || s->func)
         return;
+
+    /*
+     * A scalar-annotated symbol is PINNED to its declared type (`int x`): the
+     * accumulator stays the declared type (seeded in reset_round), and each
+     * contribution is instead CHECKED to be assignable to it. So `int x = 3.5`,
+     * `int x = 5; x = 2.5`, and a float arg to an `int` parameter are errors,
+     * while `float f = 3` (int widens) is fine. A param's *call-site* args get
+     * the precise per-argument error from check_call; here we only check
+     * assignments to a declared var. Unknown/none defer (Unknown is bottom; a
+     * `none` into a non-opt declared type is reported by require_nonopt/the
+     * mandatory-opt rule).
+     */
+    if (STyRef d = ann_scalar_sty(s)) {
+        if (strict_dyn && !s->is_param) {
+            STyRef rt = sty_resolve(t);
+            if (!is_unknown(rt) && !is_none(rt) && !sty_assignable(rt, d))
+                mismatch("'" + std::string(s->name->val) +
+                             "' is declared '" + sty_to_string(d) +
+                             "' but is assigned '" + sty_to_string(t) + "'",
+                         loc, Loc());
+        }
+        s->acc = d;                  /* pinned: never widens */
+        return;
+    }
+
     STyRef nw = A.join(s->acc, t);
     if (!nw)
         mismatch("'" + std::string(s->name->val) + "' has type '" +
@@ -2081,10 +2206,30 @@ void Inferencer::check_call(CallExpr *call)
     size_t nparams = fparams ? fparams->size() : fsty->params.size();
     size_t nargs = args->elems.size();
 
-    if (nargs != nparams)
-        argcount("function expects " + std::to_string(nparams) +
-                     " argument(s), got " + std::to_string(nargs),
+    /*
+     * Trailing `opt` parameters may be omitted by the caller (they default to
+     * `none`), so the legal arg count is a range [min_args, nparams], where
+     * min_args is 1 + the index of the last non-opt param. An omitted opt param
+     * is already typed `opt T` at finalization, so the body still null-checks
+     * it; no per-call contribution is needed here.
+     */
+    auto param_is_opt = [&](size_t i) -> bool {
+        return fparams ? (*fparams)[i]->opt_decl
+                       : (i < fsty->param_opt.size() && fsty->param_opt[i]);
+    };
+    size_t min_args = 0;
+    for (size_t i = 0; i < nparams; i++)
+        if (!param_is_opt(i))
+            min_args = i + 1;
+
+    if (nargs < min_args || nargs > nparams) {
+        const std::string want = min_args == nparams
+            ? std::to_string(nparams)
+            : std::to_string(min_args) + " to " + std::to_string(nparams);
+        argcount("function expects " + want + " argument(s), got " +
+                     std::to_string(nargs),
                  call->start, call->end);
+    }
 
     for (size_t i = 0; i < nargs && i < nparams; i++) {
         Construct *anode = args->elems[i].get();
@@ -2366,7 +2511,8 @@ void Inferencer::collect_arrays(AnalysisInfo &out)
         STyRef el = sty_resolve(ty->elem);
         AnnoKind k;
         if (!el->opt && (el->kind == STyKind::Int ||
-                         el->kind == STyKind::Float))
+                         el->kind == STyKind::Float ||
+                         el->kind == STyKind::Bool))
             k = AnnoKind::flat_array;
         else if (el->kind == STyKind::Dyn)
             k = AnnoKind::dyn_array;

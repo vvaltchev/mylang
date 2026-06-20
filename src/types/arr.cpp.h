@@ -46,6 +46,15 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
             return;
         }
 
+        case Storage::bools: {
+            bvec_type nv(
+                shobj->bvec.cbegin() + offset(),
+                shobj->bvec.cbegin() + offset() + size()
+            );
+            *this = SharedArrayObjTempl(move(nv));
+            return;
+        }
+
         default:
             break;
     }
@@ -160,6 +169,8 @@ EvalValue TypeArr::intptr(const EvalValue &a)
             return reinterpret_cast<int_type>(&arr.flat_ints());
         case SharedArrayObj::Storage::floats:
             return reinterpret_cast<int_type>(&arr.flat_floats());
+        case SharedArrayObj::Storage::bools:
+            return reinterpret_cast<int_type>(&arr.flat_bools());
         default:
             return reinterpret_cast<int_type>(&arr.get_vec());
     }
@@ -245,6 +256,36 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
         return;
     }
 
+    if (lval.skind() == rhs.skind() &&
+        lval.skind() == SharedArrayObj::Storage::bools)
+    {
+        const auto &rv = rhs.flat_bools();
+
+        if (!lval.is_slice()) {
+
+            auto &lv = lval.flat_bools();
+            lv.reserve(lval.size() + rhs.size());
+            lv.insert(lv.end(),
+                      rv.cbegin() + rhs.offset(),
+                      rv.cbegin() + rhs.offset() + rhs.size());
+
+        } else {
+
+            const auto &lv = lval.flat_bools();
+            SharedArrayObj::bvec_type nv;
+            nv.reserve(lval.size() + rhs.size());
+            nv.insert(nv.end(),
+                      lv.cbegin() + lval.offset(),
+                      lv.cbegin() + lval.offset() + lval.size());
+            nv.insert(nv.end(),
+                      rv.cbegin() + rhs.offset(),
+                      rv.cbegin() + rhs.offset() + rhs.size());
+            lval = SharedArrayObj(move(nv));
+        }
+
+        return;
+    }
+
     /*
      * Mixed / general concat. The result is a general array. If lhs is already
      * a general non-slice, append rhs's elements in place; otherwise build a
@@ -286,6 +327,8 @@ static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i)
             return EvalValue(arr.flat_ints()[at]);
         case SharedArrayObj::Storage::floats:
             return EvalValue(arr.flat_floats()[at]);
+        case SharedArrayObj::Storage::bools:
+            return EvalValue(static_cast<bool>(arr.flat_bools()[at]));
         default:
             return arr.get_vec()[at].get();
     }
@@ -338,7 +381,7 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
 void TypeArr::noteq(EvalValue &a, const EvalValue &b)
 {
     eq(a, b);
-    a = !a.get<int_type>();
+    a = !a.is_true();   /* eq() yields a bool; negate it (stays bool) */
 }
 
 string TypeArr::to_string(const EvalValue &a)
@@ -353,12 +396,8 @@ string TypeArr::to_string(const EvalValue &a)
     /* Flat fast path: stringify the unboxed vector directly, no promotion. */
     if (arr.skind() != SharedArrayObj::Storage::general) {
 
-        const bool kind_int = arr.skind() == SharedArrayObj::Storage::ints;
-        const size_type off = arr.offset();
-
         for (size_type i = 0; i < n; i++) {
-            res += kind_int ? EvalValue(arr.flat_ints()[off + i]).to_string()
-                            : EvalValue(arr.flat_floats()[off + i]).to_string();
+            res += arr_elem_at(arr, i).to_string();
             if (i != n - 1)
                 res += ", ";
         }
@@ -411,12 +450,8 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval,
      * it can't be a mutate-in-place container target either. So every read that
      * reaches here (print(a[i]), a dyn context, a builtin arg, ...) stays flat.
      */
-    if (arr.skind() != SharedArrayObj::Storage::general) {
-        const size_type at = arr.offset() + idx;
-        return arr.skind() == SharedArrayObj::Storage::ints
-            ? EvalValue(arr.flat_ints()[at])
-            : EvalValue(arr.flat_floats()[at]);
-    }
+    if (arr.skind() != SharedArrayObj::Storage::general)
+        return arr_elem_at(arr, idx);
 
     SharedArrayObj::vec_type &vec = arr.get_vec();
     LValue *ret = &vec[arr.offset() + idx];

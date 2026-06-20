@@ -612,12 +612,16 @@ leaves the tree untouched for the later passes. Full design + the decisions
 behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
 
 - **Static types** are `STy` (`stype.h`), distinct from the runtime `Type *`:
-  `None` (the only-none / not-yet-pinned unit), `Int`, `Float`, `Str`,
+  `None` (the only-none / not-yet-pinned unit), `Bool`, `Int`, `Float`, `Str`,
   `Array<elem>`, `Dict<k,v>`, `Func(params)->ret`, `Exception`, `Dyn` (explicit
   top), each with an `opt` (nullable) flag. The lattice ops are
-  `assignable`/`join`/`unify`/`equal` (`int <= float` promotion; `None`/`opt`
-  nullability; mixed container elements fall to `Dyn`; a scalar/kind conflict is
-  an error).
+  `assignable`/`join`/`unify`/`equal` with the numeric promotion chain
+  **`Bool <= Int <= Float`** (`join` climbs by numeric rank: `join(bool,int)` is
+  int, `join(int,float)` is float; `assignable` lets bool fit int/float;
+  arithmetic over bools promotes to int — `binop_result`'s `arith_join` bumps a
+  bool result to int, so `true+true` is int 2; comparisons/logical → `Bool`).
+  `None`/`opt` give nullability; mixed container elements fall to `Dyn`; a
+  scalar/kind conflict is an error.
 - **Three passes**: (1) *structural* — build scopes, one `TypeSym` per
   declaration, resolve every `Identifier` to its `TypeSym`, one `FuncInfo` per
   function; (2) *fixpoint* — **Jacobi** iteration: each round recomputes every
@@ -654,6 +658,35 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   In `STy`, `opt dyn` is `g_dyn[1]` (the opt-`Dyn` ground); `with_opt` carries
   the opt bit onto a `Dyn` kind, and `join` keeps it when a mix collapses to dyn
   (`dyn | none` → `opt dyn`).
+- **Explicit type annotations** (`int x = 5;`, `func f(str s)`,
+  `array a = [...]`): the primitive type keywords `bool`/`int`/`float`/`str`/
+  `array`/`dict` may replace `var` on a decl/`for`-init or precede a parameter
+  name, combinable as `[const] [opt] TYPE name`. They are **not lexer keywords**
+  (they stay the builtins `int()`/`array()`/…); the parser disambiguates by
+  one-token lookahead — a type name is a type only when the next token (after an
+  optional `const`/`opt`) is the variable name (`pAcceptDeclPrefix` in
+  `parser.cpp`, shared by `pStmt` and `for`-init; uses `TokenStream::peek`). The
+  annotation rides on `Identifier::decl_type` (a `DeclType` enum, `syntax.h`),
+  threaded from the prefix via `ParseContext::pending_decl_type` and **also
+  propagated by the resolver from the declaration to every use** (so a
+  reassignment can coerce). Semantics, in the inferencer (`TypeSym::ann`): a
+  **scalar** annotation *pins* the symbol's type (`reset_round` seeds the
+  declared `STy`, `contribute` keeps it and checks each value is `assignable` —
+  so `int x = 3.5` / `int x = 5; x = 2.5` / a wrong-typed arg to a typed param
+  are errors, while `float f = 3` widens); `array`/`dict` are **generic** (only
+  the kind is checked, by `enforce_decl_types` in the strict block — element
+  types stay inferred, so `array a = [1,2,3]` is still flat `array<int>`). A
+  scalar error is gated by `strict_dyn` (off for the `-a`/`--debug-ti`
+  non-strict passes). **Runtime:** `coerce_to_decl_type` (`eval.cpp`) does the
+  numeric widenings (float←int/bool, int←bool) so a typed-float var/param holds
+  a float — at the decl/assign (`handle_single_expr14`, `op == assign`, lvalue's
+  `decl_type`) and at param bind (`bind_param`). Auto-const inlining
+  (`resolver.cpp`) and the parser's const-scalar inlining both coerce too (their
+  own `coerce_decl_scalar`/`check_coerce_const_scalar` copies, since a `const`
+  scalar is inlined *before* the inferencer runs — that path also does the
+  type-check the inferencer can't). An **uninitialized** typed decl
+  (`int x;`) gets the type's zero value (`zero_value_literal`: 0/0.0/false/""/
+  []/{}), or `none` when `opt`.
 - **Errors** are compile-time (`DECL`-style plain `Exception`s, **not**
   `RuntimeException`s, so script `try/catch` cannot catch them; `errors.h`):
   `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),
@@ -733,7 +766,14 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
 ### M8 — typed scalar specialization (`specialize_types`, the speed payoff)
 
 After inference, `infer_types` stamps a `TypeHint` (`th`: `i`/`f`) on every node
-it proved is a non-null int/float. After `resolve_names`, `specialize_types`
+it proved is a non-null int/float. **A `bool` node is stamped `i` too** — bool
+flows through the int (`eval_int`) path, computing as `0`/`1`, which is exactly
+its promoted value, so a typed scalar over bool operands is unboxed like int
+(the boxing in `TypedScalarExpr::do_eval`/`LiteralBool` keeps a bool where it
+must — a comparison/logical/`!` result, a bool literal — while arithmetic over
+bools correctly yields int). `Construct`/`Identifier`/`Subscript`
+`eval_int`/`eval_float` read a bool value/slot/flat element as `0`/`1`. After
+`resolve_names`, `specialize_types`
 (`inferencer.cpp`, called from `mylang.cpp` + the test harness, gated by `-nti`)
 rewrites hot scalar nodes — `Expr03/04` (arith), `Expr06/07` (compare),
 `Expr11/12` (logical), `Expr02` (unary) — over typed operands into a single
@@ -744,7 +784,9 @@ through `eval()`/`RValue`, so a typed node may call them on any child) — with 
 `EvalValue` boxing. `Identifier`/`Subscript` override `eval_int`/`eval_float`
 to read a resolved-local slot / an array element's scalar directly
 (`EvalValue::get_ref<T>()` avoids a refcount bump); loop/if conditions take the
-unboxed path via `eval_cond` when the condition is a known int. The specializer
+unboxed path via `eval_cond` when the condition is a known int (a comparison
+result is bool-typed but specialized with `result_th = i`, so conditions stay
+fast). The specializer
 recurses bottom-up so nested typed subtrees chain `eval_int` calls with no
 boxing between them. **Effect:** ~2.8x on `bench/44_primes_sqrt`, ~2x on
 float-heavy reductions; the once-slower-than-Python primes benchmark is now
@@ -786,30 +828,49 @@ wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
   example). Binary ops
   **mutate the left operand in place**
   (`void add(EvalValue &a, const EvalValue &b)` does `a += b`).
+- **`bool` is a real scalar type (`t_bool`, `TypeBool` in
+  `src/types/bool.cpp.h`).** `true`/`false` are its only two values (parsed to
+  `LiteralBool`, `syntax.h`). It is stored in `EvalValue`'s `bval` union member
+  (which aliases `ival`'s low byte; the `EvalValue(bool)` ctor zeroes the full
+  `ival` first, so reading the slot as the int `0`/`1` is also valid). `bool`
+  sits at the bottom of the numeric promotion chain **`bool <= int <= float`**:
+  `num_bin_op` promotes a bool operand to `int 0/1` before dispatch, so
+  `TypeBool` itself only implements `is_true`/`to_string`/`hash` (the hash
+  matches the equal int `0/1`, so `true` and `1` are one dict key). Comparisons
+  (`Expr06`/`Expr07`), logical ops (`Expr11`/`Expr12`, via `logop_loc`), and
+  unary `!`/`-`/`+` produce a `bool` (`-true`/`+true` promote to int first); the
+  `EvalValue` comparison operators read the result via `is_true()`, **not**
+  `get<int_type>()` (a comparison result may now be a bool — `TypeArr::noteq`
+  was the one internal consumer that had to switch). `MakeConstructFromConstVal`
+  and `value_repr` (specialization-dedup key) handle bool. Bool-returning
+  predicate builtins (`defined`/`isconst`/`isconstdecl`/`ispure`/`ispuredecl`/
+  `startswith`/`endswith`/`isinf`/`isfinite`/`isnormal`/`isnan`) return a real
+  bool; `int()`/`float()` accept a bool.
 - **Mixed int/float promotion is centralized in `num_bin_op()`**
   (`evalvalue.h`), not in the type
   classes. The type virtuals are single-type: `TypeInt::add` only handles an int
   RHS, `TypeFloat::add`
   also accepts an int RHS (promoting it). `num_bin_op(a, b, &Type::op)` is the
   dispatch chokepoint:
-  when `a` is int and `b` is float it promotes `a` to float first, so
-  `int OP float` lands in
-  `TypeFloat` and behaves identically to `float OP int`. **Dispatch binary
+  it first promotes a **bool** operand (either side) to `int 0/1`, then, when
+  `a` is int and `b` is float, promotes `a` to float, so `int OP float` lands in
+  `TypeFloat` and behaves identically to `float OP int` (and `bool OP x` like
+  `int OP x`). **Dispatch binary
   arithmetic/comparison
   through `num_bin_op`, never by calling `a.get_type()->add(...)` directly** —
   every call site does
   (the `ExprNN::do_eval` ladder and compound-assign in `eval.cpp`, `EvalValue`'s
   `== != < <= > >=`
-  operators, `builtin_sum`). It is a no-op for any non-`(int,float)` operand
-  pair, so string/array/etc.
+  operators, `builtin_sum`). It is a no-op for any non-`(bool/int,float)`
+  operand pair, so string/array/etc.
   comparisons pass through unchanged. (Logical `&&`/`||` and unary ops are *not*
   routed through it.)
   Note for dict keys: an integer-valued float hashes as the equal int
   (`TypeFloat::hash`) so that
   `1` and `1.0`, which compare equal, are the same key.
 - **The trivial / non-trivial boundary is `t_str`.** `TypeE` order matters:
-  `t_none, t_lval, t_undefid, t_int, t_builtin, t_float` (`< t_str`, trivial,
-  stored inline,
+  `t_none, t_lval, t_undefid, t_int, t_builtin, t_float, t_bool` (`< t_str`,
+  trivial, stored inline,
   bit-copyable) then `t_str, t_func, t_arr, t_ex, t_dict` (`>= t_str`,
   non-trivial, need the
   type-erased lifecycle ops). Hot paths branch on `type->t < Type::t_str` /
@@ -944,6 +1005,18 @@ wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
   consts + params).
   Builtins are different: they receive the **caller's `ctx`** and the
   **unevaluated** `ExprList`.
+- **Trailing `opt` parameters are skippable at the call site.** The four
+  `do_func_bind_params` overloads (`eval.cpp`) accept any arg count in
+  `[min_required_args(params), nparams]` and bind each omitted trailing param to
+  `none`. `min_required_args` is `1 + the index of the last non-opt param` (0 if
+  all opt), keyed off `Identifier::opt_mod` — so a non-opt param *after* an opt
+  one raises the minimum and can't be skipped (`f(x, opt y, z)` still needs 3).
+  The inferencer's `check_call` enforces the same `[min, nparams]` range
+  (`WrongArgCountEx` with a "MIN to MAX" message); no per-call type contribution
+  is needed for the omitted params, since an `opt`-declared param is already
+  typed `opt T` at finalization (so the body must null-check it). The inliner /
+  tail-inliner / specializer all bail on an arg-count ≠ nparams mismatch, so an
+  under-arity call simply runs through `do_func_call` at runtime (correct).
 - **Const parameters.** A param declared `const` (`func f(const x, y)`, parsed
   by `pFuncParam`, flagged `Identifier::const_param`) is bound as a const
   `LValue`, so reassigning it throws — caught at compile time by the resolver
@@ -1021,34 +1094,39 @@ are unchanged.
   it truncates a grown array. `clone_aliased_slices` therefore clones each slice
   while its `slice` flag is still set, so `offset()`/`size()` report the slice
   range.)
-- **Flat (unboxed) int/float storage.** `SharedObject` carries a `Storage kind`
-  (`general`/`ints`/`floats`) and an **anonymous union** of `vec` (the
-  `vector<LValue>`, 48-byte slots), `ivec` (`vector<int_type>`), and `fvec`
-  (`vector<float_type>`) — the latter two are 8-byte unboxed slots, so a
-  homogeneous int/float array moves ~6× less memory in bulk ops. A `union`
+- **Flat (unboxed) int/float/bool storage.** `SharedObject` carries a `Storage
+  kind` (`general`/`ints`/`floats`/`bools`) and an **anonymous union** of `vec`
+  (the `vector<LValue>`, 48-byte slots), `ivec` (`vector<int_type>`), `fvec`
+  (`vector<float_type>`), and `bvec` (`vector<unsigned char>`, **one byte** per
+  element) — the flat members are unboxed, so a homogeneous int/float array
+  moves ~6× less memory in bulk ops and a bool array ~48× less. A `union`
   member can't have non-trivial ctors/dtors, so `SharedObject` placement-news
   the live member per kind and the dtor switches on `kind`.
   **Representation is type-driven and fixed at creation — there is NO runtime
   promotion** (`promote_to_general` was deleted). An array-producing node is
   built flat **iff** the inferencer proved its *destination* is
-  `array<int>`/`array<float>`; a destination that is `array<dyn>` (or any
-  non-int/float element) is built **general from the start**. The inferencer's
+  `array<int>`/`array<float>`/`array<bool>`; a destination that is `array<dyn>`
+  (or any other element type) is built **general from the start**. The
+  inferencer's
   `set_array_repr_hint` (in `annotate_hints`, runs on `a = <rvalue>` decls and
   assigns) stamps an **`ArrHint`** (`syntax.h`: `dflt`/`general`/`flat_i`/
-  `flat_f`) on the rvalue — on a `range()`/`array()`/`make_array()` call's args
+  `flat_f`/`flat_b`) on the rvalue — on a `range()`/`array()`/`make_array()`
+  call's args
   `ExprList`, or directly on an array literal / folded `LiteralObj`. A
   `dyn`-typed destination (`var dyn d = [1,2,3]`) also gets `general`, so
   declaring `dyn` builds a polymorphic array from the start (else a later
   `d[0]="x"` would wrongly hit the flat-array error on an already-`dyn` var).
-  Creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f` → flat
-  `0`/`0.0` fill, replacing the old `array(N)` rewrite; `general` → general),
+  Creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f`/`flat_b`
+  → flat `0`/`0.0`/`false` fill, replacing the old `array(N)` rewrite;
+  `general` → general),
   `make_array`, `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
   literal bound to an `array<dyn>` dest is made general via
   `make_general_array_clone`).
   The fixpoint propagates the destination type through direct aliases
   (`var b = a`), so they agree. Value-driven flat (`dflt`) is the fallback for
   contexts the hint doesn't cover. The flat fast paths (each branches on
-  `skind()`, reads `flat_ints()`/`flat_floats()`/`arr_elem_at` directly, never
+  `skind()`, reads `flat_ints()`/`flat_floats()`/`flat_bools()`/`arr_elem_at`
+  directly, never
   promotes): `sum`/`reverse`/`sort` (comparator and not — `comparator_heapsort`
   is templated over the element vector)/`min`/`max`/`append`/`pop`/`top`/`find`/
   `erase`/`insert`/`map`/`filter`/`foreach`/`intptr`/`dict`(from pairs)/`join`/
@@ -1057,7 +1135,9 @@ are unchanged.
   (idlist/`foreach`-tuple, via `arr_elem_boxed`), and the flat subscript-store
   `try_flat_subscript_store` (`eval.cpp`: `a[i] = v` / `a[i] OP= v` writes the
   scalar straight into the flat vector — gated on a side-effect-free lvalue
-  *chain* via `no_side_effects`). `clone_internal_vec`, `make_const_clone`, and
+  *chain* via `no_side_effects`). `arr_elem_at`/`arr_elem_boxed` box a flat bool
+  element as a real `bool`; `sum` of an `array<bool>` returns an int (counts the
+  trues). `clone_internal_vec`, `make_const_clone`, and
   `clone_to_mutable` are kind-aware so clone/COW/const keep flat. `size()` is
   kind-aware. **`get_vec()`/`get_view()` are general-only** — they throw
   `InternalErrorEx` on a flat array (an invariant tripwire, not a promotion);
@@ -1073,7 +1153,8 @@ are unchanged.
   position; `clone`/`deepclone` deliberately preserve the layout). `runtime()`
   does *not* promote — it only relabels the static type, not the storage.
   `array_storage(a)` reports
-  `"ints"`/`"floats"`/`"general"` (tests pin it). **Gotcha:** any pass that
+  `"ints"`/`"floats"`/`"bools"`/`"general"` (tests pin it). **Gotcha:** any pass
+  that
   inspects a const array's element type must read from `skind()`, not
   `get_view()`/`get_vec()` (now they'd throw on flat anyway). `array()` is a
   **non-const** builtin (never folds to a baked literal, so `array(N)` is always

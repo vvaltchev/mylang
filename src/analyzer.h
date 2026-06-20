@@ -22,7 +22,7 @@ class Construct;
 enum class AnnoKind : unsigned char {
     none,
     auto_const,    /* yellow:  auto-const var/param, auto-pure function */
-    flat_array,    /* green:   array<int>/array<float> (unboxed storage) */
+    flat_array,    /* green:   array<int>/<float>/<bool> (unboxed storage) */
     dyn_array,     /* red:     array<dyn> (dynamic, unoptimizable) */
     inlined,       /* blue:    call spliced inline at its call-site */
     specialized,   /* cyan:    call redirected to a $specN clone */

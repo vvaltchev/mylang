@@ -3,6 +3,7 @@
 #include "eval.h"
 #include "evaltypes.cpp.h"
 #include "types/int.cpp.h"
+#include "types/bool.cpp.h"
 #include "types/str.cpp.h"
 #include "types/func.cpp.h"
 #include "types/arr.cpp.h"
@@ -27,6 +28,7 @@ static const std::array<SharedStr, Type::t_count> TypeNames =
     string("int"),
     string("builtin"),
     string("float"),
+    string("bool"),
     string("str"),
     string("func"),
     string("arr"),
@@ -128,6 +130,7 @@ const std::array<Type *, Type::t_count> AllTypes =
     new TypeInt(),
     new TypeBuiltin(),
     new TypeFloat(),
+    new TypeBool(),
 
     /* Non-trivial types */
     new TypeStr(),
