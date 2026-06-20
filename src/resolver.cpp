@@ -1576,6 +1576,11 @@ private:
 
         tag_inline(body.get(), ic);
 
+        if (analysis)
+            analysis->mark(callee->start,
+                static_cast<int>(callee->get_str().length()),
+                AnnoKind::inlined);
+
         /* Replaces (frees) the old CallExpr; its args were already cloned. */
         slot = move(body);
 
@@ -1846,6 +1851,11 @@ private:
             { std::string(f->id->get_str()), param_names(f),
               ce->start, ce->inline_ctx });
         tag_inline(spliced.get(), ic);
+
+        if (analysis)
+            analysis->mark(callee->start,
+                static_cast<int>(callee->get_str().length()),
+                AnnoKind::inlined);
 
         slot = move(spliced);   /* the ReturnStmt becomes f's (spliced) body */
         refold(slot);
@@ -2155,6 +2165,11 @@ private:
 
         if (!clone)
             return;
+
+        if (analysis)
+            analysis->mark(callee->start,
+                static_cast<int>(callee->get_str().length()),
+                AnnoKind::specialized);
 
         /* Redirect to the clone (same args; the const ones are now ignored). */
         auto what = make_unique<Identifier>(clone->id->get_str());
