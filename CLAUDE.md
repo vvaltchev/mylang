@@ -104,6 +104,8 @@ Running scripts:
 ./build/mylang -nr FILE          # parse/validate only, don't run
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang --debug-ti FILE   # dump every identifier's inferred type + uses
+./build/mylang -a FILE           # analyze: source colored by optimization
+./build/mylang -a --no-color F   # same, plain (for piping / diffing)
 ```
 `--debug-ti` runs inference (non-strict) and prints one tab-separated `ti`
 record per declared identifier — `name, kind (var|const|param|func), line, col,
@@ -112,6 +114,27 @@ tool for the mandatory-`dyn` / type-driven work (see
 `plans/type-driven-specialization.md`): used to find identifiers inferred `dyn`
 / `array<dyn>` and decide whether each is justified (annotate with `dyn`) or an
 inference gap (fix the inferencer).
+
+`-a` / `--analyze` reprints the source **verbatim** with ANSI colors marking
+where each compile-time optimization fired (a legend header is printed; exits
+without running; `--no-color` for plain). It is **non-strict** (analyzes code
+that a normal run would reject for a bare `dyn`). The legend: **yellow** =
+became const-like automatically (an auto-const `var` at decl + folded uses, an
+un-mutated parameter, an auto-`pure` function); **green** = a flat (unboxed)
+`array<int>`/`array<float>`; **red** = an `array<dyn>`; **blue** = an inlined
+call (expression-body or tail); **cyan** = a call redirected to a `$specN`
+specialization clone; **magenta** = a call folded to a literal at compile time
+(pure/auto-pure/const-builtin with const args); **dim** = dead code the
+optimizer eliminated (a const-condition branch / `while (false)`). Precedence:
+call-site (blue/cyan/magenta) > array storage (green/red) > yellow; a dead range
+dims regardless. Implementation: a `Loc`-keyed `AnalysisInfo` (`analyzer.h`)
+populated by the passes only when threaded in — array colors from a non-strict
+inference pass (`collect_array_analysis`), auto-pure/param from a post-resolve
+walk (`collect_resolver_analysis`), and the mutation-time decisions (auto-const
+vars, dead code, inlined/specialized/folded) recorded *as they happen* by the
+parser (`ParseContext::analysis`), AutoConst, and the Inliner; `mylang.cpp`
+renders. Like `-s`/`--debug-ti`, it is a CLI inspection tool, not unit-tested in
+`-rt`.
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
 what survived
 const-folding, and `-nc` lets you see the tree as written before folding. Reach
@@ -206,6 +229,12 @@ units:
   static type inference + checking** pass (see the dedicated section below).
 - `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
   `Exception`'s captured call-stack (see the error model section).
+- `analyzer.h` — header-only (no TU): the `AnalysisInfo` `Loc`-keyed annotation
+  collector + `AnnoKind` for the `-a`/`--analyze` colored optimization view. The
+  collectors live in the relevant passes (`collect_array_analysis` in
+  `inferencer.cpp`, `collect_resolver_analysis` in `resolver.cpp`, mutation-time
+  records in `parser.cpp`/`resolver.cpp`); the renderer is in `mylang.cpp` (see
+  the `-a` description under "Build & run").
 
 **The `.cpp.h` convention.** Files under `src/types/` and `src/builtins/` are
 named `*.cpp.h` and are
