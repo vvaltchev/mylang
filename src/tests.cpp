@@ -5575,6 +5575,43 @@ static const std::vector<test> tests =
     { "types reject: str argument to a float param",
       { "func g(float x) => x; g(\"no\");" }, &typeid(TypeMismatchEx) },
 
+    /* ----------- null alias + the `?` nullable short syntax ----------- */
+    { "null: alias for none",
+      { "var x = null; assert(x == none); assert(none == null);",
+        "assert(null == null);" } },
+    { "null: usable as an opt value",
+      { "opt int x = null; assert(x == none);",
+        "x = 5; assert(x == 5);" } },
+    { "syntax: ? is the canonical nullable suffix (var?/int?/dyn?/array?)",
+      { "int? a = 5; assert(a == 5); assert(type(a) == \"int\");",
+        "var? b; assert(b == none);",
+        "dyn? c; assert(c == none);",
+        "array? d; assert(d == none);",          /* opt -> none default */
+        "array e; assert(e == []);",             /* non-opt -> zero value */
+        "int? f; assert(f == none);" } },        /* opt int uninit -> none */
+    { "syntax: ? equals the opt keyword",
+      { "int? a = none; opt int b = none;",
+        "assert(a == none); assert(b == none);" } },
+    { "syntax: dyn is a standalone declaration starter",
+      { "dyn z = 5; assert(z == 5); z = \"hi\"; assert(z == \"hi\");",
+        "dyn? k; assert(k == none); k = 1; assert(k == 1);" } },
+    { "syntax: ~ and trailing ? short forms on parameters",
+      { "func f(x, y?, ~z?) { if (y == none) y = -1;",
+        "  if (z == none) z = -2; return [x, y, z]; }",
+        "assert(f(1) == [1, -1, -2]);",
+        "assert(f(1, 2) == [1, 2, -2]);",
+        "assert(f(1, 2, 3) == [1, 2, 3]);" } },
+    { "syntax: canonical ? on parameters (var?/dyn?/int?)",
+      { "func f(var x, var? y, dyn z, int? w) => [x, y, z, w];",
+        "assert(f(1, 2, 3, 4) == [1, 2, 3, 4]);",
+        "assert(f(1, 2, 3) == [1, 2, 3, none]);" } },   /* w (int?) omitted */
+    { "syntax: ~ param is dynamic",
+      { "func f(~x) => x; assert(f(1) == 1); assert(f(\"s\") == \"s\");" } },
+    { "syntax reject: ~ is not a general expression operator",
+      { "var x = ~5;" }, &typeid(SyntaxErrorEx) },
+    { "syntax reject: trailing name-? is rejected in a body declaration",
+      { "int x?;" }, &typeid(SyntaxErrorEx) },
+
     { "ti: dyn param accepts differing types",
       { "func id(dyn x) => x; assert(id(3) == 3); assert(id(\"s\") == \"s\");" } },
     { "ti: dyn var allows reassignment to a different type",

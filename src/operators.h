@@ -41,6 +41,7 @@ enum class Op : int {
     arrow       = 32, // =>
     colon       = 33,
     dot         = 34,
+    questionmark = 35, // ? (opt/nullable type suffix)
 
-    op_count    = 35,
+    op_count    = 36,
 };

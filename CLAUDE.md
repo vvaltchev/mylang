@@ -687,6 +687,20 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   type-check the inferencer can't). An **uninitialized** typed decl
   (`int x;`) gets the type's zero value (`zero_value_literal`: 0/0.0/false/""/
   []/{}), or `none` when `opt`.
+- **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
+  (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
+  `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is
+  a run-scanner that consumes a prefix of `{const,var,dyn,opt,?,TYPE}` ending at
+  the name — `dyn` is now a standalone decl starter (`dyn z;`, not only
+  `var dyn z`), and a leading `?`/`opt` alone is *not* a starter (needs
+  const/var/dyn/TYPE), so `int(5)`/`x = 5` stay expressions. **Param-only short
+  forms** (`pFuncParam`, rejected in body decls since they're not in
+  `pAcceptDeclPrefix`): a leading **`~`** = `dyn` (reusing the otherwise-unused
+  `Op::bnot` token), and a trailing **`?` on the name** = `opt` — so
+  `func f(x, y?, ~z?)`. `null` is a keyword (`kw_null`) the parser treats
+  identically to `none` (a `LiteralNone`). The opt flag from `?` flows through
+  the existing `pInOptDecl`/`Identifier::opt_mod` path, so inference/runtime
+  need no `?`-specific code.
 - **Errors** are compile-time (`DECL`-style plain `Exception`s, **not**
   `RuntimeException`s, so script `try/catch` cannot catch them; `errors.h`):
   `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),

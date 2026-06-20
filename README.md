@@ -231,18 +231,39 @@ you get a compile error.
   * **No initializer** gives the type's zero value: `int x;` → `0`, `float x;` →
     `0.0`, `bool x;` → `false`, `str x;` → `""`, `array x;` → `[]`,
     `dict x;` → `{}`. (An `opt`-qualified one defaults to `none`.)
-  * The type may be combined with `const` and/or `opt`, in that order:
-    `const int MAX = 100;`, `opt int maybe;` (nullable, defaults to `none`).
   * It works in a `for` initializer too: `for (int i = 0; i < n; i += 1) ...`.
 
 The type keywords are still ordinary identifiers everywhere else — `int(x)`,
 `array(n)`, `map(str, xs)` keep working — they are read as a type only at the
 start of a declaration (when immediately followed by the variable name).
 
-Parameters can be typed the same way (see *Functions* below):
+##### Nullable types: the `?` suffix
+
+Append **`?`** to the type to make it **nullable** (an `Optional<T>`, as in
+Kotlin/Swift) — it may also hold `none`/`null`. This is the canonical short form
+of the `opt` keyword and works on every declaration kind, including `var?`
+(inferred) and `dyn?` (dynamic):
 
 ```C#
-func dist(float x, float y) => sqrt(x*x + y*y);
+int?   x;            # nullable int, defaults to none
+str?   s = null;     # `null` is just `none`
+var?   maybe;        # inferred type, nullable
+dyn?   anything;     # dynamic and nullable  (== opt dyn)
+array? items;        # nullable array
+```
+
+`int? x` is exactly `opt int x`; `var? x` is `var opt x`; `dyn? x` is
+`opt dyn x`. A `?`-typed declaration with no initializer defaults to `none`
+(rather than the zero value), since it is explicitly nullable. `dyn` may also be
+used directly as a declaration keyword (`dyn z = 5;`), not only as a modifier
+after `var`.
+
+Parameters can be typed the same way (see *Functions* below), and additionally
+get two terse param-only short forms:
+
+```C#
+func dist(float x, float y) => sqrt(x*x + y*y);   # typed params
+func f(x, y?, ~z?) => ...    # y optional; z optional and dynamic (~ = dyn)
 ```
 
 ### Declaring constants
@@ -487,10 +508,11 @@ runtime instead.
 `MyLang` supports, at the moment, only the following (builtin) types:
 
   * **None**
-    The type of `none`, the equivalent of Python's `None`. Variables just declared
-    without having a value assigned to them, have value `none` (e.g. `var x;`).
-    The same applies to functions that don't have a return value. Also, it's
-    used as a special value by builtins like `find()`, in case of failure.
+    The type of `none` (also spelled **`null`** — the two are exact aliases),
+    the equivalent of Python's `None`. Variables just declared without having a
+    value assigned to them have value `none` (e.g. `var x;`). The same applies to
+    functions that don't have a return value. Also, it's used as a special value
+    by builtins like `find()`, in case of failure.
 
   * **Boolean**
     The type `bool`, with exactly two values: `true` and `false`. It is the
@@ -628,6 +650,9 @@ slot = "now a string";           # ok, because it's dyn
     check above possible. Like `dyn`, `opt` is **required**, not optional, on a
     parameter that can actually receive `none` from some call path — otherwise
     you get a compile error at the param's declaration telling you to add it.
+    The **`?` type suffix** is the canonical short form of `opt` (`int? x` ≡
+    `opt int x`, `var? x` ≡ `var opt x`, `dyn? x` ≡ `opt dyn x`) — see *Nullable
+    types* above.
 
     **Trailing `opt` parameters are also optional at the call site** (the other
     sense of "optional"): the caller may omit them, and each omitted one binds
@@ -912,11 +937,34 @@ A parameter may carry an explicit primitive type, like a variable declaration
 (see *Explicit types*): `func f(int a, str b)`. The type is enforced — every
 call is checked that the argument is assignable to the declared parameter type
 (`f(1, 2)` is a compile error since `2` is not a `str`), and a widening numeric
-argument is coerced (`func g(float x); g(3)` binds `x = 3.0`). The modifiers
-combine in the order `[const] [opt] TYPE name`, e.g. `func f(opt int n)`
-(nullable) or `func f(const float k)`. A typed parameter overrides the usual
-"infer the type from the call sites" behavior — it *is* that type, and callers
-must comply.
+argument is coerced (`func g(float x); g(3)` binds `x = 3.0`). A typed parameter
+overrides the usual "infer the type from the call sites" behavior — it *is* that
+type, and callers must comply.
+
+All the declaration forms work on a parameter — `const`, `opt`/`?`, `dyn`,
+`var`, and the type keywords — so the canonical, fully-explicit style is e.g.
+`func f(var x, var? y, dyn z, dyn? k, int m, int? n)`.
+
+##### Short parameter forms
+
+Because lambdas reuse the very same `func(params) => body` syntax (there is no
+separate lambda notation), parameters also accept two **terse, param-only**
+shortcuts so quick callbacks stay compact:
+
+  * a trailing **`?`** on the *name* makes the parameter optional: `y?` ≡
+    `var? y` ≡ `opt y`;
+  * a leading **`~`** makes it dynamic: `~z` ≡ `dyn z`, and `~z?` ≡ `dyn? z` ≡
+    `opt dyn z`.
+
+```C#
+sort(a, func(x, y) => x < y);       # plain
+map(func(~x) => str(x), mixed);     # ~x : a dynamic parameter
+func handler(event, ~data?) => ...  # data : optional and dynamic
+```
+
+These two shortcuts are accepted **only inside a parameter list** — a body
+declaration must use the canonical `dyn x` / `var? x` forms (`~x` and a trailing
+`x?` are not declaration syntax outside of `func(...)`).
 
 #### Lambda captures
 
