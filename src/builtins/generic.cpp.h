@@ -411,12 +411,15 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 
     if (val1.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = val1.get<SharedArrayObj>().get_view();
+        /* Read the input element-by-element WITHOUT promoting flat storage
+         * (arr_elem_at). map() builds a fresh array - not a promotion. */
+        const SharedArrayObj &arr = val1.get<SharedArrayObj>();
+        const size_type n = arr.size();
 
-        for (size_type i = 0; i < view.size(); i++) {
+        for (size_type i = 0; i < n; i++) {
 
             result.emplace_back(
-                eval_func(ctx, funcObj, view[i].get()),
+                eval_func(ctx, funcObj, arr_elem_at(arr, i)),
                 ctx->const_ctx
             );
         }
@@ -463,13 +466,16 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
 
     if (val1.is<SharedArrayObj>()) {
 
-        const ArrayConstView &view = val1.get<SharedArrayObj>().get_view();
+        /* Read input without promoting flat storage; build a fresh array. */
+        const SharedArrayObj &arr = val1.get<SharedArrayObj>();
+        const size_type n = arr.size();
         SharedArrayObj::vec_type result;
 
-        for (size_type i = 0; i < view.size(); i++) {
+        for (size_type i = 0; i < n; i++) {
 
-            if (eval_func(ctx, funcObj, view[i].get()).is_true())
-                result.emplace_back(view[i].get(), ctx->const_ctx);
+            const EvalValue e = arr_elem_at(arr, i);
+            if (eval_func(ctx, funcObj, e).is_true())
+                result.emplace_back(e, ctx->const_ctx);
         }
 
         return SharedArrayObj(move(result));

@@ -308,81 +308,91 @@ EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
     if (!e.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
 
-    const ArrayConstView &view = e.get<SharedArrayObj>().get_view();
+    const SharedArrayObj &arr = e.get<SharedArrayObj>();
+    const size_type n = arr.size();
 
-    if (!view.size())
+    if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
 
-    return view[view.size() - 1].get();
+    return arr_elem_at(arr, n - 1);   /* no promotion of flat storage */
 }
 
 EvalValue builtin_erase_arr(LValue *lval, int_type index)
 {
     SharedArrayObj &arr = lval->getval<SharedArrayObj>();
-    const ArrayConstView &view = arr.get_view();
+    const size_type n = arr.size();
 
-    if (!view.size())
-        throw OutOfBoundsEx();
-
-    if (index < 0)
-        throw OutOfBoundsEx();
-
-    if (static_cast<size_t>(index) >= view.size())
+    if (!n || index < 0 || static_cast<size_t>(index) >= n)
         throw OutOfBoundsEx();
 
     if (arr.is_slice()) {
 
+        /* Erasing the first/last element of a slice is just a narrower view. */
         if (index == 0) {
-
-            lval->put(SharedArrayObj(arr, arr.offset() + 1, arr.size() - 1));
-
-        } else if (index == view.size() - 1) {
-
-            lval->put(SharedArrayObj(arr, arr.offset(), arr.size() - 1));
-
-        } else {
-
-            arr.clone_internal_vec();
-            auto &vec = arr.get_vec();
-            vec.erase(vec.begin() + arr.offset() + index);
-            lval->put(SharedArrayObj(move(vec)));
+            lval->put(SharedArrayObj(arr, arr.offset() + 1, n - 1));
+            return true;
         }
+        if (static_cast<size_type>(index) == n - 1) {
+            lval->put(SharedArrayObj(arr, arr.offset(), n - 1));
+            return true;
+        }
+        arr.clone_internal_vec();   /* middle: own the data, keep-flat */
 
     } else {
 
-        arr.clone_aliased_slices(arr.offset() + arr.size() - 1);
-        arr.get_vec().erase(arr.get_vec().begin() + arr.offset() + index);
+        arr.clone_aliased_slices(arr.offset() + n - 1);
     }
 
+    /* Erase in place, kind-aware (no promotion of flat storage). */
+    const size_type at = arr.offset() + index;
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints: {
+            auto &v = arr.flat_ints();   v.erase(v.begin() + at); break;
+        }
+        case SharedArrayObj::Storage::floats: {
+            auto &v = arr.flat_floats(); v.erase(v.begin() + at); break;
+        }
+        default: {
+            auto &v = arr.get_vec();     v.erase(v.begin() + at); break;
+        }
+    }
     return true;
 }
 
 EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
 {
     SharedArrayObj &arr = lval->getval<SharedArrayObj>();
-    const ArrayConstView &view = arr.get_view();
+    const size_type n = arr.size();
 
-    if (index < 0)
+    if (index < 0 || static_cast<size_t>(index) > n)
         throw OutOfBoundsEx();
 
-    if (static_cast<size_t>(index) > view.size())
-        throw OutOfBoundsEx();
+    if (arr.is_slice())
+        arr.clone_internal_vec();          /* keep-flat; standalone, off=0 */
+    else if (static_cast<size_type>(index) != n)
+        arr.clone_all_slices();
 
-    if (arr.is_slice()) {
+    const size_type at = arr.offset() + index;
 
-        arr.clone_internal_vec();
-        auto &vec = arr.get_vec();
-        vec.insert(vec.begin() + index, LValue(val, false));
-        lval->put(SharedArrayObj(move(vec)));
-
-    } else {
-
-        if (index != view.size())
-            arr.clone_all_slices();
-
-        arr.get_vec().insert(arr.get_vec().begin() + index, LValue(val, false));
+    /* Flat in-place insert when the value matches the kind. A non-fitting value
+     * means the array's static type is array<dyn> (so it was built general by
+     * type-driven creation): the general path below handles it. */
+    if (arr.skind() == SharedArrayObj::Storage::ints && val.is<int_type>()) {
+        auto &v = arr.flat_ints();
+        v.insert(v.begin() + at, val.get<int_type>());
+        return true;
+    }
+    if (arr.skind() == SharedArrayObj::Storage::floats &&
+        (val.is<float_type>() || val.is<int_type>())) {
+        auto &v = arr.flat_floats();
+        v.insert(v.begin() + at, val.is<int_type>()
+            ? static_cast<float_type>(val.get<int_type>())
+            : val.get<float_type>());
+        return true;
     }
 
+    auto &v = arr.get_vec();
+    v.insert(v.begin() + at, LValue(val, false));
     return true;
 }
 
@@ -452,25 +462,63 @@ builtin_find_arr(const SharedArrayObj &arr,
                  FuncObject *key,
                  EvalContext *ctx)
 {
-    const ArrayConstView &view = arr.get_view();
+    /* Read elements without promoting flat storage (arr_elem_at). */
+    const size_type n = arr.size();
 
     if (key) {
 
-        for (size_type i = 0; i < view.size(); i++) {
+        for (size_type i = 0; i < n; i++) {
 
-            if (eval_func(ctx, *key, view[i].get()) == v)
+            if (eval_func(ctx, *key, arr_elem_at(arr, i)) == v)
                 return static_cast<int_type>(i);
         }
 
     } else {
 
-        for (size_type i = 0; i < view.size(); i++) {
-            if (view[i].get() == v)
+        for (size_type i = 0; i < n; i++) {
+            if (arr_elem_at(arr, i) == v)
                 return static_cast<int_type>(i);
         }
     }
 
     return none;
+}
+
+/*
+ * Memory-safe heapsort with an arbitrary (possibly non-ordering) user
+ * comparator - see the note in sort_arr's comparator branch. Templated on the
+ * element vector so it runs over flat int/float storage too (no promotion).
+ * cmp(elem, elem) returns true when the first element should sort *after* the
+ * second (max-heap order).
+ */
+template <class Vec, class Cmp>
+static void comparator_heapsort(Vec &vec, Cmp cmp)
+{
+    const size_t n = vec.size();
+
+    auto sift_down = [&](size_t root, size_t end) {
+        for (;;) {
+            size_t child = 2 * root + 1;
+            if (child >= end)
+                break;
+            if (child + 1 < end && cmp(vec[child], vec[child + 1]))
+                child++;                 /* the larger of the children */
+            if (!cmp(vec[root], vec[child]))
+                break;                   /* root already >= its children */
+            std::swap(vec[root], vec[child]);
+            root = child;                /* strictly increases -> bounded */
+        }
+    };
+
+    for (size_t i = n / 2; i > 0; ) {    /* build a max-heap */
+        --i;
+        sift_down(i, n);
+    }
+    for (size_t end = n; end > 1; ) {    /* pop the max, n-1 times */
+        --end;
+        std::swap(vec[0], vec[end]);
+        sift_down(0, end);
+    }
 }
 
 static EvalValue
@@ -559,7 +607,6 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 
     } else {
 
-        auto &vec = arr.get_vec();
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
@@ -568,51 +615,40 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 
         FuncObject &funcObj = *val1.get<shared_ptr<FuncObject>>().get();
 
-        auto cmp = [&](const auto &a, const auto &b) {
-            const bool lt =
-                eval_func(ctx, funcObj, make_pair(a.get(), b.get())).is_true();
-            return reverse ? !lt : lt;
-        };
-
         /*
          * A user comparator is arbitrary script code, so it need NOT be a valid
-         * strict weak ordering (e.g. `func(a, b) => a != b`, or one that varies
-         * with call order). std::sort's introsort would run its *unguarded*
-         * partition/insertion past the ends of the buffer once that assumption
-         * breaks - a heap-buffer-overflow reachable straight from a script. We
-         * therefore hand-roll a heapsort: `sift_down`'s root index strictly
-         * descends, so it terminates for ANY comparator, and it only ever
-         * indexes within [0, n), so a bogus comparator yields an
-         * unspecified-but-memory-safe order instead of UB. (We do NOT use
-         * std::make_heap/std::sort_heap: MSVC's debug STL wraps them in
-         * comparator-validity instrumentation that hangs on a non-ordering
-         * comparator. Same O(n log n) comparisons; for a valid comparator the
-         * result is identical - neither is stable.)
+         * strict weak ordering; comparator_heapsort stays in-bounds and
+         * terminates for ANY comparator (see its note). Run it directly over
+         * the unboxed int/float vector when flat - no promotion.
          */
-        const size_t n = vec.size();
-
-        auto sift_down = [&](size_t root, size_t end) {
-            for (;;) {
-                size_t child = 2 * root + 1;
-                if (child >= end)
-                    break;
-                if (child + 1 < end && cmp(vec[child], vec[child + 1]))
-                    child++;                 /* the larger of the children */
-                if (!cmp(vec[root], vec[child]))
-                    break;                   /* root already >= its children */
-                std::swap(vec[root], vec[child]);
-                root = child;                /* strictly increases -> bounded */
+        switch (arr.skind()) {
+            case SharedArrayObj::Storage::ints: {
+                auto &v = arr.flat_ints();
+                comparator_heapsort(v, [&](int_type a, int_type b) {
+                    const bool lt = eval_func(ctx, funcObj,
+                        make_pair(EvalValue(a), EvalValue(b))).is_true();
+                    return reverse ? !lt : lt;
+                });
+                break;
             }
-        };
-
-        for (size_t i = n / 2; i > 0; ) {    /* build a max-heap */
-            --i;
-            sift_down(i, n);
-        }
-        for (size_t end = n; end > 1; ) {    /* pop the max, n-1 times */
-            --end;
-            std::swap(vec[0], vec[end]);
-            sift_down(0, end);
+            case SharedArrayObj::Storage::floats: {
+                auto &v = arr.flat_floats();
+                comparator_heapsort(v, [&](float_type a, float_type b) {
+                    const bool lt = eval_func(ctx, funcObj,
+                        make_pair(EvalValue(a), EvalValue(b))).is_true();
+                    return reverse ? !lt : lt;
+                });
+                break;
+            }
+            default: {
+                auto &vec = arr.get_vec();
+                comparator_heapsort(vec, [&](const LValue &a, const LValue &b) {
+                    const bool lt = eval_func(ctx, funcObj,
+                        make_pair(a.get(), b.get())).is_true();
+                    return reverse ? !lt : lt;
+                });
+                break;
+            }
         }
     }
 

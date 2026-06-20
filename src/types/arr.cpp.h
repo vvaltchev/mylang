@@ -126,6 +126,10 @@ void SharedArrayObjTempl<LValueT>::promote_to_general()
     shobj->kind = Storage::general;
 }
 
+/* Read element `i` (slice-relative) as a boxed EvalValue WITHOUT promoting flat
+ * storage (defined below). */
+static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i);
+
 
 class TypeArr : public TypeImpl<SharedArrayObj> {
 
@@ -178,7 +182,18 @@ EvalValue TypeArr::clone(const EvalValue &a)
 
 EvalValue TypeArr::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<int_type>(&a.get<SharedArrayObj>().get_vec());
+    /* The address of the live backing vector (kind-aware, no promotion): two
+     * slices of the same array share one backing object, so they report the
+     * same intptr - which is what the COW tests check. */
+    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints:
+            return reinterpret_cast<int_type>(&arr.flat_ints());
+        case SharedArrayObj::Storage::floats:
+            return reinterpret_cast<int_type>(&arr.flat_floats());
+        default:
+            return reinterpret_cast<int_type>(&arr.get_vec());
+    }
 }
 
 void TypeArr::add(EvalValue &a, const EvalValue &b)
@@ -196,9 +211,10 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     /*
      * Flat homogeneous fast path: int+int / float+float concatenate in unboxed
      * storage, with no promotion (8-byte appends). A mismatched or general
-     * operand falls through to the boxed path below, which promotes both via
-     * get_vec(). A non-slice lhs appends in place (same alias semantics as the
-     * general path); a slice lhs builds a fresh flat array.
+     * operand falls through to the boxed path below, which reads both operands
+     * directly (arr_elem_at) and builds the result general - it never promotes
+     * an operand in place. A non-slice lhs appends in place (same alias
+     * semantics as before); a slice lhs builds a fresh flat array.
      */
     if (lval.skind() == rhs.skind() &&
         lval.skind() == SharedArrayObj::Storage::ints)
@@ -260,33 +276,30 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
         return;
     }
 
-    if (!lval.is_slice()) {
+    /*
+     * Mixed / general concat. The result is a general array. If lhs is already
+     * a general non-slice, append rhs's elements in place; otherwise build a
+     * fresh general array. Either way both operands are read via arr_elem_at,
+     * so a flat operand is read directly (its representation is never promoted).
+     */
+    const size_type rn = rhs.size();
 
-        lval.get_vec().reserve(lval.size() + rhs.size());
+    if (lval.skind() == SharedArrayObj::Storage::general && !lval.is_slice()) {
 
-        lval.get_vec().insert(
-            lval.get_vec().end(),
-            rhs.get_vec().cbegin() + rhs.offset(),
-            rhs.get_vec().cbegin() + rhs.offset() + rhs.size()
-        );
+        auto &v = lval.get_vec();   /* general: get_vec() doesn't promote */
+        v.reserve(lval.size() + rn);
+        for (size_type i = 0; i < rn; i++)
+            v.emplace_back(arr_elem_at(rhs, i), false);
 
     } else {
 
+        const size_type ln = lval.size();
         SharedArrayObj::vec_type new_arr;
-        new_arr.reserve(lval.size() + rhs.size());
-
-        new_arr.insert(
-            new_arr.end(),
-            lval.get_vec().begin() + lval.offset(),
-            lval.get_vec().begin() + lval.offset() + lval.size()
-        );
-
-        new_arr.insert(
-            new_arr.end(),
-            rhs.get_vec().cbegin() + rhs.offset(),
-            rhs.get_vec().cbegin() + rhs.offset() + rhs.size()
-        );
-
+        new_arr.reserve(ln + rn);
+        for (size_type i = 0; i < ln; i++)
+            new_arr.emplace_back(arr_elem_at(lval, i), false);
+        for (size_type i = 0; i < rn; i++)
+            new_arr.emplace_back(arr_elem_at(rhs, i), false);
         lval = SharedArrayObj(move(new_arr));
     }
 }
