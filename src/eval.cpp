@@ -1996,6 +1996,24 @@ EvalValue WhileStmt::do_eval(EvalContext *ctx, bool rec) const
     return none;
 }
 
+EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    /* Bind the struct name to its type descriptor (a const t_structtype value
+     * holding the AST-owned StructTypeDef*), like a func name. */
+    EvalValue desc(def.get());
+
+    if (id) {
+
+        if (!id->eval(ctx).is<UndefinedId>())
+            throw AlreadyDefinedEx(id->start, id->end);
+
+        ctx->emplace(id.get(), move(desc), true /* const */);
+        return none;
+    }
+
+    return desc;
+}
+
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue func(
