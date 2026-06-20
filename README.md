@@ -517,12 +517,22 @@ Key rules:
     A genuinely mixed container is allowed — its element type just becomes `dyn`
     (see below), so you don't get the speed/safety benefits but it still works.
   * **Null safety.** A plain value is *non-nullable*: passing `none` where a
-    non-`none` value is required — a non-`opt` parameter, an arithmetic operand,
-    a subscript base — is a compile error. Mark a parameter `opt` to allow
-    `none` (see below). A local that might be `none` (e.g. just `var x;`, or
-    assigned only on some branches) is treated as nullable, so using it directly
-    where a value is required is rejected — initialize it (`var x = 0;`) or use
+    non-`none` value is required — an arithmetic operand, a subscript base — is
+    a compile error. A local that might be `none` (e.g. `var x;`, or assigned
+    only on some branches) is treated as nullable, so using it directly where a
+    value is required is rejected — initialize it (`var x = 0;`) or use
     `opt`/`dyn`.
+  * **A parameter that can receive `none` must be declared `opt`.** If any call
+    (transitively, across the whole program) could pass `none` to a parameter
+    that is not `opt` (and not `dyn`), it is a compile error *at the param's
+    declaration* asking you to mark it `opt`. So a non-`opt` parameter is
+    *guaranteed* never to be `none` — the body can use it without a check. This
+    is the nullability analogue of the mandatory-`dyn` rule.
+  * **A dict read is nullable.** `d[k]` / `d.k` may not find the key, so they
+    have type `opt V` and must be narrowed before use (`var v = d[k]; if (v !=
+    none) ...`). A read of a `const` dict with a statically-known key is the
+    exception: it is computed at compile time, so it is the exact (non-`opt`)
+    value.
   * `==` and `!=` work between any two values (they never error, returning a
     bool); ordering operators `< <= > >=` need two numbers or two strings.
 
@@ -545,7 +555,9 @@ slot = "now a string";           # ok, because it's dyn
 
   * **`opt`** — *nullable*: the value may be `none`. A non-`opt` parameter is
     guaranteed never to receive `none`, which is what makes the null-safety
-    check above possible.
+    check above possible. Like `dyn`, `opt` is **required**, not optional, on a
+    parameter that can actually receive `none` from some call path — otherwise
+    you get a compile error at the param's declaration telling you to add it.
   * **`dyn`** — *dynamically typed*: the value behaves exactly as in untyped
     MyLang. Inference places no constraints on it, operations on it are checked
     at runtime (as before), and it may even change type. Use it for genuinely

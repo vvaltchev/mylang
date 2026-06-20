@@ -1374,7 +1374,9 @@ static const std::vector<test> tests =
         "deepclone() of a const dict is fully mutable and independent",
         {
             "const d = {\"a\": [1,2]};",
-            "var e = deepclone(d);",
+            /* dyn: a dict read is opt now, so mutating a nested value needs the
+             * dyn escape (this test is about deepclone, not nullability). */
+            "var dyn e = deepclone(d);",
             "e[\"a\"][0] = 99;",
             "assert(e[\"a\"] == [99,2]);",
             "assert(d[\"a\"] == [1,2]);",
@@ -1782,7 +1784,7 @@ static const std::vector<test> tests =
             "    a[i] = 5;",             /* index in a plain-assign lvalue */
             "    var j = 1;",
             "    a[j] += 100;",          /* index in a compound-assign lvalue */
-            "    var d = {};",
+            "    var dyn d = {};",       /* dyn: a dict read is opt otherwise */
             "    var k = 7;",
             "    d[k] = 99;",            /* dict key in an assign lvalue */
             "    return a[0] + a[1] + d[7];",
@@ -4142,7 +4144,9 @@ static const std::vector<test> tests =
     {
         "Object member-access syntax for dict: composition with other ops",
         {
-            "var d = {\"a\": [{}, 3, 4]};",
+            /* dyn: a dict read is opt now; this exercises nested member /
+             * subscript writes, not nullability. */
+            "var dyn d = {\"a\": [{}, 3, 4]};",
             "assert(d.a[0] == {});",
             "d.a[0].f1 = 3;",
             "d.a[0].f2 = [11,22];",
@@ -5170,8 +5174,13 @@ static const std::vector<test> tests =
       { "var a = [1,2]; append(a, 3); assert(a == [1,2,3]);" } },
     { "ti: append of a mixed type degrades to dyn (no error)",
       { "var dyn x = 1; var a = [1,2]; append(a, \"s\"); assert(len(a) == 3);" } },
-    { "ti: dict typed and subscripted",
-      { "var d = {\"a\": 1, \"b\": 2}; assert(d[\"a\"] + d[\"b\"] == 3);" } },
+    { "ti: dict typed and subscripted (read is opt)",
+      /* a dict read is opt int now; == is opt-safe (no narrowing needed) */
+      { "var d = {\"a\": 1, \"b\": 2};",
+        "assert(d[\"a\"] == 1 && d[\"b\"] == 2);" } },
+    { "ti: dict read narrowed then used as non-opt",
+      { "var d = {\"a\": 5}; var opt v = d[\"a\"];",
+        "if (v != none) assert(v + 1 == 6);" } },
     { "ti: dict member access typed",
       { "var d = {\"a\": 1}; assert(d.a == 1);" } },
     { "ti: foreach over an array",
@@ -5220,8 +5229,16 @@ static const std::vector<test> tests =
       { "func f(a) => a; f(1, 2);" }, &typeid(WrongArgCountEx) },
     { "ti reject: too few arguments",
       { "func f(a, b) => a + b; f(1);" }, &typeid(WrongArgCountEx) },
-    { "ti reject: none passed to a non-opt param",
-      { "func f(x) => 1; var n = none; f(n);" }, &typeid(NullabilityEx) },
+    { "ti reject: none passed to a non-opt param (forces opt at decl)",
+      /* a possibly-none arg to a non-opt param is now reported at the param
+       * declaration as OptRequiredEx (the mandatory-`opt` rule). */
+      { "func f(x) => 1; var n = none; f(n);" }, &typeid(OptRequiredEx) },
+    { "ti reject: dict read passed to a non-opt param forces opt",
+      { "func f(x) => x + 1; var d = {\"a\": 1}; f(d.a);" },
+      &typeid(OptRequiredEx) },
+    { "ti accept: opt param takes a dict read, narrowed in body",
+      { "func f(opt x) { if (x == none) return 0; return x + 1; }",
+        "var d = {\"a\": 5}; assert(f(d.a) == 6); assert(f(d.b) == 0);" } },
     { "ti reject: opt value used in arithmetic",
       { "func f(opt x) => x + 1; f(3);" }, &typeid(NullabilityEx) },
     { "ti reject: bare-declared (none) local in arithmetic",
