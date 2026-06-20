@@ -1,5 +1,21 @@
 # Custom struct types — implementation plan
 
+> **BUILD STATUS (live).** Phases **1–4 are DONE and committed** — the full
+> *boxed* feature: `struct` decl, construction (positional / named / mixed, with
+> the named-arg pipeline), field & `const` access, value/COW/const semantics,
+> whole-program inference, and const-folding. **Phase 9 (tests + docs + a
+> coverage pass + the `bench/58_structs` baseline) is DONE** for the boxed
+> feature — 837 `-rt` tests pass; README + CLAUDE document it. **Phases 5–8 (the
+> POD C-layout, nested POD, flat `array<Struct>`, and M8 field access — i.e. the
+> perf optimization) are NOT yet done**; today every struct is boxed
+> (`bench/58_structs` is ~26× CPython, the gap those phases close). The approach
+> is validated: a POD field *write* reuses the existing
+> `try_flat_subscript_store` pattern (a direct typed store bypassing the lvalue
+> model), and member access
+> must respect `is_lvalue_rooted` (a field lvalue is handed out only for a
+> variable-rooted base, never a temporary — see the UAF fix in eval.cpp). See
+> §16 for the remaining task order.
+
 Status: **designed, ready to build.** The prerequisites the original version of
 this plan was waiting on have all landed, which changes the design materially:
 
