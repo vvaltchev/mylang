@@ -415,6 +415,13 @@ int main(int argc, char **argv)
         ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
         unique_ptr<Construct> root;
 
+        /* -a: the parser records parse-time folds/DCE it would otherwise erase
+         * (magenta folded calls, dim dead branches) into this collector; the
+         * later passes add to it. Set before pBlock so the parser records. */
+        AnalysisInfo analyze_info;
+        if (opt_analyze)
+            ctx.analysis = &analyze_info;
+
         if (opt_show_tokens) {
             cout << "Tokens" << endl;
             cout << "--------------------------" << endl;
@@ -454,12 +461,14 @@ int main(int argc, char **argv)
          * the clean tree); the resolver passes run next and record auto-const /
          * dead-code / inlined / specialized / folded as the tree mutates. */
         if (opt_analyze) {
-            AnalysisInfo info;
-            collect_array_analysis(root.get(), info);
+            /* analyze_info already holds the parser's records; add the
+             * inference (array storage) and resolver (auto-const/inline/etc.)
+             * decisions, then reprint the source colored. */
+            collect_array_analysis(root.get(), analyze_info);
             resolve_names(root.get(), !opt_no_inline, opt_inline_threshold,
-                          &info);
-            collect_resolver_analysis(root.get(), info);
-            render_analysis(lines, info, !opt_no_color);
+                          &analyze_info);
+            collect_resolver_analysis(root.get(), analyze_info);
+            render_analysis(lines, analyze_info, !opt_no_color);
             return 0;
         }
 

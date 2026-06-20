@@ -3,6 +3,7 @@
 #include "parser.h"
 #include "eval.h"
 #include "syntax.h"
+#include "analyzer.h"
 
 #include <stdexcept>
 #include <string>
@@ -423,6 +424,14 @@ pAcceptCallExpr(ParseContext &c,
         if (c.const_eval && expr->what->is_const && expr->args->is_const) {
 
             expr->is_const = true;
+
+            /* -a: this call is about to fold to a literal at compile time -
+             * color the callee identifier magenta before it is gone. */
+            if (c.analysis)
+                if (auto *cid = dynamic_cast<Identifier *>(expr->what.get()))
+                    c.analysis->mark(cid->start,
+                        static_cast<int>(cid->get_str().length()),
+                        AnnoKind::folded);
 
             cse_materialize(
                 c,
@@ -1313,8 +1322,17 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     if (c.const_eval && ifstmt->condExpr->is_const) {
 
         const EvalValue &v = ifstmt->condExpr->eval(c.const_ctx);
+        const bool t = v.get_type()->is_true(v);
 
-        if (v.get_type()->is_true(v))
+        /* -a: dim the dead (not-taken) branch before it is dropped. */
+        if (c.analysis) {
+            Construct *dead = t ? ifstmt->elseBlock.get()
+                                : ifstmt->thenBlock.get();
+            if (dead)
+                c.analysis->mark_dead(dead->start, dead->end);
+        }
+
+        if (t)
             ret = move(ifstmt->thenBlock);
         else
             ret = move(ifstmt->elseBlock);
@@ -1355,6 +1373,11 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         const EvalValue &v = whileStmt->condExpr->eval(c.const_ctx);
 
         if (!v.get_type()->is_true(v)) {
+            /* -a: while (false) is dead - dim the loop (the body's end, not
+             * whileStmt->end, which points at the next token). */
+            if (c.analysis)
+                c.analysis->mark_dead(whileStmt->start,
+                    whileStmt->body ? whileStmt->body->end : whileStmt->end);
             ret.reset();
             return true;
         }
