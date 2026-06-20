@@ -42,6 +42,7 @@ as well.
       - [Calling functions during const-evaluation](#calling-functions-during-const-evaluation)
       - [Pure functions](#pure-functions)
       - [Automatic pure promotion](#automatic-pure-promotion)
+    * [Structs](#structs)
     * [Exceptions](#exceptions)
       - [Custom exceptions](#custom-exceptions)
       - [Re-throwing an exception](#re-throwing-an-exception)
@@ -158,9 +159,10 @@ aspects:
 
   - MyLang supports both the classic `for` loop and an explicit `foreach` loop.
 
-  - MyLang does not support custom types, at the moment. However, dictionaries
-    support a nice syntactic sugar: in addition to the main syntax `d["key"]`,
-    for string keys the syntax `d.key` is supported as well.
+  - MyLang supports user-defined **struct** types (see *Structs* below).
+    Dictionaries also support a nice syntactic sugar: in addition to the main
+    syntax `d["key"]`, for string keys the syntax `d.key` is supported as well
+    (`.` is struct-field access on a struct, dict-key access on a dict).
 
 ### Declaring variables
 
@@ -1280,9 +1282,68 @@ try {
 }
 ```
 
+### Structs
+
+`struct` declares a C-like value type with explicitly-typed fields and
+type-level `const`s (no methods in v1):
+
+```C#
+struct Point {
+    int x;
+    int y;
+    const ORIGIN_NAME = "origin";
+}
+
+var p = Point(1, 2);          # positional
+var q = Point(x: 3, y: 4);    # named
+var r = Point(1, y: 2);       # mixed (positional then named)
+p.x;                          # field read -> 1
+p.x = 9;                      # field write
+p.ORIGIN_NAME;                # const via an instance -> "origin"
+Point.ORIGIN_NAME;            # const via the type     -> "origin"
+```
+
+**Construction is a call.** `Point(...)` is written exactly like a function
+call and reuses the same argument rules — positional, named (`x: v`), and mixed
+(positional first, then names **in field-declaration order**); a skipped
+*optional* field becomes `none`. So construction is type-checked like a call: a
+wrong-typed, missing, extra, reordered, or unknown-named field is a compile
+error.
+
+**Fields take the same explicit types as variables** — `bool`, `int`, `float`,
+`str`, `array`, `dict`, another struct type, or `dyn`. v1 restrictions (to be
+lifted later): a field must have an explicit type (no `var`), and `opt` is
+allowed only on a `dyn`/`array`/`dict` field (a non-opt field is guaranteed
+never `none`). An uninitialised field-less use isn't possible — every field is
+supplied at construction (or defaulted to `none` when an omitted optional).
+
+**Access.** `obj.field` reads/writes a field; `obj.CONST` / `Type.CONST` reads a
+const member. `.` means *field access* on a struct and *key access* on a dict —
+resolved by the base's type. Reading a field that doesn't exist is a compile
+error (for a statically-typed base).
+
+**Value semantics.** A struct is a value, with the same COW semantics as
+arrays/dicts: plain assignment **aliases** (`var q = p; p.x = 9` makes `q.x` 9
+too, like Python objects), while `clone()` makes an independent (shallow) copy
+and `deepclone()` a deep one. `==` is structural and field-wise between
+**same-type** instances (different struct types are never equal); structs are
+not hashable (cannot be dict keys) in v1. `print(p)` shows `Point(x: 1, y: 2)`.
+
+**`const` works fully.** A struct holds state only in instances, not in the
+type, so `const P = Point(1, 2)` is computed at compile time and is **deep
+read-only** — mutating a const instance's field is an error. `Type.CONST` folds
+at parse time. An `array` of a struct type infers as `array<Struct>`
+(`var a = [Point(1,2), Point(3,4)]`).
+
+Structs may be declared anywhere a statement is allowed, **including inside a
+function** (lexically scoped like a nested function). A struct's fields and
+consts live in the struct's own namespace, so a struct `const PI` never clashes
+with a global `const PI`.
+
 ### Custom exceptions
 
-This language does not support custom types, at the moment. Therefore,
+This language does not support throwing custom objects, at the moment.
+Therefore,
 it's not possible to *throw* any kind of object like in some other languages.
 To throw an exception, it's necessary to use the special built-in function
 `exception()` or its shortcut, `ex()`. Consider the following example:
