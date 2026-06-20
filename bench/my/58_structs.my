@@ -1,0 +1,22 @@
+# build an array of structs, then reduce over their fields
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+struct Point { int x; int y; }
+
+var N = 100000 * scale;
+var pts = [];
+
+for (var i = 0; i < N; i += 1)
+    append(pts, Point(i, i * 2));
+
+var sx = 0;
+var sy = 0;
+
+foreach (var p in pts) {
+    sx += p.x;
+    sy += p.y;
+}
+
+print("result:", sx, sy);
