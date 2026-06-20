@@ -5,6 +5,7 @@
 #include "defs.h"
 #include "flatval.h"
 #include "intrusiveptr.h"
+#include "errors.h"
 #include <vector>
 #include <unordered_set>
 #include <cassert>
@@ -116,7 +117,6 @@ private:
     /* Convert flat int/float storage to general vector<LValue> in place.
      * Defined out-of-line (needs EvalValue/LValue) in types/arr.cpp.h. No-op if
      * already general. */
-    void promote_to_general();
 
 public:
     size_type off;
@@ -225,20 +225,24 @@ public:
     void clone_all_slices() { clone_aliased_slices(all_slices); }
 
     /*
-     * General (vector<LValue>) access. Promotes flat int/float storage to
-     * general on demand - so any code that needs LValue elements just works,
-     * paying a one-time O(n) conversion. The hot paths instead check skind()
-     * and use flat_ints()/flat_floats() to read the unboxed vector directly.
-     * Promotion is value-preserving, so the const overload promotes too.
+     * General (vector<LValue>) access. mylang does NOT promote flat int/float
+     * storage to general on demand: an array's representation is fixed at
+     * creation from its proven static type (type-driven), so the only valid
+     * caller of get_vec() is one operating on an already-general array. Code
+     * that may face a flat array must branch on skind() and read flat_ints()/
+     * flat_floats() (or arr_elem_at) directly. Reaching here on a flat array is
+     * an internal invariant violation - throw rather than read the inactive
+     * union member. A non-fitting *mutation* of a flat array (the dyn-launder
+     * case) is caught earlier with a user-facing TypeErrorEx.
      */
     vec_type &get_vec() {
         if (shobj->kind != Storage::general)
-            promote_to_general();
+            throw InternalErrorEx();
         return shobj->vec;
     }
     const vec_type &get_vec() const {
         if (shobj->kind != Storage::general)
-            const_cast<SharedArrayObjTempl *>(this)->promote_to_general();
+            throw InternalErrorEx();
         return shobj->vec;
     }
 

@@ -1,17 +1,25 @@
 # Type-driven specialization + mandatory `dyn`
 
-Status: **Phase A + Phase B DONE.** Phase A: `--debug-ti`, the mandatory-`dyn`
-rule ON by default, and the inference-completeness audit of the whole corpus.
-Phase B: type-driven flat-array representation — flat int/float array literals,
-`array(N)` one-arg auto-fill (0/0.0/none by inference), and the nested
-flat-subscript-store fix; `array()` made non-const. **Array element-type
-strictness (`array<dyn>` requires `dyn`) was deliberately NOT done** — the user
-chose tolerant arrays: it forced `dyn` on every heterogeneous container
-(literals, mixed dicts, all `kvpairs()` results, ~21 core tests) and was *not*
-needed for the payoff, since inference already computes the exact element type.
-The end goal — representation driven by the proven static type, not the runtime
-value — is met: a literal/`array(N)`'s element type drives flat-vs-general, and
-a genuinely `array<dyn>` value is made general (no specialize-then-promote).
+Status: **Phase A + Phase B DONE, including full promotion removal.** Phase A:
+`--debug-ti`, the mandatory-`dyn` rule ON by default, and the inference-
+completeness audit of the whole corpus. Phase B: type-driven flat-array
+representation, then the **complete removal of runtime promotion**. Every
+array-producing node is built in its final representation at creation, chosen
+from the destination's proven static type via an `ArrHint` the inferencer stamps
+(`set_array_repr_hint`, replacing the old `array(N)` auto-fill rewrite) and the
+creators honor (`range`/`array`/`make_array`/`LiteralArray`/`LiteralObj`).
+`promote_to_general` is **deleted**; `get_vec()`/`get_view()` are general-only;
+every op (incl. `insert`/`erase`/`map`/`filter`/`sort`-with-comparator/`dict`-
+from-pairs/`join`/`writelines`/spreads) handles flat directly; and the one
+residual — mutating a flat array to a non-fitting type through a `dyn` alias —
+raises a `TypeError` (`flat_array_violation_msg`) rather than promoting.
+**Array element-type strictness (`array<dyn>` requires `dyn`) was deliberately
+NOT done** — the user chose tolerant arrays: it forced `dyn` on every
+heterogeneous container (literals, mixed dicts, all `kvpairs()` results, ~21
+core tests) and was *not* needed for the payoff, since inference already
+computes the exact element type. The end goal — representation driven by the
+proven static type, not the runtime value, with no specialize-then-promote and
+no on-demand promotion — is fully met.
 
 **Phase A results:** every identifier in `bench/my/*` and `samples/*` infers a
 concrete type (zero spurious `dyn`); the completeness fixes are the
@@ -123,18 +131,25 @@ dump, don't run.
   `array<int>`→`array<dyn>` via `contribute_container`; element-type checking
   vs. widening). Then flip array representation to type-driven (below).
 
-## Type-driven representation mechanics (the payoff, Phase B end)
+## Type-driven representation mechanics (the payoff, Phase B end) — AS BUILT
 
-Once `array<int>`/`array<float>` is trustworthy, route representation off it:
-- The specializer (`specialize_types`, post-`resolve_names`) stamps array-
-  producing nodes (`range()`, `array(N[,v])`, `make_array`, array literals,
-  folded const arrays) with a representation hint derived from the *inferred
-  type at the destination* (extend `TypeHint` with array kinds, or a small new
-  hint field), and the creator emits flat only when the hint says int/float.
-- A value flowing into a `dyn`/`array<dyn>` slot is created general from the
-  start — no specialize-then-promote. `range()` (intrinsically `array<int>`)
-  stays flat unless its destination is `dyn`.
-- Promotion remains only as the `dyn`-escape safety net.
+Representation is routed off the proven `array<int>`/`array<float>` type:
+- The inferencer (`set_array_repr_hint`, in `annotate_hints`, on `a = <rvalue>`
+  decls/assigns) stamps a small new `ArrHint` field (`syntax.h`:
+  `dflt`/`general`/`flat_i`/`flat_f`) on the array-producing rvalue — on a
+  `range()`/`array()`/`make_array()` call's args `ExprList`, or directly on an
+  array literal / folded `LiteralObj` — derived from the destination's inferred
+  element type. (A separate field, not `TypeHint`: the two are orthogonal.)
+- The creators emit flat only when the hint says int/float; a value flowing into
+  a `dyn`/`array<dyn>` destination is created general from the start — no
+  specialize-then-promote. `range()` (intrinsically `array<int>`) stays flat
+  unless its destination is `dyn`. The fixpoint propagates the destination type
+  through direct aliases (`var b = a`), so they agree on representation.
+- **There is no promotion safety net.** `promote_to_general` is deleted. The one
+  case the hint can't cover soundly — mutating a flat array to a non-fitting
+  type through a `dyn` alias, where the storage is shared and the static type
+  stays `array<int>` — raises a `TypeError` (`flat_array_violation_msg`).
+  Declaring the array `dyn` from the start gets a polymorphic (general) array.
 
 ## Resolved decisions (confirmed with the user)
 

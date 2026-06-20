@@ -150,7 +150,7 @@ private:
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
-    void maybe_autofill_array(Expr14 *e);   /* array(N) -> array(N, 0/0.0) */
+    void set_array_repr_hint(Expr14 *e);    /* type-driven ArrHint on rvalue */
     void check_call(CallExpr *call);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
                       bool arith);
@@ -557,60 +557,67 @@ void Inferencer::annotate_hints(Construct *n)
     }
 
     if (auto *e = dynamic_cast<Expr14 *>(n))
-        maybe_autofill_array(e);
+        set_array_repr_hint(e);
 
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });
 }
 
 /*
- * `var/const a = array(N)` (1-arg) whose inferred element type is a non-null
- * int/float becomes `array(N, 0)` / `array(N, 0.0)` by appending the literal
- * fill arg. So unfilled slots are 0/0.0 (not none) and the array gets flat
- * (unboxed) storage - the type-driven array(N). An array<dyn> / array<none> /
- * opt-element / non-decl array(N) is left as-is (general none).
- * Runs in annotate_hints (after inference, types final), the inferencer's one
- * AST-mutation point.
+ * Type-driven array representation. For `a = <array-producing rvalue>` (decl or
+ * plain assign) where `a`'s inferred type is an array, stamp the rvalue with
+ * the representation its PROVEN element type demands, so the array is built in
+ * final representation at creation - never promoted later:
+ *   - non-null int element  -> ArrHint::flat_i  (flat unboxed int storage)
+ *   - non-null float element -> ArrHint::flat_f (flat unboxed float storage)
+ *   - anything else (array<dyn>, opt element, nested containers) -> general.
+ * The hint goes on a range()/array()/make_array() call's args ExprList (which
+ * the builtin reads) or directly on an array literal / folded LiteralObj. The
+ * fixpoint propagates `a`'s type through direct aliases (`var b = a`), so they
+ * agree on representation. Runs in annotate_hints (types final), the
+ * inferencer's one AST-mutation point. This replaces the old array(N) autofill:
+ * a flat_i/flat_f hint makes array(N) born flat (0 / 0.0 fill), no rewrite.
  */
-void Inferencer::maybe_autofill_array(Expr14 *e)
+void Inferencer::set_array_repr_hint(Expr14 *e)
 {
-    if (!(e->fl & pFlags::pInDecl) || e->op != Op::assign)
+    if (e->op != Op::assign)
         return;
 
     auto *id = dynamic_cast<Identifier *>(e->lvalue.get());
     if (!id)
         return;
-
-    auto *call = dynamic_cast<CallExpr *>(e->rvalue.get());
-    if (!call || !call->args || call->args->elems.size() != 1)
-        return;
-
-    auto *cid = dynamic_cast<Identifier *>(call->what.get());
-    if (!cid || std::string(cid->uid->val) != "array")
-        return;
-    /* must be the builtin array(), not a user-defined function of that name */
-    auto sit = id_sym.find(cid);
-    if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
-        return;
-
     auto it = id_sym.find(id);
     if (it == id_sym.end() || !it->second)
         return;
     STyRef ty = sty_resolve(it->second->type);
     if (ty->kind != STyKind::Array)
         return;
-    STyRef el = sty_resolve(ty->elem);
-    if (el->opt)
-        return;   /* nullable element: keep the none fill */
 
-    const Loc loc = call->start;
-    if (el->kind == STyKind::Int) {
-        auto lit = std::make_unique<LiteralInt>(0);
-        lit->start = loc; lit->end = loc;
-        call->args->elems.push_back(std::move(lit));
-    } else if (el->kind == STyKind::Float) {
-        auto lit = std::make_unique<LiteralFloat>(0.0);
-        lit->start = loc; lit->end = loc;
-        call->args->elems.push_back(std::move(lit));
+    STyRef el = sty_resolve(ty->elem);
+    ArrHint hint = ArrHint::general;
+    if (!el->opt && el->kind == STyKind::Int)
+        hint = ArrHint::flat_i;
+    else if (!el->opt && el->kind == STyKind::Float)
+        hint = ArrHint::flat_f;
+
+    Construct *rv = e->rvalue.get();
+
+    if (auto *call = dynamic_cast<CallExpr *>(rv)) {
+
+        auto *cid = dynamic_cast<Identifier *>(call->what.get());
+        if (!cid || !call->args)
+            return;
+        /* must be the builtin, not a user function of the same name */
+        auto sit = id_sym.find(cid);
+        if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
+            return;
+        const std::string nm(cid->uid->val);
+        if (nm == "range" || nm == "array" || nm == "make_array")
+            call->args->arr_hint = hint;
+
+    } else {
+
+        /* an array literal or a folded const literal (LiteralObj) */
+        rv->arr_hint = hint;
     }
 }
 

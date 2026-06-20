@@ -953,42 +953,52 @@ are unchanged.
   (`vector<float_type>`) — the latter two are 8-byte unboxed slots, so a
   homogeneous int/float array moves ~6× less memory in bulk ops. A `union`
   member can't have non-trivial ctors/dtors, so `SharedObject` placement-news
-  the live member per kind and the dtor switches on `kind`. Flat storage is
-  produced by `range()`; a homogeneous int/float **array literal** (`[1,2,3]`,
-  `LiteralArray::do_eval` optimistically accumulates flat, spilling to general
-  at the first off-kind element); `array(N, value)` (an int/float fill);
-  `array(N)` one-arg **type-driven** (the inferencer rewrites `var a = array(N)`
-  to `array(N, 0)`/`array(N, 0.0)` in `maybe_autofill_array` when `a` infers
-  `array<int>`/`array<float>`, else it stays general `none`); and
-  `make_array(N, gen)` (optimistic-flat by the callback's result kind). The flat
-  fast paths (each branches on `skind()`, reads `flat_ints()`/`flat_floats()`
-  directly, no promotion): `sum`/`reverse`/`sort` (no-comparator)/`min`/`max`/
-  `append`/`pop`/`foreach`, `TypeArr::{subscript (rvalue read), to_string, eq,
-  add}`, `Subscript::eval_int`/`eval_float`, and the flat subscript-store
+  the live member per kind and the dtor switches on `kind`.
+  **Representation is type-driven and fixed at creation — there is NO runtime
+  promotion** (`promote_to_general` was deleted). An array-producing node is
+  built flat **iff** the inferencer proved its *destination* is
+  `array<int>`/`array<float>`; a destination that is `array<dyn>` (or any
+  non-int/float element) is built **general from the start**. The inferencer's
+  `set_array_repr_hint` (in `annotate_hints`, runs on `a = <rvalue>` decls and
+  assigns) stamps an **`ArrHint`** (`syntax.h`: `dflt`/`general`/`flat_i`/
+  `flat_f`) on the rvalue — on a `range()`/`array()`/`make_array()` call's args
+  `ExprList`, or directly on an array literal / folded `LiteralObj`. The
+  creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f` → flat
+  `0`/`0.0` fill, replacing the old `array(N)` rewrite; `general` → general),
+  `make_array`, `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
+  literal bound to an `array<dyn>` dest is made general via
+  `make_general_array_clone`).
+  The fixpoint propagates the destination type through direct aliases
+  (`var b = a`), so they agree. Value-driven flat (`dflt`) is the fallback for
+  contexts the hint doesn't cover. The flat fast paths (each branches on
+  `skind()`, reads `flat_ints()`/`flat_floats()`/`arr_elem_at` directly, never
+  promotes): `sum`/`reverse`/`sort` (comparator and not — `comparator_heapsort`
+  is templated over the element vector)/`min`/`max`/`append`/`pop`/`top`/`find`/
+  `erase`/`insert`/`map`/`filter`/`foreach`/`intptr`/`dict`(from pairs)/`join`/
+  `writelines`, `TypeArr::{subscript (rvalue read), to_string, eq, add}`,
+  `Subscript::eval_int`/`eval_float`, the array-spread reads
+  (idlist/`foreach`-tuple, via `arr_elem_boxed`), and the flat subscript-store
   `try_flat_subscript_store` (`eval.cpp`: `a[i] = v` / `a[i] OP= v` writes the
   scalar straight into the flat vector — gated on a side-effect-free lvalue
-  *chain* via `no_side_effects` (an id, or a nested `a[i][j]`/member chain — the
-  only place a flat array nested in a general one can be written, as it has no
-  element LValue) so the general fall-through can re-eval it; a non-fitting
-  element type promotes). `clone_internal_vec`, `make_const_clone`, and
-  `clone_to_mutable` are kind-aware so clone/COW/const keep flat. **Anything
-  without a flat fast path calls `get_vec()`, which `promote_to_general()`s in
-  place (flat → `vector<LValue>`, value-preserving, sound even when shared/
-  sliced) and reuses the general code** — so the feature is incremental and
-  correct by construction. `size()` is kind-aware and does *not* promote.
-  `array_storage(a)` reports `"ints"`/`"floats"`/`"general"` (tests pin it).
-  **Representation is type-driven** now that inference is correct (the
-  mandatory-`dyn` work): a literal/`array(N)`'s element type drives flat-vs-
-  general, and a genuinely `array<dyn>` value is simply made general (no
-  specialize-then-promote). A flat array still promotes only on a coverage gap
-  (an op with no flat path) or a `dyn`-laundered non-fitting mutation.
-  **Gotcha:** any pass that inspects a const array's element type must read from
-  `skind()`, not `get_view()`/`get_vec()` — those promote the const value (this
-  bit `sty_from_value`). `array()` is a **non-const** builtin (never folds to a
-  baked literal, so `array(N)` is always a runtime call the rewrite sees, and a
-  huge `array(1000000)` isn't baked). See `plans/typed-arrays.md` (approach B)
-  and `plans/type-driven-specialization.md`; remaining: flat
-  `insert`/`erase`/`map`/`filter`.
+  *chain* via `no_side_effects`). `clone_internal_vec`, `make_const_clone`, and
+  `clone_to_mutable` are kind-aware so clone/COW/const keep flat. `size()` is
+  kind-aware. **`get_vec()`/`get_view()` are general-only** — they throw
+  `InternalErrorEx` on a flat array (an invariant tripwire, not a promotion);
+  every caller either guarantees general or reads flat directly. **The
+  dyn-launder error:** the only way a flat (statically-typed) array can be asked
+  to hold a non-fitting element is by laundering it through a `dyn` alias and
+  mutating it (`var dyn d = int_array; append(d, "x")` / `d[0]="x"` / `insert`).
+  Since the storage stays int-typed and an alias-affecting write can't change
+  its representation without promotion, that **throws a `TypeErrorEx`** (message
+  `flat_array_violation_msg`) — declare the array `dyn` from the start for a
+  (general) polymorphic array. `array_storage(a)` reports
+  `"ints"`/`"floats"`/`"general"` (tests pin it). **Gotcha:** any pass that
+  inspects a const array's element type must read from `skind()`, not
+  `get_view()`/`get_vec()` (now they'd throw on flat anyway). `array()` is a
+  **non-const** builtin (never folds to a baked literal, so `array(N)` is always
+  a runtime call the hint reaches, and a huge `array(1000000)` isn't baked). See
+  `plans/typed-arrays.md` (approach B) and
+  `plans/type-driven-specialization.md`.
 - **`DictObject`** (`shareddict.h`): the value handle is
   `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map lives
   inside it.

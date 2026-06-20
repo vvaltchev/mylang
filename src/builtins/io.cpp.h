@@ -170,11 +170,13 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
         s = &fs;
     }
 
-    const ArrayConstView &view = val.get<SharedArrayObj>().get_view();
+    /* Read kind-aware (arr_elem_at) so a flat int/float array doesn't promote;
+     * each element streams via its own operator<<. */
+    const SharedArrayObj &arr = val.get<SharedArrayObj>();
+    const size_type n = arr.size();
 
-    for (size_type i = 0; i < view.size(); i++) {
-        *s << view[i].get() << endl;
-    }
+    for (size_type i = 0; i < n; i++)
+        *s << arr_elem_at(arr, i) << endl;
 
     return none;
 }

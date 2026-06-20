@@ -2466,18 +2466,21 @@ static const std::vector<test> tests =
         },
     },
     {
-        "Typed arrays: storing/appending a mismatched type promotes",
+        "Typed arrays: a value used polymorphically is general from creation "
+        "(type-driven, no promotion)",
         {
+            /* a[1]=\"hello\" makes `a` array<dyn>, so array(3,0) is built
+             * general from the start - never flat-then-promoted. */
             "var a = array(3, 0);",
-            "assert(array_storage(a) == \"ints\");",
             "a[1] = \"hello\";",
             "assert(a == [0, \"hello\", 0]);",
             "assert(array_storage(a) == \"general\");",
+            /* likewise `b`: append(b,\"x\") makes it array<dyn>, so range(3)
+             * is general from the start. */
             "var b = range(3);",
             "append(b, 9);",
-            "assert(b == [0,1,2,9] && array_storage(b) == \"ints\");",
-            "assert(pop(b) == 9 && array_storage(b) == \"ints\");",
             "append(b, \"x\");",
+            "assert(b == [0,1,2,9,\"x\"]);",
             "assert(array_storage(b) == \"general\");",
         },
     },
@@ -2513,15 +2516,19 @@ static const std::vector<test> tests =
         },
     },
     {
-        "Typed arrays: a flat array laundered through dyn promotes on a "
-        "non-fitting element",
+        /* `a` is array<int> (its only use is `var dyn d = a`), so it stays
+         * flat. d aliases a's flat storage; appending a str would need an
+         * in-place flat->general promotion, which mylang does not do - it
+         * errors instead (declare the array dyn for a polymorphic array). */
+        "Typed arrays: a non-fitting mutation of a dyn-laundered flat array "
+        "errors (no promotion)",
         {
             "var a = range(3);",
             "assert(array_storage(a) == \"ints\");",
             "var dyn d = a;",
             "append(d, \"hi\");",
-            "assert(array_storage(a) == \"general\");",
         },
+        &typeid(TypeErrorEx),
     },
     {
         "array_storage() rejects a non-array",

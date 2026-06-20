@@ -138,21 +138,24 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
         );
     }
 
-    const ArrayConstView &view = e.get<SharedArrayObj>().get_view();
+    /* Read both the outer array and each [k, v] pair via arr_elem_at, so a flat
+     * (unboxed int/float) pair like [1, 2] is read directly - no promotion. */
+    const SharedArrayObj &outer = e.get<SharedArrayObj>();
+    const size_type on = outer.size();
 
-    for (size_type i = 0; i < view.size(); i++) {
+    for (size_type i = 0; i < on; i++) {
 
-        const EvalValue &e = view[i].get();
+        const EvalValue pe = arr_elem_at(outer, i);
 
-        if (!e.is<SharedArrayObj>()) {
+        if (!pe.is<SharedArrayObj>()) {
             throw TypeErrorEx(
                 "Expected array of [key, value] pairs", arg->start, arg->end
             );
         }
 
-        const ArrayConstView &pair_view = e.get<SharedArrayObj>().get_view();
+        const SharedArrayObj &pair = pe.get<SharedArrayObj>();
 
-        if (pair_view.size() != 2) {
+        if (pair.size() != 2) {
             throw TypeErrorEx(
                 "Expected array of [key, value] pairs", arg->start, arg->end
             );
@@ -163,8 +166,8 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
          * later [key, value] pair wins, matching Python's dict().
          */
         data.insert_or_assign(
-            pair_view[0].get(),
-            LValue(pair_view[1].get(), false)
+            arr_elem_at(pair, 0),
+            LValue(arr_elem_at(pair, 1), false)
         );
     }
 

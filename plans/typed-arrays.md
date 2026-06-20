@@ -1,7 +1,14 @@
 # Flat typed arrays (`array<int>` / `array<float>` unboxed storage)
 
-Status: **M1 (flat int arrays) DONE.** A large, value-model-level optimization
-enabled by the type inferencer. Read this in full before continuing.
+Status: **DONE — flat int/float arrays, fully type-driven, NO promotion.** A
+large, value-model-level optimization enabled by the type inferencer. Read this
+in full before continuing. The representation is now decided at creation from
+the proven static type and never converted at runtime: `promote_to_general` was
+**deleted**, `get_vec()`/`get_view()` are general-only (they throw on a flat
+array), every op handles flat directly, and the one residual case (mutating a
+flat array to a non-fitting type via a `dyn` alias) raises a `TypeError` instead
+of promoting. See `plans/type-driven-specialization.md` and CLAUDE.md's flat-
+storage bullet for the live design; the text below describes the original M1.
 
 **Chosen design: approach B (tagged storage in `SharedObject`), NOT approach A
 (separate `t_int_arr`/`t_float_arr` types).** The original draft below the
@@ -9,9 +16,11 @@ enabled by the type inferencer. Read this in full before continuing.
 design is "Data model (approach B — chosen)". Approach B is far less invasive:
 one array type (`t_arr`), one value handle (`SharedArrayObj`), no new `TypeE`
 entries, no `ValueU` members, no second COW/slice implementation. The storage
-*kind* is an internal detail of `SharedObject`; every operation that doesn't have
-a flat fast path transparently `promote_to_general()`s and reuses the existing
-`vector<LValue>` code. That capped the M1 change to ~a dozen call sites.
+*kind* is an internal detail of `SharedObject`. (During M1 every operation
+without a flat fast path transparently `promote_to_general()`'d and reused the
+`vector<LValue>` code, which capped the change to ~a dozen call sites; that
+on-demand promotion has since been **removed** — see the status note above —
+in favor of type-driven creation, so each op now has a flat path of its own.)
 
 ## Verdict
 
