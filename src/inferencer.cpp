@@ -589,15 +589,27 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     if (it == id_sym.end() || !it->second)
         return;
     STyRef ty = sty_resolve(it->second->type);
-    if (ty->kind != STyKind::Array)
-        return;
 
-    STyRef el = sty_resolve(ty->elem);
-    ArrHint hint = ArrHint::general;
-    if (!el->opt && el->kind == STyKind::Int)
-        hint = ArrHint::flat_i;
-    else if (!el->opt && el->kind == STyKind::Float)
-        hint = ArrHint::flat_f;
+    /*
+     * A `dyn`-typed destination (`var dyn d = ...`) means "I want a polymorphic
+     * array", so build it general - otherwise `var dyn d = [1,2,3]; d[0]="x"`
+     * would wrongly hit the flat-array error even though `d` is already dyn.
+     * Anything that is neither an array nor `dyn` has no array repr to pick.
+     */
+    ArrHint hint;
+    if (ty->kind == STyKind::Array) {
+        STyRef el = sty_resolve(ty->elem);
+        if (!el->opt && el->kind == STyKind::Int)
+            hint = ArrHint::flat_i;
+        else if (!el->opt && el->kind == STyKind::Float)
+            hint = ArrHint::flat_f;
+        else
+            hint = ArrHint::general;
+    } else if (ty->kind == STyKind::Dyn) {
+        hint = ArrHint::general;
+    } else {
+        return;
+    }
 
     Construct *rv = e->rvalue.get();
 
@@ -1195,6 +1207,11 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "abs" || n == "clone" || n == "deepclone")
         return arg(0);
+    /* dynarray(a) -> array<dyn>: a polymorphic (general) copy. Typed array<dyn>
+     * (not bare dyn) so plain `var d = dynarray(a)` is accepted under the
+     * tolerant-array rule and d is built/typed general. */
+    if (n == "dynarray")
+        return A.array_of(A.dyn_ty());
     if (n == "runtime")
         return A.dyn_ty();   /* the documented opt-out: defer to runtime (Q) */
     if (n == "min" || n == "max") {
