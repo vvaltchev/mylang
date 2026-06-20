@@ -720,12 +720,13 @@ pAcceptCallExpr(ParseContext &c,
         if (!expr->args->arg_names.empty())
             pTryDesugarNamedCall(c, expr.get());
 
-        /* Struct construction `Type(args)` is NOT const-folded at parse time
-         * (v1): construction runs no type check, so folding it here would
-         * bypass the inferencer's field checks (and leak its runtime arity
-         * error to parse time). Defer to the inferencer + runtime. */
-        else if (c.const_eval && expr->what->is_const &&
-                 expr->args->is_const &&
+        /* Struct construction `Type(args)` folds only inside a `const` decl
+         * (where a compile-time value is required, and construct_struct's own
+         * coercion/validation makes it type-safe). Everywhere else it is
+         * deferred to the inferencer (which gives the precise field type/arity
+         * errors) + runtime. */
+        else if (c.const_eval && !(fl & pFlags::pInConstDecl) &&
+                 expr->what->is_const && expr->args->is_const &&
                  RValue(expr->what->eval(c.const_ctx)).is<StructTypeDef *>())
             expr->args->is_const = false;
 
@@ -906,6 +907,7 @@ pAcceptMember(ParseContext &c,
         throw InternalErrorEx(mem->start, mem->end);
 
     mem->memId = SharedStr(string(id->get_str()));
+    mem->memUid = UniqueId::get(id->get_str());
     ret = move(mem);
     return true;
 }
@@ -1168,8 +1170,9 @@ static inline bool
 ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
 {
     return
-        rvalue.is<SharedArrayObj>()           ||
+        rvalue.is<SharedArrayObj>()              ||
         rvalue.is<intrusive_ptr<DictObject>>()   ||
+        rvalue.is<intrusive_ptr<StructObject>>() ||
         rvalue.is<shared_ptr<FuncObject>>();
 }
 
@@ -1967,7 +1970,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     return true;
 }
 
-/* True if `v` is a read-only (const-backed) array or dict value. */
+/* True if `v` is a read-only (const-backed) array, dict, or struct value. */
 static bool
 is_readonly_value(const EvalValue &v)
 {
@@ -1976,6 +1979,9 @@ is_readonly_value(const EvalValue &v)
 
     if (v.is<intrusive_ptr<DictObject>>())
         return v.get<intrusive_ptr<DictObject>>()->is_readonly();
+
+    if (v.is<intrusive_ptr<StructObject>>())
+        return v.get<intrusive_ptr<StructObject>>()->is_readonly();
 
     return false;
 }
@@ -2013,7 +2019,8 @@ MakeConstructFromConstVal(const EvalValue &v,
 
     if (process_arrays) {
 
-        if (v.is<SharedArrayObj>() || v.is<intrusive_ptr<DictObject>>()) {
+        if (v.is<SharedArrayObj>() || v.is<intrusive_ptr<DictObject>>() ||
+            v.is<intrusive_ptr<StructObject>>()) {
 
             /*
              * Materialize the const array/dict as ONE node holding the value,
@@ -2222,7 +2229,8 @@ cse_materialize(ParseContext &c,
      * value so the next identical expression hits above.
      */
     if (process_arrays
-        && (v.is<SharedArrayObj>() || v.is<intrusive_ptr<DictObject>>())
+        && (v.is<SharedArrayObj>() || v.is<intrusive_ptr<DictObject>>() ||
+            v.is<intrusive_ptr<StructObject>>())
         && (immutable || is_readonly_value(v)))
     {
         EvalValue baked = make_const_clone(v);
