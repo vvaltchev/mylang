@@ -76,7 +76,7 @@ EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
         );
     }
 
-    const string_view &ex_name = name_val.get<SharedStr>().get_view();
+    const string_view ex_name = name_val.get<SharedStr>().get_view();
 
     if (isdigit(ex_name[0])) {
         throw InvalidValueEx(
