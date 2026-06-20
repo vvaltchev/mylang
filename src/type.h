@@ -32,6 +32,7 @@ public:
         t_builtin,
         t_float,
         t_bool,
+        t_structtype,   /* a struct TYPE descriptor (raw StructTypeDef*) */
 
         /* Non-trivial types */
         t_str,
@@ -39,6 +40,7 @@ public:
         t_arr,
         t_ex,
         t_dict,
+        t_struct,       /* a struct INSTANCE (intrusive_ptr<StructObject>) */
 
         /* Number of types */
         t_count,
