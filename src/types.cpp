@@ -200,6 +200,8 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("values", builtin_values),
     make_const_builtin("kvpairs", builtin_kvpairs),
     make_const_builtin("dict", builtin_dict),
+    make_const_builtin("get", builtin_get),         /* dict lookup -> opt V */
+    make_const_builtin("get!", builtin_get_throw),  /* lookup or throw -> V */
 
     /* String builtins */
     make_const_builtin("split", builtin_split),

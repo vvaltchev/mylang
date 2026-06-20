@@ -27,6 +27,51 @@ builtin_find_dict(const intrusive_ptr<DictObject> &obj, const EvalValue &key)
     return it->second.get();
 }
 
+/*
+ * get(dict, key)  -> the value, or `none` if the key is absent (opt V).
+ * get!(dict, key) -> the value, or throws KeyNotFoundEx if absent (non-opt V).
+ * Neither inserts. These are the explicit dict accessors: `get` for nullable
+ * lookup, `get!` for fail-fast (so the result is usable without a none-check).
+ * The `d.key` / `d[k]` sugar behaves like get! (throws on a missing key) unless
+ * the dict has a default value (see dict(default_value)).
+ */
+static EvalValue
+dict_get_impl(EvalContext *ctx, ExprList *exprList, bool throw_if_absent)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &d = RValue(arg0->eval(ctx));
+    const EvalValue &key = RValue(arg1->eval(ctx));
+
+    if (!d.is<intrusive_ptr<DictObject>>())
+        throw TypeErrorEx("Expected dict object", arg0->start, arg0->end);
+
+    const DictObject::inner_type &data =
+        d.get<intrusive_ptr<DictObject>>()->get_ref();
+    const auto &it = data.find(key);
+
+    if (it != data.end())
+        return it->second.get();
+
+    if (throw_if_absent)
+        throw KeyNotFoundEx(arg1->start, arg1->end);
+
+    return none;
+}
+
+EvalValue builtin_get(EvalContext *ctx, ExprList *exprList)
+{
+    return dict_get_impl(ctx, exprList, false);
+}
+
+EvalValue builtin_get_throw(EvalContext *ctx, ExprList *exprList)
+{
+    return dict_get_impl(ctx, exprList, true);
+}
+
 EvalValue
 builtin_erase_dict(LValue *lval, const EvalValue &key)
 {

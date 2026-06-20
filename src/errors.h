@@ -223,6 +223,7 @@ DECL_RUNTIME_EX(TypeErrorEx, "Type error")
 DECL_RUNTIME_EX(InvalidValueEx, "Invalid value error")
 DECL_RUNTIME_EX(NotCallableEx, "Not a callable object")
 DECL_RUNTIME_EX(OutOfBoundsEx, "Out of bounds error")
+DECL_RUNTIME_EX(KeyNotFoundEx, "Key not found in dict")
 DECL_RUNTIME_EX(CannotOpenFileEx, "Cannot open file error")
 
 struct UndefinedVariableEx : public Exception {
