@@ -21,6 +21,20 @@ class Construct;
  * plans/function-inlining.md). The CLI's `-ni` disables it; `inline_threshold`
  * (CLI `-it N`) caps the inlined body size in nodes.
  */
+struct AnalysisInfo;
+
 void resolve_names(Construct *root,
                    bool enable_inline = true,
-                   int inline_threshold = 24);
+                   int inline_threshold = 24,
+                   AnalysisInfo *analysis = nullptr);
+
+/*
+ * -a/--analyze: after resolve_names has run, record the resolver-decided
+ * optimizations that survive as flags on the tree - auto-pure functions and
+ * auto-const parameters (both yellow). The auto-const var / dead-code / inlined
+ * / specialized / folded records are emitted *during* resolve_names via the
+ * `analysis` argument above (those decisions remove or rewrite nodes, so they
+ * must be captured as they happen). Separate from the inferencer's
+ * array-storage colors (collect_array_analysis).
+ */
+void collect_resolver_analysis(Construct *root, AnalysisInfo &out);
