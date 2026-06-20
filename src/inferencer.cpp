@@ -390,16 +390,28 @@ void Inferencer::run()
         TypeSym *s = up.get();
         if (s->func)
             continue;
-        if (s->dyn_decl)
-            s->type = A.dyn_ty();
-        else if (is_unknown(s->type))
-            /* An unconstrained PARAM (never concretely called) or foreach
-             * loop var (container was Unknown/dyn) is `dyn` - it could be
-             * anything. A plain unconstrained local is `none`. */
-            s->type = (s->is_param || s->is_loopvar) ? A.dyn_ty()
-                                                     : A.none_ty();
-        if (s->opt_decl && !s->dyn_decl)
-            s->type = A.with_opt(s->type, true);
+        if (s->dyn_decl) {
+            /*
+             * Phase B: a dyn symbol's TYPE is dyn, but its nullability is
+             * orthogonal and tracked independently. A dyn *param*'s opt is
+             * *declared* (`opt dyn`); a dyn *var*'s opt is *inferred* from what
+             * flows in (the committed type carries the opt bit, since
+             * contribute() now joins dyn vars). A non-opt dyn is proven
+             * non-null - usable without a none-check.
+             */
+            const bool opt = s->opt_decl ||
+                             (!s->is_param && is_optish(s->type));
+            s->type = A.with_opt(A.dyn_ty(), opt);
+        } else {
+            if (is_unknown(s->type))
+                /* An unconstrained PARAM (never concretely called) or foreach
+                 * loop var (container was Unknown/dyn) is `dyn` - it could be
+                 * anything. A plain unconstrained local is `none`. */
+                s->type = (s->is_param || s->is_loopvar) ? A.dyn_ty()
+                                                         : A.none_ty();
+            if (s->opt_decl)
+                s->type = A.with_opt(s->type, true);
+        }
     }
     for (auto &up : all_funcs) {
         /*
@@ -501,27 +513,29 @@ void Inferencer::enforce_concrete_decls()
 /*
  * Mandatory-`opt` rule for parameters (the nullability analogue of
  * enforce_concrete_decls): a parameter that can receive `none` from some call
- * path must be declared `opt`. `received_optish` was set in the check pass when
- * a possibly-none argument reached a non-opt, non-dyn parameter; here we turn
- * that into a compile error at the param's declaration, so nullability is
- * *proven* (a non-opt param is guaranteed never none) rather than only
- * checked per call site. Skips `dyn` params (the opt-out) and params with no
- * decl loc. Runs after the check pass so a genuine type error surfaces first.
+ * path must be declared `opt` (Phase B: even a `dyn` parameter - nullability is
+ * orthogonal, so a nullable dyn must be `opt dyn`). `received_optish` was set
+ * in the check pass when a possibly-none argument reached a non-opt param; here
+ * we turn that into a compile error at the param's declaration, so nullability
+ * is *proven* (a non-opt param is guaranteed never none) rather than only
+ * checked per call site. Skips already-`opt` params and ones with no decl loc.
+ * Runs after the check pass so a genuine type error surfaces first.
  */
 void Inferencer::enforce_nonnull_params()
 {
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
 
-        if (!s->is_param || s->opt_decl || s->dyn_decl || !s->decl_loc)
+        if (!s->is_param || s->opt_decl || !s->decl_loc)
             continue;
         if (!s->received_optish)
             continue;
 
+        const std::string kw = s->dyn_decl ? "opt dyn" : "opt";
         throw OptRequiredEx(
             intern_msg(
                 "parameter '" + std::string(s->name->val) +
-                "' may be none; declare it 'opt' (e.g. 'opt " +
+                "' may be none; declare it '" + kw + "' (e.g. '" + kw + " " +
                 std::string(s->name->val) + "')"),
             s->decl_loc, s->decl_loc);
     }
@@ -1382,8 +1396,13 @@ void Inferencer::commit_round()
 
 void Inferencer::contribute(TypeSym *s, STyRef t, Loc loc)
 {
-    /* func-name syms derive their type from func_sty(); never accumulated. */
-    if (!s || s->dyn_decl || s->func)
+    /*
+     * func-name syms derive their type from func_sty(); never accumulated.
+     * A dyn *var* DOES accumulate (Phase B): join keeps the type dyn but tracks
+     * the opt bit, so `var dyn d = 5; d = none;` infers `opt dyn`. (A dyn param
+     * is skipped in contribute_arg - its opt is declared, not inferred.)
+     */
+    if (!s || s->func)
         return;
     STyRef nw = A.join(s->acc, t);
     if (!nw)
@@ -1708,8 +1727,12 @@ void Inferencer::argcount(const std::string &m, Loc s, Loc e)
 
 void Inferencer::require_nonopt(STyRef t, Loc s, Loc e, const char *what)
 {
-    if (is_dyn(t))
-        return;
+    /*
+     * Phase B: nullability is checked even for dyn. A plain `dyn` is non-opt
+     * (is_optish false) and passes - its *type* operations are runtime-checked,
+     * but it is proven non-none. An `opt dyn` is nullable and must be narrowed,
+     * exactly like `opt int`.
+     */
     if (is_optish(t))
         nullability(std::string("possibly-none value used ") + what +
                         " (type '" + sty_to_string(t) + "')",
@@ -1785,7 +1808,8 @@ TypeSym *Inferencer::narrow_target(Construct *cond, bool &in_then)
             return nullptr;
         auto it = id_sym.find(id);
         TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
-        if (s && !s->func && is_optish(s->type) && !is_dyn(s->type))
+        /* Phase B: narrow `opt dyn` too (-> `dyn` in the proven branch). */
+        if (s && !s->func && is_optish(s->type))
             return s;
         return nullptr;
     };
@@ -2078,17 +2102,15 @@ void Inferencer::check_call(CallExpr *call)
             ptype = fsty->params[i];
         }
 
-        if (p_dyn || is_dyn(at))
-            continue;
-
+        /*
+         * Nullability check FIRST, and it applies even to dyn (Phase B): a
+         * possibly-none argument reaching a non-opt parameter (concrete OR dyn)
+         * forces `opt`/`opt dyn`. For a named function we record it and report
+         * at the param's declaration (enforce_nonnull_params); for a function
+         * *value* (no decl) we flag the call. A plain `dyn` arg is non-opt, so
+         * it passes.
+         */
         if (!p_opt && is_optish(at)) {
-            /*
-             * A possibly-none argument reaches a non-opt parameter. For a named
-             * function we have the param's decl: record it and report the
-             * forcing error at the declaration ("declare it opt"), like the
-             * mandatory-`dyn` rule (enforce_nonnull_params). For a function
-             * *value* (fsty) there is no decl to point at, so flag the call.
-             */
             if (fparams)
                 (*fparams)[i]->received_optish = true;
             else
@@ -2096,6 +2118,11 @@ void Inferencer::check_call(CallExpr *call)
                                 " may be none but the parameter is not 'opt'",
                             anode->start, anode->end);
         }
+
+        /* TYPE check: a dyn parameter or a dyn argument accepts any type (the
+         * variant use-case), so skip assignability for those. */
+        if (p_dyn || is_dyn(at))
+            continue;
 
         STyRef src = p_opt ? at : strip(at);
         if (!sty_assignable(src, ptype))
