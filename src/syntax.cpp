@@ -259,6 +259,30 @@ void CallExpr::serialize(ostream &s, int level) const
     s << ")";
 }
 
+/*
+ * Like the MultiElemConstruct<> template serialize, but annotates a named
+ * argument with its label (a `name:` line above the value). Only the parser's
+ * pre-lowering tree (e.g. what `-s` dumps) ever carries labels; after
+ * lower_named_args the list is positional and prints like any ExprList.
+ */
+void ExprList::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << name << "(\n";
+
+    for (size_t i = 0; i < elems.size(); i++) {
+        if (i < arg_names.size() && arg_names[i])
+            s << string((level + 1) * 2, ' ') << arg_names[i]->val << ":\n";
+        elems[i]->serialize(s, level + 1);
+        s << endl;
+    }
+
+    s << indent;
+    s << ")";
+}
+
 void Expr14::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

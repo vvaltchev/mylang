@@ -94,6 +94,10 @@ public:
 
     bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
     bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
+    /* When false (the CLI's -nti), run() still does the structural pass and the
+     * named-argument lowering (both required for correctness), but skips the
+     * fixpoint / checking / strict enforcement. */
+    bool checks_enabled = true;
 
 private:
 
@@ -134,6 +138,8 @@ private:
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
     void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
+    void lower_named_args(Construct *n);        /* desugar named-arg calls */
+    void lower_call_named_args(CallExpr *call); /* ...for one call */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(STyRef t, bool deep);
 
@@ -387,6 +393,18 @@ void Inferencer::run()
     hoist_globals(rootBlock);
     for (auto &e : rootBlock->elems)
         walk_struct(e.get(), global);
+
+    /*
+     * Desugar named-argument calls into positional ones BEFORE anything else
+     * reads the call shape (the fixpoint, the check pass, and every later pass:
+     * resolve_names, the optimizers, eval). This is syntactic lowering, not
+     * type checking, so it runs even when checks are disabled (-nti).
+     */
+    for (auto &e : rootBlock->elems)
+        lower_named_args(e.get());
+
+    if (!checks_enabled)
+        return;
 
     /* fixpoint */
     for (int iter = 0; iter < 1000; iter++) {
@@ -918,6 +936,108 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
     }
 
     for_each_child(n, [&](Construct *c) { walk_struct(c, s); });
+}
+
+/* ----------------------- named-argument desugaring ----------------------- */
+
+/*
+ * Rewrite ONE named-argument call into the equivalent plain positional call.
+ * Runs once, right after the structural pass and before everything else, so
+ * resolve_names, the optimizers and eval only ever see positional calls - named
+ * args therefore have provably zero effect on them. The ordering rule is
+ * strict: a leading run of positional args, then named args in
+ * parameter-declaration order. A skipped *interior* optional param is filled
+ * with an explicit `none`; trailing omitted params are left off, exactly as in
+ * a hand-written positional call (so f(x:1) for f(x,y?,z?) becomes f(1), while
+ * f(x:1, z:3) becomes f(1, none, 3)). Reordering, an unknown name, a duplicate,
+ * or a missing required param is a compile error.
+ */
+void Inferencer::lower_call_named_args(CallExpr *call)
+{
+    ExprList *args = call->args.get();
+    if (args->arg_names.empty())
+        return;                               /* all positional */
+
+    FuncInfo *fi = callee_funcinfo(call->what.get());
+    if (!fi)
+        mismatch("named arguments require a directly-named function",
+                 call->what->start, call->what->end);
+
+    const auto &params = fi->params;
+    const size_t nparams = params.size();
+    const size_t nargs = args->elems.size();
+
+    std::vector<std::unique_ptr<Construct>> bound(nparams);
+    int last = -1;                            /* highest param slot filled */
+
+    for (size_t i = 0; i < nargs; i++) {
+
+        Construct *anode = args->elems[i].get();
+        size_t slot;
+
+        if (!args->arg_names[i]) {
+            /* positional arg: fills the next param slot, in order */
+            slot = i;
+            if (slot >= nparams)
+                argcount("function expects at most " +
+                             std::to_string(nparams) + " argument(s)",
+                         call->start, call->end);
+        } else {
+            /* named arg: match a parameter by its interned name */
+            slot = nparams;
+            for (size_t k = 0; k < nparams; k++)
+                if (params[k]->name == args->arg_names[i]) { slot = k; break; }
+            if (slot == nparams)
+                mismatch("no parameter named '" +
+                             std::string(args->arg_names[i]->val) + "'",
+                         anode->start, anode->end);
+        }
+
+        if (static_cast<int>(slot) <= last)
+            mismatch("named argument '" + std::string(params[slot]->name->val) +
+                         "' is out of order or duplicates an earlier argument"
+                         " (named arguments must follow parameter order)",
+                     anode->start, anode->end);
+
+        bound[slot] = std::move(args->elems[i]);
+        last = static_cast<int>(slot);
+    }
+
+    /* Rebuild a contiguous positional list 0..last; an interior gap must be an
+     * opt param and is filled with `none`. */
+    auto positional = std::make_unique<ExprList>();
+    positional->start = args->start;
+    positional->end = args->end;
+    bool all_const = true;
+
+    for (int slot = 0; slot <= last; slot++) {
+        if (bound[slot]) {
+            all_const = all_const && bound[slot]->is_const;
+            positional->elems.push_back(std::move(bound[slot]));
+        } else {
+            if (!params[slot]->opt_decl)
+                argcount("missing required argument '" +
+                             std::string(params[slot]->name->val) + "'",
+                         call->start, call->end);
+            positional->elems.push_back(std::make_unique<LiteralNone>());
+        }
+    }
+
+    positional->is_const = all_const;
+    call->args = std::move(positional);       /* now positional */
+}
+
+/* Walk the tree and lower every named-argument call (post-order: nested calls
+ * in the arguments are lowered before the call that contains them). */
+void Inferencer::lower_named_args(Construct *n)
+{
+    if (!n)
+        return;
+
+    for_each_child(n, [this](Construct *c) { lower_named_args(c); });
+
+    if (auto *call = dynamic_cast<CallExpr *>(n))
+        lower_call_named_args(call);
 }
 
 /* --------------------------- type computation ---------------------------- */
@@ -2479,11 +2599,14 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
 
 void infer_types(Construct *root, bool enable, bool strict)
 {
-    if (!enable || !root)
+    if (!root)
         return;
 
     Inferencer inf(root);
     inf.strict_dyn = strict;
+    /* -nti still lowers named-arg calls (syntactic, required for correctness),
+     * but skips the fixpoint / type checking / strict enforcement. */
+    inf.checks_enabled = enable;
     inf.run();
 }
 

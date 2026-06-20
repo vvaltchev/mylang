@@ -585,6 +585,81 @@ pList(ParseContext &c,
     return ret;
 }
 
+/*
+ * Parse a call's argument list `( arg, arg, ... )` (the '(' is already
+ * consumed by the caller; this stops at ')'). Like pList<ExprList> but supports
+ * NAMED arguments `name: value`: a leading run of positional args may be
+ * followed by named ones (never the reverse), each labeled `IDENT ':'`. The
+ * labels ride on ExprList::arg_names; the inferencer's lower_named_args() maps
+ * them to parameter positions and rewrites the call to plain positional form,
+ * so nothing past inference ever sees a name. A named call is left un-folded
+ * here (its callee's params aren't resolved at parse time).
+ */
+static unique_ptr<ExprList>
+pArgList(ParseContext &c, unsigned fl)
+{
+    unique_ptr<ExprList> ret(new ExprList);
+    bool is_const = true, any_named = false, seen_named = false;
+
+    ret->start = c.get_loc();
+
+    if (*c != Op::parenR) {
+        for (;;) {
+            const UniqueId *name = nullptr;
+            Loc name_loc;
+
+            /*
+             * A label is a bare IDENT immediately followed by ':' (one-token
+             * lookahead). Anything else is positional - including a slice
+             * `a[i:j]`, whose colon lives inside '[' and is never seen here.
+             */
+            if (*c == TokType::id && c.peek_tok(1) == Op::colon) {
+
+                name_loc = c.get_loc();
+                name = UniqueId::get(c.get_str());
+                c++;                        /* consume IDENT */
+                c++;                        /* consume ':'   */
+                seen_named = any_named = true;
+
+                for (const UniqueId *prev : ret->arg_names)
+                    if (prev == name)
+                        throw SyntaxErrorEx(name_loc,
+                                            "Duplicate named argument");
+
+            } else if (seen_named) {
+                throw SyntaxErrorEx(
+                    c.get_loc(),
+                    "A positional argument cannot follow a named one");
+            }
+
+            unique_ptr<Construct> e = pExpr14(c, fl);
+            if (!e)
+                noExprError(c);
+
+            /* Make a labeled arg's span cover `name:` so an error points at the
+             * label, not just the value. */
+            if (name)
+                e->start = name_loc;
+
+            is_const = is_const && e->is_const;
+            ret->arg_names.push_back(name);
+            ret->elems.emplace_back(move(e));
+
+            if (!pAcceptOp(c, Op::comma))
+                break;
+        }
+    }
+
+    ret->end = c.get_loc() + 1;
+    /* All-positional: drop arg_names so empty() is the fast path consumers key
+     * off. A named call stays non-const (no parse-time fold); lower_named_args
+     * desugars it and AutoConst still folds a pure call (same result). */
+    if (!any_named)
+        ret->arg_names.clear();
+    ret->is_const = is_const && !any_named;
+    return ret;
+}
+
 bool
 pAcceptCallExpr(ParseContext &c,
                 unique_ptr<Construct> &what,
@@ -598,7 +673,7 @@ pAcceptCallExpr(ParseContext &c,
         ret.reset();
         expr->start = what->start;
         expr->what = move(what);
-        expr->args = pList<ExprList>(c, fl, pExpr14);
+        expr->args = pArgList(c, fl);
 
         if (c.const_eval && expr->what->is_const && expr->args->is_const) {
 

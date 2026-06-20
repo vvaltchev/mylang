@@ -296,7 +296,10 @@ skipped):
 
 - `pExpr01` — primaries + postfix chains: literals, `()`, `[...]` array, `{...}`
   dict, identifiers, then any run of call `(...)`, subscript/slice `[...]`,
-  member `.id`
+  member `.id`. A call's argument list is parsed by `pArgList` (not the generic
+  `pList`), which also accepts **named arguments** `name: value` (label = a bare
+  IDENT followed by `:`, one-token lookahead) — see the inferencer's
+  `lower_named_args` and README *Named arguments*
 - `pExpr02` — unary `+ - !` (right-recursive, so `!!x`, `-+x` work)
 - `pExpr03` — `* / %`
 - `pExpr04` — `+ -`
@@ -608,8 +611,33 @@ violations before the program runs**. Gated by `-nti` (default ON; also runs
 under `-nr`, since type-checking is validation). It runs *after* parsing but
 *before* `resolve_names`, on the clean tree (not the inlined one), and stores
 nothing on the AST — it owns an `STyArena` (`stype.h`) and side tables, so it
-leaves the tree untouched for the later passes. Full design + the decisions
-behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
+leaves the tree untouched for the later passes (the one exception is the
+named-argument desugaring below, a deliberate lowering). Full design + the
+decisions behind it: `plans/type-inference.md`,
+`plans/type-inference-questions.md`.
+
+- **Named-argument desugaring (`lower_named_args`).** A call may pass arguments
+  by name (`f(x: 1, z: 3)`, see README *Named arguments*). The parser attaches
+  the labels to `ExprList::arg_names` (a transient `vector<const UniqueId *>`,
+  parallel to `elems`, empty == all positional) via `pArgList` (replacing the
+  generic `pList<ExprList>` for call args) and leaves the call **non-const** (no
+  parse-time fold, since the callee's params aren't resolved yet). Right after
+  the structural pass and **before** the fixpoint/check, `lower_named_args`
+  rewrites every named call into the equivalent *positional* one: it resolves
+  the callee with `callee_funcinfo` (so names need a directly-named function —
+  a `dyn`/func-value/builtin callee is an error), maps each label to its
+  parameter by interned name, enforces the strict ordering (a leading run of
+  positional args, then names in declaration order; reordering / duplicate /
+  unknown name / missing-required is a compile error), and fills a skipped
+  *interior* optional param with an explicit `LiteralNone`. After this step the
+  tree holds only positional calls, so the fixpoint, the check pass,
+  `resolve_names`, the optimizers, `specialize_types`, and eval **never see a
+  name** — named args have provably zero effect on them (a pure named call,
+  now positional, still folds at AutoConst, identical to the hand-written
+  positional call). The lowering is syntactic, not type-checking, so it runs
+  even when checks are disabled: `-nti` no longer makes `infer_types` a full
+  no-op — it sets `checks_enabled = false`, and `run()` still does the
+  structural pass + lowering, then returns before the fixpoint.
 
 - **Static types** are `STy` (`stype.h`), distinct from the runtime `Type *`:
   `None` (the only-none / not-yet-pinned unit), `Bool`, `Int`, `Float`, `Str`,

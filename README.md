@@ -37,6 +37,7 @@ as well.
     * [Functions and lambdas](#functions-and-lambdas)
       - [Const parameters](#const-parameters)
       - [Typed parameters](#typed-parameters)
+      - [Named arguments](#named-arguments)
       - [Lambda captures](#lambda-captures)
       - [Calling functions during const-evaluation](#calling-functions-during-const-evaluation)
       - [Pure functions](#pure-functions)
@@ -965,6 +966,46 @@ func handler(event, ~data?) => ...  # data : optional and dynamic
 These two shortcuts are accepted **only inside a parameter list** — a body
 declaration must use the canonical `dyn x` / `var? x` forms (`~x` and a trailing
 `x?` are not declaration syntax outside of `func(...)`).
+
+#### Named arguments
+
+At a call site an argument may be passed **by name**, with the `name: value`
+syntax, for both required and optional parameters:
+
+```C#
+func f(x, y?, z?) => [x, y, z];
+
+f(x: 1, y: 2, z: 3);   # all by name
+f(x: 1, z: 3);         # skip the optional `y` -> it binds to none: [1, none, 3]
+f(1, z: 3);            # positional `x`, then named `z`        -> [1, none, 3]
+```
+
+The rules are deliberately strict, so a named call reads exactly like the
+declaration:
+
+  * **Names follow parameter-declaration order.** You may *skip* an optional
+    parameter, but you may not *reorder*: `f(z: 3, x: 1)` is a compile error.
+    A skipped *interior* optional parameter binds to `none` (a skipped trailing
+    one is simply omitted, as without names).
+  * **Positional arguments come first**, then named ones — a positional
+    argument after a named one is a syntax error.
+  * Each parameter may be given **once**: naming a parameter already filled
+    positionally (or repeating a name) is an error.
+  * Every **required** parameter must still be supplied (by position or name).
+  * Arguments evaluate **left to right**, exactly as written (because names are
+    required to be in order, this matches a plain positional call).
+
+Named arguments are pure syntactic sugar: the compiler rewrites the call to the
+equivalent positional one (filling a skipped interior optional with `none`)
+before the program runs, so they have no effect on behavior or performance.
+
+Because that rewrite needs to know the callee's parameter names, names are only
+allowed when the callee is a **directly-named function** (a top-level/lexical
+`func`, or a variable bound to a lambda). Naming arguments through an opaque
+callable — a `dyn` value, a function-typed parameter, or a builtin — is a
+compile error. For the same reason a named call is **not folded at compile
+time**, so it cannot initialize a `const` (use positional arguments there, or a
+plain `var`).
 
 #### Lambda captures
 
