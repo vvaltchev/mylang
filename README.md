@@ -997,15 +997,16 @@ declaration:
 
 Named arguments are pure syntactic sugar: the compiler rewrites the call to the
 equivalent positional one (filling a skipped interior optional with `none`)
-before the program runs, so they have no effect on behavior or performance.
+before the program runs, so they have **no effect on behavior, performance, or
+any optimization** — a named call is treated exactly like the positional call it
+desugars to. In particular it **const-folds** identically: a named call to an
+in-scope `pure func` with constant arguments is evaluated at compile time and
+may initialize a `const`, just like the positional form.
 
-Because that rewrite needs to know the callee's parameter names, names are only
-allowed when the callee is a **directly-named function** (a top-level/lexical
-`func`, or a variable bound to a lambda). Naming arguments through an opaque
-callable — a `dyn` value, a function-typed parameter, or a builtin — is a
-compile error. For the same reason a named call is **not folded at compile
-time**, so it cannot initialize a `const` (use positional arguments there, or a
-plain `var`).
+Because the rewrite needs the callee's parameter names, names are only allowed
+when the callee is a **directly-named function** (a top-level/lexical `func`, or
+a variable bound to a lambda). Naming arguments through an opaque callable — a
+`dyn` value, a function-typed parameter, or a builtin — is a compile error.
 
 #### Lambda captures
 

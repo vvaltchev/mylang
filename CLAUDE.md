@@ -620,24 +620,37 @@ decisions behind it: `plans/type-inference.md`,
   by name (`f(x: 1, z: 3)`, see README *Named arguments*). The parser attaches
   the labels to `ExprList::arg_names` (a transient `vector<const UniqueId *>`,
   parallel to `elems`, empty == all positional) via `pArgList` (replacing the
-  generic `pList<ExprList>` for call args) and leaves the call **non-const** (no
-  parse-time fold, since the callee's params aren't resolved yet). Right after
-  the structural pass and **before** the fixpoint/check, `lower_named_args`
-  rewrites every named call into the equivalent *positional* one: it resolves
-  the callee with `callee_funcinfo` (so names need a directly-named function —
-  a `dyn`/func-value/builtin callee is an error), maps each label to its
-  parameter by interned name, enforces the strict ordering (a leading run of
-  positional args, then names in declaration order; reordering / duplicate /
-  unknown name / missing-required is a compile error), and fills a skipped
-  *interior* optional param with an explicit `LiteralNone`. After this step the
-  tree holds only positional calls, so the fixpoint, the check pass,
-  `resolve_names`, the optimizers, `specialize_types`, and eval **never see a
-  name** — named args have provably zero effect on them (a pure named call,
-  now positional, still folds at AutoConst, identical to the hand-written
-  positional call). The lowering is syntactic, not type-checking, so it runs
-  even when checks are disabled: `-nti` no longer makes `infer_types` a full
-  no-op — it sets `checks_enabled = false`, and `run()` still does the
-  structural pass + lowering, then returns before the fixpoint.
+  generic `pList<ExprList>` for call args). The desugaring to positional form
+  (filling a skipped *interior* optional with an explicit `LiteralNone`,
+  enforcing the strict ordering — a leading run of positional args, then names
+  in declaration order; reordering / duplicate / unknown name / missing-required
+  is a compile error) happens in **two places**, because a named call must
+  const-fold *identically* to its positional twin (the syntax cannot cost an
+  optimization):
+  - **At parse time** (`pTryDesugarNamedCall` → `pDesugarNamedArgs`,
+    `parser.cpp`): when a named call's callee is a parse-time-const `pure func`
+    (its `FuncObject` is available, giving the param `Identifier`s), the parser
+    desugars *before* its const-fold step, so `const C = f(x: 1, z: 5)` folds
+    just like `f(1, none, 5)`. A non-pure / forward / builtin callee can't be
+    resolved here, so the parser marks the call non-const and leaves the names
+    for the inferencer.
+  - **In the inferencer** (`lower_named_args` → `lower_call_named_args`): right
+    after the structural pass and **before** the fixpoint/check, every remaining
+    named call is desugared. It resolves the callee with `callee_funcinfo` (so
+    names need a directly-named function — a `dyn`/func-value/builtin callee is
+    the error here), then maps labels to params (by interned name) the same way.
+
+  After both, the tree holds only positional calls, so the fixpoint, the check
+  pass, `resolve_names`, the optimizers, `specialize_types`, and eval **never
+  see a name** — named args have provably zero effect on them. The inferencer
+  lowering is syntactic, not type-checking, so it runs even when checks are
+  disabled: `-nti` no longer makes `infer_types` a full no-op — it sets
+  `checks_enabled = false`, and `run()` still does the structural pass +
+  lowering, then returns before the fixpoint. (**Temporary:** the name→position
+  mapping is currently duplicated between `pDesugarNamedArgs` and
+  `lower_call_named_args` because the two callers hold the params differently
+  — `Identifier`s vs `TypeSym`s; the next commit unifies them behind one helper
+  over a normalized param view.)
 
 - **Static types** are `STy` (`stype.h`), distinct from the runtime `Type *`:
   `None` (the only-none / not-yet-pinned unit), `Bool`, `Int`, `Float`, `Str`,
@@ -1399,6 +1412,17 @@ omitting it is a compile error.
 
 ## Conventions
 
+- **Incremental is fine; ending in a half-measure is not.** Landing a feature in
+  stages — even with temporary duplication or a stubbed corner — is welcome, as
+  long as the *task* ends at a proper solution. Don't stop at "works but
+  duplicated/limited" and call it done; either finish the clean version or
+  leave a written, tracked follow-up that says exactly what remains. A specific,
+  non-negotiable instance: **the named-argument syntax must never cost an
+  optimization.** A named call has to be optimized (const-fold, inline,
+  specialize) *identically* to the positional call it desugars to — if a name
+  ever disabled a fold that the positional form would get, the feature is a
+  regression and would be better not used at all. Hold any sugar to the same
+  bar: it may add spelling, never subtract capability.
 - **Interactive `git rebase -i` is permitted in this repo** (the environment's
   general "no interactive flags" restriction is waived here by the maintainer) —
   use it to keep history clean / bisectable, e.g. squashing a fix into the

@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <deque>
 
 using std::string;
 
@@ -652,12 +653,127 @@ pArgList(ParseContext &c, unsigned fl)
 
     ret->end = c.get_loc() + 1;
     /* All-positional: drop arg_names so empty() is the fast path consumers key
-     * off. A named call stays non-const (no parse-time fold); lower_named_args
-     * desugars it and AutoConst still folds a pure call (same result). */
+     * off. A named call's const-ness is the AND of its argument values, same as
+     * a positional one - but folding it requires desugaring to positional
+     * first; pAcceptCallExpr does that (for a parse-time-const pure callee) or
+     * else marks it non-const so the named form is deferred to the inferencer's
+     * lower_named_args. */
     if (!any_named)
         ret->arg_names.clear();
-    ret->is_const = is_const && !any_named;
+    ret->is_const = is_const;
     return ret;
+}
+
+/* Intern a dynamic error message so it outlives the throw (mirrors the
+ * inferencer's intern_msg; shared in a later step). */
+static const char *pintern(const std::string &s)
+{
+    static std::deque<std::string> pool;
+    pool.push_back(s);
+    return pool.back().c_str();
+}
+
+/*
+ * Rewrite a named-argument call into the equivalent positional one, given the
+ * callee's parameter list. This is the parse-time twin of the inferencer's
+ * lower_call_named_args (same rules, same errors) - it exists so a named call
+ * to an already-declared `pure func` can const-FOLD at parse time (and thus
+ * initialize a `const`), since folding happens here, before the inferencer
+ * runs. Both copies are unified in the next step.
+ */
+static void
+pDesugarNamedArgs(CallExpr *call, const IdList *params)
+{
+    ExprList *args = call->args.get();
+    const size_t nparams = params ? params->elems.size() : 0;
+    const size_t nargs = args->elems.size();
+
+    std::vector<unique_ptr<Construct>> bound(nparams);
+    int last = -1;
+
+    for (size_t i = 0; i < nargs; i++) {
+
+        Construct *anode = args->elems[i].get();
+        size_t slot;
+
+        if (!args->arg_names[i]) {
+            slot = i;
+            if (slot >= nparams)
+                throw WrongArgCountEx(
+                    pintern("function expects at most " +
+                            std::to_string(nparams) + " argument(s)"),
+                    call->start, call->end);
+        } else {
+            slot = nparams;
+            for (size_t k = 0; k < nparams; k++)
+                if (params->elems[k]->uid == args->arg_names[i]) {
+                    slot = k;
+                    break;
+                }
+            if (slot == nparams)
+                throw TypeMismatchEx(
+                    pintern("no parameter named '" +
+                            std::string(args->arg_names[i]->val) + "'"),
+                    anode->start, anode->end);
+        }
+
+        if (static_cast<int>(slot) <= last)
+            throw TypeMismatchEx(
+                pintern("named argument '" +
+                        std::string(params->elems[slot]->uid->val) +
+                        "' is out of order or duplicates an earlier argument"
+                        " (named arguments must follow parameter order)"),
+                anode->start, anode->end);
+
+        bound[slot] = move(args->elems[i]);
+        last = static_cast<int>(slot);
+    }
+
+    auto positional = make_unique<ExprList>();
+    positional->start = args->start;
+    positional->end = args->end;
+    bool all_const = true;
+
+    for (int slot = 0; slot <= last; slot++) {
+        if (bound[slot]) {
+            all_const = all_const && bound[slot]->is_const;
+            positional->elems.push_back(move(bound[slot]));
+        } else {
+            if (!params->elems[slot]->opt_mod)
+                throw WrongArgCountEx(
+                    pintern("missing required argument '" +
+                            std::string(params->elems[slot]->uid->val) + "'"),
+                    call->start, call->end);
+            positional->elems.push_back(make_unique<LiteralNone>());
+        }
+    }
+
+    positional->is_const = all_const;
+    call->args = move(positional);
+}
+
+/*
+ * If a named call's callee is a parse-time-const `pure func`, desugar it to
+ * positional now so it can fold; otherwise mark its args non-const so the fold
+ * below is skipped and the named form is left for the inferencer (which lowers
+ * it, or rejects names on a non-function callee like a builtin).
+ */
+static void
+pTryDesugarNamedCall(ParseContext &c, CallExpr *call)
+{
+    if (!c.const_eval || !call->what->is_const) {
+        call->args->is_const = false;
+        return;
+    }
+
+    const EvalValue callee = RValue(call->what->eval(c.const_ctx));
+    if (!callee.is<shared_ptr<FuncObject>>()) {
+        call->args->is_const = false;   /* const builtin etc.: defer/reject */
+        return;
+    }
+
+    const FuncObject &fo = *callee.get<shared_ptr<FuncObject>>().get();
+    pDesugarNamedArgs(call, fo.func->params.get());
 }
 
 bool
@@ -674,6 +790,11 @@ pAcceptCallExpr(ParseContext &c,
         expr->start = what->start;
         expr->what = move(what);
         expr->args = pArgList(c, fl);
+
+        /* A named call can't bind/fold until its labels are mapped to
+         * positions; do it now if the callee is a parse-time pure func. */
+        if (!expr->args->arg_names.empty())
+            pTryDesugarNamedCall(c, expr.get());
 
         if (c.const_eval && expr->what->is_const && expr->args->is_const) {
 
