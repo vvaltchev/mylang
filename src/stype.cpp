@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "stype.h"
+#include "uniqueid.h"
 
 /*
  * M0 of the type-inference feature: the static-type lattice and its operations.
@@ -68,6 +69,15 @@ STyRef STyArena::dict_of(STyRef key, STyRef val, bool opt)
     return t;
 }
 
+STyRef STyArena::struct_ty(const void *def, const UniqueId *name, bool opt)
+{
+    STyRef t = alloc(STyKind::Struct);
+    t->struct_def = def;            /* nominal identity (the StructTypeDef*) */
+    t->struct_name = name;
+    t->opt = opt;
+    return t;
+}
+
 STyRef STyArena::func_of(std::vector<STyRef> params,
                          std::vector<bool> param_opt,
                          STyRef ret,
@@ -115,6 +125,7 @@ STyRef STyArena::with_opt(STyRef t, bool optflag)
     c->param_opt = t->param_opt;
     c->ret = t->ret;
     c->struct_def = t->struct_def;
+    c->struct_name = t->struct_name;
     return c;
 }
 
@@ -500,7 +511,8 @@ std::string sty_to_string(STyRef t)
         }
 
         case STyKind::Struct:
-            return s + "struct";
+            return s + (t->struct_name ? std::string(t->struct_name->val)
+                                       : "struct");
     }
 
     return s;

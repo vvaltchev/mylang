@@ -61,6 +61,9 @@ struct TypeSym {
     bool received_optish = false;
     Loc decl_loc;
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
+    /* non-null when this name is a struct TYPE (a `struct` decl): the symbol is
+     * a type descriptor, callable (construction) + `.CONST`-accessible. */
+    const StructTypeDef *struct_type = nullptr;
 };
 
 struct FuncInfo {
@@ -104,6 +107,8 @@ private:
 
     std::unordered_map<const Construct *, TypeSym *> id_sym;
     std::unordered_map<const Construct *, FuncInfo *> func_of_decl;
+    /* struct types by name (for resolving a struct-typed field/annotation). */
+    std::unordered_map<const UniqueId *, const StructTypeDef *> struct_by_name;
 
     Scope *global = nullptr;
     bool changed = false;
@@ -128,6 +133,8 @@ private:
     void hoist_globals(Block *root);
     void walk_struct(Construct *n, Scope *s);
     void declare_funcdecl(FuncDeclStmt *fd, Scope *s);
+    void declare_structdecl(StructDeclStmt *sd, Scope *s);
+    STyRef field_sty(const FieldDef &fd);    /* a struct field's static type */
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
     void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
@@ -164,6 +171,7 @@ private:
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
     void set_array_repr_hint(Expr14 *e);    /* type-driven ArrHint on rvalue */
     void check_call(CallExpr *call);
+    void check_struct_construction(CallExpr *call, const StructTypeDef *def);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
                       bool arith);
     void require_nonopt(STyRef t, Loc s, Loc e, const char *what);
@@ -553,12 +561,13 @@ void Inferencer::enforce_concrete_decls()
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
 
-        /* Skip: explicitly `dyn`, function names, params (a never-called func's
-         * param is legitimately `dyn` and has no `var` to annotate), foreach
-         * loop vars (their type is derived from the container, which carries
-         * any `dyn`), and builtins (no decl loc). */
-        if (s->dyn_decl || s->func || s->is_param || s->is_loopvar ||
-            !s->decl_loc)
+        /* Skip: explicitly `dyn`, function names, struct type names (a type
+         * descriptor, not a value), params (a never-called func's param is
+         * legitimately `dyn` and has no `var` to annotate), foreach loop vars
+         * (their type is derived from the container, which carries any `dyn`),
+         * and builtins (no decl loc). */
+        if (s->dyn_decl || s->func || s->struct_type || s->is_param ||
+            s->is_loopvar || !s->decl_loc)
             continue;
 
         if (!type_has_dyn(s->type, strict_deep))
@@ -765,12 +774,63 @@ void Inferencer::hoist_globals(Block *rootBlock)
         Construct *n = e.get();
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
             declare_funcdecl(fd, global);
+        } else if (auto *sd = dynamic_cast<StructDeclStmt *>(n)) {
+            declare_structdecl(sd, global);
         } else if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
             if (e14->fl & pFlags::pInDecl)
                 declare_target(e14->lvalue.get(), global,
                                e14->fl & pFlags::pInConstDecl);
         }
     }
+}
+
+/*
+ * Declare a struct type name (a type descriptor symbol) and record the def by
+ * name so struct-typed fields/annotations resolve. A bare struct-name value is
+ * typed `dyn`; its constructor / `.CONST` uses are intercepted before that.
+ */
+void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
+{
+    StructTypeDef *def = sd->def.get();
+    struct_by_name[def->name] = def;
+
+    if (sd->id) {
+        const UniqueId *nm = sd->id->uid;
+        auto it = s->syms.find(nm);
+        TypeSym *sym = (it != s->syms.end()) ? it->second
+                                             : new_sym(nm, s, sd->start);
+        sym->struct_type = def;
+        sym->type = A.dyn_ty();
+        id_sym[sd->id.get()] = sym;
+    }
+}
+
+/* The static type of one struct field (an array/dict field is generic - its
+ * element/key/value are `dyn`, since v1 has no inference inside a struct). */
+STyRef Inferencer::field_sty(const FieldDef &fd)
+{
+    STyRef base;
+
+    switch (fd.kind) {
+        case FieldKind::f_bool:   base = A.bool_ty();  break;
+        case FieldKind::f_int:    base = A.int_ty();   break;
+        case FieldKind::f_float:  base = A.float_ty(); break;
+        case FieldKind::f_str:    base = A.str_ty();   break;
+        case FieldKind::f_array:  base = A.array_of(A.dyn_ty()); break;
+        case FieldKind::f_dict:
+            base = A.dict_of(A.dyn_ty(), A.dyn_ty()); break;
+        case FieldKind::f_dyn:    base = A.dyn_ty();   break;
+        case FieldKind::f_struct: {
+            auto it = struct_by_name.find(fd.struct_ty);
+            base = (it != struct_by_name.end())
+                       ? A.struct_ty(it->second, fd.struct_ty)
+                       : A.dyn_ty();    /* unknown struct type: defer to dyn */
+            break;
+        }
+        default: base = A.dyn_ty();
+    }
+
+    return fd.is_opt ? A.with_opt(base, true) : base;
 }
 
 void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
@@ -922,6 +982,11 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         return;
     }
 
+    if (auto *sd = dynamic_cast<StructDeclStmt *>(n)) {
+        declare_structdecl(sd, s);
+        return;
+    }
+
     if (auto *id = dynamic_cast<Identifier *>(n)) {
         if (!id_sym.count(id))
             id_sym[id] = lookup(s, id->uid);
@@ -947,6 +1012,19 @@ void Inferencer::lower_call_named_args(CallExpr *call)
 {
     if (call->args->arg_names.empty())
         return;                               /* all positional */
+
+    /* Struct construction: the "parameters" are the fields, in order. */
+    if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+        auto it = id_sym.find(cid);
+        if (it != id_sym.end() && it->second && it->second->struct_type) {
+            const StructTypeDef *def = it->second->struct_type;
+            std::vector<ParamSpec> params;
+            for (const auto &f : def->fields)
+                params.push_back({ f.name, f.is_opt });
+            desugar_named_call(call, params);
+            return;
+        }
+    }
 
     FuncInfo *fi = callee_funcinfo(call->what.get());
     if (!fi)
@@ -1154,6 +1232,8 @@ STyRef Inferencer::type_of(const Construct *e)
         if (auto *cid = dynamic_cast<const Identifier *>(callee)) {
             auto it = id_sym.find(cid);
             TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
+            if (s && s->struct_type)   /* construction -> the struct type */
+                return A.struct_ty(s->struct_type, s->struct_type->name);
             if (s && s->func)
                 return s->func->ret;
             if (s && is_func(s->type))
@@ -2203,6 +2283,54 @@ void Inferencer::check(Construct *n)
     for_each_child(n, [&](Construct *c) { check(c); });
 }
 
+/* Validate a struct construction `Type(args)` against the field list. By now
+ * the args are positional (named ones were desugared in lower_named_args). The
+ * field list plays the role of the parameter list: arity range [min, nfields]
+ * (min = up to the last non-opt field), per-field assignability, and the
+ * non-opt-field-can't-receive-none rule. */
+void Inferencer::check_struct_construction(CallExpr *call,
+                                           const StructTypeDef *def)
+{
+    ExprList *args = call->args.get();
+    const size_t nfields = def->fields.size();
+    const size_t nargs = args->elems.size();
+
+    size_t min_args = 0;
+    for (size_t i = 0; i < nfields; i++)
+        if (!def->fields[i].is_opt)
+            min_args = i + 1;
+
+    if (nargs < min_args || nargs > nfields) {
+        const std::string want = (min_args == nfields)
+            ? std::to_string(nfields)
+            : std::to_string(min_args) + " to " + std::to_string(nfields);
+        argcount("struct '" + std::string(def->name->val) + "' expects " +
+                     want + " field value(s), got " + std::to_string(nargs),
+                 call->start, call->end);
+    }
+
+    for (size_t i = 0; i < nargs && i < nfields; i++) {
+        const FieldDef &fd = def->fields[i];
+        STyRef at = type_of(args->elems[i].get());
+
+        if (!fd.is_opt && is_optish(at))
+            nullability("field '" + std::string(fd.name->val) +
+                            "' is not 'opt' but the value may be none",
+                        args->elems[i]->start, args->elems[i]->end);
+
+        if (fd.kind == FieldKind::f_dyn || is_dyn(at))
+            continue;
+
+        STyRef ft = field_sty(fd);
+        STyRef src = fd.is_opt ? at : strip(at);
+        if (!sty_assignable(src, ft))
+            mismatch("field '" + std::string(fd.name->val) + "' expects '" +
+                         sty_to_string(ft) + "' but got '" +
+                         sty_to_string(at) + "'",
+                     args->elems[i]->start, args->elems[i]->end);
+    }
+}
+
 void Inferencer::check_call(CallExpr *call)
 {
     check(call->what.get());
@@ -2210,6 +2338,15 @@ void Inferencer::check_call(CallExpr *call)
         check(a.get());
 
     ExprList *args = call->args.get();
+
+    /* Struct construction: validate the args against the field types. */
+    if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+        auto it = id_sym.find(cid);
+        if (it != id_sym.end() && it->second && it->second->struct_type) {
+            check_struct_construction(call, it->second->struct_type);
+            return;
+        }
+    }
 
     /* resolve the callee to a parameter list (FuncInfo or a Func STy) */
     std::vector<TypeSym *> *fparams = nullptr;

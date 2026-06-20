@@ -539,6 +539,41 @@ EvalValue eval_func(EvalContext *ctx,
 
 static void stamp_operand_loc(const Construct *c, Exception &e);
 
+/*
+ * Build a struct instance from a (positional, already-desugared) argument list.
+ * v1 storage is boxed: one LValue slot per field, in declaration order. A
+ * numeric field coerces a widening argument (int field <- bool, float field <-
+ * int/bool), like a typed parameter. The inferencer has already type-checked
+ * the arguments against the field types (for a statically-known callee), so
+ * this is the construction, not the validation.
+ */
+static EvalValue
+construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
+{
+    const size_t nfields = def->fields.size();
+
+    if (args->elems.size() != nfields)
+        throw InvalidNumberOfArgsEx(args->start, args->end);
+
+    auto obj = make_intrusive<StructObject>(def);
+    obj->fields.reserve(nfields);
+
+    for (size_t i = 0; i < nfields; i++) {
+
+        EvalValue v = RValue(args->elems[i]->eval(ctx));
+        const FieldDef &fd = def->fields[i];
+
+        if (fd.kind == FieldKind::f_int)
+            v = coerce_to_decl_type(v, DeclType::i);
+        else if (fd.kind == FieldKind::f_float)
+            v = coerce_to_decl_type(v, DeclType::f);
+
+        obj->fields.emplace_back(move(v), false);
+    }
+
+    return intrusive_ptr<StructObject>(obj);
+}
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue callable_storage;
@@ -567,6 +602,12 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
                 inline_ctx       /* virtual frames if this call is inlined */
             );
         }
+
+        /* Calling a struct type descriptor constructs an instance. By this
+         * point a named call has been desugared to positional. */
+        if (callable.is<StructTypeDef *>())
+            return construct_struct(ctx, callable.get<StructTypeDef *>(),
+                                    args.get());
 
     } catch (Exception &e) {
 
