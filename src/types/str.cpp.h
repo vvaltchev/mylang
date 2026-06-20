@@ -28,7 +28,8 @@ public:
     void ge(EvalValue &a, const EvalValue &b) override;
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
-    EvalValue subscript(const EvalValue &what, const EvalValue &idx) override;
+    EvalValue subscript(const EvalValue &what, const EvalValue &idx,
+                        bool for_write = false) override;
     EvalValue slice(const EvalValue &what,
                     const EvalValue &start,
                     const EvalValue &end) override;
@@ -189,7 +190,8 @@ void TypeStr::noteq(EvalValue &a, const EvalValue &b)
     }
 }
 
-EvalValue TypeStr::subscript(const EvalValue &what_lval, const EvalValue &idx_val)
+EvalValue TypeStr::subscript(const EvalValue &what_lval,
+                             const EvalValue &idx_val, bool for_write)
 {
     if (!idx_val.is<int_type>())
         throw TypeErrorEx("Expected an integer as subscript");

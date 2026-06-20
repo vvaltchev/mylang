@@ -689,7 +689,11 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
             );
         }
 
-        return make_intrusive<DictObject>(move(data));
+        auto out = make_intrusive<DictObject>(move(data));
+        if (obj->get_has_default())   /* preserve the default-dict default */
+            out->set_default(
+                clone_to_mutable(obj->get_default(), through_readonly));
+        return intrusive_ptr<DictObject>(out);
     }
 
     return v;
@@ -766,11 +770,10 @@ make_const_clone(const EvalValue &v)
 
     if (v.is<intrusive_ptr<DictObject>>()) {
 
+        const DictObject &src_obj = *v.get<intrusive_ptr<DictObject>>().get();
         DictObject::inner_type data;
-        const DictObject::inner_type &src =
-            v.get<intrusive_ptr<DictObject>>()->get_ref();
 
-        for (const auto &p : src) {
+        for (const auto &p : src_obj.get_ref()) {
             data.emplace(
                 p.first,
                 LValue(make_const_clone(p.second.get()), false)
@@ -778,6 +781,8 @@ make_const_clone(const EvalValue &v)
         }
 
         auto obj = make_intrusive<DictObject>(move(data));
+        if (src_obj.get_has_default())   /* preserve the default-dict default */
+            obj->set_default(make_const_clone(src_obj.get_default()));
         obj->set_readonly();
         return intrusive_ptr<DictObject>(obj);
     }
@@ -1518,7 +1523,16 @@ handle_single_expr14(EvalContext *ctx,
             return flat_out;
     }
 
+    /*
+     * Mark the lvalue eval as a plain-assignment target (op == assign) so a
+     * dict subscript/member auto-vivifies a missing key instead of throwing
+     * (`d[k] = v` inserts; a compound `d[k] += v` or a read does not - those
+     * throw on a missing key in a plain dict). The outermost subscript/member
+     * consumes the flag; reset it afterwards for non-subscript lvalues.
+     */
+    ctx->assign_target = (!inDecl && op == Op::assign);
     const EvalValue &lval = lvalue->eval(ctx);
+    ctx->assign_target = false;
 
     if (lval.is<UndefinedId>()) {
 
@@ -1864,6 +1878,15 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
 {
+    /*
+     * Consume the plain-assignment-target flag here (before evaluating `what`
+     * and the index), so a nested base like `d[k1]` in `d[k1][k2] = v` is read
+     * normally (throws/defaults on a missing key) while only this outermost
+     * subscript may auto-vivify. See EvalContext::assign_target.
+     */
+    const bool for_write = ctx->assign_target;
+    ctx->assign_target = false;
+
     const EvalValue &lval = what->eval(ctx);
 
     Type *t = lval.is<LValue *>()
@@ -1876,7 +1899,7 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return t->subscript(lval, RValue(index->eval(ctx)));
+    return t->subscript(lval, RValue(index->eval(ctx)), for_write);
 }
 
 /*
@@ -2341,6 +2364,10 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    /* Consume the plain-assignment-target flag (see Subscript::do_eval). */
+    const bool for_write = ctx->assign_target;
+    ctx->assign_target = false;
+
     EvalValue &&dval = RValue(what->eval(ctx));
 
     if (!dval.is<intrusive_ptr<DictObject>>())
@@ -2348,23 +2375,36 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 
     const auto &obj = dval.get<intrusive_ptr<DictObject>>();
     DictObject::inner_type &data = obj->get_ref();
+    const auto &it = data.find(memId);
 
+    /*
+     * `d.key` mirrors `d[key]` (TypeDict::subscript): present -> the value
+     * (lvalue when mutable, so `d.k = v` / `d.k += v` work); missing -> the
+     * default (default dict), else throw on a read / auto-vivify on a plain-
+     * assignment target. So `d.k` is non-opt (a value or an exception, never
+     * none); use get()/get!() for explicit nullable / fail-fast lookup.
+     */
     if (obj->is_readonly()) {
-
-        /*
-         * Read-only dict: never hand out an assignable lvalue and never
-         * auto-vivify. A read of a missing member yields `none`; a write
-         * (`d.k = ...`) sees an rvalue and fails with NotLValueEx.
-         */
-        const auto &it = data.find(memId);
-        return it != data.end() ? it->second.get() : none;
+        if (it != data.end())
+            return it->second.get();
+        if (obj->get_has_default())
+            return obj->get_default();
+        if (for_write)
+            return none;            /* write then fails NotLValueEx */
+        throw KeyNotFoundEx(start, end);
     }
 
-    return &(
-        *data.emplace(
-            memId, LValue(none, false)
-        ).first
-    ).second;
+    if (it != data.end())
+        return &it->second;
+
+    if (obj->get_has_default())
+        return &(*data.emplace(memId, LValue(obj->get_default(), false))
+                      .first).second;
+
+    if (for_write)
+        return &(*data.emplace(memId, LValue(none, false)).first).second;
+
+    throw KeyNotFoundEx(start, end);
 }
 
 EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const

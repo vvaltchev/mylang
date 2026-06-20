@@ -21,7 +21,8 @@ public:
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
-    EvalValue subscript(const EvalValue &what_lval, const EvalValue &idx_val) override;
+    EvalValue subscript(const EvalValue &w, const EvalValue &i,
+                        bool for_write = false) override;
 
     int_type len(const EvalValue &a) override;
     int_type use_count(const EvalValue &a) override;
@@ -68,32 +69,51 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
     a = dataA != dataB;
 }
 
-EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key)
+EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
+                              bool for_write)
 {
     const EvalValue &what = RValue(what_lval);
     intrusive_ptr<DictObject> &&flatObj = what.get<intrusive_ptr<DictObject>>();
-    DictObject::inner_type &data = flatObj.get()->get_ref();
+    DictObject &obj = *flatObj.get();
+    DictObject::inner_type &data = obj.get_ref();
 
     const auto &it = data.find(key);
 
+    /*
+     * A read-only (const) dict never hands out an assignable lvalue: present ->
+     * the value, missing -> the default (default dict) or KeyNotFoundEx. On a
+     * write target a const dict returns an rvalue so the write fails NotLValue.
+     */
     if (flatObj->is_readonly()) {
-
-        /*
-         * Read-only dict (a `const` value): never hand out an assignable
-         * lvalue and never auto-vivify. A read of a missing key yields `none`;
-         * a write (`d[k] = ...`) sees an rvalue and fails with NotLValueEx.
-         */
-        return it != data.end() ? it->second.get() : none;
+        if (it != data.end())
+            return it->second.get();
+        if (obj.get_has_default())
+            return obj.get_default();
+        if (for_write)
+            return none;
+        throw KeyNotFoundEx();
     }
 
+    /* Present key: hand out the lvalue (a read RValue()s it; a compound assign
+     * reads-and-writes it). */
     if (it != data.end())
         return &it->second;
 
-    return &(
-        *data.emplace(
-            key, LValue(none, false)
-        ).first
-    ).second;
+    /*
+     * Missing key. A default dict inserts+returns its default (so `d[k]` is
+     * non-opt and `d[k] += 1` works). A plain dict auto-vivifies only on a
+     * plain-assignment target (`d[k] = v`); a read/compound throws (so `d[k]` /
+     * `d.k` never yields none - it is a value or an exception). `get()` is the
+     * explicit nullable lookup.
+     */
+    if (obj.get_has_default())
+        return &(*data.emplace(key, LValue(obj.get_default(), false))
+                      .first).second;
+
+    if (for_write)
+        return &(*data.emplace(key, LValue(none, false)).first).second;
+
+    throw KeyNotFoundEx();
 }
 
 string TypeDict::to_string(const EvalValue &a)

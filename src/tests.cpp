@@ -1486,15 +1486,20 @@ static const std::vector<test> tests =
     },
 
     {
-        "Read a const dict's members at runtime: existing and missing",
+        "Read a const dict's members at runtime: existing (member) + missing "
+        "(get)",
         {
             "func ga(p) { return p.a; }",
-            "func gz(p) { return p.zzz; }",
             "const d = {\"a\": 1};",
-            "assert(ga(d) == 1);",
-            "assert(gz(d) == none);",            /* missing: none, no vivify */
+            "assert(ga(d) == 1);",                /* present member -> value */
+            "assert(get(d, \"zzz\") == none);",   /* missing -> none */
             "assert(len(d) == 1);",
         },
+    },
+    {
+        "A missing dict member throws (member access is non-opt)",
+        { "var d = {\"a\": 1}; print(d.zzz);" },
+        &typeid(KeyNotFoundEx),
     },
 
     {
@@ -5236,12 +5241,12 @@ static const std::vector<test> tests =
       /* a possibly-none arg to a non-opt param is now reported at the param
        * declaration as OptRequiredEx (the mandatory-`opt` rule). */
       { "func f(x) => 1; var n = none; f(n);" }, &typeid(OptRequiredEx) },
-    { "ti reject: dict read passed to a non-opt param forces opt",
-      { "func f(x) => x + 1; var d = {\"a\": 1}; f(d.a);" },
-      &typeid(OptRequiredEx) },
-    { "ti accept: opt param takes a dict read, narrowed in body",
+    { "ti accept: a dict read is non-opt (usable as a non-opt arg)",
+      { "func f(x) => x + 1; var d = {\"a\": 1}; assert(f(d.a) == 2);" } },
+    { "ti accept: get() is opt, narrowed in body",
       { "func f(opt x) { if (x == none) return 0; return x + 1; }",
-        "var d = {\"a\": 5}; assert(f(d.a) == 6); assert(f(d.b) == 0);" } },
+        "var d = {\"a\": 5};",
+        "assert(f(get(d, \"a\")) == 6); assert(f(get(d, \"b\")) == 0);" } },
     { "ti reject: opt value used in arithmetic",
       { "func f(opt x) => x + 1; f(3);" }, &typeid(NullabilityEx) },
     { "ti reject: bare-declared (none) local in arithmetic",

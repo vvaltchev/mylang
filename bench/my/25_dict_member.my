@@ -1,6 +1,6 @@
 # dictionary member access with the `d.key` sugar (== d["key"]).
-# A dict read is statically nullable (opt), so each member is narrowed before
-# use (the keys always exist, so every branch is taken).
+# A dict read is non-opt: `d.key` returns the value or throws on a missing key,
+# so present keys are used directly with no none-check.
 var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
@@ -11,14 +11,7 @@ var N = 500000 * scale;
 var s = 0;
 
 for (var i = 0; i < N; i += 1) {
-    var a = d.alpha;
-    var b = d.beta;
-    var g = d.gamma;
-    var dl = d.delta;
-    if (a != none) s += a;
-    if (b != none) s += b;
-    if (g != none) s += g;
-    if (dl != none) s += dl;
+    s += d.alpha + d.beta + d.gamma + d.delta;
     s = s % 1000000007;
 }
 

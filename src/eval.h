@@ -112,6 +112,16 @@ public:
     const bool func_ctx;
 
     /*
+     * Transient: set true by handle_single_expr14 only while evaluating the
+     * target of a *plain* assignment (`d[k] = v`), so a dict subscript/member
+     * auto-vivifies a missing key (insert) instead of throwing. The outermost
+     * Subscript/MemberExpr::do_eval consumes it (sets false) before recursing
+     * into sub-expressions, so nested reads (`d[k1][k2]=v`: the `d[k1]` read)
+     * still throw/default on a missing key. Reset after the target eval.
+     */
+    bool assign_target = false;
+
+    /*
      * The current call's slot Frame, or nullptr outside any resolved call.
      * Inherited from the parent on construction; do_func_call points a resolved
      * call's args context at a fresh Frame.

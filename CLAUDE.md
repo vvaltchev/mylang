@@ -280,7 +280,9 @@ keywords (`Keyword` enum,
 `KwString` arrays — keep
 those arrays index-aligned with the enums if you add tokens. `invalid_tok` is
 the EOF sentinel.
-Chars are 8-bit; **no Unicode** (deliberate, to stay small).
+Chars are 8-bit; **no Unicode** (deliberate, to stay small). A **trailing `!`**
+is part of an identifier (Ruby/Scheme "bang" convention, e.g. `get!`), but only
+when it is not the start of `!=` — so `x!=y` still lexes as `x != y`.
 
 ### Parser — operator-precedence ladder
 
@@ -670,12 +672,14 @@ behind it: `plans/type-inference.md`, `plans/type-inference-questions.md`.
   uses it without a check), not merely checked per call site. A call to a
   function *value* (no decl to point at) still reports the old per-call
   `NullabilityEx`. The nullability analogue of mandatory-`dyn`; see
-  `[[nullability-opt-roadmap]]`. **A dict read is nullable:** `type_of` types
-  `d[k]` / `d.k` (Subscript/MemberExpr on a `Dict`) as **`opt V`** — a dict read
-  can miss (auto-vivifies to `none`); a `const` dict with a known key already
-  folded to a literal before inference, so a *surviving* dict read is genuinely
-  nullable and must be narrowed. (Auto-vivification is slated for removal with
-  user-defined types; a future `get(dict,key)` builtin will return `opt V` too.)
+  `[[nullability-opt-roadmap]]`. **A dict read is non-`opt`:** `type_of` types
+  `d[k]` / `d.k` (Subscript/MemberExpr on a `Dict`) as **`V`** (the value type):
+  a missing key *throws* `KeyNotFoundEx` at runtime (or returns the default of a
+  default dict), so the read is a value or an exception, never `none`. The
+  explicit accessors are `get(d,k)` → `opt V` (nullable lookup) and `get!(d,k)`
+  → `V` (value or throw); `dict(default_value)` → `dict<dyn, typeof default>`
+  (a default dict). See the dict-access runtime notes below and
+  `[[nullability-opt-roadmap]]`.
 - **The defer-on-Unknown/None invariant (soundness of the fixpoint).** Any type
   computation (`binop_result`, `unary_result`, `elem_of`, `type_of` of
   Subscript/Slice/Member/CallExpr-callee, `accumulate_foreach`) that meets an
@@ -951,11 +955,23 @@ wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
   rvalue assigns the same value to each (`var a,b = 0`). The same helper drives
   `foreach`
   tuple-unpacking and the `indexed` keyword.
-- **`d.key` (member access) auto-vivifies.** `MemberExpr::do_eval` `emplace`s
-  the key with `none` if
-  absent and returns it as an assignable `LValue` — so reading a missing member
-  in lvalue position
-  *mutates* the dict. Keep this in mind when reasoning about dict side effects.
+- **Dict access: throw-on-missing-read, insert-on-write, or default.**
+  `TypeDict::subscript(what, key, for_write)` and `MemberExpr::do_eval` (which
+  share the logic) handle a missing key by: returning the dict's default (a
+  *default dict* from `dict(default_value)`, `DictObject::{has_default,
+  default_val}`); else, on a **plain-assignment target** (`for_write`),
+  auto-vivifying (insert `none`/default) so `d[k] = v` inserts; else **throws**
+  `KeyNotFoundEx` — so a *read* or *compound assign* (`d[k]`, `d.k`, `d[k]+=1`)
+  of a missing key in a plain dict throws rather than yielding `none` (the read
+  is non-`opt`). `for_write` is `EvalContext::assign_target`, set by
+  `handle_single_expr14` only for `op == assign` and **consumed** by the
+  outermost subscript/member (so a nested base like `d[k1]` in `d[k1][k2]=v` is
+  read, not vivified). `get!()`/`get()` are the explicit fail-fast / nullable
+  accessors. A `const` dict folds known-key reads at parse time (a known-missing
+  key therefore throws at *compile* time). The clone paths
+  (`TypeDict::clone`, `clone_to_mutable`, `make_const_clone`) preserve
+  `has_default`/`default_val` (`dict()` stays a const builtin, so `dict(0)`
+  folds — hence the clone-preservation matters).
 
 ## Copy-on-write containers
 
@@ -1115,8 +1131,8 @@ and two macros:
   A statically provable type error is reported here, before the program runs.
 - `DECL_RUNTIME_EX` — subclasses of `RuntimeException` (adds `clone()` +
   `[[noreturn]] rethrow()`):
-  `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `NotLValueEx`,
-  `NotCallableEx`,
+  `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `KeyNotFoundEx`,
+  `NotLValueEx`, `NotCallableEx`,
   `AssertionFailureEx`, `CannotOpenFileEx`, `InvalidValueEx`. These are the ones
   script `try/catch`
   can handle (matched by name).

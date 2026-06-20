@@ -455,11 +455,14 @@ runtime instead.
     copies while, under the hood, they use copy-on-write techniques.
 
   * **Dictionary**
-    Dictionaries are hash-maps defined using `Python`'s syntax: `{"a": 3, "b": 4}`.
-    Elements are accessed with the familiar syntax `d["key-string"]` or `d[23]`, can
-    be looked-up with `find()` and deleted with `erase()`. At the moment, only strings,
-    integers, and floats can be used as keys of a dictionary. **Perks**: identifier-like
-    string-keys can be accessed also with the "member of" syntax: `d.key`.
+    Dictionaries are hash-maps defined using `Python`'s syntax: `{"a": 3}`.
+    Elements are accessed with `d["key-string"]` or `d[23]`, looked-up with
+    `get()`/`get!()`/`find()`, and deleted with `erase()`. Only strings, ints,
+    and floats can be keys. **Perks**: identifier-like string-keys can be
+    accessed with the "member of" syntax: `d.key`. A read of a *missing* key
+    (`d[k]`/`d.key`) raises `KeyNotFoundEx` — non-`opt` access (a value or an
+    exception, never `none`); use `get()` for a nullable lookup, or
+    `dict(default)` for a default value. A write (`d[k] = v`) inserts the key.
 
   * **Function**
     Both standalone functions and lambdas have the same object type and can be passed
@@ -528,11 +531,12 @@ Key rules:
     declaration* asking you to mark it `opt`. So a non-`opt` parameter is
     *guaranteed* never to be `none` — the body can use it without a check. This
     is the nullability analogue of the mandatory-`dyn` rule.
-  * **A dict read is nullable.** `d[k]` / `d.k` may not find the key, so they
-    have type `opt V` and must be narrowed before use (`var v = d[k]; if (v !=
-    none) ...`). A read of a `const` dict with a statically-known key is the
-    exception: it is computed at compile time, so it is the exact (non-`opt`)
-    value.
+  * **A dict read is non-`opt` — it throws on a missing key.** `d[k]` / `d.k`
+    return the value (a value or an exception, never `none`), so they are usable
+    without a check; a missing key raises `KeyNotFoundEx` at runtime. For a
+    nullable or fail-fast lookup use `get()` / `get!()`, and for the "absent ==
+    a default" pattern use a default dict (`dict(default_value)`) — see the dict
+    builtins. A write (`d[k] = v`) still inserts a new key as usual.
   * `==` and `!=` work between any two values (they never error, returning a
     bool); ordering operators `< <= > >=` need two numbers or two strings.
 
@@ -1073,6 +1077,7 @@ caught with `try-catch` blocks is:
   * TypeErrorEx
   * NotCallableEx
   * OutOfBoundsEx
+  * KeyNotFoundEx
   * CannotOpenFileEx
 
 Other exceptions like `SyntaxErrorEx` cannot be caught, instead.
@@ -1298,9 +1303,27 @@ Return an array containing all the values of the given dictionary.
 Return the contents of the given dictionary, in the form of an array of
 [key, value] arrays.
 
-#### `dict(array)`
-Build a dictionary from an array of [key, value] arrays. This is the counter-part
-function of `kvpairs()`.
+#### `dict(array)` / `dict(default_value)`
+With an **array** argument, build a dictionary from an array of [key, value]
+arrays (the counterpart of `kvpairs()`). With any other (non-array, non-`none`)
+argument, build an empty **default dict**: reading a missing key returns (and
+inserts) that default value instead of throwing, so accumulation works directly:
+
+```C#
+var counts = dict(0);
+foreach (var w in words)
+    counts[w] += 1;        # a missing word reads as 0
+```
+
+#### `get(dictionary, key)`
+Look up `key`, returning its value or `none` if the key is absent — the explicit
+*nullable* lookup (type `opt V`, so you narrow it before use). Contrast
+`d[key]`, which throws on a missing key.
+
+#### `get!(dictionary, key)`
+Look up `key`, returning its value or raising `KeyNotFoundEx` if the key is
+absent — the *fail-fast* lookup (type `V`, non-`opt`, so the result is usable
+without a none-check). Same behavior as the `d[key]` / `d.key` sugar.
 
 ### String builtins
 
