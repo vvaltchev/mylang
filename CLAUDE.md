@@ -207,7 +207,9 @@ units:
   `serialize()` (what `-s` prints), and `clone()` (a deep copy of a subtree,
   used by inlining; pure virtual so every concrete node must provide one — see
   the `clone_as`/`copy_base_fields`/`clone_ops_into`/`clone_elems_into`
-  helpers).
+  helpers). Also `desugar_named_call` (over a `ParamSpec` view) — the shared
+  named-argument → positional rewrite used by both the parser and the
+  inferencer (see *Static type inference*).
 - `resolver.cpp` / `resolver.h` — `resolve_names(root)`, a post-parse pass that
   assigns function
   params slot indices for O(1) access at runtime (see the value model section).
@@ -646,11 +648,19 @@ decisions behind it: `plans/type-inference.md`,
   lowering is syntactic, not type-checking, so it runs even when checks are
   disabled: `-nti` no longer makes `infer_types` a full no-op — it sets
   `checks_enabled = false`, and `run()` still does the structural pass +
-  lowering, then returns before the fixpoint. (**Temporary:** the name→position
-  mapping is currently duplicated between `pDesugarNamedArgs` and
-  `lower_call_named_args` because the two callers hold the params differently
-  — `Identifier`s vs `TypeSym`s; the next commit unifies them behind one helper
-  over a normalized param view.)
+  lowering, then returns before the fixpoint.
+
+  Both sites share **one** mapping implementation, `desugar_named_call`
+  (`syntax.cpp`, declared in `syntax.h`): it takes the call plus a normalized
+  `vector<ParamSpec>` (`{const UniqueId *name; bool opt;}`) and owns all the
+  rules (label→position by interned name, the strict ordering, the `none`
+  fill, the errors). Each caller just builds the `ParamSpec` view from its own
+  param representation — the parser from a `FuncObject`'s param `Identifier`s
+  (`uid`/`opt_mod`), the inferencer from its `TypeSym`s (`name`/`opt_decl`) —
+  and the callee-resolution + "names need a directly-named function" decision
+  stays caller-specific. So a named call is rewritten, and therefore optimized,
+  byte-identically wherever it is lowered. (`intern_msg`, the stable-message
+  helper the compile errors need, is likewise shared from `errors.h`.)
 
 - **Static types** are `STy` (`stype.h`), distinct from the runtime `Type *`:
   `None` (the only-none / not-yet-pinned unit), `Bool`, `Int`, `Float`, `Str`,

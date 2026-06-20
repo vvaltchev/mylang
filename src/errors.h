@@ -6,7 +6,21 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <deque>
 #include "operators.h"
+
+/*
+ * Intern a dynamically-built error message so the `const char *` a thrown
+ * Exception stores outlives the throw (the std::string that built it is
+ * usually a temporary). `inline` => one shared pool across all TUs. Used by the
+ * inferencer's compile-time errors and the named-argument desugaring.
+ */
+inline const char *intern_msg(const std::string &s)
+{
+    static std::deque<std::string> pool;
+    pool.push_back(s);
+    return pool.back().c_str();
+}
 
 struct Loc {
 
