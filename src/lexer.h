@@ -64,6 +64,7 @@ static const std::array<std::string, (int)Op::op_count> OpString =
     "=>",
     ":",
     ".",
+    "?",
 };
 
 enum class Keyword : int {
@@ -95,8 +96,9 @@ enum class Keyword : int {
     kw_pure     = 23,
     kw_opt      = 24,
     kw_dyn      = 25,
+    kw_null     = 26,   // alias for `none`
 
-    kw_count    = 26,
+    kw_count    = 27,
 };
 
 static const std::array<std::string, (int)Keyword::kw_count> KwString =
@@ -128,6 +130,7 @@ static const std::array<std::string, (int)Keyword::kw_count> KwString =
     "pure",
     "opt",
     "dyn",
+    "null",
 };
 
 std::ostream &operator<<(std::ostream &s, TokType t);

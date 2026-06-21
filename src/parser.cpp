@@ -144,45 +144,68 @@ check_coerce_const_scalar(const EvalValue &v, DeclType dt, Loc s, Loc e)
 /*
  * Recognize and consume a declaration prefix at the start of a statement or a
  * `for`-loop initializer, setting the pInDecl / pInConstDecl / pInOptDecl /
- * pInDynDecl flags on `fl` and ParseContext::pending_decl_type for a type. The
- * forms are: `var [opt] [dyn]`, `const [opt] [dyn]`, or an explicit type
- * `[const] [opt] TYPE` (bool/int/float/str/array/dict). A type keyword is an
- * ordinary identifier, so it is a type only when - after an optional
- * `const`/`opt` - it is followed by the variable name (another identifier);
- * `int(5)`, `array(n)`, `map(int, a)` therefore stay plain uses. No-op if no
- * declaration prefix is present.
+ * pInDynDecl flags on `fl` and ParseContext::pending_decl_type for an explicit
+ * type. A declaration is a run of prefix tokens followed by the variable name:
+ *
+ *   prefix := ( const | var | opt | dyn | ? | TYPE )+
+ *
+ * where a type keyword (bool/int/float/str/array/dict) counts only when it is
+ * followed (after an optional `?`) by the name - so `int(5)`, `map(int, a)` etc.
+ * stay ordinary uses. `?` is the canonical nullable marker (`var? x`, `int? x`,
+ * `dyn? x`), equivalent to the `opt` keyword. `dyn` is a standalone starter
+ * (`dyn x;`, not only `var dyn x;`). The run must end at an identifier (the
+ * name), and must contain at least one "starter" (const/var/dyn/TYPE) to be a
+ * declaration. No-op otherwise.
  */
 static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
 {
     int k = 0;
-    const bool tc = c.peek_tok(k) == Keyword::kw_const ? (k++, true) : false;
-    const bool to = c.peek_tok(k) == Keyword::kw_opt ? (k++, true) : false;
-    const DeclType dt = c.peek_tok(k) == TokType::id
-        ? type_keyword(c.peek_tok(k).value) : DeclType::none;
+    unsigned f = 0;
+    DeclType dt = DeclType::none;
+    bool starter = false;   /* something that makes this a declaration */
 
-    if (dt != DeclType::none && c.peek_tok(k + 1) == TokType::id) {
-        for (int j = 0; j <= k; j++)   /* const?, opt?, TYPE */
-            c.next();
-        fl |= pFlags::pInDecl;
-        if (tc) fl |= pFlags::pInConstDecl;
-        if (to) fl |= pFlags::pInOptDecl;
-        c.pending_decl_type = dt;
+    for (;;) {
+        const Tok &t = c.peek_tok(k);
+
+        if (t == Keyword::kw_const) {
+            f |= pFlags::pInDecl | pFlags::pInConstDecl; starter = true; k++;
+        } else if (t == Keyword::kw_var) {
+            f |= pFlags::pInDecl; starter = true; k++;
+        } else if (t == Keyword::kw_dyn) {
+            f |= pFlags::pInDecl | pFlags::pInDynDecl; starter = true; k++;
+        } else if (t == Keyword::kw_opt || t == Op::questionmark) {
+            f |= pFlags::pInDecl | pFlags::pInOptDecl; k++;
+        } else if (dt == DeclType::none && t == TokType::id &&
+                   type_keyword(t.value) != DeclType::none) {
+            /* A type keyword counts only if the name follows (after `?`). */
+            int n = k + 1;
+            if (c.peek_tok(n) == Op::questionmark)
+                n++;
+            if (c.peek_tok(n) != TokType::id)
+                break;
+            dt = type_keyword(t.value);
+            f |= pFlags::pInDecl; starter = true; k++;
+        } else {
+            break;
+        }
+    }
+
+    /*
+     * Commit only if a "starter" was seen (const/var/dyn, or a TYPE that was
+     * already confirmed to be followed by the name). A starter keyword commits
+     * even if the name is missing (`var ;`), so the decl parser raises the
+     * proper "expected identifier" error. A bare `opt`/`?` is not a starter, and
+     * a type keyword not followed by a name was never consumed - so `int(5)`,
+     * `map(int, a)`, `x = 5` are left as ordinary expressions.
+     */
+    if (!starter)
         return;
-    }
 
-    if (pAcceptKeyword(c, Keyword::kw_var))
-        fl |= pFlags::pInDecl;
-    else if (pAcceptKeyword(c, Keyword::kw_const))
-        fl |= pFlags::pInDecl | pFlags::pInConstDecl;
+    for (int i = 0; i < k; i++)
+        c.next();
 
-    /* `var`/`const` may be followed by the `opt` and/or `dyn` type modifiers,
-     * in order (`opt dyn` = nullable, dynamically typed). */
-    if (fl & pFlags::pInDecl) {
-        if (pAcceptKeyword(c, Keyword::kw_opt))
-            fl |= pFlags::pInOptDecl;
-        if (pAcceptKeyword(c, Keyword::kw_dyn))
-            fl |= pFlags::pInDynDecl;
-    }
+    fl |= f;
+    c.pending_decl_type = dt;
 }
 
 /* The zero value of an explicit type, for an uninitialized typed declaration
@@ -450,39 +473,55 @@ pIdentifier(ParseContext &c, unsigned fl)
 }
 
 /*
- * A function parameter: an identifier optionally preceded by `const`, e.g.
- * `func f(const x, y)`. A const parameter cannot be reassigned in the body
- * (enforced by the resolver and, as a safety net, at runtime). The identifier
- * is NOT const-resolved (resolve_const=false): a param shadows any outer const
- * of the same name, so it must stay a plain identifier.
+ * A function parameter. It accepts the canonical declaration forms (the same as
+ * a statement-level decl: `const`, `opt`, `dyn`, `var`, a TYPE keyword, and the
+ * `?` nullable suffix - e.g. `const x`, `var? y`, `dyn z`, `dyn? k`, `int n`,
+ * `int? m`) PLUS two terse param-only short forms, since lambdas reuse the same
+ * `func(params) => ...` syntax and benefit from brevity:
+ *   - a leading `~` marks a `dyn` (dynamically-typed) parameter (`~z`);
+ *   - a trailing `?` on the NAME marks it optional (`y?`, `int m?`, `~z?`).
+ * (These two are rejected outside a parameter list - a body declaration must
+ * use the canonical `dyn x` / `var? x` forms.) The identifier is NOT
+ * const-resolved (resolve_const=false): a param shadows any outer const of the
+ * same name, so it must stay a plain identifier.
  */
 unique_ptr<Identifier>
 pFuncParam(ParseContext &c, unsigned fl)
 {
-    /* A param may carry modifiers in any order: `const`, `opt` (nullable), and
-     * `dyn` (dynamically typed). See plans/type-inference.md. */
     bool is_const = false, is_opt = false, is_dyn = false;
     bool got_mod;
 
+    /* param-only short form: leading `~` = dyn (the `~` token is Op::bnot). */
+    if (pAcceptOp(c, Op::bnot))
+        is_dyn = true;
+
+    /* Modifiers in any order: const, opt, dyn, var (inferred, no-op), and the
+     * canonical `?` nullable marker (`var? y`, `dyn? k`). */
     do {
         got_mod = false;
         if (pAcceptKeyword(c, Keyword::kw_const)) { is_const = true; got_mod = true; }
         if (pAcceptKeyword(c, Keyword::kw_opt))   { is_opt = true;   got_mod = true; }
         if (pAcceptKeyword(c, Keyword::kw_dyn))   { is_dyn = true;   got_mod = true; }
+        if (pAcceptKeyword(c, Keyword::kw_var))   { got_mod = true; }
+        if (pAcceptOp(c, Op::questionmark))       { is_opt = true;   got_mod = true; }
     } while (got_mod);
 
     /*
-     * An explicit primitive type before the name: `func f(int x, str s)`.
-     * Recognized like at statement level - the type keyword (an identifier) is
-     * a type only when followed by the parameter name. `dyn` (no static type)
-     * is mutually exclusive with a type keyword.
+     * An explicit primitive type before the name: `func f(int x, int? n)`. The
+     * type keyword (an identifier) is a type only when the name follows (after
+     * an optional canonical `?`). `dyn` is mutually exclusive with a type.
      */
     DeclType dt = DeclType::none;
     if (!is_dyn && *c == TokType::id) {
         const DeclType maybe = type_keyword(c.get_str());
-        if (maybe != DeclType::none && c.peek_tok(1) == TokType::id) {
+        const bool q1 = c.peek_tok(1) == Op::questionmark;
+        if (maybe != DeclType::none &&
+            (c.peek_tok(1) == TokType::id ||
+             (q1 && c.peek_tok(2) == TokType::id))) {
             dt = maybe;
             c.next();                          /* consume the type keyword */
+            if (pAcceptOp(c, Op::questionmark))   /* `int? n` */
+                is_opt = true;
         }
     }
 
@@ -497,6 +536,10 @@ pFuncParam(ParseContext &c, unsigned fl)
             );
         return nullptr;
     }
+
+    /* param-only short form: a trailing `?` on the name = optional. */
+    if (pAcceptOp(c, Op::questionmark))
+        is_opt = true;
 
     unique_ptr<Identifier> id(static_cast<Identifier *>(ret.release()));
     id->const_param = is_const;
@@ -753,8 +796,10 @@ pExpr01(ParseContext &c, unsigned fl)
 
         return main;
 
-    } else if (pAcceptKeyword(c, Keyword::kw_none)) {
+    } else if (pAcceptKeyword(c, Keyword::kw_none) ||
+               pAcceptKeyword(c, Keyword::kw_null)) {
 
+        /* `null` is an alias for `none`. */
         main.reset(new LiteralNone());
         main->start = start;
         main->end = c.get_loc();
