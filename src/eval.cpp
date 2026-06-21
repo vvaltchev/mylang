@@ -1694,6 +1694,50 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
     if (blv->is_const_var() || arr.is_readonly())
         return false;
 
+    /*
+     * Flat POD-struct array: `a[i] = <matching POD struct>` stores the value's
+     * bytes (a compound op falls through; structs have no `+=`). A non-matching
+     * value is the dyn-launder case (errors like the scalar kinds).
+     */
+    if (arr.skind() == SharedArrayObj::Storage::structs) {
+
+        if (op != Op::assign)
+            return false;
+
+        const EvalValue r = RValue(rval);
+        const auto &sv0 = arr.flat_structs();
+
+        const EvalValue idx_v = RValue(sub->index->eval(ctx));
+        if (!idx_v.is<int_type>())
+            throw TypeErrorEx("Expected integer as subscript",
+                              sub->index->start, sub->index->end);
+        int_type idx = idx_v.get<int_type>();
+        if (idx < 0)
+            idx += arr.size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+            throw OutOfBoundsEx(sub->start, sub->end);
+
+        if (!r.is<intrusive_ptr<StructObject>>() ||
+            !r.get<intrusive_ptr<StructObject>>()->is_pod() ||
+            r.get<intrusive_ptr<StructObject>>()->def != sv0.def)
+            throw TypeErrorEx(
+                "Cannot store a value of a different type in a flat (typed) "
+                "array; declare the array dyn for a polymorphic array",
+                sub->start, sub->end);
+
+        if (arr.is_slice())
+            arr.clone_internal_vec();
+        else if (arr.use_count() > 1)
+            arr.clone_aliased_slices(arr.offset() + idx);
+
+        auto &sv = arr.flat_structs();
+        const StructObject &o = *r.get<intrusive_ptr<StructObject>>().get();
+        std::memcpy(sv.buf.data() + (arr.offset() + idx) * sv.stride,
+                    o.bytes.data(), sv.stride);
+        out = r;
+        return true;
+    }
+
     const bool kind_int = arr.skind() == SharedArrayObj::Storage::ints;
     const bool kind_bool = arr.skind() == SharedArrayObj::Storage::bools;
 
