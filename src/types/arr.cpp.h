@@ -11,6 +11,34 @@
 #include "defs.h"
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
+#include "structtype.h"
+#include <cstring>
+
+/* Materialize the POD-struct element at index `i` (already offset-adjusted)
+ * flat struct array as a boxed StructObject EvalValue (a copy of its bytes). */
+static EvalValue struct_elem_at(const SharedArrayObj &arr, size_type i)
+{
+    const SharedArrayObj::svec_type &sv = arr.flat_structs();
+    auto obj = make_intrusive<StructObject>(sv.def);   /* resizes bytes */
+    std::memcpy(obj->bytes.data(),
+                sv.buf.data() + (arr.offset() + i) * sv.stride, sv.stride);
+    return intrusive_ptr<StructObject>(obj);
+}
+
+template <class LValueT>
+void SharedArrayObjTempl<LValueT>::promote_structs_to_general()
+{
+    if (shobj->kind != Storage::structs)
+        return;
+
+    const size_type n = size();
+    vec_type nv;
+    nv.reserve(n);
+    for (size_type i = 0; i < n; i++)
+        nv.emplace_back(struct_elem_at(*this, i), false);
+
+    *this = SharedArrayObjTempl(move(nv));
+}
 
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_internal_vec()
@@ -52,6 +80,17 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->bvec.cbegin() + offset() + size()
             );
             *this = SharedArrayObjTempl(move(nv));
+            return;
+        }
+
+        case Storage::structs: {
+            const int stride = shobj->svec.stride;
+            std::vector<char> nb(
+                shobj->svec.buf.cbegin() + offset() * stride,
+                shobj->svec.buf.cbegin() + (offset() + size()) * stride
+            );
+            *this = SharedArrayObjTempl(
+                svec_type(move(nb), shobj->svec.def, stride));
             return;
         }
 
@@ -329,6 +368,8 @@ static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i)
             return EvalValue(arr.flat_floats()[at]);
         case SharedArrayObj::Storage::bools:
             return EvalValue(static_cast<bool>(arr.flat_bools()[at]));
+        case SharedArrayObj::Storage::structs:
+            return struct_elem_at(arr, i);   /* materialize a StructObject */
         default:
             return arr.get_vec()[at].get();
     }

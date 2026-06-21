@@ -11,6 +11,8 @@
 #include <cassert>
 #include <new>
 
+struct StructTypeDef;   /* a struct type (structtype.h); only a pointer here */
+
 
 /*
  * These classes are templates simply because otherwise this header wouldn't be
@@ -52,6 +54,26 @@ public:
     typedef std::vector<unsigned char> bvec_type;   /* one byte per bool */
 
     /*
+     * Flat storage for an array of POD structs (plans/structs.md phase 7): the
+     * elements laid out contiguously as raw C-struct bytes, `stride`
+     * bytes each.
+     * `def` (a StructTypeDef*) is the element type - used only by the impl
+     * (arr.cpp.h, where it is complete) to materialize/store a StructObject;
+     * `stride` is cached here so the inline template never needs StructTypeDef
+     * to be a complete type. Cold operations promote this to `general` via
+     * get_vec() (see promote_structs_to_general), so only the hot paths
+     * (creation / append / subscript read / foreach) touch the bytes directly.
+     */
+    struct svec_type {
+        std::vector<char> buf;
+        StructTypeDef *def = nullptr;
+        int stride = 0;
+        svec_type() = default;
+        svec_type(std::vector<char> &&b, StructTypeDef *d, int s)
+            : buf(move(b)), def(d), stride(s) { }
+    };
+
+    /*
      * Backing-storage kind (see plans/typed-arrays.md). A homogeneous
      * int/float/bool array keeps an *unboxed* vector instead of vector<LValue>
      * (48-byte slots), which makes bulk ops (reverse/sort/sum/foreach) move far
@@ -60,7 +82,9 @@ public:
      * flat array to general (representation is type-driven, fixed at creation);
      * the hot ops branch on the kind and touch the flat vector directly.
      */
-    enum class Storage : unsigned char { general, ints, floats, bools };
+    enum class Storage : unsigned char {
+        general, ints, floats, bools, structs
+    };
 
 private:
     static constexpr size_type all_slices = static_cast<size_type>(-1);
@@ -79,6 +103,7 @@ private:
             ivec_type ivec;    /* kind == ints */
             fvec_type fvec;    /* kind == floats */
             bvec_type bvec;    /* kind == bools */
+            svec_type svec;    /* kind == structs */
         };
 
         std::unordered_set<SharedArrayObjTempl *> slices;
@@ -105,6 +130,9 @@ private:
         SharedObject(bvec_type &&a) : kind(Storage::bools) {
             new (&bvec) bvec_type(move(a));
         }
+        SharedObject(svec_type &&a) : kind(Storage::structs) {
+            new (&svec) svec_type(move(a));
+        }
 
         ~SharedObject() {
             switch (kind) {
@@ -112,6 +140,7 @@ private:
                 case Storage::ints:    ivec.~ivec_type(); break;
                 case Storage::floats:  fvec.~fvec_type(); break;
                 case Storage::bools:   bvec.~bvec_type(); break;
+                case Storage::structs: svec.~svec_type(); break;
             }
         }
 
@@ -160,6 +189,18 @@ public:
         : shobj(make_intrusive<SharedObject>(move(arr)))
         , off(0)
         , len(shobj->bvec.size())
+        , slice(false)
+    { }
+
+    /* Flat POD-struct storage (plans/structs.md phase 7). `len` is the element
+     * count (buf bytes / stride). */
+    SharedArrayObjTempl(svec_type &&arr)
+        : shobj(make_intrusive<SharedObject>(move(arr)))
+        , off(0)
+        , len(shobj->svec.stride
+                  ? static_cast<size_type>(shobj->svec.buf.size() /
+                                           shobj->svec.stride)
+                  : 0)
         , slice(false)
     { }
 
@@ -239,6 +280,16 @@ public:
     void clone_all_slices() { clone_aliased_slices(all_slices); }
 
     /*
+     * Materialize a flat POD-struct array into a general vector<LValue> (one
+     * boxed StructObject per element), in place. Defined out-of-line in
+     * types/arr.cpp.h (needs StructObject). No-op if not `structs`. The bounded
+     * cost of a struct-array operation that has no flat fast path: it promotes
+     * here (via get_vec) rather than touching the bytes, so EVERY general array
+     * op works on a struct array without a dedicated case.
+     */
+    void promote_structs_to_general();
+
+    /*
      * General (vector<LValue>) access. mylang does NOT promote flat int/float
      * storage to general on demand: an array's representation is fixed at
      * creation from its proven static type (type-driven), so the only valid
@@ -250,6 +301,10 @@ public:
      * case) is caught earlier with a user-facing TypeErrorEx.
      */
     vec_type &get_vec() {
+        /* A struct array promotes to general here (the cold-path fallback); a
+         * flat scalar array reaching here is an invariant violation. */
+        if (shobj->kind == Storage::structs)
+            promote_structs_to_general();
         if (shobj->kind != Storage::general)
             throw InternalErrorEx();
         return shobj->vec;
@@ -267,6 +322,8 @@ public:
     const ivec_type &flat_ints()   const { return shobj->ivec; }
     const fvec_type &flat_floats() const { return shobj->fvec; }
     const bvec_type &flat_bools()  const { return shobj->bvec; }
+    svec_type &flat_structs()             { return shobj->svec; }
+    const svec_type &flat_structs() const { return shobj->svec; }
 
     int_type use_count() const { return shobj.use_count(); }
 
@@ -284,6 +341,11 @@ public:
             case Storage::ints:   return shobj->ivec.size();
             case Storage::floats: return shobj->fvec.size();
             case Storage::bools:  return shobj->bvec.size();
+            case Storage::structs:
+                return shobj->svec.stride
+                    ? static_cast<size_type>(shobj->svec.buf.size() /
+                                             shobj->svec.stride)
+                    : 0;
             default:              return shobj->vec.size();
         }
     }

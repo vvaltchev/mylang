@@ -236,6 +236,8 @@ EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList)
             return SharedStr(string("floats"));
         case SharedArrayObj::Storage::bools:
             return SharedStr(string("bools"));
+        case SharedArrayObj::Storage::structs:
+            return SharedStr(string("structs"));
         default:
             return SharedStr(string("general"));
     }
@@ -323,6 +325,20 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     }
     if (arr.skind() == SharedArrayObj::Storage::bools && elem.is<bool>()) {
         arr.flat_bools().push_back(elem.get<bool>() ? 1 : 0);
+        return lval->get();
+    }
+    /* flat POD-struct array: append the element's bytes (the hot path that
+     * keeps a built-up array<Struct> unboxed). */
+    if (arr.skind() == SharedArrayObj::Storage::structs &&
+        elem.is<intrusive_ptr<StructObject>>() &&
+        elem.get<intrusive_ptr<StructObject>>()->is_pod() &&
+        elem.get<intrusive_ptr<StructObject>>()->def ==
+            arr.flat_structs().def) {
+        auto &sv = arr.flat_structs();
+        const StructObject &o = *elem.get<intrusive_ptr<StructObject>>().get();
+        const size_t at = sv.buf.size();
+        sv.buf.resize(at + sv.stride);
+        std::memcpy(sv.buf.data() + at, o.bytes.data(), sv.stride);
         return lval->get();
     }
 
@@ -502,7 +518,10 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
         return true;
     }
 
-    if (arr.skind() != SharedArrayObj::Storage::general)
+    /* A struct array has no flat insert fast path: fall through to get_vec(),
+     * which promotes it to general first (the cold-path cost). */
+    if (arr.skind() != SharedArrayObj::Storage::general &&
+        arr.skind() != SharedArrayObj::Storage::structs)
         throw TypeErrorEx(flat_array_violation_msg);
 
     auto &v = arr.get_vec();
