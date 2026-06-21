@@ -25,10 +25,16 @@ enum class FieldKind : unsigned char {
     f_bool, f_int, f_float, f_str, f_array, f_dict, f_dyn, f_struct
 };
 
+struct StructTypeDef;
+
 struct FieldDef {
     const UniqueId *name = nullptr;
     FieldKind kind = FieldKind::f_dyn;
     const UniqueId *struct_ty = nullptr;  /* when kind == f_struct */
+    /* For an f_struct field: the resolved nested type (if it was declared
+     * before this struct). Non-null AND POD => the field is embedded inline
+     * (recursive POD); otherwise the field is a boxed pointer. */
+    const StructTypeDef *struct_def = nullptr;
     bool is_opt = false;
     int slot = -1;        /* boxed: index into StructObject::fields */
     int offset = -1;      /* POD: byte offset into the bytes buffer; else -1 */
@@ -95,6 +101,28 @@ struct StructTypeDef {
      * struct boxed for now. Called once by the parser after the fields are
      * built.
      */
+    /* A field's POD size/align: a scalar's own metrics, or - for an f_struct
+     * field whose nested type is itself POD - that struct's size/align embedded
+     * inline (recursive POD). Returns false if the field can't be POD-inlined
+     * (a ref kind, an opt field, or a boxed/forward-ref struct field). */
+    static bool pod_field_metrics(const FieldDef &f, int &sz, int &al) {
+        if (f.is_opt)
+            return false;
+        const int s = pod_field_size(f.kind);
+        if (s >= 0) {
+            sz = s;
+            al = pod_field_align(f.kind);
+            return true;
+        }
+        if (f.kind == FieldKind::f_struct && f.struct_def &&
+            f.struct_def->is_pod()) {
+            sz = f.struct_def->size;
+            al = f.struct_def->align;
+            return true;
+        }
+        return false;
+    }
+
     void compute_layout() {
         layout = Layout::boxed;
         size = 0;
@@ -103,19 +131,19 @@ struct StructTypeDef {
         if (fields.empty())
             return;
 
+        int sz, al;
         for (const auto &f : fields)
-            if (f.is_opt || pod_field_size(f.kind) < 0)
-                return;                       /* not all non-opt scalars */
+            if (!pod_field_metrics(f, sz, al))
+                return;                       /* not all POD-inline-able */
 
         int cursor = 0, maxalign = 1;
         for (auto &f : fields) {
-            const int a = pod_field_align(f.kind);
-            const int s = pod_field_size(f.kind);
-            cursor = (cursor + a - 1) & ~(a - 1);   /* align up */
+            pod_field_metrics(f, sz, al);
+            cursor = (cursor + al - 1) & ~(al - 1);   /* align up */
             f.offset = cursor;
-            cursor += s;
-            if (a > maxalign)
-                maxalign = a;
+            cursor += sz;
+            if (al > maxalign)
+                maxalign = al;
         }
 
         size = (cursor + maxalign - 1) & ~(maxalign - 1);   /* tail padding */
@@ -175,6 +203,13 @@ public:
                 std::memcpy(&v, p, sizeof v);
                 return EvalValue(v);
             }
+            case FieldKind::f_struct: {
+                /* an inline nested POD struct: copy its bytes into a fresh one */
+                StructTypeDef *nd = const_cast<StructTypeDef *>(f.struct_def);
+                auto obj = make_intrusive<StructObject>(nd);
+                std::memcpy(obj->bytes.data(), p, nd->size);
+                return intrusive_ptr<StructObject>(obj);
+            }
             default:
                 throw InternalErrorEx();
         }
@@ -196,6 +231,13 @@ public:
             case FieldKind::f_float: {
                 float_type x = v.get<float_type>();
                 std::memcpy(p, &x, sizeof x);
+                break;
+            }
+            case FieldKind::f_struct: {
+                /* copy the value's bytes into the inline nested-struct slot */
+                const StructObject &o =
+                    *v.get<intrusive_ptr<StructObject>>().get();
+                std::memcpy(p, o.bytes.data(), f.struct_def->size);
                 break;
             }
             default:
