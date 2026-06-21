@@ -46,19 +46,21 @@ template <class LValueT>
 class SharedArrayObjTempl final {
 
 public:
-    typedef std::vector<LValueT>    vec_type;
-    typedef std::vector<int_type>   ivec_type;
-    typedef std::vector<float_type> fvec_type;
+    typedef std::vector<LValueT>      vec_type;
+    typedef std::vector<int_type>     ivec_type;
+    typedef std::vector<float_type>   fvec_type;
+    typedef std::vector<unsigned char> bvec_type;   /* one byte per bool */
 
     /*
-     * Backing-storage kind (see plans/typed-arrays.md). A homogeneous int/float
-     * array keeps an *unboxed* vector<int_type>/<float_type> (8-byte slots)
-     * instead of vector<LValue> (48-byte slots), which makes bulk ops
-     * (reverse/sort/sum/foreach) move ~6x less memory. get_vec() promotes a
-     * flat array to `general` on demand (any code needing LValue access); the
-     * hot ops branch on the kind and touch the flat vector directly.
+     * Backing-storage kind (see plans/typed-arrays.md). A homogeneous
+     * int/float/bool array keeps an *unboxed* vector instead of vector<LValue>
+     * (48-byte slots), which makes bulk ops (reverse/sort/sum/foreach) move far
+     * less memory: int/float are 8-byte slots, bool is a single byte (48x
+     * denser than general, ideal for sieves/bitmaps). mylang never promotes a
+     * flat array to general (representation is type-driven, fixed at creation);
+     * the hot ops branch on the kind and touch the flat vector directly.
      */
-    enum class Storage : unsigned char { general, ints, floats };
+    enum class Storage : unsigned char { general, ints, floats, bools };
 
 private:
     static constexpr size_type all_slices = static_cast<size_type>(-1);
@@ -76,6 +78,7 @@ private:
             vec_type  vec;     /* kind == general */
             ivec_type ivec;    /* kind == ints */
             fvec_type fvec;    /* kind == floats */
+            bvec_type bvec;    /* kind == bools */
         };
 
         std::unordered_set<SharedArrayObjTempl *> slices;
@@ -99,12 +102,16 @@ private:
         SharedObject(fvec_type &&a) : kind(Storage::floats) {
             new (&fvec) fvec_type(move(a));
         }
+        SharedObject(bvec_type &&a) : kind(Storage::bools) {
+            new (&bvec) bvec_type(move(a));
+        }
 
         ~SharedObject() {
             switch (kind) {
                 case Storage::general: vec.~vec_type();   break;
                 case Storage::ints:    ivec.~ivec_type(); break;
                 case Storage::floats:  fvec.~fvec_type(); break;
+                case Storage::bools:   bvec.~bvec_type(); break;
             }
         }
 
@@ -146,6 +153,13 @@ public:
         : shobj(make_intrusive<SharedObject>(move(arr)))
         , off(0)
         , len(shobj->fvec.size())
+        , slice(false)
+    { }
+
+    SharedArrayObjTempl(bvec_type &&arr)
+        : shobj(make_intrusive<SharedObject>(move(arr)))
+        , off(0)
+        , len(shobj->bvec.size())
         , slice(false)
     { }
 
@@ -249,8 +263,10 @@ public:
     Storage skind() const { return shobj->kind; }
     ivec_type &flat_ints()   { return shobj->ivec; }   /* skind()==ints */
     fvec_type &flat_floats() { return shobj->fvec; }   /* skind()==floats */
+    bvec_type &flat_bools()  { return shobj->bvec; }   /* skind()==bools */
     const ivec_type &flat_ints()   const { return shobj->ivec; }
     const fvec_type &flat_floats() const { return shobj->fvec; }
+    const bvec_type &flat_bools()  const { return shobj->bvec; }
 
     int_type use_count() const { return shobj.use_count(); }
 
@@ -267,6 +283,7 @@ public:
         switch (shobj->kind) {
             case Storage::ints:   return shobj->ivec.size();
             case Storage::floats: return shobj->fvec.size();
+            case Storage::bools:  return shobj->bvec.size();
             default:              return shobj->vec.size();
         }
     }

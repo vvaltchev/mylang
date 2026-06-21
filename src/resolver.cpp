@@ -73,7 +73,15 @@ void for_each_child(Construct *c, const std::function<void(Construct *)> &fn);
  * slotted binding while still resolving to a runtime map lookup.
  */
 struct Scope {
-    std::vector<std::pair<const UniqueId *, int>> decls;
+    /* name -> { slot (or -1 = masked/map), explicit-type annotation }. The
+     * annotation is propagated to every use so an assignment can coerce a
+     * widening value to the declared type (e.g. `float f; f = 3;` stores 3.0). */
+    struct Decl {
+        const UniqueId *name;
+        int slot;
+        DeclType type;
+    };
+    std::vector<Decl> decls;
 };
 
 /*
@@ -118,6 +126,26 @@ static bool is_lvalue_arg_builtin(std::string_view name)
     return name == "append" || name == "push" || name == "pop"
         || name == "insert" || name == "erase" || name == "intptr"
         || name == "undef";
+}
+
+/*
+ * Coerce a const-folded value to a declared scalar type when inlining a typed
+ * var/const (`float f = 3` -> 3.0). Mirrors eval.cpp's coerce_to_decl_type (a
+ * separate TU); the inferencer has already validated assignability, so this only
+ * applies the numeric widenings (float <- int/bool, int <- bool).
+ */
+static EvalValue coerce_decl_scalar(const EvalValue &v, DeclType dt)
+{
+    if (dt == DeclType::f) {
+        if (v.is<int_type>())
+            return EvalValue(static_cast<float_type>(v.get<int_type>()));
+        if (v.is<bool>())
+            return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+    } else if (dt == DeclType::i) {
+        if (v.is<bool>())
+            return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    return v;
 }
 
 /* True if `v` is a read-only (const-backed) array or dict value. Mirrors the
@@ -237,8 +265,7 @@ private:
             result = arg->is_const;
         }
 
-        MakeConstructFromConstVal(
-            EvalValue(static_cast<int_type>(result)), slot, false);
+        MakeConstructFromConstVal(EvalValue(result), slot, false);
     }
 
     /*
@@ -424,7 +451,8 @@ private:
                             analysis->mark(id->start,
                                 static_cast<int>(id->get_str().length()),
                                 AnnoKind::auto_const);
-                        fc.consts[id->sym.slot] = e14->rvalue->eval(&cctx);
+                        fc.consts[id->sym.slot] = coerce_decl_scalar(
+                            e14->rvalue->eval(&cctx), id->decl_type);
                         continue;
                     }
 
@@ -786,12 +814,12 @@ private:
         const bool keep_in_map = cur->is_main && escaped.count(id->uid);
 
         if (keep_in_map || cur->next_slot >= MAX_SLOTS) {
-            cur->scopes.back().decls.push_back({ id->uid, -1 });
+            cur->scopes.back().decls.push_back({ id->uid, -1, id->decl_type });
             return;
         }
 
         const int slot = cur->next_slot++;
-        cur->scopes.back().decls.push_back({ id->uid, slot });
+        cur->scopes.back().decls.push_back({ id->uid, slot, id->decl_type });
         cur->writes.push_back(1);   /* the declaration is write #1 */
         id->sym = ResolvedSym{ SymKind::local, slot };
     }
@@ -807,14 +835,14 @@ private:
             return;
 
         check_no_redecl(cur, id);
-        cur->scopes.back().decls.push_back({ id->uid, -1 });
+        cur->scopes.back().decls.push_back({ id->uid, -1, id->decl_type });
     }
 
     /* Throw AlreadyDefinedEx if `id` is already declared in this scope. */
     void check_no_redecl(FuncState *cur, Identifier *id) const
     {
         for (const auto &d : cur->scopes.back().decls) {
-            if (d.first == id->uid)
+            if (d.name == id->uid)
                 throw AlreadyDefinedEx(id->start, id->end);
         }
     }
@@ -834,9 +862,12 @@ private:
         if (cur->slottable) {
             for (auto s = cur->scopes.rbegin(); s != cur->scopes.rend(); ++s) {
                 for (const auto &d : s->decls) {
-                    if (d.first == id->uid) {
-                        if (d.second >= 0)
-                            id->sym = ResolvedSym{ SymKind::local, d.second };
+                    if (d.name == id->uid) {
+                        if (d.slot >= 0)
+                            id->sym = ResolvedSym{ SymKind::local, d.slot };
+                        /* Carry the declared type to the use so an assignment
+                         * can coerce a widening value (float f; f = 3). */
+                        id->decl_type = d.type;
                         return;     /* found (slotted or masked) */
                     }
                 }
@@ -1025,7 +1056,7 @@ Resolver::process_function(FuncDeclStmt *fd)
         for (int i = 0; i < nparams; i++) {
             Identifier *p = fd->params->elems[i].get();
             check_no_redecl(&st, p);   /* duplicate param -> error */
-            st.scopes.back().decls.push_back({ p->uid, i });
+            st.scopes.back().decls.push_back({ p->uid, i, p->decl_type });
             st.writes.push_back(0);   /* binding isn't a body write */
             p->sym = ResolvedSym{ SymKind::local, i };
         }
@@ -1154,7 +1185,7 @@ Resolver::walk(Construct *c, FuncState *cur)
              * Then do_eval needs no EvalContext of its own. */
             bool all_slotted = true;
             for (const auto &d : cur->scopes.back().decls)
-                if (d.second < 0) { all_slotted = false; break; }
+                if (d.slot < 0) { all_slotted = false; break; }
             b->scope_free = all_slotted;
 
             cur->scopes.pop_back();
@@ -2244,6 +2275,8 @@ private:
     {
         if (v.is<int_type>())
             return "i" + std::to_string(v.get<int_type>());
+        if (v.is<bool>())
+            return v.get<bool>() ? "bT" : "bF";
         if (v.is<float_type>())
             return "f" + std::to_string(
                 static_cast<double>(v.get<float_type>()));

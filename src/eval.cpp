@@ -184,7 +184,10 @@ LiteralStr::LiteralStr(const std::string_view &v)
  */
 int_type Construct::eval_int(EvalContext *ctx) const
 {
-    return RValue(eval(ctx)).get<int_type>();
+    const EvalValue v = RValue(eval(ctx));
+    if (v.is<bool>())
+        return v.get<bool>() ? 1 : 0;     /* bool promotes to int 0/1 */
+    return v.get<int_type>();
 }
 
 float_type Construct::eval_float(EvalContext *ctx) const
@@ -192,6 +195,8 @@ float_type Construct::eval_float(EvalContext *ctx) const
     const EvalValue v = RValue(eval(ctx));
     if (v.is<int_type>())
         return static_cast<float_type>(v.get<int_type>());
+    if (v.is<bool>())
+        return v.get<bool>() ? 1.0 : 0.0;
     return v.get<float_type>();
 }
 
@@ -201,8 +206,12 @@ float_type Construct::eval_float(EvalContext *ctx) const
 int_type Identifier::eval_int(EvalContext *ctx) const
 {
     if (sym.kind == SymKind::local && ctx->frame &&
-        (ctx->frame->live & (static_cast<uint64_t>(1) << sym.slot)))
-        return ctx->frame->slots[sym.slot].getval<int_type>();
+        (ctx->frame->live & (static_cast<uint64_t>(1) << sym.slot))) {
+        const LValue &lv = ctx->frame->slots[sym.slot];
+        if (lv.is<bool>())
+            return lv.getval<bool>() ? 1 : 0;   /* bool slot -> int 0/1 */
+        return lv.getval<int_type>();
+    }
     return Construct::eval_int(ctx);
 }
 
@@ -213,6 +222,8 @@ float_type Identifier::eval_float(EvalContext *ctx) const
         const LValue &lv = ctx->frame->slots[sym.slot];
         if (lv.is<int_type>())
             return static_cast<float_type>(lv.getval<int_type>());
+        if (lv.is<bool>())
+            return lv.getval<bool>() ? 1.0 : 0.0;
         return lv.getval<float_type>();
     }
     return Construct::eval_float(ctx);
@@ -269,10 +280,15 @@ do_func_return(EvalValue &&tmp, Construct *retExpr)
     return RValue(tmp);
 }
 
+static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt);
+
 /*
  * Bind one parameter. When `frame` is set (the function was resolved), the
  * value goes into its fixed slot and the slot is marked live; otherwise it is
  * emplaced into the args context map (the unresolved / const-eval path).
+ *
+ * A param with an explicit numeric type coerces a widening argument to it
+ * (`func f(float x); f(3)` binds 3.0), via the same rule as a typed variable.
  */
 static inline void
 bind_param(EvalContext *args_ctx,
@@ -282,6 +298,9 @@ bind_param(EvalContext *args_ctx,
            EvalValue val,
            bool is_const)
 {
+    if (param->decl_type == DeclType::f || param->decl_type == DeclType::i)
+        val = coerce_to_decl_type(val, param->decl_type);
+
     if (frame) {
         frame->slots[idx] = LValue(move(val), is_const);
         frame->live |= static_cast<uint64_t>(1) << idx;
@@ -291,11 +310,31 @@ bind_param(EvalContext *args_ctx,
 }
 
 /*
+ * The minimum number of arguments a call must supply: 1 + the index of the last
+ * non-`opt` parameter (0 if every parameter is `opt`). Trailing `opt` params
+ * may be omitted by the caller; an omitted one binds to `none`. A non-opt param
+ * after an opt one simply raises the minimum to include it (it can't be
+ * skipped), so `f(x, opt y, z)` still requires all three.
+ */
+static size_t
+min_required_args(const vector<unique_ptr<Identifier>> &params)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < params.size(); i++)
+        if (!params[i]->opt_mod)
+            n = i + 1;
+    return n;
+}
+
+/*
  * Bind call arguments to the function's parameters. There is one overload per
  * argument representation - unevaluated argument expressions (the normal call
  * path), an already-evaluated value vector, a single value, and a pair (used by
  * builtins that invoke a callback). Each evaluates/forwards the args and hands
  * the actual storage to bind_param (slot Frame when resolved, else the map).
+ *
+ * The caller may pass between min_required_args() and funcParams.size()
+ * arguments; any trailing `opt` parameter it omits is bound to `none`.
  */
 static void
 do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
@@ -304,10 +343,11 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     EvalContext *args_ctx,
                     Frame *frame)
 {
-    if (args.size() != funcParams.size())
+    const size_t nparams = funcParams.size();
+    if (args.size() > nparams || args.size() < min_required_args(funcParams))
         throw InvalidNumberOfArgsEx();
 
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < nparams; i++) {
         /*
          * A param's binding is const iff it was declared `const` - NOT merely
          * because we are const-evaluating. This lets a (pure) function reassign
@@ -316,7 +356,8 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
          */
         bind_param(
             args_ctx, frame, i, funcParams[i].get(),
-            RValue(args[i]->eval(ctx)), funcParams[i]->const_param
+            i < args.size() ? RValue(args[i]->eval(ctx)) : EvalValue(),
+            funcParams[i]->const_param
         );
     }
 }
@@ -328,12 +369,14 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     EvalContext *args_ctx,
                     Frame *frame)
 {
-    if (args.size() != funcParams.size())
+    const size_t nparams = funcParams.size();
+    if (args.size() > nparams || args.size() < min_required_args(funcParams))
         throw InvalidNumberOfArgsEx();
 
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < nparams; i++) {
         bind_param(
-            args_ctx, frame, i, funcParams[i].get(), args[i], ctx->const_ctx
+            args_ctx, frame, i, funcParams[i].get(),
+            i < args.size() ? args[i] : EvalValue(), ctx->const_ctx
         );
     }
 }
@@ -345,10 +388,13 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     EvalContext *args_ctx,
                     Frame *frame)
 {
-    if (funcParams.size() != 1)
+    const size_t nparams = funcParams.size();
+    if (nparams < 1 || min_required_args(funcParams) > 1)
         throw InvalidNumberOfArgsEx();
 
-    bind_param(args_ctx, frame, 0, funcParams[0].get(), arg, ctx->const_ctx);
+    for (size_t i = 0; i < nparams; i++)
+        bind_param(args_ctx, frame, i, funcParams[i].get(),
+                   i == 0 ? arg : EvalValue(), ctx->const_ctx);
 }
 
 
@@ -359,13 +405,14 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     EvalContext *args_ctx,
                     Frame *frame)
 {
-    if (funcParams.size() != 2)
+    const size_t nparams = funcParams.size();
+    if (nparams < 2 || min_required_args(funcParams) > 2)
         throw InvalidNumberOfArgsEx();
 
-    bind_param(args_ctx, frame, 0, funcParams[0].get(), args.first,
-               ctx->const_ctx);
-    bind_param(args_ctx, frame, 1, funcParams[1].get(), args.second,
-               ctx->const_ctx);
+    for (size_t i = 0; i < nparams; i++)
+        bind_param(args_ctx, frame, i, funcParams[i].get(),
+                   i == 0 ? args.first : i == 1 ? args.second : EvalValue(),
+                   ctx->const_ctx);
 }
 
 /*
@@ -549,14 +596,15 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     const size_t n = elems.size();
     SharedArrayObj::ivec_type ivec;
     SharedArrayObj::fvec_type fvec;
+    SharedArrayObj::bvec_type bvec;
     SharedArrayObj::vec_type  gvec;
     /*
-     * 0 = empty, 1 = ints, 2 = floats, 3 = general. Type-driven: a literal
-     * bound to a dynamically-typed destination (arr_hint general, set by the
-     * inferencer) is built general from the start, so a later mixed write to it
-     * never has to promote. (The flat_i/flat_f hints need no special case - the
-     * value-driven scan already produces flat for an all-int/all-float literal,
-     * which is exactly when those hints are set.)
+     * 0 = empty, 1 = ints, 2 = floats, 4 = bools, 3 = general. Type-driven: a
+     * literal bound to a dynamically-typed destination (arr_hint general, set by
+     * the inferencer) is built general from the start, so a later mixed write to
+     * it never has to promote. (The flat_i/flat_f/flat_b hints need no special
+     * case - the value-driven scan already produces flat for an all-one-kind
+     * literal, which is exactly when those hints are set.)
      */
     int mode = arr_hint == ArrHint::general ? 3 : 0;
     if (mode == 3)
@@ -570,8 +618,13 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         else if (mode == 2)
             for (float_type x : fvec)
                 gvec.emplace_back(EvalValue(x), ctx->const_ctx);
+        else if (mode == 4)
+            for (unsigned char x : bvec)
+                gvec.emplace_back(EvalValue(static_cast<bool>(x)),
+                                  ctx->const_ctx);
         ivec.clear();
         fvec.clear();
+        bvec.clear();
         mode = 3;
     };
 
@@ -584,6 +637,8 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
                 mode = 1; ivec.push_back(v.get<int_type>());
             } else if (v.is<float_type>()) {
                 mode = 2; fvec.push_back(v.get<float_type>());
+            } else if (v.is<bool>()) {
+                mode = 4; bvec.push_back(v.get<bool>() ? 1 : 0);
             } else {
                 mode = 3; gvec.reserve(n);
                 gvec.emplace_back(v, ctx->const_ctx);
@@ -592,6 +647,8 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
             ivec.push_back(v.get<int_type>());
         } else if (mode == 2 && v.is<float_type>()) {
             fvec.push_back(v.get<float_type>());
+        } else if (mode == 4 && v.is<bool>()) {
+            bvec.push_back(v.get<bool>() ? 1 : 0);
         } else {
             if (mode != 3)
                 spill_to_general();
@@ -601,6 +658,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 
     if (mode == 1) return SharedArrayObj(move(ivec));
     if (mode == 2) return SharedArrayObj(move(fvec));
+    if (mode == 4) return SharedArrayObj(move(bvec));
     return SharedArrayObj(move(gvec));
 }
 
@@ -653,6 +711,14 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
             return SharedArrayObj(SharedArrayObj::fvec_type(
                 fv.cbegin() + arr.offset(),
                 fv.cbegin() + arr.offset() + arr.size()
+            ));
+        }
+
+        if (arr.skind() == SharedArrayObj::Storage::bools) {
+            const auto &bv = arr.flat_bools();
+            return SharedArrayObj(SharedArrayObj::bvec_type(
+                bv.cbegin() + arr.offset(),
+                bv.cbegin() + arr.offset() + arr.size()
             ));
         }
 
@@ -755,6 +821,17 @@ make_const_clone(const EvalValue &v)
             return arr;
         }
 
+        if (src.skind() == SharedArrayObj::Storage::bools) {
+            const auto &bv = src.flat_bools();
+            SharedArrayObj::bvec_type nv(
+                bv.cbegin() + src.offset(),
+                bv.cbegin() + src.offset() + src.size()
+            );
+            SharedArrayObj arr(move(nv));
+            arr.set_readonly();
+            return arr;
+        }
+
         const ArrayConstView &view = src.get_view();
 
         SharedArrayObj::vec_type vec;
@@ -809,10 +886,15 @@ make_general_array_clone(const SharedArrayObj &src)
         const auto &iv = src.flat_ints();
         for (size_type i = 0; i < m; i++)
             gv.emplace_back(EvalValue(iv[src.offset() + i]), false);
-    } else {
+    } else if (src.skind() == SharedArrayObj::Storage::floats) {
         const auto &fv = src.flat_floats();
         for (size_type i = 0; i < m; i++)
             gv.emplace_back(EvalValue(fv[src.offset() + i]), false);
+    } else {
+        const auto &bv = src.flat_bools();
+        for (size_type i = 0; i < m; i++)
+            gv.emplace_back(EvalValue(static_cast<bool>(bv[src.offset() + i])),
+                            false);
     }
 
     return SharedArrayObj(move(gv));
@@ -832,6 +914,8 @@ arr_elem_boxed(const SharedArrayObj &a, size_type i)
             return EvalValue(a.flat_ints()[a.offset() + i]);
         case SharedArrayObj::Storage::floats:
             return EvalValue(a.flat_floats()[a.offset() + i]);
+        case SharedArrayObj::Storage::bools:
+            return EvalValue(static_cast<bool>(a.flat_bools()[a.offset() + i]));
         default:
             return a.get_view()[i].get();
     }
@@ -899,11 +983,15 @@ num_binop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx,
 static void
 logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx, Op op)
 {
+    /*
+     * `&&` / `||` operate on truthiness (the unchanged truthy rules:
+     * 0/none/[]/{} are false, everything else true) and yield a bool. This
+     * works for any operand type, not just int, and returns a real bool.
+     */
     try {
-        if (op == Op::land)
-            acc.get_type()->land(acc, RValue(operand->eval(ctx)));
-        else
-            acc.get_type()->lor(acc, RValue(operand->eval(ctx)));
+        const bool a = acc.is_true();
+        const bool b = RValue(operand->eval(ctx)).is_true();
+        acc = EvalValue(op == Op::land ? (a && b) : (a || b));
     } catch (Exception &e) {
         stamp_operand_loc(operand, e);
         throw;
@@ -940,15 +1028,19 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::plus:
-                /* Unary operator '+': do nothing */
+                /* Unary operator '+': promote a bool to int 0/1, else no-op */
+                if (val.is<bool>())
+                    val = static_cast<int_type>(val.get<bool>() ? 1 : 0);
                 break;
             case Op::minus:
-                /* Unary operator '-': negate */
+                /* Unary operator '-': negate (a bool promotes to int first) */
+                if (val.is<bool>())
+                    val = static_cast<int_type>(val.get<bool>() ? 1 : 0);
                 val.get_type()->opneg(val);
                 break;
             case Op::lnot:
-                /* Unary operator '!': logial not */
-                val.get_type()->lnot(val);
+                /* Unary '!': logical not of the truthiness, yielding a bool */
+                val = EvalValue(!val.is_true());
                 break;
             default:
                 throw InternalErrorEx();
@@ -1037,7 +1129,8 @@ EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    /* an ordering comparison (<, >, <=, >=) yields a bool */
+    return EvalValue(val.is_true());
 }
 
 EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
@@ -1060,7 +1153,8 @@ EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    /* `==` / `!=` yield a bool */
+    return EvalValue(val.is_true());
 }
 
 EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
@@ -1222,6 +1316,10 @@ float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
 
 EvalValue TypedScalarExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    /* Comparisons / logical / `!` yield a bool (computed unboxed as 0/1 by
+     * eval_int, then boxed as a bool). Arithmetic / negation keep int/float. */
+    if (cat == Cat::cmp || cat == Cat::logical || cat == Cat::lnot)
+        return EvalValue(eval_int(ctx) != 0);
     if ((cat == Cat::arith || cat == Cat::neg) && kind == TypeHint::f)
         return EvalValue(eval_float(ctx));
     return EvalValue(eval_int(ctx));
@@ -1356,6 +1454,7 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
         return false;
 
     const bool kind_int = arr.skind() == SharedArrayObj::Storage::ints;
+    const bool kind_bool = arr.skind() == SharedArrayObj::Storage::bools;
 
     /* Committed to the flat path now: evaluate the index exactly once. */
     const EvalValue idx_v = RValue(sub->index->eval(ctx));
@@ -1377,14 +1476,15 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
     if (op == Op::assign) {
         newval = r;
     } else {
-        newval = kind_int ? EvalValue(arr.flat_ints()[at0])
-                          : EvalValue(arr.flat_floats()[at0]);
+        newval = arr_elem_boxed(arr, idx);   /* read current element, any kind */
         apply_compound_op(newval, r, op);
     }
 
     const bool fits = kind_int
         ? newval.is<int_type>()
-        : (newval.is<float_type>() || newval.is<int_type>());
+        : kind_bool
+            ? newval.is<bool>()
+            : (newval.is<float_type>() || newval.is<int_type>());
 
     if (!fits) {
         /*
@@ -1415,6 +1515,8 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
     const size_type at = arr.offset() + idx;
     if (kind_int) {
         arr.flat_ints()[at] = newval.get<int_type>();
+    } else if (kind_bool) {
+        arr.flat_bools()[at] = newval.get<bool>() ? 1 : 0;
     } else {
         arr.flat_floats()[at] = newval.is<int_type>()
             ? static_cast<float_type>(newval.get<int_type>())
@@ -1425,13 +1527,54 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
     return true;
 }
 
+/*
+ * Coerce a value to a declared scalar type's storage on a typed assignment /
+ * declaration: a `float` variable stores an int/bool as a float, an `int`
+ * variable stores a bool as an int (the numeric-widening coercions of the
+ * `bool <= int <= float` chain). So `float f = 3;` and a later `f = 5;` actually
+ * hold a float, not an int. Other declared types (str/bool/array/dict) and
+ * non-widening values pass through unchanged; the inferencer has already
+ * rejected anything not assignable to the declared type.
+ */
+static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
+{
+    if (dt == DeclType::f) {
+        if (v.is<int_type>())
+            return EvalValue(static_cast<float_type>(v.get<int_type>()));
+        if (v.is<bool>())
+            return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+    } else if (dt == DeclType::i) {
+        if (v.is<bool>())
+            return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    return v;
+}
+
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,
                      Op op,
                      Construct *lvalue,
-                     const EvalValue &rval)
+                     const EvalValue &rval_in)
 {
+    /*
+     * For a plain `=` to an explicitly-typed scalar variable, coerce a widening
+     * value to the declared type (float <- int/bool, int <- bool). The decl's
+     * type is on the Identifier (the resolver also copied it to every use, so a
+     * later reassignment coerces too). Compound ops (`+=`) already produce the
+     * right type via num_bin_op, so only `assign` is handled here.
+     */
+    EvalValue rval_storage;
+    const EvalValue *rvalp = &rval_in;
+    if (op == Op::assign && lvalue->is_id()) {
+        const DeclType dt = static_cast<const Identifier *>(lvalue)->decl_type;
+        if (dt == DeclType::f || dt == DeclType::i) {
+            rval_storage = coerce_to_decl_type(RValue(rval_in), dt);
+            rvalp = &rval_storage;
+        }
+    }
+    const EvalValue &rval = *rvalp;
+
     /*
      * Fast path: declaring a resolved local. Write its slot and mark it live.
      * The resolver already rejected illegal same-block redeclarations and the
@@ -1924,6 +2067,8 @@ int_type Subscript::eval_int(EvalContext *ctx) const
         const size_type at = arr.offset() + idx;
         if (arr.skind() == SharedArrayObj::Storage::ints)
             return arr.flat_ints()[at];     /* unboxed: no promotion */
+        if (arr.skind() == SharedArrayObj::Storage::bools)
+            return arr.flat_bools()[at] ? 1 : 0;   /* bool elem -> int 0/1 */
         return arr.get_vec()[at].getval<int_type>();
     }
     return Construct::eval_int(ctx);
@@ -1947,6 +2092,8 @@ float_type Subscript::eval_float(EvalContext *ctx) const
             return arr.flat_floats()[at];   /* unboxed: no promotion */
         if (arr.skind() == SharedArrayObj::Storage::ints)
             return static_cast<float_type>(arr.flat_ints()[at]);
+        if (arr.skind() == SharedArrayObj::Storage::bools)
+            return arr.flat_bools()[at] ? 1.0 : 0.0;
         const LValue &el = arr.get_vec()[at];
         if (el.is<int_type>())
             return static_cast<float_type>(el.getval<int_type>());
@@ -2289,6 +2436,17 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
             for (size_type i = 0; i < n; i++) {
                 const EvalValue elem(fv[off + i]);
+                if (!do_iter(&loopCtx, i, &elem, 1))
+                    break;
+            }
+
+        } else if (arr.skind() == SharedArrayObj::Storage::bools) {
+
+            const auto &bv = arr.flat_bools();
+            const size_type off = arr.offset(), n = arr.size();
+
+            for (size_type i = 0; i < n; i++) {
+                const EvalValue elem(static_cast<bool>(bv[off + i]));
                 if (!do_iter(&loopCtx, i, &elem, 1))
                     break;
             }

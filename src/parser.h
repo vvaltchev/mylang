@@ -12,6 +12,7 @@
 class EvalContext;
 class Block;
 struct AnalysisInfo;
+enum class DeclType : unsigned char;   /* defined in syntax.h */
 
 /*
  * Parse-time common-subexpression cache (de-duplication of const array/dict
@@ -39,6 +40,16 @@ public:
             return *pos;
 
         return invalid_tok;
+    }
+
+    /* Look ahead `n` tokens without consuming (n == 0 is get()). */
+    const Tok &peek(int n) const {
+
+        auto p = pos;
+        for (int i = 0; i < n && p != end; i++)
+            ++p;
+
+        return p != end ? *p : invalid_tok;
     }
 
     void next() {
@@ -70,9 +81,20 @@ public:
     ParseContext(const TokenStream &ts, bool const_eval);
     ~ParseContext(); // out-of-line: CseCache is incomplete here (PIMPL)
 
+    /*
+     * A declaration's pending explicit-type annotation (e.g. the `int` in
+     * `int x = 5`), set by pStmt/pFuncParam after recognizing the type keyword
+     * and consumed where the decl's Identifier is built (pExpr14 / pFuncParam).
+     * Transient: it applies to exactly the next declared identifier.
+     * Initialized to DeclType::none in the (out-of-line) constructor, since the
+     * enumerators aren't visible here (only a forward declaration).
+     */
+    DeclType pending_decl_type;
+
     /* token operations */
     const Tok &operator*() const { return ts.get(); }
     const Tok &get_tok() const { return ts.get(); }
+    const Tok &peek_tok(int n) const { return ts.peek(n); }
     Op get_op() const { return ts.get().op; }
     Loc get_loc() const { return ts.get().loc; }
     std::string_view get_str() const { return ts.get().value; }

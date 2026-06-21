@@ -55,7 +55,7 @@ ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
     , const_ctx(const_ctx_owner.get())
     , cse(new CseCache)
 {
-
+    pending_decl_type = DeclType::none;
 }
 
 ParseContext::~ParseContext() = default;
@@ -79,6 +79,126 @@ unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl); // ops: = (assignme
 
 unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl);
 unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl);
+
+/*
+ * Map an identifier string to an explicit-type DeclType, or `none` if it is not
+ * one of the primitive type keywords. These names stay ordinary identifiers
+ * (the builtins int()/float()/str()/array()/dict() and the bare `bool`); they
+ * are treated as a type only in declaration position, where the next token is
+ * the variable/parameter name (so `int(5)`, `map(int, a)` remain plain uses).
+ */
+bool pAcceptKeyword(ParseContext &c, Keyword exp);   /* defined below */
+
+static DeclType type_keyword(std::string_view s)
+{
+    if (s == "int")   return DeclType::i;
+    if (s == "float") return DeclType::f;
+    if (s == "str")   return DeclType::s;
+    if (s == "bool")  return DeclType::b;
+    if (s == "array") return DeclType::arr;
+    if (s == "dict")  return DeclType::dict;
+    return DeclType::none;
+}
+
+/*
+ * A `const` scalar is inlined (and its decl dropped) at parse time, BEFORE the
+ * inferencer runs, so a `const int x = ...` annotation must be checked here
+ * rather than later. Verify the folded value against the declared scalar type
+ * and apply the numeric widening coercion (float <- int/bool, int <- bool), so
+ * `const float x = 3` inlines 3.0 and `const int x = 3.5` is a compile error.
+ * `array`/`dict` consts are kept as runtime symbols and checked by the
+ * inferencer, so they pass through unchanged.
+ */
+static EvalValue
+check_coerce_const_scalar(const EvalValue &v, DeclType dt, Loc s, Loc e)
+{
+    bool ok = true;
+    EvalValue out = v;
+
+    switch (dt) {
+        case DeclType::b: ok = v.is<bool>(); break;
+        case DeclType::s: ok = v.is<SharedStr>(); break;
+        case DeclType::i:
+            if (v.is<int_type>())   { /* exact */ }
+            else if (v.is<bool>())
+                out = EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+            else ok = false;
+            break;
+        case DeclType::f:
+            if (v.is<float_type>()) { /* exact */ }
+            else if (v.is<int_type>())
+                out = EvalValue(static_cast<float_type>(v.get<int_type>()));
+            else if (v.is<bool>())
+                out = EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+            else ok = false;
+            break;
+        default: return v;   /* array/dict: checked by the inferencer */
+    }
+
+    if (!ok)
+        throw TypeMismatchEx(
+            "const value does not match its declared type", s, e);
+    return out;
+}
+
+/*
+ * Recognize and consume a declaration prefix at the start of a statement or a
+ * `for`-loop initializer, setting the pInDecl / pInConstDecl / pInOptDecl /
+ * pInDynDecl flags on `fl` and ParseContext::pending_decl_type for a type. The
+ * forms are: `var [opt] [dyn]`, `const [opt] [dyn]`, or an explicit type
+ * `[const] [opt] TYPE` (bool/int/float/str/array/dict). A type keyword is an
+ * ordinary identifier, so it is a type only when - after an optional
+ * `const`/`opt` - it is followed by the variable name (another identifier);
+ * `int(5)`, `array(n)`, `map(int, a)` therefore stay plain uses. No-op if no
+ * declaration prefix is present.
+ */
+static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
+{
+    int k = 0;
+    const bool tc = c.peek_tok(k) == Keyword::kw_const ? (k++, true) : false;
+    const bool to = c.peek_tok(k) == Keyword::kw_opt ? (k++, true) : false;
+    const DeclType dt = c.peek_tok(k) == TokType::id
+        ? type_keyword(c.peek_tok(k).value) : DeclType::none;
+
+    if (dt != DeclType::none && c.peek_tok(k + 1) == TokType::id) {
+        for (int j = 0; j <= k; j++)   /* const?, opt?, TYPE */
+            c.next();
+        fl |= pFlags::pInDecl;
+        if (tc) fl |= pFlags::pInConstDecl;
+        if (to) fl |= pFlags::pInOptDecl;
+        c.pending_decl_type = dt;
+        return;
+    }
+
+    if (pAcceptKeyword(c, Keyword::kw_var))
+        fl |= pFlags::pInDecl;
+    else if (pAcceptKeyword(c, Keyword::kw_const))
+        fl |= pFlags::pInDecl | pFlags::pInConstDecl;
+
+    /* `var`/`const` may be followed by the `opt` and/or `dyn` type modifiers,
+     * in order (`opt dyn` = nullable, dynamically typed). */
+    if (fl & pFlags::pInDecl) {
+        if (pAcceptKeyword(c, Keyword::kw_opt))
+            fl |= pFlags::pInOptDecl;
+        if (pAcceptKeyword(c, Keyword::kw_dyn))
+            fl |= pFlags::pInDynDecl;
+    }
+}
+
+/* The zero value of an explicit type, for an uninitialized typed declaration
+ * (`int x;` -> 0, `bool b;` -> false, `array a;` -> [], etc.). */
+static unique_ptr<Construct> zero_value_literal(DeclType dt)
+{
+    switch (dt) {
+        case DeclType::b:    return make_unique<LiteralBool>(false);
+        case DeclType::i:    return make_unique<LiteralInt>(0);
+        case DeclType::f:    return make_unique<LiteralFloat>(0.0);
+        case DeclType::s:    return make_unique<LiteralStr>(std::string_view());
+        case DeclType::arr:  return make_unique<LiteralArray>();
+        case DeclType::dict: return make_unique<LiteralDict>();
+        default:             return make_unique<LiteralNone>();
+    }
+}
 
 bool
 pAcceptKeyword(ParseContext &c, Keyword exp);
@@ -161,14 +281,14 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 
     } else if (pAcceptKeyword(c, Keyword::kw_true)) {
 
-        v.reset(new LiteralInt(1));
+        v.reset(new LiteralBool(true));
         v->start = start;
         v->end = c.get_loc() + 5;
         return true;
 
     } else if (pAcceptKeyword(c, Keyword::kw_false)) {
 
-        v.reset(new LiteralInt(0));
+        v.reset(new LiteralBool(false));
         v->start = start;
         v->end = c.get_loc() + 6;
         return true;
@@ -351,10 +471,25 @@ pFuncParam(ParseContext &c, unsigned fl)
         if (pAcceptKeyword(c, Keyword::kw_dyn))   { is_dyn = true;   got_mod = true; }
     } while (got_mod);
 
+    /*
+     * An explicit primitive type before the name: `func f(int x, str s)`.
+     * Recognized like at statement level - the type keyword (an identifier) is
+     * a type only when followed by the parameter name. `dyn` (no static type)
+     * is mutually exclusive with a type keyword.
+     */
+    DeclType dt = DeclType::none;
+    if (!is_dyn && *c == TokType::id) {
+        const DeclType maybe = type_keyword(c.get_str());
+        if (maybe != DeclType::none && c.peek_tok(1) == TokType::id) {
+            dt = maybe;
+            c.next();                          /* consume the type keyword */
+        }
+    }
+
     unique_ptr<Construct> ret;
 
     if (!pAcceptId(c, ret, false /* resolve_const */)) {
-        if (is_const || is_opt || is_dyn)
+        if (is_const || is_opt || is_dyn || dt != DeclType::none)
             throw SyntaxErrorEx(
                 c.get_loc(),
                 "Expected parameter name after modifier, got",
@@ -367,6 +502,7 @@ pFuncParam(ParseContext &c, unsigned fl)
     id->const_param = is_const;
     id->opt_mod = is_opt;
     id->dyn_mod = is_dyn;
+    id->decl_type = dt;
     return id;
 }
 
@@ -955,12 +1091,20 @@ pExpr14(ParseContext &c, unsigned fl)
 
         if (fl & pFlags::pInDecl) {
 
-            /* But we're in a decl (var or const): assume `none` as rvalue */
-
+            /*
+             * A decl with no initializer. A plain `var x;` assumes `none`; an
+             * explicitly-typed `int x;` / `str s;` assumes the type's zero value
+             * (0 / 0.0 / false / "" / [] / {}), so a non-null typed var is never
+             * left `none`.
+             */
             ret.reset(new Expr14);
             ret->op = Op::assign;
             ret->lvalue = move(lside);
-            ret->rvalue.reset(new LiteralNone());
+            /* An `opt` typed decl (nullable) defaults to none; a non-opt typed
+             * decl to its type's zero value; a plain `var` to none. */
+            ret->rvalue = (fl & pFlags::pInOptDecl)
+                ? unique_ptr<Construct>(new LiteralNone())
+                : zero_value_literal(c.pending_decl_type);
 
         } else if (in_idlist) {
 
@@ -1010,6 +1154,21 @@ pExpr14(ParseContext &c, unsigned fl)
         }
     }
 
+    /* Propagate an explicit-type annotation (`int x = ...`) onto the declared
+     * identifier(s) for the inferencer/resolver. Consume the pending type. */
+    if ((fl & pFlags::pInDecl) && c.pending_decl_type != DeclType::none) {
+
+        const DeclType dt = c.pending_decl_type;
+        c.pending_decl_type = DeclType::none;
+
+        if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
+            id->decl_type = dt;
+        } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
+            for (auto &e : idl->elems)
+                e->decl_type = dt;
+        }
+    }
+
     if (!ret->rvalue)
         noExprError(c);
 
@@ -1039,6 +1198,23 @@ pExpr14(ParseContext &c, unsigned fl)
 
         if (!ret->rvalue->is_const)
             throw ExpressionIsNotConstEx(ret->rvalue->start, ret->rvalue->end);
+
+        /*
+         * A typed const SCALAR is inlined before the inferencer runs, so check
+         * its declared type (and coerce a widening value) here; the rvalue is
+         * replaced with the coerced literal so the inlined value has the right
+         * type. array/dict consts stay runtime symbols (checked by inference).
+         */
+        if (auto *cid = dynamic_cast<Identifier *>(ret->lvalue.get())) {
+            const DeclType dt = cid->decl_type;
+            if (dt == DeclType::b || dt == DeclType::i ||
+                dt == DeclType::f || dt == DeclType::s) {
+                EvalValue cv = check_coerce_const_scalar(
+                    RValue(ret->rvalue->eval(c.const_ctx)), dt,
+                    ret->rvalue->start, ret->rvalue->end);
+                MakeConstructFromConstVal(cv, ret->rvalue);
+            }
+        }
 
         /*
          * Save the const declaration by evaluating the assignment
@@ -1200,19 +1376,7 @@ pStmt(ParseContext &c, unsigned fl)
 
     } else {
 
-        if (pAcceptKeyword(c, Keyword::kw_var))
-            fl |= pFlags::pInDecl;
-        else if (pAcceptKeyword(c, Keyword::kw_const))
-            fl |= pFlags::pInDecl | pFlags::pInConstDecl;
-
-        /* `var`/`const` may be followed by the `opt` and/or `dyn` type
-         * modifiers, in order (`opt dyn` = nullable, dynamically typed). */
-        if (fl & pFlags::pInDecl) {
-            if (pAcceptKeyword(c, Keyword::kw_opt))
-                fl |= pFlags::pInOptDecl;
-            if (pAcceptKeyword(c, Keyword::kw_dyn))
-                fl |= pFlags::pInDynDecl;
-        }
+        pAcceptDeclPrefix(c, fl);
 
         unique_ptr<Construct> lowerE = pExprTop(c, fl);
 
@@ -1490,6 +1654,11 @@ MakeConstructFromConstVal(const EvalValue &v,
 {
     if (v.is<int_type>()) {
         out = make_unique<LiteralInt>(v.get<int_type>());
+        return true;
+    }
+
+    if (v.is<bool>()) {
+        out = make_unique<LiteralBool>(v.get<bool>());
         return true;
     }
 
@@ -1900,8 +2069,9 @@ pAcceptForStmt(ParseContext &c,
     {
         unsigned init_fl = fl;
 
-        if (pAcceptKeyword(c, Keyword::kw_var))
-            init_fl |= pFlags::pInDecl;
+        /* The init clause may declare the loop var: `for (var i = 0; ...)` or a
+         * typed `for (int i = 0; ...)`. */
+        pAcceptDeclPrefix(c, init_fl);
 
         stmt->init = pExprTop(c, init_fl);
         pExpectOp(c, Op::semicolon);

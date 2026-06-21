@@ -1,0 +1,25 @@
+# Sieve of Eratosthenes over a flat array<bool>: count primes below N.
+# Showcases bool-typed array storage (one byte per element vs Python's 8-byte
+# PyObject pointer per element) plus the typed flat-bool subscript read/store.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 2000000 * scale;
+var sieve = array(N, true);     # array<bool>, flat "bools" storage
+sieve[0] = false;
+sieve[1] = false;
+
+for (var i = 2; i * i < N; i += 1) {
+    if (sieve[i]) {
+        for (var j = i * i; j < N; j += i)
+            sieve[j] = false;
+    }
+}
+
+var count = 0;
+for (var i = 2; i < N; i += 1)
+    if (sieve[i])
+        count += 1;
+
+print("result:", count);

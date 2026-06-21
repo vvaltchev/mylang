@@ -32,6 +32,10 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
 
         return val;
 
+    } else if (val.is<bool>()) {
+
+        return static_cast<int_type>(val.get<bool>() ? 1 : 0);
+
     } else if (val.is<float_type>()) {
 
         return static_cast<int_type>(val.get<float_type>());
@@ -77,6 +81,10 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
     } else if (val.is<int_type>()) {
 
         return static_cast<float_type>(val.get<int_type>());
+
+    } else if (val.is<bool>()) {
+
+        return static_cast<float_type>(val.get<bool>() ? 1 : 0);
 
     } else if (val.is<SharedStr>()) {
 
@@ -139,6 +147,17 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr)
                     best = x;
             }
             return EvalValue(best);
+        }
+
+        if (arr.skind() == SharedArrayObj::Storage::bools) {
+            const auto &bv = arr.flat_bools();
+            unsigned char best = bv[off];
+            for (size_type i = 1; i < n; i++) {
+                const unsigned char x = bv[off + i];
+                if (is_max ? (x > best) : (x < best))
+                    best = x;
+            }
+            return EvalValue(static_cast<bool>(best));   /* min/max stay bool */
         }
 
         const auto &fv = arr.flat_floats();

@@ -24,6 +24,7 @@ as well.
   * [Syntax](#syntax)
     * [Core concepts](#core-concepts)
     * [Declaring variables](#declaring-variables)
+      - [Explicit types](#explicit-types)
     * [Declaring constants](#declaring-constants)
       - [Automatic const promotion](#automatic-const-promotion)
     * [Type system](#type-system)
@@ -35,6 +36,7 @@ as well.
       - [Array expansion](#extra-features-array-expansion)
     * [Functions and lambdas](#functions-and-lambdas)
       - [Const parameters](#const-parameters)
+      - [Typed parameters](#typed-parameters)
       - [Lambda captures](#lambda-captures)
       - [Calling functions during const-evaluation](#calling-functions-during-const-evaluation)
       - [Pure functions](#pure-functions)
@@ -136,10 +138,18 @@ aspects:
 
   - All expression statements must end with `;` like in `C`, `C++`, and `Java`.
 
-  - The keywords `true` and `false` exist, but there's no `boolean` type. Like in C,
-    `0` is false, everything else is `true`. However, strings, arrays, and dictionaries
-    have a boolean value, exactly like in `Python` (e.g. an empty array is considered
-    `false`). The `true` builtin is just an alias for the integer `1`.
+  - `true` and `false` are the two values of a real `bool` type (so
+    `type(true) == "bool"`, distinct from `int`). `bool` sits at the bottom of
+    the numeric promotion chain `bool <= int <= float`: a bool used in
+    arithmetic promotes to the integers `0`/`1` (`true + 1 == 2`,
+    `sum([true, true]) == 2`), and `true == 1`, `false == 0` compare equal (and
+    hash equal, so `true` and `1` are the same dict key). Comparisons
+    (`== != < <= > >=`), the logical operators (`&& || !`), and a `bool`
+    literal/variable all have type `bool`. The **truthiness** rule is unchanged:
+    `0`, `none`, and an empty string/array/dict are false, everything else is
+    true — so any value can still be used as a condition. Arrays of `bool` get a
+    compact one-byte-per-element flat representation (`array_storage()` reports
+    `"bools"`), like flat `int`/`float` arrays.
 
   - The assignment operator `=` can be used like in `C`, inside expressions, but
     there's no such thing as the comma operator, because of the array-expansion
@@ -189,6 +199,50 @@ variable to a different value, use the array-expansion syntax:
 
 ```C#
 var a,b,c = [1,2,3];
+```
+
+#### Explicit types
+
+A declaration may use an explicit primitive type instead of `var`. The type
+names are `bool`, `int`, `float`, `str`, `array`, and `dict`:
+
+```C#
+int   x = 32;
+float ratio = 1.5;
+str   name = "Neo";
+bool  done = false;
+array nums = [1, 2, 3];     # generic array; the element type is still inferred
+dict  conf = {"n": 1};
+```
+
+It is the same declaration as `var`, plus a **compile-time type constraint**:
+the value (and any later assignment) must be assignable to the declared type, or
+you get a compile error.
+
+  * **Scalars** (`bool`/`int`/`float`/`str`) pin the variable's type. Assigning
+    an incompatible value is an error (`int x = "hi"`, `int x = 3.5`, or a later
+    `x = 2.5`). The numeric chain still applies: `float f = 3;` is fine and
+    **coerces** the value to `3.0` (so `f` really holds a float, including after
+    `f = 5;`), and `int x = true;` stores `1`.
+  * **`array`/`dict`** are *generic*: they only require the value to be an array
+    / dict, while its element/key/value types are inferred as usual — so
+    `array nums = [1,2,3]` is still a fast flat `array<int>` (parameterized
+    `array<T>` / `dict<K,V>` syntax is not available yet).
+  * **No initializer** gives the type's zero value: `int x;` → `0`, `float x;` →
+    `0.0`, `bool x;` → `false`, `str x;` → `""`, `array x;` → `[]`,
+    `dict x;` → `{}`. (An `opt`-qualified one defaults to `none`.)
+  * The type may be combined with `const` and/or `opt`, in that order:
+    `const int MAX = 100;`, `opt int maybe;` (nullable, defaults to `none`).
+  * It works in a `for` initializer too: `for (int i = 0; i < n; i += 1) ...`.
+
+The type keywords are still ordinary identifiers everywhere else — `int(x)`,
+`array(n)`, `map(str, xs)` keep working — they are read as a type only at the
+start of a declaration (when immediately followed by the variable name).
+
+Parameters can be typed the same way (see *Functions* below):
+
+```C#
+func dist(float x, float y) => sqrt(x*x + y*y);
 ```
 
 ### Declaring constants
@@ -438,6 +492,14 @@ runtime instead.
     The same applies to functions that don't have a return value. Also, it's
     used as a special value by builtins like `find()`, in case of failure.
 
+  * **Boolean**
+    The type `bool`, with exactly two values: `true` and `false`. It is the
+    bottom of the numeric chain `bool <= int <= float`, so a bool promotes to
+    the integers `0`/`1` in arithmetic (`true + 1 == 2`) and `true == 1`,
+    `false == 0` (also hashing equal — same dict key). Comparisons and the
+    logical operators (`&& || !`) produce `bool`. Truthiness is unchanged: `0`,
+    `none`, and empty containers/strings are false, everything else true.
+
   * **Integer**
     A *signed* pointer-size integer (e.g. `3`).
 
@@ -539,7 +601,10 @@ Key rules:
     a default" pattern use a default dict (`dict(default_value)`) — see the dict
     builtins. A write (`d[k] = v`) still inserts a new key as usual.
   * `==` and `!=` work between any two values (they never error, returning a
-    bool); ordering operators `< <= > >=` need two numbers or two strings.
+    `bool`); ordering operators `< <= > >=` need two numbers or two strings and
+    also return a `bool`. The logical operators `&& || !` return a `bool` too.
+    A comparison/logical result therefore infers as `bool` (e.g. `var ok = a <
+    b;` makes `ok` a `bool`), and an array of such results is `array<bool>`.
 
 #### The `opt` and `dyn` modifiers
 
@@ -563,6 +628,15 @@ slot = "now a string";           # ok, because it's dyn
     check above possible. Like `dyn`, `opt` is **required**, not optional, on a
     parameter that can actually receive `none` from some call path — otherwise
     you get a compile error at the param's declaration telling you to add it.
+
+    **Trailing `opt` parameters are also optional at the call site** (the other
+    sense of "optional"): the caller may omit them, and each omitted one binds
+    to `none`. So `func foo(x, opt y, opt z)` can be called as `foo(1)`,
+    `foo(1, 2)`, or `foo(1, 2, 3)` — the legal argument count is a range. The
+    minimum is "up to and including the last non-`opt` parameter", so a non-opt
+    param *after* an opt one simply can't be skipped: `func f(x, opt y, z)`
+    still requires all three. Passing fewer than the minimum (or more than the
+    total) is a compile-time arity error.
   * **`dyn`** — *dynamically typed*: the value may hold any **type** and may
     change type; *type* operations on it are checked at runtime, not at compile
     time. Use it for variant values — a variable or an array element that
@@ -831,6 +905,18 @@ stays mutable, and - since parameters are passed by value - a function (even a
 `pure` one) may freely reassign its own non-const parameters without affecting
 the caller. A plain parameter that is never reassigned anywhere in the body is
 treated as *effectively const* automatically.
+
+#### Typed parameters
+
+A parameter may carry an explicit primitive type, like a variable declaration
+(see *Explicit types*): `func f(int a, str b)`. The type is enforced — every
+call is checked that the argument is assignable to the declared parameter type
+(`f(1, 2)` is a compile error since `2` is not a `str`), and a widening numeric
+argument is coerced (`func g(float x); g(3)` binds `x = 3.0`). The modifiers
+combine in the order `[const] [opt] TYPE name`, e.g. `func f(opt int n)`
+(nullable) or `func f(const float k)`. A typed parameter overrides the usual
+"infer the type from the call sites" behavior — it *is* that type, and callers
+must comply.
 
 #### Lambda captures
 
@@ -1188,7 +1274,8 @@ const arguments are passed to them.
 ### General builtins
 
 #### `defined(symbol)`
-Check if `symbol` is defined. Returns 1 if the symbol is defined, 0 otherwise.
+Check if `symbol` is defined. Returns `true` if the symbol is defined, `false`
+otherwise.
 
 #### `len(container)`
 Return the number of elements in the given container.
@@ -1223,25 +1310,26 @@ of a `const` (or of any object you want to change deeply without affecting the
 source). Scalars and strings are returned unchanged.
 
 #### `type(value)`
-Return the name of the type of the given value in string-form.
-Useful for debugging.
+Return the name of the type of the given value in string-form (e.g. `"int"`,
+`"bool"`, `"str"`, `"arr"`). Useful for debugging.
 
 #### `hash(value)`
 Return the hash value used by dictionaries internally when `value` is used
-as a key. At the moment, only integers, floats and strings support `hash()`.
+as a key. At the moment, only booleans, integers, floats and strings support
+`hash()` (a `bool` hashes as the equal int `0`/`1`).
 
 ### Array builtins
 
 #### `array(N, [value])`
 Return an array with `N` elements. With a second argument, every element is
 `value` (a fixed value, not a callback). With **one** argument the fill is
-chosen by *type inference*: if the array's inferred element type is `int` or
-`float` (e.g. you later fill it with ints), unfilled elements are `0` / `0.0`;
-otherwise they are `none`. So `var a = array(3); a[0] = 5;` yields
-`[5, 0, 0]`, while an array that stays untyped/dynamic yields all `none`. The
-element type also picks the internal storage: an `int`/`float` array is a
-compact *flat* array (see `array_storage()`), anything else is general. To
-build each element from its index, use `make_array()`.
+chosen by *type inference*: if the array's inferred element type is `int`,
+`float`, or `bool` (e.g. you later fill it with ints), unfilled elements are
+`0` / `0.0` / `false`; otherwise they are `none`. So `var a = array(3); a[0] =
+5;` yields `[5, 0, 0]`, while an array that stays untyped/dynamic yields all
+`none`. The element type also picks the internal storage: an `int`/`float`/`bool`
+array is a compact *flat* array (see `array_storage()`), anything else is
+general. To build each element from its index, use `make_array()`.
 
 (`array()` is a *non-const* builtin: a call like `array(1000000)` is never
 folded into a baked literal at parse time, it always allocates at run time.)
@@ -1249,7 +1337,7 @@ folded into a baked literal at parse time, it always allocates at run time.)
 #### `make_array(N, gen_func)`
 Return `[gen_func(0), gen_func(1), ..., gen_func(N-1)]` — the callback form of
 `array()`. `gen_func` is called once per index with that index. The result is
-flat (`int`/`float`) when every element the callback returns is that one
+flat (`int`/`float`/`bool`) when every element the callback returns is that one
 scalar kind, otherwise general.
 
 #### `top(array)`
@@ -1377,12 +1465,12 @@ Return a slice of the given string skipping any leading or trailing
 whitespace.
 
 #### `startswith(string, sub_string)`
-Return true (1) if the given string starts with the given sub_string and
-false (0), otherwise.
+Return `true` if the given string starts with the given sub_string, `false`
+otherwise.
 
 #### `endswith(string, sub_string)`
-Return true (1) if the given string ends with the given sub_string and
-false (0), otherwise.
+Return `true` if the given string ends with the given sub_string, `false`
+otherwise.
 
 
 #### Generic-container builtins
@@ -1582,10 +1670,11 @@ It's currently used in tests to check if two array slices refer internally
 to the same object.
 
 #### `array_storage(array)`
-Return the array's internal storage as a string: `"ints"` or `"floats"` for a
-compact *flat* (unboxed) array, or `"general"` otherwise. This is purely an
-introspection aid (mainly for tests) — flat and general arrays behave
-identically; the only observable difference is speed and memory.
+Return the array's internal storage as a string: `"ints"`, `"floats"`, or
+`"bools"` for a compact *flat* (unboxed) array (8 bytes per element for
+int/float, **one byte** per element for bool), or `"general"` otherwise. This
+is purely an introspection aid (mainly for tests) — flat and general arrays
+behave identically; the only observable difference is speed and memory.
 
 An array's storage is **decided once, at creation, from its proven static
 type** — it is never converted afterward (no runtime "promotion", so no
@@ -1653,8 +1742,8 @@ array from the start.
 
 #### `erase(container, key_or_index)`
 Erase the element at the given index or the element indexed by the given key
-from the given container (array or dictionary). Return true (1) if the key
-existed. For arrays, it always returns true or throws `OutOfBoundsEx` in
+from the given container (array or dictionary). Return `true` if the key
+existed. For arrays, it always returns `true` or throws `OutOfBoundsEx` in
 case of an invalid index.
 
 #### `insert(container, key_or_index, value)`

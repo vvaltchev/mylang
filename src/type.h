@@ -31,6 +31,7 @@ public:
         t_int,
         t_builtin,
         t_float,
+        t_bool,
 
         /* Non-trivial types */
         t_str,
