@@ -1963,6 +1963,9 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
     stmt->end = c.get_loc() + 1;
 
+    /* decide POD vs boxed storage and assign POD field byte offsets */
+    stmt->def->compute_layout();
+
     if (c.const_eval)
         stmt->eval(c.const_ctx);
 
