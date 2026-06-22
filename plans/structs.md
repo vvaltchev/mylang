@@ -1,23 +1,26 @@
 # Custom struct types — implementation plan
 
-> **BUILD STATUS (live).** Phases **1–7 are DONE and committed** — the full
+> **BUILD STATUS (live).** **ALL 8 phases are DONE and committed.** The full
 > boxed feature (decl, construction, field/`const` access, inference,
 > const-fold, COW) **plus** phase 5 (POD C-layout), phase 6 (nested/recursive
-> POD), and phase 7 (flat `array<PodStruct>` storage with a COW-reuse `foreach`
-> and an auto-promote cold path). 871 `-rt` tests pass (ASan), coverage-
-> hardened;
-> README + CLAUDE document it. **Only phase 8 remains** — the M8-style *direct*
-> field access (read `s.x`/`a[i].x` from the bytes without materializing a
-> `StructObject`). Until then a flat struct array is a memory/cache win and
-> CPU-neutral on per-element access (`bench/58_structs`), not yet an
-> `array<int>`-speed win; that gap is exactly what phase 8 closes (it needs
-> foreach-body / subscript-chain specialization). The earlier validation held: a
-> POD field *write* reuses the `try_flat_subscript_store` pattern (a direct
-> typed
-> store bypassing the lvalue model), and member access
-> must respect `is_lvalue_rooted` (a field lvalue is handed out only for a
-> variable-rooted base, never a temporary — see the UAF fix in eval.cpp). See
-> §16 for the remaining task order.
+> POD), phase 7 (flat `array<PodStruct>` storage with a COW-reuse `foreach` and
+> an auto-promote cold path), and **phase 8** — M8-style *direct* unboxed field
+> access (`MemberExpr::eval_int`/`eval_float`; `a[i].field` reads straight from
+> the array bytes via `member_pod_array_scalar`, no materialization; the
+> compound-assign fast path treats a `th==i` rhs as an `eval_int` read) **and**
+> construct-in-place append (`append(arr, S(..))` builds into the array buffer
+> via `try_construct_into_struct_array`, no temporary `StructObject`). 885 `-rt`
+> tests pass (ASan), coverage-hardened; README + CLAUDE document it.
+> **Perf:** `a[i].x` field access is within ~6% of `array<int>`'s `a[i]`;
+> construction stays object-bound but the per-element alloc is gone (build
+> overhead 2.47x→1.76x vs `array<int>`; `bench/58_structs` ~26x→~21x CPython).
+> The validated patterns held: a POD field *write* reuses the
+> `try_flat_subscript_store` pattern (a direct typed store bypassing the lvalue
+> model), and member access must respect `is_lvalue_rooted` (a field lvalue is
+> handed out only for a variable-rooted base, never a temporary — the UAF fix in
+> eval.cpp). Remaining (beyond v1 scope): `var` fields, `opt` scalar fields,
+> methods, empty structs, and a foreach-body specialization that would avoid the
+> loop-var `StructObject` entirely.
 
 Status: **designed, ready to build.** The prerequisites the original version of
 this plan was waiting on have all landed, which changes the design materially:
