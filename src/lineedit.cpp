@@ -234,11 +234,12 @@ void wr(const string &s)
 
 ReadLineResult
 read_line(const string &prompt, std::vector<string> &history,
-          string (*highlight)(const string &))
+          string (*highlight)(const string &), const string &initial)
 {
     ReadLineResult res;
 
-    /* Not a terminal (piped input / a test harness): plain line read. */
+    /* Not a terminal (piped input / a test harness): plain line read. The
+     * initial (auto-indent) text is prepended so behavior matches the TTY. */
     if (!isatty(STDIN_FILENO)) {
         std::cout << prompt << std::flush;
         string line;
@@ -246,15 +247,17 @@ read_line(const string &prompt, std::vector<string> &history,
             res.eof = true;
             return res;
         }
-        res.line = line;
+        res.line = initial + line;
         return res;
     }
 
     RawMode raw;
     LineEditor ed;
     ed.set_history(&history);
+    if (!initial.empty())
+        ed.set_buffer(initial);
 
-    wr(render_line(prompt, "", 0, highlight));
+    wr(render_line(prompt, ed.buffer(), ed.cursor(), highlight));
 
     for (;;) {
         unsigned char c;
