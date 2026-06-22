@@ -19,6 +19,7 @@
 #include "inferencer.h"
 #include "repl.h"
 #include "lineedit.h"
+#include "highlight.h"
 
 #include <typeinfo>
 #include <vector>
@@ -7723,8 +7724,66 @@ static bool lineedit_history_nav()
     return ed.buffer() == "live";
 }
 
+/* Strip ANSI escape sequences (ESC '[' ... final-letter) from `s`. */
+static std::string strip_ansi(const std::string &s)
+{
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\033') {
+            i++;
+            if (i < s.size() && s[i] == '[')
+                while (i < s.size() && !isalpha((unsigned char)s[i]))
+                    i++;
+            continue;                          /* skip the final letter too */
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+static bool highlight_inserts_color()
+{
+    set_highlight_enabled(true);
+    const std::string h = highlight_line("var x = 5  # c");
+    /* keyword, number and comment should each introduce an escape */
+    return h.find("\033[") != std::string::npos &&
+           h != "var x = 5  # c";
+}
+
+static bool highlight_preserves_visible_text()
+{
+    set_highlight_enabled(true);
+    const std::string src = "func f(n) => n * 2  # cmt \"s\"";
+    /* the colored text, with escapes removed, must equal the input exactly -
+     * this is what guarantees the editor's cursor columns stay correct */
+    return strip_ansi(highlight_line(src)) == src;
+}
+
+static bool highlight_disabled_is_identity()
+{
+    set_highlight_enabled(false);
+    const std::string s = "var x = 5  # c";
+    const bool ok = highlight_line(s) == s;
+    set_highlight_enabled(true);
+    return ok;
+}
+
+static bool highlight_tolerates_unterminated_string()
+{
+    set_highlight_enabled(true);
+    /* mid-edit: an unclosed string must not throw or drop characters */
+    const std::string src = "var s = \"hello";
+    return strip_ansi(highlight_line(src)) == src;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
+    { "highlight: inserts color escapes", highlight_inserts_color },
+    { "highlight: stripping escapes restores the input",
+      highlight_preserves_visible_text },
+    { "highlight: disabled is identity", highlight_disabled_is_identity },
+    { "highlight: tolerates an unterminated string",
+      highlight_tolerates_unterminated_string },
     { "lineedit: typing and backspace", lineedit_typing_and_backspace },
     { "lineedit: cursor move and insert", lineedit_cursor_move_and_insert },
     { "lineedit: home/end and kill-to-end", lineedit_home_end_kill },

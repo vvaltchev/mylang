@@ -9,12 +9,15 @@
 #include "evalvalue.h"
 #include "errfmt.h"
 #include "lineedit.h"
+#include "highlight.h"
 
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstdlib>     /* getenv */
+#include <unistd.h>    /* isatty */
 
 using std::string;
 
@@ -325,6 +328,11 @@ run_repl()
     ReplEngine engine;
     std::vector<string> history;
 
+    /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
+    const bool color = isatty(STDOUT_FILENO) && !std::getenv("NO_COLOR");
+    set_highlight_enabled(color);
+    auto *hl = color ? highlight_line : nullptr;
+
     std::cout << "MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.\n";
 
     string input;
@@ -332,7 +340,7 @@ run_repl()
 
     while (true) {
 
-        ReadLineResult r = read_line(continuing ? ".. " : ">> ", history);
+        ReadLineResult r = read_line(continuing ? ".. " : ">> ", history, hl);
 
         if (r.eof) {
             /* Ctrl-D mid-block abandons it; at a fresh prompt it exits. */
