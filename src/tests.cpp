@@ -7583,6 +7583,17 @@ static const std::vector<repl_test> repl_tests =
       { { "var q = (1 + ", "SyntaxError" },
         { "var q = 7", "=> 7" },
         { "q", "=> 7" } } },
+
+    { ":tree shows the const-folded syntax tree",
+      { { ":tree 2 + 3 * 4", "Int(14)" } } },
+
+    { ":tree does not commit its declarations",
+      { { ":tree var wq = 5", "Int(5)" },
+        { "wq", "Undefined variable 'wq'" } } },
+
+    { ":help and an unknown command",
+      { { ":help", ":source" },
+        { ":bogus", "Unknown command" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)

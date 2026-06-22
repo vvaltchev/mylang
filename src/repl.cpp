@@ -10,6 +10,7 @@
 #include "errfmt.h"
 
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -48,6 +49,11 @@ struct ReplEngine::Impl {
         format_exception(o, e, lines);
         return o.str();
     }
+
+    string do_eval(const string &src, bool echo);
+    string meta_command(const string &src);
+    string cmd_tree(const string &code);
+    string cmd_source(const string &path);
 };
 
 ReplEngine::ReplEngine() : impl(new Impl) { }
@@ -55,6 +61,19 @@ ReplEngine::~ReplEngine() = default;
 
 string
 ReplEngine::eval_input(const string &src)
+{
+    /* A leading ':' is a REPL meta-command (inspection / load / help), never
+     * mylang source. */
+    {
+        const size_t s = src.find_first_not_of(" \t\r\n");
+        if (s != string::npos && src[s] == ':')
+            return impl->meta_command(src.substr(s));
+    }
+    return impl->do_eval(src, /*echo=*/true);
+}
+
+string
+ReplEngine::Impl::do_eval(const string &src, bool echo)
 {
     std::ostringstream out;
 
@@ -79,8 +98,8 @@ ReplEngine::eval_input(const string &src)
         std::stringstream ss(source);
         string line;
         while (std::getline(ss, line)) {
-            impl->lines.push_back(line);
-            lexer(impl->lines.back(), impl->next_line++, tokens);
+            lines.push_back(line);
+            lexer(lines.back(), next_line++, tokens);
         }
     }
 
@@ -92,13 +111,13 @@ ReplEngine::eval_input(const string &src)
     unique_ptr<Construct> root;
     try {
         ParseContext pc(TokenStream(tokens), true);
-        pc.const_ctx = impl->const_ctx.get();
+        pc.const_ctx = const_ctx.get();
         root = pBlock(pc, 0, /*push_const_scope=*/false);
         if (!pc.eoi())
             throw SyntaxErrorEx(Loc(pc.get_tok().loc),
                                 "Unexpected token at the end", &pc.get_tok());
     } catch (const Exception &e) {
-        return impl->format_error(e);
+        return format_error(e);
     }
 
     /* 3. Evaluate each top-level statement directly in the persistent global
@@ -110,7 +129,7 @@ ReplEngine::eval_input(const string &src)
     try {
         if (blk) {
             for (const auto &e : blk->elems) {
-                EvalValue v = e->eval(impl->runtime_ctx.get());
+                EvalValue v = e->eval(runtime_ctx.get());
                 if (v.is<UndefinedId>())
                     throw UndefinedVariableEx(
                         v.get<UndefinedId>().id, e->start, e->end);
@@ -119,17 +138,139 @@ ReplEngine::eval_input(const string &src)
         }
     } catch (const Exception &e) {
         std::cout.rdbuf(old_cout);
-        impl->retained.push_back(move(root));   /* keep partial defs alive */
-        out << impl->format_error(e);
+        retained.push_back(move(root));   /* keep partial defs alive */
+        out << format_error(e);
         return out.str();
     }
 
     std::cout.rdbuf(old_cout);
-    impl->retained.push_back(move(root));
+    retained.push_back(move(root));
 
     /* 4. The `=> value` echo (RValue collapses an lvalue result). */
-    const EvalValue r = RValue(last);
-    out << "=> " << r.get_type()->to_string(r) << "\n";
+    if (echo) {
+        const EvalValue r = RValue(last);
+        out << "=> " << r.get_type()->to_string(r) << "\n";
+    }
+    return out.str();
+}
+
+/* ------------------------------------------------------------------ */
+/* Meta-commands (`:name args`) - inspection / load / help.            */
+/* ------------------------------------------------------------------ */
+
+string
+ReplEngine::Impl::meta_command(const string &src)
+{
+    /* Split into the command word and the rest (the argument). */
+    string cmd, arg;
+    {
+        size_t i = 1;                       /* skip the ':' */
+        while (i < src.size() && !isspace(static_cast<unsigned char>(src[i])))
+            cmd += src[i++];
+        while (i < src.size() && isspace(static_cast<unsigned char>(src[i])))
+            i++;
+        arg = src.substr(i);
+        const size_t e = arg.find_last_not_of(" \t\r\n");
+        arg.erase(e == string::npos ? 0 : e + 1);
+    }
+
+    if (cmd == "tree" || cmd == "s")
+        return cmd_tree(arg);
+    if (cmd == "source" || cmd == "load")
+        return cmd_source(arg);
+    if (cmd == "help" || cmd == "h") {
+        return
+            ":help            this message\n"
+            ":tree <code>     show the parsed (const-folded) syntax tree\n"
+            ":source <file>   evaluate a file as if typed at the prompt\n"
+            ":quit            exit the REPL\n";
+    }
+    if (cmd == "quit" || cmd == "q")
+        return "";              /* the loop handles the actual exit */
+
+    return "Unknown command ':" + cmd + "' (try :help)\n";
+}
+
+/*
+ * :tree - parse `code` and print its syntax tree WITHOUT committing it. We pass
+ * push_const_scope=true so prior consts are visible for folding but any new
+ * const/func/struct binds in the pushed scope the parser pops (so persistent
+ * state is untouched), and we never evaluate or retain the result.
+ */
+string
+ReplEngine::Impl::cmd_tree(const string &code)
+{
+    if (code.empty())
+        return "usage: :tree <code>\n";
+
+    string source = code;
+    const size_t e = source.find_last_not_of(" \t\r\n");
+    source.erase(e + 1);
+    if (!source.empty() && source.back() != ';')
+        source += ';';
+
+    /* Keep the source lines in a stable vector: the lexer stores string_views
+     * into them, so they must outlive the parse (a local getline buffer would
+     * dangle). The vector also backs an error caret. */
+    std::vector<string> local_lines;
+    {
+        std::stringstream ss(source);
+        string line;
+        while (std::getline(ss, line))
+            local_lines.push_back(line);
+    }
+
+    std::vector<Tok> toks;
+    for (size_t i = 0; i < local_lines.size(); i++)
+        lexer(local_lines[i], static_cast<int>(i + 1), toks);
+
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        pc.const_ctx = const_ctx.get();
+        unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
+        std::ostringstream o;
+        o << *root << "\n";
+        return o.str();
+    } catch (const Exception &ex) {
+        std::ostringstream o;
+        format_exception(o, ex, local_lines);
+        return o.str();
+    }
+}
+
+/*
+ * :source - read a file and feed it to the engine EXACTLY as if typed: split it
+ * into complete top-level units (the same completeness rule the loop uses) and
+ * eval each as one input, in order, so cross-input semantics and per-unit error
+ * recovery apply. The `=>` echo is suppressed for sourced units (print() output
+ * and errors still show).
+ */
+string
+ReplEngine::Impl::cmd_source(const string &path)
+{
+    if (path.empty())
+        return "usage: :source <file>\n";
+
+    std::ifstream f(path);
+    if (!f.is_open())
+        return "Failed to open file '" + path + "'\n";
+
+    std::ostringstream out;
+    string unit, line;
+
+    while (std::getline(f, line)) {
+        if (!unit.empty())
+            unit += "\n";
+        unit += line;
+        if (ReplEngine::is_incomplete(unit))
+            continue;
+        out << do_eval(unit, /*echo=*/false);
+        unit.clear();
+    }
+
+    if (!unit.empty())                 /* a trailing incomplete unit: try it */
+        out << do_eval(unit, /*echo=*/false);
+
     return out.str();
 }
 
@@ -197,8 +338,18 @@ run_repl()
             break;                              /* EOF / Ctrl-D */
         }
 
-        if (!continuing && (line == ":quit" || line == ":q"))
-            break;
+        /* A meta-command (`:name ...`) at a fresh prompt is a complete one-line
+         * input - never accumulated for multi-line continuation. */
+        if (!continuing) {
+            const size_t s = line.find_first_not_of(" \t");
+            if (s != string::npos && line[s] == ':') {
+                const string c = line.substr(s);
+                if (c == ":quit" || c == ":q")
+                    break;
+                std::cout << engine.eval_input(line);
+                continue;
+            }
+        }
 
         if (!input.empty())
             input += "\n";
