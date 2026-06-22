@@ -10,12 +10,15 @@
 #include "errfmt.h"
 #include "lineedit.h"
 #include "highlight.h"
+#include "structtype.h"
 
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>     /* getenv */
 #include <unistd.h>    /* isatty */
 
@@ -403,6 +406,81 @@ repl_bracket_depth(const string &src)
     return depth < 0 ? 0 : depth;
 }
 
+std::vector<string>
+ReplEngine::completions(const string &buf, size_t cursor) const
+{
+    if (cursor > buf.size())
+        cursor = buf.size();
+
+    /* the identifier prefix ending at the cursor */
+    size_t start = cursor;
+    while (start > 0 &&
+           (isalnum(static_cast<unsigned char>(buf[start - 1])) ||
+            buf[start - 1] == '_'))
+        start--;
+    const string prefix = buf.substr(start, cursor - start);
+
+    auto starts_with = [&](const string &s) {
+        return s.size() >= prefix.size() &&
+               s.compare(0, prefix.size(), prefix) == 0;
+    };
+
+    std::vector<string> out;
+
+    if (start > 0 && buf[start - 1] == '.') {
+
+        /* member access `base.<prefix>`: complete base's fields / consts */
+        size_t bend = start - 1, bstart = bend;
+        while (bstart > 0 &&
+               (isalnum(static_cast<unsigned char>(buf[bstart - 1])) ||
+                buf[bstart - 1] == '_'))
+            bstart--;
+        const string base = buf.substr(bstart, bend - bstart);
+
+        if (!base.empty()) {
+            std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+            impl->runtime_ctx->collect_symbols(syms);
+            for (const auto &kv : syms) {
+                if (kv.first->val != base)
+                    continue;
+                const EvalValue &v = kv.second->get();
+                const StructTypeDef *def = nullptr;
+                const bool inst = v.is<intrusive_ptr<StructObject>>();
+                if (inst)
+                    def = v.get<intrusive_ptr<StructObject>>()->def;
+                else if (v.is<StructTypeDef *>())
+                    def = v.get<StructTypeDef *>();
+                if (def) {
+                    if (inst)
+                        for (const auto &f : def->fields)
+                            if (starts_with(f.name->val))
+                                out.push_back(f.name->val);
+                    for (const auto &c : def->consts)
+                        if (starts_with(c.first->val))
+                            out.push_back(c.first->val);
+                }
+                break;
+            }
+        }
+
+    } else {
+
+        for (int i = 1; i < static_cast<int>(Keyword::kw_count); i++)
+            if (starts_with(KwString[i]))
+                out.push_back(KwString[i]);
+
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        impl->runtime_ctx->collect_symbols(syms);
+        for (const auto &kv : syms)
+            if (starts_with(kv.first->val))
+                out.push_back(kv.first->val);
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 bool
 ReplEngine::is_incomplete(const string &src)
 {
@@ -451,6 +529,11 @@ run_repl()
     set_highlight_enabled(color);
     auto *hl = color ? highlight_line : nullptr;
 
+    LineEditor::Completer completer =
+        [&engine](const string &b, size_t cur) {
+            return engine.completions(b, cur);
+        };
+
     std::cout << "MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.\n";
 
     string input;
@@ -462,8 +545,8 @@ run_repl()
         const string indent =
             continuing ? string(repl_bracket_depth(input) * 2, ' ') : "";
 
-        ReadLineResult r =
-            read_line(continuing ? ".. " : ">> ", history, hl, indent);
+        ReadLineResult r = read_line(continuing ? ".. " : ">> ", history, hl,
+                                     indent, completer);
 
         if (r.eof) {
             /* Ctrl-D mid-block abandons it; at a fresh prompt it exits. */

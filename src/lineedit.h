@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <functional>
 
 /*
  * A hand-rolled line editor (the project forbids third-party deps, so no
@@ -47,6 +48,24 @@ public:
     /* The history vector is owned by the caller; the editor navigates it. */
     void set_history(const std::vector<std::string> *h) { hist = h; }
 
+    /*
+     * Tab completion. The callback is given (buffer, cursor) and returns the
+     * candidate full words that could replace the identifier ending at the
+     * cursor (each already matching that prefix). On Tab the editor completes a
+     * lone candidate / the longest common prefix in place; when several remain
+     * it stashes them for the caller to display via take_completions().
+     */
+    using Completer =
+        std::function<std::vector<std::string>(const std::string &, size_t)>;
+    void set_completer(Completer c) { completer = std::move(c); }
+
+    std::vector<std::string> take_completions()
+    {
+        std::vector<std::string> v;
+        v.swap(comp_list);
+        return v;
+    }
+
 private:
 
     enum class Esc { none, esc, csi };
@@ -58,7 +77,10 @@ private:
     const std::vector<std::string> *hist = nullptr;
     int hist_idx = -1;                    /* -1 == editing the live line */
     std::string saved_live;               /* live line, saved entering hist */
+    Completer completer;
+    std::vector<std::string> comp_list;   /* candidates pending display */
 
+    void complete();
     void insert(char c);
     void backspace();
     void del_forward();
@@ -98,4 +120,5 @@ struct ReadLineResult {
 ReadLineResult
 read_line(const std::string &prompt, std::vector<std::string> &history,
           std::string (*highlight)(const std::string &) = nullptr,
-          const std::string &initial = "");
+          const std::string &initial = "",
+          LineEditor::Completer completer = {});

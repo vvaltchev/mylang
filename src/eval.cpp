@@ -139,6 +139,13 @@ void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_c
     symbols.emplace(UniqueId::get(id), LValue(move(val), is_const));
 }
 
+void EvalContext::collect_symbols(
+    std::vector<std::pair<const UniqueId *, const LValue *>> &out) const
+{
+    for (const auto &kv : symbols)
+        out.emplace_back(kv.first, &kv.second);
+}
+
 /* ------------------ Constructs ------------------- */
 
 EvalValue Construct::eval(EvalContext *ctx, bool rec) const
