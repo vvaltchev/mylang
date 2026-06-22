@@ -1273,10 +1273,45 @@ are unchanged.
 ## Custom struct types
 
 User-defined value types (`struct Point { int x; int y; }`). Full design +
-phasing: `plans/structs.md`. **Status: the boxed implementation is complete**
-(decl, construction, field/const access, inference, const-folding, COW); the
-**C-layout / flat-`array<Struct>` / fast-access perf phases are still to land**
-(see the plan), so today every struct is a `boxed` slot array.
+phasing: `plans/structs.md`. **Status: complete through the flat-array perf
+work** — decl, construction, field/const access, inference, const-folding, COW
+**plus** the POD C-layout, nested (recursive) POD, and flat `array<PodStruct>`
+storage. The **only** remaining piece is the M8-style *direct* field access
+(read `s.x`/`a[i].x` straight from the bytes without materializing a
+`StructObject`); until then a flat struct array is a memory/cache win and
+CPU-neutral on per-element access (`bench/58_structs`), not yet an
+`array<int>`-speed win.
+
+- **POD vs boxed storage** (`StructTypeDef::compute_layout`, run by the parser).
+  A struct is **POD** iff every field is a non-opt scalar (`bool`/`int`/`float`)
+  **or a non-opt POD struct** (embedded *inline*, recursively); it then has a
+  native C byte layout (`pod_field_metrics` assigns offsets with our own fixed
+  alignment rules — `pod_field_size`/`align` in `structtype.h`, the one place an
+  arch assumption lives, depending only on `sizeof(int_type)`). Any ref/opt/
+  boxed-struct field makes it **boxed** (a `vector<LValue>` slot array). A
+  nested struct field embeds inline only if its type was *declared before* this
+  one (resolved via `const_ctx` in the parser → `FieldDef::struct_def`); a
+  forward/self reference stays a boxed pointer (so no infinite layout).
+- **`StructObject`** holds EITHER `bytes` (POD: a `def->size` C-laid-out buffer;
+  `pod_get`/`pod_set` load/store a typed scalar or an inline nested struct at a
+  field offset) OR `fields` (boxed). A POD field WRITE goes through
+  `try_pod_struct_store` (a direct byte store, mirroring
+  `try_flat_subscript_store`); a POD field READ in `MemberExpr` returns a value
+  (no per-field LValue). `==` is `memcmp` for POD, field-wise for boxed.
+- **Flat `array<PodStruct>`** — `SharedArrayObj::Storage::structs`: a contiguous
+  byte buffer + the element `StructTypeDef*` + cached `stride` (so the template
+  never needs `StructTypeDef` complete). Created value-driven (a literal of
+  same-type POD structs → `LiteralArray` mode 5) or type-driven for an empty
+  `[]` whose destination is `array<PodStruct>` (`ArrHint::flat_s` +
+  `Construct::arr_hint_struct`, honored by `LiteralArray`/`LiteralObj`), so
+  `var a=[]; append(a, S(..))` stays unboxed. Hot paths touch bytes directly
+  (subscript read/store, append, `==`, `to_string`, clone/const-clone,
+  `sty_from_value`); **`foreach` reuses one `StructObject`** across iterations
+  (overwrite-in-place with a `use_count` COW guard, so a captured element keeps
+  its value). Cold ops (insert/sort/map/...) **auto-promote** to a general array
+  via `get_vec()`'s `promote_structs_to_general()`, so every existing array op
+  works with no dedicated case and nothing throws. `array_storage` reports
+  `"structs"`.
 
 - **Two value kinds, mirroring func's decl/object split** (`type.h` `TypeE`):
   `t_structtype` (trivial, `< t_str`, a raw `StructTypeDef *`) is the **type
@@ -1327,9 +1362,9 @@ phasing: `plans/structs.md`. **Status: the boxed implementation is complete**
   deep `const`; plain assignment aliases; `clone()` shallow, `deepclone()`
   deep). `==`
   is structural between same-`def` instances (`TypeStruct::eq`); `hash` throws
-  (not hashable, v1). **Deferred** (plans/structs.md): `var` fields (call-site
-  field inference), `opt` scalar fields, the POD C-layout + flat `array<Struct>`
-  + M8-style direct `s.x`/`a[i].x` access, methods, and empty structs.
+  (not hashable, v1). **Deferred** (plans/structs.md): the M8-style *direct*
+  `s.x`/`a[i].x` byte access (the remaining flat-array CPU win), `var` fields
+  (call-site field inference), `opt` scalar fields, methods, and empty structs.
 
 ## Error model
 

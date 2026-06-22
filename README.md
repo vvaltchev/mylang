@@ -1335,6 +1335,14 @@ read-only** — mutating a const instance's field is an error. `Type.CONST` fold
 at parse time. An `array` of a struct type infers as `array<Struct>`
 (`var a = [Point(1,2), Point(3,4)]`).
 
+**Layout.** A struct whose fields are all `bool`/`int`/`float` (or other such
+POD structs, embedded inline) gets a compact native-C byte layout, and an
+`array` of it is stored **flat/unboxed** — contiguous bytes, no per-element
+object — just like `array<int>` (`array_storage(a)` reports `"structs"`). A
+struct with any `array`/`dict`/`str`/`dyn`/`opt` field is stored as a boxed
+slot array instead. This is transparent: it changes only memory layout and
+speed, never behavior.
+
 Structs may be declared anywhere a statement is allowed, **including inside a
 function** (lexically scoped like a nested function). A struct's fields and
 consts live in the struct's own namespace, so a struct `const PI` never clashes
