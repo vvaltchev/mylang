@@ -18,6 +18,7 @@
 #include "stype.h"
 #include "inferencer.h"
 #include "repl.h"
+#include "lineedit.h"
 
 #include <typeinfo>
 #include <vector>
@@ -7615,8 +7616,124 @@ static bool run_one_repl_test(const repl_test &t)
     return true;
 }
 
+/*
+ * LineEditor core tests (the pure, headless part of the line editor). Each
+ * feeds a byte script - including raw control codes (Ctrl-x is byte x) and ESC
+ * sequences for the arrows - and asserts the resulting buffer/cursor. No TTY.
+ */
+static void le_feed(LineEditor &ed, const std::string &bytes)
+{
+    for (char c : bytes)
+        ed.feed(static_cast<unsigned char>(c));
+}
+
+static bool lineedit_typing_and_backspace()
+{
+    LineEditor ed;
+    le_feed(ed, "abc");
+    if (ed.buffer() != "abc" || ed.cursor() != 3) return false;
+    ed.feed(127);                                  /* Backspace */
+    return ed.buffer() == "ab" && ed.cursor() == 2;
+}
+
+static bool lineedit_cursor_move_and_insert()
+{
+    LineEditor ed;
+    le_feed(ed, "abc");
+    ed.feed(2); ed.feed(2);                        /* Ctrl-B x2 -> cursor 1 */
+    ed.feed('X');
+    return ed.buffer() == "aXbc" && ed.cursor() == 2;
+}
+
+static bool lineedit_home_end_kill()
+{
+    LineEditor ed;
+    le_feed(ed, "hello");
+    ed.feed(1);                                    /* Ctrl-A (home) */
+    ed.feed('Z');
+    if (ed.buffer() != "Zhello") return false;
+    ed.feed(11);                                   /* Ctrl-K (kill to end) */
+    if (ed.buffer() != "Z") return false;
+    ed.feed(5);                                    /* Ctrl-E (end) */
+    return ed.cursor() == 1;
+}
+
+static bool lineedit_kill_word()
+{
+    LineEditor ed;
+    le_feed(ed, "foo bar");
+    ed.feed(23);                                   /* Ctrl-W */
+    return ed.buffer() == "foo " && ed.cursor() == 4;
+}
+
+static bool lineedit_arrow_keys()
+{
+    LineEditor ed;
+    le_feed(ed, "ab");
+    le_feed(ed, "\033[D");                         /* left arrow -> cursor 1 */
+    ed.feed('X');
+    if (ed.buffer() != "aXb" || ed.cursor() != 2) return false;
+    le_feed(ed, "\033[C");                         /* right arrow -> cursor 3 */
+    return ed.cursor() == 3;
+}
+
+static bool lineedit_delete_key()
+{
+    LineEditor ed;
+    le_feed(ed, "abc");
+    ed.feed(1);                                    /* home */
+    le_feed(ed, "\033[3~");                        /* Delete -> remove 'a' */
+    return ed.buffer() == "bc" && ed.cursor() == 0;
+}
+
+static bool lineedit_submit_action()
+{
+    LineEditor ed;
+    le_feed(ed, "abc");
+    return ed.feed(13) == LineEditor::Action::submit && ed.buffer() == "abc";
+}
+
+static bool lineedit_ctrl_c_and_d()
+{
+    LineEditor ed;
+    if (ed.feed(3) != LineEditor::Action::cancel) return false;   /* Ctrl-C */
+    LineEditor ed2;
+    if (ed2.feed(4) != LineEditor::Action::eof) return false;     /* C-D empty */
+    LineEditor ed3;
+    le_feed(ed3, "ab");
+    ed3.feed(1);                                   /* home */
+    if (ed3.feed(4) != LineEditor::Action::none)   /* C-D non-empty: del fwd */
+        return false;
+    return ed3.buffer() == "b";
+}
+
+static bool lineedit_history_nav()
+{
+    std::vector<std::string> h = { "first", "second" };
+    LineEditor ed;
+    ed.set_history(&h);
+    le_feed(ed, "live");                           /* the live line */
+    le_feed(ed, "\033[A");                         /* up -> "second" */
+    if (ed.buffer() != "second") return false;
+    le_feed(ed, "\033[A");                         /* up -> "first" */
+    if (ed.buffer() != "first") return false;
+    le_feed(ed, "\033[B");                         /* down -> "second" */
+    if (ed.buffer() != "second") return false;
+    le_feed(ed, "\033[B");                         /* down -> back to live */
+    return ed.buffer() == "live";
+}
+
 static const std::vector<extra_check> extra_checks =
 {
+    { "lineedit: typing and backspace", lineedit_typing_and_backspace },
+    { "lineedit: cursor move and insert", lineedit_cursor_move_and_insert },
+    { "lineedit: home/end and kill-to-end", lineedit_home_end_kill },
+    { "lineedit: kill word (Ctrl-W)", lineedit_kill_word },
+    { "lineedit: arrow keys move the cursor", lineedit_arrow_keys },
+    { "lineedit: the Delete key", lineedit_delete_key },
+    { "lineedit: Enter submits", lineedit_submit_action },
+    { "lineedit: Ctrl-C cancels, Ctrl-D eof/delete", lineedit_ctrl_c_and_d },
+    { "lineedit: Up/Down history navigation", lineedit_history_nav },
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
     { "AST deep-clone round-trips", ast_clone_roundtrip },
     { "inliner splices an expr-func call", inliner_splices_call },

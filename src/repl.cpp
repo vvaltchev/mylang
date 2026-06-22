@@ -8,6 +8,7 @@
 #include "errors.h"
 #include "evalvalue.h"
 #include "errfmt.h"
+#include "lineedit.h"
 
 #include <iostream>
 #include <fstream>
@@ -322,21 +323,36 @@ int
 run_repl()
 {
     ReplEngine engine;
+    std::vector<string> history;
 
-    std::cout << "MyLang REPL. Type :quit (or Ctrl-D) to exit.\n";
+    std::cout << "MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.\n";
 
     string input;
     bool continuing = false;
 
     while (true) {
 
-        std::cout << (continuing ? ".. " : ">> ") << std::flush;
+        ReadLineResult r = read_line(continuing ? ".. " : ">> ", history);
 
-        string line;
-        if (!std::getline(std::cin, line)) {
-            std::cout << "\n";
-            break;                              /* EOF / Ctrl-D */
+        if (r.eof) {
+            /* Ctrl-D mid-block abandons it; at a fresh prompt it exits. */
+            if (continuing) {
+                input.clear();
+                continuing = false;
+                continue;
+            }
+            break;
         }
+
+        if (r.cancelled) {                  /* Ctrl-C: drop the current input */
+            input.clear();
+            continuing = false;
+            continue;
+        }
+
+        const string &line = r.line;
+        if (!line.empty())
+            history.push_back(line);
 
         /* A meta-command (`:name ...`) at a fresh prompt is a complete one-line
          * input - never accumulated for multi-line continuation. */
@@ -360,8 +376,7 @@ run_repl()
             continue;
         }
 
-        const string out = engine.eval_input(input);
-        std::cout << out;
+        std::cout << engine.eval_input(input);
 
         input.clear();
         continuing = false;
