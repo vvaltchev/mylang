@@ -2106,10 +2106,17 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         if (const Identifier *id = as_resolved_local(lvalue.get())) {
 
-            if (rvalue->is_lit_int()) {
+            /*
+             * The rhs is an int when it is an int literal OR a node the
+             * inferencer proved is a non-null int (th == i) - e.g. a POD struct
+             * field `p.x`. The latter reads UNBOXED via eval_int() (no
+             * pod_get/EvalValue), which is what makes `sx += p.x` over a flat
+             * struct array a true unboxed reduction (plans/structs.md phase 8).
+             */
+            const bool rhs_int =
+                rvalue->is_lit_int() || rvalue->th == TypeHint::i;
 
-                const auto *lit =
-                    static_cast<const LiteralInt *>(rvalue.get());
+            if (rhs_int) {
 
                 Frame *f = ctx->frame;
                 const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
@@ -2120,8 +2127,12 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
                     if (!lv.is_const_var() && lv.is<int_type>()) {
 
+                        const int_type n = rvalue->is_lit_int()
+                            ? static_cast<const LiteralInt *>(
+                                  rvalue.get())->ival()
+                            : rvalue->eval_int(ctx);   /* unboxed */
+
                         int_type &v = lv.getval<int_type>();
-                        const int_type n = lit->ival();
 
                         if (op == Op::addeq)      v += n;
                         else if (op == Op::subeq) v -= n;
@@ -3038,6 +3049,128 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
         return &(*data.emplace(memId, LValue(none, false)).first).second;
 
     throw KeyNotFoundEx(start, end);
+}
+
+/*
+ * Typed (unboxed) reads of a POD struct field (the M8 fast path, plans/
+ * structs.md phase 8): the inferencer stamps `th` on `s.x` when the field is a
+ * non-null int/float, and the specializer / compound-assign fast path then call
+ * these instead of do_eval() -> pod_get() -> a boxed EvalValue.
+ *
+ * Two cases: `a[i].field` on a flat POD-struct array reads the scalar STRAIGHT
+ * from the array bytes, with NO per-element StructObject materialized at all
+ * (guarded by no_side_effects so the array base is evaluated once); any other
+ * base falls back to evaluating it to a StructObject and reading its bytes.
+ */
+template <class T>
+static bool member_pod_array_scalar(const Subscript *sub, EvalContext *ctx,
+                                    const UniqueId *memUid, Loc s, Loc e,
+                                    T &out)
+{
+    if (!no_side_effects(sub->what.get()))
+        return false;
+
+    const EvalValue av = sub->what->eval(ctx);
+    const EvalValue &arrv = av.is<LValue *>() ? av.get<LValue *>()->get() : av;
+    if (!arrv.is<SharedArrayObj>())
+        return false;
+
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    if (arr.skind() != SharedArrayObj::Storage::structs)
+        return false;
+
+    const auto &sv = arr.flat_structs();
+    const FieldDef *f = sv.def->field_of(memUid);
+    if (!f || f->offset < 0)
+        return false;
+
+    int_type idx = sub->index->eval_int(ctx);
+    if (idx < 0)
+        idx += arr.size();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+        throw OutOfBoundsEx(s, e);
+
+    const char *p =
+        sv.buf.data() + (arr.offset() + idx) * sv.stride + f->offset;
+
+    switch (f->kind) {
+        case FieldKind::f_int: {
+            int_type v;
+            std::memcpy(&v, p, sizeof v);
+            out = static_cast<T>(v);
+            return true;
+        }
+        case FieldKind::f_float: {
+            float_type v;
+            std::memcpy(&v, p, sizeof v);
+            out = static_cast<T>(v);
+            return true;
+        }
+        case FieldKind::f_bool:
+            out = static_cast<T>(static_cast<unsigned char>(*p) != 0 ? 1 : 0);
+            return true;
+        default:
+            return false;
+    }
+}
+
+int_type MemberExpr::eval_int(EvalContext *ctx) const
+{
+    if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
+        int_type v;
+        if (member_pod_array_scalar(sub, ctx, memUid, start, end, v))
+            return v;
+    }
+
+    const EvalValue base = RValue(what->eval(ctx));
+    if (base.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *base.get<intrusive_ptr<StructObject>>().get();
+        const int slot = o.def->slot_of(memUid);
+        if (slot >= 0 && o.is_pod()) {
+            const FieldDef &f = o.def->fields[slot];
+            const char *p = o.bytes.data() + f.offset;
+            if (f.kind == FieldKind::f_int) {
+                int_type v;
+                std::memcpy(&v, p, sizeof v);
+                return v;
+            }
+            if (f.kind == FieldKind::f_bool)
+                return static_cast<unsigned char>(*p) != 0 ? 1 : 0;
+        }
+    }
+    return Construct::eval_int(ctx);
+}
+
+float_type MemberExpr::eval_float(EvalContext *ctx) const
+{
+    if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
+        float_type v;
+        if (member_pod_array_scalar(sub, ctx, memUid, start, end, v))
+            return v;
+    }
+
+    const EvalValue base = RValue(what->eval(ctx));
+    if (base.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *base.get<intrusive_ptr<StructObject>>().get();
+        const int slot = o.def->slot_of(memUid);
+        if (slot >= 0 && o.is_pod()) {
+            const FieldDef &f = o.def->fields[slot];
+            const char *p = o.bytes.data() + f.offset;
+            if (f.kind == FieldKind::f_float) {
+                float_type v;
+                std::memcpy(&v, p, sizeof v);
+                return v;
+            }
+            if (f.kind == FieldKind::f_int) {
+                int_type v;
+                std::memcpy(&v, p, sizeof v);
+                return static_cast<float_type>(v);
+            }
+            if (f.kind == FieldKind::f_bool)
+                return static_cast<unsigned char>(*p) != 0 ? 1.0 : 0.0;
+        }
+    }
+    return Construct::eval_float(ctx);
 }
 
 EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const
