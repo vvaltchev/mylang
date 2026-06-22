@@ -105,5 +105,12 @@ public:
     void next() { ts.next(); }
 };
 
+/*
+ * Parse a block of statements. `push_const_scope` (default true) pushes a fresh
+ * nested const-eval scope for the block, popped on exit - the normal lexical
+ * behavior. The REPL passes false for its top-level input so the statements
+ * parse directly into the persistent const context it set on `c.const_ctx`,
+ * letting a `const`/`pure func`/`struct` from one input fold in the next.
+ */
 unique_ptr<Construct>
-pBlock(ParseContext &c, unsigned fl = 0);
+pBlock(ParseContext &c, unsigned fl = 0, bool push_const_scope = true);

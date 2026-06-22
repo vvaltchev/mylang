@@ -17,6 +17,7 @@
 #include "backtrace.h"
 #include "stype.h"
 #include "inferencer.h"
+#include "repl.h"
 
 #include <typeinfo>
 #include <vector>
@@ -7504,6 +7505,105 @@ static bool stype_to_string_basic()
     return true;
 }
 
+/*
+ * REPL tests: a sequence of (input, expected-output-substring) steps driving a
+ * SINGLE ReplEngine, so the persisted global context is exercised across steps
+ * (input -> output -> input -> output ...). A step passes when the engine's
+ * output for that input CONTAINS the expected substring; the whole test passes
+ * iff every step does. This is the headless mock of an interactive session - no
+ * TTY needed (the line-editor layer is tested separately).
+ */
+struct repl_step {
+    const char *input;
+    const char *expect;     /* substring that must appear in the output */
+};
+
+struct repl_test {
+    const char *name;
+    std::vector<repl_step> steps;
+};
+
+static const std::vector<repl_test> repl_tests =
+{
+    { "a var persists across inputs",
+      { { "var x = 5", "=> 5" },
+        { "x + 1", "=> 6" },
+        { "x * x", "=> 25" } } },
+
+    { "a function defined in one input is callable in the next",
+      { { "func f(a) => a * 2", "" },
+        { "f(21)", "=> 42" },
+        { "f(f(3))", "=> 12" } } },
+
+    { "a const folds in a later input",
+      { { "const C = 10", "" },
+        { "C * 3", "=> 30" },
+        { "C + C", "=> 20" } } },
+
+    { "a struct type persists and constructs later",
+      { { "struct P { int x; int y; }", "" },
+        { "var p = P(3, 4)", "P(x: 3, y: 4)" },
+        { "p.x + p.y", "=> 7" } } },
+
+    { "redefining a global rebinds it",
+      { { "var x = 5", "=> 5" },
+        { "var x = 99", "=> 99" },
+        { "x", "=> 99" } } },
+
+    { "an undefined-variable error is recoverable",
+      { { "z + 1", "Undefined variable 'z'" },
+        { "var z = 3", "=> 3" },
+        { "z + 1", "=> 4" } } },
+
+    { "a runtime error does not kill the session",
+      { { "var b = 0", "=> 0" },
+        { "10 / b", "Division by zero" },
+        { "b + 7", "=> 7" } } },
+
+    { "print() output is shown, then the => echo",
+      { { "var x = 5", "=> 5" },
+        { "print(\"hi\", x)", "hi 5" } } },
+
+    { "multiple statements in one input; last value echoes",
+      { { "var a = 1; var b = 2; a + b", "=> 3" } } },
+
+    { "a flat array and a builtin over it persist",
+      { { "var arr = [10, 20, 30]", "" },
+        { "sum(arr)", "=> 60" },
+        { "len(arr)", "=> 3" } } },
+
+    { "a closure captures the persistent global scope",
+      { { "var base = 100", "=> 100" },
+        { "func addbase(n) => n + base", "" },
+        { "addbase(5)", "=> 105" },
+        { "var base = 200", "=> 200" },
+        { "addbase(5)", "=> 205" } } },
+
+    { "a syntax error in one input is recoverable",
+      { { "var q = (1 + ", "SyntaxError" },
+        { "var q = 7", "=> 7" },
+        { "q", "=> 7" } } },
+};
+
+static bool run_one_repl_test(const repl_test &t)
+{
+    ReplEngine engine;
+
+    for (const auto &s : t.steps) {
+
+        const std::string out = engine.eval_input(s.input);
+
+        if (out.find(s.expect) == std::string::npos) {
+            cout << "  step input : " << s.input << "\n";
+            cout << "  expected   : " << s.expect << "\n";
+            cout << "  got        : " << out << "\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
@@ -7584,7 +7684,25 @@ void run_tests(bool dump_syntax_tree)
         cout << endl << endl;
     }
 
-    const size_t total = tests.size() + extra_checks.size();
+    for (const auto &rt : repl_tests) {
+
+        cout << "[ RUN  ] repl: " << rt.name << endl;
+
+        if (run_one_repl_test(rt)) {
+
+            cout << "[ PASS ]";
+            pass_count++;
+
+        } else {
+
+            cout << "[ FAIL ]";
+        }
+
+        cout << endl << endl;
+    }
+
+    const size_t total =
+        tests.size() + extra_checks.size() + repl_tests.size();
 
     cout << "SUMMARY" << endl;
     cout << "===========================================" << endl;

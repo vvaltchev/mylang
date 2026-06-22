@@ -2150,7 +2150,20 @@ handle_single_expr14(EvalContext *ctx,
             const EvalValue &local_lval = lvalue->eval(ctx, false);
 
             if (!local_lval.is<UndefinedId>()) {
-                /* We're re-defining the same variable, in the same block */
+
+                /* REPL: a re-declaration of an existing global rebinds it
+                 * (fresh value + const-ness) - see
+                 * EvalContext::allow_redeclare.
+                 * Otherwise, re-defining the same variable in the same scope is
+                 * an error (the script rule). */
+                if (ctx->allow_redeclare && lvalue->is_id()) {
+                    const Identifier *id =
+                        static_cast<const Identifier *>(lvalue);
+                    ctx->erase(id);
+                    ctx->emplace(id, RValue(rval), lvalue->is_const);
+                    return rval;
+                }
+
                 throw AlreadyDefinedEx(lvalue->start, lvalue->end);
             }
 
