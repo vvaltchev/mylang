@@ -59,6 +59,29 @@ inline int pod_field_size(FieldKind k)
 
 inline int pod_field_align(FieldKind k) { return pod_field_size(k); }
 
+class StructObject;
+
+/*
+ * Store a (already-coerced) value into a POD field's byte slot at `base +
+ * f.offset`. Shared by StructObject::pod_set and the construct-in-place append
+ * fast path (builtin_append) so both write bytes identically. Defined out of
+ * line in eval.cpp (needs StructObject complete for the nested-struct case).
+ */
+void pod_store_field(const FieldDef &f, char *base, const EvalValue &v);
+
+class EvalContext;
+class Construct;
+
+/*
+ * The construct-in-place fast path behind `append(flat_struct_arr, S(...))`:
+ * build the new POD element straight into the array's byte buffer, no temporary
+ * StructObject. Returns false (fall back to the normal value-append) unless the
+ * arg is a struct-constructor call for the array's exact POD type. Defined in
+ * eval.cpp; called from builtin_append (a different TU).
+ */
+bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
+                                     Construct *arg);
+
 struct StructTypeDef {
 
     enum class Layout : unsigned char { boxed, pod };
@@ -217,31 +240,6 @@ public:
 
     /* Store a (coerced) scalar value into a POD field's byte slot. */
     void pod_set(int slot, const EvalValue &v) {
-        const FieldDef &f = def->fields[slot];
-        char *p = bytes.data() + f.offset;
-        switch (f.kind) {
-            case FieldKind::f_bool:
-                *p = v.get<bool>() ? 1 : 0;
-                break;
-            case FieldKind::f_int: {
-                int_type x = v.get<int_type>();
-                std::memcpy(p, &x, sizeof x);
-                break;
-            }
-            case FieldKind::f_float: {
-                float_type x = v.get<float_type>();
-                std::memcpy(p, &x, sizeof x);
-                break;
-            }
-            case FieldKind::f_struct: {
-                /* copy the value's bytes into the inline nested-struct slot */
-                const StructObject &o =
-                    *v.get<intrusive_ptr<StructObject>>().get();
-                std::memcpy(p, o.bytes.data(), f.struct_def->size);
-                break;
-            }
-            default:
-                throw InternalErrorEx();
-        }
+        pod_store_field(def->fields[slot], bytes.data(), v);
     }
 };
