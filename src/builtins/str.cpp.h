@@ -34,7 +34,7 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
 
     const SharedStr &shared_str = val_str.get<SharedStr>();
     const string_view &str = shared_str.get_view();
-    const string_view &delim = val_delim.get<SharedStr>().get_view();
+    const string_view delim = val_delim.get<SharedStr>().get_view();
 
     SharedArrayObj::vec_type vec;
 
@@ -87,7 +87,7 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
     if (!val_delim.is<SharedStr>())
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
 
-    const string_view &delim = val_delim.get<SharedStr>().get_view();
+    const string_view delim = val_delim.get<SharedStr>().get_view();
     /* Read kind-aware (arr_elem_at) so a flat int/float array doesn't promote -
      * its elements aren't strings, so each one is a clean TypeError below. */
     const SharedArrayObj &arr = val_arr.get<SharedArrayObj>();
@@ -242,7 +242,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
         if (!padc.is<SharedStr>())
             throw TypeErrorEx("Expected string", arg2->start, arg2->end);
 
-        const string_view &padstr = padc.get<SharedStr>().get_view();
+        const string_view padstr = padc.get<SharedStr>().get_view();
 
         if (padstr.size() > 1)
             throw InvalidValueEx("Expected 1-char string", arg2->start, arg2->end);
@@ -250,7 +250,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
         pad_char = padstr[0];
     }
 
-    const string_view &str = strval.get<SharedStr>().get_view();
+    const string_view str = strval.get<SharedStr>().get_view();
     const int_type n_orig = nval.get<int_type>();
 
     if (n_orig < 0)
@@ -381,8 +381,8 @@ EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList)
     if (!val1.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg1->start, arg1->end);
 
-    const string_view &str = val0.get<SharedStr>().get_view();
-    const string_view &substr = val1.get<SharedStr>().get_view();
+    const string_view str = val0.get<SharedStr>().get_view();
+    const string_view substr = val1.get<SharedStr>().get_view();
 
     if (str.size() >= substr.size())
         if (str.substr(0, substr.size()) == substr)
@@ -407,8 +407,8 @@ EvalValue builtin_endswith(EvalContext *ctx, ExprList *exprList)
     if (!val1.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg1->start, arg1->end);
 
-    const string_view &str = val0.get<SharedStr>().get_view();
-    const string_view &substr = val1.get<SharedStr>().get_view();
+    const string_view str = val0.get<SharedStr>().get_view();
+    const string_view substr = val1.get<SharedStr>().get_view();
 
     if (str.size() >= substr.size())
         if (str.substr(str.size() - substr.size()) == substr)

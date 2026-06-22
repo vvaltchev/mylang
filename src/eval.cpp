@@ -2466,7 +2466,7 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
     } else if (cval.is<SharedStr>()) {
 
-        const string_view &view = cval.get<SharedStr>().get_view();
+        const string_view view = cval.get<SharedStr>().get_view();
 
         for (size_type i = 0; i < view.size(); i++) {
 
