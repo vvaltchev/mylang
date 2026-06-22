@@ -1343,6 +1343,21 @@ struct with any `array`/`dict`/`str`/`dyn`/`opt` field is stored as a boxed
 slot array instead. This is transparent: it changes only memory layout and
 speed, never behavior.
 
+**Recursive structs must use a nullable field.** A *non-opt* struct field whose
+type contains its own struct (directly, `struct N { N next; }`, or through a
+cycle of non-opt struct fields) is a **compile error** — such a value could
+never be constructed (it would nest forever). Make the back-edge **nullable** so
+it can terminate with `none`: write `dyn? next` (or `opt dyn next`). That is how
+you build a linked list or tree:
+
+```
+struct Node {
+    int val;
+    dyn? next;          # nullable: the chain ends at `none`
+}
+var list = Node(1, Node(2, Node(3, none)));
+```
+
 Structs may be declared anywhere a statement is allowed, **including inside a
 function** (lexically scoped like a nested function). A struct's fields and
 consts live in the struct's own namespace, so a struct `const PI` never clashes

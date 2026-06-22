@@ -1292,7 +1292,19 @@ but the per-element `StructObject` allocation is gone (build overhead
   boxed-struct field makes it **boxed** (a `vector<LValue>` slot array). A
   nested struct field embeds inline only if its type was *declared before* this
   one (resolved via `const_ctx` in the parser → `FieldDef::struct_def`); a
-  forward/self reference stays a boxed pointer (so no infinite layout).
+  forward/self reference to a **non-recursive** type stays a boxed pointer.
+- **Recursive-struct rejection** (`check_struct_no_recursion`, parser, run
+  before `compute_layout`). A **non-opt** struct field whose type — directly or
+  transitively through other non-opt struct fields — contains the struct itself
+  is a compile error (`SyntaxErrorEx`, "box it as `dyn? <name>`"): such a value
+  can never be constructed (infinite nesting; and inlined, infinite size). The
+  field-reference graph among earlier structs is a DAG (inline only goes
+  backward), so the only back-edge that can close a cycle is a forward/self
+  reference to the struct being declared — detected by a DFS over non-opt struct
+  fields (`struct_field_target` resolves each edge by `struct_def`, the
+  root's own name, or a `const_ctx` lookup for an intermediate forward ref). An
+  **`opt`** field (e.g. `dyn? next`) breaks the cycle (it can terminate with
+  `none`) and is allowed — the way to write a linked list / tree.
 - **`StructObject`** holds EITHER `bytes` (POD: a `def->size` C-laid-out buffer;
   `pod_get`/`pod_set` load/store a typed scalar or an inline nested struct at a
   field offset) OR `fields` (boxed). A POD field WRITE goes through

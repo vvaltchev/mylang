@@ -3,7 +3,10 @@
 > **BUILD STATUS (live).** **ALL 8 phases are DONE and committed.** The full
 > boxed feature (decl, construction, field/`const` access, inference,
 > const-fold, COW) **plus** phase 5 (POD C-layout), phase 6 (nested/recursive
-> POD), phase 7 (flat `array<PodStruct>` storage with a COW-reuse `foreach` and
+> POD — with a `check_struct_no_recursion` parser pass that rejects an
+> infinitely-recursive non-opt struct field, pointing the user at a nullable
+> `dyn? <field>` back-edge), phase 7 (flat `array<PodStruct>` storage with a
+> COW-reuse `foreach` and
 > an auto-promote cold path), and **phase 8** — M8-style *direct* unboxed field
 > access (`MemberExpr::eval_int`/`eval_float`; `a[i].field` reads straight from
 > the array bytes via `member_pod_array_scalar`, no materialization; the
