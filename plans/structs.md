@@ -1,17 +1,20 @@
 # Custom struct types — implementation plan
 
-> **BUILD STATUS (live).** Phases **1–4 are DONE and committed** — the full
-> *boxed* feature: `struct` decl, construction (positional / named / mixed, with
-> the named-arg pipeline), field & `const` access, value/COW/const semantics,
-> whole-program inference, and const-folding. **Phase 9 (tests + docs + a
-> coverage pass + the `bench/58_structs` baseline) is DONE** for the boxed
-> feature — 837 `-rt` tests pass; README + CLAUDE document it. **Phases 5–8 (the
-> POD C-layout, nested POD, flat `array<Struct>`, and M8 field access — i.e. the
-> perf optimization) are NOT yet done**; today every struct is boxed
-> (`bench/58_structs` is ~26× CPython, the gap those phases close). The approach
-> is validated: a POD field *write* reuses the existing
-> `try_flat_subscript_store` pattern (a direct typed store bypassing the lvalue
-> model), and member access
+> **BUILD STATUS (live).** Phases **1–7 are DONE and committed** — the full
+> boxed feature (decl, construction, field/`const` access, inference,
+> const-fold, COW) **plus** phase 5 (POD C-layout), phase 6 (nested/recursive
+> POD), and phase 7 (flat `array<PodStruct>` storage with a COW-reuse `foreach`
+> and an auto-promote cold path). 871 `-rt` tests pass (ASan), coverage-
+> hardened;
+> README + CLAUDE document it. **Only phase 8 remains** — the M8-style *direct*
+> field access (read `s.x`/`a[i].x` from the bytes without materializing a
+> `StructObject`). Until then a flat struct array is a memory/cache win and
+> CPU-neutral on per-element access (`bench/58_structs`), not yet an
+> `array<int>`-speed win; that gap is exactly what phase 8 closes (it needs
+> foreach-body / subscript-chain specialization). The earlier validation held: a
+> POD field *write* reuses the `try_flat_subscript_store` pattern (a direct
+> typed
+> store bypassing the lvalue model), and member access
 > must respect `is_lvalue_rooted` (a field lvalue is handed out only for a
 > variable-rooted base, never a temporary — see the UAF fix in eval.cpp). See
 > §16 for the remaining task order.
