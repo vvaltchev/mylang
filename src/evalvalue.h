@@ -27,6 +27,8 @@ class EvalValue;
 class EvalContext;
 
 class FuncObject;
+struct StructTypeDef;   /* a struct type descriptor (structtype.h) */
+class StructObject;     /* a struct instance (structtype.h) */
 struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
 
 /* Base typedefs for non-generic template types */
@@ -55,6 +57,8 @@ template <> struct TypeToEnum<shared_ptr<FuncObject>> { enum { val = Type::t_fun
 template <> struct TypeToEnum<SharedArrayObj> { enum { val = Type::t_arr }; };
 template <> struct TypeToEnum<shared_ptr<ExceptionObject>> { enum { val = Type::t_ex }; };
 template <> struct TypeToEnum<intrusive_ptr<DictObject>> { enum { val = Type::t_dict }; };
+template <> struct TypeToEnum<StructTypeDef *> { enum { val = Type::t_structtype }; };
+template <> struct TypeToEnum<intrusive_ptr<StructObject>> { enum { val = Type::t_struct }; };
 
 /*
  * Binary-operation dispatch with int -> float promotion.
@@ -89,6 +93,7 @@ class EvalValue final {
         Builtin bfunc;
         float_type ldval;
         bool bval;          /* t_bool; aliases ival's low byte */
+        StructTypeDef *structtype;   /* t_structtype (raw, AST-owned) */
 
         /* non-trivial types */
         FlatVal<SharedStr> str;
@@ -96,6 +101,7 @@ class EvalValue final {
         FlatVal<SharedArrayObj> arr;
         FlatVal<shared_ptr<ExceptionObject>> ex;
         FlatVal<intrusive_ptr<DictObject>> dict;
+        FlatVal<intrusive_ptr<StructObject>> struct_;   /* t_struct */
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }
@@ -103,6 +109,7 @@ class EvalValue final {
         ValueU(int_type val) : ival(val) { }
         ValueU(const Builtin &val) : bfunc(val) { }
         ValueU(float_type val) : ldval(val) { }
+        ValueU(StructTypeDef *val) : structtype(val) { }
     };
 
 
@@ -179,11 +186,13 @@ public:
         static_assert(offsetof(ValueU, bfunc) == 0);
         static_assert(offsetof(ValueU, ldval) == 0);
         static_assert(offsetof(ValueU, bval) == 0);
+        static_assert(offsetof(ValueU, structtype) == 0);
         static_assert(offsetof(ValueU, str) == 0);
         static_assert(offsetof(ValueU, func) == 0);
         static_assert(offsetof(ValueU, arr) == 0);
         static_assert(offsetof(ValueU, ex) == 0);
         static_assert(offsetof(ValueU, dict) == 0);
+        static_assert(offsetof(ValueU, struct_) == 0);
 
         if (is<T>())
             return *reinterpret_cast<T *>(&val);

@@ -10,6 +10,7 @@
 #include "types/exception.cpp.h"
 #include "types/float.cpp.h"
 #include "types/dict.cpp.h"
+#include "types/struct.cpp.h"
 #include "builtins/str.cpp.h"
 #include "builtins/io.cpp.h"
 #include "builtins/num.cpp.h"
@@ -29,11 +30,13 @@ static const std::array<SharedStr, Type::t_count> TypeNames =
     string("builtin"),
     string("float"),
     string("bool"),
+    string("struct_type"),
     string("str"),
     string("func"),
     string("arr"),
     string("exception"),
     string("dict"),
+    string("struct"),
 };
 
 EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
@@ -131,6 +134,7 @@ const std::array<Type *, Type::t_count> AllTypes =
     new TypeBuiltin(),
     new TypeFloat(),
     new TypeBool(),
+    new TypeStructType(),
 
     /* Non-trivial types */
     new TypeStr(),
@@ -138,6 +142,7 @@ const std::array<Type *, Type::t_count> AllTypes =
     new TypeArr(),
     new TypeException(),
     new TypeDict(),
+    new TypeStruct(),
 };
 
 
