@@ -1851,6 +1851,84 @@ struct_check_name_free(const StructTypeDef &def, const UniqueId *n, Loc loc)
 }
 
 /*
+ * The struct a non-opt struct-typed field points at: its resolved `struct_def`
+ * (a backward reference), else `root` if the field names the struct being
+ * declared (a self/forward reference to it), else a lookup of the field's type
+ * name in `const_ctx` (a forward reference to a struct declared in between -
+ * its `struct_def` was null when the field was parsed but it is in scope now).
+ * Returns null for an opt/non-struct field or a genuinely undeclared type.
+ */
+static const StructTypeDef *
+struct_field_target(const FieldDef &f, const StructTypeDef *root,
+                    EvalContext *const_ctx)
+{
+    if (f.kind != FieldKind::f_struct || f.is_opt)
+        return nullptr;
+    if (f.struct_def)
+        return f.struct_def;
+    if (f.struct_ty == root->name)
+        return root;
+    if (const_ctx) {
+        Identifier nameRef(f.struct_ty->val);
+        const EvalValue ev = nameRef.eval(const_ctx);
+        if (ev.is<LValue *>()) {
+            const EvalValue &dv = ev.get<LValue *>()->get();
+            if (dv.is<StructTypeDef *>())
+                return dv.get<StructTypeDef *>();
+        }
+    }
+    return nullptr;
+}
+
+/* Whether `cur` can reach `root` by following NON-OPT struct fields (the
+ * back-edge that would make `root` infinitely recursive). */
+static bool
+struct_reaches_root(const StructTypeDef *cur, const StructTypeDef *root,
+                    std::set<const StructTypeDef *> &seen, EvalContext *cctx)
+{
+    for (const auto &f : cur->fields) {
+        const StructTypeDef *t = struct_field_target(f, root, cctx);
+        if (!t)
+            continue;
+        if (t == root)
+            return true;
+        if (seen.insert(t).second && struct_reaches_root(t, root, seen, cctx))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Reject a struct that is infinitely recursive: a NON-OPT struct-typed field
+ * whose type (directly or transitively, through other non-opt struct fields)
+ * contains the struct itself. Such a value can never be constructed - it would
+ * nest forever (and, were such a field inlined, have infinite size). The fix is
+ * to box the back-edge by making it nullable; v1 boxes via `dyn`, so the
+ * message points the user at `dyn? <field>`. A self/mutual cycle is detected at
+ * the declaration that closes it. An `opt` field breaks the cycle (it can
+ * terminate with `none`), so it is not followed.
+ */
+static void
+check_struct_no_recursion(const StructTypeDef *def,
+                          const std::vector<Loc> &field_locs,
+                          EvalContext *cctx)
+{
+    for (size_t i = 0; i < def->fields.size(); i++) {
+        const StructTypeDef *t =
+            struct_field_target(def->fields[i], def, cctx);
+        if (!t)
+            continue;
+        std::set<const StructTypeDef *> seen{def};
+        if (t == def || struct_reaches_root(t, def, seen, cctx))
+            throw SyntaxErrorEx(field_locs[i],
+                "recursive struct field: a non-opt struct field whose type "
+                "contains its own struct can never be constructed (it would "
+                "nest forever). Box it by making it nullable - e.g. "
+                "'dyn? <name>' or 'opt dyn <name>'");
+    }
+}
+
+/*
  * Parse `struct Name { field/const ... }` (plans/structs.md). A field is
  * `[opt] TYPE name;` where TYPE is a primitive keyword, `dyn`, or a struct-type
  * name (an identifier - validated later by the inferencer). v1 rejects `var`
@@ -1879,6 +1957,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     pExpectOp(c, Op::braceL);
 
     int next_slot = 0;
+    std::vector<Loc> field_locs;     /* parallel to def->fields, for errors */
 
     while (!pAcceptOp(c, Op::braceR)) {
 
@@ -1973,9 +2052,16 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         fd.slot = next_slot++;
         stmt->def->fields.push_back(fd);
+        field_locs.push_back(mloc);
     }
 
     stmt->end = c.get_loc() + 1;
+
+    /* reject an infinitely-recursive struct (a non-opt self/mutual struct
+     * field) with a clear "box it as 'dyn?'" message - before compute_layout,
+     * which would otherwise just silently box the back-edge */
+    check_struct_no_recursion(stmt->def.get(), field_locs,
+                              c.const_eval ? c.const_ctx : nullptr);
 
     /* decide POD vs boxed storage and assign POD field byte offsets */
     stmt->def->compute_layout();
