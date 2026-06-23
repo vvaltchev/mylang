@@ -5572,16 +5572,17 @@ static const std::vector<test> tests =
       { "func f(float a, int b) => a;",
         "assert(type(f(a: 3, b: 2)) == \"float\");",
         "assert(f(a: 3, b: 2) == 3.0);" } },
-    { "named args: a pure call with names folds (var path / AutoConst)",
-      /* A named call is not folded at PARSE time (callee params unresolved
-       * there), so it cannot initialize a `const` - but AutoConst still folds a
-       * pure named call bound to a `var`. */
+    { "named args: a pure call with names folds (var + const)",
+      /* A named call to an already-declared pure func is desugared to
+       * positional at parse time, so it const-folds like the positional form -
+       * usable in a `var` and a `const` alike. */
       { "pure func add(a, b) => a + b;",
         "var c = add(a: 3, b: 4); assert(c == 7);",
-        "var d = add(a: 10, b: 100); assert(d == 110);" } },
-    { "named args: a named call cannot be a const initializer",
-      { "pure func add(a, b) => a + b; const C = add(a: 3, b: 4);" },
-      &typeid(ExpressionIsNotConstEx) },
+        "const D = add(a: 10, b: 100); assert(D == 110);" } },
+    { "named args: a named pure call folds in a const initializer",
+      /* skips the interior opt `y` -> none, all at compile time */
+      { "pure func f(x, y?, z?) => [x, y, z];",
+        "const C = f(x: 1, z: 5); assert(C == [1, none, 5]);" } },
     { "named args: all-opt function, name just the second",
       { "func f(opt a, opt b) { if (a == none) return b; return a; }",
         "assert(f(b: 9) == 9); assert(f(a: 1) == 1);" } },
