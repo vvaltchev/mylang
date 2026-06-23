@@ -527,6 +527,9 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         what->start = call->what->start;
         what->end = call->what->end;
         id_sym[what.get()] = global->syms[clone->id->uid];
+        /* The old callee Identifier is about to be freed: drop its id_sym entry
+         * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
+        id_sym.erase(call->what.get());
         call->what = move(what);
         progress = true;
     }
