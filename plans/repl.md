@@ -9,16 +9,18 @@
 > syntax highlighting (`highlight.{h,cpp}`); multi-line blocks (context-aware
 > auto-`;` + auto-indent); meta-commands (`:tree`/`:source`/`:help`/`:quit`).
 > Headless tests cover all of it (`repl:` sequences + `lineedit:`/`highlight:`
-> checks). **Also done since v1:** Phase 4 **Tab autocompletion** (keywords +
-> builtins + globals + struct fields after `.`) and Phase-5 polish bits
-> (history persisted to `~/.mylang_history`; a `none` result isn't echoed).
-> **DEFERRED (one piece): the faithful incremental inference** of §3.1 —
-> running the real type-inference/resolver/specialize passes per input with
-> cross-input type-commitment. The engine evaluates correctly and persists
-> state (const-folding crosses inputs), but does not yet run inference/the
-> optimizers per input; that needs a persistent-`Inferencer` refactor (intricate
-> code) and is left for review. **Not yet:** the IRB dropdown-style completion
-> menu, reverse-search/bracketed-paste, and the Windows backend (Phase 5).
+> checks). **Also done:** Phase 4 **Tab autocompletion** (keywords + builtins +
+> globals + struct fields after `.`); Phase-5 polish (history persisted to
+> `~/.mylang_history`; a `none` result isn't echoed); and — the once-deferred
+> §3.1 piece — the **faithful per-input pipeline**: the REAL inference,
+> resolver, and specializer run on every input over an expandable global scope,
+> with **cross-input type commitment** (a committed global's type is pinned, so
+> a later `x = <wrong type>` is the same `TypeMismatchEx` a script gives;
+> `undef(x)` resets it), the **optimizers run per input** (resolver `repl_mode`
+> keeps top-level decls as map globals while nested locals slot/inline/
+> specialize), and a **`:analyze`** command to inspect them. **Not yet:** the
+> IRB dropdown-style completion menu, reverse-search/bracketed-paste, and the
+> Windows backend (Phase 5).
 >
 > Original design follows. The two hard problems are (1) running the *real,
 > full* pipeline per input over an **expandable global scope** so the REPL is a
