@@ -2462,6 +2462,67 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* `array += array` concatenation for each flat storage kind, plus
+         * clone/intptr - the flat float/bool paths the struct flat-array work
+         * (plans/structs.md phase 7) mirrors. */
+        "Typed arrays: flat += concatenation, clone, intptr (float/bool)",
+        {
+            "var fa = [1.0, 2.0]; fa += [3.0, 4.0];",
+            "assert(fa == [1.0, 2.0, 3.0, 4.0]);",
+            "assert(array_storage(fa) == \"floats\");",
+            "var ba = [true, false]; ba += [true, true];",
+            "assert(ba == [true, false, true, true]);",
+            "assert(array_storage(ba) == \"bools\");",
+            "var ia = [1, 2]; ia += [3, 4]; assert(ia == [1, 2, 3, 4]);",
+            "assert(array_storage(ia) == \"ints\");",
+            /* concatenation onto a slice clones (the slice branch); slice a
+             * variable so it is a live slice view, not a materialized copy */
+            "var fbase = [1.0, 2.0, 3.0]; var fs = fbase[0:2]; fs += [9.0];",
+            "assert(fs == [1.0, 2.0, 9.0]); assert(fbase == [1.0, 2.0, 3.0]);",
+            "var bbase = [true, false, true]; var bs = bbase[0:2];",
+            "bs += [true]; assert(bs == [true, false, true]);",
+            /* clone keeps flat storage and is independent */
+            "var fc = clone([1.0, 2.0]); append(fc, 3.0);",
+            "assert(array_storage(fc) == \"floats\"); assert(len(fc) == 3);",
+            "var bc = clone([true]); assert(array_storage(bc) == \"bools\");",
+            /* intptr identity on flat float/bool arrays */
+            "var fp = [1.0]; var fq = fp; assert(intptr(fp) == intptr(fq));",
+            "var bp = [true]; var bp2 = clone(bp);",
+            "assert(intptr(bp) != intptr(bp2));",
+            /* a general array concatenating a flat one (arr_elem_at path) */
+            "var dyn ga = [1, \"x\"]; ga += [2, 3];",
+            "assert(ga == [1, \"x\", 2, 3]);",
+        },
+    },
+    { "arrays: += with a non-array right side is a type error (runtime)",
+      { "var dyn a = [1.0]; a += 5;" }, &typeid(TypeErrorEx) },
+    {
+        /* the flat float/bool builtin paths (append/pop/insert/erase/sort/
+         * reverse/min/max/sum/find/map/filter) that the struct flat-array work
+         * mirrors - each must keep the storage flat and stay correct. */
+        "Typed arrays: flat float/bool builtin operations",
+        {
+            "var f = [3.0, 1.0, 2.0];",
+            "append(f, 4.0); assert(f == [3.0, 1.0, 2.0, 4.0]);",
+            "assert(pop(f) == 4.0);",
+            "insert(f, 0, 0.0); assert(f == [0.0, 3.0, 1.0, 2.0]);",
+            "erase(f, 1); assert(f == [0.0, 1.0, 2.0]);",
+            "sort(f); assert(f == [0.0, 1.0, 2.0]);",
+            "reverse(f); assert(f == [2.0, 1.0, 0.0]);",
+            "assert(min(f) == 0.0); assert(max(f) == 2.0);",
+            "assert(sum(f) == 3.0); assert(find(f, 1.0) == 1);",
+            "assert(map(func(x) => x * 2.0, f) == [4.0, 2.0, 0.0]);",
+            "assert(filter(func(x) => x > 0.0, f) == [2.0, 1.0]);",
+            "assert(array_storage(f) == \"floats\");",
+            "var b = [false, true, false];",
+            "append(b, true); assert(array_storage(b) == \"bools\");",
+            "assert(sum(b) == 2);",
+            "reverse(b); assert(b == [true, false, true, false]);",
+            "assert(find(b, true) == 0);",
+            "sort(b); assert(b == [false, false, true, true]);",
+        },
+    },
+    {
         "Typed arrays: flat subscript store + compound keep storage flat",
         {
             "var a = range(5);",
