@@ -2472,8 +2472,11 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
     if (id) {
 
-        if (!id->eval(ctx).is<UndefinedId>())
-            throw AlreadyDefinedEx(id->start, id->end);
+        if (!id->eval(ctx).is<UndefinedId>()) {
+            if (!ctx->allow_redeclare)        /* REPL: redefining replaces */
+                throw AlreadyDefinedEx(id->start, id->end);
+            ctx->erase(id.get());
+        }
 
         ctx->emplace(id.get(), move(desc), true /* const */);
         return none;
@@ -2490,8 +2493,13 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
     if (id) {
 
-        if (!id->eval(ctx).is<UndefinedId>())
-            throw AlreadyDefinedEx(id->start, id->end);
+        if (!id->eval(ctx).is<UndefinedId>()) {
+            /* REPL: re-defining a function replaces it (the edit-and-resubmit
+             * workflow); a script rejects the duplicate. */
+            if (!ctx->allow_redeclare)
+                throw AlreadyDefinedEx(id->start, id->end);
+            ctx->erase(id.get());
+        }
 
         ctx->emplace(
             id.get(),

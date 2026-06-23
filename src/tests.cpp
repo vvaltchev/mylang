@@ -7657,6 +7657,22 @@ static const std::vector<repl_test> repl_tests =
         { "array_storage(fa)", "=> ints" },
         { "var fb = [1.5, 2.5]", "" },
         { "array_storage(fb)", "=> floats" } } },
+
+    { "a function can be redefined (edit + resubmit)",
+      { { "func rf(n) => n * 2", "" },
+        { "rf(5)", "=> 10" },
+        { "func rf(n) => n * 3", "" },
+        { "rf(5)", "=> 15" } } },
+
+    { "a struct can be redefined",
+      { { "struct RS { int x; }", "" },
+        { "struct RS { int x; int y; }", "" },
+        { "var rsv = RS(1, 2)", "RS(x: 1, y: 2)" },
+        { "rsv.x + rsv.y", "=> 3" } } },
+
+    { "a multi-line input is one history/eval unit",
+      { { "func ml(int a) {\n  var t = a + 1\n  return t * 10\n}", "" },
+        { "ml(4)", "=> 50" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)
@@ -7767,6 +7783,56 @@ static bool lineedit_ctrl_c_and_d()
     if (ed3.feed(4) != LineEditor::Action::none)   /* C-D non-empty: del fwd */
         return false;
     return ed3.buffer() == "b";
+}
+
+/* a simple completeness test for the multi-line editor tests: brackets balance */
+static bool le_balanced(const std::string &s)
+{
+    int d = 0;
+    for (char c : s) {
+        if (c == '{' || c == '(' || c == '[') d++;
+        else if (c == '}' || c == ')' || c == ']') d--;
+    }
+    return d <= 0;
+}
+
+static bool lineedit_multiline_enter_inserts_newline()
+{
+    LineEditor ed;
+    ed.set_submitter(le_balanced);
+    le_feed(ed, "func f() {");
+    /* unbalanced -> Enter inserts a newline + auto-indent (2 spaces) */
+    if (ed.feed(13) != LineEditor::Action::none) return false;
+    if (ed.buffer() != "func f() {\n  ") return false;
+    le_feed(ed, "return 1;");
+    ed.feed(13);                       /* still one open brace -> newline */
+    le_feed(ed, "}");
+    /* balanced now -> Enter submits */
+    return ed.feed(13) == LineEditor::Action::submit;
+}
+
+static bool lineedit_multiline_cursor_and_nav()
+{
+    LineEditor ed;
+    ed.set_buffer("ab\ncde\nf");       /* 3 lines, cursor at end */
+    if (ed.cursor_row() != 2 || ed.cursor_col() != 1) return false;
+    ed.feed(16);                       /* Ctrl-P: up to line 1, col 1 */
+    if (ed.cursor_row() != 1 || ed.cursor_col() != 1) return false;
+    ed.feed(16);                       /* up to line 0, col 1 */
+    if (ed.cursor_row() != 0 || ed.cursor_col() != 1) return false;
+    ed.feed(14);                       /* Ctrl-N: back down to line 1 */
+    return ed.cursor_row() == 1;
+}
+
+static bool lineedit_multiline_home_end_kill()
+{
+    LineEditor ed;
+    ed.set_buffer("first\nsecond");    /* cursor at end of line 1 */
+    ed.feed(1);                        /* Ctrl-A: start of CURRENT line */
+    if (ed.cursor_col() != 0) return false;
+    ed.feed(11);                       /* Ctrl-K: kill to end of LINE */
+    if (ed.buffer() != "first\n") return false;
+    return ed.cursor_row() == 1 && ed.cursor_col() == 0;
 }
 
 static bool lineedit_history_nav()
@@ -7933,6 +7999,12 @@ static const std::vector<extra_check> extra_checks =
     { "lineedit: Enter submits", lineedit_submit_action },
     { "lineedit: Ctrl-C cancels, Ctrl-D eof/delete", lineedit_ctrl_c_and_d },
     { "lineedit: Up/Down history navigation", lineedit_history_nav },
+    { "lineedit: Enter inserts a newline until complete (multi-line)",
+      lineedit_multiline_enter_inserts_newline },
+    { "lineedit: 2-D cursor + within-block Up/Down",
+      lineedit_multiline_cursor_and_nav },
+    { "lineedit: line-relative Home/End/kill in a block",
+      lineedit_multiline_home_end_kill },
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
     { "AST deep-clone round-trips", ast_clone_roundtrip },
     { "inliner splices an expr-func call", inliner_splices_call },

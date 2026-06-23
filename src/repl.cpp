@@ -24,9 +24,23 @@
 #include <iterator>
 #include <cctype>
 #include <cstdlib>     /* getenv */
+#ifndef _WIN32
 #include <unistd.h>    /* isatty */
+#endif
 
 using std::string;
+
+/* Is stdout a terminal (for color)? The REPL is non-interactive on Windows
+ * (see plans/repl.md), so there it is always "not a tty" - no color. */
+static bool
+repl_out_is_tty()
+{
+#ifdef _WIN32
+    return false;
+#else
+    return isatty(STDOUT_FILENO);
+#endif
+}
 
 /*
  * Persistent interpreter state for the REPL. The const context and the runtime
@@ -50,9 +64,13 @@ struct ReplEngine::Impl {
         : const_ctx(new EvalContext(nullptr, /*const_ctx=*/true))
         , runtime_ctx(new EvalContext(nullptr, /*const_ctx=*/false))
     {
-        /* The prompt lets you redefine a global (re-declare to change its
-         * value/type), unlike a script where a duplicate decl is an error. */
+        /* The prompt lets you redefine a function or struct (the edit-and-
+         * resubmit workflow), unlike a script where a duplicate decl is an
+         * error. Set on both scopes: structs / pure funcs are registered in the
+         * const context at parse time, vars/funcs in the runtime one. (A plain
+         * `var`'s TYPE still sticks - the inferencer's job, not this.) */
         runtime_ctx->allow_redeclare = true;
+        const_ctx->allow_redeclare = true;
     }
 
     string format_error(const Exception &e) const {
@@ -453,7 +471,7 @@ ReplEngine::Impl::cmd_analyze(const string &code)
         collect_resolver_analysis(root.get(), info);
 
         const bool color =
-            isatty(STDOUT_FILENO) && !std::getenv("NO_COLOR");
+            repl_out_is_tty() && !std::getenv("NO_COLOR");
         std::ostringstream o;
         render_analysis(o, local_lines, info, color);
         return o.str();
@@ -683,7 +701,7 @@ run_repl()
     load_history(history);
 
     /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
-    const bool color = isatty(STDOUT_FILENO) && !std::getenv("NO_COLOR");
+    const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
     set_highlight_enabled(color);
     auto *hl = color ? highlight_line : nullptr;
 
@@ -692,66 +710,42 @@ run_repl()
             return engine.completions(b, cur);
         };
 
-    std::cout << "MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.\n";
+    /* The editor keeps a block open until it parses complete (a meta-command
+     * `:...` line is always complete - it never spans rows). */
+    LineEditor::Submitter submitter = [](const string &s) {
+        const size_t i = s.find_first_not_of(" \t\r\n");
+        if (i != string::npos && s[i] == ':')
+            return true;
+        return !ReplEngine::is_incomplete(s);
+    };
 
-    string input;
-    bool continuing = false;
+    std::cout << "MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.\n";
 
     while (true) {
 
-        /* Auto-indent a continuation line by the current bracket depth. */
-        const string indent =
-            continuing ? string(repl_bracket_depth(input) * 2, ' ') : "";
+        ReadLineResult r =
+            read_line(">> ", ".. ", history, hl, completer, submitter);
 
-        ReadLineResult r = read_line(continuing ? ".. " : ">> ", history, hl,
-                                     indent, completer);
+        if (r.eof)
+            break;                          /* Ctrl-D at the prompt exits */
+        if (r.cancelled)
+            continue;                       /* Ctrl-C drops the input */
 
-        if (r.eof) {
-            /* Ctrl-D mid-block abandons it; at a fresh prompt it exits. */
-            if (continuing) {
-                input.clear();
-                continuing = false;
-                continue;
-            }
+        const string &input = r.line;       /* may span multiple lines */
+        if (input.find_first_not_of(" \t\r\n") == string::npos)
+            continue;                       /* blank */
+
+        /* A leading ':' meta-command (`:quit` exits; others run via eval_input,
+         * which dispatches them). The whole input is one history entry. */
+        const size_t s = input.find_first_not_of(" \t");
+        const bool is_meta = (s != string::npos && input[s] == ':');
+        if (is_meta && (input.substr(s) == ":quit" || input.substr(s) == ":q"))
             break;
-        }
 
-        if (r.cancelled) {                  /* Ctrl-C: drop the current input */
-            input.clear();
-            continuing = false;
-            continue;
-        }
-
-        const string &line = r.line;
-        if (!line.empty() && line != ":quit" && line != ":q")
-            history.push_back(line);
-
-        /* A meta-command (`:name ...`) at a fresh prompt is a complete one-line
-         * input - never accumulated for multi-line continuation. */
-        if (!continuing) {
-            const size_t s = line.find_first_not_of(" \t");
-            if (s != string::npos && line[s] == ':') {
-                const string c = line.substr(s);
-                if (c == ":quit" || c == ":q")
-                    break;
-                std::cout << engine.eval_input(line);
-                continue;
-            }
-        }
-
-        if (!input.empty())
-            input += "\n";
-        input += line;
-
-        if (ReplEngine::is_incomplete(input)) {
-            continuing = true;
-            continue;
-        }
+        if (input != ":quit" && input != ":q")
+            history.push_back(input);
 
         std::cout << engine.eval_input(input);
-
-        input.clear();
-        continuing = false;
     }
 
     save_history(history);
