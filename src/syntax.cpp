@@ -360,6 +360,28 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
     call->args = move(positional);
 }
 
+void StructDeclStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+    s << indent << "StructDecl(\"" << def->name->val << "\"";
+
+    for (const auto &f : def->fields)
+        s << ", " << f.name->val;
+    for (const auto &c : def->consts)
+        s << ", const " << c.first->val;
+
+    s << ")";
+}
+
+unique_ptr<Construct> StructDeclStmt::clone() const
+{
+    auto c = make_unique<StructDeclStmt>();
+    copy_base_fields(*c);
+    c->id = clone_as(id);
+    c->def = make_unique<StructTypeDef>(*def);
+    return c;
+}
+
 void Expr14::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

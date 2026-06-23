@@ -258,6 +258,11 @@ pAcceptFuncDecl(ParseContext &c,
                 unsigned fl);
 
 bool
+pAcceptStructDecl(ParseContext &c,
+                  unique_ptr<Construct> &ret,
+                  unsigned fl);
+
+bool
 pAcceptTryCatchStmt(ParseContext &c,
                     unique_ptr<Construct> &ret,
                     unsigned fl);
@@ -1510,6 +1515,10 @@ pStmt(ParseContext &c, unsigned fl)
 
         return subStmt;
 
+    } else if (pAcceptStructDecl(c, subStmt, fl)) {
+
+        return subStmt;
+
     } else if (pAcceptReturnStmt(c, subStmt, fl)) {
 
         return subStmt;
@@ -1790,6 +1799,162 @@ pAcceptFuncDecl(ParseContext &c,
         func->eval(c.const_ctx);
 
     ret = move(func);
+    return true;
+}
+
+static FieldKind decltype_to_fieldkind(DeclType dt)
+{
+    switch (dt) {
+        case DeclType::b:    return FieldKind::f_bool;
+        case DeclType::i:    return FieldKind::f_int;
+        case DeclType::f:    return FieldKind::f_float;
+        case DeclType::s:    return FieldKind::f_str;
+        case DeclType::arr:  return FieldKind::f_array;
+        case DeclType::dict: return FieldKind::f_dict;
+        default:             return FieldKind::f_dyn;
+    }
+}
+
+/* v1: `opt` is allowed only on the reference kinds that already carry `none`
+ * (a null handle): dyn/array/dict. A scalar/str/struct field with `opt` would
+ * need extra presence bits or break the C layout - deferred (plans/structs.md).
+ */
+static bool fieldkind_allows_opt(FieldKind k)
+{
+    return k == FieldKind::f_dyn || k == FieldKind::f_array ||
+           k == FieldKind::f_dict;
+}
+
+/* Reject a field/const name already used by a field or const in this struct
+ * (struct members share one namespace). */
+static void
+struct_check_name_free(const StructTypeDef &def, const UniqueId *n, Loc loc)
+{
+    for (const auto &f : def.fields)
+        if (f.name == n)
+            throw SyntaxErrorEx(loc, "Duplicate struct member name");
+    for (const auto &c : def.consts)
+        if (c.first == n)
+            throw SyntaxErrorEx(loc, "Duplicate struct member name");
+}
+
+/*
+ * Parse `struct Name { field/const ... }` (plans/structs.md). A field is
+ * `[opt] TYPE name;` where TYPE is a primitive keyword, `dyn`, or a struct-type
+ * name (an identifier - validated later by the inferencer). v1 rejects `var`
+ * fields and `opt` on a non-reference field. A `const NAME = expr;` member is
+ * folded immediately into the StructTypeDef.
+ */
+bool
+pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
+{
+    const Loc start = c.get_loc();
+
+    if (!pAcceptKeyword(c, Keyword::kw_struct))
+        return false;
+
+    auto stmt = make_unique<StructDeclStmt>();
+    stmt->start = start;
+    stmt->id = pIdentifier(c, fl & ~pFlags::pInStmt);
+
+    if (!stmt->id)
+        throw SyntaxErrorEx(c.get_loc(), "Expected struct name, got",
+                            &c.get_tok());
+
+    stmt->def = make_unique<StructTypeDef>();
+    stmt->def->name = stmt->id->uid;
+
+    pExpectOp(c, Op::braceL);
+
+    int next_slot = 0;
+
+    while (!pAcceptOp(c, Op::braceR)) {
+
+        const Loc mloc = c.get_loc();
+
+        if (pAcceptKeyword(c, Keyword::kw_const)) {
+
+            unique_ptr<Construct> nameId;
+            if (!pAcceptId(c, nameId, false))
+                throw SyntaxErrorEx(c.get_loc(),
+                    "Expected const member name, got", &c.get_tok());
+
+            const UniqueId *cn =
+                static_cast<Identifier *>(nameId.get())->uid;
+            struct_check_name_free(*stmt->def, cn, mloc);
+
+            pExpectOp(c, Op::assign);
+
+            /* The rvalue is a plain (const) expression, not a declaration: no
+             * pInDecl. make_const_clone below makes the stored value deep
+             * read-only regardless. */
+            unique_ptr<Construct> rv = pExpr14(c, fl & ~pFlags::pInStmt);
+            if (!rv)
+                noExprError(c);
+            if (!rv->is_const)
+                throw ExpressionIsNotConstEx(rv->start, rv->end);
+
+            EvalValue cv = make_const_clone(RValue(rv->eval(c.const_ctx)));
+            stmt->def->consts.emplace_back(cn, move(cv));
+            pExpectOp(c, Op::semicolon);
+            continue;
+        }
+
+        /* a field declaration */
+        FieldDef fd;
+
+        if (pAcceptKeyword(c, Keyword::kw_opt) ||
+            pAcceptOp(c, Op::questionmark))
+            fd.is_opt = true;
+
+        if (*c == Keyword::kw_var)
+            throw SyntaxErrorEx(c.get_loc(),
+                "struct fields require an explicit type "
+                "('var' is not supported yet)");
+
+        if (pAcceptKeyword(c, Keyword::kw_dyn)) {
+            fd.kind = FieldKind::f_dyn;
+        } else if (*c == TokType::id &&
+                   type_keyword(c.get_str()) != DeclType::none) {
+            fd.kind = decltype_to_fieldkind(type_keyword(c.get_str()));
+            c++;
+        } else if (*c == TokType::id) {
+            fd.kind = FieldKind::f_struct;
+            fd.struct_ty = UniqueId::get(c.get_str());
+            c++;
+        } else {
+            throw SyntaxErrorEx(c.get_loc(),
+                "Expected a field type, got", &c.get_tok());
+        }
+
+        /* a trailing `?` on the type also marks the field opt (`array? a;`) */
+        if (pAcceptOp(c, Op::questionmark))
+            fd.is_opt = true;
+
+        unique_ptr<Construct> nameId;
+        if (!pAcceptId(c, nameId, false))
+            throw SyntaxErrorEx(c.get_loc(),
+                "Expected field name, got", &c.get_tok());
+
+        fd.name = static_cast<Identifier *>(nameId.get())->uid;
+        struct_check_name_free(*stmt->def, fd.name, mloc);
+
+        if (fd.is_opt && !fieldkind_allows_opt(fd.kind))
+            throw SyntaxErrorEx(mloc,
+                "'opt' is only allowed on dyn/array/dict fields (v1)");
+
+        pExpectOp(c, Op::semicolon);
+
+        fd.slot = next_slot++;
+        stmt->def->fields.push_back(fd);
+    }
+
+    stmt->end = c.get_loc() + 1;
+
+    if (c.const_eval)
+        stmt->eval(c.const_ctx);
+
+    ret = move(stmt);
     return true;
 }
 

@@ -6,6 +6,7 @@
 #include "evalvalue.h"
 #include "parser.h"
 #include "uniqueid.h"
+#include "structtype.h"
 
 enum pFlags : unsigned {
 
@@ -1045,6 +1046,24 @@ public:
         c->display_name = display_name;
         return c;
     }
+};
+
+/*
+ * A `struct Name { ... }` declaration (plans/structs.md). Owns the
+ * StructTypeDef; do_eval binds the type name to a const descriptor value
+ * (t_structtype) in scope, like a func name. Const-evaluable, so a `const`
+ * built from the type (construction, `Type.CONST`) folds at parse time.
+ */
+class StructDeclStmt final: public Construct {
+
+public:
+    unique_ptr<Identifier> id;
+    unique_ptr<StructTypeDef> def;
+
+    StructDeclStmt() : Construct("StructDeclStmt", true) { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+    unique_ptr<Construct> clone() const override;
 };
 
 class Subscript final: public Construct {
