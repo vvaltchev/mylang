@@ -1273,14 +1273,15 @@ are unchanged.
 ## Custom struct types
 
 User-defined value types (`struct Point { int x; int y; }`). Full design +
-phasing: `plans/structs.md`. **Status: complete through the flat-array perf
-work** — decl, construction, field/const access, inference, const-folding, COW
-**plus** the POD C-layout, nested (recursive) POD, and flat `array<PodStruct>`
-storage. The **only** remaining piece is the M8-style *direct* field access
-(read `s.x`/`a[i].x` straight from the bytes without materializing a
-`StructObject`); until then a flat struct array is a memory/cache win and
-CPU-neutral on per-element access (`bench/58_structs`), not yet an
-`array<int>`-speed win.
+phasing: `plans/structs.md`. **Status: complete (all 8 phases)** — decl,
+construction, field/const access, inference, const-folding, COW; the POD
+C-layout; nested (recursive) POD; flat `array<PodStruct>` storage; M8-style
+*direct* (unboxed) field access; and construct-in-place append. A flat struct
+array is now both a memory/cache win and array<int>-speed on field ACCESS
+(`a[i].x` reads straight from the bytes, within ~6% of `array<int>`'s `a[i]`).
+Construction stays more expensive than an inline int (a struct is an object),
+but the per-element `StructObject` allocation is gone (build overhead
+2.47x→1.76x vs `array<int>`; `bench/58_structs` ~26x→~21x CPython).
 
 - **POD vs boxed storage** (`StructTypeDef::compute_layout`, run by the parser).
   A struct is **POD** iff every field is a non-opt scalar (`bool`/`int`/`float`)
@@ -1312,6 +1313,26 @@ CPU-neutral on per-element access (`bench/58_structs`), not yet an
   via `get_vec()`'s `promote_structs_to_general()`, so every existing array op
   works with no dedicated case and nothing throws. `array_storage` reports
   `"structs"`.
+
+- **Direct (unboxed) field access** (M8, phase 8). The inferencer stamps a
+  `TypeHint` on `s.x` when the field is a non-null int/float; `MemberExpr::
+  eval_int`/`eval_float` then read it unboxed. `a[i].field` on a flat struct
+  array reads the scalar STRAIGHT from the array bytes
+  (`member_pod_array_scalar`) with **no per-element `StructObject`** built
+  (guarded by `no_side_effects` so the base evals once) — `a[i].x` is within ~6%
+  of `array<int>`'s `a[i]`. The resolved-local compound-assign fast path
+  (`sx += rhs`) treats a `th==i` rhs (e.g. `p.x`) as an `eval_int()` read, so a
+  reduction is fully unboxed.
+
+- **Construct-in-place append** (phase 8). `append(flat_struct_arr, S(...))`
+  recognizes a struct-constructor arg for the array's exact POD type and builds
+  the element straight into the array's byte buffer
+  (`try_construct_into_struct_array`, `eval.cpp`) — no temporary `StructObject`.
+  Field args are coerced into a stack buffer first (a throw mid-construct leaves
+  the array unchanged), then committed. Named/mixed args (already desugared) and
+  nested POD work; a non-constructor / different-type arg falls back to the
+  normal value-append (the arg is never evaluated twice). The byte store is the
+  shared `pod_store_field` (also backs `StructObject::pod_set`).
 
 - **Two value kinds, mirroring func's decl/object split** (`type.h` `TypeE`):
   `t_structtype` (trivial, `< t_str`, a raw `StructTypeDef *`) is the **type
@@ -1362,9 +1383,8 @@ CPU-neutral on per-element access (`bench/58_structs`), not yet an
   deep `const`; plain assignment aliases; `clone()` shallow, `deepclone()`
   deep). `==`
   is structural between same-`def` instances (`TypeStruct::eq`); `hash` throws
-  (not hashable, v1). **Deferred** (plans/structs.md): the M8-style *direct*
-  `s.x`/`a[i].x` byte access (the remaining flat-array CPU win), `var` fields
-  (call-site field inference), `opt` scalar fields, methods, and empty structs.
+  (not hashable, v1). **Deferred** (plans/structs.md): `var` fields (call-site
+  field inference), `opt` scalar fields, methods, and empty structs.
 
 ## Error model
 
