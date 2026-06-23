@@ -662,6 +662,30 @@ public:
     }
 };
 
+/*
+ * A normalized view of one callee parameter, enough to desugar named arguments
+ * against it: the interned name (pointer-comparable to ExprList::arg_names) and
+ * whether it is optional. Both desugaring sites build a vector of these from
+ * their own param representation (the parser from a FuncObject's `Identifier`s,
+ * the inferencer from its `TypeSym`s) and hand it to desugar_named_call.
+ */
+struct ParamSpec {
+    const UniqueId *name;
+    bool opt;
+};
+
+/*
+ * Rewrite a named-argument call (`call->args` carries ExprList::arg_names) into
+ * the equivalent positional one: map each label to its parameter by name,
+ * enforce the strict ordering (a leading run of positional args, then names in
+ * declaration order), fill a skipped interior optional with `none`, and replace
+ * `call->args` with the positional list. Reordering / duplicate / unknown name
+ * / too-many / missing-required throw a compile-time TypeMismatchEx /
+ * WrongArgCountEx. The single source of truth shared by both desugaring sites
+ * (parser const-fold path and the inferencer's lower_named_args).
+ */
+void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params);
+
 class Expr01 final: public SingleChildConstruct {
 
 public:

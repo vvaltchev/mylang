@@ -283,6 +283,83 @@ void ExprList::serialize(ostream &s, int level) const
     s << ")";
 }
 
+/*
+ * Named-argument desugaring (see the declaration in syntax.h). One shared
+ * implementation for the parser's const-fold path and the inferencer's
+ * lower_named_args, so a named call is rewritten - and therefore optimized -
+ * identically wherever it is lowered.
+ */
+void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
+{
+    ExprList *args = call->args.get();
+    const size_t nparams = params.size();
+    const size_t nargs = args->elems.size();
+
+    std::vector<unique_ptr<Construct>> bound(nparams);
+    int last = -1;                            /* highest param slot filled */
+
+    for (size_t i = 0; i < nargs; i++) {
+
+        Construct *anode = args->elems[i].get();
+        size_t slot;
+
+        if (!args->arg_names[i]) {
+            /* positional arg: fills the next param slot, in order */
+            slot = i;
+            if (slot >= nparams)
+                throw WrongArgCountEx(
+                    intern_msg("function expects at most " +
+                               std::to_string(nparams) + " argument(s)"),
+                    call->start, call->end);
+        } else {
+            /* named arg: match a parameter by its interned name */
+            slot = nparams;
+            for (size_t k = 0; k < nparams; k++)
+                if (params[k].name == args->arg_names[i]) { slot = k; break; }
+            if (slot == nparams)
+                throw TypeMismatchEx(
+                    intern_msg("no parameter named '" +
+                               std::string(args->arg_names[i]->val) + "'"),
+                    anode->start, anode->end);
+        }
+
+        if (static_cast<int>(slot) <= last)
+            throw TypeMismatchEx(
+                intern_msg("named argument '" +
+                           std::string(params[slot].name->val) +
+                           "' is out of order or duplicates an earlier argument"
+                           " (named arguments must follow parameter order)"),
+                anode->start, anode->end);
+
+        bound[slot] = move(args->elems[i]);
+        last = static_cast<int>(slot);
+    }
+
+    /* Rebuild a contiguous positional list 0..last; an interior gap must be an
+     * opt param and is filled with `none`. */
+    auto positional = make_unique<ExprList>();
+    positional->start = args->start;
+    positional->end = args->end;
+    bool all_const = true;
+
+    for (int slot = 0; slot <= last; slot++) {
+        if (bound[slot]) {
+            all_const = all_const && bound[slot]->is_const;
+            positional->elems.push_back(move(bound[slot]));
+        } else {
+            if (!params[slot].opt)
+                throw WrongArgCountEx(
+                    intern_msg("missing required argument '" +
+                               std::string(params[slot].name->val) + "'"),
+                    call->start, call->end);
+            positional->elems.push_back(make_unique<LiteralNone>());
+        }
+    }
+
+    positional->is_const = all_const;
+    call->args = move(positional);
+}
+
 void Expr14::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
