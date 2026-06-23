@@ -120,11 +120,40 @@ Proposed shape:
   machinery). Bounded (open decision D4: cap on instantiations per template to
   avoid blow-up on deeply polymorphic recursion).
 
-Recursion / mutual recursion: when instantiating `g<int>` and the body calls
-`g(n-1)` (int) → the *same* signature, already "in progress" → use a fresh
-return type variable that the local fixpoint resolves (standard
-instantiation-in-progress guard). Mutual template recursion uses the shared
-worklist with the same guard.
+**Refinement (the clean mechanism).** A clone doesn't need its param types
+*seeded or pinned*: because clones are **deduped by signature**, each clone has
+exactly one signature's worth of (redirected) call sites, so its un-annotated
+params simply **accumulate to that signature** through the ordinary
+concrete-function path — no conflict, no special casing. So instantiation is:
+clone the template (synthetic id + `display_name`), `walk_struct` it, set its
+`FuncInfo::is_template = false` (it is now concrete), insert it at the root
+block, and **redirect** the call's callee to the clone. The next fixpoint round
+infers the clone's body from its sig-typed params, exactly like any concrete
+function — which also gives M8 / flat arrays for free.
+
+In the fixpoint, an **un-instantiated template is skipped**: `accumulate` does
+not descend its body and does not `contribute_arg` to its params; the check pass
+does not validate its body (structural-only). The instantiation outer loop runs
+between the fixpoint and finalize: collect template-call signatures from the
+settled arg types, instantiate+redirect new ones, re-run the fixpoint; repeat
+until no new signatures (bounded by D4).
+
+Recursion / mutual recursion fall out of dedup: instantiating `g<int>` whose
+body calls `g(n-1)` (int) finds, on the next collection pass, that `g<int>`
+already exists → it redirects the recursive call to the same clone (self-
+recursive). Mutual `a→b→a` converges the same way through the shared
+instantiation cache.
+
+**Risk to control: the template path applies to a LOT of existing code** (every
+`func f(x) …` with an un-annotated param). Concrete functions (all params
+typed/`dyn`) must stay byte-identical. For a single, consistently-typed call
+site the old join already produced the right answer, so an option to **minimize
+divergence** — only diverge from today where today is wrong (0 call sites →
+structural-only; conflicting call signatures → per-signature clones; a single
+consistent signature → leave the join) — is on the table if full instantiation
+churns the 944-test suite too much. The full-instantiation form is the clean
+target; the minimal-divergence form is the fallback. Either way the suite is the
+guard.
 
 ## 5. The unifying mechanism: an instantiation IS a typed clone
 
