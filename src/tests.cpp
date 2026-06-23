@@ -6379,6 +6379,30 @@ static const std::vector<test> tests =
     { "ti reject: typed-int use of an un-narrowed opt is still caught",
       { "func f(opt x) => x + 1; f(3);" }, &typeid(NullabilityEx) },
 
+    /* ---- function templates (monomorphization) ---- */
+    { "template: a generic helper, no dyn needed (the user's case)",
+      { "func f(x, y){ var t = x + y; t += 2; return t; }",
+        "assert(f(3, 4) == 9); assert(f(1.5, 2.5) == 6.0);" } },
+    { "template: int and str calls don't conflict (separate instances)",
+      { "func id(x){ return x; }",
+        "assert(id(5) == 5); assert(id(\"hi\") == \"hi\");" } },
+    { "template: a never-called template is not checked (no error)",
+      { "func unused(a){ var r = a + 1; r += 2; return r; }",
+        "assert(true);" } },
+    { "template: a derived local needs no `var dyn`",
+      { "func g(a){ var r = a + 1; return r; }",
+        "assert(g(41) == 42); assert(g(2.5) == 3.5);" } },
+    { "template: recursion instantiates once (self-redirect)",
+      { "func fib(n){ if (n < 2) return n; return fib(n-1) + fib(n-2); }",
+        "assert(fib(10) == 55);" } },
+    { "template: a template calling another template",
+      { "func dbl(x){ return x * 2; } func quad(x){ return dbl(dbl(x)); }",
+        "assert(quad(5) == 20);" } },
+    { "template: a wrong-arity call is still an arity error",
+      { "func g(a){ return a; } g(1, 2);" }, &typeid(WrongArgCountEx) },
+    { "template: a per-instantiation type error is caught",
+      { "func g(a){ return a * a; } g(\"x\");" }, &typeid(TypeMismatchEx) },
+
     /* ---- mandatory `dyn`: a plain var/const must infer a concrete type -- */
     { "ti: mandatory dyn - a plain var inferred dyn is rejected",
       { "var x = runtime(5);" }, &typeid(DynRequiredEx) },
@@ -7673,6 +7697,12 @@ static const std::vector<repl_test> repl_tests =
     { "a multi-line input is one history/eval unit",
       { { "func ml(int a) {\n  var t = a + 1\n  return t * 10\n}", "" },
         { "ml(4)", "=> 50" } } },
+
+    { "a template defined then called across inputs instantiates per type",
+      { { "func tg(a){ var r = a + 1; return r; }", "" },
+        { "tg(41)", "=> 42" },
+        { "tg(2.5)", "=> 3.5" },
+        { "tg(\"x\")", "=> x1" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)

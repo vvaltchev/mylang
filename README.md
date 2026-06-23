@@ -625,8 +625,8 @@ func add(a, b) => a + b;
 add(1, 2, 3);          # error: add expects 2 arguments, got 3
 
 func sq(n) => n * n;
-sq(4);                 # ok: n inferred as int from this call
-sq("z");               # error: n would have to be both int and str
+sq(4);                 # ok: instantiates sq for int -> returns 16
+sq("z");               # error: 'z'*'z' has no meaning (caught in THAT instance)
 ```
 
 Key rules:
@@ -643,10 +643,26 @@ Key rules:
   * A variable's type is the **join** of everything assigned to it. Assigning an
     incompatible type on any path is an error. `int` automatically widens to
     `float` (so `var x = 1; x = 2.5;` is fine, and `x` becomes a `float`).
-  * A **function's parameter and return types are inferred from how it is called
-    and what it returns**, across the whole program (recursion and forward
-    references included). A function called with conflicting argument types for
-    the same parameter is an error.
+  * **A function with un-annotated parameters is a *template*** (like a C++
+    template), not a fixed-type function. It is **not type-checked on its own**;
+    instead it is **instantiated per call-site signature**, and each instance is
+    type-checked + compiled separately. So `sq` above works for `int`, and would
+    *independently* work for `float` — calling a template with two different
+    argument types is **not a conflict**, it makes two instances. A
+    never-called template is not type-checked at all (so a generic helper you
+    haven't used yet never errors). Consequently an un-annotated parameter
+    **never requires `dyn`**: `func f(x){ var t = x + 1; return t; }` is fine
+    (in the `int` instance `t` is `int`). To pin a parameter's type instead,
+    annotate it (`func f(int n)`) — then the function is concrete and a
+    wrong-typed call is an error — or mark it `dyn` for one dynamic instance
+    that accepts anything. Return types are inferred from what each instance
+    returns. (Recursion and forward references work; an anonymous lambda or a
+    function with an `opt` parameter is not a template — it uses the join model
+    below.)
+  * A **concrete** function's (typed or `dyn` params) parameter and return
+    types are the **join** of how it is called and what it returns, across the
+    whole program. A typed parameter called with an incompatible type is an
+    error.
   * Arrays and dicts are typed by their contents (`[1,2,3]` is an array of int).
     A genuinely mixed container is allowed — its element type just becomes `dyn`
     (see below), so you don't get the speed/safety benefits but it still works.
