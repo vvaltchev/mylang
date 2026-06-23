@@ -254,10 +254,13 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     std::cout.rdbuf(old_cout);
     retained.push_back(move(root));
 
-    /* 4. The `=> value` echo (RValue collapses an lvalue result). */
+    /* 4. The `=> value` echo (RValue collapses an lvalue result). A `none`
+     *    result - a func/struct decl, a `print`, an `if`/loop, a void call -
+     *    is not echoed, so the prompt stays uncluttered. */
     if (echo) {
         const EvalValue r = RValue(last);
-        out << "=> " << r.get_type()->to_string(r) << "\n";
+        if (!r.is<NoneVal>())
+            out << "=> " << r.get_type()->to_string(r) << "\n";
     }
     return out.str();
 }

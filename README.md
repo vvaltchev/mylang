@@ -112,6 +112,50 @@ better, right? :-)
 [GoogleTest]: https://github.com/google/googletest
 [Boost.Test]: https://www.boost.org/doc/libs/1_75_0/libs/test/doc/html/index.html
 
+### The interactive REPL
+
+Run `mylang` with no file argument on a terminal to drop into an interactive
+REPL (use `mylang --repl` to force it when stdin is not a terminal):
+
+```
+$ ./build/mylang
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> var xs = [1, 2, 3]
+=> [1, 2, 3]
+>> sum(xs)
+=> 6
+>> func dbl(n) => n * 2
+>> map(dbl, xs)
+=> [2, 4, 6]
+```
+
+Definitions — variables, constants, functions, structs — **persist across
+inputs** (the global scope is expandable), and const-folding done in one input
+still applies in the next; each input is otherwise evaluated by the real
+interpreter. You don't type semicolons (they're inserted automatically), and a
+multi-line block stays open until it's balanced, auto-indented as you go:
+
+```
+>> func fib(n) {
+..   if (n < 2) { return n; }
+..   return fib(n - 1) + fib(n - 2);
+.. }
+>> fib(10)
+=> 55
+```
+
+The line editor is hand-rolled (no `readline`/`reline` dependency, in keeping
+with the no-dependencies rule): live syntax highlighting, command history
+(Up/Down, persisted to `~/.mylang_history`), the usual Emacs-style editing keys
+(`Ctrl-A`/`E`/`U`/`K`/`W`, arrows, …), and **Tab completion** of keywords,
+builtins, your own globals, and a struct value's fields (`p.<Tab>`). A `none`
+result (a definition, a `print`, an `if`) is not echoed, to keep things quiet.
+
+Meta-commands start with `:` — `:tree <code>` prints the const-folded syntax
+tree (so you can watch folding happen, e.g. `:tree 2 + 3 * 4` → `Int(14)`),
+`:source <file>` evaluates a file as if it were typed at the prompt, plus
+`:help` and `:quit`. Colors honor [`NO_COLOR`](https://no-color.org).
+
 ## Syntax
 
 The shortest way to describe `MyLang` is: *a C-looking dynamic python-ish
