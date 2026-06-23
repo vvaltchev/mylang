@@ -692,8 +692,17 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
-    if (!elems.size())
+    if (!elems.size()) {
+        /* An empty array<POD struct> destination: start flat (with the element
+         * type from the hint) so a built-up `var a = []; append(a, S(..))`
+         * stays unboxed. */
+        if (arr_hint == ArrHint::flat_s && arr_hint_struct) {
+            StructTypeDef *def = const_cast<StructTypeDef *>(arr_hint_struct);
+            return SharedArrayObj(
+                SharedArrayObj::svec_type({}, def, def->size));
+        }
         return empty_arr;
+    }
 
     /*
      * Build flat (unboxed) int/float storage when every element is that one
@@ -708,6 +717,22 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     SharedArrayObj::fvec_type fvec;
     SharedArrayObj::bvec_type bvec;
     SharedArrayObj::vec_type  gvec;
+    /* mode 5: a flat array of same-type POD structs (their bytes packed) */
+    std::vector<char> svecbuf;
+    StructTypeDef *sdef = nullptr;
+    int sstride = 0;
+
+    auto is_pod_struct_of = [](const EvalValue &v, StructTypeDef *d) -> bool {
+        return v.is<intrusive_ptr<StructObject>>() &&
+               v.get<intrusive_ptr<StructObject>>()->is_pod() &&
+               (d == nullptr || v.get<intrusive_ptr<StructObject>>()->def == d);
+    };
+    auto append_struct_bytes = [&](const EvalValue &v) {
+        const StructObject &o = *v.get<intrusive_ptr<StructObject>>().get();
+        const size_t at = svecbuf.size();
+        svecbuf.resize(at + sstride);
+        std::memcpy(svecbuf.data() + at, o.bytes.data(), sstride);
+    };
     /*
      * 0 = empty, 1 = ints, 2 = floats, 4 = bools, 3 = general. Type-driven: a
      * literal bound to a dynamically-typed destination (arr_hint general, set by
@@ -732,9 +757,20 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
             for (unsigned char x : bvec)
                 gvec.emplace_back(EvalValue(static_cast<bool>(x)),
                                   ctx->const_ctx);
+        else if (mode == 5) {
+            const size_t cnt = sstride ? svecbuf.size() / sstride : 0;
+            for (size_t i = 0; i < cnt; i++) {
+                auto o = make_intrusive<StructObject>(sdef);
+                std::memcpy(o->bytes.data(),
+                            svecbuf.data() + i * sstride, sstride);
+                gvec.emplace_back(EvalValue(intrusive_ptr<StructObject>(o)),
+                                  ctx->const_ctx);
+            }
+        }
         ivec.clear();
         fvec.clear();
         bvec.clear();
+        svecbuf.clear();
         mode = 3;
     };
 
@@ -749,6 +785,12 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
                 mode = 2; fvec.push_back(v.get<float_type>());
             } else if (v.is<bool>()) {
                 mode = 4; bvec.push_back(v.get<bool>() ? 1 : 0);
+            } else if (is_pod_struct_of(v, nullptr)) {
+                mode = 5;
+                sdef = v.get<intrusive_ptr<StructObject>>()->def;
+                sstride = sdef->size;
+                svecbuf.reserve(n * sstride);
+                append_struct_bytes(v);
             } else {
                 mode = 3; gvec.reserve(n);
                 gvec.emplace_back(v, ctx->const_ctx);
@@ -759,6 +801,8 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
             fvec.push_back(v.get<float_type>());
         } else if (mode == 4 && v.is<bool>()) {
             bvec.push_back(v.get<bool>() ? 1 : 0);
+        } else if (mode == 5 && is_pod_struct_of(v, sdef)) {
+            append_struct_bytes(v);
         } else {
             if (mode != 3)
                 spill_to_general();
@@ -769,6 +813,9 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     if (mode == 1) return SharedArrayObj(move(ivec));
     if (mode == 2) return SharedArrayObj(move(fvec));
     if (mode == 4) return SharedArrayObj(move(bvec));
+    if (mode == 5)
+        return SharedArrayObj(
+            SharedArrayObj::svec_type(move(svecbuf), sdef, sstride));
     return SharedArrayObj(move(gvec));
 }
 
@@ -830,6 +877,18 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
                 bv.cbegin() + arr.offset(),
                 bv.cbegin() + arr.offset() + arr.size()
             ));
+        }
+
+        /* Flat POD-struct array: a byte copy keeps it flat (POD bytes hold no
+         * references, so it is a full mutable copy). */
+        if (arr.skind() == SharedArrayObj::Storage::structs) {
+            const auto &sv = arr.flat_structs();
+            std::vector<char> nb(
+                sv.buf.cbegin() + arr.offset() * sv.stride,
+                sv.buf.cbegin() + (arr.offset() + arr.size()) * sv.stride
+            );
+            return SharedArrayObj(
+                SharedArrayObj::svec_type(move(nb), sv.def, sv.stride));
         }
 
         const ArrayConstView &view = arr.get_view();
@@ -964,6 +1023,20 @@ make_const_clone(const EvalValue &v)
             return arr;
         }
 
+        /* Flat POD-struct array: a deep read-only byte copy (POD bytes hold no
+         * nested references to recurse into). */
+        if (src.skind() == SharedArrayObj::Storage::structs) {
+            const auto &sv = src.flat_structs();
+            std::vector<char> nb(
+                sv.buf.cbegin() + src.offset() * sv.stride,
+                sv.buf.cbegin() + (src.offset() + src.size()) * sv.stride
+            );
+            SharedArrayObj arr(
+                SharedArrayObj::svec_type(move(nb), sv.def, sv.stride));
+            arr.set_readonly();
+            return arr;
+        }
+
         const ArrayConstView &view = src.get_view();
 
         SharedArrayObj::vec_type vec;
@@ -1067,6 +1140,14 @@ arr_elem_boxed(const SharedArrayObj &a, size_type i)
             return EvalValue(a.flat_floats()[a.offset() + i]);
         case SharedArrayObj::Storage::bools:
             return EvalValue(static_cast<bool>(a.flat_bools()[a.offset() + i]));
+        case SharedArrayObj::Storage::structs: {
+            const auto &sv = a.flat_structs();
+            auto obj = make_intrusive<StructObject>(sv.def);
+            std::memcpy(obj->bytes.data(),
+                        sv.buf.data() + (a.offset() + i) * sv.stride,
+                        sv.stride);
+            return intrusive_ptr<StructObject>(obj);
+        }
         default:
             return a.get_view()[i].get();
     }
@@ -1091,6 +1172,15 @@ EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
         && value.get<SharedArrayObj>().skind()
                != SharedArrayObj::Storage::general)
         return make_general_array_clone(value.get<SharedArrayObj>());
+
+    /* An empty baked array bound to an array<POD struct> destination starts
+     * flat (the const-fold erased the element type, so the hint restores it),
+     * so a built-up `var a = []; append(a, S(..))` stays unboxed. */
+    if (arr_hint == ArrHint::flat_s && arr_hint_struct &&
+        value.is<SharedArrayObj>() && value.get<SharedArrayObj>().size() == 0) {
+        StructTypeDef *def = const_cast<StructTypeDef *>(arr_hint_struct);
+        return SharedArrayObj(SharedArrayObj::svec_type({}, def, def->size));
+    }
 
     return immutable ? value : make_mutable_clone(value);
 }
@@ -2685,6 +2775,34 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
             for (size_type i = 0; i < n; i++) {
                 const EvalValue elem(static_cast<bool>(bv[off + i]));
+                if (!do_iter(&loopCtx, i, &elem, 1))
+                    break;
+            }
+
+        } else if (arr.skind() == SharedArrayObj::Storage::structs) {
+
+            /*
+             * Flat POD-struct array: rather than heap-allocate a StructObject
+             * per element, reuse ONE across iterations - overwrite its bytes in
+             * place and hand it to the body. COW guard: if the previous body
+             * captured the element (so something other than the loop var still
+             * holds it: use_count() > 2 == this local + the loop var's slot +
+             * a capture), allocate a fresh one so the capture keeps its value.
+             */
+            const auto &sv = arr.flat_structs();
+            const size_type n = arr.size(), base = arr.offset();
+            intrusive_ptr<StructObject> reuse;
+
+            for (size_type i = 0; i < n; i++) {
+
+                if (!reuse || reuse.use_count() > 2)
+                    reuse = intrusive_ptr<StructObject>(
+                        make_intrusive<StructObject>(sv.def));
+
+                std::memcpy(reuse->bytes.data(),
+                            sv.buf.data() + (base + i) * sv.stride, sv.stride);
+
+                const EvalValue elem(reuse);
                 if (!do_iter(&loopCtx, i, &elem, 1))
                     break;
             }

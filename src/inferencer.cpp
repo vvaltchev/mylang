@@ -738,6 +738,12 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
             hint = ArrHint::flat_f;
         else if (!el->opt && el->kind == STyKind::Bool)
             hint = ArrHint::flat_b;
+        else if (!el->opt && el->kind == STyKind::Struct &&
+                 static_cast<const StructTypeDef *>(el->struct_def) &&
+                 static_cast<const StructTypeDef *>(el->struct_def)->is_pod())
+            /* array<POD struct>: flat storage (the def lets even an empty
+             * `[]` start flat); a boxed-struct array stays general. */
+            hint = ArrHint::flat_s;
         else
             hint = ArrHint::general;
     } else if (ty->kind == STyKind::Dyn) {
@@ -745,6 +751,13 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     } else {
         return;
     }
+
+    /* the element struct type, needed by an empty flat_s array literal */
+    const StructTypeDef *sdef =
+        hint == ArrHint::flat_s
+            ? static_cast<const StructTypeDef *>(
+                  sty_resolve(ty->elem)->struct_def)
+            : nullptr;
 
     Construct *rv = e->rvalue.get();
 
@@ -758,13 +771,16 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
         if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
             return;
         const std::string nm(cid->uid->val);
-        if (nm == "range" || nm == "array" || nm == "make_array")
+        if (nm == "range" || nm == "array" || nm == "make_array") {
             call->args->arr_hint = hint;
+            call->args->arr_hint_struct = sdef;
+        }
 
     } else {
 
         /* an array literal or a folded const literal (LiteralObj) */
         rv->arr_hint = hint;
+        rv->arr_hint_struct = sdef;
     }
 }
 
@@ -1103,6 +1119,10 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
                 return A.array_of(A.int_ty());
             if (arr.skind() == SharedArrayObj::Storage::floats)
                 return A.array_of(A.float_ty());
+            if (arr.skind() == SharedArrayObj::Storage::structs) {
+                const StructTypeDef *def = arr.flat_structs().def;
+                return A.array_of(A.struct_ty(def, def->name));
+            }
 
             ArrayConstView view = arr.get_view();
             if (view.size() == 0)

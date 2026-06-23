@@ -50,7 +50,9 @@ enum class TypeHint : unsigned char { none, i, f };
  * value-driven (build flat iff the elements are homogeneous int/float). See
  * plans/type-driven-specialization.md.
  */
-enum class ArrHint : unsigned char { dflt, general, flat_i, flat_f, flat_b };
+enum class ArrHint : unsigned char {
+    dflt, general, flat_i, flat_f, flat_b, flat_s
+};
 
 /*
  * Explicit type annotation on a declaration / parameter (e.g. `int x = 5;`,
@@ -113,6 +115,9 @@ public:
      * copy_base_fields().
      */
     ArrHint arr_hint = ArrHint::dflt;
+    /* The element struct type for ArrHint::flat_s (an empty array<Struct> needs
+     * it, having no element to infer from). Copied by copy_base_fields. */
+    const StructTypeDef *arr_hint_struct = nullptr;
 
     /*
      * Set on nodes spliced in by function inlining: the "inlined-at" chain used
@@ -179,6 +184,7 @@ protected:
         d.inline_ctx = inline_ctx;
         d.th = th;
         d.arr_hint = arr_hint;
+        d.arr_hint_struct = arr_hint_struct;
     }
 };
 
