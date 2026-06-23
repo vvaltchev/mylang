@@ -1933,6 +1933,20 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         } else if (*c == TokType::id) {
             fd.kind = FieldKind::f_struct;
             fd.struct_ty = UniqueId::get(c.get_str());
+            /* Resolve the nested type if it was declared before this struct
+             * (its descriptor is in const_ctx): a POD nested struct is then
+             * embedded inline (compute_layout); a forward-ref / boxed one stays
+             * a boxed pointer field. A self/forward reference is simply not yet
+             * in scope, so it boxes - no infinite layout. */
+            if (c.const_eval) {
+                Identifier nameRef(fd.struct_ty->val);
+                const EvalValue ev = nameRef.eval(c.const_ctx);
+                if (ev.is<LValue *>()) {
+                    const EvalValue &dv = ev.get<LValue *>()->get();
+                    if (dv.is<StructTypeDef *>())
+                        fd.struct_def = dv.get<StructTypeDef *>();
+                }
+            }
             c++;
         } else {
             throw SyntaxErrorEx(c.get_loc(),
