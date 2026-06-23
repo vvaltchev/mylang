@@ -614,7 +614,20 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
     if (nargs < min_args || nargs > nfields)
         throw InvalidNumberOfArgsEx(args->start, args->end);
 
-    auto obj = make_intrusive<StructObject>(def);
+    auto obj = make_intrusive<StructObject>(def);   /* resizes bytes if POD */
+
+    if (def->is_pod()) {
+        /* POD has no opt fields, so nargs == nfields; store each scalar into
+         * its byte slot. */
+        for (size_t i = 0; i < nfields; i++) {
+            EvalValue v = coerce_struct_field(
+                def->fields[i], RValue(args->elems[i]->eval(ctx)),
+                args->elems[i]->start, args->elems[i]->end);
+            obj->pod_set(static_cast<int>(i), v);
+        }
+        return intrusive_ptr<StructObject>(obj);
+    }
+
     obj->fields.reserve(nfields);
 
     for (size_t i = 0; i < nfields; i++) {
@@ -866,6 +879,13 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
         if (obj->is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
 
+        /* POD: a byte copy is a full mutable copy (no nested references). */
+        if (obj->is_pod()) {
+            auto out = make_intrusive<StructObject>(*obj);   /* copies bytes */
+            out->clear_readonly();
+            return intrusive_ptr<StructObject>(out);
+        }
+
         auto out = make_intrusive<StructObject>(obj->def);
         out->fields.reserve(obj->fields.size());
         for (const auto &f : obj->fields)
@@ -979,6 +999,13 @@ make_const_clone(const EvalValue &v)
     if (v.is<intrusive_ptr<StructObject>>()) {
 
         const StructObject &src = *v.get<intrusive_ptr<StructObject>>().get();
+
+        /* POD: bytes hold no references, so a byte copy is a deep copy. */
+        if (src.is_pod()) {
+            auto obj = make_intrusive<StructObject>(src);   /* copies bytes */
+            obj->set_readonly();
+            return intrusive_ptr<StructObject>(obj);
+        }
 
         auto obj = make_intrusive<StructObject>(src.def);
         obj->fields.reserve(src.fields.size());
@@ -1652,6 +1679,65 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
 }
 
 /*
+ * Fast path for `s.field = v` / `s.field OP= v` when `s` is a POD struct: a POD
+ * field is bytes, not an LValue, so the general lvalue path can't target it -
+ * write the (coerced/validated) scalar straight into the byte slot. Returns
+ * false (and lets the general path run) for a boxed struct, a const/read-only
+ * instance (so the right error fires), a non-field member, or a non-lvalue
+ * base. No COW clone: a POD struct aliases like any value (a `var q = p` shares
+ * it, and the write is shared - the same as the boxed path and arrays/dicts).
+ */
+static bool
+try_pod_struct_store(EvalContext *ctx, Construct *lvalue, Op op,
+                     const EvalValue &rval, EvalValue &out)
+{
+    auto *mem = dynamic_cast<MemberExpr *>(lvalue);
+    if (!mem)
+        return false;
+
+    if (!no_side_effects(mem->what.get()))
+        return false;
+
+    const EvalValue base_lv = mem->what->eval(ctx);
+    if (!base_lv.is<LValue *>())
+        return false;                 /* temporary base: general path errors */
+
+    LValue *blv = base_lv.get<LValue *>();
+    if (!blv->is<intrusive_ptr<StructObject>>())
+        return false;
+
+    StructObject &obj = *blv->getval<intrusive_ptr<StructObject>>().get();
+    if (!obj.is_pod())
+        return false;                 /* boxed: general lvalue path handles */
+
+    const int slot = obj.def->slot_of(mem->memUid);
+    if (slot < 0)
+        return false;                 /* a const member etc.: general path */
+
+    if (blv->is_const_var() || obj.is_readonly())
+        return false;                 /* const: defer for the right error/loc */
+
+    const EvalValue r = RValue(rval);
+
+    EvalValue newval;
+    if (op == Op::assign) {
+        newval = r;
+    } else {
+        newval = obj.pod_get(slot);
+        apply_compound_op(newval, r, op);
+    }
+
+    /* coerce + runtime-validate to the field's scalar type (throws on mismatch,
+     * e.g. a dyn-laundered wrong type) */
+    newval = coerce_struct_field(obj.def->fields[slot], move(newval),
+                                 mem->start, mem->end);
+    obj.pod_set(slot, newval);
+
+    out = newval;
+    return true;
+}
+
+/*
  * Coerce a value to a declared scalar type's storage on a typed assignment /
  * declaration: a `float` variable stores an int/bool as a float, an `int`
  * variable stores a bool as an int (the numeric-widening coercions of the
@@ -1788,6 +1874,16 @@ handle_single_expr14(EvalContext *ctx,
         EvalValue flat_out;
         if (try_flat_subscript_store(ctx, lvalue, op, rval, flat_out))
             return flat_out;
+    }
+
+    /*
+     * Fast path: `s.field = v` / `s.field OP= v` into a POD struct - store the
+     * scalar straight into the struct's byte slot (a POD field has no LValue).
+     */
+    {
+        EvalValue pod_out;
+        if (try_pod_struct_store(ctx, lvalue, op, rval, pod_out))
+            return pod_out;
     }
 
     /*
@@ -2697,10 +2793,18 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 
         if (slot >= 0) {
             /*
-             * Hand out an assignable field lvalue ONLY when the base is rooted
-             * at a variable (so the StructObject outlives this call). For a
-             * read-only instance, or a *temporary* base (`Point(1,2).x`, a call
-             * result), return the value by copy - a field lvalue into a
+             * A POD field has no per-field LValue (it is bytes), so a read
+             * always returns the value; a write goes through
+             * try_pod_struct_store (handle_single_expr14), never this lvalue
+             * path.
+             */
+            if (obj->is_pod())
+                return obj->pod_get(slot);
+            /*
+             * Boxed: hand out an assignable field lvalue ONLY when the base is
+             * rooted at a variable (so the StructObject outlives this call).
+             * For a read-only instance, or a *temporary* base (`Point(1,2).x`,
+             * a call result), return the value by copy - a field lvalue into a
              * soon-freed temporary would dangle, and a temporary's field isn't
              * assignable anyway.
              */

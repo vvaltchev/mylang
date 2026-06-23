@@ -74,6 +74,10 @@ static bool struct_equal(const StructObject &x, const StructObject &y)
     if (x.def != y.def)
         return false;
 
+    /* POD: same def -> same layout, so a raw byte compare is exact. */
+    if (x.is_pod())
+        return x.bytes == y.bytes;
+
     /* boxed: field-wise EvalValue equality (recurses for nested structs) */
     for (size_t i = 0; i < x.fields.size(); i++)
         if (!(x.fields[i].get() == y.fields[i].get()))
@@ -118,7 +122,8 @@ string TypeStruct::to_string(const EvalValue &a)
 
         res += string(def.fields[i].name->val);
         res += ": ";
-        res += o.fields[i].get().to_string();
+        res += (o.is_pod() ? o.pod_get(static_cast<int>(i))
+                           : o.fields[i].get()).to_string();
 
         if (i != def.fields.size() - 1)
             res += ", ";
