@@ -621,8 +621,9 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
         const FieldDef &fd = def->fields[i];
         const Loc s = i < nargs ? args->elems[i]->start : args->start;
         const Loc e = i < nargs ? args->elems[i]->end : args->end;
+        /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? RValue(args->elems[i]->eval(ctx))
-                                : EvalValue();   /* omitted trailing opt: none */
+                                : EvalValue();
         obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e), false);
     }
 
