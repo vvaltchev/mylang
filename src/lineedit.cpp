@@ -245,9 +245,9 @@ void LineEditor::csi_final(unsigned char c)
         case 'F': pos = line_end(pos); break;                  /* end   */
         case '~':
             if (esc_params == "1" || esc_params == "7")
-                pos = 0;                                       /* home  */
+                pos = line_start(pos);                         /* home  */
             else if (esc_params == "4" || esc_params == "8")
-                pos = buf.size();                              /* end   */
+                pos = line_end(pos);                           /* end   */
             else if (esc_params == "3")
                 del_forward();                                 /* delete */
             break;

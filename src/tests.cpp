@@ -7835,6 +7835,17 @@ static bool lineedit_multiline_home_end_kill()
     return ed.cursor_row() == 1 && ed.cursor_col() == 0;
 }
 
+static bool lineedit_multiline_tilde_home_end()
+{
+    /* the ESC[1~ / ESC[4~ Home/End variants must be line-relative too */
+    LineEditor ed;
+    ed.set_buffer("first\nsecond");    /* cursor at end of line 1 */
+    ed.feed(27); ed.feed('['); ed.feed('1'); ed.feed('~');   /* Home */
+    if (ed.cursor_row() != 1 || ed.cursor_col() != 0) return false;
+    ed.feed(27); ed.feed('['); ed.feed('4'); ed.feed('~');   /* End */
+    return ed.cursor_row() == 1 && ed.cursor_col() == 6;     /* "second" */
+}
+
 static bool lineedit_history_nav()
 {
     std::vector<std::string> h = { "first", "second" };
@@ -8005,6 +8016,8 @@ static const std::vector<extra_check> extra_checks =
       lineedit_multiline_cursor_and_nav },
     { "lineedit: line-relative Home/End/kill in a block",
       lineedit_multiline_home_end_kill },
+    { "lineedit: ESC[1~/ESC[4~ Home/End are line-relative",
+      lineedit_multiline_tilde_home_end },
     { "serialize() writes to the given stream", serialize_writes_to_given_stream },
     { "AST deep-clone round-trips", ast_clone_roundtrip },
     { "inliner splices an expr-func call", inliner_splices_call },
