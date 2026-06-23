@@ -602,12 +602,27 @@ class ExprList final: public MultiElemConstruct<> {
 
 public:
 
+    /*
+     * Named-argument labels, parallel to `elems`. A *transient* carrier from
+     * the parser to the inferencer's lower_named_args() desugaring step, which
+     * rewrites a named call into a plain positional one and clears these. EMPTY
+     * means every argument is positional (the common case, zero overhead);
+     * otherwise it is sized == elems.size(), with arg_names[i] == nullptr for a
+     * positional argument and the param label (an interned UniqueId, so it is
+     * pointer-comparable to a param Identifier's `uid`) for a named one. By the
+     * time any later pass (resolve_names, the optimizers, eval) sees this list
+     * it is positional again, so named args have zero effect on them.
+     */
+    std::vector<const UniqueId *> arg_names;
+
     ExprList() : MultiElemConstruct<>("ExprList") { }
+    void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<ExprList>();
         copy_base_fields(*c);
         clone_elems_into(*c);
+        c->arg_names = arg_names;
         return c;
     }
 };
