@@ -501,6 +501,18 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         if (!tmpl || !tmpl->is_template)
             continue;
 
+        /*
+         * REPL: only instantiate a template DECLARED IN THIS INPUT. A template
+         * committed by a PRIOR input (`pinned`) is left as a dynamic call - it
+         * evaluates correctly via the tree-walker (just not monomorphized), and
+         * this avoids cloning a prior input's already-resolved/evaluated decl
+         * across the persistent session state (a fragile cross-input path). In
+         * the one-shot script path nothing is pinned, so all templates
+         * instantiate as before. See plans/function-templates.md.
+         */
+        if (tmpl->pinned)
+            continue;
+
         /* v1: require an exact arity match (opt-param templates deferred). */
         if (call->args->elems.size() != tmpl->params.size())
             continue;
@@ -526,7 +538,12 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         auto what = make_unique<Identifier>(clone->id->get_str());
         what->start = call->what->start;
         what->end = call->what->end;
-        id_sym[what.get()] = global->syms[clone->id->uid];
+        /* Resolve the clone's symbol BY NODE (id_sym on the clone's own id),
+         * not by name (global->syms[uid]) - the by-name lookup is ambiguous if
+         * two clones ever shared a name, which manifested (MSVC release) as a
+         * call resolving to the wrong (prior) instance. */
+        auto cs = id_sym.find(clone->id.get());
+        id_sym[what.get()] = (cs != id_sym.end()) ? cs->second : nullptr;
         /* The old callee Identifier is about to be freed: drop its id_sym entry
          * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
         id_sym.erase(call->what.get());
