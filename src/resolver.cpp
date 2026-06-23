@@ -767,8 +767,10 @@ public:
      * own slot range (slot_count == top-level frame size), and Block::do_eval
      * builds the "main" Frame from it - so nothing needs to be returned here.
      */
-    void run(Construct *root, AnalysisInfo *analysis = nullptr)
+    void run(Construct *root, AnalysisInfo *analysis = nullptr,
+             bool repl = false)
     {
+        repl_mode = repl;
         top_level_only = false;
         walk(root, nullptr);            /* pass 1: functions; fill `escaped` */
 
@@ -792,6 +794,9 @@ private:
     /* Pass 2: function bodies are already resolved, so don't re-enter them. */
     bool top_level_only = false;
 
+    /* REPL: keep ALL top-level decls in the map as persistent globals. */
+    bool repl_mode = false;
+
     void walk(Construct *c, FuncState *cur);
     void process_function(FuncDeclStmt *fd);
 
@@ -810,8 +815,12 @@ private:
 
         /* A top-level variable that some function reads must stay in the map
          * (functions reach globals via the scope-chain map walk, not slots),
-         * so add it as a masking entry instead of slotting it. */
-        const bool keep_in_map = cur->is_main && escaped.count(id->uid);
+         * so add it as a masking entry instead of slotting it. In REPL mode
+         * EVERY top-level decl stays in the map - it is a persistent global
+         * that survives to the next input (and so is never auto-const-promoted,
+         * which would be unsound in an open world). */
+        const bool keep_in_map =
+            cur->is_main && (escaped.count(id->uid) || repl_mode);
 
         if (keep_in_map || cur->next_slot >= MAX_SLOTS) {
             cur->scopes.back().decls.push_back({ id->uid, -1, id->decl_type });
@@ -2346,9 +2355,9 @@ private:
  */
 void
 resolve_names(Construct *root, bool enable_inline, int inline_threshold,
-              AnalysisInfo *analysis)
+              AnalysisInfo *analysis, bool repl_mode)
 {
-    Resolver().run(root, analysis);
+    Resolver().run(root, analysis, repl_mode);
 
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))

@@ -23,10 +23,17 @@ class Construct;
  */
 struct AnalysisInfo;
 
+/*
+ * `repl_mode` (REPL only): keep EVERY top-level declaration in the map as a
+ * persistent global - never slot it into the "main" frame and never
+ * auto-const-promote it (unsound in the REPL's open world, where a later input
+ * may reassign it). Nested function locals still slot normally.
+ */
 void resolve_names(Construct *root,
                    bool enable_inline = true,
                    int inline_threshold = 24,
-                   AnalysisInfo *analysis = nullptr);
+                   AnalysisInfo *analysis = nullptr,
+                   bool repl_mode = false);
 
 /*
  * -a/--analyze: after resolve_names has run, record the resolver-decided
