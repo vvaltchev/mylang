@@ -1208,7 +1208,8 @@ class MemberExpr final: public Construct {
 public:
 
     unique_ptr<Construct> what;
-    EvalValue memId;
+    EvalValue memId;            /* the name as a SharedStr (dict key) */
+    const UniqueId *memUid = nullptr;   /* interned name (struct slot lookup) */
 
     MemberExpr() : Construct("MemberExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1219,6 +1220,7 @@ public:
         copy_base_fields(*c);
         c->what = clone_as(what);
         c->memId = memId;
+        c->memUid = memUid;
         return c;
     }
 };

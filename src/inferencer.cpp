@@ -1083,6 +1083,12 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
         case Type::t_str:   return A.str_ty();
         case Type::t_none:  return A.none_ty();
 
+        case Type::t_struct: {
+            const StructTypeDef *def =
+                v.get<intrusive_ptr<StructObject>>()->def;
+            return A.struct_ty(def, def->name);
+        }
+
         case Type::t_arr: {
             const SharedArrayObj &arr = v.get<SharedArrayObj>();
 
@@ -1277,8 +1283,33 @@ STyRef Inferencer::type_of(const Construct *e)
     }
 
     if (auto *mem = dynamic_cast<const MemberExpr *>(e)) {
+
+        /* `Type.CONST` (a struct descriptor base): a const member's type. */
+        if (auto *cid = dynamic_cast<const Identifier *>(mem->what.get())) {
+            auto it = id_sym.find(cid);
+            if (it != id_sym.end() && it->second && it->second->struct_type) {
+                const StructTypeDef *def = it->second->struct_type;
+                if (const EvalValue *cv = def->const_of(mem->memUid))
+                    return sty_from_value(*cv);
+                return A.dyn_ty();
+            }
+        }
+
         STyRef w = sty_resolve(type_of(mem->what.get()));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
+
+        /* A struct instance: `s.field` is the field's type (a dict read is
+         * non-opt), `s.CONST` is the const member's type. */
+        if (w->kind == STyKind::Struct) {
+            const StructTypeDef *def =
+                static_cast<const StructTypeDef *>(w->struct_def);
+            if (const FieldDef *f = def->field_of(mem->memUid))
+                return field_sty(*f);
+            if (const EvalValue *cv = def->const_of(mem->memUid))
+                return sty_from_value(*cv);
+            return A.dyn_ty();
+        }
+
         /* `d.key` mirrors `d[key]`: non-opt (value / default / throws). */
         if (w->kind == STyKind::Dict)
             return w->val;
@@ -1906,7 +1937,12 @@ void Inferencer::accumulate_assign(Expr14 *e)
     if (auto *mem = dynamic_cast<MemberExpr *>(lv)) {
         if (auto *bid = dynamic_cast<Identifier *>(mem->what.get())) {
             auto it = id_sym.find(bid);
-            if (it != id_sym.end())
+            /* Only a *known* dict base accrues a dict type from `b.k = v`; a
+             * struct field assignment leaves the struct's (fixed) type alone,
+             * and an Unknown base must not be guessed a dict (it may be a
+             * struct). Mirrors the Subscript lvalue rule above. */
+            if (it != id_sym.end() && it->second &&
+                sty_resolve(it->second->type)->kind == STyKind::Dict)
                 contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start);
         }
         return;
@@ -2227,13 +2263,47 @@ void Inferencer::check(Construct *n)
 
     if (auto *mem = dynamic_cast<MemberExpr *>(n)) {
         check(mem->what.get());
+
+        /* struct descriptor base: only a const member (`Type.CONST`). */
+        if (auto *cid = dynamic_cast<Identifier *>(mem->what.get())) {
+            auto it = id_sym.find(cid);
+            if (it != id_sym.end() && it->second && it->second->struct_type) {
+                const StructTypeDef *def = it->second->struct_type;
+                if (!def->const_of(mem->memUid)) {
+                    if (def->field_of(mem->memUid))
+                        mismatch("field '" + std::string(mem->memUid->val) +
+                                     "' needs an instance of '" +
+                                     std::string(def->name->val) + "'",
+                                 mem->start, mem->end);
+                    mismatch("struct '" + std::string(def->name->val) +
+                                 "' has no member '" +
+                                 std::string(mem->memUid->val) + "'",
+                             mem->start, mem->end);
+                }
+                return;
+            }
+        }
+
         STyRef w = type_of(mem->what.get());
         require_nonopt(w, mem->what->start, mem->what->end,
                        "as a member-access base");
         STyRef wr = strip(sty_resolve(w));
+
+        /* struct instance base: validate the field/const exists. */
+        if (wr->kind == STyKind::Struct) {
+            const StructTypeDef *def =
+                static_cast<const StructTypeDef *>(wr->struct_def);
+            if (!def->field_of(mem->memUid) && !def->const_of(mem->memUid))
+                mismatch("struct '" + std::string(def->name->val) +
+                             "' has no member '" +
+                             std::string(mem->memUid->val) + "'",
+                         mem->start, mem->end);
+            return;
+        }
+
         if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != STyKind::Dict)
             mismatch("type '" + sty_to_string(w) +
-                         "' has no members (only a dict does)",
+                         "' has no members (only a struct or dict does)",
                      mem->what->start, mem->what->end);
         return;
     }

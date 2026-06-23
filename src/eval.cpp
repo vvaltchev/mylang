@@ -547,6 +547,57 @@ static void stamp_operand_loc(const Construct *c, Exception &e);
  * the arguments against the field types (for a statically-known callee), so
  * this is the construction, not the validation.
  */
+/* Coerce + runtime-validate one field value. The inferencer already checks a
+ * statically-known construction, but this guards a `dyn`-laundered value and
+ * makes a parse-time (const) construction type-safe (so it can fold). */
+static EvalValue
+coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
+{
+    if (v.is<NoneVal>()) {
+        if (fd.is_opt)
+            return v;
+        throw TypeErrorEx(intern_msg("struct field '" +
+                          string(fd.name->val) + "' cannot be none"), s, e);
+    }
+
+    switch (fd.kind) {
+        case FieldKind::f_dyn:
+            return v;
+        case FieldKind::f_int:
+            if (v.is<bool>() || v.is<int_type>())
+                return coerce_to_decl_type(v, DeclType::i);
+            break;
+        case FieldKind::f_float:
+            if (v.is<bool>() || v.is<int_type>() || v.is<float_type>())
+                return coerce_to_decl_type(v, DeclType::f);
+            break;
+        case FieldKind::f_bool:
+            if (v.is<bool>())
+                return v;
+            break;
+        case FieldKind::f_str:
+            if (v.is<SharedStr>())
+                return v;
+            break;
+        case FieldKind::f_array:
+            if (v.is<SharedArrayObj>())
+                return v;
+            break;
+        case FieldKind::f_dict:
+            if (v.is<intrusive_ptr<DictObject>>())
+                return v;
+            break;
+        case FieldKind::f_struct:
+            if (v.is<intrusive_ptr<StructObject>>() &&
+                v.get<intrusive_ptr<StructObject>>()->def->name == fd.struct_ty)
+                return v;
+            break;
+    }
+
+    throw TypeErrorEx(intern_msg("struct field '" + string(fd.name->val) +
+                      "' got a value of the wrong type"), s, e);
+}
+
 static EvalValue
 construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
 {
@@ -559,16 +610,11 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
     obj->fields.reserve(nfields);
 
     for (size_t i = 0; i < nfields; i++) {
-
         EvalValue v = RValue(args->elems[i]->eval(ctx));
-        const FieldDef &fd = def->fields[i];
-
-        if (fd.kind == FieldKind::f_int)
-            v = coerce_to_decl_type(v, DeclType::i);
-        else if (fd.kind == FieldKind::f_float)
-            v = coerce_to_decl_type(v, DeclType::f);
-
-        obj->fields.emplace_back(move(v), false);
+        obj->fields.emplace_back(
+            coerce_struct_field(def->fields[i], move(v),
+                                args->elems[i]->start, args->elems[i]->end),
+            false);
     }
 
     return intrusive_ptr<StructObject>(obj);
@@ -803,6 +849,21 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
         return intrusive_ptr<DictObject>(out);
     }
 
+    if (v.is<intrusive_ptr<StructObject>>()) {
+
+        const auto &obj = v.get<intrusive_ptr<StructObject>>();
+
+        if (obj->is_readonly() && !through_readonly)
+            return v;   /* share the const sub-object, don't copy it */
+
+        auto out = make_intrusive<StructObject>(obj->def);
+        out->fields.reserve(obj->fields.size());
+        for (const auto &f : obj->fields)
+            out->fields.emplace_back(
+                clone_to_mutable(f.get(), through_readonly), false);
+        return intrusive_ptr<StructObject>(out);
+    }
+
     return v;
 }
 
@@ -903,6 +964,18 @@ make_const_clone(const EvalValue &v)
             obj->set_default(make_const_clone(src_obj.get_default()));
         obj->set_readonly();
         return intrusive_ptr<DictObject>(obj);
+    }
+
+    if (v.is<intrusive_ptr<StructObject>>()) {
+
+        const StructObject &src = *v.get<intrusive_ptr<StructObject>>().get();
+
+        auto obj = make_intrusive<StructObject>(src.def);
+        obj->fields.reserve(src.fields.size());
+        for (const auto &f : src.fields)
+            obj->fields.emplace_back(make_const_clone(f.get()), false);
+        obj->set_readonly();
+        return intrusive_ptr<StructObject>(obj);
     }
 
     return v;
@@ -2586,6 +2659,51 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
     ctx->assign_target = false;
 
     EvalValue &&dval = RValue(what->eval(ctx));
+
+    /*
+     * A struct instance: `s.field` is a field (an lvalue when the instance is
+     * mutable, so `s.f = v` / `s.f += v` work; an rvalue for a read-only/const
+     * instance, so a write fails NotLValueEx), else `s.K` is a const member,
+     * else field-not-found.
+     */
+    if (dval.is<intrusive_ptr<StructObject>>()) {
+
+        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
+        const int slot = obj->def->slot_of(memUid);
+
+        if (slot >= 0) {
+            if (obj->is_readonly())
+                return obj->fields[slot].get();
+            return &obj->fields[slot];
+        }
+
+        if (const EvalValue *cv = obj->def->const_of(memUid))
+            return *cv;
+
+        throw TypeErrorEx(
+            intern_msg("Struct '" + string(obj->def->name->val) +
+                       "' has no member '" + string(memUid->val) + "'"),
+            start, end);
+    }
+
+    /* A struct TYPE descriptor: only its `const` members (no instance). */
+    if (dval.is<StructTypeDef *>()) {
+
+        StructTypeDef *def = dval.get<StructTypeDef *>();
+
+        if (const EvalValue *cv = def->const_of(memUid))
+            return *cv;
+
+        if (def->slot_of(memUid) >= 0)
+            throw TypeErrorEx(
+                intern_msg("Field '" + string(memUid->val) +
+                           "' needs an instance"), start, end);
+
+        throw TypeErrorEx(
+            intern_msg("Struct '" + string(def->name->val) +
+                       "' has no member '" + string(memUid->val) + "'"),
+            start, end);
+    }
 
     if (!dval.is<intrusive_ptr<DictObject>>())
         throw TypeErrorEx("Expected dict object", what->start, what->end);
