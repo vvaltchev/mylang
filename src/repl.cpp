@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <iterator>
 #include <cctype>
 #include <cstdlib>     /* getenv */
 #include <unistd.h>    /* isatty */
@@ -56,6 +57,19 @@ struct ReplEngine::Impl {
         std::ostringstream o;
         format_exception(o, e, lines);
         return o.str();
+    }
+
+    /* The interned names currently bound in the global scope (sorted), used to
+     * detect what an input's undef() removed. */
+    std::vector<const UniqueId *> global_names() const {
+        std::vector<std::pair<const UniqueId *, const LValue *>> s;
+        runtime_ctx->collect_symbols(s);
+        std::vector<const UniqueId *> names;
+        names.reserve(s.size());
+        for (const auto &kv : s)
+            names.push_back(kv.first);
+        std::sort(names.begin(), names.end());
+        return names;
     }
 
     string do_eval(const string &src, bool echo);
@@ -246,6 +260,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    scope, capturing print() output and the last statement's value. */
     Block *blk = dynamic_cast<Block *>(root.get());
     EvalValue last;
+    const std::vector<const UniqueId *> names_before = global_names();
     std::streambuf *old_cout = std::cout.rdbuf(out.rdbuf());
 
     try {
@@ -267,6 +282,19 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
 
     std::cout.rdbuf(old_cout);
     retained.push_back(move(root));
+
+    /* A global that undef() removed at runtime is also dropped from the type
+     * environment, so a LATER input may re-declare it with a new type (the
+     * documented way to change a global's type). */
+    {
+        const std::vector<const UniqueId *> names_after = global_names();
+        std::vector<const UniqueId *> removed;
+        std::set_difference(names_before.begin(), names_before.end(),
+                            names_after.begin(), names_after.end(),
+                            std::back_inserter(removed));
+        for (const UniqueId *n : removed)
+            infer.undef_global(n);
+    }
 
     /* 4. The `=> value` echo (RValue collapses an lvalue result). A `none`
      *    result - a func/struct decl, a `print`, an `if`/loop, a void call -

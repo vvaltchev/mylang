@@ -7641,6 +7641,13 @@ static const std::vector<repl_test> repl_tests =
       { { "var ca = [1, 2, 3]", "=> [1, 2, 3]" },
         { "ca[0] + 100", "=> 101" },
         { "ca = [\"a\", \"b\"]", "is assigned" } } },
+
+    { "undef() resets a global's type so it can be redeclared",
+      { { "var cu = 3", "=> 3" },
+        { "var cu = \"s\"", "is assigned 'str'" },   /* redeclare: rejected */
+        { "undef(cu)", "" },                          /* now reset it */
+        { "var cu = \"s\"", "=> s" },                 /* fresh type: ok */
+        { "cu", "=> s" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)
