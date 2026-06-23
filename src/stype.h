@@ -7,6 +7,8 @@
 #include <memory>
 #include <cstddef>
 
+class UniqueId;
+
 /*
  * Static types for MyLang's type-inference pass (see plans/type-inference.md).
  *
@@ -59,7 +61,8 @@ struct STy {
     std::vector<STyRef> params;        /* Func */
     std::vector<bool> param_opt;       /* Func */
     STyRef ret = nullptr;              /* Func */
-    const void *struct_def = nullptr;  /* Struct (StructTypeDef*, future) */
+    const void *struct_def = nullptr;  /* Struct: the StructTypeDef* identity */
+    const UniqueId *struct_name = nullptr;  /* Struct: name (for to_string) */
 
     explicit STy(STyKind k) : kind(k) { }
 };
@@ -83,6 +86,7 @@ public:
     STyRef fresh_var();
     STyRef array_of(STyRef elem, bool opt = false);
     STyRef dict_of(STyRef key, STyRef val, bool opt = false);
+    STyRef struct_ty(const void *def, const UniqueId *name, bool opt = false);
     STyRef func_of(std::vector<STyRef> params,
                    std::vector<bool> param_opt,
                    STyRef ret,

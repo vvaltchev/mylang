@@ -720,6 +720,15 @@ pAcceptCallExpr(ParseContext &c,
         if (!expr->args->arg_names.empty())
             pTryDesugarNamedCall(c, expr.get());
 
+        /* Struct construction `Type(args)` is NOT const-folded at parse time
+         * (v1): construction runs no type check, so folding it here would
+         * bypass the inferencer's field checks (and leak its runtime arity
+         * error to parse time). Defer to the inferencer + runtime. */
+        else if (c.const_eval && expr->what->is_const &&
+                 expr->args->is_const &&
+                 RValue(expr->what->eval(c.const_ctx)).is<StructTypeDef *>())
+            expr->args->is_const = false;
+
         if (c.const_eval && expr->what->is_const && expr->args->is_const) {
 
             expr->is_const = true;
