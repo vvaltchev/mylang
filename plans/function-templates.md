@@ -1,14 +1,23 @@
 # Function templates (monomorphization) — design plan
 
-> **STATUS: APPROVED, building.** Supersedes the "never-called param → dyn" +
-> mandatory-`dyn`-on-derived-locals behavior for functions with un-annotated
-> parameters. **Decisions locked** (see §7): D1 any un-annotated non-`dyn` param
-> ⇒ template (`dyn` params stay concrete); **D2 = structural-only** for a
-> never-instantiated template (true C++ two-phase); **D3 = type-checking +
-> monomorphized eval together** — each instantiation is a real specialized body
-> (typed params ⇒ M8 / flat arrays), reusing the `$specN` clone machinery, from
-> the start; D4 instantiation cap with a diagnostic; D5 expected-type then
-> single-`dyn` fallback for a template used as a value.
+> **STATUS: v1 BUILT (all CI green: Linux/macOS/Windows/Coverage; GCC + clang,
+> debug + opt + sanitized).** A NAMED function with ≥1 un-annotated, non-`dyn`,
+> non-`opt` parameter is a template: not checked in isolation (D2 structural-
+> only), instantiated per call-site signature as a typed clone the concrete-
+> function inference + M8 + eval handle (D3), with the call redirected like the
+> `$specN` clones. `dyn` is never *required*. Decisions: D1 un-annotated non-
+> `dyn` param ⇒ template; D2 structural-only never-called; D3 monomorphized
+> eval together.
+>
+> **Deferred (v1 boundaries, in code + tests):** anonymous lambdas and any
+> function with an `opt` parameter keep the join model (no clone). In the REPL,
+> a template DEFINED IN A PRIOR INPUT (`pinned`) is **not** instantiated in a
+> later input — it evaluates dynamically via the tree-walker (correct, just not
+> monomorphized); a template defined+used within one input, and every script
+> template, monomorphize fully. (This deliberately avoids cloning a prior
+> input's already-resolved decl across the persistent session state, a path that
+> proved fragile under MSVC.) Still open: opt-param templates, a hard
+> instantiation cap (D4), and the template-as-a-value path (D5).
 
 ## 1. The problem & the model
 

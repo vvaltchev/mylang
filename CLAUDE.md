@@ -860,6 +860,35 @@ faster. `th` is copied by `copy_base_fields` (clones/inliner preserve it), and
 the typed eval's `get<int_type>()` throws `TypeError` if inference were ever
 wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
 
+### Function templates (monomorphization)
+
+A **named** function with ≥1 un-annotated, non-`dyn`, non-`opt` parameter is a
+**template** (`FuncInfo::is_template`, set in `declare_funcdecl`): not
+type-checked in isolation, but **instantiated per call-site signature** as a
+typed clone the ordinary concrete-function path handles. So `func f(x){var
+t=x+1; return t;}` never needs `var dyn t`, a never-called template never
+errors, and `f(1); f("s")` makes two instances not a type conflict. `dyn` is the
+explicit one-instance-any-type param; an `opt` param or a lambda keeps the join
+model (v1). Full design + deferrals: `plans/function-templates.md`.
+
+Mechanism (`inferencer.cpp`): the fixpoint and check pass **skip** an
+un-instantiated template (`accumulate`/`accumulate_call`/`check`/`check_call`
+test `is_template`); an outer loop in `infer_one`, between the main fixpoint and
+finalize, runs `instantiate_round` — for each template call whose arg types have
+settled, it clones the template (`make_template_clone`: synthetic `$tmplN` id +
+`display_name` for backtraces, `walk_struct`'d, `is_template=false`, inserted at
+the root block's front), **redirects** the call to the clone (resolving the
+clone's sym BY NODE via `id_sym`, not by name), and re-runs the fixpoint; the
+clone's params accumulate their one signature through the concrete path (dedup
+by `(template, signature)` in `tmpl_cache`; recursion → self-redirect). Arity is
+still checked for a template call; per-arg type/nullability is checked inside
+each clone. **REPL caveat:** a template committed by a PRIOR input (`pinned`) is
+NOT instantiated in a later input — it evaluates dynamically (correct, just not
+monomorphized); only a within-input template and every script template
+monomorphize. (`tmpl_cache` is cleared per input.) This deliberately avoids
+cloning a prior input's already-resolved decl across the persistent session
+state, which was fragile under MSVC.
+
 ## The value & type model (the subtle part)
 
 - **`EvalValue`** (`evalvalue.h`) is a hand-rolled tagged union: a `ValueU`
