@@ -11,14 +11,19 @@
 > Headless tests cover all of it (`repl:` sequences + `lineedit:`/`highlight:`
 > checks). **Also done:** Phase 4 **Tab autocompletion** (keywords + builtins +
 > globals + struct fields after `.`); Phase-5 polish (history persisted to
-> `~/.mylang_history`; a `none` result isn't echoed); and — the once-deferred
+> `~/.mylang_history`; a `none` result isn't echoed); the once-deferred
 > §3.1 piece — the **faithful per-input pipeline**: the REAL inference,
 > resolver, and specializer run on every input over an expandable global scope,
 > with **cross-input type commitment** (a committed global's type is pinned, so
 > a later `x = <wrong type>` is the same `TypeMismatchEx` a script gives;
 > `undef(x)` resets it), the **optimizers run per input** (resolver `repl_mode`
 > keeps top-level decls as map globals while nested locals slot/inline/
-> specialize), and a **`:analyze`** command to inspect them. **Not yet:** the
+> specialize), and a **`:analyze`** command to inspect them; and the **true
+> multi-line block editor** (§1's headline) — the buffer holds newlines with a
+> 2-D cursor, Enter submits only when the block parses complete (else newline +
+> auto-indent), UP/DOWN move within the block then fall through to history, and
+> a committed multi-line input is recalled and re-edited as ONE unit (with
+> function/struct **redefinition** so edit-and-resubmit works). **Not yet:** the
 > IRB dropdown-style completion menu, reverse-search/bracketed-paste, and the
 > Windows backend (Phase 5).
 >
