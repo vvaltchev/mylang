@@ -1270,6 +1270,67 @@ are unchanged.
   logic, those tests are
   your spec.
 
+## Custom struct types
+
+User-defined value types (`struct Point { int x; int y; }`). Full design +
+phasing: `plans/structs.md`. **Status: the boxed implementation is complete**
+(decl, construction, field/const access, inference, const-folding, COW); the
+**C-layout / flat-`array<Struct>` / fast-access perf phases are still to land**
+(see the plan), so today every struct is a `boxed` slot array.
+
+- **Two value kinds, mirroring func's decl/object split** (`type.h` `TypeE`):
+  `t_structtype` (trivial, `< t_str`, a raw `StructTypeDef *`) is the **type
+  descriptor** the `struct` decl binds as a `const` in scope — callable
+  (construction) and `.CONST`-accessible; `t_struct` (non-trivial, `>= t_str`,
+  `intrusive_ptr<StructObject>`) is an **instance**. `TypeStruct` /
+  `TypeStructType` in `src/types/struct.cpp.h`; wired through `ValueU`,
+  `TypeToEnum`, `TypeNames`, `AllTypes`.
+- **`structtype.h`** defines `StructTypeDef` (AST-owned, program-lifetime:
+  `name`, `fields` as `FieldDef{name, FieldKind, struct_ty, is_opt, slot,
+  offset}`, folded `consts`, plus the `Layout`/`size`/`align` fields the POD
+  phases will fill) and `StructObject` (`RefCounted`: `def`, `readonly`, and a
+  boxed `vector<LValue> fields`). `evalvalue.h` forward-declares both.
+- **Parser** (`pAcceptStructDecl`, `parser.cpp`): the `struct` keyword
+  (`kw_struct`) → a `StructDeclStmt` (owns the `StructTypeDef`;
+  `do_eval` binds the descriptor like a func name, so it works inside a function
+  too). Fields are `[opt] TYPE name;` (a primitive keyword, `dyn`, or a
+  struct-type name → `FieldKind`); `const NAME = expr;` members fold immediately
+  (`make_const_clone`). v1 rejects `var` fields and `opt` on a non-ref field;
+  and duplicate member names.
+- **Construction is a call**: `Point(...)` parses as a `CallExpr`; what makes it
+  construction is only that the callee is a struct descriptor (decided in the
+  inferencer + at eval, never in the grammar). It reuses the named-arg pipeline:
+  the inferencer's `lower_named_args` and `check_call` recognize a struct callee
+  and build the `ParamSpec`/param-type list from the fields, so positional /
+  named / mixed and the arity-range / per-field-assignability / non-opt-not-none
+  checks all come from the shared machinery. `CallExpr::do_eval` →
+  `construct_struct` builds the boxed instance; `coerce_struct_field`
+  coerces a numeric field and **runtime-validates** each field's type (guarding
+  a `dyn`-laundered value; the `dynarray`-style escape hatch is just declaring
+  the field `dyn`). `type_of(Point(..))` is `STyKind::Struct` (`stype.h`'s
+  reserved `Struct` kind + `struct_def`/`struct_name`; `STyArena::struct_ty`).
+- **Member access** (`MemberExpr::do_eval`): dispatch on the base — a `t_struct`
+  instance → `def->slot_of(memUid)` field (an lvalue when mutable, an rvalue for
+  a read-only/const instance so a write fails `NotLValueEx`) else a `const`
+  member else not-found; a `t_structtype` descriptor → only `const_of`; a dict
+  unchanged. `MemberExpr::memUid` (interned `UniqueId`, set in `pAcceptMember`
+  beside the dict-key `memId`) drives the slot lookup. The inferencer types
+  `s.field`/`Type.CONST` and validates membership; a `dyn`-base read resolves at
+  runtime via the tag.
+- **`const` works fully**: a struct construction folds **inside a `const` decl**
+  (`construct_struct`'s own validation makes it safe), baked deep read-only by
+  `make_const_clone`; `MakeConstructFromConstVal` / `clone_to_mutable` /
+  `is_readonly_value` / `ShouldConstSymbolExistAtRuntime` / `sty_from_value` all
+  handle a struct value. Outside a `const` decl, construction is left a runtime
+  `CallExpr` so the inferencer gives the precise field errors.
+- **Value semantics**: COW like arrays/dicts (`StructObject::readonly` backs a
+  deep `const`; plain assignment aliases; `clone()` shallow, `deepclone()`
+  deep). `==`
+  is structural between same-`def` instances (`TypeStruct::eq`); `hash` throws
+  (not hashable, v1). **Deferred** (plans/structs.md): `var` fields (call-site
+  field inference), `opt` scalar fields, the POD C-layout + flat `array<Struct>`
+  + M8-style direct `s.x`/`a[i].x` access, methods, and empty structs.
+
 ## Error model
 
 `errors.h` defines an `Exception` base (`name`, `msg`, `loc_start`, `loc_end`)
