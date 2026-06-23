@@ -643,6 +643,89 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
     return intrusive_ptr<StructObject>(obj);
 }
 
+void pod_store_field(const FieldDef &f, char *base, const EvalValue &v)
+{
+    char *p = base + f.offset;
+    switch (f.kind) {
+        case FieldKind::f_bool:
+            *p = v.get<bool>() ? 1 : 0;
+            break;
+        case FieldKind::f_int: {
+            int_type x = v.get<int_type>();
+            std::memcpy(p, &x, sizeof x);
+            break;
+        }
+        case FieldKind::f_float: {
+            float_type x = v.get<float_type>();
+            std::memcpy(p, &x, sizeof x);
+            break;
+        }
+        case FieldKind::f_struct: {
+            const StructObject &o = *v.get<intrusive_ptr<StructObject>>().get();
+            std::memcpy(p, o.bytes.data(), f.struct_def->size);
+            break;
+        }
+        default:
+            throw InternalErrorEx();
+    }
+}
+
+/*
+ * The build-hot fast path behind `append(arr, Point(...))`: when appending a
+ * struct constructor call to a flat POD-struct array of that exact type,
+ * construct the element STRAIGHT into the array's byte buffer - no temporary
+ * StructObject (which would be two heap allocations per element, the dominant
+ * cost of building an array<Struct>). Returns false (caller falls back to the
+ * normal `eval arg -> append value` path) unless every condition holds.
+ *
+ * Field args are evaluated/coerced into a stack buffer FIRST, so a throw mid-
+ * construction (a type error, a side-effecting arg) leaves the array unchanged;
+ * only on full success is the slot committed (resize + copy). Declared in
+ * structtype.h so builtin_append (a different TU) can call it.
+ */
+bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
+                                     Construct *arg);
+bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
+                                     Construct *arg)
+{
+    auto *cc = dynamic_cast<CallExpr *>(arg);
+    if (!cc || !cc->args)
+        return false;
+
+    const EvalValue cv = RValue(cc->what->eval(ctx));
+    if (!cv.is<StructTypeDef *>())
+        return false;
+
+    StructTypeDef *def = cv.get<StructTypeDef *>();
+    auto &sv = arr.flat_structs();
+    if (def != sv.def || !def->is_pod())
+        return false;
+
+    const size_t nfields = def->fields.size();
+    /* POD has no opt fields: an exact arity is required. A mismatch falls back
+     * so the normal path raises the proper InvalidNumberOfArgsEx. */
+    if (cc->args->elems.size() != nfields)
+        return false;
+
+    /* Build into a stack buffer (POD structs are small); cap defensively. */
+    constexpr int STACK_CAP = 512;
+    if (def->size > STACK_CAP)
+        return false;
+    char tmp[STACK_CAP];
+
+    for (size_t i = 0; i < nfields; i++) {
+        EvalValue v = coerce_struct_field(
+            def->fields[i], RValue(cc->args->elems[i]->eval(ctx)),
+            cc->args->elems[i]->start, cc->args->elems[i]->end);
+        pod_store_field(def->fields[i], tmp, v);
+    }
+
+    const size_t at = sv.buf.size();
+    sv.buf.resize(at + sv.stride);
+    std::memcpy(sv.buf.data() + at, tmp, sv.stride);
+    return true;
+}
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue callable_storage;

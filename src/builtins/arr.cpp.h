@@ -284,7 +284,6 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
     const EvalValue &arr_lval = arg0->eval(ctx);
-    const EvalValue &elem = RValue(arg1->eval(ctx));
 
     if (!arr_lval.is<LValue *>())
         throw NotLValueEx(arg0->start, arg0->end);
@@ -304,6 +303,16 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
 
     if (arr.is_slice())
         arr.clone_internal_vec();
+
+    /* Build-hot fast path: `append(flat_struct_arr, S(...))` constructs the new
+     * element straight into the byte buffer (no temporary StructObject). The
+     * arg is evaluated INSIDE on success; on a miss it is evaluated normally
+     * below, so it is never evaluated twice. */
+    if (arr.skind() == SharedArrayObj::Storage::structs &&
+        try_construct_into_struct_array(ctx, arr, arg1))
+        return lval->get();
+
+    const EvalValue &elem = RValue(arg1->eval(ctx));
 
     /*
      * Flat fast path: append a matching scalar straight into the unboxed
