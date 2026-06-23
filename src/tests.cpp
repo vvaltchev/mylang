@@ -7614,6 +7614,33 @@ static const std::vector<repl_test> repl_tests =
       { { "var yy = 5", "=> 5" },
         { "if (yy > 0) {\n  yy = 100\n} else {\n  yy = -1\n}", "" },
         { "yy", "=> 100" } } },
+
+    /* ---- faithful cross-input type commitment (incremental inference) ---- */
+    { "a committed global's inferred type is pinned across inputs",
+      { { "var ci = 3", "=> 3" },
+        { "ci = \"hello\"", "has type 'int' but is assigned 'str'" },
+        { "ci", "=> 3" } } },             /* the bad input was rejected */
+
+    { "a conforming reassignment across inputs is fine",
+      { { "var cj = 3", "=> 3" },
+        { "cj = 40", "=> 40" },
+        { "cj", "=> 40" } } },
+
+    { "an annotated global says 'is declared', inferred says 'has type'",
+      { { "int ck = 3", "=> 3" },
+        { "ck = \"x\"", "is declared 'int'" },
+        { "var cl = 3", "=> 3" },
+        { "cl = \"x\"", "has type 'int'" } } },
+
+    { "a wrong-typed arg to a prior function is caught across inputs",
+      { { "func cf(int n) => n + 1", "" },
+        { "cf(10)", "=> 11" },
+        { "cf(\"x\")", "TypeMismatch" } } },
+
+    { "a flat array's element type is enforced across inputs",
+      { { "var ca = [1, 2, 3]", "=> [1, 2, 3]" },
+        { "ca[0] + 100", "=> 101" },
+        { "ca = [\"a\", \"b\"]", "is assigned" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)

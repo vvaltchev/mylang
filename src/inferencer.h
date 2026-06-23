@@ -3,8 +3,10 @@
 #pragma once
 
 #include <iosfwd>
+#include <memory>
 
 class Construct;
+class UniqueId;
 
 /*
  * Whole-program static type inference + checking (see plans/type-inference.md).
@@ -40,3 +42,31 @@ void dump_type_info(Construct *root, std::ostream &os);
  * disabled (no TypeHints are set). See plans/type-inference.md M8.
  */
 void specialize_types(Construct *root, bool enable = true);
+
+/*
+ * REPL incremental type inference + checking. A persistent type-checker that
+ * runs the REAL inference per input over an EXPANDABLE global scope: each input
+ * is checked against the globals committed by prior inputs (their types PINNED,
+ * so a committed global behaves like an annotation - the cross-input type
+ * commitment), then its own new globals are committed. `check_input` throws a
+ * compile-time exception (TypeMismatchEx, DynRequiredEx, ...) on a violation,
+ * which the REPL catches to reject just that input. `undef_global` drops a name
+ * from the committed set (so a later `var x` of a new type is fresh, not a
+ * conflict). The one-shot `infer_types` (scripts + all tests) is untouched.
+ * See plans/repl.md §3.1.
+ */
+class ReplInfer {
+
+public:
+
+    ReplInfer();
+    ~ReplInfer();
+
+    void check_input(Construct *input);
+    void undef_global(const UniqueId *name);
+
+private:
+
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};

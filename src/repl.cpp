@@ -11,6 +11,7 @@
 #include "lineedit.h"
 #include "highlight.h"
 #include "structtype.h"
+#include "inferencer.h"
 
 #include <iostream>
 #include <fstream>
@@ -38,6 +39,7 @@ struct ReplEngine::Impl {
 
     unique_ptr<EvalContext> const_ctx;
     unique_ptr<EvalContext> runtime_ctx;
+    ReplInfer infer;               /* faithful per-input type-checking */
     std::vector<unique_ptr<Construct>> retained;
     std::vector<string> lines;
 
@@ -225,6 +227,18 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
             throw SyntaxErrorEx(Loc(pc.get_tok().loc),
                                 "Unexpected token at the end", &pc.get_tok());
     } catch (const Exception &e) {
+        return format_error(e);
+    }
+
+    /* 2b. Type-check this input against the committed globals (faithful
+     *     incremental inference). A type error rejects just this input - report
+     *     it and commit nothing (no eval, no retain). On success the inferencer
+     *     has pinned this input's new globals for the next input, and stamped
+     *     ArrHints/TypeHints on the tree the evaluator below reads. */
+    try {
+        infer.check_input(root.get());
+    } catch (const Exception &e) {
+        retained.push_back(move(root));   /* keep the AST alive (id_sym refs) */
         return format_error(e);
     }
 
