@@ -514,15 +514,55 @@ ReplEngine::is_incomplete(const string &src)
 }
 
 /* ------------------------------------------------------------------ */
-/* The interactive loop (cooked mode for now - a hand-rolled raw line  */
-/* editor replaces std::getline in Phase 1).                           */
+/* The interactive loop (raw-mode line editor; see lineedit.cpp).       */
 /* ------------------------------------------------------------------ */
+
+/* The persisted history file path ($HOME/.mylang_history), or "" if no HOME. */
+static string
+history_path()
+{
+    const char *home = std::getenv("HOME");
+    return home ? string(home) + "/.mylang_history" : string();
+}
+
+static const size_t HISTORY_CAP = 2000;
+
+static void
+load_history(std::vector<string> &history)
+{
+    const string path = history_path();
+    if (path.empty())
+        return;
+    std::ifstream f(path);
+    string line;
+    while (std::getline(f, line))
+        if (!line.empty())
+            history.push_back(line);
+    if (history.size() > HISTORY_CAP)
+        history.erase(history.begin(), history.end() - HISTORY_CAP);
+}
+
+static void
+save_history(const std::vector<string> &history)
+{
+    const string path = history_path();
+    if (path.empty())
+        return;
+    std::ofstream f(path, std::ios::trunc);
+    if (!f.is_open())
+        return;
+    const size_t from =
+        history.size() > HISTORY_CAP ? history.size() - HISTORY_CAP : 0;
+    for (size_t i = from; i < history.size(); i++)
+        f << history[i] << "\n";
+}
 
 int
 run_repl()
 {
     ReplEngine engine;
     std::vector<string> history;
+    load_history(history);
 
     /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
     const bool color = isatty(STDOUT_FILENO) && !std::getenv("NO_COLOR");
@@ -565,7 +605,7 @@ run_repl()
         }
 
         const string &line = r.line;
-        if (!line.empty())
+        if (!line.empty() && line != ":quit" && line != ":q")
             history.push_back(line);
 
         /* A meta-command (`:name ...`) at a fresh prompt is a complete one-line
@@ -596,5 +636,6 @@ run_repl()
         continuing = false;
     }
 
+    save_history(history);
     return 0;
 }
