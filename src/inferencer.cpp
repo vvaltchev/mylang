@@ -1420,8 +1420,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
          * resolves here without being marked value_used, so a var used only to
          * be called stays monomorphizable. Args are value uses. */
         if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
-            if (!id_sym.count(cid))
-                id_sym[cid] = lookup(s, cid->uid);
+            id_sym[cid] = lookup(s, cid->uid);   /* always - see Identifier */
         } else {
             walk_struct(call->what.get(), s);
         }
@@ -1478,8 +1477,12 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
     }
 
     if (auto *id = dynamic_cast<Identifier *>(n)) {
-        if (!id_sym.count(id))
-            id_sym[id] = lookup(s, id->uid);
+        /* ALWAYS (re)resolve - never `if (!id_sym.count(id))`. id_sym is keyed
+         * by node pointer and persists for the session; a fresh node can reuse a
+         * freed node's address, so a stale entry must be OVERWRITTEN, not kept
+         * (keeping it bound an input's callee to a prior clone -> the MSVC bug).
+         * walk_struct visits each node once, so this never double-resolves. */
+        id_sym[id] = lookup(s, id->uid);
         /* reached for every reference EXCEPT a call callee (handled above): a
          * value (non-callee) use. */
         if (TypeSym *sym = id_sym[id])
