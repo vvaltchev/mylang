@@ -94,6 +94,29 @@ public:
     const char *const name;
     const ConstructType ct;     /* Purpose: avoid dynamic_cast in some cases */
 
+    /*
+     * A process-stable, monotonically-assigned identity. Unlike the node's
+     * ADDRESS - which the allocator RECYCLES after free, the root of a whole
+     * class of "stale pointer-keyed map" bugs (see CLAUDE.md "Invariants &
+     * hazards") - node_id is never reused, so it is a safe stable identity for
+     * debugging and for keying any map that outlives the node. A clone() gets a
+     * FRESH id (it runs this constructor); copy_base_fields does NOT copy it.
+     */
+    static uint64_t next_node_id;
+    const uint64_t node_id;
+
+#ifdef RECYCLE_ALLOC
+    /*
+     * Adversarial test allocator (RECYCLE=1 builds only): a LIFO free-list that
+     * hands a just-freed node's address straight back to the next same-size
+     * allocation, so any "AST pointer used as a stable identity" bug manifests
+     * DETERMINISTICALLY under -rt instead of depending on the host allocator's
+     * luck. Defined in syntax.cpp. See CLAUDE.md "Invariants & hazards".
+     */
+    static void *operator new(std::size_t n);
+    static void operator delete(void *p) noexcept;
+#endif
+
     bool is_const;
     Loc start;
     Loc end;
@@ -132,6 +155,7 @@ public:
               ConstructType ct = ConstructType::other)
         : name(name)
         , ct(ct)
+        , node_id(next_node_id++)
         , is_const(is_const)
         , start(Loc())
         , end(Loc())
