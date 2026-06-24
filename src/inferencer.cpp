@@ -134,6 +134,11 @@ private:
     bool changed = false;
     FuncInfo *cur_func = nullptr;
 
+    /* Monomorphization: instantiations cached by (template, signature) so the
+     * same call signature shares one clone; a monotonic counter names them. */
+    std::unordered_map<std::string, FuncDeclStmt *> tmpl_cache;
+    int tmpl_clone_counter = 0;
+
     /* Flow-sensitive null narrowing (check pass only): inside the proven branch
      * of `if (x != none)` / `if (x)`, x reads as non-opt. */
     std::unordered_map<const TypeSym *, STyRef> narrowed;
@@ -185,6 +190,15 @@ private:
     void accumulate_call(CallExpr *call);
     void accumulate_foreach(ForeachStmt *fe);
     void spread_idlist(IdList *idl, Construct *rvalue);
+
+    /* monomorphization (templates - see plans/function-templates.md) */
+    void run_fixpoint(Block *root);             /* the Jacobi loop, extracted */
+    bool instantiate_round(Block *root);     /* clone + redirect; progress? */
+    FuncDeclStmt *make_template_clone(FuncInfo *tmpl, const std::string &key,
+                                      Block *root);
+    std::string template_sig_key(FuncInfo *tmpl,
+                                  const std::vector<STyRef> &sig);
+    void collect_calls(Construct *n, std::vector<CallExpr *> &out);
 
     /* check pass */
     void check(Construct *n);
@@ -402,6 +416,123 @@ void Inferencer::for_each_child(Construct *n,
     /* leaves: literals, Identifier, Break/Continue/Rethrow/Nop */
 }
 
+/* ----------------------- monomorphization (templates) -------------------- */
+
+/* The Jacobi fixpoint, extracted so the instantiation loop can re-run it. */
+void Inferencer::run_fixpoint(Block *rootBlock)
+{
+    for (int iter = 0; iter < 1000; iter++) {
+        reset_round();
+        cur_func = nullptr;
+        for (auto &e : rootBlock->elems)
+            accumulate(e.get());
+        changed = false;
+        commit_round();          /* sets `changed` if any type moved */
+        if (!changed)
+            break;
+    }
+}
+
+/* Every CallExpr in the subtree (complete traversal). */
+void Inferencer::collect_calls(Construct *n, std::vector<CallExpr *> &out)
+{
+    if (!n)
+        return;
+    if (auto *c = dynamic_cast<CallExpr *>(n))
+        out.push_back(c);
+    for_each_child(n, [&](Construct *c) { collect_calls(c, out); });
+}
+
+/* Dedup key for an instantiation: the template identity + the signature. */
+std::string Inferencer::template_sig_key(FuncInfo *tmpl,
+                                         const std::vector<STyRef> &sig)
+{
+    std::string k = "T";
+    k += std::to_string(reinterpret_cast<uintptr_t>(tmpl));
+    for (STyRef t : sig) {
+        k += ";";
+        k += sty_to_string(t);
+    }
+    return k;
+}
+
+/*
+ * Build a concrete clone of a template for one signature: a fresh `$tmplN` name
+ * (display_name keeps the original for backtraces), structurally walked so it
+ * has its own FuncInfo + param/local syms, marked non-template, and inserted at
+ * the root block's front. Its params are NOT seeded - the redirected call (the
+ * only call site for this signature) feeds them through the concrete path.
+ */
+FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
+                                              const std::string &key,
+                                              Block *rootBlock)
+{
+    unique_ptr<Construct> cl = tmpl->decl->clone();
+    auto *fc = static_cast<FuncDeclStmt *>(cl.get());
+    fc->display_name = std::string(tmpl->decl->id->get_str());
+    fc->id = make_unique<Identifier>(
+        "$tmpl" + std::to_string(tmpl_clone_counter++));
+
+    walk_struct(fc, global);            /* declare its name + build its syms */
+    if (FuncInfo *cfi = func_of_decl[fc])
+        cfi->is_template = false;         /* an instantiation is concrete */
+
+    FuncDeclStmt *raw = fc;
+    rootBlock->elems.insert(rootBlock->elems.begin(), move(cl));
+    tmpl_cache[key] = raw;
+    return raw;
+}
+
+/*
+ * One instantiation round: for every call whose callee is a template and whose
+ * argument types have settled, get-or-make the clone for that signature and
+ * redirect the call to it. Returns whether any call was redirected (so the
+ * caller re-runs the fixpoint and looks for newly-exposed template calls).
+ */
+bool Inferencer::instantiate_round(Block *rootBlock)
+{
+    std::vector<CallExpr *> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+
+    bool progress = false;
+    for (CallExpr *call : calls) {
+        FuncInfo *tmpl = callee_funcinfo(call->what.get());
+        if (!tmpl || !tmpl->is_template)
+            continue;
+
+        /* v1: require an exact arity match (opt-param templates deferred). */
+        if (call->args->elems.size() != tmpl->params.size())
+            continue;
+
+        std::vector<STyRef> sig;
+        bool ready = true;
+        for (auto &a : call->args->elems) {
+            STyRef t = sty_resolve(type_of(a.get()));
+            if (is_unknown(t)) { ready = false; break; }
+            sig.push_back(t);
+        }
+        if (!ready)
+            continue;       /* args not settled yet; a later round */
+
+        const std::string key = template_sig_key(tmpl, sig);
+        auto it = tmpl_cache.find(key);
+        FuncDeclStmt *clone = (it != tmpl_cache.end())
+            ? it->second
+            : make_template_clone(tmpl, key, rootBlock);
+        if (!clone)
+            continue;
+
+        auto what = make_unique<Identifier>(clone->id->get_str());
+        what->start = call->what->start;
+        what->end = call->what->end;
+        id_sym[what.get()] = global->syms[clone->id->uid];
+        call->what = move(what);
+        progress = true;
+    }
+    return progress;
+}
+
 /* ------------------------------ run / passes ----------------------------- */
 
 /*
@@ -440,16 +571,20 @@ void Inferencer::infer_one(Block *rootBlock)
     if (!checks_enabled)
         return;
 
-    /* fixpoint */
-    for (int iter = 0; iter < 1000; iter++) {
-        reset_round();
-        cur_func = nullptr;
-        for (auto &e : rootBlock->elems)
-            accumulate(e.get());
-        changed = false;
-        commit_round();          /* sets `changed` if any type moved */
-        if (!changed)
+    run_fixpoint(rootBlock);
+
+    /*
+     * Monomorphization. A template (un-annotated params) is skipped by the
+     * fixpoint; instead, each of its call-site signatures becomes a typed clone
+     * (params accumulate the signature through the concrete path), the call is
+     * redirected, and the fixpoint re-runs so the clone's body infers. Iterate
+     * until no new signature appears - a clone's body may call other templates
+     * (or itself), which surface only once its own params are settled.
+     */
+    for (int round = 0; round < 64; round++) {
+        if (!instantiate_round(rootBlock))
             break;
+        run_fixpoint(rootBlock);
     }
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
@@ -544,6 +679,14 @@ void Inferencer::infer_input(Block *rootBlock)
 {
     if (!rootBlock)
         return;
+
+    /*
+     * Each REPL input instantiates templates fresh - the instantiation cache is
+     * NOT shared across inputs (a prior input's clone lives in a prior block; a
+     * later input builds its own in its own block). The clone-name counter
+     * stays monotonic, so names never collide in the persistent global scope.
+     */
+    tmpl_cache.clear();
 
     const size_t sym_base = all_syms.size();
     const size_t func_base = all_funcs.size();
@@ -953,13 +1096,24 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
     fi->ret_acc = bottom;
     fi->falls_through =
         fd->body && fd->body->is_block() && !always_exits(fd->body.get());
-    /* A template iff any param is un-annotated and not explicitly `dyn`. */
-    if (fd->params)
-        for (auto &p : fd->params->elems)
-            if (p->decl_type == DeclType::none && !p->dyn_mod) {
-                fi->is_template = true;
-                break;
-            }
+    /*
+     * A template iff it is a NAMED function with at least one un-annotated,
+     * non-`dyn` parameter AND no `opt` parameter. (An anonymous lambda has no
+     * name to redirect a call to; an `opt` param accepts `none`, which doesn't
+     * fit clean per-signature cloning - a `none` argument would make a
+     * degenerate `none`-typed instantiation. Both keep the join model in v1 -
+     * see plans/function-templates.md "deferred".)
+     */
+    if (fd->id && fd->params) {
+        bool has_un = false, has_opt = false;
+        for (auto &p : fd->params->elems) {
+            if (p->opt_mod)
+                has_opt = true;
+            else if (p->decl_type == DeclType::none && !p->dyn_mod)
+                has_un = true;
+        }
+        fi->is_template = has_un && !has_opt;
+    }
     func_of_decl[fd] = fi;
 
     if (fd->id) {
@@ -1875,8 +2029,11 @@ void Inferencer::accumulate(Construct *n)
         return;
 
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        FuncInfo *fi = func_of_decl[fd];
+        if (fi && fi->is_template)
+            return;   /* a template: inferred per instantiation, not here */
         FuncInfo *prev = cur_func;
-        cur_func = func_of_decl[fd];
+        cur_func = fi;
         if (fd->body && !fd->body->is_block()) {
             accumulate(fd->body.get());
             contribute_ret(type_of(fd->body.get()));
@@ -1924,6 +2081,8 @@ void Inferencer::accumulate_call(CallExpr *call)
     /* direct call to a known function (named, func-var, or inline lambda): feed
      * the argument types into its parameters */
     if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
+        if (fi->is_template)
+            return;   /* a template call: handled by instantiation (redirect) */
         size_t n = std::min(fi->params.size(), args->elems.size());
         for (size_t i = 0; i < n; i++)
             contribute_arg(fi->params[i], type_of(args->elems[i].get()),
@@ -2313,9 +2472,12 @@ void Inferencer::check(Construct *n)
         return;
 
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
-        FuncInfo *prev = cur_func;
         auto it = func_of_decl.find(fd);
-        cur_func = (it != func_of_decl.end()) ? it->second : nullptr;
+        FuncInfo *fi = (it != func_of_decl.end()) ? it->second : nullptr;
+        if (fi && fi->is_template)
+            return;   /* a template: checked per instantiation (its clones) */
+        FuncInfo *prev = cur_func;
+        cur_func = fi;
         check(fd->body.get());
         cur_func = prev;
         return;
@@ -2568,10 +2730,15 @@ void Inferencer::check_call(CallExpr *call)
     std::vector<TypeSym *> *fparams = nullptr;
     const STy *fsty = nullptr;
     bool callable_known = false;
+    /* An un-instantiated template call: ARITY is still checked here (vs the
+     * declared params), but per-argument type/nullability is validated per
+     * instantiation (in each clone), so the per-arg loop below is skipped. */
+    bool template_call = false;
 
     if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
         fparams = &fi->params;
         callable_known = true;
+        template_call = fi->is_template;
     } else if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
         auto it = id_sym.find(cid);
         TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
@@ -2636,6 +2803,9 @@ void Inferencer::check_call(CallExpr *call)
                      std::to_string(nargs),
                  call->start, call->end);
     }
+
+    if (template_call)
+        return;   /* per-argument checking happens in each instantiation */
 
     for (size_t i = 0; i < nargs && i < nparams; i++) {
         Construct *anode = args->elems[i].get();
