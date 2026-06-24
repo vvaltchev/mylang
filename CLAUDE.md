@@ -76,8 +76,21 @@ disable (e.g. for a faster/debuggable link); an `OPT=0` build is non-LTO anyway.
 `make OPT=1 UBSAN=1` (sanitized release). The flags go into `BASE_FLAGS` so they
 reach the compile and link lines. UBSan is configured `-fno-sanitize=signed-
 integer-overflow`, because the codebase relies on `-fwrapv` wraparound (that
-overflow is *defined* here, not a bug). `-fno-omit-frame-pointer` is added
-whenever either sanitizer is on. `-rt` is verified green under both.
+overflow is *defined* here, not a bug); it also runs with
+`-fno-sanitize-recover=undefined`, so a UBSan finding **aborts** (non-zero exit)
+instead of diagnose-and-continue — otherwise a real UB could print and still
+exit 0 past CI's exit-code check. `-fno-omit-frame-pointer` is added whenever
+either sanitizer is on. `-rt` is verified green under both.
+
+**Assertions: `ASSERTS` (default 1).** The C `assert()` + the project's
+`ML_CHECK()` invariant net (see *Invariants & hazards*) are **on for every build
+type** (debug AND release), so every build and CI lane exercises them. With
+`ASSERTS` on the build also enables libstdc++ container hardening
+(`-D_GLIBCXX_ASSERTIONS`, ABI-safe; the libc++ analog is set per-OS in CI).
+`make ASSERTS=0` defines `-DNDEBUG`, compiling all of that away — use it on an
+optimized build to measure the assertion overhead, e.g. `make OPT=1 ASSERTS=0`
+vs the default `make OPT=1`. **`RECYCLE` (default 0):** `make RECYCLE=1 TESTS=1`
+builds the adversarial node allocator (see *Invariants & hazards*).
 
 CMake is also supported (used by CI):
 `cmake -DTESTS=1 -DCMAKE_BUILD_TYPE=Debug .. && cmake --build .`
@@ -88,9 +101,14 @@ configure with `-DLTO=OFF` to disable. The same `ASAN`/`UBSAN` options exist
 (`-DASAN=ON/OFF`), defaulting **on for a `Debug` build** and off otherwise — the
 analog of `OPT=0` vs `OPT=1` — and are applied on GCC/clang only (skipped on
 MSVC). CMake now also passes `-fwrapv` (non-MSVC), matching the Makefile so the
-relied-upon signed wraparound is defined in CMake builds too. CI
-(`.github/workflows/`) builds Debug+Release × g+++clang
-on Linux, plus macOS and Windows, and runs `./mylang -rt`.
+relied-upon signed wraparound is defined in CMake builds too. It also has the
+**`-DASSERTS=ON/OFF`** (default ON; OFF defines `NDEBUG`, and since CMake's
+optimized configs add `-DNDEBUG` themselves, ASSERTS=ON appends `-UNDEBUG` to
+keep asserts in Release) and **`-DRECYCLE=ON/OFF`** (default OFF) options,
+mirroring the Makefile. CI (`.github/workflows/`) builds Debug+Release ×
+g+++clang on Linux (plus a `RECYCLE=ON` lane), macOS (with libc++ hardening),
+and Windows, and runs `./mylang -rt` — correctness only, no timing, so the
+lanes carry as many checks as possible.
 
 Running scripts:
 ```
@@ -1690,10 +1708,14 @@ instrumentation (see `plans/function-templates.md`).
 - **`ML_CHECK` / `ML_CHECK_MSG` (`defs.h`) are the assertion layer.** Use them —
   not bare `assert` — to state an invariant the code RELIES ON but a wrong
   change could break: "this is impossible if the code is correct." They must be
-  **side-effect-free** (compiled out of a plain release). Active under
-  `-DMLDEBUG`, which the Makefile sets for every debug build (`OPT=0`) and every
-  sanitized build, so all CI debug runs exercise them; a plain optimized
-  release and the bench pay nothing. **Assert the right things:** logical
+  **side-effect-free**. They follow the C `assert()` exactly: active unless
+  `NDEBUG`, i.e. gated by the **`ASSERTS`** build flag (defaults **ON for every
+  build type**, debug AND release, in both build systems — so every build and
+  every CI lane exercises the full net). `ASSERTS=0` defines `NDEBUG`, compiling
+  both the C asserts and these away — the way to measure their overhead
+  (`make OPT=1 ASSERTS=0` vs `make OPT=1`). When ASSERTS is on, the build also
+  enables stdlib container hardening (`_GLIBCXX_ASSERTIONS` / libc++
+  `_LIBCPP_HARDENING_MODE`). **Assert the right things:** logical
   invariants the sanitizers CANNOT see — a union/tag mismatch (reading the wrong
   active member is valid memory, wrong meaning), a refcount underflow, a state
   the type system should have made impossible, a stable-identity check. Do NOT
@@ -1714,8 +1736,17 @@ instrumentation (see `plans/function-templates.md`).
   tool for that whole class and a future-regression net. **Honest scope:** it
   did *not* by itself reproduce the specific cross-input bug above — the REPL
   test path retains its ASTs, so there were no intra-test frees to recycle; the
-  per-input map clear is the guard there. Run it as an extra CI/matrix lane,
-  not a replacement for the structural fixes.
+  per-input map clear is the guard there. It runs as a dedicated CI lane
+  (`linux.yml`, `-DRECYCLE=ON`) and a local matrix entry — not a replacement for
+  the structural fixes.
+
+- **CI maximizes correctness checks (it does not time anything).** Every CI lane
+  builds with `ASSERTS` on (C asserts + `ML_CHECK` + stdlib container
+  hardening), Debug lanes add ASan + UBSan, UBSan runs with
+  `-fno-sanitize-recover` (a finding ABORTS, so it can't print-and-still-exit-0
+  past the exit-code check), and there is a `RECYCLE=ON` lane. Slower is fine —
+  performance is measured separately (`bench/`, a plain `make` release). Adding
+  a new check here is cheap insurance; reach for it.
 
 ## Recipes
 
@@ -1794,6 +1825,14 @@ omitting it is a compile error.
   commit that introduced the bug. Drive it non-interactively from an agent with
   `GIT_SEQUENCE_EDITOR` (rewrite the todo) and `GIT_EDITOR` (supply messages).
   `exp-work` is a topic branch whose history may be rewritten freely.
+- **Never edit a source file while a build that compiles it is running.** A
+  background `make`/`cmake` reads `src/` AND writes shared dep files (`.d/`) as
+  it goes; editing during that window makes it compile a half-written file or
+  corrupt a dep, producing a *bogus* "BUILD FAILED" that looks like a real
+  regression and wastes a debugging cycle. Serialize: let a background build (or
+  the test matrix) finish before touching sources, or run it in a separate
+  `BUILD_DIR` / worktree. Docs (`CLAUDE.md`, `README.md`, plans) are not
+  compiled, so editing those during a build is fine.
 - **Every line stays within 80 columns** — code, comments, and the Markdown
   docs (`CLAUDE.md` included). Wrap long expressions; put a comment that would
   overflow on its own line above the code instead of trailing it. (A few legacy
