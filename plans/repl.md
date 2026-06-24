@@ -9,13 +9,16 @@
 > syntax highlighting (`highlight.{h,cpp}`); multi-line blocks (context-aware
 > auto-`;` + auto-indent); meta-commands (`:tree`/`:source`/`:help`/`:quit`).
 > Headless tests cover all of it (`repl:` sequences + `lineedit:`/`highlight:`
-> checks). **DEFERRED (one piece): the faithful incremental inference** of §3.1
-> — running the real type-inference/resolver/specialize passes per input with
+> checks). **Also done since v1:** Phase 4 **Tab autocompletion** (keywords +
+> builtins + globals + struct fields after `.`) and Phase-5 polish bits
+> (history persisted to `~/.mylang_history`; a `none` result isn't echoed).
+> **DEFERRED (one piece): the faithful incremental inference** of §3.1 —
+> running the real type-inference/resolver/specialize passes per input with
 > cross-input type-commitment. The engine evaluates correctly and persists
 > state (const-folding crosses inputs), but does not yet run inference/the
 > optimizers per input; that needs a persistent-`Inferencer` refactor (intricate
-> code) and is left for review. **Not in v1:** autocompletion (Phase 4),
-> polish/Windows (Phase 5).
+> code) and is left for review. **Not yet:** the IRB dropdown-style completion
+> menu, reverse-search/bracketed-paste, and the Windows backend (Phase 5).
 >
 > Original design follows. The two hard problems are (1) running the *real,
 > full* pipeline per input over an **expandable global scope** so the REPL is a
