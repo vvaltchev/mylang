@@ -529,24 +529,39 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
         ? std::string(tmpl->decl->id->get_str()) : std::string("<lambda>");
     const int my_n = tmpl_clone_counter++;
     fc->id = make_unique<Identifier>("$tmpl" + std::to_string(my_n));
-#if TMPL_INSTR
+
+    /*
+     * THE FIX: id_sym is keyed by node POINTER and persists for the session.
+     * clone() produces fresh nodes, but their addresses can collide with stale
+     * id_sym entries left by freed nodes; walk_struct's `if (!id_sym.count(id))`
+     * guard would then SKIP re-resolving such a node, leaving the clone's body
+     * identifier bound to a wrong (stale) symbol. (Address-dependent => the
+     * MSVC-only, non-deterministic wrong-instance bug.) Clear any id_sym /
+     * func_of_decl entry on the clone's subtree so walk_struct resolves every
+     * node fresh.
+     */
     {
-        std::function<void(Construct *)> chk = [&](Construct *n) {
+        int cleared = 0;
+        std::function<void(Construct *)> clr = [&](Construct *n) {
             if (!n) return;
-            auto it = id_sym.find(n);
-            if (it != id_sym.end()) {
-                auto *idn = dynamic_cast<Identifier *>(n);
-                fprintf(stderr, "ZZ STALE-PRE clone node=%p isId=%d str='%s' "
-                        "ALREADY in id_sym -> sym=%p type=%s\n", (void *)n,
-                        idn != nullptr,
-                        idn ? std::string(idn->get_str()).c_str() : "",
-                        (void *)it->second, it->second
-                            ? sty_to_string(it->second->type).c_str() : "?");
+            if (id_sym.erase(n)) cleared++;
+            if (auto *fd2 = dynamic_cast<FuncDeclStmt *>(n)) {
+                func_of_decl.erase(fd2);
+                clr(fd2->captures.get());
+                clr(fd2->params.get());
+                clr(fd2->body.get());
+                return;
             }
-            for_each_child(n, chk);
+            for_each_child(n, clr);
         };
-        chk(fc);
+        clr(fc);
+#if TMPL_INSTR
+        if (cleared)
+            fprintf(stderr, "ZZ STALE-CLEARED %d entries on clone fc=%p\n",
+                    cleared, (void *)fc);
+#endif
     }
+#if TMPL_INSTR
     fprintf(stderr, "ZZ MAKE tmpl=%p name=%s -> newid=$tmpl%d fc=%p "
             "fc_idnode=%p fc_uid=%p key=%s\n", (void *)tmpl, TMPL_NAME(tmpl),
             my_n, (void *)fc, (void *)fc->id.get(), (void *)fc->id->uid,
