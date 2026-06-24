@@ -55,7 +55,11 @@ ifeq ($(ASAN),1)
 endif
 
 ifeq ($(UBSAN),1)
-	BASE_FLAGS += -fsanitize=undefined -fno-sanitize=signed-integer-overflow
+	# -fno-sanitize-recover: a UBSan finding ABORTS (non-zero exit) instead of
+	# diagnose-and-continue, so a real UB failure can't slip through CI's
+	# exit-code check (the default recovers and would still exit 0).
+	BASE_FLAGS += -fsanitize=undefined -fno-sanitize=signed-integer-overflow \
+	              -fno-sanitize-recover=undefined
 endif
 
 ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
@@ -72,6 +76,11 @@ endif
 ASSERTS ?= 1
 ifeq ($(ASSERTS),0)
 	BASE_FLAGS += -DNDEBUG
+else
+	# libstdc++ container hardening (bounds-checks vector::operator[] etc.;
+	# ABI-safe, no-op on libc++). Part of the assertion net, so ASSERTS=0
+	# drops it too for a clean perf baseline.
+	BASE_FLAGS += -D_GLIBCXX_ASSERTIONS
 endif
 
 # Adversarial Construct allocator (a LIFO free-list that hands a just-freed

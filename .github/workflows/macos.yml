@@ -17,7 +17,11 @@ jobs:
     - name: Configure CMake
       shell: bash
       working-directory: ${{github.workspace}}/build
+      # libc++ hardening (macOS uses libc++): bounds-checks std containers, the
+      # libc++ analog of -D_GLIBCXX_ASSERTIONS. EXTENSIVE = the broad,
+      # low-overhead mode (LLVM 17+; macos-latest has it).
       run: cmake -DTESTS=1 $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+           -DCMAKE_CXX_FLAGS="-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE"
 
     - name: Build
       working-directory: ${{github.workspace}}/build
