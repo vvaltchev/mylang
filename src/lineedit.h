@@ -92,8 +92,10 @@ struct ReadLineResult {
 /*
  * Read one line interactively in raw mode (restoring the terminal on return).
  * `history` is read for Up/Down navigation. `highlight`, if given, colors the
- * line as you type. Falls back to a plain getline when stdin is not a TTY.
+ * line as you type. `initial` preloads the buffer (used to auto-indent a
+ * continuation line). Falls back to a plain getline when stdin is not a TTY.
  */
 ReadLineResult
 read_line(const std::string &prompt, std::vector<std::string> &history,
-          std::string (*highlight)(const std::string &) = nullptr);
+          std::string (*highlight)(const std::string &) = nullptr,
+          const std::string &initial = "");

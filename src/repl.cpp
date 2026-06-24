@@ -37,7 +37,6 @@ struct ReplEngine::Impl {
     unique_ptr<EvalContext> runtime_ctx;
     std::vector<unique_ptr<Construct>> retained;
     std::vector<string> lines;
-    int next_line = 1;
 
     Impl()
         : const_ctx(new EvalContext(nullptr, /*const_ctx=*/true))
@@ -76,36 +75,138 @@ ReplEngine::eval_input(const string &src)
     return impl->do_eval(src, /*echo=*/true);
 }
 
+/* Is `op` a token after which a statement clearly continues (so no `;` should
+ * be auto-inserted at a line end)? Binary/assign operators, comma/dot/arrow/
+ * colon, an open bracket, or a semicolon already present. */
+static bool
+repl_continuation_op(Op op)
+{
+    switch (op) {
+        case Op::plus:  case Op::minus: case Op::times: case Op::div:
+        case Op::mod:   case Op::lt:    case Op::gt:    case Op::le:
+        case Op::ge:    case Op::eq:    case Op::noteq: case Op::land:
+        case Op::lor:   case Op::band:  case Op::bor:   case Op::assign:
+        case Op::addeq: case Op::subeq: case Op::muleq: case Op::diveq:
+        case Op::modeq: case Op::comma: case Op::dot:   case Op::arrow:
+        case Op::colon: case Op::parenL: case Op::braceL: case Op::bracketL:
+        case Op::semicolon:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
+ * Insert statement-terminating `;` so a REPL user need not type them (like
+ * Ruby). Per physical line, a `;` is appended unless: the line is empty /
+ * comment-only; the line ends inside an unclosed `(` or `[` (an expression
+ * spanning lines, e.g. an array literal); or its last token is a continuation
+ * (a binary operator, comma, an open bracket, ...). Inside a `{}` block, each
+ * statement line is terminated, so a multi-line func/if body works without
+ * typing `;`. A `;` after a `}` is a harmless empty statement (and is needed
+ * after a dict literal), so it is added.
+ */
+static string
+repl_auto_terminate(const string &src)
+{
+    std::vector<string> phys;
+    {
+        std::stringstream ss(src);
+        string line;
+        while (std::getline(ss, line))
+            phys.push_back(line);
+    }
+
+    string out;
+    /*
+     * Bracket-context stack. `(` and `[` are expression brackets; a `{` is
+     * either a block ('B', a statement body where lines need `;`) or a dict
+     * literal ('D', an expression where they don't). We tell them apart by
+     * whether the previous token expected a value: a `{` right after `=`,
+     * `(`, `,`, `:`, `=>`, a binary op, or `return` is a dict; otherwise
+     * (after `)`, `;`, `}`, a keyword, or at statement start) it is a block.
+     */
+    std::vector<char> stack;
+    bool expects_value = false;       /* statement position at the start */
+
+    for (const string &line : phys) {
+
+        std::vector<Tok> toks;
+        try {
+            lexer(line, 1, toks);     /* only token kinds/ops are read */
+        } catch (...) {
+            /* a bad token: leave the line as-is and let the parser report it */
+            out += line;
+            out += '\n';
+            continue;
+        }
+
+        const Tok *last = nullptr;
+        for (const auto &t : toks) {
+            if (t == Op::braceL) {
+                const char kind = expects_value ? 'D' : 'B';
+                stack.push_back(kind);
+                expects_value = (kind == 'D');
+            } else if (t == Op::parenL) {
+                stack.push_back('(');
+                expects_value = true;
+            } else if (t == Op::bracketL) {
+                stack.push_back('[');
+                expects_value = true;
+            } else if (t == Op::parenR || t == Op::bracketR ||
+                       t == Op::braceR) {
+                if (!stack.empty())
+                    stack.pop_back();
+                expects_value = false;
+            } else if (t == Keyword::kw_return) {
+                expects_value = true;
+            } else {
+                /* an operator that takes a RHS keeps us in value position */
+                expects_value =
+                    t.op != Op::invalid && repl_continuation_op(t.op);
+            }
+            last = &t;
+        }
+
+        out += line;
+
+        const char ctx = stack.empty() ? 'B' : stack.back();
+        const bool stmt_ctx = (ctx == 'B');     /* not 'D'/'('/'[' */
+        if (last && stmt_ctx && !repl_continuation_op(last->op))
+            out += ';';
+        out += '\n';
+    }
+
+    return out;
+}
+
 string
 ReplEngine::Impl::do_eval(const string &src, bool echo)
 {
     std::ostringstream out;
 
-    /* A REPL input is not semicolon-terminated the way a script statement is
-     * (you don't type `;` at a prompt, like Ruby), so auto-terminate it. A
-     * trailing `;` (or `;` after a closing `}`) is just an empty statement, so
-     * appending one is always safe. */
-    string source = src;
-    {
-        const size_t e = source.find_last_not_of(" \t\r\n");
-        if (e == string::npos)
-            return "";                       /* blank input */
-        source.erase(e + 1);
-        if (source.back() != ';')
-            source += ';';
-    }
+    /* A REPL input is not semicolon-terminated the way a script is (you don't
+     * type `;` at a prompt, like Ruby): auto-insert them per line. */
+    if (src.find_first_not_of(" \t\r\n") == string::npos)
+        return "";                           /* blank input */
+    const string source = repl_auto_terminate(src);
 
-    /* 1. Split into physical lines, append to the persistent source, and lex
-     *    each into this input's token vector (line numbers continue). */
-    std::vector<Tok> tokens;
+    /* 1. Append all physical lines to the persistent source FIRST (so the
+     *    vector finishes any reallocation), THEN lex from the now-stable
+     *    buffers - the lexer stores string_views into them, so lexing while
+     *    the vector still grows would dangle earlier lines' tokens. The line
+     *    number of lines[i] is i + 1 (1-based, continuing across inputs). */
+    const size_t base = lines.size();
     {
         std::stringstream ss(source);
         string line;
-        while (std::getline(ss, line)) {
+        while (std::getline(ss, line))
             lines.push_back(line);
-            lexer(lines.back(), next_line++, tokens);
-        }
     }
+
+    std::vector<Tok> tokens;
+    for (size_t i = base; i < lines.size(); i++)
+        lexer(lines[i], static_cast<int>(i + 1), tokens);
 
     if (tokens.empty())
         return "";
@@ -278,6 +379,30 @@ ReplEngine::Impl::cmd_source(const string &path)
     return out.str();
 }
 
+/* Net unclosed (){}/[] depth of `src` (>=0), lexer-based so strings/comments
+ * don't count. Drives both is_incomplete and the continuation auto-indent. */
+static int
+repl_bracket_depth(const string &src)
+{
+    std::vector<Tok> toks;
+    {
+        std::stringstream ss(src);
+        string line;
+        int n = 1;
+        while (std::getline(ss, line))
+            lexer(line, n++, toks);
+    }
+
+    int depth = 0;
+    for (const auto &t : toks) {
+        if (t == Op::parenL || t == Op::braceL || t == Op::bracketL)
+            depth++;
+        else if (t == Op::parenR || t == Op::braceR || t == Op::bracketR)
+            depth--;
+    }
+    return depth < 0 ? 0 : depth;
+}
+
 bool
 ReplEngine::is_incomplete(const string &src)
 {
@@ -293,14 +418,7 @@ ReplEngine::is_incomplete(const string &src)
     if (toks.empty())
         return false;
 
-    int depth = 0;
-    for (const auto &t : toks) {
-        if (t == Op::parenL || t == Op::braceL || t == Op::bracketL)
-            depth++;
-        else if (t == Op::parenR || t == Op::braceR || t == Op::bracketR)
-            depth--;
-    }
-    if (depth > 0)
+    if (repl_bracket_depth(src) > 0)
         return true;
 
     /* A line ending on a binary/continuation operator wants more. */
@@ -340,7 +458,12 @@ run_repl()
 
     while (true) {
 
-        ReadLineResult r = read_line(continuing ? ".. " : ">> ", history, hl);
+        /* Auto-indent a continuation line by the current bracket depth. */
+        const string indent =
+            continuing ? string(repl_bracket_depth(input) * 2, ' ') : "";
+
+        ReadLineResult r =
+            read_line(continuing ? ".. " : ">> ", history, hl, indent);
 
         if (r.eof) {
             /* Ctrl-D mid-block abandons it; at a fresh prompt it exits. */

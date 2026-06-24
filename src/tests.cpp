@@ -7596,6 +7596,23 @@ static const std::vector<repl_test> repl_tests =
     { ":help and an unknown command",
       { { ":help", ":source" },
         { ":bogus", "Unknown command" } } },
+
+    { "a multi-line func body needs no typed semicolons",
+      { { "func g(a) {\n  var r = a + 1\n  return r\n}", "" },
+        { "g(41)", "=> 42" } } },
+
+    { "a multi-line dict literal is not statement-terminated",
+      { { "var dd = {\n  \"k\": 7,\n  \"m\": 8\n}", "k: 7" },
+        { "dd.k + dd.m", "=> 15" } } },
+
+    { "a multi-line array literal persists",
+      { { "var aa = [\n  1, 2,\n  3, 4\n]", "[1, 2, 3, 4]" },
+        { "sum(aa)", "=> 10" } } },
+
+    { "an if/else block evaluates without typed semicolons",
+      { { "var yy = 5", "=> 5" },
+        { "if (yy > 0) {\n  yy = 100\n} else {\n  yy = -1\n}", "" },
+        { "yy", "=> 100" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)
@@ -7776,8 +7793,22 @@ static bool highlight_tolerates_unterminated_string()
     return strip_ansi(highlight_line(src)) == src;
 }
 
+static bool repl_incomplete_detection()
+{
+    if (!ReplEngine::is_incomplete("func f() {")) return false;   /* open { */
+    if (!ReplEngine::is_incomplete("var a = [1,")) return false;  /* open [  */
+    if (!ReplEngine::is_incomplete("1 +")) return false;          /* trailing op */
+    if (!ReplEngine::is_incomplete("foo(1, 2")) return false;     /* open ( */
+    if (ReplEngine::is_incomplete("var x = 5")) return false;     /* complete */
+    if (ReplEngine::is_incomplete("func f() { return 1; }"))      /* complete */
+        return false;
+    if (ReplEngine::is_incomplete("[1, 2, 3]")) return false;     /* complete */
+    return true;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
+    { "repl: multi-line completeness detection", repl_incomplete_detection },
     { "highlight: inserts color escapes", highlight_inserts_color },
     { "highlight: stripping escapes restores the input",
       highlight_preserves_visible_text },
