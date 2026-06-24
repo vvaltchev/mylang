@@ -530,6 +530,23 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     const int my_n = tmpl_clone_counter++;
     fc->id = make_unique<Identifier>("$tmpl" + std::to_string(my_n));
 #if TMPL_INSTR
+    {
+        std::function<void(Construct *)> chk = [&](Construct *n) {
+            if (!n) return;
+            auto it = id_sym.find(n);
+            if (it != id_sym.end()) {
+                auto *idn = dynamic_cast<Identifier *>(n);
+                fprintf(stderr, "ZZ STALE-PRE clone node=%p isId=%d str='%s' "
+                        "ALREADY in id_sym -> sym=%p type=%s\n", (void *)n,
+                        idn != nullptr,
+                        idn ? std::string(idn->get_str()).c_str() : "",
+                        (void *)it->second, it->second
+                            ? sty_to_string(it->second->type).c_str() : "?");
+            }
+            for_each_child(n, chk);
+        };
+        chk(fc);
+    }
     fprintf(stderr, "ZZ MAKE tmpl=%p name=%s -> newid=$tmpl%d fc=%p "
             "fc_idnode=%p fc_uid=%p key=%s\n", (void *)tmpl, TMPL_NAME(tmpl),
             my_n, (void *)fc, (void *)fc->id.get(), (void *)fc->id->uid,
