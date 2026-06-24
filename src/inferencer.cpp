@@ -59,6 +59,14 @@ struct TypeSym {
      * with this set is a compile error demanding `opt` (enforce_nonnull_params,
      * the param analogue of the mandatory-`dyn` rule). */
     bool received_optish = false;
+    /*
+     * REPL incremental inference only: a symbol committed by a PRIOR input is
+     * "pinned" - its `type` is fixed (a later input may read it or assign to
+     * it, but cannot change its type), and the fixpoint must read it without
+     * resetting/recomputing it. Always false in the one-shot (whole-program)
+     * path, so every "skip pinned" branch is a no-op there.
+     */
+    bool pinned = false;
     Loc decl_loc;
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
     /* non-null when this name is a struct TYPE (a `struct` decl): the symbol is
@@ -72,6 +80,7 @@ struct FuncInfo {
     STyRef ret = nullptr;        /* stable return type */
     STyRef ret_acc = nullptr;    /* return accumulator (current round) */
     bool falls_through = false;
+    bool pinned = false;         /* committed by a prior REPL input */
 };
 
 struct Scope {
@@ -83,8 +92,11 @@ class Inferencer {
 
 public:
 
-    explicit Inferencer(Construct *root) : root(root) { }
+    explicit Inferencer(Construct *root = nullptr) : root(root) { }
     void run();
+    void setup();                  /* once: bottom + global scope */
+    void infer_input(Block *root); /* REPL: one input, commit+pin its globals */
+    void undef_global(const UniqueId *name);  /* REPL undef(x) */
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
     void collect_arrays(AnalysisInfo &out); /* -a: array storage colors */
 
@@ -118,6 +130,8 @@ private:
      * of `if (x != none)` / `if (x)`, x reads as non-opt. */
     std::unordered_map<const TypeSym *, STyRef> narrowed;
     bool narrowing_on = false;
+
+    void infer_one(Block *root);     /* the per-root passes (shared) */
 
     /* helpers */
     Scope *new_scope(Scope *parent);
@@ -382,15 +396,26 @@ void Inferencer::for_each_child(Construct *n,
 
 /* ------------------------------ run / passes ----------------------------- */
 
-void Inferencer::run()
+/*
+ * One-time setup shared by the one-shot and the REPL-incremental paths: the
+ * `bottom` Unknown identity and the persistent global scope. The arena and side
+ * tables persist for the Inferencer's lifetime (one call for a script; a
+ * whole session for the REPL).
+ */
+void Inferencer::setup()
 {
-    Block *rootBlock = dynamic_cast<Block *>(root);
-    if (!rootBlock)
-        return;
-
     bottom = A.fresh_var();
     global = new_scope(nullptr);
+}
 
+/*
+ * Infer + check one root Block. In the one-shot path it is the whole program;
+ * in the REPL it is one input, with prior globals already PINNED (so the
+ * fixpoint reads but never recomputes them). All passes operate on this root's
+ * elems only; the persistent global scope / arena carry cross-input state.
+ */
+void Inferencer::infer_one(Block *rootBlock)
+{
     hoist_globals(rootBlock);
     for (auto &e : rootBlock->elems)
         walk_struct(e.get(), global);
@@ -426,7 +451,7 @@ void Inferencer::run()
      * we don't model precisely). dyn/opt declarations win as written. */
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
-        if (s->func)
+        if (s->func || s->pinned)   /* already finalized in its own input */
             continue;
         if (s->dyn_decl) {
             /*
@@ -461,6 +486,8 @@ void Inferencer::run()
          * `none` to ret_acc, so its return is `none` here, not Unknown - this
          * branch doesn't touch it.
          */
+        if (up->pinned)
+            continue;
         if (is_unknown(up->ret))
             up->ret = A.dyn_ty();
     }
@@ -486,6 +513,63 @@ void Inferencer::run()
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
     for (auto &e : rootBlock->elems)
         annotate_hints(e.get());
+}
+
+void Inferencer::run()
+{
+    Block *rootBlock = dynamic_cast<Block *>(root);
+    if (!rootBlock)
+        return;
+
+    setup();
+    infer_one(rootBlock);
+}
+
+/*
+ * REPL incremental: type-check one input against the already-committed globals,
+ * then COMMIT this input's new globals - mark every symbol/func created during
+ * this call `pinned`, so the next input reads their types as fixed (and an
+ * assignment that violates one is the cross-input type error). Throws on a type
+ * error before pinning, so a rejected input commits nothing.
+ */
+void Inferencer::infer_input(Block *rootBlock)
+{
+    if (!rootBlock)
+        return;
+
+    const size_t sym_base = all_syms.size();
+    const size_t func_base = all_funcs.size();
+    /* snapshot the global bindings so a rejected input commits nothing */
+    auto global_snapshot = global->syms;
+
+    auto pin_new = [&]() {
+        for (size_t i = sym_base; i < all_syms.size(); i++)
+            all_syms[i]->pinned = true;
+        for (size_t i = func_base; i < all_funcs.size(); i++)
+            all_funcs[i]->pinned = true;
+    };
+
+    try {
+        infer_one(rootBlock);
+    } catch (...) {
+        /* Reject: restore the global scope (drop any decl this input added) and
+         * `pin` (i.e. skip henceforth) the half-built symbols so no later input
+         * re-finalizes/re-enforces them. They stay in all_syms but inert. */
+        global->syms = std::move(global_snapshot);
+        pin_new();
+        throw;
+    }
+
+    pin_new();     /* success: commit this input's new globals */
+}
+
+/* REPL `undef(x)`: drop a global from the committed set so a later `var x` of a
+ * different type is a fresh declaration, not a type conflict. The old TypeSym
+ * stays in all_syms (pinned, inert); only the scope binding is removed. */
+void Inferencer::undef_global(const UniqueId *name)
+{
+    if (global)
+        global->syms.erase(name);
 }
 
 /*
@@ -529,7 +613,7 @@ void Inferencer::enforce_decl_types()
 
         if (s->ann != DeclType::arr && s->ann != DeclType::dict)
             continue;
-        if (s->func || !s->decl_loc)
+        if (s->func || s->pinned || !s->decl_loc)
             continue;
 
         STyRef t = sty_resolve(s->type);
@@ -567,7 +651,7 @@ void Inferencer::enforce_concrete_decls()
          * (their type is derived from the container, which carries any `dyn`),
          * and builtins (no decl loc). */
         if (s->dyn_decl || s->func || s->struct_type || s->is_param ||
-            s->is_loopvar || !s->decl_loc)
+            s->is_loopvar || s->pinned || !s->decl_loc)
             continue;
 
         if (!type_has_dyn(s->type, strict_deep))
@@ -601,7 +685,7 @@ void Inferencer::enforce_nonnull_params()
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
 
-        if (!s->is_param || s->opt_decl || !s->decl_loc)
+        if (!s->is_param || s->opt_decl || s->pinned || !s->decl_loc)
             continue;
         if (!s->received_optish)
             continue;
@@ -1647,7 +1731,7 @@ void Inferencer::reset_round()
 {
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
-        if (s->func)
+        if (s->func || s->pinned)   /* pinned: a prior input's fixed type */
             continue;
         /* A scalar annotation pins the type: seed the accumulator with the
          * declared type so it stays fixed (contribute() keeps it and checks
@@ -1658,20 +1742,23 @@ void Inferencer::reset_round()
             s->acc = s->dyn_decl ? A.dyn_ty() : bottom;
     }
     for (auto &up : all_funcs)
-        up->ret_acc = bottom;
+        if (!up->pinned)
+            up->ret_acc = bottom;
 }
 
 void Inferencer::commit_round()
 {
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
-        if (s->func)
+        if (s->func || s->pinned)
             continue;
         if (!sty_equal(s->acc, s->type))
             changed = true;
         s->type = s->acc;
     }
     for (auto &up : all_funcs) {
+        if (up->pinned)
+            continue;
         if (!sty_equal(up->ret_acc, up->ret))
             changed = true;
         up->ret = up->ret_acc;
@@ -1688,6 +1775,30 @@ void Inferencer::contribute(TypeSym *s, STyRef t, Loc loc)
      */
     if (!s || s->func)
         return;
+
+    /*
+     * REPL incremental: a symbol committed by a prior input has a FIXED type.
+     * A new input may read it or assign to it, but an assignment must be
+     * assignable to the committed type (the cross-input type-commitment) - the
+     * same rule as a scalar annotation, but for any type. The message says
+     * "is declared" when the commit came from an explicit annotation, else
+     * "has type" (an inferred commit). Pinned syms are skipped by reset/commit,
+     * so the type never moves.
+     */
+    if (s->pinned) {
+        if (strict_dyn && !s->is_param) {
+            STyRef rt = sty_resolve(t);
+            STyRef pt = sty_resolve(s->type);
+            if (!is_unknown(rt) && !is_none(rt) && !sty_assignable(rt, pt))
+                mismatch("'" + std::string(s->name->val) + "' " +
+                             (s->ann != DeclType::none ? "is declared '"
+                                                       : "has type '") +
+                             sty_to_string(pt) + "' but is assigned '" +
+                             sty_to_string(t) + "'",
+                         loc, Loc());
+        }
+        return;
+    }
 
     /*
      * A scalar-annotated symbol is PINNED to its declared type (`int x`): the
@@ -2841,4 +2952,37 @@ void specialize_types(Construct *root, bool enable)
 
     for (auto &e : blk->elems)
         e = specialize(std::move(e));
+}
+
+/* ---- REPL incremental inference (wraps a persistent Inferencer) -------- */
+
+struct ReplInfer::Impl {
+    Inferencer inf;            /* root == nullptr; fed one input at a time */
+    bool did_setup = false;
+
+    Impl() {
+        inf.strict_dyn = true;     /* faithful: the real strict checks */
+        inf.checks_enabled = true;
+    }
+};
+
+ReplInfer::ReplInfer() : impl(new Impl) { }
+ReplInfer::~ReplInfer() = default;
+
+void ReplInfer::check_input(Construct *input)
+{
+    auto *blk = dynamic_cast<Block *>(input);
+    if (!blk)
+        return;
+
+    if (!impl->did_setup) {
+        impl->inf.setup();
+        impl->did_setup = true;
+    }
+    impl->inf.infer_input(blk);
+}
+
+void ReplInfer::undef_global(const UniqueId *name)
+{
+    impl->inf.undef_global(name);
 }
