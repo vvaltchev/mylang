@@ -520,14 +520,28 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         if (tmpl->pinned)
             continue;
 
-        /* v1: require an exact arity match (opt-param templates deferred). */
-        if (call->args->elems.size() != tmpl->params.size())
+        /* Arity must be in the legal range [min, nparams] (a trailing opt param
+         * may be omitted); else leave the call for check_call to report. */
+        const size_t nparams = tmpl->params.size();
+        const size_t nargs = call->args->elems.size();
+        size_t min_args = 0;
+        for (size_t i = 0; i < nparams; i++)
+            if (!tmpl->params[i]->opt_decl)
+                min_args = i + 1;
+        if (nargs < min_args || nargs > nparams)
             continue;
 
+        /* The signature is keyed by the TEMPLATE params (un-annotated, non-dyn,
+         * non-opt) only; opt/typed/dyn params just join within the clone. A
+         * template param is non-opt, so min_args > its index => its arg is
+         * always present. */
         std::vector<STyRef> sig;
         bool ready = true;
-        for (auto &a : call->args->elems) {
-            STyRef t = sty_resolve(type_of(a.get()));
+        for (size_t i = 0; i < nparams; i++) {
+            TypeSym *p = tmpl->params[i];
+            if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+                continue;       /* not a template param */
+            STyRef t = sty_resolve(type_of(call->args->elems[i].get()));
             if (is_unknown(t)) { ready = false; break; }
             sig.push_back(t);
         }
@@ -1142,23 +1156,21 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
     fi->falls_through =
         fd->body && fd->body->is_block() && !always_exits(fd->body.get());
     /*
-     * A template iff it is a NAMED function with at least one un-annotated,
-     * non-`dyn` parameter AND no `opt` parameter. (An anonymous lambda has no
-     * name to redirect a call to; an `opt` param accepts `none`, which doesn't
-     * fit clean per-signature cloning - a `none` argument would make a
-     * degenerate `none`-typed instantiation. Both keep the join model in v1 -
-     * see plans/function-templates.md "deferred".)
+     * A template iff it is a NAMED function with at least one *template
+     * parameter*: an un-annotated, non-`dyn`, non-`opt` param. Those are the
+     * params the instance signature is keyed by; any `opt`/typed/`dyn` params
+     * coexist and just `join` within each clone (handled by the concrete path).
+     * So `func f(a, opt b)` is a template over `a` (b joins), while `func
+     * f(opt x)` (no template param) keeps the join model. (A lambda has no name
+     * to redirect a call to, so it also keeps the join model - v1; see
+     * plans/function-templates.md.)
      */
-    if (fd->id && fd->params) {
-        bool has_un = false, has_opt = false;
-        for (auto &p : fd->params->elems) {
-            if (p->opt_mod)
-                has_opt = true;
-            else if (p->decl_type == DeclType::none && !p->dyn_mod)
-                has_un = true;
-        }
-        fi->is_template = has_un && !has_opt;
-    }
+    if (fd->id && fd->params)
+        for (auto &p : fd->params->elems)
+            if (!p->opt_mod && !p->dyn_mod && p->decl_type == DeclType::none) {
+                fi->is_template = true;
+                break;
+            }
     func_of_decl[fd] = fi;
 
     if (fd->id) {
