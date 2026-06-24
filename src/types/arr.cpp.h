@@ -19,6 +19,10 @@
 static EvalValue struct_elem_at(const SharedArrayObj &arr, size_type i)
 {
     const SharedArrayObj::svec_type &sv = arr.flat_structs();
+    ML_CHECK(sv.stride > 0 && i < arr.size());
+    /* the element's bytes [start, start+stride) must lie within buf */
+    ML_CHECK((static_cast<size_t>(arr.offset() + i) + 1) *
+                 static_cast<size_t>(sv.stride) <= sv.buf.size());
     auto obj = make_intrusive<StructObject>(sv.def);   /* resizes bytes */
     std::memcpy(obj->bytes.data(),
                 sv.buf.data() + (arr.offset() + i) * sv.stride, sv.stride);
@@ -360,6 +364,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
  */
 static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i)
 {
+    ML_CHECK(i < arr.size());
     const size_type at = arr.offset() + i;
     switch (arr.skind()) {
         case SharedArrayObj::Storage::ints:
