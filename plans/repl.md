@@ -1,13 +1,27 @@
 # Interactive REPL — implementation plan
 
-> **STATUS: designed, not started.** This plan targets an IRB-3.4-quality REPL
-> (live syntax highlighting, true multi-line block editing, auto-indent, pretty
-> `=>` output, history) — *not* the dumb readline loop of the classic Python
-> REPL. **v1 = Phases 0–3, Unix-only** (Windows + autocompletion are deferred,
-> see §8). The two hard problems are (1) running the *real, full* pipeline per
-> input over an **expandable global scope** so the REPL is a faithful inspection
-> tool, not a stripped-down interpreter, and (2) hand-rolling the
-> terminal/line-editor under the project's hard "no third-party deps" rule.
+> **STATUS: Phases 0–3 BUILT (Unix-only), one piece deferred.** Done &
+> committed: the persistent engine (`repl.{h,cpp}` `ReplEngine` — persistent
+> const + runtime-global contexts, retained input ASTs, per-input `=>` echo,
+> error-catch-continue, redefinition via `EvalContext::allow_redeclare`, the
+> shared `errfmt`); the hand-rolled raw-mode line editor (`lineedit.{h,cpp}` —
+> a pure, headless-testable `LineEditor` + a thin termios `read_line`); live
+> syntax highlighting (`highlight.{h,cpp}`); multi-line blocks (context-aware
+> auto-`;` + auto-indent); meta-commands (`:tree`/`:source`/`:help`/`:quit`).
+> Headless tests cover all of it (`repl:` sequences + `lineedit:`/`highlight:`
+> checks). **DEFERRED (one piece): the faithful incremental inference** of §3.1
+> — running the real type-inference/resolver/specialize passes per input with
+> cross-input type-commitment. The engine evaluates correctly and persists
+> state (const-folding crosses inputs), but does not yet run inference/the
+> optimizers per input; that needs a persistent-`Inferencer` refactor (intricate
+> code) and is left for review. **Not in v1:** autocompletion (Phase 4),
+> polish/Windows (Phase 5).
+>
+> Original design follows. The two hard problems are (1) running the *real,
+> full* pipeline per input over an **expandable global scope** so the REPL is a
+> faithful inspection tool (the deferred piece above), and (2) hand-rolling the
+> terminal/line-editor under the project's hard "no third-party deps" rule
+> (done).
 
 ## 1. Goal & the bar ("inspired by Ruby, not Python")
 
