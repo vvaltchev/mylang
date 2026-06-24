@@ -94,8 +94,8 @@ struct FuncInfo {
      * A TEMPLATE: at least one parameter is un-annotated and not explicitly
      * `dyn`, so its type is not fixed by the declaration. Such a function is
      * not type-checked in isolation; it is instantiated per call-site signature
-     * as a typed clone (see plans/function-templates.md). A `dyn` param is NOT a
-     * template parameter - it is the explicit "one instantiation, any type".
+     * as a typed clone (see plans/function-templates.md). A `dyn` param is not
+     * a template parameter - it is the explicit "one instantiation, any type".
      */
     bool is_template = false;
 };
@@ -1415,9 +1415,9 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
 
     if (auto *id = dynamic_cast<Identifier *>(n)) {
         /* ALWAYS (re)resolve - never `if (!id_sym.count(id))`. id_sym is keyed
-         * by node pointer and persists for the session; a fresh node can reuse a
-         * freed node's address, so a stale entry must be OVERWRITTEN, not kept
-         * (keeping it bound an input's callee to a prior clone -> the MSVC bug).
+         * by node pointer and persists for the session; a fresh node can reuse
+         * a freed node's address, so a stale entry must be OVERWRITTEN, not
+         * kept (keeping it bound an input's callee to a prior clone -> the bug).
          * walk_struct visits each node once, so this never double-resolves. */
         id_sym[id] = lookup(s, id->uid);
         /* reached for every reference EXCEPT a call callee (handled above): a
