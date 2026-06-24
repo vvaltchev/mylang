@@ -73,6 +73,11 @@ struct Frame {
     /* Make `slots` point at storage holding exactly `frame_size` live slots. */
     void init(int frame_size)
     {
+        /* `live` is one 64-bit word: at most 64 trackable slots. The resolver's
+         * slot budget must keep every frame within that, or a slot >= 64 would
+         * be untrackable (silently always-undefined). */
+        ML_CHECK(frame_size >= 0 && frame_size <= 64);
+
         if (frame_size > INLINE_SLOTS) {
 
             /* Rare: too big to fit inline, one heap allocation. */

@@ -50,13 +50,18 @@ public:
         , off(off)
         , len(len)
         , slice(true)
-    { }
+    {
+        /* the slice must lie within the underlying string (no overflow form) */
+        ML_CHECK(off <= obj->s.size() && len <= obj->s.size() - off);
+    }
 
     int_type use_count() const { return obj.use_count(); }
     inner_type &get_ref() { return obj->s; }
     const inner_type &get_ref() const { return obj->s; }
 
     std::string_view get_view() const {
+        ML_CHECK(offset() <= obj->s.size() &&
+                 size() <= obj->s.size() - offset());
         return std::string_view(obj->s.data() + offset(), size());
     }
 

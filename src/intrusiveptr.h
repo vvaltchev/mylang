@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "defs.h"       /* ML_CHECK */
 #include <cstdint>
 #include <utility>
 #include <cstddef>
@@ -47,7 +48,17 @@ class intrusive_ptr final {
     T *ptr;
 
     void retain() { if (ptr) ++ptr->intr_refcount; }
-    void release() { if (ptr && --ptr->intr_refcount == 0) delete ptr; }
+    void release()
+    {
+        if (ptr) {
+            /* Over-release (count already 0) would underflow this unsigned
+             * counter to a huge value and silently leak / cause a UAF later;
+             * catch it at the exact point the balance breaks. */
+            ML_CHECK(ptr->intr_refcount > 0);
+            if (--ptr->intr_refcount == 0)
+                delete ptr;
+        }
+    }
 
 public:
 
