@@ -45,9 +45,9 @@ uint64_t Construct::next_node_id = 1;
 
 /*
  * The recycler never frees, so LeakSanitizer would report every recycled block
- * as a leak. Those leaks are intentional and bounded (one short -rt process), so
- * turn leak detection off for a RECYCLE build. (A weak hook ASan reads at start;
- * harmless if ASan isn't linked.)
+ * as a leak. Those leaks are intentional and bounded (one short -rt process),
+ * so turn leak detection off for a RECYCLE build. (A weak hook ASan reads at
+ * start; harmless if ASan isn't linked.)
  */
 extern "C" const char *__asan_default_options()
 {
@@ -71,7 +71,7 @@ void *Construct::operator new(std::size_t n)
     auto &bin = recycle_bins()[n];
     void *base;
 
-    if (!bin.empty()) {         /* reuse the MOST-recently freed same-size block */
+    if (!bin.empty()) {         /* reuse the most-recently freed block */
         base = bin.back();
         bin.pop_back();
     } else {
@@ -80,7 +80,7 @@ void *Construct::operator new(std::size_t n)
             throw std::bad_alloc();
     }
 
-    *static_cast<std::size_t *>(base) = n;          /* remember size for delete */
+    *static_cast<std::size_t *>(base) = n;      /* remember size for delete */
     void *user = static_cast<char *>(base) + RECYCLE_HDR;
     RECYCLE_UNPOISON(user, n);
     return user;
@@ -93,8 +93,8 @@ void Construct::operator delete(void *p) noexcept
 
     void *base = static_cast<char *>(p) - RECYCLE_HDR;
     std::size_t n = *static_cast<std::size_t *>(base);
-    RECYCLE_POISON(p, n);                  /* trap a dangling access till reuse */
-    recycle_bins()[n].push_back(base);     /* never freed; reused by next new(n) */
+    RECYCLE_POISON(p, n);               /* trap a dangling access till reuse */
+    recycle_bins()[n].push_back(base);  /* never freed; reused by next new(n) */
 }
 
 #endif   /* RECYCLE_ALLOC */
