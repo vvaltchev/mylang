@@ -9,12 +9,15 @@
 #include "backtrace.h"
 #include "inferencer.h"
 #include "analyzer.h"
+#include "repl.h"
+#include "errfmt.h"
 
 #include <initializer_list>
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <unistd.h>   /* isatty */
 
 using std::string;
 
@@ -28,6 +31,7 @@ static bool opt_no_type_infer;
 static bool opt_debug_ti;
 static bool opt_analyze;
 static bool opt_no_color;
+static bool opt_repl;
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
@@ -97,6 +101,13 @@ parse_args(int argc, char **argv)
         exit(1);
 
     } else if (argc == 1) {
+
+        /* No FILE / -e: drop into the interactive REPL on a terminal (Ruby-
+         * like); otherwise print help. */
+        if (isatty(STDIN_FILENO)) {
+            opt_repl = true;
+            return;
+        }
 
         help();
         exit(0);
@@ -173,6 +184,11 @@ parse_args(int argc, char **argv)
 
             opt_no_color = true;
 
+        } else if (!strcmp(arg, "--repl")) {
+
+            opt_repl = true;   /* force the REPL even off a TTY (for testing) */
+            return;
+
         } else if (!strcmp(arg, "-e")) {
 
             if (argc > 1) {
@@ -210,103 +226,6 @@ parse_args(int argc, char **argv)
         lines.emplace_back(move(inline_text));
         lexer(lines[0], 1, tokens);
     }
-}
-
-/*
- * Print one source line with a caret row underneath marking columns [from, to]
- * (1-based, inclusive). Leading whitespace is reproduced verbatim so tabs line
- * up. `to == 0` means "to the end of the line".
- */
-static void
-dumpLineWithCaret(const string &ln, int from, int to)
-{
-    if (from < 1)
-        from = 1;
-    if (to == 0 || to > static_cast<int>(ln.length()))
-        to = static_cast<int>(ln.length());
-
-    cerr << "    " << ln << endl << "    ";
-
-    for (int i = 1; i < from; i++)
-        cerr << (i - 1 < static_cast<int>(ln.length()) && isspace(ln[i - 1])
-                     ? ln[i - 1] : ' ');
-
-    cerr << string(std::max(1, to - from + 1), '^') << endl;
-}
-
-static void
-dumpLocInError(const Exception &e)
-{
-    if (!e.loc_start.col) {
-        cerr << endl;
-        return;
-    }
-
-    cerr << " at line " << e.loc_start.line << ", col " << e.loc_start.col;
-
-    /* loc_end.col is one past the last char + 1, so the last char is at
-     * loc_end.col - 2 and the printed end column is loc_end.col - 1. */
-    const bool have_end =
-        e.loc_end.col != 0 && e.loc_end.line >= e.loc_start.line;
-    const int end_line = have_end ? e.loc_end.line : e.loc_start.line;
-    const int end_col = have_end ? e.loc_end.col - 2 : 0;
-
-    if (have_end) {
-        if (e.loc_end.line == e.loc_start.line)
-            cerr << ":" << e.loc_end.col - 1;
-        else
-            cerr << " to line " << e.loc_end.line
-                 << ", col " << e.loc_end.col - 1;
-    }
-
-    cerr << endl << endl;
-
-    for (int ln = e.loc_start.line;
-         ln <= end_line && ln <= static_cast<int>(lines.size());
-         ln++) {
-
-        const int from = (ln == e.loc_start.line) ? e.loc_start.col : 1;
-        const int to = (ln == end_line) ? end_col : 0;   /* 0 == end of line */
-        dumpLineWithCaret(lines[ln - 1], from, to);
-    }
-}
-
-static void
-handleSyntaxError(SyntaxErrorEx e)
-{
-    if (e.tok == &invalid_tok) {
-        e.loc_start = tokens.back().loc + 1;
-        e.loc_end = tokens.back().loc + 2;
-    }
-
-    cerr << "SyntaxError";
-    dumpLocInError(e);
-    cerr << e.msg;
-
-    if (e.op != Op::invalid) {
-
-        cerr << " '" << OpString[(int)e.op] << "'";
-
-        if (e.tok)
-            cerr << ", got:";
-    }
-
-    if (e.tok) {
-
-        cerr << " '";
-
-        if (e.tok->op != Op::invalid)
-            cerr << OpString[(int)e.tok->op];
-        else if (e.tok->kw != Keyword::kw_invalid)
-            cerr << KwString[(int)e.tok->kw];
-        else
-            cerr << e.tok->value;
-
-        cerr << "'";
-
-    }
-
-    cerr << endl;
 }
 
 /* ANSI color escape for an annotation kind (see analyzer.h's legend). */
@@ -412,6 +331,9 @@ int main(int argc, char **argv)
 
         parse_args(argc, argv);
 
+        if (opt_repl)
+            return run_repl();
+
         ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
         unique_ptr<Construct> root;
 
@@ -485,45 +407,23 @@ int main(int argc, char **argv)
             root->eval(nullptr);
         }
 
-    } catch (const InvalidTokenEx &e) {
+    } catch (const SyntaxErrorEx &caught) {
 
-        cerr << "Invalid token: " << e.val << endl;
-        return 1;
+        /* An "unexpected EOF" syntax error carries the EOF sentinel; point it
+         * just past the last real token so the caret lands at end-of-input.
+         * (Copy first - loc adjusts, the other fields are const.) */
+        SyntaxErrorEx e = caught;
+        if (e.tok == &invalid_tok && !tokens.empty()) {
+            e.loc_start = tokens.back().loc + 1;
+            e.loc_end = tokens.back().loc + 2;
+        }
 
-    } catch (const SyntaxErrorEx &e) {
-
-        handleSyntaxError(e);
-        return 1;
-
-    } catch (const UndefinedVariableEx &e) {
-
-        cerr << "Undefined variable '" << e.name << "'";
-
-        if (e.in_pure_func)
-            cerr << " while evaluating a PURE function";
-
-        dumpLocInError(e);
-        cerr << format_backtrace(e);
-        return 1;
-
-    } catch (const ExceptionObject &e) {
-
-        cerr << "Uncaught exception '" << e.get_name() << "'";
-
-        const EvalValue &data = e.get_data();
-
-        if (!data.is<NoneVal>())
-            cerr << ", data: " << data.get_type()->to_string(data);
-
-        dumpLocInError(e);
-        cerr << format_backtrace(e);
+        format_exception(cerr, e, lines);
         return 1;
 
     } catch (const Exception &e) {
 
-        cerr << e.name << ": " << e.msg;
-        dumpLocInError(e);
-        cerr << format_backtrace(e);
+        format_exception(cerr, e, lines);
         return 1;
     }
 

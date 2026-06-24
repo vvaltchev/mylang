@@ -1569,15 +1569,23 @@ pStmt(ParseContext &c, unsigned fl)
 }
 
 unique_ptr<Construct>
-pBlock(ParseContext &c, unsigned fl)
+pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
 {
     unique_ptr<Block> ret(new Block);
     unique_ptr<Construct> stmt, tmp;
     bool added_elem;
 
     ret->start = c.get_loc();
+
+    /*
+     * A block normally gets its own nested const scope (popped on exit). The
+     * REPL's top-level input passes push_const_scope=false so its consts land
+     * in the persistent const context on c.const_ctx and survive to the next
+     * input (see plans/repl.md). The CSE cache scope is still per-block.
+     */
     EvalContext block_const_ctx(c.const_ctx, true);
-    c.const_ctx = &block_const_ctx; // push a new const eval context
+    if (push_const_scope)
+        c.const_ctx = &block_const_ctx; // push a new const eval context
     c.cse->push();                  // matching CSE cache scope
 
     if (!c.eoi()) {
@@ -1607,7 +1615,8 @@ pBlock(ParseContext &c, unsigned fl)
 
     ret->end = c.get_loc();
     c.cse->pop();                      // pop the CSE cache scope
-    c.const_ctx = c.const_ctx->parent; // restore the previous const ctx
+    if (push_const_scope)
+        c.const_ctx = c.const_ctx->parent; // restore the previous const ctx
     return ret;
 }
 

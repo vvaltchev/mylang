@@ -122,6 +122,15 @@ public:
     bool assign_target = false;
 
     /*
+     * REPL only: when set on the persistent global scope, re-declaring an
+     * existing name (`var x = ...` for a name already bound here) rebinds it
+     * instead of throwing AlreadyDefinedEx - the documented way to change a
+     * global's value/type at the prompt. Off (default) keeps the script rule
+     * (a same-scope duplicate declaration is an error).
+     */
+    bool allow_redeclare = false;
+
+    /*
      * The current call's slot Frame, or nullptr outside any resolved call.
      * Inherited from the parent on construction; do_func_call points a resolved
      * call's args context at a fresh Frame.
