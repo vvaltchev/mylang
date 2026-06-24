@@ -17,7 +17,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
-#include <unistd.h>   /* isatty */
+#ifndef _WIN32
+#include <unistd.h>   /* isatty (REPL launch; Unix-only) */
+#endif
 
 using std::string;
 
@@ -103,11 +105,14 @@ parse_args(int argc, char **argv)
     } else if (argc == 1) {
 
         /* No FILE / -e: drop into the interactive REPL on a terminal (Ruby-
-         * like); otherwise print help. */
+         * like); otherwise print help. The REPL is Unix-only (see plans/
+         * repl.md), so on Windows the no-args case just prints help. */
+#ifndef _WIN32
         if (isatty(STDIN_FILENO)) {
             opt_repl = true;
             return;
         }
+#endif
 
         help();
         exit(0);

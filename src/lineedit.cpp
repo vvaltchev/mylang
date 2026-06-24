@@ -5,19 +5,112 @@
 #include <cctype>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <iostream>
 
+/* The raw-mode interactive editor is Unix-only (termios). On Windows the REPL
+ * is not interactive (read_line falls back to a cooked getline) - see
+ * plans/repl.md; the pure LineEditor core compiles everywhere for the tests. */
+#ifndef _WIN32
 #include <unistd.h>
 #include <termios.h>
+#endif
 
 using std::string;
 
 /* ---------------------------- the pure core ----------------------------- */
 
+size_t line_count(const string &s)
+{
+    return 1 + static_cast<size_t>(std::count(s.begin(), s.end(), '\n'));
+}
+
+size_t LineEditor::line_start(size_t off) const
+{
+    while (off > 0 && buf[off - 1] != '\n')
+        off--;
+    return off;
+}
+
+size_t LineEditor::line_end(size_t off) const
+{
+    while (off < buf.size() && buf[off] != '\n')
+        off++;
+    return off;
+}
+
+size_t LineEditor::cursor_row() const
+{
+    return static_cast<size_t>(
+        std::count(buf.begin(), buf.begin() + pos, '\n'));
+}
+
+size_t LineEditor::cursor_col() const
+{
+    return pos - line_start(pos);
+}
+
 void LineEditor::insert(char c)
 {
     buf.insert(buf.begin() + pos, c);
     pos++;
+}
+
+/* Enter on an incomplete buffer: split the line here and auto-indent the new
+ * line by the bracket depth up to the cursor (naive - tolerant of strings). */
+void LineEditor::newline()
+{
+    buf.insert(buf.begin() + pos, '\n');
+    pos++;
+
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = 0; i < pos; i++) {
+        const char c = buf[i];
+        if (in_str) {
+            if (c == '"')
+                in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+        }
+    }
+    for (int i = 0; i < depth * 2; i++) {
+        buf.insert(buf.begin() + pos, ' ');
+        pos++;
+    }
+}
+
+/* UP: move to the same column on the previous line; on the first line, recall
+ * the previous history entry instead. DOWN is the mirror. */
+void LineEditor::move_up()
+{
+    const size_t ls = line_start(pos);
+    if (ls == 0) {
+        hist_prev();
+        return;
+    }
+    const size_t col = pos - ls;
+    const size_t prev_start = line_start(ls - 1);   /* ls-1 is the '\n' */
+    const size_t prev_len = (ls - 1) - prev_start;
+    pos = prev_start + std::min(col, prev_len);
+}
+
+void LineEditor::move_down()
+{
+    const size_t le = line_end(pos);
+    if (le == buf.size()) {
+        hist_next();
+        return;
+    }
+    const size_t col = pos - line_start(pos);
+    const size_t next_start = le + 1;
+    const size_t next_len = line_end(next_start) - next_start;
+    pos = next_start + std::min(col, next_len);
 }
 
 void LineEditor::backspace()
@@ -34,15 +127,16 @@ void LineEditor::del_forward()
         buf.erase(buf.begin() + pos);
 }
 
-void LineEditor::kill_to_end()
+void LineEditor::kill_to_end()        /* to end of the current LINE */
 {
-    buf.erase(pos);
+    buf.erase(pos, line_end(pos) - pos);
 }
 
-void LineEditor::kill_to_start()
+void LineEditor::kill_to_start()      /* to start of the current LINE */
 {
-    buf.erase(0, pos);
-    pos = 0;
+    const size_t ls = line_start(pos);
+    buf.erase(ls, pos - ls);
+    pos = ls;
 }
 
 void LineEditor::kill_word()
@@ -143,12 +237,12 @@ void LineEditor::complete()
 void LineEditor::csi_final(unsigned char c)
 {
     switch (c) {
-        case 'A': hist_prev(); break;                          /* up    */
-        case 'B': hist_next(); break;                          /* down  */
+        case 'A': move_up(); break;                            /* up    */
+        case 'B': move_down(); break;                          /* down  */
         case 'C': if (pos < buf.size()) pos++; break;          /* right */
         case 'D': if (pos) pos--; break;                       /* left  */
-        case 'H': pos = 0; break;                              /* home  */
-        case 'F': pos = buf.size(); break;                     /* end   */
+        case 'H': pos = line_start(pos); break;                /* home  */
+        case 'F': pos = line_end(pos); break;                  /* end   */
         case '~':
             if (esc_params == "1" || esc_params == "7")
                 pos = 0;                                       /* home  */
@@ -184,14 +278,17 @@ LineEditor::Action LineEditor::feed(unsigned char c)
         case 27:  esc = Esc::esc;          return Action::none;  /* ESC */
         case 9:   complete();              return Action::none;  /* Tab */
         case 13:
-        case 10:                           return Action::submit;
+        case 10:                                                 /* Enter */
+            if (!submitter || submitter(buf))
+                return Action::submit;
+            newline();                     return Action::none;
         case 3:                            return Action::cancel; /* Ctrl-C */
         case 4:                                                   /* Ctrl-D */
             if (buf.empty())               return Action::eof;
             del_forward();                 return Action::none;
         case 12:                           return Action::clear;  /* Ctrl-L */
-        case 1:   pos = 0;                 return Action::none;   /* Ctrl-A */
-        case 5:   pos = buf.size();        return Action::none;   /* Ctrl-E */
+        case 1:   pos = line_start(pos);   return Action::none;   /* Ctrl-A */
+        case 5:   pos = line_end(pos);     return Action::none;   /* Ctrl-E */
         case 2:   if (pos) pos--;          return Action::none;   /* Ctrl-B */
         case 6:   if (pos < buf.size()) pos++; return Action::none; /* C-F */
         case 8:
@@ -199,8 +296,8 @@ LineEditor::Action LineEditor::feed(unsigned char c)
         case 21:  kill_to_start();         return Action::none;   /* Ctrl-U */
         case 11:  kill_to_end();           return Action::none;   /* Ctrl-K */
         case 23:  kill_word();             return Action::none;   /* Ctrl-W */
-        case 16:  hist_prev();             return Action::none;   /* Ctrl-P */
-        case 14:  hist_next();             return Action::none;   /* Ctrl-N */
+        case 16:  move_up();               return Action::none;   /* Ctrl-P */
+        case 14:  move_down();             return Action::none;   /* Ctrl-N */
         default:
             if (c >= 32 && c < 127)
                 insert(static_cast<char>(c));
@@ -208,30 +305,24 @@ LineEditor::Action LineEditor::feed(unsigned char c)
     }
 }
 
-/* --------------------------- the renderer ------------------------------- */
-
-string
-render_line(const string &prompt, const string &buf, size_t cursor,
-            string (*highlight)(const string &))
-{
-    string out;
-    out += "\r\033[K";                          /* CR + clear to end of line */
-    out += prompt;
-    out += highlight ? highlight(buf) : buf;
-
-    /* Put the cursor at column (prompt + cursor): CR, then move right. */
-    out += "\r";
-    const size_t target = prompt.size() + cursor;
-    if (target > 0)
-        out += "\033[" + std::to_string(target) + "C";
-
-    return out;
-}
-
 /* --------------------------- the TTY shell ------------------------------ */
 
 namespace {
 
+/* Split `s` into its logical lines (by '\n'). */
+std::vector<string> split_lines(const string &s)
+{
+    std::vector<string> rows;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); i++)
+        if (i == s.size() || s[i] == '\n') {
+            rows.push_back(s.substr(start, i - start));
+            start = i + 1;
+        }
+    return rows;
+}
+
+#ifndef _WIN32
 /* Put the terminal in raw mode for the lifetime of the object, restoring the
  * previous attributes on destruction (so the shell is never left broken). */
 struct RawMode {
@@ -268,57 +359,131 @@ void wr(const string &s)
     ssize_t n = write(STDOUT_FILENO, s.data(), s.size());
     (void) n;
 }
+#endif /* !_WIN32 */
 
-/* Print a Tab-completion candidate list below the input line. */
-void show_completions(const std::vector<string> &cands)
+/*
+ * Cooked (non-raw) read: accumulate physical lines until the input parses
+ * complete (or EOF), so a multi-line block read off a pipe behaves like one
+ * typed at the prompt. Used for piped input / a test harness, and as the whole
+ * read path on Windows (no raw-mode editor there).
+ */
+ReadLineResult
+read_line_cooked(const string &prompt, const string &cont_prompt,
+                 const LineEditor::Submitter &submitter)
 {
-    string out = "\n";
+    ReadLineResult res;
+    std::cout << prompt << std::flush;
+    string acc, line;
+    while (std::getline(std::cin, line)) {
+        if (!acc.empty())
+            acc += "\n";
+        acc += line;
+        if (!submitter || submitter(acc)) {
+            res.line = acc;
+            return res;
+        }
+        std::cout << cont_prompt << std::flush;
+    }
+    if (!acc.empty()) {
+        res.line = acc;     /* trailing incomplete block at EOF */
+        return res;
+    }
+    res.eof = true;
+    return res;
+}
+
+/* Join a Tab-completion candidate list (two spaces apart) + a trailing NL. */
+string completions_str(const std::vector<string> &cands)
+{
+    string out;
     for (size_t i = 0; i < cands.size(); i++) {
         out += cands[i];
         if (i + 1 < cands.size())
             out += "  ";
     }
     out += "\n";
-    wr(out);
+    return out;
 }
 
 }  /* namespace */
 
 ReadLineResult
-read_line(const string &prompt, std::vector<string> &history,
-          string (*highlight)(const string &), const string &initial,
-          LineEditor::Completer completer)
+read_line(const string &prompt, const string &cont_prompt,
+          std::vector<string> &history,
+          string (*highlight)(const string &),
+          LineEditor::Completer completer, LineEditor::Submitter submitter)
 {
     ReadLineResult res;
 
-    /* Not a terminal (piped input / a test harness): plain line read. The
-     * initial (auto-indent) text is prepended so behavior matches the TTY. */
-    if (!isatty(STDIN_FILENO)) {
-        std::cout << prompt << std::flush;
-        string line;
-        if (!std::getline(std::cin, line)) {
-            res.eof = true;
-            return res;
-        }
-        res.line = initial + line;
-        return res;
-    }
+    /*
+     * On Windows, or when stdin is not a terminal (piped input / a test
+     * harness), there is no raw-mode editor - read in cooked mode.
+     */
+#ifdef _WIN32
+    return read_line_cooked(prompt, cont_prompt, submitter);
+#else
+    if (!isatty(STDIN_FILENO))
+        return read_line_cooked(prompt, cont_prompt, submitter);
 
     RawMode raw;
     LineEditor ed;
     ed.set_history(&history);
     if (completer)
         ed.set_completer(std::move(completer));
-    if (!initial.empty())
-        ed.set_buffer(initial);
+    if (submitter)
+        ed.set_submitter(std::move(submitter));
 
-    wr(render_line(prompt, ed.buffer(), ed.cursor(), highlight));
+    /* The row (0-based, within the block) the cursor was on after the last
+     * paint - so the next paint can move back to the top of the block. */
+    int prev_cursor_row = 0;
+
+    auto repaint = [&]() {
+        string o;
+        if (prev_cursor_row > 0)
+            o += "\033[" + std::to_string(prev_cursor_row) + "A";
+        o += "\r\033[J";                       /* col 0, clear downward */
+
+        const std::vector<string> rows = split_lines(ed.buffer());
+        for (size_t i = 0; i < rows.size(); i++) {
+            o += (i == 0 ? prompt : cont_prompt);
+            o += highlight ? highlight(rows[i]) : rows[i];
+            if (i + 1 < rows.size())
+                o += "\r\n";
+        }
+
+        const int crow = static_cast<int>(ed.cursor_row());
+        const int last = static_cast<int>(rows.size()) - 1;
+        if (last > crow)
+            o += "\033[" + std::to_string(last - crow) + "A";
+        o += "\r";
+        const size_t target =
+            (crow == 0 ? prompt.size() : cont_prompt.size()) + ed.cursor_col();
+        if (target > 0)
+            o += "\033[" + std::to_string(target) + "C";
+
+        prev_cursor_row = crow;
+        wr(o);
+    };
+
+    /* Move the terminal cursor below the whole block (for submit / a list). */
+    auto move_below = [&]() {
+        const int rows = static_cast<int>(line_count(ed.buffer()));
+        const int down = (rows - 1) - prev_cursor_row;
+        string o;
+        if (down > 0)
+            o += "\033[" + std::to_string(down) + "B";
+        o += "\r\n";
+        wr(o);
+        prev_cursor_row = 0;
+    };
+
+    repaint();
 
     for (;;) {
         unsigned char c;
         const ssize_t n = read(STDIN_FILENO, &c, 1);
         if (n <= 0) {
-            wr("\n");
+            move_below();
             res.eof = true;
             return res;
         }
@@ -326,28 +491,33 @@ read_line(const string &prompt, std::vector<string> &history,
         const LineEditor::Action a = ed.feed(c);
 
         if (a == LineEditor::Action::submit) {
-            wr("\n");
+            move_below();
             res.line = ed.buffer();
             return res;
         }
         if (a == LineEditor::Action::cancel) {
-            wr("^C\n");
+            move_below();
             res.cancelled = true;
             return res;
         }
         if (a == LineEditor::Action::eof) {
-            wr("\n");
+            move_below();
             res.eof = true;
             return res;
         }
-        if (a == LineEditor::Action::clear)
+        if (a == LineEditor::Action::clear) {
             wr("\033[2J\033[H");
+            prev_cursor_row = 0;
+        }
 
-        /* A Tab with several candidates: list them, then repaint the prompt. */
+        /* A Tab with several candidates: list them, then repaint fresh. */
         const std::vector<string> cands = ed.take_completions();
-        if (!cands.empty())
-            show_completions(cands);
+        if (!cands.empty()) {
+            move_below();
+            wr(completions_str(cands));
+        }
 
-        wr(render_line(prompt, ed.buffer(), ed.cursor(), highlight));
+        repaint();
     }
+#endif /* !_WIN32 */
 }
