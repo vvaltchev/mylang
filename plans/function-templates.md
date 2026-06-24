@@ -23,17 +23,21 @@
 > - **D4** — a per-template instantiation cap (64 signatures) past which calls
 >   run dynamically, with a one-time stderr warning.
 >
+> **Also built (v1.2):** **cross-input REPL monomorphization** — a template
+> defined in a PRIOR REPL input now instantiates in later inputs (it used to
+> evaluate dynamically). This took finding a real **MSVC-only, non-deterministic
+> (address-dependent) UB**, done by pushing super-heavy instrumentation through
+> CI: `id_sym`/`func_of_decl` are keyed by node POINTER and persist for the
+> session; a fresh input node can reuse a freed node's address, and
+> `walk_struct`'s `if (!id_sym.count(id))` guard then KEPT the stale entry —
+> binding an input's call CALLEE to a *prior clone's* symbol, so the call was
+> never instantiated and was checked against the wrong instance. No local config
+> reproduced it (GCC + clang × debug + opt × ASan + UBSan), and it flipped
+> Debug↔Release run-to-run. Fix: always re-resolve in `walk_struct` (it visits
+> each node once) + clear the clone subtree's `id_sym`/`func_of_decl` in
+> `make_template_clone`. All CI green.
+>
 > **Deferred / deliberate v1 boundaries:**
-> - **Cross-input REPL monomorphization.** A template committed by a PRIOR REPL
->   input evaluates **dynamically** (correct, not monomorphized); only a
->   within-input template and every *script* template monomorphize. Re-enabling
->   it was **attempted and reverted**: cloning a prior input's already-
->   resolved/evaluated decl across the persistent session is fragile **only
->   under MSVC release** (a UB-class bug NO local config reproduces — GCC +
->   clang × debug + opt × ASan + UBSan all pass — resisting three fixes:
->   node-based redirect, per-input cache clear, resolved-state reset). Dynamic
->   eval is the safe, all-green behavior; this stays a boundary until the MSVC
->   cause is reproducible.
 > - **D5 / template-as-a-value already works** (correctly typed): `var a =
 >   map(inc, xs); a[0]+1` type-checks. Monomorphizing the callback is near-zero
 >   value (`map` builds a general array + calls through its dynamic loop), so it

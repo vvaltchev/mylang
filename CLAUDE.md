@@ -894,15 +894,16 @@ clone's sym BY NODE via `id_sym`, not by name), and re-runs the fixpoint; the
 clone's params accumulate their one signature through the concrete path (dedup
 by `(template, signature)` in `tmpl_cache`; recursion → self-redirect). Arity is
 still checked for a template call; per-arg type/nullability is checked inside
-each clone. **REPL caveat:** a template committed by a PRIOR input (`pinned`) is
-NOT instantiated in a later input — it evaluates dynamically (correct, just not
-monomorphized); only a within-input template and every script template
-monomorphize. (`tmpl_cache` is cleared per input.) Cloning a prior input's
-already-resolved/evaluated decl across the persistent session is fragile **only
-under MSVC release** — a UB-class bug no local config reproduces (GCC + clang ×
-debug + opt × ASan + UBSan all pass) that resisted three targeted fixes
-(node-based redirect, per-input cache clear, resolved-state reset); re-enabling
-was attempted and **reverted**. Dynamic eval is the safe, all-green behavior.
+each clone. A template defined in a PRIOR REPL input instantiates in later
+inputs too (`tmpl_cache` is cleared per input; the clone-name counter stays
+monotonic). **Subtlety:** `id_sym`/`func_of_decl` are keyed by node POINTER and
+persist for the session, so a fresh input node can reuse a freed node's address
+— `walk_struct` therefore **always re-resolves** an identifier (never
+`if (!id_sym.count(id))`, which would keep a stale entry and bind an input's
+callee to a prior clone), and `make_template_clone` clears the clone subtree's
+`id_sym`/`func_of_decl`. (This was an MSVC-only, address-dependent,
+non-deterministic bug, root-caused via CI instrumentation; GCC/clang +
+sanitizers never reproduced it.)
 
 ## The value & type model (the subtle part)
 
