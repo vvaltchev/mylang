@@ -18,12 +18,6 @@
 #include <ostream>
 #include <cstdio>
 
-/* TEMPORARY: super-heavy template-monomorphization instrumentation to root-cause
- * the MSVC-release-only cross-input REPL bug. Drop / compile out at the end. */
-#define TMPL_INSTR 1
-#define TMPL_NAME(t) ((t)->decl->id \
-    ? std::string((t)->decl->id->get_str()).c_str() : "<lam>")
-
 /*
  * Whole-program static type inference + checking. See plans/type-inference.md
  * and plans/type-inference-questions.md for the design and decisions.
@@ -527,24 +521,21 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     auto *fc = static_cast<FuncDeclStmt *>(cl.get());
     fc->display_name = tmpl->decl->id
         ? std::string(tmpl->decl->id->get_str()) : std::string("<lambda>");
-    const int my_n = tmpl_clone_counter++;
-    fc->id = make_unique<Identifier>("$tmpl" + std::to_string(my_n));
+    fc->id = make_unique<Identifier>(
+        "$tmpl" + std::to_string(tmpl_clone_counter++));
 
     /*
-     * THE FIX: id_sym is keyed by node POINTER and persists for the session.
-     * clone() produces fresh nodes, but their addresses can collide with stale
-     * id_sym entries left by freed nodes; walk_struct's `if (!id_sym.count(id))`
-     * guard would then SKIP re-resolving such a node, leaving the clone's body
-     * identifier bound to a wrong (stale) symbol. (Address-dependent => the
-     * MSVC-only, non-deterministic wrong-instance bug.) Clear any id_sym /
-     * func_of_decl entry on the clone's subtree so walk_struct resolves every
-     * node fresh.
+     * id_sym / func_of_decl are keyed by node POINTER and persist for the
+     * session; clone() produces fresh nodes whose addresses can collide with
+     * stale entries from freed nodes. Clear them on the clone's subtree so
+     * walk_struct declares the clone's FuncInfo fresh (declare_funcdecl's
+     * own guard would otherwise skip on a stale func_of_decl entry). The
+     * Identifier resolution is also re-done unconditionally in walk_struct.
      */
     {
-        int cleared = 0;
         std::function<void(Construct *)> clr = [&](Construct *n) {
             if (!n) return;
-            if (id_sym.erase(n)) cleared++;
+            id_sym.erase(n);
             if (auto *fd2 = dynamic_cast<FuncDeclStmt *>(n)) {
                 func_of_decl.erase(fd2);
                 clr(fd2->captures.get());
@@ -555,37 +546,11 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
             for_each_child(n, clr);
         };
         clr(fc);
-#if TMPL_INSTR
-        if (cleared)
-            fprintf(stderr, "ZZ STALE-CLEARED %d entries on clone fc=%p\n",
-                    cleared, (void *)fc);
-#endif
     }
-#if TMPL_INSTR
-    fprintf(stderr, "ZZ MAKE tmpl=%p name=%s -> newid=$tmpl%d fc=%p "
-            "fc_idnode=%p fc_uid=%p key=%s\n", (void *)tmpl, TMPL_NAME(tmpl),
-            my_n, (void *)fc, (void *)fc->id.get(), (void *)fc->id->uid,
-            key.c_str());
-#endif
 
     walk_struct(fc, global);            /* declare its name + build its syms */
-    FuncInfo *cfi = func_of_decl.count(fc) ? func_of_decl[fc] : nullptr;
-    if (cfi)
+    if (FuncInfo *cfi = func_of_decl.count(fc) ? func_of_decl[fc] : nullptr)
         cfi->is_template = false;         /* an instantiation is concrete */
-#if TMPL_INSTR
-    {
-        auto its = id_sym.find(fc->id.get());
-        fprintf(stderr, "ZZ MAKE-done fc=%p cfi=%p p0ptr=%p id_sym[idnode]=%p "
-                "(==cfi's sym? func=%p) global[uid]=%p\n", (void *)fc,
-                (void *)cfi,
-                (void *)(cfi && !cfi->params.empty() ? cfi->params[0] : 0),
-                (void *)(its != id_sym.end() ? its->second : 0),
-                (void *)(its != id_sym.end() && its->second
-                         ? its->second->func : 0),
-                (void *)(global->syms.count(fc->id->uid)
-                         ? global->syms[fc->id->uid] : 0));
-    }
-#endif
 
     FuncDeclStmt *raw = fc;
     rootBlock->elems.insert(rootBlock->elems.begin(), move(cl));
@@ -635,10 +600,6 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
                 continue;       /* not a template param */
             STyRef t = sty_resolve(type_of(call->args->elems[i].get()));
-#if TMPL_INSTR
-            fprintf(stderr, "ZZ   arg[%zu] type=%s unknown=%d\n", i,
-                    sty_to_string(t).c_str(), is_unknown(t));
-#endif
             if (is_unknown(t)) { ready = false; break; }
             sig.push_back(t);
         }
@@ -647,24 +608,6 @@ bool Inferencer::instantiate_round(Block *rootBlock)
 
         const std::string key = template_sig_key(tmpl, sig);
         auto it = tmpl_cache.find(key);
-#if TMPL_INSTR
-        {
-            std::string sigs;
-            for (STyRef t : sig) { sigs += sty_to_string(t); sigs += " "; }
-            fprintf(stderr,
-                "ZZ call tmpl=%p name=%s pinned=%d nargs=%zu sig=[%s] "
-                "key=%s HIT=%d cacheN=%zu counter=%d\n",
-                (void *)tmpl, TMPL_NAME(tmpl), tmpl->pinned, nargs,
-                sigs.c_str(), key.c_str(), it != tmpl_cache.end(),
-                tmpl_cache.size(), tmpl_clone_counter);
-            for (auto &kv : tmpl_cache)
-                fprintf(stderr, "ZZ   cacheentry key=%s -> clone=%p id=%s\n",
-                        kv.first.c_str(), (void *)kv.second,
-                        kv.second && kv.second->id
-                            ? std::string(kv.second->id->get_str()).c_str()
-                            : "?");
-        }
-#endif
         FuncDeclStmt *clone;
         if (it != tmpl_cache.end()) {
             clone = it->second;
@@ -693,25 +636,9 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         what->start = call->what->start;
         what->end = call->what->end;
         /* Resolve the clone's symbol BY NODE (id_sym on the clone's own id),
-         * not by name (global->syms[uid]) - the by-name lookup is ambiguous if
-         * two clones ever shared a name, which manifested (MSVC release) as a
-         * call resolving to the wrong (prior) instance. */
+         * not by name (global->syms[uid]) - unambiguous even if two clones ever
+         * shared a name. */
         auto cs = id_sym.find(clone->id.get());
-#if TMPL_INSTR
-        {
-            TypeSym *rsym = (cs != id_sym.end()) ? cs->second : nullptr;
-            FuncInfo *rf = rsym ? rsym->func : nullptr;
-            FuncInfo *cfi = func_of_decl.count(clone) ? func_of_decl[clone]
-                                                      : nullptr;
-            fprintf(stderr,
-                "ZZ   redirect clone_id=%s clone=%p clone_idnode=%p cfi=%p "
-                "rsym=%p rsym_func=%p (cfi==rf? %d) what_uid=%p clone_uid=%p\n",
-                std::string(clone->id->get_str()).c_str(), (void *)clone,
-                (void *)clone->id.get(), (void *)cfi, (void *)rsym,
-                (void *)rf, cfi == rf,
-                (void *)what->uid, (void *)clone->id->uid);
-        }
-#endif
         id_sym[what.get()] = (cs != id_sym.end()) ? cs->second : nullptr;
         /* The old callee Identifier is about to be freed: drop its id_sym entry
          * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
@@ -877,11 +804,6 @@ void Inferencer::infer_input(Block *rootBlock)
      * stays monotonic, so names never collide in the persistent global scope.
      */
     tmpl_cache.clear();
-#if TMPL_INSTR
-    fprintf(stderr, "ZZ ===== INFER_INPUT cleared cache; counter=%d "
-            "all_funcs=%zu all_syms=%zu\n", tmpl_clone_counter,
-            all_funcs.size(), all_syms.size());
-#endif
 
     const size_t sym_base = all_syms.size();
     const size_t func_base = all_funcs.size();
@@ -2967,26 +2889,6 @@ void Inferencer::check_call(CallExpr *call)
         fparams = &fi->params;
         callable_known = true;
         template_call = fi->is_template;
-#if TMPL_INSTR
-        if (auto *wid = dynamic_cast<Identifier *>(call->what.get())) {
-            auto ws = wid->get_str();
-            if (ws.size() >= 5 && ws.compare(0, 5, "$tmpl") == 0) {
-                auto isr = id_sym.find(wid);
-                fprintf(stderr,
-                    "ZZ CHECKCALL what=%.*s whatnode=%p fi=%p tmpl=%d "
-                    "nparams=%zu p0=%s p0ptr=%p id_sym[what]=%p "
-                    "id_sym_func=%p\n",
-                    (int)ws.size(), ws.data(), (void *)wid, (void *)fi,
-                    fi->is_template, fi->params.size(),
-                    fi->params.empty() ? "?"
-                        : sty_to_string(fi->params[0]->type).c_str(),
-                    fi->params.empty() ? nullptr : (void *)fi->params[0],
-                    (void *)(isr != id_sym.end() ? isr->second : 0),
-                    (void *)(isr != id_sym.end() && isr->second
-                             ? isr->second->func : 0));
-            }
-        }
-#endif
     } else if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
         auto it = id_sym.find(cid);
         TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
