@@ -1537,16 +1537,24 @@ behind a thin terminal shell:
   - **`completions(buf, cursor)`** — Tab candidates: keywords + builtins + REPL
     globals (`EvalContext::collect_symbols`), or a struct value/type's fields/
     consts right after `base.`.
-- **`lineedit.{h,cpp}` — the hand-rolled line editor.** A **pure
-  `LineEditor`** core driven one byte at a time via `feed()` (edit buffer +
-  cursor, an escape-sequence decoder for arrows/Home/End/Delete, kill/word keys,
-  history nav, Tab completion via a `Completer` callback) — it emits no output
-  and touches no fd, so it is unit-tested with raw byte scripts. `render_line`
-  is a pure renderer (prompt + buffer, cursor positioned with ANSI; the
-  highlight is zero-width so columns are unaffected). `read_line` is the only
-  non-pure part: termios raw mode via an RAII guard that restores the terminal
-  on every exit path, byte-at-a-time read, repaint. Falls back to plain
-  `getline` off a TTY.
+- **`lineedit.{h,cpp}` — the hand-rolled, IRB-style multi-line editor.** A
+  **pure `LineEditor`** core driven one byte at a time via `feed()`: the edit
+  buffer **holds embedded newlines** (a multi-line block) and the cursor is an
+  offset with a 2-D view (`cursor_row`/`cursor_col`). **Enter SUBMITS only when
+  a `Submitter` callback says the buffer parses complete**, else inserts a
+  newline + auto-indents by bracket depth (`newline()`); **UP/DOWN move within
+  the block** (same column, prev/next line via `move_up`/`move_down`) and fall
+  through to history only at the first/last line; **Home/End and the kill keys
+  are line-relative** (`line_start`/`line_end` — including the `ESC[1~`/`ESC[4~`
+  variants). With no `Submitter` set it is the old single-line behavior, so the
+  feed-based unit tests are unchanged. It emits no output and touches no fd, so
+  it is unit-tested with raw byte scripts (assert `buffer()`/`cursor_row()`/
+  `cursor_col()`). `read_line` is the only non-pure part: termios raw mode via
+  an RAII guard, byte-at-a-time read, and the **2-D repaint** (each logical line
+  under its `>>`/`..` prompt, the cursor positioned in two dimensions, the prior
+  block cleared) — it assumes each logical line fits the terminal width (no
+  soft-wrap). Off a TTY it accumulates physical lines until complete. History
+  stores whole logical inputs, so UP recalls an entire block.
 - **`highlight.{h,cpp}`** — `highlight_line`, a self-contained scanner (NOT the
   lexer; tolerates mid-edit input) that wraps keywords/strings/numbers/comments/
   type-words in ANSI color, preserving the bytes exactly otherwise.
@@ -1556,9 +1564,17 @@ behind a thin terminal shell:
   the REPL share it.
 
 `run_repl` (in `repl.cpp`) drives it: history loaded/saved to
-`~/.mylang_history`, colors gated on a TTY + `NO_COLOR`, multi-line accumulation
-via `is_incomplete` with auto-indent (`repl_bracket_depth`), Ctrl-C drops the
-current input, Ctrl-D mid-block abandons it.
+`~/.mylang_history`, colors gated on a TTY + `NO_COLOR`, Ctrl-C drops the
+current input, Ctrl-D at the prompt exits. The editor owns multi-line
+continuation (its `Submitter` wraps `ReplEngine::is_incomplete`, treating a
+leading-`:` meta-command as always complete), so `run_repl` reads one whole
+logical input per `read_line` — no per-line accumulation loop. **A function or
+struct can be REDEFINED at the prompt** (the edit-and-resubmit workflow):
+`EvalContext::allow_redeclare` is set on *both* the runtime and const scopes
+(structs/pure funcs register in the const ctx at parse time), and the
+`FuncDeclStmt`/`StructDeclStmt` eval paths erase-then-rebind under it instead of
+throwing `AlreadyDefinedEx`. A plain `var`'s TYPE still sticks (the inferencer's
+job — see the type-commitment above; `undef` resets it).
 
 **Faithful per-input pipeline.** `do_eval` runs the REAL pipeline on each input
 (after parse): `ReplInfer::check_input` (type inference + checking) →
