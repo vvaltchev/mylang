@@ -6411,6 +6411,18 @@ static const std::vector<test> tests =
     { "template: a function with only an opt param stays join (narrows)",
       { "func f(opt x){ if (x != none) return x + 1; return 0; }",
         "assert(f(5) == 6); assert(f(none) == 0);" } },
+    { "template: a write-once, calls-only var-bound lambda is a template",
+      { "var id = func(x) => x;",
+        "assert(id(1) == 1); assert(id(\"s\") == \"s\"); assert(id(2.5)==2.5);" } },
+    { "template: a var-bound lambda's typed result is concrete",
+      { "var sq = func(n) => n*n; var r = sq(6);",
+        "assert(r + 1 == 37);" } },
+    { "template: a value-used lambda stays the join model (map)",
+      { "var f = func(x) => x*2;",
+        "assert(sum(map(f, [1,2,3])) == 12);" } },
+    { "template: a capturing lambda stays the join model",
+      { "var b = 10; var add = func(n) => n + b;",
+        "assert(add(5) == 15);" } },
 
     /* ---- mandatory `dyn`: a plain var/const must infer a concrete type -- */
     { "ti: mandatory dyn - a plain var inferred dyn is rejected",
