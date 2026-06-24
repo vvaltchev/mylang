@@ -1560,20 +1560,42 @@ behind a thin terminal shell:
 via `is_incomplete` with auto-indent (`repl_bracket_depth`), Ctrl-C drops the
 current input, Ctrl-D mid-block abandons it.
 
-**Tests:** all headless. The **`repl:`** tests drive ONE `ReplEngine` through a
-sequence of `(input, expected-substring)` steps (so the persisted global scope
-is exercised); the **`lineedit:`** / **`highlight:`** `extra_checks` feed byte
-scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
-unit-tested.
+**Faithful per-input pipeline.** `do_eval` runs the REAL pipeline on each input
+(after parse): `ReplInfer::check_input` (type inference + checking) →
+`resolve_names(..., repl_mode=true)` → `specialize_types` → eval. So the REPL is
+the true interpreter — flat arrays, M8 specialization, inlining, slotted nested
+locals all happen and are inspectable (`:analyze`).
+- **`ReplInfer`** (`inferencer.{h,cpp}`) is a persistent `Inferencer`: the
+  one-shot `run()` is factored into `setup()` (once) + `infer_one(root)`
+  (per root), and `infer_input(root)` runs `infer_one` then marks this input's
+  new `TypeSym`s/`FuncInfo`s **`pinned`**. A `pinned` symbol is a committed
+  global: the fixpoint (`reset_round`/`commit_round`/finalize/the `enforce_*`
+  passes) **skips** it, and `contribute()` instead **checks** an assignment is
+  assignable to its committed type — the cross-input **type commitment** (`var
+  x = 3` then a later `x = "hello"` is a `TypeMismatchEx`, "has type" for an
+  inferred commit vs "is declared" for an annotated one). All `pinned` branches
+  are no-ops in the one-shot path, so scripts/tests are byte-identical. A
+  rejected input rolls back (`infer_input` restores the global scope + pins the
+  half-built syms). `undef(x)` → `ReplInfer::undef_global` drops the name so a
+  later `var x` of a new type is fresh (the REPL diffs the global symbol names
+  before/after eval to find what `undef` removed). REPL redeclaration is **not**
+  a feature: a re-declared global hits the type-commitment check, and `undef`
+  is the way to change a global's type.
+- **`resolve_names`'s `repl_mode`** keeps EVERY top-level decl in the map as a
+  persistent global (never slotted into "main", never auto-const-promoted — the
+  open-world soundness point); nested function locals slot/inline/specialize
+  normally. `eval` runs the input's elems directly in the persistent global
+  scope, so globals persist and nested calls build their own frames.
+- **`render_analysis`/`anno_code`** moved from `mylang.cpp` to `analyzer.cpp`
+  (an `ostream` param) so `-a` and `:analyze` share one renderer.
 
-**Deferred (see `plans/repl.md` §3.1):** the **faithful incremental inference**
-— running the real `infer_types`/`resolve_names`/`specialize_types` per input
-with cross-input **type commitment** (a committed global's inferred type pinned
-like an annotation, so a later `x = <wrong type>` is the same `TypeMismatchEx`
-a script's `int x` would give). It can't be shortcut (re-inferring the whole
-accumulated program gives script join-semantics, not pinning), so it needs a
-persistent-`Inferencer` refactor; today the REPL evaluates correctly and
-persists state but does not type-check per input.
+**Tests:** all headless. The **`repl:`** tests drive ONE `ReplEngine` through a
+sequence of `(input, expected-substring)` steps, so the persisted global scope
+AND the cross-input type commitment / `undef` reset / per-input optimizers are
+exercised; the **`lineedit:`** / **`highlight:`** `extra_checks` feed byte
+scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
+unit-tested. **Not yet (Phase 5):** an IRB-style dropdown completion menu,
+reverse-search / bracketed paste, and the Windows raw-input backend.
 
 ## Recipes
 
