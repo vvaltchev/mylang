@@ -102,6 +102,44 @@ void LineEditor::hist_next()
     pos = buf.size();
 }
 
+void LineEditor::complete()
+{
+    if (!completer)
+        return;
+
+    /* the identifier prefix ending at the cursor */
+    size_t start = pos;
+    while (start > 0 &&
+           (isalnum(static_cast<unsigned char>(buf[start - 1])) ||
+            buf[start - 1] == '_'))
+        start--;
+    const string word = buf.substr(start, pos - start);
+
+    const std::vector<string> cands = completer(buf, pos);
+    if (cands.empty())
+        return;
+
+    if (cands.size() == 1) {                       /* unique: complete it */
+        buf.replace(start, pos - start, cands[0]);
+        pos = start + cands[0].size();
+        return;
+    }
+
+    /* several: extend to the longest common prefix, then offer the list */
+    string lcp = cands[0];
+    for (size_t i = 1; i < cands.size(); i++) {
+        size_t j = 0;
+        while (j < lcp.size() && j < cands[i].size() && lcp[j] == cands[i][j])
+            j++;
+        lcp.resize(j);
+    }
+    if (lcp.size() > word.size()) {
+        buf.replace(start, pos - start, lcp);
+        pos = start + lcp.size();
+    }
+    comp_list = cands;
+}
+
 void LineEditor::csi_final(unsigned char c)
 {
     switch (c) {
@@ -144,6 +182,7 @@ LineEditor::Action LineEditor::feed(unsigned char c)
 
     switch (c) {
         case 27:  esc = Esc::esc;          return Action::none;  /* ESC */
+        case 9:   complete();              return Action::none;  /* Tab */
         case 13:
         case 10:                           return Action::submit;
         case 3:                            return Action::cancel; /* Ctrl-C */
@@ -230,11 +269,25 @@ void wr(const string &s)
     (void) n;
 }
 
+/* Print a Tab-completion candidate list below the input line. */
+void show_completions(const std::vector<string> &cands)
+{
+    string out = "\n";
+    for (size_t i = 0; i < cands.size(); i++) {
+        out += cands[i];
+        if (i + 1 < cands.size())
+            out += "  ";
+    }
+    out += "\n";
+    wr(out);
+}
+
 }  /* namespace */
 
 ReadLineResult
 read_line(const string &prompt, std::vector<string> &history,
-          string (*highlight)(const string &), const string &initial)
+          string (*highlight)(const string &), const string &initial,
+          LineEditor::Completer completer)
 {
     ReadLineResult res;
 
@@ -254,6 +307,8 @@ read_line(const string &prompt, std::vector<string> &history,
     RawMode raw;
     LineEditor ed;
     ed.set_history(&history);
+    if (completer)
+        ed.set_completer(std::move(completer));
     if (!initial.empty())
         ed.set_buffer(initial);
 
@@ -287,6 +342,11 @@ read_line(const string &prompt, std::vector<string> &history,
         }
         if (a == LineEditor::Action::clear)
             wr("\033[2J\033[H");
+
+        /* A Tab with several candidates: list them, then repaint the prompt. */
+        const std::vector<string> cands = ed.take_completions();
+        if (!cands.empty())
+            show_completions(cands);
 
         wr(render_line(prompt, ed.buffer(), ed.cursor(), highlight));
     }

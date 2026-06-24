@@ -23,6 +23,7 @@
 
 #include <typeinfo>
 #include <vector>
+#include <algorithm>
 
 using std::setw;
 using std::setfill;
@@ -7793,6 +7794,64 @@ static bool highlight_tolerates_unterminated_string()
     return strip_ansi(highlight_line(src)) == src;
 }
 
+static bool has_cand(const std::vector<std::string> &v, const std::string &s)
+{
+    return std::find(v.begin(), v.end(), s) != v.end();
+}
+
+static bool repl_completion_globals_builtins_keywords()
+{
+    ReplEngine e;
+    e.eval_input("var counter = 1");
+    e.eval_input("var country = 2");
+    /* a global prefix completes to both globals */
+    const auto g = e.completions("coun", 4);
+    if (!has_cand(g, "counter") || !has_cand(g, "country")) return false;
+    /* a builtin and a keyword complete too */
+    if (!has_cand(e.completions("le", 2), "len")) return false;
+    if (!has_cand(e.completions("retu", 4), "return")) return false;
+    /* an unrelated prefix yields nothing */
+    return e.completions("zzzq", 4).empty();
+}
+
+static bool repl_completion_struct_members()
+{
+    ReplEngine e;
+    e.eval_input("struct P { int alpha; int beta; }");
+    e.eval_input("var p = P(1, 2)");
+    /* `p.` lists the fields */
+    const auto all = e.completions("p.", 2);
+    if (!has_cand(all, "alpha") || !has_cand(all, "beta")) return false;
+    /* `p.al` uniquely completes to alpha */
+    const auto one = e.completions("p.al", 4);
+    return one.size() == 1 && one[0] == "alpha";
+}
+
+static bool lineedit_tab_unique_completion()
+{
+    LineEditor ed;
+    ed.set_completer([](const std::string &, size_t) {
+        return std::vector<std::string>{ "counter" };
+    });
+    le_feed(ed, "coun");
+    ed.feed(9);                                    /* Tab */
+    return ed.buffer() == "counter" && ed.cursor() == 7;
+}
+
+static bool lineedit_tab_common_prefix()
+{
+    LineEditor ed;
+    ed.set_completer([](const std::string &, size_t) {
+        return std::vector<std::string>{ "counter", "country" };
+    });
+    le_feed(ed, "cou");
+    ed.feed(9);                                    /* Tab */
+    /* extends to the longest common prefix "count" and offers the list */
+    if (ed.buffer() != "count") return false;
+    const auto offered = ed.take_completions();
+    return offered.size() == 2;
+}
+
 static bool repl_incomplete_detection()
 {
     if (!ReplEngine::is_incomplete("func f() {")) return false;   /* open { */
@@ -7809,6 +7868,13 @@ static bool repl_incomplete_detection()
 static const std::vector<extra_check> extra_checks =
 {
     { "repl: multi-line completeness detection", repl_incomplete_detection },
+    { "repl: completion (globals/builtins/keywords)",
+      repl_completion_globals_builtins_keywords },
+    { "repl: completion (struct members)", repl_completion_struct_members },
+    { "lineedit: Tab completes a unique candidate",
+      lineedit_tab_unique_completion },
+    { "lineedit: Tab extends to the common prefix",
+      lineedit_tab_common_prefix },
     { "highlight: inserts color escapes", highlight_inserts_color },
     { "highlight: stripping escapes restores the input",
       highlight_preserves_visible_text },

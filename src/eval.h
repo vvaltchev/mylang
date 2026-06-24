@@ -9,6 +9,8 @@
 #include <map>
 #include <new>
 #include <string_view>
+#include <vector>
+#include <utility>
 
 class Identifier;
 
@@ -161,6 +163,13 @@ public:
 
     bool empty() const { return symbols.empty(); }
     void copy_symbols_from(const EvalContext &ctx) { symbols = ctx.symbols; }
+
+    /* Append the interned name of every symbol bound in THIS context (not the
+     * parent chain) to `out`. Used by the REPL completer to list globals +
+     * builtins; a const-instance value is needed for member completion, so the
+     * LValue is exposed too. */
+    void collect_symbols(
+        std::vector<std::pair<const UniqueId *, const LValue *>> &out) const;
 
     static SymbolsType builtins;
     static const SymbolsType const_builtins;

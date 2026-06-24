@@ -40,6 +40,15 @@ public:
      */
     static bool is_incomplete(const std::string &src);
 
+    /*
+     * Tab-completion candidates for the identifier ending at `cursor` in `buf`:
+     * keywords + builtins + REPL globals, or - right after `base.` where base
+     * is a struct value/type in scope - that struct's fields and consts. Each
+     * candidate is a full word matching the prefix at the cursor. Read-only.
+     */
+    std::vector<std::string>
+    completions(const std::string &buf, size_t cursor) const;
+
 private:
 
     struct Impl;
