@@ -31,7 +31,9 @@ struct CseCache {
     std::vector<std::unordered_map<string, EvalValue>> stack;
 
     void push() { stack.emplace_back(); }
-    void pop() { stack.pop_back(); }
+    /* push/pop must stay in lockstep with pBlock's const-ctx scopes (CLAUDE.md
+     * const-evaluation): an unbalanced pop here is a scope-management bug. */
+    void pop() { ML_CHECK(!stack.empty()); stack.pop_back(); }
 
     const EvalValue *lookup(const string &key) const {
         for (auto it = stack.rbegin(); it != stack.rend(); ++it) {

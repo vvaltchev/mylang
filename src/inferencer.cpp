@@ -524,6 +524,15 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     fc->id = make_unique<Identifier>(
         "$tmpl" + std::to_string(tmpl_clone_counter++));
 
+    /* clone() ran every node's ctor, so the clone is a genuinely DISTINCT node
+     * from the template (a fresh node_id) - the property the whole monomorph-
+     * ization relies on. If these were equal, clone() failed to deep-copy and
+     * we would be re-resolving the template in place. (A var-bound lambda
+     * template has no decl->id - it is anonymous - so guard that.) */
+    ML_CHECK(fc->node_id != tmpl->decl->node_id);
+    ML_CHECK(!tmpl->decl->id ||
+             fc->id->node_id != tmpl->decl->id->node_id);
+
     /*
      * id_sym / func_of_decl are keyed by node POINTER and persist for the
      * session; clone() produces fresh nodes whose addresses can collide with
@@ -549,8 +558,11 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     }
 
     walk_struct(fc, global);            /* declare its name + build its syms */
-    if (FuncInfo *cfi = func_of_decl.count(fc) ? func_of_decl[fc] : nullptr)
-        cfi->is_template = false;         /* an instantiation is concrete */
+    FuncInfo *cfi = func_of_decl.count(fc) ? func_of_decl[fc] : nullptr;
+    /* walk_struct must have built the clone its OWN FuncInfo (not reused the
+     * template's, and not skipped on a stale func_of_decl entry). */
+    ML_CHECK(cfi && cfi != tmpl);
+    cfi->is_template = false;             /* an instantiation is concrete */
 
     FuncDeclStmt *raw = fc;
     rootBlock->elems.insert(rootBlock->elems.begin(), move(cl));
