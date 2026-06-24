@@ -81,6 +81,14 @@ struct FuncInfo {
     STyRef ret_acc = nullptr;    /* return accumulator (current round) */
     bool falls_through = false;
     bool pinned = false;         /* committed by a prior REPL input */
+    /*
+     * A TEMPLATE: at least one parameter is un-annotated and not explicitly
+     * `dyn`, so its type is not fixed by the declaration. Such a function is
+     * not type-checked in isolation; it is instantiated per call-site signature
+     * as a typed clone (see plans/function-templates.md). A `dyn` param is NOT a
+     * template parameter - it is the explicit "one instantiation, any type".
+     */
+    bool is_template = false;
 };
 
 struct Scope {
@@ -945,6 +953,13 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
     fi->ret_acc = bottom;
     fi->falls_through =
         fd->body && fd->body->is_block() && !always_exits(fd->body.get());
+    /* A template iff any param is un-annotated and not explicitly `dyn`. */
+    if (fd->params)
+        for (auto &p : fd->params->elems)
+            if (p->decl_type == DeclType::none && !p->dyn_mod) {
+                fi->is_template = true;
+                break;
+            }
     func_of_decl[fd] = fi;
 
     if (fd->id) {
