@@ -9,12 +9,14 @@
 #include "eval.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 #include <string>
 #include <functional>
 #include <algorithm>
 #include <ostream>
+#include <cstdio>
 
 /*
  * Whole-program static type inference + checking. See plans/type-inference.md
@@ -138,6 +140,11 @@ private:
      * same call signature shares one clone; a monotonic counter names them. */
     std::unordered_map<std::string, FuncDeclStmt *> tmpl_cache;
     int tmpl_clone_counter = 0;
+    /* Per-template instantiation count + a per-template "already warned" guard:
+     * past MAX_TMPL_INSTANCES distinct signatures, further calls run
+     * dynamically (no clone) - a backstop for runaway polymorphism (D4). */
+    std::unordered_map<FuncInfo *, int> tmpl_inst_count;
+    std::unordered_set<FuncInfo *> tmpl_cap_warned;
 
     /* Flow-sensitive null narrowing (check pass only): inside the proven branch
      * of `if (x != none)` / `if (x)`, x reads as non-opt. */
@@ -529,9 +536,27 @@ bool Inferencer::instantiate_round(Block *rootBlock)
 
         const std::string key = template_sig_key(tmpl, sig);
         auto it = tmpl_cache.find(key);
-        FuncDeclStmt *clone = (it != tmpl_cache.end())
-            ? it->second
-            : make_template_clone(tmpl, key, rootBlock);
+        FuncDeclStmt *clone;
+        if (it != tmpl_cache.end()) {
+            clone = it->second;
+        } else {
+            /* D4: a new signature past the cap runs dynamically, not as a clone
+             * - a backstop for pathological polymorphic recursion. */
+            static const int MAX_TMPL_INSTANCES = 64;
+            if (tmpl_inst_count[tmpl] >= MAX_TMPL_INSTANCES) {
+                if (tmpl_cap_warned.insert(tmpl).second && tmpl->decl->id) {
+                    auto nm = tmpl->decl->id->get_str();
+                    fprintf(stderr,
+                            "warning: template '%.*s' exceeded %d "
+                            "instantiations; further calls run dynamically\n",
+                            static_cast<int>(nm.size()), nm.data(),
+                            MAX_TMPL_INSTANCES);
+                }
+                continue;
+            }
+            clone = make_template_clone(tmpl, key, rootBlock);
+            tmpl_inst_count[tmpl]++;
+        }
         if (!clone)
             continue;
 
