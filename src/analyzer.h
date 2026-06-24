@@ -6,6 +6,8 @@
 #include <map>
 #include <vector>
 #include <utility>
+#include <string>
+#include <iosfwd>
 
 class Construct;
 
@@ -84,3 +86,12 @@ struct AnalysisInfo {
  * the renderer's point of view (the tree's source Locs are what is recorded).
  */
 void collect_array_analysis(Construct *root, AnalysisInfo &out);
+
+/*
+ * Render `src` (the source lines) to `o`, coloring each column by the
+ * optimization annotations in `info` (and dimming dead ranges) when `color` is
+ * set; otherwise reprint verbatim. Shared by the `-a` file driver and the
+ * REPL's `:analyze`. See mylang.cpp's `-a` description for the legend.
+ */
+void render_analysis(std::ostream &o, const std::vector<std::string> &src,
+                     const AnalysisInfo &info, bool color);

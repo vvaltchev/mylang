@@ -13,6 +13,7 @@
 #include "structtype.h"
 #include "inferencer.h"
 #include "resolver.h"
+#include "analyzer.h"
 
 #include <iostream>
 #include <fstream>
@@ -76,7 +77,21 @@ struct ReplEngine::Impl {
     string do_eval(const string &src, bool echo);
     string meta_command(const string &src);
     string cmd_tree(const string &code);
+    string cmd_analyze(const string &code);
     string cmd_source(const string &path);
+
+    /* lex `source` into stable per-line storage (the lexer holds string_views
+     * into the lines, so they must outlive the parse). */
+    static void lex_stable(const string &source,
+                           std::vector<string> &local_lines,
+                           std::vector<Tok> &toks) {
+        std::stringstream ss(source);
+        string line;
+        while (std::getline(ss, line))
+            local_lines.push_back(line);
+        for (size_t i = 0; i < local_lines.size(); i++)
+            lexer(local_lines[i], static_cast<int>(i + 1), toks);
+    }
 };
 
 ReplEngine::ReplEngine() : impl(new Impl) { }
@@ -338,12 +353,15 @@ ReplEngine::Impl::meta_command(const string &src)
 
     if (cmd == "tree" || cmd == "s")
         return cmd_tree(arg);
+    if (cmd == "analyze" || cmd == "a")
+        return cmd_analyze(arg);
     if (cmd == "source" || cmd == "load")
         return cmd_source(arg);
     if (cmd == "help" || cmd == "h") {
         return
             ":help            this message\n"
             ":tree <code>     show the parsed (const-folded) syntax tree\n"
+            ":analyze <code>  reprint code colored by optimizations that fired\n"
             ":source <file>   evaluate a file as if typed at the prompt\n"
             ":quit            exit the REPL\n";
     }
@@ -392,6 +410,52 @@ ReplEngine::Impl::cmd_tree(const string &code)
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
         std::ostringstream o;
         o << *root << "\n";
+        return o.str();
+    } catch (const Exception &ex) {
+        std::ostringstream o;
+        format_exception(o, ex, local_lines);
+        return o.str();
+    }
+}
+
+/*
+ * :analyze - the REPL's `-a`: parse `code` and reprint it colored by which
+ * compile-time optimizations fired (auto-const/pure, flat vs dyn array,
+ * inlined, specialized, folded, dead code). Non-committing like :tree (parsed
+ * against a pushed scope, never evaluated), and analyzed in repl_mode so the
+ * top-level mirrors how the REPL actually resolves.
+ */
+string
+ReplEngine::Impl::cmd_analyze(const string &code)
+{
+    if (code.empty())
+        return "usage: :analyze <code>\n";
+
+    string source = code;
+    const size_t e = source.find_last_not_of(" \t\r\n");
+    source.erase(e + 1);
+    if (!source.empty() && source.back() != ';')
+        source += ';';
+
+    std::vector<string> local_lines;
+    std::vector<Tok> toks;
+    lex_stable(source, local_lines, toks);
+
+    try {
+        AnalysisInfo info;
+        ParseContext pc(TokenStream(toks), true);
+        pc.const_ctx = const_ctx.get();
+        pc.analysis = &info;        /* record parse-time folds / dead code */
+        unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
+
+        collect_array_analysis(root.get(), info);
+        resolve_names(root.get(), /*inline=*/true, 24, &info, /*repl=*/true);
+        collect_resolver_analysis(root.get(), info);
+
+        const bool color =
+            isatty(STDOUT_FILENO) && !std::getenv("NO_COLOR");
+        std::ostringstream o;
+        render_analysis(o, local_lines, info, color);
         return o.str();
     } catch (const Exception &ex) {
         std::ostringstream o;

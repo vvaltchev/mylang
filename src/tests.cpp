@@ -7598,6 +7598,9 @@ static const std::vector<repl_test> repl_tests =
       { { ":help", ":source" },
         { ":bogus", "Unknown command" } } },
 
+    { ":analyze reprints the code (optimization view)",
+      { { ":analyze var a = [1, 2, 3]", "var a = [1, 2, 3]" } } },
+
     { "a multi-line func body needs no typed semicolons",
       { { "func g(a) {\n  var r = a + 1\n  return r\n}", "" },
         { "g(41)", "=> 42" } } },
