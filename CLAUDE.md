@@ -187,11 +187,12 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — eleven translation
-units:
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — fifteen
+translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
-`eval.cpp`, `types.cpp`, `stype.cpp`, `backtrace.cpp`, `mylang.cpp`,
-`tests.cpp`.
+`eval.cpp`, `types.cpp`, `stype.cpp`, `backtrace.cpp`, `errfmt.cpp`,
+`highlight.cpp`, `lineedit.cpp`, `repl.cpp`, `mylang.cpp`, `tests.cpp` (the last
+four are the REPL — see "The interactive REPL" below).
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
   turns thrown
@@ -1489,6 +1490,90 @@ and two macros:
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
   see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`
   cover the formatter (including synthetic inlined-frame reconstruction).
+
+## The interactive REPL
+
+`mylang` with no FILE/`-e` on a TTY (or `--repl` to force it off a TTY, for
+testing) runs the REPL (`run_repl`, launched from `mylang.cpp`). Full design +
+status: `plans/repl.md`. Four TUs, split so the logic is headless-testable
+behind a thin terminal shell:
+
+- **`repl.{h,cpp}` — `ReplEngine`**, the headless evaluation core. Holds the
+  persistent interpreter state: a persistent **const-eval `EvalContext`** + a
+  persistent **runtime global `EvalContext`** (both roots, so they auto-load
+  the builtins) + the **retained input ASTs** (`vector<unique_ptr<Construct>>`
+  — never freed, so a prior pure func / struct / kept const stays valid and
+  foldable for later inputs) + the ever-growing source `lines` (for error
+  carets). `eval_input(src)` parses against the persistent const ctx with
+  `pBlock(pc, 0, /*push_const_scope=*/false)` (so top-level consts/pure-funcs/
+  structs survive — the parser drops a const *scalar* decl, but its *value*
+  lives in the const ctx, which is what folding reads), then evaluates each
+  top-level statement **directly in the persistent runtime ctx** (no fresh
+  Block context/frame — that's why state persists and a redeclaration can
+  rebind), capturing `print` output (via a `cout` rdbuf swap) and echoing the
+  last non-`none` value as `=> ...`. Errors are caught per input and the loop
+  continues. The whole-program optimizers (`resolve_names`/inliner/`infer_types`
+  /`specialize_types`) are **not** run per input yet (see "deferred" below), so
+  top-level names are map-based globals.
+  - **Inputs auto-terminate** (`repl_auto_terminate`): you don't type `;` at a
+    prompt. Per physical line a `;` is appended unless the line is empty/
+    comment-only, ends inside an unclosed `(`/`[`, or ends on a continuation
+    token — and a `{` is classified as a statement **block** vs a dict
+    **literal** by whether the previous token expected a value, so a multi-line
+    func/if body gets interior `;` but a multi-line dict does not.
+  - **`EvalContext::allow_redeclare`** (set only on the REPL global scope) makes
+    a re-declaration rebind the global instead of throwing `AlreadyDefinedEx`
+    (the script rule is unchanged — the resolver still catches same-scope dups
+    at compile time). **`pBlock`'s `push_const_scope`** flag (default true) is
+    the const-ctx analogue. **Gotcha:** the lexer stores `string_view`s into the
+    source lines, so all lines of a multi-line input are appended to `lines`
+    *first*, then lexed from the stable buffers (growing-while-lexing dangles
+    earlier tokens — an ASan-caught UAF).
+  - **Meta-commands** (`eval_input` dispatches a leading `:`): `:tree <code>`
+    (parse + serialize, non-committing — parsed with `push_const_scope=true` so
+    prior consts fold but new decls land in the popped scope), `:source <file>`
+    (split into complete units via `is_incomplete` and replay each through
+    `do_eval(echo=false)`), `:help`, `:quit`.
+  - **`completions(buf, cursor)`** — Tab candidates: keywords + builtins + REPL
+    globals (`EvalContext::collect_symbols`), or a struct value/type's fields/
+    consts right after `base.`.
+- **`lineedit.{h,cpp}` — the hand-rolled line editor.** A **pure
+  `LineEditor`** core driven one byte at a time via `feed()` (edit buffer +
+  cursor, an escape-sequence decoder for arrows/Home/End/Delete, kill/word keys,
+  history nav, Tab completion via a `Completer` callback) — it emits no output
+  and touches no fd, so it is unit-tested with raw byte scripts. `render_line`
+  is a pure renderer (prompt + buffer, cursor positioned with ANSI; the
+  highlight is zero-width so columns are unaffected). `read_line` is the only
+  non-pure part: termios raw mode via an RAII guard that restores the terminal
+  on every exit path, byte-at-a-time read, repaint. Falls back to plain
+  `getline` off a TTY.
+- **`highlight.{h,cpp}`** — `highlight_line`, a self-contained scanner (NOT the
+  lexer; tolerates mid-edit input) that wraps keywords/strings/numbers/comments/
+  type-words in ANSI color, preserving the bytes exactly otherwise.
+- **`errfmt.{h,cpp}`** — `format_exception`/`dump_loc_in_error`, the
+  per-exception-type caret/backtrace rendering, factored out of `mylang.cpp`
+  (parameterized by an `ostream` + the source `lines`) so the file driver and
+  the REPL share it.
+
+`run_repl` (in `repl.cpp`) drives it: history loaded/saved to
+`~/.mylang_history`, colors gated on a TTY + `NO_COLOR`, multi-line accumulation
+via `is_incomplete` with auto-indent (`repl_bracket_depth`), Ctrl-C drops the
+current input, Ctrl-D mid-block abandons it.
+
+**Tests:** all headless. The **`repl:`** tests drive ONE `ReplEngine` through a
+sequence of `(input, expected-substring)` steps (so the persisted global scope
+is exercised); the **`lineedit:`** / **`highlight:`** `extra_checks` feed byte
+scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
+unit-tested.
+
+**Deferred (see `plans/repl.md` §3.1):** the **faithful incremental inference**
+— running the real `infer_types`/`resolve_names`/`specialize_types` per input
+with cross-input **type commitment** (a committed global's inferred type pinned
+like an annotation, so a later `x = <wrong type>` is the same `TypeMismatchEx`
+a script's `int x` would give). It can't be shortcut (re-inferring the whole
+accumulated program gives script join-semantics, not pinning), so it needs a
+persistent-`Inferencer` refactor; today the REPL evaluates correctly and
+persists state but does not type-check per input.
 
 ## Recipes
 
