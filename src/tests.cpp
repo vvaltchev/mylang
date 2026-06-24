@@ -7648,6 +7648,12 @@ static const std::vector<repl_test> repl_tests =
         { "undef(cu)", "" },                          /* now reset it */
         { "var cu = \"s\"", "=> s" },                 /* fresh type: ok */
         { "cu", "=> s" } } },
+
+    { "the real optimizers run per input (flat array storage)",
+      { { "var fa = [1, 2, 3]", "=> [1, 2, 3]" },
+        { "array_storage(fa)", "=> ints" },
+        { "var fb = [1.5, 2.5]", "" },
+        { "array_storage(fb)", "=> floats" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)

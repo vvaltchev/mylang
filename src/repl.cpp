@@ -12,6 +12,7 @@
 #include "highlight.h"
 #include "structtype.h"
 #include "inferencer.h"
+#include "resolver.h"
 
 #include <iostream>
 #include <fstream>
@@ -255,6 +256,14 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         retained.push_back(move(root));   /* keep the AST alive (id_sym refs) */
         return format_error(e);
     }
+
+    /* 2c. Run the real optimizers so the REPL is the true interpreter (and the
+     *     optimizations are inspectable). repl_mode keeps top-level decls as
+     *     persistent map globals (never slotted / auto-const-promoted), while
+     *     nested locals slot, inline, and specialize as in a script. */
+    resolve_names(root.get(), /*enable_inline=*/true, /*inline_threshold=*/24,
+                  /*analysis=*/nullptr, /*repl_mode=*/true);
+    specialize_types(root.get(), true);
 
     /* 3. Evaluate each top-level statement directly in the persistent global
      *    scope, capturing print() output and the last statement's value. */
