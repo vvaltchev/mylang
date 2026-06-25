@@ -19,7 +19,7 @@ const base = reverse(range(SZ));
 var N = 1500 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     s = (s + sum(sort(base)) + sum(sort(base))
            + sum(base + base) + sum(base + base)) % 1000000007;
 }

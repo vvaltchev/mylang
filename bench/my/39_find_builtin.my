@@ -10,7 +10,7 @@ var hay = "abcdefghi." * 1000;     # 10000 chars - matches "abcdefghi." * 1000
 var R = 1000 * scale;
 var s = 0;
 
-for (var k = 0; k < R; k += 1) {
+for (var k = 0; k < R; k++) {
     # find() returns an `opt int` (the index, or none if absent); narrow it
     # before use, exactly as you must in any null-correct language.
     var ai = find(a, SZ - 1);     # array find: scans to the last element

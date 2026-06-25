@@ -10,7 +10,7 @@ var sieve = array(N, true);     # array<bool>, flat "bools" storage
 sieve[0] = false;
 sieve[1] = false;
 
-for (var i = 2; i * i < N; i += 1) {
+for (var i = 2; i * i < N; i++) {
     if (sieve[i]) {
         for (var j = i * i; j < N; j += i)
             sieve[j] = false;
@@ -18,8 +18,8 @@ for (var i = 2; i * i < N; i += 1) {
 }
 
 var count = 0;
-for (var i = 2; i < N; i += 1)
+for (var i = 2; i < N; i++)
     if (sieve[i])
-        count += 1;
+        count++;
 
 print("result:", count);

@@ -13,7 +13,7 @@ var base = range(1000);   # [0..999] - matches Python's list(range(1000))
 var N = 100000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     var sl = base[0:1000];   # O(1) view ...
     sl[0] = i;               # ... but this write clones the 1000 elements
     s += sl[0];

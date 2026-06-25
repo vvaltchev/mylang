@@ -15,7 +15,7 @@ var base = range(1000);   # [0..999] - matches Python's list(range(1000))
 var N = 200000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     var sl = base[1:999];
     s += sl[0] + sl[len(sl) - 1];
     s = s % 1000000007;

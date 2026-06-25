@@ -10,7 +10,7 @@ var base = "0123456789" * 100;     # 1000-char string (matches Python's * 100)
 var N = 200000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     var sub = base[1:999];
     s += ord(sub[0]) + ord(sub[len(sub) - 1]);
     s = s % 1000000007;

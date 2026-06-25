@@ -8,7 +8,7 @@ if (len(argv) > 0)
 var N = 50000 * scale;
 var s = "";
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     s += str(i);
     s += ",";
 }

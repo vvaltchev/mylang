@@ -16,7 +16,7 @@ var DEBUG = 0;
 var N = 6000000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     if ((A * B + C) * (D + A) - B * C + (A - D) * (B + C) > 0 && DEBUG) {
         # dead: never executed, and eliminated at compile time
         s += i * i + 1;

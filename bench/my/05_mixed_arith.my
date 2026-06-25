@@ -7,7 +7,7 @@ if (len(argv) > 0)
 var N = 1000000 * scale;
 var x = 0.0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     x = x + i * 0.5;     # int * float -> float
     x = x - i;           # float - int -> float
     if (x > 1000000.0)

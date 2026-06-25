@@ -6,7 +6,7 @@ if (len(argv) > 0)
 var SZ = 1000000;
 var a = array(SZ, 0);
 var x = 42;
-for (var i = 0; i < SZ; i += 1) {
+for (var i = 0; i < SZ; i++) {
     x = (x * 1103515245 + 12345) % 2147483647;
     a[i] = x;
 }
@@ -14,7 +14,7 @@ for (var i = 0; i < SZ; i += 1) {
 var R = 5 * scale;
 var s = 0;
 
-for (var k = 0; k < R; k += 1)
+for (var k = 0; k < R; k++)
     s += min(a) + max(a);
 
 print("result:", s);

@@ -8,9 +8,9 @@ var SIZE = 200;
 var MAXIT = 80 * scale;
 var total = 0;
 
-for (var py = 0; py < SIZE; py += 1) {
+for (var py = 0; py < SIZE; py++) {
     var y0 = (py * 1.0 / SIZE) * 2.0 - 1.0;       # imaginary part: -1 .. 1
-    for (var px = 0; px < SIZE; px += 1) {
+    for (var px = 0; px < SIZE; px++) {
         var x0 = (px * 1.0 / SIZE) * 3.0 - 2.0;   # real part: -2 .. 1
         var zr = 0.0;
         var zi = 0.0;
@@ -19,7 +19,7 @@ for (var py = 0; py < SIZE; py += 1) {
             var nzr = zr * zr - zi * zi + x0;
             zi = 2.0 * zr * zi + y0;
             zr = nzr;
-            it += 1;
+            it++;
         }
         total += it;
     }

@@ -6,7 +6,7 @@ if (len(argv) > 0)
 var a = range(100000);   # [0..99999] - matches Python's list(range(100000))
 
 var R = 50 * scale;
-for (var k = 0; k < R; k += 1)
+for (var k = 0; k < R; k++)
     reverse(a);
 
 print("result:", a[0]);

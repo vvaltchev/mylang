@@ -16,7 +16,7 @@ var D = 3;
 var N = 3000000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     var k = (A * B + C) * (D + A) - B * C + A * B * C * D % 100 + (A - D) * (B + C);
     s += k + i;
     s = s % 1000000007;

@@ -11,7 +11,7 @@ func fib(n) {
 }
 
 var r = 0;
-for (var k = 0; k < scale; k += 1)
+for (var k = 0; k < scale; k++)
     r = fib(29);
 
 print("result:", r);

@@ -10,7 +10,7 @@ var d = {"alpha": 1, "beta": 2, "gamma": 3, "delta": 4};
 var N = 500000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     s += d.alpha + d.beta + d.gamma + d.delta;
     s = s % 1000000007;
 }

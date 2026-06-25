@@ -9,18 +9,18 @@ var words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"];
 var n = 200000 * scale;
 var sb = array(n);
 var x = 7;
-for (var i = 0; i < n; i += 1) {
+for (var i = 0; i < n; i++) {
     x = (x * 1103515245 + 12345) % 8;
     sb[i] = words[x];
 }
 var text = join(sb, " ");
 
-# a default dict: a missing key reads as 0, so `counts[w] += 1` just works
+# a default dict: a missing key reads as 0, so `counts[w]++` just works
 var counts = dict(0);
 var toks = split(text, " ");
 
 foreach (var w in toks)
-    counts[w] += 1;
+    counts[w]++;
 
 var total = 0;
 foreach (var k, v in counts)

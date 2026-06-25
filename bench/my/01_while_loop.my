@@ -9,7 +9,7 @@ var s = 0;
 
 while (i < N) {
     s += i;
-    i += 1;
+    i++;
 }
 
 print("result:", s);

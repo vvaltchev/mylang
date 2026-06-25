@@ -6,7 +6,7 @@ if (len(argv) > 0)
 var N = 3000000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1)
+for (var i = 0; i < N; i++)
     s += i;
 
 print("result:", s);

@@ -8,7 +8,7 @@ struct Point { int x; int y; }
 var N = 100000 * scale;
 var pts = [];
 
-for (var i = 0; i < N; i += 1)
+for (var i = 0; i < N; i++)
     append(pts, Point(i, i * 2));
 
 var sx = 0;

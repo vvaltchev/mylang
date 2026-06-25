@@ -26,7 +26,7 @@ const folded = heavy(data);
 var N = 1000000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     s += folded;
     s = s % 1000000007;
 }

@@ -8,12 +8,12 @@ var SZ = 200000;
 var R = 3 * scale;
 var checksum = 0;
 
-for (var k = 0; k < R; k += 1) {
+for (var k = 0; k < R; k++) {
 
     var a = array(SZ, 0);
     var x = 123456789;
 
-    for (var i = 0; i < SZ; i += 1) {
+    for (var i = 0; i < SZ; i++) {
         x = (x * 1103515245 + 12345) % 2147483647;
         a[i] = x;
     }

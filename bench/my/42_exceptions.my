@@ -6,7 +6,7 @@ if (len(argv) > 0)
 var N = 200000 * scale;
 var caught = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     try {
         if (i % 2 == 0) {
             throw ex("Even", i);
@@ -14,7 +14,7 @@ for (var i = 0; i < N; i += 1) {
             throw ex("Odd", i);
         }
     } catch (Even) {
-        caught += 1;
+        caught++;
     } catch (Odd) {
         caught += 2;
     }

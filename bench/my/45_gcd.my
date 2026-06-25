@@ -15,7 +15,7 @@ func gcd(a, b) {
 var N = 150000 * scale;
 var s = 0;
 
-for (var i = 1; i < N; i += 1) {
+for (var i = 1; i < N; i++) {
     s += gcd(i * 12345 % 999983, i * 54321 % 999983 + 1);
     s = s % 1000000007;
 }
