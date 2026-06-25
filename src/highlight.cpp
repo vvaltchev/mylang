@@ -39,7 +39,9 @@ bool is_type_word(const string &w)
 }
 
 bool id_start(unsigned char c) { return isalpha(c) || c == '_'; }
-bool id_char(unsigned char c)  { return isalnum(c) || c == '_'; }
+/* '$' is a valid identifier char (the compiler's `f$0` clone names - see the
+ * lexer), so a synthetic name highlights as one token. */
+bool id_char(unsigned char c)  { return isalnum(c) || c == '_' || c == '$'; }
 
 }  /* namespace */
 
@@ -64,6 +66,25 @@ highlight_line(const string &src)
             out += C_COM;
             while (i < n && src[i] != '\n')
                 out += src[i++];
+            out += RESET;
+            continue;
+        }
+
+        /* C-style block comment - real MyLang source has none (it uses #), but
+         * the :show decompiler annotates with them, so color them gray. */
+        if (c == '/' && i + 1 < n && src[i + 1] == '*') {
+            out += C_COM;
+            out += src[i++];                    /* '/' */
+            out += src[i++];                    /* '*' */
+            while (i < n &&
+                   !(src[i] == '*' && i + 1 < n && src[i + 1] == '/'))
+                out += src[i++];
+            if (i + 1 < n) {                    /* the closing '*'/ */
+                out += src[i++];
+                out += src[i++];
+            } else if (i < n) {
+                out += src[i++];
+            }
             out += RESET;
             continue;
         }

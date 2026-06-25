@@ -1704,9 +1704,15 @@ behind a thin terminal shell:
   an optional per-param inferred-type list: `:show` passes
   `ReplInfer::func_param_types` (the instance's `FuncInfo::params` types,
   empty for an un-instantiated template), so a template instance renders
-  `func dot$0(int x, int y)` while the base shows untyped `func dot(x, y)`; the
-  `show()` builtin (no persistent inferencer) renders AST-hint types only. See
-  `plans/repl-introspection.md`.
+  `int func dot$0(int x, int y)` (param **and** return types, via
+  `func_param_types`/`func_return_type`) while the base shows untyped
+  `func dot(x, y)`; the `show()` builtin (no persistent inferencer) renders
+  AST-hint types only. `show()` / `:show` also accept an **expression** (not a
+  function): `render_construct_code` renders its optimized tree
+  (`:show 2 + 3 * 4` → `14`; `:show <expr>` parses + `resolve_names`'s the arg
+  non-committing). `:show` output is **syntax-highlighted** via `highlight_line`
+  (extended to color C-style block comments and treat `$` as an id char — the
+  `f$0` names). See `plans/repl-introspection.md`.
 - **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
   category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/
   autopure/arrays/fold) in `g_trace_mask`, the hot guard `trace_enabled(c)`,

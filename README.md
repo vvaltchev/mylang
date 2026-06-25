@@ -2033,11 +2033,14 @@ runs: dead code removed, folded constants as literals (`func g() {
 print(f(1,2)); }` shows as `func g() { print(3); }` once `f` is inlined and
 folded), inlined call bodies spliced in and annotated, and a flat array's
 element type shown as `array<int>`. Best-effort and not round-trippable (an
-unhandled node renders as a comment placeholder). In the REPL, `:show <name>`
-prints this for a function **and** its `name$N` template-instance /
-specialization clones, with each clone's **inferred parameter types** made
-explicit (`func dot$0(int x, int y)`), so you can compare the generic template
-against each concrete, per-signature version.
+unhandled node renders as a comment placeholder). Passing **any other
+argument** treats it as an **expression** and renders its optimized tree —
+`show(2 + 3 * 4)` is `"14"`. In the REPL, `:show <name>` prints this for a
+function **and** its `name$N` template-instance / specialization clones, with
+each clone's **inferred parameter and return types** made explicit
+(`int func dot$0(int x, int y)`) and the whole thing **syntax-highlighted**, so
+you can compare the generic template against each concrete, per-signature
+version. `:show <expression>` works too.
 
 #### `specializations(f)`
 Return an `array<str>` of the synthetic global names (`name$N` template
