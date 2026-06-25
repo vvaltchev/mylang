@@ -15,18 +15,28 @@ struct CatName {
     const char *name;
     TraceCat cat;
     const char *color;     /* ANSI for the category tag */
+    const char *desc;      /* one-line description (for :trace help / :help) */
 };
 
-/* The user-facing category names + their tag colors. */
+/* The user-facing category names, tag colors, and descriptions - the single
+ * source of truth shared by `:trace help`, `:help :trace`, and `--trace`. */
 const CatName cat_names[] = {
-    { "infer",      TraceCat::infer,      "\x1b[36m" },   /* cyan */
-    { "inline",     TraceCat::inlining,   "\x1b[34m" },   /* blue */
-    { "specialize", TraceCat::specialize, "\x1b[35m" },   /* magenta */
-    { "template",   TraceCat::templ,      "\x1b[32m" },   /* green */
-    { "autoconst",  TraceCat::autoconst,  "\x1b[33m" },   /* yellow */
-    { "autopure",   TraceCat::autopure,   "\x1b[93m" },   /* bright yellow */
-    { "arrays",     TraceCat::arrays,     "\x1b[92m" },   /* bright green */
-    { "fold",       TraceCat::fold,       "\x1b[90m" },   /* gray */
+    { "infer",      TraceCat::infer,      "\x1b[36m",     /* cyan */
+      "type inference: how each type is inferred" },
+    { "inline",     TraceCat::inlining,   "\x1b[34m",     /* blue */
+      "calls spliced in place" },
+    { "specialize", TraceCat::specialize, "\x1b[35m",     /* magenta */
+      "const-arg calls redirected to a $specN clone" },
+    { "template",   TraceCat::templ,      "\x1b[32m",     /* green */
+      "a template monomorphized to $tmplN per signature" },
+    { "autoconst",  TraceCat::autoconst,  "\x1b[33m",     /* yellow */
+      "a write-once scalar var folded to a constant" },
+    { "autopure",   TraceCat::autopure,   "\x1b[93m",     /* bright yellow */
+      "a function proven effectively pure" },
+    { "arrays",     TraceCat::arrays,     "\x1b[92m",     /* bright green */
+      "flat (unboxed) vs general array storage" },
+    { "fold",       TraceCat::fold,       "\x1b[90m",     /* gray */
+      "const expressions / calls folded to literals" },
 };
 
 const CatName *lookup(TraceCat c)
@@ -105,13 +115,26 @@ trace_active()
     return out;
 }
 
-std::vector<std::string>
-trace_categories()
+std::string
+trace_categories_help(const std::string &indent)
 {
-    std::vector<std::string> out;
+    size_t w = 3;                        /* "all" */
     for (const CatName &cn : cat_names)
-        out.push_back(cn.name);
-    return out;                          /* declaration order */
+        w = std::max(w, std::strlen(cn.name));
+
+    std::string s;
+    auto line = [&](const char *name, const char *desc) {
+        s += indent + "- " + name;
+        for (size_t i = std::strlen(name); i < w; i++)
+            s += ' ';
+        s += "  ";
+        s += desc;
+        s += "\n";
+    };
+    for (const CatName &cn : cat_names)
+        line(cn.name, cn.desc);
+    line("all", "every category at once");
+    return s;
 }
 
 std::string

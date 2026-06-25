@@ -7814,8 +7814,8 @@ static const std::vector<repl_test> repl_tests =
       { { ":trace bogus on", "Unknown trace category" },
         { ":trace off", "tracing: off" } } },
 
-    { "trace: :trace help lists the categories",
-      { { ":trace help", "autopure" } } },
+    { "trace: :trace help lists the categories as a bullet list",
+      { { ":trace help", "- autopure " } } },
 
     { "help: :help :trace and :help trace both reach the tracer",
       { { ":help :trace", "[REPL command]" },
@@ -8292,8 +8292,12 @@ static bool replhelp_commands()
      * pointer to the command (the user's ":help trace" case) */
     if (!help_has("trace", "trace(category, on)"))   return false;
     if (!help_has("trace", "also a REPL command"))   return false;
-    /* and the trace builtin lists the categories (the original complaint) */
-    if (!help_has("trace", "autopure"))              return false;
+    /* and the trace entries list the categories as a bullet list (one per
+     * line) - the original complaint */
+    if (!help_has("trace", "categories:"))           return false;
+    if (!help_has("trace", "- infer "))              return false;
+    if (!help_has("trace", "- autopure "))           return false;
+    if (!help_has(":trace", "- all "))               return false;
     return true;
 }
 
