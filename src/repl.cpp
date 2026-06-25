@@ -322,7 +322,8 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *     persistent map globals (never slotted / auto-const-promoted), while
      *     nested locals slot, inline, and specialize as in a script. */
     resolve_names(root.get(), /*enable_inline=*/true, /*inline_threshold=*/24,
-                  /*analysis=*/nullptr, /*repl_mode=*/true);
+                  /*analysis=*/nullptr, /*repl_mode=*/true,
+                  /*prior_pure=*/runtime_ctx.get());
     specialize_types(root.get(), true);
 
     /* 3. Evaluate each top-level statement directly in the persistent global

@@ -29,11 +29,20 @@ struct AnalysisInfo;
  * auto-const-promote it (unsound in the REPL's open world, where a later input
  * may reassign it). Nested function locals still slot normally.
  */
+/*
+ * `prior_pure` (REPL only): a scope holding earlier inputs' globals. Its
+ * effectively-pure FUNCTIONS seed both the auto-pure recognition and the
+ * const-fold context, so a call to a pure function from a prior input folds
+ * across inputs (e.g. `func f2() => f(1,2)`). Only pure functions are used, so
+ * folding stays sound.
+ */
+class EvalContext;
 void resolve_names(Construct *root,
                    bool enable_inline = true,
                    int inline_threshold = 24,
                    AnalysisInfo *analysis = nullptr,
-                   bool repl_mode = false);
+                   bool repl_mode = false,
+                   EvalContext *prior_pure = nullptr);
 
 /*
  * -a/--analyze: after resolve_names has run, record the resolver-decided
