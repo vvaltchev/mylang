@@ -107,6 +107,10 @@ struct ReplEngine::Impl {
     string cmd_type(const string &code);
     string cmd_show(const string &arg);
 
+    /* GC a redefined function's now-orphaned template/spec instances */
+    void gc_redefined_instances(Block *blk,
+                                const std::vector<const UniqueId *> &before);
+
     /* lex `source` into stable per-line storage (the lexer holds string_views
      * into the lines, so they must outlive the parse). */
     static void lex_stable(const string &source,
@@ -360,6 +364,11 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         for (const UniqueId *n : removed)
             infer.undef_global(n);
     }
+
+    /* Drop any template/spec instances orphaned by a redefinition in this
+     * input (e.g. f$0 from a throwaway `f(1,2)` after `func f` is redefined),
+     * unless another function still consumes them. */
+    gc_redefined_instances(blk, names_before);
 
     /* 4. The `=> value` echo (RValue collapses an lvalue result). A `none`
      *    result - a func/struct decl, a `print`, an `if`/loop, a void call -
@@ -843,6 +852,57 @@ ReplEngine::Impl::cmd_show(const string &arg)
         std::ostringstream o;
         format_exception(o, ex, local_lines);
         return o.str();
+    }
+}
+
+void
+ReplEngine::Impl::gc_redefined_instances(
+    Block *blk, const std::vector<const UniqueId *> &before_vec)
+{
+    if (!blk)
+        return;
+
+    const std::set<const UniqueId *> before(before_vec.begin(),
+                                            before_vec.end());
+
+    /* function names this input REDEFINED: a top-level user FuncDeclStmt
+     * (display_name empty - not an inserted clone) whose name already existed.
+     */
+    std::set<string> redefined;
+    for (const auto &e : blk->elems)
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get()))
+            if (fd->id && fd->display_name.empty() &&
+                before.count(fd->id->uid))
+                redefined.insert(string(fd->id->get_str()));
+    if (redefined.empty())
+        return;
+
+    /* OLD instance globals (present before this input) whose base was redefined
+     * and which have no live function consumer -> remove from both scopes and
+     * the inferencer. (New instances created this input aren't in `before`.) */
+    std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+    runtime_ctx->collect_symbols(syms);
+
+    std::vector<const UniqueId *> to_remove;
+    for (const auto &kv : syms) {
+        if (!before.count(kv.first))
+            continue;
+        const EvalValue &v = kv.second->get();
+        if (!v.is<shared_ptr<FuncObject>>())
+            continue;
+        const FuncDeclStmt *fd = v.get<shared_ptr<FuncObject>>()->func;
+        if (fd->display_name.empty() || !redefined.count(fd->display_name))
+            continue;                       /* not a redefined func's clone */
+        if (infer.instance_has_consumer(fd))
+            continue;                       /* still used by a function */
+        to_remove.push_back(kv.first);
+    }
+
+    for (const UniqueId *n : to_remove) {
+        Identifier id(n->val);
+        runtime_ctx->erase(&id);
+        const_ctx->erase(&id);
+        infer.undef_global(n);
     }
 }
 

@@ -7851,6 +7851,23 @@ static const std::vector<repl_test> repl_tests =
         { "af(4)", "" },
         { "ag", "[1, 2, 3, 4]" } } },
 
+    /* redefining a function GCs its now-orphaned instances (created by a
+     * throwaway top-level call), but keeps any a function still consumes. */
+    { "template: redefining a function drops its orphaned instances",
+      { { "func rf(x, y) => x + y", "" },
+        { "rf(1, 2)", "=> 3" },
+        { "specializations(rf)", "[rf$0]" },
+        { "func rf(x, y) => x * y", "" },          /* redefine */
+        { "specializations(rf)", "[]" } } },       /* orphan dropped */
+
+    { "template: a consumed instance survives a redefinition",
+      { { "func cf(x, y) => x + y", "" },
+        { "cf(1, 2)", "=> 3" },
+        { "func cg() { return cf(1, 2); }", "" },  /* cg consumes cf$0 */
+        { "func cf(x, y) => x * y", "" },          /* redefine cf */
+        { "specializations(cf)", "[cf$0]" },       /* kept */
+        { "cg()", "=> 3" } } },                     /* still callable */
+
     { "trace: an uninstantiated template is reported as a template, not dyn",
       { { ":trace infer on", "tracing: infer" },
         { "func tt(a, b) { var u = a + b; return u; }",
