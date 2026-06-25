@@ -55,6 +55,11 @@ if (ASSERTS)
       target_compile_options(mylang PUBLIC /UNDEBUG)
    else()
       target_compile_options(mylang PUBLIC -UNDEBUG)
+      # libstdc++ container hardening: bounds-checks vector::operator[], string
+      # ops, etc. that ASan only partially catches. ABI-safe (unlike
+      # _GLIBCXX_DEBUG) and a no-op on libc++. Tied to ASSERTS so ASSERTS=0
+      # removes it too (clean perf baseline).
+      target_compile_definitions(mylang PUBLIC "_GLIBCXX_ASSERTIONS")
    endif()
 else()
    target_compile_definitions(mylang PUBLIC "NDEBUG")
@@ -96,8 +101,12 @@ if (NOT MSVC)
       list(APPEND SAN_OPTS -fsanitize=address)
    endif()
    if (UBSAN)
+      # -fno-sanitize-recover makes a UBSan finding ABORT (non-zero exit) rather
+      # than diagnose-and-continue - otherwise `mylang -rt` could hit UB, print
+      # it, and still exit 0, so CI would pass on a real bug.
       list(APPEND SAN_OPTS -fsanitize=undefined
-                           -fno-sanitize=signed-integer-overflow)
+                           -fno-sanitize=signed-integer-overflow
+                           -fno-sanitize-recover=undefined)
    endif()
    if (SAN_OPTS)
       list(APPEND SAN_OPTS -fno-omit-frame-pointer)

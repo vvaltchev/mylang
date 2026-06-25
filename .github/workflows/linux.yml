@@ -35,3 +35,29 @@ jobs:
       working-directory: ${{github.workspace}}/build
       shell: bash
       run:  ./mylang -rt
+
+  # Adversarial allocator lane: forces AST-node address reuse (RECYCLE=ON) so
+  # "pointer used as a stable identity" bugs surface deterministically under
+  # -rt. Debug build, so it also runs the full sanitizer + assertion net.
+  recycle:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Create Build Environment
+      run: cmake -E make_directory ${{github.workspace}}/build
+
+    - name: Configure CMake (RECYCLE)
+      shell: bash
+      working-directory: ${{github.workspace}}/build
+      run: cmake -DTESTS=1 -DRECYCLE=ON -DCMAKE_BUILD_TYPE=Debug $GITHUB_WORKSPACE
+
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: cmake --build .
+
+    - name: Test
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run:  ./mylang -rt
