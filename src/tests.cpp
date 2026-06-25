@@ -21,6 +21,7 @@
 #include "lineedit.h"
 #include "highlight.h"
 #include "replhelp.h"
+#include "trace.h"
 
 #include <typeinfo>
 #include <vector>
@@ -6499,6 +6500,16 @@ static const std::vector<test> tests =
       { "func f(int a) => a + 1; assert(len(specializations(f)) == 0);" } },
     { "reflect: specializations rejects a non-function",
       { "specializations(42);" }, &typeid(TypeErrorEx) },
+
+    /* ---- diagnostic tracing builtins (trace.h) ---- */
+    { "trace: tracing() is empty by default",
+      { "assert(len(tracing()) == 0);" } },
+    { "trace: unknown category throws",
+      { "trace(\"bogus\", true);" }, &typeid(InvalidValueEx) },
+    { "trace: trace() bad arity",
+      { "trace(\"infer\");" }, &typeid(InvalidNumberOfArgsEx) },
+    { "trace: traceoff() takes no args",
+      { "traceoff(1);" }, &typeid(InvalidNumberOfArgsEx) },
 };
 
 static void
@@ -7792,6 +7803,16 @@ static const std::vector<repl_test> repl_tests =
       { { "func tf(a) => a + 1", "" },
         { "tf(3)", "=> 4" },
         { "specializations(tf)", "$tmpl" } } },
+
+    /* ---- diagnostic tracing narrates the compiler's reasoning ---- */
+    { "trace: :trace infer narrates inference into the REPL output",
+      { { ":trace infer on", "tracing: infer" },
+        { "var tx = 5", "tx : int" },
+        { ":trace off", "tracing: off" } } },
+
+    { "trace: an unknown :trace category is reported",
+      { { ":trace bogus on", "Unknown trace category" },
+        { ":trace off", "tracing: off" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)
@@ -8149,6 +8170,39 @@ static bool replhelp_language_reference()
     return true;
 }
 
+static bool trace_module_basics()
+{
+    /* save + restore the global trace state so the suite stays clean */
+    const unsigned saved_mask = g_trace_mask;
+    std::ostream *saved_sink = trace_sink();
+
+    g_trace_mask = 0;
+    std::ostringstream cap;
+    trace_set_sink(&cap);
+
+    bool ok = true;
+    ok = ok && trace_set("infer", true);
+    ok = ok && trace_enabled(TraceCat::infer);
+    ok = ok && !trace_enabled(TraceCat::inlining);
+    ok = ok && !trace_set("nope", true);          /* unknown -> false */
+
+    trace_emit(TraceCat::infer, 1, "hello world");
+    const std::string s = cap.str();
+    ok = ok && s.find("infer") != std::string::npos;
+    ok = ok && s.find("hello world") != std::string::npos;
+
+    trace_set("all", true);
+    ok = ok && trace_active().size() == 8;
+    ok = ok && trace_state_str().find("infer") != std::string::npos;
+    trace_clear_all();
+    ok = ok && trace_active().empty();
+    ok = ok && trace_state_str() == "tracing: off";
+
+    trace_set_sink(saved_sink);
+    g_trace_mask = saved_mask;
+    return ok;
+}
+
 static bool replhelp_unknown_and_topics()
 {
     if (!help_has("no_such_thing", "No help for"))   return false;
@@ -8171,6 +8225,7 @@ static const std::vector<extra_check> extra_checks =
     { "replhelp: builtin entries + kind note", replhelp_builtin_entries },
     { "replhelp: language reference", replhelp_language_reference },
     { "replhelp: unknown topic + completion", replhelp_unknown_and_topics },
+    { "trace: module set/emit/active basics", trace_module_basics },
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },
     { "repl: completion (struct members)", repl_completion_struct_members },

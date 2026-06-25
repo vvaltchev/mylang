@@ -15,6 +15,7 @@
 #include "resolver.h"
 #include "analyzer.h"
 #include "replhelp.h"
+#include "trace.h"
 
 #include <iostream>
 #include <fstream>
@@ -98,6 +99,7 @@ struct ReplEngine::Impl {
     string cmd_tree(const string &code);
     string cmd_analyze(const string &code);
     string cmd_source(const string &path);
+    string cmd_trace(const string &arg);
 
     /* lex `source` into stable per-line storage (the lexer holds string_views
      * into the lines, so they must outlive the parse). */
@@ -245,6 +247,18 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         return "";                           /* blank input */
     const string source = repl_auto_terminate(src);
 
+    /* Point the diagnostic-trace sink at this input's capture stream for the
+     * whole pipeline (inference/resolve/specialize run before the cout swap),
+     * so an enabled :trace narrates into the REPL output, just above the
+     * result. Restored on every return path. */
+    struct TraceSinkGuard {
+        std::ostream *prev;
+        explicit TraceSinkGuard(std::ostream *os) : prev(trace_sink()) {
+            trace_set_sink(os);
+        }
+        ~TraceSinkGuard() { trace_set_sink(prev); }
+    } trace_guard(&out);
+
     /* 1. Append all physical lines to the persistent source FIRST (so the
      *    vector finishes any reallocation), THEN lex from the now-stable
      *    buffers - the lexer stores string_views into them, so lexing while
@@ -288,7 +302,9 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         infer.check_input(root.get());
     } catch (const Exception &e) {
         retained.push_back(move(root));   /* keep the AST alive (id_sym refs) */
-        return format_error(e);
+        /* keep any trace lines emitted before the error (the reasoning that
+         * led up to it), then the error itself. */
+        return out.str() + format_error(e);
     }
 
     /* 2c. Run the real optimizers so the REPL is the true interpreter (and the
@@ -380,6 +396,8 @@ ReplEngine::Impl::meta_command(const string &src)
         const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
         return repl_help(arg, color);
     }
+    if (cmd == "trace")
+        return cmd_trace(arg);
     if (cmd == "quit" || cmd == "q")
         return "";              /* the loop handles the actual exit */
 
@@ -513,6 +531,53 @@ ReplEngine::Impl::cmd_source(const string &path)
         out << do_eval(unit, /*echo=*/false);
 
     return out.str();
+}
+
+/*
+ * :trace - toggle the diagnostic trace categories (see trace.h).
+ *   :trace                       show the active categories
+ *   :trace off | :trace none     disable all
+ *   :trace <cat> [<cat>...]       enable those categories
+ *   :trace <cat> [<cat>...] on|off  enable/disable those categories
+ * A category narrates the compiler's reasoning (inference/inlining/...) just
+ * before the next input runs.
+ */
+string
+ReplEngine::Impl::cmd_trace(const string &arg)
+{
+    std::vector<string> toks;
+    {
+        std::stringstream ss(arg);
+        string w;
+        while (ss >> w)
+            toks.push_back(w);
+    }
+
+    if (toks.empty())
+        return trace_state_str() + "\n";
+
+    if (toks.size() == 1 && (toks[0] == "off" || toks[0] == "none")) {
+        trace_clear_all();
+        return trace_state_str() + "\n";
+    }
+
+    /* a trailing on/off sets the direction; otherwise the categories go on */
+    bool on = true;
+    if (toks.back() == "on" || toks.back() == "off") {
+        on = (toks.back() == "on");
+        toks.pop_back();
+    }
+
+    string unknown;
+    for (const string &c : toks)
+        if (!trace_set(c, on))
+            unknown += (unknown.empty() ? "" : ", ") + c;
+
+    string out = trace_state_str() + "\n";
+    if (!unknown.empty())
+        out = "Unknown trace category: " + unknown +
+              " (try :help optimizations)\n" + out;
+    return out;
 }
 
 /* Net unclosed (){}/[] depth of `src` (>=0), lexer-based so strings/comments
@@ -700,6 +765,7 @@ run_repl()
     /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
     const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
     set_highlight_enabled(color);
+    trace_set_color(color);
     auto *hl = color ? highlight_line : nullptr;
 
     LineEditor::Completer completer =
