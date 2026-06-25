@@ -6402,6 +6402,15 @@ static const std::vector<test> tests =
       { "func g(a){ return a; } g(1, 2);" }, &typeid(WrongArgCountEx) },
     { "template: a per-instantiation type error is caught",
       { "func g(a){ return a * a; } g(\"x\");" }, &typeid(TypeMismatchEx) },
+    { "template: a non-opt param is generic alongside an opt param",
+      { "func f(a, opt b){ if (b == none) return a; return a + b; }",
+        "assert(f(1) == 1); assert(f(10, 5) == 15); assert(f(\"x\") == \"x\");" } },
+    { "template: the non-opt param can take different types (no conflict)",
+      { "func g(a, opt tag){ return a; }",
+        "assert(g(1) == 1); assert(g(\"s\") == \"s\"); assert(g(2.5) == 2.5);" } },
+    { "template: a function with only an opt param stays join (narrows)",
+      { "func f(opt x){ if (x != none) return x + 1; return 0; }",
+        "assert(f(5) == 6); assert(f(none) == 0);" } },
 
     /* ---- mandatory `dyn`: a plain var/const must infer a concrete type -- */
     { "ti: mandatory dyn - a plain var inferred dyn is rejected",
