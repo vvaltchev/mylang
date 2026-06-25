@@ -376,7 +376,11 @@ lexer(string_view in_str, int line, std::vector<Tok> &result)
 
             if (!exp_sign && (isspace(c) || (is_op && (!in_integer || c != '.'))))
                 ctx.handle_space_or_op();
-            else if (exp_sign || isalnum(c) || c == '_' || c == '.')
+            else if (exp_sign || isalnum(c) || c == '_' || c == '.' || c == '$')
+                /* '$' is a valid identifier char (not at the start of a
+                 * number): the compiler names its synthetic clones `<name>$N`
+                 * (template instances) / `<name>$sN` (specializations), so a
+                 * user can reference and inspect them, e.g. typeof(f$0). */
                 ctx.handle_alphanum();
             else
                 ctx.handle_other();

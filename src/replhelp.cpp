@@ -104,7 +104,7 @@ const BuiltinDoc builtin_docs[] = {
   "A struct's in-memory layout: POD field offsets + total size/align, or the "
   "boxed slot list.", nullptr },
 { "specializations", "reflect", "specializations(f)",
-  "The $specN / $tmplN specialization & template-instantiation clones derived "
+  "The <name>$N / <name>$sN template-instance & specialization clones derived "
   "from f.", nullptr },
 { "array_storage", "reflect", "array_storage(a)",
   "The array's storage kind: \"ints\"/\"floats\"/\"bools\"/\"structs\"/"
@@ -574,7 +574,7 @@ const LangFeature lang_features[] = {
   "func f(x) { var t = x + 1; return t; }    f(1); f(\"s\");",
   "A named function with an un-annotated, non-dyn, non-opt parameter is a "
   "TEMPLATE: it is not checked in isolation but instantiated per call-site "
-  "signature as a typed clone ($tmplN). So f(1) and f(\"s\") make two "
+  "signature as a typed clone (f$0, f$1, ...). So f(1) and f(\"s\") make two "
   "instances, not a type conflict. `dyn` is the explicit one-instance-any-type "
   "parameter. See :trace template / specializations()." },
 
@@ -604,15 +604,15 @@ const LangFeature lang_features[] = {
   "be under a node threshold (-it, default 24). Backtraces are preserved via "
   "inlined-at frames. :trace inline shows each decision." },
 { "specialization", "optimizations", "Specialization",
-  "func g(n) { ...big... }    g(3)  ->  $spec0  (n bound to 3, folded)",
+  "func g(n) { ...big... }    g(3)  ->  g$s0  (n bound to 3, folded)",
   "A const argument is propagated into a (possibly non-pure) function and "
-  "folded; if that shrinks the body enough, a shared clone $specN is emitted "
+  "folded; if that shrinks the body enough, a shared clone <name>$sN is made "
   "and the call redirected (a scalar OR a deep read-only array/dict arg can "
   "seed one). The half whole-call folding misses. :trace specialize." },
 { "templinst", "optimizations", "Template instantiation",
-  "f(1); f(2.5)  ->  $tmpl0 (int), $tmpl1 (float)",
+  "f(1); f(2.5)  ->  f$0 (int), f$1 (float)",
   "A template (see :help templates) is cloned per distinct call-site signature "
-  "as a concrete, typed instance $tmplN; calls of the same signature share one "
+  "as a concrete, typed instance <name>$N; same-signature calls share one "
   "clone. Past 64 instances a template's further calls run dynamically. "
   ":trace template / specializations() list them." },
 { "m8scalar", "optimizations", "Typed scalar specialization (M8)",

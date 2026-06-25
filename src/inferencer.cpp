@@ -172,7 +172,10 @@ private:
      * `template_sig_key` is stable too (the template's arena-stable FuncInfo
      * pointer + the signature's type strings). */
     std::unordered_map<std::string, const UniqueId *> tmpl_cache;
-    int tmpl_clone_counter = 0;
+    int tmpl_clone_counter = 0;       /* lambda-template fallback names */
+    /* per-base-name monotonic counter for instance names `<base>$<n>` (kept for
+     * the whole session so a re-declared template can't reuse a prior name) */
+    std::unordered_map<const UniqueId *, int> clone_name_counter;
     /* Per-template instantiation count + a per-template "already warned" guard:
      * past MAX_TMPL_INSTANCES distinct signatures, further calls run
      * dynamically (no clone) - a backstop for runaway polymorphism (D4). */
@@ -548,8 +551,17 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     auto *fc = static_cast<FuncDeclStmt *>(cl.get());
     fc->display_name = tmpl->decl->id
         ? std::string(tmpl->decl->id->get_str()) : std::string("<lambda>");
-    fc->id = make_unique<Identifier>(
-        "$tmpl" + std::to_string(tmpl_clone_counter++));
+    /* Name the instance `<base>$<n>` so it is readable and INSPECTABLE
+     * (typeof(f$0), :show f$0). The counter is per base NAME and monotonic for
+     * the session (clone_name_counter, never reset), so a re-declared template
+     * cannot reuse a prior instance's name. display_name keeps the original
+     * for backtraces. A lambda template (no id) uses a `lambda$N` fallback. */
+    const std::string base = tmpl->decl->id
+        ? std::string(tmpl->decl->id->get_str()) : std::string("lambda");
+    const int n = tmpl->decl->id
+        ? clone_name_counter[tmpl->decl->id->uid]++
+        : tmpl_clone_counter++;
+    fc->id = make_unique<Identifier>(base + "$" + std::to_string(n));
 
     /* clone() ran every node's ctor, so the clone is a genuinely DISTINCT node
      * from the template (a fresh node_id) - the property the whole monomorph-

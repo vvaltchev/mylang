@@ -7194,12 +7194,12 @@ inliner_specializes_array_const_arg()
     const std::string s_off = serialize_tree(off.get());
 
     bool ok = true;
-    ok = ok && s_on.find("$spec0") != std::string::npos;   /* specialized */
-    ok = ok && s_on.find("$spec1") != std::string::npos;   /* both funcs */
+    ok = ok && s_on.find("$s0") != std::string::npos;   /* specialized */
+    ok = ok && s_on.find("$s1") != std::string::npos;   /* both funcs */
     ok = ok && s_on.find("Int(60)") != std::string::npos;  /* a[..] folded */
     ok = ok && s_on.find("Int(300)") != std::string::npos; /* m[..] folded */
     /* off never folds these: no specialization without inlining. */
-    ok = ok && s_off.find("$spec0") == std::string::npos;
+    ok = ok && s_off.find("$s0") == std::string::npos;
     ok = ok && s_off.find("Int(60)") == std::string::npos;
 
     try { on->eval(nullptr); } catch (const Exception &) { ok = false; }
@@ -7235,8 +7235,8 @@ inliner_specializes_block_func()
     const std::string s = serialize_tree(root.get());
 
     bool ok = true;
-    ok = ok && s.find("$spec0") != std::string::npos;    /* specialized */
-    ok = ok && s.find("$spec1") == std::string::npos;    /* deduped to one */
+    ok = ok && s.find("$s0") != std::string::npos;    /* specialized */
+    ok = ok && s.find("$s1") == std::string::npos;    /* deduped to one */
 
     try { root->eval(nullptr); } catch (const Exception &) { ok = false; }
 
@@ -7278,7 +7278,7 @@ inliner_spec_backtrace_identical()
     ok = ok && !bt_on.empty();
     ok = ok && bt_on == bt_off;                              /* identical */
     ok = ok && bt_on.find("[0] f(mode, x)") != std::string::npos;
-    ok = ok && bt_on.find("$spec") == std::string::npos;    /* no synthetic */
+    ok = ok && bt_on.find("$") == std::string::npos;    /* no synthetic name */
 
     if (!ok) cout << "  bt_on:\n" << bt_on << "\n  bt_off:\n" << bt_off;
     return ok;
@@ -7802,21 +7802,26 @@ static const std::vector<repl_test> repl_tests =
     { "reflect: specializations() surfaces a template instance",
       { { "func tf(a) => a + 1", "" },
         { "tf(3)", "=> 4" },
-        { "specializations(tf)", "$tmpl" } } },
+        { "specializations(tf)", "tf$0" } } },
 
     /* ---- cross-input template instantiation: reuse, not duplicate ---- */
     { "template: the same signature across inputs reuses one instance",
       { { "func tr(x, y) { var s = x + y; return s + 1; }", "" },
         { "tr(2, 3)", "=> 6" },
-        { "specializations(tr)", "[$tmpl0]" },
+        { "specializations(tr)", "[tr$0]" },
         { "tr(10, 20)", "=> 31" },            /* same (int,int): reuse */
-        { "specializations(tr)", "[$tmpl0]" } } },   /* STILL one instance */
+        { "specializations(tr)", "[tr$0]" } } },   /* STILL one instance */
 
     { "template: a distinct signature across inputs makes a new instance",
       { { "func tq(x, y) { var s = x + y; return s; }", "" },
         { "tq(1, 2)", "=> 3" },
         { "tq(1.0, 2.0)", "=> 3.0" },
-        { "specializations(tq)", "[$tmpl0, $tmpl1]" } } },
+        { "specializations(tq)", "[tq$0, tq$1]" } } },
+
+    { "template: an instance is inspectable by its name (typeof f$0)",
+      { { "func ti(x, y) => x + y", "" },
+        { "ti(2, 3)", "=> 5" },
+        { "typeof(ti$0)", "func ti(" } } },
 
     { "trace: an uninstantiated template is reported as a template, not dyn",
       { { ":trace infer on", "tracing: infer" },
@@ -8209,7 +8214,7 @@ static bool replhelp_language_reference()
     if (!help_has("optimizations", "[inlining]"))    return false;
     /* an individual feature: syntax + body, incl. an optimization */
     if (!help_has("inlining", "spliced in place"))   return false;
-    if (!help_has("templates", "$tmplN"))            return false;
+    if (!help_has("templates", "$0"))                return false;
     if (!help_has("foreachloop", "indexed"))         return false;
     if (!help_has("namedargs", "IDENTICALLY"))       return false;
     return true;
@@ -8251,10 +8256,10 @@ static bool trace_module_basics()
 /*
  * Drive the real compile pipeline with every trace category on and a captured
  * sink, asserting each category narrates at least one decision. The program is
- * crafted to exercise all of them: a template (compute/helper -> $tmplN), a
+ * crafted to exercise all of them: a template (compute/helper -> <name>$N), a
  * flat array (arrays), an auto-pure func (helper), a write-once local
  * (autoconst k/t), an inlined call (helper spliced), constant folds, and a
- * const-arg specialization ($tmpl0 -> $spec0).
+ * const-arg specialization (compute$0 -> compute$0$s0).
  */
 static bool trace_pipeline_categories()
 {
