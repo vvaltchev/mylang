@@ -543,9 +543,11 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
 #if TMPL_INSTR
     {
         auto its = id_sym.find(fc->id.get());
-        fprintf(stderr, "ZZ MAKE-done fc=%p cfi=%p id_sym[idnode]=%p "
+        fprintf(stderr, "ZZ MAKE-done fc=%p cfi=%p p0ptr=%p id_sym[idnode]=%p "
                 "(==cfi's sym? func=%p) global[uid]=%p\n", (void *)fc,
-                (void *)cfi, (void *)(its != id_sym.end() ? its->second : 0),
+                (void *)cfi,
+                (void *)(cfi && !cfi->params.empty() ? cfi->params[0] : 0),
+                (void *)(its != id_sym.end() ? its->second : 0),
                 (void *)(its != id_sym.end() && its->second
                          ? its->second->func : 0),
                 (void *)(global->syms.count(fc->id->uid)
@@ -2930,6 +2932,26 @@ void Inferencer::check_call(CallExpr *call)
         fparams = &fi->params;
         callable_known = true;
         template_call = fi->is_template;
+#if TMPL_INSTR
+        if (auto *wid = dynamic_cast<Identifier *>(call->what.get())) {
+            auto ws = wid->get_str();
+            if (ws.size() >= 5 && ws.compare(0, 5, "$tmpl") == 0) {
+                auto isr = id_sym.find(wid);
+                fprintf(stderr,
+                    "ZZ CHECKCALL what=%.*s whatnode=%p fi=%p tmpl=%d "
+                    "nparams=%zu p0=%s p0ptr=%p id_sym[what]=%p "
+                    "id_sym_func=%p\n",
+                    (int)ws.size(), ws.data(), (void *)wid, (void *)fi,
+                    fi->is_template, fi->params.size(),
+                    fi->params.empty() ? "?"
+                        : sty_to_string(fi->params[0]->type).c_str(),
+                    fi->params.empty() ? nullptr : (void *)fi->params[0],
+                    (void *)(isr != id_sym.end() ? isr->second : 0),
+                    (void *)(isr != id_sym.end() && isr->second
+                             ? isr->second->func : 0));
+            }
+        }
+#endif
     } else if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
         auto it = id_sym.find(cid);
         TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
