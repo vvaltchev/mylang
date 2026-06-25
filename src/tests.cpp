@@ -8203,6 +8203,57 @@ static bool trace_module_basics()
     return ok;
 }
 
+/*
+ * Drive the real compile pipeline with every trace category on and a captured
+ * sink, asserting each category narrates at least one decision. The program is
+ * crafted to exercise all of them: a template (compute/helper -> $tmplN), a
+ * flat array (arrays), an auto-pure func (helper), a write-once local
+ * (autoconst k/t), an inlined call (helper spliced), constant folds, and a
+ * const-arg specialization ($tmpl0 -> $spec0).
+ */
+static bool trace_pipeline_categories()
+{
+    const unsigned saved_mask = g_trace_mask;
+    std::ostream *saved_sink = trace_sink();
+
+    g_trace_mask = 0;
+    std::ostringstream cap;
+    trace_set_sink(&cap);
+    trace_set("all", true);
+
+    bool ok = true;
+    try {
+        const char *src[] = {
+            "func helper(x) => x + 1;",
+            "func compute(n) { var k = 5; var t = helper(n) * k; "
+            "return t; }",
+            "var a = [1, 2, 3];",
+            "var r = compute(10);",
+        };
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < 4; i++)
+            lexer(src[i], static_cast<int>(i + 1), toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+    } catch (...) {
+        ok = false;
+    }
+
+    const std::string s = cap.str();
+    const char *cats[] = { "infer", "template", "arrays", "autopure",
+                           "autoconst", "inline", "fold", "specialize" };
+    for (const char *c : cats)
+        if (s.find(c) == std::string::npos)
+            ok = false;
+
+    trace_set_sink(saved_sink);
+    g_trace_mask = saved_mask;
+    return ok;
+}
+
 static bool replhelp_unknown_and_topics()
 {
     if (!help_has("no_such_thing", "No help for"))   return false;
@@ -8226,6 +8277,7 @@ static const std::vector<extra_check> extra_checks =
     { "replhelp: language reference", replhelp_language_reference },
     { "replhelp: unknown topic + completion", replhelp_unknown_and_topics },
     { "trace: module set/emit/active basics", trace_module_basics },
+    { "trace: every category narrates a decision", trace_pipeline_categories },
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },
     { "repl: completion (struct members)", repl_completion_struct_members },

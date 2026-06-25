@@ -5,6 +5,7 @@
 #include "analyzer.h"
 #include "errors.h"
 #include "eval.h"
+#include "trace.h"
 
 #include <functional>
 #include <unordered_set>
@@ -453,6 +454,10 @@ private:
                                 AnnoKind::auto_const);
                         fc.consts[id->sym.slot] = coerce_decl_scalar(
                             e14->rvalue->eval(&cctx), id->decl_type);
+                        TRACE(autoconst, 0, std::string(id->get_str()) +
+                              "  write-once scalar -> " +
+                              fc.consts[id->sym.slot].to_string() +
+                              "  (folded at uses)");
                         continue;
                     }
 
@@ -667,7 +672,9 @@ private:
                  * like the parser's const-folding. try/catch is for *runtime*
                  * exceptions and does not (and should not) catch these; see the
                  * const-eval / auto-const notes in CLAUDE.md and README.md. */
-                MakeConstructFromConstVal(RValue(mo->eval(&cctx)), slot, false);
+                EvalValue fv = RValue(mo->eval(&cctx));
+                TRACE(fold, 0, "const expr -> " + fv.to_string());
+                MakeConstructFromConstVal(fv, slot, false);
             }
             return;
         }
@@ -709,13 +716,15 @@ private:
              * code and propagates (a build error), per the auto-const rule.
              */
             if (all_const && callee) {
-                /* Capture the callee's loc before the node may be freed. */
+                /* Capture callee loc + name before the node may be freed. */
                 const Loc cloc = callee->start;
-                const int clen =
-                    static_cast<int>(callee->get_str().length());
+                const std::string cname(callee->get_str());
+                const int clen = static_cast<int>(cname.length());
                 try {
-                    MakeConstructFromConstVal(RValue(ce->eval(&cctx)),
-                                              slot, false);
+                    EvalValue cv = RValue(ce->eval(&cctx));
+                    TRACE(fold, 0, cname + "(...) -> " + cv.to_string() +
+                          "  (const-arg call)");
+                    MakeConstructFromConstVal(cv, slot, false);
                     /* -a: an auto-pure call folded away - color it magenta. */
                     if (analysis)
                         analysis->mark(cloc, clen, AnnoKind::folded);
@@ -1105,6 +1114,9 @@ Resolver::process_function(FuncDeclStmt *fd)
             && fd->body
             && func_body_is_pure(fd->body.get())) {
         fd->effective_pure = true;
+        if (fd->id)
+            TRACE(autopure, 0, std::string(fd->id->get_str()) +
+                  "  reads only consts/params -> effective pure");
     }
 
     if (st.slottable && st.next_slot > 0) {
@@ -1630,6 +1642,10 @@ private:
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
 
+        TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
+              std::to_string(nparams) + " arg(s))  body " +
+              std::to_string(bsz) + " nodes -> splice");
+
         /* Replaces (frees) the old CallExpr; its args were already cloned. */
         slot = move(body);
 
@@ -1905,6 +1921,10 @@ private:
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
+
+        TRACE(inlining, 0, std::string(f->id->get_str()) +
+              "  tail call -> splice (+" + std::to_string(nlocals) +
+              " local slot(s))");
 
         slot = move(spliced);   /* the ReturnStmt becomes f's (spliced) body */
         refold(slot);
@@ -2219,6 +2239,10 @@ private:
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::specialized);
+
+        TRACE(specialize, 0, std::string(callee->get_str()) +
+              "  const arg(s) folded -> " +
+              std::string(clone->id->get_str()));
 
         /* Redirect to the clone (same args; the const ones are now ignored). */
         auto what = make_unique<Identifier>(clone->id->get_str());

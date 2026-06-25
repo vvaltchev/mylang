@@ -11,6 +11,7 @@
 #include "analyzer.h"
 #include "repl.h"
 #include "errfmt.h"
+#include "trace.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -58,6 +59,12 @@ void help()
     cout << "  -a       Analyze: reprint the source with colors showing which"
          << endl;
     cout << "           optimizations fired (--analyze; --no-color for plain)"
+         << endl;
+    cout << "  -T CATS  Trace the compiler's reasoning to stderr (--trace);"
+         << endl;
+    cout << "           CATS is comma-separated: infer,inline,specialize,"
+         << endl;
+    cout << "           template,autoconst,autopure,arrays,fold, or all"
          << endl;
 
 #ifdef TESTS
@@ -185,6 +192,32 @@ parse_args(int argc, char **argv)
 
             opt_analyze = true;
 
+        } else if (!strcmp(arg, "-T") || !strcmp(arg, "--trace")) {
+
+            /* Enable diagnostic trace categories (comma-separated, or "all")
+             * BEFORE compilation, so a script run narrates the optimizer
+             * reasoning to stderr. See trace.h / plans/repl-introspection. */
+            if (argc < 2) {
+                cout << "error: --trace requires a category list "
+                        "(e.g. infer,inline or all)" << endl;
+                exit(1);
+            }
+            const string cats = argv[1];
+            argc--; argv++;   /* consume the value */
+            size_t pos = 0;
+            while (pos <= cats.size()) {
+                const size_t comma = cats.find(',', pos);
+                const size_t end =
+                    (comma == string::npos) ? cats.size() : comma;
+                const string c = cats.substr(pos, end - pos);
+                if (!c.empty() && !trace_set(c, true))
+                    cout << "warning: unknown trace category '" << c << "'"
+                         << endl;
+                if (comma == string::npos)
+                    break;
+                pos = comma + 1;
+            }
+
         } else if (!strcmp(arg, "--no-color")) {
 
             opt_no_color = true;
@@ -241,6 +274,12 @@ int main(int argc, char **argv)
     try {
 
         parse_args(argc, argv);
+
+        /* Color the trace tags on a stderr TTY (the trace sink is stderr for a
+         * script), unless --no-color. Harmless when no category is enabled. */
+#ifndef _WIN32
+        trace_set_color(!opt_no_color && isatty(STDERR_FILENO));
+#endif
 
         if (opt_repl)
             return run_repl();
