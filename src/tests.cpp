@@ -8134,6 +8134,21 @@ static bool replhelp_builtin_entries()
     return true;
 }
 
+static bool replhelp_language_reference()
+{
+    /* the language index + a category expansion */
+    if (!help_has("language", "Optimizations"))      return false;
+    if (!help_has("language", "Type system"))        return false;
+    if (!help_has("optimizations", "Inlining"))      return false;
+    if (!help_has("optimizations", "[inlining]"))    return false;
+    /* an individual feature: syntax + body, incl. an optimization */
+    if (!help_has("inlining", "spliced in place"))   return false;
+    if (!help_has("templates", "$tmplN"))            return false;
+    if (!help_has("foreachloop", "indexed"))         return false;
+    if (!help_has("namedargs", "IDENTICALLY"))       return false;
+    return true;
+}
+
 static bool replhelp_unknown_and_topics()
 {
     if (!help_has("no_such_thing", "No help for"))   return false;
@@ -8154,6 +8169,7 @@ static const std::vector<extra_check> extra_checks =
     { "repl: multi-line completeness detection", repl_incomplete_detection },
     { "replhelp: overview + builtins index", replhelp_overview_and_builtins },
     { "replhelp: builtin entries + kind note", replhelp_builtin_entries },
+    { "replhelp: language reference", replhelp_language_reference },
     { "replhelp: unknown topic + completion", replhelp_unknown_and_topics },
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },

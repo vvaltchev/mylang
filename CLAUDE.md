@@ -1632,13 +1632,17 @@ behind a thin terminal shell:
   the REPL share it.
 - **`replhelp.{h,cpp}`** — `repl_help(topic, color)`, the `:help`
   documentation system: a self-contained STATIC database (no interpreter
-  state) of every builtin (`{name, category, signature, summary, long?}`) and,
-  added in Pillar 2b, the language features — surface *and* the optimization
-  passes. `:help` overview, `:help builtins[/<cat>]`, `:help <builtin>`,
-  `:help language`, `:help <category>`, `:help <feature>` all route through it;
-  it shares the `reflect_*` renderers (`builtins/reflect.cpp.h`) conceptually
-  but holds its own prose. Pure/headless, so it is unit-tested directly
-  (`replhelp:` extra_checks). See `plans/repl-introspection.md`.
+  state) of every builtin (`{name, category, signature, summary, long?}`) and
+  of the language features — surface (values, vars, control, functions,
+  arrays, dicts, strings, structs, exceptions, the type system) *and* the
+  optimization passes (const-fold, auto-const/pure, inlining, specialization,
+  template instantiation, M8, flat arrays, CSE, COW), each with a syntax
+  sketch + prose and a pointer to its `:trace` category. `:help` overview,
+  `:help builtins[/<cat>]`, `:help <builtin>`, `:help language`,
+  `:help <category>`, `:help <feature>` all route through `repl_help`; feature
+  ids are kept distinct from category ids (the dispatch resolves a bare topic
+  builtin → language-category → feature). Pure/headless, so it is unit-tested
+  directly (`replhelp:` extra_checks). See `plans/repl-introspection.md`.
 
 `run_repl` (in `repl.cpp`) drives it: history loaded/saved to
 `~/.mylang_history`, colors gated on a TTY + `NO_COLOR`, Ctrl-C drops the
