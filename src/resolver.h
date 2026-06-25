@@ -45,6 +45,22 @@ void resolve_names(Construct *root,
                    EvalContext *prior_pure = nullptr);
 
 /*
+ * The post-inference optimizer pipeline run by BOTH drivers (mylang.cpp's
+ * script path and the REPL's per-input do_eval): resolve_names (slotting +
+ * auto-const + inlining + specialization) then specialize_types (M8 typed
+ * scalars). Factored so the two stay in lock-step - a new pass added here
+ * reaches the script and the REPL identically (the REPL must transform the
+ * tree exactly like the script). `repl_mode`/`prior_scope` thread through to
+ * resolve_names for the cross-input behavior; everything else is the same call.
+ */
+void run_optimizers(Construct *root,
+                    bool enable_inline = true,
+                    int inline_threshold = 24,
+                    bool enable_specialize = true,
+                    bool repl_mode = false,
+                    EvalContext *prior_scope = nullptr);
+
+/*
  * -a/--analyze: after resolve_names has run, record the resolver-decided
  * optimizations that survive as flags on the tree - auto-pure functions and
  * auto-const parameters (both yellow). The auto-const var / dead-code / inlined

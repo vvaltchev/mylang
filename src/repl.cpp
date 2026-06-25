@@ -321,10 +321,13 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *     optimizations are inspectable). repl_mode keeps top-level decls as
      *     persistent map globals (never slotted / auto-const-promoted), while
      *     nested locals slot, inline, and specialize as in a script. */
-    resolve_names(root.get(), /*enable_inline=*/true, /*inline_threshold=*/24,
-                  /*analysis=*/nullptr, /*repl_mode=*/true,
-                  /*prior_pure=*/runtime_ctx.get());
-    specialize_types(root.get(), true);
+    /* The SAME optimizer pipeline the script driver runs (run_optimizers), so
+     * the REPL's tree transformation is on par with a script's - just with
+     * repl_mode (top-level decls stay map globals) and the prior-input scope
+     * seeded for cross-input fold / inline / specialize. */
+    run_optimizers(root.get(), /*enable_inline=*/true, /*inline_threshold=*/24,
+                   /*enable_specialize=*/true, /*repl_mode=*/true,
+                   /*prior_scope=*/runtime_ctx.get());
 
     /* 3. Evaluate each top-level statement directly in the persistent global
      *    scope, capturing print() output and the last statement's value. */
@@ -503,14 +506,11 @@ ReplEngine::Impl::cmd_analyze(const string &code)
         pc.analysis = &info;        /* record parse-time folds / dead code */
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
 
-        collect_array_analysis(root.get(), info);
-        resolve_names(root.get(), /*inline=*/true, 24, &info, /*repl=*/true);
-        collect_resolver_analysis(root.get(), info);
-
         const bool color =
             repl_out_is_tty() && !std::getenv("NO_COLOR");
         std::ostringstream o;
-        render_analysis(o, local_lines, info, color);
+        analyze_and_render(o, root.get(), info, local_lines, color,
+                           /*repl_mode=*/true);
         return o.str();
     } catch (const Exception &ex) {
         std::ostringstream o;

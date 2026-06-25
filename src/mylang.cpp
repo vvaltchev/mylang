@@ -333,14 +333,12 @@ int main(int argc, char **argv)
          * the clean tree); the resolver passes run next and record auto-const /
          * dead-code / inlined / specialized / folded as the tree mutates. */
         if (opt_analyze) {
-            /* analyze_info already holds the parser's records; add the
-             * inference (array storage) and resolver (auto-const/inline/etc.)
-             * decisions, then reprint the source colored. */
-            collect_array_analysis(root.get(), analyze_info);
-            resolve_names(root.get(), !opt_no_inline, opt_inline_threshold,
-                          &analyze_info);
-            collect_resolver_analysis(root.get(), analyze_info);
-            render_analysis(cout, lines, analyze_info, !opt_no_color);
+            /* analyze_info already holds the parser's records; the shared
+             * pipeline adds the inference (array storage) and resolver
+             * (auto-const/inline/etc.) decisions, then reprints colored. */
+            analyze_and_render(cout, root.get(), analyze_info, lines,
+                               !opt_no_color, /*repl_mode=*/false,
+                               !opt_no_inline, opt_inline_threshold);
             return 0;
         }
 
@@ -350,10 +348,11 @@ int main(int argc, char **argv)
         infer_types(root.get(), !opt_no_type_infer);
 
         if (!opt_no_run) {
-            /* Resolve names to slots, then run the script. The root block
-             * builds its own "main" Frame for slotted top-level variables. */
-            resolve_names(root.get(), !opt_no_inline, opt_inline_threshold);
-            specialize_types(root.get(), !opt_no_type_infer);
+            /* Run the optimizer pipeline (resolve_names + specialize_types -
+             * the SAME helper the REPL uses), then run the script. The root
+             * block builds its own "main" Frame for slotted top-level vars. */
+            run_optimizers(root.get(), !opt_no_inline, opt_inline_threshold,
+                           !opt_no_type_infer);
             root->eval(nullptr);
         }
 

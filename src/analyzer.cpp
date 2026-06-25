@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "analyzer.h"
+#include "resolver.h"   /* resolve_names, collect_resolver_analysis */
 
 #include <ostream>
 #include <string>
@@ -22,6 +23,17 @@ anno_code(AnnoKind k)
         case AnnoKind::folded:      return "\033[35m";   /* magenta */
         default:                    return "";
     }
+}
+
+void
+analyze_and_render(ostream &o, Construct *root, AnalysisInfo &info,
+                   const std::vector<string> &src, bool color,
+                   bool repl_mode, bool enable_inline, int inline_threshold)
+{
+    collect_array_analysis(root, info);
+    resolve_names(root, enable_inline, inline_threshold, &info, repl_mode);
+    collect_resolver_analysis(root, info);
+    render_analysis(o, src, info, color);
 }
 
 void
