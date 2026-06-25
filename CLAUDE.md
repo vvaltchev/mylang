@@ -921,16 +921,25 @@ Mechanism (`inferencer.cpp`): the fixpoint and check pass **skip** an
 un-instantiated template (`accumulate`/`accumulate_call`/`check`/`check_call`
 test `is_template`); an outer loop in `infer_one`, between the main fixpoint and
 finalize, runs `instantiate_round` — for each template call whose arg types have
-settled, it clones the template (`make_template_clone`: synthetic `$tmplN` id +
-`display_name` for backtraces, `walk_struct`'d, `is_template=false`, inserted at
-the root block's front), **redirects** the call to the clone (resolving the
-clone's sym BY NODE via `id_sym`, not by name), and re-runs the fixpoint; the
-clone's params accumulate their one signature through the concrete path (dedup
-by `(template, signature)` in `tmpl_cache`; recursion → self-redirect). Arity is
-still checked for a template call; per-arg type/nullability is checked inside
-each clone. A template defined in a PRIOR REPL input instantiates in later
-inputs too (`tmpl_cache` is cleared per input; the clone-name counter stays
-monotonic). **Subtlety:** `id_sym`/`func_of_decl` are keyed by node POINTER and
+settled, it gets-or-makes the instance for that `(template, signature)`
+(`make_template_clone`: synthetic `$tmplN` id + `display_name` for backtraces,
+`walk_struct`'d, `is_template=false`, inserted at the root block's front),
+**redirects** the call to it, and re-runs the fixpoint; the clone's params
+accumulate their one signature through the concrete path. Arity is still checked
+for a template call; per-arg type/nullability is checked inside each clone.
+**The `(template, signature)` cache (`tmpl_cache`) is SESSION-persistent, NOT
+cleared per input** — a signature already instantiated by a prior input
+**reuses** that instance instead of building a duplicate (`f(2,3)` then `f(2,3)`
+again in a later input both run `$tmpl0`, not `$tmpl0` then `$tmpl1`). To stay
+clear of the node-identity hazard below, the cache is keyed by the stable
+`template_sig_key` (the template's arena-stable `FuncInfo*` + the signature's
+type strings) and **valued by the instance's interned NAME** (a `UniqueId *`,
+never a node pointer); the redirect resolves that name in the global scope
+(`global->syms`, whose `TypeSym`/`FuncInfo` are pinned), so a prior input's
+instance is reached by name, not by a stale node. `infer_input` snapshots the
+cache and restores it if the input is rejected (so a rolled-back clone leaves no
+entry); the clone-name counter stays monotonic. **Subtlety:** `id_sym`/
+`func_of_decl` are keyed by node POINTER and
 persist for the session, so a fresh input node can reuse a freed node's address
 — `walk_struct` therefore **always re-resolves** an identifier (never
 `if (!id_sym.count(id))`, which would keep a stale entry and bind an input's

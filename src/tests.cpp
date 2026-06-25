@@ -7804,6 +7804,26 @@ static const std::vector<repl_test> repl_tests =
         { "tf(3)", "=> 4" },
         { "specializations(tf)", "$tmpl" } } },
 
+    /* ---- cross-input template instantiation: reuse, not duplicate ---- */
+    { "template: the same signature across inputs reuses one instance",
+      { { "func tr(x, y) { var s = x + y; return s + 1; }", "" },
+        { "tr(2, 3)", "=> 6" },
+        { "specializations(tr)", "[$tmpl0]" },
+        { "tr(10, 20)", "=> 31" },            /* same (int,int): reuse */
+        { "specializations(tr)", "[$tmpl0]" } } },   /* STILL one instance */
+
+    { "template: a distinct signature across inputs makes a new instance",
+      { { "func tq(x, y) { var s = x + y; return s; }", "" },
+        { "tq(1, 2)", "=> 3" },
+        { "tq(1.0, 2.0)", "=> 3.0" },
+        { "specializations(tq)", "[$tmpl0, $tmpl1]" } } },
+
+    { "trace: an uninstantiated template is reported as a template, not dyn",
+      { { ":trace infer on", "tracing: infer" },
+        { "func tt(a, b) { var u = a + b; return u; }",
+          "template (instantiated per call)" },
+        { ":trace off", "tracing: off" } } },
+
     /* ---- diagnostic tracing narrates the compiler's reasoning ---- */
     { "trace: :trace infer narrates inference into the REPL output",
       { { ":trace infer on", "tracing: infer" },
