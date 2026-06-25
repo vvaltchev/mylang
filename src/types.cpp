@@ -291,6 +291,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("signature", builtin_signature),
     make_builtin("layout", builtin_layout),
     make_builtin("specializations", builtin_specializations),
+    make_builtin("show", builtin_show),
 
     /* Diagnostic tracing (see trace.h) */
     make_builtin("trace", builtin_trace),

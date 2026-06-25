@@ -17,6 +17,7 @@
 #include "replhelp.h"
 #include "trace.h"
 #include "reflect.h"
+#include "coderender.h"
 
 #include <iostream>
 #include <fstream>
@@ -104,6 +105,7 @@ struct ReplEngine::Impl {
     string cmd_trace(const string &arg);
     string cmd_globals();
     string cmd_type(const string &code);
+    string cmd_show(const string &arg);
 
     /* lex `source` into stable per-line storage (the lexer holds string_views
      * into the lines, so they must outlive the parse). */
@@ -406,6 +408,8 @@ ReplEngine::Impl::meta_command(const string &src)
         return cmd_globals();
     if (cmd == "type" || cmd == "t")
         return cmd_type(arg);
+    if (cmd == "show")
+        return cmd_show(arg);
     if (cmd == "quit" || cmd == "q")
         return "";              /* the loop handles the actual exit */
 
@@ -733,6 +737,60 @@ ReplEngine::Impl::cmd_type(const string &code)
         format_exception(o, ex, local_lines);
         return o.str();
     }
+}
+
+/*
+ * :show <function> - render a function's FINAL optimized AST back into
+ * synthetic MyLang-like code (folded consts, inlined bodies, dead code gone;
+ * see coderender.{h,cpp}). When <function> is a base name, its `<name>$N`
+ * template-instance / specialization clones are rendered too (so you see the
+ * concrete, per-signature versions the compiler generated).
+ */
+string
+ReplEngine::Impl::cmd_show(const string &arg)
+{
+    if (arg.empty())
+        return "usage: :show <function>\n";
+
+    std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+    runtime_ctx->collect_symbols(syms);
+
+    auto func_of = [](const LValue *lv) -> const FuncDeclStmt * {
+        const EvalValue &v = lv->get();
+        return v.is<shared_ptr<FuncObject>>()
+                   ? v.get<shared_ptr<FuncObject>>()->func
+                   : nullptr;
+    };
+
+    const FuncDeclStmt *base = nullptr;
+    bool found_name = false;
+    for (const auto &kv : syms)
+        if (kv.first->val == arg) {
+            found_name = true;
+            base = func_of(kv.second);
+        }
+
+    if (!found_name)
+        return "No global named '" + arg + "' (try :globals)\n";
+    if (!base)
+        return "'" + arg + "' is not a function\n";
+
+    std::ostringstream o;
+    o << render_func_code(base);
+
+    /* also its `<name>$N` clones (display_name == arg), sorted by name */
+    std::vector<std::pair<string, const FuncDeclStmt *>> clones;
+    for (const auto &kv : syms) {
+        const FuncDeclStmt *g = func_of(kv.second);
+        if (g && g != base && g->display_name == arg)
+            clones.emplace_back(string(kv.first->val), g);
+    }
+    std::sort(clones.begin(), clones.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    for (const auto &c : clones)
+        o << "\n" << render_func_code(c.second);
+
+    return o.str();
 }
 
 /* Net unclosed (){}/[] depth of `src` (>=0), lexer-based so strings/comments

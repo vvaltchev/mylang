@@ -214,14 +214,14 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — seventeen
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — eighteen
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
-`eval.cpp`, `types.cpp`, `stype.cpp`, `trace.cpp`, `backtrace.cpp`,
-`errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`, `repl.cpp`,
-`mylang.cpp`, `tests.cpp` (the last five are the REPL — see "The interactive
-REPL" below; `trace.cpp` is the diagnostic tracer used by the optimizer passes
-and the REPL).
+`eval.cpp`, `types.cpp`, `stype.cpp`, `trace.cpp`, `coderender.cpp`,
+`backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
+`repl.cpp`, `mylang.cpp`, `tests.cpp` (the last six are the REPL — see "The
+interactive REPL" below; `trace.cpp` is the diagnostic tracer and
+`coderender.cpp` the optimized-AST "decompiler", both used by the REPL).
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
   turns thrown
@@ -1631,7 +1631,9 @@ behind a thin terminal shell:
     context so folded const SCALARS still appear), `:type <expr>` (a committed
     global's inferred static type via `ReplInfer::global_type`, else the
     runtime structural type of the expression evaluated in a throwaway child
-    scope), `:quit`.
+    scope), `:show <function>` (the optimized-AST decompiler, `coderender.cpp`
+    — renders the function and its `<name>$N` clones as synthetic code),
+    `:quit`.
   - **`completions(buf, cursor)`** — Tab candidates: keywords + builtins + REPL
     globals (`EvalContext::collect_symbols`), or a struct value/type's fields/
     consts right after `base.`.
@@ -1680,6 +1682,19 @@ behind a thin terminal shell:
   (`trace.cpp`), rendered as an aligned bullet list by `:trace help` and the
   `trace`/`:trace` entries alike. Pure/headless, so it is unit-tested (`replhelp:`
   extra_checks). See `plans/repl-introspection.md`.
+- **`coderender.{h,cpp}`** — `render_func_code(fn)` /
+  `render_construct_code(c)`, the optimized-AST **"decompiler"**: it unparses
+  the FINAL tree (after parse/fold/inference/`resolve_names`/`specialize_types`)
+  back into synthetic MyLang-like code, so you see what actually runs — dead
+  code gone, folded consts as literals, inlined call bodies spliced in
+  (annotated `inlined f`), flat-array element types as `array<int>`,
+  typed-scalar/annotation hints as the var's type. A precedence-aware
+  expression printer + statement walker, with a comment fallback for any
+  unhandled node (best-effort, NOT round-trippable). Backs the `show(f)` builtin
+  and the REPL `:show <name>` (which also renders the `<name>$N` clones). It
+  reads literal values via the public `ival()`/`fval()`/`bval()`/`strval()`/
+  `literal_value()` accessors on the `Literal*` nodes. See
+  `plans/repl-introspection.md`.
 - **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
   category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/
   autopure/arrays/fold) in `g_trace_mask`, the hot guard `trace_enabled(c)`,

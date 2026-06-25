@@ -22,6 +22,7 @@
 #include "highlight.h"
 #include "replhelp.h"
 #include "trace.h"
+#include "coderender.h"
 
 #include <typeinfo>
 #include <vector>
@@ -6500,6 +6501,13 @@ static const std::vector<test> tests =
       { "func f(int a) => a + 1; assert(len(specializations(f)) == 0);" } },
     { "reflect: specializations rejects a non-function",
       { "specializations(42);" }, &typeid(TypeErrorEx) },
+    { "reflect: show() renders a function as code",
+      /* sf reads only its param, so it is auto-pure (rendered with a pure
+       * marker), then the signature */
+      { "func sf(int x) => x + 1;",
+        "assert(startswith(show(sf), \"/* pure */ func sf(int x)\"));" } },
+    { "reflect: show() rejects a non-function",
+      { "show(42);" }, &typeid(TypeErrorEx) },
 
     /* ---- diagnostic tracing builtins (trace.h) ---- */
     { "trace: tracing() is empty by default",
@@ -7823,6 +7831,11 @@ static const std::vector<repl_test> repl_tests =
         { "ti(2, 3)", "=> 5" },
         { "typeof(ti$0)", "func ti(" } } },
 
+    { ":show renders a function and its template instances as code",
+      { { "func sm(x, y) { var t = x + y; return t; }", "" },
+        { "sm(2, 3)", "=> 5" },
+        { ":show sm", "func sm$0(x, y)" } } },
+
     { "trace: an uninstantiated template is reported as a template, not dyn",
       { { ":trace infer on", "tracing: infer" },
         { "func tt(a, b) { var u = a + b; return u; }",
@@ -8326,6 +8339,71 @@ static bool replhelp_commands()
     return true;
 }
 
+/* find a top-level function decl by name in a parsed/optimized root block */
+static const FuncDeclStmt *find_top_func(Construct *root, const char *name)
+{
+    auto *blk = dynamic_cast<Block *>(root);
+    if (!blk)
+        return nullptr;
+    for (auto &e : blk->elems)
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get()))
+            if (fd->id && fd->id->get_str() == name)
+                return fd;
+    return nullptr;
+}
+
+/*
+ * The :show / show() code renderer: f inlined + const-folded into g becomes
+ * `print(3)`; inlined with non-const args becomes `print(x + y)` annotated
+ * `inlined f`; an instantiated template surfaces its array element type.
+ */
+static bool coderender_inline_fold_types()
+{
+    const char *src[] = {
+        "func f(x, y) => x + y;",
+        "func g() { print(f(1, 2)); }",
+        "func h(x, y) { print(f(x, y)); }",
+        "func mk(x) { var a = [x, x]; return a; }",
+        "var z = mk(5);",
+    };
+    std::vector<Tok> toks;
+    for (size_t i = 0; i < 5; i++)
+        lexer(src[i], static_cast<int>(i + 1), toks);
+
+    unique_ptr<Construct> root;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        root = pBlock(pc);
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+    } catch (...) {
+        return false;
+    }
+
+    const FuncDeclStmt *g = find_top_func(root.get(), "g");
+    const FuncDeclStmt *h = find_top_func(root.get(), "h");
+    if (!g || !h)
+        return false;
+
+    const std::string sg = render_func_code(g);
+    const std::string sh = render_func_code(h);
+
+    bool ok = true;
+    ok = ok && sg.find("print(3)") != std::string::npos;     /* inlined+folded */
+    ok = ok && sh.find("inlined f") != std::string::npos;    /* annotated */
+    ok = ok && sh.find("x + y") != std::string::npos;        /* non-const args */
+
+    /* the instantiated mk$0 (int) renders its flat array element type */
+    const FuncDeclStmt *mk0 = find_top_func(root.get(), "mk$0");
+    if (mk0)
+        ok = ok && render_func_code(mk0).find("array<int>") !=
+                       std::string::npos;
+
+    /* an arbitrary expression renders too */
+    return ok;
+}
+
 static bool replhelp_unknown_and_topics()
 {
     if (!help_has("no_such_thing", "No help for"))   return false;
@@ -8351,6 +8429,8 @@ static const std::vector<extra_check> extra_checks =
     { "replhelp: unknown topic + completion", replhelp_unknown_and_topics },
     { "trace: module set/emit/active basics", trace_module_basics },
     { "trace: every category narrates a decision", trace_pipeline_categories },
+    { "coderender: inlining, folding, and instance types",
+      coderender_inline_fold_types },
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },
     { "repl: completion (struct members)", repl_completion_struct_members },
