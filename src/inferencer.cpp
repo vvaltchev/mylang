@@ -77,6 +77,11 @@ struct TypeSym {
      * path, so every "skip pinned" branch is a no-op there.
      */
     bool pinned = false;
+    /* Declared inside an un-instantiated TEMPLATE's body (a param or local of a
+     * function the fixpoint skips). Its finalized type is a dyn/none fallback,
+     * not real inference, so `:trace infer` reports the template as a whole
+     * rather than these. Set during the structural pass. */
+    bool in_template = false;
     Loc decl_loc;
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
     /* non-null when this name is a struct TYPE (a `struct` decl): the symbol is
@@ -147,10 +152,26 @@ private:
     Scope *global = nullptr;
     bool changed = false;
     FuncInfo *cur_func = nullptr;
+    /* >0 while the structural pass is inside a template function's body, so
+     * new_sym tags that function's params/locals `in_template` (their finalized
+     * types are fallbacks - see TypeSym::in_template). */
+    int struct_tmpl_depth = 0;
+    /* Set while walk_struct'ing a freshly-built instantiation CLONE: its body
+     * has the template's (un-annotated) params, so declare_funcdecl marks it a
+     * template momentarily (cleared right after) - but the clone's syms ARE the
+     * concrete instance, so they must NOT be tagged in_template. */
+    bool struct_in_clone = false;
 
     /* Monomorphization: instantiations cached by (template, signature) so the
-     * same call signature shares one clone; a monotonic counter names them. */
-    std::unordered_map<std::string, FuncDeclStmt *> tmpl_cache;
+     * same call signature shares ONE clone; a monotonic counter names them.
+     * The cache is SESSION-persistent (not cleared per REPL input): a signature
+     * already instantiated by a prior input reuses that instance instead of
+     * building a duplicate. The value is the instance's interned NAME (a stable
+     * identity - never a raw node pointer); the instance is reached across
+     * inputs by that name in the global scope (its FuncInfo is pinned). The key
+     * `template_sig_key` is stable too (the template's arena-stable FuncInfo
+     * pointer + the signature's type strings). */
+    std::unordered_map<std::string, const UniqueId *> tmpl_cache;
     int tmpl_clone_counter = 0;
     /* Per-template instantiation count + a per-template "already warned" guard:
      * past MAX_TMPL_INSTANCES distinct signatures, further calls run
@@ -291,6 +312,7 @@ TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc)
     sym->type = bottom;
     sym->acc = bottom;
     sym->decl_loc = loc;
+    sym->in_template = struct_tmpl_depth > 0;
     s->syms[name] = sym;
     return sym;
 }
@@ -562,7 +584,9 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
         clr(fc);
     }
 
+    struct_in_clone = true;             /* the clone's syms are the instance */
     walk_struct(fc, global);            /* declare its name + build its syms */
+    struct_in_clone = false;
     FuncInfo *cfi = func_of_decl.count(fc) ? func_of_decl[fc] : nullptr;
     /* walk_struct must have built the clone its OWN FuncInfo (not reused the
      * template's, and not skipped on a stale func_of_decl entry). */
@@ -571,7 +595,7 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
 
     FuncDeclStmt *raw = fc;
     rootBlock->elems.insert(rootBlock->elems.begin(), move(cl));
-    tmpl_cache[key] = raw;
+    tmpl_cache[key] = fc->id->uid;       /* cache the stable NAME, not a node */
     return raw;
 }
 
@@ -624,11 +648,29 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             continue;       /* args not settled yet; a later round */
 
         const std::string key = template_sig_key(tmpl, sig);
+
+        /*
+         * Get-or-make the instance for this (template, signature). The cache is
+         * session-persistent, so a cached entry may name an instance built by a
+         * PRIOR input - reach it by NAME in the global scope (its FuncInfo is
+         * pinned). The cached name is dropped (rebuild) only if the instance is
+         * gone (undef, or a rejected input rolled it back).
+         */
+        const UniqueId *clone_name = nullptr;
+        TypeSym *clone_sym = nullptr;
+        bool reused = false;
+
         auto it = tmpl_cache.find(key);
-        FuncDeclStmt *clone;
         if (it != tmpl_cache.end()) {
-            clone = it->second;
-        } else {
+            auto gs = global->syms.find(it->second);
+            if (gs != global->syms.end() && gs->second && gs->second->func) {
+                clone_name = it->second;
+                clone_sym = gs->second;
+                reused = true;
+            }
+        }
+
+        if (!clone_sym) {
             /* D4: a new signature past the cap runs dynamically, not as a clone
              * - a backstop for pathological polymorphic recursion. */
             static const int MAX_TMPL_INSTANCES = 64;
@@ -643,34 +685,41 @@ bool Inferencer::instantiate_round(Block *rootBlock)
                 }
                 continue;
             }
-            clone = make_template_clone(tmpl, key, rootBlock);
-            tmpl_inst_count[tmpl]++;
-            if (trace_enabled(TraceCat::templ)) {
-                std::string ss;
-                for (size_t i = 0; i < sig.size(); i++) {
-                    if (i)
-                        ss += ", ";
-                    ss += sty_to_string(sig[i]);
-                }
-                const std::string nm = tmpl->decl->id
-                    ? std::string(tmpl->decl->id->get_str())
-                    : std::string("<lambda>");
-                TRACE(templ, 0, nm + "(" + ss + ") -> " +
-                      std::string(clone->id->get_str()) + "  (instance " +
-                      std::to_string(tmpl_inst_count[tmpl]) + ")");
+            FuncDeclStmt *clone = make_template_clone(tmpl, key, rootBlock);
+            clone_name = clone->id->uid;
+            auto cs = id_sym.find(clone->id.get());
+            clone_sym = (cs != id_sym.end()) ? cs->second : nullptr;
+            if (!clone_sym) {            /* fall back to the by-name binding */
+                auto gs = global->syms.find(clone_name);
+                clone_sym = (gs != global->syms.end()) ? gs->second : nullptr;
             }
+            tmpl_inst_count[tmpl]++;
         }
-        if (!clone)
-            continue;
 
-        auto what = make_unique<Identifier>(clone->id->get_str());
+        if (!clone_sym)
+            continue;                   /* couldn't resolve the instance */
+
+        if (trace_enabled(TraceCat::templ)) {
+            std::string ss;
+            for (size_t i = 0; i < sig.size(); i++) {
+                if (i)
+                    ss += ", ";
+                ss += sty_to_string(sig[i]);
+            }
+            const std::string nm = tmpl->decl->id
+                ? std::string(tmpl->decl->id->get_str())
+                : std::string("<lambda>");
+            TRACE(templ, 0, nm + "(" + ss + ") -> " +
+                  std::string(clone_name->val) +
+                  (reused ? "  (reused)"
+                          : "  (instance " +
+                            std::to_string(tmpl_inst_count[tmpl]) + ")"));
+        }
+
+        auto what = make_unique<Identifier>(clone_name->val);
         what->start = call->what->start;
         what->end = call->what->end;
-        /* Resolve the clone's symbol BY NODE (id_sym on the clone's own id),
-         * not by name (global->syms[uid]) - unambiguous even if two clones ever
-         * shared a name. */
-        auto cs = id_sym.find(clone->id.get());
-        id_sym[what.get()] = (cs != id_sym.end()) ? cs->second : nullptr;
+        id_sym[what.get()] = clone_sym;
         /* The old callee Identifier is about to be freed: drop its id_sym entry
          * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
         id_sym.erase(call->what.get());
@@ -786,9 +835,13 @@ void Inferencer::infer_one(Block *rootBlock)
     /* Trace the finalized types (the conclusion of the fixpoint), so
      * `:trace infer` shows both the per-round climb and the final answer. */
     if (trace_enabled(TraceCat::infer)) {
+        /* A template's base params/locals are dyn/none FALLBACKS, not real
+         * inference (the fixpoint skips an un-instantiated template - it is
+         * checked per call-site clone, not in isolation). Don't report them as
+         * types; the "template" line below says so instead. */
         for (auto &up : all_syms) {
             TypeSym *s = up.get();
-            if (s->func || s->pinned || !s->name)
+            if (s->func || s->pinned || !s->name || s->in_template)
                 continue;
             const char *kind = s->is_param ? "param"
                              : s->const_decl ? "const" : "var";
@@ -803,13 +856,21 @@ void Inferencer::infer_one(Block *rootBlock)
             for (size_t i = 0; i < up->params.size(); i++) {
                 if (i)
                     ps += ", ";
-                if (up->params[i]->name)
-                    ps += std::string(up->params[i]->name->val) + ": ";
-                ps += sty_to_string(up->params[i]->type);
+                ps += up->params[i]->name
+                          ? std::string(up->params[i]->name->val)
+                          : std::string("_");
+                if (!up->is_template)            /* a template's are unbound */
+                    ps += ": " + sty_to_string(up->params[i]->type);
             }
-            TRACE(infer, 0, "func " + std::string(up->decl->id->get_str()) +
-                            "(" + ps + ") -> " + sty_to_string(up->ret) +
-                            "  (final)");
+            if (up->is_template)
+                TRACE(infer, 0, "func " +
+                                std::string(up->decl->id->get_str()) + "(" +
+                                ps + ")  template (instantiated per call)");
+            else
+                TRACE(infer, 0, "func " +
+                                std::string(up->decl->id->get_str()) + "(" +
+                                ps + ") -> " + sty_to_string(up->ret) +
+                                "  (final)");
         }
     }
 
@@ -859,12 +920,16 @@ void Inferencer::infer_input(Block *rootBlock)
         return;
 
     /*
-     * Each REPL input instantiates templates fresh - the instantiation cache is
-     * NOT shared across inputs (a prior input's clone lives in a prior block; a
-     * later input builds its own in its own block). The clone-name counter
-     * stays monotonic, so names never collide in the persistent global scope.
+     * The template instantiation cache is SESSION-persistent (see its
+     * declaration): a signature already instantiated by a prior input reuses
+     * that instance instead of building a duplicate (the cross-input link is
+     * the instance's name in the global scope, not a node pointer). It is only
+     * snapshotted here so a REJECTED input - whose clone bindings are rolled
+     * back below - drops its cache entries too (self-heal would otherwise
+     * rebuild on the next use; the snapshot makes it exact). The clone-name
+     * counter stays monotonic, so names never collide.
      */
-    tmpl_cache.clear();
+    auto tmpl_cache_snapshot = tmpl_cache;
 
     /*
      * SCOPE THE NODE-KEYED MAPS TO ONE INPUT. id_sym / func_of_decl are keyed
@@ -897,9 +962,11 @@ void Inferencer::infer_input(Block *rootBlock)
         infer_one(rootBlock);
     } catch (...) {
         /* Reject: restore the global scope (drop any decl this input added) and
+         * the instantiation cache (drop any clone this input registered), then
          * `pin` (i.e. skip henceforth) the half-built symbols so no later input
          * re-finalizes/re-enforces them. They stay in all_syms but inert. */
         global->syms = std::move(global_snapshot);
+        tmpl_cache = std::move(tmpl_cache_snapshot);
         pin_new();
         throw;
     }
@@ -1379,6 +1446,12 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         FuncInfo *fi = func_of_decl[fd];
         Scope *fscope = new_scope(global);   /* funcs see globals only */
 
+        /* tag this function's params/locals if it is a template BASE (see
+         * struct_tmpl_depth / TypeSym::in_template); not an instance clone */
+        const bool is_tmpl = fi && fi->is_template && !struct_in_clone;
+        if (is_tmpl)
+            struct_tmpl_depth++;
+
         if (fd->captures)
             for (auto &cap : fd->captures->elems) {
                 TypeSym *outer = lookup(s, cap->uid);
@@ -1399,6 +1472,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
             }
 
         walk_struct(fd->body.get(), fscope);
+        if (is_tmpl)
+            struct_tmpl_depth--;
         return;
     }
 
