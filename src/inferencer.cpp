@@ -2461,9 +2461,19 @@ void Inferencer::accumulate_call(CallExpr *call)
             return;
         STyRef vt = type_of(args->elems[val_i].get());
         STyRef bt = sty_resolve(bs->type);
+        /* Defer if the element type isn't settled yet (the defer-on-Unknown
+         * invariant): contributing `array<?>` to a PINNED global array would
+         * trip its assignability check immediately - `array<?>` is not
+         * top-level Unknown, so contribute()'s own guard wouldn't catch it -
+         * and throw before a template-instance arg settles to its real type. A
+         * later fixpoint round contributes the real `array<int>`. */
+        if (is_unknown(sty_resolve(vt)))
+            return;
         if (bt->kind == STyKind::Dict) {
             STyRef kt = (key_i >= 0 && (size_t)key_i < args->elems.size())
                             ? type_of(args->elems[key_i].get()) : A.dyn_ty();
+            if (is_unknown(sty_resolve(kt)))
+                return;
             contribute(bs, A.dict_of(kt, vt), bid->start);
         } else if (bt->kind == STyKind::Array) {
             contribute(bs, A.array_of(vt), bid->start);

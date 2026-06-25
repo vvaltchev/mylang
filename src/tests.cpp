@@ -7836,6 +7836,15 @@ static const std::vector<repl_test> repl_tests =
         { "sm(2, 3)", "=> 5" },
         { ":show sm", "func sm$0(x, y)" } } },
 
+    /* a template instance appending to a PINNED global array must not trip the
+     * global's assignability check before the arg type settles (defer-on-
+     * Unknown for array<?> -> the element type). */
+    { "template: append to a pinned global array from a function works",
+      { { "var ag = [1, 2, 3]", "" },
+        { "func af(x) { append(ag, x); }", "" },
+        { "af(4)", "" },
+        { "ag", "[1, 2, 3, 4]" } } },
+
     { "trace: an uninstantiated template is reported as a template, not dyn",
       { { ":trace infer on", "tracing: infer" },
         { "func tt(a, b) { var u = a + b; return u; }",
