@@ -641,6 +641,20 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             }
             clone = make_template_clone(tmpl, key, rootBlock);
             tmpl_inst_count[tmpl]++;
+            if (trace_enabled(TraceCat::templ)) {
+                std::string ss;
+                for (size_t i = 0; i < sig.size(); i++) {
+                    if (i)
+                        ss += ", ";
+                    ss += sty_to_string(sig[i]);
+                }
+                const std::string nm = tmpl->decl->id
+                    ? std::string(tmpl->decl->id->get_str())
+                    : std::string("<lambda>");
+                TRACE(templ, 0, nm + "(" + ss + ") -> " +
+                      std::string(clone->id->get_str()) + "  (instance " +
+                      std::to_string(tmpl_inst_count[tmpl]) + ")");
+            }
         }
         if (!clone)
             continue;
@@ -1160,6 +1174,16 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
         hint = ArrHint::general;
     } else {
         return;
+    }
+
+    if (trace_enabled(TraceCat::arrays)) {
+        const char *hn = hint == ArrHint::flat_i ? "flat (ints)"
+                       : hint == ArrHint::flat_f ? "flat (floats)"
+                       : hint == ArrHint::flat_b ? "flat (bools)"
+                       : hint == ArrHint::flat_s ? "flat (structs)"
+                                                 : "general";
+        TRACE(arrays, 0, std::string(id->get_str()) + "  dest " +
+              sty_to_string(ty) + " -> " + hn);
     }
 
     /* the element struct type, needed by an empty flat_s array literal */

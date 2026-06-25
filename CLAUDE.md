@@ -124,7 +124,16 @@ Running scripts:
 ./build/mylang --debug-ti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization
 ./build/mylang -a --no-color F   # same, plain (for piping / diffing)
+./build/mylang -T CATS FILE      # trace the compiler's reasoning to stderr
+./build/mylang --trace all FILE  # CATS: infer,inline,specialize,template,
+                                 # autoconst,autopure,arrays,fold, or all
 ```
+`-T`/`--trace` enables diagnostic trace categories (see `trace.{h,cpp}` and the
+REPL `:trace`) BEFORE compilation, so a script run narrates each optimizer
+decision to stderr (colored on a stderr TTY). The same categories drive the
+`trace()`/`traceoff()`/`tracing()` builtins and the REPL `:trace [<cat>...]
+on|off`. OFF by default — zero cost on a normal run (one mask test per guarded
+site).
 `--debug-ti` runs inference (non-strict) and prints one tab-separated `ti`
 record per declared identifier — `name, kind (var|const|param|func), line, col,
 const, type, uses(line:col,...)` — then exits without running. It is the audit
