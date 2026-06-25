@@ -78,6 +78,10 @@ public:
     std::vector<std::string> func_param_types(const FuncDeclStmt *fn);
     std::string func_return_type(const FuncDeclStmt *fn);
 
+    /* REPL instance GC - true if this template/spec instance is still consumed
+     * by a function body (so redefining its base must not remove it). */
+    bool instance_has_consumer(const FuncDeclStmt *fn);
+
 private:
 
     struct Impl;

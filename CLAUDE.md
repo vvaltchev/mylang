@@ -1740,7 +1740,19 @@ struct can be REDEFINED at the prompt** (the edit-and-resubmit workflow):
 (structs/pure funcs register in the const ctx at parse time), and the
 `FuncDeclStmt`/`StructDeclStmt` eval paths erase-then-rebind under it instead of
 throwing `AlreadyDefinedEx`. A plain `var`'s TYPE still sticks (the inferencer's
-job — see the type-commitment above; `undef` resets it).
+job — see the type-commitment above; `undef` resets it). **Redefining a function
+GCs its now-orphaned template/spec instances** (`gc_redefined_instances` in
+`do_eval`): an instance (`f$0`) created only by a throwaway top-level call
+(`f(1,2)` at the prompt) is removed from both scopes + the inferencer when its
+base `f` is redefined, so `globals()`/`specializations(f)`/`:show f` stop
+showing it; an instance still **consumed by a function body** is kept (else
+calling that function would break). "Consumed" is tracked soundly in the
+inferencer: `collect_calls` carries an `in_func` flag (a call below a
+`FuncDeclStmt` in the complete `for_each_child` walk), and `instantiate_round`
+sets `FuncInfo::has_func_consumer` when it redirects an in-function call to the
+instance; `ReplInfer::instance_has_consumer` exposes it. Only instances present
+*before* the input (so not the new ones it just created) and whose base name
+this input redefined are candidates.
 
 **Faithful per-input pipeline.** `do_eval` runs the REAL pipeline on each input
 (after parse): `ReplInfer::check_input` (type inference + checking) →

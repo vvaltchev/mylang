@@ -97,6 +97,14 @@ struct FuncInfo {
     bool falls_through = false;
     bool pinned = false;         /* committed by a prior REPL input */
     /*
+     * REPL: set when a call INSIDE a function body is redirected to this
+     * template/spec instance - i.e. the instance has a live consumer (another
+     * function), so it must NOT be garbage-collected when its base function is
+     * redefined. An instance reached only from a top-level throwaway
+     * expression (`f(1,2)` at the prompt) stays false and is GC'd on redefine.
+     */
+    bool has_func_consumer = false;
+    /*
      * A TEMPLATE: at least one parameter is un-annotated and not explicitly
      * `dyn`, so its type is not fixed by the declaration. Such a function is
      * not type-checked in isolation; it is instantiated per call-site signature
@@ -132,6 +140,9 @@ public:
      * for an un-instantiated template (unbound) or an unknown function. */
     std::vector<std::string> func_param_types(const FuncDeclStmt *fn);
     std::string func_return_type(const FuncDeclStmt *fn);
+    /* REPL instance GC: does this template/spec instance have a function
+     * consumer (a redirected call inside a function body)? */
+    bool instance_has_consumer(const FuncDeclStmt *fn);
 
     bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
     bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
@@ -248,7 +259,9 @@ private:
                                       Block *root);
     std::string template_sig_key(FuncInfo *tmpl,
                                   const std::vector<STyRef> &sig);
-    void collect_calls(Construct *n, std::vector<CallExpr *> &out);
+    void collect_calls(Construct *n,
+                       std::vector<std::pair<CallExpr *, bool>> &out,
+                       bool in_func = false);
 
     /* check pass */
     void check(Construct *n);
@@ -520,13 +533,17 @@ void Inferencer::run_fixpoint(Block *rootBlock)
 }
 
 /* Every CallExpr in the subtree (complete traversal). */
-void Inferencer::collect_calls(Construct *n, std::vector<CallExpr *> &out)
+void Inferencer::collect_calls(Construct *n,
+                               std::vector<std::pair<CallExpr *, bool>> &out,
+                               bool in_func)
 {
     if (!n)
         return;
     if (auto *c = dynamic_cast<CallExpr *>(n))
-        out.push_back(c);
-    for_each_child(n, [&](Construct *c) { collect_calls(c, out); });
+        out.push_back({ c, in_func });
+    /* a call below a FuncDeclStmt is inside a function body (a live use) */
+    const bool inside = in_func || (dynamic_cast<FuncDeclStmt *>(n) != nullptr);
+    for_each_child(n, [&](Construct *c) { collect_calls(c, out, inside); });
 }
 
 /* Dedup key for an instantiation: the template identity + the signature. */
@@ -625,12 +642,14 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
  */
 bool Inferencer::instantiate_round(Block *rootBlock)
 {
-    std::vector<CallExpr *> calls;
+    std::vector<std::pair<CallExpr *, bool>> calls;
     for (auto &e : rootBlock->elems)
         collect_calls(e.get(), calls);
 
     bool progress = false;
-    for (CallExpr *call : calls) {
+    for (const auto &call_pair : calls) {
+        CallExpr *call = call_pair.first;
+        const bool call_in_func = call_pair.second;
         FuncInfo *tmpl = callee_funcinfo(call->what.get());
         if (!tmpl || !tmpl->is_template)
             continue;
@@ -716,6 +735,11 @@ bool Inferencer::instantiate_round(Block *rootBlock)
 
         if (!clone_sym)
             continue;                   /* couldn't resolve the instance */
+
+        /* mark the instance as having a live consumer when this redirected call
+         * is inside a function body (so a redefine of the base won't GC it) */
+        if (call_in_func && clone_sym->func)
+            clone_sym->func->has_func_consumer = true;
 
         if (trace_enabled(TraceCat::templ)) {
             std::string ss;
@@ -1044,6 +1068,17 @@ Inferencer::func_return_type(const FuncDeclStmt *fn)
         return sty_to_string(up->ret);
     }
     return "";
+}
+
+bool
+Inferencer::instance_has_consumer(const FuncDeclStmt *fn)
+{
+    if (!fn)
+        return true;                /* unknown: keep (conservative) */
+    for (auto &up : all_funcs)
+        if (up->decl == fn)
+            return up->has_func_consumer;
+    return true;
 }
 
 /*
@@ -3580,4 +3615,9 @@ std::vector<std::string> ReplInfer::func_param_types(const FuncDeclStmt *fn)
 std::string ReplInfer::func_return_type(const FuncDeclStmt *fn)
 {
     return impl->inf.func_return_type(fn);
+}
+
+bool ReplInfer::instance_has_consumer(const FuncDeclStmt *fn)
+{
+    return impl->inf.instance_has_consumer(fn);
 }
