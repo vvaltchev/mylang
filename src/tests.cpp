@@ -7814,6 +7814,14 @@ static const std::vector<repl_test> repl_tests =
       { { ":trace bogus on", "Unknown trace category" },
         { ":trace off", "tracing: off" } } },
 
+    { "trace: :trace help lists the categories",
+      { { ":trace help", "autopure" } } },
+
+    { "help: :help :trace and :help trace both reach the tracer",
+      { { ":help :trace", "[REPL command]" },
+        { ":help trace", "also a REPL command" },
+        { ":help commands", ":source <file>" } } },
+
     /* ---- :globals / :type rich inspection views ---- */
     { ":globals lists a function with its signature",
       { { "var gv = 7", "=> 7" },
@@ -8271,6 +8279,24 @@ static bool trace_pipeline_categories()
     return ok;
 }
 
+static bool replhelp_commands()
+{
+    /* the commands index + an explicit-colon command lookup */
+    if (!help_has("commands", ":trace"))             return false;
+    if (!help_has("commands", ":globals"))           return false;
+    if (!help_has(":trace", "[REPL command]"))       return false;
+    if (!help_has(":globals", "const context"))      return false;
+    /* a no-colon name that is a command but not a builtin */
+    if (!help_has("source", "[REPL command]"))       return false;
+    /* a name that is BOTH a builtin and a command: the builtin entry, plus a
+     * pointer to the command (the user's ":help trace" case) */
+    if (!help_has("trace", "trace(category, on)"))   return false;
+    if (!help_has("trace", "also a REPL command"))   return false;
+    /* and the trace builtin lists the categories (the original complaint) */
+    if (!help_has("trace", "autopure"))              return false;
+    return true;
+}
+
 static bool replhelp_unknown_and_topics()
 {
     if (!help_has("no_such_thing", "No help for"))   return false;
@@ -8292,6 +8318,7 @@ static const std::vector<extra_check> extra_checks =
     { "replhelp: overview + builtins index", replhelp_overview_and_builtins },
     { "replhelp: builtin entries + kind note", replhelp_builtin_entries },
     { "replhelp: language reference", replhelp_language_reference },
+    { "replhelp: REPL commands + colon lookup", replhelp_commands },
     { "replhelp: unknown topic + completion", replhelp_unknown_and_topics },
     { "trace: module set/emit/active basics", trace_module_basics },
     { "trace: every category narrates a decision", trace_pipeline_categories },

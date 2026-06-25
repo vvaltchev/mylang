@@ -123,6 +123,16 @@ const BuiltinDoc builtin_docs[] = {
   "True if f is effectively pure (declared pure OR proven pure).", nullptr },
 { "ispuredecl", "reflect", "ispuredecl(f)",
   "True only if f was explicitly declared pure.", nullptr },
+{ "trace", "reflect", "trace(category, on)",
+  "Enable/disable a diagnostic trace category that narrates the compiler.",
+  "category is one of: infer, inline, specialize, template, autoconst, "
+  "autopure, arrays, fold, or all. In the REPL use :trace; for a whole script "
+  "use mylang --trace <cats> file (a script is fully compiled before it runs, "
+  "so a runtime trace() call can't show its own compilation)." },
+{ "traceoff", "reflect", "traceoff()",
+  "Disable all diagnostic trace categories.", nullptr },
+{ "tracing", "reflect", "tracing()",
+  "The active trace categories as a sorted array<str>.", nullptr },
 
 /* --- array --- */
 { "array", "array", "array(n, [fill])",
@@ -647,6 +657,61 @@ const CatInfo *find_lang_cat(const string &id)
     return nullptr;
 }
 
+/* ------------------------ REPL command documentation --------------------- */
+
+struct CommandDoc {
+    const char *name;      /* the command word, WITHOUT the leading ':' */
+    const char *syntax;
+    const char *summary;
+    const char *longd;     /* or nullptr */
+};
+
+const CommandDoc command_docs[] = {
+    { "help", ":help [topic]",
+      "Open this reference.",
+      "topic is a builtin, a language category/feature, or a command. "
+      ":help builtins and :help language list those; :help commands lists "
+      "the commands. A leading ':' is optional (:help :trace = :help trace)." },
+    { "trace", ":trace [<cat>...] on|off",
+      "Toggle the diagnostic tracer that narrates the compiler's reasoning.",
+      "With no argument it shows the active categories; ':trace help' lists "
+      "them; ':trace off' disables all. Categories: infer, inline, specialize, "
+      "template, autoconst, autopure, arrays, fold (or all). The trace prints "
+      "just above the result as the next input compiles. (Script equivalent: "
+      "mylang --trace <cats> file; or the trace()/traceoff()/tracing() "
+      "builtins.)" },
+    { "globals", ":globals",
+      "A table of every global (vars, consts, funcs, structs) with its type.",
+      "Merges the runtime scope with the const context, so folded const "
+      "SCALARS appear too. See also the globals() builtin." },
+    { "type", ":type <expr>",
+      "Show a type without committing anything.",
+      "For a bare committed global, the inferencer's inferred/declared static "
+      "type; for any other expression, its runtime structural type (evaluated "
+      "in a throwaway scope). See also the typeof() builtin." },
+    { "tree", ":tree <code>",
+      "Print the const-folded syntax tree of <code> (non-committing).",
+      "Shows what survived parse-time folding, e.g. :tree 2 + 3 * 4 -> "
+      "Int(14)." },
+    { "analyze", ":analyze <code>",
+      "Reprint <code> colored by which optimizations fired (non-committing).",
+      "The -a/--analyze view: auto-const, flat vs dyn arrays, inlined, "
+      "specialized, folded, dead code." },
+    { "source", ":source <file>",
+      "Evaluate a file as if it were typed at the prompt, one unit at a time.",
+      nullptr },
+    { "quit", ":quit",
+      "Exit the REPL (also Ctrl-D at the prompt).", nullptr },
+};
+
+const CommandDoc *find_command(const string &name)
+{
+    for (const CommandDoc &c : command_docs)
+        if (name == c.name)
+            return &c;
+    return nullptr;
+}
+
 /* ------------------------------ rendering -------------------------------- */
 
 /* Wrap a comma-separated name list to ~72 columns under a 2-space indent. */
@@ -759,6 +824,28 @@ void render_feature(std::ostream &o, const LangFeature &f, bool color)
     o << f.body << "\n";
 }
 
+void render_command_entry(std::ostream &o, const CommandDoc &c, bool color)
+{
+    const Pal p = palette(color);
+    o << p.sig << c.syntax << p.rst << "\n";
+    o << "    " << c.summary << "\n";
+    if (c.longd)
+        o << "    " << c.longd << "\n";
+    o << p.dim << "    [REPL command]" << p.rst << "\n";
+}
+
+void render_commands_index(std::ostream &o, bool color)
+{
+    const Pal p = palette(color);
+    o << p.hdr << "REPL commands" << p.rst
+      << p.dim << "  (:help <command> for one; the leading ':' is optional)"
+      << p.rst << "\n\n";
+    for (const CommandDoc &c : command_docs) {
+        o << p.sig << "  " << c.syntax << p.rst << "\n";
+        o << "      " << c.summary << "\n";
+    }
+}
+
 void render_overview(std::ostream &o, bool color)
 {
     const Pal p = palette(color);
@@ -776,11 +863,13 @@ void render_overview(std::ostream &o, bool color)
       << "        one language category\n";
     o << "  " << p.kw << ":help <feature>" << p.rst
       << "         one language feature (incl. optimizations)\n";
+    o << "  " << p.kw << ":help commands" << p.rst
+      << "          the REPL commands (:help <command> for one)\n";
     o << "Inspection:\n";
     o << "  " << p.kw << ":globals" << p.rst
       << "  :type <expr>  :tree <code>  :analyze <code>\n";
     o << "  " << p.kw << ":trace <cat> on|off" << p.rst
-      << "     narrate the compiler's reasoning\n";
+      << "     narrate the compiler's reasoning (:trace help)\n";
     o << "Session: " << p.kw << ":source <file>" << p.rst
       << "  :quit\n";
 }
@@ -805,6 +894,20 @@ repl_help(const string &topic, bool color)
         return o.str();
     }
 
+    /* A leading ':' means the user is naming a REPL command explicitly
+     * (:help :trace == :help trace); strip it and remember. */
+    bool had_colon = false;
+    if (t[0] == ':') {
+        had_colon = true;
+        t = t.substr(1);
+        const size_t a = t.find_first_not_of(" \t");
+        t = (a == string::npos) ? string() : t.substr(a);
+        if (t.empty()) {                 /* ":help :" -> the commands index */
+            render_commands_index(o, color);
+            return o.str();
+        }
+    }
+
     /* first word + remainder */
     string w0 = t, rest;
     {
@@ -815,6 +918,11 @@ repl_help(const string &topic, bool color)
             if (r != string::npos)
                 rest = t.substr(r);
         }
+    }
+
+    if (w0 == "commands") {
+        render_commands_index(o, color);
+        return o.str();
     }
 
     if (w0 == "builtins") {
@@ -834,9 +942,29 @@ repl_help(const string &topic, bool color)
         return o.str();
     }
 
-    /* a single topic: builtin, then language category, then language feature */
-    if (const BuiltinDoc *d = find_builtin(t)) {
-        render_builtin_entry(o, *d, color);
+    /*
+     * A single topic. With an explicit ':' the user means the COMMAND, so try
+     * that first. Otherwise resolve builtin -> command -> language category ->
+     * language feature. When a builtin and a same-named command coexist (trace,
+     * type, globals), show the builtin and point at the command for discovery.
+     */
+    const CommandDoc *cmd = find_command(t);
+    const BuiltinDoc *bi = find_builtin(t);
+    const Pal p = palette(color);
+
+    if (had_colon && cmd) {
+        render_command_entry(o, *cmd, color);
+        return o.str();
+    }
+    if (bi) {
+        render_builtin_entry(o, *bi, color);
+        if (cmd)
+            o << p.dim << "    (also a REPL command - :help :" << t << ")"
+              << p.rst << "\n";
+        return o.str();
+    }
+    if (cmd) {
+        render_command_entry(o, *cmd, color);
         return o.str();
     }
     if (const CatInfo *c = find_lang_cat(t)) {
@@ -848,8 +976,8 @@ repl_help(const string &topic, bool color)
         return o.str();
     }
 
-    o << "No help for '" << t << "'. Try :help, :help builtins, or "
-      << ":help language\n";
+    o << "No help for '" << (had_colon ? ":" : "") << t
+      << "'. Try :help, :help builtins, :help language, or :help commands\n";
     return o.str();
 }
 
@@ -863,12 +991,16 @@ repl_help_topics(const string &prefix)
     std::vector<string> out;
     if (pre("builtins")) out.push_back("builtins");
     if (pre("language")) out.push_back("language");
+    if (pre("commands")) out.push_back("commands");
     for (const CatInfo &c : builtin_cats)
         if (pre(c.id))
             out.push_back(c.id);
     for (const BuiltinDoc &d : builtin_docs)
         if (pre(d.name))
             out.push_back(d.name);
+    for (const CommandDoc &c : command_docs)
+        if (pre(c.name))
+            out.push_back(c.name);
     if (!lang_db_empty()) {
         for (const CatInfo &c : lang_cats)
             if (pre(c.id))
