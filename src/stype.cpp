@@ -2,6 +2,7 @@
 
 #include "stype.h"
 #include "uniqueid.h"
+#include "defs.h"       /* ML_CHECK */
 
 /*
  * M0 of the type-inference feature: the static-type lattice and its operations.
@@ -54,6 +55,9 @@ STyRef STyArena::fresh_var()
 
 STyRef STyArena::array_of(STyRef elem, bool opt)
 {
+    /* a structural type's components are always real STyRefs (Unknown at worst,
+     * never null) - a null would null-deref in resolve/join/equal/to_string */
+    ML_CHECK(elem != nullptr);
     STyRef t = alloc(STyKind::Array);
     t->elem = elem;
     t->opt = opt;
@@ -62,6 +66,7 @@ STyRef STyArena::array_of(STyRef elem, bool opt)
 
 STyRef STyArena::dict_of(STyRef key, STyRef val, bool opt)
 {
+    ML_CHECK(key != nullptr && val != nullptr);
     STyRef t = alloc(STyKind::Dict);
     t->key = key;
     t->val = val;
@@ -83,6 +88,9 @@ STyRef STyArena::func_of(std::vector<STyRef> params,
                          STyRef ret,
                          bool opt)
 {
+    ML_CHECK(ret != nullptr);
+    /* one opt flag per param, so a call's nullability check can't index OOB */
+    ML_CHECK(param_opt.size() == params.size());
     STyRef t = alloc(STyKind::Func);
     t->params = std::move(params);
     t->param_opt = std::move(param_opt);
@@ -147,6 +155,9 @@ STyRef sty_resolve(STyRef t)
         t = next;
     }
 
+    /* the representative is a proper root: a concrete kind, or an unbound var
+     * (no link). If this fails the union-find graph has a cycle. */
+    ML_CHECK(r && (r->kind != STyKind::Unknown || !r->link));
     return r;
 }
 
