@@ -18,6 +18,12 @@
 #include <ostream>
 #include <cstdio>
 
+/* TEMPORARY: super-heavy template-monomorphization instrumentation to root-cause
+ * the MSVC-release-only cross-input REPL bug. Drop / compile out at the end. */
+#define TMPL_INSTR 1
+#define TMPL_NAME(t) ((t)->decl->id \
+    ? std::string((t)->decl->id->get_str()).c_str() : "<lam>")
+
 /*
  * Whole-program static type inference + checking. See plans/type-inference.md
  * and plans/type-inference-questions.md for the design and decisions.
@@ -521,12 +527,31 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     auto *fc = static_cast<FuncDeclStmt *>(cl.get());
     fc->display_name = tmpl->decl->id
         ? std::string(tmpl->decl->id->get_str()) : std::string("<lambda>");
-    fc->id = make_unique<Identifier>(
-        "$tmpl" + std::to_string(tmpl_clone_counter++));
+    const int my_n = tmpl_clone_counter++;
+    fc->id = make_unique<Identifier>("$tmpl" + std::to_string(my_n));
+#if TMPL_INSTR
+    fprintf(stderr, "ZZ MAKE tmpl=%p name=%s -> newid=$tmpl%d fc=%p "
+            "fc_idnode=%p fc_uid=%p key=%s\n", (void *)tmpl, TMPL_NAME(tmpl),
+            my_n, (void *)fc, (void *)fc->id.get(), (void *)fc->id->uid,
+            key.c_str());
+#endif
 
     walk_struct(fc, global);            /* declare its name + build its syms */
-    if (FuncInfo *cfi = func_of_decl[fc])
+    FuncInfo *cfi = func_of_decl.count(fc) ? func_of_decl[fc] : nullptr;
+    if (cfi)
         cfi->is_template = false;         /* an instantiation is concrete */
+#if TMPL_INSTR
+    {
+        auto its = id_sym.find(fc->id.get());
+        fprintf(stderr, "ZZ MAKE-done fc=%p cfi=%p id_sym[idnode]=%p "
+                "(==cfi's sym? func=%p) global[uid]=%p\n", (void *)fc,
+                (void *)cfi, (void *)(its != id_sym.end() ? its->second : 0),
+                (void *)(its != id_sym.end() && its->second
+                         ? its->second->func : 0),
+                (void *)(global->syms.count(fc->id->uid)
+                         ? global->syms[fc->id->uid] : 0));
+    }
+#endif
 
     FuncDeclStmt *raw = fc;
     rootBlock->elems.insert(rootBlock->elems.begin(), move(cl));
@@ -552,17 +577,7 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         if (!tmpl || !tmpl->is_template)
             continue;
 
-        /*
-         * REPL: only instantiate a template DECLARED IN THIS INPUT. A template
-         * committed by a PRIOR input (`pinned`) is left as a dynamic call - it
-         * evaluates correctly via the tree-walker (just not monomorphized), and
-         * this avoids cloning a prior input's already-resolved/evaluated decl
-         * across the persistent session state (a fragile cross-input path). In
-         * the one-shot script path nothing is pinned, so all templates
-         * instantiate as before. See plans/function-templates.md.
-         */
-        if (tmpl->pinned)
-            continue;
+        /* (cross-input re-enabled; instrumented to root-cause the MSVC bug) */
 
         /* Arity must be in the legal range [min, nparams] (a trailing opt param
          * may be omitted); else leave the call for check_call to report. */
@@ -586,6 +601,10 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
                 continue;       /* not a template param */
             STyRef t = sty_resolve(type_of(call->args->elems[i].get()));
+#if TMPL_INSTR
+            fprintf(stderr, "ZZ   arg[%zu] type=%s unknown=%d\n", i,
+                    sty_to_string(t).c_str(), is_unknown(t));
+#endif
             if (is_unknown(t)) { ready = false; break; }
             sig.push_back(t);
         }
@@ -594,6 +613,24 @@ bool Inferencer::instantiate_round(Block *rootBlock)
 
         const std::string key = template_sig_key(tmpl, sig);
         auto it = tmpl_cache.find(key);
+#if TMPL_INSTR
+        {
+            std::string sigs;
+            for (STyRef t : sig) { sigs += sty_to_string(t); sigs += " "; }
+            fprintf(stderr,
+                "ZZ call tmpl=%p name=%s pinned=%d nargs=%zu sig=[%s] "
+                "key=%s HIT=%d cacheN=%zu counter=%d\n",
+                (void *)tmpl, TMPL_NAME(tmpl), tmpl->pinned, nargs,
+                sigs.c_str(), key.c_str(), it != tmpl_cache.end(),
+                tmpl_cache.size(), tmpl_clone_counter);
+            for (auto &kv : tmpl_cache)
+                fprintf(stderr, "ZZ   cacheentry key=%s -> clone=%p id=%s\n",
+                        kv.first.c_str(), (void *)kv.second,
+                        kv.second && kv.second->id
+                            ? std::string(kv.second->id->get_str()).c_str()
+                            : "?");
+        }
+#endif
         FuncDeclStmt *clone;
         if (it != tmpl_cache.end()) {
             clone = it->second;
@@ -626,6 +663,21 @@ bool Inferencer::instantiate_round(Block *rootBlock)
          * two clones ever shared a name, which manifested (MSVC release) as a
          * call resolving to the wrong (prior) instance. */
         auto cs = id_sym.find(clone->id.get());
+#if TMPL_INSTR
+        {
+            TypeSym *rsym = (cs != id_sym.end()) ? cs->second : nullptr;
+            FuncInfo *rf = rsym ? rsym->func : nullptr;
+            FuncInfo *cfi = func_of_decl.count(clone) ? func_of_decl[clone]
+                                                      : nullptr;
+            fprintf(stderr,
+                "ZZ   redirect clone_id=%s clone=%p clone_idnode=%p cfi=%p "
+                "rsym=%p rsym_func=%p (cfi==rf? %d) what_uid=%p clone_uid=%p\n",
+                std::string(clone->id->get_str()).c_str(), (void *)clone,
+                (void *)clone->id.get(), (void *)cfi, (void *)rsym,
+                (void *)rf, cfi == rf,
+                (void *)what->uid, (void *)clone->id->uid);
+        }
+#endif
         id_sym[what.get()] = (cs != id_sym.end()) ? cs->second : nullptr;
         /* The old callee Identifier is about to be freed: drop its id_sym entry
          * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
@@ -791,6 +843,11 @@ void Inferencer::infer_input(Block *rootBlock)
      * stays monotonic, so names never collide in the persistent global scope.
      */
     tmpl_cache.clear();
+#if TMPL_INSTR
+    fprintf(stderr, "ZZ ===== INFER_INPUT cleared cache; counter=%d "
+            "all_funcs=%zu all_syms=%zu\n", tmpl_clone_counter,
+            all_funcs.size(), all_syms.size());
+#endif
 
     const size_t sym_base = all_syms.size();
     const size_t func_base = all_funcs.size();
