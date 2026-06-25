@@ -33,8 +33,19 @@ uint64_t Construct::next_node_id = 1;
 #include <cstdlib>
 #include <new>
 
-#if defined(__SANITIZE_ADDRESS__) || \
-    (defined(__has_feature) && __has_feature(address_sanitizer))
+/* Detect ASan portably. __SANITIZE_ADDRESS__ is GCC's (and clang's) macro;
+ * __has_feature is clang-only - and must be tested in a SEPARATE, nested #if,
+ * because GCC's preprocessor still parses `__has_feature(...)` in a combined
+ * `defined(__has_feature) && __has_feature(...)` expression and errors on it. */
+#if defined(__SANITIZE_ADDRESS__)
+#  define RECYCLE_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define RECYCLE_ASAN 1
+#  endif
+#endif
+
+#ifdef RECYCLE_ASAN
 #  include <sanitizer/asan_interface.h>
 #  define RECYCLE_POISON(p, n)   __asan_poison_memory_region((p), (n))
 #  define RECYCLE_UNPOISON(p, n) __asan_unpoison_memory_region((p), (n))
