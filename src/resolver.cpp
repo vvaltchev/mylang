@@ -1029,6 +1029,11 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
         for (auto &p : n->elems) {
             fn(p.second.get());
         }
+    } else if (auto *n = dynamic_cast<TypedScalarExpr *>(c)) {
+        /* an M8 specialized node: same elems shape as MultiOpConstruct. The
+         * inliner normally runs before specialize_types and never sees one,
+         * but a CROSS-INPUT inlined prior body is already specialized. */
+        for (auto &p : n->elems) fn(p.second.get());
     } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
         fn(n->what.get());
         fn(n->args.get());
@@ -1434,6 +1439,10 @@ for_each_child_slot(Construct *c,
     if (auto *n = dynamic_cast<SingleChildConstruct *>(c)) {
         fn(n->elem);
     } else if (auto *n = dynamic_cast<MultiOpConstruct *>(c)) {
+        for (auto &p : n->elems) fn(p.second);
+    } else if (auto *n = dynamic_cast<TypedScalarExpr *>(c)) {
+        /* M8 specialized node (same elems shape); a cross-input inlined prior
+         * body is already specialized, so substitution must descend here. */
         for (auto &p : n->elems) fn(p.second);
     } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
         fn(n->what);
@@ -2210,6 +2219,7 @@ private:
     static bool is_foldable_expr(const Construct *c)
     {
         return dynamic_cast<const MultiOpConstruct *>(c)
+            || dynamic_cast<const TypedScalarExpr *>(c)  /* M8: cross-input */
             || dynamic_cast<const Subscript *>(c)
             || dynamic_cast<const Slice *>(c)
             || dynamic_cast<const MemberExpr *>(c)

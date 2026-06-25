@@ -7923,6 +7923,16 @@ static const std::vector<repl_test> repl_tests =
         { ":show xc2$0", "x + " },                  /* caller inlined away */
         { ":show xc2$0", "6" } } },                 /* 2*3 folded to 6 */
 
+    /* cross-input inline must substitute a param used TWICE even inside an M8
+     * TypedScalarExpr node (the prior body is post-specialization): regression
+     * for `func mk(a)=>[a, a*2]` inlined cross-input dropping the 2nd `a`. */
+    { ":show cross-input inline substitutes a param used twice (M8 body)",
+      { { "func mk2(a) => [a, a * 2, a + a]", "" },
+        { "mk2(3)", "" },                           /* creates mk2$0 */
+        { "func um2() => mk2(5)", "" },             /* cross-input inline */
+        { "um2()", "=> [5, 10, 10]" },              /* correct at runtime */
+        { ":show um2", "[5, 10, 10]" } } },         /* all `a` subst + folded */
+
     /* a template instance appending to a PINNED global array must not trip the
      * global's assignability check before the arg type settles (defer-on-
      * Unknown for array<?> -> the element type). */
