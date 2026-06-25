@@ -129,20 +129,27 @@ The trace fires inside the REPL's real per-input pipeline (`check_input` →
 ## Phasing (commit per step)
 
 0. **Plan** (this file). ✅
-1. **Pillar 1** reflection builtins + `reflect:` tests + README. 
+1. **Pillar 1** reflection builtins + `reflect:` tests + README. ✅
 2. **Pillar 2a** `replhelp` builtins reference (`:help builtins[/cat]`, `:help
-   <builtin>`) + tests.
+   <builtin>`) + tests. ✅
 3. **Pillar 2b** `replhelp` language reference (`:help language`, categories,
-   features incl. optimizations) + tests.
+   features incl. optimizations) + tests. ✅
 4. **Pillar 3a** `trace` module + control surface (builtin + `:trace`) wired
-   with the `infer` category + tests.
+   with the `infer` category + tests. ✅
 5. **Pillar 3b** remaining trace categories (inline, specialize, template,
-   autoconst, autopure, arrays, fold) + tests.
-6. **`:globals` / `:type <expr>`** rich REPL views backed by a small ReplInfer
-   query API (pinned globals + their inferred static types, const scalars from
-   the const ctx) + tests.
-7. **Docs sync**: README (builtins + `:help`/`:trace`/reflection), CLAUDE.md
-   (the new modules, the trace mechanism, the reflection builtins).
+   autoconst, autopure, arrays, fold) + the `--trace` CLI flag + tests. ✅
+6. **`:globals` / `:type <expr>`** rich REPL views backed by
+   `ReplInfer::global_type` (committed globals' inferred static types, const
+   scalars merged from the const ctx) + tests. ✅
+7. **Docs sync**: README (builtins + `:help`/`:trace`/`:globals`/`:type` +
+   `--trace`), CLAUDE.md (the `trace`/`replhelp` TUs, `reflect.{h,cpp.h}`, the
+   trace mechanism, the reflection builtins, the meta-commands). ✅
+
+**Status: all seven phases landed.** Possible follow-ups (not blocking): a
+`:type` that runs a non-committing inference *probe* for an arbitrary
+expression (today it shows a bare global's inferred type, else the runtime
+type); Tab-completion of `:help` topics (the `repl_help_topics` helper exists
+but is not wired into the completer); a `:trace verbose` step-by-step level.
 
 ## Open questions (decide as we go)
 
