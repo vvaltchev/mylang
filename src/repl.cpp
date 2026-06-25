@@ -776,7 +776,7 @@ ReplEngine::Impl::cmd_show(const string &arg)
         return "'" + arg + "' is not a function\n";
 
     std::ostringstream o;
-    o << render_func_code(base);
+    o << render_func_code(base, infer.func_param_types(base));
 
     /* also its `<name>$N` clones (display_name == arg), sorted by name */
     std::vector<std::pair<string, const FuncDeclStmt *>> clones;
@@ -788,7 +788,8 @@ ReplEngine::Impl::cmd_show(const string &arg)
     std::sort(clones.begin(), clones.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
     for (const auto &c : clones)
-        o << "\n" << render_func_code(c.second);
+        o << "\n" << render_func_code(c.second,
+                                      infer.func_param_types(c.second));
 
     return o.str();
 }

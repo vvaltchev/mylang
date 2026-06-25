@@ -5,9 +5,11 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <vector>
 
 class Construct;
 class UniqueId;
+class FuncDeclStmt;
 
 /*
  * Whole-program static type inference + checking (see plans/type-inference.md).
@@ -70,6 +72,10 @@ public:
      * is not a committed inferred symbol - e.g. a const scalar folded away).
      * Backs the REPL :globals enrichment. */
     std::string global_type(const UniqueId *name);
+
+    /* The inferred type of each parameter of `fn` (for :show); empty for an
+     * un-instantiated template or an unknown function. */
+    std::vector<std::string> func_param_types(const FuncDeclStmt *fn);
 
 private:
 
