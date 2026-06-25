@@ -1694,6 +1694,14 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         else
             ret = move(ifstmt->elseBlock);
 
+        /* The taken branch is empty (a const-false `if` with no `else`, or a
+         * const-true `if` with an empty body): the whole statement folds away.
+         * Yield a Nop (which pBlock discards) rather than a NULL statement -
+         * pStmt returns this to pBlock, and a NULL would be read as end-of-block
+         * and make the NEXT statement a syntax error. */
+        if (!ret)
+            ret = make_unique<NopConstruct>();
+
     } else {
         ret = move(ifstmt);
     }
@@ -1735,7 +1743,9 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             if (c.analysis)
                 c.analysis->mark_dead(whileStmt->start,
                     whileStmt->body ? whileStmt->body->end : whileStmt->end);
-            ret.reset();
+            /* a Nop, not NULL: pBlock discards it; a NULL would be read as
+             * end-of-block and make the next statement a syntax error. */
+            ret = make_unique<NopConstruct>();
             return true;
         }
     }
@@ -2496,7 +2506,9 @@ pAcceptForeachStmt(ParseContext &c,
         try {
 
             if (v.get_type()->len(v) == 0) {
-                ret.reset();
+                /* never iterates: fold away. A Nop (not NULL) so pBlock
+                 * discards it; a NULL would be read as end-of-block. */
+                ret = make_unique<NopConstruct>();
                 return true;
             }
 

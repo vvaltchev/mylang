@@ -1756,6 +1756,23 @@ static const std::vector<test> tests =
     { "lexer: a malformed number is a syntax error",
       { "var x = 1.2.3;" }, &typeid(SyntaxErrorEx) },
 
+    /* parse-time dead-code folding must yield a Nop (not a NULL statement),
+     * else the FOLLOWING statement is a spurious syntax error. */
+    { "dead-code: const-false if (no else) then a statement",
+      { "func d1() { if (false) { return 99; } return 7; }",
+        "assert(d1() == 7);" } },
+    { "dead-code: const-true if (empty body) then a statement",
+      { "func d2() { if (true) { } return 5; }",
+        "assert(d2() == 5);" } },
+    { "dead-code: while(false) then a statement",
+      { "func d3() { while (false) { return 9; } return 3; }",
+        "assert(d3() == 3);" } },
+    { "dead-code: foreach over an empty literal then a statement",
+      { "func d4() { foreach (var e in []) { return e; } return 4; }",
+        "assert(d4() == 4);" } },
+    { "dead-code: const-false if at top level then a statement",
+      { "if (false) { assert(false); } var ok = 1; assert(ok == 1);" } },
+
     /* ---- resolver (resolver.cpp): auto-const DCE & auto-pure analysis ---- */
     {
         "auto-const DCE: dead branches dropped after promotion",
