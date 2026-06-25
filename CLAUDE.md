@@ -862,14 +862,26 @@ wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
 
 ### Function templates (monomorphization)
 
-A **named** function with ≥1 un-annotated, non-`dyn`, non-`opt` parameter is a
-**template** (`FuncInfo::is_template`, set in `declare_funcdecl`): not
-type-checked in isolation, but **instantiated per call-site signature** as a
-typed clone the ordinary concrete-function path handles. So `func f(x){var
-t=x+1; return t;}` never needs `var dyn t`, a never-called template never
-errors, and `f(1); f("s")` makes two instances not a type conflict. `dyn` is the
-explicit one-instance-any-type param; an `opt` param or a lambda keeps the join
-model (v1). Full design + deferrals: `plans/function-templates.md`.
+A **named** function with ≥1 *template param* — un-annotated, non-`dyn`,
+non-`opt` — is a **template** (`FuncInfo::is_template`, set in
+`declare_funcdecl`): not type-checked in isolation, but **instantiated per
+call-site signature** as a typed clone the ordinary concrete-function path
+handles. So `func f(x){var t=x+1; return t;}` never needs `var dyn t`, a
+never-called template never errors, and `f(1); f("s")` makes two instances not a
+type conflict. `dyn` is the explicit one-instance-any-type param. Full design +
+deferrals: `plans/function-templates.md`.
+
+**`opt`/typed params coexist with template params** and just `join` within each
+clone — the signature is keyed by the *template params only*. So `func f(a, opt
+b)` is a template over `a` (`b` joins; arity in `instantiate_round` is the
+`[min,nparams]` range). `func f(opt x)` with no template param keeps the join
+model. **A var-bound lambda** (`var id = func(x)=>x`) becomes a template iff it
+is non-capturing and the var is **write-once + calls-only** (`mark_lambda_
+templates`, after the structural pass, using per-symbol `writes`/`value_used`
+bookkeeping — the decl write is counted in `walk_struct`, not `declare_target`,
+which runs twice via hoist); a value-used / capturing / reassigned lambda stays
+join. **D4:** past 64 instantiations a template's further calls run dynamically
+(`tmpl_inst_count`, a one-time stderr warning).
 
 Mechanism (`inferencer.cpp`): the fixpoint and check pass **skip** an
 un-instantiated template (`accumulate`/`accumulate_call`/`check`/`check_call`
@@ -885,9 +897,12 @@ still checked for a template call; per-arg type/nullability is checked inside
 each clone. **REPL caveat:** a template committed by a PRIOR input (`pinned`) is
 NOT instantiated in a later input — it evaluates dynamically (correct, just not
 monomorphized); only a within-input template and every script template
-monomorphize. (`tmpl_cache` is cleared per input.) This deliberately avoids
-cloning a prior input's already-resolved decl across the persistent session
-state, which was fragile under MSVC.
+monomorphize. (`tmpl_cache` is cleared per input.) Cloning a prior input's
+already-resolved/evaluated decl across the persistent session is fragile **only
+under MSVC release** — a UB-class bug no local config reproduces (GCC + clang ×
+debug + opt × ASan + UBSan all pass) that resisted three targeted fixes
+(node-based redirect, per-input cache clear, resolved-state reset); re-enabling
+was attempted and **reverted**. Dynamic eval is the safe, all-green behavior.
 
 ## The value & type model (the subtle part)
 

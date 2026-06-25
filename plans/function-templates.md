@@ -9,15 +9,36 @@
 > `dyn` param ⇒ template; D2 structural-only never-called; D3 monomorphized
 > eval together.
 >
-> **Deferred (v1 boundaries, in code + tests):** anonymous lambdas and any
-> function with an `opt` parameter keep the join model (no clone). In the REPL,
-> a template DEFINED IN A PRIOR INPUT (`pinned`) is **not** instantiated in a
-> later input — it evaluates dynamically via the tree-walker (correct, just not
-> monomorphized); a template defined+used within one input, and every script
-> template, monomorphize fully. (This deliberately avoids cloning a prior
-> input's already-resolved decl across the persistent session state, a path that
-> proved fragile under MSVC.) Still open: opt-param templates, a hard
-> instantiation cap (D4), and the template-as-a-value path (D5).
+> **Also built (v1.1):**
+> - **opt-param templates** — a template is now any named function with ≥1
+>   *template param* (un-annotated, non-`dyn`, **non-`opt`**); `opt`/typed/`dyn`
+>   params coexist and `join` within each clone, so `func f(a, opt b)` is
+>   generic over `a` while `b` joins. (`func f(opt x)` with no template param
+>   keeps the join model.) The signature is keyed by the template params only.
+> - **var-bound lambda monomorphization** — a non-capturing anonymous lambda
+>   bound to a **write-once, calls-only** var is promoted to a template
+>   (`mark_lambda_templates`, after the structural pass; the inferencer gained
+>   per-symbol write/value-use bookkeeping). So `var id = func(x)=>x; id(1);
+>   id("s")` works. A value-used / capturing / reassigned lambda stays join.
+> - **D4** — a per-template instantiation cap (64 signatures) past which calls
+>   run dynamically, with a one-time stderr warning.
+>
+> **Deferred / deliberate v1 boundaries:**
+> - **Cross-input REPL monomorphization.** A template committed by a PRIOR REPL
+>   input evaluates **dynamically** (correct, not monomorphized); only a
+>   within-input template and every *script* template monomorphize. Re-enabling
+>   it was **attempted and reverted**: cloning a prior input's already-
+>   resolved/evaluated decl across the persistent session is fragile **only
+>   under MSVC release** (a UB-class bug NO local config reproduces — GCC +
+>   clang × debug + opt × ASan + UBSan all pass — resisting three fixes:
+>   node-based redirect, per-input cache clear, resolved-state reset). Dynamic
+>   eval is the safe, all-green behavior; this stays a boundary until the MSVC
+>   cause is reproducible.
+> - **D5 / template-as-a-value already works** (correctly typed): `var a =
+>   map(inc, xs); a[0]+1` type-checks. Monomorphizing the callback is near-zero
+>   value (`map` builds a general array + calls through its dynamic loop), so it
+>   is intentionally left on the dynamic path. Inline lambda callbacks too.
+> - The general value-passed-lambda + capturing-lambda cases stay join.
 
 ## 1. The problem & the model
 
