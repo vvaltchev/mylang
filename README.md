@@ -151,10 +151,33 @@ with the no-dependencies rule): live syntax highlighting, command history
 builtins, your own globals, and a struct value's fields (`p.<Tab>`). A `none`
 result (a definition, a `print`, an `if`) is not echoed, to keep things quiet.
 
-Meta-commands start with `:` — `:tree <code>` prints the const-folded syntax
-tree (so you can watch folding happen, e.g. `:tree 2 + 3 * 4` → `Int(14)`),
-`:source <file>` evaluates a file as if it were typed at the prompt, plus
-`:help` and `:quit`. Colors honor [`NO_COLOR`](https://no-color.org).
+Meta-commands start with `:`. They turn the REPL into a tool for learning and
+inspecting the language and its compiler:
+
+- **Documentation** — `:help` opens the built-in reference: `:help builtins`
+  lists every builtin by category, `:help <builtin>` shows one's signature and
+  description, `:help language` lists the feature categories, and `:help
+  <feature>` explains a feature — including the optimization passes
+  (`:help inlining`, `:help specialization`, `:help autoconst`, …).
+- **Reflection** — `:globals` prints a table of every global (variables,
+  consts — *including* folded const scalars — functions with their signatures,
+  and structs) with its inferred/declared type; `:type <expr>` shows a global's
+  inferred static type, or any expression's runtime type without committing it.
+  (These build on the reflection *builtins* `globals()`, `typeof()`,
+  `signature()`, `layout()`, `specializations()`, usable from scripts too.)
+- **The compiler's reasoning** — `:trace <category> on` narrates the optimizer
+  as your next input compiles: `:trace infer on` shows how each type is
+  inferred, and `inline` / `specialize` / `template` / `autoconst` / `autopure`
+  / `arrays` / `fold` (or `all`) show the corresponding decisions. `:trace`
+  with no argument shows what's active; `:trace off` disables it. (A script run
+  can do the same with `mylang --trace <cats> file.my`, or the `trace()` /
+  `traceoff()` / `tracing()` builtins.)
+- **Other** — `:tree <code>` prints the const-folded syntax tree (watch folding
+  happen, e.g. `:tree 2 + 3 * 4` → `Int(14)`); `:analyze <code>` reprints code
+  colored by which optimizations fired; `:source <file>` evaluates a file as if
+  typed; `:quit` exits.
+
+Colors honor [`NO_COLOR`](https://no-color.org).
 
 ## Syntax
 
@@ -2005,6 +2028,29 @@ function `f` (empty when none). These clones are real globals — the compiler
 inserts each at the root and binds its synthetic name — so this is a plain scope
 walk. *What* each clone specializes on is shown by the REPL `:trace` /
 `:globals` views.
+
+### Non-const tracing builtins
+Toggle the **diagnostic tracer** — a per-category narration of the compiler's
+reasoning (type inference, inlining, specialization, template instantiation,
+auto-const, auto-pure, array-storage decisions, const-folding). It is OFF by
+default and built so an unset category costs only a bitmask test, so leaving the
+hooks in the compiler is free for a normal run. In the REPL these back the
+`:trace` command; for a whole script use `mylang --trace <cats> file.my` (a
+script is fully compiled before it runs, so a runtime `trace()` call cannot show
+*its own* compilation — it affects later REPL inputs / compiles).
+
+#### `trace(category, on)`
+Enable (`on` truthy) or disable a trace category. `category` is one of
+`"infer"`, `"inline"`, `"specialize"`, `"template"`, `"autoconst"`,
+`"autopure"`, `"arrays"`, `"fold"`, or `"all"`. Throws `InvalidValueEx` on an
+unknown name. Trace lines go to stderr in a script (and to the REPL output in
+the REPL). Returns `none`.
+
+#### `traceoff()`
+Disable all trace categories. Returns `none`.
+
+#### `tracing()`
+Return the active trace categories as a sorted `array<str>`.
 
 ### Non-const array builtins
 
