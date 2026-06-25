@@ -564,6 +564,18 @@ ReplEngine::Impl::cmd_trace(const string &arg)
     if (toks.empty())
         return trace_state_str() + "\n";
 
+    if (toks[0] == "help" || toks[0] == "?" || toks[0] == "list") {
+        string out = "trace categories: ";
+        const std::vector<string> cats = trace_categories();
+        for (size_t i = 0; i < cats.size(); i++)
+            out += (i ? ", " : "") + cats[i];
+        out += " (or all)\n";
+        out += "usage: :trace <cat>... on|off   :trace off   "
+               ":trace            (show active)\n";
+        out += trace_state_str() + "\n";
+        return out;
+    }
+
     if (toks.size() == 1 && (toks[0] == "off" || toks[0] == "none")) {
         trace_clear_all();
         return trace_state_str() + "\n";

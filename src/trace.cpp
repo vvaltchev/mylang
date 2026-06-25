@@ -105,6 +105,15 @@ trace_active()
     return out;
 }
 
+std::vector<std::string>
+trace_categories()
+{
+    std::vector<std::string> out;
+    for (const CatName &cn : cat_names)
+        out.push_back(cn.name);
+    return out;                          /* declaration order */
+}
+
 std::string
 trace_state_str()
 {

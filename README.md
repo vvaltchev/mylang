@@ -158,7 +158,9 @@ inspecting the language and its compiler:
   lists every builtin by category, `:help <builtin>` shows one's signature and
   description, `:help language` lists the feature categories, and `:help
   <feature>` explains a feature — including the optimization passes
-  (`:help inlining`, `:help specialization`, `:help autoconst`, …).
+  (`:help inlining`, `:help specialization`, `:help autoconst`, …). `:help
+  commands` lists the REPL commands themselves, and `:help <command>` documents
+  one (`:help :trace`, `:help globals`, …) — the leading `:` is optional.
 - **Reflection** — `:globals` prints a table of every global (variables,
   consts — *including* folded const scalars — functions with their signatures,
   and structs) with its inferred/declared type; `:type <expr>` shows a global's
@@ -169,9 +171,9 @@ inspecting the language and its compiler:
   as your next input compiles: `:trace infer on` shows how each type is
   inferred, and `inline` / `specialize` / `template` / `autoconst` / `autopure`
   / `arrays` / `fold` (or `all`) show the corresponding decisions. `:trace`
-  with no argument shows what's active; `:trace off` disables it. (A script run
-  can do the same with `mylang --trace <cats> file.my`, or the `trace()` /
-  `traceoff()` / `tracing()` builtins.)
+  with no argument shows what's active, `:trace help` lists the categories, and
+  `:trace off` disables it. (A script run can do the same with `mylang --trace
+  <cats> file.my`, or the `trace()` / `traceoff()` / `tracing()` builtins.)
 - **Other** — `:tree <code>` prints the const-folded syntax tree (watch folding
   happen, e.g. `:tree 2 + 3 * 4` → `Int(14)`); `:analyze <code>` reprints code
   colored by which optimizations fired; `:source <file>` evaluates a file as if

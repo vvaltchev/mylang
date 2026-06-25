@@ -1658,10 +1658,16 @@ behind a thin terminal shell:
   template instantiation, M8, flat arrays, CSE, COW), each with a syntax
   sketch + prose and a pointer to its `:trace` category. `:help` overview,
   `:help builtins[/<cat>]`, `:help <builtin>`, `:help language`,
-  `:help <category>`, `:help <feature>` all route through `repl_help`; feature
-  ids are kept distinct from category ids (the dispatch resolves a bare topic
-  builtin → language-category → feature). Pure/headless, so it is unit-tested
-  directly (`replhelp:` extra_checks). See `plans/repl-introspection.md`.
+  `:help <category>`, `:help <feature>` all route through `repl_help`, plus a
+  **commands DB** (`:help commands`, `:help <command>`) documenting the REPL
+  meta-commands themselves. A leading `:` is stripped and means "this is a
+  command" (`:help :trace`); a bare topic resolves builtin → command →
+  language-category → feature, and when a builtin and a command share a name
+  (`trace`/`type`/`globals`) the builtin entry shows with a pointer to the
+  command. Feature ids are kept distinct from category ids. The trace category
+  list has one source of truth, `trace_categories()` (`trace.cpp`), used by
+  `:trace help`. Pure/headless, so it is unit-tested directly (`replhelp:`
+  extra_checks). See `plans/repl-introspection.md`.
 - **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
   category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/
   autopure/arrays/fold) in `g_trace_mask`, the hot guard `trace_enabled(c)`,
