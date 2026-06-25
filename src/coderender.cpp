@@ -152,6 +152,8 @@ struct Renderer {
             dynamic_cast<const Slice *>(c) ||
             dynamic_cast<const MemberExpr *>(c))
             return PREC_POSTFIX;
+        if (auto *e = dynamic_cast<const IncDecExpr *>(c))
+            return e->is_prefix ? 8 : PREC_POSTFIX;
         if (auto *e1 = dynamic_cast<const Expr01 *>(c))
             return e1->elem ? expr_prec(e1->elem.get()) : PREC_PRIMARY;
         return PREC_PRIMARY;
@@ -244,6 +246,12 @@ struct Renderer {
                     expr(e->args->elems[i].get(), 0);
                 }
             o << ")"; return;
+        }
+        if (auto *e = dynamic_cast<const IncDecExpr *>(c)) {
+            const char *op = e->is_inc ? "++" : "--";
+            if (e->is_prefix) { o << op; expr(e->lvalue.get(), 8); }
+            else { expr(e->lvalue.get(), PREC_POSTFIX); o << op; }
+            return;
         }
         if (auto *e = dynamic_cast<const TypedScalarExpr *>(c)) {
             op_chain(e->elems, expr_prec(c)); return;

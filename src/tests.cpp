@@ -1919,6 +1919,76 @@ static const std::vector<test> tests =
     { "exdata() with no args is rejected",
       { "exdata();" }, &typeid(InvalidNumberOfArgsEx) },
 
+    /* ---- ++ / -- (pre/postfix increment/decrement, int/float only) ---- */
+    { "++/--: postfix yields the OLD value, prefix the NEW (int)",
+      { "var x = 5; var a = x++; assert(a == 5 && x == 6);",
+        "var y = 5; var b = ++y; assert(b == 6 && y == 6);",
+        "var z = 5; var c = z--; assert(c == 5 && z == 4);",
+        "var w = 5; var d = --w; assert(d == 4 && w == 4);" } },
+    { "++/--: float",
+      { "var x = 2.5; x++; assert(x == 3.5);",
+        "x--; x--; assert(x == 1.5);",
+        "var a = x++; assert(a == 1.5 && x == 2.5);" } },
+    { "++/--: negative values",
+      { "var x = -3; x++; assert(x == -2);",
+        "var y = -3; --y; assert(y == -4);" } },
+    { "++/--: repeated, as statements",
+      { "var x = 0; x++; x++; x++; assert(x == 3);",
+        "x--; assert(x == 2);" } },
+    { "++/--: used inside a larger expression",
+      { "var x = 3; var r = (x++) + 10; assert(r == 13 && x == 4);",
+        "var y = 3; var s = (++y) * 2; assert(s == 8 && y == 4);" } },
+    { "++/--: as a for-loop counter",
+      { "var s = 0; for (var i = 0; i < 5; i++) { s += i; }",
+        "assert(s == 10);",
+        "var t = 0; for (var i = 10; i > 0; i--) { t += 1; }",
+        "assert(t == 10);" } },
+    { "++/--: on an array element (general + flat storage)",
+      { "var a = [1, 2, 3]; var o = a[1]++; assert(o == 2 && a[1] == 3);",
+        "++a[0]; assert(a[0] == 2);",
+        "assert(array_storage(a) == \"ints\");",   /* stays flat */
+        "var b = [[1, 2], [3, 4]]; b[0][1]++; assert(b[0][1] == 3);" } },
+    { "++/--: on a struct field",
+      { "struct P { int x; int y; }",
+        "var p = P(1, 2); var o = p.x++; assert(o == 1 && p.x == 2);",
+        "--p.y; assert(p.y == 1);" } },
+    { "++/--: on a function's scalar param (local copy)",
+      { "func f(n) { n++; return n; }",
+        "assert(f(5) == 6);",
+        "var a = 5; f(a); assert(a == 5);" } },   /* caller untouched */
+    { "++/--: a dyn holding an int works",
+      { "var dyn d = 5; d++; assert(d == 6); --d; assert(d == 5);" } },
+    { "++/--: a dyn holding a non-number throws at runtime",
+      { "var dyn d = \"s\"; d++;" }, &typeid(TypeErrorEx) },
+
+    /* error cases (compile-time unless noted) */
+    { "++ on a bool is a type error",
+      { "var b = true; b++;" }, &typeid(TypeMismatchEx) },
+    { "++ on a string is a type error",
+      { "var s = \"a\"; s++;" }, &typeid(TypeMismatchEx) },
+    { "++ on an array is a type error",
+      { "var a = [1, 2]; a++;" }, &typeid(TypeMismatchEx) },
+    { "++ on a non-lvalue expression is rejected",
+      { "var x = 5; var y = (x + 1)++;" }, &typeid(TypeMismatchEx) },
+    { "++ on a const is rejected",
+      { "const c = 5; c++;" }, &typeid(TypeMismatchEx) },
+
+    /* optimization interactions */
+    { "++/--: a ++'d var is NOT auto-const-promoted",
+      { "var x = 5; x++; assert(isconst(x) == false);" } },
+    { "++/--: a pure function with a ++ loop folds at a const call",
+      { "pure func sumto(n) { var s = 0; var i = 0;"
+        " while (i < n) { s += i; i++; } return s; }",
+        "var r = sumto(5);",
+        "assert(isconst(r) && r == 10);" } },
+    { "++/--: a scalar-param-mutating func is NOT inlined (sound)",
+      { "func f(x) => x++;",   /* x++ on the param: must stay a call */
+        "var a = 5; var r = f(a); assert(a == 5 && r == 5);" } },
+    { "++/--: a through-param mutation inlines to the same effect",
+      { "func g(arr) => arr[0]++;",
+        "var a = [10, 20]; var r = g(a);",
+        "assert(r == 10 && a[0] == 11);" } },   /* ref semantics, like a call */
+
     /* ---- evaluator (eval.cpp) ---- */
     {
         "string escape sequences (\\t \\v \\a \\b and unknown)",

@@ -2295,6 +2295,77 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
     }
 }
 
+/*
+ * C-style ++ / -- on an int/float lvalue. Two paths, both evaluating the
+ * operand exactly ONCE:
+ *
+ *  - statically int/float (th stamped by the inferencer - the usual case,
+ *    incl. flat-array elements and POD struct fields, which have no LValue):
+ *    route the mutation through handle_single_expr14 (`operand += 1`), which
+ *    reuses every store fast path (slot, flat array, COW, struct). It returns
+ *    the NEW value; postfix derives `old = new ∓ 1` (the delta is exactly 1),
+ *    so we never re-read the operand;
+ *
+ *  - a `dyn` / un-hinted operand (always LValue-backed - a dyn value is never
+ *    flat): read-modify-write through the LValue so the int/float requirement
+ *    can be enforced at runtime (a `dyn` holding a string/bool throws here).
+ *
+ * The inferencer rejects a non-lvalue / const / non-numeric operand at compile
+ * time; the runtime checks are the `dyn` safety net.
+ */
+EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    const Op cop = is_inc ? Op::addeq : Op::subeq;
+    const EvalValue one{static_cast<int_type>(1)};
+
+    if (th == TypeHint::i || th == TypeHint::f) {
+
+        const EvalValue nv =
+            handle_single_expr14(ctx, false, cop, lvalue.get(), one);
+
+        if (is_prefix)
+            return nv;
+
+        EvalValue old = nv;     /* old = new ∓ 1 (no re-read of the operand) */
+        apply_compound_op(old, one, is_inc ? Op::subeq : Op::addeq);
+        return old;
+    }
+
+    /* dyn / un-hinted: read-modify-write through the LValue. */
+    EvalValue lref;
+    try {
+        lref = lvalue->eval(ctx);
+    } catch (Exception &e) {
+        stamp_operand_loc(lvalue.get(), e);
+        throw;
+    }
+
+    if (lref.is<UndefinedId>())
+        throw UndefinedVariableEx(lref.get<UndefinedId>().id, start, end);
+
+    if (!lref.is<LValue *>())
+        throw NotLValueEx(start, end);
+
+    LValue *lv = lref.get<LValue *>();
+
+    if (lv->is<Builtin>())
+        throw CannotRebindBuiltinEx();
+
+    if (lv->is_const_var())
+        throw CannotChangeConstEx(start, end);
+
+    EvalValue old = lv->get();
+
+    if (!old.is<int_type>() && !old.is<float_type>())
+        throw TypeErrorEx("'++'/'--' requires an int or float", start, end);
+
+    EvalValue nv = old;
+    apply_compound_op(nv, one, cop);
+    lv->put(move(nv));
+
+    return is_prefix ? lv->get() : old;
+}
+
 EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     if (eval_cond(condExpr.get(), ctx)) {

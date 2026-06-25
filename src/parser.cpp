@@ -982,6 +982,23 @@ pExpr01(ParseContext &c, unsigned fl)
         main = move(otherExpr);
     }
 
+    /* postfix ++ / -- : binds tighter than any unary/binary operator (it sits
+     * at the primary level), and yields the value BEFORE the change. Only one
+     * postfix op applies (`x++ ++` is meaningless - the first yields an rvalue,
+     * which the inferencer then rejects as a non-lvalue). */
+    if (main && (*c == Op::inc || *c == Op::dec)) {
+        const bool is_inc = (*c == Op::inc);
+        const Loc opLoc = c.get_loc();
+        c++;
+        auto id = make_unique<IncDecExpr>();
+        id->start = main->start;
+        id->end = opLoc + 2;       /* span through the ++ / -- */
+        id->is_prefix = false;
+        id->is_inc = is_inc;
+        id->lvalue = move(main);
+        return id;
+    }
+
     return main;
 }
 
@@ -1034,6 +1051,26 @@ pExpr02(ParseContext &c, unsigned fl)
     unique_ptr<Expr02> ret;
     unique_ptr<Construct> elem;
     const Loc start = c.get_loc();
+
+    /* prefix ++ / -- : a dedicated node (it MUTATES an lvalue and yields the
+     * NEW value). The operand is parsed recursively at this same level so
+     * `++ ++ x` etc. chain; lvalue-ness and int/float-ness are enforced by the
+     * inferencer (and re-checked at eval for a `dyn` operand). */
+    if (*c == Op::inc || *c == Op::dec) {
+        const bool is_inc = (*c == Op::inc);
+        c++;
+        elem = pExpr02(c, fl);
+        if (!elem)
+            noExprError(c);
+        auto id = make_unique<IncDecExpr>();
+        id->start = start;
+        id->end = c.get_loc();
+        id->is_prefix = true;
+        id->is_inc = is_inc;
+        id->lvalue = move(elem);
+        return id;
+    }
+
     Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::lnot});
 
     if (op != Op::invalid) {

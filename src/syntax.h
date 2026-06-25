@@ -1261,6 +1261,34 @@ public:
     }
 };
 
+/*
+ * C-style pre/postfix increment/decrement: `++x`, `x++`, `--x`, `x--`. The
+ * operand must be an int or float lvalue (the inferencer rejects every other
+ * type - including bool - and a const/non-lvalue target). Postfix yields the
+ * value BEFORE the change, prefix the value AFTER (exactly as in C).
+ */
+class IncDecExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> lvalue;   /* the operand: an int/float lvalue */
+    bool is_prefix;                 /* ++x / --x  (else postfix x++ / x--) */
+    bool is_inc;                    /* ++ (else --) */
+
+    IncDecExpr() : Construct("IncDecExpr"), is_prefix(false), is_inc(true) { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<IncDecExpr>();
+        copy_base_fields(*c);
+        c->lvalue = clone_as(lvalue);
+        c->is_prefix = is_prefix;
+        c->is_inc = is_inc;
+        return c;
+    }
+};
+
 class ForStmt final: public Construct {
 
 public:
