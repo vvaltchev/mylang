@@ -4,6 +4,7 @@
 
 #include <iosfwd>
 #include <memory>
+#include <string>
 
 class Construct;
 class UniqueId;
@@ -64,6 +65,11 @@ public:
 
     void check_input(Construct *input);
     void undef_global(const UniqueId *name);
+
+    /* The inferred static type string of a committed global (or "" if the name
+     * is not a committed inferred symbol - e.g. a const scalar folded away).
+     * Backs the REPL :globals enrichment. */
+    std::string global_type(const UniqueId *name);
 
 private:
 

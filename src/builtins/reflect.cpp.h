@@ -29,6 +29,7 @@
 #include "syntax.h"
 #include "structtype.h"
 #include "trace.h"
+#include "reflect.h"
 
 #include <string>
 #include <vector>
@@ -91,7 +92,7 @@ static std::string reflect_param_str(const Identifier *p)
 }
 
 /* A function's declared signature, e.g. "pure func hypot(float a, float b)". */
-static std::string reflect_func_sig(const FuncDeclStmt *f)
+std::string reflect_func_sig(const FuncDeclStmt *f)
 {
     std::string s;
     if (f->explicit_pure)
@@ -115,7 +116,7 @@ static std::string reflect_func_sig(const FuncDeclStmt *f)
 }
 
 /* A struct type's constructor signature, e.g. "Point(int x, int y)". */
-static std::string reflect_struct_ctor(const StructTypeDef *def)
+std::string reflect_struct_ctor(const StructTypeDef *def)
 {
     std::string s(def->name ? std::string(def->name->val) : std::string("?"));
     s += "(";
@@ -129,8 +130,6 @@ static std::string reflect_struct_ctor(const StructTypeDef *def)
     s += ")";
     return s;
 }
-
-static std::string reflect_typeof(const EvalValue &e);  /* fwd (recursion) */
 
 /* The structural type of an array value, from its storage kind (probing a
  * general array's elements for a homogeneous element type). */
@@ -170,7 +169,7 @@ static std::string reflect_dict_type(const DictObject &d)
            reflect_typeof(kv.second.get()) + ">";
 }
 
-static std::string reflect_typeof(const EvalValue &e)
+std::string reflect_typeof(const EvalValue &e)
 {
     switch (e.get_type()->t) {
         case Type::t_none:    return "none";
@@ -200,7 +199,7 @@ static std::string reflect_typeof(const EvalValue &e)
 }
 
 /* A struct type's full in-memory layout (POD offsets/sizes or boxed slots). */
-static std::string reflect_layout(const StructTypeDef *def)
+std::string reflect_layout(const StructTypeDef *def)
 {
     std::string s(def->name ? std::string(def->name->val) : std::string("?"));
     if (def->is_pod()) {
