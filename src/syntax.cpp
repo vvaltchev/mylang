@@ -6,6 +6,99 @@
 using std::string;
 using std::string_view;
 
+/* Monotonic node-identity counter (see Construct::node_id in syntax.h). Starts
+ * at 1 so 0 can stay a "no node" sentinel. Single-threaded interpreter, so a
+ * plain increment is fine. */
+uint64_t Construct::next_node_id = 1;
+
+#ifdef RECYCLE_ALLOC
+
+/*
+ * The adversarial recycling allocator (RECYCLE=1). It NEVER returns memory to
+ * the system: a freed block goes onto a size-keyed LIFO bin and the very next
+ * same-size `new` reuses it - so a fresh node deterministically lands on a
+ * just-freed node's address. That is exactly the condition that exposes a
+ * "raw AST pointer used as a stable map key" bug (a stale entry getting matched
+ * by the recycled address). Leaks by design; only for the short-lived `-rt`
+ * test process. See CLAUDE.md "Invariants & hazards".
+ *
+ * Layout: a small header (kept max_align-wide so the returned pointer stays
+ * suitably aligned) stores the block size so delete can find the right bin.
+ * Under ASan we poison the user region while it sits on the free-list, so a
+ * dangling access in the reuse window is still caught (forced reuse AND UAF
+ * detection at once).
+ */
+#include <unordered_map>
+#include <vector>
+#include <cstdlib>
+#include <new>
+
+#if defined(__SANITIZE_ADDRESS__) || \
+    (defined(__has_feature) && __has_feature(address_sanitizer))
+#  include <sanitizer/asan_interface.h>
+#  define RECYCLE_POISON(p, n)   __asan_poison_memory_region((p), (n))
+#  define RECYCLE_UNPOISON(p, n) __asan_unpoison_memory_region((p), (n))
+#else
+#  define RECYCLE_POISON(p, n)   ((void) 0)
+#  define RECYCLE_UNPOISON(p, n) ((void) 0)
+#endif
+
+/*
+ * The recycler never frees, so LeakSanitizer would report every recycled block
+ * as a leak. Those leaks are intentional and bounded (one short -rt process), so
+ * turn leak detection off for a RECYCLE build. (A weak hook ASan reads at start;
+ * harmless if ASan isn't linked.)
+ */
+extern "C" const char *__asan_default_options()
+{
+    return "detect_leaks=0";
+}
+
+namespace {
+
+constexpr std::size_t RECYCLE_HDR = alignof(std::max_align_t);
+
+std::unordered_map<std::size_t, std::vector<void *>> &recycle_bins()
+{
+    static std::unordered_map<std::size_t, std::vector<void *>> bins;
+    return bins;
+}
+
+}   /* anonymous namespace */
+
+void *Construct::operator new(std::size_t n)
+{
+    auto &bin = recycle_bins()[n];
+    void *base;
+
+    if (!bin.empty()) {         /* reuse the MOST-recently freed same-size block */
+        base = bin.back();
+        bin.pop_back();
+    } else {
+        base = std::malloc(n + RECYCLE_HDR);
+        if (!base)
+            throw std::bad_alloc();
+    }
+
+    *static_cast<std::size_t *>(base) = n;          /* remember size for delete */
+    void *user = static_cast<char *>(base) + RECYCLE_HDR;
+    RECYCLE_UNPOISON(user, n);
+    return user;
+}
+
+void Construct::operator delete(void *p) noexcept
+{
+    if (!p)
+        return;
+
+    void *base = static_cast<char *>(p) - RECYCLE_HDR;
+    std::size_t n = *static_cast<std::size_t *>(base);
+    RECYCLE_POISON(p, n);                  /* trap a dangling access till reuse */
+    recycle_bins()[n].push_back(base);     /* never freed; reused by next new(n) */
+}
+
+#endif   /* RECYCLE_ALLOC */
+
 string
 escape_str(const string_view &v)
 {

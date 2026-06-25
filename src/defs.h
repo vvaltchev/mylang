@@ -64,3 +64,29 @@ typedef intptr_t int_type;
      */
     typedef size_t size_type;
 #endif
+
+/*
+ * ML_CHECK / ML_CHECK_MSG - the project's defense-in-depth assertion macros.
+ *
+ * Use these (NOT bare assert) to state an invariant the code RELIES ON but a
+ * caller could violate with an incorrect change: "this can't happen if the
+ * code is correct." They are the Swiss-cheese layers - each one is a hole in a
+ * different place, so a bad change has many chances to hit a wall. They must be
+ * SIDE-EFFECT FREE (the condition is compiled out in a plain release build).
+ *
+ * Active when -DMLDEBUG is set: every debug build (OPT=0) and every sanitized
+ * build (ASAN/UBSAN), which covers all CI debug runs. Compiled to nothing in a
+ * plain optimized build, so release and the bench suite pay zero.
+ *
+ * For conditions that CAN legitimately occur at runtime (bad user input, I/O
+ * failure, a real type error) do NOT use these - throw a proper Exception so
+ * the error is handled in every build. ML_CHECK is for "impossible" states.
+ */
+#ifdef MLDEBUG
+#  include <cassert>
+#  define ML_CHECK(cond)          assert(cond)
+#  define ML_CHECK_MSG(cond, msg) assert((cond) && (msg))
+#else
+#  define ML_CHECK(cond)          ((void)0)
+#  define ML_CHECK_MSG(cond, msg) ((void)0)
+#endif

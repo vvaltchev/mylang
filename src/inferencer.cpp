@@ -805,6 +805,21 @@ void Inferencer::infer_input(Block *rootBlock)
      */
     tmpl_cache.clear();
 
+    /*
+     * SCOPE THE NODE-KEYED MAPS TO ONE INPUT. id_sym / func_of_decl are keyed
+     * by raw Construct* (AST node ADDRESS), which the allocator recycles once a
+     * node is freed - so a stale entry from a prior input could be matched by a
+     * fresh node reusing that address (the MSVC-only, address-dependent bug we
+     * root-caused). walk_struct rebuilds both for THIS input, and no reader ever
+     * looks up a prior input's node (the cross-input link is the persistent,
+     * arena-stable TypeSym/FuncInfo, reached via the UniqueId-keyed scope - see
+     * callee_funcinfo). So clearing here removes the staleness at the source.
+     * Belt-and-suspenders: walk_struct also always re-resolves (never trusts a
+     * present entry), and a RECYCLE=1 build forces the hostile reuse under -rt.
+     */
+    id_sym.clear();
+    func_of_decl.clear();
+
     const size_t sym_base = all_syms.size();
     const size_t func_base = all_funcs.size();
     /* snapshot the global bindings so a rejected input commits nothing */

@@ -62,6 +62,31 @@ ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
 	BASE_FLAGS += -fno-omit-frame-pointer
 endif
 
+# ML_CHECK() debug assertions (defense-in-depth invariant checks, errors.h).
+# ON for a debug build (OPT=0) or ANY sanitized build, OFF for a plain
+# optimized build - so release and the bench suite pay nothing for them, while
+# every CI debug run and every sanitized run exercises the full assertion net.
+# Force either way with MLDEBUG=1 / MLDEBUG=0.
+MLDEBUG ?= 0
+ifeq ($(OPT),0)
+	MLDEBUG := 1
+endif
+ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
+	MLDEBUG := 1
+endif
+ifeq ($(MLDEBUG),1)
+	BASE_FLAGS += -DMLDEBUG
+endif
+
+# Adversarial Construct allocator (a LIFO free-list that hands a just-freed
+# node's address straight back), so any "pointer used as a stable identity"
+# bug manifests DETERMINISTICALLY under -rt instead of only on a hostile
+# allocator like MSVC's. Off by default; `make RECYCLE=1 TESTS=1`. See
+# syntax.cpp / the "Invariants & hazards" section in CLAUDE.md.
+ifeq ($(RECYCLE),1)
+	BASE_FLAGS += -DRECYCLE_ALLOC
+endif
+
 ifdef TESTS
 	ifeq ($(TESTS),1)
 		BASE_FLAGS += -DTESTS
