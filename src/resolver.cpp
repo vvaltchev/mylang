@@ -703,6 +703,29 @@ private:
                 if (!is_scalar_literal(p.second.get()))
                     all_lit = false;
             }
+            /* Short-circuit fold: a logical op whose FIRST operand is a const
+             * that already determines the result - `false && rest` -> false,
+             * `true || rest` -> true. Sound regardless of `rest` (it is
+             * short-circuited, so never evaluated - even side effects). This is
+             * what eliminates a `const FLAG=false; if (FLAG && ...)` branch
+             * (the if-DCE then drops the `if (false)`). */
+            if (!all_lit && mo->elems.size() >= 2
+                    && is_scalar_literal(mo->elems[0].second.get())) {
+                const bool is_and = dynamic_cast<Expr11 *>(mo) != nullptr;
+                const bool is_or  = dynamic_cast<Expr12 *>(mo) != nullptr;
+                if (is_and || is_or) {
+                    EvalValue f0 = RValue(mo->elems[0].second->eval(&cctx));
+                    const bool t = f0.get_type()->is_true(f0);
+                    if ((is_and && !t) || (is_or && t)) {
+                        EvalValue r{t};   /* false for &&, true for || */
+                        TRACE(fold, 0, std::string("short-circuit ")
+                              + (is_and ? "&&" : "||") + " -> "
+                              + r.to_string());
+                        MakeConstructFromConstVal(r, slot, false);
+                        return;
+                    }
+                }
+            }
             if (all_lit) {
                 /* Fold the constant op to a literal. If evaluating it raises an
                  * exception (x/0, a type mismatch, ...), we DON'T swallow it: a
