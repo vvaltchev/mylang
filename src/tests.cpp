@@ -1795,6 +1795,25 @@ static const std::vector<test> tests =
     { "fold: short-circuit `true ||` drops an undefined dead operand",
       { "func sc_undef() => 7 || undefined_name_xyz;",
         "assert(sc_undef() == true);" } },
+    /* a NON-determining leading const (`false ||`, `true &&`) drops - but only
+     * collapses to a lone operand when that operand is ALREADY bool, since
+     * mylang's ||/&& yield bool (so `false || 5` is `true`, not `5`). */
+    { "fold: `false || (cmp)` collapses to the comparison (already bool)",
+      { "func bc1(x) => false || (x > 0);",
+        "assert(startswith(show(bc1),"
+        " \"/* pure */ func bc1(x) => x > 0\"));",
+        "assert(bc1(5) == true && bc1(-1) == false);" } },
+    { "fold: `true && (cmp)` collapses to the comparison",
+      { "func bc2(x) => true && (x > 0);",
+        "assert(startswith(show(bc2),"
+        " \"/* pure */ func bc2(x) => x > 0\"));" } },
+    { "fold: `false || x` (non-bool x) does NOT collapse; yields bool(x)",
+      { "func bc3(x) => false || x;",
+        "assert(bc3(5) == true);",   /* bool true, NOT the int 5 */
+        "assert(bc3(0) == false);" } },
+    { "fold: a leading const-false drops from a || chain",
+      { "func bc4(a, b) => false || (a > 0) || (b > 0);",
+        "assert(endswith(show(bc4), \"a > 0 || b > 0;\\n\"));" } },
 
     /* ---- resolver (resolver.cpp): auto-const DCE & auto-pure analysis ---- */
     {
