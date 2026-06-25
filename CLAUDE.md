@@ -205,12 +205,14 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — sixteen
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — seventeen
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
-`eval.cpp`, `types.cpp`, `stype.cpp`, `backtrace.cpp`, `errfmt.cpp`,
-`highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`, `repl.cpp`, `mylang.cpp`,
-`tests.cpp` (the last five are the REPL — see "The interactive REPL" below).
+`eval.cpp`, `types.cpp`, `stype.cpp`, `trace.cpp`, `backtrace.cpp`,
+`errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`, `repl.cpp`,
+`mylang.cpp`, `tests.cpp` (the last five are the REPL — see "The interactive
+REPL" below; `trace.cpp` is the diagnostic tracer used by the optimizer passes
+and the REPL).
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
   turns thrown
@@ -1643,6 +1645,21 @@ behind a thin terminal shell:
   ids are kept distinct from category ids (the dispatch resolves a bare topic
   builtin → language-category → feature). Pure/headless, so it is unit-tested
   directly (`replhelp:` extra_checks). See `plans/repl-introspection.md`.
+- **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
+  category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/
+  autopure/arrays/fold) in `g_trace_mask`, the hot guard `trace_enabled(c)`,
+  and `trace_emit(c, indent, msg)` to a swappable sink (default `&std::cerr`).
+  The `TRACE(cat, indent, msg)` macro builds `msg` ONLY when the category is on
+  — so the guarded emits sprinkled at optimizer decision points (inferencer
+  `commit_round`/finalize, and — Pillar 3b — the resolver's inliner /
+  auto-const / auto-pure / specializer, the array-hint and fold sites) cost
+  one mask test when off. Control surface (both, builtins-first): the
+  `trace()`/`traceoff()`/`tracing()` builtins (`builtins/reflect.cpp.h`) and
+  the REPL `:trace [<cat>...] on|off` meta-command. The REPL points the sink at
+  its per-input capture stream (a `TraceSinkGuard` in `do_eval`) so an enabled
+  trace narrates into the REPL output just above the result (and is testable);
+  a script leaves it at `cerr` so trace never corrupts stdout. OFF by default,
+  so scripts/tests are unaffected. See `plans/repl-introspection.md`.
 
 `run_repl` (in `repl.cpp`) drives it: history loaded/saved to
 `~/.mylang_history`, colors gated on a TTY + `NO_COLOR`, Ctrl-C drops the

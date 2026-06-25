@@ -28,6 +28,7 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 #include "structtype.h"
+#include "trace.h"
 
 #include <string>
 #include <vector>
@@ -368,6 +369,55 @@ EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList)
     SharedArrayObj::vec_type vec;
     vec.reserve(out.size());
     for (std::string &n : out)
+        vec.emplace_back(SharedStr(move(n)), false);
+    return SharedArrayObj(move(vec));
+}
+
+/* ------------------------ diagnostic tracing ----------------------------- */
+
+/*
+ * trace(category, on): enable/disable a diagnostic trace category (see
+ * trace.h). category is a string ("infer", "inline", "specialize", "template",
+ * "autoconst", "autopure", "arrays", "fold", or "all"); on is truthy/falsy.
+ * Throws InvalidValueEx on an unknown category. Returns none.
+ */
+EvalValue builtin_trace(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *a0 = exprList->elems[0].get();
+    const EvalValue &name = RValue(a0->eval(ctx));
+    const EvalValue &on = RValue(exprList->elems[1]->eval(ctx));
+
+    if (!name.is<SharedStr>())
+        throw TypeErrorEx("Expected a category string", a0->start, a0->end);
+
+    const string cat(name.get<SharedStr>().get_view());
+    if (!trace_set(cat, on.get_type()->is_true(on)))
+        throw InvalidValueEx("Unknown trace category", a0->start, a0->end);
+    return none;
+}
+
+/* traceoff(): disable all trace categories. Returns none. */
+EvalValue builtin_traceoff(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 0)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+    trace_clear_all();
+    return none;
+}
+
+/* tracing(): the active trace categories as a sorted array<str>. */
+EvalValue builtin_tracing(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 0)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    std::vector<std::string> active = trace_active();
+    SharedArrayObj::vec_type vec;
+    vec.reserve(active.size());
+    for (std::string &n : active)
         vec.emplace_back(SharedStr(move(n)), false);
     return SharedArrayObj(move(vec));
 }

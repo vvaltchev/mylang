@@ -291,6 +291,11 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("signature", builtin_signature),
     make_builtin("layout", builtin_layout),
     make_builtin("specializations", builtin_specializations),
+
+    /* Diagnostic tracing (see trace.h) */
+    make_builtin("trace", builtin_trace),
+    make_builtin("traceoff", builtin_traceoff),
+    make_builtin("tracing", builtin_tracing),
     /* dynarray(a): manual promotion - a fresh general (polymorphic) copy of an
      * array. Non-const (fresh mutable value). See builtin_dynarray. */
     make_builtin("dynarray", builtin_dynarray),

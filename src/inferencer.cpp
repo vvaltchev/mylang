@@ -7,6 +7,7 @@
 #include "analyzer.h"
 #include "evalvalue.h"
 #include "eval.h"
+#include "trace.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -762,6 +763,36 @@ void Inferencer::infer_one(Block *rootBlock)
             continue;
         if (is_unknown(up->ret))
             up->ret = A.dyn_ty();
+    }
+
+    /* Trace the finalized types (the conclusion of the fixpoint), so
+     * `:trace infer` shows both the per-round climb and the final answer. */
+    if (trace_enabled(TraceCat::infer)) {
+        for (auto &up : all_syms) {
+            TypeSym *s = up.get();
+            if (s->func || s->pinned || !s->name)
+                continue;
+            const char *kind = s->is_param ? "param"
+                             : s->const_decl ? "const" : "var";
+            TRACE(infer, 0, std::string(kind) + " " +
+                            std::string(s->name->val) + " : " +
+                            sty_to_string(s->type) + "  (final)");
+        }
+        for (auto &up : all_funcs) {
+            if (up->pinned || !up->decl || !up->decl->id)
+                continue;
+            std::string ps;
+            for (size_t i = 0; i < up->params.size(); i++) {
+                if (i)
+                    ps += ", ";
+                if (up->params[i]->name)
+                    ps += std::string(up->params[i]->name->val) + ": ";
+                ps += sty_to_string(up->params[i]->type);
+            }
+            TRACE(infer, 0, "func " + std::string(up->decl->id->get_str()) +
+                            "(" + ps + ") -> " + sty_to_string(up->ret) +
+                            "  (final)");
+        }
     }
 
     cur_func = nullptr;
@@ -2098,15 +2129,26 @@ void Inferencer::commit_round()
         TypeSym *s = up.get();
         if (s->func || s->pinned)
             continue;
-        if (!sty_equal(s->acc, s->type))
+        if (!sty_equal(s->acc, s->type)) {
             changed = true;
+            if (s->name)
+                TRACE(infer, 1, std::string(s->name->val) + "  " +
+                                sty_to_string(s->type) + " -> " +
+                                sty_to_string(s->acc));
+        }
         s->type = s->acc;
     }
     for (auto &up : all_funcs) {
         if (up->pinned)
             continue;
-        if (!sty_equal(up->ret_acc, up->ret))
+        if (!sty_equal(up->ret_acc, up->ret)) {
             changed = true;
+            if (up->decl && up->decl->id)
+                TRACE(infer, 1, "func " +
+                                std::string(up->decl->id->get_str()) +
+                                " returns " + sty_to_string(up->ret) + " -> " +
+                                sty_to_string(up->ret_acc));
+        }
         up->ret = up->ret_acc;
     }
 }
