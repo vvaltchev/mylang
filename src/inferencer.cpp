@@ -118,6 +118,10 @@ public:
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
     void collect_arrays(AnalysisInfo &out); /* -a: array storage colors */
 
+    /* REPL :globals/:type - the inferred static type string of a committed
+     * global (or "" if it is not a committed inferred symbol). */
+    std::string global_type_str(const UniqueId *name);
+
     bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
     bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
     /* When false (the CLI's -nti), run() still does the structural pass and the
@@ -910,6 +914,18 @@ void Inferencer::undef_global(const UniqueId *name)
 {
     if (global)
         global->syms.erase(name);
+}
+
+std::string Inferencer::global_type_str(const UniqueId *name)
+{
+    if (!global)
+        return "";
+    auto it = global->syms.find(name);
+    if (it == global->syms.end() || !it->second)
+        return "";
+    TypeSym *s = it->second;
+    STyRef ty = s->func ? func_sty(s->func) : s->type;
+    return sty_to_string(ty);
 }
 
 /*
@@ -3413,4 +3429,9 @@ void ReplInfer::check_input(Construct *input)
 void ReplInfer::undef_global(const UniqueId *name)
 {
     impl->inf.undef_global(name);
+}
+
+std::string ReplInfer::global_type(const UniqueId *name)
+{
+    return impl->inf.global_type_str(name);
 }

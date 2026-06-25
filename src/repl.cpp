@@ -16,12 +16,14 @@
 #include "analyzer.h"
 #include "replhelp.h"
 #include "trace.h"
+#include "reflect.h"
 
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <set>
 #include <algorithm>
 #include <iterator>
 #include <cctype>
@@ -100,6 +102,8 @@ struct ReplEngine::Impl {
     string cmd_analyze(const string &code);
     string cmd_source(const string &path);
     string cmd_trace(const string &arg);
+    string cmd_globals();
+    string cmd_type(const string &code);
 
     /* lex `source` into stable per-line storage (the lexer holds string_views
      * into the lines, so they must outlive the parse). */
@@ -398,6 +402,10 @@ ReplEngine::Impl::meta_command(const string &src)
     }
     if (cmd == "trace")
         return cmd_trace(arg);
+    if (cmd == "globals" || cmd == "g")
+        return cmd_globals();
+    if (cmd == "type" || cmd == "t")
+        return cmd_type(arg);
     if (cmd == "quit" || cmd == "q")
         return "";              /* the loop handles the actual exit */
 
@@ -578,6 +586,144 @@ ReplEngine::Impl::cmd_trace(const string &arg)
         out = "Unknown trace category: " + unknown +
               " (try :help optimizations)\n" + out;
     return out;
+}
+
+/*
+ * :globals - a table of every global the session holds: variables, functions,
+ * structs, and consts (including const SCALARS, which are folded out of the
+ * runtime scope but live in the persistent const context). Each row shows the
+ * name, its type (the inferencer's INFERRED/declared static type for a var; a
+ * signature for a function; a constructor for a struct type), and the kind.
+ */
+string
+ReplEngine::Impl::cmd_globals()
+{
+    struct Row { string name; string type; const char *kind; };
+    std::vector<Row> rows;
+    std::set<const UniqueId *> seen;
+
+    auto classify = [&](const UniqueId *uid, const EvalValue &v,
+                        bool is_const) -> Row {
+        Row r;
+        r.name = string(uid->val);
+        if (v.is<shared_ptr<FuncObject>>()) {
+            r.kind = "func";
+            r.type = reflect_func_sig(v.get<shared_ptr<FuncObject>>()->func);
+        } else if (v.is<StructTypeDef *>()) {
+            r.kind = "struct type";
+            r.type = reflect_struct_ctor(v.get<StructTypeDef *>());
+        } else if (v.is<intrusive_ptr<StructObject>>()) {
+            r.kind = is_const ? "const" : "var";
+            r.type = string(
+                v.get<intrusive_ptr<StructObject>>()->def->name->val);
+        } else {
+            r.kind = is_const ? "const" : "var";
+            /* the inferred/declared static type (richer than the runtime kind:
+             * opt, dyn, array<dyn>, ...); fall back to the runtime structural
+             * type for a const scalar the inferencer never saw as a symbol. */
+            const string st = infer.global_type(uid);
+            r.type = !st.empty() ? st : reflect_typeof(v);
+        }
+        return r;
+    };
+
+    std::vector<std::pair<const UniqueId *, const LValue *>> rsyms;
+    runtime_ctx->collect_symbols(rsyms);
+    for (const auto &kv : rsyms) {
+        if (EvalContext::const_builtins.count(kv.first) ||
+            EvalContext::builtins.count(kv.first))
+            continue;
+        seen.insert(kv.first);
+        rows.push_back(classify(kv.first, kv.second->get(),
+                                kv.second->is_const_var()));
+    }
+
+    /* const scalars: present in the const context, folded out of runtime */
+    std::vector<std::pair<const UniqueId *, const LValue *>> csyms;
+    const_ctx->collect_symbols(csyms);
+    for (const auto &kv : csyms) {
+        if (EvalContext::const_builtins.count(kv.first) ||
+            seen.count(kv.first))
+            continue;
+        rows.push_back(classify(kv.first, kv.second->get(), true));
+    }
+
+    if (rows.empty())
+        return "(no globals defined yet)\n";
+
+    std::sort(rows.begin(), rows.end(),
+              [](const Row &a, const Row &b) { return a.name < b.name; });
+
+    size_t w = 0;
+    for (const Row &r : rows)
+        w = std::max(w, r.name.size());
+
+    std::ostringstream o;
+    for (const Row &r : rows) {
+        o << r.name;
+        for (size_t i = r.name.size(); i < w; i++)
+            o << ' ';
+        o << " : " << r.type << "   [" << r.kind << "]\n";
+    }
+    return o.str();
+}
+
+/*
+ * :type <expr> - show a type without committing anything. For a bare committed
+ * global it reports the inferencer's INFERRED/declared static type (opt, dyn,
+ * array<dyn>, a function/struct shape); for any other expression it evaluates
+ * it in a throwaway child scope and reports the runtime structural type. The
+ * expression is parsed against (but does not modify) the persistent state.
+ */
+string
+ReplEngine::Impl::cmd_type(const string &code)
+{
+    if (code.empty())
+        return "usage: :type <expr>\n";
+
+    string source = code;
+    const size_t e = source.find_last_not_of(" \t\r\n");
+    source.erase(e == string::npos ? 0 : e + 1);
+    if (!source.empty() && source.back() != ';')
+        source += ';';
+
+    std::vector<string> local_lines;
+    std::vector<Tok> toks;
+    lex_stable(source, local_lines, toks);
+
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        pc.const_ctx = const_ctx.get();
+        unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
+        Block *blk = dynamic_cast<Block *>(root.get());
+        if (!blk || blk->elems.empty())
+            return "(empty)\n";
+
+        /* a single bare identifier that is a committed global -> its inferred
+         * static type (no evaluation needed, richer than the value kind). */
+        if (blk->elems.size() == 1) {
+            if (auto *id = dynamic_cast<Identifier *>(blk->elems[0].get())) {
+                const string st = infer.global_type(id->uid);
+                if (!st.empty())
+                    return string(id->get_str()) + " : " + st +
+                           "   (inferred static type)\n";
+            }
+        }
+
+        /* otherwise evaluate in a throwaway child of the global scope (a
+         * declaration in the expr does NOT persist), read the runtime type. */
+        EvalContext child(runtime_ctx.get());
+        EvalValue last;
+        for (const auto &el : blk->elems)
+            last = el->eval(&child);
+        const EvalValue r = RValue(last);
+        return reflect_typeof(r) + "   (runtime type)\n";
+
+    } catch (const Exception &ex) {
+        std::ostringstream o;
+        format_exception(o, ex, local_lines);
+        return o.str();
+    }
 }
 
 /* Net unclosed (){}/[] depth of `src` (>=0), lexer-based so strings/comments

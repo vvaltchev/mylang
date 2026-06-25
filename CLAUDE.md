@@ -1610,9 +1610,17 @@ behind a thin terminal shell:
     earlier tokens — an ASan-caught UAF).
   - **Meta-commands** (`eval_input` dispatches a leading `:`): `:tree <code>`
     (parse + serialize, non-committing — parsed with `push_const_scope=true` so
-    prior consts fold but new decls land in the popped scope), `:source <file>`
-    (split into complete units via `is_incomplete` and replay each through
-    `do_eval(echo=false)`), `:help`, `:quit`.
+    prior consts fold but new decls land in the popped scope), `:analyze
+    <code>` (the colored optimization view), `:source <file>` (split into
+    complete units via `is_incomplete` and replay each through
+    `do_eval(echo=false)`), `:help [topic]` (the documentation system,
+    `replhelp.cpp`), `:trace [<cat>...] on|off` (toggle the diagnostic
+    tracer), `:globals` (a table of every global — vars/consts/funcs/structs —
+    with its inferred/declared type, merging the runtime scope with the const
+    context so folded const SCALARS still appear), `:type <expr>` (a committed
+    global's inferred static type via `ReplInfer::global_type`, else the
+    runtime structural type of the expression evaluated in a throwaway child
+    scope), `:quit`.
   - **`completions(buf, cursor)`** — Tab candidates: keywords + builtins + REPL
     globals (`EvalContext::collect_symbols`), or a struct value/type's fields/
     consts right after `base.`.

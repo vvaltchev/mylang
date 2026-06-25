@@ -7813,6 +7813,23 @@ static const std::vector<repl_test> repl_tests =
     { "trace: an unknown :trace category is reported",
       { { ":trace bogus on", "Unknown trace category" },
         { ":trace off", "tracing: off" } } },
+
+    /* ---- :globals / :type rich inspection views ---- */
+    { ":globals lists a function with its signature",
+      { { "var gv = 7", "=> 7" },
+        { "func gfn(int a) => a", "" },
+        { ":globals", "gfn : func gfn(int a)" } } },
+
+    { ":globals shows a const scalar (folded, from the const ctx)",
+      { { "const KC = 42", "" },
+        { ":globals", "KC : int   [const]" } } },
+
+    { ":type of a global shows its inferred static type",
+      { { "var ta = [1, 2, 3]", "" },
+        { ":type ta", "array<int>" } } },
+
+    { ":type of an expression shows the runtime type",
+      { { ":type [1.5, 2.5]", "array<float>" } } },
 };
 
 static bool run_one_repl_test(const repl_test &t)
