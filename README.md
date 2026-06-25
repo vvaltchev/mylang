@@ -165,8 +165,11 @@ inspecting the language and its compiler:
   consts — *including* folded const scalars — functions with their signatures,
   and structs) with its inferred/declared type; `:type <expr>` shows a global's
   inferred static type, or any expression's runtime type without committing it.
-  (These build on the reflection *builtins* `globals()`, `typeof()`,
-  `signature()`, `layout()`, `specializations()`, usable from scripts too.)
+  `:show <function>` "decompiles" a function's final optimized AST back into
+  code (folded consts, inlined bodies, dead code gone), and its `name$N` clones
+  too. (These build on the reflection *builtins* `globals()`, `typeof()`,
+  `signature()`, `layout()`, `specializations()`, `show()`, usable from scripts
+  too.)
 - **The compiler's reasoning** — `:trace <category> on` narrates the optimizer
   as your next input compiles: `:trace infer on` shows how each type is
   inferred, and `inline` / `specialize` / `template` / `autoconst` / `autopure`
@@ -2022,6 +2025,18 @@ Point - POD, size=16 bytes, align=8
 ```
 For a boxed struct it lists each field's slot index. `const` members are listed
 at the end. Accepts a struct **type descriptor** or an **instance**.
+
+#### `show(f)`
+Render function `f`'s **final optimized AST** back into synthetic MyLang-like
+code — the closest thing to "showing the disassembly". You see what actually
+runs: dead code removed, folded constants as literals (`func g() {
+print(f(1,2)); }` shows as `func g() { print(3); }` once `f` is inlined and
+folded), inlined call bodies spliced in and annotated, and a flat array's
+element type shown as `array<int>`. Best-effort and not round-trippable (an
+unhandled node renders as a comment placeholder). In the REPL, `:show <name>`
+prints this for a function **and** its `name$N` template-instance /
+specialization clones, so you can compare the generic template against each
+concrete, per-signature version.
 
 #### `specializations(f)`
 Return an `array<str>` of the synthetic global names (`name$N` template

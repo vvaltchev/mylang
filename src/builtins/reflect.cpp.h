@@ -30,6 +30,7 @@
 #include "structtype.h"
 #include "trace.h"
 #include "reflect.h"
+#include "coderender.h"
 
 #include <string>
 #include <vector>
@@ -370,6 +371,26 @@ EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList)
     for (std::string &n : out)
         vec.emplace_back(SharedStr(move(n)), false);
     return SharedArrayObj(move(vec));
+}
+
+/*
+ * show(f): render the FINAL optimized AST of function `f` back into synthetic
+ * MyLang-like code (folded consts as literals, inlined call bodies spliced in,
+ * dead code gone, flat-array element types shown). Returns the code as a
+ * string. See coderender.{h,cpp} and the REPL :show command.
+ */
+EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = RValue(arg->eval(ctx));
+
+    if (!e.is<shared_ptr<FuncObject>>())
+        throw TypeErrorEx("Expected a function", arg->start, arg->end);
+
+    return SharedStr(render_func_code(e.get<shared_ptr<FuncObject>>()->func));
 }
 
 /* ------------------------ diagnostic tracing ----------------------------- */

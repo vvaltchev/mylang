@@ -106,6 +106,12 @@ const BuiltinDoc builtin_docs[] = {
 { "specializations", "reflect", "specializations(f)",
   "The <name>$N / <name>$sN template-instance & specialization clones derived "
   "from f.", nullptr },
+{ "show", "reflect", "show(f)",
+  "Render function f's FINAL optimized AST back into synthetic MyLang code.",
+  "Dead code is gone, folded consts are literals, inlined call bodies are "
+  "spliced in (annotated), and flat-array element types show as array<int>. "
+  "In the REPL, :show <name> also renders the <name>$N clones. Best-effort, "
+  "not round-trippable." },
 { "array_storage", "reflect", "array_storage(a)",
   "The array's storage kind: \"ints\"/\"floats\"/\"bools\"/\"structs\"/"
   "\"general\".",
@@ -688,6 +694,12 @@ const CommandDoc command_docs[] = {
       "For a bare committed global, the inferencer's inferred/declared static "
       "type; for any other expression, its runtime structural type (evaluated "
       "in a throwaway scope). See also the typeof() builtin." },
+    { "show", ":show <function>",
+      "Render a function's final optimized AST back into MyLang-like code.",
+      "Folded consts as literals, inlined call bodies spliced in, dead code "
+      "gone, flat-array element types shown. For a base name its <name>$N "
+      "template-instance / specialization clones are rendered too. See the "
+      "show() builtin." },
     { "tree", ":tree <code>",
       "Print the const-folded syntax tree of <code> (non-committing).",
       "Shows what survived parse-time folding, e.g. :tree 2 + 3 * 4 -> "
@@ -874,7 +886,7 @@ void render_overview(std::ostream &o, bool color)
       << "          the REPL commands (:help <command> for one)\n";
     o << "Inspection:\n";
     o << "  " << p.kw << ":globals" << p.rst
-      << "  :type <expr>  :tree <code>  :analyze <code>\n";
+      << "  :type <expr>  :show <func>  :tree <code>  :analyze <code>\n";
     o << "  " << p.kw << ":trace <cat> on|off" << p.rst
       << "     narrate the compiler's reasoning (:trace help)\n";
     o << "Session: " << p.kw << ":source <file>" << p.rst

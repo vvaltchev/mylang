@@ -392,6 +392,8 @@ public:
 
     LiteralFloat(float_type v) : value(v) { }
 
+    float_type fval() const { return value; }
+
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;
     }
@@ -448,6 +450,8 @@ public:
     LiteralStr(const std::string_view &v);
     LiteralStr(const EvalValue &v) : value(v) { }
     LiteralStr(EvalValue &&v) : value(move(v)) { }
+
+    const EvalValue &strval() const { return value; }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return value;
