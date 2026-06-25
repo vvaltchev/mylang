@@ -332,7 +332,6 @@ const CatInfo *find_builtin_cat(const string &id)
 }
 
 /* ------------------------ language documentation ------------------------- */
-/* Populated by Pillar 2b; the dispatch handles an empty database gracefully. */
 
 struct LangFeature {
     const char *id;
@@ -342,18 +341,311 @@ struct LangFeature {
     const char *body;      /* the explanation */
 };
 
+/* Language categories, in display order. */
 const CatInfo lang_cats[] = {
-    { "__none__", "" },    /* placeholder; replaced in 2b */
+    { "basics",        "Values & types" },
+    { "variables",     "Variables & constants" },
+    { "operators",     "Operators" },
+    { "control",       "Control flow" },
+    { "functions",     "Functions & closures" },
+    { "arrays",        "Arrays & slices" },
+    { "dicts",         "Dictionaries" },
+    { "strings",       "Strings" },
+    { "structs",       "Structs" },
+    { "exceptions",    "Exceptions" },
+    { "types",         "Type system & inference" },
+    { "optimizations", "Optimizations" },
 };
 
 const LangFeature lang_features[] = {
-    { "__none__", "__none__", "", "", "" },
+
+/* ---- basics ---- */
+{ "values", "basics", "Values & literals",
+  "1    3.14    true    \"text\"    none\n[1, 2, 3]    {\"k\": 1}",
+  "MyLang has int (64-bit, wraps on overflow), float (64-bit IEEE double), "
+  "bool, str, none, arrays, and dicts, plus user structs. Integer division "
+  "truncates toward zero; floats match Python's." },
+{ "nonenull", "basics", "none / null",
+  "var opt x;    x = none;    x = null;",
+  "`none` is the absent/unit value; `null` is an exact alias for it. A value "
+  "can be `none` only where its type is nullable (see opt)." },
+{ "booltype", "basics", "Booleans",
+  "true    false",
+  "A real scalar type. The numeric promotion chain is bool <= int <= float, so "
+  "true + true is the int 2, while comparisons / logical ops / ! yield bool." },
+
+/* ---- variables ---- */
+{ "vardecl", "variables", "var",
+  "var x = 5;\nvar a, b = [1, 2];    var a, b = 0;",
+  "Declare a re-bindable variable. An id-list target with an array rvalue "
+  "spreads element-wise; with a scalar rvalue it assigns the same value to "
+  "each. A var only makes the NAME rebindable - a value derived from a const "
+  "stays read-only." },
+{ "constdecl", "variables", "const",
+  "const K = 10;    const A = [1, 2, 3];",
+  "A compile-time constant, evaluated at parse time (like C++ constexpr). A "
+  "const SCALAR is inlined at every use and its declaration dropped; a const "
+  "array/dict/func is kept as one runtime symbol but reads of it still fold. A "
+  "const is DEEP read-only (immutable through any alias, e.g. a function "
+  "parameter)." },
+{ "annotations", "variables", "Type annotations",
+  "int x = 5;    float f = 3;    str s;    array a = [1, 2];",
+  "A primitive type keyword (bool/int/float/str/array/dict) replaces `var` to "
+  "PIN a scalar's type: a wrong-typed value or reassignment is a compile "
+  "error, while float f = 3 widens. An uninitialized typed decl gets the "
+  "type's zero value (0/0.0/false/\"\"/[]/{}), or none when opt. array/dict "
+  "annotations check only the kind (the element type stays inferred)." },
+{ "optmod", "variables", "opt / nullable ?",
+  "opt int x;    int? y;    var opt z;    func f(x?)",
+  "`opt` makes a declaration nullable (may hold none). `T? ` is the short "
+  "form (int? == opt int); on a parameter, a trailing `?` on the NAME means "
+  "opt. A non-opt value is statically guaranteed never none, so the body uses "
+  "it without a check (mandatory-opt - see :help mandatoryopt)." },
+{ "dynmod", "variables", "dyn",
+  "var dyn d = ...;    dyn z;    func f(dyn a)    func f(~a)",
+  "`dyn` is a dynamically-typed (variant) declaration: it holds any type and "
+  "its type operations are checked at runtime, not by the inferencer. It is "
+  "orthogonal to nullability - a bare dyn is non-null, `opt dyn` is nullable. "
+  "On a parameter, a leading `~` is the short form of dyn." },
+
+/* ---- operators ---- */
+{ "arithmetic", "operators", "Arithmetic",
+  "+  -  *  /  %",
+  "Over int/float (bool promotes to int). `/` truncates toward zero for ints; "
+  "`+` also concatenates strings/arrays. Mixed int/float promotes to float." },
+{ "comparison", "operators", "Comparison",
+  "<  >  <=  >=  ==  !=",
+  "All yield a bool. ==/!= are defined for any pair of values; ordering "
+  "(< <= > >=) is numeric or string. 1 and 1.0 compare equal (and hash the "
+  "same, so they are one dict key)." },
+{ "logical", "operators", "Logical",
+  "&&    ||    !",
+  "Short-circuit && and ||, and unary !. The result is a bool." },
+{ "assignment", "operators", "Assignment",
+  "=   +=   -=   *=   /=   %=",
+  "Plain and compound assignment. The left side may be a variable, an "
+  "array/dict element, a struct field, or an id-list (multiple assignment)." },
+
+/* ---- control ---- */
+{ "ifelse", "control", "if / else",
+  "if (cond) { ... } else if (c2) { ... } else { ... }",
+  "Standard conditional. A const condition is folded at compile time - the "
+  "taken branch replaces the whole if and the dead branch is removed." },
+{ "whileloop", "control", "while",
+  "while (cond) { ... }",
+  "A const-false condition drops the loop entirely; break/continue work "
+  "inside." },
+{ "forloop", "control", "for",
+  "for (var i = 0; i < n; i += 1) { ... }",
+  "The classic C-style loop. `continue` still runs the increment. (There is no "
+  "++ operator; write i += 1.)" },
+{ "foreachloop", "control", "foreach",
+  "foreach (var e in a) { ... }\nforeach (var k, v in d) { ... }\n"
+  "foreach (var i, e in indexed a) { ... }",
+  "Iterate an array/dict/string. Tuple-unpacking binds dict key+value (or a "
+  "[k,v] pair); the `indexed` keyword also yields the position. The loop var's "
+  "type is derived from the container." },
+{ "breakcont", "control", "break / continue / return",
+  "break;    continue;    return expr;",
+  "break/continue only inside a loop, return only inside a function body - "
+  "each is a compile error elsewhere. They are signalled internally (not via "
+  "C++ exceptions), so they are cheap." },
+
+/* ---- functions ---- */
+{ "funcdecl", "functions", "func & lambdas",
+  "func f(a, b) { return a + b; }\nfunc g(x) => x + 1;\n"
+  "var h = func(x) => x * x;",
+  "Named functions, an expression body via `=>`, and anonymous lambdas. "
+  "Parameters are passed by value. A function sees only its captures (and, for "
+  "a pure func, only consts + params) - never the caller's locals or globals "
+  "unless captured." },
+{ "params", "functions", "Parameters",
+  "func f(const x, opt y, dyn z, int n)",
+  "A parameter may be `const` (reassigning it is an error), `opt` (nullable, "
+  "and a trailing opt param is skippable at the call site -> none), `dyn` "
+  "(variant), or carry a type annotation. An un-annotated plain parameter "
+  "makes the function a template (see :help templates)." },
+{ "namedargs", "functions", "Named arguments",
+  "func f(x, y, z) ...    f(x: 1, z: 3)",
+  "Arguments may be passed by name after a leading run of positional ones, in "
+  "declaration order; a skipped interior optional is filled with none. A named "
+  "call desugars to the positional form and is optimized IDENTICALLY - the "
+  "syntax never costs a fold/inline/specialization." },
+{ "closures", "functions", "Closures & captures",
+  "func make() { var n = 0; return func[n]() => n; }",
+  "A function can capture outer variables via a capture list. A non-capturing "
+  "function clones to itself (shared); a capturing one is deep-copied per "
+  "clone, so each closure has independent captured state." },
+{ "purefunc", "functions", "pure func",
+  "pure func sq(x) => x * x;    const C = sq(5);",
+  "A `pure func` can be invoked during const-evaluation: it may not capture "
+  "and sees only consts + its own params. It is the escape hatch that lets a "
+  "call run at parse time (sort(a, pure func(x,y) => x<y) folds). See also "
+  "auto-pure (:help autopure)." },
+
+/* ---- arrays ---- */
+{ "arraylit", "arrays", "Array literals & access",
+  "var a = [1, 2, 3];    a[0]    a[1:3]    len(a)    a += [4];",
+  "Arrays are 0-indexed, growable, and have value semantics (copy-on-write). "
+  "Indexing reads/writes an element; slicing yields an independent (lazily "
+  "copied) sub-array." },
+{ "slices", "arrays", "Slices (copy-on-write)",
+  "var s = a[1:3];",
+  "A slice is a cheap VIEW until written: reading it shares the parent's "
+  "storage, and a write clones first so logically-distinct arrays never bleed "
+  "into each other. intptr(x) reveals when two values share storage." },
+{ "flatstorage", "arrays", "Flat (unboxed) arrays",
+  "array_storage(a)    dynarray(a)",
+  "A homogeneous array<int>/<float>/<bool> (and array<PodStruct>) is stored "
+  "UNBOXED - far less memory and much faster bulk ops. The representation is "
+  "decided once from the proven static type and never converted; declare `dyn` "
+  "or use dynarray() for a polymorphic array. See :help flatarrays / "
+  ":trace arrays." },
+
+/* ---- dicts ---- */
+{ "dictlit", "dicts", "Dictionaries",
+  "var d = {\"k\": 1};    d[\"k\"]    d.k    get(d, k)    get!(d, k)\n"
+  "var dd = dict(0);   // a default dict",
+  "Keys may be any hashable scalar. A missing-key READ throws KeyNotFoundEx "
+  "(the read is non-opt) unless the dict has a default (dict(default_value)); "
+  "a plain-assignment to a missing key inserts it. get(d,k) is the nullable "
+  "lookup (opt V), get!(d,k) is value-or-throw." },
+
+/* ---- strings ---- */
+{ "strtype", "strings", "Strings",
+  "var s = \"text\";    s[0]    s[1:3]    s + t    len(s)",
+  "Strings are immutable and reference-counted; a slice is a cheap view (never "
+  "mutated in place). Characters are 8-bit - there is no Unicode (deliberate). "
+  "`+` concatenates; str(x) converts any value." },
+
+/* ---- structs ---- */
+{ "structdecl", "structs", "struct",
+  "struct Point { int x; int y; const ORIGIN = 0; }\n"
+  "var p = Point(3, 4);    p.x    Point.ORIGIN",
+  "A user value type with explicitly-typed fields and optional const members. "
+  "Construction is a call (Point(...)); fields are accessed with `.`. Structs "
+  "have COW value semantics. An all-scalar struct is POD (a native C byte "
+  "layout - see layout()); a ref/opt field makes it boxed. A self-reference "
+  "must be `opt` (dyn? next) to break the cycle - that is how you write a "
+  "list/tree." },
+
+/* ---- exceptions ---- */
+{ "trycatch", "exceptions", "Exceptions",
+  "try { ... }\ncatch (DivisionByZeroEx e) { ... }\nfinally { ... }\n"
+  "throw ex(\"MyError\", data);    rethrow;",
+  "try/catch/finally with catch clauses matched by exception NAME. Built-in "
+  "runtime errors (DivisionByZeroEx, TypeErrorEx, OutOfBoundsEx, "
+  "KeyNotFoundEx, ...) are catchable; user exceptions are made with "
+  "ex(name, data) and their payload read with exdata(). COMPILE-time errors "
+  "(type/syntax) are NOT catchable. `rethrow` re-throws the in-flight "
+  "exception from a catch." },
+
+/* ---- types ---- */
+{ "inference", "types", "Static type inference",
+  "(automatic; disable with -nti)",
+  "A whole-program, compile-time pass gives every variable, parameter and "
+  "function return a fixed static type and REJECTS type violations before the "
+  "program runs (a static type error is a compile error, not a runtime one). "
+  "It runs a fixpoint, then checks every operator/call/assignment/return. "
+  ":trace infer narrates it; the REPL :type <expr> shows an inferred type." },
+{ "mandatorydyn", "types", "Mandatory dyn",
+  "var dyn d = runtime(5);    // a plain `var` here is an error",
+  "A plain var/const must infer a CONCRETE type; if its type would be dyn, the "
+  "compiler demands you write it explicitly (var dyn). This keeps `dyn` "
+  "visible at the declaration. Parameters and foreach loop vars are exempt." },
+{ "mandatoryopt", "types", "Mandatory opt & null narrowing",
+  "func f(opt x) { if (x == none) return; use(x); }",
+  "A parameter that can receive none from some call must be declared `opt`, "
+  "else it is a compile error at the declaration - so a non-opt parameter is "
+  "PROVEN never none and the body needs no check. Inside a proven branch "
+  "(if (x != none) ..., a guard clause) a nullable reads as non-opt." },
+{ "templates", "types", "Function templates",
+  "func f(x) { var t = x + 1; return t; }    f(1); f(\"s\");",
+  "A named function with an un-annotated, non-dyn, non-opt parameter is a "
+  "TEMPLATE: it is not checked in isolation but instantiated per call-site "
+  "signature as a typed clone ($tmplN). So f(1) and f(\"s\") make two "
+  "instances, not a type conflict. `dyn` is the explicit one-instance-any-type "
+  "parameter. See :trace template / specializations()." },
+
+/* ---- optimizations ---- */
+{ "constfold", "optimizations", "Const-evaluation",
+  "const K = 2 + 3 * 4;    // baked to 14 at parse time",
+  "Constants are computed at PARSE time (constexpr-like), inside the parser. A "
+  "pure func with const args runs then too. A const error fails the build (it "
+  "is not deferred to runtime). :trace fold shows folds; :tree / :analyze show "
+  "the result." },
+{ "autoconst", "optimizations", "Auto-const",
+  "var n = 10;    // write-once scalar -> a compile-time constant",
+  "A post-parse pass does for plain `var`s what const does: a write-once "
+  "variable with a constant scalar initializer is promoted to a compile-time "
+  "constant, its declaration dropped and every use folded - cascading in "
+  "declaration order. :trace autoconst narrates it." },
+{ "autopure", "optimizations", "Auto-pure",
+  "func area(r) => math_pi * r * r;    // proven pure",
+  "A capture-free function that reads only consts/params (and nests no "
+  "function) is promoted to effectively-pure, so its const-argument calls fold "
+  "even though it was not written `pure`. ispure() reports it; :trace autopure "
+  "narrates it." },
+{ "inlining", "optimizations", "Inlining",
+  "func inc(x) => x + 1;    inc(y)  ->  y + 1    (-it N, -ni to disable)",
+  "A small expression-bodied or tail call is spliced in place: it removes call "
+  "overhead and exposes the body to the caller's const-folder. The body must "
+  "be under a node threshold (-it, default 24). Backtraces are preserved via "
+  "inlined-at frames. :trace inline shows each decision." },
+{ "specialization", "optimizations", "Specialization",
+  "func g(n) { ...big... }    g(3)  ->  $spec0  (n bound to 3, folded)",
+  "A const argument is propagated into a (possibly non-pure) function and "
+  "folded; if that shrinks the body enough, a shared clone $specN is emitted "
+  "and the call redirected (a scalar OR a deep read-only array/dict arg can "
+  "seed one). The half whole-call folding misses. :trace specialize." },
+{ "templinst", "optimizations", "Template instantiation",
+  "f(1); f(2.5)  ->  $tmpl0 (int), $tmpl1 (float)",
+  "A template (see :help templates) is cloned per distinct call-site signature "
+  "as a concrete, typed instance $tmplN; calls of the same signature share one "
+  "clone. Past 64 instances a template's further calls run dynamically. "
+  ":trace template / specializations() list them." },
+{ "m8scalar", "optimizations", "Typed scalar specialization (M8)",
+  "(automatic for proven int/float scalar expressions)",
+  "After inference proves a scalar expression is a non-null int/float, it is "
+  "rewritten to an unboxed TypedScalarExpr evaluated with no promotion "
+  "dispatch and no intermediate boxing - ~2-3x on numeric loops. :analyze "
+  "marks specialized call sites." },
+{ "flatarrays", "optimizations", "Flat arrays",
+  "array_storage(a) == \"ints\"",
+  "A homogeneous int/float/bool array (and array<PodStruct>) is stored unboxed "
+  "(8 bytes per int/float, ONE byte per bool), decided from the proven static "
+  "type and never converted. See :help flatstorage / :trace arrays." },
+{ "cse", "optimizations", "Const de-duplication (CSE)",
+  "const A = [1,2,3]; const B = [1,2,3];   // share one baked value",
+  "Two identical const expressions share one baked read-only value instead of "
+  "duplicating it - a compile-time + memory win (folding already made each use "
+  "a literal). intptr() shows the shared identity." },
+{ "cow", "optimizations", "Copy-on-write",
+  "var b = a;    // aliases until one is written",
+  "Arrays, dicts, strings and structs are reference-counted with value "
+  "semantics preserved via copy-on-write: assignment/slicing share storage "
+  "until a mutation, which clones first. Read-only (const) values are never "
+  "cloned. clone() is shallow, deepclone() deep." },
+
 };
 
-bool lang_db_empty() { return true; }    /* flipped on in 2b */
+bool lang_db_empty() { return false; }
 
-const LangFeature *find_feature(const string &) { return nullptr; }
-const CatInfo *find_lang_cat(const string &) { return nullptr; }
+const LangFeature *find_feature(const string &id)
+{
+    for (const LangFeature &f : lang_features)
+        if (id == f.id)
+            return &f;
+    return nullptr;
+}
+
+const CatInfo *find_lang_cat(const string &id)
+{
+    for (const CatInfo &c : lang_cats)
+        if (id == c.id)
+            return &c;
+    return nullptr;
+}
 
 /* ------------------------------ rendering -------------------------------- */
 
