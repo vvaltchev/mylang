@@ -43,6 +43,22 @@ if (TESTS)
    target_compile_definitions(mylang PUBLIC "TESTS")
 endif()
 
+# ML_CHECK() defense-in-depth assertions (defs.h): ON for a Debug build or any
+# sanitized build, OFF for a plain optimized release - mirrors the Makefile's
+# -DMLDEBUG so every CI Debug run (GCC, Clang, AND MSVC) exercises the assert
+# net, while release/bench pay nothing. See "Invariants & hazards" in CLAUDE.md.
+if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR ASAN OR UBSAN)
+   target_compile_definitions(mylang PUBLIC "MLDEBUG")
+endif()
+
+# Adversarial Construct allocator (forces address reuse so pointer-identity
+# bugs are deterministic under -rt). Off by default; -DRECYCLE=ON. Parity with
+# the Makefile's RECYCLE=1.
+set(RECYCLE OFF CACHE BOOL "Adversarial recycling Construct allocator")
+if (RECYCLE)
+   target_compile_definitions(mylang PUBLIC "RECYCLE_ALLOC")
+endif()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
    if (GCOV)
       target_compile_options(mylang PUBLIC -fprofile-arcs -ftest-coverage)
