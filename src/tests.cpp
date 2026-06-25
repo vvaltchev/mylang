@@ -20,6 +20,7 @@
 #include "repl.h"
 #include "lineedit.h"
 #include "highlight.h"
+#include "replhelp.h"
 
 #include <typeinfo>
 #include <vector>
@@ -8103,9 +8104,57 @@ static bool repl_incomplete_detection()
     return true;
 }
 
+/* A substring test helper for the headless :help renderer. */
+static bool help_has(const std::string &topic, const char *needle)
+{
+    const std::string s = repl_help(topic, /*color=*/false);
+    return s.find(needle) != std::string::npos;
+}
+
+static bool replhelp_overview_and_builtins()
+{
+    if (!help_has("", "MyLang REPL help"))           return false;
+    if (!help_has("", ":help builtins"))             return false;
+    if (!help_has("builtins", "Arrays"))             return false;
+    if (!help_has("builtins", "Reflection"))         return false;
+    if (!help_has("builtins math", "sqrt"))          return false;
+    return true;
+}
+
+static bool replhelp_builtin_entries()
+{
+    /* a builtin signature + its description, including the bang name */
+    if (!help_has("typeof", "typeof(x)"))            return false;
+    if (!help_has("typeof", "structural type"))      return false;
+    if (!help_has("get!", "KeyNotFoundEx"))          return false;
+    if (!help_has("runtime", "optimization barrier")) return false;
+    /* the const-vs-runtime kind note */
+    if (!help_has("len", "const ("))                 return false;
+    if (!help_has("print", "runtime ("))             return false;
+    return true;
+}
+
+static bool replhelp_unknown_and_topics()
+{
+    if (!help_has("no_such_thing", "No help for"))   return false;
+    if (!help_has("builtins boguscat", "Unknown builtin category"))
+        return false;
+    /* completion topics */
+    const auto t = repl_help_topics("ar");
+    bool has_array = false, has_array_storage = false;
+    for (const auto &s : t) {
+        if (s == "array")         has_array = true;
+        if (s == "array_storage") has_array_storage = true;
+    }
+    return has_array && has_array_storage;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "repl: multi-line completeness detection", repl_incomplete_detection },
+    { "replhelp: overview + builtins index", replhelp_overview_and_builtins },
+    { "replhelp: builtin entries + kind note", replhelp_builtin_entries },
+    { "replhelp: unknown topic + completion", replhelp_unknown_and_topics },
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },
     { "repl: completion (struct members)", repl_completion_struct_members },
