@@ -565,13 +565,10 @@ ReplEngine::Impl::cmd_trace(const string &arg)
         return trace_state_str() + "\n";
 
     if (toks[0] == "help" || toks[0] == "?" || toks[0] == "list") {
-        string out = "trace categories: ";
-        const std::vector<string> cats = trace_categories();
-        for (size_t i = 0; i < cats.size(); i++)
-            out += (i ? ", " : "") + cats[i];
-        out += " (or all)\n";
+        string out = "trace categories:\n";
+        out += trace_categories_help("  ");
         out += "usage: :trace <cat>... on|off   :trace off   "
-               ":trace            (show active)\n";
+               ":trace   (show active)\n";
         out += trace_state_str() + "\n";
         return out;
     }

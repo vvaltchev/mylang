@@ -1665,8 +1665,9 @@ behind a thin terminal shell:
   language-category → feature, and when a builtin and a command share a name
   (`trace`/`type`/`globals`) the builtin entry shows with a pointer to the
   command. Feature ids are kept distinct from category ids. The trace category
-  list has one source of truth, `trace_categories()` (`trace.cpp`), used by
-  `:trace help`. Pure/headless, so it is unit-tested directly (`replhelp:`
+  list (names + descriptions) has one source of truth, `trace_categories_help()`
+  (`trace.cpp`), rendered as an aligned bullet list by `:trace help` and the
+  `trace`/`:trace` entries alike. Pure/headless, so it is unit-tested (`replhelp:`
   extra_checks). See `plans/repl-introspection.md`.
 - **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
   category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/

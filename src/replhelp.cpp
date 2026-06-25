@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "replhelp.h"
+#include "trace.h"
 
 #include <sstream>
 #include <string>
@@ -125,10 +126,10 @@ const BuiltinDoc builtin_docs[] = {
   "True only if f was explicitly declared pure.", nullptr },
 { "trace", "reflect", "trace(category, on)",
   "Enable/disable a diagnostic trace category that narrates the compiler.",
-  "category is one of: infer, inline, specialize, template, autoconst, "
-  "autopure, arrays, fold, or all. In the REPL use :trace; for a whole script "
-  "use mylang --trace <cats> file (a script is fully compiled before it runs, "
-  "so a runtime trace() call can't show its own compilation)." },
+  "category is a single category name or \"all\". In the REPL use :trace; for "
+  "a whole script use mylang --trace <cats> file (a script is fully compiled "
+  "before it runs, so a runtime trace() call can't show its own "
+  "compilation)." },
 { "traceoff", "reflect", "traceoff()",
   "Disable all diagnostic trace categories.", nullptr },
 { "tracing", "reflect", "tracing()",
@@ -674,12 +675,10 @@ const CommandDoc command_docs[] = {
       "the commands. A leading ':' is optional (:help :trace = :help trace)." },
     { "trace", ":trace [<cat>...] on|off",
       "Toggle the diagnostic tracer that narrates the compiler's reasoning.",
-      "With no argument it shows the active categories; ':trace help' lists "
-      "them; ':trace off' disables all. Categories: infer, inline, specialize, "
-      "template, autoconst, autopure, arrays, fold (or all). The trace prints "
-      "just above the result as the next input compiles. (Script equivalent: "
-      "mylang --trace <cats> file; or the trace()/traceoff()/tracing() "
-      "builtins.)" },
+      "With no argument it shows the active categories; ':trace off' disables "
+      "all. The trace prints just above the result as the next input compiles. "
+      "(Script equivalent: mylang --trace <cats> file; or the "
+      "trace()/traceoff()/tracing() builtins.)" },
     { "globals", ":globals",
       "A table of every global (vars, consts, funcs, structs) with its type.",
       "Merges the runtime scope with the const context, so folded const "
@@ -755,6 +754,10 @@ void render_builtin_entry(std::ostream &o, const BuiltinDoc &d, bool color)
     o << "    " << d.summary << "\n";
     if (d.longd)
         o << "    " << d.longd << "\n";
+    if (!std::strcmp(d.name, "trace")) {       /* the category bullet list */
+        o << "    categories:\n";
+        o << trace_categories_help("      ");
+    }
     const CatInfo *c = find_builtin_cat(d.cat);
     o << p.dim << "    [" << (c ? c->title : d.cat) << "; "
       << builtin_kind_note(d) << "]" << p.rst << "\n";
@@ -831,6 +834,10 @@ void render_command_entry(std::ostream &o, const CommandDoc &c, bool color)
     o << "    " << c.summary << "\n";
     if (c.longd)
         o << "    " << c.longd << "\n";
+    if (!std::strcmp(c.name, "trace")) {       /* the category bullet list */
+        o << "    categories:\n";
+        o << trace_categories_help("      ");
+    }
     o << p.dim << "    [REPL command]" << p.rst << "\n";
 }
 

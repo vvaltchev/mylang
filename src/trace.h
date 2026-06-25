@@ -68,10 +68,11 @@ void trace_clear_all();
 std::vector<std::string> trace_active();
 std::string trace_state_str();
 
-/* All trace category names in canonical (declaration) order - the single
- * source of truth shared by `:trace help`, `:help :trace`, and `--trace`. Does
- * not include the "all" meta-name. */
-std::vector<std::string> trace_categories();
+/* The categories as an aligned bullet list (name + description, plus an `all`
+ * row), each line prefixed by `indent` - the single source of truth, shared by
+ * `:trace help` and the `trace` / `:trace` help entries so the list is
+ * identical everywhere. */
+std::string trace_categories_help(const std::string &indent);
 
 /* Output controls. Color wraps the category tag in ANSI; the sink defaults to
  * &std::cerr. The REPL points the sink at its per-input capture stream so trace
