@@ -74,15 +74,17 @@ typedef intptr_t int_type;
  * different place, so a bad change has many chances to hit a wall. They must be
  * SIDE-EFFECT FREE (the condition is compiled out in a plain release build).
  *
- * Active when -DMLDEBUG is set: every debug build (OPT=0) and every sanitized
- * build (ASAN/UBSAN), which covers all CI debug runs. Compiled to nothing in a
- * plain optimized build, so release and the bench suite pay zero.
+ * Tied to the build's ASSERTS flag, exactly like the C `assert()`: active
+ * unless NDEBUG is defined. ASSERTS defaults ON for EVERY build type (debug and
+ * release alike); a build with ASSERTS=0 defines NDEBUG, which compiles both
+ * the C asserts and these away (the way to measure the assert overhead, e.g.
+ * `make OPT=1 ASSERTS=0`). So all CI runs exercise the full net.
  *
  * For conditions that CAN legitimately occur at runtime (bad user input, I/O
  * failure, a real type error) do NOT use these - throw a proper Exception so
  * the error is handled in every build. ML_CHECK is for "impossible" states.
  */
-#ifdef MLDEBUG
+#ifndef NDEBUG
 #  include <cassert>
 #  define ML_CHECK(cond)          assert(cond)
 #  define ML_CHECK_MSG(cond, msg) assert((cond) && (msg))

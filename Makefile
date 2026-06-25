@@ -62,20 +62,16 @@ ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
 	BASE_FLAGS += -fno-omit-frame-pointer
 endif
 
-# ML_CHECK() debug assertions (defense-in-depth invariant checks, errors.h).
-# ON for a debug build (OPT=0) or ANY sanitized build, OFF for a plain
-# optimized build - so release and the bench suite pay nothing for them, while
-# every CI debug run and every sanitized run exercises the full assertion net.
-# Force either way with MLDEBUG=1 / MLDEBUG=0.
-MLDEBUG ?= 0
-ifeq ($(OPT),0)
-	MLDEBUG := 1
-endif
-ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
-	MLDEBUG := 1
-endif
-ifeq ($(MLDEBUG),1)
-	BASE_FLAGS += -DMLDEBUG
+# ASSERTS: the defense-in-depth assertion net - both the C `assert()` and the
+# project's ML_CHECK() invariant checks (defs.h). Default ON for EVERY build
+# type (debug AND release), so every build exercises the full net. Set
+# ASSERTS=0 to compile them all away (defines NDEBUG); use that on an optimized
+# build to measure the assert overhead, e.g. `make OPT=1 ASSERTS=0` vs the
+# default `make OPT=1`. (NDEBUG was never defined here before, so the existing
+# asserts already ran in release; this just makes that a switch.)
+ASSERTS ?= 1
+ifeq ($(ASSERTS),0)
+	BASE_FLAGS += -DNDEBUG
 endif
 
 # Adversarial Construct allocator (a LIFO free-list that hands a just-freed

@@ -43,12 +43,21 @@ if (TESTS)
    target_compile_definitions(mylang PUBLIC "TESTS")
 endif()
 
-# ML_CHECK() defense-in-depth assertions (defs.h): ON for a Debug build or any
-# sanitized build, OFF for a plain optimized release - mirrors the Makefile's
-# -DMLDEBUG so every CI Debug run (GCC, Clang, AND MSVC) exercises the assert
-# net, while release/bench pay nothing. See "Invariants & hazards" in CLAUDE.md.
-if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR ASAN OR UBSAN)
-   target_compile_definitions(mylang PUBLIC "MLDEBUG")
+# ASSERTS: the defense-in-depth assertion net (C assert + ML_CHECK, defs.h).
+# Default ON for EVERY build type, so every CI run (GCC/Clang/MSVC, Debug AND
+# Release) exercises it. ASSERTS=OFF defines NDEBUG to compile them all away.
+# CMake's optimized configs add -DNDEBUG themselves; when ASSERTS is ON we
+# append -UNDEBUG (target options come AFTER the config flags, and the last of
+# -D/-U on the command line wins), cancelling it so Release keeps the asserts.
+set(ASSERTS ON CACHE BOOL "Defense-in-depth assertions (assert + ML_CHECK)")
+if (ASSERTS)
+   if (MSVC)
+      target_compile_options(mylang PUBLIC /UNDEBUG)
+   else()
+      target_compile_options(mylang PUBLIC -UNDEBUG)
+   endif()
+else()
+   target_compile_definitions(mylang PUBLIC "NDEBUG")
 endif()
 
 # Adversarial Construct allocator (forces address reuse so pointer-identity
