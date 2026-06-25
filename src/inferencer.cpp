@@ -247,6 +247,7 @@ private:
     void contribute_arg(TypeSym *param, STyRef argT, Loc loc);
     void contribute_ret(STyRef t);
     void accumulate_assign(Expr14 *e);
+    void contribute_to_lvalue(Construct *lv, STyRef ct, Loc loc);
     void accumulate_call(CallExpr *call);
     void accumulate_foreach(ForeachStmt *fe);
     void spread_idlist(IdList *idl, Construct *rvalue);
@@ -2482,6 +2483,19 @@ void Inferencer::accumulate(Construct *n)
         return;
     }
 
+    if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
+        accumulate(idc->lvalue.get());
+        /* Only a CONTAINER element accrues a type from `++` - so `d[k]++` pins
+         * a `dict(0)`'s value type to int exactly as `d[k] += 1` does. A scalar
+         * identifier does NOT: its type is fixed by its declaration, and
+         * widening it here (`b = b + 1` -> int for a bool) would mask the
+         * "++ requires int/float" check, which must still reject `b++`. */
+        Construct *lv = idc->lvalue.get();
+        if (dynamic_cast<Subscript *>(lv) || dynamic_cast<MemberExpr *>(lv))
+            contribute_to_lvalue(lv, type_of(idc), idc->start);
+        return;
+    }
+
     if (auto *call = dynamic_cast<CallExpr *>(n)) {
         accumulate_call(call);
         return;
@@ -2649,15 +2663,29 @@ void Inferencer::accumulate_assign(Expr14 *e)
 
     Construct *lv = e->lvalue.get();
 
-    if (auto *id = dynamic_cast<Identifier *>(lv)) {
-        auto it = id_sym.find(id);
-        if (it != id_sym.end())
-            contribute(it->second, ct, e->start);
+    if (auto *idl = dynamic_cast<IdList *>(lv)) {
+        spread_idlist(idl, e->rvalue.get());
         return;
     }
 
-    if (auto *idl = dynamic_cast<IdList *>(lv)) {
-        spread_idlist(idl, e->rvalue.get());
+    contribute_to_lvalue(lv, ct, e->start);
+}
+
+/*
+ * Contribute the post-write type `ct` back to an lvalue's symbol or container.
+ * Shared by `x OP= v` (accumulate_assign) and `x++`/`--x` (accumulate): a bare
+ * identifier accrues `ct`; an array/dict element accrues `array<ct>` /
+ * `dict<K,ct>` to its base (only once the base kind is known, so an as-yet
+ * Unknown base isn't wrongly guessed); a dict member accrues `dict<str,ct>`
+ * (a struct field leaves the struct's fixed type alone). An IdList spread is
+ * caller-specific (only assignment has one).
+ */
+void Inferencer::contribute_to_lvalue(Construct *lv, STyRef ct, Loc loc)
+{
+    if (auto *id = dynamic_cast<Identifier *>(lv)) {
+        auto it = id_sym.find(id);
+        if (it != id_sym.end())
+            contribute(it->second, ct, loc);
         return;
     }
 
@@ -2665,9 +2693,6 @@ void Inferencer::accumulate_assign(Expr14 *e)
         if (auto *bid = dynamic_cast<Identifier *>(sub->what.get())) {
             auto it = id_sym.find(bid);
             if (it != id_sym.end() && it->second) {
-                /* Only contribute once the base kind is known (from a prior
-                 * literal/assignment); guessing array for an as-yet-Unknown
-                 * base would spuriously conflict with a dict. */
                 STyRef bt = sty_resolve(it->second->type);
                 if (bt->kind == STyKind::Dict)
                     contribute(it->second,
@@ -2683,10 +2708,6 @@ void Inferencer::accumulate_assign(Expr14 *e)
     if (auto *mem = dynamic_cast<MemberExpr *>(lv)) {
         if (auto *bid = dynamic_cast<Identifier *>(mem->what.get())) {
             auto it = id_sym.find(bid);
-            /* Only a *known* dict base accrues a dict type from `b.k = v`; a
-             * struct field assignment leaves the struct's (fixed) type alone,
-             * and an Unknown base must not be guessed a dict (it may be a
-             * struct). Mirrors the Subscript lvalue rule above. */
             if (it != id_sym.end() && it->second &&
                 sty_resolve(it->second->type)->kind == STyKind::Dict)
                 contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start);
