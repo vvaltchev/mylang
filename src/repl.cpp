@@ -739,18 +739,36 @@ ReplEngine::Impl::cmd_type(const string &code)
     }
 }
 
-/*
- * :show <function> - render a function's FINAL optimized AST back into
- * synthetic MyLang-like code (folded consts, inlined bodies, dead code gone;
- * see coderender.{h,cpp}). When <function> is a base name, its `<name>$N`
- * template-instance / specialization clones are rendered too (so you see the
- * concrete, per-signature versions the compiler generated).
- */
+/* Syntax-highlight a (possibly multi-line) rendered block when color is on,
+ * line by line (highlight_line is per-line). */
+static string
+show_colorize(const string &s, bool color)
+{
+    if (!color)
+        return s;
+    string out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        const size_t nl = s.find('\n', start);
+        const size_t end = (nl == string::npos) ? s.size() : nl;
+        out += highlight_line(s.substr(start, end - start));
+        if (nl == string::npos)
+            break;
+        out += '\n';
+        start = nl + 1;
+    }
+    return out;
+}
+
+/* Render `fn` (and, recursively at the call site, its clones) with its inferred
+ * parameter + return types. */
 string
 ReplEngine::Impl::cmd_show(const string &arg)
 {
     if (arg.empty())
-        return "usage: :show <function>\n";
+        return "usage: :show <function-or-expression>\n";
+
+    const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
 
     std::vector<std::pair<const UniqueId *, const LValue *>> syms;
     runtime_ctx->collect_symbols(syms);
@@ -761,37 +779,71 @@ ReplEngine::Impl::cmd_show(const string &arg)
                    ? v.get<shared_ptr<FuncObject>>()->func
                    : nullptr;
     };
+    auto render = [&](const FuncDeclStmt *f) {
+        return render_func_code(f, infer.func_param_types(f),
+                                infer.func_return_type(f));
+    };
 
+    /* if `arg` is exactly a global FUNCTION name, render it + its clones */
     const FuncDeclStmt *base = nullptr;
-    bool found_name = false;
     for (const auto &kv : syms)
-        if (kv.first->val == arg) {
-            found_name = true;
+        if (kv.first->val == arg)
             base = func_of(kv.second);
+
+    if (base) {
+        std::ostringstream o;
+        o << render(base);
+        std::vector<std::pair<string, const FuncDeclStmt *>> clones;
+        for (const auto &kv : syms) {
+            const FuncDeclStmt *g = func_of(kv.second);
+            if (g && g != base && g->display_name == arg)
+                clones.emplace_back(string(kv.first->val), g);
         }
-
-    if (!found_name)
-        return "No global named '" + arg + "' (try :globals)\n";
-    if (!base)
-        return "'" + arg + "' is not a function\n";
-
-    std::ostringstream o;
-    o << render_func_code(base, infer.func_param_types(base));
-
-    /* also its `<name>$N` clones (display_name == arg), sorted by name */
-    std::vector<std::pair<string, const FuncDeclStmt *>> clones;
-    for (const auto &kv : syms) {
-        const FuncDeclStmt *g = func_of(kv.second);
-        if (g && g != base && g->display_name == arg)
-            clones.emplace_back(string(kv.first->val), g);
+        std::sort(clones.begin(), clones.end(),
+                  [](const auto &x, const auto &y) {
+                      return x.first < y.first;
+                  });
+        for (const auto &c : clones)
+            o << "\n" << render(c.second);
+        return show_colorize(o.str(), color);
     }
-    std::sort(clones.begin(), clones.end(),
-              [](const auto &a, const auto &b) { return a.first < b.first; });
-    for (const auto &c : clones)
-        o << "\n" << render_func_code(c.second,
-                                      infer.func_param_types(c.second));
 
-    return o.str();
+    /* otherwise treat `arg` as an EXPRESSION: parse it (non-committing) and run
+     * the optimizers, then render the result - so :show 2 + 3 * 4 shows `14`
+     * and :show f(x) shows how that call folds/inlines. */
+    string source = arg;
+    const size_t e = source.find_last_not_of(" \t\r\n");
+    source.erase(e == string::npos ? 0 : e + 1);
+    if (!source.empty() && source.back() != ';')
+        source += ';';
+
+    std::vector<string> local_lines;
+    std::vector<Tok> toks;
+    lex_stable(source, local_lines, toks);
+
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        pc.const_ctx = const_ctx.get();
+        unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
+        resolve_names(root.get(), /*inline=*/true, 24, nullptr, /*repl=*/true);
+
+        Block *blk = dynamic_cast<Block *>(root.get());
+        string r;
+        if (blk) {
+            for (const auto &el : blk->elems)
+                r += render_construct_code(el.get()) + "\n";
+        } else {
+            r = render_construct_code(root.get()) + "\n";
+        }
+        if (r.empty())
+            return "(nothing to show)\n";
+        return show_colorize(r, color);
+
+    } catch (const Exception &ex) {
+        std::ostringstream o;
+        format_exception(o, ex, local_lines);
+        return o.str();
+    }
 }
 
 /* Net unclosed (){}/[] depth of `src` (>=0), lexer-based so strings/comments

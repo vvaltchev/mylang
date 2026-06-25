@@ -374,10 +374,13 @@ EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList)
 }
 
 /*
- * show(f): render the FINAL optimized AST of function `f` back into synthetic
- * MyLang-like code (folded consts as literals, inlined call bodies spliced in,
- * dead code gone, flat-array element types shown). Returns the code as a
- * string. See coderender.{h,cpp} and the REPL :show command.
+ * show(x): render the FINAL optimized AST of `x` back into synthetic MyLang
+ * code (folded consts as literals, inlined call bodies spliced in, dead code
+ * gone, flat-array element types shown). If `x` is a function value its whole
+ * declaration is rendered; otherwise `x` is treated as an EXPRESSION and its
+ * (already-optimized) argument tree is rendered - so show(2 + 3 * 4) -> "14"
+ * and show(f(1, 2)) shows how that call optimized. Returns the code as a
+ * string. See coderender.{h,cpp} and the richer REPL :show command.
  */
 EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
 {
@@ -385,12 +388,21 @@ EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (!e.is<shared_ptr<FuncObject>>())
-        throw TypeErrorEx("Expected a function", arg->start, arg->end);
+    /* A bare identifier bound to a function -> render the function's body.
+     * (An Identifier eval is a side-effect-free scope lookup.) */
+    if (dynamic_cast<Identifier *>(arg)) {
+        const EvalValue lv = arg->eval(ctx);
+        if (lv.is<LValue *>()) {
+            const EvalValue &v = lv.get<LValue *>()->get();
+            if (v.is<shared_ptr<FuncObject>>())
+                return SharedStr(
+                    render_func_code(v.get<shared_ptr<FuncObject>>()->func));
+        }
+    }
 
-    return SharedStr(render_func_code(e.get<shared_ptr<FuncObject>>()->func));
+    /* Otherwise render the (optimized) expression AST itself - no evaluation. */
+    return SharedStr(render_construct_code(arg));
 }
 
 /* ------------------------ diagnostic tracing ----------------------------- */

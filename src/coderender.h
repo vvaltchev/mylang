@@ -26,7 +26,8 @@ class FuncDeclStmt;
  * falls back to a comment placeholder rather than failing.
  */
 std::string render_func_code(const FuncDeclStmt *fn,
-                             const std::vector<std::string> &param_types = {});
+                             const std::vector<std::string> &param_types = {},
+                             const std::string &ret_type = "");
 
 /* Render an arbitrary construct (a statement or expression) - used by the
  * above and by the unit tests. */

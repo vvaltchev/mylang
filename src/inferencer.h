@@ -73,9 +73,10 @@ public:
      * Backs the REPL :globals enrichment. */
     std::string global_type(const UniqueId *name);
 
-    /* The inferred type of each parameter of `fn` (for :show); empty for an
-     * un-instantiated template or an unknown function. */
+    /* The inferred type of each parameter of `fn`, and `fn`'s inferred return
+     * type (for :show); empty for an un-instantiated template / unknown func. */
     std::vector<std::string> func_param_types(const FuncDeclStmt *fn);
+    std::string func_return_type(const FuncDeclStmt *fn);
 
 private:
 

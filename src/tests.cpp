@@ -6506,8 +6506,10 @@ static const std::vector<test> tests =
        * marker), then the signature */
       { "func sf(int x) => x + 1;",
         "assert(startswith(show(sf), \"/* pure */ func sf(int x)\"));" } },
-    { "reflect: show() rejects a non-function",
-      { "show(42);" }, &typeid(TypeErrorEx) },
+    { "reflect: show() renders an expression (folded)",
+      { "assert(show(2 + 3 * 4) == \"14\");" } },
+    { "reflect: show() renders an expression tree",
+      { "assert(show([1, 2, 3]) == \"[1, 2, 3]\");" } },
 
     /* ---- diagnostic tracing builtins (trace.h) ---- */
     { "trace: tracing() is empty by default",
@@ -7831,11 +7833,14 @@ static const std::vector<repl_test> repl_tests =
         { "ti(2, 3)", "=> 5" },
         { "typeof(ti$0)", "func ti(" } } },
 
-    { ":show renders a function and its instances with inferred param types",
+    { ":show renders a function with inferred param + return types",
       { { "func sm(x, y) { var t = x + y; return t; }", "" },
         { "sm(2, 3)", "=> 5" },
-        /* the base shows untyped params; the instance shows inferred ones */
-        { ":show sm", "func sm$0(int x, int y)" } } },
+        /* the instance shows inferred param types AND the return type */
+        { ":show sm", "int func sm$0(int x, int y)" } } },
+
+    { ":show of an expression renders its optimized (folded) form",
+      { { ":show 2 + 3 * 4", "14" } } },
 
     /* a template instance appending to a PINNED global array must not trip the
      * global's assignability check before the arg type settles (defer-on-
@@ -8411,6 +8416,26 @@ static bool coderender_inline_fold_types()
                        std::string::npos;
 
     /* an arbitrary expression renders too */
+    if (Block *blk = dynamic_cast<Block *>(root.get())) {
+        if (!blk->elems.empty())
+            ok = ok && !render_construct_code(blk->elems[0].get()).empty();
+    }
+    return ok;
+}
+
+/* The :show highlighter extensions: a C-style block comment is colored, and a
+ * synthetic `f$0` name stays one identifier (the '$' is an id char now). */
+static bool coderender_highlight()
+{
+    set_highlight_enabled(true);
+    const std::string code = "/* pure */ int func f$0(int x) => x + 1;";
+    const std::string hl = highlight_line(code);
+    set_highlight_enabled(true);   /* (the suite default) */
+
+    bool ok = true;
+    ok = ok && hl != code;                              /* colored */
+    ok = ok && hl.find("\033[38;5;244m/*") != std::string::npos;  /* comment */
+    ok = ok && hl.find("f$0") != std::string::npos;     /* contiguous id */
     return ok;
 }
 
@@ -8441,6 +8466,8 @@ static const std::vector<extra_check> extra_checks =
     { "trace: every category narrates a decision", trace_pipeline_categories },
     { "coderender: inlining, folding, and instance types",
       coderender_inline_fold_types },
+    { "coderender: :show highlighting (block comment + $ id)",
+      coderender_highlight },
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },
     { "repl: completion (struct members)", repl_completion_struct_members },

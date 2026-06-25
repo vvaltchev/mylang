@@ -127,10 +127,11 @@ public:
      * global (or "" if it is not a committed inferred symbol). */
     std::string global_type_str(const UniqueId *name);
 
-    /* REPL :show - the inferred type of each of `fn`'s parameters (for a
-     * concrete function / template instance); empty for an un-instantiated
-     * template (params unbound) or an unknown function. */
+    /* REPL :show - the inferred type of each of `fn`'s parameters, and `fn`'s
+     * inferred return type (for a concrete function / template instance); empty
+     * for an un-instantiated template (unbound) or an unknown function. */
     std::vector<std::string> func_param_types(const FuncDeclStmt *fn);
+    std::string func_return_type(const FuncDeclStmt *fn);
 
     bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
     bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
@@ -1028,6 +1029,21 @@ Inferencer::func_param_types(const FuncDeclStmt *fn)
         return out;
     }
     return out;
+}
+
+std::string
+Inferencer::func_return_type(const FuncDeclStmt *fn)
+{
+    if (!fn)
+        return "";
+    for (auto &up : all_funcs) {
+        if (up->decl != fn)
+            continue;
+        if (up->is_template)        /* an un-instantiated template: unbound */
+            return "";
+        return sty_to_string(up->ret);
+    }
+    return "";
 }
 
 /*
@@ -3559,4 +3575,9 @@ std::string ReplInfer::global_type(const UniqueId *name)
 std::vector<std::string> ReplInfer::func_param_types(const FuncDeclStmt *fn)
 {
     return impl->inf.func_param_types(fn);
+}
+
+std::string ReplInfer::func_return_type(const FuncDeclStmt *fn)
+{
+    return impl->inf.func_return_type(fn);
 }

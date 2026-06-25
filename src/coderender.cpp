@@ -96,6 +96,7 @@ struct Renderer {
     /* inferred parameter types for the top-level function (REPL :show only);
      * empty falls back to the AST's explicit annotations / dyn modifiers. */
     const std::vector<std::string> *ptypes = nullptr;
+    string ret_type;                /* inferred return type prefix, or "" */
 
     explicit Renderer(std::ostream &os) : o(os) {}
 
@@ -434,6 +435,8 @@ struct Renderer {
     {
         if (f->explicit_pure || f->effective_pure)
             o << (f->explicit_pure ? "pure " : "/* pure */ ");
+        if (!ret_type.empty())                       /* inferred return type */
+            o << ret_type << " ";
         o << "func ";
         o << (f->id ? string(f->id->get_str()) : string("<lambda>"));
         o << "(";
@@ -447,6 +450,11 @@ struct Renderer {
                     o << param_str(p);                  /* AST annotation */
             }
         o << ") ";
+
+        /* the signature consumed the inferred types; clear them so a nested
+         * function in the body doesn't inherit this function's types. */
+        ptypes = nullptr;
+        ret_type.clear();
 
         if (auto *b = dynamic_cast<const Block *>(f->body.get())) {
             o << "{\n";
@@ -492,7 +500,8 @@ struct Renderer {
 }  /* namespace */
 
 string render_func_code(const FuncDeclStmt *fn,
-                        const std::vector<std::string> &param_types)
+                        const std::vector<std::string> &param_types,
+                        const std::string &ret_type)
 {
     if (!fn)
         return "";
@@ -500,6 +509,7 @@ string render_func_code(const FuncDeclStmt *fn,
     Renderer r(o);
     if (!param_types.empty())
         r.ptypes = &param_types;
+    r.ret_type = ret_type;
     r.func(fn, 0);
     o << "\n";
     return o.str();

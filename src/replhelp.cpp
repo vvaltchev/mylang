@@ -106,12 +106,13 @@ const BuiltinDoc builtin_docs[] = {
 { "specializations", "reflect", "specializations(f)",
   "The <name>$N / <name>$sN template-instance & specialization clones derived "
   "from f.", nullptr },
-{ "show", "reflect", "show(f)",
-  "Render function f's FINAL optimized AST back into synthetic MyLang code.",
-  "Dead code is gone, folded consts are literals, inlined call bodies are "
-  "spliced in (annotated), and flat-array element types show as array<int>. "
-  "In the REPL, :show <name> also renders the <name>$N clones. Best-effort, "
-  "not round-trippable." },
+{ "show", "reflect", "show(x)",
+  "Render x's FINAL optimized AST back into synthetic MyLang code.",
+  "A function value renders its whole declaration; any other argument is an "
+  "EXPRESSION whose optimized tree is rendered (show(2+3*4) -> 14). Dead code "
+  "is gone, folded consts are literals, inlined bodies are spliced in. In the "
+  "REPL, :show <name> also renders the <name>$N clones with their inferred "
+  "param/return types, syntax-highlighted." },
 { "array_storage", "reflect", "array_storage(a)",
   "The array's storage kind: \"ints\"/\"floats\"/\"bools\"/\"structs\"/"
   "\"general\".",
@@ -694,12 +695,13 @@ const CommandDoc command_docs[] = {
       "For a bare committed global, the inferencer's inferred/declared static "
       "type; for any other expression, its runtime structural type (evaluated "
       "in a throwaway scope). See also the typeof() builtin." },
-    { "show", ":show <function>",
-      "Render a function's final optimized AST back into MyLang-like code.",
-      "Folded consts as literals, inlined call bodies spliced in, dead code "
-      "gone, flat-array element types shown. For a base name its <name>$N "
-      "template-instance / specialization clones are rendered too. See the "
-      "show() builtin." },
+    { "show", ":show <function-or-expression>",
+      "Render a function (or expression) optimized AST back into MyLang code.",
+      "Folded consts as literals, inlined bodies spliced in, dead code gone. A "
+      "function's <name>$N clones are rendered too, each with its inferred "
+      "parameter and return types (e.g. `int func dot$0(int x, int y)`), "
+      "syntax-highlighted. An expression argument shows how it optimizes "
+      "(:show 2 + 3 * 4 -> 14). See the show() builtin." },
     { "tree", ":tree <code>",
       "Print the const-folded syntax tree of <code> (non-committing).",
       "Shows what survived parse-time folding, e.g. :tree 2 + 3 * 4 -> "
