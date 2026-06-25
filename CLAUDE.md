@@ -268,6 +268,11 @@ adding type or builtin
 code, put it in the matching `.cpp.h` and rely on it being pulled into
 `types.cpp` — it will not
 compile standalone, and there is nothing to add to the Makefile.
+`builtins/reflect.cpp.h` holds the **runtime reflection** builtins
+(`globals`/`typeof`/`signature`/`layout`/`specializations`) and the shared
+`reflect_*` rendering helpers (signature/type/layout strings) the REPL's
+introspection commands reuse; it is `#include`d last (after the other builtins)
+so it can call `arr_elem_at`. See `plans/repl-introspection.md`.
 
 **Why so many headers are templates.** `type.h` (`TypeTemplate`),
 `sharedarray.h`

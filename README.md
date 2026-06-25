@@ -1950,6 +1950,62 @@ A shortcut for `exception()`.
 #### `exdata(ex)`
 Get the payload data from the given exception object.
 
+### Non-const reflection builtins
+Runtime introspection of the live program state. They are ordinary (non-const)
+builtins, so **scripts and tests** use them too, not only the REPL — and the
+REPL's `:help` / `:globals` / `:trace` commands build on them. (For a symbol's
+*inferred static type* or the optimizer's reasoning — which exist only at
+compile time — use the REPL's `:type` / `:trace`; those views aren't available
+to a running script.)
+
+#### `globals()`
+Return a sorted `array<str>` of the names bound in the **global scope** —
+variables, functions, structs, kept `const` containers, and any `$specN` /
+`$tmplN` specialization/template clones — excluding the builtins (those are
+`:help builtins`). Two honest limits: a `const` **scalar** is folded away and is
+not a runtime symbol, so it is absent here (the REPL's `:globals` adds it from
+the persistent const context); and in a non-REPL **script**, top-level `var`s
+are frame slots rather than map entries, so a script's `globals()` lists only
+the map-resident names (functions, structs, clones, captured globals). In the
+REPL every global is map-resident, so all of them appear.
+
+#### `typeof(x)`
+Return the **runtime structural type** of `x` as a string — richer than
+[`type()`](#typevalue), which gives only the bare kind (`"array"`). Examples:
+`"int"`, `"float"`, `"bool"`, `"str"`, `"none"`, `"array<int>"`,
+`"array<float>"`, `"array<Point>"`, `"array<dyn>"` (a general/heterogeneous
+array), `"dict<int,str>"` (probed from one entry; `"dict"` when empty), a struct
+instance's type name (`"Point"`), `"type Point"` for a struct *descriptor*, a
+function's signature, or `"exception"`. It is computed from the value alone, so
+it works in any script.
+
+#### `signature(f)`
+Return a function's declared signature as a string, e.g.
+`"pure func hypot(float a, float b)"` — reflecting `pure`, `const`/`opt`/`dyn`
+modifiers and type annotations on each parameter. Given a **struct type** (or a
+struct **instance**) it returns the constructor form, e.g. `"Point(int x, int
+y)"`.
+
+#### `layout(struct_or_type)`
+Return a struct's **in-memory layout** as a multi-line string. For a POD struct
+(every field a non-`opt` scalar / nested POD) it shows the total size and
+alignment and each field's byte offset and size:
+```
+Point - POD, size=16 bytes, align=8
+  x: int @0 (8 bytes)
+  y: int @8 (8 bytes)
+```
+For a boxed struct it lists each field's slot index. `const` members are listed
+at the end. Accepts a struct **type descriptor** or an **instance**.
+
+#### `specializations(f)`
+Return an `array<str>` of the synthetic global names (`$specN` /
+`$tmplN`) of every specialization / template-instantiation clone derived from
+function `f` (empty when none). These clones are real globals — the compiler
+inserts each at the root and binds its synthetic name — so this is a plain scope
+walk. *What* each clone specializes on is shown by the REPL `:trace` /
+`:globals` views.
+
 ### Non-const array builtins
 
 #### `append(array, value)`
