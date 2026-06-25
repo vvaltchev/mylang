@@ -17,6 +17,7 @@
 #include "builtins/arr.cpp.h"
 #include "builtins/dict.cpp.h"
 #include "builtins/generic.cpp.h"
+#include "builtins/reflect.cpp.h"
 
 #include <cmath>
 #include <limits>
@@ -283,6 +284,13 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("ispuredecl", builtin_ispuredecl),
     make_builtin("intptr", builtin_intptr),
     make_builtin("array_storage", builtin_array_storage),
+
+    /* Runtime reflection (see builtins/reflect.cpp.h) */
+    make_builtin("globals", builtin_globals),
+    make_builtin("typeof", builtin_typeof),
+    make_builtin("signature", builtin_signature),
+    make_builtin("layout", builtin_layout),
+    make_builtin("specializations", builtin_specializations),
     /* dynarray(a): manual promotion - a fresh general (polymorphic) copy of an
      * array. Non-const (fresh mutable value). See builtin_dynarray. */
     make_builtin("dynarray", builtin_dynarray),
