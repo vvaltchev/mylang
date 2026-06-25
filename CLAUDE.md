@@ -205,12 +205,12 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — fifteen
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — sixteen
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
 `eval.cpp`, `types.cpp`, `stype.cpp`, `backtrace.cpp`, `errfmt.cpp`,
-`highlight.cpp`, `lineedit.cpp`, `repl.cpp`, `mylang.cpp`, `tests.cpp` (the last
-four are the REPL — see "The interactive REPL" below).
+`highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`, `repl.cpp`, `mylang.cpp`,
+`tests.cpp` (the last five are the REPL — see "The interactive REPL" below).
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
   turns thrown
@@ -1630,6 +1630,15 @@ behind a thin terminal shell:
   per-exception-type caret/backtrace rendering, factored out of `mylang.cpp`
   (parameterized by an `ostream` + the source `lines`) so the file driver and
   the REPL share it.
+- **`replhelp.{h,cpp}`** — `repl_help(topic, color)`, the `:help`
+  documentation system: a self-contained STATIC database (no interpreter
+  state) of every builtin (`{name, category, signature, summary, long?}`) and,
+  added in Pillar 2b, the language features — surface *and* the optimization
+  passes. `:help` overview, `:help builtins[/<cat>]`, `:help <builtin>`,
+  `:help language`, `:help <category>`, `:help <feature>` all route through it;
+  it shares the `reflect_*` renderers (`builtins/reflect.cpp.h`) conceptually
+  but holds its own prose. Pure/headless, so it is unit-tested directly
+  (`replhelp:` extra_checks). See `plans/repl-introspection.md`.
 
 `run_repl` (in `repl.cpp`) drives it: history loaded/saved to
 `~/.mylang_history`, colors gated on a TTY + `NO_COLOR`, Ctrl-C drops the

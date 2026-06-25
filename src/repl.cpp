@@ -14,6 +14,7 @@
 #include "inferencer.h"
 #include "resolver.h"
 #include "analyzer.h"
+#include "replhelp.h"
 
 #include <iostream>
 #include <fstream>
@@ -376,12 +377,8 @@ ReplEngine::Impl::meta_command(const string &src)
     if (cmd == "source" || cmd == "load")
         return cmd_source(arg);
     if (cmd == "help" || cmd == "h") {
-        return
-            ":help            this message\n"
-            ":tree <code>     show the parsed (const-folded) syntax tree\n"
-            ":analyze <code>  reprint code colored by optimizations that fired\n"
-            ":source <file>   evaluate a file as if typed at the prompt\n"
-            ":quit            exit the REPL\n";
+        const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
+        return repl_help(arg, color);
     }
     if (cmd == "quit" || cmd == "q")
         return "";              /* the loop handles the actual exit */
