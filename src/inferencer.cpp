@@ -56,6 +56,13 @@ struct TypeSym {
     bool is_param = false;
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
+    /* Structural-pass bookkeeping for safe var-bound-lambda monomorphization:
+     * how many times the name is written (decl + assigns), and whether it is
+     * ever referenced in a non-callee (value) position. A write-once,
+     * never-value-used var bound to a non-capturing lambda is safe to treat as
+     * a template (calls redirect to typed clones; nothing else holds it). */
+    int writes = 0;
+    bool value_used = false;
     /* A param that received a possibly-none (opt/none) argument at some call
      * site (set in the check pass). With strict_dyn on, a non-opt non-dyn param
      * with this set is a compile error demanding `opt` (enforce_nonnull_params,
@@ -199,6 +206,7 @@ private:
     void spread_idlist(IdList *idl, Construct *rvalue);
 
     /* monomorphization (templates - see plans/function-templates.md) */
+    void mark_lambda_templates();   /* safe var-bound lambdas -> templates */
     void run_fixpoint(Block *root);             /* the Jacobi loop, extracted */
     bool instantiate_round(Block *root);     /* clone + redirect; progress? */
     FuncDeclStmt *make_template_clone(FuncInfo *tmpl, const std::string &key,
@@ -425,6 +433,41 @@ void Inferencer::for_each_child(Construct *n,
 
 /* ----------------------- monomorphization (templates) -------------------- */
 
+/*
+ * Promote a SAFE var-bound lambda to a template after the structural pass (when
+ * `writes`/`value_used` are known). Safe = a non-capturing anonymous lambda
+ * bound to a write-once var that is only ever CALLED (never passed/stored as a
+ * value): then redirecting its calls to typed clones can't be observed through
+ * the var, and there is no value use whose type would regress to dyn. This is
+ * how `var id = func(x) => x; id(1); id("s")` stops being a join conflict.
+ */
+void Inferencer::mark_lambda_templates()
+{
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        FuncInfo *fi = s->func;
+        if (!fi || fi->is_template || fi->pinned)
+            continue;
+        FuncDeclStmt *fd = fi->decl;
+        if (!fd || fd->id)                  /* anonymous lambdas only */
+            continue;
+        if (s->writes != 1 || s->value_used)    /* write-once + calls-only */
+            continue;
+        if (fd->captures && !fd->captures->elems.empty())   /* non-capturing */
+            continue;
+        bool has_tparam = false;
+        if (fd->params)
+            for (auto &p : fd->params->elems)
+                if (!p->opt_mod && !p->dyn_mod &&
+                    p->decl_type == DeclType::none) {
+                    has_tparam = true;
+                    break;
+                }
+        if (has_tparam)
+            fi->is_template = true;
+    }
+}
+
 /* The Jacobi fixpoint, extracted so the instantiation loop can re-run it. */
 void Inferencer::run_fixpoint(Block *rootBlock)
 {
@@ -476,7 +519,8 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
 {
     unique_ptr<Construct> cl = tmpl->decl->clone();
     auto *fc = static_cast<FuncDeclStmt *>(cl.get());
-    fc->display_name = std::string(tmpl->decl->id->get_str());
+    fc->display_name = tmpl->decl->id
+        ? std::string(tmpl->decl->id->get_str()) : std::string("<lambda>");
     fc->id = make_unique<Identifier>(
         "$tmpl" + std::to_string(tmpl_clone_counter++));
 
@@ -630,6 +674,7 @@ void Inferencer::infer_one(Block *rootBlock)
     if (!checks_enabled)
         return;
 
+    mark_lambda_templates();   /* safe var-bound lambdas become templates */
     run_fixpoint(rootBlock);
 
     /*
@@ -1195,7 +1240,8 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
         sym->const_decl = sym->const_decl || is_const;
         if (id->decl_type != DeclType::none)
             sym->ann = id->decl_type;
-        id_sym[id] = sym;
+        id_sym[id] = sym;        /* the decl write is counted in walk_struct
+                                  * (declare_target runs twice via hoist) */
     };
 
     if (auto *id = dynamic_cast<Identifier *>(lvalue))
@@ -1247,6 +1293,15 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
 
     if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
         walk_struct(e14->rvalue.get(), s);   /* RHS before name exists */
+        /* count a write to each target name (decl or assign), once - this walk
+         * runs once per node (declare_target runs twice via hoist). */
+        auto count_write = [&](Construct *lv) {
+            if (auto *lid = dynamic_cast<Identifier *>(lv)) {
+                auto it = id_sym.find(lid);
+                if (it != id_sym.end() && it->second)
+                    it->second->writes++;
+            }
+        };
         if (e14->fl & pFlags::pInDecl) {
             declare_target(e14->lvalue.get(), s,
                            e14->fl & pFlags::pInConstDecl);
@@ -1262,6 +1317,24 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         } else {
             walk_struct(e14->lvalue.get(), s);
         }
+        if (auto *idl = dynamic_cast<IdList *>(e14->lvalue.get()))
+            for (auto &up : idl->elems) count_write(up.get());
+        else
+            count_write(e14->lvalue.get());
+        return;
+    }
+
+    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+        /* The callee is a CALL use (not a value use); a bare-Identifier callee
+         * resolves here without being marked value_used, so a var used only to
+         * be called stays monomorphizable. Args are value uses. */
+        if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+            if (!id_sym.count(cid))
+                id_sym[cid] = lookup(s, cid->uid);
+        } else {
+            walk_struct(call->what.get(), s);
+        }
+        walk_struct(call->args.get(), s);
         return;
     }
 
@@ -1316,6 +1389,10 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
     if (auto *id = dynamic_cast<Identifier *>(n)) {
         if (!id_sym.count(id))
             id_sym[id] = lookup(s, id->uid);
+        /* reached for every reference EXCEPT a call callee (handled above): a
+         * value (non-callee) use. */
+        if (TypeSym *sym = id_sym[id])
+            sym->value_used = true;
         return;
     }
 
