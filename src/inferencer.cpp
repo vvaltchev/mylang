@@ -810,7 +810,7 @@ void Inferencer::infer_input(Block *rootBlock)
      * by raw Construct* (AST node ADDRESS), which the allocator recycles once a
      * node is freed - so a stale entry from a prior input could be matched by a
      * fresh node reusing that address (the MSVC-only, address-dependent bug we
-     * root-caused). walk_struct rebuilds both for THIS input, and no reader ever
+     * root-caused). walk_struct rebuilds both for THIS input, and no reader
      * looks up a prior input's node (the cross-input link is the persistent,
      * arena-stable TypeSym/FuncInfo, reached via the UniqueId-keyed scope - see
      * callee_funcinfo). So clearing here removes the staleness at the source.
