@@ -799,6 +799,12 @@ private:
 
     /* Names a function reads from outer scope: kept in the map, not slotted. */
     std::unordered_set<const UniqueId *> escaped;
+    /* Names of functions PROVEN effectively-pure so far (in walk order). A call
+     * to one is itself pure - so the auto-pure test recognizes a function that
+     * calls an earlier auto-pure helper (e.g. f(x,y)=>add(x,y) is pure once add
+     * is), letting its const-arg calls fold. Monotonic; populated as
+     * process_function decides each function. */
+    std::unordered_set<const UniqueId *> pure_func_names;
 
     /* Pass 2: function bodies are already resolved, so don't re-enter them. */
     bool top_level_only = false;
@@ -991,53 +997,57 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
 /*
  * Auto-pure test: true if a function body is "effectively pure" - every free
  * identifier (sym.kind != local, i.e. not a param/local) is a compile-time
- * const (is_const: a const global, const builtin, or explicitly-pure func), and
- * the body declares no nested function. Reads the resolver's sym.kind, so it
- * must run AFTER the body is walked. Conservative: self-recursion (the func's
- * own name is a free, non-const reference) and calls to other auto-pure (not
- * explicitly-pure) functions are not recognized, so such functions stay impure.
+ * const (is_const: a const global, const builtin, or explicitly-pure func) OR
+ * the name of a function already PROVEN auto-pure (`pure_names` - so calling an
+ * earlier auto-pure helper is pure), and the body declares no nested function.
+ * Reads the resolver's sym.kind, so it must run AFTER the body is walked.
+ * Conservative: self-recursion and calls to a not-yet-decided (e.g.
+ * forward-referenced or mutually-recursive) auto-pure func stay impure.
  */
 bool
-func_body_is_pure(const Construct *c)
+func_body_is_pure(const Construct *c,
+                  const std::unordered_set<const UniqueId *> &pure_names)
 {
     if (!c)
         return true;
 
     if (auto *id = dynamic_cast<const Identifier *>(c))
-        return id->sym.kind == SymKind::local || id->is_const;
+        return id->sym.kind == SymKind::local || id->is_const ||
+               pure_names.count(id->uid) != 0;
 
     if (dynamic_cast<const FuncDeclStmt *>(c))
         return false;   /* a nested function: be conservative */
 
     if (auto *b = dynamic_cast<const Block *>(c)) {
         for (auto &e : b->elems)
-            if (!func_body_is_pure(e.get()))
+            if (!func_body_is_pure(e.get(), pure_names))
                 return false;
         return true;
     }
     if (auto *f = dynamic_cast<const ForStmt *>(c))
-        return func_body_is_pure(f->init.get())
-            && func_body_is_pure(f->cond.get())
-            && func_body_is_pure(f->inc.get())
-            && func_body_is_pure(f->body.get());
+        return func_body_is_pure(f->init.get(), pure_names)
+            && func_body_is_pure(f->cond.get(), pure_names)
+            && func_body_is_pure(f->inc.get(), pure_names)
+            && func_body_is_pure(f->body.get(), pure_names);
     if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
-        return func_body_is_pure(fe->container.get())
-            && func_body_is_pure(fe->body.get());
+        return func_body_is_pure(fe->container.get(), pure_names)
+            && func_body_is_pure(fe->body.get(), pure_names);
     if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
-        if (!func_body_is_pure(tc->tryBody.get()))
+        if (!func_body_is_pure(tc->tryBody.get(), pure_names))
             return false;
         for (auto &p : tc->catchStmts)
-            if (!func_body_is_pure(p.second.get()))
+            if (!func_body_is_pure(p.second.get(), pure_names))
                 return false;
-        return func_body_is_pure(tc->finallyBody.get());
+        return func_body_is_pure(tc->finallyBody.get(), pure_names);
     }
     if (auto *e14 = dynamic_cast<const Expr14 *>(c))
-        return func_body_is_pure(e14->lvalue.get())
-            && func_body_is_pure(e14->rvalue.get());
+        return func_body_is_pure(e14->lvalue.get(), pure_names)
+            && func_body_is_pure(e14->rvalue.get(), pure_names);
 
     bool ok = true;
-    for_each_child(const_cast<Construct *>(c),
-                   [&](Construct *ch) { ok = ok && func_body_is_pure(ch); });
+    for_each_child(const_cast<Construct *>(c), [&](Construct *ch) {
+        ok = ok && func_body_is_pure(ch, pure_names);
+    });
     return ok;
 }
 
@@ -1112,12 +1122,17 @@ Resolver::process_function(FuncDeclStmt *fd)
     if (!fd->effective_pure
             && (!fd->captures || fd->captures->elems.empty())
             && fd->body
-            && func_body_is_pure(fd->body.get())) {
+            && func_body_is_pure(fd->body.get(), pure_func_names)) {
         fd->effective_pure = true;
         if (fd->id)
             TRACE(autopure, 0, std::string(fd->id->get_str()) +
                   "  reads only consts/params -> effective pure");
     }
+
+    /* record any proven-pure function (auto OR explicit) so a LATER function
+     * that calls it is recognized pure too (see func_body_is_pure). */
+    if (fd->effective_pure && fd->id)
+        pure_func_names.insert(fd->id->uid);
 
     if (st.slottable && st.next_slot > 0) {
         fd->resolved = true;

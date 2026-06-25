@@ -2098,6 +2098,28 @@ static const std::vector<test> tests =
             "assert(ispure(p));",
         },
     },
+    /* auto-pure propagates: a function calling an earlier auto-pure helper is
+     * itself recognized pure, so the whole pure chain const-folds (-O3-like) */
+    { "auto-pure: a func calling an auto-pure helper is recognized pure",
+      { "func add(a, b) => a + b;",
+        "func f(x, y) => add(x, y);",
+        "assert(ispure(add) && ispure(f));" } },
+    { "auto-pure: a pure chain with literal args const-folds",
+      { "func add(a, b) => a + b;",
+        "func f(x, y) => add(x, 2 * y);",
+        "var r = f(1, 2);",
+        "assert(isconst(r) && r == 5);" } },
+    { "auto-pure: a 3-level pure chain folds",
+      { "func a(x) => x + 1; func b(x) => a(x) * 2;",
+        "func c(x) => b(x) + a(x);",
+        "var r = c(5); assert(isconst(r) && r == 18);" } },
+    { "auto-pure: an impure callee keeps the caller impure",
+      { "func imp(x) { print(x); return x; }",
+        "func u(x) => imp(x) + 1;",
+        "assert(ispure(imp) == false && ispure(u) == false);" } },
+    { "auto-pure: a self-recursive function stays conservative (not pure)",
+      { "func fac(n) { if (n < 2) { return 1; } return n * fac(n - 1); }",
+        "assert(ispure(fac) == false);" } },
     { "ispure() of a non-function is a type error",
       { "ispure(5);" }, &typeid(TypeErrorEx) },
     { "ispure() with no args is rejected",
@@ -8318,15 +8340,20 @@ static bool trace_pipeline_categories()
 
     bool ok = true;
     try {
+        /* helper is pure; compute has a side effect (print) so it SPECIALIZES
+         * on a const arg rather than folding away; helper(n) inside compute
+         * INLINES (n is a non-const param); helper(1) FOLDS (const pure call). */
         const char *src[] = {
             "func helper(x) => x + 1;",
-            "func compute(n) { var k = 5; var t = helper(n) * k; "
-            "return t; }",
+            "func compute(n) { var k = 5; print(helper(n) * k); "
+            "return n; }",
             "var a = [1, 2, 3];",
-            "var r = compute(10);",
+            "var fo = helper(1);",
+            "var sv = compute(10);",
         };
+        const size_t nsrc = sizeof(src) / sizeof(src[0]);
         std::vector<Tok> toks;
-        for (size_t i = 0; i < 4; i++)
+        for (size_t i = 0; i < nsrc; i++)
             lexer(src[i], static_cast<int>(i + 1), toks);
         ParseContext pc(TokenStream(toks), true);
         unique_ptr<Construct> root = pBlock(pc);

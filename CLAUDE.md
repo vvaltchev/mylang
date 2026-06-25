@@ -528,9 +528,19 @@ explicitly.
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to
 `effective_pure` when every free identifier (`sym.kind != local`) is
-`is_const` (a const global/builtin/explicit-pure func) and it nests no function.
-Conservative: self-recursion and calls to *other* auto-pure (non-explicit) funcs
-are not recognized. `FuncDeclStmt::{explicit_pure, effective_pure}` back the
+`is_const` (a const global/builtin/explicit-pure func) **or the name of a
+function already proven pure** (`Resolver::pure_func_names`, populated in
+walk order as `process_function` decides each), and it nests no function. So a
+function that calls an *earlier* auto-pure helper is itself recognized pure —
+`func f(x,y)=>add(x,y)` is pure once `add` is, so `f(1,2)` const-folds (the
+whole pure chain folds at compile time, like `-O3`). Still conservative:
+self-recursion and a call to a not-yet-decided (forward-referenced or
+mutually-recursive) func stay impure. **Order matters: this propagates within
+ONE compilation (a script / one REPL input). Cross-input — `f` in a later
+input calling `add` from an earlier one — `add` isn't in the new input's
+`pure_func_names`, so `f` is not yet recognized pure (a known REPL limitation;
+the script/-e path folds the whole chain).** `FuncDeclStmt::{explicit_pure,
+effective_pure}` back the
 runtime builtins `ispuredecl()`/`ispure()` (they evaluate the arg to a
 `FuncObject` and read its `FuncDeclStmt`). `isconst()`/`isconstdecl()` are
 resolved in the auto-const pass (`fold_isconst`): `isconstdecl` is true for
