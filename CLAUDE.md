@@ -1827,6 +1827,55 @@ scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
 unit-tested. **Not yet (Phase 5):** an IRB-style dropdown completion menu,
 reverse-search / bracketed paste, and the Windows raw-input backend.
 
+## Optimizations must generalize (the bar is a compiler, not an example)
+
+The compile-time optimizations (const-fold, auto-const, auto-pure, inline,
+specialize, DCE, short-circuit) exist to do for MyLang what a `-O3` compiler
+does: **everything knowable at compile time should fold.** A recurring failure
+mode here was an optimization that passed its one hand-written test but did
+**not** generalize — it worked "pro forma." Several shipped silently broken
+(auto-pure that didn't propagate through a call so a 2-deep pure chain didn't
+fold; const-fold / inline / specialize that only saw the *current* REPL input so
+a call to a prior-input function never folded; a const-false `if` with no `else`
+that left a NULL statement and broke the *next* line; no short-circuit folding at
+all, so a `const FLAG=false; if (FLAG && …)` guard was never eliminated). Each
+was found by a user in minutes of REPL play, not by the suite. So, when you add
+or touch ANY optimization, a passing example is the START of the test set, not
+the proof. Before calling it done:
+
+- **Test CROSS-INPUT, not just single-compilation.** `check()` (the whole `-rt`
+  suite) joins all of a test's source lines into **one** compilation, so it
+  *structurally cannot* catch a pass that only sees the current input — yet the
+  REPL compiles each input separately and is where users actually hit this. An
+  optimizer that doesn't bridge inputs (the `prior_pure` / `prior_scope`
+  plumbing on `resolve_names`/`AutoConst`/`Inliner`) regresses there invisibly.
+  Add a **`repl:`** test that defines a helper in one input and exercises the
+  optimization from a LATER input (`:show` the result). This is the single
+  highest-value rule: every cross-input gap above was invisible to single-
+  compilation tests by construction.
+- **Test COMPOSITION and TRANSITIVITY, not one shape.** A rewrite that removes
+  or replaces a node must be tested *followed by another statement*, as the last
+  statement, inside a function body, nested, and **chained** (`g`→`f`→`h`,
+  partial-const, a side-effecting operand). The bugs live at the seams: a
+  folded-away statement that returns NULL breaks the next one; auto-pure that
+  doesn't cross a call breaks the chain; an expression-bodied function body that
+  a fold pass skips never folds. One example proves nothing about the seam.
+- **Use C++ `-O3` as an ORACLE** where the comparison is meaningful (const-prop,
+  folding, inlining, specialization, DCE, short-circuit — not machine-level
+  codegen). Write the equivalent C++, `g++ -O3 -S`, and confirm MyLang folds
+  what the compiler folds — or document *precisely* why not. The legitimate
+  "why not"s are dynamic-typing soundness (`x+0`≠`x` since `x` may be a string;
+  `false||5`≠`5` since `||` yields bool) and deliberately-out-of-scope passes
+  (general algebraic simplification, loop unrolling, recursion folding). "It
+  folds my example" is not the bar; "it folds what a compiler folds, or there's
+  a written reason it can't" is.
+- **State the PROPERTY, then test the property.** "A pure call with const args
+  folds to a literal" is a property — so test a chain, a partial-const, a
+  cross-input, a nested, and a side-effecting-operand case. If only the example
+  works, the feature is unfinished: either generalize it or pin the limitation
+  with a test that documents the current (limited) behavior, so the gap is
+  *visible* and intentional rather than a latent surprise.
+
 ## Invariants & hazards (defense in depth)
 
 This project deliberately builds many overlapping correctness layers (a
