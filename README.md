@@ -1985,8 +1985,8 @@ to a running script.)
 
 #### `globals()`
 Return a sorted `array<str>` of the names bound in the **global scope** —
-variables, functions, structs, kept `const` containers, and any `$specN` /
-`$tmplN` specialization/template clones — excluding the builtins (those are
+variables, functions, structs, kept `const` containers, and any `name$N` /
+`name$sN` template-instance / specialization clones — excluding the builtins (those are
 `:help builtins`). Two honest limits: a `const` **scalar** is folded away and is
 not a runtime symbol, so it is absent here (the REPL's `:globals` adds it from
 the persistent const context); and in a non-REPL **script**, top-level `var`s
@@ -2024,8 +2024,8 @@ For a boxed struct it lists each field's slot index. `const` members are listed
 at the end. Accepts a struct **type descriptor** or an **instance**.
 
 #### `specializations(f)`
-Return an `array<str>` of the synthetic global names (`$specN` /
-`$tmplN`) of every specialization / template-instantiation clone derived from
+Return an `array<str>` of the synthetic global names (`name$N` template
+instances, `name$sN` specializations) of every clone derived from
 function `f` (empty when none). These clones are real globals — the compiler
 inserts each at the root and binds its synthetic name — so this is a plain scope
 walk. *What* each clone specializes on is shown by the REPL `:trace` /

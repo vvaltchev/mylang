@@ -145,11 +145,29 @@ The trace fires inside the REPL's real per-input pipeline (`check_input` →
    `--trace`), CLAUDE.md (the `trace`/`replhelp` TUs, `reflect.{h,cpp.h}`, the
    trace mechanism, the reflection builtins, the meta-commands). ✅
 
-**Status: all seven phases landed.** Possible follow-ups (not blocking): a
-`:type` that runs a non-committing inference *probe* for an arbitrary
-expression (today it shows a bare global's inferred type, else the runtime
-type); Tab-completion of `:help` topics (the `repl_help_topics` helper exists
-but is not wired into the completer); a `:trace verbose` step-by-step level.
+**Status: phases 0-7 landed.** Follow-up work in progress:
+
+8. **Inspectable compiler clones + `:show` (the optimized-AST view).**
+   - **Rename** synthetic clones from `$tmplN`/`$specN` to `<name>$N` /
+     `<name>$sN` (the original name as a prefix, monotonic per name so a
+     re-`undef`'d template can't collide), and make `$` a valid identifier
+     char so `typeof(f$0)` lexes. `specializations()` and `:trace template`
+     then show the readable names.
+   - **`:show <name>` + `show(f)` builtin** — render the FINAL optimized AST of
+     a function (and, for `:show <name>`, its `<name>$N` clones) as synthetic
+     MyLang-like code: dead code already gone, folded consts as literals,
+     inlined call bodies spliced in (annotated), flat-array element types as
+     `array<int>` (not valid script syntax, but informative), explicit
+     annotations / typed-scalar hints surfaced. So `func f(x,y)=>x+y;
+     func g(){print(f(1,2));}` shows `g` as `func g() { print(3); }`, and
+     `func g(x,y){print(f(x,y));}` as `func g(x, y) { print(x + y); }`. A new
+     `coderender.{h,cpp}` unparser; the optimized tree is the REPL's retained,
+     post-`resolve_names` AST.
+
+Possible later follow-ups (not blocking): a `:type` non-committing inference
+*probe* for an arbitrary expression; Tab-completion of `:help` topics
+(`repl_help_topics` exists but isn't wired into the completer); full inferred
+LOCAL types in `:show` (today best-effort from AST hints).
 
 ## Open questions (decide as we go)
 

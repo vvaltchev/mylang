@@ -2259,11 +2259,17 @@ private:
         unique_ptr<Construct> clone = f->clone();
         auto *fc = static_cast<FuncDeclStmt *>(clone.get());
 
-        /* Synthetic name so the redirected call resolves to the clone, but keep
-         * the original name for backtraces. */
-        fc->display_name = std::string(f->id->get_str());
+        /* Synthetic name `<base>$s<N>` so the redirected call resolves to the
+         * clone and it is readable/inspectable (the `$s` distinguishes a
+         * specialization from a `<base>$N` template instance); display_name
+         * keeps the original for backtraces. `base` is f's own original name
+         * (f may itself be a template-instance clone, whose display_name is the
+         * user's name). The counter is monotonic, so names never collide. */
+        const std::string base = !f->display_name.empty()
+            ? f->display_name : std::string(f->id->get_str());
+        fc->display_name = base;
         fc->id = make_unique<Identifier>(
-            "$spec" + std::to_string(spec_counter++));
+            base + "$s" + std::to_string(spec_counter++));
 
         auto *body = dynamic_cast<Block *>(fc->body.get());
         if (!body)

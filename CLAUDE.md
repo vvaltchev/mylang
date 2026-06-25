@@ -149,7 +149,7 @@ that a normal run would reject for a bare `dyn`). The legend: **yellow** =
 became const-like automatically (an auto-const `var` at decl + folded uses, an
 un-mutated parameter, an auto-`pure` function); **green** = a flat (unboxed)
 `array<int>`/`array<float>`; **red** = an `array<dyn>`; **blue** = an inlined
-call (expression-body or tail); **cyan** = a call redirected to a `$specN`
+call (expression-body or tail); **cyan** = a call redirected to a `name$sN`
 specialization clone; **magenta** = a call folded to a literal at compile time
 (pure/auto-pure/const-builtin with const args); **dim** = dead code the
 optimizer eliminated (a const-condition branch / `while (false)`). Precedence:
@@ -616,11 +616,11 @@ subscript/member READ base fold, since the
 param decl is kept so an lvalue base can't dangle). The shrink decision uses
 `count_all_nodes` (a *complete* traversal, unlike `node_count`, so a fold buried
 in a kept `var t = a[0]+a[1]` rvalue is visible). If it shrinks, a shared clone
-`$specN` is registered (deduped by (func, const-arg tuple) — an array/dict keyed
+`name$sN` is registered (deduped by (func, const-arg tuple) — an array/dict keyed
 by its `intptr` identity in `value_repr`, so the same const object shares one
 clone — inserted at the root block's front) and the call redirected; the clone
 keeps the same frame (no re-resolution) and a `FuncDeclStmt::display_name` makes
-backtraces show the original name, not `$specN`. A **tail call to a block-bodied
+backtraces show the original name, not `name$sN`. A **tail call to a block-bodied
 function** (`return f(args);` where f's body always returns — its last statement
 is a `ReturnStmt`) is inlined *directly* (`try_inline_tail`): f's body block
 replaces the return statement, sound because f's own returns become the caller's
@@ -922,7 +922,9 @@ un-instantiated template (`accumulate`/`accumulate_call`/`check`/`check_call`
 test `is_template`); an outer loop in `infer_one`, between the main fixpoint and
 finalize, runs `instantiate_round` — for each template call whose arg types have
 settled, it gets-or-makes the instance for that `(template, signature)`
-(`make_template_clone`: synthetic `$tmplN` id + `display_name` for backtraces,
+(`make_template_clone`: a `<name>$N` id - the user name plus a per-name
+monotonic counter, so it is readable AND inspectable, `typeof(f$0)`; with
+`display_name` keeping the original for backtraces -
 `walk_struct`'d, `is_template=false`, inserted at the root block's front),
 **redirects** the call to it, and re-runs the fixpoint; the clone's params
 accumulate their one signature through the concrete path. Arity is still checked
@@ -930,7 +932,7 @@ for a template call; per-arg type/nullability is checked inside each clone.
 **The `(template, signature)` cache (`tmpl_cache`) is SESSION-persistent, NOT
 cleared per input** — a signature already instantiated by a prior input
 **reuses** that instance instead of building a duplicate (`f(2,3)` then `f(2,3)`
-again in a later input both run `$tmpl0`, not `$tmpl0` then `$tmpl1`). To stay
+again in a later input both run `f$0`, not `f$0` then `f$1`). To stay
 clear of the node-identity hazard below, the cache is keyed by the stable
 `template_sig_key` (the template's arena-stable `FuncInfo*` + the signature's
 type strings) and **valued by the instance's interned NAME** (a `UniqueId *`,
