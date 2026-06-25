@@ -1658,6 +1658,65 @@ scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
 unit-tested. **Not yet (Phase 5):** an IRB-style dropdown completion menu,
 reverse-search / bracketed paste, and the Windows raw-input backend.
 
+## Invariants & hazards (defense in depth)
+
+This project deliberately builds many overlapping correctness layers (a
+"Swiss-cheese" model: every check has blind spots, but stacked checks with
+*different* blind spots make a bug clear them all very unlikely). The rules
+below came out of a real, nasty bug — an MSVC-only, non-deterministic
+wrong-result in cross-input REPL template instantiation, root-caused via CI
+instrumentation (see `plans/function-templates.md`).
+
+- **A red test on ANY platform is a real bug — never route around it.** A
+  one-platform CI failure you can't reproduce locally is NOT "flakiness" to
+  revert or disable the feature over; it is a defect to root-cause. "Can't
+  reproduce locally" raises the instrumentation bar, it never lowers the bug's
+  reality. Multi-compiler / multi-platform CI exists precisely to expose UB and
+  logical-identity bugs the dev allocator hides — lean into it.
+
+- **Never key a long-lived map by a raw AST-node pointer.** A `Construct *` is
+  NOT a stable identity: the allocator recycles a freed node's *address*, so a
+  map that outlives the node (e.g. across REPL inputs) can match a stale entry
+  with a fresh node — a silent wrong-lookup, invisible to ASan (the memory is
+  valid; the *identity* is wrong). Use a stable identity instead: the codebase's
+  established ones are **`UniqueId *`** (interned names, never freed) and the
+  **monotonic arenas** (`all_syms`/`all_funcs` — never truncated, only marked
+  `pinned`). For nodes there is now **`Construct::node_id`** (a monotonic
+  `uint64`; a clone gets a fresh one). The two remaining node-keyed maps
+  (`id_sym`, `func_of_decl`, inferencer) are instead **scoped to one input**
+  (cleared each `infer_input`) and re-resolved every pass, so no stale entry can
+  survive — that combination is the fix for the bug above.
+
+- **`ML_CHECK` / `ML_CHECK_MSG` (`defs.h`) are the assertion layer.** Use them —
+  not bare `assert` — to state an invariant the code RELIES ON but a wrong
+  change could break: "this is impossible if the code is correct." They must be
+  **side-effect-free** (compiled out of a plain release). Active under
+  `-DMLDEBUG`, which the Makefile sets for every debug build (`OPT=0`) and every
+  sanitized build, so all CI debug runs exercise them; a plain optimized
+  release and the bench pay nothing. **Assert the right things:** logical
+  invariants the sanitizers CANNOT see — a union/tag mismatch (reading the wrong
+  active member is valid memory, wrong meaning), a refcount underflow, a state
+  the type system should have made impossible, a stable-identity check. Do NOT
+  add asserts for plain out-of-bounds / shift-overflow / use-after-free —
+  ASan/UBSan already catch those, and a real *runtime* condition (bad user
+  input, I/O failure, a genuine type error) must `throw` a proper `Exception`,
+  not assert. Examples in place: the `flat_*()` union-kind checks
+  (`sharedarray.h`), `intrusive_ptr::release` refcount-underflow
+  (`intrusiveptr.h`), `pod_get`/`pod_set` field validity (`structtype.h`),
+  `Frame::init` `frame_size <= 64` (`eval.h`).
+
+- **`RECYCLE=1` — the adversarial allocator.** `make RECYCLE=1 TESTS=1` builds a
+  `Construct` allocator (a size-keyed LIFO free-list, `syntax.cpp`) that hands a
+  just-freed node's address straight back to the next allocation, so any
+  "AST pointer used as a stable identity" bug manifests DETERMINISTICALLY under
+  `-rt` instead of depending on the host allocator's luck (ASan-poisons the
+  free window too, so a dangling read is still caught). It is a general stress
+  tool for that whole class and a future-regression net. **Honest scope:** it
+  did *not* by itself reproduce the specific cross-input bug above — the REPL
+  test path retains its ASTs, so there were no intra-test frees to recycle; the
+  per-input map clear is the guard there. Run it as an extra CI/matrix lane,
+  not a replacement for the structural fixes.
+
 ## Recipes
 
 ### Adding a builtin
