@@ -2,6 +2,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 class Construct;
 class FuncDeclStmt;
@@ -24,7 +25,8 @@ class FuncDeclStmt;
  * It is best-effort, not a round-trippable pretty-printer: an unhandled node
  * falls back to a comment placeholder rather than failing.
  */
-std::string render_func_code(const FuncDeclStmt *fn);
+std::string render_func_code(const FuncDeclStmt *fn,
+                             const std::vector<std::string> &param_types = {});
 
 /* Render an arbitrary construct (a statement or expression) - used by the
  * above and by the unit tests. */

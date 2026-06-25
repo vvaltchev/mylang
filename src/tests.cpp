@@ -7831,10 +7831,11 @@ static const std::vector<repl_test> repl_tests =
         { "ti(2, 3)", "=> 5" },
         { "typeof(ti$0)", "func ti(" } } },
 
-    { ":show renders a function and its template instances as code",
+    { ":show renders a function and its instances with inferred param types",
       { { "func sm(x, y) { var t = x + y; return t; }", "" },
         { "sm(2, 3)", "=> 5" },
-        { ":show sm", "func sm$0(x, y)" } } },
+        /* the base shows untyped params; the instance shows inferred ones */
+        { ":show sm", "func sm$0(int x, int y)" } } },
 
     /* a template instance appending to a PINNED global array must not trip the
      * global's assignability check before the arg type settles (defer-on-

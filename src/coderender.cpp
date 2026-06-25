@@ -93,6 +93,9 @@ struct Renderer {
 
     std::ostream &o;
     const InlineCtx *cur_inline = nullptr;   /* the inline frame we're inside */
+    /* inferred parameter types for the top-level function (REPL :show only);
+     * empty falls back to the AST's explicit annotations / dyn modifiers. */
+    const std::vector<std::string> *ptypes = nullptr;
 
     explicit Renderer(std::ostream &os) : o(os) {}
 
@@ -437,7 +440,11 @@ struct Renderer {
         if (f->params)
             for (size_t i = 0; i < f->params->elems.size(); i++) {
                 if (i) o << ", ";
-                o << param_str(f->params->elems[i].get());
+                const Identifier *p = f->params->elems[i].get();
+                if (ptypes && i < ptypes->size() && !(*ptypes)[i].empty())
+                    o << param_str_typed(p, (*ptypes)[i]);   /* inferred type */
+                else
+                    o << param_str(p);                  /* AST annotation */
             }
         o << ") ";
 
@@ -453,6 +460,17 @@ struct Renderer {
         } else {
             o << "{ }";
         }
+    }
+
+    /* `[const ]<inferred-type> name` - the inferred-type string already carries
+     * `opt` where applicable, so only `const` is taken from the AST. */
+    string param_str_typed(const Identifier *p, const string &ty)
+    {
+        string s;
+        if (p->const_param) s += "const ";
+        s += ty + " ";
+        s += string(p->get_str());
+        return s;
     }
 
     string param_str(const Identifier *p)
@@ -473,12 +491,15 @@ struct Renderer {
 
 }  /* namespace */
 
-string render_func_code(const FuncDeclStmt *fn)
+string render_func_code(const FuncDeclStmt *fn,
+                        const std::vector<std::string> &param_types)
 {
     if (!fn)
         return "";
     std::ostringstream o;
     Renderer r(o);
+    if (!param_types.empty())
+        r.ptypes = &param_types;
     r.func(fn, 0);
     o << "\n";
     return o.str();

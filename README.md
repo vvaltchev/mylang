@@ -2035,8 +2035,9 @@ folded), inlined call bodies spliced in and annotated, and a flat array's
 element type shown as `array<int>`. Best-effort and not round-trippable (an
 unhandled node renders as a comment placeholder). In the REPL, `:show <name>`
 prints this for a function **and** its `name$N` template-instance /
-specialization clones, so you can compare the generic template against each
-concrete, per-signature version.
+specialization clones, with each clone's **inferred parameter types** made
+explicit (`func dot$0(int x, int y)`), so you can compare the generic template
+against each concrete, per-signature version.
 
 #### `specializations(f)`
 Return an `array<str>` of the synthetic global names (`name$N` template

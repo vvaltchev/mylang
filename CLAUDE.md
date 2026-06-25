@@ -835,7 +835,14 @@ decisions behind it: `plans/type-inference.md`,
   the final types, so deferring during accumulate hides nothing. **When
   touching the inferencer, audit any new `return A.dyn_ty()` for this.**
   `--debug-ti` dumps
-  every identifier's inferred type + uses to find spurious `dyn`s.
+  every identifier's inferred type + uses to find spurious `dyn`s. The
+  invariant also applies to *contributions*, not just return types:
+  `accumulate_call`'s `contribute_container` (for `append`/`push`/`insert`)
+  defers when the element/key type is still `Unknown` — else it would
+  contribute `array<?>`, whose **outer** kind isn't `Unknown` so `contribute`'s
+  own pinned-symbol guard wouldn't catch it, tripping a PINNED global array's
+  cross-input assignability check before a template-instance arg settles
+  (`var g=[1,2,3]; func f(x){append(g,x);} f(3)`).
 - **Finalization of unconstrained symbols.** An unconstrained *param* or
   *foreach loop var* → `dyn` (could be anything); a plain local → `none`. A func
   with an Unknown *return* → `dyn` (it returns a value that depends on
@@ -1693,7 +1700,12 @@ behind a thin terminal shell:
   unhandled node (best-effort, NOT round-trippable). Backs the `show(f)` builtin
   and the REPL `:show <name>` (which also renders the `<name>$N` clones). It
   reads literal values via the public `ival()`/`fval()`/`bval()`/`strval()`/
-  `literal_value()` accessors on the `Literal*` nodes. See
+  `literal_value()` accessors on the `Literal*` nodes. `render_func_code` takes
+  an optional per-param inferred-type list: `:show` passes
+  `ReplInfer::func_param_types` (the instance's `FuncInfo::params` types,
+  empty for an un-instantiated template), so a template instance renders
+  `func dot$0(int x, int y)` while the base shows untyped `func dot(x, y)`; the
+  `show()` builtin (no persistent inferencer) renders AST-hint types only. See
   `plans/repl-introspection.md`.
 - **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
   category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/

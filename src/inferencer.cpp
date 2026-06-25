@@ -127,6 +127,11 @@ public:
      * global (or "" if it is not a committed inferred symbol). */
     std::string global_type_str(const UniqueId *name);
 
+    /* REPL :show - the inferred type of each of `fn`'s parameters (for a
+     * concrete function / template instance); empty for an un-instantiated
+     * template (params unbound) or an unknown function. */
+    std::vector<std::string> func_param_types(const FuncDeclStmt *fn);
+
     bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
     bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
     /* When false (the CLI's -nti), run() still does the structural pass and the
@@ -1005,6 +1010,24 @@ std::string Inferencer::global_type_str(const UniqueId *name)
     TypeSym *s = it->second;
     STyRef ty = s->func ? func_sty(s->func) : s->type;
     return sty_to_string(ty);
+}
+
+std::vector<std::string>
+Inferencer::func_param_types(const FuncDeclStmt *fn)
+{
+    std::vector<std::string> out;
+    if (!fn)
+        return out;
+    for (auto &up : all_funcs) {
+        if (up->decl != fn)
+            continue;
+        if (up->is_template)        /* an un-instantiated template: unbound */
+            return out;
+        for (TypeSym *p : up->params)
+            out.push_back(p ? sty_to_string(p->type) : std::string());
+        return out;
+    }
+    return out;
 }
 
 /*
@@ -3531,4 +3554,9 @@ void ReplInfer::undef_global(const UniqueId *name)
 std::string ReplInfer::global_type(const UniqueId *name)
 {
     return impl->inf.global_type_str(name);
+}
+
+std::vector<std::string> ReplInfer::func_param_types(const FuncDeclStmt *fn)
+{
+    return impl->inf.func_param_types(fn);
 }
