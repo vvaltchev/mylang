@@ -211,7 +211,11 @@ public:
 
     /* Load a POD field as an EvalValue (a typed scalar at its byte offset). */
     EvalValue pod_get(int slot) const {
+        ML_CHECK(slot >= 0 && slot < static_cast<int>(def->fields.size()));
         const FieldDef &f = def->fields[slot];
+        /* offset == -1 marks a non-POD (boxed) field: pod_get on it would read
+         * at bytes.data()-1. A POD instance must only pod_get POD fields. */
+        ML_CHECK(f.offset >= 0 && f.offset < static_cast<int>(bytes.size()));
         const char *p = bytes.data() + f.offset;
         switch (f.kind) {
             case FieldKind::f_bool:
@@ -240,6 +244,8 @@ public:
 
     /* Store a (coerced) scalar value into a POD field's byte slot. */
     void pod_set(int slot, const EvalValue &v) {
+        ML_CHECK(slot >= 0 && slot < static_cast<int>(def->fields.size()));
+        ML_CHECK(def->fields[slot].offset >= 0);
         pod_store_field(def->fields[slot], bytes.data(), v);
     }
 };

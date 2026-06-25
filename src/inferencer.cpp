@@ -1417,7 +1417,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         /* ALWAYS (re)resolve - never `if (!id_sym.count(id))`. id_sym is keyed
          * by node pointer and persists for the session; a fresh node can reuse
          * a freed node's address, so a stale entry must be OVERWRITTEN, not
-         * kept (keeping it bound an input's callee to a prior clone -> the bug).
+         * kept (keeping it bound a callee to a prior clone -> the bug).
          * walk_struct visits each node once, so this never double-resolves. */
         id_sym[id] = lookup(s, id->uid);
         /* reached for every reference EXCEPT a call callee (handled above): a

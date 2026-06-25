@@ -36,6 +36,7 @@ public:
     { }
 
     const LValueT &operator[](size_t index) const {
+        ML_CHECK(index < len && off + index < vec.size());
         return vec[off + index];
     }
 
@@ -316,14 +317,46 @@ public:
     }
 
     Storage skind() const { return shobj->kind; }
-    ivec_type &flat_ints()   { return shobj->ivec; }   /* skind()==ints */
-    fvec_type &flat_floats() { return shobj->fvec; }   /* skind()==floats */
-    bvec_type &flat_bools()  { return shobj->bvec; }   /* skind()==bools */
-    const ivec_type &flat_ints()   const { return shobj->ivec; }
-    const fvec_type &flat_floats() const { return shobj->fvec; }
-    const bvec_type &flat_bools()  const { return shobj->bvec; }
-    svec_type &flat_structs()             { return shobj->svec; }
-    const svec_type &flat_structs() const { return shobj->svec; }
+
+    /*
+     * Flat (unboxed) accessors. Each returns the union member for ONE kind;
+     * reading it for any other kind is undefined (an inactive union member).
+     * The ML_CHECK makes that mistake fire immediately in a debug/sanitized
+     * build instead of silently corrupting - the caller MUST have branched on
+     * skind() first. (Compiled out of a plain release.)
+     */
+    ivec_type &flat_ints() {
+        ML_CHECK(shobj && shobj->kind == Storage::ints);
+        return shobj->ivec;
+    }
+    fvec_type &flat_floats() {
+        ML_CHECK(shobj && shobj->kind == Storage::floats);
+        return shobj->fvec;
+    }
+    bvec_type &flat_bools() {
+        ML_CHECK(shobj && shobj->kind == Storage::bools);
+        return shobj->bvec;
+    }
+    const ivec_type &flat_ints() const {
+        ML_CHECK(shobj && shobj->kind == Storage::ints);
+        return shobj->ivec;
+    }
+    const fvec_type &flat_floats() const {
+        ML_CHECK(shobj && shobj->kind == Storage::floats);
+        return shobj->fvec;
+    }
+    const bvec_type &flat_bools() const {
+        ML_CHECK(shobj && shobj->kind == Storage::bools);
+        return shobj->bvec;
+    }
+    svec_type &flat_structs() {
+        ML_CHECK(shobj && shobj->kind == Storage::structs);
+        return shobj->svec;
+    }
+    const svec_type &flat_structs() const {
+        ML_CHECK(shobj && shobj->kind == Storage::structs);
+        return shobj->svec;
+    }
 
     int_type use_count() const { return shobj.use_count(); }
 
