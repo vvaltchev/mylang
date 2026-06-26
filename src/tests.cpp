@@ -2120,6 +2120,13 @@ static const std::vector<test> tests =
     { "auto-pure: a self-recursive function stays conservative (not pure)",
       { "func fac(n) { if (n < 2) { return 1; } return n * fac(n - 1); }",
         "assert(ispure(fac) == false);" } },
+    /* a pure call inside an EXPRESSION-bodied function folds (the body is a
+     * bare expression, which AutoConst used to skip) */
+    { "auto-const: a pure call in an expression-bodied function folds",
+      { "func aa(a, b) => a + b;",
+        "func g() => aa(1, 2);",
+        "assert(g() == 3);",
+        "assert(startswith(show(g), \"/* pure */ func g() => 3\"));" } },
     { "ispure() of a non-function is a type error",
       { "ispure(5);" }, &typeid(TypeErrorEx) },
     { "ispure() with no args is rejected",
@@ -7881,6 +7888,13 @@ static const std::vector<repl_test> repl_tests =
         { "specializations(rf)", "[rf$0]" },
         { "func rf(x, y) => x * y", "" },          /* redefine */
         { "specializations(rf)", "[]" } } },       /* orphan dropped */
+
+    { "auto-pure: a pure call to a PRIOR-input function folds (cross-input)",
+      { { "func pa(a, b) => a + b", "" },
+        { "func pf(x) => pa(x, 10)", "" },
+        { "pf(5)", "=> 15" },                  /* creates pf$0 */
+        { "func pg() => pf(3)", "" },          /* pf$0 is from a prior input */
+        { ":show pg", "=> 13" } } },           /* folded: pa(3,10) = 13 */
 
     { "template: a consumed instance survives a redefinition",
       { { "func cf(x, y) => x + y", "" },

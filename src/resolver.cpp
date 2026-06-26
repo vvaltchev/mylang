@@ -167,8 +167,32 @@ class AutoConst {
 
 public:
 
-    explicit AutoConst(AnalysisInfo *a = nullptr)
-        : cctx(nullptr, true), analysis(a) { }
+    explicit AutoConst(AnalysisInfo *a = nullptr,
+                       EvalContext *prior_pure = nullptr)
+        : cctx(nullptr, true), analysis(a)
+    {
+        /* REPL: seed the fold context with the prior inputs' effectively-pure
+         * functions (and their template/spec instances) so a call to one folds
+         * across inputs - e.g. `func f2() => f(1,2)` where f's instance came
+         * from an earlier input. Each FuncObject keeps its own capture_ctx, so
+         * its body still resolves its callees against the runtime scope. Only
+         * pure FUNCTIONS are seeded (never a runtime var), so folding stays
+         * sound; a current-input redefinition redirects to its own (new)
+         * instance, so a stale prior instance here is never used. */
+        if (prior_pure) {
+            std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+            prior_pure->collect_symbols(syms);
+            for (const auto &kv : syms) {
+                const EvalValue &v = kv.second->get();
+                if (v.is<shared_ptr<FuncObject>>() &&
+                    v.get<shared_ptr<FuncObject>>()->func->effective_pure) {
+                    try {
+                        cctx.emplace(kv.first->val, EvalValue(v), true);
+                    } catch (const Exception &) { /* dup: skip */ }
+                }
+            }
+        }
+    }
 
     void run(Block *root, const std::vector<int> &main_writes)
     {
@@ -334,6 +358,24 @@ private:
         fold_block(b, fc);
     }
 
+    /* Fold a function's body, handling BOTH a `{ ... }` block and an
+     * expression body (`=> expr`). The expression form was previously skipped
+     * (fold_function bails on a non-Block), so a pure call in an
+     * expression-bodied function never const-folded - e.g.
+     * `func g() => f(1,2)` kept the call. */
+    void fold_func_body(FuncDeclStmt *fd)
+    {
+        if (!fd->body)
+            return;
+        if (dynamic_cast<Block *>(fd->body.get())) {
+            fold_function(fd->body.get(), fd->slot_writes, fd->params.get());
+        } else {
+            FCtx fc{ fd->slot_writes, {}, {}, fd->params.get() };
+            prescan_blocked(fd->body.get(), fc.blocked);
+            fold_reads(fd->body, fc);
+        }
+    }
+
     /*
      * Collect slots that must NOT be promoted, because replacing the variable
      * with its literal value there would change behavior. A slot is blocked if
@@ -495,8 +537,7 @@ private:
         }
 
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
-            fold_function(fd->body.get(), fd->slot_writes,     /* nested func */
-                          fd->params.get());
+            fold_func_body(fd);            /* block / expr-bodied func */
             return true;
         }
 
@@ -651,8 +692,7 @@ private:
         }
 
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
-            fold_function(fd->body.get(), fd->slot_writes,   /* func expr */
-                          fd->params.get());
+            fold_func_body(fd);        /* block / expr-bodied func */
             return;                    /* leave capture list / name alone */
         }
 
@@ -777,9 +817,24 @@ public:
      * builds the "main" Frame from it - so nothing needs to be returned here.
      */
     void run(Construct *root, AnalysisInfo *analysis = nullptr,
-             bool repl = false)
+             bool repl = false, EvalContext *prior_pure = nullptr)
     {
         repl_mode = repl;
+
+        /* REPL: a function from an earlier input that is effectively pure lets
+         * a NEW function calling it is recognized pure too (cross-input
+         * auto-pure propagation - see func_body_is_pure / pure_func_names). */
+        if (prior_pure) {
+            std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+            prior_pure->collect_symbols(syms);
+            for (const auto &kv : syms) {
+                const EvalValue &v = kv.second->get();
+                if (v.is<shared_ptr<FuncObject>>() &&
+                    v.get<shared_ptr<FuncObject>>()->func->effective_pure)
+                    pure_func_names.insert(kv.first);
+            }
+        }
+
         top_level_only = false;
         walk(root, nullptr);            /* pass 1: functions; fill `escaped` */
 
@@ -790,9 +845,10 @@ public:
         walk(root, &main_st);
 
         /* Promote write-once scalar vars to constants and fold (uses the write
-         * counts just collected; the top-level frame's in main_st.writes). */
+         * counts just collected; the top-level frame's in main_st.writes).
+         * prior_pure seeds the fold context so cross-input pure calls fold. */
         if (auto *rb = dynamic_cast<Block *>(root))
-            AutoConst(analysis).run(rb, main_st.writes);
+            AutoConst(analysis, prior_pure).run(rb, main_st.writes);
     }
 
 private:
@@ -2400,9 +2456,9 @@ private:
  */
 void
 resolve_names(Construct *root, bool enable_inline, int inline_threshold,
-              AnalysisInfo *analysis, bool repl_mode)
+              AnalysisInfo *analysis, bool repl_mode, EvalContext *prior_pure)
 {
-    Resolver().run(root, analysis, repl_mode);
+    Resolver().run(root, analysis, repl_mode, prior_pure);
 
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))

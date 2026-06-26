@@ -535,12 +535,18 @@ function that calls an *earlier* auto-pure helper is itself recognized pure —
 `func f(x,y)=>add(x,y)` is pure once `add` is, so `f(1,2)` const-folds (the
 whole pure chain folds at compile time, like `-O3`). Still conservative:
 self-recursion and a call to a not-yet-decided (forward-referenced or
-mutually-recursive) func stay impure. **Order matters: this propagates within
-ONE compilation (a script / one REPL input). Cross-input — `f` in a later
-input calling `add` from an earlier one — `add` isn't in the new input's
-`pure_func_names`, so `f` is not yet recognized pure (a known REPL limitation;
-the script/-e path folds the whole chain).** `FuncDeclStmt::{explicit_pure,
-effective_pure}` back the
+mutually-recursive) func stay impure. **Cross-input** (REPL): `resolve_names`'s
+`prior_pure` arg (the persistent runtime scope) seeds both `pure_func_names`
+(so a new input's `f` calling an earlier-input `add` is recognized pure) and
+`AutoConst`'s fold context with the earlier inputs' effectively-pure FuncObjects
+(so a call to one *folds* across inputs — `func f2()=>f(1,2)` with `f`'s
+instance from an earlier input becomes `=> 5`). Only pure *functions* are
+seeded (never a runtime var), so it stays sound; a redefinition redirects to
+its own new instance, so a stale prior instance is never used. **AutoConst folds
+an EXPRESSION-bodied function's body** (`fold_func_body` handles a bare-expr
+body, not only a `{...}` block — the older `fold_function` skipped the former,
+so a pure call in `func g()=>f(1,2)` never folded).
+`FuncDeclStmt::{explicit_pure, effective_pure}` back the
 runtime builtins `ispuredecl()`/`ispure()` (they evaluate the arg to a
 `FuncObject` and read its `FuncDeclStmt`). `isconst()`/`isconstdecl()` are
 resolved in the auto-const pass (`fold_isconst`): `isconstdecl` is true for
