@@ -348,8 +348,12 @@ skipped):
   member `.id`. A call's argument list is parsed by `pArgList` (not the generic
   `pList`), which also accepts **named arguments** `name: value` (label = a bare
   IDENT followed by `:`, one-token lookahead) — see the inferencer's
-  `lower_named_args` and README *Named arguments*
-- `pExpr02` — unary `+ - !` (right-recursive, so `!!x`, `-+x` work)
+  `lower_named_args` and README *Named arguments*. A trailing **`++`/`--`**
+  (`Op::inc`/`Op::dec`) after the postfix chain makes a **postfix**
+  `IncDecExpr`.
+- `pExpr02` — unary `+ - !` (right-recursive, so `!!x`, `-+x` work); a leading
+  **`++`/`--`** makes a **prefix** `IncDecExpr` (so `--1` now lexes as
+  decrement-of-`1`, a compile error like C — not `-(-1)`)
 - `pExpr03` — `* / %`
 - `pExpr04` — `+ -`
 - `pExpr06` — `< > <= >=`
@@ -1264,6 +1268,25 @@ sanitizers never reproduced it.)
   rvalue assigns the same value to each (`var a,b = 0`). The same helper drives
   `foreach`
   tuple-unpacking and the `indexed` keyword.
+- **`++` / `--` (`IncDecExpr`, `syntax.h`)** — C-style pre/postfix increment and
+  decrement, **int/float only**. `IncDecExpr::do_eval` evaluates the operand
+  exactly ONCE via two paths: when the inferencer proved it int/float (`th` is
+  `i`/`f` — the usual case, incl. flat-array elements and POD fields that have
+  no `LValue`) it routes the mutation through `handle_single_expr14`
+  (`operand += 1`), reusing every store fast path (slot, flat array, COW,
+  struct), and **derives `old = new ∓ 1`** for postfix so it never re-reads the
+  operand; a `dyn`/un-hinted operand (always `LValue`-backed) goes through a
+  read-modify-write so the int/float requirement is enforced at runtime. The
+  **inferencer** types it (`type_of` = `operand ± 1`) and the **check pass**
+  rejects a non-lvalue, a `const`, or a non-int/float operand (bool included) at
+  compile time — `var b=true; b++` is a `TypeMismatchEx`, not a silent int.
+  The **resolver** counts it as a write (`count_write`), so a `++`'d var is not
+  auto-const-promoted; the **inliner** refuses to inline an expression body that
+  reassigns a SCALAR param (`func f(x)=>x++` — `mutates_a_param`), since the
+  param is a by-value copy (a mutation *through* a param — `p.x++`, `a[i]++` —
+  is allowed: that already has reference semantics, so inlining matches the
+  call). Lexing is maximal-munch, so `--1` is decrement-of-`1` (a compile error,
+  like C), not `-(-1)`.
 - **Dict access: throw-on-missing-read, insert-on-write, or default.**
   `TypeDict::subscript(what, key, for_write)` and `MemberExpr::do_eval` (which
   share the logic) handle a missing key by: returning the dict's default (a

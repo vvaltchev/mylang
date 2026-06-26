@@ -880,7 +880,14 @@ for (var i = 0; i < 10; i += 1) {
 Here, the `{ }` braces can be omitted as in the case above. There are only
 a few difference from `C` worth pointing out:
 
-  - The `++` and `--` operators do not exist in `MyLang`, at the moment.
+  - The `++` and `--` operators (prefix `++x`/`--x` and postfix `x++`/`x--`)
+    work exactly as in `C`, but **only on `int` and `float`** (a `bool`,
+    `str`, or any other type is a compile-time error). Postfix yields the value
+    *before* the change, prefix the value *after*; both mutate the operand,
+    which must be an lvalue — a variable, an array element (`a[i]++`), or a
+    struct field (`p.x++`). `--1` therefore lexes as decrement-of-a-literal (a
+    compile error, as in C), not as `-(-1)`; write `- -1` or `-(-1)` for double
+    negation.
 
   - To declare multiple variables, use the syntax: `var a, b = [3,4];` or
     just `var a,b,c,d = 0;` if you want all the variables to have the same

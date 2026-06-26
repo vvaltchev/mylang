@@ -42,6 +42,8 @@ enum class Op : int {
     colon       = 33,
     dot         = 34,
     questionmark = 35, // ? (opt/nullable type suffix)
+    inc         = 36, // ++ (pre/postfix increment, int/float)
+    dec         = 37, // -- (pre/postfix decrement, int/float)
 
-    op_count    = 36,
+    op_count    = 38,
 };

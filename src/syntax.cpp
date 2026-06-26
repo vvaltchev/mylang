@@ -319,6 +319,21 @@ void LiteralDictKVPair::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void IncDecExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent;
+    s << "IncDecExpr(" << (is_prefix ? "prefix " : "postfix ")
+      << (is_inc ? "++" : "--") << "\n";
+
+    lvalue->serialize(s, level + 1);
+    s << endl;
+
+    s << indent;
+    s << ")";
+}
+
 void MemberExpr::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

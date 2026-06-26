@@ -454,6 +454,9 @@ void Inferencer::for_each_child(Construct *n,
     if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
         fn(r->elem.get()); return;
     }
+    if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
+        fn(idc->lvalue.get()); return;
+    }
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
         fn(fd->body.get()); return;
     }
@@ -1907,6 +1910,14 @@ STyRef Inferencer::type_of(const Construct *e)
         return t;
     }
 
+    if (auto *idc = dynamic_cast<const IncDecExpr *>(e)) {
+        /* `x++` / `++x` yields `x ± 1` (int stays int, float stays float);
+         * binop_result defers on an Unknown operand. The check pass enforces
+         * the int/float-lvalue requirement. */
+        return binop_result(idc->is_inc ? Op::plus : Op::minus,
+                            type_of(idc->lvalue.get()), A.int_ty());
+    }
+
     if (auto *e14 = dynamic_cast<const Expr14 *>(e)) {
         if (e14->op == Op::assign)
             return type_of(e14->rvalue.get());
@@ -3052,6 +3063,41 @@ void Inferencer::check(Construct *n)
         STyRef c = type_of(fe->container.get());
         require_nonopt(c, fe->container->start, fe->container->end,
                        "as a foreach container");
+        return;
+    }
+
+    if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
+        check(idc->lvalue.get());
+        Construct *opnd = idc->lvalue.get();
+
+        /* the operand must be an lvalue: a variable, an array element, or a
+         * struct field (not a literal, an expression, or a call result). */
+        auto *id = dynamic_cast<Identifier *>(opnd);
+        if (!id && !dynamic_cast<Subscript *>(opnd)
+                && !dynamic_cast<MemberExpr *>(opnd)) {
+            mismatch("'++'/'--' needs a variable, array element, or field",
+                     idc->start, idc->end);
+            return;
+        }
+
+        /* not a const target (when the const survived as a symbol). */
+        if (id) {
+            auto it = id_sym.find(id);
+            if (it != id_sym.end() && it->second && it->second->const_decl)
+                mismatch("cannot '++'/'--' a const", idc->start, idc->end);
+        }
+
+        STyRef t = type_of(opnd);
+        require_nonopt(t, opnd->start, opnd->end, "with '++'/'--'");
+
+        /* int or float ONLY (bool / str / array / ... are rejected); a `dyn`
+         * operand defers the check to runtime. */
+        STyRef ts = strip(sty_resolve(t));
+        if (!is_dyn(ts) && !is_unknown(ts)
+                && ts->kind != STyKind::Int && ts->kind != STyKind::Float)
+            mismatch("'++'/'--' requires an int or float, got '" +
+                         sty_to_string(t) + "'",
+                     opnd->start, opnd->end);
         return;
     }
 

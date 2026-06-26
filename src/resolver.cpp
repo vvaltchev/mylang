@@ -1089,6 +1089,8 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
          * inliner normally runs before specialize_types and never sees one,
          * but a CROSS-INPUT inlined prior body is already specialized. */
         for (auto &p : n->elems) fn(p.second.get());
+    } else if (auto *n = dynamic_cast<IncDecExpr *>(c)) {
+        fn(n->lvalue.get());
     } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
         fn(n->what.get());
         fn(n->args.get());
@@ -1320,6 +1322,14 @@ Resolver::walk(Construct *c, FuncState *cur)
         return;
     }
 
+    /* --- ++ / -- : resolve the operand AND count it as a write (so the var is
+     * not treated as write-once / auto-const-promotable). --- */
+    if (auto *idc = dynamic_cast<IncDecExpr *>(c)) {
+        walk(idc->lvalue.get(), cur);
+        count_write(cur, idc->lvalue.get());
+        return;
+    }
+
     /* --- assignment / declaration --- */
     if (auto *e = dynamic_cast<Expr14 *>(c)) {
 
@@ -1499,6 +1509,8 @@ for_each_child_slot(Construct *c,
         /* M8 specialized node (same elems shape); a cross-input inlined prior
          * body is already specialized, so substitution must descend here. */
         for (auto &p : n->elems) fn(p.second);
+    } else if (auto *n = dynamic_cast<IncDecExpr *>(c)) {
+        fn(n->lvalue);
     } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
         fn(n->what);
         for (auto &e : n->args->elems) fn(e);
@@ -1695,7 +1707,56 @@ private:
              * function's parameters, which substitution would break. */
             && !contains_func(fd->body.get())
             /* not recursive / does not reference its own name */
-            && count_uses(fd->body.get(), fd->id->uid) == 0;
+            && count_uses(fd->body.get(), fd->id->uid) == 0
+            /* A body that REASSIGNS a SCALAR param - `x++`, `x = ...`,
+             * `x += ...` where the target is the param itself - can't be
+             * inlined: the param is a by-value copy, so the call leaves the
+             * caller's variable untouched, but substituting the arg would
+             * mutate it. (A mutation THROUGH a param - `p.f++`, `p[i]++` - is
+             * NOT blocked: that already mutates the caller's object by
+             * reference, so inlining gives the same effect. Tail-inline rejects
+             * a reassigned param; specialization never seeds a written one.) */
+            && !mutates_a_param(fd);
+    }
+
+    /* True if the lvalue is DIRECTLY a param identifier (`x`), not a field /
+     * element of one (`x.f`, `x[i]`). Only a direct reassignment is unsound to
+     * inline; a through-the-param mutation has reference semantics. */
+    static bool target_is_param(const Construct *lv,
+            const std::unordered_set<const UniqueId *> &params)
+    {
+        auto *id = dynamic_cast<const Identifier *>(lv);
+        return id && params.count(id->uid) != 0;
+    }
+
+    static bool body_mutates_param(const Construct *c,
+            const std::unordered_set<const UniqueId *> &params)
+    {
+        if (!c)
+            return false;
+        if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
+            if (target_is_param(idc->lvalue.get(), params))
+                return true;
+        if (auto *e = dynamic_cast<const Expr14 *>(c))
+            if (!(e->fl & pFlags::pInDecl)
+                    && target_is_param(e->lvalue.get(), params))
+                return true;
+        bool found = false;
+        for_each_child(const_cast<Construct *>(c),
+            [&](Construct *ch) {
+                if (body_mutates_param(ch, params)) found = true;
+            });
+        return found;
+    }
+
+    static bool mutates_a_param(const FuncDeclStmt *fd)
+    {
+        if (!fd->params)
+            return false;
+        std::unordered_set<const UniqueId *> params;
+        for (auto &p : fd->params->elems)
+            params.insert(p->uid);
+        return body_mutates_param(fd->body.get(), params);
     }
 
     static bool contains_func(const Construct *c)
