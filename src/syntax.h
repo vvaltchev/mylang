@@ -1378,11 +1378,13 @@ public:
 };
 
 /*
- * Specialized counted loop, emitted by specialize_types for the two hottest
+ * Specialized counted loop, emitted by specialize_types for the four hottest
  * `for` forms when `i` is a resolved int slot and `bound`/`step` are provably
  * immutable within the loop:
- *   for (var i = start; i <  bound; i += step)    (cmp_lt = true)
- *   for (var i = start; i >= bound; i -= step)    (cmp_lt = false)
+ *   for (var i = start; i <  bound; i += step)   (cmp_op = lt, ascending)
+ *   for (var i = start; i <= bound; i += step)   (cmp_op = le, ascending)
+ *   for (var i = start; i >= bound; i -= step)   (cmp_op = ge, descending)
+ *   for (var i = start; i >  bound; i -= step)   (cmp_op = gt, descending)
  * `bound` and `step` are evaluated ONCE (cached as raw `int_type`), then the
  * condition test and the increment run as plain C on the slot's int - no
  * interpreter dispatch per iteration. `step` is null for the `i++`/`i--` form
@@ -1397,7 +1399,7 @@ public:
     unique_ptr<Construct> step;   /* loop-immutable step expr, or null (== 1) */
     unique_ptr<Construct> body;
     int i_slot = 0;               /* the loop var's frame slot */
-    bool cmp_lt = true;           /* i < bound (true) vs i >= bound (false) */
+    Op cmp_op = Op::lt;           /* lt/le -> ascending; ge/gt -> descending */
 
     ForRangeStmt() : Construct("ForRangeStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1411,7 +1413,7 @@ public:
         c->step = clone_as(step);
         c->body = clone_as(body);
         c->i_slot = i_slot;
-        c->cmp_lt = cmp_lt;
+        c->cmp_op = cmp_op;
         return c;
     }
 };

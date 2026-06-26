@@ -781,7 +781,7 @@ void ForRangeStmt::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
     string sub((level + 1) * 2, ' ');
 
-    s << indent << name << "(" << (cmp_lt ? "i < bound" : "i >= bound")
+    s << indent << name << "(i " << OpString[(int)cmp_op] << " bound"
       << ", slot " << i_slot << "\n";
 
     init->serialize(s, level + 1);

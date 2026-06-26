@@ -3526,14 +3526,23 @@ EvalValue ForRangeStmt::do_eval(EvalContext *ctx, bool rec) const
     const int_type step_val =
         step ? RValue(step->eval(&loop_ctx)).get<int_type>()
              : static_cast<int_type>(1);
-    const int_type delta = cmp_lt ? step_val : -step_val;
+    /* lt/le ascend (+step), ge/gt descend (-step). */
+    const bool asc = (cmp_op == Op::lt || cmp_op == Op::le);
+    const int_type delta = asc ? step_val : -step_val;
 
     FlowState &fs = *loop_ctx.flow;
 
     while (true) {
 
         const int_type iv = f->slots[i_slot].getval<int_type>();
-        if (cmp_lt ? !(iv < bound_val) : !(iv >= bound_val))
+        bool go;
+        switch (cmp_op) {
+            case Op::lt: go = iv <  bound_val; break;
+            case Op::le: go = iv <= bound_val; break;
+            case Op::ge: go = iv >= bound_val; break;
+            default:     go = iv >  bound_val; break;   /* Op::gt */
+        }
+        if (!go)
             break;
 
         if (body)

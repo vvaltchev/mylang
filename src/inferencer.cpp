@@ -3590,45 +3590,110 @@ static void specialize_children(Construct *n)
 
 /* ---------------- for-range loop specialization (ForRangeStmt) ----------- */
 
+/* The innermost identifier of an lvalue chain (`x`, `arr[i]`, `obj.f.g` -> the
+ * root var), or null if it is not identifier-rooted. */
+static const UniqueId *fr_base_id(const Construct *lv)
+{
+    while (lv) {
+        if (auto *id = dynamic_cast<const Identifier *>(lv))
+            return id->uid;
+        if (auto *s = dynamic_cast<const Subscript *>(lv)) {
+            lv = s->what.get(); continue;
+        }
+        if (auto *m = dynamic_cast<const MemberExpr *>(lv)) {
+            lv = m->what.get(); continue;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+/* True if `callee` names a CONST (pure, side-effect-free, deterministic)
+ * builtin - the only calls whose result can be cached once for the loop. */
+static bool fr_is_const_builtin(const Construct *callee)
+{
+    auto *id = dynamic_cast<const Identifier *>(callee);
+    return id && EvalContext::const_builtins.count(id->uid) != 0;
+}
+
 /*
- * Collect every identifier DIRECTLY reassigned (= += ++ --) anywhere in `c`,
- * NOT descending into a nested function (its writes are to its own locals /
- * captured copies, which cannot alias the caller's slots). Reuses the complete
- * for_each_child so no mutating node is ever missed - the proof of a loop
- * bound/step's immutability depends on this being exhaustive.
+ * The mutations a loop body performs, split so `len(arr)` (depends only on the
+ * LENGTH/identity of arr) can stay constant through an element write that does
+ * NOT change the length (the common fill pattern `arr[i] = f(i)`):
+ *   - `mut_len`     : identifiers whose value or length/identity may change -
+ *                     a direct reassign (`x =`, `x++`), or a NON-const-builtin
+ *                     call passed the container (append/pop/insert/erase/... or
+ *                     any user func, which by reference can do anything to it);
+ *   - `mut_content` : identifiers whose ELEMENT/FIELD may change - an
+ *                     `arr[i] = v` / `obj.f = v` / `arr[i]++`, PLUS everything
+ *                     in mut_len (reassign/impure call changes content too).
+ * NOT descended into nested functions. Reuses the complete for_each_child so no
+ * mutating node is ever missed - the immutability proof depends on this.
  */
-static void fr_collect_mutated(Construct *c,
-                               std::unordered_set<const UniqueId *> &out)
+static void fr_collect_mutated(
+    Construct *c,
+    std::unordered_set<const UniqueId *> &mut_len,
+    std::unordered_set<const UniqueId *> &mut_content)
 {
     if (!c || dynamic_cast<FuncDeclStmt *>(c))
         return;
     if (auto *e = dynamic_cast<Expr14 *>(c)) {
         if (!(e->fl & pFlags::pInDecl)) {
-            if (auto *id = dynamic_cast<Identifier *>(e->lvalue.get()))
-                out.insert(id->uid);
-            else if (auto *il = dynamic_cast<IdList *>(e->lvalue.get()))
-                for (auto &p : il->elems)
-                    out.insert(p->uid);
+            if (auto *il = dynamic_cast<IdList *>(e->lvalue.get())) {
+                for (auto &p : il->elems) {
+                    mut_len.insert(p->uid);
+                    mut_content.insert(p->uid);
+                }
+            } else if (dynamic_cast<Identifier *>(e->lvalue.get())) {
+                const UniqueId *b = fr_base_id(e->lvalue.get());
+                mut_len.insert(b);          /* `x = ...` : reassign */
+                mut_content.insert(b);
+            } else if (const UniqueId *b = fr_base_id(e->lvalue.get())) {
+                mut_content.insert(b);      /* `arr[i] =`/`obj.f =` : content */
+            }
         }
     } else if (auto *idc = dynamic_cast<IncDecExpr *>(c)) {
-        if (auto *id = dynamic_cast<Identifier *>(idc->lvalue.get()))
-            out.insert(id->uid);
+        if (dynamic_cast<Identifier *>(idc->lvalue.get())) {
+            const UniqueId *b = fr_base_id(idc->lvalue.get());
+            mut_len.insert(b);
+            mut_content.insert(b);
+        } else if (const UniqueId *b = fr_base_id(idc->lvalue.get())) {
+            mut_content.insert(b);          /* `arr[i]++` : content */
+        }
+    } else if (auto *ce = dynamic_cast<CallExpr *>(c)) {
+        if (!fr_is_const_builtin(ce->what.get()) && ce->args) {
+            for (auto &a : ce->args->elems) {
+                if (a->th == TypeHint::i || a->th == TypeHint::f)
+                    continue;        /* scalar: passed by value, not mutated */
+                if (const UniqueId *b = fr_base_id(a.get())) {
+                    mut_len.insert(b);      /* impure callee can do anything */
+                    mut_content.insert(b);
+                }
+            }
+        }
     }
-    Inferencer::for_each_child(c,
-        [&](Construct *ch) { fr_collect_mutated(ch, out); });
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        fr_collect_mutated(ch, mut_len, mut_content);
+    });
 }
 
 /*
  * True if `e` is a side-effect-free INT expression whose value cannot change
- * across the loop: a literal int, a SLOTTED-LOCAL identifier (not the loop var,
- * not mutated in the body - a local scalar can only be changed by a direct
- * assignment, which `mutated` captures), or an arith/bitwise/unary chain of
- * those. A call / subscript / member / assignment / comparison is rejected
- * (it could read mutable state, have a side effect, or not be int).
+ * across the loop:
+ *   - a literal int, or a SLOTTED-LOCAL identifier (not the loop var, whose
+ *     length/identity is stable - not in `mut_len`);
+ *   - an arith/bitwise/unary chain of immutable operands;
+ *   - a subscript / member READ whose base + index are immutable AND whose base
+ *     has no element/field write (`mut_content`) - the element is then stable;
+ *   - a call to a CONST (pure) builtin with all-immutable arguments - e.g.
+ *     `len(arr)` when arr's length is stable (an `arr[i] = v` is fine: it does
+ *     not change the length).
  */
-static bool fr_immutable(const Construct *e,
-                         const std::unordered_set<const UniqueId *> &mutated,
-                         const UniqueId *i_uid)
+static bool fr_immutable(
+    const Construct *e,
+    const std::unordered_set<const UniqueId *> &mut_len,
+    const std::unordered_set<const UniqueId *> &mut_content,
+    const UniqueId *i_uid)
 {
     if (!e)
         return false;
@@ -3636,17 +3701,39 @@ static bool fr_immutable(const Construct *e,
         return true;
     if (auto *id = dynamic_cast<const Identifier *>(e))
         return id->sym.kind == SymKind::local && id->uid != i_uid &&
-               mutated.find(id->uid) == mutated.end();
+               mut_len.find(id->uid) == mut_len.end();
     if (auto *sc = dynamic_cast<const SingleChildConstruct *>(e))  /* Expr01 */
-        return fr_immutable(sc->elem.get(), mutated, i_uid);
+        return fr_immutable(sc->elem.get(), mut_len, mut_content, i_uid);
+    if (auto *sub = dynamic_cast<const Subscript *>(e)) {
+        const UniqueId *b = fr_base_id(sub->what.get());
+        return b && mut_content.find(b) == mut_content.end() &&
+               fr_immutable(sub->what.get(), mut_len, mut_content, i_uid) &&
+               fr_immutable(sub->index.get(), mut_len, mut_content, i_uid);
+    }
+    if (auto *m = dynamic_cast<const MemberExpr *>(e)) {
+        const UniqueId *b = fr_base_id(m->what.get());
+        return b && mut_content.find(b) == mut_content.end() &&
+               fr_immutable(m->what.get(), mut_len, mut_content, i_uid);
+    }
+    if (auto *ce = dynamic_cast<const CallExpr *>(e)) {
+        if (!fr_is_const_builtin(ce->what.get()))
+            return false;
+        if (ce->args)
+            for (auto &a : ce->args->elems)
+                if (!fr_immutable(a.get(), mut_len, mut_content, i_uid))
+                    return false;
+        return true;
+    }
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
         /* arith (Expr02/03/04) + bitwise (Expr05/08/09/10) only - not a
          * comparison/logical (bool result, not an int bound). */
-        if (dynamic_cast<const Expr06 *>(e) || dynamic_cast<const Expr07 *>(e) ||
-            dynamic_cast<const Expr11 *>(e) || dynamic_cast<const Expr12 *>(e))
+        if (dynamic_cast<const Expr06 *>(e) ||
+            dynamic_cast<const Expr07 *>(e) ||
+            dynamic_cast<const Expr11 *>(e) ||
+            dynamic_cast<const Expr12 *>(e))
             return false;
         for (auto &p : mo->elems)
-            if (!fr_immutable(p.second.get(), mutated, i_uid))
+            if (!fr_immutable(p.second.get(), mut_len, mut_content, i_uid))
                 return false;
         return true;
     }
@@ -3675,16 +3762,17 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
     const UniqueId *i_uid = ivar->uid;
     const int i_slot = ivar->sym.slot;
 
-    /* cond: `i < bound` (asc) or `i >= bound` (desc), bound int */
+    /* cond: `i </<= bound` (asc) or `i >=/> bound` (desc), bound int */
     auto *cond = dynamic_cast<Expr06 *>(f->cond.get());
     if (!cond || cond->elems.size() != 2)
         return n;
     auto *cleft = dynamic_cast<Identifier *>(cond->elems[0].second.get());
     if (!cleft || cleft->uid != i_uid)
         return n;
-    bool cmp_lt;
-    if (cond->elems[1].first == Op::lt)       cmp_lt = true;
-    else if (cond->elems[1].first == Op::ge)  cmp_lt = false;
+    const Op cmp_op = cond->elems[1].first;
+    bool cmp_asc;
+    if (cmp_op == Op::lt || cmp_op == Op::le)      cmp_asc = true;
+    else if (cmp_op == Op::ge || cmp_op == Op::gt) cmp_asc = false;
     else return n;
     Construct *bound = cond->elems[1].second.get();
     if (bound->th != TypeHint::i)
@@ -3715,17 +3803,17 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
         return n;
     }
 
-    /* the comparison direction must match the step direction - exactly the two
-     * forms requested (`<` with `+`, `>=` with `-`). */
-    if (cmp_lt != inc_asc)
+    /* the comparison direction must match the step direction (`<`/`<=` with
+     * `+`, `>=`/`>` with `-`). */
+    if (cmp_asc != inc_asc)
         return n;
 
     /* bound and step must be loop-immutable */
-    std::unordered_set<const UniqueId *> mutated;
-    fr_collect_mutated(f->body.get(), mutated);
-    if (!fr_immutable(bound, mutated, i_uid))
+    std::unordered_set<const UniqueId *> mut_len, mut_content;
+    fr_collect_mutated(f->body.get(), mut_len, mut_content);
+    if (!fr_immutable(bound, mut_len, mut_content, i_uid))
         return n;
-    if (step && !fr_immutable(step, mutated, i_uid))
+    if (step && !fr_immutable(step, mut_len, mut_content, i_uid))
         return n;
 
     /* Build the ForRangeStmt; specialize the kept sub-trees (the body is the
@@ -3734,7 +3822,7 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
     fr->start = f->start;
     fr->end = f->end;
     fr->i_slot = i_slot;
-    fr->cmp_lt = cmp_lt;
+    fr->cmp_op = cmp_op;
     fr->bound = specialize(std::move(cond->elems[1].second));
     if (step)
         fr->step = specialize(std::move(inc14->rvalue));
