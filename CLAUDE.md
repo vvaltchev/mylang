@@ -339,9 +339,8 @@ Binary-operator precedence is encoded as a ladder of parse functions
 `pExpr01 … pExpr14`, each
 producing a matching AST node class `Expr01 … Expr14`. **The numbering has
 gaps** — only
-`02,03,04,06,07,11,12,14` carry real operators (levels with no operators in this
-language are
-skipped):
+`02,03,04,05,06,07,08,09,10,11,12,14` carry real operators (the level numbers
+match C precedence; an unused level is skipped):
 
 - `pExpr01` — primaries + postfix chains: literals, `()`, `[...]` array, `{...}`
   dict, identifiers, then any run of call `(...)`, subscript/slice `[...]`,
@@ -351,13 +350,17 @@ skipped):
   `lower_named_args` and README *Named arguments*. A trailing **`++`/`--`**
   (`Op::inc`/`Op::dec`) after the postfix chain makes a **postfix**
   `IncDecExpr`.
-- `pExpr02` — unary `+ - !` (right-recursive, so `!!x`, `-+x` work); a leading
-  **`++`/`--`** makes a **prefix** `IncDecExpr` (so `--1` now lexes as
-  decrement-of-`1`, a compile error like C — not `-(-1)`)
+- `pExpr02` — unary `+ - ! ~` (right-recursive, so `!!x`, `-+x` work); `~` is
+  bitwise NOT here (the same `Op::bnot` token is the `dyn` alias in a *param*
+  position, but that is handled in `pFuncParam` before any expression, so they
+  never collide). A leading **`++`/`--`** makes a **prefix** `IncDecExpr` (so
+  `--1` now lexes as decrement-of-`1`, a compile error like C — not `-(-1)`)
 - `pExpr03` — `* / %`
 - `pExpr04` — `+ -`
+- `pExpr05` — `<< >> >>>` (shift; `>>` signed/arithmetic, `>>>` unsigned/logical)
 - `pExpr06` — `< > <= >=`
 - `pExpr07` — `== !=`
+- `pExpr08` — `&` (bitwise AND), `pExpr09` — `^` (XOR), `pExpr10` — `|` (OR)
 - `pExpr11` — `&&`
 - `pExpr12` — `||`
 - `pExpr14` — assignment `=  +=  -=  *=  /=  %=`, plus `var`/`const` decls and
@@ -371,6 +374,25 @@ accumulator
 dispatches statements
 (`if`/`while`/`for`/`foreach`/`func`/`try`/`throw`/`return`/braced
 block/expression-statement).
+
+**Bitwise / shift operators (`~ & ^ | << >> >>>`) are int-only.** New `Type`
+virtuals `band`/`bor`/`bxor`/`shl`/`shr`/`ushr` (binary) and `bnot` (unary) —
+base `Type` throws `TypeErrorEx`, only `TypeInt` implements them, so a `float`
+operand (which `num_bin_op` routes to `TypeFloat`) raises a type error; a `bool`
+promotes to `int` first like the other numeric ops, and the result is always
+`int`. `>>` is a SIGNED (arithmetic, sign-extending) right shift, `>>>` the
+UNSIGNED (logical, zero-filling) one (JavaScript semantics). The shift bounds /
+sign handling live in **`bitops.h`** (`bit_shl`/`bit_shr`/`bit_ushr`: count must
+be `>= 0` or `InvalidValueEx`, a count `>= 64` saturates to `0` / sign-fill
+instead of UB) — shared by `TypeInt` AND the **M8** unboxed path so they compute
+identically. M8: the BINARY bitwise nodes (`Expr05`/`08`/`09`/`10`) specialize
+into a `TypedScalarExpr` (`Cat::arith`, the int `eval_int` loop, which gained
+the `band`/.../`ushr` cases) — so a bit-manip tight loop is unboxed (~2x over
+`-nti`); unary `~` (an `Expr02`) stays the boxed path. The inferencer's
+`binop_result`/`unary_result` type them (int, int/bool operands; a float is
+`dyn` → the check pass reports "operator does not apply"). Precedence matches C
+exactly (see the `pExpr0N` ladder above), including the `a & b == c` →
+`a & (b == c)` trap.
 
 A `fl` bitmask of `pFlags` (`pInDecl`, `pInConstDecl`, `pInLoop`, `pInStmt`,
 `pInFuncBody`,

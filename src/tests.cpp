@@ -1993,6 +1993,61 @@ static const std::vector<test> tests =
         "var a = [10, 20]; var r = g(a);",
         "assert(r == 10 && a[0] == 11);" } },   /* ref semantics, like a call */
 
+    /* ---- bitwise & shift operators (~ & | ^ << >> >>>), int only ---- */
+    { "bitwise: & | ^ ~ basics",
+      { "assert((5 & 3) == 1);",
+        "assert((5 | 2) == 7);",
+        "assert((5 ^ 1) == 4);",
+        "assert(~5 == -6 && ~0 == -1 && ~(-1) == 0);" } },
+    { "bitwise: AND/OR/XOR chains",
+      { "assert((1 | 2 | 4) == 7);",
+        "assert((7 & 6 & 4) == 4);",
+        "assert((1 ^ 2 ^ 3) == 0);" } },
+    { "shift: << and the two right shifts",
+      { "assert((1 << 4) == 16 && (5 << 1) == 10);",
+        "assert((16 >> 2) == 4 && (16 >>> 2) == 4);" } },
+    { "shift: >> sign-extends, >>> zero-fills (negative)",
+      { "assert((-8 >> 1) == -4);",            /* arithmetic */
+        "assert((-8 >>> 60) == 15);",          /* logical */
+        "assert((-1 >>> 63) == 1);" } },
+    { "shift: count past the width saturates (no UB)",
+      { "assert((1 << 64) == 0 && (1 << 100) == 0);",
+        "assert((5 >>> 100) == 0);",
+        "assert((-1 >> 64) == -1 && (4 >> 64) == 0);" } },
+    { "shift: a negative count throws at runtime",
+      { "var n = -1; var x = 1 << n;" }, &typeid(InvalidValueEx) },
+    { "bitwise: bool operands promote to int",
+      { "assert((true & true) == 1);",
+        "assert((true | false) == 1);",
+        "assert(~true == -2 && (true << 2) == 4);" } },
+    { "bitwise: C precedence (== over &, & over ^ over |, shift over <)",
+      { "assert((5 & 3 == 1) == 0);",      /* 5 & (3==1) = 5 & 0 = 0 */
+        "assert((1 | 2 & 3) == 3);",       /* 1 | (2&3) */
+        "assert((1 ^ 1 & 0) == 1);",       /* 1 ^ (1&0) */
+        "assert((1 + 2 << 1) == 6);",      /* (1+2) << 1 */
+        "assert((2 < 1 << 2) == true);" } },  /* 2 < (1<<2) */
+    { "bitwise: ~ binds tightest (unary)",
+      { "assert((~5 + 1) == -5);",         /* (~5) + 1 */
+        "assert((~5 & 3) == 2);" } },      /* (~5) & 3 */
+    { "bitwise: classic set/clear/test/toggle bit idioms",
+      { "var x = 0;",
+        "x = x | (1 << 3); assert(x == 8);",           /* set bit 3 */
+        "assert(((x >> 3) & 1) == 1);",                /* test bit 3 */
+        "x = x ^ (1 << 3); assert(x == 0);",           /* toggle off */
+        "var y = 15; y = y & ~(1 << 1); assert(y == 13);" } },  /* clear */
+    { "bitwise: works on non-const values (M8-specialized path)",
+      { "func mix(a, b) => (a & b) | (a << 1) ^ (b >>> 1);",
+        "assert(mix(5, 3) == 11);" } },
+    /* type errors: bitwise is int-only */
+    { "bitwise: & on a float is a type error",
+      { "func f(float x) => x & 1;" }, &typeid(TypeMismatchEx) },
+    { "bitwise: << with a float is a type error",
+      { "func f(float x) => 1 << x;" }, &typeid(TypeMismatchEx) },
+    { "bitwise: ~ on a float is a type error",
+      { "func f(float x) => ~x;" }, &typeid(TypeMismatchEx) },
+    { "bitwise: | on a string is a type error (const-folded)",
+      { "var x = \"a\" | 2;" }, &typeid(TypeErrorEx) },
+
     /* ---- evaluator (eval.cpp) ---- */
     {
         "string escape sequences (\\t \\v \\a \\b and unknown)",
@@ -6416,8 +6471,8 @@ static const std::vector<test> tests =
         "assert(f(1, 2, 3) == [1, 2, 3, none]);" } },   /* w (int?) omitted */
     { "syntax: ~ param is dynamic",
       { "func f(~x) => x; assert(f(1) == 1); assert(f(\"s\") == \"s\");" } },
-    { "syntax reject: ~ is not a general expression operator",
-      { "var x = ~5;" }, &typeid(SyntaxErrorEx) },
+    { "~ is the bitwise-NOT operator in an expression",
+      { "assert(~5 == -6 && ~0 == -1);" } },
     { "syntax reject: trailing name-? is rejected in a body declaration",
       { "int x?;" }, &typeid(SyntaxErrorEx) },
 

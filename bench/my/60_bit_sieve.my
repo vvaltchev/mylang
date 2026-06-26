@@ -1,0 +1,22 @@
+# Sieve of Eratosthenes packed into a flat array<int>, 64 bits per word (a set
+# bit = composite). Exercises >>>, &, |, << on a real algorithm with a ~64x
+# denser representation than a bool/byte array. The flat int array + M8 keep
+# the word read/write and the bit math unboxed.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 4000000 * scale;
+var WORDS = (N >>> 6) + 1;
+var bits = array(WORDS, 0);                  # flat array<int>, all zero
+for (var i = 2; i * i < N; i++) {
+    if (((bits[i >>> 6] >>> (i & 63)) & 1) == 0) {       # i is prime
+        for (var j = i * i; j < N; j += i)
+            bits[j >>> 6] = bits[j >>> 6] | (1 << (j & 63));
+    }
+}
+var count = 0;
+for (var i = 2; i < N; i++)
+    if (((bits[i >>> 6] >>> (i & 63)) & 1) == 0)
+        count++;
+print("result:", count);

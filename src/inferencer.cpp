@@ -2036,6 +2036,14 @@ STyRef Inferencer::unary_result(Op op, STyRef a)
             return A.float_ty();
         return A.dyn_ty();
     }
+    if (op == Op::bnot) {
+        /* unary ~ : int only (bool promotes to int); float/other is an error */
+        STyRef u = strip(sty_resolve(a));
+        if (is_unknown(u)) return bottom;
+        if (u->kind == STyKind::Bool || u->kind == STyKind::Int)
+            return A.int_ty();
+        return A.dyn_ty();
+    }
     return A.dyn_ty();
 }
 
@@ -2126,6 +2134,20 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
                 STyRef j = arith_join(au, bu);
                 return j ? j : A.dyn_ty();
             }
+            return A.dyn_ty();
+
+        case Op::band:
+        case Op::bor:
+        case Op::bxor:
+        case Op::shl:
+        case Op::shr:
+        case Op::ushr:
+            /* bitwise/shift: int (or bool, which promotes) operands ONLY, ->
+             * int. A float operand is an error (-> dyn here; the check pass
+             * reports "operator does not apply"). */
+            if (an && bn && au->kind != STyKind::Float
+                    && bu->kind != STyKind::Float)
+                return A.int_ty();
             return A.dyn_ty();
 
         default:
@@ -2976,7 +2998,11 @@ void Inferencer::check(Construct *n)
         return;
     }
 
-    if (dynamic_cast<Expr03 *>(n) || dynamic_cast<Expr04 *>(n)) {
+    if (dynamic_cast<Expr03 *>(n) || dynamic_cast<Expr04 *>(n) ||
+        dynamic_cast<Expr05 *>(n) || dynamic_cast<Expr08 *>(n) ||
+        dynamic_cast<Expr09 *>(n) || dynamic_cast<Expr10 *>(n)) {
+        /* arith path: require non-opt operands and flag an invalid combination
+         * (binop_result returns dyn for e.g. a float bitwise operand). */
         check_binops(static_cast<MultiOpConstruct *>(n), false, false, true);
         return;
     }
@@ -2998,6 +3024,15 @@ void Inferencer::check(Construct *n)
             STyRef u = strip(sty_resolve(t));
             if (!is_dyn(u) && !is_unknown(u) && !is_num(u))
                 mismatch("unary +/- needs a number, got '" + sty_to_string(t) +
+                             "'", n->start, n->end);
+        } else if (op == Op::bnot) {
+            STyRef t = type_of(e2->elems[0].second.get());
+            require_nonopt(t, n->start, n->end, "with a unary ~");
+            STyRef u = strip(sty_resolve(t));
+            /* ~ is int-only (bool promotes); float/str/... is an error */
+            if (!is_dyn(u) && !is_unknown(u) &&
+                u->kind != STyKind::Int && u->kind != STyKind::Bool)
+                mismatch("unary ~ needs an int, got '" + sty_to_string(t) +
                              "'", n->start, n->end);
         }
         return;
@@ -3386,8 +3421,13 @@ make_typed(TypedScalarExpr::Cat cat, TypeHint kind, TypeHint result_th,
  * int/float; else return it unchanged. Children are already specialized. */
 static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
 {
-    /* arithmetic: Expr03 (* / %), Expr04 (+ -) */
-    if (dynamic_cast<Expr03 *>(n.get()) || dynamic_cast<Expr04 *>(n.get())) {
+    /* arithmetic: Expr03 (* / %), Expr04 (+ -); bitwise/shift: Expr05
+     * (<< >> >>>), Expr08 (&), Expr09 (^), Expr10 (|). The bitwise ones are
+     * int-only (always th==i), and share the unboxed int arith loop in
+     * TypedScalarExpr::eval_int. */
+    if (dynamic_cast<Expr03 *>(n.get()) || dynamic_cast<Expr04 *>(n.get()) ||
+        dynamic_cast<Expr05 *>(n.get()) || dynamic_cast<Expr08 *>(n.get()) ||
+        dynamic_cast<Expr09 *>(n.get()) || dynamic_cast<Expr10 *>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (n->th == TypeHint::i && ops_scalar(mo, false))
             return make_typed(TypedScalarExpr::Cat::arith, TypeHint::i,

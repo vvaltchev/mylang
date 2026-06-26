@@ -5,6 +5,7 @@
 #include "syntax.h"
 #include "lexer.h"
 #include "backtrace.h"
+#include "bitops.h"
 
 #include <cmath>
 
@@ -1373,6 +1374,12 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
                 /* Unary '!': logical not of the truthiness, yielding a bool */
                 val = EvalValue(!val.is_true());
                 break;
+            case Op::bnot:
+                /* Unary '~': bitwise NOT (a bool promotes to int 0/1 first) */
+                if (val.is<bool>())
+                    val = static_cast<int_type>(val.get<bool>() ? 1 : 0);
+                val.get_type()->bnot(val);
+                break;
             default:
                 throw InternalErrorEx();
         }
@@ -1383,6 +1390,76 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
         stamp_operand_loc(e.get(), ex);
         throw;
     }
+}
+
+EvalValue Expr05::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalValue &&val = eval_first_rvalue(ctx).clone();
+
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
+
+        switch (op) {
+            case Op::shl:  num_binop_loc(val, e.get(), ctx, &Type::shl);  break;
+            case Op::shr:  num_binop_loc(val, e.get(), ctx, &Type::shr);  break;
+            case Op::ushr: num_binop_loc(val, e.get(), ctx, &Type::ushr); break;
+            default:       throw InternalErrorEx();
+        }
+    }
+
+    return move(val);
+}
+
+EvalValue Expr08::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalValue &&val = eval_first_rvalue(ctx).clone();
+
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
+
+        if (op != Op::band)
+            throw InternalErrorEx();
+
+        num_binop_loc(val, e.get(), ctx, &Type::band);
+    }
+
+    return move(val);
+}
+
+EvalValue Expr09::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalValue &&val = eval_first_rvalue(ctx).clone();
+
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
+
+        if (op != Op::bxor)
+            throw InternalErrorEx();
+
+        num_binop_loc(val, e.get(), ctx, &Type::bxor);
+    }
+
+    return move(val);
+}
+
+EvalValue Expr10::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalValue &&val = eval_first_rvalue(ctx).clone();
+
+    for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
+
+        const auto &[op, e] = *it;
+
+        if (op != Op::bor)
+            throw InternalErrorEx();
+
+        num_binop_loc(val, e.get(), ctx, &Type::bor);
+    }
+
+    return move(val);
 }
 
 EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
@@ -1584,6 +1661,12 @@ int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
                     case Op::mod:
                         if (r == 0) throw DivisionByZeroEx(start, end);
                         acc %= r; break;
+                    case Op::band: acc &= r; break;
+                    case Op::bor:  acc |= r; break;
+                    case Op::bxor: acc ^= r; break;
+                    case Op::shl:  acc = bit_shl(acc, r);  break;
+                    case Op::shr:  acc = bit_shr(acc, r);  break;
+                    case Op::ushr: acc = bit_ushr(acc, r); break;
                     default: throw InternalErrorEx();
                 }
             }

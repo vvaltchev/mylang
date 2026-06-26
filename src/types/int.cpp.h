@@ -32,6 +32,13 @@ public:
     void opneg(EvalValue &a) override;
     void land(EvalValue &a, const EvalValue &b) override;
     void lor(EvalValue &a, const EvalValue &b) override;
+    void band(EvalValue &a, const EvalValue &b) override;
+    void bor(EvalValue &a, const EvalValue &b) override;
+    void bxor(EvalValue &a, const EvalValue &b) override;
+    void shl(EvalValue &a, const EvalValue &b) override;
+    void shr(EvalValue &a, const EvalValue &b) override;
+    void ushr(EvalValue &a, const EvalValue &b) override;
+    void bnot(EvalValue &a) override;
 
     bool is_true(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
@@ -89,6 +96,68 @@ void TypeInt::mod(EvalValue &a, const EvalValue &b)
         throw DivisionByZeroEx();
 
     a.get<int_type>() %= b.get<int_type>();
+}
+
+/*
+ * Bitwise operators - integers only (a float RHS lands in TypeFloat, which
+ * does not implement them, so it raises a type error). The shift semantics /
+ * out-of-range handling live in bit_shl/bit_shr/bit_ushr (bitops.h), shared
+ * with the unboxed M8 path so they compute identically.
+ */
+void TypeInt::band(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
+    a.get<int_type>() &= b.get<int_type>();
+}
+
+void TypeInt::bor(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
+    a.get<int_type>() |= b.get<int_type>();
+}
+
+void TypeInt::bxor(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected integer on the right side");
+
+    a.get<int_type>() ^= b.get<int_type>();
+}
+
+void TypeInt::shl(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected an integer shift count");
+
+    int_type &v = a.get<int_type>();
+    v = bit_shl(v, b.get<int_type>());
+}
+
+void TypeInt::shr(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected an integer shift count");
+
+    int_type &v = a.get<int_type>();
+    v = bit_shr(v, b.get<int_type>());
+}
+
+void TypeInt::ushr(EvalValue &a, const EvalValue &b)
+{
+    if (!b.is<int_type>())
+        throw TypeErrorEx("Expected an integer shift count");
+
+    int_type &v = a.get<int_type>();
+    v = bit_ushr(v, b.get<int_type>());
+}
+
+void TypeInt::bnot(EvalValue &a)
+{
+    a.get<int_type>() = ~a.get<int_type>();
 }
 
 void TypeInt::lt(EvalValue &a, const EvalValue &b)

@@ -44,6 +44,10 @@ enum class Op : int {
     questionmark = 35, // ? (opt/nullable type suffix)
     inc         = 36, // ++ (pre/postfix increment, int/float)
     dec         = 37, // -- (pre/postfix decrement, int/float)
+    bxor        = 38, // ^  (bitwise xor, int)
+    shl         = 39, // << (left shift, int)
+    shr         = 40, // >> (signed right shift, sign-extending)
+    ushr        = 41, // >>> (unsigned/logical right shift, zero-fill)
 
-    op_count    = 38,
+    op_count    = 42,
 };

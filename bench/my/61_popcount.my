@@ -1,0 +1,17 @@
+# Sum of popcounts (Hamming weights) over a range, computed bit-by-bit in a
+# tight inner loop (no per-element function call), so the & and >>> stay on
+# the M8-specialized unboxed path.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 4000000 * scale;
+var total = 0;
+for (var i = 0; i < N; i++) {
+    var x = i;
+    while (x != 0) {
+        total += x & 1;
+        x = x >>> 1;
+    }
+}
+print("result:", total);

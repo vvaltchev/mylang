@@ -780,6 +780,22 @@ public:
     }
 };
 
+/* shift: << >> >>>  (binds below `+ -`, above the comparisons - like C) */
+class Expr05 final: public MultiOpConstruct {
+
+public:
+
+    Expr05() : MultiOpConstruct("Expr05") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr05>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
+};
+
 class Expr06 final: public MultiOpConstruct {
 
 public:
@@ -804,6 +820,54 @@ public:
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<Expr07>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
+};
+
+/* bitwise AND `&` (binds below `== !=`, above `^`, like C) */
+class Expr08 final: public MultiOpConstruct {
+
+public:
+
+    Expr08() : MultiOpConstruct("Expr08") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr08>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
+};
+
+/* bitwise XOR `^` (binds below `&`, above `|`, like C) */
+class Expr09 final: public MultiOpConstruct {
+
+public:
+
+    Expr09() : MultiOpConstruct("Expr09") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr09>();
+        copy_base_fields(*c);
+        clone_ops_into(*c);
+        return c;
+    }
+};
+
+/* bitwise OR `|` (binds below `^`, above `&&`, like C) */
+class Expr10 final: public MultiOpConstruct {
+
+public:
+
+    Expr10() : MultiOpConstruct("Expr10") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<Expr10>();
         copy_base_fields(*c);
         clone_ops_into(*c);
         return c;

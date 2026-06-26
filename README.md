@@ -718,6 +718,22 @@ Key rules:
     also return a `bool`. The logical operators `&& || !` return a `bool` too.
     A comparison/logical result therefore infers as `bool` (e.g. `var ok = a <
     b;` makes `ok` a `bool`), and an array of such results is `array<bool>`.
+  * **Bitwise / shift operators** `~ & ^ | << >> >>>` work like in C/C++, but on
+    **`int` only** (a `bool` operand promotes to `int`; a `float`/`str`/... is a
+    compile-time type error). The result is always `int`. `~` is bitwise NOT;
+    `& ^ |` are AND/XOR/OR; `<<` is left shift. There are **two** right shifts,
+    as in JavaScript: `>>` is the **signed** (arithmetic, sign-extending) shift
+    so a negative number stays negative (`-8 >> 1 == -4`), and `>>>` is the
+    **unsigned** (logical, zero-filling) one (`-8 >>> 60 == 15`). Operands are
+    64-bit; a shift count must be `>= 0` (a negative count throws
+    `InvalidValueEx`), and a count `>= 64` yields `0` (for `<<`/`>>>`) or a full
+    sign-fill (for `>>`) rather than C's undefined behavior. Precedence matches
+    C: unary `~` binds tightest, then `<< >> >>>` (below `+ -`, above the
+    comparisons), then — below `== !=` — `&`, then `^`, then `|` (so `a & b ==
+    c` parses as `a & (b == c)`, the classic C trap; parenthesize as `(a & b) ==
+    c`). The `~` token doubles as the `dyn` modifier in a *parameter* position
+    (`func f(~x)`), but that is a declaration, not an expression, so the two
+    never collide.
 
 #### The `opt` and `dyn` modifiers
 
