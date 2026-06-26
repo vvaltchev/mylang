@@ -3693,21 +3693,19 @@ static void fr_collect_mutated(
             mut_content.insert(b);          /* `arr[i]++` : content */
         }
     } else if (auto *ce = dynamic_cast<CallExpr *>(c)) {
-        /* What a call does to a CONTAINER argument (a scalar is by value):
-         *   - const builtin: nothing (read-only);
-         *   - pure user func: may write an ELEMENT (`a[i]=v` keeps it pure),
-         *                     so content but NOT length;
-         *   - impure: anything (append/pop/...) - both length AND content. */
-        const bool ro = fr_is_const_builtin(ce->what.get());
-        const bool pure = !ro && fr_is_pure_func(ce->what.get());
-        if (!ro && ce->args) {
+        /* A PURE call (const builtin or pure user func) cannot mutate an
+         * argument - `pure` now forbids writing a reference parameter. Only an
+         * IMPURE call may change a container passed to it (append/pop/`a[i]=v`/
+         * a deeper call), so it taints both the length and the content of every
+         * non-scalar argument (a scalar is by value, never mutated). */
+        if (!fr_is_const_builtin(ce->what.get()) &&
+            !fr_is_pure_func(ce->what.get()) && ce->args) {
             for (auto &a : ce->args->elems) {
                 if (fr_is_scalar(a.get()))
-                    continue;        /* scalar: passed by value, not mutated */
+                    continue;
                 if (const UniqueId *b = fr_base_id(a.get())) {
+                    mut_len.insert(b);
                     mut_content.insert(b);
-                    if (!pure)
-                        mut_len.insert(b);   /* impure can change length too */
                 }
             }
         }
@@ -3756,24 +3754,20 @@ static bool fr_immutable(
                fr_immutable(m->what.get(), mut_len, mut_content, i_uid);
     }
     if (auto *ce = dynamic_cast<const CallExpr *>(e)) {
-        /* A call's result is constant across the loop only if the callee is
-         * pure AND it cannot mutate its arguments between iterations:
-         *   - a const builtin is READ-ONLY, so any immutable arg is fine
-         *     (this is what makes `len(arr)` work);
-         *   - a pure USER function MAY write an element of a container arg
-         *     (mylang `pure` permits `a[i]=v`), so its result is constant only
-         *     when every arg is a SCALAR (by value - it cannot mutate it). */
-        const bool ro = fr_is_const_builtin(ce->what.get());
-        const bool pure = fr_is_pure_func(ce->what.get());
-        if (!ro && !pure)
+        /* A call's result is constant across the loop iff the callee is pure
+         * (a const builtin, or an effectively-pure user function) and every
+         * argument is immutable. `pure` now forbids mutating a reference
+         * parameter (see func_mutates_input in the resolver), so a pure call
+         * neither has side effects nor changes its own result between
+         * iterations - so even a container arg (`len(arr)`, `compute(arr)`) is
+         * safe to evaluate once. */
+        if (!fr_is_const_builtin(ce->what.get()) &&
+            !fr_is_pure_func(ce->what.get()))
             return false;
         if (ce->args)
-            for (auto &a : ce->args->elems) {
-                if (pure && !ro && !fr_is_scalar(a.get()))
-                    return false;    /* pure user func needs scalar args */
+            for (auto &a : ce->args->elems)
                 if (!fr_immutable(a.get(), mut_len, mut_content, i_uid))
                     return false;
-            }
         return true;
     }
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {

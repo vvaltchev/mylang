@@ -1145,6 +1145,152 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
  * Conservative: self-recursion and calls to a not-yet-decided (e.g.
  * forward-referenced or mutually-recursive) auto-pure func stay impure.
  */
+/* ---- pure: detecting mutation of a REFERENCE-typed input parameter ---- */
+/*
+ * Mutating an array/dict/struct passed in IS an observable side effect (mylang
+ * passes them by reference), so a function that does it is NOT pure - even
+ * though its body looks "local". A SCALAR param (passed by copy) and a FRESH
+ * local container are fine. We approximate this with a small taint analysis:
+ * a reference-typed param is tainted; anything that may alias one becomes
+ * tainted; an element/field WRITE through a tainted base makes the function
+ * impure. Conservative (a clone()/slice of a param taints the result, costing a
+ * pure-classification but never soundness).
+ */
+
+/* The root identifier of an lvalue chain (`x`, `a[i]`, `o.f.g`), else null. */
+static const UniqueId *fmi_base_id(const Construct *lv)
+{
+    while (lv) {
+        if (auto *id = dynamic_cast<const Identifier *>(lv))
+            return id->uid;
+        if (auto *s = dynamic_cast<const Subscript *>(lv)) {
+            lv = s->what.get(); continue;
+        }
+        if (auto *m = dynamic_cast<const MemberExpr *>(lv)) {
+            lv = m->what.get(); continue;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+/* Complete child visitor (the resolver's for_each_child omits the nodes its
+ * walk handles - Block/for/foreach/try/Expr14 - so add them here). */
+static void fmi_children(Construct *c,
+                         const std::function<void(Construct *)> &fn)
+{
+    if (!c)
+        return;
+    if (auto *b = dynamic_cast<Block *>(c)) {
+        for (auto &e : b->elems) fn(e.get());
+    } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+        fn(f->init.get()); fn(f->cond.get());
+        fn(f->inc.get()); fn(f->body.get());
+    } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        fn(fe->container.get()); fn(fe->body.get());
+    } else if (auto *t = dynamic_cast<TryCatchStmt *>(c)) {
+        fn(t->tryBody.get());
+        for (auto &p : t->catchStmts) fn(p.second.get());
+        fn(t->finallyBody.get());
+    } else if (auto *e = dynamic_cast<Expr14 *>(c)) {
+        fn(e->lvalue.get()); fn(e->rvalue.get());
+    } else {
+        for_each_child(c, fn);
+    }
+}
+
+/* `e`'s subtree reads some tainted id (over-approximates "may alias one"). */
+static bool fmi_mentions(const Construct *e,
+                         const std::unordered_set<const UniqueId *> &t)
+{
+    if (!e || dynamic_cast<const FuncDeclStmt *>(e))
+        return false;
+    if (auto *id = dynamic_cast<const Identifier *>(e))
+        return t.count(id->uid) != 0;
+    bool found = false;
+    fmi_children(const_cast<Construct *>(e),
+                 [&](Construct *ch) { if (fmi_mentions(ch, t)) found = true; });
+    return found;
+}
+
+/* One taint-propagation step over `c`: `var b = E`/`b = E` and a `foreach`
+ * over a tainted container spread taint from a tainted rhs/container to the lhs
+ * identifier / loop var. Sets `changed` when the set grows. */
+static void fmi_propagate(Construct *c,
+                          std::unordered_set<const UniqueId *> &t,
+                          bool &changed)
+{
+    if (!c || dynamic_cast<FuncDeclStmt *>(c))
+        return;
+    if (auto *e = dynamic_cast<Expr14 *>(c)) {
+        /* Only an IDENTIFIER-lvalue assignment makes the lhs alias the rhs
+         * (`var b = a` / `b = a`); an element store `r[i] = a` writes the
+         * (possibly fresh) container `r`, it does not make `r` alias `a`. So an
+         * `r[i] = <tainted>` does NOT taint r - which is exactly why a
+         * fresh-local builder `var r = [..]; r[i] = param` stays pure. (A
+         * tainted value placed in a literal initializer, `var r = [a]`, DOES
+         * taint r, since that is an identifier-lvalue assignment.) */
+        if (fmi_mentions(e->rvalue.get(), t)) {
+            if (auto *il = dynamic_cast<IdList *>(e->lvalue.get())) {
+                for (auto &p : il->elems)
+                    if (t.insert(p->uid).second) changed = true;
+            } else if (dynamic_cast<Identifier *>(e->lvalue.get())) {
+                if (const UniqueId *b = fmi_base_id(e->lvalue.get()))
+                    if (t.insert(b).second) changed = true;
+            }
+        }
+    } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        if (fe->ids && fmi_mentions(fe->container.get(), t))
+            for (auto &p : fe->ids->elems)
+                if (t.insert(p->uid).second) changed = true;
+    }
+    fmi_children(c, [&](Construct *ch) { fmi_propagate(ch, t, changed); });
+}
+
+/* True if `c` writes an element/field (`x[i]=`, `x.f=`, `x[i]++`) through a
+ * tainted base - the mutation of an input. */
+static bool fmi_has_tainted_write(
+    const Construct *c, const std::unordered_set<const UniqueId *> &t)
+{
+    if (!c || dynamic_cast<const FuncDeclStmt *>(c))
+        return false;
+    const Construct *lv = nullptr;
+    if (auto *e = dynamic_cast<const Expr14 *>(c))
+        lv = e->lvalue.get();
+    else if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
+        lv = idc->lvalue.get();
+    if (lv && (dynamic_cast<const Subscript *>(lv) ||
+               dynamic_cast<const MemberExpr *>(lv))) {
+        const UniqueId *b = fmi_base_id(lv);
+        if (b && t.count(b))
+            return true;
+    }
+    bool found = false;
+    fmi_children(const_cast<Construct *>(c), [&](Construct *ch) {
+        if (fmi_has_tainted_write(ch, t)) found = true;
+    });
+    return found;
+}
+
+/* True if `fd` may mutate a reference-typed parameter (so it is not pure). */
+static bool func_mutates_input(FuncDeclStmt *fd)
+{
+    if (!fd->body || !fd->params)
+        return false;
+    std::unordered_set<const UniqueId *> tainted;
+    for (auto &p : fd->params->elems)
+        if (p->th != TypeHint::i && p->th != TypeHint::f)
+            tainted.insert(p->uid);   /* a non-scalar (ref/str/dyn) param */
+    if (tainted.empty())
+        return false;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        fmi_propagate(fd->body.get(), tainted, changed);
+    }
+    return fmi_has_tainted_write(fd->body.get(), tainted);
+}
+
 bool
 func_body_is_pure(const Construct *c,
                   const std::unordered_set<const UniqueId *> &pure_names)
@@ -1257,10 +1403,25 @@ Resolver::process_function(FuncDeclStmt *fd)
         }
     }
 
+    /*
+     * A function that MUTATES a reference-typed parameter is not pure (mylang
+     * passes arrays/dicts/structs by reference - mutating one is observable).
+     * This demotes `effective_pure` for BOTH an auto-pure candidate and an
+     * explicit `pure func` that does it (explicit_pure - the user's declaration
+     * - is left intact, so ispuredecl() still reports it while ispure() does
+     * not). Scalar-param and fresh-local mutation stay pure (see
+     * func_mutates_input).
+     */
+    if (func_mutates_input(fd)) {
+        if (fd->effective_pure && fd->id)
+            TRACE(autopure, 0, std::string(fd->id->get_str()) +
+                  "  mutates a reference parameter -> NOT pure");
+        fd->effective_pure = false;
+    }
     /* Auto-pure: a non-pure function with no captures whose body is effectively
-     * pure is promoted, so ispure() sees it and its const-arg calls can fold
-     * (in the auto-const pass). */
-    if (!fd->effective_pure
+     * pure (and mutates no input) is promoted, so ispure() sees it and its
+     * const-arg calls can fold (in the auto-const pass). */
+    else if (!fd->effective_pure
             && (!fd->captures || fd->captures->elems.empty())
             && fd->body
             && func_body_is_pure(fd->body.get(), pure_func_names)) {
