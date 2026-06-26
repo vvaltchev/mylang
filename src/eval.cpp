@@ -1981,6 +1981,7 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
             : newval.get<float_type>();
     }
 
+    arr.invalidate_hash();   /* an element write changes the array's hash */
     out = newval;
     return true;
 }
@@ -2968,6 +2969,9 @@ EvalValue &LValue::get_value_for_put()
     if (container->valtype()->use_count(container->val) > 1)
         container->getval<SharedArrayObj>().clone_aliased_slices(container_idx);
 
+    /* an in-place element write changes the array's hash (the slice path above
+     * returns a fresh clone, which is already hash-invalid). */
+    container->getval<SharedArrayObj>().invalidate_hash();
     return val;
 }
 

@@ -1524,6 +1524,25 @@ are unchanged.
   (`mutable hash_cache`/`hash_valid`, computed lazily — strings are immutable),
   so repeated string-key probes don't recompute; a *slice* hashes its sub-view
   on demand. No cycle guard (matches `==`/`to_string`).
+- **Flat-scalar arrays cache their hash incrementally** (`SharedObject::
+  hash_cache`/`hash_valid`). `TypeArr::hash` returns the cache when valid;
+  `append` **maintains** it in O(1) (`arr_append_maintain_hash` — an append is
+  one more `hash_combine` step), and every other mutation **invalidates** it
+  (`invalidate_hash` at `pop`/`insert`/`erase`/`sort`/`reverse`/`+=`, the flat
+  element store, and `get_value_for_put`). Caching is restricted to a non-slice
+  **int/float/bool** array (`hash_cacheable`): its elements are scalars, so the
+  only way to change its hash is a mutation OF that array, all of which are
+  instrumented. A **general/struct** array is *not* cached — a nested mutation
+  (`a[i][j]=v`, a struct field, replacing an element) changes the outer array's
+  hash with no back-pointer to invalidate it — so it recomputes on demand
+  (correct, just not O(1)). A COW clone is a fresh object (the `SharedObject`
+  copy ctor is deleted) → starts invalid → recomputes; a read-only array never
+  mutates, so its cache, once set, is valid forever (the frozen-flat-key fast
+  path). The per-path safety net is `hash(a) == hash(deepclone(a))` after each
+  mutation (a stale cache fails it loudly). (An order-dependent removable hash —
+  polynomial / Rabin-Karp — could also make `a[i]=v` O(1), but it weakens the
+  hash, taxes the write path, and still can't do O(1) insert/erase; rejected for
+  B. See `plans/hash-and-dict.md`.)
 - **Any-type dict keys, frozen on insert.** Because `hash` is total, an array/
   dict/struct/`none` can be a key. A key would corrupt the map if mutated after
   insertion (its hash would change, leaving it in the wrong bucket — COW does

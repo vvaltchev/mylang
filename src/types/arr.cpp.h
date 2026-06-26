@@ -230,6 +230,8 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     if (!b.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array on the right side of +");
 
+    lval.invalidate_hash();   /* += appends elements -> the hash changes */
+
     const SharedArrayObj &rhs = b.get<SharedArrayObj>();
 
     /*
@@ -440,12 +442,17 @@ void TypeArr::noteq(EvalValue &a, const EvalValue &b)
 size_t TypeArr::hash(const EvalValue &a)
 {
     const SharedArrayObj &arr = a.get<SharedArrayObj>();
+
+    if (arr.hash_is_cached())          /* a non-slice with a valid cache */
+        return arr.get_cached_hash();
+
     const size_type n = arr.size();
     size_t seed = hash_salt_array;
 
     for (size_type i = 0; i < n; i++)
         hash_combine(seed, arr_elem_at(arr, i).hash());
 
+    arr.store_cached_hash(seed);       /* no-op for a slice */
     return seed;
 }
 
