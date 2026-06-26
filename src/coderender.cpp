@@ -344,6 +344,29 @@ struct Renderer {
             o << ") ";
             inline_block(f->body.get(), level);
             o << "\n";
+        } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+            /* the specialized counted loop - shown as the equivalent for() with
+             * a "counted" marker so the optimization is visible. */
+            const Construct *ivar = nullptr;
+            if (auto *e14 = dynamic_cast<const Expr14 *>(fr->init.get()))
+                ivar = e14->lvalue.get();
+            o << "for (";
+            if (fr->init) stmt_oneline(fr->init.get());
+            o << "; ";
+            if (ivar) expr(ivar, 0);
+            o << (fr->cmp_lt ? " < " : " >= ");
+            expr(fr->bound.get(), 0);
+            o << "; ";
+            if (ivar) expr(ivar, 0);
+            if (fr->step) {
+                o << (fr->cmp_lt ? " += " : " -= ");
+                expr(fr->step.get(), 0);
+            } else {
+                o << (fr->cmp_lt ? "++" : "--");
+            }
+            o << ") /* counted */ ";
+            inline_block(fr->body.get(), level);
+            o << "\n";
         } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
             o << "foreach (";
             if (fe->idsVarDecl) o << "var ";
@@ -533,6 +556,7 @@ string render_construct_code(const Construct *c)
         dynamic_cast<const IfStmt *>(c) ||
         dynamic_cast<const WhileStmt *>(c) ||
         dynamic_cast<const ForStmt *>(c) ||
+        dynamic_cast<const ForRangeStmt *>(c) ||
         dynamic_cast<const ForeachStmt *>(c) ||
         dynamic_cast<const ReturnStmt *>(c) ||
         dynamic_cast<const FuncDeclStmt *>(c) ||

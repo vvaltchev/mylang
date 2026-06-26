@@ -3505,3 +3505,51 @@ EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const
 
     return none;
 }
+
+/*
+ * Specialized counted loop (see syntax.h). After `init` declares the int slot,
+ * `bound` and `step` are evaluated ONCE; the per-iteration condition test and
+ * increment are then plain C on the slot's int_type - no expression eval, no
+ * num_bin_op, no TypedScalarExpr dispatch. The slot ref is re-fetched each
+ * iteration so a body that reassigns `i` is still respected.
+ */
+EvalValue ForRangeStmt::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalContext loop_ctx(ctx, ctx->const_ctx);
+
+    init->eval(&loop_ctx);                 /* declares i in frame slot i_slot */
+
+    Frame *f = loop_ctx.frame;
+    ML_CHECK(f);              /* i is a resolved slot -> the frame must exist */
+
+    const int_type bound_val = RValue(bound->eval(&loop_ctx)).get<int_type>();
+    const int_type step_val =
+        step ? RValue(step->eval(&loop_ctx)).get<int_type>()
+             : static_cast<int_type>(1);
+    const int_type delta = cmp_lt ? step_val : -step_val;
+
+    FlowState &fs = *loop_ctx.flow;
+
+    while (true) {
+
+        const int_type iv = f->slots[i_slot].getval<int_type>();
+        if (cmp_lt ? !(iv < bound_val) : !(iv >= bound_val))
+            break;
+
+        if (body)
+            body->eval(&loop_ctx);
+
+        if (fs.type == FlowState::ret)
+            break;                          /* propagate to the function */
+        if (fs.type == FlowState::brk) {
+            fs.type = FlowState::none;
+            break;
+        }
+        if (fs.type == FlowState::cont)
+            fs.type = FlowState::none;      /* consume; still run the step */
+
+        f->slots[i_slot].getval<int_type>() += delta;
+    }
+
+    return none;
+}

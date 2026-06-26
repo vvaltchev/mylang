@@ -1557,6 +1557,41 @@ for_each_child_slot(Construct *c,
     /* literals, Identifier, IdList, childless: nothing inlinable */
 }
 
+/* True if `c` holds a ForRangeStmt anywhere (walking statement containers - a
+ * ForRangeStmt only ever appears as a statement). Used to keep cross-input
+ * inlining off a post-specialization body that contains one (see Inliner). */
+static bool has_for_range(const Construct *c)
+{
+    if (!c)
+        return false;
+    if (dynamic_cast<const ForRangeStmt *>(c))
+        return true;
+    if (auto *b = dynamic_cast<const Block *>(c)) {
+        for (auto &e : b->elems)
+            if (has_for_range(e.get()))
+                return true;
+        return false;
+    }
+    if (auto *i = dynamic_cast<const IfStmt *>(c))
+        return has_for_range(i->thenBlock.get()) ||
+               has_for_range(i->elseBlock.get());
+    if (auto *w = dynamic_cast<const WhileStmt *>(c))
+        return has_for_range(w->body.get());
+    if (auto *f = dynamic_cast<const ForStmt *>(c))
+        return has_for_range(f->body.get());
+    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+        return has_for_range(fe->body.get());
+    if (auto *t = dynamic_cast<const TryCatchStmt *>(c)) {
+        if (has_for_range(t->tryBody.get()))
+            return true;
+        for (auto &p : t->catchStmts)
+            if (has_for_range(p.second.get()))
+                return true;
+        return has_for_range(t->finallyBody.get());
+    }
+    return false;
+}
+
 class Inliner {
 
     /* uid -> the unique top-level expression-bodied func to inline, or nullptr
@@ -1640,6 +1675,12 @@ public:
                  * state may differ at the new site) - and its result isn't
                  * "known at compile time" anyway, so folding gains nothing. */
                 if (!fd->id || !fd->effective_pure)
+                    continue;
+                /* A prior body is POST-specialization, so it may hold a
+                 * ForRangeStmt whose i_slot the inliner's substitution / tail
+                 * re-resolution does not remap; don't inline/specialize such a
+                 * body across inputs (it still runs correctly as a call). */
+                if (has_for_range(fd->body.get()))
                     continue;
                 if (inlinable_decl(fd))
                     funcs.emplace(kv.first, fd);

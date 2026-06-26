@@ -1376,3 +1376,42 @@ public:
         return c;
     }
 };
+
+/*
+ * Specialized counted loop, emitted by specialize_types for the two hottest
+ * `for` forms when `i` is a resolved int slot and `bound`/`step` are provably
+ * immutable within the loop:
+ *   for (var i = start; i <  bound; i += step)    (cmp_lt = true)
+ *   for (var i = start; i >= bound; i -= step)    (cmp_lt = false)
+ * `bound` and `step` are evaluated ONCE (cached as raw `int_type`), then the
+ * condition test and the increment run as plain C on the slot's int - no
+ * interpreter dispatch per iteration. `step` is null for the `i++`/`i--` form
+ * (step == 1). See `do_eval` (eval.cpp) and `try_for_range` (inferencer.cpp).
+ */
+class ForRangeStmt final: public Construct {
+
+public:
+
+    unique_ptr<Construct> init;   /* `var i = start` - declares the slot */
+    unique_ptr<Construct> bound;  /* the loop-immutable bound expr */
+    unique_ptr<Construct> step;   /* loop-immutable step expr, or null (== 1) */
+    unique_ptr<Construct> body;
+    int i_slot = 0;               /* the loop var's frame slot */
+    bool cmp_lt = true;           /* i < bound (true) vs i >= bound (false) */
+
+    ForRangeStmt() : Construct("ForRangeStmt") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<ForRangeStmt>();
+        copy_base_fields(*c);
+        c->init = clone_as(init);
+        c->bound = clone_as(bound);
+        c->step = clone_as(step);
+        c->body = clone_as(body);
+        c->i_slot = i_slot;
+        c->cmp_lt = cmp_lt;
+        return c;
+    }
+};

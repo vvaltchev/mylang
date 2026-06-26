@@ -990,6 +990,35 @@ faster. `th` is copied by `copy_base_fields` (clones/inliner preserve it), and
 the typed eval's `get<int_type>()` throws `TypeError` if inference were ever
 wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
 
+**Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
+(via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),
+the two hottest loop shapes are rewritten to a dedicated `ForRangeStmt`
+(`syntax.h`):
+`for (var i = start; i < bound; i += step)` and
+`for (var i = start; i >= bound; i -= step)` — matched when `i` is a resolved
+**int slot** (`sym.kind == local`, `th == i`), the comparison/step directions
+agree (`<` with `+`, `>=` with `-`), and `bound`/`step` are **loop-immutable**:
+a side-effect-free int expr (literal / slotted-local id / arith/bitwise chain —
+no call/subscript/member/assignment) whose identifiers are not the loop var and
+are not reassigned anywhere in the body (`fr_collect_mutated`, which reuses the
+complete `Inferencer::for_each_child` so no write is missed; a local scalar can
+only change via a direct assignment, and a callee can't reach the caller's
+locals, so this is sound even with calls in the body). `ForRangeStmt::do_eval`
+evaluates `bound`/`step` **once** (cached as raw `int_type`), then the
+per-iteration condition test and increment are plain C on the slot's
+`int_type` — no expression eval, no `num_bin_op`, no `TypedScalarExpr` dispatch
+(the body still gets M8). `step` is null for the `i++`/`i--` form. The slot is
+re-fetched each iteration so a body that reassigns `i` is honored;
+break/continue/return go through the same `FlowState` as `ForStmt`. **Effect:**
+~10% on the bench geomean (0.61x→0.55x). Cross-input guard: a prior REPL body
+is post-specialization and may hold a `ForRangeStmt` whose `i_slot` the
+inliner's substitution / tail re-resolution would not remap, so the inliner's
+cross-input registration **skips** a prior function containing one
+(`has_for_range`) — it still runs correctly as a call. coderender renders it as
+the equivalent `for (...) /* counted */` so `:show`/`-a` make the optimization
+visible. **Not yet specialized:** a `len(arr)`/call bound (excluded as a
+possible side effect / mutable read), `<=`/`>` forms, and a float loop var.
+
 ### Function templates (monomorphization)
 
 A **named** function with ≥1 *template param* — un-annotated, non-`dyn`,
