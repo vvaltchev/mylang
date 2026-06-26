@@ -160,6 +160,27 @@ static bool is_readonly_value(const EvalValue &v)
     return false;
 }
 
+/* True if `c` STRUCTURALLY yields a bool: a comparison, a logical op, a unary
+ * `!`, a bool literal (or their M8 typed forms). Used to decide when
+ * `false || x` / `true && x` may collapse to `x` - sound only when `x` is
+ * already bool, since mylang's &&/|| yield bool (so bool(x) == x there). */
+static bool produces_bool(const Construct *c)
+{
+    if (dynamic_cast<const LiteralBool *>(c)
+            || dynamic_cast<const Expr06 *>(c)    /* < > <= >= */
+            || dynamic_cast<const Expr07 *>(c)    /* == != */
+            || dynamic_cast<const Expr11 *>(c)    /* && */
+            || dynamic_cast<const Expr12 *>(c))   /* || */
+        return true;
+    if (auto *u = dynamic_cast<const Expr02 *>(c))  /* unary `!` */
+        return u->elems.size() == 1 && u->elems[0].first == Op::lnot;
+    if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c))
+        return ts->cat == TypedScalarExpr::Cat::cmp
+            || ts->cat == TypedScalarExpr::Cat::logical
+            || ts->cat == TypedScalarExpr::Cat::lnot;
+    return false;
+}
+
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
@@ -703,27 +724,60 @@ private:
                 if (!is_scalar_literal(p.second.get()))
                     all_lit = false;
             }
-            /* Short-circuit fold: a logical op whose FIRST operand is a const
-             * that already determines the result - `false && rest` -> false,
-             * `true || rest` -> true. Sound regardless of `rest` (it is
-             * short-circuited, so never evaluated - even side effects). This is
-             * what eliminates a `const FLAG=false; if (FLAG && ...)` branch
-             * (the if-DCE then drops the `if (false)`). */
-            if (!all_lit && mo->elems.size() >= 2
+            /* Simplify a logical op with const LEADING operands. mylang's
+             * &&/|| yield a BOOL (not the operand, unlike Python: `false || 5`
+             * is `true`, not `5`), so the rules are:
+             *   - a const that DETERMINES the result (`false && rest` -> false,
+             *     `true || rest` -> true) folds the whole thing to that bool -
+             *     sound regardless of `rest`, which is short-circuited (never
+             *     evaluated, even side effects). This eliminates a
+             *     `const FLAG=false; if (FLAG && ...)` branch (the if-DCE then
+             *     drops the `if (false)`);
+             *   - a NON-determining leading const (`true && rest`, `false ||
+             *     rest`) contributes nothing and is dropped. If >=2 operands
+             *     remain it stays a logical op (still -> bool, sound for any
+             *     operand type); if exactly ONE remains the result is bool(op),
+             *     so we drop the const only when that operand is ALREADY a bool
+             *     (a comparison / logical / `!` - else bool(x) != x). */
+            const bool is_and = dynamic_cast<Expr11 *>(mo) != nullptr;
+            const bool is_or  = dynamic_cast<Expr12 *>(mo) != nullptr;
+            if (!all_lit && (is_and || is_or) && mo->elems.size() >= 2
                     && is_scalar_literal(mo->elems[0].second.get())) {
-                const bool is_and = dynamic_cast<Expr11 *>(mo) != nullptr;
-                const bool is_or  = dynamic_cast<Expr12 *>(mo) != nullptr;
-                if (is_and || is_or) {
-                    EvalValue f0 = RValue(mo->elems[0].second->eval(&cctx));
-                    const bool t = f0.get_type()->is_true(f0);
+                size_t drop = 0;
+                bool determined = false, det_val = false;
+                for (; drop < mo->elems.size(); drop++) {
+                    Construct *op = mo->elems[drop].second.get();
+                    if (!is_scalar_literal(op))
+                        break;
+                    EvalValue v = RValue(op->eval(&cctx));
+                    const bool t = v.get_type()->is_true(v);
                     if ((is_and && !t) || (is_or && t)) {
-                        EvalValue r{t};   /* false for &&, true for || */
-                        TRACE(fold, 0, std::string("short-circuit ")
-                              + (is_and ? "&&" : "||") + " -> "
-                              + r.to_string());
-                        MakeConstructFromConstVal(r, slot, false);
+                        determined = true; det_val = t; break;
+                    }
+                }
+                if (determined) {
+                    EvalValue r{det_val};
+                    TRACE(fold, 0, std::string("short-circuit ")
+                          + (is_and ? "&&" : "||") + " -> " + r.to_string());
+                    MakeConstructFromConstVal(r, slot, false);
+                    return;
+                }
+                if (drop > 0) {              /* dropped leading no-op consts */
+                    const size_t remaining = mo->elems.size() - drop;
+                    if (remaining >= 2) {
+                        mo->elems.erase(mo->elems.begin(),
+                                        mo->elems.begin() + drop);
+                        mo->elems[0].first = Op::invalid;
+                        TRACE(fold, 0, "drop non-contributing const operand");
                         return;
                     }
+                    if (remaining == 1
+                            && produces_bool(mo->elems[drop].second.get())) {
+                        slot = move(mo->elems[drop].second);
+                        TRACE(fold, 0, "drop non-contributing const operand");
+                        return;
+                    }
+                    /* one non-bool operand left: bool(x) != x, leave as-is. */
                 }
             }
             if (all_lit) {
