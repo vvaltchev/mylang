@@ -1217,6 +1217,18 @@ value of its parameters: that's exactly what we need during const evaluation.
 For example, to generate `sorted_people` during const evaluation it's enough to
 write:
 
+A pure function must have **no observable side effects**. Because arrays, dicts
+and structs are passed **by reference**, *modifying one that was passed in*
+(`a[i] = v`, `a.field = v`, `append(a, x)`, ...) is a side effect visible to the
+caller — so a function that does it is **not** pure. A pure function may still:
+modify a **scalar** parameter (`int`/`float`/`bool` are passed by copy), and
+freely build and modify **fresh local** containers (a `var r = [...]` declared
+inside the function and returned). So `func mk(n) { var r = [0,0]; r[0] = n;
+return r; }` is pure, while `func f(a) { a[0] = n; }` is not. `ispure()` reports
+this; an *explicit* `pure func` that modifies a reference parameter still
+reports `ispuredecl() == true` (you declared it pure) but `ispure() == false`
+(it isn't).
+
 ```C#
 const sorted_people = sort(people, pure func(a, b) => a[0] < b[0]);
 ```
@@ -1310,9 +1322,13 @@ function is recognized only after parsing, so its calls fold as part of
 
 The detection is conservative: a function that reads a non-const global, calls a
 non-const builtin (`print`, `rand`, I/O, ...) or a non-pure function, captures
-anything, recurses, or nests another function is left impure. When in doubt,
-declare the function `pure` explicitly — that also turns "this is not pure" into
-a hard error instead of a silent missed optimization.
+anything, recurses, nests another function, or modifies a reference parameter is
+left impure. When in doubt, declare the function `pure` explicitly — for the
+first kinds of impurity that turns "this is not pure" into a hard error (the
+function fails the moment it is const-evaluated) instead of a silent missed
+optimization; modifying a reference parameter is detected conservatively, so it
+only demotes `ispure()` to `false` (it never falsely errors on, say, mutating a
+`clone()` of a parameter).
 
 ### Exceptions
 

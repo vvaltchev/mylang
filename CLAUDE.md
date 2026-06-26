@@ -578,12 +578,39 @@ omits the nodes `walk()` handles itself (Block/for/foreach/try/`Expr14`), so
 `prescan_blocked`, `register_pure_funcs` and the folders descend into those
 explicitly.
 
+**Pure functions: no observable side effects.** A function is pure iff it has
+no side effects: it reads only consts + its params (+ calls pure functions),
+nests no function, **and does not mutate a reference parameter.** The last
+clause matters because mylang passes arrays/dicts/structs **by reference**, so
+`a[i] = v` / `a.f = v` / `append(a, …)` on a param *is* observable by the
+caller — such a function is NOT pure (mutating a **scalar** param is fine, it is
+a copy; mutating a **fresh local** container is fine, it never escaped).
+`func_mutates_input` (`resolver.cpp`) proves this with a small taint analysis:
+a non-scalar param is tainted, an *identifier-lvalue* assignment from a tainted
+value (`var b = a`, `var r = [a]`) taints the lhs, a `foreach` var over a
+tainted container taints the var — then an element/field **write** via a tainted
+base is a mutation. An element *store* `r[i] = a` does **not** taint `r` (it
+writes the possibly-fresh `r`, it doesn't make `r` alias `a`) — exactly what keeps
+the fresh-local builder `var r = [..]; r[i] = param` pure. Conservative
+(a `clone(a)`/slice of a param taints the result, costing a pure-classification,
+never soundness); the one residual gap is storing a param into a fresh empty
+local then deep-mutating (`var r=[]; r[0]=a; r[0][0]=v`). A mutating function is
+demoted to `effective_pure = false` for **both** auto-pure *and* an explicit
+`pure func` (its `explicit_pure` — the user's word — is kept, so `ispuredecl()`
+still reports it while `ispure()` does not; no error, to avoid breaking
+conservative false-positives like clone-and-mutate). **Why redefining `pure`
+this way costs ~no optimization:** a param-mutator can't const-fold (a const arg
+is read-only → the write throws), isn't inlined (mutators are block-bodied), and
+the for-range already excluded it — but it *enables* a sound pure-container-arg
+for-range bound (`compute(arr)`); see the eval below.
+
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to
 `effective_pure` when every free identifier (`sym.kind != local`) is
 `is_const` (a const global/builtin/explicit-pure func) **or the name of a
 function already proven pure** (`Resolver::pure_func_names`, populated in
-walk order as `process_function` decides each), and it nests no function. So a
+walk order as `process_function` decides each), it nests no function, **and it
+does not mutate a reference parameter** (`func_mutates_input`, above). So a
 function that calls an *earlier* auto-pure helper is itself recognized pure —
 `func f(x,y)=>add(x,y)` is pure once `add` is, so `f(1,2)` const-folds (the
 whole pure chain folds at compile time, like `-O3`). Still conservative:
@@ -1000,27 +1027,24 @@ the four hottest loop shapes are rewritten to a dedicated `ForRangeStmt`
 with `-`), and `bound`/`step` are **loop-immutable** (`fr_immutable`): a
 side-effect-free **int** expr built from literals, slotted-local ids,
 arith/bitwise chains, subscript/member READs, and **pure calls with immutable
-args** — a **const builtin** (`len(arr)` qualifies), or an **effectively-pure
-USER function with all-scalar args** (`fr_is_pure_func`, from `g_fr_pure` —
-this program's `effective_pure` funcs plus, in the REPL, prior inputs' via
-`prior_scope`). Immutability is proven against two sets from
-`fr_collect_mutated` (which reuses the complete `Inferencer::for_each_child` so
-no write is missed): **`mut_len`** (an id whose value/length/identity may
-change — a direct reassign/`++`, or an *impure* call passed the container, since
-a mylang array/dict/struct is a reference an impure callee can `append`/mutate)
-and **`mut_content`** (additionally an `arr[i] =`/`obj.f =` element write, *or*
-a container passed to a **pure user func** — mylang `pure` permits `a[i]=v`, so a
-pure call can change content but not length). A bare id / `len(arr)` arg needs
-length-stability (`∉ mut_len`) — so the common fill `for(i;i<len(a);i++) a[i]=…`
-still specializes (an element write doesn't change the length); a subscript READ
-`arr[k]` additionally needs `∉ mut_content`. **The all-scalar rule for pure user
-funcs is the key soundness point:** mylang `pure` does NOT forbid mutating a
-param's elements, so a pure `f(arr)` bound could change its own result between
-iterations (caching once ≠ re-evaluating); a *scalar* arg is passed by value, so
-the callee cannot mutate it and the deterministic result is constant. A const
-builtin is read-only, so even a container arg (`len(arr)`) is safe. Sound even
-with calls in the body: a callee can't reach the caller's *scalar* locals.
-`ForRangeStmt::do_eval`
+args** — a **const builtin** (`len(arr)`), or an **effectively-pure USER
+function** (`fr_is_pure_func`, from `g_fr_pure` — this program's
+`effective_pure` funcs plus, in the REPL, prior inputs' via `prior_scope`), with
+any immutable args including containers (`compute(arr)`). This is sound because
+**`pure` forbids mutating a reference parameter** (see *Pure functions* below /
+`func_mutates_input`): a pure call has no side effects and, given immutable
+args, the same result every iteration, so it is safe to evaluate once.
+Immutability is proven against two sets from `fr_collect_mutated` (which reuses
+the complete `Inferencer::for_each_child` so no write is missed): **`mut_len`**
+(an id whose value/length/identity may change — a direct reassign/`++`, or an
+*impure* call passed the container, since a mylang array/dict/struct is a
+reference an impure callee can `append`/mutate) and **`mut_content`**
+(additionally an `arr[i] =`/`obj.f =` element write). A bare id / `len(arr)` arg
+needs length-stability (`∉ mut_len`) — so the common fill
+`for(i;i<len(a);i++) a[i]=…` still specializes (an element write doesn't change
+the length); a subscript READ `arr[k]` additionally needs `∉ mut_content`. A
+*pure* call taints nothing (it can't mutate its args); an *impure* call taints
+the length and content of each non-scalar arg. `ForRangeStmt::do_eval`
 evaluates `bound`/`step` **once** (cached as raw `int_type`), then the
 per-iteration condition test and increment are plain C on the slot's
 `int_type` — no expression eval, no `num_bin_op`, no `TypedScalarExpr` dispatch

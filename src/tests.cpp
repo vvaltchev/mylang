@@ -2385,6 +2385,39 @@ static const std::vector<test> tests =
         "func g() => aa(1, 2);",
         "assert(g() == 3);",
         "assert(startswith(show(g), \"/* pure */ func g() => 3\"));" } },
+    /* pure forbids mutating a reference (array/dict/struct) parameter - that
+     * is an observable side effect; scalar-param and fresh-local mutation are
+     * fine. (see func_mutates_input in the resolver) */
+    { "pure: mutating an array param is NOT pure",
+      { "func f(a) { a[0] = 9; return a[0]; }",
+        "assert(ispure(f) == false);" } },
+    { "pure: mutating an array param via append is NOT pure",
+      { "func f(a) { append(a, 9); return len(a); }",
+        "assert(ispure(f) == false);" } },
+    { "pure: a fresh-local builder that writes its OWN local stays pure",
+      { "func mk(n) { var r = [0, 0]; r[0] = n; return r; }",
+        "assert(ispure(mk));" } },
+    { "pure: reading an array param stays pure",
+      { "func d(a) => a[0] + a[1];",
+        "assert(ispure(d));" } },
+    { "pure: an alias of a param then mutate is NOT pure",
+      { "func g(a) { var b = a; b[0] = 9; return b[0]; }",
+        "assert(ispure(g) == false);" } },
+    { "pure: a param stored in a literal then deep-mutated is NOT pure",
+      { "func dp(a) { var r = [a]; r[0][0] = 9; return r[0][0]; }",
+        "assert(ispure(dp) == false);" } },
+    { "pure: mutating a SCALAR param (by copy) stays pure",
+      { "func h(x) { x = x + 1; return x * 2; }",
+        "assert(ispure(h));" } },
+    { "pure: mutating a struct param field is NOT pure",
+      { "struct P { int x; int y; }",
+        "func sf(p) { p.x = 5; return p.x; }",
+        "assert(ispure(sf) == false);" } },
+    { "pure: an explicit 'pure func' that mutates input - ispuredecl still "
+      "true, ispure false",
+      { "pure func pf(a) { a[0] = 1; return a[0]; }",
+        "assert(ispuredecl(pf));",
+        "assert(ispure(pf) == false);" } },
     { "ispure() of a non-function is a type error",
       { "ispure(5);" }, &typeid(TypeErrorEx) },
     { "ispure() with no args is rejected",
@@ -8145,6 +8178,13 @@ static const std::vector<repl_test> repl_tests =
         { "func us(int n) { var s = 0; for (var i = 0; i < lm(n); i++) {"
           " s += i; } return s; }", "" },
         { ":show us", "counted" } } },
+    /* a pure CONTAINER-arg bound specializes now that `pure` forbids input
+       mutation (so caching the call once is sound). */
+    { ":show: a pure container-arg func bound specializes (counted)",
+      { { "func cnt(array a) { var n = len(a); return n - 1; }", "" },
+        { "func uc(array x) { var s = 0; for (var i = 0; i < cnt(x); i++) {"
+          " s += x[i]; } return s; }", "" },
+        { ":show uc", "counted" } } },
 
     /* cross-input inlining: a pure function from an EARLIER input is inlined +
      * folded into a function defined in a LATER one (caller$0 from a prior
