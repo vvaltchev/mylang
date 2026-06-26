@@ -466,9 +466,23 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
         }
         arr.clone_internal_vec();   /* middle: own the data, keep-flat */
 
+    } else if (static_cast<size_type>(index) == n - 1) {
+
+        /*
+         * Erasing the LAST element shifts nothing: only a slice that actually
+         * reaches the last index becomes out of bounds, so detach just those.
+         */
+        arr.clone_aliased_slices(arr.offset() + n - 1);
+
     } else {
 
-        arr.clone_aliased_slices(arr.offset() + n - 1);
+        /*
+         * A front/middle erase shifts every element after `index` left by one,
+         * so ANY live slice overlapping that region would silently see shifted
+         * data (slices must act like independent copies). Detach them all, the
+         * way insert() does for a middle insert.
+         */
+        arr.clone_all_slices();
     }
 
     /* Erase in place, kind-aware (no promotion of flat storage). */

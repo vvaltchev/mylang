@@ -1637,6 +1637,34 @@ static const std::vector<test> tests =
         &typeid(InvalidNumberOfArgsEx),
     },
 
+    /* erase()/insert() preserve slice independence: a slice taken before the
+     * mutation must keep acting like an independent copy (it is detached). */
+    { "erase: a FRONT erase does not disturb a live slice (flat int)",
+      { "var a = [10,20,30,40,50]; var s = a[1:4];",   /* s = [20,30,40] */
+        "erase(a, 0);",
+        "assert(s == [20,30,40]);",
+        "assert(a == [20,30,40,50]);" } },
+    { "erase: a MIDDLE erase does not disturb a live slice",
+      { "var a = [10,20,30,40,50]; var s = a[0:3];",   /* s = [10,20,30] */
+        "erase(a, 3);",
+        "assert(s == [10,20,30]);",
+        "assert(a == [10,20,30,50]);" } },
+    { "erase: erasing the LAST element leaves a non-reaching slice intact",
+      { "var a = [10,20,30,40,50]; var s = a[0:2];",   /* s = [10,20] */
+        "erase(a, 4);",
+        "assert(s == [10,20]);",
+        "assert(a == [10,20,30,40]);" } },
+    { "erase: front erase preserves a slice of a GENERAL (string) array",
+      { "var a = [\"a\",\"b\",\"c\",\"d\"]; var s = a[1:3];",   /* [b,c] */
+        "erase(a, 0);",
+        "assert(s == [\"b\",\"c\"]);",
+        "assert(a == [\"b\",\"c\",\"d\"]);" } },
+    { "insert: a MIDDLE insert does not disturb a live slice",
+      { "var a = [1,2,3,4,5]; var s = a[1:4];",         /* s = [2,3,4] */
+        "insert(a, 2, 99);",
+        "assert(s == [2,3,4]);",
+        "assert(a == [1,2,99,3,4,5]);" } },
+
     /* erase()/insert() error paths. */
     {
         "erase() with the wrong number of arguments is rejected",
