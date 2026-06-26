@@ -276,6 +276,21 @@ EvalValue builtin_dynarray(EvalContext *ctx, ExprList *exprList)
     return SharedArrayObj(move(gvec));
 }
 
+/*
+ * Keep the array's cached hash correct across an append in O(1): a still-valid
+ * cache just folds the new element in (an append extends the sequence at the
+ * end, which is exactly one more hash_combine step). If the cache is invalid,
+ * this is a no-op and the next hash() recomputes. See SharedObject::hash_cache.
+ */
+static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
+{
+    if (arr.hash_is_cached()) {
+        size_t h = arr.get_cached_hash();
+        hash_combine(h, elem.hash());
+        arr.store_cached_hash(h);
+    }
+}
+
 EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 2)
@@ -309,8 +324,10 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
      * arg is evaluated INSIDE on success; on a miss it is evaluated normally
      * below, so it is never evaluated twice. */
     if (arr.skind() == SharedArrayObj::Storage::structs &&
-        try_construct_into_struct_array(ctx, arr, arg1))
+        try_construct_into_struct_array(ctx, arr, arg1)) {
+        arr.invalidate_hash();   /* built in-place; nothing to fold in */
         return lval->get();
+    }
 
     const EvalValue &elem = RValue(arg1->eval(ctx));
 
@@ -323,6 +340,7 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
      */
     if (arr.skind() == SharedArrayObj::Storage::ints && elem.is<int_type>()) {
         arr.flat_ints().push_back(elem.get<int_type>());
+        arr_append_maintain_hash(arr, elem);
         return lval->get();
     }
     if (arr.skind() == SharedArrayObj::Storage::floats &&
@@ -330,10 +348,12 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
         arr.flat_floats().push_back(elem.is<int_type>()
             ? static_cast<float_type>(elem.get<int_type>())
             : elem.get<float_type>());
+        arr_append_maintain_hash(arr, elem);
         return lval->get();
     }
     if (arr.skind() == SharedArrayObj::Storage::bools && elem.is<bool>()) {
         arr.flat_bools().push_back(elem.get<bool>() ? 1 : 0);
+        arr_append_maintain_hash(arr, elem);
         return lval->get();
     }
     /* flat POD-struct array: append the element's bytes (the hot path that
@@ -348,6 +368,7 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
         const size_t at = sv.buf.size();
         sv.buf.resize(at + sv.stride);
         std::memcpy(sv.buf.data() + at, o.bytes.data(), sv.stride);
+        arr_append_maintain_hash(arr, elem);
         return lval->get();
     }
 
@@ -355,6 +376,7 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
         throw TypeErrorEx(flat_array_violation_msg, arg0->start, arg1->end);
 
     arr.get_vec().emplace_back(elem, ctx->const_ctx);
+    arr_append_maintain_hash(arr, elem);
     return lval->get();
 }
 
@@ -386,6 +408,8 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
 
     if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
+
+    arr.invalidate_hash();   /* pop removes the last element */
 
     /* Read the last element without promoting flat storage. */
     const size_type last_i = arr.offset() + n - 1;
@@ -453,6 +477,8 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
     if (!n || index < 0 || static_cast<size_t>(index) >= n)
         throw OutOfBoundsEx();
 
+    arr.invalidate_hash();   /* any erase changes the array's hash */
+
     if (arr.is_slice()) {
 
         /* Erasing the first/last element of a slice is just a narrower view. */
@@ -511,6 +537,8 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
 
     if (index < 0 || static_cast<size_t>(index) > n)
         throw OutOfBoundsEx();
+
+    arr.invalidate_hash();   /* any insert changes the array's hash */
 
     if (arr.is_slice())
         arr.clone_internal_vec();          /* keep-flat; standalone, off=0 */
@@ -732,6 +760,8 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
         arr.clone_all_slices();
     }
 
+    arr.invalidate_hash();   /* sort reorders -> order-dependent hash changes */
+
     if (exprList->elems.size() == 1) {
 
         /*
@@ -880,6 +910,8 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
 
         arr.clone_all_slices();
     }
+
+    arr.invalidate_hash();   /* reverse changes the order-dependent hash */
 
     /* Flat fast path: reverse the unboxed vector in place (8-byte swaps). */
     switch (arr.skind()) {

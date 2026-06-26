@@ -118,6 +118,18 @@ private:
          */
         bool readonly = false;
 
+        /*
+         * Cached deep hash of this array's elements (see TypeArr::hash). Lazily
+         * computed; maintained in O(1) on append; INVALIDATED on every other
+         * mutation (pop/insert/erase/sort/reverse/+=/element write). A fresh
+         * SharedObject (and every clone, which is constructed - never copied,
+         * the copy ctor is deleted) starts invalid, so a COW clone naturally
+         * recomputes. A read-only array never mutates, so its cache, once set,
+         * stays valid forever (the frozen-dict-key fast path).
+         */
+        size_t hash_cache = 0;
+        bool hash_valid = false;
+
         SharedObject() : kind(Storage::general) { new (&vec) vec_type(); }
         SharedObject(vec_type &&a) : kind(Storage::general) {
             new (&vec) vec_type(move(a));
@@ -362,6 +374,40 @@ public:
 
     bool is_readonly() const { return shobj && shobj->readonly; }
     void set_readonly() { shobj->readonly = true; }
+
+    /*
+     * Hash cache (see TypeArr::hash and SharedObject::hash_cache). Caching is
+     * restricted to a NON-slice array of FLAT SCALARS (int/float/bool): its
+     * elements are scalars, so the only way to change its hash is a mutation OF
+     * THIS array (element write / append / pop / insert / erase / sort /
+     * reverse / +=), each of which calls invalidate_hash / the append-maintain.
+     * A GENERAL or struct array is NOT cached: a nested mutation (`a[i][j]=v`,
+     * `a[i].f=v`, replacing a struct element) changes this array's hash without
+     * touching this object - and there is no back-pointer to invalidate it - so
+     * it is always recomputed on demand. A slice hashes a sub-range, never the
+     * whole shared vector, so it is not cached either. A COW clone is a fresh
+     * object (the copy ctor is deleted) and starts invalid, so it recomputes.
+     */
+    bool hash_cacheable() const {
+        return !slice && shobj &&
+               (shobj->kind == Storage::ints ||
+                shobj->kind == Storage::floats ||
+                shobj->kind == Storage::bools);
+    }
+    bool hash_is_cached() const {
+        return hash_cacheable() && shobj->hash_valid;
+    }
+    size_t get_cached_hash() const { return shobj->hash_cache; }
+    void store_cached_hash(size_t h) const {
+        if (hash_cacheable()) {
+            shobj->hash_cache = h;
+            shobj->hash_valid = true;
+        }
+    }
+    void invalidate_hash() {
+        if (shobj)
+            shobj->hash_valid = false;
+    }
 
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }
