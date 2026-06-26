@@ -10,6 +10,7 @@
 class Construct;
 class UniqueId;
 class FuncDeclStmt;
+class EvalContext;
 
 /*
  * Whole-program static type inference + checking (see plans/type-inference.md).
@@ -44,7 +45,8 @@ void dump_type_info(Construct *root, std::ostream &os);
  * resolved slots via Identifier's typed fast paths). A no-op when inference is
  * disabled (no TypeHints are set). See plans/type-inference.md M8.
  */
-void specialize_types(Construct *root, bool enable = true);
+void specialize_types(Construct *root, bool enable = true,
+                      EvalContext *prior_scope = nullptr);
 
 /*
  * REPL incremental type inference + checking. A persistent type-checker that

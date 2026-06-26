@@ -6,7 +6,7 @@ var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
 
-var N = 4000000 * scale;
+var N = 400000 * scale;
 var WORDS = (N >>> 6) + 1;
 var bits = array(WORDS, 0);                  # flat array<int>, all zero
 for (var i = 2; i * i < N; i++) {

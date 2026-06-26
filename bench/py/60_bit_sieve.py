@@ -2,7 +2,7 @@
 import sys
 scale = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
-N = 4000000 * scale
+N = 400000 * scale
 WORDS = (N >> 6) + 1
 bits = [0] * WORDS
 i = 2

@@ -3608,12 +3608,44 @@ static const UniqueId *fr_base_id(const Construct *lv)
     return nullptr;
 }
 
-/* True if `callee` names a CONST (pure, side-effect-free, deterministic)
- * builtin - the only calls whose result can be cached once for the loop. */
+/* True if `callee` names a CONST (pure, side-effect-free, READ-ONLY,
+ * deterministic) builtin - it never mutates an argument, so even a container
+ * arg (e.g. `len(arr)`) is safe to evaluate once for the loop. */
 static bool fr_is_const_builtin(const Construct *callee)
 {
     auto *id = dynamic_cast<const Identifier *>(callee);
     return id && EvalContext::const_builtins.count(id->uid) != 0;
+}
+
+/* The set of effectively-pure USER functions in the program being specialized
+ * (rebuilt per specialize_types run; see fr_collect_pure_funcs). NOTE mylang's
+ * `pure` does NOT forbid mutating a param's ELEMENTS (`a[i] = v` keeps a func
+ * pure - only length/global side effects make it impure), so a pure call's
+ * result is constant ONLY when its args cannot be mutated by it - i.e. all
+ * args are scalars (passed by value). That is enforced at the bound (below). */
+static std::unordered_set<const UniqueId *> g_fr_pure;
+
+static void fr_collect_pure_funcs(Construct *c)
+{
+    if (!c)
+        return;
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c))
+        if (fd->id && fd->effective_pure)
+            g_fr_pure.insert(fd->id->uid);
+    Inferencer::for_each_child(c, fr_collect_pure_funcs);
+}
+
+static bool fr_is_pure_func(const Construct *callee)
+{
+    auto *id = dynamic_cast<const Identifier *>(callee);
+    return id && g_fr_pure.count(id->uid) != 0;
+}
+
+/* A scalar (int/float) operand - proven by inference, passed by value, so a
+ * callee cannot mutate it. */
+static bool fr_is_scalar(const Construct *e)
+{
+    return e && (e->th == TypeHint::i || e->th == TypeHint::f);
 }
 
 /*
@@ -3661,13 +3693,21 @@ static void fr_collect_mutated(
             mut_content.insert(b);          /* `arr[i]++` : content */
         }
     } else if (auto *ce = dynamic_cast<CallExpr *>(c)) {
-        if (!fr_is_const_builtin(ce->what.get()) && ce->args) {
+        /* What a call does to a CONTAINER argument (a scalar is by value):
+         *   - const builtin: nothing (read-only);
+         *   - pure user func: may write an ELEMENT (`a[i]=v` keeps it pure),
+         *                     so content but NOT length;
+         *   - impure: anything (append/pop/...) - both length AND content. */
+        const bool ro = fr_is_const_builtin(ce->what.get());
+        const bool pure = !ro && fr_is_pure_func(ce->what.get());
+        if (!ro && ce->args) {
             for (auto &a : ce->args->elems) {
-                if (a->th == TypeHint::i || a->th == TypeHint::f)
+                if (fr_is_scalar(a.get()))
                     continue;        /* scalar: passed by value, not mutated */
                 if (const UniqueId *b = fr_base_id(a.get())) {
-                    mut_len.insert(b);      /* impure callee can do anything */
                     mut_content.insert(b);
+                    if (!pure)
+                        mut_len.insert(b);   /* impure can change length too */
                 }
             }
         }
@@ -3716,12 +3756,24 @@ static bool fr_immutable(
                fr_immutable(m->what.get(), mut_len, mut_content, i_uid);
     }
     if (auto *ce = dynamic_cast<const CallExpr *>(e)) {
-        if (!fr_is_const_builtin(ce->what.get()))
+        /* A call's result is constant across the loop only if the callee is
+         * pure AND it cannot mutate its arguments between iterations:
+         *   - a const builtin is READ-ONLY, so any immutable arg is fine
+         *     (this is what makes `len(arr)` work);
+         *   - a pure USER function MAY write an element of a container arg
+         *     (mylang `pure` permits `a[i]=v`), so its result is constant only
+         *     when every arg is a SCALAR (by value - it cannot mutate it). */
+        const bool ro = fr_is_const_builtin(ce->what.get());
+        const bool pure = fr_is_pure_func(ce->what.get());
+        if (!ro && !pure)
             return false;
         if (ce->args)
-            for (auto &a : ce->args->elems)
+            for (auto &a : ce->args->elems) {
+                if (pure && !ro && !fr_is_scalar(a.get()))
+                    return false;    /* pure user func needs scalar args */
                 if (!fr_immutable(a.get(), mut_len, mut_content, i_uid))
                     return false;
+            }
         return true;
     }
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
@@ -3921,7 +3973,7 @@ void collect_array_analysis(Construct *root, AnalysisInfo &out)
     inf.collect_arrays(out);
 }
 
-void specialize_types(Construct *root, bool enable)
+void specialize_types(Construct *root, bool enable, EvalContext *prior_scope)
 {
     if (!enable || !root)
         return;
@@ -3930,8 +3982,28 @@ void specialize_types(Construct *root, bool enable)
     if (!blk)
         return;
 
+    /* a for-range bound may call a pure user function (with scalar args) -
+     * collect this program's effectively-pure functions first, plus (in the
+     * REPL) those from earlier inputs so a cross-input bound specializes. */
+    g_fr_pure.clear();
+    fr_collect_pure_funcs(root);
+    if (prior_scope) {
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        prior_scope->collect_symbols(syms);
+        for (const auto &kv : syms) {
+            const EvalValue &v = kv.second->get();
+            if (!v.is<shared_ptr<FuncObject>>())
+                continue;
+            const FuncDeclStmt *fd = v.get<shared_ptr<FuncObject>>()->func;
+            if (fd && fd->id && fd->effective_pure)
+                g_fr_pure.insert(fd->id->uid);
+        }
+    }
+
     for (auto &e : blk->elems)
         e = specialize(std::move(e));
+
+    g_fr_pure.clear();
 }
 
 /* ---- REPL incremental inference (wraps a persistent Inferencer) -------- */

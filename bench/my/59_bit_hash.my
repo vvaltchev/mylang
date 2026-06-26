@@ -5,7 +5,7 @@ var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
 
-var N = 8000000 * scale;
+var N = 800000 * scale;
 var MASK = (1 << 32) - 1;
 var h = 2166136261;                          # FNV-1a 32-bit offset basis
 for (var i = 0; i < N; i++) {
