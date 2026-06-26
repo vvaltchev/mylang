@@ -6,9 +6,9 @@ if (len(argv) > 0)
 func mk(n, seed) {
     var m = array(n);
     var x = seed;
-    for (var i = 0; i < n; i += 1) {
+    for (var i = 0; i < n; i++) {
         var row = array(n);
-        for (var j = 0; j < n; j += 1) {
+        for (var j = 0; j < n; j++) {
             x = (x * 1103515245 + 12345) % 1000;
             row[j] = x;
         }
@@ -19,11 +19,11 @@ func mk(n, seed) {
 
 func matmul(a, b, n) {
     var c = array(n);
-    for (var i = 0; i < n; i += 1) {
+    for (var i = 0; i < n; i++) {
         var row = array(n);
-        for (var j = 0; j < n; j += 1) {
+        for (var j = 0; j < n; j++) {
             var s = 0;
-            for (var k = 0; k < n; k += 1)
+            for (var k = 0; k < n; k++)
                 s += a[i][k] * b[k][j];
             row[j] = s;
         }
@@ -37,7 +37,7 @@ var a = mk(n, 1);
 var b = mk(n, 2);
 
 var checksum = 0;
-for (var r = 0; r < scale; r += 1) {
+for (var r = 0; r < scale; r++) {
     var c = matmul(a, b, n);
     checksum += c[0][0] + c[n - 1][n - 1];
 }

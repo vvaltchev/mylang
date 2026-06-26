@@ -5,7 +5,7 @@ if (len(argv) > 0)
 
 var N = 200000 * scale;
 var parts = array(N);
-for (var i = 0; i < N; i += 1)
+for (var i = 0; i < N; i++)
     parts[i] = str(i);
 
 var joined = join(parts, ",");

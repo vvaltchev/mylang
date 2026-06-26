@@ -6,7 +6,7 @@ if (len(argv) > 0)
 func compute_primes(n) {
 
     var primes = array(n);
-    for (var i = 0; i < n; i += 1)
+    for (var i = 0; i < n; i++)
         primes[i] = true;
 
     primes[0] = false;
@@ -21,13 +21,13 @@ func compute_primes(n) {
                 j += i;
             }
         }
-        i += 1;
+        i++;
     }
 
     var count = 0;
-    for (var k = 2; k < n; k += 1)
+    for (var k = 2; k < n; k++)
         if (primes[k])
-            count += 1;
+            count++;
 
     return count;
 }

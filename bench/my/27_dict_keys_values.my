@@ -5,13 +5,13 @@ if (len(argv) > 0)
 
 var M = 100000;
 var d = {};
-for (var i = 0; i < M; i += 1)
+for (var i = 0; i < M; i++)
     d[i] = i;
 
 var R = 20 * scale;
 var s = 0;
 
-for (var k = 0; k < R; k += 1) {
+for (var k = 0; k < R; k++) {
     var ks = keys(d);
     var vs = values(d);
     s += len(ks) + len(vs);

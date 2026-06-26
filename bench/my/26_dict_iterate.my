@@ -7,13 +7,13 @@ if (len(argv) > 0)
 
 var M = 100000;
 var d = {};
-for (var i = 0; i < M; i += 1)
+for (var i = 0; i < M; i++)
     d[i] = i * 2;
 
 var R = 5 * scale;
 var s = 0;
 
-for (var k = 0; k < R; k += 1) {
+for (var k = 0; k < R; k++) {
     foreach (var key, val in d)
         s += val;
     s = s % 1000000007;

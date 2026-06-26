@@ -8,7 +8,7 @@ var a = range(1000000);   # [0..999999] - matches Python's list(range(...))
 var R = 3 * scale;
 var s = 0;
 
-for (var k = 0; k < R; k += 1) {
+for (var k = 0; k < R; k++) {
     foreach (var i, e in indexed a)
         s += i * e;
     s = s % 1000000007;

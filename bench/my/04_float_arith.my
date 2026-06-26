@@ -8,7 +8,7 @@ if (len(argv) > 0)
 var N = 1000000 * scale;
 var x = 1.0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     x = x * 1.0000001 + 0.5;
     x = x - 0.4999999;
     if (x > 1000000.0)

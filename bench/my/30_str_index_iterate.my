@@ -8,8 +8,8 @@ var s2 = "0123456789" * 500;       # 5000 chars (matches Python's * 500)
 var R = 200 * scale;
 var total = 0;
 
-for (var k = 0; k < R; k += 1) {
-    for (var i = 0; i < len(s2); i += 1)
+for (var k = 0; k < R; k++) {
+    for (var i = 0; i < len(s2); i++)
         total += ord(s2[i]);
     total = total % 1000000007;
 }

@@ -7,8 +7,8 @@ var OUT = 1500 * scale;
 var IN = 1000;
 var s = 0;
 
-for (var i = 0; i < OUT; i += 1) {
-    for (var j = 0; j < IN; j += 1) {
+for (var i = 0; i < OUT; i++) {
+    for (var j = 0; j < IN; j++) {
         s += i * j;
         s = s % 1000000007;
     }

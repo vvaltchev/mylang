@@ -9,7 +9,7 @@ var a = range(SZ);   # [0..SZ-1] - matches Python's list(range(SZ))
 var R = 5 * scale;
 var total = 0;
 
-for (var k = 0; k < R; k += 1) {
+for (var k = 0; k < R; k++) {
     total += sum(a);
     total = total % 1000000007;
 }

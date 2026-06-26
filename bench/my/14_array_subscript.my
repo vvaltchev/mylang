@@ -6,11 +6,11 @@ if (len(argv) > 0)
 var N = 1000000 * scale;
 var a = array(N, 0);
 
-for (var i = 0; i < N; i += 1)
+for (var i = 0; i < N; i++)
     a[i] = i * 2;
 
 var s = 0;
-for (var i = 0; i < N; i += 1)
+for (var i = 0; i < N; i++)
     s += a[i];
 
 print("result:", s);

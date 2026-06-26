@@ -4,7 +4,7 @@ if (len(argv) > 0)
     scale = int(argv[0]);
 
 func mk(start) => func [start] {
-    start += 1;
+    start++;
     return start;
 };
 
@@ -12,7 +12,7 @@ var c = mk(0);
 var N = 1000000 * scale;
 var s = 0;
 
-for (var i = 0; i < N; i += 1)
+for (var i = 0; i < N; i++)
     s += c();
 
 print("result:", s);

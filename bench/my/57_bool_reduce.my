@@ -9,11 +9,11 @@ var N = 200000 * scale;
 var flags = make_array(N, func(i) => i % 2 == 0);   # array<bool>
 
 var total = 0;
-for (var r = 0; r < 50; r += 1) {
+for (var r = 0; r < 50; r++) {
     var c = 0;
-    for (var i = 0; i < N; i += 1)
+    for (var i = 0; i < N; i++)
         if (flags[i])
-            c += 1;
+            c++;
     total += c;
 }
 

@@ -4,7 +4,7 @@ if (len(argv) > 0)
     scale = int(argv[0]);
 
 func is_prime(n) {
-    for (var f = 2; f * f <= n; f += 1)
+    for (var f = 2; f * f <= n; f++)
         if (n % f == 0)
             return false;
     return true;
@@ -13,8 +13,8 @@ func is_prime(n) {
 var LIMIT = 100000 * scale;
 var count = 0;
 
-for (var n = 2; n < LIMIT; n += 1)
+for (var n = 2; n < LIMIT; n++)
     if (is_prime(n))
-        count += 1;
+        count++;
 
 print("result:", count);

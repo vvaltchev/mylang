@@ -6,13 +6,13 @@ if (len(argv) > 0)
 var N = 1500000 * scale;
 var a, b, c = 0;
 
-for (var i = 0; i < N; i += 1) {
+for (var i = 0; i < N; i++) {
     if (i % 3 == 0)
-        a += 1;
+        a++;
     else if (i % 3 == 1)
-        b += 1;
+        b++;
     else
-        c += 1;
+        c++;
 }
 
 print("result:", a + b * 2 + c * 3);

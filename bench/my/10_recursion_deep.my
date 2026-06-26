@@ -10,7 +10,7 @@ func sumto(n) {
 }
 
 var r = 0;
-for (var k = 0; k < 3000 * scale; k += 1)
+for (var k = 0; k < 3000 * scale; k++)
     r = sumto(900);
 
 print("result:", r);
