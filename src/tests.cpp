@@ -1773,6 +1773,29 @@ static const std::vector<test> tests =
     { "dead-code: const-false if at top level then a statement",
       { "if (false) { assert(false); } var ok = 1; assert(ok == 1);" } },
 
+    /* short-circuit folding: a const operand that determines a logical op's
+     * result (the rest short-circuits, so dropping it is sound). */
+    { "fold: short-circuit `true || X` folds to true",
+      { "func sc_or(x) => true || (x > 0);",
+        "assert(startswith(show(sc_or),"
+        " \"/* pure */ func sc_or(x) => true\"));" } },
+    { "fold: short-circuit `false && X` folds to false",
+      { "func sc_and(x) => false && (x > 0);",
+        "assert(startswith(show(sc_and),"
+        " \"/* pure */ func sc_and(x) => false\"));" } },
+    { "fold: short-circuit drops the dead operand's side effects",
+      { "var n = 0;",
+        "func bump() { n = n + 1; return true; }",
+        "func sc_se() { if (false && bump()) { } return n; }",
+        "assert(sc_se() == 0);" } },
+    { "fold: a const-false `&&` flag eliminates the guarded branch (DCE)",
+      { "const FLAG = false;",
+        "func guarded(x) { if (FLAG && x > 1000) { return 1; } return 2; }",
+        "assert(guarded(9) == 2);" } },
+    { "fold: short-circuit `true ||` drops an undefined dead operand",
+      { "func sc_undef() => 7 || undefined_name_xyz;",
+        "assert(sc_undef() == true);" } },
+
     /* ---- resolver (resolver.cpp): auto-const DCE & auto-pure analysis ---- */
     {
         "auto-const DCE: dead branches dropped after promotion",

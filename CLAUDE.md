@@ -485,6 +485,15 @@ slot identity). For each function (and the top-level "main"), it:
 - **folds** all-literal arithmetic/logic/comparison (`MultiOpConstruct`) to a
   single literal, reusing the interpreter (`mo->eval(&cctx)` against a const
   `EvalContext`);
+- **short-circuit folds** a logical op whose FIRST operand is a const that
+  already determines the result — `false && rest` → `false`, `true || rest` →
+  `true` (the `rest` is short-circuited, so dropping it is sound even with side
+  effects / an undefined name in it). This is what makes a feature-flag guard
+  fold: `const DEBUG = false; if (DEBUG && heavy()) {...}` short-circuits to
+  `if (false)`, which the DCE below then drops — matching C++ `-O3`. (Not folded:
+  `false || X` / `true && X`, which would need to prove `X` is already `bool` to
+  drop the const operand soundly — mylang's `||`/`&&` yield a bool, so `false ||
+  5` is `true`, not `5`; that needs the deferred type-narrowing pass.)
 - performs **dead-code elimination**: an `if`/`while` whose condition folds to a
   literal has its dead branch dropped (`while (false)` removed). Crucially, a
   branch it proves dead is *eliminated, not folded* — auto-const only analyzes
