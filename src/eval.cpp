@@ -2315,6 +2315,39 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
  */
 EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    /*
+     * Fast path: a resolved, live, non-const LOCAL holding an int or float -
+     * mutate the slot's scalar straight in place and return old (postfix) / new
+     * (prefix), with NO handle_single_expr14 call and NO num_bin_op. This is
+     * the loop-counter / scalar-var case; it must be at least as fast as
+     * `i += 1` (and is slightly faster - no literal-1 operand to read).
+     */
+    if (!ctx->const_ctx) {
+        if (const Identifier *id = as_resolved_local(lvalue.get())) {
+            Frame *f = ctx->frame;
+            const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
+            if (f && (f->live & bit)) {
+                LValue &lv = f->slots[id->sym.slot];
+                if (!lv.is_const_var()) {
+                    if (lv.is<int_type>()) {
+                        int_type &v = lv.getval<int_type>();
+                        const int_type old = v;
+                        v += is_inc ? 1 : -1;
+                        return is_prefix ? EvalValue(v) : EvalValue(old);
+                    }
+                    if (lv.is<float_type>()) {
+                        float_type &v = lv.getval<float_type>();
+                        const float_type old = v;
+                        v += is_inc ? 1.0 : -1.0;
+                        return is_prefix ? EvalValue(v) : EvalValue(old);
+                    }
+                    /* another type (only reachable via a dyn alias): fall
+                     * through to the general path, which raises the error. */
+                }
+            }
+        }
+    }
+
     const Op cop = is_inc ? Op::addeq : Op::subeq;
     const EvalValue one{static_cast<int_type>(1)};
 
