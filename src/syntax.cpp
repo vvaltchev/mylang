@@ -776,6 +776,26 @@ void ForeachStmt::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void ForRangeStmt::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+    string sub((level + 1) * 2, ' ');
+
+    s << indent << name << "(" << (cmp_lt ? "i < bound" : "i >= bound")
+      << ", slot " << i_slot << "\n";
+
+    init->serialize(s, level + 1);
+    s << endl << sub << "bound:\n";
+    bound->serialize(s, level + 2);
+    s << endl << sub << "step:";
+    if (step) { s << "\n"; step->serialize(s, level + 2); }
+    else      { s << " 1"; }
+    s << endl;
+    if (body)
+        body->serialize(s, level + 1);
+    s << endl << indent << ")";
+}
+
 void ForStmt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

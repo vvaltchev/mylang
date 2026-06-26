@@ -2048,6 +2048,50 @@ static const std::vector<test> tests =
     { "bitwise: | on a string is a type error (const-folded)",
       { "var x = \"a\" | 2;" }, &typeid(TypeErrorEx) },
 
+    /* ---- for-range loop specialization (ForRangeStmt) ---- */
+    { "for-range: ascending (i++) is correct",
+      { "var s = 0; for (var i = 0; i < 5; i++) { s += i; }",
+        "assert(s == 10);" } },
+    { "for-range: descending (i--) is correct",
+      { "var s = 0; for (var i = 10; i >= 0; i--) { s += i; }",
+        "assert(s == 55);" } },
+    { "for-range: step (i += k / i -= k)",
+      { "var s = 0; for (var i = 0; i < 10; i += 2) { s += i; }",
+        "assert(s == 20);",                              /* 0+2+4+6+8 */
+        "var t = 0; for (var i = 9; i >= 0; i -= 3) { t += i; }",
+        "assert(t == 18);" } },                          /* 9+6+3+0 */
+    { "for-range: break stops the loop",
+      { "var a = 0;",
+        "for (var i = 0; i < 100; i++) { if (i == 5) { break; } a += i; }",
+        "assert(a == 10);" } },
+    { "for-range: continue still runs the step",
+      { "var b = 0;",
+        "for (var i = 0; i < 10; i++) {"
+        " if (i % 2 == 1) { continue; } b += i; }",
+        "assert(b == 20);" } },
+    { "for-range: return out of the loop",
+      { "func f() { for (var i = 0; i < 100; i++) { if (i == 7) { return i; } }"
+        " return -1; }",
+        "assert(f() == 7);" } },
+    { "for-range: a body that reassigns the loop var is respected",
+      { "var s = 0; for (var i = 0; i < 10; i++) { s += i; i += 1; }",
+        "assert(s == 20);" } },                          /* i = 0,2,4,6,8 */
+    { "for-range: nested counted loops",
+      { "var s = 0;",
+        "for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) {"
+        " s += i * j; } }",
+        "assert(s == 9);" } },
+    { "for-range: zero-iteration loops",
+      { "var s = 0; for (var i = 5; i < 5; i++) { s += 1; } assert(s == 0);",
+        "for (var i = 0; i >= 5; i--) { s += 1; } assert(s == 0);" } },
+    { "for-range: bound is an immutable expression, evaluated once",
+      { "var n = 5; var s = 0; for (var i = 0; i < n * 2; i++) { s += 1; }",
+        "assert(s == 10);" } },
+    { "for-range: a body that MUTATES the bound stays correct (general loop)",
+      { "var n = 5; var c = 0;",
+        "for (var i = 0; i < n; i++) { c += 1; if (i == 2) { n = 10; } }",
+        "assert(c == 10);" } },     /* bound re-read each iter -> 10 iters */
+
     /* ---- evaluator (eval.cpp) ---- */
     {
         "string escape sequences (\\t \\v \\a \\b and unknown)",
@@ -8058,6 +8102,16 @@ static const std::vector<repl_test> repl_tests =
 
     { ":show of an expression renders its optimized (folded) form",
       { { ":show 2 + 3 * 4", "14" } } },
+
+    /* a counted for-loop specializes to a ForRangeStmt (shown "counted") */
+    { ":show shows a counted for-loop specialized (ForRangeStmt)",
+      { { "func cf(int n) { var s = 0; for (var i = 0; i < n; i++) {"
+          " s += i; } return s; }", "" },
+        { ":show cf", "counted" } } },
+    { ":show: a loop whose bound is mutated is NOT specialized",
+      { { "func nf(int n) { var s = 0; for (var i = 0; i < n; i++) {"
+          " s += i; n = n - 1; } return s; }", "" },
+        { ":show nf", "for (" } } },     /* a plain for, no "counted" marker */
 
     /* cross-input inlining: a pure function from an EARLIER input is inlined +
      * folded into a function defined in a LATER one (caller$0 from a prior

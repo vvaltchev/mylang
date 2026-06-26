@@ -131,6 +131,11 @@ public:
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
     void collect_arrays(AnalysisInfo &out); /* -a: array storage colors */
 
+    /* Complete child-visitor (no `this`, hence static) - also used by the
+     * for-range specialization in the static specialize() path. */
+    static void for_each_child(Construct *n,
+                               const std::function<void(Construct *)> &fn);
+
     /* REPL :globals/:type - the inferred static type string of a committed
      * global (or "" if it is not a committed inferred symbol). */
     std::string global_type_str(const UniqueId *name);
@@ -212,8 +217,6 @@ private:
     static TypeSym *lookup(Scope *s, const UniqueId *name);
     FuncInfo *callee_funcinfo(Construct *e);   /* named func or inline lambda */
     static bool is_builtin(const UniqueId *name);
-    void for_each_child(Construct *n,
-                        const std::function<void(Construct *)> &fn);
     static bool always_exits(const Construct *n);
 
     /* structural pass */
@@ -440,6 +443,11 @@ void Inferencer::for_each_child(Construct *n,
     if (auto *f = dynamic_cast<ForStmt *>(n)) {
         fn(f->init.get()); fn(f->cond.get());
         fn(f->inc.get()); fn(f->body.get());
+        return;
+    }
+    if (auto *fr = dynamic_cast<ForRangeStmt *>(n)) {
+        fn(fr->init.get()); fn(fr->bound.get());
+        fn(fr->step.get()); fn(fr->body.get());
         return;
     }
     if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
@@ -3580,10 +3588,172 @@ static void specialize_children(Construct *n)
     }
 }
 
+/* ---------------- for-range loop specialization (ForRangeStmt) ----------- */
+
+/*
+ * Collect every identifier DIRECTLY reassigned (= += ++ --) anywhere in `c`,
+ * NOT descending into a nested function (its writes are to its own locals /
+ * captured copies, which cannot alias the caller's slots). Reuses the complete
+ * for_each_child so no mutating node is ever missed - the proof of a loop
+ * bound/step's immutability depends on this being exhaustive.
+ */
+static void fr_collect_mutated(Construct *c,
+                               std::unordered_set<const UniqueId *> &out)
+{
+    if (!c || dynamic_cast<FuncDeclStmt *>(c))
+        return;
+    if (auto *e = dynamic_cast<Expr14 *>(c)) {
+        if (!(e->fl & pFlags::pInDecl)) {
+            if (auto *id = dynamic_cast<Identifier *>(e->lvalue.get()))
+                out.insert(id->uid);
+            else if (auto *il = dynamic_cast<IdList *>(e->lvalue.get()))
+                for (auto &p : il->elems)
+                    out.insert(p->uid);
+        }
+    } else if (auto *idc = dynamic_cast<IncDecExpr *>(c)) {
+        if (auto *id = dynamic_cast<Identifier *>(idc->lvalue.get()))
+            out.insert(id->uid);
+    }
+    Inferencer::for_each_child(c,
+        [&](Construct *ch) { fr_collect_mutated(ch, out); });
+}
+
+/*
+ * True if `e` is a side-effect-free INT expression whose value cannot change
+ * across the loop: a literal int, a SLOTTED-LOCAL identifier (not the loop var,
+ * not mutated in the body - a local scalar can only be changed by a direct
+ * assignment, which `mutated` captures), or an arith/bitwise/unary chain of
+ * those. A call / subscript / member / assignment / comparison is rejected
+ * (it could read mutable state, have a side effect, or not be int).
+ */
+static bool fr_immutable(const Construct *e,
+                         const std::unordered_set<const UniqueId *> &mutated,
+                         const UniqueId *i_uid)
+{
+    if (!e)
+        return false;
+    if (dynamic_cast<const LiteralInt *>(e))
+        return true;
+    if (auto *id = dynamic_cast<const Identifier *>(e))
+        return id->sym.kind == SymKind::local && id->uid != i_uid &&
+               mutated.find(id->uid) == mutated.end();
+    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(e))  /* Expr01 */
+        return fr_immutable(sc->elem.get(), mutated, i_uid);
+    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
+        /* arith (Expr02/03/04) + bitwise (Expr05/08/09/10) only - not a
+         * comparison/logical (bool result, not an int bound). */
+        if (dynamic_cast<const Expr06 *>(e) || dynamic_cast<const Expr07 *>(e) ||
+            dynamic_cast<const Expr11 *>(e) || dynamic_cast<const Expr12 *>(e))
+            return false;
+        for (auto &p : mo->elems)
+            if (!fr_immutable(p.second.get(), mutated, i_uid))
+                return false;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * If `n` is one of the two specializable counted-`for` forms, return an
+ * equivalent ForRangeStmt (its kept sub-trees specialized); else return `n`
+ * unchanged. Matched on the RAW for (before its cond/inc are specialized), so
+ * the pattern is a plain Expr06 / Expr14 / IncDecExpr.
+ */
+static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
+{
+    auto *f = dynamic_cast<ForStmt *>(n.get());
+    if (!f || !f->init || !f->cond || !f->inc || !f->body)
+        return n;
+
+    /* init: `var i = start`, with i a slotted-local int */
+    auto *init = dynamic_cast<Expr14 *>(f->init.get());
+    if (!init || !(init->fl & pFlags::pInDecl) || init->op != Op::assign)
+        return n;
+    auto *ivar = dynamic_cast<Identifier *>(init->lvalue.get());
+    if (!ivar || ivar->sym.kind != SymKind::local || ivar->th != TypeHint::i)
+        return n;
+    const UniqueId *i_uid = ivar->uid;
+    const int i_slot = ivar->sym.slot;
+
+    /* cond: `i < bound` (asc) or `i >= bound` (desc), bound int */
+    auto *cond = dynamic_cast<Expr06 *>(f->cond.get());
+    if (!cond || cond->elems.size() != 2)
+        return n;
+    auto *cleft = dynamic_cast<Identifier *>(cond->elems[0].second.get());
+    if (!cleft || cleft->uid != i_uid)
+        return n;
+    bool cmp_lt;
+    if (cond->elems[1].first == Op::lt)       cmp_lt = true;
+    else if (cond->elems[1].first == Op::ge)  cmp_lt = false;
+    else return n;
+    Construct *bound = cond->elems[1].second.get();
+    if (bound->th != TypeHint::i)
+        return n;
+
+    /* inc: `i += step` / `i++` (asc) or `i -= step` / `i--` (desc) */
+    bool inc_asc;
+    Expr14 *inc14 = dynamic_cast<Expr14 *>(f->inc.get());
+    Construct *step = nullptr;
+    if (auto *idc = dynamic_cast<IncDecExpr *>(f->inc.get())) {
+        auto *iid = dynamic_cast<Identifier *>(idc->lvalue.get());
+        if (!iid || iid->uid != i_uid)
+            return n;
+        inc_asc = idc->is_inc;
+    } else if (inc14) {
+        if (inc14->fl & pFlags::pInDecl)
+            return n;
+        auto *iid = dynamic_cast<Identifier *>(inc14->lvalue.get());
+        if (!iid || iid->uid != i_uid)
+            return n;
+        if (inc14->op == Op::addeq)       inc_asc = true;
+        else if (inc14->op == Op::subeq)  inc_asc = false;
+        else return n;
+        step = inc14->rvalue.get();
+        if (step->th != TypeHint::i)
+            return n;
+    } else {
+        return n;
+    }
+
+    /* the comparison direction must match the step direction - exactly the two
+     * forms requested (`<` with `+`, `>=` with `-`). */
+    if (cmp_lt != inc_asc)
+        return n;
+
+    /* bound and step must be loop-immutable */
+    std::unordered_set<const UniqueId *> mutated;
+    fr_collect_mutated(f->body.get(), mutated);
+    if (!fr_immutable(bound, mutated, i_uid))
+        return n;
+    if (step && !fr_immutable(step, mutated, i_uid))
+        return n;
+
+    /* Build the ForRangeStmt; specialize the kept sub-trees (the body is the
+     * hot part - M8 still applies inside it). */
+    auto fr = make_unique<ForRangeStmt>();
+    fr->start = f->start;
+    fr->end = f->end;
+    fr->i_slot = i_slot;
+    fr->cmp_lt = cmp_lt;
+    fr->bound = specialize(std::move(cond->elems[1].second));
+    if (step)
+        fr->step = specialize(std::move(inc14->rvalue));
+    fr->init = specialize(std::move(f->init));
+    fr->body = specialize(std::move(f->body));
+    return fr;
+}
+
 static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
 {
     if (!n)
         return n;
+    /* a counted for-loop -> ForRangeStmt (matched on the raw form, BEFORE its
+     * cond/inc are specialized away). */
+    if (dynamic_cast<ForStmt *>(n.get())) {
+        n = try_for_range(std::move(n));
+        if (dynamic_cast<ForRangeStmt *>(n.get()))
+            return n;     /* matched: sub-trees already specialized */
+    }
     specialize_children(n.get());     /* bottom-up: children first */
     return try_specialize(std::move(n));
 }
