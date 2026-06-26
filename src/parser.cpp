@@ -73,8 +73,12 @@ unique_ptr<Construct> pExpr01(ParseContext &c, unsigned fl); // ops: ()
 unique_ptr<Construct> pExpr02(ParseContext &c, unsigned fl); // ops: + (unary), - (unary), !
 unique_ptr<Construct> pExpr03(ParseContext &c, unsigned fl); // ops: *, /
 unique_ptr<Construct> pExpr04(ParseContext &c, unsigned fl); // ops: +, -
+unique_ptr<Construct> pExpr05(ParseContext &c, unsigned fl); // ops: <<, >>, >>>
 unique_ptr<Construct> pExpr06(ParseContext &c, unsigned fl); // ops: <, >, <=, >=
 unique_ptr<Construct> pExpr07(ParseContext &c, unsigned fl); // ops: ==, !=
+unique_ptr<Construct> pExpr08(ParseContext &c, unsigned fl); // ops: & (bitwise)
+unique_ptr<Construct> pExpr09(ParseContext &c, unsigned fl); // ops: ^ (bitwise)
+unique_ptr<Construct> pExpr10(ParseContext &c, unsigned fl); // ops: | (bitwise)
 unique_ptr<Construct> pExpr11(ParseContext &c, unsigned fl); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c, unsigned fl); // ops: ||
 unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl); // ops: = (assignment)
@@ -1071,7 +1075,10 @@ pExpr02(ParseContext &c, unsigned fl)
         return id;
     }
 
-    Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::lnot});
+    /* `~` (Op::bnot) is bitwise NOT here; in a PARAM position it is the `dyn`
+     * alias, but that is handled in pFuncParam before any expression is parsed,
+     * so the two uses never collide. */
+    Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::lnot, Op::bnot});
 
     if (op != Op::invalid) {
 
@@ -1119,11 +1126,20 @@ pExpr04(ParseContext &c, unsigned fl)
     );
 }
 
+/* shift `<< >> >>>` : between additive and the comparisons (C precedence). */
+unique_ptr<Construct>
+pExpr05(ParseContext &c, unsigned fl)
+{
+    return pExprGeneric<Expr05>(
+        c, pExpr04, {Op::shl, Op::shr, Op::ushr}, fl
+    );
+}
+
 unique_ptr<Construct>
 pExpr06(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr06>(
-        c, pExpr04, {Op::lt, Op::gt, Op::le, Op::ge}, fl
+        c, pExpr05, {Op::lt, Op::gt, Op::le, Op::ge}, fl
     );
 }
 
@@ -1135,11 +1151,36 @@ pExpr07(ParseContext &c, unsigned fl)
     );
 }
 
+/* bitwise `&`, then `^`, then `|` : between equality and `&&` (C precedence). */
+unique_ptr<Construct>
+pExpr08(ParseContext &c, unsigned fl)
+{
+    return pExprGeneric<Expr08>(
+        c, pExpr07, {Op::band}, fl
+    );
+}
+
+unique_ptr<Construct>
+pExpr09(ParseContext &c, unsigned fl)
+{
+    return pExprGeneric<Expr09>(
+        c, pExpr08, {Op::bxor}, fl
+    );
+}
+
+unique_ptr<Construct>
+pExpr10(ParseContext &c, unsigned fl)
+{
+    return pExprGeneric<Expr10>(
+        c, pExpr09, {Op::bor}, fl
+    );
+}
+
 unique_ptr<Construct>
 pExpr11(ParseContext &c, unsigned fl)
 {
     return pExprGeneric<Expr11>(
-        c, pExpr07, {Op::land}, fl
+        c, pExpr10, {Op::land}, fl
     );
 }
 

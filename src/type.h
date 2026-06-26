@@ -88,6 +88,34 @@ public:
         throw TypeErrorEx("The object does NOT support operator %");
     }
 
+    virtual void band(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator &");
+    }
+
+    virtual void bor(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator |");
+    }
+
+    virtual void bxor(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator ^");
+    }
+
+    virtual void shl(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator <<");
+    }
+
+    virtual void shr(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator >>");
+    }
+
+    virtual void ushr(EvalValueT &a, const EvalValueT &b) {
+        throw TypeErrorEx("The object does NOT support operator >>>");
+    }
+
+    virtual void bnot(EvalValueT &a) {
+        throw TypeErrorEx("The object does NOT support unary operator ~");
+    }
+
     virtual void lt(EvalValueT &a, const EvalValueT &b) {
         throw TypeErrorEx("The object does NOT support operator <");
     }

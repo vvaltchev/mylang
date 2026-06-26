@@ -222,18 +222,19 @@ lexer_ctx::handle_space_or_op()
             }
         }
 
-        if (is_operator(in_str.substr(i, 2))) {
+        /*
+         * Maximal-munch: try a 3-char operator (`>>>`) first, then 2-char.
+         * Note: each requires its shorter prefixes to exist as operators too
+         * (`>>>` needs `>>` and `>`, `<=` needs `<`), because the 1-char `op`
+         * default above is what bootstraps the scan.
+         */
+        if (i + 2 < in_str.length() && is_operator(in_str.substr(i, 3))) {
 
-            /*
-            * Handle two-chars wide operators. Note: it is required,
-            * with the current implementation, an 1-char prefix operator to
-            * exist for each one of them. For example:
-            *
-            *      <= requires '<' to exist independently
-            *      += requires '+' to exist independently
-            *
-            * Reason: the check `is_operator(string_view(&c, 1))` above.
-            */
+            op = in_str.substr(i, 3);
+            i += 2;
+
+        } else if (is_operator(in_str.substr(i, 2))) {
+
             op = in_str.substr(i, 2);
             i++;
         }

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "eval.h"
+#include "bitops.h"
 #include "evaltypes.cpp.h"
 #include "types/int.cpp.h"
 #include "types/bool.cpp.h"

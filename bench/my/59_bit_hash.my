@@ -1,0 +1,16 @@
+# A 32-bit FNV-style hash mixed over a range: xor, multiply, rotate. Exercises
+# ^, *, <<, >>> and the bit-masking that keeps it within 32 bits - all on the
+# M8-specialized unboxed-int path in a tight loop.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 8000000 * scale;
+var MASK = (1 << 32) - 1;
+var h = 2166136261;                          # FNV-1a 32-bit offset basis
+for (var i = 0; i < N; i++) {
+    h = (h ^ i) & MASK;
+    h = (h * 16777619) & MASK;               # FNV prime
+    h = ((h << 13) | (h >>> 19)) & MASK;     # rotate-left 13 within 32 bits
+}
+print("result:", h);
