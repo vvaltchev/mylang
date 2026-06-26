@@ -1503,8 +1503,36 @@ are unchanged.
   `plans/typed-arrays.md` (approach B) and
   `plans/type-driven-specialization.md`.
 - **`DictObject`** (`shareddict.h`): the value handle is
-  `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map lives
-  inside it.
+  `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map is a
+  **`std::unordered_map<EvalValue, LValue>`** inside it — an O(1) hashmap (NOT a
+  sorted tree), keyed by `std::hash<EvalValue>` (→ `EvalValue::hash()` →
+  `Type::hash`) and `EvalValue::operator==`.
+- **Universal `hash()` (deep, by value).** `Type::hash` returns `size_t`; the
+  base throws, the leaves (`int`/`bool`/`float`/`str`) hash directly, and
+  `none` + the containers/structs hash deeply (`hashing.h` combiners,
+  `#include`d into `types.cpp`): **`hash_combine`** (a SplitMix64-avalanche
+  fold, order-DEPENDENT) for sequences — `TypeArr::hash` over `arr_elem_at`
+  elements,
+  `TypeStruct::hash` over fields in declaration order (salted with the def
+  pointer so distinct struct types differ; field-wise via `pod_get`, consistent
+  with `eq` for POD and boxed) — and **`hash_unordered`** (a commutative
+  SplitMix64-avalanche sum, NOT a weak xor) for `TypeDict::hash`, so two equal
+  dicts hash equal regardless of insertion order. `hash(none)` is a constant
+  (`none` is now hashable — a deliberate spec change from the old throw). The
+  scalar `hash()` builtin (`builtins/generic.cpp.h`) is unchanged and folds at
+  compile time. **String hashes are cached** on `StrObj`
+  (`mutable hash_cache`/`hash_valid`, computed lazily — strings are immutable),
+  so repeated string-key probes don't recompute; a *slice* hashes its sub-view
+  on demand. No cycle guard (matches `==`/`to_string`).
+- **Any-type dict keys, frozen on insert.** Because `hash` is total, an array/
+  dict/struct/`none` can be a key. A key would corrupt the map if mutated after
+  insertion (its hash would change, leaving it in the wrong bucket — COW does
+  NOT protect a stored key), so every insert site (`TypeDict::subscript`'s two
+  `emplace`s, `LiteralDict::do_eval`, `builtin_dict`-from-pairs) stores
+  **`make_const_clone(key)`** — a deep read-only freeze. Scalars/strings are
+  returned as-is (cheap); only a container key pays a one-time clone.
+  `MemberExpr` keys are interned strings (already immutable), so they need no
+  freeze. See `plans/hash-and-dict.md`.
 - **Deep-const read-only flag.** Both `SharedObject` (arrays) and `DictObject`
   carry a `readonly` bool (`is_readonly()`/`set_readonly()`). It backs `const`
   values: `make_const_clone()` (`eval.cpp`) sets it on every array/dict in the
@@ -1670,8 +1698,9 @@ but the per-element `StructObject` allocation is gone (build overhead
 - **Value semantics**: COW like arrays/dicts (`StructObject::readonly` backs a
   deep `const`; plain assignment aliases; `clone()` shallow, `deepclone()`
   deep). `==`
-  is structural between same-`def` instances (`TypeStruct::eq`); `hash` throws
-  (not hashable, v1). **Deferred** (plans/structs.md): `var` fields (call-site
+  is structural between same-`def` instances (`TypeStruct::eq`); `hash`
+  combines the field hashes (see *Universal `hash()`* above), so a struct can be
+  a dict key. **Deferred** (plans/structs.md): `var` fields (call-site
   field inference), `opt` scalar fields, methods, and empty structs.
 
 ## Error model
@@ -2193,6 +2222,21 @@ omitting it is a compile error.
 - No third-party dependencies, ever — that's a hard design constraint of the
   project, including for the
   test harness. Don't introduce one.
+- **No arbitrary copy-paste from other open-source projects.** Code must be
+  **original**. Do NOT paste a snippet from a copyrighted project even when its
+  license is permissive; a comment labeling code as `"<project>-style"` is
+  itself a red flag that it was copied. If a piece of logic is genuinely needed
+  from elsewhere, two acceptable routes: **(a)** reimplement it from scratch (a
+  short algorithm — a hash mix, a formula — is best rewritten originally, or
+  taken from a clearly **public-domain / CC0** reference such as SplitMix64;
+  mathematical constants like 2^64/phi or a hash prime are facts, not
+  copyrightable); or **(b)** bring the upstream code in *deliberately and
+  legally*: first confirm its license is **compatible with our BSD-2-Clause**
+  (MIT/BSD/ISC/Apache-2.0/BSL-1.0/public-domain are), then add a **`NOTICE`**
+  file at the repo root naming the project, pasting its **full license text**,
+  and stating **which file(s)** use it, and attribute it at the use site.
+  **Evaluate (b) with the maintainer before doing it** — it is the exception,
+  not the default; prefer (a).
 - When implementation behavior and the README disagree, treat it as a bug to
   surface, not a silent
   choice to make — the README is the spec.

@@ -2,6 +2,7 @@
 
 #include "eval.h"
 #include "bitops.h"
+#include "hashing.h"
 #include "evaltypes.cpp.h"
 #include "types/int.cpp.h"
 #include "types/bool.cpp.h"

@@ -614,14 +614,18 @@ runtime instead.
     copies while, under the hood, they use copy-on-write techniques.
 
   * **Dictionary**
-    Dictionaries are hash-maps defined using `Python`'s syntax: `{"a": 3}`.
-    Elements are accessed with `d["key-string"]` or `d[23]`, looked-up with
-    `get()`/`get!()`/`find()`, and deleted with `erase()`. Only strings, ints,
-    and floats can be keys. **Perks**: identifier-like string-keys can be
-    accessed with the "member of" syntax: `d.key`. A read of a *missing* key
-    (`d[k]`/`d.key`) raises `KeyNotFoundEx` — non-`opt` access (a value or an
-    exception, never `none`); use `get()` for a nullable lookup, or
-    `dict(default)` for a default value. A write (`d[k] = v`) inserts the key.
+    Dictionaries are hash-maps (O(1) lookup) defined using `Python`'s syntax:
+    `{"a": 3}`. Elements are accessed with `d["key-string"]` or `d[23]`,
+    looked-up with `get()`/`get!()`/`find()`, and deleted with `erase()`. **Any
+    hashable value can be a key** — strings, ints, floats, `bool`, `none`, and
+    (by value) arrays, dicts and structs (e.g. `d[[1,2]]`, `d[Point(1,2)]`),
+    since `hash()` is total. A container key is **frozen** (snapshotted deeply
+    read-only) when inserted, so mutating the original afterwards cannot corrupt
+    the dict. **Perks**: identifier-like string-keys can be accessed with the
+    "member of" syntax: `d.key`. A read of a *missing* key (`d[k]`/`d.key`)
+    raises `KeyNotFoundEx` — non-`opt` access (a value or an exception, never
+    `none`); use `get()` for a nullable lookup, or `dict(default)` for a default
+    value. A write (`d[k] = v`) inserts the key.
 
   * **Function**
     Both standalone functions and lambdas have the same object type and can be passed
@@ -1454,7 +1458,8 @@ arrays/dicts: plain assignment **aliases** (`var q = p; p.x = 9` makes `q.x` 9
 too, like Python objects), while `clone()` makes an independent (shallow) copy
 and `deepclone()` a deep one. `==` is structural and field-wise between
 **same-type** instances (different struct types are never equal); structs are
-not hashable (cannot be dict keys) in v1. `print(p)` shows `Point(x: 1, y: 2)`.
+**hashable** (`hash()` combines the field hashes, so a struct can be a dict key).
+`print(p)` shows `Point(x: 1, y: 2)`.
 
 **`const` works fully.** A struct holds state only in instances, not in the
 type, so `const P = Point(1, 2)` is computed at compile time and is **deep
@@ -1615,9 +1620,15 @@ Return the name of the type of the given value in string-form (e.g. `"int"`,
 `"bool"`, `"str"`, `"arr"`). Useful for debugging.
 
 #### `hash(value)`
-Return the hash value used by dictionaries internally when `value` is used
-as a key. At the moment, only booleans, integers, floats and strings support
-`hash()` (a `bool` hashes as the equal int `0`/`1`).
+Return the integer hash used by dictionaries internally when `value` is a key.
+It works on **any** value — `bool`/`int`/`float`/`str`/`none` and, **deeply
+and by value**, `array`/`dict`/`struct`. Equal values hash equal: `true`/`1`,
+`1`/`1.0`, two arrays with the same elements, two dicts with the same pairs (in
+any insertion order, since a dict is unordered), two structs of the same type
+with the same fields. The array/struct hash is **order-dependent** (`[1,2]` ≠
+`[2,1]`), the dict hash is **order-independent**. A string's hash is computed
+once and cached (strings are immutable). Because `hash()` is total, **any value
+can be a dictionary key** (see *Dictionaries*).
 
 ### Array builtins
 

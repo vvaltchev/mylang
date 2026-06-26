@@ -221,10 +221,12 @@ builtin_dict(EvalContext *ctx, ExprList *exprList)
 
         /*
          * insert_or_assign (not emplace) so that on a duplicate key the
-         * later [key, value] pair wins, matching Python's dict().
+         * later [key, value] pair wins, matching Python's dict(). The key is
+         * frozen (see TypeDict::subscript) so a mutable container key can't be
+         * mutated later and corrupt the dict.
          */
         data.insert_or_assign(
-            arr_elem_at(pair, 0),
+            make_const_clone(arr_elem_at(pair, 0)),
             LValue(arr_elem_at(pair, 1), false)
         );
     }

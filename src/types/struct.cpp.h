@@ -62,6 +62,7 @@ public:
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
+    size_t hash(const EvalValue &a) override;
     bool is_true(const EvalValue &a) override { return true; }
     string to_string(const EvalValue &a) override;
     EvalValue clone(const EvalValue &a) override;
@@ -108,6 +109,30 @@ void TypeStruct::noteq(EvalValue &a, const EvalValue &b)
     const bool e = struct_equal(*a.get<intrusive_ptr<StructObject>>().get(),
                                 *b.get<intrusive_ptr<StructObject>>().get());
     a = !e;
+}
+
+/*
+ * Deep hash of a struct: combine the field hashes in declaration order (a
+ * struct is a fixed sequence of fields), salted with the struct's def identity
+ * so two different struct types with equal field values hash differently -
+ * matching eq(), which only compares instances of the SAME def. Field-wise
+ * (via pod_get / fields[i]) keeps it consistent with eq for both POD (a==b ⇒
+ * equal field values ⇒ equal hash) and boxed instances, and avoids hashing
+ * POD padding bytes.
+ */
+size_t TypeStruct::hash(const EvalValue &a)
+{
+    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructTypeDef &def = *o.def;
+
+    size_t seed = hash_salt_struct;
+    hash_combine(seed, std::hash<const void *>()(o.def));
+
+    for (size_t i = 0; i < def.fields.size(); i++)
+        hash_combine(seed, (o.is_pod() ? o.pod_get(static_cast<int>(i))
+                                       : o.fields[i].get()).hash());
+
+    return seed;
 }
 
 string TypeStruct::to_string(const EvalValue &a)

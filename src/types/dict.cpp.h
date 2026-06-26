@@ -21,6 +21,7 @@ public:
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
+    size_t hash(const EvalValue &a) override;
     EvalValue subscript(const EvalValue &w, const EvalValue &i,
                         bool for_write = false) override;
 
@@ -69,6 +70,29 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
     a = dataA != dataB;
 }
 
+/*
+ * Deep, ORDER-INDEPENDENT hash of a dict. A dict is unordered, so two equal
+ * dicts (same pairs, any insertion order) MUST hash equal. Each (k, v) pair is
+ * hashed with the order-dependent combine (k before v), then the pair hashes
+ * are accumulated commutatively (hash_unordered) so the dict's iteration order
+ * does not matter.
+ */
+size_t TypeDict::hash(const EvalValue &a)
+{
+    const DictObject::inner_type &data
+        = a.get<intrusive_ptr<DictObject>>()->get_ref();
+    size_t acc = hash_salt_dict;
+
+    for (const auto &[k, v] : data) {
+        size_t pair = hash_salt_dict;
+        hash_combine(pair, k.hash());
+        hash_combine(pair, v.get().hash());
+        hash_unordered(acc, pair);
+    }
+
+    return acc;
+}
+
 EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
                               bool for_write)
 {
@@ -106,12 +130,24 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * `d.k` never yields none - it is a value or an exception). `get()` is the
      * explicit nullable lookup.
      */
-    if (obj.get_has_default())
-        return &(*data.emplace(key, LValue(obj.get_default(), false))
-                      .first).second;
+    /*
+     * Insert. The key is FROZEN (deep read-only via make_const_clone) before
+     * being stored, so a later mutation of the original value cannot change the
+     * stored key's value - which would change its hash and corrupt the map
+     * (the entry would sit in the wrong bucket). A scalar/string key is
+     * immutable already, so make_const_clone returns it as-is (cheap).
+     */
+    if (obj.get_has_default()) {
+        EvalValue fk = make_const_clone(key);
+        return &(*data.emplace(std::move(fk),
+                     LValue(obj.get_default(), false)).first).second;
+    }
 
-    if (for_write)
-        return &(*data.emplace(key, LValue(none, false)).first).second;
+    if (for_write) {
+        EvalValue fk = make_const_clone(key);
+        return &(*data.emplace(std::move(fk),
+                     LValue(none, false)).first).second;
+    }
 
     throw KeyNotFoundEx();
 }

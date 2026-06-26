@@ -3220,8 +3220,10 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
 
     for (const auto &e : elems) {
 
+        /* freeze the key (see TypeDict::subscript) so a mutable container key
+         * cannot be mutated later and corrupt the dict. */
         data.emplace(
-            RValue(e->key->eval(ctx)),
+            make_const_clone(RValue(e->key->eval(ctx))),
             LValue(RValue(e->value->eval(ctx)), ctx->const_ctx)
         );
     }

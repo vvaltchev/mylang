@@ -260,5 +260,8 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
 
 size_t TypeStr::hash(const EvalValue &a)
 {
-    return std::hash<string_view>()(a.get<SharedStr>().get_view());
+    /* SharedStr caches the full-string hash on its shared object (strings are
+     * immutable), so repeated dict probes with the same string key don't
+     * recompute it. */
+    return a.get<SharedStr>().hash();
 }

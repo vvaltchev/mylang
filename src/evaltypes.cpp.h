@@ -68,6 +68,10 @@ public:
     void noteq(EvalValue &a, const EvalValue &b) override {
         a = !b.is<NoneVal>();
     }
+
+    size_t hash(const EvalValue &a) override {
+        return hash_salt_none;   /* `none` is hashable: a fixed value */
+    }
 };
 
 string_view
