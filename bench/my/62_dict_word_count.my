@@ -1,0 +1,22 @@
+# Word-frequency counting with STRING keys - exercises the hashmap dict and the
+# cached string hash (immutable strings hash once). A default dict makes a
+# missing key read as 0, so the count is a single `+= 1` per word.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+             "a", "an", "and", "of", "to", "in", "is", "it", "that", "was"];
+var nw = len(words);
+var n = 2000000 * scale;
+
+var counts = dict(0);                 # default dict: missing key -> 0
+for (var i = 0; i < n; i++)
+    counts[words[i % nw]] += 1;
+
+# deterministic checksum that depends on the counts and the keys
+var total = 0;
+foreach (var k, v in counts)
+    total += v * len(k);
+
+print("result:", total);

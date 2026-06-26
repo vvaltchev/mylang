@@ -20,6 +20,15 @@ private:
      */
     struct StrObj final : RefCounted {
         inner_type s;
+        /*
+         * Strings are immutable, so their hash never changes - cache it on the
+         * shared object, computed lazily on first use (so a string never used
+         * as a key / hash() arg costs nothing). `mutable` because hash() is
+         * logically const; safe since `s` never changes. Only the FULL-string
+         * hash is cached here; a slice hashes its sub-view on demand.
+         */
+        mutable size_t hash_cache = 0;
+        mutable bool hash_valid = false;
         StrObj(inner_type &&str) : s(move(str)) { }
     };
 
@@ -68,4 +77,20 @@ public:
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }
     size_type size() const { return slice ? len : obj->s.size(); }
+
+    /*
+     * Hash of the string's value. A full (non-slice) string caches it on the
+     * shared StrObj (computed once); a slice hashes its sub-view on demand.
+     */
+    size_t hash() const {
+        if (!slice) {
+            if (!obj->hash_valid) {
+                obj->hash_cache = std::hash<std::string_view>()(
+                    std::string_view(obj->s.data(), obj->s.size()));
+                obj->hash_valid = true;
+            }
+            return obj->hash_cache;
+        }
+        return std::hash<std::string_view>()(get_view());
+    }
 };

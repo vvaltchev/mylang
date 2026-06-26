@@ -162,6 +162,7 @@ public:
     void add(EvalValue &a, const EvalValue &b) override;
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
+    size_t hash(const EvalValue &a) override;
     EvalValue subscript(const EvalValue &what, const EvalValue &idx,
                         bool for_write = false) override;
     EvalValue slice(const EvalValue &what,
@@ -428,6 +429,24 @@ void TypeArr::noteq(EvalValue &a, const EvalValue &b)
 {
     eq(a, b);
     a = !a.is_true();   /* eq() yields a bool; negate it (stays bool) */
+}
+
+/*
+ * Deep, ORDER-dependent hash of an array: combine the element hashes in order
+ * (an array is a sequence, so `[1,2]` and `[2,1]` differ). `arr_elem_at` boxes
+ * a flat int/float/bool/struct element, so this works for every storage kind
+ * and reuses the per-element hashes (`1 == 1.0` share a hash, as in eq).
+ */
+size_t TypeArr::hash(const EvalValue &a)
+{
+    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const size_type n = arr.size();
+    size_t seed = hash_salt_array;
+
+    for (size_type i = 0; i < n; i++)
+        hash_combine(seed, arr_elem_at(arr, i).hash());
+
+    return seed;
 }
 
 string TypeArr::to_string(const EvalValue &a)
