@@ -78,7 +78,9 @@ enum class DeclType : unsigned char {
  */
 enum class SymKind : unsigned char {
     unresolved,
-    local,
+    local,      /* slot in the CURRENT call's Frame (ctx->frame) */
+    global,     /* slot in the root "main" Frame (ctx->global_frame) - a
+                 * top-level function/symbol, reachable from any call depth */
 };
 
 struct ResolvedSym {
@@ -998,6 +1000,15 @@ public:
     int slot_count = 0;
 
     /*
+     * Root block only: the interned names of the top-level functions hoisted to
+     * GLOBAL-table slots, indexed by slot (the resolver fills it).
+     * Block::do_eval sizes the program's GlobalFuncTable from it; the names let
+     * globals() / reflection enumerate the (otherwise index-keyed) table. Empty
+     * elsewhere.
+     */
+    std::vector<const UniqueId *> global_func_names;
+
+    /*
      * Set by the resolver when every declaration in this block is a frame slot
      * (no map-bound decl: no capture, no nested-func name, no slot-budget
      * overflow). Such a block never touches the EvalContext map, so do_eval can
@@ -1016,6 +1027,7 @@ public:
         clone_elems_into(*c);
         c->slot_start = slot_start;
         c->slot_count = slot_count;
+        c->global_func_names = global_func_names;
         c->scope_free = scope_free;
         return c;
     }
