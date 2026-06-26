@@ -353,6 +353,11 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
     } else if (container_val.is<SharedArrayObj>()) {
 
         FuncObject *key = nullptr;
+        /* Hold the key function's handle for the whole find: an inline lambda
+         * has no other owner, so without this its FuncObject would be freed
+         * when the temporary `keyval` below goes out of scope, leaving `key`
+         * dangling (a use-after-free when find_arr calls it). */
+        shared_ptr<FuncObject> key_holder;
 
         if (exprList->elems.size() == 3) {
 
@@ -362,7 +367,8 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
             if (!keyval.is<shared_ptr<FuncObject>>())
                 throw TypeErrorEx("Expected function object", arg2->start, arg2->end);
 
-            key = keyval.get<shared_ptr<FuncObject>>().get();
+            key_holder = keyval.get<shared_ptr<FuncObject>>();
+            key = key_holder.get();
         }
 
         return builtin_find_arr(container_val.get<SharedArrayObj>(), elem_val, key, ctx);
