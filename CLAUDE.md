@@ -992,18 +992,26 @@ wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
 
 **Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
 (via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),
-the two hottest loop shapes are rewritten to a dedicated `ForRangeStmt`
-(`syntax.h`):
-`for (var i = start; i < bound; i += step)` and
-`for (var i = start; i >= bound; i -= step)` — matched when `i` is a resolved
-**int slot** (`sym.kind == local`, `th == i`), the comparison/step directions
-agree (`<` with `+`, `>=` with `-`), and `bound`/`step` are **loop-immutable**:
-a side-effect-free int expr (literal / slotted-local id / arith/bitwise chain —
-no call/subscript/member/assignment) whose identifiers are not the loop var and
-are not reassigned anywhere in the body (`fr_collect_mutated`, which reuses the
-complete `Inferencer::for_each_child` so no write is missed; a local scalar can
-only change via a direct assignment, and a callee can't reach the caller's
-locals, so this is sound even with calls in the body). `ForRangeStmt::do_eval`
+the four hottest loop shapes are rewritten to a dedicated `ForRangeStmt`
+(`syntax.h`): `for (var i = start; i </<= bound; i += step)` and
+`for (var i = start; i >=/> bound; i -= step)` (the comparison `Op` is kept in
+`cmp_op`) — matched when `i` is a resolved **int slot** (`sym.kind == local`,
+`th == i`), the comparison/step directions agree (`<`/`<=` with `+`, `>=`/`>`
+with `-`), and `bound`/`step` are **loop-immutable** (`fr_immutable`): a
+side-effect-free **int** expr built from literals, slotted-local ids,
+arith/bitwise chains, subscript/member READs, and **pure (const-builtin) calls
+with immutable args — so `len(arr)` qualifies.** Immutability is proven against
+two sets from `fr_collect_mutated` (which reuses the complete
+`Inferencer::for_each_child` so no write is missed): **`mut_len`** (an id whose
+value/length/identity may change — a direct reassign/`++`, or a *non*-const
+call passed the container, since a mylang array/dict/struct is a reference an
+impure callee can `append`/mutate) and **`mut_content`** (additionally an
+`arr[i] =`/`obj.f =` element write). A bare id / `len(arr)` arg needs
+length-stability (`∉ mut_len`) — so the common fill `for(i;i<len(a);i++) a[i]=…`
+still specializes (an element write doesn't change the length); a subscript READ
+`arr[k]` additionally needs `∉ mut_content`. Sound even with calls in the body:
+a callee can't reach the caller's *scalar* locals, and a *const* builtin (the
+only call allowed in the bound) has no side effects. `ForRangeStmt::do_eval`
 evaluates `bound`/`step` **once** (cached as raw `int_type`), then the
 per-iteration condition test and increment are plain C on the slot's
 `int_type` — no expression eval, no `num_bin_op`, no `TypedScalarExpr` dispatch
@@ -1016,8 +1024,8 @@ inliner's substitution / tail re-resolution would not remap, so the inliner's
 cross-input registration **skips** a prior function containing one
 (`has_for_range`) — it still runs correctly as a call. coderender renders it as
 the equivalent `for (...) /* counted */` so `:show`/`-a` make the optimization
-visible. **Not yet specialized:** a `len(arr)`/call bound (excluded as a
-possible side effect / mutable read), `<=`/`>` forms, and a float loop var.
+visible. **Not yet specialized:** a non-const (user-pure) function-call bound,
+and a float loop var.
 
 ### Function templates (monomorphization)
 

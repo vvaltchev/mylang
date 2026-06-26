@@ -2091,6 +2091,23 @@ static const std::vector<test> tests =
       { "var n = 5; var c = 0;",
         "for (var i = 0; i < n; i++) { c += 1; if (i == 2) { n = 10; } }",
         "assert(c == 10);" } },     /* bound re-read each iter -> 10 iters */
+    { "for-range: <= and > (inclusive / exclusive) forms",
+      { "var s = 0; for (var i = 0; i <= 5; i++) { s += i; } assert(s == 15);",
+        "var t = 0; for (var i = 5; i > 0; i--) { t += i; }",
+        "assert(t == 15);" } },
+    { "for-range: a len(arr) bound (pure builtin, arr not mutated)",
+      { "var a = [10, 20, 30, 40]; var s = 0;",
+        "for (var i = 0; i < len(a); i++) { s += a[i]; }",
+        "assert(s == 100);" } },
+    { "for-range: a fill `arr[i]=v` with len(arr) bound stays correct",
+      { "var a = [0, 0, 0, 0, 0];",
+        "for (var i = 0; i < len(a); i++) { a[i] = i * i; }",
+        "assert(a[4] == 16 && a[2] == 4);" } },
+    { "for-range: a body that GROWS the array stays correct (general loop)",
+      { "var a = [1, 2, 3]; var c = 0;",
+        "for (var i = 0; i < len(a); i++) { c += 1;"
+        " if (i == 0) { append(a, 9); } }",
+        "assert(c == 4);" } },   /* len re-read: grew to 4 -> 4 iterations */
 
     /* ---- evaluator (eval.cpp) ---- */
     {

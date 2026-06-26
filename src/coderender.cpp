@@ -350,19 +350,20 @@ struct Renderer {
             const Construct *ivar = nullptr;
             if (auto *e14 = dynamic_cast<const Expr14 *>(fr->init.get()))
                 ivar = e14->lvalue.get();
+            const bool asc = (fr->cmp_op == Op::lt || fr->cmp_op == Op::le);
             o << "for (";
             if (fr->init) stmt_oneline(fr->init.get());
             o << "; ";
             if (ivar) expr(ivar, 0);
-            o << (fr->cmp_lt ? " < " : " >= ");
+            o << " " << OpString[(int)fr->cmp_op] << " ";
             expr(fr->bound.get(), 0);
             o << "; ";
             if (ivar) expr(ivar, 0);
             if (fr->step) {
-                o << (fr->cmp_lt ? " += " : " -= ");
+                o << (asc ? " += " : " -= ");
                 expr(fr->step.get(), 0);
             } else {
-                o << (fr->cmp_lt ? "++" : "--");
+                o << (asc ? "++" : "--");
             }
             o << ") /* counted */ ";
             inline_block(fr->body.get(), level);
