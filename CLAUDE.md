@@ -562,7 +562,16 @@ writes mutable global state that may differ at the new site (and its result
 isn't compile-time-known anyway), so it is left a runtime call. Only pure
 *functions* are seeded (never a runtime var); registration skips any name the
 current input defines, so a redefinition wins and a redirected call already
-points at the current input's own instance. **AutoConst folds an
+points at the current input's own instance. **A prior input's body is
+POST-specialization** (it already ran `specialize_types`, so it can hold M8
+`TypedScalarExpr` nodes — which the inliner never sees in a normal single
+compilation, since it runs *before* `specialize_types`). So
+`for_each_child`/`for_each_child_slot` (and `is_foldable_expr`) were taught the
+`TypedScalarExpr` case: substitution descends into it (else a param used twice —
+once outside, once inside a typed `a*2` — is only half-replaced, dangling the
+inner `a`), and a const-operand one refolds to a literal (`4*2`→`8`). Without
+this, `func mk(a)=>[a,a*2]` inlined cross-input crashed with "Undefined 'a'".
+**AutoConst folds an
 EXPRESSION-bodied function's body** (`fold_func_body` handles a bare-expr
 body, not only a `{...}` block — the older `fold_function` skipped the former,
 so a pure call in `func g()=>f(1,2)` never folded).
