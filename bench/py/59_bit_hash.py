@@ -2,7 +2,7 @@
 import sys
 scale = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
-N = 8000000 * scale
+N = 800000 * scale
 MASK = (1 << 32) - 1
 h = 2166136261
 for i in range(N):

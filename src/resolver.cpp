@@ -2697,7 +2697,7 @@ run_optimizers(Construct *root, bool enable_inline, int inline_threshold,
 {
     resolve_names(root, enable_inline, inline_threshold, /*analysis=*/nullptr,
                   repl_mode, prior_scope);
-    specialize_types(root, enable_specialize);
+    specialize_types(root, enable_specialize, prior_scope);
 }
 
 /*

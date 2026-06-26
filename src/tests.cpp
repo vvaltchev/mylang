@@ -2108,6 +2108,15 @@ static const std::vector<test> tests =
         "for (var i = 0; i < len(a); i++) { c += 1;"
         " if (i == 0) { append(a, 9); } }",
         "assert(c == 4);" } },   /* len re-read: grew to 4 -> 4 iterations */
+    { "for-range: a pure user-function bound with a scalar arg",
+      { "func lim(int x) { var t = x * 2; return t; }",
+        "var s = 0; for (var i = 0; i < lim(4); i++) { s += i; }",
+        "assert(s == 28);" } },   /* lim(4) = 8 -> sum 0..7 */
+    { "for-range: a pure func that MUTATES a container bound stays correct",
+      { "func shrink(array a) { a[0] = a[0] - 1; return a[0]; }",
+        "var x = [10, 0, 0]; var c = 0;",
+        "for (var i = 0; i < shrink(x); i++) { c += 1; }",
+        "assert(c == 5);" } },  /* must re-eval (5), not cache shrink(x)=9 */
 
     /* ---- evaluator (eval.cpp) ---- */
     {
@@ -8129,6 +8138,13 @@ static const std::vector<repl_test> repl_tests =
       { { "func nf(int n) { var s = 0; for (var i = 0; i < n; i++) {"
           " s += i; n = n - 1; } return s; }", "" },
         { ":show nf", "for (" } } },     /* a plain for, no "counted" marker */
+    /* a CROSS-INPUT pure user func (block body) as a loop bound specializes:
+       the bound calls a prior-input pure func with a scalar arg. */
+    { ":show: a block-bodied pure func bound specializes (counted)",
+      { { "func lm(int x) { var t = x + 3; return t; }", "" },
+        { "func us(int n) { var s = 0; for (var i = 0; i < lm(n); i++) {"
+          " s += i; } return s; }", "" },
+        { ":show us", "counted" } } },
 
     /* cross-input inlining: a pure function from an EARLIER input is inlined +
      * folded into a function defined in a LATER one (caller$0 from a prior

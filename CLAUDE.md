@@ -999,19 +999,28 @@ the four hottest loop shapes are rewritten to a dedicated `ForRangeStmt`
 `th == i`), the comparison/step directions agree (`<`/`<=` with `+`, `>=`/`>`
 with `-`), and `bound`/`step` are **loop-immutable** (`fr_immutable`): a
 side-effect-free **int** expr built from literals, slotted-local ids,
-arith/bitwise chains, subscript/member READs, and **pure (const-builtin) calls
-with immutable args — so `len(arr)` qualifies.** Immutability is proven against
-two sets from `fr_collect_mutated` (which reuses the complete
-`Inferencer::for_each_child` so no write is missed): **`mut_len`** (an id whose
-value/length/identity may change — a direct reassign/`++`, or a *non*-const
-call passed the container, since a mylang array/dict/struct is a reference an
-impure callee can `append`/mutate) and **`mut_content`** (additionally an
-`arr[i] =`/`obj.f =` element write). A bare id / `len(arr)` arg needs
+arith/bitwise chains, subscript/member READs, and **pure calls with immutable
+args** — a **const builtin** (`len(arr)` qualifies), or an **effectively-pure
+USER function with all-scalar args** (`fr_is_pure_func`, from `g_fr_pure` —
+this program's `effective_pure` funcs plus, in the REPL, prior inputs' via
+`prior_scope`). Immutability is proven against two sets from
+`fr_collect_mutated` (which reuses the complete `Inferencer::for_each_child` so
+no write is missed): **`mut_len`** (an id whose value/length/identity may
+change — a direct reassign/`++`, or an *impure* call passed the container, since
+a mylang array/dict/struct is a reference an impure callee can `append`/mutate)
+and **`mut_content`** (additionally an `arr[i] =`/`obj.f =` element write, *or*
+a container passed to a **pure user func** — mylang `pure` permits `a[i]=v`, so a
+pure call can change content but not length). A bare id / `len(arr)` arg needs
 length-stability (`∉ mut_len`) — so the common fill `for(i;i<len(a);i++) a[i]=…`
 still specializes (an element write doesn't change the length); a subscript READ
-`arr[k]` additionally needs `∉ mut_content`. Sound even with calls in the body:
-a callee can't reach the caller's *scalar* locals, and a *const* builtin (the
-only call allowed in the bound) has no side effects. `ForRangeStmt::do_eval`
+`arr[k]` additionally needs `∉ mut_content`. **The all-scalar rule for pure user
+funcs is the key soundness point:** mylang `pure` does NOT forbid mutating a
+param's elements, so a pure `f(arr)` bound could change its own result between
+iterations (caching once ≠ re-evaluating); a *scalar* arg is passed by value, so
+the callee cannot mutate it and the deterministic result is constant. A const
+builtin is read-only, so even a container arg (`len(arr)`) is safe. Sound even
+with calls in the body: a callee can't reach the caller's *scalar* locals.
+`ForRangeStmt::do_eval`
 evaluates `bound`/`step` **once** (cached as raw `int_type`), then the
 per-iteration condition test and increment are plain C on the slot's
 `int_type` — no expression eval, no `num_bin_op`, no `TypedScalarExpr` dispatch
@@ -1024,8 +1033,8 @@ inliner's substitution / tail re-resolution would not remap, so the inliner's
 cross-input registration **skips** a prior function containing one
 (`has_for_range`) — it still runs correctly as a call. coderender renders it as
 the equivalent `for (...) /* counted */` so `:show`/`-a` make the optimization
-visible. **Not yet specialized:** a non-const (user-pure) function-call bound,
-and a float loop var.
+visible. **Not yet specialized:** a pure-user-func bound with a *container* arg
+(would need to prove the callee doesn't mutate it), and a float loop var.
 
 ### Function templates (monomorphization)
 
