@@ -1917,12 +1917,10 @@ static const std::vector<test> tests =
         },
     },
 
-    /* ---- exit / exception / exdata / type builtins (types.cpp) ---- */
+    /* ---- exit / type builtins (types.cpp) ---- */
     {
-        "exception() / exdata() / type() value forms",
+        "type() value forms",
         {
-            "var e = ex(\"MyErr\", 42);",
-            "assert(exdata(e) == 42);",
             "assert(type(5) == \"int\");",
             "assert(type(2.5) == \"float\");",
             "assert(type(\"s\") == \"str\");",
@@ -1934,18 +1932,6 @@ static const std::vector<test> tests =
       { "exit();" }, &typeid(InvalidNumberOfArgsEx) },
     { "exit() with a non-integer is a type error",
       { "exit(\"x\");" }, &typeid(TypeErrorEx) },
-    { "ex() with no args is rejected",
-      { "ex();" }, &typeid(InvalidNumberOfArgsEx) },
-    { "ex() with a non-string name is a type error",
-      { "ex(123);" }, &typeid(TypeErrorEx) },
-    { "ex() with a digit-leading name is an invalid value",
-      { "ex(\"1bad\");" }, &typeid(InvalidValueEx) },
-    { "ex() with a non-identifier name is an invalid value",
-      { "ex(\"a-b\");" }, &typeid(InvalidValueEx) },
-    { "exdata() of a non-exception is a type error",
-      { "exdata(5);" }, &typeid(TypeErrorEx) },
-    { "exdata() with no args is rejected",
-      { "exdata();" }, &typeid(InvalidNumberOfArgsEx) },
 
     /* ---- ++ / -- (pre/postfix increment/decrement, int/float only) ---- */
     { "++/--: postfix yields the OLD value, prefix the NEW (int)",
@@ -3761,8 +3747,8 @@ static const std::vector<test> tests =
     },
     {
         "err loc: uncaught user exception points at the throw",
-        { "throw ex(\"Boom\", 42);" },
-        &typeid(ExceptionObject), 1, 0, 21, 0,
+        { "struct Boom { int x; } throw Boom(42);" },
+        &typeid(ExceptionObject), 24, 0, 38, 0,
     },
     {
         "err loc: multi-line - undefined var on a continuation line",
@@ -3961,12 +3947,13 @@ static const std::vector<test> tests =
     },
 
     {
-        "Throw (custom) exception",
+        "Throw (custom) struct exception, caught by type",
         {
+            "struct MyErr { int code; }",
             "var c = 0;",
             "try {",
-            "   throw exception(\"myerr\");",
-            "} catch (myerr) {",
+            "   throw MyErr(7);",
+            "} catch (MyErr) {",
             "   c=1;",
             "}",
             "assert(c == 1);",
@@ -3974,36 +3961,116 @@ static const std::vector<test> tests =
     },
 
     {
-        "Throw (custom) exception with data",
+        "Throw struct exception, bind it and read a field",
         {
-            "var dyn c = 0;",   /* exdata() yields a dynamic payload */
+            "struct MyErr { int code; }",
+            "var dyn c = 0;",   /* e.code is dynamic (e is a caught dyn) */
             "try {",
-            "   throw exception(\"myerr\", 1234);",
-            "} catch (myerr as e) {",
-            "   c = exdata(e);",
+            "   throw MyErr(1234);",
+            "} catch (MyErr as e) {",
+            "   c = e.code;",
             "}",
             "assert(c == 1234);",
         },
     },
 
     {
-        "Re-throw (custom) exception with data",
+        "Struct exception with a string field",
         {
-            "var dyn c1, c2 = 0;",   /* exdata() payloads are dynamic */
+            "struct MyErr { str msg; }",
+            "var dyn m = \"\";",
+            "try {",
+            "   throw MyErr(\"boom\");",
+            "} catch (MyErr as e) {",
+            "   m = e.msg;",
+            "}",
+            "assert(m == \"boom\");",
+        },
+    },
+
+    {
+        "Re-throw a struct exception, field survives the rethrow",
+        {
+            "struct MyErr { int code; }",
+            "var dyn c1 = 0; var dyn c2 = 0;",
             "try {",
             "   try {",
-            "       throw ex(\"myerr\", 1234);",
-            "   } catch (myerr as e1) {",
-            "       c1 = exdata(e1);",
+            "       throw MyErr(1234);",
+            "   } catch (MyErr as e1) {",
+            "       c1 = e1.code;",
             "       rethrow;",
             "   }",
-            "} catch (myerr as e2) {",
-            "   c2 = exdata(e2);",
+            "} catch (MyErr as e2) {",
+            "   c2 = e2.code;",
             "}",
             "assert(c1 == 1234);",
             "assert(c2 == 1234);",
         },
     },
+
+    {
+        "Two struct exception types, the right catch fires",
+        {
+            "struct A { int x; }",
+            "struct B { int y; }",
+            "var dyn got = 0;",
+            "try {",
+            "   throw B(9);",
+            "} catch (A as e) {",
+            "   got = e.x;",
+            "} catch (B as e) {",
+            "   got = e.y;",
+            "}",
+            "assert(got == 9);",
+        },
+    },
+
+    {
+        "Catch-list matches one of several struct types",
+        {
+            "struct A { int x; }",
+            "struct B { int x; }",
+            "var c = 0;",
+            "try {",
+            "   throw A(1);",
+            "} catch (A, B) {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "A non-matching struct exception propagates out",
+        {
+            "struct A { int x; }",
+            "struct B { int x; }",
+            "var c = 0;",
+            "try {",
+            "   try { throw A(1); } catch (B) { c = 2; }",
+            "} catch (A) {",
+            "   c = 1;",
+            "}",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "catch-anything catches a struct exception",
+        {
+            "struct A { int x; }",
+            "var c = 0;",
+            "try { throw A(1); } catch { c = 1; }",
+            "assert(c == 1);",
+        },
+    },
+
+    {
+        "throw of a non-struct value is a compile error",
+        { "throw 5;" }, &typeid(TypeMismatchEx) },
+    {
+        "throw of a string is a compile error",
+        { "throw \"oops\";" }, &typeid(TypeMismatchEx) },
 
     {
         "Erase 1st element, no slice",
@@ -5199,9 +5266,15 @@ static const std::vector<test> tests =
     },
 
     {
-        "Exception to string",
+        "Built-in exception bound by `as e` is printable",
         {
-            "assert(str(exception(\"abc\")) == \"<Exception(abc)>\");",
+            "var dyn s = \"\";",
+            "try {",
+            "   runtime(1) / runtime(0);",
+            "} catch (DivisionByZeroEx as e) {",
+            "   s = str(e);",
+            "}",
+            "assert(s == \"<Exception(DivisionByZeroEx)>\");",
         },
     },
 

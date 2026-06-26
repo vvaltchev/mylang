@@ -2528,15 +2528,31 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue &e = RValue(elem->eval(ctx));
 
-    if (!e.is<shared_ptr<ExceptionObject>>()) {
-        throw TypeErrorEx(
-            "Expected an exception object",
-            elem->start,
-            elem->end
+    /*
+     * Throwing a struct instance: the struct IS the exception. Wrap it as a
+     * named exception whose name is the struct's type (so `catch (T)` matches
+     * by type) carrying the instance as the payload (so `catch (T as v)` binds
+     * the instance and `v.field` reads it).
+     */
+    if (e.is<intrusive_ptr<StructObject>>()) {
+        throw ExceptionObject(
+            string(e.get<intrusive_ptr<StructObject>>()->def->name->val),
+            e
         );
     }
 
-    throw *e.get<shared_ptr<ExceptionObject>>().get();
+    /*
+     * Re-throwing a caught built-in exception value (bound by `catch (X as e)`,
+     * which hands back an exception object for a payload-less built-in).
+     */
+    if (e.is<shared_ptr<ExceptionObject>>())
+        throw *e.get<shared_ptr<ExceptionObject>>().get();
+
+    throw TypeErrorEx(
+        "Can only throw a struct instance",
+        elem->start,
+        elem->end
+    );
 }
 
 /* Live-bit mask for a block's contiguous slot range [start, start+count). */
@@ -2840,26 +2856,34 @@ do_catch(EvalContext *ctx,
 
             if (asId) {
 
-                shared_ptr<ExceptionObject> shared_ex =
-                    make_shared<ExceptionObject>(
-                        exObj
-                            ? *exObj
-                            : ExceptionObject(saved_ex->name)
-                    );
+                /*
+                 * Bind the catch variable. A thrown struct carries the
+                 * instance as its payload, so `e` IS the struct (and `e.field`
+                 * works). A payload-less built-in exception binds to a small
+                 * exception object instead (printable, re-throwable).
+                 */
+                EvalValue bind_val =
+                    (exObj && exObj->get_data()
+                                  .is<intrusive_ptr<StructObject>>())
+                        ? exObj->get_data()
+                        : EvalValue(make_shared<ExceptionObject>(
+                              exObj
+                                  ? *exObj
+                                  : ExceptionObject(saved_ex->name)));
 
                 if (asId->sym.kind == SymKind::local && catch_ctx.frame) {
 
                     /* Resolved catch variable: bind it into its slot. */
                     Frame *f = catch_ctx.frame;
                     f->slots[asId->sym.slot] =
-                        LValue(move(shared_ex), ctx->const_ctx);
+                        LValue(move(bind_val), ctx->const_ctx);
                     f->live |= static_cast<uint64_t>(1) << asId->sym.slot;
 
                 } else {
 
                     catch_ctx.emplace(
                         asId,
-                        move(shared_ex),
+                        move(bind_val),
                         ctx->const_ctx
                     );
                 }

@@ -323,13 +323,6 @@ const BuiltinDoc builtin_docs[] = {
   "1/runtime(0) throws at runtime." },
 { "undef", "control", "undef(name)",
   "Remove name from the current scope (true if it existed).", nullptr },
-{ "exception", "control", "exception(name, [data])",
-  "Create an exception value with the given name and optional payload.",
-  nullptr },
-{ "ex", "control", "ex(name, [data])",
-  "A shortcut for exception().", nullptr },
-{ "exdata", "control", "exdata(e)",
-  "The payload data of an exception value.", nullptr },
 
 };
 
@@ -549,14 +542,15 @@ const LangFeature lang_features[] = {
 
 /* ---- exceptions ---- */
 { "trycatch", "exceptions", "Exceptions",
-  "try { ... }\ncatch (DivisionByZeroEx e) { ... }\nfinally { ... }\n"
-  "throw ex(\"MyError\", data);    rethrow;",
-  "try/catch/finally with catch clauses matched by exception NAME. Built-in "
-  "runtime errors (DivisionByZeroEx, TypeErrorEx, OutOfBoundsEx, "
-  "KeyNotFoundEx, ...) are catchable; user exceptions are made with "
-  "ex(name, data) and their payload read with exdata(). COMPILE-time errors "
-  "(type/syntax) are NOT catchable. `rethrow` re-throws the in-flight "
-  "exception from a catch." },
+  "struct MyError { str msg; }\ntry { throw MyError(\"boom\"); }\n"
+  "catch (MyError as e) { print(e.msg); }\nfinally { ... }    rethrow;",
+  "try/catch/finally with catch clauses matched by exception NAME. A user "
+  "exception is a struct instance: `throw MyError(...)` is caught by "
+  "`catch (MyError)` (the struct type), and `catch (MyError as e)` binds the "
+  "instance so `e.field` reads its data. Built-in runtime errors "
+  "(DivisionByZeroEx, TypeErrorEx, OutOfBoundsEx, KeyNotFoundEx, ...) are "
+  "catchable too. COMPILE-time errors (type/syntax) are NOT catchable. "
+  "`rethrow` re-throws the in-flight exception from a catch." },
 
 /* ---- types ---- */
 { "inference", "types", "Static type inference",

@@ -271,6 +271,14 @@ parse_args(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+    /*
+     * The AST owns every StructTypeDef, and an uncaught struct exception's
+     * payload references its def (to print field names). So `root` must outlive
+     * the catch handlers below: declared here, not inside the try, or unwinding
+     * would free the def before format_exception() renders the value.
+     */
+    unique_ptr<Construct> root;
+
     try {
 
         parse_args(argc, argv);
@@ -285,7 +293,6 @@ int main(int argc, char **argv)
             return run_repl();
 
         ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
-        unique_ptr<Construct> root;
 
         /* -a: the parser records parse-time folds/DCE it would otherwise erase
          * (magenta folded calls, dim dead branches) into this collector; the

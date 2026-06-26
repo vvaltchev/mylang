@@ -3190,9 +3190,12 @@ void Inferencer::check(Construct *n)
     if (auto *th = dynamic_cast<ThrowStmt *>(n)) {
         check(th->elem.get());
         STyRef t = strip(sty_resolve(type_of(th->elem.get())));
-        if (!is_dyn(t) && t->kind != STyKind::Exception &&
+        /* A struct instance is the custom-exception value; a caught built-in
+         * exception (Exception) can be re-thrown; dyn/Unknown/None defer. */
+        if (!is_dyn(t) && t->kind != STyKind::Struct &&
+            t->kind != STyKind::Exception &&
             t->kind != STyKind::Unknown && t->kind != STyKind::None)
-            mismatch("can only throw an exception, got '" +
+            mismatch("can only throw a struct instance, got '" +
                          sty_to_string(type_of(th->elem.get())) + "'",
                      th->elem->start, th->elem->end);
         return;

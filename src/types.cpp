@@ -67,66 +67,6 @@ EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)
     return TypeNames[e.get_type()->t];
 }
 
-EvalValue builtin_exception(EvalContext *ctx, ExprList *exprList)
-{
-    if (exprList->elems.size() < 1 || exprList->elems.size() > 2)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    const EvalValue &name_val = RValue(exprList->elems[0]->eval(ctx));
-
-    if (!name_val.is<SharedStr>()) {
-        throw TypeErrorEx(
-            "Expected string",
-            exprList->elems[0]->start,
-            exprList->elems[0]->end
-        );
-    }
-
-    const string_view ex_name = name_val.get<SharedStr>().get_view();
-
-    if (isdigit(ex_name[0])) {
-        throw InvalidValueEx(
-            "Expected an identifier-like string",
-            exprList->elems[0]->start,
-            exprList->elems[0]->end
-        );
-    }
-
-    for (char c : ex_name) {
-
-        if (c != '_' && !isdigit(c) && !isalnum(c)) {
-            throw InvalidValueEx(
-                "Expected an identifier-like string",
-                exprList->elems[0]->start,
-                exprList->elems[0]->end
-            );
-        }
-    }
-
-    return make_shared<ExceptionObject>(
-        ExceptionObject(
-            string(ex_name),
-            exprList->elems.size() == 2
-                ? RValue(exprList->elems[1]->eval(ctx))
-                : none
-        )
-    );
-}
-
-EvalValue builtin_exdata(EvalContext *ctx, ExprList *exprList)
-{
-    if (exprList->elems.size() != 1)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
-
-    if (!e.is<shared_ptr<ExceptionObject>>())
-        throw TypeErrorEx("Expected exception object", arg->start, arg->end);
-
-    return e.get<shared_ptr<ExceptionObject>>().get()->get_data();
-}
-
 const std::array<Type *, Type::t_count> AllTypes =
 {
     /* Trivial types */
@@ -307,9 +247,6 @@ EvalContext::SymbolsType EvalContext::builtins =
      * array(1000000) isn't baked into the AST. */
     make_builtin("array", builtin_array),
     make_builtin("undef", builtin_undef),
-    make_builtin("exception", builtin_exception),
-    make_builtin("ex", builtin_exception), /* ex() is an alias for exception() */
-    make_builtin("exdata", builtin_exdata),
 
     /* Array builtins */
     make_builtin("append", builtin_append),

@@ -183,9 +183,9 @@ throws nothing — or, when an expected exception type is given, throws *exactly
 that type (compared via `&typeid(e) != t.ex`). There is no single-test CLI
 selector; `-rt` runs all of them and `exit(1)`s if any fail. Add a test by
 appending an entry to that table (no registration needed). Note the expected
-exception is matched against the *static* C++ type; user-level `throw ex("Foo")`
-always surfaces as `ExceptionObject` (a.k.a. `DynamicExceptionEx`), not a
-distinct C++ type.
+exception is matched against the *static* C++ type; a user-level
+`throw <struct>` always surfaces as `ExceptionObject` (a.k.a.
+`DynamicExceptionEx`), not a distinct C++ type.
 
 ## Benchmarks
 
@@ -1744,15 +1744,23 @@ and two macros:
   `AssertionFailureEx`, `CannotOpenFileEx`, `InvalidValueEx`. These are the ones
   script `try/catch`
   can handle (matched by name).
-- **User exceptions** (`ex("Name", payload)`) are `ExceptionObjectTempl`
-  (`exceptionobj.h`), a
-  `RuntimeException` whose C++ type name is `"DynamicExceptionEx"` but whose
-  *script-visible* name is
-  the dynamic `dyn_name`. `try/catch` in `eval.cpp` (`do_catch`) clones the
-  in-flight exception, then
-  matches catch clauses against that dynamic name; `finally` runs via a scope
-  guard; `rethrow`
-  re-throws the saved exception with the rethrow site's `Loc`.
+- **User exceptions are STRUCTS.** `throw <struct instance>`
+  (`ThrowStmt::do_eval`, `eval.cpp`) wraps the instance in an
+  `ExceptionObjectTempl` (`exceptionobj.h`) — a `RuntimeException` whose C++
+  type name is `"DynamicExceptionEx"`, whose `dyn_name` is the **struct type's
+  name** (so `catch (T)` matches by type), and whose `data` EvalValue is the
+  struct itself. `throw` accepts only a struct instance, or a caught built-in
+  exception object (re-throw); anything else is a `TypeErrorEx` (and a
+  statically-known non-struct/non-exception throw is a compile-time
+  `TypeMismatchEx` from the inferencer). `do_catch` matches a catch clause by
+  the `dyn_name`/built-in `name` string, and `catch (T as e)` binds `e` to the
+  **struct instance** (`exObj->get_data()`, so `e.field` works) when the
+  exception carries one, else to a fresh `ExceptionObject` wrapper (the
+  payload-less built-in case — printable/re-throwable). The catch variable is
+  typed `dyn` by the inferencer (member access resolved at runtime). `finally`
+  runs via a scope guard; `rethrow` re-throws the saved exception with the
+  rethrow site's `Loc`. (The old `exception()`/`ex()`/`exdata()` builtins were
+  removed once structs existed — a struct field IS the payload.)
 - Always pass `Loc start, end` to thrown exceptions where you can, so
   `mylang.cpp` can render the caret.
 
@@ -1782,7 +1790,11 @@ and two macros:
   auto-const promotion (`prescan_blocked` blocks `CallExpr::what`), so calling a
   defined non-function reports `NotCallableEx`, not a bogus "undefined var".
 - **Uncaught user exceptions** print their throw-site loc + caret and their
-  payload (`mylang.cpp`'s `ExceptionObject` handler uses `get_data()`).
+  payload struct (`errfmt.cpp`'s `ExceptionObject` handler renders
+  `get_data()` via `to_string`). The payload struct references its
+  `StructTypeDef` (owned by the AST), so `main` (`mylang.cpp`) declares the
+  `root` AST **outside** the `try` — unwinding must not free the def before the
+  catch handler renders the value.
 - **Backtrace.** `Exception::backtrace` (a `vector<BacktraceFrame>`, `errors.h`)
   is filled as the exception unwinds: `do_func_call`'s `catch (Exception &)`
   records each frame innermost-first, capturing the function's name+params **as
