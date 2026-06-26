@@ -11,6 +11,7 @@ class Construct;
 class UniqueId;
 class FuncDeclStmt;
 class EvalContext;
+struct AnalysisInfo;
 
 /*
  * Whole-program static type inference + checking (see plans/type-inference.md).
@@ -44,9 +45,14 @@ void dump_type_info(Construct *root, std::ostream &os);
  * intermediate EvalValue boxing. Run AFTER resolve_names (it benefits from
  * resolved slots via Identifier's typed fast paths). A no-op when inference is
  * disabled (no TypeHints are set). See plans/type-inference.md M8.
+ *
+ * `analyze` (the `-a`/`:analyze` pipeline only; null in a normal run) gets a
+ * counted_for annotation on each `for` keyword this pass rewrites to a
+ * ForRangeStmt, so the colored view can mark a specialized counted loop green.
  */
 void specialize_types(Construct *root, bool enable = true,
-                      EvalContext *prior_scope = nullptr);
+                      EvalContext *prior_scope = nullptr,
+                      AnalysisInfo *analyze = nullptr);
 
 /*
  * REPL incremental type inference + checking. A persistent type-checker that

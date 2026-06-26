@@ -1386,7 +1386,11 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
         if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
             return;
         const std::string nm(cid->uid->val);
-        if (nm == "range" || nm == "array" || nm == "make_array") {
+        /* keys()/values() honor a flat hint too: building keys/values of a
+         * scalar dict into a flat array<int>/<float>/<bool> avoids per-element
+         * boxing (a big win for keys()/values() of a large dict). */
+        if (nm == "range" || nm == "array" || nm == "make_array" ||
+            nm == "keys" || nm == "values") {
             call->args->arr_hint = hint;
             call->args->arr_hint_struct = sdef;
         }
@@ -3628,6 +3632,10 @@ static bool fr_is_const_builtin(const Construct *callee)
  * args are scalars (passed by value). That is enforced at the bound (below). */
 static std::unordered_set<const UniqueId *> g_fr_pure;
 
+/* -a/--analyze only (null in a normal run): try_for_range records a counted_for
+ * annotation here for each `for` it specializes, so the view greens it. */
+static AnalysisInfo *g_specialize_analyze = nullptr;
+
 static void fr_collect_pure_funcs(Construct *c)
 {
     if (!c)
@@ -3877,6 +3885,11 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
         fr->step = specialize(std::move(inc14->rvalue));
     fr->init = specialize(std::move(f->init));
     fr->body = specialize(std::move(f->body));
+
+    /* -a/--analyze: green the `for` keyword of a specialized counted loop. */
+    if (g_specialize_analyze)
+        g_specialize_analyze->mark(fr->start, 3, AnnoKind::counted_for);
+
     return fr;
 }
 
@@ -3970,7 +3983,8 @@ void collect_array_analysis(Construct *root, AnalysisInfo &out)
     inf.collect_arrays(out);
 }
 
-void specialize_types(Construct *root, bool enable, EvalContext *prior_scope)
+void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
+                      AnalysisInfo *analyze)
 {
     if (!enable || !root)
         return;
@@ -3978,6 +3992,8 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope)
     auto *blk = dynamic_cast<Block *>(root);
     if (!blk)
         return;
+
+    g_specialize_analyze = analyze;   /* null in a normal run (no recording) */
 
     /* a for-range bound may call a pure user function (with scalar args) -
      * collect this program's effectively-pure functions first, plus (in the
@@ -4001,6 +4017,7 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope)
         e = specialize(std::move(e));
 
     g_fr_pure.clear();
+    g_specialize_analyze = nullptr;
 }
 
 /* ---- REPL incremental inference (wraps a persistent Inferencer) -------- */

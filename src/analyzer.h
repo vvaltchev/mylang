@@ -29,6 +29,7 @@ enum class AnnoKind : unsigned char {
     inlined,       /* blue:    call spliced inline at its call-site */
     specialized,   /* cyan:    call redirected to a $specN clone */
     folded,        /* magenta: call evaluated at compile time -> literal */
+    counted_for,   /* green:   `for` specialized to a counted ForRangeStmt */
 };
 
 struct AnalysisInfo {
@@ -58,6 +59,9 @@ struct AnalysisInfo {
             case AnnoKind::folded:      return 3;   /* call-site decisions */
             case AnnoKind::dyn_array:
             case AnnoKind::flat_array:  return 2;   /* array storage */
+            /* on the `for` keyword - never collides with the above (those land
+             * on identifiers / call-sites), so its priority is academic. */
+            case AnnoKind::counted_for: return 2;
             case AnnoKind::auto_const:  return 1;
             default:                    return 0;
         }
@@ -101,10 +105,12 @@ void render_analysis(std::ostream &o, const std::vector<std::string> &src,
  * and the REPL's `:analyze` so they record IDENTICAL optimization decisions:
  * collect array-storage annotations, run the resolver (which records
  * auto-const / inlined / specialized / folded / dead-code into `info` as it
- * mutates the tree), collect its auto-pure/param annotations, then render the
- * colored source. `info` must already hold the parser's parse-time records (the
- * parser writes them during pBlock when given `&info`). Only `repl_mode` and
- * the inline knobs differ between the two callers.
+ * mutates the tree), collect its auto-pure/param annotations, run
+ * specialize_types (which records a counted_for annotation for each `for` it
+ * rewrites to a ForRangeStmt), then render the colored source. `info` must
+ * already hold the parser's parse-time records (the parser writes them during
+ * pBlock when given `&info`). Only `repl_mode` and the inline knobs differ
+ * between the two callers.
  */
 void analyze_and_render(std::ostream &o, Construct *root, AnalysisInfo &info,
                         const std::vector<std::string> &src, bool color,

@@ -2749,6 +2749,12 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
  * for an array base (the inferencer proved array<int>/array<float>); anything
  * else (dict, str, dyn) falls back to the boxed path.
  */
+/* The stored value of a present dict key, else nullptr (defined below near
+ * MemberExpr). Shared by the typed dict fast paths of Subscript and MemberExpr;
+ * a missing key falls back to do_eval. */
+static const EvalValue *
+dict_present_value(const intrusive_ptr<DictObject> &obj, const EvalValue &key);
+
 int_type Subscript::eval_int(EvalContext *ctx) const
 {
     const EvalValue &lval = what->eval(ctx);
@@ -2769,7 +2775,18 @@ int_type Subscript::eval_int(EvalContext *ctx) const
             return arr.flat_bools()[at] ? 1 : 0;   /* bool elem -> int 0/1 */
         return arr.get_vec()[at].getval<int_type>();
     }
-    return Construct::eval_int(ctx);
+    /* typed dict read `d[k]` (present key): look the value up directly instead
+     * of Construct::eval_int, which would re-evaluate `what` (the dict). */
+    if (base.is<intrusive_ptr<DictObject>>()) {
+        const EvalValue key = RValue(index->eval(ctx));
+        if (const EvalValue *v = dict_present_value(
+                base.get_ref<intrusive_ptr<DictObject>>(), key)) {
+            if (v->is<bool>())
+                return v->get<bool>() ? 1 : 0;
+            return v->get<int_type>();
+        }
+    }
+    return Construct::eval_int(ctx);   /* missing key / non-dict: do_eval */
 }
 
 float_type Subscript::eval_float(EvalContext *ctx) const
@@ -2797,7 +2814,18 @@ float_type Subscript::eval_float(EvalContext *ctx) const
             return static_cast<float_type>(el.getval<int_type>());
         return el.getval<float_type>();
     }
-    return Construct::eval_float(ctx);
+    if (base.is<intrusive_ptr<DictObject>>()) {
+        const EvalValue key = RValue(index->eval(ctx));
+        if (const EvalValue *v = dict_present_value(
+                base.get_ref<intrusive_ptr<DictObject>>(), key)) {
+            if (v->is<int_type>())
+                return static_cast<float_type>(v->get<int_type>());
+            if (v->is<bool>())
+                return v->get<bool>() ? 1.0 : 0.0;
+            return v->get<float_type>();
+        }
+    }
+    return Construct::eval_float(ctx);   /* missing key / non-dict: do_eval */
 }
 
 EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
@@ -3442,6 +3470,24 @@ static bool member_pod_array_scalar(const Subscript *sub, EvalContext *ctx,
     }
 }
 
+/*
+ * The stored value of a PRESENT dict key, or nullptr if absent. Returns a
+ * pointer into the live dict (the caller's `base` keeps it alive). The typed
+ * fast paths (Subscript/MemberExpr eval_int/eval_float) use this for the common
+ * present-key case so a typed `d.key` / `d[k]` reads the value WITHOUT
+ * re-evaluating the base (the old code fell through to Construct::eval_int,
+ * which re-ran do_eval and re-fetched the dict). A missing key falls back to
+ * do_eval, preserving the exact default-dict vivify / key-freeze / KeyNotFound
+ * behavior unchanged.
+ */
+static const EvalValue *
+dict_present_value(const intrusive_ptr<DictObject> &obj, const EvalValue &key)
+{
+    const DictObject::inner_type &data = obj->get_ref();
+    const auto it = data.find(key);
+    return it != data.end() ? &it->second.get() : nullptr;
+}
+
 int_type MemberExpr::eval_int(EvalContext *ctx) const
 {
     if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
@@ -3466,7 +3512,15 @@ int_type MemberExpr::eval_int(EvalContext *ctx) const
                 return static_cast<unsigned char>(*p) != 0 ? 1 : 0;
         }
     }
-    return Construct::eval_int(ctx);
+    if (base.is<intrusive_ptr<DictObject>>()) {
+        if (const EvalValue *v = dict_present_value(
+                base.get_ref<intrusive_ptr<DictObject>>(), memId)) {
+            if (v->is<bool>())
+                return v->get<bool>() ? 1 : 0;
+            return v->get<int_type>();
+        }
+    }
+    return Construct::eval_int(ctx);   /* missing key / non-dict: do_eval */
 }
 
 float_type MemberExpr::eval_float(EvalContext *ctx) const
@@ -3498,7 +3552,17 @@ float_type MemberExpr::eval_float(EvalContext *ctx) const
                 return static_cast<unsigned char>(*p) != 0 ? 1.0 : 0.0;
         }
     }
-    return Construct::eval_float(ctx);
+    if (base.is<intrusive_ptr<DictObject>>()) {
+        if (const EvalValue *v = dict_present_value(
+                base.get_ref<intrusive_ptr<DictObject>>(), memId)) {
+            if (v->is<int_type>())
+                return static_cast<float_type>(v->get<int_type>());
+            if (v->is<bool>())
+                return v->get<bool>() ? 1.0 : 0.0;
+            return v->get<float_type>();
+        }
+    }
+    return Construct::eval_float(ctx);   /* missing key / non-dict: do_eval */
 }
 
 EvalValue ForStmt::do_eval(EvalContext *ctx, bool rec) const
