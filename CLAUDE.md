@@ -540,10 +540,21 @@ mutually-recursive) func stay impure. **Cross-input** (REPL): `resolve_names`'s
 (so a new input's `f` calling an earlier-input `add` is recognized pure) and
 `AutoConst`'s fold context with the earlier inputs' effectively-pure FuncObjects
 (so a call to one *folds* across inputs — `func f2()=>f(1,2)` with `f`'s
-instance from an earlier input becomes `=> 5`). Only pure *functions* are
-seeded (never a runtime var), so it stays sound; a redefinition redirects to
-its own new instance, so a stale prior instance is never used. **AutoConst folds
-an EXPRESSION-bodied function's body** (`fold_func_body` handles a bare-expr
+instance from an earlier input becomes `=> 5`). The same `prior_pure` scope is
+also handed to the **Inliner** (`Inliner(.., prior_scope)`): its `run()`
+registers earlier inputs' **effectively-pure** functions (and their
+instances) into `funcs`/`spec_funcs`, so a call to a prior-input pure function
+**inlines / specializes** across inputs too — `func caller(a,b)=>f(a,2*b)`
+then (later) `func c2(x)=>caller(x,3)` folds `c2`'s instance body to `x + 6`,
+matching what one compilation (or C++ `-O3`) produces. Cross-input is restricted
+to **pure** functions on purpose: the inliner only ever CLONES a callee body, so
+reusing a prior retained decl is safe, but an *impure* prior function reads/
+writes mutable global state that may differ at the new site (and its result
+isn't compile-time-known anyway), so it is left a runtime call. Only pure
+*functions* are seeded (never a runtime var); registration skips any name the
+current input defines, so a redefinition wins and a redirected call already
+points at the current input's own instance. **AutoConst folds an
+EXPRESSION-bodied function's body** (`fold_func_body` handles a bare-expr
 body, not only a `{...}` block — the older `fold_function` skipped the former,
 so a pure call in `func g()=>f(1,2)` never folded).
 `FuncDeclStmt::{explicit_pure, effective_pure}` back the

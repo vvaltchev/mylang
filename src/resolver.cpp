@@ -1472,6 +1472,7 @@ class Inliner {
     EvalContext cctx;      /* const context for re-folding spliced bodies */
     AutoConst ac;          /* used to fold specialized clones */
     AnalysisInfo *analysis;   /* -a: record inlined / specialized; or null */
+    EvalContext *prior_scope; /* REPL: earlier inputs' globals (or null) */
 
     /* (func, const-arg tuple) -> the specialized clone, or nullptr if building
      * it was not beneficial (cached so it isn't retried). */
@@ -1496,11 +1497,15 @@ class Inliner {
 
 public:
 
-    explicit Inliner(int max_nodes, AnalysisInfo *a = nullptr)
+    explicit Inliner(int max_nodes, AnalysisInfo *a = nullptr,
+                     EvalContext *prior_scope = nullptr)
         /* `ac` folds specialization *clones*, not the original source, so it
          * must NOT record analysis (that would color the original body for one
-         * specialized call). The Inliner records inline/specialize itself. */
-        : max_nodes(max_nodes), cctx(nullptr, true), ac(), analysis(a) { }
+         * specialized call). The Inliner records inline/specialize itself.
+         * `prior_scope` (REPL): earlier inputs' globals, so a call to a
+         * prior-input function inlines/specializes across inputs. */
+        : max_nodes(max_nodes), cctx(nullptr, true), ac(), analysis(a),
+          prior_scope(prior_scope) { }
 
     void run(Block *root)
     {
@@ -1512,6 +1517,36 @@ public:
                 add_unique(funcs, fd);
             else if (specializable_decl(fd))
                 add_unique(spec_funcs, fd);
+        }
+
+        /* REPL: register earlier inputs' functions (their template/spec
+         * instances too) so a call to one inlines/specializes ACROSS inputs -
+         * the inliner only ever CLONES a callee body, so reusing a prior
+         * input's retained decl is safe. Only for names this input did NOT
+         * define, so a current redefinition wins (and a redirected call already
+         * points at the current input's own instance). */
+        if (prior_scope) {
+            std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+            prior_scope->collect_symbols(syms);
+            for (const auto &kv : syms) {
+                if (funcs.count(kv.first) || spec_funcs.count(kv.first))
+                    continue;
+                const EvalValue &v = kv.second->get();
+                if (!v.is<shared_ptr<FuncObject>>())
+                    continue;
+                FuncDeclStmt *fd = const_cast<FuncDeclStmt *>(
+                    v.get<shared_ptr<FuncObject>>()->func);
+                /* only PURE prior functions: an impure one reads/writes mutable
+                 * global state, so inlining it across inputs is unsound (the
+                 * state may differ at the new site) - and its result isn't
+                 * "known at compile time" anyway, so folding gains nothing. */
+                if (!fd->id || !fd->effective_pure)
+                    continue;
+                if (inlinable_decl(fd))
+                    funcs.emplace(kv.first, fd);
+                else if (specializable_decl(fd))
+                    spec_funcs.emplace(kv.first, fd);
+            }
         }
 
         seed_const_globals(root);
@@ -2462,7 +2497,7 @@ resolve_names(Construct *root, bool enable_inline, int inline_threshold,
 
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))
-            Inliner(inline_threshold, analysis).run(rb);
+            Inliner(inline_threshold, analysis, prior_pure).run(rb);
 }
 
 /*

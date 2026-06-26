@@ -7888,6 +7888,18 @@ static const std::vector<repl_test> repl_tests =
     { ":show of an expression renders its optimized (folded) form",
       { { ":show 2 + 3 * 4", "14" } } },
 
+    /* cross-input inlining: a pure function from an EARLIER input is inlined +
+     * folded into a function defined in a LATER one (caller$0 from a prior
+     * input becomes `x + 6` here - the c2 case). */
+    { ":show inlines+folds a PRIOR-input pure call into a later function",
+      { { "func xf(x, y) => x + y", "" },
+        { "func xcaller(a, b) => xf(a, 2 * b)", "" },
+        { "xcaller(2, 3)", "=> 8" },                /* creates xcaller$0 */
+        { "func xc2(x) => xcaller(x, 3)", "" },     /* xcaller$0 is prior */
+        { "xc2(10)", "=> 16" },                     /* instantiates xc2$0 */
+        { ":show xc2$0", "x + " },                  /* caller inlined away */
+        { ":show xc2$0", "6" } } },                 /* 2*3 folded to 6 */
+
     /* a template instance appending to a PINNED global array must not trip the
      * global's assignability check before the arg type settles (defer-on-
      * Unknown for array<?> -> the element type). */
