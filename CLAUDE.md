@@ -307,6 +307,18 @@ un-inlined tree); the typed-node *specialization* it enables runs *after*
 `resolve_names`. Both are gated by the CLI's `-nti` and on by default. See
 "Static type inference" below.
 
+**The post-inference optimizer pipeline is one shared function,
+`run_optimizers` (`resolver.cpp`/`.h`): `resolve_names` (slotting + auto-const
++ inlining + specialization) then `specialize_types` (M8).** Both drivers call
+it — the script path (`mylang.cpp`) with `repl_mode=false`, the REPL
+(`repl.cpp` `do_eval`) with `repl_mode=true` + the prior-input scope — so the
+REPL transforms the tree EXACTLY like a script (only the inference *front* end
+differs: one-shot `infer_types` vs incremental `ReplInfer::check_input`, both
+built on the same `Inferencer::infer_one`). A new pass added to
+`run_optimizers` reaches both identically — the REPL's optimization parity is
+not maintained by hand. Likewise the `-a`/`:analyze` collect-and-render
+pipeline is one shared `analyze_and_render` (`analyzer.cpp`).
+
 ### Lexer
 
 Produces a `vector<Tok>`. A `Tok` is `{ TokType, Loc, value/op/kw }` where

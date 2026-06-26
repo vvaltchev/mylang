@@ -95,3 +95,18 @@ void collect_array_analysis(Construct *root, AnalysisInfo &out);
  */
 void render_analysis(std::ostream &o, const std::vector<std::string> &src,
                      const AnalysisInfo &info, bool color);
+
+/*
+ * The full `-a` / `:analyze` pipeline, shared by the file driver (mylang.cpp)
+ * and the REPL's `:analyze` so they record IDENTICAL optimization decisions:
+ * collect array-storage annotations, run the resolver (which records
+ * auto-const / inlined / specialized / folded / dead-code into `info` as it
+ * mutates the tree), collect its auto-pure/param annotations, then render the
+ * colored source. `info` must already hold the parser's parse-time records (the
+ * parser writes them during pBlock when given `&info`). Only `repl_mode` and
+ * the inline knobs differ between the two callers.
+ */
+void analyze_and_render(std::ostream &o, Construct *root, AnalysisInfo &info,
+                        const std::vector<std::string> &src, bool color,
+                        bool repl_mode, bool enable_inline = true,
+                        int inline_threshold = 24);

@@ -2,6 +2,7 @@
 
 #include "syntax.h"
 #include "resolver.h"
+#include "inferencer.h"   /* specialize_types (run_optimizers) */
 #include "analyzer.h"
 #include "errors.h"
 #include "eval.h"
@@ -2585,6 +2586,16 @@ resolve_names(Construct *root, bool enable_inline, int inline_threshold,
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))
             Inliner(inline_threshold, analysis, prior_pure).run(rb);
+}
+
+void
+run_optimizers(Construct *root, bool enable_inline, int inline_threshold,
+               bool enable_specialize, bool repl_mode,
+               EvalContext *prior_scope)
+{
+    resolve_names(root, enable_inline, inline_threshold, /*analysis=*/nullptr,
+                  repl_mode, prior_scope);
+    specialize_types(root, enable_specialize);
 }
 
 /*
