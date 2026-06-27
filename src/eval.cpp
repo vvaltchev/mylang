@@ -2524,7 +2524,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
  *    incl. flat-array elements and POD struct fields, which have no LValue):
  *    route the mutation through handle_single_expr14 (`operand += 1`), which
  *    reuses every store fast path (slot, flat array, COW, struct). It returns
- *    the NEW value; postfix derives `old = new ∓ 1` (the delta is exactly 1),
+ *    the NEW value; postfix derives `old = new -/+ 1` (the delta is exactly 1),
  *    so we never re-read the operand;
  *
  *  - a `dyn` / un-hinted operand (always LValue-backed - a dyn value is never
@@ -2579,7 +2579,7 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
         if (is_prefix)
             return nv;
 
-        EvalValue old = nv;     /* old = new ∓ 1 (no re-read of the operand) */
+        EvalValue old = nv;     /* old = new -/+ 1 (no operand re-read) */
         apply_compound_op(old, one, is_inc ? Op::subeq : Op::addeq);
         return old;
     }

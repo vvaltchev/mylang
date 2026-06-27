@@ -116,8 +116,8 @@ void TypeStruct::noteq(EvalValue &a, const EvalValue &b)
  * struct is a fixed sequence of fields), salted with the struct's def identity
  * so two different struct types with equal field values hash differently -
  * matching eq(), which only compares instances of the SAME def. Field-wise
- * (via pod_get / fields[i]) keeps it consistent with eq for both POD (a==b ⇒
- * equal field values ⇒ equal hash) and boxed instances, and avoids hashing
+ * (via pod_get / fields[i]) keeps it consistent with eq for both POD (a==b =>
+ * equal field values => equal hash) and boxed instances, and avoids hashing
  * POD padding bytes.
  */
 size_t TypeStruct::hash(const EvalValue &a)

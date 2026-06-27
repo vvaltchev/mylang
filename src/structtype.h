@@ -43,7 +43,7 @@ struct FieldDef {
 /*
  * POD field metrics: our OWN fixed alignment rules so a struct's C-style layout
  * depends only on the word size (sizeof(int_type)), never on host `alignof`.
- * This is the one place an arch assumption lives (see plans/structs.md §6); on
+ * This is the one place an arch assumption lives (see plans/structs.md s6); on
  * the LE x86/arm/riscv targets only the int width (4 vs 8) varies. -1 marks a
  * non-POD-scalar kind (a struct is then boxed).
  */

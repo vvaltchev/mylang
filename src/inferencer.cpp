@@ -1924,7 +1924,7 @@ STyRef Inferencer::type_of(const Construct *e)
     }
 
     if (auto *idc = dynamic_cast<const IncDecExpr *>(e)) {
-        /* `x++` / `++x` yields `x ± 1` (int stays int, float stays float);
+        /* `x++` / `++x` yields `x +/- 1` (int stays int, float stays float);
          * binop_result defers on an Unknown operand. The check pass enforces
          * the int/float-lvalue requirement. */
         return binop_result(idc->is_inc ? Op::plus : Op::minus,

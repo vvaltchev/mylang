@@ -64,7 +64,7 @@ void specialize_types(Construct *root, bool enable = true,
  * which the REPL catches to reject just that input. `undef_global` drops a name
  * from the committed set (so a later `var x` of a new type is fresh, not a
  * conflict). The one-shot `infer_types` (scripts + all tests) is untouched.
- * See plans/repl.md §3.1.
+ * See plans/repl.md section 3.1.
  */
 class ReplInfer {
 
