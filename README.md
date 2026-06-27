@@ -323,7 +323,10 @@ Point origin;               # zero-initialized: Point(x: 0, y: 0)
 
 It is the same declaration as `var`, plus a **compile-time type constraint**:
 the value (and any later assignment) must be assignable to the declared type, or
-you get a compile error.
+you get a compile error. In particular a **non-`opt` typed variable can never be
+`none`** — `int a = none`, a later `a = none`, or `Point p; p = none` are all
+compile errors. (A plain `var x;` is implicitly nullable — equivalent to
+`var? x;` — so it stays exempt; an `int? a` / `opt int a` accepts `none`.)
 
   * **Scalars** (`bool`/`int`/`float`/`str`) pin the variable's type. Assigning
     an incompatible value is an error (`int x = "hi"`, `int x = 3.5`, or a later
@@ -1697,8 +1700,11 @@ of a `const` (or of any object you want to change deeply without affecting the
 source). Scalars and strings are returned unchanged.
 
 #### `type(value)`
-Return the name of the type of the given value in string-form (e.g. `"int"`,
-`"bool"`, `"str"`, `"arr"`). Useful for debugging.
+Return the name of the type of the given **value** in string-form (e.g. `"int"`,
+`"bool"`, `"str"`, `"arr"`). This is the value's *runtime* type, so a nullable
+variable that currently holds `none` reads as `"none"`. For the *declared/static*
+type of a **variable** (e.g. `"opt int"` for an `int? a` that is none), use
+[`decltype(var)`](#decltypevariable). Useful for debugging.
 
 #### `hash(value)`
 Return the integer hash used by dictionaries internally when `value` is a key.
@@ -2098,10 +2104,10 @@ To get a polymorphic (general) array on purpose:
 ### Non-const reflection builtins
 Runtime introspection of the live program state. They are ordinary (non-const)
 builtins, so **scripts and tests** use them too, not only the REPL — and the
-REPL's `:help` / `:globals` / `:trace` commands build on them. (For a symbol's
-*inferred static type* or the optimizer's reasoning — which exist only at
-compile time — use the REPL's `:type` / `:trace`; those views aren't available
-to a running script.)
+REPL's `:help` / `:globals` / `:trace` commands build on them. (A *variable's*
+inferred static type is available to scripts via [`decltype`](#decltypevariable)
+below; the optimizer's reasoning exists only at compile time — use the REPL's
+`:trace` for it.)
 
 #### `globals()`
 Return a sorted `array<str>` of the names bound in the **global scope** —
@@ -2123,6 +2129,26 @@ array), `"dict<int,str>"` (probed from one entry; `"dict"` when empty), a struct
 instance's type name (`"Point"`), `"type Point"` for a struct *descriptor*, a
 function's signature, or `"exception"`. It is computed from the value alone, so
 it works in any script.
+
+#### `decltype(variable)`
+Return the **static type of a variable** — its declared or inferred type — as a
+string, resolved at compile time. Unlike [`type()`](#typevalue) and
+[`typeof()`](#typeofx), which inspect a *value*, `decltype` is a property of the
+*identifier*, so a nullable variable that currently holds `none` still reports
+its real type:
+
+```C#
+int? a;     decltype(a)  # "opt int"   (type(a) would be "none")
+dyn? d;     decltype(d)  # "opt dyn"
+int  x = 5; decltype(x)  # "int"
+var a = [1, 2, 3];   decltype(a)  # "array<int>"   (inferred)
+var m = {"k": 1};    decltype(m)  # "dict<str,int>"
+struct P { int x; } P p = P(1); decltype(p)  # "P"
+```
+
+The argument **must be a variable in scope** — a literal, an expression, or an
+unknown name is a compile error. (The format matches the REPL's `:type` and the
+compiler's error messages — `"opt int"`, not `"int?"`.)
 
 #### `signature(f)`
 Return a function's declared signature as a string, e.g.

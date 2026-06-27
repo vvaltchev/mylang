@@ -70,6 +70,28 @@ EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)
     return TypeNames[e.get_type()->t];
 }
 
+/*
+ * decltype(var): the STATIC (declared or inferred) type of a VARIABLE, as a
+ * string - e.g. "int", "opt int", "array<int>", a struct name. Unlike type()
+ * (the runtime type of a VALUE - so `int? a` holding none reads as "none"),
+ * this is a property of the IDENTIFIER, resolved at compile time. The
+ * inferencer validates the argument is an identifier in scope and folds it to a
+ * LiteralStr of its static type, which this returns. Under -nti (no inference)
+ * the argument stays an identifier - fall back to the runtime type, like type().
+ */
+EvalValue builtin_decltype(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+
+    if (dynamic_cast<LiteralStr *>(arg))   /* folded by the inferencer */
+        return RValue(arg->eval(ctx));
+
+    return TypeNames[RValue(arg->eval(ctx)).get_type()->t];
+}
+
 const std::array<Type *, Type::t_count> AllTypes =
 {
     /* Trivial types */
@@ -229,6 +251,11 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("ispuredecl", builtin_ispuredecl),
     make_builtin("intptr", builtin_intptr),
     make_builtin("array_storage", builtin_array_storage),
+
+    /* decltype(var): the static type of a variable (resolved at compile time by
+     * the inferencer). Non-const: not foldable at PARSE time (the type isn't
+     * known until inference); the inferencer folds it. See builtin_decltype. */
+    make_builtin("decltype", builtin_decltype),
 
     /* Runtime reflection (see builtins/reflect.cpp.h) */
     make_builtin("globals", builtin_globals),

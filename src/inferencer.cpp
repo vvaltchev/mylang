@@ -284,6 +284,12 @@ private:
     [[noreturn]] void nullability(const std::string &m, Loc s, Loc e);
     [[noreturn]] void argcount(const std::string &m, Loc s, Loc e);
 
+    /* `decltype(var)`: a compile-time query of a variable's static type. If the
+     * call is one, validate its argument is an identifier in scope and replace
+     * it with a LiteralStr of that type (the runtime builtin returns it), and
+     * return true; return false if it is not a decltype call. */
+    bool fold_decltype(CallExpr *call);
+
     /* An explicit SCALAR annotation (bool/int/float/str) as an STy, with the
      * symbol's opt flag applied; nullptr for none/array/dict (not pinned). */
     STyRef ann_scalar_sty(const TypeSym *s) {
@@ -2222,9 +2228,10 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.float_ty();
 
     if (n == "int")    return A.int_ty();
-    if (n == "str" || n == "type" || n == "chr" || n == "join" ||
-        n == "lpad" || n == "rpad" || n == "lstrip" || n == "rstrip" ||
-        n == "strip" || n == "readln" || n == "read" || n == "tmpdir")
+    if (n == "str" || n == "type" || n == "decltype" || n == "chr" ||
+        n == "join" || n == "lpad" || n == "rpad" || n == "lstrip" ||
+        n == "rstrip" || n == "strip" || n == "readln" || n == "read" ||
+        n == "tmpdir")
         return A.str_ty();
 
     if (n == "split" || n == "splitlines" || n == "readlines")
@@ -2974,6 +2981,42 @@ void Inferencer::check_if(IfStmt *i)
     with_narrow(i->elseBlock.get(), !in_then);
 }
 
+bool Inferencer::fold_decltype(CallExpr *call)
+{
+    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    if (!cid || cid->uid->val != "decltype")
+        return false;
+
+    /* a real user symbol named `decltype` shadows the builtin - not our call.
+     * (A builtin callee has a null id_sym entry, so test the value, not just
+     * presence - mirroring type_of's `!s && is_builtin` builtin detection.) */
+    auto cit = id_sym.find(cid);
+    if (cit != id_sym.end() && cit->second)
+        return false;
+
+    ExprList *args = call->args.get();
+    if (args->elems.size() != 1)
+        argcount("decltype expects exactly one argument (a variable)",
+                 call->start, call->end);
+
+    auto *argid = dynamic_cast<Identifier *>(args->elems[0].get());
+    if (!argid)
+        mismatch("decltype expects a variable (an identifier)",
+                 args->elems[0]->start, args->elems[0]->end);
+
+    auto it = id_sym.find(argid);
+    if (it == id_sym.end() || !it->second)
+        mismatch("decltype: '" + std::string(argid->uid->val) +
+                     "' is not a variable in scope",
+                 argid->start, argid->end);
+
+    /* Fold to the variable's static type string (types are final in the check
+     * pass). The runtime decltype builtin just returns this literal. */
+    const std::string ts = sty_to_string(it->second->type);
+    args->elems[0] = make_unique<LiteralStr>(std::string_view(ts));
+    return true;
+}
+
 void Inferencer::check(Construct *n)
 {
     if (!n)
@@ -3018,6 +3061,8 @@ void Inferencer::check(Construct *n)
     }
 
     if (auto *call = dynamic_cast<CallExpr *>(n)) {
+        if (fold_decltype(call))
+            return;
         check_call(call);
         return;
     }
@@ -3185,6 +3230,29 @@ void Inferencer::check(Construct *n)
         check(e14->rvalue.get());
         if (!(e14->fl & pFlags::pInDecl))
             check(e14->lvalue.get());
+
+        /* An explicitly-typed NON-opt variable must never become none: reject
+         * `int a = none`, a later `a = none`, or assigning any nullable value
+         * to it. A plain `var x` (no annotation) is implicitly nullable and so
+         * exempt; an `int? a` / `opt int a` (opt annotation) accepts none. The
+         * check runs here, in the check pass, with FINAL types - so a transient
+         * none during the fixpoint (e.g. an array(N) element before a write
+         * pins it) is not misflagged. */
+        if (strict_dyn && e14->op == Op::assign) {
+            if (auto *lid = dynamic_cast<Identifier *>(e14->lvalue.get())) {
+                auto it = id_sym.find(lid);
+                if (it != id_sym.end() && it->second) {
+                    STyRef d = ann_scalar_sty(it->second);
+                    if (d && !d->opt &&
+                        is_optish(type_of(e14->rvalue.get())))
+                        nullability("'" + std::string(lid->uid->val) +
+                                        "' is declared '" + sty_to_string(d) +
+                                        "' and cannot be none",
+                                    e14->start, e14->end);
+                }
+            }
+        }
+
         if (e14->op != Op::assign) {
             /* compound assign: validate the implied binary op */
             STyRef l = type_of(e14->lvalue.get());

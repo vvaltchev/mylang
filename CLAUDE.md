@@ -903,7 +903,14 @@ decisions behind it: `plans/type-inference.md`,
   **scalar** annotation *pins* the symbol's type (`reset_round` seeds the
   declared `STy`, `contribute` keeps it and checks each value is `assignable` —
   so `int x = 3.5` / `int x = 5; x = 2.5` / a wrong-typed arg to a typed param
-  are errors, while `float f = 3` widens); `array`/`dict` are **generic** (only
+  are errors, while `float f = 3` widens). A **non-`opt` typed var can never be
+  `none`**: `int a = none` / a later `a = none` / `Point p; p = none` are a
+  `NullabilityEx`, checked in the **check pass** (`Expr14` branch, via
+  `ann_scalar_sty` + `is_optish` on the rvalue) — *not* `contribute`, which
+  defers on `none` so a transient none during the fixpoint (an `array(N)`
+  element before a write) isn't misflagged. A plain `var x` (no annotation) is
+  implicitly nullable and exempt; `int? a` / `opt int a` accepts `none`.
+  `array`/`dict` are **generic** (only
   the kind is checked, by `enforce_decl_types` in the strict block — element
   types stay inferred, so `array a = [1,2,3]` is still flat `array<int>`). A
   scalar error is gated by `strict_dyn` (off for the `-a`/`--debug-ti`
@@ -942,6 +949,21 @@ decisions behind it: `plans/type-inference.md`,
   param's `decl_struct`, and the inferencer copies it to the param `TypeSym`'s
   `ann_struct` - so the param pins to struct `A` and `check_call` rejects a
   wrong-struct argument. (No runtime coercion; a struct binds as-is.)
+- **`decltype(var)` - a variable's STATIC type, at compile time.** A non-const
+  builtin (`builtin_decltype`, `types.cpp`) whose result the inferencer makes:
+  `builtin_result` types `decltype(...)` as `str`, and `fold_decltype` (run in
+  the **check pass**, where types are final) validates the single argument is an
+  identifier resolved in scope (else `TypeMismatchEx`/`WrongArgCountEx`) and
+  **replaces `args->elems[0]` with a `LiteralStr` of `sty_to_string(its type)`**.
+  At runtime the builtin just returns that string literal (under `-nti`, where
+  nothing folds, it falls back to the value's runtime type, like `type()`). So
+  `int? a` → `"opt int"`, `dyn? d` → `"opt dyn"`, an inferred `var a=[1,2,3]` →
+  `"array<int>"`, a struct var → its name. This is the static counterpart to
+  `type()`/`typeof()` (which inspect a *value*, so a nullable var holding none
+  reads `"none"`); decltype is about the *identifier*. The string format matches
+  `:type` and error messages (`"opt int"`, not `"int?"`). The arg-slot rewrite
+  (not a whole-node replacement) avoids needing a slot-based walk in the
+  inferencer, since `args->elems` is a direct vector.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
   (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
   `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is
