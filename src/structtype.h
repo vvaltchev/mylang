@@ -39,8 +39,10 @@ enum class DeclType : unsigned char;
  * containers); `opt` is the `?` nullable suffix; `strct` is set when kind is a
  * user struct; `elem` (array) and `key`/`val` (dict) are the parameters (null
  * for the *generic* `array`/`dict` form, which leaves the element type to
- * inference). Built by `pTypeAnnot` (parser.cpp), converted to an `STy` by the
- * inferencer (`annot_to_sty`). Immutable after parse, so it is freely shared
+ * inference). Built by `pTypeAnnot` (parser.cpp), converted to an
+     `StaticType` by the
+ * inferencer (`annot_to_static_type`). Immutable after parse, so it is freely
+     shared
  * (a clone shares the same node).
  */
 struct TypeAnnot {

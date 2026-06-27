@@ -15,10 +15,13 @@ soundness is a property of the *source*, best checked on what the user wrote;
 resolved/inlined tree, and it stays after resolve_names. Inference also runs
 under `-nr` (validate-only), since type-checking *is* validation.
 
-### Q2. No `static_type` field on Construct; types live in inferencer side-tables.
-The inferencer owns an `STyArena` whose nodes die when the pass returns, so a
+### Q2. No `static_type` field on Construct; types live in inferencer
+side-tables.
+The inferencer owns an `StaticTypeArena` whose nodes die when the pass
+returns, so a
 pointer stored on an AST node would dangle afterwards. Instead the inferencer
-keeps `unordered_map<const Construct*, STyRef>` (expr types) + its own symbol
+keeps `unordered_map<const Construct*, StaticTypeRef>` (expr types) + its own
+symbol
 table. syntax.h is untouched. When M8 (speed) needs persistent per-node types,
 add the field then and keep the arena alive — not needed for inference+checking.
 
@@ -94,7 +97,7 @@ Delivered M0-M7: the inferencer is **on by default** and the whole suite
   ~2.8x on primes_sqrt; float-heavy numeric loops now beat CPython.
 - **Flow-sensitive null narrowing** (`if (x != none)`, `if (x)`, `if (x==none)
   return; ...` guard).
-- **Exact const-container element types** (`sty_from_value` recurses;
+- **Exact const-container element types** (`static_type_from_value` recurses;
   heterogeneous -> `array<dyn>`; element joins absorb None; empty/`dyn` element
   fits any array).
 

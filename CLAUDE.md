@@ -267,7 +267,8 @@ interactive REPL" below; `trace.cpp` is the diagnostic tracer and
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
 - `stype.cpp` / `stype.h` — the **static-type lattice** for type inference
-  (`STy`/`STyArena`: `resolve`/`unify`/`assignable`/`join`/`equal`/
+  (`StaticType`/`StaticTypeArena`:
+  `resolve`/`unify`/`assignable`/`join`/`equal`/
   `to_string`). Distinct from the runtime `Type *` ops table — this is what the
   compile-time inferencer reasons over (type variables, nullability `opt`,
   structural array/dict/func shapes). See `plans/type-inference.md`.
@@ -799,7 +800,8 @@ variable, parameter, and function return a fixed static type and **rejects type
 violations before the program runs**. Gated by `-nti` (default ON; also runs
 under `-nr`, since type-checking is validation). It runs *after* parsing but
 *before* `resolve_names`, on the clean tree (not the inlined one), and stores
-nothing on the AST — it owns an `STyArena` (`stype.h`) and side tables, so it
+nothing on the AST — it owns an `StaticTypeArena` (`stype.h`) and side tables,
+so it
 leaves the tree untouched for the later passes (the one exception is the
 named-argument desugaring below, a deliberate lowering). Full design + the
 decisions behind it: `plans/type-inference.md`,
@@ -849,7 +851,8 @@ decisions behind it: `plans/type-inference.md`,
   byte-identically wherever it is lowered. (`intern_msg`, the stable-message
   helper the compile errors need, is likewise shared from `errors.h`.)
 
-- **Static types** are `STy` (`stype.h`), distinct from the runtime `Type *`:
+- **Static types** are `StaticType` (`stype.h`), distinct from the runtime
+  `Type *`:
   `None` (the only-none / not-yet-pinned unit), `Bool`, `Int`, `Float`, `Str`,
   `Array<elem>`, `Dict<k,v>`, `Func(params)->ret`, `Exception`, `Dyn` (explicit
   top), each with an `opt` (nullable) flag. The lattice ops are
@@ -893,7 +896,8 @@ decisions behind it: `plans/type-inference.md`,
   combinations are `T` / `opt T` / `dyn` / `opt dyn`. Implemented as
   `Identifier::{opt_mod,dyn_mod}` (params, via `pFuncParam`) and
   `pFlags::{pInOptDecl,pInDynDecl}` (decls; both can be set, for `opt dyn`).
-  In `STy`, `opt dyn` is `g_dyn[1]` (the opt-`Dyn` ground); `with_opt` carries
+  In `StaticType`, `opt dyn` is `g_dyn[1]` (the opt-`Dyn` ground); `with_opt`
+  carries
   the opt bit onto a `Dyn` kind, and `join` keeps it when a mix collapses to dyn
   (`dyn | none` → `opt dyn`).
 - **Explicit type annotations** (`int x = 5;`, `func f(str s)`,
@@ -909,12 +913,14 @@ decisions behind it: `plans/type-inference.md`,
   propagated by the resolver from the declaration to every use** (so a
   reassignment can coerce). Semantics, in the inferencer (`TypeSym::ann`): a
   **scalar** annotation *pins* the symbol's type (`reset_round` seeds the
-  declared `STy`, `contribute` keeps it and checks each value is `assignable` —
+  declared `StaticType`, `contribute` keeps it and checks each value is
+  `assignable` —
   so `int x = 3.5` / `int x = 5; x = 2.5` / a wrong-typed arg to a typed param
   are errors, while `float f = 3` widens). A **non-`opt` typed var can never be
   `none`**: `int a = none` / a later `a = none` / `Point p; p = none` are a
   `NullabilityEx`, checked in the **check pass** (`Expr14` branch, via
-  `ann_scalar_sty` + `is_optish` on the rvalue) — *not* `contribute`, which
+  `ann_scalar_static_type` + `is_optish` on the rvalue) — *not* `contribute`,
+  which
   defers on `none` so a transient none during the fixpoint (an `array(N)`
   element before a write) isn't misflagged. A plain `var x` (no annotation) is
   implicitly nullable and exempt; `int? a` / `opt int a` accepts `none`.
@@ -949,11 +955,13 @@ decisions behind it: `plans/type-inference.md`,
   `SyntaxErrorEx` ("'foo' is not a type"), not a silent fall-through. Rides on
   `Identifier::decl_struct` (the `StructTypeDef*`) with `decl_type ==
   DeclType::strct`, threaded via `ParseContext::pending_decl_struct`. The
-  inferencer pins it exactly like a scalar annotation: `ann_scalar_sty` returns
+  inferencer pins it exactly like a scalar annotation:
+  `ann_scalar_static_type` returns
   `A.struct_ty(ann_struct, ...)` (the TypeSym gains `ann_struct`), so
   `reset_round`/`contribute` pin the var and reject a wrong struct
   (`A x = B(...)` / a later `x = B(...)` → `TypeMismatchEx`, via `struct_def`
-  identity in `sty_assignable`). **Runtime:** no coercion (a struct binds
+  identity in `static_type_assignable`). **Runtime:** no coercion (a struct
+  binds
   as-is). An **uninitialized** struct var **zero-initializes recursively**
   (`build_zero_struct_init`, `parser.cpp`): it desugars `A obj;` to the
   constructor call `A(<zero per field>)` - 0/0.0/false/""/[]/{} per field
@@ -978,11 +986,14 @@ decisions behind it: `plans/type-inference.md`,
   the var name follows); `pFuncParam` and the struct-field parser do the same.
   Nested generics' merged closing token is handled by **`pAcceptCloseAngle`**
   (the `pending_gt` counter splits a `>>`/`>>>` across levels - the C++11
-  trick), so no `>>` lexer change. The inferencer's **`annot_to_sty`** turns a
-  `TypeAnnot` into an `STy`; `ann_scalar_sty` returns it (so a parameterized
+  trick), so no `>>` lexer change. The inferencer's **`annot_to_static_type`**
+  turns a
+  `TypeAnnot` into an `StaticType`; `ann_scalar_static_type` returns it (so a
+  parameterized
   container is **pinned to its full type** exactly like a scalar - `reset_round`
   seeds it, `contribute` checks each value/element is `assignable`, the non-opt
-  `none` rule applies), and `field_sty` uses `fd.annot`. `enforce_decl_types`
+  `none` rule applies), and `field_static_type` uses `fd.annot`.
+  `enforce_decl_types`
   (the generic kind-only check) skips a pinned (`ann_annot`) symbol. A wrong
   element type (`array<int> a = ["x"]`, a reassign, a struct-field arg, a
   dyn-laundered `append(a,"x")`) is a compile error. **Flat storage:** the
@@ -1000,9 +1011,10 @@ decisions behind it: `plans/type-inference.md`,
   (`decltype` requires an identifier-in-scope, else `TypeMismatchEx`/
   `WrongArgCountEx`; the others take any expression via `type_of`), and
   **replaces `args->elems[0]`** with the folded literal: a `LiteralStr` for
-  `typestr` (`sty_to_string`) / `kindstr` (`sty_kind_string` - the bare kind,
+  `typestr` (`static_type_to_string`) / `kindstr` (`static_type_kind_string` -
+  the bare kind,
   matching runtime `TypeNames`), or a baked **const `LiteralObj` Type object**
-  (`build_type_value(STy)`, recursive) for `type`/`decltype`. The runtime
+  (`build_type_value(StaticType)`, recursive) for `type`/`decltype`. The runtime
   builtin (`types.cpp`) returns args[0]; under `-nti` it builds from the runtime
   value instead (`make_runtime_type_value` - a flat Type; `reflect_typeof` for
   the strings). `Type` is a native composite type (`native_struct_type_def`,
@@ -1011,7 +1023,7 @@ decisions behind it: `plans/type-inference.md`,
   first); `typestr(x)`/`kindstr(x)` are the cheap string forms. The arg-slot
   rewrite (not a whole-node replacement) needs no slot-based inferencer walk
   (`args->elems` is a direct vector). The `?`-suffix nullability format
-  (`sty_to_string`) matches `:type` and error messages.
+  (`static_type_to_string`) matches `:type` and error messages.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
   (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
   `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is
@@ -1095,13 +1107,15 @@ decisions behind it: `plans/type-inference.md`,
   (then), `if (x == none) ... else` (else), and the guard clause
   `if (x == none) return/throw; ...` (rest of the block). Sound (the branch
   guarantees non-none). Not flow-narrowed elsewhere.
-- **Const-container types are exact** (`sty_from_value` recurses): a folded
+- **Const-container types are exact** (`static_type_from_value` recurses): a
+  folded
   const array/dict is typed `array<T>`/`dict<K,V>` from its actual elements
   (heterogeneous -> `array<dyn>`; individual elements stay exact via const-fold
   of a constant-index access). Container element joins absorb `None`
   (`join_elem`) so `array(N)`-then-fill stays `array<int>`, not opt-element;
   an empty `[]` (`array<none>`) or a `dyn`-element container fits any
-  `array<T>` (`sty_elem_compat` — invariance relaxed at the bottom/top element).
+  `array<T>` (`static_type_elem_compat` — invariance relaxed at the bottom/top
+  element).
 - **Interaction**: const scalars are already inlined to literals before this
   pass runs, so it never sees them as symbols. A statically-known type error
   that used to surface as a runtime `TypeErrorEx`/`NotCallableEx` is now a
@@ -1912,7 +1926,8 @@ but the per-element `StructObject` allocation is gone (build overhead
   `Construct::arr_hint_struct`, honored by `LiteralArray`/`LiteralObj`), so
   `var a=[]; append(a, S(..))` stays unboxed. Hot paths touch bytes directly
   (subscript read/store, append, `==`, `to_string`, clone/const-clone,
-  `sty_from_value`); **`foreach` reuses one `StructObject`** across iterations
+  `static_type_from_value`); **`foreach` reuses one `StructObject`** across
+  iterations
   (overwrite-in-place with a `use_count` COW guard, so a captured element keeps
   its value). Cold ops (insert/sort/map/...) **auto-promote** to a general array
   via `get_vec()`'s `promote_structs_to_general()`, so every existing array op
@@ -1971,8 +1986,10 @@ but the per-element `StructObject` allocation is gone (build overhead
   `construct_struct` builds the boxed instance; `coerce_struct_field`
   coerces a numeric field and **runtime-validates** each field's type (guarding
   a `dyn`-laundered value; the `dynarray`-style escape hatch is just declaring
-  the field `dyn`). `type_of(Point(..))` is `STyKind::Struct` (`stype.h`'s
-  reserved `Struct` kind + `struct_def`/`struct_name`; `STyArena::struct_ty`).
+  the field `dyn`). `type_of(Point(..))` is `StaticTypeKind::Struct`
+  (`stype.h`'s
+  reserved `Struct` kind + `struct_def`/`struct_name`;
+  `StaticTypeArena::struct_ty`).
 - **Member access** (`MemberExpr::do_eval`): dispatch on the base — a `t_struct`
   instance → `def->slot_of(memUid)` field (an lvalue when mutable, an rvalue for
   a read-only/const instance so a write fails `NotLValueEx`) else a `const`
@@ -1984,7 +2001,8 @@ but the per-element `StructObject` allocation is gone (build overhead
 - **`const` works fully**: a struct construction folds **inside a `const` decl**
   (`construct_struct`'s own validation makes it safe), baked deep read-only by
   `make_const_clone`; `MakeConstructFromConstVal` / `clone_to_mutable` /
-  `is_readonly_value` / `ShouldConstSymbolExistAtRuntime` / `sty_from_value` all
+  `is_readonly_value` / `ShouldConstSymbolExistAtRuntime` /
+  `static_type_from_value` all
   handle a struct value. Outside a `const` decl, construction is left a runtime
   `CallExpr` so the inferencer gives the precise field errors.
 - **Value semantics**: COW like arrays/dicts (`StructObject::readonly` backs a

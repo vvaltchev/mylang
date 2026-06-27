@@ -46,8 +46,8 @@ struct FuncInfo;
 
 struct TypeSym {
     const UniqueId *name = nullptr;
-    STyRef type = nullptr;     /* stable type read by type_of() */
-    STyRef acc = nullptr;      /* accumulator built during a round */
+    StaticTypeRef type = nullptr;     /* stable type read by type_of() */
+    StaticTypeRef acc = nullptr;      /* accumulator built during a round */
     bool dyn_decl = false;
     bool opt_decl = false;
     /* Explicit type annotation (`int x`, `func f(str s)`, `array a`); `none`
@@ -98,8 +98,8 @@ struct TypeSym {
 struct FuncInfo {
     FuncDeclStmt *decl = nullptr;
     std::vector<TypeSym *> params;
-    STyRef ret = nullptr;        /* stable return type */
-    STyRef ret_acc = nullptr;    /* return accumulator (current round) */
+    StaticTypeRef ret = nullptr;        /* stable return type */
+    StaticTypeRef ret_acc = nullptr;    /* return accumulator (current round) */
     bool falls_through = false;
     bool pinned = false;         /* committed by a prior REPL input */
     /*
@@ -164,9 +164,9 @@ public:
 
 private:
 
-    STyArena A;
+    StaticTypeArena A;
     Construct *root;
-    STyRef bottom = nullptr;     /* the shared Unknown identity for join */
+    StaticTypeRef bottom = nullptr;   /* shared Unknown identity (join) */
 
     std::vector<std::unique_ptr<TypeSym>> all_syms;
     std::vector<std::unique_ptr<FuncInfo>> all_funcs;
@@ -212,7 +212,7 @@ private:
 
     /* Flow-sensitive null narrowing (check pass only): inside the proven branch
      * of `if (x != none)` / `if (x)`, x reads as non-opt. */
-    std::unordered_map<const TypeSym *, STyRef> narrowed;
+    std::unordered_map<const TypeSym *, StaticTypeRef> narrowed;
     bool narrowing_on = false;
 
     void infer_one(Block *root);     /* the per-root passes (shared) */
@@ -230,34 +230,36 @@ private:
     void walk_struct(Construct *n, Scope *s);
     void declare_funcdecl(FuncDeclStmt *fd, Scope *s);
     void declare_structdecl(StructDeclStmt *sd, Scope *s);
-    STyRef field_sty(const FieldDef &fd);    /* a struct field's static type */
-    STyRef annot_to_sty(const TypeAnnot *ta); /* a parsed TypeAnnot -> STy */
+    /* a struct field's static type */
+    StaticTypeRef field_static_type(const FieldDef &fd);
+    /* a parsed TypeAnnot -> StaticType */
+    StaticTypeRef annot_to_static_type(const TypeAnnot *ta);
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
     void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
     void lower_named_args(Construct *n);        /* desugar named-arg calls */
     void lower_call_named_args(CallExpr *call); /* ...for one call */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
-    static bool type_has_dyn(STyRef t, bool deep);
+    static bool type_has_dyn(StaticTypeRef t, bool deep);
 
     /* type computation (reads stable `type`) */
-    STyRef type_of(const Construct *e);
-    STyRef func_sty(FuncInfo *fi);
-    STyRef binop_result(Op op, STyRef a, STyRef b);
-    STyRef unary_result(Op op, STyRef a);
-    STyRef builtin_result(const UniqueId *name, ExprList *args);
-    STyRef sty_from_value(const EvalValue &v);
+    StaticTypeRef type_of(const Construct *e);
+    StaticTypeRef func_static_type(FuncInfo *fi);
+    StaticTypeRef binop_result(Op op, StaticTypeRef a, StaticTypeRef b);
+    StaticTypeRef unary_result(Op op, StaticTypeRef a);
+    StaticTypeRef builtin_result(const UniqueId *name, ExprList *args);
+    StaticTypeRef static_type_from_value(const EvalValue &v);
     static Op compound_binop(Op op);
 
     /* fixpoint */
     void reset_round();
     void commit_round();
     void accumulate(Construct *n);
-    void contribute(TypeSym *s, STyRef t, Loc loc);
-    void contribute_arg(TypeSym *param, STyRef argT, Loc loc);
-    void contribute_ret(STyRef t);
+    void contribute(TypeSym *s, StaticTypeRef t, Loc loc);
+    void contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc);
+    void contribute_ret(StaticTypeRef t);
     void accumulate_assign(Expr14 *e);
-    void contribute_to_lvalue(Construct *lv, STyRef ct, Loc loc);
+    void contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc);
     void accumulate_call(CallExpr *call);
     void accumulate_foreach(ForeachStmt *fe);
     void spread_idlist(IdList *idl, Construct *rvalue);
@@ -269,7 +271,7 @@ private:
     FuncDeclStmt *make_template_clone(FuncInfo *tmpl, const std::string &key,
                                       Block *root);
     std::string template_sig_key(FuncInfo *tmpl,
-                                  const std::vector<STyRef> &sig);
+                                  const std::vector<StaticTypeRef> &sig);
     void collect_calls(Construct *n,
                        std::vector<std::pair<CallExpr *, bool>> &out,
                        bool in_func = false);
@@ -284,7 +286,7 @@ private:
     void check_struct_construction(CallExpr *call, const StructTypeDef *def);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
                       bool arith);
-    void require_nonopt(STyRef t, Loc s, Loc e, const char *what);
+    void require_nonopt(StaticTypeRef t, Loc s, Loc e, const char *what);
     [[noreturn]] void mismatch(const std::string &m, Loc s, Loc e);
     [[noreturn]] void nullability(const std::string &m, Loc s, Loc e);
     [[noreturn]] void argcount(const std::string &m, Loc s, Loc e);
@@ -295,15 +297,15 @@ private:
      * kind for kindstr) and return true; false otherwise. See the def below. */
     bool fold_type_query(CallExpr *call);
 
-    /* The STy a declaration's annotation PINS the symbol to (seeded by
+    /* The StaticType a declaration's annotation PINS the symbol to (seeded by
      * reset_round, checked by contribute), or nullptr when it does not pin: a
      * scalar (bool/int/float/str), a struct, OR a parameterized container
      * (`array<int>`, `dict<str,P>`). A *generic* `array`/`dict` (no annot)
      * returns nullptr - it constrains only the kind (enforce_decl_types). */
-    STyRef ann_scalar_sty(const TypeSym *s) {
+    StaticTypeRef ann_scalar_static_type(const TypeSym *s) {
         const bool o = s->opt_decl;
         if (s->ann_annot) {        /* parameterized array<>/dict<>: full pin */
-            STyRef t = annot_to_sty(s->ann_annot.get());
+            StaticTypeRef t = annot_to_static_type(s->ann_annot.get());
             return o ? A.with_opt(t, true) : t;
         }
         switch (s->ann) {
@@ -323,27 +325,28 @@ private:
     }
 
     /* small predicates */
-    STyRef strip(STyRef t) { return A.with_opt(t, false); }
-    static bool is_num(STyRef t) {
-        t = sty_resolve(t);
-        return t->kind == STyKind::Bool || t->kind == STyKind::Int ||
-               t->kind == STyKind::Float;
+    StaticTypeRef strip(StaticTypeRef t) { return A.with_opt(t, false); }
+    static bool is_num(StaticTypeRef t) {
+        t = static_type_resolve(t);
+        return t->kind == StaticTypeKind::Bool || t->kind ==
+            StaticTypeKind::Int ||
+               t->kind == StaticTypeKind::Float;
     }
-    static bool is_dyn(STyRef t) {
-        return sty_resolve(t)->kind == STyKind::Dyn;
+    static bool is_dyn(StaticTypeRef t) {
+        return static_type_resolve(t)->kind == StaticTypeKind::Dyn;
     }
-    static bool is_none(STyRef t) {
-        return sty_resolve(t)->kind == STyKind::None;
+    static bool is_none(StaticTypeRef t) {
+        return static_type_resolve(t)->kind == StaticTypeKind::None;
     }
-    static bool is_unknown(STyRef t) {
-        return sty_resolve(t)->kind == STyKind::Unknown;
+    static bool is_unknown(StaticTypeRef t) {
+        return static_type_resolve(t)->kind == StaticTypeKind::Unknown;
     }
-    static bool is_optish(STyRef t) {
-        t = sty_resolve(t);
-        return t->opt || t->kind == STyKind::None;
+    static bool is_optish(StaticTypeRef t) {
+        t = static_type_resolve(t);
+        return t->opt || t->kind == StaticTypeKind::None;
     }
-    static bool is_func(STyRef t) {
-        return sty_resolve(t)->kind == STyKind::Func;
+    static bool is_func(StaticTypeRef t) {
+        return static_type_resolve(t)->kind == StaticTypeKind::Func;
     }
 };
 
@@ -587,13 +590,13 @@ void Inferencer::collect_calls(Construct *n,
 
 /* Dedup key for an instantiation: the template identity + the signature. */
 std::string Inferencer::template_sig_key(FuncInfo *tmpl,
-                                         const std::vector<STyRef> &sig)
+                                         const std::vector<StaticTypeRef> &sig)
 {
     std::string k = "T";
     k += std::to_string(reinterpret_cast<uintptr_t>(tmpl));
-    for (STyRef t : sig) {
+    for (StaticTypeRef t : sig) {
         k += ";";
-        k += sty_to_string(t);
+        k += static_type_to_string(t);
     }
     return k;
 }
@@ -710,13 +713,14 @@ bool Inferencer::instantiate_round(Block *rootBlock)
          * non-opt) only; opt/typed/dyn params just join within the clone. A
          * template param is non-opt, so min_args > its index => its arg is
          * always present. */
-        std::vector<STyRef> sig;
+        std::vector<StaticTypeRef> sig;
         bool ready = true;
         for (size_t i = 0; i < nparams; i++) {
             TypeSym *p = tmpl->params[i];
             if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
                 continue;       /* not a template param */
-            STyRef t = sty_resolve(type_of(call->args->elems[i].get()));
+            StaticTypeRef t =
+                static_type_resolve(type_of(call->args->elems[i].get()));
             if (is_unknown(t)) { ready = false; break; }
             sig.push_back(t);
         }
@@ -785,7 +789,7 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             for (size_t i = 0; i < sig.size(); i++) {
                 if (i)
                     ss += ", ";
-                ss += sty_to_string(sig[i]);
+                ss += static_type_to_string(sig[i]);
             }
             const std::string nm = tmpl->decl->id
                 ? std::string(tmpl->decl->id->get_str())
@@ -937,7 +941,7 @@ void Inferencer::infer_one(Block *rootBlock)
                              : s->const_decl ? "const" : "var";
             TRACE(infer, 0, std::string(kind) + " " +
                             std::string(s->name->val) + " : " +
-                            sty_to_string(s->type) + "  (final)");
+                            static_type_to_string(s->type) + "  (final)");
         }
         for (auto &up : all_funcs) {
             if (up->pinned || !up->decl || !up->decl->id)
@@ -950,7 +954,7 @@ void Inferencer::infer_one(Block *rootBlock)
                           ? std::string(up->params[i]->name->val)
                           : std::string("_");
                 if (!up->is_template)            /* a template's are unbound */
-                    ps += ": " + sty_to_string(up->params[i]->type);
+                    ps += ": " + static_type_to_string(up->params[i]->type);
             }
             if (up->is_template)
                 TRACE(infer, 0, "func " +
@@ -959,7 +963,7 @@ void Inferencer::infer_one(Block *rootBlock)
             else
                 TRACE(infer, 0, "func " +
                                 std::string(up->decl->id->get_str()) + "(" +
-                                ps + ") -> " + sty_to_string(up->ret) +
+                                ps + ") -> " + static_type_to_string(up->ret) +
                                 "  (final)");
         }
     }
@@ -1081,8 +1085,8 @@ std::string Inferencer::global_type_str(const UniqueId *name)
     if (it == global->syms.end() || !it->second)
         return "";
     TypeSym *s = it->second;
-    STyRef ty = s->func ? func_sty(s->func) : s->type;
-    return sty_to_string(ty);
+    StaticTypeRef ty = s->func ? func_static_type(s->func) : s->type;
+    return static_type_to_string(ty);
 }
 
 std::vector<std::string>
@@ -1097,7 +1101,7 @@ Inferencer::func_param_types(const FuncDeclStmt *fn)
         if (up->is_template)        /* an un-instantiated template: unbound */
             return out;
         for (TypeSym *p : up->params)
-            out.push_back(p ? sty_to_string(p->type) : std::string());
+            out.push_back(p ? static_type_to_string(p->type) : std::string());
         return out;
     }
     return out;
@@ -1113,7 +1117,7 @@ Inferencer::func_return_type(const FuncDeclStmt *fn)
             continue;
         if (up->is_template)        /* an un-instantiated template: unbound */
             return "";
-        return sty_to_string(up->ret);
+        return static_type_to_string(up->ret);
     }
     return "";
 }
@@ -1136,20 +1140,20 @@ Inferencer::instance_has_consumer(const FuncDeclStmt *fn)
  * dynamic-element arrays). Function types are NOT recursed into: a var holding
  * a `func(dyn)->int` holds a concrete function value.
  */
-bool Inferencer::type_has_dyn(STyRef t, bool deep)
+bool Inferencer::type_has_dyn(StaticTypeRef t, bool deep)
 {
-    t = sty_resolve(t);
+    t = static_type_resolve(t);
 
-    if (t->kind == STyKind::Dyn)
+    if (t->kind == StaticTypeKind::Dyn)
         return true;
 
     if (!deep)
         return false;
 
-    if (t->kind == STyKind::Array)
+    if (t->kind == StaticTypeKind::Array)
         return type_has_dyn(t->elem, true);
 
-    if (t->kind == STyKind::Dict)
+    if (t->kind == StaticTypeKind::Dict)
         return type_has_dyn(t->key, true) || type_has_dyn(t->val, true);
 
     return false;
@@ -1173,24 +1177,27 @@ void Inferencer::enforce_decl_types()
         if (s->func || s->pinned || !s->decl_loc)
             continue;
         /* A PARAMETERIZED container is already pinned to its full type (kind +
-         * element) via ann_scalar_sty in reset_round/contribute, so the
+         * element) via ann_scalar_static_type in reset_round/contribute, so the
          * kind-only check here is redundant - skip it. */
         if (s->ann_annot)
             continue;
 
-        STyRef t = sty_resolve(s->type);
+        StaticTypeRef t = static_type_resolve(s->type);
         /* Defer on a not-yet-pinned/none/dyn type (a never-written `array a;` is
          * array<none> which IS an array; an unresolved one is tolerated). */
-        if (t->kind == STyKind::None || t->kind == STyKind::Unknown ||
-            t->kind == STyKind::Dyn)
+        if (t->kind == StaticTypeKind::None || t->kind ==
+            StaticTypeKind::Unknown ||
+            t->kind == StaticTypeKind::Dyn)
             continue;
 
-        const STyKind want = s->ann == DeclType::arr ? STyKind::Array
-                                                     : STyKind::Dict;
+        const StaticTypeKind want = s->ann == DeclType::arr ?
+            StaticTypeKind::Array
+                                                     : StaticTypeKind::Dict;
         if (t->kind != want)
             mismatch("'" + std::string(s->name->val) + "' is declared '" +
                          (s->ann == DeclType::arr ? "array" : "dict") +
-                         "' but has type '" + sty_to_string(s->type) + "'",
+                         "' but has type '" + static_type_to_string(s->type) +
+                             "'",
                      s->decl_loc, s->decl_loc);
     }
 }
@@ -1223,7 +1230,7 @@ void Inferencer::enforce_concrete_decls()
         throw DynRequiredEx(
             intern_msg(
                 std::string(s->name->val) + ": " + what +
-                " has dynamic type '" + sty_to_string(s->type) +
+                " has dynamic type '" + static_type_to_string(s->type) +
                 "'; declare it 'dyn' (e.g. '" +
                 (s->const_decl ? "const dyn " : "var dyn ") +
                 std::string(s->name->val) + " = ...')"),
@@ -1291,14 +1298,14 @@ void Inferencer::dump_debug_ti(std::ostream &os)
                          : s->const_decl ? "const"
                          : "var";
 
-        STyRef ty = s->func ? func_sty(s->func) : s->type;
+        StaticTypeRef ty = s->func ? func_static_type(s->func) : s->type;
 
         os << "ti\t" << std::string(s->name->val)
            << "\t" << kind
            << "\t" << s->decl_loc.line
            << "\t" << s->decl_loc.col
            << "\t" << (s->const_decl ? 1 : 0)
-           << "\t" << sty_to_string(ty)
+           << "\t" << static_type_to_string(ty)
            << "\t";
 
         auto it = uses.find(s);
@@ -1322,16 +1329,16 @@ void Inferencer::annotate_hints(Construct *n)
     if (!n)
         return;
 
-    STyRef t = sty_resolve(type_of(n));
+    StaticTypeRef t = static_type_resolve(type_of(n));
     if (!t->opt) {
         /* bool is evaluated through the int (eval_int) path: it promotes to
          * 0/1, so a typed scalar over bool operands computes unboxed exactly
          * like int. The boxing in TypedScalarExpr::do_eval / LiteralBool keeps
          * the value bool where it must (a comparison/logical result, a bool
          * literal); arithmetic over bool correctly yields int. */
-        if (t->kind == STyKind::Int || t->kind == STyKind::Bool)
+        if (t->kind == StaticTypeKind::Int || t->kind == StaticTypeKind::Bool)
             n->th = TypeHint::i;
-        else if (t->kind == STyKind::Float)
+        else if (t->kind == StaticTypeKind::Float)
             n->th = TypeHint::f;
     }
 
@@ -1367,7 +1374,7 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     auto it = id_sym.find(id);
     if (it == id_sym.end() || !it->second)
         return;
-    STyRef ty = sty_resolve(it->second->type);
+    StaticTypeRef ty = static_type_resolve(it->second->type);
 
     /*
      * A `dyn`-typed destination (`var dyn d = ...`) means "I want a polymorphic
@@ -1376,15 +1383,15 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
      * Anything that is neither an array nor `dyn` has no array repr to pick.
      */
     ArrHint hint;
-    if (ty->kind == STyKind::Array) {
-        STyRef el = sty_resolve(ty->elem);
-        if (!el->opt && el->kind == STyKind::Int)
+    if (ty->kind == StaticTypeKind::Array) {
+        StaticTypeRef el = static_type_resolve(ty->elem);
+        if (!el->opt && el->kind == StaticTypeKind::Int)
             hint = ArrHint::flat_i;
-        else if (!el->opt && el->kind == STyKind::Float)
+        else if (!el->opt && el->kind == StaticTypeKind::Float)
             hint = ArrHint::flat_f;
-        else if (!el->opt && el->kind == STyKind::Bool)
+        else if (!el->opt && el->kind == StaticTypeKind::Bool)
             hint = ArrHint::flat_b;
-        else if (!el->opt && el->kind == STyKind::Struct &&
+        else if (!el->opt && el->kind == StaticTypeKind::Struct &&
                  static_cast<const StructTypeDef *>(el->struct_def) &&
                  static_cast<const StructTypeDef *>(el->struct_def)->is_pod())
             /* array<POD struct>: flat storage (the def lets even an empty
@@ -1392,7 +1399,7 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
             hint = ArrHint::flat_s;
         else
             hint = ArrHint::general;
-    } else if (ty->kind == STyKind::Dyn) {
+    } else if (ty->kind == StaticTypeKind::Dyn) {
         hint = ArrHint::general;
     } else {
         return;
@@ -1405,14 +1412,14 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
                        : hint == ArrHint::flat_s ? "flat (structs)"
                                                  : "general";
         TRACE(arrays, 0, std::string(id->get_str()) + "  dest " +
-              sty_to_string(ty) + " -> " + hn);
+              static_type_to_string(ty) + " -> " + hn);
     }
 
     /* the element struct type, needed by an empty flat_s array literal */
     const StructTypeDef *sdef =
         hint == ArrHint::flat_s
             ? static_cast<const StructTypeDef *>(
-                  sty_resolve(ty->elem)->struct_def)
+                  static_type_resolve(ty->elem)->struct_def)
             : nullptr;
 
     Construct *rv = e->rvalue.get();
@@ -1484,13 +1491,13 @@ void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
 /* The static type of one struct field (an array/dict field is generic - its
  * element/key/value are `dyn`, since v1 has no inference inside a struct). */
 /* Convert a parsed recursive TypeAnnot (array<int>, dict<str, Point>, ...) into
- * an STy, applying the `?` nullable flag at each level. */
-STyRef Inferencer::annot_to_sty(const TypeAnnot *ta)
+ * an StaticType, applying the `?` nullable flag at each level. */
+StaticTypeRef Inferencer::annot_to_static_type(const TypeAnnot *ta)
 {
     if (!ta)
         return A.dyn_ty();
 
-    STyRef base;
+    StaticTypeRef base;
     switch (ta->kind) {
         case DeclType::b:   base = A.bool_ty();  break;
         case DeclType::i:   base = A.int_ty();   break;
@@ -1502,26 +1509,26 @@ STyRef Inferencer::annot_to_sty(const TypeAnnot *ta)
                              : A.dyn_ty();
             break;
         case DeclType::arr:
-            base = A.array_of(annot_to_sty(ta->elem.get()));
+            base = A.array_of(annot_to_static_type(ta->elem.get()));
             break;
         case DeclType::dict:
-            base = A.dict_of(annot_to_sty(ta->key.get()),
-                             annot_to_sty(ta->val.get()));
+            base = A.dict_of(annot_to_static_type(ta->key.get()),
+                             annot_to_static_type(ta->val.get()));
             break;
         default: base = A.dyn_ty();
     }
     return A.with_opt(base, ta->opt);
 }
 
-STyRef Inferencer::field_sty(const FieldDef &fd)
+StaticTypeRef Inferencer::field_static_type(const FieldDef &fd)
 {
-    STyRef base;
+    StaticTypeRef base;
 
     /* A parameterized container field (`array<int> xs`) carries its element
      * type in `annot`; a generic `array`/`dict` field leaves it `dyn`. */
     if (fd.annot &&
         (fd.kind == FieldKind::f_array || fd.kind == FieldKind::f_dict)) {
-        base = annot_to_sty(fd.annot.get());
+        base = annot_to_static_type(fd.annot.get());
         return fd.is_opt ? A.with_opt(base, true) : base;
     }
 
@@ -1831,9 +1838,9 @@ void Inferencer::lower_named_args(Construct *n)
 
 /* --------------------------- type computation ---------------------------- */
 
-STyRef Inferencer::func_sty(FuncInfo *fi)
+StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
 {
-    std::vector<STyRef> ps;
+    std::vector<StaticTypeRef> ps;
     std::vector<bool> popt;
     for (TypeSym *p : fi->params) {
         ps.push_back(p->dyn_decl ? A.dyn_ty() : p->type);
@@ -1850,7 +1857,7 @@ STyRef Inferencer::func_sty(FuncInfo *fi)
  * individual elements are still exact via const-folding of any constant-index
  * access at parse time). Same for dict keys/values.
  */
-STyRef Inferencer::sty_from_value(const EvalValue &v)
+StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
 {
     Type *t = v.get_type();
     switch (t->t) {
@@ -1889,9 +1896,10 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
             ArrayConstView view = arr.get_view();
             if (view.size() == 0)
                 return A.array_of(A.none_ty());
-            STyRef el = sty_from_value(view[0].get());
+            StaticTypeRef el = static_type_from_value(view[0].get());
             for (size_type i = 1; i < view.size(); i++) {
-                STyRef j = A.join(el, sty_from_value(view[i].get()));
+                StaticTypeRef j = A.join(el,
+                    static_type_from_value(view[i].get()));
                 el = j ? j : A.dyn_ty();
             }
             return A.array_of(el);
@@ -1901,15 +1909,15 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
             const auto &m = v.get<intrusive_ptr<DictObject>>()->get_ref();
             if (m.empty())
                 return A.dict_of(A.none_ty(), A.none_ty());
-            STyRef k = nullptr, val = nullptr;
+            StaticTypeRef k = nullptr, val = nullptr;
             for (const auto &kv : m) {
-                STyRef kt = sty_from_value(kv.first);
-                STyRef vt = sty_from_value(kv.second.get());
+                StaticTypeRef kt = static_type_from_value(kv.first);
+                StaticTypeRef vt = static_type_from_value(kv.second.get());
                 if (!k) {
                     k = kt; val = vt;
                 } else {
-                    STyRef jk = A.join(k, kt);
-                    STyRef jv = A.join(val, vt);
+                    StaticTypeRef jk = A.join(k, kt);
+                    StaticTypeRef jv = A.join(val, vt);
                     k = jk ? jk : A.dyn_ty();
                     val = jv ? jv : A.dyn_ty();
                 }
@@ -1922,7 +1930,7 @@ STyRef Inferencer::sty_from_value(const EvalValue &v)
     }
 }
 
-STyRef Inferencer::type_of(const Construct *e)
+StaticTypeRef Inferencer::type_of(const Construct *e)
 {
     if (!e)
         return A.none_ty();
@@ -1936,9 +1944,9 @@ STyRef Inferencer::type_of(const Construct *e)
     if (auto *la = dynamic_cast<const LiteralArray *>(e)) {
         if (la->elems.empty())
             return A.array_of(A.none_ty());
-        STyRef el = type_of(la->elems[0].get());
+        StaticTypeRef el = type_of(la->elems[0].get());
         for (size_t i = 1; i < la->elems.size(); i++) {
-            STyRef j = A.join(el, type_of(la->elems[i].get()));
+            StaticTypeRef j = A.join(el, type_of(la->elems[i].get()));
             el = j ? j : A.dyn_ty();
         }
         return A.array_of(el);
@@ -1947,11 +1955,11 @@ STyRef Inferencer::type_of(const Construct *e)
     if (auto *ld = dynamic_cast<const LiteralDict *>(e)) {
         if (ld->elems.empty())
             return A.dict_of(A.none_ty(), A.none_ty());
-        STyRef k = type_of(ld->elems[0]->key.get());
-        STyRef val = type_of(ld->elems[0]->value.get());
+        StaticTypeRef k = type_of(ld->elems[0]->key.get());
+        StaticTypeRef val = type_of(ld->elems[0]->value.get());
         for (size_t i = 1; i < ld->elems.size(); i++) {
-            STyRef jk = A.join(k, type_of(ld->elems[i]->key.get()));
-            STyRef jv = A.join(val, type_of(ld->elems[i]->value.get()));
+            StaticTypeRef jk = A.join(k, type_of(ld->elems[i]->key.get()));
+            StaticTypeRef jv = A.join(val, type_of(ld->elems[i]->value.get()));
             k = jk ? jk : A.dyn_ty();
             val = jv ? jv : A.dyn_ty();
         }
@@ -1959,14 +1967,14 @@ STyRef Inferencer::type_of(const Construct *e)
     }
 
     if (auto *lo = dynamic_cast<const LiteralObj *>(e))
-        return sty_from_value(lo->literal_value());
+        return static_type_from_value(lo->literal_value());
 
     if (auto *id = dynamic_cast<const Identifier *>(e)) {
         auto it = id_sym.find(id);
         if (it != id_sym.end() && it->second) {
             TypeSym *s = it->second;
             if (s->func)
-                return func_sty(s->func);
+                return func_static_type(s->func);
             /* flow narrowing: in an `if (x != none)` branch, x is non-opt */
             if (narrowing_on) {
                 auto nit = narrowed.find(s);
@@ -2000,7 +2008,7 @@ STyRef Inferencer::type_of(const Construct *e)
 
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
         /* Expr03/04/06/07/11/12 */
-        STyRef t = type_of(mo->elems[0].second.get());
+        StaticTypeRef t = type_of(mo->elems[0].second.get());
         for (size_t i = 1; i < mo->elems.size(); i++)
             t = binop_result(mo->elems[i].first, t,
                              type_of(mo->elems[i].second.get()));
@@ -2033,7 +2041,7 @@ STyRef Inferencer::type_of(const Construct *e)
             if (s && s->func)
                 return s->func->ret;
             if (s && is_func(s->type))
-                return sty_resolve(s->type)->ret;
+                return static_type_resolve(s->type)->ret;
             if (s && is_unknown(s->type))
                 return bottom;          /* defer: callee not yet known */
             if (s && is_dyn(s->type))
@@ -2044,30 +2052,30 @@ STyRef Inferencer::type_of(const Construct *e)
              * the enclosing var isn't forced to `dyn`, masking that error. */
             return bottom;
         }
-        STyRef ct = type_of(callee);
-        if (is_unknown(sty_resolve(ct))) return bottom;   /* defer */
-        return is_func(ct) ? sty_resolve(ct)->ret : A.dyn_ty();
+        StaticTypeRef ct = type_of(callee);
+        if (is_unknown(static_type_resolve(ct))) return bottom;   /* defer */
+        return is_func(ct) ? static_type_resolve(ct)->ret : A.dyn_ty();
     }
 
     if (auto *sub = dynamic_cast<const Subscript *>(e)) {
-        STyRef w = sty_resolve(type_of(sub->what.get()));
+        StaticTypeRef w = static_type_resolve(type_of(sub->what.get()));
         /* Defer on Unknown OR None: a None base is a fixpoint transient (the
          * element of an array(N) before its element type is pinned); a genuine
          * non-subscriptable base is caught in the check pass. */
         if (is_unknown(w) || is_none(w)) return bottom;
-        if (w->kind == STyKind::Array) return w->elem;
+        if (w->kind == StaticTypeKind::Array) return w->elem;
         /* A dict read is non-opt: `d[k]` yields the value, the dict's default
          * (a default dict), or throws on a missing key - never none. Use
          * get()/get!() for explicit nullable / fail-fast lookup. */
-        if (w->kind == STyKind::Dict)  return w->val;
-        if (w->kind == STyKind::Str)   return A.str_ty();
+        if (w->kind == StaticTypeKind::Dict)  return w->val;
+        if (w->kind == StaticTypeKind::Str)   return A.str_ty();
         return A.dyn_ty();
     }
 
     if (auto *sl = dynamic_cast<const Slice *>(e)) {
-        STyRef w = sty_resolve(type_of(sl->what.get()));
+        StaticTypeRef w = static_type_resolve(type_of(sl->what.get()));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
-        if (w->kind == STyKind::Array || w->kind == STyKind::Str)
+        if (w->kind == StaticTypeKind::Array || w->kind == StaticTypeKind::Str)
             return w;
         return A.dyn_ty();
     }
@@ -2080,28 +2088,28 @@ STyRef Inferencer::type_of(const Construct *e)
             if (it != id_sym.end() && it->second && it->second->struct_type) {
                 const StructTypeDef *def = it->second->struct_type;
                 if (const EvalValue *cv = def->const_of(mem->memUid))
-                    return sty_from_value(*cv);
+                    return static_type_from_value(*cv);
                 return A.dyn_ty();
             }
         }
 
-        STyRef w = sty_resolve(type_of(mem->what.get()));
+        StaticTypeRef w = static_type_resolve(type_of(mem->what.get()));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
 
         /* A struct instance: `s.field` is the field's type (a dict read is
          * non-opt), `s.CONST` is the const member's type. */
-        if (w->kind == STyKind::Struct) {
+        if (w->kind == StaticTypeKind::Struct) {
             const StructTypeDef *def =
                 static_cast<const StructTypeDef *>(w->struct_def);
             if (const FieldDef *f = def->field_of(mem->memUid))
-                return field_sty(*f);
+                return field_static_type(*f);
             if (const EvalValue *cv = def->const_of(mem->memUid))
-                return sty_from_value(*cv);
+                return static_type_from_value(*cv);
             return A.dyn_ty();
         }
 
         /* `d.key` mirrors `d[key]`: non-opt (value / default / throws). */
-        if (w->kind == STyKind::Dict)
+        if (w->kind == StaticTypeKind::Dict)
             return w->val;
         return A.dyn_ty();
     }
@@ -2109,44 +2117,44 @@ STyRef Inferencer::type_of(const Construct *e)
     if (auto *fd = dynamic_cast<const FuncDeclStmt *>(e)) {
         auto it = func_of_decl.find(fd);
         if (it != func_of_decl.end())
-            return func_sty(it->second);
+            return func_static_type(it->second);
         return A.dyn_ty();
     }
 
     return A.dyn_ty();
 }
 
-STyRef Inferencer::unary_result(Op op, STyRef a)
+StaticTypeRef Inferencer::unary_result(Op op, StaticTypeRef a)
 {
     if (op == Op::invalid)
         return a;
     if (op == Op::lnot)
         return A.bool_ty();
     if (op == Op::plus || op == Op::minus) {
-        STyRef u = strip(sty_resolve(a));
+        StaticTypeRef u = strip(static_type_resolve(a));
         if (is_unknown(u)) return bottom;   /* defer: operand not yet known */
         /* unary +/- promotes bool to int (`-true` is int -1). */
-        if (u->kind == STyKind::Bool || u->kind == STyKind::Int)
+        if (u->kind == StaticTypeKind::Bool || u->kind == StaticTypeKind::Int)
             return A.int_ty();
-        if (u->kind == STyKind::Float)
+        if (u->kind == StaticTypeKind::Float)
             return A.float_ty();
         return A.dyn_ty();
     }
     if (op == Op::bnot) {
         /* unary ~ : int only (bool promotes to int); float/other is an error */
-        STyRef u = strip(sty_resolve(a));
+        StaticTypeRef u = strip(static_type_resolve(a));
         if (is_unknown(u)) return bottom;
-        if (u->kind == STyKind::Bool || u->kind == STyKind::Int)
+        if (u->kind == StaticTypeKind::Bool || u->kind == StaticTypeKind::Int)
             return A.int_ty();
         return A.dyn_ty();
     }
     return A.dyn_ty();
 }
 
-STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
+StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
 {
-    a = sty_resolve(a);
-    b = sty_resolve(b);
+    a = static_type_resolve(a);
+    b = static_type_resolve(b);
 
     /* comparisons / equality / logical always yield bool */
     if (op == Op::eq || op == Op::noteq || op == Op::lt || op == Op::gt ||
@@ -2156,7 +2164,7 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
     /* `str + anything` stringifies the RHS and yields str - even a dyn/none RHS
      * (so a `s = s + e` accumulator over a dyn element stays str). Handle it
      * before the dyn short-circuit below. */
-    if (op == Op::plus && strip(a)->kind == STyKind::Str)
+    if (op == Op::plus && strip(a)->kind == StaticTypeKind::Str)
         return A.str_ty();
 
     if (is_dyn(a) || is_dyn(b))
@@ -2185,15 +2193,15 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
     if (is_none(a) || is_none(b))
         return bottom;
 
-    STyRef au = strip(a), bu = strip(b);
+    StaticTypeRef au = strip(a), bu = strip(b);
     const bool an = is_num(au), bn = is_num(bu);
 
     /* Arithmetic over numeric operands promotes bool to int first (so
      * `true + true` is int 2, never bool), then joins along bool < int <
      * float. Comparisons/logical are handled above and stay bool. */
-    auto arith_join = [&](STyRef x, STyRef y) -> STyRef {
-        STyRef j = A.join(x, y);
-        if (j && sty_resolve(j)->kind == STyKind::Bool)
+    auto arith_join = [&](StaticTypeRef x, StaticTypeRef y) -> StaticTypeRef {
+        StaticTypeRef j = A.join(x, y);
+        if (j && static_type_resolve(j)->kind == StaticTypeKind::Bool)
             j = A.int_ty(j->opt);
         return j;
     };
@@ -2202,23 +2210,25 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
         case Op::plus:
             /* str + anything -> str (the RHS is stringified); but int/float +
              * str is an error (handled by falling through to dyn). */
-            if (au->kind == STyKind::Str)
+            if (au->kind == StaticTypeKind::Str)
                 return A.str_ty();
             if (an && bn) {
-                STyRef j = arith_join(au, bu);
+                StaticTypeRef j = arith_join(au, bu);
                 return j ? j : A.dyn_ty();
             }
-            if (au->kind == STyKind::Array && bu->kind == STyKind::Array) {
-                STyRef j = A.join(au, bu);
+            if (au->kind == StaticTypeKind::Array && bu->kind ==
+                StaticTypeKind::Array) {
+                StaticTypeRef j = A.join(au, bu);
                 return j ? j : A.array_of(A.dyn_ty());
             }
             return A.dyn_ty();
 
         case Op::times:
-            if (au->kind == STyKind::Str && bu->kind == STyKind::Int)
+            if (au->kind == StaticTypeKind::Str && bu->kind ==
+                StaticTypeKind::Int)
                 return A.str_ty();
             if (an && bn) {
-                STyRef j = arith_join(au, bu);
+                StaticTypeRef j = arith_join(au, bu);
                 return j ? j : A.dyn_ty();
             }
             return A.dyn_ty();
@@ -2227,7 +2237,7 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
         case Op::div:
         case Op::mod:
             if (an && bn) {
-                STyRef j = arith_join(au, bu);
+                StaticTypeRef j = arith_join(au, bu);
                 return j ? j : A.dyn_ty();
             }
             return A.dyn_ty();
@@ -2241,8 +2251,8 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
             /* bitwise/shift: int (or bool, which promotes) operands ONLY, ->
              * int. A float operand is an error (-> dyn here; the check pass
              * reports "operator does not apply"). */
-            if (an && bn && au->kind != STyKind::Float
-                    && bu->kind != STyKind::Float)
+            if (an && bn && au->kind != StaticTypeKind::Float
+                    && bu->kind != StaticTypeKind::Float)
                 return A.int_ty();
             return A.dyn_ty();
 
@@ -2256,19 +2266,19 @@ STyRef Inferencer::binop_result(Op op, STyRef a, STyRef b)
  * `dyn` otherwise (sound - the runtime still type-checks the call). See
  * plans/type-inference-questions.md Q8.
  */
-STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
+StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 {
     const std::string n(name->val);
-    auto arg = [&](size_t i) -> STyRef {
+    auto arg = [&](size_t i) -> StaticTypeRef {
         return i < args->elems.size() ? type_of(args->elems[i].get())
                                       : A.dyn_ty();
     };
-    auto elem_of = [&](STyRef c) -> STyRef {
-        c = sty_resolve(c);
+    auto elem_of = [&](StaticTypeRef c) -> StaticTypeRef {
+        c = static_type_resolve(c);
         if (is_unknown(c) || is_none(c)) return bottom;   /* defer */
-        if (c->kind == STyKind::Array) return c->elem;
-        if (c->kind == STyKind::Str)   return A.str_ty();
-        if (c->kind == STyKind::Dict)  return c->key;
+        if (c->kind == StaticTypeKind::Array) return c->elem;
+        if (c->kind == StaticTypeKind::Str)   return A.str_ty();
+        if (c->kind == StaticTypeKind::Dict)  return c->key;
         return A.dyn_ty();
     };
 
@@ -2330,7 +2340,7 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     }
     if (n == "make_array") {
         /* make_array(N, gen) -> array of the callback's return type. */
-        STyRef f = sty_resolve(arg(1));
+        StaticTypeRef f = static_type_resolve(arg(1));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
     }
@@ -2339,9 +2349,10 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
          * d[k] is non-opt). dict(pairs) -> dict<dyn,dyn>. A non-array arg is
          * the default value, which becomes the dict's value type. */
         if (args && args->elems.size() == 1) {
-            STyRef a0 = sty_resolve(arg(0));
+            StaticTypeRef a0 = static_type_resolve(arg(0));
             if (is_unknown(a0)) return bottom;
-            if (a0->kind != STyKind::Array && a0->kind != STyKind::None)
+            if (a0->kind != StaticTypeKind::Array && a0->kind !=
+                StaticTypeKind::None)
                 return A.dict_of(A.dyn_ty(), a0);
         }
         return A.dict_of(A.dyn_ty(), A.dyn_ty());
@@ -2350,9 +2361,9 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     /* get(d,key) -> opt V (nullable lookup); get!(d,key) -> V (or throws, so
      * the result is non-opt). */
     if (n == "get" || n == "get!") {
-        STyRef d = sty_resolve(arg(0));
+        StaticTypeRef d = static_type_resolve(arg(0));
         if (is_unknown(d)) return bottom;   /* defer */
-        STyRef v = d->kind == STyKind::Dict ? d->val : A.dyn_ty();
+        StaticTypeRef v = d->kind == StaticTypeKind::Dict ? d->val : A.dyn_ty();
         return n == "get!" ? v : A.with_opt(v, true);
     }
 
@@ -2369,12 +2380,12 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         /* min(array) -> the element type; min(a, b, ...) -> the join of args. */
         if (args->elems.size() == 1)
             return elem_of(arg(0));
-        STyRef t = arg(0);
+        StaticTypeRef t = arg(0);
         for (size_t i = 1; i < args->elems.size(); i++) {
-            if (is_unknown(sty_resolve(t)) ||
-                is_unknown(sty_resolve(arg(i))))
+            if (is_unknown(static_type_resolve(t)) ||
+                is_unknown(static_type_resolve(arg(i))))
                 return bottom;          /* defer */
-            STyRef j = A.join(t, arg(i));
+            StaticTypeRef j = A.join(t, arg(i));
             t = j ? j : A.dyn_ty();
         }
         return t;
@@ -2386,15 +2397,16 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "sum") {
         /* sum returns the element type, except a bool array sums to an int
          * (it counts the `true`s; bool promotes to int in arithmetic). */
-        STyRef el = elem_of(arg(0));
+        StaticTypeRef el = elem_of(arg(0));
         if (is_unknown(el))
             return bottom;
-        return sty_resolve(el)->kind == STyKind::Bool ? A.int_ty() : el;
+        return static_type_resolve(el)->kind == StaticTypeKind::Bool ?
+            A.int_ty() : el;
     }
 
     if (n == "map") {
         /* map(func, container) -> array of the callback's return type */
-        STyRef f = sty_resolve(arg(0));
+        StaticTypeRef f = static_type_resolve(arg(0));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
     }
@@ -2404,21 +2416,23 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return arg(0);             /* sort(array, [func]) -> array */
 
     if (n == "keys") {
-        STyRef d = sty_resolve(arg(0));
+        StaticTypeRef d = static_type_resolve(arg(0));
         if (is_unknown(d)) return bottom;   /* defer */
-        return A.array_of(d->kind == STyKind::Dict ? d->key : A.dyn_ty());
+        return A.array_of(d->kind == StaticTypeKind::Dict ? d->key :
+            A.dyn_ty());
     }
     if (n == "values") {
-        STyRef d = sty_resolve(arg(0));
+        StaticTypeRef d = static_type_resolve(arg(0));
         if (is_unknown(d)) return bottom;   /* defer */
-        return A.array_of(d->kind == STyKind::Dict ? d->val : A.dyn_ty());
+        return A.array_of(d->kind == StaticTypeKind::Dict ? d->val :
+            A.dyn_ty());
     }
     if (n == "kvpairs") {
         /* dict<k,v> -> array of [k, v] pairs, i.e. array<array<join(k,v)>>. */
-        STyRef d = sty_resolve(arg(0));
+        StaticTypeRef d = static_type_resolve(arg(0));
         if (is_unknown(d)) return bottom;   /* defer */
-        if (d->kind != STyKind::Dict) return A.array_of(A.dyn_ty());
-        STyRef pair = A.join(d->key, d->val);
+        if (d->kind != StaticTypeKind::Dict) return A.array_of(A.dyn_ty());
+        StaticTypeRef pair = A.join(d->key, d->val);
         return A.array_of(A.array_of(pair ? pair : A.dyn_ty()));
     }
     if (n == "find") {
@@ -2427,10 +2441,10 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
          * opt int index of the first match (or none). Only a fully-unknown,
          * non-container base stays opt dyn.
          */
-        STyRef d = sty_resolve(arg(0));
+        StaticTypeRef d = static_type_resolve(arg(0));
         if (is_unknown(d)) return bottom;   /* defer */
-        if (d->kind == STyKind::Dict) return A.with_opt(d->val, true);
-        if (d->kind == STyKind::Array || d->kind == STyKind::Str)
+        if (d->kind == StaticTypeKind::Dict) return A.with_opt(d->val, true);
+        if (d->kind == StaticTypeKind::Array || d->kind == StaticTypeKind::Str)
             return A.with_opt(A.int_ty(), true);
         return A.with_opt(A.dyn_ty(), true);
     }
@@ -2457,7 +2471,7 @@ void Inferencer::reset_round()
         /* A scalar annotation pins the type: seed the accumulator with the
          * declared type so it stays fixed (contribute() keeps it and checks
          * assignability). dyn next, else bottom. */
-        if (STyRef d = ann_scalar_sty(s))
+        if (StaticTypeRef d = ann_scalar_static_type(s))
             s->acc = d;
         else
             s->acc = s->dyn_decl ? A.dyn_ty() : bottom;
@@ -2473,34 +2487,36 @@ void Inferencer::commit_round()
         TypeSym *s = up.get();
         if (s->func || s->pinned)
             continue;
-        if (!sty_equal(s->acc, s->type)) {
+        if (!static_type_equal(s->acc, s->type)) {
             changed = true;
             if (s->name)
                 TRACE(infer, 1, std::string(s->name->val) + "  " +
-                                sty_to_string(s->type) + " -> " +
-                                sty_to_string(s->acc));
+                                static_type_to_string(s->type) + " -> " +
+                                static_type_to_string(s->acc));
         }
         s->type = s->acc;
     }
     for (auto &up : all_funcs) {
         if (up->pinned)
             continue;
-        if (!sty_equal(up->ret_acc, up->ret)) {
+        if (!static_type_equal(up->ret_acc, up->ret)) {
             changed = true;
             if (up->decl && up->decl->id)
                 TRACE(infer, 1, "func " +
                                 std::string(up->decl->id->get_str()) +
-                                " returns " + sty_to_string(up->ret) + " -> " +
-                                sty_to_string(up->ret_acc));
+                                " returns " + static_type_to_string(up->ret) +
+                                    " -> " +
+                                static_type_to_string(up->ret_acc));
         }
         up->ret = up->ret_acc;
     }
 }
 
-void Inferencer::contribute(TypeSym *s, STyRef t, Loc loc)
+void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
 {
     /*
-     * func-name syms derive their type from func_sty(); never accumulated.
+     * func-name syms derive their type from func_static_type(); never
+         accumulated.
      * A dyn *var* DOES accumulate (Phase B): join keeps the type dyn but tracks
      * the opt bit, so `var dyn d = 5; d = none;` infers `opt dyn`. (A dyn param
      * is skipped in contribute_arg - its opt is declared, not inferred.)
@@ -2519,14 +2535,15 @@ void Inferencer::contribute(TypeSym *s, STyRef t, Loc loc)
      */
     if (s->pinned) {
         if (strict_dyn && !s->is_param) {
-            STyRef rt = sty_resolve(t);
-            STyRef pt = sty_resolve(s->type);
-            if (!is_unknown(rt) && !is_none(rt) && !sty_assignable(rt, pt))
+            StaticTypeRef rt = static_type_resolve(t);
+            StaticTypeRef pt = static_type_resolve(s->type);
+            if (!is_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
+                pt))
                 mismatch("'" + std::string(s->name->val) + "' " +
                              (s->ann != DeclType::none ? "is declared '"
                                                        : "has type '") +
-                             sty_to_string(pt) + "' but is assigned '" +
-                             sty_to_string(t) + "'",
+                             static_type_to_string(pt) + "' but is assigned '" +
+                             static_type_to_string(t) + "'",
                          loc, Loc());
         }
         return;
@@ -2543,46 +2560,48 @@ void Inferencer::contribute(TypeSym *s, STyRef t, Loc loc)
      * `none` into a non-opt declared type is reported by require_nonopt/the
      * mandatory-opt rule).
      */
-    if (STyRef d = ann_scalar_sty(s)) {
+    if (StaticTypeRef d = ann_scalar_static_type(s)) {
         if (strict_dyn && !s->is_param) {
-            STyRef rt = sty_resolve(t);
-            if (!is_unknown(rt) && !is_none(rt) && !sty_assignable(rt, d))
+            StaticTypeRef rt = static_type_resolve(t);
+            if (!is_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
+                d))
                 mismatch("'" + std::string(s->name->val) +
-                             "' is declared '" + sty_to_string(d) +
-                             "' but is assigned '" + sty_to_string(t) + "'",
+                             "' is declared '" + static_type_to_string(d) +
+                             "' but is assigned '" + static_type_to_string(t)
+                                 + "'",
                          loc, Loc());
         }
         s->acc = d;                  /* pinned: never widens */
         return;
     }
 
-    STyRef nw = A.join(s->acc, t);
+    StaticTypeRef nw = A.join(s->acc, t);
     if (!nw)
         mismatch("'" + std::string(s->name->val) + "' has type '" +
-                     sty_to_string(s->acc) + "' but is assigned '" +
-                     sty_to_string(t) + "'",
+                     static_type_to_string(s->acc) + "' but is assigned '" +
+                     static_type_to_string(t) + "'",
                  loc, Loc());
     s->acc = nw;
 }
 
-void Inferencer::contribute_arg(TypeSym *param, STyRef argT, Loc loc)
+void Inferencer::contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc)
 {
     if (!param || param->dyn_decl)
         return;
-    argT = sty_resolve(argT);
+    argT = static_type_resolve(argT);
     if (!param->opt_decl) {
-        if (argT->kind == STyKind::None)
+        if (argT->kind == StaticTypeKind::None)
             return;                  /* none->non-opt: flagged in check */
         argT = strip(argT);
     }
     contribute(param, argT, loc);
 }
 
-void Inferencer::contribute_ret(STyRef t)
+void Inferencer::contribute_ret(StaticTypeRef t)
 {
     if (!cur_func)
         return;
-    STyRef nw = A.join(cur_func->ret_acc, t);
+    StaticTypeRef nw = A.join(cur_func->ret_acc, t);
     cur_func->ret_acc = nw ? nw : A.dyn_ty();   /* return conflict -> dyn */
 }
 
@@ -2689,23 +2708,24 @@ void Inferencer::accumulate_call(CallExpr *call)
         TypeSym *bs = (bit != id_sym.end()) ? bit->second : nullptr;
         if (!bs)
             return;
-        STyRef vt = type_of(args->elems[val_i].get());
-        STyRef bt = sty_resolve(bs->type);
+        StaticTypeRef vt = type_of(args->elems[val_i].get());
+        StaticTypeRef bt = static_type_resolve(bs->type);
         /* Defer if the element type isn't settled yet (the defer-on-Unknown
          * invariant): contributing `array<?>` to a PINNED global array would
          * trip its assignability check immediately - `array<?>` is not
          * top-level Unknown, so contribute()'s own guard wouldn't catch it -
          * and throw before a template-instance arg settles to its real type. A
          * later fixpoint round contributes the real `array<int>`. */
-        if (is_unknown(sty_resolve(vt)))
+        if (is_unknown(static_type_resolve(vt)))
             return;
-        if (bt->kind == STyKind::Dict) {
-            STyRef kt = (key_i >= 0 && (size_t)key_i < args->elems.size())
+        if (bt->kind == StaticTypeKind::Dict) {
+            StaticTypeRef kt = (key_i >= 0 && (size_t)key_i <
+                args->elems.size())
                             ? type_of(args->elems[key_i].get()) : A.dyn_ty();
-            if (is_unknown(sty_resolve(kt)))
+            if (is_unknown(static_type_resolve(kt)))
                 return;
             contribute(bs, A.dict_of(kt, vt), bid->start);
-        } else if (bt->kind == STyKind::Array) {
+        } else if (bt->kind == StaticTypeKind::Array) {
             contribute(bs, A.array_of(vt), bid->start);
         }
         /* unknown/other base kind: skip (don't guess) */
@@ -2742,9 +2762,10 @@ void Inferencer::accumulate_call(CallExpr *call)
         FuncInfo *cb = callee_funcinfo(args->elems[func_i].get());
         if (!cb)
             return;
-        STyRef ct = sty_resolve(type_of(args->elems[cont_i].get()));
-        STyRef el = ct->kind == STyKind::Array ? ct->elem
-                  : ct->kind == STyKind::Dict  ? ct->key : A.dyn_ty();
+        StaticTypeRef ct =
+            static_type_resolve(type_of(args->elems[cont_i].get()));
+        StaticTypeRef el = ct->kind == StaticTypeKind::Array ? ct->elem
+                  : ct->kind == StaticTypeKind::Dict  ? ct->key : A.dyn_ty();
         Loc fl = args->elems[func_i]->start;
         auto &ps = cb->params;
         if (!ps.empty())
@@ -2756,7 +2777,7 @@ void Inferencer::accumulate_call(CallExpr *call)
 
 void Inferencer::spread_idlist(IdList *idl, Construct *rvalue)
 {
-    STyRef rt = sty_resolve(type_of(rvalue));
+    StaticTypeRef rt = static_type_resolve(type_of(rvalue));
 
     if (auto *la = dynamic_cast<LiteralArray *>(rvalue)) {
         if (la->elems.size() == idl->elems.size()) {
@@ -2767,7 +2788,7 @@ void Inferencer::spread_idlist(IdList *idl, Construct *rvalue)
         }
     }
 
-    STyRef each = rt->kind == STyKind::Array ? rt->elem : rt;
+    StaticTypeRef each = rt->kind == StaticTypeKind::Array ? rt->elem : rt;
     for (auto &id : idl->elems)
         contribute(id_sym[id.get()], each, id->start);
 }
@@ -2778,12 +2799,12 @@ void Inferencer::accumulate_assign(Expr14 *e)
     if (!(e->fl & pFlags::pInDecl))
         accumulate(e->lvalue.get());
 
-    STyRef ct;
+    StaticTypeRef ct;
     if (e->op == Op::assign) {
         ct = type_of(e->rvalue.get());
     } else {
-        STyRef l = type_of(e->lvalue.get());
-        STyRef r = type_of(e->rvalue.get());
+        StaticTypeRef l = type_of(e->lvalue.get());
+        StaticTypeRef r = type_of(e->rvalue.get());
         ct = binop_result(compound_binop(e->op), l, r);
         /* An invalid compound op (e.g. str -= int) yields dyn; don't let that
          * widen the target to dyn and hide the error - keep its type so the
@@ -2811,7 +2832,7 @@ void Inferencer::accumulate_assign(Expr14 *e)
  * (a struct field leaves the struct's fixed type alone). An IdList spread is
  * caller-specific (only assignment has one).
  */
-void Inferencer::contribute_to_lvalue(Construct *lv, STyRef ct, Loc loc)
+void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc)
 {
     if (auto *id = dynamic_cast<Identifier *>(lv)) {
         auto it = id_sym.find(id);
@@ -2824,12 +2845,12 @@ void Inferencer::contribute_to_lvalue(Construct *lv, STyRef ct, Loc loc)
         if (auto *bid = dynamic_cast<Identifier *>(sub->what.get())) {
             auto it = id_sym.find(bid);
             if (it != id_sym.end() && it->second) {
-                STyRef bt = sty_resolve(it->second->type);
-                if (bt->kind == STyKind::Dict)
+                StaticTypeRef bt = static_type_resolve(it->second->type);
+                if (bt->kind == StaticTypeKind::Dict)
                     contribute(it->second,
                                A.dict_of(type_of(sub->index.get()), ct),
                                bid->start);
-                else if (bt->kind == STyKind::Array)
+                else if (bt->kind == StaticTypeKind::Array)
                     contribute(it->second, A.array_of(ct), bid->start);
             }
         }
@@ -2840,7 +2861,8 @@ void Inferencer::contribute_to_lvalue(Construct *lv, STyRef ct, Loc loc)
         if (auto *bid = dynamic_cast<Identifier *>(mem->what.get())) {
             auto it = id_sym.find(bid);
             if (it != id_sym.end() && it->second &&
-                sty_resolve(it->second->type)->kind == STyKind::Dict)
+                static_type_resolve(it->second->type)->kind ==
+                    StaticTypeKind::Dict)
                 contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start);
         }
         return;
@@ -2855,7 +2877,7 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
     if (!fe->ids || fe->ids->elems.empty())
         return;
 
-    STyRef c = sty_resolve(type_of(fe->container.get()));
+    StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
 
     /*
      * Defer if the container type isn't known yet: contributing `dyn` to the
@@ -2873,30 +2895,31 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
     if (fe->indexed) {
         /* enumerate-style: first id is the int index, the rest the element */
         contribute(sym_of(0), A.int_ty(), ids[0]->start);
-        STyRef el = c->kind == STyKind::Array ? c->elem
-                    : c->kind == STyKind::Str ? A.str_ty()
-                    : c->kind == STyKind::Dict ? c->key : A.dyn_ty();
+        StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
+                    : c->kind == StaticTypeKind::Str ? A.str_ty()
+                    : c->kind == StaticTypeKind::Dict ? c->key : A.dyn_ty();
         for (size_t i = 1; i < ids.size(); i++)
             contribute(sym_of(i), el, ids[i]->start);
         return;
     }
 
-    if (c->kind == STyKind::Dict && ids.size() >= 2) {
+    if (c->kind == StaticTypeKind::Dict && ids.size() >= 2) {
         contribute(sym_of(0), c->key, ids[0]->start);
         contribute(sym_of(1), c->val, ids[1]->start);
         return;
     }
 
-    STyRef el = c->kind == STyKind::Array ? c->elem
-                : c->kind == STyKind::Str ? A.str_ty()
-                : c->kind == STyKind::Dict ? c->key : A.dyn_ty();
+    StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
+                : c->kind == StaticTypeKind::Str ? A.str_ty()
+                : c->kind == StaticTypeKind::Dict ? c->key : A.dyn_ty();
 
     if (ids.size() == 1) {
         contribute(sym_of(0), el, ids[0]->start);
     } else {
         /* tuple-unpack each element (an array) into the ids */
-        STyRef inner = sty_resolve(el)->kind == STyKind::Array
-                           ? sty_resolve(el)->elem : el;
+        StaticTypeRef inner = static_type_resolve(el)->kind ==
+            StaticTypeKind::Array
+                           ? static_type_resolve(el)->elem : el;
         for (size_t i = 0; i < ids.size(); i++)
             contribute(sym_of(i), inner, ids[i]->start);
     }
@@ -2917,7 +2940,7 @@ void Inferencer::argcount(const std::string &m, Loc s, Loc e)
     throw WrongArgCountEx(intern_msg(m), s, e ? e : s);
 }
 
-void Inferencer::require_nonopt(STyRef t, Loc s, Loc e, const char *what)
+void Inferencer::require_nonopt(StaticTypeRef t, Loc s, Loc e, const char *what)
 {
     /*
      * Phase B: nullability is checked even for dyn. A plain `dyn` is non-opt
@@ -2927,7 +2950,7 @@ void Inferencer::require_nonopt(STyRef t, Loc s, Loc e, const char *what)
      */
     if (is_optish(t))
         nullability(std::string("possibly-none value used ") + what +
-                        " (type '" + sty_to_string(t) + "')",
+                        " (type '" + static_type_to_string(t) + "')",
                     s, e);
 }
 
@@ -2937,12 +2960,12 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
     for (auto &pr : mo->elems)
         check(pr.second.get());
 
-    STyRef left = type_of(mo->elems[0].second.get());
+    StaticTypeRef left = type_of(mo->elems[0].second.get());
 
     for (size_t i = 1; i < mo->elems.size(); i++) {
         Op op = mo->elems[i].first;
         Construct *rnode = mo->elems[i].second.get();
-        STyRef right = type_of(rnode);
+        StaticTypeRef right = type_of(rnode);
 
         if (logical) {
             /* && / || require int operands (verified runtime behaviour) */
@@ -2956,15 +2979,17 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                 require_nonopt(left, mo->start, mo->end, "in a comparison");
                 require_nonopt(right, rnode->start, rnode->end,
                                "in a comparison");
-                STyRef l = strip(sty_resolve(left));
-                STyRef r = strip(sty_resolve(right));
+                StaticTypeRef l = strip(static_type_resolve(left));
+                StaticTypeRef r = strip(static_type_resolve(right));
                 if (!is_dyn(l) && !is_dyn(r)) {
                     bool ok = (is_num(l) && is_num(r)) ||
-                              (l->kind == STyKind::Str &&
-                               r->kind == STyKind::Str);
+                              (l->kind == StaticTypeKind::Str &&
+                               r->kind == StaticTypeKind::Str);
                     if (!ok)
-                        mismatch("cannot compare '" + sty_to_string(left) +
-                                     "' with '" + sty_to_string(right) + "'",
+                        mismatch("cannot compare '" +
+                            static_type_to_string(left) +
+                                     "' with '" + static_type_to_string(right)
+                                         + "'",
                                  mo->start, rnode->end);
                 }
             }
@@ -2973,12 +2998,14 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                            "in an arithmetic operation");
             require_nonopt(right, rnode->start, rnode->end,
                            "in an arithmetic operation");
-            STyRef res = binop_result(op, left, right);
-            STyRef l = strip(sty_resolve(left)), r = strip(sty_resolve(right));
+            StaticTypeRef res = binop_result(op, left, right);
+            StaticTypeRef l = strip(static_type_resolve(left)), r =
+                strip(static_type_resolve(right));
             if (!is_dyn(l) && !is_dyn(r) && is_dyn(res)) {
                 /* binop_result returns dyn for an invalid combination */
-                mismatch("operator does not apply to '" + sty_to_string(left) +
-                             "' and '" + sty_to_string(right) + "'",
+                mismatch("operator does not apply to '" +
+                    static_type_to_string(left) +
+                             "' and '" + static_type_to_string(right) + "'",
                          mo->start, rnode->end);
             }
         }
@@ -3046,7 +3073,7 @@ void Inferencer::check_if(IfStmt *i)
             return;
         if (nsym && active) {
             const bool had = narrowed.count(nsym) != 0;
-            STyRef old = had ? narrowed[nsym] : nullptr;
+            StaticTypeRef old = had ? narrowed[nsym] : nullptr;
             narrowed[nsym] = strip(nsym->type);
             check(branch);
             if (had) narrowed[nsym] = old; else narrowed.erase(nsym);
@@ -3059,21 +3086,22 @@ void Inferencer::check_if(IfStmt *i)
     with_narrow(i->elseBlock.get(), !in_then);
 }
 
-/* The bare kind of an STy as a string (kindstr): "int"/"array"/"struct"/... -
+/* The bare kind of an StaticType as a string (kindstr):
+    "int"/"array"/"struct"/... -
  * matching the runtime TypeNames so the fold and -nti fallback agree. */
-static const char *sty_kind_string(STyRef t)
+static const char *static_type_kind_string(StaticTypeRef t)
 {
-    switch (sty_resolve(t)->kind) {
-        case STyKind::None:      return "none";
-        case STyKind::Bool:      return "bool";
-        case STyKind::Int:       return "int";
-        case STyKind::Float:     return "float";
-        case STyKind::Str:       return "str";
-        case STyKind::Array:     return "array";
-        case STyKind::Dict:      return "dict";
-        case STyKind::Func:      return "func";
-        case STyKind::Exception: return "exception";
-        case STyKind::Struct:    return "struct";
+    switch (static_type_resolve(t)->kind) {
+        case StaticTypeKind::None:      return "none";
+        case StaticTypeKind::Bool:      return "bool";
+        case StaticTypeKind::Int:       return "int";
+        case StaticTypeKind::Float:     return "float";
+        case StaticTypeKind::Str:       return "str";
+        case StaticTypeKind::Array:     return "array";
+        case StaticTypeKind::Dict:      return "dict";
+        case StaticTypeKind::Func:      return "func";
+        case StaticTypeKind::Exception: return "exception";
+        case StaticTypeKind::Struct:    return "struct";
         default:                 return "dyn";   /* Dyn / Unknown */
     }
 }
@@ -3083,22 +3111,23 @@ static const char *sty_kind_string(STyRef t)
  * (elem/key/val), as a boxed StructObject. PRE-GENERATED at compile time and
  * baked as a const LiteralObj by fold_type_query - never created at runtime.
  */
-static EvalValue build_type_value(STyRef t)
+static EvalValue build_type_value(StaticTypeRef t)
 {
-    t = sty_resolve(t);
+    t = static_type_resolve(t);
     StructTypeDef *td = const_cast<StructTypeDef *>(native_struct_type_def());
     auto obj = make_intrusive<StructObject>(td);
 
     obj->fields.emplace_back(
-        EvalValue(SharedStr(std::string(sty_kind_string(t)))), false);
-    obj->fields.emplace_back(EvalValue(SharedStr(sty_to_string(t))), false);
+        EvalValue(SharedStr(std::string(static_type_kind_string(t)))), false);
+    obj->fields.emplace_back(EvalValue(SharedStr(static_type_to_string(t))),
+        false);
     obj->fields.emplace_back(
-        EvalValue(t->opt && t->kind != STyKind::None), false);
+        EvalValue(t->opt && t->kind != StaticTypeKind::None), false);
 
     EvalValue elem, key, val;   /* default-constructed = none */
-    if (t->kind == STyKind::Array && t->elem) {
+    if (t->kind == StaticTypeKind::Array && t->elem) {
         elem = build_type_value(t->elem);
-    } else if (t->kind == STyKind::Dict) {
+    } else if (t->kind == StaticTypeKind::Dict) {
         if (t->key) key = build_type_value(t->key);
         if (t->val) val = build_type_value(t->val);
     }
@@ -3142,7 +3171,7 @@ bool Inferencer::fold_type_query(CallExpr *call)
         argcount(std::string(fn) + " expects exactly one argument",
                  call->start, call->end);
 
-    STyRef t;
+    StaticTypeRef t;
     if (is_decltype) {
         auto *argid = dynamic_cast<Identifier *>(args->elems[0].get());
         if (!argid)
@@ -3156,7 +3185,7 @@ bool Inferencer::fold_type_query(CallExpr *call)
         t = it->second->type;
     } else {
         t = type_of(args->elems[0].get());
-        if (is_unknown(sty_resolve(t)))
+        if (is_unknown(static_type_resolve(t)))
             return false;   /* type not determined yet: leave for runtime */
     }
 
@@ -3164,7 +3193,8 @@ bool Inferencer::fold_type_query(CallExpr *call)
         args->elems[0] = make_unique<LiteralObj>(build_type_value(t), true);
     else                                     /* typestr / kindstr -> string */
         args->elems[0] = make_unique<LiteralStr>(std::string_view(
-            is_kindstr ? std::string(sty_kind_string(t)) : sty_to_string(t)));
+            is_kindstr ? std::string(static_type_kind_string(t)) :
+                static_type_to_string(t)));
     return true;
 }
 
@@ -3239,20 +3269,23 @@ void Inferencer::check(Construct *n)
         check(e2->elems[0].second.get());
         Op op = e2->elems[0].first;
         if (op == Op::plus || op == Op::minus) {
-            STyRef t = type_of(e2->elems[0].second.get());
+            StaticTypeRef t = type_of(e2->elems[0].second.get());
             require_nonopt(t, n->start, n->end, "with a unary +/-");
-            STyRef u = strip(sty_resolve(t));
+            StaticTypeRef u = strip(static_type_resolve(t));
             if (!is_dyn(u) && !is_unknown(u) && !is_num(u))
-                mismatch("unary +/- needs a number, got '" + sty_to_string(t) +
+                mismatch("unary +/- needs a number, got '" +
+                    static_type_to_string(t) +
                              "'", n->start, n->end);
         } else if (op == Op::bnot) {
-            STyRef t = type_of(e2->elems[0].second.get());
+            StaticTypeRef t = type_of(e2->elems[0].second.get());
             require_nonopt(t, n->start, n->end, "with a unary ~");
-            STyRef u = strip(sty_resolve(t));
+            StaticTypeRef u = strip(static_type_resolve(t));
             /* ~ is int-only (bool promotes); float/str/... is an error */
             if (!is_dyn(u) && !is_unknown(u) &&
-                u->kind != STyKind::Int && u->kind != STyKind::Bool)
-                mismatch("unary ~ needs an int, got '" + sty_to_string(t) +
+                u->kind != StaticTypeKind::Int && u->kind !=
+                    StaticTypeKind::Bool)
+                mismatch("unary ~ needs an int, got '" +
+                    static_type_to_string(t) +
                              "'", n->start, n->end);
         }
         return;
@@ -3261,13 +3294,15 @@ void Inferencer::check(Construct *n)
     if (auto *sub = dynamic_cast<Subscript *>(n)) {
         check(sub->what.get());
         check(sub->index.get());
-        STyRef w = type_of(sub->what.get());
+        StaticTypeRef w = type_of(sub->what.get());
         require_nonopt(w, sub->what->start, sub->what->end,
                        "as a subscript base");
-        STyRef wr = strip(sty_resolve(w));
-        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != STyKind::Array &&
-            wr->kind != STyKind::Dict && wr->kind != STyKind::Str)
-            mismatch("type '" + sty_to_string(w) + "' is not subscriptable",
+        StaticTypeRef wr = strip(static_type_resolve(w));
+        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind !=
+            StaticTypeKind::Array &&
+            wr->kind != StaticTypeKind::Dict && wr->kind != StaticTypeKind::Str)
+            mismatch("type '" + static_type_to_string(w) +
+                "' is not subscriptable",
                      sub->what->start, sub->what->end);
         return;
     }
@@ -3276,12 +3311,13 @@ void Inferencer::check(Construct *n)
         check(sl->what.get());
         check(sl->start_idx.get());
         check(sl->end_idx.get());
-        STyRef w = type_of(sl->what.get());
+        StaticTypeRef w = type_of(sl->what.get());
         require_nonopt(w, sl->what->start, sl->what->end, "as a slice base");
-        STyRef wr = strip(sty_resolve(w));
-        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != STyKind::Array &&
-            wr->kind != STyKind::Str)
-            mismatch("type '" + sty_to_string(w) + "' is not sliceable",
+        StaticTypeRef wr = strip(static_type_resolve(w));
+        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind !=
+            StaticTypeKind::Array &&
+            wr->kind != StaticTypeKind::Str)
+            mismatch("type '" + static_type_to_string(w) + "' is not sliceable",
                      sl->what->start, sl->what->end);
         return;
     }
@@ -3309,13 +3345,13 @@ void Inferencer::check(Construct *n)
             }
         }
 
-        STyRef w = type_of(mem->what.get());
+        StaticTypeRef w = type_of(mem->what.get());
         require_nonopt(w, mem->what->start, mem->what->end,
                        "as a member-access base");
-        STyRef wr = strip(sty_resolve(w));
+        StaticTypeRef wr = strip(static_type_resolve(w));
 
         /* struct instance base: validate the field/const exists. */
-        if (wr->kind == STyKind::Struct) {
+        if (wr->kind == StaticTypeKind::Struct) {
             const StructTypeDef *def =
                 static_cast<const StructTypeDef *>(wr->struct_def);
             if (!def->field_of(mem->memUid) && !def->const_of(mem->memUid))
@@ -3326,8 +3362,8 @@ void Inferencer::check(Construct *n)
             return;
         }
 
-        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != STyKind::Dict)
-            mismatch("type '" + sty_to_string(w) +
+        if (!is_dyn(wr) && !is_unknown(wr) && wr->kind != StaticTypeKind::Dict)
+            mismatch("type '" + static_type_to_string(w) +
                          "' has no members (only a struct or dict does)",
                      mem->what->start, mem->what->end);
         return;
@@ -3336,7 +3372,7 @@ void Inferencer::check(Construct *n)
     if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
         check(fe->container.get());
         check(fe->body.get());
-        STyRef c = type_of(fe->container.get());
+        StaticTypeRef c = type_of(fe->container.get());
         require_nonopt(c, fe->container->start, fe->container->end,
                        "as a foreach container");
         return;
@@ -3363,16 +3399,17 @@ void Inferencer::check(Construct *n)
                 mismatch("cannot '++'/'--' a const", idc->start, idc->end);
         }
 
-        STyRef t = type_of(opnd);
+        StaticTypeRef t = type_of(opnd);
         require_nonopt(t, opnd->start, opnd->end, "with '++'/'--'");
 
         /* int or float ONLY (bool / str / array / ... are rejected); a `dyn`
          * operand defers the check to runtime. */
-        STyRef ts = strip(sty_resolve(t));
+        StaticTypeRef ts = strip(static_type_resolve(t));
         if (!is_dyn(ts) && !is_unknown(ts)
-                && ts->kind != STyKind::Int && ts->kind != STyKind::Float)
+                && ts->kind != StaticTypeKind::Int && ts->kind !=
+                    StaticTypeKind::Float)
             mismatch("'++'/'--' requires an int or float, got '" +
-                         sty_to_string(t) + "'",
+                         static_type_to_string(t) + "'",
                      opnd->start, opnd->end);
         return;
     }
@@ -3393,11 +3430,12 @@ void Inferencer::check(Construct *n)
             if (auto *lid = dynamic_cast<Identifier *>(e14->lvalue.get())) {
                 auto it = id_sym.find(lid);
                 if (it != id_sym.end() && it->second) {
-                    STyRef d = ann_scalar_sty(it->second);
+                    StaticTypeRef d = ann_scalar_static_type(it->second);
                     if (d && !d->opt &&
                         is_optish(type_of(e14->rvalue.get())))
                         nullability("'" + std::string(lid->uid->val) +
-                                        "' is declared '" + sty_to_string(d) +
+                                        "' is declared '" +
+                                            static_type_to_string(d) +
                                         "' and cannot be none",
                                     e14->start, e14->end);
                 }
@@ -3406,17 +3444,19 @@ void Inferencer::check(Construct *n)
 
         if (e14->op != Op::assign) {
             /* compound assign: validate the implied binary op */
-            STyRef l = type_of(e14->lvalue.get());
-            STyRef r = type_of(e14->rvalue.get());
+            StaticTypeRef l = type_of(e14->lvalue.get());
+            StaticTypeRef r = type_of(e14->rvalue.get());
             require_nonopt(l, e14->lvalue->start, e14->lvalue->end,
                            "in a compound assignment");
             require_nonopt(r, e14->rvalue->start, e14->rvalue->end,
                            "in a compound assignment");
-            STyRef res = binop_result(compound_binop(e14->op), l, r);
-            STyRef ls = strip(sty_resolve(l)), rs = strip(sty_resolve(r));
+            StaticTypeRef res = binop_result(compound_binop(e14->op), l, r);
+            StaticTypeRef ls = strip(static_type_resolve(l)), rs =
+                strip(static_type_resolve(r));
             if (!is_dyn(ls) && !is_dyn(rs) && is_dyn(res))
-                mismatch("operator does not apply to '" + sty_to_string(l) +
-                             "' and '" + sty_to_string(r) + "'",
+                mismatch("operator does not apply to '" +
+                    static_type_to_string(l) +
+                             "' and '" + static_type_to_string(r) + "'",
                          e14->start, e14->end);
         }
         return;
@@ -3424,14 +3464,15 @@ void Inferencer::check(Construct *n)
 
     if (auto *th = dynamic_cast<ThrowStmt *>(n)) {
         check(th->elem.get());
-        STyRef t = strip(sty_resolve(type_of(th->elem.get())));
+        StaticTypeRef t = strip(static_type_resolve(type_of(th->elem.get())));
         /* A struct instance is the custom-exception value; a caught built-in
          * exception (Exception) can be re-thrown; dyn/Unknown/None defer. */
-        if (!is_dyn(t) && t->kind != STyKind::Struct &&
-            t->kind != STyKind::Exception &&
-            t->kind != STyKind::Unknown && t->kind != STyKind::None)
+        if (!is_dyn(t) && t->kind != StaticTypeKind::Struct &&
+            t->kind != StaticTypeKind::Exception &&
+            t->kind != StaticTypeKind::Unknown && t->kind !=
+                StaticTypeKind::None)
             mismatch("can only throw a struct instance, got '" +
-                         sty_to_string(type_of(th->elem.get())) + "'",
+                         static_type_to_string(type_of(th->elem.get())) + "'",
                      th->elem->start, th->elem->end);
         return;
     }
@@ -3467,7 +3508,7 @@ void Inferencer::check_struct_construction(CallExpr *call,
 
     for (size_t i = 0; i < nargs && i < nfields; i++) {
         const FieldDef &fd = def->fields[i];
-        STyRef at = type_of(args->elems[i].get());
+        StaticTypeRef at = type_of(args->elems[i].get());
 
         if (!fd.is_opt && is_optish(at))
             nullability("field '" + std::string(fd.name->val) +
@@ -3477,12 +3518,12 @@ void Inferencer::check_struct_construction(CallExpr *call,
         if (fd.kind == FieldKind::f_dyn || is_dyn(at))
             continue;
 
-        STyRef ft = field_sty(fd);
-        STyRef src = fd.is_opt ? at : strip(at);
-        if (!sty_assignable(src, ft))
+        StaticTypeRef ft = field_static_type(fd);
+        StaticTypeRef src = fd.is_opt ? at : strip(at);
+        if (!static_type_assignable(src, ft))
             mismatch("field '" + std::string(fd.name->val) + "' expects '" +
-                         sty_to_string(ft) + "' but got '" +
-                         sty_to_string(at) + "'",
+                         static_type_to_string(ft) + "' but got '" +
+                         static_type_to_string(at) + "'",
                      args->elems[i]->start, args->elems[i]->end);
     }
 }
@@ -3504,9 +3545,9 @@ void Inferencer::check_call(CallExpr *call)
         }
     }
 
-    /* resolve the callee to a parameter list (FuncInfo or a Func STy) */
+    /* resolve the callee to a parameter list (FuncInfo or a Func StaticType) */
     std::vector<TypeSym *> *fparams = nullptr;
-    const STy *fsty = nullptr;
+    const StaticType *fst = nullptr;
     bool callable_known = false;
     /* An un-instantiated template call: ARITY is still checked here (vs the
      * declared params), but per-argument type/nullability is validated per
@@ -3524,7 +3565,7 @@ void Inferencer::check_call(CallExpr *call)
             fparams = &s->func->params;
             callable_known = true;
         } else if (s && is_func(s->type)) {
-            fsty = sty_resolve(s->type);
+            fst = static_type_resolve(s->type);
             callable_known = true;
         } else if (s && is_dyn(s->type)) {
             return;                       /* dyn callee: no checks */
@@ -3532,20 +3573,21 @@ void Inferencer::check_call(CallExpr *call)
             return;                       /* builtin arity checked at runtime */
         } else if (s) {
             mismatch("'" + std::string(cid->uid->val) +
-                         "' is not callable (type '" + sty_to_string(s->type) +
+                         "' is not callable (type '" +
+                             static_type_to_string(s->type) +
                          "')", call->what->start, call->what->end);
         } else {
             return;                       /* unresolved -> dyn (Q4) */
         }
     } else {
-        STyRef ct = type_of(call->what.get());
+        StaticTypeRef ct = type_of(call->what.get());
         if (is_dyn(ct))
             return;
         if (is_func(ct)) {
-            fsty = sty_resolve(ct);
+            fst = static_type_resolve(ct);
             callable_known = true;
         } else {
-            mismatch("expression of type '" + sty_to_string(ct) +
+            mismatch("expression of type '" + static_type_to_string(ct) +
                          "' is not callable", call->what->start,
                      call->what->end);
         }
@@ -3554,7 +3596,7 @@ void Inferencer::check_call(CallExpr *call)
     if (!callable_known)
         return;
 
-    size_t nparams = fparams ? fparams->size() : fsty->params.size();
+    size_t nparams = fparams ? fparams->size() : fst->params.size();
     size_t nargs = args->elems.size();
 
     /*
@@ -3566,7 +3608,7 @@ void Inferencer::check_call(CallExpr *call)
      */
     auto param_is_opt = [&](size_t i) -> bool {
         return fparams ? (*fparams)[i]->opt_decl
-                       : (i < fsty->param_opt.size() && fsty->param_opt[i]);
+                       : (i < fst->param_opt.size() && fst->param_opt[i]);
     };
     size_t min_args = 0;
     for (size_t i = 0; i < nparams; i++)
@@ -3587,18 +3629,19 @@ void Inferencer::check_call(CallExpr *call)
 
     for (size_t i = 0; i < nargs && i < nparams; i++) {
         Construct *anode = args->elems[i].get();
-        STyRef at = type_of(anode);
+        StaticTypeRef at = type_of(anode);
 
         bool p_dyn, p_opt;
-        STyRef ptype;
+        StaticTypeRef ptype;
         if (fparams) {
             p_dyn = (*fparams)[i]->dyn_decl;
             p_opt = (*fparams)[i]->opt_decl;
             ptype = (*fparams)[i]->type;
         } else {
-            p_dyn = sty_resolve(fsty->params[i])->kind == STyKind::Dyn;
-            p_opt = i < fsty->param_opt.size() && fsty->param_opt[i];
-            ptype = fsty->params[i];
+            p_dyn = static_type_resolve(fst->params[i])->kind ==
+                StaticTypeKind::Dyn;
+            p_opt = i < fst->param_opt.size() && fst->param_opt[i];
+            ptype = fst->params[i];
         }
 
         /*
@@ -3623,11 +3666,12 @@ void Inferencer::check_call(CallExpr *call)
         if (p_dyn || is_dyn(at))
             continue;
 
-        STyRef src = p_opt ? at : strip(at);
-        if (!sty_assignable(src, ptype))
+        StaticTypeRef src = p_opt ? at : strip(at);
+        if (!static_type_assignable(src, ptype))
             mismatch("argument " + std::to_string(i + 1) + " has type '" +
-                         sty_to_string(at) + "' but the parameter is '" +
-                         sty_to_string(ptype) + "'",
+                         static_type_to_string(at) +
+                             "' but the parameter is '" +
+                         static_type_to_string(ptype) + "'",
                      anode->start, anode->end);
     }
 }
@@ -4171,17 +4215,17 @@ void Inferencer::collect_arrays(AnalysisInfo &out)
         if (!id || !s)
             continue;
 
-        STyRef ty = sty_resolve(s->type);
-        if (ty->kind != STyKind::Array)
+        StaticTypeRef ty = static_type_resolve(s->type);
+        if (ty->kind != StaticTypeKind::Array)
             continue;
 
-        STyRef el = sty_resolve(ty->elem);
+        StaticTypeRef el = static_type_resolve(ty->elem);
         AnnoKind k;
-        if (!el->opt && (el->kind == STyKind::Int ||
-                         el->kind == STyKind::Float ||
-                         el->kind == STyKind::Bool))
+        if (!el->opt && (el->kind == StaticTypeKind::Int ||
+                         el->kind == StaticTypeKind::Float ||
+                         el->kind == StaticTypeKind::Bool))
             k = AnnoKind::flat_array;
-        else if (el->kind == STyKind::Dyn)
+        else if (el->kind == StaticTypeKind::Dyn)
             k = AnnoKind::dyn_array;
         else
             continue;   /* a general but non-dynamic array: leave default */

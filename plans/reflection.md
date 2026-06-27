@@ -78,7 +78,8 @@ So `type(a).kind == "array"`, `type(a).elem.kind == "int"`, `type(a).name`.
 
 **Pre-generated, never on-the-fly.** A `Type` is built at COMPILE TIME by the
 inferencer for each `type()`/`decltype()` call site (from the arg's static
-`STy`) and baked as a `LiteralObj` - we do NOT generate `Type`s at runtime
+`StaticType`) and baked as a `LiteralObj` - we do NOT generate `Type`s at
+runtime
 (there is no programmatic type creation, so none is needed, and unused
 reflection costs no memory). `typestr`/`kindstr` give the string forms cheaply.
 `Type` is another native composite type (item 4's machinery), recursive via the

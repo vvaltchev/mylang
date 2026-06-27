@@ -28,7 +28,8 @@
 Status: **designed, ready to build.** The prerequisites the original version of
 this plan was waiting on have all landed, which changes the design materially:
 
-- **Static type inference** (`plans/type-inference.md`) is in. `STyKind::Struct`
+- **Static type inference** (`plans/type-inference.md`) is in.
+  `StaticTypeKind::Struct`
   + the `struct_def` slot are already reserved in `stype.h`. Field access can be
   a compile-time slot/offset, not a runtime table lookup.
 - **Named arguments** are in: `ExprList::arg_names` plus the shared
@@ -113,7 +114,8 @@ error). One rule, one implementation.
 
 ### Static (inferencer, `stype.h` — slot already reserved)
 
-`STyKind::Struct` with `struct_def` pointing at the `StructTypeDef`. Lattice ops
+`StaticTypeKind::Struct` with `struct_def` pointing at the `StructTypeDef`.
+Lattice ops
 (`stype.cpp`):
 
 - `equal(a,b)` for two Structs: same `struct_def` (nominal, no structural
@@ -360,7 +362,8 @@ are `t_struct` values, working the moment structs are a value type.
   descriptor; record the `StructTypeDef` (built by the parser). Resolve a
   struct-typed annotation (`Point p;`) to `Struct(Point)`.
 - **`check_call` / `lower_named_args`:** if the callee resolves to a struct
-  type, use `def->ctor_params()` as the param list and `field STy`s as the param
+  type, use `def->ctor_params()` as the param list and `field StaticType`s as
+  the param
   types. Reuse the existing arg-count range, per-arg `assignable` check, and the
   named→positional rewrite. Result type = `Struct(def)`.
 - **`MemberExpr` typing:** struct base → the field's static type (or the const's
@@ -510,7 +513,8 @@ Each phase ends green (`-rt`) and is independently committable.
    the struct-descriptor callee via `ctor_params()`. Positional, named, mixed,
    arity/type errors — all from the shared path.
 4. **Member access + inference.** `MemberExpr` struct dispatch (field/const, the
-   typed and `dyn`-base paths of §8), interned `memId`, `STyKind::Struct` typing
+   typed and `dyn`-base paths of §8), interned `memId`,
+   `StaticTypeKind::Struct` typing
    of construction / fields / `Type.CONST`, `array<Struct>` element inference.
    `const` construction folds (deep read-only). COW + const-instance
    immutability. Nested **boxed** structs work here (a struct field is just a

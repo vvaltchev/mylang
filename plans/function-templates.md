@@ -150,7 +150,8 @@ Proposed shape:
      it drains.
   4. A call's result type = its instantiation's recorded return type.
 - **Caching**: keyed by `(FuncInfo*, signature)` where `signature` is the tuple
-  of template-param `STy`s (structural equality via the existing `STy`
+  of template-param `StaticType`s (structural equality via the existing
+  `StaticType`
   machinery). Bounded (open decision D4: cap on instantiations per template to
   avoid blow-up on deeply polymorphic recursion).
 

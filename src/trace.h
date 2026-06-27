@@ -49,7 +49,8 @@ void trace_emit(TraceCat c, int indent, const std::string &msg);
 
 /*
  * The guarded emit. `msg` is evaluated ONLY when the category is enabled, so a
- * `TRACE(infer, 1, "x -> " + sty_to_string(t))` costs just a mask test when
+ * `TRACE(infer, 1, "x -> " + static_type_to_string(t))` costs just a mask
+     test when
  * tracing is off. `catname` is the unqualified enumerator (e.g. `infer`).
  */
 #define TRACE(catname, indent, msg)                                       \

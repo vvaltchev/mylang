@@ -111,7 +111,8 @@ A script is parsed as ONE `pBlock`, then `infer_types` → `resolve_names` →
 `specialize_types` → `eval(nullptr)`, where the root block builds a *per-call*
 "main" `Frame` and slots top-level vars into it. Nothing survives between
 inputs, and three layers resist persistence: the parser's `const_ctx` chain;
-the whole-program inferencer (an `STyArena` + side tables, discarded each run,
+the whole-program inferencer (an `StaticTypeArena` + side tables, discarded
+each run,
 which also *enforces* the mandatory-`dyn`/`opt` rules); and the slot-based
 runtime (per-call frame, 64-slot cap, `AlreadyDefinedEx` on re-declare).
 
@@ -149,7 +150,8 @@ one rule:
 
 **Incremental inference (the one genuinely new pass-level work).** The
 inferencer must (a) seed each input's top-level scope with the *persistent*
-`TypeSym`s of prior globals (a persistent `STyArena` + a global-symbol table),
+`TypeSym`s of prior globals (a persistent `StaticTypeArena` + a global-symbol
+table),
 and (b) commit the input's globals back. It only looks *backward* (no forward
 refs across inputs — fine, an incremental compiler). The mandatory-`dyn`/`opt`
 rules run **within** an input; a global still **unconstrained** at the input's
@@ -292,7 +294,8 @@ themes/`NO_COLOR`, and the **Windows** raw-input backend — v1 is Unix-only).
   (Ruby-like); piped stdin runs as a script. Factor `dumpLocInError` into a
   shared `errfmt.{h,cpp}` so the REPL reuses caret rendering.
 - **`src/inferencer.{h,cpp}`** — add an *incremental* entry point: infer one
-  input seeded with a persistent global `TypeSym` table + `STyArena`, commit
+  input seeded with a persistent global `TypeSym` table + `StaticTypeArena`,
+  commit
   new global types, and defer (not error) a still-unconstrained global. The
   bulk of the engine work.
 - **`src/resolver.{h,cpp}`** — a REPL mode that treats the top-level block's

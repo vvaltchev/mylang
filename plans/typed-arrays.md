@@ -243,7 +243,8 @@ workloads, complementing M8.
   `TypeArr::add` (flat+flat concat), and `clone_internal_vec` (clone/COW keep
   flat). **Crucially, the const path keeps flat:** `make_const_clone` /
   `clone_to_mutable` bake/copy flat int/float arrays without promoting, and the
-  inferencer's `sty_from_value` reads the element type from `skind()` instead of
+  inferencer's `static_type_from_value` reads the element type from `skind()`
+  instead of
   `get_view()` — *that get_view() was silently promoting every const array during
   type inference and defeating the whole feature.* Everything else promotes.
   **Measured:** `17_array_concat` 2.7x→0.21x, `21_array_reverse` 1.1x→0.37x,

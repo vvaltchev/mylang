@@ -47,37 +47,40 @@ statement.")
 
 ## 2. The static type lattice
 
-A static type `STy` is distinct from the runtime `Type *` (the ops table). New
+A static type `StaticType` is distinct from the runtime `Type *` (the ops
+table). New
 representation, proposed header `src/stype.h` (+ `stype.cpp`, a normal TU added
 to the Makefile glob list):
 
 ```
-enum class STyKind {
+enum class StaticTypeKind {
     Unknown,    // a fresh type variable, no constraints yet (internal)
     None,       // the only-none / not-yet-pinned unit type (script-visible)
     Int,
     Float,
     Str,
-    Array,      // + element STy
-    Dict,       // + key STy + value STy
-    Func,       // + param STys + return STy + per-param opt flags
+    Array,      // + element StaticType
+    Dict,       // + key StaticType + value StaticType
+    Func,       // + param StaticTypes + return StaticType + per-param opt flags
     Exception,
     Struct,     // + StructTypeDef* (future)
     Dyn,        // explicit dynamic top; today's runtime behavior
 };
 
-struct STy {
-    STyKind kind;
+struct StaticType {
+    StaticTypeKind kind;
     bool opt;                 // nullable: "kind, or none"
     // payloads (only the relevant one is used):
-    STyRef elem;              // Array element
-    STyRef key, val;          // Dict
-    std::vector<STyRef> params; std::vector<bool> param_opt; STyRef ret; // Func
+    StaticTypeRef elem;              // Array element
+    StaticTypeRef key, val;          // Dict
+    std::vector<StaticTypeRef> params; std::vector<bool> param_opt;
+    StaticTypeRef ret; // Func
     // Unknown carries a union-find link (see §3).
 };
 ```
 
-`STy` values are interned/shared (`STyRef` = pointer into an arena owned by the
+`StaticType` values are interned/shared (`StaticTypeRef` = pointer into an
+arena owned by the
 inference context) so structural types compare by identity after
 canonicalization and the graph stays small.
 
@@ -121,21 +124,26 @@ Notes:
 
 ## 3. Representation in the codebase
 
-- **`src/stype.h` / `stype.cpp`** — `STy`, `STyKind`, the arena/interner, and
+- **`src/stype.h` / `stype.cpp`** — `StaticType`, `StaticTypeKind`, the
+  arena/interner, and
   the lattice ops `assignable(a,b)`, `join(a,b)`, `unify(a,b)`, plus pretty-
   printing for error messages.
-- **Type variables + union-find.** An `Unknown` STy is a union-find node with a
+- **Type variables + union-find.** An `Unknown` StaticType is a union-find
+  node with a
   representative pointer; `unify(a,b)` links them or, if both are resolved,
   checks compatibility (equality, with `Int<=Float` and `None` handled). This is
   the HM substitution, adapted with the nullability/promotion subtyping.
-- **AST annotations.** Add a `STyRef static_type` field to `Construct` (every
+- **AST annotations.** Add a `StaticTypeRef static_type` field to `Construct`
+  (every
   expression node gets its resolved type), analogous to the existing
   `Construct::sym` / `inline_ctx` additions. Decls/params/func-returns store
   their type via the symbol table (next bullet).
 - **Symbol types.** Reuse the resolver's slot/symbol identity. Extend the
-  per-symbol record (or a parallel `std::unordered_map<const UniqueId*, STyRef>`
-  keyed like the resolver) so each var/const/param/func has one `STyRef`.
-  `FuncDeclStmt` gains `STyRef param_types[]`, `STyRef return_type`, and
+  per-symbol record (or a parallel
+  `std::unordered_map<const UniqueId*, StaticTypeRef>`
+  keyed like the resolver) so each var/const/param/func has one `StaticTypeRef`.
+  `FuncDeclStmt` gains `StaticTypeRef param_types[]`,
+  `StaticTypeRef return_type`, and
   `bool param_opt[]`.
 - **New pass entry point:** `infer_types(Construct *root)` in a new
   `inferencer.cpp` (or folded into `resolver.cpp` next to `AutoConst`/`Inliner`;
@@ -246,7 +254,8 @@ checked use only — i.e. you can't move `dyn` into `int x` without `dyn`-typing
 Run as a sequence of sub-passes over the resolved AST:
 
 **Pass A — scaffolding.** Walk every function (and top-level "main"). Allocate a
-fresh `Unknown` STy variable for each var/const, each param, and each function's
+fresh `Unknown` StaticType variable for each var/const, each param, and each
+function's
 return. Seed the obvious: `const`/`var` modifiers `dyn`/`opt`; builtins from the
 signature table (D6); literal nodes get their ground type (`int`/`float`/`str`/
 `None` for `none`).
@@ -305,7 +314,8 @@ signature table (D6); literal nodes get their ground type (`int`/`float`/`str`/
 - only-`none` (or no) constraints -> `None` (sound; "doesn't matter").
 - conflicting concretes recorded -> `TypeMismatchEx` (unless `dyn`-declared).
 - otherwise its single resolved concrete type.
-Canonicalize all `STyRef`s to interned representatives; write final types into
+Canonicalize all `StaticTypeRef`s to interned representatives; write final
+types into
 the symbol table and `Construct::static_type`.
 
 **Pass E — check.** A final walk asserting every constraint with final types:
@@ -384,7 +394,8 @@ out of scope. See the profiling discussion that motivated this whole track.
 
 ## 10. Milestones (each: build clean, `-rt` green, docs synced)
 
-- **M0** — `stype.h`/`stype.cpp`: `STy`, lattice, `join`/`assignable`/`unify`,
+- **M0** — `stype.h`/`stype.cpp`: `StaticType`, lattice,
+  `join`/`assignable`/`unify`,
   union-find, pretty-printer. Table unit tests. No AST wiring yet.
 - **M1** — pass scaffolding: `infer_types(root)` skeleton wired into
   `mylang.cpp` behind `-nti`; `Construct::static_type` field; symbol-type map;

@@ -54,7 +54,7 @@ static const char *reflect_decl_type_kw(DeclType d)
 
 /* A struct field's type keyword (the struct name for an f_struct field). */
 /* Render a parsed TypeAnnot (array<int>, dict<str, Point>, ...) as a string,
- * matching the `?`-suffix notation of sty_to_string / decltype. */
+ * matching the `?`-suffix notation of static_type_to_string / decltype. */
 static std::string reflect_annot_str(const TypeAnnot *ta)
 {
     if (!ta)

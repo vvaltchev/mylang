@@ -12,13 +12,16 @@ class UniqueId;
 /*
  * Static types for MyLang's type-inference pass (see plans/type-inference.md).
  *
- * An STy is a node in the inference type graph. It is distinct from the runtime
- * `Type *` (the ops table in type.h): an STy describes what the inferencer
+ * An StaticType is a node in the inference type graph. It is distinct from
+     the runtime
+ * `Type *` (the ops table in type.h): an StaticType describes what the
+     inferencer
  * knows at COMPILE time about an expression / variable / parameter / function
  * return -- including type variables (Unknown), nullability (opt), and
  * structural shapes (array element, dict key/value, function signature).
  *
- * Nodes are owned by an STyArena (which keeps them at stable addresses); STyRef
+ * Nodes are owned by an StaticTypeArena (which keeps them at stable
+     addresses); StaticTypeRef
  * is a non-owning pointer into that arena. The ground types
  * (int/float/str/exception/none/dyn) are cached singletons per opt-flag;
  * everything else is allocated on demand.
@@ -30,7 +33,7 @@ class UniqueId;
  * plans/type-inference.md sections 2 and 4.
  */
 
-enum class STyKind {
+enum class StaticTypeKind {
     Unknown,      /* a fresh type variable (union-find); no type yet */
     None,         /* the only-none / not-yet-pinned unit type */
     Bool,         /* bool <= int <= float promotion chain */
@@ -45,94 +48,102 @@ enum class STyKind {
     Dyn,          /* explicit dynamic top */
 };
 
-struct STy;
-typedef STy *STyRef;
+struct StaticType;
+typedef StaticType *StaticTypeRef;
 
-struct STy {
-    STyKind kind;
+struct StaticType {
+    StaticTypeKind kind;
     bool opt = false;          /* nullable: "kind, or none" */
 
     /* Unknown only: union-find link. Non-null => this var is bound to *link. */
-    STyRef link = nullptr;
+    StaticTypeRef link = nullptr;
 
-    STyRef elem = nullptr;             /* Array */
-    STyRef key = nullptr;              /* Dict */
-    STyRef val = nullptr;              /* Dict */
-    std::vector<STyRef> params;        /* Func */
+    StaticTypeRef elem = nullptr;             /* Array */
+    StaticTypeRef key = nullptr;              /* Dict */
+    StaticTypeRef val = nullptr;              /* Dict */
+    std::vector<StaticTypeRef> params;        /* Func */
     std::vector<bool> param_opt;       /* Func */
-    STyRef ret = nullptr;              /* Func */
+    StaticTypeRef ret = nullptr;              /* Func */
     const void *struct_def = nullptr;  /* Struct: the StructTypeDef* identity */
     const UniqueId *struct_name = nullptr;  /* Struct: name (for to_string) */
 
-    explicit STy(STyKind k) : kind(k) { }
+    explicit StaticType(StaticTypeKind k) : kind(k) { }
 };
 
-class STyArena {
+class StaticTypeArena {
 
 public:
 
-    STyArena();
+    StaticTypeArena();
 
     /* Ground singletons (cached per opt-flag). */
-    STyRef bool_ty(bool opt = false)  { return ground(STyKind::Bool, opt); }
-    STyRef int_ty(bool opt = false)   { return ground(STyKind::Int, opt); }
-    STyRef float_ty(bool opt = false) { return ground(STyKind::Float, opt); }
-    STyRef str_ty(bool opt = false)   { return ground(STyKind::Str, opt); }
-    STyRef exc_ty(bool opt = false) { return ground(STyKind::Exception, opt); }
-    STyRef none_ty()                  { return g_none; }
-    STyRef dyn_ty()                   { return g_dyn[0]; }
+    StaticTypeRef bool_ty(bool opt = false)  { return
+        ground(StaticTypeKind::Bool, opt); }
+    StaticTypeRef int_ty(bool opt = false)   { return
+        ground(StaticTypeKind::Int, opt); }
+    StaticTypeRef float_ty(bool opt = false) { return
+        ground(StaticTypeKind::Float, opt); }
+    StaticTypeRef str_ty(bool opt = false)   { return
+        ground(StaticTypeKind::Str, opt); }
+    StaticTypeRef exc_ty(bool opt = false) { return
+        ground(StaticTypeKind::Exception, opt); }
+    StaticTypeRef none_ty()                  { return g_none; }
+    StaticTypeRef dyn_ty()                   { return g_dyn[0]; }
 
     /* Constructors for compound / variable types (always freshly allocated). */
-    STyRef fresh_var();
-    STyRef array_of(STyRef elem, bool opt = false);
-    STyRef dict_of(STyRef key, STyRef val, bool opt = false);
-    STyRef struct_ty(const void *def, const UniqueId *name, bool opt = false);
-    STyRef func_of(std::vector<STyRef> params,
+    StaticTypeRef fresh_var();
+    StaticTypeRef array_of(StaticTypeRef elem, bool opt = false);
+    StaticTypeRef dict_of(StaticTypeRef key, StaticTypeRef val, bool opt =
+        false);
+    StaticTypeRef struct_ty(const void *def, const UniqueId *name, bool opt =
+        false);
+    StaticTypeRef func_of(std::vector<StaticTypeRef> params,
                    std::vector<bool> param_opt,
-                   STyRef ret,
+                   StaticTypeRef ret,
                    bool opt = false);
 
     /* `t` with its nullability set to `optflag` (cached for grounds). */
-    STyRef with_opt(STyRef t, bool optflag);
+    StaticTypeRef with_opt(StaticTypeRef t, bool optflag);
 
     /* Least upper bound; nullptr on an irreconcilable type conflict. */
-    STyRef join(STyRef a, STyRef b);
+    StaticTypeRef join(StaticTypeRef a, StaticTypeRef b);
 
 private:
 
-    std::vector<std::unique_ptr<STy>> nodes;
-    STyRef g_bool[2];
-    STyRef g_int[2];
-    STyRef g_float[2];
-    STyRef g_str[2];
-    STyRef g_exc[2];
-    STyRef g_none;
-    STyRef g_dyn[2];   /* [0] = dyn (non-null), [1] = opt dyn (Phase B) */
+    std::vector<std::unique_ptr<StaticType>> nodes;
+    StaticTypeRef g_bool[2];
+    StaticTypeRef g_int[2];
+    StaticTypeRef g_float[2];
+    StaticTypeRef g_str[2];
+    StaticTypeRef g_exc[2];
+    StaticTypeRef g_none;
+    StaticTypeRef g_dyn[2];   /* [0] = dyn (non-null), [1] = opt dyn (Phase B)
+        */
 
-    STyRef alloc(STyKind k);
-    STyRef ground(STyKind k, bool opt);
+    StaticTypeRef alloc(StaticTypeKind k);
+    StaticTypeRef ground(StaticTypeKind k, bool opt);
 
     /* join for a *container element* (array elem / dict value): treats None as
      * bottom (absorbed, not nullable) so array(N)-then-fill or a default-none
      * slot does not make the element type `opt`. */
-    STyRef join_elem(STyRef a, STyRef b);
+    StaticTypeRef join_elem(StaticTypeRef a, StaticTypeRef b);
 };
 
 /* Free functions: pure (no allocation) given the nodes they are handed. */
 
 /* Follow union-find links to the representative (with path compression). */
-STyRef sty_resolve(STyRef t);
+StaticTypeRef static_type_resolve(StaticTypeRef t);
 
 /* Equality constraint: binds type variables; false on an occurs-check failure
  * or a structural mismatch. */
-bool sty_unify(STyRef a, STyRef b);
+bool static_type_unify(StaticTypeRef a, StaticTypeRef b);
 
 /* Can a value of static type `src` be stored where `dst` is expected?
  * (the lattice's subtyping: none->opt, T->opt T, int->float, anything->dyn). */
-bool sty_assignable(STyRef src, STyRef dst);
+bool static_type_assignable(StaticTypeRef src, StaticTypeRef dst);
 
 /* Deep structural equality (including the opt flag). */
-bool sty_equal(STyRef a, STyRef b);
+bool static_type_equal(StaticTypeRef a, StaticTypeRef b);
 
 /* Human-readable form for error messages (e.g. "opt array<int>"). */
-std::string sty_to_string(STyRef t);
+std::string static_type_to_string(StaticTypeRef t);

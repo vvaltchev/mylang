@@ -8640,7 +8640,7 @@ inliner_folds_const_global()
  */
 static bool stype_ground_caching()
 {
-    STyArena a;
+    StaticTypeArena a;
 
     if (a.int_ty() != a.int_ty())                 return false;  /* cached */
     if (a.int_ty() == a.int_ty(true))             return false;  /* opt != */
@@ -8652,29 +8652,38 @@ static bool stype_ground_caching()
 
 static bool stype_assignable_rules()
 {
-    STyArena a;
-    STyRef i = a.int_ty(), f = a.float_ty(), s = a.str_ty();
-    STyRef d = a.dyn_ty(), n = a.none_ty();
+    StaticTypeArena a;
+    StaticTypeRef i = a.int_ty(), f = a.float_ty(), s = a.str_ty();
+    StaticTypeRef d = a.dyn_ty(), n = a.none_ty();
 
-    if (!sty_assignable(i, i))            return false;
-    if (!sty_assignable(i, f))            return false;  /* int -> float */
-    if ( sty_assignable(f, i))            return false;  /* float -/-> int */
-    if (!sty_assignable(i, d))            return false;  /* any -> dyn */
-    if ( sty_assignable(d, i))            return false;  /* dyn -/-> int */
-    if ( sty_assignable(s, i))            return false;  /* str -/-> int */
-    if ( sty_assignable(n, i))            return false;  /* none -/-> int */
-    if (!sty_assignable(n, a.int_ty(true)))          return false; /* ->opt */
-    if ( sty_assignable(a.int_ty(true), i))          return false; /* opt-/->*/
-    if (!sty_assignable(i, a.int_ty(true)))          return false;
-    if (!sty_assignable(i, a.float_ty(true)))        return false; /* promote*/
+    if (!static_type_assignable(i, i))            return false;
+    if (!static_type_assignable(i, f))            return false;  /* int ->
+        float */
+    if ( static_type_assignable(f, i))            return false;  /* float -/->
+        int */
+    if (!static_type_assignable(i, d))            return false;  /* any -> dyn
+        */
+    if ( static_type_assignable(d, i))            return false;  /* dyn -/->
+        int */
+    if ( static_type_assignable(s, i))            return false;  /* str -/->
+        int */
+    if ( static_type_assignable(n, i))            return false;  /* none -/->
+        int */
+    if (!static_type_assignable(n, a.int_ty(true)))          return false; /*
+        ->opt */
+    if ( static_type_assignable(a.int_ty(true), i))          return false; /*
+        opt-/->*/
+    if (!static_type_assignable(i, a.int_ty(true)))          return false;
+    if (!static_type_assignable(i, a.float_ty(true)))        return false; /*
+        promote*/
     return true;
 }
 
 static bool stype_join_rules()
 {
-    STyArena a;
-    STyRef i = a.int_ty(), f = a.float_ty(), s = a.str_ty();
-    STyRef n = a.none_ty(), d = a.dyn_ty();
+    StaticTypeArena a;
+    StaticTypeRef i = a.int_ty(), f = a.float_ty(), s = a.str_ty();
+    StaticTypeRef n = a.none_ty(), d = a.dyn_ty();
 
     if (a.join(i, i) != i)                  return false;
     if (a.join(i, f) != f)                  return false;  /* promote */
@@ -8682,55 +8691,66 @@ static bool stype_join_rules()
     if (a.join(i, s) != nullptr)            return false;  /* conflict */
     if (a.join(i, d) != d)                  return false;  /* dyn absorbs */
 
-    STyRef ai = a.array_of(i), as = a.array_of(s);
-    if (!sty_equal(a.join(ai, ai), ai))     return false;
+    StaticTypeRef ai = a.array_of(i), as = a.array_of(s);
+    if (!static_type_equal(a.join(ai, ai), ai))     return false;
 
-    STyRef mixed = a.join(ai, as);                         /* -> array<dyn> */
-    if (!mixed || mixed->kind != STyKind::Array)           return false;
-    if (sty_resolve(mixed->elem)->kind != STyKind::Dyn)    return false;
+    StaticTypeRef mixed = a.join(ai, as);                         /* ->
+        array<dyn> */
+    if (!mixed || mixed->kind != StaticTypeKind::Array)           return false;
+    if (static_type_resolve(mixed->elem)->kind != StaticTypeKind::Dyn)
+        return false;
     return true;
 }
 
 static bool stype_unify_vars()
 {
-    STyArena a;
+    StaticTypeArena a;
 
-    STyRef v = a.fresh_var();
-    if (!sty_unify(v, a.int_ty()))          return false;
-    if (sty_resolve(v) != a.int_ty())       return false;  /* v bound int */
-    if (sty_unify(v, a.str_ty()))           return false;  /* int != str */
+    StaticTypeRef v = a.fresh_var();
+    if (!static_type_unify(v, a.int_ty()))          return false;
+    if (static_type_resolve(v) != a.int_ty())       return false;  /* v bound
+        int */
+    if (static_type_unify(v, a.str_ty()))           return false;  /* int !=
+        str */
 
     /* occurs-check: w := array<w> is an infinite type and must be rejected */
-    STyRef w = a.fresh_var();
-    if (sty_unify(w, a.array_of(w)))        return false;
+    StaticTypeRef w = a.fresh_var();
+    if (static_type_unify(w, a.array_of(w)))        return false;
 
     /* structural unify binds the inner variable */
-    STyRef x = a.fresh_var();
-    if (!sty_unify(a.array_of(x), a.array_of(a.int_ty()))) return false;
-    if (sty_resolve(x) != a.int_ty())       return false;
+    StaticTypeRef x = a.fresh_var();
+    if (!static_type_unify(a.array_of(x), a.array_of(a.int_ty()))) return false;
+    if (static_type_resolve(x) != a.int_ty())       return false;
     return true;
 }
 
 static bool stype_to_string_basic()
 {
-    STyArena a;
+    StaticTypeArena a;
 
-    if (sty_to_string(a.int_ty()) != "int")                       return false;
-    if (sty_to_string(a.int_ty(true)) != "int?")                 return false;
-    if (sty_to_string(a.array_of(a.str_ty())) != "array<str>")   return false;
-    if (sty_to_string(a.none_ty()) != "none")                    return false;
-    if (sty_to_string(a.dyn_ty()) != "dyn")                      return false;
-    if (sty_to_string(a.with_opt(a.dyn_ty(), true)) != "dyn?")   return false;
+    if (static_type_to_string(a.int_ty()) != "int")
+        return false;
+    if (static_type_to_string(a.int_ty(true)) != "int?")
+        return false;
+    if (static_type_to_string(a.array_of(a.str_ty())) != "array<str>")
+        return false;
+    if (static_type_to_string(a.none_ty()) != "none")
+        return false;
+    if (static_type_to_string(a.dyn_ty()) != "dyn")
+        return false;
+    if (static_type_to_string(a.with_opt(a.dyn_ty(), true)) != "dyn?")
+        return false;
 
     /* `?` is a suffix that composes at every level */
-    if (sty_to_string(a.array_of(a.int_ty(true))) != "array<int?>")
+    if (static_type_to_string(a.array_of(a.int_ty(true))) != "array<int?>")
         return false;
-    if (sty_to_string(a.array_of(a.int_ty(), true)) != "array<int>?")
+    if (static_type_to_string(a.array_of(a.int_ty(), true)) != "array<int>?")
         return false;
 
-    STyRef fn = a.func_of({ a.int_ty(), a.str_ty() },
+    StaticTypeRef fn = a.func_of({ a.int_ty(), a.str_ty() },
                           { false, true }, a.float_ty());
-    if (sty_to_string(fn) != "func(int,str?)->float")            return false;
+    if (static_type_to_string(fn) != "func(int,str?)->float")
+        return false;
     return true;
 }
 
