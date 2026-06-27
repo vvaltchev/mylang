@@ -49,6 +49,14 @@ public:
     std::vector<std::string>
     completions(const std::string &buf, size_t cursor) const;
 
+    /*
+     * Enable ANSI coloring of meta-command output (:show, :help, :analyze).
+     * OFF by default - the engine is headless, so the decision belongs to the
+     * caller (run_repl checks isatty(stdout); -rt tests leave it off so their
+     * substring matches aren't broken by escape codes).
+     */
+    void set_color(bool on);
+
 private:
 
     struct Impl;

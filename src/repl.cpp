@@ -64,6 +64,7 @@ struct ReplEngine::Impl {
     ReplInfer infer;               /* faithful per-input type-checking */
     std::vector<unique_ptr<Construct>> retained;
     std::vector<string> lines;
+    bool color = false;            /* set by ReplEngine::set_color */
 
     Impl()
         : const_ctx(new EvalContext(nullptr, /*const_ctx=*/true))
@@ -128,6 +129,12 @@ struct ReplEngine::Impl {
 
 ReplEngine::ReplEngine() : impl(new Impl) { }
 ReplEngine::~ReplEngine() = default;
+
+void
+ReplEngine::set_color(bool on)
+{
+    impl->color = on;
+}
 
 string
 ReplEngine::eval_input(const string &src)
@@ -407,10 +414,8 @@ ReplEngine::Impl::meta_command(const string &src)
         return cmd_analyze(arg);
     if (cmd == "source" || cmd == "load")
         return cmd_source(arg);
-    if (cmd == "help" || cmd == "h") {
-        const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
+    if (cmd == "help" || cmd == "h")
         return repl_help(arg, color);
-    }
     if (cmd == "trace")
         return cmd_trace(arg);
     if (cmd == "globals" || cmd == "g")
@@ -503,8 +508,6 @@ ReplEngine::Impl::cmd_analyze(const string &code)
         pc.analysis = &info;        /* record parse-time folds / dead code */
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
 
-        const bool color =
-            repl_out_is_tty() && !std::getenv("NO_COLOR");
         std::ostringstream o;
         analyze_and_render(o, root.get(), info, local_lines, color,
                            /*repl_mode=*/true);
@@ -798,8 +801,6 @@ ReplEngine::Impl::cmd_show(const string &arg)
 {
     if (arg.empty())
         return "usage: :show <function-or-expression>\n";
-
-    const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
 
     std::vector<std::pair<const UniqueId *, const LValue *>> syms;
     runtime_ctx->collect_symbols(syms);
@@ -1118,6 +1119,7 @@ run_repl()
 
     /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
     const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
+    engine.set_color(color);
     set_highlight_enabled(color);
     trace_set_color(color);
     auto *hl = color ? highlight_line : nullptr;

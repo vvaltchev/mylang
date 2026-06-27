@@ -2167,7 +2167,11 @@ behind a thin terminal shell:
   so scripts/tests are unaffected. See `plans/repl-introspection.md`.
 
 `run_repl` (in `repl.cpp`) drives it: history loaded/saved to
-`~/.mylang_history`, colors gated on a TTY + `NO_COLOR`, Ctrl-C drops the
+`~/.mylang_history`, colors gated on a TTY + `NO_COLOR` (passed into the
+engine via `ReplEngine::set_color`, since the engine is headless and the
+meta-commands `:help`/`:analyze`/`:show` would otherwise auto-detect stdout
+and bake ANSI escapes into the returned string — breaking `-rt`'s substring
+matches when stdout itself happens to be a TTY), Ctrl-C drops the
 current input, Ctrl-D at the prompt exits. The editor owns multi-line
 continuation (its `Submitter` wraps `ReplEngine::is_incomplete`, treating a
 leading-`:` meta-command as always complete), so `run_repl` reads one whole
