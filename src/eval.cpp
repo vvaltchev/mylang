@@ -214,6 +214,13 @@ int_type Identifier::eval_int(EvalContext *ctx) const
             return lv.getval<bool>() ? 1 : 0;   /* bool slot -> int 0/1 */
         return lv.getval<int_type>();
     }
+    if (sym.kind == SymKind::global && ctx->gfuncs &&
+        ctx->gfuncs->defined[sym.slot]) {
+        const LValue &lv = ctx->gfuncs->slots[sym.slot];
+        if (lv.is<bool>())
+            return lv.getval<bool>() ? 1 : 0;
+        return lv.getval<int_type>();
+    }
     return Construct::eval_int(ctx);
 }
 
@@ -221,6 +228,15 @@ float_type Identifier::eval_float(EvalContext *ctx) const
 {
     if (sym.kind == SymKind::local && ctx->frame) {
         const LValue &lv = ctx->frame->slots[sym.slot];
+        if (lv.is<int_type>())
+            return static_cast<float_type>(lv.getval<int_type>());
+        if (lv.is<bool>())
+            return lv.getval<bool>() ? 1.0 : 0.0;
+        return lv.getval<float_type>();
+    }
+    if (sym.kind == SymKind::global && ctx->gfuncs &&
+        ctx->gfuncs->defined[sym.slot]) {
+        const LValue &lv = ctx->gfuncs->slots[sym.slot];
         if (lv.is<int_type>())
             return static_cast<float_type>(lv.getval<int_type>());
         if (lv.is<bool>())
@@ -1787,6 +1803,18 @@ as_resolved_local(const Construct *lvalue)
     return id->sym.kind == SymKind::local ? id : nullptr;
 }
 
+/* Same, for a name resolved to a GLOBAL-table slot (a top-level function or an
+ * escaped top-level variable). */
+static inline const Identifier *
+as_resolved_global(const Construct *lvalue)
+{
+    if (!lvalue->is_id())
+        return nullptr;
+
+    const Identifier *id = static_cast<const Identifier *>(lvalue);
+    return id->sym.kind == SymKind::global ? id : nullptr;
+}
+
 /*
  * Fast path for `a[i] = v` / `a[i] OP= v` when `a` is a flat (unboxed) int or
  * float array: write the scalar straight into the unboxed vector, with no
@@ -2113,6 +2141,19 @@ handle_single_expr14(EvalContext *ctx,
             return rval;
         }
 
+        /* Declaring an escaped top-level variable: bind its global-table slot
+         * (the analogue of the local-frame write above). A global symbol implies
+         * the table exists; guard anyway so a null gfuncs falls through. */
+        if (const Identifier *id = as_resolved_global(lvalue)) {
+
+            if (GlobalFuncTable *gf = ctx->gfuncs) {
+                gf->slots[id->sym.slot] =
+                    LValue(RValue(rval), ctx->const_ctx || lvalue->is_const);
+                gf->defined[id->sym.slot] = 1;
+                return rval;
+            }
+        }
+
     } else if (!ctx->const_ctx) {
 
         /*
@@ -2149,6 +2190,55 @@ handle_single_expr14(EvalContext *ctx,
                          * div/mod (and any non-int operand) take the general
                          * path, which keeps the zero check and int->float
                          * promotion. */
+                        if (lv.is<int_type>() && r.is<int_type>() &&
+                            (op == Op::addeq || op == Op::subeq ||
+                             op == Op::muleq)) {
+
+                            int_type &v = lv.getval<int_type>();
+                            const int_type n = r.get<int_type>();
+
+                            if (op == Op::addeq)      v += n;
+                            else if (op == Op::subeq) v -= n;
+                            else                      v *= n;
+
+                        } else {
+
+                            EvalValue nv = lv.get();
+                            apply_compound_op(nv, r, op);
+                            lv.put(move(nv));
+                        }
+                    }
+
+                    return lv.get();
+                }
+            }
+        }
+
+        /*
+         * Fast path: an assignment / compound-assignment to an escaped
+         * top-level variable (a global-table slot). Mirrors the local slot path
+         * above: read-modify-write the slot's LValue in place. Falls through to
+         * the general path when the slot is undefined (use-before-decl -> the
+         * undefined-variable error) or const (the rebind error).
+         */
+        if (const Identifier *id = as_resolved_global(lvalue)) {
+
+            GlobalFuncTable *gf = ctx->gfuncs;
+
+            if (gf && gf->defined[id->sym.slot]) {
+
+                LValue &lv = gf->slots[id->sym.slot];
+
+                if (!lv.is_const_var()) {
+
+                    if (op == Op::assign) {
+
+                        lv.put(RValue(rval));
+
+                    } else {
+
+                        const EvalValue r = RValue(rval);
+
                         if (lv.is<int_type>() && r.is<int_type>() &&
                             (op == Op::addeq || op == Op::subeq ||
                              op == Op::muleq)) {

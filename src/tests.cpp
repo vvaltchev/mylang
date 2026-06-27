@@ -2169,6 +2169,81 @@ static const std::vector<test> tests =
         },
     },
     {
+        /*
+         * A top-level variable that a function reads ("escaped") is a GLOBAL-
+         * table slot (SymKind::global), so a function reads/writes the SAME
+         * object main does - an O(1) slot, no map walk. A function-side write
+         * is seen by main and vice versa; a non-escaped top-level var stays a
+         * main-frame local (covered by every other test that uses one).
+         */
+        "global variable slotting: read/write across functions and main",
+        {
+            "var counter = 10;",
+            "var dyn label = \"hi\";",
+            "func bump(){ counter = counter + 1; return counter; }",
+            "func getlabel(){ return label; }",
+            "assert(bump() == 11);",          /* func reads+writes the global */
+            "assert(bump() == 12);",          /* mutation persists per-call */
+            "counter = 100;",                 /* main writes; func sees it */
+            "assert(bump() == 101);",
+            "assert(counter == 101);",        /* func write seen by main */
+            "assert(getlabel() == \"hi\");",
+            "label = \"bye\";",
+            "assert(getlabel() == \"bye\");",
+        },
+    },
+    {
+        /* The global table is unbounded (no per-frame 64-slot cap): many
+         * globals all read from one function resolve and sum correctly. */
+        "global variable slotting: many globals (beyond the old 64-slot cap)",
+        {
+            "var g0=0;var g1=1;var g2=2;var g3=3;var g4=4;var g5=5;",
+            "var g6=6;var g7=7;var g8=8;var g9=9;var g10=10;var g11=11;",
+            "var g12=12;var g13=13;var g14=14;var g15=15;var g16=16;",
+            "var g17=17;var g18=18;var g19=19;var g20=20;var g21=21;",
+            "var g22=22;var g23=23;var g24=24;var g25=25;var g26=26;",
+            "var g27=27;var g28=28;var g29=29;var g30=30;var g31=31;",
+            "var g32=32;var g33=33;var g34=34;var g35=35;var g36=36;",
+            "var g37=37;var g38=38;var g39=39;var g40=40;var g41=41;",
+            "var g42=42;var g43=43;var g44=44;var g45=45;var g46=46;",
+            "var g47=47;var g48=48;var g49=49;var g50=50;var g51=51;",
+            "var g52=52;var g53=53;var g54=54;var g55=55;var g56=56;",
+            "var g57=57;var g58=58;var g59=59;var g60=60;var g61=61;",
+            "var g62=62;var g63=63;var g64=64;var g65=65;",
+            "func total(){ return g0+g10+g20+g30+g40+g50+g60+g63+g64+g65; }",
+            "assert(total() == 0+10+20+30+40+50+60+63+64+65);",
+        },
+    },
+    {
+        /* A nested-block var legitimately shadows an escaped global of the same
+         * name; the function still reads the outer global. */
+        "global variable slotting: a nested block shadows a global",
+        {
+            "var x = 100;",
+            "func reader(){ return x; }",
+            "var inner = 0;",
+            "{ var x = 5; inner = x; }",      /* inner x shadows the global */
+            "assert(inner == 5);",
+            "assert(reader() == 100);",       /* func reads the outer global */
+            "assert(x == 100);",              /* outer x untouched */
+        },
+    },
+    {
+        /* A const global array/dict (kept as a runtime symbol) read by a
+         * function resolves to a global slot too. */
+        "global variable slotting: const container read from a function",
+        {
+            "const arr = [10, 20, 30];",
+            "var dyn d = {\"a\": 1};",
+            "func sumarr(){ var s=0; foreach(var v in arr) s=s+v; return s; }",
+            "func getd(k){ return d[k]; }",
+            "assert(sumarr() == 60);",
+            "assert(getd(\"a\") == 1);",
+            "d[\"b\"] = 9;",                  /* main mutates; func sees it */
+            "assert(getd(\"b\") == 9);",
+        },
+    },
+    {
         "closure capturing state at runtime",
         {
             "func make_counter() {",
