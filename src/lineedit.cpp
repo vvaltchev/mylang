@@ -801,27 +801,45 @@ read_line(const string &prompt, const string &cont_prompt,
     LineEditor ed;
     ed.set_history(&history);
     if (completer)
-        ed.set_completer(std::move(completer));
+        ed.set_completer(completer);     /* a copy: Tab + suggester use it */
     if (submitter)
         ed.set_submitter(std::move(submitter));
 
     /*
-     * PowerShell-style inline autosuggestion from history: the gray ghost text
-     * is the most recent single-line history entry that the current buffer is a
-     * strict prefix of. Enabled only with color on (the ghost must be visually
-     * distinct from typed text), so NO_COLOR / no-TTY get no suggestion.
+     * Inline autosuggestion (gray ghost text) from the COMPLETER - i.e. the
+     * current symbols (variables, builtins) and keywords, NOT history (history
+     * is what Ctrl-R reverse search is for). As you type an identifier, the
+     * matching completion's remainder shows in gray; Right-arrow accepts it.
+     * Enabled only with color on (the ghost must be visually distinct).
      */
-    if (highlight) {
-        ed.set_suggester([&history](const string &b) -> string {
+    if (highlight && completer) {
+        ed.set_suggester([completer](const string &b) -> string {
             if (b.empty() || b.find('\n') != string::npos)
                 return string();
-            for (auto it = history.rbegin(); it != history.rend(); ++it) {
-                const string &h = *it;
-                if (h.size() > b.size() && h.find('\n') == string::npos &&
-                    h.compare(0, b.size(), b) == 0)
-                    return h;
-            }
-            return string();
+
+            /* the identifier prefix ending the buffer (also handles `base.x`,
+             * whose completions are the member names). */
+            size_t start = b.size();
+            while (start > 0 &&
+                   (isalnum(static_cast<unsigned char>(b[start - 1])) ||
+                    b[start - 1] == '_'))
+                start--;
+            const string prefix = b.substr(start);
+            if (prefix.empty())
+                return string();         /* not on an identifier */
+
+            const std::vector<string> cands = completer(b, b.size());
+
+            /* the shortest candidate that strictly extends the prefix (the most
+             * likely intended name); ties resolve by the completer's sort. */
+            const string *best = nullptr;
+            for (const string &c : cands)
+                if (c.size() > prefix.size() &&
+                    c.compare(0, prefix.size(), prefix) == 0 &&
+                    (!best || c.size() < best->size()))
+                    best = &c;
+
+            return best ? b.substr(0, start) + *best : string();
         });
     }
 

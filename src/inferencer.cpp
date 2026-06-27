@@ -1580,6 +1580,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                 psym->opt_decl = p->opt_mod;
                 psym->dyn_decl = p->dyn_mod;
                 psym->ann = p->decl_type;
+                psym->ann_struct = p->decl_struct;   /* set when ann == strct */
                 id_sym[p.get()] = psym;
                 fi->params.push_back(psym);
             }

@@ -612,21 +612,29 @@ pFuncParam(ParseContext &c, unsigned fl)
     } while (got_mod);
 
     /*
-     * An explicit primitive type before the name: `func f(int x, int? n)`. The
-     * type keyword (an identifier) is a type only when the name follows (after
-     * an optional canonical `?`). `dyn` is mutually exclusive with a type.
+     * An explicit type before the name: a primitive (`func f(int x, int? n)`)
+     * or a user struct type (`func f(A p)`). The type name (an identifier) is a
+     * type only when the param name follows (after an optional canonical `?`).
+     * `dyn` is mutually exclusive with a type.
      */
     DeclType dt = DeclType::none;
+    const StructTypeDef *sdef = nullptr;
     if (!is_dyn && *c == TokType::id) {
-        const DeclType maybe = type_keyword(c.get_str());
         const bool q1 = c.peek_tok(1) == Op::questionmark;
-        if (maybe != DeclType::none &&
-            (c.peek_tok(1) == TokType::id ||
-             (q1 && c.peek_tok(2) == TokType::id))) {
-            dt = maybe;
-            c.next();                          /* consume the type keyword */
-            if (pAcceptOp(c, Op::questionmark))   /* `int? n` */
-                is_opt = true;
+        const bool name_follows =
+            c.peek_tok(1) == TokType::id ||
+            (q1 && c.peek_tok(2) == TokType::id);
+        if (name_follows) {
+            const DeclType maybe = type_keyword(c.get_str());
+            if (maybe != DeclType::none)
+                dt = maybe;
+            else if ((sdef = lookup_struct_type(c, c.get_str())))
+                dt = DeclType::strct;
+            if (dt != DeclType::none) {
+                c.next();                          /* consume the type name */
+                if (pAcceptOp(c, Op::questionmark))   /* `int? n`, `A? p` */
+                    is_opt = true;
+            }
         }
     }
 
@@ -651,6 +659,7 @@ pFuncParam(ParseContext &c, unsigned fl)
     id->opt_mod = is_opt;
     id->dyn_mod = is_dyn;
     id->decl_type = dt;
+    id->decl_struct = sdef;
     return id;
 }
 

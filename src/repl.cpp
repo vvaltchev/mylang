@@ -50,6 +50,23 @@ repl_out_is_tty()
 /* Syntax-highlight a (possibly multi-line) rendered block (defined below). */
 static string show_colorize(const string &s, bool color);
 
+/*
+ * Should a `none`-valued result be echoed? A `none` is normally suppressed (a
+ * func/struct decl, a `print`, an `if`/loop, a void call all yield it - echoing
+ * `=> none` for them would be noise). But when the last statement is a plain
+ * VALUE LOOKUP - a bare variable, a member/subscript access, or the `none`/
+ * `null` literal - the user asked to SEE that value, so show `=> none`.
+ */
+static bool
+repl_echo_none(const Construct *c)
+{
+    return c &&
+           (c->is_id() ||                                /* a bare variable */
+            dynamic_cast<const MemberExpr *>(c) ||        /* obj.field */
+            dynamic_cast<const Subscript *>(c) ||         /* a[i] */
+            dynamic_cast<const LiteralNone *>(c));        /* none / null */
+}
+
 /* Width budget for the `=>` echo's pretty-printer: a value whose single-line
  * form is wider than this is expanded across lines. */
 static const int REPL_PRETTY_WIDTH = 80;
@@ -443,6 +460,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    scope, capturing print() output and the last statement's value. */
     Block *blk = dynamic_cast<Block *>(root.get());
     EvalValue last;
+    const Construct *last_elem = nullptr;   /* the last top-level statement */
     const std::vector<const UniqueId *> names_before = global_names();
     std::streambuf *old_cout = std::cout.rdbuf(out.rdbuf());
 
@@ -454,6 +472,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
                     throw UndefinedVariableEx(
                         v.get<UndefinedId>().id, e->start, e->end);
                 last = move(v);
+                last_elem = e.get();
             }
         }
     } catch (const Exception &e) {
@@ -479,7 +498,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    is not echoed, so the prompt stays uncluttered. */
     if (echo) {
         const EvalValue r = RValue(last);
-        if (!r.is<NoneVal>()) {
+        if (!r.is<NoneVal>() || repl_echo_none(last_elem)) {
             /* Pretty-print: a container too wide for one line expands across
              * lines, indented (structs/dicts/arrays, recursively). Colored
              * line-by-line via the highlighter when color is on. */

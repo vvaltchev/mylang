@@ -149,9 +149,10 @@ with the no-dependencies rule): live syntax highlighting, command history
 (Up/Down, persisted to `~/.mylang_history`), the usual Emacs-style editing keys
 (`Ctrl-A`/`E`/`U`/`K`/`W`, arrows, …), and **Tab completion** of keywords,
 builtins, your own globals, and a struct value's fields (`p.<Tab>`). It also
-shows a **PowerShell-style inline suggestion** — as you type, the most recent
-matching history entry appears in dim gray after the cursor; press **Right
-arrow** (or `Ctrl-F`) at the end of the line to accept it. **`Ctrl-R`** opens a
+shows a **PowerShell-style inline suggestion** — as you type an identifier, the
+best matching name (a variable, builtin, or keyword — the same set as Tab, *not*
+history) appears in dim gray after the cursor; press **Right arrow** (or
+`Ctrl-F`) at the end of the line to accept it. **`Ctrl-R`** opens a
 **reverse history search**: a bordered pane (about a third of the screen) whose
 top edge is the search box, over a live, best-match-first result list with the
 matched letters highlighted in each row; type to filter, **Up/Down** to select
@@ -160,9 +161,10 @@ onto the prompt (`Esc`/`Ctrl-G` cancel). The box uses rounded UTF-8 borders when
 the locale supports it, ASCII otherwise. **Pasting** is bracketed-paste aware:
 a pasted multi-line block is taken as one input (its newlines don't submit it
 early, and a Tab/Ctrl in it isn't run as a command) and **re-indented** to the
-editor's brace-depth style, then you press Enter to run it. A `none` result (a
-definition,
-a `print`, an `if`) is not echoed, to keep things quiet.
+editor's brace-depth style, then you press Enter to run it. A `none` result is
+not echoed, to keep things quiet — *except* when you evaluate a plain value
+(a bare variable, a member/subscript access, or the `none` literal), which shows
+`=> <none>` so you can see it; a definition, a `print`, or an `if` stays silent.
 
 The `=> ` result echo **pretty-prints**: a struct, dict, or array that is too
 wide for one line is expanded across lines and indented (recursively, with
@@ -336,7 +338,8 @@ you get a compile error.
     `Point p = Point(3, 4)` is fine, while `Point p = Other(...)` (or a later
     `p = Other(...)`) is a compile error. The struct name is read as a type only
     in declaration position (`Point(...)` construction and `Point.CONST` keep
-    working).
+    working). It works as a **parameter** type too — `func mag2(Point p) => ...`
+    — where a wrong-struct argument is a compile error.
   * **No initializer** gives the type's zero value: `int x;` → `0`, `float x;` →
     `0.0`, `bool x;` → `false`, `str x;` → `""`, `array x;` → `[]`,
     `dict x;` → `{}`, and a **struct zero-initializes recursively** by the same

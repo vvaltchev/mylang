@@ -6782,6 +6782,13 @@ static const std::vector<test> tests =
       { "struct A { int a; } A? z; assert(z == none);" } },
     { "struct: a non-type identifier before a name is not a decl",
       { "var foo = 1; foo bar;" }, &typeid(SyntaxErrorEx) },
+    { "struct: a struct-typed function parameter",
+      { "struct P { int x; int y; }",
+        "func mag2(P p) => p.x * p.x + p.y * p.y;",
+        "assert(mag2(P(3, 4)) == 25);" } },
+    { "struct: a wrong struct argument to a typed param is an error",
+      { "struct A { int a; } struct B { int b; }",
+        "func f(A p) => p.a; f(B(1));" }, &typeid(TypeMismatchEx) },
     { "struct: an empty-named const member chain via type",
       { "struct Cfg { int n; const MAX = 100; const MIN = 0; }",
         "assert(Cfg.MAX - Cfg.MIN == 100);" } },
@@ -8738,6 +8745,13 @@ static const std::vector<repl_test> repl_tests =
      * lines (indented), while a small one stays compact */
     { "the => echo keeps a small container on one line",
       { { "[1, 2, 3]", "=> [1, 2, 3]" } } },
+
+    /* a value lookup that is none echoes `=> <none>` (a bare variable, the
+     * `none` literal); a decl / void statement still stays quiet */
+    { "the => echo shows none for a bare variable and the none literal",
+      { { "var nn;", "" },
+        { "nn", "=> <none>" },
+        { "none", "=> <none>" } } },
     { "the => echo pretty-prints a wide value across lines",
       { { "struct Pt { int x; int y; }", "" },
         { "[Pt(1,1), Pt(2,2), Pt(3,3), Pt(4,4), Pt(5,5), Pt(6,6)]",

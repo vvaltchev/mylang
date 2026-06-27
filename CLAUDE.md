@@ -937,7 +937,11 @@ decisions behind it: `plans/type-inference.md`,
   kind, `none` for an `opt` field, and a nested zero constructor for a struct
   field. Being an ordinary `CallExpr`, it constructs a fresh value each eval and
   is type-checked like a hand-written construction. (`opt A obj;` / `A? obj;` →
-  `none`.) Params (`func f(A p)`) are not yet covered.
+  `none`.) **Parameters too** (`func f(A p)`): `pFuncParam` recognizes a struct
+  type name the same way (`lookup_struct_type`, name must follow), sets the
+  param's `decl_struct`, and the inferencer copies it to the param `TypeSym`'s
+  `ann_struct` - so the param pins to struct `A` and `check_call` rejects a
+  wrong-struct argument. (No runtime coercion; a struct binds as-is.)
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
   (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
   `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is
@@ -2042,8 +2046,12 @@ behind a thin terminal shell:
   top-level statement **directly in the persistent runtime ctx** (no fresh
   Block context/frame — that's why state persists and a redeclaration can
   rebind), capturing `print` output (via a `cout` rdbuf swap) and echoing the
-  last non-`none` value as `=> ...` (via `to_string_repr`, so a bare string
-  echoes quoted — see the value model). Errors are caught per input and the loop
+  last value as `=> ...` (pretty-printed - see the value model). A `none` result
+  is normally suppressed (a decl, `print`, `if`/loop, void call), **except** when
+  the last statement is a plain VALUE LOOKUP - a bare variable, a member/
+  subscript access, or the `none`/`null` literal (`repl_echo_none`) - so
+  `nn`/`none` echo `=> <none>` while `print(x)`/`func f(){}` stay quiet. Errors
+  are caught per input and the loop
   continues — **including a lexer error**: the lexer can throw
   (`InvalidTokenEx`, e.g. `2_`, or an unterminated single-line string), so every
   REPL lex site is guarded — `do_eval`'s lex runs inside the parse `try` (it
@@ -2124,11 +2132,12 @@ behind a thin terminal shell:
     gray (`\033[90m…\033[0m`) just past the cursor and repositions the cursor to
     its start; **Right-arrow / `Ctrl-F` at the line end accept it**
     (`accept_suggestion`: append the remainder; returns false otherwise so the
-    key falls back to moving the cursor right). It is **distinct from Tab**
-    (which completes the identifier under the cursor): the suggestion completes
-    the WHOLE line. `read_line` wires a **history** suggester (most-recent
-    single-line entry the buffer is a strict prefix of) and only when **color is
-    on** (the ghost must be visually distinct; `NO_COLOR`/no-TTY get none). The
+    key falls back to moving the cursor right). `read_line` wires the suggester
+    to the **completer** (the same source as Tab: current variables, builtins,
+    keywords - NOT history; history is `Ctrl-R`'s job): it completes the
+    identifier ending the buffer with the shortest matching candidate's
+    remainder. Enabled only when **color is on** (the ghost must be visually
+    distinct; `NO_COLOR`/no-TTY get none). The
     pure core is unit-tested with a synthetic suggester (`suggestion()` +
     accept); the gray rendering lives in `read_line` (untested, like the rest of
     the TTY shell). A navigable dropdown completion menu is still deferred (see
