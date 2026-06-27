@@ -215,20 +215,6 @@ EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList)
     return e.get_type()->intptr(e);
 }
 
-EvalValue builtin_undef(EvalContext *ctx, ExprList *exprList)
-{
-    if (exprList->elems.size() != 1)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg = exprList->elems[0].get();
-    Identifier *id = dynamic_cast<Identifier *>(arg);
-
-    if (!id)
-        throw TypeErrorEx("Expected identifier", arg->start, arg->end);
-
-    return ctx->erase(id);
-}
-
 EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)

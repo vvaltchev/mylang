@@ -984,34 +984,12 @@ static const std::vector<test> tests =
     },
 
     {
-        "Undef builtin",
-        {
-            "var a = \"hello\";",
-            "assert(a == \"hello\");",
-            "assert(undef(a));",
-            "assert(a == \"hello\");",
-        },
+        /* undef() is no longer a builtin (a script's symbols are fixed slots
+         * at compile time); calling it is an undefined-variable error. The
+         * REPL has a `:undef` command instead (see the repl: tests). */
+        "undef() is not a script builtin",
+        { "var a = 5; undef(a);" },
         &typeid(UndefinedVariableEx),
-    },
-
-    {
-        "Undef builtin, undefined var",
-        {
-            "assert(!undef(abc));",
-        }
-    },
-
-    {
-        "undef() builtin, variable shadowing another",
-        {
-            "var a = 42;",
-            "{",
-            "   var a = 10;",
-            "   assert(a == 10);",
-            "   undef(a);",
-            "}",
-            "assert(a == 42);",
-        },
     },
 
     {
@@ -2170,7 +2148,7 @@ static const std::vector<test> tests =
          * forward recursion, passing a function as a value, and globals()
          * listing them all work; undef() clears a slot.
          */
-        "global function slotting: recursion/mutual/value/globals/undef",
+        "global function slotting: recursion/mutual/value/globals",
         {
             "func mfib(n){ if(n<2) return n; return mfib(n-1)+mfib(n-2); }",
             "var k = 12;",                  /* runtime arg: real calls */
@@ -2188,10 +2166,6 @@ static const std::vector<test> tests =
             "var dyn gl = globals();",      /* globals() returns dyn */
             "assert(find(gl, \"mfib\") != none);",
             "assert(find(gl, \"sqf\") != none);",
-            /* undef() clears a function's global slot */
-            "assert(defined(sqf));",
-            "undef(sqf);",
-            "assert(!defined(sqf));",
         },
     },
     {
@@ -2579,10 +2553,6 @@ static const std::vector<test> tests =
       { "intptr();" }, &typeid(InvalidNumberOfArgsEx) },
     { "intptr() of a non-lvalue is rejected",
       { "intptr(5);" }, &typeid(NotLValueEx) },
-    { "undef() with no args is rejected",
-      { "undef();" }, &typeid(InvalidNumberOfArgsEx) },
-    { "undef() of a non-identifier is a type error",
-      { "undef(5);" }, &typeid(TypeErrorEx) },
     { "assert(false) fails",
       { "assert(false);" }, &typeid(AssertionFailureEx) },
     { "assert() with no args is rejected",
@@ -8413,12 +8383,14 @@ static const std::vector<repl_test> repl_tests =
         { "ca[0] + 100", "=> 101" },
         { "ca = [\"a\", \"b\"]", "is assigned" } } },
 
-    { "undef() resets a global's type so it can be redeclared",
+    { ":undef resets a global's type so it can be redeclared",
       { { "var cu = 3", "=> 3" },
         { "var cu = \"s\"", "is assigned 'str'" },   /* redeclare: rejected */
-        { "undef(cu)", "" },                          /* now reset it */
+        { ":undef cu", "undefined" },                 /* now reset it */
         { "var cu = \"s\"", "=> s" },                 /* fresh type: ok */
         { "cu", "=> s" } } },
+    { ":undef of an unknown global reports it",
+      { { ":undef nope", "no global" } } },
 
     { "the real optimizers run per input (flat array storage)",
       { { "var fa = [1, 2, 3]", "=> [1, 2, 3]" },

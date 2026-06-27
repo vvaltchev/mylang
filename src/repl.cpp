@@ -106,6 +106,7 @@ struct ReplEngine::Impl {
     string cmd_globals();
     string cmd_type(const string &code);
     string cmd_show(const string &arg);
+    string cmd_undef(const string &name);
 
     /* GC a redefined function's now-orphaned template/spec instances */
     void gc_redefined_instances(Block *blk,
@@ -356,18 +357,8 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     std::cout.rdbuf(old_cout);
     retained.push_back(move(root));
 
-    /* A global that undef() removed at runtime is also dropped from the type
-     * environment, so a LATER input may re-declare it with a new type (the
-     * documented way to change a global's type). */
-    {
-        const std::vector<const UniqueId *> names_after = global_names();
-        std::vector<const UniqueId *> removed;
-        std::set_difference(names_before.begin(), names_before.end(),
-                            names_after.begin(), names_after.end(),
-                            std::back_inserter(removed));
-        for (const UniqueId *n : removed)
-            infer.undef_global(n);
-    }
+    /* (Removing a global from the type environment is the `:undef` command's
+     * job now - there is no runtime undef() builtin to detect here.) */
 
     /* Drop any template/spec instances orphaned by a redefinition in this
      * input (e.g. f$0 from a throwaway `f(1,2)` after `func f` is redefined),
@@ -423,6 +414,8 @@ ReplEngine::Impl::meta_command(const string &src)
         return cmd_type(arg);
     if (cmd == "show")
         return cmd_show(arg);
+    if (cmd == "undef")
+        return cmd_undef(arg);
     if (cmd == "quit" || cmd == "q")
         return "";              /* the loop handles the actual exit */
 
@@ -689,6 +682,31 @@ ReplEngine::Impl::cmd_globals()
         o << " : " << r.type << "   [" << r.kind << "]\n";
     }
     return o.str();
+}
+
+/*
+ * :undef <name> - remove a GLOBAL symbol from the session: the runtime scope,
+ * the const context, and the type environment (so a later input may re-declare
+ * it, even with a new type). This is a REPL-only convenience: a script's
+ * symbols are fixed slots at compile time, so there is no `undef` builtin -
+ * a script just re-defines a name instead. Mirrors gc_redefined_instances'
+ * removal (a fresh Identifier resolves via the map, where REPL globals live).
+ */
+string
+ReplEngine::Impl::cmd_undef(const string &name)
+{
+    if (name.empty())
+        return "usage: :undef <name>\n";
+
+    Identifier id(name);
+    const bool in_rt = runtime_ctx->erase(&id);
+    const bool in_ct = const_ctx->erase(&id);
+
+    if (in_rt || in_ct) {
+        infer.undef_global(id.uid);
+        return "undefined '" + name + "'\n";
+    }
+    return "no global named '" + name + "'\n";
 }
 
 /*

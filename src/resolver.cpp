@@ -126,8 +126,7 @@ struct FuncState {
 static bool is_lvalue_arg_builtin(std::string_view name)
 {
     return name == "append" || name == "push" || name == "pop"
-        || name == "insert" || name == "erase" || name == "intptr"
-        || name == "undef";
+        || name == "insert" || name == "erase" || name == "intptr";
 }
 
 /*
