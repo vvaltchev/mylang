@@ -848,14 +848,21 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
     if (!elems.size()) {
-        /* An empty array<POD struct> destination: start flat (with the element
-         * type from the hint) so a built-up `var a = []; append(a, S(..))`
-         * stays unboxed. */
+        /* An empty array with a flat destination type (`array<int> a;`,
+         * `array<POD struct> a;`, ...): start flat so a built-up
+         * `append(a, ...)` stays unboxed - the destination type, not the
+         * (empty) value, drives the representation. */
         if (arr_hint == ArrHint::flat_s && arr_hint_struct) {
             StructTypeDef *def = const_cast<StructTypeDef *>(arr_hint_struct);
             return SharedArrayObj(
                 SharedArrayObj::svec_type({}, def, def->size));
         }
+        if (arr_hint == ArrHint::flat_i)
+            return SharedArrayObj(SharedArrayObj::ivec_type{});
+        if (arr_hint == ArrHint::flat_f)
+            return SharedArrayObj(SharedArrayObj::fvec_type{});
+        if (arr_hint == ArrHint::flat_b)
+            return SharedArrayObj(SharedArrayObj::bvec_type{});
         return empty_arr;
     }
 

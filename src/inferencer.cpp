@@ -56,6 +56,10 @@ struct TypeSym {
     DeclType ann = DeclType::none;
     /* When ann == DeclType::strct, the struct type the var is pinned to. */
     const StructTypeDef *ann_struct = nullptr;
+    /* For a PARAMETERIZED container annotation (`array<int>`, `dict<str,P>`):
+     * the recursive element/key/value type. When set, the symbol is pinned to
+     * the full type (kind AND element types), exactly like a scalar pin. */
+    std::shared_ptr<TypeAnnot> ann_annot;
     bool is_param = false;
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
@@ -227,6 +231,7 @@ private:
     void declare_funcdecl(FuncDeclStmt *fd, Scope *s);
     void declare_structdecl(StructDeclStmt *sd, Scope *s);
     STyRef field_sty(const FieldDef &fd);    /* a struct field's static type */
+    STyRef annot_to_sty(const TypeAnnot *ta); /* a parsed TypeAnnot -> STy */
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
     void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
@@ -290,10 +295,17 @@ private:
      * return true; return false if it is not a decltype call. */
     bool fold_decltype(CallExpr *call);
 
-    /* An explicit SCALAR annotation (bool/int/float/str) as an STy, with the
-     * symbol's opt flag applied; nullptr for none/array/dict (not pinned). */
+    /* The STy a declaration's annotation PINS the symbol to (seeded by
+     * reset_round, checked by contribute), or nullptr when it does not pin: a
+     * scalar (bool/int/float/str), a struct, OR a parameterized container
+     * (`array<int>`, `dict<str,P>`). A *generic* `array`/`dict` (no annot)
+     * returns nullptr - it constrains only the kind (enforce_decl_types). */
     STyRef ann_scalar_sty(const TypeSym *s) {
         const bool o = s->opt_decl;
+        if (s->ann_annot) {        /* parameterized array<>/dict<>: full pin */
+            STyRef t = annot_to_sty(s->ann_annot.get());
+            return o ? A.with_opt(t, true) : t;
+        }
         switch (s->ann) {
             case DeclType::b: return A.bool_ty(o);
             case DeclType::i: return A.int_ty(o);
@@ -1151,6 +1163,11 @@ void Inferencer::enforce_decl_types()
             continue;
         if (s->func || s->pinned || !s->decl_loc)
             continue;
+        /* A PARAMETERIZED container is already pinned to its full type (kind +
+         * element) via ann_scalar_sty in reset_round/contribute, so the
+         * kind-only check here is redundant - skip it. */
+        if (s->ann_annot)
+            continue;
 
         STyRef t = sty_resolve(s->type);
         /* Defer on a not-yet-pinned/none/dyn type (a never-written `array a;` is
@@ -1457,9 +1474,47 @@ void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
 
 /* The static type of one struct field (an array/dict field is generic - its
  * element/key/value are `dyn`, since v1 has no inference inside a struct). */
+/* Convert a parsed recursive TypeAnnot (array<int>, dict<str, Point>, ...) into
+ * an STy, applying the `?` nullable flag at each level. */
+STyRef Inferencer::annot_to_sty(const TypeAnnot *ta)
+{
+    if (!ta)
+        return A.dyn_ty();
+
+    STyRef base;
+    switch (ta->kind) {
+        case DeclType::b:   base = A.bool_ty();  break;
+        case DeclType::i:   base = A.int_ty();   break;
+        case DeclType::f:   base = A.float_ty(); break;
+        case DeclType::s:   base = A.str_ty();   break;
+        case DeclType::dyn: base = A.dyn_ty();   break;
+        case DeclType::strct:
+            base = ta->strct ? A.struct_ty(ta->strct, ta->strct->name)
+                             : A.dyn_ty();
+            break;
+        case DeclType::arr:
+            base = A.array_of(annot_to_sty(ta->elem.get()));
+            break;
+        case DeclType::dict:
+            base = A.dict_of(annot_to_sty(ta->key.get()),
+                             annot_to_sty(ta->val.get()));
+            break;
+        default: base = A.dyn_ty();
+    }
+    return A.with_opt(base, ta->opt);
+}
+
 STyRef Inferencer::field_sty(const FieldDef &fd)
 {
     STyRef base;
+
+    /* A parameterized container field (`array<int> xs`) carries its element
+     * type in `annot`; a generic `array`/`dict` field leaves it `dyn`. */
+    if (fd.annot &&
+        (fd.kind == FieldKind::f_array || fd.kind == FieldKind::f_dict)) {
+        base = annot_to_sty(fd.annot.get());
+        return fd.is_opt ? A.with_opt(base, true) : base;
+    }
 
     switch (fd.kind) {
         case FieldKind::f_bool:   base = A.bool_ty();  break;
@@ -1536,6 +1591,7 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
         if (id->decl_type != DeclType::none) {
             sym->ann = id->decl_type;
             sym->ann_struct = id->decl_struct;   /* set when ann == strct */
+            sym->ann_annot = id->decl_annot;     /* set when parameterized */
         }
         id_sym[id] = sym;        /* the decl write is counted in walk_struct
                                   * (declare_target runs twice via hoist) */
@@ -1587,6 +1643,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                 psym->dyn_decl = p->dyn_mod;
                 psym->ann = p->decl_type;
                 psym->ann_struct = p->decl_struct;   /* set when ann == strct */
+                psym->ann_annot = p->decl_annot;     /* if parameterized */
                 id_sym[p.get()] = psym;
                 fi->params.push_back(psym);
             }

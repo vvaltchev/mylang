@@ -8,6 +8,7 @@
 #include <vector>
 #include <utility>
 #include <cstring>
+#include <memory>
 
 /*
  * Custom struct types (see plans/structs.md). A `struct` decl builds one
@@ -27,6 +28,29 @@ enum class FieldKind : unsigned char {
 
 struct StructTypeDef;
 
+/* DeclType is defined in syntax.h (which includes this header); a forward
+ * declaration with the underlying type is enough to use it as a member. */
+enum class DeclType : unsigned char;
+
+/*
+ * A parsed, recursive TYPE annotation - what backs the parameterized container
+ * syntax `array<A>` / `dict<K, V>` (and composes: `dict<str, array<Point>>`).
+ * `kind` is the DeclType (bool/int/float/str/dyn/strct, or arr/dict for the
+ * containers); `opt` is the `?` nullable suffix; `strct` is set when kind is a
+ * user struct; `elem` (array) and `key`/`val` (dict) are the parameters (null
+ * for the *generic* `array`/`dict` form, which leaves the element type to
+ * inference). Built by `pTypeAnnot` (parser.cpp), converted to an `STy` by the
+ * inferencer (`annot_to_sty`). Immutable after parse, so it is freely shared
+ * (a clone shares the same node).
+ */
+struct TypeAnnot {
+    DeclType kind;
+    bool opt = false;
+    const StructTypeDef *strct = nullptr;       /* kind == strct */
+    std::shared_ptr<TypeAnnot> elem;            /* kind == arr */
+    std::shared_ptr<TypeAnnot> key, val;        /* kind == dict */
+};
+
 struct FieldDef {
     const UniqueId *name = nullptr;
     FieldKind kind = FieldKind::f_dyn;
@@ -36,6 +60,9 @@ struct FieldDef {
      * (recursive POD); otherwise the field is a boxed pointer. */
     const StructTypeDef *struct_def = nullptr;
     bool is_opt = false;
+    /* For a parameterized container field (`array<int> xs;`): the recursive
+     * element/key/value type. Null for a generic `array`/`dict` field. */
+    std::shared_ptr<TypeAnnot> annot;
     int slot = -1;        /* boxed: index into StructObject::fields */
     int offset = -1;      /* POD: byte offset into the bytes buffer; else -1 */
 };

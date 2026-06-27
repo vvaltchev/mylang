@@ -94,6 +94,8 @@ unique_ptr<Construct> pStmt(ParseContext &c, unsigned fl);
  * the variable/parameter name (so `int(5)`, `map(int, a)` remain plain uses).
  */
 bool pAcceptKeyword(ParseContext &c, Keyword exp);   /* defined below */
+bool pAcceptOp(ParseContext &c, Op exp);             /* defined below */
+void pExpectOp(ParseContext &c, Op exp);             /* defined below */
 
 static DeclType type_keyword(std::string_view s)
 {
@@ -124,6 +126,110 @@ lookup_struct_type(ParseContext &c, std::string_view name)
         return nullptr;
     const EvalValue &v = lv->get();
     return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+}
+
+/*
+ * Consume a type's closing `>`, splitting a `>>` / `>>>` token across nesting
+ * levels (the lexer makes `>>` one token, so a nested `array<array<int>>` ends
+ * in a single `>>`). On a multi-`>` token we consume it and record the leftover
+ * `>`s in pending_gt for the enclosing level(s). Returns false if no `>` is
+ * available. This is the localized C++11-style fix that keeps the type grammar
+ * context-free despite the merged token.
+ */
+static bool pAcceptCloseAngle(ParseContext &c)
+{
+    if (c.pending_gt > 0) {               /* a `>` left from a `>>` / `>>>` */
+        c.pending_gt--;
+        return true;
+    }
+    if (*c == Op::gt)   { c.next(); return true; }
+    if (*c == Op::shr)  { c.next(); c.pending_gt = 1; return true; }
+    if (*c == Op::ushr) { c.next(); c.pending_gt = 2; return true; }
+    return false;
+}
+
+/*
+ * Peek-based: given `start` = the index of a `<`, return the index just past
+ * the matching `>` (a `>>`/`>>>` closing multiple levels counts for 2/3), or
+ * -1 if it is not a balanced `<...>`. Used by pAcceptDeclPrefix to look past a
+ * parameterized container type and confirm the variable name follows, WITHOUT
+ * consuming (so the decision stays a no-commit scan).
+ */
+static int skip_angle_balanced(ParseContext &c, int start)
+{
+    int depth = 0;
+    for (int i = start; ; i++) {
+        const Tok &t = c.peek_tok(i);
+        if (t == TokType::invalid)
+            return -1;                    /* EOF before the close */
+        if (t == Op::lt)        depth++;
+        else if (t == Op::gt)   depth--;
+        else if (t == Op::shr)  depth -= 2;
+        else if (t == Op::ushr) depth -= 3;
+        if (depth <= 0)
+            return i + 1;                 /* just past the closing token */
+    }
+}
+
+/*
+ * Parse a TYPE annotation, recursively: a primitive (bool/int/float/str),
+ * `dyn`, a user struct name, or a parameterized container `array<ELEM>` /
+ * `dict<KEY, VAL>` - each with an optional `?` nullable suffix. The bare
+ * `array` / `dict` (no `<...>`) is the *generic* form (element type inferred).
+ * Shared by the decl prefix, function params, and struct fields. A name that is
+ * not a type is a `SyntaxErrorEx` ("'foo' is not a type").
+ */
+static std::shared_ptr<TypeAnnot> pTypeAnnot(ParseContext &c)
+{
+    auto ta = std::make_shared<TypeAnnot>();
+    const Loc loc = c.get_loc();
+
+    if (pAcceptKeyword(c, Keyword::kw_dyn)) {
+        ta->kind = DeclType::dyn;
+    } else if (*c == TokType::id) {
+        const std::string_view name = c.get_str();
+        const DeclType k = type_keyword(name);
+
+        if (k == DeclType::arr) {
+            c.next();                                  /* 'array' */
+            ta->kind = DeclType::arr;
+            if (pAcceptOp(c, Op::lt)) {                /* array<ELEM> */
+                ta->elem = pTypeAnnot(c);
+                if (!pAcceptCloseAngle(c))
+                    throw SyntaxErrorEx(c.get_loc(),
+                        "expected '>' to close 'array<...>'", &c.get_tok());
+            }
+        } else if (k == DeclType::dict) {
+            c.next();                                  /* 'dict' */
+            ta->kind = DeclType::dict;
+            if (pAcceptOp(c, Op::lt)) {                /* dict<KEY, VAL> */
+                ta->key = pTypeAnnot(c);
+                pExpectOp(c, Op::comma);
+                ta->val = pTypeAnnot(c);
+                if (!pAcceptCloseAngle(c))
+                    throw SyntaxErrorEx(c.get_loc(),
+                        "expected '>' to close 'dict<...>'", &c.get_tok());
+            }
+        } else if (k != DeclType::none) {              /* bool/int/float/str */
+            c.next();
+            ta->kind = k;
+        } else {                                       /* a user struct name */
+            const StructTypeDef *sdef = lookup_struct_type(c, name);
+            if (!sdef)
+                throw SyntaxErrorEx(loc,
+                    intern_msg("'" + std::string(name) + "' is not a type"));
+            c.next();
+            ta->kind = DeclType::strct;
+            ta->strct = sdef;
+        }
+    } else {
+        throw SyntaxErrorEx(c.get_loc(), "expected a type", &c.get_tok());
+    }
+
+    if (pAcceptOp(c, Op::questionmark))                /* nullable suffix */
+        ta->opt = true;
+
+    return ta;
 }
 
 /*
@@ -189,6 +295,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
     unsigned f = 0;
     DeclType dt = DeclType::none;
     const StructTypeDef *sdef = nullptr;   /* the struct type, if dt == strct */
+    bool parameterized = false;   /* a parameterized array<...> / dict<...> */
     bool starter = false;   /* something that makes this a declaration */
 
     for (;;) {
@@ -202,6 +309,26 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
             f |= pFlags::pInDecl | pFlags::pInDynDecl; starter = true; k++;
         } else if (t == Keyword::kw_opt || t == Op::questionmark) {
             f |= pFlags::pInDecl | pFlags::pInOptDecl; k++;
+        } else if (dt == DeclType::none && t == TokType::id &&
+                   (type_keyword(t.value) == DeclType::arr ||
+                    type_keyword(t.value) == DeclType::dict) &&
+                   c.peek_tok(k + 1) == Op::lt) {
+            /* A parameterized container `array<...>` / `dict<...>`: a container
+             * keyword + `<`, a balanced `<...>`, then the name (after optional
+             * `?`). The type is parsed by pTypeAnnot on commit (it consumes the
+             * `<...>`), so it is NOT counted in `k` - we stop the scan here. */
+            const int after = skip_angle_balanced(c, k + 1);
+            if (after < 0)
+                break;
+            int n = after;
+            if (c.peek_tok(n) == Op::questionmark)
+                n++;
+            if (c.peek_tok(n) != TokType::id)
+                break;
+            dt = type_keyword(t.value);
+            parameterized = true;
+            f |= pFlags::pInDecl; starter = true;
+            break;
         } else if (dt == DeclType::none && t == TokType::id &&
                    type_keyword(t.value) != DeclType::none) {
             /* A type keyword counts only if the name follows (after `?`). */
@@ -258,6 +385,15 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
     fl |= f;
     c.pending_decl_type = dt;
     c.pending_decl_struct = sdef;
+
+    /* A parameterized container: the type tokens weren't counted in `k`, so the
+     * stream is now at `array`/`dict` - parse the full type (consuming the
+     * `<...>` and any trailing `?`) into the recursive annotation. */
+    if (parameterized) {
+        c.pending_decl_annot = pTypeAnnot(c);
+        if (c.pending_decl_annot->opt)
+            fl |= pFlags::pInOptDecl;
+    }
 }
 
 /* The zero value of an explicit type, for an uninitialized typed declaration
@@ -628,12 +764,24 @@ pFuncParam(ParseContext &c, unsigned fl)
      */
     DeclType dt = DeclType::none;
     const StructTypeDef *sdef = nullptr;
+    std::shared_ptr<TypeAnnot> annot;
     if (!is_dyn && *c == TokType::id) {
+        const DeclType ck = type_keyword(c.get_str());
         const bool q1 = c.peek_tok(1) == Op::questionmark;
         const bool name_follows =
             c.peek_tok(1) == TokType::id ||
             (q1 && c.peek_tok(2) == TokType::id);
-        if (name_follows) {
+
+        if ((ck == DeclType::arr || ck == DeclType::dict) &&
+            c.peek_tok(1) == Op::lt) {
+            /* a parameterized container param: `array<int> xs`, `dict<str,P> m`
+             * (a param is never an expression, so the `<` is unambiguous here -
+             * no balanced-skip needed). pTypeAnnot eats the `<...>` + `?`. */
+            annot = pTypeAnnot(c);
+            dt = ck;
+            if (annot->opt)
+                is_opt = true;
+        } else if (name_follows) {
             /* `TYPE name`: an identifier before the param name is a type - by
              * SHAPE (context-free), like the statement-level decl prefix. That
              * the leading name is a real struct type is a semantic check (an
@@ -677,6 +825,7 @@ pFuncParam(ParseContext &c, unsigned fl)
     id->dyn_mod = is_dyn;
     id->decl_type = dt;
     id->decl_struct = sdef;
+    id->decl_annot = annot;
     return id;
 }
 
@@ -1541,16 +1690,20 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const DeclType dt = c.pending_decl_type;
         const StructTypeDef *ds = c.pending_decl_struct;
+        const std::shared_ptr<TypeAnnot> da = c.pending_decl_annot;
         c.pending_decl_type = DeclType::none;
         c.pending_decl_struct = nullptr;
+        c.pending_decl_annot = nullptr;
 
         if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
             id->decl_type = dt;
             id->decl_struct = ds;
+            id->decl_annot = da;
         } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
             for (auto &e : idl->elems) {
                 e->decl_type = dt;
                 e->decl_struct = ds;
+                e->decl_annot = da;
             }
         }
     }
@@ -2233,6 +2386,20 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         if (pAcceptKeyword(c, Keyword::kw_dyn)) {
             fd.kind = FieldKind::f_dyn;
+        } else if (*c == TokType::id &&
+                   (type_keyword(c.get_str()) == DeclType::arr ||
+                    type_keyword(c.get_str()) == DeclType::dict) &&
+                   c.peek_tok(1) == Op::lt) {
+            /* a parameterized container field: `array<int> xs;`,
+             * `dict<str, Point> m;` - pTypeAnnot consumes `<...>` + `?`. The
+             * field is still a (boxed) reference kind; the annot only records
+             * the element type for the inferencer. */
+            std::shared_ptr<TypeAnnot> annot = pTypeAnnot(c);
+            fd.kind = annot->kind == DeclType::arr ? FieldKind::f_array
+                                                   : FieldKind::f_dict;
+            fd.annot = annot;
+            if (annot->opt)
+                fd.is_opt = true;
         } else if (*c == TokType::id &&
                    type_keyword(c.get_str()) != DeclType::none) {
             fd.kind = decltype_to_fieldkind(type_keyword(c.get_str()));

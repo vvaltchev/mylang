@@ -959,6 +959,31 @@ decisions behind it: `plans/type-inference.md`,
   the param `TypeSym`'s
   `ann_struct` - so the param pins to struct `A` and `check_call` rejects a
   wrong-struct argument. (No runtime coercion; a struct binds as-is.)
+- **Parameterized containers `array<T>` / `dict<K, V>`** (compose recursively:
+  `dict<str, array<Point>>`, `array<array<int>>`). The element/key/value type is
+  a **`TypeAnnot`** (`structtype.h`): a small recursive struct
+  (`kind`/`opt`/`strct`/`elem`/`key`/`val`) built by **`pTypeAnnot`**
+  (`parser.cpp`), carried on `Identifier::decl_annot` (vars/params) and
+  `FieldDef::annot` (struct fields), shared (immutable after parse). **Parsing
+  stays context-free:** `pAcceptDeclPrefix` recognizes `array`/`dict` + `<` by
+  SHAPE (then `skip_angle_balanced` peeks past the balanced `<...>` to confirm
+  the var name follows); `pFuncParam` and the struct-field parser do the same.
+  Nested generics' merged closing token is handled by **`pAcceptCloseAngle`**
+  (the `pending_gt` counter splits a `>>`/`>>>` across levels - the C++11
+  trick), so no `>>` lexer change. The inferencer's **`annot_to_sty`** turns a
+  `TypeAnnot` into an `STy`; `ann_scalar_sty` returns it (so a parameterized
+  container is **pinned to its full type** exactly like a scalar - `reset_round`
+  seeds it, `contribute` checks each value/element is `assignable`, the non-opt
+  `none` rule applies), and `field_sty` uses `fd.annot`. `enforce_decl_types`
+  (the generic kind-only check) skips a pinned (`ann_annot`) symbol. A wrong
+  element type (`array<int> a = ["x"]`, a reassign, a struct-field arg, a
+  dyn-laundered `append(a,"x")`) is a compile error. **Flat storage:** the
+  existing `ArrHint` path makes a typed array flat - and an **empty** typed
+  array now starts flat too (`LiteralArray::do_eval` honors
+  `flat_i`/`flat_f`/`flat_b` for `elems.empty()`, matching the existing `flat_s`
+  case), so `array<int> a; append(a, 5)` stays unboxed. Generic `array a` /
+  `dict d` (no `<...>`) are unchanged (element inferred). See
+  `plans/typed-containers-syntax.md`.
 - **`decltype(var)` - a variable's STATIC type, at compile time.** A non-const
   builtin (`builtin_decltype`, `types.cpp`) whose result the inferencer makes:
   `builtin_result` types `decltype(...)` as `str`, and `fold_decltype` (run in
@@ -1911,9 +1936,12 @@ but the per-element `StructObject` allocation is gone (build overhead
   `TypeToEnum`, `TypeNames`, `AllTypes`.
 - **`structtype.h`** defines `StructTypeDef` (AST-owned, program-lifetime:
   `name`, `fields` as `FieldDef{name, FieldKind, struct_ty, is_opt, slot,
-  offset}`, folded `consts`, plus the `Layout`/`size`/`align` fields the POD
-  phases will fill) and `StructObject` (`RefCounted`: `def`, `readonly`, and a
-  boxed `vector<LValue> fields`). `evalvalue.h` forward-declares both.
+  offset, annot}`, folded `consts`, plus the `Layout`/`size`/`align` fields the
+  POD phases will fill) and `StructObject` (`RefCounted`: `def`, `readonly`, and
+  a boxed `vector<LValue> fields`). `evalvalue.h` forward-declares both. It also
+  defines **`TypeAnnot`** - the recursive parsed type behind the parameterized
+  container syntax `array<T>`/`dict<K,V>` (see the "Parameterized containers"
+  bullet above); `FieldDef::annot` and `Identifier::decl_annot` hold one.
 - **Parser** (`pAcceptStructDecl`, `parser.cpp`): the `struct` keyword
   (`kw_struct`) → a `StructDeclStmt` (owns the `StructTypeDef`;
   `do_eval` binds the descriptor like a func name, so it works inside a function

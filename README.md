@@ -335,8 +335,22 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     `f = 5;`), and `int x = true;` stores `1`.
   * **`array`/`dict`** are *generic*: they only require the value to be an array
     / dict, while its element/key/value types are inferred as usual — so
-    `array nums = [1,2,3]` is still a fast flat `array<int>` (parameterized
-    `array<T>` / `dict<K,V>` syntax is not available yet).
+    `array nums = [1,2,3]` is still a fast flat `array<int>`.
+  * **Parameterized containers** `array<T>` and `dict<K, V>` pin the element
+    (and key) types, and **compose recursively**:
+    ```C#
+    array<int> nums = [1, 2, 3];           # element type checked + flat storage
+    dict<str, int> ages = {"sam": 41};
+    array<Point> pts;                      # empty, typed (and flat for POD)
+    dict<str, array<int>> groups = {"a": [1, 2]};
+    array<array<int>> grid = [[1, 2], [3]];
+    ```
+    The element type is enforced (`array<int> a = ["x"]`, a later
+    `a = ["x"]`, or `append(a, "x")` are compile errors), and an **empty** typed
+    container starts in its final representation — `array<int> a;` is a flat
+    `array<int>` (likewise `array<float>` / `array<bool>` / `array<PodStruct>`),
+    so a subsequent `append` stays unboxed. Nesting uses ordinary `<...>` (a
+    closing `>>` is split automatically, as in modern C++).
   * **A `struct` type** pins the variable to that exact type (like a scalar):
     `Point p = Point(3, 4)` is fine, while `Point p = Other(...)` (or a later
     `p = Other(...)`) is a compile error. The struct name is read as a type only

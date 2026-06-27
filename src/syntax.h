@@ -66,6 +66,7 @@ enum class ArrHint : unsigned char {
 enum class DeclType : unsigned char {
     none, b, i, f, s, arr, dict,
     strct,   /* a user struct type; the exact type is in `decl_struct` */
+    dyn,     /* `dyn` as a type (used inside a TypeAnnot, e.g. `array<dyn>`) */
 };
 
 /*
@@ -621,6 +622,12 @@ public:
      * then DeclType::strct). The inferencer pins the var to this exact type. */
     const StructTypeDef *decl_struct = nullptr;
 
+    /* For a PARAMETERIZED container declaration (`array<int> a`,
+     * `dict<str, Point> m`): the recursive element/key/value type (decl_type is
+     * then DeclType::arr / DeclType::dict). Null for the generic `array`/`dict`
+     * form, whose element type stays inferred. */
+    std::shared_ptr<TypeAnnot> decl_annot;
+
     Identifier(const std::string_view &str)
         : Construct("Id", false, ConstructType::id)
         , uid(UniqueId::get(str))
@@ -641,6 +648,8 @@ public:
         c->opt_mod = opt_mod;
         c->dyn_mod = dyn_mod;
         c->decl_type = decl_type;
+        c->decl_struct = decl_struct;
+        c->decl_annot = decl_annot;   /* shared: TypeAnnot is immutable */
         return c;
     }
 };

@@ -1,7 +1,11 @@
 # Typed array / dict syntax (custom element types)
 
-> **STATUS: design note / deferred.** No code yet. Captures the decision so we
-> can implement it later.
+> **STATUS: DONE.** `array<T>` / `dict<K, V>` are implemented in every context
+> (local/global vars, consts, function params, struct fields), compose
+> recursively, are element-type-checked, drive flat storage (incl. empty typed
+> arrays), and obey the non-opt nullability rule. The decision below stands;
+> implementation notes are in CLAUDE.md ("Parameterized containers `array<T>` /
+> `dict<K, V>`") and the README "Explicit types" section.
 
 ## The question
 

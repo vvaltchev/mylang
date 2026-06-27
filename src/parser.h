@@ -13,6 +13,7 @@ class EvalContext;
 class Block;
 struct AnalysisInfo;
 struct StructTypeDef;
+struct TypeAnnot;
 enum class DeclType : unsigned char;   /* defined in syntax.h */
 
 /*
@@ -95,6 +96,20 @@ public:
     /* When pending_decl_type == strct, the struct type of the pending decl
      * (`A obj`); nullptr otherwise. Transient, like pending_decl_type. */
     const StructTypeDef *pending_decl_struct = nullptr;
+
+    /* When the pending decl is a PARAMETERIZED container (`array<int>`,
+     * `dict<str, Point>`), its recursive element/key/value type; nullptr for a
+     * generic `array`/`dict` or any non-container. Transient. */
+    std::shared_ptr<TypeAnnot> pending_decl_annot;
+
+    /*
+     * The `>>` / `>>>` token-split state for parsing nested generics
+     * (`array<array<int>>`): the lexer makes `>>` one token, so when a type's
+     * closing `>` is part of a `>>`/`>>>`, we consume the token and record the
+     * leftover `>`s here for the enclosing level(s) to consume. See
+     * pAcceptCloseAngle (parser.cpp). 0 outside a type parse.
+     */
+    int pending_gt = 0;
 
     /* token operations */
     const Tok &operator*() const { return ts.get(); }
