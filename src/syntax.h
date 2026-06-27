@@ -84,6 +84,8 @@ enum class SymKind : unsigned char {
     capture,    /* slot in the closure's per-instance capture vector
                  * (ctx->captures) - a captured outer variable, snapshot at
                  * closure creation, persists across calls to that closure */
+    builtin,    /* slot in the program-wide builtin table (builtin_slot) - a
+                 * builtin not shadowed by a user symbol; a global constant */
 };
 
 struct ResolvedSym {

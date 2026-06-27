@@ -2244,6 +2244,56 @@ static const std::vector<test> tests =
         },
     },
     {
+        /*
+         * Builtin slotting: a builtin not shadowed by a user symbol resolves to
+         * SymKind::builtin (an O(1) table slot, no map walk) - at top level and
+         * inside functions. Behavior is identical; just exercises the path.
+         */
+        "builtin slotting: builtins resolve and run (top level + in functions)",
+        {
+            "var dyn a = [3, 1, 2];",
+            "func f(x){ return max(x) + abs(-1); }",   /* builtins in a body */
+            "assert(f(a) == 4);",                       /* max([3,1,2])=3 +1 */
+            "assert(len(a) == 3);",                     /* top-level builtin */
+            "print(\"\");",                             /* runtime builtin */
+        },
+    },
+    {
+        /* A user function shadows a same-named builtin (resolved to the global
+         * table before the builtin table); the builtin is then unreachable. */
+        "builtin slotting: a user function shadows a builtin",
+        {
+            "func len(x){ return 42; }",     /* shadows builtin len */
+            "var dyn a = [1, 2, 3];",
+            "assert(len(a) == 42);",         /* the user func, not builtin 3 */
+            "func g(y){ return len(y); }",   /* shadow holds inside functions */
+            "assert(g(a) == 42);",
+        },
+    },
+    {
+        /* Regression (builtin slotting): a runtime builtin (append) is NOT a
+         * const builtin, so it must stay unfoldable in a const-eval context -
+         * an append() on a const array still throws CannotChangeConstEx at RUN
+         * time, not get evaluated at compile time (which broke when builtins
+         * became globally resolvable). */
+        "builtin slotting: append on a const array is a runtime const error",
+        {
+            "const tbl = [1, 2, 3];",
+            "append(tbl, 9);",
+        },
+        &typeid(CannotChangeConstEx),
+    },
+    {
+        /* A const builtin with const args still folds at compile time (builtin
+         * slotting must not disturb const-folding). */
+        "builtin slotting: const-builtin call still folds",
+        {
+            "const n = len([1, 2, 3, 4]);",  /* folds to 4 at compile time */
+            "assert(n == 4);",
+            "assert(isconst(n));",
+        },
+    },
+    {
         "closure capturing state at runtime",
         {
             "func make_counter() {",

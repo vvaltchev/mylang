@@ -947,12 +947,15 @@ public:
         walk(root, &main_st);
 
         /* Now that the top-level pass has given each escaped top-level var its
-         * global slot, stamp the function-side use sites recorded in pass 1. A
-         * name not in the table is a builtin / undefined - left for the map. */
+         * global slot, stamp the function-side use sites recorded in pass 1: a
+         * user global wins, else a builtin gets its table slot, else the name
+         * stays unresolved (the runtime map -> UndefinedVariableEx). */
         for (Identifier *id : escaped_refs) {
             auto it = global_func_slots.find(id->uid);
             if (it != global_func_slots.end())
                 id->sym = ResolvedSym{ SymKind::global, it->second };
+            else
+                stamp_builtin(id);
         }
 
         /* Publish the global table's slot->name list to the root block, which
@@ -1167,12 +1170,38 @@ private:
         }
 
         if (!cur->is_main) {
+            /*
+             * A function-body free name. It is EITHER an escaped top-level var
+             * (gets a global slot in pass 2) OR a builtin - but we can't tell
+             * yet (vars aren't hoisted), and a user var must win over a
+             * same-named builtin. So defer BOTH: record the use site and stamp
+             * it (global, else builtin, else leave for the map) after pass 2.
+             */
             escaped.insert(id->uid);
-            /* record the use site: if `id` turns out to be a top-level var, it
-             * is stamped SymKind::global after the top-level pass assigns its
-             * global slot (a body is resolved before that pass runs). */
             escaped_refs.push_back(id);
+            return;
         }
+
+        /*
+         * A top-level (main) free name. A user var/func of this name would have
+         * been found in the scope loop / global table above, so reaching here
+         * means it is a builtin (resolve to its table slot) or genuinely
+         * undefined (left unresolved -> the runtime map -> an error).
+         * Not in the REPL, where builtins stay map-resident (redefinable).
+         */
+        stamp_builtin(id);
+    }
+
+    /* Stamp `id` SymKind::builtin if its name is a builtin (and not in REPL
+     * mode, where builtins stay in the map); else leave it unresolved (map). */
+    void stamp_builtin(Identifier *id)
+    {
+        if (repl_mode)
+            return;
+
+        const int bi = builtin_slot_index(id->uid);
+        if (bi >= 0)
+            id->sym = ResolvedSym{ SymKind::builtin, bi };
     }
 
     /* Count an assignment to a resolved-local lvalue as a write of its slot. */

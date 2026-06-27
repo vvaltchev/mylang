@@ -228,6 +228,22 @@ public:
     static const SymbolsType const_builtins;
 };
 
+/*
+ * The program-wide builtin table: a flat vector of every builtin's value, each
+ * with a fixed index, built once (lazily) from const_builtins + builtins. A
+ * builtin reference the resolver couldn't shadow with a user symbol resolves to
+ * SymKind::builtin + its index, so it is an O(1) slot read - not a scope-chain
+ * map walk. Entries are is_const-flagged (so an `aBuiltin = x` assignment to an
+ * unshadowed builtin still raises CannotRebindBuiltinEx, and the shared global
+ * table can't be corrupted). NOT used in the REPL (builtins stay map-resident
+ * there so they remain redefinable). builtin_slot_index returns -1 if the name
+ * is not a builtin.
+ */
+int builtin_slot_index(const UniqueId *uid);
+LValue &builtin_slot(int index);
+/* did the builtin come from const_builtins (visible during const-eval)? */
+bool builtin_is_const(int index);
+
 
 inline EvalContext *
 get_root_ctx(EvalContext *ctx)

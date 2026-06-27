@@ -290,6 +290,23 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
         return EvalValue(&(*ctx->captures)[sym.slot]);
     }
 
+    if (sym.kind == SymKind::builtin) {
+        /* An unshadowed builtin: an O(1) read of the program-wide builtin
+         * table, no scope-chain map walk. The slot is is_const-flagged, so an
+         * attempt to assign to it falls through to the CannotRebindBuiltinEx
+         * path.
+         *
+         * In a const-eval context (AutoConst / the inliner's refold) only CONST
+         * builtins are visible - mirroring the const EvalContext, which loads
+         * only const_builtins. A runtime builtin reads as undefined here, so an
+         * append()/print() call stays unfoldable (those passes catch the
+         * resulting UndefinedVariableEx to keep it a runtime call). */
+        if (ctx && ctx->const_ctx && !builtin_is_const(sym.slot))
+            return UndefinedId{get_str()};
+
+        return EvalValue(&builtin_slot(sym.slot));
+    }
+
     while (ctx) {
 
         LValue *lval = ctx->lookup(this);
