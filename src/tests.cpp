@@ -2025,6 +2025,11 @@ static const std::vector<test> tests =
         "var a = [10, 20]; var r = g(a);",
         "assert(r == 10 && a[0] == 11);" } },   /* ref semantics, like a call */
 
+    { "var with no initializer: its type is inferred from later assignment",
+      { "var a; a = 3; assert(decltype(a).name == \"int?\");" } },
+    { "var with no initializer: a conflicting reassignment is a type error",
+      { "var a; a = 3; a = \"x\";" }, &typeid(TypeMismatchEx) },
+
     /* ---- ternary ?: and null-coalescing ?? ---- */
     { "ternary: basic true / false branches",
       { "assert((1 > 0 ? 10 : 20) == 10);",
@@ -9037,6 +9042,13 @@ static const std::vector<repl_test> repl_tests =
         /* a prior-input const folds the ternary; a prior global feeds ?? */
         { "FLAG ? \"on\" : \"off\"", "=> \"on\"" },
         { "g ?? 42", "=> 42" } } },
+    { "an uninitialized `var a;` is an open (dyn?) var across REPL inputs",
+      { { "var a;", "" },
+        { "decltype(a).name", "=> \"dyn?\"" },   /* not the useless "none" */
+        { "a ?? 3", "=> 3" },                    /* still none here */
+        { "a = 1", "=> 1" },                     /* a later assignment works */
+        { "a", "=> 1" },
+        { "a = \"x\"", "=> \"x\"" } } },          /* any type (it is dyn) */
 
     { "parameterized container types persist and check across inputs",
       { { "array<int> g = [10, 20]", "[10, 20]" },

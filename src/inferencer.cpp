@@ -1053,8 +1053,24 @@ void Inferencer::infer_input(Block *rootBlock)
     auto global_snapshot = global->syms;
 
     auto pin_new = [&]() {
-        for (size_t i = sym_base; i < all_syms.size(); i++)
-            all_syms[i]->pinned = true;
+        for (size_t i = sym_base; i < all_syms.size(); i++) {
+            TypeSym *s = all_syms[i].get();
+            /*
+             * A plain `var a;` (no annotation, unconstrained) finalized to
+             * `none` - a useless committed type that would reject EVERY later
+             * assignment (`a = 1` -> "'a' has type 'none' but is assigned
+             * 'int'"). A SCRIPT infers it from later uses (join: `var a; a = 3`
+             * -> `int?`), but the REPL commits each input before seeing the
+             * next, so it cannot defer - commit `var a;` as `dyn?` (nullable
+             * dynamic) so future inputs may assign any type. An annotated /
+             * `dyn` / param sym keeps its finalized type.
+             */
+            if (!s->func && !s->is_param && !s->dyn_decl &&
+                !ann_scalar_static_type(s) &&
+                is_none(static_type_resolve(s->type)))
+                s->type = A.with_opt(A.dyn_ty(), true);
+            s->pinned = true;
+        }
         for (size_t i = func_base; i < all_funcs.size(); i++)
             all_funcs[i]->pinned = true;
     };

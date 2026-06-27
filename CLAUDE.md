@@ -2417,7 +2417,15 @@ locals all happen and are inspectable (`:analyze`).
   inferred commit vs "is declared" for an annotated one). All `pinned` branches
   are no-ops in the one-shot path, so scripts/tests are byte-identical. A
   rejected input rolls back (`infer_input` restores the global scope + pins the
-  half-built syms). The **`:undef <name>`** meta-command
+  half-built syms). **An uninitialized `var a;` commits as `dyn?`, not `none`**
+  (`pin_new`): a script infers a plain `var`'s type from later uses
+  (`var a; a = 3` → `int?`; a conflicting `a = "x"` is an error), but the REPL
+  commits each input before seeing the next and so cannot defer — a `none`
+  commitment would reject *every* later assignment (`a = 1`), so an
+  unconstrained, un-annotated, non-`dyn`/non-param var is committed `opt dyn`
+  (it accepts any future assignment). This is a deliberate REPL-vs-script
+  divergence (the REPL can't see the future). The **`:undef <name>`**
+  meta-command
   (`Impl::cmd_undef`) erases a global from the runtime + const scopes and calls
   `ReplInfer::undef_global` to drop its committed type, so a later `var x` of a
   new type is fresh. REPL redeclaration is **not** a feature: a re-declared
