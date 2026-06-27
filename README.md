@@ -634,8 +634,11 @@ runtime instead.
     can. Pure functions can only see consts and their arguments.
 
   * **Exception**
-    The only type of objects that can be thrown. To create them, use the `exception()`
-    builtin or its shortcut `ex()`.
+    The internal wrapper for a *built-in* runtime error (`DivisionByZeroEx`,
+    `TypeErrorEx`, …). User exceptions are not this type: you throw a **struct**
+    instance and catch it by its type (see *Custom exceptions*). A built-in
+    exception bound with `catch (X as e)` surfaces as this type (printable,
+    re-throwable), but carries no fields.
 
 ### Static type inference
 
@@ -1385,9 +1388,10 @@ try {
 }
 ```
 
-Exceptions might contain data, but none of the built-in exceptions
-currently do. The list of builtin *runtime* exceptions that can be
-caught with `try-catch` blocks is:
+The built-in runtime exceptions carry no data (a `catch (X as e)` binds a
+printable exception object). Your own exceptions, which *do* carry data, are
+plain structs — see *Custom exceptions* below. The list of builtin *runtime*
+exceptions that can be caught with `try-catch` blocks is:
 
   * DivisionByZeroEx
   * AssertionFailureEx
@@ -1497,35 +1501,61 @@ with a global `const PI`.
 
 ### Custom exceptions
 
-This language does not support throwing custom objects, at the moment.
-Therefore,
-it's not possible to *throw* any kind of object like in some other languages.
-To throw an exception, it's necessary to use the special built-in function
-`exception()` or its shortcut, `ex()`. Consider the following example:
+A custom exception is just a **struct** (see *Structs* above): you `throw` a
+struct instance and catch it by its type. The struct's fields carry the
+exception's data — no special exception API is needed.
 
 ```C#
+struct MyError {
+    str msg;
+    int code;
+}
+
 try {
 
-    throw ex("MyError", 1234);
+    throw MyError("disk full", 1234);
 
 } catch (MyError as e) {
 
-    print("Got MyError, data:", exdata(e));
+    print("Got MyError:", e.msg, "code", e.code);
 }
 ```
 
-As intuition suggests, with `ex()` we've created and later thrown an exception
-object called `MyError`, having `1234` as payload data. Later, in the `catch` block,
-we caught the exception and, we extracted the payload data using the `exdata()` builtin.
+`throw MyError(...)` constructs the struct (positional, named, or mixed
+arguments — exactly like any struct construction) and throws it. The matching
+`catch (MyError)` selects the clause **by the struct type's name**, and
+`catch (MyError as e)` additionally binds `e` to the thrown instance, so
+`e.msg` / `e.code` read its fields.
 
-In case a given exception doesn't need to have a payload, it's possible to just
-save the result of `ex()` in a variable and throw it later using a probably more
-pleasant syntax:
+As with built-in exceptions, a single `catch` may list several types, and a
+catch variable bound with `as` is available in the handler:
 
 ```C#
-var MyError = ex("MyError");
-throw MyError;
+struct NotFound { str path; }
+struct Denied   { str path; }
+
+try {
+    open_file(p);
+} catch (NotFound, Denied as e) {
+    print("could not open", e.path);
+}
 ```
+
+When the same handler catches more than one struct type, only the fields the
+types have in common are safe to read (the bound `e` is dynamically typed, so
+field access is resolved at run time). A struct exception that no `catch`
+clause matches propagates outward like any other exception.
+
+A payload-less exception is simply a struct with no relevant fields (or one
+whose fields you ignore):
+
+```C#
+struct Stop { int dummy; }
+throw Stop(0);
+```
+
+Only a struct instance can be thrown; `throw 5` or `throw "oops"` is a compile
+error.
 
 ### Re-throwing an exception
 
@@ -2017,16 +2047,6 @@ To get a polymorphic (general) array on purpose:
 #### `undef(symbol)`
 Undefine the given symbol from the current scope. Return true if the given
 symbol was actually defined in the given scope.
-
-#### `exception(type_string, [payload_data])`
-Create an exception object having the given type plus the optional
-payload data.
-
-#### `ex(type_string, [data])`
-A shortcut for `exception()`.
-
-#### `exdata(ex)`
-Get the payload data from the given exception object.
 
 ### Non-const reflection builtins
 Runtime introspection of the live program state. They are ordinary (non-const)

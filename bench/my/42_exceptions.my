@@ -1,4 +1,7 @@
 # throw/catch user exceptions in a loop (exceptions as control flow)
+struct Even { int i; }
+struct Odd { int i; }
+
 var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);
@@ -9,9 +12,9 @@ var caught = 0;
 for (var i = 0; i < N; i++) {
     try {
         if (i % 2 == 0) {
-            throw ex("Even", i);
+            throw Even(i);
         } else {
-            throw ex("Odd", i);
+            throw Odd(i);
         }
     } catch (Even) {
         caught++;
