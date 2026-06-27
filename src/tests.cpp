@@ -9159,6 +9159,90 @@ static bool lineedit_suggestion_hidden_midline()
     return ed.buffer() == "coun" && ed.cursor() == 4;
 }
 
+static void hs_feed(HistorySearch &hs, const std::string &bytes)
+{
+    for (char c : bytes)
+        hs.feed(static_cast<unsigned char>(c));
+}
+
+/* The fuzzy scorer ranks a prefix/contiguous/boundary match above a scattered
+ * one, and an empty query matches everything equally (score 0). */
+static bool histsearch_scorer_ordering()
+{
+    if (fuzzy_score("", "whatever") != 0) return false;
+    if (!(fuzzy_score("fib", "fib(10)") > fuzzy_score("fib", "a_f_i_b")))
+        return false;
+    if (!(fuzzy_score("ab", "abc") > fuzzy_score("ab", "axbxc")))
+        return false;
+    return true;
+}
+
+/* The query filters to subsequence matches, ranked best-first; a non-matching
+ * entry is excluded; the default selection is the top (best) match. */
+static bool histsearch_query_ranking()
+{
+    std::vector<std::string> hist = {
+        "print(x)", "var fib = 1", "func fib(n) => n", "fib(10)"
+    };
+    HistorySearch hs;
+    hs.set_history(&hist);
+
+    if (hs.matches().size() != 4) return false;          /* all unique */
+    if (hs.selected_value() != "fib(10)") return false;  /* newest on top */
+
+    hs_feed(hs, "fib");
+    for (const auto &m : hs.matches())
+        if (m.value == "print(x)") return false;         /* no f-i-b subseq */
+    /* "fib(10)" - prefix + contiguous + most recent - ranks first */
+    return hs.selected_value() == "fib(10)";
+}
+
+/* Up/Down move the selection (top by default); Enter accepts it. */
+static bool histsearch_updown_and_accept()
+{
+    std::vector<std::string> hist = { "alpha", "alabama", "alps" };
+    HistorySearch hs;
+    hs.set_history(&hist);
+
+    hs_feed(hs, "al");
+    if (hs.matches().empty()) return false;
+    const std::string top = hs.selected_value();
+
+    hs_feed(hs, "\033[B");                          /* Down -> 2nd */
+    if (hs.selected() != 1 || hs.selected_value() == top) return false;
+    hs_feed(hs, "\033[A");                          /* Up -> back to top */
+    if (hs.selected() != 0) return false;
+
+    if (hs.feed(13) != HistorySearch::Action::accept) return false;
+    return hs.selected_value() == top;
+}
+
+/* Backspace edits the query (matches update); Ctrl-G cancels. */
+static bool histsearch_backspace_and_cancel()
+{
+    std::vector<std::string> hist = { "cat", "car", "dog" };
+    HistorySearch hs;
+    hs.set_history(&hist);
+
+    hs_feed(hs, "ca");
+    if (hs.matches().size() != 2) return false;     /* cat, car (not dog) */
+    hs_feed(hs, "t");
+    if (hs.matches().size() != 1 || hs.selected_value() != "cat") return false;
+    hs.feed(127);                                   /* Backspace -> "ca" */
+    if (hs.query() != "ca" || hs.matches().size() != 2) return false;
+
+    return hs.feed(7) == HistorySearch::Action::cancel;   /* Ctrl-G */
+}
+
+/* Duplicate history entries collapse to one (the most recent occurrence). */
+static bool histsearch_dedup()
+{
+    std::vector<std::string> hist = { "x", "y", "x" };
+    HistorySearch hs;
+    hs.set_history(&hist);
+    return hs.matches().size() == 2 && hs.selected_value() == "x";
+}
+
 static bool repl_incomplete_detection()
 {
     if (!ReplEngine::is_incomplete("func f() {")) return false;   /* open { */
@@ -9524,6 +9608,16 @@ static const std::vector<extra_check> extra_checks =
       lineedit_suggestion_ctrl_f_and_nomatch },
     { "lineedit: inline suggestion hidden mid-line",
       lineedit_suggestion_hidden_midline },
+    { "histsearch: fuzzy scorer ranks prefix/contiguous first",
+      histsearch_scorer_ordering },
+    { "histsearch: query ranks matches best-first, excludes non-matches",
+      histsearch_query_ranking },
+    { "histsearch: Up/Down select, Enter accepts",
+      histsearch_updown_and_accept },
+    { "histsearch: Backspace edits the query, Ctrl-G cancels",
+      histsearch_backspace_and_cancel },
+    { "histsearch: duplicate history entries collapse to one",
+      histsearch_dedup },
     { "highlight: inserts color escapes", highlight_inserts_color },
     { "highlight: stripping escapes restores the input",
       highlight_preserves_visible_text },

@@ -151,8 +151,12 @@ with the no-dependencies rule): live syntax highlighting, command history
 builtins, your own globals, and a struct value's fields (`p.<Tab>`). It also
 shows a **PowerShell-style inline suggestion** — as you type, the most recent
 matching history entry appears in dim gray after the cursor; press **Right
-arrow** (or `Ctrl-F`) at the end of the line to accept it. A `none` result (a
-definition, a `print`, an `if`) is not echoed, to keep things quiet.
+arrow** (or `Ctrl-F`) at the end of the line to accept it. **`Ctrl-R`** opens a
+**reverse history search**: a pane (about a third of the screen) with a search
+box above a live, best-match-first result list; type to filter, **Up/Down** to
+select (the top match is highlighted by default), **Enter** to load the chosen
+command onto the prompt (`Esc`/`Ctrl-G` cancel). A `none` result (a definition,
+a `print`, an `if`) is not echoed, to keep things quiet.
 
 Meta-commands start with `:`. They turn the REPL into a tool for learning and
 inspecting the language and its compiler:

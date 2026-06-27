@@ -2072,6 +2072,26 @@ behind a thin terminal shell:
     accept); the gray rendering lives in `read_line` (untested, like the rest of
     the TTY shell). A navigable dropdown completion menu is still deferred (see
     `plans/repl.md`).
+  - **Reverse history search (`Ctrl-R`).** `class HistorySearch` (lineedit.h) is
+    the **pure** analogue of `LineEditor` for searching: a query + a ranked,
+    de-duplicated match list + a selected index, driven by `feed()` one byte at
+    a time (Up/Down or Ctrl-P/N move the selection, Ctrl-R cycles to the next
+    match, Enter → `accept`, Ctrl-G/Ctrl-C → `cancel`, Backspace/printable edit
+    the query). Ranking is `fuzzy_score(query_lc, cand)` — a case-insensitive
+    **subsequence** match scored by contiguity (gap-0 runs win big), word-
+    boundary/camelCase hits, and a length tie-break; `INT_MIN` == no match; an
+    empty query matches all with score 0, ordered by **recency** (a `stable_sort`
+    over the newest-first de-duplicated list). `read_line` intercepts the raw
+    `Ctrl-R` byte (the editor never sees it) and renders a **pane ~⅓ the screen
+    high** below the input: a search box on top, then the live result rows
+    best-first with the selected one in a reverse-video bar; a lone `Esc`
+    (distinguished from an arrow burst via a `byte_ready` select-timeout)
+    cancels. Geometry is scroll-safe (reserve lines by printing newlines then
+    moving back up; `term_size` via `TIOCGWINSZ`); on exit the pane is erased and
+    the cursor returns to the input's first row. **Enter LOADS** the selected
+    command into the editor (it is not auto-run). The scorer + state machine are
+    headless-tested (`histsearch:`); the pane rendering is in `read_line`
+    (untested TTY shell, verified over a pty).
 - **`highlight.{h,cpp}`** — `highlight_line`, a self-contained scanner (NOT the
   lexer; tolerates mid-edit input) that wraps keywords/strings/numbers/comments/
   type-words in ANSI color, preserving the bytes exactly otherwise.

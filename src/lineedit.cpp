@@ -4,9 +4,12 @@
 
 #include <cctype>
 #include <cstring>
+#include <climits>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
+#include <utility>
 #include <iostream>
 
 /* The raw-mode interactive editor is Unix-only (termios). On Windows the REPL
@@ -15,6 +18,8 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <termios.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 #endif
 
 using std::string;
@@ -343,6 +348,148 @@ LineEditor::Action LineEditor::feed(unsigned char c)
     }
 }
 
+/* ------------------------ reverse history search ------------------------ */
+
+int fuzzy_score(const string &ql, const string &cand)
+{
+    if (ql.empty())
+        return 0;                          /* match all; caller uses recency */
+
+    int score = 0, prev = -1;
+    size_t qi = 0;
+
+    for (size_t j = 0; j < cand.size() && qi < ql.size(); j++) {
+
+        if (static_cast<char>(tolower(static_cast<unsigned char>(cand[j])))
+                != ql[qi])
+            continue;
+
+        const int gap = static_cast<int>(j) - prev - 1;   /* chars skipped */
+
+        /* Contiguity is the strongest signal (a gap-0 match continues the run,
+         * including the very first char at index 0); a gap is penalized so a
+         * scattered match never beats a tight one even when every hit lands on
+         * a word boundary. */
+        if (gap == 0)
+            score += 15;
+        else
+            score -= gap;
+
+        /* A match at a word boundary (start, after a non-alnum, or a camelCase
+         * hump) scores extra - that's what floats a prefix to the top. */
+        if (j == 0 ||
+            !isalnum(static_cast<unsigned char>(cand[j - 1])) ||
+            (isupper(static_cast<unsigned char>(cand[j])) &&
+             islower(static_cast<unsigned char>(cand[j - 1]))))
+            score += 10;
+
+        prev = static_cast<int>(j);
+        qi++;
+    }
+
+    if (qi < ql.size())
+        return INT_MIN;                    /* not a subsequence */
+
+    score -= static_cast<int>(cand.size()) / 8;   /* mild length tie-break */
+    return score;
+}
+
+void HistorySearch::recompute()
+{
+    res.clear();
+    sel = 0;
+    if (!hist)
+        return;
+
+    string ql = q;
+    for (char &c : ql)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+
+    /* De-duplicate, newest-first: stable_sort below keeps this order for equal
+     * scores, so among ties the most recent command ranks first. */
+    std::unordered_set<string> seen;
+    for (auto it = hist->rbegin(); it != hist->rend(); ++it) {
+
+        if (!seen.insert(*it).second)
+            continue;
+
+        const int sc = fuzzy_score(ql, *it);
+        if (sc == INT_MIN)
+            continue;
+
+        Match m;
+        m.value = *it;
+        m.display = *it;
+        for (char &c : m.display)
+            if (c == '\n' || c == '\t' || c == '\r')
+                c = ' ';                   /* flatten for the one-line row */
+        m.score = sc;
+        res.push_back(std::move(m));
+    }
+
+    std::stable_sort(res.begin(), res.end(),
+        [](const Match &a, const Match &b) { return a.score > b.score; });
+}
+
+void HistorySearch::csi_final(unsigned char c)
+{
+    if (res.empty())
+        return;
+
+    if (c == 'A') {                        /* up: toward the best match (top) */
+        if (sel > 0)
+            sel--;
+    } else if (c == 'B') {                 /* down: toward worse matches */
+        if (sel + 1 < res.size())
+            sel++;
+    }
+}
+
+HistorySearch::Action HistorySearch::feed(unsigned char c)
+{
+    if (esc == Esc::esc) {
+        esc = (c == '[' || c == 'O') ? Esc::csi : Esc::none;
+        esc_params.clear();
+        return Action::searching;
+    }
+    if (esc == Esc::csi) {
+        if ((c >= '0' && c <= '9') || c == ';') {
+            esc_params += static_cast<char>(c);
+            return Action::searching;
+        }
+        csi_final(c);
+        esc = Esc::none;
+        return Action::searching;
+    }
+
+    switch (c) {
+        case 27:  esc = Esc::esc;       return Action::searching;  /* ESC seq */
+        case 13:
+        case 10:                        return Action::accept;     /* Enter */
+        case 3:                                                    /* Ctrl-C */
+        case 7:                         return Action::cancel;     /* Ctrl-G */
+        case 18:                                                   /* Ctrl-R */
+            if (!res.empty())
+                sel = (sel + 1) % res.size();   /* cycle to the next match */
+            return Action::searching;
+        case 8:
+        case 127:                                                /* Backspace */
+            if (!q.empty()) {
+                q.pop_back();
+                recompute();
+            }
+            return Action::searching;
+        case 16:  csi_final('A');       return Action::searching;  /* Ctrl-P */
+        case 14:  csi_final('B');       return Action::searching;  /* Ctrl-N */
+        default:
+            if (c >= 32 && c < 127) {
+                q.push_back(static_cast<char>(c));
+                recompute();
+            }
+            return Action::searching;
+    }
+}
+
 /* --------------------------- the TTY shell ------------------------------ */
 
 namespace {
@@ -396,6 +543,32 @@ void wr(const string &s)
 {
     ssize_t n = write(STDOUT_FILENO, s.data(), s.size());
     (void) n;
+}
+
+/* The terminal size (rows, cols), with a sane fallback if the ioctl fails. */
+void term_size(int &rows, int &cols)
+{
+    rows = 24;
+    cols = 80;
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_row > 0) rows = ws.ws_row;
+        if (ws.ws_col > 0) cols = ws.ws_col;
+    }
+}
+
+/* Is another input byte available within `ms` milliseconds? Used to tell a lone
+ * ESC (cancel) from the ESC that starts an arrow sequence (which arrives as a
+ * burst), without consuming the byte. */
+bool byte_ready(int ms)
+{
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    return select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0;
 }
 #endif /* !_WIN32 */
 
@@ -531,6 +704,121 @@ read_line(const string &prompt, const string &cont_prompt,
         wr(o);
     };
 
+    /*
+     * Ctrl-R: a reverse history search pane (~1/3 of the screen) below the
+     * input. Results rank best-first and update live as you type; Up/Down (or
+     * Ctrl-P/N) select, the default being the top (best) row, highlighted;
+     * Ctrl-R cycles to the next match; Enter LOADS the selection into the
+     * editor (it is not auto-run); Esc / Ctrl-G / Ctrl-C cancel. On return the
+     * pane is erased and the cursor is back at the input's first row, so the
+     * caller just repaints. Returns {accepted, value}.
+     */
+    auto reverse_search = [&]() -> std::pair<bool, string> {
+        HistorySearch hs;
+        hs.set_history(&history);
+
+        int trows, tcols;
+        term_size(trows, tcols);
+        const int input_rows = static_cast<int>(line_count(ed.buffer()));
+        int pane_rows = trows / 3;
+        if (pane_rows < 2) pane_rows = 2;
+        const int room = trows - input_rows - 1;       /* keep input visible */
+        if (room >= 2 && pane_rows > room) pane_rows = room;
+        if (pane_rows < 2) pane_rows = 2;
+
+        /* Move below the input and reserve pane_rows lines. Printing newlines
+         * then moving back up is scroll-safe: if the terminal scrolls, the
+         * relative move lands at the same content. */
+        {
+            string o;
+            const int down = (input_rows - 1) - prev_cursor_row;
+            if (down > 0) o += "\033[" + std::to_string(down) + "B";
+            o += "\r\n";
+            if (pane_rows > 1)
+                o += string(pane_rows - 1, '\n') +
+                     "\033[" + std::to_string(pane_rows - 1) + "A";
+            wr(o);
+        }
+
+        const char *const label = "(search) ";
+        const int label_len = 9;
+        int win_top = 0;
+
+        auto draw = [&]() {
+            const std::vector<HistorySearch::Match> &ms = hs.matches();
+            const int sel = static_cast<int>(hs.selected());
+            const int visible = pane_rows - 1;
+
+            if (sel < win_top) win_top = sel;                  /* scroll win */
+            if (sel >= win_top + visible) win_top = sel - visible + 1;
+            if (win_top < 0) win_top = 0;
+
+            string o = "\r\033[2K";                           /* search box */
+            string box = string(label) + hs.query();
+            if (static_cast<int>(box.size()) > tcols)
+                box = box.substr(0, tcols);
+            o += box;
+
+            for (int k = 0; k < visible; k++) {               /* result rows */
+                o += "\r\n\033[2K";
+                if (ms.empty()) {
+                    if (k == 0)
+                        o += highlight ? "\033[90m(no matches)\033[0m"
+                                       : "(no matches)";
+                    continue;
+                }
+                const int idx = win_top + k;
+                if (idx >= static_cast<int>(ms.size()))
+                    continue;
+                const bool is_sel = (idx == sel);
+                string line = (is_sel ? "> " : "  ") + ms[idx].display;
+                if (static_cast<int>(line.size()) > tcols)
+                    line = line.substr(0, tcols);
+                if (is_sel && highlight) {                   /* highlight bar */
+                    if (static_cast<int>(line.size()) < tcols)
+                        line += string(tcols - line.size(), ' ');
+                    o += "\033[7m" + line + "\033[0m";
+                } else {
+                    o += line;
+                }
+            }
+
+            if (pane_rows > 1)                                 /* back to box */
+                o += "\033[" + std::to_string(pane_rows - 1) + "A";
+            o += "\r";
+            int curcol = label_len + static_cast<int>(hs.query().size());
+            if (curcol >= tcols) curcol = tcols - 1;
+            if (curcol > 0) o += "\033[" + std::to_string(curcol) + "C";
+            wr(o);
+        };
+
+        draw();
+
+        std::pair<bool, string> result{false, string()};
+        for (;;) {
+            unsigned char ch;
+            const ssize_t n = read(STDIN_FILENO, &ch, 1);
+            if (n <= 0)
+                break;                          /* EOF -> cancel */
+            if (ch == 27 && !byte_ready(40))
+                break;                          /* a lone ESC -> cancel */
+            const HistorySearch::Action a = hs.feed(ch);
+            if (a == HistorySearch::Action::accept) {
+                result = {true, hs.selected_value()};
+                break;
+            }
+            if (a == HistorySearch::Action::cancel)
+                break;
+            draw();
+        }
+
+        string o = "\r\033[J";                  /* erase the pane */
+        o += "\033[" + std::to_string(input_rows) + "A\r";   /* to input top */
+        wr(o);
+        prev_cursor_row = 0;
+        return result;
+    };
+
     /* Move the terminal cursor below the whole block (for submit / a list). */
     auto move_below = [&]() {
         const int rows = static_cast<int>(line_count(ed.buffer()));
@@ -552,6 +840,14 @@ read_line(const string &prompt, const string &cont_prompt,
             move_below();
             res.eof = true;
             return res;
+        }
+
+        if (c == 18) {                      /* Ctrl-R: reverse history search */
+            const std::pair<bool, string> chosen = reverse_search();
+            if (chosen.first && !chosen.second.empty())
+                ed.set_buffer(chosen.second);
+            repaint();
+            continue;
         }
 
         const LineEditor::Action a = ed.feed(c);

@@ -141,6 +141,69 @@ private:
 /* Number of logical lines in `s` (1 + the count of '\n'). */
 size_t line_count(const std::string &s);
 
+/*
+ * Score how well `query_lc` (already lowercased) fuzzy-matches `cand`: a
+ * case-insensitive SUBSEQUENCE match scored higher for contiguous runs and
+ * word-boundary / early hits, with a mild length penalty. Returns INT_MIN when
+ * `cand` does not contain the query as a subsequence; an empty query matches
+ * everything with score 0 (the caller orders those by recency). Exposed for the
+ * headless tests.
+ */
+int fuzzy_score(const std::string &query_lc, const std::string &cand);
+
+/*
+ * The interactive reverse history search (Ctrl-R): a PURE state machine over a
+ * history list, the search analogue of LineEditor. As the query changes it
+ * recomputes the matching (de-duplicated) entries ranked best-first
+ * (fuzzy_score, most-recent as the tie-break) and tracks a selected index (0 ==
+ * the best match, the default). feed() drives it one byte at a time - Up/Down
+ * (or Ctrl-P/N) move the selection, Ctrl-R cycles to the next match, Enter
+ * accepts, Ctrl-G/Ctrl-C cancel, Backspace edits the query, printable bytes
+ * extend it - so it is headless-testable; read_line renders it as a pane.
+ */
+class HistorySearch {
+
+public:
+
+    enum class Action { searching, accept, cancel };
+
+    struct Match {
+        std::string value;     /* the original history entry (for accept) */
+        std::string display;   /* flattened to one line, for the result row */
+        int score;
+    };
+
+    void set_history(const std::vector<std::string> *h)
+    {
+        hist = h;
+        recompute();
+    }
+
+    Action feed(unsigned char c);
+
+    const std::string &query() const { return q; }
+    const std::vector<Match> &matches() const { return res; }
+    size_t selected() const { return sel; }
+    std::string selected_value() const
+    {
+        return sel < res.size() ? res[sel].value : std::string();
+    }
+
+private:
+
+    enum class Esc { none, esc, csi };
+
+    const std::vector<std::string> *hist = nullptr;
+    std::string q;
+    std::vector<Match> res;
+    size_t sel = 0;
+    Esc esc = Esc::none;
+    std::string esc_params;
+
+    void recompute();                     /* rebuild res from q, reset sel=0 */
+    void csi_final(unsigned char c);
+};
+
 /* Result of one interactive line read. */
 struct ReadLineResult {
     bool eof = false;        /* Ctrl-D on empty / stream closed */
