@@ -917,6 +917,27 @@ decisions behind it: `plans/type-inference.md`,
   type-check the inferencer can't). An **uninitialized** typed decl
   (`int x;`) gets the type's zero value (`zero_value_literal`: 0/0.0/false/""/
   []/{}), or `none` when `opt`.
+- **A user STRUCT type as an annotation** (`A obj;`, `A obj = A(10)`): a struct
+  name is a type in declaration position too (`StructName name`). Since struct
+  names aren't keywords, `pAcceptDeclPrefix` recognizes one via
+  `lookup_struct_type` — an identifier bound to a `StructTypeDef*` in the const
+  ctx (so it needs const-eval on; structs register their descriptor there at
+  parse time), AND only when followed (after an optional `?`) by the var name
+  (so `A(...)`/`A.x`/`a = ...` stay expressions). It rides on
+  `Identifier::decl_struct` (the `StructTypeDef*`) with `decl_type ==
+  DeclType::strct`, threaded via `ParseContext::pending_decl_struct`. The
+  inferencer pins it exactly like a scalar annotation: `ann_scalar_sty` returns
+  `A.struct_ty(ann_struct, ...)` (the TypeSym gains `ann_struct`), so
+  `reset_round`/`contribute` pin the var and reject a wrong struct
+  (`A x = B(...)` / a later `x = B(...)` → `TypeMismatchEx`, via `struct_def`
+  identity in `sty_assignable`). **Runtime:** no coercion (a struct binds
+  as-is). An **uninitialized** struct var **zero-initializes recursively**
+  (`build_zero_struct_init`, `parser.cpp`): it desugars `A obj;` to the
+  constructor call `A(<zero per field>)` - 0/0.0/false/""/[]/{} per field
+  kind, `none` for an `opt` field, and a nested zero constructor for a struct
+  field. Being an ordinary `CallExpr`, it constructs a fresh value each eval and
+  is type-checked like a hand-written construction. (`opt A obj;` / `A? obj;` →
+  `none`.) Params (`func f(A p)`) are not yet covered.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
   (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
   `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is

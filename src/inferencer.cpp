@@ -54,6 +54,8 @@ struct TypeSym {
      * for an inferred `var`/`const`/param. A scalar annotation pins the type
      * (with assignability checked); `arr`/`dict` constrain only the kind. */
     DeclType ann = DeclType::none;
+    /* When ann == DeclType::strct, the struct type the var is pinned to. */
+    const StructTypeDef *ann_struct = nullptr;
     bool is_param = false;
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
@@ -291,6 +293,13 @@ private:
             case DeclType::i: return A.int_ty(o);
             case DeclType::f: return A.float_ty(o);
             case DeclType::s: return A.str_ty(o);
+            case DeclType::strct:
+                /* a struct annotation pins the exact struct type, just like a
+                 * scalar one (reset_round seeds it, contribute checks each
+                 * assignment is assignable - so `A x = B(...)` errors). */
+                return s->ann_struct
+                    ? A.struct_ty(s->ann_struct, s->ann_struct->name, o)
+                    : nullptr;
             default:          return nullptr;
         }
     }
@@ -1518,8 +1527,10 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
         sym->opt_decl = sym->opt_decl || id->opt_mod;
         sym->dyn_decl = sym->dyn_decl || id->dyn_mod;
         sym->const_decl = sym->const_decl || is_const;
-        if (id->decl_type != DeclType::none)
+        if (id->decl_type != DeclType::none) {
             sym->ann = id->decl_type;
+            sym->ann_struct = id->decl_struct;   /* set when ann == strct */
+        }
         id_sym[id] = sym;        /* the decl write is counted in walk_struct
                                   * (declare_target runs twice via hoist) */
     };

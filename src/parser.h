@@ -12,6 +12,7 @@
 class EvalContext;
 class Block;
 struct AnalysisInfo;
+struct StructTypeDef;
 enum class DeclType : unsigned char;   /* defined in syntax.h */
 
 /*
@@ -90,6 +91,10 @@ public:
      * enumerators aren't visible here (only a forward declaration).
      */
     DeclType pending_decl_type;
+
+    /* When pending_decl_type == strct, the struct type of the pending decl
+     * (`A obj`); nullptr otherwise. Transient, like pending_decl_type. */
+    const StructTypeDef *pending_decl_struct = nullptr;
 
     /* token operations */
     const Tok &operator*() const { return ts.get(); }

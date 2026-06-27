@@ -107,6 +107,26 @@ static DeclType type_keyword(std::string_view s)
 }
 
 /*
+ * If `name` is bound to a struct TYPE descriptor in the const context (i.e. a
+ * `struct` declared earlier in scope), return its StructTypeDef, else nullptr.
+ * This is what lets `A obj;` recognize `A` as a type in declaration position.
+ * Structs register their descriptor in the const ctx at parse time, so it is
+ * only meaningful with const-eval on (no struct types are visible otherwise).
+ */
+static const StructTypeDef *
+lookup_struct_type(ParseContext &c, std::string_view name)
+{
+    if (!c.const_eval || !c.const_ctx)
+        return nullptr;
+    Identifier id(name);
+    LValue *lv = c.const_ctx->lookup(&id);
+    if (!lv)
+        return nullptr;
+    const EvalValue &v = lv->get();
+    return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+}
+
+/*
  * A `const` scalar is inlined (and its decl dropped) at parse time, BEFORE the
  * inferencer runs, so a `const int x = ...` annotation must be checked here
  * rather than later. Verify the folded value against the declared scalar type
@@ -168,6 +188,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
     int k = 0;
     unsigned f = 0;
     DeclType dt = DeclType::none;
+    const StructTypeDef *sdef = nullptr;   /* the struct type, if dt == strct */
     bool starter = false;   /* something that makes this a declaration */
 
     for (;;) {
@@ -191,6 +212,21 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
                 break;
             dt = type_keyword(t.value);
             f |= pFlags::pInDecl; starter = true; k++;
+        } else if (dt == DeclType::none && t == TokType::id) {
+            /* Maybe `StructName name`: an identifier bound to a struct type,
+             * followed (after an optional `?`) by the variable name. Only then
+             * is the leading identifier a type rather than an ordinary
+             * expression (so `foo(...)`, `foo.bar`, `x = ...` are untouched). */
+            int n = k + 1;
+            if (c.peek_tok(n) == Op::questionmark)
+                n++;
+            if (c.peek_tok(n) != TokType::id)
+                break;
+            sdef = lookup_struct_type(c, t.value);
+            if (!sdef)
+                break;
+            dt = DeclType::strct;
+            f |= pFlags::pInDecl; starter = true; k++;
         } else {
             break;
         }
@@ -212,6 +248,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
 
     fl |= f;
     c.pending_decl_type = dt;
+    c.pending_decl_struct = sdef;
 }
 
 /* The zero value of an explicit type, for an uninitialized typed declaration
@@ -227,6 +264,63 @@ static unique_ptr<Construct> zero_value_literal(DeclType dt)
         case DeclType::dict: return make_unique<LiteralDict>();
         default:             return make_unique<LiteralNone>();
     }
+}
+
+/*
+ * Zero-initialize a struct (for `A obj;`): build the constructor call
+ * `A(<zero per field>)`, applying the same zero-value rules as every other type
+ * - 0 / 0.0 / false / "" / [] / {} per field kind, `none` for an `opt` field,
+ * and recursively a zero constructor for a nested struct field. It is an
+ * ordinary CallExpr, so it constructs a fresh value on every evaluation (no
+ * shared mutable state) and is type-checked like a hand-written construction.
+ */
+static unique_ptr<Construct>
+build_zero_struct_init(const StructTypeDef *def, Loc loc)
+{
+    auto args = make_unique<ExprList>();
+
+    for (const FieldDef &fd : def->fields) {
+        unique_ptr<Construct> a;
+        if (fd.is_opt) {
+            a = make_unique<LiteralNone>();
+        } else {
+            switch (fd.kind) {
+                case FieldKind::f_bool:  a = zero_value_literal(DeclType::b);
+                                         break;
+                case FieldKind::f_int:   a = zero_value_literal(DeclType::i);
+                                         break;
+                case FieldKind::f_float: a = zero_value_literal(DeclType::f);
+                                         break;
+                case FieldKind::f_str:   a = zero_value_literal(DeclType::s);
+                                         break;
+                case FieldKind::f_array: a = zero_value_literal(DeclType::arr);
+                                         break;
+                case FieldKind::f_dict:  a = zero_value_literal(DeclType::dict);
+                                         break;
+                case FieldKind::f_struct:
+                    a = fd.struct_def
+                        ? build_zero_struct_init(fd.struct_def, loc)
+                        : make_unique<LiteralNone>();
+                    break;
+                default:                 a = make_unique<LiteralNone>();
+                                         break;
+            }
+        }
+        a->start = loc;
+        a->end = loc;
+        args->elems.push_back(move(a));
+    }
+
+    auto callee = make_unique<Identifier>(def->name->val);
+    callee->start = loc;
+    callee->end = loc;
+
+    auto call = make_unique<CallExpr>();
+    call->what = move(callee);
+    call->args = move(args);
+    call->start = loc;
+    call->end = loc;
+    return call;
 }
 
 bool
@@ -1352,16 +1446,20 @@ pExpr14(ParseContext &c, unsigned fl)
              * A decl with no initializer. A plain `var x;` assumes `none`; an
              * explicitly-typed `int x;` / `str s;` assumes the type's zero value
              * (0 / 0.0 / false / "" / [] / {}), so a non-null typed var is never
-             * left `none`.
+             * left `none`. A struct zero-initializes recursively, by the same
+             * rules: `A x;` becomes `x = A(<zero per field>)`.
              */
             ret.reset(new Expr14);
             ret->op = Op::assign;
             ret->lvalue = move(lside);
             /* An `opt` typed decl (nullable) defaults to none; a non-opt typed
              * decl to its type's zero value; a plain `var` to none. */
-            ret->rvalue = (fl & pFlags::pInOptDecl)
-                ? unique_ptr<Construct>(new LiteralNone())
-                : zero_value_literal(c.pending_decl_type);
+            ret->rvalue =
+                (fl & pFlags::pInOptDecl)
+                    ? unique_ptr<Construct>(new LiteralNone())
+                    : (c.pending_decl_type == DeclType::strct
+                         ? build_zero_struct_init(c.pending_decl_struct, start)
+                         : zero_value_literal(c.pending_decl_type));
 
         } else if (in_idlist) {
 
@@ -1416,13 +1514,18 @@ pExpr14(ParseContext &c, unsigned fl)
     if ((fl & pFlags::pInDecl) && c.pending_decl_type != DeclType::none) {
 
         const DeclType dt = c.pending_decl_type;
+        const StructTypeDef *ds = c.pending_decl_struct;
         c.pending_decl_type = DeclType::none;
+        c.pending_decl_struct = nullptr;
 
         if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
             id->decl_type = dt;
+            id->decl_struct = ds;
         } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
-            for (auto &e : idl->elems)
+            for (auto &e : idl->elems) {
                 e->decl_type = dt;
+                e->decl_struct = ds;
+            }
         }
     }
 

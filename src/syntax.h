@@ -64,7 +64,8 @@ enum class ArrHint : unsigned char {
  * (coercion + zero-value default-init). See the README "explicit types".
  */
 enum class DeclType : unsigned char {
-    none, b, i, f, s, arr, dict
+    none, b, i, f, s, arr, dict,
+    strct,   /* a user struct type; the exact type is in `decl_struct` */
 };
 
 /*
@@ -615,6 +616,10 @@ public:
      * resolver from a declaration to every use, so an assignment can coerce.
      */
     DeclType decl_type = DeclType::none;
+
+    /* For a struct-typed declaration (`A obj`), the struct type (decl_type is
+     * then DeclType::strct). The inferencer pins the var to this exact type. */
+    const StructTypeDef *decl_struct = nullptr;
 
     Identifier(const std::string_view &str)
         : Construct("Id", false, ConstructType::id)

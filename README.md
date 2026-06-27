@@ -302,8 +302,9 @@ var a,b,c = [1,2,3];
 
 #### Explicit types
 
-A declaration may use an explicit primitive type instead of `var`. The type
-names are `bool`, `int`, `float`, `str`, `array`, and `dict`:
+A declaration may use an explicit type instead of `var` — a primitive type name
+(`bool`, `int`, `float`, `str`, `array`, `dict`) or **a `struct` type you have
+declared**:
 
 ```C#
 int   x = 32;
@@ -312,6 +313,10 @@ str   name = "Neo";
 bool  done = false;
 array nums = [1, 2, 3];     # generic array; the element type is still inferred
 dict  conf = {"n": 1};
+
+struct Point { int x; int y; }
+Point p = Point(3, 4);      # explicitly-typed struct variable
+Point origin;               # zero-initialized: Point(x: 0, y: 0)
 ```
 
 It is the same declaration as `var`, plus a **compile-time type constraint**:
@@ -327,9 +332,16 @@ you get a compile error.
     / dict, while its element/key/value types are inferred as usual — so
     `array nums = [1,2,3]` is still a fast flat `array<int>` (parameterized
     `array<T>` / `dict<K,V>` syntax is not available yet).
+  * **A `struct` type** pins the variable to that exact type (like a scalar):
+    `Point p = Point(3, 4)` is fine, while `Point p = Other(...)` (or a later
+    `p = Other(...)`) is a compile error. The struct name is read as a type only
+    in declaration position (`Point(...)` construction and `Point.CONST` keep
+    working).
   * **No initializer** gives the type's zero value: `int x;` → `0`, `float x;` →
     `0.0`, `bool x;` → `false`, `str x;` → `""`, `array x;` → `[]`,
-    `dict x;` → `{}`. (An `opt`-qualified one defaults to `none`.)
+    `dict x;` → `{}`, and a **struct zero-initializes recursively** by the same
+    rules (`Point origin;` → `Point(x: 0, y: 0)`; each field gets its own zero,
+    nested structs included). (An `opt`-qualified one defaults to `none`.)
   * It works in a `for` initializer too: `for (int i = 0; i < n; i += 1) ...`.
 
 The type keywords are still ordinary identifiers everywhere else — `int(x)`,
