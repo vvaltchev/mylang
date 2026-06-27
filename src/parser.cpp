@@ -213,10 +213,17 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
             dt = type_keyword(t.value);
             f |= pFlags::pInDecl; starter = true; k++;
         } else if (dt == DeclType::none && t == TokType::id) {
-            /* Maybe `StructName name`: an identifier bound to a struct type,
-             * followed (after an optional `?`) by the variable name. Only then
-             * is the leading identifier a type rather than an ordinary
-             * expression (so `foo(...)`, `foo.bar`, `x = ...` are untouched). */
+            /* `TypeName name`: a (non-keyword) identifier followed - after an
+             * optional `?` - by the variable name. The decision that this is a
+             * typed declaration is by SHAPE alone: an `IDENT IDENT` run is
+             * never a valid expression (MyLang has no juxtaposition), so
+             * recognizing it here keeps the GRAMMAR context-free - the parse
+             * decision does NOT consult the symbol table (the C "typedef" hack
+             * we avoid). `foo(...)`, `foo.bar`, `x = ...` don't match the shape
+             * and stay expressions. Whether the leading name is actually a
+             * struct TYPE is a separate SEMANTIC check (name resolution), done
+             * right after: a name that doesn't resolve to a struct type is a
+             * clear error, not a silent fall-through to expression parsing. */
             int n = k + 1;
             if (c.peek_tok(n) == Op::questionmark)
                 n++;
@@ -224,7 +231,9 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
                 break;
             sdef = lookup_struct_type(c, t.value);
             if (!sdef)
-                break;
+                throw SyntaxErrorEx(t.loc,
+                    intern_msg("'" + std::string(t.value) +
+                               "' is not a type"));
             dt = DeclType::strct;
             f |= pFlags::pInDecl; starter = true; k++;
         } else {
@@ -625,16 +634,24 @@ pFuncParam(ParseContext &c, unsigned fl)
             c.peek_tok(1) == TokType::id ||
             (q1 && c.peek_tok(2) == TokType::id);
         if (name_follows) {
+            /* `TYPE name`: an identifier before the param name is a type - by
+             * SHAPE (context-free), like the statement-level decl prefix. That
+             * the leading name is a real struct type is a semantic check (an
+             * unresolved name is a clear error, not a fall-through). */
             const DeclType maybe = type_keyword(c.get_str());
-            if (maybe != DeclType::none)
+            if (maybe != DeclType::none) {
                 dt = maybe;
-            else if ((sdef = lookup_struct_type(c, c.get_str())))
+            } else {
+                sdef = lookup_struct_type(c, c.get_str());
+                if (!sdef)
+                    throw SyntaxErrorEx(c.get_loc(),
+                        intern_msg("'" + std::string(c.get_str()) +
+                                   "' is not a type"));
                 dt = DeclType::strct;
-            if (dt != DeclType::none) {
-                c.next();                          /* consume the type name */
-                if (pAcceptOp(c, Op::questionmark))   /* `int? n`, `A? p` */
-                    is_opt = true;
             }
+            c.next();                          /* consume the type name */
+            if (pAcceptOp(c, Op::questionmark))   /* `int? n`, `A? p` */
+                is_opt = true;
         }
     }
 

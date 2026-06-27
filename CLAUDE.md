@@ -925,12 +925,20 @@ decisions behind it: `plans/type-inference.md`,
   (`int x;`) gets the type's zero value (`zero_value_literal`: 0/0.0/false/""/
   []/{}), or `none` when `opt`.
 - **A user STRUCT type as an annotation** (`A obj;`, `A obj = A(10)`): a struct
-  name is a type in declaration position too (`StructName name`). Since struct
-  names aren't keywords, `pAcceptDeclPrefix` recognizes one via
-  `lookup_struct_type` — an identifier bound to a `StructTypeDef*` in the const
-  ctx (so it needs const-eval on; structs register their descriptor there at
-  parse time), AND only when followed (after an optional `?`) by the var name
-  (so `A(...)`/`A.x`/`a = ...` stay expressions). It rides on
+  name is a type in declaration position too (`StructName name`).
+  **Context-free recognition:** `pAcceptDeclPrefix` (and `pFuncParam`) decide
+  `A x` is a typed declaration by SHAPE alone — a (non-keyword) `IDENT`
+  followed, after an optional `?`, by another `IDENT` (the var name). An
+  `IDENT IDENT` run
+  is never a valid expression (MyLang has no juxtaposition), so this needs **no
+  symbol-table lookup for the parse decision** — the grammar stays context-free
+  (we deliberately avoid the C "typedef" hack of consulting the symbol table to
+  decide decl-vs-expr). `A(...)`/`A.x`/`a = ...` don't match the shape and stay
+  expressions. *Then* a SEMANTIC step resolves the type name via
+  `lookup_struct_type` (an identifier bound to a `StructTypeDef*` in the const
+  ctx; needs const-eval on, since structs register their descriptor there at
+  parse time): a name that doesn't resolve to a struct type is a clear
+  `SyntaxErrorEx` ("'foo' is not a type"), not a silent fall-through. Rides on
   `Identifier::decl_struct` (the `StructTypeDef*`) with `decl_type ==
   DeclType::strct`, threaded via `ParseContext::pending_decl_struct`. The
   inferencer pins it exactly like a scalar annotation: `ann_scalar_sty` returns
@@ -944,9 +952,11 @@ decisions behind it: `plans/type-inference.md`,
   kind, `none` for an `opt` field, and a nested zero constructor for a struct
   field. Being an ordinary `CallExpr`, it constructs a fresh value each eval and
   is type-checked like a hand-written construction. (`opt A obj;` / `A? obj;` →
-  `none`.) **Parameters too** (`func f(A p)`): `pFuncParam` recognizes a struct
-  type name the same way (`lookup_struct_type`, name must follow), sets the
-  param's `decl_struct`, and the inferencer copies it to the param `TypeSym`'s
+  `none`.) **Parameters too** (`func f(A p)`): `pFuncParam` recognizes a typed
+  param the same way (by shape - a type `IDENT` before the param name; then
+  `lookup_struct_type` resolves it, an unresolved name being the same "not a
+  type" error), sets the param's `decl_struct`, and the inferencer copies it to
+  the param `TypeSym`'s
   `ann_struct` - so the param pins to struct `A` and `check_call` rejects a
   wrong-struct argument. (No runtime coercion; a struct binds as-is.)
 - **`decltype(var)` - a variable's STATIC type, at compile time.** A non-const

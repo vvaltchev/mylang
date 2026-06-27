@@ -6780,8 +6780,12 @@ static const std::vector<test> tests =
       { "struct A { int a; } opt A z; assert(z == none);" } },
     { "struct: the '?' short form is a nullable struct",
       { "struct A { int a; } A? z; assert(z == none);" } },
-    { "struct: a non-type identifier before a name is not a decl",
+    /* `IDENT IDENT` is recognized as a typed decl by SHAPE (context-free); a
+     * leading name that is not a real type is then a semantic error. */
+    { "struct: a non-type name in declaration position is an error",
       { "var foo = 1; foo bar;" }, &typeid(SyntaxErrorEx) },
+    { "struct: a non-type name as a parameter type is an error",
+      { "func f(foo p) => 1; f(1);" }, &typeid(SyntaxErrorEx) },
     { "struct: a struct-typed function parameter",
       { "struct P { int x; int y; }",
         "func mag2(P p) => p.x * p.x + p.y * p.y;",
