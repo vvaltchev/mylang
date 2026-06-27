@@ -106,16 +106,19 @@ struct Frame {
 };
 
 /*
- * The program-wide table of top-level (named) functions. Each gets a STATIC
- * slot index at compile time (the resolver's hoist), so a reference resolves to
+ * The program-wide GLOBAL table: every top-level (named) function AND every
+ * top-level variable that some function reads ("escaped"). Each gets a STATIC
+ * slot index at compile time (the resolver), so a reference resolves to
  * SymKind::global + that index and reads this table from any call depth - the
- * function analogue of variable slotting. A plain vector, sized once to the
- * static function count and never grown (no slot limit). A slot is `defined`
- * only after its decl executes (forward-ref tracking - the table is the one
- * place that still needs definedness, since functions are hoisted), so a call
- * reaching a function before its definition runs reads as undefined. Lexical
- * reachability is a COMPILE-TIME decision (an out-of-scope name simply never
- * resolves to a slot); the table itself holds every top-level function.
+ * single mechanism for all global symbol access (no scope-chain map walk for a
+ * user global). A plain vector, sized once to the static global count and never
+ * grown (no slot limit). A slot is `defined` only after its decl executes
+ * (functions are hoisted, and a var's value is bound when its decl runs), so a
+ * reference reaching a symbol before its definition runs reads as undefined.
+ * Lexical reachability is a COMPILE-TIME decision (an out-of-scope name simply
+ * never resolves to a slot). A top-level var that NO function reads stays a
+ * main-frame local slot instead (so auto-const, which only sees frame slots, is
+ * untouched). Despite the name, it is the global VARIABLE table too.
  */
 struct GlobalFuncTable {
     std::vector<LValue> slots;
@@ -170,13 +173,13 @@ public:
     Frame *frame;
 
     /*
-     * The program-wide table of top-level (named) functions, reachable from ANY
-     * call depth (inherited from the parent; the root block owns it). A
-     * top-level function is a `SymKind::global` slot in here, so a global /
+     * The program-wide global table - every top-level function AND every
+     * escaped top-level variable - reachable from ANY call depth (inherited
+     * from the parent; the root block owns it). Such a symbol is a
+     * `SymKind::global` slot in here, so a global var read/write or a global /
      * recursive / mutually-recursive call is an O(1) table read instead of a
-     * scope-chain map walk - the function analogue of variable slotting.
-     * nullptr when the program declares no top-level functions (or in the REPL,
-     * where top-level names stay in the map).
+     * scope-chain map walk. nullptr when the program declares no such globals
+     * (or in the REPL, where top-level names stay in the map).
      */
     GlobalFuncTable *gfuncs;
 

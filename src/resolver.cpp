@@ -18,23 +18,28 @@
 
 /*
  * Name-resolution pass: resolve a function's PARAMETERS and LOCAL variables
- * (var/const, for-init, foreach variables, catch variables), plus eligible
- * TOP-LEVEL variables, to fixed Frame slots, so references become O(1) slot
+ * (var/const, for-init, foreach variables, catch variables), plus TOP-LEVEL
+ * variables and functions, to fixed slots, so references become O(1) slot
  * reads at runtime instead of std::map lookups walking the scope chain.
+ *
+ * Two slot spaces: a per-call FRAME (a function's params/locals, and a main
+ * var no function reads) and the program-wide GLOBAL table (every top-level
+ * function, and every top-level var a function reads). A reference resolves to
+ * SymKind::local (frame) or SymKind::global (table).
  *
  * What is and isn't resolved:
  *
- *   - params, var/const, for/foreach/catch variables  -> slotted
- *   - function NAMES (FuncDeclStmt::id)                -> NOT slotted; kept in
- *         the map. They are forward-reference-able (mutual recursion), and a
- *         forward reference necessarily resolves to "unresolved" in this
- *         forward pass; a name in a slot would then not be found.
- *         A function-name declaration still creates a scope entry so it
- *         correctly SHADOWS an outer slotted binding of the same name.
- *   - top-level (module-scope) vars -> slotted in an implicit "main" frame,
- *         EXCEPT any a function reads: functions reach globals through the
- *         scope-chain map walk (not slots), so a function-read global must
- *         stay in the map. See run()'s two passes and `escaped`.
+ *   - params, var/const, for/foreach/catch variables  -> SymKind::local (frame)
+ *   - top-level functions (FuncDeclStmt::id)          -> SymKind::global. They
+ *         are HOISTED to the table up front (before bodies), so a forward /
+ *         mutually-recursive reference resolves; the slot is bound when the
+ *         decl executes. A function-name decl still creates a scope entry so it
+ *         correctly SHADOWS an outer binding of the same name.
+ *   - top-level vars -> SymKind::local in the implicit "main" frame, EXCEPT any
+ *         a function reads ("escaped"): those join the GLOBAL table
+ *         (SymKind::global), so a function reaches them as an O(1) slot too -
+ *         no map walk for any user global. See run()'s two passes, `escaped`,
+ *         and `escaped_refs`.
  *   - builtins, captures, anything unresolved         -> map fallback.
  *
  * Resolution is a forward walk with a lexical scope stack: a ref resolves
@@ -78,12 +83,15 @@ void for_each_child(Construct *c, const std::function<void(Construct *)> &fn);
  * slotted binding while still resolving to a runtime map lookup.
  */
 struct Scope {
-    /* name -> { slot (or -1 = masked/map), explicit-type annotation }. The
-     * annotation is propagated to every use so an assignment can coerce a
-     * widening value to the declared type (e.g. `float f; f = 3;` stores 3.0). */
+    /* name -> { slot (or -1 = masked/map), kind, explicit-type annotation }.
+     * `kind` is SymKind::local (a frame slot) or SymKind::global (a top-level
+     * var/function in the global table) - so a reference stamps the right
+     * storage. The annotation is propagated to every use so an assignment can
+     * coerce a widening value to the declared type (e.g. `float f; f = 3;`). */
     struct Decl {
         const UniqueId *name;
         int slot;
+        SymKind kind;
         DeclType type;
     };
     std::vector<Decl> decls;
@@ -890,11 +898,15 @@ class Resolver {
 public:
 
     /*
-     * Resolve the whole tree. Two passes: first resolve every function body
-     * (collecting the globals functions read into `escaped`), then slot the
-     * top-level variables that aren't in `escaped`. The root Block records its
-     * own slot range (slot_count == top-level frame size), and Block::do_eval
-     * builds the "main" Frame from it - so nothing needs to be returned here.
+     * Resolve the whole tree. Top-level functions are hoisted to the global
+     * table first. Then two passes: pass 1 resolves every function body
+     * (collecting the names functions read into `escaped`/`escaped_refs`); pass
+     * 2 slots the top-level vars - an escaped one joins the global table, the
+     * rest become "main" frame slots. Finally each escaped use site recorded in
+     * pass 1 is stamped SymKind::global, and the table's slot->name list is
+     * published to the root Block (which sizes the runtime GlobalFuncTable).
+     * The root Block also records its frame slot range (slot_count == top-level
+     * frame size) for Block::do_eval to build the "main" Frame.
      */
     void run(Construct *root, AnalysisInfo *analysis = nullptr,
              bool repl = false, EvalContext *prior_pure = nullptr)
@@ -935,6 +947,20 @@ public:
         main_st.is_main = true;
         walk(root, &main_st);
 
+        /* Now that the top-level pass has given each escaped top-level var its
+         * global slot, stamp the function-side use sites recorded in pass 1. A
+         * name not in the table is a builtin / undefined - left for the map. */
+        for (Identifier *id : escaped_refs) {
+            auto it = global_func_slots.find(id->uid);
+            if (it != global_func_slots.end())
+                id->sym = ResolvedSym{ SymKind::global, it->second };
+        }
+
+        /* Publish the global table's slot->name list to the root block, which
+         * sizes the runtime GlobalFuncTable and lets globals() enumerate it. */
+        if (auto *rb = dynamic_cast<Block *>(root))
+            rb->global_func_names = global_names;
+
         /* Promote write-once scalar vars to constants and fold (uses the write
          * counts just collected; the top-level frame's in main_st.writes).
          * prior_pure seeds the fold context so cross-input pure calls fold. */
@@ -944,17 +970,35 @@ public:
 
 private:
 
-    /* Names a function reads from outer scope: kept in the map, not slotted. */
+    /* Names a function reads from outer scope (so they are GLOBALs, not the
+     * function's locals): a top-level VARIABLE among them gets a global-table
+     * slot (so the function reads it as an O(1) slot, not a map walk). */
     std::unordered_set<const UniqueId *> escaped;
+    /* The function-side USE sites of those escaped names (recorded while a
+     * function body is resolved in pass 1, before the top-level pass has
+     * assigned global slots). After pass 2, each is stamped SymKind::global if
+     * its name turned out to be a top-level var (else left for the map: a
+     * builtin / genuinely-undefined name). */
+    std::vector<Identifier *> escaped_refs;
     /*
-     * Top-level function names hoisted to GLOBAL slots in the root "main" frame
-     * (uid -> slot). A reference to one (a call, including recursive/mutually-
-     * recursive) resolves to SymKind::global - an O(1) global-table read
-     * instead of a scope-chain map walk. Hoisted up front (before bodies) so a
-     * forward / mutual reference resolves; the slot is bound at runtime when
-     * the decl executes (a call before that reads "undefined"). Empty in REPL
-     * mode (top-level names stay redefinable in the map). */
+     * The GLOBAL table: every top-level function (hoisted up front so a forward
+     * / mutually-recursive reference resolves) AND every top-level variable a
+     * function reads (added as its decl is walked). `global_func_slots` is
+     * uid->slot; `global_names` is slot->uid (sizes the runtime table + lets
+     * reflection enumerate it). A reference resolves to SymKind::global - an
+     * O(1) table read, not a map walk. Empty in REPL mode (top-level names
+     * stay redefinable in the map). */
     std::unordered_map<const UniqueId *, int> global_func_slots;
+    std::vector<const UniqueId *> global_names;
+
+    /* Append a name to the global table, returning its slot. */
+    int add_global_slot(const UniqueId *uid)
+    {
+        const int slot = static_cast<int>(global_names.size());
+        global_func_slots[uid] = slot;
+        global_names.push_back(uid);
+        return slot;
+    }
     /* Names of functions PROVEN effectively-pure so far (in walk order). A call
      * to one is itself pure - so the auto-pure test recognizes a function that
      * calls an earlier auto-pure helper (e.g. f(x,y)=>add(x,y) is pure once add
@@ -990,10 +1034,8 @@ private:
                 continue;
             if (global_func_slots.count(fd->id->uid))
                 throw AlreadyDefinedEx(fd->id->start, fd->id->end);
-            const int slot = static_cast<int>(rb->global_func_names.size());
-            global_func_slots[fd->id->uid] = slot;
-            rb->global_func_names.push_back(fd->id->uid);
-            fd->id->sym = ResolvedSym{ SymKind::global, slot };
+            fd->id->sym = ResolvedSym{ SymKind::global,
+                                       add_global_slot(fd->id->uid) };
         }
     }
 
@@ -1010,28 +1052,50 @@ private:
 
         check_no_redecl(cur, id);
 
-        /* A top-level var clashing with a hoisted global function name is a
-         * duplicate declaration (the function isn't in main's scopes, so
-         * check_no_redecl above can't see it). */
-        if (cur->is_main && global_func_slots.count(id->uid))
+        /* An OUTERMOST top-level var clashing with a global-table name (a
+         * hoisted function or an earlier escaped var, neither in main's scopes
+         * for check_no_redecl to see) is a duplicate declaration. Only at the
+         * outermost scope: a nested-block var legitimately shadows a global. */
+        if (cur->is_main && cur->scopes.size() == 1 &&
+            global_func_slots.count(id->uid))
             throw AlreadyDefinedEx(id->start, id->end);
 
-        /* A top-level variable that some function reads must stay in the map
-         * (functions reach globals via the scope-chain map walk, not slots),
-         * so add it as a masking entry instead of slotting it. In REPL mode
-         * EVERY top-level decl stays in the map - it is a persistent global
-         * that survives to the next input (and so is never auto-const-promoted,
-         * which would be unsound in an open world). */
-        const bool keep_in_map =
-            cur->is_main && (escaped.count(id->uid) || repl_mode);
+        /*
+         * A top-level variable that some function reads (escaped) goes in the
+         * GLOBAL table (SymKind::global), alongside functions, so the function
+         * reaches it as an O(1) slot - not a map walk. Its decl binds the table
+         * slot at runtime (handle_single_expr14). main's own reads find it here
+         * in the root scope (kind=global). NOT auto-const-promoted (it is not a
+         * main-frame slot, so the folder never sees it - same as the old map
+         * binding). In REPL mode every top-level decl stays in the map (a
+         * persistent, redefinable global).
+         *
+         * Only the OUTERMOST main scope (scopes.size()==1) qualifies: a func is
+         * parented to the root context, so it can read only an outermost top-
+         * level var, never a main nested-block local that happens to share the
+         * name. A shadowing nested decl falls through to a normal local slot.
+         */
+        if (cur->is_main && !repl_mode && cur->scopes.size() == 1 &&
+            escaped.count(id->uid))
+        {
+            const int gslot = add_global_slot(id->uid);
+            cur->scopes.back().decls.push_back(
+                { id->uid, gslot, SymKind::global, id->decl_type });
+            id->sym = ResolvedSym{ SymKind::global, gslot };
+            return;
+        }
 
-        if (keep_in_map || cur->next_slot >= MAX_SLOTS) {
-            cur->scopes.back().decls.push_back({ id->uid, -1, id->decl_type });
+        /* REPL: keep top-level decls in the map (redefinable across inputs). A
+         * slot-budget overflow also falls back to a masking map entry. */
+        if ((cur->is_main && repl_mode) || cur->next_slot >= MAX_SLOTS) {
+            cur->scopes.back().decls.push_back(
+                { id->uid, -1, SymKind::unresolved, id->decl_type });
             return;
         }
 
         const int slot = cur->next_slot++;
-        cur->scopes.back().decls.push_back({ id->uid, slot, id->decl_type });
+        cur->scopes.back().decls.push_back(
+            { id->uid, slot, SymKind::local, id->decl_type });
         cur->writes.push_back(1);   /* the declaration is write #1 */
         id->sym = ResolvedSym{ SymKind::local, slot };
     }
@@ -1047,7 +1111,8 @@ private:
             return;
 
         check_no_redecl(cur, id);
-        cur->scopes.back().decls.push_back({ id->uid, -1, id->decl_type });
+        cur->scopes.back().decls.push_back(
+            { id->uid, -1, SymKind::unresolved, id->decl_type });
     }
 
     /* Throw AlreadyDefinedEx if `id` is already declared in this scope. */
@@ -1062,9 +1127,11 @@ private:
     /*
      * Resolve a reference: search scopes innermost-out. A slotted match stamps
      * the identifier; a masking match (-1) leaves it unresolved (map); no match
-     * also leaves it unresolved (builtin / capture / global). A non-captured
-     * free name in a function is recorded in `escaped` so the top-level pass
-     * keeps that global in the map (functions read globals via the map).
+     * also leaves it unresolved (builtin / capture). A non-captured free name
+     * in a function is recorded in `escaped` (so the top-level pass gives that
+     * var a global-table slot) and in `escaped_refs` (so this use site is
+     * stamped SymKind::global once that slot exists). A name that never gets a
+     * slot (a builtin) stays unresolved -> map.
      */
     void resolve_ref(FuncState *cur, Identifier *id)
     {
@@ -1076,7 +1143,7 @@ private:
                 for (const auto &d : s->decls) {
                     if (d.name == id->uid) {
                         if (d.slot >= 0)
-                            id->sym = ResolvedSym{ SymKind::local, d.slot };
+                            id->sym = ResolvedSym{ d.kind, d.slot };
                         /* Carry the declared type to the use so an assignment
                          * can coerce a widening value (float f; f = 3). */
                         id->decl_type = d.type;
@@ -1093,8 +1160,10 @@ private:
          */
         const bool is_capture = cur->captures.count(id->uid) != 0;
 
-        /* A top-level function: resolve to its hoisted GLOBAL slot (reached via
-         * global_frame from any call depth) instead of a map walk. */
+        /* A top-level function (hoisted before pass 1): resolve to its GLOBAL
+         * slot (reached via the global table from any call depth), not a map
+         * walk. Escaped vars aren't in the table yet during pass 1 - they are
+         * stamped post-pass-2 via escaped_refs. */
         if (!is_capture) {
             auto git = global_func_slots.find(id->uid);
             if (git != global_func_slots.end()) {
@@ -1103,8 +1172,13 @@ private:
             }
         }
 
-        if (!cur->is_main && !is_capture)
+        if (!cur->is_main && !is_capture) {
             escaped.insert(id->uid);
+            /* record the use site: if `id` turns out to be a top-level var, it
+             * is stamped SymKind::global after the top-level pass assigns its
+             * global slot (a body is resolved before that pass runs). */
+            escaped_refs.push_back(id);
+        }
     }
 
     /* Count an assignment to a resolved-local lvalue as a write of its slot. */
@@ -1442,7 +1516,8 @@ Resolver::process_function(FuncDeclStmt *fd)
         for (int i = 0; i < nparams; i++) {
             Identifier *p = fd->params->elems[i].get();
             check_no_redecl(&st, p);   /* duplicate param -> error */
-            st.scopes.back().decls.push_back({ p->uid, i, p->decl_type });
+            st.scopes.back().decls.push_back(
+                { p->uid, i, SymKind::local, p->decl_type });
             st.writes.push_back(0);   /* binding isn't a body write */
             p->sym = ResolvedSym{ SymKind::local, i };
         }

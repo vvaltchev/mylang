@@ -1247,14 +1247,16 @@ sanitizers never reproduced it.)
   for the program's implicit "main" by `Block::do_eval` on the root block;
   nested blocks inherit the `frame` pointer.
   **Slotted: a function's params and its locals** (`var`/`const`, `for`-init,
-  `foreach`, `catch` variables) **and top-level variables** (`SymKind::local`,
-  the current call's `frame`), **plus top-level FUNCTION names** (`SymKind::
-  global`, see next bullet). **Not slotted (stay in the map):** builtins,
-  captures, and any **top-level variable a function reads** — a function reaches
-  a global *variable* through the scope-chain map walk, not a slot, so the
-  resolver's first pass collects those names (`escaped`) and its second pass
-  keeps them in the map. Anything unresolved falls back to the map, so the pass
-  is purely an optimization. The resolver does a forward
+  `foreach`, `catch` variables) **and top-level variables a function does NOT
+  read** (`SymKind::local`, the current call's `frame`), **plus top-level
+  FUNCTION names and every top-level variable a function DOES read**
+  (`SymKind::global`, the program-wide global table — see next bullet). So
+  *every* user global — function or variable — is an O(1) slot, never a map
+  walk; the resolver's pass 1 collects the names functions read (`escaped`) and
+  pass 2 routes an escaped top-level var into the global table rather than a
+  main-frame slot. **Not slotted (stay in the map):** builtins, captures, and
+  anything genuinely unresolved (it falls back to the map, so the pass is purely
+  an optimization). The resolver does a forward
   lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
   `x`; top-level *functions* ARE hoisted — see next bullet). **No per-slot
   liveness**: a slot is default-constructed when the `Frame` is built, and a
@@ -1288,33 +1290,43 @@ sanitizers never reproduced it.)
   `foreach` binds a resolved-local loop var the same way via `bind_loop_var`.
   All use `as_resolved_local`, a cheap `is_id()` tag check (`ConstructType::id`),
   not a `dynamic_cast`.
-- **Top-level functions are slotted in a GLOBAL table (`SymKind::global`).** A
-  function name can't be a *frame* slot — a function body runs parented to its
-  definition scope (`capture_ctx` → root), not the call site, so a callee
-  reference from deep in a recursion isn't in the current `frame`. Instead each
-  DIRECT top-level function gets a static slot in a program-wide
-  **`GlobalFuncTable`** (`eval.h`: a plain `vector<LValue> slots` + a `defined`
-  flags vector + a slot→name list for reflection), reachable from any call
-  depth via `EvalContext::gfuncs` (inherited from the parent; the root block
-  owns the table). So `fib`/mutual-recursion/any named-function call is an
-  **O(1) table read, not a scope-chain map walk** — the function analogue of
-  local slotting, a real win on call-heavy code (`bench/09_fib`). A plain
-  vector with **no slot limit** — a program may have any number of top-level
-  functions. The resolver **hoists** them before resolving
-  bodies (`hoist_global_funcs`), so a forward / mutually-recursive reference
-  resolves to a slot; `resolve_ref` stamps `SymKind::global` for a non-captured
-  top-level-function reference (a capture-list name takes precedence and stays
-  map-bound). A slot is `defined` only once its `func` decl executes, so a call
-  that reaches a function before its definition runs reads "undefined" (same as
-  the old map late-binding); `FuncDeclStmt::do_eval` binds the slot,
-  `Identifier::do_eval` reads it, and `globals()`
-  enumerates the table's names. **Scope:** only DIRECT top-level **named**
-  functions — optimizer-inserted `name$sN` specialization clones (created after
-  the hoist), nested/conditionally-declared functions, lambdas, and (in the
-  **REPL**, where top-level names must stay redefinable) all functions remain
-  map-bound; template-instance clones, inserted before resolve_names, ARE
-  hoisted. Global *variables* a function reads are still map-bound (`escaped`);
-  slotting those is a possible follow-up.
+- **Top-level functions AND escaped variables are slotted in a GLOBAL table
+  (`SymKind::global`).** A global symbol can't be a *frame* slot — a function
+  body runs parented to its definition scope (`capture_ctx` → root), not the
+  call site, so a global reference from deep in a recursion isn't in the current
+  `frame`. Instead each top-level function AND each top-level variable some
+  function reads gets a static slot in a program-wide **`GlobalFuncTable`**
+  (`eval.h`: a plain `vector<LValue> slots` + a `defined` flags vector + a
+  slot→name list for reflection — despite the name, it holds global *variables*
+  too), reachable from any call depth via `EvalContext::gfuncs` (inherited from
+  the parent; the root block owns the table). So `fib`/mutual-recursion/any
+  named-function call AND any function's read/write of a global variable is an
+  **O(1) table read, not a scope-chain map walk** — a real win on call-heavy and
+  global-heavy code (`bench/09_fib`). A plain vector with **no slot limit** — a
+  program may have any number of global functions/variables. The resolver
+  **hoists functions** before resolving bodies (`hoist_global_funcs`), so a
+  forward / mutually-recursive reference resolves; for **variables** it instead
+  records each function-side use site (`escaped_refs`) during pass 1 and stamps
+  it `SymKind::global` after pass 2 has given the var its table slot (a var, not
+  hoisted, gets its slot when its decl is walked). `resolve_ref` resolves a
+  reference innermost-out; a capture-list name takes precedence and stays map-
+  bound. A slot is `defined` only once its decl executes (a function by
+  `FuncDeclStmt::do_eval`, a variable by `handle_single_expr14`'s global-decl
+  branch), so a reference reaching a symbol before its definition runs reads
+  "undefined" (same as the old map late-binding); `Identifier::do_eval`/
+  `eval_int`/`eval_float` read the slot, the assignment fast paths in
+  `handle_single_expr14` write it, and `globals()` enumerates the table's names.
+  **A top-level var is global only if a function reads it AND it's in the
+  OUTERMOST main scope** — a main nested-block local that merely shares a name
+  with a global stays a frame slot (a function is parented to root, so it can
+  only read an outermost top-level var); such a nested var legitimately shadows
+  the global. A non-escaped top-level var stays a main-frame `SymKind::local`
+  slot, so **auto-const (which only sees frame slots) is untouched** — only vars
+  no function reads are promotable, exactly as before. **Scope:** optimizer-
+  inserted `name$sN` specialization clones (created after the hoist), nested/
+  conditionally-declared functions, lambdas, and (in the **REPL**, where top-
+  level names must stay redefinable) all top-level names remain map-bound;
+  template-instance clones, inserted before resolve_names, ARE hoisted.
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable
