@@ -554,9 +554,9 @@ slot identity). For each function (and the top-level "main"), it:
 - **Safety (`prescan_blocked`)**: a slot is *not* promoted if the variable is
   captured by a nested function (the capture must stay an identifier), passed as
   the **first arg** of a builtin that takes it as an lvalue/identifier
-  (`append`/`push`/`pop`/`insert`/`erase`/`intptr`/`undef`, listed in
-  `is_lvalue_arg_builtin` — a literal there throws `NotLValueEx` or breaks
-  `undef`), used as a subscript/member base (`a[i]`, `a.k`), or is a `foreach`
+  (`append`/`push`/`pop`/`insert`/`erase`/`intptr`, listed in
+  `is_lvalue_arg_builtin` — a literal there throws `NotLValueEx`), used as a
+  subscript/member base (`a[i]`, `a.k`), or is a `foreach`
   loop variable (implicitly reassigned each iteration despite its write count).
   Args to pure/user functions and read-only builtins are **not** blocked, so
   they fold — this is what lets pure-call folding and `isconst()` work.
@@ -1303,7 +1303,7 @@ sanitizers never reproduced it.)
   map-bound). A slot is `defined` only once its `func` decl executes, so a call
   that reaches a function before its definition runs reads "undefined" (same as
   the old map late-binding); `FuncDeclStmt::do_eval` binds the slot,
-  `Identifier::do_eval`/`erase` (undef) read/clear it, and `globals()`
+  `Identifier::do_eval` reads it, and `globals()`
   enumerates the table's names. **Scope:** only DIRECT top-level **named**
   functions — optimizer-inserted `name$sN` specialization clones (created after
   the hoist), nested/conditionally-declared functions, lambdas, and (in the
@@ -2030,7 +2030,7 @@ struct can be REDEFINED at the prompt** (the edit-and-resubmit workflow):
 (structs/pure funcs register in the const ctx at parse time), and the
 `FuncDeclStmt`/`StructDeclStmt` eval paths erase-then-rebind under it instead of
 throwing `AlreadyDefinedEx`. A plain `var`'s TYPE still sticks (the inferencer's
-job — see the type-commitment above; `undef` resets it). **Redefining a function
+job — the type-commitment above; `:undef` resets it). **Redefining a function
 GCs its now-orphaned template/spec instances** (`gc_redefined_instances` in
 `do_eval`): an instance (`f$0`) created only by a throwaway top-level call
 (`f(1,2)` at the prompt) is removed from both scopes + the inferencer when its
@@ -2060,11 +2060,14 @@ locals all happen and are inspectable (`:analyze`).
   inferred commit vs "is declared" for an annotated one). All `pinned` branches
   are no-ops in the one-shot path, so scripts/tests are byte-identical. A
   rejected input rolls back (`infer_input` restores the global scope + pins the
-  half-built syms). `undef(x)` → `ReplInfer::undef_global` drops the name so a
-  later `var x` of a new type is fresh (the REPL diffs the global symbol names
-  before/after eval to find what `undef` removed). REPL redeclaration is **not**
-  a feature: a re-declared global hits the type-commitment check, and `undef`
-  is the way to change a global's type.
+  half-built syms). The **`:undef <name>`** meta-command
+  (`Impl::cmd_undef`) erases a global from the runtime + const scopes and calls
+  `ReplInfer::undef_global` to drop its committed type, so a later `var x` of a
+  new type is fresh. REPL redeclaration is **not** a feature: a re-declared
+  global hits the type-commitment check, and `:undef` is the way to change a
+  global's type. (There is no `undef` *builtin* — a script's symbols are fixed
+  slots at compile time, so `undef` is a REPL-only convenience; a script just
+  re-defines a name.)
 - **`resolve_names`'s `repl_mode`** keeps EVERY top-level decl in the map as a
   persistent global (never slotted into "main", never auto-const-promoted — the
   open-world soundness point); nested function locals slot/inline/specialize
@@ -2075,7 +2078,7 @@ locals all happen and are inspectable (`:analyze`).
 
 **Tests:** all headless. The **`repl:`** tests drive ONE `ReplEngine` through a
 sequence of `(input, expected-substring)` steps, so the persisted global scope
-AND the cross-input type commitment / `undef` reset / per-input optimizers are
+AND the cross-input type commitment / `:undef` reset / per-input optimizers are
 exercised; the **`lineedit:`** / **`highlight:`** `extra_checks` feed byte
 scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
 unit-tested. **Not yet (Phase 5):** an IRB-style dropdown completion menu,

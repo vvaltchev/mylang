@@ -2343,7 +2343,7 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "print" || n == "writeln" || n == "assert" || n == "append" ||
         n == "push" || n == "insert" || n == "exit" || n == "write" ||
-        n == "writelines" || n == "undef" || n == "erase")
+        n == "writelines" || n == "erase")
         return A.none_ty();
 
     return A.dyn_ty();

@@ -321,8 +321,6 @@ const BuiltinDoc builtin_docs[] = {
   "enclosing expression.",
   "The argument is still folded, so runtime(1/0) fails at compile time, while "
   "1/runtime(0) throws at runtime." },
-{ "undef", "control", "undef(name)",
-  "Remove name from the current scope (true if it existed).", nullptr },
 
 };
 
@@ -707,6 +705,10 @@ const CommandDoc command_docs[] = {
     { "source", ":source <file>",
       "Evaluate a file as if it were typed at the prompt, one unit at a time.",
       nullptr },
+    { "undef", ":undef <name>",
+      "Remove a global symbol so it can be redeclared (even with a new type).",
+      "A REPL-only convenience: a script's symbols are fixed slots at compile "
+      "time, so there is no `undef` builtin - a script re-defines a name." },
     { "quit", ":quit",
       "Exit the REPL (also Ctrl-D at the prompt).", nullptr },
 };

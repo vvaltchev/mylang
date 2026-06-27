@@ -246,7 +246,6 @@ EvalContext::SymbolsType EvalContext::builtins =
      * always a runtime call (uniform const/runtime type-driven fill) and a huge
      * array(1000000) isn't baked into the AST. */
     make_builtin("array", builtin_array),
-    make_builtin("undef", builtin_undef),
 
     /* Array builtins */
     make_builtin("append", builtin_append),

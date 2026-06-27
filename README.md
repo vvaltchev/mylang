@@ -180,7 +180,9 @@ inspecting the language and its compiler:
 - **Other** — `:tree <code>` prints the const-folded syntax tree (watch folding
   happen, e.g. `:tree 2 + 3 * 4` → `Int(14)`); `:analyze <code>` reprints code
   colored by which optimizations fired; `:source <file>` evaluates a file as if
-  typed; `:quit` exits.
+  typed; `:undef <name>` removes a global so it can be redeclared (even with a
+  new type) — a REPL convenience, since a script's symbols are fixed at compile
+  time and have no `undef`; `:quit` exits.
 
 Colors honor [`NO_COLOR`](https://no-color.org).
 
@@ -537,8 +539,8 @@ with another — each `var` gets its own writable copy. (See
 
 You don't have to write `const` to get most of these benefits. A variable
 declared with `var` that is *written exactly once* (its declaration) with a
-constant scalar initializer — and is never reassigned, captured, `undef()`-ed,
-or used in a position that needs an lvalue — is automatically promoted to a
+constant scalar initializer — and is never reassigned, captured, or used in a
+position that needs an lvalue — is automatically promoted to a
 constant. Its uses are then folded just like a `const` and its decl disappears.
 This *auto-const* pass runs after parsing, so it also handles values *derived*
 from other auto-consts:
@@ -2043,10 +2045,6 @@ To get a polymorphic (general) array on purpose:
   * **Promote an existing array with `dynarray()`** (below) — `clone()` /
     `deepclone()` deliberately preserve the layout, so a clone of a flat array
     is still flat.
-
-#### `undef(symbol)`
-Undefine the given symbol from the current scope. Return true if the given
-symbol was actually defined in the given scope.
 
 ### Non-const reflection builtins
 Runtime introspection of the live program state. They are ordinary (non-const)
