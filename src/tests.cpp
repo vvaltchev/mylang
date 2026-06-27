@@ -2566,6 +2566,35 @@ static const std::vector<test> tests =
             "assert(hash(\"x\") == hash(\"x\"));",
         },
     },
+    {
+        /*
+         * find() on a flat (unboxed) scalar array takes a raw-scan fast path
+         * (no per-element boxing) for a same-typed target; a cross-type numeric
+         * target falls back to the general numeric-== path. Both paths agree.
+         */
+        "find(): flat int/float/bool fast path + cross-type fallback",
+        {
+            "var ai = range(100);",                  /* flat array<int> */
+            "assert(find(ai, 99) == 99);",           /* scans to the last */
+            "assert(find(ai, 0) == 0);",
+            "assert(find(ai, 100) == none);",
+            "assert(array_storage(ai) == \"ints\");",
+            "assert(find(ai, 50.0) == 50);",         /* cross-type int==float */
+            "assert(find(ai, 50.5) == none);",       /* no integer match */
+            "var af = [1.0, 2.5, 3.5];",
+            "assert(find(af, 2.5) == 1);",
+            "assert(find(af, 2) == none);",          /* 2.0 absent */
+            "assert(find(af, 3) == none);",
+            "var ab = [true, false, true];",
+            "assert(find(ab, false) == 1);",
+            "assert(find(ab, true) == 0);",
+            /* a key func still works (general path): 1,2,3 -> 2,3,4; find 4 */
+            "assert(find([1,2,3], 4, func(x) => x+1) == 2);",
+            /* a slice (offset != 0) finds at the slice-relative index */
+            "var sl = range(10)[5:10];",             /* [5,6,7,8,9] */
+            "assert(find(sl, 8) == 3);",
+        },
+    },
     { "find() with no args is rejected",
       { "find();" }, &typeid(InvalidNumberOfArgsEx) },
     { "find() with a non-function key is a type error",

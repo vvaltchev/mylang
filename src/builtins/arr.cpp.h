@@ -673,12 +673,46 @@ builtin_find_arr(const SharedArrayObj &arr,
                 return static_cast<int_type>(i);
         }
 
-    } else {
+        return none;
+    }
 
-        for (size_type i = 0; i < n; i++) {
-            if (arr_elem_at(arr, i) == v)
+    /*
+     * Flat-scalar fast path: a SAME-typed scalar target scans the unboxed
+     * vector with a raw C comparison - no per-element EvalValue boxing and no
+     * num_bin_op-dispatched ==, the cost the general loop below pays. A
+     * different-typed target (e.g. find(int_array, 2.0)) falls through to the
+     * general path, which keeps the cross-type numeric == semantics. This is
+     * what makes a flat-array find() as fast as Python's list.index.
+     */
+    const size_type off = arr.offset();
+    if (arr.skind() == SharedArrayObj::Storage::ints && v.is<int_type>()) {
+        const int_type t = v.get<int_type>();
+        const SharedArrayObj::ivec_type &iv = arr.flat_ints();
+        for (size_type i = 0; i < n; i++)
+            if (iv[off + i] == t)
                 return static_cast<int_type>(i);
-        }
+        return none;
+    }
+    if (arr.skind() == SharedArrayObj::Storage::floats && v.is<float_type>()) {
+        const float_type t = v.get<float_type>();
+        const SharedArrayObj::fvec_type &fv = arr.flat_floats();
+        for (size_type i = 0; i < n; i++)
+            if (fv[off + i] == t)
+                return static_cast<int_type>(i);
+        return none;
+    }
+    if (arr.skind() == SharedArrayObj::Storage::bools && v.is<bool>()) {
+        const unsigned char t = v.get<bool>() ? 1 : 0;
+        const SharedArrayObj::bvec_type &bv = arr.flat_bools();
+        for (size_type i = 0; i < n; i++)
+            if (bv[off + i] == t)
+                return static_cast<int_type>(i);
+        return none;
+    }
+
+    for (size_type i = 0; i < n; i++) {
+        if (arr_elem_at(arr, i) == v)
+            return static_cast<int_type>(i);
     }
 
     return none;

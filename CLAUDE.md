@@ -2207,7 +2207,14 @@ comparator-validity instrumentation that *hangs* on a non-ordering comparator.
 The default (no-comparator) path keeps `std::sort` — its `operator<` is a valid
 ordering for homogeneous types and throws `TypeErrorEx` for incomparable ones.
 Keep this distinction if you touch sorting or add another callback-driven
-algorithm.
+algorithm. **Callback handle lifetime:** when a builtin keeps a raw
+`FuncObject *` to the callback, the `shared_ptr` that owns it must outlive every
+call — an inline lambda (`find(a, x, func(e)=>…)`) has *no other owner*, so a
+raw pointer extracted from a `RValue()` temporary that goes out of scope before
+the loop is a use-after-free (the `find()` key-func bug: the handle was pulled
+out inside the `if (3 args)` block but used after it; fixed by holding a
+`shared_ptr` for the whole call). Bind the owning value at the same scope as the
+use, or copy the `shared_ptr` to keep it alive.
 
 ### Adding a value type
 Touch all of: the `TypeE` enum (`type.h`) — mind the trivial/non-trivial
