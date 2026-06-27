@@ -148,8 +148,11 @@ The line editor is hand-rolled (no `readline`/`reline` dependency, in keeping
 with the no-dependencies rule): live syntax highlighting, command history
 (Up/Down, persisted to `~/.mylang_history`), the usual Emacs-style editing keys
 (`Ctrl-A`/`E`/`U`/`K`/`W`, arrows, …), and **Tab completion** of keywords,
-builtins, your own globals, and a struct value's fields (`p.<Tab>`). A `none`
-result (a definition, a `print`, an `if`) is not echoed, to keep things quiet.
+builtins, your own globals, and a struct value's fields (`p.<Tab>`). It also
+shows a **PowerShell-style inline suggestion** — as you type, the most recent
+matching history entry appears in dim gray after the cursor; press **Right
+arrow** (or `Ctrl-F`) at the end of the line to accept it. A `none` result (a
+definition, a `print`, an `if`) is not echoed, to keep things quiet.
 
 Meta-commands start with `:`. They turn the REPL into a tool for learning and
 inspecting the language and its compiler:

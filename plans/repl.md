@@ -23,9 +23,13 @@
 > 2-D cursor, Enter submits only when the block parses complete (else newline +
 > auto-indent), UP/DOWN move within the block then fall through to history, and
 > a committed multi-line input is recalled and re-edited as ONE unit (with
-> function/struct **redefinition** so edit-and-resubmit works). **Not yet:** the
-> IRB dropdown-style completion menu, reverse-search/bracketed-paste, and the
-> Windows backend (Phase 5).
+> function/struct **redefinition** so edit-and-resubmit works). Also done: a
+> **PowerShell-style inline autosuggestion** — the most recent matching history
+> entry shows as dim-gray ghost text after the cursor, accepted with Right-arrow
+> / `Ctrl-F` (a `Suggester` callback + `LineEditor::suggestion()`; rendered by
+> `read_line` only with color on). **Not yet:** the IRB dropdown-style
+> completion menu, reverse-search/bracketed-paste, and the Windows backend
+> (Phase 5).
 >
 > Original design follows. The two hard problems are (1) running the *real,
 > full* pipeline per input over an **expandable global scope** so the REPL is a
@@ -266,10 +270,11 @@ emitted ANSI.
 
 **Deferred past v1** (designed here, built later): **Phase 4 — autocompletion**
 (`complete()` from KwString + the `builtins`/`const_builtins` maps + persistent
-symbols + struct fields after `.`; eventually an IRB-style dropdown); **Phase 5
-— polish** (Ctrl-R reverse search, bracketed paste, pretty multi-line value
-printing, more meta-commands, themes/`NO_COLOR`, and the **Windows** raw-input
-backend — v1 is Unix-only).
+symbols + struct fields after `.`; eventually an IRB-style dropdown — Tab is
+done, the dropdown still deferred); **Phase 5 — polish** (the PowerShell-style
+inline autosuggestion is **done**; remaining: Ctrl-R reverse search, bracketed
+paste, pretty multi-line value printing, more meta-commands, themes/`NO_COLOR`,
+and the **Windows** raw-input backend — v1 is Unix-only).
 
 ## 5. File layout & touched passes
 

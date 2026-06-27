@@ -81,6 +81,27 @@ public:
         return v;
     }
 
+    /*
+     * Inline autosuggestion (PowerShell-style "ghost text"). The callback is
+     * given the whole buffer and returns a full suggested line (or "" for
+     * none). The editor shows the un-typed remainder in dim gray after the
+     * cursor and accepts it on Right-arrow / Ctrl-F when the cursor is at the
+     * end of the line. Distinct from Tab (which completes the identifier under
+     * the cursor): the suggestion completes the WHOLE line, from history.
+     */
+    using Suggester = std::function<std::string(const std::string &)>;
+    void set_suggester(Suggester s) { suggester = std::move(s); }
+
+    /*
+     * The un-typed remainder of the current suggestion (the gray ghost text),
+     * or "" when there is none. Shown only when the cursor is at the end of a
+     * single-line buffer (so the 2-D renderer stays simple) and the suggestion
+     * strictly extends what is typed - mirroring PowerShell, where the
+     * prediction hides once the cursor leaves the end of the line. Public so
+     * the renderer and the headless tests can read it.
+     */
+    std::string suggestion() const;
+
 private:
 
     enum class Esc { none, esc, csi };
@@ -94,9 +115,11 @@ private:
     std::string saved_live;               /* live line, saved entering hist */
     Completer completer;
     Submitter submitter;
+    Suggester suggester;
     std::vector<std::string> comp_list;   /* candidates pending display */
 
     void complete();
+    bool accept_suggestion();             /* Right/Ctrl-F: take ghost text */
     void insert(char c);
     void newline();                       /* Enter on an incomplete buffer */
     void backspace();

@@ -234,12 +234,48 @@ void LineEditor::complete()
     comp_list = cands;
 }
 
+/*
+ * The un-typed remainder of the inline suggestion (the gray ghost text). Shown
+ * only at the end of a single-line buffer (PowerShell hides the prediction once
+ * the cursor leaves the line end), and only when the suggested full line
+ * strictly extends what is typed.
+ */
+std::string LineEditor::suggestion() const
+{
+    if (!suggester || buf.empty() || pos != buf.size() ||
+        buf.find('\n') != string::npos)
+        return string();
+
+    const string full = suggester(buf);
+    if (full.size() > buf.size() && full.find('\n') == string::npos &&
+        full.compare(0, buf.size(), buf) == 0)
+        return full.substr(buf.size());
+
+    return string();
+}
+
+/* Right-arrow / Ctrl-F when a ghost suggestion is showing: take it (append the
+ * remainder, cursor to end). Returns false when there is nothing to accept, so
+ * the caller falls back to moving the cursor right. */
+bool LineEditor::accept_suggestion()
+{
+    const string s = suggestion();
+    if (s.empty())
+        return false;
+
+    buf += s;
+    pos = buf.size();
+    return true;
+}
+
 void LineEditor::csi_final(unsigned char c)
 {
     switch (c) {
         case 'A': move_up(); break;                            /* up    */
         case 'B': move_down(); break;                          /* down  */
-        case 'C': if (pos < buf.size()) pos++; break;          /* right */
+        case 'C':                                              /* right */
+            if (!accept_suggestion() && pos < buf.size()) pos++;
+            break;
         case 'D': if (pos) pos--; break;                       /* left  */
         case 'H': pos = line_start(pos); break;                /* home  */
         case 'F': pos = line_end(pos); break;                  /* end   */
@@ -290,7 +326,9 @@ LineEditor::Action LineEditor::feed(unsigned char c)
         case 1:   pos = line_start(pos);   return Action::none;   /* Ctrl-A */
         case 5:   pos = line_end(pos);     return Action::none;   /* Ctrl-E */
         case 2:   if (pos) pos--;          return Action::none;   /* Ctrl-B */
-        case 6:   if (pos < buf.size()) pos++; return Action::none; /* C-F */
+        case 6:                                                    /* Ctrl-F */
+            if (!accept_suggestion() && pos < buf.size()) pos++;
+            return Action::none;
         case 8:
         case 127: backspace();             return Action::none;   /* Bksp */
         case 21:  kill_to_start();         return Action::none;   /* Ctrl-U */
@@ -433,6 +471,26 @@ read_line(const string &prompt, const string &cont_prompt,
     if (submitter)
         ed.set_submitter(std::move(submitter));
 
+    /*
+     * PowerShell-style inline autosuggestion from history: the gray ghost text
+     * is the most recent single-line history entry that the current buffer is a
+     * strict prefix of. Enabled only with color on (the ghost must be visually
+     * distinct from typed text), so NO_COLOR / no-TTY get no suggestion.
+     */
+    if (highlight) {
+        ed.set_suggester([&history](const string &b) -> string {
+            if (b.empty() || b.find('\n') != string::npos)
+                return string();
+            for (auto it = history.rbegin(); it != history.rend(); ++it) {
+                const string &h = *it;
+                if (h.size() > b.size() && h.find('\n') == string::npos &&
+                    h.compare(0, b.size(), b) == 0)
+                    return h;
+            }
+            return string();
+        });
+    }
+
     /* The row (0-based, within the block) the cursor was on after the last
      * paint - so the next paint can move back to the top of the block. */
     int prev_cursor_row = 0;
@@ -450,6 +508,14 @@ read_line(const string &prompt, const string &cont_prompt,
             if (i + 1 < rows.size())
                 o += "\r\n";
         }
+
+        /* The inline suggestion's remainder in dim gray, just past the cursor.
+         * suggestion() is non-empty only for a single-line buffer with the
+         * cursor at the end, so it always belongs on this last row; the cursor
+         * is repositioned to its start (before the ghost) below. */
+        const string ghost = ed.suggestion();
+        if (!ghost.empty())
+            o += "\033[90m" + ghost + "\033[0m";
 
         const int crow = static_cast<int>(ed.cursor_row());
         const int last = static_cast<int>(rows.size()) - 1;

@@ -2053,6 +2053,25 @@ behind a thin terminal shell:
   block cleared) — it assumes each logical line fits the terminal width (no
   soft-wrap). Off a TTY it accumulates physical lines until complete. History
   stores whole logical inputs, so UP recalls an entire block.
+  - **Inline autosuggestion (PowerShell-style ghost text).** A `Suggester`
+    callback (`std::function<string(const string&)>`) returns a full suggested
+    line for the current buffer; `LineEditor::suggestion()` returns the un-typed
+    **remainder** — but only when the cursor is at the end of a **single-line**
+    buffer that the suggestion strictly extends (so the 2-D renderer never has
+    to draw a multi-line ghost, mirroring PowerShell hiding the prediction once
+    the cursor leaves the line end). `read_line` renders that remainder in dim
+    gray (`\033[90m…\033[0m`) just past the cursor and repositions the cursor to
+    its start; **Right-arrow / `Ctrl-F` at the line end accept it**
+    (`accept_suggestion`: append the remainder; returns false otherwise so the
+    key falls back to moving the cursor right). It is **distinct from Tab**
+    (which completes the identifier under the cursor): the suggestion completes
+    the WHOLE line. `read_line` wires a **history** suggester (most-recent
+    single-line entry the buffer is a strict prefix of) and only when **color is
+    on** (the ghost must be visually distinct; `NO_COLOR`/no-TTY get none). The
+    pure core is unit-tested with a synthetic suggester (`suggestion()` +
+    accept); the gray rendering lives in `read_line` (untested, like the rest of
+    the TTY shell). A navigable dropdown completion menu is still deferred (see
+    `plans/repl.md`).
 - **`highlight.{h,cpp}`** — `highlight_line`, a self-contained scanner (NOT the
   lexer; tolerates mid-edit input) that wraps keywords/strings/numbers/comments/
   type-words in ANSI color, preserving the bytes exactly otherwise.

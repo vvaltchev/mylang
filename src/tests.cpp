@@ -9114,6 +9114,51 @@ static bool lineedit_tab_common_prefix()
     return offered.size() == 2;
 }
 
+/* Inline autosuggestion (ghost text): a suggester that completes "coun" to
+ * "counter". The un-typed remainder is the ghost; Right-arrow accepts it. */
+static bool lineedit_suggestion_ghost_and_accept()
+{
+    LineEditor ed;
+    ed.set_suggester([](const std::string &b) -> std::string {
+        return b == "coun" ? std::string("counter") : std::string();
+    });
+    le_feed(ed, "coun");
+    if (ed.suggestion() != "ter") return false;    /* gray remainder */
+    le_feed(ed, "\033[C");                          /* Right accepts it */
+    return ed.buffer() == "counter" && ed.cursor() == 7;
+}
+
+/* Ctrl-F also accepts the ghost; with no matching suggestion it just moves the
+ * cursor (no interference with plain forward-char). */
+static bool lineedit_suggestion_ctrl_f_and_nomatch()
+{
+    LineEditor ed;
+    ed.set_suggester([](const std::string &b) -> std::string {
+        return b == "pr" ? std::string("print") : std::string();
+    });
+    le_feed(ed, "pr");
+    ed.feed(6);                                    /* Ctrl-F accepts "int" */
+    if (ed.buffer() != "print" || ed.cursor() != 5) return false;
+    /* now no suggestion extends "print" -> Ctrl-F at end is a no-op */
+    ed.feed(6);
+    return ed.buffer() == "print" && ed.cursor() == 5;
+}
+
+/* The ghost is hidden once the cursor leaves the end of the line, and Right
+ * there moves the cursor instead of accepting (PowerShell behavior). */
+static bool lineedit_suggestion_hidden_midline()
+{
+    LineEditor ed;
+    ed.set_suggester([](const std::string &b) -> std::string {
+        return b == "coun" ? std::string("counter") : std::string();
+    });
+    le_feed(ed, "coun");
+    le_feed(ed, "\033[D");                          /* left -> not at end */
+    if (!ed.suggestion().empty()) return false;     /* hidden */
+    le_feed(ed, "\033[C");                          /* Right just moves */
+    return ed.buffer() == "coun" && ed.cursor() == 4;
+}
+
 static bool repl_incomplete_detection()
 {
     if (!ReplEngine::is_incomplete("func f() {")) return false;   /* open { */
@@ -9473,6 +9518,12 @@ static const std::vector<extra_check> extra_checks =
       lineedit_tab_unique_completion },
     { "lineedit: Tab extends to the common prefix",
       lineedit_tab_common_prefix },
+    { "lineedit: inline suggestion ghost + Right accepts",
+      lineedit_suggestion_ghost_and_accept },
+    { "lineedit: inline suggestion Ctrl-F accepts / no-match no-op",
+      lineedit_suggestion_ctrl_f_and_nomatch },
+    { "lineedit: inline suggestion hidden mid-line",
+      lineedit_suggestion_hidden_midline },
     { "highlight: inserts color escapes", highlight_inserts_color },
     { "highlight: stripping escapes restores the input",
       highlight_preserves_visible_text },
