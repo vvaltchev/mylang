@@ -1250,13 +1250,15 @@ sanitizers never reproduced it.)
   `foreach`, `catch` variables) **and top-level variables a function does NOT
   read** (`SymKind::local`, the current call's `frame`), **plus top-level
   FUNCTION names and every top-level variable a function DOES read**
-  (`SymKind::global`, the program-wide global table — see next bullet). So
-  *every* user global — function or variable — is an O(1) slot, never a map
-  walk; the resolver's pass 1 collects the names functions read (`escaped`) and
-  pass 2 routes an escaped top-level var into the global table rather than a
-  main-frame slot. **Not slotted (stay in the map):** builtins, captures, and
-  anything genuinely unresolved (it falls back to the map, so the pass is purely
-  an optimization). The resolver does a forward
+  (`SymKind::global`, the program-wide global table — see next bullet), **plus a
+  closure's captured variables** (`SymKind::capture`, the closure's per-instance
+  vector — see *capture slotting* below). So *every* user symbol — local,
+  global, function, or capture — is an O(1) slot, never a map walk; the
+  resolver's pass 1 collects the names functions read (`escaped`) and pass 2
+  routes an escaped top-level var into the global table rather than a main-frame
+  slot. **Not slotted (stay in the map):** builtins, REPL globals, and anything
+  genuinely unresolved (it falls back to the map, so the pass is purely an
+  optimization). The resolver does a forward
   lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
   `x`; top-level *functions* ARE hoisted — see next bullet). **No per-slot
   liveness**: a slot is default-constructed when the `Frame` is built, and a
@@ -1309,8 +1311,9 @@ sanitizers never reproduced it.)
   records each function-side use site (`escaped_refs`) during pass 1 and stamps
   it `SymKind::global` after pass 2 has given the var its table slot (a var, not
   hoisted, gets its slot when its decl is walked). `resolve_ref` resolves a
-  reference innermost-out; a capture-list name takes precedence and stays map-
-  bound. A slot is `defined` only once its decl executes (a function by
+  reference innermost-out (a closure's capture scope is searched before the
+  global table, so a capture shadows a same-named global). A slot is `defined`
+  only once its decl executes (a function by
   `FuncDeclStmt::do_eval`, a variable by `handle_single_expr14`'s global-decl
   branch), so a reference reaching a symbol before its definition runs reads
   "undefined" (same as the old map late-binding); `Identifier::do_eval`/
@@ -1327,6 +1330,30 @@ sanitizers never reproduced it.)
   conditionally-declared functions, lambdas, and (in the **REPL**, where top-
   level names must stay redefinable) all top-level names remain map-bound;
   template-instance clones, inserted before resolve_names, ARE hoisted.
+- **Captured variables are slotted (`SymKind::capture`).** A closure's explicit
+  `[x,y]` capture list is snapshot into a per-instance `vector<LValue>`
+  **`FuncObject::capture_slots`** at closure creation (`func.cpp.h`), in
+  declaration order; a body reference to a captured name resolves to
+  `SymKind::capture` + its index there, read/written via **`EvalContext::
+  captures`** (the called closure's vector, set in `do_func_call`, inherited by
+  nested blocks) — an O(1) slot, **no map walk**. This storage lives in the
+  `FuncObject`, NOT the per-call `Frame`, because a mutable-by-value capture
+  must **persist across calls** to the same closure (a counter) — captures are
+  per-closure-instance, not per-invocation; the per-call Frame would reset them.
+  The resolver gives each function a **capture scope** (outermost, so a param
+  shadows a same-named capture) with `SymKind::capture` indices in a slot space
+  separate from the frame's `next_slot` (`process_function`). Capture indices
+  match the ctor's fill order, so a nested capture chain
+  (`func[a]{func[a,b]{…}}`) resolves correctly — the inner's capture-list entry
+  reads the middle's capture/param slot, snapshot into the inner's capture slot.
+  `Identifier::do_eval`/`eval_int`/`eval_float` read a capture slot;
+  `handle_single_expr14` writes it (the shared `slot_rmw` helper backs the local
+  / global / capture assignment fast paths). `clone()` of a capturing
+  `FuncObject` deep-copies `capture_slots` (independent per clone); a
+  non-capturing one clones to itself (the `capture_slots.empty()` check in
+  `TypeFunc::clone`). `capture_ctx` survives only as the empty linking context
+  that parents the body's args-context to root (for `gfuncs` + the builtins
+  map).
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable
@@ -1373,11 +1400,13 @@ sanitizers never reproduced it.)
 - **Function call scoping is lexical/closure-based.** `do_func_call` binds
   params into an
   `args_ctx` whose parent is the function's **`capture_ctx`**, not the call
-  site. A `FuncObject` holds
-  the `FuncDeclStmt *` plus that `capture_ctx`, which is parented to the *root*
-  context — so functions
-  cannot see caller locals or globals, only captures (and, for pure funcs, only
-  consts + params).
+  site. A `FuncObject` holds the `FuncDeclStmt *`, the per-instance
+  **`capture_slots`** (captured values, read via `SymKind::capture`; see the
+  *capture slotting* bullet above), and that `capture_ctx` — an empty context
+  parented to the *root* whose only job is to link the body's `args_ctx` to root
+  (for `gfuncs` + the builtins map). So functions cannot see caller locals or
+  globals, only
+  captures (and, for pure funcs, only consts + params).
   Builtins are different: they receive the **caller's `ctx`** and the
   **unevaluated** `ExprList`.
 - **Trailing `opt` parameters are skippable at the call site.** The four
@@ -1403,9 +1432,11 @@ sanitizers never reproduced it.)
   `auto_const_param` (effectively const; used by `isconst()`).
 - **`clone()` semantics differ by capture.** A non-capturing `FuncObject` clones
   to *itself* (shared
-  `shared_ptr`); a capturing one is deep-copied so each clone has independent
+  `shared_ptr`); a capturing one is deep-copied (its `capture_slots` vector
+  copied) so each clone has independent
   captured state. This is
-  the mechanism behind the counter/closure examples in the README.
+  the mechanism behind the counter/closure examples in the README. (Decided by
+  `capture_slots.empty()` in `TypeFunc::clone`.)
 - **Multiple assignment & array expansion** all funnel through `Expr14` +
   `handle_single_expr14`:
   an `IdList` lvalue with an array rvalue spreads element-wise

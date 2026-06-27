@@ -84,6 +84,7 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     , func_ctx(func_ctx)
     , frame(parent ? parent->frame : nullptr)
     , gfuncs(parent ? parent->gfuncs : nullptr)
+    , captures(parent ? parent->captures : nullptr)
     , flow((parent && !func_ctx) ? parent->flow : &flow_state)
 {
     if (!parent) {
@@ -221,6 +222,12 @@ int_type Identifier::eval_int(EvalContext *ctx) const
             return lv.getval<bool>() ? 1 : 0;
         return lv.getval<int_type>();
     }
+    if (sym.kind == SymKind::capture && ctx->captures) {
+        const LValue &lv = (*ctx->captures)[sym.slot];
+        if (lv.is<bool>())
+            return lv.getval<bool>() ? 1 : 0;
+        return lv.getval<int_type>();
+    }
     return Construct::eval_int(ctx);
 }
 
@@ -237,6 +244,14 @@ float_type Identifier::eval_float(EvalContext *ctx) const
     if (sym.kind == SymKind::global && ctx->gfuncs &&
         ctx->gfuncs->defined[sym.slot]) {
         const LValue &lv = ctx->gfuncs->slots[sym.slot];
+        if (lv.is<int_type>())
+            return static_cast<float_type>(lv.getval<int_type>());
+        if (lv.is<bool>())
+            return lv.getval<bool>() ? 1.0 : 0.0;
+        return lv.getval<float_type>();
+    }
+    if (sym.kind == SymKind::capture && ctx->captures) {
+        const LValue &lv = (*ctx->captures)[sym.slot];
         if (lv.is<int_type>())
             return static_cast<float_type>(lv.getval<int_type>());
         if (lv.is<bool>())
@@ -265,6 +280,14 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
             return EvalValue(&ctx->gfuncs->slots[sym.slot]);
 
         return UndefinedId{get_str()};
+    }
+
+    if (sym.kind == SymKind::capture && ctx->captures) {
+        /* A captured outer variable: an O(1) read of the closure's per-instance
+         * capture vector. The LValue * makes it assignable (a closure may
+         * mutate its captured-by-value copy). Always bound (filled at closure
+         * creation before the body runs). */
+        return EvalValue(&(*ctx->captures)[sym.slot]);
     }
 
     while (ctx) {
@@ -457,6 +480,14 @@ do_func_call(EvalContext *ctx,
 {
     /* func_ctx == true gives this call its own FlowState (see eval.h) */
     EvalContext args_ctx(&obj.capture_ctx, false, true);
+
+    /*
+     * A SymKind::capture reference in the body reads this closure's
+     * per-instance capture vector (an O(1) slot, no map walk). The pointer is
+     * stable for the call (the vector is fixed at closure creation and the
+     * FuncObject outlives the call); nested blocks inherit it.
+     */
+    args_ctx.captures = &obj.capture_slots;
 
     /*
      * When the function was resolved, params live in a flat slot Frame (O(1)
@@ -1815,6 +1846,58 @@ as_resolved_global(const Construct *lvalue)
     return id->sym.kind == SymKind::global ? id : nullptr;
 }
 
+/* Same, for a name resolved to a closure CAPTURE slot. */
+static inline const Identifier *
+as_resolved_capture(const Construct *lvalue)
+{
+    if (!lvalue->is_id())
+        return nullptr;
+
+    const Identifier *id = static_cast<const Identifier *>(lvalue);
+    return id->sym.kind == SymKind::capture ? id : nullptr;
+}
+
+/*
+ * Read-modify-write a resolved slot's LValue in place and return the new value.
+ * Shared by the local / global / capture assignment fast paths in
+ * handle_single_expr14. For a plain assign it overwrites; for a compound op it
+ * fast-paths int += / -= / *= directly on the slot's int (no num_bin_op PMF
+ * dispatch, no copy in/out) and falls back to apply_compound_op otherwise
+ * (div/mod keep the zero check; a non-int operand promotes correctly). The
+ * caller has already verified the slot is non-const.
+ */
+static inline EvalValue
+slot_rmw(LValue &lv, Op op, const EvalValue &rval)
+{
+    if (op == Op::assign) {
+
+        lv.put(RValue(rval));
+
+    } else {
+
+        const EvalValue r = RValue(rval);
+
+        if (lv.is<int_type>() && r.is<int_type>() &&
+            (op == Op::addeq || op == Op::subeq || op == Op::muleq)) {
+
+            int_type &v = lv.getval<int_type>();
+            const int_type n = r.get<int_type>();
+
+            if (op == Op::addeq)      v += n;
+            else if (op == Op::subeq) v -= n;
+            else                      v *= n;
+
+        } else {
+
+            EvalValue nv = lv.get();
+            apply_compound_op(nv, r, op);
+            lv.put(move(nv));
+        }
+    }
+
+    return lv.get();
+}
+
 /*
  * Fast path for `a[i] = v` / `a[i] OP= v` when `a` is a flat (unboxed) int or
  * float array: write the scalar straight into the unboxed vector, with no
@@ -2168,58 +2251,20 @@ handle_single_expr14(EvalContext *ctx,
          */
         if (const Identifier *id = as_resolved_local(lvalue)) {
 
-            Frame *f = ctx->frame;
-
-            if (f) {
+            if (Frame *f = ctx->frame) {
 
                 LValue &lv = f->slots[id->sym.slot];
 
-                if (!lv.is_const_var()) {
-
-                    if (op == Op::assign) {
-
-                        lv.put(RValue(rval));
-
-                    } else {
-
-                        const EvalValue r = RValue(rval);
-
-                        /* Direct int compound-assign (e.g. `j += i`): mutate
-                         * the slot's int in place, skipping the copy in/out and
-                         * the num_bin_op PMF dispatch. add/sub/mul can't fault;
-                         * div/mod (and any non-int operand) take the general
-                         * path, which keeps the zero check and int->float
-                         * promotion. */
-                        if (lv.is<int_type>() && r.is<int_type>() &&
-                            (op == Op::addeq || op == Op::subeq ||
-                             op == Op::muleq)) {
-
-                            int_type &v = lv.getval<int_type>();
-                            const int_type n = r.get<int_type>();
-
-                            if (op == Op::addeq)      v += n;
-                            else if (op == Op::subeq) v -= n;
-                            else                      v *= n;
-
-                        } else {
-
-                            EvalValue nv = lv.get();
-                            apply_compound_op(nv, r, op);
-                            lv.put(move(nv));
-                        }
-                    }
-
-                    return lv.get();
-                }
+                if (!lv.is_const_var())
+                    return slot_rmw(lv, op, rval);
             }
         }
 
         /*
          * Fast path: an assignment / compound-assignment to an escaped
          * top-level variable (a global-table slot). Mirrors the local slot path
-         * above: read-modify-write the slot's LValue in place. Falls through to
-         * the general path when the slot is undefined (use-before-decl -> the
-         * undefined-variable error) or const (the rebind error).
+         * above. Falls through to the general path when the slot is undefined
+         * (use-before-decl -> the undefined-variable error) or const (rebind).
          */
         if (const Identifier *id = as_resolved_global(lvalue)) {
 
@@ -2229,37 +2274,25 @@ handle_single_expr14(EvalContext *ctx,
 
                 LValue &lv = gf->slots[id->sym.slot];
 
-                if (!lv.is_const_var()) {
+                if (!lv.is_const_var())
+                    return slot_rmw(lv, op, rval);
+            }
+        }
 
-                    if (op == Op::assign) {
+        /*
+         * Fast path: an assignment / compound-assignment to a closure CAPTURE
+         * slot (e.g. a counter closure's `start++`). The write persists in the
+         * FuncObject's capture vector across calls. Falls through when the
+         * capture is const (the rebind error).
+         */
+        if (const Identifier *id = as_resolved_capture(lvalue)) {
 
-                        lv.put(RValue(rval));
+            if (ctx->captures) {
 
-                    } else {
+                LValue &lv = (*ctx->captures)[id->sym.slot];
 
-                        const EvalValue r = RValue(rval);
-
-                        if (lv.is<int_type>() && r.is<int_type>() &&
-                            (op == Op::addeq || op == Op::subeq ||
-                             op == Op::muleq)) {
-
-                            int_type &v = lv.getval<int_type>();
-                            const int_type n = r.get<int_type>();
-
-                            if (op == Op::addeq)      v += n;
-                            else if (op == Op::subeq) v -= n;
-                            else                      v *= n;
-
-                        } else {
-
-                            EvalValue nv = lv.get();
-                            apply_compound_op(nv, r, op);
-                            lv.put(move(nv));
-                        }
-                    }
-
-                    return lv.get();
-                }
+                if (!lv.is_const_var())
+                    return slot_rmw(lv, op, rval);
             }
         }
 

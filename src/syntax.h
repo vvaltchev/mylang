@@ -73,14 +73,17 @@ enum class DeclType : unsigned char {
  * `local` means the identifier was resolved to a fixed slot in the current
  * function call's Frame (see eval.h), so it's an O(1) array index instead of a
  * scope-chain map lookup. `unresolved` (the default) means "fall back to the
- * runtime EvalContext map walk" - used for everything the resolver doesn't
- * (yet) handle: top-level symbols, captures, builtins, globals.
+ * runtime EvalContext map walk" - used for the few things the resolver doesn't
+ * handle: builtins, REPL globals, and genuinely-undefined names.
  */
 enum class SymKind : unsigned char {
     unresolved,
     local,      /* slot in the CURRENT call's Frame (ctx->frame) */
-    global,     /* slot in the root "main" Frame (ctx->global_frame) - a
-                 * top-level function/symbol, reachable from any call depth */
+    global,     /* slot in the program-wide global table (ctx->gfuncs) - a
+                 * top-level function/variable, reachable from any call depth */
+    capture,    /* slot in the closure's per-instance capture vector
+                 * (ctx->captures) - a captured outer variable, snapshot at
+                 * closure creation, persists across calls to that closure */
 };
 
 struct ResolvedSym {

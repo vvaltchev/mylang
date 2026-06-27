@@ -184,6 +184,15 @@ public:
     GlobalFuncTable *gfuncs;
 
     /*
+     * The current closure's capture vector (the called FuncObject's
+     * `capture_slots`), or nullptr outside a closure body. Inherited from the
+     * parent so nested blocks/loops in the body see it; do_func_call points it
+     * at the called closure's vector. A `SymKind::capture` reference
+     * reads/writes `(*captures)[slot]` - an O(1) slot, no map walk.
+     */
+    std::vector<LValue> *captures;
+
+    /*
      * Points at the FlowState shared by every context within the current
      * function invocation. Function-boundary contexts (func_ctx) and the root
      * own their flow_state; nested blocks/loops inherit the parent's pointer.
@@ -234,6 +243,21 @@ class FuncObject {
 public:
 
     const FuncDeclStmt *const func;
+    /*
+     * Per-instance storage for captured outer variables (an explicit `[x,y]`
+     * capture list), filled once at closure creation in declaration order. A
+     * body reference to a captured name resolves to SymKind::capture + its
+     * index here, so it is an O(1) slot read - not a map walk. It lives in the
+     * FuncObject (NOT the per-call Frame) because a mutable-by-value capture
+     * must persist across calls to the same closure (e.g. a counter); each
+     * closure instance / clone owns its own vector.
+     */
+    std::vector<LValue> capture_slots;
+    /*
+     * An empty context parented to the program root - the body's args context
+     * parents to this, so the body reaches the global table (gfuncs) and the
+     * builtins map. Holds no captured values (those are in capture_slots).
+     */
     EvalContext capture_ctx;
 
     FuncObject(const FuncDeclStmt *func, EvalContext *ctx);

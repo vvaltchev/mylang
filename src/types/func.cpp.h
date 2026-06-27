@@ -69,7 +69,10 @@ EvalValue TypeFunc::clone(const EvalValue &a)
 {
     const FuncObject &func = *a.get<shared_ptr<FuncObject>>().get();
 
-    if (func.capture_ctx.empty())
+    /* A non-capturing function has no per-instance state, so clone()ing it can
+     * share the same object; a capturing one is deep-copied so each clone owns
+     * independent captured state. */
+    if (func.capture_slots.empty())
         return a;
 
     return shared_ptr<FuncObject>(make_shared<FuncObject>(func));
@@ -77,11 +80,11 @@ EvalValue TypeFunc::clone(const EvalValue &a)
 
 FuncObject::FuncObject(const FuncObject &rhs)
     : func(rhs.func)
+    , capture_slots(rhs.capture_slots)
     , capture_ctx(rhs.capture_ctx.parent,
                   rhs.capture_ctx.const_ctx,
                   rhs.capture_ctx.func_ctx)
 {
-    capture_ctx.copy_symbols_from(rhs.capture_ctx);
 }
 
 FuncObject::FuncObject(const FuncDeclStmt *func, EvalContext *ctx)
@@ -91,9 +94,13 @@ FuncObject::FuncObject(const FuncDeclStmt *func, EvalContext *ctx)
     if (!func->captures)
         return;
 
+    /* Snapshot each captured outer variable into a capture slot, in declaration
+     * order (the resolver assigns SymKind::capture indices in the same order).
+     * The value is a copy (RValue), mutable unless made in a const context. */
+    capture_slots.reserve(func->captures->elems.size());
+
     for (const auto &capture : func->captures->elems) {
-        capture_ctx.emplace(
-            capture.get(),
+        capture_slots.emplace_back(
             RValue(capture->eval(ctx)),
             ctx->const_ctx
         );
