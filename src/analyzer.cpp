@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "analyzer.h"
-#include "resolver.h"   /* resolve_names, collect_resolver_analysis */
+#include "resolver.h"     /* resolve_names, collect_resolver_analysis */
+#include "inferencer.h"   /* specialize_types (counted-for annotation) */
 
 #include <ostream>
 #include <string>
@@ -21,6 +22,7 @@ anno_code(AnnoKind k)
         case AnnoKind::inlined:     return "\033[94m";   /* blue    */
         case AnnoKind::specialized: return "\033[36m";   /* cyan    */
         case AnnoKind::folded:      return "\033[35m";   /* magenta */
+        case AnnoKind::counted_for: return "\033[32m";   /* green   */
         default:                    return "";
     }
 }
@@ -33,6 +35,11 @@ analyze_and_render(ostream &o, Construct *root, AnalysisInfo &info,
     collect_array_analysis(root, info);
     resolve_names(root, enable_inline, inline_threshold, &info, repl_mode);
     collect_resolver_analysis(root, info);
+    /* specialize_types runs last (as in run_optimizers), recording which `for`
+     * loops it rewrote to the counted ForRangeStmt form (green). It needs the
+     * th hints (collect_array_analysis) and resolved slots (resolve_names),
+     * both already done. */
+    specialize_types(root, /*enable=*/true, /*prior_scope=*/nullptr, &info);
     render_analysis(o, src, info, color);
 }
 
@@ -51,6 +58,7 @@ render_analysis(ostream &o, const std::vector<string> &src,
           << "\033[94minlined\033[0m  "
           << "\033[36mspecialized\033[0m  "
           << "\033[35mfolded call\033[0m  "
+          << "\033[32mcounted for\033[0m  "
           << DIM << "dead code" << RESET << "\n";
         o << "--------------------------\n";
     }

@@ -23,6 +23,7 @@
 #include "replhelp.h"
 #include "trace.h"
 #include "coderender.h"
+#include "analyzer.h"
 
 #include <typeinfo>
 #include <vector>
@@ -2906,6 +2907,64 @@ static const std::vector<test> tests =
                 " == \"general\");",
             "assert(make_array(0, func(i) => i) == []);",
         },
+    },
+    {
+        /*
+         * keys()/values() of a scalar dict build FLAT (unboxed) arrays, driven
+         * by the RESULT's static type - so a big keys()/values() avoids per-
+         * element boxing. The flat hint reaches a bound destination
+         * (`var k = keys(d)`, as in bench/27); a non-scalar key/value type
+         * stays general.
+         */
+        "Typed arrays: keys()/values() of a scalar dict are flat",
+        {
+            "var di = {1: 10, 2: 20, 3: 30};",
+            "var ki = keys(di); var vi = values(di);",
+            "assert(array_storage(ki) == \"ints\");",
+            "assert(array_storage(vi) == \"ints\");",
+            "assert(sum(ki) == 6); assert(sum(vi) == 60);",
+            "var df = {1: 1.5, 2: 2.5}; var vf = values(df);",
+            "assert(array_storage(vf) == \"floats\");",
+            "var ds = {\"a\": 1, \"b\": 2};",
+            "var ks = keys(ds); var vs = values(ds);",
+            "assert(array_storage(ks) == \"general\");",   /* str keys */
+            "assert(array_storage(vs) == \"ints\");",      /* int values */
+            "assert(sort(ks) == [\"a\", \"b\"]);",
+            /* empty-dict-then-fill: one compilation infers dict<int,int> */
+            "var d2 = {}; for (var i = 0; i < 4; i++) d2[i] = i*i;",
+            "var k2 = keys(d2);",
+            "assert(array_storage(k2) == \"ints\");",
+            "assert(len(k2) == 4);",
+        },
+    },
+    {
+        /*
+         * The typed (M8) dict-read fast path: d.key / d[k] used in arithmetic
+         * reads the value directly (no double-eval of the base). Present keys
+         * hit the fast path; a missing key / default dict falls back to do_eval
+         * so the vivify / throw behavior is unchanged.
+         */
+        "Typed dict reads: member & subscript fast paths",
+        {
+            "var d = {\"alpha\": 1, \"beta\": 2, \"gamma\": 3};",
+            "var s = 0;",
+            "for (var i = 0; i < 5; i++)"
+                " s += d.alpha + d.beta + d[\"gamma\"];",
+            "assert(s == 30);",                       /* (1+2+3)*5 */
+            "var di = {0: 10, 1: 20};",
+            "var t = 0;",
+            "for (var i = 0; i < 3; i++) t += di[0] + di[1];",
+            "assert(t == 90);",                       /* 30*3 */
+            "var fd = {\"x\": 1.5}; assert(fd.x + fd.x == 3.0);",
+            /* default dict in a typed-ish read still vivifies (fallback) */
+            "var dd = dict(7); var dyn a = dd[5]; var dyn b = dd[9];",
+            "assert(a == 7 && len(dd) == 2);",
+        },
+    },
+    {
+        "Typed dict read of a missing key throws",
+        { "var d = {\"a\": 1}; var x = d.a + d.b;" },
+        &typeid(KeyNotFoundEx),
     },
     {
         /* `array += array` concatenation for each flat storage kind, plus
@@ -9055,8 +9114,42 @@ static bool replhelp_unknown_and_topics()
     return has_array && has_array_storage;
 }
 
+/* -a/--analyze greens the `for` keyword of a counted (ForRangeStmt) loop, and
+ * leaves a non-counted (float-var) loop uncolored. GREEN+"for" uniquely marks
+ * the greened keyword (flat arrays are GREEN too, but never named "for"). */
+static bool analyze_greens_counted_for()
+{
+    const std::string green = "\033[32m";
+
+    auto analyze = [](const char *line) -> std::string {
+        std::vector<Tok> toks;
+        lexer(line, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        AnalysisInfo info;
+        pc.analysis = &info;
+        unique_ptr<Construct> root = pBlock(pc);
+        std::vector<std::string> src = { line };
+        std::ostringstream o;
+        analyze_and_render(o, root.get(), info, src, /*color=*/true,
+                           /*repl_mode=*/false);
+        return o.str();
+    };
+
+    const std::string counted =
+        analyze("var a = range(10); for (var i = 0; i < len(a); i++) a[i]=i;");
+    const std::string flt =
+        analyze("for (var f = 0.0; f < 3.0; f += 0.5) print(f);");
+
+    bool ok = true;
+    ok = ok && counted.find(green + "for") != std::string::npos;
+    ok = ok && flt.find(green + "for") == std::string::npos;
+    return ok;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
+    { "analyze: counted `for` is greened, float-var `for` is not",
+      analyze_greens_counted_for },
     { "repl: multi-line completeness detection", repl_incomplete_detection },
     { "replhelp: overview + builtins index", replhelp_overview_and_builtins },
     { "replhelp: builtin entries + kind note", replhelp_builtin_entries },

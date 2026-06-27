@@ -2606,10 +2606,13 @@ pAcceptForStmt(ParseContext &c,
                unique_ptr<Construct> &ret,
                unsigned fl)
 {
+    const Loc start = c.get_loc();
+
     if (!pAcceptKeyword(c, Keyword::kw_for))
         return false;
 
     unique_ptr<ForStmt> stmt(new ForStmt);
+    stmt->start = start;
     pExpectOp(c, Op::parenL);
 
     {
@@ -2632,6 +2635,7 @@ pAcceptForStmt(ParseContext &c,
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
         stmt->body = pStmt(c, fl);
 
+    stmt->end = c.get_loc();
     ret = move(stmt);
     return true;
 }

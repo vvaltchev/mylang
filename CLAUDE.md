@@ -148,20 +148,26 @@ without running; `--no-color` for plain). It is **non-strict** (analyzes code
 that a normal run would reject for a bare `dyn`). The legend: **yellow** =
 became const-like automatically (an auto-const `var` at decl + folded uses, an
 un-mutated parameter, an auto-`pure` function); **green** = a flat (unboxed)
-`array<int>`/`array<float>`; **red** = an `array<dyn>`; **blue** = an inlined
-call (expression-body or tail); **cyan** = a call redirected to a `name$sN`
-specialization clone; **magenta** = a call folded to a literal at compile time
-(pure/auto-pure/const-builtin with const args); **dim** = dead code the
-optimizer eliminated (a const-condition branch / `while (false)`). Precedence:
-call-site (blue/cyan/magenta) > array storage (green/red) > yellow; a dead range
-dims regardless. Implementation: a `Loc`-keyed `AnalysisInfo` (`analyzer.h`)
-populated by the passes only when threaded in — array colors from a non-strict
-inference pass (`collect_array_analysis`), auto-pure/param from a post-resolve
-walk (`collect_resolver_analysis`), and the mutation-time decisions (auto-const
-vars, dead code, inlined/specialized/folded) recorded *as they happen* by the
-parser (`ParseContext::analysis`), AutoConst, and the Inliner; `mylang.cpp`
-renders. Like `-s`/`--debug-ti`, it is a CLI inspection tool, not unit-tested in
-`-rt`.
+`array<int>`/`array<float>` **or** the `for` keyword of a counted loop that
+specialized to a `ForRangeStmt` (the two never collide — one lands on an
+identifier, the other on the `for` keyword); **red** = an `array<dyn>`;
+**blue** = an inlined call (expression-body or tail); **cyan** = a call
+redirected to a `name$sN` specialization clone; **magenta** = a call folded to a
+literal at compile time (pure/auto-pure/const-builtin with const args);
+**dim** = dead code the optimizer eliminated (a const-condition branch /
+`while (false)`). Precedence: call-site (blue/cyan/magenta) > array storage
+(green/red) > yellow; a dead range dims regardless. Implementation: a
+`Loc`-keyed `AnalysisInfo` (`analyzer.h`) populated by the passes only when
+threaded in — array colors from a non-strict inference pass
+(`collect_array_analysis`), auto-pure/param from a post-resolve walk
+(`collect_resolver_analysis`), the counted-`for` mark from `specialize_types`
+(it records `counted_for` for each `for` it rewrites — the analyze pipeline now
+runs it last, as `run_optimizers` does, gated on a non-null `AnalysisInfo *` so
+a normal run records nothing), and the mutation-time decisions (auto-const vars,
+dead code, inlined/specialized/folded) recorded *as they happen* by the parser
+(`ParseContext::analysis`), AutoConst, and the Inliner; `mylang.cpp` renders.
+Unlike `-s`/`--debug-ti`, the analyze rendering now has a headless `-rt` test
+(`analyze:`, via `analyze_and_render` with color on).
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
 what survived
 const-folding, and `-nc` lets you see the tree as written before folding. Reach
@@ -261,12 +267,14 @@ interactive REPL" below; `trace.cpp` is the diagnostic tracer and
   static type inference + checking** pass (see the dedicated section below).
 - `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
   `Exception`'s captured call-stack (see the error model section).
-- `analyzer.h` — header-only (no TU): the `AnalysisInfo` `Loc`-keyed annotation
-  collector + `AnnoKind` for the `-a`/`--analyze` colored optimization view. The
-  collectors live in the relevant passes (`collect_array_analysis` in
-  `inferencer.cpp`, `collect_resolver_analysis` in `resolver.cpp`, mutation-time
-  records in `parser.cpp`/`resolver.cpp`); the renderer is in `mylang.cpp` (see
-  the `-a` description under "Build & run").
+- `analyzer.h` / `analyzer.cpp` — the `AnalysisInfo` `Loc`-keyed annotation
+  collector + `AnnoKind` for the `-a`/`--analyze` colored optimization view, and
+  the shared `analyze_and_render` pipeline and `render_analysis` renderer (used
+  by both the `-a` file driver and the REPL `:analyze`). The collectors live in
+  the relevant passes (`collect_array_analysis` in `inferencer.cpp`,
+  `collect_resolver_analysis` in `resolver.cpp`, the counted-`for` mark inside
+  `specialize_types` in `inferencer.cpp`, mutation-time records in
+  `parser.cpp`/`resolver.cpp`). See the `-a` description under "Build & run".
 
 **The `.cpp.h` convention.** Files under `src/types/` and `src/builtins/` are
 named `*.cpp.h` and are
@@ -1396,6 +1404,16 @@ sanitizers never reproduced it.)
   (`TypeDict::clone`, `clone_to_mutable`, `make_const_clone`) preserve
   `has_default`/`default_val` (`dict()` stays a const builtin, so `dict(0)`
   folds — hence the clone-preservation matters).
+- **Typed (M8) dict read fast path.** When the inferencer proves `d.k` / `d[k]`
+  is a non-null int/float (a `dict<_, int>`/`<_, float>` value), the specialized
+  arithmetic calls `MemberExpr`/`Subscript::eval_int`/`eval_float`. Those read a
+  **present** key's value directly via `dict_present_value` (`eval.cpp`) — no
+  re-evaluation of the base. The OLD code fell through to `Construct::eval_int`,
+  which re-ran `do_eval` and **re-fetched the dict** (a double eval per access);
+  removing that is why `bench/25_dict_member` beats CPython. A **missing** key
+  falls back to `do_eval`, so the default-dict vivify / key-freeze /
+  `KeyNotFoundEx` behavior is byte-for-byte unchanged (only the common
+  present-key path is fast).
 
 ## Copy-on-write containers
 
@@ -1451,16 +1469,21 @@ are unchanged.
   inferencer's
   `set_array_repr_hint` (in `annotate_hints`, runs on `a = <rvalue>` decls and
   assigns) stamps an **`ArrHint`** (`syntax.h`: `dflt`/`general`/`flat_i`/
-  `flat_f`/`flat_b`) on the rvalue — on a `range()`/`array()`/`make_array()`
-  call's args
-  `ExprList`, or directly on an array literal / folded `LiteralObj`. A
+  `flat_f`/`flat_b`) on the rvalue — on a
+  `range()`/`array()`/`make_array()`/`keys()`/`values()` call's args `ExprList`,
+  or directly on an array literal / folded `LiteralObj`. A
   `dyn`-typed destination (`var dyn d = [1,2,3]`) also gets `general`, so
   declaring `dyn` builds a polymorphic array from the start (else a later
   `d[0]="x"` would wrongly hit the flat-array error on an already-`dyn` var).
   Creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f`/`flat_b`
   → flat `0`/`0.0`/`false` fill, replacing the old `array(N)` rewrite;
   `general` → general),
-  `make_array`, `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
+  `make_array`, `keys`/`values` (`dict_extract` — a scalar dict's keys/values
+  build a flat `array<int>/<float>/<bool>` straight from the dict, no
+  per-element boxing; the big win for `keys()`/`values()` of a large dict, and
+  why `bench/27_dict_keys_values` beats CPython — only the bound form
+  `var k = keys(d)` gets the hint, an inline `keys(d)` arg stays general),
+  `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
   literal bound to an `array<dyn>` dest is made general via
   `make_general_array_clone`).
   The fixpoint propagates the destination type through direct aliases

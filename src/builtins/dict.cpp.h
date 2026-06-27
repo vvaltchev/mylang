@@ -89,32 +89,74 @@ builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
     return it.second;
 }
 
+/*
+ * keys()/values(): extract the dict's keys (KEYS=true) or values into a fresh
+ * array. When the inferencer typed the result as a flat array<int>/<float>/
+ * <bool> (the ArrHint on the call site, from the destination's static type),
+ * build that UNBOXED storage directly - no per-element LValue boxing - which is
+ * what keeps keys()/values() of a large scalar dict cheap in time and memory
+ * (a flat int array is 8 bytes/element vs 48 boxed). Otherwise build a general
+ * (boxed) array. A flat hint is set only when the static element type is that
+ * scalar, so reading each key/value as int/float/bool is sound.
+ */
+template <bool KEYS>
 static EvalValue
-dict_keys(const DictObject::inner_type &data)
+dict_extract(const DictObject::inner_type &data, ArrHint hint)
 {
-    SharedArrayObj::vec_type result;
+    /* KEYS picks the pair's key, else its value (an LValue -> EvalValue). */
+    #define DICT_ELEM(e) (KEYS ? (e).first : (e).second.get())
 
-    for (auto const &e : data) {
-        result.emplace_back(e.first, false);
+    if (hint == ArrHint::flat_i) {
+        SharedArrayObj::ivec_type v;
+        v.reserve(data.size());
+        for (auto const &e : data) {
+            const EvalValue &kv = DICT_ELEM(e);
+            v.push_back(kv.get<int_type>());
+        }
+        return SharedArrayObj(move(v));
+    }
+    if (hint == ArrHint::flat_f) {
+        SharedArrayObj::fvec_type v;
+        v.reserve(data.size());
+        for (auto const &e : data) {
+            const EvalValue &kv = DICT_ELEM(e);
+            v.push_back(kv.get<float_type>());
+        }
+        return SharedArrayObj(move(v));
+    }
+    if (hint == ArrHint::flat_b) {
+        SharedArrayObj::bvec_type v;
+        v.reserve(data.size());
+        for (auto const &e : data) {
+            const EvalValue &kv = DICT_ELEM(e);
+            v.push_back(kv.get<bool>() ? 1 : 0);
+        }
+        return SharedArrayObj(move(v));
     }
 
+    SharedArrayObj::vec_type result;
+    result.reserve(data.size());
+    for (auto const &e : data)
+        result.emplace_back(DICT_ELEM(e), false);
     return SharedArrayObj(move(result));
+
+    #undef DICT_ELEM
 }
 
 static EvalValue
-dict_values(const DictObject::inner_type &data)
+dict_keys(const DictObject::inner_type &data, ArrHint hint)
 {
-    SharedArrayObj::vec_type result;
-
-    for (auto const &e : data) {
-        result.emplace_back(e.second.get(), false);
-    }
-
-    return SharedArrayObj(move(result));
+    return dict_extract<true>(data, hint);
 }
 
 static EvalValue
-dict_kvpairs(const DictObject::inner_type &data)
+dict_values(const DictObject::inner_type &data, ArrHint hint)
+{
+    return dict_extract<false>(data, hint);
+}
+
+static EvalValue
+dict_kvpairs(const DictObject::inner_type &data, ArrHint /*hint*/)
 {
     SharedArrayObj::vec_type result;
 
@@ -132,7 +174,7 @@ dict_kvpairs(const DictObject::inner_type &data)
 static EvalValue
 dict_1arg_func(EvalContext *ctx,
                ExprList *exprList,
-               EvalValue (*f)(const DictObject::inner_type &))
+               EvalValue (*f)(const DictObject::inner_type &, ArrHint))
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
@@ -146,7 +188,9 @@ dict_1arg_func(EvalContext *ctx,
     const DictObject::inner_type &data
         = val0.get<intrusive_ptr<DictObject>>()->get_ref();
 
-    return f(data);
+    /* arr_hint is the type-driven flat-storage hint the inferencer stamped on
+     * this call when the result's destination is a flat array (keys/values). */
+    return f(data, exprList->arr_hint);
 }
 
 EvalValue
