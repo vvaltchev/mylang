@@ -109,7 +109,6 @@ struct FuncState {
     int next_slot = 0;
     std::vector<Scope> scopes;
     std::vector<int> writes;        /* per slot -> fd->slot_writes */
-    std::unordered_set<const UniqueId *> captures;   /* capture names */
 };
 
 /*
@@ -1154,25 +1153,20 @@ private:
         }
 
         /*
-         * A captured name (an explicit capture-list entry) resolves through the
-         * closure's capture_ctx at runtime, NOT to a global - so it must take
-         * precedence over a same-named global function. Leave it unresolved.
+         * Not a local/param/capture of this function (captures resolve in the
+         * scope loop above, so they already took precedence over a same-named
+         * global). A top-level function (hoisted before pass 1) resolves to its
+         * GLOBAL slot (reached via the global table from any call depth), not a
+         * map walk. Escaped vars aren't in the table yet during pass 1 - they
+         * are stamped post-pass-2 via escaped_refs.
          */
-        const bool is_capture = cur->captures.count(id->uid) != 0;
-
-        /* A top-level function (hoisted before pass 1): resolve to its GLOBAL
-         * slot (reached via the global table from any call depth), not a map
-         * walk. Escaped vars aren't in the table yet during pass 1 - they are
-         * stamped post-pass-2 via escaped_refs. */
-        if (!is_capture) {
-            auto git = global_func_slots.find(id->uid);
-            if (git != global_func_slots.end()) {
-                id->sym = ResolvedSym{ SymKind::global, git->second };
-                return;
-            }
+        auto git = global_func_slots.find(id->uid);
+        if (git != global_func_slots.end()) {
+            id->sym = ResolvedSym{ SymKind::global, git->second };
+            return;
         }
 
-        if (!cur->is_main && !is_capture) {
+        if (!cur->is_main) {
             escaped.insert(id->uid);
             /* record the use site: if `id` turns out to be a top-level var, it
              * is stamped SymKind::global after the top-level pass assigns its
@@ -1498,18 +1492,27 @@ Resolver::process_function(FuncDeclStmt *fd)
     FuncState st;
     st.fd = fd;
 
-    /* Capture names are bound via capture_ctx (the map), not slotted; a body
-     * reference to one is not a "free global" - exclude them from `escaped`. */
-    if (fd->captures) {
-        for (auto &cap : fd->captures->elems)
-            st.captures.insert(cap->uid);
-    }
-
     const int nparams =
         fd->params ? static_cast<int>(fd->params->elems.size()) : 0;
     st.slottable = nparams <= MAX_SLOTS;
 
     if (st.slottable) {
+
+        /*
+         * Capture scope (outermost, so a param shadows a same-named capture). A
+         * captured name resolves to SymKind::capture + its index into the
+         * closure's per-instance capture_slots vector - an O(1) slot, not a map
+         * walk. Indices match declaration order, which the FuncObject ctor
+         * fills in the same order. Captures have their OWN index space
+         * (0..C-1), independent of the frame's next_slot.
+         */
+        if (fd->captures) {
+            st.scopes.emplace_back();
+            int ci = 0;
+            for (auto &cap : fd->captures->elems)
+                st.scopes.back().decls.push_back(
+                    { cap->uid, ci++, SymKind::capture, DeclType::none });
+        }
 
         st.scopes.emplace_back();   /* the function's outermost (param) scope */
 

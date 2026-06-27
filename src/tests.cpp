@@ -2255,6 +2255,68 @@ static const std::vector<test> tests =
             "assert(c() == 2);",
         },
     },
+    {
+        /*
+         * Capture slotting: a captured outer variable resolves to SymKind::
+         * capture (an O(1) slot in the closure's per-instance vector, no map
+         * walk). The mutable-by-value capture persists across calls, and each
+         * closure instance owns independent captured state.
+         */
+        "capture slotting: per-instance state + independence",
+        {
+            "func mk(start) => func [start] { start++; return start; };",
+            "var c = mk(0);",
+            "assert(c() == 1); assert(c() == 2); assert(c() == 3);",
+            "var c2 = mk(100);",
+            "assert(c2() == 101);",      /* c2 independent of c */
+            "assert(c() == 4);",         /* c kept its own state */
+            "assert(c2() == 102);",
+        },
+    },
+    {
+        /* A capture shadows a same-named global inside the closure body. */
+        "capture slotting: a capture shadows a global",
+        {
+            "var x = 999;",
+            "func reader() { return x; }",   /* x is an escaped global */
+            "func capt() { var x = 7; return func [x] () => x; }",
+            "var f = capt();",
+            "assert(f() == 7);",             /* the capture, not the global */
+            "assert(reader() == 999);",      /* global untouched */
+            "assert(x == 999);",
+        },
+    },
+    {
+        /* Nested capture chain: an inner closure captures from the middle
+         * closure (one of those is itself a capture in the middle). */
+        "capture slotting: nested capture chain",
+        {
+            "func outer(a) {",
+            "   return func [a] (b) {",
+            "      return func [a, b] () => a + b;",
+            "   };",
+            "}",
+            "var inner = outer(10)(5);",
+            "assert(inner() == 15);",
+            "var inner2 = outer(1)(2);",     /* independent instances */
+            "assert(inner2() == 3);",
+            "assert(inner() == 15);",
+        },
+    },
+    {
+        /* clone() of a capturing closure gives independent captured state; a
+         * non-capturing function clones to itself (shared). */
+        "capture slotting: clone() independence",
+        {
+            "func mk(n) => func [n] { n += 1; return n; };",
+            "var a = mk(0);",
+            "assert(a() == 1);",
+            "var b = clone(a);",             /* independent copy */
+            "assert(b() == 2);",             /* b continues from a's state */
+            "assert(a() == 2);",             /* a unaffected by b */
+            "assert(b() == 3);",
+        },
+    },
     { "calling a function with too many args is rejected",
       { "func f(a) { return a; } var k=1; f(k, 2);" },
       &typeid(WrongArgCountEx) },
