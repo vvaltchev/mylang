@@ -486,45 +486,50 @@ std::string sty_to_string(STyRef t)
 {
     t = sty_resolve(t);
 
-    std::string s;
-    if (t->opt && t->kind != STyKind::None)
-        s = "opt ";
+    /* Nullability renders as a `?` SUFFIX (Kotlin/Swift style): `int?`, `dyn?`,
+     * `array<int>?`, `array<int?>` - the `?` binds to the type it follows, so
+     * it composes at every level. */
+    const std::string q = (t->opt && t->kind != STyKind::None) ? "?" : "";
 
     switch (t->kind) {
 
-        case STyKind::Unknown:   return s + "?";
+        case STyKind::Unknown:   return "?";
         case STyKind::None:      return "none";
-        case STyKind::Bool:      return s + "bool";
-        case STyKind::Int:       return s + "int";
-        case STyKind::Float:     return s + "float";
-        case STyKind::Str:       return s + "str";
-        case STyKind::Exception: return s + "exception";
-        case STyKind::Dyn:       return s + "dyn";   /* `dyn` / `opt dyn` */
+        case STyKind::Bool:      return "bool" + q;
+        case STyKind::Int:       return "int" + q;
+        case STyKind::Float:     return "float" + q;
+        case STyKind::Str:       return "str" + q;
+        case STyKind::Exception: return "exception" + q;
+        case STyKind::Dyn:       return "dyn" + q;   /* `dyn` / `dyn?` */
 
         case STyKind::Array:
-            return s + "array<" + sty_to_string(t->elem) + ">";
+            return "array<" + sty_to_string(t->elem) + ">" + q;
 
         case STyKind::Dict:
-            return s + "dict<" + sty_to_string(t->key) + "," +
-                   sty_to_string(t->val) + ">";
+            return "dict<" + sty_to_string(t->key) + "," +
+                   sty_to_string(t->val) + ">" + q;
 
         case STyKind::Func: {
-            std::string r = s + "func(";
+            std::string r = "func(";
             for (size_t i = 0; i < t->params.size(); i++) {
                 if (i)
                     r += ",";
-                if (i < t->param_opt.size() && t->param_opt[i])
-                    r += "opt ";
-                r += sty_to_string(t->params[i]);
+                std::string p = sty_to_string(t->params[i]);
+                /* mark an opt param with `?` (unless the param type already
+                 * carries it, to avoid `str??`) */
+                if (i < t->param_opt.size() && t->param_opt[i] &&
+                    (p.empty() || p.back() != '?'))
+                    p += "?";
+                r += p;
             }
             r += ")->" + sty_to_string(t->ret);
-            return r;
+            return r + q;
         }
 
         case STyKind::Struct:
-            return s + (t->struct_name ? std::string(t->struct_name->val)
-                                       : "struct");
+            return (t->struct_name ? std::string(t->struct_name->val)
+                                   : std::string("struct")) + q;
     }
 
-    return s;
+    return q;
 }

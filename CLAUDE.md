@@ -954,14 +954,15 @@ decisions behind it: `plans/type-inference.md`,
   `builtin_result` types `decltype(...)` as `str`, and `fold_decltype` (run in
   the **check pass**, where types are final) validates the single argument is an
   identifier resolved in scope (else `TypeMismatchEx`/`WrongArgCountEx`) and
-  **replaces `args->elems[0]` with a `LiteralStr` of `sty_to_string(its type)`**.
-  At runtime the builtin just returns that string literal (under `-nti`, where
+  **replaces `args->elems[0]` with a `LiteralStr` of the type string**
+  (`sty_to_string`). At runtime the builtin returns that literal (under `-nti`,
   nothing folds, it falls back to the value's runtime type, like `type()`). So
-  `int? a` → `"opt int"`, `dyn? d` → `"opt dyn"`, an inferred `var a=[1,2,3]` →
+  `int? a` → `"int?"`, `dyn? d` → `"dyn?"`, an inferred `var a=[1,2,3]` →
   `"array<int>"`, a struct var → its name. This is the static counterpart to
   `type()`/`typeof()` (which inspect a *value*, so a nullable var holding none
   reads `"none"`); decltype is about the *identifier*. The string format matches
-  `:type` and error messages (`"opt int"`, not `"int?"`). The arg-slot rewrite
+  `:type` and error messages (nullability is a `?` suffix - `int?`, `dyn?`,
+  `array<int?>` - see `sty_to_string`). The arg-slot rewrite
   (not a whole-node replacement) avoids needing a slot-based walk in the
   inferencer, since `args->elems` is a direct vector.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token

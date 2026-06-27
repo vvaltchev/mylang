@@ -7124,15 +7124,15 @@ static const std::vector<test> tests =
     /* decltype(var): the static (declared or inferred) type of a VARIABLE */
     { "decltype: annotated scalar and opt",
       { "int x = 5; assert(decltype(x) == \"int\");",
-        "int? a; assert(decltype(a) == \"opt int\");",
-        "dyn? d; assert(decltype(d) == \"opt dyn\");" } },
+        "int? a; assert(decltype(a) == \"int?\");",
+        "dyn? d; assert(decltype(d) == \"dyn?\");" } },
     { "decltype: inferred container types",
       { "var a = [1, 2, 3]; assert(decltype(a) == \"array<int>\");",
         "var m = {\"k\": 1}; assert(decltype(m) == \"dict<str,int>\");" } },
     { "decltype: a struct variable",
       { "struct P { int x; } P p = P(1); assert(decltype(p) == \"P\");" } },
     { "decltype: type() stays the runtime value type",
-      { "int? a; assert(decltype(a) == \"opt int\");",
+      { "int? a; assert(decltype(a) == \"int?\");",
         "assert(type(a) == \"none\");" } },
     { "decltype reject: a non-identifier argument",
       { "var z = decltype(5);" }, &typeid(TypeMismatchEx) },
@@ -8573,14 +8573,21 @@ static bool stype_to_string_basic()
     STyArena a;
 
     if (sty_to_string(a.int_ty()) != "int")                       return false;
-    if (sty_to_string(a.int_ty(true)) != "opt int")              return false;
+    if (sty_to_string(a.int_ty(true)) != "int?")                 return false;
     if (sty_to_string(a.array_of(a.str_ty())) != "array<str>")   return false;
     if (sty_to_string(a.none_ty()) != "none")                    return false;
     if (sty_to_string(a.dyn_ty()) != "dyn")                      return false;
+    if (sty_to_string(a.with_opt(a.dyn_ty(), true)) != "dyn?")   return false;
+
+    /* `?` is a suffix that composes at every level */
+    if (sty_to_string(a.array_of(a.int_ty(true))) != "array<int?>")
+        return false;
+    if (sty_to_string(a.array_of(a.int_ty(), true)) != "array<int>?")
+        return false;
 
     STyRef fn = a.func_of({ a.int_ty(), a.str_ty() },
                           { false, true }, a.float_ty());
-    if (sty_to_string(fn) != "func(int,opt str)->float")         return false;
+    if (sty_to_string(fn) != "func(int,str?)->float")            return false;
     return true;
 }
 
@@ -8790,7 +8797,7 @@ static const std::vector<repl_test> repl_tests =
 
     { "decltype reports a variable's static type across inputs",
       { { "int? a;", "" },
-        { "decltype(a)", "=> \"opt int\"" },
+        { "decltype(a)", "=> \"int?\"" },
         { "type(a)", "=> \"none\"" },
         { "var b = [1, 2, 3]", "" },
         { "decltype(b)", "=> \"array<int>\"" } } },

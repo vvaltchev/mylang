@@ -1703,7 +1703,7 @@ source). Scalars and strings are returned unchanged.
 Return the name of the type of the given **value** in string-form (e.g. `"int"`,
 `"bool"`, `"str"`, `"arr"`). This is the value's *runtime* type, so a nullable
 variable that currently holds `none` reads as `"none"`. For the *declared/static*
-type of a **variable** (e.g. `"opt int"` for an `int? a` that is none), use
+type of a **variable** (e.g. `"int?"` for an `int? a` that is none), use
 [`decltype(var)`](#decltypevariable). Useful for debugging.
 
 #### `hash(value)`
@@ -2138,17 +2138,19 @@ string, resolved at compile time. Unlike [`type()`](#typevalue) and
 its real type:
 
 ```C#
-int? a;     decltype(a)  # "opt int"   (type(a) would be "none")
-dyn? d;     decltype(d)  # "opt dyn"
+int? a;     decltype(a)  # "int?"   (type(a) would be "none")
+dyn? d;     decltype(d)  # "dyn?"
 int  x = 5; decltype(x)  # "int"
 var a = [1, 2, 3];   decltype(a)  # "array<int>"   (inferred)
 var m = {"k": 1};    decltype(m)  # "dict<str,int>"
 struct P { int x; } P p = P(1); decltype(p)  # "P"
 ```
 
-The argument **must be a variable in scope** — a literal, an expression, or an
-unknown name is a compile error. (The format matches the REPL's `:type` and the
-compiler's error messages — `"opt int"`, not `"int?"`.)
+Nullability renders as a **`?` suffix** (Kotlin/Swift style), composing at every
+level: `int?`, `dyn?`, `array<int?>` (a list of nullable ints), `array<int>?`
+(a nullable list). The argument **must be a variable in scope** — a literal, an
+expression, or an unknown name is a compile error. (The format matches the
+REPL's `:type` and the compiler's error messages.)
 
 #### `signature(f)`
 Return a function's declared signature as a string, e.g.
