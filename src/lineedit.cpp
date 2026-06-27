@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstring>
 #include <climits>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -394,6 +395,25 @@ int fuzzy_score(const string &ql, const string &cand)
     return score;
 }
 
+std::vector<int> fuzzy_match_positions(const string &ql, const string &cand)
+{
+    std::vector<int> pos;
+    if (ql.empty())
+        return pos;
+
+    size_t qi = 0;
+    for (size_t j = 0; j < cand.size() && qi < ql.size(); j++)
+        if (static_cast<char>(tolower(static_cast<unsigned char>(cand[j])))
+                == ql[qi]) {
+            pos.push_back(static_cast<int>(j));
+            qi++;
+        }
+
+    if (qi < ql.size())
+        pos.clear();                       /* not a full match */
+    return pos;
+}
+
 void HistorySearch::recompute()
 {
     res.clear();
@@ -570,6 +590,23 @@ bool byte_ready(int ms)
     tv.tv_usec = (ms % 1000) * 1000;
     return select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0;
 }
+
+/* Does the locale look like UTF-8? Decides whether the search pane draws its
+ * border with rounded box-drawing glyphs or a pure-ASCII fallback (+-|). */
+bool unicode_ok()
+{
+    for (const char *v : { "LC_ALL", "LC_CTYPE", "LANG" }) {
+        const char *s = getenv(v);
+        if (s && *s) {
+            string val(s);
+            for (char &c : val)
+                c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            return val.find("utf-8") != string::npos ||
+                   val.find("utf8") != string::npos;
+        }
+    }
+    return false;
+}
 #endif /* !_WIN32 */
 
 /*
@@ -721,10 +758,10 @@ read_line(const string &prompt, const string &cont_prompt,
         term_size(trows, tcols);
         const int input_rows = static_cast<int>(line_count(ed.buffer()));
         int pane_rows = trows / 3;
-        if (pane_rows < 2) pane_rows = 2;
-        const int room = trows - input_rows - 1;       /* keep input visible */
-        if (room >= 2 && pane_rows > room) pane_rows = room;
-        if (pane_rows < 2) pane_rows = 2;
+        if (pane_rows < 3) pane_rows = 3;             /* top + 1 row + bottom */
+        const int room = trows - input_rows - 1;      /* keep input visible */
+        if (room >= 3 && pane_rows > room) pane_rows = room;
+        if (pane_rows < 3) pane_rows = 3;
 
         /* Move below the input and reserve pane_rows lines. Printing newlines
          * then moving back up is scroll-safe: if the terminal scrolls, the
@@ -734,61 +771,125 @@ read_line(const string &prompt, const string &cont_prompt,
             const int down = (input_rows - 1) - prev_cursor_row;
             if (down > 0) o += "\033[" + std::to_string(down) + "B";
             o += "\r\n";
-            if (pane_rows > 1)
-                o += string(pane_rows - 1, '\n') +
-                     "\033[" + std::to_string(pane_rows - 1) + "A";
+            o += string(pane_rows - 1, '\n') +
+                 "\033[" + std::to_string(pane_rows - 1) + "A";
             wr(o);
         }
 
-        const char *const label = "(search) ";
-        const int label_len = 9;
+        /* Box-drawing glyphs (rounded), as explicit UTF-8 bytes so the source
+         * stays pure ASCII; an ASCII fallback (+ - |) when the locale is not
+         * UTF-8. Each glyph is one display column. */
+        const bool color = highlight != nullptr;
+        const bool uni = unicode_ok();
+        const char *const TL = uni ? "\xe2\x95\xad" : "+"; /* U+256D */
+        const char *const TR = uni ? "\xe2\x95\xae" : "+"; /* U+256E */
+        const char *const BL = uni ? "\xe2\x95\xb0" : "+"; /* U+2570 */
+        const char *const BR = uni ? "\xe2\x95\xaf" : "+"; /* U+256F */
+        const char *const HZ = uni ? "\xe2\x94\x80" : "-"; /* U+2500 */
+        const char *const VT = uni ? "\xe2\x94\x82" : "|"; /* U+2502 */
+        const char *const MARK = uni ? "\xe2\x9d\xaf " : "> "; /* U+276F */
+
+        auto hrule = [&](int n) {
+            string s;
+            for (int i = 0; i < n; i++) s += HZ;
+            return s;
+        };
+
         int win_top = 0;
+        int cursor_col = 0;                  /* set by draw; the cursor slot */
 
         auto draw = [&]() {
             const std::vector<HistorySearch::Match> &ms = hs.matches();
             const int sel = static_cast<int>(hs.selected());
-            const int visible = pane_rows - 1;
+            const int visible = pane_rows - 2;        /* minus 2 borders */
+            int inner = tcols - 4;                    /* "VT _ <cell> _ VT" */
+            if (inner < 1) inner = 1;
 
-            if (sel < win_top) win_top = sel;                  /* scroll win */
+            if (sel < win_top) win_top = sel;
             if (sel >= win_top + visible) win_top = sel - visible + 1;
             if (win_top < 0) win_top = 0;
 
-            string o = "\r\033[2K";                           /* search box */
-            string box = string(label) + hs.query();
-            if (static_cast<int>(box.size()) > tcols)
-                box = box.substr(0, tcols);
-            o += box;
+            string ql = hs.query();
+            for (char &c : ql)
+                c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 
-            for (int k = 0; k < visible; k++) {               /* result rows */
-                o += "\r\n\033[2K";
-                if (ms.empty()) {
-                    if (k == 0)
-                        o += highlight ? "\033[90m(no matches)\033[0m"
-                                       : "(no matches)";
-                    continue;
+            string o = "\r";
+
+            /* top border: corner + " search: <q> " fill " <n matches> " end */
+            {
+                string count = std::to_string(ms.size()) +
+                               (ms.size() == 1 ? " match" : " matches");
+                int qlen = static_cast<int>(hs.query().size());
+                const int clen = static_cast<int>(count.size());
+                bool show_count = true;
+                int fill = tcols - 16 - qlen - clen;
+                if (fill < 1) { show_count = false; fill = tcols - 14 - qlen; }
+                if (fill < 1) {                       /* truncate the query */
+                    qlen = std::max(0, qlen + fill - 1);
+                    fill = 1;
                 }
-                const int idx = win_top + k;
-                if (idx >= static_cast<int>(ms.size()))
-                    continue;
-                const bool is_sel = (idx == sel);
-                string line = (is_sel ? "> " : "  ") + ms[idx].display;
-                if (static_cast<int>(line.size()) > tcols)
-                    line = line.substr(0, tcols);
-                if (is_sel && highlight) {                   /* highlight bar */
-                    if (static_cast<int>(line.size()) < tcols)
-                        line += string(tcols - line.size(), ' ');
-                    o += "\033[7m" + line + "\033[0m";
-                } else {
-                    o += line;
-                }
+                o += string(TL) + HZ + " search: " +
+                     hs.query().substr(0, qlen) + " " + hrule(fill);
+                if (show_count) { o += " "; o += count; o += " "; }
+                o += HZ; o += TR;
+                cursor_col = 11 + qlen;               /* just after the query */
+                if (cursor_col >= tcols) cursor_col = tcols - 1;
             }
 
-            if (pane_rows > 1)                                 /* back to box */
-                o += "\033[" + std::to_string(pane_rows - 1) + "A";
-            o += "\r";
-            int curcol = label_len + static_cast<int>(hs.query().size());
-            if (curcol >= tcols) curcol = tcols - 1;
-            if (curcol > 0) o += "\033[" + std::to_string(curcol) + "C";
+            /* result rows, best-first, the selected one a reverse-video bar
+             * with the matched query letters bolded */
+            for (int k = 0; k < visible; k++) {
+                o += "\r\n";
+                string cell;
+
+                const int idx = win_top + k;
+                if (ms.empty() && k == 0) {
+
+                    string t = "(no matches)";
+                    if (static_cast<int>(t.size()) > inner)
+                        t = t.substr(0, inner);
+                    if (color) cell += "\033[90m";
+                    cell += t;
+                    if (color) cell += "\033[0m";
+                    cell += string(inner - static_cast<int>(t.size()), ' ');
+
+                } else if (!ms.empty() && idx < static_cast<int>(ms.size())) {
+
+                    const bool is_sel = (idx == sel);
+                    string body = ms[idx].display;
+                    const int bodyw = inner - 2;      /* minus the 2-col mark */
+                    if (static_cast<int>(body.size()) > bodyw && bodyw >= 0)
+                        body = body.substr(0, bodyw);
+
+                    const std::vector<int> hl = fuzzy_match_positions(ql, body);
+
+                    if (is_sel && color) cell += "\033[7m";
+                    cell += is_sel ? MARK : "  ";
+                    size_t hp = 0;
+                    for (int i = 0; i < static_cast<int>(body.size()); i++) {
+                        const bool m = hp < hl.size() && hl[hp] == i;
+                        if (m) { hp++; if (color) cell += "\033[1m"; }
+                        cell += body[i];
+                        if (m && color) cell += "\033[22m";
+                    }
+                    const int used = 2 + static_cast<int>(body.size());
+                    if (used < inner) cell += string(inner - used, ' ');
+                    if (is_sel && color) cell += "\033[0m";
+
+                } else {
+                    cell = string(inner, ' ');        /* an empty row */
+                }
+
+                o += string(VT) + " " + cell + " " + VT;
+            }
+
+            /* bottom border */
+            o += "\r\n";
+            o += string(BL) + hrule(tcols - 2) + BR;
+
+            /* back to the top row, cursor into the query slot */
+            o += "\033[" + std::to_string(pane_rows - 1) + "A\r";
+            if (cursor_col > 0) o += "\033[" + std::to_string(cursor_col) + "C";
             wr(o);
         };
 

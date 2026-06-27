@@ -2082,16 +2082,23 @@ behind a thin terminal shell:
     boundary/camelCase hits, and a length tie-break; `INT_MIN` == no match; an
     empty query matches all with score 0, ordered by **recency** (a `stable_sort`
     over the newest-first de-duplicated list). `read_line` intercepts the raw
-    `Ctrl-R` byte (the editor never sees it) and renders a **pane ~⅓ the screen
-    high** below the input: a search box on top, then the live result rows
-    best-first with the selected one in a reverse-video bar; a lone `Esc`
-    (distinguished from an arrow burst via a `byte_ready` select-timeout)
-    cancels. Geometry is scroll-safe (reserve lines by printing newlines then
-    moving back up; `term_size` via `TIOCGWINSZ`); on exit the pane is erased and
-    the cursor returns to the input's first row. **Enter LOADS** the selected
-    command into the editor (it is not auto-run). The scorer + state machine are
-    headless-tested (`histsearch:`); the pane rendering is in `read_line`
-    (untested TTY shell, verified over a pty).
+    `Ctrl-R` byte (the editor never sees it) and renders a **bordered pane ~⅓
+    the screen high** below the input: a rounded box whose **top edge is the
+    search box** (`search: <query>` + an `N matches` count), over the live
+    result rows best-first, the selected one a full-width reverse-video bar and
+    the **matched query letters bolded** in every row (`fuzzy_match_positions`,
+    the same greedy scan as `fuzzy_score`). The border is rounded UTF-8
+    box-drawing when the locale is UTF-8 (`unicode_ok`), an ASCII fallback
+    (`+ - |`) otherwise — emitted as explicit UTF-8 *byte escapes* so the source
+    stays pure ASCII; each glyph is one display column, so the row-width math is
+    in columns, not bytes. A lone `Esc` (distinguished from an arrow burst via a
+    `byte_ready` select-timeout) cancels. Geometry is scroll-safe (reserve lines
+    by printing newlines then moving back up; `term_size` via `TIOCGWINSZ`); on
+    exit the pane is erased and the cursor returns to the input's first row.
+    **Enter LOADS** the selected command into the editor (it is not auto-run).
+    The scorer, match-position, and state machine are headless-tested
+    (`histsearch:`); the pane rendering is in `read_line` (untested TTY shell,
+    verified over a pty).
 - **`highlight.{h,cpp}`** — `highlight_line`, a self-contained scanner (NOT the
   lexer; tolerates mid-edit input) that wraps keywords/strings/numbers/comments/
   type-words in ANSI color, preserving the bytes exactly otherwise.

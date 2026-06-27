@@ -152,6 +152,15 @@ size_t line_count(const std::string &s);
 int fuzzy_score(const std::string &query_lc, const std::string &cand);
 
 /*
+ * The indices in `cand` that `query_lc` (already lowercased) matches, using the
+ * same greedy left-to-right subsequence scan as fuzzy_score - so a renderer can
+ * highlight exactly the matched letters. Empty if the query is empty or does
+ * not match. Exposed for the headless tests.
+ */
+std::vector<int> fuzzy_match_positions(const std::string &query_lc,
+                                       const std::string &cand);
+
+/*
  * The interactive reverse history search (Ctrl-R): a PURE state machine over a
  * history list, the search analogue of LineEditor. As the query changes it
  * recomputes the matching (de-duplicated) entries ranked best-first

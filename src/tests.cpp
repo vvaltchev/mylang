@@ -9234,6 +9234,19 @@ static bool histsearch_backspace_and_cancel()
     return hs.feed(7) == HistorySearch::Action::cancel;   /* Ctrl-G */
 }
 
+/* The match-position helper marks exactly the (greedy) matched letters, so the
+ * renderer can highlight them. */
+static bool histsearch_match_positions()
+{
+    std::vector<int> p = fuzzy_match_positions("ap", "apricot");
+    if (p.size() != 2 || p[0] != 0 || p[1] != 1) return false;
+    std::vector<int> q = fuzzy_match_positions("ap", "map");   /* a@1, p@2 */
+    if (q.size() != 2 || q[0] != 1 || q[1] != 2) return false;
+    if (!fuzzy_match_positions("", "anything").empty()) return false;
+    if (!fuzzy_match_positions("zz", "abc").empty()) return false;
+    return true;
+}
+
 /* Duplicate history entries collapse to one (the most recent occurrence). */
 static bool histsearch_dedup()
 {
@@ -9616,6 +9629,8 @@ static const std::vector<extra_check> extra_checks =
       histsearch_updown_and_accept },
     { "histsearch: Backspace edits the query, Ctrl-G cancels",
       histsearch_backspace_and_cancel },
+    { "histsearch: match positions mark the highlighted letters",
+      histsearch_match_positions },
     { "histsearch: duplicate history entries collapse to one",
       histsearch_dedup },
     { "highlight: inserts color escapes", highlight_inserts_color },

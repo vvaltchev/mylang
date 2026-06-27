@@ -152,10 +152,12 @@ builtins, your own globals, and a struct value's fields (`p.<Tab>`). It also
 shows a **PowerShell-style inline suggestion** — as you type, the most recent
 matching history entry appears in dim gray after the cursor; press **Right
 arrow** (or `Ctrl-F`) at the end of the line to accept it. **`Ctrl-R`** opens a
-**reverse history search**: a pane (about a third of the screen) with a search
-box above a live, best-match-first result list; type to filter, **Up/Down** to
-select (the top match is highlighted by default), **Enter** to load the chosen
-command onto the prompt (`Esc`/`Ctrl-G` cancel). A `none` result (a definition,
+**reverse history search**: a bordered pane (about a third of the screen) whose
+top edge is the search box, over a live, best-match-first result list with the
+matched letters highlighted in each row; type to filter, **Up/Down** to select
+(the top match is highlighted by default), **Enter** to load the chosen command
+onto the prompt (`Esc`/`Ctrl-G` cancel). The box uses rounded UTF-8 borders when
+the locale supports it, ASCII otherwise. A `none` result (a definition,
 a `print`, an `if`) is not echoed, to keep things quiet.
 
 Meta-commands start with `:`. They turn the REPL into a tool for learning and
