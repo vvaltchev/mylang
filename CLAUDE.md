@@ -223,7 +223,7 @@ same line.
 **Only `src/*.cpp` are compiled** (the Makefile globs them) — eighteen
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
-`eval.cpp`, `types.cpp`, `stype.cpp`, `trace.cpp`, `coderender.cpp`,
+`eval.cpp`, `types.cpp`, `statictype.cpp`, `trace.cpp`, `coderender.cpp`,
 `backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
 `repl.cpp`, `mylang.cpp`, `tests.cpp` (the last six are the REPL — see "The
 interactive REPL" below; `trace.cpp` is the diagnostic tracer and
@@ -266,7 +266,8 @@ interactive REPL" below; `trace.cpp` is the diagnostic tracer and
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
-- `stype.cpp` / `stype.h` — the **static-type lattice** for type inference
+- `statictype.cpp` / `statictype.h` — the **static-type lattice** for type
+  inference
   (`StaticType`/`StaticTypeArena`:
   `resolve`/`unify`/`assignable`/`join`/`equal`/
   `to_string`). Distinct from the runtime `Type *` ops table — this is what the
@@ -800,7 +801,8 @@ variable, parameter, and function return a fixed static type and **rejects type
 violations before the program runs**. Gated by `-nti` (default ON; also runs
 under `-nr`, since type-checking is validation). It runs *after* parsing but
 *before* `resolve_names`, on the clean tree (not the inlined one), and stores
-nothing on the AST — it owns an `StaticTypeArena` (`stype.h`) and side tables,
+nothing on the AST — it owns an `StaticTypeArena` (`statictype.h`) and side
+tables,
 so it
 leaves the tree untouched for the later passes (the one exception is the
 named-argument desugaring below, a deliberate lowering). Full design + the
@@ -851,7 +853,7 @@ decisions behind it: `plans/type-inference.md`,
   byte-identically wherever it is lowered. (`intern_msg`, the stable-message
   helper the compile errors need, is likewise shared from `errors.h`.)
 
-- **Static types** are `StaticType` (`stype.h`), distinct from the runtime
+- **Static types** are `StaticType` (`statictype.h`), distinct from the runtime
   `Type *`:
   `None` (the only-none / not-yet-pinned unit), `Bool`, `Int`, `Float`, `Str`,
   `Array<elem>`, `Dict<k,v>`, `Func(params)->ret`, `Exception`, `Dyn` (explicit
@@ -1987,7 +1989,7 @@ but the per-element `StructObject` allocation is gone (build overhead
   coerces a numeric field and **runtime-validates** each field's type (guarding
   a `dyn`-laundered value; the `dynarray`-style escape hatch is just declaring
   the field `dyn`). `type_of(Point(..))` is `StaticTypeKind::Struct`
-  (`stype.h`'s
+  (`statictype.h`'s
   reserved `Struct` kind + `struct_def`/`struct_name`;
   `StaticTypeArena::struct_ty`).
 - **Member access** (`MemberExpr::do_eval`): dispatch on the base — a `t_struct`

@@ -79,7 +79,7 @@ parser modifiers alongside `const` (Identifier flags + a var-decl flag). `const`
 
 Delivered M0-M7: the inferencer is **on by default** and the whole suite
 (635/635) + all benchmarks pass under it. Implemented:
-- `src/stype.{h,cpp}` (lattice) and `src/inferencer.{h,cpp}` (the pass).
+- `src/statictype.{h,cpp}` (lattice) and `src/inferencer.{h,cpp}` (the pass).
 - `opt`/`dyn` keywords (params + var/const decls).
 - Whole-program Jacobi fixpoint inference + a separate check pass; compile-time
   `TypeMismatchEx`/`NullabilityEx`/`WrongArgCountEx`.

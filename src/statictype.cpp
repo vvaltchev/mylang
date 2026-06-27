@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
-#include "stype.h"
+#include "statictype.h"
 #include "uniqueid.h"
 #include "defs.h"       /* ML_CHECK */
 
 /*
  * M0 of the type-inference feature: the static-type lattice and its operations.
- * See stype.h for the data model and plans/type-inference.md sections 2 & 4 for
- * the rules these implement.
+ * See statictype.h for the data model and plans/type-inference.md sections 2 &
+ * 4 for the rules these implement.
  */
 
 /* ---------------- StaticTypeArena: allocation & ground singletons

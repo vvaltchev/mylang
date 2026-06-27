@@ -49,7 +49,8 @@ statement.")
 
 A static type `StaticType` is distinct from the runtime `Type *` (the ops
 table). New
-representation, proposed header `src/stype.h` (+ `stype.cpp`, a normal TU added
+representation, proposed header `src/statictype.h` (+ `statictype.cpp`, a
+normal TU added
 to the Makefile glob list):
 
 ```
@@ -124,7 +125,8 @@ Notes:
 
 ## 3. Representation in the codebase
 
-- **`src/stype.h` / `stype.cpp`** — `StaticType`, `StaticTypeKind`, the
+- **`src/statictype.h` / `statictype.cpp`** — `StaticType`, `StaticTypeKind`,
+  the
   arena/interner, and
   the lattice ops `assignable(a,b)`, `join(a,b)`, `unify(a,b)`, plus pretty-
   printing for error messages.
@@ -376,7 +378,8 @@ New test category in `tests.cpp` (the existing table): two kinds —
   exception (`TypeMismatchEx`, `NullabilityEx`, `ArityEx`, `AmbiguousTypeEx`) —
   the §6 error cases. Plus caret-span checks (`ex_col`/`ex_line`) like the
   existing "err loc:" tests.
-Also add `stype.cpp` unit-level checks (join/assignable/unify tables) as table
+Also add `statictype.cpp` unit-level checks (join/assignable/unify tables) as
+table
 tests. The whole existing `-rt` suite + `bench/` must pass with inference ON
 (part of each milestone's done-criteria), or the offending construct gets `dyn`.
 
@@ -394,7 +397,7 @@ out of scope. See the profiling discussion that motivated this whole track.
 
 ## 10. Milestones (each: build clean, `-rt` green, docs synced)
 
-- **M0** — `stype.h`/`stype.cpp`: `StaticType`, lattice,
+- **M0** — `statictype.h`/`statictype.cpp`: `StaticType`, lattice,
   `join`/`assignable`/`unify`,
   union-find, pretty-printer. Table unit tests. No AST wiring yet.
 - **M1** — pass scaffolding: `infer_types(root)` skeleton wired into
@@ -415,7 +418,8 @@ out of scope. See the profiling discussion that motivated this whole track.
 - **M7** — turn the pass ON by default; make the entire `-rt` suite + `bench/`
   pass (mark the genuinely-dynamic spots `dyn`); README (new `opt`/`dyn`
   keywords, the typing rules, the new compile errors) + CLAUDE.md (the new pass,
-  `stype.*`, the new TU, `Construct::static_type`, errors) updated in the same
+  `statictype.*`, the new TU, `Construct::static_type`, errors) updated in the
+  same
   commits.
 - **M8 (separate)** — typed-node specialization for speed (§9).
 

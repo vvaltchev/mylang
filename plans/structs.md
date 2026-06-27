@@ -30,7 +30,8 @@ this plan was waiting on have all landed, which changes the design materially:
 
 - **Static type inference** (`plans/type-inference.md`) is in.
   `StaticTypeKind::Struct`
-  + the `struct_def` slot are already reserved in `stype.h`. Field access can be
+  + the `struct_def` slot are already reserved in `statictype.h`. Field access
+  can be
   a compile-time slot/offset, not a runtime table lookup.
 - **Named arguments** are in: `ExprList::arg_names` plus the shared
   `desugar_named_call(call, vector<ParamSpec>)` in `syntax.cpp`. A struct
@@ -112,11 +113,11 @@ error). One rule, one implementation.
 
 ## 3. Type model
 
-### Static (inferencer, `stype.h` — slot already reserved)
+### Static (inferencer, `statictype.h` — slot already reserved)
 
 `StaticTypeKind::Struct` with `struct_def` pointing at the `StructTypeDef`.
 Lattice ops
-(`stype.cpp`):
+(`statictype.cpp`):
 
 - `equal(a,b)` for two Structs: same `struct_def` (nominal, no structural
   equivalence).

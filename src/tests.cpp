@@ -15,7 +15,7 @@
 #include "eval.h"
 #include "resolver.h"
 #include "backtrace.h"
-#include "stype.h"
+#include "statictype.h"
 #include "inferencer.h"
 #include "repl.h"
 #include "lineedit.h"
@@ -8635,10 +8635,10 @@ inliner_folds_const_global()
 
 /*
  * M0 of the type-inference feature (plans/type-inference.md): unit-check the
- * static-type lattice (stype.h / stype.cpp) directly in C++, since it has no
- * AST wiring yet. These exercise the rules the inferencer will rely on.
+ * static-type lattice (statictype.h / statictype.cpp) directly in C++, since it
+ * has no AST wiring yet. These exercise the rules the inferencer relies on.
  */
-static bool stype_ground_caching()
+static bool static_type_ground_caching()
 {
     StaticTypeArena a;
 
@@ -8650,7 +8650,7 @@ static bool stype_ground_caching()
     return true;
 }
 
-static bool stype_assignable_rules()
+static bool static_type_assignable_rules()
 {
     StaticTypeArena a;
     StaticTypeRef i = a.int_ty(), f = a.float_ty(), s = a.str_ty();
@@ -8679,7 +8679,7 @@ static bool stype_assignable_rules()
     return true;
 }
 
-static bool stype_join_rules()
+static bool static_type_join_rules()
 {
     StaticTypeArena a;
     StaticTypeRef i = a.int_ty(), f = a.float_ty(), s = a.str_ty();
@@ -8702,7 +8702,7 @@ static bool stype_join_rules()
     return true;
 }
 
-static bool stype_unify_vars()
+static bool static_type_unify_vars()
 {
     StaticTypeArena a;
 
@@ -8724,7 +8724,7 @@ static bool stype_unify_vars()
     return true;
 }
 
-static bool stype_to_string_basic()
+static bool static_type_to_string_basic()
 {
     StaticTypeArena a;
 
@@ -10076,11 +10076,11 @@ static const std::vector<extra_check> extra_checks =
     { "backtrace: long-frame truncation", backtrace_truncation },
     { "backtrace: end-to-end call chain", backtrace_end_to_end },
     { "backtrace: inlined virtual frames", backtrace_inline_frames },
-    { "stype: ground caching & with_opt", stype_ground_caching },
-    { "stype: assignable rules", stype_assignable_rules },
-    { "stype: join (LUB) rules", stype_join_rules },
-    { "stype: unify & occurs-check", stype_unify_vars },
-    { "stype: to_string", stype_to_string_basic },
+    { "static_type: ground caching & with_opt", static_type_ground_caching },
+    { "static_type: assignable rules", static_type_assignable_rules },
+    { "static_type: join (LUB) rules", static_type_join_rules },
+    { "static_type: unify & occurs-check", static_type_unify_vars },
+    { "static_type: to_string", static_type_to_string_basic },
 };
 
 void run_tests(bool dump_syntax_tree)

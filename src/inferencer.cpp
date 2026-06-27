@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "syntax.h"
-#include "stype.h"
+#include "statictype.h"
 #include "errors.h"
 #include "inferencer.h"
 #include "analyzer.h"

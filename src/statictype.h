@@ -26,11 +26,11 @@ class UniqueId;
  * (int/float/str/exception/none/dyn) are cached singletons per opt-flag;
  * everything else is allocated on demand.
  *
- * This file + stype.cpp are the M0 milestone: the lattice and its operations
- * (resolve / unify / assignable / join / equal / to_string), with no AST wiring
- * yet. The lattice rules (none-nullability, int<=float promotion, mixed
- * containers falling to dyn, type conflicts being errors) are specified in
- * plans/type-inference.md sections 2 and 4.
+ * This file + statictype.cpp are the M0 milestone: the lattice and its
+ * operations (resolve / unify / assignable / join / equal / to_string), with no
+ * AST wiring yet. The lattice rules (none-nullability, int<=float promotion,
+ * mixed containers falling to dyn, type conflicts being errors) are specified
+ * in plans/type-inference.md sections 2 and 4.
  */
 
 enum class StaticTypeKind {
