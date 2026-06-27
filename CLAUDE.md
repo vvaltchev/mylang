@@ -1241,8 +1241,9 @@ sanitizers never reproduced it.)
   The post-parse `resolve_names()` pass assigns slot indices so an
   `Identifier::do_eval` for a resolved local is an O(1) read of
   `EvalContext::frame->slots[slot]` instead of the `map`+parent-chain walk. A
-  call's `Frame` (an inline slot buffer + heap spill past 8, plus a `uint64_t
-  live` bitmask) is created in `do_func_call` when `FuncDeclStmt::resolved`, and
+  call's `Frame` (an inline slot buffer + heap spill past 8 — just
+  default-constructed slots, **no liveness bitmask**, so **no 64-slot limit**)
+  is created in `do_func_call` when `FuncDeclStmt::resolved`, and
   for the program's implicit "main" by `Block::do_eval` on the root block;
   nested blocks inherit the `frame` pointer.
   **Slotted: a function's params and its locals** (`var`/`const`, `for`-init,
@@ -1255,13 +1256,16 @@ sanitizers never reproduced it.)
   keeps them in the map. Anything unresolved falls back to the map, so the pass
   is purely an optimization. The resolver does a forward
   lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
-  `x`; top-level *functions* ARE hoisted — see next bullet); each
-  `Block` records its slot range and `Block::do_eval` clears those `live` bits
-  on entry, so a re-entered loop body's locals start undefined again. Slots
-  can't hold the `UndefinedId` sentinel (`LValue` forbids it), hence the `live`
-  bitmask for undeclared/`undef()` state, and same-block duplicate declarations
-  are caught here (`AlreadyDefinedEx`) so the runtime decl path can just
-  overwrite. `Identifier::sym` and `FuncDeclStmt::{resolved, frame_size,
+  `x`; top-level *functions* ARE hoisted — see next bullet). **No per-slot
+  liveness**: a slot is default-constructed when the `Frame` is built, and a
+  local can only *resolve* to its slot AFTER its decl (forward resolution), so a
+  re-entered loop body re-binds its locals via their decls (which re-run each
+  iteration) and a use-before-decl resolves to an outer binding or errors via
+  the map — the slot's stale value is never observed. (This is why there is no
+  script `undef`: removing a binding would need per-slot definedness; the REPL's
+  `:undef` works on its map-resident globals instead.) Same-block duplicate
+  declarations are caught here (`AlreadyDefinedEx`) so the runtime decl path can
+  just overwrite. `Identifier::sym` and `FuncDeclStmt::{resolved, frame_size,
   slot_writes}` carry the results; `slot_writes` (per-slot write counts:
   write-once == 1 for a local, 0 for a never-reassigned param) is what the
   auto-const folder uses to find promotable write-once vars (see the
@@ -1294,9 +1298,9 @@ sanitizers never reproduced it.)
   depth via `EvalContext::gfuncs` (inherited from the parent; the root block
   owns the table). So `fib`/mutual-recursion/any named-function call is an
   **O(1) table read, not a scope-chain map walk** — the function analogue of
-  local slotting, a real win on call-heavy code (`bench/09_fib`). It is NOT a
-  per-call Frame, so there is **no 64-slot limit** — a program may have any
-  number of top-level functions. The resolver **hoists** them before resolving
+  local slotting, a real win on call-heavy code (`bench/09_fib`). A plain
+  vector with **no slot limit** — a program may have any number of top-level
+  functions. The resolver **hoists** them before resolving
   bodies (`hoist_global_funcs`), so a forward / mutually-recursive reference
   resolves to a slot; `resolve_ref` stamps `SymKind::global` for a non-captured
   top-level-function reference (a capture-list name takes precedence and stays

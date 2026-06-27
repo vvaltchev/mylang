@@ -9178,8 +9178,43 @@ static bool analyze_greens_counted_for()
     return ok;
 }
 
+/*
+ * A function with >64 locals must work now that the Frame has no liveness word
+ * (the old 64-slot-per-frame cap is gone). 100 sibling blocks each declaring a
+ * `var` get 100 distinct (monotonic) slots; sum 0..99 == 4950. Generated in C++
+ * since 100 decls don't fit a static test tuple.
+ */
+static bool frame_over_64_slots()
+{
+    std::vector<std::string> lines;
+    lines.push_back("func big() {");
+    lines.push_back("  var s = 0;");
+    for (int i = 0; i < 100; i++)
+        lines.push_back("  { var v = " + std::to_string(i) + "; s = s + v; }");
+    lines.push_back("  return s;");
+    lines.push_back("}");
+    lines.push_back("assert(big() == 4950);");
+
+    std::vector<Tok> toks;
+    for (size_t i = 0; i < lines.size(); i++)
+        lexer(lines[i], static_cast<int>(i + 1), toks);
+
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        root->eval(nullptr);            /* throws if the assert fails */
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
+    { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },
     { "analyze: counted `for` is greened, float-var `for` is not",
       analyze_greens_counted_for },
     { "repl: multi-line completeness detection", repl_incomplete_detection },
