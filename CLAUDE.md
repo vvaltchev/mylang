@@ -2198,7 +2198,11 @@ behind a thin terminal shell:
     keywords - NOT history; history is `Ctrl-R`'s job): it completes the
     identifier ending the buffer with the shortest matching candidate's
     remainder. Enabled only when **color is on** (the ghost must be visually
-    distinct; `NO_COLOR`/no-TTY get none). The
+    distinct; `NO_COLOR`/no-TTY get none). An un-accepted ghost is **erased on
+    leaving the line** (`move_below` emits a clear-to-EOL when `suggestion()` is
+    non-empty - which is only ever a single-line, cursor-at-end buffer, so it
+    hits exactly the ghost), else the committed line would show it (`ar` + dim
+    `ray` reading as `array`). The
     pure core is unit-tested with a synthetic suggester (`suggestion()` +
     accept); the gray rendering lives in `read_line` (untested, like the rest of
     the TTY shell). A navigable dropdown completion menu is still deferred (see

@@ -1068,6 +1068,13 @@ read_line(const string &prompt, const string &cont_prompt,
         const int rows = static_cast<int>(line_count(ed.buffer()));
         const int down = (rows - 1) - prev_cursor_row;
         string o;
+        /* Erase an un-accepted gray ghost suggestion before leaving the line -
+         * the cursor sits right before it, and the ghost only ever shows on a
+         * single-line buffer with the cursor at the end, so a clear-to-EOL hits
+         * exactly the ghost (no buffer text follows). Otherwise the ghost would
+         * linger on the committed line ("ar" + dim "ray" reads as "array"). */
+        if (!ed.suggestion().empty())
+            o += "\033[K";
         if (down > 0)
             o += "\033[" + std::to_string(down) + "B";
         o += "\r\n";
