@@ -154,6 +154,10 @@ struct Renderer {
             return PREC_POSTFIX;
         if (auto *e = dynamic_cast<const IncDecExpr *>(c))
             return e->is_prefix ? 8 : PREC_POSTFIX;
+        /* ternary / ?? are the loosest expressions (just above assignment) */
+        if (dynamic_cast<const TernaryExpr *>(c) ||
+            dynamic_cast<const CoalesceExpr *>(c))
+            return 1;
         if (auto *e1 = dynamic_cast<const Expr01 *>(c))
             return e1->elem ? expr_prec(e1->elem.get()) : PREC_PRIMARY;
         return PREC_PRIMARY;
@@ -251,6 +255,20 @@ struct Renderer {
             const char *op = e->is_inc ? "++" : "--";
             if (e->is_prefix) { o << op; expr(e->lvalue.get(), 8); }
             else { expr(e->lvalue.get(), PREC_POSTFIX); o << op; }
+            return;
+        }
+        if (auto *e = dynamic_cast<const TernaryExpr *>(c)) {
+            expr(e->condExpr.get(), 2);
+            o << " ? ";
+            expr(e->thenExpr.get(), 2);
+            o << " : ";
+            expr(e->elseExpr.get(), 1);     /* right-assoc */
+            return;
+        }
+        if (auto *e = dynamic_cast<const CoalesceExpr *>(c)) {
+            expr(e->lhs.get(), 2);
+            o << " ?? ";
+            expr(e->rhs.get(), 1);          /* right-assoc */
             return;
         }
         if (auto *e = dynamic_cast<const TypedScalarExpr *>(c)) {

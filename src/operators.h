@@ -48,6 +48,7 @@ enum class Op : int {
     shl         = 39, // << (left shift, int)
     shr         = 40, // >> (signed right shift, sign-extending)
     ushr        = 41, // >>> (unsigned/logical right shift, zero-fill)
+    coalesce    = 42, // ?? (null-coalescing: a ?? b)
 
-    op_count    = 42,
+    op_count    = 43,
 };

@@ -496,6 +496,13 @@ void Inferencer::for_each_child(Construct *n,
     if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
         fn(idc->lvalue.get()); return;
     }
+    if (auto *te = dynamic_cast<TernaryExpr *>(n)) {
+        fn(te->condExpr.get()); fn(te->thenExpr.get());
+        fn(te->elseExpr.get()); return;
+    }
+    if (auto *co = dynamic_cast<CoalesceExpr *>(n)) {
+        fn(co->lhs.get()); fn(co->rhs.get()); return;
+    }
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
         fn(fd->body.get()); return;
     }
@@ -2021,6 +2028,29 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
          * the int/float-lvalue requirement. */
         return binop_result(idc->is_inc ? Op::plus : Op::minus,
                             type_of(idc->lvalue.get()), A.int_ty());
+    }
+
+    if (auto *te = dynamic_cast<const TernaryExpr *>(e)) {
+        /* `c ? a : b` is the join of the two branches (the condition does not
+         * affect the result type). Defer on an Unknown branch. */
+        StaticTypeRef tt = static_type_resolve(type_of(te->thenExpr.get()));
+        StaticTypeRef el = static_type_resolve(type_of(te->elseExpr.get()));
+        if (is_unknown(tt) || is_unknown(el))
+            return bottom;
+        return A.join(tt, el);
+    }
+
+    if (auto *co = dynamic_cast<const CoalesceExpr *>(e)) {
+        /* `a ?? b`: a's non-none part, or b. */
+        StaticTypeRef ta = static_type_resolve(type_of(co->lhs.get()));
+        StaticTypeRef tb = static_type_resolve(type_of(co->rhs.get()));
+        if (is_unknown(ta) || is_unknown(tb))
+            return bottom;
+        if (ta->kind == StaticTypeKind::None)
+            return tb;                      /* a is always none -> b */
+        if (!ta->opt)
+            return ta;                      /* a is never none -> a (b dead) */
+        return A.join(A.with_opt(ta, false), tb);
     }
 
     if (auto *e14 = dynamic_cast<const Expr14 *>(e)) {

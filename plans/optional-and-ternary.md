@@ -2,7 +2,20 @@
 
 Three operators that all involve `?`. They are designed together so the four
 `?` roles (the existing nullable suffix `int?`, plus `?.`, `??`, `?:`) coexist
-with no ambiguity. Status: **design / not yet implemented.**
+with no ambiguity. **Status: ternary `?:` and `??` DONE (phase 1+2); `?.`
+(optional chaining) is the remaining phase 3.**
+
+Phase 1+2 notes (as built): `Op::coalesce` (`??`) is the only new token (ternary
+reuses `?`/`:`). `pExprCoalesce` + `pExpr13` sit between `||` and `=`; `pExpr14`
+enters at `pExpr13`. New nodes `TernaryExpr`/`CoalesceExpr` (syntax.h) - both
+short-circuit in eval, fold in the parser AND in AutoConst's `fold_reads` (which
+needed the new cases - it has no generic fallthrough). The decl-vs-ternary
+ambiguity is resolved by `is_decl_terminator` gating in `pAcceptDeclPrefix` (a
+`T ? name` is a decl only when a decl terminator follows `name`; else it is a
+ternary, bailed *before* `lookup_struct_type` can wrongly reject the condition
+name). Inference: ternary = `join(branches)`, `a ?? b` = a's non-none part
+joined with b (non-opt when b is). Covered by the `ternary:` / `coalesce:` tests
++ a cross-input `repl:` test.
 
 ## 0. Why one plan
 

@@ -1384,6 +1384,52 @@ public:
     }
 };
 
+/* The ternary conditional `cond ? thenExpr : elseExpr` (a value expression;
+ * short-circuits - only the taken branch is evaluated). */
+class TernaryExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> condExpr;
+    unique_ptr<Construct> thenExpr;
+    unique_ptr<Construct> elseExpr;
+
+    TernaryExpr() : Construct("TernaryExpr") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<TernaryExpr>();
+        copy_base_fields(*c);
+        c->condExpr = clone_as(condExpr);
+        c->thenExpr = clone_as(thenExpr);
+        c->elseExpr = clone_as(elseExpr);
+        return c;
+    }
+};
+
+/* Null-coalescing `lhs ?? rhs`: lhs if it is not none, else rhs (rhs is only
+ * evaluated when lhs is none). */
+class CoalesceExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> lhs;
+    unique_ptr<Construct> rhs;
+
+    CoalesceExpr() : Construct("CoalesceExpr") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<CoalesceExpr>();
+        copy_base_fields(*c);
+        c->lhs = clone_as(lhs);
+        c->rhs = clone_as(rhs);
+        return c;
+    }
+};
+
 class ForStmt final: public Construct {
 
 public:

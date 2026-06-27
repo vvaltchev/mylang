@@ -81,6 +81,8 @@ unique_ptr<Construct> pExpr09(ParseContext &c, unsigned fl); // ops: ^ (bitwise)
 unique_ptr<Construct> pExpr10(ParseContext &c, unsigned fl); // ops: | (bitwise)
 unique_ptr<Construct> pExpr11(ParseContext &c, unsigned fl); // ops: &&
 unique_ptr<Construct> pExpr12(ParseContext &c, unsigned fl); // ops: ||
+unique_ptr<Construct> pExprCoalesce(ParseContext &c, unsigned fl); // ?? r-assoc
+unique_ptr<Construct> pExpr13(ParseContext &c, unsigned fl); // ?: r-assoc
 unique_ptr<Construct> pExpr14(ParseContext &c, unsigned fl); // ops: = (assignment)
 
 unique_ptr<Construct> pExprTop(ParseContext &c, unsigned fl);
@@ -289,6 +291,20 @@ check_coerce_const_scalar(const EvalValue &v, DeclType dt, Loc s, Loc e)
  * name), and must contain at least one "starter" (const/var/dyn/TYPE) to be a
  * declaration. No-op otherwise.
  */
+/*
+ * A `T ? name` run is ambiguous: a nullable-typed decl (`int? x;`, `Point? p;`)
+ * OR a ternary whose condition is that type/struct name (`flag ? a : b`). They
+ * are told apart by what follows `name`: a declared name is followed by a decl
+ * terminator (`;` `=` `,` `}` or EOF); anything else (`:`, `(`, `.`, an
+ * operator) means a ternary/expression. Checked only when a `?` was seen (the
+ * sole ambiguity); a plain `T name` has no `?` and is always a declaration.
+ */
+static bool is_decl_terminator(const Tok &t)
+{
+    return t == Op::semicolon || t == Op::assign || t == Op::comma ||
+           t == Op::braceR || t == TokType::invalid;
+}
+
 static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
 {
     int k = 0;
@@ -321,10 +337,13 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
             if (after < 0)
                 break;
             int n = after;
-            if (c.peek_tok(n) == Op::questionmark)
+            const bool saw_q = c.peek_tok(n) == Op::questionmark;
+            if (saw_q)
                 n++;
             if (c.peek_tok(n) != TokType::id)
                 break;
+            if (saw_q && !is_decl_terminator(c.peek_tok(n + 1)))
+                break;   /* `array<...> ? a : b` ternary, not a decl */
             dt = type_keyword(t.value);
             parameterized = true;
             f |= pFlags::pInDecl; starter = true;
@@ -333,10 +352,13 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
                    type_keyword(t.value) != DeclType::none) {
             /* A type keyword counts only if the name follows (after `?`). */
             int n = k + 1;
-            if (c.peek_tok(n) == Op::questionmark)
+            const bool saw_q = c.peek_tok(n) == Op::questionmark;
+            if (saw_q)
                 n++;
             if (c.peek_tok(n) != TokType::id)
                 break;
+            if (saw_q && !is_decl_terminator(c.peek_tok(n + 1)))
+                break;   /* `int ? a : b` ternary, not a nullable decl */
             dt = type_keyword(t.value);
             f |= pFlags::pInDecl; starter = true; k++;
         } else if (dt == DeclType::none && t == TokType::id) {
@@ -352,9 +374,15 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
              * right after: a name that doesn't resolve to a struct type is a
              * clear error, not a silent fall-through to expression parsing. */
             int n = k + 1;
-            if (c.peek_tok(n) == Op::questionmark)
+            const bool saw_q = c.peek_tok(n) == Op::questionmark;
+            if (saw_q)
                 n++;
             if (c.peek_tok(n) != TokType::id)
+                break;
+            /* `IDENT ? name :` is a ternary (e.g. `flag ? a : b`), not a
+             * nullable-struct decl - bail BEFORE lookup_struct_type so a
+             * non-struct condition name isn't rejected as "not a type". */
+            if (saw_q && !is_decl_terminator(c.peek_tok(n + 1)))
                 break;
             sdef = lookup_struct_type(c, t.value);
             if (!sdef)
@@ -1461,6 +1489,70 @@ pExpr12(ParseContext &c, unsigned fl)
     );
 }
 
+/*
+ * Null-coalescing `a ?? b` (right-assoc): `a` unless it is none, otherwise `b`.
+ * Precedence sits between `||` and the ternary (matching C#: || > ?? > ?: > =).
+ * A const lhs folds: a none lhs -> rhs, a non-none lhs -> lhs.
+ */
+unique_ptr<Construct>
+pExprCoalesce(ParseContext &c, unsigned fl)
+{
+    unique_ptr<Construct> lhs = pExpr12(c, fl);
+
+    if (!lhs || !pAcceptOp(c, Op::coalesce))
+        return lhs;
+
+    unique_ptr<CoalesceExpr> co(new CoalesceExpr);
+    co->start = lhs->start;
+    co->lhs = move(lhs);
+    co->rhs = pExprCoalesce(c, fl);          /* right-associative */
+    if (!co->rhs)
+        noExprError(c);
+    co->end = co->rhs->end;
+
+    if (c.const_eval && co->lhs->is_const) {
+        const EvalValue &v = co->lhs->eval(c.const_ctx);
+        return v.is<NoneVal>() ? move(co->rhs) : move(co->lhs);
+    }
+
+    return co;
+}
+
+/*
+ * The ternary conditional `cond ? a : b` (right-associative else, so
+ * `a ? b : c ? d : e` == `a ? b : (c ? d : e)`). A const condition folds to the
+ * taken branch (the other is dropped), like a const `if`.
+ */
+unique_ptr<Construct>
+pExpr13(ParseContext &c, unsigned fl)
+{
+    unique_ptr<Construct> cond = pExprCoalesce(c, fl);
+
+    if (!cond || !pAcceptOp(c, Op::questionmark))
+        return cond;
+
+    const unsigned bfl = fl & ~(pFlags::pInStmt | pFlags::pInDecl);
+    unique_ptr<TernaryExpr> t(new TernaryExpr);
+    t->start = cond->start;
+    t->condExpr = move(cond);
+    t->thenExpr = pExpr14(c, bfl);           /* middle: full expr, up to ':' */
+    if (!t->thenExpr)
+        noExprError(c);
+    pExpectOp(c, Op::colon);
+    t->elseExpr = pExpr13(c, bfl);           /* right-associative */
+    if (!t->elseExpr)
+        noExprError(c);
+    t->end = t->elseExpr->end;
+
+    if (c.const_eval && t->condExpr->is_const) {
+        const EvalValue &v = t->condExpr->eval(c.const_ctx);
+        return v.get_type()->is_true(v) ? move(t->thenExpr)
+                                        : move(t->elseExpr);
+    }
+
+    return t;
+}
+
 static void
 declExprCheckId(ParseContext &c, Construct *id)
 {
@@ -1568,7 +1660,7 @@ pExpr14(ParseContext &c, unsigned fl)
             return lside;
 
 
-        lside = pExpr12(c, fl & ~pFlags::pInStmt);
+        lside = pExpr13(c, fl & ~pFlags::pInStmt);
     }
 
     if (!lside)

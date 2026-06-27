@@ -401,6 +401,17 @@ match C precedence; an unused level is skipped):
 - `pExpr08` — `&` (bitwise AND), `pExpr09` — `^` (XOR), `pExpr10` — `|` (OR)
 - `pExpr11` — `&&`
 - `pExpr12` — `||`
+- **`pExprCoalesce`** — null-coalescing `a ?? b` (right-assoc; `Op::coalesce`),
+  between `||` and the ternary
+- **`pExpr13`** — the ternary `cond ? a : b` (right-assoc else: `a?b:c?d:e` ==
+  `a?b:(c?d:e)`; the middle is a full `pExpr14`, bounded by `:`). Fills the
+  long-unused level-13 gap — exactly where C puts the conditional operator. Both
+  reuse the existing `?`/`:` tokens; only `??` is a new token. `pExpr14`'s lside
+  now enters at `pExpr13` (so every condition/slice/element reaches them). Both
+  const-fold (a const cond → the taken branch; a const `??` lhs → lhs/rhs); the
+  AutoConst analogue is in `fold_reads` (`resolver.cpp`), which **must** descend
+  into `TernaryExpr`/`CoalesceExpr` (it has no generic fallthrough — a missing
+  case silently fails to fold their children).
 - `pExpr14` — assignment `=  +=  -=  *=  /=  %=`, plus `var`/`const` decls and
   id-list targets
 
@@ -954,7 +965,14 @@ decisions behind it: `plans/type-inference.md`,
   `lookup_struct_type` (an identifier bound to a `StructTypeDef*` in the const
   ctx; needs const-eval on, since structs register their descriptor there at
   parse time): a name that doesn't resolve to a struct type is a clear
-  `SyntaxErrorEx` ("'foo' is not a type"), not a silent fall-through. Rides on
+  `SyntaxErrorEx` ("'foo' is not a type"), not a silent fall-through.
+  **Decl-vs-ternary:** a `T ? name` run is ambiguous with a ternary
+  (`flag ? a : b`), so when a `?` was seen the scanner requires the token after
+  `name` to be a decl terminator (`is_decl_terminator`: `;` `=` `,` `}` EOF) —
+  otherwise (`:`, `(`, an operator, …) it bails to expression parsing **before**
+  `lookup_struct_type` runs, so a non-struct condition name isn't wrongly
+  rejected as "not a type". A plain `T name` (no `?`) is unambiguous and skips
+  the check. Rides on
   `Identifier::decl_struct` (the `StructTypeDef*`) with `decl_type ==
   DeclType::strct`, threaded via `ParseContext::pending_decl_struct`. The
   inferencer pins it exactly like a scalar annotation:

@@ -876,6 +876,31 @@ private:
             fold_reads(me->what, fc);
             return;
         }
+        if (auto *te = dynamic_cast<TernaryExpr *>(c)) {
+            fold_reads(te->condExpr, fc);
+            fold_reads(te->thenExpr, fc);
+            fold_reads(te->elseExpr, fc);
+            /* const condition -> the taken branch (the AutoConst analogue of
+             * the parser's const-`if` / const-ternary fold: an auto-const flag
+             * guard `FLAG ? a : b` collapses, the other branch dropped). */
+            if (is_scalar_literal(te->condExpr.get())) {
+                const EvalValue v = te->condExpr->eval(&cctx);
+                slot = v.get_type()->is_true(v) ? std::move(te->thenExpr)
+                                                : std::move(te->elseExpr);
+            }
+            return;
+        }
+        if (auto *co = dynamic_cast<CoalesceExpr *>(c)) {
+            fold_reads(co->lhs, fc);
+            fold_reads(co->rhs, fc);
+            /* a const lhs collapses: none -> rhs, otherwise -> lhs */
+            if (is_scalar_literal(co->lhs.get())) {
+                const EvalValue v = co->lhs->eval(&cctx);
+                slot = v.is<NoneVal>() ? std::move(co->rhs)
+                                       : std::move(co->lhs);
+            }
+            return;
+        }
         if (auto *la = dynamic_cast<LiteralArray *>(c)) {
             for (auto &el : la->elems)
                 fold_reads(el, fc);
@@ -1259,6 +1284,13 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
         for (auto &p : n->elems) fn(p.second.get());
     } else if (auto *n = dynamic_cast<IncDecExpr *>(c)) {
         fn(n->lvalue.get());
+    } else if (auto *n = dynamic_cast<TernaryExpr *>(c)) {
+        fn(n->condExpr.get());
+        fn(n->thenExpr.get());
+        fn(n->elseExpr.get());
+    } else if (auto *n = dynamic_cast<CoalesceExpr *>(c)) {
+        fn(n->lhs.get());
+        fn(n->rhs.get());
     } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
         fn(n->what.get());
         fn(n->args.get());

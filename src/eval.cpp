@@ -2638,6 +2638,22 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
  * The inferencer rejects a non-lvalue / const / non-numeric operand at compile
  * time; the runtime checks are the `dyn` safety net.
  */
+EvalValue TernaryExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    const EvalValue c = RValue(condExpr->eval(ctx));
+    if (c.get_type()->is_true(c))
+        return RValue(thenExpr->eval(ctx));
+    return RValue(elseExpr->eval(ctx));
+}
+
+EvalValue CoalesceExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    EvalValue l = RValue(lhs->eval(ctx));
+    if (l.is<NoneVal>())
+        return RValue(rhs->eval(ctx));
+    return l;
+}
+
 EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     /*

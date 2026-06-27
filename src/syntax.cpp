@@ -533,6 +533,32 @@ void Expr14::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void TernaryExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent << "TernaryExpr(\n";
+    condExpr->serialize(s, level + 1);
+    s << endl;
+    thenExpr->serialize(s, level + 1);
+    s << endl;
+    elseExpr->serialize(s, level + 1);
+    s << endl;
+    s << indent << ")";
+}
+
+void CoalesceExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent << "CoalesceExpr(\n";
+    lhs->serialize(s, level + 1);
+    s << endl;
+    rhs->serialize(s, level + 1);
+    s << endl;
+    s << indent << ")";
+}
+
 void IfStmt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
