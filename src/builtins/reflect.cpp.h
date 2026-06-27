@@ -238,8 +238,9 @@ EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList)
     if (exprList->elems.size() != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
+    EvalContext *root = get_root_ctx(ctx);
     std::vector<std::pair<const UniqueId *, const LValue *>> syms;
-    get_root_ctx(ctx)->collect_symbols(syms);
+    root->collect_symbols(syms);
 
     /* The root context copies every builtin into its symbol map; exclude them
      * (they are the province of :help builtins, not the user's globals). */
@@ -251,6 +252,18 @@ EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList)
             continue;
         names.push_back(std::string(kv.first->val));
     }
+
+    /* Top-level functions are GLOBAL-table slots in a script (not map entries),
+     * so add the defined ones from the table - keeping globals() listing
+     * functions as it did before they were slotted. (In the REPL functions
+     * stay in the map, so the table is empty and this is a no-op.) */
+    if (root->gfuncs) {
+        const GlobalFuncTable &gt = *root->gfuncs;
+        for (size_t i = 0; i < gt.names.size(); i++)
+            if (gt.defined[i] && gt.names[i])
+                names.push_back(std::string(gt.names[i]->val));
+    }
+
     std::sort(names.begin(), names.end());
 
     SharedArrayObj::vec_type vec;

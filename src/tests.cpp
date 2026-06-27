@@ -2164,6 +2164,37 @@ static const std::vector<test> tests =
         },
     },
     {
+        /*
+         * Top-level functions are GLOBAL-table slots (resolved at compile time,
+         * read O(1) from any call depth - no map walk). Recursion, mutual /
+         * forward recursion, passing a function as a value, and globals()
+         * listing them all work; undef() clears a slot.
+         */
+        "global function slotting: recursion/mutual/value/globals/undef",
+        {
+            "func mfib(n){ if(n<2) return n; return mfib(n-1)+mfib(n-2); }",
+            "var k = 12;",                  /* runtime arg: real calls */
+            "assert(mfib(k) == 144);",
+            /* mutual + forward reference (iseven uses isodd, declared later) */
+            "func iseven(n){ if(n==0) return true; return isodd(n-1); }",
+            "func isodd(n){ if(n==0) return false; return iseven(n-1); }",
+            "var m = 11;",
+            "assert(iseven(10)); assert(isodd(m));",
+            /* a top-level function passed as a value resolves to its slot */
+            "func sqf(x){ return x*x; }",
+            "func apply(f,v){ return f(v); }",
+            "assert(apply(sqf, k) == 144);",
+            /* globals() lists slotted functions in a script */
+            "var dyn gl = globals();",      /* globals() returns dyn */
+            "assert(find(gl, \"mfib\") != none);",
+            "assert(find(gl, \"sqf\") != none);",
+            /* undef() clears a function's global slot */
+            "assert(defined(sqf));",
+            "undef(sqf);",
+            "assert(!defined(sqf));",
+        },
+    },
+    {
         "closure capturing state at runtime",
         {
             "func make_counter() {",

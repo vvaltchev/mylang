@@ -913,6 +913,17 @@ public:
             }
         }
 
+        /* Hoist top-level functions to global-table slots (before pass 1, so a
+         * forward / mutual ref in a body resolves to its slot). The global
+         * function table is separate from the per-call frame, so this has no
+         * 64-slot limit. Not in the REPL, where top-level names stay
+         * redefinable in the map. The slot->name list is stored on the root
+         * block (it sizes the table and lets globals()/reflection list it). */
+        if (auto *rb = dynamic_cast<Block *>(root)) {
+            if (!repl)
+                hoist_global_funcs(rb);
+        }
+
         top_level_only = false;
         walk(root, nullptr);            /* pass 1: functions; fill `escaped` */
 
@@ -933,6 +944,15 @@ private:
 
     /* Names a function reads from outer scope: kept in the map, not slotted. */
     std::unordered_set<const UniqueId *> escaped;
+    /*
+     * Top-level function names hoisted to GLOBAL slots in the root "main" frame
+     * (uid -> slot). A reference to one (a call, including recursive/mutually-
+     * recursive) resolves to SymKind::global - an O(1) global-table read
+     * instead of a scope-chain map walk. Hoisted up front (before bodies) so a
+     * forward / mutual reference resolves; the slot is bound at runtime when
+     * the decl executes (a call before that reads "undefined"). Empty in REPL
+     * mode (top-level names stay redefinable in the map). */
+    std::unordered_map<const UniqueId *, int> global_func_slots;
     /* Names of functions PROVEN effectively-pure so far (in walk order). A call
      * to one is itself pure - so the auto-pure test recognizes a function that
      * calls an earlier auto-pure helper (e.g. f(x,y)=>add(x,y) is pure once add
@@ -950,6 +970,32 @@ private:
     void process_function(FuncDeclStmt *fd);
 
     /*
+     * Assign a STATIC GLOBAL-table slot to each DIRECT top-level function
+     * declaration, so a reference to it resolves to SymKind::global - an O(1)
+     * table read, not a map walk. Slots are 0..n-1, recorded by name on the
+     * root block (`global_func_names`, which sizes the runtime table and lets
+     * reflection enumerate it). The table is a plain vector with NO 64-slot
+     * limit (it is not a per-call Frame), so every top-level function gets a
+     * slot however many there are. A duplicate top-level function name is a
+     * compile error. (Only DIRECT top-level decls: a function nested in an
+     * `if`/block at top level is conditionally defined and stays map-based.)
+     */
+    void hoist_global_funcs(Block *rb)
+    {
+        for (auto &e : rb->elems) {
+            auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
+            if (!fd || !fd->id)
+                continue;
+            if (global_func_slots.count(fd->id->uid))
+                throw AlreadyDefinedEx(fd->id->start, fd->id->end);
+            const int slot = static_cast<int>(rb->global_func_names.size());
+            global_func_slots[fd->id->uid] = slot;
+            rb->global_func_names.push_back(fd->id->uid);
+            fd->id->sym = ResolvedSym{ SymKind::global, slot };
+        }
+    }
+
+    /*
      * Declare `id` in the current innermost scope and slot it. Raises
      * AlreadyDefinedEx on a same-scope redeclaration. If the slot budget is
      * exhausted the name is added as a masking entry (resolves to the map) so
@@ -961,6 +1007,12 @@ private:
             return;
 
         check_no_redecl(cur, id);
+
+        /* A top-level var clashing with a hoisted global function name is a
+         * duplicate declaration (the function isn't in main's scopes, so
+         * check_no_redecl above can't see it). */
+        if (cur->is_main && global_func_slots.count(id->uid))
+            throw AlreadyDefinedEx(id->start, id->end);
 
         /* A top-level variable that some function reads must stay in the map
          * (functions reach globals via the scope-chain map walk, not slots),
@@ -1032,7 +1084,24 @@ private:
             }
         }
 
-        if (!cur->is_main && !cur->captures.count(id->uid))
+        /*
+         * A captured name (an explicit capture-list entry) resolves through the
+         * closure's capture_ctx at runtime, NOT to a global - so it must take
+         * precedence over a same-named global function. Leave it unresolved.
+         */
+        const bool is_capture = cur->captures.count(id->uid) != 0;
+
+        /* A top-level function: resolve to its hoisted GLOBAL slot (reached via
+         * global_frame from any call depth) instead of a map walk. */
+        if (!is_capture) {
+            auto git = global_func_slots.find(id->uid);
+            if (git != global_func_slots.end()) {
+                id->sym = ResolvedSym{ SymKind::global, git->second };
+                return;
+            }
+        }
+
+        if (!cur->is_main && !is_capture)
             escaped.insert(id->uid);
     }
 
@@ -1464,9 +1533,12 @@ Resolver::walk(Construct *c, FuncState *cur)
             }
         }
 
-        /* The function NAME is a local of the enclosing scope (masking entry:
-         * stays in the map so forward references / mutual recursion work). */
-        if (fd->id)
+        /* A hoisted top-level function already has a GLOBAL slot (resolved via
+         * global_func_slots); don't also add a masking entry (which would
+         * shadow it to the map). Any other function name is a local of the
+         * enclosing scope (masking entry: stays in the map so forward
+         * references / mutual recursion work). */
+        if (fd->id && fd->id->sym.kind != SymKind::global)
             declare_masking(cur, fd->id.get());
 
         /* In the top-level pass the body was already resolved (pass 1); here we

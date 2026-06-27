@@ -106,6 +106,31 @@ struct Frame {
     }
 };
 
+/*
+ * The program-wide table of top-level (named) functions. Each gets a STATIC
+ * slot index at compile time (the resolver's hoist), so a reference resolves to
+ * SymKind::global + that index and reads this table from any call depth - the
+ * function analogue of variable slotting. Unlike a per-call Frame it has NO
+ * 64-slot limit (a plain vector, sized once to the static function count, never
+ * grown). A slot is `defined` only after its decl executes, so a call that
+ * reaches a function before its definition runs reads as undefined. Lexical
+ * reachability is a COMPILE-TIME decision (an out-of-scope name simply never
+ * resolves to a slot); the table itself holds every top-level function.
+ */
+struct GlobalFuncTable {
+    std::vector<LValue> slots;
+    std::vector<char> defined;   /* 1 once the decl has bound the slot */
+    /* slot -> interned name; lets reflection (globals()) enumerate the table,
+     * which is otherwise index-keyed. Not used on the hot read path. */
+    std::vector<const UniqueId *> names;
+
+    void init(const std::vector<const UniqueId *> &nm) {
+        names = nm;
+        slots.resize(nm.size());
+        defined.assign(nm.size(), 0);
+    }
+};
+
 class EvalContext {
 
     typedef std::map<const UniqueId *, LValue> SymbolsType;
@@ -143,6 +168,18 @@ public:
      * call's args context at a fresh Frame.
      */
     Frame *frame;
+
+    /*
+     * The program-wide table of top-level (named) functions, reachable from ANY
+     * call depth (inherited from the parent; the root block owns it). A
+     * top-level function is a `SymKind::global` slot in here, so a global /
+     * recursive / mutually-recursive call is an O(1) table read instead of a
+     * scope-chain map walk - the function analogue of variable slotting, with
+     * NO per-frame 64-slot limit. nullptr when the program declares no
+     * top-level functions (or in the REPL, where top-level names stay in the
+     * map).
+     */
+    GlobalFuncTable *gfuncs;
 
     /*
      * Points at the FlowState shared by every context within the current

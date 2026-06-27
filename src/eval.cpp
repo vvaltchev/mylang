@@ -83,6 +83,7 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
     , const_ctx(const_ctx)
     , func_ctx(func_ctx)
     , frame(parent ? parent->frame : nullptr)
+    , gfuncs(parent ? parent->gfuncs : nullptr)
     , flow((parent && !func_ctx) ? parent->flow : &flow_state)
 {
     if (!parent) {
@@ -113,6 +114,15 @@ bool EvalContext::erase(const Identifier *id)
         const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
         const bool was_defined = frame->live & bit;
         frame->live &= ~bit;
+        return was_defined;
+    }
+
+    if (id->sym.kind == SymKind::global && gfuncs) {
+
+        /* undef() on a top-level function: clear its global-table defined flag
+         * (a later reference reads "undefined" until re-bound). */
+        const bool was_defined = gfuncs->defined[id->sym.slot];
+        gfuncs->defined[id->sym.slot] = 0;
         return was_defined;
     }
 
@@ -248,6 +258,18 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
             return EvalValue(&ctx->frame->slots[sym.slot]);
 
         return UndefinedId{get_str()};   /* slot exists but was undef()'d */
+    }
+
+    if (sym.kind == SymKind::global && ctx->gfuncs) {
+
+        /* Resolved global (a top-level function): an O(1) read of the global
+         * function table, reachable from any call depth - no scope-chain map
+         * walk. Not-yet-defined means the decl hasn't executed yet (a call that
+         * reaches the function before its definition runs). */
+        if (ctx->gfuncs->defined[sym.slot])
+            return EvalValue(&ctx->gfuncs->slots[sym.slot]);
+
+        return UndefinedId{get_str()};
     }
 
     while (ctx) {
@@ -2612,6 +2634,19 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
     }
 
     /*
+     * The root block owns the program-wide table of top-level functions (a
+     * SymKind::global slot reads it from any call depth). Sized once to the
+     * static function count the resolver computed; lives for the whole program.
+     */
+    unique_ptr<GlobalFuncTable> gtable;
+
+    if (!ctx && !global_func_names.empty()) {
+        gtable = make_unique<GlobalFuncTable>();
+        gtable->init(global_func_names);
+        curr.gfuncs = gtable.get();
+    }
+
+    /*
      * Reset this block's resolved locals to "undefined" on entry. The slots
      * persist for the whole call, so without this a re-entered block (a loop
      * body, say) would still see the previous iteration's bindings live. The
@@ -2696,6 +2731,20 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
     );
 
     if (id) {
+
+        /*
+         * A top-level function with a global slot binds directly into the root
+         * frame (so calls reach it via an O(1) global-slot read, no map). The
+         * resolver already rejected a same-scope duplicate at compile time, so
+         * no runtime redecl check is needed here (and the REPL keeps functions
+         * in the map, so this path is script-only).
+         */
+        if (id->sym.kind == SymKind::global && ctx->gfuncs) {
+            GlobalFuncTable *gf = ctx->gfuncs;
+            gf->slots[id->sym.slot] = LValue(move(func), ctx->const_ctx);
+            gf->defined[id->sym.slot] = 1;
+            return none;
+        }
 
         if (!id->eval(ctx).is<UndefinedId>()) {
             /* REPL: re-defining a function replaces it (the edit-and-resubmit

@@ -1246,14 +1246,16 @@ sanitizers never reproduced it.)
   for the program's implicit "main" by `Block::do_eval` on the root block;
   nested blocks inherit the `frame` pointer.
   **Slotted: a function's params and its locals** (`var`/`const`, `for`-init,
-  `foreach`, `catch` variables) **and top-level variables.** **Not slotted (stay
-  in the map):** function *names* (so forward references / mutual recursion
-  work), builtins, captures, and any **top-level variable a function reads** —
-  functions reach globals through the scope-chain map walk, not slots, so the
+  `foreach`, `catch` variables) **and top-level variables** (`SymKind::local`,
+  the current call's `frame`), **plus top-level FUNCTION names** (`SymKind::
+  global`, see next bullet). **Not slotted (stay in the map):** builtins,
+  captures, and any **top-level variable a function reads** — a function reaches
+  a global *variable* through the scope-chain map walk, not a slot, so the
   resolver's first pass collects those names (`escaped`) and its second pass
   keeps them in the map. Anything unresolved falls back to the map, so the pass
   is purely an optimization. The resolver does a forward
-  lexical walk (no hoisting, so `var x = x + 1` reads the outer `x`); each
+  lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
+  `x`; top-level *functions* ARE hoisted — see next bullet); each
   `Block` records its slot range and `Block::do_eval` clears those `live` bits
   on entry, so a re-entered loop body's locals start undefined again. Slots
   can't hold the `UndefinedId` sentinel (`LValue` forbids it), hence the `live`
@@ -1282,6 +1284,33 @@ sanitizers never reproduced it.)
   `foreach` binds a resolved-local loop var the same way via `bind_loop_var`.
   All use `as_resolved_local`, a cheap `is_id()` tag check (`ConstructType::id`),
   not a `dynamic_cast`.
+- **Top-level functions are slotted in a GLOBAL table (`SymKind::global`).** A
+  function name can't be a *frame* slot — a function body runs parented to its
+  definition scope (`capture_ctx` → root), not the call site, so a callee
+  reference from deep in a recursion isn't in the current `frame`. Instead each
+  DIRECT top-level function gets a static slot in a program-wide
+  **`GlobalFuncTable`** (`eval.h`: a plain `vector<LValue> slots` + a `defined`
+  flags vector + a slot→name list for reflection), reachable from any call
+  depth via `EvalContext::gfuncs` (inherited from the parent; the root block
+  owns the table). So `fib`/mutual-recursion/any named-function call is an
+  **O(1) table read, not a scope-chain map walk** — the function analogue of
+  local slotting, a real win on call-heavy code (`bench/09_fib`). It is NOT a
+  per-call Frame, so there is **no 64-slot limit** — a program may have any
+  number of top-level functions. The resolver **hoists** them before resolving
+  bodies (`hoist_global_funcs`), so a forward / mutually-recursive reference
+  resolves to a slot; `resolve_ref` stamps `SymKind::global` for a non-captured
+  top-level-function reference (a capture-list name takes precedence and stays
+  map-bound). A slot is `defined` only once its `func` decl executes, so a call
+  that reaches a function before its definition runs reads "undefined" (same as
+  the old map late-binding); `FuncDeclStmt::do_eval` binds the slot,
+  `Identifier::do_eval`/`erase` (undef) read/clear it, and `globals()`
+  enumerates the table's names. **Scope:** only DIRECT top-level **named**
+  functions — optimizer-inserted `name$sN` specialization clones (created after
+  the hoist), nested/conditionally-declared functions, lambdas, and (in the
+  **REPL**, where top-level names must stay redefinable) all functions remain
+  map-bound; template-instance clones, inserted before resolve_names, ARE
+  hoisted. Global *variables* a function reads are still map-bound (`escaped`);
+  slotting those is a possible follow-up.
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable
