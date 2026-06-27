@@ -164,6 +164,11 @@ editor's brace-depth style, then you press Enter to run it. A `none` result (a
 definition,
 a `print`, an `if`) is not echoed, to keep things quiet.
 
+The `=> ` result echo **pretty-prints**: a struct, dict, or array that is too
+wide for one line is expanded across lines and indented (recursively, with
+nested containers laid out under their key/field); small values stay on a single
+line. With color on, the echoed value is syntax-highlighted.
+
 Meta-commands start with `:`. They turn the REPL into a tool for learning and
 inspecting the language and its compiler:
 

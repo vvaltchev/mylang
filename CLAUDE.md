@@ -1190,6 +1190,17 @@ sanitizers never reproduced it.)
   quotes its elements). The REPL echoes the top-level value via `to_string_repr`
   too, so a bare string echoes `=> "hello"` (IRB-style); `print`/`str` of a bare
   string stay unquoted.
+- **`pretty` (REPL multi-line echo).** A third `Type` virtual
+  (`pretty(a, indent, width)`, default == `to_string_repr`): a container whose
+  single-line repr would overflow `width` from column `indent` is **expanded one
+  element per line, indented, recursively**; anything that fits stays on one
+  line. Only `TypeArr`/`TypeDict`/`TypeStruct` override it (each iterates its own
+  elements and recurses via `EvalValue::pretty`). A dict/struct passes each
+  *value's* actual start column (`indent + key + ": "`) as the child indent, so a
+  nested value's fit check is accurate and its closing bracket lines up under the
+  opening one. Used ONLY by the REPL `=>` echo (`r.pretty(3, ...)`, then
+  `show_colorize` colors it line-by-line when color is on); `print`/`str` are
+  unaffected. A small value still echoes on one line.
 - **`bool` is a real scalar type (`t_bool`, `TypeBool` in
   `src/types/bool.cpp.h`).** `true`/`false` are its only two values (parsed to
   `LiteralBool`, `syntax.h`). It is stored in `EvalValue`'s `bval` union member

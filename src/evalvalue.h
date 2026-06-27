@@ -291,6 +291,10 @@ public:
         return type->to_string_repr(*this);
     };
 
+    std::string pretty(int indent, int width) const {
+        return type->pretty(*this, indent, width);
+    };
+
     size_t hash() const {
         return type->hash(*this);
     };

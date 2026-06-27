@@ -8711,6 +8711,19 @@ static const std::vector<repl_test> repl_tests =
       { { "var bc = 1 /* a\n multi-line\n comment */ + 9", "" },
         { "bc", "=> 10" } } },
 
+    /* the => echo pretty-prints: a value too wide for one line expands across
+     * lines (indented), while a small one stays compact */
+    { "the => echo keeps a small container on one line",
+      { { "[1, 2, 3]", "=> [1, 2, 3]" } } },
+    { "the => echo pretty-prints a wide value across lines",
+      { { "struct Pt { int x; int y; }", "" },
+        { "[Pt(1,1), Pt(2,2), Pt(3,3), Pt(4,4), Pt(5,5), Pt(6,6)]",
+          "=> [\n     Pt(x: 1, y: 1)," } } },
+    { "the => echo expands a wide struct, one field per line",
+      { { "struct Wide { str alpha; str beta; str gamma; str delta; }", "" },
+        { "Wide(\"first value\", \"second value\", \"third value\", \"x\")",
+          "Wide(\n     alpha: \"first value\"," } } },
+
     { "a template defined then called across inputs instantiates per type",
       { { "func tg(a){ var r = a + 1; return r; }", "" },
         { "tg(41)", "=> 42" },

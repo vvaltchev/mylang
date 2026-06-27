@@ -30,6 +30,7 @@ public:
     EvalValue clone(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
+    string pretty(const EvalValue &a, int indent, int width) override;
     bool is_true(const EvalValue &a) override;
 };
 
@@ -175,6 +176,37 @@ string TypeDict::to_string(const EvalValue &a)
         i++;
     }
 
+    res += "}";
+    return res;
+}
+
+string TypeDict::pretty(const EvalValue &a, int indent, int width)
+{
+    const string flat = to_string_repr(a);
+    const DictObject &obj = *a.get<intrusive_ptr<DictObject>>().get();
+    const DictObject::inner_type &data = obj.get_ref();
+
+    if (data.empty() || indent + static_cast<int>(flat.size()) <= width)
+        return flat;
+
+    string res = "{\n";
+    const string pad(indent + 2, ' ');
+    size_type i = 0;
+    for (const auto &p : data) {
+        const string key = p.first.to_string_repr();   /* key: single line */
+        res += pad;
+        res += key;
+        res += ": ";
+        /* the value starts after `<pad><key>: `; pass that column so its own
+         * fit check / expansion line up under the value, not the key. */
+        const int val_col = indent + 2 + static_cast<int>(key.size()) + 2;
+        res += p.second.get().pretty(val_col, width);
+        if (i != data.size() - 1)
+            res += ",";
+        res += "\n";
+        i++;
+    }
+    res += string(indent, ' ');
     res += "}";
     return res;
 }

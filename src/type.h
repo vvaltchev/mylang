@@ -171,6 +171,17 @@ public:
         return to_string(a);
     }
 
+    /*
+     * Multi-line "pretty" rendering for the REPL `=>` echo: a container whose
+     * single-line repr would exceed `width` (measured from column `indent`) is
+     * expanded one element per line, indented, recursively. Anything that fits
+     * - and every scalar/string (the default here) - stays on one line as its
+     * to_string_repr. Only array/dict/struct override it.
+     */
+    virtual std::string pretty(const EvalValueT &a, int indent, int width) {
+        return to_string_repr(a);
+    }
+
     virtual int_type len(const EvalValueT &a) {
         throw TypeErrorEx("The object does NOT support len()");
     }

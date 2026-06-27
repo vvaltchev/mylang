@@ -65,6 +65,7 @@ public:
     size_t hash(const EvalValue &a) override;
     bool is_true(const EvalValue &a) override { return true; }
     string to_string(const EvalValue &a) override;
+    string pretty(const EvalValue &a, int indent, int width) override;
     EvalValue clone(const EvalValue &a) override;
     int_type use_count(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
@@ -154,6 +155,36 @@ string TypeStruct::to_string(const EvalValue &a)
             res += ", ";
     }
 
+    res += ")";
+    return res;
+}
+
+string TypeStruct::pretty(const EvalValue &a, int indent, int width)
+{
+    const string flat = to_string_repr(a);
+    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructTypeDef &def = *o.def;
+
+    if (def.fields.empty() || indent + static_cast<int>(flat.size()) <= width)
+        return flat;
+
+    string res = string(def.name->val);
+    res += "(\n";
+    const string pad(indent + 2, ' ');
+    for (size_t i = 0; i < def.fields.size(); i++) {
+        const string fname = string(def.fields[i].name->val);
+        res += pad;
+        res += fname;
+        res += ": ";
+        const EvalValue fv = o.is_pod() ? o.pod_get(static_cast<int>(i))
+                                        : o.fields[i].get();
+        const int val_col = indent + 2 + static_cast<int>(fname.size()) + 2;
+        res += fv.pretty(val_col, width);
+        if (i != def.fields.size() - 1)
+            res += ",";
+        res += "\n";
+    }
+    res += string(indent, ' ');
     res += ")";
     return res;
 }

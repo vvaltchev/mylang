@@ -176,6 +176,7 @@ public:
 
     int_type len(const EvalValue &a) override;
     string to_string(const EvalValue &a) override;
+    string pretty(const EvalValue &a, int indent, int width) override;
     bool is_true(const EvalValue &a) override;
 };
 
@@ -489,6 +490,31 @@ string TypeArr::to_string(const EvalValue &a)
             res += ", ";
     }
 
+    res += "]";
+    return res;
+}
+
+string TypeArr::pretty(const EvalValue &a, int indent, int width)
+{
+    const string flat = to_string_repr(a);
+    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const size_type n = arr.size();
+
+    /* fits on one line (or empty) -> single line */
+    if (n == 0 || indent + static_cast<int>(flat.size()) <= width)
+        return flat;
+
+    /* otherwise expand one element per line, indented */
+    string res = "[\n";
+    const string pad(indent + 2, ' ');
+    for (size_type i = 0; i < n; i++) {
+        res += pad;
+        res += arr_elem_at(arr, i).pretty(indent + 2, width);
+        if (i != n - 1)
+            res += ",";
+        res += "\n";
+    }
+    res += string(indent, ' ');
     res += "]";
     return res;
 }

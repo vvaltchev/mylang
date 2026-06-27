@@ -47,6 +47,13 @@ repl_out_is_tty()
 #endif
 }
 
+/* Syntax-highlight a (possibly multi-line) rendered block (defined below). */
+static string show_colorize(const string &s, bool color);
+
+/* Width budget for the `=>` echo's pretty-printer: a value whose single-line
+ * form is wider than this is expanded across lines. */
+static const int REPL_PRETTY_WIDTH = 80;
+
 /*
  * Persistent interpreter state for the REPL. The const context and the runtime
  * global scope are both roots that live for the whole session; the const one
@@ -472,8 +479,13 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    is not echoed, so the prompt stays uncluttered. */
     if (echo) {
         const EvalValue r = RValue(last);
-        if (!r.is<NoneVal>())
-            out << "=> " << r.to_string_repr() << "\n";
+        if (!r.is<NoneVal>()) {
+            /* Pretty-print: a container too wide for one line expands across
+             * lines, indented (structs/dicts/arrays, recursively). Colored
+             * line-by-line via the highlighter when color is on. */
+            const string p = r.pretty(3, REPL_PRETTY_WIDTH);
+            out << "=> " << show_colorize(p, color) << "\n";
+        }
     }
     return out.str();
 }
