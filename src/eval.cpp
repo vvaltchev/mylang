@@ -732,6 +732,41 @@ const StructTypeDef *native_struct_layout_def()
     return def;
 }
 
+const StructTypeDef *native_struct_type_def()
+{
+    static StructTypeDef *const def = []() {
+        auto *d = new StructTypeDef();
+        d->name = UniqueId::get("Type");
+        auto scalar = [&](const char *n, FieldKind k) {
+            FieldDef f;
+            f.name = UniqueId::get(n);
+            f.kind = k;
+            f.slot = static_cast<int>(d->fields.size());
+            d->fields.push_back(f);
+        };
+        scalar("kind",     FieldKind::f_str);
+        scalar("name",     FieldKind::f_str);
+        scalar("nullable", FieldKind::f_bool);
+        /* elem / key / val: `opt Type` (self-ref; opt breaks the recursion) */
+        auto self = [&](const char *n) {
+            FieldDef f;
+            f.name = UniqueId::get(n);
+            f.kind = FieldKind::f_struct;
+            f.struct_ty = d->name;   /* "Type" */
+            f.struct_def = d;        /* self */
+            f.is_opt = true;
+            f.slot = static_cast<int>(d->fields.size());
+            d->fields.push_back(f);
+        };
+        self("elem");
+        self("key");
+        self("val");
+        d->compute_layout();   /* boxed */
+        return d;
+    }();
+    return def;
+}
+
 static EvalValue
 construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
 {

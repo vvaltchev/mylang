@@ -120,6 +120,15 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
 const StructTypeDef *native_struct_field_def();
 const StructTypeDef *native_struct_layout_def();
 
+/*
+ * The native `Type` reflection object returned by type()/decltype():
+ *   struct Type { str kind; str name; bool nullable;
+ *                 Type? elem; Type? key; Type? val; }
+ * Recursive via the `opt Type` self-reference (elem/key/val), allowed by the
+ * struct-recursion rule. Built once; program-lifetime.
+ */
+const StructTypeDef *native_struct_type_def();
+
 struct StructTypeDef {
 
     enum class Layout : unsigned char { boxed, pod };

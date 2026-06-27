@@ -992,22 +992,26 @@ decisions behind it: `plans/type-inference.md`,
   case), so `array<int> a; append(a, 5)` stays unboxed. Generic `array a` /
   `dict d` (no `<...>`) are unchanged (element inferred). See
   `plans/typed-containers-syntax.md`.
-- **`decltype(var)` - a variable's STATIC type, at compile time.** A non-const
-  builtin (`builtin_decltype`, `types.cpp`) whose result the inferencer makes:
-  `builtin_result` types `decltype(...)` as `str`, and `fold_decltype` (run in
-  the **check pass**, where types are final) validates the single argument is an
-  identifier resolved in scope (else `TypeMismatchEx`/`WrongArgCountEx`) and
-  **replaces `args->elems[0]` with a `LiteralStr` of the type string**
-  (`sty_to_string`). At runtime the builtin returns that literal (under `-nti`,
-  nothing folds, it falls back to the value's runtime type, like `type()`). So
-  `int? a` → `"int?"`, `dyn? d` → `"dyn?"`, an inferred `var a=[1,2,3]` →
-  `"array<int>"`, a struct var → its name. This is the static counterpart to
-  `type()`/`typestr()` (which inspect a *value*, so a nullable var holding none
-  reads `"none"`); decltype is about the *identifier*. The string format matches
-  `:type` and error messages (nullability is a `?` suffix - `int?`, `dyn?`,
-  `array<int?>` - see `sty_to_string`). The arg-slot rewrite
-  (not a whole-node replacement) avoids needing a slot-based walk in the
-  inferencer, since `args->elems` is a direct vector.
+- **Compile-time TYPE QUERIES: `type`/`decltype` (-> `Type` object),
+  `typestr`/`kindstr` (-> string).** All four are non-const builtins with an
+  **UNEVALUATED operand** (like C++ `decltype`/`sizeof` - the arg is never
+  evaluated). `fold_type_query` (`inferencer.cpp`, run in the **check pass**
+  where types are final) recognizes the call, takes the argument's STATIC type
+  (`decltype` requires an identifier-in-scope, else `TypeMismatchEx`/
+  `WrongArgCountEx`; the others take any expression via `type_of`), and
+  **replaces `args->elems[0]`** with the folded literal: a `LiteralStr` for
+  `typestr` (`sty_to_string`) / `kindstr` (`sty_kind_string` - the bare kind,
+  matching runtime `TypeNames`), or a baked **const `LiteralObj` Type object**
+  (`build_type_value(STy)`, recursive) for `type`/`decltype`. The runtime
+  builtin (`types.cpp`) returns args[0]; under `-nti` it builds from the runtime
+  value instead (`make_runtime_type_value` - a flat Type; `reflect_typeof` for
+  the strings). `Type` is a native composite type (`native_struct_type_def`,
+  recursive via `opt Type` elem/key/val) registered in `struct_by_name` and
+  typed by `builtin_result`. So `type(a).elem.kind` works (narrow the `opt Type`
+  first); `typestr(x)`/`kindstr(x)` are the cheap string forms. The arg-slot
+  rewrite (not a whole-node replacement) needs no slot-based inferencer walk
+  (`args->elems` is a direct vector). The `?`-suffix nullability format
+  (`sty_to_string`) matches `:type` and error messages.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
   (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
   `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is

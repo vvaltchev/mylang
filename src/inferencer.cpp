@@ -827,8 +827,10 @@ void Inferencer::setup()
      * (e.g. layout() -> StructLayout) and its field accesses type-check. */
     const StructTypeDef *sf = native_struct_field_def();
     const StructTypeDef *sl = native_struct_layout_def();
+    const StructTypeDef *ty = native_struct_type_def();
     struct_by_name[sf->name] = sf;
     struct_by_name[sl->name] = sl;
+    struct_by_name[ty->name] = ty;
 }
 
 /*
@@ -2292,11 +2294,17 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.float_ty();
 
     if (n == "int")    return A.int_ty();
-    if (n == "str" || n == "type" || n == "decltype" || n == "typestr" ||
-        n == "kindstr" || n == "chr" || n == "join" || n == "lpad" ||
-        n == "rpad" || n == "lstrip" || n == "rstrip" || n == "strip" ||
-        n == "readln" || n == "read" || n == "tmpdir")
+    if (n == "str" || n == "typestr" || n == "kindstr" || n == "chr" ||
+        n == "join" || n == "lpad" || n == "rpad" || n == "lstrip" ||
+        n == "rstrip" || n == "strip" || n == "readln" || n == "read" ||
+        n == "tmpdir")
         return A.str_ty();
+
+    /* type(x) / decltype(v) -> a Type reflection object (native composite) */
+    if (n == "type" || n == "decltype") {
+        const StructTypeDef *ty = native_struct_type_def();
+        return A.struct_ty(ty, ty->name);
+    }
 
     if (n == "split" || n == "splitlines" || n == "readlines")
         return A.array_of(A.str_ty());
@@ -3071,14 +3079,44 @@ static const char *sty_kind_string(STyRef t)
 }
 
 /*
- * Compile-time TYPE QUERIES - `decltype(var)`, `typestr(expr)`, `kindstr(expr)`
- * - fold to a string literal of the argument's STATIC type (the arg is an
- * UNEVALUATED operand, like C++ decltype/sizeof). `decltype` takes an
- * identifier (a variable); `typestr`/`kindstr` take any expression and use its
- * inferred type. `typestr` is the full structural string, `kindstr` the bare
- * kind. Returns false when the call is not one of these. The folded literal
- * replaces args[0]; the runtime builtin returns it (or, under -nti, reads the
- * value's runtime type).
+ * Build the native `Type` reflection object for a static type, recursively
+ * (elem/key/val), as a boxed StructObject. PRE-GENERATED at compile time and
+ * baked as a const LiteralObj by fold_type_query - never created at runtime.
+ */
+static EvalValue build_type_value(STyRef t)
+{
+    t = sty_resolve(t);
+    StructTypeDef *td = const_cast<StructTypeDef *>(native_struct_type_def());
+    auto obj = make_intrusive<StructObject>(td);
+
+    obj->fields.emplace_back(
+        EvalValue(SharedStr(std::string(sty_kind_string(t)))), false);
+    obj->fields.emplace_back(EvalValue(SharedStr(sty_to_string(t))), false);
+    obj->fields.emplace_back(
+        EvalValue(t->opt && t->kind != STyKind::None), false);
+
+    EvalValue elem, key, val;   /* default-constructed = none */
+    if (t->kind == STyKind::Array && t->elem) {
+        elem = build_type_value(t->elem);
+    } else if (t->kind == STyKind::Dict) {
+        if (t->key) key = build_type_value(t->key);
+        if (t->val) val = build_type_value(t->val);
+    }
+    obj->fields.emplace_back(elem, false);
+    obj->fields.emplace_back(key, false);
+    obj->fields.emplace_back(val, false);
+
+    return EvalValue(intrusive_ptr<StructObject>(obj));
+}
+
+/*
+ * Compile-time TYPE QUERIES with an UNEVALUATED operand (like C++ decltype/
+ * sizeof): `type(expr)`/`decltype(var)` fold to a baked `Type` OBJECT
+ * (LiteralObj) of the argument's static type, `typestr(expr)`/`kindstr(expr)`
+ * to a string literal (the full structural string / the bare kind). `decltype`
+ * takes a variable; the others take any expression. Returns false when the call
+ * is none of these. The folded literal replaces args[0]; the runtime builtin
+ * returns it (or, under -nti, reads the value's runtime type).
  */
 bool Inferencer::fold_type_query(CallExpr *call)
 {
@@ -3086,10 +3124,11 @@ bool Inferencer::fold_type_query(CallExpr *call)
     if (!cid)
         return false;
     const std::string_view fn = cid->uid->val;
+    const bool is_type     = fn == "type";
     const bool is_decltype = fn == "decltype";
     const bool is_typestr  = fn == "typestr";
     const bool is_kindstr  = fn == "kindstr";
-    if (!is_decltype && !is_typestr && !is_kindstr)
+    if (!is_type && !is_decltype && !is_typestr && !is_kindstr)
         return false;
 
     /* a real user symbol of that name shadows the builtin - not our call.
@@ -3121,9 +3160,11 @@ bool Inferencer::fold_type_query(CallExpr *call)
             return false;   /* type not determined yet: leave for runtime */
     }
 
-    const std::string s = is_kindstr ? std::string(sty_kind_string(t))
-                                     : sty_to_string(t);
-    args->elems[0] = make_unique<LiteralStr>(std::string_view(s));
+    if (is_type || is_decltype)              /* -> a baked Type object */
+        args->elems[0] = make_unique<LiteralObj>(build_type_value(t), true);
+    else                                     /* typestr / kindstr -> string */
+        args->elems[0] = make_unique<LiteralStr>(std::string_view(
+            is_kindstr ? std::string(sty_kind_string(t)) : sty_to_string(t)));
     return true;
 }
 

@@ -59,37 +59,51 @@ EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
     exit(static_cast<int>(e.get<int_type>()));
 }
 
+/*
+ * Build a flat (non-recursive) `Type` reflection object from a runtime VALUE -
+ * the -nti fallback for type()/decltype() (no inference, so no static type to
+ * bake; the normal path folds a recursive Type at compile time instead).
+ */
+static EvalValue make_runtime_type_value(const EvalValue &v)
+{
+    StructTypeDef *td = const_cast<StructTypeDef *>(native_struct_type_def());
+    auto obj = make_intrusive<StructObject>(td);
+    obj->fields.emplace_back(EvalValue(TypeNames[v.get_type()->t]), false);
+    obj->fields.emplace_back(EvalValue(SharedStr(reflect_typeof(v))), false);
+    obj->fields.emplace_back(EvalValue(false), false);   /* nullable */
+    obj->fields.emplace_back(EvalValue(), false);         /* elem (none) */
+    obj->fields.emplace_back(EvalValue(), false);         /* key  (none) */
+    obj->fields.emplace_back(EvalValue(), false);         /* val  (none) */
+    return EvalValue(intrusive_ptr<StructObject>(obj));
+}
+
+/*
+ * type(x) / decltype(v): a `Type` reflection OBJECT (native composite) of x's
+ * runtime / v's static type - `.kind`, `.name`, `.nullable`, and the recursive
+ * `.elem` / `.key` / `.val`. The inferencer PRE-GENERATES the object at compile
+ * time (a baked const LiteralObj) and these hand it back; the body below runs
+ * only under -nti, building a flat Type from the runtime value.
+ */
 EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
-
-    return TypeNames[e.get_type()->t];
+    if (dynamic_cast<LiteralObj *>(arg))   /* folded Type object */
+        return RValue(arg->eval(ctx));
+    return make_runtime_type_value(RValue(arg->eval(ctx)));
 }
 
-/*
- * decltype(var): the STATIC (declared or inferred) type of a VARIABLE, as a
- * string - e.g. "int", "opt int", "array<int>", a struct name. Unlike type()
- * (the runtime type of a VALUE - so `int? a` holding none reads as "none"),
- * this is a property of the IDENTIFIER, resolved at compile time. The
- * inferencer validates the argument is an identifier in scope and folds it to a
- * LiteralStr of its static type, which this returns. Under -nti (no inference)
- * the argument stays an identifier - fall back to the runtime type, like type().
- */
 EvalValue builtin_decltype(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-
-    if (dynamic_cast<LiteralStr *>(arg))   /* folded by the inferencer */
+    if (dynamic_cast<LiteralObj *>(arg))   /* folded Type object */
         return RValue(arg->eval(ctx));
-
-    return TypeNames[RValue(arg->eval(ctx)).get_type()->t];
+    return make_runtime_type_value(RValue(arg->eval(ctx)));
 }
 
 /*
@@ -187,7 +201,6 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("int", builtin_int),
     make_const_builtin("float", builtin_float),
     make_const_builtin("clone", builtin_clone),
-    make_const_builtin("type", builtin_type),
     make_const_builtin("hash", builtin_hash),
 
     /* Array or container builtins */
@@ -286,6 +299,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* Compile-time type queries (folded by the inferencer; the runtime body is
      * a -nti fallback). decltype(var) takes a variable; typestr/kindstr take an
      * expression - the full structural string vs the bare kind. */
+    make_builtin("type", builtin_type),
     make_builtin("decltype", builtin_decltype),
     make_builtin("typestr", builtin_typestr),
     make_builtin("kindstr", builtin_kindstr),

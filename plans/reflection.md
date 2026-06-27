@@ -84,8 +84,12 @@ reflection costs no memory). `typestr`/`kindstr` give the string forms cheaply.
 `Type` is another native composite type (item 4's machinery), recursive via the
 `opt Type` self-reference.
 
-## Status
+## Status - DONE
 
-- DONE: the string family (`typestr`/`kindstr`; `typeof` removed).
-- NEXT: `Type` objects (`type`/`decltype`) - converts `type(x)==K` ->
-  `kindstr(x)==K` and `decltype(x)==S` -> `decltype(x).name`.
+- The string family: `typestr`/`kindstr` (compile-time, unevaluated); `typeof`
+  removed.
+- `Type` objects: `type(expr)`/`decltype(var)` fold to a baked const `Type`
+  `LiteralObj` (recursive elem/key/val); `make_runtime_type_value` is the -nti
+  fallback. `type(x)==K` test sites became `kindstr(x)==K`, `decltype(x)==S`
+  became `decltype(x).name==S`. The recursive `opt Type` fields need an
+  if-narrow to read (sound). See CLAUDE.md "Compile-time TYPE QUERIES".
