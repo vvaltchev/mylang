@@ -44,10 +44,13 @@ struct FlowState {
  * The name-resolution pass assigns each resolved local a fixed slot index, so
  * access is an O(1) array index here instead of a scope-chain map lookup. A
  * call's Frame is created in do_func_call and shared by every nested block of
- * that call (EvalContext::frame is inherited from the parent). `live` is a
- * bitmask of which slots are currently defined - needed because undef() can
- * remove a binding and slots cannot hold the UndefinedId sentinel (LValue
- * forbids it). Slot count is capped at 64 so the mask fits a single word.
+ * that call (EvalContext::frame is inherited from the parent). There is no
+ * per-slot liveness bitmask: every slot is default-constructed when the Frame
+ * is built, and a local can only RESOLVE to its slot after its declaration
+ * (no-hoist forward resolution), so a slot is always bound before any read -
+ * a use-before-decl resolves to an outer binding or errors via the map, never
+ * to the slot. (That removed the old 64-slot-per-frame cap; the slot count is
+ * unbounded now.)
  *
  * The Frame lives on do_func_call's C++ stack. For the common case
  * (frame_size <= INLINE_SLOTS) its slots are placement-constructed into an
@@ -64,19 +67,15 @@ struct Frame {
     std::vector<LValue> heap_buf;   /* spill when frame_size > INLINE_SLOTS */
     LValue *slots = nullptr;
     int inline_count = 0;           /* # slots placement-built in inline_buf */
-    uint64_t live = 0;
 
     Frame() = default;
     Frame(const Frame &) = delete;  /* never copied; slots would dangle */
     Frame(Frame &&) = delete;
 
-    /* Make `slots` point at storage holding exactly `frame_size` live slots. */
+    /* Make `slots` point at storage holding exactly `frame_size` slots. */
     void init(int frame_size)
     {
-        /* `live` is one 64-bit word: at most 64 trackable slots. The resolver's
-         * slot budget must keep every frame within that, or a slot >= 64 would
-         * be untrackable (silently always-undefined). */
-        ML_CHECK(frame_size >= 0 && frame_size <= 64);
+        ML_CHECK(frame_size >= 0);
 
         if (frame_size > INLINE_SLOTS) {
 
@@ -110,10 +109,11 @@ struct Frame {
  * The program-wide table of top-level (named) functions. Each gets a STATIC
  * slot index at compile time (the resolver's hoist), so a reference resolves to
  * SymKind::global + that index and reads this table from any call depth - the
- * function analogue of variable slotting. Unlike a per-call Frame it has NO
- * 64-slot limit (a plain vector, sized once to the static function count, never
- * grown). A slot is `defined` only after its decl executes, so a call that
- * reaches a function before its definition runs reads as undefined. Lexical
+ * function analogue of variable slotting. A plain vector, sized once to the
+ * static function count and never grown (no slot limit). A slot is `defined`
+ * only after its decl executes (forward-ref tracking - the table is the one
+ * place that still needs definedness, since functions are hoisted), so a call
+ * reaching a function before its definition runs reads as undefined. Lexical
  * reachability is a COMPILE-TIME decision (an out-of-scope name simply never
  * resolves to a slot); the table itself holds every top-level function.
  */
@@ -174,10 +174,9 @@ public:
      * call depth (inherited from the parent; the root block owns it). A
      * top-level function is a `SymKind::global` slot in here, so a global /
      * recursive / mutually-recursive call is an O(1) table read instead of a
-     * scope-chain map walk - the function analogue of variable slotting, with
-     * NO per-frame 64-slot limit. nullptr when the program declares no
-     * top-level functions (or in the REPL, where top-level names stay in the
-     * map).
+     * scope-chain map walk - the function analogue of variable slotting.
+     * nullptr when the program declares no top-level functions (or in the REPL,
+     * where top-level names stay in the map).
      */
     GlobalFuncTable *gfuncs;
 

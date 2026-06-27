@@ -991,10 +991,10 @@ public:
     /*
      * Slot range [slot_start, slot_start + slot_count) of the resolved locals
      * declared inside this block (assigned by the resolver; 0/0 when the block
-     * has no slotted locals or its function isn't resolved). Block::do_eval
-     * clears these slots' live bits on entry so a re-entered block (e.g. a loop
-     * body) starts with its locals undefined again - matching the old
-     * fresh-EvalContext-per-iteration semantics.
+     * has no slotted locals or its function isn't resolved). A re-entered block
+     * (e.g. a loop body) re-binds its locals via their decls, which re-run each
+     * iteration, so no slot reset is needed - the range is kept for the
+     * scope_free determination below and for documentation.
      */
     int slot_start = 0;
     int slot_count = 0;

@@ -107,25 +107,10 @@ LValue *EvalContext::lookup(const Identifier *id)
 
 bool EvalContext::erase(const Identifier *id)
 {
-    if (id->sym.kind == SymKind::local && frame) {
-
-        /* undef() on a resolved local: clear its live bit (cannot store the
-         * UndefinedId sentinel in a slot - LValue forbids it). */
-        const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
-        const bool was_defined = frame->live & bit;
-        frame->live &= ~bit;
-        return was_defined;
-    }
-
-    if (id->sym.kind == SymKind::global && gfuncs) {
-
-        /* undef() on a top-level function: clear its global-table defined flag
-         * (a later reference reads "undefined" until re-bound). */
-        const bool was_defined = gfuncs->defined[id->sym.slot];
-        gfuncs->defined[id->sym.slot] = 0;
-        return was_defined;
-    }
-
+    /* Only map-resident symbols are erasable (REPL globals: the `:undef`
+     * command, and the redefinition / instance-GC paths). Slotted locals and
+     * global-table functions have no removal mechanism - a script has no undef,
+     * and the REPL keeps its top-level names in the map. */
     const auto &it = symbols.find(id->uid);
 
     if (it == symbols.end())
@@ -223,8 +208,7 @@ float_type Construct::eval_float(EvalContext *ctx) const
  * undefined-variable error) for non-slotted or undefined symbols. */
 int_type Identifier::eval_int(EvalContext *ctx) const
 {
-    if (sym.kind == SymKind::local && ctx->frame &&
-        (ctx->frame->live & (static_cast<uint64_t>(1) << sym.slot))) {
+    if (sym.kind == SymKind::local && ctx->frame) {
         const LValue &lv = ctx->frame->slots[sym.slot];
         if (lv.is<bool>())
             return lv.getval<bool>() ? 1 : 0;   /* bool slot -> int 0/1 */
@@ -235,8 +219,7 @@ int_type Identifier::eval_int(EvalContext *ctx) const
 
 float_type Identifier::eval_float(EvalContext *ctx) const
 {
-    if (sym.kind == SymKind::local && ctx->frame &&
-        (ctx->frame->live & (static_cast<uint64_t>(1) << sym.slot))) {
+    if (sym.kind == SymKind::local && ctx->frame) {
         const LValue &lv = ctx->frame->slots[sym.slot];
         if (lv.is<int_type>())
             return static_cast<float_type>(lv.getval<int_type>());
@@ -250,14 +233,10 @@ float_type Identifier::eval_float(EvalContext *ctx) const
 EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 {
     if (sym.kind == SymKind::local && ctx->frame) {
-
-        /* Resolved local: an O(1) slot read instead of a scope-chain walk. */
-        const uint64_t bit = static_cast<uint64_t>(1) << sym.slot;
-
-        if (ctx->frame->live & bit)
-            return EvalValue(&ctx->frame->slots[sym.slot]);
-
-        return UndefinedId{get_str()};   /* slot exists but was undef()'d */
+        /* Resolved local: an O(1) slot read instead of a scope-chain walk. The
+         * slot is always bound (a local resolves to its slot only after its
+         * decl - no-hoist resolution), so no liveness check is needed. */
+        return EvalValue(&ctx->frame->slots[sym.slot]);
     }
 
     if (sym.kind == SymKind::global && ctx->gfuncs) {
@@ -333,7 +312,6 @@ bind_param(EvalContext *args_ctx,
 
     if (frame) {
         frame->slots[idx] = LValue(move(val), is_const);
-        frame->live |= static_cast<uint64_t>(1) << idx;
     } else {
         args_ctx->emplace(param, move(val), is_const);
     }
@@ -2116,10 +2094,10 @@ handle_single_expr14(EvalContext *ctx,
     const EvalValue &rval = *rvalp;
 
     /*
-     * Fast path: declaring a resolved local. Write its slot and mark it live.
-     * The resolver already rejected illegal same-block redeclarations and the
-     * enclosing block cleared this slot's live bit on entry, so we just
-     * (over)write - which is also exactly what a loop re-entry needs. The
+     * Fast path: declaring a resolved local. Write its slot. The resolver
+     * already rejected illegal same-block redeclarations, so we just
+     * (over)write - which is also exactly what a loop re-entry needs (the decl
+     * re-binds the slot each iteration). The
      * dynamic_cast is gated on inDecl so plain assignments (the hot path, e.g.
      * `s += i`) never pay for it; an assignment to a resolved local instead
      * flows through the normal lvalue->eval() -> LValue* -> doAssign path
@@ -2132,7 +2110,6 @@ handle_single_expr14(EvalContext *ctx,
             Frame *f = ctx->frame;
             f->slots[id->sym.slot] =
                 LValue(RValue(rval), ctx->const_ctx || lvalue->is_const);
-            f->live |= static_cast<uint64_t>(1) << id->sym.slot;
             return rval;
         }
 
@@ -2151,9 +2128,8 @@ handle_single_expr14(EvalContext *ctx,
         if (const Identifier *id = as_resolved_local(lvalue)) {
 
             Frame *f = ctx->frame;
-            const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
 
-            if (f && (f->live & bit)) {
+            if (f) {
 
                 LValue &lv = f->slots[id->sym.slot];
 
@@ -2328,9 +2304,8 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
             if (rhs_int) {
 
                 Frame *f = ctx->frame;
-                const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
 
-                if (f && (f->live & bit)) {
+                if (f) {
 
                     LValue &lv = f->slots[id->sym.slot];
 
@@ -2431,8 +2406,7 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
     if (!ctx->const_ctx) {
         if (const Identifier *id = as_resolved_local(lvalue.get())) {
             Frame *f = ctx->frame;
-            const uint64_t bit = static_cast<uint64_t>(1) << id->sym.slot;
-            if (f && (f->live & bit)) {
+            if (f) {
                 LValue &lv = f->slots[id->sym.slot];
                 if (!lv.is_const_var()) {
                     if (lv.is<int_type>()) {
@@ -2577,29 +2551,18 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
     );
 }
 
-/* Live-bit mask for a block's contiguous slot range [start, start+count). */
-static inline uint64_t
-block_slot_mask(int slot_start, int slot_count)
-{
-    if (slot_count >= 64)
-        return ~static_cast<uint64_t>(0);
-    return ((static_cast<uint64_t>(1) << slot_count) - 1) << slot_start;
-}
-
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
     /*
      * Scope-free fast path: this block declares only frame slots, so it never
      * uses the EvalContext map. Run its statements directly in the parent
      * context, skipping the per-entry EvalContext construction/destruction.
-     * Only the slot range still needs clearing on entry (re-entry semantics).
-     * The root block (ctx == nullptr) always takes the full path below, since
-     * it owns the program's context and frame.
+     * A re-entered block's locals are re-bound by their decls (which re-run
+     * each iteration), so no slot clearing is needed. The root block
+     * (ctx == nullptr) always takes the full path below, since it owns the
+     * program's context and frame.
      */
     if (scope_free && ctx) {
-
-        if (ctx->frame && slot_count)
-            ctx->frame->live &= ~block_slot_mask(slot_start, slot_count);
 
         for (const auto &e : elems) {
 
@@ -2647,18 +2610,11 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
     }
 
     /*
-     * Reset this block's resolved locals to "undefined" on entry. The slots
-     * persist for the whole call, so without this a re-entered block (a loop
-     * body, say) would still see the previous iteration's bindings live. The
-     * resolver guarantees a block's slots are a contiguous range, so one mask
-     * op clears them; slot_count == 0 (no slotted locals / unresolved function)
-     * makes this a no-op. Params live below the body block's range, so they are
-     * never cleared here.
+     * No per-block slot reset on entry: a re-entered block (a loop body)
+     * re-binds its locals via their decls, which re-run each iteration, and a
+     * local resolves to its slot only after its decl - so the stale prior value
+     * is never observed.
      */
-    if (curr.frame && slot_count) {
-
-        curr.frame->live &= ~block_slot_mask(slot_start, slot_count);
-    }
 
     for (const auto &e: elems) {
 
@@ -2954,7 +2910,6 @@ do_catch(EvalContext *ctx,
                     Frame *f = catch_ctx.frame;
                     f->slots[asId->sym.slot] =
                         LValue(move(bind_val), ctx->const_ctx);
-                    f->live |= static_cast<uint64_t>(1) << asId->sym.slot;
 
                 } else {
 
@@ -3103,7 +3058,6 @@ bind_loop_var(EvalContext *ctx, bool decl, Identifier *id, const EvalValue &val)
     if (id->sym.kind == SymKind::local && ctx->frame) {
         Frame *f = ctx->frame;
         f->slots[id->sym.slot] = LValue(val, id->is_const);
-        f->live |= static_cast<uint64_t>(1) << id->sym.slot;
         return;
     }
 

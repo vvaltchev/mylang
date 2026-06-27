@@ -62,8 +62,11 @@ bool MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out,
 
 namespace {
 
-/* Max slots per frame: Frame::live is one 64-bit word, one bit per slot. */
-constexpr int MAX_SLOTS = 64;
+/* Max slots per frame. The Frame no longer has a fixed-width liveness word
+ * (slots are just default-constructed storage), so this is only a generous
+ * sanity backstop - a function with more than this many locals falls back to
+ * the map (effectively never hit). */
+constexpr int MAX_SLOTS = 1 << 20;
 
 void for_each_child(Construct *c, const std::function<void(Construct *)> &fn);
 
