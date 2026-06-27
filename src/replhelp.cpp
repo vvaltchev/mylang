@@ -114,7 +114,7 @@ const BuiltinDoc builtin_docs[] = {
   "REPL, :show <name> also renders the <name>$N clones with their inferred "
   "param/return types, syntax-highlighted." },
 { "array_storage", "reflect", "array_storage(a)",
-  "The array's storage kind: \"ints\"/\"floats\"/\"bools\"/\"structs\"/"
+  "The array's storage, by element type: \"int\"/\"float\"/\"bool\"/\"struct\"/"
   "\"general\".",
   "Decided once at creation from the proven static type; never converted "
   "afterward. Flat vs general differ only in speed/memory." },
@@ -621,7 +621,7 @@ const LangFeature lang_features[] = {
   "dispatch and no intermediate boxing - ~2-3x on numeric loops. :analyze "
   "marks specialized call sites." },
 { "flatarrays", "optimizations", "Flat arrays",
-  "array_storage(a) == \"ints\"",
+  "array_storage(a) == \"int\"",
   "A homogeneous int/float/bool array (and array<PodStruct>) is stored unboxed "
   "(8 bytes per int/float, ONE byte per bool), decided from the proven static "
   "type and never converted. See :help flatstorage / :trace arrays." },

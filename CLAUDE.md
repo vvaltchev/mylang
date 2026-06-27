@@ -1751,9 +1751,9 @@ are unchanged.
   (`builtin_dynarray`: a fresh general copy, typed `array<dyn>`, usable in any
   position; `clone`/`deepclone` deliberately preserve the layout). `runtime()`
   does *not* promote — it only relabels the static type, not the storage.
-  `array_storage(a)` reports
-  `"ints"`/`"floats"`/`"bools"`/`"general"` (tests pin it). **Gotcha:** any pass
-  that
+  `array_storage(a)` reports the element-type name
+  `"int"`/`"float"`/`"bool"`/`"struct"`/`"general"` (tests pin it). **Gotcha:**
+  any pass that
   inspects a const array's element type must read from `skind()`, not
   `get_view()`/`get_vec()` (now they'd throw on flat anyway). `array()` is a
   **non-const** builtin (never folds to a baked literal, so `array(N)` is always
@@ -1905,7 +1905,7 @@ but the per-element `StructObject` allocation is gone (build overhead
   its value). Cold ops (insert/sort/map/...) **auto-promote** to a general array
   via `get_vec()`'s `promote_structs_to_general()`, so every existing array op
   works with no dedicated case and nothing throws. `array_storage` reports
-  `"structs"`.
+  `"struct"`.
 
 - **Direct (unboxed) field access** (M8, phase 8). The inferencer stamps a
   `TypeHint` on `s.x` when the field is a non-null int/float; `MemberExpr::

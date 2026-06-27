@@ -39,7 +39,7 @@ static const std::array<SharedStr, Type::t_count> TypeNames =
     string("struct_type"),
     string("str"),
     string("func"),
-    string("arr"),
+    string("array"),
     string("exception"),
     string("dict"),
     string("struct"),

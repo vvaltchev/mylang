@@ -249,7 +249,7 @@ aspects:
     `0`, `none`, and an empty string/array/dict are false, everything else is
     true — so any value can still be used as a condition. Arrays of `bool` get a
     compact one-byte-per-element flat representation (`array_storage()` reports
-    `"bools"`), like flat `int`/`float` arrays.
+    `"bool"`), like flat `int`/`float` arrays.
 
   - The assignment operator `=` can be used like in `C`, inside expressions, but
     there's no such thing as the comma operator, because of the array-expansion
@@ -1534,7 +1534,7 @@ at parse time. An `array` of a struct type infers as `array<Struct>`
 **Layout.** A struct whose fields are all `bool`/`int`/`float` (or other such
 POD structs, embedded inline) gets a compact native-C byte layout, and an
 `array` of it is stored **flat/unboxed** — contiguous bytes, no per-element
-object — just like `array<int>` (`array_storage(a)` reports `"structs"`). A
+object — just like `array<int>` (`array_storage(a)` reports `"struct"`). A
 struct with any `array`/`dict`/`str`/`dyn`/`opt` field is stored as a boxed
 slot array instead. This is transparent: it changes only memory layout and
 speed, never behavior.
@@ -1715,7 +1715,7 @@ source). Scalars and strings are returned unchanged.
 
 #### `type(value)`
 Return the name of the type of the given **value** in string-form (e.g. `"int"`,
-`"bool"`, `"str"`, `"arr"`). This is the value's *runtime* type, so a nullable
+`"bool"`, `"str"`, `"array"`). This is the value's *runtime* type, so a nullable
 variable that currently holds `none` reads as `"none"`. For the *declared/static*
 type of a **variable** (e.g. `"int?"` for an `int? a` that is none), use
 [`decltype(var)`](#decltypevariable). Useful for debugging.
@@ -2083,11 +2083,12 @@ It's currently used in tests to check if two array slices refer internally
 to the same object.
 
 #### `array_storage(array)`
-Return the array's internal storage as a string: `"ints"`, `"floats"`, or
-`"bools"` for a compact *flat* (unboxed) array (8 bytes per element for
-int/float, **one byte** per element for bool), or `"general"` otherwise. This
-is purely an introspection aid (mainly for tests) — flat and general arrays
-behave identically; the only observable difference is speed and memory.
+Return the array's internal storage, named by the element type: `"int"`,
+`"float"`, `"bool"`, or `"struct"` for a compact *flat* (unboxed) array (8 bytes
+per element for int/float, **one byte** per element for bool, packed C structs
+for `struct`), or `"general"` for the boxed representation otherwise. This is
+purely an introspection aid (mainly for tests) — flat and general arrays behave
+identically; the only observable difference is speed and memory.
 
 An array's storage is **decided once, at creation, from its proven static
 type** — it is never converted afterward (no runtime "promotion", so no

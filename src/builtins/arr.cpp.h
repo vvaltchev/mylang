@@ -212,11 +212,12 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
 }
 
 /*
- * Introspection: report an array's backing-storage specialization as a string -
- * "ints" / "floats" for flat (unboxed) storage, "general" for vector<LValue>.
- * type() can't express this (flat and general are the same t_arr); this exists
- * mainly so tests can pin the representation and catch regressions. Not const:
- * it reflects a runtime fact and must not fold.
+ * Introspection: report an array's backing-storage specialization, named by the
+ * element TYPE for the flat (unboxed) kinds - "int" / "float" / "bool" /
+ * "struct" - or "general" for the boxed vector<LValue>. type() can't express
+ * this (flat and general are the same t_arr); this exists mainly so tests can
+ * pin the representation and catch regressions. Not const: it reflects a
+ * runtime fact and must not fold.
  */
 EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList)
 {
@@ -231,13 +232,13 @@ EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList)
 
     switch (e.get<SharedArrayObj>().skind()) {
         case SharedArrayObj::Storage::ints:
-            return SharedStr(string("ints"));
+            return SharedStr(string("int"));
         case SharedArrayObj::Storage::floats:
-            return SharedStr(string("floats"));
+            return SharedStr(string("float"));
         case SharedArrayObj::Storage::bools:
-            return SharedStr(string("bools"));
+            return SharedStr(string("bool"));
         case SharedArrayObj::Storage::structs:
-            return SharedStr(string("structs"));
+            return SharedStr(string("struct"));
         default:
             return SharedStr(string("general"));
     }
