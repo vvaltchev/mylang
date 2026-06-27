@@ -1252,12 +1252,15 @@ sanitizers never reproduced it.)
   FUNCTION names and every top-level variable a function DOES read**
   (`SymKind::global`, the program-wide global table — see next bullet), **plus a
   closure's captured variables** (`SymKind::capture`, the closure's per-instance
-  vector — see *capture slotting* below). So *every* user symbol — local,
-  global, function, or capture — is an O(1) slot, never a map walk; the
+  vector — see *capture slotting* below), **plus builtins not shadowed by a user
+  symbol** (`SymKind::builtin`, the program-wide builtin table — see *builtin
+  slotting* below). So *every* name a script resolves — local, global, function,
+  capture, or builtin — is an O(1) slot, never a scope-chain map walk; the
   resolver's pass 1 collects the names functions read (`escaped`) and pass 2
   routes an escaped top-level var into the global table rather than a main-frame
-  slot. **Not slotted (stay in the map):** builtins, REPL globals, and anything
-  genuinely unresolved (it falls back to the map, so the pass is purely an
+  slot. **Not slotted (stay in the map):** REPL top-level names (open-world
+  redefinition) and anything genuinely unresolved (a truly-undefined name → the
+  runtime map → `UndefinedVariableEx`; the map fallback keeps the pass purely an
   optimization). The resolver does a forward
   lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
   `x`; top-level *functions* ARE hoisted — see next bullet). **No per-slot
@@ -1354,6 +1357,36 @@ sanitizers never reproduced it.)
   `TypeFunc::clone`). `capture_ctx` survives only as the empty linking context
   that parents the body's args-context to root (for `gfuncs` + the builtins
   map).
+- **Builtins are slotted (`SymKind::builtin`).** A builtin reference the
+  resolver couldn't shadow with a user symbol resolves to `SymKind::builtin`
+  plus an index into the program-wide **builtin table** (`builtin_slot`,
+  `types.cpp`: a flat `vector<LValue>` built once from `const_builtins` +
+  `builtins`), read by
+  `Identifier::do_eval` — an O(1) slot, **no scope-chain map walk for `print`,
+  `len`, `max`, …**. With this, a compiled script's hot path never walks the map
+  for ANY name; the runtime `EvalContext::symbols` map is touched only by the
+  REPL (open-world redefinition) and the parse-time const-evaluator (which runs
+  before slots exist), and as the fallback for a genuinely-undefined name. **A
+  user symbol always wins** — the resolver checks scopes (local/param/capture)
+  then the global table (user functions + escaped vars) BEFORE the builtin
+  table, so a `func len(x)` shadow resolves to `SymKind::global` and the builtin
+  is unreachable by name (`var <builtin>` for a *const* builtin is still a
+  parse-time `CannotRebindBuiltinEx` via the parser's `declExprCheckId`,
+  untouched). Builtin resolution for a function-body name is **deferred** to
+  post-pass-2 alongside escaped-ref stamping (`stamp_builtin`), because a user
+  `var print` read by a function (vars aren't hoisted) must still win — a user
+  global, else a builtin, else the map. Table entries are forced **is_const**,
+  so an `aBuiltin = x` assignment to an unshadowed builtin still raises
+  `CannotRebindBuiltinEx` and the shared singleton table can't be corrupted
+  (it outlives any one program, e.g. across `-rt` tests). **Const-context
+  subtlety:** in a const-eval context (`AutoConst` / the inliner's `refold`,
+  both `cctx(nullptr, true)`) `do_eval` makes a SymKind::builtin read return
+  `UndefinedId` for a *runtime* builtin (only `const_builtins` are visible
+  there, mirroring the const `EvalContext`) — so an `append()`/`print()` call
+  stays unfoldable (those passes catch the resulting `UndefinedVariableEx` to
+  keep it a runtime call); without this an `append(const_arr, …)` would be
+  wrongly evaluated at compile time. Not used in the REPL (builtins stay
+  map-resident, so they remain redefinable).
 - **`UniqueId`** (`uniqueid.h`) interns identifier strings in a global
   `std::set`; symbols are keyed
   by the interned *pointer*, so lookup is pointer comparison. (Global mutable

@@ -3,6 +3,9 @@
 #include "eval.h"
 #include "bitops.h"
 #include "hashing.h"
+
+#include <unordered_map>
+#include <vector>
 #include "evaltypes.cpp.h"
 #include "types/int.cpp.h"
 #include "types/bool.cpp.h"
@@ -272,3 +275,64 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("remove", builtin_remove),
     make_builtin("tmpdir", builtin_tmpdir),
 };
+
+/*
+ * The program-wide builtin table (see eval.h): a flat vector of every builtin's
+ * value for O(1) SymKind::builtin access, plus a name->index map for the
+ * resolver. Built once, lazily, on first lookup - by which time both builtin
+ * maps are fully static-initialized. const_builtins are added first so that on
+ * the (non-existent today) chance a name is in both, the const one wins -
+ * matching the runtime root map, whose std::map::insert keeps the const entry.
+ * Every entry is forced is_const, so an `aBuiltin = x` assignment to an
+ * unshadowed builtin raises CannotRebindBuiltinEx and the shared table can't be
+ * mutated (it outlives any one program, e.g. across -rt tests).
+ */
+static std::vector<LValue> g_builtin_slots;
+/* Per slot: did this builtin come from const_builtins? A const-eval context
+ * (AutoConst / the inliner's refold) must see ONLY const builtins - mirroring
+ * the const EvalContext, which loads only const_builtins - so a runtime-builtin
+ * call there stays unfoldable (those passes rely on the resulting "undefined"
+ * to keep it a runtime call). See Identifier::do_eval. */
+static std::vector<char> g_builtin_is_const;
+static std::unordered_map<const UniqueId *, int> g_builtin_index;
+
+static void
+build_builtin_table_once()
+{
+    if (!g_builtin_index.empty())
+        return;
+
+    const auto add = [](const UniqueId *uid, const LValue &lv, bool is_const) {
+        if (g_builtin_index.count(uid))
+            return;
+        g_builtin_index[uid] = static_cast<int>(g_builtin_slots.size());
+        g_builtin_slots.emplace_back(lv.get(), /*is_const=*/true);
+        g_builtin_is_const.push_back(is_const ? 1 : 0);
+    };
+
+    for (const auto &kv : EvalContext::const_builtins)
+        add(kv.first, kv.second, /*is_const=*/true);
+
+    for (const auto &kv : EvalContext::builtins)
+        add(kv.first, kv.second, /*is_const=*/false);
+}
+
+int
+builtin_slot_index(const UniqueId *uid)
+{
+    build_builtin_table_once();
+    const auto it = g_builtin_index.find(uid);
+    return it != g_builtin_index.end() ? it->second : -1;
+}
+
+LValue &
+builtin_slot(int index)
+{
+    return g_builtin_slots[index];
+}
+
+bool
+builtin_is_const(int index)
+{
+    return g_builtin_is_const[index] != 0;
+}
