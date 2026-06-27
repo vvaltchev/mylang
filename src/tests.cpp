@@ -5775,7 +5775,8 @@ static const std::vector<test> tests =
         {
             "var a = [\"aa\", \"bb\", \"cc\", \"dd\", \"ee\"];",
             "var s = a[1:3];",
-            "var f = tmpdir() + \"/mylang_test_io_writelines.tmp\";",
+            "var f = tmpdir() + \"/mylang_test_io_writelines_\""
+            " + str(rand(0, 999999999)) + \".tmp\";",
             "writelines(s, f);",
             "var lines = readlines(f);",
             "assert(remove(f));",   /* clean up the temp file */
@@ -5791,8 +5792,9 @@ static const std::vector<test> tests =
         "I/O: write / writeln / read a file round-trip",
         {
             "var d = tmpdir();",
-            "var f1 = d + \"/mylang_test_io_rw.tmp\";",
-            "var f2 = d + \"/mylang_test_io_rw2.tmp\";",
+            "var suf = str(rand(0, 999999999));",
+            "var f1 = d + \"/mylang_test_io_rw_\" + suf + \".tmp\";",
+            "var f2 = d + \"/mylang_test_io_rw2_\" + suf + \".tmp\";",
             "write(\"hello\\n\", f1);",
             /* writeln's newline goes to stdout, not the file, so the file
                holds just the value. */
@@ -5814,7 +5816,8 @@ static const std::vector<test> tests =
     {
         "I/O: remove() deletes a file and reports success/failure",
         {
-            "var f = tmpdir() + \"/mylang_test_remove.tmp\";",
+            "var f = tmpdir() + \"/mylang_test_remove_\""
+            " + str(rand(0, 999999999)) + \".tmp\";",
             "write(\"x\", f);",
             "assert(remove(f) == true);",   /* existed -> removed */
             "assert(remove(f) == false);",  /* gone now -> false, no throw */
@@ -9372,8 +9375,7 @@ static bool trace_pipeline_categories()
          * INLINES (n is a non-const param); helper(1) FOLDS (const pure call). */
         const char *src[] = {
             "func helper(x) => x + 1;",
-            "func compute(n) { var k = 5; print(helper(n) * k); "
-            "return n; }",
+            "func compute(n) { var k = 5; print(helper(n) * k); return n; }",
             "var a = [1, 2, 3];",
             "var fo = helper(1);",
             "var sv = compute(10);",

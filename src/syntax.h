@@ -436,7 +436,7 @@ public:
 
     NopConstruct() : Construct("nop", true, ConstructType::nop) { }
 
-    virtual void serialize(ostream &s, int level = 0) const {
+    void serialize(ostream &s, int level = 0) const override {
         /* NopConstructs should never remain in the final syntax tree */
         throw InternalErrorEx();
     }
