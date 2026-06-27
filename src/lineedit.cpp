@@ -63,16 +63,16 @@ void LineEditor::insert(char c)
     pos++;
 }
 
-/* Enter on an incomplete buffer: split the line here and auto-indent the new
- * line by the bracket depth up to the cursor (naive - tolerant of strings). */
-void LineEditor::newline()
+/* Net bracket depth of buf[0..upto), string-aware (a naive scan, tolerant of
+ * mid-edit input). Drives auto-indent for both Enter and a pasted block. */
+int LineEditor::indent_depth(size_t upto) const
 {
-    buf.insert(buf.begin() + pos, '\n');
-    pos++;
+    if (upto > buf.size())
+        upto = buf.size();
 
     int depth = 0;
     bool in_str = false;
-    for (size_t i = 0; i < pos; i++) {
+    for (size_t i = 0; i < upto; i++) {
         const char c = buf[i];
         if (in_str) {
             if (c == '"')
@@ -85,9 +85,100 @@ void LineEditor::newline()
             depth--;
         }
     }
+    return depth < 0 ? 0 : depth;
+}
+
+/* Enter on an incomplete buffer: split the line here and auto-indent the new
+ * line by the bracket depth up to the cursor. */
+void LineEditor::newline()
+{
+    buf.insert(buf.begin() + pos, '\n');
+    pos++;
+
+    const int depth = indent_depth(pos);
     for (int i = 0; i < depth * 2; i++) {
         buf.insert(buf.begin() + pos, ' ');
         pos++;
+    }
+}
+
+/*
+ * Insert a bracketed paste as inert text: never as editor commands (no submit
+ * on a newline, no Tab/Ctrl interpretation). The block is RE-INDENTED to the
+ * editor's own style - each line's original leading whitespace is dropped and
+ * replaced by bracket-depth indentation (2 spaces per level; a line that opens
+ * with a closing bracket dedents one level). Safe because MyLang whitespace is
+ * purely cosmetic. The first line is inserted verbatim when the cursor is
+ * mid-line (it continues what is already there); otherwise it is re-indented
+ * like the rest. Line endings are normalized and trailing blank lines dropped;
+ * tabs become a space and other control bytes are dropped.
+ */
+void LineEditor::apply_paste(const std::string &text)
+{
+    std::string norm;
+    norm.reserve(text.size());
+    for (size_t i = 0; i < text.size(); i++) {
+        const char c = text[i];
+        if (c == '\r') {
+            if (i + 1 < text.size() && text[i + 1] == '\n')
+                i++;                          /* CRLF -> one '\n' */
+            norm += '\n';
+        } else {
+            norm += c;
+        }
+    }
+    while (!norm.empty() && norm.back() == '\n')
+        norm.pop_back();
+
+    const bool first_inline = (cursor_col() != 0);   /* continuing a line? */
+
+    size_t start = 0, li = 0;
+    for (size_t i = 0; i <= norm.size(); i++) {
+
+        if (i != norm.size() && norm[i] != '\n')
+            continue;
+
+        const std::string line = norm.substr(start, i - start);
+        start = i + 1;
+
+        /* Clean the line: drop its own leading whitespace (unless this is the
+         * first line continuing existing text), turn tabs into a space, drop
+         * other control bytes. */
+        const bool keep_leading = (li == 0 && first_inline);
+        size_t b = 0;
+        if (!keep_leading)
+            while (b < line.size() && (line[b] == ' ' || line[b] == '\t'))
+                b++;
+        std::string content;
+        for (size_t k = b; k < line.size(); k++) {
+            const char ch = line[k];
+            if (ch == '\t')
+                content += ' ';
+            else if (static_cast<unsigned char>(ch) >= 32 &&
+                     static_cast<unsigned char>(ch) < 127)
+                content += ch;
+        }
+
+        if (li > 0) {                          /* a fresh line in the block */
+            buf.insert(buf.begin() + pos, '\n');
+            pos++;
+        }
+        if (li > 0 || !first_inline) {         /* re-indent this line */
+            int depth = indent_depth(pos);
+            if (!content.empty()) {
+                const char f = content[0];
+                if (f == ')' || f == ']' || f == '}')
+                    depth = depth > 0 ? depth - 1 : 0;
+            }
+            for (int s = 0; s < depth * 2; s++) {
+                buf.insert(buf.begin() + pos, ' ');
+                pos++;
+            }
+        }
+
+        for (char ch : content)
+            insert(ch);
+        li++;
     }
 }
 
@@ -292,6 +383,10 @@ void LineEditor::csi_final(unsigned char c)
                 pos = line_end(pos);                           /* end   */
             else if (esc_params == "3")
                 del_forward();                                 /* delete */
+            else if (esc_params == "200") {            /* bracketed paste on */
+                is_pasting = true;
+                paste_buf.clear();
+            }
             break;
         default:
             break;
@@ -300,6 +395,23 @@ void LineEditor::csi_final(unsigned char c)
 
 LineEditor::Action LineEditor::feed(unsigned char c)
 {
+    /* Bracketed paste in flight: swallow bytes verbatim (never as keystrokes -
+     * a newline must not submit, a Tab must not complete) until the end marker
+     * ESC[201~, then re-indent and insert the captured block. */
+    if (is_pasting) {
+        paste_buf += static_cast<char>(c);
+        static const std::string END = "\033[201~";
+        const size_t n = paste_buf.size();
+        if (n >= END.size() &&
+            paste_buf.compare(n - END.size(), END.size(), END) == 0) {
+            paste_buf.erase(n - END.size());
+            apply_paste(paste_buf);
+            paste_buf.clear();
+            is_pasting = false;
+        }
+        return Action::none;
+    }
+
     /* Multi-byte escape sequence in progress (arrows, Home/End, Delete). */
     if (esc == Esc::esc) {
         esc = (c == '[' || c == 'O') ? Esc::csi : Esc::none;
@@ -550,12 +662,24 @@ struct RawMode {
 
         if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0)
             ok = true;
+
+        if (ok) {
+            /* Enable bracketed paste so the editor receives a paste as data
+             * (wrapped in ESC[200~ / ESC[201~) rather than as keystrokes. */
+            const char *e = "\033[?2004h";
+            ssize_t n = write(STDOUT_FILENO, e, strlen(e));
+            (void) n;
+        }
     }
 
     ~RawMode()
     {
-        if (ok)
+        if (ok) {
+            const char *d = "\033[?2004l";       /* disable bracketed paste */
+            ssize_t n = write(STDOUT_FILENO, d, strlen(d));
+            (void) n;
             tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
+        }
     }
 };
 
@@ -943,7 +1067,7 @@ read_line(const string &prompt, const string &cont_prompt,
             return res;
         }
 
-        if (c == 18) {                      /* Ctrl-R: reverse history search */
+        if (!ed.pasting() && c == 18) {     /* Ctrl-R: reverse history search */
             const std::pair<bool, string> chosen = reverse_search();
             if (chosen.first && !chosen.second.empty())
                 ed.set_buffer(chosen.second);
@@ -952,6 +1076,9 @@ read_line(const string &prompt, const string &cont_prompt,
         }
 
         const LineEditor::Action a = ed.feed(c);
+
+        if (ed.pasting())                   /* mid-paste: accumulate quietly */
+            continue;
 
         if (a == LineEditor::Action::submit) {
             move_below();

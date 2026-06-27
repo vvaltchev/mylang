@@ -2080,8 +2080,8 @@ behind a thin terminal shell:
     the query). Ranking is `fuzzy_score(query_lc, cand)` — a case-insensitive
     **subsequence** match scored by contiguity (gap-0 runs win big), word-
     boundary/camelCase hits, and a length tie-break; `INT_MIN` == no match; an
-    empty query matches all with score 0, ordered by **recency** (a `stable_sort`
-    over the newest-first de-duplicated list). `read_line` intercepts the raw
+    empty query matches all with score 0, ordered by **recency** (a
+    `stable_sort` over the newest-first deduped list). `read_line` reads the raw
     `Ctrl-R` byte (the editor never sees it) and renders a **bordered pane ~⅓
     the screen high** below the input: a rounded box whose **top edge is the
     search box** (`search: <query>` + an `N matches` count), over the live
@@ -2099,6 +2099,22 @@ behind a thin terminal shell:
     The scorer, match-position, and state machine are headless-tested
     (`histsearch:`); the pane rendering is in `read_line` (untested TTY shell,
     verified over a pty).
+  - **Bracketed paste.** `RawMode` enables it (`ESC[?2004h`, off on exit), so
+    the terminal wraps a paste in `ESC[200~ .. ESC[201~`. `LineEditor::feed`
+    recognizes the start marker (in `csi_final`, `esc_params == "200"`) and then
+    **swallows bytes verbatim** into `paste_buf` until the end marker - never
+    interpreting them as keystrokes (a pasted newline doesn't submit, a Tab
+    doesn't complete). On the end marker it calls `apply_paste`, which inserts
+    the block as inert text **re-indented to the editor's brace-depth style**
+    (`indent_depth`, shared with `newline()`): each line's own leading
+    whitespace is dropped and replaced by 2-spaces-per-level, a line opening
+    with a closing bracket dedents, and the first line is kept verbatim only
+    when it continues a non-empty line (`cursor_col() != 0`). Safe because
+    MyLang whitespace is purely cosmetic. `pasting()` lets `read_line` skip the
+    Ctrl-R interception and per-byte repaints mid-paste; the normal `repaint`
+    then re-renders the block syntax-highlighted. The re-indent + insert is
+    headless-tested (`lineedit:` bracketed-paste cases); the mode toggle is in
+    `read_line`.
 - **`highlight.{h,cpp}`** — `highlight_line`, a self-contained scanner (NOT the
   lexer; tolerates mid-edit input) that wraps keywords/strings/numbers/comments/
   type-words in ANSI color, preserving the bytes exactly otherwise.

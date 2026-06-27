@@ -40,13 +40,21 @@ public:
     const std::string &buffer() const { return buf; }
     size_t cursor() const { return pos; }
 
+    /*
+     * True while a bracketed paste is being accumulated (between the terminal's
+     * ESC[200~ / ESC[201~ markers). The shell uses it to suppress per-byte
+     * repaints and to not treat a Ctrl-R in the pasted text as a command.
+     */
+    bool pasting() const { return is_pasting; }
+
     /* The cursor's position as (logical line, column) - the buffer may hold
      * embedded newlines (a multi-line block). Used by the 2-D renderer. */
     size_t cursor_row() const;
     size_t cursor_col() const;
 
     /* Start a fresh line (keeps the history pointer). */
-    void reset() { buf.clear(); pos = 0; esc = Esc::none; hist_idx = -1; }
+    void reset() { buf.clear(); pos = 0; esc = Esc::none; hist_idx = -1;
+                   is_pasting = false; paste_buf.clear(); }
 
     /* Preload the buffer (e.g. to re-edit a multi-line block). */
     void set_buffer(const std::string &s) { buf = s; pos = s.size(); }
@@ -117,9 +125,13 @@ private:
     Submitter submitter;
     Suggester suggester;
     std::vector<std::string> comp_list;   /* candidates pending display */
+    bool is_pasting = false;              /* between ESC[200~ and ESC[201~ */
+    std::string paste_buf;                /* raw bytes accumulated mid-paste */
 
     void complete();
     bool accept_suggestion();             /* Right/Ctrl-F: take ghost text */
+    void apply_paste(const std::string &text);   /* re-indent + insert */
+    int indent_depth(size_t upto) const;  /* brace depth of buf[0..upto) */
     void insert(char c);
     void newline();                       /* Enter on an incomplete buffer */
     void backspace();

@@ -157,7 +157,11 @@ top edge is the search box, over a live, best-match-first result list with the
 matched letters highlighted in each row; type to filter, **Up/Down** to select
 (the top match is highlighted by default), **Enter** to load the chosen command
 onto the prompt (`Esc`/`Ctrl-G` cancel). The box uses rounded UTF-8 borders when
-the locale supports it, ASCII otherwise. A `none` result (a definition,
+the locale supports it, ASCII otherwise. **Pasting** is bracketed-paste aware:
+a pasted multi-line block is taken as one input (its newlines don't submit it
+early, and a Tab/Ctrl in it isn't run as a command) and **re-indented** to the
+editor's brace-depth style, then you press Enter to run it. A `none` result (a
+definition,
 a `print`, an `if`) is not echoed, to keep things quiet.
 
 Meta-commands start with `:`. They turn the REPL into a tool for learning and

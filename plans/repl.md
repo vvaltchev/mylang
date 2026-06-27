@@ -31,8 +31,10 @@
 > search** — a pure `HistorySearch` core (fuzzy-ranked, de-duplicated, best
 > match selected by default; Up/Down to select, Enter to load) rendered by
 > `read_line` as a ~⅓-screen pane (search box above a live result list, the
-> selection in a reverse-video bar). **Not yet:** the IRB dropdown-style
-> completion menu, bracketed paste, and the Windows backend (Phase 5).
+> selection in a reverse-video bar). Also done: **bracketed paste** — a pasted
+> multi-line block is taken as one input (its newlines don't submit, a Tab/Ctrl
+> in it isn't run) and re-indented to brace-depth style. **Not yet:** the IRB
+> dropdown-style completion menu and the Windows backend (Phase 5).
 >
 > Original design follows. The two hard problems are (1) running the *real,
 > full* pipeline per input over an **expandable global scope** so the REPL is a
@@ -275,10 +277,9 @@ emitted ANSI.
 (`complete()` from KwString + the `builtins`/`const_builtins` maps + persistent
 symbols + struct fields after `.`; eventually an IRB-style dropdown — Tab is
 done, the dropdown still deferred); **Phase 5 — polish** (the PowerShell-style
-inline autosuggestion and `Ctrl-R` reverse history search are **done**;
-remaining: bracketed paste, pretty multi-line value printing, more
-meta-commands, themes/`NO_COLOR`, and the **Windows** raw-input backend — v1 is
-Unix-only).
+inline autosuggestion, `Ctrl-R` reverse history search, and bracketed paste are
+**done**; remaining: pretty multi-line value printing, more meta-commands,
+themes/`NO_COLOR`, and the **Windows** raw-input backend — v1 is Unix-only).
 
 ## 5. File layout & touched passes
 

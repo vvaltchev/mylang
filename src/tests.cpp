@@ -9259,6 +9259,35 @@ static bool histsearch_dedup()
     return hs.matches().size() == 2 && hs.selected_value() == "x";
 }
 
+/* A bracketed paste (ESC[200~ .. ESC[201~) is inserted as inert text - the
+ * embedded newlines do NOT submit - and re-indented to the editor's style. */
+static bool lineedit_bracketed_paste_reindents()
+{
+    LineEditor ed;
+    le_feed(ed, "\033[200~func f() {\nreturn 1;\n}\033[201~");
+    if (ed.pasting()) return false;                   /* finished */
+    return ed.buffer() == "func f() {\n  return 1;\n}";
+}
+
+/* Over-indented / tab-indented source collapses to the 2-space style; the
+ * closing brace dedents; a literal tab becomes a space. */
+static bool lineedit_bracketed_paste_normalizes_indent()
+{
+    LineEditor ed;
+    le_feed(ed, "\033[200~{\n\t\tx = 1;\n}\033[201~");
+    return ed.buffer() == "{\n  x = 1;\n}" && !ed.pasting();
+}
+
+/* A single-line paste mid-line continues the line verbatim (leading space kept,
+ * not stripped); no command is triggered. */
+static bool lineedit_bracketed_paste_inline()
+{
+    LineEditor ed;
+    le_feed(ed, "ab");
+    le_feed(ed, "\033[200~ + 1\033[201~");
+    return ed.buffer() == "ab + 1" && !ed.pasting() && ed.cursor() == 6;
+}
+
 static bool repl_incomplete_detection()
 {
     if (!ReplEngine::is_incomplete("func f() {")) return false;   /* open { */
@@ -9635,6 +9664,12 @@ static const std::vector<extra_check> extra_checks =
       histsearch_match_positions },
     { "histsearch: duplicate history entries collapse to one",
       histsearch_dedup },
+    { "lineedit: bracketed paste inserts + re-indents a block",
+      lineedit_bracketed_paste_reindents },
+    { "lineedit: bracketed paste normalizes indentation",
+      lineedit_bracketed_paste_normalizes_indent },
+    { "lineedit: bracketed paste inline continues the line",
+      lineedit_bracketed_paste_inline },
     { "highlight: inserts color escapes", highlight_inserts_color },
     { "highlight: stripping escapes restores the input",
       highlight_preserves_visible_text },
