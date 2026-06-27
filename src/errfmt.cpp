@@ -123,7 +123,8 @@ format_exception(ostream &o, const Exception &e,
     }
 
     if (auto *it = dynamic_cast<const InvalidTokenEx *>(&e)) {
-        o << "Invalid token: " << it->val << "\n";
+        o << "Invalid token: " << it->val;
+        dump_loc_in_error(o, e, lines);   /* caret when a loc is set */
         return;
     }
 

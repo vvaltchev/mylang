@@ -165,9 +165,9 @@ string TypeDict::to_string(const EvalValue &a)
 
     for (const auto &p: data) {
 
-        res += p.first.to_string();
+        res += p.first.to_string_repr();
         res += ": ";
-        res += p.second.get().to_string();
+        res += p.second.get().to_string_repr();
 
         if (i != data.size() - 1)
             res += ", ";

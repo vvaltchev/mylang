@@ -148,7 +148,7 @@ string TypeStruct::to_string(const EvalValue &a)
         res += string(def.fields[i].name->val);
         res += ": ";
         res += (o.is_pod() ? o.pod_get(static_cast<int>(i))
-                           : o.fields[i].get()).to_string();
+                           : o.fields[i].get()).to_string_repr();
 
         if (i != def.fields.size() - 1)
             res += ", ";

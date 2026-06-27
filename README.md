@@ -1620,7 +1620,15 @@ Return the number of elements in the given container.
 
 #### `str(value, [decimal_digits])`
 Convert the given value to a string. If `value` is a float, the 2nd parameter
-indicates the desired number of decimal digits in the output string.
+indicates the desired number of decimal digits in the output string. A string
+converts to **itself** (unquoted), but a string nested **inside a container**
+(array, dict, or struct) is rendered **quoted and escaped** so the output is
+unambiguous and re-parseable — e.g. `str(["a", 1])` is `[\"a\", 1]` and
+`str({"k": "v"})` is `{\"k\": \"v\"}` (matching how Python prints a list). The
+escapes (`\\`, `\"`, `\n`, `\t`, …) mirror the string-literal syntax, so the
+shown form round-trips back to the same value. The interactive REPL's `=> `
+echo uses this quoted form for the top-level value too, so a bare string echoes
+as `=> "hello"` (IRB-style).
 
 #### `int(value)`
 Convert the given string to an integer. If the value is a float, it will be

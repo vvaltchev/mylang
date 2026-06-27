@@ -4887,8 +4887,8 @@ static const std::vector<test> tests =
             "foreach (var e in arr) {",
             "   append(tmp, str(e));",
             "}",
-            "assert(tmp[0] == \"[11, hello]\");",
-            "assert(tmp[1] == \"[22, world]\");",
+            "assert(tmp[0] == \"[11, \\\"hello\\\"]\");",
+            "assert(tmp[1] == \"[22, \\\"world\\\"]\");",
         }
     },
 
@@ -4913,8 +4913,8 @@ static const std::vector<test> tests =
             "foreach (var i, e in indexed arr) {",
             "   append(tmp, str(i)+str(e));",
             "}",
-            "assert(tmp[0] == \"0[11, hello]\");",
-            "assert(tmp[1] == \"1[22, world]\");",
+            "assert(tmp[0] == \"0[11, \\\"hello\\\"]\");",
+            "assert(tmp[1] == \"1[22, \\\"world\\\"]\");",
         }
     },
 
@@ -5380,7 +5380,7 @@ static const std::vector<test> tests =
     {
         "Dict to string",
         {
-            "assert(str({\"a\":3}) == \"{a: 3}\");",
+            "assert(str({\"a\":3}) == \"{\\\"a\\\": 3}\");",
         },
     },
 
@@ -5388,6 +5388,43 @@ static const std::vector<test> tests =
         "Array to string",
         {
             "assert(str([1,2,3]) == \"[1, 2, 3]\");",
+        },
+    },
+
+    {
+        /* A string nested in a container is rendered QUOTED (repr), so the
+         * output is unambiguous and re-parseable - while a bare str() of a
+         * string stays unquoted. */
+        "String elements are quoted inside a container",
+        {
+            "assert(str(\"hi\") == \"hi\");",            /* bare: unquoted */
+            "assert(str([\"a\", \"b\"]) == \"[\\\"a\\\", \\\"b\\\"]\");",
+            "assert(str([1, \"x\"]) == \"[1, \\\"x\\\"]\");",
+            "assert(str([1, [\"y\"]]) == \"[1, [\\\"y\\\"]]\");",
+            "assert(str({\"k\": \"v\"}) == \"{\\\"k\\\": \\\"v\\\"}\");",
+        },
+    },
+
+    {
+        "A string field of a struct is quoted in its to_string",
+        {
+            "struct S { int n; str s; }",
+            "assert(str(S(1, \"hi\")) == \"S(n: 1, s: \\\"hi\\\")\");",
+        },
+    },
+
+    {
+        /* quote_str escapes a backslash and an embedded quote so the repr
+         * round-trips through the lexer's unescape_str. bs is the 3 chars
+         * a <backslash> b; its quoted repr inside [] is ["a\\b"]. */
+        "Nested-string repr escapes backslash and quote",
+        {
+            "var bs = \"a\\\\b\";",                 /* value: a<backslash>b */
+            "assert(len(bs) == 3);",
+            "assert(str([bs]) == \"[\\\"a\\\\\\\\b\\\"]\");",
+            "var qs = \"a\\\"b\";",                 /* value: a<quote>b */
+            "assert(len(qs) == 3);",
+            "assert(str([qs]) == \"[\\\"a\\\\\\\"b\\\"]\");",
         },
     },
 
@@ -8488,6 +8525,19 @@ static const std::vector<repl_test> repl_tests =
         { "10 / b", "Division by zero" },
         { "b + 7", "=> 7" } } },
 
+    /* A lexer error (here `2_`) must be reported like any other and reject only
+     * this input - it must NOT escape and crash the raw-mode REPL. */
+    { "a bad token is reported and the session continues",
+      { { "2_", "Invalid token" },
+        { "var ok = 5", "=> 5" },
+        { "ok + 1", "=> 6" } } },
+
+    /* The => echo uses repr, so a bare string echoes quoted (IRB-style). */
+    { "the => echo quotes a string value",
+      { { "var sv = \"hello\"", "=> \"hello\"" },
+        { "sv + \" world\"", "=> \"hello world\"" },
+        { "[sv, 1]", "=> [\"hello\", 1]" } } },
+
     { "print() output is shown, then the => echo",
       { { "var x = 5", "=> 5" },
         { "print(\"hi\", x)", "hi 5" } } },
@@ -8531,7 +8581,7 @@ static const std::vector<repl_test> repl_tests =
         { "g(41)", "=> 42" } } },
 
     { "a multi-line dict literal is not statement-terminated",
-      { { "var dd = {\n  \"k\": 7,\n  \"m\": 8\n}", "k: 7" },
+      { { "var dd = {\n  \"k\": 7,\n  \"m\": 8\n}", "\"k\": 7" },
         { "dd.k + dd.m", "=> 15" } } },
 
     { "a multi-line array literal persists",
@@ -8574,16 +8624,16 @@ static const std::vector<repl_test> repl_tests =
       { { "var cu = 3", "=> 3" },
         { "var cu = \"s\"", "is assigned 'str'" },   /* redeclare: rejected */
         { ":undef cu", "undefined" },                 /* now reset it */
-        { "var cu = \"s\"", "=> s" },                 /* fresh type: ok */
-        { "cu", "=> s" } } },
+        { "var cu = \"s\"", "=> \"s\"" },             /* fresh type: ok */
+        { "cu", "=> \"s\"" } } },
     { ":undef of an unknown global reports it",
       { { ":undef nope", "no global" } } },
 
     { "the real optimizers run per input (flat array storage)",
       { { "var fa = [1, 2, 3]", "=> [1, 2, 3]" },
-        { "array_storage(fa)", "=> ints" },
+        { "array_storage(fa)", "=> \"ints\"" },
         { "var fb = [1.5, 2.5]", "" },
-        { "array_storage(fb)", "=> floats" } } },
+        { "array_storage(fb)", "=> \"floats\"" } } },
 
     { "a function can be redefined (edit + resubmit)",
       { { "func rf(n) => n * 2", "" },
@@ -8605,13 +8655,13 @@ static const std::vector<repl_test> repl_tests =
       { { "func tg(a){ var r = a + 1; return r; }", "" },
         { "tg(41)", "=> 42" },
         { "tg(2.5)", "=> 3.5" },
-        { "tg(\"x\")", "=> x1" } } },
+        { "tg(\"x\")", "=> \"x1\"" } } },
 
     /* ---- runtime reflection over the persistent global scope ---- */
     { "reflect: globals() lists user globals, excludes builtins",
       { { "var gx = 1", "=> 1" },
         { "func gf(a) => a", "" },
-        { "globals()", "[gf, gx]" } } },
+        { "globals()", "[\"gf\", \"gx\"]" } } },
 
     { "reflect: specializations() surfaces a template instance",
       { { "func tf(a) => a + 1", "" },
@@ -8622,15 +8672,15 @@ static const std::vector<repl_test> repl_tests =
     { "template: the same signature across inputs reuses one instance",
       { { "func tr(x, y) { var s = x + y; return s + 1; }", "" },
         { "tr(2, 3)", "=> 6" },
-        { "specializations(tr)", "[tr$0]" },
+        { "specializations(tr)", "[\"tr$0\"]" },
         { "tr(10, 20)", "=> 31" },            /* same (int,int): reuse */
-        { "specializations(tr)", "[tr$0]" } } },   /* STILL one instance */
+        { "specializations(tr)", "[\"tr$0\"]" } } }, /* STILL one instance */
 
     { "template: a distinct signature across inputs makes a new instance",
       { { "func tq(x, y) { var s = x + y; return s; }", "" },
         { "tq(1, 2)", "=> 3" },
         { "tq(1.0, 2.0)", "=> 3.0" },
-        { "specializations(tq)", "[tq$0, tq$1]" } } },
+        { "specializations(tq)", "[\"tq$0\", \"tq$1\"]" } } },
 
     { "template: an instance is inspectable by its name (typeof f$0)",
       { { "func ti(x, y) => x + y", "" },
@@ -8706,7 +8756,7 @@ static const std::vector<repl_test> repl_tests =
     { "template: redefining a function drops its orphaned instances",
       { { "func rf(x, y) => x + y", "" },
         { "rf(1, 2)", "=> 3" },
-        { "specializations(rf)", "[rf$0]" },
+        { "specializations(rf)", "[\"rf$0\"]" },
         { "func rf(x, y) => x * y", "" },          /* redefine */
         { "specializations(rf)", "[]" } } },       /* orphan dropped */
 
@@ -8722,7 +8772,7 @@ static const std::vector<repl_test> repl_tests =
         { "cf(1, 2)", "=> 3" },
         { "func cg() { return cf(1, 2); }", "" },  /* cg consumes cf$0 */
         { "func cf(x, y) => x * y", "" },          /* redefine cf */
-        { "specializations(cf)", "[cf$0]" },       /* kept */
+        { "specializations(cf)", "[\"cf$0\"]" },   /* kept */
         { "cg()", "=> 3" } } },                     /* still callable */
 
     { "trace: an uninstantiated template is reported as a template, not dyn",

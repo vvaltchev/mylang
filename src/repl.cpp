@@ -283,17 +283,22 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
             lines.push_back(line);
     }
 
+    /* 2. Lex, then parse against the PERSISTENT const context (no pushed
+     *    top-level scope, so new consts/pure-funcs/structs survive to the next
+     *    input). The lexer itself can throw (a bad token like `2_`), so it runs
+     *    inside the try: a lex error is reported like any other and rejects
+     *    only this input, never the session. The lexer reads the persistent
+     *    `lines` (not a local), so an InvalidTokenEx's view stays valid for the
+     *    caret. */
     std::vector<Tok> tokens;
-    for (size_t i = base; i < lines.size(); i++)
-        lexer(lines[i], static_cast<int>(i + 1), tokens);
-
-    if (tokens.empty())
-        return "";
-
-    /* 2. Parse against the PERSISTENT const context (no pushed top-level scope,
-     *    so new consts/pure-funcs/structs survive to the next input). */
     unique_ptr<Construct> root;
     try {
+        for (size_t i = base; i < lines.size(); i++)
+            lexer(lines[i], static_cast<int>(i + 1), tokens);
+
+        if (tokens.empty())
+            return "";
+
         ParseContext pc(TokenStream(tokens), true);
         pc.const_ctx = const_ctx.get();
         root = pBlock(pc, 0, /*push_const_scope=*/false);
@@ -371,7 +376,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     if (echo) {
         const EvalValue r = RValue(last);
         if (!r.is<NoneVal>())
-            out << "=> " << r.get_type()->to_string(r) << "\n";
+            out << "=> " << r.to_string_repr() << "\n";
     }
     return out.str();
 }
@@ -452,10 +457,10 @@ ReplEngine::Impl::cmd_tree(const string &code)
     }
 
     std::vector<Tok> toks;
-    for (size_t i = 0; i < local_lines.size(); i++)
-        lexer(local_lines[i], static_cast<int>(i + 1), toks);
 
     try {
+        for (size_t i = 0; i < local_lines.size(); i++)
+            lexer(local_lines[i], static_cast<int>(i + 1), toks);
         ParseContext pc(TokenStream(toks), true);
         pc.const_ctx = const_ctx.get();
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
@@ -490,9 +495,8 @@ ReplEngine::Impl::cmd_analyze(const string &code)
 
     std::vector<string> local_lines;
     std::vector<Tok> toks;
-    lex_stable(source, local_lines, toks);
-
     try {
+        lex_stable(source, local_lines, toks);
         AnalysisInfo info;
         ParseContext pc(TokenStream(toks), true);
         pc.const_ctx = const_ctx.get();
@@ -730,9 +734,8 @@ ReplEngine::Impl::cmd_type(const string &code)
 
     std::vector<string> local_lines;
     std::vector<Tok> toks;
-    lex_stable(source, local_lines, toks);
-
     try {
+        lex_stable(source, local_lines, toks);
         ParseContext pc(TokenStream(toks), true);
         pc.const_ctx = const_ctx.get();
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
@@ -847,9 +850,8 @@ ReplEngine::Impl::cmd_show(const string &arg)
 
     std::vector<string> local_lines;
     std::vector<Tok> toks;
-    lex_stable(source, local_lines, toks);
-
     try {
+        lex_stable(source, local_lines, toks);
         ParseContext pc(TokenStream(toks), true);
         pc.const_ctx = const_ctx.get();
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
@@ -1028,12 +1030,19 @@ bool
 ReplEngine::is_incomplete(const string &src)
 {
     std::vector<Tok> toks;
-    {
+    try {
         std::stringstream ss(src);
         string line;
         int n = 1;
         while (std::getline(ss, line))
             lexer(line, n++, toks);
+    } catch (const Exception &) {
+        /* A bad token (e.g. `2_`, or an unterminated string - mylang strings
+         * are single-line) is a definitive error, not an input still waiting
+         * for more: report it complete so the editor submits it and do_eval
+         * surfaces the lex error. Never let it escape (it would crash the
+         * raw-mode REPL via the submitter). */
+        return false;
     }
 
     if (toks.empty())

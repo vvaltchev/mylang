@@ -160,6 +160,17 @@ public:
         throw TypeErrorEx("The object does NOT support conversion to string");
     }
 
+    /*
+     * "repr" form: how a value is rendered INSIDE a container (array/dict/
+     * struct), and by the REPL `=>` echo. A string is quoted + escaped so
+     * `["a", 1]` is unambiguous and re-parseable (matching how print() shows a
+     * list in Python, and IRB's quoted echo). Identical to to_string for every
+     * type but str - a container's own to_string already repr's its elements.
+     */
+    virtual std::string to_string_repr(const EvalValueT &a) {
+        return to_string(a);
+    }
+
     virtual int_type len(const EvalValueT &a) {
         throw TypeErrorEx("The object does NOT support len()");
     }

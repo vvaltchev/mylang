@@ -287,6 +287,10 @@ public:
         return type->to_string(*this);
     };
 
+    std::string to_string_repr() const {
+        return type->to_string_repr(*this);
+    };
+
     size_t hash() const {
         return type->hash(*this);
     };

@@ -166,8 +166,9 @@ struct InvalidTokenEx : public Exception {
 
     const std::string_view val;
 
-    InvalidTokenEx(const std::string_view &val)
-        : Exception("InvalidTokenEx", "Invalid token error")
+    InvalidTokenEx(const std::string_view &val,
+                   Loc start = Loc(), Loc end = Loc())
+        : Exception("InvalidTokenEx", "Invalid token error", start, end)
         , val(val)
     { }
 };

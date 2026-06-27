@@ -469,7 +469,7 @@ string TypeArr::to_string(const EvalValue &a)
     if (arr.skind() != SharedArrayObj::Storage::general) {
 
         for (size_type i = 0; i < n; i++) {
-            res += arr_elem_at(arr, i).to_string();
+            res += arr_elem_at(arr, i).to_string_repr();
             if (i != n - 1)
                 res += ", ";
         }
@@ -483,7 +483,7 @@ string TypeArr::to_string(const EvalValue &a)
     for (size_type i = 0; i < arr_view.size(); i++) {
 
         const EvalValue &val = arr_view[i].get();
-        res += val.to_string();
+        res += val.to_string_repr();
 
         if (i != arr_view.size() - 1)
             res += ", ";

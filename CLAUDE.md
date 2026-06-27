@@ -1158,6 +1158,18 @@ sanitizers never reproduced it.)
   example). Binary ops
   **mutate the left operand in place**
   (`void add(EvalValue &a, const EvalValue &b)` does `a += b`).
+- **`to_string` vs `to_string_repr`.** `to_string` is the plain conversion
+  (`print`/`str` of a bare value: a string renders unquoted). `to_string_repr`
+  (`type.h`, default == `to_string`) is the **repr** form used when a value is
+  rendered *inside a container* and by the REPL `=>` echo: only `TypeStr`
+  overrides it, returning the **quoted + escaped** literal (`quote_str` in
+  `str.cpp.h`, the inverse of `unescape_str`). So `TypeArr`/`TypeDict`/
+  `TypeStruct::to_string` call `elem.to_string_repr()` on their elements/keys/
+  values — `["a", 1]`, `{"k": "v"}`, `P(name: "bob")` — matching how Python
+  prints a list (a container's *own* repr is just its `to_string`, which already
+  quotes its elements). The REPL echoes the top-level value via `to_string_repr`
+  too, so a bare string echoes `=> "hello"` (IRB-style); `print`/`str` of a bare
+  string stay unquoted.
 - **`bool` is a real scalar type (`t_bool`, `TypeBool` in
   `src/types/bool.cpp.h`).** `true`/`false` are its only two values (parsed to
   `LiteralBool`, `syntax.h`). It is stored in `EvalValue`'s `bval` union member
@@ -1978,10 +1990,19 @@ behind a thin terminal shell:
   top-level statement **directly in the persistent runtime ctx** (no fresh
   Block context/frame — that's why state persists and a redeclaration can
   rebind), capturing `print` output (via a `cout` rdbuf swap) and echoing the
-  last non-`none` value as `=> ...`. Errors are caught per input and the loop
-  continues. The whole-program optimizers (`resolve_names`/inliner/`infer_types`
-  /`specialize_types`) are **not** run per input yet (see "deferred" below), so
-  top-level names are map-based globals.
+  last non-`none` value as `=> ...` (via `to_string_repr`, so a bare string
+  echoes quoted — see the value model). Errors are caught per input and the loop
+  continues — **including a lexer error**: the lexer can throw
+  (`InvalidTokenEx`, e.g. `2_`, or an unterminated single-line string), so every
+  REPL lex site is guarded — `do_eval`'s lex runs inside the parse `try` (it
+  reads the persistent `lines`, so the error's view stays valid for the caret),
+  `is_incomplete` catches and reports the input *complete* (a bad token is a
+  definitive error, not an input awaiting more — never let it escape the
+  `Submitter`, which would crash the raw-mode editor), and the inspection
+  meta-commands lex inside their own `try`. `InvalidTokenEx` now carries a `Loc`
+  so it renders a caret like every other error. The whole-program optimizers
+  (`resolve_names`/inliner/`infer_types`/`specialize_types`) are **not** run per
+  input yet (see "deferred" below), so top-level names are map-based globals.
   - **Inputs auto-terminate** (`repl_auto_terminate`): you don't type `;` at a
     prompt. Per physical line a `;` is appended unless the line is empty/
     comment-only, ends inside an unclosed `(`/`[`, or ends on a continuation

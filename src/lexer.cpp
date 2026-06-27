@@ -133,7 +133,11 @@ struct lexer_ctx {
 void
 lexer_ctx::invalid_token()
 {
-    throw InvalidTokenEx(in_str.substr(tok_start, i - tok_start + 1));
+    /* Carry the offending token's source span so the error renders a caret
+     * like every other one (end = last-char col + 2, the project convention -
+     * the bad token is in_str[tok_start .. i]). */
+    throw InvalidTokenEx(in_str.substr(tok_start, i - tok_start + 1),
+                         Loc(line, tok_start + 1), Loc(line, i + 3));
 }
 
 void

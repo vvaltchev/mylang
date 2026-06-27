@@ -12,6 +12,36 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
+/*
+ * Render `s` as a double-quoted, escaped string literal - the inverse of the
+ * lexer's unescape_str (eval.cpp), so the result re-parses to the same string.
+ * Used to show a string quoted inside a container ([..]/{..}/struct) and by the
+ * REPL `=>` echo. The escaped set matches unescape_str's cases exactly.
+ */
+static string quote_str(const string_view &s)
+{
+    string res;
+    res.reserve(s.size() + 2);
+    res += '"';
+
+    for (char c : s) {
+        switch (c) {
+            case '\\': res += "\\\\"; break;
+            case '"':  res += "\\\""; break;
+            case '\n': res += "\\n";  break;
+            case '\r': res += "\\r";  break;
+            case '\t': res += "\\t";  break;
+            case '\v': res += "\\v";  break;
+            case '\a': res += "\\a";  break;
+            case '\b': res += "\\b";  break;
+            default:   res += c;      break;
+        }
+    }
+
+    res += '"';
+    return res;
+}
+
 class TypeStr : public TypeImpl<SharedStr> {
 
     void append(SharedStr &lval, const string_view &s);
@@ -49,6 +79,11 @@ public:
 
     string to_string(const EvalValue &a) override {
         return string(a.get<SharedStr>().get_view());
+    }
+
+    /* Quoted + escaped, for rendering inside a container and the REPL echo. */
+    string to_string_repr(const EvalValue &a) override {
+        return quote_str(a.get<SharedStr>().get_view());
     }
 
     size_t hash(const EvalValue &a) override;
