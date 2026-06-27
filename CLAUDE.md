@@ -296,8 +296,8 @@ code, put it in the matching `.cpp.h` and rely on it being pulled into
 `types.cpp` — it will not
 compile standalone, and there is nothing to add to the Makefile.
 `builtins/reflect.cpp.h` holds the **runtime reflection** builtins
-(`globals`/`typeof`/`signature`/`layout`/`specializations`) and the shared
-`reflect_*` rendering helpers (signature/type/layout strings) the REPL's
+(`globals`/`typestr`/`kindstr`/`signature`/`layout`/`specializations`) and the
+shared `reflect_*` rendering helpers (signature/type/layout strings) the REPL's
 introspection commands reuse; it is `#include`d last (after the other builtins)
 so it can call `arr_elem_at`. See `plans/repl-introspection.md`.
 **`layout(S)` returns a structured value, not a string** — a **native composite
@@ -1002,7 +1002,7 @@ decisions behind it: `plans/type-inference.md`,
   nothing folds, it falls back to the value's runtime type, like `type()`). So
   `int? a` → `"int?"`, `dyn? d` → `"dyn?"`, an inferred `var a=[1,2,3]` →
   `"array<int>"`, a struct var → its name. This is the static counterpart to
-  `type()`/`typeof()` (which inspect a *value*, so a nullable var holding none
+  `type()`/`typestr()` (which inspect a *value*, so a nullable var holding none
   reads `"none"`); decltype is about the *identifier*. The string format matches
   `:type` and error messages (nullability is a `?` suffix - `int?`, `dyn?`,
   `array<int?>` - see `sty_to_string`). The arg-slot rewrite

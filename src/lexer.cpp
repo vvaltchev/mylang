@@ -467,7 +467,7 @@ lexer(string_view in_str, int line, std::vector<Tok> &result)
             /* '$' is a valid identifier char (not at the start of a
              * number): the compiler names its synthetic clones `<name>$N`
              * (template instances) / `<name>$sN` (specializations), so a
-             * user can reference and inspect them, e.g. typeof(f$0). */
+             * user can reference and inspect them, e.g. typestr(f$0). */
             ctx.handle_alphanum();
         else
             ctx.handle_other();

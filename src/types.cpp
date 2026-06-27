@@ -92,6 +92,37 @@ EvalValue builtin_decltype(EvalContext *ctx, ExprList *exprList)
     return TypeNames[RValue(arg->eval(ctx)).get_type()->t];
 }
 
+/*
+ * typestr(x) / kindstr(x): the static type of x as a string - the full
+ * structural form ("array<int>", "Point", "int?") and the bare kind ("array",
+ * "int", "struct"). Compile-time type QUERIES with an UNEVALUATED operand: the
+ * inferencer folds the call to a string literal of x's static type (the arg is
+ * never evaluated). These bodies run only under -nti (no inference), where they
+ * fall back to the value's runtime type. (Defined here, after TypeNames, so the
+ * kindstr fallback can use it; reflect_typeof comes from reflect.cpp.h above.)
+ */
+EvalValue builtin_typestr(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    if (dynamic_cast<LiteralStr *>(arg))   /* folded by the inferencer */
+        return RValue(arg->eval(ctx));
+    return SharedStr(reflect_typeof(RValue(arg->eval(ctx))));
+}
+
+EvalValue builtin_kindstr(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    if (dynamic_cast<LiteralStr *>(arg))   /* folded by the inferencer */
+        return RValue(arg->eval(ctx));
+    return TypeNames[RValue(arg->eval(ctx)).get_type()->t];
+}
+
 const std::array<Type *, Type::t_count> AllTypes =
 {
     /* Trivial types */
@@ -252,14 +283,15 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("intptr", builtin_intptr),
     make_builtin("array_storage", builtin_array_storage),
 
-    /* decltype(var): the static type of a variable (resolved at compile time by
-     * the inferencer). Non-const: not foldable at PARSE time (the type isn't
-     * known until inference); the inferencer folds it. See builtin_decltype. */
+    /* Compile-time type queries (folded by the inferencer; the runtime body is
+     * a -nti fallback). decltype(var) takes a variable; typestr/kindstr take an
+     * expression - the full structural string vs the bare kind. */
     make_builtin("decltype", builtin_decltype),
+    make_builtin("typestr", builtin_typestr),
+    make_builtin("kindstr", builtin_kindstr),
 
     /* Runtime reflection (see builtins/reflect.cpp.h) */
     make_builtin("globals", builtin_globals),
-    make_builtin("typeof", builtin_typeof),
     make_builtin("signature", builtin_signature),
     make_builtin("layout", builtin_layout),
     make_builtin("specializations", builtin_specializations),

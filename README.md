@@ -187,9 +187,9 @@ inspecting the language and its compiler:
   inferred static type, or any expression's runtime type without committing it.
   `:show <function>` "decompiles" a function's final optimized AST back into
   code (folded consts, inlined bodies, dead code gone), and its `name$N` clones
-  too. (These build on the reflection *builtins* `globals()`, `typeof()`,
-  `signature()`, `layout()`, `specializations()`, `show()`, usable from scripts
-  too.)
+  too. (These build on the reflection *builtins* `globals()`, `typestr()` /
+  `kindstr()`, `signature()`, `layout()`, `specializations()`, `show()`, usable
+  from scripts too.)
 - **The compiler's reasoning** — `:trace <category> on` narrates the optimizer
   as your next input compiles: `:trace infer on` shows how each type is
   inferred, and `inline` / `specialize` / `template` / `autoconst` / `autopure`
@@ -2135,20 +2135,24 @@ are frame slots rather than map entries, so a script's `globals()` lists only
 the map-resident names (functions, structs, clones, captured globals). In the
 REPL every global is map-resident, so all of them appear.
 
-#### `typeof(x)`
-Return the **runtime structural type** of `x` as a string — richer than
-[`type()`](#typevalue), which gives only the bare kind (`"array"`). Examples:
-`"int"`, `"float"`, `"bool"`, `"str"`, `"none"`, `"array<int>"`,
-`"array<float>"`, `"array<Point>"`, `"array<dyn>"` (a general/heterogeneous
-array), `"dict<int,str>"` (probed from one entry; `"dict"` when empty), a struct
-instance's type name (`"Point"`), `"type Point"` for a struct *descriptor*, a
-function's signature, or `"exception"`. It is computed from the value alone, so
-it works in any script.
+#### `typestr(x)` / `kindstr(x)`
+Two **compile-time type queries**: `typestr` gives `x`'s full **structural**
+type as a string (`"array<int>"`, `"dict<str,int>"`, `"array<dict<str,int>>"`,
+`"int?"`, a struct name `"Point"`), and `kindstr` gives just the **kind**
+(`"array"`, `"int"`, `"struct"`, …). They are richer / coarser views of the same
+thing — use `kindstr` for a quick category check, `typestr` for the exact type.
+
+Both have an **unevaluated operand** (like C++ `decltype`/`sizeof`): the arg
+is *never evaluated* — the compiler folds the call to a string literal of `x`'s
+**static** type (so `kindstr(f())` does not call `f()`). They are `const` and
+fold at compile time whenever the type is known (always, since even `dyn` is
+statically `dyn`); only under `-nti` (inference disabled) do they fall back to
+the value's runtime type. (These replace the former `typeof()`.)
 
 #### `decltype(variable)`
 Return the **static type of a variable** — its declared or inferred type — as a
-string, resolved at compile time. Unlike [`type()`](#typevalue) and
-[`typeof()`](#typeofx), which inspect a *value*, `decltype` is a property of the
+string, resolved at compile time. Unlike `type()` and `typestr()`, which inspect
+a *value*, `decltype` is a property of the
 *identifier*, so a nullable variable that currently holds `none` still reports
 its real type:
 

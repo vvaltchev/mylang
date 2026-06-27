@@ -289,11 +289,11 @@ private:
     [[noreturn]] void nullability(const std::string &m, Loc s, Loc e);
     [[noreturn]] void argcount(const std::string &m, Loc s, Loc e);
 
-    /* `decltype(var)`: a compile-time query of a variable's static type. If the
-     * call is one, validate its argument is an identifier in scope and replace
-     * it with a LiteralStr of that type (the runtime builtin returns it), and
-     * return true; return false if it is not a decltype call. */
-    bool fold_decltype(CallExpr *call);
+    /* Compile-time type queries `decltype(var)` / `typestr(expr)` /
+     * `kindstr(expr)`: if the call is one, fold its (unevaluated) arg to a
+     * LiteralStr of the static type (structural for decltype/typestr, the bare
+     * kind for kindstr) and return true; false otherwise. See the def below. */
+    bool fold_type_query(CallExpr *call);
 
     /* The STy a declaration's annotation PINS the symbol to (seeded by
      * reset_round, checked by contribute), or nullptr when it does not pin: a
@@ -614,7 +614,7 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     fc->display_name = tmpl->decl->id
         ? std::string(tmpl->decl->id->get_str()) : std::string("<lambda>");
     /* Name the instance `<base>$<n>` so it is readable and INSPECTABLE
-     * (typeof(f$0), :show f$0). The counter is per base NAME and monotonic for
+     * (typestr(f$0), :show f$0). The counter is per base NAME and monotonic for
      * the session (clone_name_counter, never reset), so a re-declared template
      * cannot reuse a prior instance's name. display_name keeps the original
      * for backtraces. A lambda template (no id) uses a `lambda$N` fallback. */
@@ -2292,10 +2292,10 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.float_ty();
 
     if (n == "int")    return A.int_ty();
-    if (n == "str" || n == "type" || n == "decltype" || n == "chr" ||
-        n == "join" || n == "lpad" || n == "rpad" || n == "lstrip" ||
-        n == "rstrip" || n == "strip" || n == "readln" || n == "read" ||
-        n == "tmpdir")
+    if (n == "str" || n == "type" || n == "decltype" || n == "typestr" ||
+        n == "kindstr" || n == "chr" || n == "join" || n == "lpad" ||
+        n == "rpad" || n == "lstrip" || n == "rstrip" || n == "strip" ||
+        n == "readln" || n == "read" || n == "tmpdir")
         return A.str_ty();
 
     if (n == "split" || n == "splitlines" || n == "readlines")
@@ -3051,39 +3051,79 @@ void Inferencer::check_if(IfStmt *i)
     with_narrow(i->elseBlock.get(), !in_then);
 }
 
-bool Inferencer::fold_decltype(CallExpr *call)
+/* The bare kind of an STy as a string (kindstr): "int"/"array"/"struct"/... -
+ * matching the runtime TypeNames so the fold and -nti fallback agree. */
+static const char *sty_kind_string(STyRef t)
+{
+    switch (sty_resolve(t)->kind) {
+        case STyKind::None:      return "none";
+        case STyKind::Bool:      return "bool";
+        case STyKind::Int:       return "int";
+        case STyKind::Float:     return "float";
+        case STyKind::Str:       return "str";
+        case STyKind::Array:     return "array";
+        case STyKind::Dict:      return "dict";
+        case STyKind::Func:      return "func";
+        case STyKind::Exception: return "exception";
+        case STyKind::Struct:    return "struct";
+        default:                 return "dyn";   /* Dyn / Unknown */
+    }
+}
+
+/*
+ * Compile-time TYPE QUERIES - `decltype(var)`, `typestr(expr)`, `kindstr(expr)`
+ * - fold to a string literal of the argument's STATIC type (the arg is an
+ * UNEVALUATED operand, like C++ decltype/sizeof). `decltype` takes an
+ * identifier (a variable); `typestr`/`kindstr` take any expression and use its
+ * inferred type. `typestr` is the full structural string, `kindstr` the bare
+ * kind. Returns false when the call is not one of these. The folded literal
+ * replaces args[0]; the runtime builtin returns it (or, under -nti, reads the
+ * value's runtime type).
+ */
+bool Inferencer::fold_type_query(CallExpr *call)
 {
     auto *cid = dynamic_cast<Identifier *>(call->what.get());
-    if (!cid || cid->uid->val != "decltype")
+    if (!cid)
+        return false;
+    const std::string_view fn = cid->uid->val;
+    const bool is_decltype = fn == "decltype";
+    const bool is_typestr  = fn == "typestr";
+    const bool is_kindstr  = fn == "kindstr";
+    if (!is_decltype && !is_typestr && !is_kindstr)
         return false;
 
-    /* a real user symbol named `decltype` shadows the builtin - not our call.
-     * (A builtin callee has a null id_sym entry, so test the value, not just
-     * presence - mirroring type_of's `!s && is_builtin` builtin detection.) */
+    /* a real user symbol of that name shadows the builtin - not our call.
+     * (A builtin callee has a null id_sym entry, so test the value.) */
     auto cit = id_sym.find(cid);
     if (cit != id_sym.end() && cit->second)
         return false;
 
     ExprList *args = call->args.get();
     if (args->elems.size() != 1)
-        argcount("decltype expects exactly one argument (a variable)",
+        argcount(std::string(fn) + " expects exactly one argument",
                  call->start, call->end);
 
-    auto *argid = dynamic_cast<Identifier *>(args->elems[0].get());
-    if (!argid)
-        mismatch("decltype expects a variable (an identifier)",
-                 args->elems[0]->start, args->elems[0]->end);
+    STyRef t;
+    if (is_decltype) {
+        auto *argid = dynamic_cast<Identifier *>(args->elems[0].get());
+        if (!argid)
+            mismatch("decltype expects a variable (an identifier)",
+                     args->elems[0]->start, args->elems[0]->end);
+        auto it = id_sym.find(argid);
+        if (it == id_sym.end() || !it->second)
+            mismatch("decltype: '" + std::string(argid->uid->val) +
+                         "' is not a variable in scope",
+                     argid->start, argid->end);
+        t = it->second->type;
+    } else {
+        t = type_of(args->elems[0].get());
+        if (is_unknown(sty_resolve(t)))
+            return false;   /* type not determined yet: leave for runtime */
+    }
 
-    auto it = id_sym.find(argid);
-    if (it == id_sym.end() || !it->second)
-        mismatch("decltype: '" + std::string(argid->uid->val) +
-                     "' is not a variable in scope",
-                 argid->start, argid->end);
-
-    /* Fold to the variable's static type string (types are final in the check
-     * pass). The runtime decltype builtin just returns this literal. */
-    const std::string ts = sty_to_string(it->second->type);
-    args->elems[0] = make_unique<LiteralStr>(std::string_view(ts));
+    const std::string s = is_kindstr ? std::string(sty_kind_string(t))
+                                     : sty_to_string(t);
+    args->elems[0] = make_unique<LiteralStr>(std::string_view(s));
     return true;
 }
 
@@ -3131,7 +3171,7 @@ void Inferencer::check(Construct *n)
     }
 
     if (auto *call = dynamic_cast<CallExpr *>(n)) {
-        if (fold_decltype(call))
+        if (fold_type_query(call))
             return;
         check_call(call);
         return;

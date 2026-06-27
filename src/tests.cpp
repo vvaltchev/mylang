@@ -7147,6 +7147,23 @@ static const std::vector<test> tests =
     { "decltype reject: an unknown variable",
       { "var z = decltype(nope);" }, &typeid(TypeMismatchEx) },
 
+    /* kindstr / typestr: compile-time type-query strings (replace typeof) */
+    { "kindstr: the bare kind of an expression",
+      { "assert(kindstr(5) == \"int\");",
+        "assert(kindstr([1, 2, 3]) == \"array\");",
+        "assert(kindstr({\"a\": 1}) == \"dict\");",
+        "struct P { int x; } assert(kindstr(P(1)) == \"struct\");" } },
+    { "typestr: the full structural type of an expression",
+      { "assert(typestr([1, 2, 3]) == \"array<int>\");",
+        "assert(typestr({\"a\": 1}) == \"dict<str,int>\");",
+        "int? a; assert(typestr(a) == \"int?\");" } },
+    { "typestr / kindstr fold at compile time (unevaluated operand)",
+      { "var fired = false;",
+        "func f() { fired = true; return 1; }",
+        /* the operand is NOT evaluated - f() never runs */
+        "assert(typestr(f()) == \"int\"); assert(kindstr(f()) == \"int\");",
+        "assert(fired == false);" } },
+
     /* ---- parameterized container types: array<T> / dict<K, V> ---- */
     { "array<T>: a typed array is flat and decltype-reported",
       { "array<int> a = [1, 2, 3];",
@@ -7466,33 +7483,35 @@ static const std::vector<test> tests =
 
     /* ---- runtime reflection builtins (builtins/reflect.cpp.h) ---- */
     { "reflect: typeof flat int array",
-      { "assert(typeof([1, 2, 3]) == \"array<int>\");" } },
+      { "assert(typestr([1, 2, 3]) == \"array<int>\");" } },
     { "reflect: typeof flat float array",
-      { "assert(typeof([1.0, 2.0]) == \"array<float>\");" } },
+      { "assert(typestr([1.0, 2.0]) == \"array<float>\");" } },
     { "reflect: typeof flat bool array",
-      { "assert(typeof([true, false]) == \"array<bool>\");" } },
+      { "assert(typestr([true, false]) == \"array<bool>\");" } },
     { "reflect: typeof str array",
-      { "assert(typeof([\"a\", \"b\"]) == \"array<str>\");" } },
+      { "assert(typestr([\"a\", \"b\"]) == \"array<str>\");" } },
     { "reflect: typeof nested array",
-      { "assert(typeof([[1, 2], [3, 4]]) == \"array<array<int>>\");" } },
-    { "reflect: typeof a heterogeneous (general) array is array<dyn>",
-      { "var dyn a = [1, \"x\", 2.0];",
-        "assert(typeof(a) == \"array<dyn>\");" } },
+      { "assert(typestr([[1, 2], [3, 4]]) == \"array<array<int>>\");" } },
+    { "reflect: typestr of a heterogeneous (general) array is array<dyn>",
+      { "var a = [1, \"x\", 2.0];",
+        "assert(typestr(a) == \"array<dyn>\");" } },
     { "reflect: typeof dict",
-      { "assert(typeof({1: \"a\"}) == \"dict<int,str>\");" } },
+      { "assert(typestr({1: \"a\"}) == \"dict<int,str>\");" } },
     { "reflect: typeof scalars",
-      { "assert(typeof(1) == \"int\");",
-        "assert(typeof(2.5) == \"float\");",
-        "assert(typeof(true) == \"bool\");",
-        "assert(typeof(\"s\") == \"str\");" } },
-    { "reflect: typeof none",
-      { "var dyn n = none; assert(typeof(n) == \"none\");" } },
+      { "assert(typestr(1) == \"int\");",
+        "assert(typestr(2.5) == \"float\");",
+        "assert(typestr(true) == \"bool\");",
+        "assert(typestr(\"s\") == \"str\");" } },
+    { "reflect: typestr of the none literal is none",
+      { "assert(typestr(none) == \"none\");" } },
+    { "reflect: typestr of a dyn variable holding none is its static type",
+      { "var dyn n = none; assert(typestr(n) == \"dyn?\");" } },
     { "reflect: typeof a struct instance is its name",
       { "struct Pt { int x; int y; }",
-        "var p = Pt(1, 2); assert(typeof(p) == \"Pt\");" } },
+        "var p = Pt(1, 2); assert(typestr(p) == \"Pt\");" } },
     { "reflect: typeof a flat struct array",
       { "struct Pt { int x; int y; }",
-        "assert(typeof([Pt(1, 2), Pt(3, 4)]) == \"array<Pt>\");" } },
+        "assert(typestr([Pt(1, 2), Pt(3, 4)]) == \"array<Pt>\");" } },
     { "reflect: signature of a function",
       { "func f(int a, float b) => a + b;",
         "assert(signature(f) == \"func f(int a, float b)\");" } },
@@ -8939,10 +8958,10 @@ static const std::vector<repl_test> repl_tests =
         { "tq(1.0, 2.0)", "=> 3.0" },
         { "specializations(tq)", "[\"tq$0\", \"tq$1\"]" } } },
 
-    { "template: an instance is inspectable by its name (typeof f$0)",
+    { "template: an instance is inspectable by its name (typestr f$0)",
       { { "func ti(x, y) => x + y", "" },
         { "ti(2, 3)", "=> 5" },
-        { "typeof(ti$0)", "func ti(" } } },
+        { "typestr(ti$0)", "func(int,int)->int" } } },
 
     { ":show renders a function with inferred param + return types",
       { { "func sm(x, y) { var t = x + y; return t; }", "" },
@@ -9596,8 +9615,9 @@ static bool replhelp_overview_and_builtins()
 static bool replhelp_builtin_entries()
 {
     /* a builtin signature + its description, including the bang name */
-    if (!help_has("typeof", "typeof(x)"))            return false;
-    if (!help_has("typeof", "structural type"))      return false;
+    if (!help_has("typestr", "typestr(x)"))           return false;
+    if (!help_has("typestr", "structural type"))      return false;
+    if (!help_has("kindstr", "kindstr(x)"))           return false;
     if (!help_has("get!", "KeyNotFoundEx"))          return false;
     if (!help_has("runtime", "optimization barrier")) return false;
     /* the const-vs-runtime kind note */

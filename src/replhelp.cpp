@@ -74,7 +74,7 @@ const BuiltinDoc builtin_docs[] = {
   "Convert a bool/int/string to a float.", nullptr },
 { "type", "convert", "type(x)",
   "The bare type name of x as a string (\"int\", \"array\", \"dict\", ...).",
-  "Compare typeof(x), which gives the full structural type." },
+  "Compare typestr(x), the full structural type, and kindstr(x), the kind." },
 { "defined", "convert", "defined(x)",
   "True if x is a defined symbol (not an undefined identifier).", nullptr },
 { "clone", "convert", "clone(x)",
@@ -87,11 +87,14 @@ const BuiltinDoc builtin_docs[] = {
   "The integer hash of a hashable value (as used for dict keys).", nullptr },
 
 /* --- reflect --- */
-{ "typeof", "reflect", "typeof(x)",
-  "The rich structural type of x (\"array<int>\", \"dict<K,V>\", a struct name,"
-  " a function signature).",
-  "Value-driven, so it works in any script. For a symbol's INFERRED static "
-  "type use the REPL :type." },
+{ "typestr", "reflect", "typestr(x)",
+  "The full structural type of x as a string (\"array<int>\", \"dict<K,V>\", a "
+  "struct name).",
+  "A compile-time type QUERY (the arg is unevaluated): folds to a string "
+  "literal of x's static type. Replaces the old typeof()." },
+{ "kindstr", "reflect", "kindstr(x)",
+  "Just x's kind as a string (\"array\", \"int\", \"struct\", ...).",
+  "Like typestr but the bare kind; also a compile-time fold." },
 { "globals", "reflect", "globals()",
   "Sorted names bound in the global scope (vars/funcs/structs), excluding "
   "builtins.",
@@ -686,7 +689,7 @@ const CommandDoc command_docs[] = {
       "Show a type without committing anything.",
       "For a bare committed global, the inferencer's inferred/declared static "
       "type; for any other expression, its runtime structural type (evaluated "
-      "in a throwaway scope). See also the typeof() builtin." },
+      "in a throwaway scope). See also the typestr() builtin." },
     { "show", ":show <function-or-expression>",
       "Render a function (or expression) optimized AST back into MyLang code.",
       "Folded consts as literals, inlined bodies spliced in, dead code gone. A "

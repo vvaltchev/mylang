@@ -314,18 +314,11 @@ EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList)
 }
 
 /*
- * typeof(x): the runtime structural type of `x` as a string - richer than
- * type(x) (which gives the bare kind "array"): "array<int>", "dict<int,str>",
- * a struct name, a function's signature, etc.
+ * reflect_typeof(v): the runtime structural type of a VALUE as a string -
+ * "array<int>", "dict<int,str>", a struct name, a function's signature, etc.
+ * Backs typestr()'s -nti fallback (and `:type` of a runtime expression). The
+ * normal typestr() path folds to the static type at compile time instead.
  */
-EvalValue builtin_typeof(EvalContext *ctx, ExprList *exprList)
-{
-    if (exprList->elems.size() != 1)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    const EvalValue &e = RValue(exprList->elems[0]->eval(ctx));
-    return SharedStr(reflect_typeof(e));
-}
 
 /*
  * signature(f): the declared signature of a function (or a struct type's
