@@ -165,11 +165,17 @@ struct RuntimeException : public Exception {
 struct InvalidTokenEx : public Exception {
 
     const std::string_view val;
+    /* True when the lexer reached end-of-input still inside a string or block
+     * comment (vs. a genuinely malformed token like `2_`). The REPL uses it to
+     * keep the input open for more lines instead of reporting an error. */
+    const bool unterminated;
 
     InvalidTokenEx(const std::string_view &val,
-                   Loc start = Loc(), Loc end = Loc())
+                   Loc start = Loc(), Loc end = Loc(),
+                   bool unterminated = false)
         : Exception("InvalidTokenEx", "Invalid token error", start, end)
         , val(val)
+        , unterminated(unterminated)
     { }
 };
 

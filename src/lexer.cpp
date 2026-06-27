@@ -100,44 +100,67 @@ ostream &operator<<(ostream &s, const Tok &t)
     return s;
 }
 
+/*
+ * The lexer scans the WHOLE source buffer at once (not line by line), tracking
+ * the current line + the offset of that line's start so each token's Loc is
+ * (line, column). This is what lets a string literal or a C-style block
+ * comment span newlines: the embedded '\n' is ordinary content, the line just
+ * advances. `\n` outside a string/comment is whitespace; `cur_loc()` gives a
+ * token's start Loc, captured into `tok_loc` when the token begins (so a
+ * multi-line string reports the loc of its opening quote, not its close).
+ */
 struct lexer_ctx {
 
     /* Input params */
     const string_view in_str;
     std::vector<Tok> &result;
-    const int line;
 
     /* State variables */
     size_type i = 0;
     size_type tok_start = 0;
-    bool float_exp = false;       /* an 'e' has been seen in the current float */
+    int cur_line;                 /* line of the char at `i` (1-based) */
+    size_type line_start = 0;     /* offset where the current line begins */
+    Loc tok_loc;                  /* the in-progress token's start Loc */
+    bool float_exp = false;       /* an 'e' has been seen in this float */
     bool exp_sign_ok = false;     /* next char may be the exponent's +/- sign */
-    bool exp_need_digit = false;  /* the exponent still needs at least one digit */
+    bool exp_need_digit = false;  /* the exponent still needs a digit */
     TokType tok_type = TokType::invalid;
 
     lexer_ctx(const string_view &in_str, int line, std::vector<Tok> &result)
         : in_str(in_str)
         , result(result)
-        , line(line)
+        , cur_line(line)
     { }
 
+    Loc cur_loc() const { return Loc(cur_line, i - line_start + 1); }
+
     void accept_token();
-    void invalid_token();
+    void flush_pending();
+    [[noreturn]] void invalid_token();
+    void newline();               /* bump the line counter at a '\n' */
 
     void handle_in_str();
     void handle_space_or_op();
     void handle_alphanum();
     void handle_other();
+    void skip_block_comment();
 };
+
+void
+lexer_ctx::newline()
+{
+    cur_line++;
+    line_start = i + 1;
+}
 
 void
 lexer_ctx::invalid_token()
 {
     /* Carry the offending token's source span so the error renders a caret
      * like every other one (end = last-char col + 2, the project convention -
-     * the bad token is in_str[tok_start .. i]). */
+     * the bad token is in_str[tok_start .. i]); tok_loc is its start. */
     throw InvalidTokenEx(in_str.substr(tok_start, i - tok_start + 1),
-                         Loc(line, tok_start + 1), Loc(line, i + 3));
+                         tok_loc, Loc(cur_line, i - line_start + 3));
 }
 
 void
@@ -153,16 +176,22 @@ lexer_ctx::accept_token()
         Keyword kw = get_keyword(val);
 
         if (kw != Keyword::kw_invalid) {
-            result.emplace_back(TokType::kw, Loc(line, tok_start + 1), kw);
+            result.emplace_back(TokType::kw, tok_loc, kw);
             return;
         }
     }
 
-    result.emplace_back(
-        tok_type,
-        Loc(line, tok_start + 1),
-        val
-    );
+    result.emplace_back(tok_type, tok_loc, val);
+}
+
+/* Accept any in-progress non-string token (called before a comment starts). */
+void
+lexer_ctx::flush_pending()
+{
+    if (tok_type != TokType::invalid) {
+        accept_token();
+        tok_type = TokType::invalid;
+    }
 }
 
 void
@@ -172,13 +201,13 @@ lexer_ctx::handle_in_str()
 
     if (c == '"') {
 
-        accept_token();
+        accept_token();                  /* value may span newlines */
         tok_type = TokType::invalid;
 
     } else if (c == '\\') {
 
-        if (i == in_str.length() - 1)
-            invalid_token();
+        if (i + 1 >= in_str.length())
+            return;                      /* trailing '\' at EOF: unterminated */
 
         /*
          * Skip the escaped char, whatever it is, so it cannot end the
@@ -189,6 +218,8 @@ lexer_ctx::handle_in_str()
          */
         i++;
     }
+    /* any other char (incl. '\n') is part of the string; the main loop's i++
+     * consumes it and bumps the line counter for a '\n'. */
 }
 
 void
@@ -202,24 +233,25 @@ lexer_ctx::handle_space_or_op()
         tok_type = TokType::invalid;
     }
 
-    if (isspace(c))
+    if (isspace(static_cast<unsigned char>(c)))
         return;
 
     /*
-     * Capture the operator's starting column now: for a two-char operator
-     * `i` is advanced below, so computing the Loc afterwards would point at
-     * the operator's second char instead of its first.
+     * Capture the operator's starting Loc now: for a two-char operator `i` is
+     * advanced below, so computing the Loc afterwards would point at the
+     * operator's second char instead of its first.
      */
-    const size_type op_col = i + 1;
+    const Loc op_loc = cur_loc();
     string_view op = in_str.substr(i, 1);
 
     if (i + 1 < in_str.length()) {
 
         if (c == '.') {
 
-            if (isdigit(in_str[i + 1])) {
+            if (isdigit(static_cast<unsigned char>(in_str[i + 1]))) {
 
                 tok_start = i;
+                tok_loc = op_loc;
                 tok_type = TokType::floatnum;
                 i++;
                 return;
@@ -244,7 +276,7 @@ lexer_ctx::handle_space_or_op()
         }
     }
 
-    result.emplace_back(TokType::op, Loc(line, op_col), get_op_type(op));
+    result.emplace_back(TokType::op, op_loc, get_op_type(op));
 }
 
 void
@@ -255,11 +287,12 @@ lexer_ctx::handle_alphanum()
     if (tok_type == TokType::invalid) {
 
         tok_start = i;
+        tok_loc = cur_loc();
         float_exp = false;
         exp_sign_ok = false;
         exp_need_digit = false;
 
-        if (isdigit(c))
+        if (isdigit(static_cast<unsigned char>(c)))
             tok_type = TokType::integer;
         else if (c == '.')
             tok_type = TokType::floatnum;
@@ -279,7 +312,7 @@ lexer_ctx::handle_alphanum()
             exp_sign_ok = true;
             exp_need_digit = true;
 
-        } else if (!isdigit(c)) {
+        } else if (!isdigit(static_cast<unsigned char>(c))) {
 
             invalid_token();
         }
@@ -300,7 +333,7 @@ lexer_ctx::handle_alphanum()
             /* a +/- sign is allowed only right after the exponent's 'e' */
             exp_sign_ok = false;
 
-        } else if (isdigit(c)) {
+        } else if (isdigit(static_cast<unsigned char>(c))) {
 
             exp_sign_ok = false;
             exp_need_digit = false;
@@ -321,7 +354,9 @@ lexer_ctx::handle_other()
 
         if (c == '"') {
 
-            /* Start a string token */
+            /* Start a string token (tok_start was set to i; the value begins
+             * after the quote, but tok_loc points AT the quote). */
+            tok_loc = cur_loc();
             tok_type = TokType::str;
             tok_start++;
 
@@ -329,6 +364,7 @@ lexer_ctx::handle_other()
 
             /* Start token of unknown type */
             tok_start = i;
+            tok_loc = cur_loc();
             tok_type = TokType::unknown;
         }
 
@@ -344,61 +380,111 @@ lexer_ctx::handle_other()
     }
 }
 
+/*
+ * Skip a C-style block comment (slash-star ... star-slash), which MAY span
+ * newlines. On entry `i` is at the leading slash; this advances `i` to the
+ * slash of the closing delimiter (the main loop's i++ then steps past it).
+ * Throws an unterminated-token error (flagged so the REPL keeps reading) if
+ * EOF is reached with no close.
+ */
+void
+lexer_ctx::skip_block_comment()
+{
+    const Loc cstart = cur_loc();
+    i += 2;                                  /* past the opening delimiter */
+
+    while (i + 1 < in_str.length()) {
+
+        if (in_str[i] == '*' && in_str[i + 1] == '/') {
+            i++;                             /* at '/'; loop's i++ skips it */
+            return;
+        }
+
+        if (in_str[i] == '\n')
+            newline();
+        i++;
+    }
+
+    throw InvalidTokenEx(string_view("/*"), cstart, Loc(),
+                         /*unterminated=*/true);
+}
+
 void
 lexer(string_view in_str, int line, std::vector<Tok> &result)
 {
     lexer_ctx ctx(in_str, line, result);
+    const size_type len = in_str.length();
 
-    for (ctx.i = 0; ctx.i < in_str.length(); ctx.i++) {
+    for (ctx.i = 0; ctx.i < len; ctx.i++) {
 
         const char c = in_str[ctx.i];
 
         if (ctx.tok_type == TokType::str) {
 
             ctx.handle_in_str();
-
-        } else {
-
-            if (c == '#')
-                break; /* comment: stop the lexer, until the end of the line */
-
-            /*
-             * A trailing '!' is part of an identifier (Ruby/Scheme "bang"
-             * convention, e.g. `get!`), but only when it is not the start of
-             * `!=` - so `x!=y` still lexes as `x != y`. The '!' is the last
-             * char of the id; the next char ends the token.
-             */
-            if (ctx.tok_type == TokType::id && c == '!' &&
-                (ctx.i + 1 >= in_str.length() || in_str[ctx.i + 1] != '='))
-                continue;
-
-            if (ctx.tok_type == TokType::invalid)
-                ctx.tok_start = ctx.i;
-
-            const bool is_op = is_operator(string_view(&c, 1));
-            const bool in_integer = ctx.tok_type == TokType::integer;
-            const bool exp_sign = ctx.exp_sign_ok && (c == '+' || c == '-');
-
-            if (!exp_sign && (isspace(c) || (is_op && (!in_integer || c != '.'))))
-                ctx.handle_space_or_op();
-            else if (exp_sign || isalnum(c) || c == '_' || c == '.' || c == '$')
-                /* '$' is a valid identifier char (not at the start of a
-                 * number): the compiler names its synthetic clones `<name>$N`
-                 * (template instances) / `<name>$sN` (specializations), so a
-                 * user can reference and inspect them, e.g. typeof(f$0). */
-                ctx.handle_alphanum();
-            else
-                ctx.handle_other();
+            if (c == '\n')
+                ctx.newline();
+            continue;
         }
+
+        if (c == '#') {            /* line comment: skip to end of line */
+            ctx.flush_pending();
+            while (ctx.i + 1 < len && in_str[ctx.i + 1] != '\n')
+                ctx.i++;
+            continue;              /* the '\n' (if any) is handled next round */
+        }
+
+        if (c == '/' && ctx.i + 1 < len && in_str[ctx.i + 1] == '*') {
+            ctx.flush_pending();
+            ctx.skip_block_comment();
+            continue;
+        }
+
+        /*
+         * A trailing '!' is part of an identifier (Ruby/Scheme "bang"
+         * convention, e.g. `get!`), but only when it is not the start of
+         * `!=` - so `x!=y` still lexes as `x != y`. The '!' is the last
+         * char of the id; the next char ends the token.
+         */
+        if (ctx.tok_type == TokType::id && c == '!' &&
+            (ctx.i + 1 >= len || in_str[ctx.i + 1] != '='))
+            continue;
+
+        if (ctx.tok_type == TokType::invalid) {
+            ctx.tok_start = ctx.i;
+            ctx.tok_loc = ctx.cur_loc();
+        }
+
+        const bool is_op = is_operator(string_view(&c, 1));
+        const bool in_integer = ctx.tok_type == TokType::integer;
+        const bool exp_sign = ctx.exp_sign_ok && (c == '+' || c == '-');
+
+        if (!exp_sign && (isspace(static_cast<unsigned char>(c)) ||
+                          (is_op && (!in_integer || c != '.'))))
+            ctx.handle_space_or_op();
+        else if (exp_sign || isalnum(static_cast<unsigned char>(c)) ||
+                 c == '_' || c == '.' || c == '$')
+            /* '$' is a valid identifier char (not at the start of a
+             * number): the compiler names its synthetic clones `<name>$N`
+             * (template instances) / `<name>$sN` (specializations), so a
+             * user can reference and inspect them, e.g. typeof(f$0). */
+            ctx.handle_alphanum();
+        else
+            ctx.handle_other();
+
+        if (c == '\n')
+            ctx.newline();
     }
 
     if (ctx.tok_type != TokType::invalid) {
 
         if (ctx.tok_type == TokType::str) {
-            /* This happens in case of an unterminated string literal */
-            assert(ctx.tok_start > 0);
-            ctx.tok_start--; /* Include " in the invalid token */
-            ctx.invalid_token();
+            /* Unterminated string literal (EOF before the closing quote). The
+             * opening quote is at tok_start - 1; flag it unterminated so the
+             * REPL keeps reading more lines instead of erroring. */
+            const size_type q = ctx.tok_start > 0 ? ctx.tok_start - 1 : 0;
+            throw InvalidTokenEx(in_str.substr(q, ctx.i - q),
+                                 ctx.tok_loc, Loc(), /*unterminated=*/true);
         }
 
         ctx.accept_token();

@@ -233,9 +233,17 @@ interactive REPL" below; `trace.cpp` is the diagnostic tracer and
   turns thrown
   `Exception`s into formatted error output (`dumpLocInError` prints the source
   line + a `^` caret).
-- `lexer.cpp` / `lexer.h` — `lexer(line, line_no, tokens)` appends tokens for
-  one source line. The
-  CLI feeds it line by line so token `Loc`s carry real line/column numbers.
+- `lexer.cpp` / `lexer.h` — `lexer(src, start_line, tokens)` appends tokens for
+  a WHOLE source buffer (not one line): it scans `src` in a single pass,
+  tracking the current line + line-start offset so each token's `Loc` is
+  (line, column). Scanning the whole buffer is what lets a **string literal or a
+  `/* */` block comment span newlines** (the embedded `\n` is ordinary content;
+  the line just advances). Callers join their source lines with `\n` and lex
+  once (`mylang.cpp`'s `lex_all`/`source`, the REPL's per-input `source`,
+  `tests.cpp`'s `check`); `start_line` lets the REPL continue line numbering
+  across inputs. `#` is a line comment; an unterminated string / block comment
+  at EOF throws `InvalidTokenEx` with `unterminated=true` (the REPL reads that
+  flag to keep the input open for more lines).
 - `parser.cpp` / `parser.h` — recursive-descent parser, const-folding woven in.
   `pBlock()` is the
   entry point.
@@ -340,6 +348,18 @@ the EOF sentinel.
 Chars are 8-bit; **no Unicode** (deliberate, to stay small). A **trailing `!`**
 is part of an identifier (Ruby/Scheme "bang" convention, e.g. `get!`), but only
 when it is not the start of `!=` — so `x!=y` still lexes as `x != y`.
+**The lexer scans the whole buffer in one pass** (see the file bullet above): a
+`lexer_ctx` tracks `cur_line`/`line_start` and stamps each token's start `Loc`
+into `tok_loc` when it begins (so a multi-line string reports the loc of its
+**opening quote**, not its close). Two **multi-line constructs**: a `"..."`
+string keeps embedded newlines in its value (the `string_view` spans them —
+which is *why* the lexer must see the whole buffer, not a line at a time), and a
+`/* ... */` **block comment** (`skip_block_comment`) is skipped across lines.
+`/*` can never be valid code (there is no unary `*`), so adding it broke
+nothing. Both throw `InvalidTokenEx` with **`unterminated=true`** at EOF if not
+closed (vs. a malformed token like `2_`, which is `unterminated=false`); the
+REPL's `is_incomplete` returns that flag to keep reading. `#` line comments and
+the trivial value paths are unchanged.
 
 ### Parser — operator-precedence ladder
 
@@ -2009,6 +2029,15 @@ behind a thin terminal shell:
     token — and a `{` is classified as a statement **block** vs a dict
     **literal** by whether the previous token expected a value, so a multi-line
     func/if body gets interior `;` but a multi-line dict does not.
+    **Multi-line-string/comment aware:** `repl_scan_line` tracks an
+    `in_string`/`in_comment` state across physical lines and returns each line's
+    `[code_begin, code_end)` span (the part NOT inside a string/comment); a line
+    wholly inside one is passed through verbatim with no `;`, and only the code
+    span is lexed for the bracket/continuation logic (so it can never hit an
+    unterminated token). A multi-line string that **closes** at the start of a
+    line is itself a value, so the statement can be terminated there even with
+    no following code token (`closed_string`); a line that **opens** one that
+    continues gets no `;` (`open_at_end`).
   - **`EvalContext::allow_redeclare`** (set only on the REPL global scope) makes
     a re-declaration rebind the global instead of throwing `AlreadyDefinedEx`
     (the script rule is unchanged — the resolver still catches same-scope dups
@@ -2117,7 +2146,12 @@ behind a thin terminal shell:
     `read_line`.
 - **`highlight.{h,cpp}`** — `highlight_line`, a self-contained scanner (NOT the
   lexer; tolerates mid-edit input) that wraps keywords/strings/numbers/comments/
-  type-words in ANSI color, preserving the bytes exactly otherwise.
+  type-words in ANSI color, preserving the bytes exactly otherwise. The two-arg
+  `highlight_line(src, int &state)` threads an `HlState` (`HL_NONE`/`HL_STRING`/
+  `HL_COMMENT`) across lines, so a string or `/* */` block comment is colored
+  **across rows**; `read_line`'s repaint carries that state row to row (the
+  one-arg form is the stateless wrapper for isolated lines). The `read_line`
+  highlight callback type is `string (*)(const string &, int &)` accordingly.
 - **`errfmt.{h,cpp}`** — `format_exception`/`dump_loc_in_error`, the
   per-exception-type caret/backtrace rendering, factored out of `mylang.cpp`
   (parameterized by an `ostream` + the source `lines`) so the file driver and

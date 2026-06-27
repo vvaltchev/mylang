@@ -38,6 +38,23 @@ static bool opt_repl;
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
+/* The whole source as one buffer (lines re-joined with '\n'). The lexer scans
+ * it in one pass so strings / block comments can span lines; token string_views
+ * point into it, so it must outlive parsing (it is static => program lifetime).
+ * `lines` is kept separately for per-line error carets. */
+static string source;
+
+static void
+lex_all()
+{
+    source.clear();
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (i)
+            source += '\n';
+        source += lines[i];
+    }
+    lexer(source, 1, tokens);
+}
 
 void run_tests(bool dump_syntax_tree);
 
@@ -93,8 +110,7 @@ read_script(const char *filename)
         }
     }
 
-    for (size_t i = 0; i < lines.size(); i++)
-        lexer(lines[i], static_cast<int>(i+1), tokens);
+    lex_all();
 }
 
 void
@@ -262,7 +278,7 @@ parse_args(int argc, char **argv)
 
     if (in_tokens) {
         lines.emplace_back(move(inline_text));
-        lexer(lines[0], 1, tokens);
+        lex_all();
     }
 }
 

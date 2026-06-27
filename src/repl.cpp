@@ -113,8 +113,9 @@ struct ReplEngine::Impl {
     void gc_redefined_instances(Block *blk,
                                 const std::vector<const UniqueId *> &before);
 
-    /* lex `source` into stable per-line storage (the lexer holds string_views
-     * into the lines, so they must outlive the parse). */
+    /* Lex `source` in one pass (so a string / block comment can span lines);
+     * token string_views point into `source`, which the caller keeps alive
+     * through the parse. `local_lines` is filled too, for error carets. */
     static void lex_stable(const string &source,
                            std::vector<string> &local_lines,
                            std::vector<Tok> &toks) {
@@ -122,8 +123,7 @@ struct ReplEngine::Impl {
         string line;
         while (std::getline(ss, line))
             local_lines.push_back(line);
-        for (size_t i = 0; i < local_lines.size(); i++)
-            lexer(local_lines[i], static_cast<int>(i + 1), toks);
+        lexer(source, 1, toks);
     }
 };
 
@@ -180,6 +180,65 @@ repl_continuation_op(Op op)
  * typing `;`. A `;` after a `}` is a harmless empty statement (and is needed
  * after a dict literal), so it is added.
  */
+/*
+ * Find the "code" span [begin, end) of one physical line, given the running
+ * in_string / in_comment state (updated in place). A string or block comment
+ * may span lines: any part of the line inside one is excluded so the caller
+ * lexes only real code (and never an unterminated token). Returns begin ==
+ * npos when the whole line sits inside a string/comment. On return, in_string /
+ * in_comment reflect the state AT END OF LINE (true => the line opens one that
+ * does not close here). `#` starts a line comment (code ends there).
+ */
+static size_t
+repl_scan_line(const string &line, bool &in_string, bool &in_comment,
+               size_t &code_end)
+{
+    const size_t n = line.size();
+    size_t i = 0, begin;
+
+    if (in_comment) {
+        while (i + 1 < n && !(line[i] == '*' && line[i + 1] == '/'))
+            i++;
+        if (i + 1 < n) { in_comment = false; i += 2; begin = i; }
+        else { code_end = n; return string::npos; }   /* still in comment */
+    } else if (in_string) {
+        while (i < n) {
+            if (line[i] == '\\') { i += 2; continue; }
+            if (line[i] == '"') { in_string = false; i++; break; }
+            i++;
+        }
+        if (in_string) { code_end = n; return string::npos; }  /* still open */
+        begin = i;
+    } else {
+        begin = 0;
+    }
+
+    code_end = n;
+    while (i < n) {
+        const char c = line[i];
+        if (c == '#') { code_end = i; break; }     /* line comment */
+        if (c == '/' && i + 1 < n && line[i + 1] == '*') {
+            size_t j = i + 2;
+            while (j + 1 < n && !(line[j] == '*' && line[j + 1] == '/'))
+                j++;
+            if (j + 1 < n) { i = j + 2; continue; }            /* closed */
+            in_comment = true; code_end = i; break;            /* opens */
+        }
+        if (c == '"') {
+            size_t j = i + 1;
+            while (j < n) {
+                if (line[j] == '\\') { j += 2; continue; }
+                if (line[j] == '"') break;
+                j++;
+            }
+            if (j < n) { i = j + 1; continue; }                /* closed */
+            in_string = true; code_end = i; break;             /* opens */
+        }
+        i++;
+    }
+    return begin;
+}
+
 static string
 repl_auto_terminate(const string &src)
 {
@@ -202,12 +261,35 @@ repl_auto_terminate(const string &src)
      */
     std::vector<char> stack;
     bool expects_value = false;       /* statement position at the start */
+    bool in_string = false;           /* a string spanning physical lines */
+    bool in_comment = false;          /* a block comment spanning lines */
 
     for (const string &line : phys) {
 
+        /* A line wholly inside a multi-line string / comment is passed through
+         * verbatim - never lex it (it is not code) or terminate it. */
+        const bool was_in_string = in_string;
+        size_t code_end = 0;
+        const size_t code_begin =
+            repl_scan_line(line, in_string, in_comment, code_end);
+        if (code_begin == string::npos) {
+            out += line;
+            out += '\n';
+            continue;
+        }
+
+        /* A multi-line string that CLOSED at the start of this line is itself a
+         * value, so the statement can end here with no code token after. */
+        const bool closed_string = was_in_string && !in_string;
+
+        /* Lex only the code part (complete strings/comments, never an open one
+         * - so the lexer can't throw on an unterminated token here). */
+        const string code = line.substr(code_begin, code_end - code_begin);
+        const bool open_at_end = in_string || in_comment;
+
         std::vector<Tok> toks;
         try {
-            lexer(line, 1, toks);     /* only token kinds/ops are read */
+            lexer(code, 1, toks);     /* only token kinds/ops are read */
         } catch (...) {
             /* a bad token: leave the line as-is and let the parser report it */
             out += line;
@@ -246,7 +328,13 @@ repl_auto_terminate(const string &src)
 
         const char ctx = stack.empty() ? 'B' : stack.back();
         const bool stmt_ctx = (ctx == 'B');     /* not 'D'/'('/'[' */
-        if (last && stmt_ctx && !repl_continuation_op(last->op))
+        /* The line ends in a value (so a `;` terminates the statement) when its
+         * last code token isn't a continuation, or - with no code token - when
+         * a multi-line string just closed here. No `;` when the line instead
+         * opens a string/comment that continues onto the next line. */
+        const bool ends_in_value =
+            last ? !repl_continuation_op(last->op) : closed_string;
+        if (!open_at_end && stmt_ctx && ends_in_value)
             out += ';';
         out += '\n';
     }
@@ -290,18 +378,20 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
             lines.push_back(line);
     }
 
-    /* 2. Lex, then parse against the PERSISTENT const context (no pushed
+    /* 2. Lex the whole input in one pass (so a string / block comment can span
+     *    lines), then parse against the PERSISTENT const context (no pushed
      *    top-level scope, so new consts/pure-funcs/structs survive to the next
-     *    input). The lexer itself can throw (a bad token like `2_`), so it runs
-     *    inside the try: a lex error is reported like any other and rejects
-     *    only this input, never the session. The lexer reads the persistent
-     *    `lines` (not a local), so an InvalidTokenEx's view stays valid for the
-     *    caret. */
+     *    input). The lexer can throw (a bad token like `2_`, or an unterminated
+     *    string), so it runs inside the try: a lex error is reported like any
+     *    other and rejects only this input, never the session. `source` (the
+     *    auto-terminated input, which already holds these lines joined by '\n')
+     *    outlives parsing, so a token / error string_view into it stays valid;
+     *    the caret line itself comes from the persistent `lines`. The first
+     *    line is number base + 1, continuing across inputs. */
     std::vector<Tok> tokens;
     unique_ptr<Construct> root;
     try {
-        for (size_t i = base; i < lines.size(); i++)
-            lexer(lines[i], static_cast<int>(i + 1), tokens);
+        lexer(source, static_cast<int>(base + 1), tokens);
 
         if (tokens.empty())
             return "";
@@ -464,8 +554,7 @@ ReplEngine::Impl::cmd_tree(const string &code)
     std::vector<Tok> toks;
 
     try {
-        for (size_t i = 0; i < local_lines.size(); i++)
-            lexer(local_lines[i], static_cast<int>(i + 1), toks);
+        lexer(source, 1, toks);   /* one pass; views point into `source` */
         ParseContext pc(TokenStream(toks), true);
         pc.const_ctx = const_ctx.get();
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
@@ -928,30 +1017,6 @@ ReplEngine::Impl::gc_redefined_instances(
     }
 }
 
-/* Net unclosed (){}/[] depth of `src` (>=0), lexer-based so strings/comments
- * don't count. Drives both is_incomplete and the continuation auto-indent. */
-static int
-repl_bracket_depth(const string &src)
-{
-    std::vector<Tok> toks;
-    {
-        std::stringstream ss(src);
-        string line;
-        int n = 1;
-        while (std::getline(ss, line))
-            lexer(line, n++, toks);
-    }
-
-    int depth = 0;
-    for (const auto &t : toks) {
-        if (t == Op::parenL || t == Op::braceL || t == Op::bracketL)
-            depth++;
-        else if (t == Op::parenR || t == Op::braceR || t == Op::bracketR)
-            depth--;
-    }
-    return depth < 0 ? 0 : depth;
-}
-
 std::vector<string>
 ReplEngine::completions(const string &buf, size_t cursor) const
 {
@@ -1032,24 +1097,30 @@ ReplEngine::is_incomplete(const string &src)
 {
     std::vector<Tok> toks;
     try {
-        std::stringstream ss(src);
-        string line;
-        int n = 1;
-        while (std::getline(ss, line))
-            lexer(line, n++, toks);
+        lexer(src, 1, toks);          /* whole-buffer: strings/comments span */
+    } catch (const InvalidTokenEx &e) {
+        /* An UNTERMINATED string / block comment means the input is still being
+         * written - keep the editor open for more lines. Any other bad token
+         * (e.g. `2_`) is a definitive error: report it complete so the editor
+         * submits it and do_eval surfaces the error. */
+        return e.unterminated;
     } catch (const Exception &) {
-        /* A bad token (e.g. `2_`, or an unterminated string - mylang strings
-         * are single-line) is a definitive error, not an input still waiting
-         * for more: report it complete so the editor submits it and do_eval
-         * surfaces the lex error. Never let it escape (it would crash the
-         * raw-mode REPL via the submitter). */
         return false;
     }
 
     if (toks.empty())
         return false;
 
-    if (repl_bracket_depth(src) > 0)
+    /* Net unclosed (){}/[] depth (>0 wants more). A string's / comment's own
+     * brackets aren't here - they're inside a single string token / skipped. */
+    int depth = 0;
+    for (const auto &t : toks) {
+        if (t == Op::parenL || t == Op::braceL || t == Op::bracketL)
+            depth++;
+        else if (t == Op::parenR || t == Op::braceR || t == Op::bracketR)
+            depth--;
+    }
+    if (depth > 0)
         return true;
 
     /* A line ending on a binary/continuation operator wants more. */
@@ -1122,7 +1193,10 @@ run_repl()
     engine.set_color(color);
     set_highlight_enabled(color);
     trace_set_color(color);
-    auto *hl = color ? highlight_line : nullptr;
+    /* the cast selects the cross-line (stateful) highlight overload */
+    string (*hl)(const string &, int &) =
+        color ? static_cast<string (*)(const string &, int &)>(highlight_line)
+              : nullptr;
 
     LineEditor::Completer completer =
         [&engine](const string &b, size_t cur) {

@@ -50,12 +50,37 @@ void set_highlight_enabled(bool on) { g_enabled = on; }
 string
 highlight_line(const string &src)
 {
+    int state = HL_NONE;
+    return highlight_line(src, state);
+}
+
+string
+highlight_line(const string &src, int &state)
+{
     if (!g_enabled)
         return src;
 
     string out;
     const size_t n = src.size();
     size_t i = 0;
+
+    /* Continue a string / block comment opened on a previous line. */
+    if (state == HL_STRING) {
+        out += C_STR;
+        while (i < n && src[i] != '"') {
+            if (src[i] == '\\' && i + 1 < n)
+                out += src[i++];
+            out += src[i++];
+        }
+        if (i < n) { out += src[i++]; state = HL_NONE; }   /* closing quote */
+        out += RESET;
+    } else if (state == HL_COMMENT) {
+        out += C_COM;
+        while (i < n && !(src[i] == '*' && i + 1 < n && src[i + 1] == '/'))
+            out += src[i++];
+        if (i < n) { out += src[i++]; out += src[i++]; state = HL_NONE; }
+        out += RESET;
+    }
 
     while (i < n) {
 
@@ -70,8 +95,7 @@ highlight_line(const string &src)
             continue;
         }
 
-        /* C-style block comment - real MyLang source has none (it uses #), but
-         * the :show decompiler annotates with them, so color them gray. */
+        /* C-style block comment (may span lines: set HL_COMMENT if unclosed) */
         if (c == '/' && i + 1 < n && src[i + 1] == '*') {
             out += C_COM;
             out += src[i++];                    /* '/' */
@@ -79,17 +103,17 @@ highlight_line(const string &src)
             while (i < n &&
                    !(src[i] == '*' && i + 1 < n && src[i + 1] == '/'))
                 out += src[i++];
-            if (i + 1 < n) {                    /* the closing '*'/ */
+            if (i < n) {                        /* the closing star-slash */
                 out += src[i++];
                 out += src[i++];
-            } else if (i < n) {
-                out += src[i++];
+            } else {
+                state = HL_COMMENT;            /* unclosed: carry over */
             }
             out += RESET;
             continue;
         }
 
-        /* string literal "..." (tolerate it being unterminated mid-edit) */
+        /* string literal (may span lines: set HL_STRING if unterminated) */
         if (c == '"') {
             out += C_STR;
             out += src[i++];
@@ -100,6 +124,8 @@ highlight_line(const string &src)
             }
             if (i < n)                          /* the closing quote */
                 out += src[i++];
+            else
+                state = HL_STRING;              /* unterminated: carry over */
             out += RESET;
             continue;
         }

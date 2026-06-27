@@ -206,6 +206,10 @@ language*. Probably, the fastest way to learn this language is to check
 out the scripts in the `samples/` directory while taking a look at the short
 documentation below.
 
+**Comments.** A `#` starts a line comment (to end of line). A `/* ... */` is a
+block comment that **may span multiple lines**. (Both are also recognized by the
+syntax highlighter, across lines.)
+
 ### Core concepts
 
 `MyLang` is a dynamic duck-typing language, like `Python`. If you know `Python`
@@ -622,6 +626,10 @@ runtime instead.
   * **String**
     A string like "hello". Strings are immutable and support slices (e.g.
     `s[3:5]` or `s[3:]` or `s[-2:]`, having the same meaning as in `Python`).
+    A `"..."` literal **may span multiple lines**, and the line breaks are kept
+    as `\n` in the value (Ruby-style); the usual escapes (`\n`, `\t`, `\"`,
+    `\\`, …) work too. An unterminated string (no closing `"` before
+    end-of-input) is an error.
 
   * **Array**
     A mutable type for arrays and tuples (e.g. `[1,2,3]`). It can contain items

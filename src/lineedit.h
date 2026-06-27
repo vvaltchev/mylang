@@ -244,6 +244,6 @@ struct ReadLineResult {
 ReadLineResult
 read_line(const std::string &prompt, const std::string &cont_prompt,
           std::vector<std::string> &history,
-          std::string (*highlight)(const std::string &) = nullptr,
+          std::string (*highlight)(const std::string &, int &) = nullptr,
           LineEditor::Completer completer = {},
           LineEditor::Submitter submitter = {});

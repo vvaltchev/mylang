@@ -782,7 +782,7 @@ string completions_str(const std::vector<string> &cands)
 ReadLineResult
 read_line(const string &prompt, const string &cont_prompt,
           std::vector<string> &history,
-          string (*highlight)(const string &),
+          string (*highlight)(const string &, int &),
           LineEditor::Completer completer, LineEditor::Submitter submitter)
 {
     ReadLineResult res;
@@ -836,9 +836,10 @@ read_line(const string &prompt, const string &cont_prompt,
         o += "\r\033[J";                       /* col 0, clear downward */
 
         const std::vector<string> rows = split_lines(ed.buffer());
+        int hlstate = 0;           /* thread string/comment color across rows */
         for (size_t i = 0; i < rows.size(); i++) {
             o += (i == 0 ? prompt : cont_prompt);
-            o += highlight ? highlight(rows[i]) : rows[i];
+            o += highlight ? highlight(rows[i], hlstate) : rows[i];
             if (i + 1 < rows.size())
                 o += "\r\n";
         }

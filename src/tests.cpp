@@ -1760,6 +1760,45 @@ static const std::vector<test> tests =
       { "var x = \"abc;" }, &typeid(InvalidTokenEx) },
     { "lexer: an unknown character is a syntax error",
       { "var x = @;" }, &typeid(SyntaxErrorEx) },
+
+    /* ---- multi-line strings & block comments ---- */
+    {
+        "lexer: a string literal spans lines (the newline is kept)",
+        {
+            "var s = \"line1",
+            "line2\";",
+            "assert(len(s) == 11);",            /* 5 + '\n' + 5 */
+            "assert(s == \"line1\\nline2\");",
+        },
+    },
+    {
+        "lexer: a three-line string keeps both newlines",
+        {
+            "var s = \"a",
+            "b",
+            "c\";",
+            "assert(len(s) == 5);",
+            "assert(s == \"a\\nb\\nc\");",
+        },
+    },
+    {
+        "lexer: a block comment spans lines",
+        {
+            "var x = 1 /* this comment",
+            "   keeps going */ + 2;",
+            "assert(x == 3);",
+        },
+    },
+    { "lexer: a single-line block comment",
+      { "var y = 5 /* inline */ + 1; assert(y == 6);" } },
+    { "lexer: a block comment between tokens",
+      { "assert(1 /* a */ + 2 /* b */ == 3);" } },
+    { "lexer: division is not mistaken for a block comment",
+      { "assert(10 / 2 == 5);" } },
+    { "lexer: a comment marker inside a string is literal text",
+      { "var s = \"a/*b#c\"; assert(len(s) == 6);" } },
+    { "lexer: an unterminated block comment is an invalid token",
+      { "var x = 1 /* never closed" }, &typeid(InvalidTokenEx) },
     { "lexer: a malformed number is a syntax error",
       { "var x = 1.2.3;" }, &typeid(SyntaxErrorEx) },
 
@@ -7376,11 +7415,18 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
 {
     std::vector<Tok> tokens;
     unique_ptr<Construct> root;
+    std::string src;   /* the test's lines re-joined; lexed in one pass so a
+                        * string / block comment can span lines. Outlives the
+                        * parse below, so token string_views into it stay valid. */
 
     try {
 
-        for (size_t i = 0; i < t.source.size(); i++)
-            lexer(t.source[i], static_cast<int>(i+1), tokens);
+        for (size_t i = 0; i < t.source.size(); i++) {
+            if (i)
+                src += '\n';
+            src += t.source[i];
+        }
+        lexer(src, 1, tokens);
 
         ParseContext pCtx(TokenStream(tokens), true /* const eval */);
 
@@ -8654,6 +8700,17 @@ static const std::vector<repl_test> repl_tests =
       { { "func ml(int a) {\n  var t = a + 1\n  return t * 10\n}", "" },
         { "ml(4)", "=> 50" } } },
 
+    /* a string literal whose newline is typed across input lines keeps it */
+    { "a string literal spans lines in the REPL",
+      { { "var ms = \"a\nb\nc\"", "" },
+        { "len(ms)", "=> 5" },
+        { "ms", "=> \"a\\nb\\nc\"" } } },
+
+    /* a block comment spanning lines is skipped; the statement still runs */
+    { "a block comment spans lines in the REPL",
+      { { "var bc = 1 /* a\n multi-line\n comment */ + 9", "" },
+        { "bc", "=> 10" } } },
+
     { "a template defined then called across inputs instantiates per type",
       { { "func tg(a){ var r = a + 1; return r; }", "" },
         { "tg(41)", "=> 42" },
@@ -9057,6 +9114,27 @@ static bool highlight_tolerates_unterminated_string()
     /* mid-edit: an unclosed string must not throw or drop characters */
     const std::string src = "var s = \"hello";
     return strip_ansi(highlight_line(src)) == src;
+}
+
+/* A string / block comment is colored across lines via the carried state. */
+static bool highlight_multiline_carries_state()
+{
+    set_highlight_enabled(true);
+    const std::string STR = "\033[38;5;114m";   /* the string color */
+    const std::string COM = "\033[38;5;244m";   /* the comment color */
+
+    int st = HL_NONE;
+    highlight_line("var s = \"abc", st);       /* opens a string */
+    if (st != HL_STRING) return false;
+    const std::string r2 = highlight_line("def\"", st);   /* continues it */
+    if (st != HL_NONE) return false;           /* closed on this line */
+    if (r2.find(STR) == std::string::npos) return false;  /* colored as string */
+
+    st = HL_NONE;
+    highlight_line("x /* open", st);           /* opens a block comment */
+    if (st != HL_COMMENT) return false;
+    const std::string c2 = highlight_line("still */ y", st);
+    return st == HL_NONE && c2.find(COM) != std::string::npos;
 }
 
 static bool has_cand(const std::vector<std::string> &v, const std::string &s)
@@ -9676,6 +9754,8 @@ static const std::vector<extra_check> extra_checks =
     { "highlight: disabled is identity", highlight_disabled_is_identity },
     { "highlight: tolerates an unterminated string",
       highlight_tolerates_unterminated_string },
+    { "highlight: a string/comment is colored across lines",
+      highlight_multiline_carries_state },
     { "lineedit: typing and backspace", lineedit_typing_and_backspace },
     { "lineedit: cursor move and insert", lineedit_cursor_move_and_insert },
     { "lineedit: home/end and kill-to-end", lineedit_home_end_kill },
