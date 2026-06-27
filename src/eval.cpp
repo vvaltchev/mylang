@@ -670,6 +670,68 @@ coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
                       "' got a value of the wrong type"), s, e);
 }
 
+/*
+ * Native composite types for reflection (see plans/reflection.md). Built once
+ * (lazy static, program-lifetime), boxed (they have str/array fields), slots in
+ * declaration order. `StructLayout`'s `fields` carries a TypeAnnot of
+ * `array<StructField>` so the inferencer types `layout(S).fields[0]` as a
+ * StructField.
+ */
+const StructTypeDef *native_struct_field_def()
+{
+    static StructTypeDef *const def = []() {
+        auto *d = new StructTypeDef();
+        d->name = UniqueId::get("StructField");
+        auto add = [&](const char *n, FieldKind k) {
+            FieldDef f;
+            f.name = UniqueId::get(n);
+            f.kind = k;
+            f.slot = static_cast<int>(d->fields.size());
+            d->fields.push_back(f);
+        };
+        add("name",   FieldKind::f_str);
+        add("type",   FieldKind::f_str);
+        add("offset", FieldKind::f_int);
+        add("size",   FieldKind::f_int);
+        add("align",  FieldKind::f_int);
+        d->compute_layout();
+        return d;
+    }();
+    return def;
+}
+
+const StructTypeDef *native_struct_layout_def()
+{
+    static StructTypeDef *const def = []() {
+        auto *d = new StructTypeDef();
+        d->name = UniqueId::get("StructLayout");
+        auto add = [&](const char *n, FieldKind k,
+                       std::shared_ptr<TypeAnnot> annot) {
+            FieldDef f;
+            f.name = UniqueId::get(n);
+            f.kind = k;
+            f.annot = move(annot);
+            f.slot = static_cast<int>(d->fields.size());
+            d->fields.push_back(f);
+        };
+        add("name",  FieldKind::f_str,  nullptr);
+        add("size",  FieldKind::f_int,  nullptr);
+        add("align", FieldKind::f_int,  nullptr);
+        add("pod",   FieldKind::f_bool, nullptr);
+        /* fields: array<StructField> */
+        auto elem = std::make_shared<TypeAnnot>();
+        elem->kind = DeclType::strct;
+        elem->strct = native_struct_field_def();
+        auto arr = std::make_shared<TypeAnnot>();
+        arr->kind = DeclType::arr;
+        arr->elem = elem;
+        add("fields", FieldKind::f_array, arr);
+        d->compute_layout();
+        return d;
+    }();
+    return def;
+}
+
 static EvalValue
 construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
 {

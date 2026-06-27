@@ -101,8 +101,8 @@ const BuiltinDoc builtin_docs[] = {
   "A function's declared signature, or a struct type's constructor form.",
   nullptr },
 { "layout", "reflect", "layout(S)",
-  "A struct's in-memory layout: POD field offsets + total size/align, or the "
-  "boxed slot list.", nullptr },
+  "A struct's layout as a StructLayout value (name/size/align/pod and .fields, "
+  "an array<StructField> of name/type/offset/size/align).", nullptr },
 { "specializations", "reflect", "specializations(f)",
   "The <name>$N / <name>$sN template-instance & specialization clones derived "
   "from f.", nullptr },

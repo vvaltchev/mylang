@@ -300,6 +300,14 @@ compile standalone, and there is nothing to add to the Makefile.
 `reflect_*` rendering helpers (signature/type/layout strings) the REPL's
 introspection commands reuse; it is `#include`d last (after the other builtins)
 so it can call `arr_elem_at`. See `plans/repl-introspection.md`.
+**`layout(S)` returns a structured value, not a string** — a **native composite
+type** (`StructLayout`, holding an `array<StructField>`), the first of the
+reflection objects. The two native `StructTypeDef`s are built in C++
+(`native_struct_field_def`/`native_struct_layout_def`, `eval.cpp`), the
+inferencer registers them in `struct_by_name` (`setup()`) and types `layout()`
+via `builtin_result`, and `reflect_make_layout` (reflect.cpp.h) constructs the
+boxed instance. This is the mechanism `Type` objects (the planned
+`type()`/`decltype()` return value) will reuse — see `plans/reflection.md`.
 
 **Why so many headers are templates.** `type.h` (`TypeTemplate`),
 `sharedarray.h`

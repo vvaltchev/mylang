@@ -822,6 +822,13 @@ void Inferencer::setup()
 {
     bottom = A.fresh_var();
     global = new_scope(nullptr);
+
+    /* Native composite types (reflection): register so a builtin returning one
+     * (e.g. layout() -> StructLayout) and its field accesses type-check. */
+    const StructTypeDef *sf = native_struct_field_def();
+    const StructTypeDef *sl = native_struct_layout_def();
+    struct_by_name[sf->name] = sf;
+    struct_by_name[sl->name] = sl;
 }
 
 /*
@@ -2293,6 +2300,12 @@ STyRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "split" || n == "splitlines" || n == "readlines")
         return A.array_of(A.str_ty());
+
+    /* layout(S) -> a StructLayout reflection object (native composite type) */
+    if (n == "layout") {
+        const StructTypeDef *sl = native_struct_layout_def();
+        return A.struct_ty(sl, sl->name);
+    }
 
     if (n == "range")  return A.array_of(A.int_ty());
     if (n == "array") {

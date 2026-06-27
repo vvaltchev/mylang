@@ -2175,16 +2175,24 @@ struct **instance**) it returns the constructor form, e.g. `"Point(int x, int
 y)"`.
 
 #### `layout(struct_or_type)`
-Return a struct's **in-memory layout** as a multi-line string. For a POD struct
-(every field a non-`opt` scalar / nested POD) it shows the total size and
-alignment and each field's byte offset and size:
+Return a struct's **in-memory layout** as a structured **`StructLayout`** value
+(a *native composite type* — an actual struct you can read programmatically),
+with `.name`, `.size` (POD bytes, 0 for boxed), `.align`, `.pod` (bool), and
+`.fields` — an `array<StructField>`, each `{ str name; str type; int offset;
+int size; int align; }`. For a boxed field, `offset`/`size`/`align` are `-1`
+(it has no byte layout).
+```C#
+struct Point { int x; int y; }
+var lay = layout(Point);
+lay.name             # "Point"
+lay.pod              # true
+lay.size             # 16
+lay.fields[1].name   # "y"
+lay.fields[1].offset # 8
 ```
-Point - POD, size=16 bytes, align=8
-  x: int @0 (8 bytes)
-  y: int @8 (8 bytes)
-```
-For a boxed struct it lists each field's slot index. `const` members are listed
-at the end. Accepts a struct **type descriptor** or an **instance**.
+Accepts a struct **type descriptor** or an **instance**. (`StructLayout` /
+`StructField` are the first *native composite types* — the same mechanism will
+back `Type` objects for `type()` / `decltype()`.)
 
 #### `show(f)`
 Render function `f`'s **final optimized AST** back into synthetic MyLang-like

@@ -53,8 +53,48 @@ static const char *reflect_decl_type_kw(DeclType d)
 }
 
 /* A struct field's type keyword (the struct name for an f_struct field). */
+/* Render a parsed TypeAnnot (array<int>, dict<str, Point>, ...) as a string,
+ * matching the `?`-suffix notation of sty_to_string / decltype. */
+static std::string reflect_annot_str(const TypeAnnot *ta)
+{
+    if (!ta)
+        return "?";
+    std::string s;
+    switch (ta->kind) {
+        case DeclType::b:   s = "bool";  break;
+        case DeclType::i:   s = "int";   break;
+        case DeclType::f:   s = "float"; break;
+        case DeclType::s:   s = "str";   break;
+        case DeclType::dyn: s = "dyn";   break;
+        case DeclType::strct:
+            s = ta->strct ? std::string(ta->strct->name->val) : "struct";
+            break;
+        case DeclType::arr:
+            s = "array<" + reflect_annot_str(ta->elem.get()) + ">";
+            break;
+        case DeclType::dict:
+            s = "dict<" + reflect_annot_str(ta->key.get()) + "," +
+                reflect_annot_str(ta->val.get()) + ">";
+            break;
+        default: s = "dyn";
+    }
+    if (ta->opt)
+        s += "?";
+    return s;
+}
+
 static std::string reflect_field_type(const FieldDef &f)
 {
+    /* a parameterized container (`array<int>`, `dict<str,P>`): the annot
+     * carries the full element type (with its own `?` for nullability). */
+    if (f.annot && (f.kind == FieldKind::f_array ||
+                    f.kind == FieldKind::f_dict)) {
+        std::string t = reflect_annot_str(f.annot.get());
+        if (f.is_opt && (t.empty() || t.back() != '?'))
+            t += "?";
+        return t;
+    }
+
     std::string s;
     if (f.is_opt)
         s += "opt ";
@@ -314,9 +354,54 @@ EvalValue builtin_signature(EvalContext *ctx, ExprList *exprList)
 }
 
 /*
- * layout(S): a struct's in-memory layout (POD field offsets/sizes + total
- * size/alignment, or the boxed slot list), as a multi-line string. Accepts a
- * struct type descriptor or a struct instance.
+ * Build a StructLayout reflection value (a native composite type, see
+ * plans/reflection.md) describing `qdef`: name, size, align, pod, and an
+ * array<StructField> with each field's name/type/offset/size/align (the last
+ * three are -1 for a boxed field, which has no byte layout).
+ */
+static EvalValue reflect_make_layout(const StructTypeDef *qdef)
+{
+    StructTypeDef *sf = const_cast<StructTypeDef *>(native_struct_field_def());
+    StructTypeDef *sl = const_cast<StructTypeDef *>(native_struct_layout_def());
+
+    SharedArrayObj::vec_type fieldvec;
+    for (const FieldDef &f : qdef->fields) {
+        int sz = 0, al = 0;
+        const bool pod = StructTypeDef::pod_field_metrics(f, sz, al);
+        auto fo = make_intrusive<StructObject>(sf);
+        fo->fields.emplace_back(
+            EvalValue(SharedStr(std::string(f.name->val))), false);
+        fo->fields.emplace_back(
+            EvalValue(SharedStr(reflect_field_type(f))), false);
+        fo->fields.emplace_back(
+            EvalValue(static_cast<int_type>(qdef->is_pod() ? f.offset : -1)),
+            false);
+        fo->fields.emplace_back(
+            EvalValue(static_cast<int_type>(pod ? sz : -1)), false);
+        fo->fields.emplace_back(
+            EvalValue(static_cast<int_type>(pod ? al : -1)), false);
+        fieldvec.emplace_back(
+            EvalValue(intrusive_ptr<StructObject>(fo)), false);
+    }
+
+    auto lo = make_intrusive<StructObject>(sl);
+    lo->fields.emplace_back(
+        EvalValue(SharedStr(std::string(qdef->name->val))), false);
+    lo->fields.emplace_back(
+        EvalValue(static_cast<int_type>(qdef->size)), false);
+    lo->fields.emplace_back(EvalValue(static_cast<int_type>(qdef->align)),
+                            false);
+    lo->fields.emplace_back(EvalValue(qdef->is_pod()), false);
+    lo->fields.emplace_back(EvalValue(SharedArrayObj(move(fieldvec))), false);
+    return EvalValue(intrusive_ptr<StructObject>(lo));
+}
+
+/*
+ * layout(S): a struct's in-memory layout as a structured `StructLayout` value -
+ * `.name`, `.size`, `.align`, `.pod`, and `.fields` (an array<StructField> of
+ * {name, type, offset, size, align}). Accepts a struct type descriptor or a
+ * struct instance. (The legacy `reflect_layout` string renderer is kept for the
+ * REPL `:layout`-style introspection.)
  */
 EvalValue builtin_layout(EvalContext *ctx, ExprList *exprList)
 {
@@ -327,10 +412,9 @@ EvalValue builtin_layout(EvalContext *ctx, ExprList *exprList)
     const EvalValue &e = RValue(arg->eval(ctx));
 
     if (e.is<StructTypeDef *>())
-        return SharedStr(reflect_layout(e.get<StructTypeDef *>()));
+        return reflect_make_layout(e.get<StructTypeDef *>());
     if (e.is<intrusive_ptr<StructObject>>())
-        return SharedStr(
-            reflect_layout(e.get<intrusive_ptr<StructObject>>()->def));
+        return reflect_make_layout(e.get<intrusive_ptr<StructObject>>()->def);
 
     throw TypeErrorEx("Expected a struct type or instance", arg->start,
                       arg->end);
