@@ -2311,10 +2311,11 @@ private:
 
     /*
      * A BLOCK-bodied function the inliner can splice in place via an
-     * InlinedCallExpr (step-1 / v1). Like inlinable_decl but for `{...}` bodies:
-     *  - NO LOCALS (frame_size == nparams): after the params are substituted no
-     *    callee-frame slot survives, so no frame remapping is needed. (A body
-     *    WITH locals - the splice_tail-style remapping case - is v2.)
+     * InlinedCallExpr. Like inlinable_decl but for `{...}` bodies:
+     *  - RESOLVED: its params/locals are slotted, so splice_tail can substitute
+     *    the params (by slot) and remap the locals into the caller's frame. (A
+     *    0-param-0-local unresolved func is folded by AutoConst already, so
+     *    requiring resolved loses nothing.)
      *  - non-capturing, no nested function (substitution would break a closure),
      *  - NON-recursive: a COMPLETE refs_uid check (count_uses misses uses buried
      *    inside the block); the recursion ban is lifted later for bounded
@@ -2322,18 +2323,17 @@ private:
      *  - does not reassign a scalar param,
      *  - body weight below ONE call (the benefit function - body_weight): the
      *    call overhead it removes outweighs the spliced body.
+     * Locals are allowed (v2): try_inline_block remaps them, growing the caller
+     * frame (capped at 64 slots).
      */
     static bool block_inlinable_decl(const FuncDeclStmt *fd)
     {
-        if (!fd->body || !fd->body->is_block() || !fd->id)
+        if (!fd->body || !fd->body->is_block() || !fd->id || !fd->resolved)
             return false;
-        const int nparams =
-            fd->params ? static_cast<int>(fd->params->elems.size()) : 0;
         return (!fd->captures || fd->captures->elems.empty())
             && !contains_func(fd->body.get())
             && !refs_uid(fd->body.get(), fd->id->uid)   /* non-recursive */
             && !mutates_a_param(fd)
-            && fd->frame_size == nparams                 /* no locals */
             && body_weight(fd->body.get()) < CALL_WEIGHT;
     }
 
@@ -2377,12 +2377,38 @@ private:
         return body_mutates_param(fd->body.get(), params);
     }
 
+    /* A COMPLETE search for a nested function (descends into the containers
+     * for_each_child stops at - Block/Expr14/for/foreach/try). The plain
+     * for_each_child form MISSED a closure that is the rvalue of a decl
+     * (`var f = func[..]..;`), which let try_inline_block wrongly inline a body
+     * whose closure captured a param - a real bug v2 exposed once bodies with
+     * locals became eligible. */
     static bool contains_func(const Construct *c)
     {
         if (!c)
             return false;
         if (dynamic_cast<const FuncDeclStmt *>(c))
             return true;
+        if (auto *b = dynamic_cast<const Block *>(c)) {
+            for (auto &e : b->elems)
+                if (contains_func(e.get())) return true;
+            return false;
+        }
+        if (auto *f = dynamic_cast<const ForStmt *>(c))
+            return contains_func(f->init.get()) || contains_func(f->cond.get())
+                || contains_func(f->inc.get()) || contains_func(f->body.get());
+        if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+            return contains_func(fe->container.get())
+                || contains_func(fe->body.get());
+        if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+            if (contains_func(tc->tryBody.get())) return true;
+            for (auto &p : tc->catchStmts)
+                if (contains_func(p.second.get())) return true;
+            return contains_func(tc->finallyBody.get());
+        }
+        if (auto *e = dynamic_cast<const Expr14 *>(c))
+            return contains_func(e->lvalue.get())
+                || contains_func(e->rvalue.get());
         bool found = false;
         for_each_child(const_cast<Construct *>(c),
             [&](Construct *ch) { if (contains_func(ch)) found = true; });
@@ -2418,7 +2444,8 @@ private:
      * nullptr means the enclosing function is unresolved (no frame), so block-
      * body inlining is skipped there.
      */
-    void walk(unique_ptr<Construct> &slot, int depth, int *fsize)
+    void walk(unique_ptr<Construct> &slot, int depth, int *fsize,
+              bool no_block = false)
     {
         if (!slot)
             return;
@@ -2433,13 +2460,38 @@ private:
             return;
         }
 
+        /*
+         * A loop CONDITION: walk it with block-inline SUPPRESSED. The
+         * specialize_types for-range pass (run later) caches a pure-call bound -
+         * `for (i; i < f(n); i++)` evaluates f(n) ONCE - but it only recognizes
+         * the call shape, not an opaque InlinedCallExpr; block-inlining f(n)
+         * first would turn the ForRangeStmt into a per-iteration ForStmt (a
+         * regression). Leaving the call there costs nothing (a plain loop's cond
+         * runs every iteration anyway) and lets for-range claim it. Expression-
+         * body inlining is NOT suppressed: it yields a for-range-recognizable
+         * arithmetic expression, not an InlinedCallExpr.
+         */
+        if (auto *fs = dynamic_cast<ForStmt *>(slot.get())) {
+            if (fs->init) walk(fs->init, depth, fsize, no_block);
+            if (fs->cond) walk(fs->cond, depth, fsize, /*no_block*/true);
+            if (fs->inc)  walk(fs->inc,  depth, fsize, no_block);
+            if (fs->body) walk(fs->body, depth, fsize, no_block);
+            return;
+        }
+        if (auto *ws = dynamic_cast<WhileStmt *>(slot.get())) {
+            if (ws->condExpr) walk(ws->condExpr, depth, fsize, /*no_block*/true);
+            if (ws->body)     walk(ws->body, depth, fsize, no_block);
+            return;
+        }
+
         /* Recurse into children at the same splice depth. */
         for_each_child_slot(slot.get(),
-            [&](unique_ptr<Construct> &ch) { walk(ch, depth, fsize); });
+            [&](unique_ptr<Construct> &ch) { walk(ch, depth, fsize, no_block); });
 
         try_inline(slot, depth, fsize);   /* re-scans its splice (depth + 1) */
         try_inline_tail(slot, depth, fsize);   /* tail call to a block func */
-        try_inline_block(slot, depth, fsize); /* non-tail block func (any pos) */
+        if (!no_block)
+            try_inline_block(slot, depth, fsize); /* non-tail block func */
         try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
@@ -2720,36 +2772,63 @@ private:
             return;
 
         FuncDeclStmt *f = it->second;
-        const size_t nparams = f->params ? f->params->elems.size() : 0;
+        if (!f->resolved)
+            return;       /* its locals aren't slotted: nothing to remap into */
 
-        if (ce->args->elems.size() != nparams)
+        const int nparams = f->params
+            ? static_cast<int>(f->params->elems.size()) : 0;
+        if (static_cast<int>(ce->args->elems.size()) != nparams)
             return;   /* arity mismatch: let the runtime error survive */
 
-        /* Each arg must be evaluated as often as the param is used and a
-         * side-effecting arg neither dropped nor duplicated. A COMPLETE use
-         * count (count_matching) - the param may be used deep inside the
-         * block, where count_uses would miss it. */
-        for (size_t i = 0; i < nparams; i++) {
-            const UniqueId *puid = f->params->elems[i]->uid;
+        /*
+         * Each param must be VALUE-STABLE when substituted, by SLOT (a shadowing
+         * local mustn't mislead): non-reassigned in the body (slot_writes), and
+         * `tail_arg_ok` - a caller LOCAL or const literal, never a global or
+         * side-effecting expr. Stricter than sub_ok because a block body can
+         * change shared state (a global) BETWEEN the param's uses, so an
+         * identifier read inside the body must be one the body can't reassign.
+         */
+        for (int i = 0; i < nparams; i++) {
+            if (i < static_cast<int>(f->slot_writes.size())
+                    && f->slot_writes[i] != 0)
+                return;
             const int uses = count_matching(f->body.get(),
-                [&](const Identifier *id) { return id->uid == puid; });
-            if (!sub_ok(uses, ce->args->elems[i].get()))
+                [&](const Identifier *id) {
+                    return id->sym.kind == SymKind::local
+                        && id->sym.slot == i;
+                });
+            if (!tail_arg_ok(uses, ce->args->elems[i].get()))
                 return;
         }
+
+        /* The body's locals are remapped into a fresh range at the top of the
+         * caller's frame (which grows by f's local count, capped at 64). With no
+         * caller frame (fsize null) only a no-locals body can be inlined. */
+        const int nlocals = f->frame_size - nparams;
+        if (nlocals > 0 && !fsize)
+            return;
+        if (fsize && *fsize + nlocals > MAX_FRAME_SLOTS)
+            return;       /* would overflow the 64-slot frame */
 
         const int bsz = count_all_nodes(f->body.get());
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
             return;
         inline_budget -= bsz;
 
+        /* Splice: substitute params (by slot) + remap locals to [*fsize, ...). */
+        const int off = fsize ? (*fsize - nparams) : 0;
+        std::vector<Construct *> args;
+        for (auto &a : ce->args->elems)
+            args.push_back(a.get());
+
+        unique_ptr<Construct> body = f->body->clone();
+        splice_tail(body, args, nparams, off);
+        if (fsize)
+            *fsize += nlocals;   /* the caller's frame absorbed f's locals */
+
         const InlineCtx *ic = alloc_inline_ctx(
             { std::string(f->id->get_str()), param_names(f),
               ce->start, ce->inline_ctx });
-
-        unique_ptr<Construct> body = f->body->clone();
-        for (size_t i = 0; i < nparams; i++)
-            substitute(body, f->params->elems[i]->uid,
-                       ce->args->elems[i].get());
         tag_inline(body.get(), ic);
 
         auto ica = make_unique<InlinedCallExpr>();
@@ -2763,7 +2842,8 @@ private:
 
         TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
               std::to_string(nparams) + " arg(s))  block body " +
-              std::to_string(bsz) + " nodes -> inline");
+              std::to_string(bsz) + " nodes -> inline (+" +
+              std::to_string(nlocals) + " local slot(s))");
 
         slot = move(ica);
         walk(slot, depth + 1, fsize);   /* re-scan: nested calls in the body */

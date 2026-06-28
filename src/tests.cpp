@@ -2940,6 +2940,35 @@ static const std::vector<test> tests =
       { "func bad(a) { if (a > 0) return a; return 1 / 0; }",
         "func c(p) { return bad(p); }",
         "c(0);" }, &typeid(DivisionByZeroEx) },
+    /* v2: a block body WITH a local is inlined (its locals are remapped into
+     * the caller's frame, which grows by the local count). */
+    { "block-inline v2: body with a local",
+      { "func f(a, b) { var t = a + b; return t; }",
+        "func c(p, q) { var y = f(p, q); return y; }",
+        "assert(c(3, 4) == 7);",
+        "assert(c(5, 6) == 11);" } },
+    { "block-inline v2: two inlines in one expr get distinct local slots",
+      { "func f(a, b) { var t = a + b; return t; }",
+        "func c(p, q, r) { return f(p, q) + f(q, r); }",
+        "assert(c(1, 2, 3) == (1 + 2) + (2 + 3));" } },
+    /* A GLOBAL arg substituted into a body that mutates that global would be
+     * unsound (the body could change it between the param's uses); tail_arg_ok
+     * rejects a global arg, so the call is NOT inlined - the value is the
+     * call-time global. (Was a v1 bug: sub_ok wrongly allowed the global.) */
+    { "block-inline: global arg + global-mutating body is NOT inlined",
+      { "var g = 5;",
+        "func f(a) { g = 99; return a; }",
+        "func c() { var y = f(g); return y; }",
+        "assert(c() == 5);",     /* arg g bound at call time = 5, not 99 */
+        "assert(g == 99);" } },
+    /* A closure that is the rvalue of a decl (`var h = func[v]..`) must keep
+     * the function from being block-inlined - substitution would break the
+     * capture. (Was a v2 bug: contains_func used the incomplete for_each_child,
+     * which doesn't descend into an Expr14 rvalue.) */
+    { "block-inline: a body with a captured closure decl is not inlined",
+      { "func mk(v) { var h = func [v] (a) => a + v; return h; }",
+        "func c(p) { return mk(p); }",
+        "assert((c(3))(2) == 5);" } },
     /* a pure call inside an EXPRESSION-bodied function folds (the body is a
      * bare expression, which AutoConst used to skip) */
     { "auto-const: a pure call in an expression-bodied function folds",

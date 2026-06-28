@@ -286,6 +286,25 @@ struct Renderer {
             o << " " << OpString[(int)e->op] << " ";
             expr(e->rvalue.get(), 0); return;
         }
+        if (auto *e = dynamic_cast<const InlinedCallExpr *>(c)) {
+            /* An inlined block body in expression position. The common
+             * single-return body renders as its value expression (an
+             * "inlined <name>" marker is emitted by the body's inline_ctx
+             * tracking); a multi-statement body is summarized best-effort. */
+            auto *b = dynamic_cast<const Block *>(e->elem.get());
+            const ReturnStmt *r = (b && b->elems.size() == 1)
+                ? dynamic_cast<const ReturnStmt *>(b->elems[0].get()) : nullptr;
+            if (r) {
+                o << "(";
+                if (r->elem) expr(r->elem.get(), 0); else o << "none";
+                o << ")";
+            } else {
+                const char *nm = (e->elem && e->elem->inline_ctx)
+                    ? e->elem->inline_ctx->callee_name.c_str() : "?";
+                o << "/* inlined " << nm << " */";
+            }
+            return;
+        }
         /* fallback for an unhandled expression node */
         o << "/* " << c->name << " */";
     }

@@ -859,23 +859,36 @@ body's `return`s yield THIS expression's value instead of returning from the
 caller. No statement hoisting and no eval-order change — the node sits exactly
 where the call was — and no child `EvalContext` (the body block is `scope_free`,
 so it runs in place; far cheaper than the EvalContext+Frame+bind a real call
-pays — ~1.4x on a call-heavy non-const loop). **v1 scope (`block_inlinable_decl`):**
-NO LOCALS (`frame_size == nparams`), so after substitution no callee-frame slot
-survives and no frame remapping is needed; non-capturing, no nested function,
-**non-recursive** (a COMPLETE `refs_uid` check — `count_uses` misses
-block-interior uses), no scalar-param reassignment, args `sub_ok` (with a
-complete use count). The size gate is the **cost model**: `body_weight` (a
-weighted node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x
-an arith op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)** —
-the call overhead removed must outweigh the spliced body. Bounded by
-`MAX_INLINE_DEPTH` + `inline_budget`, re-scanned (depth+1) so nested calls
-collapse, `InlineCtx`-tagged for backtraces. A const-arg call to such a func is
-folded by AutoConst *before* the inliner (the func is auto-pure), so block-inline
-only fires on the non-const-arg calls AutoConst can't. Registered in `block_funcs`
-independently of `funcs`/`spec_funcs` (so a func can be both tail-inlined and
-block-inlined; walk order: expr-inline, tail-inline, block-inline, specialize).
-Still **not done** (see `plans/function-inlining.md` "Remaining"): block bodies
-WITH locals (the splice_tail-style remapping, v2); the recursion ban lifted for
+pays — ~1.4x on a call-heavy non-const loop). **Scope (`block_inlinable_decl`):**
+**resolved** (params + locals slotted), non-capturing, no nested function
+(`contains_func` — a COMPLETE walk; the plain `for_each_child` form missed a
+closure that is a decl rvalue `var h = func[..]..`, which let an inline break the
+capture), **non-recursive** (a COMPLETE `refs_uid` check), no scalar-param
+reassignment, args **`tail_arg_ok`** (a caller LOCAL or const literal, never a
+global or side-effecting expr — a block body can change shared state between a
+param's uses, so the arg must be value-stable; `sub_ok` would be unsound here),
+use count by SLOT. The size gate is the **cost model**: `body_weight` (a weighted
+node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x an arith
+op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)**. **Bodies WITH
+locals are handled** (v2): `splice_tail` substitutes the params (by slot) and
+**remaps the locals** into a fresh range at the top of the caller's frame (which
+grows by the local count, capped at 64) — the same machinery tail-inline uses;
+two inlines in one expression get distinct ranges. **Block-inline is SUPPRESSED
+inside a loop condition** (`walk`'s `no_block` flag, threaded into `ForStmt`/
+`WhileStmt` conds): the for-range specializer (run later) caches a pure-call
+bound, but only recognizes the call shape, not an opaque `InlinedCallExpr`, so
+inlining a `for (i; i < f(n); i++)` bound first would turn a once-evaluated
+`ForRangeStmt` into a per-iteration `ForStmt` — a regression; the call is left for
+for-range (expression-body inlining is NOT suppressed there — it yields a
+for-range-recognizable arithmetic expression). Bounded by `MAX_INLINE_DEPTH` +
+`inline_budget`, re-scanned (depth+1) so nested calls collapse, `InlineCtx`-tagged
+for backtraces. A const-arg call to such a (auto-pure) func is folded by AutoConst
+*before* the inliner, so block-inline only fires on the non-const-arg calls.
+Registered in `block_funcs` independently of `funcs`/`spec_funcs` (a func can be
+both tail-inlined and block-inlined; walk order: expr-inline, tail-inline,
+block-inline, specialize). coderender renders an `InlinedCallExpr` as its
+value (a single-return body) or an `inlined <name>` marker. Still **not done**
+(see `plans/function-inlining.md` "Remaining"): the recursion ban lifted for
 bounded unrolling + CSE of duplicate pure calls; the deferred
 type-narrowing/algebraic pass.
 

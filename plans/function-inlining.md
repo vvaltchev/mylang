@@ -355,13 +355,27 @@ Not yet done; roughly in priority order:
    approach below (statement-level splice with a result temp) turned out
    unnecessary for the common case — the FlowState-boundary expression is
    simpler and cheaper. The size gate is the measured **cost model**
-   (`body_weight` < `CALL_WEIGHT` = 21, weights from `--weights`). **v1 scope:**
-   no-locals bodies (so no frame remapping), non-capturing, no nested func,
-   non-recursive, args `sub_ok`. Result: ~1.4x on a call-heavy non-const loop;
-   1286/1286 across the matrix. **Still v2/v3:** (a) bodies WITH locals (reuse
-   `splice_tail` remapping into the caller frame); (b) lift the recursion ban
-   for bounded unrolling + CSE of duplicate pure calls (the recursive-auto-pure
-   prerequisite is already in).
+   (`body_weight` < `CALL_WEIGHT` = 21, weights from `--weights`), non-capturing,
+   no nested func, non-recursive.
+
+   **v2 DONE — bodies WITH locals.** `splice_tail` substitutes the params (by
+   slot) and **remaps the locals** into a fresh range at the top of the caller's
+   frame (grown by the local count, capped at 64) — the same machinery
+   tail-inline uses; two inlines in one expression get distinct ranges. Args use
+   **`tail_arg_ok`** (a caller local or const literal, never a global — a block
+   body can change shared state between a param's uses; `sub_ok` was a latent v1
+   unsoundness that allowed a global arg). Two bugs the broadened eligibility
+   exposed and fixed: (1) `contains_func` was incomplete (`for_each_child` skips
+   an `Expr14` rvalue), so a closure decl `var h = func[v]..` wasn't seen and the
+   capture broke — made it a COMPLETE walk; (2) block-inlining a pure call in a
+   `for`-condition ran before the for-range specializer and turned a once-cached
+   `ForRangeStmt` bound into a per-iteration `ForStmt` — `walk` now SUPPRESSES
+   block-inline inside loop conds (`no_block`), leaving the call for for-range
+   (expression-inline there is fine — it yields a recognizable arithmetic bound).
+   Result: ~1.4x on a call-heavy non-const loop; 1290/1290 across the matrix.
+
+   **Still v3:** lift the recursion ban for bounded unrolling + CSE of duplicate
+   pure calls (the recursive-auto-pure prerequisite is already in).
 
    The original gap: a block-bodied function used **in expression position**
    (`var y = f(z) + 1;`) and **recursive** functions (banned by
