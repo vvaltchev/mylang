@@ -405,10 +405,11 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const vector<unique_ptr<Construct>> &args,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
-                    Frame *frame)
+                    Frame *frame,
+                    size_t min_args)   /* precomputed: see FuncDeclStmt */
 {
     const size_t nparams = funcParams.size();
-    if (args.size() > nparams || args.size() < min_required_args(funcParams))
+    if (args.size() > nparams || args.size() < min_args)
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++) {
@@ -431,10 +432,11 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const vector<EvalValue> &args,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
-                    Frame *frame)
+                    Frame *frame,
+                    size_t min_args)
 {
     const size_t nparams = funcParams.size();
-    if (args.size() > nparams || args.size() < min_required_args(funcParams))
+    if (args.size() > nparams || args.size() < min_args)
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++) {
@@ -450,10 +452,11 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const EvalValue &arg,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
-                    Frame *frame)
+                    Frame *frame,
+                    size_t min_args)
 {
     const size_t nparams = funcParams.size();
-    if (nparams < 1 || min_required_args(funcParams) > 1)
+    if (nparams < 1 || min_args > 1)
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++)
@@ -467,10 +470,11 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const pair<EvalValue, EvalValue> &args,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
-                    Frame *frame)
+                    Frame *frame,
+                    size_t min_args)
 {
     const size_t nparams = funcParams.size();
-    if (nparams < 2 || min_required_args(funcParams) > 2)
+    if (nparams < 2 || min_args > 2)
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++)
@@ -520,9 +524,13 @@ do_func_call(EvalContext *ctx,
 
     if (obj.func->params) {
         const auto &funcParams = obj.func->params->elems;
+        if (obj.func->min_args_cache < 0)
+            obj.func->min_args_cache =
+                static_cast<int>(min_required_args(funcParams));
         do_func_bind_params(
             funcParams, args, ctx, &args_ctx,
-            obj.func->resolved ? &frame : nullptr
+            obj.func->resolved ? &frame : nullptr,
+            static_cast<size_t>(obj.func->min_args_cache)
         );
     }
 

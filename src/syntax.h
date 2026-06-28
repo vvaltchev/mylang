@@ -1139,6 +1139,14 @@ public:
     std::vector<int> slot_writes;
 
     /*
+     * The minimum number of arguments a call must pass (1 + index of the last
+     * non-opt param; trailing opt params are skippable). Lazily cached on the
+     * first call so the per-call arity check is a field read, not a param-list
+     * walk. -1 = not computed yet; a clone leaves it -1 and recomputes once.
+     */
+    mutable int min_args_cache = -1;
+
+    /*
      * Purity. `explicit_pure` is set by the parser for a `pure func`.
      * `effective_pure` is `explicit_pure` OR a function the resolver proves
      * effectively pure (reads only consts + its params, calls only const
