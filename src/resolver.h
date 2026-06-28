@@ -2,7 +2,25 @@
 
 #pragma once
 
+#include <unordered_set>
+
 class Construct;
+class UniqueId;
+
+/*
+ * Implicit top-level `var` (Plan A): an assignment `name = expr` to an
+ * UNDECLARED name at the OUTERMOST scope (a direct statement of the root block)
+ * is an implicit declaration - so trivial scripts and the REPL need no `var`
+ * for globals. Run AFTER parse, BEFORE inference: it flips `pInDecl` on the
+ * qualifying `Expr14` nodes, after which every later pass treats them as
+ * ordinary `var` decls (no other change anywhere). Only a bare `Identifier =`
+ * directly in the root block qualifies - nested blocks and function bodies
+ * still require `var`. A name already declared (including `known` - the REPL's
+ * prior-input globals) or a builtin name is left a plain assignment. No-op when
+ * `root` is not a Block.
+ */
+void mark_implicit_globals(Construct *root,
+                           const std::unordered_set<const UniqueId *> &known);
 
 /*
  * Name-resolution pass: run once on the parsed (and const-folded) syntax tree,

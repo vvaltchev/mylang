@@ -2025,6 +2025,23 @@ static const std::vector<test> tests =
         "var a = [10, 20]; var r = g(a);",
         "assert(r == 10 && a[0] == 11);" } },   /* ref semantics, like a call */
 
+    /* ---- implicit top-level `var` (Plan A: outermost scope only) ---- */
+    { "implicit var: a bare top-level assignment declares a global",
+      { "a = 1; assert(a == 1); a = 2; assert(a == 2);" } },
+    { "implicit var: type is inferred and fixed (like an explicit var)",
+      { "a = 5; assert(decltype(a).name == \"int\");" } },
+    { "implicit var: a function reads and writes the implicit global",
+      { "g = 10; func inc() { g = g + 1; } inc(); inc(); assert(g == 12);" } },
+    { "implicit var: a new variable inside a function still needs `var`",
+      { "func f() { b = 2; return b; } print(f());" },
+      &typeid(UndefinedVariableEx) },
+    { "implicit var: a nested top-level block still needs `var` (Plan A)",
+      { "if (true) { c = 3; } print(c);" }, &typeid(UndefinedVariableEx) },
+    { "implicit var: a builtin name is not implicitly declared (rebind error)",
+      { "len = 1;" }, &typeid(CannotRebindBuiltinEx) },
+    { "implicit var: assigning a conflicting type is still an error",
+      { "a = 1; a = \"x\";" }, &typeid(TypeMismatchEx) },
+
     { "var with no initializer: its type is inferred from later assignment",
       { "var a; a = 3; assert(decltype(a).name == \"int?\");" } },
     { "var with no initializer: a conflicting reassignment is a type error",
@@ -2500,8 +2517,9 @@ static const std::vector<test> tests =
     { "calling a function with too few args is rejected",
       { "func f(a, b) { return a; } var k=1; f(k);" },
       &typeid(WrongArgCountEx) },
-    { "assigning to an undefined variable is an error",
-      { "nonexistent = 5;" }, &typeid(UndefinedVariableEx) },
+    { "assigning to an undefined variable inside a function is an error",
+      /* at top level `x = 5` is an implicit var; inside a function it is not */
+      { "func f() { nonexistent = 5; } f();" }, &typeid(UndefinedVariableEx) },
     { "foreach over a non-iterable is a type error",
       { "var n = 5; foreach (var x in n) { }" }, &typeid(TypeErrorEx) },
     { "member access on a non-dict is a type error",
@@ -7727,6 +7745,7 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
         ParseContext pCtx(TokenStream(tokens), true /* const eval */);
 
         root = pBlock(pCtx);
+        mark_implicit_globals(root.get(), {});
         infer_types(root.get());
         resolve_names(root.get());
         specialize_types(root.get());
@@ -9061,6 +9080,13 @@ static const std::vector<repl_test> repl_tests =
         /* a prior-input const folds the ternary; a prior global feeds ?? */
         { "FLAG ? \"on\" : \"off\"", "=> \"on\"" },
         { "g ?? 42", "=> 42" } } },
+    { "implicit top-level var works (and commits) across REPL inputs",
+      { { "a = 1", "=> 1" },           /* implicit var, commits int */
+        { "a", "=> 1" },
+        { "a = 2", "=> 2" },           /* re-targets the existing global */
+        { "func g() { return a + 10; }", "" },
+        { "g()", "=> 12" },        /* a function reads the implicit global */
+        { "a = \"x\"", "has type 'int'" } } },  /* type-commitment holds */
     { "an uninitialized `var a;` is an open (dyn?) var across REPL inputs",
       { { "var a;", "" },
         { "decltype(a).name", "=> \"dyn?\"" },   /* not the useless "none" */

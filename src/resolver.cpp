@@ -3074,6 +3074,64 @@ run_optimizers(Construct *root, bool enable_inline, int inline_threshold,
     specialize_types(root, enable_specialize, prior_scope);
 }
 
+void
+mark_implicit_globals(Construct *root,
+                      const std::unordered_set<const UniqueId *> &known)
+{
+    Block *rb = dynamic_cast<Block *>(root);
+    if (!rb)
+        return;
+
+    std::unordered_set<const UniqueId *> declared(known.begin(), known.end());
+
+    /* Record a name an explicit decl / func / struct introduces, so a later
+     * top-level assignment to it is recognized as an assignment, not a fresh
+     * implicit var (`var a = 1; a = 2;` -> the second is an assignment). */
+    auto record = [&](Construct *lv) {
+        if (auto *id = dynamic_cast<Identifier *>(lv))
+            declared.insert(id->uid);
+        else if (auto *il = dynamic_cast<IdList *>(lv))
+            for (auto &e : il->elems)
+                declared.insert(e->uid);
+    };
+
+    for (auto &up : rb->elems) {
+        Construct *c = up.get();
+
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+            if (fd->id)
+                declared.insert(fd->id->uid);
+            continue;
+        }
+        if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+            if (sd->id)
+                declared.insert(sd->id->uid);
+            continue;
+        }
+
+        auto *e = dynamic_cast<Expr14 *>(c);
+        if (!e)
+            continue;
+
+        if (e->fl & pFlags::pInDecl) {        /* an explicit var/const decl */
+            record(e->lvalue.get());
+            continue;
+        }
+
+        /* A plain `name = expr` to an undeclared, non-builtin name: implicit
+         * `var`. Only a bare identifier at the outermost scope qualifies. */
+        if (e->op == Op::assign) {
+            if (auto *id = dynamic_cast<Identifier *>(e->lvalue.get())) {
+                if (!declared.count(id->uid) &&
+                    builtin_slot_index(id->uid) < 0) {
+                    e->fl |= pFlags::pInDecl;
+                    declared.insert(id->uid);
+                }
+            }
+        }
+    }
+}
+
 /*
  * Post-resolve walk that records the resolver-decided optimizations still
  * readable on the tree: an auto-pure function (effective_pure but not written

@@ -333,6 +333,20 @@ un-inlined tree); the typed-node *specialization* it enables runs *after*
 `resolve_names`. Both are gated by the CLI's `-nti` and on by default. See
 "Static type inference" below.
 
+**Implicit top-level `var` (`mark_implicit_globals`, `resolver.cpp`).** A tiny
+pre-pass run by every driver right after parse and *before* inference (script
+`mylang.cpp`, REPL `repl.cpp`, and the `-rt` harness's `check()`), so it is NOT
+gated by `-nti`. It scans the root block's **direct** statements and, for a
+plain `name = expr` (`Expr14`, `op == assign`, bare `Identifier` lvalue) whose
+name is not yet declared and is not a builtin, **sets `pInDecl` on that node** —
+turning it into an ordinary `var` decl that every later pass already handles (no
+other change anywhere). Only the OUTERMOST scope qualifies (a nested block /
+function body still needs `var`). The "already declared" set is built forward
+(explicit decls, func/struct names, earlier implicit vars) seeded with `known` —
+empty for a script, the prior-input globals (runtime + const scopes) for the
+REPL, so a later `a = 2` re-targets the existing global instead of re-declaring
+it. See README *Declaring variables*.
+
 **The post-inference optimizer pipeline is one shared function,
 `run_optimizers` (`resolver.cpp`/`.h`): `resolve_names` (slotting + auto-const
 + inlining + specialization) then `specialize_types` (M8).** Both drivers call

@@ -344,6 +344,12 @@ int main(int argc, char **argv)
                 &ctx.get_tok()
             );
 
+        /* Implicit top-level `var`: a bare `name = expr` to an undeclared name
+         * at the outermost scope is a declaration. Runs before inference so all
+         * later passes see it as an ordinary var decl. (Script: no prior
+         * globals.) */
+        mark_implicit_globals(root.get(), {});
+
         /* --debug-ti: dump the inferred type of every identifier + its use
          * sites (machine-readable) and exit, without running. */
         if (opt_debug_ti) {

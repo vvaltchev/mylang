@@ -430,6 +430,24 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         return format_error(e);
     }
 
+    /* 2a-bis. Implicit top-level `var`: a bare `name = expr` to a name not
+     *     already a committed global (or builtin) is a declaration. Seed the
+     *     "known" set with this REPL's prior globals (runtime + const scopes)
+     *     so a later `a = 2` re-targets the existing global instead of
+     *     re-declaring it. */
+    {
+        std::unordered_set<const UniqueId *> known;
+        std::vector<std::pair<const UniqueId *, const LValue *>> prior;
+        runtime_ctx->collect_symbols(prior);
+        for (auto &kv : prior)
+            known.insert(kv.first);
+        prior.clear();
+        const_ctx->collect_symbols(prior);
+        for (auto &kv : prior)
+            known.insert(kv.first);
+        mark_implicit_globals(root.get(), known);
+    }
+
     /* 2b. Type-check this input against the committed globals (faithful
      *     incremental inference). A type error rejects just this input - report
      *     it and commit nothing (no eval, no retain). On success the inferencer

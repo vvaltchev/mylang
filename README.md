@@ -280,6 +280,31 @@ var a = 42;
 # But here we cannot see `b`.
 ```
 
+**Top-level variables have an implicit `var`.** At the outermost scope (a
+statement directly in the program/REPL, not inside any block or function), a
+plain assignment to a name that hasn't been declared yet *is* its declaration —
+so trivial scripts and the REPL need no `var` for globals:
+
+```C#
+total = 0;          # implicit `var total = 0;` (a global)
+total = total + 5;  # an ordinary assignment (total already exists)
+
+func add(n) {
+    total = total + n;   # reads & writes the global `total` (no `var` needed)
+    var tmp = n * 2;     # a NEW variable inside a function ALWAYS needs `var`
+}
+```
+
+The implicit declaration fires **only at the outermost scope**: inside a
+function
+body or a nested block (`if`/`for`/`{ }`), assigning to an undeclared name is an
+error — use `var`. The implicit var is otherwise identical to an explicit one
+(its type is inferred and then fixed; `total = 0; total = "x";` is a type
+error).
+A name that is a builtin (`len`, `print`, …) is never implicitly declared. This
+is purely additive: explicit `var` at the top level still works exactly as
+before.
+
 It's possible to declare multiple variables using the following familiar syntax:
 
 ```C#
