@@ -767,9 +767,9 @@ ReplEngine::Impl::cmd_globals()
                         bool is_const) -> Row {
         Row r;
         r.name = string(uid->val);
-        if (v.is<shared_ptr<FuncObject>>()) {
+        if (v.is<intrusive_ptr<FuncObject>>()) {
             r.kind = "func";
-            r.type = reflect_func_sig(v.get<shared_ptr<FuncObject>>()->func);
+            r.type = reflect_func_sig(v.get<intrusive_ptr<FuncObject>>()->func);
         } else if (v.is<StructTypeDef *>()) {
             r.kind = "struct type";
             r.type = reflect_struct_ctor(v.get<StructTypeDef *>());
@@ -945,8 +945,8 @@ ReplEngine::Impl::cmd_show(const string &arg)
 
     auto func_of = [](const LValue *lv) -> const FuncDeclStmt * {
         const EvalValue &v = lv->get();
-        return v.is<shared_ptr<FuncObject>>()
-                   ? v.get<shared_ptr<FuncObject>>()->func
+        return v.is<intrusive_ptr<FuncObject>>()
+                   ? v.get<intrusive_ptr<FuncObject>>()->func
                    : nullptr;
     };
     auto render = [&](const FuncDeclStmt *f) {
@@ -1048,9 +1048,9 @@ ReplEngine::Impl::gc_redefined_instances(
         if (!before.count(kv.first))
             continue;
         const EvalValue &v = kv.second->get();
-        if (!v.is<shared_ptr<FuncObject>>())
+        if (!v.is<intrusive_ptr<FuncObject>>())
             continue;
-        const FuncDeclStmt *fd = v.get<shared_ptr<FuncObject>>()->func;
+        const FuncDeclStmt *fd = v.get<intrusive_ptr<FuncObject>>()->func;
         if (fd->display_name.empty() || !redefined.count(fd->display_name))
             continue;                       /* not a redefined func's clone */
         if (infer.instance_has_consumer(fd))

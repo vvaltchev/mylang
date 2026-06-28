@@ -148,10 +148,10 @@ EvalValue builtin_ispure(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &v = RValue(arg->eval(ctx));
 
-    if (!v.is<shared_ptr<FuncObject>>())
+    if (!v.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx(arg->start, arg->end);
 
-    return v.get<shared_ptr<FuncObject>>()->func->effective_pure;
+    return v.get<intrusive_ptr<FuncObject>>()->func->effective_pure;
 }
 
 EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList)
@@ -162,10 +162,10 @@ EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &v = RValue(arg->eval(ctx));
 
-    if (!v.is<shared_ptr<FuncObject>>())
+    if (!v.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx(arg->start, arg->end);
 
-    return v.get<shared_ptr<FuncObject>>()->func->explicit_pure;
+    return v.get<intrusive_ptr<FuncObject>>()->func->explicit_pure;
 }
 
 EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
@@ -343,17 +343,17 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
          * has no other owner, so without this its FuncObject would be freed
          * when the temporary `keyval` below goes out of scope, leaving `key`
          * dangling (a use-after-free when find_arr calls it). */
-        shared_ptr<FuncObject> key_holder;
+        intrusive_ptr<FuncObject> key_holder;
 
         if (exprList->elems.size() == 3) {
 
             Construct *arg2 = exprList->elems[2].get();
             const EvalValue &keyval = RValue(arg2->eval(ctx));
 
-            if (!keyval.is<shared_ptr<FuncObject>>())
+            if (!keyval.is<intrusive_ptr<FuncObject>>())
                 throw TypeErrorEx("Expected function object", arg2->start, arg2->end);
 
-            key_holder = keyval.get<shared_ptr<FuncObject>>();
+            key_holder = keyval.get<intrusive_ptr<FuncObject>>();
             key = key_holder.get();
         }
 
@@ -394,11 +394,11 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
     Construct *arg1 = exprList->elems[1].get();
     const EvalValue &val0 = RValue(arg0->eval(ctx));
 
-    if (!val0.is<shared_ptr<FuncObject>>())
+    if (!val0.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
 
     const EvalValue &val1 = RValue(arg1->eval(ctx));
-    FuncObject &funcObj = *val0.get<shared_ptr<FuncObject>>().get();
+    FuncObject &funcObj = *val0.get<intrusive_ptr<FuncObject>>().get();
     SharedArrayObj::vec_type result;
 
     if (val1.is<SharedArrayObj>()) {
@@ -450,11 +450,11 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
     Construct *arg1 = exprList->elems[1].get();
     const EvalValue &val0 = RValue(arg0->eval(ctx));
 
-    if (!val0.is<shared_ptr<FuncObject>>())
+    if (!val0.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
 
     const EvalValue &val1 = RValue(arg1->eval(ctx));
-    FuncObject &funcObj = *val0.get<shared_ptr<FuncObject>>().get();
+    FuncObject &funcObj = *val0.get<intrusive_ptr<FuncObject>>().get();
 
     if (val1.is<SharedArrayObj>()) {
 

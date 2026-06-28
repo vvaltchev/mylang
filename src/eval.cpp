@@ -922,10 +922,10 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
         if (callable.is<Builtin>())
             return callable.get<Builtin>().func(ctx, args.get());
 
-        if (callable.is<shared_ptr<FuncObject>>()) {
+        if (callable.is<intrusive_ptr<FuncObject>>()) {
             return do_func_call(
                 ctx,
-                *callable.get<shared_ptr<FuncObject>>().get(),
+                *callable.get<intrusive_ptr<FuncObject>>().get(),
                 args->elems,
                 start,           /* call site = this CallExpr's location */
                 inline_ctx       /* virtual frames if this call is inlined */
@@ -2809,8 +2809,8 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
      * Re-throwing a caught built-in exception value (bound by `catch (X as e)`,
      * which hands back an exception object for a payload-less built-in).
      */
-    if (e.is<shared_ptr<ExceptionObject>>())
-        throw *e.get<shared_ptr<ExceptionObject>>().get();
+    if (e.is<intrusive_ptr<ExceptionObject>>())
+        throw *e.get<intrusive_ptr<ExceptionObject>>().get();
 
     throw TypeErrorEx(
         "Can only throw a struct instance",
@@ -2951,7 +2951,7 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue func(
-        shared_ptr<FuncObject>(make_shared<FuncObject>(this, ctx))
+        intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(this, ctx))
     );
 
     if (id) {
@@ -3167,7 +3167,7 @@ do_catch(EvalContext *ctx,
                     (exObj && exObj->get_data()
                                   .is<intrusive_ptr<StructObject>>())
                         ? exObj->get_data()
-                        : EvalValue(make_shared<ExceptionObject>(
+                        : EvalValue(make_intrusive<ExceptionObject>(
                               exObj
                                   ? *exObj
                                   : ExceptionObject(saved_ex->name)));

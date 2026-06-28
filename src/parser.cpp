@@ -671,10 +671,10 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
                 MakeConstructFromConstVal(RValue(const_value), v);
                 v->is_const = true;
 
-            } else if (const_value.is<shared_ptr<FuncObject>>()) {
+            } else if (const_value.is<intrusive_ptr<FuncObject>>()) {
 
                 const FuncObject &obj =
-                    *const_value.get<shared_ptr<FuncObject>>().get();
+                    *const_value.get<intrusive_ptr<FuncObject>>().get();
 
                 if (obj.func->is_const)
                     v->is_const = true;
@@ -989,12 +989,12 @@ pTryDesugarNamedCall(ParseContext &c, CallExpr *call)
     }
 
     const EvalValue callee = RValue(call->what->eval(c.const_ctx));
-    if (!callee.is<shared_ptr<FuncObject>>()) {
+    if (!callee.is<intrusive_ptr<FuncObject>>()) {
         call->args->is_const = false;   /* const builtin etc.: defer/reject */
         return;
     }
 
-    const FuncObject &fo = *callee.get<shared_ptr<FuncObject>>().get();
+    const FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
     std::vector<ParamSpec> params;
     if (fo.func->params)
         for (const auto &p : fo.func->params->elems)
@@ -1621,7 +1621,7 @@ ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
         rvalue.is<SharedArrayObj>()              ||
         rvalue.is<intrusive_ptr<DictObject>>()   ||
         rvalue.is<intrusive_ptr<StructObject>>() ||
-        rvalue.is<shared_ptr<FuncObject>>();
+        rvalue.is<intrusive_ptr<FuncObject>>();
 }
 
 unique_ptr<Construct>

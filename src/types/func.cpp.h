@@ -14,11 +14,11 @@
 #include "evaltypes.cpp.h"
 #include "syntax.h"
 
-class TypeFunc : public TypeImpl<shared_ptr<FuncObject>> {
+class TypeFunc : public TypeImpl<intrusive_ptr<FuncObject>> {
 
 public:
 
-    TypeFunc() : TypeImpl<shared_ptr<FuncObject>>(Type::t_func) { }
+    TypeFunc() : TypeImpl<intrusive_ptr<FuncObject>>(Type::t_func) { }
 
     void eq(EvalValue &a, const EvalValue &b) override;
     void noteq(EvalValue &a, const EvalValue &b) override;
@@ -35,39 +35,39 @@ public:
 
 void TypeFunc::eq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<shared_ptr<FuncObject>>()) {
+    if (!b.is<intrusive_ptr<FuncObject>>()) {
         a = false;
         return;
     }
 
-    FuncObject *objp = a.get<shared_ptr<FuncObject>>().get();
-    a = (objp == b.get<shared_ptr<FuncObject>>().get());
+    FuncObject *objp = a.get<intrusive_ptr<FuncObject>>().get();
+    a = (objp == b.get<intrusive_ptr<FuncObject>>().get());
 }
 
 void TypeFunc::noteq(EvalValue &a, const EvalValue &b)
 {
-    if (!b.is<shared_ptr<FuncObject>>()) {
+    if (!b.is<intrusive_ptr<FuncObject>>()) {
         a = true;
         return;
     }
 
-    FuncObject *objp = a.get<shared_ptr<FuncObject>>().get();
-    a = (objp != b.get<shared_ptr<FuncObject>>().get());
+    FuncObject *objp = a.get<intrusive_ptr<FuncObject>>().get();
+    a = (objp != b.get<intrusive_ptr<FuncObject>>().get());
 }
 
 int_type TypeFunc::use_count(const EvalValue &a)
 {
-    return a.get<shared_ptr<FuncObject>>().use_count();
+    return a.get<intrusive_ptr<FuncObject>>().use_count();
 }
 
 EvalValue TypeFunc::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<int_type>(a.get<shared_ptr<FuncObject>>().get());
+    return reinterpret_cast<int_type>(a.get<intrusive_ptr<FuncObject>>().get());
 }
 
 EvalValue TypeFunc::clone(const EvalValue &a)
 {
-    const FuncObject &func = *a.get<shared_ptr<FuncObject>>().get();
+    const FuncObject &func = *a.get<intrusive_ptr<FuncObject>>().get();
 
     /* A non-capturing function has no per-instance state, so clone()ing it can
      * share the same object; a capturing one is deep-copied so each clone owns
@@ -75,7 +75,7 @@ EvalValue TypeFunc::clone(const EvalValue &a)
     if (func.capture_slots.empty())
         return a;
 
-    return shared_ptr<FuncObject>(make_shared<FuncObject>(func));
+    return intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(func));
 }
 
 FuncObject::FuncObject(const FuncObject &rhs)

@@ -5,10 +5,14 @@
 #include "defs.h"
 #include "flatval.h"
 #include "errors.h"
+#include "intrusiveptr.h"   /* RefCounted: held in the value model as t_ex */
 #include <string>
 
+/* A user/runtime exception object is BOTH thrown (as a RuntimeException) and
+ * held in the value model (t_ex) - the latter via a non-atomic intrusive_ptr,
+ * so it also inherits RefCounted. The refcount is irrelevant while thrown. */
 template <class EvalValueT>
-class ExceptionObjectTempl : public RuntimeException {
+class ExceptionObjectTempl : public RuntimeException, public RefCounted {
 
     std::string dyn_name;
     EvalValueT data;

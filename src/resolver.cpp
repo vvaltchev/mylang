@@ -215,8 +215,8 @@ public:
             prior_pure->collect_symbols(syms);
             for (const auto &kv : syms) {
                 const EvalValue &v = kv.second->get();
-                if (v.is<shared_ptr<FuncObject>>() &&
-                    v.get<shared_ptr<FuncObject>>()->func->effective_pure) {
+                if (v.is<intrusive_ptr<FuncObject>>() &&
+                    v.get<intrusive_ptr<FuncObject>>()->func->effective_pure) {
                     try {
                         cctx.emplace(kv.first->val, EvalValue(v), true);
                     } catch (const Exception &) { /* dup: skip */ }
@@ -945,8 +945,8 @@ public:
             prior_pure->collect_symbols(syms);
             for (const auto &kv : syms) {
                 const EvalValue &v = kv.second->get();
-                if (v.is<shared_ptr<FuncObject>>() &&
-                    v.get<shared_ptr<FuncObject>>()->func->effective_pure)
+                if (v.is<intrusive_ptr<FuncObject>>() &&
+                    v.get<intrusive_ptr<FuncObject>>()->func->effective_pure)
                     pure_func_names.insert(kv.first);
             }
         }
@@ -2040,10 +2040,10 @@ public:
                 if (funcs.count(kv.first) || spec_funcs.count(kv.first))
                     continue;
                 const EvalValue &v = kv.second->get();
-                if (!v.is<shared_ptr<FuncObject>>())
+                if (!v.is<intrusive_ptr<FuncObject>>())
                     continue;
                 FuncDeclStmt *fd = const_cast<FuncDeclStmt *>(
-                    v.get<shared_ptr<FuncObject>>()->func);
+                    v.get<intrusive_ptr<FuncObject>>()->func);
                 /* only PURE prior functions: an impure one reads/writes mutable
                  * global state, so inlining it across inputs is unsound (the
                  * state may differ at the new site) - and its result isn't

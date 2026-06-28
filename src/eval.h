@@ -254,7 +254,7 @@ get_root_ctx(EvalContext *ctx)
     return ctx;
 }
 
-class FuncObject {
+class FuncObject : public RefCounted {
 
 public:
 

@@ -12,15 +12,15 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 
-class TypeException : public TypeImpl<shared_ptr<ExceptionObject>> {
+class TypeException : public TypeImpl<intrusive_ptr<ExceptionObject>> {
 
 public:
 
-    TypeException() : TypeImpl<shared_ptr<ExceptionObject>>(Type::t_ex) { }
+    TypeException() : TypeImpl<intrusive_ptr<ExceptionObject>>(Type::t_ex) { }
 
     string to_string(const EvalValue &a) override {
 
-        const ExceptionObject &ex = *a.get<shared_ptr<ExceptionObject>>().get();
+        const ExceptionObject &ex = *a.get<intrusive_ptr<ExceptionObject>>().get();
         string res = "<Exception(";
         res += ex.get_name();
         res += ")>";

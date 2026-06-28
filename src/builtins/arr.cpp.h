@@ -141,10 +141,10 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
     Construct *arg1 = exprList->elems[1].get();
     const EvalValue &fval = RValue(arg1->eval(ctx));
 
-    if (!fval.is<shared_ptr<FuncObject>>())
+    if (!fval.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
-    FuncObject &funcObj = *fval.get<shared_ptr<FuncObject>>().get();
+    FuncObject &funcObj = *fval.get<intrusive_ptr<FuncObject>>().get();
 
     /*
      * Optimistic flat: stay in `ivec`/`fvec` while every element matches that
@@ -855,10 +855,10 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
-        if (!val1.is<shared_ptr<FuncObject>>())
+        if (!val1.is<intrusive_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
-        FuncObject &funcObj = *val1.get<shared_ptr<FuncObject>>().get();
+        FuncObject &funcObj = *val1.get<intrusive_ptr<FuncObject>>().get();
 
         /*
          * A user comparator is arbitrary script code, so it need NOT be a valid
@@ -1082,10 +1082,10 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
         Construct *arg1 = exprList->elems[1].get();
         const EvalValue &val1 = RValue(arg1->eval(ctx));
 
-        if (!val1.is<shared_ptr<FuncObject>>())
+        if (!val1.is<intrusive_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
-        FuncObject &funcObj = *val1.get<shared_ptr<FuncObject>>().get();
+        FuncObject &funcObj = *val1.get<intrusive_ptr<FuncObject>>().get();
         EvalValue val = eval_func(ctx, funcObj, view[0].get());
 
         for (size_type i = 1; i < view.size(); i++) {

@@ -221,7 +221,7 @@ std::string reflect_typeof(const EvalValue &e)
         case Type::t_ex:      return "exception";
         case Type::t_builtin: return "builtin";
         case Type::t_func:
-            return reflect_func_sig(e.get<shared_ptr<FuncObject>>()->func);
+            return reflect_func_sig(e.get<intrusive_ptr<FuncObject>>()->func);
         case Type::t_structtype:
             return std::string("type ") +
                    std::string(e.get<StructTypeDef *>()->name->val);
@@ -333,9 +333,9 @@ EvalValue builtin_signature(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (e.is<shared_ptr<FuncObject>>())
+    if (e.is<intrusive_ptr<FuncObject>>())
         return SharedStr(
-            reflect_func_sig(e.get<shared_ptr<FuncObject>>()->func));
+            reflect_func_sig(e.get<intrusive_ptr<FuncObject>>()->func));
     if (e.is<StructTypeDef *>())
         return SharedStr(reflect_struct_ctor(e.get<StructTypeDef *>()));
     if (e.is<intrusive_ptr<StructObject>>())
@@ -429,10 +429,10 @@ EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList)
     Construct *arg = exprList->elems[0].get();
     const EvalValue &e = RValue(arg->eval(ctx));
 
-    if (!e.is<shared_ptr<FuncObject>>())
+    if (!e.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected a function", arg->start, arg->end);
 
-    const FuncDeclStmt *f = e.get<shared_ptr<FuncObject>>()->func;
+    const FuncDeclStmt *f = e.get<intrusive_ptr<FuncObject>>()->func;
     const std::string name =
         !f->display_name.empty()
             ? f->display_name
@@ -444,9 +444,9 @@ EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList)
     std::vector<std::string> out;
     for (const auto &kv : syms) {
         const EvalValue &v = kv.second->get();
-        if (!v.is<shared_ptr<FuncObject>>())
+        if (!v.is<intrusive_ptr<FuncObject>>())
             continue;
-        const FuncDeclStmt *g = v.get<shared_ptr<FuncObject>>()->func;
+        const FuncDeclStmt *g = v.get<intrusive_ptr<FuncObject>>()->func;
         if (g == f || g->display_name != name)
             continue;
         /* a clone has a synthetic id ($specN/$tmplN) + the original name in
@@ -485,9 +485,9 @@ EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
         const EvalValue lv = arg->eval(ctx);
         if (lv.is<LValue *>()) {
             const EvalValue &v = lv.get<LValue *>()->get();
-            if (v.is<shared_ptr<FuncObject>>())
+            if (v.is<intrusive_ptr<FuncObject>>())
                 return SharedStr(
-                    render_func_code(v.get<shared_ptr<FuncObject>>()->func));
+                    render_func_code(v.get<intrusive_ptr<FuncObject>>()->func));
         }
     }
 

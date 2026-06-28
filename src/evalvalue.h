@@ -53,9 +53,9 @@ template <> struct TypeToEnum<Builtin> { enum { val = Type::t_builtin }; };
 template <> struct TypeToEnum<float_type> { enum { val = Type::t_float }; };
 template <> struct TypeToEnum<bool> { enum { val = Type::t_bool }; };
 template <> struct TypeToEnum<SharedStr> { enum { val = Type::t_str }; };
-template <> struct TypeToEnum<shared_ptr<FuncObject>> { enum { val = Type::t_func }; };
+template <> struct TypeToEnum<intrusive_ptr<FuncObject>> { enum { val = Type::t_func }; };
 template <> struct TypeToEnum<SharedArrayObj> { enum { val = Type::t_arr }; };
-template <> struct TypeToEnum<shared_ptr<ExceptionObject>> { enum { val = Type::t_ex }; };
+template <> struct TypeToEnum<intrusive_ptr<ExceptionObject>> { enum { val = Type::t_ex }; };
 template <> struct TypeToEnum<intrusive_ptr<DictObject>> { enum { val = Type::t_dict }; };
 template <> struct TypeToEnum<StructTypeDef *> { enum { val = Type::t_structtype }; };
 template <> struct TypeToEnum<intrusive_ptr<StructObject>> { enum { val = Type::t_struct }; };
@@ -97,9 +97,9 @@ class EvalValue final {
 
         /* non-trivial types */
         FlatVal<SharedStr> str;
-        FlatVal<shared_ptr<FuncObject>> func;
+        FlatVal<intrusive_ptr<FuncObject>> func;
         FlatVal<SharedArrayObj> arr;
-        FlatVal<shared_ptr<ExceptionObject>> ex;
+        FlatVal<intrusive_ptr<ExceptionObject>> ex;
         FlatVal<intrusive_ptr<DictObject>> dict;
         FlatVal<intrusive_ptr<StructObject>> struct_;   /* t_struct */
 

@@ -4334,9 +4334,9 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
         prior_scope->collect_symbols(syms);
         for (const auto &kv : syms) {
             const EvalValue &v = kv.second->get();
-            if (!v.is<shared_ptr<FuncObject>>())
+            if (!v.is<intrusive_ptr<FuncObject>>())
                 continue;
-            const FuncDeclStmt *fd = v.get<shared_ptr<FuncObject>>()->func;
+            const FuncDeclStmt *fd = v.get<intrusive_ptr<FuncObject>>()->func;
             if (fd && fd->id && fd->effective_pure)
                 g_fr_pure.insert(fd->id->uid);
         }
