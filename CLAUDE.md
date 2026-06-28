@@ -1521,11 +1521,17 @@ sanitizers never reproduced it.)
   only read an outermost top-level var); such a nested var legitimately shadows
   the global. A non-escaped top-level var stays a main-frame `SymKind::local`
   slot, so **auto-const (which only sees frame slots) is untouched** — only vars
-  no function reads are promotable, exactly as before. **Scope:** optimizer-
-  inserted `name$sN` specialization clones (created after the hoist), nested/
-  conditionally-declared functions, lambdas, and (in the **REPL**, where top-
-  level names must stay redefinable) all top-level names remain map-bound;
-  template-instance clones, inserted before resolve_names, ARE hoisted.
+  no function reads are promotable, exactly as before. **Scope:** nested/
+  conditionally-declared functions, lambdas, struct names, and (in the **REPL**,
+  where top-level names must stay redefinable) all top-level names remain
+  map-bound; template-instance clones, inserted before resolve_names, ARE
+  hoisted. **Optimizer-inserted `name$sN` specialization clones**, though
+  created *after* the hoist, are now ALSO given a global slot in SCRIPT mode
+  (the Inliner appends the clone name to the root block's `global_func_names`
+  and stamps the clone decl + the redirected call's callee as `SymKind::global`)
+  — so a specialized call is an O(1) slot read, not a map walk, and the clone's
+  decl binds a slot rather than the map. In the REPL (no global table) a spec
+  clone stays map-resident.
 - **Captured variables are slotted (`SymKind::capture`).** A closure's explicit
   `[x,y]` capture list is snapshot into a per-instance `vector<LValue>`
   **`FuncObject::capture_slots`** at closure creation (`func.cpp.h`), in

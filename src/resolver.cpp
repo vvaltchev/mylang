@@ -1981,6 +1981,8 @@ class Inliner {
     AutoConst ac;          /* used to fold specialized clones */
     AnalysisInfo *analysis;   /* -a: record inlined / specialized; or null */
     EvalContext *prior_scope; /* REPL: earlier inputs' globals (or null) */
+    Block *root_block = nullptr;   /* set in run(); for slotting spec clones */
+    bool repl_mode = false;        /* REPL: clones stay map-resident */
 
     /* (func, const-arg tuple) -> the specialized clone, or nullptr if building
      * it was not beneficial (cached so it isn't retried). */
@@ -2006,17 +2008,18 @@ class Inliner {
 public:
 
     explicit Inliner(int max_nodes, AnalysisInfo *a = nullptr,
-                     EvalContext *prior_scope = nullptr)
+                     EvalContext *prior_scope = nullptr, bool repl = false)
         /* `ac` folds specialization *clones*, not the original source, so it
          * must NOT record analysis (that would color the original body for one
          * specialized call). The Inliner records inline/specialize itself.
          * `prior_scope` (REPL): earlier inputs' globals, so a call to a
          * prior-input function inlines/specializes across inputs. */
         : max_nodes(max_nodes), cctx(nullptr, true), ac(), analysis(a),
-          prior_scope(prior_scope) { }
+          prior_scope(prior_scope), repl_mode(repl) { }
 
     void run(Block *root)
     {
+        root_block = root;   /* for slotting spec-clone names in script mode */
         for (auto &e : root->elems) {
             auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
             if (!fd || !fd->id)
@@ -2914,10 +2917,13 @@ private:
               "  const arg(s) folded -> " +
               std::string(clone->id->get_str()));
 
-        /* Redirect to the clone (same args; the const ones are now ignored). */
+        /* Redirect to the clone (same args; the const ones are now ignored).
+         * Carry the clone's resolved sym onto the new callee so the call reads
+         * the clone's slot directly (no map walk); unresolved in the REPL. */
         auto what = make_unique<Identifier>(clone->id->get_str());
         what->start = ce->what->start;
         what->end = ce->what->end;
+        what->sym = clone->id->sym;
         ce->what = move(what);
     }
 
@@ -2954,6 +2960,21 @@ private:
 
         if (count_all_nodes(fc->body.get()) >= before)
             return nullptr;        /* folding didn't shrink it: not worth it */
+
+        /*
+         * Give the clone's name a GLOBAL-table slot (script mode), so its decl
+         * binds a slot - not the map - and the redirected call reads a slot.
+         * This keeps the script-runtime symbols map EMPTY (the clone is inserted
+         * after the resolver's hoist, so it would otherwise fall back to the
+         * map). In the REPL top-level names stay map-resident (no global table),
+         * so the clone is left unresolved and binds via the map there.
+         */
+        if (!repl_mode && root_block) {
+            const int slot =
+                static_cast<int>(root_block->global_func_names.size());
+            root_block->global_func_names.push_back(fc->id->uid);
+            fc->id->sym = ResolvedSym{ SymKind::global, slot };
+        }
 
         FuncDeclStmt *raw = fc;
         new_funcs.push_back(move(clone));
@@ -3061,7 +3082,7 @@ resolve_names(Construct *root, bool enable_inline, int inline_threshold,
 
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))
-            Inliner(inline_threshold, analysis, prior_pure).run(rb);
+            Inliner(inline_threshold, analysis, prior_pure, repl_mode).run(rb);
 }
 
 void
