@@ -342,7 +342,76 @@ Two properties that make this cheap and safe:
 
 Not yet done; roughly in priority order:
 
-1. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
+1. **Block-bodied inlining at non-tail positions + bounded recursive unrolling**
+   (the active task). Today only `=> expr` bodies inline at arbitrary call sites,
+   and a block body inlines only as a tail call (`return f(args);`). The gap is a
+   block-bodied function used **in expression position** (`var y = f(z) + 1;`)
+   and **recursive** functions (currently banned outright by
+   `count_uses(body, self) == 0` and the tail self-recursion exclusion).
+
+   **Mechanism — statement-level splice (the "args-as-locals" form the tail-
+   inliner's note pointed to).** A `{ }` body can't drop into an expression, so
+   at `var y = f(z) + 1;`:
+   - clone f's body; bind each propagatable param (a const literal, or a
+     single-use / side-effect-free arg, substituted directly; otherwise
+     **temp-bind** the arg once up front — `var __p = <arg>;` — to preserve
+     single evaluation);
+   - rewrite the body so its result reaches the call site: a body that always
+     returns can deliver via the existing block-`ret` `FlowState`; an early
+     return in non-tail position uses a **result temp** (`__ret = e;` + the body
+     wrapped so control reaches the end) ;
+   - **hoist** the (substituted, return-rewritten) body as statements *before*
+     the enclosing statement, and replace `f(z)` with `__ret`.
+   Locals + the temps are remapped into the caller's frame exactly as
+   `splice_tail` already does (frame growth capped at 64 slots); the splice
+   carries an `InlineCtx` for an identical backtrace, like every existing splice.
+
+   **Recursion is bounded unrolling of the DEFINITION, not the top call.** The
+   inliner already walks each function's own body, so lifting the recursion ban
+   lets it inline a function's `self(...)` calls *into its own body*; the
+   existing re-scan fixpoint (`walk(slot, depth+1)`) unrolls one level at a time,
+   bounded by `MAX_INLINE_DEPTH` (depth) and `inline_budget` (breadth/total
+   nodes). The frontier calls past the budget stay real (`fib(n-k)` calls left as
+   calls — the A->B->C->stop-at-D chain, self-referential). Because the
+   *definition* is unrolled, **every** call advances k levels of the recursion
+   per invocation, so the call count drops by a factor that grows with k while
+   the arithmetic is unchanged — a pure call-overhead reduction (the canonical
+   win, e.g. `fib`). With a **const arg + a pure** function the unrolled frontier
+   folds to literals, so the recursion bottoms out at compile time
+   (`fib(5) -> 5`). Termination is the existing depth cap + budget.
+
+   **The benefit function (size-tiered "decide"), keyed on original body size O
+   (weighted; a surviving loop weighs heavily and *disqualifies* a call-overhead-
+   only inline — the loop dominates):**
+   - **Tier 1 — small (`O <= INLINE_SMALL`, ~16-24 weighted):** inline
+     **unconditionally**, no fold required, subject only to `inline_budget` +
+     `MAX_INLINE_DEPTH`. Node count may **grow** (recursion unroll, multi-use
+     args) — accepted, because the benefit is the dropped call count, not a
+     smaller tree. (fib.)
+   - **Tier 2 — medium (`INLINE_SMALL < O <= ATTEMPT_MAX`, ~150-200):**
+     **speculate** — clone, bind propagatable const/auto-const args, fold + DCE,
+     measure folded size `S` and benefit `B = O - S`. Inline if `S <=
+     INLINE_SMALL`; else emit/reuse a shared clone `f$specN` if `B` is large
+     (substantial fold, e.g. `S <= O/2` or `B >= K`); else **discard** the
+     speculative clone and keep the ordinary call (the discard is free — the
+     existing `fold_specialized` already catches+drops const errors, so a
+     speculative attempt has no side effects).
+   - **Tier 3 — huge (`O > ATTEMPT_MAX`):** **don't even attempt** — the
+     clone+fold compile cost isn't worth it and the call overhead is negligible
+     vs the body. Keep the call.
+
+   **Order.** (a) statement-level block-body splice for **non-recursive** funcs
+   (the mechanism) under the size-tiered gate + the loop-disqualifier; verify
+   backtraces identical to `-ni` and the `-rt` suite green. (b) Lift the
+   recursion ban so the fixpoint unrolls recursive funcs under depth/budget; tune
+   `INLINE_SMALL` / `ATTEMPT_MAX` / depth / budget against `bench/`. **Measure
+   the proper way** (per `bench/README.md`): `ASSERTS=0` release builds compared
+   with `run.py --baseline`, and confirm wins vs noise with **callgrind
+   instruction counts** (layout-independent) — e.g. fib's call-count drop should
+   show as fewer `do_func_call`/`EvalContext` instructions, not just a wall-clock
+   wobble.
+
+2. **(deferred) Type-narrowing -> algebraic simplification** (`x+1-1 -> x`).
    Unsound on unknown dynamic types (float non-associativity, `+` overloading,
    preserved type errors); needs a "provably-int" analysis first. Inlining
    already leaves spliced expressions with original locs + full structure so
@@ -350,8 +419,12 @@ Not yet done; roughly in priority order:
 
 ## Open questions
 
-- Exact default thresholds (need `bench/` data). The body-size cap is tunable at
-  runtime via `-it N` (default 24), which makes measuring easy.
+- Exact default thresholds (need `bench/` data): `INLINE_SMALL` (Tier-1 splice
+  cap, ~16-24), `ATTEMPT_MAX` (Tier-3 don't-attempt cap, ~150-200), the recursion
+  depth cap, and `inline_budget`. The existing body-size cap is tunable at
+  runtime via `-it N` (default 24); add knobs for the new tiers so they're as
+  easy to sweep. Tune with `ASSERTS=0` release builds + `run.py --baseline` +
+  callgrind (see `bench/README.md`).
 - Whether `InlineCtx` lives as a node field or a side table (closure body-clone
   argues for a field).
 - How `-s` should annotate inlined regions (cheap, useful — like the const-fold
