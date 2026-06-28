@@ -5944,10 +5944,12 @@ static const std::vector<test> tests =
             /* writeln's newline goes to stdout, not the file, so the file
                holds just the value. */
             "writeln(\"world\", f2);",
-            "assert(read(f1) == \"hello\\n\");",
-            "assert(read(f2) == \"world\");",
-            "var L = readlines(f1);",
+            /* read everything FIRST, then remove, THEN assert - so a failing
+               content assert below can't leak the temp files into tmpdir. */
+            "var r1 = read(f1); var r2 = read(f2); var L = readlines(f1);",
             "assert(remove(f1)); assert(remove(f2));",   /* clean up */
+            "assert(r1 == \"hello\\n\");",
+            "assert(r2 == \"world\");",
             "assert(len(L) == 1 && L[0] == \"hello\");",
         },
     },
