@@ -3185,14 +3185,31 @@ devirtualize_calls(unique_ptr<Construct> &slot)
         return;
 
     if (auto *call = dynamic_cast<CallExpr *>(slot.get())) {
-        if (call->direct_func_slot >= 0 &&
-            !dynamic_cast<DirectCallExpr *>(call)) {
-            auto d = make_unique<DirectCallExpr>();
-            call->copy_base_fields(*d);
-            d->what = move(call->what);
-            d->args = move(call->args);
-            d->direct_func_slot = call->direct_func_slot;
-            slot = move(d);
+        /* Skip an already-specialized node (idempotent). */
+        if (!dynamic_cast<DirectCallExpr *>(call) &&
+            !dynamic_cast<DirectBuiltinCallExpr *>(call)) {
+
+            auto *id = dynamic_cast<Identifier *>(call->what.get());
+
+            if (id && id->sym.kind == SymKind::builtin) {
+                /* Unshadowed builtin: bake its (immutable, singleton-table)
+                 * function pointer. Never set in the REPL, where builtins stay
+                 * map-resident (sym.kind isn't builtin). */
+                auto d = make_unique<DirectBuiltinCallExpr>();
+                call->copy_base_fields(*d);
+                d->what = move(call->what);
+                d->args = move(call->args);
+                d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();
+                slot = move(d);
+            } else if (call->direct_func_slot >= 0) {
+                /* Global-slot callee (function / struct / escaped global). */
+                auto d = make_unique<DirectCallExpr>();
+                call->copy_base_fields(*d);
+                d->what = move(call->what);
+                d->args = move(call->args);
+                d->direct_func_slot = call->direct_func_slot;
+                slot = move(d);
+            }
         }
     }
 

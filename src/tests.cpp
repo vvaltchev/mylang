@@ -2079,6 +2079,16 @@ static const std::vector<test> tests =
         "assert(P(7).x == 7);",
         "assert(use_g() == 11);" } },
 
+    /* Devirtualized builtin calls (DirectBuiltinCallExpr): the callee is an
+     * unshadowed builtin, baked at resolve time. Plain call + in a function +
+     * nested-arg builtins all work; a shadowing user func is NOT a builtin and
+     * uses the normal path. */
+    { "devirt builtin call: direct, nested, in a function",
+      { "assert(len([10, 20, 30]) == 3);",
+        "assert(max(min(3, 9), 7) == 7);",
+        "func sz(a) => len(a);",
+        "assert(sz([1, 2, 3, 4]) == 4);" } },
+
     { "var with no initializer: its type is inferred from later assignment",
       { "var a; a = 3; assert(decltype(a).name == \"int?\");" } },
     { "var with no initializer: a conflicting reassignment is a type error",

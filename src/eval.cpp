@@ -994,6 +994,27 @@ EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
     return CallExpr::do_eval(ctx, rec);
 }
 
+/*
+ * Devirtualized builtin call (see DirectBuiltinCallExpr). Calls the baked
+ * builtin function pointer directly - no callee eval, RValue, or dispatch. The
+ * builtin gets the caller's ctx + the unevaluated args, exactly as the generic
+ * path. The try/catch reproduces the generic path's behavior of stamping the
+ * argument-list loc onto a loc-less error from the builtin, so error reporting
+ * is identical.
+ */
+EvalValue DirectBuiltinCallExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    try {
+        return builtin.func(ctx, args.get());
+    } catch (Exception &e) {
+        if (!e.loc_start) {
+            e.loc_start = args->start;
+            e.loc_end = args->end;
+        }
+        throw;
+    }
+}
+
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
     if (!elems.size()) {

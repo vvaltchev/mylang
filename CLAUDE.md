@@ -1706,6 +1706,19 @@ sanitizers never reproduced it.)
   (top-level names are map-resident, not global slots), so REPL calls stay plain
   `CallExpr`. coderender / serialize treat a `DirectCallExpr` as the `CallExpr`
   it subclasses.
+  The same swap also specializes a call whose callee is an **unshadowed builtin**
+  (`SymKind::builtin`) into a **`DirectBuiltinCallExpr`**: the builtin table is an
+  immutable singleton, so it **bakes the builtin's function pointer** at compile
+  time (`builtin_slot(slot).getval<Builtin>()`) and `do_eval` calls it straight
+  (`builtin.func(ctx, args.get())`) — even leaner than `DirectCallExpr` (no slot
+  read, no `defined` check, no soundness fallback, since a builtin is always
+  callable and never reassigned). The builtin still gets the **caller's `ctx`**
+  and the **unevaluated** args, and `do_eval` reproduces the generic path's
+  argument-list loc stamping so **error reporting is byte-identical**. **Effect:**
+  ~20% fewer instructions on `bench/40_math_builtins` (cheap builtins in a tight
+  loop, where the per-call dispatch dominated); negligible where the builtin body
+  dominates (`sort`, big-array `sum`). Like `DirectCallExpr`, it is a separate
+  node so `CallExpr::do_eval` is untouched; never created in the REPL.
 - **Trailing `opt` parameters are skippable at the call site.** The four
   `do_func_bind_params` overloads (`eval.cpp`) accept any arg count in
   `[min_required_args(params), nparams]` and bind each omitted trailing param to

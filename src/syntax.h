@@ -759,6 +759,37 @@ public:
 };
 
 /*
+ * A CallExpr whose callee is an unshadowed builtin (`SymKind::builtin`). The
+ * builtin table is an immutable singleton, so the swap pass (resolver.cpp) bakes
+ * the builtin's function pointer into `builtin` at compile time, and do_eval
+ * calls it straight (`builtin.func(ctx, args)`) - no callee eval (the
+ * Construct::eval wrapper + Identifier::do_eval + builtin-slot read), no RValue,
+ * no is<Builtin> dispatch. Even leaner than DirectCallExpr: a builtin is always
+ * defined and can't be reassigned, so there is no slot read, no defined check,
+ * and no soundness fallback. Builtins still get the **caller's** ctx and the
+ * **unevaluated** args (`args.get()`), exactly like the generic path. do_eval
+ * preserves the generic path's args-loc error stamping. Never created in the
+ * REPL (builtins are map-resident there, not SymKind::builtin).
+ */
+class DirectBuiltinCallExpr final: public CallExpr {
+
+public:
+    Builtin builtin{nullptr};   /* baked from builtin_slot() at resolve time */
+
+    DirectBuiltinCallExpr() : CallExpr("DirectBuiltinCallExpr") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<DirectBuiltinCallExpr>();
+        copy_base_fields(*c);
+        c->what = clone_as(what);
+        c->args = clone_as(args);
+        c->builtin = builtin;
+        return c;
+    }
+};
+
+/*
  * A normalized view of one callee parameter, enough to desugar named arguments
  * against it: the interned name (pointer-comparable to ExprList::arg_names) and
  * whether it is optional. Both desugaring sites build a vector of these from
