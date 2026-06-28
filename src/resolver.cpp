@@ -2136,6 +2136,13 @@ class Inliner {
      * given const-arg tuple), or nullptr if ambiguous. */
     std::unordered_map<const UniqueId *, FuncDeclStmt *> spec_funcs;
 
+    /* uid -> the unique top-level block-bodied func to INLINE in place via an
+     * InlinedCallExpr (v1: no-locals, non-recursive, weight below a call), or
+     * nullptr if ambiguous. Disjoint from `funcs` (those are expr-bodied); a
+     * func here may also be in spec_funcs (tail-inline / specialize get first
+     * crack in walk, block-inline catches the other call positions). */
+    std::unordered_map<const UniqueId *, FuncDeclStmt *> block_funcs;
+
     const int max_nodes;   /* inline only when the body is at most this big */
     EvalContext cctx;      /* const context for re-folding spliced bodies */
     AutoConst ac;          /* used to fold specialized clones */
@@ -2188,6 +2195,9 @@ public:
                 add_unique(funcs, fd);
             else if (specializable_decl(fd))
                 add_unique(spec_funcs, fd);
+            /* independent: a block body can be both specialized and inlined */
+            if (block_inlinable_decl(fd))
+                add_unique(block_funcs, fd);
         }
 
         /* REPL: register earlier inputs' functions (their template/spec
@@ -2223,6 +2233,8 @@ public:
                     funcs.emplace(kv.first, fd);
                 else if (specializable_decl(fd))
                     spec_funcs.emplace(kv.first, fd);
+                if (block_inlinable_decl(fd))
+                    block_funcs.emplace(kv.first, fd);
             }
         }
 
@@ -2295,6 +2307,34 @@ private:
              * reference, so inlining gives the same effect. Tail-inline rejects
              * a reassigned param; specialization never seeds a written one.) */
             && !mutates_a_param(fd);
+    }
+
+    /*
+     * A BLOCK-bodied function the inliner can splice in place via an
+     * InlinedCallExpr (step-1 / v1). Like inlinable_decl but for `{...}` bodies:
+     *  - NO LOCALS (frame_size == nparams): after the params are substituted no
+     *    callee-frame slot survives, so no frame remapping is needed. (A body
+     *    WITH locals - the splice_tail-style remapping case - is v2.)
+     *  - non-capturing, no nested function (substitution would break a closure),
+     *  - NON-recursive: a COMPLETE refs_uid check (count_uses misses uses buried
+     *    inside the block); the recursion ban is lifted later for bounded
+     *    unrolling,
+     *  - does not reassign a scalar param,
+     *  - body weight below ONE call (the benefit function - body_weight): the
+     *    call overhead it removes outweighs the spliced body.
+     */
+    static bool block_inlinable_decl(const FuncDeclStmt *fd)
+    {
+        if (!fd->body || !fd->body->is_block() || !fd->id)
+            return false;
+        const int nparams =
+            fd->params ? static_cast<int>(fd->params->elems.size()) : 0;
+        return (!fd->captures || fd->captures->elems.empty())
+            && !contains_func(fd->body.get())
+            && !refs_uid(fd->body.get(), fd->id->uid)   /* non-recursive */
+            && !mutates_a_param(fd)
+            && fd->frame_size == nparams                 /* no locals */
+            && body_weight(fd->body.get()) < CALL_WEIGHT;
     }
 
     /* True if the lvalue is DIRECTLY a param identifier (`x`), not a field /
@@ -2399,6 +2439,7 @@ private:
 
         try_inline(slot, depth, fsize);   /* re-scans its splice (depth + 1) */
         try_inline_tail(slot, depth, fsize);   /* tail call to a block func */
+        try_inline_block(slot, depth, fsize); /* non-tail block func (any pos) */
         try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
@@ -2652,6 +2693,83 @@ private:
     }
 
     /*
+     * Inline a NON-TAIL call to a block-bodied function (any expression
+     * position) by replacing the CallExpr with an InlinedCallExpr: the callee's
+     * cloned, param-substituted body runs behind its own FlowState boundary, so
+     * its `return`s yield the call's value instead of returning from the caller.
+     * No statement hoisting and no eval-order change (the node sits exactly
+     * where the call was). v1: only block_inlinable_decl funcs - NO LOCALS, so
+     * after substitution the body holds no callee-frame slot and needs no frame
+     * remapping (the v2 case reuses splice_tail). Args must be substitutable
+     * (sub_ok, with a COMPLETE use count). Bounded by depth + inline_budget like
+     * try_inline; the spliced body is re-scanned (depth+1) so nested calls
+     * collapse too.
+     */
+    void try_inline_block(unique_ptr<Construct> &slot, int depth, int *fsize)
+    {
+        auto *ce = dynamic_cast<CallExpr *>(slot.get());
+        if (!ce)
+            return;
+
+        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        if (!callee || callee->sym.kind == SymKind::local)
+            return;
+
+        auto it = block_funcs.find(callee->uid);
+        if (it == block_funcs.end() || !it->second)
+            return;
+
+        FuncDeclStmt *f = it->second;
+        const size_t nparams = f->params ? f->params->elems.size() : 0;
+
+        if (ce->args->elems.size() != nparams)
+            return;   /* arity mismatch: let the runtime error survive */
+
+        /* Each arg must be evaluated as often as the param is used and a
+         * side-effecting arg neither dropped nor duplicated. A COMPLETE use
+         * count (count_matching) - the param may be used deep inside the
+         * block, where count_uses would miss it. */
+        for (size_t i = 0; i < nparams; i++) {
+            const UniqueId *puid = f->params->elems[i]->uid;
+            const int uses = count_matching(f->body.get(),
+                [&](const Identifier *id) { return id->uid == puid; });
+            if (!sub_ok(uses, ce->args->elems[i].get()))
+                return;
+        }
+
+        const int bsz = count_all_nodes(f->body.get());
+        if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
+            return;
+        inline_budget -= bsz;
+
+        const InlineCtx *ic = alloc_inline_ctx(
+            { std::string(f->id->get_str()), param_names(f),
+              ce->start, ce->inline_ctx });
+
+        unique_ptr<Construct> body = f->body->clone();
+        for (size_t i = 0; i < nparams; i++)
+            substitute(body, f->params->elems[i]->uid,
+                       ce->args->elems[i].get());
+        tag_inline(body.get(), ic);
+
+        auto ica = make_unique<InlinedCallExpr>();
+        ce->copy_base_fields(*ica);   /* loc + inline_ctx of the call site */
+        ica->elem = move(body);
+
+        if (analysis)
+            analysis->mark(callee->start,
+                static_cast<int>(callee->get_str().length()),
+                AnnoKind::inlined);
+
+        TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
+              std::to_string(nparams) + " arg(s))  block body " +
+              std::to_string(bsz) + " nodes -> inline");
+
+        slot = move(ica);
+        walk(slot, depth + 1, fsize);   /* re-scan: nested calls in the body */
+    }
+
+    /*
      * Inline a TAIL call to a block-bodied function: `return f(args);` where
      * f's body always returns. Splicing f's body in place of the return is
      * sound because f's own `return`s become the caller's returns (it was a
@@ -2824,6 +2942,60 @@ private:
         for_each_child(const_cast<Construct *>(c),
             [&](Construct *ch) { n += node_count(ch); });
         return n;
+    }
+
+    /*
+     * The inlining COST MODEL (the benefit function). A flat node count is the
+     * wrong size metric: fib's body is dominated by its two CALLS, which are
+     * ~20x an arith op, so a body containing a call must weigh much more than
+     * one of plain arithmetic. node_weight gives each node type its measured
+     * eval cost (xId-read), from the `--weights` calibration (run_weight_bench,
+     * eval.cpp). body_weight sums them over the whole subtree; the inliner
+     * splices a block body when its weight is below ONE call (CALL_WEIGHT).
+     * Re-derive the numbers with `--weights` when the interpreter changes; the
+     * benefit function itself is backend-independent (it carries over to the
+     * eventual bytecode VM, only the weights change).
+     */
+    static const int CALL_WEIGHT = 21;   /* a 2-param call, ~21 id-reads */
+
+    static int node_weight(const Construct *c)
+    {
+        if (dynamic_cast<const CallExpr *>(c))    return CALL_WEIGHT; /* +Direct*/
+        if (dynamic_cast<const Expr14 *>(c))      return 11;  /* assignment    */
+        if (dynamic_cast<const IfStmt *>(c))      return 7;
+        if (dynamic_cast<const ReturnStmt *>(c))  return 3;
+        /* id / literal / arith / compare / structural: ~1 */
+        return 1;
+    }
+
+    /* Complete weighted sum over the subtree (descends into the containers
+     * for_each_child stops at, like count_all_nodes). */
+    static int body_weight(const Construct *c)
+    {
+        if (!c)
+            return 0;
+        int w = node_weight(c);
+        if (auto *b = dynamic_cast<const Block *>(c)) {
+            for (auto &e : b->elems) w += body_weight(e.get());
+            return w;
+        }
+        if (auto *f = dynamic_cast<const ForStmt *>(c))
+            return w + body_weight(f->init.get()) + body_weight(f->cond.get())
+                 + body_weight(f->inc.get()) + body_weight(f->body.get());
+        if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+            return w + body_weight(fe->container.get())
+                 + body_weight(fe->body.get());
+        if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+            w += body_weight(tc->tryBody.get());
+            for (auto &p : tc->catchStmts) w += body_weight(p.second.get());
+            return w + body_weight(tc->finallyBody.get());
+        }
+        if (auto *e = dynamic_cast<const Expr14 *>(c))
+            return w + body_weight(e->lvalue.get())
+                 + body_weight(e->rvalue.get());
+        for_each_child(const_cast<Construct *>(c),
+            [&](Construct *ch) { w += body_weight(ch); });
+        return w;
     }
 
     /*

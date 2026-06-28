@@ -1016,6 +1016,35 @@ EvalValue DirectBuiltinCallExpr::do_eval(EvalContext *ctx, bool rec) const
     }
 }
 
+/*
+ * An inlined block-bodied call. Run the (already param-substituted) body with
+ * its OWN FlowState boundary, so a `return` inside the body terminates HERE and
+ * yields this expression's value - it does NOT return from the caller's
+ * function. The boundary is a stack-local FlowState that we point ctx->flow at
+ * for the body's duration, then restore (also on an exception). No child
+ * EvalContext is built - the body runs in the SAME ctx (its param refs were
+ * substituted away and v1 bodies have no locals, so there are no callee-frame
+ * slots to bind; the body block is scope_free, so it executes in place). Far
+ * cheaper than a real call: no EvalContext, no Frame::init, no param binding,
+ * no callee lookup. A fall-through body yields `none`, matching call semantics.
+ */
+EvalValue InlinedCallExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    FlowState my_flow;
+    FlowState *const saved = ctx->flow;
+    ctx->flow = &my_flow;
+
+    try {
+        elem->eval(ctx);
+    } catch (...) {
+        ctx->flow = saved;
+        throw;
+    }
+
+    ctx->flow = saved;
+    return my_flow.type == FlowState::ret ? my_flow.value : none;
+}
+
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
     if (!elems.size()) {

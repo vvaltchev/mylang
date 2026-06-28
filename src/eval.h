@@ -213,8 +213,13 @@ public:
      * function invocation. Function-boundary contexts (func_ctx) and the root
      * own their flow_state; nested blocks/loops inherit the parent's pointer.
      * Each call gets a fresh one, so recursion never shares flow state.
+     *
+     * NOT const: an InlinedCallExpr (a spliced block body) temporarily points
+     * it at a stack-local FlowState to give the body its own return boundary,
+     * then restores it - far cheaper than building a child EvalContext (which
+     * carries a symbols-map member) per inlined call. That is the ONLY mutator.
      */
-    FlowState *const flow;
+    FlowState *flow;
 
     EvalContext(const EvalContext &rhs) = delete;
     EvalContext(EvalContext &&rhs) = delete;

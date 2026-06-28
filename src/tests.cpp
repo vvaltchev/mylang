@@ -2899,6 +2899,47 @@ static const std::vector<test> tests =
      * fib(N) would execute at runtime. It is verified manually with `-nr`:
      * `mylang -nr -e 'func fib(n){...} var c=fib(45);'` returns instantly,
      * proving AutoConst did not evaluate the recursion.) */
+
+    /* ---- block-body inlining (InlinedCallExpr, no-locals v1) ----
+     * The callers pass NON-const args (their own params), so the call is not
+     * const-folded away before the inliner - it is actually block-inlined. The
+     * inline is transparent; these pin the RESULT is unchanged. */
+    { "block-inline: multi-return body (max), both branches",
+      { "func mx(a, b) { if (a > b) return a; return b; }",
+        "func c(p, q) { var y = mx(p, q); return y; }",
+        "assert(c(3, 7) == 7);",
+        "assert(c(9, 2) == 9);" } },
+    { "block-inline: cap (single if), called twice",
+      { "func cap(x, hi) { if (x > hi) return hi; return x; }",
+        "func c(v) { return cap(v, 10) + cap(v, 3); }",
+        "assert(c(5) == 5 + 3);" } },
+    { "block-inline: in an expression position (not whole rvalue)",
+      { "func mx(a, b) { if (a > b) return a; return b; }",
+        "func c(p, q) { return mx(p, q) * 2 + 1; }",
+        "assert(c(3, 7) == 15);" } },
+    { "block-inline: fall-through body yields none",
+      { "func f(a) { if (a > 0) return a; }",
+        "func c(p) { return f(p); }",
+        "assert(c(5) == 5);",
+        "assert(c(-1) == none);" } },
+    { "block-inline: nested block calls collapse (g uses mx)",
+      { "func mx(a, b) { if (a > b) return a; return b; }",
+        "func g(a, b, cc) { var t = mx(a, b); return mx(t, cc); }",
+        "func c(p, q, r) { return g(p, q, r); }",
+        "assert(c(1, 5, 3) == 5);",
+        "assert(c(8, 2, 9) == 9);" } },
+    { "block-inline: a side-effecting arg is not duplicated",
+      { "var cnt = 0;",
+        "func bump() { cnt = cnt + 1; return cnt; }",
+        "func use(a) { return a + a; }",   /* a used twice */
+        "func c() { return use(bump()); }",
+        "var r = c();",          /* sub_ok blocks the inline; bump() runs once */
+        "assert(cnt == 1);",
+        "assert(r == 2);" } },
+    { "block-inline: error inside an inlined body still throws at runtime",
+      { "func bad(a) { if (a > 0) return a; return 1 / 0; }",
+        "func c(p) { return bad(p); }",
+        "c(0);" }, &typeid(DivisionByZeroEx) },
     /* a pure call inside an EXPRESSION-bodied function folds (the body is a
      * bare expression, which AutoConst used to skip) */
     { "auto-const: a pure call in an expression-bodied function folds",

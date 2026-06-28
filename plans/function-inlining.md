@@ -343,10 +343,28 @@ Two properties that make this cheap and safe:
 Not yet done; roughly in priority order:
 
 1. **Block-bodied inlining at non-tail positions + bounded recursive unrolling**
-   (the active task). Today only `=> expr` bodies inline at arbitrary call sites,
-   and a block body inlines only as a tail call (`return f(args);`). The gap is a
-   block-bodied function used **in expression position** (`var y = f(z) + 1;`)
-   and **recursive** functions (currently banned outright by
+   (the active task).
+
+   **v1 DONE (`try_inline_block` → `InlinedCallExpr`).** A block-bodied function
+   is now inlined in ANY expression position by replacing the `CallExpr` with an
+   `InlinedCallExpr` whose `do_eval` runs the cloned, param-substituted body
+   behind its own `FlowState` boundary (a stack FlowState swapped onto `ctx->flow`
+   and restored — so a `return` yields the call's value, not the caller's). NO
+   statement hoisting and no eval-order change (the node sits where the call was),
+   NO child EvalContext (the no-locals body is `scope_free`, runs in place). The
+   approach below (statement-level splice with a result temp) turned out
+   unnecessary for the common case — the FlowState-boundary expression is
+   simpler and cheaper. The size gate is the measured **cost model**
+   (`body_weight` < `CALL_WEIGHT` = 21, weights from `--weights`). **v1 scope:**
+   no-locals bodies (so no frame remapping), non-capturing, no nested func,
+   non-recursive, args `sub_ok`. Result: ~1.4x on a call-heavy non-const loop;
+   1286/1286 across the matrix. **Still v2/v3:** (a) bodies WITH locals (reuse
+   `splice_tail` remapping into the caller frame); (b) lift the recursion ban
+   for bounded unrolling + CSE of duplicate pure calls (the recursive-auto-pure
+   prerequisite is already in).
+
+   The original gap: a block-bodied function used **in expression position**
+   (`var y = f(z) + 1;`) and **recursive** functions (banned by
    `count_uses(body, self) == 0` and the tail self-recursion exclusion).
 
    **Mechanism — statement-level splice (the "args-as-locals" form the tail-

@@ -790,6 +790,34 @@ public:
 };
 
 /*
+ * An INLINED call to a block-bodied function. `elem` is the callee's body (a
+ * Block) after the inliner cloned it and substituted the params with the call
+ * arguments. do_eval runs that body behind its OWN FlowState boundary, so a
+ * `return` inside the body yields THIS expression's value instead of returning
+ * from the caller - which lets a block body (with early returns) be spliced in
+ * any expression position with no statement hoisting. Created by the inliner's
+ * try_inline_block; see resolver.cpp. As a SingleChildConstruct it is
+ * auto-traversed by every for_each_child walk (specialize_types descends into
+ * the body, refold/coderender too). v1: only no-locals bodies (params + ifs +
+ * returns), so the body holds no callee-frame slot references after
+ * substitution and needs no frame remapping.
+ */
+class InlinedCallExpr final: public SingleChildConstruct {
+
+public:
+
+    InlinedCallExpr() : SingleChildConstruct("InlinedCall") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<InlinedCallExpr>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        return c;
+    }
+};
+
+/*
  * A normalized view of one callee parameter, enough to desugar named arguments
  * against it: the interned name (pointer-comparable to ExprList::arg_names) and
  * whether it is optional. Both desugaring sites build a vector of these from

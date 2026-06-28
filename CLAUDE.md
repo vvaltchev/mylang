@@ -845,9 +845,39 @@ the root block's `slot_count` for "main", threaded through `walk` as `fsize`)
 grows by f's local count, capped at 64 (`Frame::live` is one 64-bit word); over
 that, the call is left as-is. The spliced body is tagged with an `InlineCtx`
 like an expression splice, so a runtime error shows f's virtual frame above the
-caller's real one. Still **not done** (see `plans/function-inlining.md`
-"Remaining"): the deferred type-narrowing/algebraic pass; block-tail inlining of
-non-tail calls or reassigned/global args would need an args-as-locals form.
+caller's real one.
+
+**Non-tail block-body inlining (`try_inline_block` → `InlinedCallExpr`).** A
+call to a block-bodied function in ANY expression position (not just
+`return f(args)`) is inlined by replacing the `CallExpr` with an
+**`InlinedCallExpr`** (`syntax.h`, a `SingleChildConstruct` so every
+`for_each_child` walk auto-descends into its body): the callee's cloned,
+param-substituted body. `InlinedCallExpr::do_eval` runs that body behind its OWN
+return boundary — it points `ctx->flow` at a stack-local `FlowState` for the
+body's duration and restores it (so `flow` is no longer `const`), making the
+body's `return`s yield THIS expression's value instead of returning from the
+caller. No statement hoisting and no eval-order change — the node sits exactly
+where the call was — and no child `EvalContext` (the body block is `scope_free`,
+so it runs in place; far cheaper than the EvalContext+Frame+bind a real call
+pays — ~1.4x on a call-heavy non-const loop). **v1 scope (`block_inlinable_decl`):**
+NO LOCALS (`frame_size == nparams`), so after substitution no callee-frame slot
+survives and no frame remapping is needed; non-capturing, no nested function,
+**non-recursive** (a COMPLETE `refs_uid` check — `count_uses` misses
+block-interior uses), no scalar-param reassignment, args `sub_ok` (with a
+complete use count). The size gate is the **cost model**: `body_weight` (a
+weighted node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x
+an arith op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)** —
+the call overhead removed must outweigh the spliced body. Bounded by
+`MAX_INLINE_DEPTH` + `inline_budget`, re-scanned (depth+1) so nested calls
+collapse, `InlineCtx`-tagged for backtraces. A const-arg call to such a func is
+folded by AutoConst *before* the inliner (the func is auto-pure), so block-inline
+only fires on the non-const-arg calls AutoConst can't. Registered in `block_funcs`
+independently of `funcs`/`spec_funcs` (so a func can be both tail-inlined and
+block-inlined; walk order: expr-inline, tail-inline, block-inline, specialize).
+Still **not done** (see `plans/function-inlining.md` "Remaining"): block bodies
+WITH locals (the splice_tail-style remapping, v2); the recursion ban lifted for
+bounded unrolling + CSE of duplicate pure calls; the deferred
+type-narrowing/algebraic pass.
 
 ## Static type inference (`inferencer.cpp`)
 
