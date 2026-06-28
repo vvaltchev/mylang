@@ -2750,12 +2750,11 @@ private:
      * cloned, param-substituted body runs behind its own FlowState boundary, so
      * its `return`s yield the call's value instead of returning from the caller.
      * No statement hoisting and no eval-order change (the node sits exactly
-     * where the call was). v1: only block_inlinable_decl funcs - NO LOCALS, so
-     * after substitution the body holds no callee-frame slot and needs no frame
-     * remapping (the v2 case reuses splice_tail). Args must be substitutable
-     * (sub_ok, with a COMPLETE use count). Bounded by depth + inline_budget like
-     * try_inline; the spliced body is re-scanned (depth+1) so nested calls
-     * collapse too.
+     * where the call was). Locals are remapped into the caller frame
+     * (splice_tail); args are substituted directly when value-stable, else bound
+     * to a fresh frame temp once ("args as locals" - see below). Bounded by
+     * depth + inline_budget like try_inline; the spliced body is re-scanned
+     * (depth+1) so nested calls collapse too.
      */
     void try_inline_block(unique_ptr<Construct> &slot, int depth, int *fsize)
     {
@@ -2781,33 +2780,45 @@ private:
             return;   /* arity mismatch: let the runtime error survive */
 
         /*
-         * Each param must be VALUE-STABLE when substituted, by SLOT (a shadowing
-         * local mustn't mislead): non-reassigned in the body (slot_writes), and
-         * `tail_arg_ok` - a caller LOCAL or const literal, never a global or
-         * side-effecting expr. Stricter than sub_ok because a block body can
-         * change shared state (a global) BETWEEN the param's uses, so an
-         * identifier read inside the body must be one the body can't reassign.
+         * Decide each param. A param REASSIGNED in the body can't be inlined (it
+         * is a by-value copy; substituting the arg would wrongly alias it).
+         * Otherwise: a VALUE-STABLE arg (`tail_arg_ok` - a caller LOCAL or const
+         * literal the body can't reassign) is substituted DIRECTLY (cheap, read
+         * at each param use). Any other arg (a non-trivial expression, a global,
+         * a side-effecting call) is bound to a fresh frame TEMP once at the top
+         * of the body (`$a = arg`) and the param reads the temp - "args as
+         * locals". Evaluating once captures the call-time value, so a body that
+         * mutates the global / a multi-use side-effecting arg stays sound; it
+         * also lets `f(a+b)`, `f(g())`, `f(global)` inline (and is what the
+         * recursion-unroll needs, since a self-call's arg is `n-1`). Use count
+         * is by SLOT so a shadowing local doesn't mislead.
          */
+        std::vector<bool> needs_temp(nparams, false);
+        int ntemps = 0;
         for (int i = 0; i < nparams; i++) {
             if (i < static_cast<int>(f->slot_writes.size())
                     && f->slot_writes[i] != 0)
-                return;
+                return;       /* reassigned param: not inlinable */
             const int uses = count_matching(f->body.get(),
                 [&](const Identifier *id) {
                     return id->sym.kind == SymKind::local
                         && id->sym.slot == i;
                 });
-            if (!tail_arg_ok(uses, ce->args->elems[i].get()))
-                return;
+            if (!tail_arg_ok(uses, ce->args->elems[i].get())) {
+                needs_temp[i] = true;
+                ntemps++;
+            }
         }
 
         /* The body's locals are remapped into a fresh range at the top of the
-         * caller's frame (which grows by f's local count, capped at 64). With no
-         * caller frame (fsize null) only a no-locals body can be inlined. */
+         * caller's frame, and the arg temps above those; the frame grows by
+         * both (capped at 64). With no caller frame (fsize null) nothing that
+         * needs a slot can be inlined. */
         const int nlocals = f->frame_size - nparams;
-        if (nlocals > 0 && !fsize)
+        const int grow = nlocals + ntemps;
+        if (grow > 0 && !fsize)
             return;
-        if (fsize && *fsize + nlocals > MAX_FRAME_SLOTS)
+        if (fsize && *fsize + grow > MAX_FRAME_SLOTS)
             return;       /* would overflow the 64-slot frame */
 
         const int bsz = count_all_nodes(f->body.get());
@@ -2815,16 +2826,52 @@ private:
             return;
         inline_budget -= bsz;
 
-        /* Splice: substitute params (by slot) + remap locals to [*fsize, ...). */
+        /* Splice: substitute params (by slot) + remap locals to [*fsize, ...).
+         * For a temp-bound param, the substituted value is a read of its temp
+         * slot (allocated above the remapped locals). */
         const int off = fsize ? (*fsize - nparams) : 0;
+        const int temp_base = fsize ? (*fsize + nlocals) : 0;
+        std::vector<unique_ptr<Identifier>> temp_reads;  /* own the substitutes */
         std::vector<Construct *> args;
-        for (auto &a : ce->args->elems)
-            args.push_back(a.get());
+        int t = 0;
+        for (int i = 0; i < nparams; i++) {
+            if (needs_temp[i]) {
+                auto id = make_unique<Identifier>("$a");
+                id->sym = ResolvedSym{ SymKind::local, temp_base + t };
+                id->th = ce->args->elems[i]->th;   /* keep M8 hint if any */
+                temp_reads.push_back(move(id));
+                args.push_back(temp_reads.back().get());
+                t++;
+            } else {
+                args.push_back(ce->args->elems[i].get());
+            }
+        }
 
         unique_ptr<Construct> body = f->body->clone();
         splice_tail(body, args, nparams, off);
+
+        /* Prepend `$a = arg` for each temp-bound param, in PARAM ORDER so the
+         * args evaluate left-to-right (insert at front in reverse). The arg is
+         * the ORIGINAL caller expression (not remapped). */
+        auto *blk = dynamic_cast<Block *>(body.get());
+        ML_CHECK(blk != nullptr);   /* block_inlinable_decl required is_block */
+        t = ntemps;
+        for (int i = nparams - 1; i >= 0; i--) {
+            if (!needs_temp[i])
+                continue;
+            t--;
+            auto asn = make_unique<Expr14>();
+            asn->op = Op::assign;
+            auto lv = make_unique<Identifier>("$a");
+            lv->sym = ResolvedSym{ SymKind::local, temp_base + t };
+            lv->th = ce->args->elems[i]->th;
+            asn->lvalue = move(lv);
+            asn->rvalue = ce->args->elems[i]->clone();
+            blk->elems.insert(blk->elems.begin(), move(asn));
+        }
+
         if (fsize)
-            *fsize += nlocals;   /* the caller's frame absorbed f's locals */
+            *fsize += grow;   /* the caller's frame absorbed locals + arg temps */
 
         const InlineCtx *ic = alloc_inline_ctx(
             { std::string(f->id->get_str()), param_names(f),
@@ -2843,7 +2890,8 @@ private:
         TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
               std::to_string(nparams) + " arg(s))  block body " +
               std::to_string(bsz) + " nodes -> inline (+" +
-              std::to_string(nlocals) + " local slot(s))");
+              std::to_string(nlocals) + " local, +" +
+              std::to_string(ntemps) + " arg-temp slot(s))");
 
         slot = move(ica);
         walk(slot, depth + 1, fsize);   /* re-scan: nested calls in the body */

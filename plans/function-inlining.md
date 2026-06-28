@@ -374,8 +374,27 @@ Not yet done; roughly in priority order:
    (expression-inline there is fine — it yields a recognizable arithmetic bound).
    Result: ~1.4x on a call-heavy non-const loop; 1290/1290 across the matrix.
 
-   **Still v3:** lift the recursion ban for bounded unrolling + CSE of duplicate
-   pure calls (the recursive-auto-pure prerequisite is already in).
+   **v3 in progress** (recursion unroll + per-frame pure-call cache). Sound:
+   reusing a pure result is lazy reuse of an already-evaluated value, NOT the
+   unsound hoist-out-of-a-guard (see [[pure-call-cse-soundness]]). Three steps:
+   - **A — args-as-locals: DONE.** A non-value-stable arg (non-trivial expr,
+     global, or side-effecting call) is bound to a fresh frame TEMP once at the
+     top of the inlined body and the param reads it; value-stable args still
+     substitute directly. Evaluating once captures the call-time value (sound;
+     fixes the old `sub_ok` global-arg unsoundness) and lets `f(a+b)`, `f(g())`,
+     `f(global)` inline — and is what a self-call's `n-1` arg needs.
+   - **B — lift the recursion ban** for block-inline (bounded by depth/budget),
+     so fib unrolls N levels; the InlinedCallExpr shares the caller frame, so the
+     recursion's duplicate calls land in ONE frame.
+   - **C — per-frame pure-call cache:** in `do_func_call`, a call to a pure func
+     with ≥2 self-calls (tree recursion) checks a lazily-allocated per-frame
+     cache keyed by (func, args); hit → reuse, miss → call + store; dies with the
+     frame. Lazy → sound; frame-scoped → not global memoization.
+   B and C land together (B alone is an exponential body; C alone finds no
+   in-frame dups). The VARIABLE-arg compile-time CSE (hoisting `fib(n-5)` to a
+   temp) is NOT sound — for a function whose base case misses negatives
+   (factorial), the hoisted call diverges; the runtime per-frame cache avoids it
+   by being lazy.
 
    The original gap: a block-bodied function used **in expression position**
    (`var y = f(z) + 1;`) and **recursive** functions (banned by

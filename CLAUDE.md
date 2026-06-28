@@ -864,10 +864,17 @@ pays — ~1.4x on a call-heavy non-const loop). **Scope (`block_inlinable_decl`)
 (`contains_func` — a COMPLETE walk; the plain `for_each_child` form missed a
 closure that is a decl rvalue `var h = func[..]..`, which let an inline break the
 capture), **non-recursive** (a COMPLETE `refs_uid` check), no scalar-param
-reassignment, args **`tail_arg_ok`** (a caller LOCAL or const literal, never a
-global or side-effecting expr — a block body can change shared state between a
-param's uses, so the arg must be value-stable; `sub_ok` would be unsound here),
-use count by SLOT. The size gate is the **cost model**: `body_weight` (a weighted
+reassignment (a reassigned param is a by-value copy — substituting the arg would
+alias it). **Args (use count by SLOT):** a **value-stable** arg (`tail_arg_ok` —
+a caller LOCAL or const literal the body can't reassign) is substituted DIRECTLY;
+**any other arg** (a non-trivial expression, a global, a side-effecting call) is
+bound to a fresh frame **temp once** at the top of the body (`$a = arg`) and the
+param reads that temp — **"args as locals"**. Evaluating once captures the
+call-time value, so a body that mutates the passed-in global, or a multi-use
+side-effecting arg, stays sound (the earlier `sub_ok` allowed a bare global
+identifier, an unsoundness); it also lets `f(a+b)`, `f(g())`, `f(global)` inline,
+and is what the recursion-unroll needs (a self-call's arg is `n-1`). The size
+gate is the **cost model**: `body_weight` (a weighted
 node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x an arith
 op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)**. **Bodies WITH
 locals are handled** (v2): `splice_tail` substitutes the params (by slot) and

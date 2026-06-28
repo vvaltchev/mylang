@@ -2933,7 +2933,7 @@ static const std::vector<test> tests =
         "func bump() { cnt = cnt + 1; return cnt; }",
         "func use(a) { return a + a; }",   /* a used twice */
         "func c() { return use(bump()); }",
-        "var r = c();",          /* sub_ok blocks the inline; bump() runs once */
+        "var r = c();",          /* temp-bound: bump() evaluated exactly once */
         "assert(cnt == 1);",
         "assert(r == 2);" } },
     { "block-inline: error inside an inlined body still throws at runtime",
@@ -2951,16 +2951,22 @@ static const std::vector<test> tests =
       { "func f(a, b) { var t = a + b; return t; }",
         "func c(p, q, r) { return f(p, q) + f(q, r); }",
         "assert(c(1, 2, 3) == (1 + 2) + (2 + 3));" } },
-    /* A GLOBAL arg substituted into a body that mutates that global would be
-     * unsound (the body could change it between the param's uses); tail_arg_ok
-     * rejects a global arg, so the call is NOT inlined - the value is the
-     * call-time global. (Was a v1 bug: sub_ok wrongly allowed the global.) */
-    { "block-inline: global arg + global-mutating body is NOT inlined",
+    /* A GLOBAL arg into a body that mutates that global is bound to a temp ONCE
+     * at the top of the inlined body ("args as locals"), capturing the call-time
+     * value - so it inlines AND stays sound (the body's later mutation of the
+     * global doesn't change the param). */
+    { "block-inline: global arg + global-mutating body (temp-bound, sound)",
       { "var g = 5;",
         "func f(a) { g = 99; return a; }",
         "func c() { var y = f(g); return y; }",
         "assert(c() == 5);",     /* arg g bound at call time = 5, not 99 */
         "assert(g == 99);" } },
+    /* args-as-locals: a non-trivial arg expression inlines (bound to a temp). */
+    { "block-inline: non-trivial arg expression (temp-bound)",
+      { "func mx(a, b) { if (a > b) return a; return b; }",
+        "func c(p, q) { return mx(p + 1, q * 2); }",
+        "assert(c(3, 7) == 14);",
+        "assert(c(20, 2) == 21);" } },
     /* A closure that is the rvalue of a decl (`var h = func[v]..`) must keep
      * the function from being block-inlined - substitution would break the
      * capture. (Was a v2 bug: contains_func used the incomplete for_each_child,
