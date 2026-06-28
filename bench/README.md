@@ -45,6 +45,17 @@ make -j BUILD_DIR=build_rel           # -> build_rel/mylang  (-O3, no TESTS)
 python3 bench/run.py --mylang ./build_rel/mylang
 ```
 
+**For perf, also build `ASSERTS=0`.** Assertions are ON by default in *every*
+build (debug AND release): the C `assert()`s, the `ML_CHECK()` invariant net,
+**and `_GLIBCXX_ASSERTIONS` stdlib container hardening** — the last adds a bounds
+check to every `vector`/`string` access, which taxes container-heavy benchmarks
+(`array_*`, `dict_*`, `*_concat`) by a few percent. Build `make -j ASSERTS=0`
+(release defaults to `-O3`, so this is the true perf binary). When comparing two
+binaries with `--baseline`, build **both** the same way, and when a wall-clock
+delta looks small or suspicious, confirm with `callgrind` (instruction counts
+are layout-independent: a real change moves interpreter instruction counts; pure
+cycle/cache/allocator-layout noise leaves them identical).
+
 (Using a separate `build_rel/` keeps your `-rt`-capable debug `build/` intact.)
 If you just run `make -j`, the optimized binary lands at `build/mylang`, which
 is what the harness auto-discovers when `--mylang` is omitted. Either way the
