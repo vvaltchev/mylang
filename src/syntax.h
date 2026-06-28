@@ -742,14 +742,38 @@ public:
  * CallExpr::do_eval is left byte-for-byte unchanged - builtin calls in tight
  * loops are not perturbed. Created by the swap pass in resolver.cpp.
  */
-class DirectCallExpr final: public CallExpr {
+class DirectCallExpr: public CallExpr {
 
 public:
     DirectCallExpr() : CallExpr("DirectCallExpr") { }
+    DirectCallExpr(const char *name) : CallExpr(name) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<DirectCallExpr>();
+        copy_base_fields(*c);
+        c->what = clone_as(what);
+        c->args = clone_as(args);
+        c->direct_func_slot = direct_func_slot;
+        return c;
+    }
+};
+
+/*
+ * A devirtualized call to a CACHEABLE pure recursive function (the v3 fib win):
+ * like DirectCallExpr but routes through cached_call so the per-frame PureCache
+ * dedups the recursion's duplicate self-calls. It is a SEPARATE node precisely
+ * so the plain DirectCallExpr path pays NO per-call cache check. The devirt pass
+ * creates it only for a global func the inliner marked cache_results.
+ */
+class CachedCallExpr final: public DirectCallExpr {
+
+public:
+    CachedCallExpr() : DirectCallExpr("CachedCallExpr") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<CachedCallExpr>();
         copy_base_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
@@ -1254,6 +1278,15 @@ public:
      */
     bool explicit_pure = false;
     bool effective_pure = false;
+
+    /*
+     * Set by the inliner when it unrolls this (pure, self-recursive, >=2
+     * self-call) function: a call to it caches its result in the CALLER's frame
+     * (see PureCache, eval.h), so the duplicate self-calls the unroll brings
+     * into one frame compute once. Off by default - no call pays the cache
+     * check unless the inliner enabled it for this function.
+     */
+    bool cache_results = false;
 
     /*
      * Name to show in a backtrace, when it should differ from `id`. Empty for

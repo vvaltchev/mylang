@@ -11,6 +11,8 @@
 #include <string_view>
 #include <vector>
 #include <utility>
+#include <memory>
+#include <unordered_map>
 
 class Identifier;
 
@@ -60,6 +62,34 @@ struct FlowState {
  * slot, not eight - the unused inline capacity is just stack bytes. `slots`
  * always points at whichever storage is active, so callers just index slots[i].
  */
+/*
+ * Per-frame cache of PURE function-call results (the v3 recursion optimization).
+ * Key: the callee's FuncDeclStmt + the call's argument values. When a recursive
+ * pure function is unrolled into a frame (the InlinedCallExpr shares the caller
+ * frame), its duplicate self-calls land here and compute ONCE. Lazy (only calls
+ * actually made are stored) so it never evaluates a call the program wouldn't -
+ * sound; frame-scoped (dies with the frame) so it is NOT global memoization.
+ */
+struct PureCacheKey {
+    const void *fn;
+    std::vector<EvalValue> args;
+
+    bool operator==(const PureCacheKey &o) const {
+        return fn == o.fn && args == o.args;
+    }
+};
+
+struct PureCacheKeyHash {
+    size_t operator()(const PureCacheKey &k) const {
+        size_t h = reinterpret_cast<size_t>(k.fn);
+        for (const auto &a : k.args)
+            h = h * 1000003u + a.hash();
+        return h;
+    }
+};
+
+typedef std::unordered_map<PureCacheKey, EvalValue, PureCacheKeyHash> PureCache;
+
 struct Frame {
     static constexpr int INLINE_SLOTS = 8;
 
@@ -68,9 +98,20 @@ struct Frame {
     LValue *slots = nullptr;
     int inline_count = 0;           /* # slots placement-built in inline_buf */
 
+    /* Lazily-allocated pure-call result cache (see PureCache above); null until
+     * the first cacheable call is made from this frame. Freed with the frame. */
+    std::unique_ptr<PureCache> pure_cache;
+
     Frame() = default;
     Frame(const Frame &) = delete;  /* never copied; slots would dangle */
     Frame(Frame &&) = delete;
+
+    PureCache &ensure_pure_cache()
+    {
+        if (!pure_cache)
+            pure_cache = std::unique_ptr<PureCache>(new PureCache());
+        return *pure_cache;
+    }
 
     /* Make `slots` point at storage holding exactly `frame_size` slots. */
     void init(int frame_size)

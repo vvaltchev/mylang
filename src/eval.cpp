@@ -634,6 +634,51 @@ EvalValue eval_func(EvalContext *ctx,
     return do_func_call(ctx, obj, args);
 }
 
+/*
+ * A call to a pure, self-recursive function the inliner unrolled
+ * (obj.func->cache_results) caches its result in the CALLER's frame
+ * (PureCache, eval.h). When the unroll splices the recursion into one frame,
+ * the duplicate self-calls land here and compute ONCE - a per-frame "limited
+ * memoization" that is SOUND (lazy: only calls actually made are stored, so it
+ * never evaluates a call the program wouldn't) and NOT global (the cache dies
+ * with the frame). Args are evaluated ONCE (for the key AND the bind), so a
+ * side-effecting arg is not duplicated. Falls back to do_func_call when there
+ * is no frame to cache in.
+ */
+static EvalValue
+cached_call(EvalContext *ctx, FuncObject &obj,
+            const vector<unique_ptr<Construct>> &args,
+            Loc call_site, const InlineCtx *inl)
+{
+    if (!ctx->frame)
+        return do_func_call(ctx, obj, args, call_site, inl);
+
+    vector<EvalValue> vals;
+    vals.reserve(args.size());
+    for (const auto &a : args)
+        vals.push_back(RValue(a->eval(ctx)));
+
+    PureCache &cache = ctx->frame->ensure_pure_cache();
+    PureCacheKey key{ obj.func, vals };
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+
+    EvalValue r = do_func_call(ctx, obj, vals, call_site, inl);
+
+    /*
+     * Cache only a SCALAR result (a trivial value type: none/int/float/bool).
+     * A pure function may return a fresh MUTABLE container (array/dict/struct);
+     * caching and re-handing that out would alias it across callers - the
+     * un-cached call gives each its own. Scalars are value-copied, so sharing
+     * is safe. (Tree-recursive funcs that the unroll targets return scalars -
+     * fib, sums, counts - so this loses nothing in practice.)
+     */
+    if (r.get_type()->t < Type::t_str)
+        cache.emplace(move(key), r);
+    return r;
+}
+
 static void stamp_operand_loc(const Construct *c, Exception &e);
 
 /*
@@ -985,6 +1030,31 @@ EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
         const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
         if (fv.is<intrusive_ptr<FuncObject>>())
             return do_func_call(
+                ctx,
+                *fv.get<intrusive_ptr<FuncObject>>().get(),
+                args->elems,
+                start,
+                inline_ctx
+            );
+    }
+    return CallExpr::do_eval(ctx, rec);
+}
+
+/*
+ * Devirtualized call to a CACHEABLE pure recursive function (see PureCache):
+ * like DirectCallExpr but routes through cached_call so the per-frame cache
+ * dedups the recursion's duplicate self-calls. A SEPARATE node so the plain
+ * DirectCallExpr path pays NO per-call cache check (the cost model that made
+ * DirectCallExpr worth it). Created by the devirt pass only for a global func
+ * the inliner marked cache_results; falls back to CallExpr if the slot isn't a
+ * FuncObject (a struct ctor, a reassigned slot, the REPL).
+ */
+EvalValue CachedCallExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
+        const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
+        if (fv.is<intrusive_ptr<FuncObject>>())
+            return cached_call(
                 ctx,
                 *fv.get<intrusive_ptr<FuncObject>>().get(),
                 args->elems,

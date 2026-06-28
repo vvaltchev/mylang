@@ -2940,6 +2940,38 @@ static const std::vector<test> tests =
       { "func bad(a) { if (a > 0) return a; return 1 / 0; }",
         "func c(p) { return bad(p); }",
         "c(0);" }, &typeid(DivisionByZeroEx) },
+    /* ---- v3: recursion unroll + per-frame pure-call cache ----
+     * A pure tree-recursive function (>=2 self-calls) is unrolled in place and
+     * its duplicate self-calls dedup in the per-frame cache. Correctness must be
+     * unchanged for all n incl. the base cases. */
+    { "v3 recursion: fib correct across n (unroll + cache)",
+      { "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
+        "assert(fib(0) == 0);",
+        "assert(fib(1) == 1);",
+        "assert(fib(2) == 1);",
+        "assert(fib(10) == 55);",
+        "assert(fib(20) == 6765);" } },
+    { "v3 recursion: nested recursion (ackermann) correct",
+      { "func ack(m, n) {",
+        "  if (m == 0) return n + 1;",
+        "  if (n == 0) return ack(m - 1, 1);",
+        "  return ack(m - 1, ack(m, n - 1));",
+        "}",
+        "assert(ack(2, 3) == 9);",
+        "assert(ack(3, 3) == 61);" } },
+    { "v3 recursion: a non-negative-base recursion folds negatives safely",
+      { "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
+        "assert(fib(7) == 13);" } },
+    /* A pure recursive function returning a CONTAINER is NOT cached (the scalar
+     * gate): two equal calls give INDEPENDENT arrays, so mutating one must not
+     * affect the other. (If the cache wrongly cached the array, they'd alias.) */
+    { "v3 recursion: container result is not cached (no aliasing)",
+      { "func tree(n) { if (n < 2) return [n]; return tree(n-1) + tree(n-2); }",
+        "var a = tree(4);",
+        "var b = tree(4);",
+        "assert(len(a) == 5);",     /* fib(5) == 5 elements */
+        "a[0] = 99;",
+        "assert(b[0] == 1);" } },   /* independent: b unaffected */
     /* v2: a block body WITH a local is inlined (its locals are remapped into
      * the caller's frame, which grows by the local count). */
     { "block-inline v2: body with a local",

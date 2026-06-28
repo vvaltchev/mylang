@@ -234,6 +234,48 @@ static bool func_is_self_recursive(const FuncDeclStmt *fd)
     return fd->id && fd->body && refs_uid(fd->body.get(), fd->id->uid);
 }
 
+/* Count references to `uid` in the subtree (a COMPLETE traversal, like
+ * refs_uid). Used to find a TREE-recursive function (>=2 self-calls), where
+ * unrolling produces duplicate self-calls that the per-frame cache dedups. */
+static int count_uid(const Construct *c, const UniqueId *uid)
+{
+    if (!c)
+        return 0;
+    if (auto *id = dynamic_cast<const Identifier *>(c))
+        return id->uid == uid ? 1 : 0;
+    int n = 0;
+    if (auto *b = dynamic_cast<const Block *>(c)) {
+        for (auto &e : b->elems) n += count_uid(e.get(), uid);
+        return n;
+    }
+    if (auto *f = dynamic_cast<const ForStmt *>(c))
+        return count_uid(f->init.get(), uid) + count_uid(f->cond.get(), uid)
+             + count_uid(f->inc.get(), uid) + count_uid(f->body.get(), uid);
+    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+        return count_uid(fe->container.get(), uid)
+             + count_uid(fe->body.get(), uid);
+    if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+        n += count_uid(tc->tryBody.get(), uid);
+        for (auto &p : tc->catchStmts) n += count_uid(p.second.get(), uid);
+        return n + count_uid(tc->finallyBody.get(), uid);
+    }
+    if (auto *e = dynamic_cast<const Expr14 *>(c))
+        return count_uid(e->lvalue.get(), uid) + count_uid(e->rvalue.get(), uid);
+    for_each_child(const_cast<Construct *>(c),
+        [&](Construct *ch) { n += count_uid(ch, uid); });
+    return n;
+}
+
+/* A pure, TREE-recursive (>=2 self-calls) function. Unrolling it brings its
+ * duplicate self-calls into one frame, where the per-frame pure-call cache
+ * dedups them (the v3 fib win). A LINEAR recursion (1 self-call) has no dups,
+ * so it is NOT included - unrolling it would only grow the body. */
+static bool func_is_cacheable_recursive(const FuncDeclStmt *fd)
+{
+    return fd->effective_pure && fd->id && fd->body
+        && count_uid(fd->body.get(), fd->id->uid) >= 2;
+}
+
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
@@ -2170,7 +2212,17 @@ class Inliner {
      * remaining calls in place (still correct - they run at runtime).
      */
     static const int MAX_INLINE_DEPTH = 16;
+    /* A self-recursive function's body is unrolled in place until it reaches
+     * this many nodes (count_all_nodes), then the remaining self-calls are the
+     * frontier (deduped at runtime by the per-frame cache). Bounds the unrolled
+     * decl size; tune vs bench/. */
+    static const int REC_NODE_CAP = 80;
     long inline_budget = 0;
+
+    /* A recursive function's ORIGINAL (pre-unroll) body, saved on first sight so
+     * each self-call splices the original, not the in-place-growing body (which
+     * would compound). Keyed by the FuncDeclStmt (stable for the run). */
+    std::unordered_map<FuncDeclStmt *, unique_ptr<Construct>> rec_orig;
 
 public:
 
@@ -2330,11 +2382,22 @@ private:
     {
         if (!fd->body || !fd->body->is_block() || !fd->id || !fd->resolved)
             return false;
-        return (!fd->captures || fd->captures->elems.empty())
-            && !contains_func(fd->body.get())
-            && !refs_uid(fd->body.get(), fd->id->uid)   /* non-recursive */
-            && !mutates_a_param(fd)
-            && body_weight(fd->body.get()) < CALL_WEIGHT;
+        if (!(!fd->captures || fd->captures->elems.empty())
+                || contains_func(fd->body.get())
+                || mutates_a_param(fd))
+            return false;
+        /*
+         * A self-recursive func is inlinable only if it is TREE-recursive and
+         * pure (func_is_cacheable_recursive): the inliner UNROLLS it a bounded
+         * number of levels and the per-frame cache dedups the duplicate
+         * self-calls (the v3 fib win). Its body weight is dominated by the
+         * self-calls (which become the frontier, not inlined past the cap), so
+         * the weight gate does NOT apply - the recursion cap bounds it instead.
+         * A non-recursive func uses the cost-model weight gate (below one call).
+         */
+        if (refs_uid(fd->body.get(), fd->id->uid))
+            return func_is_cacheable_recursive(fd);
+        return body_weight(fd->body.get()) < CALL_WEIGHT;
     }
 
     /* True if the lvalue is DIRECTLY a param identifier (`x`), not a field /
@@ -2774,6 +2837,32 @@ private:
         if (!f->resolved)
             return;       /* its locals aren't slotted: nothing to remap into */
 
+        /*
+         * A SELF-RECURSIVE callee (block_inlinable_decl admitted it only if it
+         * is tree-recursive + pure) is UNROLLED by SIZE: stop once its body (it
+         * grows in place as the walk inlines its own self-calls - this IS the
+         * "unroll the definition") reaches REC_NODE_CAP. Two subtleties:
+         *  - each self-call splices a clone of the ORIGINAL body (saved lazily
+         *    on first sight, before any unroll), NOT the growing body, so the
+         *    unroll does not COMPOUND;
+         *  - a size cap is robust to template-instance name redirects (a chain
+         *    of inlined-at names is not, since a self-call may go through `fib`
+         *    or `fib$0`).
+         * Template instances sit at the root's front, so the decl is unrolled
+         * before any external call site is walked; that site then sees the body
+         * >= cap and does NOT inline it - it CALLS the unrolled function, so the
+         * unroll lives in the decl and EVERY frame runs it. The deduped frontier
+         * self-calls hit the per-frame pure-call cache (cache_results).
+         */
+        const bool is_rec = refs_uid(f->body.get(), f->id->uid);
+        if (is_rec) {
+            if (count_all_nodes(f->body.get()) >= REC_NODE_CAP)
+                return;
+            if (!rec_orig.count(f))
+                rec_orig[f] = f->body->clone();
+            f->cache_results = true;
+        }
+
         const int nparams = f->params
             ? static_cast<int>(f->params->elems.size()) : 0;
         if (static_cast<int>(ce->args->elems.size()) != nparams)
@@ -2847,7 +2936,10 @@ private:
             }
         }
 
-        unique_ptr<Construct> body = f->body->clone();
+        /* For a recursive callee, splice the ORIGINAL (pre-unroll) body so the
+         * in-place decl unroll does not compound; otherwise the current body. */
+        unique_ptr<Construct> body =
+            is_rec ? rec_orig.at(f)->clone() : f->body->clone();
         splice_tail(body, args, nparams, off);
 
         /* Prepend `$a = arg` for each temp-bound param, in PARAM ORDER so the
@@ -3550,7 +3642,8 @@ private:
  * inliner's spec clones and their redirected calls.
  */
 static void
-devirtualize_calls(unique_ptr<Construct> &slot)
+devirtualize_calls(unique_ptr<Construct> &slot,
+                   const std::unordered_set<int> &cacheable)
 {
     if (!slot)
         return;
@@ -3573,8 +3666,15 @@ devirtualize_calls(unique_ptr<Construct> &slot)
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();
                 slot = move(d);
             } else if (call->direct_func_slot >= 0) {
-                /* Global-slot callee (function / struct / escaped global). */
-                auto d = make_unique<DirectCallExpr>();
+                /* Global-slot callee (function / struct / escaped global). A
+                 * cacheable pure-recursive callee becomes a CachedCallExpr so
+                 * its recursion's duplicate self-calls dedup in the per-frame
+                 * cache; every other global call is a plain DirectCallExpr (no
+                 * per-call cache check). */
+                unique_ptr<DirectCallExpr> d =
+                    cacheable.count(call->direct_func_slot)
+                        ? unique_ptr<DirectCallExpr>(new CachedCallExpr())
+                        : make_unique<DirectCallExpr>();
                 call->copy_base_fields(*d);
                 d->what = move(call->what);
                 d->args = move(call->args);
@@ -3585,7 +3685,29 @@ devirtualize_calls(unique_ptr<Construct> &slot)
     }
 
     for_each_child_slot(slot.get(),
-        [](unique_ptr<Construct> &ch) { devirtualize_calls(ch); });
+        [&](unique_ptr<Construct> &ch) { devirtualize_calls(ch, cacheable); });
+}
+
+/* Collect the global-table slots of functions the inliner marked cache_results
+ * (a pure, tree-recursive func it unrolled), so a call to one becomes a
+ * CachedCallExpr. A complete walk (cacheable funcs may be nested). */
+static void
+collect_cacheable_slots(Construct *c, std::unordered_set<int> &out)
+{
+    if (!c)
+        return;
+    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (fd->id && fd->id->sym.kind == SymKind::global && fd->cache_results)
+            out.insert(fd->id->sym.slot);
+        if (fd->body)
+            collect_cacheable_slots(fd->body.get(), out);
+        return;
+    }
+    if (auto *b = dynamic_cast<Block *>(c)) {
+        for (auto &e : b->elems) collect_cacheable_slots(e.get(), out);
+        return;
+    }
+    for_each_child(c, [&](Construct *ch) { collect_cacheable_slots(ch, out); });
 }
 
 static void
@@ -3593,8 +3715,10 @@ devirtualize_direct_calls(Construct *root)
 {
     if (!root)
         return;
+    std::unordered_set<int> cacheable;
+    collect_cacheable_slots(root, cacheable);
     for_each_child_slot(root,
-        [](unique_ptr<Construct> &ch) { devirtualize_calls(ch); });
+        [&](unique_ptr<Construct> &ch) { devirtualize_calls(ch, cacheable); });
 }
 
 void
