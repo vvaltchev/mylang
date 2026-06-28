@@ -1683,6 +1683,29 @@ sanitizers never reproduced it.)
   captures (and, for pure funcs, only consts + params).
   Builtins are different: they receive the **caller's `ctx`** and the
   **unevaluated** `ExprList`.
+- **Devirtualized direct calls (`DirectCallExpr`, `syntax.h`).** When the
+  resolver proves a `CallExpr`'s callee is an identifier bound to a global-table
+  slot (a top-level/scoped function, an escaped global, or a struct descriptor),
+  it records the slot on `CallExpr::direct_func_slot`, and a slot-based swap pass
+  at the end of `resolve_names` (`devirtualize_direct_calls`, run after the
+  inliner so spec clones + redirected calls are covered, before
+  `specialize_types`) replaces that `CallExpr` with a **`DirectCallExpr`** (a
+  subclass; `CallExpr` is no longer `final`). Its `do_eval` reads the callee
+  **straight from the global slot** and, when the slot holds a `FuncObject`,
+  jumps to `do_func_call` — skipping the generic callee eval (the
+  `Construct::eval` wrapper + `Identifier::do_eval`), the `RValue` copy /
+  refcount bump, and the `Builtin`/`FuncObject`/`StructTypeDef` dispatch. A
+  runtime `is<FuncObject>` check keeps it sound: a struct construction
+  (`P(...)`, a global-slot call too), a slot reassigned to a non-function, an
+  undefined slot, or the REPL (no global table) **falls back to
+  `CallExpr::do_eval`**. It is a SEPARATE node, not a flag on the hot
+  `CallExpr::do_eval`, precisely so the plain-call path (builtin / closure /
+  lambda calls) is left byte-for-byte unchanged. **Effect:** ~15% on
+  `bench/09_fib_recursive` and call/recursion/dict-heavy code; neutral on the
+  broad suite (most micro-benchmarks aren't call-bound). Never set in the REPL
+  (top-level names are map-resident, not global slots), so REPL calls stay plain
+  `CallExpr`. coderender / serialize treat a `DirectCallExpr` as the `CallExpr`
+  it subclasses.
 - **Trailing `opt` parameters are skippable at the call site.** The four
   `do_func_bind_params` overloads (`eval.cpp`) accept any arg count in
   `[min_required_args(params), nparams]` and bind each omitted trailing param to

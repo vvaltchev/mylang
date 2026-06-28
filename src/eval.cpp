@@ -966,6 +966,34 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
     throw NotCallableEx(what->start, what->end);
 }
 
+/*
+ * Devirtualized direct call. The resolver proved the callee is a global-table
+ * slot (a top-level / scoped function, an escaped global, or a struct
+ * descriptor) and recorded it; the swap pass (resolver.cpp) turned that CallExpr
+ * into this node so its do_eval is SEPARATE code - CallExpr::do_eval is left
+ * byte-for-byte unchanged, so plain calls (incl. builtin calls in tight loops)
+ * are not perturbed. Read the callee straight from the slot: no callee eval (and
+ * its Construct::eval wrapper), no RValue copy / refcount bump, no Builtin/Func/
+ * Struct dispatch. The is<FuncObject> check keeps it sound - a struct
+ * construction, a slot reassigned to a non-function, an undefined slot, or the
+ * REPL (no global table) falls back to the full CallExpr path.
+ */
+EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
+        const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
+        if (fv.is<intrusive_ptr<FuncObject>>())
+            return do_func_call(
+                ctx,
+                *fv.get<intrusive_ptr<FuncObject>>().get(),
+                args->elems,
+                start,
+                inline_ctx
+            );
+    }
+    return CallExpr::do_eval(ctx, rec);
+}
+
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
     if (!elems.size()) {

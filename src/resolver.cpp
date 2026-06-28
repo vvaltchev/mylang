@@ -1894,6 +1894,25 @@ Resolver::walk(Construct *c, FuncState *cur)
         return;
     }
 
+    /* --- call: resolve callee + args, then devirtualize a global callee --- */
+    if (auto *call = dynamic_cast<CallExpr *>(c)) {
+        walk(call->what.get(), cur);
+        if (call->args)
+            for (auto &a : call->args->elems)
+                walk(a.get(), cur);
+
+        /* If the callee resolved to a global-table slot (a top-level / scoped
+         * function, or a struct descriptor), record it so do_eval can read the
+         * callable straight from the slot. A struct construction or a slot that
+         * later holds a non-function falls through at runtime (is<FuncObject>),
+         * so recording any global slot is sound. */
+        if (auto *id = dynamic_cast<Identifier *>(call->what.get()))
+            if (id->sym.kind == SymKind::global)
+                call->direct_func_slot = id->sym.slot;
+
+        return;
+    }
+
     /* --- everything else: generic traversal --- */
     for_each_child(c, [&](Construct *ch) { walk(ch, cur); });
 }
@@ -2995,6 +3014,12 @@ private:
         what->end = ce->what->end;
         what->sym = clone->id->sym;
         ce->what = move(what);
+
+        /* Re-point the devirtualized-call slot at the CLONE (the resolver set it
+         * to the original function before this redirect). Script mode: the clone
+         * has a global slot; REPL: it is map-resident, so disable the fast path. */
+        ce->direct_func_slot =
+            clone->id->sym.kind == SymKind::global ? clone->id->sym.slot : -1;
     }
 
     FuncDeclStmt *build_specialization(
@@ -3144,6 +3169,46 @@ private:
  * builds the "main" Frame from it in Block::do_eval), then - unless disabled -
  * the inlining pass.
  */
+/*
+ * Call devirtualization: replace each CallExpr whose callee resolved to a
+ * global-table slot (direct_func_slot >= 0) with a DirectCallExpr, whose
+ * do_eval reads the callee straight from the slot. A SEPARATE node (not a flag
+ * on CallExpr's hot do_eval) so plain calls - builtin / closure / lambda - are
+ * not perturbed. Slot-based (for_each_child_slot yields replaceable slots), so
+ * the node is swapped in place. Runs after the inliner, so it also covers the
+ * inliner's spec clones and their redirected calls.
+ */
+static void
+devirtualize_calls(unique_ptr<Construct> &slot)
+{
+    if (!slot)
+        return;
+
+    if (auto *call = dynamic_cast<CallExpr *>(slot.get())) {
+        if (call->direct_func_slot >= 0 &&
+            !dynamic_cast<DirectCallExpr *>(call)) {
+            auto d = make_unique<DirectCallExpr>();
+            call->copy_base_fields(*d);
+            d->what = move(call->what);
+            d->args = move(call->args);
+            d->direct_func_slot = call->direct_func_slot;
+            slot = move(d);
+        }
+    }
+
+    for_each_child_slot(slot.get(),
+        [](unique_ptr<Construct> &ch) { devirtualize_calls(ch); });
+}
+
+static void
+devirtualize_direct_calls(Construct *root)
+{
+    if (!root)
+        return;
+    for_each_child_slot(root,
+        [](unique_ptr<Construct> &ch) { devirtualize_calls(ch); });
+}
+
 void
 resolve_names(Construct *root, bool enable_inline, int inline_threshold,
               AnalysisInfo *analysis, bool repl_mode, EvalContext *prior_pure)
@@ -3153,6 +3218,11 @@ resolve_names(Construct *root, bool enable_inline, int inline_threshold,
     if (enable_inline)
         if (auto *rb = dynamic_cast<Block *>(root))
             Inliner(inline_threshold, analysis, prior_pure, repl_mode).run(rb);
+
+    /* Devirtualize direct (global-slot) calls into DirectCallExpr nodes. After
+     * the inliner so spec clones + redirected calls are covered; before
+     * specialize_types, which treats a DirectCallExpr as the CallExpr it is. */
+    devirtualize_direct_calls(root);
 }
 
 void

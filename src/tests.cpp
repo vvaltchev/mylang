@@ -2064,6 +2064,21 @@ static const std::vector<test> tests =
         "func f() { struct Q { int y; } n = n + 1; return Q(n).y; }",
         "assert(f() == 1); assert(f() == 2);" } },
 
+    /* Devirtualized direct calls (DirectCallExpr): a global-slot callee is
+     * called straight from the slot. Exercises the FuncObject fast path (global
+     * func + recursion), the struct-descriptor fallback (a struct construction
+     * is a global-slot call too), and an escaped-global lambda call. */
+    { "devirt call: global func, recursion, struct construct, escaped lambda",
+      { "func dbl(x) => x * 2;",
+        "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
+        "struct P { int x; }",
+        "var g = func(x) => x + 1;",
+        "func use_g() { return g(10); }",   /* g escapes -> global slot */
+        "assert(dbl(21) == 42);",
+        "assert(fib(10) == 55);",
+        "assert(P(7).x == 7);",
+        "assert(use_g() == 11);" } },
+
     { "var with no initializer: its type is inferred from later assignment",
       { "var a; a = 3; assert(decltype(a).name == \"int?\");" } },
     { "var with no initializer: a conflicting reassignment is a type error",

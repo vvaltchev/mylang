@@ -208,8 +208,9 @@ public:
      */
     virtual unique_ptr<Construct> clone() const = 0;
 
-protected:
-
+    /* Copy the shared base fields into `d`. Used by every clone() and by the
+     * call-devirtualization swap (resolver.cpp), which moves a CallExpr's
+     * children into a fresh DirectCallExpr. Public so that swap can use it. */
     void copy_base_fields(Construct &d) const {
         d.is_const = is_const;
         d.start = start;
@@ -699,13 +700,25 @@ public:
     }
 };
 
-class CallExpr final: public Construct {
+/* NOT `final`: DirectCallExpr (below) derives from it for the devirtualized
+ * direct-call fast path, reusing what/args/serialize/clone helpers. */
+class CallExpr: public Construct {
 
 public:
     unique_ptr<Construct> what;
     unique_ptr<ExprList> args;
 
+    /*
+     * Devirtualized direct call: when the resolver proves the callee `what` is
+     * an identifier bound to a global-table slot, it records the slot here
+     * (>= 0). After resolution the swap pass (resolver.cpp) replaces such a
+     * CallExpr with a DirectCallExpr, whose do_eval reads the callee straight
+     * from the slot. -1 == not a direct call (a plain CallExpr stays one).
+     * Carried on the base so the swap can read it off any CallExpr. */
+    int direct_func_slot = -1;
+
     CallExpr() : Construct("CallExpr") { }
+    explicit CallExpr(const char *name) : Construct(name) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
@@ -714,6 +727,33 @@ public:
         copy_base_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
+        c->direct_func_slot = direct_func_slot;
+        return c;
+    }
+};
+
+/*
+ * A CallExpr whose callee is a known global-table slot (direct_func_slot). Its
+ * do_eval reads the callee straight from the slot and, when it holds a
+ * FuncObject, jumps to do_func_call - skipping the generic callee eval (the
+ * Construct::eval wrapper + Identifier::do_eval), the RValue copy / refcount
+ * bump, and the Builtin/Func/Struct dispatch; anything else falls back to
+ * CallExpr::do_eval. A SEPARATE node (not a flag on CallExpr) so the plain
+ * CallExpr::do_eval is left byte-for-byte unchanged - builtin calls in tight
+ * loops are not perturbed. Created by the swap pass in resolver.cpp.
+ */
+class DirectCallExpr final: public CallExpr {
+
+public:
+    DirectCallExpr() : CallExpr("DirectCallExpr") { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<DirectCallExpr>();
+        copy_base_fields(*c);
+        c->what = clone_as(what);
+        c->args = clone_as(args);
+        c->direct_func_slot = direct_func_slot;
         return c;
     }
 };
