@@ -49,6 +49,7 @@ enum class Op : int {
     shr         = 40, // >> (signed right shift, sign-extending)
     ushr        = 41, // >>> (unsigned/logical right shift, zero-fill)
     coalesce    = 42, // ?? (null-coalescing: a ?? b)
+    qmdot       = 43, // ?. (optional member access: a?.b)
 
-    op_count    = 43,
+    op_count    = 44,
 };

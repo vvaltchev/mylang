@@ -3572,6 +3572,11 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 
     EvalValue &&dval = RValue(what->eval(ctx));
 
+    /* `a?.b`: if the base is none, the access short-circuits to none (the
+     * member is not looked up). Each `?.` guards its own base. */
+    if (optional && dval.is<NoneVal>())
+        return EvalValue();
+
     /*
      * A struct instance: `s.field` is a field (an lvalue when the instance is
      * mutable, so `s.f = v` / `s.f += v` work; an rvalue for a read-only/const

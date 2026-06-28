@@ -2142,22 +2142,27 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         StaticTypeRef w = static_type_resolve(type_of(mem->what.get()));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
 
+        StaticTypeRef mt;   /* the member's type, before optionality */
         /* A struct instance: `s.field` is the field's type (a dict read is
          * non-opt), `s.CONST` is the const member's type. */
         if (w->kind == StaticTypeKind::Struct) {
             const StructTypeDef *def =
                 static_cast<const StructTypeDef *>(w->struct_def);
             if (const FieldDef *f = def->field_of(mem->memUid))
-                return field_static_type(*f);
-            if (const EvalValue *cv = def->const_of(mem->memUid))
-                return static_type_from_value(*cv);
-            return A.dyn_ty();
+                mt = field_static_type(*f);
+            else if (const EvalValue *cv = def->const_of(mem->memUid))
+                mt = static_type_from_value(*cv);
+            else
+                mt = A.dyn_ty();
+        } else if (w->kind == StaticTypeKind::Dict) {
+            /* `d.key` mirrors `d[key]`: non-opt (value / default / throws). */
+            mt = w->val;
+        } else {
+            mt = A.dyn_ty();
         }
 
-        /* `d.key` mirrors `d[key]`: non-opt (value / default / throws). */
-        if (w->kind == StaticTypeKind::Dict)
-            return w->val;
-        return A.dyn_ty();
+        /* `a?.b` is nullable: none when `a` is none, else the member's type. */
+        return mem->optional ? A.with_opt(static_type_resolve(mt), true) : mt;
     }
 
     if (auto *fd = dynamic_cast<const FuncDeclStmt *>(e)) {
@@ -3392,8 +3397,11 @@ void Inferencer::check(Construct *n)
         }
 
         StaticTypeRef w = type_of(mem->what.get());
-        require_nonopt(w, mem->what->start, mem->what->end,
-                       "as a member-access base");
+        /* `a?.b` deliberately accepts a nullable base (none short-circuits);
+         * a plain `a.b` requires a non-opt base. */
+        if (!mem->optional)
+            require_nonopt(w, mem->what->start, mem->what->end,
+                           "as a member-access base");
         StaticTypeRef wr = strip(static_type_resolve(w));
 
         /* struct instance base: validate the field/const exists. */

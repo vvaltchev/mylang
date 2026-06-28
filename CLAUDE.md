@@ -387,7 +387,13 @@ match C precedence; an unused level is skipped):
   IDENT followed by `:`, one-token lookahead) — see the inferencer's
   `lower_named_args` and README *Named arguments*. A trailing **`++`/`--`**
   (`Op::inc`/`Op::dec`) after the postfix chain makes a **postfix**
-  `IncDecExpr`.
+  `IncDecExpr`. **Optional member access** `a?.b` (`Op::qmdot`, a new 2-char
+  token) sets `MemberExpr::optional`: `do_eval` returns `none` when the base is
+  `none` (else the member); the inferencer types it `opt(member)` and the check
+  pass skips the non-opt-base requirement for it. Each `?.` guards only its own
+  base (an all-optional chain `a?.b?.c` short-circuits; a plain `.c` after `?.`
+  is not guarded — a deliberate simplification vs JS's whole-chain guard).
+  Optional subscript/`?.[`/optional call `?.()` are not implemented.
 - `pExpr02` — unary `+ - ! ~` (right-recursive, so `!!x`, `-+x` work); `~` is
   bitwise NOT here (the same `Op::bnot` token is the `dyn` alias in a *param*
   position, but that is handled in `pFuncParam` before any expression, so they
@@ -1039,8 +1045,9 @@ decisions behind it: `plans/type-inference.md`,
   value instead (`make_runtime_type_value` - a flat Type; `reflect_typeof` for
   the strings). `Type` is a native composite type (`native_struct_type_def`,
   recursive via `opt Type` elem/key/val) registered in `struct_by_name` and
-  typed by `builtin_result`. So `type(a).elem.kind` works (narrow the `opt Type`
-  first); `typestr(x)`/`kindstr(x)` are the cheap string forms. The arg-slot
+  typed by `builtin_result`. So `type(a)?.elem?.kind` works (the `opt Type`
+  elem/key/val are read with optional chaining `?.`, or narrowed with `if`);
+  `typestr(x)`/`kindstr(x)` are the cheap string forms. The arg-slot
   rewrite (not a whole-node replacement) needs no slot-based inferencer walk
   (`args->elems` is a direct vector). The `?`-suffix nullability format
   (`static_type_to_string`) matches `:type` and error messages.

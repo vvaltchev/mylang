@@ -339,7 +339,7 @@ void MemberExpr::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << "MemberExpr(\n";
+    s << "MemberExpr(" << (optional ? "?." : "") << "\n";
 
     what->serialize(s, level + 1);
     s << endl;

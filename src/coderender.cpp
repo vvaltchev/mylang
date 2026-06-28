@@ -225,7 +225,7 @@ struct Renderer {
         }
         if (auto *e = dynamic_cast<const MemberExpr *>(c)) {
             expr(e->what.get(), PREC_POSTFIX);
-            o << "." << e->memId; return;
+            o << (e->optional ? "?." : ".") << e->memId; return;
         }
         if (auto *e = dynamic_cast<const Subscript *>(c)) {
             expr(e->what.get(), PREC_POSTFIX);

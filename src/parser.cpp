@@ -1189,11 +1189,18 @@ pAcceptMember(ParseContext &c,
               unique_ptr<Construct> &ret,
               unsigned fl)
 {
-    if (!pAcceptOp(c, Op::dot))
+    /* `.id` is a plain member; `?.id` is an OPTIONAL member: `a?.b` is none
+     * when `a` is none, else `a.b`. Each `?.` guards its own base, so an
+     * all-optional chain `a?.b?.c` short-circuits; a plain `.c` after a `?.`
+     * is NOT guarded. */
+    const bool opt = pAcceptOp(c, Op::qmdot);
+    if (!opt && !pAcceptOp(c, Op::dot))
         return false;
 
     unique_ptr<MemberExpr> mem(new MemberExpr);
-    mem->is_const = what->is_const;
+    /* an optional access can yield none, so it is never a parse-time const */
+    mem->is_const = what->is_const && !opt;
+    mem->optional = opt;
     mem->start = what->start;
     mem->what = move(what);
 

@@ -813,6 +813,16 @@ Key rules:
     is non-`opt` (`var n = maybe ?? 0;` makes `n` a plain `int`).
     Right-associative (`a ?? b ?? c`), binds tighter than `?:` and looser than
     `||` (matching C#: `|| > ?? > ?: > =`).
+  * **Optional member access** `a?.b` — `none` if `a` is `none`, otherwise `a.b`
+    (the member is not looked up when `a` is `none`). Unlike a plain `a.b`
+    (which
+    requires a non-`none` base), `?.` accepts a nullable base and its result is
+    nullable (`opt`). Each `?.` guards **its own** base, so an all-optional
+    chain
+    short-circuits cleanly: `type(a)?.elem?.kind` is `none` if any link is
+    `none`. (A plain `.c` after a `?.` is *not* guarded — write `?.c` for every
+    link you want null-safe; this differs from JavaScript, where one `?.` guards
+    the rest of the chain.) Pairs naturally with `??`: `a?.b ?? default`.
 
 #### The `opt` and `dyn` modifiers
 

@@ -2,8 +2,20 @@
 
 Three operators that all involve `?`. They are designed together so the four
 `?` roles (the existing nullable suffix `int?`, plus `?.`, `??`, `?:`) coexist
-with no ambiguity. **Status: ternary `?:` and `??` DONE (phase 1+2); `?.`
-(optional chaining) is the remaining phase 3.**
+with no ambiguity. **Status: ALL DONE — ternary `?:` + `??` (phase 1+2) and
+`?.` optional member access (phase 3).**
+
+Phase 3 notes (as built): `Op::qmdot` (`?.`) - a `bool MemberExpr::optional`
+flag (NOT the planned `OptChainExpr` node; the per-link flag is far less code
+and
+covers the all-optional chains that MyLang's member chains actually are). Each
+`?.` guards ONLY its own base (`a?.b?.c` short-circuits; a plain `.c` after `?.`
+is unguarded - a deliberate simplification vs JS's whole-chain guard, documented
+in README). do_eval returns none on a none base; type_of is `opt(member)`; the
+check pass skips the non-opt-base requirement for it. Scoped to member access -
+optional subscript `?.[` and optional call `?.()` are not implemented. This
+makes
+the reflection chains clean: `type(a)?.elem?.kind` (no if-narrowing).
 
 Phase 1+2 notes (as built): `Op::coalesce` (`??`) is the only new token (ternary
 reuses `?`/`:`). `pExprCoalesce` + `pExpr13` sit between `||` and `=`; `pExpr14`

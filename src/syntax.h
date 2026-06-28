@@ -1339,6 +1339,7 @@ public:
     unique_ptr<Construct> what;
     EvalValue memId;            /* the name as a SharedStr (dict key) */
     const UniqueId *memUid = nullptr;   /* interned name (struct slot lookup) */
+    bool optional = false;      /* `a?.b`: none if `a` is none, else `a.b` */
 
     MemberExpr() : Construct("MemberExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1352,6 +1353,7 @@ public:
         c->what = clone_as(what);
         c->memId = memId;
         c->memUid = memUid;
+        c->optional = optional;
         return c;
     }
 };

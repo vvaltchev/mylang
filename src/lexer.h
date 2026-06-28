@@ -72,6 +72,7 @@ static const std::array<std::string, (int)Op::op_count> OpString =
     ">>",
     ">>>",
     "??",
+    "?.",
 };
 
 enum class Keyword : int {

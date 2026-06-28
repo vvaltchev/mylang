@@ -2094,6 +2094,25 @@ static const std::vector<test> tests =
         "assert(id(n > 0 ? (n > 5 ? \"big\" : \"small\") : \"neg\")",
         "       == \"small\");" } },
 
+    /* ---- optional chaining `?.` (member access) ---- */
+    { "optional member: none short-circuits, else the member",
+      { "struct P { int x; }",
+        "var dyn? p = none; assert(p?.x == none);",
+        "p = P(5); assert(p?.x == 5);" } },
+    { "optional chain: all-optional links short-circuit (no narrowing needed)",
+      { "var t = type([[1, 2]]);",
+        "assert(t?.elem?.elem?.kind == \"int\");" } },
+    { "optional member combines with ?? for a default",
+      { "struct P { int x; }",
+        "var dyn? p = none; assert((p?.x ?? -1) == -1);",
+        "p = P(7); assert((p?.x ?? -1) == 7);" } },
+    { "optional member result is nullable (opt)",
+      { "struct P { int x; } var p = P(3);",
+        "assert(typestr(p?.x) == \"int?\");" } },
+    { "a plain `.member` on a nullable base is still an error",
+      { "struct P { int x; } var dyn? p = none; var z = p.x;" },
+      &typeid(NullabilityEx) },
+
     /* ---- bitwise & shift operators (~ & | ^ << >> >>>), int only ---- */
     { "bitwise: & | ^ ~ basics",
       { "assert((5 & 3) == 1);",
