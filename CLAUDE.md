@@ -1502,8 +1502,11 @@ sanitizers never reproduced it.)
   **O(1) table read, not a scope-chain map walk** — a real win on call-heavy and
   global-heavy code (`bench/09_fib`). A plain vector with **no slot limit** — a
   program may have any number of global functions/variables. The resolver
-  **hoists functions** before resolving bodies (`hoist_global_funcs`), so a
-  forward / mutually-recursive reference resolves; for **variables** it instead
+  **hoists functions AND top-level structs** before resolving bodies
+  (`hoist_global_funcs` handles both; a struct name binds its descriptor in a
+  global slot like a func — so `P(...)`/`P.CONST` are O(1) slot reads, not a map
+  walk), so a forward / mutually-recursive reference resolves; for **variables**
+  it instead
   records each function-side use site (`escaped_refs`) during pass 1 and stamps
   it `SymKind::global` after pass 2 has given the var its table slot (a var, not
   hoisted, gets its slot when its decl is walked). `resolve_ref` resolves a
@@ -1521,11 +1524,16 @@ sanitizers never reproduced it.)
   only read an outermost top-level var); such a nested var legitimately shadows
   the global. A non-escaped top-level var stays a main-frame `SymKind::local`
   slot, so **auto-const (which only sees frame slots) is untouched** — only vars
-  no function reads are promotable, exactly as before. **Scope:** nested/
-  conditionally-declared functions, lambdas, struct names, and (in the **REPL**,
-  where top-level names must stay redefinable) all top-level names remain
-  map-bound; template-instance clones, inserted before resolve_names, ARE
-  hoisted. **Optimizer-inserted `name$sN` specialization clones**, though
+  no function reads are promotable, exactly as before. **Top-level STRUCT names
+  are hoisted into the global table too** (`hoist_global_funcs` handles both
+  `FuncDeclStmt` and `StructDeclStmt`): a struct is a non-capturing named decl
+  visible from any function body, so its name binds its type descriptor in a
+  global slot exactly like a function (`StructDeclStmt::do_eval` writes the slot
+  when `id->sym.kind == global`), and `P(...)`/`P.CONST` resolve to it — no map.
+  **Scope:** nested/conditionally-declared functions, lambdas, NESTED struct
+  names, and (in the **REPL**, where top-level names must stay redefinable) all
+  top-level names remain map-bound; template-instance clones, inserted before
+  resolve_names, ARE hoisted. **Optimizer-inserted `name$sN` specialization clones**, though
   created *after* the hoist, are now ALSO given a global slot in SCRIPT mode
   (the Inliner appends the clone name to the root block's `global_func_names`
   and stamps the clone decl + the redirected call's callee as `SymKind::global`)

@@ -2935,6 +2935,16 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
     if (id) {
 
+        /* A hoisted struct name binds its descriptor into the global table (an
+         * O(1) slot, no map) - like a top-level function. Script-only (the REPL
+         * keeps structs in the redefinable map; gfuncs is null there). */
+        if (id->sym.kind == SymKind::global && ctx->gfuncs) {
+            GlobalFuncTable *gf = ctx->gfuncs;
+            gf->slots[id->sym.slot] = LValue(move(desc), true /* const */);
+            gf->defined[id->sym.slot] = 1;
+            return none;
+        }
+
         if (!id->eval(ctx).is<UndefinedId>()) {
             if (!ctx->allow_redeclare)        /* REPL: redefining replaces */
                 throw AlreadyDefinedEx(id->start, id->end);

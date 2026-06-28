@@ -1056,13 +1056,20 @@ private:
     void hoist_global_funcs(Block *rb)
     {
         for (auto &e : rb->elems) {
-            auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
-            if (!fd || !fd->id)
+            /* A top-level function OR struct: both are non-capturing named
+             * declarations visible from any function body, so both get a global
+             * table slot (a struct's name binds its type descriptor, like a
+             * func name binds its FuncObject). */
+            Identifier *id = nullptr;
+            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get()))
+                id = fd->id.get();
+            else if (auto *sd = dynamic_cast<StructDeclStmt *>(e.get()))
+                id = sd->id.get();
+            if (!id)
                 continue;
-            if (global_func_slots.count(fd->id->uid))
-                throw AlreadyDefinedEx(fd->id->start, fd->id->end);
-            fd->id->sym = ResolvedSym{ SymKind::global,
-                                       add_global_slot(fd->id->uid) };
+            if (global_func_slots.count(id->uid))
+                throw AlreadyDefinedEx(id->start, id->end);
+            id->sym = ResolvedSym{ SymKind::global, add_global_slot(id->uid) };
         }
     }
 
