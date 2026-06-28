@@ -2042,6 +2042,28 @@ static const std::vector<test> tests =
     { "implicit var: assigning a conflicting type is still an error",
       { "a = 1; a = \"x\";" }, &typeid(TypeMismatchEx) },
 
+    /* Scoped global-table slotting of non-top-level named declarations: a
+     * non-capturing nested/conditional function and a nested struct are
+     * block-scoped global slots (no runtime symbols-map fallback). */
+    { "nested func: visible within its function",
+      { "func f() { func g() { return 7; } return g(); }",
+        "assert(f() == 7);" } },
+    { "nested func: block-scoped, not visible after its block",
+      { "var r = 5; { func g() { return r + 1; } } print(g());" },
+      &typeid(UndefinedVariableEx) },
+    { "nested func: same name in sibling blocks is independent",
+      { "func f() {",
+        "  var a = 0;",
+        "  { func g() { return 1; } a = g(); }",
+        "  { func g() { return 2; } a = a + g(); }",
+        "  return a;",
+        "}",
+        "assert(f() == 3);" } },
+    { "nested struct: constructed at runtime (impure, no fold)",
+      { "var n = 0;",
+        "func f() { struct Q { int y; } n = n + 1; return Q(n).y; }",
+        "assert(f() == 1); assert(f() == 2);" } },
+
     { "var with no initializer: its type is inferred from later assignment",
       { "var a; a = 3; assert(decltype(a).name == \"int?\");" } },
     { "var with no initializer: a conflicting reassignment is a type error",

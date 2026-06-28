@@ -1026,6 +1026,21 @@ private:
         global_names.push_back(uid);
         return slot;
     }
+
+    /*
+     * Append a SCOPED global slot: a non-capturing nested/conditional function
+     * or struct gets a real global-table slot (so its decl binds a slot, not the
+     * map, and a reference is an O(1) read) but is NOT entered into
+     * global_func_slots - so it is reachable ONLY through the lexical scope it is
+     * registered in (block-scoped, C-style). Two same-named nested decls in
+     * different scopes therefore get distinct slots and never collide.
+     */
+    int add_anon_global_slot(const UniqueId *uid)
+    {
+        const int slot = static_cast<int>(global_names.size());
+        global_names.push_back(uid);
+        return slot;
+    }
     /* Names of functions PROVEN effectively-pure so far (in walk order). A call
      * to one is itself pure - so the auto-pure test recognizes a function that
      * calls an earlier auto-pure helper (e.g. f(x,y)=>add(x,y) is pure once add
@@ -1147,6 +1162,48 @@ private:
         check_no_redecl(cur, id);
         cur->scopes.back().decls.push_back(
             { id->uid, -1, SymKind::unresolved, id->decl_type });
+    }
+
+    /*
+     * Hoist the non-capturing named FUNCTION and STRUCT declarations directly in
+     * block `b` into the CURRENT lexical scope as scoped global slots, BEFORE the
+     * block's statements are walked - so a forward / mutually-recursive reference
+     * within the block resolves to the slot. They are block-scoped: registered in
+     * this scope only (popped with the block), so a nested func/struct is not
+     * visible after its block, and same-named decls in sibling scopes get
+     * distinct slots. A CAPTURING named function is skipped (it closes over
+     * locals, so it is not a shared global - it stays the enclosing scope's local
+     * via declare_masking, as before). Top-level decls (already SymKind::global
+     * from hoist_global_funcs) and REPL mode (open-world map) are skipped.
+     */
+    void hoist_scoped_decls(FuncState *cur, Block *b)
+    {
+        if (!cur || !cur->slottable || repl_mode)
+            return;
+
+        for (auto &e : b->elems) {
+            Identifier *id = nullptr;
+
+            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get())) {
+                /* Non-capturing only; a captured-list func is not a shared
+                 * global. Skip a name already hoisted (top-level global). */
+                if (fd->id && fd->id->sym.kind != SymKind::global &&
+                    (!fd->captures || fd->captures->elems.empty()))
+                    id = fd->id.get();
+            } else if (auto *sd = dynamic_cast<StructDeclStmt *>(e.get())) {
+                if (sd->id && sd->id->sym.kind != SymKind::global)
+                    id = sd->id.get();
+            }
+
+            if (!id)
+                continue;
+
+            check_no_redecl(cur, id);   /* a same-block duplicate is an error */
+            const int slot = add_anon_global_slot(id->uid);
+            cur->scopes.back().decls.push_back(
+                { id->uid, slot, SymKind::global, id->decl_type });
+            id->sym = ResolvedSym{ SymKind::global, slot };
+        }
     }
 
     /* Throw AlreadyDefinedEx if `id` is already declared in this scope. */
@@ -1736,6 +1793,12 @@ Resolver::walk(Construct *c, FuncState *cur)
 
         if (track)
             cur->scopes.emplace_back();
+
+        /* Hoist non-capturing nested funcs / structs into THIS scope first, so a
+         * forward / mutual reference within the block resolves to its (block-
+         * scoped) global slot. */
+        if (track)
+            hoist_scoped_decls(cur, b);
 
         for (auto &e : b->elems) {
             walk(e.get(), cur);

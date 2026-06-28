@@ -92,7 +92,8 @@ struct ReplEngine::Impl {
 
     Impl()
         : const_ctx(new EvalContext(nullptr, /*const_ctx=*/true))
-        , runtime_ctx(new EvalContext(nullptr, /*const_ctx=*/false))
+        , runtime_ctx(new EvalContext(nullptr, /*const_ctx=*/false,
+                                      /*func_ctx=*/false, /*repl=*/true))
     {
         /* The prompt lets you redefine a function or struct (the edit-and-
          * resubmit workflow), unlike a script where a duplicate decl is an

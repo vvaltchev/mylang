@@ -146,6 +146,22 @@ public:
     const bool const_ctx;
     const bool func_ctx;
 
+    /* REPL mode (inherited). REPL: names map-resident (live map). SCRIPT: false,
+     * the map must stay EMPTY (everything slotted) - asserted in emplace/lookup. */
+    const bool repl_mode;
+
+    /* True if this context OR any ancestor is a const-eval context. The map may
+     * legitimately be written/read during compile-time folding: AutoConst
+     * evaluates pure functions in throwaway non-const args contexts whose ROOT
+     * is the const cctx, so a struct/func decl inside such a folded body
+     * emplaces into a discarded map. Only a RUNTIME write (no const ancestor)
+     * is the violation the empty-map invariant forbids. */
+    bool in_const_eval() const {
+        for (const EvalContext *c = this; c; c = c->parent)
+            if (c->const_ctx) return true;
+        return false;
+    }
+
     /*
      * Transient: set true by handle_single_expr14 only while evaluating the
      * target of a *plain* assignment (`d[k] = v`), so a dict subscript/member
@@ -205,7 +221,8 @@ public:
 
     EvalContext(EvalContext *parent = nullptr,
                 bool const_ctx = false,
-                bool func_ctx = false);
+                bool func_ctx = false,
+                bool repl = false);
 
     LValue *lookup(const Identifier *id);
     bool erase(const Identifier *id);

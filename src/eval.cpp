@@ -78,19 +78,26 @@ unescape_str(const string_view &v)
 
 /* ------------------ EvalContext ------------------ */
 
-EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
+EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx,
+                         bool repl)
     : parent(parent)
     , const_ctx(const_ctx)
     , func_ctx(func_ctx)
+    , repl_mode(parent ? parent->repl_mode : repl)
     , frame(parent ? parent->frame : nullptr)
     , gfuncs(parent ? parent->gfuncs : nullptr)
     , captures(parent ? parent->captures : nullptr)
     , flow((parent && !func_ctx) ? parent->flow : &flow_state)
 {
+    /* Load builtins into the map ONLY for a context that resolves names through
+     * the map: the const-evaluator (const_builtins) and the REPL (both). A
+     * SCRIPT runtime root loads NOTHING - the resolver slotted every name (incl.
+     * builtins), so its map stays empty (see the emplace/lookup asserts). */
     if (!parent) {
-        symbols.insert(const_builtins.begin(), const_builtins.end());
-
-        if (!const_ctx) {
+        if (const_ctx) {
+            symbols.insert(const_builtins.begin(), const_builtins.end());
+        } else if (repl_mode) {
+            symbols.insert(const_builtins.begin(), const_builtins.end());
             symbols.insert(builtins.begin(), builtins.end());
         }
     }
@@ -98,6 +105,10 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx)
 
 LValue *EvalContext::lookup(const Identifier *id)
 {
+    /* The map is a resolution path ONLY in const-eval and the REPL. In a script
+     * it must be empty (every name slotted), so this is reached only by a
+     * genuinely-undefined name and must find nothing - assert that. */
+    ML_CHECK(in_const_eval() || repl_mode || symbols.empty());
     auto &&it = symbols.find(id->uid);
 
     if (it != symbols.end())
@@ -121,18 +132,23 @@ bool EvalContext::erase(const Identifier *id)
     return true;
 }
 
+/* The map is written only during const-eval (compile-time folding) and in the
+ * REPL; a SCRIPT runtime never falls back to it (every name slotted). */
 void EvalContext::emplace(const Identifier *id, const EvalValue &val, bool is_const)
 {
+    ML_CHECK(in_const_eval() || repl_mode);
     symbols.emplace(id->uid, LValue(val, is_const));
 }
 
 void EvalContext::emplace(const Identifier *id, EvalValue &&val, bool is_const)
 {
+    ML_CHECK(in_const_eval() || repl_mode);
     symbols.emplace(id->uid, LValue(move(val), is_const));
 }
 
 void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_const)
 {
+    ML_CHECK(in_const_eval() || repl_mode);
     symbols.emplace(UniqueId::get(id), LValue(move(val), is_const));
 }
 

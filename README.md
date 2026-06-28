@@ -1142,6 +1142,24 @@ var add = func (x, y) => x + y;
 Note: when creating function objects in expressions, we're not allowed to assign
 them a name.
 
+**Function scope is lexical, like a variable's.** A named function (or struct)
+declared inside a block — an `if`/`for`/`{ }` body, or another function's body —
+is **scoped to that block**: it is visible from its declaration to the end of
+the block (and in nested blocks), but **not after the block ends**. Two
+same-named functions in sibling blocks are therefore independent. Only a
+function declared at the **outermost (program) scope** is visible everywhere
+(and may be forward-/mutually-referenced).
+
+```C#
+{
+    func helper() => 42;
+    print(helper());   # OK: in scope here
+}
+# print(helper());     # ERROR: `helper` is not visible after its block
+```
+
+A `var`-bound lambda (`var f = func(x) => x;`) follows ordinary variable scope.
+
 #### Const parameters
 
 A parameter can be declared `const`, which forbids reassigning it in the body:

@@ -1530,16 +1530,49 @@ sanitizers never reproduced it.)
   visible from any function body, so its name binds its type descriptor in a
   global slot exactly like a function (`StructDeclStmt::do_eval` writes the slot
   when `id->sym.kind == global`), and `P(...)`/`P.CONST` resolve to it — no map.
-  **Scope:** nested/conditionally-declared functions, lambdas, NESTED struct
-  names, and (in the **REPL**, where top-level names must stay redefinable) all
-  top-level names remain map-bound; template-instance clones, inserted before
-  resolve_names, ARE hoisted. **Optimizer-inserted `name$sN` specialization clones**, though
-  created *after* the hoist, are now ALSO given a global slot in SCRIPT mode
-  (the Inliner appends the clone name to the root block's `global_func_names`
-  and stamps the clone decl + the redirected call's callee as `SymKind::global`)
-  — so a specialized call is an O(1) slot read, not a map walk, and the clone's
-  decl binds a slot rather than the map. In the REPL (no global table) a spec
-  clone stays map-resident.
+  **Non-top-level named decls are SCOPED global slots
+  (`hoist_scoped_decls`).** A non-capturing function or struct declared inside a
+  block (nested in a function body, an `if`/`for`/`{ }`) is *effectively global*
+  (it closes over nothing), so it gets a real global-table slot — but via
+  `add_anon_global_slot` (appended to `global_names` for the table size, **NOT**
+  entered into `global_func_slots`) and registered **only in its lexical scope**.
+  So it is **block-scoped** (resolvable just within that block, popped with it)
+  and two same-named nested decls in sibling scopes get **distinct slots** and
+  never collide. The block handler pre-scans and hoists these into the scope
+  *before* walking the block's statements, so a forward/mutual reference within
+  the block resolves. This makes nested functions/structs lexically scoped like
+  variables (a script-visible change: a func in an `if`-block is no longer
+  visible after it — previously only TOP-LEVEL block funcs leaked; function-
+  nested ones already didn't). A **capturing** named func is excluded (it closes
+  over locals, so it is the enclosing scope's local via `declare_masking`, as
+  before). **Known limitation (pre-existing):** mutual recursion between *sibling
+  nested* functions doesn't resolve (each function's body resolves in its own
+  scope stack, which doesn't see the enclosing scope's scoped globals) — it was
+  already broken (a runtime `UndefinedVariableEx`), and stays so.
+  **Scope, still map-bound:** lambdas (anonymous — no name binding; their
+  params/locals ARE slotted) and, in the **REPL** (top-level names stay
+  redefinable), all top-level names; template-instance clones, inserted before
+  resolve_names, ARE hoisted. **Optimizer-inserted `name$sN` specialization
+  clones**, though created *after* the hoist, are ALSO given a global slot in
+  SCRIPT mode (the Inliner appends the clone name to the root block's
+  `global_func_names` and stamps the clone decl + the redirected call's callee as
+  `SymKind::global`) — so a specialized call is an O(1) slot read, not a map
+  walk. In the REPL (no global table) a spec clone stays map-resident.
+- **The script runtime symbols map is EMPTY (asserted).** Once const-evaluation
+  finishes, a SCRIPT (not the REPL) has 100% of its names slotted (locals/
+  globals/captures/builtins/spec clones/structs/nested decls), so the runtime
+  `EvalContext::symbols` map is never a resolution fallback. The script root
+  therefore loads **no** builtins into the map (they are `SymKind::builtin`
+  slots); only a const-eval root (`const_builtins`, for parse-time folding) and
+  the REPL (both, open-world) populate it. `EvalContext::repl_mode` (a new
+  inherited flag, set on the REPL runtime root) distinguishes the REPL. The
+  invariant is enforced: `emplace` asserts `in_const_eval() || repl_mode`, and
+  `lookup` asserts `in_const_eval() || repl_mode || symbols.empty()` —
+  `in_const_eval()` walks the parent chain for a `const_ctx` ancestor, because
+  AutoConst folds pure functions in throwaway non-const args contexts whose ROOT
+  is the const `cctx` (so a struct/func decl inside a folded body legitimately
+  emplaces into a discarded map). A genuinely-undefined name at runtime reaches
+  `lookup` on an empty map → `UndefinedId` → `UndefinedVariableEx`, as before.
 - **Captured variables are slotted (`SymKind::capture`).** A closure's explicit
   `[x,y]` capture list is snapshot into a per-instance `vector<LValue>`
   **`FuncObject::capture_slots`** at closure creation (`func.cpp.h`), in
@@ -1570,11 +1603,12 @@ sanitizers never reproduced it.)
   `types.cpp`: a flat `vector<LValue>` built once from `const_builtins` +
   `builtins`), read by
   `Identifier::do_eval` — an O(1) slot, **no scope-chain map walk for `print`,
-  `len`, `max`, …**. With this, a compiled script's hot path never walks the map
-  for ANY name; the runtime `EvalContext::symbols` map is touched only by the
+  `len`, `max`, …**. With this, a compiled script's runtime `EvalContext::
+  symbols` map is **empty and never a resolution path** (asserted — see *The
+  script runtime symbols map is EMPTY* above): the map is populated only by the
   REPL (open-world redefinition) and the parse-time const-evaluator (which runs
-  before slots exist), and as the fallback for a genuinely-undefined name. **A
-  user symbol always wins** — the resolver checks scopes (local/param/capture)
+  before slots exist). A genuinely-undefined name reaches `lookup` on an empty
+  map and surfaces `UndefinedVariableEx`. **A user symbol always wins** — the resolver checks scopes (local/param/capture)
   then the global table (user functions + escaped vars) BEFORE the builtin
   table, so a `func len(x)` shadow resolves to `SymKind::global` and the builtin
   is unreachable by name (`var <builtin>` for a *const* builtin is still a
