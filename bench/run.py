@@ -16,7 +16,10 @@
 #   python3 bench/run.py --scale 2       # 2x the per-benchmark workload
 #   python3 bench/run.py --repeat 5      # best of 5 runs (default 3)
 #   python3 bench/run.py --filter slice  # only benchmarks whose name matches
+#                                        # (comma-separated for several)
 #   python3 bench/run.py --mylang ./build/mylang
+#   python3 bench/run.py --baseline OLD  # also time a 2nd mylang binary and
+#                                        # report cur/base speedup (before/after)
 #   python3 bench/run.py --csv out.csv   # also write the table as CSV
 #   python3 bench/run.py -s              # also re-dump sorted by ratio (wins
 #                                        # first, regressions last)
@@ -98,11 +101,32 @@ def colorize_ratio(ratio, text):
     return "\x1b[38;5;%dm%s\x1b[0m" % (ratio_xterm_color(ratio), text)
 
 
-def render_row(name, my_s, py_s, ratio_s, status, ratio):
-    """One formatted table line; the ratio field is colored on a TTY. Used for
-    both the streaming run and the --sorted re-dump, so they stay identical."""
-    ratio_field = colorize_ratio(ratio, "%8s" % ratio_s)
-    return "%-24s %10s %10s %s  %s" % (name, my_s, py_s, ratio_field, status)
+def render_row(row, has_base):
+    """One formatted table line; the ratio fields are colored on a TTY. Used for
+    both the streaming run and the --sorted re-dump, so they stay identical.
+
+    A row is (name, base_s, my_s, py_s, speedup_s, ratio_s, status, speedup,
+    ratio); the base(s) / cur-base columns appear only when `has_base`."""
+    (name, base_s, my_s, py_s, speedup_s, ratio_s, status,
+     speedup, ratio) = row
+    out = "%-24s" % name
+    if has_base:
+        # cur/base: <1 means the current binary is FASTER (colored green, the
+        # same good/bad convention as my/py).
+        sp_field = colorize_ratio(speedup, "%8s" % speedup_s)
+        out += " %10s %10s %s" % (base_s, my_s, sp_field)
+    else:
+        out += " %10s" % my_s
+    out += " %10s %s  %s" % (py_s, colorize_ratio(ratio, "%8s" % ratio_s), status)
+    return out
+
+
+def geomean(vals):
+    """Geometric mean of a non-empty list of positive ratios."""
+    prod = 1.0
+    for v in vals:
+        prod *= v
+    return prod ** (1.0 / len(vals))
 
 
 def find_mylang(explicit):
@@ -193,9 +217,13 @@ def main():
     ap.add_argument("--repeat", type=int, default=3,
                     help="runs per benchmark, best time kept (default 3)")
     ap.add_argument("--filter", default="",
-                    help="only run benchmarks whose name contains this substring")
+                    help="only run benchmarks whose name contains this substring "
+                         "(comma-separated to match any of several)")
     ap.add_argument("--mylang", default="",
                     help="path to the mylang binary (default build/mylang)")
+    ap.add_argument("--baseline", default="",
+                    help="a 2nd mylang binary to compare against (before/after); "
+                         "adds base(s) and cur/base (speedup) columns")
     ap.add_argument("--python", default=sys.executable,
                     help="python interpreter to compare against")
     ap.add_argument("--timeout", type=float, default=120.0,
@@ -212,14 +240,23 @@ def main():
     if not mylang:
         sys.exit("error: mylang binary not found; build it (make -j) or pass --mylang")
 
+    has_base = bool(args.baseline)
+    if has_base and not (os.path.isfile(args.baseline)
+                         and os.access(args.baseline, os.X_OK)):
+        sys.exit("error: --baseline '%s' is not an executable file" % args.baseline)
+
     names = sorted(f[:-3] for f in os.listdir(MY_DIR) if f.endswith(".my"))
     if args.filter:
-        names = [n for n in names if args.filter in n]
+        # comma-separated: a name matches if it contains ANY of the substrings.
+        subs = [s for s in args.filter.split(",") if s]
+        names = [n for n in names if any(s in n for s in subs)]
     if not names:
         sys.exit("no benchmarks matched")
 
     scale_arg = str(args.scale)
     print("mylang : %s" % mylang)
+    if has_base:
+        print("baseline: %s" % args.baseline)
     print("python : %s" % args.python)
     print("scale  : %d    repeat (best of): %d\n" % (args.scale, args.repeat))
 
@@ -227,19 +264,30 @@ def main():
     if warn:
         print(warn + "\n")
 
-    hdr = "%-24s %10s %10s %8s  %s" % (
-        "benchmark", "mylang(s)", "python(s)", "my/py", "result")
+    if has_base:
+        hdr = "%-24s %10s %10s %8s %10s %8s  %s" % (
+            "benchmark", "base(s)", "mylang(s)", "cur/base",
+            "python(s)", "my/py", "result")
+    else:
+        hdr = "%-24s %10s %10s %8s  %s" % (
+            "benchmark", "mylang(s)", "python(s)", "my/py", "result")
     print(hdr)
     print("-" * len(hdr))
 
     rows = []
     ratios = []
+    speedups = []
     for name in names:
         my_path = os.path.join(MY_DIR, name + ".my")
         py_path = os.path.join(PY_DIR, name + ".py")
 
         my_t, my_out, my_err = time_cmd(
             [mylang, my_path, scale_arg], args.repeat, args.timeout)
+
+        base_t = None
+        if has_base:
+            base_t, _bout, _berr = time_cmd(
+                [args.baseline, my_path, scale_arg], args.repeat, args.timeout)
 
         if os.path.isfile(py_path):
             # -B: don't read/write __pycache__. MyLang re-parses its source on
@@ -265,6 +313,8 @@ def main():
 
         my_s = "%.3f" % my_t if my_t is not None else "-"
         py_s = "%.3f" % py_t if py_t is not None else "-"
+        base_s = "%.3f" % base_t if base_t is not None else "-"
+
         ratio = None
         if my_t and py_t:
             ratio = my_t / py_t
@@ -273,45 +323,75 @@ def main():
         else:
             ratio_s = "-"
 
+        # cur/base: current time over baseline time. <1 == current is faster.
+        speedup = None
+        speedup_s = "-"
+        if has_base and my_t and base_t:
+            speedup = my_t / base_t
+            speedups.append(speedup)
+            speedup_s = "%.2fx" % speedup
+
         # render_row pads to width before coloring, so the ANSI escapes don't
-        # throw off column alignment. We keep the numeric `ratio` in the row so
-        # --sorted can order by it (CSV still uses only the plain fields).
-        print(render_row(name, my_s, py_s, ratio_s, status, ratio))
-        rows.append((name, my_s, py_s, ratio_s, status, ratio))
+        # throw off column alignment. The numeric ratio/speedup stay in the row
+        # so --sorted can order by them (CSV uses only the plain fields).
+        row = (name, base_s, my_s, py_s, speedup_s, ratio_s, status,
+               speedup, ratio)
+        print(render_row(row, has_base))
+        rows.append(row)
 
     if ratios:
-        prod = 1.0
-        for r in ratios:
-            prod *= r
-        geomean = prod ** (1.0 / len(ratios))
-        gm = colorize_ratio(geomean, "%.2fx" % geomean)
-        if geomean >= 1.0:
-            tail = "MyLang is ~%.1fx slower" % geomean
+        gm_v = geomean(ratios)
+        gm = colorize_ratio(gm_v, "%.2fx" % gm_v)
+        if gm_v >= 1.0:
+            tail = "MyLang is ~%.1fx slower" % gm_v
         else:
-            tail = "MyLang is ~%.1fx faster" % (1.0 / geomean)
+            tail = "MyLang is ~%.1fx faster" % (1.0 / gm_v)
         print("-" * len(hdr))
         print("geomean my/py over %d paired benchmarks: %s (%s)"
               % (len(ratios), gm, tail))
 
+    if speedups:
+        sp_v = geomean(speedups)
+        sp = colorize_ratio(sp_v, "%.2fx" % sp_v)
+        if sp_v < 1.0:
+            tail = "current is ~%.1fx FASTER than baseline" % (1.0 / sp_v)
+        else:
+            tail = "current is ~%.1fx SLOWER than baseline" % sp_v
+        print("geomean cur/base over %d benchmarks: %s (%s)"
+              % (len(speedups), sp, tail))
+
     if args.sorted:
-        # Ascending by ratio: biggest win (smallest ratio) first, worst
-        # regression (largest ratio) last. Rows without a ratio (my-only or a
-        # failed run) have nothing to compare, so they trail at the end.
+        # Ascending: biggest win first, worst regression last. Order by cur/base
+        # when comparing two binaries (most-improved first), else by my/py. Rows
+        # without that ratio (my-only / failed) have nothing to compare -> trail.
+        key_i = 7 if has_base else 8
         ordered = sorted(
-            rows, key=lambda r: (r[5] is None, r[5] if r[5] is not None else 0))
-        print("\nsorted by my/py ratio (biggest win first):")
+            rows, key=lambda r: (r[key_i] is None,
+                                 r[key_i] if r[key_i] is not None else 0))
+        label = "cur/base" if has_base else "my/py"
+        print("\nsorted by %s ratio (biggest win first):" % label)
         print(hdr)
         print("-" * len(hdr))
         for row in ordered:
-            print(render_row(*row))
+            print(render_row(row, has_base))
 
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("benchmark,mylang_s,python_s,my_over_py,status\n")
-            for name, my_s, py_s, ratio_s, status, _ratio in rows:
-                f.write("%s,%s,%s,%s,%s\n" %
-                        (name, my_s, py_s, ratio_s.rstrip("x"),
-                         status.replace(",", ";")))
+            if has_base:
+                f.write("benchmark,base_s,mylang_s,cur_over_base,"
+                        "python_s,my_over_py,status\n")
+                for (name, base_s, my_s, py_s, speedup_s, ratio_s,
+                     status, _sp, _ratio) in rows:
+                    f.write("%s,%s,%s,%s,%s,%s,%s\n" %
+                            (name, base_s, my_s, speedup_s.rstrip("x"), py_s,
+                             ratio_s.rstrip("x"), status.replace(",", ";")))
+            else:
+                f.write("benchmark,mylang_s,python_s,my_over_py,status\n")
+                for (name, _base_s, my_s, py_s, _speedup_s, ratio_s,
+                     status, _sp, _ratio) in rows:
+                    f.write("%s,%s,%s,%s,%s\n" %
+                            (name, my_s, py_s, ratio_s.rstrip("x"),
+                             status.replace(",", ";")))
         print("\nwrote %s" % args.csv)
 
 

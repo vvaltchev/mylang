@@ -54,8 +54,18 @@ unoptimized. Other options:
 ```
 python3 bench/run.py --scale 4        # 4x the per-benchmark workload
 python3 bench/run.py --filter slice   # just the slice benchmarks
+python3 bench/run.py --filter fib,sort  # several (comma-separated)
 python3 bench/run.py --repeat 5 --csv bench/results.csv
+python3 bench/run.py --baseline OLD   # before/after: also time a 2nd mylang
+                                      # binary, report cur/base (speedup)
 ```
+
+`--baseline` is the way to measure whether a change actually helped: build the
+*old* binary (e.g. in a `git worktree` at the parent commit), then run with
+`--mylang NEW --baseline OLD`. The table gains `base(s)` and `cur/base` columns
+(a `cur/base` below 1.00x means the current binary is faster), plus a
+`geomean cur/base` summary line. Combine with `--filter` to focus on the
+benchmarks a change should affect, and `-s` to sort most-improved first.
 
 Every script takes an optional integer **scale** argument (the harness passes
 it through) that multiplies the base workload, so you can dial total runtime up
