@@ -179,7 +179,21 @@ behavior surprises you.
 ```
 ./build/mylang -rt               # run the whole suite (needs a TESTS=1 build)
 ./build/mylang -rt -s            # same, but dump the tree of a failing test
+./build/mylang --weights         # inlining cost-model calibration (any build;
+                                 # use OPT=1 ASSERTS=0 for meaningful numbers)
 ```
+
+**`--weights` — the inlining cost-model calibration** (`run_weight_bench`,
+eval.cpp). Measures the per-node-type eval cost of the tree-walker by building
+the AST nodes **by hand in C++** (never parsed, so no fold/inline/specialize can
+perturb the measured nodes or the loop count) and timing each in a tight C++
+loop; per-node marginal cost is isolated by subtracting child-subtree costs and
+printed relative to a slot read. The **CALL** weight is the reference for the
+planned inliner benefit function (inline a body when the sum of its node weights
+is below the call weight — see `plans/function-inlining.md`). Re-run when the
+interpreter changes; reusable for the eventual bytecode VM (the weights change,
+the benefit function does not). Current (`OPT=1 ASSERTS=0`): id/lit/add/cmp ≈ 1,
+return ≈ 3, if ≈ 7, assign ≈ 11, **CALL ≈ 21** (×id-read).
 
 Tests are **not** a separate framework — they are entries in the `tests` table
 (a `static const std::vector<test>`) in `src/tests.cpp`. Each entry is a tuple:

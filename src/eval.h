@@ -261,6 +261,10 @@ LValue &builtin_slot(int index);
 /* did the builtin come from const_builtins (visible during const-eval)? */
 bool builtin_is_const(int index);
 
+/* Inlining cost-model calibration: measure per-node-type eval cost from
+ * hand-built AST nodes and print the weights. Driven by `--weights`. */
+void run_weight_bench();
+
 
 inline EvalContext *
 get_root_ctx(EvalContext *ctx)

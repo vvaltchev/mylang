@@ -165,6 +165,10 @@ parse_args(int argc, char **argv)
 
             run_tests(opt_show_syntax_tree); exit(0);
 
+        } else if (!strcmp(arg, "--weights")) {
+
+            run_weight_bench(); exit(0);
+
         } else if (!strcmp(arg, "-t")) {
 
             opt_show_tokens = true;

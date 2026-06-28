@@ -8,6 +8,7 @@
 #include "bitops.h"
 
 #include <cmath>
+#include <chrono>
 
 using std::pair;
 using std::vector;
@@ -4006,4 +4007,215 @@ EvalValue ForRangeStmt::do_eval(EvalContext *ctx, bool rec) const
     }
 
     return none;
+}
+
+/* ===================================================================== *
+ *  Inlining cost-model calibration  (`--weights`)
+ *
+ *  Measures the per-node-type eval cost of the tree-walker by evaluating
+ *  HAND-BUILT AST nodes (constructed here in C++, never parsed) in a tight
+ *  C++ loop - so no optimizer pass (fold / inline / specialize) can perturb
+ *  the measured nodes or the iteration count. Per-node "weights" are isolated
+ *  by subtracting child-subtree costs, then dumped relative to a slot read.
+ *  The CALL machinery is the reference: the inliner's benefit function inlines
+ *  a body unconditionally when the sum of its node weights is below the call
+ *  weight. Re-run whenever the interpreter changes (and, later, for the
+ *  bytecode VM - the weights change, the benefit function does not).
+ * ===================================================================== */
+
+static volatile int_type g_wb_sink = 0;
+
+namespace {
+
+using wb_clock = std::chrono::steady_clock;
+
+static unique_ptr<Identifier> wb_id(int slot)
+{
+    auto id = make_unique<Identifier>("x");
+    id->sym = ResolvedSym{ SymKind::local, slot };
+    id->th = TypeHint::i;
+    return id;
+}
+
+static unique_ptr<TypedScalarExpr>
+wb_bin(TypedScalarExpr::Cat cat, Op op,
+       unique_ptr<Construct> a, unique_ptr<Construct> b)
+{
+    auto e = make_unique<TypedScalarExpr>(cat, TypeHint::i);
+    e->th = TypeHint::i;
+    e->elems.emplace_back(Op::invalid, move(a));
+    e->elems.emplace_back(op, move(b));
+    return e;
+}
+
+static unique_ptr<Construct>
+wb_assign(int dst, unique_ptr<Construct> rhs)
+{
+    auto a = make_unique<Expr14>();
+    a->op = Op::assign;
+    a->lvalue = wb_id(dst);
+    a->rvalue = move(rhs);
+    return a;
+}
+
+/* ns/eval via eval_int() (the M8 fast path, used for arithmetic operands). */
+static double wb_time_int(const Construct *n, EvalContext *ctx, long M)
+{
+    double best = 1e18;
+    for (int r = 0; r < 5; r++) {
+        auto t0 = wb_clock::now();
+        int_type acc = 0;
+        for (long i = 0; i < M; i++)
+            acc += n->eval_int(ctx);
+        g_wb_sink += acc;
+        auto t1 = wb_clock::now();
+        double ns =
+            std::chrono::duration<double, std::nano>(t1 - t0).count() / M;
+        if (ns < best) best = ns;
+    }
+    return best;
+}
+
+/* ns/eval via eval() (the statement path, with the Construct::eval wrapper).
+ * Flow is reset each iteration so a return/if measures a clean dispatch. */
+static double wb_time_eval(const Construct *n, EvalContext *ctx, long M)
+{
+    double best = 1e18;
+    for (int r = 0; r < 5; r++) {
+        auto t0 = wb_clock::now();
+        for (long i = 0; i < M; i++) {
+            ctx->flow->type = FlowState::none;
+            n->eval(ctx);
+        }
+        ctx->flow->type = FlowState::none;
+        g_wb_sink += ctx->frame->slots[2].getval<int_type>();
+        auto t1 = wb_clock::now();
+        double ns =
+            std::chrono::duration<double, std::nano>(t1 - t0).count() / M;
+        if (ns < best) best = ns;
+    }
+    return best;
+}
+
+} // namespace
+
+void run_weight_bench()
+{
+    const long M = 20000000;
+
+    /* A clean func-context root with an 8-slot int frame (slots pre-bound). */
+    EvalContext ctx(nullptr, false, true);
+    Frame frame;
+    frame.init(8);
+    ctx.frame = &frame;
+    for (int i = 0; i < 8; i++)
+        frame.slots[i] = LValue(EvalValue(static_cast<int_type>(i + 2)), false);
+
+    /* leaves */
+    auto idn = wb_id(0);
+    double t_id  = wb_time_int(idn.get(), &ctx, M);
+    auto litn = make_unique<LiteralInt>(7);
+    double t_lit = wb_time_int(litn.get(), &ctx, M);
+
+    /* arith / compare (each reads two operands) */
+    auto addn = wb_bin(TypedScalarExpr::Cat::arith, Op::plus, wb_id(0), wb_id(1));
+    double t_add = wb_time_int(addn.get(), &ctx, M);
+    auto cmpn = wb_bin(TypedScalarExpr::Cat::cmp, Op::lt, wb_id(0), wb_id(1));
+    double t_cmp = wb_time_int(cmpn.get(), &ctx, M);
+
+    /* assignment `r = a + b` (statement path) */
+    auto asn = wb_assign(2,
+        wb_bin(TypedScalarExpr::Cat::arith, Op::plus, wb_id(0), wb_id(1)));
+    double t_asn = wb_time_eval(asn.get(), &ctx, M);
+
+    /* return `return a` */
+    auto retn = make_unique<ReturnStmt>();
+    retn->elem = wb_id(0);
+    double t_ret = wb_time_eval(retn.get(), &ctx, M);
+
+    /* if `if (a < b) r = a + b;` */
+    auto iff = make_unique<IfStmt>();
+    iff->condExpr = wb_bin(TypedScalarExpr::Cat::cmp, Op::lt, wb_id(0), wb_id(1));
+    {
+        auto thn = make_unique<Block>();
+        thn->elems.push_back(wb_assign(2,
+            wb_bin(TypedScalarExpr::Cat::arith, Op::plus, wb_id(0), wb_id(1))));
+        iff->thenBlock = move(thn);
+    }
+    double t_if = wb_time_eval(iff.get(), &ctx, M);
+
+    /* CALL `func bench(a, b) { return a + b; }` invoked f(s0, s1) */
+    auto fd = make_unique<FuncDeclStmt>();
+    fd->id = make_unique<Identifier>("bench");
+    fd->params = make_unique<IdList>();
+    fd->params->elems.push_back(make_unique<Identifier>("a"));
+    fd->params->elems.push_back(make_unique<Identifier>("b"));
+    {
+        auto body = make_unique<Block>();
+        auto r = make_unique<ReturnStmt>();
+        r->elem = wb_bin(TypedScalarExpr::Cat::arith, Op::plus,
+                         wb_id(0), wb_id(1));
+        body->elems.push_back(move(r));
+        fd->body = move(body);
+    }
+    fd->resolved = true;
+    fd->frame_size = 2;
+    FuncObject fobj(fd.get(), &ctx);
+    std::vector<unique_ptr<Construct>> cargs;
+    cargs.push_back(wb_id(0));
+    cargs.push_back(wb_id(1));
+    double t_call = 1e18;
+    for (int r = 0; r < 5; r++) {
+        auto t0 = wb_clock::now();
+        int_type acc = 0;
+        for (long i = 0; i < M; i++)
+            acc += do_func_call(&ctx, fobj, cargs).get<int_type>();
+        g_wb_sink += acc;
+        auto t1 = wb_clock::now();
+        double ns =
+            std::chrono::duration<double, std::nano>(t1 - t0).count() / M;
+        if (ns < t_call) t_call = ns;
+    }
+
+    /* --- isolate marginal per-node costs (subtract child-subtree totals) --- */
+    const double w_id   = t_id;
+    const double w_lit  = t_lit;
+    const double w_add  = t_add - 2 * t_id;          /* the + op only        */
+    const double w_cmp  = t_cmp - 2 * t_id;          /* the < op only        */
+    const double w_asn  = t_asn - t_add;             /* assign + slot write  */
+    const double w_ret  = t_ret - t_id;              /* return dispatch      */
+    const double w_if   = t_if  - t_cmp - t_asn;     /* if dispatch          */
+    /* call machinery = total - args(2 ids) - body(return + add total). The
+     * args are the caller's (substituted away by inlining), so they are not
+     * part of the machinery the inline saves. */
+    const double body   = w_ret + t_add;             /* `return a+b` body    */
+    const double w_call = t_call - 2 * t_id - body;  /* the call overhead    */
+
+    auto rel = [&](double w) { return w / w_id; };
+    printf("\nInlining cost-model weights (ns/eval, best of 5, %ldM iters)\n",
+           M / 1000000);
+    printf("  built from hand-constructed AST nodes (optimizer-immune)\n\n");
+    printf("  %-22s %8s %8s\n", "node", "ns", "xId");
+    printf("  ------------------------------------------\n");
+    printf("  %-22s %8.2f %8.1f\n", "id (slot read)",  w_id,  rel(w_id));
+    printf("  %-22s %8.2f %8.1f\n", "literal",          w_lit, rel(w_lit));
+    printf("  %-22s %8.2f %8.1f\n", "arith op (+)",     w_add, rel(w_add));
+    printf("  %-22s %8.2f %8.1f\n", "compare (<)",      w_cmp, rel(w_cmp));
+    printf("  %-22s %8.2f %8.1f\n", "assignment",       w_asn, rel(w_asn));
+    printf("  %-22s %8.2f %8.1f\n", "return",           w_ret, rel(w_ret));
+    printf("  %-22s %8.2f %8.1f\n", "if",               w_if,  rel(w_if));
+    printf("  %-22s %8.2f %8.1f  <- threshold\n",
+           "CALL (2-param)",  w_call, rel(w_call));
+    printf("\n  benefit function: inline a body when the sum of its node\n");
+    printf("  weights is below the CALL weight (%.1f xId).\n", rel(w_call));
+    printf("\n  suggested integer weights (xId, rounded):\n");
+    printf("    id=%d lit=%d add=%d cmp=%d assign=%d return=%d if=%d CALL=%d\n",
+           1,
+           std::max(1, (int)(rel(w_lit)  + 0.5)),
+           std::max(1, (int)(rel(w_add)  + 0.5)),
+           std::max(1, (int)(rel(w_cmp)  + 0.5)),
+           std::max(1, (int)(rel(w_asn)  + 0.5)),
+           std::max(1, (int)(rel(w_ret)  + 0.5)),
+           std::max(1, (int)(rel(w_if)   + 0.5)),
+           std::max(1, (int)(rel(w_call) + 0.5)));
 }

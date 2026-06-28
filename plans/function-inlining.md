@@ -383,11 +383,38 @@ Not yet done; roughly in priority order:
    **The benefit function (size-tiered "decide"), keyed on original body size O
    (weighted; a surviving loop weighs heavily and *disqualifies* a call-overhead-
    only inline — the loop dominates):**
-   - **Tier 1 — small (`O <= INLINE_SMALL`, ~16-24 weighted):** inline
-     **unconditionally**, no fold required, subject only to `inline_budget` +
-     `MAX_INLINE_DEPTH`. Node count may **grow** (recursion unroll, multi-use
-     args) — accepted, because the benefit is the dropped call count, not a
-     smaller tree. (fib.)
+   - **Tier 1 — small (body weight `< CALL_WEIGHT`):** inline **unconditionally**,
+     no fold required, subject only to `inline_budget` + `MAX_INLINE_DEPTH`. The
+     body's raw node count may **grow** (recursion unroll, multi-use args) —
+     accepted, the benefit is the dropped call count, not a smaller tree. (fib.)
+
+     **Cost model (measured, not guessed) — a per-node-type weight table.** A
+     flat node count is wrong: fib's body is dominated by its two *calls*, which
+     are ~20x an arith op. So weigh each node by its measured eval cost. The
+     **`--weights`** mode (`run_weight_bench`, eval.cpp) builds the AST nodes by
+     hand in C++ (never parsed, so no fold/inline/specialize can perturb them or
+     the loop count) and times each in a tight C++ loop, isolating per-node
+     marginal cost by subtracting child-subtree costs. **Re-runnable** as the
+     interpreter changes — and reusable for the bytecode VM (the weights change,
+     the benefit function does not). Measured on the `OPT=1 ASSERTS=0` build
+     (ns/eval relative to a slot read = 1):
+
+     | node | xId | node | xId |
+     |---|---|---|---|
+     | id (slot read) | 1 | return | 3 |
+     | literal | 1 | if | 7 |
+     | arith op (+) | 1 | assignment | 11 |
+     | compare (<) | 1 | **CALL (2-param)** | **~21** |
+
+     (assign/if are heavy because a *statement* pays the `Construct::eval`
+     wrapper; a CALL is ~21x — the reference.) **Benefit function:** sum the
+     body's per-node weights; **inline when the sum `< CALL_WEIGHT` (~21).** Then
+     a body of a couple of cheap statements always inlines, but a body
+     containing a call (≥21 by itself) does not — except via Tier-2 fold or the
+     recursion path. Hard-code these weights into a small table in the inliner
+     (id=1, lit=1, add=1, cmp=1, return=3, if=7, assign=11, call=21);
+     re-derive with `--weights` when the interpreter changes. Calibrated to 2
+     params (more params raise the call cost, so the threshold is conservative).
    - **Tier 2 — medium (`INLINE_SMALL < O <= ATTEMPT_MAX`, ~150-200):**
      **speculate** — clone, bind propagatable const/auto-const args, fold + DCE,
      measure folded size `S` and benefit `B = O - S`. Inline if `S <=
@@ -419,12 +446,13 @@ Not yet done; roughly in priority order:
 
 ## Open questions
 
-- Exact default thresholds (need `bench/` data): `INLINE_SMALL` (Tier-1 splice
-  cap, ~16-24), `ATTEMPT_MAX` (Tier-3 don't-attempt cap, ~150-200), the recursion
-  depth cap, and `inline_budget`. The existing body-size cap is tunable at
-  runtime via `-it N` (default 24); add knobs for the new tiers so they're as
-  easy to sweep. Tune with `ASSERTS=0` release builds + `run.py --baseline` +
-  callgrind (see `bench/README.md`).
+- The Tier-1 threshold is `CALL_WEIGHT` from the measured weight table
+  (`--weights`, ~21 xId), re-derivable as the interpreter changes. Still need
+  `bench/` data for: `ATTEMPT_MAX` (Tier-3 don't-attempt cap), the recursion
+  depth cap, and `inline_budget`. The existing body-size cap is tunable via
+  `-it N` (default 24); add knobs for the new tiers so they're easy to sweep.
+  Tune with `ASSERTS=0` release builds + `run.py --baseline` + callgrind (see
+  `bench/README.md`).
 - Whether `InlineCtx` lives as a node field or a side table (closure body-clone
   argues for a field).
 - How `-s` should annotate inlined regions (cheap, useful — like the const-fold
