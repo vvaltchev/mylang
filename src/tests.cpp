@@ -2879,9 +2879,26 @@ static const std::vector<test> tests =
       { "func imp(x) { print(x); return x; }",
         "func u(x) => imp(x) + 1;",
         "assert(ispure(imp) == false && ispure(u) == false);" } },
-    { "auto-pure: a self-recursive function stays conservative (not pure)",
+    /* A self-recursive function IS auto-pure when its body is otherwise pure: a
+     * recursive call to a pure function is pure (sound by induction). The
+     * purity flag drives CSE during inlining/unrolling; the recursion is NOT
+     * eagerly const-folded (no compile-time blowup) - see func_is_self_recursive
+     * + register_pure_funcs. Mutual recursion stays conservative. */
+    { "auto-pure: a self-recursive pure function is pure",
       { "func fac(n) { if (n < 2) { return 1; } return n * fac(n - 1); }",
-        "assert(ispure(fac) == false);" } },
+        "assert(ispure(fac) == true);" } },
+    { "auto-pure: a self-recursive IMPURE function (prints) is not pure",
+      { "func f(n) { if (n < 1) { print(n); return 0; } return f(n - 1); }",
+        "assert(ispure(f) == false);" } },
+    { "auto-pure: mutual recursion stays conservative (not pure)",
+      { "func ev(n) { if (n == 0) return true; return od(n - 1); }",
+        "func od(n) { if (n == 0) return false; return ev(n - 1); }",
+        "assert(ispure(ev) == false);" } },
+    /* (The "a const-arg recursion must NOT be const-folded at compile time"
+     * safety can't be a check() test - check() runs the code, so a large
+     * fib(N) would execute at runtime. It is verified manually with `-nr`:
+     * `mylang -nr -e 'func fib(n){...} var c=fib(45);'` returns instantly,
+     * proving AutoConst did not evaluate the recursion.) */
     /* a pure call inside an EXPRESSION-bodied function folds (the body is a
      * bare expression, which AutoConst used to skip) */
     { "auto-const: a pure call in an expression-bodied function folds",

@@ -380,6 +380,21 @@ Not yet done; roughly in priority order:
    folds to literals, so the recursion bottoms out at compile time
    (`fib(5) -> 5`). Termination is the existing depth cap + budget.
 
+   **CSE of duplicate pure calls in the unrolled body (key to making it pay).**
+   Unrolling `fib` k levels duplicates subtrees — `fib(n-3)` appears twice at
+   depth 2, and the duplication compounds. If `fib` is **pure**, each distinct
+   `fib(arg)` is computed once and reused (`fib(n-3) + fib(n-3)` -> `2 * t`,
+   `t = fib(n-3)`), which collapses the exponential unroll into something
+   sharable and lets us unroll deeper within budget. This needs `fib` recognized
+   pure. **DONE (prerequisite):** a self-recursive function is now auto-pure when
+   its body is otherwise pure (`process_function`'s optimistic self-add), and
+   such a function is excluded from AutoConst's eager const-fold
+   (`func_is_self_recursive`) so a const-arg recursion never runs at compile time
+   (`fib(40)` won't hang) — it folds only via this bounded unroll. **Remaining:**
+   the CSE pass over the spliced/unrolled body (dedupe identical pure-call
+   subexpressions into a temp), reusing the `cse_key` canonicalization from the
+   parse-time CSE work.
+
    **The benefit function (size-tiered "decide"), keyed on original body size O
    (weighted; a surviving loop weighs heavily and *disqualifies* a call-overhead-
    only inline — the loop dominates):**

@@ -191,6 +191,49 @@ static bool produces_bool(const Construct *c)
     return false;
 }
 
+/* True if `uid` is referenced anywhere in the subtree. A COMPLETE traversal
+ * (handles the containers for_each_child stops at), so a self-call buried in a
+ * block body is found. Used to detect a (self-)recursive function. */
+static bool refs_uid(const Construct *c, const UniqueId *uid)
+{
+    if (!c)
+        return false;
+    if (auto *id = dynamic_cast<const Identifier *>(c))
+        return id->uid == uid;
+    if (auto *b = dynamic_cast<const Block *>(c)) {
+        for (auto &e : b->elems)
+            if (refs_uid(e.get(), uid)) return true;
+        return false;
+    }
+    if (auto *f = dynamic_cast<const ForStmt *>(c))
+        return refs_uid(f->init.get(), uid) || refs_uid(f->cond.get(), uid)
+            || refs_uid(f->inc.get(), uid) || refs_uid(f->body.get(), uid);
+    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+        return refs_uid(fe->container.get(), uid) || refs_uid(fe->body.get(), uid);
+    if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+        if (refs_uid(tc->tryBody.get(), uid)) return true;
+        for (auto &p : tc->catchStmts)
+            if (refs_uid(p.second.get(), uid)) return true;
+        return refs_uid(tc->finallyBody.get(), uid);
+    }
+    if (auto *e = dynamic_cast<const Expr14 *>(c))
+        return refs_uid(e->lvalue.get(), uid) || refs_uid(e->rvalue.get(), uid);
+    bool found = false;
+    for_each_child(const_cast<Construct *>(c),
+        [&](Construct *ch) { if (refs_uid(ch, uid)) found = true; });
+    return found;
+}
+
+/* A (self-)recursive function: its body references its own name. Such a func
+ * may be auto-pure (a recursive call to a pure function is pure), but it must
+ * NOT be eagerly const-folded - evaluating `fib(40)` at compile time would hang.
+ * A const-arg recursion instead folds only through the depth/budget-bounded
+ * inliner unroll. Mutual recursion is not detected here (stays conservative). */
+static bool func_is_self_recursive(const FuncDeclStmt *fd)
+{
+    return fd->id && fd->body && refs_uid(fd->body.get(), fd->id->uid);
+}
+
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
@@ -216,7 +259,12 @@ public:
             for (const auto &kv : syms) {
                 const EvalValue &v = kv.second->get();
                 if (v.is<intrusive_ptr<FuncObject>>() &&
-                    v.get<intrusive_ptr<FuncObject>>()->func->effective_pure) {
+                    v.get<intrusive_ptr<FuncObject>>()->func->effective_pure &&
+                    /* a recursive pure func stays unfolded - don't run it at
+                     * compile time (it could be fib(40)); see func_is_self_
+                     * recursive. Its purity is still used for inlining/CSE. */
+                    !func_is_self_recursive(
+                        v.get<intrusive_ptr<FuncObject>>()->func)) {
                     try {
                         cctx.emplace(kv.first->val, EvalValue(v), true);
                     } catch (const Exception &) { /* dup: skip */ }
@@ -340,7 +388,12 @@ private:
             return;
 
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
-            if (fd->effective_pure && fd->id) {
+            /* Register a pure func into the fold context so its const-arg calls
+             * fold - EXCEPT a recursive one: evaluating it at compile time
+             * (fib(40)) could hang. A recursive pure func keeps its purity flag
+             * (for inlining/CSE) but its const-arg recursion folds only via the
+             * depth/budget-bounded unroll. */
+            if (fd->effective_pure && fd->id && !func_is_self_recursive(fd)) {
                 try {
                     fd->eval(&cctx);
                 } catch (const Exception &) {
@@ -1697,12 +1750,30 @@ Resolver::process_function(FuncDeclStmt *fd)
      * const-arg calls can fold (in the auto-const pass). */
     else if (!fd->effective_pure
             && (!fd->captures || fd->captures->elems.empty())
-            && fd->body
-            && func_body_is_pure(fd->body.get(), pure_func_names)) {
-        fd->effective_pure = true;
-        if (fd->id)
-            TRACE(autopure, 0, std::string(fd->id->get_str()) +
-                  "  reads only consts/params -> effective pure");
+            && fd->body) {
+        /*
+         * Optimistic self-recursion: assume `fd` is pure while checking its own
+         * body, so a recursive self-call counts as a call to a pure function.
+         * Sound by induction - a recursive call to a pure function is pure, so
+         * if the body is otherwise pure under that assumption, fd really is pure
+         * (the only new free name it then has is itself). Mutual recursion is
+         * not handled (g isn't in pure_func_names when f is decided). Undo the
+         * optimistic add if the body turns out impure. (A recursive pure func is
+         * NOT eagerly const-folded - see register_pure_funcs / the ctor guard.)
+         */
+        bool added_self = false;
+        if (fd->id && !pure_func_names.count(fd->id->uid)) {
+            pure_func_names.insert(fd->id->uid);
+            added_self = true;
+        }
+        if (func_body_is_pure(fd->body.get(), pure_func_names)) {
+            fd->effective_pure = true;
+            if (fd->id)
+                TRACE(autopure, 0, std::string(fd->id->get_str()) +
+                      "  reads only consts/params -> effective pure");
+        } else if (added_self) {
+            pure_func_names.erase(fd->id->uid);
+        }
     }
 
     /* record any proven-pure function (auto OR explicit) so a LATER function

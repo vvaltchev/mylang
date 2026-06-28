@@ -696,9 +696,19 @@ walk order as `process_function` decides each), it nests no function, **and it
 does not mutate a reference parameter** (`func_mutates_input`, above). So a
 function that calls an *earlier* auto-pure helper is itself recognized pure —
 `func f(x,y)=>add(x,y)` is pure once `add` is, so `f(1,2)` const-folds (the
-whole pure chain folds at compile time, like `-O3`). Still conservative:
-self-recursion and a call to a not-yet-decided (forward-referenced or
-mutually-recursive) func stay impure. **Cross-input** (REPL): `resolve_names`'s
+whole pure chain folds at compile time, like `-O3`). **A SELF-recursive function
+is auto-pure** when its body is otherwise pure: `process_function` optimistically
+adds the function's own name to `pure_func_names` before checking its body, so a
+recursive self-call counts as a call to a pure function (sound by induction — a
+recursive call to a pure function is pure), undoing the add if the body turns out
+impure. This is the purity the inliner needs to CSE duplicate calls when
+unrolling a recursive body (`fib(n-3)` appears twice → compute once). **But a
+recursive pure func is NOT eagerly const-folded** (`func_is_self_recursive`
+excludes it from AutoConst's fold context — `register_pure_funcs` + the ctor's
+`prior_pure` loop): evaluating `fib(40)` at compile time would hang. A const-arg
+recursion folds only through the depth/budget-bounded inliner unroll. Still
+conservative: a call to a *not-yet-decided* func (forward-referenced or
+**mutually**-recursive) stays impure. **Cross-input** (REPL): `resolve_names`'s
 `prior_pure` arg (the persistent runtime scope) seeds both `pure_func_names`
 (so a new input's `f` calling an earlier-input `add` is recognized pure) and
 `AutoConst`'s fold context with the earlier inputs' effectively-pure FuncObjects
