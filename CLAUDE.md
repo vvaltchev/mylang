@@ -914,15 +914,23 @@ which excludes a nested call) is substituted directly and re-evaluated at each
 param use (sound: a pure body can't change the arg's value). The recursion
 unroll therefore produces **nested ternaries** (fib →
 `(n-1<2 ? n-1 : fib(..)+fib(..)) + (n-2<2 ? n-2 : ..)`), and the frontier
-self-calls in the ternary branches still hit the per-frame cache. A body that is
-NOT a temp-free guard chain (locals, a loop, a non-substitutable/side-effecting
-arg → an arg temp) keeps the `InlinedCallExpr` form (statement-hoisting those is
-a deferred follow-up). For this, `for_each_child_slot` gained `TernaryExpr` /
-`CoalesceExpr` cases — previously absent, so a call inside a `? :` was never
-inlined or devirtualized (a latent missed-optimization, now fixed). coderender
-no longer prints a per-node `inlined` marker (a ternary is self-evidently real
-code; the flood made a deep unroll unreadable) — only the `InlinedCallExpr` case
-emits one.
+self-calls in the ternary branches still hit the per-frame cache. **A body with
+write-once LOCALS** is first run through **`collapse_locals`** (copy propagation):
+a `var t = <cheap side-effect-free expr>` whose slot is written once is
+substituted into its uses and the decl dropped, so `{ var t=a*a; return t; }`
+collapses to `{ return a*a; }` → a temp-free guard chain → a ternary/expression
+(`uc(x)` → `x*x+1`). Sound — a write-once local with a side-effect-free rvalue is
+just a name for that expression (re-evaluating a cheap rvalue is exact). With
+this, the small bodies that used to inline as a non-expressible
+`InlinedCallExpr(Block(...))` now inline as **expressible** code; the
+`InlinedCallExpr` form survives only for a residual that can't collapse (a
+reassigned / expensive / side-effecting local), which is almost always already
+over the block-inline weight gate (so not inlined at all). For this,
+`for_each_child_slot` gained `TernaryExpr` / `CoalesceExpr` cases — previously
+absent, so a call inside a `? :` was never inlined or devirtualized (a latent
+missed-optimization, now fixed). coderender no longer prints a per-node `inlined`
+marker (a ternary is self-evidently real code; the flood made a deep unroll
+unreadable) — only the `InlinedCallExpr` case emits one.
 
 **Int-algebra fold (`fold_int_arith`, run once after the inline fixpoint).** The
 substitution produces nested arithmetic — `fib(((n-1)-1)-1)`. A bottom-up pass

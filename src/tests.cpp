@@ -2973,6 +2973,13 @@ static const std::vector<test> tests =
     { "v3 recursion: a non-negative-base recursion folds negatives safely",
       { "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
         "assert(fib(7) == 13);" } },
+    /* A non-guard block body (a write-once local) inlines correctly: the local
+     * is copy-propagated away, so the body collapses to an expression. */
+    { "inline: a body with a local inlines correctly",
+      { "func lc(int a) { var t = a * a; return t; }",
+        "func uc(int x) { return lc(x) + 1; }",
+        "assert(uc(5) == 26);",
+        "assert(uc(0) == 1);" } },
     /* A pure recursive function returning a CONTAINER is NOT cached (the scalar
      * gate): two equal calls give INDEPENDENT arrays, so mutating one must not
      * affect the other. (If the cache wrongly cached the array, they'd alias.) */
@@ -10167,7 +10174,12 @@ static bool inline_unroll_shape()
         "  var p=n*2; var q=p+1; var r=q*3; var s=r-n; var t=s+p;"
         "  var u=t*2; var v=u-1;"
         "  return big(n-1)+big(n-2)+p+q+r+s+t+u+v; }",
-        "var a = fib(10); var b = tri(10); var c = big(10);",
+        /* a non-guard body (a write-once local): collapse_locals copy-propagates
+         * the local away so it inlines as an EXPRESSIBLE expression, not a
+         * non-expressible InlinedCall. */
+        "func lc(int a) { var t = a * a; return t; }",
+        "func uc(int x) { return lc(x) + 1; }",
+        "var a = fib(10); var b = tri(10); var c = big(10); var d = uc(3);",
     };
     std::vector<Tok> toks;
     for (size_t i = 0; i < sizeof(src) / sizeof(src[0]); i++)
@@ -10199,6 +10211,17 @@ static bool inline_unroll_shape()
     ok = ok && ternary_count("fib") == 6;   /* 2 balanced levels: 2 + 4 */
     ok = ok && ternary_count("tri") == 3;   /* 1 level, ALL 3 branches (balance) */
     ok = ok && ternary_count("big") == 0;   /* over budget -> not unrolled */
+
+    /* uc's body inlines lc as an EXPRESSIBLE expression: the local collapses
+     * (uc reads `x * x + 1`) and there is NO non-expressible InlinedCall. */
+    const FuncDeclStmt *uc = find_top_func(root.get(), "uc");
+    if (uc) {
+        const std::string su = render_func_code(uc);
+        ok = ok && su.find("x * x") != std::string::npos;
+        std::ostringstream os;
+        os << *uc;
+        ok = ok && os.str().find("InlinedCall") == std::string::npos;
+    }
 
     /* int-algebra fold: the substituted arithmetic is combined - the depth-2
      * frontier reads fib(n - 3)/fib(n - 4), NOT fib(((n-1)-1)-1). Sound because

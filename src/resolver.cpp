@@ -2484,6 +2484,107 @@ private:
         return acc;
     }
 
+    /* A write to a resolved LOCAL slot (assignment LHS or ++/--). */
+    static int count_slot_writes(Construct *c, int slot)
+    {
+        if (!c)
+            return 0;
+        int n = 0;
+        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+            if (auto *id = dynamic_cast<Identifier *>(e14->lvalue.get()))
+                if (id->sym.kind == SymKind::local && id->sym.slot == slot)
+                    n++;
+        } else if (auto *inc = dynamic_cast<IncDecExpr *>(c)) {
+            if (auto *id = dynamic_cast<Identifier *>(inc->lvalue.get()))
+                if (id->sym.kind == SymKind::local && id->sym.slot == slot)
+                    n++;
+        }
+        for_each_child_slot(c,
+            [&](unique_ptr<Construct> &ch) { n += count_slot_writes(ch.get(),
+                                                                    slot); });
+        return n;
+    }
+
+    /* Replace every READ of local `slot` with a clone of `repl` (keeping the
+     * read's type hint + loc). Used after the slot's sole writer (its decl) has
+     * been removed, so there are no write targets left to wrongly rewrite. */
+    static void subst_local_reads(unique_ptr<Construct> &ref, int slot,
+                                  const Construct *repl)
+    {
+        if (!ref)
+            return;
+        if (auto *id = dynamic_cast<Identifier *>(ref.get())) {
+            if (id->sym.kind == SymKind::local && id->sym.slot == slot) {
+                auto r = repl->clone();
+                r->th = ref->th;
+                r->start = ref->start;
+                r->end = ref->end;
+                ref = move(r);
+            }
+            return;
+        }
+        for_each_child_slot(ref.get(),
+            [&](unique_ptr<Construct> &ch) { subst_local_reads(ch, slot,
+                                                               repl); });
+    }
+
+    /* True if evaluating `c` could have a side effect (a call, an inlined body,
+     * an assignment, or ++/--) - so it is NOT safe to re-evaluate. */
+    static bool expr_has_side_effect(Construct *c)
+    {
+        if (!c)
+            return false;
+        if (dynamic_cast<CallExpr *>(c) || dynamic_cast<InlinedCallExpr *>(c)
+                || dynamic_cast<IncDecExpr *>(c) || dynamic_cast<Expr14 *>(c))
+            return true;
+        bool se = false;
+        for_each_child_slot(c,
+            [&](unique_ptr<Construct> &ch) {
+                if (expr_has_side_effect(ch.get())) se = true; });
+        return se;
+    }
+
+    /* Copy-propagate a block's WRITE-ONCE, cheap, side-effect-free locals into
+     * their uses (`var t = expr; ...t...` -> `...expr...`), then drop the decl.
+     * This collapses a simple non-guard block body - the only thing that still
+     * inlines as a non-expressible `InlinedCall(Block(...))` - into a guard chain
+     * / single return that guard_to_ternary turns into EXPRESSIBLE code. Sound:
+     * a write-once local whose rvalue is side-effect-free is just a name for that
+     * expression, so substituting (and re-evaluating, for a cheap rvalue) is
+     * exact. A reassigned / expensive / side-effecting local is left in place
+     * (the body then stays an InlinedCall - rare, and still correct). */
+    void collapse_locals(Block *body)
+    {
+        if (!body)
+            return;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t i = 0; i < body->elems.size(); i++) {
+                auto *e14 = dynamic_cast<Expr14 *>(body->elems[i].get());
+                if (!e14 || !(e14->fl & pFlags::pInDecl)
+                        || e14->op != Op::assign || !e14->rvalue)
+                    continue;
+                auto *lv = dynamic_cast<Identifier *>(e14->lvalue.get());
+                if (!lv || lv->sym.kind != SymKind::local)
+                    continue;
+                if (body_weight(e14->rvalue.get()) > ARG_SUBST_MAX
+                        || expr_has_side_effect(e14->rvalue.get()))
+                    continue;
+                const int slot = lv->sym.slot;
+                if (count_slot_writes(body, slot) != 1)   /* not write-once */
+                    continue;
+                unique_ptr<Construct> rv = move(e14->rvalue);
+                body->elems.erase(body->elems.begin() +
+                                  static_cast<long>(i));
+                for (size_t j = i; j < body->elems.size(); j++)
+                    subst_local_reads(body->elems[j], slot, rv.get());
+                changed = true;
+                break;          /* indices shifted; restart the scan */
+            }
+        }
+    }
+
     /* True if every operator in the +/- chain is + or -. */
     static bool is_addsub_chain(const MultiOpConstruct *mo)
     {
@@ -3168,6 +3269,10 @@ private:
          * / a loop is not yet expression-convertible). */
         unique_ptr<Construct> spliced;
         if (ntemps == 0) {
+            /* copy-propagate write-once cheap locals so a simple body collapses
+             * to a guard chain / single return -> an expressible ternary instead
+             * of a non-expressible InlinedCall */
+            collapse_locals(blk);
             if (auto tern = guard_to_ternary(blk)) {
                 ce->copy_base_fields(*tern);   /* loc + th of the call site */
                 tag_inline(tern.get(), ic);
