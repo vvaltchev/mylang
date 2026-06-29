@@ -10187,6 +10187,18 @@ static bool inline_unroll_shape()
     ok = ok && ternary_count("fib") == 6;   /* 2 balanced levels: 2 + 4 */
     ok = ok && ternary_count("tri") == 3;   /* 1 level, ALL 3 branches (balance) */
     ok = ok && ternary_count("big") == 0;   /* over budget -> not unrolled */
+
+    /* int-algebra fold: the substituted arithmetic is combined - the depth-2
+     * frontier reads fib(n - 3)/fib(n - 4), NOT fib(((n-1)-1)-1). Sound because
+     * fib(int) is int-typed (wraparound is associative); a float chain would not
+     * fold. */
+    const FuncDeclStmt *ff = find_top_func(root.get(), "fib");
+    if (ff) {
+        const std::string sf = render_func_code(ff);
+        ok = ok && sf.find("fib(n - 3)") != std::string::npos;
+        ok = ok && sf.find("fib(n - 4)") != std::string::npos;
+        ok = ok && sf.find("- 1) - 1") == std::string::npos;  /* not unfolded */
+    }
     return ok;
 }
 

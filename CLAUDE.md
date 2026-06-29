@@ -922,9 +922,24 @@ a deferred follow-up). For this, `for_each_child_slot` gained `TernaryExpr` /
 inlined or devirtualized (a latent missed-optimization, now fixed). coderender
 no longer prints a per-node `inlined` marker (a ternary is self-evidently real
 code; the flood made a deep unroll unreadable) — only the `InlinedCallExpr` case
-emits one. **Still not folded:** the arithmetic stays as written
-(`fib(((n-1)-1)-1)`, not `fib(n-3)`) — `n-1-1`→`n-2` is the deferred int-algebra
-pass.
+emits one.
+
+**Int-algebra fold (`fold_int_arith`, run once after the inline fixpoint).** The
+substitution produces nested arithmetic — `fib(((n-1)-1)-1)`. A bottom-up pass
+combines the constant literals in an **int-typed** `+`/`-` chain into one term:
+`(n-1)-1`→`n-2`, so the depth-2 frontier reads **`fib(n-3)`/`fib(n-4)`**. It
+flattens a nested `+`/`-` base, sums the literal operands, and rebuilds
+`base ± K` (dropping the chain entirely if the constants cancel). **SOUND for int
+ONLY** — wraparound is associative mod 2⁶⁴, so regrouping `+`/`-` is exact under
+`-fwrapv` — hence **gated on `th == i`**: a float chain (non-associative
+rounding) or a string `+` (concatenation) is never touched. This is the
+type-narrowed slice of the long-deferred "algebraic simplification" pass, now
+safe because inference proved the type. **Caveat:** an UNTYPED template base
+(`func fib(n)`) has no `th`, so its body stays literal (`fib(((n-1)-1)-1)`) — its
+arithmetic CAN'T be folded soundly (a future instance might be float); a concrete
+/ `int`-annotated function (or any int instance) folds. The base-case guards are
+never dropped (`(n-1<2 ? ... )` stays — a flat "4 calls" is unsound for a
+variable `n`).
 
 **Recursion unroll + per-frame pure-call cache (the fib win).** A pure,
 TREE-recursive function (≥2 self-calls, `func_is_cacheable_recursive`) is

@@ -2366,6 +2366,13 @@ public:
                 std::make_move_iterator(new_funcs.end()));
             new_funcs.clear();
         }
+
+        /* Simplify the int +/- chains the unroll/substitution created
+         * ((n-1)-1 -> n-2), over the WHOLE tree incl. the just-registered
+         * clones, so `:show fib` reads `fib(n-3)` not `fib(((n-1)-1)-1)`. Run
+         * after the inline fixpoint (all levels spliced). */
+        for (auto &e : root->elems)
+            fold_int_arith(e);
     }
 
 private:
@@ -2475,6 +2482,82 @@ private:
             acc = move(tern);
         }
         return acc;
+    }
+
+    /* True if every operator in the +/- chain is + or -. */
+    static bool is_addsub_chain(const MultiOpConstruct *mo)
+    {
+        for (size_t i = 1; i < mo->elems.size(); i++)
+            if (mo->elems[i].first != Op::plus
+                    && mo->elems[i].first != Op::minus)
+                return false;
+        return true;
+    }
+
+    /* Combine constant literals in an INT-typed +/- chain: (n-1)-1 -> n-2,
+     * ((n-1)-1)-1 -> n-3. SOUND for int only - wraparound is associative mod
+     * 2^64, so regrouping/reordering +/- is exact under -fwrapv - hence GATED on
+     * th == i: a float chain (non-associative rounding) or a string `+` (concat)
+     * is never touched. Bottom-up, so a nested chain folds before its parent.
+     * This is what makes an unrolled recursion render `fib(n-3)` instead of the
+     * literal `fib(((n-1)-1)-1)` the substitution produces. */
+    void fold_int_arith(unique_ptr<Construct> &slot)
+    {
+        if (!slot)
+            return;
+        for_each_child_slot(slot.get(),
+            [&](unique_ptr<Construct> &ch) { fold_int_arith(ch); });
+
+        auto *mo = dynamic_cast<Expr04 *>(slot.get());
+        if (!mo || slot->th != TypeHint::i || mo->elems.size() < 2
+                || !is_addsub_chain(mo))
+            return;
+
+        /* FLATTEN: if the base (elems[0]) is itself an int +/- chain (folded
+         * already, bottom-up), splice its operands in. The base has sign +, so
+         * its signs carry directly. */
+        if (auto *base = dynamic_cast<Expr04 *>(mo->elems[0].second.get())) {
+            if (mo->elems[0].second->th == TypeHint::i
+                    && is_addsub_chain(base)) {
+                std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
+                for (auto &pr : base->elems)
+                    merged.push_back(std::move(pr));
+                for (size_t i = 1; i < mo->elems.size(); i++)
+                    merged.push_back(std::move(mo->elems[i]));
+                mo->elems = std::move(merged);
+            }
+        }
+
+        /* Need a non-constant base to rebuild around (skip `1 - n`). */
+        if (mo->elems[0].second->is_lit_int())
+            return;
+
+        /* COMBINE: fold int-literal operands into one constant; keep the
+         * non-constant operands in order. */
+        int_type constant = 0;
+        std::vector<std::pair<Op, unique_ptr<Construct>>> kept;
+        kept.push_back(std::move(mo->elems[0]));        /* the non-const base */
+        for (size_t i = 1; i < mo->elems.size(); i++) {
+            auto *li = dynamic_cast<const LiteralInt *>(
+                mo->elems[i].second.get());
+            if (li)
+                constant += (mo->elems[i].first == Op::minus) ? -li->ival()
+                                                              : li->ival();
+            else
+                kept.push_back(std::move(mo->elems[i]));
+        }
+        if (constant != 0) {
+            auto lit = make_unique<LiteralInt>(
+                constant < 0 ? -constant : constant);
+            lit->th = TypeHint::i;
+            kept.emplace_back(constant < 0 ? Op::minus : Op::plus,
+                              std::move(lit));
+        }
+
+        if (kept.size() == 1)
+            slot = std::move(kept[0].second);   /* constants canceled: base only */
+        else
+            mo->elems = std::move(kept);
     }
 
     bool block_inlinable_decl(const FuncDeclStmt *fd)
