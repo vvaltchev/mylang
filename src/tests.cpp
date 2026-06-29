@@ -9076,6 +9076,18 @@ static const std::vector<repl_test> repl_tests =
         { "f(21)", "=> 42" },
         { "f(f(3))", "=> 12" } } },
 
+    /* A template DEFINED in one input and first CALLED in a LATER input must
+     * instantiate + retain the int instance (so the REPL matches a script): the
+     * call must NOT reject with DynRequiredEx (a template call defers, not the
+     * template's sticky `dyn` ret), x must be the right value, and the instance
+     * must be retained + fully optimized (unrolled + arithmetic-folded). */
+    { "a template called in a LATER input is instantiated + retained",
+      { { "func fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2); }", "" },
+        { "var x = fib(10)", "" },
+        { "x", "=> 55" },                       /* not 'Undefined x' (rollback) */
+        { "specializations(fib)", "fib$0" },    /* the int instance retained */
+        { ":show fib", "fib$0(n - 3)" } } },    /* unrolled + folded */
+
     { "a const folds in a later input",
       { { "const C = 10", "" },
         { "C * 3", "=> 30" },

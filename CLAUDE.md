@@ -1297,7 +1297,18 @@ decisions behind it: `plans/type-inference.md`,
   contribute `array<?>`, whose **outer** kind isn't `Unknown` so `contribute`'s
   own pinned-symbol guard wouldn't catch it, tripping a PINNED global array's
   cross-input assignability check before a template-instance arg settles
-  (`var g=[1,2,3]; func f(x){append(g,x);} f(3)`).
+  (`var g=[1,2,3]; func f(x){append(g,x);} f(3)`). The invariant also covers a
+  **call to a TEMPLATE**: `type_of` of a `CallExpr` whose callee is a template
+  returns `bottom` (defer), NOT the template's `ret` — a template's `ret`
+  finalizes to `dyn` (it is never inferred in isolation), and instantiation is
+  about to redirect this call to a concrete clone whose `ret` is the real type.
+  Returning `dyn` would be sticky and survive the redirect. This is what made a
+  **cross-input** `var x = fib(10)` (calling a prior-input, *pinned* template)
+  reject with `DynRequiredEx` — `x` got the template's `dyn` before the redirect,
+  stuck — which rolled back the instance, so a REPL template first called in a
+  *later* input was left un-instantiated (unlike a script). With the defer, the
+  call settles to the clone's type and the instance is retained + optimized
+  exactly as in a script (`repl:` cross-input test).
 - **Finalization of unconstrained symbols.** An unconstrained *param* or
   *foreach loop var* → `dyn` (could be anything); a plain local → `none`. A func
   with an Unknown *return* → `dyn` (it returns a value that depends on

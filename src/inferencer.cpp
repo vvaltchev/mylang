@@ -2084,8 +2084,19 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
             TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
             if (s && s->struct_type)   /* construction -> the struct type */
                 return A.struct_ty(s->struct_type, s->struct_type->name);
-            if (s && s->func)
+            if (s && s->func) {
+                /* A call to a TEMPLATE defers (bottom), NOT the template's
+                 * fallback `ret` (which finalizes to `dyn`): instantiation will
+                 * redirect this call to a concrete clone, and the clone's `ret`
+                 * is the real type. Returning `dyn` here would be STICKY - it
+                 * climbs the lattice and never comes back - so the enclosing var
+                 * would stay `dyn` even after the redirect. This is what made a
+                 * CROSS-INPUT call to a prior (pinned) template reject with
+                 * DynRequiredEx and roll the instance back. */
+                if (s->func->is_template)
+                    return bottom;
                 return s->func->ret;
+            }
             if (s && is_func(s->type))
                 return static_type_resolve(s->type)->ret;
             if (s && is_unknown(s->type))
