@@ -102,13 +102,15 @@ struct Renderer {
 
     static string ind(int n) { return string(n * 4, ' '); }
 
-    /* Note a transition into a spliced (inlined) subtree once, so we don't
-     * repeat the annotation on every interior node. */
+    /* Track entry into a spliced (inlined) subtree. We deliberately do NOT print
+     * a per-node "inlined NAME" marker: a guard body is inlined as a real
+     * TERNARY (expressible code that needs no annotation), and marking every
+     * interior node floods a deeply-nested unroll. The only marker is one
+     * emitted by the InlinedCallExpr case (the non-expressible block form). */
     bool enter_inline(const Construct *c, const InlineCtx *&saved)
     {
         saved = cur_inline;
         if (c->inline_ctx && c->inline_ctx != cur_inline) {
-            o << "/* inlined " << c->inline_ctx->callee_name << " */ ";
             cur_inline = c->inline_ctx;
             return true;
         }
@@ -287,23 +289,24 @@ struct Renderer {
             expr(e->rvalue.get(), 0); return;
         }
         if (auto *e = dynamic_cast<const InlinedCallExpr *>(c)) {
-            /* An inlined block body in expression position. The common
-             * single-return body renders as its value expression (an
-             * "inlined <name>" marker is emitted by the body's inline_ctx
-             * tracking); a multi-statement body is summarized best-effort. */
+            /* An inlined block body in expression position (the non-expressible
+             * form, used when the body is not a temp-free guard chain - a guard
+             * body is inlined as a real ternary instead). Label it once, then
+             * render the single-return body as its value, else the block. */
+            const char *nm = (e->elem && e->elem->inline_ctx)
+                ? e->elem->inline_ctx->callee_name.c_str() : "?";
             auto *b = dynamic_cast<const Block *>(e->elem.get());
             const ReturnStmt *r = (b && b->elems.size() == 1)
                 ? dynamic_cast<const ReturnStmt *>(b->elems[0].get()) : nullptr;
             if (r) {
-                o << "(";
+                o << "/* inlined " << nm << " */ (";
                 if (r->elem) expr(r->elem.get(), 0); else o << "none";
                 o << ")";
             } else if (e->elem) {
-                /* a multi-statement inlined body (e.g. an unrolled recursion):
-                 * render it as a brace block so the expansion is visible (an
-                 * "inlined <name>" marker comes from the body's inline_ctx
-                 * tracking). Best-effort - a block in expression position is not
-                 * valid MyLang, but :show is a decompiler. */
+                /* a multi-statement inlined body: render it as a brace block so
+                 * the expansion is visible. Best-effort - a block in expression
+                 * position is not valid MyLang, but :show is a decompiler. */
+                o << "/* inlined " << nm << " */ ";
                 inline_block(e->elem.get(), cur_level);
             }
             return;

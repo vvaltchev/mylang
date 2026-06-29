@@ -10138,10 +10138,11 @@ static const FuncDeclStmt *find_top_func(Construct *root, const char *name)
  * `inlined f`; an instantiated template surfaces its array element type.
  */
 /* Audit the SHAPE of the recursion unroll (not just that it computes the right
- * answer - a lopsided/wrong-depth unroll is still correct). Counts InlinedCall
- * nodes in the optimized AST (via serialize): a balanced K-level unroll of a
- * branching-B body has B + B^2 + ... + B^K of them. Typed params keep each func
- * concrete (no template instance to disambiguate). */
+ * answer - a lopsided/wrong-depth unroll is still correct). A guard body unrolls
+ * to an EXPRESSIBLE ternary, so a balanced K-level unroll of a branching-B body
+ * has B + B^2 + ... + B^K TernaryExpr nodes. Counts them in the optimized AST
+ * (via serialize). Typed params keep each func concrete (no template instance to
+ * disambiguate). */
 static bool inline_unroll_shape()
 {
     const char *src[] = {
@@ -10169,7 +10170,7 @@ static bool inline_unroll_shape()
     } catch (...) {
         return false;
     }
-    auto inlined_count = [&](const char *name) -> int {
+    auto ternary_count = [&](const char *name) -> int {
         const FuncDeclStmt *f = find_top_func(root.get(), name);
         if (!f)
             return -1;
@@ -10177,15 +10178,15 @@ static bool inline_unroll_shape()
         os << *f;
         const std::string s = os.str();
         int n = 0;
-        for (size_t p = s.find("InlinedCall"); p != std::string::npos;
-             p = s.find("InlinedCall", p + 1))
+        for (size_t p = s.find("TernaryExpr"); p != std::string::npos;
+             p = s.find("TernaryExpr", p + 1))
             n++;
         return n;
     };
     bool ok = true;
-    ok = ok && inlined_count("fib") == 6;   /* 2 balanced levels: 2 + 4 */
-    ok = ok && inlined_count("tri") == 3;   /* 1 level, ALL 3 branches (balance) */
-    ok = ok && inlined_count("big") == 0;   /* over budget -> not unrolled */
+    ok = ok && ternary_count("fib") == 6;   /* 2 balanced levels: 2 + 4 */
+    ok = ok && ternary_count("tri") == 3;   /* 1 level, ALL 3 branches (balance) */
+    ok = ok && ternary_count("big") == 0;   /* over budget -> not unrolled */
     return ok;
 }
 
@@ -10226,8 +10227,8 @@ static bool coderender_inline_fold_types()
 
     bool ok = true;
     ok = ok && sg.find("print(3)") != std::string::npos;     /* inlined+folded */
-    ok = ok && sh.find("inlined f") != std::string::npos;    /* annotated */
-    ok = ok && sh.find("x + y") != std::string::npos;        /* non-const args */
+    /* f's body is substituted inline (expressible code - no "inlined" marker) */
+    ok = ok && sh.find("x + y") != std::string::npos;
 
     /* the instantiated mk$0 (int) renders its flat array element type */
     const FuncDeclStmt *mk0 = find_top_func(root.get(), "mk$0");
@@ -10235,18 +10236,15 @@ static bool coderender_inline_fold_types()
         ok = ok && render_func_code(mk0).find("array<int>") !=
                        std::string::npos;
 
-    /* fib is a pure tree-recursion: the unroll must be BALANCED and
-     * MULTI-LEVEL (REC_UNROLL_LEVELS). A single level renders ~2 "inlined fib"
-     * markers; >1 level renders several. (Audits the optimizer OUTPUT, not just
-     * that fib computes the right answer.) */
+    /* fib's guard body is inlined as an EXPRESSIBLE ternary (not a
+     * block-with-returns): its render has the ternary operators and a frontier
+     * fib() call. The unroll DEPTH/balance is pinned by inline_unroll_shape. */
     const FuncDeclStmt *fib = find_top_func(root.get(), "fib");
     if (fib) {
         const std::string sf = render_func_code(fib);
-        int cnt = 0;
-        for (size_t p = sf.find("inlined fib"); p != std::string::npos;
-             p = sf.find("inlined fib", p + 1))
-            cnt++;
-        ok = ok && cnt >= 4;   /* > 1 unroll level (balanced, both branches) */
+        ok = ok && sf.find(" ? ") != std::string::npos
+                && sf.find(" : ") != std::string::npos
+                && sf.find("fib(") != std::string::npos;
     }
 
     /* an arbitrary expression renders too */

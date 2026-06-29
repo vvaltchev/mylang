@@ -900,6 +900,32 @@ both tail-inlined and block-inlined; walk order: expr-inline, tail-inline,
 block-inline, specialize). coderender renders an `InlinedCallExpr` as its
 value (a single-return body) or an `inlined <name>` marker.
 
+**Guard bodies inline to an EXPRESSIBLE ternary, not an `InlinedCallExpr`.** An
+`InlinedCallExpr(Block(... return ... return ...))` sitting in expression
+position is NOT writable MyLang (a block-with-returns is not an expression) — an
+optimized AST that isn't a subset of the source AST. So when the spliced body is
+a **temp-free guard chain** — `{ if(c1) return a1; ...; return b; }`,
+`guard_to_ternary` — it is converted to the equivalent **`TernaryExpr`**
+`(c1 ? a1 : (... : b))`, real code that runs in the caller's frame like any
+expression (no flow boundary, no `InlinedCallExpr`). "Temp-free" requires the
+args to be DIRECT-substituted, not bound to temp statements; for a **pure**
+callee an arg is side-effect-free, so a cheap one (`body_weight ≤ ARG_SUBST_MAX`,
+which excludes a nested call) is substituted directly and re-evaluated at each
+param use (sound: a pure body can't change the arg's value). The recursion
+unroll therefore produces **nested ternaries** (fib →
+`(n-1<2 ? n-1 : fib(..)+fib(..)) + (n-2<2 ? n-2 : ..)`), and the frontier
+self-calls in the ternary branches still hit the per-frame cache. A body that is
+NOT a temp-free guard chain (locals, a loop, a non-substitutable/side-effecting
+arg → an arg temp) keeps the `InlinedCallExpr` form (statement-hoisting those is
+a deferred follow-up). For this, `for_each_child_slot` gained `TernaryExpr` /
+`CoalesceExpr` cases — previously absent, so a call inside a `? :` was never
+inlined or devirtualized (a latent missed-optimization, now fixed). coderender
+no longer prints a per-node `inlined` marker (a ternary is self-evidently real
+code; the flood made a deep unroll unreadable) — only the `InlinedCallExpr` case
+emits one. **Still not folded:** the arithmetic stays as written
+(`fib(((n-1)-1)-1)`, not `fib(n-3)`) — `n-1-1`→`n-2` is the deferred int-algebra
+pass.
+
 **Recursion unroll + per-frame pure-call cache (the fib win).** A pure,
 TREE-recursive function (≥2 self-calls, `func_is_cacheable_recursive`) is
 admitted to `block_funcs` and **unrolled in place** ("unroll the definition"):

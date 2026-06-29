@@ -2111,6 +2111,10 @@ for_each_child_slot(Construct *c,
         if (n->end_idx) fn(n->end_idx);
     } else if (auto *n = dynamic_cast<MemberExpr *>(c)) {
         fn(n->what);
+    } else if (auto *n = dynamic_cast<TernaryExpr *>(c)) {
+        fn(n->condExpr); fn(n->thenExpr); fn(n->elseExpr);
+    } else if (auto *n = dynamic_cast<CoalesceExpr *>(c)) {
+        fn(n->lhs); fn(n->rhs);
     } else if (auto *n = dynamic_cast<ReturnStmt *>(c)) {
         if (n->elem) fn(n->elem);
     } else if (auto *n = dynamic_cast<Expr14 *>(c)) {
@@ -2231,6 +2235,12 @@ class Inliner {
     static const int REC_UNROLL_MAX = 3;
     /* A high node backstop for a pathological body (many self-calls x depth). */
     static const int REC_NODE_CAP = 600;
+    /* Max weight of an arg that is DIRECT-substituted (re-evaluated at each param
+     * use) instead of bound to a temp. Only for a PURE callee (its args are
+     * side-effect-free, so re-evaluation is sound); the cap keeps re-eval cheap
+     * and excludes a nested call (weight ~21). A temp-free body is what lets a
+     * guard body convert to an EXPRESSIBLE ternary (guard_to_ternary). */
+    static const long ARG_SUBST_MAX = 8;
     int rec_depth = 0;   /* current self-inline depth along the walk path */
     long inline_budget = 0;
 
@@ -2422,6 +2432,51 @@ private:
      * Locals are allowed (v2): try_inline_block remaps them, growing the caller
      * frame (capped at 64 slots).
      */
+    /* Convert a guard-chain block - { if(c1) return a1; ...; return b; } - into
+     * the equivalent ternary (c1 ? a1 : (... : b)), so an inlined guard body is
+     * EXPRESSIBLE (real MyLang) instead of a block-with-returns sitting in
+     * expression position (an InlinedCall). Returns null when the block is not a
+     * pure guard chain: a leading non-if/return statement (a `var` local, a
+     * loop, an arg-temp `$a = ...`), an `if` with an `else`, or an `if` whose
+     * then-branch is not a single `return`. */
+    static unique_ptr<Construct> guard_to_ternary(const Block *b)
+    {
+        if (!b || b->elems.empty())
+            return nullptr;
+        const size_t n = b->elems.size();
+        auto *last = dynamic_cast<const ReturnStmt *>(b->elems[n - 1].get());
+        if (!last || !last->elem)
+            return nullptr;
+        auto guard_ret = [](const Construct *thenB) -> const ReturnStmt * {
+            if (auto *r = dynamic_cast<const ReturnStmt *>(thenB))
+                return r;
+            if (auto *blk = dynamic_cast<const Block *>(thenB))
+                if (blk->elems.size() == 1)
+                    return dynamic_cast<const ReturnStmt *>(
+                        blk->elems[0].get());
+            return nullptr;
+        };
+        for (size_t i = 0; i + 1 < n; i++) {
+            auto *iff = dynamic_cast<const IfStmt *>(b->elems[i].get());
+            if (!iff || iff->elseBlock)
+                return nullptr;
+            const ReturnStmt *r = guard_ret(iff->thenBlock.get());
+            if (!r || !r->elem)
+                return nullptr;
+        }
+        unique_ptr<Construct> acc = last->elem->clone();
+        for (size_t i = n - 1; i-- > 0; ) {
+            auto *iff = dynamic_cast<const IfStmt *>(b->elems[i].get());
+            const ReturnStmt *r = guard_ret(iff->thenBlock.get());
+            auto tern = make_unique<TernaryExpr>();
+            tern->condExpr = iff->condExpr->clone();
+            tern->thenExpr = r->elem->clone();
+            tern->elseExpr = move(acc);
+            acc = move(tern);
+        }
+        return acc;
+    }
+
     bool block_inlinable_decl(const FuncDeclStmt *fd)
     {
         if (!fd->body || !fd->body->is_block() || !fd->id || !fd->resolved)
@@ -2935,7 +2990,14 @@ private:
                     return id->sym.kind == SymKind::local
                         && id->sym.slot == i;
                 });
-            if (!tail_arg_ok(uses, ce->args->elems[i].get())) {
+            const Construct *arg = ce->args->elems[i].get();
+            /* A cheap arg to a PURE callee is direct-substituted (no temp): the
+             * callee's purity makes the arg side-effect-free, so re-evaluating
+             * it at each param use is sound, and a temp-free body can become an
+             * expressible ternary. Otherwise temp-bind (capture-once). */
+            const bool subst = tail_arg_ok(uses, arg)
+                || (f->effective_pure && body_weight(arg) <= ARG_SUBST_MAX);
+            if (!subst) {
                 needs_temp[i] = true;
                 ntemps++;
             }
@@ -3014,11 +3076,28 @@ private:
         const InlineCtx *ic = alloc_inline_ctx(
             { std::string(f->id->get_str()), param_names(f),
               ce->start, ce->inline_ctx });
-        tag_inline(body.get(), ic);
 
-        auto ica = make_unique<InlinedCallExpr>();
-        ce->copy_base_fields(*ica);   /* loc + inline_ctx of the call site */
-        ica->elem = move(body);
+        /* If the spliced body is a temp-free guard chain, emit an EXPRESSIBLE
+         * ternary instead of an InlinedCall(Block(...return...)). The ternary is
+         * a normal expression - it runs in the caller's frame (no flow boundary)
+         * and the frontier self-calls in its branches still hit the per-frame
+         * cache. Otherwise keep the InlinedCall (a body with locals / arg temps
+         * / a loop is not yet expression-convertible). */
+        unique_ptr<Construct> spliced;
+        if (ntemps == 0) {
+            if (auto tern = guard_to_ternary(blk)) {
+                ce->copy_base_fields(*tern);   /* loc + th of the call site */
+                tag_inline(tern.get(), ic);
+                spliced = move(tern);
+            }
+        }
+        if (!spliced) {
+            tag_inline(body.get(), ic);
+            auto ica = make_unique<InlinedCallExpr>();
+            ce->copy_base_fields(*ica);   /* loc + inline_ctx of the call site */
+            ica->elem = move(body);
+            spliced = move(ica);
+        }
 
         if (analysis)
             analysis->mark(callee->start,
@@ -3031,7 +3110,7 @@ private:
               std::to_string(nlocals) + " local, +" +
               std::to_string(ntemps) + " arg-temp slot(s))");
 
-        slot = move(ica);
+        slot = move(spliced);
         /* Re-scan to collapse nested calls in the spliced body. For a recursive
          * self-inline, bump rec_depth around the re-scan so the next level's
          * self-calls see the deeper bound (and stop at REC_UNROLL_LEVELS). Every
