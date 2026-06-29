@@ -2959,6 +2959,17 @@ static const std::vector<test> tests =
         "}",
         "assert(ack(2, 3) == 9);",
         "assert(ack(3, 3) == 61);" } },
+    /* THREE self-calls: the unroll must expand ALL of them to the same depth
+     * (a size cap left the third a call - lopsided; the depth cap is balanced).
+     * Correctness must hold across n incl. the base cases. */
+    { "v3 recursion: tribonacci (3 self-calls) correct",
+      { "func tri(n) { if (n < 3) return n;"
+        "              return tri(n-1) + tri(n-2) + tri(n-3); }",
+        "assert(tri(0) == 0);",
+        "assert(tri(2) == 2);",
+        "assert(tri(3) == 3);",
+        "assert(tri(10) == 230);",
+        "assert(tri(15) == 4841);" } },
     { "v3 recursion: a non-negative-base recursion folds negatives safely",
       { "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
         "assert(fib(7) == 13);" } },
@@ -10134,9 +10145,12 @@ static bool coderender_inline_fold_types()
         "func h(x, y) { print(f(x, y)); }",
         "func mk(x) { var a = [x, x]; return a; }",
         "var z = mk(5);",
+        "func fib(n) { if (n<2) return n; return fib(n-1)+fib(n-2); }",
+        "var fv = fib(10);",
     };
+    const size_t nsrc = sizeof(src) / sizeof(src[0]);
     std::vector<Tok> toks;
-    for (size_t i = 0; i < 5; i++)
+    for (size_t i = 0; i < nsrc; i++)
         lexer(src[i], static_cast<int>(i + 1), toks);
 
     unique_ptr<Construct> root;
@@ -10168,6 +10182,20 @@ static bool coderender_inline_fold_types()
     if (mk0)
         ok = ok && render_func_code(mk0).find("array<int>") !=
                        std::string::npos;
+
+    /* fib is a pure tree-recursion: the unroll must be BALANCED and
+     * MULTI-LEVEL (REC_UNROLL_LEVELS). A single level renders ~2 "inlined fib"
+     * markers; >1 level renders several. (Audits the optimizer OUTPUT, not just
+     * that fib computes the right answer.) */
+    const FuncDeclStmt *fib = find_top_func(root.get(), "fib");
+    if (fib) {
+        const std::string sf = render_func_code(fib);
+        int cnt = 0;
+        for (size_t p = sf.find("inlined fib"); p != std::string::npos;
+             p = sf.find("inlined fib", p + 1))
+            cnt++;
+        ok = ok && cnt >= 4;   /* > 1 unroll level (balanced, both branches) */
+    }
 
     /* an arbitrary expression renders too */
     if (Block *blk = dynamic_cast<Block *>(root.get())) {

@@ -2216,7 +2216,14 @@ class Inliner {
      * this many nodes (count_all_nodes), then the remaining self-calls are the
      * frontier (deduped at runtime by the per-frame cache). Bounds the unrolled
      * decl size; tune vs bench/. */
-    static const int REC_NODE_CAP = 80;
+    /* How many levels deep a self-recursive func is unrolled. Bounding by DEPTH
+     * (not body size) keeps the unroll BALANCED: every self-call is expanded to
+     * the same depth, regardless of how many self-calls the body has (a size cap
+     * cuts off mid-level -> lopsided, which dedups far worse). Tune vs bench/. */
+    static const int REC_UNROLL_LEVELS = 2;
+    /* A high size backstop for a pathological body (many self-calls x depth). */
+    static const int REC_NODE_CAP = 400;
+    int rec_depth = 0;   /* current self-inline depth along the walk path */
     long inline_budget = 0;
 
     /* A recursive function's ORIGINAL (pre-unroll) body, saved on first sight so
@@ -2839,24 +2846,21 @@ private:
 
         /*
          * A SELF-RECURSIVE callee (block_inlinable_decl admitted it only if it
-         * is tree-recursive + pure) is UNROLLED by SIZE: stop once its body (it
-         * grows in place as the walk inlines its own self-calls - this IS the
-         * "unroll the definition") reaches REC_NODE_CAP. Two subtleties:
-         *  - each self-call splices a clone of the ORIGINAL body (saved lazily
-         *    on first sight, before any unroll), NOT the growing body, so the
-         *    unroll does not COMPOUND;
-         *  - a size cap is robust to template-instance name redirects (a chain
-         *    of inlined-at names is not, since a self-call may go through `fib`
-         *    or `fib$0`).
-         * Template instances sit at the root's front, so the decl is unrolled
-         * before any external call site is walked; that site then sees the body
-         * >= cap and does NOT inline it - it CALLS the unrolled function, so the
-         * unroll lives in the decl and EVERY frame runs it. The deduped frontier
-         * self-calls hit the per-frame pure-call cache (cache_results).
+         * is tree-recursive + pure) is UNROLLED to `REC_UNROLL_LEVELS` levels.
+         * The bound is `rec_depth` (this call's self-inline depth along the walk
+         * path), NOT body size: a size cap stops mid-level and leaves some
+         * self-calls un-expanded (LOPSIDED, dedups far worse), while a depth cap
+         * expands EVERY self-call to the same depth (balanced) regardless of how
+         * many a body has. Each self-call splices a clone of the ORIGINAL body
+         * (`rec_orig`, saved before any unroll), NOT the in-place-growing body,
+         * so the unroll does not COMPOUND. `REC_NODE_CAP` is a high backstop for
+         * a pathological body. The duplicate frontier self-calls hit the
+         * per-frame pure-call cache (cache_results).
          */
         const bool is_rec = refs_uid(f->body.get(), f->id->uid);
         if (is_rec) {
-            if (count_all_nodes(f->body.get()) >= REC_NODE_CAP)
+            if (rec_depth >= REC_UNROLL_LEVELS
+                    || count_all_nodes(f->body.get()) >= REC_NODE_CAP)
                 return;
             if (!rec_orig.count(f))
                 rec_orig[f] = f->body->clone();
@@ -2925,7 +2929,10 @@ private:
         int t = 0;
         for (int i = 0; i < nparams; i++) {
             if (needs_temp[i]) {
-                auto id = make_unique<Identifier>("$a");
+                /* name by slot ($a<slot>) so nested arg-temps don't collide in
+                 * :show (the slot is what matters; the name is cosmetic) */
+                auto id = make_unique<Identifier>(
+                    "$a" + std::to_string(temp_base + t));
                 id->sym = ResolvedSym{ SymKind::local, temp_base + t };
                 id->th = ce->args->elems[i]->th;   /* keep M8 hint if any */
                 temp_reads.push_back(move(id));
@@ -2954,7 +2961,8 @@ private:
             t--;
             auto asn = make_unique<Expr14>();
             asn->op = Op::assign;
-            auto lv = make_unique<Identifier>("$a");
+            auto lv = make_unique<Identifier>(
+                "$a" + std::to_string(temp_base + t));
             lv->sym = ResolvedSym{ SymKind::local, temp_base + t };
             lv->th = ce->args->elems[i]->th;
             asn->lvalue = move(lv);
@@ -2986,14 +2994,18 @@ private:
               std::to_string(ntemps) + " arg-temp slot(s))");
 
         slot = move(ica);
-        /* Re-scan to collapse nested calls in the spliced body. NOT for a
-         * recursive self-inline: the re-scan is depth-first, so it would expand
-         * ONE self-call branch to the size cap and leave the sibling a call (a
-         * lopsided unroll). Skipping it means the outer walk expands each
-         * self-call exactly once - a BALANCED 1-level unroll whose frontier
-         * self-calls (with their duplicates) the per-frame cache dedups. */
-        if (!is_rec)
+        /* Re-scan to collapse nested calls in the spliced body. For a recursive
+         * self-inline, bump rec_depth around the re-scan so the next level's
+         * self-calls see the deeper bound (and stop at REC_UNROLL_LEVELS). Every
+         * self-call at a given level is expanded (the re-scan visits them all),
+         * so the unroll stays BALANCED; the depth cap keeps it finite. */
+        if (is_rec) {
+            rec_depth++;
             walk(slot, depth + 1, fsize);
+            rec_depth--;
+        } else {
+            walk(slot, depth + 1, fsize);
+        }
     }
 
     /*

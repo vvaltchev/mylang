@@ -311,6 +311,10 @@ bool builtin_is_const(int index);
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
 void run_weight_bench();
 
+/* The per-frame pure-call cache (PureCache) is on by default; `-npc` clears
+ * this to measure the recursion unroll without it. */
+extern bool g_pure_cache_enabled;
+
 
 inline EvalContext *
 get_root_ctx(EvalContext *ctx)

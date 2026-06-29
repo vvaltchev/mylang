@@ -384,14 +384,14 @@ Not yet done; roughly in priority order:
      a self-call's `n-1` arg needs.
    - **B — recursion unroll.** A pure tree-recursive func (≥2 self-calls,
      `func_is_cacheable_recursive`) is admitted to `block_funcs` and unrolled in
-     place: the walk inlines its own self-calls. The unroll is **balanced — one
-     level**: the recursive splice does NOT re-scan (`if (!is_rec)`), since the
-     re-scan is depth-first and would expand one branch to the cap and leave the
-     sibling a call (a LOPSIDED unroll — measured ~20x SLOWER than balanced,
-     because the un-expanded branch is the bottleneck). Each self-call splices a
-     clone of the SAVED ORIGINAL body (`rec_orig`), not the growing body (no
-     compounding); `REC_NODE_CAP` (a SIZE bound, robust to template-instance name
-     redirects) caps a func with many self-calls.
+     place to **`REC_UNROLL_LEVELS`** (2) levels. The bound is recursion DEPTH
+     (`rec_depth`, bumped around the recursive re-scan), NOT body size: a depth
+     cap expands EVERY self-call to the same depth (BALANCED), a size cap stops
+     mid-level and leaves some self-calls un-expanded (LOPSIDED — dedups far
+     worse; the first cut at this used a 1-level re-scan-skip that happened to
+     balance fib but still left `tribonacci`'s 3rd self-call a call). Each
+     self-call splices a clone of the SAVED ORIGINAL body (`rec_orig`), not the
+     growing body (no compounding); `REC_NODE_CAP` is a high SIZE backstop.
    - **C — per-frame pure-call cache.** The InlinedCallExpr shares the caller
      frame, so the unroll's duplicate self-calls land in one frame; the inliner
      sets `cache_results`, devirt makes such a call a **`CachedCallExpr`** (a
@@ -399,11 +399,18 @@ Not yet done; roughly in priority order:
      check), and `cached_call` checks the caller `Frame`'s lazy `PureCache`
      ({func, args}→result). Lazy → sound (a base-case-misses-negatives recursion
      like `fact(-1)` can't diverge); frame-scoped → not global memoization; only
-     SCALAR results cached (a container result would alias).
+     SCALAR results cached (a container result would alias). **`-npc`** disables
+     this cache (the unroll still runs) for measurement.
    The VARIABLE-arg COMPILE-TIME CSE (hoisting `fib(n-5)` to a temp) is NOT sound
-   (the runtime lazy cache is the sound form). Effect is a base reduction of the
-   exponential (~1.6→~1.45), NOT linear (that's global memoization = the script's
-   job). Remaining: the deferred type-narrowing/algebraic pass.
+   (the runtime lazy cache is the sound form). **The unroll pays ONLY with the
+   cache:** measured fib(32) = 0.01s default / 0.5s `-npc` / 0.28s `-ni` — the
+   unroll alone GROWS the body without dedup, so it's neutral (1 level) to harmful
+   (deeper); the per-frame dedup is the actual win, so the two ship together and
+   depth is tuned for cache-on. ~14x vs CPython on fib. **Remaining:** the
+   deferred type-narrowing/algebraic pass — also what a NATURAL `:show` needs
+   (fold `n-1-1`→`n-2`, `if`→ternary). The base-case guards can't be dropped for a
+   variable arg (a flat "4 calls" is unsound — `n` may be 2); today `:show` shows
+   the literal unrolled block with `$a<slot>` arg-temps.
 
    The original gap: a block-bodied function used **in expression position**
    (`var y = f(z) + 1;`) and **recursive** functions (banned by

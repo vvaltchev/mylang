@@ -118,6 +118,8 @@ Running scripts:
 ./build/mylang -t FILE           # dump tokens
 ./build/mylang -nc FILE          # disable const-eval (compare -s with/without)
 ./build/mylang -ni FILE          # disable function inlining (debug)
+./build/mylang -npc FILE         # disable the per-frame pure-call cache
+                                 # (recursion still unrolls; for measurement)
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -nr FILE          # parse/validate only, don't run
 ./build/mylang -nti FILE         # disable static type inference / checking
@@ -899,15 +901,16 @@ value (a single-return body) or an `inlined <name>` marker.
 **Recursion unroll + per-frame pure-call cache (the fib win).** A pure,
 TREE-recursive function (≥2 self-calls, `func_is_cacheable_recursive`) is
 admitted to `block_funcs` and **unrolled in place** ("unroll the definition"):
-the walk inlines its own self-calls. The unroll is **balanced — one level**: the
-recursive splice does NOT re-scan (`if (!is_rec)`), because the re-scan is
-depth-first and would expand ONE self-call branch to the cap and leave the
-sibling a call (a LOPSIDED unroll that dedups far worse — the un-expanded branch
-is the bottleneck); skipping it lets the outer walk expand EACH self-call exactly
-once. Two more correctness points: each self-call splices a clone of the **saved
+the walk inlines its own self-calls, to **`REC_UNROLL_LEVELS`** levels (2). The
+bound is **recursion DEPTH** (`rec_depth`, bumped around the recursive re-scan),
+NOT body size: a depth cap expands EVERY self-call to the same depth (BALANCED),
+while a size cap stops mid-level and leaves some self-calls un-expanded
+(LOPSIDED, which dedups far worse — the un-expanded branch is the bottleneck;
+e.g. a 3-self-call `tribonacci` lost its third branch under the old size cap).
+Two more correctness points: each self-call splices a clone of the **saved
 ORIGINAL body** (`rec_orig`), not the in-place-growing body, so the unroll does
-not compound; and `REC_NODE_CAP` (a size bound, robust to template-instance name
-redirects) caps a func with many self-calls. The unroll's **duplicate self-calls**
+not compound; and `REC_NODE_CAP` is a high size BACKSTOP for a pathological body.
+The unroll's **duplicate self-calls**
 (`fib(n-1)` and `fib(n-2)`'s bodies both call `fib(n-3)`) land in ONE frame (the
 `InlinedCallExpr` shares the caller frame) and **dedup at runtime via a per-frame
 cache**: the
@@ -921,13 +924,21 @@ wouldn't, so a recursion whose base case misses negatives — `fact(-1)` — can
 diverge), and frame-scoped (the cache dies with the frame → not global
 memoization, which would be the script's job). Only a **scalar** result is cached
 (a pure func may return a fresh mutable container; caching it would alias it
-across callers). **Effect: ~6x on `bench/09_fib_recursive`** (a base reduction of
-the exponential, not linear), more when a caller calls the same `fib(k)` repeatedly
-(the per-frame cache also dedups those); broad-suite geomean is a slight net win
-(0.98x), linear recursion byte-neutral. Correct for `fib`, `ackermann`, and
-container-returning tree recursions. coderender renders the unrolled body so
-`:show fib` shows the balanced one-level expansion. Still **not done** (see
-`plans/function-inlining.md`): the deferred type-narrowing/algebraic pass.
+across callers). **The unroll only pays WITH the cache** — the per-frame dedup is
+what reduces the exponential; the unroll ALONE grows the body without dedup, so
+it is neutral (1 level) to harmful (deeper). So depth is tuned for the
+cache-on default; **`-npc`** disables the cache (the unroll still runs) to MEASURE
+its contribution. **Effect: ~14x on naive `fib(32)`** (0.01s vs 0.14s CPython;
+`-npc` 0.5s, `-ni` 0.28s — i.e. cache off is *slower* than no-inline, which is
+why the two ship together); more when a caller calls the same `fib(k)` repeatedly
+(the cache dedups those too); broad-suite geomean a slight net win. Correct for
+`fib`, `ackermann`, container-returning tree recursions. coderender renders the
+unrolled body so `:show fib` shows the (depth-`REC_UNROLL_LEVELS`) expansion. Still
+**not done**: the deferred type-narrowing/algebraic pass — which is also what a
+*natural* `:show` rendering needs (fold `n-1-1`→`n-2`, an `if`→ternary, so the
+body reads as `(n<3 ? n-1 : fib(n-2)+fib(n-3)) + …`); today it renders the literal
+unrolled block with `$a<slot>` arg-temps. Note the base-case guards CANNOT be
+dropped for a variable arg (a flat "4 calls" is unsound — `n` could be 2).
 
 ## Static type inference (`inferencer.cpp`)
 

@@ -185,6 +185,10 @@ parse_args(int argc, char **argv)
 
             opt_no_inline = true;
 
+        } else if (!strcmp(arg, "-npc")) {
+
+            g_pure_cache_enabled = false;   /* recursion unroll, no per-frame cache */
+
         } else if (!strcmp(arg, "-it")) {
 
             if (argc < 2) {

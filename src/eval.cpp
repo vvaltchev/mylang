@@ -645,12 +645,16 @@ EvalValue eval_func(EvalContext *ctx,
  * side-effecting arg is not duplicated. Falls back to do_func_call when there
  * is no frame to cache in.
  */
+/* Disabled by the `-npc` CLI flag, to measure the recursion unroll WITHOUT the
+ * per-frame cache (the unroll still happens; only the dedup is off). */
+bool g_pure_cache_enabled = true;
+
 static EvalValue
 cached_call(EvalContext *ctx, FuncObject &obj,
             const vector<unique_ptr<Construct>> &args,
             Loc call_site, const InlineCtx *inl)
 {
-    if (!ctx->frame)
+    if (!ctx->frame || !g_pure_cache_enabled)
         return do_func_call(ctx, obj, args, call_site, inl);
 
     vector<EvalValue> vals;
