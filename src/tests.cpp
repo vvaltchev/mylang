@@ -2980,6 +2980,28 @@ static const std::vector<test> tests =
         "func uc(int x) { return lc(x) + 1; }",
         "assert(uc(5) == 26);",
         "assert(uc(0) == 1);" } },
+    /* int-algebra simplification: like-term collection (a+a->2a, a-a->0,
+     * a+b-a->b) and constant-factor combining (x*2*3->x*6, x*1->x, x*0->0),
+     * gated on int. The concrete values (incl. negatives) catch a sign/
+     * coefficient bug; a float chain must NOT fold (non-associative). */
+    { "int-algebra: like-terms + constant factors fold soundly",
+      { "func aa(int x)    => x + x;",
+        "func can(int x, int y) => x + y - x;",
+        "func tri(int x)   => x + x + x;",
+        "func mc(int x)    => x * 2 * 3;",
+        "func one(int x)   => x * 1;",
+        "func zero(int x)  => x * 0 + 5;",
+        "func mix(int x)   => x + 1 + x + 2;",
+        "assert(aa(5) == 10);   assert(aa(-3) == -6);",
+        "assert(can(5, 3) == 3);   assert(can(-3, -7) == -7);",
+        "assert(tri(4) == 12);   assert(tri(-2) == -6);",
+        "assert(mc(5) == 30);   assert(mc(-4) == -24);",
+        "assert(one(7) == 7);",
+        "assert(zero(7) == 5);",
+        "assert(mix(10) == 23);   assert(mix(-10) == -17);" } },
+    { "int-algebra: a float chain is NOT merged (still correct)",
+      { "func fa(float a) => a + a + a;",
+        "assert(fa(1.5) > 4.4 && fa(1.5) < 4.6);" } },
     /* A pure recursive function returning a CONTAINER is NOT cached (the scalar
      * gate): two equal calls give INDEPENDENT arrays, so mutating one must not
      * affect the other. (If the cache wrongly cached the array, they'd alias.) */
@@ -9094,6 +9116,15 @@ static const std::vector<repl_test> repl_tests =
         { "x", "=> 55" },                       /* not 'Undefined x' (rollback) */
         { "specializations(fib)", "fib$0" },    /* the int instance retained */
         { ":show fib", "fib$0(n - 3)" } } },    /* unrolled + folded */
+
+    /* int-algebra simplification is visible in the optimized AST (:show). */
+    { "int-algebra fold shows like-terms and constant factors",
+      { { "func aa(int x) => x + x", "" },
+        { ":show aa", "2 * x" },
+        { "func mc(int x) => x * 2 * 3", "" },
+        { ":show mc", "x * 6" },
+        { "func can(int x, int y) => x + y - x", "" },
+        { ":show can", "=> y" } } },
 
     { "a const folds in a later input",
       { { "const C = 10", "" },

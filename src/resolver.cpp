@@ -2602,6 +2602,233 @@ private:
      * is never touched. Bottom-up, so a nested chain folds before its parent.
      * This is what makes an unrolled recursion render `fib(n-3)` instead of the
      * literal `fib(((n-1)-1)-1)` the substitution produces. */
+    /* Structural equality of two SIDE-EFFECT-FREE expressions (used to collect
+     * like terms). Conservative: identifiers (same resolution), int literals,
+     * and arithmetic chains over those; anything else compares unequal. */
+    static bool expr_equal(const Construct *a, const Construct *b)
+    {
+        if (a == b)
+            return true;
+        if (!a || !b)
+            return false;
+        if (auto *ia = dynamic_cast<const Identifier *>(a)) {
+            auto *ib = dynamic_cast<const Identifier *>(b);
+            return ib && ia->uid == ib->uid
+                && ia->sym.kind == ib->sym.kind
+                && ia->sym.slot == ib->sym.slot;
+        }
+        if (auto *la = dynamic_cast<const LiteralInt *>(a)) {
+            auto *lb = dynamic_cast<const LiteralInt *>(b);
+            return lb && la->ival() == lb->ival();
+        }
+        if (auto *ma = dynamic_cast<const MultiOpConstruct *>(a)) {
+            auto *mb = dynamic_cast<const MultiOpConstruct *>(b);
+            if (!mb || ma->elems.size() != mb->elems.size())
+                return false;
+            for (size_t i = 0; i < ma->elems.size(); i++)
+                if (ma->elems[i].first != mb->elems[i].first
+                        || !expr_equal(ma->elems[i].second.get(),
+                                       mb->elems[i].second.get()))
+                    return false;
+            return true;
+        }
+        return false;
+    }
+
+    /* True if every operator in the chain is `*` (a pure multiplication chain;
+     * `/` and `%` are not associative under truncating int division). */
+    static bool is_mul_chain(const MultiOpConstruct *mo)
+    {
+        for (size_t i = 1; i < mo->elems.size(); i++)
+            if (mo->elems[i].first != Op::times)
+                return false;
+        return true;
+    }
+
+    /* Build an Expr03 `k * e` (k a fresh int literal, the base op Op::invalid). */
+    static unique_ptr<Construct> make_int_mul(int_type k, unique_ptr<Construct> e)
+    {
+        auto lit = make_unique<LiteralInt>(k);
+        lit->th = TypeHint::i;
+        auto mul = make_unique<Expr03>();
+        mul->th = TypeHint::i;
+        mul->elems.emplace_back(Op::invalid, move(lit));
+        mul->elems.emplace_back(Op::times, move(e));
+        return mul;
+    }
+
+    /*
+     * Algebraic simplification of an INT-typed `+`/`-` chain: combine constant
+     * literals AND collect like terms (structurally-equal, side-effect-free
+     * operands) by net coefficient. So `(n-1)-1`->`n-2`, `a+a`->`2*a`,
+     * `a-a`->`0`, `a+b-a`->`b`, `x+1+y+2`->`x+y+3`. SOUND for int only:
+     * wraparound `+`/`-` is associative & commutative mod 2^64 under -fwrapv, so
+     * regrouping/reordering and merging duplicate side-effect-free operands is
+     * exact (a side-effecting operand is kept verbatim, each occurrence, so its
+     * effect count is unchanged). Gated on th == i by the caller.
+     */
+    void fold_addsub(unique_ptr<Construct> &slot)
+    {
+        auto *mo = dynamic_cast<Expr04 *>(slot.get());
+        if (!mo || mo->elems.size() < 2 || !is_addsub_chain(mo))
+            return;
+
+        /* FLATTEN a nested +/- base (already folded bottom-up); its signs carry
+         * directly (the base has sign +). */
+        if (auto *base = dynamic_cast<Expr04 *>(mo->elems[0].second.get()))
+            if (mo->elems[0].second->th == TypeHint::i
+                    && is_addsub_chain(base)) {
+                std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
+                for (auto &pr : base->elems)
+                    merged.push_back(move(pr));
+                for (size_t i = 1; i < mo->elems.size(); i++)
+                    merged.push_back(move(mo->elems[i]));
+                mo->elems = move(merged);
+            }
+
+        /* COLLECT: a constant + signed terms (like terms merged by coefficient
+         * when side-effect-free). */
+        int_type constant = 0;
+        struct STerm { unique_ptr<Construct> expr; int_type coeff; bool grp; };
+        std::vector<STerm> terms;
+        auto add = [&](unique_ptr<Construct> e, int_type sign) {
+            if (auto *li = dynamic_cast<LiteralInt *>(e.get())) {
+                constant += sign * li->ival();
+                return;
+            }
+            const bool grp = !expr_has_side_effect(e.get());
+            if (grp)
+                for (auto &t : terms)
+                    if (t.grp && expr_equal(t.expr.get(), e.get())) {
+                        t.coeff += sign;
+                        return;
+                    }
+            terms.push_back({ move(e), sign, grp });
+        };
+        add(move(mo->elems[0].second), 1);
+        for (size_t i = 1; i < mo->elems.size(); i++)
+            add(move(mo->elems[i].second),
+                mo->elems[i].first == Op::minus ? -1 : 1);
+
+        /* nothing merged/cancelled and no flatten benefit: leave it (the common
+         * case is already handled, and this avoids rebuilding identical trees) */
+
+        /* OUT: each non-zero term as (sign, expr-or-(|c|*expr)); then the
+         * constant. */
+        std::vector<std::pair<int_type, unique_ptr<Construct>>> out;
+        for (auto &t : terms) {
+            if (t.coeff == 0)
+                continue;
+            const int_type s = t.coeff > 0 ? 1 : -1;
+            const int_type mag = t.coeff > 0 ? t.coeff : -t.coeff;
+            out.emplace_back(s, mag == 1 ? move(t.expr)
+                                         : make_int_mul(mag, move(t.expr)));
+        }
+        if (constant != 0) {
+            auto lit = make_unique<LiteralInt>(
+                constant < 0 ? -constant : constant);
+            lit->th = TypeHint::i;
+            out.emplace_back(constant < 0 ? -1 : 1, move(lit));
+        }
+
+        /* REBUILD a +/- chain. The base (elems[0]) must be positive (op
+         * Op::invalid); if none is positive, lead with a literal 0. */
+        if (out.empty()) {
+            auto z = make_unique<LiteralInt>(0);
+            z->th = TypeHint::i;
+            slot = move(z);
+            return;
+        }
+        int base_i = -1;
+        for (size_t i = 0; i < out.size(); i++)
+            if (out[i].first > 0) { base_i = static_cast<int>(i); break; }
+
+        auto chain = make_unique<Expr04>();
+        chain->th = TypeHint::i;
+        if (base_i < 0) {                    /* all negative: 0 - a - b ... */
+            auto z = make_unique<LiteralInt>(0);
+            z->th = TypeHint::i;
+            chain->elems.emplace_back(Op::invalid, move(z));
+        } else {
+            chain->elems.emplace_back(Op::invalid, move(out[base_i].second));
+        }
+        for (size_t i = 0; i < out.size(); i++) {
+            if (static_cast<int>(i) == base_i)
+                continue;
+            chain->elems.emplace_back(out[i].first > 0 ? Op::plus : Op::minus,
+                                      move(out[i].second));
+        }
+        if (chain->elems.size() == 1)
+            slot = move(chain->elems[0].second);   /* a single positive term */
+        else
+            slot = move(chain);
+    }
+
+    /*
+     * Algebraic simplification of an INT-typed pure `*` chain: combine the
+     * constant FACTORS into one product. `x*2*3`->`x*6`, `x*1`->`x`,
+     * `x*0`->`0` (only when the non-const factors are side-effect-free, so
+     * dropping them is sound). SOUND for int: `*` is associative & commutative
+     * mod 2^64 under -fwrapv. Gated on th == i by the caller.
+     */
+    void fold_mul(unique_ptr<Construct> &slot)
+    {
+        auto *mo = dynamic_cast<Expr03 *>(slot.get());
+        if (!mo || mo->elems.size() < 2 || !is_mul_chain(mo))
+            return;
+
+        if (auto *base = dynamic_cast<Expr03 *>(mo->elems[0].second.get()))
+            if (mo->elems[0].second->th == TypeHint::i && is_mul_chain(base)) {
+                std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
+                for (auto &pr : base->elems)
+                    merged.push_back(move(pr));
+                for (size_t i = 1; i < mo->elems.size(); i++)
+                    merged.push_back(move(mo->elems[i]));
+                mo->elems = move(merged);
+            }
+
+        int_type product = 1;
+        std::vector<unique_ptr<Construct>> factors;     /* non-constant */
+        bool side_effects = false;
+        for (auto &pr : mo->elems) {
+            if (auto *li = dynamic_cast<LiteralInt *>(pr.second.get()))
+                product *= li->ival();
+            else {
+                if (expr_has_side_effect(pr.second.get()))
+                    side_effects = true;
+                factors.push_back(move(pr.second));
+            }
+        }
+
+        if (product == 0 && !side_effects) {            /* x * 0 -> 0 */
+            auto z = make_unique<LiteralInt>(0);
+            z->th = TypeHint::i;
+            slot = move(z);
+            return;
+        }
+        if (factors.empty())                            /* all constant */
+            return;                                     /* const-fold owns this */
+
+        /* rebuild factor0 (* factor1 ...) (* product) */
+        auto chain = make_unique<Expr03>();
+        chain->th = TypeHint::i;
+        chain->elems.emplace_back(Op::invalid, move(factors[0]));
+        for (size_t i = 1; i < factors.size(); i++)
+            chain->elems.emplace_back(Op::times, move(factors[i]));
+        if (product != 1)
+            chain->elems.emplace_back(Op::times,
+                [&] { auto l = make_unique<LiteralInt>(product);
+                      l->th = TypeHint::i; return l; }());
+        if (chain->elems.size() == 1)
+            slot = move(chain->elems[0].second);        /* x * 1 -> x */
+        else
+            slot = move(chain);
+    }
+
+    /* Int-arithmetic algebraic simplification: combine constants, collect like
+     * terms in +/- chains, and combine constant factors in * chains. Bottom-up,
+     * so a nested chain is normalized before its parent. Gated on th == i (sound
+     * for int only; see fold_addsub / fold_mul). */
     void fold_int_arith(unique_ptr<Construct> &slot)
     {
         if (!slot)
@@ -2609,56 +2836,12 @@ private:
         for_each_child_slot(slot.get(),
             [&](unique_ptr<Construct> &ch) { fold_int_arith(ch); });
 
-        auto *mo = dynamic_cast<Expr04 *>(slot.get());
-        if (!mo || slot->th != TypeHint::i || mo->elems.size() < 2
-                || !is_addsub_chain(mo))
+        if (slot->th != TypeHint::i)
             return;
-
-        /* FLATTEN: if the base (elems[0]) is itself an int +/- chain (folded
-         * already, bottom-up), splice its operands in. The base has sign +, so
-         * its signs carry directly. */
-        if (auto *base = dynamic_cast<Expr04 *>(mo->elems[0].second.get())) {
-            if (mo->elems[0].second->th == TypeHint::i
-                    && is_addsub_chain(base)) {
-                std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
-                for (auto &pr : base->elems)
-                    merged.push_back(std::move(pr));
-                for (size_t i = 1; i < mo->elems.size(); i++)
-                    merged.push_back(std::move(mo->elems[i]));
-                mo->elems = std::move(merged);
-            }
-        }
-
-        /* Need a non-constant base to rebuild around (skip `1 - n`). */
-        if (mo->elems[0].second->is_lit_int())
-            return;
-
-        /* COMBINE: fold int-literal operands into one constant; keep the
-         * non-constant operands in order. */
-        int_type constant = 0;
-        std::vector<std::pair<Op, unique_ptr<Construct>>> kept;
-        kept.push_back(std::move(mo->elems[0]));        /* the non-const base */
-        for (size_t i = 1; i < mo->elems.size(); i++) {
-            auto *li = dynamic_cast<const LiteralInt *>(
-                mo->elems[i].second.get());
-            if (li)
-                constant += (mo->elems[i].first == Op::minus) ? -li->ival()
-                                                              : li->ival();
-            else
-                kept.push_back(std::move(mo->elems[i]));
-        }
-        if (constant != 0) {
-            auto lit = make_unique<LiteralInt>(
-                constant < 0 ? -constant : constant);
-            lit->th = TypeHint::i;
-            kept.emplace_back(constant < 0 ? Op::minus : Op::plus,
-                              std::move(lit));
-        }
-
-        if (kept.size() == 1)
-            slot = std::move(kept[0].second);   /* constants canceled: base only */
-        else
-            mo->elems = std::move(kept);
+        if (dynamic_cast<Expr04 *>(slot.get()))
+            fold_addsub(slot);
+        else if (dynamic_cast<Expr03 *>(slot.get()))
+            fold_mul(slot);
     }
 
     bool block_inlinable_decl(const FuncDeclStmt *fd)

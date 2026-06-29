@@ -765,11 +765,13 @@ if it folded a lot; else leave the call), and the **backtrace** uses
 "inlined-at" chains (`InlineCtx`, `errors.h`) flushed by `flush_inline_frames`
 (`backtrace.cpp`) at two error-path points (`Construct::eval` and
 `do_func_call`'s catch), keyed off `Exception::inline_origin_emitted` (see the
-re-fold paragraph), leaving `format_backtrace` unchanged. *General*
-algebraic simplification of non-constant operands (`x+1-1 -> x`) is deliberately
-out of scope — unsound in a dynamically-typed language without type narrowing
-(float non-associativity, `+`-overloading on strings/arrays, preserved type
-errors). **Status:** the `InlineCtx` backtrace foundation exists (a
+re-fold paragraph), leaving `format_backtrace` unchanged. Algebraic
+simplification of non-constant operands (`x+1-1 -> x`, `a+a -> 2*a`,
+`x*2*3 -> x*6`) is done for **int-typed** operands only (`fold_int_arith`, see
+its own section) — sound because inference proves the type (`-fwrapv` makes int
+`+`/`-`/`*` associative); it stays out of scope for `float` (non-associative
+rounding) and `str`/`array` (`+`-overloading), and `/`/`%` (truncating division
+isn't associative). **Status:** the `InlineCtx` backtrace foundation exists (a
 `Construct::inline_ctx` field, the flush helper + the `Construct::eval` hook),
 **AST deep-clone** (`Construct::clone()`, all node types), and the **size-only
 inliner** (`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
@@ -932,17 +934,25 @@ missed-optimization, now fixed). coderender no longer prints a per-node `inlined
 marker (a ternary is self-evidently real code; the flood made a deep unroll
 unreadable) — only the `InlinedCallExpr` case emits one.
 
-**Int-algebra fold (`fold_int_arith`, run once after the inline fixpoint).** The
-substitution produces nested arithmetic — `fib(((n-1)-1)-1)`. A bottom-up pass
-combines the constant literals in an **int-typed** `+`/`-` chain into one term:
-`(n-1)-1`→`n-2`, so the depth-2 frontier reads **`fib(n-3)`/`fib(n-4)`**. It
-flattens a nested `+`/`-` base, sums the literal operands, and rebuilds
-`base ± K` (dropping the chain entirely if the constants cancel). **SOUND for int
-ONLY** — wraparound is associative mod 2⁶⁴, so regrouping `+`/`-` is exact under
-`-fwrapv` — hence **gated on `th == i`**: a float chain (non-associative
-rounding) or a string `+` (concatenation) is never touched. This is the
-type-narrowed slice of the long-deferred "algebraic simplification" pass, now
-safe because inference proved the type. **Caveat:** an UNTYPED template base
+**Int-algebra fold (`fold_int_arith`, run once after the inline fixpoint).** A
+bottom-up algebraic simplifier for **int-typed** (`th == i`) arithmetic chains,
+in three parts: (1) **`+`/`-` constant combining** — `(n-1)-1`→`n-2`, so the
+unrolled frontier reads **`fib(n-3)`/`fib(n-4)`** not `fib(((n-1)-1)-1)`;
+(2) **`+`/`-` like-term collection** (`fold_addsub`) — structurally-equal
+side-effect-free operands merge by net coefficient: `a+a`→`2*a`, `a-a`→`0`,
+`a+b-a`→`b`, `x+1+x+2`→`2*x+3` (`expr_equal` compares ids/int-literals/arith
+chains; a side-effecting operand is kept verbatim per occurrence); (3) **`*`
+constant-factor combining** (`fold_mul`) — `x*2*3`→`x*6`, `x*1`→`x`, `x*0`→`0`
+(the last only when the non-const factors are side-effect-free, so dropping them
+is sound). **SOUND for int ONLY** — `+`/`-`/`*` are associative & commutative mod
+2⁶⁴ under `-fwrapv`, so regroup/reorder/merge is exact — hence **gated on
+`th == i`**: a float chain (non-associative rounding) or a string `+`
+(concatenation) is never touched. `/` and `%` are excluded (truncating int
+division isn't associative). A rebuilt chain's base op is `Op::invalid` (asserted
+in `eval_first_rvalue`, so a structural mistake aborts rather than miscomputes).
+This is the type-narrowed realization of the long-deferred "algebraic
+simplification" pass, now safe because inference proved the type. **Caveat:** an
+UNTYPED template base
 (`func fib(n)`) has no `th`, so its body stays literal (`fib(((n-1)-1)-1)`) — its
 arithmetic CAN'T be folded soundly (a future instance might be float); a concrete
 / `int`-annotated function (or any int instance) folds. The base-case guards are
@@ -988,13 +998,14 @@ its contribution. **Effect: ~14x on naive `fib(32)`** (0.01s vs 0.14s CPython;
 `-npc` 0.5s, `-ni` 0.28s — i.e. cache off is *slower* than no-inline, which is
 why the two ship together); more when a caller calls the same `fib(k)` repeatedly
 (the cache dedups those too); broad-suite geomean a slight net win. Correct for
-`fib`, `ackermann`, container-returning tree recursions. coderender renders the
-unrolled body so `:show fib` shows the (depth-`REC_UNROLL_LEVELS`) expansion. Still
-**not done**: the deferred type-narrowing/algebraic pass — which is also what a
-*natural* `:show` rendering needs (fold `n-1-1`→`n-2`, an `if`→ternary, so the
-body reads as `(n<3 ? n-1 : fib(n-2)+fib(n-3)) + …`); today it renders the literal
-unrolled block with `$a<slot>` arg-temps. Note the base-case guards CANNOT be
-dropped for a variable arg (a flat "4 calls" is unsound — `n` could be 2).
+`fib`, `ackermann`, container-returning tree recursions. The unrolled body is
+**expressible** (guard bodies → ternaries, locals copy-propagated, arithmetic
+int-folded), so `:show fib$0` reads
+`(n-1<2 ? n-1 : fib$0(n-2)+fib$0(n-3)) + …` — real, writable MyLang. The
+base-case guards CANNOT be dropped for a variable arg (a flat "4 calls" is
+unsound — `n` could be 2). The only inlining-adjacent item still **deferred** is
+*general* flow-sensitive type narrowing beyond the null-narrowing the check pass
+already does (the int-algebraic part is done — see `fold_int_arith`).
 
 ## Static type inference (`inferencer.cpp`)
 
