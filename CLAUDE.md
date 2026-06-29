@@ -898,18 +898,19 @@ value (a single-return body) or an `inlined <name>` marker.
 
 **Recursion unroll + per-frame pure-call cache (the fib win).** A pure,
 TREE-recursive function (≥2 self-calls, `func_is_cacheable_recursive`) is
-admitted to `block_funcs` and **unrolled in place**: the walk inlines its own
-self-calls, growing its decl body until it reaches `REC_NODE_CAP` nodes (the
-"unroll the definition"). Two correctness points: each self-call splices a clone
-of the **saved ORIGINAL body** (`rec_orig`), not the in-place-growing body, so
-the unroll does not compound; and the bound is by **size** (robust to
-template-instance name redirects, which a chain-of-names count is not). Template
-instances sit at the root's front, so the decl is unrolled before any external
-call site is walked — that site then sees the body ≥ cap and does NOT inline it,
-it CALLS the unrolled function, so the unroll lives in the decl and every frame
-runs it. The unroll's **duplicate self-calls** (`fib(n-3)` appears in both
-`fib(n-1)`'s and `fib(n-2)`'s expansions) land in ONE frame (the `InlinedCallExpr`
-shares the caller frame) and **dedup at runtime via a per-frame cache**: the
+admitted to `block_funcs` and **unrolled in place** ("unroll the definition"):
+the walk inlines its own self-calls. The unroll is **balanced — one level**: the
+recursive splice does NOT re-scan (`if (!is_rec)`), because the re-scan is
+depth-first and would expand ONE self-call branch to the cap and leave the
+sibling a call (a LOPSIDED unroll that dedups far worse — the un-expanded branch
+is the bottleneck); skipping it lets the outer walk expand EACH self-call exactly
+once. Two more correctness points: each self-call splices a clone of the **saved
+ORIGINAL body** (`rec_orig`), not the in-place-growing body, so the unroll does
+not compound; and `REC_NODE_CAP` (a size bound, robust to template-instance name
+redirects) caps a func with many self-calls. The unroll's **duplicate self-calls**
+(`fib(n-1)` and `fib(n-2)`'s bodies both call `fib(n-3)`) land in ONE frame (the
+`InlinedCallExpr` shares the caller frame) and **dedup at runtime via a per-frame
+cache**: the
 inliner sets `FuncDeclStmt::cache_results`, the devirt pass turns a call to such
 a func into a **`CachedCallExpr`** (a `DirectCallExpr` subclass — a SEPARATE node
 so the plain `DirectCallExpr` path pays NO per-call cache check), and
@@ -920,9 +921,12 @@ wouldn't, so a recursion whose base case misses negatives — `fact(-1)` — can
 diverge), and frame-scoped (the cache dies with the frame → not global
 memoization, which would be the script's job). Only a **scalar** result is cached
 (a pure func may return a fresh mutable container; caching it would alias it
-across callers). **Effect: ~2.1x on naive `fib` (a base reduction of the
-exponential — ~1.6→~1.45, NOT linear)**; correct for `fib`, `ackermann`, and
-container-returning tree recursions. Still **not done** (see
+across callers). **Effect: ~6x on `bench/09_fib_recursive`** (a base reduction of
+the exponential, not linear), more when a caller calls the same `fib(k)` repeatedly
+(the per-frame cache also dedups those); broad-suite geomean is a slight net win
+(0.98x), linear recursion byte-neutral. Correct for `fib`, `ackermann`, and
+container-returning tree recursions. coderender renders the unrolled body so
+`:show fib` shows the balanced one-level expansion. Still **not done** (see
 `plans/function-inlining.md`): the deferred type-narrowing/algebraic pass.
 
 ## Static type inference (`inferencer.cpp`)

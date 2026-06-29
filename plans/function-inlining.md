@@ -384,12 +384,14 @@ Not yet done; roughly in priority order:
      a self-call's `n-1` arg needs.
    - **B — recursion unroll.** A pure tree-recursive func (≥2 self-calls,
      `func_is_cacheable_recursive`) is admitted to `block_funcs` and unrolled in
-     place: the walk inlines its own self-calls, growing the decl body to
-     `REC_NODE_CAP`. Each self-call splices a clone of the SAVED ORIGINAL body
-     (`rec_orig`), not the growing body (no compounding); the bound is by SIZE
-     (robust to template-instance name redirects). Instances are at the root
-     front, so the decl is unrolled before external call sites are walked — those
-     see the body ≥ cap and CALL the unrolled func (no call-site re-unroll).
+     place: the walk inlines its own self-calls. The unroll is **balanced — one
+     level**: the recursive splice does NOT re-scan (`if (!is_rec)`), since the
+     re-scan is depth-first and would expand one branch to the cap and leave the
+     sibling a call (a LOPSIDED unroll — measured ~20x SLOWER than balanced,
+     because the un-expanded branch is the bottleneck). Each self-call splices a
+     clone of the SAVED ORIGINAL body (`rec_orig`), not the growing body (no
+     compounding); `REC_NODE_CAP` (a SIZE bound, robust to template-instance name
+     redirects) caps a func with many self-calls.
    - **C — per-frame pure-call cache.** The InlinedCallExpr shares the caller
      frame, so the unroll's duplicate self-calls land in one frame; the inliner
      sets `cache_results`, devirt makes such a call a **`CachedCallExpr`** (a

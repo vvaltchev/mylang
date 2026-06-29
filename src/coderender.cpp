@@ -298,10 +298,13 @@ struct Renderer {
                 o << "(";
                 if (r->elem) expr(r->elem.get(), 0); else o << "none";
                 o << ")";
-            } else {
-                const char *nm = (e->elem && e->elem->inline_ctx)
-                    ? e->elem->inline_ctx->callee_name.c_str() : "?";
-                o << "/* inlined " << nm << " */";
+            } else if (e->elem) {
+                /* a multi-statement inlined body (e.g. an unrolled recursion):
+                 * render it as a brace block so the expansion is visible (an
+                 * "inlined <name>" marker comes from the body's inline_ctx
+                 * tracking). Best-effort - a block in expression position is not
+                 * valid MyLang, but :show is a decompiler. */
+                inline_block(e->elem.get(), cur_level);
             }
             return;
         }
@@ -334,11 +337,15 @@ struct Renderer {
         return is_const ? "const" : "var";
     }
 
+    int cur_level = 0;   /* the enclosing statement's indent, for an inlined
+                          * block body rendered inside an expression */
+
     void stmt(const Construct *c, int level)
     {
         if (!c || dynamic_cast<const NopConstruct *>(c))
             return;
 
+        cur_level = level;
         const InlineCtx *saved;
         const bool tagged = enter_inline(c, saved);
 

@@ -2986,7 +2986,14 @@ private:
               std::to_string(ntemps) + " arg-temp slot(s))");
 
         slot = move(ica);
-        walk(slot, depth + 1, fsize);   /* re-scan: nested calls in the body */
+        /* Re-scan to collapse nested calls in the spliced body. NOT for a
+         * recursive self-inline: the re-scan is depth-first, so it would expand
+         * ONE self-call branch to the size cap and leave the sibling a call (a
+         * lopsided unroll). Skipping it means the outer walk expands each
+         * self-call exactly once - a BALANCED 1-level unroll whose frontier
+         * self-calls (with their duplicates) the per-frame cache dedups. */
+        if (!is_rec)
+            walk(slot, depth + 1, fsize);
     }
 
     /*
