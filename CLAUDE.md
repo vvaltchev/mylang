@@ -114,7 +114,8 @@ Running scripts:
 ```
 ./build/mylang FILE              # run a script; extra args become argv
 ./build/mylang -e 'EXPR'         # run inline source (-e args concatenated)
-./build/mylang -s FILE           # dump syntax tree (const-folding) then run
+./build/mylang -s FILE           # dump syntax tree (const-folded), then ALSO
+                                 # the post-optimizer tree (inline/unroll), run
 ./build/mylang -t FILE           # dump tokens
 ./build/mylang -nc FILE          # disable const-eval (compare -s with/without)
 ./build/mylang -ni FILE          # disable function inlining (debug)
@@ -172,9 +173,10 @@ Unlike `-s`/`--debug-ti`, the analyze rendering now has a headless `-rt` test
 (`analyze:`, via `analyze_and_render` with color on).
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
 what survived
-const-folding, and `-nc` lets you see the tree as written before folding. Reach
-for them whenever
-behavior surprises you.
+const-folding (and, after the optimizer runs, a second **"Optimized syntax
+tree"** dump showing the post-inline/unroll/specialize AST — the actual node
+shapes, e.g. an `InlinedCall(Block(...))`), and `-nc` lets you see the tree as
+written before folding. Reach for them whenever behavior surprises you.
 
 ## Tests
 
@@ -901,15 +903,20 @@ value (a single-return body) or an `inlined <name>` marker.
 **Recursion unroll + per-frame pure-call cache (the fib win).** A pure,
 TREE-recursive function (≥2 self-calls, `func_is_cacheable_recursive`) is
 admitted to `block_funcs` and **unrolled in place** ("unroll the definition"):
-the walk inlines its own self-calls, to **`REC_UNROLL_LEVELS`** levels (2). The
-bound is **recursion DEPTH** (`rec_depth`, bumped around the recursive re-scan),
-NOT body size: a depth cap expands EVERY self-call to the same depth (BALANCED),
-while a size cap stops mid-level and leaves some self-calls un-expanded
-(LOPSIDED, which dedups far worse — the un-expanded branch is the bottleneck;
-e.g. a 3-self-call `tribonacci` lost its third branch under the old size cap).
-Two more correctness points: each self-call splices a clone of the **saved
-ORIGINAL body** (`rec_orig`), not the in-place-growing body, so the unroll does
-not compound; and `REC_NODE_CAP` is a high size BACKSTOP for a pathological body.
+the walk inlines its own self-calls, to a **per-function depth**
+(`rec_unroll_depth`) chosen from the COST MODEL — keep adding levels while the
+projected body weight (×branching each level) fits `REC_UNROLL_BUDGET` (tuned so
+fib, w0≈71/branching 2, gets 2 levels; tribonacci, w0≈97/branching 3, gets 1; a
+body weight >~150 gets 0 — 2 levels of a huge body is a waste, the fib-class is
+small). The runtime bound is **recursion DEPTH** (`rec_depth`, bumped around the
+recursive re-scan), NOT body size: a depth cap expands EVERY self-call to the
+same depth (BALANCED), while a size cap stops mid-level and leaves some
+self-calls un-expanded (LOPSIDED, which dedups far worse — e.g. a 3-self-call
+`tribonacci` lost its third branch under the old size cap). A LEVEL is
+all-or-nothing (every self-call at it is expanded). Two more correctness points:
+each self-call splices a clone of the **saved ORIGINAL body** (`rec_orig`), not
+the in-place-growing body, so the unroll does not compound; and `REC_NODE_CAP` is
+a high size BACKSTOP for a pathological body.
 The unroll's **duplicate self-calls**
 (`fib(n-1)` and `fib(n-2)`'s bodies both call `fib(n-3)`) land in ONE frame (the
 `InlinedCallExpr` shares the caller frame) and **dedup at runtime via a per-frame

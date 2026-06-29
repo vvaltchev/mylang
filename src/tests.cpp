@@ -10137,6 +10137,58 @@ static const FuncDeclStmt *find_top_func(Construct *root, const char *name)
  * `print(3)`; inlined with non-const args becomes `print(x + y)` annotated
  * `inlined f`; an instantiated template surfaces its array element type.
  */
+/* Audit the SHAPE of the recursion unroll (not just that it computes the right
+ * answer - a lopsided/wrong-depth unroll is still correct). Counts InlinedCall
+ * nodes in the optimized AST (via serialize): a balanced K-level unroll of a
+ * branching-B body has B + B^2 + ... + B^K of them. Typed params keep each func
+ * concrete (no template instance to disambiguate). */
+static bool inline_unroll_shape()
+{
+    const char *src[] = {
+        "func fib(int n) { if (n<2) return n; return fib(n-1)+fib(n-2); }",
+        "func tri(int n) { if (n<3) return n;"
+        "                  return tri(n-1)+tri(n-2)+tri(n-3); }",
+        /* a deliberately HEAVY body: its weight exceeds the unroll budget, so
+         * it must NOT unroll (2 levels of a big body is a waste). */
+        "func big(int n) { if (n<2) return n;"
+        "  var p=n*2; var q=p+1; var r=q*3; var s=r-n; var t=s+p;"
+        "  var u=t*2; var v=u-1;"
+        "  return big(n-1)+big(n-2)+p+q+r+s+t+u+v; }",
+        "var a = fib(10); var b = tri(10); var c = big(10);",
+    };
+    std::vector<Tok> toks;
+    for (size_t i = 0; i < sizeof(src) / sizeof(src[0]); i++)
+        lexer(src[i], static_cast<int>(i + 1), toks);
+    unique_ptr<Construct> root;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        root = pBlock(pc);
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+    } catch (...) {
+        return false;
+    }
+    auto inlined_count = [&](const char *name) -> int {
+        const FuncDeclStmt *f = find_top_func(root.get(), name);
+        if (!f)
+            return -1;
+        std::ostringstream os;
+        os << *f;
+        const std::string s = os.str();
+        int n = 0;
+        for (size_t p = s.find("InlinedCall"); p != std::string::npos;
+             p = s.find("InlinedCall", p + 1))
+            n++;
+        return n;
+    };
+    bool ok = true;
+    ok = ok && inlined_count("fib") == 6;   /* 2 balanced levels: 2 + 4 */
+    ok = ok && inlined_count("tri") == 3;   /* 1 level, ALL 3 branches (balance) */
+    ok = ok && inlined_count("big") == 0;   /* over budget -> not unrolled */
+    return ok;
+}
+
 static bool coderender_inline_fold_types()
 {
     const char *src[] = {
@@ -10317,6 +10369,8 @@ static const std::vector<extra_check> extra_checks =
     { "trace: every category narrates a decision", trace_pipeline_categories },
     { "coderender: inlining, folding, and instance types",
       coderender_inline_fold_types },
+    { "inline: recursion unroll shape (depth/balance/budget)",
+      inline_unroll_shape },
     { "coderender: :show highlighting (block comment + $ id)",
       coderender_highlight },
     { "repl: completion (globals/builtins/keywords)",

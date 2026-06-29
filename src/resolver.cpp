@@ -2216,13 +2216,21 @@ class Inliner {
      * this many nodes (count_all_nodes), then the remaining self-calls are the
      * frontier (deduped at runtime by the per-frame cache). Bounds the unrolled
      * decl size; tune vs bench/. */
-    /* How many levels deep a self-recursive func is unrolled. Bounding by DEPTH
-     * (not body size) keeps the unroll BALANCED: every self-call is expanded to
-     * the same depth, regardless of how many self-calls the body has (a size cap
-     * cuts off mid-level -> lopsided, which dedups far worse). Tune vs bench/. */
-    static const int REC_UNROLL_LEVELS = 2;
-    /* A high size backstop for a pathological body (many self-calls x depth). */
-    static const int REC_NODE_CAP = 400;
+    /* How deep a self-recursive func is unrolled. The DEPTH is chosen per-func
+     * from the cost model so a level always fits a weight BUDGET (and a level is
+     * all-or-nothing - every self-call at a level is expanded, so the unroll is
+     * BALANCED). Each level roughly multiplies the body weight by the branching
+     * factor (#self-calls), so a small body (fib) gets 2 levels while a big one
+     * gets fewer or none - 2 levels of a huge body would be a waste.
+     * `rec_unroll_depth()` computes it; `REC_UNROLL_BUDGET` is the projected
+     * post-unroll weight ceiling, `REC_UNROLL_MAX` a hard level cap. */
+    /* Tuned (via the `--trace inline` rec_unroll_depth line) so fib (w0=71,
+     * branching 2) unrolls 2 levels and tribonacci (w0=97, branching 3) 1; a
+     * body weight >~150 unrolls 0 levels (2 levels of a big body is a waste). */
+    static const long REC_UNROLL_BUDGET = 300;
+    static const int REC_UNROLL_MAX = 3;
+    /* A high node backstop for a pathological body (many self-calls x depth). */
+    static const int REC_NODE_CAP = 600;
     int rec_depth = 0;   /* current self-inline depth along the walk path */
     long inline_budget = 0;
 
@@ -2230,6 +2238,35 @@ class Inliner {
      * each self-call splices the original, not the in-place-growing body (which
      * would compound). Keyed by the FuncDeclStmt (stable for the run). */
     std::unordered_map<FuncDeclStmt *, unique_ptr<Construct>> rec_orig;
+    /* Per-func unroll depth, computed once from the ORIGINAL body (the first
+     * rec_unroll_depth() call, before any unroll grows the body). */
+    std::unordered_map<const FuncDeclStmt *, int> rec_levels;
+
+    /* The unroll depth for a self-recursive func: keep adding levels while the
+     * projected body weight (w * branching each level) fits REC_UNROLL_BUDGET,
+     * capped at REC_UNROLL_MAX. Cached, because the body grows during unroll but
+     * the depth must be computed from the ORIGINAL (the first call sees it). */
+    int rec_unroll_depth(const FuncDeclStmt *f)
+    {
+        auto it = rec_levels.find(f);
+        if (it != rec_levels.end())
+            return it->second;
+        const long branching = count_uid(f->body.get(), f->id->uid);
+        const long w0 = body_weight(f->body.get());
+        long w = w0;
+        int k = 0;
+        while (k < REC_UNROLL_MAX && branching >= 2
+               && w * branching <= REC_UNROLL_BUDGET) {
+            w *= branching;
+            k++;
+        }
+        TRACE(inlining, 0, std::string("rec_unroll_depth ") +
+              std::string(f->id->get_str()) + " w0=" + std::to_string(w0) +
+              " branching=" + std::to_string(branching) +
+              " -> " + std::to_string(k) + " level(s)");
+        rec_levels[f] = k;
+        return k;
+    }
 
 public:
 
@@ -2385,7 +2422,7 @@ private:
      * Locals are allowed (v2): try_inline_block remaps them, growing the caller
      * frame (capped at 64 slots).
      */
-    static bool block_inlinable_decl(const FuncDeclStmt *fd)
+    bool block_inlinable_decl(const FuncDeclStmt *fd)
     {
         if (!fd->body || !fd->body->is_block() || !fd->id || !fd->resolved)
             return false;
@@ -2395,15 +2432,15 @@ private:
             return false;
         /*
          * A self-recursive func is inlinable only if it is TREE-recursive and
-         * pure (func_is_cacheable_recursive): the inliner UNROLLS it a bounded
-         * number of levels and the per-frame cache dedups the duplicate
-         * self-calls (the v3 fib win). Its body weight is dominated by the
-         * self-calls (which become the frontier, not inlined past the cap), so
-         * the weight gate does NOT apply - the recursion cap bounds it instead.
-         * A non-recursive func uses the cost-model weight gate (below one call).
+         * pure (func_is_cacheable_recursive) AND big enough to unroll at least
+         * one level within the weight budget (rec_unroll_depth > 0): the inliner
+         * UNROLLS it that many levels and the per-frame cache dedups the
+         * duplicate self-calls (the v3 fib win). A huge recursive body unrolls
+         * to 0 levels and is left a plain call (no benefit, just bloat). A
+         * non-recursive func uses the cost-model weight gate (below one call).
          */
         if (refs_uid(fd->body.get(), fd->id->uid))
-            return func_is_cacheable_recursive(fd);
+            return func_is_cacheable_recursive(fd) && rec_unroll_depth(fd) > 0;
         return body_weight(fd->body.get()) < CALL_WEIGHT;
     }
 
@@ -2846,20 +2883,21 @@ private:
 
         /*
          * A SELF-RECURSIVE callee (block_inlinable_decl admitted it only if it
-         * is tree-recursive + pure) is UNROLLED to `REC_UNROLL_LEVELS` levels.
-         * The bound is `rec_depth` (this call's self-inline depth along the walk
-         * path), NOT body size: a size cap stops mid-level and leaves some
-         * self-calls un-expanded (LOPSIDED, dedups far worse), while a depth cap
-         * expands EVERY self-call to the same depth (balanced) regardless of how
-         * many a body has. Each self-call splices a clone of the ORIGINAL body
-         * (`rec_orig`, saved before any unroll), NOT the in-place-growing body,
-         * so the unroll does not COMPOUND. `REC_NODE_CAP` is a high backstop for
-         * a pathological body. The duplicate frontier self-calls hit the
-         * per-frame pure-call cache (cache_results).
+         * is tree-recursive + pure) is UNROLLED to `rec_unroll_depth(f)` levels
+         * (chosen per-func from the weight budget). The bound is `rec_depth`
+         * (this call's self-inline depth along the walk path), NOT body size: a
+         * size cap stops mid-level and leaves some self-calls un-expanded
+         * (LOPSIDED, dedups far worse), while a depth cap expands EVERY self-call
+         * to the same depth (balanced) regardless of how many a body has. Each
+         * self-call splices a clone of the ORIGINAL body (`rec_orig`, saved
+         * before any unroll), NOT the in-place-growing body, so the unroll does
+         * not COMPOUND. `REC_NODE_CAP` is a high backstop for a pathological
+         * body. The duplicate frontier self-calls hit the per-frame pure-call
+         * cache (cache_results).
          */
         const bool is_rec = refs_uid(f->body.get(), f->id->uid);
         if (is_rec) {
-            if (rec_depth >= REC_UNROLL_LEVELS
+            if (rec_depth >= rec_unroll_depth(f)
                     || count_all_nodes(f->body.get()) >= REC_NODE_CAP)
                 return;
             if (!rec_orig.count(f))

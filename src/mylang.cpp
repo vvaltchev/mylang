@@ -390,6 +390,16 @@ int main(int argc, char **argv)
              * block builds its own "main" Frame for slotted top-level vars. */
             run_optimizers(root.get(), !opt_no_inline, opt_inline_threshold,
                            !opt_no_type_infer);
+
+            /* -s also dumps the tree AFTER the optimizer (inlining, unroll,
+             * specialization) so the actual optimized AST is inspectable. */
+            if (opt_show_syntax_tree) {
+                cout << "Optimized syntax tree" << endl;
+                cout << "--------------------------" << endl;
+                cout << *root << endl;
+                cout << "--------------------------" << endl;
+            }
+
             root->eval(nullptr);
         }
 
