@@ -37,7 +37,8 @@ CMakeSettings.json
 
 # Specific files and directories to ignore
 mylang
-build
+# any build directory: build, build-rel, build-dbg, out-of-tree BUILD_DIRs, ...
+build*
 
 # Temp files produced by the I/O builtin tests
 *.tmp
