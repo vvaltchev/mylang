@@ -224,6 +224,11 @@ def main():
     ap.add_argument("--baseline", default="",
                     help="a 2nd mylang binary to compare against (before/after); "
                          "adds base(s) and cur/base (speedup) columns")
+    ap.add_argument("--vm", action="store_true",
+                    help="run the current mylang with -vm (the bytecode VM). "
+                         "Pair with --baseline <same binary> to gate the VM "
+                         "vs the tree-walker: cur/base = VM/tree-walk "
+                         "(<1 == VM faster). The baseline is NOT given -vm.")
     ap.add_argument("--python", default=sys.executable,
                     help="python interpreter to compare against")
     ap.add_argument("--timeout", type=float, default=120.0,
@@ -254,9 +259,11 @@ def main():
         sys.exit("no benchmarks matched")
 
     scale_arg = str(args.scale)
-    print("mylang : %s" % mylang)
+    print("mylang : %s%s" % (mylang, "  (engine: -vm bytecode VM)"
+                             if args.vm else ""))
     if has_base:
-        print("baseline: %s" % args.baseline)
+        print("baseline: %s%s" % (args.baseline,
+                                  "  (engine: tree-walker)" if args.vm else ""))
     print("python : %s" % args.python)
     print("scale  : %d    repeat (best of): %d\n" % (args.scale, args.repeat))
 
@@ -281,8 +288,10 @@ def main():
         my_path = os.path.join(MY_DIR, name + ".my")
         py_path = os.path.join(PY_DIR, name + ".py")
 
-        my_t, my_out, my_err = time_cmd(
-            [mylang, my_path, scale_arg], args.repeat, args.timeout)
+        # The current mylang runs under -vm when requested; the baseline never
+        # does, so `--vm --baseline <same binary>` gates VM against tree-walker.
+        my_cmd = [mylang] + (["-vm"] if args.vm else []) + [my_path, scale_arg]
+        my_t, my_out, my_err = time_cmd(my_cmd, args.repeat, args.timeout)
 
         base_t = None
         if has_base:

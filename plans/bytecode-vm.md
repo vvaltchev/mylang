@@ -89,6 +89,43 @@ Since Phase 0 is fallback-only, both engines are identical by construction, and
 each subsequent native lowering is validated against the oracle the moment it
 lands. A wrong opcode surfaces as a diff on some existing test, immediately.
 
+## Pillar 3 — the performance gate (never ship a silent regression)
+
+Correctness is not enough: the VM exists to be *faster*, so every step is also
+gated on the bench. `bench/run.py --vm --baseline <same binary>` runs the
+suite with the current binary under `-vm` (current) and without it (baseline),
+so the `cur/base` column is **VM / tree-walker** (<1 == VM faster) and the
+geomean is the verdict. Run it (release, `ASSERTS=0`) at the end of every phase.
+
+**The target is "VM ≥ tree-walker at every step," but that is an aspiration,
+not a theorem.** The end state is strictly faster by construction (native
+replaces fallback, and fallback == tree-walker cost). But an *intermediate*
+step can be marginally slower for two principled reasons the structured
+tree-walker doesn't pay:
+- **boundary marshalling** — moving a value between a fallback op's `EvalValue`
+  return and the native value stack;
+- **dispatch scaffolding** — a flattened region runs several opcode-switch
+  iterations where the tree-walker used one tight C++ loop / virtual call.
+
+So a step that adds a thin native shell over still-fallback internals may not
+pay for itself until a later phase makes enough of the hot path native. **That
+is allowed, but only if flagged**: if a phase regresses any benchmark, either
+fix it, or record it here (and in the commit) as a **temporary, tracked**
+regression naming the phase that must erase it — and that later phase's exit
+gate must show it gone. A regression that is neither justified nor tracked
+fails the phase. Phase 0 (pure fallback) measured **geomean 1.00x** (0.99-1.02x
+band, noise) — the expected neutral baseline.
+
+**Design rule that keeps the aspiration true: lower only as deep as you go
+native.** Do not shatter a region into fallback ops you're not yet making
+native — that is pure added scaffolding with no offsetting win. Flatten the
+STRUCTURE you're nativizing (e.g. a loop's CFG, so break/continue/return become
+jumps) but keep each not-yet-native straight-line body as a SINGLE fallback
+block-eval, and have the native driver consume the body's `FlowState` afterward
+exactly as `WhileStmt::do_eval` does. One `do_eval` per not-yet-native chunk =
+no marshalling, no per-statement dispatch = neutral-or-better at that step. Only
+flatten a body into individual ops in the phase that makes those ops native.
+
 ## Phase roadmap
 
 Each phase: **what it adds**, the **fallback boundary** (what still uses the
@@ -113,8 +150,10 @@ engines"). Rough LoC budgets keep steps honest.
   (`g_exec_engine`) as a SEPARATE `VM differential: M/K` summary line - the same
   tests a second time, counted once (the headline total is unchanged); both
   must be green to exit 0.
-- **Result**: `-vm` runs the whole language via fallback; **2457/2457** under
-  both engines (debug+ASan/UBSan and release). Plumbing proven.
+- **Result**: `-vm` runs the whole language via fallback; **1302/1302**
+  (tree-walker) + **1155/1155** (VM differential) under both debug+ASan/UBSan
+  and release; bench gate `--vm --baseline` **geomean 1.00x** (neutral, as a
+  pure-fallback engine must be). Plumbing proven.
 
 ### Phase 1 — control-flow flattening, "main" body (~250 LoC)
 The maintainer's "goto / collapse if / collapse loops" step. Expressions still
@@ -232,10 +271,15 @@ work — dominates. Don't pre-optimize the machine model.
 
 ## Definition of done (per phase and overall)
 
-- **Per phase**: the whole `-rt` suite is green under the tree-walker AND the
-  VM, including the stdout/exception/loc/backtrace diffs; the phase's target
-  construct is native (no longer falls back); a `repl:`-style / functional test
-  pins any new VM-visible behavior; the commit updates this plan's status +
-  CLAUDE.md if the implementation shape changed.
-- **Overall**: `-vm` at full parity with `-tw`, faster on the bench geomean,
-  default flipped, both engines exercised in CI. No un-`log`ged fallbacks.
+- **Per phase**: (1) the whole `-rt` suite is green under the tree-walker AND
+  the VM (the differential pass), including the stdout/exception/loc/backtrace
+  diffs; (2) the **bench gate** (`--vm --baseline <same binary>`, release
+  `ASSERTS=0`) shows no unflagged regression vs the tree-walker — a regression
+  is either fixed or recorded here as temporary+tracked (Pillar 3); (3) the
+  phase's target construct is native (no longer falls back); (4) a
+  `repl:`-style / functional test pins any new VM-visible behavior; (5) the
+  commit updates this plan's status + CLAUDE.md if the implementation shape
+  changed.
+- **Overall**: `-vm` at full parity with `-tw`, faster on the bench geomean
+  (and no benchmark left behind by a still-tracked regression), default
+  flipped, both engines exercised in CI. No un-`log`ged fallbacks.

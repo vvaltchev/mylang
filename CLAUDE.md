@@ -253,6 +253,16 @@ enumerated there. (Floats match: both are 64-bit IEEE `double`.)
 `bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
+**`--vm` — the bytecode-VM performance gate.** `run.py --vm` runs the current
+mylang binary with `-vm` (the bytecode VM). Combined with `--baseline <the same
+binary>`, the baseline runs WITHOUT `-vm` (the tree-walker), so the `cur/base`
+column and geomean are **VM / tree-walker** (<1 == VM faster). This is the
+per-phase performance gate for the VM build-out (see "Execution strategy" +
+`plans/bytecode-vm.md`): run it release + `ASSERTS=0` at the end of each phase;
+a phase must not regress the tree-walker unless the regression is flagged as
+temporary + tracked to a later phase that erases it. Phase 0 (pure fallback) is
+neutral (geomean 1.00x), as it must be.
+
 ## Source layout & compilation model
 
 **Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty
