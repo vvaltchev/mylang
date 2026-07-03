@@ -116,6 +116,25 @@ gate must show it gone. A regression that is neither justified nor tracked
 fails the phase. Phase 0 (pure fallback) measured **geomean 1.00x** (0.99-1.02x
 band, noise) — the expected neutral baseline.
 
+**Concrete thresholds (the boundary cost is small, so a big regression is a
+bug, not a tax).** `cur/base` is VM/tree-walker; >1 means the VM is slower.
+- **Gate on the GEOMEAN** — it is noise-robust; single benchmarks swing ±2-5%
+  on this box from thermal/load alone. Healthy: geomean `cur/base` ≤ ~1.03
+  (≤3% slower). >~1.05 (5%) is **stop-and-investigate**.
+- A **single benchmark** may sit up to ~5% slower *temporarily* only if flagged
+  + tracked AND confirmed real. A wall-clock swing under ~5% on one benchmark
+  is inside the noise floor — **confirm with cachegrind** (deterministic
+  instruction count; no `perf` on WSL2) before treating it as a regression at
+  all. "Is this 5% real?" is answered by instruction count, never by re-running
+  the clock.
+- **A geomean past ~5%, or a cachegrind-confirmed single-benchmark regression
+  approaching double digits (and certainly ~30%), is a RED FLAG, not a boundary
+  tax** — halt the phase and root-cause it (per-iteration codegen, a rebuilt
+  context/frame per call, an extra hot-path allocation, a tree-walker fast path
+  the VM bypassed, an accidental O(n²)). The boundary/scaffolding costs are
+  small constant factors; they *cannot* produce a large regression, so a large
+  one is always a real defect. It is never "acceptable overhead."
+
 **Design rule that keeps the aspiration true: lower only as deep as you go
 native.** Do not shatter a region into fallback ops you're not yet making
 native — that is pure added scaffolding with no offsetting win. Flatten the
