@@ -2796,6 +2796,51 @@ the proof. Before calling it done:
   with a test that documents the current (limited) behavior, so the gap is
   *visible* and intentional rather than a latent surprise.
 
+## Execution strategy: strip compile-time overhead first, THEN a bytecode VM
+
+MyLang's performance philosophy is a two-front strategy, in this deliberate
+order — the same order a real C/C++ compiler works in:
+
+1. **Do at compile time everything a compiler would.** The AST tree-walker
+   runs *at parse time* (const-eval) and the optimizer stack (fold,
+   auto-const/pure, inline, specialize, monomorphize, M8, flat arrays,
+   recursion unroll, int-algebra) rewrites the tree into an **optimal AST**
+   with the pointless work already removed. This is the project's defining
+   trait and is **not** compromised for the VM: the tree-walker is a permanent
+   part of the compiler — both as the parse-time const evaluator (woven into
+   the parser; it can *never* be a VM's job, since const-eval happens before
+   any bytecode exists) and as the producer of the optimized AST the VM
+   consumes. A `-vm` run still runs every optimizer pass, then lowers the
+   result; the VM never re-does compile-time work.
+2. **THEN execute that optimal AST fast at runtime with a bytecode VM.** The
+   tree-walker is already ~2.7x faster than CPython (geomean); a flat bytecode
+   interpreter removes the residual per-node virtual-dispatch tax — which we
+   *measured* to be the tree-walker's floor (an instruction-count study with
+   cachegrind killed node-level "superinstructions": fusing a typed operator's
+   operand reads saved ~1 instruction/iteration, 0.03%, because it only trades
+   a well-predicted monomorphic vcall for an equal-length inline branch; the
+   per-node dispatch can only be removed *wholesale*, which is what a VM does).
+   Target: **5-10x CPython**.
+
+The VM does **not** replace the runtime value/scope model — it reuses
+`EvalValue`, `EvalContext`, `Frame`/slots, the global/builtin tables,
+`num_bin_op`, the `Type` ops, and every builtin unchanged. It is a *dispatch
+strategy* (a flat instruction stream + a switch loop) layered over the same
+runtime, not a second interpreter — which is what keeps it small and correct.
+
+**Status: planned, not built.** Gated by a new `-vm` flag (the tree-walker is
+the default); once the VM is at full parity **and** faster on the bench
+geomean, the default flips and `-tw` selects the tree-walker. Implemented in
+its **own files** (`bytecode.*`, `codegen.*`, `vm.*`), never woven into
+`eval.cpp`. The build-out is strictly incremental behind two safety pillars: a
+**differential test harness** (every functional test runs under BOTH engines
+and must produce identical output/exception/loc/backtrace) and an
+**AST-fallback opcode** (`EVAL_STMT`/`EVAL_EXPR` that just calls the node's
+existing `do_eval`), so the VM executes the *whole* language from day one and
+we replace fallbacks with native opcodes one small, fully-tested step at a
+time — never a big-bang 10k-LoC drop. Full roadmap + phase order:
+`plans/bytecode-vm.md`.
+
 ## Invariants & hazards (defense in depth)
 
 This project deliberately builds many overlapping correctness layers (a
