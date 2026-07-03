@@ -2857,8 +2857,9 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: Phase 1 landed** (scaffold + both safety pillars; native control-flow
-flattening for top-level `if`/`while`). Gated by the
+**Status: Phase 2 landed** (register machine over frame slots — a resolved-local
+int loop runs native, no fallback; `01_while_loop` ~2x faster under `-vm`).
+Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
@@ -2882,9 +2883,17 @@ smallest sensible step is acceptable, an accidental one is not.
 flattens **top-level `if`/`while`** to jumps; conditions/bodies still fall back
 (one `do_eval` each), so break/continue/nested loops go through the body's own
 FlowState, which `LoopBackEdge` consumes — identical to `While`/`IfStmt`. `for`
-is left fallback (its child-context loop-var scope mustn't be dropped). This
-carries one tracked regression (`01_while_loop` +8%: loop scaffolding with no
-native win yet, erased when the loop goes native). Full roadmap + phase order:
+is left fallback (its child-context loop-var scope mustn't be dropped).
+**Phase 2** is a **REGISTER machine over the frame slots** (the VM's registers
+ARE the resolved-local slots — NO value stack), with fused superinstructions:
+`IntBin` (3-address `dst = a <arith> b`, operands = slot or int immediate) and
+`JumpUnlessIntCmp` (fused compare+branch). A `while` whose condition is a leaf
+int compare and whose body is all leaf-operand int compound-assigns / `++`/`--`
+compiles with **no tree-walker fallback**; anything else falls back to Phase 1.
+This is where the VM starts to *win*: `01_while_loop` −50% instructions / ~2x
+wall-clock, erasing the Phase-1 regression. The register choice (over a stack
+machine, which the already-M8-optimized tree-walker would beat) is also the
+right IR for the eventual native x86-64 codegen. Full roadmap + phase order:
 `plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)

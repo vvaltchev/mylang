@@ -6,6 +6,7 @@
 #include "syntax.h"
 #include "eval.h"
 #include "errors.h"
+#include "bitops.h"
 
 #include <memory>
 
@@ -25,6 +26,32 @@ vm_eval_cond(const Construct *c, EvalContext *ctx)
     if (c->th == TypeHint::i)
         return c->eval_int(ctx) != 0;
     return RValue(c->eval(ctx)).is_true();
+}
+
+/* Read a register operand as an int: an immediate, or a frame slot's int (a
+ * bool slot reads as 0/1, mirroring Identifier::eval_int). The register machine
+ * uses the frame slots directly - no value stack. */
+static inline int_type
+read_int_operand(const Operand &o, EvalContext *ctx)
+{
+    if (o.is_lit)
+        return o.lit;
+    const LValue &lv = ctx->frame->slots[o.slot];
+    if (lv.is<bool>())
+        return lv.getval<bool>() ? 1 : 0;
+    return lv.getval<int_type>();
+}
+
+/* Write an int result into a frame slot: overwrite the int in place when the
+ * slot already holds one (the common, hot case), else set value + int type. */
+static inline void
+write_int_slot(EvalContext *ctx, int slot, int_type v)
+{
+    LValue &lv = ctx->frame->slots[slot];
+    if (lv.is<int_type>())
+        lv.getval<int_type>() = v;
+    else
+        lv.put(EvalValue(v));
 }
 
 /*
@@ -118,6 +145,58 @@ vm_execute(const Construct *root_c)
                 break;
             }
 
+            break;
+        }
+
+        case OpCode::IntBin: {
+
+            const int_type a = read_int_operand(in.a, &ctx);
+            const int_type b = read_int_operand(in.b, &ctx);
+            int_type r;
+
+            switch (in.aop) {
+            case Op::plus:  r = a + b; break;
+            case Op::minus: r = a - b; break;
+            case Op::times: r = a * b; break;
+            case Op::div:
+                if (b == 0) throw DivisionByZeroEx(in.node->start, in.node->end);
+                r = a / b; break;
+            case Op::mod:
+                if (b == 0) throw DivisionByZeroEx(in.node->start, in.node->end);
+                r = a % b; break;
+            case Op::band: r = a & b;          break;
+            case Op::bor:  r = a | b;          break;
+            case Op::bxor: r = a ^ b;          break;
+            case Op::shl:  r = bit_shl(a, b);  break;
+            case Op::shr:  r = bit_shr(a, b);  break;
+            case Op::ushr: r = bit_ushr(a, b); break;
+            default: throw InternalErrorEx();
+            }
+
+            write_int_slot(&ctx, in.target, r);
+            pc++;
+            break;
+        }
+
+        case OpCode::JumpUnlessIntCmp: {
+
+            const int_type a = read_int_operand(in.a, &ctx);
+            const int_type b = read_int_operand(in.b, &ctx);
+            bool cond;
+
+            switch (in.aop) {
+            case Op::lt: cond = a <  b; break;
+            case Op::gt: cond = a >  b; break;
+            case Op::le: cond = a <= b; break;
+            case Op::ge: cond = a >= b; break;
+            case Op::eq: cond = a == b; break;
+            default:     cond = a != b; break;   /* noteq */
+            }
+
+            if (cond)
+                pc++;
+            else
+                pc = in.target;
             break;
         }
 

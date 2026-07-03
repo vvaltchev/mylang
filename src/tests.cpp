@@ -10441,29 +10441,29 @@ static bool frame_over_64_slots()
 }
 
 /*
- * Phase-1 codegen SHAPE: a top-level `while` must lower to native jumps
- * (JumpIfFalse + LoopBackEdge), an `if/else` to a JumpIfFalse + Jump - not a
- * single EvalStmt fallback. Behavior alone can't prove this (fallback runs the
- * same), so assert the emitted opcodes directly. See plans/bytecode-vm.md.
+ * Codegen SHAPE (Phase 1 + 2): assert the emitted opcodes directly - behavior
+ * alone can't tell native from fallback (both run the same). Three paths:
+ *   - a resolved-local int `while` -> the register machine (JumpUnlessIntCmp +
+ *     IntBin), NO tree-walker fallback;
+ *   - a `while` whose body isn't int-compilable (a call) -> the Phase-1 flatten
+ *     (JumpIfFalse + LoopBackEdge);
+ *   - an `if/else` -> JumpIfFalse + Jump.
+ * See plans/bytecode-vm.md.
  */
-static bool vm_codegen_flattens_control_flow()
-{
-    const char *lines[] = {
-        "var i = 0;",
-        "var s = 0;",
-        "while (i < 5) { s += i; i += 1; }",
-        "if (s > 3) s += 100; else s -= 1;",
-    };
+struct VmOpCounts {
+    size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
+};
 
+static bool codegen_counts(const std::vector<const char *> &lines,
+                           VmOpCounts &c)
+{
     std::string src;
     std::vector<Tok> toks;
-    for (size_t i = 0; i < sizeof(lines) / sizeof(*lines); i++) {
+    for (size_t i = 0; i < lines.size(); i++) {
         if (i) src += '\n';
         src += lines[i];
     }
     lexer(src, 1, toks);
-
-    size_t jif = 0, jmp = 0, back = 0, halt = 0;
     try {
         ParseContext pc(TokenStream(toks), true);
         unique_ptr<Construct> root = pBlock(pc);
@@ -10471,31 +10471,61 @@ static bool vm_codegen_flattens_control_flow()
         infer_types(root.get());
         resolve_names(root.get());
         specialize_types(root.get());
-
         const Block *b = dynamic_cast<const Block *>(root.get());
         if (!b)
             return false;
-
         const Chunk chunk = codegen_program(b);
         for (const Instr &in : chunk.code) {
-            if (in.op == OpCode::JumpIfFalse) jif++;
-            else if (in.op == OpCode::Jump) jmp++;
-            else if (in.op == OpCode::LoopBackEdge) back++;
-            else if (in.op == OpCode::Halt) halt++;
+            switch (in.op) {
+            case OpCode::JumpIfFalse:      c.jif++;    break;
+            case OpCode::Jump:             c.jmp++;    break;
+            case OpCode::LoopBackEdge:     c.back++;   break;
+            case OpCode::JumpUnlessIntCmp: c.juic++;   break;
+            case OpCode::IntBin:           c.intbin++; break;
+            case OpCode::Halt:             c.halt++;   break;
+            default:                                   break;
+            }
         }
     } catch (...) {
         return false;
     }
+    return true;
+}
 
-    /* while: >=1 JumpIfFalse + exactly 1 LoopBackEdge; if/else: 1 JumpIfFalse
-     * + 1 Jump; the program ends in exactly one Halt. */
-    return back == 1 && jmp >= 1 && jif >= 2 && halt == 1;
+static bool vm_codegen_shapes()
+{
+    /* 1) resolved-local int while -> native register ops; if/else -> flatten. */
+    VmOpCounts a;
+    if (!codegen_counts({
+            "var i = 0;", "var s = 0;",
+            "while (i < 5) { s += i; i += 1; }",
+            "if (s > 3) s += 100; else s -= 1;",
+        }, a))
+        return false;
+    /* native while: 1 JumpUnlessIntCmp + 2 IntBin (s+=i, i+=1), NO LoopBackEdge;
+     * if/else: 1 JumpIfFalse + 1 Jump; exactly one Halt. */
+    const bool native_ok =
+        a.juic == 1 && a.intbin == 2 && a.back == 0 &&
+        a.jif == 1 && a.jmp >= 1 && a.halt == 1;
+
+    /* 2) a while whose body isn't int-compilable (a call) stays the Phase-1
+     * flatten: JumpIfFalse + LoopBackEdge, no native ops. */
+    VmOpCounts b;
+    if (!codegen_counts({
+            "var i = 0; var s = 0;",
+            "while (i < 5) { print(i); i += 1; }",
+        }, b))
+        return false;
+    const bool fallback_ok =
+        b.back == 1 && b.jif == 1 && b.juic == 0 && b.intbin == 0;
+
+    return native_ok && fallback_ok;
 }
 
 static const std::vector<extra_check> extra_checks =
 {
-    { "vm: codegen flattens if/while to jumps",
-      vm_codegen_flattens_control_flow },
+    { "vm: codegen shapes (native int loop + flatten)",
+      vm_codegen_shapes },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },
     { "analyze: counted `for` is greened, float-var `for` is not",
       analyze_greens_counted_for },

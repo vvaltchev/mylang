@@ -1,7 +1,9 @@
 # Bytecode VM
 
-Status: **Phase 0 landed** (scaffold + both safety pillars; the whole `-rt`
-suite passes under both engines). Branch: `exp-work`.
+Status: **Phase 2 (step 2.0) landed** — a register machine over the frame slots
+makes a resolved-local int loop native (`01_while_loop` ~2x faster under `-vm`,
+−50% instructions); Phases 0–1 (scaffold, both pillars, if/while flattening)
+done; the whole `-rt` suite passes under both engines. Branch: `exp-work`.
 
 The design + incremental task plan for MyLang's runtime bytecode VM. Read the
 CLAUDE.md section "Execution strategy: strip compile-time overhead first, THEN
@@ -121,16 +123,10 @@ exit gate must show it gone. Phase 0 (pure fallback) measured **geomean 1.00x**
 (0.99-1.02x band, noise) — the expected neutral baseline.
 
 **Tracked regressions (temporary, understood, must be erased):**
-- **`01_while_loop` +8.1% instructions (cachegrind), Phase 1.** Flattening a
-  top-level `while` adds per-iteration opcode dispatch (JumpIfFalse + EvalStmt +
-  LoopBackEdge) while the condition and body are still fallbacks calling the
-  same `do_eval` — pure scaffolding, no native win yet. It is the *only*
-  benchmark with a top-level `while` (the rest are in functions → fallback), so
-  the suite geomean stays ~1.01x. **Erased by:** the native-loop work (native
-  scalar conditions, Phase 2; native loop body, Phase 3) — once the loop's
-  condition+body are native VM ops, the VM does cheaper work than the
-  tree-walker's per-node dispatch, and the flattening pays. Phase 2/3's exit
-  gate must show `01_while_loop` back to ≤ ~1.0x.
+- ~~`01_while_loop` +8.1% instructions, Phase 1~~ — **ERASED in Phase 2.** The
+  register machine (native int loop) took it from +8.1% to **−50.3%
+  instructions** (cachegrind) / **0.51x wall-clock** — a ~2x *win*, not just
+  parity. No open tracked regressions.
 
 **Concrete thresholds (the boundary cost is small, so a big regression is a
 bug, not a tax).** `cur/base` is VM/tree-walker; >1 means the VM is slower.
@@ -220,24 +216,48 @@ still fall back.
   handled), hoist break/continue to real jumps, `return`-as-jump/epilogue (main
   has no top-level return), foreach/try-catch native.
 
-### Phase 2 — native scalar exprs + the value stack (~500 LoC, 2 sub-steps)
-Where the VM starts to *win*.
-- **2a (boxed, correctness):** value stack of `EvalValue`. Opcodes:
-  `PUSH_LIT`, `LOAD_LOCAL/GLOBAL/CAPTURE/BUILTIN slot`, and boxed binary/unary
-  ops that pop, call `num_bin_op`/the `Type` op, push. Lower the `Expr0N` ladder
-  + `TypedScalarExpr` + `Identifier` + literals; `EVAL_EXPR` fallback for
-  subscript/call/dict/member/string. Removes tree dispatch; still boxed.
-- **2b (unboxed, speed):** typed int/float stack ops mirroring
-  `TypedScalarExpr::eval_int/eval_float` (no `num_bin_op` promotion, no boxing),
-  chosen by the node's `TypeHint`. `JUMP_IF_FALSE` consumes an unboxed int
-  condition. This is the M8 payoff, now in a flat loop.
-- **Exit**: scalar arithmetic/comparison run native (unboxed) in main; suite
-  green both; **first VM bench wins** on scalar loops.
+### Phase 2 — a REGISTER machine over the frame slots (NOT a value stack)
+Where the VM starts to *win* — and an architecture decision that supersedes the
+original "value stack" plan.
 
-### Phase 3 — native statements (~250 LoC)
-- `STORE_LOCAL/GLOBAL/CAPTURE`, compound-assign, decl — reusing `slot_rmw` /
-  the `handle_single_expr14` fast paths. `i += 1`, `x = expr`, `var y = expr`.
-- **Exit**: common assignment/decl native; suite green both.
+**Why register, not stack.** The tree-walker's scalar paths are already at their
+floor (the Option-A cachegrind study: fusing a typed node's operand reads saved
+0.03%). A naive **stack machine** re-encodes each node as push/pop — per-op
+dispatch ≈ the tree-walker's per-node vcall, *plus* stack traffic — so it would
+be neutral-or-worse. Instead: the interpreter already has **frame slots** for
+resolved locals, so the VM's **registers ARE the slots**. Operands name slot
+indices directly; there is no value stack. Combined with **fused
+superinstructions** (one op = a whole statement/condition), the VM does *fewer,
+fatter* ops than the tree-walker's per-node dispatch — a real win. Bonus: a
+3-address slot-based IR is the right on-ramp to the maintainer's eventual native
+x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
+
+- **Step 2.0 — resolved-local INT scalar loop — DONE.** Two ops:
+  `IntBin{dst_slot = a <arith> b}` (3-address; a/b are `Operand`s = slot or int
+  immediate) and `JumpUnlessIntCmp{a <cmp> b -> target}` (fused compare+branch).
+  Codegen (`try_native_int_while`) compiles a `while` whose condition is a leaf
+  int compare and whose body is entirely compound-assigns / `++`/`--` of leaf
+  int operands into `JumpUnlessIntCmp` + `IntBin`s + a back `Jump` — no
+  `LoopBackEdge` (a compilable body has no break/continue/decl). Anything
+  unsupported (nested rhs, float, plain assign, global/capture slot, a call,
+  ...) falls back to Phase 1 exactly. VM reads/writes slots directly
+  (`read_int_operand`/`write_int_slot`, bool slot read as 0/1); div/mod keep the
+  zero check with the source `Loc`. **Result: `01_while_loop` −50.3%
+  instructions / 0.51x wall-clock (~2x win)** — erased the Phase-1 regression;
+  geomean **0.99x**; `53_collatz` (worst wall outlier) +0.00% instrs = confirmed
+  noise, no accidental regression. 1303/1303 + 1155/1155; shape test
+  `vm: codegen shapes` pins the opcodes.
+- **Next steps (same register architecture):** nested int expressions (allocate
+  temp slots as scratch registers), plain `x = expr`, `float` ops, global /
+  capture slot operands, more statement forms; compile them where each is a win.
+
+### Phase 3 — compact the Instr encoding + broaden native statements
+- The `Instr` grew (two `Operand`s + `aop`) to carry register ops; harmless now
+  (top-level Instr counts are small) but compact it (operand pool / variant)
+  before function bodies compile many Instrs.
+- Broaden native statements/expressions on the register machine (decls, more
+  assign shapes), reusing the `slot_rmw` semantics.
+- **Exit**: common assignment/decl native; suite green both; no regression.
 
 ### Phase 4 — function calls + call stack (~500 LoC)
 The maintainer's "global bytecode / stack / calls in the VM" milestone. Removes
