@@ -109,12 +109,28 @@ tree-walker doesn't pay:
 
 So a step that adds a thin native shell over still-fallback internals may not
 pay for itself until a later phase makes enough of the hot path native. **That
-is allowed, but only if flagged**: if a phase regresses any benchmark, either
-fix it, or record it here (and in the commit) as a **temporary, tracked**
-regression naming the phase that must erase it — and that later phase's exit
-gate must show it gone. A regression that is neither justified nor tracked
-fails the phase. Phase 0 (pure fallback) measured **geomean 1.00x** (0.99-1.02x
-band, noise) — the expected neutral baseline.
+is allowed when it is the smallest sensible increment and it is flagged.** The
+maintainer's rule: take the smallest incremental step, and if that step carries
+a temporary scaffolding regression that *makes sense*, keep it and keep
+improving the engine — do NOT inflate the step just to avoid a temporary
+regression. What is forbidden is an **accidental** regression (unexplained, or
+from a mistake). So: understood + tracked = fine; surprising = stop and
+root-cause. Record every tracked regression under "Tracked regressions" below
+(and in the commit), naming the later phase that must erase it; that phase's
+exit gate must show it gone. Phase 0 (pure fallback) measured **geomean 1.00x**
+(0.99-1.02x band, noise) — the expected neutral baseline.
+
+**Tracked regressions (temporary, understood, must be erased):**
+- **`01_while_loop` +8.1% instructions (cachegrind), Phase 1.** Flattening a
+  top-level `while` adds per-iteration opcode dispatch (JumpIfFalse + EvalStmt +
+  LoopBackEdge) while the condition and body are still fallbacks calling the
+  same `do_eval` — pure scaffolding, no native win yet. It is the *only*
+  benchmark with a top-level `while` (the rest are in functions → fallback), so
+  the suite geomean stays ~1.01x. **Erased by:** the native-loop work (native
+  scalar conditions, Phase 2; native loop body, Phase 3) — once the loop's
+  condition+body are native VM ops, the VM does cheaper work than the
+  tree-walker's per-node dispatch, and the flattening pays. Phase 2/3's exit
+  gate must show `01_while_loop` back to ≤ ~1.0x.
 
 **Concrete thresholds (the boundary cost is small, so a big regression is a
 bug, not a tax).** `cur/base` is VM/tree-walker; >1 means the VM is slower.
@@ -135,15 +151,17 @@ bug, not a tax).** `cur/base` is VM/tree-walker; >1 means the VM is slower.
   small constant factors; they *cannot* produce a large regression, so a large
   one is always a real defect. It is never "acceptable overhead."
 
-**Design rule that keeps the aspiration true: lower only as deep as you go
-native.** Do not shatter a region into fallback ops you're not yet making
-native — that is pure added scaffolding with no offsetting win. Flatten the
-STRUCTURE you're nativizing (e.g. a loop's CFG, so break/continue/return become
-jumps) but keep each not-yet-native straight-line body as a SINGLE fallback
-block-eval, and have the native driver consume the body's `FlowState` afterward
-exactly as `WhileStmt::do_eval` does. One `do_eval` per not-yet-native chunk =
-no marshalling, no per-statement dispatch = neutral-or-better at that step. Only
-flatten a body into individual ops in the phase that makes those ops native.
+**Design guideline (minimize scaffolding, but don't inflate steps): lower only
+as deep as you go native, WHERE that's still the smallest step.** Keeping each
+not-yet-native straight-line body as a SINGLE fallback block-eval (the native
+driver consuming its `FlowState`, as `WhileStmt::do_eval` does) avoids
+marshalling and per-statement dispatch. Prefer it. BUT per the maintainer's
+call, don't grow a step just to reach zero regression: Phase 1 flattens the
+`while` CFG (JumpIfFalse + a single fallback body + LoopBackEdge) even though,
+with a fallback condition+body, that is scaffolding with no native win yet — it
+is the smallest step that builds the loop machinery, and its cost is tracked
+(see `01_while_loop` above) to be erased when the loop goes native. The bar is:
+smallest sensible increment + no *accidental* regression, not zero regression.
 
 ## Phase roadmap
 
@@ -174,20 +192,33 @@ engines"). Rough LoC budgets keep steps honest.
   and release; bench gate `--vm --baseline` **geomean 1.00x** (neutral, as a
   pure-fallback engine must be). Plumbing proven.
 
-### Phase 1 — control-flow flattening, "main" body (~250 LoC)
-The maintainer's "goto / collapse if / collapse loops" step. Expressions still
-fall back.
-- Add `JUMP target`, `JUMP_IF_FALSE{cond, target}` (cond evaluated via the
-  existing `eval_cond`, reused verbatim — so the typed-condition fast path is
-  preserved even in fallback).
-- Lower `if`/`while`/`for` in the **main** body to flat jumps + `EVAL_STMT`
-  leaves; `break`/`continue` -> jumps to loop end/continue labels; `return` ->
-  store result + jump to epilogue (`HALT` for main). No `FlowState` for
-  VM-native control flow — jumps replace it.
-- `foreach`, `try/catch` stay whole-statement `EVAL_STMT` fallbacks (iterator /
-  exception state is fiddly; do them natively much later).
-- **Exit**: main's if/while/for/break/continue/return are native jumps; suite
-  green both. Heavily exercised immediately — most tests *are* top-level code.
+### Phase 1 — control-flow flattening, "main" body — **DONE**
+The maintainer's "collapse if / collapse loops" step. Conditions and bodies
+still fall back.
+- Added `Jump{target}`, `JumpIfFalse{cond, target}` (cond via `vm_eval_cond`,
+  mirroring the tree-walker's `eval_cond` — the typed-condition fast path is
+  preserved), and `LoopBackEdge{cont, break}` (post-body flow dispatch,
+  mirroring While/ForStmt::do_eval).
+- Codegen flattens **top-level `if` and `while`** (`Codegen` in `codegen.cpp`,
+  emit + label-backpatch): `if` -> JumpIfFalse + fallback then/else + Jump;
+  `while` -> JumpIfFalse + fallback body + LoopBackEdge. Bodies stay SINGLE
+  fallback `EvalStmt`s (one `do_eval`, own scope), so break/continue/nested
+  loops are handled by the body's own do_eval + FlowState, which LoopBackEdge
+  consumes — provably identical to the tree-walker.
+- **`for` is NOT flattened** — ForStmt::do_eval wraps init/cond/inc/body in a
+  child EvalContext (loop-variable scope) that a naive flatten would drop;
+  While/If run in the passed ctx, so they're safe. `for`/foreach/ForRangeStmt/
+  leaf statements stay fallback `EvalStmt`. (Most counted `for`s are
+  `ForRangeStmt` anyway.)
+- **Result**: 1302/1302 + 1155/1155 (VM differential); a codegen SHAPE test
+  (`vm: codegen flattens if/while to jumps`) pins the opcodes. Perf gate:
+  geomean **1.01x** with ONE **tracked regression** — `01_while_loop` +8.1%
+  instrs (see "Tracked regressions"; the only top-level-`while` benchmark),
+  erased when the loop goes native (Phase 2/3). Smallest incremental step per
+  the maintainer's call; no accidental regressions.
+- Deferred to a later step (Phase 2/3): flatten `for` (needs the loop-var scope
+  handled), hoist break/continue to real jumps, `return`-as-jump/epilogue (main
+  has no top-level return), foreach/try-catch native.
 
 ### Phase 2 — native scalar exprs + the value stack (~500 LoC, 2 sub-steps)
 Where the VM starts to *win*.

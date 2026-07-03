@@ -2857,7 +2857,8 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: Phase 0 landed** (scaffold + both safety pillars). Gated by the
+**Status: Phase 1 landed** (scaffold + both safety pillars; native control-flow
+flattening for top-level `if`/`while`). Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
@@ -2865,17 +2866,26 @@ enum — named `OpCode`, since `Op` is already the operator enum in
 `operators.h` — plus `Instr`/`Chunk`), `codegen.{h,cpp}` (`codegen_program`,
 AST→`Chunk` lowering), `vm.{h,cpp}` (`vm_execute` + the `g_exec_engine`
 harness switch) — never woven into `eval.cpp`. The build-out is strictly
-incremental behind two safety pillars: an **AST-fallback opcode**
+incremental behind three safety pillars: an **AST-fallback opcode**
 (`OpCode::EvalStmt`, and later `EvalExpr`, whose handler is just
-`node->eval(ctx)`) so the VM executes the *whole* language from day one, and a
+`node->eval(ctx)`) so the VM executes the *whole* language from day one; a
 **differential test harness** (the `tests` table reruns under the VM and must
-match the tree-walker — see "Tests"). We replace fallbacks with native opcodes
-one small, fully-tested step at a time — never a big-bang 10k-LoC drop. What
-Phase 0 built: `vm_execute` lowers the optimized root to one `EvalStmt` per
-top-level statement + `Halt`, builds the root `EvalContext`/`Frame`/
-`GlobalFuncTable` exactly as `Block::do_eval`'s root path does, and drives the
-flat list — byte-identical to `root->eval(nullptr)`, proven by the whole suite
-passing under both engines. Full roadmap + phase order: `plans/bytecode-vm.md`.
+match the tree-walker — see "Tests"); and a **performance gate** (`bench/run.py
+--vm --baseline`, `cur/base` = VM/tree-walker — see "Benchmarks"). We replace
+fallbacks with native opcodes one small, fully-tested step at a time — never a
+big-bang 10k-LoC drop; a temporary, *tracked* scaffolding regression from the
+smallest sensible step is acceptable, an accidental one is not.
+**Phase 0** lowered the optimized root to one `EvalStmt` per top-level statement
++ `Halt`, building the root `EvalContext`/`Frame`/`GlobalFuncTable` exactly as
+`Block::do_eval`'s root path — byte-identical to `root->eval(nullptr)`.
+**Phase 1** added native control flow (`Jump`/`JumpIfFalse`/`LoopBackEdge`) and
+flattens **top-level `if`/`while`** to jumps; conditions/bodies still fall back
+(one `do_eval` each), so break/continue/nested loops go through the body's own
+FlowState, which `LoopBackEdge` consumes — identical to `While`/`IfStmt`. `for`
+is left fallback (its child-context loop-var scope mustn't be dropped). This
+carries one tracked regression (`01_while_loop` +8%: loop scaffolding with no
+native win yet, erased when the loop goes native). Full roadmap + phase order:
+`plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)
 

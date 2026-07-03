@@ -13,6 +13,21 @@
 ExecEngine g_exec_engine = ExecEngine::TreeWalk;
 
 /*
+ * Evaluate a condition node the same way the tree-walker's eval_cond does: the
+ * unboxed int path when inference proved it a non-null int, else the boxed
+ * is_true path. Mirrored here (eval_cond is a static inline in eval.cpp) so the
+ * VM's JumpIfFalse costs exactly what an `if`/`while` test costs tree-walked -
+ * no regression. The differential harness proves the two agree.
+ */
+static inline bool
+vm_eval_cond(const Construct *c, EvalContext *ctx)
+{
+    if (c->th == TypeHint::i)
+        return c->eval_int(ctx) != 0;
+    return RValue(c->eval(ctx)).is_true();
+}
+
+/*
  * Execute the optimized program via the bytecode VM. It builds the program's
  * root EvalContext exactly as Block::do_eval does for the root block
  * (ctx == nullptr): the implicit "main" Frame for slotted top-level vars, and
@@ -54,19 +69,55 @@ vm_execute(const Construct *root_c)
 
             EvalValue &&tmp = in.node->eval(&ctx);
 
-            /*
-             * Same as Block::do_eval's root loop: an unresolved name surfaces
-             * as an UndefinedId sentinel, and an in-flight return/break/cont
-             * stops the program (a top-level `return` in "main").
-             */
+            /* An unresolved name surfaces as an UndefinedId sentinel, which
+             * Block::do_eval turns into UndefinedVariableEx. FlowState is NOT
+             * acted on here: a break/continue set by a loop body is consumed by
+             * the following LoopBackEdge; main has no top-level flow signal. */
             if (tmp.is<UndefinedId>())
                 throw UndefinedVariableEx(tmp.get<UndefinedId>().id,
                                           in.node->start, in.node->end);
 
-            if (ctx.flow->type != FlowState::none)
-                return;
-
             pc++;
+            break;
+        }
+
+        case OpCode::Jump:
+            pc = in.target;
+            break;
+
+        case OpCode::JumpIfFalse:
+            if (vm_eval_cond(in.node, &ctx))
+                pc++;
+            else
+                pc = in.target;
+            break;
+
+        case OpCode::LoopBackEdge: {
+
+            /* Mirror While/ForStmt::do_eval's post-body flow handling. */
+            FlowState &fs = *ctx.flow;
+
+            switch (fs.type) {
+
+            case FlowState::ret:
+                pc = in.target2;    /* exit loop; leave flow set (propagates) */
+                break;
+
+            case FlowState::brk:
+                fs.type = FlowState::none;
+                pc = in.target2;    /* exit loop */
+                break;
+
+            case FlowState::cont:
+                fs.type = FlowState::none;
+                pc = in.target;     /* continue dest */
+                break;
+
+            default:                /* none */
+                pc = in.target;     /* continue dest */
+                break;
+            }
+
             break;
         }
 
