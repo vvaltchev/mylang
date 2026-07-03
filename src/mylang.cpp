@@ -12,6 +12,7 @@
 #include "repl.h"
 #include "errfmt.h"
 #include "trace.h"
+#include "vm.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -35,6 +36,7 @@ static bool opt_debug_ti;
 static bool opt_analyze;
 static bool opt_no_color;
 static bool opt_repl;
+static bool opt_vm;   /* execute via the bytecode VM instead of the tree-walker */
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
@@ -70,6 +72,9 @@ void help()
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
+    cout << "  -vm      Execute via the bytecode VM (experimental; default is"
+         << endl;
+    cout << "           the tree-walker). See plans/bytecode-vm.md" << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
     cout << " --debug-ti  Dump inferred types of all identifiers, then exit"
          << endl;
@@ -207,6 +212,10 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-nti")) {
 
             opt_no_type_infer = true;
+
+        } else if (!strcmp(arg, "-vm")) {
+
+            opt_vm = true;   /* run via the bytecode VM (plans/bytecode-vm) */
 
         } else if (!strcmp(arg, "--debug-ti")) {
 
@@ -400,7 +409,13 @@ int main(int argc, char **argv)
                 cout << "--------------------------" << endl;
             }
 
-            root->eval(nullptr);
+            /* Execution engine: the tree-walker by default, or the bytecode VM
+             * when -vm is given. The VM runs the SAME optimized AST (it lowers
+             * `root`), so behavior is identical - see plans/bytecode-vm.md. */
+            if (opt_vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
         }
 
     } catch (const SyntaxErrorEx &caught) {

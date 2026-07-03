@@ -1,6 +1,7 @@
 # Bytecode VM
 
-Status: **planning**. Branch: `exp-work`.
+Status: **Phase 0 landed** (scaffold + both safety pillars; the whole `-rt`
+suite passes under both engines). Branch: `exp-work`.
 
 The design + incremental task plan for MyLang's runtime bytecode VM. Read the
 CLAUDE.md section "Execution strategy: strip compile-time overhead first, THEN
@@ -94,19 +95,26 @@ Each phase: **what it adds**, the **fallback boundary** (what still uses the
 oracle), and the **exit gate** (always includes "full suite green under both
 engines"). Rough LoC budgets keep steps honest.
 
-### Phase 0 — scaffolding + both pillars (~300 LoC)
-- New files; `-vm` flag in `mylang.cpp` (after `run_optimizers`, call
-  `vm_execute(root)` instead of `root->eval(nullptr)`).
-- Instr set: `EVAL_STMT`, `EVAL_EXPR`, `HALT`.
-- Factor a shared `setup_root_context` (the root `Frame`/`gfuncs`/context setup
-  currently inside `Block::do_eval`) so the VM and tree-walker build the root
-  environment from **one** code path — no divergence.
-- Codegen: root block -> one `EVAL_STMT` per statement -> `HALT`. (Function
-  calls fully fall back: an `EVAL_STMT` containing a call runs the callee
+### Phase 0 — scaffolding + both pillars — **DONE**
+- New files `bytecode.h` / `codegen.{h,cpp}` / `vm.{h,cpp}`; `-vm` flag in
+  `mylang.cpp` (after `run_optimizers`, call `vm_execute(root)` instead of
+  `root->eval(nullptr)`).
+- Opcode set: `OpCode::EvalStmt`, `OpCode::Halt` (enum named `OpCode`, since
+  `Op` is the operator enum). `EvalExpr` deferred to Phase 2 (nothing needs it
+  yet — don't add unused ops).
+- `vm_execute` builds the root `EvalContext`/`Frame`/`GlobalFuncTable` inline,
+  mirroring `Block::do_eval`'s root path (a shared `setup_root_context`
+  refactor was judged riskier than leaving the oracle untouched — the
+  differential harness proves they agree; factor it later if they drift).
+- Codegen: root block -> one `EvalStmt` per statement -> `Halt`. (Function
+  calls fully fall back: an `EvalStmt` containing a call runs the callee
   tree-walked.)
-- Differential harness wired into `-rt`.
-- **Exit**: `-vm` runs the whole language via fallback; suite green under both
-  (trivially). Plumbing proven.
+- Differential harness wired into `-rt`: the `tests` list reruns under the VM
+  (`g_exec_engine`) as a SEPARATE `VM differential: M/K` summary line - the same
+  tests a second time, counted once (the headline total is unchanged); both
+  must be green to exit 0.
+- **Result**: `-vm` runs the whole language via fallback; **2457/2457** under
+  both engines (debug+ASan/UBSan and release). Plumbing proven.
 
 ### Phase 1 — control-flow flattening, "main" body (~250 LoC)
 The maintainer's "goto / collapse if / collapse loops" step. Expressions still

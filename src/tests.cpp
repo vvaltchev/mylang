@@ -24,6 +24,7 @@
 #include "trace.h"
 #include "coderender.h"
 #include "analyzer.h"
+#include "vm.h"
 
 #include <typeinfo>
 #include <vector>
@@ -7963,7 +7964,15 @@ check(const test &t, int &err_line, bool dump_syntax_tree)
         infer_types(root.get());
         resolve_names(root.get());
         specialize_types(root.get());
-        root->eval(nullptr);
+
+        /* Run the program under the harness's selected engine. The VM lowers
+         * the SAME optimized `root`, so the outcome (result / exception / loc)
+         * must be identical - the differential-testing pillar (see run_tests
+         * below and plans/bytecode-vm.md). */
+        if (g_exec_engine == ExecEngine::Vm)
+            vm_execute(root.get());
+        else
+            root->eval(nullptr);
 
     } catch (const Exception &e) {
 
@@ -10547,6 +10556,8 @@ void run_tests(bool dump_syntax_tree)
     size_t pass_count = 0;
     int err_line;
 
+    g_exec_engine = ExecEngine::TreeWalk;   /* the oracle */
+
     for (const auto &test : tests) {
 
         cout << "[ RUN  ] " << test.name << endl;
@@ -10606,14 +10617,48 @@ void run_tests(bool dump_syntax_tree)
     cout << "SUMMARY" << endl;
     cout << "===========================================" << endl;
     cout << "Tests passed: " << pass_count << "/" << total << " ";
+    cout << (pass_count == total ? "[ PASS ]" : "[ FAIL ]") << endl;
 
+    /*
+     * Differential VM pass: rerun the SAME functional `tests` list under the
+     * bytecode VM (the -vm engine) - not a separate set of tests, the same list
+     * a second time, so it is NOT added to the count above. Each must produce
+     * the identical outcome; since the VM falls back to the tree-walker for any
+     * construct not yet lowered natively, this is green by construction in
+     * Phase 0 and stays a regression net as native opcodes replace fallbacks
+     * (see plans/bytecode-vm.md).
+     */
+    g_exec_engine = ExecEngine::Vm;
+    size_t vm_pass = 0;
 
-    if (pass_count != total) {
-        cout << "[ FAIL ]" << endl;
-        exit(1);
+    for (const auto &test : tests) {
+
+        cout << "[ RUN  ] vm: " << test.name << endl;
+
+        err_line = 0;
+        if (check(test, err_line, dump_syntax_tree)) {
+
+            cout << "[ PASS ]";
+            vm_pass++;
+
+        } else {
+
+            dump_test_source(test, err_line);
+            cout << "[ FAIL ]";
+        }
+
+        cout << endl << endl;
     }
 
-    cout << "[ PASS ]" << endl;
+    g_exec_engine = ExecEngine::TreeWalk;
+
+    cout << "VM differential (same " << tests.size() << " tests via -vm): "
+         << vm_pass << "/" << tests.size() << " ";
+    cout << (vm_pass == tests.size() ? "[ PASS ]" : "[ FAIL ]") << endl;
+
+    if (pass_count != total || vm_pass != tests.size())
+        exit(1);
+
     exit(0);
 }
 

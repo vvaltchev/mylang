@@ -123,6 +123,8 @@ Running scripts:
                                  # (recursion still unrolls; for measurement)
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -nr FILE          # parse/validate only, don't run
+./build/mylang -vm FILE          # execute via the bytecode VM (experimental;
+                                 # default is the tree-walker) — bytecode-vm.md
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang --debug-ti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization
@@ -211,6 +213,21 @@ exception is matched against the *static* C++ type; a user-level
 `throw <struct>` always surfaces as `ExceptionObject` (a.k.a.
 `DynamicExceptionEx`), not a distinct C++ type.
 
+**The `tests` list runs TWICE — once per execution engine (`g_exec_engine`) —
+but is COUNTED ONCE.** The headline `Tests passed: N/total` is unchanged
+(`total = tests + extra_checks + repl_tests`, the tree-walker pass). After it,
+`run_tests` reruns the **same** `tests` list under the **bytecode VM**
+(`vm_execute`, marked `vm:` in the output) and prints a **separate** line,
+`VM differential (same K tests via -vm): M/K` — it is the same tests a second
+time, not a new set, so it is *not* added to the headline total. Both must be
+green to `exit(0)`. This is the **differential-testing pillar** of the VM
+build-out (see "Execution strategy" + the plan): `check()` dispatches its final
+run on `g_exec_engine`, with the tree-walker as the oracle. Because the VM
+falls back to `do_eval` for any construct not yet lowered natively, the
+differential pass is green by construction today and stays a regression net as
+native opcodes land. A new functional test therefore auto-covers both engines
+with no extra work.
+
 ## Benchmarks
 
 `bench/` is a standalone performance suite comparing MyLang against CPython,
@@ -238,14 +255,16 @@ same line.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — eighteen
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
 `eval.cpp`, `types.cpp`, `statictype.cpp`, `trace.cpp`, `coderender.cpp`,
 `backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
-`repl.cpp`, `mylang.cpp`, `tests.cpp` (the last six are the REPL — see "The
-interactive REPL" below; `trace.cpp` is the diagnostic tracer and
-`coderender.cpp` the optimized-AST "decompiler", both used by the REPL).
+`repl.cpp`, `codegen.cpp`, `vm.cpp`, `mylang.cpp`, `tests.cpp` (six of them are
+the REPL — see "The interactive REPL" below; `trace.cpp` is the diagnostic
+tracer and `coderender.cpp` the optimized-AST "decompiler", both used by the
+REPL; `codegen.cpp`/`vm.cpp` are the bytecode-VM engine — see "Execution
+strategy" — added by the glob, nothing to register).
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
   turns thrown
@@ -2828,18 +2847,25 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: planned, not built.** Gated by a new `-vm` flag (the tree-walker is
-the default); once the VM is at full parity **and** faster on the bench
-geomean, the default flips and `-tw` selects the tree-walker. Implemented in
-its **own files** (`bytecode.*`, `codegen.*`, `vm.*`), never woven into
-`eval.cpp`. The build-out is strictly incremental behind two safety pillars: a
-**differential test harness** (every functional test runs under BOTH engines
-and must produce identical output/exception/loc/backtrace) and an
-**AST-fallback opcode** (`EVAL_STMT`/`EVAL_EXPR` that just calls the node's
-existing `do_eval`), so the VM executes the *whole* language from day one and
-we replace fallbacks with native opcodes one small, fully-tested step at a
-time — never a big-bang 10k-LoC drop. Full roadmap + phase order:
-`plans/bytecode-vm.md`.
+**Status: Phase 0 landed** (scaffold + both safety pillars). Gated by the
+`-vm` flag (the tree-walker is the default); once the VM is at full parity
+**and** faster on the bench geomean, the default flips and `-tw` selects the
+tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
+enum — named `OpCode`, since `Op` is already the operator enum in
+`operators.h` — plus `Instr`/`Chunk`), `codegen.{h,cpp}` (`codegen_program`,
+AST→`Chunk` lowering), `vm.{h,cpp}` (`vm_execute` + the `g_exec_engine`
+harness switch) — never woven into `eval.cpp`. The build-out is strictly
+incremental behind two safety pillars: an **AST-fallback opcode**
+(`OpCode::EvalStmt`, and later `EvalExpr`, whose handler is just
+`node->eval(ctx)`) so the VM executes the *whole* language from day one, and a
+**differential test harness** (the `tests` table reruns under the VM and must
+match the tree-walker — see "Tests"). We replace fallbacks with native opcodes
+one small, fully-tested step at a time — never a big-bang 10k-LoC drop. What
+Phase 0 built: `vm_execute` lowers the optimized root to one `EvalStmt` per
+top-level statement + `Halt`, builds the root `EvalContext`/`Frame`/
+`GlobalFuncTable` exactly as `Block::do_eval`'s root path does, and drives the
+flat list — byte-identical to `root->eval(nullptr)`, proven by the whole suite
+passing under both engines. Full roadmap + phase order: `plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)
 
