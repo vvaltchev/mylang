@@ -422,6 +422,17 @@ enum class OpCode : unsigned char {
     MemberV,
 
     /*
+     * Boxed slice READ `dst = base[start:end]` (an array / string sub-view):
+     * `target2` = the base slot, `a` = the start-index slot (-1 = absent -> the
+     * slice defaults to 0), `b` = the end-index slot (-1 = absent -> to the
+     * end); `node` = the Slice (loc for a non-int-index TypeError, nulled by
+     * extract_locs). Calls the runtime `base.get_type()->slice(base, start,
+     * end)` (which RValues the base + registers the COW slice view), mirroring
+     * Slice::do_eval.
+     */
+    SliceV,
+
+    /*
      * Build an array VALUE from element values in a register run, into `target`
      * - the native form of a `[a, b, ..]` LITERAL whose elements aren't all
      * const (a fully-const literal is baked to a single LoadConstV, not this).

@@ -6451,6 +6451,28 @@ static const std::vector<test> tests =
     },
 
     {
+        /* SharedArrayObj::operator= must unregister THIS from its OLD array's
+         * slices set before taking a new value (the dtor does; the assigns
+         * used not to). A slice var reassigned to a DIFFERENT array's slice,
+         * then both arrays mutated: the reassigned var must no longer be a's
+         * slice (a[0]=99 leaves it) yet still be b's (b[0]=88 COW-protects it).
+         * A stale a-registration -> a dangling pointer read during a's COW
+         * (UBSan-caught under -vm, where a reused slot frees the memory). */
+        "Slice reassign across arrays unregisters from old (assign-op)",
+        {
+            "var a = [1,2,3];",
+            "var b = [4,5,6];",
+            "var s = a[0:1];",
+            "s = b[0:1];",
+            "a[0] = 99;",
+            "b[0] = 88;",
+            "assert(s == [4]);",
+            "assert(a == [99,2,3]);",
+            "assert(b == [88,5,6]);",
+        },
+    },
+
+    {
         "Insert() is slice-safe on arrays (2)",
         {
             "var a = [1,2,3];",

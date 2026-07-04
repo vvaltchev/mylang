@@ -1414,6 +1414,27 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::SliceV: {
+            /* base[start:end] via the runtime Type::slice (which RValues the
+             * base + registers the COW slice view) - mirrors Slice::do_eval. An
+             * absent bound (slot -1) passes `none`. The slice() throws (a
+             * non-int index) get the caret from the loc side table. */
+            const EvalValue &base = ctx.frame->at(in.target2).get();
+            const EvalValue start = in.a.slot >= 0
+                ? ctx.frame->at(in.a.slot).get() : EvalValue();
+            const EvalValue end = in.b.slot >= 0
+                ? ctx.frame->at(in.b.slot).get() : EvalValue();
+            try {
+                ctx.frame->at(in.target).put(
+                    base.get_type()->slice(base, start, end));
+            } catch (Exception &e) {
+                vm_stamp_loc(chunk, pc, e);
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::JumpUnlessTrueV:
             if (!ctx.frame->at(in.target2).get().is_true())
                 pc = in.target;

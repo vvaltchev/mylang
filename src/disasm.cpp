@@ -392,6 +392,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << "." << chunk.member_keys[in.a.lit].memId.get_type()
                               ->to_string(chunk.member_keys[in.a.lit].memId);
             break;
+        case OpCode::SliceV:
+            row << "slice.v      " << D(in.target) << " = " << D(in.target2)
+                << "[";
+            if (in.a.slot >= 0) row << D(in.a.slot);
+            row << ":";
+            if (in.b.slot >= 0) row << D(in.b.slot);
+            row << "]";
+            break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  " << D(in.target2) << ", L" << in.target;
             break;

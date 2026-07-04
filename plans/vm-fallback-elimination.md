@@ -24,6 +24,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~G~~ | ~~general array store~~ | 5 | ~~P4~~ | ✅ 32:.67 20:.62 |
 | ~~S~~ | string element `s[i]`, build | 29,30,31 | — | ✅ native; 30 len-bound |
 | ~~M~~ | multi-assign literal `a,b=[..]` | 22 | — | ✅ array-elide 0.89→0.18 |
+| ~~Sl~~ | slice `a[i:j]`/`s[i:j]` | 15,16,29 | — | ✅ SliceV .50-.78 |
 | ~~C~~ | ~~closure/indirect call `c()`~~ | 11 | — | ✅ CallValueV 1.09→1.00 |
 | **R** | call-in-global-assign `r=f(n)+9` | 10 | P10b | todo |
 | **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |

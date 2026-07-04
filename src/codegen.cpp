@@ -94,6 +94,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::CmpV:        case OpCode::LogV:
     case OpCode::IntBin:      case OpCode::FloatBin:
     case OpCode::SubscriptV:  case OpCode::MemberV:
+    case OpCode::SliceV:
     case OpCode::CallV:       case OpCode::CachedCallV:
     case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
     case OpCode::EvalToSlot:  case OpCode::ArrLen:
@@ -593,6 +594,33 @@ struct Codegen {
             return true;
         }
 
+        /* A slice READ `base[start:end]` -> SliceV. Compile base, then the
+         * optional bounds (in eval order: what, start, end), each into a slot;
+         * an absent bound is a slot of -1. The op calls the runtime slice(). */
+        if (const Slice *sl = dynamic_cast<const Slice *>(e)) {
+            int base_slot;
+            if (!compile_boxed_expr(sl->what.get(), base_slot, ops))
+                return false;
+            int start_slot = -1, end_slot = -1;
+            if (sl->start_idx
+                && !compile_boxed_expr(sl->start_idx.get(), start_slot, ops))
+                return false;
+            if (sl->end_idx
+                && !compile_boxed_expr(sl->end_idx.get(), end_slot, ops))
+                return false;
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::SliceV;
+            in.node = sl;                /* extract_locs nulls it */
+            in.target = t;
+            in.target2 = base_slot;
+            in.a = slot_op(start_slot);  /* -1 == absent */
+            in.b = slot_op(end_slot);
+            ops.push_back(in);
+            out_slot = t;
+            return true;
+        }
+
         /* A native user-function call `f(args...)` -> CallV. */
         if (const DirectCallExpr *dc = dynamic_cast<const DirectCallExpr *>(e))
             if (try_native_call(dc, out_slot, ops))
@@ -915,11 +943,12 @@ struct Codegen {
                 && (ops.back().op == OpCode::BinOpV
                     || ops.back().op == OpCode::LoadConstV
                     || ops.back().op == OpCode::MakeArrayV
-                    || ops.back().op == OpCode::MakeDictV)) {
-                /* MakeArrayV/MakeDictV read their element run before writing
-                 * `target`, and the local lvalue slot can't overlap the temp
-                 * run - so writing the container straight into `a` is sound
-                 * (even `a=[a,1]`, whose old `a` is already in the run). */
+                    || ops.back().op == OpCode::MakeDictV
+                    || ops.back().op == OpCode::SliceV)) {
+                /* These read their operand slots BEFORE writing `target`, and
+                 * the local lvalue slot can't overlap the temp run - so writing
+                 * the result straight into `a` is sound (even `a=[a,1]` /
+                 * `a=a[1:]`, whose operand slots are read first). */
                 ops.back().target = lv->sym.slot;
             } else {
                 Instr in;
@@ -2889,6 +2918,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::CallValueV:
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
+        case OpCode::SliceV:
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold

@@ -255,6 +255,15 @@ public:
 
     SharedArrayObjTempl &operator=(const SharedArrayObjTempl &obj)
     {
+        /* If THIS currently is a slice, it is registered in its OLD shobj's
+         * slices set - unregister before overwriting shobj, or that set keeps a
+         * dangling pointer to us (we now hold a different array). The dtor does
+         * this; the assign operators must too. A VM slot holding a slice, then
+         * overwritten with another value, is exactly this path (a tree-walker
+         * temporary is torn down via the dtor instead, which masked it. */
+        if (slice)
+            shobj->slices.erase(this);
+
         shobj = obj.shobj;
         off = obj.off;
         len = obj.len;
@@ -268,6 +277,9 @@ public:
 
     SharedArrayObjTempl &operator=(SharedArrayObjTempl &&obj)
     {
+        if (slice)                     /* unregister THIS from its old shobj */
+            shobj->slices.erase(this);
+
         shobj = move(obj.shobj);
         off = obj.off;
         len = obj.len;

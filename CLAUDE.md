@@ -2092,7 +2092,15 @@ are unchanged.
   `intrusive_ptr<SharedObject{ vec, set<live slices> }>` +
   `off`/`len`/`slice`. A slice registers itself in the parent's `slices` set
   (and unregisters on
-  move/destroy). Writing through an array-element `LValue`
+  move/destroy — **and on `operator=`**: a copy/move *assign* into a
+  slice-holding value must first `slices.erase(this)` from its OLD `shobj`, or
+  that set keeps a **dangling pointer** to a value that now holds a different
+  array — the dtor did this but the two assign operators used not to. A
+  tree-walker temporary is torn down via the dtor, which masked it; a **VM frame
+  slot** holding a slice and then *overwritten* (slot reuse) hits the assign
+  path and freed the memory, so the stale registration became a genuine
+  use-after-free — UBSan-caught during an array COW). Writing through an
+  array-element `LValue`
   (`LValue::get_value_for_put` in `eval.cpp`)
   triggers COW: if the container is a slice, or is aliased (`use_count > 1` /
   has live slices), it is
@@ -2912,9 +2920,13 @@ geomean 0.75x, VM ~1.3x faster than the tree-walker**). A **boxed (dyn/string)
 value tier** then removed the `node->eval` fallback for scalar `dyn`/string
 expressions — assign / compound-assign / comparison / logical `&&`/`||` over
 locals, globals, captures, builtins, literals, subscripts (`a[i]` via the
-runtime `Type::subscript`), and members (`obj.f` / `d.k` via a shared
-`member_read` factored out of `MemberExpr::do_eval`) — and **`foreach` over an
-array** lowers to a counted loop (snapshot + `ArrLen` + a per-element load + the
+runtime `Type::subscript`), members (`obj.f` / `d.k` via a shared
+`member_read` factored out of `MemberExpr::do_eval`), and **slices**
+(`a[i:j]` / `s[i:j]` → **`SliceV`**, via the runtime `base.get_type()->slice()`
+— the same COW-registered sub-view path as `Slice::do_eval`, absent bounds
+passed as `none`; ~2x on `bench/15`/`16` array-slice, `29` fully native) —
+and **`foreach` over an array** lowers to a counted loop (snapshot + `ArrLen`
++ a per-element load + the
 fused `ForLoopStep`, −64% instructions): a flat `array<int>`/`array<float>`
 reads the raw scalar (`LoadElemInt/Float`, stamped `ForeachStmt::elem_th`), and
 a **GENERAL element (`array<str>` / `array<array>` / `array<dict>` /
