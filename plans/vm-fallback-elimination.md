@@ -27,6 +27,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~Sl~~ | slice `a[i:j]`/`s[i:j]` | 15,16,29 | — | ✅ SliceV .50-.78 |
 | ~~C~~ | ~~closure/indirect call `c()`~~ | 11 | — | ✅ CallValueV 1.09→1.00 |
 | ~~R~~ | global write `g=`/`+=`/`++` | — | — | ✅ StoreGlobalV (0-bench) |
+| ~~I++~~ | flat `a[i]++`/`a[i]--` | — | — | ✅ StoreElem±1 (dict deferred) |
 | **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |
 | ~~Lit~~ | array/dict literal `[..]`/`{}` | 20,22,46 | — | ✅ MakeArr/DictV |
 | ~~LitO~~ | const-literal decl | many | — | ✅ LoadLiteralObjV 76→55 |

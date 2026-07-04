@@ -5463,6 +5463,23 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native flat-array element inc-dec (VM StoreElemInt/Float with a
+         * constant 1 == `a[i] += 1`): `a[i]++` / `a[i]--` on a flat int/float
+         * array. The OOB caret is the subscript's. Differential under -vm. */
+        "Flat-array element inc-dec native (a[i]++)",
+        {
+            "var a = [1, 2, 3];",
+            "for (var i = 0; i < 3; i++) { a[i]++; }",
+            "assert(a == [2, 3, 4]);",
+            "a[0]--;",
+            "assert(a[0] == 1);",
+            "var f = [1.0, 2.0];",
+            "f[1]++;",
+            "assert(f[1] == 3.0);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

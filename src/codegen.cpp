@@ -1593,6 +1593,28 @@ struct Codegen {
                 ops.push_back(in);
                 return true;
             }
+            /* A flat-INT array element `a[i]++` / `a[i]--` -> StoreElemInt with
+             * the base op + a constant 1 (`a[i] += 1`). StoreElemInt's loc is
+             * node->start/end (generic - works for an IncDecExpr node). */
+            if (const Subscript *sub =
+                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                if (sub->th == TypeHint::i && sub->base_array) {
+                    int aslot;
+                    Operand idx;
+                    if (!as_array_slot(sub->what.get(), aslot)
+                        || !compile_int_expr(sub->index.get(), idx, ops))
+                        return false;
+                    Instr in;
+                    in.op = OpCode::StoreElemInt;
+                    in.node = sub;   /* subscript loc for OOB (matches TW) */
+                    in.target2 = aslot;
+                    in.a = idx;
+                    in.b = int_lit(1);
+                    in.aop = inc->is_inc ? Op::plus : Op::minus;
+                    ops.push_back(in);
+                    return true;
+                }
+            }
             return false;
         }
 
@@ -1909,6 +1931,27 @@ struct Codegen {
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
+            }
+            /* A flat-FLOAT array element `a[i]++` / `a[i]--` -> StoreElemFloat
+             * (== `a[i] += 1.0`); loc is node->start/end (generic). */
+            if (const Subscript *sub =
+                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                if (sub->th == TypeHint::f && sub->base_array) {
+                    int aslot;
+                    Operand idx;
+                    if (!as_array_slot(sub->what.get(), aslot)
+                        || !compile_int_expr(sub->index.get(), idx, ops))
+                        return false;
+                    Instr in;
+                    in.op = OpCode::StoreElemFloat;
+                    in.node = sub;   /* subscript loc for OOB (matches TW) */
+                    in.target2 = aslot;
+                    in.a = idx;
+                    in.b = float_lit(1);
+                    in.aop = inc->is_inc ? Op::plus : Op::minus;
+                    ops.push_back(in);
+                    return true;
+                }
             }
             return false;
         }
