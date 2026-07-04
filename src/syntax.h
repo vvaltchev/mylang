@@ -542,6 +542,10 @@ public:
      * the static type of a folded const array/dict literal. */
     const EvalValue &literal_value() const { return value; }
 
+    /* Whether do_eval shares the value (const target) vs a mutable clone (var).
+     * Read by the VM codegen to bake a LoadLiteralObjV pool entry. */
+    bool is_immutable() const { return immutable; }
+
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<LiteralObj>(value, immutable);
         copy_base_fields(*c);

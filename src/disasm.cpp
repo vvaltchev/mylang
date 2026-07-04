@@ -346,6 +346,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << c.get_type()->to_string_repr(c);
             break;
         }
+        case OpCode::LoadLiteralObjV: {
+            const EvalValue &c = chunk.literal_objs[in.target2].value;
+            row << "load.obj     " << D(in.target) << ", "
+                << c.get_type()->to_string_repr(c)
+                << (chunk.literal_objs[in.target2].immutable ? " (const)" : "");
+            break;
+        }
         case OpCode::MoveV:
             row << "move         " << D(in.target) << " = " << D(in.target2);
             break;

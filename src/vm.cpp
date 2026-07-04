@@ -1280,6 +1280,19 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
+        case OpCode::LoadLiteralObjV: {
+            /* Materialize a baked const array/dict/struct literal via shared
+             * eval_literal_obj (immutable share vs a fresh mutable clone, plus
+             * the general/flat_s arr_hint cases) - byte-identical to
+             * LiteralObj::do_eval. */
+            const Chunk::LiteralObjEntry &lo = chunk.literal_objs[in.target2];
+            ctx.frame->at(in.target).put(
+                eval_literal_obj(lo.value, lo.immutable, lo.arr_hint,
+                                 lo.arr_hint_struct));
+            pc++;
+            break;
+        }
+
         case OpCode::MoveV:
             /* Alias, not clone (a container assignment shares the handle;
              * matches doAssign's `x = RValue(rval)` - COW protects later). */

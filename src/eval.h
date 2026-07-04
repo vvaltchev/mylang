@@ -366,6 +366,14 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                                   const StructTypeDef *hint_struct,
                                   bool is_const);
 
+/* The value a baked const array/dict/struct LiteralObj materializes (immutable
+ * share vs mutable clone, plus the general/flat_s arr_hint cases). Shared by
+ * tree-walker (LiteralObj::do_eval) and the VM's LoadLiteralObjV op, so both
+ * materialize byte-identically. */
+EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
+                           ArrHint arr_hint,
+                           const StructTypeDef *arr_hint_struct);
+
 /* Build a dict VALUE from `npairs` INTERLEAVED key/value values ([k0,v0,..]).
  * Keys are frozen. Shared by LiteralDict::do_eval and the VM's MakeDictV. */
 EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,

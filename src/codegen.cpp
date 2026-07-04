@@ -88,6 +88,7 @@ bool op_writes_pure_target(OpCode op)
 {
     switch (op) {
     case OpCode::LoadConstV:  case OpCode::LoadImmInt:
+    case OpCode::LoadLiteralObjV:
     case OpCode::LoadImmFloat: case OpCode::LoadGlobalV:
     case OpCode::LoadCaptureV: case OpCode::LoadBuiltinV:
     case OpCode::MoveV:       case OpCode::BinOpV:
@@ -488,6 +489,24 @@ struct Codegen {
             in.node = e;
             in.target = t;
             in.target2 = add_const(lit);
+            ops.push_back(in);
+            out_slot = t;
+            return true;
+        }
+
+        /* A baked const array/dict/struct literal (LiteralObj) - what a
+         * `var a = [1,2,3]` / `d = {}` const-literal rvalue folds to ->
+         * LoadLiteralObjV materializes it from the pool (immutable share vs a
+         * fresh mutable clone, plus the general/flat_s cases). Node-free. */
+        if (const LiteralObj *lo = dynamic_cast<const LiteralObj *>(e)) {
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::LoadLiteralObjV;
+            in.target = t;
+            in.target2 = static_cast<int>(chunk.literal_objs.size());
+            chunk.literal_objs.push_back(
+                {lo->literal_value(), lo->is_immutable(), lo->arr_hint,
+                 lo->arr_hint_struct});
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -942,6 +961,7 @@ struct Codegen {
             if (ops.size() > omark && ops.back().target == rslot
                 && (ops.back().op == OpCode::BinOpV
                     || ops.back().op == OpCode::LoadConstV
+                    || ops.back().op == OpCode::LoadLiteralObjV
                     || ops.back().op == OpCode::MakeArrayV
                     || ops.back().op == OpCode::MakeDictV
                     || ops.back().op == OpCode::SliceV)) {

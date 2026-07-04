@@ -1817,7 +1817,15 @@ arr_elem_boxed(const SharedArrayObj &a, size_type i)
     }
 }
 
-EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
+/*
+ * The value a LiteralObj (a baked const array/dict/struct) materializes -
+ * factored out of LiteralObj::do_eval so the VM's LoadLiteralObjV op reproduces
+ * it BYTE-for-BYTE from a baked pool entry (value + immutable + arr_hint +
+ * arr_hint_struct), AST-free (no LiteralObj node needed at run time).
+ */
+EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
+                           ArrHint arr_hint,
+                           const StructTypeDef *arr_hint_struct)
 {
     /*
      * A const-decl target (immutable) shares the baked value directly: it was
@@ -1847,6 +1855,11 @@ EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
     }
 
     return immutable ? value : make_mutable_clone(value);
+}
+
+EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
+{
+    return eval_literal_obj(value, immutable, arr_hint, arr_hint_struct);
 }
 
 /*

@@ -2979,9 +2979,15 @@ global slot) goes native via **`CallValueV`**: the callee EXPRESSION is compiled
 into a temp (callee-first, matching the tree-walker), then the args run, and the
 op reads the temp's `FuncObject` and `vm_call_func`s it — so
 `11_closure_counter` (1.09x → 1.00x, no longer a VM loss) and `12_higher_order`
-(0.54x) go native. An **array LITERAL** `[a, b, ..]` whose elements aren't all
-const (a fully-const one is a baked `LoadConstV`; a `LiteralObj` stays fallback)
-builds native via **`MakeArrayV`**: the element expressions compile into a
+(0.54x) go native. A **baked const array/dict/struct literal** (a `LiteralObj` —
+what a fully-const `var a = [1,2,3]` / `d = {}` folds to) materializes via
+**`LoadLiteralObjV`**, which calls the shared **`eval_literal_obj`** (the
+immutable-share vs fresh-mutable-clone logic + the general/flat_s `arr_hint`
+cases, factored out of `LiteralObj::do_eval`) from a `Chunk::literal_objs` pool
+entry — AST-free, byte-identical to the tree-walker. An **array LITERAL**
+`[a, b, ..]` whose elements aren't all const (a fully-const *scalar* one is a
+baked `LoadConstV`) builds native via **`MakeArrayV`**: the element expressions
+compile into a
 register run (the same contiguous-run pattern native calls use for args, via
 `emit_args_range`), and the op builds the array through the tree-walker's shared
 **`build_array_from_values`** core — flat (int/float/bool) or general per the

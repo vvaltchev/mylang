@@ -5402,6 +5402,28 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native const-literal materialization (VM LoadLiteralObjV): a mutable
+         * `var` literal is a FRESH deep copy each eval (so a loop's per-iter
+         * mutation never leaks), a `const` shares the deep read-only value.
+         * Reruns under -vm via the differential. */
+        "Const-literal materializes native (LoadLiteralObjV)",
+        {
+            "var t = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "    var a = [1, 2, 3];",     /* fresh each iteration */
+            "    a[0] = i;",
+            "    t += a[0];",
+            "}",
+            "assert(t == 3);",            /* 0+1+2 */
+            "var d = {\"x\": 10};",
+            "d[\"x\"] = 99;",
+            "assert(d[\"x\"] == 99);",
+            "const C = [7, 8, 9];",
+            "assert(C[1] == 8);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {
@@ -11149,15 +11171,17 @@ static bool vm_codegen_shapes()
     const bool builtin_dispatch_ok =
         bd.callbuiltinv == 1 && bd.fbin == 1 && bd.flstep == 1 && bd.jif == 0;
 
-    /* 15) a native loop with a FLOW-FREE fallback body statement (a void call /
-     * an array-building decl / a general store) still goes native AROUND the
-     * EvalStmt: the counted `for` compiles (ForLoopStep) with the native
-     * `s += i` and an EvalStmt for `append(a, i)`. This lets a matrix/sieve
-     * outer loop go native despite `var row = array(n,0)` / `c[i] = row`. */
+    /* 15) a native loop with a FLOW-FREE fallback body statement still goes
+     * native AROUND the EvalStmt: the counted `for` compiles (ForLoopStep) with
+     * the native `s += i` and an EvalStmt for the still-fallback `var p = P(i)`
+     * (a struct construct - most other flow-free statements, incl. array
+     * literals/append/general stores, are now native). This lets a matrix/sieve
+     * outer loop go native despite a fallback body statement. */
     VmOpCounts ab;
     if (!codegen_counts({
-            "var a = []; var s = 0;",
-            "for (var i = 0; i < 5; i++) { s += i; append(a, i); }",
+            "struct P { int x; }",
+            "var s = 0;",
+            "for (var i = 0; i < 5; i++) { s += i; var p = P(i); }",
         }, ab))
         return false;
     const bool array_build_ok =
@@ -11333,8 +11357,8 @@ static bool vm_codegen_shapes()
             "append(a, 4);",
         }, clv))
         return false;
-    /* The `var a = [1,2,3]` decl is itself a fallback EvalStmt (array literals
-     * aren't native yet); only the append becomes CallBuiltinLV. */
+    /* The `var a = [1,2,3]` decl now materializes natively (LoadLiteralObjV);
+     * the append becomes CallBuiltinLV. */
     const bool callbuiltinlv_ok = clv.callbuiltinlv == 1;
 
     return native_ok && fallback_ok && nested_ok && bool_safe
