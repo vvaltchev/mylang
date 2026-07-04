@@ -670,12 +670,18 @@ struct Codegen {
 }  /* namespace */
 
 Chunk
-codegen_program(const Block *root)
+codegen_chunk(const Block *block, int slot_count)
 {
     Codegen cg;
-    cg.temp_base = cg.next_temp = cg.max_temp = root->slot_count;
-    cg.gen_stmts(root->elems);
+    cg.temp_base = cg.next_temp = cg.max_temp = slot_count;
+    cg.gen_stmts(block->elems);
     cg.emit(OpCode::Halt);
-    cg.chunk.n_temps = cg.max_temp - root->slot_count;
+    cg.chunk.n_temps = cg.max_temp - slot_count;
     return std::move(cg.chunk);
+}
+
+Chunk
+codegen_program(const Block *root)
+{
+    return codegen_chunk(root, root->slot_count);
 }

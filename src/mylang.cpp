@@ -411,11 +411,15 @@ int main(int argc, char **argv)
 
             /* Execution engine: the tree-walker by default, or the bytecode VM
              * when -vm is given. The VM runs the SAME optimized AST (it lowers
-             * `root`), so behavior is identical - see plans/bytecode-vm.md. */
-            if (opt_vm)
+             * `root`), so behavior is identical - see plans/bytecode-vm.md.
+             * g_exec_engine tells do_func_call to run function bodies via the
+             * VM too (Phase 4), not just the top-level chunk. */
+            if (opt_vm) {
+                g_exec_engine = ExecEngine::Vm;
                 vm_execute(root.get());
-            else
+            } else {
                 root->eval(nullptr);
+            }
         }
 
     } catch (const SyntaxErrorEx &caught) {

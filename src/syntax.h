@@ -1296,6 +1296,19 @@ public:
      */
     std::string display_name;
 
+    /*
+     * The bytecode VM's per-function compiled body chunk (Phase 4), an opaque
+     * pointer so syntax.h needn't include the VM headers. Lazily filled on the
+     * first call under -vm by vm_func_chunk (vm.cpp): `vm_chunk_tried` guards a
+     * one-time compile, `vm_chunk` is the resulting `const Chunk *` (null when
+     * the body has no register ops worth running natively - it then stays
+     * tree-walked, so an expression/recursion-heavy func pays nothing). The
+     * chunk storage lives in vm.cpp, cleared per run; a clone resets these (it
+     * has its own body). NOT used in the REPL.
+     */
+    mutable const void *vm_chunk = nullptr;
+    mutable bool vm_chunk_tried = false;
+
     FuncDeclStmt() : Construct("FuncDeclStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;

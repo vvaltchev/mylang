@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <cmath>
+#include <unordered_map>
 
 /* The harness's engine switch (see vm.h). Default: the tree-walker. */
 ExecEngine g_exec_engine = ExecEngine::TreeWalk;
@@ -81,18 +82,33 @@ write_float_slot(EvalContext *ctx, int slot, float_type v)
 }
 
 /*
+ * Per-run storage for compiled function-body chunks (Phase 4), keyed by the
+ * FuncDeclStmt. Cleared at the start of every vm_execute so a fresh program run
+ * never reuses a prior run's chunks (and a FuncDeclStmt's `vm_chunk` pointer
+ * into this map only needs to stay valid for the current run). An unordered_map
+ * is node-based, so a stored Chunk's address is stable across rehashes - the
+ * `vm_chunk` pointers stay valid as more functions are compiled. Script-only
+ * (the VM is not used in the REPL).
+ */
+static std::unordered_map<const FuncDeclStmt *, Chunk> g_func_chunks;
+
+/*
  * Execute the optimized program via the bytecode VM. It builds the program's
  * root EvalContext exactly as Block::do_eval does for the root block
  * (ctx == nullptr): the implicit "main" Frame for slotted top-level vars, and
  * the program-wide GlobalFuncTable for top-level functions / escaped globals.
- * Both live for the whole run. The dispatch loop then drives the chunk; in
- * Phase 0 every instruction is a fallback EvalStmt, so this is byte-identical
- * to root->eval(nullptr) - which the differential harness enforces.
+ * Both live for the whole run. run_chunk then drives the chunk; in Phase 0
+ * every instruction is a fallback EvalStmt, so this is byte-identical to
+ * root->eval(nullptr) - which the differential harness enforces.
  */
 void
 vm_execute(const Construct *root_c)
 {
     const Block *root = static_cast<const Block *>(root_c);
+
+    /* Fresh per run: drop any prior program's function chunks (and their stale
+     * FuncDeclStmt::vm_chunk pointers, whose functions are long freed). */
+    g_func_chunks.clear();
 
     const Chunk chunk = codegen_program(root);
 
@@ -115,6 +131,55 @@ vm_execute(const Construct *root_c)
         ctx.gfuncs = gtable.get();
     }
 
+    vm_run_chunk(chunk, ctx);
+}
+
+/*
+ * Compile a block-bodied function's body to a chunk on first use and cache it
+ * (see vm.h). Returns null - so the caller tree-walks - for an expression body,
+ * or a block whose codegen produced NO register op (a native loop): such a body
+ * is pure fallback, and driving it through the VM would only add dispatch over
+ * Block::do_eval with no offsetting win.
+ */
+const Chunk *
+vm_func_chunk(const FuncDeclStmt *fdecl)
+{
+    if (!fdecl->body || !fdecl->body->is_block())
+        return nullptr;
+
+    const Block *body = static_cast<const Block *>(fdecl->body.get());
+
+    /* vm_run_chunk runs the body's statements directly in the call's args
+     * context (no per-block child EvalContext), which is correct only for a
+     * SCOPE-FREE body (every decl is a frame slot - no capture / nested func).
+     * A non-scope-free body needs its own child context, so tree-walk it. */
+    if (!body->scope_free)
+        return nullptr;
+
+    auto it = g_func_chunks.find(fdecl);
+    if (it != g_func_chunks.end())
+        return &it->second;
+    Chunk ck = codegen_chunk(body, fdecl->frame_size);
+
+    bool has_native = false;
+    for (const Instr &in : ck.code) {
+        if (in.op == OpCode::IntBin || in.op == OpCode::FloatBin
+            || in.op == OpCode::JumpUnlessIntCmp
+            || in.op == OpCode::JumpUnlessFloatCmp
+            || in.op == OpCode::ForLoopStep) {
+            has_native = true;
+            break;
+        }
+    }
+    if (!has_native)
+        return nullptr;
+
+    return &g_func_chunks.emplace(fdecl, std::move(ck)).first->second;
+}
+
+void
+vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
+{
     for (size_t pc = 0; ; ) {
 
         const Instr &in = chunk.code[pc];
@@ -126,12 +191,18 @@ vm_execute(const Construct *root_c)
             EvalValue &&tmp = in.node->eval(&ctx);
 
             /* An unresolved name surfaces as an UndefinedId sentinel, which
-             * Block::do_eval turns into UndefinedVariableEx. FlowState is NOT
-             * acted on here: a break/continue set by a loop body is consumed by
-             * the following LoopBackEdge; main has no top-level flow signal. */
+             * Block::do_eval turns into UndefinedVariableEx. */
             if (tmp.is<UndefinedId>())
                 throw UndefinedVariableEx(tmp.get<UndefinedId>().id,
                                           in.node->start, in.node->end);
+
+            /* A `return` from a function body (this statement was a ReturnStmt,
+             * or a fallback loop/block that returned) stops the chunk; the
+             * caller reads ctx->flow->value. break/continue in a loop body are
+             * consumed by the following LoopBackEdge, not here; main never sets
+             * a flow signal at the top level. */
+            if (ctx.flow->type == FlowState::ret)
+                return;
 
             pc++;
             break;
@@ -156,8 +227,8 @@ vm_execute(const Construct *root_c)
             switch (fs.type) {
 
             case FlowState::ret:
-                pc = in.target2;    /* exit loop; leave flow set (propagates) */
-                break;
+                return;             /* a return propagating out of the loop -
+                                     * stops the whole chunk (function body) */
 
             case FlowState::brk:
                 fs.type = FlowState::none;

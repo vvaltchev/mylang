@@ -1,10 +1,11 @@
 # Bytecode VM
 
-Status: **Phase 2 landed** — a register machine over the frame slots makes
-resolved-local int/float scalar `while` AND counted `for` loops native (fused
-`ForLoopStep`). **Suite geomean 0.89x (VM ~11% faster than the tree-walker)**;
-Phases 0–1 (scaffold, both pillars, if/while flattening) done; the whole `-rt`
-suite passes under both engines. Branch: `exp-work`.
+Status: **Phase 4 landed** — the register machine runs resolved-local int/float
+scalar loops (`while`/counted `for`, fused `ForLoopStep`) natively, both at top
+level AND inside function bodies (`do_func_call` hooks `vm_run_chunk`).
+**Suite geomean 0.87x (VM ~13% faster than the tree-walker)**; recursion stays
+neutral; Phases 0–3 done; the whole `-rt` suite passes under both engines.
+Branch: `exp-work`.
 
 The design + incremental task plan for MyLang's runtime bytecode VM. Read the
 CLAUDE.md section "Execution strategy: strip compile-time overhead first, THEN
@@ -338,26 +339,42 @@ x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
   (needs the loop to emit directly into the chunk with backpatching, not into a
   temp op vector) — deferred to the long-tail (Phase 5).
 
-### Phase 4 — function calls + call stack (~500 LoC)
-The maintainer's "global bytecode / stack / calls in the VM" milestone. Removes
-the "callee runs tree-walked" fallback.
-- Compile **every** function body to its own `Chunk`. `CALL{callee, argc}` binds
-  a `Frame` (reuse `do_func_call`'s param binding), pushes a return address,
-  jumps into the callee chunk; `RET` pops and pushes the result.
-- Start with **user-function direct calls** (`DirectCallExpr` -> `CALL` to a
-  known chunk). Builtin calls, closures/lambdas, and struct construction stay
-  `EVAL_EXPR` fallback initially (builtins take *unevaluated* args — keep the
-  fallback until a dedicated builtin-call op in Phase 5).
-- **Backtraces**: the VM call stack must record `BacktraceFrame`s exactly like
-  `do_func_call` (name/params-as-strings + call-site `Loc`); each `Instr`
-  carries a `Loc` stamped onto an escaping exception. `format_backtrace` stays
-  unchanged. The differential harness's backtrace diff is the gate here.
-- **Inherited optimizer wins**: the VM lowers the *optimized* AST, so an
-  unrolled recursion is already a nested ternary of `CachedCallExpr`s. Falling
-  back `CachedCallExpr` keeps the per-frame cache; lowering the ternary is just
-  expressions. The fib-class win survives with zero VM-specific work.
-- **Exit**: user calls + recursion run VM-native; suite green both; call-heavy
-  benchmarks (fib) VM-native.
+### Phase 4 — function bodies run via the VM — **DONE**
+Runs function BODIES through the register machine so the −50-70% loop wins land
+inside functions, not just at top level. The approach is simpler than the
+originally-planned "CALL opcode + VM call stack": a call still goes through
+`do_func_call` (the VM reaches it via a fallback EvalStmt for the CallExpr), and
+`do_func_call` is **hooked** to run the callee's body via `vm_run_chunk` instead
+of `body->eval`. So it reuses ALL of `do_func_call`'s machinery — frame,
+param-binding, capture ctx, and the backtrace-recording catch — unchanged; no
+separate call stack, no RET opcode.
+- **4.0 (refactor):** the dispatch loop is extracted into
+  `vm_run_chunk(chunk, ctx)`; `codegen_chunk(block, slot_count)` generalizes
+  codegen to any block + frame size. `vm_run_chunk` stops on `Halt` OR an
+  in-flight `return` (EvalStmt / LoopBackEdge check `flow==ret`) — a function
+  body's `return` (a fallback EvalStmt) sets `flow`, and `do_func_call` reads
+  `flow.value` as before. Neutral.
+- **4.1 (feature):** `vm_func_chunk(fdecl)` compiles a **scope-free block body**
+  and returns it ONLY if it has ≥1 register op (a real native loop); an
+  expression body / a body with no native content returns null → tree-walked.
+  The chunk is cached **on the FuncDeclStmt** (`vm_chunk`/`vm_chunk_tried`,
+  opaque `void*`) so the per-call cost is a field read, not a compile/lookup -
+  this is what keeps **recursion neutral** (`fib` −0.08%, `10_recursion_deep`
+  +0.45%: their bodies have no native loop → null → tree-walked). `do_func_call`
+  (under `g_exec_engine==Vm`) sizes the frame to `frame_size + n_temps` and runs
+  `vm_run_chunk`. Chunk storage is a per-run `unordered_map` in vm.cpp (cleared
+  each `vm_execute`; node-based so `vm_chunk` pointers stay valid).
+- **Backtraces** are preserved for free: an error (native div-zero or a fallback
+  statement) propagates out of `vm_run_chunk` → `do_func_call`'s existing catch
+  records the frame. Verified byte-identical (differential + a hand check:
+  a div-0 in a function loop shows `[0] bad(n) [1] main()`).
+- **Result:** `55_float_sum` (a float loop INSIDE a function) −62.0%
+  instructions; nested-call functions both go native; **geomean 0.87x**
+  (VM ~13% faster); no regression (worst outlier +0.00% instrs = noise).
+  1303/1303 + 1155/1155.
+- **Deferred:** builtin calls / closures-with-captures / non-scope-free bodies
+  stay tree-walked (fine — they're correct, just not native); a loop touching
+  arrays/dicts/strings still falls back (its operands aren't scalar - Phase 5).
 
 ### Phase 5 — long-tail native coverage, one construct per commit
 Replace each remaining fallback with native ops, ordered by bench impact, each

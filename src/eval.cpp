@@ -6,6 +6,7 @@
 #include "lexer.h"
 #include "backtrace.h"
 #include "bitops.h"
+#include "vm.h"   /* Phase 4: run a function body via the bytecode VM */
 
 #include <cmath>
 #include <chrono>
@@ -533,9 +534,35 @@ do_func_call(EvalContext *ctx,
      * frame for the whole call; nested blocks inherit the pointer.
      */
     Frame frame;
+    const Chunk *vm_ck = nullptr;
 
     if (obj.func->resolved) {
-        frame.init(obj.func->frame_size);
+
+        /*
+         * Phase 4: under -vm, run a loop-bearing (scope-free block) body as a
+         * native chunk. The chunk is compiled once and cached on the
+         * FuncDeclStmt (vm_chunk_tried), so this is a field read per call, not
+         * a per-call compile/lookup - which is what keeps expression/recursion-
+         * heavy functions (chunk == null) off the VM path with no overhead. The
+         * frame grows by the chunk's register-machine temps.
+         */
+        /*
+         * NOT during const-eval: AutoConst / the inliner's refold fold pure
+         * calls at COMPILE time (resolve_names), while the tree is still being
+         * transformed - compiling a body into a chunk there would cache
+         * (on the FuncDeclStmt) pointers into nodes the inliner then frees, and
+         * running it re-reads freed memory (a RECYCLE/ASan use-after-poison).
+         * The VM is a RUNTIME engine; const-eval always uses the tree-walker.
+         */
+        if (g_exec_engine == ExecEngine::Vm && !ctx->in_const_eval()) {
+            if (!obj.func->vm_chunk_tried) {
+                obj.func->vm_chunk = vm_func_chunk(obj.func);
+                obj.func->vm_chunk_tried = true;
+            }
+            vm_ck = static_cast<const Chunk *>(obj.func->vm_chunk);
+        }
+
+        frame.init(obj.func->frame_size + (vm_ck ? vm_ck->n_temps : 0));
         args_ctx.frame = &frame;
     }
 
@@ -564,9 +591,15 @@ do_func_call(EvalContext *ctx,
 
         /*
          * Block body: statements run until one sets the FlowState to `ret`
-         * (Block::do_eval stops there). No exception is thrown for `return`.
+         * (stopping there). No exception is thrown for `return`. Under -vm a
+         * loop-bearing body runs as a native chunk (vm_run_chunk stops on the
+         * same `ret`); otherwise the tree-walker runs it. Either way the
+         * return value is read from the FlowState below.
          */
-        obj.func->body->eval(&args_ctx);
+        if (vm_ck)
+            vm_run_chunk(*vm_ck, args_ctx);
+        else
+            obj.func->body->eval(&args_ctx);
 
     } catch (Exception &e) {
 

@@ -2857,9 +2857,10 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: Phase 2 landed** (register machine over frame slots — resolved-local
-int/float/mixed `while` and counted `for` loops run native, no fallback; **suite
-geomean 0.89x, VM ~11% faster than the tree-walker**). Gated by the
+**Status: Phase 4 landed** (register machine over frame slots — resolved-local
+int/float/mixed scalar loops run native at top level AND inside function bodies,
+via a `do_func_call` hook; recursion stays neutral; **suite geomean 0.87x, VM
+~13% faster than the tree-walker**). Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
@@ -2902,11 +2903,16 @@ loops** — the last via a **fused `ForLoopStep`** superinstruction (`i += step`
 test + branch in one dispatch, matching the tree-walker's raw-C `ForRangeStmt`
 counter; a naive 3-op encoding regressed +28%, the fused op wins). This is where
 the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
-−71%, `03_int_arith` (top-level `for`) −72% instructions — **suite geomean
-0.89x, VM ~11% faster than the tree-walker.** The register choice (over a stack
-machine, which the already-M8-optimized tree-walker would beat) is also the
-right IR for the eventual native x86-64 codegen. Full roadmap + phase order:
-`plans/bytecode-vm.md`.
+−71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** runs these
+loops inside **function bodies** too: `do_func_call` is hooked to run a callee's
+body via `vm_run_chunk` when it's a scope-free block with a native loop
+(compiled once, cached on the `FuncDeclStmt`), reusing all of `do_func_call`'s
+frame/param/backtrace machinery — so `55_float_sum` (a loop in a function) is
+−62%, while recursion stays neutral (a body with no native loop → tree-walked,
+`fib` −0.08%). **Suite geomean 0.87x, VM ~13% faster than the tree-walker.** The
+register choice (over a stack machine, which the already-M8-optimized
+tree-walker would beat) is also the right IR for the eventual native x86-64
+codegen. Full roadmap + phase order: `plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)
 
