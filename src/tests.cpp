@@ -5444,6 +5444,25 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native global compound-assign + inc-dec (StoreGlobalV compound path):
+         * `g += x` / `g++` / `g--` on a global-table slot, requires the slot
+         * DEFINED. Reruns under -vm via the differential. */
+        "Global compound + inc-dec native (StoreGlobalV)",
+        {
+            "var g = 0;",
+            "func rd() { return g; }",
+            "for (var i = 0; i < 5; i++) { g += i; }",
+            "assert(rd() == 10);",
+            "for (var i = 0; i < 3; i++) { g++; }",
+            "assert(rd() == 13);",
+            "g -= 3;",
+            "assert(rd() == 10);",
+            "g *= 2;",
+            "assert(rd() == 20);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

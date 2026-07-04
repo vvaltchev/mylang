@@ -2990,12 +2990,20 @@ counterpart of `LoadGlobalV`) goes native via **`StoreGlobalV`** (`target` = the
 `GlobalFuncTable` slot, `a` = the value temp): it writes `gfuncs->slots[target]`
 + `defined[target]=1`, which for a plain assign is byte-identical to the
 tree-walker's decl (bind + define) AND reassign (`slot_rmw(op==assign)` ==
-`put(RValue)`). Compile in `compile_boxed_stmt` (the gate now also accepts a
-`SymKind::global` lvalue); a TYPED global (needs `coerce_to_decl_type`), a
-`const` global (must throw `CannotRebindConstEx`), and a compound `g += x` /
-`g++` fall back to `EvalStmt` (deferred). Script-only (no `SymKind::global` in
-the REPL), so never emitted there; **not** a pure-target retarget candidate (it
-writes the table, not a temp). An **array LITERAL**
+`put(RValue)`). A **compound** `g += x` and **inc-dec** `g++`/`g--` (a global
+statement, lowered to `g += 1`/`-= 1`) use the SAME op with `aop` = the base op
+(`Op::invalid` == plain assign): it requires the slot already `defined` (else
+`UndefinedVariableEx`) then copy-modify-stores via `num_bin_op`, identical to
+`CompoundV` (the compound rhs is a boxed operand — a complex rhs falls back).
+The
+compound/inc-dec variant carries a `node` for its caret (div/undefined, via the
+loc side table); the plain assign is node-free. Compile in `compile_boxed_stmt`
+(the gate now also accepts a `SymKind::global` lvalue; a global `IncDecExpr`
+statement is handled at its top). A TYPED global (needs `coerce_to_decl_type`)
+and a `const` global (must throw `CannotRebindConstEx`) fall back to `EvalStmt`.
+Script-only (no `SymKind::global` in the REPL), so never emitted there; **not**
+a pure-target retarget candidate (it writes the table, not a temp). An **array
+LITERAL**
 `[a, b, ..]` whose elements aren't all const (a fully-const *scalar* one is a
 baked `LoadConstV`) builds native via **`MakeArrayV`**: the element expressions
 compile into a

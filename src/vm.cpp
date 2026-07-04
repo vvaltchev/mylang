@@ -1396,15 +1396,39 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
-        case OpCode::StoreGlobalV:
-            /* g = <expr>: write the shared global table slot + mark defined -
-             * exactly slot_rmw(op==assign) (lv.put(RValue(v))) + the decl's
-             * defined=1. Serves both a decl and a reassign (idempotent). */
-            ctx.gfuncs->slots[in.target].put(
-                RValue(ctx.frame->at(in.a.slot).get()));
-            ctx.gfuncs->defined[in.target] = 1;
+        case OpCode::StoreGlobalV: {
+            LValue &lv = ctx.gfuncs->slots[in.target];
+            if (in.aop == Op::invalid) {
+                /* g = <expr>: write the shared global slot + mark defined -
+                 * exactly slot_rmw(op==assign) (put(RValue)) + the decl's
+                 * defined=1. Serves both a decl and a reassign (idempotent). */
+                lv.put(RValue(ctx.frame->at(in.a.slot).get()));
+                ctx.gfuncs->defined[in.target] = 1;
+            } else {
+                /* g OP= rhs / g++ (aop = the base op, rhs in `a`): a compound
+                 * requires the slot already DEFINED (else UndefinedVariableEx,
+                 * like the tree-walker falling through its defined guard), then
+                 * copy-modify-store via num_bin_op - identical to CompoundV. */
+                if (!ctx.gfuncs->defined[in.target]) {
+                    Loc s, en;
+                    chunk.loc_at(pc, s, en);
+                    throw UndefinedVariableEx(
+                        ctx.gfuncs->names[in.target]->val, s, en);
+                }
+                EvalValue sb;
+                EvalValue nv = lv.get();
+                try {
+                    num_bin_op(nv, boxed_operand(in.a, &ctx, sb),
+                               binop_pmf(in.aop));
+                } catch (Exception &e) {
+                    vm_stamp_loc(chunk, pc, e);
+                    throw;
+                }
+                lv.put(std::move(nv));
+            }
             pc++;
             break;
+        }
 
         case OpCode::SubscriptV: {
             /* base[idx] read via the runtime Type::subscript (any base type -

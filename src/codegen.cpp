@@ -894,6 +894,28 @@ struct Codegen {
 
     bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
     {
+        /* A global `g++` / `g--` statement -> a compound StoreGlobalV
+         * (g += 1 / g -= 1). A LOCAL inc-dec is handled earlier
+         * (compile_int/float_stmt); a global one reaches here. A non-global /
+         * typed / const operand falls back. */
+        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+            const Identifier *id =
+                dynamic_cast<const Identifier *>(inc->lvalue.get());
+            if (id && id->sym.kind == SymKind::global && !id->is_const
+                && (id->decl_type == DeclType::none
+                    || id->decl_type == DeclType::dyn)) {
+                Instr in;
+                in.op = OpCode::StoreGlobalV;
+                in.node = s;
+                in.target = id->sym.slot;
+                in.a = int_lit(1);
+                in.aop = inc->is_inc ? Op::plus : Op::minus;
+                ops.push_back(in);
+                return true;
+            }
+            return false;
+        }
+
         const Expr14 *e = dynamic_cast<const Expr14 *>(s);
         if (!e)
             return false;
@@ -933,18 +955,34 @@ struct Codegen {
          * (they stay a correct EvalStmt fallback). No retarget: the producing
          * op writes a FRAME temp, the global lives in gfuncs. */
         if (lv->sym.kind == SymKind::global) {
-            if (!is_assign)
-                return false;
-            int rslot;
-            if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+            if (is_assign) {
+                int rslot;
+                if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                    ops.resize(omark);
+                    chunk.consts.resize(cmark);
+                    return false;
+                }
+                Instr in;
+                in.op = OpCode::StoreGlobalV;
+                in.target = lv->sym.slot;   /* the GlobalFuncTable slot */
+                in.a = slot_op(rslot);      /* aop invalid == plain assign */
+                ops.push_back(in);
+                return true;
+            }
+            /* Compound `g OP= rhs`: the rhs is a boxed operand (immediate or a
+             * slot, like the local CompoundV); a complex rhs falls back. */
+            Operand rhs_op;
+            if (!boxed_operand(e->rvalue.get(), rhs_op, ops)) {
                 ops.resize(omark);
                 chunk.consts.resize(cmark);
                 return false;
             }
             Instr in;
             in.op = OpCode::StoreGlobalV;
-            in.target = lv->sym.slot;   /* the GlobalFuncTable slot */
-            in.a = slot_op(rslot);      /* the value temp */
+            in.node = s;               /* loc: compound may throw (div/undef) */
+            in.target = lv->sym.slot;
+            in.a = rhs_op;
+            in.aop = cbase;
             ops.push_back(in);
             return true;
         }
@@ -2963,6 +3001,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
         case OpCode::SliceV:
+        case OpCode::StoreGlobalV:   /* compound/inc-dec (plain: node null) */
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
