@@ -2754,6 +2754,21 @@ static const std::vector<test> tests =
         "var df = {\"x\": 1.5, \"y\": 2.5};",
         "var f = 0.0; for (var i = 0; i < 4; i++) f += df.x + df.y;",
         "assert(f == 16.0);" } },
+    { /* Foundation 2 (const pool): DictLoad is now AST-free - the member key
+       * lives in the const pool and the MISSING-key path (a default-dict insert
+       * / KeyNotFoundEx) goes through the shared Type::subscript, not
+       * node->eval. This drives the cold missing-key path (default dict). */
+      "dict read: AST-free missing key inserts the default (default dict)",
+      { "var d = dict(7);",
+        "d.a = 1;",
+        "var s = d.a;",         /* present -> 1 */
+        "s += d.zz;",           /* missing member -> default 7, inserted */
+        "assert(s == 8);",
+        "assert(len(d) == 2);",
+        "assert(d.zz == 7);" } },
+    { "dict read: AST-free missing key on a plain dict throws KeyNotFoundEx",
+      { "var d = {\"a\": 1};", "var x = d.b;" },
+      &typeid(KeyNotFoundEx) },
     { "dict key: an array can be a key",
       { "var d = {}; d[[1,2]] = 5; d[[3,4]] = 6;",
         "assert(d[[1,2]] == 5);",

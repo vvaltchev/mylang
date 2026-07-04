@@ -1094,9 +1094,13 @@ struct Codegen {
             tt = alloc_temp();
             Instr in;
             in.op = op;
-            in.node = m;
+            in.node = m;                 /* extract_locs records + nulls */
             in.target = tt;
             in.target2 = dslot;
+            /* the member NAME (a dict key) goes into the CONST POOL; `a` as an
+             * immediate = its index, so the handler needs no AST (a.is_lit
+             * distinguishes a member key from a subscript's key temp). */
+            in.a = int_lit(add_const(m->memId));
             ops.push_back(in);
             return true;
         }
@@ -2411,7 +2415,11 @@ static void extract_locs(Chunk &chunk)
         switch (in.op) {
         case OpCode::IntBin:
         case OpCode::FloatBin:
-            /* node used ONLY for the div/mod caret: record it -> AST-free. */
+        case OpCode::DictLoadInt:
+        case OpCode::DictLoadFloat:
+            /* node used ONLY for the caret now (div/mod, or the missing-key
+             * KeyNotFoundEx - the key + present/missing logic are AST-free):
+             * record the loc -> AST-free. */
             chunk.locs.push_back(
                 {static_cast<uint32_t>(pc), in.node->start, in.node->end});
             in.node = nullptr;

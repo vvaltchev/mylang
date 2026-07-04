@@ -3045,9 +3045,21 @@ which uses `loc_at`, not `node`) and dropped the dead `node` from the
 non-throwing `JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/`ForLoopStep`. So the whole
 register/loop CORE is now `node`-free; the `Instr::node` FIELD stays until the
 remaining users (the `EvalStmt`/`JumpIfFalse` fallbacks, the element/dict/call
-op-data) are migrated too, at which point `Instr` loses the 8-byte field. Next
-foundation steps: op-data into the constant pool (a member key as a `consts`
-index, not `MemberExpr::memId`), then kill the fallback ops.
+op-data) are migrated too, at which point `Instr` loses the 8-byte field.
+
+**Foundation step 2 — op-data into the CONST POOL (member key, started).**
+`DictLoadInt`/`DictLoadFloat` (the typed `d.k` / `d[k]` read) are now fully
+AST-free: a member's key is baked into `Chunk::consts` at codegen (`add_const`)
+and `Instr::a` carries its index as an immediate (`a.is_lit` distinguishes a
+member key from a subscript's key temp), so the handler needs no `MemberExpr::
+memId`. The PRESENT-key path stays `dict_present_value` (hot); the MISSING-key
+path (a default-dict insert or `KeyNotFoundEx`) now routes through the shared
+`Type::subscript(for_write=false)` - the tree-walker's exact logic - with its
+loc from the side table, NOT `node->eval_int/eval_float`. `extract_locs` records
+the caret + nulls the node. So DictLoad joined the register core as node-free.
+Next: the remaining op-data (member/subscript general reads via `MemberV`/
+`SubscriptV`, call callees, struct-ctor defs), then kill the fallback ops, then
+`Instr` sheds the `node` field.
 
 ## Invariants & hazards (defense in depth)
 

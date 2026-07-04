@@ -88,6 +88,22 @@ write_float_slot(EvalContext *ctx, int slot, float_type v)
         lv.put(EvalValue(v));
 }
 
+/* Write a boxed scalar `v` into a slot as an int OR float, with the same
+ * int/bool -> promotion the tree-walker's eval_int/eval_float dict reads use.
+ * Shared by DictLoadInt/Float's present-key and missing-key (default) paths. */
+static ML_ALWAYS_INLINE void
+write_scalar_slot(EvalContext *ctx, int slot, bool is_int, const EvalValue &v)
+{
+    if (is_int)
+        write_int_slot(ctx, slot,
+            v.is<bool>() ? (v.get<bool>() ? 1 : 0) : v.get<int_type>());
+    else
+        write_float_slot(ctx, slot,
+            v.is<int_type>() ? static_cast<float_type>(v.get<int_type>())
+          : v.is<bool>()     ? (v.get<bool>() ? 1.0 : 0.0)
+                             : v.get<float_type>());
+}
+
 /* Read a BOXED operand as an EvalValue: a slot returns a const ref (no copy);
  * an immediate materializes into `scratch` (by its lit_kind) and returns a ref
  * to it - so a boxed op (BinOpV/CmpV/LogV/CompoundV) takes an int/float/bool
@@ -793,38 +809,43 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::DictLoadInt:
         case OpCode::DictLoadFloat: {
 
-            /* Typed dict scalar read d[k] / d.k (P3): a PRESENT key reads the
-             * stored scalar directly via dict_present_value (the same map find
-             * the tree-walker's eval_int/eval_float uses); a MISSING key or a
-             * non-dict base falls back to node->eval_int/eval_float (the
-             * default-dict / KeyNotFoundEx path). The key is a boxed temp for a
-             * Subscript (`a`), or the node's memId for a MemberExpr. */
-            const EvalValue &base = ctx.frame->at(in.target2).get();
+            /* Typed dict scalar read d[k] / d.k (P3), AST-FREE (foundation 2):
+             * the KEY comes from the CONST POOL for a member `d.k` (in.a is an
+             * immediate = the consts index of the interned name) or from a temp
+             * slot for a subscript `d[k]` (in.a is a slot) - distinguished by
+             * in.a.is_lit, no `node`. A PRESENT key reads the scalar via
+             * dict_present_value (hot); a MISSING key / non-dict base goes
+             * through the shared Type::subscript (the tree-walker's exact
+             * default-dict insert / KeyNotFoundEx / not-subscriptable logic),
+             * its loc taken from the loc side table, NOT node->eval. */
             const bool is_int = in.op == OpCode::DictLoadInt;
-            if (base.is<intrusive_ptr<DictObject>>()) {
-                const auto &dict = base.get_ref<intrusive_ptr<DictObject>>();
-                const EvalValue &key = in.node->is_subscript()
-                    ? ctx.frame->at(in.a.slot).get()
-                    : static_cast<const MemberExpr *>(in.node)->memId;
-                if (const EvalValue *v = dict_present_value(dict, key)) {
-                    if (is_int)
-                        write_int_slot(&ctx, in.target,
-                            v->is<bool>() ? (v->get<bool>() ? 1 : 0)
-                                          : v->get<int_type>());
-                    else
-                        write_float_slot(&ctx, in.target,
-                            v->is<int_type>()
-                                ? static_cast<float_type>(v->get<int_type>())
-                            : v->is<bool>() ? (v->get<bool>() ? 1.0 : 0.0)
-                                            : v->get<float_type>());
+            const EvalValue &key = in.a.is_lit
+                ? chunk.consts[in.a.lit]
+                : ctx.frame->at(in.a.slot).get();
+            const EvalValue &base = ctx.frame->at(in.target2).get();
+            if (base.is<intrusive_ptr<DictObject>>())
+                if (const EvalValue *v = dict_present_value(
+                        base.get_ref<intrusive_ptr<DictObject>>(), key)) {
+                    write_scalar_slot(&ctx, in.target, is_int, *v);
                     pc++;
                     break;
                 }
+            /* cold: missing key (default insert / throw) or a non-dict base. */
+            LValue &dlv = ctx.frame->at(in.target2);
+            EvalValue r;
+            try {
+                r = base.get_type()->subscript(EvalValue(&dlv), key, false);
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    Loc s, en;
+                    chunk.loc_at(pc, s, en);
+                    e.loc_start = s;
+                    e.loc_end = en;
+                }
+                throw;
             }
-            if (is_int)
-                write_int_slot(&ctx, in.target, in.node->eval_int(&ctx));
-            else
-                write_float_slot(&ctx, in.target, in.node->eval_float(&ctx));
+            write_scalar_slot(&ctx, in.target, is_int,
+                              r.is<LValue *>() ? r.get<LValue *>()->get() : r);
             pc++;
             break;
         }

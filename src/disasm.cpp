@@ -209,13 +209,15 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
         case OpCode::DictLoadFloat: {
             const char *mn = in.op == OpCode::DictLoadInt
                 ? "dict.load.i  " : "dict.load.f  ";
+            /* AST-free: a member's key is const-pool[a.lit] (an immediate), a
+             * subscript's key is a temp slot. `node` is null (loc table). */
             row << mn << D(in.target) << " = " << D(in.target2) << "[";
-            if (in.node->is_subscript())
-                row << RI(in.a, false);
+            if (in.a.is_lit)
+                row << chunk.consts[in.a.lit].get_type()->to_string(
+                           chunk.consts[in.a.lit]);
             else
-                row << ".<member>";
+                row << RI(in.a, false);
             row << "]";
-            cmt(row, in.node);
             break;
         }
         case OpCode::ArrLen:
