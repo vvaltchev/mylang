@@ -529,6 +529,12 @@ struct Codegen {
             if (try_native_builtin(bc, out_slot, ops))
                 return true;
 
+        /* An indirect call of a func VALUE (a closure / lambda / func var):
+         * a plain CallExpr whose callee is Func-typed -> CallValueV. */
+        if (const CallExpr *call = dynamic_cast<const CallExpr *>(e))
+            if (try_native_value_call(call, out_slot, ops))
+                return true;
+
         /* A ternary `cond ? a : b` as a VALUE: compute cond, branch on it, and
          * evaluate exactly ONE of the two arms into `dst`. This is what makes a
          * recursion-unroll return (fib: `return (n-1<2 ? .. : f(..)+f(..))..`)
@@ -901,6 +907,51 @@ struct Codegen {
         cv.target2 = dc->direct_func_slot;
         cv.a = int_lit(argbase);
         cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
+        ops.push_back(cv);
+        out_slot = dst;
+        return true;
+    }
+
+    /* An INDIRECT call of a func VALUE (a closure / lambda / func-valued var):
+     * a plain CallExpr (not a Direct{Call,BuiltinCall}Expr) whose callee is
+     * Func-typed (vm_direct_func). Evaluate the callee expression into a temp
+     * (callee-first, matching the tree-walker), then the args into a register
+     * run, and emit CallValueV. The runtime value is a FuncObject (the Func
+     * static type proves it), so no dispatch is needed. */
+    bool try_native_value_call(const CallExpr *call, int &out_slot,
+                               std::vector<Instr> &ops)
+    {
+        if (dynamic_cast<const DirectCallExpr *>(call)
+            || dynamic_cast<const DirectBuiltinCallExpr *>(call))
+            return false;
+        if (!call->vm_direct_func || !call->args)
+            return false;
+
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+
+        int callee_slot;
+        if (!compile_boxed_expr(call->what.get(), callee_slot, ops)) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+
+        int argbase;
+        if (!emit_args_range(call->args->elems, argbase, ops)) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+
+        const int dst = alloc_temp();
+        Instr cv;
+        cv.op = OpCode::CallValueV;
+        cv.node = call;
+        cv.target = dst;
+        cv.target2 = callee_slot;
+        cv.a = int_lit(argbase);
+        cv.b = int_lit(static_cast<int>(call->args->elems.size()));
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -2439,6 +2490,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::CompoundV:
         case OpCode::CmpV:
         case OpCode::LoadGlobalV:
+        case OpCode::CallValueV:
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold

@@ -276,6 +276,18 @@ enum class OpCode : unsigned char {
     CachedCallV,
 
     /*
+     * Indirect call of a FUNCTION VALUE (a closure / lambda / func-valued var):
+     * a plain CallExpr whose callee is Func-typed (vm_direct_func) but NOT
+     * devirtualized to a global slot. The callee EXPRESSION is evaluated into
+     * `target2` (a temp holding the FuncObject) before the args register run
+     * [a.lit, a.lit + b.lit); the op reads it and calls vm_call_func. A
+     * non-FuncObject value (dyn-laundered) throws NotCallableEx via the loc
+     * table (unreachable given the Func static type). `node` = the CallExpr,
+     * for the backtrace call-site loc (nulled by extract_locs).
+     */
+    CallValueV,
+
+    /*
      * Native `return <expr>;` (no node->eval of the return): `a` = the slot
      * holding the already-evaluated return value (a bare `return;` loads `none`
      * into it first). Sets ctx->flow to {ret, value} and STOPS the chunk

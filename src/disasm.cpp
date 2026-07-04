@@ -301,6 +301,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "call.cached  " << D(in.target) << " = g" << in.target2
                 << arglist(chunk, in.a.lit, in.b.lit);
             break;
+        case OpCode::CallValueV:
+            /* the callee is a func VALUE in a temp (target2), not a slot. */
+            row << "call.val     " << D(in.target) << " = " << D(in.target2)
+                << arglist(chunk, in.a.lit, in.b.lit);
+            break;
         case OpCode::ReturnV:
             row << "return.v     " << RI(in.a, false);
             break;

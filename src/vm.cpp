@@ -1051,6 +1051,25 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CallValueV: {
+            /* Indirect call of a func VALUE: the callee was evaluated into
+             * target2 (a FuncObject - proven by the Func static type). Read it
+             * and call vm_call_func; a dyn-laundered non-func throws
+             * NotCallableEx via the loc side table (the call-site loc). */
+            const EvalValue &callee = ctx.frame->at(in.target2).get();
+            if (!callee.is<intrusive_ptr<FuncObject>>()) {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
+                throw NotCallableEx(s, en);
+            }
+            FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+            LValue *ap = &ctx.frame->at(in.a.lit);
+            ctx.frame->at(in.target).put(
+                vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc));
+            pc++;
+            break;
+        }
+
         case OpCode::ReturnV:
             /* `return <expr>`: the value is already in a.slot (a bare return
              * loaded `none`). Set flow and STOP the chunk, as an

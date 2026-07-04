@@ -2903,7 +2903,14 @@ proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
 struct constructor / builtin) that devirtualized to a global slot evaluates its
 args into a register run (a `VmArgs` view over the caller's frame slots — no
 per-call allocation) and calls `vm_call_func` → `do_func_call` with the VALUES
-(no `node->eval` of the call). A **`return <expr>;`** likewise lowers to a
+(no `node->eval` of the call). An **INDIRECT call of a func VALUE** (a closure /
+lambda / func-valued var — a plain `CallExpr` with `vm_direct_func` but no
+global slot) goes native via **`CallValueV`**: the callee EXPRESSION is compiled
+into a temp (callee-first, matching the tree-walker), then the args run, and the
+op reads the temp's `FuncObject` and `vm_call_func`s it — so
+`11_closure_counter` (1.09x → 1.00x, no longer a VM loss) and `12_higher_order`
+(0.54x) go native. A
+**`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
 sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)
 compiles to a branch producing one arm into a slot, and a **`CachedCallV`**
