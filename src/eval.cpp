@@ -3751,29 +3751,41 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
     if (count == 1) {
 
-        if (elems[0].is<SharedArrayObj>() && ids->elems.size() > (1 + id_start)) {
+        const size_type nvars = ids->elems.size() - id_start;
+
+        if (nvars > 1) {
+
+            /*
+             * Array DESTRUCTURING: the element must be an array of EXACTLY
+             * `nvars` (STRICT, like Python). A non-array element or a
+             * length mismatch is an error - the old lenient behavior (pad the
+             * missing with none, silently drop extras, treat a scalar as the
+             * first value) is gone; it hid bugs and could not be nativized to
+             * plain scalar reads. Well-formed data is unaffected.
+             */
+            if (!elems[0].is<SharedArrayObj>())
+                throw TypeErrorEx(
+                    intern_msg("foreach: cannot unpack a non-array element "
+                               "into " + std::to_string(nvars) + " variables"),
+                    container->start, container->end);
 
             const SharedArrayObj &arr = elems[0].get<SharedArrayObj>();
-            const size_type asz = arr.size();
 
-            for (size_type i = id_start; i < ids->elems.size(); i++) {
+            if (arr.size() != nvars)
+                throw TypeErrorEx(
+                    intern_msg("foreach: cannot unpack an array of length " +
+                               std::to_string(arr.size()) + " into " +
+                               std::to_string(nvars) + " variables"),
+                    container->start, container->end);
 
-                const size_type val_i = i - id_start;
-
-                bind_loop_var(
-                    ctx,
-                    decl,
-                    ids->elems[i].get(),
-                    val_i < asz ? arr_elem_boxed(arr, val_i) : none
-                );
-            }
+            for (size_type i = id_start; i < ids->elems.size(); i++)
+                bind_loop_var(ctx, decl, ids->elems[i].get(),
+                              arr_elem_boxed(arr, i - id_start));
 
         } else {
 
+            /* A single loop var (or the value slot of an `indexed` loop). */
             bind_loop_var(ctx, decl, ids->elems[id_start].get(), elems[0]);
-
-            for (size_type i = id_start+1; i < ids->elems.size(); i++)
-                bind_loop_var(ctx, decl, ids->elems[i].get(), none);
         }
 
     } else {

@@ -1997,7 +1997,13 @@ sanitizers never reproduced it.)
   (`var a,b = [1,2]`), with a non-array
   rvalue assigns the same value to each (`var a,b = 0`). The same helper drives
   `foreach`
-  tuple-unpacking and the `indexed` keyword.
+  tuple-unpacking and the `indexed` keyword. **`foreach` array-destructuring
+  (`foreach (x, y in pairs)`) is STRICT** (`do_iter`, `eval.cpp`): each element
+  must be an array of EXACTLY the loop-var count — a non-array element or a
+  length mismatch throws `TypeErrorEx` (both engines: the VM falls back to
+  `do_iter` for unpack). The old lenient behavior (pad short with `none`,
+  silently drop extras, treat a scalar as the first value) was removed — it hid
+  bugs and could not be lowered to plain scalar reads.
 - **`++` / `--` (`IncDecExpr`, `syntax.h`)** — C-style pre/postfix increment and
   decrement, **int/float only**. `IncDecExpr::do_eval` evaluates the operand
   exactly ONCE via two paths: when the inferencer proved it int/float (`th` is

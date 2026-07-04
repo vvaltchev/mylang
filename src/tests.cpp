@@ -5414,6 +5414,43 @@ static const std::vector<test> tests =
     },
 
     {
+        "Foreach STRICT array unpack: well-formed",
+        {
+            "var pairs = [[1,2],[3,4],[5,6]];",
+            "var s = 0;",
+            "foreach (var x, y in pairs) { s += x + y; }",
+            "assert(s == 21);",
+        },
+    },
+
+    {
+        "Foreach STRICT unpack: a ragged sub-array is an error",
+        {
+            "var dyn p = [[1], [3,4]];",
+            "foreach (var x, y in p) { }",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "Foreach STRICT unpack: a too-long sub-array is an error",
+        {
+            "var dyn p = [[1,2,9]];",
+            "foreach (var x, y in p) { }",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        "Foreach STRICT unpack: a scalar element is an error",
+        {
+            "var dyn p = [1, 2];",
+            "foreach (var x, y in p) { }",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
         "Foreach in string",
         {
             "var res = \"\";",

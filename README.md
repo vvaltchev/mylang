@@ -1126,6 +1126,16 @@ foreach (var elem in arr) {
 }
 ```
 
+Array destructuring is **strict**: each element must be an array whose length
+**exactly** matches the number of loop variables. A non-array element, a shorter
+array, or a longer one is a runtime error (an obvious mistake caught early,
+rather than silently padding with `none` or dropping values):
+
+```C#
+foreach (var x, y in [[1, 2], [3]]) { }   # error: [3] has length 1, not 2
+foreach (var x, y in [1, 2]) { }          # error: 1 is not an array
+```
+
 ### Functions and lambdas
 
 Declaring a function is simple as:
