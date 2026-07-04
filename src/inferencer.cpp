@@ -1399,7 +1399,14 @@ void Inferencer::annotate_hints(Construct *n)
      * is NOT enough - a single var over a dict binds the KEY (also int), so the
      * container kind must be checked here where the static type is known. */
     if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
-        if (!fe->indexed && fe->ids && fe->ids->elems.size() == 1) {
+        /* A single-var array foreach (ids = [elem]) OR an INDEXED 2-var one
+         * (ids = [index, elem]) can go native: elem_th is keyed off the ARRAY
+         * ELEMENT type either way (ids[0] vs ids[1] is a codegen detail). */
+        const bool single = !fe->indexed && fe->ids
+                            && fe->ids->elems.size() == 1;
+        const bool indexed2 = fe->indexed && fe->ids
+                            && fe->ids->elems.size() == 2;
+        if (single || indexed2) {
             StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
             if (c->kind == StaticTypeKind::Array) {
                 StaticTypeRef el = static_type_resolve(c->elem);

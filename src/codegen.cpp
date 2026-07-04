@@ -2253,11 +2253,24 @@ struct Codegen {
         if (!fe->container_is_array)
             return false;
 
+        /* For an INDEXED foreach (ids = [index, elem]) the index var IS the
+         * loop counter (the body reads it as the index) and the element goes
+         * into ids[1]; a single-var foreach uses a temp counter and puts the
+         * element in ids[0]. */
+        const int elem_id = fe->indexed ? 1 : 0;
         const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+            dynamic_cast<const Identifier *>(fe->ids->elems[elem_id].get());
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
+        int idx_slot = -1;
+        if (fe->indexed) {
+            const Identifier *ix =
+                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+            if (!ix || ix->sym.kind != SymKind::local)
+                return false;
+            idx_slot = ix->sym.slot;
+        }
 
         const size_t start = chunk.code.size();
         reset_temps();
@@ -2285,7 +2298,10 @@ struct Codegen {
         ln.target2 = c;
         chunk.code.push_back(ln);
 
-        const int i = alloc_temp();
+        /* The counter: for an indexed foreach it IS the index var (ids[0], read
+         * by the body); otherwise a fresh temp. Either way it starts at 0 and
+         * the ForLoopStep increments it. */
+        const int i = fe->indexed ? idx_slot : alloc_temp();
         Instr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;

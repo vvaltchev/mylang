@@ -2887,17 +2887,20 @@ expressions — assign / compound-assign / comparison / logical `&&`/`||` over
 locals, globals, captures, builtins, literals, subscripts (`a[i]` via the
 runtime `Type::subscript`), and members (`obj.f` / `d.k` via a shared
 `member_read` factored out of `MemberExpr::do_eval`) — and **`foreach` over an
-array** (single, non-indexed loop var) lowers to a counted loop (snapshot +
-`ArrLen` + a per-element load + the fused `ForLoopStep`, −64% instructions): a
-flat `array<int>`/`array<float>` reads the raw scalar (`LoadElemInt/Float`,
-stamped `ForeachStmt::elem_th`), and a **GENERAL element (`array<str>` /
-`array<array>` / `array<dict>` / `array<dyn>`)** binds the element's existing
-`EvalValue` into the loop var via **`LoadElemValue`** — **box-free (no
-box/unbox)**, matching the tree-walker's general `elem = view[i].get()`, ~1.7x
-on a general-array foreach loop; the inferencer stamps
-`ForeachStmt::container_is_array`. (Flat `array<bool>` / `array<PodStruct>` are
-NOT lowered yet — their raw byte/struct storage needs a scalar read, not a
-boxed `LoadElemValue` — so they still fall back.) **User-function calls** go
+array** lowers to a counted loop (snapshot + `ArrLen` + a per-element load + the
+fused `ForLoopStep`, −64% instructions): a flat `array<int>`/`array<float>`
+reads the raw scalar (`LoadElemInt/Float`, stamped `ForeachStmt::elem_th`), and
+a **GENERAL element (`array<str>` / `array<array>` / `array<dict>` /
+`array<dyn>`)** binds the element's existing `EvalValue` into the loop var via
+**`LoadElemValue`** — **box-free (no box/unbox)**, matching the tree-walker's
+general `elem = view[i].get()`, ~1.7x on a general-array foreach loop; the
+inferencer stamps `ForeachStmt::container_is_array`. Both the **single-var**
+(`foreach (e in a)`) and the **INDEXED 2-var** (`foreach (i, e in indexed a)`)
+forms are native: for indexed, the index var IS the loop counter (the body
+reads it) and the element loads into the 2nd var. (Flat `array<bool>` /
+`array<PodStruct>`, and unpack `foreach (x,y in pairs)` / dict `foreach (k,v in
+d)`, still fall back — the last needs a dict-iterator foundation, since a dict
+has no O(1) index.) **User-function calls** go
 native via `CallV`: a call
 proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
 struct constructor / builtin) that devirtualized to a global slot evaluates its
