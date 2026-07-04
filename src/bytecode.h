@@ -387,6 +387,16 @@ enum class OpCode : unsigned char {
     MemberV,
 
     /*
+     * Build an array VALUE from element values in a register run, into `target`
+     * - the native form of a `[a, b, ..]` LITERAL whose elements aren't all
+     * const (a fully-const literal is baked to a single LoadConstV, not this).
+     * The N element values are in slots [a.lit, a.lit + b.lit); `target2`
+     * carries the flat/general ArrHint. Shares the tree-walker's build core
+     * (build_array_from_values). No Construct*: the build never throws.
+     */
+    MakeArrayV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()

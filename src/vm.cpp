@@ -165,6 +165,18 @@ vm_call_builtin_big(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
     return dc->builtin.func_v(&ctx, dc->args.get(), heapbuf.data(), n);
 }
 
+/* Cold helper for a large array LITERAL (n>16): copy the element values from
+ * register run into a heap buffer and build. Keeps the vector code out of the
+ * hot vm_run_chunk switch, like vm_call_builtin_big. */
+static ML_NOINLINE EvalValue
+vm_make_array_big(EvalContext &ctx, int_type base, int_type n, ArrHint hint)
+{
+    std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
+    for (int_type i = 0; i < n; i++)
+        heapbuf[i] = ctx.frame->at(base + i).get();
+    return build_array_from_values(heapbuf.data(), n, hint, nullptr, false);
+}
+
 /* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
  * the value args (1..n) from the register run [base, base+n_rest) into a buffer
  * and call func_lv with `target` + `rest` - zero node->eval. ML_NOINLINE keeps
@@ -891,6 +903,28 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     e.loc_end = dc->args->end;
                 }
                 throw;
+            }
+            pc++;
+            break;
+        }
+
+        case OpCode::MakeArrayV: {
+
+            /* Build an array LITERAL from the element run [base,base+n) via the
+             * shared build core the tree-walker's LiteralArray::do_eval uses -
+             * so both engines build byte-identically. `target2` = the ArrHint;
+             * is_const is false (the VM runs at runtime). Never throws. */
+            const int_type base = in.a.lit, n = in.b.lit;
+            const ArrHint hint = static_cast<ArrHint>(in.target2);
+            if (n <= 16) {
+                EvalValue stackbuf[16];
+                for (int_type i = 0; i < n; i++)
+                    stackbuf[i] = ctx.frame->at(base + i).get();
+                ctx.frame->at(in.target).put(
+                    build_array_from_values(stackbuf, n, hint, nullptr, false));
+            } else {
+                ctx.frame->at(in.target).put(
+                    vm_make_array_big(ctx, base, n, hint));
             }
             pc++;
             break;

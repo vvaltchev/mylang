@@ -5272,6 +5272,30 @@ static const std::vector<test> tests =
     },
 
     {
+        /* array-literal build in a loop (the VM MakeArrayV native path; the
+         * differential reruns this under -vm). */
+        "Array literal built per iteration",
+        {
+            "var s = 0;",
+            "for (int i = 0; i < 5; i++) {",
+            "    var a = [i, i * 2, i * 3];",
+            "    s += a[0] + a[1] + a[2];",
+            "}",
+            "assert(s == 60);",           /* sum_{i=0..4} 6i = 60 */
+        },
+    },
+
+    {
+        /* nested + self-referential literal (retarget safety) */
+        "Array literal nested and self-referential",
+        {
+            "var a = [9, 8];",
+            "a = [a, [1, 2]];",
+            "assert(a[0][0] == 9 && a[1][1] == 2);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

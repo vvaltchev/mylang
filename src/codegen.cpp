@@ -98,7 +98,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
     case OpCode::EvalToSlot:  case OpCode::ArrLen:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
-    case OpCode::LoadElemValue:
+    case OpCode::LoadElemValue: case OpCode::MakeArrayV:
         return true;
     default:
         return false;
@@ -481,6 +481,34 @@ struct Codegen {
             return true;
         }
 
+        /* An array LITERAL `[a, b, ..]` whose elements aren't all const ->
+         * MakeArrayV: compile the element run, then build the array. A
+         * fully-const literal is a baked LoadConstV (boxed_literal above) or a
+         * LiteralObj (left to the fallback), so only a literal with element
+         * NODES reaches here. A flat struct array (arr_hint flat_s) is left to
+         * the fallback - the ArrHint-only op can't carry its struct def; its
+         * struct-ctor elements can't lower anyway. */
+        if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e)) {
+            if (la->arr_hint == ArrHint::flat_s)
+                return false;
+            const size_t cmark = chunk.consts.size();
+            int base;
+            if (!emit_args_range(la->elems, base, ops)) {
+                chunk.consts.resize(cmark);   /* emit_args_range won't undo */
+                return false;
+            }
+            const int dst = alloc_temp();
+            Instr in;
+            in.op = OpCode::MakeArrayV;
+            in.target = dst;
+            in.a = int_lit(base);
+            in.b = int_lit(static_cast<int>(la->elems.size()));
+            in.target2 = static_cast<int>(la->arr_hint);
+            ops.push_back(in);
+            out_slot = dst;
+            return true;
+        }
+
         /* A subscript READ `a[i]` (general array / dict / string element) ->
          * SubscriptV via the runtime Type::subscript. (A slice is a separate
          * node, not handled here.) */
@@ -765,7 +793,12 @@ struct Codegen {
              * bug). A leaf falls to MoveV. */
             if (ops.size() > omark && ops.back().target == rslot
                 && (ops.back().op == OpCode::BinOpV
-                    || ops.back().op == OpCode::LoadConstV)) {
+                    || ops.back().op == OpCode::LoadConstV
+                    || ops.back().op == OpCode::MakeArrayV)) {
+                /* MakeArrayV reads its element run before writing `target`, and
+                 * the local lvalue slot can't overlap the temp run - so writing
+                 * the array straight into `a` is sound (even `a=[a,1]`, whose
+                 * old `a` is already copied into the run). */
                 ops.back().target = lv->sym.slot;
             } else {
                 Instr in;

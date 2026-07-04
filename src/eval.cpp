@@ -1315,23 +1315,35 @@ EvalValue InlinedCallExpr::do_eval(EvalContext *ctx, bool rec) const
     return my_flow.type == FlowState::ret ? my_flow.value : none;
 }
 
-EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
+/*
+ * Build an array VALUE from `n` already-evaluated element values, honoring the
+ * `hint` (flat int/float/bool/struct storage vs general). Shared by the
+ * tree-walker (LiteralArray::do_eval, which evaluates its element nodes into a
+ * buffer first) and the VM's MakeArrayV op (which reads the values from
+ * frame-slot registers) - so both build byte-identically with no per-element
+ * node re-eval on the VM side. The only context it needs is `is_const` (whether
+ * the elements' LValues are read-only, i.e. we are in a const-eval context).
+ */
+EvalValue build_array_from_values(const EvalValue *vals, size_t n,
+                                  ArrHint hint,
+                                  const StructTypeDef *hint_struct,
+                                  bool is_const)
 {
-    if (!elems.size()) {
+    if (!n) {
         /* An empty array with a flat destination type (`array<int> a;`,
          * `array<POD struct> a;`, ...): start flat so a built-up
          * `append(a, ...)` stays unboxed - the destination type, not the
          * (empty) value, drives the representation. */
-        if (arr_hint == ArrHint::flat_s && arr_hint_struct) {
-            StructTypeDef *def = const_cast<StructTypeDef *>(arr_hint_struct);
+        if (hint == ArrHint::flat_s && hint_struct) {
+            StructTypeDef *def = const_cast<StructTypeDef *>(hint_struct);
             return SharedArrayObj(
                 SharedArrayObj::svec_type({}, def, def->size));
         }
-        if (arr_hint == ArrHint::flat_i)
+        if (hint == ArrHint::flat_i)
             return SharedArrayObj(SharedArrayObj::ivec_type{});
-        if (arr_hint == ArrHint::flat_f)
+        if (hint == ArrHint::flat_f)
             return SharedArrayObj(SharedArrayObj::fvec_type{});
-        if (arr_hint == ArrHint::flat_b)
+        if (hint == ArrHint::flat_b)
             return SharedArrayObj(SharedArrayObj::bvec_type{});
         return empty_arr;
     }
@@ -1344,7 +1356,6 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
      * vector while the kind holds, spilling to a general vector<LValue> at the
      * first off-kind element. A mixed literal is general.
      */
-    const size_t n = elems.size();
     SharedArrayObj::ivec_type ivec;
     SharedArrayObj::fvec_type fvec;
     SharedArrayObj::bvec_type bvec;
@@ -1373,7 +1384,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
      * case - the value-driven scan already produces flat for an all-one-kind
      * literal, which is exactly when those hints are set.)
      */
-    int mode = arr_hint == ArrHint::general ? 3 : 0;
+    int mode = hint == ArrHint::general ? 3 : 0;
     if (mode == 3)
         gvec.reserve(n);
 
@@ -1381,14 +1392,13 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         gvec.reserve(n);
         if (mode == 1)
             for (int_type x : ivec)
-                gvec.emplace_back(EvalValue(x), ctx->const_ctx);
+                gvec.emplace_back(EvalValue(x), is_const);
         else if (mode == 2)
             for (float_type x : fvec)
-                gvec.emplace_back(EvalValue(x), ctx->const_ctx);
+                gvec.emplace_back(EvalValue(x), is_const);
         else if (mode == 4)
             for (unsigned char x : bvec)
-                gvec.emplace_back(EvalValue(static_cast<bool>(x)),
-                                  ctx->const_ctx);
+                gvec.emplace_back(EvalValue(static_cast<bool>(x)), is_const);
         else if (mode == 5) {
             const size_t cnt = sstride ? svecbuf.size() / sstride : 0;
             for (size_t i = 0; i < cnt; i++) {
@@ -1396,7 +1406,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
                 std::memcpy(o->bytes.data(),
                             svecbuf.data() + i * sstride, sstride);
                 gvec.emplace_back(EvalValue(intrusive_ptr<StructObject>(o)),
-                                  ctx->const_ctx);
+                                  is_const);
             }
         }
         ivec.clear();
@@ -1406,9 +1416,9 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         mode = 3;
     };
 
-    for (const auto &e : elems) {
+    for (size_t i = 0; i < n; i++) {
 
-        EvalValue v = RValue(e->eval(ctx));
+        const EvalValue &v = vals[i];
 
         if (mode == 0) {
             if (v.is<int_type>()) {
@@ -1425,7 +1435,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
                 append_struct_bytes(v);
             } else {
                 mode = 3; gvec.reserve(n);
-                gvec.emplace_back(v, ctx->const_ctx);
+                gvec.emplace_back(v, is_const);
             }
         } else if (mode == 1 && v.is<int_type>()) {
             ivec.push_back(v.get<int_type>());
@@ -1438,7 +1448,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         } else {
             if (mode != 3)
                 spill_to_general();
-            gvec.emplace_back(v, ctx->const_ctx);
+            gvec.emplace_back(v, is_const);
         }
     }
 
@@ -1449,6 +1459,28 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         return SharedArrayObj(
             SharedArrayObj::svec_type(move(svecbuf), sdef, sstride));
     return SharedArrayObj(move(gvec));
+}
+
+EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
+{
+    /* Evaluate the element nodes into a buffer (stack for the common small
+     * literal, heap for a large one), then hand off to the shared builder -
+     * the same builder the VM's MakeArrayV op calls with register values. */
+    const size_t n = elems.size();
+
+    if (n <= 16) {
+        EvalValue buf[16];
+        for (size_t i = 0; i < n; i++)
+            buf[i] = RValue(elems[i]->eval(ctx));
+        return build_array_from_values(buf, n, arr_hint, arr_hint_struct,
+                                       ctx->const_ctx);
+    }
+
+    std::vector<EvalValue> buf(n);
+    for (size_t i = 0; i < n; i++)
+        buf[i] = RValue(elems[i]->eval(ctx));
+    return build_array_from_values(buf.data(), n, arr_hint, arr_hint_struct,
+                                   ctx->const_ctx);
 }
 
 /*

@@ -309,6 +309,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
         case OpCode::ReturnV:
             row << "return.v     " << RI(in.a, false);
             break;
+        case OpCode::MakeArrayV:
+            row << "make.arr     " << D(in.target) << " = "
+                << arglist(chunk, in.a.lit, in.b.lit)
+                << "  ; array literal, hint " << in.target2;
+            break;
         case OpCode::LoadImmInt:
             row << "load         " << D(in.target) << ", #" << in.a.lit;
             break;

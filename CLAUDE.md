@@ -2939,7 +2939,18 @@ global slot) goes native via **`CallValueV`**: the callee EXPRESSION is compiled
 into a temp (callee-first, matching the tree-walker), then the args run, and the
 op reads the temp's `FuncObject` and `vm_call_func`s it — so
 `11_closure_counter` (1.09x → 1.00x, no longer a VM loss) and `12_higher_order`
-(0.54x) go native. A
+(0.54x) go native. An **array LITERAL** `[a, b, ..]` whose elements aren't all
+const (a fully-const one is a baked `LoadConstV`; a `LiteralObj` stays fallback)
+builds native via **`MakeArrayV`**: the element expressions compile into a
+register run (the same contiguous-run pattern native calls use for args, via
+`emit_args_range`), and the op builds the array through the tree-walker's shared
+**`build_array_from_values`** core — flat (int/float/bool) or general per the
+`ArrHint` carried in `target2`, box-free, never throwing (so `node`-free) — and
+is retargeted straight into the lvalue slot for `var a = [..]` (no `MoveV`). A
+flat STRUCT-array literal (`ArrHint::flat_s`) stays fallback (its ctor elements
+don't lower, and the def isn't in the op). So a per-iteration array literal
+(`22_multi_assign` 1.05x→0.89x; matrix/sieve/wordcount) no longer falls back to
+`EvalStmt`. A
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
 sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)

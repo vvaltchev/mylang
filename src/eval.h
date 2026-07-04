@@ -355,6 +355,17 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
 const EvalValue *dict_present_value(const intrusive_ptr<DictObject> &obj,
                                     const EvalValue &key);
 
+enum class ArrHint : unsigned char;   /* defined in syntax.h */
+
+/* Build an array VALUE from `n` already-evaluated element values, honoring the
+ * flat/general storage hint. Shared by the tree-walker (LiteralArray::do_eval)
+ * and the bytecode VM's MakeArrayV op (which reads the values from registers),
+ * so both build byte-identically. `is_const` == the elements are read-only. */
+EvalValue build_array_from_values(const EvalValue *vals, size_t n,
+                                  ArrHint hint,
+                                  const StructTypeDef *hint_struct,
+                                  bool is_const);
+
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
 void run_weight_bench();
