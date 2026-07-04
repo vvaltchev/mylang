@@ -3753,10 +3753,33 @@ void Inferencer::check_call(CallExpr *call)
 
 /* All operands of a MultiOpConstruct are statically scalar? `allow_float` also
  * accepts float operands (for a float-result op / a float comparison). */
+/*
+ * The scalar TypeHint of an operand for the specialization decision. Normally
+ * its stamped `th`, but a scalar LITERAL created AFTER infer_types (AutoConst
+ * folding a const `var` into a use, or the inliner's refold) carries no th -
+ * yet its type is intrinsic. Derive it (int/bool -> i, float -> f) so a
+ * comparison / arithmetic / bitwise op over a folded const still specializes.
+ * Without this, `var N = 8; while (i < N)` (N auto-const-folded to 8) left
+ * `i < 8` a boxed Expr06 - slow in BOTH the tree-walker and unlowerable by the
+ * VM. Downstream is unaffected: a literal's eval_int/eval_float and the VM's
+ * as_int_operand read it by kind, not th.
+ */
+static TypeHint operand_th(const Construct *n)
+{
+    if (n->th == TypeHint::i || n->th == TypeHint::f)
+        return n->th;
+    if (dynamic_cast<const LiteralInt *>(n)
+        || dynamic_cast<const LiteralBool *>(n))
+        return TypeHint::i;
+    if (dynamic_cast<const LiteralFloat *>(n))
+        return TypeHint::f;
+    return n->th;
+}
+
 static bool ops_scalar(const MultiOpConstruct *mo, bool allow_float)
 {
     for (const auto &pr : mo->elems) {
-        const TypeHint t = pr.second->th;
+        const TypeHint t = operand_th(pr.second.get());
         if (t == TypeHint::i)
             continue;
         if (t == TypeHint::f && allow_float)
@@ -3806,8 +3829,9 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
     if (dynamic_cast<Expr06 *>(n.get()) || dynamic_cast<Expr07 *>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (mo->elems.size() == 2 && ops_scalar(mo, true)) {
-            const bool anyf = mo->elems[0].second->th == TypeHint::f ||
-                              mo->elems[1].second->th == TypeHint::f;
+            const bool anyf =
+                operand_th(mo->elems[0].second.get()) == TypeHint::f ||
+                operand_th(mo->elems[1].second.get()) == TypeHint::f;
             return make_typed(TypedScalarExpr::Cat::cmp,
                               anyf ? TypeHint::f : TypeHint::i,
                               TypeHint::i, mo);
