@@ -17,15 +17,18 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~D1~~ | ~~dict store~~ | 5 | ~~P2~~ | ✅ .55/.43 |
 | **D1m** | dict MEMBER store `d.k=v` | (rare) | P2b | todo |
 | ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
-| ⛔F | ~~foreach unpack/indexed~~ | 19,20 | — | REVERTED — regressed, see note |
-| ⛔D3 | ~~dict `foreach(k,v in d)`~~ | 26,47,62 | — | not worth it, see note |
+| ~~F1~~ | ~~foreach single-var gen arr~~ | (grp) | — | ✅ box-free LoadElem.v |
+| ~~F2~~ | ~~foreach INDEXED 2-var~~ | 19 | — | ✅ box-free (see "redo") |
+| **F3** | foreach UNPACK `x,y in pairs` | 20 | — | strict done; native todo |
+| **D3** | dict `foreach(k,v in d)` | 26,47,62 | — | needs dict-iterator fdn |
 | ~~G~~ | ~~general array store~~ | 5 | ~~P4~~ | ✅ 32:.67 20:.62 |
 | **S** | string element `s[i]`, build | 29,30,31,32 | P7 | todo |
 | **M** | multi-assign / IdList | 22,06 | P9 | todo |
-| **C** | closure / indirect call `c()` | 11 | P6 | todo |
-| **R** | call-in-global-assign `r=f(n)+900` | 10 | P10b | todo |
-| **A** | `push(a,i)` value self-eval | 13 | P10a | todo |
-| **X** | try/catch + C++ `throw` | 42 (24.5×) | P8 | todo |
+| ~~C~~ | ~~closure/indirect call `c()`~~ | 11 | — | ✅ CallValueV 1.09→1.00 |
+| **R** | call-in-global-assign `r=f(n)+9` | 10 | P10b | todo |
+| **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |
+| **Lit** | array/dict literal `[..]`/`{}` | 20,46 | — | MakeArrayV/DictV todo |
+| **X** | try/catch + C++ `throw` | 42 (24.5×) | P8 | LAST (VM-level exc) |
 
 Plus the Part-C native-but-slow work (typed reads, computed-goto dispatch,
 arg-view builtin ABI, ...) — none skipped.
@@ -44,6 +47,49 @@ cost is a shared runtime helper (not `node->eval` of a rich body) is NOT worth
 nativizing — the VM only wins where it removes real per-node dispatch. Left as a
 tree-walker fallback (which is fast). Kept nothing; `git checkout` reverted the
 op, the codegen, the inferencer flag, and the `do_iter` refactor.
+
+## Current state (the foundations were then built; foreach re-done box-free)
+
+The negative result above was the trigger for building the **AST-free
+foundations FIRST** (see `bytecode-vm.md` + `vm-ast-free.md`): a **loc side
+table** (`Chunk::locs`), a **const pool** + **member-key pool**, and a
+**deferred backtrace loc** in `do_func_call`. With those, 8 op-data families are
+now `node`-free (DictLoad, SubscriptV, boxed BinOpV/CompoundV/CmpV/LogV,
+LoadGlobalV, MemberV, CallV/CachedCallV), and foreach was **re-done the RIGHT
+way** — box-free, no `bind_loop_var`/`arr_elem_boxed`:
+- **single-var general array** (`array<str|array|dict|dyn>`) → `LoadElemValue`
+  binds the element's existing `EvalValue` (a copy, no box/unbox), ~1.7x on a
+  general-foreach loop;
+- **indexed 2-var** (`foreach i,e in indexed a`) → the index var IS the counter,
+  element via `elem_th`;
+- **closure/indirect call** (`c()`) → `CallValueV` (`11_closure_counter`
+  1.09→1.00, `12_higher_order` 0.54x).
+
+**Audit correction:** `-vd` shows only the TOP-LEVEL chunk, and a `func` decl
+renders its body text inline — so an earlier per-bench audit over-counted "for
+body" fallbacks that are really func-decl renderings (func bodies compile
+separately via the Phase-4 hook). The genuinely remaining fallbacks are the
+table rows above; the biggest real losses were all noise/parity once
+`11_closure` was fixed.
+
+**The one missing ABSTRACTION** is dict iteration (D3): a dict has no O(1)
+index, so the counted-loop machine can't express `foreach k,v in d`. Build a
+proper VM dict-iterator (iteration-state slot + a `DictIterNext` op), NOT the
+cheap snapshot-to-two-arrays hack. Everything else is index-model ops.
+
+**Language simplification is a lever (MyLang is pre-release).** We already used
+it: **`foreach` array-destructuring is now STRICT** (ragged/scalar/mismatch
+error instead of the old none-padding), which both improves semantics AND
+unblocks the native unpack lowering (plain scalar reads, no per-element
+is-array?/size? branch). And **`var` is now optional in `foreach`** (declares;
+no-`var` may not shadow). Look for more such wins: a rarely-used dynamic
+behavior that blocks nativization is a candidate to tighten (with a `README` +
+`samples/` update — see CLAUDE.md).
+
+**Order:** native unpack (F3), then the index-model ops (Lit / S / M),
+then the dict-iterator foundation (D3), then func-body/free-the-AST, and
+**exceptions (X) LAST** (needs VM-level exception dispatch to kill the C++
+`throw` cost).
 
 **Goal restated:** lift the `-vm` geomean from **~4.0× CPython** to **5×+**.
 Progress (60-bench geomean; `run.py`'s 61-set reads a touch higher):

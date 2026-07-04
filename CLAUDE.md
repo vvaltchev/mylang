@@ -3349,6 +3349,21 @@ omitting it is a compile error.
 
 ## Conventions
 
+- **A breaking language change must update `samples/` too, in the SAME change.**
+  The extensionless scripts in `samples/` (`fib`, `gcd`, `loop`, `phonebook`,
+  `primes`, `primes2`, `rand_sort`, `shopping`, `strloop`, …) are part of the
+  codebase, not throwaway demos — they are the human-facing showcase of the
+  language and must always run. When a change alters script-visible behavior
+  (a removed/changed keyword, a stricter rule, a new error condition), run every
+  sample and fix any that broke, in the same commit as the change (alongside the
+  `README.md` update — see the doc-sync rule at the top). Verify with the actual
+  interpreter, not by eye; some samples are interactive (`phonebook` reads
+  stdin), so a bare run "erroring" may just be the script's own handling of
+  empty input, not a regression — distinguish a MyLang `Exception`/compile error
+  from the script's own output. (A sample that was ALREADY broken by an earlier,
+  unrelated change is a separate bug to fix on its own, but don't let a breaking
+  change ADD to the pile.)
+
 - **Incremental is fine; ending in a half-measure is not.** Landing a feature in
   stages — even with temporary duplication or a stubbed corner — is welcome, as
   long as the *task* ends at a proper solution. Don't stop at "works but
