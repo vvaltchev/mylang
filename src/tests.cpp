@@ -10641,9 +10641,26 @@ static bool vm_codegen_shapes()
     const bool write_flt_ok =
         wf.storef == 1 && wf.flstep == 1;
 
+    /* 11) NESTED loops + an `if` in a loop body compile fully native - two
+     * ForLoopStep (outer+inner), no EvalStmt/JumpIfFalse in the hot path. The
+     * `if` here has a comparison condition, so it is a native JumpUnlessIntCmp
+     * (a jif==0 witnesses that the whole nest lowered without a fallback). */
+    VmOpCounts nl;
+    if (!codegen_counts({
+            "var a = array(10, 0); var s = 0;",
+            "for (var i = 0; i < 10; i++)",
+            "  for (var j = 0; j < 10; j++)",
+            "    if (i < j) s += a[i];",
+        }, nl))
+        return false;
+    const bool nested_native_ok =
+        nl.flstep == 2 && nl.loadei == 1 && nl.jif == 0
+        && nl.juic >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
-        && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok;
+        && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
+        && nested_native_ok;
 }
 
 static const std::vector<extra_check> extra_checks =

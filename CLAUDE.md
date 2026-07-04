@@ -2857,10 +2857,12 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: Phase 4 landed** (register machine over frame slots — resolved-local
-int/float/mixed scalar loops run native at top level AND inside function bodies,
-via a `do_func_call` hook; recursion stays neutral; **suite geomean 0.87x, VM
-~13% faster than the tree-walker**). Gated by the
+**Status: Phase 5 in progress** (register machine over frame slots —
+resolved-local int/float/mixed scalar loops run native at top level, inside
+function bodies via a `do_func_call` hook, and NESTED — nested loops + `if` in a
+loop body compile directly into the chunk; array element read/write `a[i]` /
+`a[i]=v` are native; recursion stays neutral; **suite geomean 0.82x, VM ~1.2x
+faster than the tree-walker**). Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
@@ -2909,10 +2911,18 @@ body via `vm_run_chunk` when it's a scope-free block with a native loop
 (compiled once, cached on the `FuncDeclStmt`), reusing all of `do_func_call`'s
 frame/param/backtrace machinery — so `55_float_sum` (a loop in a function) is
 −62%, while recursion stays neutral (a body with no native loop → tree-walked,
-`fib` −0.08%). **Suite geomean 0.87x, VM ~13% faster than the tree-walker.** The
-register choice (over a stack machine, which the already-M8-optimized
-tree-walker would beat) is also the right IR for the eventual native x86-64
-codegen. Full roadmap + phase order: `plans/bytecode-vm.md`.
+`fib` −0.08%). **Phase 5** widens native coverage: array element read/write
+(`a[i]` / `a[i]=v` → `LoadElem`/`StoreElem`, mirroring the flat-array
+subscript/store incl. COW; a dict subscript stays a fallback via the inferencer-
+set `Subscript::base_array`), and **nested control flow** — the loop codegen
+emits the body directly into the chunk with backpatching, so nested loops and an
+`if` in a loop body go native (this is the broad win: many benchmarks wrap their
+work loop in a `for(rep)` amplifier whose body — a loop — used to force the
+whole thing to fall back). **Suite geomean 0.82x, VM ~1.2x faster than the
+tree-walker.** The register choice (over a stack machine, which the
+already-M8-optimized tree-walker would beat) is also the right IR for the
+eventual native x86-64 codegen. Full roadmap + phase order:
+`plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)
 

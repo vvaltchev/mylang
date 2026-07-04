@@ -1,10 +1,13 @@
 # Bytecode VM
 
-Status: **Phase 4 landed** — the register machine runs resolved-local int/float
-scalar loops (`while`/counted `for`, fused `ForLoopStep`) natively, both at top
-level AND inside function bodies (`do_func_call` hooks `vm_run_chunk`).
-**Suite geomean 0.87x (VM ~13% faster than the tree-walker)**; recursion stays
-neutral; Phases 0–3 done; the whole `-rt` suite passes under both engines.
+Status: **Phase 5 in progress** — the register machine runs resolved-local
+int/float scalar loops (`while`/counted `for`, fused `ForLoopStep`) natively at
+top level, inside function bodies (`do_func_call` hooks `vm_run_chunk`), and
+NESTED (nested loops + `if` in a body compile directly into the chunk with
+backpatching); array element read/write `a[i]` / `a[i]=v` are native (`LoadElem`
+/ `StoreElem`, dict subscripts stay fallback via `Subscript::base_array`).
+**Suite geomean 0.82x (VM ~1.2x faster than the tree-walker)**; recursion stays
+neutral; Phases 0–4 done; the whole `-rt` suite passes under both engines.
 Branch: `exp-work`.
 
 The design + incremental task plan for MyLang's runtime bytecode VM. Read the
@@ -401,11 +404,30 @@ behind the differential harness:
   −7.4% → **−58.4%** (both its loops native now). Verified: alias/slice COW,
   write-in-func, const→NotLValueEx, and `hash(a)==hash(deepclone(a))`.
   Compound `a[i] OP= v` still falls back. 1303/1303 + 1155/1155.
-- **native nested loops / `if` inside a loop body** (compile the body directly
-  into the chunk with backpatching, not into a temp op vector) - the geomean
-  MOVER: unlocks `43_sieve` / `56_sieve_bool` / `46_matrix_mult`, whose loops
-  nest (they still fall back today: an outer loop whose body is a loop isn't a
-  scalar statement, so the whole nest tree-walks);
+- **native nested loops + `if` inside a loop body — DONE (the geomean mover:
+  0.87x -> 0.82x).** The loop codegen was restructured to emit the body
+  DIRECTLY into chunk.code (jumps chunk-absolute, no relocation) with
+  backpatching + SELF-TRUNCATION on failure, and `compile_scalar_body` now
+  recurses into nested `for`/`while` and `if` (native `JumpUnless*Cmp` cond, or
+  a fallback `JumpIfFalse` for `if (flag)` / `if (a[i])`) - so arbitrary native
+  control flow nests. The big win wasn't the sieve/matrix shapes themselves
+  (barely moved - a sieve's inner `a[j]=0` write + its cross-cutting spend, and
+  matrix's `c[i][j] += ` needs a COMPOUND array store, still a fallback) but the
+  many benchmarks that wrap their work loop in a `for(rep)` amplifier: that
+  outer loop's body being a loop meant the whole thing fell back before, so
+  `04_float_arith` −80%, `05_mixed_arith`, etc. now go native. A
+  `break`/`continue`/`return` or any non-compilable body statement still
+  self-truncates the whole nest to a fallback (correct). **Dict-subscript fix:**
+  `d[k]`/`d[k]=v` (a dict, th==i) was wrongly compiled to a LoadElem/StoreElem
+  that fell back at runtime while STILL computing the index/value as native
+  operands - a double-compute that regressed `23_dict_insert` +5.7%. The
+  inferencer now stamps `Subscript::base_array` (true only when the base is
+  statically an ARRAY); codegen emits LoadElem/StoreElem only then, so a dict
+  subscript stays a clean fallback (regression -> +0.0%).
+  1303/1303 + 1155/1155; nested/for-while/if/if-else/sieve/matrix/triple-nest
+  hand-verified vs the tree-walker.
+- **compound array store `a[i] OP= v`** (unlocks `46_matrix_mult`);
+- native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct
   (unboxed) field read;

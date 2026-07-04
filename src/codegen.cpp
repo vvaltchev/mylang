@@ -166,9 +166,10 @@ struct Codegen {
         if (as_int_operand(e, out))
             return true;
 
-        /* Array element read `a[i]` -> LoadElemInt into a temp. */
+        /* Array element read `a[i]` -> LoadElemInt into a temp (arrays only; a
+         * dict subscript stays fallback - see Subscript::base_array). */
         if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
-            if (e->th != TypeHint::i)
+            if (e->th != TypeHint::i || !sub->base_array)
                 return false;
             int aslot;
             Operand idx;
@@ -268,7 +269,7 @@ struct Codegen {
         if (e->op == Op::assign) {
             if (const Subscript *sub =
                     dynamic_cast<const Subscript *>(e->lvalue.get())) {
-                if (sub->th != TypeHint::i)
+                if (sub->th != TypeHint::i || !sub->base_array)
                     return false;
                 int aslot;
                 if (!as_array_slot(sub->what.get(), aslot))
@@ -371,7 +372,7 @@ struct Codegen {
         /* Array element read `a[i]` (float element) -> LoadElemFloat; the index
          * is still an int expression. */
         if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
-            if (e->th != TypeHint::f)
+            if (e->th != TypeHint::f || !sub->base_array)
                 return false;
             int aslot;
             Operand idx;
@@ -466,7 +467,7 @@ struct Codegen {
         if (e->op == Op::assign) {
             if (const Subscript *sub =
                     dynamic_cast<const Subscript *>(e->lvalue.get())) {
-                if (sub->th != TypeHint::f)
+                if (sub->th != TypeHint::f || !sub->base_array)
                     return false;
                 int aslot;
                 if (!as_array_slot(sub->what.get(), aslot))
@@ -564,104 +565,169 @@ struct Codegen {
         return stmts;
     }
 
-    /* Compile a loop body's statements into `body_ops`, each dispatched by its
-     * OWN kind (int or float), so a MIXED body compiles. A failed int attempt
-     * may leave partial ops; truncate before the float retry. False if any
-     * statement is unsupported. */
-    bool compile_scalar_body(const std::vector<const Construct *> &stmts,
-                             std::vector<Instr> &body_ops)
+    /*
+     * Compile a loop/if body's statements DIRECTLY into chunk.code (so any jumps
+     * they emit - from a nested loop / if - are chunk-absolute, no relocation),
+     * each dispatched by its OWN kind: an int/float scalar statement, a NESTED
+     * `for`/`while` loop, or an `if`. This is what lets native control flow nest
+     * (sieve/matrix shapes). SELF-TRUNCATING: on the first unsupported statement
+     * (break/continue/return/a call/a nested func/...) it resizes chunk.code
+     * back to where the body started and returns false, so the caller falls the
+     * whole enclosing loop back with nothing left behind. A MIXED int/float body
+     * still compiles (per-statement kind dispatch).
+     */
+    bool compile_scalar_body(const std::vector<const Construct *> &stmts)
     {
+        const size_t start = chunk.code.size();
         for (const Construct *s : stmts) {
             reset_temps();
-            const size_t mark = body_ops.size();
-            if (compile_int_stmt(s, body_ops))
+            const size_t mark = chunk.code.size();
+            if (compile_int_stmt(s, chunk.code))
                 continue;
-            body_ops.resize(mark);
+            chunk.code.resize(mark);
             reset_temps();
-            if (!compile_float_stmt(s, body_ops))
-                return false;
+            if (compile_float_stmt(s, chunk.code))
+                continue;
+            chunk.code.resize(mark);
+
+            /* Nested native control flow. Each is itself self-truncating, so on
+             * failure chunk.code is already back at `mark`; undo the whole body
+             * and bail so the enclosing loop falls back. */
+            if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
+                if (try_native_for_range(fr))
+                    continue;
+            } else if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
+                if (try_native_scalar_while(w))
+                    continue;
+            } else if (const IfStmt *iff = dynamic_cast<const IfStmt *>(s)) {
+                if (compile_native_if(iff))
+                    continue;
+            }
+
+            chunk.code.resize(start);
+            return false;
         }
         return true;
     }
 
-    /* Emit a compiled native loop: Lstart <cond ops> JumpUnless{cmp_op} <body
-     * ops> Jump Lstart ; Lend. */
-    void emit_native_while(const WhileStmt *w, OpCode cmp_op, Op cmp,
-                           Operand ca, Operand cb,
-                           const std::vector<Instr> &cond_ops,
-                           const std::vector<Instr> &body_ops)
+    /*
+     * An `if` inside a native body -> jumps, with native then/else. The
+     * condition is a native int/float compare (JumpUnless*Cmp -> Lelse when
+     * false) when it is one, else a fallback JumpIfFalse{cond} (eval_cond) - so
+     * `if (flag)` / `if (a[i])` work too. Self-truncating like the loops.
+     */
+    bool compile_native_if(const IfStmt *f)
     {
-        const int lstart = here();
-        for (const Instr &in : cond_ops)
-            chunk.code.push_back(in);
+        const size_t start = chunk.code.size();
 
-        Instr test;
-        test.op = cmp_op;
-        test.node = w->condExpr.get();
-        test.aop = cmp;
-        test.a = ca;
-        test.b = cb;
-        const size_t jt = chunk.code.size();
-        chunk.code.push_back(test);      /* target = Lend, patched below */
+        size_t jf;                    /* the conditional jump, patched to Lelse */
+        Operand ca, cb;
+        Op cmp;
+        reset_temps();
+        if (compile_int_cond(f->condExpr.get(), chunk.code, ca, cmp, cb)) {
+            jf = emit_cmp(OpCode::JumpUnlessIntCmp, f->condExpr.get(),
+                          cmp, ca, cb);
+        } else {
+            chunk.code.resize(start);
+            reset_temps();
+            if (compile_float_cond(f->condExpr.get(), chunk.code, ca, cmp, cb)) {
+                jf = emit_cmp(OpCode::JumpUnlessFloatCmp, f->condExpr.get(),
+                              cmp, ca, cb);
+            } else {
+                chunk.code.resize(start);
+                jf = emit(OpCode::JumpIfFalse, f->condExpr.get());
+            }
+        }
 
-        for (const Instr &in : body_ops)
-            chunk.code.push_back(in);
+        if (f->thenBlock
+            && !compile_scalar_body(body_stmts(f->thenBlock.get()))) {
+            chunk.code.resize(start);
+            return false;
+        }
 
-        emit(OpCode::Jump, nullptr, lstart);
-        chunk.code[jt].target = here();  /* Lend */
+        if (f->elseBlock) {
+            const size_t j = emit(OpCode::Jump);
+            chunk.code[jf].target = here();          /* Lelse */
+            if (!compile_scalar_body(body_stmts(f->elseBlock.get()))) {
+                chunk.code.resize(start);
+                return false;
+            }
+            chunk.code[j].target = here();           /* Lend */
+        } else {
+            chunk.code[jf].target = here();          /* Lend */
+        }
+        return true;
+    }
+
+    /* Push a JumpUnless{Int,Float}Cmp and return its index (for backpatching). */
+    size_t emit_cmp(OpCode opc, const Construct *node, Op cmp,
+                    const Operand &a, const Operand &b)
+    {
+        Instr t;
+        t.op = opc;
+        t.node = node;
+        t.aop = cmp;
+        t.a = a;
+        t.b = b;
+        const size_t at = chunk.code.size();
+        chunk.code.push_back(t);
+        return at;
     }
 
     /*
-     * A resolved-local scalar (int OR float) loop -> native register ops, no
-     * fallback:
+     * A resolved-local scalar (int OR float) loop -> native register ops emitted
+     * DIRECTLY into chunk.code:
      *   Lstart: <cond ops> JumpUnless{Int,Float}Cmp{a,cmp,b -> Lend}
      *           <body ops> Jump Lstart ; Lend:
      * Fires when the condition is an int/float comparison and every body
-     * statement is a compilable int/float assignment/inc-dec (so no decl to
-     * scope, no break/continue/return). The condition and each body statement
-     * are dispatched by their OWN kind, so a MIXED int/float loop compiles too;
-     * any unsupported statement emits nothing and returns false (-> Phase 1).
+     * statement compiles (scalar / nested loop / if). Self-truncating: any
+     * failure resizes chunk.code back to the start and returns false (-> the
+     * Phase 1 fallback in gen_while, or the enclosing body falls back).
      */
     bool try_native_scalar_while(const WhileStmt *w)
     {
-        std::vector<Instr> cond_ops, body_ops;
+        const size_t start = chunk.code.size();
+        const int lstart = here();
+
         Operand ca, cb;
         Op cmp;
         OpCode cmp_opcode;
 
-        /* Condition: int or float compare (per-condition dispatch). A failed
-         * int attempt may have appended partial operand ops - clear before
-         * retrying float. */
         reset_temps();
-        if (compile_int_cond(w->condExpr.get(), cond_ops, ca, cmp, cb)) {
+        if (compile_int_cond(w->condExpr.get(), chunk.code, ca, cmp, cb)) {
             cmp_opcode = OpCode::JumpUnlessIntCmp;
         } else {
-            cond_ops.clear();
+            chunk.code.resize(start);
             reset_temps();
-            if (!compile_float_cond(w->condExpr.get(), cond_ops, ca, cmp, cb))
+            if (!compile_float_cond(w->condExpr.get(), chunk.code,
+                                    ca, cmp, cb)) {
+                chunk.code.resize(start);
                 return false;
+            }
             cmp_opcode = OpCode::JumpUnlessFloatCmp;
         }
 
-        /* Body: each statement dispatched by its OWN kind, so a MIXED loop -
-         * `while (i < n) { f += 0.5; i++; }` - compiles. */
-        if (!compile_scalar_body(body_stmts(w->body.get()), body_ops))
-            return false;
+        const size_t jt = emit_cmp(cmp_opcode, w->condExpr.get(), cmp, ca, cb);
 
-        emit_native_while(w, cmp_opcode, cmp, ca, cb, cond_ops, body_ops);
+        if (!compile_scalar_body(body_stmts(w->body.get()))) {
+            chunk.code.resize(start);
+            return false;
+        }
+
+        emit(OpCode::Jump, nullptr, lstart);
+        chunk.code[jt].target = here();             /* Lend */
         return true;
     }
 
     /*
-     * A counted int for-loop (ForRangeStmt) -> native register ops. `init` runs
-     * ONCE as a fallback (it declares `i` - a frame slot - so running it in the
-     * main context writes the same slot); `bound`/`step` must be simple int
-     * operands (a slot or literal, both loop-immutable, so reading them each
-     * iteration matches the once-evaluated tree-walker); the body compiles like
-     * a while body. The counter uses the FUSED ForLoopStep back-edge (one
-     * dispatch = i += step + test + branch), so a `for` is on par with the
-     * tree-walker's raw-C ForRangeStmt and wins when the body has real work.
-     * Falls back (returns false) otherwise.
+     * A counted int for-loop (ForRangeStmt) -> native register ops emitted
+     * directly into chunk.code. `init` runs ONCE as a fallback (it declares `i`
+     * - a frame slot - so running it in place writes the same slot);
+     * `bound`/`step` must be simple int operands (a slot or literal, both
+     * loop-immutable, so reading them each iteration matches the once-evaluated
+     * tree-walker); the body compiles like a while body (scalar / nested / if).
+     * The counter uses the FUSED ForLoopStep back-edge (one dispatch = i +=
+     * step + test + branch). Self-truncating on failure.
      */
     bool try_native_for_range(const ForRangeStmt *f)
     {
@@ -675,27 +741,21 @@ struct Codegen {
             step = int_lit(1);
         }
 
-        std::vector<Instr> body_ops;
-        if (!compile_scalar_body(body_stmts(f->body.get()), body_ops))
-            return false;
+        const size_t start = chunk.code.size();
 
         emit(OpCode::EvalStmt, f->init.get());      /* `var i = start`, once */
 
         const Operand ci = slot_op(f->i_slot);
 
         /* Initial test: skip the loop entirely if !(i <cmp> bound). */
-        Instr test;
-        test.op = OpCode::JumpUnlessIntCmp;
-        test.node = f;
-        test.aop = f->cmp_op;
-        test.a = ci;
-        test.b = bound;
-        const size_t jt = chunk.code.size();
-        chunk.code.push_back(test);
+        const size_t jt =
+            emit_cmp(OpCode::JumpUnlessIntCmp, f, f->cmp_op, ci, bound);
 
         const int lbody = here();
-        for (const Instr &in : body_ops)
-            chunk.code.push_back(in);
+        if (!compile_scalar_body(body_stmts(f->body.get()))) {
+            chunk.code.resize(start);
+            return false;
+        }
 
         /* Fused back-edge: i += step; if (i <cmp> bound) goto lbody. */
         Instr fstep;

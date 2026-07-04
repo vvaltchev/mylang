@@ -1368,6 +1368,14 @@ void Inferencer::annotate_hints(Construct *n)
     if (auto *e = dynamic_cast<Expr14 *>(n))
         set_array_repr_hint(e);
 
+    /* Mark `a[i]` whose base is statically an ARRAY, so the VM only compiles a
+     * native element load/store for arrays (a dict subscript stays a fallback -
+     * see Subscript::base_array). */
+    if (auto *sub = dynamic_cast<Subscript *>(n)) {
+        StaticTypeRef bt = static_type_resolve(type_of(sub->what.get()));
+        sub->base_array = bt->kind == StaticTypeKind::Array;
+    }
+
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });
 }
 

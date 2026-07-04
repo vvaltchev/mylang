@@ -1355,6 +1355,13 @@ public:
     unique_ptr<Construct> what;
     unique_ptr<Construct> index;
 
+    /* Set by the inferencer (annotate_hints) when `what` is statically an ARRAY
+     * (not a dict/string). The VM codegen only compiles `a[i]` to a native
+     * LoadElem/StoreElem when this holds - a dict subscript stays a fallback, so
+     * the VM never wastefully computes the index/value as native operands only
+     * to re-evaluate them in the dict fallback path. */
+    bool base_array = false;
+
     Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     int_type eval_int(EvalContext *ctx) const override;
@@ -1366,6 +1373,7 @@ public:
         copy_base_fields(*c);
         c->what = clone_as(what);
         c->index = clone_as(index);
+        c->base_array = base_array;
         return c;
     }
 };
