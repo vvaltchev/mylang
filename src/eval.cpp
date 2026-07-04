@@ -2997,6 +2997,21 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
             const SharedArrayObj &arr = rval.get<SharedArrayObj>();
             const size_type asz = arr.size();
 
+            /*
+             * STRICT array destructuring: the array must have EXACTLY as many
+             * elements as there are targets (same rule as foreach unpack). A
+             * length mismatch is an error, not a silent none-pad (too few) or
+             * dropped extras (too many). The non-array case above still spreads
+             * the same value to each target - a deliberate convenience kept.
+             */
+            if (asz != idlist->elems.size())
+                throw TypeErrorEx(
+                    intern_msg("cannot unpack an array of length " +
+                               std::to_string(asz) + " into " +
+                               std::to_string(idlist->elems.size()) +
+                               " variables"),
+                    lvalue->start, lvalue->end);
+
             for (size_type i = 0; i < idlist->elems.size(); i++) {
 
                 handle_single_expr14(
@@ -3004,7 +3019,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
                     inDecl,
                     op,
                     idlist->elems[i].get(),
-                    i < asz ? arr_elem_boxed(arr, i) : none
+                    arr_elem_boxed(arr, i)
                 );
             }
         }

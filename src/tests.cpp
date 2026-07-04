@@ -5244,21 +5244,30 @@ static const std::vector<test> tests =
     },
 
     {
-        "Multi-id assignments with more IDs than elems",
+        /* STRICT: an array destructure must match the target count exactly
+         * (like foreach unpack) - too few is an error, not a none-pad. */
+        "Multi-id assign with MORE ids than elems is an error",
         {
             "var a,b,c = [1,2];",
-            "assert(a == 1);",
-            "assert(b == 2);",
-            "assert(c == none);",
         },
+        &typeid(TypeErrorEx),
     },
 
     {
-        "Multi-id assignments with more elems than IDs",
+        /* STRICT: too many is an error too, not a silent drop. */
+        "Multi-id assign with MORE elems than ids is an error",
         {
             "var a,b = [1,2,3];",
-            "assert(a == 1);",
-            "assert(b == 2);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        /* the scalar-spread convenience is KEPT: `var a,b = 0` -> both 0. */
+        "Multi-id assign scalar-spread kept",
+        {
+            "var a,b,c = 5;",
+            "assert(a == 5 && b == 5 && c == 5);",
         },
     },
 

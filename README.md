@@ -1021,7 +1021,10 @@ a few difference from `C` worth pointing out:
 
   - To declare multiple variables, use the syntax: `var a, b = [3,4];` or
     just `var a,b,c,d = 0;` if you want all the variables to have the same
-    initial value.
+    initial value. When the right-hand side is an **array**, it is destructured
+    **strictly** — it must have exactly as many elements as there are targets
+    (`var a, b, c = [1, 2];` is an error, as is `var a, b = [1, 2, 3];`). A
+    **non-array** value is spread to every target (the `var a,b = 0` case).
 
   - To increase the value of multiple variables use the syntax:
     `a, b += [1, 2]`. In the extremely rare and complex cases when in the

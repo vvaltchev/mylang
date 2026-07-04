@@ -1992,18 +1992,17 @@ sanitizers never reproduced it.)
   the mechanism behind the counter/closure examples in the README. (Decided by
   `capture_slots.empty()` in `TypeFunc::clone`.)
 - **Multiple assignment & array expansion** all funnel through `Expr14` +
-  `handle_single_expr14`:
-  an `IdList` lvalue with an array rvalue spreads element-wise
-  (`var a,b = [1,2]`), with a non-array
-  rvalue assigns the same value to each (`var a,b = 0`). The same helper drives
-  `foreach`
-  tuple-unpacking and the `indexed` keyword. **`foreach` array-destructuring
-  (`foreach (x, y in pairs)`) is STRICT** (`do_iter`, `eval.cpp`): each element
-  must be an array of EXACTLY the loop-var count — a non-array element or a
-  length mismatch throws `TypeErrorEx` (both engines: the VM falls back to
-  `do_iter` for unpack). The old lenient behavior (pad short with `none`,
-  silently drop extras, treat a scalar as the first value) was removed — it hid
-  bugs and could not be lowered to plain scalar reads.
+  `handle_single_expr14`. An `IdList` lvalue with an **array** rvalue
+  destructures element-wise (`var a,b = [1,2]`); with a **non-array** rvalue it
+  spreads the same value to each (`var a,b = 0` → both 0 — a deliberate
+  convenience). Both the multi-assign array case (`handle_single_expr14`) AND
+  `foreach` array-destructuring (`do_iter`) are **STRICT**: the array must have
+  EXACTLY as many elements as targets, else `TypeErrorEx` ("cannot unpack an
+  array of length M into N variables"). The old lenient behavior — pad short
+  with `none`, drop extras, treat a scalar element as the first value — was
+  removed (it hid bugs and blocked a native lowering to plain scalar reads).
+  `foreach` runs strict on both engines (the VM falls back to `do_iter` for
+  unpack). The `indexed` keyword rides the same path.
 - **`++` / `--` (`IncDecExpr`, `syntax.h`)** — C-style pre/postfix increment and
   decrement, **int/float only**. `IncDecExpr::do_eval` evaluates the operand
   exactly ONCE via two paths: when the inferencer proved it int/float (`th` is
