@@ -205,6 +205,20 @@ enum class OpCode : unsigned char {
     LogV,
 
     /*
+     * Boxed NON-LOCAL leaf loads (the boxed path's operand can be a global /
+     * captured / builtin value, not only a resolved-local slot): read the value
+     * into a temp `target` from `target2` = the table index. Mirror
+     * Identifier::do_eval.
+     *   LoadGlobalV   gfuncs->slots[target2] (throws UndefinedVariableEx via
+     *                 `node` if !gfuncs->defined - a read before the decl ran)
+     *   LoadCaptureV  (*captures)[target2] (a closure's per-instance capture)
+     *   LoadBuiltinV  builtin_slot(target2) (an unshadowed builtin as a value)
+     */
+    LoadGlobalV,
+    LoadCaptureV,
+    LoadBuiltinV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()

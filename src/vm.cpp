@@ -682,6 +682,27 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::LoadGlobalV:
+            if (!ctx.gfuncs->defined[in.target2])
+                throw UndefinedVariableEx(
+                    static_cast<const Identifier *>(in.node)->get_str(),
+                    in.node->start, in.node->end);
+            ctx.frame->slots[in.target].put(
+                ctx.gfuncs->slots[in.target2].get());
+            pc++;
+            break;
+
+        case OpCode::LoadCaptureV:
+            ctx.frame->slots[in.target].put(
+                (*ctx.captures)[in.target2].get());
+            pc++;
+            break;
+
+        case OpCode::LoadBuiltinV:
+            ctx.frame->slots[in.target].put(builtin_slot(in.target2).get());
+            pc++;
+            break;
+
         case OpCode::JumpUnlessTrueV:
             if (!ctx.frame->slots[in.target2].get().is_true())
                 pc = in.target;

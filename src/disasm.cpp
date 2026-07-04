@@ -191,6 +191,15 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
                 << reg_or_imm(in.b, false);
             break;
+        case OpCode::LoadGlobalV:
+            row << "load.global  r" << in.target << ", g" << in.target2;
+            break;
+        case OpCode::LoadCaptureV:
+            row << "load.capture r" << in.target << ", c" << in.target2;
+            break;
+        case OpCode::LoadBuiltinV:
+            row << "load.builtin r" << in.target << ", b" << in.target2;
+            break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  r" << in.target2 << ", L" << in.target;
             break;

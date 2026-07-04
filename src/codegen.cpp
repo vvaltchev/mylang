@@ -288,9 +288,25 @@ struct Codegen {
         if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
             if (id->sym.kind == SymKind::local) {
                 out_slot = id->sym.slot;
-                return true;
+                return true;   /* the slot IS the operand - no op */
             }
-            return false;
+            /* A global / capture / builtin leaf -> load into a temp. */
+            OpCode op;
+            switch (id->sym.kind) {
+                case SymKind::global:  op = OpCode::LoadGlobalV;  break;
+                case SymKind::capture: op = OpCode::LoadCaptureV; break;
+                case SymKind::builtin: op = OpCode::LoadBuiltinV; break;
+                default: return false;
+            }
+            const int t = alloc_temp();
+            Instr in;
+            in.op = op;
+            in.node = id;              /* for the undefined-global loc/name */
+            in.target = t;
+            in.target2 = id->sym.slot;
+            ops.push_back(in);
+            out_slot = t;
+            return true;
         }
 
         EvalValue lit;
