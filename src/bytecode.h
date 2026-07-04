@@ -104,16 +104,19 @@ enum class OpCode : unsigned char {
     LoadElemFloat,
 
     /*
-     * Native array-element store `a[i] = v` (Phase 5, assign only): `target2` =
-     * the array slot, `a` = the int index operand, `b` = the value operand,
-     * `node` = the Expr14 (loc + fallback). For a FLAT mutable int/float array
-     * it stores the scalar directly, mirroring try_flat_subscript_store (bounds,
-     * negative wrap, COW: a slice clones, an aliased non-slice clones its live
-     * slices; then invalidate the cached hash). For a const/read-only / general
-     * / bool / dyn-laundered base it falls back to `node->eval` - SOUND because
-     * a compiled rvalue has no side effects, so re-evaluating it is exact. The
-     * value ops are emitted before the index ops so a both-throw case matches
-     * the tree-walker (rhs before index). Int / float value variants.
+     * Native array-element store `a[i] = v` / `a[i] OP= v` (Phase 5): `target2`
+     * = the array slot, `a` = the int index operand, `b` = the value operand,
+     * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith
+     * op: a[i] = a[i] <aop> v), `node` = the Expr14 (loc/fallback). For a FLAT
+     * mutable int/float array it stores/updates the scalar directly, mirroring
+     * try_flat_subscript_store (bounds, negative wrap, div/mod-by-zero checked
+     * BEFORE any clone like the tree-walker, COW: a slice clones, an aliased
+     * non-slice clones its live slices; then invalidate the cached hash). For a
+     * const/read-only / general / bool / dyn-laundered base it falls back to
+     * `node->eval` - SOUND because a compiled rvalue has no side effects, so
+     * re-evaluating it is exact. The value ops are emitted before the index ops
+     * so a both-throw case matches the tree-walker (rhs before index). Int /
+     * float value variants.
      */
     StoreElemInt,
     StoreElemFloat,

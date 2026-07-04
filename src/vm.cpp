@@ -259,10 +259,12 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             case Op::minus: r = a - b; break;
             case Op::times: r = a * b; break;
             case Op::div:
-                if (b == 0) throw DivisionByZeroEx(in.node->start, in.node->end);
+                if (b == 0)
+                    throw DivisionByZeroEx(in.node->start, in.node->end);
                 r = a / b; break;
             case Op::mod:
-                if (b == 0) throw DivisionByZeroEx(in.node->start, in.node->end);
+                if (b == 0)
+                    throw DivisionByZeroEx(in.node->start, in.node->end);
                 r = a % b; break;
             case Op::band: r = a & b;          break;
             case Op::bor:  r = a | b;          break;
@@ -431,11 +433,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::StoreElemInt: {
 
-            /* a[i] = v for a flat mutable int array (mirrors the int path of
-             * try_flat_subscript_store, incl. COW); anything else (const /
-             * read-only / general / bool / dyn) falls back to the node - sound
-             * because a compiled rvalue is side-effect-free, so re-eval is
-             * exact. */
+            /* a[i] = v / a[i] OP= v for a flat mutable int array (mirrors the
+             * int path of try_flat_subscript_store, incl. COW); anything else
+             * (const / read-only / general / bool / dyn) falls back to the node
+             * - sound because a compiled rvalue is side-effect-free, so re-eval
+             * is exact. */
             LValue &alv = ctx.frame->slots[in.target2];
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
@@ -446,12 +448,25 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
                         throw OutOfBoundsEx(in.node->start, in.node->end);
+                    const int_type rhs = read_int_operand(in.b, &ctx);
+                    /* div/mod by zero throws BEFORE any clone (tree-walker
+                     * throws during the op eval, before the COW). */
+                    if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0)
+                        throw DivisionByZeroEx(in.node->start, in.node->end);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
                         arr.clone_aliased_slices(arr.offset() + idx);
-                    arr.flat_ints()[arr.offset() + idx] =
-                        read_int_operand(in.b, &ctx);
+                    int_type &el = arr.flat_ints()[arr.offset() + idx];
+                    switch (in.aop) {
+                    case Op::invalid: el = rhs;  break;
+                    case Op::plus:    el += rhs; break;
+                    case Op::minus:   el -= rhs; break;
+                    case Op::times:   el *= rhs; break;
+                    case Op::div:     el /= rhs; break;
+                    case Op::mod:     el %= rhs; break;
+                    default: throw InternalErrorEx();
+                    }
                     arr.invalidate_hash();
                     pc++;
                     break;
@@ -474,12 +489,23 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
                         throw OutOfBoundsEx(in.node->start, in.node->end);
+                    const float_type rhs = read_float_operand(in.b, &ctx);
+                    if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0.0)
+                        throw DivisionByZeroEx(in.node->start, in.node->end);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
                         arr.clone_aliased_slices(arr.offset() + idx);
-                    arr.flat_floats()[arr.offset() + idx] =
-                        read_float_operand(in.b, &ctx);
+                    float_type &el = arr.flat_floats()[arr.offset() + idx];
+                    switch (in.aop) {
+                    case Op::invalid: el = rhs;               break;
+                    case Op::plus:    el += rhs;              break;
+                    case Op::minus:   el -= rhs;              break;
+                    case Op::times:   el *= rhs;              break;
+                    case Op::div:     el /= rhs;              break;
+                    case Op::mod:     el = std::fmod(el, rhs); break;
+                    default: throw InternalErrorEx();
+                    }
                     arr.invalidate_hash();
                     pc++;
                     break;

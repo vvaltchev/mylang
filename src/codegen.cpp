@@ -264,29 +264,39 @@ struct Codegen {
         if (!e)
             return false;
 
-        /* Native array-element store `a[i] = v` (int element, assign only). The
-         * value is compiled BEFORE the index (tree-walker rhs-before-index). */
-        if (e->op == Op::assign) {
-            if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(e->lvalue.get())) {
-                if (sub->th != TypeHint::i || !sub->base_array)
-                    return false;
-                int aslot;
-                if (!as_array_slot(sub->what.get(), aslot))
-                    return false;
-                Operand val, idx;
-                if (!compile_int_expr(e->rvalue.get(), val, ops)
-                    || !compile_int_expr(sub->index.get(), idx, ops))
-                    return false;
-                Instr in;
-                in.op = OpCode::StoreElemInt;
-                in.node = s;
-                in.target2 = aslot;
-                in.a = idx;
-                in.b = val;
-                ops.push_back(in);
-                return true;
+        /* Native array-element store `a[i] = v` / `a[i] OP= v` (int element).
+         * The value is compiled BEFORE the index (tree-walker: rhs then index).
+         * A subscript lvalue can't be a scalar slot, so this always returns. */
+        if (const Subscript *sub =
+                dynamic_cast<const Subscript *>(e->lvalue.get())) {
+            if (sub->th != TypeHint::i || !sub->base_array)
+                return false;
+            Op aop;
+            switch (e->op) {
+                case Op::assign: aop = Op::invalid; break;
+                case Op::addeq:  aop = Op::plus;    break;
+                case Op::subeq:  aop = Op::minus;   break;
+                case Op::muleq:  aop = Op::times;   break;
+                case Op::diveq:  aop = Op::div;     break;
+                case Op::modeq:  aop = Op::mod;     break;
+                default: return false;
             }
+            int aslot;
+            if (!as_array_slot(sub->what.get(), aslot))
+                return false;
+            Operand val, idx;
+            if (!compile_int_expr(e->rvalue.get(), val, ops)
+                || !compile_int_expr(sub->index.get(), idx, ops))
+                return false;
+            Instr in;
+            in.op = OpCode::StoreElemInt;
+            in.node = s;
+            in.target2 = aslot;
+            in.a = idx;
+            in.b = val;
+            in.aop = aop;
+            ops.push_back(in);
+            return true;
         }
 
         Operand dst;
@@ -462,29 +472,38 @@ struct Codegen {
         if (!e)
             return false;
 
-        /* Native array-element store `a[i] = v` (float element, assign only);
+        /* Native array-element store `a[i] = v` / `a[i] OP= v` (float element);
          * value before index, like compile_int_stmt. */
-        if (e->op == Op::assign) {
-            if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(e->lvalue.get())) {
-                if (sub->th != TypeHint::f || !sub->base_array)
-                    return false;
-                int aslot;
-                if (!as_array_slot(sub->what.get(), aslot))
-                    return false;
-                Operand val, idx;
-                if (!compile_float_expr(e->rvalue.get(), val, ops)
-                    || !compile_int_expr(sub->index.get(), idx, ops))
-                    return false;
-                Instr in;
-                in.op = OpCode::StoreElemFloat;
-                in.node = s;
-                in.target2 = aslot;
-                in.a = idx;
-                in.b = val;
-                ops.push_back(in);
-                return true;
+        if (const Subscript *sub =
+                dynamic_cast<const Subscript *>(e->lvalue.get())) {
+            if (sub->th != TypeHint::f || !sub->base_array)
+                return false;
+            Op aop;
+            switch (e->op) {
+                case Op::assign: aop = Op::invalid; break;
+                case Op::addeq:  aop = Op::plus;    break;
+                case Op::subeq:  aop = Op::minus;   break;
+                case Op::muleq:  aop = Op::times;   break;
+                case Op::diveq:  aop = Op::div;     break;
+                case Op::modeq:  aop = Op::mod;     break;
+                default: return false;
             }
+            int aslot;
+            if (!as_array_slot(sub->what.get(), aslot))
+                return false;
+            Operand val, idx;
+            if (!compile_float_expr(e->rvalue.get(), val, ops)
+                || !compile_int_expr(sub->index.get(), idx, ops))
+                return false;
+            Instr in;
+            in.op = OpCode::StoreElemFloat;
+            in.node = s;
+            in.target2 = aslot;
+            in.a = idx;
+            in.b = val;
+            in.aop = aop;
+            ops.push_back(in);
+            return true;
         }
 
         /* The destination must be a genuine FLOAT slot (int dst -> compile_int_

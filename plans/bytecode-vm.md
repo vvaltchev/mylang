@@ -426,7 +426,18 @@ behind the differential harness:
   subscript stays a clean fallback (regression -> +0.0%).
   1303/1303 + 1155/1155; nested/for-while/if/if-else/sieve/matrix/triple-nest
   hand-verified vs the tree-walker.
-- **compound array store `a[i] OP= v`** (unlocks `46_matrix_mult`);
+- **compound array store `a[i] OP= v` — DONE** (correctness/completeness, not a
+  bench mover). Added as an `aop` on `StoreElemInt/Float` (`Op::invalid` = plain
+  assign, else the arith op) so ONE op read-modify-writes the element with a
+  single index eval + one COW; div/mod-by-zero is checked BEFORE any clone,
+  matching the tree-walker. Verified `+=`/`-=`/`*=`/`/=`/`%=`, float, aliased +
+  slice COW, div-zero, `h[d[i]]+=1` histogram. **No bench uses it** (geomean
+  unchanged) - real code (histograms, vector ops) does. NOTE: this does NOT
+  unlock `46_matrix_mult` (an earlier note was wrong): matrix uses **2D**
+  `a[i][k]` whose base `a[i]` isn't a bare local slot, so it needs
+  nested-subscript-base support (next), not the compound store.
+- **nested-subscript base `a[i][j]` / a slice or field base** (`as_array_slot`
+  only accepts a bare local slot today) - unlocks `46_matrix_mult`;
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct

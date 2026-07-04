@@ -10657,10 +10657,22 @@ static bool vm_codegen_shapes()
         nl.flstep == 2 && nl.loadei == 1 && nl.jif == 0
         && nl.juic >= 1;
 
+    /* 12) a COMPOUND array store `a[i] += b[i]` compiles native: one
+     * StoreElemInt (the compound is an aop on it, not a separate load+store)
+     * and one LoadElemInt for the b[i] read, no fallback. */
+    VmOpCounts cs;
+    if (!codegen_counts({
+            "var a = array(5, 0); var b = [1,2,3,4,5];",
+            "for (var i = 0; i < 5; i++) a[i] += b[i];",
+        }, cs))
+        return false;
+    const bool compound_store_ok =
+        cs.storei == 1 && cs.loadei == 1 && cs.flstep == 1 && cs.jif == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
-        && nested_native_ok;
+        && nested_native_ok && compound_store_ok;
 }
 
 static const std::vector<extra_check> extra_checks =
