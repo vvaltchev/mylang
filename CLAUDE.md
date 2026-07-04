@@ -3057,9 +3057,19 @@ path (a default-dict insert or `KeyNotFoundEx`) now routes through the shared
 `Type::subscript(for_write=false)` - the tree-walker's exact logic - with its
 loc from the side table, NOT `node->eval_int/eval_float`. `extract_locs` records
 the caret + nulls the node. So DictLoad joined the register core as node-free.
-Next: the remaining op-data (member/subscript general reads via `MemberV`/
-`SubscriptV`, call callees, struct-ctor defs), then kill the fallback ops, then
-`Instr` sheds the `node` field.
+The same loc-side-table move then freed every op whose only remaining `node` use
+was the error caret: **`SubscriptV`** (`base[idx]` via `Type::subscript`) and
+the **boxed scalar ops `BinOpV`/`CompoundV`/`CmpV`** (their `num_bin_op` PMF is
+baked from `aop`; the catch does `vm_stamp_loc(chunk, pc, e)`), plus **`LogV`**
+(never throws - node was dead). The shared `vm_stamp_loc` helper (vm.cpp) does
+the cold-path `chunk.loc_at(pc, ...)` stamp for all of them. Remaining `node`
+users, by kind: op-data that is NOT just a loc - `MemberV` (a member key/uid +
+optional, a member-key pool), `CallV`/`CachedCallV` + `LoadGlobalV` (the name
+for `UndefinedVariableEx`, from `gfuncs`'s slot->name list), the builtin calls
+(`CallBuiltinV`/`LV`/`LVElem` - a baked `func_v` ptr + the args `ExprList`),
+`EmplaceStruct` (a struct-ctor def); then the fallback ops (`EvalStmt`/
+`JumpIfFalse`/the element-store fallbacks). Once those are migrated, `Instr`
+sheds the 8-byte `node` field.
 
 ## Invariants & hazards (defense in depth)
 

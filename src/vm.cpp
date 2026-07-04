@@ -139,6 +139,16 @@ vm_throw_div0(const Chunk &chunk, size_t pc)
     throw DivisionByZeroEx(s, en);
 }
 
+/* Stamp an unlocated in-flight exception with the op's caret from the loc side
+ * table (used by the catch of an AST-free op whose runtime function threw with
+ * no loc). Cold - the error path only. */
+static ML_NOINLINE void
+vm_stamp_loc(const Chunk &chunk, size_t pc, Exception &e)
+{
+    if (!e.loc_start)
+        chunk.loc_at(pc, e.loc_start, e.loc_end);
+}
+
 /* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
  * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
  * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
@@ -836,12 +846,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             try {
                 r = base.get_type()->subscript(EvalValue(&dlv), key, false);
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    Loc s, en;
-                    chunk.loc_at(pc, s, en);
-                    e.loc_start = s;
-                    e.loc_end = en;
-                }
+                vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             write_scalar_slot(&ctx, in.target, is_int,
@@ -1091,12 +1096,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 num_bin_op(val, boxed_operand(in.b, &ctx, sb),
                            binop_pmf(in.aop));
             } catch (Exception &e) {
-                /* Stamp the right-operand loc (in.node) like stamp_operand_loc,
-                 * so a div-zero / type error points where the tree-walker's. */
-                if (!e.loc_start) {
-                    e.loc_start = in.node->start;
-                    e.loc_end = in.node->end;
-                }
+                /* Stamp the operand loc (side table) like stamp_operand_loc, so
+                 * a div-zero / type error points where the tree-walker does. */
+                vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             ctx.frame->at(in.target).put(std::move(val));
@@ -1114,10 +1116,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 num_bin_op(nv, boxed_operand(in.b, &ctx, sb),
                            binop_pmf(in.aop));
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = in.node->start;
-                    e.loc_end = in.node->end;
-                }
+                vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             ctx.frame->at(in.target).put(std::move(nv));
@@ -1134,10 +1133,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 num_bin_op(val, boxed_operand(in.b, &ctx, sb),
                            cmp_pmf(in.aop));
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = in.node->start;
-                    e.loc_end = in.node->end;
-                }
+                vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             ctx.frame->at(in.target).put(EvalValue(val.is_true()));
@@ -1190,10 +1186,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 ctx.frame->at(in.target).put(
                     RValue(t->subscript(EvalValue(&base_lv), idx, false)));
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = in.node->start;
-                    e.loc_end = in.node->end;
-                }
+                vm_stamp_loc(chunk, pc, e);   /* AST-free: loc side table */
                 throw;
             }
             pc++;
