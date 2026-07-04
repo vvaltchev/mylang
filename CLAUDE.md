@@ -2861,8 +2861,10 @@ runtime, not a second interpreter — which is what keeps it small and correct.
 resolved-local int/float/mixed scalar loops run native at top level, inside
 function bodies via a `do_func_call` hook, and NESTED — nested loops + `if` in a
 loop body compile directly into the chunk; array element read/write `a[i]` /
-`a[i]=v` are native; recursion stays neutral; **suite geomean 0.82x, VM ~1.2x
-faster than the tree-walker**). Gated by the
+`a[i]=v` / `a[i][j]` and a scalar builtin/call in an expression are native; a
+flow-free statement runs as a fallback within an otherwise-native loop so
+array-building loops (matrix/sieve) go native; recursion stays neutral; **suite
+geomean 0.75x, VM ~1.3x faster than the tree-walker**). Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`

@@ -645,44 +645,76 @@ struct Codegen {
     }
 
     /*
-     * Compile a loop/if body's statements DIRECTLY into chunk.code (so any jumps
-     * they emit - from a nested loop / if - are chunk-absolute, no relocation),
-     * each dispatched by its OWN kind: an int/float scalar statement, a NESTED
-     * `for`/`while` loop, or an `if`. This is what lets native control flow nest
-     * (sieve/matrix shapes). SELF-TRUNCATING: on the first unsupported statement
-     * (break/continue/return/a call/a nested func/...) it resizes chunk.code
-     * back to where the body started and returns false, so the caller falls the
-     * whole enclosing loop back with nothing left behind. A MIXED int/float body
-     * still compiles (per-statement kind dispatch).
+     * Compile a loop/if body's statements DIRECTLY into chunk.code (so any
+     * jumps a nested loop / if emits are chunk-absolute, no relocation), each
+     * dispatched by its OWN kind: an int/float scalar statement, a NESTED
+     * `for`/`while` loop, or an `if`. A FLOW-FREE statement that isn't natively
+     * compilable (an array-building decl `var row = array(n,0)`, a general
+     * store `c[i] = row`, a void call) runs as a fallback EvalStmt WITHIN the
+     * native loop, so the loop still goes native around it. SELF-TRUNCATING: a
+     * flow-AFFECTING unsupported statement (break/continue/return, or a nested
+     * loop/if that can't compile) resizes chunk.code back to the body start and
+     * returns false, so the caller falls the whole loop back. Also returns
+     * false when NO statement compiled natively (an all-EvalStmt body: the
+     * tree-walker's tight counter beats a native loop that only dispatches
+     * fallbacks).
      */
     bool compile_scalar_body(const std::vector<const Construct *> &stmts)
     {
         const size_t start = chunk.code.size();
+        bool any_native = false;
         for (const Construct *s : stmts) {
             reset_temps();
             const size_t mark = chunk.code.size();
-            if (compile_int_stmt(s, chunk.code))
+            if (compile_int_stmt(s, chunk.code)) {
+                any_native = true;
                 continue;
+            }
             chunk.code.resize(mark);
             reset_temps();
-            if (compile_float_stmt(s, chunk.code))
+            if (compile_float_stmt(s, chunk.code)) {
+                any_native = true;
                 continue;
+            }
             chunk.code.resize(mark);
 
             /* Nested native control flow. Each is itself self-truncating, so on
-             * failure chunk.code is already back at `mark`; undo the whole body
-             * and bail so the enclosing loop falls back. */
+             * failure chunk.code is already back at `mark`. */
             if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
-                if (try_native_for_range(fr))
+                if (try_native_for_range(fr)) {
+                    any_native = true;
                     continue;
+                }
             } else if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
-                if (try_native_scalar_while(w))
+                if (try_native_scalar_while(w)) {
+                    any_native = true;
                     continue;
+                }
             } else if (const IfStmt *iff = dynamic_cast<const IfStmt *>(s)) {
-                if (compile_native_if(iff))
+                if (compile_native_if(iff)) {
+                    any_native = true;
                     continue;
+                }
             }
 
+            /* Flow-free fallback: an assignment/decl (Expr14) or a call
+             * statement (CallExpr) neither sets the loop's FlowState nor is a
+             * nested loop, so running it tree-walked WITHIN the native loop is
+             * safe. Anything else (break/continue/return, a nested loop/if that
+             * couldn't compile, a block) falls the whole loop back. */
+            chunk.code.resize(mark);
+            if (dynamic_cast<const Expr14 *>(s)
+                || dynamic_cast<const CallExpr *>(s)) {
+                emit(OpCode::EvalStmt, s);
+                continue;
+            }
+
+            chunk.code.resize(start);
+            return false;
+        }
+        /* An all-fallback body: not worth a native loop (the tree-walker's
+         * tight counter beats one that only dispatches EvalStmts). */
+        if (!any_native) {
             chunk.code.resize(start);
             return false;
         }

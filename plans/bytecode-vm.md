@@ -4,11 +4,12 @@ Status: **Phase 5 in progress** — the register machine runs resolved-local
 int/float scalar loops (`while`/counted `for`, fused `ForLoopStep`) natively at
 top level, inside function bodies (`do_func_call` hooks `vm_run_chunk`), and
 NESTED (nested loops + `if` in a body compile directly into the chunk with
-backpatching); array element read/write `a[i]` / `a[i]=v` are native (`LoadElem`
-/ `StoreElem`, dict subscripts stay fallback via `Subscript::base_array`).
-**Suite geomean 0.82x (VM ~1.2x faster than the tree-walker)**; recursion stays
-neutral; Phases 0–4 done; the whole `-rt` suite passes under both engines.
-Branch: `exp-work`.
+backpatching); array element read/write `a[i]` / `a[i]=v` / `a[i][j]` and a
+scalar builtin/call in an expression are native; a flow-free statement runs as a
+fallback within an otherwise-native loop, so array-building loops (matrix/sieve)
+go native. **Suite geomean 0.75x (VM ~1.3x faster than the tree-walker)**;
+recursion stays neutral; Phases 0–4 done; the whole `-rt` suite passes under
+both engines. Branch: `exp-work`.
 
 The design + incremental task plan for MyLang's runtime bytecode VM. Read the
 CLAUDE.md section "Execution strategy: strip compile-time overhead first, THEN
@@ -458,13 +459,23 @@ behind the differential harness:
   builtin ABI takes the unevaluated ExprList), so this still holds a
   `Construct*` - a fully Construct*-free builtin dispatch (args into slots, a
   new builtin ABI) is later work toward the no-fallback end-goal.
-- **the real plateau:** the register machine has the scalar-loop wins (0.82x);
-  the array/dict-heavy benchmarks now fall back for STRUCTURAL reasons that
-  element-access ops don't fix - native array CREATION (`array(n,0)`, `[]`) +
-  general-element stores (to make array-building loops like matrix/sieve-setup
-  native), and native BUILTIN dispatch (append/sort/keys/map/... - the
-  DirectBuiltinCallExpr analogue). These are the next real movers; both are
-  bigger than a single opcode.
+- **flow-free EvalStmt within a native loop — DONE (the biggest single-step
+  move: 0.81x -> 0.75x).** `compile_scalar_body` used to fall the WHOLE loop
+  back if ANY body statement wasn't natively compilable. Now a FLOW-FREE
+  statement (an assignment/decl `var row = array(n,0)`, a general store
+  `c[i] = row`, a void call `append(a,i)`) runs as a fallback `EvalStmt` WITHIN
+  the native loop, so the loop still goes native around it - decoupling "the
+  loop is native" from "every statement is native." An `any_native` gate keeps
+  an ALL-fallback body on the tree-walker's tight counter (no regression:
+  `for(i) d[i]=v` still fully falls back). break/continue/return + a nested
+  loop/if that can't compile are NOT flow-free (their flow would escape the
+  native counter), so they still fall the whole loop back. This finally moved
+  the array-BUILDING benchmarks: `46_matrix_mult` +0.0% -> **−37.7%** (outer
+  i-loop with `var row=..`/`c[i]=row` now native, the hot k-loop with native 2-D
+  reads), `43_sieve` −1.1% -> **−15.8%**; geomean 0.81x -> 0.75x. INTERIM: the
+  array-building statements are still EvalStmt (`Construct*`) - true native
+  array CREATION (`array(n,0)`, `[]`) + general-element store OPS are later work
+  toward the no-fallback end-goal.
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct

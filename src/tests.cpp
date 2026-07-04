@@ -10453,7 +10453,7 @@ static bool frame_over_64_slots()
 struct VmOpCounts {
     size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
     size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0;
-    size_t storei = 0, storef = 0, loadev = 0, evalslot = 0;
+    size_t storei = 0, storef = 0, loadev = 0, evalslot = 0, evalstmt = 0;
     int n_temps = 0;
 };
 
@@ -10495,6 +10495,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::StoreElemFloat:   c.storef++; break;
             case OpCode::LoadElemValue:    c.loadev++; break;
             case OpCode::EvalToSlot:       c.evalslot++; break;
+            case OpCode::EvalStmt:         c.evalstmt++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10521,12 +10522,16 @@ static bool vm_codegen_shapes()
         a.juic == 1 && a.intbin == 2 && a.back == 0 &&
         a.jif == 1 && a.jmp >= 1 && a.halt == 1;
 
-    /* 2) a while whose body isn't int-compilable (a call) stays the Phase-1
-     * flatten: JumpIfFalse + LoopBackEdge, no native ops. */
+    /* 2) a while whose body has NO natively-compilable statement (only calls)
+     * stays the Phase-1 flatten - the any_native gate keeps an all-fallback
+     * body on the tree-walker's tight counter: JumpIfFalse + LoopBackEdge, no
+     * native ops. (A body with even one native statement + a fallback call
+     * instead goes native around the EvalStmt - see the builtin / array-build
+     * tests below.) */
     VmOpCounts b;
     if (!codegen_counts({
             "var i = 0; var s = 0;",
-            "while (i < 5) { print(i); i += 1; }",
+            "while (i < 5) { print(i); print(s); }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -10543,15 +10548,19 @@ static bool vm_codegen_shapes()
     const bool nested_ok =
         c.juic == 1 && c.intbin >= 3 && c.n_temps >= 1 && c.back == 0;
 
-    /* 4) bool-safety: a plain assign of a BOOL leaf must NOT go native (writing
-     * an int to a bool slot would corrupt it) - the loop falls back. */
+    /* 4) bool-safety: a plain assign of a BOOL value must NOT become a native
+     * int-write (that would corrupt the bool slot). It stays a fallback
+     * EvalStmt - safe (tree-walked) - while the native `i++` makes the loop go
+     * native around it. The guarantee is exactly ONE IntBin (the `i++`): the
+     * `b = flag` did NOT become a second, corrupting int-write. (`flag` folds
+     * to `true`, a bool literal - definitely_int correctly rejects it.) */
     VmOpCounts d;
     if (!codegen_counts({
             "var flag = true; var b = false; var i = 0;",
             "while (i < 5) { b = flag; i++; }",
         }, d))
         return false;
-    const bool bool_safe = d.back == 1 && d.intbin == 0 && d.juic == 0;
+    const bool bool_safe = d.juic == 1 && d.intbin == 1 && d.back == 0;
 
     /* 5) a pure-FLOAT loop compiles to the float register ops (FloatBin +
      * JumpUnlessFloatCmp), no fallback, no int ops. */
@@ -10697,11 +10706,25 @@ static bool vm_codegen_shapes()
     const bool builtin_dispatch_ok =
         bd.evalslot == 1 && bd.fbin == 1 && bd.flstep == 1 && bd.jif == 0;
 
+    /* 15) a native loop with a FLOW-FREE fallback body statement (a void call /
+     * an array-building decl / a general store) still goes native AROUND the
+     * EvalStmt: the counted `for` compiles (ForLoopStep) with the native
+     * `s += i` and an EvalStmt for `append(a, i)`. This lets a matrix/sieve
+     * outer loop go native despite `var row = array(n,0)` / `c[i] = row`. */
+    VmOpCounts ab;
+    if (!codegen_counts({
+            "var a = []; var s = 0;",
+            "for (var i = 0; i < 5; i++) { s += i; append(a, i); }",
+        }, ab))
+        return false;
+    const bool array_build_ok =
+        ab.flstep == 1 && ab.intbin >= 1 && ab.evalstmt >= 1 && ab.jif == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
         && nested_native_ok && compound_store_ok && read_2d_ok
-        && builtin_dispatch_ok;
+        && builtin_dispatch_ok && array_build_ok;
 }
 
 static const std::vector<extra_check> extra_checks =
