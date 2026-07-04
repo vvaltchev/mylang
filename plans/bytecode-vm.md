@@ -555,10 +555,15 @@ incl. the clone-left-operand and the right-operand error loc). `compile_boxed_
 expr`/`compile_boxed_stmt` fire after the typed attempts, so a `dyn`/string/bool
 scalar ASSIGNMENT (`s = s + "x"`) is native, not an EvalStmt. Guards: only a
 decl_type none/dyn, non-const lvalue (a typed-numeric decl coerces, a const
-reassign must throw — both left to the tree-walker). **Still TODO in this
-tier:** compound-assign (`s += x`), a comparison/logical BinOpV, a
-global/capture/builtin leaf, then subscript/member/call/make/foreach — see the
-op list below.
+reassign must throw — both left to the tree-walker).
+
+**Also landed:** `CompoundV` (`s += x` — copies the lvalue so a container
+mutates in place, = doAssign's compound branch; commit bfc8589); `CmpV` +
+`JumpUnlessTrueV` (a dyn/string comparison as a value AND in a condition —
+`if (a==b)`, `while (x != none)`, `if (x)` — wired into emit_cond_jumps +
+compile_native_if; commit 4920ada). **Still TODO in this tier:** a boxed
+LOGICAL (`&&`/`||`, needs short-circuit), a global/capture/builtin leaf, then
+subscript/member/call/make/foreach — see the op list below.
 
 The typed unboxed int/float register machine is only the fast tier. To satisfy
 the directive (never fall back, full `dyn` support, `Construct*`-free, machine-
