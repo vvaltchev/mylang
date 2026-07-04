@@ -341,8 +341,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << RI(in.b, false) << "   ; boxed";
             break;
         case OpCode::LoadGlobalV:
-            row << "load.global  " << D(in.target) << ", "
-                << node_name(in.node);
+            /* AST-free: the global name lives in gfuncs, not the chunk, so a
+             * disassembly shows the global slot (g<n>). */
+            row << "load.global  " << D(in.target) << ", g" << in.target2;
             break;
         case OpCode::LoadCaptureV:
             row << "load.capture " << D(in.target) << ", "

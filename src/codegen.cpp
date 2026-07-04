@@ -2421,10 +2421,12 @@ static void extract_locs(Chunk &chunk)
         case OpCode::BinOpV:
         case OpCode::CompoundV:
         case OpCode::CmpV:
+        case OpCode::LoadGlobalV:
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
-             * arith/compound/compare div-zero or type error - the operation
-             * itself is AST-free): record the loc -> AST-free. */
+             * arith/compound/compare div-zero or type error; the cold
+             * undefined-global error - the operation itself is AST-free):
+             * record the loc -> AST-free. */
             chunk.locs.push_back(
                 {static_cast<uint32_t>(pc), in.node->start, in.node->end});
             in.node = nullptr;

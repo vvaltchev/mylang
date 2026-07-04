@@ -1155,10 +1155,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::LoadGlobalV:
-            if (!ctx.gfuncs->defined[in.target2])
+            /* AST-free: the hot read is a gfuncs slot; the cold undefined
+             * error takes its NAME from gfuncs's slot->name list and its loc
+             * from the side table - no `node`. */
+            if (!ctx.gfuncs->defined[in.target2]) {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
                 throw UndefinedVariableEx(
-                    static_cast<const Identifier *>(in.node)->get_str(),
-                    in.node->start, in.node->end);
+                    ctx.gfuncs->names[in.target2]->val, s, en);
+            }
             ctx.frame->at(in.target).put(
                 ctx.gfuncs->slots[in.target2].get());
             pc++;
