@@ -2989,8 +2989,12 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         if (!rval.is<SharedArrayObj>()) {
 
-            for (const auto &e: idlist->elems)
+            for (const auto &e: idlist->elems) {
+                if (e->is_id()
+                    && static_cast<Identifier *>(e.get())->is_underscore())
+                    continue;   /* `_` placeholder: skip */
                 handle_single_expr14(ctx, inDecl, op, e.get(), rval);
+            }
 
         } else {
 
@@ -3013,6 +3017,11 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
                     lvalue->start, lvalue->end);
 
             for (size_type i = 0; i < idlist->elems.size(); i++) {
+
+                if (idlist->elems[i]->is_id()
+                    && static_cast<Identifier *>(idlist->elems[i].get())
+                           ->is_underscore())
+                    continue;   /* `_` placeholder: skip this array slot */
 
                 handle_single_expr14(
                     ctx,
@@ -3737,6 +3746,9 @@ void LValue::put(EvalValue &&v)
 static inline void
 bind_loop_var(EvalContext *ctx, bool decl, Identifier *id, const EvalValue &val)
 {
+    if (id->is_underscore())   /* the `_` placeholder binds nothing */
+        return;
+
     if (id->sym.kind == SymKind::local && ctx->frame) {
         Frame *f = ctx->frame;
         f->slots[id->sym.slot] = LValue(val, id->is_const);

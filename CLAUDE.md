@@ -2002,7 +2002,18 @@ sanitizers never reproduced it.)
   with `none`, drop extras, treat a scalar element as the first value — was
   removed (it hid bugs and blocked a native lowering to plain scalar reads).
   `foreach` runs strict on both engines (the VM falls back to `do_iter` for
-  unpack). The `indexed` keyword rides the same path.
+  unpack). The `indexed` keyword rides the same path. **`_` is the destructuring
+  PLACEHOLDER** (`Identifier::is_underscore`, syntax.h): in an `IdList`
+  destructure target OR a `foreach` loop-var position it is NOT declared and NOT
+  bound (its array slot is skipped), so it may **repeat** (`var a, _, _, d =
+  [1,2,3,4]`) and reading it is an `UndefinedVariableEx` — but it still **counts
+  toward the strict arity**. It is skipped at four sites: the two eval binders
+  (`handle_single_expr14`'s `IdList` loop, `bind_loop_var`) and the two declare
+  paths (resolver `declare_lvalue` IdList + the foreach loop, inferencer
+  `declare_target` IdList + the walk_struct foreach — which also skips its
+  no-`var` shadow check for `_`). A `_` in a **single** `var _ = ...` or a
+  **parameter** is a normal name (only destructuring/foreach positions treat it
+  specially).
 - **`++` / `--` (`IncDecExpr`, `syntax.h`)** — C-style pre/postfix increment and
   decrement, **int/float only**. `IncDecExpr::do_eval` evaluates the operand
   exactly ONCE via two paths: when the inferencer proved it int/float (`th` is

@@ -1026,6 +1026,13 @@ a few difference from `C` worth pointing out:
     (`var a, b, c = [1, 2];` is an error, as is `var a, b = [1, 2, 3];`). A
     **non-array** value is spread to every target (the `var a,b = 0` case).
 
+  - Use `_` as a **placeholder** for a destructured entry you don't want:
+    `var a, _, b = [1, 2, 3];` binds `a == 1`, `b == 3` and drops the middle.
+    `_` is never declared (so it may repeat — `var a, _, _, d = [1,2,3,4];` —
+    and reading it is an error), but it still counts toward the strict arity
+    above. It works the same in a `foreach` loop var (`foreach (k, _ in pairs)`,
+    or `foreach (_ in xs)` to iterate without a variable).
+
   - To increase the value of multiple variables use the syntax:
     `a, b += [1, 2]`. In the extremely rare and complex cases when in the
     *increment* statement of the for-loop we need to assign to each variable

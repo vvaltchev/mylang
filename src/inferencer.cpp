@@ -1703,7 +1703,8 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
         decl_one(id);
     else if (auto *idl = dynamic_cast<IdList *>(lvalue))
         for (auto &up : idl->elems)
-            decl_one(up.get());
+            if (!up->is_underscore())   /* `_` placeholder: not declared */
+                decl_one(up.get());
 }
 
 void Inferencer::walk_struct(Construct *n, Scope *s)
@@ -1816,6 +1817,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         walk_struct(fe->container.get(), s);
         if (fe->ids)
             for (auto &id : fe->ids->elems) {
+                if (id->is_underscore())
+                    continue;   /* `_` placeholder: not declared, no shadow */
                 /* A loop var written WITHOUT `var` may not shadow a variable
                  * visible outside the loop (a subtle-bug guard) - it is looked
                  * up in the ENCLOSING scope `s` (the fresh loop scope `inner`

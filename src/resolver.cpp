@@ -1426,6 +1426,8 @@ private:
             declare(cur, id);
         } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
             for (auto &id : il->elems) {
+                if (id->is_underscore())
+                    continue;   /* `_` placeholder: not declared */
                 declare(cur, id.get());
             }
         }
@@ -1978,6 +1980,8 @@ Resolver::walk(Construct *c, FuncState *cur)
 
         if (fe->ids) {
             for (auto &id : fe->ids->elems) {
+                if (id->is_underscore())
+                    continue;   /* `_` placeholder: not declared/resolved */
                 if (fe->idsVarDecl)
                     declare(cur, id.get());  /* `foreach (var a, b in ...)` */
                 else

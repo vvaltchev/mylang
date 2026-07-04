@@ -593,6 +593,13 @@ public:
     const UniqueId *uid;
     ResolvedSym sym;        /* filled in by the name-resolution pass */
 
+    /* `_` is the DESTRUCTURING PLACEHOLDER: in a `foreach` loop var or an
+     * `IdList` (multi-assign) target position it is NOT declared and NOT bound
+     * (its array slot is skipped), and it may repeat - so `var a, _, b =
+     * [1,2,3]` binds a=1, b=3 and drops the middle. It is a normal name in any
+     * other position. */
+    bool is_underscore() const { return uid->val == "_"; }
+
     /*
      * Only meaningful when this Identifier is a function parameter (an element
      * of FuncDeclStmt::params). `const_param` is set by the parser for a param

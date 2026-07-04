@@ -5272,6 +5272,70 @@ static const std::vector<test> tests =
     },
 
     {
+        /* `_` is the destructuring placeholder: skipped, unbound. */
+        "Underscore placeholder skips a destructure entry",
+        {
+            "var a, _, b = [1,2,3];",
+            "assert(a == 1 && b == 3);",
+        },
+    },
+
+    {
+        /* `_` may repeat (it is never declared). */
+        "Underscore placeholder may repeat",
+        {
+            "var a, _, _, b = [1,2,3,4];",
+            "assert(a == 1 && b == 4);",
+        },
+    },
+
+    {
+        /* scalar-spread skips `_` too. */
+        "Underscore placeholder with scalar-spread",
+        {
+            "var a, _, c = 9;",
+            "assert(a == 9 && c == 9);",
+        },
+    },
+
+    {
+        /* the strict count still includes the `_` positions. */
+        "Underscore counts toward the strict destructure arity",
+        {
+            "var a, _, b = [1,2];",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
+        /* `_` binds nothing, so reading it is undefined. */
+        "Underscore placeholder is not readable",
+        {
+            "var a, _, b = [1,2,3];",
+            "var x = _;",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
+        "Underscore placeholder in foreach unpack",
+        {
+            "var s = 0;",
+            "foreach (a, _, b in [[1,2,3],[4,5,6]]) { s += a + b; }",
+            "assert(s == 14);",   /* (1+3) + (4+6) */
+        },
+    },
+
+    {
+        "Underscore placeholder as a lone foreach var iterates",
+        {
+            "var n = 0;",
+            "foreach (_ in [10,20,30]) { n += 1; }",
+            "assert(n == 3);",
+        },
+    },
+
+    {
         "Decl multi-id assignments with re-defines",
         {
             "var a = 3;",
