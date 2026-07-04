@@ -127,6 +127,18 @@ bool is_boxed_binop(Op op)
     }
 }
 
+/* A comparison Op the boxed CmpV handles (has a cmp_pmf). */
+bool is_boxed_cmp(Op op)
+{
+    switch (op) {
+        case Op::lt: case Op::gt: case Op::le:
+        case Op::ge: case Op::eq: case Op::noteq:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* The BASE arith Op of a boxed compound-assign (`+=` -> plus), or Op::invalid
  * if `op` isn't a compound-assign the boxed CompoundV handles. */
 Op compound_base_op(Op op)
@@ -328,6 +340,32 @@ struct Codegen {
                 acc = t;
             }
             out_slot = acc;
+            return true;
+        }
+
+        /* A two-operand comparison `a <cmp> b` -> CmpV (a bool). Only the
+         * simple 2-operand form (a chain `a<b<c` is left to the fallback). */
+        if (dynamic_cast<const Expr06 *>(e)
+            || dynamic_cast<const Expr07 *>(e)) {
+            const MultiOpConstruct *mo =
+                static_cast<const MultiOpConstruct *>(e);
+            if (mo->elems.size() != 2 || mo->elems[0].first != Op::invalid
+                || !is_boxed_cmp(mo->elems[1].first))
+                return false;
+            int a_slot, b_slot;
+            if (!compile_boxed_expr(mo->elems[0].second.get(), a_slot, ops)
+                || !compile_boxed_expr(mo->elems[1].second.get(), b_slot, ops))
+                return false;
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::CmpV;
+            in.node = mo->elems[1].second.get();   /* right operand: err loc */
+            in.target = t;
+            in.a = slot_op(a_slot);
+            in.b = slot_op(b_slot);
+            in.aop = mo->elems[1].first;
+            ops.push_back(in);
+            out_slot = t;
             return true;
         }
 
@@ -959,6 +997,21 @@ struct Codegen {
             return true;
         }
 
+        /* BOXED condition (a dyn/string comparison, or a dyn truthy value):
+         * compile it to a bool slot, then branch to the exit unless true. */
+        int cslot;
+        reset_temps();
+        const size_t mark = chunk.code.size();
+        if (compile_boxed_expr(cond, cslot, chunk.code)) {
+            Instr in;
+            in.op = OpCode::JumpUnlessTrueV;
+            in.node = cond;
+            in.target2 = cslot;
+            exit_jumps.push_back(chunk.code.size());
+            chunk.code.push_back(in);
+            return true;
+        }
+        chunk.code.resize(mark);
         return false;
     }
 
@@ -1121,7 +1174,21 @@ struct Codegen {
                               cmp, ca, cb);
             } else {
                 chunk.code.resize(start);
-                jf = emit(OpCode::JumpIfFalse, f->condExpr.get());
+                reset_temps();
+                int cslot;
+                /* BOXED condition -> compute a bool slot + branch-unless-true;
+                 * else the tree-walker cond (JumpIfFalse). */
+                if (compile_boxed_expr(f->condExpr.get(), cslot, chunk.code)) {
+                    Instr in;
+                    in.op = OpCode::JumpUnlessTrueV;
+                    in.node = f->condExpr.get();
+                    in.target2 = cslot;
+                    jf = chunk.code.size();
+                    chunk.code.push_back(in);
+                } else {
+                    chunk.code.resize(start);
+                    jf = emit(OpCode::JumpIfFalse, f->condExpr.get());
+                }
             }
         }
 

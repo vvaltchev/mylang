@@ -181,6 +181,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "compound.v   r" << in.target << " " << opsym(in.aop)
                 << "= " << reg_or_imm(in.b, false);
             break;
+        case OpCode::CmpV:
+            row << "cmp.v        r" << in.target << " = "
+                << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
+                << reg_or_imm(in.b, false);
+            break;
+        case OpCode::JumpUnlessTrueV:
+            row << "jmp.ifnot.v  r" << in.target2 << ", L" << in.target;
+            break;
         case OpCode::Halt:
             row << "halt";
             break;

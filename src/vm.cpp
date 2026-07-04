@@ -101,6 +101,20 @@ static NumBinOp binop_pmf(Op op)
     }
 }
 
+/* The comparison Type method for the boxed CmpV (Expr06/Expr07's PMFs). */
+static NumBinOp cmp_pmf(Op op)
+{
+    switch (op) {
+        case Op::lt:    return &Type::lt;
+        case Op::gt:    return &Type::gt;
+        case Op::le:    return &Type::le;
+        case Op::ge:    return &Type::ge;
+        case Op::eq:    return &Type::eq;
+        case Op::noteq: return &Type::noteq;
+        default:        return nullptr;
+    }
+}
+
 /*
  * Per-run storage for compiled function-body chunks (Phase 4), keyed by the
  * FuncDeclStmt. Cleared at the start of every vm_execute so a fresh program run
@@ -637,6 +651,32 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
         }
+
+        case OpCode::CmpV: {
+            /* dst = (a <cmp> b) as a bool - copy a, num_bin_op with the
+             * comparison PMF, store is_true() (= Expr06/Expr07::do_eval). */
+            EvalValue val = ctx.frame->slots[in.a.slot].get();
+            try {
+                num_bin_op(val, ctx.frame->slots[in.b.slot].get(),
+                           cmp_pmf(in.aop));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = in.node->start;
+                    e.loc_end = in.node->end;
+                }
+                throw;
+            }
+            ctx.frame->slots[in.target].put(EvalValue(val.is_true()));
+            pc++;
+            break;
+        }
+
+        case OpCode::JumpUnlessTrueV:
+            if (!ctx.frame->slots[in.target2].get().is_true())
+                pc = in.target;
+            else
+                pc++;
+            break;
 
         case OpCode::Halt:
             return;

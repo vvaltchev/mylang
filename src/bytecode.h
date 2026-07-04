@@ -186,6 +186,22 @@ enum class OpCode : unsigned char {
      */
     CompoundV,
 
+    /*
+     * Boxed comparison `dst = (a <cmp> b)` -> a bool. Copies a, num_bin_op with
+     * the comparison Type method (lt/gt/le/ge/eq/noteq), stores
+     * EvalValue(result.is_true()) - exactly Expr06/Expr07::do_eval. `node` =
+     * the right operand (error loc). A dyn/string cmp the typed path can't do.
+     */
+    CmpV,
+
+    /*
+     * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
+     * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
+     * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()
+     * truthiness (0/none/[]/{} false).
+     */
+    JumpUnlessTrueV,
+
     /* Stop the program. */
     Halt,
 };
