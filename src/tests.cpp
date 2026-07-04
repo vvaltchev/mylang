@@ -10509,7 +10509,9 @@ static bool codegen_counts(const std::vector<const char *> &lines,
 
 static bool vm_codegen_shapes()
 {
-    /* 1) resolved-local int while -> native ops; if/else -> flatten. */
+    /* 1) resolved-local int while + if -> native ops (native-first codegen
+     * applies to top-level statements, not only loop bodies). Setup `var i/s=0`
+     * -> LoadImm (not counted). */
     VmOpCounts a;
     if (!codegen_counts({
             "var i = 0;", "var s = 0;",
@@ -10517,11 +10519,13 @@ static bool vm_codegen_shapes()
             "if (s > 3) s += 100; else s -= 1;",
         }, a))
         return false;
-    /* native while: 1 JumpUnlessIntCmp + 2 IntBin (s+=i, i+=1), no back-edge;
-     * if/else: 1 JumpIfFalse + 1 Jump; exactly one Halt. */
+    /* native while: 1 JumpUnlessIntCmp + 2 IntBin (s+=i, i+=1); the if's cond
+     * `s>3` is a native compare too (a 2nd JumpUnlessIntCmp) with 2 IntBin
+     * branches (s+=100, s-=1) + a Jump over the else - so NO JumpIfFalse; one
+     * Halt. */
     const bool native_ok =
-        a.juic == 1 && a.intbin == 2 && a.back == 0 &&
-        a.jif == 1 && a.jmp >= 1 && a.halt == 1;
+        a.juic == 2 && a.intbin == 4 && a.back == 0 &&
+        a.jif == 0 && a.jmp >= 1 && a.halt == 1;
 
     /* 2) a while whose body has NO natively-compilable statement (only calls)
      * stays the Phase-1 flatten - the any_native gate keeps an all-fallback
@@ -10785,7 +10789,7 @@ static bool vm_disasm_shape()
         const std::string d = disassemble(codegen_program(b), "main");
         return d.find("for.step") != std::string::npos
             && d.find("i.bin") != std::string::npos
-            && d.find("i.jmp.ncmp") != std::string::npos
+            && d.find("i.jmp.ifnot") != std::string::npos
             && d.find("eval.stmt") != std::string::npos  /* print fallback */
             && d.find("halt") != std::string::npos;
     } catch (...) {

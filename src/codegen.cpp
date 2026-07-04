@@ -178,6 +178,24 @@ struct Codegen {
         loops.pop_back();
     }
 
+    /* A loop's init (`var i = start`), emitted ONCE: native (a LoadImmInt /
+     * store) when it is a resolved-local scalar decl, else a fallback EvalStmt.
+     * Native-izing the once-run init doesn't speed the loop, but it keeps the
+     * `i = start` off the tree-walker and reads cleanly in the disassembly. */
+    void emit_init(const Construct *init)
+    {
+        reset_temps();
+        const size_t mark = chunk.code.size();
+        if (compile_int_stmt(init, chunk.code))
+            return;
+        chunk.code.resize(mark);
+        reset_temps();
+        if (compile_float_stmt(init, chunk.code))
+            return;
+        chunk.code.resize(mark);
+        emit(OpCode::EvalStmt, init);
+    }
+
     /*
      * Compile int expression `e` into `ops`, leaving the result in `out` (a
      * slot or immediate). A leaf costs no op; an arith/neg TypedScalarExpr emits
@@ -392,12 +410,20 @@ struct Codegen {
             if (!compile_int_expr(e->rvalue.get(), r, ops))
                 return false;
             /* Peephole: if the last op produced `r` in a temp, retarget it to
-             * write `dst` directly; else emit a move (dst = r + 0). */
+             * write `dst` directly; a constant -> a clean LoadImmInt; else a
+             * slot-to-slot copy (dst = r + 0). */
             if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::IntBin
                 && ops.back().target == r.slot) {
                 ops.back().target = dst.slot;
-            } else {
+            } else if (r.is_lit) {
                 Instr in;
+                in.op = OpCode::LoadImmInt;
+                in.node = s;
+                in.target = dst.slot;
+                in.a = r;
+                ops.push_back(in);
+            } else {
+                Instr in;                /* dst = r + 0 (slot copy) */
                 in.op = OpCode::IntBin;
                 in.node = s;
                 in.target = dst.slot;
@@ -611,8 +637,15 @@ struct Codegen {
             if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::FloatBin
                 && ops.back().target == r.slot) {
                 ops.back().target = dslot;
+            } else if (r.is_lit) {
+                Instr in;
+                in.op = OpCode::LoadImmFloat;
+                in.node = s;
+                in.target = dslot;
+                in.a = r;
+                ops.push_back(in);
             } else {
-                Instr in;                /* dst = r + 0.0 */
+                Instr in;                /* dst = r + 0.0 (slot copy) */
                 in.op = OpCode::FloatBin;
                 in.node = s;
                 in.target = dslot;
@@ -925,7 +958,7 @@ struct Codegen {
 
         const size_t start = chunk.code.size();
 
-        emit(OpCode::EvalStmt, f->init.get());      /* `var i = start`, once */
+        emit_init(f->init.get());                   /* `var i = start`, once */
 
         const Operand ci = slot_op(f->i_slot);
 
@@ -982,7 +1015,7 @@ struct Codegen {
         const size_t start = chunk.code.size();
 
         if (f->init)
-            emit(OpCode::EvalStmt, f->init.get());   /* declare the var, once */
+            emit_init(f->init.get());                /* declare the var, once */
 
         const int lstart = here();
 
@@ -1044,7 +1077,29 @@ struct Codegen {
 
     void gen_stmt(const Construct *s)
     {
+        /* Native-first: the register machine applies to top-level AND
+         * function-body statements, not only loop bodies. A resolved-local
+         * int/float scalar decl/assign/`++`/compound-assign lowers to register
+         * ops; an `if` with a native compare condition + native branches lowers
+         * to compares/jumps (compile_native_if, else fallback gen_if); a loop
+         * tries its native form. Anything else - a return, a call, a complex
+         * expression - stays a fallback EvalStmt (tree-walked). Each attempt is
+         * self-truncating (resets to `mark` on failure). This is what makes a
+         * scalar-arithmetic FUNCTION body native, not only a loop body. */
+        reset_temps();
+        const size_t mark = chunk.code.size();
+        if (compile_int_stmt(s, chunk.code))
+            return;
+        chunk.code.resize(mark);
+        reset_temps();
+        if (compile_float_stmt(s, chunk.code))
+            return;
+        chunk.code.resize(mark);
+
         if (const IfStmt *f = dynamic_cast<const IfStmt *>(s)) {
+            if (compile_native_if(f))
+                return;
+            chunk.code.resize(mark);
             gen_if(f);
             return;
         }

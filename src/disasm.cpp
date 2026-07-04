@@ -100,7 +100,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "jmp          L" << in.target;
             break;
         case OpCode::JumpIfFalse:
-            row << "jmp.if.not   (" << node1(in.node) << ") L" << in.target;
+            row << "jmp.ifnot    (" << node1(in.node) << "), L" << in.target;
             break;
         case OpCode::LoopBackEdge:
             row << "loop.back    cont=L" << in.target << " brk=L" << in.target2;
@@ -111,9 +111,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << reg_or_imm(in.b, false);
             break;
         case OpCode::JumpUnlessIntCmp:
-            row << "i.jmp.ncmp   " << reg_or_imm(in.a, false) << " "
+            row << "i.jmp.ifnot  " << reg_or_imm(in.a, false) << " "
                 << opsym(in.aop) << " " << reg_or_imm(in.b, false)
-                << " else L" << in.target;
+                << ", L" << in.target;
             break;
         case OpCode::FloatBin:
             row << "f.bin        r" << in.target << " = "
@@ -121,15 +121,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << reg_or_imm(in.b, true);
             break;
         case OpCode::JumpUnlessFloatCmp:
-            row << "f.jmp.ncmp   " << reg_or_imm(in.a, true) << " "
+            row << "f.jmp.ifnot  " << reg_or_imm(in.a, true) << " "
                 << opsym(in.aop) << " " << reg_or_imm(in.b, true)
-                << " else L" << in.target;
+                << ", L" << in.target;
             break;
         case OpCode::ForLoopStep:
             row << "for.step     r" << in.target2 << " "
                 << (in.aop == Op::lt || in.aop == Op::le ? "+=" : "-=") << " "
-                << reg_or_imm(in.b, false) << "; if " << opsym(in.aop) << " "
-                << reg_or_imm(in.a, false) << " L" << in.target;
+                << reg_or_imm(in.b, false) << ", if r" << in.target2 << " "
+                << opsym(in.aop) << " " << reg_or_imm(in.a, false)
+                << " -> L" << in.target;
             break;
         case OpCode::LoadElemInt:
             row << "load.elem.i  r" << in.target << " = r" << in.target2
@@ -155,6 +156,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             break;
         case OpCode::EvalToSlot:
             row << "eval.slot    r" << in.target << " = " << node1(in.node);
+            break;
+        case OpCode::LoadImmInt:
+            row << "load         r" << in.target << ", #" << in.a.lit;
+            break;
+        case OpCode::LoadImmFloat:
+            row << "load         r" << in.target << ", #" << in.a.flit;
             break;
         case OpCode::Halt:
             row << "halt";

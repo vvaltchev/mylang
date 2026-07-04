@@ -128,7 +128,7 @@ Running scripts:
 ./build/mylang -vd FILE          # dump the VM bytecode disassembly (the
                                  # bytecode analogue of -s), exit — disasm.h
 ./build/mylang -nti FILE         # disable static type inference / checking
-./build/mylang --debug-ti FILE   # dump every identifier's inferred type + uses
+./build/mylang -dti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization
 ./build/mylang -a --no-color F   # same, plain (for piping / diffing)
 ./build/mylang -T CATS FILE      # trace the compiler's reasoning to stderr
@@ -141,7 +141,7 @@ decision to stderr (colored on a stderr TTY). The same categories drive the
 `trace()`/`traceoff()`/`tracing()` builtins and the REPL `:trace [<cat>...]
 on|off`. OFF by default — zero cost on a normal run (one mask test per guarded
 site).
-`--debug-ti` runs inference (non-strict) and prints one tab-separated `ti`
+`-dti` runs inference (non-strict) and prints one tab-separated `ti`
 record per declared identifier — `name, kind (var|const|param|func), line, col,
 const, type, uses(line:col,...)` — then exits without running. It is the audit
 tool for the mandatory-`dyn` / type-driven work (see
@@ -173,7 +173,7 @@ runs it last, as `run_optimizers` does, gated on a non-null `AnalysisInfo *` so
 a normal run records nothing), and the mutation-time decisions (auto-const vars,
 dead code, inlined/specialized/folded) recorded *as they happen* by the parser
 (`ParseContext::analysis`), AutoConst, and the Inliner; `mylang.cpp` renders.
-Unlike `-s`/`--debug-ti`, the analyze rendering now has a headless `-rt` test
+Unlike `-s`/`-dti`, the analyze rendering now has a headless `-rt` test
 (`analyze:`, via `analyze_and_render` with color on).
 `-s` / `-nc` are the two indispensable debugging tools: `-s` shows you exactly
 what survived
@@ -1174,7 +1174,7 @@ decisions behind it: `plans/type-inference.md`,
   `array`/`dict` are **generic** (only
   the kind is checked, by `enforce_decl_types` in the strict block — element
   types stay inferred, so `array a = [1,2,3]` is still flat `array<int>`). A
-  scalar error is gated by `strict_dyn` (off for the `-a`/`--debug-ti`
+  scalar error is gated by `strict_dyn` (off for the `-a`/`-dti`
   non-strict passes). **Runtime:** `coerce_to_decl_type` (`eval.cpp`) does the
   numeric widenings (float←int/bool, int←bool) so a typed-float var/param holds
   a float — at the decl/assign (`handle_single_expr14`, `op == assign`, lvalue's
@@ -1340,7 +1340,7 @@ decisions behind it: `plans/type-inference.md`,
   pass re-validates genuine errors (`require_nonopt`, not-subscriptable) with
   the final types, so deferring during accumulate hides nothing. **When
   touching the inferencer, audit any new `return A.dyn_ty()` for this.**
-  `--debug-ti` dumps
+  `-dti` dumps
   every identifier's inferred type + uses to find spurious `dyn`s. The
   invariant also applies to *contributions*, not just return types:
   `accumulate_call`'s `contribute_container` (for `append`/`push`/`insert`)

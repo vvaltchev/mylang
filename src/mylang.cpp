@@ -79,7 +79,7 @@ void help()
     cout << "           the tree-walker). See plans/bytecode-vm.md" << endl;
     cout << "  -vd      Dump the VM bytecode disassembly, then exit" << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
-    cout << " --debug-ti  Dump inferred types of all identifiers, then exit"
+    cout << " -dti      Dump inferred types of all identifiers, then exit"
          << endl;
     cout << "  -a       Analyze: reprint the source with colors showing which"
          << endl;
@@ -224,7 +224,7 @@ parse_args(int argc, char **argv)
 
             opt_vm_disasm = true;   /* dump the bytecode disassembly, no run */
 
-        } else if (!strcmp(arg, "--debug-ti")) {
+        } else if (!strcmp(arg, "-dti")) {
 
             opt_debug_ti = true;
 
@@ -374,7 +374,7 @@ int main(int argc, char **argv)
          * globals.) */
         mark_implicit_globals(root.get(), {});
 
-        /* --debug-ti: dump the inferred type of every identifier + its use
+        /* -dti: dump the inferred type of every identifier + its use
          * sites (machine-readable) and exit, without running. */
         if (opt_debug_ti) {
             dump_type_info(root.get(), cout);

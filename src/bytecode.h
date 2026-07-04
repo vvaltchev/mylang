@@ -146,6 +146,16 @@ enum class OpCode : unsigned char {
      */
     EvalToSlot,
 
+    /*
+     * Load an immediate into a frame slot: slot[target] = <int/float literal>
+     * (`a.lit` / `a.flit`). This is the clean "move a constant to a slot" that
+     * a `var i = 0` / `x = 5` compiles to (instead of an `IntBin dst = imm + 0`
+     * add-with-zero). Trivial, so it is NOT counted by the has_native gate (a
+     * body of only constant loads isn't worth running via the VM chunk).
+     */
+    LoadImmInt,
+    LoadImmFloat,
+
     /* Stop the program. */
     Halt,
 };

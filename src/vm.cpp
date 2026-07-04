@@ -550,6 +550,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::LoadImmInt:
+            ctx.frame->slots[in.target].put(
+                EvalValue(static_cast<int_type>(in.a.lit)));
+            pc++;
+            break;
+
+        case OpCode::LoadImmFloat:
+            ctx.frame->slots[in.target].put(
+                EvalValue(static_cast<float_type>(in.a.flit)));
+            pc++;
+            break;
+
         case OpCode::Halt:
             return;
         }
