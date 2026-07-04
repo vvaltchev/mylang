@@ -163,6 +163,20 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
         case OpCode::LoadImmFloat:
             row << "load         r" << in.target << ", #" << in.a.flit;
             break;
+        case OpCode::LoadConstV: {
+            const EvalValue &c = chunk.consts[in.target2];
+            row << "load.v       r" << in.target << ", "
+                << c.get_type()->to_string_repr(c);
+            break;
+        }
+        case OpCode::MoveV:
+            row << "move.v       r" << in.target << " = r" << in.target2;
+            break;
+        case OpCode::BinOpV:
+            row << "bin.v        r" << in.target << " = "
+                << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
+                << reg_or_imm(in.b, false);
+            break;
         case OpCode::Halt:
             row << "halt";
             break;

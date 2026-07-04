@@ -111,6 +111,49 @@ bool definitely_int(const Construct *e)
             || t->cat == TypedScalarExpr::Cat::neg);
 }
 
+/* An arith/bitwise Op the boxed BinOpV handles (has a binop_pmf). Comparisons
+ * and logical ops use a different runtime dispatch - the boxed path grows to
+ * cover them later. */
+bool is_boxed_binop(Op op)
+{
+    switch (op) {
+        case Op::plus:  case Op::minus: case Op::times:
+        case Op::div:   case Op::mod:
+        case Op::band:  case Op::bor:   case Op::bxor:
+        case Op::shl:   case Op::shr:   case Op::ushr:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Bake a scalar/string literal into an EvalValue for the boxed const pool.
+ * Returns false for a non-scalar literal (an array/dict LiteralObj) - later. */
+bool boxed_literal(const Construct *e, EvalValue &out)
+{
+    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+        out = EvalValue(li->ival());
+        return true;
+    }
+    if (const LiteralFloat *lf = dynamic_cast<const LiteralFloat *>(e)) {
+        out = EvalValue(lf->fval());
+        return true;
+    }
+    if (const LiteralBool *lb = dynamic_cast<const LiteralBool *>(e)) {
+        out = EvalValue(lb->bval());
+        return true;
+    }
+    if (const LiteralStr *ls = dynamic_cast<const LiteralStr *>(e)) {
+        out = ls->strval();
+        return true;
+    }
+    if (dynamic_cast<const LiteralNone *>(e)) {
+        out = EvalValue();   /* none */
+        return true;
+    }
+    return false;
+}
+
 /*
  * Lowers a statement list to a Chunk. `if`/`while` become native jumps
  * (Phase 1); a `while` whose condition + body are resolved-local int ops
@@ -194,6 +237,146 @@ struct Codegen {
             return;
         chunk.code.resize(mark);
         emit(OpCode::EvalStmt, init);
+    }
+
+    int add_const(const EvalValue &v)
+    {
+        chunk.consts.push_back(v);
+        return static_cast<int>(chunk.consts.size()) - 1;
+    }
+
+    /*
+     * BOXED general-value expression (the zero-fallback / dyn tier) -> ops,
+     * result left in `out_slot` (a resolved-local slot, or a temp). Handles a
+     * resolved-local leaf (its slot, no op), a scalar/string literal (into
+     * the const pool + LoadConstV), and an arith/bitwise binary op (a BinOpV
+     * chain, each into a temp). Returns false for anything else - a
+     * global/capture/builtin leaf, a comparison/logical op, a call, subscript,
+     * member - which the boxed path grows to cover. The ops call the RUNTIME
+     * (num_bin_op) directly, no node->eval, so a `dyn`/string scalar expr is
+     * native. Self-truncating: on a nested failure the caller discards.
+     */
+    bool compile_boxed_expr(const Construct *e, int &out_slot,
+                            std::vector<Instr> &ops)
+    {
+        if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+            if (id->sym.kind == SymKind::local) {
+                out_slot = id->sym.slot;
+                return true;
+            }
+            return false;
+        }
+
+        EvalValue lit;
+        if (boxed_literal(e, lit)) {
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::LoadConstV;
+            in.node = e;
+            in.target = t;
+            in.target2 = add_const(lit);
+            ops.push_back(in);
+            out_slot = t;
+            return true;
+        }
+
+        if (dynamic_cast<const Expr03 *>(e) || dynamic_cast<const Expr04 *>(e)
+            || dynamic_cast<const Expr05 *>(e)
+            || dynamic_cast<const Expr08 *>(e)
+            || dynamic_cast<const Expr09 *>(e)
+            || dynamic_cast<const Expr10 *>(e)) {
+            const MultiOpConstruct *mo =
+                static_cast<const MultiOpConstruct *>(e);
+            if (mo->elems.empty() || mo->elems[0].first != Op::invalid)
+                return false;
+            for (size_t i = 1; i < mo->elems.size(); i++)
+                if (!is_boxed_binop(mo->elems[i].first))
+                    return false;
+            int acc;
+            if (!compile_boxed_expr(mo->elems[0].second.get(), acc, ops))
+                return false;
+            for (size_t i = 1; i < mo->elems.size(); i++) {
+                int rhs;
+                if (!compile_boxed_expr(mo->elems[i].second.get(), rhs, ops))
+                    return false;
+                const int t = alloc_temp();
+                Instr in;
+                in.op = OpCode::BinOpV;
+                /* node = the RIGHT operand: an operator error (div-zero, a type
+                 * mismatch) is stamped there, matching the tree-walker's
+                 * num_binop_loc -> stamp_operand_loc(operand). */
+                in.node = mo->elems[i].second.get();
+                in.target = t;
+                in.a = slot_op(acc);
+                in.b = slot_op(rhs);
+                in.aop = mo->elems[i].first;
+                ops.push_back(in);
+                acc = t;
+            }
+            out_slot = acc;
+            return true;
+        }
+
+        return false;
+    }
+
+    /*
+     * BOXED general-value ASSIGNMENT `local = <boxed expr>` -> ops. Fires only
+     * for a resolved-local lvalue whose decl needs NO numeric coercion
+     * (decl_type none / dyn), so a plain slot write matches the tree-walker's
+     * doAssign (a typed int/float/bool/str decl coerces via coerce_to_decl_type
+     * - left to the fallback). Covers a decl AND a plain assign (both write
+     * the slot); compound-assign (`+=`) is not boxed yet. The producing op is
+     * retargeted to write the lvalue directly (a leaf copy uses MoveV, an alias
+     * matching doAssign). Rolls back the const pool on failure.
+     */
+    bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
+    {
+        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        if (!e || e->op != Op::assign)
+            return false;
+        const Identifier *lv =
+            dynamic_cast<const Identifier *>(e->lvalue.get());
+        if (!lv || lv->sym.kind != SymKind::local)
+            return false;
+        if (lv->decl_type != DeclType::none && lv->decl_type != DeclType::dyn)
+            return false;
+        /* A reassignment of a CONST (a runtime const - a func/array kept in a
+         * slot) must throw CannotRebindConstEx; the boxed store would skip that
+         * runtime check. Leave a const lvalue to the tree-walker (throws with
+         * the lvalue's exact loc). */
+        if (lv->is_const)
+            return false;
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        int rslot;
+        if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+            ops.resize(omark);
+            chunk.consts.resize(cmark);
+            return false;
+        }
+
+        if (rslot != lv->sym.slot) {
+            /* Retarget the producing op to write the lvalue directly - but ONLY
+             * an op THIS statement emitted (ops grew past omark). A LEAF rvalue
+             * (a bare local) emits no op, so ops.back() would be the PREVIOUS
+             * statement's op - retargeting it would corrupt it (the `var t = s`
+             * bug). A leaf falls to MoveV. */
+            if (ops.size() > omark && ops.back().target == rslot
+                && (ops.back().op == OpCode::BinOpV
+                    || ops.back().op == OpCode::LoadConstV)) {
+                ops.back().target = lv->sym.slot;
+            } else {
+                Instr in;
+                in.op = OpCode::MoveV;
+                in.node = s;
+                in.target = lv->sym.slot;
+                in.target2 = rslot;
+                ops.push_back(in);
+            }
+        }
+        return true;
     }
 
     /*
@@ -796,6 +979,12 @@ struct Codegen {
                 continue;
             }
             chunk.code.resize(mark);
+            reset_temps();
+            if (compile_boxed_stmt(s, chunk.code)) {   /* dyn/string assign */
+                any_native = true;
+                continue;
+            }
+            chunk.code.resize(mark);
 
             /* Nested native control flow. Each is itself self-truncating, so on
              * failure chunk.code is already back at `mark`. */
@@ -1137,6 +1326,10 @@ struct Codegen {
         chunk.code.resize(mark);
         reset_temps();
         if (compile_float_stmt(s, chunk.code))
+            return;
+        chunk.code.resize(mark);
+        reset_temps();
+        if (compile_boxed_stmt(s, chunk.code))   /* dyn/string scalar assign */
             return;
         chunk.code.resize(mark);
 

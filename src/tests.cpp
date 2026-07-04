@@ -10455,6 +10455,7 @@ struct VmOpCounts {
     size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
     size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0;
     size_t storei = 0, storef = 0, loadev = 0, evalslot = 0, evalstmt = 0;
+    size_t loadconstv = 0, movev = 0, binopv = 0;
     int n_temps = 0;
 };
 
@@ -10497,6 +10498,9 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::LoadElemValue:    c.loadev++; break;
             case OpCode::EvalToSlot:       c.evalslot++; break;
             case OpCode::EvalStmt:         c.evalstmt++; break;
+            case OpCode::LoadConstV:       c.loadconstv++; break;
+            case OpCode::MoveV:            c.movev++; break;
+            case OpCode::BinOpV:           c.binopv++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10765,12 +10769,26 @@ static bool vm_codegen_shapes()
     const bool compound_cond_ok =
         cc.juic == 2 && cc.jif == 0 && cc.intbin >= 1 && cc.back == 0;
 
+    /* 19) the BOXED general-value path: `s = s + "x"` (a string-build loop)
+     * lowers to native boxed ops (LoadConstV for "x", BinOpV for the concat via
+     * num_bin_op) instead of a fallback EvalStmt - no eval.stmt for the assign,
+     * and the for-loop stays counted. */
+    VmOpCounts bx;
+    if (!codegen_counts({
+            "var s = \"\";",
+            "for (var i = 0; i < 5; i++) { s = s + \"x\"; }",
+        }, bx))
+        return false;
+    const bool boxed_ok =
+        bx.binopv == 1 && bx.loadconstv >= 1 && bx.flstep == 1
+        && bx.evalstmt == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
         && nested_native_ok && compound_store_ok && read_2d_ok
         && builtin_dispatch_ok && array_build_ok && general_for_ok
-        && break_cont_ok && compound_cond_ok;
+        && break_cont_ok && compound_cond_ok && boxed_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

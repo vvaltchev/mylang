@@ -81,6 +81,26 @@ write_float_slot(EvalContext *ctx, int slot, float_type v)
         lv.put(EvalValue(v));
 }
 
+/* Map an arith/bitwise Op to its num_bin_op Type method, for the boxed BinOpV
+ * (the same PMFs the tree-walker's binary-op eval uses). */
+static NumBinOp binop_pmf(Op op)
+{
+    switch (op) {
+        case Op::plus:  return &Type::add;
+        case Op::minus: return &Type::sub;
+        case Op::times: return &Type::mul;
+        case Op::div:   return &Type::div;
+        case Op::mod:   return &Type::mod;
+        case Op::band:  return &Type::band;
+        case Op::bor:   return &Type::bor;
+        case Op::bxor:  return &Type::bxor;
+        case Op::shl:   return &Type::shl;
+        case Op::shr:   return &Type::shr;
+        case Op::ushr:  return &Type::ushr;
+        default:        return nullptr;
+    }
+}
+
 /*
  * Per-run storage for compiled function-body chunks (Phase 4), keyed by the
  * FuncDeclStmt. Cleared at the start of every vm_execute so a fresh program run
@@ -561,6 +581,42 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 EvalValue(static_cast<float_type>(in.a.flit)));
             pc++;
             break;
+
+        case OpCode::LoadConstV:
+            ctx.frame->slots[in.target].put(chunk.consts[in.target2]);
+            pc++;
+            break;
+
+        case OpCode::MoveV:
+            /* Alias, not clone (a container assignment shares the handle;
+             * matches doAssign's `x = RValue(rval)` - COW protects later). */
+            ctx.frame->slots[in.target].put(
+                ctx.frame->slots[in.target2].get());
+            pc++;
+            break;
+
+        case OpCode::BinOpV: {
+            /* Clone the left operand, then num_bin_op mutates the clone (so
+             * `a + b` never corrupts a) - byte-identical to the tree-walker's
+             * eval_first_rvalue().clone() + num_binop_loc chain (int/float
+             * promotion, string `+` concat, bitwise). */
+            EvalValue val = ctx.frame->slots[in.a.slot].get().clone();
+            try {
+                num_bin_op(val, ctx.frame->slots[in.b.slot].get(),
+                           binop_pmf(in.aop));
+            } catch (Exception &e) {
+                /* Stamp the right-operand loc (in.node) like stamp_operand_loc,
+                 * so a div-zero / type error points where the tree-walker's. */
+                if (!e.loc_start) {
+                    e.loc_start = in.node->start;
+                    e.loc_end = in.node->end;
+                }
+                throw;
+            }
+            ctx.frame->slots[in.target].put(std::move(val));
+            pc++;
+            break;
+        }
 
         case OpCode::Halt:
             return;

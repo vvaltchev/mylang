@@ -149,12 +149,31 @@ enum class OpCode : unsigned char {
     /*
      * Load an immediate into a frame slot: slot[target] = <int/float literal>
      * (`a.lit` / `a.flit`). This is the clean "move a constant to a slot" that
-     * a `var i = 0` / `x = 5` compiles to (instead of an `IntBin dst = imm + 0`
+     * a `var i = 0` / `x = 5` compiles to (vs an `IntBin dst = imm + 0`
      * add-with-zero). Trivial, so it is NOT counted by the has_native gate (a
      * body of only constant loads isn't worth running via the VM chunk).
      */
     LoadImmInt,
     LoadImmFloat,
+
+    /*
+     * The BOXED general-value path (the zero-fallback / dyn tier). These
+     * operate on EvalValue frame slots (the same slots the typed ops use, read
+     * as boxed values) and call the RUNTIME directly - num_bin_op / the Type
+     * vtable - so a `dyn` / string / bool scalar expr runs native instead of
+     * falling back to node->eval. No Construct* (a machine-code backend lowers
+     * these to runtime-library calls). Args pre-evaluated into slots.
+     *
+     * LoadConstV  slot[target] = consts[target2]           (a baked literal)
+     * MoveV       slot[target] = RValue(slot[target2])     (alias, no clone)
+     * BinOpV      slot[target] = clone(RValue(slot[a])) <aop> RValue(slot[b])
+     *             via num_bin_op (arith/bitwise Op); mirrors the tree-walker
+     *             (clone the left operand, then mutate it - so `a+b` doesn't
+     *             corrupt a), incl. int/float promotion + string `+` concat.
+     */
+    LoadConstV,
+    MoveV,
+    BinOpV,
 
     /* Stop the program. */
     Halt,
@@ -196,4 +215,11 @@ struct Chunk {
      * them. Zero when no native expression needed a temp.
      */
     int n_temps = 0;
+    /*
+     * The BOXED general-value path's constant pool: literal EvalValues baked at
+     * codegen (a machine-code backend would put these in the data section),
+     * each referenced by index from a LoadConstV. Empty until a boxed op needs
+     * a literal operand.
+     */
+    std::vector<EvalValue> consts;
 };
