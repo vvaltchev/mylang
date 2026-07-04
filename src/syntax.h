@@ -1545,6 +1545,13 @@ public:
      * box-free. A dict has no O(1) index, so this is a separate loop shape from
      * the counted array foreach. */
     bool container_is_dict = false;
+    /* Set by the inferencer (i/f) for a non-indexed 2+-var STRICT-unpack loop
+     * over a proven array<array<int>> / array<array<float>> (flat sub-arrays):
+     * the VM iterates the outer array counted and, per element, destructures
+     * flat sub-array's scalars box-free into the consecutive loop-var slots
+     * (UnpackElemInt/Float), with the strict size check. `none` = not this form
+     * (a `_`, general/opt sub-array, etc. -> fall back). */
+    TypeHint unpack_elem_th = TypeHint::none;
 
     ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1562,6 +1569,7 @@ public:
         c->elem_th = elem_th;
         c->container_is_array = container_is_array;
         c->container_is_dict = container_is_dict;
+        c->unpack_elem_th = unpack_elem_th;
         return c;
     }
 };

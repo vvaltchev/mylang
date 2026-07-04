@@ -1458,6 +1458,30 @@ void Inferencer::annotate_hints(Construct *n)
             if (c->kind == StaticTypeKind::Dict)
                 fe->container_is_dict = true;
         }
+
+        /* A non-indexed 2+-var STRICT-unpack foreach over a proven
+         * array<array<int>> / array<array<float>> (non-opt flat sub-arrays):
+         * the VM iterates the outer array counted and destructures each flat
+         * sub-array's scalars box-free into the consecutive loop-var slots
+         * (UnpackElemInt/Float). A general/opt/dyn sub-array leaves it none ->
+         * the tree-walker's strict do_iter fallback. The runtime size check
+         * (each sub-array must have exactly N elements) keeps it strict;
+         * N is the loop-var count, not matched statically (arrays vary). */
+        const bool unpack_form = !fe->indexed && fe->ids
+                              && fe->ids->elems.size() >= 2;
+        if (unpack_form) {
+            StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
+            if (c->kind == StaticTypeKind::Array) {
+                StaticTypeRef el = static_type_resolve(c->elem);
+                if (!el->opt && el->kind == StaticTypeKind::Array) {
+                    StaticTypeRef sub = static_type_resolve(el->elem);
+                    if (!sub->opt && sub->kind == StaticTypeKind::Int)
+                        fe->unpack_elem_th = TypeHint::i;
+                    else if (!sub->opt && sub->kind == StaticTypeKind::Float)
+                        fe->unpack_elem_th = TypeHint::f;
+                }
+            }
+        }
     }
 
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });

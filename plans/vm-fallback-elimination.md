@@ -19,7 +19,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
 | ~~F1~~ | ~~foreach single-var gen arr~~ | (grp) | — | ✅ box-free LoadElem.v |
 | ~~F2~~ | ~~foreach INDEXED 2-var~~ | 19 | — | ✅ box-free (see "redo") |
-| **F3** | foreach UNPACK `x,y in pairs` | 20 | — | strict done; native todo |
+| ~~F3~~ | foreach UNPACK `x,y in pairs` | 20 | — | ✅ UnpackElem 0.87→0.73 |
 | ~~D3~~ | dict `foreach(k,v in d)` | 26,47,62 | — | ✅ live iterator 62:.64 |
 | ~~G~~ | ~~general array store~~ | 5 | ~~P4~~ | ✅ 32:.67 20:.62 |
 | ~~S~~ | string element `s[i]`, build | 29,30,31 | — | ✅ native; 30 len-bound |

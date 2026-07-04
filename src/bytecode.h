@@ -145,6 +145,21 @@ enum class OpCode : unsigned char {
     DictIterNext,
 
     /*
+     * Native STRICT foreach-unpack element: `foreach (x, y in pairs)` over a
+     * proven array<array<int/float>>. The counted loop over the OUTER array is
+     * the usual ArrLen/ForLoopStep; per iteration this op reads pairs[i] (a
+     * general element = a flat sub-array), checks it is an array of EXACTLY N,
+     * and writes its N scalars BOX-FREE into the consecutive loop-var slots.
+     *   target2 = outer general-array slot, a = the index operand (loop
+     *   counter, in-range), target = the first loop-var slot (x; y=tgt+1,..),
+     *   b = N (loop-var count), node = the container (loc for the two strict
+     *   throws - a non-array element / a length mismatch - matching do_iter,
+     *   nulled by extract_locs). Int / float variants (the sub-array kind).
+     */
+    UnpackElemInt,
+    UnpackElemFloat,
+
+    /*
      * Native array-element store `a[i] = v` / `a[i] OP= v` (Phase 5): `target2`
      * = the array slot, `a` = the int index operand, `b` = the value operand,
      * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith

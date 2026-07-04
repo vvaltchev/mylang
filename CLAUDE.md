@@ -2925,7 +2925,17 @@ inferencer stamps `ForeachStmt::container_is_array`. Both the **single-var**
 (`foreach (e in a)`) and the **INDEXED 2-var** (`foreach (i, e in indexed a)`)
 forms are native: for indexed, the index var IS the loop counter (the body
 reads it) and the element loads into the 2nd var. (Flat `array<bool>` /
-`array<PodStruct>`, and unpack `foreach (x,y in pairs)`, still fall back.)
+`array<PodStruct>` still fall back.) The **STRICT-UNPACK** `foreach (x, y in
+pairs)` over a proven `array<array<int>>` / `array<array<float>>` (flat
+sub-arrays) is native too: the outer array iterates counted, and per element a
+**`UnpackElemInt`/`UnpackElemFloat`** op reads `pairs[i]` (a general element = a
+flat sub-array), strict-checks its length == the loop-var count `N`, and writes
+its `N` scalars BOX-FREE into the consecutive loop-var slots (`base..+N-1`) —
+matching `do_iter`'s strict destructure (same two `TypeErrorEx`s, same container
+loc, via the loc side table so the op is `node`-free). Stamped by the inferencer
+as `ForeachStmt::unpack_elem_th` (i/f); a `_` (breaks slot↔position), a
+non-consecutive/non-int-float target, or a general/opt sub-array fall back.
+~1.2x: `20_foreach_unpack` 0.87x→0.73x vs the tree-walker.
 **Dict `foreach (k, v in d)` / `foreach (k in d)`** is native via a **LIVE
 dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
 but a while-shaped loop over two ops: **`DictIterInit`** pins the dict

@@ -2060,7 +2060,8 @@ struct Codegen {
                 }
             } else if (const ForeachStmt *fe =
                            dynamic_cast<const ForeachStmt *>(s)) {
-                if (try_native_foreach(fe) || try_native_dict_foreach(fe)) {
+                if (try_native_foreach(fe) || try_native_foreach_unpack(fe)
+                    || try_native_dict_foreach(fe)) {
                     any_native = true;
                     continue;
                 }
@@ -2550,6 +2551,112 @@ struct Codegen {
     }
 
     /*
+     * Native STRICT foreach-unpack: `foreach (x, y in pairs)` over a proven
+     * array<array<int/float>>. Same counted loop over the OUTER array as
+     * try_native_foreach, but each element is a flat sub-array destructured
+     * BOX-FREE into the consecutive loop-var slots (UnpackElemInt/Float), with
+     * the strict size check. A `_`, non-consecutive slots, or a general/opt
+     * sub-array (unpack_elem_th none) fall back to the tree-walker's do_iter.
+     */
+    bool try_native_foreach_unpack(const ForeachStmt *fe)
+    {
+        if (fe->unpack_elem_th == TypeHint::none || fe->indexed || !fe->ids
+            || fe->ids->elems.size() < 2)
+            return false;
+
+        /* All loop vars must be real (non-`_`), resolved-local, CONSECUTIVE
+         * slots (guaranteed for `var x, y` - declared in order; verified). */
+        const int N = static_cast<int>(fe->ids->elems.size());
+        int base = -1;
+        for (int k = 0; k < N; k++) {
+            const Identifier *id =
+                dynamic_cast<const Identifier *>(fe->ids->elems[k].get());
+            if (!id || id->is_underscore() || id->sym.kind != SymKind::local)
+                return false;
+            if (k == 0)
+                base = id->sym.slot;
+            else if (id->sym.slot != base + k)
+                return false;
+        }
+
+        const size_t start = chunk.code.size();
+        reset_temps();
+
+        int csrc;
+        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
+            chunk.code.resize(start);
+            return false;
+        }
+        const int c = alloc_temp();
+        Instr mv;
+        mv.op = OpCode::MoveV;
+        mv.target = c;
+        mv.target2 = csrc;
+        chunk.code.push_back(mv);
+
+        const int n = alloc_temp();
+        Instr ln;
+        ln.op = OpCode::ArrLen;
+        ln.node = fe->container.get();
+        ln.target = n;
+        ln.target2 = c;
+        chunk.code.push_back(ln);
+
+        const int i = alloc_temp();
+        Instr z;
+        z.op = OpCode::LoadImmInt;
+        z.target = i;
+        z.a = int_lit(0);
+        chunk.code.push_back(z);
+
+        const int saved_base = temp_base;
+        temp_base = next_temp;   /* reserve c/n/i */
+
+        const size_t jt = emit_cmp(OpCode::JumpUnlessIntCmp,
+                                   fe->container.get(), Op::lt,
+                                   slot_op(i), slot_op(n));
+
+        const int lbody = here();
+
+        /* Per element: read pairs[i] (a flat sub-array), strict-check its
+         * length == N, and write its N scalars box-free into base..base+N-1. */
+        Instr up;
+        up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
+                                                  : OpCode::UnpackElemFloat;
+        up.node = fe->container.get();
+        up.target = base;
+        up.target2 = c;
+        up.a = slot_op(i);
+        up.b = int_lit(N);
+        chunk.code.push_back(up);
+
+        loops.push_back({});
+        if (!compile_scalar_body(body_stmts(fe->body.get()))) {
+            loops.pop_back();
+            temp_base = saved_base;
+            chunk.code.resize(start);
+            return false;
+        }
+
+        const int lcont = here();
+        Instr fstep;
+        fstep.op = OpCode::ForLoopStep;
+        fstep.node = fe->container.get();
+        fstep.aop = Op::lt;
+        fstep.target = lbody;
+        fstep.target2 = i;
+        fstep.a = slot_op(n);
+        fstep.b = int_lit(1);
+        chunk.code.push_back(fstep);
+
+        const int lend = here();
+        chunk.code[jt].target = lend;
+        pop_loop(lend, lcont);
+        temp_base = saved_base;
+        return true;
+    }
+
+    /*
      * Native dict `foreach` via a LIVE iterator (DictIterInit/DictIterNext) - a
      * dict has no O(1) index, so it's a while-shaped loop, not the counted
      * array one. 1 var binds the key (keys-only), 2 vars key + value; a `_`
@@ -2688,6 +2795,7 @@ struct Codegen {
         }
         if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
             if (!try_native_foreach(fe)         /* flat/general array */
+                && !try_native_foreach_unpack(fe) /* strict array destructure */
                 && !try_native_dict_foreach(fe))  /* live dict iterator */
                 emit(OpCode::EvalStmt, s);
             return;
@@ -2779,6 +2887,8 @@ static void extract_locs(Chunk &chunk)
         case OpCode::CmpV:
         case OpCode::LoadGlobalV:
         case OpCode::CallValueV:
+        case OpCode::UnpackElemInt:
+        case OpCode::UnpackElemFloat:
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold

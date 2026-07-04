@@ -149,6 +149,29 @@ vm_stamp_loc(const Chunk &chunk, size_t pc, Exception &e)
         chunk.loc_at(pc, e.loc_start, e.loc_end);
 }
 
+/* The two STRICT foreach-unpack errors (UnpackElem*), matching do_iter's
+ * messages + loc (the container's, from the loc side table) BYTE-for-byte, so
+ * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. */
+[[noreturn]] static ML_NOINLINE void
+vm_throw_unpack_nonarray(const Chunk &chunk, size_t pc, int_type nvars)
+{
+    Loc s, en;
+    chunk.loc_at(pc, s, en);
+    throw TypeErrorEx(intern_msg("foreach: cannot unpack a non-array element "
+                                 "into " + std::to_string(nvars) +
+                                 " variables"), s, en);
+}
+
+[[noreturn]] static ML_NOINLINE void
+vm_throw_unpack_len(const Chunk &chunk, size_t pc, size_type m, int_type nvars)
+{
+    Loc s, en;
+    chunk.loc_at(pc, s, en);
+    throw TypeErrorEx(intern_msg("foreach: cannot unpack an array of length " +
+                                 std::to_string(m) + " into " +
+                                 std::to_string(nvars) + " variables"), s, en);
+}
+
 /* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
  * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
  * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
@@ -731,6 +754,41 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (in.b.slot >= 0)
                 ctx.frame->at(in.b.slot).put(st.it->second.get());
             ++st.it;
+            pc++;
+            break;
+        }
+
+        case OpCode::UnpackElemInt:
+        case OpCode::UnpackElemFloat: {
+
+            /* STRICT foreach-unpack: read pairs[i] (a general outer element = a
+             * flat sub-array), check it is an array of EXACTLY N, write its
+             * N scalars BOX-FREE into the consecutive loop-var slots
+             * base..base+N-1 - matching do_iter's strict destructure element
+             * for element. `i` is the loop counter (in-range), so the outer
+             * read never OOB; the only throws are the two strict errors. */
+            const bool is_int = in.op == OpCode::UnpackElemInt;
+            const EvalValue &base_v = ctx.frame->at(in.target2).get();
+            ML_VM_CHECK(base_v.is<SharedArrayObj>());
+            const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
+            const int_type idx = read_int_operand(in.a, &ctx);
+            const EvalValue &elem =
+                outer.get_vec()[outer.offset() + idx].get();
+            const int_type N = in.b.lit;
+            if (!elem.is<SharedArrayObj>())
+                vm_throw_unpack_nonarray(chunk, pc, N);
+            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
+            if (sub.size() != static_cast<size_type>(N))
+                vm_throw_unpack_len(chunk, pc, sub.size(), N);
+            const size_type off = sub.offset();
+            if (is_int)
+                for (int_type k = 0; k < N; k++)
+                    write_int_slot(&ctx, in.target + k,
+                                   sub.flat_ints()[off + k]);
+            else
+                for (int_type k = 0; k < N; k++)
+                    write_float_slot(&ctx, in.target + k,
+                                     sub.flat_floats()[off + k]);
             pc++;
             break;
         }

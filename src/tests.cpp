@@ -5389,6 +5389,19 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native STRICT foreach-unpack over array<array<int>> (the VM
+         * UnpackElem* path; differential reruns under -vm). */
+        "Foreach unpack native over array<array<int>>",
+        {
+            "var pairs = [];",
+            "for (var i = 0; i < 5; i++) append(pairs, [i, i * 2]);",
+            "var s = 0;",
+            "foreach (var x, y in pairs) { s += x + y; }",
+            "assert(s == 30);",           /* sum (i + 2i) for i=0..4 */
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {
