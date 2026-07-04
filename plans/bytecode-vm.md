@@ -548,6 +548,18 @@ behind the differential harness:
 
 ### The BOXED general-value path (the zero-fallback / dyn tier) — the big piece
 
+**Tier-1 landed (commit a3985d4):** `LoadConstV` (a scalar/string literal from a
+per-Chunk const pool), `MoveV` (alias, = doAssign), `BinOpV` (`clone(a) <op> b`
+via num_bin_op — arith/bitwise + string `+`, byte-identical to the tree-walker
+incl. the clone-left-operand and the right-operand error loc). `compile_boxed_
+expr`/`compile_boxed_stmt` fire after the typed attempts, so a `dyn`/string/bool
+scalar ASSIGNMENT (`s = s + "x"`) is native, not an EvalStmt. Guards: only a
+decl_type none/dyn, non-const lvalue (a typed-numeric decl coerces, a const
+reassign must throw — both left to the tree-walker). **Still TODO in this
+tier:** compound-assign (`s += x`), a comparison/logical BinOpV, a
+global/capture/builtin leaf, then subscript/member/call/make/foreach — see the
+op list below.
+
 The typed unboxed int/float register machine is only the fast tier. To satisfy
 the directive (never fall back, full `dyn` support, `Construct*`-free, machine-
 code-lowerable) there must be a SECOND tier: a boxed value machine whose
