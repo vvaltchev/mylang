@@ -443,11 +443,11 @@ struct Codegen {
             && compile_float_expr(t->elems[1].second.get(), b, ops);
     }
 
-    /* Gather a while body's statements (a Block's elems, or a single stmt). */
-    std::vector<const Construct *> body_stmts(const WhileStmt *w)
+    /* A loop body's statements (a Block's elems, or a single statement). */
+    std::vector<const Construct *> body_stmts(const Construct *body)
     {
         std::vector<const Construct *> stmts;
-        if (const Construct *body = w->body.get()) {
+        if (body) {
             if (const Block *b = dynamic_cast<const Block *>(body))
                 for (const auto &e : b->elems)
                     stmts.push_back(e.get());
@@ -455,6 +455,26 @@ struct Codegen {
                 stmts.push_back(body);
         }
         return stmts;
+    }
+
+    /* Compile a loop body's statements into `body_ops`, each dispatched by its
+     * OWN kind (int or float), so a MIXED body compiles. A failed int attempt
+     * may leave partial ops; truncate before the float retry. False if any
+     * statement is unsupported. */
+    bool compile_scalar_body(const std::vector<const Construct *> &stmts,
+                             std::vector<Instr> &body_ops)
+    {
+        for (const Construct *s : stmts) {
+            reset_temps();
+            const size_t mark = body_ops.size();
+            if (compile_int_stmt(s, body_ops))
+                continue;
+            body_ops.resize(mark);
+            reset_temps();
+            if (!compile_float_stmt(s, body_ops))
+                return false;
+        }
+        return true;
     }
 
     /* Emit a compiled native loop: Lstart <cond ops> JumpUnless{cmp_op} <body
@@ -516,21 +536,72 @@ struct Codegen {
             cmp_opcode = OpCode::JumpUnlessFloatCmp;
         }
 
-        /* Body: each statement dispatched by its OWN kind (int OR float), so a
-         * MIXED loop - `while (i < n) { f += 0.5; i++; }` - compiles. A failed
-         * int attempt may leave partial ops; truncate before trying float. */
-        for (const Construct *s : body_stmts(w)) {
-            reset_temps();
-            const size_t mark = body_ops.size();
-            if (compile_int_stmt(s, body_ops))
-                continue;
-            body_ops.resize(mark);
-            reset_temps();
-            if (!compile_float_stmt(s, body_ops))
-                return false;
-        }
+        /* Body: each statement dispatched by its OWN kind, so a MIXED loop -
+         * `while (i < n) { f += 0.5; i++; }` - compiles. */
+        if (!compile_scalar_body(body_stmts(w->body.get()), body_ops))
+            return false;
 
         emit_native_while(w, cmp_opcode, cmp, ca, cb, cond_ops, body_ops);
+        return true;
+    }
+
+    /*
+     * A counted int for-loop (ForRangeStmt) -> native register ops. `init` runs
+     * ONCE as a fallback (it declares `i` - a frame slot - so running it in the
+     * main context writes the same slot); `bound`/`step` must be simple int
+     * operands (a slot or literal, both loop-immutable, so reading them each
+     * iteration matches the once-evaluated tree-walker); the body compiles like
+     * a while body. The counter uses the FUSED ForLoopStep back-edge (one
+     * dispatch = i += step + test + branch), so a `for` is on par with the
+     * tree-walker's raw-C ForRangeStmt and wins when the body has real work.
+     * Falls back (returns false) otherwise.
+     */
+    bool try_native_for_range(const ForRangeStmt *f)
+    {
+        Operand bound, step;
+        if (!as_int_operand(f->bound.get(), bound))
+            return false;
+        if (f->step) {
+            if (!as_int_operand(f->step.get(), step))
+                return false;
+        } else {
+            step = int_lit(1);
+        }
+
+        std::vector<Instr> body_ops;
+        if (!compile_scalar_body(body_stmts(f->body.get()), body_ops))
+            return false;
+
+        emit(OpCode::EvalStmt, f->init.get());      /* `var i = start`, once */
+
+        const Operand ci = slot_op(f->i_slot);
+
+        /* Initial test: skip the loop entirely if !(i <cmp> bound). */
+        Instr test;
+        test.op = OpCode::JumpUnlessIntCmp;
+        test.node = f;
+        test.aop = f->cmp_op;
+        test.a = ci;
+        test.b = bound;
+        const size_t jt = chunk.code.size();
+        chunk.code.push_back(test);
+
+        const int lbody = here();
+        for (const Instr &in : body_ops)
+            chunk.code.push_back(in);
+
+        /* Fused back-edge: i += step; if (i <cmp> bound) goto lbody. */
+        Instr fstep;
+        fstep.op = OpCode::ForLoopStep;
+        fstep.node = f;
+        fstep.aop = f->cmp_op;
+        fstep.target = lbody;
+        fstep.target2 = f->i_slot;
+        fstep.a = bound;
+        fstep.b = step;
+        chunk.code.push_back(fstep);
+
+        chunk.code[jt].target = here();             /* Lend */
         return true;
     }
 
@@ -548,6 +619,11 @@ struct Codegen {
         }
         if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
             gen_while(w);
+            return;
+        }
+        if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
+            if (!try_native_for_range(fr))     /* else the counted loop falls */
+                emit(OpCode::EvalStmt, s);      /* back to the tree-walker */
             return;
         }
         emit(OpCode::EvalStmt, s);

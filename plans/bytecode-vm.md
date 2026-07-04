@@ -1,9 +1,10 @@
 # Bytecode VM
 
-Status: **Phase 2 (step 2.0) landed** — a register machine over the frame slots
-makes a resolved-local int loop native (`01_while_loop` ~2x faster under `-vm`,
-−50% instructions); Phases 0–1 (scaffold, both pillars, if/while flattening)
-done; the whole `-rt` suite passes under both engines. Branch: `exp-work`.
+Status: **Phase 2 landed** — a register machine over the frame slots makes
+resolved-local int/float scalar `while` AND counted `for` loops native (fused
+`ForLoopStep`). **Suite geomean 0.89x (VM ~11% faster than the tree-walker)**;
+Phases 0–1 (scaffold, both pillars, if/while flattening) done; the whole `-rt`
+suite passes under both engines. Branch: `exp-work`.
 
 The design + incremental task plan for MyLang's runtime bytecode VM. Read the
 CLAUDE.md section "Execution strategy: strip compile-time overhead first, THEN
@@ -286,17 +287,26 @@ x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
   accumulator) compiles fully native: **−51.0% instructions**; homogeneous loops
   emit byte-identical bytecode (`01_while_loop` unchanged). 1303/1303 +
   1155/1155; shape test pins the mixed path.
-- **`for` loops (ForRangeStmt) — deliberately NOT compiled (measured).** Tried
-  it; cachegrind showed **+28% instructions** on `02_for_loop`. The tree-walker's
-  `ForRangeStmt` is *already raw C* (bound/step cached once, the counter is
-  native C on the slot's int, only the body is tree-walked) — there is no
-  per-node dispatch for the VM to remove, so re-encoding it with opcode dispatch
-  only adds work. Same lesson as the Option-A study: the VM can't beat an
-  already-optimal tree-walker path, and unlike the Phase-1 while regression this
-  one would *never* be erased. So a counted `for` stays a fallback `EvalStmt`.
-  (A `while` has per-node virtual dispatch in its condition/body, which is why
-  the VM *does* win there.) Correctness was fine (differential green) — the gate
-  is what vetoed it. This is why every step runs the perf gate.
+- **Step 2.4 — counted `for` loops (ForRangeStmt), via a FUSED back-edge —
+  DONE.** First attempt used GENERIC ops (JumpUnlessIntCmp + an IntBin increment
+  + a Jump = 3 dispatches/iter for the counter) and measured **+28%
+  instructions** on `02_for_loop` — I wrongly concluded the VM couldn't beat the
+  tree-walker's raw-C ForRangeStmt and deferred it. The maintainer pushed back:
+  a `for` should at least be on par. The real fix was a **fused
+  superinstruction**, `ForLoopStep{i += step; if (i <cmp> bound) loop back}` -
+  ONE dispatch for the whole counter, matching ForRangeStmt's inlined C. Codegen
+  (`try_native_for_range`): `init` once (fallback EvalStmt - it declares `i`, a
+  frame slot), an initial `JumpUnlessIntCmp`, the native body, then the fused
+  `ForLoopStep`. **Result: `02_for_loop` +28% → −11.9%** (a *win* even on the
+  trivial body `s += i`, because the VM's `IntBin` body is leaner than the
+  tree-walker's `body->eval` chain while the counter is now on par); a
+  heavy-body `for` is −56%. **This moved the suite geomean 1.00x → 0.89x** -
+  many benchmarks have top-level `for`s: `03_int_arith` −71.6%,
+  `51_purefunc_fold` −67.8%, `08_func_call` −57.7% instructions (cachegrind);
+  the worst wall-clock outliers are +0.0% instrs (noise). 1303/1303 + 1155/1155.
+  **Lesson (corrected):** the VM CAN beat an already-optimal tree-walker path -
+  but only with a fused superinstruction, not generic ops. Don't conclude
+  "can't win" from a naive encoding; try the fused form first.
 - **`global`/`capture` operands — deferred (soundness cost > value).** A native
   op reading an *undefined* global can't throw a proper `UndefinedVariableEx`
   without threading the var's name + exact `Loc` onto every `Operand` — real

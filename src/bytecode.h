@@ -79,6 +79,17 @@ enum class OpCode : unsigned char {
     FloatBin,
     JumpUnlessFloatCmp,
 
+    /*
+     * Fused counted-loop back-edge (the register-machine superinstruction for a
+     * `for`): in ONE dispatch, i += step (or -= for a descending loop), then if
+     * (i <aop> bound) pc = target (loop back to the body), else fall through
+     * (exit) - matching the tree-walker's raw-C ForRangeStmt counter so a `for`
+     * doesn't regress. Fields: `target2` = i's slot, `b` = step, `a` = bound,
+     * `aop` = the comparison Op (lt/le ascend +step, ge/gt descend -step),
+     * `target` = the loop body. int-only (ForRangeStmt is always int).
+     */
+    ForLoopStep,
+
     /* Stop the program. */
     Halt,
 };

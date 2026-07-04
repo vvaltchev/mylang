@@ -277,6 +277,33 @@ vm_execute(const Construct *root_c)
             break;
         }
 
+        case OpCode::ForLoopStep: {
+
+            /* i += step (or -=); if (i <aop> bound) loop back, else exit. One
+             * dispatch for the whole counter (see bytecode.h). */
+            LValue &ilv = ctx.frame->slots[in.target2];
+            int_type i = ilv.getval<int_type>();
+            const int_type step = read_int_operand(in.b, &ctx);
+
+            i = (in.aop == Op::lt || in.aop == Op::le) ? i + step : i - step;
+            ilv.getval<int_type>() = i;   /* counter slot always holds int */
+
+            const int_type bound = read_int_operand(in.a, &ctx);
+            bool go;
+            switch (in.aop) {
+            case Op::lt: go = i <  bound; break;
+            case Op::le: go = i <= bound; break;
+            case Op::ge: go = i >= bound; break;
+            default:     go = i >  bound; break;   /* gt */
+            }
+
+            if (go)
+                pc = in.target;
+            else
+                pc++;
+            break;
+        }
+
         case OpCode::Halt:
             return;
         }

@@ -10452,7 +10452,7 @@ static bool frame_over_64_slots()
  */
 struct VmOpCounts {
     size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
-    size_t fbin = 0, jufc = 0;
+    size_t fbin = 0, jufc = 0, flstep = 0;
     int n_temps = 0;
 };
 
@@ -10487,6 +10487,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::IntBin:           c.intbin++; break;
             case OpCode::FloatBin:         c.fbin++;   break;
             case OpCode::JumpUnlessFloatCmp: c.jufc++; break;
+            case OpCode::ForLoopStep:      c.flstep++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10499,7 +10500,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
 
 static bool vm_codegen_shapes()
 {
-    /* 1) resolved-local int while -> native register ops; if/else -> flatten. */
+    /* 1) resolved-local int while -> native ops; if/else -> flatten. */
     VmOpCounts a;
     if (!codegen_counts({
             "var i = 0;", "var s = 0;",
@@ -10507,7 +10508,7 @@ static bool vm_codegen_shapes()
             "if (s > 3) s += 100; else s -= 1;",
         }, a))
         return false;
-    /* native while: 1 JumpUnlessIntCmp + 2 IntBin (s+=i, i+=1), NO LoopBackEdge;
+    /* native while: 1 JumpUnlessIntCmp + 2 IntBin (s+=i, i+=1), no back-edge;
      * if/else: 1 JumpIfFalse + 1 Jump; exactly one Halt. */
     const bool native_ok =
         a.juic == 1 && a.intbin == 2 && a.back == 0 &&
@@ -10569,8 +10570,21 @@ static bool vm_codegen_shapes()
         m.juic == 1 && m.jufc == 0 && m.intbin == 1 && m.fbin == 1
         && m.back == 0;
 
+    /* 7) a counted `for` compiles to the fused register loop: an initial
+     * JumpUnlessIntCmp + a ForLoopStep back-edge (NOT a separate IntBin
+     * increment + Jump), plus the native body IntBin. */
+    VmOpCounts g;
+    if (!codegen_counts({
+            "var s = 0;",
+            "for (var i = 0; i < 10; i++) s += i*i;",
+        }, g))
+        return false;
+    const bool for_ok =
+        g.flstep == 1 && g.juic == 1 && g.intbin >= 1
+        && g.back == 0 && g.jmp == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
-        && float_ok && mixed_ok;
+        && float_ok && mixed_ok && for_ok;
 }
 
 static const std::vector<extra_check> extra_checks =

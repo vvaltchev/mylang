@@ -2857,9 +2857,9 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: Phase 2 landed** (register machine over frame slots — a resolved-local
-int loop runs native, no fallback; `01_while_loop` ~2x faster under `-vm`).
-Gated by the
+**Status: Phase 2 landed** (register machine over frame slots — resolved-local
+int/float/mixed `while` and counted `for` loops run native, no fallback; **suite
+geomean 0.89x, VM ~11% faster than the tree-walker**). Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
@@ -2892,16 +2892,20 @@ compare and whose body is int assignments (compound `s += i*i`, plain
 `x = a*b+1`, `++`/`--`) compiles with **no tree-walker fallback**; **nested
 expressions** use scratch temp slots (`compile_int_expr` + a temp register
 allocator above the resolved locals; `Chunk::n_temps` grows the frame). Anything
-else (float, a bare/bool leaf plain-assign, a global/capture operand, a call)
-falls back to Phase 1. **Bool-safety:** a plain assign's rhs must be
-`definitely_int` (arith/neg/int-literal, never a leaf id or comparison — both
-can be bool), since writing an int into a bool slot would corrupt it. **Float**
-loops compile too (`FloatBin`/`JumpUnlessFloatCmp`, operands promote; a pure-int
-or pure-float loop goes native, a mixed one falls back). This is where the VM
-*wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop −71%
-instructions (cachegrind). The register choice (over a stack machine, which the
-already-M8-optimized tree-walker would beat) is also the right IR for the
-eventual native x86-64 codegen. Full roadmap + phase order:
+else (a bare/bool leaf plain-assign, a global/capture operand, a call) falls
+back to Phase 1. **Bool-safety:** a plain assign's rhs must be `definitely_int`
+(arith/neg/int-literal, never a leaf id or comparison — both can be bool), since
+writing an int into a bool slot would corrupt it. **Float** loops compile too
+(`FloatBin`/`JumpUnlessFloatCmp`, operands promote), as do **mixed** int/float
+loops (each condition/statement dispatched by its own kind) and **counted `for`
+loops** — the last via a **fused `ForLoopStep`** superinstruction (`i += step` +
+test + branch in one dispatch, matching the tree-walker's raw-C `ForRangeStmt`
+counter; a naive 3-op encoding regressed +28%, the fused op wins). This is where
+the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
+−71%, `03_int_arith` (top-level `for`) −72% instructions — **suite geomean
+0.89x, VM ~11% faster than the tree-walker.** The register choice (over a stack
+machine, which the already-M8-optimized tree-walker would beat) is also the
+right IR for the eventual native x86-64 codegen. Full roadmap + phase order:
 `plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)
