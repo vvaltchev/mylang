@@ -362,6 +362,20 @@ Scope *Inferencer::new_scope(Scope *parent)
 
 TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc)
 {
+    /*
+     * `_` is RESERVED as the destructuring / foreach placeholder - it may only
+     * appear in a binding position that is skipped (an IdList target or a
+     * foreach loop var, both of which never reach here). Every readable
+     * declaration of a name funnels through new_sym (a single var/const, a
+     * param, a catch var, a function), so this one guard reserves `_`
+     * everywhere it would otherwise become a real, readable name. (A struct
+     * FIELD / dict key `_` is a member, not a scope sym, so it stays allowed.)
+     */
+    if (name->val == "_")
+        throw SyntaxErrorEx(loc,
+            "'_' is reserved as the destructuring/foreach placeholder and "
+            "cannot be used as a variable, parameter, or function name");
+
     all_syms.push_back(std::make_unique<TypeSym>());
     TypeSym *sym = all_syms.back().get();
     sym->name = name;

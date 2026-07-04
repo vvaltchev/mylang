@@ -2011,9 +2011,15 @@ sanitizers never reproduced it.)
   (`handle_single_expr14`'s `IdList` loop, `bind_loop_var`) and the two declare
   paths (resolver `declare_lvalue` IdList + the foreach loop, inferencer
   `declare_target` IdList + the walk_struct foreach — which also skips its
-  no-`var` shadow check for `_`). A `_` in a **single** `var _ = ...` or a
-  **parameter** is a normal name (only destructuring/foreach positions treat it
-  specially).
+  no-`var` shadow check for `_`). **`_` is RESERVED** — it may ONLY appear in a
+  skipped placeholder position: a readable declaration of it (a single `var`/
+  `const`, a parameter, a `catch` var, a function name) is a compile
+  `SyntaxErrorEx`, enforced by ONE guard in the inferencer's `new_sym` (every
+  such name funnels through it, while the destructuring/foreach `_` is skipped
+  *before* reaching it — so the guard reserves `_` without touching the
+  placeholder). It runs for script + REPL + `-nti` (the structural pass). A `_`
+  **struct field** or **dict key** is still allowed (a member/key accessed via
+  `.`/`[]`, not a bare readable identifier).
 - **`++` / `--` (`IncDecExpr`, `syntax.h`)** — C-style pre/postfix increment and
   decrement, **int/float only**. `IncDecExpr::do_eval` evaluates the operand
   exactly ONCE via two paths: when the inferencer proved it int/float (`th` is

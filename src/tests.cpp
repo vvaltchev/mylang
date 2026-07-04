@@ -5336,6 +5336,32 @@ static const std::vector<test> tests =
     },
 
     {
+        /* `_` is RESERVED: it may NOT be a readable variable name. */
+        "Underscore cannot be a regular variable name",
+        {
+            "var _ = 3;",
+        },
+        &typeid(SyntaxErrorEx),
+    },
+
+    {
+        "Underscore cannot be a parameter name",
+        {
+            "func f(_) { return 1; }",
+            "print(f(9));",
+        },
+        &typeid(SyntaxErrorEx),
+    },
+
+    {
+        "Underscore cannot be a function name",
+        {
+            "func _() { return 1; }",
+        },
+        &typeid(SyntaxErrorEx),
+    },
+
+    {
         "Decl multi-id assignments with re-defines",
         {
             "var a = 3;",

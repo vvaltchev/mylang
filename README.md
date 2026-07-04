@@ -1031,7 +1031,9 @@ a few difference from `C` worth pointing out:
     `_` is never declared (so it may repeat — `var a, _, _, d = [1,2,3,4];` —
     and reading it is an error), but it still counts toward the strict arity
     above. It works the same in a `foreach` loop var (`foreach (k, _ in pairs)`,
-    or `foreach (_ in xs)` to iterate without a variable).
+    or `foreach (_ in xs)` to iterate without a variable). `_` is **reserved**
+    for this: using it as a regular variable, parameter, or function name is a
+    compile error.
 
   - To increase the value of multiple variables use the syntax:
     `a, b += [1, 2]`. In the extremely rare and complex cases when in the
