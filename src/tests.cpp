@@ -5319,6 +5319,31 @@ static const std::vector<test> tests =
     },
 
     {
+        /* multi-assign of a literal -> distributed to slots, array elided (the
+         * VM design-B path; the differential reruns this under -vm). */
+        "Multi-assign literal destructure in a loop",
+        {
+            "var a, b, c = 0;",
+            "var s = 0;",
+            "for (var i = 0; i < 5; i++) {",
+            "    a, b, c = [i, i + 1, i + 2];",
+            "    s += a + b + c;",
+            "}",
+            "assert(s == 45);",           /* sum (3i+3) for i=0..4 */
+        },
+    },
+
+    {
+        /* snapshot-first makes the distribute swap-safe */
+        "Multi-assign literal is swap-safe",
+        {
+            "var a, b = [1, 2];",
+            "a, b = [b, a];",
+            "assert(a == 2 && b == 1);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

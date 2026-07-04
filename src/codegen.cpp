@@ -770,6 +770,71 @@ struct Codegen {
      * leaf copy uses MoveV, an alias matching doAssign). Rolls back the const
      * pool on failure.
      */
+    /*
+     * Multi-assign destructure of an ARRAY LITERAL: `a, b, c = [e0, e1, e2]` ->
+     * compile each element into a snapshot temp, then distribute the snapshots
+     * to the target slots. This ELIMINATES the array entirely (no MakeArrayV
+     * heap alloc per iteration - the real win over building-then-unpacking) and
+     * is box-free for int/float elements. Snapshot-FIRST (all elements compiled
+     * before any target write) makes it swap-safe (`a, b = [b, a]`), matching
+     * the tree-walker (build array, then bind each). Returns false (-> the
+     * statement stays an EvalStmt, i.e. the tree-walker's strict
+     * handle_single_expr14) unless: the rvalue is a LiteralArray of EXACTLY the
+     * target count (an arity mismatch stays a runtime strict error via the
+     * fallback), and every target is a real (non-`_`), resolved-local,
+     * non-const identifier with no type-coercion. So a scalar-spread (`a,b=0`),
+     * a
+     * `_` placeholder, a non-literal array (`a,b = f()`), and a const/typed
+     * target all fall back - byte-identical under the differential.
+     */
+    bool try_multi_literal_store(const Expr14 *e, const IdList *il,
+                                 std::vector<Instr> &ops)
+    {
+        const LiteralArray *la =
+            dynamic_cast<const LiteralArray *>(e->rvalue.get());
+        if (!la)
+            return false;
+        const int n = static_cast<int>(il->elems.size());
+        if (n == 0 || static_cast<int>(la->elems.size()) != n)
+            return false;
+        for (const auto &t : il->elems) {
+            if (t->is_underscore() || t->sym.kind != SymKind::local
+                || t->is_const
+                || (t->decl_type != DeclType::none
+                    && t->decl_type != DeclType::dyn))
+                return false;
+        }
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        const int snap_base = next_temp;
+        next_temp += n;
+        if (next_temp > max_temp)
+            max_temp = next_temp;
+
+        for (int i = 0; i < n; i++) {
+            if (!compile_to_run_slot(la->elems[i].get(), snap_base + i, ops)) {
+                ops.resize(omark);
+                next_temp = save_top;
+                chunk.consts.resize(cmark);
+                return false;
+            }
+        }
+        /* distribute: every snapshot is now computed, so the writes are
+         * simultaneous (swap-safe). */
+        for (int i = 0; i < n; i++) {
+            Instr mv;
+            mv.op = OpCode::MoveV;
+            mv.node = e;
+            mv.target = il->elems[i]->sym.slot;
+            mv.target2 = snap_base + i;
+            ops.push_back(mv);
+        }
+        next_temp = save_top;   /* free the snapshot run */
+        return true;
+    }
+
     bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
     {
         const Expr14 *e = dynamic_cast<const Expr14 *>(s);
@@ -779,6 +844,14 @@ struct Codegen {
         const Op cbase = compound_base_op(e->op);   /* `+=` -> plus, else inv */
         if (!is_assign && cbase == Op::invalid)
             return false;
+
+        /* Multi-assign `a, b, .. = <array literal>` -> distribute elements to
+         * the target slots (no array). Any non-qualifying shape falls back. */
+        if (is_assign) {
+            if (const IdList *il =
+                    dynamic_cast<const IdList *>(e->lvalue.get()))
+                return try_multi_literal_store(e, il, ops);
+        }
         const Identifier *lv =
             dynamic_cast<const Identifier *>(e->lvalue.get());
         if (!lv || lv->sym.kind != SymKind::local)

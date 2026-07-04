@@ -2956,7 +2956,20 @@ even/value at odd), and the op builds via the shared **`build_dict_from_pairs`**
 (which freezes each key). Both share **`compile_to_run_slot`** (factored out of
 `emit_args_range`) to place each element in its run slot. Dict-literal loops
 (`25_dict_member` 0.63x, `62_dict_word_count` 0.69x vs the tree-walker) go
-native. A
+native. A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
+e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
+**`try_multi_literal_store`** (codegen) NOT by building the array and unpacking,
+but by compiling each element into a snapshot temp and **distributing** the
+snapshots to the target slots — **eliminating the array alloc entirely** (the
+real win; box-free for int/float elements). Snapshot-FIRST makes it swap-safe
+(`a, b = [b, a]`), matching the tree-walker's build-then-bind. Only when the
+rvalue is a `LiteralArray` of EXACTLY the target count and every target is a
+real (non-`_`), resolved-local, non-const, non-coerced identifier; a scalar
+spread (`a,b = 0`), a `_` placeholder, an arity mismatch (a runtime strict
+error), a non-literal array (`a,b = f()`), or a typed/const target all fall back
+to the strict `handle_single_expr14` `EvalStmt` (byte-identical under the
+differential). **Effect: `22_multi_assign` 0.89x → 0.18x** (the per-iteration
+array alloc was the whole cost). A
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
 sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)
