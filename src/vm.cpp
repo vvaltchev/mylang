@@ -431,6 +431,31 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::LoadElemValue: {
+
+            /* a[i] (an array-valued element of a GENERAL array) into a temp
+             * slot, so a 2-D read `a[i][k]` is native (both indices). A
+             * non-array / non-general base falls back to the node. */
+            const EvalValue &base = ctx.frame->slots[in.target2].get();
+            if (base.is<SharedArrayObj>()) {
+                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+                if (arr.skind() == SharedArrayObj::Storage::general) {
+                    int_type idx = read_int_operand(in.a, &ctx);
+                    if (idx < 0)
+                        idx += arr.size();
+                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                        throw OutOfBoundsEx(in.node->start, in.node->end);
+                    ctx.frame->slots[in.target].put(
+                        arr.get_vec()[arr.offset() + idx].get());
+                    pc++;
+                    break;
+                }
+            }
+            ctx.frame->slots[in.target].put(RValue(in.node->eval(&ctx)));
+            pc++;
+            break;
+        }
+
         case OpCode::StoreElemInt: {
 
             /* a[i] = v / a[i] OP= v for a flat mutable int array (mirrors the

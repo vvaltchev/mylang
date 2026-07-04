@@ -104,6 +104,19 @@ enum class OpCode : unsigned char {
     LoadElemFloat,
 
     /*
+     * Native array-VALUE-element read `a[i]` into a temp slot (Phase 5, for a
+     * nested subscript `a[i][j]`): `target2` = the (general) array slot, `a` =
+     * the int index, `target` = the dst temp; `node` = the Subscript. Reads the
+     * i-th element VALUE (itself an array, since `a` is array<array<..>> - a
+     * GENERAL array) straight from the element vector into the temp, so the
+     * outer `a[i]` of a 2-D read is native; the temp is then the array slot of
+     * an inner LoadElem/etc. A non-array / non-general base falls back to
+     * `node->eval`. READ path only - a 2-D *write* through a temp would COW the
+     * temp and not write back, so those stay fallback.
+     */
+    LoadElemValue,
+
+    /*
      * Native array-element store `a[i] = v` / `a[i] OP= v` (Phase 5): `target2`
      * = the array slot, `a` = the int index operand, `b` = the value operand,
      * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith

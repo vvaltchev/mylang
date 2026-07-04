@@ -160,6 +160,38 @@ struct Codegen {
      * IntBin(s) into temp slots. Returns false for a non-int expression (a
      * comparison, a call, a subscript, ...) so the enclosing loop falls back.
      */
+    /*
+     * The ARRAY base of a subscript as a slot holding the array: a bare local
+     * slot directly, or a nested `a[i]` loaded into a temp via LoadElemValue (a
+     * native general-array element read), so a 2-D read `a[i][j]` lowers with
+     * both indices native. READ path only - a 2-D WRITE via a temp would COW
+     * the temp and never write back, so store codegen keeps as_array_slot.
+     */
+    bool compile_array_base(const Construct *e, int &out_slot,
+                            std::vector<Instr> &ops)
+    {
+        if (as_array_slot(e, out_slot))
+            return true;
+        const Subscript *sub = dynamic_cast<const Subscript *>(e);
+        if (!sub || !sub->base_array)
+            return false;
+        int inner;
+        Operand idx;
+        if (!compile_array_base(sub->what.get(), inner, ops)
+            || !compile_int_expr(sub->index.get(), idx, ops))
+            return false;
+        const int t = alloc_temp();
+        Instr in;
+        in.op = OpCode::LoadElemValue;
+        in.node = e;
+        in.target = t;
+        in.target2 = inner;
+        in.a = idx;
+        ops.push_back(in);
+        out_slot = t;
+        return true;
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<Instr> &ops)
     {
@@ -167,13 +199,14 @@ struct Codegen {
             return true;
 
         /* Array element read `a[i]` -> LoadElemInt into a temp (arrays only; a
-         * dict subscript stays fallback - see Subscript::base_array). */
+         * dict subscript stays fallback - see Subscript::base_array). A nested
+         * base `a[i][k]` loads `a[i]` via compile_array_base first. */
         if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
             if (e->th != TypeHint::i || !sub->base_array)
                 return false;
             int aslot;
             Operand idx;
-            if (!as_array_slot(sub->what.get(), aslot)
+            if (!compile_array_base(sub->what.get(), aslot, ops)
                 || !compile_int_expr(sub->index.get(), idx, ops))
                 return false;
             const int tt = alloc_temp();
@@ -386,7 +419,7 @@ struct Codegen {
                 return false;
             int aslot;
             Operand idx;
-            if (!as_array_slot(sub->what.get(), aslot)
+            if (!compile_array_base(sub->what.get(), aslot, ops)
                 || !compile_int_expr(sub->index.get(), idx, ops))
                 return false;
             const int tt = alloc_temp();

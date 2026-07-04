@@ -436,8 +436,25 @@ behind the differential harness:
   unlock `46_matrix_mult` (an earlier note was wrong): matrix uses **2D**
   `a[i][k]` whose base `a[i]` isn't a bare local slot, so it needs
   nested-subscript-base support (next), not the compound store.
-- **nested-subscript base `a[i][j]` / a slice or field base** (`as_array_slot`
-  only accepts a bare local slot today) - unlocks `46_matrix_mult`;
+- **2-D array READ `a[i][j]` — DONE** (correctness/completeness, NOT a bench
+  mover). `compile_array_base` loads the outer `a[i]` (an array-valued element
+  of the GENERAL array `a`) into a temp via a new `LoadElemValue` op - a native
+  general-element read - then the inner `[j]` is an ordinary `LoadElem` on the
+  temp; recurses for 3-D+. Both indices native. READ path only: a 2-D WRITE
+  through a temp would COW the temp and never write back, so `a[i][j]=v` stays a
+  fallback (store codegen keeps `as_array_slot`). Verified 2-D/3-D sum, matrix
+  mult, in-func, float, OOB, 2-D-write fallback. **Did NOT speed up
+  `46_matrix_mult`** (+0.0%): its OUTER i-loop falls back on `var row =
+  array(n,0)` + `c[i] = row` (array-valued statements, not scalar), so the whole
+  nest tree-walks and the native 2-D reads inside never fire. A plain 2-D sum
+  (no array building) DOES go native. 1303/1303 + 1155/1155.
+- **the real plateau:** the register machine has the scalar-loop wins (0.82x);
+  the array/dict-heavy benchmarks now fall back for STRUCTURAL reasons that
+  element-access ops don't fix - native array CREATION (`array(n,0)`, `[]`) +
+  general-element stores (to make array-building loops like matrix/sieve-setup
+  native), and native BUILTIN dispatch (append/sort/keys/map/... - the
+  DirectBuiltinCallExpr analogue). These are the next real movers; both are
+  bigger than a single opcode.
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct
