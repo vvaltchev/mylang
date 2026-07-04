@@ -1312,7 +1312,12 @@ decisions behind it: `plans/type-inference.md`,
   `TypeMismatchEx` (type change / bad operator / wrong arg type / not callable),
   `NullabilityEx` (`none`/`opt` used where a non-opt value is required),
   `WrongArgCountEx` (arity), `DynRequiredEx` (the mandatory-`dyn` rule below),
-  `OptRequiredEx` (the mandatory-`opt` rule for params, below).
+  `OptRequiredEx` (the mandatory-`opt` rule for params, below), `ShadowingEx`
+  (a `foreach` loop var written WITHOUT `var` that would shadow an outer
+  variable — `ForeachStmt::implicit_var`, checked in the inferencer's structural
+  pass via `lookup` of the enclosing scope; `var` is now OPTIONAL in a `foreach`
+  header and always DECLARES a fresh loop-scoped var — the old bare-name
+  reuse-an-existing-var path is gone — so `idsVarDecl` is set for both forms).
   Each carries an interned custom message + a `Loc`.
 - **Mandatory `dyn`** (`enforce_concrete_decls`, ON by default via
   `infer_types(strict=true)`, off under `-nti`): a plain `var`/`const` must

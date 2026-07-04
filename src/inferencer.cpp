@@ -1816,13 +1816,21 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         walk_struct(fe->container.get(), s);
         if (fe->ids)
             for (auto &id : fe->ids->elems) {
-                if (fe->idsVarDecl) {
-                    TypeSym *sym = new_sym(id->uid, inner, id->start);
-                    sym->is_loopvar = true;   /* type derived from container */
-                    id_sym[id.get()] = sym;
-                } else {
-                    id_sym[id.get()] = lookup(s, id->uid);
-                }
+                /* A loop var written WITHOUT `var` may not shadow a variable
+                 * visible outside the loop (a subtle-bug guard) - it is looked
+                 * up in the ENCLOSING scope `s` (the fresh loop scope `inner`
+                 * is still empty), and if found the loop is rejected; write
+                 * `var` to shadow on purpose. */
+                if (fe->implicit_var && lookup(s, id->uid))
+                    throw ShadowingEx(
+                        intern_msg("foreach variable '" +
+                            std::string(id->uid->val) + "' shadows a variable "
+                            "visible here; write 'var " +
+                            std::string(id->uid->val) + "' to shadow it"),
+                        id->start, id->end);
+                TypeSym *sym = new_sym(id->uid, inner, id->start);
+                sym->is_loopvar = true;   /* type derived from container */
+                id_sym[id.get()] = sym;
             }
         walk_struct(fe->body.get(), inner);
         return;

@@ -1514,6 +1514,12 @@ public:
     unique_ptr<Construct> container;
     unique_ptr<Construct> body;
     bool idsVarDecl;
+    /* The loop var(s) were written WITHOUT `var` (`foreach (x in a)`). They
+     * still DECLARE fresh loop-scoped vars (idsVarDecl is set for them too),
+     * but the inferencer rejects the loop if a same-named variable is visible
+     * outside the loop - omitting `var` may not silently shadow; write `var x`
+     * to shadow on purpose. */
+    bool implicit_var = false;
     bool indexed;
     /* VM native-foreach hint (set by the inferencer's annotate_hints ONLY for
      * the sound case: a single, non-indexed loop var over a flat array<int> /
@@ -1538,6 +1544,7 @@ public:
         c->container = clone_as(container);
         c->body = clone_as(body);
         c->idsVarDecl = idsVarDecl;
+        c->implicit_var = implicit_var;
         c->indexed = indexed;
         c->elem_th = elem_th;
         c->container_is_array = container_is_array;

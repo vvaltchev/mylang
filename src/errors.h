@@ -236,6 +236,14 @@ struct OptRequiredEx : public Exception {
         : Exception("OptRequiredEx", m, start, end) { }
 };
 
+/* A `foreach (x in ...)` (no `var`) whose loop var would shadow a variable
+ * visible outside the loop - omitting `var` may not silently shadow. */
+struct ShadowingEx : public Exception {
+    ShadowingEx(const char *m = "Loop variable shadows an outer variable",
+                Loc start = Loc(), Loc end = Loc())
+        : Exception("ShadowingEx", m, start, end) { }
+};
+
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")

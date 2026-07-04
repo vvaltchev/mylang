@@ -5380,14 +5380,36 @@ static const std::vector<test> tests =
     },
 
     {
-        "Foreach with extern variable",
+        /* `var` is optional in foreach: no `var` declares a fresh loop var. */
+        "Foreach optional var: no `var` declares a fresh loop var",
         {
-            "var e = 0;",   /* non-null: used in comparisons below */
+            "var s = 0;",
             "foreach (e in [1,2,3,4,5]) {",
             "   if (e == 3) continue;",
             "   if (e >= 4) break;",
+            "   s += e;",
             "}",
-            "assert(e == 4);",
+            "assert(s == 3);",   /* 1 + 2 (3 skipped, 4 breaks) */
+        },
+    },
+
+    {
+        /* ... but a no-`var` loop var may NOT shadow an outer variable - that
+         * is a compile error; write `var e` to shadow on purpose. */
+        "Foreach no-var may not shadow an outer variable",
+        {
+            "var e = 0;",
+            "foreach (e in [1,2,3]) { }",
+        },
+        &typeid(ShadowingEx),
+    },
+
+    {
+        "Foreach explicit `var` MAY shadow an outer variable",
+        {
+            "var e = 42;",
+            "foreach (var e in [1,2,3]) { }",
+            "assert(e == 42);",   /* outer e untouched (inner is loop-scoped) */
         },
     },
 

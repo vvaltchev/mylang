@@ -1055,6 +1055,26 @@ foreach (var k, v in d) {
 
 To iterate only through each key, just use `var k in d` instead.
 
+#### Optional `var`
+
+The `var` keyword is **optional** in a `foreach` header: `foreach (e in arr)`
+declares a fresh, loop-scoped variable `e` exactly like `foreach (var e in arr)`
+does. To prevent a subtle class of bugs, omitting `var` is **not allowed to
+shadow** a variable already visible outside the loop — if such a variable
+exists, the loop is a compile error. Write `var` explicitly to shadow on
+purpose.
+
+```C#
+foreach (e in arr) { ... }        # OK: declares a fresh loop-scoped `e`
+
+var e = 3;
+foreach (e in arr) { ... }        # compile error: `e` would shadow the outer e
+foreach (var e in arr) { ... }    # OK: `var` shadows intentionally
+```
+
+(Note: this differs from a previous behavior where a bare name reused an
+existing variable. A `foreach` loop variable is now always a fresh declaration.)
+
 #### Extra features: the "indexed" keyword
 
 `MyLang` supports enumeration in foreach loops as well. Check the following

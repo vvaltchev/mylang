@@ -2946,8 +2946,13 @@ pAcceptForeachStmt(ParseContext &c,
 
     pExpectOp(c, Op::parenL);
 
-    if (pAcceptKeyword(c, Keyword::kw_var))
-        stmt->idsVarDecl = true;
+    /* `var` is OPTIONAL: with or without it the loop var(s) are DECLARED
+     * (fresh, loop-scoped). Omitting `var` additionally forbids shadowing a
+     * variable visible outside the loop (enforced by the inferencer) - to
+     * shadow on purpose, write `var`. */
+    stmt->idsVarDecl = true;
+    if (!pAcceptKeyword(c, Keyword::kw_var))
+        stmt->implicit_var = true;
 
     stmt->ids = pList<IdList>(c, fl, pIdentifier);
 
