@@ -488,6 +488,26 @@ behind the differential harness:
   discipline that caught the AST optimizer bugs once we dumped the tree).
   Step-1 scope: main chunk + block-bodied functions reachable through
   Blocks/function bodies (a function nested in a loop/if body isn't walked yet).
+- **general (non-range) `for` loop — DONE (`-vd`-found "Gap A").** The `-vd`
+  audit of `44_primes_sqrt` (~1.00x) showed `is_prime`'s whole loop was ONE
+  `eval.stmt`: `gen_stmt` only lowered a `ForRangeStmt` (the counted `i<bound`
+  shape), so a general `for (init; cond; inc)` (e.g. `f*f <= n`) fell back
+  entirely - even though the equivalent `while` was already native.
+  `try_native_for` now lowers a general `ForStmt` to the WHILE form (`<init
+  once> Lstart: <cond> JmpUnlessCmp; <body>; <inc>; Jump Lstart`), reusing the
+  while machinery; wired into `gen_stmt` + `compile_scalar_body` (so a nested
+  general for is native too). A general-for micro is **−46.6%**. HONEST: geomean
+  UNCHANGED (0.75x) - the bench general-fors (`primes`, `sieve`) ALSO have an
+  early `return`/`break` (Gap B) or are already range-fors, so none benefit yet;
+  Gap A is the prerequisite, Gap B unlocks them. break/continue/return in the
+  body still fall the loop back (correct). 1304/1304 + 1155/1155.
+- **loop flow: native `return`/`break`/`continue` ("Gap B", the -vd-found
+  blocker for `primes`/`is_prime`).** A `return`/`break`/`continue` in a loop
+  body forces the WHOLE loop to fall back today (not flow-free). Handling them
+  natively - a native loop that checks/propagates `flow`, or a `ret` opcode -
+  unlocks the early-return-loop class AND is the on-ramp to killing C++
+  exceptions (see `[[vm-endgame]]`): once flow is a VM-level branch, there is no
+  C++ throw for control flow and no fallback.
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct

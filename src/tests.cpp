@@ -10721,11 +10721,25 @@ static bool vm_codegen_shapes()
     const bool array_build_ok =
         ab.flstep == 1 && ab.intbin >= 1 && ab.evalstmt >= 1 && ab.jif == 0;
 
+    /* 16) a GENERAL (non-range) `for` whose cond isn't the counted `i<bound`
+     * shape (`f*f <= 100`) still compiles native, lowered to the while form: a
+     * cond compare (JumpUnlessIntCmp), the body + inc IntBins, and a Jump back
+     * - NOT a ForLoopStep (it isn't a counted loop), no fallback. */
+    VmOpCounts gf;
+    if (!codegen_counts({
+            "var s = 0;",
+            "for (var f = 2; f*f <= 100; f++) s += f;",
+        }, gf))
+        return false;
+    const bool general_for_ok =
+        gf.juic == 1 && gf.intbin >= 3 && gf.jmp >= 1 && gf.flstep == 0
+        && gf.jif == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
         && nested_native_ok && compound_store_ok && read_2d_ok
-        && builtin_dispatch_ok && array_build_ok;
+        && builtin_dispatch_ok && array_build_ok && general_for_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

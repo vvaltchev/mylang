@@ -695,6 +695,11 @@ struct Codegen {
                     any_native = true;
                     continue;
                 }
+            } else if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
+                if (try_native_for(fs)) {
+                    any_native = true;
+                    continue;
+                }
             }
 
             /* Flow-free fallback: an assignment/decl (Expr14) or a call
@@ -883,6 +888,75 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * A general `for (init; cond; inc) body` that specialize_types did NOT turn
+     * into a ForRangeStmt (its cond isn't the counted `i </<= bound` shape -
+     * e.g. `f*f <= n`) -> native register ops, lowered to the WHILE form:
+     *   <init once>  Lstart: <cond> JmpUnlessCmp -> Lend ; <body> ; <inc> ;
+     *   Jump Lstart ; Lend:
+     * The cond re-runs each iteration; the inc runs after the body. Fires when
+     * the cond is an int/float comparison, the body compiles (scalar / nested /
+     * flow-free EvalStmt - the any_native gate applies), and the inc is a
+     * compilable scalar statement. Self-truncating. The loop var must be a
+     * frame slot (so running init/inc in place is sound, no child scope) - the
+     * operand compilers enforce that. A break/continue/return in the body isn't
+     * flow-free, so the whole loop falls back (correct).
+     */
+    bool try_native_for(const ForStmt *f)
+    {
+        if (!f->cond)
+            return false;   /* no cond (infinite loop) -> fall back */
+
+        const size_t start = chunk.code.size();
+
+        if (f->init)
+            emit(OpCode::EvalStmt, f->init.get());   /* declare the var, once */
+
+        const int lstart = here();
+
+        Operand ca, cb;
+        Op cmp;
+        OpCode cmp_opcode;
+        const size_t cmark = chunk.code.size();
+        reset_temps();
+        if (compile_int_cond(f->cond.get(), chunk.code, ca, cmp, cb)) {
+            cmp_opcode = OpCode::JumpUnlessIntCmp;
+        } else {
+            chunk.code.resize(cmark);
+            reset_temps();
+            if (!compile_float_cond(f->cond.get(), chunk.code, ca, cmp, cb)) {
+                chunk.code.resize(start);
+                return false;
+            }
+            cmp_opcode = OpCode::JumpUnlessFloatCmp;
+        }
+
+        const size_t jt = emit_cmp(cmp_opcode, f->cond.get(), cmp, ca, cb);
+
+        if (!compile_scalar_body(body_stmts(f->body.get()))) {
+            chunk.code.resize(start);
+            return false;
+        }
+
+        /* The increment, each iteration after the body (int or float). */
+        if (f->inc) {
+            reset_temps();
+            const size_t imark = chunk.code.size();
+            if (!compile_int_stmt(f->inc.get(), chunk.code)) {
+                chunk.code.resize(imark);
+                reset_temps();
+                if (!compile_float_stmt(f->inc.get(), chunk.code)) {
+                    chunk.code.resize(start);
+                    return false;
+                }
+            }
+        }
+
+        emit(OpCode::Jump, nullptr, lstart);
+        chunk.code[jt].target = here();             /* Lend */
+        return true;
+    }
+
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
     {
         for (const auto &e : elems)
@@ -902,6 +976,11 @@ struct Codegen {
         if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
             if (!try_native_for_range(fr))     /* else the counted loop falls */
                 emit(OpCode::EvalStmt, s);      /* back to the tree-walker */
+            return;
+        }
+        if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
+            if (!try_native_for(fs))           /* general (non-range) for */
+                emit(OpCode::EvalStmt, s);
             return;
         }
         emit(OpCode::EvalStmt, s);
