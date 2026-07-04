@@ -3077,7 +3077,13 @@ writing an int into a bool slot would corrupt it. **Float** loops compile too
 loops (each condition/statement dispatched by its own kind) and **counted `for`
 loops** — the last via a **fused `ForLoopStep`** superinstruction (`i += step` +
 test + branch in one dispatch, matching the tree-walker's raw-C `ForRangeStmt`
-counter; a naive 3-op encoding regressed +28%, the fused op wins). This is where
+counter; a naive 3-op encoding regressed +28%, the fused op wins). A counted
+loop's **bound may be non-trivial** — `for (i; i < len(s); i++)`, `i < f()` —
+not just a slot/immediate: `try_native_for_range` compiles such a bound once
+a reserved temp (the for-range specializer proved it loop-immutable) that
+`ForLoopStep` re-reads each iteration, so a `len()`-bounded counted loop (and
+nested forms) goes native instead of falling back — e.g. `30_str_index_iterate`
+1.03x→0.80x vs the tree-walker. This is where
 the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
 −71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** runs these
 loops inside **function bodies** too: `do_func_call` is hooked to run a callee's

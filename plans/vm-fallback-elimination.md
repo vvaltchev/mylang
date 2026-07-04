@@ -22,7 +22,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | **F3** | foreach UNPACK `x,y in pairs` | 20 | — | strict done; native todo |
 | ~~D3~~ | dict `foreach(k,v in d)` | 26,47,62 | — | ✅ live iterator 62:.64 |
 | ~~G~~ | ~~general array store~~ | 5 | ~~P4~~ | ✅ 32:.67 20:.62 |
-| **S** | string element `s[i]`, build | 29,30,31,32 | P7 | todo |
+| ~~S~~ | string element `s[i]`, build | 29,30,31 | — | ✅ native; 30 len-bound |
 | ~~M~~ | multi-assign literal `a,b=[..]` | 22 | — | ✅ array-elide 0.89→0.18 |
 | ~~C~~ | ~~closure/indirect call `c()`~~ | 11 | — | ✅ CallValueV 1.09→1.00 |
 | **R** | call-in-global-assign `r=f(n)+9` | 10 | P10b | todo |

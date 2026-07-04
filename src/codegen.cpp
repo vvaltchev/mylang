@@ -2275,17 +2275,37 @@ struct Codegen {
      */
     bool try_native_for_range(const ForRangeStmt *f)
     {
-        Operand bound, step;
-        if (!as_int_operand(f->bound.get(), bound))
-            return false;
-        if (f->step) {
-            if (!as_int_operand(f->step.get(), step))
+        const size_t start = chunk.code.size();
+        const int saved_base = temp_base;
+
+        /* The bound + step are loop-immutable (the for-range specializer proved
+         * it), so evaluate ONCE. A simple int operand (a slot or immediate) is
+         * used directly; a non-trivial bound - `len(s)`/`f()`/an arith chain -
+         * compiles into a temp reserved for the whole loop, which ForLoopStep
+         * re-reads each iteration (its value is fixed). This is what lets a
+         * `for (i; i < len(x); i++)` counted loop go native instead of falling
+         * back to node->eval. */
+        Operand bound;
+        if (!as_int_operand(f->bound.get(), bound)) {
+            reset_temps();
+            int bslot;
+            if (!compile_boxed_expr(f->bound.get(), bslot, chunk.code)) {
+                chunk.code.resize(start);
                 return false;
+            }
+            bound = slot_op(bslot);
+            temp_base = next_temp;   /* reserve the bound temp */
+        }
+        Operand step;
+        if (f->step) {
+            if (!as_int_operand(f->step.get(), step)) {
+                chunk.code.resize(start);
+                temp_base = saved_base;
+                return false;
+            }
         } else {
             step = int_lit(1);
         }
-
-        const size_t start = chunk.code.size();
 
         emit_init(f->init.get());                   /* `var i = start`, once */
 
@@ -2300,6 +2320,7 @@ struct Codegen {
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
             loops.pop_back();
             chunk.code.resize(start);
+            temp_base = saved_base;
             return false;
         }
 
@@ -2319,6 +2340,7 @@ struct Codegen {
         const int lend = here();
         chunk.code[jt].target = lend;
         pop_loop(lend, lcont);
+        temp_base = saved_base;
         return true;
     }
 

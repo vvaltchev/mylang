@@ -5377,6 +5377,18 @@ static const std::vector<test> tests =
     },
 
     {
+        /* a counted loop with a NON-TRIVIAL bound (len(s)) goes native: the VM
+         * caches the bound once, like the tree-walker's ForRangeStmt. */
+        "For-range with a len() bound",
+        {
+            "var s = \"hello\";",
+            "var t = 0;",
+            "for (var i = 0; i < len(s); i++) t += ord(s[i]);",
+            "assert(t == 532);",          /* 104+101+108+108+111 */
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {
