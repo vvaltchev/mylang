@@ -26,6 +26,7 @@
 #include "analyzer.h"
 #include "vm.h"
 #include "codegen.h"
+#include "disasm.h"
 
 #include <typeinfo>
 #include <vector>
@@ -10727,10 +10728,47 @@ static bool vm_codegen_shapes()
         && builtin_dispatch_ok && array_build_ok;
 }
 
+/* The bytecode disassembler (-vd) renders a native int loop as smart assembly:
+ * the fused for.step counter, the register i.bin ops, the fused compare/branch,
+ * and a fallback eval.stmt (the still-embedded Construct*, here `print(s)`). */
+static bool vm_disasm_shape()
+{
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : { "var s = 0;",
+                           "for (var i = 0; i < 10; i++) s += i*i;",
+                           "print(s);" }) {
+        if (!src.empty())
+            src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (!b)
+            return false;
+        const std::string d = disassemble(codegen_program(b), "main");
+        return d.find("for.step") != std::string::npos
+            && d.find("i.bin") != std::string::npos
+            && d.find("i.jmp.ncmp") != std::string::npos
+            && d.find("eval.stmt") != std::string::npos  /* print fallback */
+            && d.find("halt") != std::string::npos;
+    } catch (...) {
+        return false;
+    }
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
+    { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },
     { "analyze: counted `for` is greened, float-var `for` is not",
       analyze_greens_counted_for },

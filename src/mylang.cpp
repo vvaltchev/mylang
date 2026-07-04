@@ -13,6 +13,7 @@
 #include "errfmt.h"
 #include "trace.h"
 #include "vm.h"
+#include "disasm.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -37,6 +38,7 @@ static bool opt_analyze;
 static bool opt_no_color;
 static bool opt_repl;
 static bool opt_vm;   /* execute via the bytecode VM instead of the tree-walker */
+static bool opt_vm_disasm;   /* -vd: print the bytecode disassembly, no run */
 
 static std::vector<string> lines;
 static std::vector<Tok> tokens;
@@ -75,6 +77,7 @@ void help()
     cout << "  -vm      Execute via the bytecode VM (experimental; default is"
          << endl;
     cout << "           the tree-walker). See plans/bytecode-vm.md" << endl;
+    cout << "  -vd      Dump the VM bytecode disassembly, then exit" << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
     cout << " --debug-ti  Dump inferred types of all identifiers, then exit"
          << endl;
@@ -216,6 +219,10 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-vm")) {
 
             opt_vm = true;   /* run via the bytecode VM (plans/bytecode-vm) */
+
+        } else if (!strcmp(arg, "-vd")) {
+
+            opt_vm_disasm = true;   /* dump the bytecode disassembly, no run */
 
         } else if (!strcmp(arg, "--debug-ti")) {
 
@@ -407,6 +414,14 @@ int main(int argc, char **argv)
                 cout << "--------------------------" << endl;
                 cout << *root << endl;
                 cout << "--------------------------" << endl;
+            }
+
+            /* -vd: dump the bytecode disassembly (the bytecode analogue of -s)
+             * and do NOT run. See disasm.{h,cpp}. */
+            if (opt_vm_disasm) {
+                cout << disassemble_program(
+                    static_cast<const Block *>(root.get()));
+                return 0;
             }
 
             /* Execution engine: the tree-walker by default, or the bytecode VM

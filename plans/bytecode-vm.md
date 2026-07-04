@@ -476,6 +476,18 @@ behind the differential harness:
   array-building statements are still EvalStmt (`Construct*`) - true native
   array CREATION (`array(n,0)`, `[]`) + general-element store OPS are later work
   toward the no-fallback end-goal.
+- **bytecode disassembler (`-vd`) — DONE** (`disasm.{h,cpp}`), the bytecode
+  analogue of `-s`: "smart assembly" (register slots `rN` - unbounded, they ARE
+  the frame slots - immediates `#N`, fused superinstructions like `for.step`).
+  A fallback op still carrying a `Construct*` (`eval.stmt`/`eval.slot`/
+  `jmp.if.not`/...) renders that node via the SHARED AST decompiler
+  (`render_construct_code`), so the constructs still embedded in the bytecode
+  are shown. This is the AUDIT TOOL for the no-fallback end-goal (see
+  `[[vm-endgame]]`): every `eval.stmt`/`eval.slot` row in a hot loop is a
+  `Construct*` still to erase; run it per bench to find wasted cycles (the same
+  discipline that caught the AST optimizer bugs once we dumped the tree).
+  Step-1 scope: main chunk + block-bodied functions reachable through
+  Blocks/function bodies (a function nested in a loop/if body isn't walked yet).
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct

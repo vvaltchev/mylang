@@ -125,6 +125,8 @@ Running scripts:
 ./build/mylang -nr FILE          # parse/validate only, don't run
 ./build/mylang -vm FILE          # execute via the bytecode VM (experimental;
                                  # default is the tree-walker) — bytecode-vm.md
+./build/mylang -vd FILE          # dump the VM bytecode disassembly (the
+                                 # bytecode analogue of -s), exit — disasm.h
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang --debug-ti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization
@@ -265,16 +267,17 @@ neutral (geomean 1.00x), as it must be.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-one
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
 `eval.cpp`, `types.cpp`, `statictype.cpp`, `trace.cpp`, `coderender.cpp`,
 `backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
-`repl.cpp`, `codegen.cpp`, `vm.cpp`, `mylang.cpp`, `tests.cpp` (six of them are
-the REPL — see "The interactive REPL" below; `trace.cpp` is the diagnostic
-tracer and `coderender.cpp` the optimized-AST "decompiler", both used by the
-REPL; `codegen.cpp`/`vm.cpp` are the bytecode-VM engine — see "Execution
-strategy" — added by the glob, nothing to register).
+`repl.cpp`, `codegen.cpp`, `vm.cpp`, `disasm.cpp`, `mylang.cpp`, `tests.cpp`
+(six of them are the REPL — see "The interactive REPL" below; `trace.cpp` is the
+diagnostic tracer and `coderender.cpp` the optimized-AST "decompiler", both used
+by the REPL; `codegen.cpp`/`vm.cpp` are the bytecode-VM engine and `disasm.cpp`
+its text disassembler (`-vd`) — see "Execution strategy" — added by the glob,
+nothing to register).
 
 - `mylang.cpp` — CLI entry point, arg parsing, the top-level `try/catch` that
   turns thrown
