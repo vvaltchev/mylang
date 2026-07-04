@@ -569,8 +569,16 @@ goes native; commit fa114a6); `LoadGlobalV` / `LoadCaptureV` / `LoadBuiltinV`
 (a boxed operand can be a global / captured / builtin value, mirroring
 Identifier::do_eval incl. the undefined-global throw; commit 3a93b93). (A boxed
 ARITH over a TypedScalarExpr operand, e.g. `var dyn d = i + j` with i/j int, is
-handled by emit_boxed_chain too.) **Still TODO in this tier:**
-subscript/member/call/make/foreach — see the op list below.
+handled by emit_boxed_chain too.); `SubscriptV` (a boxed `a[i]` READ - dict /
+general-array / string element via the runtime Type::subscript, RValue'd; nested
+`d[k1][k2]` works; commit 16f58da). **Still TODO in this tier:**
+- **member READ (`obj.f`, `d.k`)** — NEEDS a refactor first: extract the
+  value-read path of MemberExpr::do_eval (a 110-line function: struct field /
+  POD / const / struct-type const / dict key / optional-`?.`) into a shared
+  `member_read(base_value, MemberExpr*)`, so a `MemberV` op and the tree-walker
+  both use it (the LValue*/auto-vivify WRITE paths stay in do_eval). Deferred to
+  do carefully, not rushed — a slip breaks member reads AND writes.
+- then call / make-array/dict / foreach — see the op list below.
 
 The typed unboxed int/float register machine is only the fast tier. To satisfy
 the directive (never fall back, full `dyn` support, `Construct*`-free, machine-
