@@ -27,6 +27,11 @@ func dump_products() {
 
 func read_quantity(pnum) {
 
+    # Loop until a valid number is entered, then RETURN it once after the loop.
+    # (Returning inside a `while (true)` leaves the function's type as `float?`
+    # to the checker, since it can't prove the loop never falls through.)
+    var qty = 0.0;
+
     while (true) {
 
         write("How many " + products[pnum][0] + "? ");
@@ -34,7 +39,8 @@ func read_quantity(pnum) {
 
         try {
 
-            return float(input);
+            qty = float(input);
+            break;
 
         } catch {
 
@@ -42,6 +48,8 @@ func read_quantity(pnum) {
             continue;
         }
     }
+
+    return qty;
 }
 
 print("Shopping list");
@@ -55,17 +63,24 @@ while (true) {
     print();
     write("Enter product number ('q' to quit): ");
     var input = readln();
-    var dyn pnum;   # holds a find() result (opt int) or a parsed int
-
     if (input == "q") {
         print();
         print("Quit");
         break;
     }
 
-    pnum = find(products, input, func(x) => x[0]);
+    # Match a product by name; if not found, parse the input as a number.
+    # Splitting the opt find() result (`found`) from a non-null `pnum` keeps the
+    # checks below off a possibly-none value (and, unlike the old `if (!pnum)`,
+    # correctly handles the product at index 0, which is falsy).
+    var dyn found = find(products, input, func(x) => x[0]);
+    var pnum = 0;
 
-    if (!pnum) {
+    if (found != none) {
+
+        pnum = int(found);
+
+    } else {
 
         try {
 
