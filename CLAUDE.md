@@ -2895,11 +2895,14 @@ allocator above the resolved locals; `Chunk::n_temps` grows the frame). Anything
 else (float, a bare/bool leaf plain-assign, a global/capture operand, a call)
 falls back to Phase 1. **Bool-safety:** a plain assign's rhs must be
 `definitely_int` (arith/neg/int-literal, never a leaf id or comparison — both
-can be bool), since writing an int into a bool slot would corrupt it. This is
-where the VM *wins*: `01_while_loop` −50%, a nested-expr loop −61% instructions.
-The register choice (over a stack machine, which the already-M8-optimized
-tree-walker would beat) is also the right IR for the eventual native x86-64
-codegen. Full roadmap + phase order: `plans/bytecode-vm.md`.
+can be bool), since writing an int into a bool slot would corrupt it. **Float**
+loops compile too (`FloatBin`/`JumpUnlessFloatCmp`, operands promote; a pure-int
+or pure-float loop goes native, a mixed one falls back). This is where the VM
+*wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop −71%
+instructions (cachegrind). The register choice (over a stack machine, which the
+already-M8-optimized tree-walker would beat) is also the right IR for the
+eventual native x86-64 codegen. Full roadmap + phase order:
+`plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)
 

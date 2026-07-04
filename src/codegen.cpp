@@ -44,6 +44,40 @@ bool as_int_operand(const Construct *e, Operand &out)
     return false;
 }
 
+Operand float_lit(float_type v)
+{
+    Operand o;
+    o.is_lit = true;
+    o.flit = v;
+    return o;
+}
+
+/*
+ * Read `e` as a LEAF float operand: an int/float literal (converted to float),
+ * or a resolved-local slot (read as float at runtime - an int/bool slot
+ * promotes). Returns false otherwise. Accepts a `th == i` operand too, since a
+ * float expression promotes an int operand.
+ */
+bool as_float_operand(const Construct *e, Operand &out)
+{
+    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+        out = float_lit(static_cast<float_type>(li->ival()));
+        return true;
+    }
+    if (const LiteralFloat *lf = dynamic_cast<const LiteralFloat *>(e)) {
+        out = float_lit(lf->fval());
+        return true;
+    }
+    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+        if (id->sym.kind == SymKind::local
+            && (id->th == TypeHint::f || id->th == TypeHint::i)) {
+            out = slot_op(id->sym.slot);
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Is `e` a DEFINITELY-int (never bool) expression? An arithmetic or unary-minus
  * TypedScalarExpr always yields int (arith promotes bool operands to int); an
@@ -87,7 +121,12 @@ struct Codegen {
     size_t emit(OpCode op, const Construct *node = nullptr,
                 int target = -1, int target2 = -1)
     {
-        chunk.code.push_back({ op, node, target, target2 });
+        Instr in;
+        in.op = op;
+        in.node = node;
+        in.target = target;
+        in.target2 = target2;
+        chunk.code.push_back(in);
         return chunk.code.size() - 1;
     }
 
@@ -258,45 +297,179 @@ struct Codegen {
             && compile_int_expr(t->elems[1].second.get(), b, ops);
     }
 
-    /*
-     * A resolved-local int scalar loop -> native register ops (no fallback):
-     *   Lstart: <cond ops> JumpUnlessIntCmp{a,cmp,b -> Lend} <body ops>
-     *           Jump Lstart ; Lend:
-     * Fires when the condition is an int comparison and every body statement is
-     * a compilable int assignment/inc-dec (so no decl to scope and no
-     * break/continue/return). Emits nothing and returns false otherwise.
-     */
-    bool try_native_int_while(const WhileStmt *w)
-    {
-        std::vector<Instr> cond_ops, body_ops;
-        Operand ca, cb;
-        Op cmp;
+    /* The FLOAT analogues of compile_int_expr/stmt/cond (mirroring the tree-
+     * walker's eval_float): operands read as float, arithmetic is `double`,
+     * FloatBin writes a float slot. No bool-safety concern - a float
+     * destination is never a bool slot. */
 
-        reset_temps();
-        if (!compile_int_cond(w->condExpr.get(), cond_ops, ca, cmp, cb))
+    bool compile_float_expr(const Construct *e, Operand &out,
+                            std::vector<Instr> &ops)
+    {
+        if (as_float_operand(e, out))
+            return true;
+
+        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+        if (!t || t->kind != TypeHint::f)
             return false;
 
-        std::vector<const Construct *> stmts;
-        if (const Construct *body = w->body.get()) {
-            if (const Block *b = dynamic_cast<const Block *>(body)) {
-                for (const auto &e : b->elems)
-                    stmts.push_back(e.get());
-            } else {
-                stmts.push_back(body);
-            }
-        }
-        for (const Construct *s : stmts) {
-            reset_temps();
-            if (!compile_int_stmt(s, body_ops))
+        if (t->cat == TypedScalarExpr::Cat::arith) {
+            Operand acc;
+            if (!compile_float_expr(t->elems[0].second.get(), acc, ops))
                 return false;
+            for (size_t i = 1; i < t->elems.size(); i++) {
+                Operand rhs;
+                if (!compile_float_expr(t->elems[i].second.get(), rhs, ops))
+                    return false;
+                const int tt = alloc_temp();
+                Instr in;
+                in.op = OpCode::FloatBin;
+                in.node = e;
+                in.target = tt;
+                in.a = acc;
+                in.b = rhs;
+                in.aop = t->elems[i].first;
+                ops.push_back(in);
+                acc = slot_op(tt);
+            }
+            out = acc;
+            return true;
         }
 
+        if (t->cat == TypedScalarExpr::Cat::neg) {
+            Operand op;
+            if (!compile_float_expr(t->elems[0].second.get(), op, ops))
+                return false;
+            const int tt = alloc_temp();
+            Instr in;                    /* tt = 0.0 - op */
+            in.op = OpCode::FloatBin;
+            in.node = e;
+            in.target = tt;
+            in.a = float_lit(0);
+            in.b = op;
+            in.aop = Op::minus;
+            ops.push_back(in);
+            out = slot_op(tt);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool compile_float_stmt(const Construct *s, std::vector<Instr> &ops)
+    {
+        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+            const Identifier *id =
+                dynamic_cast<const Identifier *>(inc->lvalue.get());
+            if (inc->th == TypeHint::f && id
+                && id->sym.kind == SymKind::local && id->th == TypeHint::f) {
+                Instr in;
+                in.op = OpCode::FloatBin;
+                in.node = s;
+                in.target = id->sym.slot;
+                in.a = slot_op(id->sym.slot);
+                in.b = float_lit(1);
+                in.aop = inc->is_inc ? Op::plus : Op::minus;
+                ops.push_back(in);
+                return true;
+            }
+            return false;
+        }
+
+        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        if (!e)
+            return false;
+
+        /* The destination must be a genuine FLOAT slot (int dst -> compile_int_
+         * stmt handles it; a float result can't narrow into an int/bool). */
+        const Identifier *dst =
+            dynamic_cast<const Identifier *>(e->lvalue.get());
+        if (!dst || dst->sym.kind != SymKind::local || dst->th != TypeHint::f)
+            return false;
+        const int dslot = dst->sym.slot;
+
+        if (e->op == Op::assign) {
+            Operand r;
+            if (!compile_float_expr(e->rvalue.get(), r, ops))
+                return false;
+            if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::FloatBin
+                && ops.back().target == r.slot) {
+                ops.back().target = dslot;
+            } else {
+                Instr in;                /* dst = r + 0.0 */
+                in.op = OpCode::FloatBin;
+                in.node = s;
+                in.target = dslot;
+                in.a = r;
+                in.b = float_lit(0);
+                in.aop = Op::plus;
+                ops.push_back(in);
+            }
+            return true;
+        }
+
+        Op arith;
+        switch (e->op) {
+            case Op::addeq: arith = Op::plus;  break;
+            case Op::subeq: arith = Op::minus; break;
+            case Op::muleq: arith = Op::times; break;
+            case Op::diveq: arith = Op::div;   break;
+            case Op::modeq: arith = Op::mod;   break;
+            default: return false;
+        }
+
+        Operand rhs;                     /* dst = dst <arith> rhs */
+        if (!compile_float_expr(e->rvalue.get(), rhs, ops))
+            return false;
+        Instr in;
+        in.op = OpCode::FloatBin;
+        in.node = s;
+        in.target = dslot;
+        in.a = slot_op(dslot);
+        in.b = rhs;
+        in.aop = arith;
+        ops.push_back(in);
+        return true;
+    }
+
+    bool compile_float_cond(const Construct *cond, std::vector<Instr> &ops,
+                            Operand &a, Op &cmp, Operand &b)
+    {
+        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        if (!t || t->cat != TypedScalarExpr::Cat::cmp
+            || t->kind != TypeHint::f || t->elems.size() != 2)
+            return false;
+        cmp = t->elems[1].first;
+        return compile_float_expr(t->elems[0].second.get(), a, ops)
+            && compile_float_expr(t->elems[1].second.get(), b, ops);
+    }
+
+    /* Gather a while body's statements (a Block's elems, or a single stmt). */
+    std::vector<const Construct *> body_stmts(const WhileStmt *w)
+    {
+        std::vector<const Construct *> stmts;
+        if (const Construct *body = w->body.get()) {
+            if (const Block *b = dynamic_cast<const Block *>(body))
+                for (const auto &e : b->elems)
+                    stmts.push_back(e.get());
+            else
+                stmts.push_back(body);
+        }
+        return stmts;
+    }
+
+    /* Emit a compiled native loop: Lstart <cond ops> JumpUnless{cmp_op} <body
+     * ops> Jump Lstart ; Lend. */
+    void emit_native_while(const WhileStmt *w, OpCode cmp_op, Op cmp,
+                           Operand ca, Operand cb,
+                           const std::vector<Instr> &cond_ops,
+                           const std::vector<Instr> &body_ops)
+    {
         const int lstart = here();
         for (const Instr &in : cond_ops)
             chunk.code.push_back(in);
 
         Instr test;
-        test.op = OpCode::JumpUnlessIntCmp;
+        test.op = cmp_op;
         test.node = w->condExpr.get();
         test.aop = cmp;
         test.a = ca;
@@ -308,9 +481,62 @@ struct Codegen {
             chunk.code.push_back(in);
 
         emit(OpCode::Jump, nullptr, lstart);
-
         chunk.code[jt].target = here();  /* Lend */
-        return true;
+    }
+
+    /*
+     * A resolved-local scalar (int OR float) loop -> native register ops, no
+     * fallback:
+     *   Lstart: <cond ops> JumpUnless{Int,Float}Cmp{a,cmp,b -> Lend}
+     *           <body ops> Jump Lstart ; Lend:
+     * Fires when the condition is an int/float comparison and every body
+     * statement is a compilable assignment/inc-dec of the SAME kind (so no decl
+     * to scope, no break/continue/return). A mixed int/float loop, or any
+     * unsupported statement, emits nothing and returns false (-> Phase 1).
+     */
+    bool try_native_scalar_while(const WhileStmt *w)
+    {
+        const std::vector<const Construct *> stmts = body_stmts(w);
+
+        {   /* all-int loop */
+            std::vector<Instr> cond_ops, body_ops;
+            Operand ca, cb;
+            Op cmp;
+            reset_temps();
+            bool ok = compile_int_cond(w->condExpr.get(), cond_ops,
+                                       ca, cmp, cb);
+            for (const Construct *s : stmts) {
+                if (!ok) break;
+                reset_temps();
+                ok = compile_int_stmt(s, body_ops);
+            }
+            if (ok) {
+                emit_native_while(w, OpCode::JumpUnlessIntCmp, cmp, ca, cb,
+                                  cond_ops, body_ops);
+                return true;
+            }
+        }
+
+        {   /* all-float loop */
+            std::vector<Instr> cond_ops, body_ops;
+            Operand ca, cb;
+            Op cmp;
+            reset_temps();
+            bool ok = compile_float_cond(w->condExpr.get(), cond_ops,
+                                         ca, cmp, cb);
+            for (const Construct *s : stmts) {
+                if (!ok) break;
+                reset_temps();
+                ok = compile_float_stmt(s, body_ops);
+            }
+            if (ok) {
+                emit_native_while(w, OpCode::JumpUnlessFloatCmp, cmp, ca, cb,
+                                  cond_ops, body_ops);
+                return true;
+            }
+        }
+
+        return false;
     }
 
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
@@ -352,7 +578,7 @@ struct Codegen {
 
     void gen_while(const WhileStmt *w)
     {
-        if (try_native_int_while(w))       /* Phase 2 register fast path */
+        if (try_native_scalar_while(w))    /* Phase 2 register fast path */
             return;
 
         /* Phase 1 fallback: Lstart JumpIfFalse cond->Lend body LoopBackEdge */

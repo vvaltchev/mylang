@@ -9,6 +9,7 @@
 #include "bitops.h"
 
 #include <memory>
+#include <cmath>
 
 /* The harness's engine switch (see vm.h). Default: the tree-walker. */
 ExecEngine g_exec_engine = ExecEngine::TreeWalk;
@@ -50,6 +51,31 @@ write_int_slot(EvalContext *ctx, int slot, int_type v)
     LValue &lv = ctx->frame->slots[slot];
     if (lv.is<int_type>())
         lv.getval<int_type>() = v;
+    else
+        lv.put(EvalValue(v));
+}
+
+/* The float analogues: read an operand as float (an int/bool slot promotes,
+ * mirroring Identifier::eval_float) and write a float result into a slot. */
+static inline float_type
+read_float_operand(const Operand &o, EvalContext *ctx)
+{
+    if (o.is_lit)
+        return o.flit;
+    const LValue &lv = ctx->frame->slots[o.slot];
+    if (lv.is<int_type>())
+        return static_cast<float_type>(lv.getval<int_type>());
+    if (lv.is<bool>())
+        return lv.getval<bool>() ? 1.0 : 0.0;
+    return lv.getval<float_type>();
+}
+
+static inline void
+write_float_slot(EvalContext *ctx, int slot, float_type v)
+{
+    LValue &lv = ctx->frame->slots[slot];
+    if (lv.is<float_type>())
+        lv.getval<float_type>() = v;
     else
         lv.put(EvalValue(v));
 }
@@ -185,6 +211,54 @@ vm_execute(const Construct *root_c)
 
             const int_type a = read_int_operand(in.a, &ctx);
             const int_type b = read_int_operand(in.b, &ctx);
+            bool cond;
+
+            switch (in.aop) {
+            case Op::lt: cond = a <  b; break;
+            case Op::gt: cond = a >  b; break;
+            case Op::le: cond = a <= b; break;
+            case Op::ge: cond = a >= b; break;
+            case Op::eq: cond = a == b; break;
+            default:     cond = a != b; break;   /* noteq */
+            }
+
+            if (cond)
+                pc++;
+            else
+                pc = in.target;
+            break;
+        }
+
+        case OpCode::FloatBin: {
+
+            const float_type a = read_float_operand(in.a, &ctx);
+            const float_type b = read_float_operand(in.b, &ctx);
+            float_type r;
+
+            switch (in.aop) {
+            case Op::plus:  r = a + b; break;
+            case Op::minus: r = a - b; break;
+            case Op::times: r = a * b; break;
+            case Op::div:
+                if (b == 0.0)
+                    throw DivisionByZeroEx(in.node->start, in.node->end);
+                r = a / b; break;
+            case Op::mod:
+                if (b == 0.0)
+                    throw DivisionByZeroEx(in.node->start, in.node->end);
+                r = std::fmod(a, b); break;
+            default: throw InternalErrorEx();
+            }
+
+            write_float_slot(&ctx, in.target, r);
+            pc++;
+            break;
+        }
+
+        case OpCode::JumpUnlessFloatCmp: {
+
+            const float_type a = read_float_operand(in.a, &ctx);
+            const float_type b = read_float_operand(in.b, &ctx);
             bool cond;
 
             switch (in.aop) {

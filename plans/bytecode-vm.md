@@ -265,9 +265,22 @@ x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
   (no regression); geomean **0.99x**, worst outlier +0.00% instrs (noise).
   1303/1303 + 1155/1155; the shape test now pins native / fallback / nested /
   bool-safe.
-- **Next steps (same register architecture):** `float` ops, global / capture
-  slot operands, more statement/expression forms; then function bodies (Phase
-  4). Compile each where it's a win.
+- **Step 2.2 — float scalar loops — DONE.** `FloatBin` / `JumpUnlessFloatCmp`
+  (operands read as float — an int/bool slot promotes, mirroring
+  `eval_float`; div/mod keep the zero check, mod via `fmod`). `Operand` gained a
+  `flit` (float immediate). Parallel `compile_float_expr/stmt/cond`;
+  `try_native_scalar_while` tries an all-int loop, then an all-float loop (a
+  MIXED int/float loop falls back — handled later). Float needs no bool-safety
+  (a float destination is never a bool slot), so a plain `f = <float leaf/expr>`
+  compiles too. **Result:** a pure-float loop (`s = s + x*x - x`) is **−71.0%
+  instructions** (the biggest win yet — `eval_float` has the most per-node
+  dispatch); `01_while_loop` still 0.51x; geomean **1.00x**, the four worst
+  wall-clock outliers all cachegrind-confirmed +0.00% instrs (noise — the bigger
+  `Operand` did NOT regress int loops). 1303/1303 + 1155/1155; shape test pins
+  the float path.
+- **Next steps (same register architecture):** mixed int/float loops
+  (per-statement kind dispatch), global / capture slot operands, `for` loops,
+  more forms; then function bodies (Phase 4). Compile each where it's a win.
 
 ### Phase 3 — compact the Instr encoding + broaden native statements
 - The `Instr` grew (two `Operand`s + `aop`) to carry register ops; harmless now

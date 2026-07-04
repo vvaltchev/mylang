@@ -72,6 +72,13 @@ enum class OpCode : unsigned char {
      */
     JumpUnlessIntCmp,
 
+    /* The FLOAT analogues of IntBin / JumpUnlessIntCmp: operands are read as
+     * float (an int/bool slot promotes), the arithmetic is `double`, the result
+     * is written to a float slot. div/mod (fmod) keep the zero check. For a
+     * pure-float scalar loop. */
+    FloatBin,
+    JumpUnlessFloatCmp,
+
     /* Stop the program. */
     Halt,
 };
@@ -82,8 +89,9 @@ enum class OpCode : unsigned char {
  */
 struct Operand {
     bool is_lit = false;
-    int slot = -1;       /* frame slot index when !is_lit */
-    int_type lit = 0;    /* immediate when is_lit */
+    int slot = -1;         /* frame slot index when !is_lit */
+    int_type lit = 0;      /* int immediate when is_lit (IntBin ops) */
+    float_type flit = 0;   /* float immediate when is_lit (FloatBin ops) */
 };
 
 struct Instr {

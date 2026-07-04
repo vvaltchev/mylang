@@ -10452,6 +10452,7 @@ static bool frame_over_64_slots()
  */
 struct VmOpCounts {
     size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
+    size_t fbin = 0, jufc = 0;
     int n_temps = 0;
 };
 
@@ -10484,6 +10485,8 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::LoopBackEdge:     c.back++;   break;
             case OpCode::JumpUnlessIntCmp: c.juic++;   break;
             case OpCode::IntBin:           c.intbin++; break;
+            case OpCode::FloatBin:         c.fbin++;   break;
+            case OpCode::JumpUnlessFloatCmp: c.jufc++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10542,7 +10545,19 @@ static bool vm_codegen_shapes()
         return false;
     const bool bool_safe = d.back == 1 && d.intbin == 0 && d.juic == 0;
 
-    return native_ok && fallback_ok && nested_ok && bool_safe;
+    /* 5) a pure-FLOAT loop compiles to the float register ops (FloatBin +
+     * JumpUnlessFloatCmp), no fallback, no int ops. */
+    VmOpCounts f;
+    if (!codegen_counts({
+            "var x = 0.0; var s = 0.0;",
+            "while (x < 5.0) { s = s + x*x; x += 1.0; }",
+        }, f))
+        return false;
+    const bool float_ok =
+        f.jufc == 1 && f.fbin >= 3 && f.back == 0
+        && f.juic == 0 && f.intbin == 0;
+
+    return native_ok && fallback_ok && nested_ok && bool_safe && float_ok;
 }
 
 static const std::vector<extra_check> extra_checks =
