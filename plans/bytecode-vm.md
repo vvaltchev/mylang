@@ -278,9 +278,17 @@ x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
   wall-clock outliers all cachegrind-confirmed +0.00% instrs (noise — the bigger
   `Operand` did NOT regress int loops). 1303/1303 + 1155/1155; shape test pins
   the float path.
-- **Next steps (same register architecture):** mixed int/float loops
-  (per-statement kind dispatch), global / capture slot operands, `for` loops,
-  more forms; then function bodies (Phase 4). Compile each where it's a win.
+- **Step 2.3 — mixed int/float loops — DONE.** `try_native_scalar_while` now
+  dispatches the condition and EACH body statement by its own kind (try int,
+  then float — a failed int attempt truncates its partial ops before the float
+  retry), replacing the old all-int-then-all-float two-attempt structure. So a
+  `while (i < N) { s += i*i; f += i*0.5; i++; }` (int counter + float
+  accumulator) compiles fully native: **−51.0% instructions**; homogeneous loops
+  emit byte-identical bytecode (`01_while_loop` unchanged). 1303/1303 +
+  1155/1155; shape test pins the mixed path.
+- **Next steps (same register architecture):** global / capture slot operands,
+  `for` loops, more forms; then function bodies (Phase 4). Compile each where
+  it's a win.
 
 ### Phase 3 — compact the Instr encoding + broaden native statements
 - The `Instr` grew (two `Operand`s + `aop`) to carry register ops; harmless now

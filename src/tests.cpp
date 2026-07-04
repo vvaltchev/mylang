@@ -10557,7 +10557,20 @@ static bool vm_codegen_shapes()
         f.jufc == 1 && f.fbin >= 3 && f.back == 0
         && f.juic == 0 && f.intbin == 0;
 
-    return native_ok && fallback_ok && nested_ok && bool_safe && float_ok;
+    /* 6) a MIXED int/float loop compiles per-statement: an int condition + an
+     * int counter (IntBin) and a float accumulator (FloatBin), no fallback. */
+    VmOpCounts m;
+    if (!codegen_counts({
+            "var i = 0; var f = 0.0;",
+            "while (i < 5) { f += 0.5; i++; }",
+        }, m))
+        return false;
+    const bool mixed_ok =
+        m.juic == 1 && m.jufc == 0 && m.intbin == 1 && m.fbin == 1
+        && m.back == 0;
+
+    return native_ok && fallback_ok && nested_ok && bool_safe
+        && float_ok && mixed_ok;
 }
 
 static const std::vector<extra_check> extra_checks =

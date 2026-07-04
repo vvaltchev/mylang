@@ -490,53 +490,48 @@ struct Codegen {
      *   Lstart: <cond ops> JumpUnless{Int,Float}Cmp{a,cmp,b -> Lend}
      *           <body ops> Jump Lstart ; Lend:
      * Fires when the condition is an int/float comparison and every body
-     * statement is a compilable assignment/inc-dec of the SAME kind (so no decl
-     * to scope, no break/continue/return). A mixed int/float loop, or any
-     * unsupported statement, emits nothing and returns false (-> Phase 1).
+     * statement is a compilable int/float assignment/inc-dec (so no decl to
+     * scope, no break/continue/return). The condition and each body statement
+     * are dispatched by their OWN kind, so a MIXED int/float loop compiles too;
+     * any unsupported statement emits nothing and returns false (-> Phase 1).
      */
     bool try_native_scalar_while(const WhileStmt *w)
     {
-        const std::vector<const Construct *> stmts = body_stmts(w);
+        std::vector<Instr> cond_ops, body_ops;
+        Operand ca, cb;
+        Op cmp;
+        OpCode cmp_opcode;
 
-        {   /* all-int loop */
-            std::vector<Instr> cond_ops, body_ops;
-            Operand ca, cb;
-            Op cmp;
+        /* Condition: int or float compare (per-condition dispatch). A failed
+         * int attempt may have appended partial operand ops - clear before
+         * retrying float. */
+        reset_temps();
+        if (compile_int_cond(w->condExpr.get(), cond_ops, ca, cmp, cb)) {
+            cmp_opcode = OpCode::JumpUnlessIntCmp;
+        } else {
+            cond_ops.clear();
             reset_temps();
-            bool ok = compile_int_cond(w->condExpr.get(), cond_ops,
-                                       ca, cmp, cb);
-            for (const Construct *s : stmts) {
-                if (!ok) break;
-                reset_temps();
-                ok = compile_int_stmt(s, body_ops);
-            }
-            if (ok) {
-                emit_native_while(w, OpCode::JumpUnlessIntCmp, cmp, ca, cb,
-                                  cond_ops, body_ops);
-                return true;
-            }
+            if (!compile_float_cond(w->condExpr.get(), cond_ops, ca, cmp, cb))
+                return false;
+            cmp_opcode = OpCode::JumpUnlessFloatCmp;
         }
 
-        {   /* all-float loop */
-            std::vector<Instr> cond_ops, body_ops;
-            Operand ca, cb;
-            Op cmp;
+        /* Body: each statement dispatched by its OWN kind (int OR float), so a
+         * MIXED loop - `while (i < n) { f += 0.5; i++; }` - compiles. A failed
+         * int attempt may leave partial ops; truncate before trying float. */
+        for (const Construct *s : body_stmts(w)) {
             reset_temps();
-            bool ok = compile_float_cond(w->condExpr.get(), cond_ops,
-                                         ca, cmp, cb);
-            for (const Construct *s : stmts) {
-                if (!ok) break;
-                reset_temps();
-                ok = compile_float_stmt(s, body_ops);
-            }
-            if (ok) {
-                emit_native_while(w, OpCode::JumpUnlessFloatCmp, cmp, ca, cb,
-                                  cond_ops, body_ops);
-                return true;
-            }
+            const size_t mark = body_ops.size();
+            if (compile_int_stmt(s, body_ops))
+                continue;
+            body_ops.resize(mark);
+            reset_temps();
+            if (!compile_float_stmt(s, body_ops))
+                return false;
         }
 
-        return false;
+        emit_native_while(w, cmp_opcode, cmp, ca, cb, cond_ops, body_ops);
+        return true;
     }
 
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
