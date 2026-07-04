@@ -177,6 +177,17 @@ vm_make_array_big(EvalContext &ctx, int_type base, int_type n, ArrHint hint)
     return build_array_from_values(heapbuf.data(), n, hint, nullptr, false);
 }
 
+/* Cold helper for a large dict LITERAL (npairs>8): copy the interleaved
+ * key/value run [base, base + 2*npairs) into a heap buffer and build. */
+static ML_NOINLINE EvalValue
+vm_make_dict_big(EvalContext &ctx, int_type base, int_type npairs)
+{
+    std::vector<EvalValue> heapbuf(static_cast<size_t>(2 * npairs));
+    for (int_type i = 0; i < 2 * npairs; i++)
+        heapbuf[i] = ctx.frame->at(base + i).get();
+    return build_dict_from_pairs(heapbuf.data(), npairs, false);
+}
+
 /* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
  * the value args (1..n) from the register run [base, base+n_rest) into a buffer
  * and call func_lv with `target` + `rest` - zero node->eval. ML_NOINLINE keeps
@@ -925,6 +936,25 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             } else {
                 ctx.frame->at(in.target).put(
                     vm_make_array_big(ctx, base, n, hint));
+            }
+            pc++;
+            break;
+        }
+
+        case OpCode::MakeDictV: {
+
+            /* Build a dict LITERAL from the interleaved key/value run
+             * [base, base + 2*npairs) via the shared build core (which freezes
+             * each key). is_const false; never throws (all values hashable). */
+            const int_type base = in.a.lit, np = in.b.lit;
+            if (np <= 8) {
+                EvalValue stackbuf[16];
+                for (int_type i = 0; i < 2 * np; i++)
+                    stackbuf[i] = ctx.frame->at(base + i).get();
+                ctx.frame->at(in.target).put(
+                    build_dict_from_pairs(stackbuf, np, false));
+            } else {
+                ctx.frame->at(in.target).put(vm_make_dict_big(ctx, base, np));
             }
             pc++;
             break;

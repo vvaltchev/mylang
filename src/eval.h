@@ -366,6 +366,11 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                                   const StructTypeDef *hint_struct,
                                   bool is_const);
 
+/* Build a dict VALUE from `npairs` INTERLEAVED key/value values ([k0,v0,..]).
+ * Keys are frozen. Shared by LiteralDict::do_eval and the VM's MakeDictV. */
+EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
+                                bool is_const);
+
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
 void run_weight_bench();

@@ -4011,21 +4011,46 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
     return none;
 }
 
-EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
+/*
+ * Build a dict VALUE from `npairs` already-evaluated key/value pairs, stored
+ * INTERLEAVED in `pairs` ([k0, v0, k1, v1, ...]). Shared by the tree-walker
+ * (LiteralDict::do_eval) and the VM's MakeDictV op. Each key is FROZEN
+ * (make_const_clone) so a mutable container key can't later be mutated and
+ * corrupt the dict (see TypeDict::subscript) - which is why this helper lives
+ * in eval.cpp, and the VM only ever passes it values.
+ */
+EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
+                                bool is_const)
 {
     DictObject::inner_type data;
+    for (size_t i = 0; i < npairs; i++)
+        data.emplace(make_const_clone(pairs[2 * i]),
+                     LValue(pairs[2 * i + 1], is_const));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+}
 
-    for (const auto &e : elems) {
+EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
+{
+    /* Evaluate the key/value nodes into an interleaved buffer (stack for the
+     * common small literal, heap for a large one), then the shared builder -
+     * the same builder the VM's MakeDictV op calls with register values. */
+    const size_t np = elems.size();
 
-        /* freeze the key (see TypeDict::subscript) so a mutable container key
-         * cannot be mutated later and corrupt the dict. */
-        data.emplace(
-            make_const_clone(RValue(e->key->eval(ctx))),
-            LValue(RValue(e->value->eval(ctx)), ctx->const_ctx)
-        );
+    if (np <= 8) {
+        EvalValue buf[16];
+        for (size_t i = 0; i < np; i++) {
+            buf[2 * i]     = RValue(elems[i]->key->eval(ctx));
+            buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
+        }
+        return build_dict_from_pairs(buf, np, ctx->const_ctx);
     }
 
-    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+    std::vector<EvalValue> buf(2 * np);
+    for (size_t i = 0; i < np; i++) {
+        buf[2 * i]     = RValue(elems[i]->key->eval(ctx));
+        buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
+    }
+    return build_dict_from_pairs(buf.data(), np, ctx->const_ctx);
 }
 
 /* True if `c` is rooted at a variable (an identifier, or a member/subscript

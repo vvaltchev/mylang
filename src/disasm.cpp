@@ -314,6 +314,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << arglist(chunk, in.a.lit, in.b.lit)
                 << "  ; array literal, hint " << in.target2;
             break;
+        case OpCode::MakeDictV:
+            row << "make.dict    " << D(in.target) << " = "
+                << arglist(chunk, in.a.lit, 2 * in.b.lit)
+                << "  ; dict literal (" << in.b.lit << " pairs)";
+            break;
         case OpCode::LoadImmInt:
             row << "load         " << D(in.target) << ", #" << in.a.lit;
             break;

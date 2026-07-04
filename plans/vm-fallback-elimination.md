@@ -27,7 +27,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~C~~ | ~~closure/indirect call `c()`~~ | 11 | — | ✅ CallValueV 1.09→1.00 |
 | **R** | call-in-global-assign `r=f(n)+9` | 10 | P10b | todo |
 | **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |
-| ~Lit~ | array literal `[a,b,..]` | 20,22,46 | — | ✅ MakeArrayV; DictV todo |
+| ~~Lit~~ | array/dict literal `[..]`/`{}` | 20,22,46 | — | ✅ MakeArr/DictV |
 | **X** | try/catch + C++ `throw` | 42 (24.5×) | P8 | LAST (VM-level exc) |
 
 Plus the Part-C native-but-slow work (typed reads, computed-goto dispatch,

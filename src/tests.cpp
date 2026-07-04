@@ -5296,6 +5296,29 @@ static const std::vector<test> tests =
     },
 
     {
+        /* dict-literal build (the VM MakeDictV native path) */
+        "Dict literal built per iteration",
+        {
+            "var s = 0;",
+            "for (int i = 0; i < 4; i++) {",
+            "    var d = {i: i * i, i + 10: i};",
+            "    s += d[i] + d[i + 10];",
+            "}",
+            "assert(s == 20);",           /* sum (i*i + i) = 14 + 6 */
+        },
+    },
+
+    {
+        /* nested / computed-key dict literal (both engines) */
+        "Dict literal nested with computed keys",
+        {
+            "var k = \"key\";",
+            "var d = {k: [1, 2], \"m\": {3: 4}};",
+            "assert(d[\"key\"][1] == 2 && d[\"m\"][3] == 4);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

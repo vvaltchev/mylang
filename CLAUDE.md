@@ -2950,7 +2950,13 @@ is retargeted straight into the lvalue slot for `var a = [..]` (no `MoveV`). A
 flat STRUCT-array literal (`ArrHint::flat_s`) stays fallback (its ctor elements
 don't lower, and the def isn't in the op). So a per-iteration array literal
 (`22_multi_assign` 1.05x→0.89x; matrix/sieve/wordcount) no longer falls back to
-`EvalStmt`. A
+`EvalStmt`. A **dict LITERAL** `{k0: v0, ..}` is the twin **`MakeDictV`**: the
+key/value pairs compile INTERLEAVED into the run (`[k0,v0,k1,v1,..]`, key at
+even/value at odd), and the op builds via the shared **`build_dict_from_pairs`**
+(which freezes each key). Both share **`compile_to_run_slot`** (factored out of
+`emit_args_range`) to place each element in its run slot. Dict-literal loops
+(`25_dict_member` 0.63x, `62_dict_word_count` 0.69x vs the tree-walker) go
+native. A
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
 sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)

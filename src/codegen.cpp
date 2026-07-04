@@ -99,6 +99,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::EvalToSlot:  case OpCode::ArrLen:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemValue: case OpCode::MakeArrayV:
+    case OpCode::MakeDictV:
         return true;
     default:
         return false;
@@ -509,6 +510,42 @@ struct Codegen {
             return true;
         }
 
+        /* A dict LITERAL `{k0: v0, ..}` (elements not all const) -> MakeDictV:
+         * compile the key/value pairs INTERLEAVED into a register run [base,
+         * base + 2*npairs) (key at even, value at odd), then build. Same
+         * const/LiteralObj caveat as the array case. */
+        if (const LiteralDict *ld = dynamic_cast<const LiteralDict *>(e)) {
+            const size_t mark = ops.size();
+            const size_t cmark = chunk.consts.size();
+            const int save_top = next_temp;
+            const int npairs = static_cast<int>(ld->elems.size());
+            const int base = next_temp;
+            next_temp += 2 * npairs;
+            if (next_temp > max_temp)
+                max_temp = next_temp;
+            bool ok = true;
+            for (int i = 0; i < npairs && ok; i++)
+                ok = compile_to_run_slot(ld->elems[i]->key.get(),
+                                         base + 2 * i, ops)
+                  && compile_to_run_slot(ld->elems[i]->value.get(),
+                                         base + 2 * i + 1, ops);
+            if (!ok) {
+                ops.resize(mark);
+                next_temp = save_top;
+                chunk.consts.resize(cmark);
+                return false;
+            }
+            const int dst = alloc_temp();
+            Instr in;
+            in.op = OpCode::MakeDictV;
+            in.target = dst;
+            in.a = int_lit(base);
+            in.b = int_lit(npairs);
+            ops.push_back(in);
+            out_slot = dst;
+            return true;
+        }
+
         /* A subscript READ `a[i]` (general array / dict / string element) ->
          * SubscriptV via the runtime Type::subscript. (A slice is a separate
          * node, not handled here.) */
@@ -794,11 +831,12 @@ struct Codegen {
             if (ops.size() > omark && ops.back().target == rslot
                 && (ops.back().op == OpCode::BinOpV
                     || ops.back().op == OpCode::LoadConstV
-                    || ops.back().op == OpCode::MakeArrayV)) {
-                /* MakeArrayV reads its element run before writing `target`, and
-                 * the local lvalue slot can't overlap the temp run - so writing
-                 * the array straight into `a` is sound (even `a=[a,1]`, whose
-                 * old `a` is already copied into the run). */
+                    || ops.back().op == OpCode::MakeArrayV
+                    || ops.back().op == OpCode::MakeDictV)) {
+                /* MakeArrayV/MakeDictV read their element run before writing
+                 * `target`, and the local lvalue slot can't overlap the temp
+                 * run - so writing the container straight into `a` is sound
+                 * (even `a=[a,1]`, whose old `a` is already in the run). */
                 ops.back().target = lv->sym.slot;
             } else {
                 Instr in;
@@ -876,6 +914,36 @@ struct Codegen {
      * [argbase, argbase+n) via compile_boxed_expr, left-to-right, once each;
      * rolls back ops + temps and returns false if an arg can't lower. Shared by
      * the native user-call and native-builtin lowerings. */
+    /* Compile `e` into the run slot `dst`: fuse the producing op's target
+     * straight to `dst` (dropping a redundant temp + MoveV - `load t, "x"; move
+     * rarg = t` becomes `load rarg, "x"`), or emit a MoveV; then restore the
+     * per-element scratch. Returns false if `e` can't lower (the CALLER rolls
+     * back ops/next_temp). Shared by emit_args_range (call arg runs) and the
+     * array/dict literal builders. */
+    bool compile_to_run_slot(const Construct *e, int dst,
+                             std::vector<Instr> &ops)
+    {
+        const int sub = next_temp;
+        int out;
+        if (!compile_boxed_expr(e, out, ops))
+            return false;
+        if (out == dst) {
+            /* already in place */
+        } else if (out >= temp_base && !ops.empty()
+                   && ops.back().target == out
+                   && op_writes_pure_target(ops.back().op)) {
+            ops.back().target = dst;
+        } else {
+            Instr mv;
+            mv.op = OpCode::MoveV;
+            mv.target = dst;
+            mv.target2 = out;
+            ops.push_back(mv);
+        }
+        next_temp = sub;   /* free this element's scratch for the next */
+        return true;
+    }
+
     bool emit_args_range(const std::vector<unique_ptr<Construct>> &elems,
                          int &argbase, std::vector<Instr> &ops, int start = 0)
     {
@@ -889,32 +957,12 @@ struct Codegen {
             max_temp = next_temp;
 
         for (int i = 0; i < n; i++) {
-            const int sub = next_temp;
-            int out;
-            if (!compile_boxed_expr(elems[start + i].get(), out, ops)) {
+            if (!compile_to_run_slot(elems[start + i].get(),
+                                     argbase + i, ops)) {
                 ops.resize(mark);
                 next_temp = save_top;
                 return false;
             }
-            const int dst = argbase + i;
-            if (out == dst) {
-                /* already in place */
-            } else if (out >= temp_base && !ops.empty()
-                       && ops.back().target == out
-                       && op_writes_pure_target(ops.back().op)) {
-                /* Fuse: the arg's value was just produced into a FRESH temp by
-                 * an op that purely writes .target - retarget it straight to
-                 * the arg slot, dropping the redundant temp + MoveV. So
-                 * `load t, "x"; move rarg = t` becomes `load rarg, "x"`. */
-                ops.back().target = dst;
-            } else {
-                Instr mv;
-                mv.op = OpCode::MoveV;
-                mv.target = dst;
-                mv.target2 = out;
-                ops.push_back(mv);
-            }
-            next_temp = sub;   /* free this arg's scratch for the next */
         }
         return true;
     }

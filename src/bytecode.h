@@ -397,6 +397,14 @@ enum class OpCode : unsigned char {
     MakeArrayV,
 
     /*
+     * Build a dict VALUE `{k0: v0, ..}` from a register run into `target` - the
+     * native form of a `{..}` LITERAL. The `b.lit` key/value pairs are
+     * INTERLEAVED in slots [a.lit, a.lit + 2*b.lit): key at even, value at odd
+     * offset. Shares build_dict_from_pairs (freezes each key). No Construct*.
+     */
+    MakeDictV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()
