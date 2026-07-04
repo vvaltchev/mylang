@@ -10753,12 +10753,24 @@ static bool vm_codegen_shapes()
     const bool break_cont_ok =
         bk.flstep == 1 && bk.jmp >= 2 && bk.juic >= 3 && bk.intbin >= 1;
 
+    /* 18) a COMPOUND loop condition `while (A && B)` lowers to one native
+     * compare-branch per conjunct (both to the exit), NOT a boxed JumpIfFalse -
+     * so `while (i<10 && j<20)` is two JumpUnlessIntCmp, no JumpIfFalse. */
+    VmOpCounts cc;
+    if (!codegen_counts({
+            "var i = 0; var j = 0; var s = 0;",
+            "while (i < 10 && j < 20) { s += i; i++; j += 2; }",
+        }, cc))
+        return false;
+    const bool compound_cond_ok =
+        cc.juic == 2 && cc.jif == 0 && cc.intbin >= 1 && cc.back == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
         && nested_native_ok && compound_store_ok && read_2d_ok
         && builtin_dispatch_ok && array_build_ok && general_for_ok
-        && break_cont_ok;
+        && break_cont_ok && compound_cond_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

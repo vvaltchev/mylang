@@ -693,6 +693,61 @@ struct Codegen {
             && compile_float_expr(t->elems[1].second.get(), b, ops);
     }
 
+    /*
+     * Emit a loop/if condition as native compare-branches that jump to the loop
+     * EXIT when the condition is FALSE, recording each branch's index in
+     * `exit_jumps` (the caller patches them to the exit label). A single
+     * comparison -> one JumpUnless{Int,Float}Cmp. A CONJUNCTION `A && B && ...`
+     * (a Cat::logical of all `&&`) -> one compare-branch per conjunct, each to
+     * exit: fall-through means all held, and a later conjunct's ops only run if
+     * the earlier branches didn't take (native short-circuit, sound since the
+     * operands are side-effect-free scalar reads). Returns false for a `||`, a
+     * non-comparison, or a boxed operand - those await the boxed general path.
+     * Self-truncating per comparison; the caller discards all of chunk on
+     * a false return. This is what makes `while (it < MAXIT && zr*zr+zi*zi <=
+     * 4.0)` (mandelbrot) go native instead of falling back whole.
+     */
+    bool emit_cond_jumps(const Construct *cond,
+                         std::vector<size_t> &exit_jumps)
+    {
+        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        if (!t)
+            return false;
+
+        if (t->cat == TypedScalarExpr::Cat::cmp) {
+            Operand a, b;
+            Op cmp;
+            reset_temps();
+            const size_t mark = chunk.code.size();
+            if (compile_int_cond(cond, chunk.code, a, cmp, b)) {
+                exit_jumps.push_back(
+                    emit_cmp(OpCode::JumpUnlessIntCmp, cond, cmp, a, b));
+                return true;
+            }
+            chunk.code.resize(mark);
+            reset_temps();
+            if (compile_float_cond(cond, chunk.code, a, cmp, b)) {
+                exit_jumps.push_back(
+                    emit_cmp(OpCode::JumpUnlessFloatCmp, cond, cmp, a, b));
+                return true;
+            }
+            chunk.code.resize(mark);
+            return false;
+        }
+
+        if (t->cat == TypedScalarExpr::Cat::logical) {
+            for (size_t i = 1; i < t->elems.size(); i++)
+                if (t->elems[i].first != Op::land)
+                    return false;   /* `||` is not native yet */
+            for (const auto &pr : t->elems)
+                if (!emit_cond_jumps(pr.second.get(), exit_jumps))
+                    return false;
+            return true;
+        }
+
+        return false;
+    }
+
     /* A loop body's statements (a Block's elems, or a single statement). */
     std::vector<const Construct *> body_stmts(const Construct *body)
     {
@@ -900,25 +955,13 @@ struct Codegen {
         const size_t start = chunk.code.size();
         const int lstart = here();
 
-        Operand ca, cb;
-        Op cmp;
-        OpCode cmp_opcode;
-
-        reset_temps();
-        if (compile_int_cond(w->condExpr.get(), chunk.code, ca, cmp, cb)) {
-            cmp_opcode = OpCode::JumpUnlessIntCmp;
-        } else {
+        /* The condition -> native compare-branch(es) to the exit; a compound
+         * `A && B` becomes one branch per conjunct (see emit_cond_jumps). */
+        std::vector<size_t> exit_jumps;
+        if (!emit_cond_jumps(w->condExpr.get(), exit_jumps)) {
             chunk.code.resize(start);
-            reset_temps();
-            if (!compile_float_cond(w->condExpr.get(), chunk.code,
-                                    ca, cmp, cb)) {
-                chunk.code.resize(start);
-                return false;
-            }
-            cmp_opcode = OpCode::JumpUnlessFloatCmp;
+            return false;
         }
-
-        const size_t jt = emit_cmp(cmp_opcode, w->condExpr.get(), cmp, ca, cb);
 
         loops.push_back({});
         if (!compile_scalar_body(body_stmts(w->body.get()))) {
@@ -929,7 +972,8 @@ struct Codegen {
 
         emit(OpCode::Jump, nullptr, lstart);
         const int lend = here();
-        chunk.code[jt].target = lend;
+        for (size_t j : exit_jumps)
+            chunk.code[j].target = lend;
         pop_loop(lend, lstart);   /* continue -> the cond re-test (Lstart) */
         return true;
     }
