@@ -5344,6 +5344,39 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native dict foreach (VM DictIterInit/DictIterNext; -vm rerun via the
+         * differential). Assertions are order-independent - a dict's iteration
+         * order is unspecified. */
+        "Dict foreach binds key and value",
+        {
+            "var d = {1: 10, 2: 20, 3: 30};",
+            "var s = 0;",
+            "foreach (var k, v in d) { s += k + v; }",
+            "assert(s == 66);",           /* (1+2+3) + (10+20+30) */
+        },
+    },
+
+    {
+        "Dict foreach single var is keys-only",
+        {
+            "var d = {5: 100, 6: 200, 7: 300};",
+            "var s = 0;",
+            "foreach (var k in d) { s += k; }",
+            "assert(s == 18);",           /* 5+6+7, values ignored */
+        },
+    },
+
+    {
+        "Dict foreach continue skips an entry",
+        {
+            "var d = {1: 10, 2: 20, 3: 30};",
+            "var s = 0;",
+            "foreach (var k, v in d) { if (k == 2) continue; s += v; }",
+            "assert(s == 40);",           /* 10 + 30 */
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

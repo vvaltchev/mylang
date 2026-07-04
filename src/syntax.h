@@ -1539,6 +1539,12 @@ public:
      * is the flat-scalar fast path. Flat bool / POD-struct arrays are NOT set
      * (they need a raw scalar read, not a boxed LoadElemValue). */
     bool container_is_array = false;
+    /* Set by the inferencer for a non-indexed 1- or 2-var loop over a proven
+     * DICT: the VM iterates it natively with a LIVE unordered_map iterator
+     * (DictIterInit/DictIterNext), binding the key (1-var) or key+value (2-var)
+     * box-free. A dict has no O(1) index, so this is a separate loop shape from
+     * the counted array foreach. */
+    bool container_is_dict = false;
 
     ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1555,6 +1561,7 @@ public:
         c->indexed = indexed;
         c->elem_th = elem_th;
         c->container_is_array = container_is_array;
+        c->container_is_dict = container_is_dict;
         return c;
     }
 };

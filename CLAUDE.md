@@ -2925,9 +2925,27 @@ inferencer stamps `ForeachStmt::container_is_array`. Both the **single-var**
 (`foreach (e in a)`) and the **INDEXED 2-var** (`foreach (i, e in indexed a)`)
 forms are native: for indexed, the index var IS the loop counter (the body
 reads it) and the element loads into the 2nd var. (Flat `array<bool>` /
-`array<PodStruct>`, and unpack `foreach (x,y in pairs)` / dict `foreach (k,v in
-d)`, still fall back — the last needs a dict-iterator foundation, since a dict
-has no O(1) index.) **User-function calls** go
+`array<PodStruct>`, and unpack `foreach (x,y in pairs)`, still fall back.)
+**Dict `foreach (k, v in d)` / `foreach (k in d)`** is native via a **LIVE
+dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
+but a while-shaped loop over two ops: **`DictIterInit`** pins the dict
+(an `intrusive_ptr` copy → alive for the loop, matching the tree-walker's
+lifetime-extended `cval`) and sets the `unordered_map` iterator to `begin()`;
+**`DictIterNext`** tests it (→ end_pc on end), binds the key (and value,
+`.put(it->first)`/`.put(it->second.get())` — like the array general case), and
+`++`s. The per-loop iterator STATE lives in a **`vm_run_chunk`-local
+`std::vector<DictIterState>`** (`{intrusive_ptr<DictObject> dict; iterator;}`)
+sized by **`Chunk::n_dict_iters`** and indexed by a codegen-assigned `iter_id`
+(monotonic, never reset → nested/sequential dict foreachs get distinct slots); a
+mid-loop `return`/exception releases it when the frame unwinds — no cleanup op.
+Advance is BEFORE the body: the visited sequence is identical to the
+tree-walker's range-for, and the only difference (`++it` timing) is observable
+only under mutation-during-iteration, which is UB in both engines (dicts don't
+COW, so a body write hits the same map either way — a snapshot would DIVERGE, so
+we DON'T snapshot). The inferencer stamps `ForeachStmt::container_is_dict` for a
+non-indexed 1/2-var loop over a proven `Dict` type; a `dyn` container falls
+`_`/keys-only bind a slot of `-1` (skip). ~1.5x on `62_dict_word_count`
+(0.71x→0.64x vs the tree-walker). **User-function calls** go
 native via `CallV`: a call
 proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
 struct constructor / builtin) that devirtualized to a global slot evaluates its

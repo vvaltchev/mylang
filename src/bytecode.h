@@ -125,6 +125,26 @@ enum class OpCode : unsigned char {
     LoadElemValue,
 
     /*
+     * Native dict `foreach` via a LIVE unordered_map iterator (a dict has no
+     * O(1) index, so it can't use the counted-loop machine). The per-loop
+     * iterator STATE lives in a `vm_run_chunk`-local vector sized by
+     * `Chunk::n_dict_iters`, indexed by a codegen-assigned `iter_id`.
+     *
+     * DictIterInit  target=iter_id, target2=dict_slot: pin the dict
+     *               (intrusive_ptr copy -> alive for loop) + set it=begin().
+     * DictIterNext  target=end_pc, target2=iter_id, a.slot=k, b.slot=v
+     *               (-1 == `_`/unused): if it==end -> pc=end_pc; else bind
+     *               k=it->first, v=it->second.get() (box-free, like
+     *               LoadElemValue), ++it, fall through to the body. Advance is
+     *               BEFORE the body - the visited sequence is identical to the
+     *               tree-walker's range-for; the only difference (++it timing)
+     *               is observable only under mutation-during-iteration, UB in
+     *               both engines. Neither op throws (node stays null).
+     */
+    DictIterInit,
+    DictIterNext,
+
+    /*
      * Native array-element store `a[i] = v` / `a[i] OP= v` (Phase 5): `target2`
      * = the array slot, `a` = the int index operand, `b` = the value operand,
      * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith
@@ -457,6 +477,12 @@ struct Chunk {
      * them. Zero when no native expression needed a temp.
      */
     int n_temps = 0;
+    /*
+     * The number of live dict-iterator state slots vm_run_chunk must allocate
+     * (max iter_id + 1). Sized like n_temps; one per native dict foreach in the
+     * chunk (nested/sequential get distinct ids). See the DictIter ops.
+     */
+    int n_dict_iters = 0;
     /*
      * The BOXED general-value path's constant pool: literal EvalValues baked at
      * codegen (a machine-code backend would put these in the data section),

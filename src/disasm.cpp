@@ -205,6 +205,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "load.elem.v  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";
             break;
+        case OpCode::DictIterInit:
+            row << "dict.iter.i  I" << in.target << " <- " << D(in.target2);
+            break;
+        case OpCode::DictIterNext:
+            row << "dict.iter.n  I" << in.target2 << " k=" << in.a.slot
+                << " v=" << in.b.slot << " -> L" << in.target;
+            break;
         case OpCode::DictLoadInt:
         case OpCode::DictLoadFloat: {
             const char *mn = in.op == OpCode::DictLoadInt

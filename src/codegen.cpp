@@ -308,6 +308,7 @@ struct Codegen {
     int temp_base = 0;
     int next_temp = 0;
     int max_temp = 0;
+    int max_dict_iters = 0;   /* # native dict foreachs -> n_dict_iters */
 
     int here() const { return static_cast<int>(chunk.code.size()); }
 
@@ -332,6 +333,15 @@ struct Codegen {
     }
 
     void reset_temps() { next_temp = temp_base; }
+
+    /* A distinct persistent dict-iterator state slot per native dict foreach.
+     * NEVER reset - nested/sequential dict foreachs in a chunk each keep their
+     * own live-iterator slot (sized into Chunk::n_dict_iters). */
+    int alloc_dict_iter()
+    {
+        const int id = max_dict_iters++;
+        return id;
+    }
 
     /*
      * Native break/continue (Gap B): a loop body's `break`/`continue` compiles
@@ -2050,7 +2060,7 @@ struct Codegen {
                 }
             } else if (const ForeachStmt *fe =
                            dynamic_cast<const ForeachStmt *>(s)) {
-                if (try_native_foreach(fe)) {
+                if (try_native_foreach(fe) || try_native_dict_foreach(fe)) {
                     any_native = true;
                     continue;
                 }
@@ -2517,6 +2527,91 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * Native dict `foreach` via a LIVE iterator (DictIterInit/DictIterNext) - a
+     * dict has no O(1) index, so it's a while-shaped loop, not the counted
+     * array one. 1 var binds the key (keys-only), 2 vars key + value; a `_`
+     * in either position binds nothing (slot -1). Break/continue/return flow
+     * through the same FlowState machinery as the array foreach.
+     */
+    bool try_native_dict_foreach(const ForeachStmt *fe)
+    {
+        if (!fe->container_is_dict || !fe->ids
+            || (fe->ids->elems.size() != 1 && fe->ids->elems.size() != 2))
+            return false;
+
+        /* Resolve the key/value target slots. `_` -> -1 (bind nothing); any
+         * non-local target -> bail (leave to the tree-walker). */
+        auto slot_of = [&](size_t i, int &out) -> bool {
+            const Identifier *id =
+                dynamic_cast<const Identifier *>(fe->ids->elems[i].get());
+            if (!id)
+                return false;
+            if (id->is_underscore()) { out = -1; return true; }
+            if (id->sym.kind != SymKind::local)
+                return false;
+            out = id->sym.slot;
+            return true;
+        };
+        int k_slot = -1, v_slot = -1;
+        if (!slot_of(0, k_slot))
+            return false;
+        if (fe->ids->elems.size() == 2 && !slot_of(1, v_slot))
+            return false;
+
+        const size_t start = chunk.code.size();
+        reset_temps();
+
+        /* Compile the dict container into a slot; DictIterInit's intrusive_ptr
+         * copy IS the once-eval snapshot (a body reassign of the container var
+         * can't change what we iterate). */
+        int dsrc;
+        if (!compile_boxed_expr(fe->container.get(), dsrc, chunk.code)) {
+            chunk.code.resize(start);
+            return false;
+        }
+        const int saved_base = temp_base;
+        temp_base = next_temp;      /* reserve dsrc for DictIterInit */
+
+        const int iter_id = alloc_dict_iter();
+
+        Instr init;
+        init.op = OpCode::DictIterInit;
+        init.node = fe->container.get();
+        init.target = iter_id;
+        init.target2 = dsrc;
+        chunk.code.push_back(init);
+
+        const int lnext = here();   /* test + bind + advance */
+        Instr nx;
+        nx.op = OpCode::DictIterNext;
+        nx.target2 = iter_id;
+        nx.a = slot_op(k_slot);     /* -1 == `_`/keys-only-unused */
+        nx.b = slot_op(v_slot);
+        const size_t nx_i = chunk.code.size();
+        chunk.code.push_back(nx);   /* .target (end_pc) backpatched below */
+
+        loops.push_back({});
+        if (!compile_scalar_body(body_stmts(fe->body.get()))) {
+            loops.pop_back();
+            temp_base = saved_base;
+            chunk.code.resize(start);
+            return false;
+        }
+
+        const int lcont = here();   /* continue -> back to DictIterNext */
+        Instr jb;
+        jb.op = OpCode::Jump;
+        jb.target = lnext;
+        chunk.code.push_back(jb);
+
+        const int lend = here();
+        chunk.code[nx_i].target = lend;
+        pop_loop(lend, lcont);
+        temp_base = saved_base;
+        return true;
+    }
+
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
     {
         for (const auto &e : elems)
@@ -2570,7 +2665,8 @@ struct Codegen {
             return;
         }
         if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
-            if (!try_native_foreach(fe))       /* flat int/float array only */
+            if (!try_native_foreach(fe)         /* flat/general array */
+                && !try_native_dict_foreach(fe))  /* live dict iterator */
                 emit(OpCode::EvalStmt, s);
             return;
         }
@@ -2707,6 +2803,7 @@ codegen_chunk(const Block *block, int slot_count)
     cg.gen_stmts(block->elems);
     cg.emit(OpCode::Halt);
     cg.chunk.n_temps = cg.max_temp - slot_count;
+    cg.chunk.n_dict_iters = cg.max_dict_iters;
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     extract_locs(cg.chunk);   /* move div/mod carets to the loc side table */

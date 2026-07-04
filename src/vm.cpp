@@ -402,9 +402,23 @@ vm_func_chunk(const FuncDeclStmt *fdecl)
     return &g_func_chunks.emplace(fdecl, std::move(ck)).first->second;
 }
 
+/* Per-loop LIVE dict-iterator state (DictIterInit/DictIterNext): the
+ * intrusive_ptr pins the dict alive for the loop, the iterator persists across
+ * iterations. One per native dict foreach in the chunk (Chunk::n_dict_iters),
+ * indexed by the codegen-assigned iter_id. Local to vm_run_chunk, so a `return`
+ * / exception mid-loop releases it when the frame unwinds - no cleanup op. */
+struct DictIterState {
+    intrusive_ptr<DictObject> dict;
+    DictObject::inner_type::iterator it;
+};
+
 void
 vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 {
+    /* Sized once from the chunk; empty (no alloc) for a no-dict-foreach
+     * chunk. */
+    std::vector<DictIterState> dict_iters(chunk.n_dict_iters);
+
     for (size_t pc = 0; ; ) {
 
         const Instr &in = chunk.code[pc];
@@ -677,6 +691,46 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 }
             }
             ctx.frame->at(in.target).put(RValue(in.node->eval(&ctx)));
+            pc++;
+            break;
+        }
+
+        case OpCode::DictIterInit: {
+
+            /* Pin the dict (an intrusive_ptr copy keeps it alive for the loop,
+             * matching the tree-walker's lifetime-extended `cval`) and set the
+             * live iterator to begin(). The inferencer proved a Dict static
+             * type; the ML_VM_CHECKs are the hardening net. */
+            ML_VM_CHECK(in.target >= 0
+                && static_cast<size_t>(in.target) < dict_iters.size());
+            const EvalValue &base = ctx.frame->at(in.target2).get();
+            ML_VM_CHECK(base.is<intrusive_ptr<DictObject>>());
+            DictIterState &st = dict_iters[in.target];
+            st.dict = base.get<intrusive_ptr<DictObject>>();
+            st.it = st.dict->get_ref().begin();
+            pc++;
+            break;
+        }
+
+        case OpCode::DictIterNext: {
+
+            /* Test the live iterator: on end jump to end_pc; else bind the key
+             * (and value) box-free - a plain EvalValue copy (LoadElemValue),
+             * matching the tree-walker's `elems = {p.first, p.second.get()}` -
+             * then advance. A slot of -1 is a `_` placeholder / the keys-only
+             * 1-var form (bind nothing). */
+            ML_VM_CHECK(in.target2 >= 0
+                && static_cast<size_t>(in.target2) < dict_iters.size());
+            DictIterState &st = dict_iters[in.target2];
+            if (st.it == st.dict->get_ref().end()) {
+                pc = static_cast<size_t>(in.target);
+                break;
+            }
+            if (in.a.slot >= 0)
+                ctx.frame->at(in.a.slot).put(st.it->first);
+            if (in.b.slot >= 0)
+                ctx.frame->at(in.b.slot).put(st.it->second.get());
+            ++st.it;
             pc++;
             break;
         }

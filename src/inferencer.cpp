@@ -1443,6 +1443,21 @@ void Inferencer::annotate_hints(Construct *n)
                 }
             }
         }
+
+        /* A non-indexed 1- or 2-var foreach over a proven DICT -> the VM's
+         * native live iterator (DictIterInit/DictIterNext). The map value is
+         * always a boxed LValue, so both the key and the value bind the general
+         * EvalValue box (box-free copy, like LoadElemValue) - no key/value
+         * TypeHint is needed. A `dyn` container that can't be proven a dict is
+         * left to the tree-walker fallback. */
+        const bool dict_form = !fe->indexed && fe->ids
+                            && (fe->ids->elems.size() == 1
+                                || fe->ids->elems.size() == 2);
+        if (dict_form) {
+            StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
+            if (c->kind == StaticTypeKind::Dict)
+                fe->container_is_dict = true;
+        }
     }
 
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });
