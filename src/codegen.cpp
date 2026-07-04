@@ -192,6 +192,19 @@ struct Codegen {
         return true;
     }
 
+    /* Emit EvalToSlot{temp = node->eval}, returning the temp as an operand, so
+     * a scalar-result call becomes a native int/float operand. */
+    Operand eval_to_temp(const Construct *e, std::vector<Instr> &ops)
+    {
+        const int t = alloc_temp();
+        Instr in;
+        in.op = OpCode::EvalToSlot;
+        in.node = e;
+        in.target = t;
+        ops.push_back(in);
+        return slot_op(t);
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<Instr> &ops)
     {
@@ -218,6 +231,13 @@ struct Codegen {
             in.a = idx;
             ops.push_back(in);
             out = slot_op(tt);
+            return true;
+        }
+
+        /* A scalar-result CALL (builtin/user) -> eval into a temp; the result
+         * is then a native int operand (native builtin dispatch). */
+        if (e->th == TypeHint::i && dynamic_cast<const CallExpr *>(e)) {
+            out = eval_to_temp(e, ops);
             return true;
         }
 
@@ -431,6 +451,13 @@ struct Codegen {
             in.a = idx;
             ops.push_back(in);
             out = slot_op(tt);
+            return true;
+        }
+
+        /* A scalar-result CALL (builtin/user) -> eval into a temp (native
+         * builtin dispatch); the result is then a native float operand. */
+        if (e->th == TypeHint::f && dynamic_cast<const CallExpr *>(e)) {
+            out = eval_to_temp(e, ops);
             return true;
         }
 

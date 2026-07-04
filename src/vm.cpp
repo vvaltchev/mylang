@@ -541,6 +541,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::EvalToSlot: {
+
+            /* A scalar-result call evaluated into a temp (native builtin/call
+             * dispatch): the result is then read as an int/float operand. */
+            ctx.frame->slots[in.target].put(RValue(in.node->eval(&ctx)));
+            pc++;
+            break;
+        }
+
         case OpCode::Halt:
             return;
         }

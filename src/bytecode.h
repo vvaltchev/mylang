@@ -134,6 +134,18 @@ enum class OpCode : unsigned char {
     StoreElemInt,
     StoreElemFloat,
 
+    /*
+     * Evaluate a scalar-returning CALL (a builtin - via the baked
+     * DirectBuiltinCallExpr fn pointer - or a user function) into a temp slot
+     * as an RValue (Phase 5): `target` = the dst temp, `node` = the CallExpr.
+     * The result is then an ordinary int/float operand, so a loop body like
+     * `s += sqrt(i)` / `s += f(i)` goes native instead of falling back whole.
+     * The call still evaluates its own args (the builtin ABI takes the
+     * unevaluated ExprList) - a fully Construct*-free builtin dispatch (args
+     * pre-evaluated into slots) is later work.
+     */
+    EvalToSlot,
+
     /* Stop the program. */
     Halt,
 };

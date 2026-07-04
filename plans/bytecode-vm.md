@@ -448,6 +448,16 @@ behind the differential harness:
   array(n,0)` + `c[i] = row` (array-valued statements, not scalar), so the whole
   nest tree-walks and the native 2-D reads inside never fire. A plain 2-D sum
   (no array building) DOES go native. 1303/1303 + 1155/1155.
+- **native builtin/call dispatch in an expression — DONE** (`40_math_builtins`
+  −10.6%, geomean 0.82x -> 0.81x). An `EvalToSlot` op evaluates a scalar-result
+  CALL (a builtin via the baked DirectBuiltinCallExpr fn pointer, or a user
+  function) into a temp, so its result is a native int/float operand and a loop
+  body like `s += sqrt(i)` / `s += f(i)` / `a[i] = sqrt(i)` goes native instead
+  of falling back wholesale. compile_int_expr/compile_float_expr emit it for a
+  CallExpr with scalar `th`. INTERIM: the call still evaluates its own args (the
+  builtin ABI takes the unevaluated ExprList), so this still holds a
+  `Construct*` - a fully Construct*-free builtin dispatch (args into slots, a
+  new builtin ABI) is later work toward the no-fallback end-goal.
 - **the real plateau:** the register machine has the scalar-loop wins (0.82x);
   the array/dict-heavy benchmarks now fall back for STRUCTURAL reasons that
   element-access ops don't fix - native array CREATION (`array(n,0)`, `[]`) +
