@@ -175,6 +175,17 @@ enum class OpCode : unsigned char {
     MoveV,
     BinOpV,
 
+    /*
+     * Boxed compound-assign `dst OP= b` (dst = a frame slot, b a slot operand,
+     * aop the BASE arith Op): copies the lvalue's value (NOT clone - so a
+     * container mutates IN PLACE, matching the tree-walker's `newVal =
+     * slot->get(); apply_compound_op(newVal, rhs, op)`), applies num_bin_op,
+     * stores back. `node` = the statement (for the error loc). Only for a
+     * dyn/string lvalue - a typed int/float compound is the IntBin/FloatBin
+     * fast path.
+     */
+    CompoundV,
+
     /* Stop the program. */
     Halt,
 };

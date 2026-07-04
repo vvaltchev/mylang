@@ -618,6 +618,26 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CompoundV: {
+            /* dst OP= b: COPY the lvalue (a container shares its handle, so the
+             * op mutates it in place), apply num_bin_op, store back - identical
+             * to doAssign's compound branch. */
+            EvalValue nv = ctx.frame->slots[in.target].get();
+            try {
+                num_bin_op(nv, ctx.frame->slots[in.b.slot].get(),
+                           binop_pmf(in.aop));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = in.node->start;
+                    e.loc_end = in.node->end;
+                }
+                throw;
+            }
+            ctx.frame->slots[in.target].put(std::move(nv));
+            pc++;
+            break;
+        }
+
         case OpCode::Halt:
             return;
         }

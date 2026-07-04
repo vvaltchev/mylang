@@ -127,6 +127,20 @@ bool is_boxed_binop(Op op)
     }
 }
 
+/* The BASE arith Op of a boxed compound-assign (`+=` -> plus), or Op::invalid
+ * if `op` isn't a compound-assign the boxed CompoundV handles. */
+Op compound_base_op(Op op)
+{
+    switch (op) {
+        case Op::addeq: return Op::plus;
+        case Op::subeq: return Op::minus;
+        case Op::muleq: return Op::times;
+        case Op::diveq: return Op::div;
+        case Op::modeq: return Op::mod;
+        default:        return Op::invalid;
+    }
+}
+
 /* Bake a scalar/string literal into an EvalValue for the boxed const pool.
  * Returns false for a non-scalar literal (an array/dict LiteralObj) - later. */
 bool boxed_literal(const Construct *e, EvalValue &out)
@@ -325,15 +339,20 @@ struct Codegen {
      * for a resolved-local lvalue whose decl needs NO numeric coercion
      * (decl_type none / dyn), so a plain slot write matches the tree-walker's
      * doAssign (a typed int/float/bool/str decl coerces via coerce_to_decl_type
-     * - left to the fallback). Covers a decl AND a plain assign (both write
-     * the slot); compound-assign (`+=`) is not boxed yet. The producing op is
-     * retargeted to write the lvalue directly (a leaf copy uses MoveV, an alias
-     * matching doAssign). Rolls back the const pool on failure.
+     * - left to the fallback). Covers a decl, a plain assign (both write the
+     * slot), AND a compound-assign (`+=` -> a CompoundV read-modify-write). A
+     * plain assign's producing op is retargeted to write the lvalue directly (a
+     * leaf copy uses MoveV, an alias matching doAssign). Rolls back the const
+     * pool on failure.
      */
     bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
     {
         const Expr14 *e = dynamic_cast<const Expr14 *>(s);
-        if (!e || e->op != Op::assign)
+        if (!e)
+            return false;
+        const bool is_assign = e->op == Op::assign;
+        const Op cbase = compound_base_op(e->op);   /* `+=` -> plus, else inv */
+        if (!is_assign && cbase == Op::invalid)
             return false;
         const Identifier *lv =
             dynamic_cast<const Identifier *>(e->lvalue.get());
@@ -355,6 +374,18 @@ struct Codegen {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             return false;
+        }
+
+        /* Compound-assign `lv OP= rhs` -> a boxed read-modify-write. */
+        if (!is_assign) {
+            Instr in;
+            in.op = OpCode::CompoundV;
+            in.node = s;
+            in.target = lv->sym.slot;
+            in.b = slot_op(rslot);
+            in.aop = cbase;
+            ops.push_back(in);
+            return true;
         }
 
         if (rslot != lv->sym.slot) {

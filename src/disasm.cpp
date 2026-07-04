@@ -177,6 +177,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
                 << reg_or_imm(in.b, false);
             break;
+        case OpCode::CompoundV:
+            row << "compound.v   r" << in.target << " " << opsym(in.aop)
+                << "= " << reg_or_imm(in.b, false);
+            break;
         case OpCode::Halt:
             row << "halt";
             break;
