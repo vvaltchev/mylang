@@ -322,6 +322,26 @@ struct Codegen {
             return true;
         }
 
+        /* A subscript READ `a[i]` (general array / dict / string element) ->
+         * SubscriptV via the runtime Type::subscript. (A slice is a separate
+         * node, not handled here.) */
+        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+            int base_slot, idx_slot;
+            if (!compile_boxed_expr(sub->what.get(), base_slot, ops)
+                || !compile_boxed_expr(sub->index.get(), idx_slot, ops))
+                return false;
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::SubscriptV;
+            in.node = sub;
+            in.target = t;
+            in.target2 = base_slot;
+            in.a = slot_op(idx_slot);
+            ops.push_back(in);
+            out_slot = t;
+            return true;
+        }
+
         /* An arith (`a+b`) / comparison (`a<b`) / logical (`a&&b`) chain, as a
          * raw ExprNN OR a TypedScalarExpr - `A && B` of comparisons specializes
          * to a logical even when the comparisons are boxed over a dyn operand,

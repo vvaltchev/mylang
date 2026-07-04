@@ -703,6 +703,27 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
+        case OpCode::SubscriptV: {
+            /* base[idx] read via the runtime Type::subscript (any base type -
+             * array / dict / string), an LValue* to the base slot passed like
+             * Subscript::do_eval, for_write=false, RValue'd into dst. */
+            LValue &base_lv = ctx.frame->slots[in.target2];
+            const EvalValue &idx = ctx.frame->slots[in.a.slot].get();
+            try {
+                Type *t = base_lv.get().get_type();
+                ctx.frame->slots[in.target].put(
+                    RValue(t->subscript(EvalValue(&base_lv), idx, false)));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = in.node->start;
+                    e.loc_end = in.node->end;
+                }
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::JumpUnlessTrueV:
             if (!ctx.frame->slots[in.target2].get().is_true())
                 pc = in.target;

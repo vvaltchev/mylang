@@ -200,6 +200,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
         case OpCode::LoadBuiltinV:
             row << "load.builtin r" << in.target << ", b" << in.target2;
             break;
+        case OpCode::SubscriptV:
+            row << "subscript.v  r" << in.target << " = r" << in.target2
+                << "[" << reg_or_imm(in.a, false) << "]";
+            break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  r" << in.target2 << ", L" << in.target;
             break;

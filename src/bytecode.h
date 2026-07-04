@@ -219,6 +219,15 @@ enum class OpCode : unsigned char {
     LoadBuiltinV,
 
     /*
+     * Boxed subscript READ `dst = base[idx]` (a general array / dict / string
+     * element - the typed flat-array path is LoadElem*). `target2` = the base
+     * slot, `a` = the index slot, `node` = the Subscript (error loc). Calls the
+     * runtime Type::subscript(for_write=false) with an LValue* to the base slot
+     * (matching Subscript::do_eval) and RValues the result into `target`.
+     */
+    SubscriptV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()
