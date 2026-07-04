@@ -3784,6 +3784,71 @@ static bool is_lvalue_rooted(const Construct *c)
     return false;
 }
 
+/*
+ * The VALUE-read path of a member access `base.member` - a struct field / POD
+ * field / struct const / struct-type const / dict key / optional-`?.` none.
+ * Shared by MemberExpr::do_eval and the boxed VM's MemberV op. ALWAYS returns a
+ * value (never an assignable LValue*); the lvalue / auto-vivify WRITE paths
+ * stay in do_eval (they need `what` for rooting and the for_write flag). An
+ * error carries the MemberExpr's loc.
+ */
+EvalValue member_read(const EvalValue &dval, const MemberExpr *m)
+{
+    if (m->optional && dval.is<NoneVal>())
+        return EvalValue();
+
+    if (dval.is<intrusive_ptr<StructObject>>()) {
+
+        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
+        const int slot = obj->def->slot_of(m->memUid);
+
+        if (slot >= 0)
+            return obj->is_pod() ? obj->pod_get(slot)
+                                 : obj->fields[slot].get();
+
+        if (const EvalValue *cv = obj->def->const_of(m->memUid))
+            return *cv;
+
+        throw TypeErrorEx(
+            intern_msg("Struct '" + string(obj->def->name->val) +
+                       "' has no member '" + string(m->memUid->val) + "'"),
+            m->start, m->end);
+    }
+
+    /* A struct TYPE descriptor: only its `const` members (no instance). */
+    if (dval.is<StructTypeDef *>()) {
+
+        StructTypeDef *def = dval.get<StructTypeDef *>();
+
+        if (const EvalValue *cv = def->const_of(m->memUid))
+            return *cv;
+
+        if (def->slot_of(m->memUid) >= 0)
+            throw TypeErrorEx(
+                intern_msg("Field '" + string(m->memUid->val) +
+                           "' needs an instance"), m->start, m->end);
+
+        throw TypeErrorEx(
+            intern_msg("Struct '" + string(def->name->val) +
+                       "' has no member '" + string(m->memUid->val) + "'"),
+            m->start, m->end);
+    }
+
+    if (!dval.is<intrusive_ptr<DictObject>>())
+        throw TypeErrorEx("Expected dict object",
+                          m->what->start, m->what->end);
+
+    const auto &obj = dval.get<intrusive_ptr<DictObject>>();
+    DictObject::inner_type &data = obj->get_ref();
+    const auto &it = data.find(m->memId);
+
+    if (it != data.end())            /* present key -> the value */
+        return it->second.get();
+    if (obj->get_has_default())      /* a default dict -> its default */
+        return obj->get_default();
+    throw KeyNotFoundEx(m->start, m->end);   /* missing -> throw */
+}
+
 EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     /* Consume the plain-assignment-target flag (see Subscript::do_eval). */
@@ -3792,107 +3857,57 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
 
     EvalValue &&dval = RValue(what->eval(ctx));
 
-    /* `a?.b`: if the base is none, the access short-circuits to none (the
-     * member is not looked up). Each `?.` guards its own base. */
-    if (optional && dval.is<NoneVal>())
-        return EvalValue();
-
     /*
-     * A struct instance: `s.field` is a field (an lvalue when the instance is
-     * mutable, so `s.f = v` / `s.f += v` work; an rvalue for a read-only/const
-     * instance, so a write fails NotLValueEx), else `s.K` is a const member,
-     * else field-not-found.
+     * The assignable-lvalue / auto-vivify paths need `what` (rooting) or the
+     * for_write flag; every other case is a VALUE read via member_read (shared
+     * with the boxed VM's MemberV op).
      */
     if (dval.is<intrusive_ptr<StructObject>>()) {
 
         const auto &obj = dval.get<intrusive_ptr<StructObject>>();
         const int slot = obj->def->slot_of(memUid);
 
-        if (slot >= 0) {
-            /*
-             * A POD field has no per-field LValue (it is bytes), so a read
-             * always returns the value; a write goes through
-             * try_pod_struct_store (handle_single_expr14), never this lvalue
-             * path.
-             */
-            if (obj->is_pod())
-                return obj->pod_get(slot);
-            /*
-             * Boxed: hand out an assignable field lvalue ONLY when the base is
-             * rooted at a variable (so the StructObject outlives this call).
-             * For a read-only instance, or a *temporary* base (`Point(1,2).x`,
-             * a call result), return the value by copy - a field lvalue into a
-             * soon-freed temporary would dangle, and a temporary's field isn't
-             * assignable anyway.
-             */
-            if (obj->is_readonly() || !is_lvalue_rooted(what.get()))
-                return obj->fields[slot].get();
+        /*
+         * A rooted, mutable, boxed field -> an assignable field lvalue (so
+         * `s.f = v` / `s.f += v` work). A POD field (bytes, no per-field
+         * LValue), a read-only instance, or a temporary base (`Point(1,2).x`)
+         * is a value read - member_read handles those.
+         */
+        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly()
+            && is_lvalue_rooted(what.get()))
             return &obj->fields[slot];
+
+    } else if (dval.is<intrusive_ptr<DictObject>>()) {
+
+        const auto &obj = dval.get<intrusive_ptr<DictObject>>();
+        DictObject::inner_type &data = obj->get_ref();
+        const auto &it = data.find(memId);
+
+        /*
+         * `d.key` mirrors `d[key]` (TypeDict::subscript): present -> the value
+         * (an lvalue when mutable, so `d.k = v` / `d.k += v` work); missing ->
+         * the default (default dict), else auto-vivify on a plain-assignment
+         * target, else throw. A readonly dict's read (present / default /
+         * missing) is member_read's job.
+         */
+        if (!obj->is_readonly()) {
+            if (it != data.end())
+                return &it->second;
+            if (obj->get_has_default())
+                return &(*data.emplace(memId, LValue(obj->get_default(), false))
+                              .first).second;
+            if (for_write)
+                return &(*data.emplace(memId,
+                    LValue(none, false)).first).second;
+            throw KeyNotFoundEx(start, end);
         }
-
-        if (const EvalValue *cv = obj->def->const_of(memUid))
-            return *cv;
-
-        throw TypeErrorEx(
-            intern_msg("Struct '" + string(obj->def->name->val) +
-                       "' has no member '" + string(memUid->val) + "'"),
-            start, end);
+        /* A readonly dict + a for_write missing-key (no default) -> `none`, so
+         * the ensuing write fails NotLValueEx (not a KeyNotFound read). */
+        if (for_write && it == data.end() && !obj->get_has_default())
+            return none;
     }
 
-    /* A struct TYPE descriptor: only its `const` members (no instance). */
-    if (dval.is<StructTypeDef *>()) {
-
-        StructTypeDef *def = dval.get<StructTypeDef *>();
-
-        if (const EvalValue *cv = def->const_of(memUid))
-            return *cv;
-
-        if (def->slot_of(memUid) >= 0)
-            throw TypeErrorEx(
-                intern_msg("Field '" + string(memUid->val) +
-                           "' needs an instance"), start, end);
-
-        throw TypeErrorEx(
-            intern_msg("Struct '" + string(def->name->val) +
-                       "' has no member '" + string(memUid->val) + "'"),
-            start, end);
-    }
-
-    if (!dval.is<intrusive_ptr<DictObject>>())
-        throw TypeErrorEx("Expected dict object", what->start, what->end);
-
-    const auto &obj = dval.get<intrusive_ptr<DictObject>>();
-    DictObject::inner_type &data = obj->get_ref();
-    const auto &it = data.find(memId);
-
-    /*
-     * `d.key` mirrors `d[key]` (TypeDict::subscript): present -> the value
-     * (lvalue when mutable, so `d.k = v` / `d.k += v` work); missing -> the
-     * default (default dict), else throw on a read / auto-vivify on a plain-
-     * assignment target. So `d.k` is non-opt (a value or an exception, never
-     * none); use get()/get!() for explicit nullable / fail-fast lookup.
-     */
-    if (obj->is_readonly()) {
-        if (it != data.end())
-            return it->second.get();
-        if (obj->get_has_default())
-            return obj->get_default();
-        if (for_write)
-            return none;            /* write then fails NotLValueEx */
-        throw KeyNotFoundEx(start, end);
-    }
-
-    if (it != data.end())
-        return &it->second;
-
-    if (obj->get_has_default())
-        return &(*data.emplace(memId, LValue(obj->get_default(), false))
-                      .first).second;
-
-    if (for_write)
-        return &(*data.emplace(memId, LValue(none, false)).first).second;
-
-    throw KeyNotFoundEx(start, end);
+    return member_read(dval, this);
 }
 
 /*

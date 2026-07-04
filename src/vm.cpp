@@ -724,6 +724,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::MemberV:
+            /* base.member value read via the shared member_read (struct field /
+             * const / dict key / optional); errors carry the MemberExpr loc. */
+            ctx.frame->slots[in.target].put(
+                member_read(ctx.frame->slots[in.target2].get(),
+                            static_cast<const MemberExpr *>(in.node)));
+            pc++;
+            break;
+
         case OpCode::JumpUnlessTrueV:
             if (!ctx.frame->slots[in.target2].get().is_true())
                 pc = in.target;

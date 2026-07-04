@@ -228,6 +228,14 @@ enum class OpCode : unsigned char {
     SubscriptV,
 
     /*
+     * Boxed member READ `dst = base.member` (a struct field / const / dict key
+     * / optional-`?.`). `target2` = the base slot, `node` = the MemberExpr (its
+     * memUid/memId/optional/loc). Calls the shared member_read (the value-read
+     * path of MemberExpr::do_eval) into `target`.
+     */
+    MemberV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()

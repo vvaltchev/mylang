@@ -307,6 +307,11 @@ LValue &builtin_slot(int index);
 /* did the builtin come from const_builtins (visible during const-eval)? */
 bool builtin_is_const(int index);
 
+/* The VALUE-read path of `base.member` (a struct field / const / dict key /
+ * optional-none), shared by MemberExpr::do_eval and the VM's MemberV. */
+class MemberExpr;
+EvalValue member_read(const EvalValue &base, const MemberExpr *m);
+
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
 void run_weight_bench();

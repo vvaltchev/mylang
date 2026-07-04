@@ -342,6 +342,22 @@ struct Codegen {
             return true;
         }
 
+        /* A member READ `obj.f` / `d.k` -> MemberV (shared member_read). */
+        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+            int base_slot;
+            if (!compile_boxed_expr(m->what.get(), base_slot, ops))
+                return false;
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::MemberV;
+            in.node = m;
+            in.target = t;
+            in.target2 = base_slot;
+            ops.push_back(in);
+            out_slot = t;
+            return true;
+        }
+
         /* An arith (`a+b`) / comparison (`a<b`) / logical (`a&&b`) chain, as a
          * raw ExprNN OR a TypedScalarExpr - `A && B` of comparisons specializes
          * to a logical even when the comparisons are boxed over a dyn operand,

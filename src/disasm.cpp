@@ -204,6 +204,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "subscript.v  r" << in.target << " = r" << in.target2
                 << "[" << reg_or_imm(in.a, false) << "]";
             break;
+        case OpCode::MemberV:
+            row << "member.v     r" << in.target << " = r" << in.target2
+                << ".<member>";
+            break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  r" << in.target2 << ", L" << in.target;
             break;
