@@ -527,6 +527,41 @@ behind the differential harness:
   a non-inlined one (a closure) is better left to fall back. `11_closure_counter`
   +4.05% -> **+0.0%**, with `40_math_builtins` still −10.6% and `08_func_call`
   still −64% (native via inlining). Geomean holds 0.73x. 1304/1304 + 1155/1155.
+- **VM-level exceptions (kill the C++-throw overhead) — DESIGNED, not yet built
+  (deliberately NOT big-banged).** `-vd` audit: `42_exceptions` (a loop doing
+  200k `throw`/`catch`) is ONE `eval.stmt` - the whole `try/catch` loop
+  tree-walks, so every throw is a C++ throw (~1.6µs each: heap alloc + DWARF
+  unwind). Loop control flow is already VM-level (Gap B: return/break/continue
+  are jumps/flow-stops, no C++ throw); this is the remaining piece. The
+  mechanism
+  (per the maintainer's "smart assembly, VM-level handler table" vision):
+  - `exc` register in vm_run_chunk (the in-flight thrown value) + a runtime
+    HANDLER STACK (active try regions' catch-dispatch pc).
+  - `EnterTry{catch_dispatch}` / `LeaveTry` push/pop the handler stack.
+  - native `Throw{expr}`: `exc = wrap(eval(expr))` (reuse ThrowStmt's struct ->
+    ExceptionObject wrap), then JUMP to the enclosing try's catch-dispatch
+    (compile-time known for a lexical throw) - NO C++ throw.
+  - catch-dispatch: `CatchTest{type, handler}` ops reusing `do_catch`'s matching
+    (by struct-type name / built-in name), then bind `catch (T as e)`, else
+    re-propagate (jump to the outer handler, or set the error + return).
+  - CHUNK-LEVEL C++ boundary (REQUIRED for correctness): a fallback op inside a
+    try can still C++-throw (a builtin error, a struct-construction failure in a
+    `throw` arg). vm_run_chunk wraps its dispatch in `try{}catch(Exception&)`;
+    on
+    a C++ throw it consults the handler stack and resumes at the catch-dispatch
+    (or rethrows if none). So native throws pay no C++ throw; fallback throws
+    are
+    still caught, just VM-routed.
+  - `finally` (scope-guard flow-suspend/resume), `rethrow`, nested try, and the
+    uncaught-propagation BACKTRACE must stay byte-identical (the differential
+    harness checks exception type/message/Loc/backtrace) - this is why it's a
+    focused MULTI-COMMIT effort, not one drop. Suggested increments: (1) the
+    handler stack + chunk-level C++ boundary + `try/catch` compiled to a handler
+    region with throw STILL C++ (structure native, behavior identical - a safe
+    base); (2) native `Throw` op (removes the C++ throw - the `42_exceptions`
+    win); (3) `finally`/`rethrow`/binding; each gated on the differential
+    harness
+    + `-vd`. See `[[vm-endgame]]`.
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct
