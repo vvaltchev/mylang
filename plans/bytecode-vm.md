@@ -7,9 +7,27 @@ NESTED (nested loops + `if` in a body compile directly into the chunk with
 backpatching); array element read/write `a[i]` / `a[i]=v` / `a[i][j]` and a
 scalar builtin/call in an expression are native; a flow-free statement runs as a
 fallback within an otherwise-native loop, so array-building loops (matrix/sieve)
-go native. **Suite geomean 0.75x (VM ~1.3x faster than the tree-walker)**;
-recursion stays neutral; Phases 0–4 done; the whole `-rt` suite passes under
-both engines. Branch: `exp-work`.
+go native. NOW ALSO: native-first codegen for FUNCTION BODIES + top-level (not
+only loop bodies - `gen_stmt` tries the register machine first), `LoadImm` for
+constant moves, native for-init, native COMPOUND loop conditions (`while (A &&
+B)` -> a compare-branch chain), and an M8 fix so an auto-const-folded operand
+(`var N=8; while(i<N)`) specializes (mandelbrot/bit_hash went whole-loop
+fallback -> native). Disassembly reads as `i.jmp.ifnot a < b, L` / `load rN,#k`.
+**Suite geomean ~0.73x (VM ~1.35x faster than the tree-walker)**; recursion
+stays neutral; the whole `-rt` suite passes under both engines. Branch:
+`exp-work`.
+
+**THE DIRECTIVE (user, 2026-07-04), see [[vm-endgame]]:** do it ALL (every
+statement/expression kind native, ordered by EASE not perf impact); native ops
+must fully support `dyn`/general values and NEVER fall back to the tree walker;
+the end state removes `Construct*`/`EvalStmt` entirely; and the ops must be
+primitive enough to lower to real machine code (x86-64/arm64) later - so an op
+may call a runtime function (num_bin_op, a builtin, a Type method) but may NOT
+`node->eval()`. The current `EvalStmt`/`EvalToSlot` fallbacks are TEMPORARY
+scaffolding. **The big missing piece is a BOXED general-value path** (EvalValue
+registers + load/store/binop/call/subscript/make ops over the runtime), the
+tier below the typed unboxed fast path, that makes a `dyn` value / string / dict
+/ struct / general call run as native ops. See "Boxed general-value path" below.
 
 The design + incremental task plan for MyLang's runtime bytecode VM. Read the
 CLAUDE.md section "Execution strategy: strip compile-time overhead first, THEN
@@ -527,6 +545,41 @@ behind the differential harness:
   a non-inlined one (a closure) is better left to fall back. `11_closure_counter`
   +4.05% -> **+0.0%**, with `40_math_builtins` still −10.6% and `08_func_call`
   still −64% (native via inlining). Geomean holds 0.73x. 1304/1304 + 1155/1155.
+
+### The BOXED general-value path (the zero-fallback / dyn tier) — the big piece
+
+The typed unboxed int/float register machine is only the fast tier. To satisfy
+the directive (never fall back, full `dyn` support, `Construct*`-free, machine-
+code-lowerable) there must be a SECOND tier: a boxed value machine whose
+registers hold `EvalValue`s and whose ops call the runtime directly (no
+`node->eval`). This is what makes a `dyn` value, a string/dict/struct op, a
+general call, `foreach`, etc. run native. Ops (all operate on EvalValue frame
+slots / a value-register file - "unlimited registers"):
+- **loads:** `LoadSlotV dst, slot` (RValue of a local), `LoadGlobalV`,
+  `LoadCaptureV`, `LoadConstV dst, const#` (a baked literal EvalValue),
+  `LoadBuiltinV`. (Replaces the const/ident leaves of an EvalExpr.)
+- **stores:** `StoreSlotV slot, src`, `StoreGlobalV`, `StoreElemV arr, idx,
+  src` (Type::subscript for-write), `StoreMemberV`.
+- **ops:** `BinOpV dst, a, b, Op` (dispatch through `num_bin_op` / the `Type`
+  vtable - a runtime call, machine-code-legal), `UnOpV`, `CmpV`.
+- **access:** `SubscriptV dst, base, idx`, `MemberV dst, base, name#`, `SliceV`.
+- **calls:** `CallV dst, callee, argc` with args pre-evaluated into value
+  registers - this REQUIRES evolving the builtin ABI off the unevaluated
+  `ExprList` (today builtins take `ExprList*` and eval args themselves; the
+  end-state passes a `span<EvalValue>`). Until then a builtin call is the last
+  `Construct*` holdout.
+- **make:** `MakeArrayV`, `MakeDictV`, `MakeStructV` (from value registers).
+- **iterate:** a `foreach` lowers to get-iterator + a native loop over
+  ForeachV-step ops.
+Control flow already exists (jumps + the planned VM-level throw/catch). The
+typed tier and the boxed tier interoperate through the frame slots (a typed op
+writes an int slot; a boxed op boxing it reads the same slot as an EvalValue).
+**Order by EASE:** boxed binary-op + load/store (kills the scalar `EvalStmt`
+first), then subscript/member, then make-array/dict, then `foreach`, then the
+builtin-ABI change + `CallV`, then string/struct/dict builtins fall out. Each
+step deletes a class of `EvalStmt`/`EvalToSlot` and is gated on the differential
+harness + `-vd` (watch the `eval.stmt` count fall toward zero).
+
 - **VM-level exceptions (kill the C++-throw overhead) — DESIGNED, not yet built
   (deliberately NOT big-banged).** `-vd` audit: `42_exceptions` (a loop doing
   200k `throw`/`catch`) is ONE `eval.stmt` - the whole `try/catch` loop
