@@ -101,8 +101,13 @@ enum class OpCode : unsigned char {
 struct Operand {
     bool is_lit = false;
     int slot = -1;         /* frame slot index when !is_lit */
-    int_type lit = 0;      /* int immediate when is_lit (IntBin ops) */
-    float_type flit = 0;   /* float immediate when is_lit (FloatBin ops) */
+    /* The immediate when is_lit. An int op (IntBin) reads `lit`, a float op
+     * (FloatBin) reads `flit`; the two are mutually exclusive, so they share
+     * storage - the operand is written and read as one kind throughout. */
+    union {
+        int_type lit = 0;
+        float_type flit;
+    };
 };
 
 struct Instr {

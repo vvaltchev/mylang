@@ -10583,8 +10583,20 @@ static bool vm_codegen_shapes()
         g.flstep == 1 && g.juic == 1 && g.intbin >= 1
         && g.back == 0 && g.jmp == 0;
 
+    /* 8) a DECL with an arith rvalue inside a loop body compiles natively (the
+     * register machine treats `var t = <int expr>` like a plain assign to t's
+     * frame slot) - no fallback. */
+    VmOpCounts h;
+    if (!codegen_counts({
+            "var i = 0; var s = 0;",
+            "while (i < 5) { var t = i*2; s += t; i++; }",
+        }, h))
+        return false;
+    const bool decl_ok =
+        h.juic == 1 && h.intbin >= 3 && h.back == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
-        && float_ok && mixed_ok && for_ok;
+        && float_ok && mixed_ok && for_ok && decl_ok;
 }
 
 static const std::vector<extra_check> extra_checks =

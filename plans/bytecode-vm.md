@@ -318,13 +318,25 @@ x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
   loops live in functions. The scalar register machine (int/float/nested/mixed
   `while`) is otherwise complete.
 
-### Phase 3 — compact the Instr encoding + broaden native statements
-- The `Instr` grew (two `Operand`s + `aop`) to carry register ops; harmless now
-  (top-level Instr counts are small) but compact it (operand pool / variant)
-  before function bodies compile many Instrs.
-- Broaden native statements/expressions on the register machine (decls, more
-  assign shapes), reusing the `slot_rmw` semantics.
-- **Exit**: common assignment/decl native; suite green both; no regression.
+### Phase 3 — compact the Instr encoding + confirm statement coverage — **DONE**
+- **Instr compaction:** an `Operand`'s int immediate (`lit`) and float immediate
+  (`flit`) are mutually exclusive, so they now share a **union** →
+  `sizeof(Operand)` 24→16, `sizeof(Instr)` 80→64 (−20%). Perf-neutral now
+  (geomean holds 0.89x, top-level chunks are small) but it matters once Phase 4
+  compiles many function-body Instrs. (Further compaction — a per-opcode
+  variant / operand pool — is possible but deferred; 64 B is fine.)
+- **Statement coverage:** the register machine already made assignments/
+  compound-assigns/inc-dec native in Phase 2; **decls with an arith/literal
+  rvalue** (`var t = i*2`, `var k = 100`) also compile natively (the plain
+  assign path treats them as a write to `t`'s frame slot) - verified and pinned
+  by a shape test. So the Phase-3 exit ("common assignment/decl native") is met.
+- **Residual (documented, not a gap to fix now):** an int **leaf copy**
+  (`x = y`, `var t = i`) stays a fallback — a bare `th == i` leaf can be a bool,
+  and writing an int into a bool slot would corrupt it; distinguishing needs a
+  separate bool `TypeHint`, too invasive for the value. A NATIVE `if` inside a
+  loop body (conditionals in loops) is genuinely valuable but is control flow
+  (needs the loop to emit directly into the chunk with backpatching, not into a
+  temp op vector) — deferred to the long-tail (Phase 5).
 
 ### Phase 4 — function calls + call stack (~500 LoC)
 The maintainer's "global bytecode / stack / calls in the VM" milestone. Removes
