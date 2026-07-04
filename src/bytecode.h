@@ -99,4 +99,11 @@ struct Instr {
 
 struct Chunk {
     std::vector<Instr> code;
+    /*
+     * Scratch frame slots the register machine needs for expression
+     * intermediates, laid out ABOVE the resolved locals: temps occupy
+     * [slot_count, slot_count + n_temps). vm_execute sizes the frame to fit
+     * them. Zero when no native expression needed a temp.
+     */
+    int n_temps = 0;
 };

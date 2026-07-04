@@ -7,7 +7,6 @@
 
 namespace {
 
-/* An int immediate operand. */
 Operand int_lit(int_type v)
 {
     Operand o;
@@ -16,12 +15,19 @@ Operand int_lit(int_type v)
     return o;
 }
 
+Operand slot_op(int slot)
+{
+    Operand o;
+    o.is_lit = false;
+    o.slot = slot;
+    return o;
+}
+
 /*
  * Read `e` as a LEAF int operand: a resolved-local int frame slot, or an int
- * literal. Returns false for anything else (a global/capture slot, a float, a
- * nested expression, a call, ...) - the enclosing loop then falls back. Only
- * `SymKind::local` slots are registers here (main-frame / current call); a
- * bool slot also carries `th == i` and is read defensively at runtime.
+ * literal. Returns false for anything else. Only `SymKind::local` slots are
+ * registers here; a bool slot also carries `th == i` and is read defensively
+ * (as 0/1) at runtime.
  */
 bool as_int_operand(const Construct *e, Operand &out)
 {
@@ -31,8 +37,7 @@ bool as_int_operand(const Construct *e, Operand &out)
     }
     if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
         if (id->sym.kind == SymKind::local && id->th == TypeHint::i) {
-            out.is_lit = false;
-            out.slot = id->sym.slot;
+            out = slot_op(id->sym.slot);
             return true;
         }
     }
@@ -40,91 +45,42 @@ bool as_int_operand(const Construct *e, Operand &out)
 }
 
 /*
- * Compile statement `s` to native int op(s) appended to `out`. Handles a
- * compound assignment (`x += y` etc.) and `x++`/`x--` where the target is a
- * resolved-local int slot and the rhs is a leaf int operand. Returns false
- * otherwise (plain assign, nested rhs, float, a call, ...) so the loop falls
- * back. Postfix vs prefix on `++`/`--` is irrelevant as a statement.
+ * Is `e` a DEFINITELY-int (never bool) expression? An arithmetic or unary-minus
+ * TypedScalarExpr always yields int (arith promotes bool operands to int); an
+ * int literal is int. A bare leaf Identifier is ambiguous (`th == i` also
+ * covers bool) and a comparison/logical yields bool - both excluded. Used to
+ * decide a PLAIN assignment `x = rhs` is safe (writing an int result to a bool
+ * slot would corrupt it; but a valid `x = <int>` requires x to accept int, so x
+ * is int - never bool).
  */
-bool gen_int_stmt(const Construct *s, std::vector<Instr> &out)
+bool definitely_int(const Construct *e)
 {
-    if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
-        Operand dst;
-        if (inc->th == TypeHint::i && as_int_operand(inc->lvalue.get(), dst)
-            && !dst.is_lit) {
-            Instr in;
-            in.op = OpCode::IntBin;
-            in.node = s;
-            in.target = dst.slot;
-            in.a = dst;
-            in.b = int_lit(1);
-            in.aop = inc->is_inc ? Op::plus : Op::minus;
-            out.push_back(in);
-            return true;
-        }
-        return false;
-    }
-
-    if (const Expr14 *e = dynamic_cast<const Expr14 *>(s)) {
-        Operand dst, rhs;
-        if (!as_int_operand(e->lvalue.get(), dst) || dst.is_lit)
-            return false;
-
-        Op arith;
-        switch (e->op) {
-            case Op::addeq: arith = Op::plus;  break;
-            case Op::subeq: arith = Op::minus; break;
-            case Op::muleq: arith = Op::times; break;
-            case Op::diveq: arith = Op::div;   break;
-            case Op::modeq: arith = Op::mod;   break;
-            /* plain assign + others: fall back (compiled in a later step). */
-            default: return false;
-        }
-
-        if (!as_int_operand(e->rvalue.get(), rhs))
-            return false;
-
-        Instr in;                       /* dst = dst <arith> rhs */
-        in.op = OpCode::IntBin;
-        in.node = s;
-        in.target = dst.slot;
-        in.a = dst;
-        in.b = rhs;
-        in.aop = arith;
-        out.push_back(in);
+    if (dynamic_cast<const LiteralInt *>(e))
         return true;
-    }
-
-    return false;
+    const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+    return t && t->kind == TypeHint::i
+        && (t->cat == TypedScalarExpr::Cat::arith
+            || t->cat == TypedScalarExpr::Cat::neg);
 }
 
 /*
- * Read a while condition as a fused int comparison of two leaf operands. After
- * specialize_types, `i < N` is a TypedScalarExpr(cat=cmp, kind=i) with elems
- * [(invalid, a), (cmpOp, b)]. Returns false for any other shape.
- */
-bool gen_int_cond(const Construct *cond, Operand &a, Op &cmp, Operand &b)
-{
-    const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
-    if (!t || t->cat != TypedScalarExpr::Cat::cmp || t->kind != TypeHint::i)
-        return false;
-    if (t->elems.size() != 2)
-        return false;
-    cmp = t->elems[1].first;
-    return as_int_operand(t->elems[0].second.get(), a)
-        && as_int_operand(t->elems[1].second.get(), b);
-}
-
-/*
- * Lowers a statement list to a Chunk. `if` and `while` become native jumps
- * (Phase 1); a `while` whose condition + body are all resolved-local int ops
- * (Phase 2) compiles with no tree-walker fallback. `for` is NOT flattened -
- * ForStmt::do_eval wraps its body in a child EvalContext (loop-variable scope)
- * a naive flatten would drop. See plans/bytecode-vm.md.
+ * Lowers a statement list to a Chunk. `if`/`while` become native jumps
+ * (Phase 1); a `while` whose condition + body are resolved-local int ops
+ * compiles to the register machine (Phase 2), the VM's registers being the
+ * frame slots. Nested int expressions use scratch TEMP slots laid out above the
+ * resolved locals. See plans/bytecode-vm.md.
  */
 struct Codegen {
 
     Chunk chunk;
+
+    /* Temp (scratch register) allocator. temp_base == the frame's slot_count;
+     * temps grow above it. Reset to base per statement (a statement's temps are
+     * dead once its result is stored); max_temp is the high-water mark that
+     * sizes the frame. */
+    int temp_base = 0;
+    int next_temp = 0;
+    int max_temp = 0;
 
     int here() const { return static_cast<int>(chunk.code.size()); }
 
@@ -133,6 +89,228 @@ struct Codegen {
     {
         chunk.code.push_back({ op, node, target, target2 });
         return chunk.code.size() - 1;
+    }
+
+    int alloc_temp()
+    {
+        const int t = next_temp++;
+        if (next_temp > max_temp)
+            max_temp = next_temp;
+        return t;
+    }
+
+    void reset_temps() { next_temp = temp_base; }
+
+    /*
+     * Compile int expression `e` into `ops`, leaving the result in `out` (a
+     * slot or immediate). A leaf costs no op; an arith/neg TypedScalarExpr emits
+     * IntBin(s) into temp slots. Returns false for a non-int expression (a
+     * comparison, a call, a subscript, ...) so the enclosing loop falls back.
+     */
+    bool compile_int_expr(const Construct *e, Operand &out,
+                          std::vector<Instr> &ops)
+    {
+        if (as_int_operand(e, out))
+            return true;
+
+        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+        if (!t || t->kind != TypeHint::i)
+            return false;
+
+        if (t->cat == TypedScalarExpr::Cat::arith) {
+            Operand acc;
+            if (!compile_int_expr(t->elems[0].second.get(), acc, ops))
+                return false;
+            for (size_t i = 1; i < t->elems.size(); i++) {
+                Operand rhs;
+                if (!compile_int_expr(t->elems[i].second.get(), rhs, ops))
+                    return false;
+                const int tt = alloc_temp();
+                Instr in;
+                in.op = OpCode::IntBin;
+                in.node = e;
+                in.target = tt;
+                in.a = acc;
+                in.b = rhs;
+                in.aop = t->elems[i].first;
+                ops.push_back(in);
+                acc = slot_op(tt);
+            }
+            out = acc;
+            return true;
+        }
+
+        if (t->cat == TypedScalarExpr::Cat::neg) {
+            Operand op;
+            if (!compile_int_expr(t->elems[0].second.get(), op, ops))
+                return false;
+            const int tt = alloc_temp();
+            Instr in;                    /* tt = 0 - op */
+            in.op = OpCode::IntBin;
+            in.node = e;
+            in.target = tt;
+            in.a = int_lit(0);
+            in.b = op;
+            in.aop = Op::minus;
+            ops.push_back(in);
+            out = slot_op(tt);
+            return true;
+        }
+
+        return false;   /* cmp / logical / lnot -> bool, not an int expr */
+    }
+
+    /*
+     * Compile statement `s` to native int op(s). Handles `x++`/`x--`, a
+     * compound assignment `x OP= <int expr>` (rhs may be nested), and a plain
+     * `x = <definitely-int expr>`. Returns false otherwise (a plain assign of a
+     * bare/ bool rhs, a decl, a call, ...) so the loop falls back.
+     */
+    bool compile_int_stmt(const Construct *s, std::vector<Instr> &ops)
+    {
+        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+            Operand dst;
+            if (inc->th == TypeHint::i && as_int_operand(inc->lvalue.get(), dst)
+                && !dst.is_lit) {
+                Instr in;
+                in.op = OpCode::IntBin;
+                in.node = s;
+                in.target = dst.slot;
+                in.a = dst;
+                in.b = int_lit(1);
+                in.aop = inc->is_inc ? Op::plus : Op::minus;
+                ops.push_back(in);
+                return true;
+            }
+            return false;
+        }
+
+        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        if (!e)
+            return false;
+
+        Operand dst;
+        if (!as_int_operand(e->lvalue.get(), dst) || dst.is_lit)
+            return false;
+
+        if (e->op == Op::assign) {
+            if (!definitely_int(e->rvalue.get()))
+                return false;
+            Operand r;
+            if (!compile_int_expr(e->rvalue.get(), r, ops))
+                return false;
+            /* Peephole: if the last op produced `r` in a temp, retarget it to
+             * write `dst` directly; else emit a move (dst = r + 0). */
+            if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::IntBin
+                && ops.back().target == r.slot) {
+                ops.back().target = dst.slot;
+            } else {
+                Instr in;
+                in.op = OpCode::IntBin;
+                in.node = s;
+                in.target = dst.slot;
+                in.a = r;
+                in.b = int_lit(0);
+                in.aop = Op::plus;
+                ops.push_back(in);
+            }
+            return true;
+        }
+
+        Op arith;
+        switch (e->op) {
+            case Op::addeq: arith = Op::plus;  break;
+            case Op::subeq: arith = Op::minus; break;
+            case Op::muleq: arith = Op::times; break;
+            case Op::diveq: arith = Op::div;   break;
+            case Op::modeq: arith = Op::mod;   break;
+            default: return false;
+        }
+
+        Operand rhs;                     /* dst = dst <arith> rhs (rhs nested) */
+        if (!compile_int_expr(e->rvalue.get(), rhs, ops))
+            return false;
+        Instr in;
+        in.op = OpCode::IntBin;
+        in.node = s;
+        in.target = dst.slot;
+        in.a = dst;
+        in.b = rhs;
+        in.aop = arith;
+        ops.push_back(in);
+        return true;
+    }
+
+    /*
+     * Read a while condition as an int comparison into `a <cmp> b`, appending
+     * any operand-computation ops (a nested `(x+1) < N`) to `ops`. False for a
+     * non-int / non-comparison condition.
+     */
+    bool compile_int_cond(const Construct *cond, std::vector<Instr> &ops,
+                          Operand &a, Op &cmp, Operand &b)
+    {
+        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        if (!t || t->cat != TypedScalarExpr::Cat::cmp
+            || t->kind != TypeHint::i || t->elems.size() != 2)
+            return false;
+        cmp = t->elems[1].first;
+        return compile_int_expr(t->elems[0].second.get(), a, ops)
+            && compile_int_expr(t->elems[1].second.get(), b, ops);
+    }
+
+    /*
+     * A resolved-local int scalar loop -> native register ops (no fallback):
+     *   Lstart: <cond ops> JumpUnlessIntCmp{a,cmp,b -> Lend} <body ops>
+     *           Jump Lstart ; Lend:
+     * Fires when the condition is an int comparison and every body statement is
+     * a compilable int assignment/inc-dec (so no decl to scope and no
+     * break/continue/return). Emits nothing and returns false otherwise.
+     */
+    bool try_native_int_while(const WhileStmt *w)
+    {
+        std::vector<Instr> cond_ops, body_ops;
+        Operand ca, cb;
+        Op cmp;
+
+        reset_temps();
+        if (!compile_int_cond(w->condExpr.get(), cond_ops, ca, cmp, cb))
+            return false;
+
+        std::vector<const Construct *> stmts;
+        if (const Construct *body = w->body.get()) {
+            if (const Block *b = dynamic_cast<const Block *>(body)) {
+                for (const auto &e : b->elems)
+                    stmts.push_back(e.get());
+            } else {
+                stmts.push_back(body);
+            }
+        }
+        for (const Construct *s : stmts) {
+            reset_temps();
+            if (!compile_int_stmt(s, body_ops))
+                return false;
+        }
+
+        const int lstart = here();
+        for (const Instr &in : cond_ops)
+            chunk.code.push_back(in);
+
+        Instr test;
+        test.op = OpCode::JumpUnlessIntCmp;
+        test.node = w->condExpr.get();
+        test.aop = cmp;
+        test.a = ca;
+        test.b = cb;
+        const size_t jt = chunk.code.size();
+        chunk.code.push_back(test);      /* target = Lend, patched below */
+
+        for (const Instr &in : body_ops)
+            chunk.code.push_back(in);
+
+        emit(OpCode::Jump, nullptr, lstart);
+
+        chunk.code[jt].target = here();  /* Lend */
+        return true;
     }
 
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
@@ -147,12 +325,10 @@ struct Codegen {
             gen_if(f);
             return;
         }
-
         if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
             gen_while(w);
             return;
         }
-
         emit(OpCode::EvalStmt, s);
     }
 
@@ -192,59 +368,6 @@ struct Codegen {
         chunk.code[jf].target = lend;
         chunk.code[be].target2 = lend;
     }
-
-    /*
-     * A resolved-local int scalar loop -> native register ops (no fallback):
-     *   Lstart: JumpUnlessIntCmp{a,cmp,b -> Lend} ; <body IntBin ops> ;
-     *           Jump Lstart ; Lend:
-     * Fires only when the condition is a leaf int compare AND every body
-     * statement is a compilable int assignment/inc-dec (so there is no decl to
-     * scope and no break/continue/return - hence no LoopBackEdge needed).
-     * Returns false (emitting nothing) otherwise.
-     */
-    bool try_native_int_while(const WhileStmt *w)
-    {
-        Operand ca, cb;
-        Op cmp;
-        if (!gen_int_cond(w->condExpr.get(), ca, cmp, cb))
-            return false;
-
-        /* Gather body statements (a Block's elems, or a single statement). */
-        std::vector<const Construct *> stmts;
-        if (const Construct *body = w->body.get()) {
-            if (const Block *b = dynamic_cast<const Block *>(body)) {
-                for (const auto &e : b->elems)
-                    stmts.push_back(e.get());
-            } else {
-                stmts.push_back(body);
-            }
-        }
-
-        /* Compile every body statement first; bail (no partial emit) on any. */
-        std::vector<Instr> body_ops;
-        for (const Construct *s : stmts)
-            if (!gen_int_stmt(s, body_ops))
-                return false;
-
-        const int lstart = here();
-
-        Instr test;
-        test.op = OpCode::JumpUnlessIntCmp;
-        test.node = w->condExpr.get();
-        test.aop = cmp;
-        test.a = ca;
-        test.b = cb;
-        const size_t jt = chunk.code.size();
-        chunk.code.push_back(test);      /* target = Lend, patched below */
-
-        for (const Instr &in : body_ops)
-            chunk.code.push_back(in);
-
-        emit(OpCode::Jump, nullptr, lstart);
-
-        chunk.code[jt].target = here();  /* Lend */
-        return true;
-    }
 };
 
 }  /* namespace */
@@ -253,7 +376,9 @@ Chunk
 codegen_program(const Block *root)
 {
     Codegen cg;
+    cg.temp_base = cg.next_temp = cg.max_temp = root->slot_count;
     cg.gen_stmts(root->elems);
     cg.emit(OpCode::Halt);
+    cg.chunk.n_temps = cg.max_temp - root->slot_count;
     return std::move(cg.chunk);
 }

@@ -10452,6 +10452,7 @@ static bool frame_over_64_slots()
  */
 struct VmOpCounts {
     size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
+    int n_temps = 0;
 };
 
 static bool codegen_counts(const std::vector<const char *> &lines,
@@ -10475,6 +10476,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
         if (!b)
             return false;
         const Chunk chunk = codegen_program(b);
+        c.n_temps = chunk.n_temps;
         for (const Instr &in : chunk.code) {
             switch (in.op) {
             case OpCode::JumpIfFalse:      c.jif++;    break;
@@ -10519,7 +10521,28 @@ static bool vm_codegen_shapes()
     const bool fallback_ok =
         b.back == 1 && b.jif == 1 && b.juic == 0 && b.intbin == 0;
 
-    return native_ok && fallback_ok;
+    /* 3) a NESTED-expr plain assignment goes native and allocates a temp:
+     * `s = i*i + 1` -> IntBin{t=i*i}, IntBin{s=t+1} (+ i++). */
+    VmOpCounts c;
+    if (!codegen_counts({
+            "var i = 0; var s = 0;",
+            "while (i < 5) { s = i*i + 1; i++; }",
+        }, c))
+        return false;
+    const bool nested_ok =
+        c.juic == 1 && c.intbin >= 3 && c.n_temps >= 1 && c.back == 0;
+
+    /* 4) bool-safety: a plain assign of a BOOL leaf must NOT go native (writing
+     * an int to a bool slot would corrupt it) - the loop falls back. */
+    VmOpCounts d;
+    if (!codegen_counts({
+            "var flag = true; var b = false; var i = 0;",
+            "while (i < 5) { b = flag; i++; }",
+        }, d))
+        return false;
+    const bool bool_safe = d.back == 1 && d.intbin == 0 && d.juic == 0;
+
+    return native_ok && fallback_ok && nested_ok && bool_safe;
 }
 
 static const std::vector<extra_check> extra_checks =

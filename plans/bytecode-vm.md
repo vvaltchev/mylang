@@ -247,9 +247,27 @@ x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
   geomean **0.99x**; `53_collatz` (worst wall outlier) +0.00% instrs = confirmed
   noise, no accidental regression. 1303/1303 + 1155/1155; shape test
   `vm: codegen shapes` pins the opcodes.
-- **Next steps (same register architecture):** nested int expressions (allocate
-  temp slots as scratch registers), plain `x = expr`, `float` ops, global /
-  capture slot operands, more statement forms; compile them where each is a win.
+- **Step 2.1 — nested int expressions + plain assignments — DONE.** A recursive
+  `compile_int_expr` lowers an arith/neg `TypedScalarExpr` tree into `IntBin`s
+  writing **scratch temp slots** (the register allocator: temps laid out above
+  the resolved locals at `[slot_count, slot_count + n_temps)`, reset per
+  statement, high-water sizes the frame; `Chunk::n_temps`, `vm_execute` grows
+  the frame). Compound assigns take a nested rhs (`s += i*i`); a plain
+  `x = <expr>` compiles with a peephole that retargets the last `IntBin` to
+  write `x` directly (`x = a*b + 1` → 2 ops). **Bool-safety:** the rhs must be
+  `definitely_int` (an arith/neg TSE or int literal — never a bare leaf
+  Identifier or a comparison, both of which can be bool), because writing an int
+  result into a bool slot would corrupt it; a valid `x = <int>` guarantees x is
+  int (bool can't accept int), so it is sound. Compound assign / condition
+  operands read a bool slot as 0/1 (arith promotes), so they stay safe.
+  **Result:** a nested-expr loop (`s = s + i*i - i`) is **−61.5% instructions**
+  (bigger win — more nodes, more dispatch removed); `01_while_loop` still −51.7%
+  (no regression); geomean **0.99x**, worst outlier +0.00% instrs (noise).
+  1303/1303 + 1155/1155; the shape test now pins native / fallback / nested /
+  bool-safe.
+- **Next steps (same register architecture):** `float` ops, global / capture
+  slot operands, more statement/expression forms; then function bodies (Phase
+  4). Compile each where it's a win.
 
 ### Phase 3 — compact the Instr encoding + broaden native statements
 - The `Instr` grew (two `Operand`s + `aop`) to carry register ops; harmless now

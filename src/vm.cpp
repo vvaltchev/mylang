@@ -72,10 +72,13 @@ vm_execute(const Construct *root_c)
 
     EvalContext ctx(nullptr, /*const_ctx=*/false);
 
+    /* The frame holds the resolved locals plus the register machine's scratch
+     * temps [slot_count, slot_count + n_temps); the tree-walker fallback only
+     * ever touches slots < slot_count, so the extra temps never collide. */
     std::unique_ptr<Frame> root_frame;
-    if (root->slot_count) {
+    if (root->slot_count || chunk.n_temps) {
         root_frame = std::make_unique<Frame>();
-        root_frame->init(root->slot_count);
+        root_frame->init(root->slot_count + chunk.n_temps);
         ctx.frame = root_frame.get();
     }
 

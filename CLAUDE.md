@@ -2887,14 +2887,19 @@ is left fallback (its child-context loop-var scope mustn't be dropped).
 **Phase 2** is a **REGISTER machine over the frame slots** (the VM's registers
 ARE the resolved-local slots — NO value stack), with fused superinstructions:
 `IntBin` (3-address `dst = a <arith> b`, operands = slot or int immediate) and
-`JumpUnlessIntCmp` (fused compare+branch). A `while` whose condition is a leaf
-int compare and whose body is all leaf-operand int compound-assigns / `++`/`--`
-compiles with **no tree-walker fallback**; anything else falls back to Phase 1.
-This is where the VM starts to *win*: `01_while_loop` −50% instructions / ~2x
-wall-clock, erasing the Phase-1 regression. The register choice (over a stack
-machine, which the already-M8-optimized tree-walker would beat) is also the
-right IR for the eventual native x86-64 codegen. Full roadmap + phase order:
-`plans/bytecode-vm.md`.
+`JumpUnlessIntCmp` (fused compare+branch). A `while` whose condition is an int
+compare and whose body is int assignments (compound `s += i*i`, plain
+`x = a*b+1`, `++`/`--`) compiles with **no tree-walker fallback**; **nested
+expressions** use scratch temp slots (`compile_int_expr` + a temp register
+allocator above the resolved locals; `Chunk::n_temps` grows the frame). Anything
+else (float, a bare/bool leaf plain-assign, a global/capture operand, a call)
+falls back to Phase 1. **Bool-safety:** a plain assign's rhs must be
+`definitely_int` (arith/neg/int-literal, never a leaf id or comparison — both
+can be bool), since writing an int into a bool slot would corrupt it. This is
+where the VM *wins*: `01_while_loop` −50%, a nested-expr loop −61% instructions.
+The register choice (over a stack machine, which the already-M8-optimized
+tree-walker would beat) is also the right IR for the eventual native x86-64
+codegen. Full roadmap + phase order: `plans/bytecode-vm.md`.
 
 ## Invariants & hazards (defense in depth)
 
