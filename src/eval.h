@@ -326,6 +326,12 @@ bool builtin_is_const(int index);
  * optional-none), shared by MemberExpr::do_eval and the VM's MemberV. */
 class MemberExpr;
 EvalValue member_read(const EvalValue &base, const MemberExpr *m);
+/* The AST-free core: the VM's MemberV passes a member-key pool entry's fields
+ * (the member_read wrapper passes a MemberExpr's). */
+EvalValue member_read_core(const EvalValue &base, const EvalValue &memId,
+                           const UniqueId *memUid, bool optional,
+                           const Loc &mstart, const Loc &mend,
+                           const Loc &bstart, const Loc &bend);
 
 /* VM Phase 2b: append a POD struct built from the pre-evaluated ctor arg values
  * `vals` into `target` (a flat array<Struct> - coerced into the bytes - or a

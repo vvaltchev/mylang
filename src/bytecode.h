@@ -480,4 +480,22 @@ struct Chunk {
         end = Loc();
         return false;
     }
+
+    /*
+     * MEMBER-KEY POOL (foundation 2, AST-free op-data). A boxed member read
+     * `base.member` (MemberV) needs the member's name (as a dict key AND an
+     * interned uid), the optional-`?.` flag, and the carets member_read throws
+     * with - all pulled out of the MemberExpr into a pool entry so the op is
+     * a bare index (`Instr::a`), no `node`. Program-lifetime data, so the
+     * interned uid pointer is stable; a serializing backend would re-intern by
+     * name on load.
+     */
+    struct MemberKey {
+        EvalValue memId;          /* the name as a dict key value */
+        const UniqueId *memUid;   /* the interned name (struct slot / const) */
+        bool optional;            /* `a?.b` short-circuits a none base */
+        Loc mstart, mend;         /* the member-expr caret (most errors) */
+        Loc bstart, bend;         /* the base caret ("Expected dict object") */
+    };
+    std::vector<MemberKey> member_keys;
 };

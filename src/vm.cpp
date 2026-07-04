@@ -1198,14 +1198,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
-        case OpCode::MemberV:
-            /* base.member value read via the shared member_read (struct field /
-             * const / dict key / optional); errors carry the MemberExpr loc. */
+        case OpCode::MemberV: {
+            /* base.member value read via the shared member_read_core (struct
+             * field / const / dict key / optional); AST-free - the name
+             * key/uid, optional flag and carets come from the pool (in.a). */
+            const Chunk::MemberKey &mk = chunk.member_keys[in.a.lit];
             ctx.frame->at(in.target).put(
-                member_read(ctx.frame->at(in.target2).get(),
-                            static_cast<const MemberExpr *>(in.node)));
+                member_read_core(ctx.frame->at(in.target2).get(), mk.memId,
+                                 mk.memUid, mk.optional, mk.mstart, mk.mend,
+                                 mk.bstart, mk.bend));
             pc++;
             break;
+        }
 
         case OpCode::JumpUnlessTrueV:
             if (!ctx.frame->at(in.target2).get().is_true())

@@ -3062,14 +3062,22 @@ was the error caret: **`SubscriptV`** (`base[idx]` via `Type::subscript`) and
 the **boxed scalar ops `BinOpV`/`CompoundV`/`CmpV`** (their `num_bin_op` PMF is
 baked from `aop`; the catch does `vm_stamp_loc(chunk, pc, e)`), plus **`LogV`**
 (never throws - node was dead). The shared `vm_stamp_loc` helper (vm.cpp) does
-the cold-path `chunk.loc_at(pc, ...)` stamp for all of them. Remaining `node`
-users, by kind: op-data that is NOT just a loc - `MemberV` (a member key/uid +
-optional, a member-key pool), `CallV`/`CachedCallV` + `LoadGlobalV` (the name
-for `UndefinedVariableEx`, from `gfuncs`'s slot->name list), the builtin calls
-(`CallBuiltinV`/`LV`/`LVElem` - a baked `func_v` ptr + the args `ExprList`),
-`EmplaceStruct` (a struct-ctor def); then the fallback ops (`EvalStmt`/
-`JumpIfFalse`/the element-store fallbacks). Once those are migrated, `Instr`
-sheds the 8-byte `node` field.
+the cold-path `chunk.loc_at(pc, ...)` stamp for them all. **`LoadGlobalV`** is
+node-free too: its only use was the cold undefined-global error, whose NAME is
+in `gfuncs`'s slot->name list and its loc in the side table. **`MemberV`**
+(`base.member`) took the next op-data step - a **member-key pool** (`Chunk::
+MemberKey` = the name as a dict key + the interned uid + the optional flag +
+both carets member_read throws with), so the op is a bare pool index
+(`Instr::a`); `member_read` was factored into `member_read_core(dval, memId,
+memUid, optional, mstart, mend, bstart, bend)` shared by the tree-walker wrapper
+and the VM. Remaining `node` users: `CallV`/`CachedCallV` (the callee name is in
+`gfuncs`, but the backtrace call-site loc is a PER-CALL need - wants a
+`vm_call_func` refactor that defers the `loc_at` lookup to the error path, so a
+per-call search can't regress fib), the builtin calls (`CallBuiltinV`/`LV`/
+`LVElem` - a baked `func_v` ptr + the args `ExprList`), `EmplaceStruct` (a
+struct-ctor def);
+then the fallback ops (`EvalStmt`/`JumpIfFalse`/the element-store fallbacks).
+Once those are migrated, `Instr` sheds the 8-byte `node` field.
 
 ## Invariants & hazards (defense in depth)
 

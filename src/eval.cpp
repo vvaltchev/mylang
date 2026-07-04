@@ -3967,27 +3967,37 @@ static bool is_lvalue_rooted(const Construct *c)
  * stay in do_eval (they need `what` for rooting and the for_write flag). An
  * error carries the MemberExpr's loc.
  */
-EvalValue member_read(const EvalValue &dval, const MemberExpr *m)
+/*
+ * The value-read of `base.member`, factored to take the member's fields
+ * DIRECTLY (name-as-key, interned uid, optional flag, and the two carets it
+ * throws with) instead of a MemberExpr*. So the VM's MemberV can call it from a
+ * member-key pool entry with no AST node, while the tree-walker's wrapper below
+ * still passes a MemberExpr's fields - one shared implementation.
+ */
+EvalValue member_read_core(const EvalValue &dval, const EvalValue &memId,
+                           const UniqueId *memUid, bool optional,
+                           const Loc &mstart, const Loc &mend,
+                           const Loc &bstart, const Loc &bend)
 {
-    if (m->optional && dval.is<NoneVal>())
+    if (optional && dval.is<NoneVal>())
         return EvalValue();
 
     if (dval.is<intrusive_ptr<StructObject>>()) {
 
         const auto &obj = dval.get<intrusive_ptr<StructObject>>();
-        const int slot = obj->def->slot_of(m->memUid);
+        const int slot = obj->def->slot_of(memUid);
 
         if (slot >= 0)
             return obj->is_pod() ? obj->pod_get(slot)
                                  : obj->fields[slot].get();
 
-        if (const EvalValue *cv = obj->def->const_of(m->memUid))
+        if (const EvalValue *cv = obj->def->const_of(memUid))
             return *cv;
 
         throw TypeErrorEx(
             intern_msg("Struct '" + string(obj->def->name->val) +
-                       "' has no member '" + string(m->memUid->val) + "'"),
-            m->start, m->end);
+                       "' has no member '" + string(memUid->val) + "'"),
+            mstart, mend);
     }
 
     /* A struct TYPE descriptor: only its `const` members (no instance). */
@@ -3995,33 +4005,38 @@ EvalValue member_read(const EvalValue &dval, const MemberExpr *m)
 
         StructTypeDef *def = dval.get<StructTypeDef *>();
 
-        if (const EvalValue *cv = def->const_of(m->memUid))
+        if (const EvalValue *cv = def->const_of(memUid))
             return *cv;
 
-        if (def->slot_of(m->memUid) >= 0)
+        if (def->slot_of(memUid) >= 0)
             throw TypeErrorEx(
-                intern_msg("Field '" + string(m->memUid->val) +
-                           "' needs an instance"), m->start, m->end);
+                intern_msg("Field '" + string(memUid->val) +
+                           "' needs an instance"), mstart, mend);
 
         throw TypeErrorEx(
             intern_msg("Struct '" + string(def->name->val) +
-                       "' has no member '" + string(m->memUid->val) + "'"),
-            m->start, m->end);
+                       "' has no member '" + string(memUid->val) + "'"),
+            mstart, mend);
     }
 
     if (!dval.is<intrusive_ptr<DictObject>>())
-        throw TypeErrorEx("Expected dict object",
-                          m->what->start, m->what->end);
+        throw TypeErrorEx("Expected dict object", bstart, bend);
 
     const auto &obj = dval.get<intrusive_ptr<DictObject>>();
     DictObject::inner_type &data = obj->get_ref();
-    const auto &it = data.find(m->memId);
+    const auto &it = data.find(memId);
 
     if (it != data.end())            /* present key -> the value */
         return it->second.get();
     if (obj->get_has_default())      /* a default dict -> its default */
         return obj->get_default();
-    throw KeyNotFoundEx(m->start, m->end);   /* missing -> throw */
+    throw KeyNotFoundEx(mstart, mend);   /* missing -> throw */
+}
+
+EvalValue member_read(const EvalValue &dval, const MemberExpr *m)
+{
+    return member_read_core(dval, m->memId, m->memUid, m->optional,
+                            m->start, m->end, m->what->start, m->what->end);
 }
 
 EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const

@@ -359,9 +359,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             cmt(row, in.node);
             break;
         case OpCode::MemberV:
+            /* AST-free: the member name comes from the member-key pool. */
             row << "member.v     " << D(in.target) << " = " << D(in.target2)
-                << ".<member>";
-            cmt(row, in.node);
+                << "." << chunk.member_keys[in.a.lit].memId.get_type()
+                              ->to_string(chunk.member_keys[in.a.lit].memId);
             break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  " << D(in.target2) << ", L" << in.target;

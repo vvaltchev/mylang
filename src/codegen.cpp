@@ -380,6 +380,16 @@ struct Codegen {
         return static_cast<int>(chunk.consts.size()) - 1;
     }
 
+    /* Pull a MemberExpr's read data (name key/uid, optional flag, both carets)
+     * into the member-key pool so MemberV is a bare index, no `node`. */
+    int add_member_key(const MemberExpr *m)
+    {
+        chunk.member_keys.push_back(
+            {m->memId, m->memUid, m->optional,
+             m->start, m->end, m->what->start, m->what->end});
+        return static_cast<int>(chunk.member_keys.size()) - 1;
+    }
+
     /*
      * BOXED general-value expression (the zero-fallback / dyn tier) -> ops,
      * result left in `out_slot` (a resolved-local slot, or a temp). Handles a
@@ -499,9 +509,10 @@ struct Codegen {
             const int t = alloc_temp();
             Instr in;
             in.op = OpCode::MemberV;
-            in.node = m;
+            in.node = m;                 /* extract_locs nulls it */
             in.target = t;
             in.target2 = base_slot;
+            in.a = int_lit(add_member_key(m));   /* AST-free: pool index */
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -2435,7 +2446,9 @@ static void extract_locs(Chunk &chunk)
         case OpCode::JumpUnlessFloatCmp:
         case OpCode::ForLoopStep:
         case OpCode::LogV:
-            /* never throw: node is dead weight, just drop it -> AST-free. */
+        case OpCode::MemberV:
+            /* node not needed for a caret: LogV never throws; MemberV's carets
+             * (and name/uid/optional) live in the member-key pool. Drop it. */
             in.node = nullptr;
             break;
         default:
