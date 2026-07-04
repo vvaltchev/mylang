@@ -2451,6 +2451,18 @@ static void extract_locs(Chunk &chunk)
              * (and name/uid/optional) live in the member-key pool. Drop it. */
             in.node = nullptr;
             break;
+        case OpCode::CallV:
+        case OpCode::CachedCallV: {
+            /* Record the CALLEE-IDENTIFIER loc (matches the tree-walker's
+             * undefined-callee caret); the backtrace call-site uses its start
+             * (== the call's). NotCallableEx is unreachable for a CallV (a
+             * proven global func slot), so its caret is moot. */
+            const CallExpr *call = static_cast<const CallExpr *>(in.node);
+            chunk.locs.push_back({static_cast<uint32_t>(pc),
+                                  call->what->start, call->what->end});
+            in.node = nullptr;
+            break;
+        }
         default:
             break;
         }

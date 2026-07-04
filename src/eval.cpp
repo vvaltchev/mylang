@@ -550,7 +550,9 @@ do_func_call(EvalContext *ctx,
              FuncObject &obj,
              const ArgsVecT &args,
              Loc call_site = Loc(),
-             const InlineCtx *call_site_inl = nullptr)
+             const InlineCtx *call_site_inl = nullptr,
+             const Chunk *call_ck = nullptr,
+             size_t call_pc = 0)
 {
     /* func_ctx == true gives this call its own FlowState (see eval.h) */
     EvalContext args_ctx(&obj.capture_ctx, false, true);
@@ -655,7 +657,15 @@ do_func_call(EvalContext *ctx,
         if (obj.func->params)
             for (const auto &p : obj.func->params->elems)
                 bf.params.push_back(string(p->get_str()));
-        bf.call_site = call_site;
+        /* The VM's native call (CallV) is AST-free: it passes its chunk+pc
+         * instead of a loc, and the call-site caret is resolved from the loc
+         * side table HERE, on the error path only - so the hot success path
+         * pays no per-call lookup. The tree-walker passes a real loc. */
+        if (call_ck) {
+            Loc end_ignored;
+            call_ck->loc_at(call_pc, bf.call_site, end_ignored);
+        } else
+            bf.call_site = call_site;
         e.backtrace.push_back(move(bf));
 
         /*
@@ -696,9 +706,9 @@ EvalValue vm_call_func(EvalContext *ctx,
                        FuncObject &obj,
                        const LValue *argslots,
                        size_t n,
-                       Loc call_site)
+                       const Chunk *ck, size_t pc)
 {
-    return do_func_call(ctx, obj, VmArgs{argslots, n}, call_site);
+    return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr, ck, pc);
 }
 
 EvalValue eval_func(EvalContext *ctx,
@@ -741,7 +751,8 @@ bool g_pure_cache_enabled = true;
 static EvalValue
 pure_cache_call(EvalContext *ctx, FuncObject &obj,
                 const vector<EvalValue> &vals, Loc call_site,
-                const InlineCtx *inl)
+                const InlineCtx *inl,
+                const Chunk *ck = nullptr, size_t pc = 0)
 {
     PureCache &cache = ctx->frame->ensure_pure_cache();
     PureCacheKey key{ obj.func, vals };
@@ -749,7 +760,7 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
     if (it != cache.end())
         return it->second;
 
-    EvalValue r = do_func_call(ctx, obj, vals, call_site, inl);
+    EvalValue r = do_func_call(ctx, obj, vals, call_site, inl, ck, pc);
     if (r.get_type()->t < Type::t_str)
         cache.emplace(move(key), r);
     return r;
@@ -775,17 +786,18 @@ cached_call(EvalContext *ctx, FuncObject &obj,
  * caller's frame slots (no node->eval). Same per-frame dedup. */
 EvalValue
 vm_cached_call(EvalContext *ctx, FuncObject &obj,
-               const LValue *argslots, size_t n, Loc call_site)
+               const LValue *argslots, size_t n, const Chunk *ck, size_t pc)
 {
     if (!ctx->frame || !g_pure_cache_enabled)
-        return do_func_call(ctx, obj, VmArgs{argslots, n}, call_site);
+        return do_func_call(ctx, obj, VmArgs{argslots, n},
+                            Loc(), nullptr, ck, pc);
 
     vector<EvalValue> vals;
     vals.reserve(n);
     for (size_t i = 0; i < n; i++)
         vals.push_back(argslots[i].get());
 
-    return pure_cache_call(ctx, obj, vals, call_site, nullptr);
+    return pure_cache_call(ctx, obj, vals, Loc(), nullptr, ck, pc);
 }
 
 static void stamp_operand_loc(const Construct *c, Exception &e);

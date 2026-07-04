@@ -292,16 +292,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             cmt(row, in.node);
             break;
         case OpCode::CallV:
-            row << "call.v       " << D(in.target) << " = "
-                << callee_name(in.node)
+            /* AST-free: the callee is a global slot (its name lives in gfuncs,
+             * not the chunk), so show g<n>. */
+            row << "call.v       " << D(in.target) << " = g" << in.target2
                 << arglist(chunk, in.a.lit, in.b.lit);
-            cmt(row, in.node);
             break;
         case OpCode::CachedCallV:
-            row << "call.cached  " << D(in.target) << " = "
-                << callee_name(in.node)
+            row << "call.cached  " << D(in.target) << " = g" << in.target2
                 << arglist(chunk, in.a.lit, in.b.lit);
-            cmt(row, in.node);
             break;
         case OpCode::ReturnV:
             row << "return.v     " << RI(in.a, false);

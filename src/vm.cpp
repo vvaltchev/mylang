@@ -1024,21 +1024,29 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * callee slot not yet defined / reassigned to a non-function throws
              * the same UndefinedVariableEx / NotCallableEx the tree-walker
              * would; the args are evaluated exactly once either way. */
-            const CallExpr *call = static_cast<const CallExpr *>(in.node);
-            if (!ctx.gfuncs->defined[in.target2])
+            /* AST-free: the callee NAME (undefined-slot error) is in gfuncs's
+             * slot->name list, the caret in the loc side table (recording the
+             * callee-identifier loc, which matches the tree-walker), and the
+             * backtrace call-site is resolved lazily inside do_func_call (pass
+             * &chunk, pc - no per-call lookup on the success path). */
+            if (!ctx.gfuncs->defined[in.target2]) {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
                 throw UndefinedVariableEx(
-                    static_cast<const Identifier *>(
-                        call->what.get())->get_str(),
-                    call->what->start, call->what->end);
+                    ctx.gfuncs->names[in.target2]->val, s, en);
+            }
             const EvalValue &callee = ctx.gfuncs->slots[in.target2].get();
-            if (!callee.is<intrusive_ptr<FuncObject>>())
-                throw NotCallableEx(call->start, call->end);
+            if (!callee.is<intrusive_ptr<FuncObject>>()) {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
+                throw NotCallableEx(s, en);
+            }
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
             LValue *ap = &ctx.frame->at(in.a.lit);
             ctx.frame->at(in.target).put(
                 in.op == OpCode::CachedCallV
-                    ? vm_cached_call(&ctx, fo, ap, in.b.lit, call->start)
-                    : vm_call_func(&ctx, fo, ap, in.b.lit, call->start));
+                    ? vm_cached_call(&ctx, fo, ap, in.b.lit, &chunk, pc)
+                    : vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc));
             pc++;
             break;
         }

@@ -610,11 +610,15 @@ EvalValue eval_func(EvalContext *ctx,
  * directly (no per-call vector allocation - the hot recursion path);
  * `call_site`
  * is the CallExpr's loc, for the backtrace. */
+/* The call-site loc for a native VM call's backtrace is AST-free: instead of a
+ * Loc, the VM passes its chunk + pc, and do_func_call resolves the caret from
+ * the loc side table ON THE ERROR PATH only (no per-call lookup). */
+struct Chunk;
 EvalValue vm_call_func(EvalContext *ctx,
                        FuncObject &obj,
                        const LValue *argslots,
                        size_t n,
-                       Loc call_site);
+                       const Chunk *ck, size_t pc);
 
 /* The VM's CachedCallV: like vm_call_func but with the per-frame pure-call
  * cache
@@ -623,7 +627,7 @@ EvalValue vm_cached_call(EvalContext *ctx,
                          FuncObject &obj,
                          const LValue *argslots,
                          size_t n,
-                         Loc call_site);
+                         const Chunk *ck, size_t pc);
 
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,

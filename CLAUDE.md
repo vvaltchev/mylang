@@ -3070,14 +3070,19 @@ MemberKey` = the name as a dict key + the interned uid + the optional flag +
 both carets member_read throws with), so the op is a bare pool index
 (`Instr::a`); `member_read` was factored into `member_read_core(dval, memId,
 memUid, optional, mstart, mend, bstart, bend)` shared by the tree-walker wrapper
-and the VM. Remaining `node` users: `CallV`/`CachedCallV` (the callee name is in
-`gfuncs`, but the backtrace call-site loc is a PER-CALL need - wants a
-`vm_call_func` refactor that defers the `loc_at` lookup to the error path, so a
-per-call search can't regress fib), the builtin calls (`CallBuiltinV`/`LV`/
-`LVElem` - a baked `func_v` ptr + the args `ExprList`), `EmplaceStruct` (a
-struct-ctor def);
-then the fallback ops (`EvalStmt`/`JumpIfFalse`/the element-store fallbacks).
-Once those are migrated, `Instr` sheds the 8-byte `node` field.
+and the VM. **`CallV`/`CachedCallV`** are node-free too: the callee name (an
+undefined-slot error) is in `gfuncs`'s slot->name list, the caret in the loc
+side table (recording the callee-IDENTIFIER loc, matching the tree-walker's
+undefined-callee error), and the backtrace call-site loc - a PER-CALL value -
+is NOT looked up per call: `do_func_call` gained `(const Chunk *call_ck, size_t
+call_pc)` params and resolves `loc_at` in its EXISTING catch, on the error path
+only, so the hot success path pays no lookup (`vm_call_func`/`vm_cached_call`
+pass `&chunk, pc` not a `Loc`; fib stays 0.95x vs the tree-walker, and multi-
+frame backtraces are byte-identical). Remaining `node` users: the builtin calls
+(`CallBuiltinV`/`LV`/`LVElem` - a baked `func_v` ptr + the args `ExprList`),
+`EmplaceStruct` (a struct-ctor def); then the fallback ops (`EvalStmt`/
+`JumpIfFalse`/the element-store fallbacks). Once those are migrated, `Instr`
+sheds the 8-byte `node` field.
 
 ## Invariants & hazards (defense in depth)
 
