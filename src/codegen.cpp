@@ -2194,7 +2194,12 @@ struct Codegen {
      */
     bool try_native_foreach(const ForeachStmt *fe)
     {
-        if (fe->elem_th != TypeHint::i && fe->elem_th != TypeHint::f)
+        /* Single, non-indexed loop var over a proven array. elem_th i/f is the
+         * flat-scalar fast path (LoadElemInt/Float); any other element type
+         * (general/str/array/dict/dyn) goes native via LoadElemValue, which
+         * binds the element's EvalValue into the loop var - box-free (no
+         * unbox), matching the tree-walker's general `elem = view[i].get()`. */
+        if (!fe->container_is_array)
             return false;
 
         const Identifier *id =
@@ -2253,7 +2258,8 @@ struct Codegen {
          * here). */
         Instr ld;
         ld.op = fe->elem_th == TypeHint::i ? OpCode::LoadElemInt
-                                           : OpCode::LoadElemFloat;
+              : fe->elem_th == TypeHint::f ? OpCode::LoadElemFloat
+                                           : OpCode::LoadElemValue;
         ld.node = fe->container.get();
         ld.target = x_slot;
         ld.target2 = c;

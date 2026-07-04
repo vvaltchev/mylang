@@ -1519,6 +1519,13 @@ public:
      * the sound case: a single, non-indexed loop var over a flat array<int> /
      * array<float>). `none` -> the VM iterates via the tree-walker fallback. */
     TypeHint elem_th = TypeHint::none;
+    /* Set by the inferencer for a single, non-indexed loop var over a proven
+     * array with a GENERAL element (str/array/dict/dyn) OR a flat int/float
+     * (elem_th i/f). A general element goes native via LoadElemValue (bind the
+     * element's EvalValue into the loop var - box-free, no unbox); elem_th i/f
+     * is the flat-scalar fast path. Flat bool / POD-struct arrays are NOT set
+     * (they need a raw scalar read, not a boxed LoadElemValue). */
+    bool container_is_array = false;
 
     ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1533,6 +1540,7 @@ public:
         c->idsVarDecl = idsVarDecl;
         c->indexed = indexed;
         c->elem_th = elem_th;
+        c->container_is_array = container_is_array;
         return c;
     }
 };

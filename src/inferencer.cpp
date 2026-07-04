@@ -1403,10 +1403,23 @@ void Inferencer::annotate_hints(Construct *n)
             StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
             if (c->kind == StaticTypeKind::Array) {
                 StaticTypeRef el = static_type_resolve(c->elem);
-                if (!el->opt && el->kind == StaticTypeKind::Int)
-                    fe->elem_th = TypeHint::i;
-                else if (!el->opt && el->kind == StaticTypeKind::Float)
-                    fe->elem_th = TypeHint::f;
+                if (!el->opt && el->kind == StaticTypeKind::Int) {
+                    fe->elem_th = TypeHint::i;          /* flat int fast path */
+                    fe->container_is_array = true;
+                } else if (!el->opt && el->kind == StaticTypeKind::Float) {
+                    fe->elem_th = TypeHint::f;          /* flat float path */
+                    fe->container_is_array = true;
+                } else if (el->kind == StaticTypeKind::Str
+                        || el->kind == StaticTypeKind::Array
+                        || el->kind == StaticTypeKind::Dict
+                        || el->kind == StaticTypeKind::Dyn) {
+                    /* GENERAL (non-flat) storage: the VM binds each element's
+                     * EvalValue into the loop var via LoadElemValue - box-free.
+                     * Flat bool / POD-struct arrays are intentionally NOT here:
+                     * their raw bool byte / struct bytes need a scalar read (as
+                     * int/float do), not a boxed LoadElemValue - deferred. */
+                    fe->container_is_array = true;
+                }
             }
         }
     }

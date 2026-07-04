@@ -2886,11 +2886,19 @@ value tier** then removed the `node->eval` fallback for scalar `dyn`/string
 expressions — assign / compound-assign / comparison / logical `&&`/`||` over
 locals, globals, captures, builtins, literals, subscripts (`a[i]` via the
 runtime `Type::subscript`), and members (`obj.f` / `d.k` via a shared
-`member_read` factored out of `MemberExpr::do_eval`) — and **`foreach` over a
-flat `array<int>`/`array<float>`** (single, non-indexed loop var) lowers to a
-counted loop (snapshot + `ArrLen` + `LoadElem` + the fused `ForLoopStep`, −64%
-instructions; the sound case is stamped by the inferencer as
-`ForeachStmt::elem_th`). **User-function calls** go native via `CallV`: a call
+`member_read` factored out of `MemberExpr::do_eval`) — and **`foreach` over an
+array** (single, non-indexed loop var) lowers to a counted loop (snapshot +
+`ArrLen` + a per-element load + the fused `ForLoopStep`, −64% instructions): a
+flat `array<int>`/`array<float>` reads the raw scalar (`LoadElemInt/Float`,
+stamped `ForeachStmt::elem_th`), and a **GENERAL element (`array<str>` /
+`array<array>` / `array<dict>` / `array<dyn>`)** binds the element's existing
+`EvalValue` into the loop var via **`LoadElemValue`** — **box-free (no
+box/unbox)**, matching the tree-walker's general `elem = view[i].get()`, ~1.7x
+on a general-array foreach loop; the inferencer stamps
+`ForeachStmt::container_is_array`. (Flat `array<bool>` / `array<PodStruct>` are
+NOT lowered yet — their raw byte/struct storage needs a scalar read, not a
+boxed `LoadElemValue` — so they still fall back.) **User-function calls** go
+native via `CallV`: a call
 proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
 struct constructor / builtin) that devirtualized to a global slot evaluates its
 args into a register run (a `VmArgs` view over the caller's frame slots — no
