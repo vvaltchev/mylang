@@ -2732,13 +2732,13 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
  */
 EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
-                             const Construct *node)
+                             Loc lstart, Loc lend)
 {
     const bool for_write = (op == Op::assign);
     EvalValue elv = base_lv->get().get_type()->subscript(
         EvalValue(base_lv), key, for_write);
     if (!elv.is<LValue *>())
-        throw NotLValueEx(node->start, node->end);
+        throw NotLValueEx(lstart, lend);
     return slot_rmw(*elv.get<LValue *>(), op, value);
 }
 

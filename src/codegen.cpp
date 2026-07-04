@@ -1614,6 +1614,36 @@ struct Codegen {
                     ops.push_back(in);
                     return true;
                 }
+                /* A DICT element `d[k]++`/`d[k]--` -> DictStore with a boxed
+                 * 1 + the compound op (== `d[k] += 1`), now DictStore is
+                 * AST-free (node = the subscript, for its loc). Gated on
+                 * base_dict ONLY (like the Expr14 `d[k] += v` compound), NOT on
+                 * the value th: a default dict `dict(0)` infers a `none` value
+                 * type yet `counts[w]++` is valid; the boxed 1 promotes for
+                 * int/float, a non-numeric value throws as the TW does. */
+                if (sub->base_dict) {
+                    int dslot;
+                    if (!as_array_slot(sub->what.get(), dslot))
+                        return false;
+                    const int vtemp = alloc_temp();   /* the boxed 1 (value) */
+                    Instr ld;
+                    ld.op = OpCode::LoadConstV;
+                    ld.target = vtemp;
+                    ld.target2 = add_const(EvalValue((int_type)1));
+                    ops.push_back(ld);
+                    int kslot;
+                    if (!compile_boxed_expr(sub->index.get(), kslot, ops))
+                        return false;
+                    Instr in;
+                    in.op = OpCode::DictStore;
+                    in.node = sub;
+                    in.target2 = dslot;
+                    in.a = slot_op(kslot);
+                    in.b = slot_op(vtemp);
+                    in.aop = inc->is_inc ? Op::addeq : Op::subeq;
+                    ops.push_back(in);
+                    return true;
+                }
             }
             return false;
         }
@@ -1648,7 +1678,7 @@ struct Codegen {
                     return false;
                 Instr in;
                 in.op = OpCode::DictStore;
-                in.node = s;
+                in.node = sub;   /* the subscript, for its loc (extract_locs) */
                 in.target2 = dslot;
                 in.a = slot_op(kslot);
                 in.b = slot_op(vslot);
@@ -1678,7 +1708,7 @@ struct Codegen {
                     return false;
                 Instr in;
                 in.op = OpCode::StoreElemValue;
-                in.node = s;
+                in.node = sub;   /* the subscript, for its loc (extract_locs) */
                 in.target2 = aslot;
                 in.a = slot_op(kslot);
                 in.b = slot_op(vslot);
@@ -3045,6 +3075,8 @@ static void extract_locs(Chunk &chunk)
         case OpCode::UnpackElemFloat:
         case OpCode::SliceV:
         case OpCode::StoreGlobalV:   /* compound/inc-dec (plain: node null) */
+        case OpCode::DictStore:      /* node = the Subscript (its caret) */
+        case OpCode::StoreElemValue:
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold

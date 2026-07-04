@@ -5480,6 +5480,23 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native dict element inc-dec (VM DictStore compound, now that
+         * DictStore/StoreElemValue are AST-free via the loc side table):
+         * `d[k]++` / `d[k]--` (== `d[k] += 1`), incl. the wordcount `c[w]++`
+         * pattern. Differential under -vm. */
+        "Dict element inc-dec native (d[k]++, wordcount)",
+        {
+            "var c = {\"a\": 0, \"b\": 0};",
+            "foreach (var w in [\"a\", \"a\", \"b\", \"a\"]) { c[w]++; }",
+            "assert(c[\"a\"] == 3);",
+            "assert(c[\"b\"] == 1);",
+            "var d = {0: 10};",
+            "d[0]--;",
+            "assert(d[0] == 9);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

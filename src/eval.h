@@ -343,11 +343,12 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             const EvalValue *vals, size_t n);
 
 /* VM P2/P4: native subscript element store `c[k] = v` / `c[k] OP= v` for a dict
- * or a general array - reuses the shared, type-dispatched Type::subscript
- * (for_write) lvalue path + slot_rmw. See eval.cpp. */
+ * or a general array (any base - type-dispatched Type::subscript(for_write)
+ * + slot_rmw). AST-free: the not-an-lvalue caret is a Loc pair (from the loc
+ * side table), not a node. See eval.cpp. */
 EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
-                             const Construct *node);
+                             Loc lstart, Loc lend);
 
 /* The stored value of a PRESENT dict key, else nullptr (a plain map find - the
  * tree-walker's typed dict fast path). Shared by Subscript/MemberExpr eval_int/
