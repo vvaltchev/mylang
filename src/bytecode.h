@@ -415,6 +415,18 @@ enum class OpCode : unsigned char {
     LoadBuiltinV,
 
     /*
+     * PLAIN assignment to a GLOBAL-table slot `g = <expr>` (a top-level var a
+     * function reads - the write counterpart of LoadGlobalV): the value temp is
+     * in `a`, `target` = the GlobalFuncTable slot index. Writes
+     * gfuncs->slots[target] and marks defined[target]=1 - byte-identical to the
+     * tree-walker's decl (bind + define) AND reassign (overwrite), which for a
+     * plain assign are the same put(). Never throws (a typed/const/compound
+     * global write falls back to EvalStmt). Script-only (no SymKind::global
+     * exist in the REPL), so gfuncs is never null here.
+     */
+    StoreGlobalV,
+
+    /*
      * Boxed subscript READ `dst = base[idx]` (a general array / dict / string
      * element - the typed flat-array path is LoadElem*). `target2` = the base
      * slot, `a` = the index slot, `node` = the Subscript (error loc). Calls the

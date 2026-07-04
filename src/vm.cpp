@@ -1396,6 +1396,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
+        case OpCode::StoreGlobalV:
+            /* g = <expr>: write the shared global table slot + mark defined -
+             * exactly slot_rmw(op==assign) (lv.put(RValue(v))) + the decl's
+             * defined=1. Serves both a decl and a reassign (idempotent). */
+            ctx.gfuncs->slots[in.target].put(
+                RValue(ctx.frame->at(in.a.slot).get()));
+            ctx.gfuncs->defined[in.target] = 1;
+            pc++;
+            break;
+
         case OpCode::SubscriptV: {
             /* base[idx] read via the runtime Type::subscript (any base type -
              * array / dict / string), an LValue* to the base slot passed like

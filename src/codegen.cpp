@@ -911,7 +911,8 @@ struct Codegen {
         }
         const Identifier *lv =
             dynamic_cast<const Identifier *>(e->lvalue.get());
-        if (!lv || lv->sym.kind != SymKind::local)
+        if (!lv || (lv->sym.kind != SymKind::local
+                    && lv->sym.kind != SymKind::global))
             return false;
         if (lv->decl_type != DeclType::none && lv->decl_type != DeclType::dyn)
             return false;
@@ -924,6 +925,29 @@ struct Codegen {
 
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();
+
+        /* A GLOBAL-table lvalue (a top-level var a function reads): a PLAIN
+         * assign lowers to StoreGlobalV (compile the rvalue into a temp, then
+         * write the shared table slot + mark defined - byte-identical to the
+         * tree-walker's decl/reassign). Compound `g += x` / `g++` are deferred
+         * (they stay a correct EvalStmt fallback). No retarget: the producing
+         * op writes a FRAME temp, the global lives in gfuncs. */
+        if (lv->sym.kind == SymKind::global) {
+            if (!is_assign)
+                return false;
+            int rslot;
+            if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                ops.resize(omark);
+                chunk.consts.resize(cmark);
+                return false;
+            }
+            Instr in;
+            in.op = OpCode::StoreGlobalV;
+            in.target = lv->sym.slot;   /* the GlobalFuncTable slot */
+            in.a = slot_op(rslot);      /* the value temp */
+            ops.push_back(in);
+            return true;
+        }
 
         /* Compound-assign `lv OP= rhs` -> a boxed read-modify-write; the rhs
          * can be an IMMEDIATE (`s += 3` needs no LoadConstV first). */

@@ -5424,6 +5424,26 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native global-variable write (VM StoreGlobalV): a top-level var a
+         * function reads is a global-table slot; a plain reassign / decl lowers
+         * to StoreGlobalV. `g = g + 10` reads the OLD g first (rvalue-first).
+         * Reruns under -vm via the differential. */
+        "Global var write native (StoreGlobalV)",
+        {
+            "var g = 0;",
+            "func rd() { return g; }",
+            "g = 5;",
+            "assert(rd() == 5);",
+            "g = g + 10;",
+            "assert(rd() == 15);",
+            "var arr = [1, 2, 3];",
+            "func rda() { return arr[0]; }",
+            "arr = [9, 8, 7];",
+            "assert(rda() == 9);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {

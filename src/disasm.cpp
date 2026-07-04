@@ -380,6 +380,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
              * disassembly shows the global slot (g<n>). */
             row << "load.global  " << D(in.target) << ", g" << in.target2;
             break;
+        case OpCode::StoreGlobalV:
+            row << "store.global g" << in.target << " = " << RI(in.a, false);
+            break;
         case OpCode::LoadCaptureV:
             row << "load.capture " << D(in.target) << ", "
                 << node_name(in.node);

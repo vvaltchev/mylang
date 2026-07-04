@@ -2984,7 +2984,18 @@ what a fully-const `var a = [1,2,3]` / `d = {}` folds to) materializes via
 **`LoadLiteralObjV`**, which calls the shared **`eval_literal_obj`** (the
 immutable-share vs fresh-mutable-clone logic + the general/flat_s `arr_hint`
 cases, factored out of `LiteralObj::do_eval`) from a `Chunk::literal_objs` pool
-entry — AST-free, byte-identical to the tree-walker. An **array LITERAL**
+entry — AST-free, byte-identical to the tree-walker. A **plain assignment to a
+GLOBAL-table slot** `g = <expr>` (a top-level var a function reads — the write
+counterpart of `LoadGlobalV`) goes native via **`StoreGlobalV`** (`target` = the
+`GlobalFuncTable` slot, `a` = the value temp): it writes `gfuncs->slots[target]`
++ `defined[target]=1`, which for a plain assign is byte-identical to the
+tree-walker's decl (bind + define) AND reassign (`slot_rmw(op==assign)` ==
+`put(RValue)`). Compile in `compile_boxed_stmt` (the gate now also accepts a
+`SymKind::global` lvalue); a TYPED global (needs `coerce_to_decl_type`), a
+`const` global (must throw `CannotRebindConstEx`), and a compound `g += x` /
+`g++` fall back to `EvalStmt` (deferred). Script-only (no `SymKind::global` in
+the REPL), so never emitted there; **not** a pure-target retarget candidate (it
+writes the table, not a temp). An **array LITERAL**
 `[a, b, ..]` whose elements aren't all const (a fully-const *scalar* one is a
 baked `LoadConstV`) builds native via **`MakeArrayV`**: the element expressions
 compile into a
