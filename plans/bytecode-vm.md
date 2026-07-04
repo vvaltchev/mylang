@@ -517,12 +517,16 @@ behind the differential harness:
   exceptions (`[[vm-endgame]]`): control flow is now VM-level jumps, no C++
   throw. break/continue/return + nested + while + range-for hand-verified;
   1304/1304 + 1155/1155.
-- **KNOWN minor regression (pre-existing, from EvalToSlot):**
-  `11_closure_counter` +4.05% instrs - `s += c()` (a captured, tree-walked
-  closure) goes native via EvalToSlot, but the closure body isn't native, so
-  EvalToSlot's box/unbox
-  around the call is overhead the tree-walker's in-place `s += c()` avoids. Fix:
-  don't EvalToSlot a call whose body won't be native (or only builtins) - next.
+- **EvalToSlot restricted to BUILTINS — DONE (fixed the closure regression).**
+  `s += c()` (a captured, tree-walked closure) had gone native via EvalToSlot,
+  but the closure body isn't native, so the box/unbox around the call was
+  overhead the tree-walker's in-place `s += c()` avoids (`11_closure_counter`
+  +4.05% instrs). EvalToSlot now fires ONLY for a `DirectBuiltinCallExpr`, not a
+  general user call: a builtin is cheap so the loop-nativization outweighs the
+  boxing; a beneficial user call (`func f(x)=>x+1`) is already inlined away, and
+  a non-inlined one (a closure) is better left to fall back. `11_closure_counter`
+  +4.05% -> **+0.0%**, with `40_math_builtins` still −10.6% and `08_func_call`
+  still −64% (native via inlining). Geomean holds 0.73x. 1304/1304 + 1155/1155.
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct

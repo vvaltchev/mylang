@@ -258,9 +258,14 @@ struct Codegen {
             return true;
         }
 
-        /* A scalar-result CALL (builtin/user) -> eval into a temp; the result
-         * is then a native int operand (native builtin dispatch). */
-        if (e->th == TypeHint::i && dynamic_cast<const CallExpr *>(e)) {
+        /* A scalar-result BUILTIN call -> eval into a temp; the result is then
+         * a native int operand. Builtins ONLY: a builtin is cheap, so the
+         * loop-nativization it enables outweighs the EvalToSlot box/unbox. A
+         * user call whose body is tree-walked (a closure) would only add the
+         * boxing on top of the call (see 11_closure_counter); a cheap/inlinable
+         * user call (`func f(x)=>x+1`) is already inlined away. */
+        if (e->th == TypeHint::i
+            && dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
             out = eval_to_temp(e, ops);
             return true;
         }
@@ -478,9 +483,10 @@ struct Codegen {
             return true;
         }
 
-        /* A scalar-result CALL (builtin/user) -> eval into a temp (native
-         * builtin dispatch); the result is then a native float operand. */
-        if (e->th == TypeHint::f && dynamic_cast<const CallExpr *>(e)) {
+        /* A scalar-result BUILTIN call -> eval into a temp; the result is then
+         * a native float operand (builtins only - see compile_int_expr). */
+        if (e->th == TypeHint::f
+            && dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
             out = eval_to_temp(e, ops);
             return true;
         }
