@@ -10452,7 +10452,7 @@ static bool frame_over_64_slots()
  */
 struct VmOpCounts {
     size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
-    size_t fbin = 0, jufc = 0, flstep = 0;
+    size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0;
     int n_temps = 0;
 };
 
@@ -10488,6 +10488,8 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::FloatBin:         c.fbin++;   break;
             case OpCode::JumpUnlessFloatCmp: c.jufc++; break;
             case OpCode::ForLoopStep:      c.flstep++; break;
+            case OpCode::LoadElemInt:      c.loadei++; break;
+            case OpCode::LoadElemFloat:    c.loadef++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10595,8 +10597,30 @@ static bool vm_codegen_shapes()
     const bool decl_ok =
         h.juic == 1 && h.intbin >= 3 && h.back == 0;
 
+    /* 9) an array-element READ `a[i]` in a loop compiles to a native LoadElemInt
+     * (no fallback for the read), and the float element variant to LoadElemFloat
+     * (Phase 5). */
+    VmOpCounts ai;
+    if (!codegen_counts({
+            "var a = [10, 20, 30, 40, 50]; var s = 0;",
+            "for (var i = 0; i < 5; i++) s += a[i];",
+        }, ai))
+        return false;
+    const bool read_int_ok =
+        ai.loadei == 1 && ai.flstep == 1 && ai.intbin >= 1;
+
+    VmOpCounts af;
+    if (!codegen_counts({
+            "var a = [1.5, 2.5, 3.5]; var s = 0.0;",
+            "for (var i = 0; i < 3; i++) s += a[i];",
+        }, af))
+        return false;
+    const bool read_flt_ok =
+        af.loadef == 1 && af.flstep == 1 && af.fbin >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
-        && float_ok && mixed_ok && for_ok && decl_ok;
+        && float_ok && mixed_ok && for_ok && decl_ok
+        && read_int_ok && read_flt_ok;
 }
 
 static const std::vector<extra_check> extra_checks =

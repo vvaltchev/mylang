@@ -90,6 +90,19 @@ enum class OpCode : unsigned char {
      */
     ForLoopStep,
 
+    /*
+     * Native array-element read `a[i]` into a temp (Phase 5): `target2` = the
+     * array's frame slot, `a` = the int index operand, `target` = the dst
+     * temp slot; `node` is the Subscript (for the OutOfBoundsEx loc, and the
+     * fallback below). When the slot holds a flat array it reads the element
+     * directly - no Identifier/Subscript dispatch, mirroring
+     * Subscript::eval_int/eval_float (negative index wraps, bounds throw). When
+     * it's NOT an array (a dict / a general array), it falls back to
+     * `node->eval_int` / `eval_float`. Int / float element variants.
+     */
+    LoadElemInt,
+    LoadElemFloat,
+
     /* Stop the program. */
     Halt,
 };

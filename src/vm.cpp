@@ -375,6 +375,60 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::LoadElemInt: {
+
+            /* a[i] into a temp (mirrors Subscript::eval_int for a flat array;
+             * a dict / general base falls back to the node). */
+            const EvalValue &base = ctx.frame->slots[in.target2].get();
+            if (base.is<SharedArrayObj>()) {
+                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+                int_type idx = read_int_operand(in.a, &ctx);
+                if (idx < 0)
+                    idx += arr.size();
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                    throw OutOfBoundsEx(in.node->start, in.node->end);
+                const size_type at = arr.offset() + idx;
+                int_type v;
+                if (arr.skind() == SharedArrayObj::Storage::ints)
+                    v = arr.flat_ints()[at];
+                else if (arr.skind() == SharedArrayObj::Storage::bools)
+                    v = arr.flat_bools()[at] ? 1 : 0;
+                else
+                    v = arr.get_vec()[at].getval<int_type>();
+                write_int_slot(&ctx, in.target, v);
+            } else {
+                write_int_slot(&ctx, in.target, in.node->eval_int(&ctx));
+            }
+            pc++;
+            break;
+        }
+
+        case OpCode::LoadElemFloat: {
+
+            const EvalValue &base = ctx.frame->slots[in.target2].get();
+            if (base.is<SharedArrayObj>()) {
+                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+                int_type idx = read_int_operand(in.a, &ctx);
+                if (idx < 0)
+                    idx += arr.size();
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                    throw OutOfBoundsEx(in.node->start, in.node->end);
+                const size_type at = arr.offset() + idx;
+                float_type v;
+                if (arr.skind() == SharedArrayObj::Storage::floats)
+                    v = arr.flat_floats()[at];
+                else if (arr.skind() == SharedArrayObj::Storage::ints)
+                    v = static_cast<float_type>(arr.flat_ints()[at]);
+                else
+                    v = arr.get_vec()[at].getval<float_type>();
+                write_float_slot(&ctx, in.target, v);
+            } else {
+                write_float_slot(&ctx, in.target, in.node->eval_float(&ctx));
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::Halt:
             return;
         }

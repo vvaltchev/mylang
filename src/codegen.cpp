@@ -52,6 +52,20 @@ Operand float_lit(float_type v)
     return o;
 }
 
+/* The array base of a subscript `a[i]` as a resolved-local slot (whatever it
+ * holds - the LoadElem op checks it's an array at runtime, else falls back). A
+ * nested base (`a[i][j]`, `obj.arr[i]`) is not a bare local slot -> false. */
+bool as_array_slot(const Construct *e, int &slot)
+{
+    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+        if (id->sym.kind == SymKind::local) {
+            slot = id->sym.slot;
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Read `e` as a LEAF float operand: an int/float literal (converted to float),
  * or a resolved-local slot (read as float at runtime - an int/bool slot
@@ -151,6 +165,27 @@ struct Codegen {
     {
         if (as_int_operand(e, out))
             return true;
+
+        /* Array element read `a[i]` -> LoadElemInt into a temp. */
+        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+            if (e->th != TypeHint::i)
+                return false;
+            int aslot;
+            Operand idx;
+            if (!as_array_slot(sub->what.get(), aslot)
+                || !compile_int_expr(sub->index.get(), idx, ops))
+                return false;
+            const int tt = alloc_temp();
+            Instr in;
+            in.op = OpCode::LoadElemInt;
+            in.node = e;
+            in.target = tt;
+            in.target2 = aslot;
+            in.a = idx;
+            ops.push_back(in);
+            out = slot_op(tt);
+            return true;
+        }
 
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
         if (!t || t->kind != TypeHint::i)
@@ -307,6 +342,28 @@ struct Codegen {
     {
         if (as_float_operand(e, out))
             return true;
+
+        /* Array element read `a[i]` (float element) -> LoadElemFloat; the index
+         * is still an int expression. */
+        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+            if (e->th != TypeHint::f)
+                return false;
+            int aslot;
+            Operand idx;
+            if (!as_array_slot(sub->what.get(), aslot)
+                || !compile_int_expr(sub->index.get(), idx, ops))
+                return false;
+            const int tt = alloc_temp();
+            Instr in;
+            in.op = OpCode::LoadElemFloat;
+            in.node = e;
+            in.target = tt;
+            in.target2 = aslot;
+            in.a = idx;
+            ops.push_back(in);
+            out = slot_op(tt);
+            return true;
+        }
 
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
         if (!t || t->kind != TypeHint::f)
