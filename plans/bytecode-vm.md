@@ -286,9 +286,27 @@ x86-64 codegen (slots → registers/memory), so this IR is not throwaway.
   accumulator) compiles fully native: **−51.0% instructions**; homogeneous loops
   emit byte-identical bytecode (`01_while_loop` unchanged). 1303/1303 +
   1155/1155; shape test pins the mixed path.
-- **Next steps (same register architecture):** global / capture slot operands,
-  `for` loops, more forms; then function bodies (Phase 4). Compile each where
-  it's a win.
+- **`for` loops (ForRangeStmt) — deliberately NOT compiled (measured).** Tried
+  it; cachegrind showed **+28% instructions** on `02_for_loop`. The tree-walker's
+  `ForRangeStmt` is *already raw C* (bound/step cached once, the counter is
+  native C on the slot's int, only the body is tree-walked) — there is no
+  per-node dispatch for the VM to remove, so re-encoding it with opcode dispatch
+  only adds work. Same lesson as the Option-A study: the VM can't beat an
+  already-optimal tree-walker path, and unlike the Phase-1 while regression this
+  one would *never* be erased. So a counted `for` stays a fallback `EvalStmt`.
+  (A `while` has per-node virtual dispatch in its condition/body, which is why
+  the VM *does* win there.) Correctness was fine (differential green) — the gate
+  is what vetoed it. This is why every step runs the perf gate.
+- **`global`/`capture` operands — deferred (soundness cost > value).** A native
+  op reading an *undefined* global can't throw a proper `UndefinedVariableEx`
+  without threading the var's name + exact `Loc` onto every `Operand` — real
+  complexity for benchmark-zero value (no top-level loop uses a global var). If
+  it ever matters, do it when function bodies compile (Phase 4), which needs the
+  capture/global machinery anyway.
+- **Next steps:** function bodies (Phase 4: calls + per-function chunks) — the
+  only remaining step that moves the suite geomean, since the benchmarks' hot
+  loops live in functions. The scalar register machine (int/float/nested/mixed
+  `while`) is otherwise complete.
 
 ### Phase 3 — compact the Instr encoding + broaden native statements
 - The `Instr` grew (two `Operand`s + `aop`) to carry register ops; harmless now
