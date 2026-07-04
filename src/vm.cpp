@@ -429,6 +429,67 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::StoreElemInt: {
+
+            /* a[i] = v for a flat mutable int array (mirrors the int path of
+             * try_flat_subscript_store, incl. COW); anything else (const /
+             * read-only / general / bool / dyn) falls back to the node - sound
+             * because a compiled rvalue is side-effect-free, so re-eval is
+             * exact. */
+            LValue &alv = ctx.frame->slots[in.target2];
+            if (alv.is<SharedArrayObj>()) {
+                SharedArrayObj &arr = alv.getval<SharedArrayObj>();
+                if (arr.skind() == SharedArrayObj::Storage::ints
+                    && !alv.is_const_var() && !arr.is_readonly()) {
+                    int_type idx = read_int_operand(in.a, &ctx);
+                    if (idx < 0)
+                        idx += arr.size();
+                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                        throw OutOfBoundsEx(in.node->start, in.node->end);
+                    if (arr.is_slice())
+                        arr.clone_internal_vec();
+                    else if (arr.use_count() > 1)
+                        arr.clone_aliased_slices(arr.offset() + idx);
+                    arr.flat_ints()[arr.offset() + idx] =
+                        read_int_operand(in.b, &ctx);
+                    arr.invalidate_hash();
+                    pc++;
+                    break;
+                }
+            }
+            in.node->eval(&ctx);
+            pc++;
+            break;
+        }
+
+        case OpCode::StoreElemFloat: {
+
+            LValue &alv = ctx.frame->slots[in.target2];
+            if (alv.is<SharedArrayObj>()) {
+                SharedArrayObj &arr = alv.getval<SharedArrayObj>();
+                if (arr.skind() == SharedArrayObj::Storage::floats
+                    && !alv.is_const_var() && !arr.is_readonly()) {
+                    int_type idx = read_int_operand(in.a, &ctx);
+                    if (idx < 0)
+                        idx += arr.size();
+                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                        throw OutOfBoundsEx(in.node->start, in.node->end);
+                    if (arr.is_slice())
+                        arr.clone_internal_vec();
+                    else if (arr.use_count() > 1)
+                        arr.clone_aliased_slices(arr.offset() + idx);
+                    arr.flat_floats()[arr.offset() + idx] =
+                        read_float_operand(in.b, &ctx);
+                    arr.invalidate_hash();
+                    pc++;
+                    break;
+                }
+            }
+            in.node->eval(&ctx);
+            pc++;
+            break;
+        }
+
         case OpCode::Halt:
             return;
         }

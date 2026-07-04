@@ -263,6 +263,31 @@ struct Codegen {
         if (!e)
             return false;
 
+        /* Native array-element store `a[i] = v` (int element, assign only). The
+         * value is compiled BEFORE the index (tree-walker rhs-before-index). */
+        if (e->op == Op::assign) {
+            if (const Subscript *sub =
+                    dynamic_cast<const Subscript *>(e->lvalue.get())) {
+                if (sub->th != TypeHint::i)
+                    return false;
+                int aslot;
+                if (!as_array_slot(sub->what.get(), aslot))
+                    return false;
+                Operand val, idx;
+                if (!compile_int_expr(e->rvalue.get(), val, ops)
+                    || !compile_int_expr(sub->index.get(), idx, ops))
+                    return false;
+                Instr in;
+                in.op = OpCode::StoreElemInt;
+                in.node = s;
+                in.target2 = aslot;
+                in.a = idx;
+                in.b = val;
+                ops.push_back(in);
+                return true;
+            }
+        }
+
         Operand dst;
         if (!as_int_operand(e->lvalue.get(), dst) || dst.is_lit)
             return false;
@@ -435,6 +460,31 @@ struct Codegen {
         const Expr14 *e = dynamic_cast<const Expr14 *>(s);
         if (!e)
             return false;
+
+        /* Native array-element store `a[i] = v` (float element, assign only);
+         * value before index, like compile_int_stmt. */
+        if (e->op == Op::assign) {
+            if (const Subscript *sub =
+                    dynamic_cast<const Subscript *>(e->lvalue.get())) {
+                if (sub->th != TypeHint::f)
+                    return false;
+                int aslot;
+                if (!as_array_slot(sub->what.get(), aslot))
+                    return false;
+                Operand val, idx;
+                if (!compile_float_expr(e->rvalue.get(), val, ops)
+                    || !compile_int_expr(sub->index.get(), idx, ops))
+                    return false;
+                Instr in;
+                in.op = OpCode::StoreElemFloat;
+                in.node = s;
+                in.target2 = aslot;
+                in.a = idx;
+                in.b = val;
+                ops.push_back(in);
+                return true;
+            }
+        }
 
         /* The destination must be a genuine FLOAT slot (int dst -> compile_int_
          * stmt handles it; a float result can't narrow into an int/bool). */

@@ -390,10 +390,22 @@ behind the differential harness:
   `14_array_subscript` **−7.4%** (its read half; the WRITE half `a[i]=v` still
   falls back - next). Geomean unchanged (few bench loops are single + indexed;
   nested loops still fall back). 1303/1303 + 1155/1155.
-- array-element WRITE `a[i] = v` / `a[i] OP= v` (the flat-store fast path);
-- native nested loops / `if` inside a loop body (compile the body directly into
-  the chunk with backpatching, not into a temp op vector) - unlocks the
-  sieve/matrix-shaped benchmarks whose loops nest;
+- **array-element WRITE `a[i] = v` (assign) — DONE.** `StoreElemInt` /
+  `StoreElemFloat`: for a flat mutable int/float array it stores the scalar
+  directly with COW (slice clones, aliased non-slice clones its live slices,
+  then invalidate the cached hash), mirroring `try_flat_subscript_store`; a
+  const/read-only / general / dyn base falls back to `node->eval` (sound - a
+  compiled rvalue is side-effect-free, so re-eval is exact). The value ops are
+  emitted before the index ops (tree-walker rhs-before-index), so a both-throw
+  case (`a[i]=b[j]`, both OOB) reports the same error. `14_array_subscript`
+  −7.4% → **−58.4%** (both its loops native now). Verified: alias/slice COW,
+  write-in-func, const→NotLValueEx, and `hash(a)==hash(deepclone(a))`.
+  Compound `a[i] OP= v` still falls back. 1303/1303 + 1155/1155.
+- **native nested loops / `if` inside a loop body** (compile the body directly
+  into the chunk with backpatching, not into a temp op vector) - the geomean
+  MOVER: unlocks `43_sieve` / `56_sieve_bool` / `46_matrix_mult`, whose loops
+  nest (they still fall back today: an outer loop whose body is a loop isn't a
+  scalar statement, so the whole nest tree-walks);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct
   (unboxed) field read;
