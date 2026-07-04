@@ -306,70 +306,85 @@ struct Codegen {
             return true;
         }
 
+        /* An arith (`a+b`) / comparison (`a<b`) / logical (`a&&b`) chain, as a
+         * raw ExprNN OR a TypedScalarExpr - `A && B` of comparisons specializes
+         * to a logical even when the comparisons are boxed over a dyn operand,
+         * so both forms reach here. emit_boxed_chain handles both. */
+        if (const TypedScalarExpr *t =
+                dynamic_cast<const TypedScalarExpr *>(e)) {
+            const char k = t->cat == TypedScalarExpr::Cat::arith   ? 'a'
+                         : t->cat == TypedScalarExpr::Cat::cmp     ? 'c'
+                         : t->cat == TypedScalarExpr::Cat::logical ? 'l'
+                                                                   : 0;
+            return k && emit_boxed_chain(t->elems, k, e, out_slot, ops);
+        }
+        char k = 0;
         if (dynamic_cast<const Expr03 *>(e) || dynamic_cast<const Expr04 *>(e)
             || dynamic_cast<const Expr05 *>(e)
             || dynamic_cast<const Expr08 *>(e)
             || dynamic_cast<const Expr09 *>(e)
-            || dynamic_cast<const Expr10 *>(e)) {
-            const MultiOpConstruct *mo =
-                static_cast<const MultiOpConstruct *>(e);
-            if (mo->elems.empty() || mo->elems[0].first != Op::invalid)
-                return false;
-            for (size_t i = 1; i < mo->elems.size(); i++)
-                if (!is_boxed_binop(mo->elems[i].first))
-                    return false;
-            int acc;
-            if (!compile_boxed_expr(mo->elems[0].second.get(), acc, ops))
-                return false;
-            for (size_t i = 1; i < mo->elems.size(); i++) {
-                int rhs;
-                if (!compile_boxed_expr(mo->elems[i].second.get(), rhs, ops))
-                    return false;
-                const int t = alloc_temp();
-                Instr in;
-                in.op = OpCode::BinOpV;
-                /* node = the RIGHT operand: an operator error (div-zero, a type
-                 * mismatch) is stamped there, matching the tree-walker's
-                 * num_binop_loc -> stamp_operand_loc(operand). */
-                in.node = mo->elems[i].second.get();
-                in.target = t;
-                in.a = slot_op(acc);
-                in.b = slot_op(rhs);
-                in.aop = mo->elems[i].first;
-                ops.push_back(in);
-                acc = t;
-            }
-            out_slot = acc;
-            return true;
-        }
+            || dynamic_cast<const Expr10 *>(e))
+            k = 'a';
+        else if (dynamic_cast<const Expr06 *>(e)
+                 || dynamic_cast<const Expr07 *>(e))
+            k = 'c';
+        else if (dynamic_cast<const Expr11 *>(e)
+                 || dynamic_cast<const Expr12 *>(e))
+            k = 'l';
+        else
+            return false;
+        return emit_boxed_chain(
+            static_cast<const MultiOpConstruct *>(e)->elems, k, e,
+            out_slot, ops);
+    }
 
-        /* A two-operand comparison `a <cmp> b` -> CmpV (a bool). Only the
-         * simple 2-operand form (a chain `a<b<c` is left to the fallback). */
-        if (dynamic_cast<const Expr06 *>(e)
-            || dynamic_cast<const Expr07 *>(e)) {
-            const MultiOpConstruct *mo =
-                static_cast<const MultiOpConstruct *>(e);
-            if (mo->elems.size() != 2 || mo->elems[0].first != Op::invalid
-                || !is_boxed_cmp(mo->elems[1].first))
+    /*
+     * The shared boxed chain builder: `a OP b OP ...` -> a BinOpV (k='a'),
+     * CmpV (k='c', 2-operand only), or LogV (k='l') chain, each result into a
+     * temp, left-associative. Every operand compiles via compile_boxed_expr
+     * (a leaf / literal / nested chain). An arith/cmp error is stamped at the
+     * RIGHT operand (matching num_binop_loc -> stamp_operand_loc); a logical
+     * has no error path. Returns false if an op isn't of the kind or an operand
+     * can't compile. Used for both the raw ExprNN and TypedScalarExpr forms.
+     */
+    bool emit_boxed_chain(
+        const std::vector<std::pair<Op, unique_ptr<Construct>>> &elems,
+        char k, const Construct *node, int &out_slot, std::vector<Instr> &ops)
+    {
+        if (elems.empty() || elems[0].first != Op::invalid)
+            return false;
+        if (k == 'c' && elems.size() != 2)   /* only a 2-operand comparison */
+            return false;
+        for (size_t i = 1; i < elems.size(); i++) {
+            const Op op = elems[i].first;
+            const bool ok = k == 'a' ? is_boxed_binop(op)
+                          : k == 'c' ? is_boxed_cmp(op)
+                                     : (op == Op::land || op == Op::lor);
+            if (!ok)
                 return false;
-            int a_slot, b_slot;
-            if (!compile_boxed_expr(mo->elems[0].second.get(), a_slot, ops)
-                || !compile_boxed_expr(mo->elems[1].second.get(), b_slot, ops))
+        }
+        int acc;
+        if (!compile_boxed_expr(elems[0].second.get(), acc, ops))
+            return false;
+        for (size_t i = 1; i < elems.size(); i++) {
+            int rhs;
+            if (!compile_boxed_expr(elems[i].second.get(), rhs, ops))
                 return false;
             const int t = alloc_temp();
             Instr in;
-            in.op = OpCode::CmpV;
-            in.node = mo->elems[1].second.get();   /* right operand: err loc */
+            in.op = k == 'a' ? OpCode::BinOpV
+                  : k == 'c' ? OpCode::CmpV
+                             : OpCode::LogV;
+            in.node = k == 'l' ? node : elems[i].second.get();
             in.target = t;
-            in.a = slot_op(a_slot);
-            in.b = slot_op(b_slot);
-            in.aop = mo->elems[1].first;
+            in.a = slot_op(acc);
+            in.b = slot_op(rhs);
+            in.aop = elems[i].first;
             ops.push_back(in);
-            out_slot = t;
-            return true;
+            acc = t;
         }
-
-        return false;
+        out_slot = acc;
+        return true;
     }
 
     /*

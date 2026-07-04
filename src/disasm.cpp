@@ -186,6 +186,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
                 << reg_or_imm(in.b, false);
             break;
+        case OpCode::LogV:
+            row << "log.v        r" << in.target << " = "
+                << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
+                << reg_or_imm(in.b, false);
+            break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  r" << in.target2 << ", L" << in.target;
             break;

@@ -671,6 +671,17 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::LogV: {
+            /* Eager (MyLang &&/|| don't short-circuit at runtime) - both
+             * operands are already computed into slots; combine truthiness. */
+            const bool a = ctx.frame->slots[in.a.slot].get().is_true();
+            const bool b = ctx.frame->slots[in.b.slot].get().is_true();
+            ctx.frame->slots[in.target].put(
+                EvalValue(in.aop == Op::land ? (a && b) : (a || b)));
+            pc++;
+            break;
+        }
+
         case OpCode::JumpUnlessTrueV:
             if (!ctx.frame->slots[in.target2].get().is_true())
                 pc = in.target;

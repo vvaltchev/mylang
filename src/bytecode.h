@@ -195,6 +195,16 @@ enum class OpCode : unsigned char {
     CmpV,
 
     /*
+     * Boxed logical `dst = a <&&|||> b` -> a bool. MyLang's `&&`/`||` do NOT
+     * short-circuit at runtime (both operands always evaluate - only the
+     * compile-time folder short-circuits const cases), so this is EAGER:
+     * EvalValue(a.is_true() <op> b.is_true()), matching logop_loc /
+     * Expr11/Expr12. `aop` = Op::land or Op::lor. No error path (is_true is
+     * total).
+     */
+    LogV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()
