@@ -155,6 +155,30 @@ struct Codegen {
     void reset_temps() { next_temp = temp_base; }
 
     /*
+     * Native break/continue (Gap B): a loop body's `break`/`continue` compiles
+     * to a Jump, recorded here and backpatched when the loop closes - `breaks`
+     * to the loop exit (Lend), `conts` to the loop's continue point (a while's
+     * cond re-test, a for's increment / the fused ForLoopStep). A stack, so a
+     * break in a NESTED loop targets the innermost loop. (`return` needs no
+     * entry: it runs as an EvalStmt whose flow==ret stops the chunk - see
+     * compile_scalar_body / vm_run_chunk.)
+     */
+    struct LoopFrame {
+        std::vector<size_t> breaks;
+        std::vector<size_t> conts;
+    };
+    std::vector<LoopFrame> loops;
+
+    void pop_loop(int lend, int lcont)
+    {
+        for (size_t j : loops.back().breaks)
+            chunk.code[j].target = lend;
+        for (size_t j : loops.back().conts)
+            chunk.code[j].target = lcont;
+        loops.pop_back();
+    }
+
+    /*
      * Compile int expression `e` into `ops`, leaving the result in `out` (a
      * slot or immediate). A leaf costs no op; an arith/neg TypedScalarExpr emits
      * IntBin(s) into temp slots. Returns false for a non-int expression (a
@@ -659,7 +683,8 @@ struct Codegen {
      * tree-walker's tight counter beats a native loop that only dispatches
      * fallbacks).
      */
-    bool compile_scalar_body(const std::vector<const Construct *> &stmts)
+    bool compile_scalar_body(const std::vector<const Construct *> &stmts,
+                             bool is_loop_body = true)
     {
         const size_t start = chunk.code.size();
         bool any_native = false;
@@ -702,14 +727,41 @@ struct Codegen {
                 }
             }
 
-            /* Flow-free fallback: an assignment/decl (Expr14) or a call
-             * statement (CallExpr) neither sets the loop's FlowState nor is a
-             * nested loop, so running it tree-walked WITHIN the native loop is
-             * safe. Anything else (break/continue/return, a nested loop/if that
-             * couldn't compile, a block) falls the whole loop back. */
             chunk.code.resize(mark);
+
+            /* break / continue -> a native Jump to the enclosing loop's exit /
+             * continue point (backpatched by pop_loop). Needs an enclosing
+             * native loop frame (always present - compile_scalar_body only runs
+             * inside one). Gap B. */
+            if (dynamic_cast<const BreakStmt *>(s)) {
+                if (loops.empty()) {
+                    chunk.code.resize(start);
+                    return false;
+                }
+                loops.back().breaks.push_back(emit(OpCode::Jump));
+                any_native = true;
+                continue;
+            }
+            if (dynamic_cast<const ContinueStmt *>(s)) {
+                if (loops.empty()) {
+                    chunk.code.resize(start);
+                    return false;
+                }
+                loops.back().conts.push_back(emit(OpCode::Jump));
+                any_native = true;
+                continue;
+            }
+
+            /* An assignment/decl (Expr14), a call statement (CallExpr), or a
+             * `return` (ReturnStmt) runs as a fallback EvalStmt WITHIN the
+             * native loop. Expr14/CallExpr don't touch the loop's FlowState; a
+             * return sets flow==ret, which the EvalStmt handler acts on by
+             * stopping the chunk (a return abandons the loop). Anything
+             * else (a nested loop/if that couldn't compile, a block) falls the
+             * whole loop back. */
             if (dynamic_cast<const Expr14 *>(s)
-                || dynamic_cast<const CallExpr *>(s)) {
+                || dynamic_cast<const CallExpr *>(s)
+                || dynamic_cast<const ReturnStmt *>(s)) {
                 emit(OpCode::EvalStmt, s);
                 continue;
             }
@@ -717,9 +769,13 @@ struct Codegen {
             chunk.code.resize(start);
             return false;
         }
-        /* An all-fallback body: not worth a native loop (the tree-walker's
-         * tight counter beats one that only dispatches EvalStmts). */
-        if (!any_native) {
+        /* An all-fallback LOOP body: not worth a native loop (the tree-walker's
+         * tight counter beats one that only dispatches EvalStmts). This gate
+         * does NOT apply to an `if` then/else block (is_loop_body=false): the
+         * `if` provides its own native branch, so an all-fallback branch - e.g.
+         * `if (n%f==0) return false;` - must still compile so the enclosing
+         * loop can go native around it. */
+        if (is_loop_body && !any_native) {
             chunk.code.resize(start);
             return false;
         }
@@ -756,7 +812,7 @@ struct Codegen {
         }
 
         if (f->thenBlock
-            && !compile_scalar_body(body_stmts(f->thenBlock.get()))) {
+            && !compile_scalar_body(body_stmts(f->thenBlock.get()), false)) {
             chunk.code.resize(start);
             return false;
         }
@@ -764,7 +820,7 @@ struct Codegen {
         if (f->elseBlock) {
             const size_t j = emit(OpCode::Jump);
             chunk.code[jf].target = here();          /* Lelse */
-            if (!compile_scalar_body(body_stmts(f->elseBlock.get()))) {
+            if (!compile_scalar_body(body_stmts(f->elseBlock.get()), false)) {
                 chunk.code.resize(start);
                 return false;
             }
@@ -825,13 +881,17 @@ struct Codegen {
 
         const size_t jt = emit_cmp(cmp_opcode, w->condExpr.get(), cmp, ca, cb);
 
+        loops.push_back({});
         if (!compile_scalar_body(body_stmts(w->body.get()))) {
+            loops.pop_back();
             chunk.code.resize(start);
             return false;
         }
 
         emit(OpCode::Jump, nullptr, lstart);
-        chunk.code[jt].target = here();             /* Lend */
+        const int lend = here();
+        chunk.code[jt].target = lend;
+        pop_loop(lend, lstart);   /* continue -> the cond re-test (Lstart) */
         return true;
     }
 
@@ -868,10 +928,14 @@ struct Codegen {
             emit_cmp(OpCode::JumpUnlessIntCmp, f, f->cmp_op, ci, bound);
 
         const int lbody = here();
+        loops.push_back({});
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
+            loops.pop_back();
             chunk.code.resize(start);
             return false;
         }
+
+        const int lcont = here();   /* continue -> the fused step (i+=; test) */
 
         /* Fused back-edge: i += step; if (i <cmp> bound) goto lbody. */
         Instr fstep;
@@ -884,7 +948,9 @@ struct Codegen {
         fstep.b = step;
         chunk.code.push_back(fstep);
 
-        chunk.code[jt].target = here();             /* Lend */
+        const int lend = here();
+        chunk.code[jt].target = lend;
+        pop_loop(lend, lcont);
         return true;
     }
 
@@ -933,10 +999,14 @@ struct Codegen {
 
         const size_t jt = emit_cmp(cmp_opcode, f->cond.get(), cmp, ca, cb);
 
+        loops.push_back({});
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
+            loops.pop_back();
             chunk.code.resize(start);
             return false;
         }
+
+        const int lcont = here();   /* continue -> the inc, then re-test */
 
         /* The increment, each iteration after the body (int or float). */
         if (f->inc) {
@@ -946,6 +1016,7 @@ struct Codegen {
                 chunk.code.resize(imark);
                 reset_temps();
                 if (!compile_float_stmt(f->inc.get(), chunk.code)) {
+                    loops.pop_back();
                     chunk.code.resize(start);
                     return false;
                 }
@@ -953,7 +1024,9 @@ struct Codegen {
         }
 
         emit(OpCode::Jump, nullptr, lstart);
-        chunk.code[jt].target = here();             /* Lend */
+        const int lend = here();
+        chunk.code[jt].target = lend;
+        pop_loop(lend, lcont);
         return true;
     }
 

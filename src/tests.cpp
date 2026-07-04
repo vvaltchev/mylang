@@ -10735,11 +10735,26 @@ static bool vm_codegen_shapes()
         gf.juic == 1 && gf.intbin >= 3 && gf.jmp >= 1 && gf.flstep == 0
         && gf.jif == 0;
 
+    /* 17) break/continue in a native loop compile to native Jumps (Gap B), NOT
+     * a whole-loop fallback: a counted `for` with `if(i==3) continue;` +
+     * `if(i==7) break;` stays a ForLoopStep with two extra Jumps (the continue
+     * + the break) and three JumpUnlessIntCmp (the loop test + the two ifs). */
+    VmOpCounts bk;
+    if (!codegen_counts({
+            "var s = 0;",
+            "for (var i=0; i<10; i++) { if (i==3) continue; if (i==7) break;"
+            " s += i; }",
+        }, bk))
+        return false;
+    const bool break_cont_ok =
+        bk.flstep == 1 && bk.jmp >= 2 && bk.juic >= 3 && bk.intbin >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
         && nested_native_ok && compound_store_ok && read_2d_ok
-        && builtin_dispatch_ok && array_build_ok && general_for_ok;
+        && builtin_dispatch_ok && array_build_ok && general_for_ok
+        && break_cont_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

@@ -501,13 +501,28 @@ behind the differential harness:
   early `return`/`break` (Gap B) or are already range-fors, so none benefit yet;
   Gap A is the prerequisite, Gap B unlocks them. break/continue/return in the
   body still fall the loop back (correct). 1304/1304 + 1155/1155.
-- **loop flow: native `return`/`break`/`continue` ("Gap B", the -vd-found
-  blocker for `primes`/`is_prime`).** A `return`/`break`/`continue` in a loop
-  body forces the WHOLE loop to fall back today (not flow-free). Handling them
-  natively - a native loop that checks/propagates `flow`, or a `ret` opcode -
-  unlocks the early-return-loop class AND is the on-ramp to killing C++
-  exceptions (see `[[vm-endgame]]`): once flow is a VM-level branch, there is no
-  C++ throw for control flow and no fallback.
+- **loop flow: native `return`/`break`/`continue` — DONE (Gap B; geomean 0.75x
+  -> 0.73x).** `break`/`continue` compile to native Jumps backpatched to the
+  loop's exit / continue point via a codegen loop-stack (`LoopFrame`; nesting
+  handled - a break targets the innermost loop; a for's continue lands on the
+  fused `ForLoopStep`, a while's on the cond re-test). `return` needs NO new op:
+  it runs as an EvalStmt whose `flow==ret` the vm_run_chunk handler already acts
+  on (Phase 4) by stopping the chunk - a return abandons the loop, correct. The
+  `any_native` gate was scoped to LOOP bodies only (`is_loop_body`): an `if`
+  then/else block that's all-fallback (e.g. `if(n%f==0) return false;`) must
+  still compile so the ENCLOSING loop goes native - this is what actually made
+  `is_prime` native (`-vd`-verified: the whole loop is native, only the two
+  `return`s are eval.stmt). Unlocked `44_primes_sqrt` +0.0% -> **−47.7%** and
+  `60_bit_sieve` -> **−51.7%**. This is also the on-ramp to killing C++
+  exceptions (`[[vm-endgame]]`): control flow is now VM-level jumps, no C++
+  throw. break/continue/return + nested + while + range-for hand-verified;
+  1304/1304 + 1155/1155.
+- **KNOWN minor regression (pre-existing, from EvalToSlot):**
+  `11_closure_counter` +4.05% instrs - `s += c()` (a captured, tree-walked
+  closure) goes native via EvalToSlot, but the closure body isn't native, so
+  EvalToSlot's box/unbox
+  around the call is overhead the tree-walker's in-place `s += c()` avoids. Fix:
+  don't EvalToSlot a call whose body won't be native (or only builtins) - next.
 - native dict read/insert (unlocks the dict/sieve remainder);
 - slice read+write;
 - dict ops (read/insert/default), member/POD-struct field access + direct
