@@ -45,13 +45,14 @@ static const std::array<SharedStr, Type::t_count> TypeNames =
     string("struct"),
 };
 
-EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const Construct *arg = exprList->elems[0].get();
+    const EvalValue &e = args[0];
 
     if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
@@ -280,28 +281,28 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin_v<builtin_str>("str"),
     make_const_builtin_v<builtin_int>("int"),
     make_const_builtin_v<builtin_float>("float"),
-    make_const_builtin("clone", builtin_clone),
-    make_const_builtin("hash", builtin_hash),
+    make_const_builtin_v<builtin_clone>("clone"),
+    make_const_builtin_v<builtin_hash>("hash"),
 
     /* Array or container builtins */
-    make_const_builtin("make_array", builtin_make_array),
-    make_const_builtin("top", builtin_top),
-    make_const_builtin("range", builtin_range),
-    make_const_builtin("find", builtin_find),
+    make_const_builtin_v<builtin_make_array>("make_array"),
+    make_const_builtin_v<builtin_top>("top"),
+    make_const_builtin_v<builtin_range>("range"),
+    make_const_builtin_v<builtin_find>("find"),
     make_const_builtin("sort", builtin_sort),
     make_const_builtin("rev_sort", builtin_rev_sort),
     make_const_builtin("reverse", builtin_reverse),
-    make_const_builtin("sum", builtin_sum),
+    make_const_builtin_v<builtin_sum>("sum"),
     make_const_builtin("map", builtin_map),
     make_const_builtin("filter", builtin_filter),
 
     /* Dictionary builtins */
-    make_const_builtin("keys", builtin_keys),
-    make_const_builtin("values", builtin_values),
-    make_const_builtin("kvpairs", builtin_kvpairs),
-    make_const_builtin("dict", builtin_dict),
-    make_const_builtin("get", builtin_get),         /* dict lookup -> opt V */
-    make_const_builtin("get!", builtin_get_throw),  /* lookup or throw -> V */
+    make_const_builtin_v<builtin_keys>("keys"),
+    make_const_builtin_v<builtin_values>("values"),
+    make_const_builtin_v<builtin_kvpairs>("kvpairs"),
+    make_const_builtin_v<builtin_dict>("dict"),
+    make_const_builtin_v<builtin_get>("get"),         /* dict lookup -> opt V */
+    make_const_builtin_v<builtin_get_throw>("get!"),  /* lookup or throw -> V */
 
     /* String builtins */
     make_const_builtin_v<builtin_split>("split"),
@@ -366,15 +367,15 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
 EvalContext::SymbolsType EvalContext::builtins =
 {
     /* Misc builtins */
-    make_builtin("assert", builtin_assert),
-    make_builtin("exit", builtin_exit),
-    make_builtin("runtime", builtin_runtime), /* optimization barrier */
+    make_builtin_v<builtin_assert>("assert"),
+    make_builtin_v<builtin_exit>("exit"),
+    make_builtin_v<builtin_runtime>("runtime"), /* optimization barrier */
     make_builtin("isconst", builtin_isconst),
     make_builtin("isconstdecl", builtin_isconstdecl),
-    make_builtin("ispure", builtin_ispure),
-    make_builtin("ispuredecl", builtin_ispuredecl),
+    make_builtin_v<builtin_ispure>("ispure"),
+    make_builtin_v<builtin_ispuredecl>("ispuredecl"),
     make_builtin_lv<builtin_intptr>("intptr"),
-    make_builtin("array_storage", builtin_array_storage),
+    make_builtin_v<builtin_array_storage>("array_storage"),
 
     /* Compile-time type queries (folded by the inferencer; the runtime body is
      * a -nti fallback). decltype(var) takes a variable; typestr/kindstr take an
@@ -385,23 +386,23 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("kindstr", builtin_kindstr),
 
     /* Runtime reflection (see builtins/reflect.cpp.h) */
-    make_builtin("globals", builtin_globals),
-    make_builtin("signature", builtin_signature),
-    make_builtin("layout", builtin_layout),
-    make_builtin("specializations", builtin_specializations),
+    make_builtin_v<builtin_globals>("globals"),
+    make_builtin_v<builtin_signature>("signature"),
+    make_builtin_v<builtin_layout>("layout"),
+    make_builtin_v<builtin_specializations>("specializations"),
     make_builtin("show", builtin_show),
 
     /* Diagnostic tracing (see trace.h) */
-    make_builtin("trace", builtin_trace),
-    make_builtin("traceoff", builtin_traceoff),
-    make_builtin("tracing", builtin_tracing),
+    make_builtin_v<builtin_trace>("trace"),
+    make_builtin_v<builtin_traceoff>("traceoff"),
+    make_builtin_v<builtin_tracing>("tracing"),
     /* dynarray(a): manual promotion - a fresh general (polymorphic) copy of an
      * array. Non-const (fresh mutable value). See builtin_dynarray. */
-    make_builtin("dynarray", builtin_dynarray),
+    make_builtin_v<builtin_dynarray>("dynarray"),
     /* array() is non-const: it never folds to a baked literal, so array(N) is
      * always a runtime call (uniform const/runtime type-driven fill) and a huge
      * array(1000000) isn't baked into the AST. */
-    make_builtin("array", builtin_array),
+    make_builtin_v<builtin_array>("array"),
 
     /* Array builtins */
     make_builtin_lv<builtin_append>("append"),
@@ -411,11 +412,11 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* Generic-container builtins */
     make_builtin_lv<builtin_erase>("erase"),
     make_builtin_lv<builtin_insert>("insert"),
-    make_builtin("deepclone", builtin_deepclone), /* deep mutable copy */
+    make_builtin_v<builtin_deepclone>("deepclone"), /* deep mutable copy */
 
     /* Numeric builtins */
-    make_builtin("rand", builtin_rand),
-    make_builtin("randf", builtin_randf),
+    make_builtin_v<builtin_rand>("rand"),
+    make_builtin_v<builtin_randf>("randf"),
 
     /* I/O builtins */
     make_builtin_v<builtin_print>("print"),

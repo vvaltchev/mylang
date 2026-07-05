@@ -2912,8 +2912,18 @@ an `LValue*` target and self-evaluates its remaining args (so append keeps
 construct-in-place), dispatching via **`CallBuiltinLV`** when arg0 is a slotted
 identifier (local/global/capture — the op forms the `LValue*` straight from the
 table). An **AST builtin** (defined/type/…, needs the arg node) keeps the union
-null and stays `EvalToSlot`. Still fallbacks: AST builtins, a subscript/member
-lvalue target (`append(a[i], …)` — Phase 2), struct construction. Gated by
+null and stays `EvalToSlot`. **The read-only builtin migration to `func_v` is
+complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose
+args are plain values now dispatches via `CallBuiltinV`, and the residual
+old-ABI (`func`, `EvalToSlot`) floor is exactly three principled groups — **AST
+builtins** (`defined`/`isconst`/`isconstdecl`/`type`/`decltype`/`typestr`/
+`kindstr`/`show`: unevaluated / node-property operand), **`sort`/`rev_sort`/
+`reverse`** (arg0 is an `LValue` for slice write-back + const-copy — need a
+future const-capable lvalue ABI), and **`map`/`filter`** (validate arg0 the
+function and throw BEFORE evaluating arg1, which the eager value ABI would
+change — pinned by their "validates its function argument first" tests). Still
+fallbacks beyond builtins: a subscript/member lvalue target (`append(a[i], …)` —
+Phase 2), struct construction. Gated by
 the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the

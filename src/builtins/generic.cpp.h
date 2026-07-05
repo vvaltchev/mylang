@@ -101,12 +101,13 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList,
  * inside the expression, before it is "runtime-ized"), while 1/runtime(0)
  * throws at run time. Useful in tests, and to opt an expression out of folding.
  */
-EvalValue builtin_runtime(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_runtime(EvalContext *ctx, ExprList *exprList,
+                          const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    return RValue(exprList->elems[0]->eval(ctx));
+    return args[0];
 }
 
 /*
@@ -141,13 +142,14 @@ EvalValue builtin_isconstdecl(EvalContext *ctx, ExprList *exprList)
  * object that is effectively pure (explicitly `pure`, OR proven pure by the
  * resolver), resp. *explicitly* declared `pure`. The arg is evaluated.
  */
-EvalValue builtin_ispure(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_ispure(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &v = RValue(arg->eval(ctx));
+    const EvalValue &v = args[0];
 
     if (!v.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx(arg->start, arg->end);
@@ -155,13 +157,14 @@ EvalValue builtin_ispure(EvalContext *ctx, ExprList *exprList)
     return v.get<intrusive_ptr<FuncObject>>()->func->effective_pure;
 }
 
-EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList,
+                             const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &v = RValue(arg->eval(ctx));
+    const EvalValue &v = args[0];
 
     if (!v.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx(arg->start, arg->end);
@@ -169,13 +172,13 @@ EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList)
     return v.get<intrusive_ptr<FuncObject>>()->func->explicit_pure;
 }
 
-EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (e.is<SharedStr>()) {
         /* Strings are immutable */
@@ -192,13 +195,13 @@ EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList)
  * runtime (non-const) builtin: it produces a mutable value that must be copied
  * fresh per evaluation anyway, so folding it would only bloat the tree.
  */
-EvalValue builtin_deepclone(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_deepclone(EvalContext *ctx, ExprList *exprList,
+                            const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
-    return make_deep_mutable_clone(RValue(arg->eval(ctx)));
+    return make_deep_mutable_clone(args[0]);
 }
 
 EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList, LValue *target)
@@ -215,13 +218,13 @@ EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList, LValue *target)
     return e.get_type()->intptr(e);
 }
 
-EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.get_type()->is_true(e))
         throw AssertionFailureEx(exprList->start, exprList->end);
@@ -319,15 +322,16 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList, LValue *target)
     }
 }
 
-EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_find(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() < 2 || exprList->elems.size() > 3)
+    if (n < 2 || n > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &container_val = RValue(arg0->eval(ctx));
-    const EvalValue &elem_val = RValue(arg1->eval(ctx));
+    const EvalValue &container_val = args[0];
+    const EvalValue &elem_val = args[1];
 
     if (container_val.is<intrusive_ptr<DictObject>>()) {
 
@@ -337,16 +341,14 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
     } else if (container_val.is<SharedArrayObj>()) {
 
         FuncObject *key = nullptr;
-        /* Hold the key function's handle for the whole find: an inline lambda
-         * has no other owner, so without this its FuncObject would be freed
-         * when the temporary `keyval` below goes out of scope, leaving `key`
-         * dangling (a use-after-free when find_arr calls it). */
+        /* args[2] owns the key function's handle for the whole call, so a raw
+         * FuncObject* into it stays valid for the loop; hold an extra ref. */
         intrusive_ptr<FuncObject> key_holder;
 
-        if (exprList->elems.size() == 3) {
+        if (n == 3) {
 
             Construct *arg2 = exprList->elems[2].get();
-            const EvalValue &keyval = RValue(arg2->eval(ctx));
+            const EvalValue &keyval = args[2];
 
             if (!keyval.is<intrusive_ptr<FuncObject>>())
                 throw TypeErrorEx("Expected function object", arg2->start, arg2->end);
@@ -373,16 +375,23 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList)
     }
 }
 
-EvalValue builtin_hash(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_hash(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
     return static_cast<int_type>(e.hash());
 }
 
+/*
+ * map/filter are NOT value-ABI-migrated: they validate arg0 (the function) and
+ * throw BEFORE evaluating arg1 (the container), which the eager value ABI would
+ * break (`map(5, undefined_var)` must be TypeErrorEx on the 5, not
+ * UndefinedVariableEx on arg1). Pinned by "map()/filter() validates its
+ * function argument first". Stay on the old ABI (self-eval, order-controlled).
+ */
 EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 2)

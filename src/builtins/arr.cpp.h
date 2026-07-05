@@ -37,15 +37,14 @@ static const char *const flat_array_violation_msg =
  *                    -> flat int, a float -> flat float, else general. For a
  *                    callback-built array use make_array().
  */
-EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_array(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t nargs)
 {
-    const size_t nargs = exprList->elems.size();
-
     if (nargs < 1 || nargs > 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
@@ -82,7 +81,7 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
         return SharedArrayObj(move(vec));
     }
 
-    const EvalValue &v = RValue(exprList->elems[1]->eval(ctx));
+    const EvalValue &v = args[1];
 
     /*
      * Flat storage for a scalar fill value, unless the destination is
@@ -121,13 +120,14 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList)
  * unboxed int/float vector while they stay that one scalar kind, and the array
  * promotes to general the moment a callback returns something else.
  */
-EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList,
+                             const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() != 2)
+    if (nargs != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg0->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg0->start, arg0->end);
@@ -139,7 +139,7 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
                              arg0->start, arg0->end);
 
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &fval = RValue(arg1->eval(ctx));
+    const EvalValue &fval = args[1];
 
     if (!fval.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg1->start, arg1->end);
@@ -219,13 +219,14 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList)
  * pin the representation and catch regressions. Not const: it reflects a
  * runtime fact and must not fold.
  */
-EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList,
+                                const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
@@ -255,13 +256,14 @@ EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList)
  * that must be re-copied per eval). Compare `var dyn d = [1,2,3]`, where the
  * dyn declaration already builds general from the start.
  */
-EvalValue builtin_dynarray(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_dynarray(EvalContext *ctx, ExprList *exprList,
+                           const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() != 1)
+    if (nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
@@ -448,13 +450,14 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList, LValue *target)
     return last;
 }
 
-EvalValue builtin_top(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_top(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() != 1)
+    if (nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
@@ -579,22 +582,23 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     return true;
 }
 
-EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_range(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() < 1 || exprList->elems.size() > 3)
+    if (n < 1 || n > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     int_type end, start = 0, step = 1;
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue &val0 = args[0];
 
     if (!val0.is<int_type>())
         throw TypeErrorEx("Expected integer", arg0->start, arg0->end);
 
-    if (exprList->elems.size() >= 2) {
+    if (n >= 2) {
 
         Construct *arg1 = exprList->elems[1].get();
-        const EvalValue &val1 = RValue(arg1->eval(ctx));
+        const EvalValue &val1 = args[1];
 
         if (!val1.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
@@ -602,10 +606,10 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList)
         start = val0.get<int_type>();
         end = val1.get<int_type>();
 
-        if (exprList->elems.size() == 3) {
+        if (n == 3) {
 
             Construct *arg2 = exprList->elems[2].get();
-            const EvalValue &val2 = RValue(arg2->eval(ctx));
+            const EvalValue &val2 = args[2];
 
             if (!val2.is<int_type>())
                 throw TypeErrorEx("Expected integer", arg2->start, arg2->end);
@@ -973,13 +977,14 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
     return arr;
 }
 
-EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() < 1 || exprList->elems.size() > 2)
+    if (nargs < 1 || nargs > 2)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue &val0 = args[0];
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
@@ -991,7 +996,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
      * promotion to vector<LValue> and no per-element virtual dispatch. Only the
      * 1-arg (no callback) form - a user reducer needs boxed EvalValues.
      */
-    if (exprList->elems.size() == 1 &&
+    if (nargs == 1 &&
         arr.skind() != SharedArrayObj::Storage::general)
     {
         const size_type off = arr.offset(), n = arr.size();
@@ -1028,7 +1033,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
     if (view.size() == 0)
         return none; /* sum of an empty array is none, like min()/max() */
 
-    if (exprList->elems.size() == 1) {
+    if (nargs == 1) {
 
         const EvalValue &first = view[0].get();
 
@@ -1078,7 +1083,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList)
     } else {
 
         Construct *arg1 = exprList->elems[1].get();
-        const EvalValue &val1 = RValue(arg1->eval(ctx));
+        const EvalValue &val1 = args[1];
 
         if (!val1.is<intrusive_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);

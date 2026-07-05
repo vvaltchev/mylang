@@ -273,9 +273,10 @@ std::string reflect_layout(const StructTypeDef *def)
  * Excludes builtins (use :help builtins). See the file header for the const
  * scalar / script-slot limits.
  */
-EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList,
+                          const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 0)
+    if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     EvalContext *root = get_root_ctx(ctx);
@@ -325,13 +326,14 @@ EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList)
  * constructor), as a string. Accepts a function value, a struct type
  * descriptor, or a struct instance (its type's constructor).
  */
-EvalValue builtin_signature(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_signature(EvalContext *ctx, ExprList *exprList,
+                            const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (e.is<intrusive_ptr<FuncObject>>())
         return SharedStr(
@@ -396,13 +398,14 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
  * struct instance. (The legacy `reflect_layout` string renderer is kept for the
  * REPL `:layout`-style introspection.)
  */
-EvalValue builtin_layout(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_layout(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (e.is<StructTypeDef *>())
         return reflect_make_layout(e.get<StructTypeDef *>());
@@ -421,13 +424,14 @@ EvalValue builtin_layout(EvalContext *ctx, ExprList *exprList)
  * a runtime scope walk; what each clone specializes on is shown by the trace /
  * :globals.
  */
-EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList,
+                                  const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected a function", arg->start, arg->end);
@@ -503,14 +507,15 @@ EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
  * "autoconst", "autopure", "arrays", "fold", or "all"); on is truthy/falsy.
  * Throws InvalidValueEx on an unknown category. Returns none.
  */
-EvalValue builtin_trace(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_trace(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 2)
+    if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *a0 = exprList->elems[0].get();
-    const EvalValue &name = RValue(a0->eval(ctx));
-    const EvalValue &on = RValue(exprList->elems[1]->eval(ctx));
+    const EvalValue &name = args[0];
+    const EvalValue &on = args[1];
 
     if (!name.is<SharedStr>())
         throw TypeErrorEx("Expected a category string", a0->start, a0->end);
@@ -522,18 +527,20 @@ EvalValue builtin_trace(EvalContext *ctx, ExprList *exprList)
 }
 
 /* traceoff(): disable all trace categories. Returns none. */
-EvalValue builtin_traceoff(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_traceoff(EvalContext *ctx, ExprList *exprList,
+                           const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 0)
+    if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
     trace_clear_all();
     return none;
 }
 
 /* tracing(): the active trace categories as a sorted array<str>. */
-EvalValue builtin_tracing(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_tracing(EvalContext *ctx, ExprList *exprList,
+                          const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 0)
+    if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     std::vector<std::string> active = trace_active();

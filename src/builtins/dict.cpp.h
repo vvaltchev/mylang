@@ -36,15 +36,19 @@ builtin_find_dict(const intrusive_ptr<DictObject> &obj, const EvalValue &key)
  * the dict has a default value (see dict(default_value)).
  */
 static EvalValue
-dict_get_impl(EvalContext *ctx, ExprList *exprList, bool throw_if_absent)
+dict_get_impl(EvalContext *ctx,
+              ExprList *exprList,
+              const EvalValue *args,
+              size_t n,
+              bool throw_if_absent)
 {
-    if (exprList->elems.size() != 2)
+    if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &d = RValue(arg0->eval(ctx));
-    const EvalValue &key = RValue(arg1->eval(ctx));
+    const EvalValue &d = args[0];
+    const EvalValue &key = args[1];
 
     if (!d.is<intrusive_ptr<DictObject>>())
         throw TypeErrorEx("Expected dict object", arg0->start, arg0->end);
@@ -62,14 +66,16 @@ dict_get_impl(EvalContext *ctx, ExprList *exprList, bool throw_if_absent)
     return none;
 }
 
-EvalValue builtin_get(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_get(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    return dict_get_impl(ctx, exprList, false);
+    return dict_get_impl(ctx, exprList, args, n, false);
 }
 
-EvalValue builtin_get_throw(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_get_throw(EvalContext *ctx, ExprList *exprList,
+                            const EvalValue *args, size_t n)
 {
-    return dict_get_impl(ctx, exprList, true);
+    return dict_get_impl(ctx, exprList, args, n, true);
 }
 
 EvalValue
@@ -174,13 +180,15 @@ dict_kvpairs(const DictObject::inner_type &data, ArrHint /*hint*/)
 static EvalValue
 dict_1arg_func(EvalContext *ctx,
                ExprList *exprList,
+               const EvalValue *args,
+               size_t n,
                EvalValue (*f)(const DictObject::inner_type &, ArrHint))
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue &val0 = args[0];
 
     if (!val0.is<intrusive_ptr<DictObject>>())
         throw TypeErrorEx("Expected dict object", arg0->start, arg0->end);
@@ -194,31 +202,35 @@ dict_1arg_func(EvalContext *ctx,
 }
 
 EvalValue
-builtin_keys(EvalContext *ctx, ExprList *exprList)
+builtin_keys(EvalContext *ctx, ExprList *exprList,
+             const EvalValue *args, size_t n)
 {
-    return dict_1arg_func(ctx, exprList, &dict_keys);
+    return dict_1arg_func(ctx, exprList, args, n, &dict_keys);
 }
 
 EvalValue
-builtin_values(EvalContext *ctx, ExprList *exprList)
+builtin_values(EvalContext *ctx, ExprList *exprList,
+               const EvalValue *args, size_t n)
 {
-    return dict_1arg_func(ctx, exprList, &dict_values);
+    return dict_1arg_func(ctx, exprList, args, n, &dict_values);
 }
 
 EvalValue
-builtin_kvpairs(EvalContext *ctx, ExprList *exprList)
+builtin_kvpairs(EvalContext *ctx, ExprList *exprList,
+                const EvalValue *args, size_t n)
 {
-    return dict_1arg_func(ctx, exprList, &dict_kvpairs);
+    return dict_1arg_func(ctx, exprList, args, n, &dict_kvpairs);
 }
 
 EvalValue
-builtin_dict(EvalContext *ctx, ExprList *exprList)
+builtin_dict(EvalContext *ctx, ExprList *exprList,
+             const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
     DictObject::inner_type data;
 
     /*

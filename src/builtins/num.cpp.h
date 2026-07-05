@@ -378,15 +378,16 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList,
     }
 }
 
-EvalValue builtin_rand(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_rand(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 2)
+    if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &v0 = RValue(arg0->eval(ctx));
-    const EvalValue &v1 = RValue(arg1->eval(ctx));
+    const EvalValue &v0 = args[0];
+    const EvalValue &v1 = args[1];
 
     if (!v0.is<int_type>())
         throw TypeErrorEx("Expected integer", arg0->start, arg0->end);
@@ -407,15 +408,16 @@ EvalValue builtin_rand(EvalContext *ctx, ExprList *exprList)
     return distrib(mt_engine);
 }
 
-EvalValue builtin_randf(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_randf(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 2)
+    if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &v0 = RValue(arg0->eval(ctx));
-    const EvalValue &v1 = RValue(arg1->eval(ctx));
+    const EvalValue &v0 = args[0];
+    const EvalValue &v1 = args[1];
 
     if (!v0.is<float_type>())
         throw TypeErrorEx("Expected float", arg0->start, arg0->end);
