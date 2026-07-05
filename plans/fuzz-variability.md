@@ -33,7 +33,7 @@ Order = manage risk first, biggest/most-valuable last. Each: implement -> fuzz
       `a if cond else b` (Python). A VALUE that depends on control flow, not a
       branch statement. Emitted as a `(my, py)` pair at the value level (not
       nested inside arithmetic, to avoid an expr()->pair refactor).
-- [ ] **2. More loop shapes** - a DOWN-counting `for (i = N; i > 0; i--)` and a
+- [x] **2. More loop shapes** - a DOWN-counting `for (i = N; i > 0; i--)` and a
       DATA-DEPENDENT-bound `while (s < limit)` (bound changes during the loop;
       needs a guaranteed-progress counter to terminate). Reverse iteration +
       changing bounds.

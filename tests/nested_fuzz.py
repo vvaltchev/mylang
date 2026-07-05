@@ -208,7 +208,8 @@ class Gen:
         for _ in range(self.rng.randint(0, 1)):
             self.side_effect(im, ip)
 
-        kind = self.rng.choice(["if", "while", "for_opt", "for_gen"])
+        kind = self.rng.choice(["if", "while", "for_opt", "for_gen",
+                                "for_down", "while_data"])
         v = "v%d" % level
 
         if kind == "if":
@@ -252,6 +253,35 @@ class Gen:
             g2 = self.rng.choice(self.scalars)
             self.emit(im + "  if (%s %% 13 == 0) break;" % g2,
                       ip + "    if %s %% 13 == 0: break" % g2)
+            self.emit(im + "}", "")
+
+        elif kind == "for_down":
+            # DOWN-counting: v = N, N-1, ..., 1 (reverse iteration).
+            n = self.rng.randint(2, 3)
+            self.emit(im + "for (var %s = %d; %s > 0; %s--) {" % (v, n, v, v),
+                      ip + "for %s in range(%d, 0, -1):" % (v, n))
+            self.loopvars.append(v)
+            self.build(level + 1, im + "  ", ip + "    ")
+            self.loopvars.pop()
+            g = self.rng.choice(self.scalars)
+            self.emit(im + "  if (%s %% 13 == 0) break;" % g,
+                      ip + "    if %s %% 13 == 0: break" % g)
+            self.emit(im + "}", "")
+
+        elif kind == "while_data":
+            # DATA-DEPENDENT bound: the `<scalar> < LIM` part can flip during the
+            # loop (the body mutates scalars); the `v < N` counter guarantees
+            # termination. `&&` vs `and` -> an explicit (my, py) header pair.
+            n = self.rng.randint(2, 4)
+            lim = self.rng.randint(40, 90)
+            g = self.rng.choice(self.scalars)
+            self.emit(im + "var %s = 0;" % v, ip + "%s = 0" % v)
+            self.emit(im + "while (%s < %d && %s < %d) {" % (v, n, g, lim),
+                      ip + "while %s < %d and %s < %d:" % (v, n, g, lim))
+            self.emit(im + "  %s += 1;" % v, ip + "    %s += 1" % v)
+            self.loopvars.append(v)
+            self.build(level + 1, im + "  ", ip + "    ")
+            self.loopvars.pop()
             self.emit(im + "}", "")
 
         else:  # for_gen: multiplicative step -> Python `while` (no continue:
