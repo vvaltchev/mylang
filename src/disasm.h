@@ -23,13 +23,24 @@ class Block;
  * end-goal), the disassembly loses its `Construct*` rows and becomes pure
  * bytecode - the disassembler is how we track that progress and audit each
  * bench for wasted cycles.
+ *
+ * `cap_names` is a CLOSURE's capture list - its anonymous capture-struct field
+ * names, in `cN` slot order: the header prints them (`; captures (anon struct):
+ * { ... }`) and the capture ops read a `cN` slot as its field name. Empty for a
+ * non-capturing chunk.
  */
-std::string disassemble(const Chunk &chunk, const std::string &title);
+std::string disassemble(const Chunk &chunk, const std::string &title,
+                        const std::vector<std::string> &cap_names = {});
 
 /*
  * Disassemble a whole program: the "main" chunk, then every block-bodied
- * function's chunk (each labelled). Compiles the chunks fresh (like a `-vm`
- * run would) without executing. Used by the `-vd` driver.
+ * function AND CLOSURE reachable (a complete AST walk - a lambda in a
+ * `return func[..]{..}` / a var-init / a call arg is found too, not only
+ * top-level funcs), each labelled (`func <name>` / `closure#N` / `lambda#N`)
+ * with its captures. Compiles the chunks fresh (like a `-vm` run) without
+ * executing. Used by the `-vd` driver. NB: a function body that ends in a
+ * return has NO trailing `halt` (ReturnV already stops the chunk; only a
+ * fall-through body - `main`, a void function - keeps the `halt` terminator).
  */
 std::string disassemble_program(const Block *root);
 

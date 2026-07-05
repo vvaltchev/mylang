@@ -108,31 +108,87 @@ std::string store_op(Op aop)
     return aop == Op::invalid ? std::string("=") : opsym(aop) + "=";
 }
 
-/* Find every FuncDeclStmt reachable through Blocks / function bodies (top-level
- * and function-nested). A function inside a loop/if body is not walked - rare,
- * and a step-1 limitation of the -vd driver. */
+/* Find every FuncDeclStmt reachable from `c` - a COMPLETE walk, so a lambda in
+ * ANY expression position (a `return func[..]{..}`, a `var f = func..`, a call
+ * arg, a ternary branch, ...) is disassembled too, not only top-level / body-
+ * statement functions. Each FuncDeclStmt's own body is recursed for further
+ * nested closures. */
 void collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
 {
     if (!c)
         return;
     if (const FuncDeclStmt *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
         out.push_back(fn);
-        collect_funcs(fn->body.get(), out);
+        collect_funcs(fn->body.get(), out);   /* nested closures within */
         return;
     }
-    if (const Block *b = dynamic_cast<const Block *>(c))
-        for (const auto &e : b->elems)
-            collect_funcs(e.get(), out);
+    auto rec = [&](const Construct *ch) { collect_funcs(ch, out); };
+    if (const Block *b = dynamic_cast<const Block *>(c)) {
+        for (const auto &e : b->elems) rec(e.get());
+    } else if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c)) {
+        rec(sc->elem.get());
+    } else if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+        for (auto &p : mo->elems) rec(p.second.get());
+    } else if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c)) {
+        for (auto &p : ts->elems) rec(p.second.get());
+    } else if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
+        for (auto &e : me->elems) rec(e.get());
+    } else if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+        rec(e->lvalue.get()); rec(e->rvalue.get());
+    } else if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
+        rec(ce->what.get()); rec(ce->args.get());
+    } else if (auto *sub = dynamic_cast<const Subscript *>(c)) {
+        rec(sub->what.get()); rec(sub->index.get());
+    } else if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+        rec(m->what.get());
+    } else if (auto *ret = dynamic_cast<const ReturnStmt *>(c)) {
+        rec(ret->elem.get());
+    } else if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
+        rec(iff->condExpr.get()); rec(iff->thenBlock.get());
+        rec(iff->elseBlock.get());
+    } else if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+        rec(w->condExpr.get()); rec(w->body.get());
+    } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+        rec(f->init.get()); rec(f->cond.get()); rec(f->inc.get());
+        rec(f->body.get());
+    } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+        rec(fr->init.get()); rec(fr->bound.get()); rec(fr->step.get());
+        rec(fr->body.get());
+    } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+        rec(fe->container.get()); rec(fe->body.get());
+    } else if (auto *te = dynamic_cast<const TernaryExpr *>(c)) {
+        rec(te->condExpr.get()); rec(te->thenExpr.get());
+        rec(te->elseExpr.get());
+    } else if (auto *co = dynamic_cast<const CoalesceExpr *>(c)) {
+        rec(co->lhs.get()); rec(co->rhs.get());
+    }
 }
 
 }  /* namespace */
 
-std::string disassemble(const Chunk &chunk, const std::string &title)
+std::string disassemble(const Chunk &chunk, const std::string &title,
+                        const std::vector<std::string> &cap_names)
 {
     std::ostringstream s;
     s << "; ===== " << title << "  (" << chunk.code.size() << " instr, "
-      << chunk.n_temps << " temps) =====\n"
-      << "; registers: a source var reads by NAME; `rN` is a scratch temp\n";
+      << chunk.n_temps << " temps) =====\n";
+    /* A closure's captures ARE an anonymous struct: show its fields, and the
+     * capture ops below name them (a `cN` capture slot reads as its field). */
+    if (!cap_names.empty()) {
+        s << "; captures (anon struct): {";
+        for (size_t i = 0; i < cap_names.size(); i++)
+            s << (i ? ", " : " ") << cap_names[i];
+        s << " }\n";
+    }
+    s << "; registers: a source var reads by NAME; `rN` is a scratch temp\n";
+
+    /* A capture slot as its field name (the anon capture-struct field), else
+     * `cN`. */
+    auto CAP = [&](int slot) -> std::string {
+        if (slot >= 0 && static_cast<size_t>(slot) < cap_names.size())
+            return cap_names[slot];
+        return "c" + std::to_string(slot);
+    };
 
     /* Terse operand helpers bound to this chunk (names + immediates), and the
      * `; source` comment column an op carries its AST snippet in. */
@@ -402,7 +458,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << RI(in.a, false);
             break;
         case OpCode::StoreCaptureV:
-            row << "store.cap    c" << in.target
+            row << "store.cap    " << CAP(in.target)
                 << (in.aop == Op::invalid ? " = " : " OP= ")
                 << RI(in.a, false);
             break;
@@ -455,14 +511,31 @@ std::string disassemble_program(const Block *root)
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
 
+    int anon = 0;
     for (const FuncDeclStmt *fn : funcs) {
         if (!fn->body || !fn->body->is_block())
             continue;
         const Block *body = static_cast<const Block *>(fn->body.get());
-        std::string name = fn->id ? std::string(fn->id->get_str())
-                                  : "<anon>";
-        s << "\n" << disassemble(codegen_chunk(body, fn->frame_size),
-                                 "func " + name);
+
+        /* The capture list IS the closure's anonymous struct: its field names,
+         * in declaration order (== the cN capture-slot order). */
+        std::vector<std::string> cap_names;
+        if (fn->captures)
+            for (const auto &cap : fn->captures->elems)
+                if (auto *id = dynamic_cast<const Identifier *>(cap.get()))
+                    cap_names.push_back(std::string(id->get_str()));
+
+        /* Label: a named func is `func <name>`; an anonymous lambda gets a
+         * synthetic id, `closure` iff it captures (else `lambda`). */
+        std::string title;
+        if (fn->id)
+            title = "func " + std::string(fn->id->get_str());
+        else
+            title = (cap_names.empty() ? "lambda#" : "closure#")
+                    + std::to_string(anon++);
+
+        s << "\n" << disassemble(codegen_chunk(body, fn->frame_size), title,
+                                 cap_names);
     }
     return s.str();
 }

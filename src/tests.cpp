@@ -11667,12 +11667,69 @@ static bool disasm_highlight_shape()
     return colored && stripped == plain;
 }
 
+/* The disassembler (a) finds a CLOSURE body in EXPRESSION position (a returned
+ * lambda - the complete collect_funcs walk), labels it + shows its captures as
+ * an anonymous struct with named capture ops, and (b) drops the dead trailing
+ * Halt from a function body that ends in a return (codegen_chunk). */
+static bool vm_disasm_closure_shape()
+{
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : { "func f(x) { return x + 1; }",
+                           "func mk(n) { return func [n] { return n; }; }",
+                           "print(f(1) + mk(2)());" }) {
+        if (!src.empty())
+            src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (!b)
+            return false;
+
+        /* (a) the returned lambda is disassembled with its capture struct. */
+        const std::string d = disassemble_program(b);
+        const bool closure_shown =
+            d.find("closure#") != std::string::npos
+            && d.find("captures (anon struct): { n }") != std::string::npos
+            && d.find("load.capture") != std::string::npos;
+
+        /* (b) f's body `{ return x+1; }` ends in ReturnV, so its chunk has NO
+         * trailing Halt (dead). */
+        const FuncDeclStmt *f = nullptr;
+        for (const auto &e : b->elems)
+            if (auto *fn = dynamic_cast<const FuncDeclStmt *>(e.get()))
+                if (fn->id && fn->id->get_str() == "f") {
+                    f = fn;
+                    break;
+                }
+        bool halt_dropped = false;
+        if (f && f->body && f->body->is_block()) {
+            Chunk ch = codegen_chunk(
+                static_cast<const Block *>(f->body.get()), f->frame_size);
+            halt_dropped = !ch.code.empty()
+                        && ch.code.back().op == OpCode::ReturnV;
+        }
+        return closure_shown && halt_dropped;
+    } catch (...) {
+        return false;
+    }
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
+    { "vm: disasm closures + halt-drop", vm_disasm_closure_shape },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },
     { "analyze: counted `for` is greened, float-var `for` is not",
       analyze_greens_counted_for },

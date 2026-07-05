@@ -3497,7 +3497,17 @@ codegen_chunk(const Block *block, int slot_count)
     Codegen cg;
     cg.temp_base = cg.next_temp = cg.max_temp = slot_count;
     cg.gen_stmts(block->elems);
-    cg.emit(OpCode::Halt);
+    /* A body that ends in a ReturnV needs no Halt terminator: ReturnV already
+     * stops the chunk (vm_run_chunk `return`s), so a trailing Halt is dead AND
+     * unreferenced - the codegen emits no jump to the chunk end past a
+     * return (an if whose branches all return leaves no merge Jump; a loop
+     * exit targets the following op, not the end). A FALL-THROUGH body (last op
+     * not a ReturnV - a void fn, a trailing loop/if) keeps the Halt as
+     * its implicit-return-`none` terminator + jump target. Saves one dead instr
+     * per always-returning function. */
+    if (cg.chunk.code.empty()
+        || cg.chunk.code.back().op != OpCode::ReturnV)
+        cg.emit(OpCode::Halt);
     cg.chunk.n_temps = cg.max_temp - slot_count;
     cg.chunk.n_dict_iters = cg.max_dict_iters;
     cg.chunk.slot_count = slot_count;

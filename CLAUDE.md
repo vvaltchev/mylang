@@ -141,7 +141,8 @@ Running scripts:
                                  # default is the tree-walker) — bytecode-vm.md
 ./build/mylang -vd FILE          # dump the VM bytecode disassembly (the
                                  # bytecode analogue of -s), exit — disasm.h;
-                                 # 256-color syntax-highlighted on a TTY
+                                 # closures + their capture struct shown, 256-
+                                 # color syntax-highlighted on a TTY
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang -dti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization
@@ -3206,7 +3207,14 @@ frame/param/backtrace machinery — so `55_float_sum` (a loop in a function) is
 `DictStore`, `CallBuiltinV`, `SliceV`, a `ReturnV` over a native expr, …), which
 has NO arith/loop op, compiles too (the old arith/loop-only gate left those on
 the tree-walker); an all-fallback body still tree-walks (the VM would only add
-dispatch). Recursion with arith stays ~neutral (`fib` −0.08%). A non-scope-free
+dispatch). A function chunk (`codegen_chunk`) whose body ends in a `ReturnV`
+OMITS the trailing `Halt`: `ReturnV` already `return`s from `vm_run_chunk`, so
+the `Halt` would be dead AND unreferenced (the codegen emits no jump to the
+chunk end past a return — an if whose branches all return leaves no merge
+`Jump`, a loop-exit targets the following op). A FALL-THROUGH body (`main`, a
+void function, a trailing loop/if) keeps the `Halt` as its implicit-return-
+`none` terminator + jump target. Recursion with arith stays ~neutral (`fib`
+−0.08%). A non-scope-free
 body (captures / nested func) still tree-walks (it needs its own child context,
 which `vm_run_chunk` doesn't build).
 
