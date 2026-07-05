@@ -123,51 +123,81 @@ class Gen:
         self.my.append(m)
         self.py.append(p)
 
+    # A weighted menu of side-effect kinds - (method, weight). New structural
+    # constructs are added here (see plans/fuzz-variability.md).
+    def se_menu(self):
+        return [
+            (self.se_scalar,  30),
+            (self.se_array,   15),
+            (self.se_dict,    12),
+            (self.se_append,  10),
+            (self.se_temp,    10),
+            (self.se_foreach, 10),
+            (self.se_ternary, 10),
+        ]
+
     def side_effect(self, im, ip):
-        """One random side effect (MyLang line, Python line) - both identical
-        text except the trailing `;` / loop syntax."""
-        k = self.rng.random()
-        if k < 0.10:
-            # a FLAT foreach over the fixed array, folding it into a scalar
-            fe = "e%d" % self.tempcount
-            self.tempcount += 1
-            tgt = self.rng.choice(self.scalars)
-            body = "%s = (%s + %s) %% %d" % (tgt, tgt, fe, MOD)
-            self.emit(im + "foreach (var %s in A) %s;" % (fe, body),
-                      ip + "for %s in A: %s" % (fe, body))
-        elif k < 0.40:
-            tgt = self.rng.choice(self.scalars)
-            e = "%s = %s" % (tgt, self.expr())
-            self.emit(im + e + ";", ip + e)
-        elif k < 0.55:
-            # the INDEX is often a full expression too (A[<large expr>] = v),
-            # not just a bare scalar - it exercises the store's index-eval path
-            if self.rng.random() < 0.5:
-                idx = "%s %% %d" % (self.leaf(), ALEN)
-            else:
-                idx = "(%s) %% %d" % (self.expr(), ALEN)
-            e = "A[%s] = %s" % (idx, self.expr())
-            self.emit(im + e + ";", ip + e)
-        elif k < 0.70:
-            key = self.rng.randint(0, 4)
-            e = "D[%d] = (D[%d] + %s) %% %d" % (key, key, self.operand(), MOD)
-            self.emit(im + e + ";", ip + e)
-        elif k < 0.85:
-            # bounded append to the growing array (expr computed ONCE - the same
-            # string must go to both engines)
-            e = self.expr()
-            self.emit(im + "if (len(G) < %d) append(G, %s);" % (GCAP, e),
-                      ip + "if len(G) < %d: G.append(%s)" % (GCAP, e))
+        """One random side effect, emitted as a (MyLang, Python) pair."""
+        menu = self.se_menu()
+        fn = self.rng.choices([m for m, _ in menu],
+                              weights=[w for _, w in menu])[0]
+        fn(im, ip)
+
+    def se_scalar(self, im, ip):
+        tgt = self.rng.choice(self.scalars)
+        e = "%s = %s" % (tgt, self.expr())
+        self.emit(im + e + ";", ip + e)
+
+    def se_array(self, im, ip):
+        # the INDEX is often a full expression too (A[<large expr>] = v)
+        if self.rng.random() < 0.5:
+            idx = "%s %% %d" % (self.leaf(), ALEN)
         else:
-            # a per-level TEMP variable: declare + fold into a scalar (stresses
-            # the VM's scratch-slot allocation at depth)
-            t = "t%d" % self.tempcount
-            self.tempcount += 1
-            tgt = self.rng.choice(self.scalars)
-            ev = self.expr()   # ONCE
-            self.emit(im + "var %s = %s;" % (t, ev), ip + "%s = %s" % (t, ev))
-            e = "%s = (%s + %s) %% %d" % (tgt, tgt, t, MOD)
-            self.emit(im + e + ";", ip + e)
+            idx = "(%s) %% %d" % (self.expr(), ALEN)
+        e = "A[%s] = %s" % (idx, self.expr())
+        self.emit(im + e + ";", ip + e)
+
+    def se_dict(self, im, ip):
+        key = self.rng.randint(0, 4)
+        e = "D[%d] = (D[%d] + %s) %% %d" % (key, key, self.operand(), MOD)
+        self.emit(im + e + ";", ip + e)
+
+    def se_append(self, im, ip):
+        e = self.expr()   # ONCE - the same string must go to both engines
+        self.emit(im + "if (len(G) < %d) append(G, %s);" % (GCAP, e),
+                  ip + "if len(G) < %d: G.append(%s)" % (GCAP, e))
+
+    def se_foreach(self, im, ip):
+        # a FLAT foreach over the fixed array, folding it into a scalar
+        fe = "e%d" % self.tempcount
+        self.tempcount += 1
+        tgt = self.rng.choice(self.scalars)
+        body = "%s = (%s + %s) %% %d" % (tgt, tgt, fe, MOD)
+        self.emit(im + "foreach (var %s in A) %s;" % (fe, body),
+                  ip + "for %s in A: %s" % (fe, body))
+
+    def se_temp(self, im, ip):
+        # a per-level TEMP variable: declare + fold into a scalar (stresses the
+        # VM's scratch-slot allocation at depth)
+        t = "t%d" % self.tempcount
+        self.tempcount += 1
+        tgt = self.rng.choice(self.scalars)
+        ev = self.expr()   # ONCE
+        self.emit(im + "var %s = %s;" % (t, ev), ip + "%s = %s" % (t, ev))
+        e = "%s = (%s + %s) %% %d" % (tgt, tgt, t, MOD)
+        self.emit(im + e + ";", ip + e)
+
+    def se_ternary(self, im, ip):
+        # a conditional VALUE (not a branch statement): s = cond ? a : b.
+        # MyLang `c ? a : b` vs Python `a if c else b` - the ONLY difference is
+        # the wrapper; the condition + arms are identical-syntax strings.
+        tgt = self.rng.choice(self.scalars)
+        cond = "(%s %s %s)" % (self.leaf(),
+                               self.rng.choice(["<", ">", "<=", ">=",
+                                                "==", "!="]), self.leaf())
+        a, b = self.expr(), self.expr()
+        self.emit(im + "%s = (%s ? %s : %s);" % (tgt, cond, a, b),
+                  ip + "%s = (%s if %s else %s)" % (tgt, a, cond, b))
 
     def build(self, level, im, ip):
         # a side effect at this level, then (if not innermost) a nested construct

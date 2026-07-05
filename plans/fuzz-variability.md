@@ -29,7 +29,7 @@ Stay inside the documented MyLang/Python **equivalence subset** (see
 Order = manage risk first, biggest/most-valuable last. Each: implement -> fuzz
 200-500 (fix translation bugs) -> `--show` sanity -> commit.
 
-- [ ] **1. Ternary / conditional values** - `cond ? a : b` (MyLang) vs
+- [x] **1. Ternary / conditional values** - `cond ? a : b` (MyLang) vs
       `a if cond else b` (Python). A VALUE that depends on control flow, not a
       branch statement. Emitted as a `(my, py)` pair at the value level (not
       nested inside arithmetic, to avoid an expr()->pair refactor).
