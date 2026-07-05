@@ -1,0 +1,92 @@
+# Native mutating builtins (VM)
+
+Making the mutating builtins (`append`/`push`/`pop`/`insert`/`erase`/`intptr`)
+run natively under `-vm` instead of the whole-call `node->eval` fallback. They
+were the last builtin group on the fallback because their arg0 is an **lvalue**
+(a mutable reference to the caller's container), which the value ABI destroys by
+pre-evaluating.
+
+See CLAUDE.md "The value & type model" (Builtin ABI) and `plans/bytecode-vm.md`.
+
+## Phase 1 — DONE (commit `3e94b5b`)
+
+The **lvalue ABI**: `Builtin::func_lv(ctx, exprList, LValue* target)`, sharing
+the `func_v` UNION (mutually exclusive per builtin, discriminated by
+`DirectBuiltinCallExpr::lvalue_arg0`, so `Builtin` stays 2 pointers / `EvalValue`
+32). The builtin gets arg0 as an `LValue*` and **self-evaluates its remaining
+args** (so `append` keeps its construct-in-place fast path, which needs the arg
+node). `make_builtin_lv` registers `builtin_lv_adapter` as `func` (the
+tree-walker / const-eval entry — evals arg0 to an lvalue, passes it), so both
+engines share one impl. `CallBuiltinLV` forms arg0's `LValue*` straight from its
+slot table by kind (local/global/capture; a not-yet-defined global → null target
+→ `NotLValueEx`, matching `Identifier::do_eval`) and calls `func_lv`. Emitted
+(`try_native_mutating_builtin`) only when arg0 is a **slotted identifier** — the
+common `append(a, x)` form.
+
+**Residuals left after Phase 1:**
+1. A subscript/member lvalue **target** (`append(a[i], x)`, `append(d[k], x)`,
+   `append(s.f, x)`) stays an `EvalStmt` fallback.
+2. The **value args** are still self-evaluated (a contained `node->eval`), not
+   passed natively — so `append`/`insert`/`erase` are native *dispatch + arg0*
+   but not `node->eval`-free.
+
+## Phase 2 — DESIGNED (do next)
+
+Goal: remove BOTH residuals — the mutating builtins reach **zero `node->eval`**.
+
+### 2a. Value args passed natively
+
+Extend the ABI to
+`func_lv(ctx, exprList, LValue* target, const EvalValue* rest, size_t n_rest)` —
+the value args pre-evaluated (like `CallBuiltinV`). `pop`/`insert`/`erase`/
+`intptr` then use `rest[]` with NO self-eval (fully native); the codegen
+compiles their value args into the register run and `CallBuiltinLV` copies them
+into a buffer (reuse the `vm_call_builtin_big` cold-path pattern for >N args).
+
+### 2b. `emplace` fusion for `append(struct_arr, Ctor(args))`
+
+This is the piece that lets `append`'s value arg be pre-evaluated WITHOUT losing
+construct-in-place (the reason Phase 1 kept self-eval). The construct-in-place
+does NOT actually need the ctor node: the **struct type is recoverable from the
+target array** (a flat `array<Point>` carries its `StructTypeDef`), and the
+constructor's arguments can be **pre-evaluated values**. So
+
+```
+append(pts, Point(i, i*2))   ->   emplace(pts, i, i*2)
+```
+
+- The codegen recognizes `append(target, Ctor(args))` where the inferencer
+  proved `target` is `array<Struct>` and `Ctor` builds that `Struct`. It
+  compiles the CTOR's arg exprs into the register run and emits an
+  **`EmplaceStruct`** op (target lvalue + arg run + n).
+- `EmplaceStruct` reads the target array's element `def`, coerces the value args
+  field-by-field straight into the array's byte buffer (reuse `pod_store_field`
+  / the field-coercion in `try_construct_into_struct_array`, but driven by
+  VALUES, not the ctor node). **No temp `StructObject`** — so it is actually
+  FASTER than today's tree-walker (which builds a temp, then byte-copies).
+- A plain-value `append(a, x)` compiles `x` as a value and uses the normal
+  append path (2a).
+
+**Recognition fork (decide before starting):**
+- (a) **codegen-only pattern match** — simplest; no AST rewrite; VM-only.
+  *Recommended first.*
+- (b) **inferencer rewrite** of the call to an internal `emplace` — cleaner, and
+  the TREE-WALKER would share the win (drop its temp `StructObject` too), but
+  touches more (a new internal builtin + the rewrite pass). Do after (a) if we
+  want the tree-walker to benefit.
+
+### 2c. Subscript/member lvalue targets
+
+The other Phase 1 residual (independent of 2a/2b): `append(a[i], x)` etc. Needs a
+native "eval arg0 to an element/field `LValue*`" — a `LoadElemLValue` /
+`LoadMemberLValue` that produces the element/field lvalue (reusing the
+StoreElem COW machinery: appending to `a[i]` must clone `a` if aliased). Until
+then these stay `EvalToSlot` (correct, just not native). The shape test in
+`vm_codegen_shapes` deliberately uses `append(a[0], i)` as its stable fallback —
+update it when 2c lands.
+
+### Verification bar (per CLAUDE.md)
+Differential-green under both engines; RECYCLE+ASan clean; `bench/58_structs`
+(the `append(pts, Point(...))` builder) must not regress and should IMPROVE once
+2b drops the temp `StructObject`; cachegrind the append-heavy benches
+(`13_array_append`, `58_structs`) `-vm` vs the Phase-1 baseline.

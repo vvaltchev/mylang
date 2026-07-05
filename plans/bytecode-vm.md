@@ -54,6 +54,25 @@ The `40_math_builtins` +9% residual (the `CallBuiltinV` arg-copy + result-store,
 `EvalValue::operator=` / `LValue::put`) is the remaining builtin-dense case,
 left for the later perf pass.
 
+**Clarifying the EARLIER 4.1x → 3.8x slip (for the record).** The note above
+attributes it to the boxed-tier / call ops being not-yet-optimal native paths
+(boxed `BinOpV` vs unboxed `IntBin`, unfused sequences, per-op switch vs the M8
+single vcall). That is real, but it was NOT the whole story: **part of the
+4.1x → 3.8x was the SAME inlining regression** just root-caused for 3.8x → 3.7x.
+The evidence: the `ML_ALWAYS_INLINE` fix took the **3.8x baseline** (commit
+`2d03175`, the state AFTER the 4.1→3.8 slip) up to **3.9x** — so the operand
+helpers were ALREADY de-inlined in that 3.8x state, meaning `vm_run_chunk` had
+already grown past the inline budget as the earlier call ops (`CallV`/`ReturnV`/
+`SubscriptV`/`MemberV`/…) were added, de-inlining the hot leaves then too.
+So the 4.1→3.8 slip = (i) that inlining regression, now PARTLY recovered by the
+force-inline (worth ~0.1x, 3.8→3.9), plus (ii) the genuine unfused/boxed op cost
+that remains (the gap up to 4.1x), still deferred to the perf-reclaim pass. The
+lesson generalizes: **every** batch that grows `vm_run_chunk` risks silently
+de-inlining the hot operand helpers — the `ML_ALWAYS_INLINE` pins now guard
+against it, but re-measure a pure-int loop (`01_while_loop`) after any big VM
+addition. To pin the exact (i)/(ii) split, cachegrind a pre-4.1-slip commit
+(before the boxed tier / call ops) vs current `-vm`.
+
 **THE DIRECTIVE (user, 2026-07-04), see [[vm-endgame]]:** do it ALL (every
 statement/expression kind native, ordered by EASE not perf impact); native ops
 must fully support `dyn`/general values and NEVER fall back to the tree walker;
