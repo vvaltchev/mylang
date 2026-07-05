@@ -162,6 +162,20 @@ static NumBinOp cmp_pmf(Op op)
 }
 
 /*
+ * True ONLY while vm_execute is running the (final) program AST. The VM's
+ * function-body hook in do_func_call compiles a chunk (raw Construct* node
+ * pointers) lazily on first call; that is safe only once the AST is final. A
+ * compile-time fold (AutoConst / the inliner's refold, in resolve_names) that
+ * reached the hook while the tree is still being mutated would cache pointers
+ * into nodes the optimizer then frees -> a use-after-free (a real, rare
+ * RECYCLE/ASan crash before do_func_call's `!ctx->in_const_eval()` gate). This
+ * flag makes `vm_func_chunk` ASSERT it is only ever entered during execution,
+ * so any future fold path that slips past that gate fails LOUDLY here instead
+ * of corrupting memory. See defs.h ML_VM_CHECK / CLAUDE.md.
+ */
+static bool g_vm_executing = false;
+
+/*
  * Per-run storage for compiled function-body chunks (Phase 4), keyed by the
  * FuncDeclStmt. Cleared at the start of every vm_execute so a fresh program run
  * never reuses a prior run's chunks (and a FuncDeclStmt's `vm_chunk` pointer
@@ -185,6 +199,15 @@ void
 vm_execute(const Construct *root_c)
 {
     const Block *root = static_cast<const Block *>(root_c);
+
+    /* Mark the program as EXECUTING for the duration, so vm_func_chunk's guard
+     * knows any chunk it compiles is over the final AST (save/restore, not a
+     * bare set, in case of re-entry; restored even on an exception). */
+    struct ExecGuard {
+        bool prev;
+        ExecGuard() : prev(g_vm_executing) { g_vm_executing = true; }
+        ~ExecGuard() { g_vm_executing = prev; }
+    } exec_guard;
 
     /* Fresh per run: drop any prior program's function chunks (and their stale
      * FuncDeclStmt::vm_chunk pointers, whose functions are long freed). */
@@ -224,6 +247,18 @@ vm_execute(const Construct *root_c)
 const Chunk *
 vm_func_chunk(const FuncDeclStmt *fdecl)
 {
+    /*
+     * A chunk may be compiled ONLY while executing the final AST. If we are
+     * here during a compile-time fold (resolve_names), the const-eval gate in
+     * do_func_call was bypassed and we are about to cache node pointers the
+     * optimizer will free (use-after-free). Fail loudly instead. Cold path
+     * (once per function per run), so a plain ML_CHECK - on in every ASSERTS
+     * build.
+     */
+    ML_CHECK_MSG(g_vm_executing,
+                 "vm_func_chunk outside vm_execute: a compile-time fold "
+                 "reached the VM body hook (const-eval gate bypassed)");
+
     if (!fdecl->body || !fdecl->body->is_block())
         return nullptr;
 

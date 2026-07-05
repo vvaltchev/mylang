@@ -3062,6 +3062,35 @@ instrumentation (see `plans/function-templates.md`).
   (`linux.yml`, `-DRECYCLE=ON`) and a local matrix entry — not a replacement for
   the structural fixes.
 
+- **Reproducing an AST-node use-after-free: RECYCLE+ASan is the detector, and
+  build the EXACT failing SHA.** A dangling `Construct*` UAF is fully
+  DETERMINISTIC — MyLang is single-threaded, so it is never a race; the only
+  variable is the allocator's address-reuse *pattern*, which decides whether a
+  freed node's memory is poisoned at the stale read. **Plain ASan can MISS it**
+  (its quarantine reuses the address before the read — a real case here passed
+  under plain ASan even with `ASAN_OPTIONS=quarantine_size_mb=2048`), while
+  **`make RECYCLE=1 TESTS=1 OPT=0` reproduces it 3/3** (immediate reuse + poison
+  of the freed `Construct`). So reach for **RECYCLE+ASan**, not plain ASan, for
+  any suspected node UAF. **And when a CI job fails, check out the run's exact
+  `headSha`** (`gh run view <id> --json headSha`), not your local same-named
+  commit: after a rebase the SHAs *and the code* diverge, so a local build can
+  silently already contain the fix (this exact trap cost a long "unreproducible
+  heisenbug" hunt — the local commit had the fix, the CI's pre-rebase SHA did
+  not). No exotic tooling (a GCC plugin, etc.) is needed; the deterministic
+  repro was there under the existing RECYCLE lane the whole time.
+
+- **The VM body hook must not compile a chunk during compile-time folding.**
+  `do_func_call`'s Phase-4 hook lazily compiles a function body to a `Chunk`
+  (raw `Construct*` node pointers) and caches it on the `FuncDeclStmt`. During
+  `resolve_names` (AutoConst / the inliner's refold) the tree is STILL being
+  mutated, so a fold that reached the hook would cache pointers into nodes the
+  optimizer then frees → a UAF (exactly the bug above). Two layers stop it: the
+  **`!ctx->in_const_eval()` gate** in `do_func_call` (a fold's ctx is rooted at
+  the const `cctx`, so `in_const_eval()` is true and the hook is skipped) and a
+  **`g_vm_executing` assert in `vm_func_chunk`** (set only for the duration of
+  `vm_execute`), so any future fold path that slips past the gate fails LOUDLY
+  instead of corrupting memory.
+
 - **CI maximizes correctness checks (it does not time anything).** Every CI lane
   builds with `ASSERTS` on (C asserts + `ML_CHECK` + stdlib container
   hardening) **and `VM_HARDENING=ON`** (the `ML_VM_CHECK` per-op tier — so even
