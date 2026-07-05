@@ -40,7 +40,7 @@ Order = manage risk first, biggest/most-valuable last. Each: implement -> fuzz
 - [x] **3. Nested arrays `M[i][j]`** - a real 2-D structure (an array of
       arrays). Multi-level subscript load/store + COW on inner arrays. Identical
       syntax in both engines.
-- [ ] **4. Data-structure ops** - `pop`/`insert`/`erase` on the growing array
+- [x] **4. Data-structure ops** - `pop`/`insert`/`erase` on the growing array
       (mutating length mid-loop; guarded so it never underflows), array SLICES
       `A[i:j]` (aliasing / COW), `clone`. `pop`/`insert`/`erase` are
       MyLang-builtin vs Python-method -> `(my, py)` pairs; slices identical.

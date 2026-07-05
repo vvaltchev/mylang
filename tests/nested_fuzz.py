@@ -106,6 +106,16 @@ class Gen:
             # a 2-D array read M[i][j] (multi-level subscript load)
             return "M[%s %% %d][%s %% %d]" % (self.leaf(), MDIM,
                                               self.leaf(), MDIM)
+        if d < 2 and r < 0.72:
+            # sum of a NON-EMPTY slice a<b (COW sub-view). Two subtleties:
+            # (1) an EMPTY slice diverges (MyLang sum([]) is none, Python 0) - so
+            # keep a<b strictly; (2) the sum can reach (b-a)*99 >> MOD, and EVERY
+            # operand must stay < MOD or the `(x + MOD - operand)` subtraction
+            # form goes negative (a mixed truncate/floor `%` divergence + an
+            # out-of-bounds erase index) - so mod it.
+            a = self.rng.randint(0, ALEN - 2)
+            b = self.rng.randint(a + 1, ALEN)
+            return "(sum(A[%d:%d])) %% %d" % (a, b, MOD)
         return self.leaf()
 
     def expr(self, d=0):
@@ -140,6 +150,10 @@ class Gen:
             (self.se_foreach, 10),
             (self.se_ternary, 10),
             (self.se_matrix,  12),
+            (self.se_pop,      6),
+            (self.se_insert,   6),
+            (self.se_erase,    6),
+            (self.se_clone,    5),
         ]
 
     def side_effect(self, im, ip):
@@ -212,6 +226,30 @@ class Gen:
         j = "%s %% %d" % (self.leaf(), MDIM)
         e = "M[%s][%s] = %s" % (i, j, self.expr())
         self.emit(im + e + ";", ip + e)
+
+    # data-structure mutations on the growing array G (guarded so they never
+    # under/overflow); builtins in MyLang vs methods in Python -> (my, py) pairs
+    def se_pop(self, im, ip):
+        self.emit(im + "if (len(G) > 0) pop(G);",
+                  ip + "if len(G) > 0: G.pop()")
+
+    def se_insert(self, im, ip):
+        e = self.expr()   # ONCE
+        self.emit(im + "if (len(G) < %d) insert(G, 0, %s);" % (GCAP, e),
+                  ip + "if len(G) < %d: G.insert(0, %s)" % (GCAP, e))
+
+    def se_erase(self, im, ip):
+        # erase at a valid data-dependent index; `del` is Python's erase
+        g = self.rng.choice(self.scalars)
+        self.emit(im + "if (len(G) > 0) erase(G, %s %% len(G));" % g,
+                  ip + "if len(G) > 0: del G[%s %% len(G)]" % g)
+
+    def se_clone(self, im, ip):
+        # clone the fixed array + fold its sum (exercises the clone builtin);
+        # MyLang clone() vs Python list()
+        tgt = self.rng.choice(self.scalars)
+        self.emit(im + "%s = (%s + sum(clone(A))) %% %d;" % (tgt, tgt, MOD),
+                  ip + "%s = (%s + sum(list(A))) %% %d" % (tgt, tgt, MOD))
 
     def build(self, level, im, ip):
         # a side effect at this level, then (if not innermost) a nested construct
