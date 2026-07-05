@@ -5505,6 +5505,22 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native top-level FUNC-DECL binding (VM MakeClosureV + StoreGlobalV):
+         * `func f(..){}` binds the FuncObject into its hoisted global slot +
+         * marks it defined. Mutual recursion needs both decls bound before any
+         * call (a forward reference resolves the slot, defined once its decl
+         * runs). Differential under -vm. */
+        "Func decl binding native (mutual recursion)",
+        {
+            "func is_even(n) { if (n == 0) return true; return is_odd(n-1); }",
+            "func is_odd(n) { if (n == 0) return false; return is_even(n-1); }",
+            "assert(is_even(10));",
+            "assert(is_odd(7));",
+            "assert(!is_even(3));",
+        },
+    },
+
+    {
         /* native flat-array element inc-dec (VM StoreElemInt/Float with a
          * constant 1 == `a[i] += 1`): `a[i]++` / `a[i]--` on a flat int/float
          * array. The OOB caret is the subscript's. Differential under -vm. */

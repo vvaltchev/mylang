@@ -29,6 +29,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~R~~ | global write `g=`/`+=`/`++` | — | — | ✅ StoreGlobalV (0-bench) |
 | ~~Cap~~ | closure capture `cap++` | 11,63 | — | ✅ StoreCaptureV (0-bench) |
 | ~~MkC~~ | closure `<lambda>` create | 11,63 | — | ✅ MakeClosureV (node-free) |
+| ~~FDecl~~ | top-level `func f(){}` | all | — | ✅ MakeClosureV+StoreGlobalV |
 | ~~I++~~ | subscript `a[i]++`/`d[k]++` | 47 | — | ✅ StoreElem/DictStore±1 |
 | ~~AF~~ | DictStore/StoreElemV AST-free | — | — | ✅ vm_subscript_store loc |
 | **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |

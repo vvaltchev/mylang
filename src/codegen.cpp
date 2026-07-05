@@ -3032,6 +3032,29 @@ struct Codegen {
             if (try_native_return(ret, chunk.code))
                 return;
         }
+        /* A `func f(..) {..}` decl statement bound into a GLOBAL slot (a
+         * hoisted top-level / scoped function) -> MakeClosureV (create the
+         * FuncObject, snapshotting captures) + StoreGlobalV (write the slot +
+         * mark defined) - byte-identical to FuncDeclStmt::do_eval's global-bind
+         * `slots[slot] = LValue(func, false); defined = 1`. A capturing named
+         * func (local slot) or the REPL (map) falls back to EvalStmt. */
+        if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(s)) {
+            if (fd->id && fd->id->sym.kind == SymKind::global) {
+                const int t = alloc_temp();
+                Instr mk;
+                mk.op = OpCode::MakeClosureV;
+                mk.target = t;
+                mk.target2 = static_cast<int>(chunk.closure_defs.size());
+                chunk.closure_defs.push_back(fd);
+                chunk.code.push_back(mk);
+                Instr st;             /* aop invalid == plain assign+defined */
+                st.op = OpCode::StoreGlobalV;
+                st.target = fd->id->sym.slot;
+                st.a = slot_op(t);
+                chunk.code.push_back(st);
+                return;
+            }
+        }
         emit(OpCode::EvalStmt, s);
     }
 

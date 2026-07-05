@@ -3042,10 +3042,15 @@ returned / var-bound / call-arg lambda, `id == null`) builds via
 captures from `ctx` — byte-identical to `FuncDeclStmt::do_eval` for a lambda —
 where `def` is a program-lifetime `FuncDeclStmt*` from a `Chunk::closure_defs`
 pool (the `Instr` holds only the index, no raw `Construct*`; the ctor never
-throws for a resolved closure, so no loc). With this + `StoreCaptureV` +
-`CallValueV`, the whole closure lifecycle (**create → capture read/write → call
-→ body**) is native — the residual `EvalStmt` in a closure bench is the one-time
-top-level **func-decl binding** (`func make_counter(..)`).
+throws for a resolved closure, so no loc). A **top-level `func f(..){}` decl
+STATEMENT** bound into a hoisted GLOBAL slot reuses the same op — `gen_stmt`
+emits `MakeClosureV` (the `FuncObject`) + **`StoreGlobalV`** (write the slot +
+mark `defined`), byte-identical to `FuncDeclStmt::do_eval`'s global-bind
+`slots[slot] = LValue(func, false); defined = 1` (a capturing named func / the
+REPL map falls back). So the **whole function/closure path is native** — decl
+BIND, closure CREATE, capture read/write, indirect CALL, and the compiled body —
+via `MakeClosureV` + `StoreGlobalV`/`StoreCaptureV` + `CallV`/`CallValueV`.
+Removing the per-func-decl `EvalStmt` cut the bench-suite fallback count 54→24.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
