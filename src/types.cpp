@@ -376,15 +376,15 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("randf", builtin_randf),
 
     /* I/O builtins */
-    make_builtin("print", builtin_print),
-    make_builtin("readln", builtin_readln),
-    make_builtin("writeln", builtin_writeln),
-    make_builtin("read", builtin_read),
-    make_builtin("write", builtin_write),
-    make_builtin("readlines", builtin_readlines),
-    make_builtin("writelines", builtin_writelines),
-    make_builtin("remove", builtin_remove),
-    make_builtin("tmpdir", builtin_tmpdir),
+    make_builtin_v<builtin_print>("print"),
+    make_builtin_v<builtin_readln>("readln"),
+    make_builtin_v<builtin_writeln>("writeln"),
+    make_builtin_v<builtin_read>("read"),
+    make_builtin_v<builtin_write>("write"),
+    make_builtin_v<builtin_readlines>("readlines"),
+    make_builtin_v<builtin_writelines>("writelines"),
+    make_builtin_v<builtin_remove>("remove"),
+    make_builtin_v<builtin_tmpdir>("tmpdir"),
 };
 
 /*

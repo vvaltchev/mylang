@@ -17,23 +17,25 @@
 #include <cstdio>
 #include <cstdlib>
 
-EvalValue builtin_print(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_print(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    for (const auto &e: exprList->elems) {
-        cout << RValue(e->eval(ctx)) << " ";
+    for (size_t i = 0; i < n; i++) {
+        cout << args[i] << " ";
     }
 
     cout << endl;
     return none;
 }
 
-EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_write(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() < 1 || exprList->elems.size() > 2)
+    if (n < 1 || n > 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg0->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (!e.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg0->start, arg0->end);
@@ -41,10 +43,10 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
     ostream *s = &cout;
     std::ofstream fs;
 
-    if (exprList->elems.size() == 2) {
+    if (n == 2) {
 
         Construct *arg1 = exprList->elems[1].get();
-        const EvalValue &fstr = RValue(arg1->eval(ctx));
+        const EvalValue &fstr = args[1];
 
         if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg1->start, arg1->end);
@@ -62,25 +64,27 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList)
     return none;
 }
 
-EvalValue builtin_writeln(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_writeln(EvalContext *ctx, ExprList *exprList,
+                          const EvalValue *args, size_t n)
 {
-    builtin_write(ctx, exprList);
+    builtin_write(ctx, exprList, args, n);
     cout << endl;
     return none;
 }
 
-EvalValue builtin_read(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_read(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() > 1)
+    if (n > 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     std::istream *s = &cin;
     std::ifstream fs;
 
-    if (exprList->elems.size() == 1) {
+    if (n == 1) {
 
         Construct *arg0 = exprList->elems[0].get();
-        const EvalValue &fstr = RValue(arg0->eval(ctx));
+        const EvalValue &fstr = args[0];
 
         if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg0->start, arg0->end);
@@ -96,9 +100,10 @@ EvalValue builtin_read(EvalContext *ctx, ExprList *exprList)
     return SharedStr(string(std::istreambuf_iterator<char>(*s), {}));
 }
 
-EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 0)
+    if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     string str;
@@ -106,9 +111,10 @@ EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList)
     return SharedStr(move(str));
 }
 
-EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList,
+                            const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() > 1)
+    if (n > 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     SharedArrayObj::vec_type vec;
@@ -116,10 +122,10 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
     std::ifstream fs;
     string tmp;
 
-    if (exprList->elems.size() == 1) {
+    if (n == 1) {
 
         Construct *arg0 = exprList->elems[0].get();
-        const EvalValue &fstr = RValue(arg0->eval(ctx));
+        const EvalValue &fstr = args[0];
 
         if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg0->start, arg0->end);
@@ -140,13 +146,14 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList)
     return SharedArrayObj(move(vec));
 }
 
-EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList,
+                             const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() < 1 || exprList->elems.size() > 2)
+    if (nargs < 1 || nargs > 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (!val.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);
@@ -154,10 +161,10 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
     ostream *s = &cout;
     std::ofstream fs;
 
-    if (exprList->elems.size() == 2) {
+    if (nargs == 2) {
 
         Construct *arg1 = exprList->elems[1].get();
-        const EvalValue &fstr = RValue(arg1->eval(ctx));
+        const EvalValue &fstr = args[1];
 
         if (!fstr.is<SharedStr>())
             throw TypeErrorEx("Expect filename (string)", arg1->start, arg1->end);
@@ -186,13 +193,14 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList)
  * (0) otherwise (e.g. it did not exist) - so it is safe to call for cleanup
  * without checking first. Throws only on a bad argument.
  */
-EvalValue builtin_remove(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_remove(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &fstr = RValue(arg0->eval(ctx));
+    const EvalValue &fstr = args[0];
 
     if (!fstr.is<SharedStr>())
         throw TypeErrorEx("Expect filename (string)", arg0->start, arg0->end);
@@ -206,9 +214,10 @@ EvalValue builtin_remove(EvalContext *ctx, ExprList *exprList)
  * (so a caller can append "/name"). Portable: honors $TMPDIR / %TEMP% / %TMP%,
  * falling back to "/tmp". Like Python's tempfile.gettempdir().
  */
-EvalValue builtin_tmpdir(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_tmpdir(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 0)
+    if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     const char *dir = nullptr;

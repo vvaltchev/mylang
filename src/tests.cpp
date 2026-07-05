@@ -10553,16 +10553,17 @@ static bool vm_codegen_shapes()
         a.juic == 2 && a.intbin == 4 && a.back == 0 &&
         a.jif == 0 && a.jmp >= 1 && a.halt == 1;
 
-    /* 2) a while whose body has NO natively-compilable statement (only calls)
-     * stays the Phase-1 flatten - the any_native gate keeps an all-fallback
-     * body on the tree-walker's tight counter: JumpIfFalse + LoopBackEdge, no
-     * native ops. (A body with even one native statement + a fallback call
-     * instead goes native around the EvalStmt - see the builtin / array-build
-     * tests below.) */
+    /* 2) a while whose body has NO natively-compilable statement stays the
+     * Phase-1 flatten - the any_native gate keeps an all-fallback body on the
+     * tree-walker's tight counter: JumpIfFalse + LoopBackEdge, no native ops.
+     * (A body with even one native statement + a fallback call instead goes
+     * native around the EvalStmt - see the builtin / array-build tests below.)
+     * Uses `append` - a MUTATING builtin that can never get the value ABI, so
+     * it stays a fallback EvalStmt regardless of builtin migration. */
     VmOpCounts b;
     if (!codegen_counts({
-            "var i = 0; var s = 0;",
-            "while (i < 5) { print(i); print(s); }",
+            "var a = [1]; var i = 0;",
+            "while (i < 5) { append(a, i); append(a, i); }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -10925,7 +10926,7 @@ static bool vm_codegen_shapes()
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:
  * the fused for.step counter, the register i.bin ops, the fused compare/branch,
- * and a fallback eval.stmt (the still-embedded Construct*, here `print(s)`). */
+ * and a native builtin call (`print(s)` -> call.blt.v via the value ABI). */
 static bool vm_disasm_shape()
 {
     std::string src;
@@ -10952,7 +10953,7 @@ static bool vm_disasm_shape()
         return d.find("for.step") != std::string::npos
             && d.find("i.bin") != std::string::npos
             && d.find("i.jmp.ifnot") != std::string::npos
-            && d.find("eval.stmt") != std::string::npos  /* print fallback */
+            && d.find("call.blt.v") != std::string::npos  /* print(s) native */
             && d.find("halt") != std::string::npos;
     } catch (...) {
         return false;
