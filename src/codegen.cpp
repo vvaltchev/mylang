@@ -2128,6 +2128,42 @@ struct Codegen {
             return true;
         }
 
+        /* A DICT MEMBER store `d.k = v` / `d.k OP= v` -> DictStore, exactly like
+         * `d["k"] = v`: the member NAME is the string key (baked into the const
+         * pool, loaded to a temp). base_dict is set by the inferencer for a dict
+         * base; a STRUCT member store falls through (a separate op). */
+        if (const MemberExpr *m =
+                dynamic_cast<const MemberExpr *>(e->lvalue.get())) {
+            if (m->base_dict) {
+                int dslot;
+                switch (e->op) {
+                case Op::assign: case Op::addeq: case Op::subeq:
+                case Op::muleq:  case Op::diveq: case Op::modeq: break;
+                default: return false;
+                }
+                if (!as_array_slot(m->what.get(), dslot))
+                    return false;
+                int vslot;
+                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
+                    return false;
+                Instr kin;               /* the member name as a string key */
+                kin.op = OpCode::LoadConstV;
+                kin.node = m;
+                kin.target = alloc_temp();
+                kin.target2 = add_const(m->memId);
+                ops.push_back(kin);
+                Instr in;
+                in.op = OpCode::DictStore;
+                in.node = m;             /* for its loc (extract_locs) */
+                in.target2 = dslot;
+                in.a = slot_op(kin.target);
+                in.b = slot_op(vslot);
+                in.aop = e->op;
+                ops.push_back(in);
+                return true;
+            }
+        }
+
         Operand dst;
         if (!as_int_operand(e->lvalue.get(), dst) || dst.is_lit)
             return false;

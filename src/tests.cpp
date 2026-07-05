@@ -11945,6 +11945,16 @@ static bool vm_codegen_shapes()
         return false;
     const bool block_ok = blk.evalstmt == 0 && blk.intbin >= 2;
 
+    /* 33) a DICT MEMBER store `d.k = v` compiles to a DictStore (like `d["k"]`),
+     * the member name a string key - not an EvalStmt fallback. */
+    VmOpCounts dms;
+    if (!codegen_counts({
+            "var d = {\"x\": 0, \"y\": 0};",
+            "for (var i = 0; i < 3; i++) { d.x = d.x + i; }",
+        }, dms))
+        return false;
+    const bool dict_member_ok = dms.evalstmt == 0 && dms.dictstore >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -11954,7 +11964,7 @@ static bool vm_codegen_shapes()
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
         && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
-        && bool_cond_ok && var_init_ok && block_ok;
+        && bool_cond_ok && var_init_ok && block_ok && dict_member_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:
