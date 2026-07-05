@@ -338,6 +338,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "make.closure " << D(in.target) << " = closure_defs["
                 << in.target2 << "]";
             break;
+        case OpCode::StructCtorV:
+            row << "struct.ctor  " << D(in.target) << " = struct_defs["
+                << in.target2 << "]("
+                << arglist(chunk, in.a.lit, in.b.lit) << ")";
+            break;
         case OpCode::LoadImmInt:
             row << "load         " << D(in.target) << ", #" << in.a.lit;
             break;

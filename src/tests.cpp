@@ -5538,6 +5538,30 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native standalone struct construction (VM StructCtorV) + flat-struct
+         * element store: `var p = P(x,y)` constructs from typed-scalar args
+         * straight into the POD bytes (coerce can't throw - no per-arg loc);
+         * `arr[i] = P(..)` / `arr[i] = struct_var` writes the struct's bytes
+         * into a flat array element (the store path the native construction
+         * exposed - vm_subscript_store's struct path). Diff under -vm. */
+        "Struct construction + flat-array store native",
+        {
+            "struct P { int x; int y; }",
+            "var p = P(3, 4);",
+            "assert(p.x == 3 && p.y == 4);",
+            "struct V { float a; float b; }",
+            "var v = V(1.5, 2.5);",
+            "assert(v.a + v.b == 4.0);",
+            "var arr = [P(1, 1), P(2, 2)];",
+            "arr[1] = P(9, 8);",
+            "assert(arr[1].x == 9 && arr[1].y == 8);",
+            "var q = P(7, 6); arr[0] = q;",
+            "assert(arr[0].x == 7 && arr[0].y == 6);",
+            "assert(array_storage(arr) == \"struct\");",
+        },
+    },
+
+    {
         /* native flat-array element inc-dec (VM StoreElemInt/Float with a
          * constant 1 == `a[i] += 1`): `a[i]++` / `a[i]--` on a flat int/float
          * array. The OOB caret is the subscript's. Differential under -vm. */
@@ -11346,15 +11370,15 @@ static bool vm_codegen_shapes()
 
     /* 15) a native loop with a FLOW-FREE fallback body statement still goes
      * native AROUND the EvalStmt: the counted `for` compiles (ForLoopStep) with
-     * the native `s += i` and an EvalStmt for the still-fallback `var p = P(i)`
-     * (a struct construct - most other flow-free statements, incl. array
-     * literals/append/general stores, are now native). This lets a matrix/sieve
-     * outer loop go native despite a fallback body statement. */
+     * the native `s += i` and an EvalStmt for the still-fallback `sort(a)` (a
+     * builtin on the old lvalue ABI - most other flow-free statements, incl.
+     * array literals/append/general stores AND struct construction/decl, are
+     * now native). This lets a matrix/sieve outer loop go native despite a
+     * fallback body statement. */
     VmOpCounts ab;
     if (!codegen_counts({
-            "struct P { int x; }",
-            "var s = 0;",
-            "for (var i = 0; i < 5; i++) { s += i; var p = P(i); }",
+            "var s = 0; var a = [3, 1, 2];",
+            "for (var i = 0; i < 5; i++) { s += i; sort(a); }",
         }, ab))
         return false;
     const bool array_build_ok =

@@ -3057,8 +3057,18 @@ descriptor (a trivial `t_structtype` value holding the program-lifetime
 The tree-walker binds it `const`, but that flag is unobservable at runtime (a
 reassign `P = x` is a compile-time `CannotRebindConstEx`, `isconst` folds), so a
 plain `StoreGlobalV` is differential-identical (a REPL map-resident struct falls
-back). Standalone construction `P(x,y)` stays a fallback (an `append`-fused ctor
-is already native via `EmplaceStruct`).
+back). A standalone POD construction `P(x, y)` builds via **`StructCtorV`**: the
+field args compile into a register run, then `construct_struct_from_values`
+coerces them into the POD bytes (the `StructTypeDef*` is a `Chunk::struct_defs`
+index, so node-free). It's gated on **every arg a typed scalar** (`th==i/f`) —
+the inferencer already rejected a non-fitting typed arg, so `coerce` can't throw
+and no per-arg loc is needed; a nested-struct-field arg (`Q(..)`, `th==none`) or
+a `dyn` arg falls back to the tree-walker, which reports the exact arg loc (the
+`append`-fused ctor is `EmplaceStruct`). This exposed a latent VM bug: `a[i] =
+<struct>` into a **flat struct array** has no boxed element LValue, so the
+general `StoreElemValue` path (`subscript(for_write)`) wrongly raised
+`NotLValueEx`; `vm_subscript_store` now byte-stores a flat POD-struct element
+directly (bounds/type-check/COW/`memcpy`), mirroring `try_flat_subscript_store`.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by

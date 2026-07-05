@@ -31,6 +31,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~MkC~~ | closure `<lambda>` create | 11,63 | — | ✅ MakeClosureV (node-free) |
 | ~~FDecl~~ | top-level `func f(){}` | all | — | ✅ MakeClosureV+StoreGlobalV |
 | ~~SDecl~~ | `struct P{}` decl bind | 58 | — | ✅ LoadConstV+StoreGlobalV |
+| ~~SCtor~~ | `P(x,y)` construct | 64 | 0.75x | ✅ StructCtorV (typed POD) |
 | ~~I++~~ | subscript `a[i]++`/`d[k]++` | 47 | — | ✅ StoreElem/DictStore±1 |
 | ~~AF~~ | DictStore/StoreElemV AST-free | — | — | ✅ vm_subscript_store loc |
 | **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |

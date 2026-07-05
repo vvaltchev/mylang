@@ -958,6 +958,26 @@ const StructTypeDef *native_struct_type_def()
     return def;
 }
 
+/* Construct a POD struct from already-evaluated field VALUES (the VM's
+ * StructCtorV, whose field args were compiled into a register run). Mirrors
+ * construct_struct's POD path but takes values, not an ExprList to eval. The
+ * codegen emits StructCtorV only when nargs == nfields and every arg is a typed
+ * scalar the inferencer proved assignable, so coerce_struct_field cannot throw
+ * here; a defensive throw is caught + given the construction's loc by the VM
+ * handler (empty locs below). */
+intrusive_ptr<StructObject>
+construct_struct_from_values(StructTypeDef *def,
+                            const EvalValue *vals, size_t n)
+{
+    auto obj = make_intrusive<StructObject>(def);
+    for (size_t i = 0; i < n; i++) {
+        EvalValue v = coerce_struct_field(def->fields[i], vals[i],
+                                          Loc(), Loc());
+        obj->pod_set(static_cast<int>(i), v);
+    }
+    return intrusive_ptr<StructObject>(obj);
+}
+
 static EvalValue
 construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
 {
@@ -2745,6 +2765,45 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
                              Loc lstart, Loc lend)
 {
+    /* Flat POD-struct array `a[i] = <struct>`: a flat struct element has no
+     * boxed LValue (it's bytes), so subscript(for_write) returns an rvalue and
+     * the general path below would wrongly raise NotLValueEx. Store the value's
+     * bytes directly, mirroring try_flat_subscript_store's struct path (only a
+     * plain assign - structs have no compound op; a non-matching value is the
+     * dyn-launder TypeErrorEx). */
+    if (op == Op::assign && base_lv->is<SharedArrayObj>()) {
+        SharedArrayObj &arr = base_lv->getval<SharedArrayObj>();
+        if (arr.skind() == SharedArrayObj::Storage::structs
+            && !base_lv->is_const_var() && !arr.is_readonly()) {
+            const EvalValue r = RValue(value);
+            const auto &sv0 = arr.flat_structs();
+            if (!key.is<int_type>())
+                throw TypeErrorEx("Expected integer as subscript",
+                                  lstart, lend);
+            int_type idx = key.get<int_type>();
+            if (idx < 0)
+                idx += arr.size();
+            if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                throw OutOfBoundsEx(lstart, lend);
+            if (!r.is<intrusive_ptr<StructObject>>()
+                || !r.get<intrusive_ptr<StructObject>>()->is_pod()
+                || r.get<intrusive_ptr<StructObject>>()->def != sv0.def)
+                throw TypeErrorEx(
+                    "Cannot store a value of a different type in a flat "
+                    "(typed) array; declare the array dyn for a polymorphic "
+                    "array", lstart, lend);
+            if (arr.is_slice())
+                arr.clone_internal_vec();
+            else if (arr.use_count() > 1)
+                arr.clone_aliased_slices(arr.offset() + idx);
+            auto &sv = arr.flat_structs();
+            const StructObject &o = *r.get<intrusive_ptr<StructObject>>().get();
+            std::memcpy(sv.buf.data() + (arr.offset() + idx) * sv.stride,
+                        o.bytes.data(), sv.stride);
+            return r;
+        }
+    }
+
     const bool for_write = (op == Op::assign);
     EvalValue elv = base_lv->get().get_type()->subscript(
         EvalValue(base_lv), key, for_write);

@@ -342,6 +342,13 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             const Construct *arg0, const CallExpr *ctor,
                             const EvalValue *vals, size_t n);
 
+/* VM StructCtorV: construct a POD struct standalone `P(x, y)` from its field
+ * VALUES (a register run). Only emitted for a typed-scalar-arg POD
+ * construction, so coerce cannot throw here. See eval.cpp. */
+intrusive_ptr<StructObject>
+construct_struct_from_values(StructTypeDef *def,
+                             const EvalValue *vals, size_t n);
+
 /* VM P2/P4: native subscript element store `c[k] = v` / `c[k] OP= v` for a dict
  * or a general array (any base - type-dispatched Type::subscript(for_write)
  * + slot_rmw). AST-free: the not-an-lvalue caret is a Loc pair (from the loc

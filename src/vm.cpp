@@ -1081,6 +1081,28 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::StructCtorV: {
+            /* Standalone POD struct construction P(x,y): the field arg values
+             * are in the run [a.lit, a.lit + b.lit). Coerce them into the POD
+             * bytes; the typed-arg gate means coerce won't throw, but
+             * a defensive throw is stamped with the ctor's loc (side table). */
+            StructTypeDef *def =
+                const_cast<StructTypeDef *>(chunk.struct_defs[in.target2]);
+            const int_type base = in.a.lit, nf = in.b.lit;
+            EvalValue vals[16];
+            for (int_type i = 0; i < nf; i++)
+                vals[i] = ctx.frame->at(base + i).get();
+            try {
+                ctx.frame->at(in.target).put(EvalValue(
+                    construct_struct_from_values(def, vals, nf)));
+            } catch (Exception &e) {
+                vm_stamp_loc(chunk, pc, e);
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::CallBuiltinLV: {
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*

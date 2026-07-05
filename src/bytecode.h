@@ -499,6 +499,19 @@ enum class OpCode : unsigned char {
     MakeClosureV,
 
     /*
+     * Construct a POD struct STANDALONE `P(x, y)` into `target`: the field arg
+     * values are in the register run [a.lit, a.lit + b.lit), `target2` = the
+     * index into Chunk::struct_defs (the program-lifetime StructTypeDef*; the
+     * Instr holds only the index). construct_struct_from_values coerces the
+     * values into the POD bytes. The codegen emits this ONLY when nargs ==
+     * nfields and every arg is a typed scalar (th==i/f) the inferencer proved
+     * assignable, so coerce cannot throw; a defensive throw is caught + given
+     * the construction's loc (loc side table). The append-fused ctor is
+     * EmplaceStruct, not this.
+     */
+    StructCtorV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()
@@ -648,4 +661,9 @@ struct Chunk {
      * expression). Program-lifetime AST-owned pointers; the Instr carries the
      * index, so it holds no raw Construct*. */
     std::vector<const FuncDeclStmt *> closure_defs;
+
+    /* Struct type descriptors for StructCtorV (the StructTypeDef* of each
+     * standalone `P(..)` construction). Program-lifetime AST-owned pointers,
+     * indexed by the Instr. */
+    std::vector<const StructTypeDef *> struct_defs;
 };

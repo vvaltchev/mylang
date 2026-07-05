@@ -102,6 +102,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemValue: case OpCode::MakeArrayV:
     case OpCode::MakeDictV:      case OpCode::MakeClosureV:
+    case OpCode::StructCtorV:
         return true;
     default:
         return false;
@@ -528,6 +529,54 @@ struct Codegen {
             ops.push_back(in);
             out_slot = t;
             return true;
+        }
+
+        /* A standalone POD struct construction `P(x, y)` -> StructCtorV:
+         * the field args into a register run, then coerce them into the POD
+         * compile the field args into a register run, then coerce them into
+         * the POD bytes. Gated on a POD ctor (vm_struct_ctor_def), nargs ==
+         * nfields (no
+         * skipped-opt fill - POD has no opt fields), a small field count, and
+         * EVERY arg a typed scalar (th==i/f). The typed-arg gate is what keeps
+         * coerce from throwing (the inferencer already rejected a non-fitting
+         * typed arg), so no per-arg loc is needed; a nested-struct-field arg (a
+         * `Q(..)`, th==none) or a dyn arg fails the gate and falls back to the
+         * tree-walker, which reports the exact arg loc. The append-fused
+         * ctor is
+         * EmplaceStruct. */
+        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+            const StructTypeDef *sdef = ce->vm_struct_ctor_def;
+            if (sdef && ce->args
+                && ce->args->elems.size() == sdef->fields.size()
+                && ce->args->elems.size() <= 16) {
+                bool all_typed = true;
+                for (const auto &a : ce->args->elems)
+                    if (a->th != TypeHint::i && a->th != TypeHint::f) {
+                        all_typed = false;
+                        break;
+                    }
+                if (all_typed) {
+                    const size_t cmark = chunk.consts.size();
+                    int base;
+                    if (!emit_args_range(ce->args->elems, base, ops)) {
+                        chunk.consts.resize(cmark);
+                        return false;
+                    }
+                    const int dst = alloc_temp();
+                    Instr in;
+                    in.op = OpCode::StructCtorV;
+                    in.node = ce;   /* loc for a defensive throw (nulled) */
+                    in.target = dst;
+                    in.a = int_lit(base);
+                    in.b = int_lit(
+                        static_cast<int>(ce->args->elems.size()));
+                    in.target2 = static_cast<int>(chunk.struct_defs.size());
+                    chunk.struct_defs.push_back(sdef);
+                    ops.push_back(in);
+                    out_slot = dst;
+                    return true;
+                }
+            }
         }
 
         /* An array LITERAL `[a, b, ..]` whose elements aren't all const ->
@@ -1055,6 +1104,7 @@ struct Codegen {
                     || ops.back().op == OpCode::MakeArrayV
                     || ops.back().op == OpCode::MakeDictV
                     || ops.back().op == OpCode::MakeClosureV
+                    || ops.back().op == OpCode::StructCtorV
                     || ops.back().op == OpCode::SliceV)) {
                 /* These read their operand slots BEFORE writing `target`, and
                  * the local lvalue slot can't overlap the temp run - so writing
@@ -3154,6 +3204,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreCaptureV:
         case OpCode::DictStore:      /* node = the Subscript (its caret) */
         case OpCode::StoreElemValue:
+        case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
