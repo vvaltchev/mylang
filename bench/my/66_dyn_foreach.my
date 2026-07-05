@@ -1,0 +1,19 @@
+# dyn-container foreach: the container is `dyn`, so the inferencer cannot prove
+# it is an array and the `foreach` can NOT specialize to the counted/box-free
+# form a typed `foreach` uses - it dispatches on the runtime type per loop. This
+# exercises the dyn-foreach at RUNTIME (unlike 48_const_fold's `heavy`, whose
+# only call folds at parse time, so its foreach body is never compiled/run).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var dyn a = range(1000);       # `dyn` launders the static array<int> type
+var dyn s = 0;                 # `e` is dyn (a dyn array's element), so `s` is
+var reps = 20000 * scale;
+
+for (var r = 0; r < reps; r++) {
+    foreach (var e in a)
+        s = (s + e) % 1000000007;
+}
+
+print("result:", s);
