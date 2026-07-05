@@ -275,6 +275,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "dict.iter.n  I" << in.target2 << " k=" << in.a.slot
                 << " v=" << in.b.slot << " -> L" << in.target;
             break;
+        case OpCode::ForeachDynInit:
+            row << "fe.dyn.init  I" << in.target << " <- " << D(in.target2)
+                << "  ; array|dict runtime dispatch";
+            break;
+        case OpCode::ForeachDynNext:
+            row << "fe.dyn.next  I" << in.target2 << " e=" << in.a.slot
+                << " -> L" << in.target;
+            break;
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
             row << (in.op == OpCode::UnpackElemInt ? "unpack.elem.i"

@@ -458,6 +458,13 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                       cstart, cend);
 }
 
+/* VM ForeachDynNext element read: box-free (boxing a flat int/float/bool
+ * scalar), reaching the static arr_elem_at in this (types.cpp) TU. */
+EvalValue vm_arr_elem(const EvalValue &arr_val, size_type i)
+{
+    return arr_elem_at(arr_val.get_ref<SharedArrayObj>(), i);
+}
+
 /* map/filter validate arg0 (the function) BEFORE evaluating arg1 (the
  * container) - a TESTED order (`map(5, undefined_var)` is a type error on the
  * 5, not undefined-var on arg1), so they stay on the `func` ABI (the eager

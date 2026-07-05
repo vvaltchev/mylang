@@ -1555,6 +1555,13 @@ public:
      * box-free. A dict has no O(1) index, so this is a separate loop shape from
      * the counted array foreach. */
     bool container_is_dict = false;
+    /* Set by the inferencer for a non-indexed SINGLE-var loop over a DYN
+     * container (static type dyn - can't prove array or dict): the VM iterates
+     * it with a runtime-dispatching LIVE iterator (ForeachDynInit/Next) that
+     * checks array-vs-dict once at init, then binds the element (array) or key
+     * (dict) box-free. An unsupported runtime container throws. Keeps the dyn
+     * foreach off the tree-walker fallback (an EvalStmt). */
+    bool container_is_dyn = false;
     /* Set by the inferencer (i/f) for a non-indexed 2+-var STRICT-unpack loop
      * over a proven array<array<int>> / array<array<float>> (flat sub-arrays):
      * the VM iterates the outer array counted and, per element, destructures
@@ -1586,6 +1593,7 @@ public:
         c->elem_th = elem_th;
         c->container_is_array = container_is_array;
         c->container_is_dict = container_is_dict;
+        c->container_is_dyn = container_is_dyn;
         c->unpack_elem_th = unpack_elem_th;
         c->container_struct_def = container_struct_def;
         return c;

@@ -158,6 +158,27 @@ enum class OpCode : unsigned char {
     DictIterNext,
 
     /*
+     * Native SINGLE-var `foreach (e in <dyn container>)`: the container's
+     * static type is dyn, so the array-vs-dict choice is at RUNTIME. A live
+     * iterator like DictIter, over a `Chunk::n_dyn_iters` state pool indexed by
+     * `target` (a codegen-assigned iter_id).
+     *
+     * ForeachDynInit: `target` = iter_id; `target2` = the container slot. Pins
+     * the container; if an array -> {arr, idx=0, size}; if a dict ->
+     * {dict, it=begin}; else throws TypeErrorEx via the loc side table (the
+     * container caret; `node` recorded by extract_locs, then nulled).
+     */
+    ForeachDynInit,
+
+    /*
+     * ForeachDynNext: `target2` = iter_id; `a` = the loop-var slot (`_` = -1);
+     * `target` = end_pc. On exhaustion jumps to end_pc; else binds the loop var
+     * BOX-FREE - the array ELEMENT (arr_elem_at) or the dict KEY (it->first) -
+     * then advances. Never throws (node-free).
+     */
+    ForeachDynNext,
+
+    /*
      * Native STRICT foreach-unpack element: `foreach (x, y in pairs)` over a
      * proven array<array<int/float>>. The counted loop over the OUTER array is
      * the usual ArrLen/ForLoopStep; per iteration this op reads pairs[i] (a
@@ -616,6 +637,10 @@ struct Chunk {
      * chunk (nested/sequential get distinct ids). See the DictIter ops.
      */
     int n_dict_iters = 0;
+
+    /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
+     * ForeachDyn in the chunk. See the ForeachDyn ops. */
+    int n_dyn_iters = 0;
     /*
      * The BOXED general-value path's constant pool: literal EvalValues baked at
      * codegen (a machine-code backend would put these in the data section),

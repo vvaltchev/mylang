@@ -77,8 +77,11 @@ first:
    `try_multi_scalar_spread` — compile the scalar once, MoveV to each target);
    ~~a big const array literal decl (48/52)~~ **DONE** (2026-07-08, `DeclConstV`
    — materialize the rvalue then bind the slot as a CONST LValue so a later
-   rebind still throws; one-time, so not a perf mover); a `var dyn` foreach
-   reduction (48_heavy); exceptions (42). Audit with: for each chunk, a `name`
+   rebind still throws; one-time, so not a perf mover);
+   ~~a `var dyn` foreach reduction (48_heavy)~~ **DONE** (2026-07-08,
+   `ForeachDynInit`/`ForeachDynNext` — a runtime-dispatching box-free single-var
+   iterator, array element / dict key; measured on the dedicated non-folding
+   `66_dyn_foreach`); exceptions (42). Audit with: for each chunk, a `name`
    is a dead template iff some other chunk is `name$<digits>`.
 
 2. **Free the AST - drop `Instr::node`** (the node-field goal). The AST-free

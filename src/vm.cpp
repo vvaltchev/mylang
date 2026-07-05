@@ -443,12 +443,24 @@ struct DictIterState {
     DictObject::inner_type::iterator it;
 };
 
+/* Per-loop LIVE state for a native single-var `foreach (e in <dyn>)`: the
+ * array-vs-dict choice is made ONCE at ForeachDynInit and recorded here (the
+ * pinned `container` keeps the array/dict alive for the loop). One per native
+ * ForeachDyn (Chunk::n_dyn_iters), indexed by the codegen-assigned iter_id. */
+struct DynIterState {
+    EvalValue container;   /* pins the array OR dict for the loop */
+    bool is_dict = false;
+    size_type idx = 0, size = 0;               /* array cursor + snapshot */
+    DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
+};
+
 void
 vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 {
     /* Sized once from the chunk; empty (no alloc) for a no-dict-foreach
      * chunk. */
     std::vector<DictIterState> dict_iters(chunk.n_dict_iters);
+    std::vector<DynIterState> dyn_iters(chunk.n_dyn_iters);
 
     for (size_t pc = 0; ; ) {
 
@@ -762,6 +774,61 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (in.b.slot >= 0)
                 ctx.frame->at(in.b.slot).put(st.it->second.get());
             ++st.it;
+            pc++;
+            break;
+        }
+
+        case OpCode::ForeachDynInit: {
+            /* Dispatch the DYN container once: pin it, and set up an array or
+             * dict cursor. An unsupported runtime value throws (loc side
+             * table). */
+            ML_VM_CHECK(in.target >= 0
+                && static_cast<size_t>(in.target) < dyn_iters.size());
+            DynIterState &st = dyn_iters[in.target];
+            st.container = ctx.frame->at(in.target2).get();
+            if (st.container.is<SharedArrayObj>()) {
+                st.is_dict = false;
+                st.idx = 0;
+                st.size = st.container.get<SharedArrayObj>().size();
+            } else if (st.container.is<intrusive_ptr<DictObject>>()) {
+                st.is_dict = true;
+                st.it = st.container.get<intrusive_ptr<DictObject>>()
+                            ->get_ref().begin();
+            } else {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
+                throw TypeErrorEx(
+                    "foreach: expected an array or dict", s, en);
+            }
+            pc++;
+            break;
+        }
+
+        case OpCode::ForeachDynNext: {
+            /* On exhaustion jump to end_pc; else bind the loop var BOX-FREE -
+             * the array element (arr_elem_at) or the dict key - and advance. */
+            ML_VM_CHECK(in.target2 >= 0
+                && static_cast<size_t>(in.target2) < dyn_iters.size());
+            DynIterState &st = dyn_iters[in.target2];
+            if (!st.is_dict) {
+                if (st.idx >= st.size) {
+                    pc = static_cast<size_t>(in.target);
+                    break;
+                }
+                if (in.a.slot >= 0)
+                    ctx.frame->at(in.a.slot).put(
+                        vm_arr_elem(st.container, st.idx));
+                st.idx++;
+            } else {
+                DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
+                if (st.it == d.get_ref().end()) {
+                    pc = static_cast<size_t>(in.target);
+                    break;
+                }
+                if (in.a.slot >= 0)
+                    ctx.frame->at(in.a.slot).put(st.it->first);
+                ++st.it;
+            }
             pc++;
             break;
         }

@@ -3004,7 +3004,19 @@ COW, so a body write hits the same map either way — a snapshot would DIVERGE, 
 we DON'T snapshot). The inferencer stamps `ForeachStmt::container_is_dict` for a
 non-indexed 1/2-var loop over a proven `Dict` type; a `dyn` container falls
 `_`/keys-only bind a slot of `-1` (skip). ~1.5x on `62_dict_word_count`
-(0.71x→0.64x vs the tree-walker). **User-function calls** go
+(0.71x→0.64x vs the tree-walker).
+**A SINGLE-var `foreach (e in <dyn container>)`** — the container's static type
+is `dyn`, so array-vs-dict can't be proven — is native via a runtime-dispatching
+LIVE iterator, **`ForeachDynInit`**/**`ForeachDynNext`** (like the dict pair,
+over a **`Chunk::n_dyn_iters`** `DynIterState` pool): Init pins the container,
+chooses ONCE — an array (`{idx, size}`) or a dict (`{it}`), else throws
+`TypeErrorEx` (loc side table); Next binds the loop var BOX-FREE — the array
+ELEMENT (`vm_arr_elem` → `arr_elem_at`, boxing a flat scalar) or the dict KEY —
+then advances. The inferencer stamps `ForeachStmt::container_is_dyn` for a
+single-var non-indexed foreach over a `Dyn` container (2-var/indexed dyn falls
+back). **~1.8x CPython** on the dedicated non-folding `66_dyn_foreach` (VM 0.60s
+vs the 0.99s `do_iter` fallback, 0.59x the tree-walker) — the box-free bind is
+the win. **User-function calls** go
 native via `CallV`: a call
 proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
 struct constructor / builtin) that devirtualized to a global slot evaluates its

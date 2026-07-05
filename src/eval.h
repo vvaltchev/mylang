@@ -363,6 +363,10 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                         const EvalValue &container, bool is_filter,
                         Loc cstart, Loc cend);
 
+/* VM (ForeachDynNext): read element `i` of the array VALUE box-free (boxing a
+ * flat scalar), reaching arr_elem_at in its own TU. See generic.cpp.h. */
+EvalValue vm_arr_elem(const EvalValue &arr_val, size_type i);
+
 /* VM LoadStructFieldInt/Float: read scalar field #fidx of element `idx` of a
  * flat array<PodStruct> directly from the bytes (the struct-foreach direct
  * read). No bounds/type checks - the codegen proved them. See eval.cpp. */

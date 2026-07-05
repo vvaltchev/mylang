@@ -406,6 +406,7 @@ struct Codegen {
     int next_temp = 0;
     int max_temp = 0;
     int max_dict_iters = 0;   /* # native dict foreachs -> n_dict_iters */
+    int max_dyn_iters = 0;    /* # native dyn foreachs -> n_dyn_iters */
 
     /* Active struct-foreach direct-read mapping: while compiling a
      * try_native_struct_foreach body, a MemberExpr reading `sfe_loop_slot`'s
@@ -447,6 +448,14 @@ struct Codegen {
     int alloc_dict_iter()
     {
         const int id = max_dict_iters++;
+        return id;
+    }
+
+    /* A distinct persistent dyn-foreach iterator state slot (like
+     * alloc_dict_iter, sized into Chunk::n_dyn_iters). */
+    int alloc_dyn_iter()
+    {
+        const int id = max_dyn_iters++;
         return id;
     }
 
@@ -2604,7 +2613,8 @@ struct Codegen {
                            dynamic_cast<const ForeachStmt *>(s)) {
                 if (try_native_foreach(fe) || try_native_foreach_unpack(fe)
                     || try_native_struct_foreach(fe)
-                    || try_native_dict_foreach(fe)) {
+                    || try_native_dict_foreach(fe)
+                    || try_native_dyn_foreach(fe)) {
                     any_native = true;
                     continue;
                 }
@@ -3385,6 +3395,80 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * Native SINGLE-var `foreach (e in <dyn container>)` via a runtime-
+     * dispatching live iterator (ForeachDynInit/ForeachDynNext): the
+     * array-vs-dict choice is made at runtime, then the loop var binds the
+     * array element or the dict key box-free. Same shape as the dict foreach;
+     * a `_` binds nothing (slot -1). 2-var / indexed dyn foreach falls back.
+     */
+    bool try_native_dyn_foreach(const ForeachStmt *fe)
+    {
+        if (!fe->container_is_dyn || !fe->ids
+            || fe->ids->elems.size() != 1)
+            return false;
+
+        const Identifier *id =
+            dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+        if (!id)
+            return false;
+        int e_slot;
+        if (id->is_underscore())
+            e_slot = -1;
+        else if (id->sym.kind != SymKind::local)
+            return false;
+        else
+            e_slot = id->sym.slot;
+
+        const size_t start = chunk.code.size();
+        reset_temps();
+
+        int dsrc;
+        if (!compile_boxed_expr(fe->container.get(), dsrc, chunk.code)) {
+            chunk.code.resize(start);
+            return false;
+        }
+        const int saved_base = temp_base;
+        temp_base = next_temp;      /* reserve dsrc for ForeachDynInit */
+
+        const int iter_id = alloc_dyn_iter();
+
+        Instr init;
+        init.op = OpCode::ForeachDynInit;
+        init.node = fe->container.get();   /* extract_locs -> the caret */
+        init.target = iter_id;
+        init.target2 = dsrc;
+        chunk.code.push_back(init);
+
+        const int lnext = here();          /* test + bind + advance */
+        Instr nx;
+        nx.op = OpCode::ForeachDynNext;
+        nx.target2 = iter_id;
+        nx.a = slot_op(e_slot);            /* -1 == `_` */
+        const size_t nx_i = chunk.code.size();
+        chunk.code.push_back(nx);          /* .target (end_pc) backpatched */
+
+        loops.push_back({});
+        if (!compile_scalar_body(body_stmts(fe->body.get()))) {
+            loops.pop_back();
+            temp_base = saved_base;
+            chunk.code.resize(start);
+            return false;
+        }
+
+        const int lcont = here();
+        Instr jb;
+        jb.op = OpCode::Jump;
+        jb.target = lnext;
+        chunk.code.push_back(jb);
+
+        const int lend = here();
+        chunk.code[nx_i].target = lend;
+        pop_loop(lend, lcont);
+        temp_base = saved_base;
+        return true;
+    }
+
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
     {
         for (const auto &e : elems)
@@ -3441,7 +3525,8 @@ struct Codegen {
             if (!try_native_foreach(fe)         /* flat/general array */
                 && !try_native_foreach_unpack(fe) /* strict array destructure */
                 && !try_native_struct_foreach(fe) /* flat struct fields */
-                && !try_native_dict_foreach(fe))  /* live dict iterator */
+                && !try_native_dict_foreach(fe)   /* live dict iterator */
+                && !try_native_dyn_foreach(fe))   /* runtime array|dict */
                 emit(OpCode::EvalStmt, s);
             return;
         }
@@ -3587,6 +3672,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::DictStore:      /* node = the Subscript (its caret) */
         case OpCode::StoreElemValue:
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
+        case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
@@ -3644,6 +3730,7 @@ codegen_chunk(const Block *block, int slot_count)
         cg.emit(OpCode::Halt);
     cg.chunk.n_temps = cg.max_temp - slot_count;
     cg.chunk.n_dict_iters = cg.max_dict_iters;
+    cg.chunk.n_dyn_iters = cg.max_dyn_iters;
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     extract_locs(cg.chunk);   /* move div/mod carets to the loc side table */
