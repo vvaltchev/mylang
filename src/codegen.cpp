@@ -498,6 +498,15 @@ struct Codegen {
         if (compile_float_stmt(init, chunk.code))
             return;
         chunk.code.resize(mark);
+        reset_temps();
+        /* Boxed decl-init: `var k = i` (an int/bool leaf, or a dyn/string
+         * value) - the int path rejects a bare identifier rhs (it can't prove
+         * int-not-bool for a raw int store), but a boxed move preserves the
+         * rhs's real type. Runs ONCE per loop entry; keeps a var-initialized
+         * for-loop off the EvalStmt fallback. */
+        if (compile_boxed_stmt(init, chunk.code))
+            return;
+        chunk.code.resize(mark);
         emit(OpCode::EvalStmt, init);
     }
 
@@ -2480,10 +2489,10 @@ struct Codegen {
                          std::vector<size_t> &exit_jumps)
     {
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
-        if (!t)
-            return false;
 
-        if (t->cat == TypedScalarExpr::Cat::cmp) {
+        /* A typed int/float comparison -> one native compare-branch to the
+         * exit. On failure, fall through to the boxed path (don't bail). */
+        if (t && t->cat == TypedScalarExpr::Cat::cmp) {
             Operand a, b;
             Op cmp;
             reset_temps();
@@ -2501,21 +2510,40 @@ struct Codegen {
                 return true;
             }
             chunk.code.resize(mark);
-            return false;
+            /* fall through to boxed */
         }
 
-        if (t->cat == TypedScalarExpr::Cat::logical) {
+        /* `A && B && ...` -> one compare-branch per conjunct (each recurses, so
+         * a bool-var conjunct lowers via the boxed path below). A `||` chain
+         * isn't split - it falls through to the boxed path, which evaluates it
+         * as a single truthiness test. Tried into a scratch: on any conjunct
+         * failure, undo the partial emission and box the whole condition. */
+        if (t && t->cat == TypedScalarExpr::Cat::logical) {
+            bool all_and = true;
             for (size_t i = 1; i < t->elems.size(); i++)
-                if (t->elems[i].first != Op::land)
-                    return false;   /* `||` is not native yet */
-            for (const auto &pr : t->elems)
-                if (!emit_cond_jumps(pr.second.get(), exit_jumps))
-                    return false;
-            return true;
+                if (t->elems[i].first != Op::land) { all_and = false; break; }
+            if (all_and) {
+                const size_t mark = chunk.code.size();
+                const size_t nexit = exit_jumps.size();
+                bool ok = true;
+                for (const auto &pr : t->elems)
+                    if (!emit_cond_jumps(pr.second.get(), exit_jumps)) {
+                        ok = false;
+                        break;
+                    }
+                if (ok)
+                    return true;
+                chunk.code.resize(mark);
+                exit_jumps.resize(nexit);
+                /* fall through to boxed */
+            }
         }
 
-        /* BOXED condition (a dyn/string comparison, or a dyn truthy value):
-         * compile it to a bool slot, then branch to the exit unless true. */
+        /* BOXED condition: a bool VARIABLE (`while (flag)`), a dyn/string
+         * comparison, a `||` chain, or a conjunct that didn't lower - compile
+         * it to a bool slot, then branch to the exit unless true. This is the
+         * SAME path `if` uses, so a loop condition is now just as capable (a
+         * bool-var loop cond used to bail the WHOLE loop to an eval.stmt). */
         int cslot;
         reset_temps();
         const size_t mark = chunk.code.size();
@@ -2615,6 +2643,17 @@ struct Codegen {
                     || try_native_struct_foreach(fe)
                     || try_native_dict_foreach(fe)
                     || try_native_dyn_foreach(fe)) {
+                    any_native = true;
+                    continue;
+                }
+            } else if (const Block *blk = dynamic_cast<const Block *>(s)) {
+                /* A bare nested block `{ ... }` - what a const-folded
+                 * `if (true) { ... }` leaves behind (a const condition drops
+                 * the if but keeps its braced body), or an explicit block. A
+                 * scope_free block runs inline in the same frame, so compile
+                 * its statements in place (nested blocks recurse). Without this
+                 * the whole enclosing loop fell back to one EvalStmt. */
+                if (blk->scope_free && compile_scalar_body(body_stmts(blk))) {
                     any_native = true;
                     continue;
                 }
@@ -2924,24 +2963,15 @@ struct Codegen {
 
         const int lstart = here();
 
-        Operand ca, cb;
-        Op cmp;
-        OpCode cmp_opcode;
-        const size_t cmark = chunk.code.size();
-        reset_temps();
-        if (compile_int_cond(f->cond.get(), chunk.code, ca, cmp, cb)) {
-            cmp_opcode = OpCode::JumpUnlessIntCmp;
-        } else {
-            chunk.code.resize(cmark);
-            reset_temps();
-            if (!compile_float_cond(f->cond.get(), chunk.code, ca, cmp, cb)) {
-                chunk.code.resize(start);
-                return false;
-            }
-            cmp_opcode = OpCode::JumpUnlessFloatCmp;
+        /* The condition -> native compare-branch(es) to the exit, sharing the
+         * while path's helper: an int/float compare, a split `A && B`, or a
+         * boxed truthiness test (a bool var / `||` / dyn). Bails the loop only
+         * if even the boxed path can't compile the cond. */
+        std::vector<size_t> exit_jumps;
+        if (!emit_cond_jumps(f->cond.get(), exit_jumps)) {
+            chunk.code.resize(start);
+            return false;
         }
-
-        const size_t jt = emit_cmp(cmp_opcode, f->cond.get(), cmp, ca, cb);
 
         loops.push_back({});
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
@@ -2969,7 +2999,8 @@ struct Codegen {
 
         emit(OpCode::Jump, nullptr, lstart);
         const int lend = here();
-        chunk.code[jt].target = lend;
+        for (size_t j : exit_jumps)
+            chunk.code[j].target = lend;
         pop_loop(lend, lcont);
         return true;
     }

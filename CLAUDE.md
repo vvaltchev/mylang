@@ -3290,7 +3290,25 @@ set `Subscript::base_array`), and **nested control flow** — the loop codegen
 emits the body directly into the chunk with backpatching, so nested loops and an
 `if` in a loop body go native (this is the broad win: many benchmarks wrap their
 work loop in a `for(rep)` amplifier whose body — a loop — used to force the
-whole thing to fall back). **Suite geomean 0.82x, VM ~1.2x faster than the
+whole thing to fall back). **Loop CONDITIONS are as capable as `if`
+conditions:** `emit_cond_jumps` (the while/for helper) now falls through to the
+boxed `JumpUnlessTrueV` path (the same one `if` uses) for a condition that isn't
+a `TypedScalarExpr` — a **bool VARIABLE** (`while (flag)`), a bool var in a `&&`
+conjunct (`while (flag && j < N)`, split per-conjunct so the bool one boxes and
+the comparison stays a native `JumpUnlessIntCmp`), a `||` chain, or a dyn/string
+truthiness test. Before, a bool-var loop cond bailed the WHOLE loop to an
+`EvalStmt`; `try_native_for` was unified onto the same helper so a general
+`for` gets it too. A **var-initialized loop** (`for (var k = i; ...)`) also goes
+native: `emit_init` falls through to a boxed move (`compile_boxed_stmt`) before
+`EvalStmt` — the raw int-store path rejects a bare-identifier rhs (it can't
+prove int-not-bool for a raw store, since a bool is `th==i` too), but a boxed
+move preserves the real type. A **15-level randomly-nested if/while/for
+(optimized + general) spine lowers with ZERO `EvalStmt` fallback** (see the
+`vm/codegen: deep 15-level nest` test + `bench/*/68_nested`, ~4x CPython; and
+the `tests/nested_fuzz.py` differential fuzzer, which generates thousands of
+random deep-nested programs + their Python twins and checks tree-walker == VM ==
+CPython).
+**Suite geomean 0.82x, VM ~1.2x faster than the
 tree-walker.** The register choice (over a stack machine, which the
 already-M8-optimized tree-walker would beat) is also the right IR for the
 eventual native x86-64 codegen. Full roadmap + phase order:

@@ -1,0 +1,206 @@
+# AUTO-GENERATED rich nested workload (depth=15 seed=12345)
+# for_gen -> if -> for_opt -> for_opt -> while -> for_opt -> for_gen -> while -> for_opt -> if -> for_gen -> for_opt -> while -> while -> for_opt
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+var A = [1, 2, 3, 4, 5, 6, 7];
+var G = [];
+var D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0};
+var s1 = 1; var s2 = 2; var s3 = 3;
+var reps = 5000*scale;
+for (var rep = 0; rep < reps; rep++) {
+    if (len(G) < 300) append(G, (s1 + s2) % 97);
+    for (var v0 = 1; v0 < 4; v0 = v0 * 2) {
+      D[1 % 5] = D[1 % 5] + (s1 % 3);
+      if (s1 % 4 != 1) {
+        s3 = (s3 + 1) % 1000000007;
+        s3 = (s3 + v0 * v0 + 1) % 1000000007;
+        for (var v2 = 0; v2 < 2; v2++) {
+          if (s3 % 11 == 0) continue;
+          s1 = (s1 * 31 + v2 + 3) % 1000000007;
+          for (var v3 = 0; v3 < 2; v3++) {
+            if (s3 % 11 == 0) continue;
+            A[4 % 7] = (A[4 % 7] + s1 + v3) % 1000000007;
+            var v4 = 0;
+            while (v4 < 2) {
+              v4 += 1;
+              s2 = (s2 + A[(s1 + 5) % 7]) % 1000000007;
+              for (var v5 = 0; v5 < 2; v5++) {
+                if (s3 % 11 == 0) continue;
+                if (len(G) < 300) append(G, (s1 + s2) % 97);
+                for (var v6 = 1; v6 < 4; v6 = v6 * 2) {
+                  D[7 % 5] = D[7 % 5] + (s1 % 3);
+                  var v7 = 0;
+                  while (v7 < 2) {
+                    v7 += 1;
+                    s3 = (s3 + v7 * v7 + 1) % 1000000007;
+                    for (var v8 = 0; v8 < 2; v8++) {
+                      if (s3 % 11 == 0) continue;
+                      s1 = (s1 * 31 + v8 + 9) % 1000000007;
+                      if (s1 % 4 != 1) {
+                        s3 = (s3 + 9) % 1000000007;
+                        A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;
+                        for (var v10 = 1; v10 < 4; v10 = v10 * 2) {
+                          s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;
+                          for (var v11 = 0; v11 < 2; v11++) {
+                            if (s3 % 11 == 0) continue;
+                            if (len(G) < 300) append(G, (s1 + s2) % 97);
+                            var v12 = 0;
+                            while (v12 < 2) {
+                              v12 += 1;
+                              D[13 % 5] = D[13 % 5] + (s1 % 3);
+                              var v13 = 0;
+                              while (v13 < 2) {
+                                v13 += 1;
+                                s3 = (s3 + v13 * v13 + 1) % 1000000007;
+                                for (var v14 = 0; v14 < 2; v14++) {
+                                  if (s3 % 11 == 0) continue;
+                                  s1 = (s1 * 31 + v14 + 15) % 1000000007;
+                                  A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1000000007;
+                                  if (s2 % 13 == 0) break;
+                                }
+                              }
+                            }
+                            if (s2 % 13 == 0) break;
+                          }
+                        }
+                      } else {
+                        s2 = (s2 + 9) % 1000000007;
+                        A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;
+                        for (var v10 = 1; v10 < 4; v10 = v10 * 2) {
+                          s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;
+                          for (var v11 = 0; v11 < 2; v11++) {
+                            if (s3 % 11 == 0) continue;
+                            if (len(G) < 300) append(G, (s1 + s2) % 97);
+                            var v12 = 0;
+                            while (v12 < 2) {
+                              v12 += 1;
+                              D[13 % 5] = D[13 % 5] + (s1 % 3);
+                              var v13 = 0;
+                              while (v13 < 2) {
+                                v13 += 1;
+                                s3 = (s3 + v13 * v13 + 1) % 1000000007;
+                                for (var v14 = 0; v14 < 2; v14++) {
+                                  if (s3 % 11 == 0) continue;
+                                  s1 = (s1 * 31 + v14 + 15) % 1000000007;
+                                  A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1000000007;
+                                  if (s2 % 13 == 0) break;
+                                }
+                              }
+                            }
+                            if (s2 % 13 == 0) break;
+                          }
+                        }
+                      }
+                      if (s2 % 13 == 0) break;
+                    }
+                  }
+                }
+                if (s2 % 13 == 0) break;
+              }
+            }
+            if (s2 % 13 == 0) break;
+          }
+          if (s2 % 13 == 0) break;
+        }
+      } else {
+        s2 = (s2 + 1) % 1000000007;
+        s3 = (s3 + v0 * v0 + 1) % 1000000007;
+        for (var v2 = 0; v2 < 2; v2++) {
+          if (s3 % 11 == 0) continue;
+          s1 = (s1 * 31 + v2 + 3) % 1000000007;
+          for (var v3 = 0; v3 < 2; v3++) {
+            if (s3 % 11 == 0) continue;
+            A[4 % 7] = (A[4 % 7] + s1 + v3) % 1000000007;
+            var v4 = 0;
+            while (v4 < 2) {
+              v4 += 1;
+              s2 = (s2 + A[(s1 + 5) % 7]) % 1000000007;
+              for (var v5 = 0; v5 < 2; v5++) {
+                if (s3 % 11 == 0) continue;
+                if (len(G) < 300) append(G, (s1 + s2) % 97);
+                for (var v6 = 1; v6 < 4; v6 = v6 * 2) {
+                  D[7 % 5] = D[7 % 5] + (s1 % 3);
+                  var v7 = 0;
+                  while (v7 < 2) {
+                    v7 += 1;
+                    s3 = (s3 + v7 * v7 + 1) % 1000000007;
+                    for (var v8 = 0; v8 < 2; v8++) {
+                      if (s3 % 11 == 0) continue;
+                      s1 = (s1 * 31 + v8 + 9) % 1000000007;
+                      if (s1 % 4 != 1) {
+                        s3 = (s3 + 9) % 1000000007;
+                        A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;
+                        for (var v10 = 1; v10 < 4; v10 = v10 * 2) {
+                          s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;
+                          for (var v11 = 0; v11 < 2; v11++) {
+                            if (s3 % 11 == 0) continue;
+                            if (len(G) < 300) append(G, (s1 + s2) % 97);
+                            var v12 = 0;
+                            while (v12 < 2) {
+                              v12 += 1;
+                              D[13 % 5] = D[13 % 5] + (s1 % 3);
+                              var v13 = 0;
+                              while (v13 < 2) {
+                                v13 += 1;
+                                s3 = (s3 + v13 * v13 + 1) % 1000000007;
+                                for (var v14 = 0; v14 < 2; v14++) {
+                                  if (s3 % 11 == 0) continue;
+                                  s1 = (s1 * 31 + v14 + 15) % 1000000007;
+                                  A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1000000007;
+                                  if (s2 % 13 == 0) break;
+                                }
+                              }
+                            }
+                            if (s2 % 13 == 0) break;
+                          }
+                        }
+                      } else {
+                        s2 = (s2 + 9) % 1000000007;
+                        A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;
+                        for (var v10 = 1; v10 < 4; v10 = v10 * 2) {
+                          s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;
+                          for (var v11 = 0; v11 < 2; v11++) {
+                            if (s3 % 11 == 0) continue;
+                            if (len(G) < 300) append(G, (s1 + s2) % 97);
+                            var v12 = 0;
+                            while (v12 < 2) {
+                              v12 += 1;
+                              D[13 % 5] = D[13 % 5] + (s1 % 3);
+                              var v13 = 0;
+                              while (v13 < 2) {
+                                v13 += 1;
+                                s3 = (s3 + v13 * v13 + 1) % 1000000007;
+                                for (var v14 = 0; v14 < 2; v14++) {
+                                  if (s3 % 11 == 0) continue;
+                                  s1 = (s1 * 31 + v14 + 15) % 1000000007;
+                                  A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1000000007;
+                                  if (s2 % 13 == 0) break;
+                                }
+                              }
+                            }
+                            if (s2 % 13 == 0) break;
+                          }
+                        }
+                      }
+                      if (s2 % 13 == 0) break;
+                    }
+                  }
+                }
+                if (s2 % 13 == 0) break;
+              }
+            }
+            if (s2 % 13 == 0) break;
+          }
+          if (s2 % 13 == 0) break;
+        }
+      }
+    }
+}
+var r = 0;
+foreach (var x in A) r = (r + x) % 1000000007;
+foreach (var x in G) r = (r + x) % 1000000007;
+r = (r + len(G)) % 1000000007;
+r = (r + s1 + s2 + s3) % 1000000007;
+r = (r + D[0] + D[1] + D[2] + D[3] + D[4]) % 1000000007;
+print("result:", r);

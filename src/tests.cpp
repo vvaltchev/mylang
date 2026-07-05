@@ -3627,6 +3627,242 @@ static const std::vector<test> tests =
     },
     {
         /*
+         * VM codegen stress: a 15-level randomly-nested if/while/for spine
+         * (seed 12345) with NON-TRIVIAL side effects at every level -
+         * a fixed array (indexed r/w + foreach), a bounded growing array
+         * (append), a dict, three cross-level scalar accumulators, loop
+         * vars, and rare break/continue. The deepest level executes ~12.5k
+         * times; the result aggregates ALL state so any divergence at any
+         * level (temp-slot reuse, nested backpatch, break/continue targets,
+         * array COW) changes it. Auto-run on BOTH engines by the VM
+         * differential, and it lowers to native bytecode - 0 eval.stmt.
+         * (A flat bytecode VM handling deep nesting is far less obvious
+         * than the recursive tree-walker; this is the real proof.)
+         */
+        "vm/codegen: deep 15-level nest with arrays/dict/side-effects",
+        {
+            "var A = [1, 2, 3, 4, 5, 6, 7];",
+            "var G = [];",
+            "var D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0};",
+            "var s1 = 1; var s2 = 2; var s3 = 3;",
+            "for (var rep = 0; rep < 3; rep++) {",
+            "if (len(G) < 300) append(G, (s1 + s2) % 97);",
+            "for (var v0 = 1; v0 < 4; v0 = v0 * 2) {",
+            "D[1 % 5] = D[1 % 5] + (s1 % 3);",
+            "if (s1 % 4 != 1) {",
+            "s3 = (s3 + 1) % 1000000007;",
+            "s3 = (s3 + v0 * v0 + 1) % 1000000007;",
+            "for (var v2 = 0; v2 < 2; v2++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v2 + 3) % 1000000007;",
+            "for (var v3 = 0; v3 < 2; v3++) {",
+            "if (s3 % 11 == 0) continue;",
+            "A[4 % 7] = (A[4 % 7] + s1 + v3) % 1000000007;",
+            "var v4 = 0;",
+            "while (v4 < 2) {",
+            "v4 += 1;",
+            "s2 = (s2 + A[(s1 + 5) % 7]) % 1000000007;",
+            "for (var v5 = 0; v5 < 2; v5++) {",
+            "if (s3 % 11 == 0) continue;",
+            "if (len(G) < 300) append(G, (s1 + s2) % 97);",
+            "for (var v6 = 1; v6 < 4; v6 = v6 * 2) {",
+            "D[7 % 5] = D[7 % 5] + (s1 % 3);",
+            "var v7 = 0;",
+            "while (v7 < 2) {",
+            "v7 += 1;",
+            "s3 = (s3 + v7 * v7 + 1) % 1000000007;",
+            "for (var v8 = 0; v8 < 2; v8++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v8 + 9) % 1000000007;",
+            "if (s1 % 4 != 1) {",
+            "s3 = (s3 + 9) % 1000000007;",
+            "A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;",
+            "for (var v10 = 1; v10 < 4; v10 = v10 * 2) {",
+            "s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;",
+            "for (var v11 = 0; v11 < 2; v11++) {",
+            "if (s3 % 11 == 0) continue;",
+            "if (len(G) < 300) append(G, (s1 + s2) % 97);",
+            "var v12 = 0;",
+            "while (v12 < 2) {",
+            "v12 += 1;",
+            "D[13 % 5] = D[13 % 5] + (s1 % 3);",
+            "var v13 = 0;",
+            "while (v13 < 2) {",
+            "v13 += 1;",
+            "s3 = (s3 + v13 * v13 + 1) % 1000000007;",
+            "for (var v14 = 0; v14 < 2; v14++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v14 + 15) % 1000000007;",
+            "A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1"
+                "000000007;",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "} else {",
+            "s2 = (s2 + 9) % 1000000007;",
+            "A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;",
+            "for (var v10 = 1; v10 < 4; v10 = v10 * 2) {",
+            "s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;",
+            "for (var v11 = 0; v11 < 2; v11++) {",
+            "if (s3 % 11 == 0) continue;",
+            "if (len(G) < 300) append(G, (s1 + s2) % 97);",
+            "var v12 = 0;",
+            "while (v12 < 2) {",
+            "v12 += 1;",
+            "D[13 % 5] = D[13 % 5] + (s1 % 3);",
+            "var v13 = 0;",
+            "while (v13 < 2) {",
+            "v13 += 1;",
+            "s3 = (s3 + v13 * v13 + 1) % 1000000007;",
+            "for (var v14 = 0; v14 < 2; v14++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v14 + 15) % 1000000007;",
+            "A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1"
+                "000000007;",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "} else {",
+            "s2 = (s2 + 1) % 1000000007;",
+            "s3 = (s3 + v0 * v0 + 1) % 1000000007;",
+            "for (var v2 = 0; v2 < 2; v2++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v2 + 3) % 1000000007;",
+            "for (var v3 = 0; v3 < 2; v3++) {",
+            "if (s3 % 11 == 0) continue;",
+            "A[4 % 7] = (A[4 % 7] + s1 + v3) % 1000000007;",
+            "var v4 = 0;",
+            "while (v4 < 2) {",
+            "v4 += 1;",
+            "s2 = (s2 + A[(s1 + 5) % 7]) % 1000000007;",
+            "for (var v5 = 0; v5 < 2; v5++) {",
+            "if (s3 % 11 == 0) continue;",
+            "if (len(G) < 300) append(G, (s1 + s2) % 97);",
+            "for (var v6 = 1; v6 < 4; v6 = v6 * 2) {",
+            "D[7 % 5] = D[7 % 5] + (s1 % 3);",
+            "var v7 = 0;",
+            "while (v7 < 2) {",
+            "v7 += 1;",
+            "s3 = (s3 + v7 * v7 + 1) % 1000000007;",
+            "for (var v8 = 0; v8 < 2; v8++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v8 + 9) % 1000000007;",
+            "if (s1 % 4 != 1) {",
+            "s3 = (s3 + 9) % 1000000007;",
+            "A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;",
+            "for (var v10 = 1; v10 < 4; v10 = v10 * 2) {",
+            "s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;",
+            "for (var v11 = 0; v11 < 2; v11++) {",
+            "if (s3 % 11 == 0) continue;",
+            "if (len(G) < 300) append(G, (s1 + s2) % 97);",
+            "var v12 = 0;",
+            "while (v12 < 2) {",
+            "v12 += 1;",
+            "D[13 % 5] = D[13 % 5] + (s1 % 3);",
+            "var v13 = 0;",
+            "while (v13 < 2) {",
+            "v13 += 1;",
+            "s3 = (s3 + v13 * v13 + 1) % 1000000007;",
+            "for (var v14 = 0; v14 < 2; v14++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v14 + 15) % 1000000007;",
+            "A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1"
+                "000000007;",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "} else {",
+            "s2 = (s2 + 9) % 1000000007;",
+            "A[10 % 7] = (A[10 % 7] + s1 + v8) % 1000000007;",
+            "for (var v10 = 1; v10 < 4; v10 = v10 * 2) {",
+            "s2 = (s2 + A[(s1 + 11) % 7]) % 1000000007;",
+            "for (var v11 = 0; v11 < 2; v11++) {",
+            "if (s3 % 11 == 0) continue;",
+            "if (len(G) < 300) append(G, (s1 + s2) % 97);",
+            "var v12 = 0;",
+            "while (v12 < 2) {",
+            "v12 += 1;",
+            "D[13 % 5] = D[13 % 5] + (s1 % 3);",
+            "var v13 = 0;",
+            "while (v13 < 2) {",
+            "v13 += 1;",
+            "s3 = (s3 + v13 * v13 + 1) % 1000000007;",
+            "for (var v14 = 0; v14 < 2; v14++) {",
+            "if (s3 % 11 == 0) continue;",
+            "s1 = (s1 * 31 + v14 + 15) % 1000000007;",
+            "A[v14 % 7] = (A[v14 % 7] * 3 + s1 * 2 - s2 + 15 + 1000000007) % 1"
+                "000000007;",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "if (s2 % 13 == 0) break;",
+            "}",
+            "}",
+            "}",
+            "}",
+            "var r = 0;",
+            "foreach (var x in A) r = (r + x) % 1000000007;",
+            "foreach (var x in G) r = (r + x) % 1000000007;",
+            "r = (r + len(G)) % 1000000007;",
+            "r = (r + s1 + s2 + s3) % 1000000007;",
+            "r = (r + D[0] + D[1] + D[2] + D[3] + D[4]) % 1000000007;",
+            "assert(r == 743293559);",
+        },
+    },
+    {
+        /*
+         * A const-folded `if (true) { ... }` inside a loop leaves a bare nested
+         * block; verify it RUNS correctly on both engines (the codegen compiles
+         * a scope-free bare block in place). Found by tests/nested_fuzz.py.
+         */
+        "vm/codegen: const-folded if leaves a runnable native bare block",
+        {
+            "var s = 0;",
+            "for (var r = 0; r < 5; r++)"
+                " { if (2 > 1) { s = s + r; s = (s * 2) % 1000; } }",
+            "assert(s == 52);",
+        },
+    },
+    {
+        /*
          * keys()/values() of a scalar dict build FLAT (unboxed) arrays, driven
          * by the RESULT's static type - so a big keys()/values() avoids per-
          * element boxing. The flat hint reaches a bound destination
@@ -11289,21 +11525,20 @@ static bool vm_codegen_shapes()
         a.juic == 2 && a.intbin == 4 && a.back == 0 &&
         a.jif == 0 && a.jmp >= 1 && a.halt == 1;
 
-    /* 2) a while whose body has NO natively-compilable statement stays the
-     * Phase-1 flatten - the any_native gate keeps an all-fallback body on the
-     * tree-walker's tight counter: JumpIfFalse + LoopBackEdge, no native ops.
-     * (A body with even one native statement + a fallback call instead goes
-     * native around the EvalStmt - see the builtin / array-build tests below.)
-     * Uses `append(a[0], ..)` with NO counter increment: a mutating-builtin
-     * statement does not itself TRIGGER the any_native gate (nor does the
-     * never-incremented `i` give a native op), so the whole body flattens.
-     * (Since 2c a subscript target DOES compile to CallBuiltinLVElem once the
-     * body is native - a counted `for`, or a while with `i = i+1` - so this
-     * degenerate never-incrementing while is the stable all-fallback shape.) */
+    /* 2) a while whose body has a NON-natively-compilable statement stays the
+     * Phase-1 flatten - the whole body drops to one EvalStmt on the tree-walker's
+     * tight counter: JumpIfFalse (the cond too, even though `i < 5` is an int
+     * compare) + LoopBackEdge, no native ops. Uses a try/catch body: the try
+     * block has no native lowering, so compile_scalar_body fails and the loop
+     * flattens. (An ALL-native body goes native; a body that MIXES native ops
+     * with a fallback call goes native around the EvalStmt - see the tests
+     * below.) NB: the loop CONDITION alone no longer forces a fallback - a bool
+     * var / logical / boxed cond compiles to JumpUnlessTrueV now (a bool-var
+     * `while (flag)` used to bail the whole loop). */
     VmOpCounts b;
     if (!codegen_counts({
-            "var a = [[1]]; var i = 0;",
-            "while (i < 5) { append(a[0], i); append(a[0], i); }",
+            "var s = 0; var i = 0;",
+            "while (i < 5) { try { s += 1; } catch (x) { } i += 1; }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -11670,6 +11905,46 @@ static bool vm_codegen_shapes()
      * the append becomes CallBuiltinLV. */
     const bool callbuiltinlv_ok = clv.callbuiltinlv == 1;
 
+    /* 30) a loop condition with a BOOL VARIABLE (`while (flag && j < N)`)
+     * compiles the bool conjunct to a boxed truthiness branch (JumpUnlessTrueV)
+     * with NO eval.stmt - it used to bail the WHOLE loop to a fallback. `flag`
+     * is a genuine runtime bool (reassigned each outer iter), so it can't fold. */
+    VmOpCounts bvc;
+    if (!codegen_counts({
+            "var flag = false; var j = 0; var s = 0; var i = 0;",
+            "while (i < 4) { flag = i % 2 == 0;"
+                " while (flag && j < 3) { s += j; j += 1; } i += 1; }",
+        }, bvc))
+        return false;
+    const bool bool_cond_ok = bvc.jutv >= 1 && bvc.evalstmt == 0;
+
+    /* 31) a for-loop whose init reads a VARIABLE (`for (var k = i; ...)`)
+     * compiles the init via a boxed move (MoveV), NOT an eval.stmt - the raw
+     * int-store path rejects a bare identifier rhs (it can't prove int-not-bool
+     * for a raw store, but a boxed move preserves the real type). */
+    VmOpCounts vif;
+    if (!codegen_counts({
+            "var s = 0;",
+            "for (var i = 0; i < 4; i++)"
+                " for (var k = i; k < 4; k++) s += k;",
+        }, vif))
+        return false;
+    const bool var_init_ok = vif.evalstmt == 0 && vif.movev >= 1;
+
+    /* 32) a const-folded `if (true) { ... }` inside a loop leaves a bare nested
+     * block `{ ... }`; the loop-body compiler compiles a scope-free bare block
+     * IN PLACE (it used to bail the whole loop to one EvalStmt). `1 < 2` folds
+     * to true, so the if drops but keeps its braced body. (Found by the
+     * tests/nested_fuzz.py differential fuzzer.) */
+    VmOpCounts blk;
+    if (!codegen_counts({
+            "var s = 0;",
+            "for (var r = 0; r < 3; r++)"
+                " { if (1 < 2) { s = s + 1; s = s * 2; } }",
+        }, blk))
+        return false;
+    const bool block_ok = blk.evalstmt == 0 && blk.intbin >= 2;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -11678,7 +11953,8 @@ static bool vm_codegen_shapes()
         && break_cont_ok && compound_cond_ok && boxed_ok
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
-        && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok;
+        && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
+        && bool_cond_ok && var_init_ok && block_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:
