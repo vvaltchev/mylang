@@ -38,21 +38,35 @@ register/loop core (`IntBin`/`FloatBin`/`JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/
 
 ## ⚠ Perf regression to RECOVER here (drop `Instr::node`, Step 5)
 
-**2026-07-08 — TRACKED, do NOT lose:** the `bench/run.py --vm` geomean slipped
-from ~**4.5×** CPython to ~**4.3×** over the recent fallback-nativization pushes
-(sort/reverse, map/filter, const-decl, scalar-spread, ...). This is EXPECTED,
-and expected to recover — and then some — at **Step 5 (drop `Instr::node`)**:
-every op still carries an 8-byte `Construct *node`, so `Instr` is 64 bytes (2×
-an `EvalValue`), and the recent work ADDED node-holding ops
-(`CheckFuncV`/`MapFilterV`/`DeclConstV`, plus `sort`/`reverse` via
-`CallBuiltinLV`). More native ops → more of the program runs through the VM
-dispatch loop, which pays that bloated-`Instr` I-cache cost. Removing the field
-shrinks `Instr` → far better dispatch-loop density (the SAME locality argument
-that sizes `EvalValue`). So the dip is the temporary cost of nativizing MORE
-constructs *before* the node field is gone — the fix is the builtin loc handle
-(Steps 1–3) + freeing the AST (Step 5), **NOT** reverting any nativization.
-**Action: re-measure `run.py --vm` geomean after Step 5 and confirm it clears
-4.5× (target: well beyond, toward the 5× floor).**
+**2026-07-08 — TRACKED, ROOT-CAUSED (apples-to-apples).** The reported
+`run.py --vm` geomean drift (~**4.5×** → ~**4.2×**) was decomposed by timing the
+pre-fallback-work binary (`b0090d7`) vs now (`5c3c6d1`) over the SAME current
+bench set, same machine. Two effects, ONLY the second a regression:
+
+- **~half is a BENCH-SET artifact, NOT a regression.** The recently-ADDED
+  benches are BELOW the geomean, so they drag it by construction:
+  `63_closures` 1.8×, `64_struct_create` 1.6×, `66_dyn_foreach` 1.1–1.9×. The
+  **OLD binary itself**
+  scores **4.36× EXCLUDING 63–66 but 4.15× WITH them** — a ~0.2× drag with ZERO
+  code change. Adding a below-average bench lowers a geomean mechanically; it is
+  not slower code.
+- **~half is a small REAL regression (~4–5%)**, confirmed DRIFT-CONTROLLED
+  (interleaved `old -vm` vs `cur -vm`, best-of-5): untouched native /
+  dispatch-bound benches got slightly slower (`01_while_loop` 1.10×,
+  `03_int_arith` 1.07×, `44_primes_sqrt` 1.11×, `60_bit_sieve` 1.08×). Caution:
+  the FIRST (serial, non-interleaved) pass over-reported this — `24_dict_lookup`
+  showed 1.20× serial but 0.99× interleaved (pure machine drift). The nativized
+  benches themselves IMPROVED (`66` 0.57×, sort/reverse). So the regression is a
+  broad, small dispatch-loop slowdown: the recent nativizations ADDED ops
+  (`CheckFuncV`/`MapFilterV`/`DeclConstV`/`ForeachDyn*`/`StoreCaptureV`/…),
+  enlarging the `vm_run_chunk` switch, while every `Instr` still carries the
+  8-byte `Construct *node` (`Instr` = 64 bytes, 2× an `EvalValue`).
+
+- **Fix = Step 5 (drop `Instr::node` → `Instr` 64→56 bytes, better dispatch-loop
+  I-cache) + the builtin loc handle (Steps 1–3)** — **NOT** reverting a
+  nativization. **Action: re-measure `run.py --vm` after Step 5** and confirm
+  the ~4–5% comes back (the bench-set drag is permanent + correct — those
+  benches belong in the suite).
 
 ## The plan
 
