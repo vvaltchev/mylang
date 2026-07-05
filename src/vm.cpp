@@ -51,7 +51,7 @@ read_int_operand(const Operand &o, EvalContext *ctx)
 /* Write an int result into a frame slot: overwrite the int in place when the
  * slot already holds one (the common, hot case), else set value + int type. */
 static ML_ALWAYS_INLINE void
-write_int_slot(EvalContext *ctx, int slot, int_type v)
+write_int_slot(EvalContext *ctx, int_type slot, int_type v)
 {
     LValue &lv = ctx->frame->at(slot);
     if (lv.is<int_type>())
@@ -79,7 +79,7 @@ read_float_operand(const Operand &o, EvalContext *ctx)
 }
 
 static ML_ALWAYS_INLINE void
-write_float_slot(EvalContext *ctx, int slot, float_type v)
+write_float_slot(EvalContext *ctx, int_type slot, float_type v)
 {
     LValue &lv = ctx->frame->at(slot);
     if (lv.is<float_type>())
@@ -92,7 +92,8 @@ write_float_slot(EvalContext *ctx, int slot, float_type v)
  * int/bool -> promotion the tree-walker's eval_int/eval_float dict reads use.
  * Shared by DictLoadInt/Float's present-key and missing-key (default) paths. */
 static ML_ALWAYS_INLINE void
-write_scalar_slot(EvalContext *ctx, int slot, bool is_int, const EvalValue &v)
+write_scalar_slot(EvalContext *ctx, int_type slot, bool is_int,
+                  const EvalValue &v)
 {
     if (is_int)
         write_int_slot(ctx, slot,

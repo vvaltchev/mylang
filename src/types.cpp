@@ -3,6 +3,7 @@
 #include "eval.h"
 #include "bitops.h"
 #include "hashing.h"
+#include "env.h"      /* env_get - shared by builtins/io.cpp.h (tmpdir) */
 
 #include <unordered_map>
 #include <vector>

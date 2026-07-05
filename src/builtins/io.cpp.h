@@ -220,16 +220,14 @@ EvalValue builtin_tmpdir(EvalContext *ctx, ExprList *exprList,
     if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    const char *dir = nullptr;
+    string s = "/tmp";
     for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
-        const char *e = getenv(var);
-        if (e && *e) {
-            dir = e;
+        const std::optional<string> e = env_get(var);
+        if (e && !e->empty()) {
+            s = *e;
             break;
         }
     }
-
-    string s(dir ? dir : "/tmp");
 
     while (s.size() > 1 && (s.back() == '/' || s.back() == '\\'))
         s.pop_back();

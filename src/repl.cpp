@@ -28,7 +28,8 @@
 #include <algorithm>
 #include <iterator>
 #include <cctype>
-#include <cstdlib>     /* getenv */
+#include <cstdlib>
+#include "env.h"     /* env_get - cross-platform getenv */
 #ifndef _WIN32
 #include <unistd.h>    /* isatty */
 #endif
@@ -1195,8 +1196,8 @@ ReplEngine::is_incomplete(const string &src)
 static string
 history_path()
 {
-    const char *home = std::getenv("HOME");
-    return home ? string(home) + "/.mylang_history" : string();
+    const std::optional<string> home = env_get("HOME");
+    return home ? *home + "/.mylang_history" : string();
 }
 
 static const size_t HISTORY_CAP = 2000;
@@ -1239,7 +1240,7 @@ run_repl()
     load_history(history);
 
     /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
-    const bool color = repl_out_is_tty() && !std::getenv("NO_COLOR");
+    const bool color = repl_out_is_tty() && !env_get("NO_COLOR");
     engine.set_color(color);
     set_highlight_enabled(color);
     trace_set_color(color);

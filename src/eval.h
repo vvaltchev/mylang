@@ -122,7 +122,7 @@ struct Frame {
      * out-of-range LValue - a garbage type pointer, a layout-dependent crash)
      * fails LOUDLY here instead. Compiles to a plain `slots[i]` in a normal
      * release build. */
-    ML_ALWAYS_INLINE LValue &at(int i)
+    ML_ALWAYS_INLINE LValue &at(int_type i)
     {
         ML_VM_CHECK(i >= 0 && i < size);
         return slots[i];
@@ -360,8 +360,10 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
 /* VM LoadStructFieldInt/Float: read scalar field #fidx of element `idx` of a
  * flat array<PodStruct> directly from the bytes (the struct-foreach direct
  * read). No bounds/type checks - the codegen proved them. See eval.cpp. */
-int_type vm_struct_field_int(const EvalValue &arrv, int_type idx, int fidx);
-float_type vm_struct_field_float(const EvalValue &arrv, int_type idx, int fidx);
+int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
+                             int_type fidx);
+float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
+                                 int_type fidx);
 
 /* The stored value of a PRESENT dict key, else nullptr (a plain map find - the
  * tree-walker's typed dict fast path). Shared by Subscript/MemberExpr eval_int/

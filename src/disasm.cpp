@@ -16,7 +16,7 @@ namespace {
  * (slot < slot_count), else `rN` for a scratch temp (the VM's registers ARE the
  * frame slots; a temp has no name). So a loop reads `s = s + i`, not
  * `r3 = r3 + r2`. */
-std::string reg(const Chunk &ch, int slot)
+std::string reg(const Chunk &ch, int_type slot)
 {
     if (slot >= 0 && slot < ch.slot_count
         && static_cast<size_t>(slot) < ch.slot_names.size()
@@ -53,7 +53,7 @@ std::string callee_name(const Construct *node)
 }
 
 /* A call's argument registers as `(a, b, c)` from the run [base, base+n). */
-std::string arglist(const Chunk &ch, int base, int n)
+std::string arglist(const Chunk &ch, int_type base, int_type n)
 {
     std::string s = "(";
     for (int i = 0; i < n; i++) {
@@ -143,7 +143,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             r << "   ; " << node1(n);
     };
     /* arg0's lvalue target for a CallBuiltinLV, by slot kind (a.lit). */
-    auto lval_ref = [&](int kind, int slot) -> std::string {
+    auto lval_ref = [&](int_type kind, int_type slot) -> std::string {
         if (kind == 0) return "&" + reg(chunk, slot);        /* local */
         if (kind == 1) return "&g" + std::to_string(slot);   /* global */
         return "&c" + std::to_string(slot);                  /* capture */

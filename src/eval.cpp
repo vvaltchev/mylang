@@ -438,7 +438,8 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
          * stays immutable everywhere.
          */
         bind_param(
-            args_ctx, frame, i, funcParams[i].get(),
+            args_ctx, frame, static_cast<int>(i),
+            funcParams[i].get(),
             i < args.size() ? RValue(args[i]->eval(ctx)) : EvalValue(),
             funcParams[i]->const_param
         );
@@ -459,7 +460,8 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
 
     for (size_t i = 0; i < nparams; i++) {
         bind_param(
-            args_ctx, frame, i, funcParams[i].get(),
+            args_ctx, frame, static_cast<int>(i),
+            funcParams[i].get(),
             i < args.size() ? args[i] : EvalValue(), ctx->const_ctx
         );
     }
@@ -492,10 +494,12 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
 
     for (size_t i = 0; i < nparams; i++) {
         if (i < args.size())
-            bind_param(args_ctx, frame, i, funcParams[i].get(),
+            bind_param(args_ctx, frame, static_cast<int>(i),
+                       funcParams[i].get(),
                        args[i], ctx->const_ctx);
         else
-            bind_param(args_ctx, frame, i, funcParams[i].get(),
+            bind_param(args_ctx, frame, static_cast<int>(i),
+                       funcParams[i].get(),
                        EvalValue(), ctx->const_ctx);
     }
 }
@@ -513,7 +517,8 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++)
-        bind_param(args_ctx, frame, i, funcParams[i].get(),
+        bind_param(args_ctx, frame, static_cast<int>(i),
+                       funcParams[i].get(),
                    i == 0 ? arg : EvalValue(), ctx->const_ctx);
 }
 
@@ -531,7 +536,8 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++)
-        bind_param(args_ctx, frame, i, funcParams[i].get(),
+        bind_param(args_ctx, frame, static_cast<int>(i),
+                       funcParams[i].get(),
                    i == 0 ? args.first : i == 1 ? args.second : EvalValue(),
                    ctx->const_ctx);
 }
@@ -2816,7 +2822,8 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
  * from the bytes (the VM's LoadStructFieldInt/Float, the struct-foreach direct
  * read). `arrv` is the array value; the codegen proved it flat-struct + `idx`
  * in range (the counted loop), so no checks. A bool field reads as 0/1. */
-int_type vm_struct_field_int(const EvalValue &arrv, int_type idx, int fidx)
+int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
+                    int_type fidx)
 {
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
     const auto &sv = arr.flat_structs();
@@ -2830,7 +2837,8 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx, int fidx)
     return v;
 }
 
-float_type vm_struct_field_float(const EvalValue &arrv, int_type idx, int fidx)
+float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
+                      int_type fidx)
 {
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
     const auto &sv = arr.flat_structs();

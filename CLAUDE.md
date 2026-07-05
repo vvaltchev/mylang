@@ -3586,19 +3586,27 @@ omitting it is a compile error.
   overflow wraps — and
   is *relied upon*; don't "fix" wrap-dependent arithmetic).
 - **Compiler warnings must be ADDRESSED, not SILENCED — the build stays
-  warning-clean on BOTH g++ and clang.** A `-Wall -Wextra` warning is a real
-  signal; fix the ROOT CAUSE, never suppress it with a `#pragma`, a `-Wno-...`
-  flag, or a cast/`(void)` that hides the issue. When a warning looks like a
-  false positive, the fix is to make the INTENT EXPLICIT (which also documents
-  it), not to disable the diagnostic — e.g. a `-Wmissing-field-initializers` on
-  aggregate-initializing a struct with an anonymous union → give the struct a
-  **constructor** that initializes every member (done for `Builtin`); a
-  `-Wextra` "base should be explicitly initialized in the copy constructor" →
-  **name the base** in the init list (`FuncObject`'s copy ctor lists
-  `RefCounted()` to state "a clone owns a fresh count"). After any change, a
-  clean build (`make clean && make`) must show ZERO warnings; audit clang too
-  (`make CXX=clang++`), since CI builds both and each emits some the other
-  doesn't.
+  warning-clean on ALL THREE CI compilers (g++, clang, MSVC).** A warning is a
+  real signal; fix the ROOT CAUSE, never suppress it with a `#pragma`, a
+  `-Wno-...` / `/wd####` flag, `_CRT_SECURE_NO_WARNINGS`, or a cast / `(void)`
+  that hides it. When a warning looks like a false positive, make the INTENT
+  EXPLICIT (which also documents it) instead of disabling the diagnostic — e.g.
+  a `-Wmissing-field-initializers` on aggregate-initializing a struct with an
+  anonymous union → give the struct a **constructor** that inits every member
+  (done for `Builtin`); a `-Wextra` "base should be explicitly initialized in
+  the copy constructor" → **name the base** in the init list (`FuncObject`'s
+  copy ctor lists `RefCounted()` for "a clone owns a fresh count").
+  **MSVC is stricter about narrowing than g++/clang** (silent under the project
+  flags): `C4244`/`C4267` (`int_type`/`size_t` → `int`) are fixed by widening
+  the target param to `int_type` where it is a slot/index (`Frame::at`, the VM's
+  `write_*_slot`, `disasm`'s `reg`/`arglist`, `vm_struct_field_*` — a widening
+  call is warning-free everywhere) or an explicit `static_cast<int>` at a
+  one-off site; `C4996` (MSVC deprecating standard `getenv`) by a cross-platform
+  wrapper (`env_get`, `_dupenv_s` on `_WIN32`), NOT `_CRT_SECURE_NO_WARNINGS`.
+  After any
+  change a clean `make clean && make` must show ZERO warnings on g++ AND clang
+  (`make CXX=clang++`); MSVC's set is only visible on the Windows CI lane, so
+  read its log after a build-touching change.
 - Every file starts with `/* SPDX-License-Identifier: BSD-2-Clause */`.
 - Core typedefs (`defs.h`): `int_type = intptr_t`, `float_type = double`
   (printf/snprintf with `%f`/`%.*f`; the comment warns to update the format
