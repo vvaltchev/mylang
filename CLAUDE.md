@@ -3011,8 +3011,14 @@ loc side table); the plain assign is node-free. Compile in `compile_boxed_stmt`
 statement is handled at its top). A TYPED global (needs `coerce_to_decl_type`)
 and a `const` global (must throw `CannotRebindConstEx`) fall back to `EvalStmt`.
 Script-only (no `SymKind::global` in the REPL), so never emitted there; **not**
-a pure-target retarget candidate (it writes the table, not a temp). An **array
-LITERAL**
+a pure-target retarget candidate (it writes the table, not a temp). A closure
+**CAPTURE write** `cap = v` / `cap += v` / `cap++` (a counter `start++`) is the
+exact analog — **`StoreCaptureV`** writes `(*ctx->captures)[target]` with the
+same plain/compound/inc-dec `aop` split, no defined check (a capture is always
+defined - snapshot at closure creation). So a closure BODY is now fully native
+(the capture write was its last `EvalStmt`); 0-bench (the `do_func_call` call
+overhead, engine-neutral, dominates a counter loop) but it completes the
+slot-write family (local / global / capture). An **array LITERAL**
 `[a, b, ..]` whose elements aren't all const (a fully-const *scalar* one is a
 baked `LoadConstV`) builds native via **`MakeArrayV`**: the element expressions
 compile into a

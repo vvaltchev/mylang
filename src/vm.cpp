@@ -1425,6 +1425,29 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::StoreCaptureV: {
+            /* cap = <expr> / cap OP= v / cap++ : write the called closure's
+             * per-instance capture slot. A capture is ALWAYS defined (snapshot
+             * at closure creation), so - unlike a global - no defined check. */
+            LValue &lv = (*ctx.captures)[in.target];
+            if (in.aop == Op::invalid) {
+                lv.put(RValue(ctx.frame->at(in.a.slot).get()));
+            } else {
+                EvalValue sb;
+                EvalValue nv = lv.get();
+                try {
+                    num_bin_op(nv, boxed_operand(in.a, &ctx, sb),
+                               binop_pmf(in.aop));
+                } catch (Exception &e) {
+                    vm_stamp_loc(chunk, pc, e);
+                    throw;
+                }
+                lv.put(std::move(nv));
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::SubscriptV: {
             /* base[idx] read via the runtime Type::subscript (any base type -
              * array / dict / string), an LValue* to the base slot passed like

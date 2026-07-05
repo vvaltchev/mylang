@@ -385,6 +385,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << (in.aop == Op::invalid ? " = " : " OP= ")
                 << RI(in.a, false);
             break;
+        case OpCode::StoreCaptureV:
+            row << "store.cap    c" << in.target
+                << (in.aop == Op::invalid ? " = " : " OP= ")
+                << RI(in.a, false);
+            break;
         case OpCode::LoadCaptureV:
             row << "load.capture " << D(in.target) << ", "
                 << node_name(in.node);

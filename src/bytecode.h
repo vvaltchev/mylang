@@ -427,6 +427,19 @@ enum class OpCode : unsigned char {
     StoreGlobalV,
 
     /*
+     * Write to a closure CAPTURE slot `cap = <expr>` / `cap OP= v` / `cap++`
+     * (the write counterpart of LoadCaptureV): the value/rhs in `a`, `target`
+     * = the index into the called closure's per-instance capture vector
+     * (ctx->captures). `aop == Op::invalid` is a plain assign (put(RValue)),
+     * else a compound / inc-dec (copy-modify-store via num_bin_op, node for the
+     * caret). Unlike a global slot a capture is ALWAYS defined (snapshot at
+     * closure creation), so there is no defined check. This is what a counter
+     * closure's `start++` compiles to. Never emitted in the REPL (captures stay
+     * map-resident there).
+     */
+    StoreCaptureV,
+
+    /*
      * Boxed subscript READ `dst = base[idx]` (a general array / dict / string
      * element - the typed flat-array path is LoadElem*). `target2` = the base
      * slot, `a` = the index slot, `node` = the Subscript (error loc). Calls the

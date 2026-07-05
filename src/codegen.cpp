@@ -894,18 +894,22 @@ struct Codegen {
 
     bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
     {
-        /* A global `g++` / `g--` statement -> a compound StoreGlobalV
-         * (g += 1 / g -= 1). A LOCAL inc-dec is handled earlier
-         * (compile_int/float_stmt); a global one reaches here. A non-global /
-         * typed / const operand falls back. */
+        /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
+         * a compound StoreGlobalV/StoreCaptureV (x += 1 / x -= 1). A LOCAL
+         * inc-dec is handled earlier (compile_int/float_stmt); a subscript one
+         * in the store codegen; a global/capture id reaches here. A typed /
+         * const operand falls back. */
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             const Identifier *id =
                 dynamic_cast<const Identifier *>(inc->lvalue.get());
-            if (id && id->sym.kind == SymKind::global && !id->is_const
+            if (id && !id->is_const
                 && (id->decl_type == DeclType::none
-                    || id->decl_type == DeclType::dyn)) {
+                    || id->decl_type == DeclType::dyn)
+                && (id->sym.kind == SymKind::global
+                    || id->sym.kind == SymKind::capture)) {
                 Instr in;
-                in.op = OpCode::StoreGlobalV;
+                in.op = id->sym.kind == SymKind::global
+                            ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
                 in.node = s;
                 in.target = id->sym.slot;
                 in.a = int_lit(1);
@@ -934,7 +938,8 @@ struct Codegen {
         const Identifier *lv =
             dynamic_cast<const Identifier *>(e->lvalue.get());
         if (!lv || (lv->sym.kind != SymKind::local
-                    && lv->sym.kind != SymKind::global))
+                    && lv->sym.kind != SymKind::global
+                    && lv->sym.kind != SymKind::capture))
             return false;
         if (lv->decl_type != DeclType::none && lv->decl_type != DeclType::dyn)
             return false;
@@ -948,13 +953,18 @@ struct Codegen {
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();
 
-        /* A GLOBAL-table lvalue (a top-level var a function reads): a PLAIN
-         * assign lowers to StoreGlobalV (compile the rvalue into a temp, then
-         * write the shared table slot + mark defined - byte-identical to the
-         * tree-walker's decl/reassign). Compound `g += x` / `g++` are deferred
-         * (they stay a correct EvalStmt fallback). No retarget: the producing
-         * op writes a FRAME temp, the global lives in gfuncs. */
-        if (lv->sym.kind == SymKind::global) {
+        /* A GLOBAL-table lvalue (a top-level var a function reads) or a closure
+         * CAPTURE slot: a PLAIN assign lowers to StoreGlobalV/StoreCaptureV
+         * (compile the rvalue into a temp, then write the table/capture slot -
+         * byte-identical to the tree-walker), a compound `x OP= v` to the same
+         * op with the base op (rhs a boxed operand; a complex rhs falls back).
+         * No retarget: the producing op writes a FRAME temp; the target is in
+         * gfuncs / the capture vector. */
+        if (lv->sym.kind == SymKind::global
+            || lv->sym.kind == SymKind::capture) {
+            const OpCode store_op = lv->sym.kind == SymKind::global
+                                        ? OpCode::StoreGlobalV
+                                        : OpCode::StoreCaptureV;
             if (is_assign) {
                 int rslot;
                 if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
@@ -963,13 +973,13 @@ struct Codegen {
                     return false;
                 }
                 Instr in;
-                in.op = OpCode::StoreGlobalV;
-                in.target = lv->sym.slot;   /* the GlobalFuncTable slot */
+                in.op = store_op;
+                in.target = lv->sym.slot;   /* global-table / capture slot */
                 in.a = slot_op(rslot);      /* aop invalid == plain assign */
                 ops.push_back(in);
                 return true;
             }
-            /* Compound `g OP= rhs`: the rhs is a boxed operand (immediate or a
+            /* Compound `x OP= rhs`: the rhs is a boxed operand (immediate or a
              * slot, like the local CompoundV); a complex rhs falls back. */
             Operand rhs_op;
             if (!boxed_operand(e->rvalue.get(), rhs_op, ops)) {
@@ -978,7 +988,7 @@ struct Codegen {
                 return false;
             }
             Instr in;
-            in.op = OpCode::StoreGlobalV;
+            in.op = store_op;
             in.node = s;               /* loc: compound may throw (div/undef) */
             in.target = lv->sym.slot;
             in.a = rhs_op;
@@ -3075,6 +3085,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::UnpackElemFloat:
         case OpCode::SliceV:
         case OpCode::StoreGlobalV:   /* compound/inc-dec (plain: node null) */
+        case OpCode::StoreCaptureV:
         case OpCode::DictStore:      /* node = the Subscript (its caret) */
         case OpCode::StoreElemValue:
             /* node used ONLY for the caret now (div/mod; the missing-key

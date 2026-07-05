@@ -5463,6 +5463,28 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native closure CAPTURE write (VM StoreCaptureV): a captured var's
+         * plain assign / compound / inc-dec inside a closure body (a counter's
+         * `start++`, an accumulator `s += x`). A capture is always defined, so
+         * no defined check. Differential under -vm. */
+        "Closure capture write native (StoreCaptureV)",
+        {
+            "func mk(s) { return func [s] { s++; return s; }; }",
+            "var c = mk(10);",
+            "assert(c() == 11);",
+            "assert(c() == 12);",
+            "func acc(s) { return func [s] (x) { s += x; return s; }; }",
+            "var a = acc(0);",
+            "assert(a(5) == 5);",
+            "assert(a(3) == 8);",
+            "func dn(s) { return func [s] { s--; return s; }; }",
+            "var d = dn(3);",
+            "assert(d() == 2);",
+            "assert(d() == 1);",
+        },
+    },
+
+    {
         /* native flat-array element inc-dec (VM StoreElemInt/Float with a
          * constant 1 == `a[i] += 1`): `a[i]++` / `a[i]--` on a flat int/float
          * array. The OOB caret is the subscript's. Differential under -vm. */
