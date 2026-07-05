@@ -643,9 +643,19 @@ without func_v stays EvalToSlot. **Excluded (keep func_v == null → fallback):*
 MUTATING builtins (append/push/pop/insert/erase/intptr — need an lvalue arg) and
 AST builtins (defined/type/decltype/typestr/kindstr — need the node). **Still
 TODO in this tier:**
-- **migrate the remaining ~85 read-only builtins** to func_v (mechanical:
-  `RValue(elems[i]->eval)` → `args[i]`, keeping the exprList locs). First batch
-  done: len, str, int, float.
+- **migrate the remaining read-only builtins** to func_v (mechanical:
+  `RValue(elems[i]->eval)` → `args[i]`, keeping the exprList locs; an inner `n`
+  in a body becomes `nargs`). **Done so far (~50):** len/str/int/float; all of
+  num.cpp.h (abs/min/max/round + the std::math wrappers via `float_func`); all
+  of str.cpp.h (split/join/ord/chr/pad/strip/startswith/endswith); all of
+  io.cpp.h (print/write/read/...). **Remaining (~40):** arr.cpp.h
+  (make_array/top/range/sum/reverse/find/sort/map/filter — the callback ones,
+  sort/map/filter/find, need care: the callback arg is a value but the container
+  semantics differ),
+  dict.cpp.h (keys/values/kvpairs/dict/get/get!), generic.cpp.h (clone/hash),
+  reflect.cpp.h (globals/layout/...). **Permanently excluded (func_v stays
+  null):** the mutating builtins (append/push/pop/insert/erase/intptr — need an
+  lvalue arg) and the AST builtins (defined/type/decltype/typestr/kindstr).
 - make-array/dict — see the op list below.
 
 The boxed SCALAR + SUBSCRIPT + MEMBER core is complete: a `dyn`/string
