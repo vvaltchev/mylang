@@ -43,6 +43,53 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 Plus the Part-C native-but-slow work (typed reads, computed-goto dispatch,
 arg-view builtin ABI, ...) — none skipped.
 
+## Remaining work (current — 2026-07-07)
+
+The tracker rows above are kept current (struck as they land). The Part A/B/C
+PROSE further down is the ORIGINAL roadmap and is now STALE for the DONE items:
+P1-P7 + P9 (bool arrays, dict store/read, general store, ALL foreach forms incl.
+struct, strings, slices, multi-assign, closures/func decls, structs) have all
+landed — see the tracker, not the prose. What genuinely REMAINS, most-valuable-
+first:
+
+1. **Builtin ABI holdouts — `sort`/`rev_sort`/`reverse` + `map`/`filter`.** The
+   read-only-builtin migration to the value ABI (`func_v` -> `CallBuiltinV`) is
+   otherwise complete; these five are the principled residue (see
+   `builtin-abi-migration.md`):
+   - `sort`/`rev_sort`/`reverse` take arg0 as an **LValue** (slice write-back +
+     a const-copy on a read-only array) - they need a future **const-capable
+     lvalue ABI**, not the plain value ABI.
+   - `map`/`filter` **validate arg0 (the function) and throw BEFORE evaluating
+     arg1** - the eager value ABI would change that order (pinned by their
+     "validates its function argument first" tests).
+   Benches: 33 (sort), 21 (reverse), 35 (map/filter). Each stays `EvalStmt`.
+
+2. **Free the AST - drop `Instr::node`** (the node-field goal). The AST-free
+   foundations exist (loc side table, const / member-key / struct-def / closure-
+   def pools). The remaining `node` users are: the **builtin call ops**
+   (`CallBuiltinV`/`LV`/`LVElem` + `EmplaceStruct` - they hold the args
+   `ExprList` + the per-arg caret; the **builtin loc-handle refactor** is the
+   step that frees them) and, inherently, the **fallback ops** (`EvalStmt`/
+   `JumpIfFalse` - they hold the node to re-enter `node->eval`). So the field
+   can only come off once (a) the builtin ops migrate to a loc-handle + an
+   AST-free arg source, AND (b) every construct is native (no `EvalStmt`/
+   `JumpIfFalse` left). This is the FINAL structural step.
+
+3. **Exceptions (X / P8) - LAST.** `try`/`catch`/`throw` are `EvalStmt`; every
+   `throw` is a C++ throw (bench 42, 24.5x). Needs VM-level exception dispatch
+   (a handler stack + a pending-exception jump). One bench (~5% geomean) but the
+   stated endgame + the single most-dramatic per-bench win.
+
+4. **Small residual fallbacks** (low value): a dict MEMBER store `d.k=v` (D1m,
+   rare); a GLOBAL/capture dict base; a nested general store `a[i][j]=v`; a
+   `global = <expr with a call>` loop driver (R/P10b, bench 10). Each is a
+   contained op.
+
+5. **Part C - native-but-slow** (independent of fallbacks): computed-goto
+   dispatch (C2, broad 10-20% on dispatch-bound loops), the builtin arg-view ABI
+   (C3), `ModConst` (C4). The typed-read work (C1) largely landed as the typed
+   dict / struct / element read ops.
+
 **⛔ Negative result — foreach (F + D3), attempted P5 and REVERTED.** Built a
 `ForeachBind` op that reuses a factored `foreach_bind_one` to make an array
 foreach (indexed / general single-var; unpack excluded as unsound — its extra
