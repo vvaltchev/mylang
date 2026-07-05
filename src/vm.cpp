@@ -81,6 +81,29 @@ write_float_slot(EvalContext *ctx, int slot, float_type v)
         lv.put(EvalValue(v));
 }
 
+/* Read a BOXED operand as an EvalValue: a slot returns a const ref (no copy);
+ * an immediate materializes into `scratch` (by its lit_kind) and returns a ref
+ * to it - so a boxed op (BinOpV/CmpV/LogV/CompoundV) takes an int/float/bool
+ * immediate directly, with no LoadConstV first. */
+static ML_ALWAYS_INLINE const EvalValue &
+boxed_operand(const Operand &o, EvalContext *ctx, EvalValue &scratch)
+{
+    if (!o.is_lit)
+        return ctx->frame->slots[o.slot].get();
+    switch (o.lit_kind) {
+    case Operand::LitKind::f:
+        scratch = EvalValue(o.flit);
+        break;
+    case Operand::LitKind::b:
+        scratch = EvalValue(static_cast<bool>(o.lit));
+        break;
+    default:
+        scratch = EvalValue(o.lit);
+        break;
+    }
+    return scratch;
+}
+
 /* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
  * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
  * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
@@ -747,9 +770,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * `a + b` never corrupts a) - byte-identical to the tree-walker's
              * eval_first_rvalue().clone() + num_binop_loc chain (int/float
              * promotion, string `+` concat, bitwise). */
-            EvalValue val = ctx.frame->slots[in.a.slot].get().clone();
+            EvalValue sa, sb;
+            EvalValue val = boxed_operand(in.a, &ctx, sa).clone();
             try {
-                num_bin_op(val, ctx.frame->slots[in.b.slot].get(),
+                num_bin_op(val, boxed_operand(in.b, &ctx, sb),
                            binop_pmf(in.aop));
             } catch (Exception &e) {
                 /* Stamp the right-operand loc (in.node) like stamp_operand_loc,
@@ -768,10 +792,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::CompoundV: {
             /* dst OP= b: COPY the lvalue (a container shares its handle, so the
              * op mutates it in place), apply num_bin_op, store back - identical
-             * to doAssign's compound branch. */
+             * to doAssign's compound branch. `b` may be an immediate. */
+            EvalValue sb;
             EvalValue nv = ctx.frame->slots[in.target].get();
             try {
-                num_bin_op(nv, ctx.frame->slots[in.b.slot].get(),
+                num_bin_op(nv, boxed_operand(in.b, &ctx, sb),
                            binop_pmf(in.aop));
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -788,9 +813,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::CmpV: {
             /* dst = (a <cmp> b) as a bool - copy a, num_bin_op with the
              * comparison PMF, store is_true() (= Expr06/Expr07::do_eval). */
-            EvalValue val = ctx.frame->slots[in.a.slot].get();
+            EvalValue sa, sb;
+            EvalValue val = boxed_operand(in.a, &ctx, sa);
             try {
-                num_bin_op(val, ctx.frame->slots[in.b.slot].get(),
+                num_bin_op(val, boxed_operand(in.b, &ctx, sb),
                            cmp_pmf(in.aop));
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -806,9 +832,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::LogV: {
             /* Eager (MyLang &&/|| don't short-circuit at runtime) - both
-             * operands are already computed into slots; combine truthiness. */
-            const bool a = ctx.frame->slots[in.a.slot].get().is_true();
-            const bool b = ctx.frame->slots[in.b.slot].get().is_true();
+             * operands are already computed (a slot or an immediate); combine
+             * truthiness. */
+            EvalValue sa, sb;
+            const bool a = boxed_operand(in.a, &ctx, sa).is_true();
+            const bool b = boxed_operand(in.b, &ctx, sb).is_true();
             ctx.frame->slots[in.target].put(
                 EvalValue(in.aop == Op::land ? (a && b) : (a || b)));
             pc++;

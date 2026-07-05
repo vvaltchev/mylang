@@ -320,10 +320,15 @@ enum class OpCode : unsigned char {
  */
 struct Operand {
     bool is_lit = false;
+    /* When is_lit, which immediate kind is live: an int op (IntBin) always
+     * reads `lit`, a float op (FloatBin) `flit`, so for those it is implied; a
+     * BOXED
+     * op (BinOpV/CmpV/LogV/CompoundV) reads whichever this says and
+     * materializes an EvalValue of that kind - so `r0 - 3`, `f + 1.5`,
+     * `b && true` need no LoadConstV first. `b` (bool) stores 0/1 in `lit`. */
+    enum class LitKind : unsigned char { i, f, b };
+    LitKind lit_kind = LitKind::i;
     int slot = -1;         /* frame slot index when !is_lit */
-    /* The immediate when is_lit. An int op (IntBin) reads `lit`, a float op
-     * (FloatBin) reads `flit`; the two are mutually exclusive, so they share
-     * storage - the operand is written and read as one kind throughout. */
     union {
         int_type lit = 0;
         float_type flit;

@@ -26,17 +26,20 @@ std::string reg(const Chunk &ch, int slot)
 }
 
 /* An operand as "smart assembly": a register (named or `rN`) or an immediate
- * `#N`. */
-std::string reg_or_imm(const Chunk &ch, const Operand &o, bool is_float)
+ * `#N`. The immediate is rendered by its lit_kind (int / float / bool), so a
+ * boxed op's `#3` / `#1.5` / `#true` prints correctly. (`is_float` is now
+ * subsumed by lit_kind, kept only for call-site compatibility.) */
+std::string reg_or_imm(const Chunk &ch, const Operand &o, bool /*is_float*/)
 {
     if (!o.is_lit)
         return reg(ch, o.slot);
     std::ostringstream s;
     s << "#";
-    if (is_float)
-        s << o.flit;
-    else
-        s << o.lit;
+    switch (o.lit_kind) {
+    case Operand::LitKind::f: s << o.flit; break;
+    case Operand::LitKind::b: s << (o.lit ? "true" : "false"); break;
+    default:                  s << o.lit; break;
+    }
     return s.str();
 }
 

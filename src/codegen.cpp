@@ -109,7 +109,17 @@ Operand int_lit(int_type v)
 {
     Operand o;
     o.is_lit = true;
+    o.lit_kind = Operand::LitKind::i;
     o.lit = v;
+    return o;
+}
+
+Operand bool_lit(bool v)
+{
+    Operand o;
+    o.is_lit = true;
+    o.lit_kind = Operand::LitKind::b;
+    o.lit = v ? 1 : 0;
     return o;
 }
 
@@ -146,6 +156,7 @@ Operand float_lit(float_type v)
 {
     Operand o;
     o.is_lit = true;
+    o.lit_kind = Operand::LitKind::f;
     o.flit = v;
     return o;
 }
@@ -574,12 +585,12 @@ struct Codegen {
             if (!ok)
                 return false;
         }
-        int acc;
-        if (!compile_boxed_expr(elems[0].second.get(), acc, ops))
+        Operand acc_op;
+        if (!boxed_operand(elems[0].second.get(), acc_op, ops))
             return false;
         for (size_t i = 1; i < elems.size(); i++) {
-            int rhs;
-            if (!compile_boxed_expr(elems[i].second.get(), rhs, ops))
+            Operand rhs_op;
+            if (!boxed_operand(elems[i].second.get(), rhs_op, ops))
                 return false;
             const int t = alloc_temp();
             Instr in;
@@ -588,13 +599,41 @@ struct Codegen {
                              : OpCode::LogV;
             in.node = k == 'l' ? node : elems[i].second.get();
             in.target = t;
-            in.a = slot_op(acc);
-            in.b = slot_op(rhs);
+            in.a = acc_op;
+            in.b = rhs_op;
             in.aop = elems[i].first;
             ops.push_back(in);
-            acc = t;
+            acc_op = slot_op(t);   /* the result temp feeds the next op */
         }
-        out_slot = acc;
+        out_slot = acc_op.slot;
+        return true;
+    }
+
+    /*
+     * A boxed operand: an int/float/bool LITERAL becomes an IMMEDIATE operand
+     * (no LoadConstV - a boxed op materializes it, like a CPU immediate); any
+     * other expression compiles to a slot. Returns false if a non-literal can't
+     * lower.
+     */
+    bool boxed_operand(const Construct *e, Operand &out,
+                       std::vector<Instr> &ops)
+    {
+        if (auto *li = dynamic_cast<const LiteralInt *>(e)) {
+            out = int_lit(li->ival());
+            return true;
+        }
+        if (auto *lf = dynamic_cast<const LiteralFloat *>(e)) {
+            out = float_lit(lf->fval());
+            return true;
+        }
+        if (auto *lb = dynamic_cast<const LiteralBool *>(e)) {
+            out = bool_lit(lb->bval());
+            return true;
+        }
+        int slot;
+        if (!compile_boxed_expr(e, slot, ops))
+            return false;
+        out = slot_op(slot);
         return true;
     }
 
@@ -633,23 +672,32 @@ struct Codegen {
 
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();
+
+        /* Compound-assign `lv OP= rhs` -> a boxed read-modify-write; the rhs
+         * can be an IMMEDIATE (`s += 3` needs no LoadConstV first). */
+        if (!is_assign) {
+            Operand rhs_op;
+            if (!boxed_operand(e->rvalue.get(), rhs_op, ops)) {
+                ops.resize(omark);
+                chunk.consts.resize(cmark);
+                return false;
+            }
+            Instr in;
+            in.op = OpCode::CompoundV;
+            in.node = s;
+            in.target = lv->sym.slot;
+            in.b = rhs_op;
+            in.aop = cbase;
+            ops.push_back(in);
+            return true;
+        }
+
+        /* Plain assign: compile the rvalue, then retarget/move it. */
         int rslot;
         if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             return false;
-        }
-
-        /* Compound-assign `lv OP= rhs` -> a boxed read-modify-write. */
-        if (!is_assign) {
-            Instr in;
-            in.op = OpCode::CompoundV;
-            in.node = s;
-            in.target = lv->sym.slot;
-            in.b = slot_op(rslot);
-            in.aop = cbase;
-            ops.push_back(in);
-            return true;
         }
 
         if (rslot != lv->sym.slot) {
