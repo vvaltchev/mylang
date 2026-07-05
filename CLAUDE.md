@@ -2992,6 +2992,35 @@ instrumentation (see `plans/function-templates.md`).
   reality. Multi-compiler / multi-platform CI exists precisely to expose UB and
   logical-identity bugs the dev allocator hides — lean into it.
 
+- **MyLang is single-threaded — there is NO "I can't reproduce this bug."** No
+  threads, no races, no timing nondeterminism. A failure is a pure function of
+  (source commit, build config, inputs), plus at most ASLR — and ASLR only
+  shifts a memory bug's *manifestation*, never its *existence*; ASan / valgrind
+  are deterministic. So "I couldn't reproduce it" is NEVER an acceptable
+  stopping point — it means you have not yet matched one of those inputs. In
+  practice the miss is almost always **the commit**: build the failing CI run's
+  EXACT `headSha` (a rebase diverges SHA *and* code, so a local same-named
+  commit may already contain the fix) with the SAME config (RECYCLE+ASan for a
+  RECYCLE-lane failure — plain ASan can miss an AST-node UAF), and it
+  reproduces. Keep going until it does.
+
+- **On a CI failure, read the logs of ALL failing jobs — never sample.** Do NOT
+  look at one job, form a theory, and stop. Pull every failing lane's full log
+  (`gh run view <id> --log-failed`) and read it — different lanes fail
+  DIFFERENTLY and one of them usually hands you the answer. A real case: several
+  lanes showed only a bare `Segmentation fault`, but ONE lane (the RECYCLE/ASan
+  job) carried a complete AddressSanitizer use-after-free backtrace pinpointing
+  the bug — and sampling the wrong lane turned a five-minute fix into a long,
+  wrong "unreproducible heisenbug" hunt. Grep the FULL log for
+  `AddressSanitizer`/`runtime error`/`Assertion`/backtrace frames, per job.
+
+- **DO NOT BE LAZY. Do all the work, check everything, do not give up.** Every
+  failing lane, every log, the exact SHA, the actual reproduction — not a
+  plausible-sounding shortcut. Sampling one artifact, guessing from a partial
+  read, declaring a deterministic bug "unreproducible", or handing back a theory
+  instead of a proven root cause are all failures of diligence, not of skill.
+  When the evidence and a convenient conclusion disagree, chase the evidence.
+
 - **Never key a long-lived map by a raw AST-node pointer.** A `Construct *` is
   NOT a stable identity: the allocator recycles a freed node's *address*, so a
   map that outlives the node (e.g. across REPL inputs) can match a stale entry
