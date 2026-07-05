@@ -3160,13 +3160,20 @@ handed arg0's slot `LValue*` by the VM's `CallBuiltinLV`), sharing a
 `sort_core`/`reverse_core` so both engines behave identically and a const-array
 sort still folds at parse time. They're now in `is_lvalue_arg_builtin` (so the
 VM devirtualizes to `CallBuiltinLV`, and AutoConst/the specializer correctly
-treat arg0 as a write position — no unsound const substitution into a sort). The
-residual old-ABI (`func`, `EvalToSlot`) floor is now exactly two principled
-groups — **AST builtins** (`defined`/`isconst`/`isconstdecl`/`type`/`decltype`/
-`typestr`/`kindstr`/`show`: unevaluated / node-property operand) and
-**`map`/`filter`** (validate arg0 the function and throw BEFORE evaluating arg1,
-which the eager value ABI would change — pinned by their "validates its function
-argument first" tests).
+treat arg0 as a write position — no unsound const substitution into a sort).
+**`map`/`filter`** — which must validate arg0 (the function) and throw BEFORE
+evaluating arg1 (a TESTED order the eager value ABI would break) — go native via
+a two-op sequence in **`compile_boxed_expr`** (`try_native_map_filter`): compile
+arg0 into a temp, **`CheckFuncV`** (throws with arg0's caret if it isn't a
+function, BEFORE arg1's code runs), compile arg1, **`MapFilterV`** (calls the
+shared **`vm_map_filter`** in generic.cpp.h, declared in eval.h — map builds a
+fresh array, filter keeps truthy elements; array→array, dict→dict — the SAME
+core the tree-walker's `builtin_map`/`builtin_filter` now call). The
+devirtualize pass sets `DirectBuiltinCallExpr::map_filter_kind` from the callee
+name. So the residual old-ABI (`func`, `EvalToSlot`) floor is now exactly ONE
+principled group — the **AST builtins** (`defined`/`isconst`/`isconstdecl`/
+`type`/`decltype`/`typestr`/`kindstr`/`show`: an unevaluated / node-property
+operand, inherently node-based).
 **A SUBSCRIPT lvalue target `append/push/pop(a[i], d[k])` goes native too
 (Phase 2c, `CallBuiltinLVElem`)**: the codegen compiles the index and records
 the base slot; the handler forms the element `LValue*` by calling the runtime

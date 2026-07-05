@@ -4187,6 +4187,8 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                 d->lvalue_arg0 = is_lvalue_arg_builtin(id->get_str());
                 d->lvalue_rest_native =
                     is_lvalue_rest_native_builtin(id->get_str());
+                d->map_filter_kind = id->get_str() == "map"    ? 1
+                                   : id->get_str() == "filter" ? 2 : 0;
                 d->what = move(call->what);
                 d->args = move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();

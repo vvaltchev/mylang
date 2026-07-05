@@ -840,6 +840,11 @@ public:
      * and passes it as `rest`. A self-eval one (append/push/pop/intptr) leaves
      * this false and reads its args off the node. Needs lvalue_arg0. */
     bool lvalue_rest_native = false;
+    /* 0 = not map/filter; 1 = map; 2 = filter. Set by the devirtualize pass
+     * from the callee name, so the codegen can emit the validate-first
+     * CheckFuncV + MapFilterV sequence (map/filter must validate arg0 before
+     * evaluating arg1, so they can't take the eager value ABI). */
+    int map_filter_kind = 0;
 
     DirectBuiltinCallExpr() : CallExpr("DirectBuiltinCallExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -852,6 +857,7 @@ public:
         c->builtin = builtin;
         c->lvalue_arg0 = lvalue_arg0;
         c->lvalue_rest_native = lvalue_rest_native;
+        c->map_filter_kind = map_filter_kind;
         return c;
     }
 };

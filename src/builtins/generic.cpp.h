@@ -394,6 +394,75 @@ EvalValue builtin_hash(EvalContext *ctx, ExprList *exprList,
  * UndefinedVariableEx on arg1). Pinned by "map()/filter() validates its
  * function argument first". Stay on the old ABI (self-eval, order-controlled).
  */
+/*
+ * VM (MapFilterV) + tree-walker (builtin_map/filter) SHARED core: apply
+ * `func_val` (a FuncObject, validated by the caller) to each element of
+ * `container` - map builds a fresh array from every result; filter keeps the
+ * elements whose result is truthy (an array from an array, a dict from a dict).
+ * The caller validates arg0 BEFORE evaluating the container (builtin_map/filter
+ * in the tree-walker; CheckFuncV in the VM), preserving that order.
+ * `cstart`/`cend` = the container arg's caret. Defined here (arr_elem_at's TU),
+ * declared in eval.h so the VM's MapFilterV handler can call it.
+ */
+EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
+                        const EvalValue &container, bool is_filter,
+                        Loc cstart, Loc cend)
+{
+    FuncObject &funcObj = *func_val.get<intrusive_ptr<FuncObject>>().get();
+
+    if (container.is<SharedArrayObj>()) {
+
+        /* Read element-by-element WITHOUT promoting flat storage (arr_elem_at);
+         * build a fresh array. */
+        const SharedArrayObj &arr = container.get<SharedArrayObj>();
+        const size_type n = arr.size();
+        SharedArrayObj::vec_type result;
+
+        for (size_type i = 0; i < n; i++) {
+            const EvalValue e = arr_elem_at(arr, i);
+            if (!is_filter)
+                result.emplace_back(eval_func(ctx, funcObj, e),
+                                    ctx->const_ctx);
+            else if (eval_func(ctx, funcObj, e).is_true())
+                result.emplace_back(e, ctx->const_ctx);
+        }
+
+        return SharedArrayObj(move(result));
+
+    } else if (container.is<intrusive_ptr<DictObject>>()) {
+
+        const DictObject::inner_type &data =
+            container.get<intrusive_ptr<DictObject>>()->get_ref();
+
+        if (!is_filter) {
+
+            SharedArrayObj::vec_type result;
+            for (auto const &e : data)
+                result.emplace_back(
+                    eval_func(ctx, funcObj,
+                              make_pair(e.first, e.second.get())),
+                    ctx->const_ctx);
+            return SharedArrayObj(move(result));
+        }
+
+        DictObject::inner_type result;
+        for (auto const &e : data)
+            if (eval_func(ctx, funcObj,
+                          make_pair(e.first, e.second.get())).is_true())
+                result.insert(e);
+        return make_intrusive<DictObject>(move(result));
+    }
+
+    throw TypeErrorEx(is_filter ? "Unsupported container type for filter()"
+                                : "Unsupported container type for map()",
+                      cstart, cend);
+}
+
+/* map/filter validate arg0 (the function) BEFORE evaluating arg1 (the
+ * container) - a TESTED order (`map(5, undefined_var)` is a type error on the
+ * 5, not undefined-var on arg1), so they stay on the `func` ABI (the eager
+ * value ABI would evaluate arg1 first). The VM preserves the order with a
+ * CheckFuncV between arg0 and arg1; both engines then share vm_map_filter. */
 EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 2)
@@ -401,53 +470,14 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue val0 = RValue(arg0->eval(ctx));
 
     if (!val0.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
 
-    const EvalValue &val1 = RValue(arg1->eval(ctx));
-    FuncObject &funcObj = *val0.get<intrusive_ptr<FuncObject>>().get();
-    SharedArrayObj::vec_type result;
-
-    if (val1.is<SharedArrayObj>()) {
-
-        /* Read the input element-by-element WITHOUT promoting flat storage
-         * (arr_elem_at). map() builds a fresh array - not a promotion. */
-        const SharedArrayObj &arr = val1.get<SharedArrayObj>();
-        const size_type n = arr.size();
-
-        for (size_type i = 0; i < n; i++) {
-
-            result.emplace_back(
-                eval_func(ctx, funcObj, arr_elem_at(arr, i)),
-                ctx->const_ctx
-            );
-        }
-
-    } else if (val1.is<intrusive_ptr<DictObject>>()) {
-
-        const DictObject::inner_type &data
-            = val1.get<intrusive_ptr<DictObject>>()->get_ref();
-
-        for (auto const &e : data) {
-
-            result.emplace_back(
-                eval_func(ctx, funcObj, make_pair(e.first, e.second.get())),
-                ctx->const_ctx
-            );
-        }
-
-    } else {
-
-        throw TypeErrorEx(
-            "Unsupported container type for map()",
-            arg1->start,
-            arg1->end
-        );
-    }
-
-    return SharedArrayObj(move(result));
+    const EvalValue val1 = RValue(arg1->eval(ctx));
+    return vm_map_filter(ctx, val0, val1, /*is_filter=*/false,
+                         arg1->start, arg1->end);
 }
 
 EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
@@ -457,50 +487,12 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &val0 = RValue(arg0->eval(ctx));
+    const EvalValue val0 = RValue(arg0->eval(ctx));
 
     if (!val0.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected function", arg0->start, arg0->end);
 
-    const EvalValue &val1 = RValue(arg1->eval(ctx));
-    FuncObject &funcObj = *val0.get<intrusive_ptr<FuncObject>>().get();
-
-    if (val1.is<SharedArrayObj>()) {
-
-        /* Read input without promoting flat storage; build a fresh array. */
-        const SharedArrayObj &arr = val1.get<SharedArrayObj>();
-        const size_type n = arr.size();
-        SharedArrayObj::vec_type result;
-
-        for (size_type i = 0; i < n; i++) {
-
-            const EvalValue e = arr_elem_at(arr, i);
-            if (eval_func(ctx, funcObj, e).is_true())
-                result.emplace_back(e, ctx->const_ctx);
-        }
-
-        return SharedArrayObj(move(result));
-
-    } else if (val1.is<intrusive_ptr<DictObject>>()) {
-
-        const DictObject::inner_type &data
-            = val1.get<intrusive_ptr<DictObject>>()->get_ref();
-
-        DictObject::inner_type result;
-
-        for (auto const &e : data) {
-            if (eval_func(ctx, funcObj, make_pair(e.first, e.second.get())).is_true())
-                result.insert(e);
-        }
-
-        return make_intrusive<DictObject>(move(result));
-
-    } else {
-
-        throw TypeErrorEx(
-            "Unsupported container type for filter()",
-            arg1->start,
-            arg1->end
-        );
-    }
+    const EvalValue val1 = RValue(arg1->eval(ctx));
+    return vm_map_filter(ctx, val0, val1, /*is_filter=*/true,
+                         arg1->start, arg1->end);
 }

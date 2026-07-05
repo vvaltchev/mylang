@@ -58,11 +58,14 @@ first:
    the tree-walker + `func_lv` for the VM's `CallBuiltinLV`; added to
    `is_lvalue_arg_builtin`). `sort(a)`/`reverse(a)` are `call.blt.lv` now;
    `21_array_reverse`'s reverse-in-a-loop goes native. See
-   `builtin-abi-migration.md`. Only **`map`/`filter`** remain: they **validate
-   arg0 (the function) and throw BEFORE evaluating arg1** — the eager value ABI
-   reorders that (pinned by the "validates its function arg first" tests).
-   A native map/filter needs an op that evaluates+validates arg0, THEN arg1.
-   Bench 35.
+   `builtin-abi-migration.md`. ~~`map`/`filter`~~ **DONE** (2026-07-08): they
+   **validate arg0 before evaluating arg1** (the eager value ABI reorders that),
+   so they stay `func` for the tree-walker but the VM lowers them natively as a
+   `CheckFuncV` (validate arg0, throw before arg1's code) + a `MapFilterV`
+   calling the shared `vm_map_filter` core. 35_map_filter is now 0 fallbacks.
+   The builtin floor is now ONLY the inherently-node-based AST builtins
+   (`defined`/`isconst`/`type`/`show`/...), freed later by the AST-free builtin
+   loc handle (`vm-ast-free.md` Steps 1-3).
 
    **AUDIT CORRECTION (2026-07-08):** the earlier per-bench `-vd` fallback
    counts were INFLATED by **dead template bodies** — a `func f` whose calls all

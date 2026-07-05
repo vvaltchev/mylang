@@ -357,6 +357,12 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
                              Loc lstart, Loc lend);
 
+/* VM (MapFilterV) + tree-walker shared map/filter core: apply a (pre-validated)
+ * function to each element of a container. See eval.cpp. */
+EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
+                        const EvalValue &container, bool is_filter,
+                        Loc cstart, Loc cend);
+
 /* VM LoadStructFieldInt/Float: read scalar field #fidx of element `idx` of a
  * flat array<PodStruct> directly from the bytes (the struct-foreach direct
  * read). No bounds/type checks - the codegen proved them. See eval.cpp. */

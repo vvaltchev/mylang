@@ -1296,6 +1296,26 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CheckFuncV:
+            /* map/filter's arg0 guard: throw (arg0's caret) if it isn't a
+             * function, BEFORE arg1's code runs - the tree-walker's order. */
+            if (!ctx.frame->at(in.a.slot).get()
+                     .is<intrusive_ptr<FuncObject>>())
+                throw TypeErrorEx("Expected function",
+                                  in.node->start, in.node->end);
+            pc++;
+            break;
+
+        case OpCode::MapFilterV:
+            /* map/filter over the pre-validated function + the container. */
+            ctx.frame->at(in.target).put(
+                vm_map_filter(&ctx, ctx.frame->at(in.a.slot).get(),
+                              ctx.frame->at(in.b.slot).get(),
+                              in.target2 != 0,
+                              in.node->start, in.node->end));
+            pc++;
+            break;
+
         case OpCode::ReturnV:
             /* `return <expr>`: the value is already in a.slot (a bare return
              * loaded `none`). Set flow and STOP the chunk, as an

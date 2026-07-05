@@ -816,11 +816,15 @@ struct Codegen {
             if (try_native_call(dc, out_slot, ops))
                 return true;
 
-        /* A native builtin call (value ABI) -> CallBuiltinV. */
+        /* A native builtin call. map/filter get the validate-first sequence
+         * (CheckFuncV + MapFilterV); value-ABI builtins get CallBuiltinV. */
         if (const DirectBuiltinCallExpr *bc =
-                dynamic_cast<const DirectBuiltinCallExpr *>(e))
+                dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
+            if (try_native_map_filter(bc, out_slot, ops))
+                return true;
             if (try_native_builtin(bc, out_slot, ops))
                 return true;
+        }
 
         /* An indirect call of a func VALUE (a closure / lambda / func var):
          * a plain CallExpr whose callee is Func-typed -> CallValueV. */
@@ -1495,6 +1499,56 @@ struct Codegen {
         cv.a = int_lit(argbase);
         cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
         ops.push_back(cv);
+        out_slot = dst;
+        return true;
+    }
+
+    /* map(f, c) / filter(f, c): the validate-first sequence - compile arg0 (the
+     * function) into t0, CheckFuncV(t0) (throws BEFORE arg1 is evaluated if it
+     * is not a function, the tree-walker's tested order), compile arg1 (the
+     * container) into t1, then MapFilterV(dst, t0, t1). Both are read-only, so
+     * this is an EXPRESSION-position lowering (compile_boxed_expr). */
+    bool try_native_map_filter(const DirectBuiltinCallExpr *dc, int &out_slot,
+                               std::vector<Instr> &ops)
+    {
+        if (dc->map_filter_kind == 0 || !dc->args
+            || dc->args->elems.size() != 2)
+            return false;
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+
+        int t0;
+        if (!compile_boxed_expr(dc->args->elems[0].get(), t0, ops)) {
+            ops.resize(omark);
+            next_temp = save_top;
+            chunk.consts.resize(cmark);
+            return false;
+        }
+        Instr chk;
+        chk.op = OpCode::CheckFuncV;
+        chk.node = dc->args->elems[0].get();   /* arg0's caret */
+        chk.a = slot_op(t0);
+        ops.push_back(chk);
+
+        int t1;
+        if (!compile_boxed_expr(dc->args->elems[1].get(), t1, ops)) {
+            ops.resize(omark);
+            next_temp = save_top;
+            chunk.consts.resize(cmark);
+            return false;
+        }
+
+        const int dst = alloc_temp();
+        Instr in;
+        in.op = OpCode::MapFilterV;
+        in.node = dc->args->elems[1].get();    /* arg1's caret (container) */
+        in.target = dst;
+        in.target2 = dc->map_filter_kind == 2 ? 1 : 0;   /* is_filter */
+        in.a = slot_op(t0);
+        in.b = slot_op(t1);
+        ops.push_back(in);
         out_slot = dst;
         return true;
     }

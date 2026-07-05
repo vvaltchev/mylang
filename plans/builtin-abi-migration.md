@@ -27,19 +27,26 @@ builtin_x>("x")` (or `make_builtin_v` for a runtime builtin). A callback arg
 strictly SAFER than the old self-eval-temporary lifetime.
 
 ## MUST stay on `func` (do NOT migrate) — the documented floor
-TWO reasons a read-only builtin can't take the value ABI (a third,
-lvalue-arg0, was RESOLVED — see below):
+ONE reason a read-only builtin can't take the value ABI (the other two -
+lvalue-arg0 and map/filter's order-dependence - were RESOLVED, see below):
 - **Unevaluated / node-property operand:** `defined` (must not eval an undefined
   name), `isconst`/`isconstdecl` (read the *node's* compile-time `is_const`, not
   the value), `type`/`decltype`/`typestr`/`kindstr` (unevaluated operand, C++
-  `decltype`-style), `show` (renders the arg's optimized tree).
-- **Order-dependent validation (lazy arg eval):** `map`/`filter` validate arg0
-  (the function) and throw `TypeErrorEx` BEFORE evaluating arg1 (the container),
-  so `map(5, undefined_var)` is a type error on the `5`, not
-  `UndefinedVariableEx` on arg1. The eager value ABI evaluates arg1 first and
-  changes the error. Pinned by "map()/filter() validates its function argument
-  first". (The eager-eval error-order shift is otherwise ACCEPTED for the
-  migrated builtins — only these two have a *tested* ordering contract.)
+  `decltype`-style), `show` (renders the arg's optimized tree). Inherently
+  node-based - the FLOOR, freed only by the AST-free builtin loc handle
+  (`vm-ast-free.md` Steps 1-3) which keeps them node-referencing but AST-free.
+
+**Order-dependent (map/filter) — RESOLVED (2026-07-08), still on `func`.** They
+validate arg0 (the function) and throw `TypeErrorEx` BEFORE evaluating arg1, so
+`map(5, undefined_var)` is a type error on the `5`, not `UndefinedVariableEx` on
+arg1 (pinned by "map()/filter() validates its function argument first"). The
+eager value ABI (`func_v`) would evaluate arg1 first, so they KEEP `func` for
+the tree-walker - but the VM lowers them natively WITHOUT that ABI: a
+**`CheckFuncV`** (validate arg0, throw before arg1's code runs) + a
+**`MapFilterV`** calling the shared **`vm_map_filter`** core (generic.cpp.h,
+declared in eval.h; the SAME core `builtin_map`/`builtin_filter` now call).
+`DirectBuiltinCallExpr::map_filter_kind` (set in devirtualize) drives the
+codegen. So they are no longer a `-vm` fallback.
 
 ## To migrate (read-only), by file — perf-hot first
 The bench laggards are builtin-dense (`40_math_builtins` was already migrated in

@@ -336,6 +336,28 @@ enum class OpCode : unsigned char {
     CallValueV,
 
     /*
+     * map()/filter() validate arg0 (the function) BEFORE evaluating arg1 (the
+     * container) - a TESTED order the eager value ABI would break. So the VM
+     * emits, in eval order: [compile arg0 -> t0], CheckFuncV(t0), [compile arg1
+     * -> t1], MapFilterV(dst, t0, t1). CheckFuncV throws before arg1's code
+     * runs, exactly like the tree-walker.
+     *
+     * CheckFuncV: `a` = the slot holding arg0's value; throws TypeErrorEx
+     * ("Expected function") via `node` (arg0's caret) if it is not a
+     * FuncObject. No dst - a pure guard.
+     */
+    CheckFuncV,
+
+    /*
+     * MapFilterV: `target` = dst; `a` = the (already CheckFuncV'd) function
+     * slot; `b` = the container slot; `target2` = is_filter (0 = map, 1 =
+     * filter). Calls the shared vm_map_filter (generic.cpp.h) - map builds a
+     * fresh array, filter keeps truthy elements (array->array, dict->dict).
+     * `node` = arg1 (the unsupported-container caret).
+     */
+    MapFilterV,
+
+    /*
      * Native `return <expr>;` (no node->eval of the return): `a` = the slot
      * holding the already-evaluated return value (a bare `return;` loads `none`
      * into it first). Sets ctx->flow to {ret, value} and STOPS the chunk
