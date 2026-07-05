@@ -10453,7 +10453,7 @@ static bool frame_over_64_slots()
  */
 struct VmOpCounts {
     size_t jif = 0, jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
-    size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0;
+    size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0, arrlen = 0;
     size_t storei = 0, storef = 0, loadev = 0, evalslot = 0, evalstmt = 0;
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
@@ -10494,6 +10494,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::JumpUnlessFloatCmp: c.jufc++; break;
             case OpCode::ForLoopStep:      c.flstep++; break;
             case OpCode::LoadElemInt:      c.loadei++; break;
+            case OpCode::ArrLen:           c.arrlen++; break;
             case OpCode::LoadElemFloat:    c.loadef++; break;
             case OpCode::StoreElemInt:     c.storei++; break;
             case OpCode::StoreElemFloat:   c.storef++; break;
@@ -10859,6 +10860,20 @@ static bool vm_codegen_shapes()
         return false;
     const bool boxed_member_ok = bxm.memberv == 1;
 
+    /* 26) a native foreach over a flat int array: the counted loop reads the
+     * length once (ArrLen), each element via LoadElemInt, and advances with the
+     * fused ForLoopStep - no EvalStmt for the loop itself (the `s = s + x` body
+     * is a native IntBin). */
+    VmOpCounts fe;
+    if (!codegen_counts({
+            "var a = [1, 2, 3];",
+            "var s = 0;",
+            "foreach (var x in a) s = s + x;",
+        }, fe))
+        return false;
+    const bool foreach_ok = fe.arrlen == 1 && fe.loadei == 1
+        && fe.flstep == 1 && fe.intbin >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -10866,7 +10881,8 @@ static bool vm_codegen_shapes()
         && builtin_dispatch_ok && array_build_ok && general_for_ok
         && break_cont_ok && compound_cond_ok && boxed_ok
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
-        && boxed_global_ok && boxed_subscript_ok && boxed_member_ok;
+        && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
+        && foreach_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

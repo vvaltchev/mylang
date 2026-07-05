@@ -1376,6 +1376,25 @@ void Inferencer::annotate_hints(Construct *n)
         sub->base_array = bt->kind == StaticTypeKind::Array;
     }
 
+    /* Native-foreach hint: a single, non-indexed loop var over a flat
+     * array<int>/array<float>. Only then may the VM iterate it as a counted
+     * loop with a direct element load (a dict / string / general / tuple /
+     * indexed foreach stays the tree-walker fallback). The loop var's own `th`
+     * is NOT enough - a single var over a dict binds the KEY (also int), so the
+     * container kind must be checked here where the static type is known. */
+    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+        if (!fe->indexed && fe->ids && fe->ids->elems.size() == 1) {
+            StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
+            if (c->kind == StaticTypeKind::Array) {
+                StaticTypeRef el = static_type_resolve(c->elem);
+                if (!el->opt && el->kind == StaticTypeKind::Int)
+                    fe->elem_th = TypeHint::i;
+                else if (!el->opt && el->kind == StaticTypeKind::Float)
+                    fe->elem_th = TypeHint::f;
+            }
+        }
+    }
+
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });
 }
 

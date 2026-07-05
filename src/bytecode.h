@@ -104,6 +104,14 @@ enum class OpCode : unsigned char {
     LoadElemFloat,
 
     /*
+     * Array length into an int slot: slot[target] = size(slot[target2]). The
+     * native-foreach loop bound over a flat array, evaluated once. `target2`
+     * holds a flat array (guaranteed by ForeachStmt::elem_th), so it reads
+     * SharedArrayObj::size() directly.
+     */
+    ArrLen,
+
+    /*
      * Native array-VALUE-element read `a[i]` into a temp slot (Phase 5, for a
      * nested subscript `a[i][j]`): `target2` = the (general) array slot, `a` =
      * the int index, `target` = the dst temp; `node` = the Subscript. Reads the

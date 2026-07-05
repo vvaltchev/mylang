@@ -144,6 +144,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "load.elem.v  r" << in.target << " = r" << in.target2
                 << "[" << reg_or_imm(in.a, false) << "]  (array elem)";
             break;
+        case OpCode::ArrLen:
+            row << "arr.len      r" << in.target << " = len(r"
+                << in.target2 << ")";
+            break;
         case OpCode::StoreElemInt:
             row << "store.elem.i r" << in.target2 << "["
                 << reg_or_imm(in.a, false) << "] " << store_op(in.aop) << " "

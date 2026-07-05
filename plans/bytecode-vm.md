@@ -575,8 +575,18 @@ general-array / string element via the runtime Type::subscript, RValue'd; nested
 commit 974a837 — done with the prerequisite refactor: the value-read path of the
 110-line MemberExpr::do_eval is now a shared `member_read(base, MemberExpr*)`
 that the tree-walker AND the VM use; the LValue*/auto-vivify WRITE paths stay in
-do_eval; behavior byte-preserved). **Still TODO in this tier:**
-call / make-array/dict / foreach — see the op list below. The boxed SCALAR +
+do_eval; behavior byte-preserved). **`foreach` over a flat int/float array**
+(single, non-indexed loop var) now goes native too: the inferencer stamps
+`ForeachStmt::elem_th` ONLY for that sound case (a single var over a dict binds
+the KEY, also int, so the loop var's own `th` is not enough — the container kind
+is checked where the static type is known), and `try_native_foreach` lowers it
+to a counted loop — snapshot the container once, `n = ArrLen` (a new op),
+`x = c[i]` via the existing `LoadElemInt/Float`, the native body, and the FUSED
+`ForLoopStep` back-edge (the unfused compare+i++/jump was perf-NEUTRAL vs the
+tree-walker's already-excellent flat-int foreach; the fused step is −64%
+instructions). Dict / string / general / tuple / indexed / non-local-array
+foreach stay the tree-walker fallback. **Still TODO in this tier:**
+call / make-array/dict — see the op list below. The boxed SCALAR +
 SUBSCRIPT + MEMBER core is complete: a `dyn`/string expression over
 locals/globals/captures/builtins/literals/subscripts/members, with
 assign/compound/comparison/logical, runs with no `node->eval`.

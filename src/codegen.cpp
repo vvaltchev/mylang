@@ -1159,6 +1159,12 @@ struct Codegen {
                     any_native = true;
                     continue;
                 }
+            } else if (const ForeachStmt *fe =
+                           dynamic_cast<const ForeachStmt *>(s)) {
+                if (try_native_foreach(fe)) {
+                    any_native = true;
+                    continue;
+                }
             }
 
             chunk.code.resize(mark);
@@ -1467,6 +1473,113 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * Native foreach over a flat int/float array with a single, non-indexed
+     * loop var (ForeachStmt::elem_th, set by the inferencer - the only sound
+     * case; a dict / string / general / tuple / indexed foreach stays the
+     * tree-walker fallback). Lowered as a counted loop: snapshot the container
+     * once, n = its length, then each step does `x = c[i]` (a direct flat
+     * element load into the loop var) + the native body + i++. break / continue
+     * / return use the same FlowState + loop backpatching as try_native_for.
+     */
+    bool try_native_foreach(const ForeachStmt *fe)
+    {
+        if (fe->elem_th != TypeHint::i && fe->elem_th != TypeHint::f)
+            return false;
+
+        const Identifier *id =
+            dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+        if (!id || id->sym.kind != SymKind::local)
+            return false;
+        const int x_slot = id->sym.slot;
+
+        const size_t start = chunk.code.size();
+        reset_temps();
+
+        /* Snapshot the container into a temp: the tree-walker evals it ONCE
+         * before the loop, so a body reassignment of the container var must not
+         * change what we iterate. */
+        int csrc;
+        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
+            chunk.code.resize(start);
+            return false;
+        }
+        const int c = alloc_temp();
+        Instr mv;
+        mv.op = OpCode::MoveV;
+        mv.target = c;
+        mv.target2 = csrc;
+        chunk.code.push_back(mv);
+
+        const int n = alloc_temp();
+        Instr ln;
+        ln.op = OpCode::ArrLen;
+        ln.node = fe->container.get();
+        ln.target = n;
+        ln.target2 = c;
+        chunk.code.push_back(ln);
+
+        const int i = alloc_temp();
+        Instr z;
+        z.op = OpCode::LoadImmInt;
+        z.target = i;
+        z.a = int_lit(0);
+        chunk.code.push_back(z);
+
+        /* Reserve c/n/i for the whole loop - a body statement's reset_temps()
+         * must not reuse their slots. */
+        const int saved_base = temp_base;
+        temp_base = next_temp;
+
+        /* Initial test: skip the loop entirely for an empty array. */
+        const size_t jt = emit_cmp(OpCode::JumpUnlessIntCmp,
+                                   fe->container.get(), Op::lt,
+                                   slot_op(i), slot_op(n));
+
+        const int lbody = here();
+
+        /* x = c[i] : a direct flat int/float element load into the loop var,
+         * re-run at the top of every iteration (the ForLoopStep re-enters
+         * here). */
+        Instr ld;
+        ld.op = fe->elem_th == TypeHint::i ? OpCode::LoadElemInt
+                                           : OpCode::LoadElemFloat;
+        ld.node = fe->container.get();
+        ld.target = x_slot;
+        ld.target2 = c;
+        ld.a = slot_op(i);
+        chunk.code.push_back(ld);
+
+        loops.push_back({});
+        if (!compile_scalar_body(body_stmts(fe->body.get()))) {
+            loops.pop_back();
+            temp_base = saved_base;
+            chunk.code.resize(start);
+            return false;
+        }
+
+        const int lcont = here();   /* continue -> the fused step */
+
+        /* Fused back-edge: i += 1; if (i < n) goto lbody (the same
+         * superinstruction the native for-range uses - one dispatch per
+         * iteration instead of a separate compare + increment + jump). */
+        Instr fstep;
+        fstep.op = OpCode::ForLoopStep;
+        fstep.node = fe->container.get();
+        fstep.aop = Op::lt;
+        fstep.target = lbody;
+        fstep.target2 = i;
+        fstep.a = slot_op(n);
+        fstep.b = int_lit(1);
+        chunk.code.push_back(fstep);
+
+        const int lend = here();
+        chunk.code[jt].target = lend;
+        pop_loop(lend, lcont);
+        temp_base = saved_base;
+        return true;
+    }
+
     void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
     {
         for (const auto &e : elems)
@@ -1516,6 +1629,11 @@ struct Codegen {
         }
         if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
             if (!try_native_for(fs))           /* general (non-range) for */
+                emit(OpCode::EvalStmt, s);
+            return;
+        }
+        if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
+            if (!try_native_foreach(fe))       /* flat int/float array only */
                 emit(OpCode::EvalStmt, s);
             return;
         }

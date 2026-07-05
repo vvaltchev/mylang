@@ -2867,7 +2867,16 @@ loop body compile directly into the chunk; array element read/write `a[i]` /
 `a[i]=v` / `a[i][j]` and a scalar builtin/call in an expression are native; a
 flow-free statement runs as a fallback within an otherwise-native loop so
 array-building loops (matrix/sieve) go native; recursion stays neutral; **suite
-geomean 0.75x, VM ~1.3x faster than the tree-walker**). Gated by the
+geomean 0.75x, VM ~1.3x faster than the tree-walker**). A **boxed (dyn/string)
+value tier** then removed the `node->eval` fallback for scalar `dyn`/string
+expressions — assign / compound-assign / comparison / logical `&&`/`||` over
+locals, globals, captures, builtins, literals, subscripts (`a[i]` via the
+runtime `Type::subscript`), and members (`obj.f` / `d.k` via a shared
+`member_read` factored out of `MemberExpr::do_eval`) — and **`foreach` over a
+flat `array<int>`/`array<float>`** (single, non-indexed loop var) lowers to a
+counted loop (snapshot + `ArrLen` + `LoadElem` + the fused `ForLoopStep`, −64%
+instructions; the sound case is stamped by the inferencer as
+`ForeachStmt::elem_th`). Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`

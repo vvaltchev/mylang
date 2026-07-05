@@ -1476,6 +1476,10 @@ public:
     unique_ptr<Construct> body;
     bool idsVarDecl;
     bool indexed;
+    /* VM native-foreach hint (set by the inferencer's annotate_hints ONLY for
+     * the sound case: a single, non-indexed loop var over a flat array<int> /
+     * array<float>). `none` -> the VM iterates via the tree-walker fallback. */
+    TypeHint elem_th = TypeHint::none;
 
     ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1489,6 +1493,7 @@ public:
         c->body = clone_as(body);
         c->idsVarDecl = idsVarDecl;
         c->indexed = indexed;
+        c->elem_th = elem_th;
         return c;
     }
 };

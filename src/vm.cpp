@@ -584,6 +584,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::ArrLen:
+            /* n = size(array). The base is a flat array (ForeachStmt::elem_th
+             * guarantees array<int>/array<float>), so read size() directly. */
+            ctx.frame->slots[in.target].put(EvalValue(static_cast<int_type>(
+                ctx.frame->slots[in.target2].get()
+                    .get_ref<SharedArrayObj>().size())));
+            pc++;
+            break;
+
         case OpCode::LoadImmInt:
             ctx.frame->slots[in.target].put(
                 EvalValue(static_cast<int_type>(in.a.lit)));
