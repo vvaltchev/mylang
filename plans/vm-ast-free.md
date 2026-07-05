@@ -50,43 +50,142 @@ bench set, same machine. Two effects, ONLY the second a regression:
   scores **4.36× EXCLUDING 63–66 but 4.15× WITH them** — a ~0.2× drag with ZERO
   code change. Adding a below-average bench lowers a geomean mechanically; it is
   not slower code.
-- **~half is a small REAL regression (~4–5%)**, confirmed DRIFT-CONTROLLED
-  (interleaved `old -vm` vs `cur -vm`, best-of-5): untouched native /
-  dispatch-bound benches got slightly slower (`01_while_loop` 1.10×,
-  `03_int_arith` 1.07×, `44_primes_sqrt` 1.11×, `60_bit_sieve` 1.08×). Caution:
-  the FIRST (serial, non-interleaved) pass over-reported this — `24_dict_lookup`
-  showed 1.20× serial but 0.99× interleaved (pure machine drift). The nativized
-  benches themselves IMPROVED (`66` 0.57×, sort/reverse).
+- **~half is a REAL regression on the DISPATCH-BOUND benches**, confirmed
+  DRIFT-CONTROLLED (interleaved `old -vm` vs `cur -vm`). Its SIZE depends on
+  scale (startup dilutes it): at bench-default scale ~4–5% (best-of-5), but at
+  **scale 10 (loop dominates), release wall-clock `CUR/OLD` geomean = 1.125** —
+  `01_while_loop` 1.166×, `03_int_arith` 1.106×, `44_primes_sqrt` 1.135×,
+  `60_bit_sieve` 1.096× (best-of-9). The overall `run.py` geomean moves less
+  (~7%) because non-dispatch benches are unaffected and the nativized ones
+  IMPROVED (`66` 0.57×, sort/reverse). Caution: a serial (non-interleaved) pass
+  over-reports — `24_dict_lookup` showed 1.20× serial but ~1.0× interleaved
+  (machine drift); always interleave. **This is a real-CPU FRONT-END effect, not
+  instruction count — see the PROFILED + FALSIFIED-FIX bullets below.**
 
-- **The VICTIM ops (what to profile + re-measure), and why it is NOT op-level.**
-  The four slow benches are dispatch-bound int/float loops; their hot ops —
-  **`IntBin`, `FloatBin`, `JumpUnlessIntCmp`, `ForLoopStep`, `LoadElemInt`,
-  `StoreElemInt`** — were NOT touched this cycle, so no handler got a worse
-  implementation. What changed is the `vm_run_chunk` DISPATCH: the session added
-  ~8 new op cases (`CheckFuncV`/`MapFilterV`/`DeclConstV`/`ForeachDynInit`/
-  `ForeachDynNext`/… on top of the prior `StoreCaptureV`/`MakeClosureV`/
-  `StructCtorV`/…), so the switch's handler CODE grew, hurting the hot handlers'
-  code-side I-cache + the single indirect-branch hub's prediction. NB: `Instr`
-  SIZE did NOT change (the 8-byte `node` was always there), so this is a
-  **code**-side effect, not the Instr-data-size one. INFERRED (the hot ops'
-  code is unchanged) — a `perf stat` (branch-misses / L1i-misses) or cachegrind
-  pass on `01_while_loop`/`03_int_arith`/`44_primes_sqrt`/`60_bit_sieve` would
-  pinpoint it. These four + those six ops are the re-measure set.
+- **The VICTIM ops, and why it is NOT op-level.** The four slow benches are
+  dispatch-bound int/float loops; their hot ops — **`IntBin`, `FloatBin`,
+  `JumpUnlessIntCmp`, `ForLoopStep`, `LoadElemInt`, `StoreElemInt`** — were NOT
+  touched this cycle, so no handler got a worse implementation. What changed is
+  the `vm_run_chunk` DISPATCH: the session added ~8 new op cases
+  (`CheckFuncV`/`MapFilterV`/`DeclConstV`/`ForeachDynInit`/`ForeachDynNext`/…),
+  growing the switch's handler CODE. NB: `Instr` SIZE did NOT change (the 8-byte
+  `node` was always there), so this is a **code**-side effect.
 
-- **Candidate fixes, most-direct first — none is "revert a nativization":**
-  1. **Computed-goto dispatch** (Part C2, `&&label` threading on GCC/clang; keep
-     the `switch` for MSVC). Each op becomes its own indirect branch, so a
-     bigger op set stops regressing the hot ops' prediction — the DIRECT fix for
-     a growing-switch cost.
-  2. **Split COLD handlers out of the hot switch** — move the rare ops
-     (`MapFilterV`/`DeclConstV`/`ForeachDyn*`/`CheckFuncV`/`EmplaceStruct`/…) to
-     a cold `[[gnu::noinline]]` secondary dispatch, so the hot `vm_run_chunk`
-     body stays small (better I-cache for `IntBin`/`ForLoopStep`).
-  3. **Drop `Instr::node`** (Step 5 → `Instr` 64→56 bytes) — a DATA-side I-cache
-     win (the instruction stream a tight loop re-reads); general, not this dip's
-     specific cause.
-  **Action: re-measure the four benches after each; the bench-set drag is
-  permanent + correct (those benches belong in the suite).**
+- **PROFILED (2026-07-08, cachegrind `--branch-sim`, `b0090d7` vs `5c3c6d1`).**
+  The regression is REAL and REPRODUCIBLE (consistent across repeated wall-clock
+  runs); cachegrind REFUTES the specific *mechanisms* I first guessed
+  (I-cache / branch prediction), it does NOT refute the regression. Runs on
+  `01_while_loop` (scale 1, 3M iters) and a minimal dispatch loop
+  (`s+=i; s%=M` × 1M):
+  - `01_while_loop`: I refs 562.16M → **565.16M (+0.53%, ≈ +1 instr/iter)**;
+    I1 misses 6081 → 6130 (of 565M — negligible); indirect-branch mispredicts
+    9,012,965 → **9,012,711 (CUR fewer)**.
+  - minimal loop: I refs 174,335,589 → **174,335,896 (+0.0002%)**; I1 misses
+    5855 → 5889; indirect mispredicts 4,007,839 → **4,007,611 (CUR fewer)**.
+  So the modeled I-cache and modeled branch prediction are FLAT (I1 misses ~6k,
+  not a bottleneck at all; indirect mispredicts marginally *lower* on CUR). What
+  IS confirmed is a **+0.53% instruction floor on the while loop (~0 on the for
+  loop)** = a compiler **register-allocation / spill** effect of the larger
+  `vm_run_chunk` (more cases → more register pressure → an extra spill/reload in
+  a hot handler).
+
+  **SMOKING GUN (callgrind `--dump-line` + objdump, prof binaries `LTO=0`
+  `OPT=1` `ASSERTS=0`).** On `01_while_loop` (3M iters) `vm_run_chunk` self-Ir is
+  **318,000,519 (CUR) vs 315,000,517 (OLD) = +3,000,002 = EXACTLY +1
+  instruction/iteration**; on the for-loop `/tmp/disp.my` it is 105,000,185 vs
+  105,000,183 (+2 total, ZERO per-iter) — so the regression is confined to the
+  while-loop handler path (`JumpUnlessIntCmp`+`IntBin`), not the for-loop
+  (`ForLoopStep`) path. Static disassembly of the compiled function:
+  `vm_run_chunk` grew from **6403 → 6952 instructions (+549, +8.6%)** and its
+  stack-spill `mov`s went **40 → 47 (+7)** — the direct evidence of higher
+  register pressure. GCC already emits a `.cold` partition, yet the HOT body
+  still grew this much. Causal chain, fully evidenced: ~8 new op cases → +549
+  static instr in `vm_run_chunk` → +7 spills → +1 spill executed per while-loop
+  iteration → the +0.53% instruction regression.
+
+  **Call-graph confirmation (callgrind, `44_primes_sqrt`):** the register VM is
+  as dispatch-bound as expected — `vm_run_chunk` is **~89%** (53% direct + the
+  inlined `eval.h`/`evalvalue.h`/`stl_vector.h` slices), `do_func_call` ~2%,
+  `LValue::get_value_for_put` ~1.3%. (`09_fib_recursive`'s profile is NOT a
+  runtime hot path — its cached recursion runs in ~0.006s, so its 115M-Ir
+  profile is compile/startup-dominated, RTTI + interning; a sign fib is
+  well-optimized, not a target.)
+
+- **THE REAL SIZE OF THE REGRESSION, and why it is a FRONT-END effect (release
+  wall-clock, drift-controlled interleaved best-of-9, scale 10, `-vm`).** The
+  cachegrind numbers above are the RELEASE (LTO=1) binaries, so the +0.53%
+  instruction count IS the release instruction delta. But the release
+  WALL-CLOCK regression is far bigger: **`CUR/OLD` geomean = 1.125** —
+  `01_while_loop` 1.166×, `03_int_arith` 1.106×, `44_primes_sqrt` 1.135×,
+  `60_bit_sieve` 1.096×. A **0.5% instruction increase producing a ~12.5%
+  wall-clock regression is a 24× amplification** — the unmistakable signature of
+  a **real-CPU FRONT-END / code-layout effect** (µop-cache/DSB eviction, hot-loop
+  code alignment, or real indirect-branch/BTB behavior) that cachegrind CANNOT
+  model (it has no DSB, no real-BTB capacity, no OoO port model) and that this
+  PMU-less WSL2 CANNOT measure (`perf` hardware counters read `<not supported>`).
+  It is NOT instruction count, NOT modeled I-cache, NOT modeled branch
+  prediction (all three flat/lower). It is the ~50-target switch dispatch's hot
+  loop shifting layout when the op set grew.
+
+- **FALSIFIED FIX — "shrink the hot function" does NOT work (measured, reverted
+  2026-07-08).** The cold-handler-split experiment (move the ~10 fat cold ops —
+  `MakeArrayV`/`MakeDictV`/`MakeClosureV`/`StructCtorV`/`CallBuiltinLV`/
+  `EmplaceStruct`/`CallBuiltinLVElem`/`CheckFuncV`/`MapFilterV`/`DeclConstV` —
+  into an `ML_NOINLINE vm_cold_op`) DID shrink `vm_run_chunk` **6952 → 5803
+  static instructions (smaller than OLD's 6403)** and kept `-rt` green
+  (1355/1355 + 1204/1204). Yet it made the regression **WORSE, not better**:
+  release wall-clock `NEW/OLD` geomean **1.168 > CUR/OLD 1.125** (worse on every
+  bench), and the prof-binary `vm_run_chunk` self-Ir on `01_while_loop` rose to
+  **330M (vs CUR 318M, OLD 315M)**. Lesson: the regression is a **fragile layout
+  effect** — perturbing the layout (even to shrink it) reshuffles the hot loop's
+  register allocation + code placement UNPREDICTABLY, and here it went the wrong
+  way. "Function size" is thus DISPROVEN as the lever; ad-hoc restructuring is a
+  gamble, not a fix.
+
+- **FALSIFIED MICRO-OPT — switch → `.rodata` array lookup (audited, measured,
+  reverted 2026-07-08).** Hypothesis: the big switches aren't jump-tabled;
+  convert them to array lookups (Op/OpCode enums are dense 0-based). AUDIT (gcc
+  `-O3` disasm): the HOT dispatches are ALREADY jump tables — `switch(in.op)` →
+  `notrack jmp *%rax`; IntBin's `switch(in.aop)` → `cmp; lea table; movslq
+  (table,idx,4); jmp *%rdx`. The only convertible ones are the VALUE-mapping
+  switches `binop_pmf`/`cmp_pmf` (Op → a `NumBinOp` PMF), which GCC compiles as
+  a jump-table-of-constant-loads (an indirect branch just to fetch a constant).
+  Converting them to hard-coded `.rodata` tables (`static constexpr NumBinOp
+  t[op_count]`, positional — C++17 has NO designated array initializers, a C99
+  extension g++/clang/MSVC all reject; verified `.rodata` via `nm` letter `r`,
+  portable, `-rt` green) measured **~2-3% SLOWER** on the boxed path
+  (`66_dyn_foreach`, best-of-15, `rodata/switch` 1.023-1.027). WHY: for a
+  PREDICTABLE dispatch in a tight loop the jump table's indirect branch is
+  perfectly predicted (~free) and the `mov $imm` has no load latency, whereas
+  the table forces a LOAD with latency on the critical path before the PMF
+  indirect-call. (A `.data` constructor-filled table was even worse — an
+  immutable `.rodata` table optimizes better than a runtime-filled `.data` one,
+  but still lost.) It is CPU-DEPENDENT: the branchless table could win on a
+  weak-indirect-predictor CPU or an UNPREDICTABLE op stream; on this strong
+  predictor with a 2-op loop the switch wins. Reverted. Lesson: GCC already
+  jump-tables the dense switches; hand-conversion only helps if the compiler
+  DIDN'T table it (it did) or the dispatch is unpredictable.
+
+- **Candidate fixes — now that "shrink it" is falsified:**
+  1. **Computed-goto / direct-threaded dispatch** (Part C2, `&&label` on
+     GCC/clang; keep `switch` on MSVC). This is the STANDARD cure for a
+     switch-interpreter front-end problem: one indirect branch per op instead of
+     a single shared hub, and the compiler can co-locate the hot ops. BUT it is
+     ALSO a layout change, so — like the cold-split — it could backfire, and
+     without a PMU (DSB-uop / branch-misprediction counters) it cannot be
+     validated here. Do NOT land it blind; measure it on a PMU-capable box.
+  2. **Drop `Instr::node`** (Step 5 → `Instr` 64→56 bytes). A DATA-side change
+     (the instruction stream the tight loop re-reads), independent of the
+     handler-code layout. Principled and worth measuring — it may help the
+     front-end for a different reason than dispatch layout.
+  3. **Get a PMU.** The only way to STOP guessing: a bare-metal Linux or a cloud
+     VM that exposes `perf` hardware counters (`idq.dsb_uops`,
+     `br_misp_retired.indirect`, `frontend_retired.*`) — then the front-end
+     mechanism is directly measurable and a fix can be tuned, not gambled.
+  **Action: do NOT keep perturbing the layout blind (the cold-split proved that
+  backfires). Either measure on a PMU box, or fold the fix into the principled
+  AST-free `Instr::node` drop and re-measure. The bench-set drag (63–66 below
+  geomean) is permanent + correct.**
 
 ## The plan
 
