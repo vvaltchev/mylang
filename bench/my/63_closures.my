@@ -1,0 +1,36 @@
+# closures: create closures in a loop (factories that capture mutable/immutable
+# state), call them, and mutate their captures - the whole closure lifecycle
+# (creation + capture read/write + indirect call), amplified in a loop.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+# a factory whose body captures MUTABLE state (count++ in the closure)
+func make_counter(start) {
+    var count = start;
+    return func [count] {
+        count++;
+        return count;
+    };
+}
+
+# a factory whose body captures IMMUTABLE state (base is read, not written)
+func make_adder(n) {
+    var base = n * 10;
+    return func [base] (x) {
+        return base + x;
+    };
+}
+
+var N = 200000 * scale;
+var s = 0;
+
+for (var i = 0; i < N; i++) {
+    var c = make_counter(i);      # create a counter closure
+    s += c() + c();               # two capture-mutating calls (i+1, i+2)
+    var add = make_adder(i);      # create an adder closure
+    s += add(i);                  # a capture-reading call (11*i)
+    s = s % 1000000007;
+}
+
+print("result:", s);
