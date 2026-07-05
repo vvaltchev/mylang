@@ -65,16 +65,16 @@ first:
    Bench 35.
 
    **AUDIT CORRECTION (2026-07-08):** the earlier per-bench `-vd` fallback
-   counts
-   were INFLATED by **dead template bodies** — a `func f` whose calls all
+   counts were INFLATED by **dead template bodies** — a `func f` whose calls all
    redirect to a native instance `func f$0` (the template is never compiled at
    runtime). E.g. 43_sieve's 5 `eval.stmt` are all in the `compute_primes`
    template; the `compute_primes$0` instance (the hot path) is fully native.
    Excluding dead templates, the genuine LIVE fallbacks are: map/filter (35);
-   a scalar-spread multi-assign `a,b=0` (06/22, one-time setup); a big const
-   array literal (48/52, one-time); a `var dyn` foreach reduction (48_heavy);
-   exceptions (42). Audit with: for each chunk, a `name` is a dead template iff
-   some other chunk is `name$<digits>`.
+   ~~a scalar-spread multi-assign `a,b=0` (06/22)~~ **DONE** (2026-07-08,
+   `try_multi_scalar_spread` — compile the scalar once, MoveV to each target);
+   a big const array literal decl (48/52, one-time); a `var dyn` foreach
+   reduction (48_heavy); exceptions (42). Audit with: for each chunk, a `name`
+   is a dead template iff some other chunk is `name$<digits>`.
 
 2. **Free the AST - drop `Instr::node`** (the node-field goal). The AST-free
    foundations exist (loc side table, const / member-key / struct-def / closure-

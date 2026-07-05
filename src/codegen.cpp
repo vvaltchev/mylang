@@ -1063,6 +1063,54 @@ struct Codegen {
         return true;
     }
 
+    /* Multi-assign SCALAR SPREAD `a, b, c = <non-array scalar>` -> the strict
+     * rule spreads the SAME value to every target, so compile it ONCE into a
+     * temp and MoveV (copy/alias) it to each target slot - no array, no runtime
+     * destructure-vs-spread branch. Gated on a provably-non-array rvalue: a
+     * proven int/float (th) or a SCALAR literal (`Literal` - LiteralInt/Bool/
+     * Float/Str/None; NOT LiteralObj, which is an array/dict). An array / dyn
+     * rvalue falls back to the strict `handle_single_expr14` destructure. */
+    bool try_multi_scalar_spread(const Expr14 *e, const IdList *il,
+                                 std::vector<Instr> &ops)
+    {
+        const Construct *rv = e->rvalue.get();
+        const bool scalar = rv->th == TypeHint::i || rv->th == TypeHint::f
+                            || dynamic_cast<const Literal *>(rv);
+        if (!scalar)
+            return false;
+        const int n = static_cast<int>(il->elems.size());
+        if (n == 0)
+            return false;
+        for (const auto &t : il->elems) {
+            if (t->is_underscore() || t->sym.kind != SymKind::local
+                || t->is_const
+                || (t->decl_type != DeclType::none
+                    && t->decl_type != DeclType::dyn))
+                return false;
+        }
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        const int vslot = alloc_temp();
+        if (!compile_to_run_slot(rv, vslot, ops)) {
+            ops.resize(omark);
+            next_temp = save_top;
+            chunk.consts.resize(cmark);
+            return false;
+        }
+        for (int i = 0; i < n; i++) {
+            Instr mv;
+            mv.op = OpCode::MoveV;
+            mv.node = e;
+            mv.target = il->elems[i]->sym.slot;
+            mv.target2 = vslot;
+            ops.push_back(mv);
+        }
+        next_temp = save_top;   /* free the value temp */
+        return true;
+    }
+
     bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
     {
         /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
@@ -1099,12 +1147,18 @@ struct Codegen {
         if (!is_assign && cbase == Op::invalid)
             return false;
 
-        /* Multi-assign `a, b, .. = <array literal>` -> distribute elements to
-         * the target slots (no array). Any non-qualifying shape falls back. */
+        /* Multi-assign `a, b, .. = <rvalue>`: an ARRAY literal distributes its
+         * elements to the target slots (destructure, no array); a non-array
+         * SCALAR spreads to every target. A non-qualifying shape falls back. */
         if (is_assign) {
             if (const IdList *il =
-                    dynamic_cast<const IdList *>(e->lvalue.get()))
-                return try_multi_literal_store(e, il, ops);
+                    dynamic_cast<const IdList *>(e->lvalue.get())) {
+                if (try_multi_literal_store(e, il, ops))
+                    return true;
+                if (try_multi_scalar_spread(e, il, ops))
+                    return true;
+                return false;
+            }
         }
         const Identifier *lv =
             dynamic_cast<const Identifier *>(e->lvalue.get());

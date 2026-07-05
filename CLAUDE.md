@@ -3106,11 +3106,17 @@ snapshots to the target slots — **eliminating the array alloc entirely** (the
 real win; box-free for int/float elements). Snapshot-FIRST makes it swap-safe
 (`a, b = [b, a]`), matching the tree-walker's build-then-bind. Only when the
 rvalue is a `LiteralArray` of EXACTLY the target count and every target is a
-real (non-`_`), resolved-local, non-const, non-coerced identifier; a scalar
-spread (`a,b = 0`), a `_` placeholder, an arity mismatch (a runtime strict
-error), a non-literal array (`a,b = f()`), or a typed/const target all fall back
-to the strict `handle_single_expr14` `EvalStmt` (byte-identical under the
-differential). **Effect: `22_multi_assign` 0.89x → 0.18x** (the per-iteration
+real (non-`_`), resolved-local, non-const, non-coerced identifier; a `_`
+placeholder, an arity mismatch (a runtime strict error), a non-literal array
+(`a,b = f()`), or a typed/const target all fall back to the strict
+`handle_single_expr14` `EvalStmt` (byte-identical under the differential).
+A **SCALAR SPREAD** `a, b, c = <non-array scalar>` (the sibling
+`try_multi_scalar_spread`) compiles the rvalue ONCE and **`MoveV`s (copy/alias)
+it to every target** — no array, no runtime destructure-vs-spread branch. Gated
+on a provably-non-array rvalue (a proven int/float `th`, or a scalar `Literal` —
+int/bool/float/str/none, NOT `LiteralObj`); an array/dyn rvalue falls back to
+the strict destructure. So `var a,b,c = 0` / `= "hi"` / `= x` (int `x`) are
+native. **Effect: `22_multi_assign` 0.89x → 0.18x** (the per-iteration
 array alloc was the whole cost). A
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
