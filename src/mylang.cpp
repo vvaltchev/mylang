@@ -419,8 +419,18 @@ int main(int argc, char **argv)
             /* -vd: dump the bytecode disassembly (the bytecode analogue of -s)
              * and do NOT run. See disasm.{h,cpp}. */
             if (opt_vm_disasm) {
-                cout << disassemble_program(
+                std::string dump = disassemble_program(
                     static_cast<const Block *>(root.get()));
+                /* 256-color syntax highlight on a TTY only; a piped/redirected
+                 * dump (or NO_COLOR / --no-color) stays plain for diffing.
+                 * Unix-only (isatty/unistd), like the REPL - Windows dumps
+                 * plain. */
+#ifndef _WIN32
+                if (!opt_no_color && !getenv("NO_COLOR")
+                    && isatty(STDOUT_FILENO))
+                    dump = highlight_disasm(dump);
+#endif
+                cout << dump;
                 return 0;
             }
 

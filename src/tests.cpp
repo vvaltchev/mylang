@@ -11634,11 +11634,45 @@ static bool vm_disasm_shape()
     }
 }
 
+/* highlight_disasm colors each token class of a plain disassembly (256-color,
+ * TTY only) AND leaves the text intact - stripping every ESC..m sequence gives
+ * the plain input back exactly. */
+static bool disasm_highlight_shape()
+{
+    const std::string plain =
+        "; ===== main  (2 instr) =====\n"
+        "   0  i.bin        s = s + #1\n"
+        "   1  i.jmp.ifnot  i < #3, L4\n";
+    const std::string c = highlight_disasm(plain);
+
+    const bool colored =
+        c.find("\033[1;38;5;222m; =====") != std::string::npos      /* header */
+        && c.find("\033[38;5;69mi.bin") != std::string::npos        /* arith */
+        && c.find("\033[38;5;214mi.jmp.ifnot") != std::string::npos /* ctrl */
+        && c.find("\033[38;5;150m#1") != std::string::npos          /* immed. */
+        && c.find("\033[38;5;213mL4") != std::string::npos          /* label */
+        && c.find("\033[38;5;80ms") != std::string::npos;           /* reg */
+
+    std::string stripped;
+    for (size_t i = 0; i < c.size(); ) {
+        if (c[i] == '\033') {              /* skip an ESC [ ... m sequence */
+            while (i < c.size() && c[i] != 'm')
+                i++;
+            if (i < c.size())
+                i++;
+        } else {
+            stripped += c[i++];
+        }
+    }
+    return colored && stripped == plain;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
+    { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },
     { "analyze: counted `for` is greened, float-var `for` is not",
       analyze_greens_counted_for },

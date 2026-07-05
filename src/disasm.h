@@ -32,3 +32,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title);
  * run would) without executing. Used by the `-vd` driver.
  */
 std::string disassemble_program(const Block *root);
+
+/*
+ * Colorize a plain disassembly (from `disassemble`/`disassemble_program`) with
+ * 256-color ANSI syntax highlighting - a post-pass that tokenizes each line by
+ * the disassembler's own shape (`<pc> <mnemonic> <operands> ; comment`) and
+ * colors the pc / mnemonic-by-category / registers / immediates / labels /
+ * comments / section headers. The `-vd` driver applies it only on a TTY (not
+ * piped, honoring NO_COLOR / --no-color), so a redirected dump stays plain.
+ */
+std::string highlight_disasm(const std::string &plain);

@@ -466,3 +466,134 @@ std::string disassemble_program(const Block *root)
     }
     return s.str();
 }
+
+/* ------------------------------------------------------------------------
+ * -vd syntax highlighting (256-color, TTY only)
+ *
+ * A post-pass over the finished plain disassembly: it tokenizes each line by
+ * the disassembler's own regular shape - `<pc>  <mnemonic>  <operands> ; cmt`
+ * - and colors each piece. No opcode rendering is touched. The token classes
+ * are unambiguous by prefix: `#N` immediates, `L<N>` labels, `rN`/`gN`/source
+ * names registers, `; ...` comments, `; ===== ... =====` section headers.
+ * ------------------------------------------------------------------------ */
+namespace {
+
+const char *const RST = "\033[0m";
+
+/* The mnemonic's color by op CATEGORY - so the class reads at a glance. */
+const char *mnemonic_color(const std::string &m)
+{
+    if (m.compare(0, 5, "eval.") == 0)
+        return "\033[38;5;203m";                    /* fallback  - red     */
+    if (m == "jmp" || m == "halt" || m == "for.step"
+        || m.compare(0, 4, "loop") == 0 || m.compare(0, 3, "ret") == 0
+        || m.compare(0, 3, "jmp") == 0
+        || m.find(".jmp.") != std::string::npos)
+        return "\033[38;5;214m";                    /* control   - orange  */
+    if (m.compare(0, 4, "call") == 0)
+        return "\033[38;5;177m";                    /* call      - purple  */
+    if (m == "i.bin" || m == "f.bin" || m == "bin.v" || m == "cmp.v"
+        || m == "log.v" || m == "compound.v")
+        return "\033[38;5;69m";                     /* arithmetic - blue   */
+    return "\033[38;5;78m";                         /* mem/other - green   */
+}
+
+std::string hl_line(const std::string &line)
+{
+    size_t i = 0;
+    while (i < line.size() && line[i] == ' ')
+        i++;
+
+    /* whole-line comment / section header */
+    if (i < line.size() && line[i] == ';') {
+        const char *c = line.find("=====") != std::string::npos
+                            ? "\033[1;38;5;222m"     /* header  - bold gold */
+                            : "\033[38;5;245m";      /* comment - gray      */
+        return c + line + RST;
+    }
+    if (i >= line.size())
+        return line;                                 /* blank */
+
+    std::ostringstream o;
+    o << line.substr(0, i);                          /* leading indent */
+
+    /* pc (the leading number) */
+    size_t j = i;
+    while (j < line.size() && isdigit((unsigned char)line[j]))
+        j++;
+    if (j > i) {
+        o << "\033[38;5;240m" << line.substr(i, j - i) << RST;
+        i = j;
+    }
+    while (i < line.size() && line[i] == ' ')
+        o << line[i++];
+
+    /* mnemonic (the leading lowercase/./digit run) */
+    size_t m = i;
+    while (m < line.size()
+           && (islower((unsigned char)line[m]) || line[m] == '.'
+               || isdigit((unsigned char)line[m])))
+        m++;
+    if (m > i) {
+        const std::string mn = line.substr(i, m - i);
+        o << mnemonic_color(mn) << mn << RST;
+        i = m;
+    }
+
+    /* operands - a token scan */
+    while (i < line.size()) {
+        const char c = line[i];
+        if (c == ';') {                              /* inline comment -> EOL */
+            o << "\033[38;5;245m" << line.substr(i) << RST;
+            break;
+        }
+        if (c == ' ') {
+            o << c;
+            i++;
+            continue;
+        }
+        if (c == '#' || isdigit((unsigned char)c)) {  /* immediate / number */
+            size_t k = i + (c == '#' ? 1 : 0);
+            while (k < line.size() && isdigit((unsigned char)line[k]))
+                k++;
+            o << "\033[38;5;150m" << line.substr(i, k - i) << RST;
+            i = k;
+            continue;
+        }
+        if (isalpha((unsigned char)c) || c == '_') {  /* reg / name / label */
+            size_t k = i;
+            while (k < line.size()
+                   && (isalnum((unsigned char)line[k]) || line[k] == '_'))
+                k++;
+            const std::string id = line.substr(i, k - i);
+            bool label = id.size() > 1 && id[0] == 'L';
+            for (size_t x = 1; label && x < id.size(); x++)
+                if (!isdigit((unsigned char)id[x]))
+                    label = false;
+            o << (label ? "\033[38;5;213m" : "\033[38;5;80m") << id << RST;
+            i = k;
+            continue;
+        }
+        o << "\033[38;5;243m" << c << RST;           /* operator / punct */
+        i++;
+    }
+    return o.str();
+}
+
+} // namespace
+
+std::string highlight_disasm(const std::string &plain)
+{
+    std::ostringstream out;
+    size_t start = 0;
+    for (;;) {
+        const size_t nl = plain.find('\n', start);
+        out << hl_line(plain.substr(
+            start, nl == std::string::npos ? std::string::npos : nl - start));
+        if (nl == std::string::npos)
+            break;
+        out << '\n';
+        start = nl + 1;
+    }
+    return out.str();
+}

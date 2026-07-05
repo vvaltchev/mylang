@@ -140,7 +140,8 @@ Running scripts:
 ./build/mylang -vm FILE          # execute via the bytecode VM (experimental;
                                  # default is the tree-walker) — bytecode-vm.md
 ./build/mylang -vd FILE          # dump the VM bytecode disassembly (the
-                                 # bytecode analogue of -s), exit — disasm.h
+                                 # bytecode analogue of -s), exit — disasm.h;
+                                 # 256-color syntax-highlighted on a TTY
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang -dti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization
