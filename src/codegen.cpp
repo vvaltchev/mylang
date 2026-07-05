@@ -358,6 +358,11 @@ struct Codegen {
             return true;
         }
 
+        /* A native user-function call `f(args...)` -> CallV. */
+        if (const DirectCallExpr *dc = dynamic_cast<const DirectCallExpr *>(e))
+            if (try_native_call(dc, out_slot, ops))
+                return true;
+
         /* An arith (`a+b`) / comparison (`a<b`) / logical (`a&&b`) chain, as a
          * raw ExprNN OR a TypedScalarExpr - `A && B` of comparisons specializes
          * to a logical even when the comparisons are boxed over a dyn operand,
@@ -566,6 +571,61 @@ struct Codegen {
         return slot_op(t);
     }
 
+    /*
+     * Native user-function call `dst = f(args...)` -> CallV: evaluate each arg
+     * into a contiguous register run [argbase, argbase+n), then one CallV that
+     * gathers those values and calls do_func_call (no node->eval of the call).
+     * Only a DirectCallExpr the inferencer proved a user function
+     * (vm_direct_func); an arg compile_boxed_expr can't lower (a nested call, a
+     * complex expression) rolls the whole call back to the EvalStmt/EvalToSlot
+     * fallback. Args are evaluated left-to-right, once each.
+     */
+    bool try_native_call(const DirectCallExpr *dc, int &out_slot,
+                         std::vector<Instr> &ops)
+    {
+        if (!dc->vm_direct_func || dc->direct_func_slot < 0 || !dc->args)
+            return false;
+
+        const auto &elems = dc->args->elems;
+        const int n = static_cast<int>(elems.size());
+
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+
+        const int argbase = next_temp;
+        next_temp += n;
+        if (next_temp > max_temp)
+            max_temp = next_temp;
+
+        for (int i = 0; i < n; i++) {
+            const int sub = next_temp;
+            int out;
+            if (!compile_boxed_expr(elems[i].get(), out, ops)) {
+                ops.resize(mark);
+                next_temp = save_top;
+                return false;
+            }
+            Instr mv;
+            mv.op = OpCode::MoveV;
+            mv.target = argbase + i;
+            mv.target2 = out;
+            ops.push_back(mv);
+            next_temp = sub;   /* free this arg's scratch for the next */
+        }
+
+        const int dst = alloc_temp();
+        Instr cv;
+        cv.op = OpCode::CallV;
+        cv.node = dc;
+        cv.target = dst;
+        cv.target2 = dc->direct_func_slot;
+        cv.a = int_lit(argbase);
+        cv.b = int_lit(n);
+        ops.push_back(cv);
+        out_slot = dst;
+        return true;
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<Instr> &ops)
     {
@@ -606,6 +666,18 @@ struct Codegen {
             out = eval_to_temp(e, ops);
             return true;
         }
+
+        /* An int-returning native user-function call -> CallV, its result an
+         * int operand (so `s += f(i)` stays the int fast path). */
+        if (e->th == TypeHint::i)
+            if (const DirectCallExpr *dc =
+                    dynamic_cast<const DirectCallExpr *>(e)) {
+                int ct;
+                if (try_native_call(dc, ct, ops)) {
+                    out = slot_op(ct);
+                    return true;
+                }
+            }
 
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
         if (!t || t->kind != TypeHint::i)
@@ -835,6 +907,17 @@ struct Codegen {
             out = eval_to_temp(e, ops);
             return true;
         }
+
+        /* A float-returning native user-function call -> CallV. */
+        if (e->th == TypeHint::f)
+            if (const DirectCallExpr *dc =
+                    dynamic_cast<const DirectCallExpr *>(e)) {
+                int ct;
+                if (try_native_call(dc, ct, ops)) {
+                    out = slot_op(ct);
+                    return true;
+                }
+            }
 
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
         if (!t || t->kind != TypeHint::f)
@@ -1199,6 +1282,16 @@ struct Codegen {
              * stopping the chunk (a return abandons the loop). Anything
              * else (a nested loop/if that couldn't compile, a block) falls the
              * whole loop back. */
+            /* A user-function call statement -> CallV (result discarded). */
+            if (const DirectCallExpr *dc =
+                    dynamic_cast<const DirectCallExpr *>(s)) {
+                int dst;
+                if (try_native_call(dc, dst, chunk.code)) {
+                    any_native = true;
+                    continue;
+                }
+            }
+
             if (dynamic_cast<const Expr14 *>(s)
                 || dynamic_cast<const CallExpr *>(s)
                 || dynamic_cast<const ReturnStmt *>(s)) {
@@ -1636,6 +1729,13 @@ struct Codegen {
             if (!try_native_foreach(fe))       /* flat int/float array only */
                 emit(OpCode::EvalStmt, s);
             return;
+        }
+        /* A user-function call statement (result discarded) -> CallV. */
+        if (const DirectCallExpr *dc =
+                dynamic_cast<const DirectCallExpr *>(s)) {
+            int dst;
+            if (try_native_call(dc, dst, chunk.code))
+                return;
         }
         emit(OpCode::EvalStmt, s);
     }

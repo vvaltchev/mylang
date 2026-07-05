@@ -584,6 +584,35 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CallV: {
+
+            /* Native user-function call: gather the pre-evaluated args from the
+             * register run and vm_call_func -> do_func_call (which runs the
+             * callee body via its chunk or the tree-walker). A callee slot not
+             * yet defined / reassigned to a non-function throws the same
+             * UndefinedVariableEx / NotCallableEx the tree-walker would; the
+             * args
+             * are evaluated exactly once either way. */
+            const CallExpr *call = static_cast<const CallExpr *>(in.node);
+            if (!ctx.gfuncs->defined[in.target2])
+                throw UndefinedVariableEx(
+                    static_cast<const Identifier *>(
+                        call->what.get())->get_str(),
+                    call->what->start, call->what->end);
+            const EvalValue &callee = ctx.gfuncs->slots[in.target2].get();
+            if (!callee.is<intrusive_ptr<FuncObject>>())
+                throw NotCallableEx(call->start, call->end);
+            std::vector<EvalValue> argvals;
+            argvals.reserve(in.b.lit);
+            for (int_type i = 0; i < in.b.lit; i++)
+                argvals.push_back(ctx.frame->slots[in.a.lit + i].get());
+            ctx.frame->slots[in.target].put(vm_call_func(
+                &ctx, *callee.get<intrusive_ptr<FuncObject>>().get(),
+                argvals, call->start));
+            pc++;
+            break;
+        }
+
         case OpCode::ArrLen:
             /* n = size(array). The base is a flat array (ForeachStmt::elem_th
              * guarantees array<int>/array<float>), so read size() directly. */

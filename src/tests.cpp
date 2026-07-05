@@ -10457,7 +10457,7 @@ struct VmOpCounts {
     size_t storei = 0, storef = 0, loadev = 0, evalslot = 0, evalstmt = 0;
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
-    size_t memberv = 0;
+    size_t memberv = 0, callv = 0;
     int n_temps = 0;
 };
 
@@ -10511,6 +10511,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::LoadGlobalV:      c.loadglobalv++; break;
             case OpCode::SubscriptV:       c.subscriptv++; break;
             case OpCode::MemberV:          c.memberv++; break;
+            case OpCode::CallV:            c.callv++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10874,6 +10875,21 @@ static bool vm_codegen_shapes()
     const bool foreach_ok = fe.arrlen == 1 && fe.loadei == 1
         && fe.flstep == 1 && fe.intbin >= 1;
 
+    /* 27) a native user-function call: a large (non-inlined) function called in
+     * a loop with a non-const int arg lowers to a CallV, not an EvalStmt/
+     * EvalToSlot fallback (the loop var instantiates the template with int, so
+     * the body's locals are int - no mandatory-dyn error). */
+    VmOpCounts cv;
+    if (!codegen_counts({
+            "func big(x) { var a=x*2; var b=a*3; var c=b*4; var d=c*5;",
+            "              var e=d*6; var f=e*7; var g=f*8;",
+            "              return a+b+c+d+e+f+g; }",
+            "var s = 0;",
+            "for (var i = 0; i < 4; i = i + 1) s = s + big(i);",
+        }, cv))
+        return false;
+    const bool callv_ok = cv.callv == 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -10882,7 +10898,7 @@ static bool vm_codegen_shapes()
         && break_cont_ok && compound_cond_ok && boxed_ok
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
-        && foreach_ok;
+        && foreach_ok && callv_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

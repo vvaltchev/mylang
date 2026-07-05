@@ -1376,6 +1376,14 @@ void Inferencer::annotate_hints(Construct *n)
         sub->base_array = bt->kind == StaticTypeKind::Array;
     }
 
+    /* VM native-call hint: the callee is a user FUNCTION (Func static type -
+     * not a struct constructor / builtin). With a global-slot callee this lets
+     * the VM emit a CallV instead of node->eval-ing the call. */
+    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+        StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
+        call->vm_direct_func = ct->kind == StaticTypeKind::Func;
+    }
+
     /* Native-foreach hint: a single, non-indexed loop var over a flat
      * array<int>/array<float>. Only then may the VM iterate it as a counted
      * loop with a direct element load (a dict / string / general / tuple /

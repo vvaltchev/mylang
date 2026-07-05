@@ -717,6 +717,14 @@ public:
      * Carried on the base so the swap can read it off any CallExpr. */
     int direct_func_slot = -1;
 
+    /* VM native-call hint: the inferencer proved the callee is a user FUNCTION
+     * (a Func static type - not a struct constructor, whose args
+     * construct_struct self-evaluates, nor a builtin). With a global-slot
+     * callee (a DirectCallExpr) this lets the VM emit a native CallV: evaluate
+     * the args into registers and call do_func_call with the VALUES, instead of
+     * node->eval-ing the call. */
+    bool vm_direct_func = false;
+
     CallExpr() : Construct("CallExpr") { }
     explicit CallExpr(const char *name) : Construct(name) { }
     void serialize(ostream &s, int level = 0) const override;
@@ -728,6 +736,7 @@ public:
         c->what = clone_as(what);
         c->args = clone_as(args);
         c->direct_func_slot = direct_func_slot;
+        c->vm_direct_func = vm_direct_func;
         return c;
     }
 };
@@ -755,6 +764,7 @@ public:
         c->what = clone_as(what);
         c->args = clone_as(args);
         c->direct_func_slot = direct_func_slot;
+        c->vm_direct_func = vm_direct_func;
         return c;
     }
 };
@@ -778,6 +788,7 @@ public:
         c->what = clone_as(what);
         c->args = clone_as(args);
         c->direct_func_slot = direct_func_slot;
+        c->vm_direct_func = vm_direct_func;
         return c;
     }
 };

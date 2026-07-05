@@ -653,6 +653,18 @@ EvalValue eval_func(EvalContext *ctx,
     return do_func_call(ctx, obj, args);
 }
 
+/* The VM's native-call entry (CallV): the args are already evaluated into
+ * registers, so bind the VALUES (skipping the per-arg node->eval the
+ * tree-walker
+ * does); `call_site` is the CallExpr's loc, for the backtrace. */
+EvalValue vm_call_func(EvalContext *ctx,
+                       FuncObject &obj,
+                       const vector<EvalValue> &args,
+                       Loc call_site)
+{
+    return do_func_call(ctx, obj, args, call_site);
+}
+
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const EvalValue &arg)

@@ -161,6 +161,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
         case OpCode::EvalToSlot:
             row << "eval.slot    r" << in.target << " = " << node1(in.node);
             break;
+        case OpCode::CallV:
+            row << "call.v       r" << in.target << " = g" << in.target2
+                << "(r" << in.a.lit << "..+" << in.b.lit << ")";
+            break;
         case OpCode::LoadImmInt:
             row << "load         r" << in.target << ", #" << in.a.lit;
             break;

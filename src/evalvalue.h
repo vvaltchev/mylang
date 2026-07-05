@@ -568,6 +568,13 @@ EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const std::vector<EvalValue> &args);
 
+/* The VM's native-call entry (CallV): pre-evaluated arg values + the call-site
+ * loc for the backtrace. */
+EvalValue vm_call_func(EvalContext *ctx,
+                       FuncObject &obj,
+                       const std::vector<EvalValue> &args,
+                       Loc call_site);
+
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const EvalValue &arg);

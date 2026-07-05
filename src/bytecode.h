@@ -155,6 +155,20 @@ enum class OpCode : unsigned char {
     EvalToSlot,
 
     /*
+     * Native USER-function call (no node->eval): the args are already evaluated
+     * into a contiguous register run [a.lit, a.lit + b.lit); `target2` = the
+     * callee's GLOBAL-table slot (a DirectCallExpr with vm_direct_func, so the
+     * callee is a proven user function); `target` = the dst slot for the
+     * result;
+     * `node` = the CallExpr (its loc is the backtrace call site + the
+     * NotCallableEx loc if the slot was reassigned to a non-function). Gathers
+     * the arg values and calls vm_call_func -> do_func_call, which runs the
+     * callee's body via its own chunk (Phase 4) or the tree-walker. Builtins
+     * (DirectBuiltinCallExpr) and struct constructors stay EvalToSlot/EvalStmt.
+     */
+    CallV,
+
+    /*
      * Load an immediate into a frame slot: slot[target] = <int/float literal>
      * (`a.lit` / `a.flit`). This is the clean "move a constant to a slot" that
      * a `var i = 0` / `x = 5` compiles to (vs an `IntBin dst = imm + 0`
