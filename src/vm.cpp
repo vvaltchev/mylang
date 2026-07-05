@@ -584,15 +584,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
-        case OpCode::CallV: {
+        case OpCode::CallV:
+        case OpCode::CachedCallV: {
 
-            /* Native user-function call: gather the pre-evaluated args from the
-             * register run and vm_call_func -> do_func_call (which runs the
-             * callee body via its chunk or the tree-walker). A callee slot not
-             * yet defined / reassigned to a non-function throws the same
-             * UndefinedVariableEx / NotCallableEx the tree-walker would; the
-             * args
-             * are evaluated exactly once either way. */
+            /* Native user-function call: the args occupy the contiguous run
+             * [a.lit, a.lit+b.lit) of THIS frame's slots - pass a view (no
+             * per-call vector allocation). vm_call_func -> do_func_call runs
+             * the
+             * callee body via its chunk or the tree-walker; CachedCallV routes
+             * through the per-frame pure-call cache (the fib-unroll dedup). A
+             * callee slot not yet defined / reassigned to a non-function throws
+             * the same UndefinedVariableEx / NotCallableEx the tree-walker
+             * would; the args are evaluated exactly once either way. */
             const CallExpr *call = static_cast<const CallExpr *>(in.node);
             if (!ctx.gfuncs->defined[in.target2])
                 throw UndefinedVariableEx(
@@ -602,11 +605,12 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             const EvalValue &callee = ctx.gfuncs->slots[in.target2].get();
             if (!callee.is<intrusive_ptr<FuncObject>>())
                 throw NotCallableEx(call->start, call->end);
-            /* The args occupy the contiguous run [a.lit, a.lit+b.lit) of THIS
-             * frame's slots - pass a view (no per-call vector allocation). */
-            ctx.frame->slots[in.target].put(vm_call_func(
-                &ctx, *callee.get<intrusive_ptr<FuncObject>>().get(),
-                &ctx.frame->slots[in.a.lit], in.b.lit, call->start));
+            FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+            LValue *ap = &ctx.frame->slots[in.a.lit];
+            ctx.frame->slots[in.target].put(
+                in.op == OpCode::CachedCallV
+                    ? vm_cached_call(&ctx, fo, ap, in.b.lit, call->start)
+                    : vm_call_func(&ctx, fo, ap, in.b.lit, call->start));
             pc++;
             break;
         }

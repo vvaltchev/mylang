@@ -730,6 +730,31 @@ EvalValue eval_func(EvalContext *ctx,
  * per-frame cache (the unroll still happens; only the dedup is off). */
 bool g_pure_cache_enabled = true;
 
+/*
+ * The per-frame pure-call cache lookup given already-evaluated arg values:
+ * {func, vals} -> result. A hit reuses it; a miss calls and caches a SCALAR
+ * result (a fresh mutable container is never cached - it would alias across
+ * callers; the un-cached call gives each its own). Shared by cached_call
+ * (tree-walker) and vm_cached_call (the VM's CachedCallV). The caller has
+ * already checked ctx->frame && g_pure_cache_enabled.
+ */
+static EvalValue
+pure_cache_call(EvalContext *ctx, FuncObject &obj,
+                const vector<EvalValue> &vals, Loc call_site,
+                const InlineCtx *inl)
+{
+    PureCache &cache = ctx->frame->ensure_pure_cache();
+    PureCacheKey key{ obj.func, vals };
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+
+    EvalValue r = do_func_call(ctx, obj, vals, call_site, inl);
+    if (r.get_type()->t < Type::t_str)
+        cache.emplace(move(key), r);
+    return r;
+}
+
 static EvalValue
 cached_call(EvalContext *ctx, FuncObject &obj,
             const vector<unique_ptr<Construct>> &args,
@@ -743,25 +768,24 @@ cached_call(EvalContext *ctx, FuncObject &obj,
     for (const auto &a : args)
         vals.push_back(RValue(a->eval(ctx)));
 
-    PureCache &cache = ctx->frame->ensure_pure_cache();
-    PureCacheKey key{ obj.func, vals };
-    auto it = cache.find(key);
-    if (it != cache.end())
-        return it->second;
+    return pure_cache_call(ctx, obj, vals, call_site, inl);
+}
 
-    EvalValue r = do_func_call(ctx, obj, vals, call_site, inl);
+/* The VM's CachedCallV: cached_call but the args are already evaluated into the
+ * caller's frame slots (no node->eval). Same per-frame dedup. */
+EvalValue
+vm_cached_call(EvalContext *ctx, FuncObject &obj,
+               const LValue *argslots, size_t n, Loc call_site)
+{
+    if (!ctx->frame || !g_pure_cache_enabled)
+        return do_func_call(ctx, obj, VmArgs{argslots, n}, call_site);
 
-    /*
-     * Cache only a SCALAR result (a trivial value type: none/int/float/bool).
-     * A pure function may return a fresh MUTABLE container (array/dict/struct);
-     * caching and re-handing that out would alias it across callers - the
-     * un-cached call gives each its own. Scalars are value-copied, so sharing
-     * is safe. (Tree-recursive funcs that the unroll targets return scalars -
-     * fib, sums, counts - so this loses nothing in practice.)
-     */
-    if (r.get_type()->t < Type::t_str)
-        cache.emplace(move(key), r);
-    return r;
+    vector<EvalValue> vals;
+    vals.reserve(n);
+    for (size_t i = 0; i < n; i++)
+        vals.push_back(argslots[i].get());
+
+    return pure_cache_call(ctx, obj, vals, call_site, nullptr);
 }
 
 static void stamp_operand_loc(const Construct *c, Exception &e);

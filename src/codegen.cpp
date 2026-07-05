@@ -363,6 +363,56 @@ struct Codegen {
             if (try_native_call(dc, out_slot, ops))
                 return true;
 
+        /* A ternary `cond ? a : b` as a VALUE: compute cond, branch on it, and
+         * evaluate exactly ONE of the two arms into `dst`. This is what makes a
+         * recursion-unroll return (fib: `return (n-1<2 ? .. : f(..)+f(..))..`)
+         * go native - each arm's own calls become CallV. `dst` is reserved
+         * BELOW the arms' scratch so neither arm clobbers it. */
+        if (const TernaryExpr *t = dynamic_cast<const TernaryExpr *>(e)) {
+            const size_t mark = ops.size();
+            const int save_top = next_temp;
+            const int dst = alloc_temp();
+            const int scratch = next_temp;
+
+            int cslot;
+            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops)) {
+                ops.resize(mark); next_temp = save_top; return false;
+            }
+            Instr jf;
+            jf.op = OpCode::JumpUnlessTrueV;
+            jf.target2 = cslot;
+            const size_t jf_i = ops.size();
+            ops.push_back(jf);
+            next_temp = scratch;
+
+            int aslot;
+            if (!compile_boxed_expr(t->thenExpr.get(), aslot, ops)) {
+                ops.resize(mark); next_temp = save_top; return false;
+            }
+            Instr mva;
+            mva.op = OpCode::MoveV; mva.target = dst; mva.target2 = aslot;
+            ops.push_back(mva);
+            const size_t jmp_i = ops.size();
+            Instr jend; jend.op = OpCode::Jump;
+            ops.push_back(jend);
+            next_temp = scratch;
+
+            ops[jf_i].target = static_cast<int>(ops.size());   /* else arm */
+
+            int bslot;
+            if (!compile_boxed_expr(t->elseExpr.get(), bslot, ops)) {
+                ops.resize(mark); next_temp = save_top; return false;
+            }
+            Instr mvb;
+            mvb.op = OpCode::MoveV; mvb.target = dst; mvb.target2 = bslot;
+            ops.push_back(mvb);
+            next_temp = scratch;
+
+            ops[jmp_i].target = static_cast<int>(ops.size());   /* merge */
+            out_slot = dst;
+            return true;
+        }
+
         /* An arith (`a+b`) / comparison (`a<b`) / logical (`a&&b`) chain, as a
          * raw ExprNN OR a TypedScalarExpr - `A && B` of comparisons specializes
          * to a logical even when the comparisons are boxed over a dyn operand,
@@ -615,7 +665,10 @@ struct Codegen {
 
         const int dst = alloc_temp();
         Instr cv;
-        cv.op = OpCode::CallV;
+        /* A CachedCallExpr (a pure tree-recursive callee the unroll dedups)
+         * routes through the per-frame pure-call cache; else a plain call. */
+        cv.op = dynamic_cast<const CachedCallExpr *>(dc)
+                    ? OpCode::CachedCallV : OpCode::CallV;
         cv.node = dc;
         cv.target = dst;
         cv.target2 = dc->direct_func_slot;

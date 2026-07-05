@@ -579,6 +579,15 @@ EvalValue vm_call_func(EvalContext *ctx,
                        size_t n,
                        Loc call_site);
 
+/* The VM's CachedCallV: like vm_call_func but with the per-frame pure-call
+ * cache
+ * (a CachedCallExpr - the recursion-unroll dedup, e.g. fib). */
+EvalValue vm_cached_call(EvalContext *ctx,
+                         FuncObject &obj,
+                         const LValue *argslots,
+                         size_t n,
+                         Loc call_site);
+
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const EvalValue &arg);

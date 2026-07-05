@@ -169,6 +169,16 @@ enum class OpCode : unsigned char {
     CallV,
 
     /*
+     * Like CallV but for a CachedCallExpr (a pure tree-recursive callee the
+     * unroll dedups): goes through vm_cached_call, which checks the caller
+     * frame's per-frame PureCache ({func, arg values} -> result) before the
+     * call.
+     * WITHOUT this, the exponential recursion the cache collapses (fib$0) would
+     * be recomputed - a huge regression. Same operand layout as CallV.
+     */
+    CachedCallV,
+
+    /*
      * Native `return <expr>;` (no node->eval of the return): `a` = the slot
      * holding the already-evaluated return value (a bare `return;` loads `none`
      * into it first). Sets ctx->flow to {ret, value} and STOPS the chunk

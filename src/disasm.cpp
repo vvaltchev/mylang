@@ -165,6 +165,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "call.v       r" << in.target << " = g" << in.target2
                 << "(r" << in.a.lit << "..+" << in.b.lit << ")";
             break;
+        case OpCode::CachedCallV:
+            row << "call.cached  r" << in.target << " = g" << in.target2
+                << "(r" << in.a.lit << "..+" << in.b.lit << ")";
+            break;
         case OpCode::ReturnV:
             row << "return.v     " << reg_or_imm(in.a, false);
             break;
