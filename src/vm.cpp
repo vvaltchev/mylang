@@ -602,16 +602,22 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             const EvalValue &callee = ctx.gfuncs->slots[in.target2].get();
             if (!callee.is<intrusive_ptr<FuncObject>>())
                 throw NotCallableEx(call->start, call->end);
-            std::vector<EvalValue> argvals;
-            argvals.reserve(in.b.lit);
-            for (int_type i = 0; i < in.b.lit; i++)
-                argvals.push_back(ctx.frame->slots[in.a.lit + i].get());
+            /* The args occupy the contiguous run [a.lit, a.lit+b.lit) of THIS
+             * frame's slots - pass a view (no per-call vector allocation). */
             ctx.frame->slots[in.target].put(vm_call_func(
                 &ctx, *callee.get<intrusive_ptr<FuncObject>>().get(),
-                argvals, call->start));
+                &ctx.frame->slots[in.a.lit], in.b.lit, call->start));
             pc++;
             break;
         }
+
+        case OpCode::ReturnV:
+            /* `return <expr>`: the value is already in a.slot (a bare return
+             * loaded `none`). Set flow and STOP the chunk, as an
+             * EvalStmt(ReturnStmt) does; do_func_call reads flow->value. */
+            ctx.flow->value = ctx.frame->slots[in.a.slot].get();
+            ctx.flow->type = FlowState::ret;
+            return;
 
         case OpCode::ArrLen:
             /* n = size(array). The base is a flat array (ForeachStmt::elem_th

@@ -626,6 +626,42 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * Native `return <expr>;` -> ReturnV (no node->eval of the return): the
+     * value expr compiles via compile_boxed_expr - so a `return f(x)` becomes a
+     * CallV, `return a+b` a BinOpV, etc. A bare `return;` loads `none`. An expr
+     * compile_boxed_expr can't lower (e.g. a ternary from a recursion unroll)
+     * rolls back to the EvalStmt fallback.
+     */
+    bool try_native_return(const ReturnStmt *ret, std::vector<Instr> &ops)
+    {
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+
+        int vslot;
+        if (ret->elem) {
+            if (!compile_boxed_expr(ret->elem.get(), vslot, ops)) {
+                ops.resize(mark);
+                next_temp = save_top;
+                return false;
+            }
+        } else {
+            vslot = alloc_temp();
+            Instr ld;
+            ld.op = OpCode::LoadConstV;
+            ld.target = vslot;
+            ld.target2 = add_const(EvalValue());   /* none */
+            ops.push_back(ld);
+        }
+
+        Instr rv;
+        rv.op = OpCode::ReturnV;
+        rv.node = ret;
+        rv.a = slot_op(vslot);
+        ops.push_back(rv);
+        return true;
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<Instr> &ops)
     {
@@ -1291,6 +1327,13 @@ struct Codegen {
                     continue;
                 }
             }
+            /* `return <expr>;` -> ReturnV. */
+            if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
+                if (try_native_return(ret, chunk.code)) {
+                    any_native = true;
+                    continue;
+                }
+            }
 
             if (dynamic_cast<const Expr14 *>(s)
                 || dynamic_cast<const CallExpr *>(s)
@@ -1735,6 +1778,11 @@ struct Codegen {
                 dynamic_cast<const DirectCallExpr *>(s)) {
             int dst;
             if (try_native_call(dc, dst, chunk.code))
+                return;
+        }
+        /* `return <expr>;` -> ReturnV (its expr compiled natively). */
+        if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
+            if (try_native_return(ret, chunk.code))
                 return;
         }
         emit(OpCode::EvalStmt, s);

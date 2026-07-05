@@ -568,11 +568,15 @@ EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const std::vector<EvalValue> &args);
 
-/* The VM's native-call entry (CallV): pre-evaluated arg values + the call-site
- * loc for the backtrace. */
+/* The VM's native-call entry (CallV): the args are already evaluated into a
+ * contiguous run of the CALLER's frame slots `argslots[0..n)`, so bind them
+ * directly (no per-call vector allocation - the hot recursion path);
+ * `call_site`
+ * is the CallExpr's loc, for the backtrace. */
 EvalValue vm_call_func(EvalContext *ctx,
                        FuncObject &obj,
-                       const std::vector<EvalValue> &args,
+                       const LValue *argslots,
+                       size_t n,
                        Loc call_site);
 
 EvalValue eval_func(EvalContext *ctx,

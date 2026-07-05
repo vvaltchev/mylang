@@ -465,6 +465,41 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
     }
 }
 
+/*
+ * A view over the caller's frame arg slots for the VM's native call (CallV): no
+ * vector allocation and no per-arg copy - bind reads each slot's value in
+ * place.
+ * This is the hot recursion path (a per-call vector was a ~30% regression).
+ */
+struct VmArgs {
+    const LValue *slots;
+    size_t n;
+    size_t size() const { return n; }
+    const EvalValue &operator[](size_t i) const { return slots[i].get(); }
+};
+
+static void
+do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+                    const VmArgs &args,
+                    EvalContext *ctx,
+                    EvalContext *args_ctx,
+                    Frame *frame,
+                    size_t min_args)
+{
+    const size_t nparams = funcParams.size();
+    if (args.size() > nparams || args.size() < min_args)
+        throw InvalidNumberOfArgsEx();
+
+    for (size_t i = 0; i < nparams; i++) {
+        if (i < args.size())
+            bind_param(args_ctx, frame, i, funcParams[i].get(),
+                       args[i], ctx->const_ctx);
+        else
+            bind_param(args_ctx, frame, i, funcParams[i].get(),
+                       EvalValue(), ctx->const_ctx);
+    }
+}
+
 static void
 do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
                     const EvalValue &arg,
@@ -653,16 +688,17 @@ EvalValue eval_func(EvalContext *ctx,
     return do_func_call(ctx, obj, args);
 }
 
-/* The VM's native-call entry (CallV): the args are already evaluated into
- * registers, so bind the VALUES (skipping the per-arg node->eval the
- * tree-walker
- * does); `call_site` is the CallExpr's loc, for the backtrace. */
+/* The VM's native-call entry (CallV): the args are already evaluated into a
+ * contiguous run of the CALLER's frame slots, so bind them in place via a
+ * VmArgs view - no per-call vector allocation (the hot recursion path).
+ * `call_site` is the CallExpr's loc, for the backtrace. */
 EvalValue vm_call_func(EvalContext *ctx,
                        FuncObject &obj,
-                       const vector<EvalValue> &args,
+                       const LValue *argslots,
+                       size_t n,
                        Loc call_site)
 {
-    return do_func_call(ctx, obj, args, call_site);
+    return do_func_call(ctx, obj, VmArgs{argslots, n}, call_site);
 }
 
 EvalValue eval_func(EvalContext *ctx,

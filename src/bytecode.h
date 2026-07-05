@@ -169,6 +169,16 @@ enum class OpCode : unsigned char {
     CallV,
 
     /*
+     * Native `return <expr>;` (no node->eval of the return): `a` = the slot
+     * holding the already-evaluated return value (a bare `return;` loads `none`
+     * into it first). Sets ctx->flow to {ret, value} and STOPS the chunk
+     * (returns from vm_run_chunk), exactly as an EvalStmt(ReturnStmt) does - so
+     * do_func_call reads flow->value. The return EXPRESSION is compiled by
+     * compile_boxed_expr, so its own calls (`return f(x)`) become CallV.
+     */
+    ReturnV,
+
+    /*
      * Load an immediate into a frame slot: slot[target] = <int/float literal>
      * (`a.lit` / `a.flit`). This is the clean "move a constant to a slot" that
      * a `var i = 0` / `x = 5` compiles to (vs an `IntBin dst = imm + 0`

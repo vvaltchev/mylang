@@ -2973,6 +2973,16 @@ static const std::vector<test> tests =
         "assert(tri(3) == 3);",
         "assert(tri(10) == 230);",
         "assert(tri(15) == 4841);" } },
+    /* Native returns (VM): a `return f(x)` compiles the return EXPRESSION (a
+     * CallV) into a ReturnV, so a mutual recursion - whose bodies chunk via the
+     * `if`'s native compare - runs its returns + recursive calls with no
+     * node->eval. Exercised under both engines by the differential harness. */
+    { "vm: native return + mutual recursion",
+      { "func iseven(n) { if (n == 0) return 1; return isodd(n - 1); }",
+        "func isodd(n) { if (n == 0) return 0; return iseven(n - 1); }",
+        "assert(iseven(6) == 1);",
+        "assert(isodd(5) == 1);",
+        "assert(iseven(7) == 0);" } },
     { "v3 recursion: a non-negative-base recursion folds negatives safely",
       { "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
         "assert(fib(7) == 13);" } },
