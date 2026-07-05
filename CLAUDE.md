@@ -2876,7 +2876,12 @@ runtime `Type::subscript`), and members (`obj.f` / `d.k` via a shared
 flat `array<int>`/`array<float>`** (single, non-indexed loop var) lowers to a
 counted loop (snapshot + `ArrLen` + `LoadElem` + the fused `ForLoopStep`, −64%
 instructions; the sound case is stamped by the inferencer as
-`ForeachStmt::elem_th`). Gated by the
+`ForeachStmt::elem_th`). **User-function calls** go native via `CallV`: a call
+proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
+struct constructor / builtin) that devirtualized to a global slot evaluates its
+args into a register run and calls `vm_call_func` → `do_func_call` with the
+VALUES (no `node->eval` of the call); builtins (the ABI change) and calls inside
+a `return` are still fallbacks. Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`

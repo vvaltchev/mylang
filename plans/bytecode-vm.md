@@ -585,10 +585,28 @@ to a counted loop — snapshot the container once, `n = ArrLen` (a new op),
 `ForLoopStep` back-edge (the unfused compare+i++/jump was perf-NEUTRAL vs the
 tree-walker's already-excellent flat-int foreach; the fused step is −64%
 instructions). Dict / string / general / tuple / indexed / non-local-array
-foreach stay the tree-walker fallback. **Still TODO in this tier:**
-call / make-array/dict — see the op list below. The boxed SCALAR +
-SUBSCRIPT + MEMBER core is complete: a `dyn`/string expression over
-locals/globals/captures/builtins/literals/subscripts/members, with
+foreach stay the tree-walker fallback. **Native USER-function calls** landed as
+`CallV` (the first half of the call work): a call the inferencer proved a user
+FUNCTION (`CallExpr::vm_direct_func`, a Func static type - NOT a struct
+constructor, whose `construct_struct` self-evaluates its args, nor a builtin)
+and that devirtualized to a global slot evaluates its args into a register run
+and calls `vm_call_func` → `do_func_call` with the VALUES (no `node->eval`
+of the call). Fires for a call as a scalar/boxed operand or a statement; a
+callee not yet defined / reassigned throws the same UndefinedVariableEx /
+NotCallableEx.
+**Still TODO in this tier:**
+- **builtin calls** — the ABI change: every builtin from `(ctx, ExprList*)` (it
+  self-evaluates its arg NODES) to evaluated-VALUES, so `CallV` can dispatch a
+  builtin natively. ~74 builtins, migrated incrementally (a few - `defined`, the
+  `type`/`decltype` queries - genuinely need the AST and keep a shim). This is
+  the real "last Construct* holdout".
+- **native returns** — a call inside a `return` expression is still an EvalStmt,
+  so a recursion's return-calls don't use CallV yet.
+- make-array/dict — see the op list below.
+
+The boxed SCALAR + SUBSCRIPT + MEMBER core is complete: a `dyn`/string
+expression over locals/globals/captures/builtins/literals/subscripts/members,
+with
 assign/compound/comparison/logical, runs with no `node->eval`.
 
 The typed unboxed int/float register machine is only the fast tier. To satisfy
