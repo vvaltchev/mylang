@@ -1436,10 +1436,21 @@ void Inferencer::annotate_hints(Construct *n)
                         || el->kind == StaticTypeKind::Dyn) {
                     /* GENERAL (non-flat) storage: the VM binds each element's
                      * EvalValue into the loop var via LoadElemValue - box-free.
-                     * Flat bool / POD-struct arrays are intentionally NOT here:
-                     * their raw bool byte / struct bytes need a scalar read (as
-                     * int/float do), not a boxed LoadElemValue - deferred. */
+                     * Flat bool arrays are intentionally NOT here: their raw
+                     * bool byte needs a scalar read, not LoadElemValue. */
                     fe->container_is_array = true;
+                } else if (single && el->kind == StaticTypeKind::Struct
+                           && el->struct_def) {
+                    /* Flat array<PodStruct>: the loop var's SCALAR fields are
+                     * read DIRECTLY from the array bytes (no per-iteration
+                     * StructObject), IF the body uses `p` only as scalar-field
+                     * reads - the codegen (try_native_struct_foreach) checks
+                     * that, else falls back. Not container_is_array (the
+                     * loop var is never bound to an element value). */
+                    const StructTypeDef *sd =
+                        static_cast<const StructTypeDef *>(el->struct_def);
+                    if (sd->is_pod())
+                        fe->container_struct_def = sd;
                 }
             }
         }

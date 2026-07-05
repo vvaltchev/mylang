@@ -125,6 +125,19 @@ enum class OpCode : unsigned char {
     LoadElemValue,
 
     /*
+     * Native struct-FIELD read from a flat array<PodStruct> element `pts[i].f`
+     * into a scalar slot (the struct-foreach direct read): `target` = the dst,
+     * `target2` = the struct-array slot, `a` = the int index/counter, `b` =
+     * the field INDEX (into the def). Reads the scalar straight from the array
+     * bytes at (arr.offset() + i)*stride + field.offset - NO StructObject,
+     * no memcpy (what beats the tree-walker's reused-object foreach). The
+     * codegen proves the base is a flat struct array + the field a non-null
+     * scalar, so the read can't fault (index in range by the counted loop);
+     * node-free. Int / float variants. */
+    LoadStructFieldInt,
+    LoadStructFieldFloat,
+
+    /*
      * Native dict `foreach` via a LIVE unordered_map iterator (a dict has no
      * O(1) index, so it can't use the counted-loop machine). The per-loop
      * iterator STATE lives in a `vm_run_chunk`-local vector sized by

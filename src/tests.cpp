@@ -5562,6 +5562,35 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native struct-foreach DIRECT field read (VM LoadStructField{Int,
+         * Float}): a foreach over a flat array<PodStruct> whose body reads the
+         * loop var ONLY as scalar fields reads them straight from the array
+         * bytes - no per-element StructObject. A whole-`p` use or a `p.field`
+         * WRITE (must not hit the array - `p` is a copy) falls back. -vm. */
+        "Struct foreach direct field read native",
+        {
+            "struct P { int x; int y; }",
+            "var a = [P(1, 2), P(3, 4), P(5, 6)];",
+            "var sx = 0; var sy = 0;",
+            "foreach (var p in a) { sx += p.x; sy += p.y; }",
+            "assert(sx == 9 && sy == 12);",
+            "struct V { float a; float b; }",
+            "var vs = [V(1.5, 0.5), V(2.0, 1.0)];",
+            "var f = 0.0;",
+            "foreach (var v in vs) f += v.a + v.b;",
+            "assert(f == 5.0);",
+            "var q = P(0, 0);",       /* whole-p use -> fall back */
+            "foreach (var p in a) q = p;",
+            "assert(q.x == 5 && q.y == 6);",
+            "foreach (var p in a) p.x = 99;",   /* p.field write -> fall back */
+            "assert(a[0].x == 1);",             /* array unchanged (copy) */
+            "var t = 0;",                       /* nested loop, p.field */
+            "for (var r = 0; r < 2; r++) foreach (var p in a) t += p.x;",
+            "assert(t == 18);",
+        },
+    },
+
+    {
         /* native flat-array element inc-dec (VM StoreElemInt/Float with a
          * constant 1 == `a[i] += 1`): `a[i]++` / `a[i]--` on a flat int/float
          * array. The OOB caret is the subscript's. Differential under -vm. */

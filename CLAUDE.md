@@ -2945,8 +2945,21 @@ general `elem = view[i].get()`, ~1.7x on a general-array foreach loop; the
 inferencer stamps `ForeachStmt::container_is_array`. Both the **single-var**
 (`foreach (e in a)`) and the **INDEXED 2-var** (`foreach (i, e in indexed a)`)
 forms are native: for indexed, the index var IS the loop counter (the body
-reads it) and the element loads into the 2nd var. (Flat `array<bool>` /
-`array<PodStruct>` still fall back.) The **STRICT-UNPACK** `foreach (x, y in
+reads it) and the element loads into the 2nd var. (Flat `array<bool>` still
+falls back.) A **flat `array<PodStruct>` foreach** whose body reads the loop var
+ONLY as SCALAR FIELDS (`p.x`) is native via a **DIRECT read**: the loop var is
+NEVER materialized — the counted loop runs and each `p.field` compiles to
+**`LoadStructFieldInt`/`LoadStructFieldFloat`**, a scalar read STRAIGHT from the
+array element's bytes (`vm_struct_field_int/float`), skipping the per-iteration
+`StructObject` + `memcpy` the tree-walker's reused-object foreach pays (**~4x**
+on `65_struct_field_sum`). The inferencer stamps
+`ForeachStmt::container_struct_def`; the codegen's `struct_fe_body_ok` proves
+every loop-var use is a scalar-field READ (a whole-`p` use or a `p.field` WRITE
+— which must NOT hit the array, `p` is a copy — falls back to the tree-walker's
+reused-`StructObject` bind), and a per-body `sfe` mapping makes
+`compile_int/float_expr` emit the direct read for `p.field`. The
+**STRICT-UNPACK**
+`foreach (x, y in
 pairs)` over a proven `array<array<int>>` / `array<array<float>>` (flat
 sub-arrays) is native too: the outer array iterates counted, and per element a
 **`UnpackElemInt`/`UnpackElemFloat`** op reads `pairs[i]` (a general element = a

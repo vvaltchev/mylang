@@ -357,6 +357,12 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
                              Loc lstart, Loc lend);
 
+/* VM LoadStructFieldInt/Float: read scalar field #fidx of element `idx` of a
+ * flat array<PodStruct> directly from the bytes (the struct-foreach direct
+ * read). No bounds/type checks - the codegen proved them. See eval.cpp. */
+int_type vm_struct_field_int(const EvalValue &arrv, int_type idx, int fidx);
+float_type vm_struct_field_float(const EvalValue &arrv, int_type idx, int fidx);
+
 /* The stored value of a PRESENT dict key, else nullptr (a plain map find - the
  * tree-walker's typed dict fast path). Shared by Subscript/MemberExpr eval_int/
  * eval_float and the VM's P3 typed dict reads (DictLoadInt/Float). */

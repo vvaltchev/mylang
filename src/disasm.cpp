@@ -205,6 +205,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "load.elem.v  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";
             break;
+        case OpCode::LoadStructFieldInt:
+        case OpCode::LoadStructFieldFloat:
+            row << "load.sfield" << (in.op == OpCode::LoadStructFieldInt
+                                        ? "i " : "f ")
+                << D(in.target) << " = " << D(in.target2) << "["
+                << RI(in.a, false) << "].fld" << in.b.lit;
+            break;
         case OpCode::DictIterInit:
             row << "dict.iter.i  I" << in.target << " <- " << D(in.target2);
             break;

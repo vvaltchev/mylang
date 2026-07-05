@@ -77,6 +77,100 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
 }
 
 /*
+ * Body analysis for the struct-foreach direct read (try_native_struct_foreach):
+ * true iff EVERY use of the loop-var slot `loop_slot` in `c` is a READ of a POD
+ * SCALAR field (`p.x`). Then the loop var need not be materialized - each `p.x`
+ * compiles to a direct byte read of the array element. Bails (false) on: a
+ * whole-`p` use (a bare identifier - passed, assigned, compared, captured), a
+ * `p.field` WRITE (`p.field = ..` / `p.field++`, which must NOT hit the array -
+ * foreach `p` is a copy), a non-scalar field, or any node type we don't
+ * recognize (an unhandled node could hide a `p` use). `lval` marks an
+ * assignment-target context.
+ */
+static bool struct_fe_body_ok(const Construct *c, int loop_slot,
+                              const StructTypeDef *def, bool lval)
+{
+    if (!c)
+        return true;
+    if (auto *id = dynamic_cast<const Identifier *>(c))
+        return !(id->sym.kind == SymKind::local && id->sym.slot == loop_slot);
+    if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+        auto *bid = dynamic_cast<const Identifier *>(m->what.get());
+        if (bid && bid->sym.kind == SymKind::local
+            && bid->sym.slot == loop_slot) {
+            if (lval)
+                return false;                    /* a p.field WRITE */
+            const FieldDef *f = def->field_of(m->memUid);
+            if (!f || f->offset < 0)
+                return false;
+            return f->kind == FieldKind::f_int
+                || f->kind == FieldKind::f_float
+                || f->kind == FieldKind::f_bool;
+        }
+        return struct_fe_body_ok(m->what.get(), loop_slot, def, false);
+    }
+    if (auto *e = dynamic_cast<const Expr14 *>(c))
+        return struct_fe_body_ok(e->lvalue.get(), loop_slot, def, true)
+            && struct_fe_body_ok(e->rvalue.get(), loop_slot, def, false);
+    if (auto *inc = dynamic_cast<const IncDecExpr *>(c))
+        return struct_fe_body_ok(inc->lvalue.get(), loop_slot, def, true);
+    auto all = [&](std::initializer_list<const Construct *> cs) {
+        for (const Construct *ch : cs)
+            if (!struct_fe_body_ok(ch, loop_slot, def, false))
+                return false;
+        return true;
+    };
+    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+        for (const auto &pr : mo->elems)
+            if (!struct_fe_body_ok(pr.second.get(), loop_slot, def, false))
+                return false;
+        return true;
+    }
+    if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c)) {
+        for (const auto &pr : ts->elems)
+            if (!struct_fe_body_ok(pr.second.get(), loop_slot, def, false))
+                return false;
+        return true;
+    }
+    if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
+        for (const auto &el : me->elems)
+            if (!struct_fe_body_ok(el.get(), loop_slot, def, false))
+                return false;
+        return true;
+    }
+    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
+        return struct_fe_body_ok(sc->elem.get(), loop_slot, def, false);
+    if (auto *ce = dynamic_cast<const CallExpr *>(c))
+        return all({ce->what.get(), ce->args.get()});
+    if (auto *sub = dynamic_cast<const Subscript *>(c))
+        return all({sub->what.get(), sub->index.get()});
+    if (auto *iff = dynamic_cast<const IfStmt *>(c))
+        return all({iff->condExpr.get(), iff->thenBlock.get(),
+                    iff->elseBlock.get()});
+    if (auto *w = dynamic_cast<const WhileStmt *>(c))
+        return all({w->condExpr.get(), w->body.get()});
+    if (auto *f = dynamic_cast<const ForStmt *>(c))
+        return all({f->init.get(), f->cond.get(), f->inc.get(),
+                    f->body.get()});
+    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c))
+        return all({fr->init.get(), fr->bound.get(), fr->step.get(),
+                    fr->body.get()});
+    if (auto *fe2 = dynamic_cast<const ForeachStmt *>(c))
+        return all({fe2->container.get(), fe2->body.get()});
+    if (auto *te = dynamic_cast<const TernaryExpr *>(c))
+        return all({te->condExpr.get(), te->thenExpr.get(),
+                    te->elseExpr.get()});
+    if (auto *co = dynamic_cast<const CoalesceExpr *>(c))
+        return all({co->lhs.get(), co->rhs.get()});
+    if (auto *ret = dynamic_cast<const ReturnStmt *>(c))
+        return struct_fe_body_ok(ret->elem.get(), loop_slot, def, false);
+    if (dynamic_cast<const Literal *>(c)
+        || dynamic_cast<const ChildlessConstruct *>(c))
+        return true;                             /* a childless leaf */
+    return false;                                /* unrecognized -> bail */
+}
+
+/*
  * True for an op that WRITES its result into `.target` as a pure value and does
  * not also READ `.target` - so it is safe to retarget its `.target` to a
  * different (fresh) slot. Used to fuse away `<produce t>; MoveV rD = t` into a
@@ -312,6 +406,16 @@ struct Codegen {
     int next_temp = 0;
     int max_temp = 0;
     int max_dict_iters = 0;   /* # native dict foreachs -> n_dict_iters */
+
+    /* Active struct-foreach direct-read mapping: while compiling a
+     * try_native_struct_foreach body, a MemberExpr reading `sfe_loop_slot`'s
+     * scalar field compiles to a LoadStructField* (a direct byte read of
+     * sfe_arr_slot[sfe_ctr_slot].field) instead of materializing the loop var.
+     * sfe_loop_slot == -1 when inactive. */
+    int sfe_loop_slot = -1;
+    int sfe_arr_slot = -1;
+    int sfe_ctr_slot = -1;
+    const StructTypeDef *sfe_def = nullptr;
 
     int here() const { return static_cast<int>(chunk.code.size()); }
 
@@ -1538,11 +1642,47 @@ struct Codegen {
         return false;
     }
 
+    /* Struct-foreach direct read: if `m` reads the ACTIVE loop var's scalar
+     * field (`p.x`), emit LoadStructField{Int,Float} - a direct byte read of
+     * sfe_arr_slot[sfe_ctr_slot].field - into a temp (out). The body analysis
+     * (struct_fe_body_ok) already proved the base is the loop var + the field a
+     * scalar, so this can't misfire. */
+    bool try_sfe_field(const MemberExpr *m, Operand &out,
+                       std::vector<Instr> &ops, OpCode fieldop)
+    {
+        if (sfe_loop_slot < 0)
+            return false;
+        const Identifier *bid =
+            dynamic_cast<const Identifier *>(m->what.get());
+        if (!bid || bid->sym.kind != SymKind::local
+            || bid->sym.slot != sfe_loop_slot)
+            return false;
+        const FieldDef *f = sfe_def->field_of(m->memUid);
+        if (!f || f->offset < 0)
+            return false;
+        const int fidx = static_cast<int>(f - sfe_def->fields.data());
+        const int tt = alloc_temp();
+        Instr in;
+        in.op = fieldop;
+        in.target = tt;
+        in.target2 = sfe_arr_slot;
+        in.a = slot_op(sfe_ctr_slot);
+        in.b = int_lit(fidx);
+        ops.push_back(in);
+        out = slot_op(tt);
+        return true;
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<Instr> &ops)
     {
         if (as_int_operand(e, out))
             return true;
+
+        if (e->th == TypeHint::i)
+            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e))
+                if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldInt))
+                    return true;
 
         int dtt;
         if (try_dict_scalar_load(e, dtt, ops, OpCode::DictLoadInt,
@@ -1923,6 +2063,11 @@ struct Codegen {
     {
         if (as_float_operand(e, out))
             return true;
+
+        if (e->th == TypeHint::f)
+            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e))
+                if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldFloat))
+                    return true;
 
         int dtt;
         if (try_dict_scalar_load(e, dtt, ops, OpCode::DictLoadFloat,
@@ -2324,6 +2469,7 @@ struct Codegen {
             } else if (const ForeachStmt *fe =
                            dynamic_cast<const ForeachStmt *>(s)) {
                 if (try_native_foreach(fe) || try_native_foreach_unpack(fe)
+                    || try_native_struct_foreach(fe)
                     || try_native_dict_foreach(fe)) {
                     any_native = true;
                     continue;
@@ -2814,6 +2960,107 @@ struct Codegen {
     }
 
     /*
+     * Native foreach over a flat array<PodStruct> whose body reads the loop var
+     * ONLY as scalar-field reads (struct_fe_body_ok). The loop var is NEVER
+     * materialized: the counted loop over the array runs, and each `p.field` in
+     * the body compiles to a DIRECT byte read of the array element
+     * (LoadStructField*, via the sfe mapping), skipping the per-iteration
+     * StructObject + memcpy the tree-walker's reused-object foreach pays. Any
+     * whole-`p` use or a `p.field` write makes struct_fe_body_ok fail -> the
+     * tree-walker fallback.
+     */
+    bool try_native_struct_foreach(const ForeachStmt *fe)
+    {
+        if (!fe->container_struct_def || fe->indexed || !fe->ids
+            || fe->ids->elems.size() != 1)
+            return false;
+        const Identifier *id =
+            dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+        if (!id || id->sym.kind != SymKind::local)
+            return false;
+        const int x_slot = id->sym.slot;
+        if (!struct_fe_body_ok(fe->body.get(), x_slot,
+                               fe->container_struct_def, false))
+            return false;
+
+        const size_t start = chunk.code.size();
+        reset_temps();
+
+        int csrc;
+        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
+            chunk.code.resize(start);
+            return false;
+        }
+        const int c = alloc_temp();
+        Instr mv;
+        mv.op = OpCode::MoveV;
+        mv.target = c;
+        mv.target2 = csrc;
+        chunk.code.push_back(mv);
+
+        const int n = alloc_temp();
+        Instr ln;
+        ln.op = OpCode::ArrLen;
+        ln.node = fe->container.get();
+        ln.target = n;
+        ln.target2 = c;
+        chunk.code.push_back(ln);
+
+        const int i = alloc_temp();
+        Instr z;
+        z.op = OpCode::LoadImmInt;
+        z.target = i;
+        z.a = int_lit(0);
+        chunk.code.push_back(z);
+
+        const int saved_base = temp_base;
+        temp_base = next_temp;
+
+        const size_t jt = emit_cmp(OpCode::JumpUnlessIntCmp,
+                                   fe->container.get(), Op::lt,
+                                   slot_op(i), slot_op(n));
+        const int lbody = here();
+
+        /* No element load - p is never materialized. Activate the direct-read
+         * mapping so a p.field read -> LoadStructField*(c[i].fld). */
+        sfe_loop_slot = x_slot;
+        sfe_arr_slot = c;
+        sfe_ctr_slot = i;
+        sfe_def = fe->container_struct_def;
+
+        loops.push_back({});
+        const bool body_ok = compile_scalar_body(body_stmts(fe->body.get()));
+
+        sfe_loop_slot = -1;   /* deactivate (success AND failure path) */
+        sfe_arr_slot = sfe_ctr_slot = -1;
+        sfe_def = nullptr;
+
+        if (!body_ok) {
+            loops.pop_back();
+            temp_base = saved_base;
+            chunk.code.resize(start);
+            return false;
+        }
+
+        const int lcont = here();
+        Instr fstep;
+        fstep.op = OpCode::ForLoopStep;
+        fstep.node = fe->container.get();
+        fstep.aop = Op::lt;
+        fstep.target = lbody;
+        fstep.target2 = i;
+        fstep.a = slot_op(n);
+        fstep.b = int_lit(1);
+        chunk.code.push_back(fstep);
+
+        const int lend = here();
+        chunk.code[jt].target = lend;
+        pop_loop(lend, lcont);
+        temp_base = saved_base;
+        return true;
+    }
+
+    /*
      * Native STRICT foreach-unpack: `foreach (x, y in pairs)` over a proven
      * array<array<int/float>>. Same counted loop over the OUTER array as
      * try_native_foreach, but each element is a flat sub-array destructured
@@ -3059,6 +3306,7 @@ struct Codegen {
         if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
             if (!try_native_foreach(fe)         /* flat/general array */
                 && !try_native_foreach_unpack(fe) /* strict array destructure */
+                && !try_native_struct_foreach(fe) /* flat struct fields */
                 && !try_native_dict_foreach(fe))  /* live dict iterator */
                 emit(OpCode::EvalStmt, s);
             return;

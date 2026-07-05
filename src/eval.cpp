@@ -2812,6 +2812,36 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
     return slot_rmw(*elv.get<LValue *>(), op, value);
 }
 
+/* Read scalar field #fidx of element `idx` of a flat array<PodStruct> straight
+ * from the bytes (the VM's LoadStructFieldInt/Float, the struct-foreach direct
+ * read). `arrv` is the array value; the codegen proved it flat-struct + `idx`
+ * in range (the counted loop), so no checks. A bool field reads as 0/1. */
+int_type vm_struct_field_int(const EvalValue &arrv, int_type idx, int fidx)
+{
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    const auto &sv = arr.flat_structs();
+    const FieldDef &f = sv.def->fields[fidx];
+    const char *p =
+        sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
+    if (f.kind == FieldKind::f_bool)
+        return static_cast<unsigned char>(*p) != 0 ? 1 : 0;
+    int_type v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
+
+float_type vm_struct_field_float(const EvalValue &arrv, int_type idx, int fidx)
+{
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    const auto &sv = arr.flat_structs();
+    const FieldDef &f = sv.def->fields[fidx];
+    const char *p =
+        sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
+    float_type v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
+
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,

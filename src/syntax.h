@@ -1556,6 +1556,13 @@ public:
      * (UnpackElemInt/Float), with the strict size check. `none` = not this form
      * (a `_`, general/opt sub-array, etc. -> fall back). */
     TypeHint unpack_elem_th = TypeHint::none;
+    /* Set by the inferencer to the (POD) struct def for a single, non-indexed
+     * loop over a proven flat array<PodStruct>. The VM iterates it counted and,
+     * when the body reads ONLY the loop var's SCALAR FIELDS (`p.x`), reads them
+     * DIRECTLY from the array bytes (LoadStructFieldInt/Float) with NO per-
+     * iteration StructObject / memcpy - beating the tree-walker's reused-object
+     * bind. A whole-`p` use or `p.field` write makes the codegen bail. */
+    const StructTypeDef *container_struct_def = nullptr;
 
     ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1574,6 +1581,7 @@ public:
         c->container_is_array = container_is_array;
         c->container_is_dict = container_is_dict;
         c->unpack_elem_th = unpack_elem_th;
+        c->container_struct_def = container_struct_def;
         return c;
     }
 };

@@ -32,6 +32,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~FDecl~~ | top-level `func f(){}` | all | — | ✅ MakeClosureV+StoreGlobalV |
 | ~~SDecl~~ | `struct P{}` decl bind | 58 | — | ✅ LoadConstV+StoreGlobalV |
 | ~~SCtor~~ | `P(x,y)` construct | 64 | 0.75x | ✅ StructCtorV (typed POD) |
+| ~~SFe~~ | struct foreach `p.x` | 65 | 0.27x | ✅ LoadStructField (direct) |
 | ~~I++~~ | subscript `a[i]++`/`d[k]++` | 47 | — | ✅ StoreElem/DictStore±1 |
 | ~~AF~~ | DictStore/StoreElemV AST-free | — | — | ✅ vm_subscript_store loc |
 | **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |

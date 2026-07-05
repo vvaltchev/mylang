@@ -1103,6 +1103,24 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::LoadStructFieldInt:
+            /* pts[i].f (scalar int/bool field) read straight from the flat
+             * struct-array bytes into a slot - the struct-foreach direct read,
+             * no StructObject. target2 = the array slot, a = the counter, b =
+             * the field index. */
+            write_int_slot(&ctx, in.target,
+                vm_struct_field_int(ctx.frame->at(in.target2).get(),
+                                    read_int_operand(in.a, &ctx), in.b.lit));
+            pc++;
+            break;
+
+        case OpCode::LoadStructFieldFloat:
+            write_float_slot(&ctx, in.target,
+                vm_struct_field_float(ctx.frame->at(in.target2).get(),
+                                      read_int_operand(in.a, &ctx), in.b.lit));
+            pc++;
+            break;
+
         case OpCode::CallBuiltinLV: {
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*
