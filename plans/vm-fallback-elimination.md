@@ -170,6 +170,13 @@ Progress (60-bench geomean; `run.py`'s 61-set reads a touch higher):
 **baseline 3.76× → P1 (bool) 3.82× → P2 (dict store) 3.96× → P3 (dict read)
 3.97× → P4 (general store) 4.02×.**
 
+**2026-07-08 — a TRACKED geomean dip:** `run.py --vm` slipped ~**4.5×** to
+~**4.3×** over the recent nativization pushes. This is the temporary cost of the
+still-present `Instr::node` field (more native ops → more of the bloated-`Instr`
+dispatch loop runs) and is scheduled to recover past 4.5× when `Instr::node` is
+dropped — see the "Perf regression to RECOVER" note in `vm-ast-free.md`. Do NOT
+revert a nativization to chase it.
+
 **Method:** ran `mylang -vd` on all 62 `bench/my/*.my` and recorded every
 AST-fallback op (`eval.stmt` = `EvalStmt`, `eval.slot` = `EvalToSlot` — the two
 ops that re-enter `node->eval`). Cross-referenced with the per-benchmark

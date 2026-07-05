@@ -36,6 +36,24 @@ register/loop core (`IntBin`/`FloatBin`/`JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/
 `node` users: the builtin calls, `EmplaceStruct`, and the fallback ops
 (`EvalStmt`/`JumpIfFalse` + the element-store fallbacks).
 
+## ⚠ Perf regression to RECOVER here (drop `Instr::node`, Step 5)
+
+**2026-07-08 — TRACKED, do NOT lose:** the `bench/run.py --vm` geomean slipped
+from ~**4.5×** CPython to ~**4.3×** over the recent fallback-nativization pushes
+(sort/reverse, map/filter, const-decl, scalar-spread, ...). This is EXPECTED,
+and expected to recover — and then some — at **Step 5 (drop `Instr::node`)**:
+every op still carries an 8-byte `Construct *node`, so `Instr` is 64 bytes (2×
+an `EvalValue`), and the recent work ADDED node-holding ops
+(`CheckFuncV`/`MapFilterV`/`DeclConstV`, plus `sort`/`reverse` via
+`CallBuiltinLV`). More native ops → more of the program runs through the VM
+dispatch loop, which pays that bloated-`Instr` I-cache cost. Removing the field
+shrinks `Instr` → far better dispatch-loop density (the SAME locality argument
+that sizes `EvalValue`). So the dip is the temporary cost of nativizing MORE
+constructs *before* the node field is gone — the fix is the builtin loc handle
+(Steps 1–3) + freeing the AST (Step 5), **NOT** reverting any nativization.
+**Action: re-measure `run.py --vm` geomean after Step 5 and confirm it clears
+4.5× (target: well beyond, toward the 5× floor).**
+
 ## The plan
 
 ### Step 1 — Generalize the loc table to carry per-op AND per-arg locs
