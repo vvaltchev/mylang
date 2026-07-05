@@ -262,18 +262,18 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin("get!", builtin_get_throw),  /* lookup or throw -> V */
 
     /* String builtins */
-    make_const_builtin("split", builtin_split),
-    make_const_builtin("join", builtin_join),
-    make_const_builtin("ord", builtin_ord),
-    make_const_builtin("chr", builtin_chr),
-    make_const_builtin("splitlines", builtin_splitlines),
-    make_const_builtin("lpad", builtin_lpad),
-    make_const_builtin("rpad", builtin_rpad),
-    make_const_builtin("lstrip", builtin_lstrip),
-    make_const_builtin("rstrip", builtin_rstrip),
-    make_const_builtin("strip", builtin_strip),
-    make_const_builtin("startswith", builtin_startswith),
-    make_const_builtin("endswith", builtin_endswith),
+    make_const_builtin_v<builtin_split>("split"),
+    make_const_builtin_v<builtin_join>("join"),
+    make_const_builtin_v<builtin_ord>("ord"),
+    make_const_builtin_v<builtin_chr>("chr"),
+    make_const_builtin_v<builtin_splitlines>("splitlines"),
+    make_const_builtin_v<builtin_lpad>("lpad"),
+    make_const_builtin_v<builtin_rpad>("rpad"),
+    make_const_builtin_v<builtin_lstrip>("lstrip"),
+    make_const_builtin_v<builtin_rstrip>("rstrip"),
+    make_const_builtin_v<builtin_strip>("strip"),
+    make_const_builtin_v<builtin_startswith>("startswith"),
+    make_const_builtin_v<builtin_endswith>("endswith"),
 
     /* Numeric builtins */
     make_const_builtin_v<builtin_abs>("abs"),

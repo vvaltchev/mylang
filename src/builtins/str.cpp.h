@@ -15,16 +15,17 @@
 
 #include <cctype>
 
-EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_split(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 2)
+    if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg_str = exprList->elems[0].get();
     Construct *arg_delim = exprList->elems[1].get();
 
-    const EvalValue &val_str = RValue(arg_str->eval(ctx));
-    const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
+    const EvalValue &val_str = args[0];
+    const EvalValue &val_delim = args[1];
 
     if (!val_str.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg_str->start, arg_str->end);
@@ -70,16 +71,17 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList)
     return SharedArrayObj(move(vec));
 }
 
-EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_join(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() != 2)
+    if (nargs != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg_arr = exprList->elems[0].get();
     Construct *arg_delim = exprList->elems[1].get();
 
-    const EvalValue &val_arr = RValue(arg_arr->eval(ctx));
-    const EvalValue &val_delim = RValue(arg_delim->eval(ctx));
+    const EvalValue &val_arr = args[0];
+    const EvalValue &val_delim = args[1];
 
     if (!val_arr.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg_arr->start, arg_arr->end);
@@ -110,13 +112,14 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList)
     return SharedStr(move(result));
 }
 
-EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList,
+                             const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg->start, arg->end);
@@ -161,13 +164,14 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList)
     return SharedArrayObj(move(vec));
 }
 
-EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg->start, arg->end);
@@ -181,13 +185,14 @@ EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList)
     return static_cast<int_type>(static_cast<unsigned char>(str[0]));
 }
 
-EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() != 1)
+    if (nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (!val.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
@@ -217,15 +222,16 @@ builtin_find_str(const SharedStr &str, const SharedStr &substr)
 
 template <bool leftpad>
 static EvalValue
-generic_pad(EvalContext *ctx, ExprList *exprList)
+generic_pad(EvalContext *ctx, ExprList *exprList,
+            const EvalValue *args, size_t nargs)
 {
-    if (exprList->elems.size() < 2 || exprList->elems.size() > 3)
+    if (nargs < 2 || nargs > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &strval = RValue(arg0->eval(ctx));
-    const EvalValue &nval = RValue(arg1->eval(ctx));
+    const EvalValue &strval = args[0];
+    const EvalValue &nval = args[1];
     char pad_char = ' ';
 
     if (!strval.is<SharedStr>())
@@ -234,10 +240,10 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
     if (!nval.is<int_type>())
         throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
-    if (exprList->elems.size() == 3) {
+    if (nargs == 3) {
 
         Construct *arg2 = exprList->elems[2].get();
-        const EvalValue &padc = RValue(arg2->eval(ctx));
+        const EvalValue &padc = args[2];
 
         if (!padc.is<SharedStr>())
             throw TypeErrorEx("Expected string", arg2->start, arg2->end);
@@ -272,23 +278,26 @@ generic_pad(EvalContext *ctx, ExprList *exprList)
     return strval;
 }
 
-EvalValue builtin_lpad(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_lpad(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t n)
 {
-    return generic_pad<true>(ctx, exprList);
+    return generic_pad<true>(ctx, exprList, args, n);
 }
 
-EvalValue builtin_rpad(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_rpad(EvalContext *ctx, ExprList *exprList,
+                       const EvalValue *args, size_t n)
 {
-    return generic_pad<false>(ctx, exprList);
+    return generic_pad<false>(ctx, exprList, args, n);
 }
 
-EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg->start, arg->end);
@@ -308,13 +317,14 @@ EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList)
     return SharedStr(shared_str, shared_str.offset() + s, str.size() - s);
 }
 
-EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList,
+                         const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg->start, arg->end);
@@ -334,13 +344,14 @@ EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList)
     return SharedStr(shared_str, shared_str.offset(), l);
 }
 
-EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg->start, arg->end);
@@ -365,15 +376,16 @@ EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList)
     return SharedStr(shared_str, shared_str.offset() + s, l - s);
 }
 
-EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList,
+                             const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 2)
+    if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &val0 = RValue(arg0->eval(ctx));
-    const EvalValue &val1 = RValue(arg1->eval(ctx));
+    const EvalValue &val0 = args[0];
+    const EvalValue &val1 = args[1];
 
     if (!val0.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg0->start, arg0->end);
@@ -391,15 +403,16 @@ EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList)
     return false;
 }
 
-EvalValue builtin_endswith(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_endswith(EvalContext *ctx, ExprList *exprList,
+                           const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 2)
+    if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &val0 = RValue(arg0->eval(ctx));
-    const EvalValue &val1 = RValue(arg1->eval(ctx));
+    const EvalValue &val0 = args[0];
+    const EvalValue &val1 = args[1];
 
     if (!val0.is<SharedStr>())
         throw TypeErrorEx("Expected string", arg0->start, arg0->end);
