@@ -17,6 +17,18 @@ fallback -> native). Disassembly reads as `i.jmp.ifnot a < b, L` / `load rN,#k`.
 stays neutral; the whole `-rt` suite passes under both engines. Branch:
 `exp-work`.
 
+**Perf-regression note (2026-07-04, user-observed):** the BROAD geomean
+(mylang-vs-CPython, the `bench/run.py` verdict) has slowly slipped from ~4.1x to
+~3.8x faster than CPython over the last several VM commits. The boxed-tier /
+call ops trade the tree-walker's already-tuned paths for not-yet-optimal native
+ones
+(boxed arg arithmetic through `BinOpV` instead of unboxed `IntBin`, unfused
+op sequences, a per-op switch where the tree-walker had one M8 vcall). This is
+ACCEPTED for now — the priority is correctness + removing every `node->eval`
+fallback first; a second pass reclaims the perf (typed arg lowering, fusing,
+dropping the boxed marshalling) once the fallbacks are gone. **Resume perf
+tuning after the fallbacks are removed** — do not let the slip grow unbounded.
+
 **THE DIRECTIVE (user, 2026-07-04), see [[vm-endgame]]:** do it ALL (every
 statement/expression kind native, ordered by EASE not perf impact); native ops
 must fully support `dyn`/general values and NEVER fall back to the tree walker;
@@ -604,16 +616,23 @@ no node->eval. **This also forced a CallV fix:** the handler built a
 std::vector<EvalValue> per call (a heap alloc), a ~32% regression on deep
 recursion; the args now stay in the caller's frame slots, passed as a `VmArgs`
 view (pointer+count) that `do_func_bind_params` binds in place — 1.315x →
-1.002x (neutral). A ternary return (a recursion unroll, e.g. fib) still isn't
-compiled by compile_boxed_expr → EvalStmt fallback.
-**Still TODO in this tier:**
+1.002x (neutral).
+
+**fib (bench 09) is now fully native too** (was the last recursion on the
+fallback — its unrolled return is a ternary): (a) a **ternary VALUE** in
+compile_boxed_expr (`cond ? a : b` → compute cond, `JumpUnlessTrueV`, one arm
+into a reserved `dst`; each arm's calls become CallV/CachedCallV), and (b)
+**`CachedCallV`** — the fib-unroll self-calls are `CachedCallExpr` (per-frame
+`PureCache` dedup of the exponential); a plain CallV BYPASSED the cache and made
+fib 15.7x SLOWER, so CachedCallV routes through `vm_cached_call` (the cache
+lookup given evaluated args is a shared `pure_cache_call` both engines use).
+fib$0 body → 0 EvalStmt; bench 09 15.767x → 0.996x (neutral, the cache
+dominates). **Still TODO in this tier:**
 - **builtin calls** — the ABI change: every builtin from `(ctx, ExprList*)` (it
   self-evaluates its arg NODES) to evaluated-VALUES, so `CallV` can dispatch a
   builtin natively. ~74 builtins, migrated incrementally (a few - `defined`, the
   `type`/`decltype` queries - genuinely need the AST and keep a shim). This is
   the real "last Construct* holdout".
-- **ternary in compile_boxed_expr** — so a recursion-unroll return (`fib`) goes
-  native too.
 - make-array/dict — see the op list below.
 
 The boxed SCALAR + SUBSCRIPT + MEMBER core is complete: a `dyn`/string

@@ -2883,10 +2883,12 @@ args into a register run (a `VmArgs` view over the caller's frame slots — no
 per-call allocation) and calls `vm_call_func` → `do_func_call` with the VALUES
 (no `node->eval` of the call). A **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
-sets flow={ret,value} and stops the chunk — so a mutual recursion runs its
-returns + recursive calls natively. Still fallbacks: builtins (the ABI change),
-a `return` of a ternary (a recursion unroll like fib), struct construction.
-Gated by the
+sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)
+compiles to a branch producing one arm into a slot, and a **`CachedCallV`**
+(a `CachedCallExpr`) routes through the caller frame's per-frame `PureCache` —
+together these make a recursion-unroll return native, so **`fib` runs fully
+native** (a plain CallV would BYPASS the cache and recompute the exponential).
+Still fallbacks: builtins (the ABI change), struct construction. Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
