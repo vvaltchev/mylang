@@ -10725,9 +10725,10 @@ static bool vm_codegen_shapes()
     const bool read_2d_ok =
         d2.loadev == 1 && d2.loadei == 1 && d2.flstep == 2 && d2.jif == 0;
 
-    /* 14) a scalar-returning BUILTIN in a loop body (`s += sqrt(i)`) lowers
-     * native: an EvalToSlot for the call, a FloatBin for the +=, a ForLoopStep,
-     * no fallback EvalStmt/JumpIfFalse (native builtin dispatch). */
+    /* 14) a scalar-returning migrated BUILTIN in a loop body (`s += sqrt(i)`)
+     * lowers native: a CallBuiltinV for the call (the value ABI, not the
+     * EvalToSlot fallback), a FloatBin for the +=, a ForLoopStep, no fallback
+     * EvalStmt/JumpIfFalse. */
     VmOpCounts bd;
     if (!codegen_counts({
             "var s = 0.0;",
@@ -10735,7 +10736,7 @@ static bool vm_codegen_shapes()
         }, bd))
         return false;
     const bool builtin_dispatch_ok =
-        bd.evalslot == 1 && bd.fbin == 1 && bd.flstep == 1 && bd.jif == 0;
+        bd.callbuiltinv == 1 && bd.fbin == 1 && bd.flstep == 1 && bd.jif == 0;
 
     /* 15) a native loop with a FLOW-FREE fallback body statement (a void call /
      * an array-building decl / a general store) still goes native AROUND the

@@ -105,13 +105,14 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList,
     }
 }
 
-EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (e.is<int_type>()) {
 
@@ -200,16 +201,16 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr)
 }
 
 template <bool is_max>
-EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
+EvalValue b_min_max(EvalContext *ctx, ExprList *exprList,
+                    const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() == 0)
+    if (n == 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *first_arg = exprList->elems[0].get();
-    EvalValue val = RValue(first_arg->eval(ctx));
-    const auto &vec = exprList->elems;
+    EvalValue val = args[0];
 
-    if (vec.size() == 1) {
+    if (n == 1) {
 
         if (!val.is<SharedArrayObj>()) {
             throw TypeErrorEx(
@@ -222,9 +223,9 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
         return b_min_max_arr<is_max>(val.get<SharedArrayObj>());
     }
 
-    for (size_type i = 1; i < vec.size(); i++) {
+    for (size_type i = 1; i < n; i++) {
 
-        const EvalValue &other = RValue(vec[i]->eval(ctx));
+        const EvalValue &other = args[i];
 
         if constexpr(is_max) {
 
@@ -241,21 +242,24 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList)
     return val;
 }
 
-EvalValue builtin_min(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_min(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    return b_min_max<false>(ctx, exprList);
+    return b_min_max<false>(ctx, exprList, args, n);
 }
 
-EvalValue builtin_max(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_max(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    return b_min_max<true>(ctx, exprList);
+    return b_min_max<true>(ctx, exprList, args, n);
 }
 
 template <size_type N, typename funcT>
 static EvalValue
-float_func(EvalContext *ctx, ExprList *exprList, funcT f)
+float_func(EvalContext *ctx, ExprList *exprList,
+           const EvalValue *args, size_t n, funcT f)
 {
-    if (exprList->elems.size() != N)
+    if (n != N)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
     float_type x[N];
@@ -263,7 +267,7 @@ float_func(EvalContext *ctx, ExprList *exprList, funcT f)
     for (size_type i = 0; i < N; i++) {
 
         Construct *arg = exprList->elems[i].get();
-        const EvalValue &v = RValue(arg->eval(ctx));
+        const EvalValue &v = args[i];
 
         if (v.is<float_type>())
 
@@ -290,19 +294,22 @@ float_func(EvalContext *ctx, ExprList *exprList, funcT f)
 /* The std::<name> overload for float_type (double), selected by an explicit
  * function-pointer cast (the name is overloaded for float/double/long dbl). */
 #define INST_FLOAT_BUILTIN_1(name)                                      \
-    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList) {    \
-        return float_func<1>(ctx, exprList,                            \
+    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList,      \
+                             const EvalValue *args, size_t n) {         \
+        return float_func<1>(ctx, exprList, args, n,                   \
             static_cast<float_type (*)(float_type)>(std::name));        \
     }
 
 #define INST_FLOAT_BUILTIN_1_ex(name, funcT, funcName)                  \
-    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList) {    \
-        return float_func<1, funcT>(ctx, exprList, funcName);           \
+    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList,      \
+                             const EvalValue *args, size_t n) {         \
+        return float_func<1, funcT>(ctx, exprList, args, n, funcName);  \
     }
 
 #define INST_FLOAT_BUILTIN_2(name)                                      \
-    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList) {    \
-        return float_func<2>(ctx, exprList,                            \
+    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList,      \
+                             const EvalValue *args, size_t n) {         \
+        return float_func<2>(ctx, exprList, args, n,                   \
             static_cast<float_type (*)(float_type, float_type)>(std::name)); \
     }
 
@@ -328,13 +335,14 @@ INST_FLOAT_BUILTIN_1_ex(isfinite, bool (*)(float_type), std::isfinite);
 INST_FLOAT_BUILTIN_1_ex(isnormal, bool (*)(float_type), std::isnormal);
 INST_FLOAT_BUILTIN_1_ex(isnan, bool (*)(float_type), std::isnan);
 
-EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_round(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() < 1)
+    if (n < 1)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &v0 = RValue(arg0->eval(ctx));
+    const EvalValue &v0 = args[0];
     float_type x;
 
     if (v0.is<float_type>())
@@ -344,17 +352,17 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList)
     else
         throw TypeErrorEx("Expected numeric type", arg0->start, arg0->end);
 
-    if (exprList->elems.size() == 1) {
+    if (n == 1) {
 
         return std::round(x);
 
     } else {
 
-        if (exprList->elems.size() != 2)
+        if (n != 2)
             throw InvalidArgumentEx(exprList->start, exprList->end);
 
         Construct *arg1 = exprList->elems[1].get();
-        const EvalValue &v1 = RValue(arg1->eval(ctx));
+        const EvalValue &v1 = args[1];
 
         if (!v1.is<int_type>() || v1.get<int_type>() < 0) {
             throw TypeErrorEx(
