@@ -6468,18 +6468,25 @@ static const std::vector<test> tests =
     },
 
     {
-        "The empty_arr optimization works as expected",
+        /* A `var x = []` LITERAL is a FRESH MUTABLE empty array, so append()
+         * mutates it IN PLACE - a function that appends to a passed-in `[]`
+         * grows the caller's array. The fix: neither make_mutable_clone (a
+         * const-folded `[]`) nor build_array_from_values (a runtime `[]`) may
+         * collapse an empty to the shared READ-ONLY empty_arr singleton. */
+        "Empty array: literal is fresh+mutable (not the read-only singleton)",
         {
             "var a=[1];",
-            "var b=a[5:];",
+            "var b=a[5:];",                  /* out-of-range slice -> empty */
             "b+=[99];",
             "assert(b == [99]);",
             "var c = a[5:];",
             "assert(c == []);",
             "",
             "var e1 = []; var e2 = [];",
-            "assert(intptr(e1) == intptr(e2));",
-            "assert(intptr(e1) == intptr(c));",
+            "assert(intptr(e1) != intptr(e2));",    /* fresh, don't alias */
+            "func app(arr) { append(arr, 7); }",
+            "app(e1);",
+            "assert(e1 == [7]);",                   /* mutated in place */
         },
     },
 

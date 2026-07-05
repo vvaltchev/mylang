@@ -1345,7 +1345,11 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
             return SharedArrayObj(SharedArrayObj::fvec_type{});
         if (hint == ArrHint::flat_b)
             return SharedArrayObj(SharedArrayObj::bvec_type{});
-        return empty_arr;
+        /* A general empty `[]` must be a FRESH MUTABLE array, not the shared
+         * read-only empty_arr singleton (like the flat hints above) - else a
+         * later append() COW-clones instead of mutating in place (a function
+         * appending to a passed-in `[]` wouldn't grow the caller). */
+        return SharedArrayObj(SharedArrayObj::vec_type{});
     }
 
     /*
@@ -1511,8 +1515,15 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
         if (arr.is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
 
-        if (!arr.size())
-            return empty_arr;
+        /* An empty array must NOT collapse to the shared read-only empty_arr
+         * singleton here: this is a MUTABLE clone (make_mutable_clone /
+         * make_deep_mutable_clone), so `var x = []` needs a FRESH MUTABLE empty
+         * of the source's kind - else `x` aliases the read-only singleton and a
+         * later append() COW-clones instead of mutating in place (so a function
+         * that appends to a passed-in `[]` won't grow the caller's array). The
+         * empty flows through the kind-specific copies below, which build a
+         * fresh empty vector of the right storage. (empty_arr stays the shared
+         * for CONST empties, via make_const_clone - a different path.) */
 
         /*
          * Flat homogeneous array: copy into fresh mutable unboxed storage. The
