@@ -101,7 +101,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::EvalToSlot:  case OpCode::ArrLen:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemValue: case OpCode::MakeArrayV:
-    case OpCode::MakeDictV:
+    case OpCode::MakeDictV:      case OpCode::MakeClosureV:
         return true;
     default:
         return false;
@@ -507,6 +507,24 @@ struct Codegen {
             chunk.literal_objs.push_back(
                 {lo->literal_value(), lo->is_immutable(), lo->arr_hint,
                  lo->arr_hint_struct});
+            ops.push_back(in);
+            out_slot = t;
+            return true;
+        }
+
+        /* A lambda `func [caps] (params) {..}` in EXPRESSION position (id ==
+         * null - a named nested func decl is a statement) -> MakeClosureV: it
+         * creates the FuncObject + snapshots captures from ctx, like
+         * FuncDeclStmt::do_eval; the Instr carries only the pool index. */
+        if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(e)) {
+            if (fd->id)
+                return false;
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::MakeClosureV;
+            in.target = t;
+            in.target2 = static_cast<int>(chunk.closure_defs.size());
+            chunk.closure_defs.push_back(fd);
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -1036,6 +1054,7 @@ struct Codegen {
                     || ops.back().op == OpCode::LoadLiteralObjV
                     || ops.back().op == OpCode::MakeArrayV
                     || ops.back().op == OpCode::MakeDictV
+                    || ops.back().op == OpCode::MakeClosureV
                     || ops.back().op == OpCode::SliceV)) {
                 /* These read their operand slots BEFORE writing `target`, and
                  * the local lvalue slot can't overlap the temp run - so writing

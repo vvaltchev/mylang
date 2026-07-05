@@ -5485,6 +5485,26 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native closure CREATION (VM MakeClosureV): a lambda `func[caps]{..}`
+         * in expression position (returned, var-bound, or a call arg) makes
+         * the FuncObject + snapshots its captures, byte-identical to
+         * FuncDeclStmt::do_eval. Differential under -vm. */
+        "Closure creation native (MakeClosureV)",
+        {
+            "func mk(n) { var b=n*10; return func [b] (x) { return b + x; }; }",
+            "var f = mk(5);",
+            "assert(f(3) == 53);",
+            "var g = func(x) => x * x;",             /* expression lambda */
+            "assert(g(6) == 36);",
+            "func ho(fn, x) => fn(x);",
+            "assert(ho(func(a) => a + 1, 9) == 10);", /* lambda as a call arg */
+            "func counter(s) { return func [s] { s++; return s; }; }",
+            "var c = counter(0);",
+            "assert(c() + c() == 3);",           /* create + capture write */
+        },
+    },
+
+    {
         /* native flat-array element inc-dec (VM StoreElemInt/Float with a
          * constant 1 == `a[i] += 1`): `a[i]++` / `a[i]--` on a flat int/float
          * array. The OOB caret is the subscript's. Differential under -vm. */

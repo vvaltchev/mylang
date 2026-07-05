@@ -1067,6 +1067,20 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::MakeClosureV: {
+            /* func[caps]{..} in expression position: create the FuncObject +
+             * snapshot the captures from ctx - byte-identical to
+             * FuncDeclStmt::do_eval for a lambda. The def is a program-lifetime
+             * FuncDeclStmt* from the pool (the Instr holds only the index). The
+             * ctor never throws (a resolved closure's captures are defined),
+             * so no loc. */
+            ctx.frame->at(in.target).put(EvalValue(intrusive_ptr<FuncObject>(
+                make_intrusive<FuncObject>(chunk.closure_defs[in.target2],
+                                           &ctx))));
+            pc++;
+            break;
+        }
+
         case OpCode::CallBuiltinLV: {
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*

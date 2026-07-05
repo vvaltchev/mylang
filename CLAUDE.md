@@ -3036,7 +3036,18 @@ even/value at odd), and the op builds via the shared **`build_dict_from_pairs`**
 (which freezes each key). Both share **`compile_to_run_slot`** (factored out of
 `emit_args_range`) to place each element in its run slot. Dict-literal loops
 (`25_dict_member` 0.63x, `62_dict_word_count` 0.69x vs the tree-walker) go
-native. A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
+native. A **CLOSURE** `func [caps] (params) {..}` in expression position (a
+returned / var-bound / call-arg lambda, `id == null`) builds via
+**`MakeClosureV`**: `make_intrusive<FuncObject>(def, &ctx)` snapshots the
+captures from `ctx` — byte-identical to `FuncDeclStmt::do_eval` for a lambda —
+where `def` is a program-lifetime `FuncDeclStmt*` from a `Chunk::closure_defs`
+pool (the `Instr` holds only the index, no raw `Construct*`; the ctor never
+throws for a resolved closure, so no loc). With this + `StoreCaptureV` +
+`CallValueV`, the whole closure lifecycle (**create → capture read/write → call
+→ body**) is native — the residual `EvalStmt` in a closure bench is the one-time
+top-level **func-decl binding** (`func make_counter(..)`).
+
+A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
 **`try_multi_literal_store`** (codegen) NOT by building the array and unpacking,
 but by compiling each element into a snapshot temp and **distributing** the

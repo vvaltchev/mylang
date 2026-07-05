@@ -28,6 +28,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~C~~ | ~~closure/indirect call `c()`~~ | 11 | — | ✅ CallValueV 1.09→1.00 |
 | ~~R~~ | global write `g=`/`+=`/`++` | — | — | ✅ StoreGlobalV (0-bench) |
 | ~~Cap~~ | closure capture `cap++` | 11,63 | — | ✅ StoreCaptureV (0-bench) |
+| ~~MkC~~ | closure `<lambda>` create | 11,63 | — | ✅ MakeClosureV (node-free) |
 | ~~I++~~ | subscript `a[i]++`/`d[k]++` | 47 | — | ✅ StoreElem/DictStore±1 |
 | ~~AF~~ | DictStore/StoreElemV AST-free | — | — | ✅ vm_subscript_store loc |
 | **A** | `push(a,i)` value self-eval | 13 | P10a | native already (noise) |

@@ -486,6 +486,19 @@ enum class OpCode : unsigned char {
     MakeDictV,
 
     /*
+     * Build a CLOSURE value `func [caps] (params) {..}` (a lambda in expression
+     * position) into `target`: make_intrusive<FuncObject>(def, &ctx), which
+     * snapshots the captures from ctx - byte-identical to FuncDeclStmt::do_eval
+     * for a lambda (id == null). `target2` = the index into Chunk::closure_defs
+     * (the program-lifetime FuncDeclStmt*; the closure inherently needs its
+     * definition, but the Instr carries only an index, no raw Construct*). The
+     * ctor never throws for a resolved closure (captures are all resolved), so
+     * node-free / no loc. This is what a `return <lambda>` / `var f = <lambda>`
+     * folds to.
+     */
+    MakeClosureV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()
@@ -630,4 +643,9 @@ struct Chunk {
         const StructTypeDef *arr_hint_struct;
     };
     std::vector<LiteralObjEntry> literal_objs;
+
+    /* Lambda definitions for MakeClosureV (the FuncDeclStmt* of each `func[..]`
+     * expression). Program-lifetime AST-owned pointers; the Instr carries the
+     * index, so it holds no raw Construct*. */
+    std::vector<const FuncDeclStmt *> closure_defs;
 };

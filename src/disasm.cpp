@@ -334,6 +334,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << arglist(chunk, in.a.lit, 2 * in.b.lit)
                 << "  ; dict literal (" << in.b.lit << " pairs)";
             break;
+        case OpCode::MakeClosureV:
+            row << "make.closure " << D(in.target) << " = closure_defs["
+                << in.target2 << "]";
+            break;
         case OpCode::LoadImmInt:
             row << "load         " << D(in.target) << ", #" << in.a.lit;
             break;
