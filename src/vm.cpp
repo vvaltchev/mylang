@@ -127,6 +127,30 @@ vm_call_builtin_big(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
     return dc->builtin.func_v(&ctx, dc->args.get(), heapbuf.data(), n);
 }
 
+/* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
+ * the value args (1..n) from the register run [base, base+n_rest) into a buffer
+ * and call func_lv with `target` + `rest` - zero node->eval. ML_NOINLINE keeps
+ * the (cold) CallBuiltinLV case out of vm_run_chunk's hot body. n_rest is small
+ * for a valid call (insert 2, erase 1); >8 (a wrong-arity call) heaps. */
+static ML_NOINLINE EvalValue
+vm_call_builtin_lv_rest(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
+                        LValue *target, int_type base)
+{
+    const int_type n_rest = static_cast<int_type>(dc->args->elems.size()) - 1;
+    if (n_rest <= 8) {
+        EvalValue stackbuf[8];
+        for (int_type i = 0; i < n_rest; i++)
+            stackbuf[i] = ctx.frame->at(base + i).get();
+        return dc->builtin.func_lv(&ctx, dc->args.get(), target, stackbuf,
+                                   static_cast<size_t>(n_rest));
+    }
+    std::vector<EvalValue> heapbuf(static_cast<size_t>(n_rest));
+    for (int_type i = 0; i < n_rest; i++)
+        heapbuf[i] = ctx.frame->at(base + i).get();
+    return dc->builtin.func_lv(&ctx, dc->args.get(), target, heapbuf.data(),
+                               static_cast<size_t>(n_rest));
+}
+
 /* Map an arith/bitwise Op to its num_bin_op Type method, for the boxed BinOpV
  * (the same PMFs the tree-walker's binary-op eval uses). */
 static NumBinOp binop_pmf(Op op)
@@ -701,10 +725,12 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*
              * from its slot table (by kind), then call func_lv - which mutates
-             * through it and self-evaluates its remaining args (so append keeps
-             * construct-in-place). Mirrors Identifier::do_eval for each kind: a
-             * not-yet-defined global -> null target -> NotLValueEx, like the
-             * tree-walker. */
+             * through it. A REST-NATIVE builtin (insert/erase) gets its value
+             * args pre-evaluated from the register run at `b` (no node->eval);
+             * a self-eval one (append/push/pop/intptr) gets rest=null and reads
+             * its args off the node (so append keeps construct-in-place).
+             * Mirrors Identifier::do_eval for each kind: a not-yet-defined
+             * global -> null target -> NotLValueEx, like the tree-walker. */
             const DirectBuiltinCallExpr *dc =
                 static_cast<const DirectBuiltinCallExpr *>(in.node);
             LValue *target;
@@ -722,7 +748,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             }
             try {
                 ctx.frame->at(in.target).put(
-                    dc->builtin.func_lv(&ctx, dc->args.get(), target));
+                    dc->lvalue_rest_native
+                        ? vm_call_builtin_lv_rest(ctx, dc, target, in.b.lit)
+                        : dc->builtin.func_lv(&ctx, dc->args.get(), target,
+                                              nullptr, 0));
             } catch (Exception &e) {
                 if (!e.loc_start) {
                     e.loc_start = dc->args->start;

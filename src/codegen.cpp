@@ -827,11 +827,11 @@ struct Codegen {
      * rolls back ops + temps and returns false if an arg can't lower. Shared by
      * the native user-call and native-builtin lowerings. */
     bool emit_args_range(const std::vector<unique_ptr<Construct>> &elems,
-                         int &argbase, std::vector<Instr> &ops)
+                         int &argbase, std::vector<Instr> &ops, int start = 0)
     {
         const size_t mark = ops.size();
         const int save_top = next_temp;
-        const int n = static_cast<int>(elems.size());
+        const int n = static_cast<int>(elems.size()) - start;
 
         argbase = next_temp;
         next_temp += n;
@@ -841,7 +841,7 @@ struct Codegen {
         for (int i = 0; i < n; i++) {
             const int sub = next_temp;
             int out;
-            if (!compile_boxed_expr(elems[i].get(), out, ops)) {
+            if (!compile_boxed_expr(elems[start + i].get(), out, ops)) {
                 ops.resize(mark);
                 next_temp = save_top;
                 return false;
@@ -949,6 +949,16 @@ struct Codegen {
         default: return false;   /* builtin / unresolved -> fall back */
         }
 
+        /* REST-NATIVE (insert/erase): compile the value args (1..n) into a
+         * register run so func_lv has zero node->eval; `b` carries its base.
+         * A self-eval builtin (append/push/pop/intptr) leaves `b` unused and
+         * reads its args off the node. */
+        int restbase = 0;
+        if (dc->lvalue_rest_native) {
+            if (!emit_args_range(dc->args->elems, restbase, ops, 1))
+                return false;   /* a rest arg didn't lower -> fall back */
+        }
+
         const int dst = alloc_temp();
         Instr cv;
         cv.op = OpCode::CallBuiltinLV;
@@ -956,6 +966,8 @@ struct Codegen {
         cv.target = dst;
         cv.target2 = static_cast<const Identifier *>(a0)->sym.slot;
         cv.a = int_lit(kind);
+        if (dc->lvalue_rest_native)
+            cv.b = int_lit(restbase);
         ops.push_back(cv);
         out_slot = dst;
         return true;

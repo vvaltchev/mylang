@@ -814,6 +814,11 @@ public:
      * builtin.func_lv, and arg0 must be handed over as an LValue*, not a value.
      * Discriminates the Builtin union (func_v vs func_lv) for the VM. */
     bool lvalue_arg0 = false;
+    /* A REST-NATIVE mutating builtin (insert/erase): its value args (1..n) are
+     * pre-evaluated, so the VM's CallBuiltinLV forms a register run for them
+     * and passes it as `rest`. A self-eval one (append/push/pop/intptr) leaves
+     * this false and reads its args off the node. Needs lvalue_arg0. */
+    bool lvalue_rest_native = false;
 
     DirectBuiltinCallExpr() : CallExpr("DirectBuiltinCallExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -825,6 +830,7 @@ public:
         c->args = clone_as(args);
         c->builtin = builtin;
         c->lvalue_arg0 = lvalue_arg0;
+        c->lvalue_rest_native = lvalue_rest_native;
         return c;
     }
 };

@@ -294,7 +294,8 @@ static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
     }
 }
 
-EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target)
+EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target,
+                         const EvalValue *rest, size_t n_rest)
 {
     if (exprList->elems.size() != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
@@ -382,7 +383,8 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target)
     return lval->get();
 }
 
-EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList, LValue *target)
+EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList, LValue *target,
+                      const EvalValue *rest, size_t n_rest)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);

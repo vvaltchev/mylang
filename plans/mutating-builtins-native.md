@@ -30,18 +30,28 @@ common `append(a, x)` form.
    passed natively — so `append`/`insert`/`erase` are native *dispatch + arg0*
    but not `node->eval`-free.
 
-## Phase 2 — DESIGNED (do next)
+## Phase 2
 
 Goal: remove BOTH residuals — the mutating builtins reach **zero `node->eval`**.
 
-### 2a. Value args passed natively
+### 2a. Value args passed natively — DONE (2026-07-05)
 
-Extend the ABI to
-`func_lv(ctx, exprList, LValue* target, const EvalValue* rest, size_t n_rest)` —
-the value args pre-evaluated (like `CallBuiltinV`). `pop`/`insert`/`erase`/
-`intptr` then use `rest[]` with NO self-eval (fully native); the codegen
-compiles their value args into the register run and `CallBuiltinLV` copies them
-into a buffer (reuse the `vm_call_builtin_big` cold-path pattern for >N args).
+`func_lv` extended to
+`func_lv(ctx, exprList, LValue* target, const EvalValue* rest, size_t n_rest)`.
+A **rest-native** builtin gets its value args (1..n) pre-evaluated in `rest`;
+a **self-eval** one gets `rest == nullptr` and reads the node. Only **`insert`
+(2 value args) and `erase` (1)** actually needed it — `pop`/`intptr` take arg0
+only (no value args, already native), and `append`/`push` MUST stay self-eval
+for construct-in-place (2b). So: `insert`/`erase` register via
+`make_builtin_lv_v` (a second lvalue adapter, `builtin_lv_v_adapter`) and set
+`DirectBuiltinCallExpr::lvalue_rest_native`; the VM's `CallBuiltinLV` compiles
+their value args into a register run (`emit_args_range(..., start=1)`, base in
+`Instr::b`) and `vm_call_builtin_lv_rest` (cold, ML_NOINLINE, stack ≤8 / heap
+>8) copies them by value — arg0's `LValue*` is still formed from the slot table.
+`insert`/`erase` now `-vd` as `load r,#i; load r,#v; call.blt.lv` with NO
+`eval.stmt`. Both engines share `builtin_lv_v_adapter` (arg0 first, then the
+rest — a pure slot ref, so the VM's rest-first order is observationally equal).
+Verified 1305/1305 + 1156/1156 (incl. a side-effecting value arg), RECYCLE+ASan.
 
 ### 2b. `emplace` fusion for `append(struct_arr, Ctor(args))`
 

@@ -2907,12 +2907,19 @@ pre-evaluated, no `node->eval`; set by `make_const_builtin_v`, which also
 registers a generic adapter as the tree-walker's `func`) dispatches natively via
 `CallBuiltinV`. A **mutating builtin** (append/pop/insert/erase/intptr) uses the
 **lvalue ABI** (`Builtin::func_lv` — a UNION with `func_v`, discriminated by
-`DirectBuiltinCallExpr::lvalue_arg0`; set by `make_builtin_lv`): it gets arg0 as
-an `LValue*` target and self-evaluates its remaining args (so append keeps
-construct-in-place), dispatching via **`CallBuiltinLV`** when arg0 is a slotted
-identifier (local/global/capture — the op forms the `LValue*` straight from the
-table). An **AST builtin** (defined/type/…, needs the arg node) keeps the union
-null and stays `EvalToSlot`. **The read-only builtin migration to `func_v` is
+`DirectBuiltinCallExpr::lvalue_arg0`): it gets arg0 as an `LValue*` target,
+dispatching via **`CallBuiltinLV`** when arg0 is a slotted identifier
+(local/global/capture — the op forms the `LValue*` straight from the table). The
+value args (1..n) come in one of two forms (Phase 2a): a **rest-native** builtin
+(`insert`/`erase`, `make_builtin_lv_v` + `lvalue_rest_native`) has them
+pre-evaluated in `rest`/`n_rest` (the VM compiles a register run, base in
+`Instr::b`; `vm_call_builtin_lv_rest` copies by value) — **zero `node->eval`**;
+a **self-eval** builtin (`append`/`push` — construct-in-place needs the node;
+`pop`/`intptr` — no value args, `make_builtin_lv`) gets `rest == nullptr` and
+reads its args off `exprList`. `append`'s value arg going native (the
+construct-in-place `emplace` fusion) is Phase 2b, still open. An **AST builtin**
+(defined/type/…, needs the arg node) keeps the union null and stays
+`EvalToSlot`. **The read-only builtin migration to `func_v` is
 complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose
 args are plain values now dispatches via `CallBuiltinV`, and the residual
 old-ABI (`func`, `EvalToSlot`) floor is exactly three principled groups — **AST

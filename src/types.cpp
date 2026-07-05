@@ -262,7 +262,47 @@ EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
         if (a0.is<LValue *>())
             target = a0.get<LValue *>();
     }
-    return FLV(ctx, exprList, target);
+    /* SELF-EVAL form (append/push/pop/intptr): no pre-evaluated rest - the
+     * builtin reads args 1..n off exprList itself (append needs the node). */
+    return FLV(ctx, exprList, target, nullptr, 0);
+}
+
+/* Cold >8-rest path for the REST-NATIVE lvalue adapter (heap arg buffer). */
+static ML_NOINLINE EvalValue
+builtin_lv_v_adapter_big(decltype(Builtin::func_lv) flv, EvalContext *ctx,
+                         ExprList *exprList, LValue *target, size_t n_rest)
+{
+    std::vector<EvalValue> heapbuf(n_rest);
+    for (size_t i = 0; i < n_rest; i++)
+        heapbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
+    return flv(ctx, exprList, target, heapbuf.data(), n_rest);
+}
+
+/*
+ * REST-NATIVE lvalue adapter (insert/erase): arg0 -> LValue* target as above,
+ * PLUS the value args (1..n) pre-evaluated by VALUE into a buffer, so the
+ * builtin has ZERO node->eval. Both engines reach it - the tree-walker as the
+ * builtin's `func`, the VM as CallBuiltinLV (which forms the same rest run in
+ * registers). arg0 is evaluated first (a pure slot reference), then the rest,
+ * matching the old self-eval order.
+ */
+template <decltype(Builtin::func_lv) FLV>
+EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
+{
+    LValue *target = nullptr;
+    if (!exprList->elems.empty()) {
+        EvalValue a0 = exprList->elems[0]->eval(ctx);
+        if (a0.is<LValue *>())
+            target = a0.get<LValue *>();
+    }
+    const size_t total = exprList->elems.size();
+    const size_t n_rest = total ? total - 1 : 0;
+    if (n_rest > 8)
+        return builtin_lv_v_adapter_big(FLV, ctx, exprList, target, n_rest);
+    EvalValue stackbuf[8];
+    for (size_t i = 0; i < n_rest; i++)
+        stackbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
+    return FLV(ctx, exprList, target, stackbuf, n_rest);
 }
 
 template <decltype(Builtin::func_lv) FLV>
@@ -270,6 +310,17 @@ inline auto make_builtin_lv(const char *name)
 {
     Builtin b{builtin_lv_adapter<FLV>};   /* func set; the union is zeroed */
     b.func_lv = FLV;                      /* the mutating-form pointer */
+    return make_pair(UniqueId::get(name), LValue(b, false));
+}
+
+/* Rest-native registration (insert/erase): the value args are pre-evaluated.
+ * DirectBuiltinCallExpr::lvalue_rest_native must be set for these so the VM's
+ * CallBuiltinLV forms the rest run too (see resolver.cpp). */
+template <decltype(Builtin::func_lv) FLV>
+inline auto make_builtin_lv_v(const char *name)
+{
+    Builtin b{builtin_lv_v_adapter<FLV>};
+    b.func_lv = FLV;
     return make_pair(UniqueId::get(name), LValue(b, false));
 }
 
@@ -410,8 +461,8 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_lv<builtin_pop>("pop"),
 
     /* Generic-container builtins */
-    make_builtin_lv<builtin_erase>("erase"),
-    make_builtin_lv<builtin_insert>("insert"),
+    make_builtin_lv_v<builtin_erase>("erase"),
+    make_builtin_lv_v<builtin_insert>("insert"),
     make_builtin_v<builtin_deepclone>("deepclone"), /* deep mutable copy */
 
     /* Numeric builtins */

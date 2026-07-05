@@ -140,6 +140,17 @@ static bool is_lvalue_arg_builtin(std::string_view name)
 }
 
 /*
+ * A REST-NATIVE mutating builtin: arg0 is an lvalue, and its value args (1..n)
+ * are pre-evaluated (make_builtin_lv_v), so the VM compiles a register run for
+ * them. The self-eval ones (append/push - construct-in-place needs the node;
+ * pop/intptr - no value args) are NOT in this set.
+ */
+static bool is_lvalue_rest_native_builtin(std::string_view name)
+{
+    return name == "insert" || name == "erase";
+}
+
+/*
  * Coerce a const-folded value to a declared scalar type when inlining a typed
  * var/const (`float f = 3` -> 3.0). Mirrors eval.cpp's coerce_to_decl_type (a
  * separate TU); the inferencer has already validated assignability, so this only
@@ -4169,6 +4180,8 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                 auto d = make_unique<DirectBuiltinCallExpr>();
                 call->copy_base_fields(*d);
                 d->lvalue_arg0 = is_lvalue_arg_builtin(id->get_str());
+                d->lvalue_rest_native =
+                    is_lvalue_rest_native_builtin(id->get_str());
                 d->what = move(call->what);
                 d->args = move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();

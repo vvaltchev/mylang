@@ -51,15 +51,20 @@ struct Builtin {
      * DirectBuiltinCallExpr::lvalue_arg0 (the VM) / the registered adapter (the
      * tree-walker), never by reading both:
      *   func_v  - a READ-ONLY builtin: args pre-evaluated by VALUE, no lvalue.
-     *   func_lv - a MUTATING builtin: arg0 handed over as an LValue* target;
-     *             the builtin self-evaluates its remaining args (so append
-     *             keeps construct-in-place, which needs the arg node).
+     *   func_lv - a MUTATING builtin: arg0 handed over as an LValue* target,
+     *             plus the value args (1..n) either pre-evaluated in `rest`/
+     *             `n_rest` (a REST-NATIVE builtin: insert/erase, via
+     *             make_builtin_lv_v + lvalue_rest_native) or `rest == nullptr`
+     *             for a SELF-EVAL builtin (append/push/pop/intptr), which reads
+     *             its args off `exprList` - so append keeps construct-in-place,
+     *             which needs the arg node.
      * Null (union zero) == not migrated: the VM falls back to func (EvalStmt).
      */
     union {
         EvalValue (*func_v)(EvalContext *, ExprList *, const EvalValue *,
                             size_t);
-        EvalValue (*func_lv)(EvalContext *, ExprList *, LValue *);
+        EvalValue (*func_lv)(EvalContext *, ExprList *, LValue *,
+                             const EvalValue *, size_t);
     };
 };
 

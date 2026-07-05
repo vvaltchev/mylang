@@ -204,7 +204,8 @@ EvalValue builtin_deepclone(EvalContext *ctx, ExprList *exprList,
     return make_deep_mutable_clone(args[0]);
 }
 
-EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList, LValue *target)
+EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList, LValue *target,
+                         const EvalValue *rest, size_t n_rest)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
@@ -232,14 +233,15 @@ EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList,
     return none;
 }
 
-EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList, LValue *target)
+EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList, LValue *target,
+                        const EvalValue *rest, size_t n_rest)
 {
     if (exprList->elems.size() != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &index_val = RValue(arg1->eval(ctx));
+    const EvalValue &index_val = rest[0];   /* value ABI: pre-evaluated */
 
     if (!target)
         throw NotLValueEx(arg0->start, arg0->end);
@@ -276,16 +278,16 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList, LValue *target)
     }
 }
 
-EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList, LValue *target)
+EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList, LValue *target,
+                         const EvalValue *rest, size_t n_rest)
 {
     if (exprList->elems.size() != 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    Construct *arg2 = exprList->elems[2].get();
-    const EvalValue &index_val = RValue(arg1->eval(ctx));
-    const EvalValue &val = RValue(arg2->eval(ctx));
+    const EvalValue &index_val = rest[0];   /* value ABI: pre-evaluated */
+    const EvalValue &val = rest[1];
 
     if (!target)
         throw NotLValueEx(arg0->start, arg0->end);
