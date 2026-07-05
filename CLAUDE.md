@@ -3143,11 +3143,20 @@ nested forms) goes native instead of falling back — e.g. `30_str_index_iterate
 the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
 −71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** runs these
 loops inside **function bodies** too: `do_func_call` is hooked to run a callee's
-body via `vm_run_chunk` when it's a scope-free block with a native loop
-(compiled once, cached on the `FuncDeclStmt`), reusing all of `do_func_call`'s
+body via `vm_run_chunk` when it's a scope-free block (compiled once, cached on
+the `FuncDeclStmt` in `g_func_chunks`), reusing all of `do_func_call`'s
 frame/param/backtrace machinery — so `55_float_sum` (a loop in a function) is
-−62%, while recursion stays neutral (a body with no native loop → tree-walked,
-`fib` −0.08%). **Phase 5** widens native coverage: array element read/write
+−62%. The compile gate (`vm_func_chunk`) is "the body has at least one REAL op"
+— anything but the pure fallback/control ops (`EvalStmt`/`JumpIfFalse`/`Jump`/
+`LoopBackEdge`/`Halt`) — so a body of native **calls/stores/loads** (`CallV`,
+`DictStore`, `CallBuiltinV`, `SliceV`, a `ReturnV` over a native expr, …), which
+has NO arith/loop op, compiles too (the old arith/loop-only gate left those on
+the tree-walker); an all-fallback body still tree-walks (the VM would only add
+dispatch). Recursion with arith stays ~neutral (`fib` −0.08%). A non-scope-free
+body (captures / nested func) still tree-walks (it needs its own child context,
+which `vm_run_chunk` doesn't build).
+
+**Phase 5** widens native coverage: array element read/write
 (`a[i]` / `a[i]=v` → `LoadElem`/`StoreElem`, mirroring the flat-array
 subscript/store incl. COW; a dict subscript stays a fallback via the inferencer-
 set `Subscript::base_array`), and **nested control flow** — the loop codegen

@@ -409,12 +409,19 @@ vm_func_chunk(const FuncDeclStmt *fdecl)
         return &it->second;
     Chunk ck = codegen_chunk(body, fdecl->frame_size);
 
+    /* Compile the body iff it has at least one REAL op - anything that is not a
+     * pure fallback (EvalStmt) or control-flow op (JumpIfFalse / Jump /
+     * LoopBackEdge / Halt). An all-fallback body gains nothing from the VM: an
+     * EvalStmt is `node->eval`, same as the tree-walker, plus dispatch), so it
+     * stays tree-walked; but a body of native calls / stores / loads (CallV,
+     * DictStore, CallBuiltinV, SliceV, a ReturnV over a native expr) - which
+     * has NO arith/loop op - now compiles, where the old arith/loop-only gate
+     * left it on the tree-walker. */
     bool has_native = false;
     for (const Instr &in : ck.code) {
-        if (in.op == OpCode::IntBin || in.op == OpCode::FloatBin
-            || in.op == OpCode::JumpUnlessIntCmp
-            || in.op == OpCode::JumpUnlessFloatCmp
-            || in.op == OpCode::ForLoopStep) {
+        if (in.op != OpCode::EvalStmt && in.op != OpCode::JumpIfFalse
+            && in.op != OpCode::Jump && in.op != OpCode::LoopBackEdge
+            && in.op != OpCode::Halt) {
             has_native = true;
             break;
         }

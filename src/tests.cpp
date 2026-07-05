@@ -5497,6 +5497,24 @@ static const std::vector<test> tests =
     },
 
     {
+        /* a scope-free function body of native CALLS/STORES (no arith/loop op)
+         * now compiles to a bytecode chunk + runs via the VM - the do_func_call
+         * gate widened from arith/loop-only to "any real op". Reruns under -vm.
+         * (Uses [0] not [] to sidestep the pre-existing empty-array quirk.) */
+        "Function body of calls/stores compiles to bytecode",
+        {
+            "func build(a) { append(a, 1); append(a, 2); append(a, 3); }",
+            "var x = [0];",
+            "build(x);",
+            "assert(x == [0, 1, 2, 3]);",
+            "func bump(d, k) { d[k]++; }",
+            "var m = {\"n\": 0};",
+            "bump(m, \"n\"); bump(m, \"n\");",
+            "assert(m[\"n\"] == 2);",
+        },
+    },
+
+    {
         /* `_` is the destructuring placeholder: skipped, unbound. */
         "Underscore placeholder skips a destructure entry",
         {
