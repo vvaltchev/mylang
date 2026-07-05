@@ -2879,9 +2879,14 @@ instructions; the sound case is stamped by the inferencer as
 `ForeachStmt::elem_th`). **User-function calls** go native via `CallV`: a call
 proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
 struct constructor / builtin) that devirtualized to a global slot evaluates its
-args into a register run and calls `vm_call_func` → `do_func_call` with the
-VALUES (no `node->eval` of the call); builtins (the ABI change) and calls inside
-a `return` are still fallbacks. Gated by the
+args into a register run (a `VmArgs` view over the caller's frame slots — no
+per-call allocation) and calls `vm_call_func` → `do_func_call` with the VALUES
+(no `node->eval` of the call). A **`return <expr>;`** likewise lowers to a
+`ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
+sets flow={ret,value} and stops the chunk — so a mutual recursion runs its
+returns + recursive calls natively. Still fallbacks: builtins (the ABI change),
+a `return` of a ternary (a recursion unroll like fib), struct construction.
+Gated by the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`

@@ -594,14 +594,26 @@ and calls `vm_call_func` → `do_func_call` with the VALUES (no `node->eval`
 of the call). Fires for a call as a scalar/boxed operand or a statement; a
 callee not yet defined / reassigned throws the same UndefinedVariableEx /
 NotCallableEx.
+**Native RETURNS landed** (`ReturnV`): `return <expr>;` in a chunked body was an
+EvalStmt (the whole return, incl. its recursive calls, tree-walked). It now
+compiles the return EXPRESSION via compile_boxed_expr (so `return f(x)` →
+CallV, `return a+b` → BinOpV; a bare `return;` loads none) then sets
+flow={ret,value} and STOPS the chunk. So a mutual recursion — whose bodies
+chunk via the `if`'s native compare — runs its returns AND recursive calls with
+no node->eval. **This also forced a CallV fix:** the handler built a
+std::vector<EvalValue> per call (a heap alloc), a ~32% regression on deep
+recursion; the args now stay in the caller's frame slots, passed as a `VmArgs`
+view (pointer+count) that `do_func_bind_params` binds in place — 1.315x →
+1.002x (neutral). A ternary return (a recursion unroll, e.g. fib) still isn't
+compiled by compile_boxed_expr → EvalStmt fallback.
 **Still TODO in this tier:**
 - **builtin calls** — the ABI change: every builtin from `(ctx, ExprList*)` (it
   self-evaluates its arg NODES) to evaluated-VALUES, so `CallV` can dispatch a
   builtin natively. ~74 builtins, migrated incrementally (a few - `defined`, the
   `type`/`decltype` queries - genuinely need the AST and keep a shim). This is
   the real "last Construct* holdout".
-- **native returns** — a call inside a `return` expression is still an EvalStmt,
-  so a recursion's return-calls don't use CallV yet.
+- **ternary in compile_boxed_expr** — so a recursion-unroll return (`fib`) goes
+  native too.
 - make-array/dict — see the op list below.
 
 The boxed SCALAR + SUBSCRIPT + MEMBER core is complete: a `dyn`/string
