@@ -76,6 +76,35 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
     }
 }
 
+/*
+ * True for an op that WRITES its result into `.target` as a pure value and does
+ * not also READ `.target` - so it is safe to retarget its `.target` to a
+ * different (fresh) slot. Used to fuse away `<produce t>; MoveV rD = t` into a
+ * single `<produce rD>` (see emit_args_range). Excludes a jump/branch (whose
+ * `.target` is a code label), a store (writes memory), CompoundV (reads its
+ * target), and the loop back-edges.
+ */
+bool op_writes_pure_target(OpCode op)
+{
+    switch (op) {
+    case OpCode::LoadConstV:  case OpCode::LoadImmInt:
+    case OpCode::LoadImmFloat: case OpCode::LoadGlobalV:
+    case OpCode::LoadCaptureV: case OpCode::LoadBuiltinV:
+    case OpCode::MoveV:       case OpCode::BinOpV:
+    case OpCode::CmpV:        case OpCode::LogV:
+    case OpCode::IntBin:      case OpCode::FloatBin:
+    case OpCode::SubscriptV:  case OpCode::MemberV:
+    case OpCode::CallV:       case OpCode::CachedCallV:
+    case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
+    case OpCode::EvalToSlot:  case OpCode::ArrLen:
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElemValue:
+        return true;
+    default:
+        return false;
+    }
+}
+
 Operand int_lit(int_type v)
 {
     Operand o;
@@ -729,11 +758,24 @@ struct Codegen {
                 next_temp = save_top;
                 return false;
             }
-            Instr mv;
-            mv.op = OpCode::MoveV;
-            mv.target = argbase + i;
-            mv.target2 = out;
-            ops.push_back(mv);
+            const int dst = argbase + i;
+            if (out == dst) {
+                /* already in place */
+            } else if (out >= temp_base && !ops.empty()
+                       && ops.back().target == out
+                       && op_writes_pure_target(ops.back().op)) {
+                /* Fuse: the arg's value was just produced into a FRESH temp by
+                 * an op that purely writes .target - retarget it straight to
+                 * the arg slot, dropping the redundant temp + MoveV. So
+                 * `load t, "x"; move rarg = t` becomes `load rarg, "x"`. */
+                ops.back().target = dst;
+            } else {
+                Instr mv;
+                mv.op = OpCode::MoveV;
+                mv.target = dst;
+                mv.target2 = out;
+                ops.push_back(mv);
+            }
             next_temp = sub;   /* free this arg's scratch for the next */
         }
         return true;
