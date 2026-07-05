@@ -364,6 +364,12 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const Loc &mstart, const Loc &mend,
                           const Loc &bstart, const Loc &bend);
 
+/* VM (StoreElem2V): native NESTED store `a[i][j] = v` / `OP= v`. See eval.cpp. */
+EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
+                                    const EvalValue &key2,
+                                    const EvalValue &value, Op op,
+                                    Loc lstart, Loc lend);
+
 /* VM (MapFilterV) + tree-walker shared map/filter core: apply a (pre-validated)
  * function to each element of a container. See eval.cpp. */
 EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,

@@ -2523,41 +2523,26 @@ no_side_effects(const Construct *c)
     return false;
 }
 
+/*
+ * Flat-array element store CORE: `blv` holds a flat (non-general, non-const,
+ * non-read-only) SharedArrayObj `arr`; store `rval` (op) at index `idx_v`. The
+ * caller has already proven blv is a flat writable array. Shared by the AST
+ * path (try_flat_subscript_store, base `a` from the AST) and the VM's NESTED
+ * store (vm_nested_subscript_store, base `a[i]` an inner element LValue).
+ * Returns true (and sets `out`) on a store; false ONLY for a compound op on a
+ * flat struct array (structs have no `+=`), so the caller defers to the general
+ * path. `sub_*` is the subscript's caret (OOB / type errors), `idx_*` the
+ * index's (the "Expected integer" error).
+ */
 static bool
-try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
-                         const EvalValue &rval, EvalValue &out)
+flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
+                const EvalValue &rval, Op op, EvalValue &out,
+                Loc sub_start, Loc sub_end, Loc idx_start, Loc idx_end)
 {
-    if (!lvalue->is_subscript())
-        return false;
-
-    Subscript *sub = static_cast<Subscript *>(lvalue);
-
-    /* Base must be a side-effect-free lvalue - see the note above. */
-    if (!no_side_effects(sub->what.get()))
-        return false;
-
-    const EvalValue base_lv = sub->what->eval(ctx);
-    if (!base_lv.is<LValue *>())
-        return false;
-
-    LValue *blv = base_lv.get<LValue *>();
-    if (!blv->is<SharedArrayObj>())
-        return false;
-
-    SharedArrayObj &arr = blv->getval<SharedArrayObj>();
-
-    if (arr.skind() == SharedArrayObj::Storage::general)
-        return false;            /* not flat: let the general path handle it */
-
-    /* A const/read-only array: defer so the general path raises the right error
-     * (CannotChangeConstEx / NotLValueEx) with the proper loc. */
-    if (blv->is_const_var() || arr.is_readonly())
-        return false;
-
     /*
      * Flat POD-struct array: `a[i] = <matching POD struct>` stores the value's
-     * bytes (a compound op falls through; structs have no `+=`). A non-matching
-     * value is the dyn-launder case (errors like the scalar kinds).
+     * bytes (a compound op defers; structs have no `+=`). A non-matching value
+     * is the dyn-launder case (errors like the scalar kinds).
      */
     if (arr.skind() == SharedArrayObj::Storage::structs) {
 
@@ -2567,15 +2552,14 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
         const EvalValue r = RValue(rval);
         const auto &sv0 = arr.flat_structs();
 
-        const EvalValue idx_v = RValue(sub->index->eval(ctx));
         if (!idx_v.is<int_type>())
             throw TypeErrorEx("Expected integer as subscript",
-                              sub->index->start, sub->index->end);
+                              idx_start, idx_end);
         int_type idx = idx_v.get<int_type>();
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-            throw OutOfBoundsEx(sub->start, sub->end);
+            throw OutOfBoundsEx(sub_start, sub_end);
 
         if (!r.is<intrusive_ptr<StructObject>>() ||
             !r.get<intrusive_ptr<StructObject>>()->is_pod() ||
@@ -2583,7 +2567,7 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
             throw TypeErrorEx(
                 "Cannot store a value of a different type in a flat (typed) "
                 "array; declare the array dyn for a polymorphic array",
-                sub->start, sub->end);
+                sub_start, sub_end);
 
         if (arr.is_slice())
             arr.clone_internal_vec();
@@ -2601,17 +2585,15 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
     const bool kind_int = arr.skind() == SharedArrayObj::Storage::ints;
     const bool kind_bool = arr.skind() == SharedArrayObj::Storage::bools;
 
-    /* Committed to the flat path now: evaluate the index exactly once. */
-    const EvalValue idx_v = RValue(sub->index->eval(ctx));
     if (!idx_v.is<int_type>())
         throw TypeErrorEx("Expected integer as subscript",
-                          sub->index->start, sub->index->end);
+                          idx_start, idx_end);
 
     int_type idx = idx_v.get<int_type>();
     if (idx < 0)
         idx += arr.size();
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-        throw OutOfBoundsEx(sub->start, sub->end);
+        throw OutOfBoundsEx(sub_start, sub_end);
 
     const size_type at0 = arr.offset() + idx;
     const EvalValue r = RValue(rval);
@@ -2643,7 +2625,7 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
         throw TypeErrorEx(
             "Cannot store a value of a different type in a flat (typed) array; "
             "declare the array dyn for a polymorphic array",
-            sub->start, sub->end);
+            sub_start, sub_end);
     }
 
     /*
@@ -2671,6 +2653,52 @@ try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
     arr.invalidate_hash();   /* an element write changes the array's hash */
     out = newval;
     return true;
+}
+
+/* True if `blv` holds a flat (non-general), writable (non-const/read-only)
+ * SharedArrayObj; sets `arr` to it. The shared "is this a flat store" gate. */
+static bool
+flat_writable_array(LValue *blv, SharedArrayObj *&arr)
+{
+    if (!blv->is<SharedArrayObj>())
+        return false;
+    SharedArrayObj &a = blv->getval<SharedArrayObj>();
+    if (a.skind() == SharedArrayObj::Storage::general)
+        return false;            /* not flat: let the general path handle it */
+    /* A const/read-only array: defer so the general path raises the right error
+     * (CannotChangeConstEx / NotLValueEx) with the proper loc. */
+    if (blv->is_const_var() || a.is_readonly())
+        return false;
+    arr = &a;
+    return true;
+}
+
+static bool
+try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
+                         const EvalValue &rval, EvalValue &out)
+{
+    if (!lvalue->is_subscript())
+        return false;
+
+    Subscript *sub = static_cast<Subscript *>(lvalue);
+
+    /* Base must be a side-effect-free lvalue - see the note above. */
+    if (!no_side_effects(sub->what.get()))
+        return false;
+
+    const EvalValue base_lv = sub->what->eval(ctx);
+    if (!base_lv.is<LValue *>())
+        return false;
+
+    SharedArrayObj *arr;
+    if (!flat_writable_array(base_lv.get<LValue *>(), arr))
+        return false;
+
+    /* Committed to the flat path now: evaluate the index exactly once. */
+    const EvalValue idx_v = RValue(sub->index->eval(ctx));
+    return flat_store_core(base_lv.get<LValue *>(), *arr, idx_v, rval, op, out,
+                           sub->start, sub->end,
+                           sub->index->start, sub->index->end);
 }
 
 /*
@@ -2862,6 +2890,52 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
     }
 
     return slot_rmw(obj.fields[slot], op, value);   /* boxed field lvalue */
+}
+
+/*
+ * VM StoreElem2V: native NESTED general store `a[i][j] = v` / `a[i][j] OP= v`
+ * (a Subscript lvalue whose base is another Subscript over a slotted base). The
+ * inner `a[i]` is READ as a reference (for_write=false) - exactly like
+ * Subscript::do_eval consuming assign_target only at the OUTERMOST subscript, so
+ * a missing dict key in the nested base throws/defaults on the read - then the
+ * outer `[j]` stores into that reference (COW writes back through the inner
+ * element's container back-pointer, so the write is visible in `a`). This is
+ * the two-level form of vm_subscript_store; the dispatch mirrors the
+ * tree-walker's `t = lval.is<LValue*>() ? ... : lval.get_type()`.
+ */
+EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
+                                    const EvalValue &key2,
+                                    const EvalValue &value, Op op,
+                                    Loc lstart, Loc lend)
+{
+    EvalValue inner = outer_base->get().get_type()->subscript(
+        EvalValue(outer_base), key1, /*for_write=*/false);
+
+    /* A FLAT inner array (`[[1,2],[3,4]]`: general outer, flat int inners) has
+     * no element LValue - store the scalar straight into its buffer, exactly
+     * like the single-level flat store (COW-correct). */
+    if (inner.is<LValue *>()) {
+        SharedArrayObj *arr;
+        if (flat_writable_array(inner.get<LValue *>(), arr)) {
+            EvalValue fout;
+            if (flat_store_core(inner.get<LValue *>(), *arr, key2, value, op,
+                                fout, lstart, lend, lstart, lend))
+                return fout;
+            /* a compound op on a flat struct array: defer to the general path
+             * below, which raises the same error as the tree-walker. */
+        }
+    }
+
+    /* GENERAL inner (array<dyn>/array<array>): the element IS an LValue. */
+    Type *t = inner.is<LValue *>()
+        ? inner.get<LValue *>()->get().get_type()
+        : inner.get_type();
+
+    const bool for_write = (op == Op::assign);
+    EvalValue elv = t->subscript(inner, key2, for_write);
+    if (!elv.is<LValue *>())
+        throw NotLValueEx(lstart, lend);
+    return slot_rmw(*elv.get<LValue *>(), op, value);
 }
 
 /* Read scalar field #fidx of element `idx` of a flat array<PodStruct> straight

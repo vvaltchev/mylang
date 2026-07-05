@@ -354,6 +354,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.a, false) << "] " << o << " " << RI(in.b, false);
             break;
         }
+        case OpCode::StoreElem2V: {
+            const char *o = in.aop == Op::assign ? "=" :
+                            in.aop == Op::addeq  ? "+=" :
+                            in.aop == Op::subeq  ? "-=" :
+                            in.aop == Op::muleq  ? "*=" :
+                            in.aop == Op::diveq  ? "/=" : "%=";
+            row << "store.elem2 " << D(in.target2) << "[" << RI(in.a, false)
+                << "][" << RI(in.b, false) << "] " << o << " " << D(in.target);
+            break;
+        }
         case OpCode::EvalToSlot:
             row << "eval.slot    " << D(in.target) << " = " << node1(in.node);
             break;

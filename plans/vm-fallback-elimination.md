@@ -17,6 +17,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~D1~~ | ~~dict store~~ | 5 | ~~P2~~ | ✅ .55/.43 |
 | ~~D1m~~ | ~~dict MEMBER store `d.k=v`~~ | (rare) | P2b | ✅ DictStore (string key) |
 | ~~S1m~~ | ~~struct field store `s.f=v`~~ | 58,65 | — | ✅ StoreMemberV (POD/boxed) |
+| ~~N2~~ | ~~nested store `a[i][j]=v`~~ | 68,matrix | — | ✅ StoreElem2V (flat+general) |
 | ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
 | ~~F1~~ | ~~foreach single-var gen arr~~ | (grp) | — | ✅ box-free LoadElem.v |
 | ~~F2~~ | ~~foreach INDEXED 2-var~~ | 19 | — | ✅ box-free (see "redo") |
@@ -106,7 +107,10 @@ first:
    (StoreMemberV, POD byte store / boxed-field slot_rmw — gated on the
    inferencer's `MemberExpr::base_struct`, base a slotted local; a flat-array
    element `a[i].x=v` base is a pre-existing tree-walker NotLValueEx, unchanged);
-   a GLOBAL/capture dict base; a nested general store `a[i][j]=v`; a
+   ~~a nested store `a[i][j]=v`~~ ✅ (StoreElem2V — reads `a[i]` as a reference
+   then stores `[j]`; a FLAT inner via the shared `flat_store_core`, a GENERAL
+   inner via the element LValue + slot_rmw; matrix benches 0-fallback, VM ~2.2×
+   the tree-walker on the nested workload); a GLOBAL/capture dict base; a
    `global = <expr with a call>` loop driver (R/P10b, bench 10). Each is a
    contained op.
 

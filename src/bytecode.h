@@ -253,6 +253,17 @@ enum class OpCode : unsigned char {
     StoreElemValue,
 
     /*
+     * Native NESTED general store `a[i][j] = v` / `a[i][j] OP= v` (residual): a
+     * Subscript lvalue whose base is another Subscript over a slotted base.
+     * `target2` = the outer base's (local) slot, `a` = KEY1 (i) temp, `b` = KEY2
+     * (j) temp, `target` = the VALUE temp, `aop` = the Expr14 op. vm_nested_
+     * subscript_store reads `a[i]` as a reference then stores `[j]` into it
+     * (two-level vm_subscript_store; COW writes back through the inner element).
+     * AST-free: caret from the loc side table (node = the outer Subscript).
+     */
+    StoreElem2V,
+
+    /*
      * Typed DICT scalar READ `d[k]` / `d.k` into a temp (P3), when inference
      * proved the value is a non-null int/float. `target2` = the dict's (local)
      * slot, `target` = the dst temp; `node` = the Subscript or MemberExpr - a

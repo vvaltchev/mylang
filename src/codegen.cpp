@@ -2029,6 +2029,39 @@ struct Codegen {
         if (const Subscript *sub =
                 dynamic_cast<const Subscript *>(e->lvalue.get())) {
 
+            /* NESTED store `a[i][j] = v` / `a[i][j] OP= v` -> StoreElem2V: the
+             * base is another Subscript over a SLOTTED base. Reads `a[i]` as a
+             * reference then stores `[j]` into it (flat OR general inner);
+             * vm_nested_subscript_store matches the tree-walker's two-level
+             * lvalue chain. Value first (rhs), then key1 (inner i), key2 (j) -
+             * the tree-walker's rhs-then-lvalue, a(slot)-then-i-then-j order. */
+            if (const Subscript *inner =
+                    dynamic_cast<const Subscript *>(sub->what.get())) {
+                int aslot;
+                switch (e->op) {
+                case Op::assign: case Op::addeq: case Op::subeq:
+                case Op::muleq:  case Op::diveq: case Op::modeq: break;
+                default: return false;
+                }
+                if (!as_array_slot(inner->what.get(), aslot))
+                    return false;
+                int vslot, k1slot, k2slot;
+                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
+                    || !compile_boxed_expr(inner->index.get(), k1slot, ops)
+                    || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                    return false;
+                Instr in;
+                in.op = OpCode::StoreElem2V;
+                in.node = sub;   /* outer subscript, for its loc (extract_locs) */
+                in.target = vslot;
+                in.target2 = aslot;
+                in.a = slot_op(k1slot);
+                in.b = slot_op(k2slot);
+                in.aop = e->op;
+                ops.push_back(in);
+                return true;
+            }
+
             /* P2: a DICT element store `d[k] = v` / `d[k] OP= v` -> DictStore.
              * The base must be a local slot; the KEY + VALUE compile to boxed
              * temps (value first - tree-walker rhs-then-lvalue order; the base
@@ -3763,6 +3796,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreCaptureV:
         case OpCode::DictStore:      /* node = the Subscript (its caret) */
         case OpCode::StoreElemValue:
+        case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
             /* node used ONLY for the caret now (div/mod; the missing-key

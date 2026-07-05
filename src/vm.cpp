@@ -1035,6 +1035,30 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::StoreElem2V: {
+
+            /* a[i][j] = v / OP= v (nested general store): read a[i] as a
+             * reference then store [j] into it (two-level vm_subscript_store).
+             * AST-free: the outer subscript's caret comes from the side table. */
+            LValue &alv = ctx.frame->at(in.target2);
+            const EvalValue &k1 = ctx.frame->at(in.a.slot).get();
+            const EvalValue &k2 = ctx.frame->at(in.b.slot).get();
+            const EvalValue &val = ctx.frame->at(in.target).get();
+            Loc ls, le;
+            chunk.loc_at(pc, ls, le);
+            try {
+                vm_nested_subscript_store(&alv, k1, k2, val, in.aop, ls, le);
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = ls;
+                    e.loc_end = le;
+                }
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::DictLoadInt:
         case OpCode::DictLoadFloat: {
 

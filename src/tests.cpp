@@ -1348,6 +1348,44 @@ static const std::vector<test> tests =
     },
 
     {
+        "nested store a[i][j]=v in a loop (native StoreElem2V, flat inner)",
+        {
+            "var m = [[0,0,0],[0,0,0]];",
+            "for (var i = 0; i < 2; i++) {",
+            "  for (var j = 0; j < 3; j++) { m[i][j] = i*3 + j; } }",
+            "for (var i = 0; i < 2; i++) {",
+            "  for (var j = 0; j < 3; j++) { m[i][j] += 10; } }",
+            "assert(m == [[10,11,12],[13,14,15]]);",
+        },
+    },
+    {
+        "nested store a[i][j]=v aliases (shared inner, Python-like)",
+        {
+            "var m = [[1,2],[3,4]]; var b = m;",
+            "m[0][0] = 99; assert(b[0][0] == 99);",
+        },
+    },
+    {
+        "nested store on a general (dyn) inner + float inner",
+        {
+            "var dyn a = [[1,\"x\"],[3,4]];",   /* general inner */
+            "a[0][0] = 5; a[1][0] = a[1][0] + 100;",
+            "assert(a[0][0] == 5); assert(a[1][0] == 103);",
+            "var f = [[1.0,2.0],[3.0,4.0]];",
+            "f[0][1] = 9.5; f[1][0] += 0.5;",
+            "assert(f[0][1] == 9.5); assert(f[1][0] == 3.5);",
+        },
+    },
+    {
+        "nested store into a dict-of-arrays d[k][j]=v",
+        {
+            "var d = {0: [1,2], 1: [3,4]};",
+            "d[0][1] = 99; d[1][0] += 5;",
+            "assert(d[0][1] == 99); assert(d[1][0] == 8);",
+        },
+    },
+
+    {
         "deepclone() of a const yields a fully-mutable deep copy",
         {
             "const y = [[1,2],[3,4]];",
@@ -11444,6 +11482,7 @@ struct VmOpCounts {
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
     size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
+    size_t storeelem2 = 0;
     int n_temps = 0;
 };
 
@@ -11499,6 +11538,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::MemberV:          c.memberv++; break;
             case OpCode::DictStore:        c.dictstore++;  break;
             case OpCode::StoreMemberV:     c.storememberv++; break;
+            case OpCode::StoreElem2V:      c.storeelem2++; break;
             case OpCode::DictLoadInt:      c.dictloadi++;  break;
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
@@ -11976,6 +12016,17 @@ static bool vm_codegen_shapes()
     const bool struct_member_ok =
         sms.evalstmt == 0 && sms.storememberv >= 2;
 
+    /* 35) a NESTED store `a[i][j] = v` / `a[i][j] OP= v` (matrix) compiles to
+     * StoreElem2V (two-level lvalue), not an EvalStmt fallback. */
+    VmOpCounts n2;
+    if (!codegen_counts({
+            "var m = [[0, 0], [0, 0]];",
+            "for (var i = 0; i < 2; i++) {"
+                " for (var j = 0; j < 2; j++) { m[i][j] = i + j; } }",
+        }, n2))
+        return false;
+    const bool nested_store_ok = n2.evalstmt == 0 && n2.storeelem2 >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -11986,7 +12037,7 @@ static bool vm_codegen_shapes()
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
         && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
         && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
-        && struct_member_ok;
+        && struct_member_ok && nested_store_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:
