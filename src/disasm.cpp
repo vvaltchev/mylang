@@ -164,6 +164,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
         case OpCode::CallBuiltinV:
             row << "call.blt.v   r" << in.target << " = " << node1(in.node);
             break;
+        case OpCode::CallBuiltinLV:
+            row << "call.blt.lv  r" << in.target << " = " << node1(in.node)
+                << "  (&r" << in.target2 << ")";
+            break;
         case OpCode::CallV:
             row << "call.v       r" << in.target << " = g" << in.target2
                 << "(r" << in.a.lit << "..+" << in.b.lit << ")";

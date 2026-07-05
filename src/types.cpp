@@ -243,6 +243,35 @@ inline auto make_builtin_v(const char *name)
                      LValue(Builtin{builtin_v_adapter<FV>, FV}, false));
 }
 
+/*
+ * The tree-walker adapter for a MUTATING (lvalue-arg0) builtin: evaluate arg0
+ * to an lvalue (NOT RValue - keep the LValue* the builtin needs to mutate the
+ * caller's storage) and hand it over; the builtin self-evaluates its remaining
+ * args. Registered as `func`, so the tree-walker + const-eval reach the same
+ * impl as the VM's CallBuiltinLV. A non-lvalue arg0 (or none) passes a null
+ * target, and the builtin throws NotLValueEx / the arity error, matching the
+ * pre-migration behavior byte-for-byte.
+ */
+template <decltype(Builtin::func_lv) FLV>
+EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
+{
+    LValue *target = nullptr;
+    if (!exprList->elems.empty()) {
+        EvalValue a0 = exprList->elems[0]->eval(ctx);
+        if (a0.is<LValue *>())
+            target = a0.get<LValue *>();
+    }
+    return FLV(ctx, exprList, target);
+}
+
+template <decltype(Builtin::func_lv) FLV>
+inline auto make_builtin_lv(const char *name)
+{
+    Builtin b{builtin_lv_adapter<FLV>};   /* func set; the union is zeroed */
+    b.func_lv = FLV;                      /* the mutating-form pointer */
+    return make_pair(UniqueId::get(name), LValue(b, false));
+}
+
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     /* Generic builtins */
@@ -344,7 +373,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("isconstdecl", builtin_isconstdecl),
     make_builtin("ispure", builtin_ispure),
     make_builtin("ispuredecl", builtin_ispuredecl),
-    make_builtin("intptr", builtin_intptr),
+    make_builtin_lv<builtin_intptr>("intptr"),
     make_builtin("array_storage", builtin_array_storage),
 
     /* Compile-time type queries (folded by the inferencer; the runtime body is
@@ -375,13 +404,13 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin("array", builtin_array),
 
     /* Array builtins */
-    make_builtin("append", builtin_append),
-    make_builtin("push", builtin_append), /* push() is an alias for append() */
-    make_builtin("pop", builtin_pop),
+    make_builtin_lv<builtin_append>("append"),
+    make_builtin_lv<builtin_append>("push"),   /* push() aliases append() */
+    make_builtin_lv<builtin_pop>("pop"),
 
     /* Generic-container builtins */
-    make_builtin("erase", builtin_erase),
-    make_builtin("insert", builtin_insert),
+    make_builtin_lv<builtin_erase>("erase"),
+    make_builtin_lv<builtin_insert>("insert"),
     make_builtin("deepclone", builtin_deepclone), /* deep mutable copy */
 
     /* Numeric builtins */

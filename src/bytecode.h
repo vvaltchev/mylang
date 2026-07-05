@@ -166,6 +166,20 @@ enum class OpCode : unsigned char {
     CallBuiltinV,
 
     /*
+     * Native MUTATING-BUILTIN call (append/pop/insert/erase/intptr) with the
+     * lvalue ABI: `node` = the DirectBuiltinCallExpr (baked `builtin.func_lv`
+     * + its args ExprList); `target` = the dst slot; `target2` = arg0's slot;
+     * `a.lit` = arg0's slot KIND (0 local / 1 global / 2 capture). The handler
+     * forms arg0's LValue* straight from the matching table (mirroring
+     * Identifier::do_eval: a not-yet-defined global gives a null target ->
+     * NotLValueEx, as the tree-walker does) and calls func_lv, which mutates
+     * through it and self-evaluates its remaining args (so append keeps
+     * construct-in-place). Emitted only when arg0 is a slotted identifier
+     * (Phase 1); a subscript/member lvalue target stays EvalToSlot for now.
+     */
+    CallBuiltinLV,
+
+    /*
      * Native USER-function call (no node->eval): the args are already evaluated
      * into a contiguous register run [a.lit, a.lit + b.lit); `target2` = the
      * callee's GLOBAL-table slot (a DirectCallExpr with vm_direct_func, so the

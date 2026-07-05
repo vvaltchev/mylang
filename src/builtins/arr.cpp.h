@@ -292,19 +292,18 @@ static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
     }
 }
 
-EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target)
 {
     if (exprList->elems.size() != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &arr_lval = arg0->eval(ctx);
 
-    if (!arr_lval.is<LValue *>())
+    if (!target)
         throw NotLValueEx(arg0->start, arg0->end);
 
-    LValue *lval = arr_lval.get<LValue *>();
+    LValue *lval = target;
 
     if (!lval->is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
@@ -381,18 +380,17 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList)
     return lval->get();
 }
 
-EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList, LValue *target)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &arr_lval = arg->eval(ctx);
 
-    if (!arr_lval.is<LValue *>())
+    if (!target)
         throw NotLValueEx(arg->start, arg->end);
 
-    LValue *lval = arr_lval.get<LValue *>();
+    LValue *lval = target;
 
     if (!lval->is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg->start, arg->end);

@@ -4168,6 +4168,7 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                  * map-resident (sym.kind isn't builtin). */
                 auto d = make_unique<DirectBuiltinCallExpr>();
                 call->copy_base_fields(*d);
+                d->lvalue_arg0 = is_lvalue_arg_builtin(id->get_str());
                 d->what = move(call->what);
                 d->args = move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();

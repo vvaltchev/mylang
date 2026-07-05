@@ -201,18 +201,17 @@ EvalValue builtin_deepclone(EvalContext *ctx, ExprList *exprList)
     return make_deep_mutable_clone(RValue(arg->eval(ctx)));
 }
 
-EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList, LValue *target)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &lval = arg->eval(ctx);
 
-    if (!lval.is<LValue *>())
+    if (!target)
         throw NotLValueEx(arg->start, arg->end);
 
-    const EvalValue &e = lval.get<LValue *>()->get();
+    const EvalValue &e = target->get();
     return e.get_type()->intptr(e);
 }
 
@@ -230,20 +229,19 @@ EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList)
     return none;
 }
 
-EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList, LValue *target)
 {
     if (exprList->elems.size() != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
-    const EvalValue &container_lval = arg0->eval(ctx);
     const EvalValue &index_val = RValue(arg1->eval(ctx));
 
-    if (!container_lval.is<LValue *>())
+    if (!target)
         throw NotLValueEx(arg0->start, arg0->end);
 
-    LValue *lval = container_lval.get<LValue *>();
+    LValue *lval = target;
 
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg0->start, arg0->end);
@@ -275,7 +273,7 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList)
     }
 }
 
-EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList, LValue *target)
 {
     if (exprList->elems.size() != 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
@@ -283,14 +281,13 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
     Construct *arg2 = exprList->elems[2].get();
-    const EvalValue &container_lval = arg0->eval(ctx);
     const EvalValue &index_val = RValue(arg1->eval(ctx));
     const EvalValue &val = RValue(arg2->eval(ctx));
 
-    if (!container_lval.is<LValue *>())
+    if (!target)
         throw NotLValueEx(arg0->start, arg0->end);
 
-    LValue *lval = container_lval.get<LValue *>();
+    LValue *lval = target;
 
     if (lval->is_const_var())
         throw CannotChangeConstEx(arg0->start, arg0->end);

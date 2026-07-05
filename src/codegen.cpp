@@ -702,6 +702,11 @@ struct Codegen {
     bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
                             std::vector<Instr> &ops)
     {
+        /* A mutating builtin's union holds func_lv (which aliases func_v's
+         * storage, so the null test below can't distinguish it) - its arg0 is
+         * an lvalue, handled by the CallBuiltinLV path, not here. */
+        if (dc->lvalue_arg0)
+            return try_native_mutating_builtin(dc, out_slot, ops);
         if (!dc->builtin.func_v || !dc->args)
             return false;
 
@@ -716,6 +721,42 @@ struct Codegen {
         cv.target = dst;
         cv.a = int_lit(argbase);
         cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
+        ops.push_back(cv);
+        out_slot = dst;
+        return true;
+    }
+
+    /* Native mutating-builtin call -> CallBuiltinLV, but ONLY when arg0 is a
+     * slotted identifier (local/global/capture) - the common `append(a, x)`
+     * form. The value args are NOT compiled here: func_lv self-evaluates them,
+     * which is what keeps append's construct-in-place fast path (it needs the
+     * arg node). A subscript/member/other arg0 (or an unresolved one) falls
+     * back to EvalToSlot - Phase 2 will nativize those lvalue targets. */
+    bool try_native_mutating_builtin(const DirectBuiltinCallExpr *dc,
+                                     int &out_slot, std::vector<Instr> &ops)
+    {
+        if (!dc->builtin.func_lv || !dc->args || dc->args->elems.empty())
+            return false;
+
+        const Construct *a0 = dc->args->elems[0].get();
+        if (!a0->is_id())
+            return false;
+
+        int kind;
+        switch (static_cast<const Identifier *>(a0)->sym.kind) {
+        case SymKind::local:   kind = 0; break;
+        case SymKind::global:  kind = 1; break;
+        case SymKind::capture: kind = 2; break;
+        default: return false;   /* builtin / unresolved -> fall back */
+        }
+
+        const int dst = alloc_temp();
+        Instr cv;
+        cv.op = OpCode::CallBuiltinLV;
+        cv.node = dc;
+        cv.target = dst;
+        cv.target2 = static_cast<const Identifier *>(a0)->sym.slot;
+        cv.a = int_lit(kind);
         ops.push_back(cv);
         out_slot = dst;
         return true;

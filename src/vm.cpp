@@ -632,6 +632,43 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CallBuiltinLV: {
+
+            /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*
+             * from its slot table (by kind), then call func_lv - which mutates
+             * through it and self-evaluates its remaining args (so append keeps
+             * construct-in-place). Mirrors Identifier::do_eval for each kind: a
+             * not-yet-defined global -> null target -> NotLValueEx, like the
+             * tree-walker. */
+            const DirectBuiltinCallExpr *dc =
+                static_cast<const DirectBuiltinCallExpr *>(in.node);
+            LValue *target;
+            switch (in.a.lit) {
+            case 0:   /* local */
+                target = &ctx.frame->slots[in.target2];
+                break;
+            case 1:   /* global */
+                target = ctx.gfuncs->defined[in.target2]
+                             ? &ctx.gfuncs->slots[in.target2] : nullptr;
+                break;
+            default:  /* capture */
+                target = &(*ctx.captures)[in.target2];
+                break;
+            }
+            try {
+                ctx.frame->slots[in.target].put(
+                    dc->builtin.func_lv(&ctx, dc->args.get(), target));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = dc->args->start;
+                    e.loc_end = dc->args->end;
+                }
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::CallV:
         case OpCode::CachedCallV: {
 

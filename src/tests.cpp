@@ -10467,7 +10467,7 @@ struct VmOpCounts {
     size_t storei = 0, storef = 0, loadev = 0, evalslot = 0, evalstmt = 0;
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
-    size_t memberv = 0, callv = 0, callbuiltinv = 0;
+    size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
     int n_temps = 0;
 };
 
@@ -10523,6 +10523,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::MemberV:          c.memberv++; break;
             case OpCode::CallV:            c.callv++; break;
             case OpCode::CallBuiltinV:     c.callbuiltinv++; break;
+            case OpCode::CallBuiltinLV:    c.callbuiltinlv++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10558,12 +10559,13 @@ static bool vm_codegen_shapes()
      * tree-walker's tight counter: JumpIfFalse + LoopBackEdge, no native ops.
      * (A body with even one native statement + a fallback call instead goes
      * native around the EvalStmt - see the builtin / array-build tests below.)
-     * Uses `append` - a MUTATING builtin that can never get the value ABI, so
-     * it stays a fallback EvalStmt regardless of builtin migration. */
+     * Uses `append(a[0], ..)` - a mutating builtin over a NESTED (subscript)
+     * lvalue target, which stays an EvalStmt fallback in Phase 1 (only a
+     * slotted-identifier target goes native via CallBuiltinLV). */
     VmOpCounts b;
     if (!codegen_counts({
-            "var a = [1]; var i = 0;",
-            "while (i < 5) { append(a, i); append(a, i); }",
+            "var a = [[1]]; var i = 0;",
+            "while (i < 5) { append(a[0], i); append(a[0], i); }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -10913,6 +10915,18 @@ static bool vm_codegen_shapes()
         return false;
     const bool callbuiltinv_ok = cbv.callbuiltinv == 1;
 
+    /* 29) a MUTATING builtin over a slotted-identifier target (`append(a, x)`)
+     * -> CallBuiltinLV (the lvalue ABI), not the EvalStmt fallback. */
+    VmOpCounts clv;
+    if (!codegen_counts({
+            "var a = [1, 2, 3];",
+            "append(a, 4);",
+        }, clv))
+        return false;
+    /* The `var a = [1,2,3]` decl is itself a fallback EvalStmt (array literals
+     * aren't native yet); only the append becomes CallBuiltinLV. */
+    const bool callbuiltinlv_ok = clv.callbuiltinlv == 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -10921,7 +10935,7 @@ static bool vm_codegen_shapes()
         && break_cont_ok && compound_cond_ok && boxed_ok
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
-        && foreach_ok && callv_ok && callbuiltinv_ok;
+        && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

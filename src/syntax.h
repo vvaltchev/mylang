@@ -810,6 +810,10 @@ class DirectBuiltinCallExpr final: public CallExpr {
 
 public:
     Builtin builtin{nullptr};   /* baked from builtin_slot() at resolve time */
+    /* A MUTATING (lvalue-arg0) builtin (append/pop/...): its native form is
+     * builtin.func_lv, and arg0 must be handed over as an LValue*, not a value.
+     * Discriminates the Builtin union (func_v vs func_lv) for the VM. */
+    bool lvalue_arg0 = false;
 
     DirectBuiltinCallExpr() : CallExpr("DirectBuiltinCallExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -820,6 +824,7 @@ public:
         c->what = clone_as(what);
         c->args = clone_as(args);
         c->builtin = builtin;
+        c->lvalue_arg0 = lvalue_arg0;
         return c;
     }
 };

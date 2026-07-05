@@ -35,16 +35,32 @@ class StructObject;     /* a struct instance (structtype.h) */
  * VALUE ABI: the args are ALREADY evaluated into `args[0..n)` and passed by
  * value (no node->eval); `exprList` is handed over for LOCS + arity ONLY (never
  * evaluated). It is non-null only for a migrated, read-only builtin; the VM's
- * CallBuiltinV uses it, else it falls back to `func` via EvalToSlot. A mutating
- * builtin (append/pop/...) needs an lvalue arg and an AST builtin
- * (defined/type) needs the node, so those keep func_v == null. For a migrated
- * builtin `func` is a generic adapter (make_const_builtin_v) that evaluates the
- * args and calls func_v - so the two engines share one implementation.
+ * CallBuiltinV uses it, else it falls back to `func` via EvalToSlot. A MUTATING
+ * builtin (append/pop/...) uses the `func_lv` form below instead (arg0 is an
+ * lvalue); an AST builtin (defined/type) needs the arg node, so it keeps the
+ * union null and stays a fallback. For a migrated builtin `func` is a generic
+ * adapter (make_const_builtin_v / make_builtin_lv) that prepares the args and
+ * calls the native form - so the two engines share one implementation.
  */
 struct Builtin {
     EvalValue (*func)(EvalContext *, ExprList *);
-    EvalValue (*func_v)(EvalContext *, ExprList *, const EvalValue *,
-                        size_t) = nullptr;
+    /*
+     * The native (VM / tree-walker-adapter) form. ONE of two shapes, mutually
+     * exclusive per builtin, so they SHARE storage in a union - keeping Builtin
+     * at two pointers (EvalValue stays 32). Which one is live is decided by
+     * DirectBuiltinCallExpr::lvalue_arg0 (the VM) / the registered adapter (the
+     * tree-walker), never by reading both:
+     *   func_v  - a READ-ONLY builtin: args pre-evaluated by VALUE, no lvalue.
+     *   func_lv - a MUTATING builtin: arg0 handed over as an LValue* target;
+     *             the builtin self-evaluates its remaining args (so append
+     *             keeps construct-in-place, which needs the arg node).
+     * Null (union zero) == not migrated: the VM falls back to func (EvalStmt).
+     */
+    union {
+        EvalValue (*func_v)(EvalContext *, ExprList *, const EvalValue *,
+                            size_t);
+        EvalValue (*func_lv)(EvalContext *, ExprList *, LValue *);
+    };
 };
 
 /* Base typedefs for non-generic template types */
