@@ -584,6 +584,39 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CallBuiltinV: {
+
+            /* Native builtin call (value ABI): copy the pre-evaluated args from
+             * the register run into a buffer and call func_v (the args ExprList
+             * is passed for error locs only, never evaluated). The try/catch
+             * stamps the args-list loc onto a loc-less error, exactly as
+             * DirectBuiltinCallExpr::do_eval does. */
+            const DirectBuiltinCallExpr *dc =
+                static_cast<const DirectBuiltinCallExpr *>(in.node);
+            const int_type base = in.a.lit, n = in.b.lit;
+            EvalValue stackbuf[8];
+            std::vector<EvalValue> heapbuf;
+            EvalValue *buf = stackbuf;
+            if (n > 8) {
+                heapbuf.resize(n);
+                buf = heapbuf.data();
+            }
+            for (int_type i = 0; i < n; i++)
+                buf[i] = ctx.frame->slots[base + i].get();
+            try {
+                ctx.frame->slots[in.target].put(
+                    dc->builtin.func_v(&ctx, dc->args.get(), buf, n));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = dc->args->start;
+                    e.loc_end = dc->args->end;
+                }
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::CallV:
         case OpCode::CachedCallV: {
 

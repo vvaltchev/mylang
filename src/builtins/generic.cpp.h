@@ -22,23 +22,23 @@ EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
     return !arg->eval(ctx).is<UndefinedId>();
 }
 
-EvalValue builtin_len(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_len(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg->eval(ctx));
+    const EvalValue &e = args[0];
     return e.get_type()->len(e);
 }
 
-EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_str(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() < 1)
+    if (n < 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &e = RValue(arg0->eval(ctx));
+    const EvalValue &e = args[0];
 
     if (e.is<SharedStr>()) {
 
@@ -46,13 +46,13 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
 
     } else if (e.is<float_type>()) {
 
-        if (exprList->elems.size() > 2)
+        if (n > 2)
             throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-        if (exprList->elems.size() == 2) {
+        if (n == 2) {
 
             Construct *arg1 = exprList->elems[1].get();
-            const EvalValue &p = RValue(arg1->eval(ctx));
+            const EvalValue &p = args[1];
 
             if (!p.is<int_type>() || p.get<int_type>() < 0 || p.get<int_type>() > 64) {
 
@@ -71,19 +71,20 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList)
              * silently truncate for large-magnitude values at high precision
              * (e.g. str(1e30, 64) needs ~96 chars).
              */
-            const int n = snprintf(nullptr, 0, "%.*f", precision, fval);
+            const int slen = snprintf(nullptr, 0, "%.*f", precision, fval);
 
-            if (n < 0)
-                throw InternalErrorEx(arg0->start, arg0->end);
+            if (slen < 0)
+                throw InternalErrorEx(exprList->elems[0]->start,
+                                      exprList->elems[0]->end);
 
-            std::vector<char> buf(static_cast<size_t>(n) + 1);
+            std::vector<char> buf(static_cast<size_t>(slen) + 1);
             snprintf(buf.data(), buf.size(), "%.*f", precision, fval);
-            return SharedStr(string(buf.data(), static_cast<size_t>(n)));
+            return SharedStr(string(buf.data(), static_cast<size_t>(slen)));
         }
 
     } else {
 
-        if (exprList->elems.size() > 1)
+        if (n > 1)
             throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
     }
 

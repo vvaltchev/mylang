@@ -10467,7 +10467,7 @@ struct VmOpCounts {
     size_t storei = 0, storef = 0, loadev = 0, evalslot = 0, evalstmt = 0;
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
-    size_t memberv = 0, callv = 0;
+    size_t memberv = 0, callv = 0, callbuiltinv = 0;
     int n_temps = 0;
 };
 
@@ -10522,6 +10522,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::SubscriptV:       c.subscriptv++; break;
             case OpCode::MemberV:          c.memberv++; break;
             case OpCode::CallV:            c.callv++; break;
+            case OpCode::CallBuiltinV:     c.callbuiltinv++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }
@@ -10900,6 +10901,16 @@ static bool vm_codegen_shapes()
         return false;
     const bool callv_ok = cv.callv == 1;
 
+    /* 28) a migrated read-only builtin (value ABI) -> CallBuiltinV, not an
+     * EvalToSlot fallback. `len(a)` with a non-const `a` (not folded). */
+    VmOpCounts cbv;
+    if (!codegen_counts({
+            "var a = [1, 2, 3];",
+            "var dyn x = len(a);",
+        }, cbv))
+        return false;
+    const bool callbuiltinv_ok = cbv.callbuiltinv == 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -10908,7 +10919,7 @@ static bool vm_codegen_shapes()
         && break_cont_ok && compound_cond_ok && boxed_ok
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
-        && foreach_ok && callv_ok;
+        && foreach_ok && callv_ok && callbuiltinv_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

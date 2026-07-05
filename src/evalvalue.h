@@ -29,7 +29,23 @@ class EvalContext;
 class FuncObject;
 struct StructTypeDef;   /* a struct type descriptor (structtype.h) */
 class StructObject;     /* a struct instance (structtype.h) */
-struct Builtin { EvalValue (*func)(EvalContext *, ExprList *); };
+/*
+ * A builtin. `func` is the ORIGINAL ABI (self-evaluates the unevaluated arg
+ * nodes) - always set; the tree-walker calls it. `func_v` is the VM's
+ * VALUE ABI: the args are ALREADY evaluated into `args[0..n)` and passed by
+ * value (no node->eval); `exprList` is handed over for LOCS + arity ONLY (never
+ * evaluated). It is non-null only for a migrated, read-only builtin; the VM's
+ * CallBuiltinV uses it, else it falls back to `func` via EvalToSlot. A mutating
+ * builtin (append/pop/...) needs an lvalue arg and an AST builtin
+ * (defined/type) needs the node, so those keep func_v == null. For a migrated
+ * builtin `func` is a generic adapter (make_const_builtin_v) that evaluates the
+ * args and calls func_v - so the two engines share one implementation.
+ */
+struct Builtin {
+    EvalValue (*func)(EvalContext *, ExprList *);
+    EvalValue (*func_v)(EvalContext *, ExprList *, const EvalValue *,
+                        size_t) = nullptr;
+};
 
 /* Base typedefs for non-generic template types */
 typedef DictObjectTempl<EvalValue, LValue> DictObject;

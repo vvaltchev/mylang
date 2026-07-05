@@ -155,6 +155,17 @@ enum class OpCode : unsigned char {
     EvalToSlot,
 
     /*
+     * Native BUILTIN call with the VALUE ABI (no node->eval): the args are
+     * already evaluated into the register run [a.lit, a.lit+b.lit); `node` =
+     * the DirectBuiltinCallExpr (its baked `builtin.func_v` + its args ExprList
+     * for error locs); `target` = the dst slot. Copies the arg values into a
+     * buffer and calls func_v. Emitted only for a builtin that HAS func_v (a
+     * migrated, read-only builtin); a mutating / AST / un-migrated one stays
+     * EvalToSlot.
+     */
+    CallBuiltinV,
+
+    /*
      * Native USER-function call (no node->eval): the args are already evaluated
      * into a contiguous register run [a.lit, a.lit + b.lit); `target2` = the
      * callee's GLOBAL-table slot (a DirectCallExpr with vm_direct_func, so the

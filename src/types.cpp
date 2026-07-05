@@ -192,14 +192,52 @@ inline auto make_builtin(const char *name, decltype(Builtin::func) f)
     return make_pair(UniqueId::get(name), LValue(Builtin{f}, false));
 }
 
+/*
+ * The generic tree-walker adapter for a VALUE-ABI builtin (Builtin::func_v):
+ * evaluate the unevaluated args into a buffer, then call the value form. So a
+ * migrated builtin has ONE implementation, reached by the tree-walker through
+ * this adapter and by the VM (CallBuiltinV) directly with pre-evaluated args.
+ * A stack buffer covers the common small-arity call; only a big variadic call
+ * heap-allocates.
+ */
+template <decltype(Builtin::func_v) FV>
+EvalValue builtin_v_adapter(EvalContext *ctx, ExprList *exprList)
+{
+    const size_t n = exprList->elems.size();
+    EvalValue stackbuf[8];
+    std::vector<EvalValue> heapbuf;
+    EvalValue *buf = stackbuf;
+    if (n > 8) {
+        heapbuf.resize(n);
+        buf = heapbuf.data();
+    }
+    for (size_t i = 0; i < n; i++)
+        buf[i] = RValue(exprList->elems[i]->eval(ctx));
+    return FV(ctx, exprList, buf, n);
+}
+
+template <decltype(Builtin::func_v) FV>
+inline auto make_const_builtin_v(const char *name)
+{
+    return make_pair(UniqueId::get(name),
+                     LValue(Builtin{builtin_v_adapter<FV>, FV}, true));
+}
+
+template <decltype(Builtin::func_v) FV>
+inline auto make_builtin_v(const char *name)
+{
+    return make_pair(UniqueId::get(name),
+                     LValue(Builtin{builtin_v_adapter<FV>, FV}, false));
+}
+
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     /* Generic builtins */
     make_const_builtin("defined", builtin_defined),
-    make_const_builtin("len", builtin_len),
-    make_const_builtin("str", builtin_str),
-    make_const_builtin("int", builtin_int),
-    make_const_builtin("float", builtin_float),
+    make_const_builtin_v<builtin_len>("len"),
+    make_const_builtin_v<builtin_str>("str"),
+    make_const_builtin_v<builtin_int>("int"),
+    make_const_builtin_v<builtin_float>("float"),
     make_const_builtin("clone", builtin_clone),
     make_const_builtin("hash", builtin_hash),
 

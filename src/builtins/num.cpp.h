@@ -20,13 +20,14 @@ static std::random_device rdev;
 static std::mt19937_64 mt_engine(rdev());
 
 
-EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_int(EvalContext *ctx, ExprList *exprList,
+                      const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (val.is<int_type>()) {
 
@@ -66,13 +67,14 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList)
     }
 }
 
-EvalValue builtin_float(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_float(EvalContext *ctx, ExprList *exprList,
+                        const EvalValue *args, size_t n)
 {
-    if (exprList->elems.size() != 1)
+    if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const EvalValue &val = RValue(arg->eval(ctx));
+    const EvalValue &val = args[0];
 
     if (val.is<float_type>()) {
 

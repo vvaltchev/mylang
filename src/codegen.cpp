@@ -363,6 +363,12 @@ struct Codegen {
             if (try_native_call(dc, out_slot, ops))
                 return true;
 
+        /* A native builtin call (value ABI) -> CallBuiltinV. */
+        if (const DirectBuiltinCallExpr *bc =
+                dynamic_cast<const DirectBuiltinCallExpr *>(e))
+            if (try_native_builtin(bc, out_slot, ops))
+                return true;
+
         /* A ternary `cond ? a : b` as a VALUE: compute cond, branch on it, and
          * evaluate exactly ONE of the two arms into `dst`. This is what makes a
          * recursion-unroll return (fib: `return (n-1<2 ? .. : f(..)+f(..))..`)
@@ -630,19 +636,18 @@ struct Codegen {
      * complex expression) rolls the whole call back to the EvalStmt/EvalToSlot
      * fallback. Args are evaluated left-to-right, once each.
      */
-    bool try_native_call(const DirectCallExpr *dc, int &out_slot,
-                         std::vector<Instr> &ops)
+    /* Evaluate a call's args into a fresh contiguous register run
+     * [argbase, argbase+n) via compile_boxed_expr, left-to-right, once each;
+     * rolls back ops + temps and returns false if an arg can't lower. Shared by
+     * the native user-call and native-builtin lowerings. */
+    bool emit_args_range(const std::vector<unique_ptr<Construct>> &elems,
+                         int &argbase, std::vector<Instr> &ops)
     {
-        if (!dc->vm_direct_func || dc->direct_func_slot < 0 || !dc->args)
-            return false;
-
-        const auto &elems = dc->args->elems;
-        const int n = static_cast<int>(elems.size());
-
         const size_t mark = ops.size();
         const int save_top = next_temp;
+        const int n = static_cast<int>(elems.size());
 
-        const int argbase = next_temp;
+        argbase = next_temp;
         next_temp += n;
         if (next_temp > max_temp)
             max_temp = next_temp;
@@ -662,6 +667,18 @@ struct Codegen {
             ops.push_back(mv);
             next_temp = sub;   /* free this arg's scratch for the next */
         }
+        return true;
+    }
+
+    bool try_native_call(const DirectCallExpr *dc, int &out_slot,
+                         std::vector<Instr> &ops)
+    {
+        if (!dc->vm_direct_func || dc->direct_func_slot < 0 || !dc->args)
+            return false;
+
+        int argbase;
+        if (!emit_args_range(dc->args->elems, argbase, ops))
+            return false;
 
         const int dst = alloc_temp();
         Instr cv;
@@ -673,7 +690,32 @@ struct Codegen {
         cv.target = dst;
         cv.target2 = dc->direct_func_slot;
         cv.a = int_lit(argbase);
-        cv.b = int_lit(n);
+        cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
+        ops.push_back(cv);
+        out_slot = dst;
+        return true;
+    }
+
+    /* Native builtin call -> CallBuiltinV, but only for a builtin with the
+     * VALUE ABI (func_v is set - a migrated, read-only builtin); a mutating /
+     * AST / un-migrated builtin stays the EvalToSlot fallback. */
+    bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
+                            std::vector<Instr> &ops)
+    {
+        if (!dc->builtin.func_v || !dc->args)
+            return false;
+
+        int argbase;
+        if (!emit_args_range(dc->args->elems, argbase, ops))
+            return false;
+
+        const int dst = alloc_temp();
+        Instr cv;
+        cv.op = OpCode::CallBuiltinV;
+        cv.node = dc;
+        cv.target = dst;
+        cv.a = int_lit(argbase);
+        cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -750,11 +792,16 @@ struct Codegen {
          * user call whose body is tree-walked (a closure) would only add the
          * boxing on top of the call (see 11_closure_counter); a cheap/inlinable
          * user call (`func f(x)=>x+1`) is already inlined away. */
-        if (e->th == TypeHint::i
-            && dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
-            out = eval_to_temp(e, ops);
-            return true;
-        }
+        if (e->th == TypeHint::i)
+            if (const DirectBuiltinCallExpr *bc =
+                    dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
+                int t;
+                if (try_native_builtin(bc, t, ops))   /* value ABI */
+                    out = slot_op(t);
+                else
+                    out = eval_to_temp(e, ops);        /* old ABI fallback */
+                return true;
+            }
 
         /* An int-returning native user-function call -> CallV, its result an
          * int operand (so `s += f(i)` stays the int fast path). */
@@ -989,13 +1036,18 @@ struct Codegen {
             return true;
         }
 
-        /* A scalar-result BUILTIN call -> eval into a temp; the result is then
-         * a native float operand (builtins only - see compile_int_expr). */
-        if (e->th == TypeHint::f
-            && dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
-            out = eval_to_temp(e, ops);
-            return true;
-        }
+        /* A scalar-result BUILTIN call -> CallBuiltinV (value ABI) or eval into
+         * a temp (old ABI); the result is a native float operand. */
+        if (e->th == TypeHint::f)
+            if (const DirectBuiltinCallExpr *bc =
+                    dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
+                int t;
+                if (try_native_builtin(bc, t, ops))
+                    out = slot_op(t);
+                else
+                    out = eval_to_temp(e, ops);
+                return true;
+            }
 
         /* A float-returning native user-function call -> CallV. */
         if (e->th == TypeHint::f)
@@ -1376,6 +1428,15 @@ struct Codegen {
                     dynamic_cast<const DirectCallExpr *>(s)) {
                 int dst;
                 if (try_native_call(dc, dst, chunk.code)) {
+                    any_native = true;
+                    continue;
+                }
+            }
+            /* A builtin call statement -> CallBuiltinV (result discarded). */
+            if (const DirectBuiltinCallExpr *bc =
+                    dynamic_cast<const DirectBuiltinCallExpr *>(s)) {
+                int dst;
+                if (try_native_builtin(bc, dst, chunk.code)) {
                     any_native = true;
                     continue;
                 }
@@ -1831,6 +1892,13 @@ struct Codegen {
                 dynamic_cast<const DirectCallExpr *>(s)) {
             int dst;
             if (try_native_call(dc, dst, chunk.code))
+                return;
+        }
+        /* A builtin call statement (result discarded) -> CallBuiltinV. */
+        if (const DirectBuiltinCallExpr *bc =
+                dynamic_cast<const DirectBuiltinCallExpr *>(s)) {
+            int dst;
+            if (try_native_builtin(bc, dst, chunk.code))
                 return;
         }
         /* `return <expr>;` -> ReturnV (its expr compiled natively). */
