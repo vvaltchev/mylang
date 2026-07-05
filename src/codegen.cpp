@@ -394,6 +394,46 @@ struct Codegen {
     bool compile_boxed_expr(const Construct *e, int &out_slot,
                             std::vector<Instr> &ops)
     {
+        /*
+         * Typed-arg lowering: a th==i/f node computes its int/float value via
+         * the UNBOXED typed path (IntBin/FloatBin/CallV/LoadElem...), which
+         * writes a VALID int/float EvalValue into the result slot - so a boxed
+         * consumer reads it fine. Prefer that over a boxed BinOpV+num_bin_op:
+         * `fib(n-1) + fib(n-2)` in a return becomes an IntBin, not a `bin.v`.
+         * If the typed path can't lower this node (a comparison-as-value, an
+         * un-typed shape, a global/capture leaf), roll back what it emitted and
+         * fall through to the boxed cases below - so this only ever turns a
+         * boxed op into the equivalent typed one, never changes behavior.
+         */
+        if (e->th == TypeHint::i || e->th == TypeHint::f) {
+            const size_t omark = ops.size();
+            const size_t cmark = chunk.consts.size();
+            const int save_top = next_temp;
+            Operand top;
+            const bool ok = e->th == TypeHint::i
+                ? compile_int_expr(e, top, ops)
+                : compile_float_expr(e, top, ops);
+            if (ok) {
+                if (!top.is_lit) {
+                    out_slot = top.slot;
+                    return true;
+                }
+                /* an immediate result (a bare literal) -> materialize a slot */
+                const int t = alloc_temp();
+                Instr ld;
+                ld.op = e->th == TypeHint::i ? OpCode::LoadImmInt
+                                             : OpCode::LoadImmFloat;
+                ld.target = t;
+                ld.a = top;
+                ops.push_back(ld);
+                out_slot = t;
+                return true;
+            }
+            ops.resize(omark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+        }
+
         if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
             if (id->sym.kind == SymKind::local) {
                 out_slot = id->sym.slot;
