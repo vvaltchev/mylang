@@ -106,9 +106,11 @@ first:
    contained op.
 
 5. **Part C - native-but-slow** (independent of fallbacks): computed-goto
-   dispatch (C2, broad 10-20% on dispatch-bound loops), the builtin arg-view ABI
-   (C3), `ModConst` (C4). The typed-read work (C1) largely landed as the typed
-   dict / struct / element read ops.
+   dispatch (C2, broad 10-20% on dispatch-bound loops — **and the DIRECT fix for
+   the 2026-07-08 dispatch-slowdown regression**, since a bigger op set stops
+   regressing the hot ops' branch prediction; pair with a cold-handler split),
+   the builtin arg-view ABI (C3), `ModConst` (C4). The typed-read work (C1)
+   largely landed as the typed dict / struct / element read ops.
 
 **⛔ Negative result — foreach (F + D3), attempted P5 and REVERTED.** Built a
 `ForeachBind` op that reuses a factored `foreach_bind_one` to make an array
@@ -178,10 +180,14 @@ Progress (60-bench geomean; `run.py`'s 61-set reads a touch higher):
 now, same bench set): ~HALF is a **bench-set artifact** (the recently-added
 `63`/`64`/`66` benches are below-average — the OLD binary itself drops
 4.36×→4.15× just from including them, no code change), and ~half is a small
-**real ~4–5% regression** on native/dispatch benches from the bigger VM (more
-ops + the
-still-present 8-byte `Instr::node`), recoverable at drop-`Instr::node` (Step 5).
-Full data + the drift caveat in the "Perf regression to RECOVER" note in
+**real ~4–5% regression** on dispatch-bound int/float benches (`01_while_loop`/
+`03_int_arith`/`44_primes_sqrt`/`60_bit_sieve`) whose hot ops (`IntBin`/
+`ForLoopStep`/`JumpUnlessIntCmp`/`LoadElemInt`/`StoreElemInt`) were untouched —
+so it's the `vm_run_chunk` SWITCH growing (~8 new op cases → worse code-side
+I-cache/branch prediction), NOT the Instr size (unchanged). Direct fix =
+**computed-goto dispatch (C2)** + a cold-handler split; `drop-Instr::node`
+(Step 5) is a secondary data-side win. Full data, the drift caveat, and the
+profile/re-measure set in the "Perf regression to RECOVER" note in
 `vm-ast-free.md`. Do NOT revert a nativization to chase it.
 
 **Method:** ran `mylang -vd` on all 62 `bench/my/*.my` and recorded every

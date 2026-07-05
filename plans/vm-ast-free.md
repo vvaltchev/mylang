@@ -56,17 +56,37 @@ bench set, same machine. Two effects, ONLY the second a regression:
   `03_int_arith` 1.07×, `44_primes_sqrt` 1.11×, `60_bit_sieve` 1.08×). Caution:
   the FIRST (serial, non-interleaved) pass over-reported this — `24_dict_lookup`
   showed 1.20× serial but 0.99× interleaved (pure machine drift). The nativized
-  benches themselves IMPROVED (`66` 0.57×, sort/reverse). So the regression is a
-  broad, small dispatch-loop slowdown: the recent nativizations ADDED ops
-  (`CheckFuncV`/`MapFilterV`/`DeclConstV`/`ForeachDyn*`/`StoreCaptureV`/…),
-  enlarging the `vm_run_chunk` switch, while every `Instr` still carries the
-  8-byte `Construct *node` (`Instr` = 64 bytes, 2× an `EvalValue`).
+  benches themselves IMPROVED (`66` 0.57×, sort/reverse).
 
-- **Fix = Step 5 (drop `Instr::node` → `Instr` 64→56 bytes, better dispatch-loop
-  I-cache) + the builtin loc handle (Steps 1–3)** — **NOT** reverting a
-  nativization. **Action: re-measure `run.py --vm` after Step 5** and confirm
-  the ~4–5% comes back (the bench-set drag is permanent + correct — those
-  benches belong in the suite).
+- **The VICTIM ops (what to profile + re-measure), and why it is NOT op-level.**
+  The four slow benches are dispatch-bound int/float loops; their hot ops —
+  **`IntBin`, `FloatBin`, `JumpUnlessIntCmp`, `ForLoopStep`, `LoadElemInt`,
+  `StoreElemInt`** — were NOT touched this cycle, so no handler got a worse
+  implementation. What changed is the `vm_run_chunk` DISPATCH: the session added
+  ~8 new op cases (`CheckFuncV`/`MapFilterV`/`DeclConstV`/`ForeachDynInit`/
+  `ForeachDynNext`/… on top of the prior `StoreCaptureV`/`MakeClosureV`/
+  `StructCtorV`/…), so the switch's handler CODE grew, hurting the hot handlers'
+  code-side I-cache + the single indirect-branch hub's prediction. NB: `Instr`
+  SIZE did NOT change (the 8-byte `node` was always there), so this is a
+  **code**-side effect, not the Instr-data-size one. INFERRED (the hot ops'
+  code is unchanged) — a `perf stat` (branch-misses / L1i-misses) or cachegrind
+  pass on `01_while_loop`/`03_int_arith`/`44_primes_sqrt`/`60_bit_sieve` would
+  pinpoint it. These four + those six ops are the re-measure set.
+
+- **Candidate fixes, most-direct first — none is "revert a nativization":**
+  1. **Computed-goto dispatch** (Part C2, `&&label` threading on GCC/clang; keep
+     the `switch` for MSVC). Each op becomes its own indirect branch, so a
+     bigger op set stops regressing the hot ops' prediction — the DIRECT fix for
+     a growing-switch cost.
+  2. **Split COLD handlers out of the hot switch** — move the rare ops
+     (`MapFilterV`/`DeclConstV`/`ForeachDyn*`/`CheckFuncV`/`EmplaceStruct`/…) to
+     a cold `[[gnu::noinline]]` secondary dispatch, so the hot `vm_run_chunk`
+     body stays small (better I-cache for `IntBin`/`ForLoopStep`).
+  3. **Drop `Instr::node`** (Step 5 → `Instr` 64→56 bytes) — a DATA-side I-cache
+     win (the instruction stream a tight loop re-reads); general, not this dip's
+     specific cause.
+  **Action: re-measure the four benches after each; the bench-set drag is
+  permanent + correct (those benches belong in the suite).**
 
 ## The plan
 
