@@ -66,6 +66,19 @@ struct Builtin {
         EvalValue (*func_lv)(EvalContext *, ExprList *, LValue *,
                              const EvalValue *, size_t);
     };
+
+    /*
+     * Explicit ctors so no construction leaves the anonymous union member
+     * uninitialized - aggregate init `Builtin{f}` / `Builtin{nullptr}` used to,
+     * which -Wmissing-field-initializers (rightly) flagged. Both pointers null
+     * == "not migrated" (the VM falls back to `func`). A MUTATING builtin is
+     * built via the 1-arg ctor (func set, union zeroed) then `b.func_lv = FLV`.
+     * Only ctors are user-declared, so Builtin stays trivially COPYABLE (the
+     * union's bit-copy of a t_builtin value is unaffected).
+     */
+    Builtin() : func(nullptr), func_v(nullptr) { }
+    explicit Builtin(decltype(func) f) : func(f), func_v(nullptr) { }
+    Builtin(decltype(func) f, decltype(func_v) fv) : func(f), func_v(fv) { }
 };
 
 /* Base typedefs for non-generic template types */

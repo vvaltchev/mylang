@@ -3584,6 +3584,20 @@ omitting it is a compile error.
 - C++17, `-Wall -Wextra -Wno-unused-parameter`, compiled with `-fwrapv` (signed
   overflow wraps — and
   is *relied upon*; don't "fix" wrap-dependent arithmetic).
+- **Compiler warnings must be ADDRESSED, not SILENCED — the build stays
+  warning-clean on BOTH g++ and clang.** A `-Wall -Wextra` warning is a real
+  signal; fix the ROOT CAUSE, never suppress it with a `#pragma`, a `-Wno-...`
+  flag, or a cast/`(void)` that hides the issue. When a warning looks like a
+  false positive, the fix is to make the INTENT EXPLICIT (which also documents
+  it), not to disable the diagnostic — e.g. a `-Wmissing-field-initializers` on
+  aggregate-initializing a struct with an anonymous union → give the struct a
+  **constructor** that initializes every member (done for `Builtin`); a
+  `-Wextra` "base should be explicitly initialized in the copy constructor" →
+  **name the base** in the init list (`FuncObject`'s copy ctor lists
+  `RefCounted()` to state "a clone owns a fresh count"). After any change, a
+  clean build (`make clean && make`) must show ZERO warnings; audit clang too
+  (`make CXX=clang++`), since CI builds both and each emits some the other
+  doesn't.
 - Every file starts with `/* SPDX-License-Identifier: BSD-2-Clause */`.
 - Core typedefs (`defs.h`): `int_type = intptr_t`, `float_type = double`
   (printf/snprintf with `%f`/`%.*f`; the comment warns to update the format

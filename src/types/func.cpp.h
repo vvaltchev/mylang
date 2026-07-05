@@ -79,7 +79,8 @@ EvalValue TypeFunc::clone(const EvalValue &a)
 }
 
 FuncObject::FuncObject(const FuncObject &rhs)
-    : func(rhs.func)
+    : RefCounted()   /* a clone owns a FRESH count - do NOT copy rhs's */
+    , func(rhs.func)
     , capture_slots(rhs.capture_slots)
     , capture_ctx(rhs.capture_ctx.parent,
                   rhs.capture_ctx.const_ctx,
