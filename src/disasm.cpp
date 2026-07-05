@@ -204,6 +204,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         if (kind == 1) return "&g" + std::to_string(slot);   /* global */
         return "&c" + std::to_string(slot);                  /* capture */
     };
+    /* a container-store op's BASE by slot kind (in.target): local reg / gN / cN.
+     * (-1, the unset default, is local too.) */
+    auto bref = [&](int kind, int slot) -> std::string {
+        if (kind == 1) return "g" + std::to_string(slot);    /* global */
+        if (kind == 2) return "c" + std::to_string(slot);    /* capture */
+        return reg(chunk, slot);                             /* local (or -1) */
+    };
 
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
         const Instr &in = chunk.code[pc];
@@ -311,12 +318,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << D(in.target2) << ")";
             break;
         case OpCode::StoreElemInt:
-            row << "store.elem.i " << D(in.target2) << "["
+            row << "store.elem.i " << bref(in.target, in.target2) << "["
                 << RI(in.a, false) << "] " << store_op(in.aop) << " "
                 << RI(in.b, false);
             break;
         case OpCode::StoreElemFloat:
-            row << "store.elem.f " << D(in.target2) << "["
+            row << "store.elem.f " << bref(in.target, in.target2) << "["
                 << RI(in.a, false) << "] " << store_op(in.aop) << " "
                 << RI(in.b, true);
             break;
@@ -327,7 +334,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                             in.aop == Op::subeq  ? "-=" :
                             in.aop == Op::muleq  ? "*=" :
                             in.aop == Op::diveq  ? "/=" : "%=";
-            row << "dict.store   " << D(in.target2) << "["
+            row << "dict.store   " << bref(in.target, in.target2) << "["
                 << RI(in.a, false) << "] " << o << " " << RI(in.b, false);
             break;
         }
@@ -338,7 +345,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                             in.aop == Op::subeq  ? "-=" :
                             in.aop == Op::muleq  ? "*=" :
                             in.aop == Op::diveq  ? "/=" : "%=";
-            row << "member.store " << D(in.target2) << "."
+            row << "member.store " << bref(in.target, in.target2) << "."
                 << chunk.member_keys[in.a.lit].memId.get_type()
                        ->to_string(chunk.member_keys[in.a.lit].memId)
                 << " " << o << " " << RI(in.b, false);
@@ -350,7 +357,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                             in.aop == Op::subeq  ? "-=" :
                             in.aop == Op::muleq  ? "*=" :
                             in.aop == Op::diveq  ? "/=" : "%=";
-            row << "store.elem.v " << D(in.target2) << "["
+            row << "store.elem.v " << bref(in.target, in.target2) << "["
                 << RI(in.a, false) << "] " << o << " " << RI(in.b, false);
             break;
         }

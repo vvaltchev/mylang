@@ -18,6 +18,8 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~D1m~~ | ~~dict MEMBER store `d.k=v`~~ | (rare) | P2b | ✅ DictStore (string key) |
 | ~~S1m~~ | ~~struct field store `s.f=v`~~ | 58,65 | — | ✅ StoreMemberV (POD/boxed) |
 | ~~N2~~ | ~~nested store `a[i][j]=v`~~ | 68,matrix | — | ✅ StoreElem2V (flat+general) |
+| ~~G/C~~ | ~~global/capture container base~~ | — | — | ✅ as_container_base + vm_store_base |
+| ~~DYN~~ | ~~dyn/unproven-base store~~ | — | — | ✅ universal StoreElemValue (flat via core) |
 | ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
 | ~~F1~~ | ~~foreach single-var gen arr~~ | (grp) | — | ✅ box-free LoadElem.v |
 | ~~F2~~ | ~~foreach INDEXED 2-var~~ | 19 | — | ✅ box-free (see "redo") |
@@ -106,13 +108,24 @@ first:
    (D1m)~~ ✅ (DictStore, string key); ~~a struct field store `s.f=v` (S1m)~~ ✅
    (StoreMemberV, POD byte store / boxed-field slot_rmw — gated on the
    inferencer's `MemberExpr::base_struct`, base a slotted local; a flat-array
-   element `a[i].x=v` base is a pre-existing tree-walker NotLValueEx, unchanged);
+   element `a[i].x=v` base is a pre-existing tree-walker NotLValueEx);
    ~~a nested store `a[i][j]=v`~~ ✅ (StoreElem2V — reads `a[i]` as a reference
    then stores `[j]`; a FLAT inner via the shared `flat_store_core`, a GENERAL
    inner via the element LValue + slot_rmw; matrix benches 0-fallback, VM ~2.2×
-   the tree-walker on the nested workload); a GLOBAL/capture dict base; a
-   `global = <expr with a call>` loop driver (R/P10b, bench 10). Each is a
-   contained op.
+   the tree-walker on the nested workload); ~~a GLOBAL/capture container base~~
+   ✅ (`as_container_base` returns a slot KIND 0/1/2, the store ops carry it in
+   `in.target`, `vm_store_base` forms the base LValue* from the frame / global
+   table / capture vector — so `a[i]=v` / `d[k]=v` / `s.f=v` target a top-level
+   container a function reads or a captured one, not only a frame local); ~~a
+   DYN / unproven base~~ ✅ (the UNIVERSAL `StoreElemValue`: `vm_subscript_store`
+   now handles a FLAT scalar base too via the shared `flat_store_core`, so it
+   dispatches flat/general/dict at runtime like the tree-walker's
+   try_flat->general — the codegen emits it as the catch-all for any
+   container-slot base a fast path didn't take, preserving the unboxed
+   StoreElemInt/Float for proven flat int/float arrays); ~~a `global = <expr
+   with a call>` loop driver (bench 10)~~ ✅ (already 0-fallback: `r = f(x)` is a
+   local store over a native CallV). The only remaining executed-code bench
+   fallback is exceptions (42, P8).
 
 5. **Part C - native-but-slow** (independent of fallbacks): computed-goto
    dispatch (C2, broad 10-20% on dispatch-bound loops — **and the DIRECT fix for

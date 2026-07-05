@@ -3129,6 +3129,34 @@ general `StoreElemValue` path (`subscript(for_write)`) wrongly raised
 `NotLValueEx`; `vm_subscript_store` now byte-stores a flat POD-struct element
 directly (bounds/type-check/COW/`memcpy`), mirroring `try_flat_subscript_store`.
 
+**The residual container-STORE family (all now native).** A **struct field
+store** `s.f = v` / `s.f OP= v` → **`StoreMemberV`** (`vm_member_store`: a POD
+field coerces + byte-stores, a boxed field takes the field LValue + `slot_rmw`),
+gated on the inferencer's `MemberExpr::base_struct`; a **nested store**
+`a[i][j] = v` → **`StoreElem2V`** (`vm_nested_subscript_store` reads `a[i]` as a
+reference then stores `[j]` into it — a FLAT inner via the shared
+`flat_store_core`, a GENERAL inner via the element LValue; COW writes back
+through the inner element). Both ride the loc side table / member-key pool
+(AST-free). **A store's base may be a GLOBAL or CAPTURE container**, not only a
+frame local: `as_container_base` (codegen) returns a slot **KIND** (0 local / 1
+global / 2 capture) which the store ops carry in `in.target`, and
+`vm_store_base`
+(vm.cpp) forms the base `LValue*` from the frame / the `GlobalFuncTable` /
+`ctx->captures` (an undefined global → `UndefinedVariableEx`) — so `a[i]=v` /
+`d[k]=v` / `s.f=v` targeting a top-level container a function reads, or a
+captured one, go native. **`StoreElemValue` is the UNIVERSAL store**:
+`vm_subscript_store` now handles a **flat scalar** base too (via the shared
+`flat_store_core`, factored out of `try_flat_subscript_store` alongside
+`flat_writable_array`), so it dispatches **flat / general / dict** at runtime
+exactly like the tree-walker's `try_flat`→general. The codegen emits it as the
+**catch-all** for any container-slot base a fast path didn't take — a proven
+GENERAL array, a **DYN / captured / unproven** base, or a flat int array whose
+index isn't int-compilable (the flat `StoreElemInt` path rolls back and falls
+through) — while a **proven flat int/float array keeps its unboxed
+`StoreElemInt`/`StoreElemFloat`** (the catch-all excludes `th==f && base_array`,
+left to `compile_float_stmt`). The only remaining executed-code fallback across
+the bench suite is exceptions (P8).
+
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
 **`try_multi_literal_store`** (codegen) NOT by building the array and unpacking,

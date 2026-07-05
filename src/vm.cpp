@@ -150,6 +150,31 @@ vm_stamp_loc(const Chunk &chunk, size_t pc, Exception &e)
         chunk.loc_at(pc, e.loc_start, e.loc_end);
 }
 
+/* Resolve a container-store op's BASE LValue* by slot KIND (0 local / 1 global /
+ * 2 capture), so `a[i]=v` / `d[k]=v` / `s.f=v` can target a top-level container
+ * a function reads (global) or a captured one, not only a frame local. An
+ * undefined global throws UndefinedVariableEx (name from gfuncs, caret from the
+ * loc side table) - matching the tree-walker's base-read of an undefined name.
+ * Cold on the global-undefined path only; the common local/global paths inline.
+ */
+static LValue *
+vm_store_base(EvalContext &ctx, int kind, int slot,
+              const Chunk &chunk, size_t pc, const Construct *node)
+{
+    if (kind == 1) {                            /* global */
+        if (!ctx.gfuncs->defined[slot]) {
+            Loc s, en;
+            if (node) { s = node->start; en = node->end; }
+            else chunk.loc_at(pc, s, en);       /* AST-free op: side table */
+            throw UndefinedVariableEx(ctx.gfuncs->names[slot]->val, s, en);
+        }
+        return &ctx.gfuncs->slots[slot];
+    }
+    if (kind == 2)                              /* capture */
+        return &(*ctx.captures)[slot];
+    return &ctx.frame->at(slot);                /* local */
+}
+
 /* The two STRICT foreach-unpack errors (UnpackElem*), matching do_iter's
  * messages + loc (the container's, from the loc side table) BYTE-for-byte, so
  * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. */
@@ -876,8 +901,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * for bool; the value operand is the bool's 0/1, written to bvec).
              * Anything else (const / read-only / general / float / dyn, or a
              * COMPOUND on a bool array) falls back to node - sound because a
-             * compiled rvalue is side-effect-free, so re-eval is exact. */
-            LValue &alv = ctx.frame->at(in.target2);
+             * compiled rvalue is side-effect-free, so re-eval is exact. The base
+             * may be a global/capture array (in.target = the slot kind). */
+            LValue &alv =
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 const auto sk = arr.skind();
@@ -927,7 +954,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::StoreElemFloat: {
 
-            LValue &alv = ctx.frame->at(in.target2);
+            LValue &alv =
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::floats
@@ -972,7 +1000,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * node->eval fallback is needed). AST-free: the subscript's caret
              * (`d[k]`) comes from the loc side table (recorded by extract_locs
              * from node = the Subscript). */
-            LValue &dlv = ctx.frame->at(in.target2);
+            LValue &dlv =
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
             const EvalValue &key = ctx.frame->at(in.a.slot).get();
             const EvalValue &val = ctx.frame->at(in.b.slot).get();
             Loc ls, le;
@@ -994,11 +1023,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             /* s.member = v / s.member OP= v for a STRUCT base (a dict member
              * store uses DictStore). vm_member_store does the POD/boxed-field
              * store; AST-free - the member uid + carets come from the pool. */
-            LValue &blv = ctx.frame->at(in.target2);
             const Chunk::MemberKey &mk = chunk.member_keys[in.a.lit];
             const EvalValue &val = ctx.frame->at(in.b.slot).get();
             try {
-                vm_member_store(&blv, mk.memUid, in.aop, val,
+                /* base inside the try so an undefined-global throw is stamped
+                 * with the member caret; base may be global/capture (in.target
+                 * = kind). */
+                LValue *blv = vm_store_base(ctx, in.target, in.target2,
+                                            chunk, pc, nullptr);
+                vm_member_store(blv, mk.memUid, in.aop, val,
                                 mk.mstart, mk.mend, mk.bstart, mk.bend);
             } catch (Exception &e) {
                 if (!e.loc_start) {          /* a compound div/mod is loc-less */
@@ -1017,7 +1050,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * shared, type-dispatched vm_subscript_store (bounds check + COW +
              * slot_rmw - matches the tree-walker for ANY base). AST-free: the
              * subscript's caret comes from the loc side table. */
-            LValue &alv = ctx.frame->at(in.target2);
+            LValue &alv =
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
             const EvalValue &idx = ctx.frame->at(in.a.slot).get();
             const EvalValue &val = ctx.frame->at(in.b.slot).get();
             Loc ls, le;

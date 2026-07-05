@@ -1384,6 +1384,37 @@ static const std::vector<test> tests =
             "assert(d[0][1] == 99); assert(d[1][0] == 8);",
         },
     },
+    {
+        "global array/dict base store (a function reads the global)",
+        {
+            "var a = [0, 0, 0]; var d = {0: 0, 1: 0};",
+            "func use() { return a[0] + d[0]; }",   /* a, d are globals */
+            "for (var i = 0; i < 3; i++) { a[i] = i * 2; }",
+            "d[0] = 5; d[1] += 7;",
+            "assert(use() == 5); assert(a[2] == 4); assert(d[1] == 7);",
+        },
+    },
+    {
+        "capture array base store in a closure (StoreElemValue)",
+        {
+            "func mk() { var a = [0, 0, 0];",
+            "  return func [a] (i) { a[i] = i * 2; return a[i]; }; }",
+            "var c = mk();",
+            "assert(c(0) == 0); assert(c(1) == 2); assert(c(2) == 4);",
+        },
+    },
+    {
+        "dyn-base store dispatches flat/general/dict at runtime",
+        {
+            "var dyn f = [1, 2, 3];",             /* general (dyn) array */
+            "for (var i = 0; i < 3; i++) { f[i] = i * 10; }",
+            "assert(f == [0, 10, 20]);",
+            "var g = [1, 2, 3]; var dyn h = g;",  /* flat int via dyn alias */
+            "h[0] = 99; assert(g[0] == 99);",
+            "var dyn m = {0: 0}; m[1] = 5; m[0] += 3;",
+            "assert(m[0] == 3); assert(m[1] == 5);",
+        },
+    },
 
     {
         "deepclone() of a const yields a fully-mutable deep copy",
@@ -11482,7 +11513,7 @@ struct VmOpCounts {
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
     size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
-    size_t storeelem2 = 0;
+    size_t storeelem2 = 0, storeev = 0;
     int n_temps = 0;
 };
 
@@ -11539,6 +11570,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::DictStore:        c.dictstore++;  break;
             case OpCode::StoreMemberV:     c.storememberv++; break;
             case OpCode::StoreElem2V:      c.storeelem2++; break;
+            case OpCode::StoreElemValue:   c.storeev++; break;
             case OpCode::DictLoadInt:      c.dictloadi++;  break;
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
@@ -12027,6 +12059,29 @@ static bool vm_codegen_shapes()
         return false;
     const bool nested_store_ok = n2.evalstmt == 0 && n2.storeelem2 >= 1;
 
+    /* 36) a GLOBAL array-base store `a[i]=v` (a top-level array a function
+     * reads is a global slot, not a main-frame local) compiles native - a
+     * StoreElemInt (base kind rides in in.target), NOT an EvalStmt. */
+    VmOpCounts gs;
+    if (!codegen_counts({
+            "var a = [0, 0, 0];",
+            "func use() { return a[0]; }",   /* makes `a` a global */
+            "for (var i = 0; i < 3; i++) { a[i] = i * 2; }",
+        }, gs))
+        return false;
+    const bool global_store_ok = gs.evalstmt == 0 && gs.storei >= 1;
+
+    /* 37) a DYN / unproven-base store `d[i]=v` compiles to the UNIVERSAL
+     * StoreElemValue (vm_subscript_store dispatches flat/general/dict at
+     * runtime), NOT an EvalStmt fallback. */
+    VmOpCounts uv;
+    if (!codegen_counts({
+            "var dyn d = [1, 2, 3];",
+            "for (var i = 0; i < 3; i++) { d[i] = i * 2; }",
+        }, uv))
+        return false;
+    const bool universal_store_ok = uv.evalstmt == 0 && uv.storeev >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -12037,7 +12092,8 @@ static bool vm_codegen_shapes()
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
         && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
         && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
-        && struct_member_ok && nested_store_ok;
+        && struct_member_ok && nested_store_ok && global_store_ok
+        && universal_store_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

@@ -2799,42 +2799,22 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
                              Loc lstart, Loc lend)
 {
-    /* Flat POD-struct array `a[i] = <struct>`: a flat struct element has no
-     * boxed LValue (it's bytes), so subscript(for_write) returns an rvalue and
-     * the general path below would wrongly raise NotLValueEx. Store the value's
-     * bytes directly, mirroring try_flat_subscript_store's struct path (only a
-     * plain assign - structs have no compound op; a non-matching value is the
-     * dyn-launder TypeErrorEx). */
-    if (op == Op::assign && base_lv->is<SharedArrayObj>()) {
-        SharedArrayObj &arr = base_lv->getval<SharedArrayObj>();
-        if (arr.skind() == SharedArrayObj::Storage::structs
-            && !base_lv->is_const_var() && !arr.is_readonly()) {
-            const EvalValue r = RValue(value);
-            const auto &sv0 = arr.flat_structs();
-            if (!key.is<int_type>())
-                throw TypeErrorEx("Expected integer as subscript",
-                                  lstart, lend);
-            int_type idx = key.get<int_type>();
-            if (idx < 0)
-                idx += arr.size();
-            if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                throw OutOfBoundsEx(lstart, lend);
-            if (!r.is<intrusive_ptr<StructObject>>()
-                || !r.get<intrusive_ptr<StructObject>>()->is_pod()
-                || r.get<intrusive_ptr<StructObject>>()->def != sv0.def)
-                throw TypeErrorEx(
-                    "Cannot store a value of a different type in a flat "
-                    "(typed) array; declare the array dyn for a polymorphic "
-                    "array", lstart, lend);
-            if (arr.is_slice())
-                arr.clone_internal_vec();
-            else if (arr.use_count() > 1)
-                arr.clone_aliased_slices(arr.offset() + idx);
-            auto &sv = arr.flat_structs();
-            const StructObject &o = *r.get<intrusive_ptr<StructObject>>().get();
-            std::memcpy(sv.buf.data() + (arr.offset() + idx) * sv.stride,
-                        o.bytes.data(), sv.stride);
-            return r;
+    /* A FLAT array element (int/float/bool/struct) has no boxed LValue - it's a
+     * scalar/bytes in the flat vector - so the general subscript(for_write) path
+     * below would wrongly raise NotLValueEx. Store straight into the flat buffer
+     * via the shared flat_store_core (COW + type check + the dyn-launder error),
+     * exactly as the tree-walker's try_flat_subscript_store. This is what makes
+     * StoreElemValue a UNIVERSAL store (any base: flat / general / dict), so the
+     * codegen can emit it for a dyn/unproven base. flat_store_core returns false
+     * only for a compound op on a flat STRUCT array (defer to the general path,
+     * which raises the same error). */
+    if (base_lv->is<SharedArrayObj>()) {
+        SharedArrayObj *arr;
+        if (flat_writable_array(base_lv, arr)) {
+            EvalValue out;
+            if (flat_store_core(base_lv, *arr, key, value, op, out,
+                                lstart, lend, lstart, lend))
+                return out;
         }
     }
 

@@ -274,6 +274,28 @@ bool as_array_slot(const Construct *e, int &slot)
 }
 
 /*
+ * Like as_array_slot, but ALSO accepts a GLOBAL (a top-level container a
+ * function reads) or CAPTURE base, returning `kind` (0 local / 1 global / 2
+ * capture) so a store op can form the base LValue* from the right table (the
+ * VM's vm_store_base). Used by the container-STORE ops (a[i]/d[k]/s.f), where
+ * mutating through a global/capture base is sound (an array COWs in place
+ * through the slot's LValue, a dict mutates the shared object). Not for the
+ * flat READ fast paths, which stay local-only.
+ */
+bool as_container_base(const Construct *e, int &slot, int &kind)
+{
+    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+        switch (id->sym.kind) {
+        case SymKind::local:   kind = 0; slot = id->sym.slot; return true;
+        case SymKind::global:  kind = 1; slot = id->sym.slot; return true;
+        case SymKind::capture: kind = 2; slot = id->sym.slot; return true;
+        default: break;
+        }
+    }
+    return false;
+}
+
+/*
  * Read `e` as a LEAF float operand: an int/float literal (converted to float),
  * or a resolved-local slot (read as float at runtime - an int/bool slot
  * promotes). Returns false otherwise. Accepts a `th == i` operand too, since a
@@ -1970,14 +1992,15 @@ struct Codegen {
             if (const Subscript *sub =
                     dynamic_cast<const Subscript *>(inc->lvalue.get())) {
                 if (sub->th == TypeHint::i && sub->base_array) {
-                    int aslot;
+                    int aslot, akind;
                     Operand idx;
-                    if (!as_array_slot(sub->what.get(), aslot)
+                    if (!as_container_base(sub->what.get(), aslot, akind)
                         || !compile_int_expr(sub->index.get(), idx, ops))
                         return false;
                     Instr in;
                     in.op = OpCode::StoreElemInt;
                     in.node = sub;   /* subscript loc for OOB (matches TW) */
+                    in.target = akind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = aslot;
                     in.a = idx;
                     in.b = int_lit(1);
@@ -1993,8 +2016,8 @@ struct Codegen {
                  * type yet `counts[w]++` is valid; the boxed 1 promotes for
                  * int/float, a non-numeric value throws as the TW does. */
                 if (sub->base_dict) {
-                    int dslot;
-                    if (!as_array_slot(sub->what.get(), dslot))
+                    int dslot, dkind;
+                    if (!as_container_base(sub->what.get(), dslot, dkind))
                         return false;
                     const int vtemp = alloc_temp();   /* the boxed 1 (value) */
                     Instr ld;
@@ -2008,6 +2031,7 @@ struct Codegen {
                     Instr in;
                     in.op = OpCode::DictStore;
                     in.node = sub;
+                    in.target = dkind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = dslot;
                     in.a = slot_op(kslot);
                     in.b = slot_op(vtemp);
@@ -2068,13 +2092,13 @@ struct Codegen {
              * `d` is a side-effect-free slot read done in the handler). The
              * runtime Type::subscript(for_write) + slot_rmw do the store. */
             if (sub->base_dict) {
-                int dslot;
+                int dslot, dkind;
                 switch (e->op) {
                 case Op::assign: case Op::addeq: case Op::subeq:
                 case Op::muleq:  case Op::diveq: case Op::modeq: break;
                 default: return false;
                 }
-                if (!as_array_slot(sub->what.get(), dslot))
+                if (!as_container_base(sub->what.get(), dslot, dkind))
                     return false;
                 int vslot, kslot;
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
@@ -2083,6 +2107,7 @@ struct Codegen {
                 Instr in;
                 in.op = OpCode::DictStore;
                 in.node = sub;   /* the subscript, for its loc (extract_locs) */
+                in.target = dkind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = dslot;
                 in.a = slot_op(kslot);
                 in.b = slot_op(vslot);
@@ -2091,20 +2116,73 @@ struct Codegen {
                 return true;
             }
 
-            /* P4: a GENERAL array element store `a[i] = v` / `a[i] OP= v` ->
-             * StoreElemValue - the array is base_array but the element is NOT a
-             * flat scalar (th != i/f): an array/str/struct/dyn element. Same
-             * shape as DictStore (local base, value then index to boxed temps);
-             * vm_subscript_store does the bounds check + COW + store. */
-            if (sub->base_array && sub->th != TypeHint::i
-                && sub->th != TypeHint::f) {
-                int aslot;
+            /* FLAT int array element `a[i] = <int>` / `OP= <int>` -> the fast
+             * unboxed StoreElemInt (an int-compilable value + index). On any
+             * failure - e.g. a dyn index (a closure param) or a non-int rhs -
+             * roll the partial ops back and FALL THROUGH to the universal
+             * StoreElemValue below (which boxes the operands and dispatches at
+             * runtime). A flat FLOAT array is left to compile_float_stmt's
+             * StoreElemFloat (excluded from the catch-all). */
+            if (sub->th == TypeHint::i && sub->base_array) {
+                const size_t mark = ops.size();
+                Op aop = Op::invalid;
+                bool ok = true;
+                switch (e->op) {
+                    case Op::assign: aop = Op::invalid; break;
+                    case Op::addeq:  aop = Op::plus;    break;
+                    case Op::subeq:  aop = Op::minus;   break;
+                    case Op::muleq:  aop = Op::times;   break;
+                    case Op::diveq:  aop = Op::div;     break;
+                    case Op::modeq:  aop = Op::mod;     break;
+                    default: ok = false; break;
+                }
+                int aslot, akind;
+                Operand val, idx;
+                if (ok && as_container_base(sub->what.get(), aslot, akind)) {
+                    /* A bool-literal RHS (`a[i]=true/false`, common in bool
+                     * arrays) is a 0/1 int operand: StoreElemInt's bool branch
+                     * writes it to bvec, or an int array stores the promoted
+                     * 0/1. A bool VAR / comparison RHS compiles via compile_int_
+                     * expr (th==i). rhs-before-index order is preserved. */
+                    bool vok;
+                    if (const LiteralBool *lb =
+                            dynamic_cast<const LiteralBool *>(e->rvalue.get())) {
+                        val = int_lit(lb->bval() ? 1 : 0);
+                        vok = true;
+                    } else {
+                        vok = compile_int_expr(e->rvalue.get(), val, ops);
+                    }
+                    if (vok && compile_int_expr(sub->index.get(), idx, ops)) {
+                        Instr in;
+                        in.op = OpCode::StoreElemInt;
+                        in.node = s;
+                        in.target = akind;   /* 0 local / 1 global / 2 cap */
+                        in.target2 = aslot;
+                        in.a = idx;
+                        in.b = val;
+                        in.aop = aop;
+                        ops.push_back(in);
+                        return true;
+                    }
+                }
+                ops.resize(mark);   /* fall through to the universal store */
+            }
+
+            /* UNIVERSAL store (catch-all): ANY container-slot base -> Store
+             * ElemValue, whose vm_subscript_store dispatches at runtime (flat /
+             * general / dict, matching the tree-walker's try_flat->general).
+             * Covers a proven GENERAL array, a DYN / captured / unproven base,
+             * AND a flat int array with a non-int-compilable index (fell through
+             * above). EXCLUDES a proven flat FLOAT array (th==f && base_array),
+             * left to compile_float_stmt's fast unboxed StoreElemFloat. */
+            if (!(sub->th == TypeHint::f && sub->base_array)) {
+                int aslot, akind;
                 switch (e->op) {
                 case Op::assign: case Op::addeq: case Op::subeq:
                 case Op::muleq:  case Op::diveq: case Op::modeq: break;
                 default: return false;
                 }
-                if (!as_array_slot(sub->what.get(), aslot))
+                if (!as_container_base(sub->what.get(), aslot, akind))
                     return false;
                 int vslot, kslot;
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
@@ -2113,6 +2191,7 @@ struct Codegen {
                 Instr in;
                 in.op = OpCode::StoreElemValue;
                 in.node = sub;   /* the subscript, for its loc (extract_locs) */
+                in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = aslot;
                 in.a = slot_op(kslot);
                 in.b = slot_op(vslot);
@@ -2121,44 +2200,7 @@ struct Codegen {
                 return true;
             }
 
-            if (sub->th != TypeHint::i || !sub->base_array)
-                return false;
-            Op aop;
-            switch (e->op) {
-                case Op::assign: aop = Op::invalid; break;
-                case Op::addeq:  aop = Op::plus;    break;
-                case Op::subeq:  aop = Op::minus;   break;
-                case Op::muleq:  aop = Op::times;   break;
-                case Op::diveq:  aop = Op::div;     break;
-                case Op::modeq:  aop = Op::mod;     break;
-                default: return false;
-            }
-            int aslot;
-            if (!as_array_slot(sub->what.get(), aslot))
-                return false;
-            Operand val, idx;
-            /* A bool-literal RHS (`a[i]=true/false`, common in bool arrays)
-             * is a 0/1 int operand: the StoreElemInt bool branch writes it to
-             * bvec, or an int array stores the promoted 0/1. LOCAL to the
-             * store (not in as_int_operand) so a bool literal stays a real bool
-             * in the boxed path. A bool VAR / comparison RHS compiles via
-             * compile_int_expr (th==i). rhs-before-index order is preserved. */
-            if (const LiteralBool *lb =
-                    dynamic_cast<const LiteralBool *>(e->rvalue.get()))
-                val = int_lit(lb->bval() ? 1 : 0);
-            else if (!compile_int_expr(e->rvalue.get(), val, ops))
-                return false;
-            if (!compile_int_expr(sub->index.get(), idx, ops))
-                return false;
-            Instr in;
-            in.op = OpCode::StoreElemInt;
-            in.node = s;
-            in.target2 = aslot;
-            in.a = idx;
-            in.b = val;
-            in.aop = aop;
-            ops.push_back(in);
-            return true;
+            return false;   /* proven flat float -> compile_float_stmt */
         }
 
         /* A DICT MEMBER store `d.k = v` / `d.k OP= v` -> DictStore, exactly like
@@ -2168,13 +2210,13 @@ struct Codegen {
         if (const MemberExpr *m =
                 dynamic_cast<const MemberExpr *>(e->lvalue.get())) {
             if (m->base_dict) {
-                int dslot;
+                int dslot, dkind;
                 switch (e->op) {
                 case Op::assign: case Op::addeq: case Op::subeq:
                 case Op::muleq:  case Op::diveq: case Op::modeq: break;
                 default: return false;
                 }
-                if (!as_array_slot(m->what.get(), dslot))
+                if (!as_container_base(m->what.get(), dslot, dkind))
                     return false;
                 int vslot;
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
@@ -2188,6 +2230,7 @@ struct Codegen {
                 Instr in;
                 in.op = OpCode::DictStore;
                 in.node = m;             /* for its loc (extract_locs) */
+                in.target = dkind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = dslot;
                 in.a = slot_op(kin.target);
                 in.b = slot_op(vslot);
@@ -2197,22 +2240,23 @@ struct Codegen {
             }
 
             /* A STRUCT field store `s.f = v` / `s.f OP= v` -> StoreMemberV. The
-             * base must be a slotted local; the value is a boxed temp. The
-             * member uid + carets ride in the member-key pool (AST-free). */
+             * base is a slotted local/global/capture; the value is a boxed temp.
+             * The member uid + carets ride in the member-key pool (AST-free). */
             if (m->base_struct) {
-                int sslot;
+                int sslot, skind;
                 switch (e->op) {
                 case Op::assign: case Op::addeq: case Op::subeq:
                 case Op::muleq:  case Op::diveq: case Op::modeq: break;
                 default: return false;
                 }
-                if (!as_array_slot(m->what.get(), sslot))
+                if (!as_container_base(m->what.get(), sslot, skind))
                     return false;
                 int vslot;
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
                     return false;
                 Instr in;
                 in.op = OpCode::StoreMemberV;
+                in.target = skind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = sslot;
                 in.a = int_lit(add_member_key(m));   /* AST-free: pool index */
                 in.b = slot_op(vslot);
@@ -2476,8 +2520,8 @@ struct Codegen {
                 case Op::modeq:  aop = Op::mod;     break;
                 default: return false;
             }
-            int aslot;
-            if (!as_array_slot(sub->what.get(), aslot))
+            int aslot, akind;
+            if (!as_container_base(sub->what.get(), aslot, akind))
                 return false;
             Operand val, idx;
             if (!compile_float_expr(e->rvalue.get(), val, ops)
@@ -2486,6 +2530,7 @@ struct Codegen {
             Instr in;
             in.op = OpCode::StoreElemFloat;
             in.node = s;
+            in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
             in.target2 = aslot;
             in.a = idx;
             in.b = val;
