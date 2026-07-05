@@ -116,7 +116,38 @@ class Gen:
             a = self.rng.randint(0, ALEN - 2)
             b = self.rng.randint(a + 1, ALEN)
             return "(sum(A[%d:%d])) %% %d" % (a, b, MOD)
+        if d < 2 and r < 0.80:
+            # a call to a helper FUNCTION (identical call syntax; each returns a
+            # value < MOD, and recursive args are bounded so they terminate)
+            fn = self.rng.choice(["mix", "rsum", "gcd", "comp"])
+            if fn == "mix":
+                return "mix(%s, %s, %s)" % (self.leaf(), self.leaf(),
+                                            self.leaf())
+            if fn == "rsum":
+                return "rsum(%s %% 6)" % self.leaf()          # depth <= 6
+            if fn == "gcd":
+                return "gcd(%s %% 50, %s %% 50)" % (self.leaf(), self.leaf())
+            return "comp(%s)" % self.leaf()
         return self.leaf()
+
+    def emit_helpers(self):
+        # helper functions defined ONCE at program top (before the rep loop),
+        # called as operands. Pure + deterministic + non-negative, staying in the
+        # equivalence subset. mix: arithmetic; rsum: bounded linear recursion;
+        # gcd: Euclidean recursion (a%b non-negative -> truncate==floor); comp:
+        # composition. A one-line MyLang body vs a multi-line Python def.
+        self.emit("func mix(a, b, c) => (a + b * c) % 100;",
+                  "def mix(a, b, c): return (a + b * c) % 100")
+        self.emit("func rsum(n) { if (n <= 0) return 0;"
+                  " return (n + rsum(n - 1)) % 100; }", "def rsum(n):")
+        self.emit("", "    if n <= 0: return 0")
+        self.emit("", "    return (n + rsum(n - 1)) % 100")
+        self.emit("func gcd(a, b) { if (b == 0) return a;"
+                  " return gcd(b, a % b); }", "def gcd(a, b):")
+        self.emit("", "    if b == 0: return a")
+        self.emit("", "    return gcd(b, a % b)")
+        self.emit("func comp(x) => mix(x, x, 2);",
+                  "def comp(x): return mix(x, x, 2)")
 
     def expr(self, d=0):
         """A short non-negative expression `(...) % MOD`, MyLang/Python-identical.
@@ -386,6 +417,7 @@ class Gen:
         self.emit("var s0 = 0; var s1 = 1; var s2 = 2; var s3 = 3; "
                   "var s4 = 4; var s5 = 5; var s6 = 6;",
                   "s0 = 0; s1 = 1; s2 = 2; s3 = 3; s4 = 4; s5 = 5; s6 = 6")
+        self.emit_helpers()
         self.emit("for (var rep = 0; rep < %d; rep++) {" % reps,
                   "for rep in range(%d):" % reps)
         self.build(0, "  ", "    ")

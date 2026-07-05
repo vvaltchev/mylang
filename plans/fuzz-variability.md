@@ -47,7 +47,7 @@ Order = manage risk first, biggest/most-valuable last. Each: implement -> fuzz
 - [x] **5. Multi-assignment / destructuring** - `var a, b = [x, y]` (MyLang) vs
       `a, b = x, y` (Python), incl. the swap idiom `a, b = [b, a]`. STRICT
       arity (MyLang throws on a length mismatch - generate exact-length only).
-- [ ] **6. Nested functions (highest value)** - top-level `func f(a, b) { ...
+- [x] **6. Nested functions (highest value)** - top-level `func f(a, b) { ...
       return ...; }` (and expression-bodied `=>`), called as an operand `f(x,
       y)` (identical call syntax). Includes a BOUNDED self-recursive helper
       (e.g. a small fib/gcd with a non-negative, depth-limited arg). Exercises
@@ -58,4 +58,11 @@ Order = manage risk first, biggest/most-valuable last. Each: implement -> fuzz
 
 ## Done
 
-(moved here as each lands, with the commit hash)
+All 6 constructs landed (see the checklist above), each in its own
+commit. Final validation: 1500 random programs at depth <= 20 - 0 diverged
+(tree-walker == VM == CPython). The generator now uses small numbers (MOD=100,
+readable) and its variability is STRUCTURAL (construct/operation kinds), not
+expression length. Bugs the differential caught along the way: a bare-block
+loop fallback (real VM codegen bug, fixed), a `%%`-escaping slip, a
+double-eval that diverged the .my/.py sides, and an unbounded slice-sum that
+broke the non-negative invariant (negative `%` diverges + OOB erase index).
