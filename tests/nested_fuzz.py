@@ -154,6 +154,8 @@ class Gen:
             (self.se_insert,   6),
             (self.se_erase,    6),
             (self.se_clone,    5),
+            (self.se_swap,     8),
+            (self.se_multidecl, 8),
         ]
 
     def side_effect(self, im, ip):
@@ -250,6 +252,27 @@ class Gen:
         tgt = self.rng.choice(self.scalars)
         self.emit(im + "%s = (%s + sum(clone(A))) %% %d;" % (tgt, tgt, MOD),
                   ip + "%s = (%s + sum(list(A))) %% %d" % (tgt, tgt, MOD))
+
+    def se_swap(self, im, ip):
+        # rotate N distinct scalars via multi-assign - snapshot-before-bind
+        # (`a, b = [b, a]` swaps). MyLang array-destructure vs Python tuple.
+        n = self.rng.randint(2, 3)
+        tgts = self.rng.sample(self.scalars, n)
+        src = tgts[1:] + tgts[:1]          # rotate left
+        lhs = ", ".join(tgts)
+        self.emit(im + "%s = [%s];" % (lhs, ", ".join(src)),
+                  ip + "%s = %s" % (lhs, ", ".join(src)))
+
+    def se_multidecl(self, im, ip):
+        # a destructuring DECL `var a, b = [e0, e1]` (STRICT arity), then fold
+        a, b = "t%d" % self.tempcount, "t%d" % (self.tempcount + 1)
+        self.tempcount += 2
+        e0, e1 = self.expr(), self.expr()
+        tgt = self.rng.choice(self.scalars)
+        self.emit(im + "var %s, %s = [%s, %s];" % (a, b, e0, e1),
+                  ip + "%s, %s = %s, %s" % (a, b, e0, e1))
+        fold = "%s = (%s + %s + %s) %% %d" % (tgt, tgt, a, b, MOD)
+        self.emit(im + fold + ";", ip + fold)
 
     def build(self, level, im, ip):
         # a side effect at this level, then (if not innermost) a nested construct

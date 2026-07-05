@@ -44,7 +44,7 @@ Order = manage risk first, biggest/most-valuable last. Each: implement -> fuzz
       (mutating length mid-loop; guarded so it never underflows), array SLICES
       `A[i:j]` (aliasing / COW), `clone`. `pop`/`insert`/`erase` are
       MyLang-builtin vs Python-method -> `(my, py)` pairs; slices identical.
-- [ ] **5. Multi-assignment / destructuring** - `var a, b = [x, y]` (MyLang) vs
+- [x] **5. Multi-assignment / destructuring** - `var a, b = [x, y]` (MyLang) vs
       `a, b = x, y` (Python), incl. the swap idiom `a, b = [b, a]`. STRICT
       arity (MyLang throws on a length mismatch - generate exact-length only).
 - [ ] **6. Nested functions (highest value)** - top-level `func f(a, b) { ...
