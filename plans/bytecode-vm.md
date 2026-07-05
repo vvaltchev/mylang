@@ -29,6 +29,21 @@ fallback first; a second pass reclaims the perf (typed arg lowering, fusing,
 dropping the boxed marshalling) once the fallbacks are gone. **Resume perf
 tuning after the fallbacks are removed** — do not let the slip grow unbounded.
 
+**Update (2026-07-04): ~3.8x → ~3.7x** — caused by the builtin VALUE-ABI
+migration (the num/str/io batches; the only commits since the 3.8x note).
+UNLIKE the slips above (VM-path only), this one hits the DEFAULT (tree-walker)
+engine, which is what `bench/run.py` measures: the tree-walker now reaches a
+migrated builtin through `builtin_v_adapter`, which stack-constructs an 8-slot
+`EvalValue` arg buffer and calls `func_v` through a SECOND function-pointer hop
+— vs the old single direct call that evaluated the args inline. Benches that
+call migrated builtins (40_math_builtins etc.) pay it per call. **Reclaimable:**
+on the hot `DirectBuiltinCallExpr` path, call `func_v` directly (build the
+buffer in `do_eval`) so the tree-walker skips the adapter hop too, and/or size
+the buffer to `n` not 8; the adapter then survives only for the cold
+generic-CallExpr / const-eval paths. Because this regresses the *default*
+engine (not just opt-in `-vm`), it is a higher-priority reclaim than the earlier
+slips.
+
 **THE DIRECTIVE (user, 2026-07-04), see [[vm-endgame]]:** do it ALL (every
 statement/expression kind native, ordered by EASE not perf impact); native ops
 must fully support `dyn`/general values and NEVER fall back to the tree walker;
