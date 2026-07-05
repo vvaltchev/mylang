@@ -75,7 +75,9 @@ first:
    Excluding dead templates, the genuine LIVE fallbacks are: map/filter (35);
    ~~a scalar-spread multi-assign `a,b=0` (06/22)~~ **DONE** (2026-07-08,
    `try_multi_scalar_spread` — compile the scalar once, MoveV to each target);
-   a big const array literal decl (48/52, one-time); a `var dyn` foreach
+   ~~a big const array literal decl (48/52)~~ **DONE** (2026-07-08, `DeclConstV`
+   — materialize the rvalue then bind the slot as a CONST LValue so a later
+   rebind still throws; one-time, so not a perf mover); a `var dyn` foreach
    reduction (48_heavy); exceptions (42). Audit with: for each chunk, a `name`
    is a dead template iff some other chunk is `name$<digits>`.
 

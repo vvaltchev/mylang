@@ -1500,6 +1500,21 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::DeclConstV: {
+            /* const arr/dict/func decl: bind the slot as a CONST LValue (so a
+             * later rebind still throws), local (target2==0) or global (==1).
+             * The rvalue value is already materialized in `a`. */
+            EvalValue v = ctx.frame->at(in.a.slot).get();
+            if (in.target2 == 0) {
+                ctx.frame->at(in.target) = LValue(std::move(v), true);
+            } else {
+                ctx.gfuncs->slots[in.target] = LValue(std::move(v), true);
+                ctx.gfuncs->defined[in.target] = 1;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::StoreCaptureV: {
             /* cap = <expr> / cap OP= v / cap++ : write the called closure's
              * per-instance capture slot. A capture is ALWAYS defined (snapshot

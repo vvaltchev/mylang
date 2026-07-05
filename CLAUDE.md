@@ -3079,6 +3079,16 @@ REPL map falls back). So the **whole function/closure path is native** — decl
 BIND, closure CREATE, capture read/write, indirect CALL, and the compiled body —
 via `MakeClosureV` + `StoreGlobalV`/`StoreCaptureV` + `CallV`/`CallValueV`.
 Removing the per-func-decl `EvalStmt` cut the bench-suite fallback count 54→24.
+A **`const` DECL of an arr/dict/func kept as a runtime symbol** (`const x =
+<LiteralObj>`; const SCALARS are inlined, so never here) goes native via
+**`DeclConstV`**: materialize the rvalue then BIND the slot as a **const
+`LValue`** (`LValue(v, true)`) — a LOCAL (`target2==0`) or GLOBAL (`==1`) slot.
+Binding const (not a plain `put`) is what keeps a later rebind throwing
+`CannotRebindConstEx` (a rebind, having no `pInConstDecl`, stays `EvalStmt` and
+throws via the tree-walker). The codegen (`compile_boxed_stmt`) recognizes it by
+`Expr14::fl & pInConstDecl` — which distinguishes a DECL from a REASSIGN (a
+const reassign is a RUNTIME error, not caught at compile time, so the codegen
+does see it and must leave it to the tree-walker).
 A **`struct P {..}` decl** binds the same way — `gen_stmt` bakes the type
 descriptor (a trivial `t_structtype` value holding the program-lifetime
 `StructTypeDef*`) into the const pool -> **`LoadConstV` + `StoreGlobalV`**.

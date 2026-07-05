@@ -462,6 +462,17 @@ enum class OpCode : unsigned char {
     StoreGlobalV,
 
     /*
+     * A CONST DECL of an arr/dict/func kept as a runtime symbol (`const x =
+     * <LiteralObj>`). Materialize the rvalue (`a`) then BIND the slot as a
+     * CONST LValue - `target` = the slot, `target2` = 0 (a main-frame LOCAL
+     * slot) or 1 (a GLOBAL slot). Binding CONST (not a plain put) is what makes
+     * a later rebind still throw CannotRebindConstEx (a rebind stays EvalStmt).
+     * Only a DECL reaches here (Expr14 with pInConstDecl); a const reassign
+     * never does. Const SCALARS are inlined, so they never appear.
+     */
+    DeclConstV,
+
+    /*
      * Write to a closure CAPTURE slot `cap = <expr>` / `cap OP= v` / `cap++`
      * (the write counterpart of LoadCaptureV): the value/rhs in `a`, `target`
      * = the index into the called closure's per-instance capture vector

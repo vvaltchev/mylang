@@ -1172,6 +1172,32 @@ struct Codegen {
             return false;
         if (lv->decl_type != DeclType::none && lv->decl_type != DeclType::dyn)
             return false;
+        /* A CONST DECL (a const arr/dict/func kept as a runtime symbol; const
+         * SCALARS are inlined, so never here). `pInConstDecl` on the Expr14
+         * distinguishes it from a REASSIGN (which has no such flag and must
+         * throw, below): materialize the rvalue + DeclConstV, which binds the
+         * slot as a CONST LValue so a later rebind still throws. Local or
+         * global; a capture const decl falls back. */
+        if (lv->is_const && is_assign && (e->fl & pInConstDecl)
+            && lv->sym.kind != SymKind::capture) {
+            const size_t om = ops.size();
+            const size_t cm = chunk.consts.size();
+            const int st = next_temp;
+            int rslot;
+            if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                Instr in;
+                in.op = OpCode::DeclConstV;
+                in.target = lv->sym.slot;
+                in.target2 = lv->sym.kind == SymKind::global ? 1 : 0;
+                in.a = slot_op(rslot);
+                ops.push_back(in);
+                return true;
+            }
+            ops.resize(om);
+            chunk.consts.resize(cm);
+            next_temp = st;
+        }
+
         /* A reassignment of a CONST (a runtime const - a func/array kept in a
          * slot) must throw CannotRebindConstEx; the boxed store would skip that
          * runtime check. Leave a const lvalue to the tree-walker (throws with

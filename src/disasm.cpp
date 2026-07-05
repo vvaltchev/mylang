@@ -466,6 +466,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << (in.aop == Op::invalid ? " = " : " OP= ")
                 << RI(in.a, false);
             break;
+        case OpCode::DeclConstV:
+            row << "decl.const   " << (in.target2 ? "g" : "r") << in.target
+                << " = " << RI(in.a, false) << "  ; const";
+            break;
         case OpCode::StoreCaptureV:
             row << "store.cap    " << CAP(in.target)
                 << (in.aop == Op::invalid ? " = " : " OP= ")
