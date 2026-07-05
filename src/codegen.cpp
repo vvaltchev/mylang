@@ -3055,6 +3055,30 @@ struct Codegen {
                 return;
             }
         }
+        /* A `struct P {..}` decl bound into a GLOBAL slot (hoisted, like a func
+         * name): bake the type descriptor (a trivial t_structtype value holding
+         * the program-lifetime StructTypeDef*) into the const pool -> LoadConst
+         * + StoreGlobalV. The tree-walker binds it CONST, but that flag is
+         * unobservable at runtime (a reassign `P = x` is a compile-time error,
+         * `isconst` folds), so a plain StoreGlobalV is differential-identical
+         * (the REPL, map-resident structs, falls back). */
+        const StructDeclStmt *sd = dynamic_cast<const StructDeclStmt *>(s);
+        if (sd) {
+            if (sd->id && sd->id->sym.kind == SymKind::global) {
+                const int t = alloc_temp();
+                Instr ld;
+                ld.op = OpCode::LoadConstV;
+                ld.target = t;
+                ld.target2 = add_const(EvalValue(sd->def.get()));
+                chunk.code.push_back(ld);
+                Instr st;
+                st.op = OpCode::StoreGlobalV;
+                st.target = sd->id->sym.slot;
+                st.a = slot_op(t);
+                chunk.code.push_back(st);
+                return;
+            }
+        }
         emit(OpCode::EvalStmt, s);
     }
 

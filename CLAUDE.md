@@ -3051,6 +3051,14 @@ REPL map falls back). So the **whole function/closure path is native** — decl
 BIND, closure CREATE, capture read/write, indirect CALL, and the compiled body —
 via `MakeClosureV` + `StoreGlobalV`/`StoreCaptureV` + `CallV`/`CallValueV`.
 Removing the per-func-decl `EvalStmt` cut the bench-suite fallback count 54→24.
+A **`struct P {..}` decl** binds the same way — `gen_stmt` bakes the type
+descriptor (a trivial `t_structtype` value holding the program-lifetime
+`StructTypeDef*`) into the const pool -> **`LoadConstV` + `StoreGlobalV`**.
+The tree-walker binds it `const`, but that flag is unobservable at runtime (a
+reassign `P = x` is a compile-time `CannotRebindConstEx`, `isconst` folds), so a
+plain `StoreGlobalV` is differential-identical (a REPL map-resident struct falls
+back). Standalone construction `P(x,y)` stays a fallback (an `append`-fused ctor
+is already native via `EmplaceStruct`).
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by

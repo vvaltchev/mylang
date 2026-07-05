@@ -5521,6 +5521,23 @@ static const std::vector<test> tests =
     },
 
     {
+        /* native struct-DECL binding (VM LoadConstV + StoreGlobalV): a
+         * `struct P{..}` binds its type descriptor into a hoisted global slot,
+         * like a func name; construction + member/const access read it back.
+         * Differential under -vm. */
+        "Struct decl binding native",
+        {
+            "struct P { int x; int y; }",
+            "struct Q { float f; const K = 9; }",
+            "var p = P(3, 4);",
+            "assert(p.x + p.y == 7);",
+            "var q = Q(2.5);",
+            "assert(q.f == 2.5);",
+            "assert(Q.K == 9);",
+        },
+    },
+
+    {
         /* native flat-array element inc-dec (VM StoreElemInt/Float with a
          * constant 1 == `a[i] += 1`): `a[i]++` / `a[i]--` on a flat int/float
          * array. The OOB caret is the subscript's. Differential under -vm. */
