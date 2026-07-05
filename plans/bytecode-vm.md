@@ -627,12 +627,25 @@ into a reserved `dst`; each arm's calls become CallV/CachedCallV), and (b)
 fib 15.7x SLOWER, so CachedCallV routes through `vm_cached_call` (the cache
 lookup given evaluated args is a shared `pure_cache_call` both engines use).
 fib$0 body → 0 EvalStmt; bench 09 15.767x → 0.996x (neutral, the cache
-dominates). **Still TODO in this tier:**
-- **builtin calls** — the ABI change: every builtin from `(ctx, ExprList*)` (it
-  self-evaluates its arg NODES) to evaluated-VALUES, so `CallV` can dispatch a
-  builtin natively. ~74 builtins, migrated incrementally (a few - `defined`, the
-  `type`/`decltype` queries - genuinely need the AST and keep a shim). This is
-  the real "last Construct* holdout".
+dominates).
+
+**Builtin VALUE ABI + `CallBuiltinV` — infrastructure + first batch landed.**
+A builtin's original ABI `(ctx, ExprList*)` self-evaluates its arg NODES (a
+node->eval even on the VM's EvalToSlot path). The VALUE ABI passes them
+pre-evaluated. Dual-ABI (incremental, both engines one impl): `Builtin` gains
+`func_v(ctx, ExprList*, const EvalValue* args, size_t n)` — set only for a
+migrated READ-ONLY builtin; `exprList` is for error LOCS + arity ONLY (per-arg
+locs byte-preserved). `make_const_builtin_v<FV>` registers func_v + a generic
+`builtin_v_adapter<FV>` as `func` (the tree-walker evaluates + calls func_v; the
+VM calls func_v directly). `CallBuiltinV` copies the register args into a buffer
+and calls func_v (stamping the args-loc like DirectBuiltinCallExpr); a builtin
+without func_v stays EvalToSlot. **Excluded (keep func_v == null → fallback):**
+MUTATING builtins (append/push/pop/insert/erase/intptr — need an lvalue arg) and
+AST builtins (defined/type/decltype/typestr/kindstr — need the node). **Still
+TODO in this tier:**
+- **migrate the remaining ~85 read-only builtins** to func_v (mechanical:
+  `RValue(elems[i]->eval)` → `args[i]`, keeping the exprList locs). First batch
+  done: len, str, int, float.
 - make-array/dict — see the op list below.
 
 The boxed SCALAR + SUBSCRIPT + MEMBER core is complete: a `dyn`/string

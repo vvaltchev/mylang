@@ -2888,7 +2888,13 @@ compiles to a branch producing one arm into a slot, and a **`CachedCallV`**
 (a `CachedCallExpr`) routes through the caller frame's per-frame `PureCache` —
 together these make a recursion-unroll return native, so **`fib` runs fully
 native** (a plain CallV would BYPASS the cache and recompute the exponential).
-Still fallbacks: builtins (the ABI change), struct construction. Gated by the
+A **read-only builtin** with the VALUE ABI (`Builtin::func_v` — args
+pre-evaluated, no `node->eval`; set by `make_const_builtin_v`, which also
+registers a generic adapter as the tree-walker's `func`) dispatches natively via
+`CallBuiltinV`; a mutating (append/pop/…, need an lvalue arg) / AST
+(defined/type/…, need the node) / un-migrated builtin keeps `func_v == null` and
+stays EvalToSlot. Still fallbacks: those builtins, struct construction. Gated by
+the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
 tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
