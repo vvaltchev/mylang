@@ -66,6 +66,33 @@ typedef intptr_t int_type;
 #endif
 
 /*
+ * Force-inline: `inline` is only a hint, and the compiler drops it for a tiny
+ * helper once its CALLER grows too large (its inline budget shrinks). The VM's
+ * dispatch loop (vm_run_chunk) is exactly that case - it grows as opcodes are
+ * added, and past a threshold the compiler stopped inlining the hot per-op
+ * operand helpers (read_int_operand/write_int_slot/...), adding a call+return
+ * to EVERY int/float op and regressing the whole VM ~11% (measured). Marking
+ * those leaf helpers ML_ALWAYS_INLINE pins them into the loop regardless of its
+ * size. Use ONLY for tiny, hot, non-recursive, non-address-taken leaves.
+ */
+#if defined(_MSC_VER)
+#  define ML_ALWAYS_INLINE __forceinline
+#else
+#  define ML_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+
+/*
+ * The opposite: keep a COLD path (rare error / big-arity fallback) OUT of a hot
+ * caller, so its setup/teardown code (a std::vector ctor+dtor, etc.) does not
+ * bloat the caller and push the caller past the inline threshold above.
+ */
+#if defined(_MSC_VER)
+#  define ML_NOINLINE __declspec(noinline)
+#else
+#  define ML_NOINLINE __attribute__((noinline))
+#endif
+
+/*
  * ML_CHECK / ML_CHECK_MSG - the project's defense-in-depth assertion macros.
  *
  * Use these (NOT bare assert) to state an invariant the code RELIES ON but a

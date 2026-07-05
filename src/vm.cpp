@@ -33,7 +33,7 @@ vm_eval_cond(const Construct *c, EvalContext *ctx)
 /* Read a register operand as an int: an immediate, or a frame slot's int (a
  * bool slot reads as 0/1, mirroring Identifier::eval_int). The register machine
  * uses the frame slots directly - no value stack. */
-static inline int_type
+static ML_ALWAYS_INLINE int_type
 read_int_operand(const Operand &o, EvalContext *ctx)
 {
     if (o.is_lit)
@@ -46,7 +46,7 @@ read_int_operand(const Operand &o, EvalContext *ctx)
 
 /* Write an int result into a frame slot: overwrite the int in place when the
  * slot already holds one (the common, hot case), else set value + int type. */
-static inline void
+static ML_ALWAYS_INLINE void
 write_int_slot(EvalContext *ctx, int slot, int_type v)
 {
     LValue &lv = ctx->frame->slots[slot];
@@ -58,7 +58,7 @@ write_int_slot(EvalContext *ctx, int slot, int_type v)
 
 /* The float analogues: read an operand as float (an int/bool slot promotes,
  * mirroring Identifier::eval_float) and write a float result into a slot. */
-static inline float_type
+static ML_ALWAYS_INLINE float_type
 read_float_operand(const Operand &o, EvalContext *ctx)
 {
     if (o.is_lit)
@@ -71,7 +71,7 @@ read_float_operand(const Operand &o, EvalContext *ctx)
     return lv.getval<float_type>();
 }
 
-static inline void
+static ML_ALWAYS_INLINE void
 write_float_slot(EvalContext *ctx, int slot, float_type v)
 {
     LValue &lv = ctx->frame->slots[slot];
@@ -79,6 +79,22 @@ write_float_slot(EvalContext *ctx, int slot, float_type v)
         lv.getval<float_type>() = v;
     else
         lv.put(EvalValue(v));
+}
+
+/* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
+ * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
+ * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
+ * CallBuiltinV, measurably regressed a builtin-heavy loop. Also keeps the
+ * vector code out of vm_run_chunk, so it stays small enough to inline the hot
+ * int/float operand helpers. */
+static ML_NOINLINE EvalValue
+vm_call_builtin_big(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
+                    int_type base, int_type n)
+{
+    std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
+    for (int_type i = 0; i < n; i++)
+        heapbuf[i] = ctx.frame->slots[base + i].get();
+    return dc->builtin.func_v(&ctx, dc->args.get(), heapbuf.data(), n);
 }
 
 /* Map an arith/bitwise Op to its num_bin_op Type method, for the boxed BinOpV
@@ -594,18 +610,17 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             const DirectBuiltinCallExpr *dc =
                 static_cast<const DirectBuiltinCallExpr *>(in.node);
             const int_type base = in.a.lit, n = in.b.lit;
-            EvalValue stackbuf[8];
-            std::vector<EvalValue> heapbuf;
-            EvalValue *buf = stackbuf;
-            if (n > 8) {
-                heapbuf.resize(n);
-                buf = heapbuf.data();
-            }
-            for (int_type i = 0; i < n; i++)
-                buf[i] = ctx.frame->slots[base + i].get();
             try {
-                ctx.frame->slots[in.target].put(
-                    dc->builtin.func_v(&ctx, dc->args.get(), buf, n));
+                if (n <= 8) {
+                    EvalValue stackbuf[8];
+                    for (int_type i = 0; i < n; i++)
+                        stackbuf[i] = ctx.frame->slots[base + i].get();
+                    ctx.frame->slots[in.target].put(
+                        dc->builtin.func_v(&ctx, dc->args.get(), stackbuf, n));
+                } else {
+                    ctx.frame->slots[in.target].put(
+                        vm_call_builtin_big(ctx, dc, base, n));
+                }
             } catch (Exception &e) {
                 if (!e.loc_start) {
                     e.loc_start = dc->args->start;

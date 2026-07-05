@@ -193,27 +193,40 @@ inline auto make_builtin(const char *name, decltype(Builtin::func) f)
 }
 
 /*
+ * Cold n>8 path for the adapter below: heap-allocate the arg buffer.
+ * ML_NOINLINE and NON-template (fv is a runtime arg) so the hot adapter body
+ * carries no std::vector ctor/dtor - that overhead, paid on every
+ * migrated-builtin call, measurably taxes the tree-walker.
+ */
+static ML_NOINLINE EvalValue
+builtin_v_adapter_big(decltype(Builtin::func_v) fv, EvalContext *ctx,
+                      ExprList *exprList)
+{
+    const size_t n = exprList->elems.size();
+    std::vector<EvalValue> heapbuf(n);
+    for (size_t i = 0; i < n; i++)
+        heapbuf[i] = RValue(exprList->elems[i]->eval(ctx));
+    return fv(ctx, exprList, heapbuf.data(), n);
+}
+
+/*
  * The generic tree-walker adapter for a VALUE-ABI builtin (Builtin::func_v):
  * evaluate the unevaluated args into a buffer, then call the value form. So a
  * migrated builtin has ONE implementation, reached by the tree-walker through
  * this adapter and by the VM (CallBuiltinV) directly with pre-evaluated args.
- * A stack buffer covers the common small-arity call; only a big variadic call
- * heap-allocates.
+ * A stack buffer covers the common small-arity call (NO vector on the path);
+ * only a big (>8-arg) variadic call heap-allocates, via the cold helper above.
  */
 template <decltype(Builtin::func_v) FV>
 EvalValue builtin_v_adapter(EvalContext *ctx, ExprList *exprList)
 {
     const size_t n = exprList->elems.size();
+    if (n > 8)
+        return builtin_v_adapter_big(FV, ctx, exprList);
     EvalValue stackbuf[8];
-    std::vector<EvalValue> heapbuf;
-    EvalValue *buf = stackbuf;
-    if (n > 8) {
-        heapbuf.resize(n);
-        buf = heapbuf.data();
-    }
     for (size_t i = 0; i < n; i++)
-        buf[i] = RValue(exprList->elems[i]->eval(ctx));
-    return FV(ctx, exprList, buf, n);
+        stackbuf[i] = RValue(exprList->elems[i]->eval(ctx));
+    return FV(ctx, exprList, stackbuf, n);
 }
 
 template <decltype(Builtin::func_v) FV>
