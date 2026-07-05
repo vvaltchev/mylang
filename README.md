@@ -1945,6 +1945,18 @@ foreach (var w in words)
     counts[w] += 1;        # a missing word reads as 0
 ```
 
+#### `make_dict(keys, gen_func)`
+Return `{ keys[0]: gen_func(keys[0]), ..., keys[N-1]: gen_func(keys[N-1]) }` —
+the dictionary analogue of `make_array()` (a value-callback comprehension).
+`keys` is an array; `gen_func` is called once per key and returns that key's
+value. The result type is `dict<K, V>` with `K` the keys' element type and `V`
+the callback's return type. On a duplicate key the later one wins (as with
+`dict()`), and each key is frozen on insert. Example:
+
+```C#
+var squares = make_dict([1, 2, 3, 4], func(k) => k * k);  # {1:1, 2:4, 3:9, 4:16}
+```
+
 #### `get(dictionary, key)`
 Look up `key`, returning its value or `none` if the key is absent — the explicit
 *nullable* lookup (type `opt V`, so you narrow it before use). Contrast

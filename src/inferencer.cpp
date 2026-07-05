@@ -2555,6 +2555,18 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
     }
+    if (n == "make_dict") {
+        /* make_dict(keys, gen) -> dict<K, V>: K = the keys array's element
+         * type, V = the callback's return type. The dict analogue of
+         * make_array (typed the same way). */
+        StaticTypeRef ks = static_type_resolve(arg(0));
+        StaticTypeRef f = static_type_resolve(arg(1));
+        if (is_unknown(ks) || is_unknown(f))
+            return bottom;                  /* defer: args not yet known */
+        StaticTypeRef k =
+            ks->kind == StaticTypeKind::Array ? ks->elem : A.dyn_ty();
+        return A.dict_of(k, is_func(f) ? f->ret : A.dyn_ty());
+    }
     if (n == "dict") {
         /* dict(default_value) -> dict<dyn, typeof default> (a default dict, so
          * d[k] is non-opt). dict(pairs) -> dict<dyn,dyn>. A non-array arg is
@@ -2965,6 +2977,10 @@ void Inferencer::accumulate_call(CallExpr *call)
                                    args->elems[1]->start);
             }
             return;
+        } else if (nm == "make_dict") {
+            /* make_dict(keys, gen): the callback's param is a KEY, so feed it
+             * the keys array's element type via the general path below. */
+            func_i = 1; cont_i = 0;
         } else {
             return;
         }
@@ -2975,6 +2991,14 @@ void Inferencer::accumulate_call(CallExpr *call)
             return;
         StaticTypeRef ct =
             static_type_resolve(type_of(args->elems[cont_i].get()));
+        /* DEFER while the container type is still Unknown - feeding the
+         * callback param `dyn` here would be sticky (it climbs the lattice and
+         * never comes back), poisoning the callback's ret and any accumulator
+         * of the higher-order result (e.g. `total += make_dict(ks, f)[k]` or
+         * `map`/`filter` in a loop). The param settles once ct does; if ct
+         * finalizes Unknown the param legitimately finalizes dyn. Invariant. */
+        if (is_unknown(ct))
+            return;
         StaticTypeRef el = ct->kind == StaticTypeKind::Array ? ct->elem
                   : ct->kind == StaticTypeKind::Dict  ? ct->key : A.dyn_ty();
         Loc fl = args->elems[func_i]->start;

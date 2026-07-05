@@ -1159,10 +1159,19 @@ decisions behind it: `plans/type-inference.md`,
   gets `none` becomes `opt dyn`). `runtime(x)` returns `Dyn`
   (its documented opt-out: it defers to runtime). `==`/`!=` are always
   well-typed (→ int); ordering is numeric-or-string. `str + anything` → str.
-  Higher-order builtins (`map(func,c)`, `filter(func,c)`, `sort(c,func)`,...)
-  feed the container's element type into the callback's params (named **or**
-  inline lambda; `callee_funcinfo`). A `var f = <lambda>` binds `f`'s `TypeSym`
-  to the lambda's `FuncInfo`, so calls to `f` type its params and check arity.
+  Higher-order builtins (`map(func,c)`, `filter(func,c)`, `sort(c,func)`,
+  `make_dict(keys,gen)`,...) feed the container's element type into the
+  callback's params (named **or** inline lambda; `callee_funcinfo`) — for
+  `make_dict` the callback's param is the KEYS array's element type (the key),
+  and the result is `dict<K, V>` (K the key type, V the callback's return), the
+  dict analogue of `make_array(N,gen)` (whose callback param is the int index).
+  This feeding **defers while the container type is Unknown** (never feeds `dyn`
+  — a premature `dyn` param is sticky and poisons the callback's ret, leaking a
+  sticky `dyn` into any accumulator of the higher-order result, e.g.
+  `total += make_dict(ks,f)[k]` in a loop with an inline `f`); `make_array` is
+  immune since it feeds `int` unconditionally. A `var f = <lambda>` binds `f`'s
+  `TypeSym` to the lambda's `FuncInfo`, so calls to `f` type its params and
+  check arity.
 - **New surface syntax**: the `opt` and `dyn` keywords, usable as modifiers on a
   parameter (`func f(opt x, dyn y)`) or a var/const decl (`var dyn z = ...;`,
   `var opt w;`), and **combinable as `opt dyn`** (in that order) on either.

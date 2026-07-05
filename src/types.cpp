@@ -369,6 +369,7 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin_v<builtin_values>("values"),
     make_const_builtin_v<builtin_kvpairs>("kvpairs"),
     make_const_builtin_v<builtin_dict>("dict"),
+    make_const_builtin_v<builtin_make_dict>("make_dict"),
     make_const_builtin_v<builtin_get>("get"),         /* dict lookup -> opt V */
     make_const_builtin_v<builtin_get_throw>("get!"),  /* lookup or throw -> V */
 

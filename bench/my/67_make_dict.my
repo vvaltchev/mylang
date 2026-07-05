@@ -1,0 +1,20 @@
+# make_dict: build a dict from an array of keys via a value callback - the
+# dict-comprehension form (the analogue of Python's { k: k*k + r for k in ks }).
+# Each rep builds a fresh 400-entry dict whose values depend on the loop counter
+# (a captured var) so it can't be hoisted. Exercises the per-key callback
+# dispatch + dict insert + key freeze.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var nkeys = 400;
+var reps = 3000 * scale;
+var ks = range(nkeys);
+
+var total = 0;
+for (var r = 0; r < reps; r++) {
+    var d = make_dict(ks, func[r](k) => k * k + r);
+    total += d[r % nkeys];
+}
+
+print("result:", total);

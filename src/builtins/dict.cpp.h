@@ -289,3 +289,48 @@ builtin_dict(EvalContext *ctx, ExprList *exprList,
 
     return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
 }
+
+/*
+ * make_dict(keys, gen) -> { keys[0]: gen(keys[0]), ..., keys[N-1]: gen(...) }.
+ * The dict analogue of make_array(N, gen): the value of each entry is produced
+ * by calling `gen` with the key. `keys` is an array (its elements may be flat
+ * int/float/bool - read via arr_elem_at, no promotion); `gen` is a function of
+ * one arg (the key) returning the value. On a duplicate key the later one wins
+ * (insert_or_assign), matching dict(). Each key is frozen (make_const_clone,
+ * like every dict insert) so a mutable container key can't later be mutated and
+ * corrupt the map. Symmetric with make_array; a const-foldable (const) builtin.
+ */
+EvalValue builtin_make_dict(EvalContext *ctx, ExprList *exprList,
+                            const EvalValue *args, size_t nargs)
+{
+    if (nargs != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    const EvalValue &e = args[0];
+
+    if (!e.is<SharedArrayObj>())
+        throw TypeErrorEx("Expected array of keys", arg0->start, arg0->end);
+
+    Construct *arg1 = exprList->elems[1].get();
+    const EvalValue &fval = args[1];
+
+    if (!fval.is<intrusive_ptr<FuncObject>>())
+        throw TypeErrorEx("Expected function", arg1->start, arg1->end);
+
+    FuncObject &funcObj = *fval.get<intrusive_ptr<FuncObject>>().get();
+
+    const SharedArrayObj &keys = e.get<SharedArrayObj>();
+    const size_type n = keys.size();
+    DictObject::inner_type data;
+
+    for (size_type i = 0; i < n; i++) {
+
+        const EvalValue k = arr_elem_at(keys, i);
+        const EvalValue v = eval_func(ctx, funcObj, k);
+
+        data.insert_or_assign(make_const_clone(k), LValue(v, false));
+    }
+
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+}

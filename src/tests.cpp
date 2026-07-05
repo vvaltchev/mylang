@@ -3545,6 +3545,88 @@ static const std::vector<test> tests =
     },
     {
         /*
+         * make_dict(keys, gen): the dict analogue of make_array - build a dict
+         * by calling `gen` on each key (a value-callback comprehension). Dup
+         * keys: the later one wins (like dict()); keys are frozen; flat scalar
+         * keys are read directly; const-foldable with const keys + a pure gen.
+         */
+        "make_dict: build a dict from keys via a value callback",
+        {
+            "assert(make_dict([1,2,3], func(k) => k*k) == {1:1, 2:4, 3:9});",
+            "var d = make_dict([1,2,3], func(k) => k*10);",
+            "assert(d[2] == 20); assert(len(d) == 3);",
+            "assert(make_dict([], func(k) => k) == {});",
+            /* string keys, value = len(key) */
+            "assert(make_dict([\"a\",\"bb\"], func(k) => len(k))"
+                " == {\"a\":1, \"bb\":2});",
+            /* duplicate key: the later call wins, like dict() */
+            "assert(make_dict([1,1,2], func(k) => k*100) == {1:100, 2:200});",
+            /* flat float keys are read directly (no promotion) */
+            "assert(make_dict([1.5,2.5], func(k) => k*2) == {1.5:3.0, 2.5:5.0});",
+            /* container values */
+            "assert(make_dict([1,2], func(k) => [k,k]) == {1:[1,1], 2:[2,2]});",
+            /* a container KEY is frozen and usable for lookup */
+            "var dk = make_dict([[1,2],[3,4]], func(k) => sum(k));",
+            "assert(dk[[1,2]] == 3); assert(dk[[3,4]] == 7);",
+            /* static type is dict<K, V> - K from the keys, V from the gen */
+            "assert(typestr(make_dict([1,2], func(k) => k*2))"
+                " == \"dict<int,int>\");",
+            "assert(typestr(make_dict([\"x\"], func(k) => len(k)))"
+                " == \"dict<str,int>\");",
+            /* const keys + a pure gen fold at parse time (like make_array) */
+            "const D = make_dict([1,2,3], pure func(k) => k*k);",
+            "assert(D[3] == 9); assert(len(D) == 3);",
+            /* works in a pure const context: make_dict inside a pure func that
+             * is itself const-evaluated (the whole call folds to a baked dict) */
+            "pure func mk(n) => make_dict(range(n), pure func(k) => k+1);",
+            "const E = mk(3);",
+            "assert(E[0] == 1); assert(E[2] == 3); assert(len(E) == 3);",
+        },
+    },
+    {
+        /*
+         * Regression: accumulating a higher-order-builtin result built with an
+         * INLINE lambda (make_dict / map / filter) in a loop must keep the
+         * accumulator's inferred type. The callback param is fed the container's
+         * element type only once the container type settles; feeding `dyn` early
+         * used to leak a sticky dyn into the accumulator (a DynRequiredEx). Now
+         * the higher-order path in accumulate_call defers on an Unknown
+         * container. make_array never had the bug (it feeds int unconditionally).
+         */
+        "Inference: inline-lambda higher-order results accumulate cleanly",
+        {
+            "var kk = range(4);",   /* a var, so its type settles over rounds */
+            "var a1 = 0;",
+            "for (var r = 0; r < 4; r++)"
+                " { var d = make_dict(kk, func(k) => k*k); a1 += d[r]; }",
+            "assert(a1 == 14);",    /* {0:0,1:1,2:4,3:9} -> 0+1+4+9 */
+            "var a2 = 0;",
+            "for (var r = 0; r < 4; r++)"
+                " { var m = map(func(x) => x+1, kk); a2 += m[r]; }",
+            "assert(a2 == 10);",    /* [1,2,3,4] -> 1+2+3+4 */
+            "var a3 = 0;",
+            "for (var r = 0; r < 2; r++)"
+                " { var fl = filter(func(x) => x > 1, kk); a3 += fl[r]; }",
+            "assert(a3 == 5);",     /* [2,3] -> 2+3 */
+        },
+    },
+    {
+        "make_dict: wrong argument count throws",
+        { "make_dict([1,2]);" },
+        &typeid(InvalidNumberOfArgsEx),
+    },
+    {
+        "make_dict: non-array first argument throws",
+        { "var dyn x = 5; make_dict(x, func(k) => k);" },
+        &typeid(TypeErrorEx),
+    },
+    {
+        "make_dict: non-function second argument throws",
+        { "var dyn f = 5; make_dict([1,2], f);" },
+        &typeid(TypeErrorEx),
+    },
+    {
+        /*
          * keys()/values() of a scalar dict build FLAT (unboxed) arrays, driven
          * by the RESULT's static type - so a big keys()/values() avoids per-
          * element boxing. The flat hint reaches a bound destination

@@ -203,6 +203,10 @@ const BuiltinDoc builtin_docs[] = {
   "An array of the dict's values.", nullptr },
 { "kvpairs", "dict", "kvpairs(d)",
   "An array of [key, value] pairs.", nullptr },
+{ "make_dict", "dict", "make_dict(keys, gen)",
+  "A dict where each key k maps to gen(k) - the dict form of make_array.",
+  "keys is an array; gen is called once per key. Result type dict<K,V>; a "
+  "duplicate key keeps the later value." },
 { "get", "dict", "get(d, k)",
   "The value for k, or none if absent (the nullable lookup -> opt V).",
   nullptr },
