@@ -19,10 +19,15 @@ jobs:
     - name: Create Build Environment
       run: cmake -E make_directory ${{github.workspace}}/build
 
+    # VM_HARDENING=ON: the heavy per-op VM checks (frame-slot bounds + operand
+    # type tags) in BOTH the Debug and Release lanes - so the Windows Release
+    # lane (where a layout-dependent VM UB has crashed) turns it into a loud,
+    # located assertion instead of a mystery access violation.
     - name: Configure CMake
       shell: bash
       working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+      run: cmake -DTESTS=1 -DVM_HARDENING=ON $GITHUB_WORKSPACE
+           -DCMAKE_BUILD_TYPE=$BUILD_TYPE
 
     - name: Build
       working-directory: ${{github.workspace}}/build

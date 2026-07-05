@@ -97,6 +97,8 @@ struct Frame {
     std::vector<LValue> heap_buf;   /* spill when frame_size > INLINE_SLOTS */
     LValue *slots = nullptr;
     int inline_count = 0;           /* # slots placement-built in inline_buf */
+    int size = 0;                   /* # valid (constructed) slots - the bound
+                                     * the ML_VM_CHECK slot guard enforces */
 
     /* Lazily-allocated pure-call result cache (see PureCache above); null until
      * the first cacheable call is made from this frame. Freed with the frame. */
@@ -114,9 +116,22 @@ struct Frame {
     }
 
     /* Make `slots` point at storage holding exactly `frame_size` slots. */
+    /*
+     * Bounds-checked slot access. Under VM hardening (debug + CI-release) a
+     * slot index >= size (a codegen bug that would otherwise read an
+     * out-of-range LValue - a garbage type pointer, a layout-dependent crash)
+     * fails LOUDLY here instead. Compiles to a plain `slots[i]` in a normal
+     * release build. */
+    ML_ALWAYS_INLINE LValue &at(int i)
+    {
+        ML_VM_CHECK(i >= 0 && i < size);
+        return slots[i];
+    }
+
     void init(int frame_size)
     {
         ML_CHECK(frame_size >= 0);
+        size = frame_size;
 
         if (frame_size > INLINE_SLOTS) {
 

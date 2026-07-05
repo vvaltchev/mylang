@@ -21,24 +21,69 @@ jobs:
     - name: Create Build Environment
       run: cmake -E make_directory ${{github.workspace}}/build
 
+    # VM_HARDENING=ON turns on the HEAVY per-op VM checks (frame-slot bounds +
+    # operand type tags, ML_VM_CHECK) even in the Release lane - a CI release
+    # runs with far more safety than a local one, so a layout-dependent VM UB
+    # (a bad slot index reading a garbage LValue) fails as a LOUD, located
+    # assertion instead of a mystery segfault. See defs.h / CLAUDE.md.
     - name: Configure CMake
       shell: bash
       working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+      run: cmake -DTESTS=1 -DVM_HARDENING=ON $GITHUB_WORKSPACE
+           -DCMAKE_BUILD_TYPE=$BUILD_TYPE
 
     - name: Build
       working-directory: ${{github.workspace}}/build
       shell: bash
       run: cmake --build . --config $BUILD_TYPE
 
+    # Enable core dumps into the build dir before running, so a crash (the rare
+    # layout-dependent VM heisenbug) leaves a core we can inspect + download.
     - name: Test
       working-directory: ${{github.workspace}}/build
       shell: bash
-      run:  ./mylang -rt
+      run: |
+        ulimit -c unlimited
+        echo "${{github.workspace}}/build/core.%e.%p" \
+          | sudo tee /proc/sys/kernel/core_pattern
+        ./mylang -rt
+
+    # On a crash: print a full backtrace from the core (immediately visible in
+    # the log) and upload the core + the exact binary as an artifact, so the
+    # failure can be debugged offline without re-reproducing it.
+    - name: Backtrace on crash
+      if: failure()
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: |
+        sudo apt-get update >/dev/null 2>&1 || true
+        sudo apt-get install -y gdb >/dev/null 2>&1 || true
+        shopt -s nullglob
+        cores=(core.*)
+        if [ ${#cores[@]} -eq 0 ]; then
+          echo "(no core file produced)"
+          exit 0
+        fi
+        for c in "${cores[@]}"; do
+          echo "===== gdb backtrace for $c ====="
+          gdb -batch -ex "thread apply all bt full" ./mylang "$c" 2>&1 \
+            | head -300
+        done
+
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: crash-${{ matrix.bt }}-${{ matrix.cxx }}
+        path: |
+          ${{github.workspace}}/build/core.*
+          ${{github.workspace}}/build/mylang
+        if-no-files-found: ignore
 
   # Adversarial allocator lane: forces AST-node address reuse (RECYCLE=ON) so
   # "pointer used as a stable identity" bugs surface deterministically under
-  # -rt. Debug build, so it also runs the full sanitizer + assertion net.
+  # -rt. Debug build, so it also runs the full sanitizer + assertion net
+  # (VM_HARDENING defaults ON for a Debug build).
   recycle:
     runs-on: ubuntu-latest
     steps:
@@ -50,7 +95,8 @@ jobs:
     - name: Configure CMake (RECYCLE)
       shell: bash
       working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 -DRECYCLE=ON -DCMAKE_BUILD_TYPE=Debug $GITHUB_WORKSPACE
+      run: cmake -DTESTS=1 -DRECYCLE=ON -DVM_HARDENING=ON
+           -DCMAKE_BUILD_TYPE=Debug $GITHUB_WORKSPACE
 
     - name: Build
       working-directory: ${{github.workspace}}/build
@@ -60,4 +106,37 @@ jobs:
     - name: Test
       working-directory: ${{github.workspace}}/build
       shell: bash
-      run:  ./mylang -rt
+      run: |
+        ulimit -c unlimited
+        echo "${{github.workspace}}/build/core.%e.%p" \
+          | sudo tee /proc/sys/kernel/core_pattern
+        ./mylang -rt
+
+    - name: Backtrace on crash
+      if: failure()
+      working-directory: ${{github.workspace}}/build
+      shell: bash
+      run: |
+        sudo apt-get update >/dev/null 2>&1 || true
+        sudo apt-get install -y gdb >/dev/null 2>&1 || true
+        shopt -s nullglob
+        cores=(core.*)
+        if [ ${#cores[@]} -eq 0 ]; then
+          echo "(no core file produced)"
+          exit 0
+        fi
+        for c in "${cores[@]}"; do
+          echo "===== gdb backtrace for $c ====="
+          gdb -batch -ex "thread apply all bt full" ./mylang "$c" 2>&1 \
+            | head -300
+        done
+
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: crash-recycle
+        path: |
+          ${{github.workspace}}/build/core.*
+          ${{github.workspace}}/build/mylang
+        if-no-files-found: ignore

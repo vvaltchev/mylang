@@ -73,6 +73,25 @@ if (RECYCLE)
    target_compile_definitions(mylang PUBLIC "RECYCLE_ALLOC")
 endif()
 
+# VM hardening (ML_VM_CHECK): HEAVY per-op VM invariants - a frame-slot bounds
+# check on every register access + an operand type-tag check. Default follows
+# the build type (ON for Debug, OFF for an optimized build, for speed);
+# -DVM_HARDENING=ON forces it on. CI enables it in the RELEASE lanes so a CI
+# release exposes a layout-dependent UB as a loud, deterministic check rather
+# than a mystery segfault. Parity with the Makefile's VM_HARDENING; gated by
+# ASSERTS (a no-op under NDEBUG).
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+   set(VM_HARDENING_DEFAULT ON)
+else()
+   set(VM_HARDENING_DEFAULT OFF)
+endif()
+set(VM_HARDENING ${VM_HARDENING_DEFAULT} CACHE BOOL "Heavy per-op VM checks")
+if (VM_HARDENING)
+   target_compile_definitions(mylang PUBLIC "ML_VM_HARDENING=1")
+else()
+   target_compile_definitions(mylang PUBLIC "ML_VM_HARDENING=0")
+endif()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
    if (GCOV)
       target_compile_options(mylang PUBLIC -fprofile-arcs -ftest-coverage)

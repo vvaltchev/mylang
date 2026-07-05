@@ -92,6 +92,20 @@ optimized build to measure the assertion overhead, e.g. `make OPT=1 ASSERTS=0`
 vs the default `make OPT=1`. **`RECYCLE` (default 0):** `make RECYCLE=1 TESTS=1`
 builds the adversarial node allocator (see *Invariants & hazards*).
 
+**VM hardening: `VM_HARDENING` (default = debug).** The heavy per-op VM
+invariants (`ML_VM_CHECK`, `defs.h`) — a **frame-slot bounds check on every
+register access** (`Frame::at`) plus an **operand type-tag check** in the VM's
+int/float readers — are too hot for a normal release (a compare per register
+access), so they default **ON for a debug build (`OPT=0`) and OFF for a release
+(`OPT=1`)**. `make VM_HARDENING=1` forces them on; **CI turns them ON in the
+*release* lanes** (`-DVM_HARDENING=ON`), so a CI release runs with far more
+safety than a local one — a layout-dependent VM UB (a bad slot index reading an
+unconstructed/out-of-range `LValue` → a garbage type pointer → a crash only on
+some toolchains) fails as a **loud, located `ML_VM_CHECK` assertion** instead of
+a mystery segfault. Still gated by `ASSERTS` (a no-op under `NDEBUG`). CMake:
+`-DVM_HARDENING=ON/OFF` (default follows the build type). See *Invariants &
+hazards*.
+
 CMake is also supported (used by CI):
 `cmake -DTESTS=1 -DCMAKE_BUILD_TYPE=Debug .. && cmake --build .`
 (`-DGCOV=ON` for a coverage build, GCC only). It enables LTO via
@@ -3013,6 +3027,28 @@ instrumentation (see `plans/function-templates.md`).
   (`intrusiveptr.h`), `pod_get`/`pod_set` field validity (`structtype.h`),
   `Frame::init` `frame_size <= 64` (`eval.h`).
 
+- **`ML_VM_CHECK` (`defs.h`) — the VM's HEAVY per-op layer.** A separate, hotter
+  tier than `ML_CHECK`, for invariants too expensive to run on every register
+  access in a normal release: a **frame-slot bounds check** (`Frame::at(i)`, now
+  used for *every* `frame->slots[i]` in `vm.cpp` and `eval.cpp` — the
+  resolved-local path both engines share) and an **operand type-tag check** (a
+  `th==i/f` operand must actually hold an int/float;
+  `read_int_operand`/`read_float_operand`). This is the net for a
+  **layout-dependent VM UB**: a bad slot index reads an *unconstructed* inline
+  slot (`[size, 8)`) or an *out-of-range* one — a garbage `LValue` whose garbage
+  type pointer crashes only on some toolchains — and the bounds/tag check turns
+  that into a **loud, located** failure *everywhere* it occurs, not just where
+  the garbage happens to be a bad pointer. Gated by `ML_VM_HARDENING` (the
+  **`VM_HARDENING`** build flag: default ON for a debug build, OFF for a plain
+  release; CI forces it ON in the *release* lanes — see *VM hardening* under
+  "Build & run") **and** by `ASSERTS` (a no-op under `NDEBUG`). It was added
+  after a rare, non-deterministic CI-only segfault at a VM inline test that
+  reproduced under NO local tool (Release loops, ASan, UBSan, RECYCLE, valgrind
+  memcheck — 100+ runs on the failing commit and HEAD): the bug spans a *range*
+  of commits and is layout/toolchain-specific, so the response is *more
+  instrumentation on CI* (this + the Linux core-dump artifact), not a bisect.
+  `Frame` gained a `size` field (the constructed-slot count) for the bound.
+
 - **`RECYCLE=1` — the adversarial allocator.** `make RECYCLE=1 TESTS=1` builds a
   `Construct` allocator (a size-keyed LIFO free-list, `syntax.cpp`) that hands a
   just-freed node's address straight back to the next allocation, so any
@@ -3028,11 +3064,28 @@ instrumentation (see `plans/function-templates.md`).
 
 - **CI maximizes correctness checks (it does not time anything).** Every CI lane
   builds with `ASSERTS` on (C asserts + `ML_CHECK` + stdlib container
-  hardening), Debug lanes add ASan + UBSan, UBSan runs with
-  `-fno-sanitize-recover` (a finding ABORTS, so it can't print-and-still-exit-0
-  past the exit-code check), and there is a `RECYCLE=ON` lane. Slower is fine —
-  performance is measured separately (`bench/`, a plain `make` release). Adding
-  a new check here is cheap insurance; reach for it.
+  hardening) **and `VM_HARDENING=ON`** (the `ML_VM_CHECK` per-op tier — so even
+  the **release** lanes, where a local release runs *without* it, get the
+  frame-slot bounds + operand type-tag checks), Debug lanes add ASan + UBSan,
+  UBSan runs with `-fno-sanitize-recover` (a finding ABORTS, so it can't
+  print-and-still-exit-0 past the exit-code check), and there is a `RECYCLE=ON`
+  lane. Slower is fine — performance is measured separately (`bench/`, a plain
+  `make` release, which is NOT hardened). Adding a new check here is cheap
+  insurance; reach for it.
+
+- **CI core-dump capture (`linux.yml`).** Both Linux jobs (the Debug/Release
+  matrix and the `recycle` lane) enable core dumps (`ulimit -c unlimited` + a
+  `core.%e.%p` pattern in the build dir) before `-rt`, and on ANY failure a
+  `Backtrace on crash` step installs `gdb` and prints `thread apply all bt full`
+  from each core to the log, while an `Upload crash artifacts` step
+  (`if: failure()`) uploads the core **and the exact binary** as a downloadable
+  artifact. So when the rare layout-dependent VM crash DOES occur on CI it is
+  immediately debuggable (a real backtrace, an offline-loadable core) instead of
+  a bare "Segmentation fault". This is the deliberate response to a
+  can't-reproduce-locally bug: *raise the instrumentation bar on CI*. (A blind
+  loop-`-rt`-N-times was rejected — it burns CI without improving the odds much;
+  the `VM_HARDENING` checks, which fire on the bad access itself rather than
+  only when its garbage is a bad pointer, are the higher-value catch.)
 
 ## Recipes
 

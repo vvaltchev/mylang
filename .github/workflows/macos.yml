@@ -20,7 +20,11 @@ jobs:
       # libc++ hardening (macOS uses libc++): bounds-checks std containers, the
       # libc++ analog of -D_GLIBCXX_ASSERTIONS. EXTENSIVE = the broad,
       # low-overhead mode (LLVM 17+; macos-latest has it).
-      run: cmake -DTESTS=1 $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+      # VM_HARDENING=ON: the heavy per-op VM checks (frame-slot bounds + operand
+      # type tags) - on here explicitly (a Debug build enables them by default,
+      # but pin it so a config change can't silently drop them).
+      run: cmake -DTESTS=1 -DVM_HARDENING=ON $GITHUB_WORKSPACE
+           -DCMAKE_BUILD_TYPE=$BUILD_TYPE
            -DCMAKE_CXX_FLAGS="-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE"
 
     - name: Build

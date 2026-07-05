@@ -92,6 +92,21 @@ ifeq ($(RECYCLE),1)
 	BASE_FLAGS += -DRECYCLE_ALLOC
 endif
 
+# VM hardening (ML_VM_CHECK): HEAVY per-op VM invariants - a frame-slot bounds
+# check on every register access, an operand type-tag check - too hot for a
+# plain release, invaluable for exposing a LAYOUT-DEPENDENT UB (a bad slot index
+# reading a garbage LValue crashes only on some toolchains; the check catches it
+# everywhere, deterministically). ON by default in a debug build (OPT=0), OFF in
+# a plain release (OPT=1) for speed; force VM_HARDENING=1. CI turns it ON in the
+# RELEASE lanes, so a CI release runs with far more safety than a local one.
+# (Still gated by ASSERTS - a no-op under NDEBUG.)
+VM_HARDENING ?= $(if $(filter 0,$(OPT)),1,0)
+ifeq ($(VM_HARDENING),1)
+	BASE_FLAGS += -DML_VM_HARDENING=1
+else
+	BASE_FLAGS += -DML_VM_HARDENING=0
+endif
+
 ifdef TESTS
 	ifeq ($(TESTS),1)
 		BASE_FLAGS += -DTESTS

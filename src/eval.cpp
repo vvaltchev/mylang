@@ -228,7 +228,7 @@ float_type Construct::eval_float(EvalContext *ctx) const
 int_type Identifier::eval_int(EvalContext *ctx) const
 {
     if (sym.kind == SymKind::local && ctx->frame) {
-        const LValue &lv = ctx->frame->slots[sym.slot];
+        const LValue &lv = ctx->frame->at(sym.slot);
         if (lv.is<bool>())
             return lv.getval<bool>() ? 1 : 0;   /* bool slot -> int 0/1 */
         return lv.getval<int_type>();
@@ -252,7 +252,7 @@ int_type Identifier::eval_int(EvalContext *ctx) const
 float_type Identifier::eval_float(EvalContext *ctx) const
 {
     if (sym.kind == SymKind::local && ctx->frame) {
-        const LValue &lv = ctx->frame->slots[sym.slot];
+        const LValue &lv = ctx->frame->at(sym.slot);
         if (lv.is<int_type>())
             return static_cast<float_type>(lv.getval<int_type>());
         if (lv.is<bool>())
@@ -285,7 +285,7 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
         /* Resolved local: an O(1) slot read instead of a scope-chain walk. The
          * slot is always bound (a local resolves to its slot only after its
          * decl - no-hoist resolution), so no liveness check is needed. */
-        return EvalValue(&ctx->frame->slots[sym.slot]);
+        return EvalValue(&ctx->frame->at(sym.slot));
     }
 
     if (sym.kind == SymKind::global && ctx->gfuncs) {
@@ -385,7 +385,7 @@ bind_param(EvalContext *args_ctx,
         val = coerce_to_decl_type(val, param->decl_type);
 
     if (frame) {
-        frame->slots[idx] = LValue(move(val), is_const);
+        frame->at(idx) = LValue(move(val), is_const);
     } else {
         args_ctx->emplace(param, move(val), is_const);
     }
@@ -4311,7 +4311,7 @@ static double wb_time_eval(const Construct *n, EvalContext *ctx, long M)
             n->eval(ctx);
         }
         ctx->flow->type = FlowState::none;
-        g_wb_sink += ctx->frame->slots[2].getval<int_type>();
+        g_wb_sink += ctx->frame->at(2).getval<int_type>();
         auto t1 = wb_clock::now();
         double ns =
             std::chrono::duration<double, std::nano>(t1 - t0).count() / M;

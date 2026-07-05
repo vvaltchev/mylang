@@ -38,9 +38,13 @@ read_int_operand(const Operand &o, EvalContext *ctx)
 {
     if (o.is_lit)
         return o.lit;
-    const LValue &lv = ctx->frame->slots[o.slot];
+    const LValue &lv = ctx->frame->at(o.slot);
     if (lv.is<bool>())
         return lv.getval<bool>() ? 1 : 0;
+    /* A th==i operand must hold an int here; anything else is an inference bug
+     * or a corrupt/garbage slot (its type ptr won't match int) - caught before
+     * the raw getval misreads the union. */
+    ML_VM_CHECK(lv.is<int_type>());
     return lv.getval<int_type>();
 }
 
@@ -49,7 +53,7 @@ read_int_operand(const Operand &o, EvalContext *ctx)
 static ML_ALWAYS_INLINE void
 write_int_slot(EvalContext *ctx, int slot, int_type v)
 {
-    LValue &lv = ctx->frame->slots[slot];
+    LValue &lv = ctx->frame->at(slot);
     if (lv.is<int_type>())
         lv.getval<int_type>() = v;
     else
@@ -63,18 +67,21 @@ read_float_operand(const Operand &o, EvalContext *ctx)
 {
     if (o.is_lit)
         return o.flit;
-    const LValue &lv = ctx->frame->slots[o.slot];
+    const LValue &lv = ctx->frame->at(o.slot);
     if (lv.is<int_type>())
         return static_cast<float_type>(lv.getval<int_type>());
     if (lv.is<bool>())
         return lv.getval<bool>() ? 1.0 : 0.0;
+    /* Likewise a th==f operand must hold a float here (int/bool promoted
+     * above); a wrong-typed / garbage slot fails before the raw union read. */
+    ML_VM_CHECK(lv.is<float_type>());
     return lv.getval<float_type>();
 }
 
 static ML_ALWAYS_INLINE void
 write_float_slot(EvalContext *ctx, int slot, float_type v)
 {
-    LValue &lv = ctx->frame->slots[slot];
+    LValue &lv = ctx->frame->at(slot);
     if (lv.is<float_type>())
         lv.getval<float_type>() = v;
     else
@@ -89,7 +96,7 @@ static ML_ALWAYS_INLINE const EvalValue &
 boxed_operand(const Operand &o, EvalContext *ctx, EvalValue &scratch)
 {
     if (!o.is_lit)
-        return ctx->frame->slots[o.slot].get();
+        return ctx->frame->at(o.slot).get();
     switch (o.lit_kind) {
     case Operand::LitKind::f:
         scratch = EvalValue(o.flit);
@@ -116,7 +123,7 @@ vm_call_builtin_big(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
 {
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
     for (int_type i = 0; i < n; i++)
-        heapbuf[i] = ctx.frame->slots[base + i].get();
+        heapbuf[i] = ctx.frame->at(base + i).get();
     return dc->builtin.func_v(&ctx, dc->args.get(), heapbuf.data(), n);
 }
 
@@ -427,7 +434,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* i += step (or -=); if (i <aop> bound) loop back, else exit. One
              * dispatch for the whole counter (see bytecode.h). */
-            LValue &ilv = ctx.frame->slots[in.target2];
+            LValue &ilv = ctx.frame->at(in.target2);
             int_type i = ilv.getval<int_type>();
             const int_type step = read_int_operand(in.b, &ctx);
 
@@ -454,7 +461,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* a[i] into a temp (mirrors Subscript::eval_int for a flat array;
              * a dict / general base falls back to the node). */
-            const EvalValue &base = ctx.frame->slots[in.target2].get();
+            const EvalValue &base = ctx.frame->at(in.target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
                 int_type idx = read_int_operand(in.a, &ctx);
@@ -480,7 +487,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::LoadElemFloat: {
 
-            const EvalValue &base = ctx.frame->slots[in.target2].get();
+            const EvalValue &base = ctx.frame->at(in.target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
                 int_type idx = read_int_operand(in.a, &ctx);
@@ -509,7 +516,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             /* a[i] (an array-valued element of a GENERAL array) into a temp
              * slot, so a 2-D read `a[i][k]` is native (both indices). A
              * non-array / non-general base falls back to the node. */
-            const EvalValue &base = ctx.frame->slots[in.target2].get();
+            const EvalValue &base = ctx.frame->at(in.target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::general) {
@@ -518,13 +525,13 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
                         throw OutOfBoundsEx(in.node->start, in.node->end);
-                    ctx.frame->slots[in.target].put(
+                    ctx.frame->at(in.target).put(
                         arr.get_vec()[arr.offset() + idx].get());
                     pc++;
                     break;
                 }
             }
-            ctx.frame->slots[in.target].put(RValue(in.node->eval(&ctx)));
+            ctx.frame->at(in.target).put(RValue(in.node->eval(&ctx)));
             pc++;
             break;
         }
@@ -536,7 +543,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * (const / read-only / general / bool / dyn) falls back to the node
              * - sound because a compiled rvalue is side-effect-free, so re-eval
              * is exact. */
-            LValue &alv = ctx.frame->slots[in.target2];
+            LValue &alv = ctx.frame->at(in.target2);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::ints
@@ -577,7 +584,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::StoreElemFloat: {
 
-            LValue &alv = ctx.frame->slots[in.target2];
+            LValue &alv = ctx.frame->at(in.target2);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::floats
@@ -618,7 +625,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* A scalar-result call evaluated into a temp (native builtin/call
              * dispatch): the result is then read as an int/float operand. */
-            ctx.frame->slots[in.target].put(RValue(in.node->eval(&ctx)));
+            ctx.frame->at(in.target).put(RValue(in.node->eval(&ctx)));
             pc++;
             break;
         }
@@ -637,11 +644,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 if (n <= 8) {
                     EvalValue stackbuf[8];
                     for (int_type i = 0; i < n; i++)
-                        stackbuf[i] = ctx.frame->slots[base + i].get();
-                    ctx.frame->slots[in.target].put(
+                        stackbuf[i] = ctx.frame->at(base + i).get();
+                    ctx.frame->at(in.target).put(
                         dc->builtin.func_v(&ctx, dc->args.get(), stackbuf, n));
                 } else {
-                    ctx.frame->slots[in.target].put(
+                    ctx.frame->at(in.target).put(
                         vm_call_builtin_big(ctx, dc, base, n));
                 }
             } catch (Exception &e) {
@@ -668,7 +675,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             LValue *target;
             switch (in.a.lit) {
             case 0:   /* local */
-                target = &ctx.frame->slots[in.target2];
+                target = &ctx.frame->at(in.target2);
                 break;
             case 1:   /* global */
                 target = ctx.gfuncs->defined[in.target2]
@@ -679,7 +686,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 break;
             }
             try {
-                ctx.frame->slots[in.target].put(
+                ctx.frame->at(in.target).put(
                     dc->builtin.func_lv(&ctx, dc->args.get(), target));
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -714,8 +721,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (!callee.is<intrusive_ptr<FuncObject>>())
                 throw NotCallableEx(call->start, call->end);
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
-            LValue *ap = &ctx.frame->slots[in.a.lit];
-            ctx.frame->slots[in.target].put(
+            LValue *ap = &ctx.frame->at(in.a.lit);
+            ctx.frame->at(in.target).put(
                 in.op == OpCode::CachedCallV
                     ? vm_cached_call(&ctx, fo, ap, in.b.lit, call->start)
                     : vm_call_func(&ctx, fo, ap, in.b.lit, call->start));
@@ -727,41 +734,41 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             /* `return <expr>`: the value is already in a.slot (a bare return
              * loaded `none`). Set flow and STOP the chunk, as an
              * EvalStmt(ReturnStmt) does; do_func_call reads flow->value. */
-            ctx.flow->value = ctx.frame->slots[in.a.slot].get();
+            ctx.flow->value = ctx.frame->at(in.a.slot).get();
             ctx.flow->type = FlowState::ret;
             return;
 
         case OpCode::ArrLen:
             /* n = size(array). The base is a flat array (ForeachStmt::elem_th
              * guarantees array<int>/array<float>), so read size() directly. */
-            ctx.frame->slots[in.target].put(EvalValue(static_cast<int_type>(
-                ctx.frame->slots[in.target2].get()
+            ctx.frame->at(in.target).put(EvalValue(static_cast<int_type>(
+                ctx.frame->at(in.target2).get()
                     .get_ref<SharedArrayObj>().size())));
             pc++;
             break;
 
         case OpCode::LoadImmInt:
-            ctx.frame->slots[in.target].put(
+            ctx.frame->at(in.target).put(
                 EvalValue(static_cast<int_type>(in.a.lit)));
             pc++;
             break;
 
         case OpCode::LoadImmFloat:
-            ctx.frame->slots[in.target].put(
+            ctx.frame->at(in.target).put(
                 EvalValue(static_cast<float_type>(in.a.flit)));
             pc++;
             break;
 
         case OpCode::LoadConstV:
-            ctx.frame->slots[in.target].put(chunk.consts[in.target2]);
+            ctx.frame->at(in.target).put(chunk.consts[in.target2]);
             pc++;
             break;
 
         case OpCode::MoveV:
             /* Alias, not clone (a container assignment shares the handle;
              * matches doAssign's `x = RValue(rval)` - COW protects later). */
-            ctx.frame->slots[in.target].put(
-                ctx.frame->slots[in.target2].get());
+            ctx.frame->at(in.target).put(
+                ctx.frame->at(in.target2).get());
             pc++;
             break;
 
@@ -784,7 +791,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 }
                 throw;
             }
-            ctx.frame->slots[in.target].put(std::move(val));
+            ctx.frame->at(in.target).put(std::move(val));
             pc++;
             break;
         }
@@ -794,7 +801,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * op mutates it in place), apply num_bin_op, store back - identical
              * to doAssign's compound branch. `b` may be an immediate. */
             EvalValue sb;
-            EvalValue nv = ctx.frame->slots[in.target].get();
+            EvalValue nv = ctx.frame->at(in.target).get();
             try {
                 num_bin_op(nv, boxed_operand(in.b, &ctx, sb),
                            binop_pmf(in.aop));
@@ -805,7 +812,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 }
                 throw;
             }
-            ctx.frame->slots[in.target].put(std::move(nv));
+            ctx.frame->at(in.target).put(std::move(nv));
             pc++;
             break;
         }
@@ -825,7 +832,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 }
                 throw;
             }
-            ctx.frame->slots[in.target].put(EvalValue(val.is_true()));
+            ctx.frame->at(in.target).put(EvalValue(val.is_true()));
             pc++;
             break;
         }
@@ -837,7 +844,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             EvalValue sa, sb;
             const bool a = boxed_operand(in.a, &ctx, sa).is_true();
             const bool b = boxed_operand(in.b, &ctx, sb).is_true();
-            ctx.frame->slots[in.target].put(
+            ctx.frame->at(in.target).put(
                 EvalValue(in.aop == Op::land ? (a && b) : (a || b)));
             pc++;
             break;
@@ -848,19 +855,19 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw UndefinedVariableEx(
                     static_cast<const Identifier *>(in.node)->get_str(),
                     in.node->start, in.node->end);
-            ctx.frame->slots[in.target].put(
+            ctx.frame->at(in.target).put(
                 ctx.gfuncs->slots[in.target2].get());
             pc++;
             break;
 
         case OpCode::LoadCaptureV:
-            ctx.frame->slots[in.target].put(
+            ctx.frame->at(in.target).put(
                 (*ctx.captures)[in.target2].get());
             pc++;
             break;
 
         case OpCode::LoadBuiltinV:
-            ctx.frame->slots[in.target].put(builtin_slot(in.target2).get());
+            ctx.frame->at(in.target).put(builtin_slot(in.target2).get());
             pc++;
             break;
 
@@ -868,11 +875,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             /* base[idx] read via the runtime Type::subscript (any base type -
              * array / dict / string), an LValue* to the base slot passed like
              * Subscript::do_eval, for_write=false, RValue'd into dst. */
-            LValue &base_lv = ctx.frame->slots[in.target2];
-            const EvalValue &idx = ctx.frame->slots[in.a.slot].get();
+            LValue &base_lv = ctx.frame->at(in.target2);
+            const EvalValue &idx = ctx.frame->at(in.a.slot).get();
             try {
                 Type *t = base_lv.get().get_type();
-                ctx.frame->slots[in.target].put(
+                ctx.frame->at(in.target).put(
                     RValue(t->subscript(EvalValue(&base_lv), idx, false)));
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -888,14 +895,14 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::MemberV:
             /* base.member value read via the shared member_read (struct field /
              * const / dict key / optional); errors carry the MemberExpr loc. */
-            ctx.frame->slots[in.target].put(
-                member_read(ctx.frame->slots[in.target2].get(),
+            ctx.frame->at(in.target).put(
+                member_read(ctx.frame->at(in.target2).get(),
                             static_cast<const MemberExpr *>(in.node)));
             pc++;
             break;
 
         case OpCode::JumpUnlessTrueV:
-            if (!ctx.frame->slots[in.target2].get().is_true())
+            if (!ctx.frame->at(in.target2).get().is_true())
                 pc = in.target;
             else
                 pc++;

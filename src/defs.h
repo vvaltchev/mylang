@@ -119,3 +119,27 @@ typedef intptr_t int_type;
 #  define ML_CHECK(cond)          ((void)0)
 #  define ML_CHECK_MSG(cond, msg) ((void)0)
 #endif
+
+/*
+ * ML_VM_CHECK - HEAVY per-op VM invariants (frame-slot bounds, ...): too hot
+ * for a plain release (a compare on every register access), but invaluable for
+ * exposing a LAYOUT-DEPENDENT UB - a bad slot index that silently reads an
+ * unconstructed/out-of-range LValue (garbage type pointer) crashes only on some
+ * toolchains, but the bounds check catches it EVERYWHERE, deterministically.
+ *
+ * Gated by ML_VM_HARDENING (and, like ML_CHECK, by NDEBUG). The BUILD sets the
+ * default: ON in a debug build, OFF in a plain release (speed) - the Makefile /
+ * CMake pass -DML_VM_HARDENING=0 for a release unless VM_HARDENING=1. CI turns
+ * it ON in the RELEASE lanes, so a CI release runs with far more safety than a
+ * local release. If undefined here, it defaults ON (fail safe).
+ */
+#ifndef ML_VM_HARDENING
+#  define ML_VM_HARDENING 1
+#endif
+#if ML_VM_HARDENING
+#  define ML_VM_CHECK(cond)          ML_CHECK(cond)
+#  define ML_VM_CHECK_MSG(cond, msg) ML_CHECK_MSG(cond, msg)
+#else
+#  define ML_VM_CHECK(cond)          ((void)0)
+#  define ML_VM_CHECK_MSG(cond, msg) ((void)0)
+#endif
