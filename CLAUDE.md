@@ -92,6 +92,16 @@ optimized build to measure the assertion overhead, e.g. `make OPT=1 ASSERTS=0`
 vs the default `make OPT=1`. **`RECYCLE` (default 0):** `make RECYCLE=1 TESTS=1`
 builds the adversarial node allocator (see *Invariants & hazards*).
 
+**Warnings-as-errors: `WERROR` (default 1).** Every build (both build systems,
+every type, ALL THREE compilers) treats a warning as an ERROR, so a warning
+CANNOT be pushed — it fails the build and must be addressed (see the warning
+rule under *Conventions*). GCC/Clang get `-Werror`; MSVC gets `/WX` (its CMake
+default level is `/W3`). CMake also gains the Makefile's `-Wall -Wextra
+-Wno-unused-parameter` for GCC/Clang (it set none before, so CI was laxer than a
+local build — that gap is why the MSVC narrowing/`getenv` warnings accumulated
+unnoticed). `make WERROR=0` (or CMake `-DWERROR=OFF`) opts out for a
+work-in-progress build.
+
 **VM hardening: `VM_HARDENING` (default = debug).** The heavy per-op VM
 invariants (`ML_VM_CHECK`, `defs.h`) — a **frame-slot bounds check on every
 register access** (`Frame::at`) plus an **operand type-tag check** in the VM's
@@ -119,7 +129,10 @@ relied-upon signed wraparound is defined in CMake builds too. It also has the
 **`-DASSERTS=ON/OFF`** (default ON; OFF defines `NDEBUG`, and since CMake's
 optimized configs add `-DNDEBUG` themselves, ASSERTS=ON appends `-UNDEBUG` to
 keep asserts in Release) and **`-DRECYCLE=ON/OFF`** (default OFF) options,
-mirroring the Makefile. CI (`.github/workflows/`) builds Debug+Release ×
+mirroring the Makefile. It ALSO now sets `-Wall -Wextra -Wno-unused-parameter`
+for GCC/clang (it set no warning flags before) and **`-DWERROR=ON/OFF`**
+(default ON) — warnings-as-errors (`-Werror` / MSVC `/WX`), matching the
+Makefile's `WERROR`. CI (`.github/workflows/`) builds Debug+Release ×
 g+++clang on Linux (plus a `RECYCLE=ON` lane), macOS (with libc++ hardening),
 and Windows, and runs `./mylang -rt` — correctness only, no timing, so the
 lanes carry as many checks as possible.

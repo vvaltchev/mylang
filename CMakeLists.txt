@@ -21,6 +21,7 @@ endif()
 set(TESTS         OFF CACHE BOOL   "Compile-in unit tests")
 set(GCOV          OFF CACHE BOOL   "Prepare a coverage build")
 set(LTO           ON  CACHE BOOL   "Link-time optimization (optimized configs)")
+set(WERROR        ON  CACHE BOOL   "Warnings are errors (-Werror / MSVC /WX)")
 
 # AddressSanitizer / UndefinedBehaviorSanitizer (GCC/Clang). Both default ON for
 # a Debug build and OFF otherwise - the analog of the Makefile's OPT=0 vs OPT=1.
@@ -99,11 +100,33 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
    endif()
 endif()
 
+# --- Warnings ---------------------------------------------------------------
+# CMake sets no -Wall by default; mirror the Makefile's warning set for
+# GCC/Clang so CI catches the same warnings a local build does. MSVC's CMake
+# default level is already /W3.  (Order matters below: -Wall first, then the
+# -Wno override, then -Werror last.)
+if (NOT MSVC)
+   target_compile_options(mylang PUBLIC -Wall -Wextra -Wno-unused-parameter)
+endif()
+
 # The codebase intentionally calls `move`/`forward` unqualified (see
 # `using std::move;` in defs.h), which recent clang reports under
-# -Wunqualified-std-cast-call. Silence it for clang only.
+# -Wunqualified-std-cast-call. Silence it for clang only (AFTER -Wall/-Wextra
+# so the -Wno wins).
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
    target_compile_options(mylang PUBLIC -Wno-unqualified-std-cast-call)
+endif()
+
+# WERROR (default ON, EVERY build type + compiler): a warning FAILS the build,
+# so it must be ADDRESSED, not left to accumulate in the log (see CLAUDE.md's
+# warning rule - MSVC in particular emits narrowing/deprecation warnings the
+# others don't). MSVC: /WX; GCC/Clang: -Werror. -DWERROR=OFF opts out.
+if (WERROR)
+   if (MSVC)
+      target_compile_options(mylang PUBLIC /WX)
+   else()
+      target_compile_options(mylang PUBLIC -Werror)
+   endif()
 endif()
 
 if (NOT MSVC)

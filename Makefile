@@ -17,6 +17,15 @@ ifneq (,$(findstring clang,$(shell $(CXX) --version 2>/dev/null)))
 	FL_WARN += -Wno-unqualified-std-cast-call
 endif
 
+# WERROR (default 1): a warning FAILS the build, so it must be addressed, not
+# left to accumulate (see CLAUDE.md's warning rule). Matches CMake's -DWERROR.
+# Appended AFTER the -Wno above so that override wins; WERROR=0 for a
+# work-in-progress build.
+WERROR ?= 1
+ifeq ($(WERROR),1)
+	FL_WARN += -Werror
+endif
+
 FL_OTHER ?= -fwrapv
 FL_INC = -I$(PROJ_ROOT)/src
 BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
