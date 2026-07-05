@@ -37,7 +37,7 @@ Order = manage risk first, biggest/most-valuable last. Each: implement -> fuzz
       DATA-DEPENDENT-bound `while (s < limit)` (bound changes during the loop;
       needs a guaranteed-progress counter to terminate). Reverse iteration +
       changing bounds.
-- [ ] **3. Nested arrays `M[i][j]`** - a real 2-D structure (an array of
+- [x] **3. Nested arrays `M[i][j]`** - a real 2-D structure (an array of
       arrays). Multi-level subscript load/store + COW on inner arrays. Identical
       syntax in both engines.
 - [ ] **4. Data-structure ops** - `pop`/`insert`/`erase` on the growing array

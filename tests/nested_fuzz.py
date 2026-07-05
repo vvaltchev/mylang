@@ -51,6 +51,7 @@ import tempfile
 MOD = 100
 ALEN = 7          # size of the fixed array A
 GCAP = 20         # cap on the growing array G (so len(G) stays small too)
+MDIM = 3          # M is an MDIM x MDIM nested array (2-D structure)
 
 
 class Gen:
@@ -101,6 +102,10 @@ class Gen:
         if d < 2 and r < 0.60:
             return "%s(%s, %s)" % (self.rng.choice(["max", "min"]),
                                    self.leaf(), self.leaf())
+        if d < 2 and r < 0.66:
+            # a 2-D array read M[i][j] (multi-level subscript load)
+            return "M[%s %% %d][%s %% %d]" % (self.leaf(), MDIM,
+                                              self.leaf(), MDIM)
         return self.leaf()
 
     def expr(self, d=0):
@@ -134,6 +139,7 @@ class Gen:
             (self.se_temp,    10),
             (self.se_foreach, 10),
             (self.se_ternary, 10),
+            (self.se_matrix,  12),
         ]
 
     def side_effect(self, im, ip):
@@ -198,6 +204,14 @@ class Gen:
         a, b = self.expr(), self.expr()
         self.emit(im + "%s = (%s ? %s : %s);" % (tgt, cond, a, b),
                   ip + "%s = (%s if %s else %s)" % (tgt, a, cond, b))
+
+    def se_matrix(self, im, ip):
+        # a 2-D array store M[i][j] = v (multi-level subscript store, inner COW).
+        # Identical syntax in both engines.
+        i = "%s %% %d" % (self.leaf(), MDIM)
+        j = "%s %% %d" % (self.leaf(), MDIM)
+        e = "M[%s][%s] = %s" % (i, j, self.expr())
+        self.emit(im + e + ";", ip + e)
 
     def build(self, level, im, ip):
         # a side effect at this level, then (if not innermost) a nested construct
@@ -306,6 +320,8 @@ class Gen:
         self.emit("var G = [0];", "G = [0]")
         self.emit("var D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0};",
                   "D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}")
+        self.emit("var M = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];",
+                  "M = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]")
         self.emit("var s0 = 0; var s1 = 1; var s2 = 2; var s3 = 3; "
                   "var s4 = 4; var s5 = 5; var s6 = 6;",
                   "s0 = 0; s1 = 1; s2 = 2; s3 = 3; s4 = 4; s5 = 5; s6 = 6")
@@ -324,6 +340,10 @@ class Gen:
              "for x in G: acc = (acc + x) % " + m),
             ("acc = (acc + len(G)) % " + m + ";",
              "acc = (acc + len(G)) % " + m),
+            ("foreach (var row in M) foreach (var x in row)"
+             " acc = (acc + x) % " + m + ";",
+             "for row in M:"),
+            ("", "    for x in row: acc = (acc + x) % " + m),
             ("acc = (acc + s0 + s1 + s2 + s3 + s4 + s5 + s6) % " + m + ";",
              "acc = (acc + s0 + s1 + s2 + s3 + s4 + s5 + s6) % " + m),
             ("acc = (acc + D[0] + D[1] + D[2] + D[3] + D[4]) % " + m + ";",
