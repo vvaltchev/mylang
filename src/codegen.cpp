@@ -2162,6 +2162,31 @@ struct Codegen {
                 ops.push_back(in);
                 return true;
             }
+
+            /* A STRUCT field store `s.f = v` / `s.f OP= v` -> StoreMemberV. The
+             * base must be a slotted local; the value is a boxed temp. The
+             * member uid + carets ride in the member-key pool (AST-free). */
+            if (m->base_struct) {
+                int sslot;
+                switch (e->op) {
+                case Op::assign: case Op::addeq: case Op::subeq:
+                case Op::muleq:  case Op::diveq: case Op::modeq: break;
+                default: return false;
+                }
+                if (!as_array_slot(m->what.get(), sslot))
+                    return false;
+                int vslot;
+                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
+                    return false;
+                Instr in;
+                in.op = OpCode::StoreMemberV;
+                in.target2 = sslot;
+                in.a = int_lit(add_member_key(m));   /* AST-free: pool index */
+                in.b = slot_op(vslot);
+                in.aop = e->op;
+                ops.push_back(in);
+                return true;
+            }
         }
 
         Operand dst;

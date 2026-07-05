@@ -15,7 +15,8 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 |---|---|---|---|---|
 | ~~**B**~~ | ~~bool array r/w~~ | ~~43,56,57~~ | ~~P1~~ | ✅ 43:.48 56:.15 |
 | ~~D1~~ | ~~dict store~~ | 5 | ~~P2~~ | ✅ .55/.43 |
-| **D1m** | dict MEMBER store `d.k=v` | (rare) | P2b | todo |
+| ~~D1m~~ | ~~dict MEMBER store `d.k=v`~~ | (rare) | P2b | ✅ DictStore (string key) |
+| ~~S1m~~ | ~~struct field store `s.f=v`~~ | 58,65 | — | ✅ StoreMemberV (POD/boxed) |
 | ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
 | ~~F1~~ | ~~foreach single-var gen arr~~ | (grp) | — | ✅ box-free LoadElem.v |
 | ~~F2~~ | ~~foreach INDEXED 2-var~~ | 19 | — | ✅ box-free (see "redo") |
@@ -100,8 +101,12 @@ first:
    (a handler stack + a pending-exception jump). One bench (~5% geomean) but the
    stated endgame + the single most-dramatic per-bench win.
 
-4. **Small residual fallbacks** (low value): a dict MEMBER store `d.k=v` (D1m,
-   rare); a GLOBAL/capture dict base; a nested general store `a[i][j]=v`; a
+4. **Small residual fallbacks** (low value): ~~a dict MEMBER store `d.k=v`
+   (D1m)~~ ✅ (DictStore, string key); ~~a struct field store `s.f=v` (S1m)~~ ✅
+   (StoreMemberV, POD byte store / boxed-field slot_rmw — gated on the
+   inferencer's `MemberExpr::base_struct`, base a slotted local; a flat-array
+   element `a[i].x=v` base is a pre-existing tree-walker NotLValueEx, unchanged);
+   a GLOBAL/capture dict base; a nested general store `a[i][j]=v`; a
    `global = <expr with a call>` loop driver (R/P10b, bench 10). Each is a
    contained op.
 

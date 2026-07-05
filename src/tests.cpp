@@ -7968,6 +7968,14 @@ static const std::vector<test> tests =
     { "struct: field write mutates in place",
       { "struct Point { int x; int y; } var p = Point(1, 2);",
         "p.x = 9; p.y = p.y + 1; assert(p == Point(9, 3));" } },
+    { "struct: field store in a loop (native StoreMemberV path)",
+      { "struct P { int x; float y; } var p = P(0, 0.0);",
+        "for (var i = 0; i < 5; i++) { p.x += i; p.y = p.x * 2; }",
+        "assert(p.x == 10); assert(p.y == 20.0);" } },
+    { "struct: boxed field store in a loop",
+      { "struct B { dyn? tag; int n; } var b = B(none, 0);",
+        "for (var i = 0; i < 3; i++) { b.tag = i; b.n += i; }",
+        "assert(b.tag == 2); assert(b.n == 3);" } },
     { "struct: assignment aliases (mutation is shared, Python-like)",
       { "struct Point { int x; int y; } var p = Point(1, 2); var q = p;",
         "p.x = 9; assert(q.x == 9);" } },
@@ -11435,7 +11443,7 @@ struct VmOpCounts {
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
-    size_t dictstore = 0, dictloadi = 0, dictloadf = 0;
+    size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
     int n_temps = 0;
 };
 
@@ -11490,6 +11498,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::SubscriptV:       c.subscriptv++; break;
             case OpCode::MemberV:          c.memberv++; break;
             case OpCode::DictStore:        c.dictstore++;  break;
+            case OpCode::StoreMemberV:     c.storememberv++; break;
             case OpCode::DictLoadInt:      c.dictloadi++;  break;
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
@@ -11955,6 +11964,18 @@ static bool vm_codegen_shapes()
         return false;
     const bool dict_member_ok = dms.evalstmt == 0 && dms.dictstore >= 1;
 
+    /* 34) a STRUCT field store `s.f = v` / `s.f OP= v` compiles to StoreMemberV
+     * (a POD field: coerce + byte store), not an EvalStmt fallback. */
+    VmOpCounts sms;
+    if (!codegen_counts({
+            "struct P { int x; int y; }",
+            "var p = P(0, 0);",
+            "for (var i = 0; i < 3; i++) { p.x += i; p.y = p.x * 2; }",
+        }, sms))
+        return false;
+    const bool struct_member_ok =
+        sms.evalstmt == 0 && sms.storememberv >= 2;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -11964,7 +11985,8 @@ static bool vm_codegen_shapes()
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok
         && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
-        && bool_cond_ok && var_init_ok && block_ok && dict_member_ok;
+        && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
+        && struct_member_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

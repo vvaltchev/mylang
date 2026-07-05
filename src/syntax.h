@@ -1611,6 +1611,9 @@ public:
     /* Set by the inferencer when `what` is statically a DICT (so `d.k` is a
      * dict key read, not a struct field). Gates the VM's P3 typed dict read. */
     bool base_dict = false;
+    /* Set by the inferencer when `what` is statically a STRUCT instance (so
+     * `s.f = v` is a field store). Gates the VM's native StoreMemberV. */
+    bool base_struct = false;
 
     MemberExpr() : Construct("MemberExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1626,6 +1629,7 @@ public:
         c->memUid = memUid;
         c->optional = optional;
         c->base_dict = base_dict;
+        c->base_struct = base_struct;
         return c;
     }
 };

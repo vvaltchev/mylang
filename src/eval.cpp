@@ -2818,6 +2818,52 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
     return slot_rmw(*elv.get<LValue *>(), op, value);
 }
 
+/*
+ * VM StoreMemberV: native `s.member = v` / `s.member OP= v` for a STRUCT base (a
+ * dict member store goes through DictStore). Mirrors try_pod_struct_store (a POD
+ * field: coerce + byte store) + the boxed-field lvalue store the tree-walker's
+ * handle_single_expr14 does, but AST-free: `base_lv` from a slot, the member's
+ * uid + carets from the member-key pool. Returns the stored value. A const /
+ * read-only struct throws NotLValueEx (the tree-walker's general-path error).
+ */
+EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
+                          const EvalValue &value,
+                          const Loc &mstart, const Loc &mend,
+                          const Loc &bstart, const Loc &bend)
+{
+    const EvalValue &dval = base_lv->get();
+    if (!dval.is<intrusive_ptr<StructObject>>())
+        throw TypeErrorEx("Expected struct object", bstart, bend);
+
+    StructObject &obj = *dval.get<intrusive_ptr<StructObject>>().get();
+    const int slot = obj.def->slot_of(memUid);
+    if (slot < 0)
+        throw TypeErrorEx(
+            intern_msg("Struct '" + string(obj.def->name->val) +
+                       "' has no member '" + string(memUid->val) + "'"),
+            mstart, mend);
+
+    if (base_lv->is_const_var() || obj.is_readonly())
+        throw NotLValueEx(mstart, mend);
+
+    if (obj.is_pod()) {
+        const EvalValue r = RValue(value);
+        EvalValue newval;
+        if (op == Op::assign) {
+            newval = r;
+        } else {
+            newval = obj.pod_get(slot);
+            apply_compound_op(newval, r, op);
+        }
+        newval = coerce_struct_field(obj.def->fields[slot], std::move(newval),
+                                     mstart, mend);
+        obj.pod_set(slot, newval);
+        return newval;
+    }
+
+    return slot_rmw(obj.fields[slot], op, value);   /* boxed field lvalue */
+}
+
 /* Read scalar field #fidx of element `idx` of a flat array<PodStruct> straight
  * from the bytes (the VM's LoadStructFieldInt/Float, the struct-foreach direct
  * read). `arrv` is the array value; the codegen proved it flat-struct + `idx`

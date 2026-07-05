@@ -331,6 +331,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.a, false) << "] " << o << " " << RI(in.b, false);
             break;
         }
+        case OpCode::StoreMemberV: {
+            /* aop is the Expr14 op; the member name comes from the pool. */
+            const char *o = in.aop == Op::assign ? "=" :
+                            in.aop == Op::addeq  ? "+=" :
+                            in.aop == Op::subeq  ? "-=" :
+                            in.aop == Op::muleq  ? "*=" :
+                            in.aop == Op::diveq  ? "/=" : "%=";
+            row << "member.store " << D(in.target2) << "."
+                << chunk.member_keys[in.a.lit].memId.get_type()
+                       ->to_string(chunk.member_keys[in.a.lit].memId)
+                << " " << o << " " << RI(in.b, false);
+            break;
+        }
         case OpCode::StoreElemValue: {
             const char *o = in.aop == Op::assign ? "=" :
                             in.aop == Op::addeq  ? "+=" :

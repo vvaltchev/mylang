@@ -990,6 +990,27 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::StoreMemberV: {
+            /* s.member = v / s.member OP= v for a STRUCT base (a dict member
+             * store uses DictStore). vm_member_store does the POD/boxed-field
+             * store; AST-free - the member uid + carets come from the pool. */
+            LValue &blv = ctx.frame->at(in.target2);
+            const Chunk::MemberKey &mk = chunk.member_keys[in.a.lit];
+            const EvalValue &val = ctx.frame->at(in.b.slot).get();
+            try {
+                vm_member_store(&blv, mk.memUid, in.aop, val,
+                                mk.mstart, mk.mend, mk.bstart, mk.bend);
+            } catch (Exception &e) {
+                if (!e.loc_start) {          /* a compound div/mod is loc-less */
+                    e.loc_start = mk.mstart;
+                    e.loc_end = mk.mend;
+                }
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::StoreElemValue: {
 
             /* a[i] = v / a[i] OP= v for a GENERAL array (P4): store via the

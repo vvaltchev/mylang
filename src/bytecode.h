@@ -229,6 +229,18 @@ enum class OpCode : unsigned char {
     DictStore,
 
     /*
+     * Native STRUCT field store `s.member = v` / `s.member OP= v` (residual).
+     * `target2` = the struct base's (local) slot, `a` = the member-key pool
+     * index (`a.lit`, giving memUid + carets), `b` = the VALUE (a boxed temp),
+     * `aop` = the Expr14 op. vm_member_store does the store (a POD field: coerce
+     * + byte pod_set; a boxed field: the field LValue + slot_rmw), matching the
+     * tree-walker's try_pod_struct_store / boxed-field store. A dict member
+     * store uses DictStore instead; emitted only for a proven struct base.
+     * AST-free: no `node`, carets from the member-key pool.
+     */
+    StoreMemberV,
+
+    /*
      * Native GENERAL array element store `a[i] = v` / `a[i] OP= v` (P4), where
      * the element is non-scalar (array/str/struct/dyn - the StoreElem* flat
      * fast paths don't apply). `target2` = the array's (local) slot, `a` = the

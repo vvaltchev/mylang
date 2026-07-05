@@ -1396,6 +1396,8 @@ void Inferencer::annotate_hints(Construct *n)
     if (auto *mem = dynamic_cast<MemberExpr *>(n)) {
         StaticTypeRef bt = static_type_resolve(type_of(mem->what.get()));
         mem->base_dict = bt->kind == StaticTypeKind::Dict;
+        /* a non-opt struct instance base -> native field store (StoreMemberV) */
+        mem->base_struct = bt->kind == StaticTypeKind::Struct && !bt->opt;
     }
 
     /* VM native-call hint: the callee is a user FUNCTION (Func static type -
