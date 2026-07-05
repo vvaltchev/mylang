@@ -11399,15 +11399,16 @@ static bool vm_codegen_shapes()
 
     /* 15) a native loop with a FLOW-FREE fallback body statement still goes
      * native AROUND the EvalStmt: the counted `for` compiles (ForLoopStep) with
-     * the native `s += i` and an EvalStmt for the still-fallback `sort(a)` (a
-     * builtin on the old lvalue ABI - most other flow-free statements, incl.
-     * array literals/append/general stores AND struct construction/decl, are
-     * now native). This lets a matrix/sieve outer loop go native despite a
-     * fallback body statement. */
+     * the native `s += i` and an EvalStmt for the still-fallback `map(...)` (an
+     * order-dependent builtin that must stay on the old ABI - it validates its
+     * function arg before evaluating the container; most other flow-free
+     * statements, incl. array literals/append/general stores, struct
+     * construction, AND sort/reverse, are now native). This lets a matrix/sieve
+     * outer loop go native despite a fallback body statement. */
     VmOpCounts ab;
     if (!codegen_counts({
             "var s = 0; var a = [3, 1, 2];",
-            "for (var i = 0; i < 5; i++) { s += i; sort(a); }",
+            "for (var i = 0; i < 5; i++) { s += i; map(func(e) => e, a); }",
         }, ab))
         return false;
     const bool array_build_ok =

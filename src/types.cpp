@@ -184,6 +184,22 @@ inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
     return make_pair(UniqueId::get(name), LValue(Builtin{f}, true));
 }
 
+/*
+ * A const, read-only-foldable builtin whose arg0 is an LVALUE (sort/reverse):
+ * `f` is the tree-walker / const-eval form (eval's arg0 itself), `flv` the VM's
+ * CallBuiltinLV form (handed arg0's slot LValue*). Both share a core so the two
+ * engines behave identically; it stays const so a const-array sort still folds
+ * at parse time. Unlike make_builtin_lv, `func` is NOT the generic adapter (it
+ * would pass a null target for a non-lvalue arg0, which sort/reverse accept).
+ */
+inline auto make_const_builtin_lv(const char *name, decltype(Builtin::func) f,
+                                  decltype(Builtin::func_lv) flv)
+{
+    Builtin b{f};        /* the custom func (value-or-lvalue arg0) */
+    b.func_lv = flv;     /* the VM's lvalue form */
+    return make_pair(UniqueId::get(name), LValue(b, true));
+}
+
 inline auto make_const_builtin(const char *name, float_type val)
 {
     return make_pair(UniqueId::get(name), LValue(val, true));
@@ -341,9 +357,9 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin_v<builtin_top>("top"),
     make_const_builtin_v<builtin_range>("range"),
     make_const_builtin_v<builtin_find>("find"),
-    make_const_builtin("sort", builtin_sort),
-    make_const_builtin("rev_sort", builtin_rev_sort),
-    make_const_builtin("reverse", builtin_reverse),
+    make_const_builtin_lv("sort", builtin_sort, builtin_sort_lv),
+    make_const_builtin_lv("rev_sort", builtin_rev_sort, builtin_rev_sort_lv),
+    make_const_builtin_lv("reverse", builtin_reverse, builtin_reverse_lv),
     make_const_builtin_v<builtin_sum>("sum"),
     make_const_builtin("map", builtin_map),
     make_const_builtin("filter", builtin_filter),

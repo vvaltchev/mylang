@@ -760,15 +760,22 @@ static void comparator_heapsort(Vec &vec, Cmp cmp)
     }
 }
 
+/*
+ * The sort core: `val0` is arg0's value, `lval` its LValue* (or null for a
+ * non-lvalue arg0) - used to sort a const's COPY (is_const_var) and to write a
+ * sorted SLICE back to its parent slot. Shared by the tree-walker/const-eval
+ * `func` (sort_arr, which eval's arg0) and the VM's `func_lv` (sort_lv, handed
+ * the slot's LValue* by CallBuiltinLV). The cmp arg (arg1) is self-eval'd off
+ * exprList in both paths.
+ */
 static EvalValue
-sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
+sort_core(EvalContext *ctx, ExprList *exprList, EvalValue val0, LValue *lval,
+          bool reverse)
 {
     if (exprList->elems.size() == 0)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &val0_lval = arg0->eval(ctx);
-    EvalValue val0 = RValue(val0_lval);
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
@@ -780,9 +787,8 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
      */
     if (val0.get<SharedArrayObj>().is_readonly()) {
         val0 = val0.clone();
-    } else if (val0_lval.is<LValue *>()) {
-        if (val0_lval.get<LValue *>()->is_const_var())
-            val0 = val0.clone();
+    } else if (lval && lval->is_const_var()) {
+        val0 = val0.clone();
     }
 
     SharedArrayObj &arr = val0.get<SharedArrayObj>();
@@ -791,8 +797,8 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 
         arr.clone_internal_vec();
 
-        if (val0_lval.is<LValue *>())
-            val0_lval.get<LValue *>()->put(arr);
+        if (lval)
+            lval->put(arr);
 
     } else {
 
@@ -914,6 +920,29 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
     return arr;
 }
 
+/* `func` entry (tree-walker / const-eval): eval arg0 - an lvalue or a value. */
+static EvalValue
+sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
+{
+    if (exprList->elems.size() == 0)
+        throw InvalidArgumentEx(exprList->start, exprList->end);
+    const EvalValue &val0_lval = exprList->elems[0]->eval(ctx);
+    LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
+                                            : nullptr;
+    return sort_core(ctx, exprList, RValue(val0_lval), lval, reverse);
+}
+
+/* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* is handed in (never
+ * null - CallBuiltinLV fires only for a slotted-id arg0). rest is unused: the
+ * cmp arg self-evals off exprList like the tree-walker. */
+static EvalValue
+sort_lv(EvalContext *ctx, ExprList *exprList, LValue *target,
+        const EvalValue *rest, size_t n_rest, bool reverse)
+{
+    return sort_core(ctx, exprList, RValue(EvalValue(target)), target,
+                     reverse);
+}
+
 EvalValue builtin_sort(EvalContext *ctx, ExprList *exprList)
 {
     return sort_arr(ctx, exprList, false);
@@ -924,14 +953,28 @@ EvalValue builtin_rev_sort(EvalContext *ctx, ExprList *exprList)
     return sort_arr(ctx, exprList, true);
 }
 
-EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
+EvalValue builtin_sort_lv(EvalContext *ctx, ExprList *exprList,
+                          LValue *target, const EvalValue *rest, size_t n)
+{
+    return sort_lv(ctx, exprList, target, rest, n, false);
+}
+
+EvalValue builtin_rev_sort_lv(EvalContext *ctx, ExprList *exprList,
+                              LValue *target, const EvalValue *rest, size_t n)
+{
+    return sort_lv(ctx, exprList, target, rest, n, true);
+}
+
+/* reverse core - `lval` (or null) as in sort_core (slice write-back). Preserves
+ * the original reverse (no const-copy: reverse has no 'const' contract). */
+static EvalValue
+reverse_core(EvalContext *ctx, ExprList *exprList, EvalValue val0,
+             LValue *lval)
 {
     if (exprList->elems.size() != 1)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
     Construct *arg0 = exprList->elems[0].get();
-    const EvalValue &val0_lval = arg0->eval(ctx);
-    EvalValue val0 = RValue(val0_lval);
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
@@ -942,8 +985,8 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
 
         arr.clone_internal_vec();
 
-        if (val0_lval.is<LValue *>())
-            val0_lval.get<LValue *>()->put(arr);
+        if (lval)
+            lval->put(arr);
 
     } else {
 
@@ -977,6 +1020,30 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
     }
 
     return arr;
+}
+
+/* `func` entry: eval arg0 (lvalue or value). */
+static EvalValue
+reverse_arr(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidArgumentEx(exprList->start, exprList->end);
+    const EvalValue &val0_lval = exprList->elems[0]->eval(ctx);
+    LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
+                                            : nullptr;
+    return reverse_core(ctx, exprList, RValue(val0_lval), lval);
+}
+
+EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
+{
+    return reverse_arr(ctx, exprList);
+}
+
+/* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* handed in. */
+EvalValue builtin_reverse_lv(EvalContext *ctx, ExprList *exprList,
+                             LValue *target, const EvalValue *rest, size_t n)
+{
+    return reverse_core(ctx, exprList, RValue(EvalValue(target)), target);
 }
 
 EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList,

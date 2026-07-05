@@ -27,17 +27,12 @@ builtin_x>("x")` (or `make_builtin_v` for a runtime builtin). A callback arg
 strictly SAFER than the old self-eval-temporary lifetime.
 
 ## MUST stay on `func` (do NOT migrate) — the documented floor
-Three reasons a read-only builtin can't take the value ABI:
+TWO reasons a read-only builtin can't take the value ABI (a third,
+lvalue-arg0, was RESOLVED — see below):
 - **Unevaluated / node-property operand:** `defined` (must not eval an undefined
   name), `isconst`/`isconstdecl` (read the *node's* compile-time `is_const`, not
   the value), `type`/`decltype`/`typestr`/`kindstr` (unevaluated operand, C++
   `decltype`-style), `show` (renders the arg's optimized tree).
-- **arg0 is an LVALUE, not a value:** `sort`/`rev_sort`/`reverse` read arg0's
-  `LValue*` to write back the sorted/reversed array (slice write-back) and to
-  sort a `const`'s copy (`is_const_var`). The value ABI RValue's it away. Pinned
-  by "Sort on slice"/"Reverse slice"/"sort of a const" (they'd need a
-  *const-capable lvalue ABI* — a follow-up, distinct from the mutating `func_lv`,
-  which is non-const).
 - **Order-dependent validation (lazy arg eval):** `map`/`filter` validate arg0
   (the function) and throw `TypeErrorEx` BEFORE evaluating arg1 (the container),
   so `map(5, undefined_var)` is a type error on the `5`, not
@@ -61,6 +56,23 @@ values` 0.82x, `31_str_split_join` 0.81x still old-ABI). Order:
 4. **num.cpp.h** — `rand` `randf`. **types.cpp** — `exit`.
 5. **reflect.cpp.h** — `signature` `specializations` `globals` `layout` `trace`
    `traceoff` `tracing` (NOT `show` — renders the arg's tree).
+
+**DONE (2026-07-08) — the lvalue-arg0 holdouts `sort`/`rev_sort`/`reverse` via a
+const-capable lvalue ABI.** `make_const_builtin_lv(name, func, func_lv)`
+registers a CUSTOM `func` (`sort_arr`/`reverse_arr` — the tree-walker/const-eval
+path, eval's arg0 as value-or-lvalue) + a `func_lv` (`sort_lv`/`reverse_lv` —
+the VM's `CallBuiltinLV` path, handed arg0's slot `LValue*`), both delegating to
+a shared `sort_core`/`reverse_core` (the const-copy + slice write-back keyed off
+an `LValue*` param, null for a non-lvalue arg0). Added to
+`is_lvalue_arg_builtin` so the resolver devirtualizes to `CallBuiltinLV` AND
+AutoConst/the specializer treat arg0 as a write position (no unsound const
+substitution). It stays `const` (folds a const-array sort at parse time); the
+cmp arg self-evals off `exprList` like the tree-walker. NOT the generic
+`make_builtin_lv` adapter (that passes a null target for a non-lvalue arg0,
+which sort/reverse accept but the adapter would mishandle). 1355/1355 +
+1204/1204, RECYCLE 2/2. `sort(a)`/`reverse(a)` are now `call.blt.lv`, so a
+reverse-in-a-loop (`21_array_reverse`) goes fully native. Only `map`/`filter`
+(order-dependent) + the AST builtins remain old-ABI.
 
 Built, `-rt` differential-green both engines (1305/1305 + 1156/1156),
 RECYCLE+ASan clean.

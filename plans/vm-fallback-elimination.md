@@ -52,17 +52,29 @@ struct, strings, slices, multi-assign, closures/func decls, structs) have all
 landed — see the tracker, not the prose. What genuinely REMAINS, most-valuable-
 first:
 
-1. **Builtin ABI holdouts — `sort`/`rev_sort`/`reverse` + `map`/`filter`.** The
-   read-only-builtin migration to the value ABI (`func_v` -> `CallBuiltinV`) is
-   otherwise complete; these five are the principled residue (see
-   `builtin-abi-migration.md`):
-   - `sort`/`rev_sort`/`reverse` take arg0 as an **LValue** (slice write-back +
-     a const-copy on a read-only array) - they need a future **const-capable
-     lvalue ABI**, not the plain value ABI.
-   - `map`/`filter` **validate arg0 (the function) and throw BEFORE evaluating
-     arg1** - the eager value ABI would change that order (pinned by their
-     "validates its function argument first" tests).
-   Benches: 33 (sort), 21 (reverse), 35 (map/filter). Each stays `EvalStmt`.
+1. **Builtin ABI holdouts.** ~~`sort`/`rev_sort`/`reverse`~~ **DONE**
+   (2026-07-08) — migrated to a const-capable lvalue ABI
+   (`make_const_builtin_lv` + a shared `sort_core`/`reverse_core`, `func` for
+   the tree-walker + `func_lv` for the VM's `CallBuiltinLV`; added to
+   `is_lvalue_arg_builtin`). `sort(a)`/`reverse(a)` are `call.blt.lv` now;
+   `21_array_reverse`'s reverse-in-a-loop goes native. See
+   `builtin-abi-migration.md`. Only **`map`/`filter`** remain: they **validate
+   arg0 (the function) and throw BEFORE evaluating arg1** — the eager value ABI
+   reorders that (pinned by the "validates its function arg first" tests).
+   A native map/filter needs an op that evaluates+validates arg0, THEN arg1.
+   Bench 35.
+
+   **AUDIT CORRECTION (2026-07-08):** the earlier per-bench `-vd` fallback
+   counts
+   were INFLATED by **dead template bodies** — a `func f` whose calls all
+   redirect to a native instance `func f$0` (the template is never compiled at
+   runtime). E.g. 43_sieve's 5 `eval.stmt` are all in the `compute_primes`
+   template; the `compute_primes$0` instance (the hot path) is fully native.
+   Excluding dead templates, the genuine LIVE fallbacks are: map/filter (35);
+   a scalar-spread multi-assign `a,b=0` (06/22, one-time setup); a big const
+   array literal (48/52, one-time); a `var dyn` foreach reduction (48_heavy);
+   exceptions (42). Audit with: for each chunk, a `name` is a dead template iff
+   some other chunk is `name$<digits>`.
 
 2. **Free the AST - drop `Instr::node`** (the node-field goal). The AST-free
    foundations exist (loc side table, const / member-key / struct-def / closure-

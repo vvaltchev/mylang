@@ -3145,14 +3145,22 @@ target falls back to build+append, matching the tree-walker). So a
 (defined/type/…, needs the arg node) keeps the union null and stays
 `EvalToSlot`. **The read-only builtin migration to `func_v` is
 complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose
-args are plain values now dispatches via `CallBuiltinV`, and the residual
-old-ABI (`func`, `EvalToSlot`) floor is exactly three principled groups — **AST
-builtins** (`defined`/`isconst`/`isconstdecl`/`type`/`decltype`/`typestr`/
-`kindstr`/`show`: unevaluated / node-property operand), **`sort`/`rev_sort`/
-`reverse`** (arg0 is an `LValue` for slice write-back + const-copy — need a
-future const-capable lvalue ABI), and **`map`/`filter`** (validate arg0 the
-function and throw BEFORE evaluating arg1, which the eager value ABI would
-change — pinned by their "validates its function argument first" tests).
+args are plain values now dispatches via `CallBuiltinV`. **`sort`/`rev_sort`/
+`reverse`** — whose arg0 is an `LValue` (slice write-back + a const's copy) —
+migrated to a **const-capable lvalue ABI**: `make_const_builtin_lv` registers a
+custom `func` (the tree-walker / const-eval path, `sort_arr`/`reverse_arr`,
+eval's arg0 as value-or-lvalue) PLUS a `func_lv` (`sort_lv`/`reverse_lv`,
+handed arg0's slot `LValue*` by the VM's `CallBuiltinLV`), sharing a
+`sort_core`/`reverse_core` so both engines behave identically and a const-array
+sort still folds at parse time. They're now in `is_lvalue_arg_builtin` (so the
+VM devirtualizes to `CallBuiltinLV`, and AutoConst/the specializer correctly
+treat arg0 as a write position — no unsound const substitution into a sort). The
+residual old-ABI (`func`, `EvalToSlot`) floor is now exactly two principled
+groups — **AST builtins** (`defined`/`isconst`/`isconstdecl`/`type`/`decltype`/
+`typestr`/`kindstr`/`show`: unevaluated / node-property operand) and
+**`map`/`filter`** (validate arg0 the function and throw BEFORE evaluating arg1,
+which the eager value ABI would change — pinned by their "validates its function
+argument first" tests).
 **A SUBSCRIPT lvalue target `append/push/pop(a[i], d[k])` goes native too
 (Phase 2c, `CallBuiltinLVElem`)**: the codegen compiles the index and records
 the base slot; the handler forms the element `LValue*` by calling the runtime
