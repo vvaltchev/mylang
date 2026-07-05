@@ -12,12 +12,25 @@
 
 namespace {
 
-/* An operand as "smart assembly": a register slot `rN` (unbounded - the VM's
- * registers ARE the frame slots) or an immediate `#N`. */
-std::string reg_or_imm(const Operand &o, bool is_float)
+/* A register slot as text: the source VARIABLE NAME for a resolved local
+ * (slot < slot_count), else `rN` for a scratch temp (the VM's registers ARE the
+ * frame slots; a temp has no name). So a loop reads `s = s + i`, not
+ * `r3 = r3 + r2`. */
+std::string reg(const Chunk &ch, int slot)
+{
+    if (slot >= 0 && slot < ch.slot_count
+        && static_cast<size_t>(slot) < ch.slot_names.size()
+        && !ch.slot_names[slot].empty())
+        return ch.slot_names[slot];
+    return "r" + std::to_string(slot);
+}
+
+/* An operand as "smart assembly": a register (named or `rN`) or an immediate
+ * `#N`. */
+std::string reg_or_imm(const Chunk &ch, const Operand &o, bool is_float)
 {
     if (!o.is_lit)
-        return "r" + std::to_string(o.slot);
+        return reg(ch, o.slot);
     std::ostringstream s;
     s << "#";
     if (is_float)
@@ -25,6 +38,35 @@ std::string reg_or_imm(const Operand &o, bool is_float)
     else
         s << o.lit;
     return s.str();
+}
+
+/* The callee's source name for a CallExpr node (`len`, `print`, `fib`, ...). */
+std::string callee_name(const Construct *node)
+{
+    if (auto *call = dynamic_cast<const CallExpr *>(node))
+        if (auto *id = dynamic_cast<const Identifier *>(call->what.get()))
+            return std::string(id->get_str());
+    return "?";
+}
+
+/* A call's argument registers as `(a, b, c)` from the run [base, base+n). */
+std::string arglist(const Chunk &ch, int base, int n)
+{
+    std::string s = "(";
+    for (int i = 0; i < n; i++) {
+        if (i)
+            s += ", ";
+        s += reg(ch, base + i);
+    }
+    return s + ")";
+}
+
+/* The Identifier name behind a load/global/capture/builtin op's node. */
+std::string node_name(const Construct *node)
+{
+    if (auto *id = dynamic_cast<const Identifier *>(node))
+        return std::string(id->get_str());
+    return "?";
 }
 
 std::string opsym(Op op)
@@ -86,7 +128,23 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
 {
     std::ostringstream s;
     s << "; ===== " << title << "  (" << chunk.code.size() << " instr, "
-      << chunk.n_temps << " temps) =====\n";
+      << chunk.n_temps << " temps) =====\n"
+      << "; registers: a source var reads by NAME; `rN` is a scratch temp\n";
+
+    /* Terse operand helpers bound to this chunk (names + immediates), and the
+     * `; source` comment column an op carries its AST snippet in. */
+    auto D  = [&](int slot)                 { return reg(chunk, slot); };
+    auto RI = [&](const Operand &o, bool f) { return reg_or_imm(chunk, o, f); };
+    auto cmt = [&](std::ostream &r, const Construct *n) {
+        if (n)
+            r << "   ; " << node1(n);
+    };
+    /* arg0's lvalue target for a CallBuiltinLV, by slot kind (a.lit). */
+    auto lval_ref = [&](int kind, int slot) -> std::string {
+        if (kind == 0) return "&" + reg(chunk, slot);        /* local */
+        if (kind == 1) return "&g" + std::to_string(slot);   /* global */
+        return "&c" + std::to_string(slot);                  /* capture */
+    };
 
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
         const Instr &in = chunk.code[pc];
@@ -106,132 +164,146 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "loop.back    cont=L" << in.target << " brk=L" << in.target2;
             break;
         case OpCode::IntBin:
-            row << "i.bin        r" << in.target << " = "
-                << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
-                << reg_or_imm(in.b, false);
+            row << "i.bin        " << D(in.target) << " = "
+                << RI(in.a, false) << " " << opsym(in.aop) << " "
+                << RI(in.b, false);
             break;
         case OpCode::JumpUnlessIntCmp:
-            row << "i.jmp.ifnot  " << reg_or_imm(in.a, false) << " "
-                << opsym(in.aop) << " " << reg_or_imm(in.b, false)
+            row << "i.jmp.ifnot  " << RI(in.a, false) << " "
+                << opsym(in.aop) << " " << RI(in.b, false)
                 << ", L" << in.target;
             break;
         case OpCode::FloatBin:
-            row << "f.bin        r" << in.target << " = "
-                << reg_or_imm(in.a, true) << " " << opsym(in.aop) << " "
-                << reg_or_imm(in.b, true);
+            row << "f.bin        " << D(in.target) << " = "
+                << RI(in.a, true) << " " << opsym(in.aop) << " "
+                << RI(in.b, true);
             break;
         case OpCode::JumpUnlessFloatCmp:
-            row << "f.jmp.ifnot  " << reg_or_imm(in.a, true) << " "
-                << opsym(in.aop) << " " << reg_or_imm(in.b, true)
+            row << "f.jmp.ifnot  " << RI(in.a, true) << " "
+                << opsym(in.aop) << " " << RI(in.b, true)
                 << ", L" << in.target;
             break;
         case OpCode::ForLoopStep:
-            row << "for.step     r" << in.target2 << " "
+            row << "for.step     " << D(in.target2) << " "
                 << (in.aop == Op::lt || in.aop == Op::le ? "+=" : "-=") << " "
-                << reg_or_imm(in.b, false) << ", if r" << in.target2 << " "
-                << opsym(in.aop) << " " << reg_or_imm(in.a, false)
+                << RI(in.b, false) << ", if " << D(in.target2) << " "
+                << opsym(in.aop) << " " << RI(in.a, false)
                 << " -> L" << in.target;
             break;
         case OpCode::LoadElemInt:
-            row << "load.elem.i  r" << in.target << " = r" << in.target2
-                << "[" << reg_or_imm(in.a, false) << "]";
+            row << "load.elem.i  " << D(in.target) << " = " << D(in.target2)
+                << "[" << RI(in.a, false) << "]";
             break;
         case OpCode::LoadElemFloat:
-            row << "load.elem.f  r" << in.target << " = r" << in.target2
-                << "[" << reg_or_imm(in.a, false) << "]";
+            row << "load.elem.f  " << D(in.target) << " = " << D(in.target2)
+                << "[" << RI(in.a, false) << "]";
             break;
         case OpCode::LoadElemValue:
-            row << "load.elem.v  r" << in.target << " = r" << in.target2
-                << "[" << reg_or_imm(in.a, false) << "]  (array elem)";
+            row << "load.elem.v  " << D(in.target) << " = " << D(in.target2)
+                << "[" << RI(in.a, false) << "]";
             break;
         case OpCode::ArrLen:
-            row << "arr.len      r" << in.target << " = len(r"
-                << in.target2 << ")";
+            row << "arr.len      " << D(in.target) << " = len("
+                << D(in.target2) << ")";
             break;
         case OpCode::StoreElemInt:
-            row << "store.elem.i r" << in.target2 << "["
-                << reg_or_imm(in.a, false) << "] " << store_op(in.aop) << " "
-                << reg_or_imm(in.b, false);
+            row << "store.elem.i " << D(in.target2) << "["
+                << RI(in.a, false) << "] " << store_op(in.aop) << " "
+                << RI(in.b, false);
             break;
         case OpCode::StoreElemFloat:
-            row << "store.elem.f r" << in.target2 << "["
-                << reg_or_imm(in.a, false) << "] " << store_op(in.aop) << " "
-                << reg_or_imm(in.b, true);
+            row << "store.elem.f " << D(in.target2) << "["
+                << RI(in.a, false) << "] " << store_op(in.aop) << " "
+                << RI(in.b, true);
             break;
         case OpCode::EvalToSlot:
-            row << "eval.slot    r" << in.target << " = " << node1(in.node);
+            row << "eval.slot    " << D(in.target) << " = " << node1(in.node);
             break;
         case OpCode::CallBuiltinV:
-            row << "call.blt.v   r" << in.target << " = " << node1(in.node);
+            row << "call.blt.v   " << D(in.target) << " = "
+                << callee_name(in.node)
+                << arglist(chunk, in.a.lit, in.b.lit);
+            cmt(row, in.node);
             break;
         case OpCode::CallBuiltinLV:
-            row << "call.blt.lv  r" << in.target << " = " << node1(in.node)
-                << "  (&r" << in.target2 << ")";
+            row << "call.blt.lv  " << D(in.target) << " = "
+                << callee_name(in.node)
+                << "(" << lval_ref(in.a.lit, in.target2) << ", ...)";
+            cmt(row, in.node);
             break;
         case OpCode::CallV:
-            row << "call.v       r" << in.target << " = g" << in.target2
-                << "(r" << in.a.lit << "..+" << in.b.lit << ")";
+            row << "call.v       " << D(in.target) << " = "
+                << callee_name(in.node)
+                << arglist(chunk, in.a.lit, in.b.lit);
+            cmt(row, in.node);
             break;
         case OpCode::CachedCallV:
-            row << "call.cached  r" << in.target << " = g" << in.target2
-                << "(r" << in.a.lit << "..+" << in.b.lit << ")";
+            row << "call.cached  " << D(in.target) << " = "
+                << callee_name(in.node)
+                << arglist(chunk, in.a.lit, in.b.lit);
+            cmt(row, in.node);
             break;
         case OpCode::ReturnV:
-            row << "return.v     " << reg_or_imm(in.a, false);
+            row << "return.v     " << RI(in.a, false);
             break;
         case OpCode::LoadImmInt:
-            row << "load         r" << in.target << ", #" << in.a.lit;
+            row << "load         " << D(in.target) << ", #" << in.a.lit;
             break;
         case OpCode::LoadImmFloat:
-            row << "load         r" << in.target << ", #" << in.a.flit;
+            row << "load         " << D(in.target) << ", #" << in.a.flit;
             break;
         case OpCode::LoadConstV: {
             const EvalValue &c = chunk.consts[in.target2];
-            row << "load.v       r" << in.target << ", "
+            row << "load         " << D(in.target) << ", "
                 << c.get_type()->to_string_repr(c);
             break;
         }
         case OpCode::MoveV:
-            row << "move.v       r" << in.target << " = r" << in.target2;
+            row << "move         " << D(in.target) << " = " << D(in.target2);
             break;
         case OpCode::BinOpV:
-            row << "bin.v        r" << in.target << " = "
-                << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
-                << reg_or_imm(in.b, false);
+            row << "bin.v        " << D(in.target) << " = "
+                << RI(in.a, false) << " " << opsym(in.aop) << " "
+                << RI(in.b, false) << "   ; boxed";
             break;
         case OpCode::CompoundV:
-            row << "compound.v   r" << in.target << " " << opsym(in.aop)
-                << "= " << reg_or_imm(in.b, false);
+            row << "compound.v   " << D(in.target) << " " << opsym(in.aop)
+                << "= " << RI(in.b, false) << "   ; boxed";
             break;
         case OpCode::CmpV:
-            row << "cmp.v        r" << in.target << " = "
-                << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
-                << reg_or_imm(in.b, false);
+            row << "cmp.v        " << D(in.target) << " = "
+                << RI(in.a, false) << " " << opsym(in.aop) << " "
+                << RI(in.b, false) << "   ; boxed";
             break;
         case OpCode::LogV:
-            row << "log.v        r" << in.target << " = "
-                << reg_or_imm(in.a, false) << " " << opsym(in.aop) << " "
-                << reg_or_imm(in.b, false);
+            row << "log.v        " << D(in.target) << " = "
+                << RI(in.a, false) << " " << opsym(in.aop) << " "
+                << RI(in.b, false) << "   ; boxed";
             break;
         case OpCode::LoadGlobalV:
-            row << "load.global  r" << in.target << ", g" << in.target2;
+            row << "load.global  " << D(in.target) << ", "
+                << node_name(in.node);
             break;
         case OpCode::LoadCaptureV:
-            row << "load.capture r" << in.target << ", c" << in.target2;
+            row << "load.capture " << D(in.target) << ", "
+                << node_name(in.node);
             break;
         case OpCode::LoadBuiltinV:
-            row << "load.builtin r" << in.target << ", b" << in.target2;
+            row << "load.builtin " << D(in.target) << ", "
+                << node_name(in.node);
             break;
         case OpCode::SubscriptV:
-            row << "subscript.v  r" << in.target << " = r" << in.target2
-                << "[" << reg_or_imm(in.a, false) << "]";
+            row << "subscript.v  " << D(in.target) << " = " << D(in.target2)
+                << "[" << RI(in.a, false) << "]";
+            cmt(row, in.node);
             break;
         case OpCode::MemberV:
-            row << "member.v     r" << in.target << " = r" << in.target2
+            row << "member.v     " << D(in.target) << " = " << D(in.target2)
                 << ".<member>";
+            cmt(row, in.node);
             break;
         case OpCode::JumpUnlessTrueV:
-            row << "jmp.ifnot.v  r" << in.target2 << ", L" << in.target;
+            row << "jmp.ifnot.v  " << D(in.target2) << ", L" << in.target;
             break;
         case OpCode::Halt:
             row << "halt";

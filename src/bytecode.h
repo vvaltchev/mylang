@@ -357,4 +357,14 @@ struct Chunk {
      * a literal operand.
      */
     std::vector<EvalValue> consts;
+    /*
+     * Debug info for the disassembler (-vd) ONLY - not consulted by the VM.
+     * `slot_count` = the number of resolved-local slots; a register below
+     * slot_count is a named variable, at/above it a scratch temp.
+     * `slot_names[s]` is
+     * that local's source name (empty for an unnamed/temp slot), so `-vd` can
+     * print `s = s + i` instead of `r3 = r3 + r2`. Populated by codegen.
+     */
+    int slot_count = 0;
+    std::vector<std::string> slot_names;
 };

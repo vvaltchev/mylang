@@ -7,6 +7,75 @@
 
 namespace {
 
+/*
+ * Collect resolved-LOCAL slot -> source name into `names` (debug info for the
+ * -vd disassembler ONLY; the VM never reads it). A recursive walk over the
+ * common node kinds - via the generic base classes (SingleChild / MultiOp /
+ * MultiElem) plus the multi-field statements - so `for (var i...) s += i` reads
+ * with names. It need not be exhaustive: a local under a node kind not covered
+ * here simply shows as a scratch-style `rN` (harmless for a debug dump).
+ */
+void collect_slot_names(const Construct *c, std::vector<std::string> &names)
+{
+    if (!c)
+        return;
+    if (auto *id = dynamic_cast<const Identifier *>(c)) {
+        if (id->sym.kind == SymKind::local && id->sym.slot >= 0) {
+            if (static_cast<size_t>(id->sym.slot) >= names.size())
+                names.resize(id->sym.slot + 1);
+            if (names[id->sym.slot].empty())
+                names[id->sym.slot] = std::string(id->get_str());
+        }
+        return;
+    }
+    auto rec = [&](const Construct *ch) { collect_slot_names(ch, names); };
+    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c)) {
+        rec(sc->elem.get()); return;
+    }
+    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+        for (auto &p : mo->elems) rec(p.second.get());
+        return;
+    }
+    if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
+        for (auto &e : me->elems) rec(e.get());
+        return;
+    }
+    if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+        rec(e->lvalue.get()); rec(e->rvalue.get()); return;
+    }
+    if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
+        rec(ce->what.get()); rec(ce->args.get()); return;
+    }
+    if (auto *sub = dynamic_cast<const Subscript *>(c)) {
+        rec(sub->what.get()); rec(sub->index.get()); return;
+    }
+    if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+        rec(m->what.get()); return;
+    }
+    if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
+        rec(iff->condExpr.get()); rec(iff->thenBlock.get());
+        rec(iff->elseBlock.get()); return;
+    }
+    if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+        rec(w->condExpr.get()); rec(w->body.get()); return;
+    }
+    if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+        rec(f->init.get()); rec(f->cond.get());
+        rec(f->inc.get()); rec(f->body.get()); return;
+    }
+    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+        rec(fr->init.get()); rec(fr->bound.get());
+        rec(fr->step.get()); rec(fr->body.get()); return;
+    }
+    if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+        rec(fe->container.get()); rec(fe->body.get()); return;
+    }
+    if (auto *te = dynamic_cast<const TernaryExpr *>(c)) {
+        rec(te->condExpr.get()); rec(te->thenExpr.get());
+        rec(te->elseExpr.get()); return;
+    }
+}
+
 Operand int_lit(int_type v)
 {
     Operand o;
@@ -1998,6 +2067,8 @@ codegen_chunk(const Block *block, int slot_count)
     cg.gen_stmts(block->elems);
     cg.emit(OpCode::Halt);
     cg.chunk.n_temps = cg.max_temp - slot_count;
+    cg.chunk.slot_count = slot_count;
+    collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     return std::move(cg.chunk);
 }
 
