@@ -2891,9 +2891,15 @@ native** (a plain CallV would BYPASS the cache and recompute the exponential).
 A **read-only builtin** with the VALUE ABI (`Builtin::func_v` — args
 pre-evaluated, no `node->eval`; set by `make_const_builtin_v`, which also
 registers a generic adapter as the tree-walker's `func`) dispatches natively via
-`CallBuiltinV`; a mutating (append/pop/…, need an lvalue arg) / AST
-(defined/type/…, need the node) / un-migrated builtin keeps `func_v == null` and
-stays EvalToSlot. Still fallbacks: those builtins, struct construction. Gated by
+`CallBuiltinV`. A **mutating builtin** (append/pop/insert/erase/intptr) uses the
+**lvalue ABI** (`Builtin::func_lv` — a UNION with `func_v`, discriminated by
+`DirectBuiltinCallExpr::lvalue_arg0`; set by `make_builtin_lv`): it gets arg0 as
+an `LValue*` target and self-evaluates its remaining args (so append keeps
+construct-in-place), dispatching via **`CallBuiltinLV`** when arg0 is a slotted
+identifier (local/global/capture — the op forms the `LValue*` straight from the
+table). An **AST builtin** (defined/type/…, needs the arg node) keeps the union
+null and stays `EvalToSlot`. Still fallbacks: AST builtins, a subscript/member
+lvalue target (`append(a[i], …)` — Phase 2), struct construction. Gated by
 the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the
