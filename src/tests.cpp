@@ -3892,6 +3892,29 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* P1: the VM's native bool-array element store (StoreElemInt bool
+         * branch) - a literal RHS, a bool-var RHS, a comparison RHS, all in a
+         * loop, plus a slice-store COW check. The differential runs it under
+         * both engines. */
+        "array<bool>: in-loop store/read + COW (VM native bool store)",
+        {
+            "var b = [false, false, false, false, false, false];",
+            "for (var i = 0; i < 6; i++) if (i % 2 == 0) b[i] = true;",
+            "assert(b == [true, false, true, false, true, false]);",
+            "var c = 0;",
+            "foreach (var e in b) if (e) c++;",
+            "assert(c == 3);",
+            "assert(array_storage(b) == \"bool\");",
+            "var flag = false; b[0] = flag;",
+            "b[1] = (c > 2);",
+            "assert(b == [false, true, true, false, true, false]);",
+            "var s = b[0:3];",
+            "s[0] = true;",
+            "assert(s == [true, true, true]);",
+            "assert(b == [false, true, true, false, true, false]);",
+        },
+    },
+    {
         "array<bool>: sum counts trues (as int), min/max",
         {
             "var b = [true, false, true, true];",

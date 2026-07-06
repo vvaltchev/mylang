@@ -623,14 +623,19 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::StoreElemInt: {
 
             /* a[i] = v / a[i] OP= v for a flat mutable int array (mirrors the
-             * int path of try_flat_subscript_store, incl. COW); anything else
-             * (const / read-only / general / bool / dyn) falls back to the node
-             * - sound because a compiled rvalue is side-effect-free, so re-eval
-             * is exact. */
+             * int path of try_flat_subscript_store, COW), and a[i] = <bool>
+             * for a flat bool array (P1: plain assign only - no compound
+             * for bool; the value operand is the bool's 0/1, written to bvec).
+             * Anything else (const / read-only / general / float / dyn, or a
+             * COMPOUND on a bool array) falls back to node - sound because a
+             * compiled rvalue is side-effect-free, so re-eval is exact. */
             LValue &alv = ctx.frame->at(in.target2);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
-                if (arr.skind() == SharedArrayObj::Storage::ints
+                const auto sk = arr.skind();
+                const bool is_bool = sk == SharedArrayObj::Storage::bools;
+                if ((sk == SharedArrayObj::Storage::ints
+                     || (is_bool && in.aop == Op::invalid))
                     && !alv.is_const_var() && !arr.is_readonly()) {
                     int_type idx = read_int_operand(in.a, &ctx);
                     if (idx < 0)
@@ -646,6 +651,12 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
                         arr.clone_aliased_slices(arr.offset() + idx);
+                    if (is_bool) {
+                        arr.flat_bools()[arr.offset() + idx] = rhs ? 1 : 0;
+                        arr.invalidate_hash();
+                        pc++;
+                        break;
+                    }
                     int_type &el = arr.flat_ints()[arr.offset() + idx];
                     switch (in.aop) {
                     case Op::invalid: el = rhs;  break;

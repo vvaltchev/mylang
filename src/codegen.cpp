@@ -1231,8 +1231,18 @@ struct Codegen {
             if (!as_array_slot(sub->what.get(), aslot))
                 return false;
             Operand val, idx;
-            if (!compile_int_expr(e->rvalue.get(), val, ops)
-                || !compile_int_expr(sub->index.get(), idx, ops))
+            /* A bool-literal RHS (`a[i]=true/false`, common in bool arrays)
+             * is a 0/1 int operand: the StoreElemInt bool branch writes it to
+             * bvec, or an int array stores the promoted 0/1. LOCAL to the
+             * store (not in as_int_operand) so a bool literal stays a real bool
+             * in the boxed path. A bool VAR / comparison RHS compiles via
+             * compile_int_expr (th==i). rhs-before-index order is preserved. */
+            if (const LiteralBool *lb =
+                    dynamic_cast<const LiteralBool *>(e->rvalue.get()))
+                val = int_lit(lb->bval() ? 1 : 0);
+            else if (!compile_int_expr(e->rvalue.get(), val, ops))
+                return false;
+            if (!compile_int_expr(sub->index.get(), idx, ops))
                 return false;
             Instr in;
             in.op = OpCode::StoreElemInt;

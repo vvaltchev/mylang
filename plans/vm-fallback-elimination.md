@@ -1,6 +1,37 @@
 # VM fallback elimination + optimization — road to 5× CPython
 
-**Goal:** lift the `-vm` geomean from **~4.0× CPython** to **5×**.
+**Goal:** **5× is the FLOOR, not the target.** The per-benchmark table shows the
+native benches already run 5–7× CPython, so the ceiling is well above 5× once
+the fallbacks are gone. **No possible optimization is skipped** — pursue every
+category below and every Part-C idea until the VM's own dispatch is the only
+floor left.
+
+## Progress tracker (update every step — strike a row when it lands)
+
+Hot fallback categories, most-benchmarks-first. Strike + date a row when its op
+lands and the differential/bench confirm it; keep it (struck) for the record.
+
+| Cat | Construct | Benches | Fix (Part B) | Status |
+|---|---|---|---|---|
+| ~~**B**~~ | ~~bool array r/w~~ | ~~43,56,57~~ | ~~P1~~ | ✅ 43:.48 56:.15 |
+| **D1** | dict store `d[k]=v`, `d.k=v` | 23,24,26,27,47,62 | P2 | todo |
+| **D2** | typed dict read `d.k`/`d[k]` int/float | 25 | P3 | todo |
+| **D3** | dict `foreach(k,v in d)` | 26,47,62 | P5c | todo |
+| **G** | general array store `a[i]=<non-scalar>` | 46,20,31,32,47 | P4 | todo |
+| **F** | foreach unpack/indexed | 19,20 | P5a/b | todo |
+| **S** | string element `s[i]`, build | 29,30,31,32 | P7 | todo |
+| **M** | multi-assign / IdList | 22,06 | P9 | todo |
+| **C** | closure / indirect call `c()` | 11 | P6 | todo |
+| **R** | call-in-global-assign `r=f(n)+900` | 10 | P10b | todo |
+| **A** | `push(a,i)` value self-eval | 13 | P10a | todo |
+| **X** | try/catch + C++ `throw` | 42 (24.5×) | P8 | todo |
+
+Plus the Part-C native-but-slow work (typed reads, computed-goto dispatch,
+arg-view builtin ABI, ...) — none skipped.
+
+**Goal restated:** lift the `-vm` geomean from **~4.0× CPython** to **5×+**.
+Progress: **P1 done → 3.76×→3.82×** (bool sieve now native; the 60-bench
+geomean, `run.py`'s 61-set reads ~4.0×).
 
 **Method:** ran `mylang -vd` on all 62 `bench/my/*.my` and recorded every
 AST-fallback op (`eval.stmt` = `EvalStmt`, `eval.slot` = `EvalToSlot` — the two

@@ -132,12 +132,15 @@ enum class OpCode : unsigned char {
      * mutable int/float array it stores/updates the scalar directly, mirroring
      * try_flat_subscript_store (bounds, negative wrap, div/mod-by-zero checked
      * BEFORE any clone like the tree-walker, COW: a slice clones, an aliased
-     * non-slice clones its live slices; then invalidate the cached hash). For a
-     * const/read-only / general / bool / dyn-laundered base it falls back to
-     * `node->eval` - SOUND because a compiled rvalue has no side effects, so
-     * re-evaluating it is exact. The value ops are emitted before the index ops
-     * so a both-throw case matches the tree-walker (rhs before index). Int /
-     * float value variants.
+     * non-slice clones its live slices; then invalidate the hash). A flat
+     * BOOL array is handled too (P1), PLAIN-assign only (`aop == invalid`) -
+     * bool has no compound - writing the value operand's 0/1 to bvec.
+     * For a const/read-only / general / float-in-StoreElemInt / dyn-laundered
+     * base, or a compound on a bool array, falls back to `node->eval` - SOUND
+     * because a compiled rvalue has no side effects, so re-evaluating it is
+     * exact. Value ops are emitted before the index ops so a both-throw case
+     * matches the tree-walker (rhs before index). Int / float value variants
+     * (the int variant carries bool arrays too; LoadElemInt reads them).
      */
     StoreElemInt,
     StoreElemFloat,
