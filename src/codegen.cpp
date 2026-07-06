@@ -3000,43 +3000,74 @@ struct Codegen {
      * EvalStmt (flow-crossing-try is a later increment). Conservative: flags a
      * break/continue even inside a NESTED loop in the body (safe, rare in a try
      * body). Does NOT descend into a nested function (its flow is local). */
-    static bool contains_escaping_flow(const Construct *c)
+    /* P8 Inc 2c: does `c` contain a break/continue (bc) and/or a return (ret)
+     * that would cross a try boundary? Such a flow op must pop the try's handler
+     * and run its finally before jumping. Descends into nested loops/ifs/trys
+     * but NOT nested functions (their flow is local). Conservative for
+     * break/continue: flags one even inside a nested loop that wouldn't actually
+     * escape (safe, rare in a try body). */
+    static bool has_flow(const Construct *c, bool bc, bool ret)
     {
         if (!c)
             return false;
-        if (dynamic_cast<const BreakStmt *>(c)
-            || dynamic_cast<const ContinueStmt *>(c)
-            || dynamic_cast<const ReturnStmt *>(c))
-            return true;   /* rethrow is native (Inc 2a) - not a flow escape */
+        if (bc && (dynamic_cast<const BreakStmt *>(c)
+                   || dynamic_cast<const ContinueStmt *>(c)))
+            return true;
+        if (ret && dynamic_cast<const ReturnStmt *>(c))
+            return true;
         if (dynamic_cast<const FuncDeclStmt *>(c))
             return false;                    /* a nested function's flow is local */
         if (const Block *b = dynamic_cast<const Block *>(c)) {
             for (const auto &e : b->elems)
-                if (contains_escaping_flow(e.get()))
+                if (has_flow(e.get(), bc, ret))
                     return true;
             return false;
         }
         if (const IfStmt *f = dynamic_cast<const IfStmt *>(c))
-            return contains_escaping_flow(f->thenBlock.get())
-                || contains_escaping_flow(f->elseBlock.get());
+            return has_flow(f->thenBlock.get(), bc, ret)
+                || has_flow(f->elseBlock.get(), bc, ret);
         if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(c))
-            return contains_escaping_flow(w->body.get());
+            return has_flow(w->body.get(), bc, ret);
         if (const ForStmt *fs = dynamic_cast<const ForStmt *>(c))
-            return contains_escaping_flow(fs->body.get());
+            return has_flow(fs->body.get(), bc, ret);
         if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(c))
-            return contains_escaping_flow(fr->body.get());
+            return has_flow(fr->body.get(), bc, ret);
         if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(c))
-            return contains_escaping_flow(fe->body.get());
+            return has_flow(fe->body.get(), bc, ret);
         if (const TryCatchStmt *t = dynamic_cast<const TryCatchStmt *>(c)) {
-            if (contains_escaping_flow(t->tryBody.get())
-                || contains_escaping_flow(t->finallyBody.get()))
+            if (has_flow(t->tryBody.get(), bc, ret)
+                || has_flow(t->finallyBody.get(), bc, ret))
                 return true;
             for (const auto &cs : t->catchStmts)
-                if (contains_escaping_flow(cs.second.get()))
+                if (has_flow(cs.second.get(), bc, ret))
                     return true;
             return false;
         }
         return false;                        /* an expression statement */
+    }
+
+    /* A break/continue crossing this try (all its bodies) - Inc 2c step 3. */
+    bool try_has_break_continue(const TryCatchStmt *t)
+    {
+        if (has_flow(t->tryBody.get(), true, false)
+            || has_flow(t->finallyBody.get(), true, false))
+            return true;
+        for (const auto &cs : t->catchStmts)
+            if (has_flow(cs.second.get(), true, false))
+                return true;
+        return false;
+    }
+
+    /* A return crossing this try (all its bodies). */
+    bool try_has_return(const TryCatchStmt *t)
+    {
+        if (has_flow(t->tryBody.get(), false, true)
+            || has_flow(t->finallyBody.get(), false, true))
+            return true;
+        for (const auto &cs : t->catchStmts)
+            if (has_flow(cs.second.get(), false, true))
+                return true;
+        return false;
     }
 
     /*
@@ -3065,17 +3096,22 @@ struct Codegen {
     {
         const bool has_fin = t->finallyBody != nullptr;
 
-        if (contains_escaping_flow(t->tryBody.get()))
-            return false;                              /* flow crossing: Inc 2c */
+        /* A break/continue crossing the try must pop the handler (+ run finally)
+         * before jumping - Inc 2c step 3, still deferred. */
+        if (try_has_break_continue(t))
+            return false;
+        /* A resolved (frame-slot) catch var only; the REPL's map var falls back. */
         for (const auto &cs : t->catchStmts) {
-            if (contains_escaping_flow(cs.second.get()))
-                return false;
             const Identifier *asId = cs.first.asId.get();
             if (asId && asId->sym.kind != SymKind::local)
-                return false;                  /* REPL: non-slot catch var */
+                return false;
         }
-        if (has_fin && contains_escaping_flow(t->finallyBody.get()))
-            return false;                      /* flow in a finally: later */
+        /* A `return` that crosses a FINALLY must run it first - Inc 2c step 2,
+         * deferred - so fall back. WITHOUT a finally, a return -> ReturnV exits
+         * the chunk (the handler stack, a vm_run_chunk local, is destroyed), so
+         * it needs no handler-pop and no finally: allowed (Inc 2c step 1). */
+        if (has_fin && try_has_return(t))
+            return false;
 
         const size_t start = chunk.code.size();
         const size_t ct_start = chunk.catch_types.size();

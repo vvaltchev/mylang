@@ -5055,6 +5055,33 @@ static const std::vector<test> tests =
         },
         &typeid(ExceptionObject),
     },
+    {
+        /* P8 Inc 2c: a `return` inside a try/catch (NO finally) compiles native
+         * (ReturnV exits the chunk, destroying the handler stack). */
+        "try/catch with return in both the try and the catch",
+        {
+            "struct E { int v; }",
+            "func f(n) {",
+            "   try { if (n > 0) throw E(n); return n * 2; }",
+            "   catch (E) { return -1; }",
+            "   return 0;",
+            "}",
+            "assert(f(5) == -1); assert(f(-3) == -6); assert(f(0) == 0);",
+        },
+    },
+    {
+        "return from inside a try nested in a loop, exits the function",
+        {
+            "func f {",
+            "   var t = 0;",
+            "   for (var i = 0; i < 10; i++) {",
+            "       try { t += i; if (i == 3) return t; } catch (E) { }",
+            "   }",
+            "   return -1;",
+            "}",
+            "assert(f() == 6);",       // 0+1+2+3 = 6, returned at i==3
+        },
+    },
 
     {
         "Catch anything: TypeErrorEx",
