@@ -90,14 +90,31 @@ first:
 
 2. **Free the AST - drop `Instr::node`** (the node-field goal). The AST-free
    foundations exist (loc side table, const / member-key / struct-def / closure-
-   def pools). The remaining `node` users are: the **builtin call ops**
-   (`CallBuiltinV`/`LV`/`LVElem` + `EmplaceStruct` - they hold the args
-   `ExprList` + the per-arg caret; the **builtin loc-handle refactor** is the
-   step that frees them) and, inherently, the **fallback ops** (`EvalStmt`/
-   `JumpIfFalse` - they hold the node to re-enter `node->eval`). So the field
-   can only come off once (a) the builtin ops migrate to a loc-handle + an
-   AST-free arg source, AND (b) every construct is native (no `EvalStmt`/
-   `JumpIfFalse` left). This is the FINAL structural step.
+   def pools). **The foreach / array-read ops are now node-free** (2026-07-09,
+   `e67b6b2`): `LoadElem*`'s OOB caret moved to the loc side table and its dead
+   non-array `node->eval` else-branch (unreachable - `base_array` is proven)
+   became an `InternalErrorEx` net; `ArrLen`/`DictIterInit` nulled; the rest are
+   already free. The remaining `node` users are exactly two groups:
+   - the **builtin call ops** (`CallBuiltinV`/`LV`/`LVElem` + `EmplaceStruct`):
+     their args are ALREADY frame-sourced (AST-free); `node` survives only for
+     the baked `func_v`/`func_lv` ptr + the **per-arg error caret** (from the
+     args `ExprList`). Freeing them = the **builtin loc-handle refactor**: bake
+     the func ptr into a pool + carry the arg locs in a loc-handle. Does NOT
+     require touching the 84 `func_v` builtin signatures.
+   - the **fallback ops** (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`): they hold the
+     node to re-enter `node->eval`. Reached in real code ONLY by: **exceptions**
+     (try/catch/throw/rethrow), the reflection builtins **`show`** (renders the
+     AST - inherently node-based) and non-folding **`type`/`typestr`**, and the
+     **flat struct-array literal** `[P(a),P(b)]`.
+
+   **KEY (corrects the old claim):** dropping the field does NOT require every
+   construct to be native. A fallback op can hold its node as an **index into a
+   `Chunk::ast_nodes` pool** (`const Construct*`, program-lifetime, like
+   `closure_defs`) via a spare operand, and `EvalStmt` runs
+   `chunk.ast_nodes[in.a.lit]->eval(ctx)`. So the node-drop is a MECHANICAL
+   pool-migration (builtin loc-handle + a node pool for the fallbacks), doable
+   INDEPENDENTLY of nativizing exceptions - the two are ~orthogonal (see the
+   decision note at the bottom).
 
 3. **Exceptions (X / P8) - LAST.** `try`/`catch`/`throw` are `EvalStmt`; every
    `throw` is a C++ throw (bench 42, 24.5x). Needs VM-level exception dispatch
@@ -127,12 +144,57 @@ first:
    local store over a native CallV). The only remaining executed-code bench
    fallback is exceptions (42, P8).
 
-5. **Part C - native-but-slow** (independent of fallbacks): computed-goto
-   dispatch (C2, broad 10-20% on dispatch-bound loops — **and the DIRECT fix for
-   the 2026-07-08 dispatch-slowdown regression**, since a bigger op set stops
-   regressing the hot ops' branch prediction; pair with a cold-handler split),
-   the builtin arg-view ABI (C3), `ModConst` (C4). The typed-read work (C1)
-   largely landed as the typed dict / struct / element read ops.
+5. **Part C - native-but-slow** (independent of fallbacks). **Assessment
+   (2026-07-09): the remaining Part-C items are diminishing-returns / risky on
+   WSL2 - the big wins (P1-P7 + the store residuals) are done.** Item by item:
+   - **C2 computed-goto** (`&&label` threading; the DIRECT fix for the
+     2026-07-08 dispatch regression). The one real lever, BUT: a ~64-handler
+     mechanical conversion (bug-risk, differential-gated), and its front-end
+     benefit CANNOT be isolated on WSL2 (no PMU) - and modern ITTAGE predictors
+     have shrunk the classic 10-20% win. Do as a MEASURED EXPERIMENT: implement
+     behind `#if defined(__GNUC__)` (switch fallback for MSVC), verify the 1220
+     differential, then keep ONLY if the `--vm` wall-clock geomean is
+     neutral-or-better (WSL2 wall-clock IS reliable here - benches are
+     consistent - even though the PMU isn't). Not a blind commit (see
+     [[vm-dispatch-frontend-regression]]: "don't perturb layout blind").
+   - **C3 builtin arg-view ABI.** Marginal: the CallBuiltinV arg copy is a stack
+     `EvalValue` copy per arg (cheap for the scalar builtins that dominate hot
+     loops; only non-trivial args pay a refcount bump), and avoiding it touches
+     all **84** `func_v` signatures. Low value-to-churn. Its genuinely-valuable
+     half - freeing the builtin ops' `node` - is the **builtin loc-handle
+     refactor**, which belongs with the node-drop work (item 2), NOT here.
+   - **C4 `ModConst`** (`x = x % C` immediate form). Adds a NEW op → per
+     [[vm-dispatch-frontend-regression]] that risks a front-end regression that
+     dwarfs the tiny operand-decode saving; the plan itself calls it "minor" -
+     likely net-negative on a switch dispatch - **defer until AFTER C2** (comp.-
+     goto makes the op-set size front-end-neutral), or skip.
+   - **C1 typed reads** largely landed as the typed dict / struct / element read
+     ops.
+
+## Decision: the "big loc table" (drop `Instr::node`) vs exceptions (P8)
+
+They are **~orthogonal** (see item 2's KEY correction) - neither blocks the
+other - so pick by value/effort, not dependency:
+
+- **Drop `Instr::node`** (mechanical, broad, LOWER risk). Remaining work: the
+  builtin loc-handle refactor + a `Chunk::ast_nodes` pool so the fallback ops
+  (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`) reference their node by index. Then
+  remove the 8-byte field → a smaller `Instr` (~12% if Instr≈64B) → a hotter
+  instruction stream (better I-cache on EVERY dispatch-bound loop, the broad
+  win). Differential-safe; no new runtime feature. Payoff is broad-but-small and
+  measurable (Instr size + `--vm` geomean).
+- **Exceptions (P8)** (a NEW runtime feature, HIGHER effort/novelty). VM-level
+  exception dispatch (a handler stack + a pending-exception jump) replaces the
+  `EvalStmt`-per-try/catch/throw + the per-`throw` C++ throw (~1.6µs each).
+  Removes the last real EvalStmt CONSTRUCT and is the single most-dramatic
+  per-bench win (42 is ~24x CPython) but only ~5% geomean (one bench).
+
+**Recommendation:** exceptions FIRST - it's the higher-value, higher-novelty
+work, it removes the last *construct-level* fallback (leaving only the
+inherently-node-based `show`/`type`/flat-struct-lit for the node-drop to
+pool-encode), and doing it first means the subsequent node-drop pool-migration
+covers a strictly smaller/cleaner fallback set. The node-drop is then a
+low-risk mechanical sweep to finish the AST-free endgame.
 
 **⛔ Negative result — foreach (F + D3), attempted P5 and REVERTED.** Built a
 `ForeachBind` op that reuses a factored `foreach_bind_one` to make an array

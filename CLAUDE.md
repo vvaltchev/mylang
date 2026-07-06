@@ -3419,11 +3419,19 @@ is NOT looked up per call: `do_func_call` gained `(const Chunk *call_ck, size_t
 call_pc)` params and resolves `loc_at` in its EXISTING catch, on the error path
 only, so the hot success path pays no lookup (`vm_call_func`/`vm_cached_call`
 pass `&chunk, pc` not a `Loc`; fib stays 0.95x vs the tree-walker, and multi-
-frame backtraces are byte-identical). Remaining `node` users: the builtin calls
-(`CallBuiltinV`/`LV`/`LVElem` - a baked `func_v` ptr + the args `ExprList`),
-`EmplaceStruct` (a struct-ctor def); then the fallback ops (`EvalStmt`/
-`JumpIfFalse`/the element-store fallbacks). Once those are migrated, `Instr`
-sheds the 8-byte `node` field.
+frame backtraces are byte-identical). **The foreach / array-read ops
+(`LoadElem*`, `ArrLen`, `DictIter*`, `ForeachDyn*`, `UnpackElem*`,
+`LoadStructField*`) are now node-free too** (the loc side table; `LoadElem*`'s
+dead non-array `node->eval` else-branch - unreachable, `base_array` is proven -
+became an `InternalErrorEx` net). So the ONLY remaining `node` users are: the
+builtin calls (`CallBuiltinV`/`LV`/`LVElem`/`EmplaceStruct` - a baked func ptr +
+the args `ExprList` for per-arg error carets; freed by the builtin loc-handle
+refactor) and the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, reached
+in real code only by exceptions, the reflection builtins `show`/`type`, and the
+flat struct-array literal). A fallback op can hold its node as an index into a
+`Chunk::ast_nodes` pool, so `Instr` can shed the 8-byte `node` field WITHOUT
+first nativizing exceptions - the node-drop and the VM-exception work are
+~orthogonal (see `plans/vm-fallback-elimination.md`).
 
 ## Invariants & hazards (defense in depth)
 
