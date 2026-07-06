@@ -1294,6 +1294,36 @@ struct Codegen {
                 return true;
             }
 
+            /* P4: a GENERAL array element store `a[i] = v` / `a[i] OP= v` ->
+             * StoreElemValue - the array is base_array but the element is NOT a
+             * flat scalar (th != i/f): an array/str/struct/dyn element. Same
+             * shape as DictStore (local base, value then index to boxed temps);
+             * vm_subscript_store does the bounds check + COW + store. */
+            if (sub->base_array && sub->th != TypeHint::i
+                && sub->th != TypeHint::f) {
+                int aslot;
+                switch (e->op) {
+                case Op::assign: case Op::addeq: case Op::subeq:
+                case Op::muleq:  case Op::diveq: case Op::modeq: break;
+                default: return false;
+                }
+                if (!as_array_slot(sub->what.get(), aslot))
+                    return false;
+                int vslot, kslot;
+                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
+                    || !compile_boxed_expr(sub->index.get(), kslot, ops))
+                    return false;
+                Instr in;
+                in.op = OpCode::StoreElemValue;
+                in.node = s;
+                in.target2 = aslot;
+                in.a = slot_op(kslot);
+                in.b = slot_op(vslot);
+                in.aop = e->op;
+                ops.push_back(in);
+                return true;
+            }
+
             if (sub->th != TypeHint::i || !sub->base_array)
                 return false;
             Op aop;

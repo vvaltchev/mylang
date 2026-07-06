@@ -18,7 +18,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | **D1m** | dict MEMBER store `d.k=v` | (rare) | P2b | todo |
 | ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
 | **D3** | dict `foreach(k,v in d)` | 26,47,62 | P5c | todo |
-| **G** | general array store `a[i]=<non-scalar>` | 46,20,31,32,47 | P4 | todo |
+| ~~G~~ | ~~general array store~~ | 5 | ~~P4~~ | ✅ 32:.67 20:.62 |
 | **F** | foreach unpack/indexed | 19,20 | P5a/b | todo |
 | **S** | string element `s[i]`, build | 29,30,31,32 | P7 | todo |
 | **M** | multi-assign / IdList | 22,06 | P9 | todo |
@@ -33,7 +33,7 @@ arg-view builtin ABI, ...) — none skipped.
 **Goal restated:** lift the `-vm` geomean from **~4.0× CPython** to **5×+**.
 Progress (60-bench geomean; `run.py`'s 61-set reads a touch higher):
 **baseline 3.76× → P1 (bool) 3.82× → P2 (dict store) 3.96× → P3 (dict read)
-3.97×.**
+3.97× → P4 (general store) 4.02×.**
 
 **Method:** ran `mylang -vd` on all 62 `bench/my/*.my` and recorded every
 AST-fallback op (`eval.stmt` = `EvalStmt`, `eval.slot` = `EvalToSlot` — the two
@@ -157,11 +157,22 @@ test #24/#25 updated). Verified 1309/1309 + 1160/1160, RECYCLE+ASan. Benches:
 
 *(original design)* When inference proved `dict<_,int/float>`, read the
 
-### P4. General array element store — `StoreElemValue`
-*Benches: 46_matrix (.42), 20, 31, 32, 47. MED risk.* `a[i]=<value>` where the
-element is a non-scalar (array/str/struct) or the array is general: evaluate the
-value boxed, use the tree-walker's element-lvalue + COW store. Pairs with P2/P3
-to make the matrix/row-build and `parts[i]=str(i)` loops native.
+### P4. General array element store — `StoreElemValue` — DONE (2026-07-05)
+Landed: a `StoreElemValue` op for `a[i] = v` / `a[i] OP= v` where the array is
+`base_array` but the element is NOT a flat scalar (`th != i/f`) - an
+array/str/struct/dyn element. Same codegen shape as DictStore (local-slot base,
+value then index to boxed temps). The `vm_dict_store` helper was generalized +
+renamed **`vm_subscript_store`** (it was already type-dispatched via
+`Type::subscript(for_write)`), so the same function now backs DictStore (P2) AND
+StoreElemValue (P4) - the array's bounds check + COW (alias vs slice-clone)
+and the store come straight from the shared runtime, matching the tree-walker.
+A non-array runtime base falls back. Verified 1310/1310 + 1161/1161 (+1 test:
+nested/str/compound/alias-share/slice-COW), RECYCLE+ASan. Benches:
+32_str_build .82→.67, 20/47 .66/.65→.62, matrix flat; geomean 3.97×→**4.02×**
+(crossed 4× on the 60-set). **Follow-up:** a nested base `a[i][j] = v` (general)
+and a global/capture base stay fallback.
+
+*(original design)* `a[i]=<value>` where the element is a non-scalar
 
 ### P5. foreach — unpack, indexed, and dict
 *Benches: 19, 20 (.69), 26, 47, 62. MED/HARD.* Extend the native-foreach

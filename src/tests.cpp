@@ -3948,6 +3948,26 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* P4: the VM's native GENERAL array element store (StoreElemValue) - a
+         * nested (array) element, a str element, compound concat, alias-share
+         * vs slice-COW, in loops. The differential runs it both engines. */
+        "general array store: nested/str/compound/COW (VM StoreElemValue)",
+        {
+            "var m = [[0, 0], [0, 0]];",
+            "for (var i = 0; i < 2; i++) { var r = [i, i + 5]; m[i] = r; }",
+            "assert(m == [[0, 5], [1, 6]]);",
+            "var p = [\"\", \"\", \"\"];",
+            "for (var i = 0; i < 3; i++) p[i] = str(i * i);",
+            "assert(p == [\"0\", \"1\", \"4\"]);",
+            "for (var i = 0; i < 3; i++) p[i] += \"!\";",
+            "assert(p == [\"0!\", \"1!\", \"4!\"]);",
+            "var a = [[1], [2]]; var b = a; a[0] = [9];",  /* alias: shared */
+            "assert(a == [[9], [2]] && b == [[9], [2]]);",
+            "var x = [[1], [2], [3]]; var s = x[0:2]; s[0] = [7];",  /* slice */
+            "assert(s == [[7], [2]] && x == [[1], [2], [3]]);",
+        },
+    },
+    {
         "array<bool>: sum counts trues (as int), min/max",
         {
             "var b = [true, false, true, true];",

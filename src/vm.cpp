@@ -719,7 +719,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::DictStore: {
 
             /* d[k] = v / d[k] OP= v (P2): if the slot holds a dict, store via
-             * vm_dict_store (shared Type::subscript(for_write) + slot_rmw -
+             * vm_subscript_store (shared Type::subscript(for_write)+slot_rmw -
              * matches the tree-walker's auto-vivify / COW / key-freeze / throw
              * behavior). A non-dict (none / dyn-laundered) base falls back. */
             LValue &dlv = ctx.frame->at(in.target2);
@@ -732,7 +732,37 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 const Construct *lvn =
                     static_cast<const Expr14 *>(in.node)->lvalue.get();
                 try {
-                    vm_dict_store(&dlv, key, val, in.aop, lvn);
+                    vm_subscript_store(&dlv, key, val, in.aop, lvn);
+                } catch (Exception &e) {
+                    if (!e.loc_start) {
+                        e.loc_start = lvn->start;
+                        e.loc_end = lvn->end;
+                    }
+                    throw;
+                }
+                pc++;
+                break;
+            }
+            in.node->eval(&ctx);
+            pc++;
+            break;
+        }
+
+        case OpCode::StoreElemValue: {
+
+            /* a[i] = v / a[i] OP= v for a GENERAL array (P4): if the slot holds
+             * an array, store via vm_subscript_store (the shared
+             * Type::subscript(for_write) bounds check + COW + slot_rmw -
+             * the tree-walker). A non-array (dyn) base falls back. The
+             * SUBSCRIPT loc stamps a bounds/read-only error (not Expr14). */
+            LValue &alv = ctx.frame->at(in.target2);
+            if (alv.get().is<SharedArrayObj>()) {
+                const EvalValue &idx = ctx.frame->at(in.a.slot).get();
+                const EvalValue &val = ctx.frame->at(in.b.slot).get();
+                const Construct *lvn =
+                    static_cast<const Expr14 *>(in.node)->lvalue.get();
+                try {
+                    vm_subscript_store(&alv, idx, val, in.aop, lvn);
                 } catch (Exception &e) {
                     if (!e.loc_start) {
                         e.loc_start = lvn->start;

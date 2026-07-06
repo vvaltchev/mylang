@@ -336,10 +336,12 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             const Construct *arg0, const CallExpr *ctor,
                             const EvalValue *vals, size_t n);
 
-/* VM P2: native dict element store `d[k] = v` / `d[k] OP= v` - reuses the
- * shared Type::subscript(for_write) lvalue path + slot_rmw. See eval.cpp. */
-EvalValue vm_dict_store(LValue *dict_lv, const EvalValue &key,
-                        const EvalValue &value, Op op, const Construct *node);
+/* VM P2/P4: native subscript element store `c[k] = v` / `c[k] OP= v` for a dict
+ * or a general array - reuses the shared, type-dispatched Type::subscript
+ * (for_write) lvalue path + slot_rmw. See eval.cpp. */
+EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
+                             const EvalValue &value, Op op,
+                             const Construct *node);
 
 /* The stored value of a PRESENT dict key, else nullptr (a plain map find - the
  * tree-walker's typed dict fast path). Shared by Subscript/MemberExpr eval_int/

@@ -151,13 +151,25 @@ enum class OpCode : unsigned char {
      * VALUE operand (a boxed temp slot), `aop` = the Expr14 op (`Op::assign` /
      * `addeq` / ...), `node` = the Expr14 (loc/fallback). The value is compiled
      * before the key (tree-walker order: rhs, then the lvalue's base+index; the
-     * base is a side-effect-free slot read done here). vm_dict_store reuses the
+     * base is a side-effect-free slot read done here). vm_subscript_store uses
      * shared Type::subscript(for_write) path (auto-vivify on a plain miss,
      * COW, key-freeze) + slot_rmw, matching the tree-walker exactly. If the
      * slot doesn't hold a dict at runtime (a dyn-laundered base) it falls back
      * to `node->eval`. Emitted only when the inferencer proved base_dict.
      */
     DictStore,
+
+    /*
+     * Native GENERAL array element store `a[i] = v` / `a[i] OP= v` (P4), where
+     * the element is non-scalar (array/str/struct/dyn - the StoreElem* flat
+     * fast paths don't apply). `target2` = the array's (local) slot, `a` = the
+     * KEY (index) operand (a boxed temp), `b` = the VALUE (a boxed temp),
+     * `aop` = the Expr14 op, `node` = the Expr14. Same value-then-index compile
+     * order as StoreElem; vm_subscript_store does the store via the shared
+     * Type::subscript(for_write) + slot_rmw (bounds check + COW as the
+     * tree-walker). A non-array runtime base falls back to `node->eval`.
+     */
+    StoreElemValue,
 
     /*
      * Typed DICT scalar READ `d[k]` / `d.k` into a temp (P3), when inference

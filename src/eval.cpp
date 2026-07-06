@@ -2662,20 +2662,24 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
 }
 
 /*
- * VM P2: native dict element store `d[k] = v` / `d[k] OP= v`. `dict_lv` = the
- * dict's LValue (a slot), `key`/`value` the pre-evaluated operands, `op` the
- * Expr14 op (assign / addeq / ...). Reuses the Type::subscript(for_write)
- * lvalue path (auto-vivify none on a plain-assign miss, COW, container-key
- * freeze - the SAME the tree-walker's Subscript::do_eval takes) and slot_rmw
- * (the SAME assign/compound), so the result and the throw behavior (a missing
- * key on a compound, a read-only dict) match the tree-walker byte-for-byte.
+ * VM P2/P4: native SUBSCRIPT element store `c[k] = v` / `c[k] OP= v` for a dict
+ * (P2) OR a general array (P4). `base_lv` = the container's LValue (a slot),
+ * `key`/`value` the pre-evaluated operands (an int index for an array, any key
+ * for a dict), `op` the Expr14 op (assign / addeq / ...). Reuses the shared
+ * Type::subscript(for_write) lvalue path - which is type-dispatched, so it does
+ * the dict's auto-vivify-none-on-plain-miss + container-key freeze OR the
+ * array's bounds check, and the COW, exactly as the tree-walker's
+ * Subscript::do_eval - plus slot_rmw (the SAME assign/compound). So the result
+ * and the throws (missing dict key on a compound, out-of-bounds array index, a
+ * read-only container) match the tree-walker byte-for-byte.
  */
-EvalValue vm_dict_store(LValue *dict_lv, const EvalValue &key,
-                        const EvalValue &value, Op op, const Construct *node)
+EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
+                             const EvalValue &value, Op op,
+                             const Construct *node)
 {
     const bool for_write = (op == Op::assign);
-    EvalValue elv = dict_lv->get().get_type()->subscript(
-        EvalValue(dict_lv), key, for_write);
+    EvalValue elv = base_lv->get().get_type()->subscript(
+        EvalValue(base_lv), key, for_write);
     if (!elv.is<LValue *>())
         throw NotLValueEx(node->start, node->end);
     return slot_rmw(*elv.get<LValue *>(), op, value);
