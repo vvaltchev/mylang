@@ -327,6 +327,15 @@ bool builtin_is_const(int index);
 class MemberExpr;
 EvalValue member_read(const EvalValue &base, const MemberExpr *m);
 
+/* VM Phase 2b: append a POD struct built from the pre-evaluated ctor arg values
+ * `vals` into `target` (a flat array<Struct> - coerced into the bytes - or a
+ * general array - fallback build+append). `ctor` carries vm_struct_ctor_def and
+ * the field arg locs; `arg0` the container arg (loc). See eval.cpp. */
+class CallExpr;
+EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
+                            const Construct *arg0, const CallExpr *ctor,
+                            const EvalValue *vals, size_t n);
+
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
 void run_weight_bench();

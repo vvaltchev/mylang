@@ -180,6 +180,18 @@ enum class OpCode : unsigned char {
     CallBuiltinLV,
 
     /*
+     * Emplace-append a struct (Phase 2b): `append(struct_arr, Ctor(args))` with
+     * the ctor's arg VALUES already in a register run [b.lit, b.lit+nfields).
+     * `a.lit` = arg0's slot KIND (like CallBuiltinLV, forms the target ptr);
+     * `target2` = arg0's slot; `target` = the dst slot; `node` = the append
+     * DirectBuiltinCallExpr (args[1] is the ctor, carrying vm_struct_ctor_def
+     * + the field arg locs). vm_emplace_struct coerces the values straight into
+     * the flat POD-struct array's bytes (no temporary StructObject); a non-flat
+     * target falls back to building the struct + a general append.
+     */
+    EmplaceStruct,
+
+    /*
      * Native USER-function call (no node->eval): the args are already evaluated
      * into a contiguous register run [a.lit, a.lit + b.lit); `target2` = the
      * callee's GLOBAL-table slot (a DirectCallExpr with vm_direct_func, so the

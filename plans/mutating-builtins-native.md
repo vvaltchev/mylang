@@ -53,7 +53,28 @@ their value args into a register run (`emit_args_range(..., start=1)`, base in
 rest — a pure slot ref, so the VM's rest-first order is observationally equal).
 Verified 1305/1305 + 1156/1156 (incl. a side-effecting value arg), RECYCLE+ASan.
 
-### 2b. `emplace` fusion for `append(struct_arr, Ctor(args))`
+### 2b. `emplace` fusion — DONE (2026-07-05)
+
+Landed via **recognition fork (a)** — codegen pattern match, VM-only, no AST
+rewrite (the tree-walker keeps its own construct-in-place). The inferencer
+stamps a POD struct construction with `CallExpr::vm_struct_ctor_def`
+(`check_struct_construction`; transferred through the devirt swap). The codegen
+(`try_native_mutating_builtin`) recognizes append/push (a self-eval lvalue
+builtin, 2 args) whose arg1 is such a ctor, compiles the ctor's field-arg VALUES
+into a register run (`emit_args_range`), and emits **`EmplaceStruct`** (arg0's
+`LValue*` by slot kind + run base in `b`). `vm_emplace_struct` (eval.cpp,
+declared in eval.h) does the FAST path — coerce the values straight into the
+flat `array<Struct>`'s bytes (no temp `StructObject`, mirroring
+`try_construct_into_struct_array`) — and a FALLBACK for a non-flat target
+(`array<dyn>` holding structs: build the `StructObject` + general append). COW
+(slice-clone), const/readonly checks, and float-field coercion match the
+tree-walker byte-for-byte (differential-verified). `append(a, Point(5,6))` now
+`-vd`s as `emplace r = append(&a <- Point(r1, r2))`; a plain `append(a, x)`
+stays self-eval (construct-in-place for a Ctor, plain append otherwise).
+Verified 1305/1305 + 1156/1156 (flat / dyn-fallback / float-coerce / slice-COW),
+RECYCLE+ASan 3/3, `58_structs` 0.25x (~4x CPython), geomean ~4.1x.
+
+(Original design below, for the record.)
 
 This is the piece that lets `append`'s value arg be pre-evaluated WITHOUT losing
 construct-in-place (the reason Phase 1 kept self-eval). The construct-in-place

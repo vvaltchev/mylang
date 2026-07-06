@@ -1074,6 +1074,85 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
     return true;
 }
 
+/*
+ * VM Phase 2b: append a POD struct built from PRE-EVALUATED field values `vals`
+ * (the ctor's args, compiled into a VM register run) to the array `target`,
+ * without a temporary StructObject on the hot path. The values-driven twin of
+ * builtin_append's construct-in-place (try_construct_into_struct_array): the
+ * FAST path coerces the values straight into a flat array<Struct>'s bytes; a
+ * non-flat target (an array<dyn> holding structs) FALLS BACK to building the
+ * StructObject and a general append. `ctor` carries `vm_struct_ctor_def` (the
+ * POD def, inferencer-stamped) and the per-field arg locs; `arg0` is the
+ * container arg (for the lvalue/array errors). Result matches the tree-walker's
+ * append byte-for-byte (the differential proves it).
+ */
+EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
+                            const Construct *arg0, const CallExpr *ctor,
+                            const EvalValue *vals, size_t n)
+{
+    if (!target)
+        throw NotLValueEx(arg0->start, arg0->end);
+    if (!target->is<SharedArrayObj>())
+        throw TypeErrorEx("Expected array", arg0->start, arg0->end);
+    if (target->is_const_var())
+        throw CannotChangeConstEx(arg0->start, arg0->end);
+
+    SharedArrayObj &arr = target->getval<SharedArrayObj>();
+    if (arr.is_readonly())
+        throw CannotChangeConstEx(arg0->start, arg0->end);
+    if (arr.is_slice())
+        arr.clone_internal_vec();
+
+    StructTypeDef *def = const_cast<StructTypeDef *>(ctor->vm_struct_ctor_def);
+    const ExprList *cargs = ctor->args.get();
+    ML_CHECK(def && def->is_pod() && n == def->fields.size());
+
+    /* FAST: a flat POD-struct array of this exact def - coerce into the bytes,
+     * no temporary StructObject (mirrors try_construct_into_struct_array). */
+    if (arr.skind() == SharedArrayObj::Storage::structs &&
+        arr.flat_structs().def == def && def->size <= 512) {
+
+        char tmp[512];
+        for (size_t i = 0; i < n; i++) {
+            EvalValue v = coerce_struct_field(
+                def->fields[i], vals[i],
+                cargs->elems[i]->start, cargs->elems[i]->end);
+            pod_store_field(def->fields[i], tmp, v);
+        }
+        auto &sv = arr.flat_structs();
+        const size_t at = sv.buf.size();
+        sv.buf.resize(at + sv.stride);
+        std::memcpy(sv.buf.data() + at, tmp, sv.stride);
+        arr.invalidate_hash();
+        return target->get();
+    }
+
+    /* FALLBACK: build the StructObject from the values, then append it - a flat
+     * array<Struct> (huge struct / same def) memcpys its bytes, a general array
+     * stores the value. */
+    auto obj = make_intrusive<StructObject>(def);
+    for (size_t i = 0; i < n; i++)
+        obj->pod_set(static_cast<int>(i), coerce_struct_field(
+            def->fields[i], vals[i],
+            cargs->elems[i]->start, cargs->elems[i]->end));
+    const EvalValue elem(intrusive_ptr<StructObject>{obj});
+
+    if (arr.skind() == SharedArrayObj::Storage::structs &&
+        arr.flat_structs().def == def) {
+        auto &sv = arr.flat_structs();
+        const size_t at = sv.buf.size();
+        sv.buf.resize(at + sv.stride);
+        std::memcpy(sv.buf.data() + at, obj->bytes.data(), sv.stride);
+    } else if (arr.skind() == SharedArrayObj::Storage::general) {
+        arr.get_vec().emplace_back(elem, ctx->const_ctx);
+    } else {
+        throw TypeErrorEx("Cannot append a struct to this array",
+                          arg0->start, arg0->end);
+    }
+    arr.invalidate_hash();
+    return target->get();
+}
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue callable_storage;

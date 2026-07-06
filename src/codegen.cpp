@@ -949,6 +949,37 @@ struct Codegen {
         default: return false;   /* builtin / unresolved -> fall back */
         }
 
+        /* EMPLACE (Phase 2b): append(struct_arr, Ctor(args)) with a POD struct
+         * ctor -> EmplaceStruct: compile the ctor's field arg VALUES into a
+         * register run (`b`) and coerce them into the array's bytes, no
+         * temporary StructObject. Recognized by a SELF-EVAL lvalue builtin
+         * (append/push - not rest-native) with 2 args, arg1 a POD struct
+         * construction (vm_struct_ctor_def): pop/intptr take 1 arg and
+         * insert/erase are rest-native, so this shape is append/push only. */
+        if (!dc->lvalue_rest_native && dc->args->elems.size() == 2) {
+            auto *ctor =
+                dynamic_cast<const CallExpr *>(dc->args->elems[1].get());
+            if (ctor && ctor->vm_struct_ctor_def && ctor->args) {
+                int fieldbase;
+                if (emit_args_range(ctor->args->elems, fieldbase, ops)) {
+                    const int dst = alloc_temp();
+                    Instr cv;
+                    cv.op = OpCode::EmplaceStruct;
+                    cv.node = dc;
+                    cv.target = dst;
+                    cv.target2 =
+                        static_cast<const Identifier *>(a0)->sym.slot;
+                    cv.a = int_lit(kind);
+                    cv.b = int_lit(fieldbase);
+                    ops.push_back(cv);
+                    out_slot = dst;
+                    return true;
+                }
+                /* a field arg didn't lower -> fall through to CallBuiltinLV
+                 * (append self-evals the ctor node = construct-in-place). */
+            }
+        }
+
         /* REST-NATIVE (insert/erase): compile the value args (1..n) into a
          * register run so func_lv has zero node->eval; `b` carries its base.
          * A self-eval builtin (append/push/pop/intptr) leaves `b` unused and

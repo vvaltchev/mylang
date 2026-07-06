@@ -725,6 +725,13 @@ public:
      * node->eval-ing the call. */
     bool vm_direct_func = false;
 
+    /* VM emplace hint (Phase 2b): when this CallExpr is a STRUCT construction,
+     * the inferencer stamps the constructed `StructTypeDef *` here (null for a
+     * func/builtin/dyn call). It lets the VM fuse `append(struct_arr, Ctor(a))`
+     * into an EmplaceStruct that coerces the ctor's arg values into the
+     * flat struct array's bytes - no temporary StructObject. */
+    const StructTypeDef *vm_struct_ctor_def = nullptr;
+
     CallExpr() : Construct("CallExpr") { }
     explicit CallExpr(const char *name) : Construct(name) { }
     void serialize(ostream &s, int level = 0) const override;
@@ -737,6 +744,7 @@ public:
         c->args = clone_as(args);
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
+        c->vm_struct_ctor_def = vm_struct_ctor_def;
         return c;
     }
 };
@@ -765,6 +773,7 @@ public:
         c->args = clone_as(args);
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
+        c->vm_struct_ctor_def = vm_struct_ctor_def;
         return c;
     }
 };
@@ -789,6 +798,7 @@ public:
         c->args = clone_as(args);
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
+        c->vm_struct_ctor_def = vm_struct_ctor_def;
         return c;
     }
 };

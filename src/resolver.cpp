@@ -4201,6 +4201,7 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                 d->args = move(call->args);
                 d->direct_func_slot = call->direct_func_slot;
                 d->vm_direct_func = call->vm_direct_func;
+                d->vm_struct_ctor_def = call->vm_struct_ctor_def;
                 slot = move(d);
             }
         }

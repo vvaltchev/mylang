@@ -2916,8 +2916,15 @@ pre-evaluated in `rest`/`n_rest` (the VM compiles a register run, base in
 `Instr::b`; `vm_call_builtin_lv_rest` copies by value) — **zero `node->eval`**;
 a **self-eval** builtin (`append`/`push` — construct-in-place needs the node;
 `pop`/`intptr` — no value args, `make_builtin_lv`) gets `rest == nullptr` and
-reads its args off `exprList`. `append`'s value arg going native (the
-construct-in-place `emplace` fusion) is Phase 2b, still open. An **AST builtin**
+reads its args off `exprList`. **`append(struct_arr, Ctor(args))` fuses to an
+`EmplaceStruct` op (Phase 2b)**: the inferencer stamps a POD struct construction
+with `CallExpr::vm_struct_ctor_def`; the codegen recognizes append/push of such
+a ctor, compiles the ctor's field-arg VALUES into a register run, and emits
+`EmplaceStruct` (arg0's `LValue*` by slot kind + the run base in `b`);
+`vm_emplace_struct` (eval.cpp) coerces those values straight into the flat
+`array<Struct>`'s bytes — **no temp `StructObject`** (a non-flat `array<dyn>`
+target falls back to build+append, matching the tree-walker). So a
+`append(pts, Point(i, i*2))` build loop is fully native. An **AST builtin**
 (defined/type/…, needs the arg node) keeps the union null and stays
 `EvalToSlot`. **The read-only builtin migration to `func_v` is
 complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose

@@ -234,6 +234,20 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
                 << "(" << lval_ref(in.a.lit, in.target2) << ", ...)";
             cmt(row, in.node);
             break;
+        case OpCode::EmplaceStruct: {
+            const auto *dc =
+                static_cast<const DirectBuiltinCallExpr *>(in.node);
+            const auto *ctor =
+                static_cast<const CallExpr *>(dc->args->elems[1].get());
+            const int nf = static_cast<int>(ctor->args->elems.size());
+            row << "emplace      " << D(in.target) << " = "
+                << callee_name(in.node) << "("
+                << lval_ref(in.a.lit, in.target2) << " <- "
+                << std::string(ctor->vm_struct_ctor_def->name->val)
+                << arglist(chunk, in.b.lit, nf) << ")";
+            cmt(row, in.node);
+            break;
+        }
         case OpCode::CallV:
             row << "call.v       " << D(in.target) << " = "
                 << callee_name(in.node)

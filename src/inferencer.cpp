@@ -3592,6 +3592,13 @@ void Inferencer::check_struct_construction(CallExpr *call,
     const size_t nfields = def->fields.size();
     const size_t nargs = args->elems.size();
 
+    /* VM emplace hint (Phase 2b): a POD struct construction can be fused into
+     * `append(struct_arr, Ctor(...))` -> EmplaceStruct (coerce the arg values
+     * straight into the flat array's bytes). Only POD (a flat array<Struct> is
+     * POD); a boxed struct stays the normal build+append path. */
+    if (def->is_pod())
+        call->vm_struct_ctor_def = def;
+
     size_t min_args = 0;
     for (size_t i = 0; i < nfields; i++)
         if (!def->fields[i].is_opt)
