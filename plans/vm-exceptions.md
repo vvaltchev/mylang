@@ -259,17 +259,32 @@ focused effort.
     brk/cont) + `SetPend`/`EndFinally` ops + `vm_pend`. Every try exit sets the
     pending action + jumps to one shared finally block; `EndFinally` resumes it
     (Inc 2b: normal → fall through, reraise → re-raise vm_exc). try/catch/finally
-    is now fully native. **`72_exc_finally` my/py 0.36× → 0.17× (MyLang ~6×
+    fully native. **`72_exc_finally` my/py 0.36× → 0.17× (MyLang ~6×
     FASTER than CPython).** NOTE: the VM is MORE correct than the tree-walker on
     a **throw inside a finally** — the tree-walker runs finally in a (noexcept)
     scope-guard *destructor*, so a throwing finally always `terminate`s; the VM
     handles it (the throw propagates, matching Python). No -rt test / bench /
     fuzz hits it (they'd crash the tree-walker). A tree-walker fix (finally not
     in a destructor) would restore strict tw==vm, but is out of the VM scope.
-  - **2c flow-crossing-try (next).** A break/continue/return that crosses a try
-    (must run finally + pop the handler first): `SetPend ret/brk/cont` + jump to
-    finally; `EndFinally` resumes the flow. Removes the last fall-back
-    restriction (`contains_escaping_flow`).
+  - **2c flow-crossing-try (in progress).** A break/continue/return crossing a
+    try must pop the handler + run the finally first.
+    - **Step 1 ✅ (c7ae2c6): a `return` crossing a try with NO finally.** →
+      `ReturnV`, which exits the chunk (the handler stack, a vm_run_chunk local,
+      is destroyed - no leak, no finally). Nativizes the common `try { …;
+      return x; } catch (E) { return d; }`. `contains_escaping_flow` refactored
+      to `has_flow(c, bc, ret)` + `try_has_break_continue` / `try_has_return`.
+    - **Step 2 (return crossing a FINALLY) — deferred.** Two candidate designs:
+      (a) inline each enclosing finally before `ReturnV` (handles nested
+      finallys naturally, but the return VALUE temp must survive the finally's
+      temps - a temp-allocation subtlety); (b) `SetPend ret` + jump to finally,
+      `EndFinally` resumes the return via `vm_pend_val` (clean for ONE finally;
+      nested finallys need EndFinally to chain to the next). Falls back for now.
+    - **Step 3 (break/continue crossing a try) — deferred.** Needs a PopHandler
+      per crossed try + finally + the loop's break/continue target; the pending-
+      action `brk`/`cont` + EndFinally chaining. Falls back for now.
+    - **Correctness is unaffected:** the deferred cases fall back to the
+      tree-walker (tw==vm by definition); step 2/3 are PERFORMANCE (the last
+      fallbacks to remove for zero-fallback `.myv`).
 - **Inc 3 — nested try / dynamic nesting.** The handler STACK already supports
   it; this increment is really "prove it": lexical `try{ try{}catch{} }catch{}`
   and a `try` in a called function. (If Inc 0–2 shipped with a depth-1 handler
