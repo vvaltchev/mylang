@@ -17,9 +17,9 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~D1~~ | ~~dict store~~ | 5 | ~~P2~~ | ✅ .55/.43 |
 | **D1m** | dict MEMBER store `d.k=v` | (rare) | P2b | todo |
 | ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
-| **D3** | dict `foreach(k,v in d)` | 26,47,62 | P5c | todo |
+| ⛔F | ~~foreach unpack/indexed~~ | 19,20 | — | REVERTED — regressed, see note |
+| ⛔D3 | ~~dict `foreach(k,v in d)`~~ | 26,47,62 | — | not worth it, see note |
 | ~~G~~ | ~~general array store~~ | 5 | ~~P4~~ | ✅ 32:.67 20:.62 |
-| **F** | foreach unpack/indexed | 19,20 | P5a/b | todo |
 | **S** | string element `s[i]`, build | 29,30,31,32 | P7 | todo |
 | **M** | multi-assign / IdList | 22,06 | P9 | todo |
 | **C** | closure / indirect call `c()` | 11 | P6 | todo |
@@ -29,6 +29,21 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 
 Plus the Part-C native-but-slow work (typed reads, computed-goto dispatch,
 arg-view builtin ABI, ...) — none skipped.
+
+**⛔ Negative result — foreach (F + D3), attempted P5 and REVERTED.** Built a
+`ForeachBind` op that reuses a factored `foreach_bind_one` to make an array
+foreach (indexed / general single-var; unpack excluded as unsound — its extra
+vars can be `none` yet are typed non-null, which a native body would misread)
+run native. It **regressed**: 19_foreach_indexed 0.27→0.30, geomean 4.02→4.01.
+Root cause: the tree-walker's `do_iter` is ALREADY a tight C++ loop, and per
+element the cost is dominated by `bind_loop_var` (the SAME in both engines) plus
+the boxing in `arr_elem_boxed` — so the VM adds op-dispatch overhead without a
+real native-body win (foreach bodies are small). The dict foreach (D3) is worse
+(a bucket-walk / snapshot on top). **Lesson:** a fallback whose per-iteration
+cost is a shared runtime helper (not `node->eval` of a rich body) is NOT worth
+nativizing — the VM only wins where it removes real per-node dispatch. Left as a
+tree-walker fallback (which is fast). Kept nothing; `git checkout` reverted the
+op, the codegen, the inferencer flag, and the `do_iter` refactor.
 
 **Goal restated:** lift the `-vm` geomean from **~4.0× CPython** to **5×+**.
 Progress (60-bench geomean; `run.py`'s 61-set reads a touch higher):
