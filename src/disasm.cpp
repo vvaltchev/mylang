@@ -249,6 +249,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::Reraise:
             row << "reraise";
             break;
+        case OpCode::Rethrow:
+            row << "rethrow";
+            break;
         case OpCode::JumpIfFalse:
             row << "jmp.ifnot    (" << node1(in.node) << "), L" << in.target;
             break;

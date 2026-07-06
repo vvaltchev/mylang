@@ -1858,9 +1858,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::CatchTest: {
             /* vm_exc holds the caught exception. Match its type name against
              * this clause (a.lit = catch_types idx, or -1 = catch-all). On a
-             * match: bind `catch (T as e)` (target2 = slot, -1 if none), clear
-             * vm_exc, jump to the catch body (target). Else fall to the next
-             * CatchTest / Reraise. */
+             * match: bind `catch (T as e)` (target2 = slot, -1 if none), jump to
+             * the catch body (target). Else fall to the next CatchTest /
+             * Reraise. vm_exc is KEPT (not cleared) so a `rethrow` in the catch
+             * body can re-raise it; a new throw overwrites it. */
             bool match;
             if (in.a.lit < 0) {
                 match = true;
@@ -1876,7 +1877,6 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 if (in.target2 >= 0)
                     ctx.frame->at(in.target2).put(
                         vm_catch_bind_val(vm_exc.get()));
-                vm_exc.reset();
                 pc = static_cast<size_t>(in.target);
             } else {
                 pc++;
@@ -1885,9 +1885,25 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::Reraise:
-            /* No clause matched: re-raise the in-flight exception (C++ throw →
-             * the boundary routes it to the OUTER handler, or propagates).
-             * Mirrors TryCatchStmt's saved_ex->rethrow(). */
+            /* No clause matched: re-raise vm_exc to the OUTER handler (native
+             * jump), or C++-throw to propagate. Mirrors saved_ex->rethrow(). */
+            if (vm_dispatch_exc(handlers, pc))
+                break;
+            vm_exc->rethrow();
+            break;                    /* unreachable ([[noreturn]]) */
+
+        case OpCode::Rethrow:
+            /* `rethrow` in a catch body: re-raise the being-handled vm_exc with
+             * the rethrow-site loc (like do_catch's RethrowEx handling), to the
+             * OUTER handler (native) or C++-propagate. */
+            {
+                Loc ls, le;
+                chunk.loc_at(pc, ls, le);
+                vm_exc->loc_start = ls;
+                vm_exc->loc_end = le;
+            }
+            if (vm_dispatch_exc(handlers, pc))
+                break;
             vm_exc->rethrow();
             break;                    /* unreachable ([[noreturn]]) */
 

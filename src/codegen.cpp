@@ -1790,6 +1790,16 @@ struct Codegen {
         return true;
     }
 
+    /* P8 Inc 2a: `rethrow` (only in a catch body) -> a native Rethrow op
+     * (re-raise vm_exc with the rethrow-site loc). Always succeeds. */
+    void emit_rethrow(const RethrowStmt *rt, std::vector<Instr> &ops)
+    {
+        Instr in;
+        in.op = OpCode::Rethrow;
+        in.node = rt;                 /* rethrow-site loc (extract_locs) */
+        ops.push_back(in);
+    }
+
     /* P3: a typed DICT scalar read `d[k]` / `d.k` (value proven int/float) ->
      * DictLoadInt/Float into a fresh temp `tt`. The base must be a local-slot
      * dict; a subscript compiles its key to a boxed temp (in `a`), a member
@@ -2888,6 +2898,12 @@ struct Codegen {
                     continue;
                 }
             }
+            /* `rethrow;` (in a catch body) -> a native Rethrow op (P8 Inc 2a). */
+            if (const RethrowStmt *rt = dynamic_cast<const RethrowStmt *>(s)) {
+                emit_rethrow(rt, chunk.code);
+                any_native = true;
+                continue;
+            }
 
             if (dynamic_cast<const Expr14 *>(s)
                 || dynamic_cast<const CallExpr *>(s)
@@ -2990,9 +3006,8 @@ struct Codegen {
             return false;
         if (dynamic_cast<const BreakStmt *>(c)
             || dynamic_cast<const ContinueStmt *>(c)
-            || dynamic_cast<const ReturnStmt *>(c)
-            || dynamic_cast<const RethrowStmt *>(c))
-            return true;
+            || dynamic_cast<const ReturnStmt *>(c))
+            return true;   /* rethrow is native (Inc 2a) - not a flow escape */
         if (dynamic_cast<const FuncDeclStmt *>(c))
             return false;                    /* a nested function's flow is local */
         if (const Block *b = dynamic_cast<const Block *>(c)) {
@@ -4021,6 +4036,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
         case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
+        case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold

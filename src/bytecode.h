@@ -620,8 +620,10 @@ enum class OpCode : unsigned char {
      *             target=catch-body pc): if the in-flight exception's type name
      *             matches, bind `catch (T as e)` + jump to the body; else fall
      *             through to the next CatchTest / Reraise.
-     *   Reraise: no clause matched → re-raise the in-flight exception (C++
-     *            throw, routed to the OUTER handler or propagated).
+     *   Reraise: no clause matched → re-raise the in-flight exception to the
+     *            OUTER handler (native jump) or propagate (C++ throw).
+     *   Rethrow: `rethrow` in a catch body → re-raise vm_exc with the
+     *            rethrow-site loc (from the loc side table).
      *   Throw(a=value slot): raise the value (Inc 1). A same-frame catch is a
      *            NATIVE jump (no C++ throw); no handler here → C++ throw
      *            (cross-frame). The throw-site loc is in the loc side table.
@@ -631,6 +633,7 @@ enum class OpCode : unsigned char {
     PopHandler,
     CatchTest,
     Reraise,
+    Rethrow,
 
     /* Stop the program. */
     Halt,
