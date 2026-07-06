@@ -1,5 +1,34 @@
 # Bytecode VM
 
+## END GOAL — SERIALIZABLE `.myv` bytecode (user, 2026-07-09)
+
+The concrete target that drives everything: **`mylang -c source.my` emits a
+binary `source.myv`** — a self-contained bytecode image — and **`mylang
+source.myv` runs it with NO source and NO AST present.** This makes "zero AST
+fallback" a **categorical, no-exceptions requirement**, stricter than "AST-free
+at runtime":
+
+- **No `Construct*` anywhere in the serialized image — not even a pool of
+  program-lifetime AST pointers** (a pointer pool can't serialize). So dropping
+  `Instr::node` by moving nodes into a `Chunk::ast_nodes` pool is NOT acceptable
+  for `.myv`; every fallback op (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`) must be
+  TRULY nativized.
+- **Every op self-contained**; operands = slots / immediates / pool indices.
+- **Every pool serializes to bytes**: `consts` (scalar + nested array/dict/
+  struct VALUES), `member_keys` (the name string), the loc side table (ints),
+  `struct_defs` (full field layout), `closure_defs` (each nested function as its
+  OWN serialized sub-chunk + params/captures). Today `closure_defs` /
+  `struct_defs` hold AST-owned pointers → they need a serializable form.
+- **Exceptions MUST go native** — a `try` as `EvalStmt` is an AST reference, so
+  P8 is a PREREQUISITE for `.myv`, not an independent choice.
+- The inherently-AST reflection builtins **`show`** / a non-folding **`type`/
+  `typestr`** can't reference the AST in `.myv`: bake them to serializable data
+  (a pre-rendered string / a baked type object) or forbid them in `-c` output.
+- Format: magic number + a **bytecode version** + a compat check (reject a
+  mismatched `.myv`); pick/tag endianness.
+
+See `[[vm-endgame]]`. The rest of this doc is the incremental path there.
+
 Status: **Phase 5 in progress** — the register machine runs resolved-local
 int/float scalar loops (`while`/counted `for`, fused `ForLoopStep`) natively at
 top level, inside function bodies (`do_func_call` hooks `vm_run_chunk`), and
