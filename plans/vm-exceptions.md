@@ -219,13 +219,27 @@ the existing `MakeStruct`/`StructCtorV` ops).
 Deliberately NOT big-banged — `finally`/rethrow/nested/backtrace make it a
 focused effort.
 
-- **Inc 0 — structure, behavior identical (safe base).** `try/catch/finally`
-  compile to a handler region (`PushHandler`/`PopHandler`/`CatchTest`/
-  `EndFinally`) + the handler stack + the C++ boundary, **but `throw` and
-  runtime errors STILL go through C++** (caught by the boundary and routed into
-  the handler stack). Removes the `EvalStmt` for `try` (structure native) with
-  ZERO behavior change — the safest possible base. `42_exceptions` is not yet
-  faster (throw is still C++) but is now real ops.
+- **Inc 0 — structure native (safe base). ✅ DONE (bd3eb9c + follow-up).**
+  `try/catch` (NO finally, NO rethrow/flow-escape, resolved catch vars) compiles
+  to a handler region (`PushHandler`/`PopHandler`/`CatchTest`/`Reraise`) + the
+  handler stack + the C++ boundary; `throw` + runtime errors STILL go through
+  C++ (routed by the boundary). A finally / rethrow / a break/continue/return
+  could escape the try / a REPL catch var falls back to `EvalStmt` (unchanged).
+  Full suite 1371/1371 + VM differential 1220/1220.
+  **RESULTS (my/py, VM):** even with throw still C++, the native region + native
+  enclosing loop cut the common cases sharply — `42` **24×→11×**, `70`
+  **22×→9×**, and the no-throw `71` **0.40×→0.14×** (MyLang ~7× *faster* than
+  CPython: the native `PushHandler`/`PopHandler` beats the tree-walker's
+  TryCatchStmt scope-guard + child-context machinery). **REGRESSION:** `69`
+  cross-frame **~21% slower** (a throw through 16 handler-less frames now also
+  pays each frame's boundary landing-pad, on top of do_func_call's backtrace
+  catch). This is confined to the throw path (the boundary is proven FREE on the
+  no-throw path — 01/03/44/55 neutral), so it hits ONLY cross-frame
+  exceptions-as-control-flow (an anti-pattern). Fixing it by skipping the
+  boundary for handler-less chunks would risk the common hot path (a lambda/
+  extract refactor of the 1270-line loop) — a bad trade. **v2 (return-value
+  propagation) removes the C++ throw entirely and fixes `69` properly**; left as
+  a documented, tracked Inc-0 cost until then.
 - **Inc 1 — native `Throw` (THE win).** A same-frame `throw`→catch jumps via
   `dispatch_exc`, no C++ throw. `42_exceptions` drops sharply. Cross-frame
   throw still uses the C++ boundary.

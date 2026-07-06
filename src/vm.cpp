@@ -479,6 +479,32 @@ struct DynIterState {
     DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
 };
 
+/* P8 Inc 0: an active `try` region on the VM handler stack. `catch_pc` is where
+ * the boundary jumps on a caught exception (the CatchTest chain). */
+struct VmHandler {
+    uint32_t catch_pc;
+};
+
+/* The in-flight exception's type NAME for catch-matching (a user struct
+ * exception's type name, else the built-in name). Mirrors do_catch's ex_name. */
+static std::string_view vm_exc_name(const RuntimeException *ex)
+{
+    if (auto *eo = dynamic_cast<const ExceptionObject *>(ex))
+        return eo->get_name();
+    return ex->name;
+}
+
+/* The value `catch (T as e)` binds: a thrown struct's instance (so `e.field`
+ * works), else a fresh ExceptionObject. Mirrors do_catch's bind_val. */
+static EvalValue vm_catch_bind_val(RuntimeException *ex)
+{
+    auto *eo = dynamic_cast<ExceptionObject *>(ex);
+    if (eo && eo->get_data().is<intrusive_ptr<StructObject>>())
+        return eo->get_data();
+    return EvalValue(make_intrusive<ExceptionObject>(
+        eo ? *eo : ExceptionObject(ex->name)));
+}
+
 void
 vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 {
@@ -486,18 +512,24 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
      * chunk. */
     std::vector<DictIterState> dict_iters(chunk.n_dict_iters);
     std::vector<DynIterState> dyn_iters(chunk.n_dyn_iters);
+    /* P8: active `try` regions + the in-flight caught exception. Empty/null when
+     * no try is active (the common case), so no cost for exception-free code. */
+    std::vector<VmHandler> handlers;
+    std::unique_ptr<RuntimeException> vm_exc;
 
     /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
      * RuntimeException thrown by any op (a runtime-library error, a fallback
-     * `throw`, or a callee) into the VM handler stack. Behavior-neutral until
-     * the codegen emits PushHandler (handler stack stays empty → propagate
-     * unchanged). PROVEN hot-path-neutral (zero-cost EH: ratios 0.97-1.00 on the
-     * dispatch-bound VM benches), so it wraps the dispatch loop directly - no
-     * cold-wrapper needed. Body deliberately NOT reindented (a 1270-line switch;
-     * indentation is cosmetic). */
+     * `throw`, or a callee) into the VM handler stack: on a caught exception
+     * with an active handler, resume at its catch-dispatch pc. PROVEN hot-path-
+     * neutral (zero-cost EH: 0.97-1.00 on the dispatch-bound VM benches), so it
+     * wraps the dispatch loop directly - no cold-wrapper needed. Body
+     * deliberately NOT reindented (a 1270-line switch; indentation is cosmetic).
+     * `pc` lives out here so the catch can set it before `goto vm_resume`. */
+    size_t pc = 0;
+  vm_resume:
     try {
 
-    for (size_t pc = 0; ; ) {
+    for (; ; ) {
 
         const Instr &in = chunk.code[pc];
 
@@ -1764,12 +1796,68 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 pc++;
             break;
 
+        case OpCode::PushHandler:
+            handlers.push_back({ static_cast<uint32_t>(in.target) });
+            pc++;
+            break;
+
+        case OpCode::PopHandler:
+            handlers.pop_back();      /* the try body exited normally */
+            pc++;
+            break;
+
+        case OpCode::CatchTest: {
+            /* vm_exc holds the caught exception. Match its type name against
+             * this clause (a.lit = catch_types idx, or -1 = catch-all). On a
+             * match: bind `catch (T as e)` (target2 = slot, -1 if none), clear
+             * vm_exc, jump to the catch body (target). Else fall to the next
+             * CatchTest / Reraise. */
+            bool match;
+            if (in.a.lit < 0) {
+                match = true;
+            } else {
+                const std::vector<std::string> &names =
+                    chunk.catch_types[in.a.lit];
+                const std::string_view en = vm_exc_name(vm_exc.get());
+                match = false;
+                for (const std::string &nm : names)
+                    if (nm == en) { match = true; break; }
+            }
+            if (match) {
+                if (in.target2 >= 0)
+                    ctx.frame->at(in.target2).put(
+                        vm_catch_bind_val(vm_exc.get()));
+                vm_exc.reset();
+                pc = static_cast<size_t>(in.target);
+            } else {
+                pc++;
+            }
+            break;
+        }
+
+        case OpCode::Reraise:
+            /* No clause matched: re-raise the in-flight exception (C++ throw →
+             * the boundary routes it to the OUTER handler, or propagates).
+             * Mirrors TryCatchStmt's saved_ex->rethrow(). */
+            vm_exc->rethrow();
+            break;                    /* unreachable ([[noreturn]]) */
+
         case OpCode::Halt:
             return;
         }
     }
 
-    } catch (RuntimeException &) {
-        throw;   /* Inc 0 probe: no handlers yet → propagate unchanged */
+    } catch (RuntimeException &e) {
+        /* An exception reached the boundary: a fallback `throw`, a runtime-
+         * library error (div0/OOB/KeyNotFound/…), or a callee's uncaught throw.
+         * With an active try, route it to the innermost handler's catch-dispatch
+         * (like TryCatchStmt catching a RuntimeException); else propagate. */
+        if (handlers.empty())
+            throw;
+        vm_exc.reset(e.clone());               /* like saved_ex */
+        const VmHandler h = handlers.back();
+        handlers.pop_back();
+        pc = h.catch_pc;
+        goto vm_resume;                        /* re-enter at the CatchTest chain */
     }
 }

@@ -223,6 +223,29 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::Jump:
             row << "jmp          L" << in.target;
             break;
+        case OpCode::PushHandler:
+            row << "try.push     catch=L" << in.target;
+            break;
+        case OpCode::PopHandler:
+            row << "try.pop";
+            break;
+        case OpCode::CatchTest: {
+            row << "catch.test   ";
+            if (in.a.lit < 0)
+                row << "(any)";
+            else {
+                const auto &names = chunk.catch_types[in.a.lit];
+                for (size_t i = 0; i < names.size(); i++)
+                    row << (i ? "|" : "") << names[i];
+            }
+            if (in.target2 >= 0)
+                row << " as " << reg(chunk, in.target2);
+            row << " -> L" << in.target;
+            break;
+        }
+        case OpCode::Reraise:
+            row << "reraise";
+            break;
         case OpCode::JumpIfFalse:
             row << "jmp.ifnot    (" << node1(in.node) << "), L" << in.target;
             break;

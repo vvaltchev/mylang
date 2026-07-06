@@ -11514,6 +11514,7 @@ struct VmOpCounts {
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
     size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
     size_t storeelem2 = 0, storeev = 0;
+    size_t pushhandler = 0, catchtest = 0;
     int n_temps = 0;
 };
 
@@ -11571,6 +11572,8 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::StoreMemberV:     c.storememberv++; break;
             case OpCode::StoreElem2V:      c.storeelem2++; break;
             case OpCode::StoreElemValue:   c.storeev++; break;
+            case OpCode::PushHandler:      c.pushhandler++; break;
+            case OpCode::CatchTest:        c.catchtest++; break;
             case OpCode::DictLoadInt:      c.dictloadi++;  break;
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
@@ -11609,8 +11612,9 @@ static bool vm_codegen_shapes()
     /* 2) a while whose body has a NON-natively-compilable statement stays the
      * Phase-1 flatten - the whole body drops to one EvalStmt on the tree-walker's
      * tight counter: JumpIfFalse (the cond too, even though `i < 5` is an int
-     * compare) + LoopBackEdge, no native ops. Uses a try/catch body: the try
-     * block has no native lowering, so compile_scalar_body fails and the loop
+     * compare) + LoopBackEdge, no native ops. Uses a try/FINALLY body: a plain
+     * try/catch now lowers to a native handler region (P8 Inc 0), but a `finally`
+     * is deferred (Inc 0b), so compile_native_try falls back and the loop
      * flattens. (An ALL-native body goes native; a body that MIXES native ops
      * with a fallback call goes native around the EvalStmt - see the tests
      * below.) NB: the loop CONDITION alone no longer forces a fallback - a bool
@@ -11619,7 +11623,7 @@ static bool vm_codegen_shapes()
     VmOpCounts b;
     if (!codegen_counts({
             "var s = 0; var i = 0;",
-            "while (i < 5) { try { s += 1; } catch (x) { } i += 1; }",
+            "while (i < 5) { try { s += 1; } finally { } i += 1; }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -12082,6 +12086,32 @@ static bool vm_codegen_shapes()
         return false;
     const bool universal_store_ok = uv.evalstmt == 0 && uv.storeev >= 1;
 
+    /* 38) a try/catch region (P8 Inc 0) lowers natively: PushHandler + one
+     * CatchTest per clause + the enclosing counted loop stays native (for.step).
+     * The `throw` inside is still a fallback EvalStmt (Inc 0), so evalstmt > 0 -
+     * that's expected; what's asserted is the try STRUCTURE is native ops, not
+     * one big EvalStmt for the whole try/catch. A try/FINALLY still falls back. */
+    VmOpCounts tc;
+    if (!codegen_counts({
+            "struct E { int v; }",
+            "var c = 0;",
+            "for (var i = 0; i < 5; i++) {",
+            "  try { throw E(i); } catch (E) { c++; } }",
+        }, tc))
+        return false;
+    const bool try_native_ok =
+        tc.pushhandler == 1 && tc.catchtest == 1 && tc.flstep == 1;
+
+    VmOpCounts tf;
+    if (!codegen_counts({
+            "var c = 0;",
+            "for (var i = 0; i < 5; i++) {",
+            "  try { c += 1; } finally { c += 2; } }",
+        }, tf))
+        return false;
+    const bool try_finally_fallback_ok =
+        tf.pushhandler == 0 && tf.evalstmt >= 1;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -12093,7 +12123,7 @@ static bool vm_codegen_shapes()
         && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
         && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
         && struct_member_ok && nested_store_ok && global_store_ok
-        && universal_store_ok;
+        && universal_store_ok && try_native_ok && try_finally_fallback_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

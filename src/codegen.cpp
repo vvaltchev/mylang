@@ -2785,6 +2785,12 @@ struct Codegen {
                     any_native = true;
                     continue;
                 }
+            } else if (const TryCatchStmt *tc =
+                           dynamic_cast<const TryCatchStmt *>(s)) {
+                if (compile_native_try(tc)) {   /* native handler region (P8) */
+                    any_native = true;
+                    continue;
+                }
             } else if (const Block *blk = dynamic_cast<const Block *>(s)) {
                 /* A bare nested block `{ ... }` - what a const-folded
                  * `if (true) { ... }` leaves behind (a const condition drops
@@ -2858,7 +2864,11 @@ struct Codegen {
 
             if (dynamic_cast<const Expr14 *>(s)
                 || dynamic_cast<const CallExpr *>(s)
-                || dynamic_cast<const ReturnStmt *>(s)) {
+                || dynamic_cast<const ReturnStmt *>(s)
+                || dynamic_cast<const ThrowStmt *>(s)) {
+                /* A `throw` runs as a fallback EvalStmt (P8 Inc 0: still a C++
+                 * throw) - safe inside a native loop/region: the vm_run_chunk
+                 * boundary routes it to an active handler, or propagates it. */
                 emit(OpCode::EvalStmt, s);
                 continue;
             }
@@ -2939,6 +2949,132 @@ struct Codegen {
         } else {
             chunk.code[jf].target = here();          /* Lend */
         }
+        return true;
+    }
+
+    /* P8 Inc 0: true if `c` contains a break/continue/return/rethrow that could
+     * cross a try boundary (leaking a handler). Inc 0 falls such a try back to
+     * EvalStmt (flow-crossing-try is a later increment). Conservative: flags a
+     * break/continue even inside a NESTED loop in the body (safe, rare in a try
+     * body). Does NOT descend into a nested function (its flow is local). */
+    static bool contains_escaping_flow(const Construct *c)
+    {
+        if (!c)
+            return false;
+        if (dynamic_cast<const BreakStmt *>(c)
+            || dynamic_cast<const ContinueStmt *>(c)
+            || dynamic_cast<const ReturnStmt *>(c)
+            || dynamic_cast<const RethrowStmt *>(c))
+            return true;
+        if (dynamic_cast<const FuncDeclStmt *>(c))
+            return false;                    /* a nested function's flow is local */
+        if (const Block *b = dynamic_cast<const Block *>(c)) {
+            for (const auto &e : b->elems)
+                if (contains_escaping_flow(e.get()))
+                    return true;
+            return false;
+        }
+        if (const IfStmt *f = dynamic_cast<const IfStmt *>(c))
+            return contains_escaping_flow(f->thenBlock.get())
+                || contains_escaping_flow(f->elseBlock.get());
+        if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(c))
+            return contains_escaping_flow(w->body.get());
+        if (const ForStmt *fs = dynamic_cast<const ForStmt *>(c))
+            return contains_escaping_flow(fs->body.get());
+        if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(c))
+            return contains_escaping_flow(fr->body.get());
+        if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(c))
+            return contains_escaping_flow(fe->body.get());
+        if (const TryCatchStmt *t = dynamic_cast<const TryCatchStmt *>(c)) {
+            if (contains_escaping_flow(t->tryBody.get())
+                || contains_escaping_flow(t->finallyBody.get()))
+                return true;
+            for (const auto &cs : t->catchStmts)
+                if (contains_escaping_flow(cs.second.get()))
+                    return true;
+            return false;
+        }
+        return false;                        /* an expression statement */
+    }
+
+    /*
+     * P8 Inc 0: lower a `try {} catch (A) {} catch (B as e) {}` (NO finally, NO
+     * rethrow/flow-escape, resolved catch vars) to a native handler region.
+     * `throw` + runtime errors inside still C++-throw and are caught by
+     * vm_run_chunk's boundary, which routes them to the pushed handler. Layout:
+     *   PushHandler catch=Lcatch      ; active try region
+     *   <try body> ; PopHandler ; Jump Lend        ; normal exit
+     *   Lcatch:  CatchTest A -> Lca   ; boundary lands here (vm_exc set)
+     *            CatchTest B -> Lcb ; Reraise       ; no clause matched
+     *   Lca: <catch A> ; Jump Lend
+     *   Lcb: <catch B> ; Jump Lend
+     *   Lend:
+     */
+    bool compile_native_try(const TryCatchStmt *t)
+    {
+        if (t->finallyBody)
+            return false;                              /* finally: Inc 0b */
+        if (contains_escaping_flow(t->tryBody.get()))
+            return false;
+        for (const auto &cs : t->catchStmts) {
+            if (contains_escaping_flow(cs.second.get()))
+                return false;
+            const Identifier *asId = cs.first.asId.get();
+            if (asId && asId->sym.kind != SymKind::local)
+                return false;                  /* REPL: non-slot catch var */
+        }
+
+        const size_t start = chunk.code.size();
+        const size_t ct_start = chunk.catch_types.size();
+
+        const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
+        if (!compile_scalar_body(body_stmts(t->tryBody.get()), false)) {
+            chunk.code.resize(start);
+            chunk.catch_types.resize(ct_start);
+            return false;
+        }
+        emit(OpCode::PopHandler);
+        const size_t jend = emit(OpCode::Jump);        /* normal exit -> Lend */
+
+        chunk.code[ph].target = static_cast<int>(here());   /* Lcatch */
+
+        std::vector<size_t> tests;
+        for (const auto &cs : t->catchStmts) {
+            int types_idx = -1;
+            if (cs.first.exList) {
+                std::vector<std::string> names;
+                for (const auto &id : cs.first.exList->elems)
+                    names.push_back(std::string(id->get_str()));
+                types_idx = static_cast<int>(chunk.catch_types.size());
+                chunk.catch_types.push_back(std::move(names));
+            }
+            const Identifier *asId = cs.first.asId.get();
+            Instr in;
+            in.op = OpCode::CatchTest;
+            in.a = int_lit(types_idx);
+            in.target2 = asId ? asId->sym.slot : -1;   /* bind slot / -1 */
+            tests.push_back(chunk.code.size());         /* patch .target below */
+            chunk.code.push_back(in);
+        }
+        emit(OpCode::Reraise);
+
+        std::vector<size_t> body_jends;
+        size_t ci = 0;
+        for (const auto &cs : t->catchStmts) {
+            chunk.code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
+            if (!compile_scalar_body(body_stmts(cs.second.get()), false)) {
+                chunk.code.resize(start);
+                chunk.catch_types.resize(ct_start);
+                return false;
+            }
+            body_jends.push_back(emit(OpCode::Jump));   /* -> Lend */
+            ci++;
+        }
+
+        const int lend = static_cast<int>(here());
+        chunk.code[jend].target = lend;
+        for (size_t j : body_jends)
+            chunk.code[j].target = lend;
         return true;
     }
 
@@ -3765,6 +3901,11 @@ struct Codegen {
                 chunk.code.push_back(st);
                 return;
             }
+        }
+        /* A `try/catch` -> a native handler region (P8 Inc 0). */
+        if (const TryCatchStmt *tc = dynamic_cast<const TryCatchStmt *>(s)) {
+            if (compile_native_try(tc))
+                return;
         }
         emit(OpCode::EvalStmt, s);
     }

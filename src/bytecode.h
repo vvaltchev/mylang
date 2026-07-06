@@ -609,6 +609,25 @@ enum class OpCode : unsigned char {
      */
     JumpUnlessTrueV,
 
+    /*
+     * VM exceptions (P8 Inc 0). A `try/catch` (no finally) lowers to a handler
+     * region; `throw` + runtime errors still go through the C++ boundary in
+     * vm_run_chunk, which routes them into the handler stack. All AST-free
+     * (offsets + pool indices), so serializable.
+     *   PushHandler(target=catch_pc): push an active try region.
+     *   PopHandler: pop it (the try body exited normally).
+     *   CatchTest(a=catch_types idx or -1=catch-all, target2=bind slot or -1,
+     *             target=catch-body pc): if the in-flight exception's type name
+     *             matches, bind `catch (T as e)` + jump to the body; else fall
+     *             through to the next CatchTest / Reraise.
+     *   Reraise: no clause matched → re-raise the in-flight exception (C++
+     *            throw, routed to the OUTER handler or propagated).
+     */
+    PushHandler,
+    PopHandler,
+    CatchTest,
+    Reraise,
+
     /* Stop the program. */
     Halt,
 };
@@ -735,6 +754,15 @@ struct Chunk {
         Loc bstart, bend;         /* the base caret ("Expected dict object") */
     };
     std::vector<MemberKey> member_keys;
+
+    /*
+     * CATCH-TYPE POOL (P8). One entry per `catch (A, B, ...)` clause with a type
+     * list: the interned type NAMES a CatchTest matches the in-flight
+     * exception's name against (a user struct-type name or a built-in error
+     * name). A catch-all clause (`catch`/`catch (e)`) has no entry (CatchTest
+     * carries -1). Strings, so serializable as-is.
+     */
+    std::vector<std::vector<std::string>> catch_types;
 
     /*
      * Baked const array/dict/struct literals (LoadLiteralObjV). The op reads
