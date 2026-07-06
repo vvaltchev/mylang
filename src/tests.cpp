@@ -5006,6 +5006,56 @@ static const std::vector<test> tests =
         },
     },
 
+    /*
+     * A throw INSIDE a finally must PROPAGATE (superseding any pending
+     * exception / return), like Python/C#/Java - NOT crash. Regression guard:
+     * the tree-walker used to run finally in a noexcept scope-guard destructor,
+     * so a throwing finally hit std::terminate (crashing this whole -rt run).
+     * These also run under the VM (the differential), so tw and vm must agree.
+     */
+    {
+        "Finally: a throw in finally supersedes a caught inner exception",
+        {
+            "struct E { int v; } struct F { int v; }",
+            "var got = 0;",
+            "try {",
+            "   try { throw E(1); } finally { throw F(2); }",
+            "} catch (F) { got = 20; } catch (E) { got = 99; }",
+            "assert(got == 20);",       // F (from finally) wins, not E
+        },
+    },
+    {
+        "Finally: a throw in finally on the normal path propagates",
+        {
+            "struct F { int v; }",
+            "var got = 0;",
+            "try {",
+            "   try { var s = 1; } finally { throw F(2); }",
+            "} catch (F) { got = 20; }",
+            "assert(got == 20);",
+        },
+    },
+    {
+        "Finally: a throw in finally supersedes a pending return",
+        {
+            "struct F { int v; }",
+            "var got = 0;",
+            "func f {",
+            "   try { return 1; } finally { throw F(9); }",
+            "}",
+            "try { f(); } catch (F) { got = 5; }",
+            "assert(got == 5);",
+        },
+    },
+    {
+        "Finally: an uncaught throw in finally propagates (no terminate)",
+        {
+            "struct E { int v; }",
+            "try { } finally { throw E(7); }",
+        },
+        &typeid(ExceptionObject),
+    },
+
     {
         "Catch anything: TypeErrorEx",
         {

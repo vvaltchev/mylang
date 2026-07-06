@@ -3881,66 +3881,76 @@ do_catch(EvalContext *ctx,
 
 EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    struct trivial_scope_guard {
+    /*
+     * Run the try body + catch clauses. Returns normally (body completed, or a
+     * catch handled the exception - possibly leaving a return/break/continue in
+     * ctx->flow), or THROWS (an unhandled exception re-raised, or a NEW
+     * exception a catch body / `rethrow` threw). A lambda so `finally` can run
+     * it directly (no finally) or wrapped in a try (finally present).
+     *
+     * `finally` runs EXPLICITLY here, NOT in a scope-guard destructor: a
+     * destructor is implicitly noexcept, so a throw from the finally body used
+     * to hit std::terminate. Running it explicitly lets a throwing finally
+     * propagate (superseding any pending exception/flow), matching Python/C#/
+     * Java - and the VM.
+     */
+    auto run_try_catches = [&]() {
 
-        EvalContext *ctx;
-        Construct *finallyBody;
+        unique_ptr<RuntimeException> saved_ex;
 
-        trivial_scope_guard(EvalContext *ctx, Construct *body)
-            : ctx(ctx), finallyBody(body) { }
-
-        ~trivial_scope_guard() {
-
-            if (!finallyBody)
-                return;
-
-            FlowState &fs = *ctx->flow;
-
-            /*
-             * A return/break/continue may be in flight out of the try or catch
-             * block. Suspend it so the finally body runs to completion, then
-             * resume it - unless finally raised its own control-flow signal,
-             * which then takes over (as in C#/Java).
-             */
-            const FlowState::Type saved_type = fs.type;
-            EvalValue saved_val = move(fs.value);
-            fs.type = FlowState::none;
-
-            finallyBody->eval(ctx);
-
-            if (fs.type == FlowState::none) {
-                fs.type = saved_type;
-                fs.value = move(saved_val);
-            }
+        try {
+            tryBody->eval(ctx);
+        } catch (const RuntimeException &e) {
+            saved_ex.reset(e.clone());
         }
+
+        if (!saved_ex)
+            return;
+
+        for (const auto &p : catchStmts) {
+            if (do_catch(ctx, saved_ex.get(), p.first.exList.get(),
+                         p.first.asId.get(), p.second.get()))
+                return;                    /* handled (do_catch may itself throw) */
+        }
+
+        saved_ex->rethrow();               /* no clause matched -> re-raise */
     };
 
-    trivial_scope_guard on_exit(ctx, finallyBody.get());
-    unique_ptr<RuntimeException> saved_ex;
+    if (!finallyBody) {
+        run_try_catches();
+        return none;
+    }
+
+    /*
+     * With a `finally`: capture any exception AND any return/break/continue the
+     * try/catch left, run finally, then resume it - unless finally throws or
+     * raises its own flow signal, which SUPERSEDES the pending one.
+     */
+    unique_ptr<RuntimeException> pending;
 
     try {
-
-        tryBody->eval(ctx);
-
+        run_try_catches();
     } catch (const RuntimeException &e) {
-
-        saved_ex.reset(e.clone());
+        pending.reset(e.clone());
     }
 
-    if (!saved_ex)
-        return none;
+    FlowState &fs = *ctx->flow;
+    const FlowState::Type saved_type = fs.type;
+    EvalValue saved_val = move(fs.value);
+    fs.type = FlowState::none;
 
-    for (const auto &p : catchStmts) {
+    finallyBody->eval(ctx);                /* may throw / set its own flow */
 
-        IdList *exList = p.first.exList.get();
-        Identifier *asId = p.first.asId.get();
-        Construct *catchBody = p.second.get();
-
-        if (do_catch(ctx, saved_ex.get(), exList, asId, catchBody))
-            return none;
+    if (fs.type == FlowState::none) {
+        fs.type = saved_type;              /* resume the suspended signal */
+        fs.value = move(saved_val);
+    } else {
+        pending.reset();                   /* finally's own flow supersedes */
     }
 
-    saved_ex->rethrow();
+    if (pending)
+        pending->rethrow();
+
     return none; /* Make compilers unaware of [[noreturn]] happy */
 }
 
