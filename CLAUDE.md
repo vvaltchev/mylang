@@ -3336,8 +3336,12 @@ move preserves the real type. A **15-level randomly-nested if/while/for
 the `tests/nested_fuzz.py` differential fuzzer, which generates thousands of
 random deep-nested programs + their Python twins and checks tree-walker == VM ==
 CPython).
-**Suite geomean 0.82x, VM ~1.2x faster than the
-tree-walker.** The register choice (over a stack machine, which the
+**Suite geomean 0.61x, VM ~1.6x faster than the
+tree-walker** (improved from 0.82x as the container-STORE residuals — struct
+field, nested `a[i][j]`, global/capture base, and the universal dyn-base
+`StoreElemValue` — went native, so matrix/dict/struct benches no longer fall
+back: `68_nested` 0.22x, `65_struct_field_sum` 0.22x vs the tree-walker). The
+register choice (over a stack machine, which the
 already-M8-optimized tree-walker would beat) is also the right IR for the
 eventual native x86-64 codegen. Full roadmap + phase order:
 `plans/bytecode-vm.md`.
