@@ -260,9 +260,70 @@ that, like Python does."* Two readings, and this plan covers both:
   Deferred, but the handler-stack design leaves room (the currently-handled
   exception is knowable).
 
-**Open question for the maintainer:** did "nested" mean nested try blocks or
-exception chaining? The plan assumes chaining is the "later, like Python" part
-and builds nested try blocks in from the start; confirm.
+**CONFIRMED (maintainer, 2026-07-09):** "nested" = exception CHAINING. So v1 =
+C++-default (a throw during handling replaces); a later increment adds
+Python-style chaining (`__context__`). Nested TRY BLOCKS are built in from Inc 0
+(the stack).
+
+---
+
+## Cost model — what this removes, and the hot-path cost
+
+The maintainer's stress-test (all answered YES-honestly):
+
+**"It only removes the same-frame cost, not the C++ unwind cost in general."**
+Correct. v1 makes exactly ONE case native: a user `throw` caught in the SAME
+frame (bench 42). Runtime errors (div0/OOB/KeyNotFound/type — thrown by the
+runtime LIBRARY, outside the dispatch loop) and CROSS-FRAME user throws still
+C++-unwind. v1 is honestly "kill the AST fallback (unblocks `.myv`) + kill the
+C++ cost of the same-frame throw/catch idiom", not "kill C++ exceptions".
+
+**"A throw deep in the MyLang stack — slower?"** No, not vs today. The
+tree-walker ALREADY pays per-frame C++ cost: `do_func_call`'s `catch (Exception
+&)` catches + re-throws at EVERY frame to build the backtrace. So a deep
+already O(frames) of catch/rethrow; the VM boundary is the same order — not a
+regression, just not yet faster. **v2 (return-value propagation)** makes it
+fast: `vm_run_chunk` returns a status `{ok, exception}` instead of C++-throwing
+on no-local-handler; `do_func_call` returns it up; the CALLING op (`CallV`)
+checks it + runs `dispatch_exc` in the caller. Cross-frame unwind = a chain of
+status-return branches, ZERO C++ throw. Cost: one branch after each CALL (not
+each op).
+
+**"Cost in the hot path (no exceptions)? A per-block check?"** No per-op /
+per-block check — and this is where the C++-boundary design WINS over a
+return-code VM:
+- **Zero-cost EH** (Itanium/table-based on Linux) emits NO instructions to
+  enter/leave a `try`; the entire cost is on the THROW path (the unwinder walks
+  tables). So wrapping the loop adds no happy-path instructions. (Contrast:
+  CPython checks an error indicator after EVERY fallible op — a branch per op.)
+- **`PushHandler`/`PopHandler` are only at `try` boundaries**, never
+  per-op. Code
+  with NO `try` pays literally zero — no ops, no register, no check.
+- **The one real risk**: the `try{}catch` around the hottest function can make
+  the compiler slightly more conservative about code motion near the (already
+  potentially-throwing) call sites. Usually negligible, but MEASURE it.
+  **Mitigation if it regresses**: move the boundary to a COLD WRAPPER
+  (`try { dispatch(state); } catch { route + re-enter; }`) with the VM state
+  (`vm_exc`/`vm_handlers`/`pc`/the iterator pools) in a heap/ref struct, so the
+  hot dispatch loop is entirely `try`-free.
+
+### The spectrum
+
+| | same-frame | cross-frame | runtime error | hot path |
+|---|---|---|---|---|
+| today | C++ | C++ (per frame) | C++ | free |
+| **v1** (Inc 0–4) | **native** | C++ (per frame) | C++ | free |
+| **v2** ret-value prop | native | **native** | C++ (or native if VM-checked) | +1 branch / call |
+| **v3** runtime-lib ret codes | native | native | native | +check / fallible op — likely NOT worth it |
+
+Two v1-reachable refinements: (a) **VM-detected** errors (div0/OOB that the op
+checks itself in `IntBin`/`LoadElem`) can `dispatch_exc` not C++-throw,
+so they're native when caught nearby — only errors from INSIDE a called runtime
+fn need the boundary. (b) **EAFP** (`try { d[k] } catch(KeyNotFound)` in a loop)
+is the one runtime-error-as-control-flow worth caring about — makeable native by
+the VM's own dict/array read op `dispatch_exc`-ing on the miss. Most runtime
+errors are BUGS (thrown once at failure) → their C++ cost is irrelevant → v3 is
+low value.
 
 ---
 
