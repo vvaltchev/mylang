@@ -487,6 +487,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
     std::vector<DictIterState> dict_iters(chunk.n_dict_iters);
     std::vector<DynIterState> dyn_iters(chunk.n_dyn_iters);
 
+    /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
+     * RuntimeException thrown by any op (a runtime-library error, a fallback
+     * `throw`, or a callee) into the VM handler stack. Behavior-neutral until
+     * the codegen emits PushHandler (handler stack stays empty → propagate
+     * unchanged). PROVEN hot-path-neutral (zero-cost EH: ratios 0.97-1.00 on the
+     * dispatch-bound VM benches), so it wraps the dispatch loop directly - no
+     * cold-wrapper needed. Body deliberately NOT reindented (a 1270-line switch;
+     * indentation is cosmetic). */
+    try {
+
     for (size_t pc = 0; ; ) {
 
         const Instr &in = chunk.code[pc];
@@ -1757,5 +1767,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::Halt:
             return;
         }
+    }
+
+    } catch (RuntimeException &) {
+        throw;   /* Inc 0 probe: no handlers yet → propagate unchanged */
     }
 }
