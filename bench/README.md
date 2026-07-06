@@ -324,11 +324,24 @@ blow-out is per-iteration *genuine* exceptions (`42` ~22×).
   `26_dict_iterate` (0.74×):** MyLang does less or tighter work — an O(1)
   copy-on-write view instead of an O(k) list copy; a C++ `std::find`/`==` scan
   and `unordered_map` walk instead of per-element Python object dispatch.
-- **`42_exceptions` (~22×):** the remaining weak spot, and it's fundamental —
-  every `throw` heap-allocates an exception object and unwinds the C++ stack via
-  DWARF tables (~1.6µs, irreducible by build flags). This is the *right*
-  tradeoff: C++ "zero-cost" EH is free until thrown, so it's reserved for rare
-  events.
+- **Exceptions (`42`, `69`–`72`) — the remaining weak spot, measured as a full
+  suite so the cost picture is complete (not just one case):**
+  - `42_exceptions` (~24×): a **same-frame** `throw`/`catch` per iteration.
+  - `69_exc_crossframe` (~38×): a throw raised 16 frames deep, caught at the top
+    — *worse* than same-frame (per-frame C++ unwind), so a same-frame-only
+    optimization would leave this untouched.
+  - `70_exc_runtime_error` (~23×): a **native** `DivisionByZeroEx` from the
+    bottom of the type system, caught in a loop (EAFP) — the runtime-library
+    C++-throw path.
+  - `71_exc_no_throw` (~0.4×, MyLang **faster**) and `72_exc_finally` (~0.4×):
+    a `try`/`catch` (resp. `try`/`finally`) that **never throws** — the
+    no-exception hot path is essentially free, because C++ "zero-cost" EH costs
+    nothing until something is thrown.
+  Root cause of the throw-heavy cases: every `throw` heap-allocates + unwinds
+  the C++ stack via DWARF tables (~1.6µs, irreducible by build flags). The VM
+  exception work (`plans/vm-exceptions.md`) targets these — same-frame first,
+  then cross-frame (return-value propagation), then VM-detected runtime errors —
+  and this suite is the scoreboard for all three.
 - **`09_fib_recursive` (3.5×), `44_primes_sqrt` (2.5×):** these were ~31× and
   ~4.9× when `return`/`break`/`continue` rode on C++ exceptions (a base-case
   `return` fired millions of times). Moving them onto a `FlowState` flag — so

@@ -1,0 +1,20 @@
+# try/catch that NEVER throws — measures the pure handler-region overhead on the
+# no-exception HOT PATH (the try/catch setup per iteration). A native VM handler
+# region should make this ~free (PushHandler/PopHandler, no per-op check).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 500000 * scale;
+var s = 0;
+var caught = 0;
+
+for (var i = 0; i < N; i++) {
+    try {
+        s = (s + i) % 1000000007;
+    } catch (DivisionByZeroEx) {
+        caught++;                    # never taken
+    }
+}
+
+print("result:", s, caught);

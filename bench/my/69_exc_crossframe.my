@@ -1,0 +1,31 @@
+# cross-frame throw: an exception raised DEPTH frames deep, caught at the top.
+# Measures the per-frame unwind cost of a throw that crosses many MyLang frames
+# (the case a SAME-FRAME-only VM mechanism does NOT speed up; see
+# plans/vm-exceptions.md). `deep` recurses (a non-inlined real call) and throws
+# at the bottom.
+struct Err { int v; }
+
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func deep(n, i) {
+    if (n <= 0) {
+        throw Err(i);
+    }
+    deep(n - 1, i);
+}
+
+var N = 20000 * scale;
+var DEPTH = 16;
+var caught = 0;
+
+for (var i = 0; i < N; i++) {
+    try {
+        deep(DEPTH, i);
+    } catch (Err) {
+        caught++;
+    }
+}
+
+print("result:", caught);

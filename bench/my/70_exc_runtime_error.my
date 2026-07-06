@@ -1,0 +1,22 @@
+# a NATIVE runtime error (division by zero) thrown from the bottom of the type
+# system, caught in a loop (EAFP style). Measures the C++ runtime-error path,
+# which a user-throw-only VM mechanism does NOT speed up. The divisor is read
+# from a mutable array so it is a genuine RUNTIME zero (never const-folded).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var zeros = [0, 0, 0];
+var N = 200000 * scale;
+var caught = 0;
+
+for (var i = 0; i < N; i++) {
+    try {
+        var x = 100 / zeros[i % 3];
+        caught += x;                 # unreachable (always divides by zero)
+    } catch (DivisionByZeroEx) {
+        caught++;
+    }
+}
+
+print("result:", caught);
