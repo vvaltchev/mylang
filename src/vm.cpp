@@ -694,8 +694,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 int_type idx = read_int_operand(in.a, &ctx);
                 if (idx < 0)
                     idx += arr.size();
-                if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                    throw OutOfBoundsEx(in.node->start, in.node->end);
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                    Loc ls, le;
+                    chunk.loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
+                }
                 const size_type at = arr.offset() + idx;
                 int_type v;
                 if (arr.skind() == SharedArrayObj::Storage::ints)
@@ -706,7 +709,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     v = arr.get_vec()[at].getval<int_type>();
                 write_int_slot(&ctx, in.target, v);
             } else {
-                write_int_slot(&ctx, in.target, in.node->eval_int(&ctx));
+                /* base_array is PROVEN at this op, so the base is always an
+                 * array here - the old node->eval_int fallback was unreachable
+                 * (an invariant net; freeing it drops in.node). */
+                throw InternalErrorEx();
             }
             pc++;
             break;
@@ -720,8 +726,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 int_type idx = read_int_operand(in.a, &ctx);
                 if (idx < 0)
                     idx += arr.size();
-                if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                    throw OutOfBoundsEx(in.node->start, in.node->end);
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                    Loc ls, le;
+                    chunk.loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
+                }
                 const size_type at = arr.offset() + idx;
                 float_type v;
                 if (arr.skind() == SharedArrayObj::Storage::floats)
@@ -732,7 +741,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     v = arr.get_vec()[at].getval<float_type>();
                 write_float_slot(&ctx, in.target, v);
             } else {
-                write_float_slot(&ctx, in.target, in.node->eval_float(&ctx));
+                throw InternalErrorEx();   /* unreachable: base_array proven */
             }
             pc++;
             break;
@@ -741,8 +750,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::LoadElemValue: {
 
             /* a[i] (an array-valued element of a GENERAL array) into a temp
-             * slot, so a 2-D read `a[i][k]` is native (both indices). A
-             * non-array / non-general base falls back to the node. */
+             * slot, so a 2-D read `a[i][k]` is native (both indices). The base
+             * is a PROVEN general array (base_array + a general element type),
+             * so the old non-general node->eval fallback was unreachable. */
             const EvalValue &base = ctx.frame->at(in.target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
@@ -750,17 +760,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     int_type idx = read_int_operand(in.a, &ctx);
                     if (idx < 0)
                         idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        throw OutOfBoundsEx(in.node->start, in.node->end);
+                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                        Loc ls, le;
+                        chunk.loc_at(pc, ls, le);
+                        throw OutOfBoundsEx(ls, le);
+                    }
                     ctx.frame->at(in.target).put(
                         arr.get_vec()[arr.offset() + idx].get());
                     pc++;
                     break;
                 }
             }
-            ctx.frame->at(in.target).put(RValue(in.node->eval(&ctx)));
-            pc++;
-            break;
+            throw InternalErrorEx();   /* unreachable: base_array general proven */
         }
 
         case OpCode::DictIterInit: {

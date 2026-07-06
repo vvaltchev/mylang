@@ -3844,6 +3844,9 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
+        case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
+        case OpCode::LoadElemFloat:
+        case OpCode::LoadElemValue:
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
@@ -3858,8 +3861,11 @@ static void extract_locs(Chunk &chunk)
         case OpCode::ForLoopStep:
         case OpCode::LogV:
         case OpCode::MemberV:
+        case OpCode::ArrLen:         /* never throws (just reads the size) */
+        case OpCode::DictIterInit:   /* pins a proven dict; no node-based throw */
             /* node not needed for a caret: LogV never throws; MemberV's carets
-             * (and name/uid/optional) live in the member-key pool. Drop it. */
+             * (and name/uid/optional) live in the member-key pool; ArrLen /
+             * DictIterInit never throw with a node loc. Drop it. */
             in.node = nullptr;
             break;
         case OpCode::CallV:
