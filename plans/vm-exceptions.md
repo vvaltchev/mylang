@@ -251,8 +251,25 @@ focused effort.
   throw - the VM-detected-error refinement targets it); `71`/`72` unchanged.
   Verified 1371/1371 + 1220/1220; nested try + a `throw e` re-throwing a caught
   built-in both native + parity; uncaught loc/backtrace parity.
-- **Inc 2 — `finally` + `rethrow` + `catch (T as e)` binding fully native**
-  (the pending-action resume; `SetPend` for return/break/continue in a try).
+- **Inc 2 — `finally` + `rethrow` + flow-crossing.** Split:
+  - **2a rethrow ✅ (de0ab23).** Native `Rethrow` op (re-raise vm_exc with the
+    rethrow-site loc to the OUTER handler / propagate); `Reraise` now dispatches
+    natively too; CatchTest KEEPS vm_exc so a rethrow can re-raise it.
+  - **2b finally ✅.** The pending-action machinery: `Pend` (normal/reraise/ret/
+    brk/cont) + `SetPend`/`EndFinally` ops + `vm_pend`. Every try exit sets the
+    pending action + jumps to one shared finally block; `EndFinally` resumes it
+    (Inc 2b: normal → fall through, reraise → re-raise vm_exc). try/catch/finally
+    is now fully native. **`72_exc_finally` my/py 0.36× → 0.17× (MyLang ~6×
+    FASTER than CPython).** NOTE: the VM is MORE correct than the tree-walker on
+    a **throw inside a finally** — the tree-walker runs finally in a (noexcept)
+    scope-guard *destructor*, so a throwing finally always `terminate`s; the VM
+    handles it (the throw propagates, matching Python). No -rt test / bench /
+    fuzz hits it (they'd crash the tree-walker). A tree-walker fix (finally not
+    in a destructor) would restore strict tw==vm, but is out of the VM scope.
+  - **2c flow-crossing-try (next).** A break/continue/return that crosses a try
+    (must run finally + pop the handler first): `SetPend ret/brk/cont` + jump to
+    finally; `EndFinally` resumes the flow. Removes the last fall-back
+    restriction (`contains_escaping_flow`).
 - **Inc 3 — nested try / dynamic nesting.** The handler STACK already supports
   it; this increment is really "prove it": lexical `try{ try{}catch{} }catch{}`
   and a `try` in a called function. (If Inc 0–2 shipped with a depth-1 handler

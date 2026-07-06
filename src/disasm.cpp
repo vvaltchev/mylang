@@ -252,6 +252,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::Rethrow:
             row << "rethrow";
             break;
+        case OpCode::SetPend: {
+            const char *p = in.target == 0 ? "normal" :
+                            in.target == 1 ? "reraise" :
+                            in.target == 2 ? "ret" :
+                            in.target == 3 ? "break" : "continue";
+            row << "set.pend     " << p;
+            if (in.target == 2)
+                row << " " << D(in.a.slot);
+            break;
+        }
+        case OpCode::EndFinally:
+            row << "end.finally";
+            break;
         case OpCode::JumpIfFalse:
             row << "jmp.ifnot    (" << node1(in.node) << "), L" << in.target;
             break;

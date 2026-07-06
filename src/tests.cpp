@@ -11515,6 +11515,7 @@ struct VmOpCounts {
     size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
     size_t storeelem2 = 0, storeev = 0;
     size_t pushhandler = 0, catchtest = 0, throwop = 0;
+    size_t setpend = 0, endfinally = 0;
     int n_temps = 0;
 };
 
@@ -11575,6 +11576,8 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::PushHandler:      c.pushhandler++; break;
             case OpCode::CatchTest:        c.catchtest++; break;
             case OpCode::Throw:            c.throwop++; break;
+            case OpCode::SetPend:          c.setpend++; break;
+            case OpCode::EndFinally:       c.endfinally++; break;
             case OpCode::DictLoadInt:      c.dictloadi++;  break;
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
@@ -11613,9 +11616,10 @@ static bool vm_codegen_shapes()
     /* 2) a while whose body has a NON-natively-compilable statement stays the
      * Phase-1 flatten - the whole body drops to one EvalStmt on the tree-walker's
      * tight counter: JumpIfFalse (the cond too, even though `i < 5` is an int
-     * compare) + LoopBackEdge, no native ops. Uses a try/FINALLY body: a plain
-     * try/catch now lowers to a native handler region (P8 Inc 0), but a `finally`
-     * is deferred (Inc 0b), so compile_native_try falls back and the loop
+     * compare) + LoopBackEdge, no native ops. Uses a try whose body has a
+     * FLOW-ESCAPE (`break`): try/catch/finally all lower to native handler
+     * regions now (P8 Inc 0-2b), but a break/continue/return that crosses the try
+     * is deferred (Inc 2c), so compile_native_try falls back and the loop
      * flattens. (An ALL-native body goes native; a body that MIXES native ops
      * with a fallback call goes native around the EvalStmt - see the tests
      * below.) NB: the loop CONDITION alone no longer forces a fallback - a bool
@@ -11624,7 +11628,7 @@ static bool vm_codegen_shapes()
     VmOpCounts b;
     if (!codegen_counts({
             "var s = 0; var i = 0;",
-            "while (i < 5) { try { s += 1; } finally { } i += 1; }",
+            "while (i < 5) { try { break; } catch (X) { } i += 1; }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -12106,6 +12110,8 @@ static bool vm_codegen_shapes()
         tc.pushhandler == 1 && tc.catchtest == 1 && tc.flstep == 1
         && tc.throwop == 1 && tc.evalstmt == 0;
 
+    /* P8 Inc 2b: try/finally lowers natively - a handler region + SetPend on
+     * each exit + one EndFinally, zero fallback. */
     VmOpCounts tf;
     if (!codegen_counts({
             "var c = 0;",
@@ -12113,8 +12119,9 @@ static bool vm_codegen_shapes()
             "  try { c += 1; } finally { c += 2; } }",
         }, tf))
         return false;
-    const bool try_finally_fallback_ok =
-        tf.pushhandler == 0 && tf.evalstmt >= 1;
+    const bool try_finally_native_ok =
+        tf.pushhandler == 1 && tf.endfinally == 1 && tf.setpend >= 2
+        && tf.evalstmt == 0;
 
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
@@ -12127,7 +12134,7 @@ static bool vm_codegen_shapes()
         && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
         && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
         && struct_member_ok && nested_store_ok && global_store_ok
-        && universal_store_ok && try_native_ok && try_finally_fallback_ok;
+        && universal_store_ok && try_native_ok && try_finally_native_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

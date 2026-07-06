@@ -3052,12 +3052,21 @@ struct Codegen {
      *   Lcb: <catch B> ; Jump Lend
      *   Lend:
      */
+    /* Emit SetPend <p> (Inc 2b): the pending action a following finally runs. */
+    void emit_setpend(Pend p)
+    {
+        Instr in;
+        in.op = OpCode::SetPend;
+        in.target = static_cast<int>(p);
+        chunk.code.push_back(in);
+    }
+
     bool compile_native_try(const TryCatchStmt *t)
     {
-        if (t->finallyBody)
-            return false;                              /* finally: Inc 0b */
+        const bool has_fin = t->finallyBody != nullptr;
+
         if (contains_escaping_flow(t->tryBody.get()))
-            return false;
+            return false;                              /* flow crossing: Inc 2c */
         for (const auto &cs : t->catchStmts) {
             if (contains_escaping_flow(cs.second.get()))
                 return false;
@@ -3065,18 +3074,37 @@ struct Codegen {
             if (asId && asId->sym.kind != SymKind::local)
                 return false;                  /* REPL: non-slot catch var */
         }
+        if (has_fin && contains_escaping_flow(t->finallyBody.get()))
+            return false;                      /* flow in a finally: later */
 
         const size_t start = chunk.code.size();
         const size_t ct_start = chunk.catch_types.size();
 
-        const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
-        if (!compile_scalar_body(body_stmts(t->tryBody.get()), false)) {
+        /* Jumps to the finally block / to Lend, backpatched at the end. With a
+         * finally, every exit path sets the pending action + jumps to Lfin
+         * (EndFinally resumes it); without, exits jump straight to Lend. */
+        std::vector<size_t> to_fin, to_end;
+        auto exit_to = [&](Pend p) {
+            if (has_fin) {
+                emit_setpend(p);
+                to_fin.push_back(emit(OpCode::Jump));
+            } else if (p == Pend::reraise) {
+                emit(OpCode::Reraise);
+            } else {
+                to_end.push_back(emit(OpCode::Jump));
+            }
+        };
+        auto bail = [&]() {
             chunk.code.resize(start);
             chunk.catch_types.resize(ct_start);
             return false;
-        }
+        };
+
+        const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
+        if (!compile_scalar_body(body_stmts(t->tryBody.get()), false))
+            return bail();
         emit(OpCode::PopHandler);
-        const size_t jend = emit(OpCode::Jump);        /* normal exit -> Lend */
+        exit_to(Pend::normal);                         /* normal try exit */
 
         chunk.code[ph].target = static_cast<int>(here());   /* Lcatch */
 
@@ -3098,24 +3126,28 @@ struct Codegen {
             tests.push_back(chunk.code.size());         /* patch .target below */
             chunk.code.push_back(in);
         }
-        emit(OpCode::Reraise);
+        exit_to(Pend::reraise);                        /* no clause matched */
 
-        std::vector<size_t> body_jends;
         size_t ci = 0;
         for (const auto &cs : t->catchStmts) {
             chunk.code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
-            if (!compile_scalar_body(body_stmts(cs.second.get()), false)) {
-                chunk.code.resize(start);
-                chunk.catch_types.resize(ct_start);
-                return false;
-            }
-            body_jends.push_back(emit(OpCode::Jump));   /* -> Lend */
+            if (!compile_scalar_body(body_stmts(cs.second.get()), false))
+                return bail();
+            exit_to(Pend::normal);                     /* catch body done */
             ci++;
         }
 
+        if (has_fin) {
+            const int lfin = static_cast<int>(here());
+            for (size_t j : to_fin)
+                chunk.code[j].target = lfin;
+            if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
+                return bail();
+            emit(OpCode::EndFinally);
+        }
+
         const int lend = static_cast<int>(here());
-        chunk.code[jend].target = lend;
-        for (size_t j : body_jends)
+        for (size_t j : to_end)
             chunk.code[j].target = lend;
         return true;
     }

@@ -545,6 +545,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
      * no try is active (the common case), so no cost for exception-free code. */
     std::vector<VmHandler> handlers;
     std::unique_ptr<RuntimeException> vm_exc;
+    /* P8 Inc 2b: the pending action a `finally` must resume (set by SetPend,
+     * consumed by EndFinally); vm_pend_val is the return value for Pend::ret. */
+    Pend vm_pend = Pend::normal;
+    EvalValue vm_pend_val;
 
     /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
      * RuntimeException thrown by any op (a runtime-library error, a fallback
@@ -1906,6 +1910,32 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 break;
             vm_exc->rethrow();
             break;                    /* unreachable ([[noreturn]]) */
+
+        case OpCode::SetPend:
+            /* Record what a following `finally` must resume (Inc 2b). */
+            vm_pend = static_cast<Pend>(in.target);
+            if (vm_pend == Pend::ret)                 /* value for ret (Inc 2c) */
+                vm_pend_val = ctx.frame->at(in.a.slot).get();
+            pc++;
+            break;
+
+        case OpCode::EndFinally:
+            /* End of a `finally`: resume the pending action. */
+            switch (vm_pend) {
+            case Pend::normal:
+                pc++;                                 /* fall through to Lend */
+                break;
+            case Pend::reraise:
+                /* finally didn't handle the exception → re-raise it. */
+                if (vm_dispatch_exc(handlers, pc))
+                    break;
+                vm_exc->rethrow();
+                break;
+            default:
+                /* ret/brk/cont crossing a try: Inc 2c (not emitted yet). */
+                throw InternalErrorEx();
+            }
+            break;
 
         case OpCode::Halt:
             return;

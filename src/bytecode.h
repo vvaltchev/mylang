@@ -24,6 +24,12 @@
  *
  * (Named OpCode, not Op: `Op` is already the operator enum in operators.h.)
  */
+/* P8 Inc 2b: the pending action a `finally` block must resume after it runs (a
+ * SetPend value; EndFinally consumes it). `normal` falls through; `reraise`
+ * re-raises the in-flight vm_exc; `ret`/`brk`/`cont` (Inc 2c) resume a flow
+ * signal that crossed the try. */
+enum class Pend : unsigned char { normal, reraise, ret, brk, cont };
+
 enum class OpCode : unsigned char {
 
     /*
@@ -627,6 +633,11 @@ enum class OpCode : unsigned char {
      *   Throw(a=value slot): raise the value (Inc 1). A same-frame catch is a
      *            NATIVE jump (no C++ throw); no handler here → C++ throw
      *            (cross-frame). The throw-site loc is in the loc side table.
+     *   SetPend(target=Pend): set the pending action a following `finally` must
+     *            resume (Inc 2b). `a` = the return-value slot (for Pend::ret).
+     *   EndFinally: at a `finally` block's end, resume vm_pend - fall through
+     *            (normal), re-raise vm_exc (reraise), or (Inc 2c)
+     *            return/break/continue.
      */
     Throw,
     PushHandler,
@@ -634,6 +645,8 @@ enum class OpCode : unsigned char {
     CatchTest,
     Reraise,
     Rethrow,
+    SetPend,
+    EndFinally,
 
     /* Stop the program. */
     Halt,
