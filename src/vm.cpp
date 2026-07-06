@@ -716,6 +716,38 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::DictStore: {
+
+            /* d[k] = v / d[k] OP= v (P2): if the slot holds a dict, store via
+             * vm_dict_store (shared Type::subscript(for_write) + slot_rmw -
+             * matches the tree-walker's auto-vivify / COW / key-freeze / throw
+             * behavior). A non-dict (none / dyn-laundered) base falls back. */
+            LValue &dlv = ctx.frame->at(in.target2);
+            if (dlv.get().is<intrusive_ptr<DictObject>>()) {
+                const EvalValue &key = ctx.frame->at(in.a.slot).get();
+                const EvalValue &val = ctx.frame->at(in.b.slot).get();
+                /* subscript errors (missing key, read-only) take the SUB's
+                 * loc (`d[k]`), not the Expr14's - matching the tree-walker
+                 * (Subscript::do_eval stamps its own node). */
+                const Construct *lvn =
+                    static_cast<const Expr14 *>(in.node)->lvalue.get();
+                try {
+                    vm_dict_store(&dlv, key, val, in.aop, lvn);
+                } catch (Exception &e) {
+                    if (!e.loc_start) {
+                        e.loc_start = lvn->start;
+                        e.loc_end = lvn->end;
+                    }
+                    throw;
+                }
+                pc++;
+                break;
+            }
+            in.node->eval(&ctx);
+            pc++;
+            break;
+        }
+
         case OpCode::EvalToSlot: {
 
             /* A scalar-result call evaluated into a temp (native builtin/call

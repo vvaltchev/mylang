@@ -1394,6 +1394,12 @@ public:
      * to re-evaluate them in the dict fallback path. */
     bool base_array = false;
 
+    /* Set by the inferencer when `what` is statically a DICT (analogous to
+     * base_array). The VM compiles a native DictStore for `d[k]=v`/`d[k]OP=v`
+     * only when this holds - the runtime type + COW + vivify are handled by
+     * the shared Type::subscript path. */
+    bool base_dict = false;
+
     Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     int_type eval_int(EvalContext *ctx) const override;
@@ -1406,6 +1412,7 @@ public:
         c->what = clone_as(what);
         c->index = clone_as(index);
         c->base_array = base_array;
+        c->base_dict = base_dict;
         return c;
     }
 };

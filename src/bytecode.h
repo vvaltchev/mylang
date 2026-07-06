@@ -146,6 +146,20 @@ enum class OpCode : unsigned char {
     StoreElemFloat,
 
     /*
+     * Native DICT element store `d[k] = v` / `d[k] OP= v` (P2): `target2` = the
+     * dict's (local) slot, `a` = the KEY operand (a boxed temp slot), `b` = the
+     * VALUE operand (a boxed temp slot), `aop` = the Expr14 op (`Op::assign` /
+     * `addeq` / ...), `node` = the Expr14 (loc/fallback). The value is compiled
+     * before the key (tree-walker order: rhs, then the lvalue's base+index; the
+     * base is a side-effect-free slot read done here). vm_dict_store reuses the
+     * shared Type::subscript(for_write) path (auto-vivify on a plain miss,
+     * COW, key-freeze) + slot_rmw, matching the tree-walker exactly. If the
+     * slot doesn't hold a dict at runtime (a dyn-laundered base) it falls back
+     * to `node->eval`. Emitted only when the inferencer proved base_dict.
+     */
+    DictStore,
+
+    /*
      * Evaluate a scalar-returning CALL (a builtin - via the baked
      * DirectBuiltinCallExpr fn pointer - or a user function) into a temp slot
      * as an RValue (Phase 5): `target` = the dst temp, `node` = the CallExpr.

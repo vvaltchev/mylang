@@ -1374,6 +1374,7 @@ void Inferencer::annotate_hints(Construct *n)
     if (auto *sub = dynamic_cast<Subscript *>(n)) {
         StaticTypeRef bt = static_type_resolve(type_of(sub->what.get()));
         sub->base_array = bt->kind == StaticTypeKind::Array;
+        sub->base_dict = bt->kind == StaticTypeKind::Dict;
     }
 
     /* VM native-call hint: the callee is a user FUNCTION (Func static type -

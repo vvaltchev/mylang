@@ -336,6 +336,11 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             const Construct *arg0, const CallExpr *ctor,
                             const EvalValue *vals, size_t n);
 
+/* VM P2: native dict element store `d[k] = v` / `d[k] OP= v` - reuses the
+ * shared Type::subscript(for_write) lvalue path + slot_rmw. See eval.cpp. */
+EvalValue vm_dict_store(LValue *dict_lv, const EvalValue &key,
+                        const EvalValue &value, Op op, const Construct *node);
+
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
 void run_weight_bench();

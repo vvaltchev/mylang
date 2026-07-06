@@ -14,7 +14,8 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | Cat | Construct | Benches | Fix (Part B) | Status |
 |---|---|---|---|---|
 | ~~**B**~~ | ~~bool array r/w~~ | ~~43,56,57~~ | ~~P1~~ | ✅ 43:.48 56:.15 |
-| **D1** | dict store `d[k]=v`, `d.k=v` | 23,24,26,27,47,62 | P2 | todo |
+| ~~D1~~ | ~~dict store~~ | 5 | ~~P2~~ | ✅ .55/.43 |
+| **D1m** | dict MEMBER store `d.k=v` | (rare) | P2b | todo |
 | **D2** | typed dict read `d.k`/`d[k]` int/float | 25 | P3 | todo |
 | **D3** | dict `foreach(k,v in d)` | 26,47,62 | P5c | todo |
 | **G** | general array store `a[i]=<non-scalar>` | 46,20,31,32,47 | P4 | todo |
@@ -30,8 +31,8 @@ Plus the Part-C native-but-slow work (typed reads, computed-goto dispatch,
 arg-view builtin ABI, ...) — none skipped.
 
 **Goal restated:** lift the `-vm` geomean from **~4.0× CPython** to **5×+**.
-Progress: **P1 done → 3.76×→3.82×** (bool sieve now native; the 60-bench
-geomean, `run.py`'s 61-set reads ~4.0×).
+Progress (60-bench geomean; `run.py`'s 61-set reads a touch higher):
+**baseline 3.76× → P1 (bool) 3.82× → P2 (dict store) 3.96×.**
 
 **Method:** ran `mylang -vd` on all 62 `bench/my/*.my` and recorded every
 AST-fallback op (`eval.stmt` = `EvalStmt`, `eval.slot` = `EvalToSlot` — the two
@@ -116,8 +117,21 @@ invalidate. `a[i]=true/false` and `if(a[i])` in the sieve become native (the
 inner `while(j<n){primes[j]=false;j+=i;}` is ALREADY native but for that one
 store). Highest value-to-effort ratio; **do first**.
 
-### P2. Dict subscript/member store — `DictStore`
-*Benches: 23, 24, 26, 27, 47, 62 (six). MED risk.* The biggest category. A
+### P2. Dict subscript store — `DictStore` — DONE (2026-07-05)
+Landed: a `base_dict` inferencer flag (mirrors `base_array`) + a `DictStore` op.
+Codegen recognizes `d[k] = v` / `d[k] OP= v` with a local-slot dict base,
+compiles the value then the key to boxed temps (rhs-then-lvalue order), emits
+`DictStore`. `vm_dict_store` (eval.cpp) reuses the shared
+`Type::subscript(for_write)` lvalue path (auto-vivify on a plain-assign miss,
+COW, container-key freeze) + `slot_rmw` (assign/compound), so results, the
+missing-key-on-compound `KeyNotFoundEx` (with the SUBSCRIPT's caret), read-only-
+dict `NotLValueEx`, and default-dict vivify match the tree-walker. A non-dict
+runtime base (none / dyn-laundered) falls back. 1306→ +2 tests, 1157/1157
+differential, RECYCLE+ASan. Benches: 23 .72→.55, 62 .67→.43, 26 .39→.32, 27/47
+.7→.67; geomean 3.82×→3.96×. **Follow-ups:** a MEMBER store `d.k = v` (D1m/P2b,
+rare) and a GLOBAL/capture dict base (only local slots for now) stay fallback.
+
+*(original design)* A dict subscript/member store, biggest category. A
 `d[k]=v` / `d.k=v` op: read the dict slot, evaluate key+value operands (boxed),
 call the shared `TypeDict::subscript(..,for_write=true)` path (auto-vivify,
 key-freeze, COW) the tree-walker uses — a runtime FUNCTION, no `node->eval`.

@@ -2721,6 +2721,25 @@ static const std::vector<test> tests =
       { "assert(hash(1) == hash(1.0));" } },
 
     /* any-type dict keys (enabled by universal hashing) + key-freeze safety */
+    { /* P2: the VM's native dict element store (DictStore) - in-loop build,
+       * compound, string + container keys, overwrite, default dict, and the
+       * missing-key-on-compound throw. The differential runs it both engines,
+       * so it pins the native path against the tree-walker oracle. */
+      "dict store: in-loop build / compound / keys (VM native DictStore)",
+      { "var d = {};",
+        "for (var i = 0; i < 5; i++) d[i] = i * i;",
+        "var s = 0; for (var i = 0; i < 5; i++) s += d[i];",
+        "assert(s == 30);",
+        "d[2] += 100; assert(d[2] == 104);",
+        "d[0] = 7; assert(d[0] == 7);",       /* overwrite */
+        "var w = {}; w[\"a\"] = 1; w[\"b\"] = 2; w[\"a\"] += 10;",
+        "assert(w[\"a\"] == 11 && w[\"b\"] == 2);",
+        "var kd = {}; kd[[1,2]] = 9; assert(kd[[1,2]] == 9);",
+        "var dd = dict(0); for (var i = 0; i < 3; i++) dd[i % 2] += 1;",
+        "assert(dd[0] == 2 && dd[1] == 1 && dd[9] == 0);" } },
+    { "dict store: compound on a missing key throws (native path)",
+      { "var d = {};", "d[5] += 1;" },
+      &typeid(KeyNotFoundEx) },
     { "dict key: an array can be a key",
       { "var d = {}; d[[1,2]] = 5; d[[3,4]] = 6;",
         "assert(d[[1,2]] == 5);",

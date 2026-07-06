@@ -1215,6 +1215,36 @@ struct Codegen {
          * A subscript lvalue can't be a scalar slot, so this always returns. */
         if (const Subscript *sub =
                 dynamic_cast<const Subscript *>(e->lvalue.get())) {
+
+            /* P2: a DICT element store `d[k] = v` / `d[k] OP= v` -> DictStore.
+             * The base must be a local slot; the KEY + VALUE compile to boxed
+             * temps (value first - tree-walker rhs-then-lvalue order; the base
+             * `d` is a side-effect-free slot read done in the handler). The
+             * runtime Type::subscript(for_write) + slot_rmw do the store. */
+            if (sub->base_dict) {
+                int dslot;
+                switch (e->op) {
+                case Op::assign: case Op::addeq: case Op::subeq:
+                case Op::muleq:  case Op::diveq: case Op::modeq: break;
+                default: return false;
+                }
+                if (!as_array_slot(sub->what.get(), dslot))
+                    return false;
+                int vslot, kslot;
+                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
+                    || !compile_boxed_expr(sub->index.get(), kslot, ops))
+                    return false;
+                Instr in;
+                in.op = OpCode::DictStore;
+                in.node = s;
+                in.target2 = dslot;
+                in.a = slot_op(kslot);
+                in.b = slot_op(vslot);
+                in.aop = e->op;
+                ops.push_back(in);
+                return true;
+            }
+
             if (sub->th != TypeHint::i || !sub->base_array)
                 return false;
             Op aop;
