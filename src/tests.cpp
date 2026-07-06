@@ -5082,6 +5082,85 @@ static const std::vector<test> tests =
             "assert(f() == 6);",       // 0+1+2+3 = 6, returned at i==3
         },
     },
+    {
+        /* P8 Inc 2c step 2: a `return` crossing a single finally runs the
+         * finally FIRST, and the return value (captured in vm_pend_val, a
+         * register) survives the finally's mutations. */
+        "return crossing a finally: value survives, finally runs",
+        {
+            "var fran = 0;",
+            "func f(n) {",
+            "   var s = 0;",
+            "   try { s = n * 2; return s; }",
+            "   finally { fran = 1; s = 999; }",  // must NOT change the result
+            "}",
+            "assert(f(10) == 20);",               // 20, not 999
+            "assert(fran == 1);",                 // finally ran
+        },
+    },
+    {
+        /* A return in a CATCH body of a finally-try: the handler is already
+         * popped by the dispatch (no double-pop); the finally still runs. */
+        "return from a catch body crosses the finally",
+        {
+            "struct E { int v; }",
+            "var fran = 0;",
+            "func g(n) {",
+            "   try { throw E(n); }",
+            "   catch (E) { return n + 100; }",
+            "   finally { fran = fran + 1; }",
+            "}",
+            "assert(g(5) == 105); assert(fran == 1);",
+        },
+    },
+    {
+        /* A conditional return AND the normal fall-through both run finally. */
+        "finally runs on both the return and the fall-through path",
+        {
+            "var hits = 0;",
+            "func h(n) {",
+            "   var r = -1;",
+            "   try { if (n > 0) { return n; } r = 7; }",
+            "   finally { hits = hits + 1; }",
+            "   return r;",
+            "}",
+            "assert(h(3) == 3); assert(h(-1) == 7);",
+            "assert(hits == 2);",                  // finally ran both times
+        },
+    },
+    {
+        /* A return crossing NESTED finallys is not native yet (chaining) - it
+         * falls back to the tree-walker, which must run BOTH finallys in order.
+         * Regression guard: the VM once skipped the finallys here (a fallback
+         * EvalStmt-return stopped the chunk, bypassing the native finally). */
+        "return crossing nested finallys runs both (fallback)",
+        {
+            "var order = [];",
+            "func f(n) {",
+            "   try {",
+            "       try { return n; } finally { append(order, 1); }",
+            "   } finally { append(order, 2); }",
+            "}",
+            "assert(f(7) == 7);",
+            "assert(len(order) == 2);",
+            "assert(order[0] == 1 && order[1] == 2);",   // inner before outer
+        },
+    },
+    {
+        /* A return in a no-finally try nested inside a finally-try: also falls
+         * back; the outer finally must still run. */
+        "return through an intervening try still runs the outer finally",
+        {
+            "struct E { int v; }",
+            "var ran = 0;",
+            "func f(n) {",
+            "   try {",
+            "       try { return n * 3; } catch (E) { }",
+            "   } finally { ran = 1; }",
+            "}",
+            "assert(f(4) == 12); assert(ran == 1);",
+        },
+    },
 
     {
         "Catch anything: TypeErrorEx",
@@ -11596,6 +11675,8 @@ struct VmOpCounts {
     int n_temps = 0;
 };
 
+static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c);
+
 static bool codegen_counts(const std::vector<const char *> &lines,
                            VmOpCounts &c)
 {
@@ -11618,6 +11699,17 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             return false;
         const Chunk chunk = codegen_program(b);
         c.n_temps = chunk.n_temps;
+        count_chunk_ops(chunk, c);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+/* Shared op tally, used by both codegen_counts (the main chunk) and
+ * codegen_func_counts (a function-body chunk). */
+static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
+{
         for (const Instr &in : chunk.code) {
             switch (in.op) {
             case OpCode::JumpIfFalse:      c.jif++;    break;
@@ -11664,6 +11756,48 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             default:                                   break;
             }
         }
+}
+
+/* Like codegen_counts, but tallies the FIRST top-level function's BODY chunk -
+ * functions are compiled lazily by the do_func_call VM hook, so codegen_program
+ * only covers "main". Used to assert a function body's native op shape (e.g. a
+ * return crossing a finally). Define the function CONCRETELY (annotate its
+ * params) and don't call it, so there is no template clone to pick up. */
+static bool codegen_func_counts(const std::vector<const char *> &lines,
+                                VmOpCounts &c)
+{
+    std::string src;
+    std::vector<Tok> toks;
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (i) src += '\n';
+        src += lines[i];
+    }
+    lexer(src, 1, toks);
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (!b)
+            return false;
+        const FuncDeclStmt *fn = nullptr;
+        for (const auto &e : b->elems)
+            if (const FuncDeclStmt *f =
+                    dynamic_cast<const FuncDeclStmt *>(e.get())) {
+                fn = f;
+                break;
+            }
+        if (!fn || !fn->body || !fn->body->is_block())
+            return false;
+        const Block *body = static_cast<const Block *>(fn->body.get());
+        if (!body->scope_free)
+            return false;
+        const Chunk chunk = codegen_chunk(body, fn->frame_size);
+        c.n_temps = chunk.n_temps;
+        count_chunk_ops(chunk, c);
     } catch (...) {
         return false;
     }
@@ -12200,6 +12334,23 @@ static bool vm_codegen_shapes()
         tf.pushhandler == 1 && tf.endfinally == 1 && tf.setpend >= 2
         && tf.evalstmt == 0;
 
+    /* P8 Inc 2c step 2: a `return` crossing a single finally is native - it
+     * routes through the finally via a SetPend(ret) (an EXTRA set.pend beyond
+     * the plain-finally normal+reraise pair) then EndFinally performs the
+     * return; ZERO fallback (a fallback EvalStmt-return would skip finally).
+     * Compiled as a function body (codegen_program only covers main). */
+    VmOpCounts fr;
+    if (!codegen_func_counts({
+            "func f(int n) {",
+            "  var s = 0;",
+            "  try { s = n * 2; return s; } finally { s = 999; }",
+            "}",
+        }, fr))
+        return false;
+    const bool ret_finally_native_ok =
+        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend >= 3
+        && fr.evalstmt == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -12211,7 +12362,8 @@ static bool vm_codegen_shapes()
         && foreach_ok && callv_ok && callbuiltinv_ok && callbuiltinlv_ok
         && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
         && struct_member_ok && nested_store_ok && global_store_ok
-        && universal_store_ok && try_native_ok && try_finally_native_ok;
+        && universal_store_ok && try_native_ok && try_finally_native_ok
+        && ret_finally_native_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

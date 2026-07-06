@@ -258,8 +258,8 @@ focused effort.
   - **2b finally ✅.** The pending-action machinery: `Pend` (normal/reraise/ret/
     brk/cont) + `SetPend`/`EndFinally` ops + `vm_pend`. Every try exit sets the
     pending action + jumps to one shared finally block; `EndFinally` resumes it
-    (Inc 2b: normal → fall through, reraise → re-raise vm_exc). try/catch/finally
-    fully native. **`72_exc_finally` my/py 0.36× → 0.17× (MyLang ~6×
+    (Inc 2b: normal → fall through, reraise → re-raise vm_exc). All of
+    try/catch/finally native. **`72_exc_finally` my/py 0.36× → 0.17× (~6×
     FASTER than CPython).** NOTE: the VM is MORE correct than the tree-walker on
     a **throw inside a finally** — the tree-walker runs finally in a (noexcept)
     scope-guard *destructor*, so a throwing finally always `terminate`s; the VM
@@ -273,17 +273,24 @@ focused effort.
       is destroyed - no leak, no finally). Nativizes the common `try { …;
       return x; } catch (E) { return d; }`. `contains_escaping_flow` refactored
       to `has_flow(c, bc, ret)` + `try_has_break_continue` / `try_has_return`.
-    - **Step 2 (return crossing a FINALLY) — deferred.** Two candidate designs:
-      (a) inline each enclosing finally before `ReturnV` (handles nested
-      finallys naturally, but the return VALUE temp must survive the finally's
-      temps - a temp-allocation subtlety); (b) `SetPend ret` + jump to finally,
-      `EndFinally` resumes the return via `vm_pend_val` (clean for ONE finally;
-      nested finallys need EndFinally to chain to the next). Falls back for now.
+    - **Step 2 ✅: a `return` crossing a SINGLE finally.** Design (b): the return
+      emits `PopHandler` (unless in the catch body, where the dispatch already
+      popped it - a codegen `trys` stack tracks `in_catch`) + `SetPend(ret,
+      value)` + a Jump routed to the finally's `Lfin` (via the try's `to_fin`
+      collector); `EndFinally(ret)` performs the real return, reading the value
+      from `vm_pend_val` - a REGISTER, so it survives the finally's temps (which
+      design (a)'s inline-finally would have clobbered). Restricted to ONE
+      enclosing try with a finally (`fin_count==1 && trys.size()==1`); nested /
+      intervening trys (handler-pop + finally chaining) fall back. **Guard:** a
+      return that DECLINES native compilation while any enclosing try has a
+      finally FAILS the whole body (a fallback EvalStmt-return STOPS the chunk
+      on `flow==ret`, skipping the finally) - so the try region tree-walks.
+      `try { return x; } finally { cleanup(); }` is now ~1.6× the tree-walker.
     - **Step 3 (break/continue crossing a try) — deferred.** Needs a PopHandler
       per crossed try + finally + the loop's break/continue target; the pending-
       action `brk`/`cont` + EndFinally chaining. Falls back for now.
     - **Correctness is unaffected:** the deferred cases fall back to the
-      tree-walker (tw==vm by definition); step 2/3 are PERFORMANCE (the last
+      tree-walker (tw==vm by definition); step 3 is PERFORMANCE (one of the last
       fallbacks to remove for zero-fallback `.myv`).
 - **Inc 3 — nested try / dynamic nesting.** The handler STACK already supports
   it; this increment is really "prove it": lexical `try{ try{}catch{} }catch{}`

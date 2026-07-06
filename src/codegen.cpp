@@ -496,6 +496,19 @@ struct Codegen {
     };
     std::vector<LoopFrame> loops;
 
+    /* P8 Inc 2c: the enclosing try regions between the current point and the
+     * function boundary (innermost last). A break/continue/return crossing them
+     * must pop each handler + run each finally. `to_fin` collects the Jumps
+     * that a return in this try routes to its finally (backpatched to Lfin);
+     * `in_catch` = we're compiling a catch body (this try's handler was already
+     * popped by the exception dispatch, so a return must NOT pop it again). */
+    struct TryFrame {
+        bool has_finally;
+        std::vector<size_t> *to_fin;
+        bool in_catch;
+    };
+    std::vector<TryFrame> trys;
+
     void pop_loop(int lend, int lcont)
     {
         for (size_t j : loops.back().breaks)
@@ -1762,12 +1775,55 @@ struct Codegen {
             ops.push_back(ld);
         }
 
-        Instr rv;
-        rv.op = OpCode::ReturnV;
-        rv.node = ret;
-        rv.a = slot_op(vslot);
-        ops.push_back(rv);
-        return true;
+        /* P8 Inc 2c: does this return cross a try that has a finally? (`ops` is
+         * always chunk.code here - the sole caller passes it - so a Jump index
+         * in `ops` is a valid chunk.code index for the finally backpatch.) */
+        int fin_count = 0;
+        for (const auto &tf : trys)
+            if (tf.has_finally)
+                fin_count++;
+
+        if (fin_count == 0) {
+            /* step 1: no finally crossed. ReturnV stops the chunk, destroying
+             * the whole handler stack, so any crossed no-finally trys need no
+             * explicit handler-pop. */
+            Instr rv;
+            rv.op = OpCode::ReturnV;
+            rv.node = ret;
+            rv.a = slot_op(vslot);
+            ops.push_back(rv);
+            return true;
+        }
+
+        /* step 2: a return crossing exactly ONE try, which has a finally and is
+         * the only enclosing try. Pop its handler (unless we're in its catch
+         * body - the dispatch already popped it there), stash the value in the
+         * pending action, and jump to the finally; EndFinally(ret) performs the
+         * real return (value from vm_pend_val, a register that survives the
+         * finally's temps). Nested / intervening trys (which need handler-pop +
+         * finally chaining) fall back to the tree-walker. */
+        if (fin_count == 1 && trys.size() == 1 && trys[0].has_finally) {
+            if (!trys[0].in_catch) {
+                Instr ph;
+                ph.op = OpCode::PopHandler;
+                ops.push_back(ph);
+            }
+            Instr sp;
+            sp.op = OpCode::SetPend;
+            sp.target = static_cast<int>(Pend::ret);
+            sp.a = slot_op(vslot);
+            ops.push_back(sp);
+            const size_t j = ops.size();
+            Instr jmp;
+            jmp.op = OpCode::Jump;
+            ops.push_back(jmp);
+            trys[0].to_fin->push_back(j);            /* backpatched to Lfin */
+            return true;
+        }
+
+        ops.resize(mark);
+        next_temp = save_top;
+        return false;
     }
 
     /* P8 Inc 1: `throw <expr>` -> compile the value into a temp + a native Throw
@@ -2884,12 +2940,23 @@ struct Codegen {
                     continue;
                 }
             }
-            /* `return <expr>;` -> ReturnV. */
+            /* `return <expr>;` -> ReturnV / SetPend-to-finally (Inc 2c). */
             if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
                 if (try_native_return(ret, chunk.code)) {
                     any_native = true;
                     continue;
                 }
+                /* try_native_return declined (a nested-try return, or an
+                 * uncompilable value): it falls back to a tree-walked EvalStmt
+                 * that STOPS the chunk on flow==ret. That's fine only if NO
+                 * finally is crossed; if any enclosing try has a finally, the
+                 * fallback would SKIP it, so fail the whole body and let the
+                 * try region tree-walk (which runs the finally correctly). */
+                for (const auto &tf : trys)
+                    if (tf.has_finally) {
+                        chunk.code.resize(start);
+                        return false;
+                    }
             }
             /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
             if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
@@ -3058,18 +3125,6 @@ struct Codegen {
         return false;
     }
 
-    /* A return crossing this try (all its bodies). */
-    bool try_has_return(const TryCatchStmt *t)
-    {
-        if (has_flow(t->tryBody.get(), false, true)
-            || has_flow(t->finallyBody.get(), false, true))
-            return true;
-        for (const auto &cs : t->catchStmts)
-            if (has_flow(cs.second.get(), false, true))
-                return true;
-        return false;
-    }
-
     /*
      * P8 Inc 0: lower a `try {} catch (A) {} catch (B as e) {}` (NO finally, NO
      * rethrow/flow-escape, resolved catch vars) to a native handler region.
@@ -3084,11 +3139,15 @@ struct Codegen {
      *   Lend:
      */
     /* Emit SetPend <p> (Inc 2b): the pending action a following finally runs. */
-    void emit_setpend(Pend p)
+    void emit_setpend(Pend p, int val_slot = -1)
     {
         Instr in;
         in.op = OpCode::SetPend;
         in.target = static_cast<int>(p);
+        /* Pend::ret carries the return value's slot; the VM reads it into
+         * vm_pend_val (a register that survives the finally's temps). */
+        if (val_slot >= 0)
+            in.a = slot_op(val_slot);
         chunk.code.push_back(in);
     }
 
@@ -3106,15 +3165,9 @@ struct Codegen {
             if (asId && asId->sym.kind != SymKind::local)
                 return false;
         }
-        /* A `return` that crosses a FINALLY must run it first - Inc 2c step 2,
-         * deferred - so fall back. WITHOUT a finally, a return -> ReturnV exits
-         * the chunk (the handler stack, a vm_run_chunk local, is destroyed), so
-         * it needs no handler-pop and no finally: allowed (Inc 2c step 1). */
-        if (has_fin && try_has_return(t))
-            return false;
-
         const size_t start = chunk.code.size();
         const size_t ct_start = chunk.catch_types.size();
+        const size_t trys_depth = trys.size();
 
         /* Jumps to the finally block / to Lend, backpatched at the end. With a
          * finally, every exit path sets the pending action + jumps to Lfin
@@ -3133,10 +3186,15 @@ struct Codegen {
         auto bail = [&]() {
             chunk.code.resize(start);
             chunk.catch_types.resize(ct_start);
+            trys.resize(trys_depth);
             return false;
         };
 
         const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
+        /* Register this try so a return in the body/catch (Inc 2c) can route
+         * through the finally + pop this handler. `in_catch` starts false (the
+         * body's handler is live); flipped true before the catch bodies. */
+        trys.push_back({ has_fin, has_fin ? &to_fin : nullptr, false });
         if (!compile_scalar_body(body_stmts(t->tryBody.get()), false))
             return bail();
         emit(OpCode::PopHandler);
@@ -3164,6 +3222,9 @@ struct Codegen {
         }
         exit_to(Pend::reraise);                        /* no clause matched */
 
+        /* Catch bodies run with THIS try's handler already popped (the
+         * dispatch popped it), so a return here must not re-pop it. */
+        trys.back().in_catch = true;
         size_t ci = 0;
         for (const auto &cs : t->catchStmts) {
             chunk.code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
@@ -3172,6 +3233,7 @@ struct Codegen {
             exit_to(Pend::normal);                     /* catch body done */
             ci++;
         }
+        trys.pop_back();                               /* body + catches done */
 
         if (has_fin) {
             const int lfin = static_cast<int>(here());

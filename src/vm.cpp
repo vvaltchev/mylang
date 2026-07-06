@@ -1931,8 +1931,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     break;
                 vm_exc->rethrow();
                 break;
+            case Pend::ret:
+                /* a `return` crossed this try (Inc 2c step 2): finally has run,
+                 * now perform the return - like ReturnV, value in vm_pend_val
+                 * (a register, so it survived the finally's temps). */
+                ctx.flow->value = vm_pend_val;
+                ctx.flow->type = FlowState::ret;
+                return;
             default:
-                /* ret/brk/cont crossing a try: Inc 2c (not emitted yet). */
+                /* brk/cont crossing a try: Inc 2c step 3 (not emitted yet). */
                 throw InternalErrorEx();
             }
             break;
