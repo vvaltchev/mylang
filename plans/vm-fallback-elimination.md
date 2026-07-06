@@ -116,10 +116,12 @@ first:
    INDEPENDENTLY of nativizing exceptions - the two are ~orthogonal (see the
    decision note at the bottom).
 
-3. **Exceptions (X / P8) - LAST.** `try`/`catch`/`throw` are `EvalStmt`; every
-   `throw` is a C++ throw (bench 42, 24.5x). Needs VM-level exception dispatch
-   (a handler stack + a pending-exception jump). One bench (~5% geomean) but the
-   stated endgame + the single most-dramatic per-bench win.
+3. **Exceptions (X / P8) - the last construct-level fallback + a hard `.myv`
+   PREREQUISITE.** `try`/`catch`/`throw` are `EvalStmt`; every `throw` is a C++
+   throw (bench 42, 24.5x). Needs VM-level exception dispatch (a handler stack +
+   a pending-exception jump). **Full design + increment breakdown:
+   `plans/vm-exceptions.md`.** One bench (~5% geomean) but the single
+   most-dramatic per-bench win + it unblocks the serializable-bytecode endgame.
 
 4. **Small residual fallbacks** (low value): ~~a dict MEMBER store `d.k=v`
    (D1m)~~ ✅ (DictStore, string key); ~~a struct field store `s.f=v` (S1m)~~ ✅
@@ -144,9 +146,11 @@ first:
    local store over a native CallV). The only remaining executed-code bench
    fallback is exceptions (42, P8).
 
-5. **Part C - native-but-slow** (independent of fallbacks). **Assessment
-   (2026-07-09): the remaining Part-C items are diminishing-returns / risky on
-   WSL2 - the big wins (P1-P7 + the store residuals) are done.** Item by item:
+5. **Part C - native-but-slow** (independent of fallbacks). **PARKED while we do
+   the `.myv` endgame (exceptions first); full write-up + assessment in
+   `plans/vm-optimizations-deferred.md`.** The remaining Part-C items are
+   diminishing-returns / risky on WSL2 - the big wins (P1-P7 +
+   the store residuals) are done. Item by item:
    - **C2 computed-goto** (`&&label` threading; the DIRECT fix for the
      2026-07-08 dispatch regression). The one real lever, BUT: a ~64-handler
      mechanical conversion (bug-risk, differential-gated), and its front-end
