@@ -111,6 +111,18 @@ boxed_operand(const Operand &o, EvalContext *ctx, EvalValue &scratch)
     return scratch;
 }
 
+/* Throw a division-by-zero located via the chunk's loc SIDE TABLE (loc_at), not
+ * an `Instr::node` - so the op that calls this (IntBin/FloatBin) is AST-free.
+ * Cold (error path); ML_NOINLINE + [[noreturn]] keep it out of the hot loop and
+ * let the caller's result stay "definitely assigned". */
+[[noreturn]] static ML_NOINLINE void
+vm_throw_div0(const Chunk &chunk, size_t pc)
+{
+    Loc s, en;
+    chunk.loc_at(pc, s, en);
+    throw DivisionByZeroEx(s, en);
+}
+
 /* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
  * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
  * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
@@ -424,11 +436,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             case Op::times: r = a * b; break;
             case Op::div:
                 if (b == 0)
-                    throw DivisionByZeroEx(in.node->start, in.node->end);
+                    vm_throw_div0(chunk, pc);
                 r = a / b; break;
             case Op::mod:
                 if (b == 0)
-                    throw DivisionByZeroEx(in.node->start, in.node->end);
+                    vm_throw_div0(chunk, pc);
                 r = a % b; break;
             case Op::band: r = a & b;          break;
             case Op::bor:  r = a | b;          break;
@@ -478,11 +490,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             case Op::times: r = a * b; break;
             case Op::div:
                 if (b == 0.0)
-                    throw DivisionByZeroEx(in.node->start, in.node->end);
+                    vm_throw_div0(chunk, pc);
                 r = a / b; break;
             case Op::mod:
                 if (b == 0.0)
-                    throw DivisionByZeroEx(in.node->start, in.node->end);
+                    vm_throw_div0(chunk, pc);
                 r = std::fmod(a, b); break;
             default: throw InternalErrorEx();
             }

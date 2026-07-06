@@ -3033,6 +3033,22 @@ pool as indices, loop vars as slot operands, locs in a `pc→loc` side table —
 See `plans/vm-fallback-elimination.md` (the foreach negative-result note) and
 `[[vm-nativization-heuristic]]`.
 
+**Foundation step 1 — the loc SIDE TABLE (`Chunk::locs`, done).** An op that can
+throw records its caret `Loc` in `Chunk::locs` (a `{pc,start,end}` vector,
+by pc, binary-searched by `Chunk::loc_at` on the throw path ONLY) instead of
+carrying an `Instr::node` AST pointer just for the error loc. A post-codegen
+pass, **`extract_locs` (codegen.cpp), runs on the FINISHED chunk** (so the
+codegen's rollback is untouched) and, for the ops whose ONLY use of `node` was
+the loc, records it and **NULLs `node`** — making them AST-free. It migrated the
+div/mod carets of `IntBin`/`FloatBin` (throw via `vm_throw_div0(chunk, pc)`,
+which uses `loc_at`, not `node`) and dropped the dead `node` from the
+non-throwing `JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/`ForLoopStep`. So the whole
+register/loop CORE is now `node`-free; the `Instr::node` FIELD stays until the
+remaining users (the `EvalStmt`/`JumpIfFalse` fallbacks, the element/dict/call
+op-data) are migrated too, at which point `Instr` loses the 8-byte field. Next
+foundation steps: op-data into the constant pool (a member key as a `consts`
+index, not `MemberExpr::memId`), then kill the fallback ops.
+
 ## Invariants & hazards (defense in depth)
 
 This project deliberately builds many overlapping correctness layers (a

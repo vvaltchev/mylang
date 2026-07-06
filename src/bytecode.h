@@ -444,4 +444,40 @@ struct Chunk {
      */
     int slot_count = 0;
     std::vector<std::string> slot_names;
+
+    /*
+     * Loc SIDE TABLE (foundation for an AST-free bytecode). An op that can
+     * throw
+     * records its source Loc here as `{pc, start, end}` instead of carrying an
+     * `Instr::node` AST pointer just for the caret - so the op becomes
+     * self-contained (serializable, JIT-able) and `Instr` loses a `node` use.
+     * Built by a post-codegen pass (extract_locs) over the finished chunk,
+     * so the codegen's rollback logic is untouched; naturally sorted by pc
+     * (the walk is ascending). Cold: read ONLY on the throw path via loc_at.
+     */
+    struct LocEntry { uint32_t pc; Loc start; Loc end; };
+    std::vector<LocEntry> locs;
+
+    /* The recorded Loc of the op at `pc` (exact match; sets start/end to {} and
+     * returns false if this op recorded none). Binary search - O(log n) on the
+     * error path only. */
+    bool loc_at(size_t pc, Loc &start, Loc &end) const
+    {
+        size_t lo = 0, hi = locs.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (locs[mid].pc < pc)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < locs.size() && locs[lo].pc == pc) {
+            start = locs[lo].start;
+            end = locs[lo].end;
+            return true;
+        }
+        start = Loc();
+        end = Loc();
+        return false;
+    }
 };

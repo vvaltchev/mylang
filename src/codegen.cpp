@@ -2392,6 +2392,42 @@ struct Codegen {
     }
 };
 
+/*
+ * Post-codegen pass: move an op's caret Loc from its `Instr::node` AST pointer
+ * into the chunk's loc SIDE TABLE, and NULL the node - so the op is AST-free
+ * (serializable / JIT-able) and only the throw path pays for the loc (loc_at).
+ * Runs on the FINISHED chunk (no interaction with the codegen's rollback), in
+ * ascending pc order (so `locs` stays sorted). Applied to the ops whose ONLY
+ * use of `node` is the error Loc - the register div/mod ops for now; other ops
+ * (fallback node->eval, op-data like a member key) keep their node until those
+ * uses are migrated too.
+ */
+static void extract_locs(Chunk &chunk)
+{
+    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+        Instr &in = chunk.code[pc];
+        if (!in.node)
+            continue;
+        switch (in.op) {
+        case OpCode::IntBin:
+        case OpCode::FloatBin:
+            /* node used ONLY for the div/mod caret: record it -> AST-free. */
+            chunk.locs.push_back(
+                {static_cast<uint32_t>(pc), in.node->start, in.node->end});
+            in.node = nullptr;
+            break;
+        case OpCode::JumpUnlessIntCmp:
+        case OpCode::JumpUnlessFloatCmp:
+        case OpCode::ForLoopStep:
+            /* never throw: node is dead weight, just drop it -> AST-free. */
+            in.node = nullptr;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 }  /* namespace */
 
 Chunk
@@ -2404,6 +2440,7 @@ codegen_chunk(const Block *block, int slot_count)
     cg.chunk.n_temps = cg.max_temp - slot_count;
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
+    extract_locs(cg.chunk);   /* move div/mod carets to the loc side table */
     return std::move(cg.chunk);
 }
 
