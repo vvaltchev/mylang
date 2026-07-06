@@ -3005,6 +3005,34 @@ already-M8-optimized tree-walker would beat) is also the right IR for the
 eventual native x86-64 codegen. Full roadmap + phase order:
 `plans/bytecode-vm.md`.
 
+**Build the VM FOUNDATIONS before optimizing a construct — do NOT bolt a native
+op onto an incomplete architecture.** A native lowering that lacks the
+architecture-level features it needs ends up SLOWER than the M8 tree-walker, not
+faster — proven: the `foreach` nativization (a `ForeachBind` op) *regressed*
+(19_foreach_indexed 0.27x→0.30x, geomean 4.02→4.01) and was reverted. Two root
+causes, both foundational: **(1) it referenced the AST** (`Instr::node =
+ForeachStmt*`), which is wrong on its own terms — a `node` pointer can't be
+serialized (no `__pycache__`-style dump), can't be JIT'd to machine code, and is
+8 dead bytes in a 64-byte `Instr` (2× an `EvalValue`; size + I-cache locality
+matter here exactly as they do for `EvalValue`) — AND having the node made it
+*easy* to reuse the tree-walker's boxing binding path instead of doing the work
+in registers. **(2) Box/unbox + shuffled temporaries** (`arr_elem_boxed`
+boxes a flat scalar, `bind_loop_var` builds a 48-byte `LValue`), which is the
+SAME per-element cost the tree-walker already pays in `do_iter` — so the VM
+only added dispatch overhead. **The VM NEVER needs to box/unbox.** A flat
+int/float/bool loop var reads the raw scalar into its register slot; a
+GENERAL loop var just binds the array element's *existing* `EvalValue` into its
+slot (a copy, no box, no unbox) — which is not slower than the tree-walker, only
+not as fast as the flat path. A construct only earns a native op once the
+foundation exists to lower it to slot/constant-pool operands with no AST
+reference and no round-trip boxing; **do NOT rush a construct-by-construct win —
+the goal is outstanding end-state results, not an immediate delta.** The
+foundations to build first: an **AST-free instruction** (op-data in a constant
+pool as indices, loop vars as slot operands, locs in a `pc→loc` side table — so
+`Instr` drops the `node` field and shrinks), and a **box-free value/slot flow**.
+See `plans/vm-fallback-elimination.md` (the foreach negative-result note) and
+`[[vm-nativization-heuristic]]`.
+
 ## Invariants & hazards (defense in depth)
 
 This project deliberately builds many overlapping correctness layers (a
