@@ -248,6 +248,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             cmt(row, in.node);
             break;
         }
+        case OpCode::CallBuiltinLVElem:
+            row << "call.blt.lve " << D(in.target) << " = "
+                << callee_name(in.node) << "("
+                << lval_ref(in.a.lit, in.target2) << "[" << RI(in.b, false)
+                << "], ...)";
+            cmt(row, in.node);
+            break;
         case OpCode::CallV:
             row << "call.v       " << D(in.target) << " = "
                 << callee_name(in.node)

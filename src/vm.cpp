@@ -818,6 +818,50 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CallBuiltinLVElem: {
+
+            /* Mutating builtin with a subscript target a[i]/d[k] (Phase 2c):
+             * form the base's LValue* (by kind), then the ELEMENT's LValue* via
+             * the runtime Type::subscript - the SAME COW path the tree-walker's
+             * Subscript::do_eval uses, given the identical base LValue* - and
+             * call func_lv (which self-evaluates its remaining args). A
+             * non-lvalue element (a flat scalar / read-only / missing dict key,
+             * which throws) gives a null target -> NotLValueEx, like the
+             * tree-walker. */
+            const DirectBuiltinCallExpr *dc =
+                static_cast<const DirectBuiltinCallExpr *>(in.node);
+            LValue *base;
+            switch (in.a.lit) {
+            case 0:  base = &ctx.frame->at(in.target2); break;
+            case 1:  base = ctx.gfuncs->defined[in.target2]
+                         ? &ctx.gfuncs->slots[in.target2] : nullptr; break;
+            default: base = &(*ctx.captures)[in.target2]; break;
+            }
+            const Construct *sub = dc->args->elems[0].get();
+            try {
+                EvalValue holder;   /* keeps the subscript result alive */
+                LValue *elem = nullptr;
+                if (base) {
+                    const EvalValue &idx = ctx.frame->at(in.b.slot).get();
+                    holder = base->get().get_type()->subscript(
+                        EvalValue(base), idx, /*for_write=*/false);
+                    if (holder.is<LValue *>())
+                        elem = holder.get<LValue *>();
+                }
+                ctx.frame->at(in.target).put(
+                    dc->builtin.func_lv(&ctx, dc->args.get(), elem,
+                                        nullptr, 0));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = sub->start;
+                    e.loc_end = sub->end;
+                }
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::CallV:
         case OpCode::CachedCallV: {
 

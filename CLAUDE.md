@@ -2935,9 +2935,14 @@ builtins** (`defined`/`isconst`/`isconstdecl`/`type`/`decltype`/`typestr`/
 `reverse`** (arg0 is an `LValue` for slice write-back + const-copy — need a
 future const-capable lvalue ABI), and **`map`/`filter`** (validate arg0 the
 function and throw BEFORE evaluating arg1, which the eager value ABI would
-change — pinned by their "validates its function argument first" tests). Still
-fallbacks beyond builtins: a subscript/member lvalue target (`append(a[i], …)` —
-Phase 2), struct construction. Gated by
+change — pinned by their "validates its function argument first" tests).
+**A SUBSCRIPT lvalue target `append/push/pop(a[i], d[k])` goes native too
+(Phase 2c, `CallBuiltinLVElem`)**: the codegen compiles the index and records
+the base slot; the handler forms the element `LValue*` by calling the runtime
+`Type::subscript(base, idx, for_write=false)` directly — the SAME COW the
+tree-walker's `Subscript::do_eval` uses — then `func_lv`. Still fallbacks: a
+MEMBER target (`append(s.f, x)`), `insert`/`erase` with a subscript target, a
+NESTED base (`a[i][j]`), and struct construction. Gated by
 the
 `-vm` flag (the tree-walker is the default); once the VM is at full parity
 **and** faster on the bench geomean, the default flips and `-tw` selects the

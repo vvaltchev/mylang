@@ -938,6 +938,42 @@ struct Codegen {
             return false;
 
         const Construct *a0 = dc->args->elems[0].get();
+
+        /* 2c: a SUBSCRIPT lvalue target `append/push/pop(a[i], ...)` (self-eval
+         * only - not rest-native). Compile the index natively; the element's
+         * LValue* is formed at runtime by Type::subscript (reuses the tree-
+         * walker's exact COW). Needs a slotted-id base + a compilable index; a
+         * nested base / rest-native builtin falls through to EvalToSlot. */
+        if (!dc->lvalue_rest_native && !a0->is_id()) {
+            if (auto *sub = dynamic_cast<const Subscript *>(a0)) {
+                const Construct *base = sub->what.get();
+                int bkind = -1;
+                if (base->is_id())
+                    switch (static_cast<const Identifier *>(base)->sym.kind) {
+                    case SymKind::local:   bkind = 0; break;
+                    case SymKind::global:  bkind = 1; break;
+                    case SymKind::capture: bkind = 2; break;
+                    default: break;
+                    }
+                int idxslot;
+                if (bkind >= 0 &&
+                    compile_boxed_expr(sub->index.get(), idxslot, ops)) {
+                    const int dst = alloc_temp();
+                    Instr cv;
+                    cv.op = OpCode::CallBuiltinLVElem;
+                    cv.node = dc;
+                    cv.target = dst;
+                    cv.target2 =
+                        static_cast<const Identifier *>(base)->sym.slot;
+                    cv.a = int_lit(bkind);
+                    cv.b = slot_op(idxslot);
+                    ops.push_back(cv);
+                    out_slot = dst;
+                    return true;
+                }
+            }
+        }
+
         if (!a0->is_id())
             return false;
 

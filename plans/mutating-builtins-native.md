@@ -106,15 +106,28 @@ append(pts, Point(i, i*2))   ->   emplace(pts, i, i*2)
   touches more (a new internal builtin + the rewrite pass). Do after (a) if we
   want the tree-walker to benefit.
 
-### 2c. Subscript/member lvalue targets
+### 2c. Subscript lvalue targets — DONE (2026-07-05)
 
-The other Phase 1 residual (independent of 2a/2b): `append(a[i], x)` etc. Needs a
-native "eval arg0 to an element/field `LValue*`" — a `LoadElemLValue` /
-`LoadMemberLValue` that produces the element/field lvalue (reusing the
-StoreElem COW machinery: appending to `a[i]` must clone `a` if aliased). Until
-then these stay `EvalToSlot` (correct, just not native). The shape test in
-`vm_codegen_shapes` deliberately uses `append(a[0], i)` as its stable fallback —
-update it when 2c lands.
+`append`/`push`/`pop` of `a[i]` / `d[k]` (a slotted-id base + a compilable
+index) go native via **`CallBuiltinLVElem`**: the codegen compiles the index
+into a register run (`b`) and records the base's slot+kind; the handler forms
+the base's `LValue*` and then the ELEMENT's `LValue*` by calling the **runtime
+`Type::subscript(base, idx, for_write=false)` directly** — the SAME function (so
+the SAME COW: slice-clone, alias-share, dict-key-throw) the tree-walker's
+`Subscript::do_eval` uses, given the identical base `LValue*` — then calls
+`func_lv` (self-eval rest). So no new `LoadElemLValue` op or duplicated COW: the
+match is by construction. A non-lvalue element (a flat scalar, a read-only
+container, a missing dict key that throws) yields a null target → `NotLValueEx`,
+like the tree-walker. Verified 1305/1305 + 1156/1156 (nested append, alias,
+slice-COW, dict target, pop, capture base, OOB / not-lvalue / missing-key
+carets), RECYCLE+ASan 3/3. The `vm_codegen_shapes` #2 test's never-incrementing
+while stays a stable all-fallback shape (a bare mutating-builtin statement
+doesn't trigger the any_native gate; comment updated).
+
+**Deferred (documented floor):** a MEMBER target `append(s.f, x)` (a boxed
+struct field), `insert`/`erase` with a subscript target (rest-native + index =
+two extra operands), and a NESTED base `append(a[i][j], x)` — all stay
+`EvalToSlot`, correct.
 
 ### Verification bar (per CLAUDE.md)
 Differential-green under both engines; RECYCLE+ASan clean; `bench/58_structs`

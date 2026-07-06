@@ -192,6 +192,21 @@ enum class OpCode : unsigned char {
     EmplaceStruct,
 
     /*
+     * Mutating builtin with a SUBSCRIPT lvalue target (Phase 2c): append/push/
+     * pop of `a[i]` / `d[k]`. `a.lit` = the BASE's slot KIND, `target2` =
+     * the base's slot, `b` = the (compiled) index operand; `node` = the append
+     * DirectBuiltinCallExpr (its args[0] is the Subscript, for the error loc).
+     * The handler forms the base's LValue*, then the ELEMENT's LValue* via the
+     * runtime `Type::subscript(base, idx, for_write=false)` - the SAME path,
+     * COW) the tree-walker's Subscript::do_eval uses, given the identical base
+     * LValue* - and calls func_lv, which self-evaluates its remaining args. A
+     * non-lvalue element (a flat scalar / read-only) gives a null target ->
+     * NotLValueEx. Emitted for append/push/pop (self-eval, not rest-native)
+     * with a slotted-id base; a nested base / insert/erase stay EvalToSlot.
+     */
+    CallBuiltinLVElem,
+
+    /*
      * Native USER-function call (no node->eval): the args are already evaluated
      * into a contiguous register run [a.lit, a.lit + b.lit); `target2` = the
      * callee's GLOBAL-table slot (a DirectCallExpr with vm_direct_func, so the

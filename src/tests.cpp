@@ -10559,9 +10559,12 @@ static bool vm_codegen_shapes()
      * tree-walker's tight counter: JumpIfFalse + LoopBackEdge, no native ops.
      * (A body with even one native statement + a fallback call instead goes
      * native around the EvalStmt - see the builtin / array-build tests below.)
-     * Uses `append(a[0], ..)` - a mutating builtin over a NESTED (subscript)
-     * lvalue target, which stays an EvalStmt fallback in Phase 1 (only a
-     * slotted-identifier target goes native via CallBuiltinLV). */
+     * Uses `append(a[0], ..)` with NO counter increment: a mutating-builtin
+     * statement does not itself TRIGGER the any_native gate (nor does the
+     * never-incremented `i` give a native op), so the whole body flattens.
+     * (Since 2c a subscript target DOES compile to CallBuiltinLVElem once the
+     * body is native - a counted `for`, or a while with `i = i+1` - so this
+     * degenerate never-incrementing while is the stable all-fallback shape.) */
     VmOpCounts b;
     if (!codegen_counts({
             "var a = [[1]]; var i = 0;",
