@@ -748,6 +748,45 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::DictLoadInt:
+        case OpCode::DictLoadFloat: {
+
+            /* Typed dict scalar read d[k] / d.k (P3): a PRESENT key reads the
+             * stored scalar directly via dict_present_value (the same map find
+             * the tree-walker's eval_int/eval_float uses); a MISSING key or a
+             * non-dict base falls back to node->eval_int/eval_float (the
+             * default-dict / KeyNotFoundEx path). The key is a boxed temp for a
+             * Subscript (`a`), or the node's memId for a MemberExpr. */
+            const EvalValue &base = ctx.frame->at(in.target2).get();
+            const bool is_int = in.op == OpCode::DictLoadInt;
+            if (base.is<intrusive_ptr<DictObject>>()) {
+                const auto &dict = base.get_ref<intrusive_ptr<DictObject>>();
+                const EvalValue &key = in.node->is_subscript()
+                    ? ctx.frame->at(in.a.slot).get()
+                    : static_cast<const MemberExpr *>(in.node)->memId;
+                if (const EvalValue *v = dict_present_value(dict, key)) {
+                    if (is_int)
+                        write_int_slot(&ctx, in.target,
+                            v->is<bool>() ? (v->get<bool>() ? 1 : 0)
+                                          : v->get<int_type>());
+                    else
+                        write_float_slot(&ctx, in.target,
+                            v->is<int_type>()
+                                ? static_cast<float_type>(v->get<int_type>())
+                            : v->is<bool>() ? (v->get<bool>() ? 1.0 : 0.0)
+                                            : v->get<float_type>());
+                    pc++;
+                    break;
+                }
+            }
+            if (is_int)
+                write_int_slot(&ctx, in.target, in.node->eval_int(&ctx));
+            else
+                write_float_slot(&ctx, in.target, in.node->eval_float(&ctx));
+            pc++;
+            break;
+        }
+
         case OpCode::EvalToSlot: {
 
             /* A scalar-result call evaluated into a temp (native builtin/call

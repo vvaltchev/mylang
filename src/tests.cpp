@@ -2740,6 +2740,20 @@ static const std::vector<test> tests =
     { "dict store: compound on a missing key throws (native path)",
       { "var d = {};", "d[5] += 1;" },
       &typeid(KeyNotFoundEx) },
+    { /* P3: the VM's typed dict scalar READ (DictLoadInt/Float) - member and
+       * subscript, int and float value, in a loop (so the reads feed a typed
+       * IntBin/FloatBin chain), plus a default-dict read (the missing-key
+       * fallback path). The differential runs it on both engines. */
+      "dict read: typed scalar member/subscript int+float (VM DictLoad)",
+      { "var di = {\"a\": 3, \"b\": 4};",
+        "var s = 0; for (var i = 0; i < 10; i++) s += di.a + di.b;",
+        "assert(s == 70);",
+        "var ds = {0: 5, 1: 6, 2: 7};",
+        "var t = 0; for (var i = 0; i < 3; i++) t += ds[i] * 2;",
+        "assert(t == 36);",
+        "var df = {\"x\": 1.5, \"y\": 2.5};",
+        "var f = 0.0; for (var i = 0; i < 4; i++) f += df.x + df.y;",
+        "assert(f == 16.0);" } },
     { "dict key: an array can be a key",
       { "var d = {}; d[[1,2]] = 5; d[[3,4]] = 6;",
         "assert(d[[1,2]] == 5);",
@@ -10510,6 +10524,7 @@ struct VmOpCounts {
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, loadglobalv = 0, subscriptv = 0;
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
+    size_t dictstore = 0, dictloadi = 0, dictloadf = 0;
     int n_temps = 0;
 };
 
@@ -10563,6 +10578,9 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::LoadGlobalV:      c.loadglobalv++; break;
             case OpCode::SubscriptV:       c.subscriptv++; break;
             case OpCode::MemberV:          c.memberv++; break;
+            case OpCode::DictStore:        c.dictstore++;  break;
+            case OpCode::DictLoadInt:      c.dictloadi++;  break;
+            case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
             case OpCode::CallBuiltinV:     c.callbuiltinv++; break;
             case OpCode::CallBuiltinLV:    c.callbuiltinlv++; break;
@@ -10901,25 +10919,27 @@ static bool vm_codegen_shapes()
     const bool boxed_global_ok =
         bxg.loadglobalv == 1 && bxg.binopv == 1;
 
-    /* 24) a boxed SUBSCRIPT read: `x = d["a"]` (a dict read) -> SubscriptV via
-     * the runtime Type::subscript, not a fallback. */
+    /* 24) an INT-valued dict SUBSCRIPT read `d["a"]` (P3): the typed dict read
+     * DictLoadInt (a direct dict_present_value map find), NOT the boxed
+     * SubscriptV - even though the destination `x` is dyn, the th==i read
+     * compiles typed and then boxes. */
     VmOpCounts bxs;
     if (!codegen_counts({
             "var d = {\"a\": 1, \"b\": 2};",
             "var dyn x = d[\"a\"];",
         }, bxs))
         return false;
-    const bool boxed_subscript_ok = bxs.subscriptv == 1;
+    const bool boxed_subscript_ok = bxs.dictloadi == 1 && bxs.subscriptv == 0;
 
-    /* 25) a boxed MEMBER read: `x = d.k` (a dict-key member) -> MemberV via the
-     * shared member_read, not a fallback. */
+    /* 25) an INT-valued dict MEMBER read `d.a` (P3): DictLoadInt (typed dict
+     * fast path), NOT the boxed MemberV. This is the 25_dict_member win. */
     VmOpCounts bxm;
     if (!codegen_counts({
             "var d = {\"a\": 1, \"b\": 2};",
             "var dyn x = d.a;",
         }, bxm))
         return false;
-    const bool boxed_member_ok = bxm.memberv == 1;
+    const bool boxed_member_ok = bxm.dictloadi == 1 && bxm.memberv == 0;
 
     /* 26) a native foreach over a flat int array: the counted loop reads the
      * length once (ArrLen), each element via LoadElemInt, and advances with the

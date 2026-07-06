@@ -16,7 +16,7 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 | ~~**B**~~ | ~~bool array r/w~~ | ~~43,56,57~~ | ~~P1~~ | ✅ 43:.48 56:.15 |
 | ~~D1~~ | ~~dict store~~ | 5 | ~~P2~~ | ✅ .55/.43 |
 | **D1m** | dict MEMBER store `d.k=v` | (rare) | P2b | todo |
-| **D2** | typed dict read `d.k`/`d[k]` int/float | 25 | P3 | todo |
+| ~~D2~~ | ~~typed dict read~~ | ~~25,24~~ | ~~P3~~ | ✅ 25:.53 24:.17 |
 | **D3** | dict `foreach(k,v in d)` | 26,47,62 | P5c | todo |
 | **G** | general array store `a[i]=<non-scalar>` | 46,20,31,32,47 | P4 | todo |
 | **F** | foreach unpack/indexed | 19,20 | P5a/b | todo |
@@ -32,7 +32,8 @@ arg-view builtin ABI, ...) — none skipped.
 
 **Goal restated:** lift the `-vm` geomean from **~4.0× CPython** to **5×+**.
 Progress (60-bench geomean; `run.py`'s 61-set reads a touch higher):
-**baseline 3.76× → P1 (bool) 3.82× → P2 (dict store) 3.96×.**
+**baseline 3.76× → P1 (bool) 3.82× → P2 (dict store) 3.96× → P3 (dict read)
+3.97×.**
 
 **Method:** ran `mylang -vd` on all 62 `bench/my/*.my` and recorded every
 AST-fallback op (`eval.stmt` = `EvalStmt`, `eval.slot` = `EvalToSlot` — the two
@@ -137,13 +138,24 @@ call the shared `TypeDict::subscript(..,for_write=true)` path (auto-vivify,
 key-freeze, COW) the tree-walker uses — a runtime FUNCTION, no `node->eval`.
 Compound `d[k]+=v` too. This un-flattens the dict-build loops gating 6 benches.
 
-### P3. Typed dict READ — `DictLoadInt` / `MemberInt` (+ float)
-*Benches: 25 (.77), and every dict-of-scalars read loop. MED risk.* When
-inference proved `dict<_,int/float>`, read the present-key value directly
-(`dict_present_value` → the scalar) into a typed slot instead of `member.v`/
-`subscript.v` boxing. The VM analogue of the tree-walker's `eval_int`
-fast path (which the VM lacks). Turns `s += d.alpha + d.beta + ..` from boxed
-member+add into typed reads + `IntBin`.
+### P3. Typed dict READ — `DictLoadInt` / `DictLoadFloat` — DONE (2026-07-05)
+Landed: a `base_dict` flag on MemberExpr (mirrors the Subscript one) + a
+`DictLoadInt`/`DictLoadFloat` op pair. `compile_int_expr`/`compile_float_expr`
+recognize a th-int/float dict `d.k` (member) / `d[k]` (subscript) read with a
+local-slot dict base and emit the op into a temp (a subscript's key is a boxed
+temp in `a`, a member's is the node's `memId`, distinguished by
+`node->is_subscript`). The handler reads the present-key scalar directly via the
+now-shared `dict_present_value` (the SAME map find the tree-walker's `eval_int`/
+`eval_float` uses; a bool value → 0/1, int→float promotion for the float
+variant); a MISSING key / non-dict base falls back to `node->eval_int`/
+`eval_float` (default-dict / `KeyNotFoundEx`), like LoadElemInt. Because
+`compile_boxed_expr` delegates a th-scalar node to compile_int/float, even a
+boxed-context read (`var dyn x = d["a"]`) now takes the faster typed path (shape
+test #24/#25 updated). Verified 1309/1309 + 1160/1160, RECYCLE+ASan. Benches:
+25_dict_member .75→.53, 24_dict_lookup .27→.17; geomean 3.96×→3.97×.
+**Follow-up:** a typed STRUCT member read `s.x` still boxes (a separate op).
+
+*(original design)* When inference proved `dict<_,int/float>`, read the
 
 ### P4. General array element store — `StoreElemValue`
 *Benches: 46_matrix (.42), 20, 31, 32, 47. MED risk.* `a[i]=<value>` where the

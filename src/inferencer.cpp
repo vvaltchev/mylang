@@ -1377,6 +1377,13 @@ void Inferencer::annotate_hints(Construct *n)
         sub->base_dict = bt->kind == StaticTypeKind::Dict;
     }
 
+    /* Mark `d.k` whose base is statically a DICT (vs a struct), so the VM
+     * compiles a native typed dict read (P3) rather than a boxed MemberV. */
+    if (auto *mem = dynamic_cast<MemberExpr *>(n)) {
+        StaticTypeRef bt = static_type_resolve(type_of(mem->what.get()));
+        mem->base_dict = bt->kind == StaticTypeKind::Dict;
+    }
+
     /* VM native-call hint: the callee is a user FUNCTION (Func static type -
      * not a struct constructor / builtin). With a global-slot callee this lets
      * the VM emit a CallV instead of node->eval-ing the call. */

@@ -341,6 +341,12 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
 EvalValue vm_dict_store(LValue *dict_lv, const EvalValue &key,
                         const EvalValue &value, Op op, const Construct *node);
 
+/* The stored value of a PRESENT dict key, else nullptr (a plain map find - the
+ * tree-walker's typed dict fast path). Shared by Subscript/MemberExpr eval_int/
+ * eval_float and the VM's P3 typed dict reads (DictLoadInt/Float). */
+const EvalValue *dict_present_value(const intrusive_ptr<DictObject> &obj,
+                                    const EvalValue &key);
+
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
 void run_weight_bench();

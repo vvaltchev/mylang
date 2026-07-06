@@ -1545,6 +1545,9 @@ public:
     EvalValue memId;            /* the name as a SharedStr (dict key) */
     const UniqueId *memUid = nullptr;   /* interned name (struct slot lookup) */
     bool optional = false;      /* `a?.b`: none if `a` is none, else `a.b` */
+    /* Set by the inferencer when `what` is statically a DICT (so `d.k` is a
+     * dict key read, not a struct field). Gates the VM's P3 typed dict read. */
+    bool base_dict = false;
 
     MemberExpr() : Construct("MemberExpr") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1559,6 +1562,7 @@ public:
         c->memId = memId;
         c->memUid = memUid;
         c->optional = optional;
+        c->base_dict = base_dict;
         return c;
     }
 };

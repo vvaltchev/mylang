@@ -160,6 +160,22 @@ enum class OpCode : unsigned char {
     DictStore,
 
     /*
+     * Typed DICT scalar READ `d[k]` / `d.k` into a temp (P3), when inference
+     * proved the value is a non-null int/float. `target2` = the dict's (local)
+     * slot, `target` = the dst temp; `node` = the Subscript or MemberExpr - a
+     * Subscript reads its key from `a` (a boxed temp), a MemberExpr from
+     * its own `memId` (interned name), keyed on `node->is_subscript`.
+     * On a PRESENT key it reads the stored scalar directly via the shared
+     * dict_present_value (a map find - the SAME the tree-walker uses),
+     * a bool value as 0/1. On a MISSING key / non-dict base it falls back to
+     * `node->eval_int` / `eval_float` (the default-dict / KeyNotFoundEx path),
+     * exactly like LoadElemInt's fallback. This removes the box+unbox of the
+     * generic MemberV/SubscriptV so a `s += d.a + d.b` chain is fully typed.
+     */
+    DictLoadInt,
+    DictLoadFloat,
+
+    /*
      * Evaluate a scalar-returning CALL (a builtin - via the baked
      * DirectBuiltinCallExpr fn pointer - or a user function) into a temp slot
      * as an RValue (Phase 5): `target` = the dst temp, `node` = the CallExpr.

@@ -1076,11 +1076,60 @@ struct Codegen {
         return true;
     }
 
+    /* P3: a typed DICT scalar read `d[k]` / `d.k` (value proven int/float) ->
+     * DictLoadInt/Float into a fresh temp `tt`. The base must be a local-slot
+     * dict; a subscript compiles its key to a boxed temp (in `a`), a member
+     * carries its key on the node (memId). Returns false for a non-dict-read /
+     * wrong-th / non-local base, so the caller falls through to the array/boxed
+     * path. `th` guards the value type (i for DictLoadInt, f for Float). */
+    bool try_dict_scalar_load(const Construct *e, int &tt,
+                              std::vector<Instr> &ops, OpCode op, TypeHint th)
+    {
+        if (e->th != th)
+            return false;
+        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+            int dslot;
+            if (!m->base_dict || !as_array_slot(m->what.get(), dslot))
+                return false;
+            tt = alloc_temp();
+            Instr in;
+            in.op = op;
+            in.node = m;
+            in.target = tt;
+            in.target2 = dslot;
+            ops.push_back(in);
+            return true;
+        }
+        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+            int dslot, kslot;
+            if (!sub->base_dict || !as_array_slot(sub->what.get(), dslot)
+                || !compile_boxed_expr(sub->index.get(), kslot, ops))
+                return false;
+            tt = alloc_temp();
+            Instr in;
+            in.op = op;
+            in.node = sub;
+            in.target = tt;
+            in.target2 = dslot;
+            in.a = slot_op(kslot);
+            ops.push_back(in);
+            return true;
+        }
+        return false;
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<Instr> &ops)
     {
         if (as_int_operand(e, out))
             return true;
+
+        int dtt;
+        if (try_dict_scalar_load(e, dtt, ops, OpCode::DictLoadInt,
+                                 TypeHint::i)) {
+            out = slot_op(dtt);
+            return true;
+        }
 
         /* Array element read `a[i]` -> LoadElemInt into a temp (arrays only; a
          * dict subscript stays fallback - see Subscript::base_array). A nested
@@ -1372,6 +1421,13 @@ struct Codegen {
     {
         if (as_float_operand(e, out))
             return true;
+
+        int dtt;
+        if (try_dict_scalar_load(e, dtt, ops, OpCode::DictLoadFloat,
+                                 TypeHint::f)) {
+            out = slot_op(dtt);
+            return true;
+        }
 
         /* Array element read `a[i]` (float element) -> LoadElemFloat; the index
          * is still an int expression. */

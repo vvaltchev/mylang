@@ -205,6 +205,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title)
             row << "load.elem.v  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";
             break;
+        case OpCode::DictLoadInt:
+        case OpCode::DictLoadFloat: {
+            const char *mn = in.op == OpCode::DictLoadInt
+                ? "dict.load.i  " : "dict.load.f  ";
+            row << mn << D(in.target) << " = " << D(in.target2) << "[";
+            if (in.node->is_subscript())
+                row << RI(in.a, false);
+            else
+                row << ".<member>";
+            row << "]";
+            cmt(row, in.node);
+            break;
+        }
         case OpCode::ArrLen:
             row << "arr.len      " << D(in.target) << " = len("
                 << D(in.target2) << ")";

@@ -3408,7 +3408,7 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
 /* The stored value of a present dict key, else nullptr (defined below near
  * MemberExpr). Shared by the typed dict fast paths of Subscript and MemberExpr;
  * a missing key falls back to do_eval. */
-static const EvalValue *
+const EvalValue *
 dict_present_value(const intrusive_ptr<DictObject> &obj, const EvalValue &key);
 
 int_type Subscript::eval_int(EvalContext *ctx) const
@@ -4154,7 +4154,7 @@ static bool member_pod_array_scalar(const Subscript *sub, EvalContext *ctx,
  * do_eval, preserving the exact default-dict vivify / key-freeze / KeyNotFound
  * behavior unchanged.
  */
-static const EvalValue *
+const EvalValue *
 dict_present_value(const intrusive_ptr<DictObject> &obj, const EvalValue &key)
 {
     const DictObject::inner_type &data = obj->get_ref();
