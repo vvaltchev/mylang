@@ -223,6 +223,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::Jump:
             row << "jmp          L" << in.target;
             break;
+        case OpCode::Throw:
+            row << "throw        " << D(in.a.slot);
+            break;
         case OpCode::PushHandler:
             row << "try.push     catch=L" << in.target;
             break;

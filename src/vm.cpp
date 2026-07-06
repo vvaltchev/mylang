@@ -505,6 +505,35 @@ static EvalValue vm_catch_bind_val(RuntimeException *ex)
         eo ? *eo : ExceptionObject(ex->name)));
 }
 
+/* P8 Inc 1: build (WITHOUT C++-throwing) the RuntimeException a native `Throw`
+ * raises. Mirrors ThrowStmt::do_eval: a struct instance → an ExceptionObject
+ * named by its type + carrying the instance; a caught ExceptionObject value →
+ * a copy (re-throw); anything else → TypeErrorEx (a real error, still C++). */
+static std::unique_ptr<RuntimeException>
+vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
+{
+    if (v.is<intrusive_ptr<StructObject>>())
+        return std::unique_ptr<RuntimeException>(new ExceptionObject(
+            std::string(v.get<intrusive_ptr<StructObject>>()->def->name->val),
+            v));
+    if (v.is<intrusive_ptr<ExceptionObject>>())
+        return std::unique_ptr<RuntimeException>(
+            v.get<intrusive_ptr<ExceptionObject>>()->clone());
+    throw TypeErrorEx("Can only throw a struct instance", estart, eend);
+}
+
+/* P8: pop the innermost active handler and set `pc` to its catch-dispatch;
+ * false (pc unchanged) if none → the caller C++-throws (cross-frame). Shared by
+ * the native Throw and the boundary. Inc 0/1: a handler is just a catch_pc. */
+static bool vm_dispatch_exc(std::vector<VmHandler> &handlers, size_t &pc)
+{
+    if (handlers.empty())
+        return false;
+    pc = handlers.back().catch_pc;
+    handlers.pop_back();
+    return true;
+}
+
 void
 vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 {
@@ -1796,6 +1825,26 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 pc++;
             break;
 
+        case OpCode::Throw: {
+            /* P8 Inc 1: raise the value in slot `a`. Build the exception (no C++
+             * throw), stamp the throw-site loc, then dispatch: with an active
+             * handler in THIS frame, jump to its catch-dispatch (NATIVE, no C++
+             * throw - the 42_exceptions win); else C++-throw so it propagates to
+             * the caller's boundary (cross-frame, like the tree-walker). */
+            Loc ls, le;
+            chunk.loc_at(pc, ls, le);
+            std::unique_ptr<RuntimeException> ex =
+                vm_make_thrown_exc(ctx.frame->at(in.a.slot).get(), ls, le);
+            if (!ex->loc_start) { ex->loc_start = ls; ex->loc_end = le; }
+            if (vm_dispatch_exc(handlers, pc)) {
+                vm_exc = std::move(ex);        /* same-frame: native jump */
+                break;
+            }
+            vm_exc = std::move(ex);            /* no handler here → C++ up */
+            vm_exc->rethrow();
+            break;                             /* unreachable ([[noreturn]]) */
+        }
+
         case OpCode::PushHandler:
             handlers.push_back({ static_cast<uint32_t>(in.target) });
             pc++;
@@ -1852,12 +1901,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
          * library error (div0/OOB/KeyNotFound/…), or a callee's uncaught throw.
          * With an active try, route it to the innermost handler's catch-dispatch
          * (like TryCatchStmt catching a RuntimeException); else propagate. */
-        if (handlers.empty())
-            throw;
+        if (!vm_dispatch_exc(handlers, pc))
+            throw;                             /* no active try → propagate */
         vm_exc.reset(e.clone());               /* like saved_ex */
-        const VmHandler h = handlers.back();
-        handlers.pop_back();
-        pc = h.catch_pc;
         goto vm_resume;                        /* re-enter at the CatchTest chain */
     }
 }

@@ -240,9 +240,17 @@ focused effort.
   extract refactor of the 1270-line loop) — a bad trade. **v2 (return-value
   propagation) removes the C++ throw entirely and fixes `69` properly**; left as
   a documented, tracked Inc-0 cost until then.
-- **Inc 1 — native `Throw` (THE win).** A same-frame `throw`→catch jumps via
-  `dispatch_exc`, no C++ throw. `42_exceptions` drops sharply. Cross-frame
-  throw still uses the C++ boundary.
+- **Inc 1 — native `Throw` (THE win). ✅ DONE.** `throw <expr>` compiles to a
+  native `Throw` op (`vm_make_thrown_exc` builds the ExceptionObject WITHOUT a
+  C++ throw, then `vm_dispatch_exc`): a same-frame catch is a pure handler-stack
+  JUMP, no C++ throw; no handler in this frame → C++ throw (cross-frame, like
+  Inc 0). **RESULT: `42_exceptions` my/py 24.5× → 0.42× — MyLang is now ~2.4×
+  FASTER than CPython** on same-frame throw/catch-as-control-flow (VM 50× faster
+  than the tree-walker). `69` cross-frame unchanged (~22×, C++ path, v2 fixes);
+  `70` runtime-error unchanged (~9×, a runtime-library C++ throw, not a user
+  throw - the VM-detected-error refinement targets it); `71`/`72` unchanged.
+  Verified 1371/1371 + 1220/1220; nested try + a `throw e` re-throwing a caught
+  built-in both native + parity; uncaught loc/backtrace parity.
 - **Inc 2 — `finally` + `rethrow` + `catch (T as e)` binding fully native**
   (the pending-action resume; `SetPend` for return/break/continue in a try).
 - **Inc 3 — nested try / dynamic nesting.** The handler STACK already supports

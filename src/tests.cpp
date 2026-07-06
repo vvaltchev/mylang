@@ -11514,7 +11514,7 @@ struct VmOpCounts {
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
     size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
     size_t storeelem2 = 0, storeev = 0;
-    size_t pushhandler = 0, catchtest = 0;
+    size_t pushhandler = 0, catchtest = 0, throwop = 0;
     int n_temps = 0;
 };
 
@@ -11574,6 +11574,7 @@ static bool codegen_counts(const std::vector<const char *> &lines,
             case OpCode::StoreElemValue:   c.storeev++; break;
             case OpCode::PushHandler:      c.pushhandler++; break;
             case OpCode::CatchTest:        c.catchtest++; break;
+            case OpCode::Throw:            c.throwop++; break;
             case OpCode::DictLoadInt:      c.dictloadi++;  break;
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
@@ -12099,8 +12100,11 @@ static bool vm_codegen_shapes()
             "  try { throw E(i); } catch (E) { c++; } }",
         }, tc))
         return false;
+    /* P8 Inc 1: the `throw` is now a native Throw op (not an EvalStmt); the
+     * whole try/catch loop has ZERO fallback. */
     const bool try_native_ok =
-        tc.pushhandler == 1 && tc.catchtest == 1 && tc.flstep == 1;
+        tc.pushhandler == 1 && tc.catchtest == 1 && tc.flstep == 1
+        && tc.throwop == 1 && tc.evalstmt == 0;
 
     VmOpCounts tf;
     if (!codegen_counts({

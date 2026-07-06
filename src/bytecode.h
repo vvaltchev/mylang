@@ -622,7 +622,11 @@ enum class OpCode : unsigned char {
      *             through to the next CatchTest / Reraise.
      *   Reraise: no clause matched → re-raise the in-flight exception (C++
      *            throw, routed to the OUTER handler or propagated).
+     *   Throw(a=value slot): raise the value (Inc 1). A same-frame catch is a
+     *            NATIVE jump (no C++ throw); no handler here → C++ throw
+     *            (cross-frame). The throw-site loc is in the loc side table.
      */
+    Throw,
     PushHandler,
     PopHandler,
     CatchTest,

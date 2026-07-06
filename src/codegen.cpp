@@ -1770,6 +1770,26 @@ struct Codegen {
         return true;
     }
 
+    /* P8 Inc 1: `throw <expr>` -> compile the value into a temp + a native Throw
+     * op (a same-frame catch is a native jump, no C++ throw). Self-cleaning. */
+    bool try_native_throw(const ThrowStmt *th, std::vector<Instr> &ops)
+    {
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+        int vslot;
+        if (!compile_boxed_expr(th->elem.get(), vslot, ops)) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+        Instr in;
+        in.op = OpCode::Throw;
+        in.node = th;                 /* throw-site loc (extract_locs) */
+        in.a = slot_op(vslot);
+        ops.push_back(in);
+        return true;
+    }
+
     /* P3: a typed DICT scalar read `d[k]` / `d.k` (value proven int/float) ->
      * DictLoadInt/Float into a fresh temp `tt`. The base must be a local-slot
      * dict; a subscript compiles its key to a boxed temp (in `a`), a member
@@ -2861,6 +2881,13 @@ struct Codegen {
                     continue;
                 }
             }
+            /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
+            if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
+                if (try_native_throw(th, chunk.code)) {
+                    any_native = true;
+                    continue;
+                }
+            }
 
             if (dynamic_cast<const Expr14 *>(s)
                 || dynamic_cast<const CallExpr *>(s)
@@ -3907,6 +3934,11 @@ struct Codegen {
             if (compile_native_try(tc))
                 return;
         }
+        /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
+        if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
+            if (try_native_throw(th, chunk.code))
+                return;
+        }
         emit(OpCode::EvalStmt, s);
     }
 
@@ -3988,6 +4020,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
+        case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
