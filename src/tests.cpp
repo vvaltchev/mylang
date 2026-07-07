@@ -5161,6 +5161,109 @@ static const std::vector<test> tests =
             "assert(f(4) == 12); assert(ran == 1);",
         },
     },
+    {
+        /* P8 Inc 2c step 3: a `break` crossing a finally runs the finally
+         * FIRST, then exits the loop. (Ordering is the whole point - the
+         * differential checks tw==vm.) */
+        "break crossing a finally runs the finally, then exits",
+        {
+            "func f {",
+            "   var out = [];",
+            "   for (var i = 0; i < 5; i++) {",
+            "       try { if (i == 2) { break; } append(out, i); }",
+            "       finally { append(out, 100 + i); }",
+            "   }",
+            "   return out;",
+            "}",
+            // i=0,1: elem+finally; i=2: break -> finally 102 -> exit
+            "var r = f();",
+            "assert(len(r) == 5);",
+            "assert(r[0]==0 && r[1]==100 && r[2]==1);",
+            "assert(r[3]==101 && r[4]==102);",
+        },
+    },
+    {
+        /* A `continue` crossing a finally runs the finally each iteration. */
+        "continue crossing a finally runs the finally each pass",
+        {
+            "func f {",
+            "   var out = [];",
+            "   for (var i = 0; i < 4; i++) {",
+            "       try { if (i % 2 == 0) { continue; } append(out, i); }",
+            "       finally { append(out, 200 + i); }",
+            "   }",
+            "   return out;",
+            "}",
+            "var r = f();",
+            // i=0:cont->200; i=1:1,201; i=2:cont->202; i=3:3,203
+            "assert(len(r) == 6);",
+            "assert(r[0]==200 && r[1]==1 && r[2]==201);",
+            "assert(r[3]==202 && r[4]==3 && r[5]==203);",
+        },
+    },
+    {
+        /* A `break` in a CATCH body of a finally-try: the handler is already
+         * popped, so no double-pop; the finally still runs before the exit. */
+        "break from a catch body crosses the finally",
+        {
+            "struct E { int v; }",
+            "func f {",
+            "   var out = [];",
+            "   for (var i = 0; i < 5; i++) {",
+            "       try { if (i == 3) { throw E(i); } append(out, i); }",
+            "       catch (E) { append(out, 900); break; }",
+            "       finally { append(out, 300 + i); }",
+            "   }",
+            "   return out;",
+            "}",
+            "var r = f();",
+            // 0,300,1,301,2,302, then i=3: 900 (catch) + 303 (finally) -> exit
+            "assert(len(r) == 8);",
+            "assert(r[6] == 900 && r[7] == 303);",
+        },
+    },
+    {
+        /* A `break` in a while nested inside a try does NOT cross the try - it
+         * targets the while; the try's finally runs only when the try exits. */
+        "break in a loop nested in a try does not cross the try",
+        {
+            "func f {",
+            "   var out = [];",
+            "   try {",
+            "       var i = 0;",
+            "       while (i < 10) {",
+            "           if (i == 3) { break; } append(out, i); i++;",
+            "       }",
+            "       append(out, 777);",
+            "   } finally { append(out, 888); }",
+            "   return out;",
+            "}",
+            "var r = f();",
+            "assert(len(r) == 5);",   // 0,1,2, then 777 (after break), 888
+            "assert(r[3] == 777 && r[4] == 888);",
+        },
+    },
+    {
+        /* A `break` crossing NESTED finallys is deferred (chaining) - it falls
+         * back to the tree-walker, which runs BOTH finallys, inner first. */
+        "break crossing nested finallys runs both (fallback)",
+        {
+            "func f {",
+            "   var out = [];",
+            "   for (var i = 0; i < 3; i++) {",
+            "       try {",
+            "           try { if (i == 1) { break; } append(out, i); }",
+            "           finally { append(out, 10); }",
+            "       } finally { append(out, 20); }",
+            "   }",
+            "   return out;",
+            "}",
+            "var r = f();",
+            // i=0: 0,10,20 ; i=1: break -> 10,20 -> exit
+            "assert(len(r) == 5);",
+            "assert(r[0]==0 && r[1]==10 && r[2]==20 && r[3]==10 && r[4]==20);",
+        },
+    },
 
     {
         "Catch anything: TypeErrorEx",
@@ -11827,19 +11930,20 @@ static bool vm_codegen_shapes()
     /* 2) a while whose body has a NON-natively-compilable statement stays the
      * Phase-1 flatten - the whole body drops to one EvalStmt on the tree-walker's
      * tight counter: JumpIfFalse (the cond too, even though `i < 5` is an int
-     * compare) + LoopBackEdge, no native ops. Uses a try whose body has a
-     * FLOW-ESCAPE (`break`): try/catch/finally all lower to native handler
-     * regions now (P8 Inc 0-2b), but a break/continue/return that crosses the try
-     * is deferred (Inc 2c), so compile_native_try falls back and the loop
-     * flattens. (An ALL-native body goes native; a body that MIXES native ops
-     * with a fallback call goes native around the EvalStmt - see the tests
-     * below.) NB: the loop CONDITION alone no longer forces a fallback - a bool
-     * var / logical / boxed cond compiles to JumpUnlessTrueV now (a bool-var
-     * `while (flag)` used to bail the whole loop). */
+     * compare) + LoopBackEdge, no native ops. A single `break` crossing a try
+     * is native now (P8 Inc 2c step 3), so this uses a break crossing NESTED
+     * finallys - which still defers (handler-pop + finally chaining), so the
+     * inner try fails to compile, the outer try (a TryCatchStmt, not
+     * EvalStmt-whitelisted) fails the whole body, and the loop flattens. (An
+     * ALL-native body goes native; a body that MIXES native ops with a fallback
+     * call goes native around the EvalStmt - see the tests below.) NB: the loop
+     * CONDITION alone no longer forces a fallback - a bool var / logical /
+     * boxed cond compiles to JumpUnlessTrueV now. */
     VmOpCounts b;
     if (!codegen_counts({
             "var s = 0; var i = 0;",
-            "while (i < 5) { try { break; } catch (X) { } i += 1; }",
+            "while (i < 5) {",
+            "  try { try { break; } finally { s = 1; } } finally { s = 2; } }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -12351,6 +12455,26 @@ static bool vm_codegen_shapes()
         fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend >= 3
         && fr.evalstmt == 0;
 
+    /* P8 Inc 2c step 3: a `break` crossing a single finally is native - it
+     * routes through the finally via SetPend(brk) (the EXTRA set.pend beyond
+     * the plain-finally normal+reraise pair) + EndFinally jumps to the loop
+     * exit; ZERO fallback (a deferred nested-finally break falls back). */
+    VmOpCounts bf;
+    if (!codegen_func_counts({
+            "func f {",
+            "  var s = 0;",
+            "  for (var i = 0; i < 5; i++) {",
+            "    try { if (i == 2) { break; } s += i; }",
+            "    finally { s += 100; }",
+            "  }",
+            "  return s;",
+            "}",
+        }, bf))
+        return false;
+    const bool break_finally_native_ok =
+        bf.pushhandler == 1 && bf.endfinally == 1 && bf.setpend >= 3
+        && bf.evalstmt == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -12363,7 +12487,7 @@ static bool vm_codegen_shapes()
         && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
         && struct_member_ok && nested_store_ok && global_store_ok
         && universal_store_ok && try_native_ok && try_finally_native_ok
-        && ret_finally_native_ok;
+        && ret_finally_native_ok && break_finally_native_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

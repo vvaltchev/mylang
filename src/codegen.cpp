@@ -493,6 +493,16 @@ struct Codegen {
     struct LoopFrame {
         std::vector<size_t> breaks;
         std::vector<size_t> conts;
+        /* P8 Inc 2c step 3: an EndFinally that resumes a break/continue
+         * crossing a finally-try jumps to this loop's break/continue target -
+         * patched like breaks/conts, into the EndFinally .target / .target2. */
+        std::vector<size_t> fin_breaks;
+        std::vector<size_t> fin_conts;
+        /* trys.size() when this loop was pushed: a break/continue inside it
+         * crosses only the trys pushed AFTER this (trys[try_depth..]), which is
+         * how `while{try{break}}` (crosses the try) differs from
+         * `try{while{break}}` (does not). */
+        size_t try_depth = 0;
     };
     std::vector<LoopFrame> loops;
 
@@ -506,8 +516,21 @@ struct Codegen {
         bool has_finally;
         std::vector<size_t> *to_fin;
         bool in_catch;
+        /* set when a break/continue crossing this try routes through its
+         * finally (step 3) - so its EndFinally is registered as a break/cont
+         * target of the enclosing loop. */
+        bool had_break = false;
+        bool had_cont = false;
     };
     std::vector<TryFrame> trys;
+
+    /* Push a loop frame, recording the current try-nesting depth so a
+     * break/continue inside can tell which trys it crosses (step 3). */
+    void push_loop()
+    {
+        loops.push_back({});
+        loops.back().try_depth = trys.size();
+    }
 
     void pop_loop(int lend, int lcont)
     {
@@ -515,6 +538,12 @@ struct Codegen {
             chunk.code[j].target = lend;
         for (size_t j : loops.back().conts)
             chunk.code[j].target = lcont;
+        /* An EndFinally resuming a crossing break/continue: its .target is the
+         * break exit, its .target2 the continue point. */
+        for (size_t j : loops.back().fin_breaks)
+            chunk.code[j].target = lend;
+        for (size_t j : loops.back().fin_conts)
+            chunk.code[j].target2 = lcont;
         loops.pop_back();
     }
 
@@ -1754,6 +1783,54 @@ struct Codegen {
      * compile_boxed_expr can't lower (e.g. a ternary from a recursion unroll)
      * rolls back to the EvalStmt fallback.
      */
+    /*
+     * P8 Inc 2c step 3: emit a break/continue, crossing at most ONE enclosing
+     * try (popping its handler + routing through its finally). Returns false if
+     * it crosses MORE than one try (handler-pop + finally chaining not yet
+     * supported) - the caller then fails the whole body so the region
+     * tree-walks. Precondition: loops non-empty (checked by the caller).
+     */
+    bool emit_break_cont(bool is_break)
+    {
+        LoopFrame &lp = loops.back();
+        const size_t crossed = trys.size() - lp.try_depth;
+        if (crossed > 1)
+            return false;                     /* nested trys -> fall back */
+
+        if (crossed == 1) {
+            TryFrame &tf = trys.back();        /* the single crossed try */
+            /* pop its handler unless in its catch body (popped already) */
+            if (!tf.in_catch) {
+                Instr ph;
+                ph.op = OpCode::PopHandler;
+                chunk.code.push_back(ph);
+            }
+            if (tf.has_finally) {
+                /* run the finally first; EndFinally jumps to the loop target */
+                emit_setpend(is_break ? Pend::brk : Pend::cont);
+                const size_t j = chunk.code.size();
+                Instr jmp;
+                jmp.op = OpCode::Jump;
+                chunk.code.push_back(jmp);
+                tf.to_fin->push_back(j);       /* -> Lfin (backpatched) */
+                if (is_break)
+                    tf.had_break = true;
+                else
+                    tf.had_cont = true;
+                return true;
+            }
+            /* no finally: fall to a plain Jump (handler already popped) */
+        }
+        /* crossed==0, or crossed==1 no-finally: a plain Jump to the loop's
+         * break/continue collector. */
+        const size_t j = emit(OpCode::Jump);
+        if (is_break)
+            lp.breaks.push_back(j);
+        else
+            lp.conts.push_back(j);
+        return true;
+    }
+
     bool try_native_return(const ReturnStmt *ret, std::vector<Instr> &ops)
     {
         const size_t mark = ops.size();
@@ -2895,22 +2972,23 @@ struct Codegen {
             /* break / continue -> a native Jump to the enclosing loop's exit /
              * continue point (backpatched by pop_loop). Needs an enclosing
              * native loop frame (always present - compile_scalar_body only runs
-             * inside one). Gap B. */
+             * inside one). Gap B. A break/continue crossing a single try pops
+             * its handler + runs its finally first (Inc 2c step 3); crossing
+             * nested trys (emit_break_cont returns false) fails the body so the
+             * region tree-walks. */
             if (dynamic_cast<const BreakStmt *>(s)) {
-                if (loops.empty()) {
+                if (loops.empty() || !emit_break_cont(/*is_break=*/true)) {
                     chunk.code.resize(start);
                     return false;
                 }
-                loops.back().breaks.push_back(emit(OpCode::Jump));
                 any_native = true;
                 continue;
             }
             if (dynamic_cast<const ContinueStmt *>(s)) {
-                if (loops.empty()) {
+                if (loops.empty() || !emit_break_cont(/*is_break=*/false)) {
                     chunk.code.resize(start);
                     return false;
                 }
-                loops.back().conts.push_back(emit(OpCode::Jump));
                 any_native = true;
                 continue;
             }
@@ -3067,64 +3145,6 @@ struct Codegen {
      * EvalStmt (flow-crossing-try is a later increment). Conservative: flags a
      * break/continue even inside a NESTED loop in the body (safe, rare in a try
      * body). Does NOT descend into a nested function (its flow is local). */
-    /* P8 Inc 2c: does `c` contain a break/continue (bc) and/or a return (ret)
-     * that would cross a try boundary? Such a flow op must pop the try's handler
-     * and run its finally before jumping. Descends into nested loops/ifs/trys
-     * but NOT nested functions (their flow is local). Conservative for
-     * break/continue: flags one even inside a nested loop that wouldn't actually
-     * escape (safe, rare in a try body). */
-    static bool has_flow(const Construct *c, bool bc, bool ret)
-    {
-        if (!c)
-            return false;
-        if (bc && (dynamic_cast<const BreakStmt *>(c)
-                   || dynamic_cast<const ContinueStmt *>(c)))
-            return true;
-        if (ret && dynamic_cast<const ReturnStmt *>(c))
-            return true;
-        if (dynamic_cast<const FuncDeclStmt *>(c))
-            return false;                    /* a nested function's flow is local */
-        if (const Block *b = dynamic_cast<const Block *>(c)) {
-            for (const auto &e : b->elems)
-                if (has_flow(e.get(), bc, ret))
-                    return true;
-            return false;
-        }
-        if (const IfStmt *f = dynamic_cast<const IfStmt *>(c))
-            return has_flow(f->thenBlock.get(), bc, ret)
-                || has_flow(f->elseBlock.get(), bc, ret);
-        if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(c))
-            return has_flow(w->body.get(), bc, ret);
-        if (const ForStmt *fs = dynamic_cast<const ForStmt *>(c))
-            return has_flow(fs->body.get(), bc, ret);
-        if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(c))
-            return has_flow(fr->body.get(), bc, ret);
-        if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(c))
-            return has_flow(fe->body.get(), bc, ret);
-        if (const TryCatchStmt *t = dynamic_cast<const TryCatchStmt *>(c)) {
-            if (has_flow(t->tryBody.get(), bc, ret)
-                || has_flow(t->finallyBody.get(), bc, ret))
-                return true;
-            for (const auto &cs : t->catchStmts)
-                if (has_flow(cs.second.get(), bc, ret))
-                    return true;
-            return false;
-        }
-        return false;                        /* an expression statement */
-    }
-
-    /* A break/continue crossing this try (all its bodies) - Inc 2c step 3. */
-    bool try_has_break_continue(const TryCatchStmt *t)
-    {
-        if (has_flow(t->tryBody.get(), true, false)
-            || has_flow(t->finallyBody.get(), true, false))
-            return true;
-        for (const auto &cs : t->catchStmts)
-            if (has_flow(cs.second.get(), true, false))
-                return true;
-        return false;
-    }
-
     /*
      * P8 Inc 0: lower a `try {} catch (A) {} catch (B as e) {}` (NO finally, NO
      * rethrow/flow-escape, resolved catch vars) to a native handler region.
@@ -3155,10 +3175,6 @@ struct Codegen {
     {
         const bool has_fin = t->finallyBody != nullptr;
 
-        /* A break/continue crossing the try must pop the handler (+ run finally)
-         * before jumping - Inc 2c step 3, still deferred. */
-        if (try_has_break_continue(t))
-            return false;
         /* A resolved (frame-slot) catch var only; the REPL's map var falls back. */
         for (const auto &cs : t->catchStmts) {
             const Identifier *asId = cs.first.asId.get();
@@ -3233,6 +3249,8 @@ struct Codegen {
             exit_to(Pend::normal);                     /* catch body done */
             ci++;
         }
+        const bool tf_had_break = trys.back().had_break;
+        const bool tf_had_cont = trys.back().had_cont;
         trys.pop_back();                               /* body + catches done */
 
         if (has_fin) {
@@ -3241,7 +3259,15 @@ struct Codegen {
                 chunk.code[j].target = lfin;
             if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
                 return bail();
-            emit(OpCode::EndFinally);
+            const size_t ef = emit(OpCode::EndFinally);
+            /* A break/continue routed through this finally (step 3): its
+             * EndFinally jumps to the enclosing loop's break/continue target,
+             * patched by pop_loop into .target / .target2. (loops is non-empty
+             * whenever a break/continue crossed - it needs a loop.) */
+            if (tf_had_break)
+                loops.back().fin_breaks.push_back(ef);
+            if (tf_had_cont)
+                loops.back().fin_conts.push_back(ef);
         }
 
         const int lend = static_cast<int>(here());
@@ -3288,7 +3314,7 @@ struct Codegen {
             return false;
         }
 
-        loops.push_back({});
+        push_loop();
         if (!compile_scalar_body(body_stmts(w->body.get()))) {
             loops.pop_back();
             chunk.code.resize(start);
@@ -3356,7 +3382,7 @@ struct Codegen {
             emit_cmp(OpCode::JumpUnlessIntCmp, f, f->cmp_op, ci, bound);
 
         const int lbody = here();
-        loops.push_back({});
+        push_loop();
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
             loops.pop_back();
             chunk.code.resize(start);
@@ -3420,7 +3446,7 @@ struct Codegen {
             return false;
         }
 
-        loops.push_back({});
+        push_loop();
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
             loops.pop_back();
             chunk.code.resize(start);
@@ -3551,7 +3577,7 @@ struct Codegen {
         ld.a = slot_op(i);
         chunk.code.push_back(ld);
 
-        loops.push_back({});
+        push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
@@ -3650,7 +3676,7 @@ struct Codegen {
         sfe_ctr_slot = i;
         sfe_def = fe->container_struct_def;
 
-        loops.push_back({});
+        push_loop();
         const bool body_ok = compile_scalar_body(body_stmts(fe->body.get()));
 
         sfe_loop_slot = -1;   /* deactivate (success AND failure path) */
@@ -3762,7 +3788,7 @@ struct Codegen {
         up.b = int_lit(N);
         chunk.code.push_back(up);
 
-        loops.push_back({});
+        push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
@@ -3852,7 +3878,7 @@ struct Codegen {
         const size_t nx_i = chunk.code.size();
         chunk.code.push_back(nx);   /* .target (end_pc) backpatched below */
 
-        loops.push_back({});
+        push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
@@ -3926,7 +3952,7 @@ struct Codegen {
         const size_t nx_i = chunk.code.size();
         chunk.code.push_back(nx);          /* .target (end_pc) backpatched */
 
-        loops.push_back({});
+        push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;

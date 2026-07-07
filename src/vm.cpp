@@ -1938,9 +1938,17 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 ctx.flow->value = vm_pend_val;
                 ctx.flow->type = FlowState::ret;
                 return;
-            default:
-                /* brk/cont crossing a try: Inc 2c step 3 (not emitted yet). */
-                throw InternalErrorEx();
+            case Pend::brk:
+                /* a `break` crossed this try (Inc 2c step 3): finally has run,
+                 * now jump to the enclosing loop's break exit (in.target,
+                 * patched by pop_loop). */
+                pc = static_cast<size_t>(in.target);
+                break;
+            case Pend::cont:
+                /* a `continue` crossed this try: jump to the loop's continue
+                 * point (in.target2). */
+                pc = static_cast<size_t>(in.target2);
+                break;
             }
             break;
 
