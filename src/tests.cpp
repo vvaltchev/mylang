@@ -4569,6 +4569,58 @@ static const std::vector<test> tests =
             "assert(c == 1);",
         },
     },
+    {
+        /* P8 (VM-detected runtime errors): the VM detects div/mod-by-zero AT
+         * the IntBin/FloatBin op and native-dispatches to a same-frame handler
+         * with NO C++ throw (vm_raise) - the differential runs this under both
+         * engines, so tw==vm confirms the native raise is byte-identical. */
+        "runtime error: int div/mod + float div by zero caught same-frame",
+        {
+            "func f(int n, int d) {",
+            "   try { return n / d; } catch (DivisionByZeroEx) { return -1; }",
+            "}",
+            "func g(int n, int d) {",
+            "   try { return n % d; } catch (DivisionByZeroEx) { return -2; }",
+            "}",
+            "func h(float x, float y) {",
+            "   try { return x / y; }",
+            "   catch (DivisionByZeroEx) { return -3.0; }",
+            "}",
+            "assert(f(10, 2) == 5); assert(f(10, 0) == -1);",
+            "assert(g(10, 3) == 1); assert(g(10, 0) == -2);",
+            "assert(h(6.0, 2.0) == 3.0); assert(h(6.0, 0.0) == -3.0);",
+        },
+    },
+    {
+        /* Same, in a loop (the bench-70 shape): a genuine runtime zero read
+         * from a mutable array, caught every iteration. */
+        "runtime error: div-by-zero in a loop, caught each pass",
+        {
+            "func f {",
+            "   var zeros = [0, 0, 0];",
+            "   var caught = 0;",
+            "   for (var i = 0; i < 6; i++) {",
+            "       try { var x = 100 / zeros[i % 3]; caught += x; }",
+            "       catch (DivisionByZeroEx) { caught += 1; }",
+            "   }",
+            "   return caught;",
+            "}",
+            "assert(f() == 6);",           // 6 iterations, all divide by zero
+        },
+    },
+    {
+        /* A runtime error with NO same-frame handler propagates cross-frame
+         * (C++ throw) to the caller's catch - unchanged by the native raise. */
+        "runtime error: div-by-zero propagates to an outer-frame catch",
+        {
+            "func inner(int n, int d) { return n / d; }",   // no try here
+            "func outer(int d) {",
+            "   try { return inner(100, d); }",
+            "   catch (DivisionByZeroEx) { return -7; }",
+            "}",
+            "assert(outer(4) == 25); assert(outer(0) == -7);",
+        },
+    },
 
     {
         "Exceptions, single catch other ex type",

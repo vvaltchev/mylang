@@ -1,7 +1,9 @@
-# a NATIVE runtime error (division by zero) thrown from the bottom of the type
-# system, caught in a loop (EAFP style). Measures the C++ runtime-error path,
-# which a user-throw-only VM mechanism does NOT speed up. The divisor is read
-# from a mutable array so it is a genuine RUNTIME zero (never const-folded).
+# a NATIVE runtime error (division by zero), caught in a loop (EAFP style). The
+# divisor is read from a mutable array so it is a genuine RUNTIME zero (never
+# const-folded). The VM detects div/mod-by-zero AT THE OP (IntBin/FloatBin) and
+# native-dispatches to the same-frame handler with NO C++ throw (vm_raise), so
+# this is now VM-native like a user `throw` - ~140x the tree-walker, faster than
+# CPython (before, the per-iteration C++ throw made it the VM's worst bench).
 var scale = 1;
 if (len(argv) > 0)
     scale = int(argv[0]);

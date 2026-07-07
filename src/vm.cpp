@@ -128,18 +128,6 @@ boxed_operand(const Operand &o, EvalContext *ctx, EvalValue &scratch)
     return scratch;
 }
 
-/* Throw a division-by-zero located via the chunk's loc SIDE TABLE (loc_at), not
- * an `Instr::node` - so the op that calls this (IntBin/FloatBin) is AST-free.
- * Cold (error path); ML_NOINLINE + [[noreturn]] keep it out of the hot loop and
- * let the caller's result stay "definitely assigned". */
-[[noreturn]] static ML_NOINLINE void
-vm_throw_div0(const Chunk &chunk, size_t pc)
-{
-    Loc s, en;
-    chunk.loc_at(pc, s, en);
-    throw DivisionByZeroEx(s, en);
-}
-
 /* Stamp an unlocated in-flight exception with the op's caret from the loc side
  * table (used by the catch of an AST-free op whose runtime function threw with
  * no loc). Cold - the error path only. */
@@ -534,6 +522,35 @@ static bool vm_dispatch_exc(std::vector<VmHandler> &handlers, size_t &pc)
     return true;
 }
 
+/*
+ * Raise an exception FROM a VM op - a `throw`, or a runtime error the op
+ * detects itself (div/mod-by-zero, a flat-array bounds fault). Native-dispatch
+ * to a same-frame handler (set `pc` to its catch + stash `vm_exc`, NO C++ throw
+ * - the caller then `continue`s to re-dispatch at the CatchTest chain); or, no
+ * active handler in this frame, C++-throw so it propagates to the caller's
+ * boundary (cross-frame, like the tree-walker). Stamps the op's caret from the
+ * loc side table when the exception carries none. Cold path only (a real
+ * error); the non-error path never calls it. Returns iff it native-dispatched.
+ */
+static void
+vm_raise(const Chunk &chunk, size_t &pc, std::vector<VmHandler> &handlers,
+         std::unique_ptr<RuntimeException> &vm_exc,
+         std::unique_ptr<RuntimeException> ex)
+{
+    if (!ex->loc_start) {
+        Loc s, en;
+        chunk.loc_at(pc, s, en);
+        ex->loc_start = s;
+        ex->loc_end = en;
+    }
+    if (vm_dispatch_exc(handlers, pc)) {
+        vm_exc = std::move(ex);            /* same-frame: native jump */
+        return;
+    }
+    vm_exc = std::move(ex);                /* no handler → C++ propagate */
+    vm_exc->rethrow();
+}
+
 void
 vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 {
@@ -640,12 +657,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             case Op::minus: r = a - b; break;
             case Op::times: r = a * b; break;
             case Op::div:
-                if (b == 0)
-                    vm_throw_div0(chunk, pc);
+                if (b == 0) {
+                    vm_raise(chunk, pc, handlers, vm_exc,
+                             std::make_unique<DivisionByZeroEx>());
+                    continue;          /* native-dispatched: skip the write */
+                }
                 r = a / b; break;
             case Op::mod:
-                if (b == 0)
-                    vm_throw_div0(chunk, pc);
+                if (b == 0) {
+                    vm_raise(chunk, pc, handlers, vm_exc,
+                             std::make_unique<DivisionByZeroEx>());
+                    continue;
+                }
                 r = a % b; break;
             case Op::band: r = a & b;          break;
             case Op::bor:  r = a | b;          break;
@@ -694,12 +717,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             case Op::minus: r = a - b; break;
             case Op::times: r = a * b; break;
             case Op::div:
-                if (b == 0.0)
-                    vm_throw_div0(chunk, pc);
+                if (b == 0.0) {
+                    vm_raise(chunk, pc, handlers, vm_exc,
+                             std::make_unique<DivisionByZeroEx>());
+                    continue;          /* native-dispatched: skip the write */
+                }
                 r = a / b; break;
             case Op::mod:
-                if (b == 0.0)
-                    vm_throw_div0(chunk, pc);
+                if (b == 0.0) {
+                    vm_raise(chunk, pc, handlers, vm_exc,
+                             std::make_unique<DivisionByZeroEx>());
+                    continue;
+                }
                 r = std::fmod(a, b); break;
             default: throw InternalErrorEx();
             }
@@ -1829,23 +1858,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
 
         case OpCode::Throw: {
-            /* P8 Inc 1: raise the value in slot `a`. Build the exception (no C++
-             * throw), stamp the throw-site loc, then dispatch: with an active
-             * handler in THIS frame, jump to its catch-dispatch (NATIVE, no C++
-             * throw - the 42_exceptions win); else C++-throw so it propagates to
-             * the caller's boundary (cross-frame, like the tree-walker). */
+            /* P8 Inc 1: raise the value in slot `a`. vm_raise builds the native
+             * dispatch (a same-frame catch jump, no C++ throw - the 42 win) or
+             * C++-throws to the caller's boundary (cross-frame, like the
+             * tree-walker) - the SAME path a runtime error takes. */
             Loc ls, le;
             chunk.loc_at(pc, ls, le);
-            std::unique_ptr<RuntimeException> ex =
-                vm_make_thrown_exc(ctx.frame->at(in.a.slot).get(), ls, le);
-            if (!ex->loc_start) { ex->loc_start = ls; ex->loc_end = le; }
-            if (vm_dispatch_exc(handlers, pc)) {
-                vm_exc = std::move(ex);        /* same-frame: native jump */
-                break;
-            }
-            vm_exc = std::move(ex);            /* no handler here → C++ up */
-            vm_exc->rethrow();
-            break;                             /* unreachable ([[noreturn]]) */
+            const EvalValue &tv = ctx.frame->at(in.a.slot).get();
+            vm_raise(chunk, pc, handlers, vm_exc,
+                     vm_make_thrown_exc(tv, ls, le));
+            continue;                          /* re-dispatch (or unreached) */
         }
 
         case OpCode::PushHandler:

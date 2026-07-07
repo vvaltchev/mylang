@@ -120,6 +120,18 @@ Runtime errors (div-zero/OOB/…) are C++ throws from the runtime library, and a
 un-catching callee re-throws C++. Both must land in THIS chunk's handler stack.
 So `vm_run_chunk` wraps its dispatch loop:
 
+**Refinement (done): VM-OP-DETECTED runtime errors skip the C++ throw.** An
+error the VM op detects *itself* — div/mod-by-zero at `IntBin`/`FloatBin` — no
+longer C++-throws from a helper (the old `vm_throw_div0`); it goes through
+**`vm_raise`** (the SAME helper the `Throw` op uses): build the exception,
+native-dispatch to a same-frame handler (`vm_dispatch_exc` + a `continue` to
+re-dispatch, NO C++ throw), else C++-throw to propagate cross-frame. So a
+locally-caught div-by-zero costs no C++ throw — `70_exc_runtime_error` went from
+the VM's WORST bench (a per-iteration C++ throw, ~9× CPython) to **~140× the
+tree-walker, faster than CPython**. Type-system errors the VM can't pre-detect
+(OOB from `Type::subscript`, `KeyNotFound`, a boxed `TypeErrorEx`) still
+C++-throw from the runtime library and land in the boundary below — unchanged.
+
 ```cpp
 void vm_run_chunk(chunk, ctx) {
     ... vm_exc, vm_handlers, vm_pend ...
@@ -247,8 +259,10 @@ focused effort.
   Inc 0). **RESULT: `42_exceptions` my/py 24.5× → 0.42× — MyLang is now ~2.4×
   FASTER than CPython** on same-frame throw/catch-as-control-flow (VM 50× faster
   than the tree-walker). `69` cross-frame unchanged (~22×, C++ path, v2 fixes);
-  `70` runtime-error unchanged (~9×, a runtime-library C++ throw, not a user
-  throw - the VM-detected-error refinement targets it); `71`/`72` unchanged.
+  `70` runtime-error was unchanged here (~9×, a runtime-library C++ throw, not a
+  user throw) — **now FIXED by the VM-detected-error refinement** (`vm_raise`
+  for div/mod-by-zero; ~140× the tree-walker, faster than CPython); `71`/`72`
+  unchanged.
   Verified 1371/1371 + 1220/1220; nested try + a `throw e` re-throwing a caught
   built-in both native + parity; uncaught loc/backtrace parity.
 - **Inc 2 — `finally` + `rethrow` + flow-crossing.** Split:
