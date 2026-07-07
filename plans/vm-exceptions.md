@@ -266,48 +266,47 @@ focused effort.
     handles it (the throw propagates, matching Python). No -rt test / bench /
     fuzz hits it (they'd crash the tree-walker). A tree-walker fix (finally not
     in a destructor) would restore strict tw==vm, but is out of the VM scope.
-  - **2c flow-crossing-try ✅ (single-try).** A break/continue/return crossing a
-    try pops the handler + runs the finally first, natively - for a SINGLE
-    crossed try. Nested-finally chaining is the one deferred case.
-    - **Step 1 ✅ (c7ae2c6): a `return` crossing a try with NO finally.** →
-      `ReturnV`, which exits the chunk (the handler stack, a vm_run_chunk local,
-      is destroyed - no leak, no finally). Nativizes the common `try { …;
-      return x; } catch (E) { return d; }`. `contains_escaping_flow` refactored
-      to `has_flow(c, bc, ret)` + `try_has_break_continue` / `try_has_return`.
-    - **Step 2 ✅: a `return` crossing a SINGLE finally.** Design (b): the return
-      emits `PopHandler` (unless in the catch body, where the dispatch already
-      popped it - a codegen `trys` stack tracks `in_catch`) + `SetPend(ret,
-      value)` + a Jump routed to the finally's `Lfin` (via the try's `to_fin`
-      collector); `EndFinally(ret)` performs the real return, reading the value
-      from `vm_pend_val` - a REGISTER, so it survives the finally's temps (which
-      design (a)'s inline-finally would have clobbered). Restricted to ONE
-      enclosing try with a finally (`fin_count==1 && trys.size()==1`); nested /
-      intervening trys (handler-pop + finally chaining) fall back. **Guard:** a
-      return that DECLINES native compilation while any enclosing try has a
-      finally FAILS the whole body (a fallback EvalStmt-return STOPS the chunk
-      on `flow==ret`, skipping the finally) - so the try region tree-walks.
-      `try { return x; } finally { cleanup(); }` is now ~1.6× the tree-walker.
-    - **Step 3 ✅: a `break`/`continue` crossing a SINGLE try.** Symmetric with
-      step 2, over `Pend::brk`/`cont` (no value). A loop frame records the
-      try-nesting depth at push (`LoopFrame::try_depth`), so a break/continue
-      crosses only the trys pushed AFTER its loop - which is how
-      `while{try{break}}` (crosses the try) differs from `try{while{break}}`
-      (does not). Crossing ONE try: `PopHandler` (unless in its catch body);
-      then for a finally-try, `SetPend(brk/cont)` + Jump to `Lfin`, whose
-      `EndFinally` jumps to the loop's break/continue target (`.target` /
-      `.target2`, patched by `pop_loop` via new `fin_breaks`/`fin_conts`); with
-      no finally, a plain Jump straight to the loop target. Crossing >1 try
-      (chaining) makes `emit_break_cont` return false, which fails the body so
-      the region tree-walks. Verified over
-      break/continue in body and catch, no-finally and finally, `foreach`, a try
-      in a nested `if`, and both a break AND a continue through one finally.
-    - **Correctness is unaffected:** the deferred nested-try cases fall back to
-      the tree-walker (tw==vm by definition). The `has_flow` /
-      `try_has_break_continue` / `try_has_return` pre-scan helpers are gone -
-      the per-flow-op native/fallback decision replaced them.
-    - **Still deferred:** nested-finally chaining (a return/break/continue
-      crossing >1 finally) - the last try-flow fallback for zero-fallback
-      `.myv`.
+  - **2c flow-crossing-try ✅ (COMPLETE, incl. nested-finally chaining).** A
+    `return`/`break`/`continue` crossing a try must pop the handler + run the
+    finally first. The final design **INLINES each crossed try's handler-pop +
+    finally at the flow-op site**, innermost first (`inline_crossed_finallys`).
+    Interleaving the pops with the finallys gives the correct
+    throw-in-finally-during-unwind semantics for free: while `T_i`'s finally
+    runs, `T_i`'s handler is popped but the OUTER trys' handlers are still live,
+    so a throw in `T_i`'s finally dispatches to the enclosing handler - exactly
+    like the tree-walker (a differential test throws in an inner finally during
+    a return-unwind and asserts the OUTER catch runs). A crossed try's finally
+    is compiled with the exited trys removed from the codegen `trys` stack
+    (truncated to `[0, T_i)`), so a flow op *inside* a finally routes through
+    the still-active outer trys, not through `T_i` again.
+    - **`return`:** if no crossed try has a finally → `ReturnV` (stops the
+      chunk, destroying the handler stack - no explicit pops). Otherwise inline
+      innermost→outermost-finally, then `ReturnV`. The value is **copied to a
+      fresh temp (`MoveV`) BEFORE the finallys** - `return s; finally { s=999 }`
+      must return `s`'s old value, but the return-slot may alias the local the
+      finally overwrites; `MoveV` captures a scalar copy (or the same COW handle
+      for a container, matching the tree-walker's captured `flow->value`), and
+      the temp base is raised above it so the finallys' temps can't reuse it.
+    - **`break`/`continue`:** crosses the trys pushed after its loop
+      (`trys[loop.try_depth..]`; `LoopFrame::try_depth` is how
+      `while{try{break}}` - crosses the try - differs from `try{while{break}}` -
+      does not). Inline each, then a `Jump` to the loop's break/continue target.
+    - **`in_catch`:** only the INNERMOST crossed try can have the flow op in its
+      catch body (where the dispatch already popped the handler), so only its
+      `PopHandler` is skipped; the outer crossed trys are exited from their
+      bodies, handlers live.
+    - This SUBSUMED the earlier single-crossed steps' `SetPend(ret/brk/cont)` +
+      shared-`Lfin` + `EndFinally`-chaining machinery: the shared finally block
+      is now reached ONLY by the normal + reraise exits, so `Pend` shrank to
+      `{normal, reraise}` and `vm_pend_val` / the `fin_breaks`/`fin_conts` loop
+      collectors / `had_break`/`had_cont` are gone. `has_flow` /
+      `try_has_break_continue` / `try_has_return` pre-scans are gone too - the
+      per-flow-op decision (inline vs fall back) replaced them.
+    - **Fallback:** `inline_crossed_finallys` returns false only if a crossed
+      finally fails to compile natively (rare) - then the region tree-walks
+      (tw==vm). `try {..} finally {..}` with an early return/break/continue is
+      ~1.6× the tree-walker; nested chaining is fully native (a return crossing
+      3 finallys shows 3 `try.pop` + 3 inlined finallys, zero fallback).
 - **Inc 3 — nested try / dynamic nesting.** The handler STACK already supports
   it; this increment is really "prove it": lexical `try{ try{}catch{} }catch{}`
   and a `try` in a called function. (If Inc 0–2 shipped with a depth-1 handler

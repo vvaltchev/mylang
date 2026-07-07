@@ -5129,11 +5129,11 @@ static const std::vector<test> tests =
         },
     },
     {
-        /* A return crossing NESTED finallys is not native yet (chaining) - it
-         * falls back to the tree-walker, which must run BOTH finallys in order.
-         * Regression guard: the VM once skipped the finallys here (a fallback
-         * EvalStmt-return stopped the chunk, bypassing the native finally). */
-        "return crossing nested finallys runs both (fallback)",
+        /* A return crossing NESTED finallys (Inc 2c chaining): each crossed
+         * finally is INLINED at the return, innermost first, so BOTH run in
+         * order. Regression guard: the VM once skipped the finallys here (a
+         * fallback EvalStmt-return stopped the chunk, bypassing finally). */
+        "return crossing nested finallys runs both, inner first",
         {
             "var order = [];",
             "func f(n) {",
@@ -5144,6 +5144,63 @@ static const std::vector<test> tests =
             "assert(f(7) == 7);",
             "assert(len(order) == 2);",
             "assert(order[0] == 1 && order[1] == 2);",   // inner before outer
+        },
+    },
+    {
+        /* Chaining: a return's value must survive a crossed finally that writes
+         * the SAME local (`return s; finally { s = 999 }`) - the value is
+         * copied before the finallys run. Across THREE crossed finallys. */
+        "return value survives clobbering across nested finallys",
+        {
+            "var out = [];",
+            "func f {",
+            "   var s = 5;",
+            "   try { try { try { s = 20; return s; }",
+            "       finally { append(out, 1); s = 100; } }",
+            "       finally { append(out, 2); s = 200; } }",
+            "   finally { append(out, 3); s = 300; }",
+            "   return -1;",
+            "}",
+            "assert(f() == 20);",                  // not 100/200/300
+            "assert(len(out) == 3);",
+            "assert(out[0]==1 && out[1]==2 && out[2]==3);",   // inner->outer
+        },
+    },
+    {
+        /* Chaining semantics: a THROW in an inner finally, while a return
+         * unwinds through it, must reach an OUTER catch - the interleaved
+         * handler-pops keep the outer handler live during the inner finally. */
+        "throw in an inner finally during a return-unwind reaches outer catch",
+        {
+            "struct F { int v; }",
+            "var out = [];",
+            "func f {",
+            "   try {",
+            "       try { return out; }",   // value superseded by the throw
+            "       finally { append(out, 1); throw F(9); }",
+            "   } catch (F) { append(out, 2); }",
+            "   return out;",
+            "}",
+            "var r = f();",
+            "assert(len(r) == 2);",
+            "assert(r[0] == 1 && r[1] == 2);",     // F(9) caught by the outer
+        },
+    },
+    {
+        /* Chaining with a container return: the crossed finallys mutate the
+         * SAME array the return references; the returned value (a shared COW
+         * handle, like the tree-walker's flow value) sees the appends. */
+        "return a container mutated by the crossed finallys",
+        {
+            "func f {",
+            "   var arr = [1, 2];",
+            "   try { try { return arr; } finally { append(arr, 3); } }",
+            "   finally { append(arr, 4); }",
+            "   return arr;",                    // keeps f's type non-null
+            "}",
+            "var r = f();",
+            "assert(len(r) == 4);",
+            "assert(r[0]==1 && r[1]==2 && r[2]==3 && r[3]==4);",
         },
     },
     {
@@ -5244,9 +5301,10 @@ static const std::vector<test> tests =
         },
     },
     {
-        /* A `break` crossing NESTED finallys is deferred (chaining) - it falls
-         * back to the tree-walker, which runs BOTH finallys, inner first. */
-        "break crossing nested finallys runs both (fallback)",
+        /* A `break` crossing NESTED finallys (Inc 2c chaining): each crossed
+         * finally is inlined at the break, innermost first, then the loop
+         * exits. Both finallys run in order. */
+        "break crossing nested finallys runs both, inner first",
         {
             "func f {",
             "   var out = [];",
@@ -5262,6 +5320,27 @@ static const std::vector<test> tests =
             // i=0: 0,10,20 ; i=1: break -> 10,20 -> exit
             "assert(len(r) == 5);",
             "assert(r[0]==0 && r[1]==10 && r[2]==20 && r[3]==10 && r[4]==20);",
+        },
+    },
+    {
+        /* A `continue` crossing NESTED finallys runs both, inner first, each
+         * iteration. */
+        "continue crossing nested finallys runs both each pass",
+        {
+            "func f {",
+            "   var out = [];",
+            "   for (var i = 0; i < 3; i++) {",
+            "       try {",
+            "           try { if (i == 1) { continue; } append(out, i); }",
+            "           finally { append(out, 10); }",
+            "       } finally { append(out, 20); }",
+            "   }",
+            "   return out;",
+            "}",
+            "var r = f();",
+            // i=0: 0,10,20 ; i=1: continue->10,20 ; i=2: 2,10,20
+            "assert(len(r) == 8);",
+            "assert(r[3]==10 && r[4]==20 && r[5]==2 && r[6]==10 && r[7]==20);",
         },
     },
 
@@ -11930,20 +12009,18 @@ static bool vm_codegen_shapes()
     /* 2) a while whose body has a NON-natively-compilable statement stays the
      * Phase-1 flatten - the whole body drops to one EvalStmt on the tree-walker's
      * tight counter: JumpIfFalse (the cond too, even though `i < 5` is an int
-     * compare) + LoopBackEdge, no native ops. A single `break` crossing a try
-     * is native now (P8 Inc 2c step 3), so this uses a break crossing NESTED
-     * finallys - which still defers (handler-pop + finally chaining), so the
-     * inner try fails to compile, the outer try (a TryCatchStmt, not
-     * EvalStmt-whitelisted) fails the whole body, and the loop flattens. (An
-     * ALL-native body goes native; a body that MIXES native ops with a fallback
-     * call goes native around the EvalStmt - see the tests below.) NB: the loop
-     * CONDITION alone no longer forces a fallback - a bool var / logical /
-     * boxed cond compiles to JumpUnlessTrueV now. */
+     * compare) + LoopBackEdge, no native ops. All the try flow ops are native
+     * now (P8 Inc 2c, incl. nested-finally chaining), so this uses a NESTED
+     * FUNCTION DECL - which compile_scalar_body doesn't lower (and isn't
+     * EvalStmt-whitelisted), so it fails the whole body and the loop flattens.
+     * (An ALL-native body goes native; a body that MIXES native ops with a
+     * fallback call goes native around the EvalStmt - see the tests below.) NB:
+     * the loop CONDITION alone no longer forces a fallback - a bool var /
+     * logical / boxed cond compiles to JumpUnlessTrueV now. */
     VmOpCounts b;
     if (!codegen_counts({
             "var s = 0; var i = 0;",
-            "while (i < 5) {",
-            "  try { try { break; } finally { s = 1; } } finally { s = 2; } }",
+            "while (i < 5) { func g() => 1; i += 1; }",
         }, b))
         return false;
     const bool fallback_ok =
@@ -12438,11 +12515,11 @@ static bool vm_codegen_shapes()
         tf.pushhandler == 1 && tf.endfinally == 1 && tf.setpend >= 2
         && tf.evalstmt == 0;
 
-    /* P8 Inc 2c step 2: a `return` crossing a single finally is native - it
-     * routes through the finally via a SetPend(ret) (an EXTRA set.pend beyond
-     * the plain-finally normal+reraise pair) then EndFinally performs the
-     * return; ZERO fallback (a fallback EvalStmt-return would skip finally).
-     * Compiled as a function body (codegen_program only covers main). */
+    /* P8 Inc 2c: a `return` crossing a finally is native - it INLINES the
+     * finally at the return site (so `setpend` stays the plain-finally
+     * normal+reraise pair of 2, NOT a flow SetPend), then ReturnV; ZERO
+     * fallback (a fallback EvalStmt-return would skip the finally). Compiled as
+     * a function body (codegen_program only covers main). */
     VmOpCounts fr;
     if (!codegen_func_counts({
             "func f(int n) {",
@@ -12452,13 +12529,13 @@ static bool vm_codegen_shapes()
         }, fr))
         return false;
     const bool ret_finally_native_ok =
-        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend >= 3
+        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend == 2
         && fr.evalstmt == 0;
 
-    /* P8 Inc 2c step 3: a `break` crossing a single finally is native - it
-     * routes through the finally via SetPend(brk) (the EXTRA set.pend beyond
-     * the plain-finally normal+reraise pair) + EndFinally jumps to the loop
-     * exit; ZERO fallback (a deferred nested-finally break falls back). */
+    /* A `break` crossing a finally likewise INLINES the finally at the break
+     * site + jumps to the loop exit. The finally `s += 100` is an IntBin,
+     * emitted TWICE (inline at the break + the shared block) atop the body's
+     * `s += i` - so intbin >= 3 proves the inline. ZERO fallback. */
     VmOpCounts bf;
     if (!codegen_func_counts({
             "func f {",
@@ -12472,8 +12549,25 @@ static bool vm_codegen_shapes()
         }, bf))
         return false;
     const bool break_finally_native_ok =
-        bf.pushhandler == 1 && bf.endfinally == 1 && bf.setpend >= 3
-        && bf.evalstmt == 0;
+        bf.pushhandler == 1 && bf.endfinally == 1 && bf.setpend == 2
+        && bf.intbin >= 3 && bf.evalstmt == 0;
+
+    /* Chaining: a return crossing TWO nested finallys is native - each is
+     * inlined at the return (innermost first), so ZERO fallback. Two trys ->
+     * pushhandler==2 + two shared finallys endfinally==2. */
+    VmOpCounts cf;
+    if (!codegen_func_counts({
+            "func f(int n) {",
+            "  var s = 0;",
+            "  try { try { s = n; return s; }",
+            "    finally { s = s + 1; } }",
+            "  finally { s = s + 2; }",
+            "  return -1;",
+            "}",
+        }, cf))
+        return false;
+    const bool chain_finally_native_ok =
+        cf.pushhandler == 2 && cf.endfinally == 2 && cf.evalstmt == 0;
 
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
@@ -12487,7 +12581,8 @@ static bool vm_codegen_shapes()
         && bool_cond_ok && var_init_ok && block_ok && dict_member_ok
         && struct_member_ok && nested_store_ok && global_store_ok
         && universal_store_ok && try_native_ok && try_finally_native_ok
-        && ret_finally_native_ok && break_finally_native_ok;
+        && ret_finally_native_ok && break_finally_native_ok
+        && chain_finally_native_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

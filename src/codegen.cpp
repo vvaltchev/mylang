@@ -493,11 +493,6 @@ struct Codegen {
     struct LoopFrame {
         std::vector<size_t> breaks;
         std::vector<size_t> conts;
-        /* P8 Inc 2c step 3: an EndFinally that resumes a break/continue
-         * crossing a finally-try jumps to this loop's break/continue target -
-         * patched like breaks/conts, into the EndFinally .target / .target2. */
-        std::vector<size_t> fin_breaks;
-        std::vector<size_t> fin_conts;
         /* trys.size() when this loop was pushed: a break/continue inside it
          * crosses only the trys pushed AFTER this (trys[try_depth..]), which is
          * how `while{try{break}}` (crosses the try) differs from
@@ -514,13 +509,11 @@ struct Codegen {
      * popped by the exception dispatch, so a return must NOT pop it again). */
     struct TryFrame {
         bool has_finally;
-        std::vector<size_t> *to_fin;
+        std::vector<size_t> *to_fin;   /* normal/reraise exits -> shared Lfin */
         bool in_catch;
-        /* set when a break/continue crossing this try routes through its
-         * finally (step 3) - so its EndFinally is registered as a break/cont
-         * target of the enclosing loop. */
-        bool had_break = false;
-        bool had_cont = false;
+        /* the finally body (or null): a flow op crossing this try INLINES it at
+         * the flow-op site (Inc 2c), so it needs the AST here. */
+        const Construct *finally_body = nullptr;
     };
     std::vector<TryFrame> trys;
 
@@ -538,12 +531,6 @@ struct Codegen {
             chunk.code[j].target = lend;
         for (size_t j : loops.back().conts)
             chunk.code[j].target = lcont;
-        /* An EndFinally resuming a crossing break/continue: its .target is the
-         * break exit, its .target2 the continue point. */
-        for (size_t j : loops.back().fin_breaks)
-            chunk.code[j].target = lend;
-        for (size_t j : loops.back().fin_conts)
-            chunk.code[j].target2 = lcont;
         loops.pop_back();
     }
 
@@ -1790,39 +1777,60 @@ struct Codegen {
      * supported) - the caller then fails the whole body so the region
      * tree-walks. Precondition: loops non-empty (checked by the caller).
      */
-    bool emit_break_cont(bool is_break)
+    /*
+     * P8 Inc 2c: at a flow op (return / break / continue) that crosses the
+     * innermost `crossed` trys, INLINE each crossed try's handler-pop + finally
+     * here, innermost first. Interleaving the pops with the finallys gives the
+     * correct throw-in-finally-during-unwind semantics: while T_i's finally
+     * runs, T_i's handler is popped but the OUTER trys' handlers stay live, so
+     * a throw in T_i's finally dispatches to the enclosing handler (like the
+     * tree-walker). A crossed try's finally is compiled with the exited trys
+     * removed from `trys` (truncated to [0, T_i)), so a flow op in a finally
+     * routes through the still-active outer trys, not through T_i again.
+     * Returns false (caller falls back) only if a finally fails to compile.
+     */
+    bool inline_crossed_finallys(size_t crossed)
     {
-        LoopFrame &lp = loops.back();
-        const size_t crossed = trys.size() - lp.try_depth;
-        if (crossed > 1)
-            return false;                     /* nested trys -> fall back */
-
-        if (crossed == 1) {
-            TryFrame &tf = trys.back();        /* the single crossed try */
-            /* pop its handler unless in its catch body (popped already) */
-            if (!tf.in_catch) {
+        const std::vector<TryFrame> saved = trys;   /* shallow (to_fin ptrs) */
+        const size_t total = saved.size();
+        for (size_t j = 0; j < crossed; j++) {
+            const size_t ti = total - 1 - j;        /* innermost first */
+            const TryFrame &tf = saved[ti];
+            /* pop this try's handler, unless the flow op is in the INNERMOST
+             * try's catch body (the dispatch already popped it there). */
+            if (!(j == 0 && tf.in_catch)) {
                 Instr ph;
                 ph.op = OpCode::PopHandler;
                 chunk.code.push_back(ph);
             }
-            if (tf.has_finally) {
-                /* run the finally first; EndFinally jumps to the loop target */
-                emit_setpend(is_break ? Pend::brk : Pend::cont);
-                const size_t j = chunk.code.size();
-                Instr jmp;
-                jmp.op = OpCode::Jump;
-                chunk.code.push_back(jmp);
-                tf.to_fin->push_back(j);       /* -> Lfin (backpatched) */
-                if (is_break)
-                    tf.had_break = true;
-                else
-                    tf.had_cont = true;
-                return true;
+            if (tf.finally_body) {
+                trys.resize(ti);                    /* active trys = [0, T_i) */
+                const bool ok =
+                    compile_scalar_body(body_stmts(tf.finally_body), false);
+                if (!ok) {
+                    trys = saved;
+                    return false;
+                }
             }
-            /* no finally: fall to a plain Jump (handler already popped) */
         }
-        /* crossed==0, or crossed==1 no-finally: a plain Jump to the loop's
-         * break/continue collector. */
+        trys = saved;
+        return true;
+    }
+
+    /*
+     * P8 Inc 2c step 3: emit a break/continue. It crosses the trys pushed after
+     * its loop (trys[loop.try_depth..]); each is exited by inlining its
+     * handler-pop + finally here, then a Jump to the loop's break/continue
+     * target. Returns false (caller fails the body) only if a crossed finally
+     * fails to compile. Precondition: loops non-empty (checked by the caller).
+     */
+    bool emit_break_cont(bool is_break)
+    {
+        LoopFrame &lp = loops.back();
+        const size_t crossed = trys.size() - lp.try_depth;
+        if (crossed > 0 && !inline_crossed_finallys(crossed))
+            return false;
+        /* handlers popped + finallys run; jump to the loop target. */
         const size_t j = emit(OpCode::Jump);
         if (is_break)
             lp.breaks.push_back(j);
@@ -1852,55 +1860,58 @@ struct Codegen {
             ops.push_back(ld);
         }
 
-        /* P8 Inc 2c: does this return cross a try that has a finally? (`ops` is
-         * always chunk.code here - the sole caller passes it - so a Jump index
-         * in `ops` is a valid chunk.code index for the finally backpatch.) */
-        int fin_count = 0;
-        for (const auto &tf : trys)
-            if (tf.has_finally)
-                fin_count++;
-
-        if (fin_count == 0) {
-            /* step 1: no finally crossed. ReturnV stops the chunk, destroying
-             * the whole handler stack, so any crossed no-finally trys need no
-             * explicit handler-pop. */
-            Instr rv;
-            rv.op = OpCode::ReturnV;
-            rv.node = ret;
-            rv.a = slot_op(vslot);
-            ops.push_back(rv);
-            return true;
-        }
-
-        /* step 2: a return crossing exactly ONE try, which has a finally and is
-         * the only enclosing try. Pop its handler (unless we're in its catch
-         * body - the dispatch already popped it there), stash the value in the
-         * pending action, and jump to the finally; EndFinally(ret) performs the
-         * real return (value from vm_pend_val, a register that survives the
-         * finally's temps). Nested / intervening trys (which need handler-pop +
-         * finally chaining) fall back to the tree-walker. */
-        if (fin_count == 1 && trys.size() == 1 && trys[0].has_finally) {
-            if (!trys[0].in_catch) {
-                Instr ph;
-                ph.op = OpCode::PopHandler;
-                ops.push_back(ph);
+        /* P8 Inc 2c: a return crosses ALL enclosing trys (up to the function).
+         * If none has a finally, ReturnV stops the chunk - destroying the whole
+         * handler stack, so no explicit handler-pop is needed. Otherwise inline
+         * each crossed try's handler-pop + finally, from innermost up to the
+         * OUTERMOST finally-try, then ReturnV; ReturnV cleans up any no-finally
+         * trys outside that. */
+        size_t outermost_fin = trys.size();
+        for (size_t i = 0; i < trys.size(); i++)
+            if (trys[i].has_finally) {
+                outermost_fin = i;
+                break;
             }
-            Instr sp;
-            sp.op = OpCode::SetPend;
-            sp.target = static_cast<int>(Pend::ret);
-            sp.a = slot_op(vslot);
-            ops.push_back(sp);
-            const size_t j = ops.size();
-            Instr jmp;
-            jmp.op = OpCode::Jump;
-            ops.push_back(jmp);
-            trys[0].to_fin->push_back(j);            /* backpatched to Lfin */
-            return true;
+
+        if (outermost_fin < trys.size()) {
+            const size_t crossed = trys.size() - outermost_fin;
+            /* COPY the value into a fresh temp BEFORE the finallys run: `return
+             * s; finally { s = 999; }` must return s's OLD value, but vslot may
+             * alias the local `s` that the finally overwrites (and even a temp
+             * vslot could be reused by a finally's temps). MoveV captures the
+             * value now (a scalar copy, or the same COW handle for a container,
+             * matching what the tree-walker's flow->value captures). The value
+             * is computed before the finallys (correct: `return f()` evaluates
+             * f() first), and read by ReturnV after. Then protect the copy by
+             * raising the temp base above it. */
+            const int vtmp = alloc_temp();
+            Instr mv;
+            mv.op = OpCode::MoveV;
+            mv.target = vtmp;
+            mv.target2 = vslot;
+            ops.push_back(mv);
+
+            const int saved_base = temp_base;
+            temp_base = vtmp + 1;
+            if (temp_base > max_temp)
+                max_temp = temp_base;
+            next_temp = temp_base;
+            const bool ok = inline_crossed_finallys(crossed);
+            temp_base = saved_base;
+            next_temp = save_top;
+            if (!ok) {
+                ops.resize(mark);
+                return false;
+            }
+            vslot = vtmp;                        /* ReturnV reads the copy */
         }
 
-        ops.resize(mark);
-        next_temp = save_top;
-        return false;
+        Instr rv;
+        rv.op = OpCode::ReturnV;
+        rv.node = ret;
+        rv.a = slot_op(vslot);
+        ops.push_back(rv);
+        return true;
     }
 
     /* P8 Inc 1: `throw <expr>` -> compile the value into a temp + a native Throw
@@ -3159,15 +3170,11 @@ struct Codegen {
      *   Lend:
      */
     /* Emit SetPend <p> (Inc 2b): the pending action a following finally runs. */
-    void emit_setpend(Pend p, int val_slot = -1)
+    void emit_setpend(Pend p)
     {
         Instr in;
         in.op = OpCode::SetPend;
         in.target = static_cast<int>(p);
-        /* Pend::ret carries the return value's slot; the VM reads it into
-         * vm_pend_val (a register that survives the finally's temps). */
-        if (val_slot >= 0)
-            in.a = slot_op(val_slot);
         chunk.code.push_back(in);
     }
 
@@ -3207,10 +3214,11 @@ struct Codegen {
         };
 
         const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
-        /* Register this try so a return in the body/catch (Inc 2c) can route
-         * through the finally + pop this handler. `in_catch` starts false (the
-         * body's handler is live); flipped true before the catch bodies. */
-        trys.push_back({ has_fin, has_fin ? &to_fin : nullptr, false });
+        /* Register this try so a flow op in the body/catch (Inc 2c) can inline
+         * this finally + pop this handler. `in_catch` starts false (the body's
+         * handler is live); flipped true before the catch bodies. */
+        trys.push_back({ has_fin, has_fin ? &to_fin : nullptr, false,
+                         t->finallyBody.get() });
         if (!compile_scalar_body(body_stmts(t->tryBody.get()), false))
             return bail();
         emit(OpCode::PopHandler);
@@ -3249,25 +3257,17 @@ struct Codegen {
             exit_to(Pend::normal);                     /* catch body done */
             ci++;
         }
-        const bool tf_had_break = trys.back().had_break;
-        const bool tf_had_cont = trys.back().had_cont;
         trys.pop_back();                               /* body + catches done */
 
         if (has_fin) {
+            /* The SHARED finally block, reached by the NORMAL and RERAISE exits
+             * only (flow ops inline their own copy - Inc 2c). */
             const int lfin = static_cast<int>(here());
             for (size_t j : to_fin)
                 chunk.code[j].target = lfin;
             if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
                 return bail();
-            const size_t ef = emit(OpCode::EndFinally);
-            /* A break/continue routed through this finally (step 3): its
-             * EndFinally jumps to the enclosing loop's break/continue target,
-             * patched by pop_loop into .target / .target2. (loops is non-empty
-             * whenever a break/continue crossed - it needs a loop.) */
-            if (tf_had_break)
-                loops.back().fin_breaks.push_back(ef);
-            if (tf_had_cont)
-                loops.back().fin_conts.push_back(ef);
+            emit(OpCode::EndFinally);
         }
 
         const int lend = static_cast<int>(here());

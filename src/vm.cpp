@@ -545,10 +545,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
      * no try is active (the common case), so no cost for exception-free code. */
     std::vector<VmHandler> handlers;
     std::unique_ptr<RuntimeException> vm_exc;
-    /* P8 Inc 2b: the pending action a `finally` must resume (set by SetPend,
-     * consumed by EndFinally); vm_pend_val is the return value for Pend::ret. */
+    /* P8 Inc 2b: the pending action the shared `finally` must resume - normal
+     * or reraise (set by SetPend, consumed by EndFinally). */
     Pend vm_pend = Pend::normal;
-    EvalValue vm_pend_val;
 
     /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
      * RuntimeException thrown by any op (a runtime-library error, a fallback
@@ -1912,43 +1911,25 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;                    /* unreachable ([[noreturn]]) */
 
         case OpCode::SetPend:
-            /* Record what a following `finally` must resume (Inc 2b). */
+            /* Record what the shared `finally` must resume - normal or reraise
+             * (Inc 2b). Flow ops inline their finally, so ret/brk/cont never
+             * reach the shared finally. */
             vm_pend = static_cast<Pend>(in.target);
-            if (vm_pend == Pend::ret)                 /* value for ret (Inc 2c) */
-                vm_pend_val = ctx.frame->at(in.a.slot).get();
             pc++;
             break;
 
         case OpCode::EndFinally:
-            /* End of a `finally`: resume the pending action. */
-            switch (vm_pend) {
-            case Pend::normal:
-                pc++;                                 /* fall through to Lend */
-                break;
-            case Pend::reraise:
+            /* End of the SHARED finally block: resume the pending action. Only
+             * the NORMAL and RERAISE exits reach here - a return/break/continue
+             * crossing this try INLINES its own copy of the finally (Inc 2c),
+             * so `vm_pend` is only ever normal or reraise here. */
+            if (vm_pend == Pend::reraise) {
                 /* finally didn't handle the exception → re-raise it. */
                 if (vm_dispatch_exc(handlers, pc))
                     break;
                 vm_exc->rethrow();
-                break;
-            case Pend::ret:
-                /* a `return` crossed this try (Inc 2c step 2): finally has run,
-                 * now perform the return - like ReturnV, value in vm_pend_val
-                 * (a register, so it survived the finally's temps). */
-                ctx.flow->value = vm_pend_val;
-                ctx.flow->type = FlowState::ret;
-                return;
-            case Pend::brk:
-                /* a `break` crossed this try (Inc 2c step 3): finally has run,
-                 * now jump to the enclosing loop's break exit (in.target,
-                 * patched by pop_loop). */
-                pc = static_cast<size_t>(in.target);
-                break;
-            case Pend::cont:
-                /* a `continue` crossed this try: jump to the loop's continue
-                 * point (in.target2). */
-                pc = static_cast<size_t>(in.target2);
-                break;
+            } else {
+                pc++;                                 /* fall through to Lend */
             }
             break;
 

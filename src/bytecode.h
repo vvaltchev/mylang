@@ -28,7 +28,11 @@
  * SetPend value; EndFinally consumes it). `normal` falls through; `reraise`
  * re-raises the in-flight vm_exc; `ret`/`brk`/`cont` (Inc 2c) resume a flow
  * signal that crossed the try. */
-enum class Pend : unsigned char { normal, reraise, ret, brk, cont };
+/* The pending action the SHARED finally block resumes. A return/break/continue
+ * crossing a try INLINES its own finally copy (Inc 2c), so only the try's
+ * normal and reraise (exception) exits reach the shared finally - just these
+ * two. */
+enum class Pend : unsigned char { normal, reraise };
 
 enum class OpCode : unsigned char {
 
@@ -633,11 +637,11 @@ enum class OpCode : unsigned char {
      *   Throw(a=value slot): raise the value (Inc 1). A same-frame catch is a
      *            NATIVE jump (no C++ throw); no handler here → C++ throw
      *            (cross-frame). The throw-site loc is in the loc side table.
-     *   SetPend(target=Pend): set the pending action a following `finally` must
-     *            resume (Inc 2b). `a` = the return-value slot (for Pend::ret).
-     *   EndFinally: at a `finally` block's end, resume vm_pend - fall through
-     *            (normal), re-raise vm_exc (reraise), or (Inc 2c)
-     *            return/break/continue.
+     *   SetPend(target=Pend): set the pending action the SHARED `finally` must
+     *            resume - normal or reraise (Inc 2b). A flow op inlines its own
+     *            finally (Inc 2c), so it never sets a pending action.
+     *   EndFinally: at the shared `finally` block's end, resume vm_pend - fall
+     *            through (normal) or re-raise vm_exc (reraise).
      */
     Throw,
     PushHandler,
