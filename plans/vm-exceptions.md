@@ -339,12 +339,34 @@ focused effort.
       (tw==vm). `try {..} finally {..}` with an early return/break/continue is
       ~1.6× the tree-walker; nested chaining is fully native (a return crossing
       3 finallys shows 3 `try.pop` + 3 inlined finallys, zero fallback).
-- **Inc 3 — nested try / dynamic nesting.** The handler STACK already supports
-  it; this increment is really "prove it": lexical `try{ try{}catch{} }catch{}`
-  and a `try` in a called function. (If Inc 0–2 shipped with a depth-1 handler
-  for simplicity, this generalizes to the stack.)
-- **Inc 4 — backtrace parity for the uncaught path** (the `BacktraceFrame`
-  capture must stay byte-identical — the differential checks it).
+- **Inc 3 — nested try / dynamic nesting. ✅ DONE (proven).** The handler STACK
+  supported arbitrary nesting all along; this increment was "prove it". Locked
+  in by a test (`nested try/catch/finally: each level catches its own type`):
+  three levels of nested try/catch/finally, each catching a DIFFERENT struct
+  type, verifying the stack dispatches to the innermost matching catch and runs
+  every enclosing finally in order - byte-identical under both engines. Dynamic
+  nesting (a `try` in a called function, caught in the caller) is exercised by
+  the Inc-v2 cross-frame tests.
+- **Inc 4 — backtrace parity for the uncaught path. ✅ (non-inlined) / ⏭
+  (inlined-frame gap tracked).** For a NON-INLINED cross-frame throw the VM's
+  backtrace is BYTE-IDENTICAL to the tree-walker's - frame names (incl.
+  spec-clone `name$N`), call-site lines, the caret, and `main()` all match
+  (`do_func_call`'s signal path captures frames via the SAME `vm_capture_frame`
+  as the C++-throw catch; verified in the Inc-v2 work).
+  **KNOWN GAP (pre-existing, NOT a v2 regression):** when a function is INLINED
+  and an exception propagates through the inlined call, the tree-walker shows
+  the inlined callee's VIRTUAL frame (via the node's `InlineCtx`, flushed by
+  `Construct::eval`), but the VM does NOT - inlined code runs as native ops with
+  no `Construct::eval` and (for `CallV`) no node, so the `InlineCtx` is
+  unreachable. `-ni` makes the VM byte-identical, confirming it's purely the
+  inline path. Only affects the COSMETIC virtual frames of an UNCAUGHT exception
+  crossing an inlined call (type / message / behavior are correct). **Fix
+  (tracked follow-up):** a `pc → InlineCtx*` side table on the `Chunk` (like
+  `locs`), populated at codegen - in `extract_locs` for the node-bearing ops,
+  and at EMIT time for the node-free `CallV`/`CachedCallV` - then flushed off
+  `inline_origin_emitted` at `vm_raise` (throw / runtime-error site) and the
+  call-op signal-propagation (a call FROM inlined code). ~80-120 lines +
+  parity tests across inlined shapes.
 
 ## "Nested exceptions" — clarifying the maintainer's ask
 

@@ -4697,6 +4697,39 @@ static const std::vector<test> tests =
             "assert(run() == -7);",
         },
     },
+    {
+        /* P8 Inc 3 (dynamic / lexical try nesting - "prove it"): three levels
+         * of nested try/catch/finally, each catching a different struct type.
+         * The handler STACK dispatches to the innermost matching catch and runs
+         * every enclosing finally on the way out, in order. Runs under both
+         * engines - tw==vm confirms the VM handler stack matches. */
+        "nested try/catch/finally: each level catches its own type",
+        {
+            "struct A { int v; } struct B { int v; } struct C { int v; }",
+            "var trc = [];",
+            "func stress(int sel) {",
+            "   try {",
+            "       try {",
+            "           try {",
+            "               if (sel == 1) { throw A(1); }",
+            "               if (sel == 2) { throw B(2); }",
+            "               if (sel == 3) { throw C(3); }",
+            "               append(trc, 0);",
+            "           } catch (A) { append(trc, 10); }",
+            "           finally { append(trc, 11); }",
+            "       } catch (B) { append(trc, 20); }",
+            "       finally { append(trc, 21); }",
+            "   } catch (C) { append(trc, 30); }",
+            "   finally { append(trc, 31); }",
+            "}",
+            "foreach (s in [0, 1, 2, 3]) { stress(s); }",
+            // 0: no throw, finallys 11/21/31; 1: A@10 then 11/21/31;
+            // 2: 11 then B@20 then 21/31; 3: 11/21 then C@30 then 31
+            "assert(len(trc) == 16);",
+            "assert(trc[0]==0 && trc[4]==10 && trc[8]==11 && trc[9]==20);",
+            "assert(trc[12]==11 && trc[13]==21 && trc[14]==30 && trc[15]==31);",
+        },
+    },
 
     {
         "Exceptions, single catch other ex type",
