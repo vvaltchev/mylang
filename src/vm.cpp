@@ -382,6 +382,15 @@ vm_execute(const Construct *root_c)
     }
 
     vm_run_chunk(chunk, ctx);
+
+    /* Inc v2: a top-level-uncaught exception propagated to here as the pending
+     * signal (main's boundary found no handler and converted it). Convert it
+     * back to a C++ throw for the mylang.cpp / -rt top-level handler - the SAME
+     * object, so type / message / loc / backtrace are unchanged. */
+    if (g_vm_exc_pending) {
+        std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
+        ex->rethrow();
+    }
 }
 
 /*
@@ -521,6 +530,9 @@ static bool vm_dispatch_exc(std::vector<VmHandler> &handlers, size_t &pc)
     handlers.pop_back();
     return true;
 }
+
+/* Inc v2: the in-flight cross-frame exception signal (see vm.h). */
+std::unique_ptr<RuntimeException> g_vm_exc_pending;
 
 /*
  * Raise an exception FROM a VM op - a `throw`, or a runtime error the op
@@ -1529,10 +1541,21 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             }
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
             LValue *ap = &ctx.frame->at(in.a.lit);
-            ctx.frame->at(in.target).put(
+            EvalValue res =
                 in.op == OpCode::CachedCallV
                     ? vm_cached_call(&ctx, fo, ap, in.b.lit, &chunk, pc)
-                    : vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc));
+                    : vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc);
+            /* Inc v2: the callee (or something it called) is unwinding
+             * cross-frame - route to a same-frame handler, or return to keep
+             * propagating (this frame's do_func_call captures it). */
+            if (g_vm_exc_pending) {
+                if (vm_dispatch_exc(handlers, pc)) {
+                    vm_exc = std::move(g_vm_exc_pending);
+                    continue;
+                }
+                return;
+            }
+            ctx.frame->at(in.target).put(std::move(res));
             pc++;
             break;
         }
@@ -1550,8 +1573,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             }
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
             LValue *ap = &ctx.frame->at(in.a.lit);
-            ctx.frame->at(in.target).put(
-                vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc));
+            EvalValue res = vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc);
+            if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
+                if (vm_dispatch_exc(handlers, pc)) {
+                    vm_exc = std::move(g_vm_exc_pending);
+                    continue;
+                }
+                return;
+            }
+            ctx.frame->at(in.target).put(std::move(res));
             pc++;
             break;
         }
@@ -1962,11 +1992,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
     } catch (RuntimeException &e) {
         /* An exception reached the boundary: a fallback `throw`, a runtime-
-         * library error (div0/OOB/KeyNotFound/…), or a callee's uncaught throw.
-         * With an active try, route it to the innermost handler's catch-dispatch
-         * (like TryCatchStmt catching a RuntimeException); else propagate. */
-        if (!vm_dispatch_exc(handlers, pc))
-            throw;                             /* no active try → propagate */
+         * library error (div0/OOB/KeyNotFound/…), or a callee's C++-thrown
+         * uncaught throw. With an active try, route it to the innermost
+         * handler's catch-dispatch (like TryCatchStmt catching a
+         * RuntimeException). Else (Inc v2) CONVERT it to the pending-exception
+         * SIGNAL and RETURN - do_func_call captures this frame + propagates it
+         * WITHOUT a C++ throw per frame; only this one landing-pad ran. */
+        if (!vm_dispatch_exc(handlers, pc)) {
+            g_vm_exc_pending.reset(e.clone());
+            return;
+        }
         vm_exc.reset(e.clone());               /* like saved_ex */
         goto vm_resume;                        /* re-enter at the CatchTest chain */
     }

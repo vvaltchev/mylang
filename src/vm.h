@@ -3,10 +3,26 @@
 #pragma once
 
 #include "bytecode.h"   /* Chunk */
+#include <memory>
 
 class Construct;
 class FuncDeclStmt;
 class EvalContext;
+struct RuntimeException;
+
+/*
+ * P8 Inc v2 (cross-frame propagation WITHOUT per-frame C++ unwinding): a
+ * VM-body exception that finds no handler in its own frame is converted, at
+ * that frame's boundary, into this GLOBAL pending-exception signal instead of a
+ * C++ re-throw. do_func_call captures its frame + propagates the signal; each
+ * VM call op (CallV/CachedCallV/CallValueV) checks it after a call and either
+ * dispatches to a same-frame handler or returns to keep propagating - so a
+ * throw crossing N frames pays ONE C++ landing-pad (at its origin), not N. Null
+ * except while such an exception is in flight (exception-free code pays zero).
+ * vm_execute converts a still-pending signal at the top back into a C++ throw
+ * for the mylang.cpp handler.
+ */
+extern std::unique_ptr<RuntimeException> g_vm_exc_pending;
 
 /*
  * The compiled body chunk for a block-bodied function (Phase 4), lazily built +

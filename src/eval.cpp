@@ -543,12 +543,56 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
 }
 
 /*
+ * Record `obj`'s frame on the unwinding exception (innermost first) - the
+ * shared body of do_func_call's C++-throw catch AND its Inc-v2 signal path (a
+ * VM-body exception propagates as g_vm_exc_pending, not a C++ throw, so the
+ * catch never fires and the frame must be captured on the signal path instead).
+ * Captures the name/params as STRINGS now (the AST is torn down during
+ * unwinding). The call-site caret is a loc-table lookup (the VM's AST-free
+ * call) or the passed loc (the tree-walker).
+ */
+static void
+vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
+                 size_t call_pc, Loc call_site, const InlineCtx *call_site_inl)
+{
+    if (obj.func->is_const)
+        if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
+            undefEx->in_pure_func = true;
+
+    BacktraceFrame bf;
+    bf.name = !obj.func->display_name.empty()
+                  ? obj.func->display_name
+                  : obj.func->id ? string(obj.func->id->get_str())
+                                 : "<lambda>";
+    if (obj.func->params)
+        for (const auto &p : obj.func->params->elems)
+            bf.params.push_back(string(p->get_str()));
+    if (call_ck) {
+        Loc end_ignored;
+        call_ck->loc_at(call_pc, bf.call_site, end_ignored);
+    } else
+        bf.call_site = call_site;
+    e.backtrace.push_back(move(bf));
+
+    if (call_site_inl) {
+        flush_inline_frames(call_site_inl, e);
+        e.inline_origin_emitted = true;
+    }
+}
+
+/*
  * Invoke `obj` with `args`. Builds the callee's argument context (its own
  * FlowState and, when the function was resolved, a flat slot Frame), binds the
  * params, evaluates the body, and returns what the body returned via the
  * FlowState (or none). An UndefinedVariableEx escaping a pure func is tagged so
  * the error message can point at the pure-func restriction. `call_site` (the
  * CallExpr's loc) is recorded into an unwinding exception's backtrace.
+ *
+ * `as_signal` (Inc v2): when the caller is a VM CALL OP (vm_call_func /
+ * vm_cached_call), a VM-body exception with no local handler is left as the
+ * g_vm_exc_pending SIGNAL for that op to check (propagate WITHOUT a C++ throw);
+ * every other caller (a builtin callback, the tree-walker) leaves it false, so
+ * the signal is converted back to a C++ throw here for them.
  */
 template <class ArgsVecT>
 static EvalValue
@@ -558,7 +602,8 @@ do_func_call(EvalContext *ctx,
              Loc call_site = Loc(),
              const InlineCtx *call_site_inl = nullptr,
              const Chunk *call_ck = nullptr,
-             size_t call_pc = 0)
+             size_t call_pc = 0,
+             bool as_signal = false)
 {
     /* func_ctx == true gives this call its own FlowState (see eval.h) */
     EvalContext args_ctx(&obj.capture_ctx, false, true);
@@ -645,48 +690,28 @@ do_func_call(EvalContext *ctx,
             obj.func->body->eval(&args_ctx);
 
     } catch (Exception &e) {
-
-        if (obj.func->is_const)
-            if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
-                undefEx->in_pure_func = true;
-
-        /*
-         * Record this frame as the exception unwinds (innermost first). Capture
-         * the name/params as strings now: the AST is destroyed during unwinding
-         * before the top-level handler builds the backtrace.
-         */
-        BacktraceFrame bf;
-        bf.name = !obj.func->display_name.empty()
-                      ? obj.func->display_name        /* e.g. a spec. clone */
-                      : obj.func->id ? string(obj.func->id->get_str())
-                                     : "<lambda>";
-        if (obj.func->params)
-            for (const auto &p : obj.func->params->elems)
-                bf.params.push_back(string(p->get_str()));
-        /* The VM's native call (CallV) is AST-free: it passes its chunk+pc
-         * instead of a loc, and the call-site caret is resolved from the loc
-         * side table HERE, on the error path only - so the hot success path
-         * pays no per-call lookup. The tree-walker passes a real loc. */
-        if (call_ck) {
-            Loc end_ignored;
-            call_ck->loc_at(call_pc, bf.call_site, end_ignored);
-        } else
-            bf.call_site = call_site;
-        e.backtrace.push_back(move(bf));
-
-        /*
-         * If this call was physically made from inside inlined code, emit the
-         * virtual frames for the inlined call(s) right above it. Setting the
-         * flag stops the enclosing CallExpr::eval from emitting this same chain
-         * again; a deeper physical call's own flush still runs (this is
-         * unconditional), so multi-level inlined call sites all show up.
-         */
-        if (call_site_inl) {
-            flush_inline_frames(call_site_inl, e);
-            e.inline_origin_emitted = true;
-        }
-
+        /* The tree-walker / expression-body path (a real C++ throw). Record
+         * this frame + any inlined-call virtual frames, then re-throw. */
+        vm_capture_frame(e, obj, call_ck, call_pc, call_site, call_site_inl);
         throw;
+    }
+
+    /*
+     * Inc v2: a VM body whose exception found no handler in its own frame set
+     * g_vm_exc_pending (its boundary converted the C++ throw to the signal) and
+     * RETURNED - so the catch above never fired. Record this frame the same
+     * way; then either keep the signal in flight (a VM call op checks it) or,
+     * for a non-VM caller (a builtin callback / the tree-walker), convert it
+     * back to a C++ throw here. A cross-frame throw thus pays ONE landing-pad.
+     */
+    if (g_vm_exc_pending) {
+        vm_capture_frame(*g_vm_exc_pending, obj, call_ck, call_pc, call_site,
+                         call_site_inl);
+        if (!as_signal) {
+            std::unique_ptr<RuntimeException> ex = move(g_vm_exc_pending);
+            ex->rethrow();
+        }
+        return none;                 /* signal in flight; caller checks it */
     }
 
     FlowState &fs = *args_ctx.flow;
@@ -714,7 +739,8 @@ EvalValue vm_call_func(EvalContext *ctx,
                        size_t n,
                        const Chunk *ck, size_t pc)
 {
-    return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr, ck, pc);
+    return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr, ck, pc,
+                        /*as_signal=*/true);
 }
 
 EvalValue eval_func(EvalContext *ctx,
@@ -758,7 +784,8 @@ static EvalValue
 pure_cache_call(EvalContext *ctx, FuncObject &obj,
                 const vector<EvalValue> &vals, Loc call_site,
                 const InlineCtx *inl,
-                const Chunk *ck = nullptr, size_t pc = 0)
+                const Chunk *ck = nullptr, size_t pc = 0,
+                bool as_signal = false)
 {
     PureCache &cache = ctx->frame->ensure_pure_cache();
     PureCacheKey key{ obj.func, vals };
@@ -766,7 +793,14 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
     if (it != cache.end())
         return it->second;
 
-    EvalValue r = do_func_call(ctx, obj, vals, call_site, inl, ck, pc);
+    EvalValue r = do_func_call(ctx, obj, vals, call_site, inl, ck, pc,
+                               as_signal);
+    /* Inc v2: a signaled (cross-frame unwinding) call must NOT be cached - its
+     * result is a sentinel. Only reachable with as_signal (a VM caller); the
+     * tree-walker's cached_call passes false, so do_func_call C++-throws and
+     * this is never a signal. */
+    if (g_vm_exc_pending)
+        return r;
     if (r.get_type()->t < Type::t_str)
         cache.emplace(move(key), r);
     return r;
@@ -796,14 +830,15 @@ vm_cached_call(EvalContext *ctx, FuncObject &obj,
 {
     if (!ctx->frame || !g_pure_cache_enabled)
         return do_func_call(ctx, obj, VmArgs{argslots, n},
-                            Loc(), nullptr, ck, pc);
+                            Loc(), nullptr, ck, pc, /*as_signal=*/true);
 
     vector<EvalValue> vals;
     vals.reserve(n);
     for (size_t i = 0; i < n; i++)
         vals.push_back(argslots[i].get());
 
-    return pure_cache_call(ctx, obj, vals, Loc(), nullptr, ck, pc);
+    return pure_cache_call(ctx, obj, vals, Loc(), nullptr, ck, pc,
+                           /*as_signal=*/true);
 }
 
 static void stamp_operand_loc(const Construct *c, Exception &e);

@@ -4621,6 +4621,82 @@ static const std::vector<test> tests =
             "assert(outer(4) == 25); assert(outer(0) == -7);",
         },
     },
+    {
+        /* P8 Inc v2 (cross-frame native propagation): a throw raised N frames
+         * deep, caught at the top, propagates as the g_vm_exc_pending SIGNAL -
+         * one C++ landing-pad at its origin, not one per frame. The
+         * differential runs this under both engines; tw==vm confirms the signal
+         * path is byte-identical (bench 69: VM ~29x the tree-walker). */
+        "cross-frame: a throw many frames deep is caught at the top",
+        {
+            "struct Err { int v; }",
+            "func deep(int n, int i) {",
+            "   if (n <= 0) { throw Err(i); }",
+            "   return deep(n - 1, i);",
+            "}",
+            "func run {",
+            "   var c = 0;",
+            "   for (var i = 0; i < 4; i++) {",
+            "       try { deep(5, i); } catch (Err) { c += 1; }",
+            "   }",
+            "   return c;",
+            "}",
+            "assert(run() == 4);",
+        },
+    },
+    {
+        /* Cross-frame with a `finally` at MULTIPLE levels on the unwind path:
+         * each finally runs, innermost first, as the signal propagates. */
+        "cross-frame: finallys at every crossed frame run in order",
+        {
+            "struct Err { int v; }",
+            "var order = [];",
+            "var caught = 0;",
+            "func f3(int n) { if (n <= 0) { throw Err(9); } f3(n - 1); }",
+            "func f2(int n) { try { f3(n); } finally { append(order, 2); } }",
+            "func f1(int n) { try { f2(n); } finally { append(order, 1); } }",
+            "func run { try { f1(3); } catch (Err) { caught = 1; } }",
+            "run();",
+            "assert(caught == 1);",
+            "assert(len(order) == 2);",
+            "assert(order[0] == 2 && order[1] == 1);",   // f2's before f1's
+        },
+    },
+    {
+        /* An intermediate frame's catch of a DIFFERENT type does not catch it -
+         * the exception keeps propagating (the signal) to the matching one. */
+        "cross-frame: propagates through a non-matching catch",
+        {
+            "struct A { int v; } struct B { int v; }",
+            "var got = 0;",
+            "func g3(int n) { if (n <= 0) { throw A(7); } g3(n - 1); }",
+            "func g2(int n) { try { g3(n); } catch (B) { got = -1; } }",
+            "func gtop(int n) { try { g2(n); } catch (A) { got = 100; } }",
+            "gtop(4);",                 // A(7) crosses g2's catch(B) to gtop
+            "assert(got == 100);",
+        },
+    },
+    {
+        /* A `throw` from a CACHED tree-recursion (fib-shape unroll + per-frame
+         * cache) - a v2 regression guard: the cached path once leaked the
+         * signal sentinel into `none + int` (a TypeError) because
+         * pure_cache_call, shared by the tree-walker and the VM, wrongly
+         * propagated it for the tree-walker too. Now cached_call converts,
+         * vm_cached_call signals. */
+        "cross-frame: throw from a cached tree-recursion",
+        {
+            "struct Stop { int v; }",
+            "func f(int n) {",
+            "   if (n == 7) { throw Stop(n); }",
+            "   if (n <= 1) { return n; }",
+            "   return f(n - 1) + f(n - 2);",
+            "}",
+            "func run {",
+            "   try { return f(10); } catch (Stop as e) { return -e.v; }",
+            "}",
+            "assert(run() == -7);",
+        },
+    },
 
     {
         "Exceptions, single catch other ex type",

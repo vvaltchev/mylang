@@ -247,18 +247,36 @@ focused effort.
   pays each frame's boundary landing-pad, on top of do_func_call's backtrace
   catch). This is confined to the throw path (the boundary is proven FREE on the
   no-throw path — 01/03/44/55 neutral), so it hits ONLY cross-frame
-  exceptions-as-control-flow (an anti-pattern). Fixing it by skipping the
-  boundary for handler-less chunks would risk the common hot path (a lambda/
-  extract refactor of the 1270-line loop) — a bad trade. **v2 (return-value
-  propagation) removes the C++ throw entirely and fixes `69` properly**; left as
-  a documented, tracked Inc-0 cost until then.
+  exceptions-as-control-flow (an anti-pattern). **✅ FIXED by v2 (below).**
+- **Inc v2 — cross-frame native propagation (the SIGNAL). ✅ DONE.** A VM-body
+  exception with no handler in its own frame is converted, AT THAT FRAME'S
+  BOUNDARY, into a GLOBAL pending-exception signal (`g_vm_exc_pending`, vm.h)
+  and the boundary RETURNS instead of C++-re-throwing. `do_func_call` captures
+  its frame (the backtrace-capture factored into `vm_capture_frame`, shared with
+  the C++-throw catch) and either keeps the signal in flight (for a VM call op,
+  via a new `as_signal` param that `vm_call_func`/`vm_cached_call` pass) or
+  converts it back to a C++ throw (for a builtin callback / the tree-walker).
+  Each VM user-call op (`CallV`/`CachedCallV`/`CallValueV`) checks the signal
+  after the call and either dispatches to a same-frame handler or returns to
+  propagate; `vm_execute` converts a top-level-still-pending signal back to a
+  C++ throw for the mylang.cpp handler. **So a throw crossing N frames pays ONE
+  C++ landing-pad (at its origin), not N** — `69_exc_crossframe` **~22× → ~0.06×
+  (VM ~25× the tree-walker, faster than CPython)**. Hot-path cost is one
+  well-predicted, always-false branch after each call (no measurable regression:
+  `10_recursion_deep`/`12_higher_order` neutral-or-faster). tw==vm 100%
+  (differential 1247/1247), uncaught cross-frame backtraces BYTE-IDENTICAL.
+  **Subtle bug caught + fixed:** `pure_cache_call` is shared by the tree-walker
+  (`cached_call`) and the VM (`vm_cached_call`); it must take `as_signal` from
+  its caller (not hardcode true), else a cached tree-recursion (fib-shape) that
+  throws leaks the sentinel `none` into `none + int` on the tree-walker path.
 - **Inc 1 — native `Throw` (THE win). ✅ DONE.** `throw <expr>` compiles to a
   native `Throw` op (`vm_make_thrown_exc` builds the ExceptionObject WITHOUT a
   C++ throw, then `vm_dispatch_exc`): a same-frame catch is a pure handler-stack
   JUMP, no C++ throw; no handler in this frame → C++ throw (cross-frame, like
   Inc 0). **RESULT: `42_exceptions` my/py 24.5× → 0.42× — MyLang is now ~2.4×
   FASTER than CPython** on same-frame throw/catch-as-control-flow (VM 50× faster
-  than the tree-walker). `69` cross-frame unchanged (~22×, C++ path, v2 fixes);
+  than the tree-walker). `69` cross-frame was unchanged here (~22×, C++ path) —
+  **now FIXED by Inc v2** (the pending-exception signal; ~25× the tree-walker);
   `70` runtime-error was unchanged here (~9×, a runtime-library C++ throw, not a
   user throw) — **now FIXED by the VM-detected-error refinement** (`vm_raise`
   for div/mod-by-zero; ~140× the tree-walker, faster than CPython); `71`/`72`
