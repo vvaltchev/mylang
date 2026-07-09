@@ -6,6 +6,7 @@
 #include "syntax.h"
 #include "eval.h"
 #include "errors.h"
+#include "backtrace.h"   /* flush_inline_frames (Inc 4 backtrace parity) */
 #include "bitops.h"
 
 #include <memory>
@@ -535,6 +536,24 @@ static bool vm_dispatch_exc(std::vector<VmHandler> &handlers, size_t &pc)
 std::unique_ptr<RuntimeException> g_vm_exc_pending;
 
 /*
+ * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
+ * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
+ * inline_origin_emitted - as the tree-walker's Construct::eval does). Called at
+ * the raise site (a throw / runtime error IN inlined code) and where a signal
+ * propagates through a call op (a call FROM inlined code). Cold: error path
+ * only. No-op for a chunk with no inlined ops (inline_ctx_at returns null).
+ */
+static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
+{
+    if (e.inline_origin_emitted)
+        return;
+    if (const InlineCtx *ic = chunk.inline_ctx_at(pc)) {
+        flush_inline_frames(ic, e);
+        e.inline_origin_emitted = true;
+    }
+}
+
+/*
  * Raise an exception FROM a VM op - a `throw`, or a runtime error the op
  * detects itself (div/mod-by-zero, a flat-array bounds fault). Native-dispatch
  * to a same-frame handler (set `pc` to its catch + stash `vm_exc`, NO C++ throw
@@ -555,6 +574,7 @@ vm_raise(const Chunk &chunk, size_t &pc, std::vector<VmHandler> &handlers,
         ex->loc_start = s;
         ex->loc_end = en;
     }
+    vm_flush_inline(chunk, pc, *ex);       /* frames if raised in inlined */
     if (vm_dispatch_exc(handlers, pc)) {
         vm_exc = std::move(ex);            /* same-frame: native jump */
         return;
@@ -1547,8 +1567,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     : vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc);
             /* Inc v2: the callee (or something it called) is unwinding
              * cross-frame - route to a same-frame handler, or return to keep
-             * propagating (this frame's do_func_call captures it). */
+             * propagating (this frame's do_func_call captures it). Inc 4: if
+             * THIS call was spliced from inlined code, flush its virtual frames
+             * as the exception passes through. */
             if (g_vm_exc_pending) {
+                vm_flush_inline(chunk, pc, *g_vm_exc_pending);
                 if (vm_dispatch_exc(handlers, pc)) {
                     vm_exc = std::move(g_vm_exc_pending);
                     continue;
@@ -1575,6 +1598,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             LValue *ap = &ctx.frame->at(in.a.lit);
             EvalValue res = vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
+                vm_flush_inline(chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
                 if (vm_dispatch_exc(handlers, pc)) {
                     vm_exc = std::move(g_vm_exc_pending);
                     continue;
@@ -1998,6 +2022,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
          * RuntimeException). Else (Inc v2) CONVERT it to the pending-exception
          * SIGNAL and RETURN - do_func_call captures this frame + propagates it
          * WITHOUT a C++ throw per frame; only this one landing-pad ran. */
+        /* Inc 4: a library error thrown FROM an inlined op flushes its virtual
+         * frames here (the raise happened in C++, not via vm_raise). */
+        vm_flush_inline(chunk, pc, e);
         if (!vm_dispatch_exc(handlers, pc)) {
             g_vm_exc_pending.reset(e.clone());
             return;

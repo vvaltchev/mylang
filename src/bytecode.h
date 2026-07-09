@@ -762,6 +762,38 @@ struct Chunk {
     }
 
     /*
+     * INLINED-FRAME side table (P8 Inc 4 - backtrace parity for inlined code).
+     * An op physically spliced from an INLINED function body records that
+     * body's `InlineCtx` "inlined-at" chain here, so a backtrace crossing it
+     * reconstructs the virtual inlined frames - the tree-walker gets them from
+     * `node->inline_ctx` via `Construct::eval`, which native ops have no hook
+     * for. SAME shape/cost as `locs`: `{pc, InlineCtx*}`, sorted by pc, read
+     * ONLY on the throw path (via inline_ctx_at). The `InlineCtx*` is
+     * program-lifetime AST-owned (like closure_defs / struct_defs); a
+     * serializing backend would flatten the chain to interned strings + a
+     * parent-index array (a separate axis from `locs`, which is pure data).
+     */
+    struct InlineEntry { uint32_t pc; const InlineCtx *ic; };
+    std::vector<InlineEntry> inline_ctxs;
+
+    /* The inlined-at chain of the op at `pc` (exact match; null if none).
+     * Binary search - O(log n), throw path only. */
+    const InlineCtx *inline_ctx_at(size_t pc) const
+    {
+        size_t lo = 0, hi = inline_ctxs.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (inline_ctxs[mid].pc < pc)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < inline_ctxs.size() && inline_ctxs[lo].pc == pc)
+            return inline_ctxs[lo].ic;
+        return nullptr;
+    }
+
+    /*
      * MEMBER-KEY POOL (foundation 2, AST-free op-data). A boxed member read
      * `base.member` (MemberV) needs the member's name (as a dict key AND an
      * interned uid), the optional-`?.` flag, and the carets member_read throws

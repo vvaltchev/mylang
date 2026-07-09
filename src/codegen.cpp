@@ -4167,6 +4167,13 @@ static void extract_locs(Chunk &chunk)
         Instr &in = chunk.code[pc];
         if (!in.node)
             continue;
+        /* P8 Inc 4: an op spliced from an INLINED body records that body's
+         * inlined-at chain, so a backtrace crossing it shows the virtual
+         * frames. Recorded BEFORE the switch nulls the node; pc-ascending, so
+         * inline_ctxs stays sorted. (Rare - only inlined ops have one.) */
+        if (in.node->inline_ctx)
+            chunk.inline_ctxs.push_back(
+                {static_cast<uint32_t>(pc), in.node->inline_ctx});
         switch (in.op) {
         case OpCode::IntBin:
         case OpCode::FloatBin:

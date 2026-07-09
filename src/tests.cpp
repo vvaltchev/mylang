@@ -9868,6 +9868,71 @@ backtrace_inline_frames()
 }
 
 /*
+ * P8 Inc 4: an UNCAUGHT exception crossing an INLINED call shows the inlined
+ * callee's virtual frame in the backtrace under the VM too (via the Chunk's
+ * pc->InlineCtx side table + vm_flush_inline), byte-identical to the
+ * tree-walker (which flushes node->inline_ctx in Construct::eval). Runs the
+ * SAME inlined-throw program under both engines and compares the backtrace.
+ */
+static bool
+vm_inlined_backtrace_parity()
+{
+    const char *src_lines[] = {
+        "struct E { int v; }",
+        "func leaf(int n) => throw_it(n);",     /* inlined into mid */
+        "func throw_it(int n) { throw E(n); }",
+        "func mid(int n) { return leaf(n); }",
+        "mid(-5);",
+    };
+
+    auto run = [&](ExecEngine eng) -> std::string {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < sizeof(src_lines) / sizeof(src_lines[0]); i++) {
+            if (i)
+                src += '\n';
+            src += src_lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = eng;
+        std::string bt;
+        try {
+            if (eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (const Exception &e) {
+            bt = format_backtrace(e);
+        }
+        g_exec_engine = saved;
+        return bt;
+    };
+
+    const std::string tw = run(ExecEngine::TreeWalk);
+    const std::string vm = run(ExecEngine::Vm);
+    const auto npos = std::string::npos;
+
+    /* The tree-walker itself must show the inlined `leaf` frame, and the VM
+     * must match it byte-for-byte. */
+    bool ok = !tw.empty() && tw == vm
+              && tw.find("leaf(n)") != npos          /* the inlined frame */
+              && tw.find("throw_it(n)") != npos
+              && tw.find("mid(n)") != npos;
+    if (!ok) {
+        cout << "  tw:\n" << tw << "  vm:\n" << vm;
+    }
+    return ok;
+}
+
+/*
  * AST deep-clone (Construct::clone): cloning a parsed + resolved program must
  * produce a structurally identical tree (same serialization) that is a separate
  * object graph and still evaluates correctly on its own (its internal assert
@@ -12981,6 +13046,8 @@ static const std::vector<extra_check> extra_checks =
     { "backtrace: long-frame truncation", backtrace_truncation },
     { "backtrace: end-to-end call chain", backtrace_end_to_end },
     { "backtrace: inlined virtual frames", backtrace_inline_frames },
+    { "backtrace: VM inlined-frame parity (Inc 4)",
+      vm_inlined_backtrace_parity },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },

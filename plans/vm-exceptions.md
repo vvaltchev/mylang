@@ -347,26 +347,26 @@ focused effort.
   every enclosing finally in order - byte-identical under both engines. Dynamic
   nesting (a `try` in a called function, caught in the caller) is exercised by
   the Inc-v2 cross-frame tests.
-- **Inc 4 — backtrace parity for the uncaught path. ✅ (non-inlined) / ⏭
-  (inlined-frame gap tracked).** For a NON-INLINED cross-frame throw the VM's
-  backtrace is BYTE-IDENTICAL to the tree-walker's - frame names (incl.
-  spec-clone `name$N`), call-site lines, the caret, and `main()` all match
-  (`do_func_call`'s signal path captures frames via the SAME `vm_capture_frame`
-  as the C++-throw catch; verified in the Inc-v2 work).
-  **KNOWN GAP (pre-existing, NOT a v2 regression):** when a function is INLINED
-  and an exception propagates through the inlined call, the tree-walker shows
-  the inlined callee's VIRTUAL frame (via the node's `InlineCtx`, flushed by
-  `Construct::eval`), but the VM does NOT - inlined code runs as native ops with
-  no `Construct::eval` and (for `CallV`) no node, so the `InlineCtx` is
-  unreachable. `-ni` makes the VM byte-identical, confirming it's purely the
-  inline path. Only affects the COSMETIC virtual frames of an UNCAUGHT exception
-  crossing an inlined call (type / message / behavior are correct). **Fix
-  (tracked follow-up):** a `pc → InlineCtx*` side table on the `Chunk` (like
-  `locs`), populated at codegen - in `extract_locs` for the node-bearing ops,
-  and at EMIT time for the node-free `CallV`/`CachedCallV` - then flushed off
-  `inline_origin_emitted` at `vm_raise` (throw / runtime-error site) and the
-  call-op signal-propagation (a call FROM inlined code). ~80-120 lines +
-  parity tests across inlined shapes.
+- **Inc 4 — backtrace parity for the uncaught path. ✅ DONE (incl. inlined
+  frames).** For a NON-INLINED cross-frame throw the VM backtrace is
+  BYTE-IDENTICAL to the tree-walker's - frame names (incl. spec-clone `name$N`),
+  call-site lines, the caret, and `main()` all match (`do_func_call`'s signal
+  path captures frames via the SAME `vm_capture_frame` as the C++-throw catch).
+  **INLINED frames now match too:** a `pc → InlineCtx*` side table on the
+  `Chunk` (`inline_ctxs`, same shape/cost as `locs` - sorted, binary-searched,
+  throw path only) records the inlined-at chain of any op spliced from an
+  inlined body. `extract_locs` populates it (the node is still on the Instr
+  there, incl. for `CallV`), and `vm_flush_inline(chunk, pc, e)` flushes the
+  virtual frames - keyed off `inline_origin_emitted`, like the tree-walker's
+  `Construct::eval` flush - at the raise site (`vm_raise`, a throw / runtime
+  error IN inlined code), where a signal propagates through a call op (a call
+  FROM inlined code), and at the boundary catch (a library C++ throw from an
+  inlined op). Verified byte-identical across shapes (throw in an inlined expr
+  body, a call from inlined code, div-by-zero in inlined code) by a
+  both-engines-compare test (`backtrace: VM inlined-frame parity`). The
+  `InlineCtx*` stays an AST-owned pointer (fine for a run; a `.myv` backend
+  would flatten the chain to interned strings + a parent-index array - a
+  separate axis from `locs`, which is pure data).
 
 ## "Nested exceptions" — clarifying the maintainer's ask
 
