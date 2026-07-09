@@ -12847,6 +12847,51 @@ static bool vm_disasm_shape()
     }
 }
 
+/* -vd (disassemble_program) dumps 100% of the SERIALIZABLE image, not just the
+ * code of funcs: the program's custom TYPES (struct defs - name, POD layout,
+ * field offsets, folded consts) and each chunk's POOLS (consts, catch_types,
+ * ...). This is the audit surface for the `.myv` stored-bytecode endgame. */
+static bool vm_disasm_full_image()
+{
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : {
+            "struct Point { int x; int y; const DIM = 2; }",
+            "func f(int n) {",
+            "  try { return n / n; } catch (DivisionByZeroEx) { return 0; }",
+            "}",
+            "print(f(5));" }) {
+        if (!src.empty())
+            src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (!b)
+            return false;
+        const std::string d = disassemble_program(b);
+        const auto has = [&](const char *x) {
+            return d.find(x) != std::string::npos;
+        };
+        return has("===== types")        /* the custom-type section */
+            && has("struct Point")       /* the struct name */
+            && has("[pod")               /* POD layout (size varies by arch) */
+            && has("int x @0")           /* a field's byte offset (portable) */
+            && has("const DIM = 2")      /* a folded struct const */
+            && has("catch_types")        /* a chunk pool section */
+            && has("DivisionByZeroEx");  /* the catch type name */
+    } catch (...) {
+        return false;
+    }
+}
+
 /* highlight_disasm colors each token class of a plain disassembly (256-color,
  * TTY only) AND leaves the text intact - stripping every ESC..m sequence gives
  * the plain input back exactly. */
@@ -12941,6 +12986,7 @@ static const std::vector<extra_check> extra_checks =
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
+    { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
     { "vm: disasm closures + halt-drop", vm_disasm_closure_shape },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },

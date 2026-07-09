@@ -154,6 +154,9 @@ Running scripts:
                                  # default is the tree-walker) — bytecode-vm.md
 ./build/mylang -vd FILE          # dump the VM bytecode disassembly (the
                                  # bytecode analogue of -s), exit — disasm.h;
+                                 # dumps 100% of the serializable image: the
+                                 # custom TYPES (struct defs), every chunk +
+                                 # its POOLS (consts/catch_types/…/side tables);
                                  # closures + their capture struct shown, 256-
                                  # color syntax-highlighted on a TTY
 ./build/mylang -nti FILE         # disable static type inference / checking
@@ -3154,8 +3157,21 @@ GENERAL array, a **DYN / captured / unproven** base, or a flat int array whose
 index isn't int-compilable (the flat `StoreElemInt` path rolls back and falls
 through) — while a **proven flat int/float array keeps its unboxed
 `StoreElemInt`/`StoreElemFloat`** (the catch-all excludes `th==f && base_array`,
-left to `compile_float_stmt`). The only remaining executed-code fallback across
-the bench suite is exceptions (P8).
+left to `compile_float_stmt`). **P8 exceptions are now fully native** (see
+`plans/vm-exceptions.md`): try/catch/finally + throw + rethrow + all
+flow-crossing-try (incl. nested-finally chaining) are native ops; a VM-detected
+runtime error (div/mod-by-zero at `IntBin`/`FloatBin`) native-dispatches via
+`vm_raise` with no C++ throw (bench 70 ~140× the tree-walker); and a CROSS-FRAME
+throw propagates as a global SIGNAL (`g_vm_exc_pending`) — a frame's boundary
+converts an unhandled C++ throw to the signal + returns, `do_func_call` captures
+its frame (`vm_capture_frame`) + propagates via a `do_func_call` `as_signal`
+param the VM call ops read, so N crossed frames pay ONE C++ landing-pad, not N
+(bench 69 ~25×). Backtraces are byte-identical, inclusive of INLINED virtual
+frames (a `Chunk::inline_ctxs` `pc→InlineCtx` side table, flushed by
+`vm_flush_inline`). The only executed-code fallback left is the TYPE-SYSTEM C++
+throws the VM can't pre-detect (OOB / KeyNotFound / a boxed `TypeErrorEx`); a
+same-frame catch of those is native (boundary dispatch), a cross-frame one pays
+one landing-pad to the boundary before the signal takes over.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
@@ -3427,11 +3443,31 @@ became an `InternalErrorEx` net). So the ONLY remaining `node` users are: the
 builtin calls (`CallBuiltinV`/`LV`/`LVElem`/`EmplaceStruct` - a baked func ptr +
 the args `ExprList` for per-arg error carets; freed by the builtin loc-handle
 refactor) and the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, reached
-in real code only by exceptions, the reflection builtins `show`/`type`, and the
-flat struct-array literal). A fallback op can hold its node as an index into a
+in real code now only by the reflection builtins `show`/`type` and the flat
+struct-array literal - **exceptions are fully native**, so they no longer reach
+a fallback op). A fallback op can hold its node as an index into a
 `Chunk::ast_nodes` pool, so `Instr` can shed the 8-byte `node` field WITHOUT
 first nativizing exceptions - the node-drop and the VM-exception work are
 ~orthogonal (see `plans/vm-fallback-elimination.md`).
+
+**A THIRD side table — `Chunk::inline_ctxs` (`pc → InlineCtx*`, P8 Inc 4).**
+Same shape/cost as `locs` (sorted, binary-searched, throw path only), populated
+by `extract_locs` from an op's `node->inline_ctx`: it records the "inlined-at"
+chain of any op spliced from an inlined body, so a backtrace crossing inlined
+code shows the virtual frames under the VM too (`vm_flush_inline`, flushed at
+`vm_raise` / a call-op signal-propagation / the boundary catch). Unlike `locs`
+(pure data), its `InlineCtx*` is an AST pointer - a serializing backend would
+flatten the chain to interned strings + a parent-index array (see the loc-table
+vs inline-table discussion in `plans/vm-exceptions.md`).
+
+**The disassembler dumps the WHOLE serializable image, not just funcs
+(`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
+(every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
+first, then each chunk's code, then that chunk's serializable POOLS + side
+tables (`consts`, `member_keys`, `catch_types`, `literal_objs`, `closure_defs`,
+`struct_defs`, `locs`, `inline_ctxs` - non-empty ones only). This is the audit
+surface for the `.myv` stored-bytecode endgame: everything a serialized file
+must hold is visible in the dump.
 
 ## Invariants & hazards (defense in depth)
 

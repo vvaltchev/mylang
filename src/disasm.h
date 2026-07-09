@@ -33,14 +33,20 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                         const std::vector<std::string> &cap_names = {});
 
 /*
- * Disassemble a whole program: the "main" chunk, then every block-bodied
- * function AND CLOSURE reachable (a complete AST walk - a lambda in a
- * `return func[..]{..}` / a var-init / a call arg is found too, not only
- * top-level funcs), each labelled (`func <name>` / `closure#N` / `lambda#N`)
- * with its captures. Compiles the chunks fresh (like a `-vm` run) without
- * executing. Used by the `-vd` driver. NB: a function body that ends in a
- * return has NO trailing `halt` (ReturnV already stops the chunk; only a
- * fall-through body - `main`, a void function - keeps the `halt` terminator).
+ * Disassemble a whole program - 100% of what a serialized `.myv` file would
+ * hold, so `-vd` is the audit surface for the stored-bytecode endgame:
+ *   1. the program's CUSTOM TYPES (every `struct` def - name, POD layout with
+ *      per-field byte offsets / boxed slots, and folded consts);
+ *   2. the "main" chunk, then every block-bodied function AND CLOSURE reachable
+ *      (a complete AST walk - a lambda in a `return func[..]{..}` / a var-init
+ *      / a call arg is found too, not only top-level funcs), each labelled
+ *      (`func <name>` / `closure#N` / `lambda#N`) with its captures;
+ *   3. after each chunk's code, its serializable POOLS + side tables (consts,
+ *      member_keys, catch_types, literal_objs, closure_defs, struct_defs, the
+ *      loc table, the inline-frame table) - non-empty ones only.
+ * Compiles the chunks fresh (like a `-vm` run) without executing. NB: a func
+ * body that ends in a return has NO trailing `halt` (ReturnV already stops the
+ * chunk; only a fall-through body - `main`, a void function - keeps `halt`).
  */
 std::string disassemble_program(const Block *root);
 

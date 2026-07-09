@@ -4,6 +4,8 @@
 #include "codegen.h"      /* codegen_program / codegen_chunk */
 #include "coderender.h"   /* render_construct_code - shared AST decompiler */
 #include "syntax.h"
+#include "structtype.h"   /* StructTypeDef / FieldDef (the custom-type dump) */
+#include "errors.h"       /* InlineCtx (the inline_ctxs pool dump) */
 #include "lexer.h"        /* OpString */
 
 #include <sstream>
@@ -161,6 +163,152 @@ void collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
         rec(te->elseExpr.get());
     } else if (auto *co = dynamic_cast<const CoalesceExpr *>(c)) {
         rec(co->lhs.get()); rec(co->rhs.get());
+    }
+}
+
+/* Every StructDeclStmt reachable from `c` (a custom type definition). Structs
+ * appear only as STATEMENTS, so only the statement-containers are walked. */
+void collect_structs(const Construct *c,
+                     std::vector<const StructDeclStmt *> &out)
+{
+    if (!c)
+        return;
+    if (auto *sd = dynamic_cast<const StructDeclStmt *>(c)) {
+        out.push_back(sd);
+        return;
+    }
+    auto rec = [&](const Construct *ch) { collect_structs(ch, out); };
+    if (auto *b = dynamic_cast<const Block *>(c)) {
+        for (const auto &e : b->elems) rec(e.get());
+    } else if (auto *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
+        rec(fn->body.get());
+    } else if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
+        rec(iff->thenBlock.get()); rec(iff->elseBlock.get());
+    } else if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+        rec(w->body.get());
+    } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+        rec(f->body.get());
+    } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+        rec(fr->body.get());
+    } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+        rec(fe->body.get());
+    } else if (auto *t = dynamic_cast<const TryCatchStmt *>(c)) {
+        rec(t->tryBody.get()); rec(t->finallyBody.get());
+        for (const auto &cs : t->catchStmts) rec(cs.second.get());
+    }
+}
+
+const char *field_kind_str(FieldKind k)
+{
+    switch (k) {
+    case FieldKind::f_bool:   return "bool";
+    case FieldKind::f_int:    return "int";
+    case FieldKind::f_float:  return "float";
+    case FieldKind::f_str:    return "str";
+    case FieldKind::f_array:  return "array";
+    case FieldKind::f_dict:   return "dict";
+    case FieldKind::f_dyn:    return "dyn";
+    case FieldKind::f_struct: return "struct";
+    }
+    return "?";
+}
+
+/* One custom TYPE definition - name, layout (POD byte offsets / boxed slots),
+ * fields, and folded consts. This is what a `.myv` file must store per struct
+ * type so an instance can be laid out + type-checked on load. */
+void dump_struct_type(const StructTypeDef *def, std::ostringstream &s)
+{
+    const bool pod = def->layout == StructTypeDef::Layout::pod;
+    s << "; struct " << def->name->val << "  [" << (pod ? "pod" : "boxed");
+    if (pod)
+        s << " size=" << def->size << " align=" << def->align;
+    s << "]\n";
+    for (const auto &f : def->fields) {
+        s << ";     ";
+        if (f.is_opt)
+            s << "opt ";
+        if (f.kind == FieldKind::f_struct && f.struct_ty)
+            s << f.struct_ty->val;
+        else
+            s << field_kind_str(f.kind);
+        s << " " << f.name->val;
+        if (f.offset >= 0)
+            s << " @" << f.offset;                 /* POD byte offset */
+        else if (f.slot >= 0)
+            s << " (slot " << f.slot << ")";       /* boxed slot */
+        s << "\n";
+    }
+    for (const auto &c : def->consts)
+        s << ";     const " << c.first->val << " = "
+          << c.second.get_type()->to_string_repr(c.second) << "\n";
+}
+
+/* The chunk's serializable POOLS + side tables, printed after its code (a
+ * `.myv` file stores exactly these, referenced by index/pc from the ops).
+ * Only non-empty sections print, to keep a plain function's dump terse. */
+void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
+{
+    if (!ch.consts.empty()) {
+        s << "; -- consts (" << ch.consts.size() << ") --\n";
+        for (size_t i = 0; i < ch.consts.size(); i++)
+            s << ";   #" << i << "  "
+              << ch.consts[i].get_type()->to_string_repr(ch.consts[i]) << "\n";
+    }
+    if (!ch.member_keys.empty()) {
+        s << "; -- member_keys (" << ch.member_keys.size() << ") --\n";
+        for (size_t i = 0; i < ch.member_keys.size(); i++) {
+            const auto &mk = ch.member_keys[i];
+            s << ";   #" << i << "  " << (mk.optional ? "?." : ".")
+              << mk.memId.get_type()->to_string(mk.memId) << "\n";
+        }
+    }
+    if (!ch.catch_types.empty()) {
+        s << "; -- catch_types (" << ch.catch_types.size() << ") --\n";
+        for (size_t i = 0; i < ch.catch_types.size(); i++) {
+            s << ";   #" << i << "  ";
+            for (size_t j = 0; j < ch.catch_types[i].size(); j++)
+                s << (j ? ", " : "") << ch.catch_types[i][j];
+            s << "\n";
+        }
+    }
+    if (!ch.literal_objs.empty()) {
+        s << "; -- literal_objs (" << ch.literal_objs.size() << ") --\n";
+        for (size_t i = 0; i < ch.literal_objs.size(); i++) {
+            const auto &lo = ch.literal_objs[i];
+            s << ";   #" << i << "  "
+              << lo.value.get_type()->to_string_repr(lo.value)
+              << (lo.immutable ? "  (immutable)" : "") << "\n";
+        }
+    }
+    if (!ch.closure_defs.empty()) {
+        s << "; -- closure_defs (" << ch.closure_defs.size() << ") --\n";
+        for (size_t i = 0; i < ch.closure_defs.size(); i++) {
+            const FuncDeclStmt *fd = ch.closure_defs[i];
+            s << ";   #" << i << "  "
+              << (fd->id ? std::string(fd->id->get_str()) : "<lambda>") << "\n";
+        }
+    }
+    if (!ch.struct_defs.empty()) {
+        s << "; -- struct_defs (" << ch.struct_defs.size() << ") --\n";
+        for (size_t i = 0; i < ch.struct_defs.size(); i++)
+            s << ";   #" << i << "  " << ch.struct_defs[i]->name->val
+              << "\n";
+    }
+    if (!ch.locs.empty()) {
+        s << "; -- locs (" << ch.locs.size() << ") --\n";
+        for (const auto &l : ch.locs)
+            s << ";   pc" << l.pc << " -> " << l.start.line << ":"
+              << l.start.col << "\n";
+    }
+    if (!ch.inline_ctxs.empty()) {
+        s << "; -- inline_ctxs (" << ch.inline_ctxs.size() << ") --\n";
+        for (const auto &ie : ch.inline_ctxs) {
+            s << ";   pc" << ie.pc << " -> ";
+            for (const InlineCtx *ic = ie.ic; ic; ic = ic->parent)
+                s << ic->callee_name << "@" << ic->call_site.line
+                  << (ic->parent ? " < " : "");
+            s << "\n";
+        }
     }
 }
 
@@ -588,12 +736,30 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 
         s << std::setw(4) << pc << "  " << row.str() << "\n";
     }
+
+    /* The serializable POOLS + side tables this chunk carries (a `.myv` file
+     * stores exactly these) - printed after the code, non-empty ones only. */
+    dump_chunk_pools(chunk, s);
+
     return s.str();
 }
 
 std::string disassemble_program(const Block *root)
 {
     std::ostringstream s;
+
+    /* The program's CUSTOM TYPES first (struct type definitions) - program-
+     * level data a `.myv` stores once, that instances/ops reference by name. */
+    std::vector<const StructDeclStmt *> structs;
+    for (const auto &e : root->elems)
+        collect_structs(e.get(), structs);
+    if (!structs.empty()) {
+        s << "; ===== types (" << structs.size() << ") =====\n";
+        for (const StructDeclStmt *sd : structs)
+            dump_struct_type(sd->def.get(), s);
+        s << "\n";
+    }
+
     s << disassemble(codegen_program(root), "main");
 
     std::vector<const FuncDeclStmt *> funcs;
