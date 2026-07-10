@@ -3442,10 +3442,16 @@ dead non-array `node->eval` else-branch - unreachable, `base_array` is proven -
 became an `InternalErrorEx` net). So the ONLY remaining `node` users are: the
 builtin calls (`CallBuiltinV`/`LV`/`LVElem`/`EmplaceStruct` - a baked func ptr +
 the args `ExprList` for per-arg error carets; freed by the builtin loc-handle
-refactor) and the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, reached
-in real code now only by the reflection builtins `show`/`type` and the flat
-struct-array literal - **exceptions are fully native**, so they no longer reach
-a fallback op). A fallback op can hold its node as an index into a
+refactor) and the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`). P8
+exceptions are fully native (they no longer reach a fallback op), but they were
+NOT the last: a verified `-vd` audit (the FALLBACK-OP AUDIT in
+`plans/vm-fallback-elimination.md`) finds LIVE `EvalStmt` fallbacks still
+emitted for several multi-assign / IdList forms, a couple of `foreach` shapes
+(dict 2-var, indexed-unpack), a discarded-result indirect call, the flat
+`array<PodStruct>` literal, and the reflection builtins
+(`show`/`type`/`typestr`/`decltype`) as non-folded calls - the last being the
+one INHERENTLY-node case.
+A fallback op can hold its node as an index into a
 `Chunk::ast_nodes` pool, so `Instr` can shed the 8-byte `node` field WITHOUT
 first nativizing exceptions - the node-drop and the VM-exception work are
 ~orthogonal (see `plans/vm-fallback-elimination.md`).

@@ -47,6 +47,49 @@ lands and the differential/bench confirm it; keep it (struck) for the record.
 Plus the Part-C native-but-slow work (typed reads, computed-goto dispatch,
 arg-view builtin ABI, ...) — none skipped.
 
+## ⚑ FALLBACK-OP AUDIT (2026-07-10, VERIFIED) — exceptions were NOT the last
+
+P8 exceptions were a big fallback category and are gone, but they were **not**
+the last. A fresh `-vd` sweep over every `bench/my/*.my` AND `samples/*`, with
+**dead template chunks excluded** (a `func f` whose calls all redirect to a
+native `f$0` is never compiled at runtime; its `eval.stmt` rows are noise - the
+`f$0` instance is native), finds these LIVE fallback ops. All are `EvalStmt`
+(no live `EvalToSlot` or `JumpIfFalse` remain - every condition/expression the
+samples use is native). Goal: nativize each → `node` becomes unused → drop it.
+
+- **F-1 · multi-assign / IdList** (three forms):
+  - **F-1a** `var a, b, c = [lit]` - a multi-var DECL destructure of an array
+    literal (`fib`: `var a,b,i = [1,1,0]`). `try_multi_literal_store` does the
+    ASSIGN form; the DECL form falls back. *Nativizable.*
+  - **F-1b** `for (var n, tot = [lit]; …)` - a multi-var-decl in a for-INIT
+    (`primes`: `[2,0]`). *Nativizable.*
+  - **F-1c** `a, b = <array VALUE>` - destructure from a NON-literal array
+    (`shopping`: `= products[pnum]`). *Needs a strict-unpack-a-value op.*
+- **F-2 · foreach** (two shapes):
+  - **F-2a** `foreach (var k, v in data)` - dict 2-var (`phonebook`). *DIAGNOSE:
+    should be D3-native; a body op or the 2-var-`var` form is blocking it.*
+  - **F-2b** `foreach (i, name, price in indexed products)` - indexed + 2-elem
+    unpack (`shopping`). *Nativizable: combine the indexed + unpack lowerings.*
+- **F-3 · indirect call statement** `cmdfunc(data)` - a discarded-result call
+  through a func-VALUE var (`phonebook`). *DIAGNOSE: likely `opt func` from
+  `find()`, not proven callable → no `CallValueV`.*
+- **F-4 · flat `array<PodStruct>` literal** `[P(a), P(b)]` (synth).
+  *`MakeArrayV` doesn't build a flat struct array from constructor elements.*
+- **F-5 · reflection builtins** `show`/`type`/`typestr`/`decltype` as a
+  NON-folded runtime call (synth `typestr(n)`). *INHERENT - an AST builtin with
+  an unevaluated operand; the one construct that genuinely needs the node.*
+
+**`node`-field status:** the fallback ops (EvalStmt/EvalToSlot/JumpIfFalse)
+hold `node` to re-enter `node->eval`; the **builtin call ops** hold it for
+per-arg carets (freed by the AST-free-locs / builtin-loc-handle refactor). So
+the order to a `node`-free `Instr` is: (a) nativize F-1..F-4 (mechanical); (b)
+AST-free-locs frees the builtin ops; (c) F-5 (reflection builtins) is the one
+INHERENTLY-node construct - either give it a small serializable "reflect these
+static types" encoding, or accept a `Chunk::ast_nodes` pool for it (a pool of
+`Construct*` blocks freeing the AST but still lets `Instr` shed the field). Only
+after (a)+(b)+(c) is `node` unused → removable, and only with F-5 encoded (not
+pooled) is the bytecode fully AST-free / serializable.
+
 ## Remaining work (current — 2026-07-07)
 
 The tracker rows above are kept current (struck as they land). The Part A/B/C
