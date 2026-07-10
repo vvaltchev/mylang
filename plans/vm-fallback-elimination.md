@@ -57,19 +57,40 @@ native `f$0` is never compiled at runtime; its `eval.stmt` rows are noise - the
 (no live `EvalToSlot` or `JumpIfFalse` remain - every condition/expression the
 samples use is native). Goal: nativize each → `node` becomes unused → drop it.
 
-- **F-1 · multi-assign / IdList** (three forms):
-  - **F-1a** `var a, b, c = [lit]` - a multi-var DECL destructure of an array
-    literal (`fib`: `var a,b,i = [1,1,0]`). `try_multi_literal_store` does the
-    ASSIGN form; the DECL form falls back. *Nativizable.*
-  - **F-1b** `for (var n, tot = [lit]; …)` - a multi-var-decl in a for-INIT
-    (`primes`: `[2,0]`). *Nativizable.*
-  - **F-1c** `a, b = <array VALUE>` - destructure from a NON-literal array
-    (`shopping`: `= products[pnum]`). *Needs a strict-unpack-a-value op.*
+- **F-1 · multi-assign / IdList** (three forms) — ✅ DONE (2026-07-10).
+  A catch-all `MultiUnpackV` op (codegen `try_multi_unpack`) now covers the
+  whole IdList branch after the two array-eliding fast paths: it compiles the
+  rvalue into a temp and the op does the tree-walker's STRICT destructure
+  (an ARRAY value → length-checked distribute via `vm_arr_elem`, which
+  dispatches on `skind()` so it is sound for a general/flat/dyn element; a
+  NON-array → spread to every target). AST-free: the target slots live in
+  `Chunk::unpack_targets` (`-1` == `_`), the strict-length caret in the loc side
+  table (recording the enclosing `Expr14`'s span, matching the tree-walker's
+  `Construct::eval` stamp of a loc-less IdList). Bench `73_multi_unpack` (the
+  array-VALUE form) VM 0.30x vs the tree-walker; `22_multi_assign` (literal,
+  elided) 0.19x. All three original forms verified native:
+  - **F-1a** `var a, b, c = [lit]` (`fib`) — a const array literal folds to a
+    `LiteralObj`, so it builds via `LoadLiteralObjV` then `MultiUnpackV` (the
+    non-const-literal ASSIGN form still elides via `try_multi_literal_store`).
+  - **F-1b** `for (var n, tot = [lit]; …)` (`primes`) — native.
+  - **F-1c** `a, b = <array VALUE>` (`shopping`: `= products[pnum]`) — native,
+    the strict-unpack-a-value op this needed.
 - **F-2 · foreach** (two shapes):
   - **F-2a** `foreach (var k, v in data)` - dict 2-var (`phonebook`). *DIAGNOSE:
     should be D3-native; a body op or the 2-var-`var` form is blocking it.*
   - **F-2b** `foreach (i, name, price in indexed products)` - indexed + 2-elem
     unpack (`shopping`). *Nativizable: combine the indexed + unpack lowerings.*
+  - **F-2 BUG (found 2026-07-10, pre-existing)** — `UnpackElemInt`/
+    `UnpackElemFloat` (the already-native `foreach (a, b in pairs)` strict
+    unpack) blindly read the sub-array via `flat_ints()`/`flat_floats()`, but a
+    MIXED-numeric sub-array literal `[int, float]` is typed `array<float>` by
+    the inferencer (int∨float join) yet built GENERAL storage at runtime → the
+    flat accessor ASSERTS / crashes (`shopping`: `[pnum, q]`; minimal repro:
+    `append(lst,[i,f]); foreach(a,b in lst){}`). The differential is green only
+    because no `-rt` test uses a mixed sub-array. Fix as part of F-2: either read
+    each scalar via `arr_elem_at` (skind-dispatched, box-then-unbox — still
+    box-free for the common flat case) or only stamp `unpack_elem_th` when the
+    sub-arrays are PROVABLY flat (all-same-scalar element type).
 - **F-3 · indirect call statement** `cmdfunc(data)` - a discarded-result call
   through a func-VALUE var (`phonebook`). *DIAGNOSE: likely `opt func` from
   `find()`, not proven callable → no `CallValueV`.*

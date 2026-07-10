@@ -3192,7 +3192,20 @@ on a provably-non-array rvalue (a proven int/float `th`, or a scalar `Literal` �
 int/bool/float/str/none, NOT `LiteralObj`); an array/dyn rvalue falls back to
 the strict destructure. So `var a,b,c = 0` / `= "hi"` / `= x` (int `x`) are
 native. **Effect: `22_multi_assign` 0.89x → 0.18x** (the per-iteration
-array alloc was the whole cost). A
+array alloc was the whole cost). Every OTHER IdList destructure — an array
+VALUE (`x, y, z = arr`, `= products[pnum]`), a const array literal (a folded
+`LiteralObj`), a `dyn` rvalue — is the catch-all **`MultiUnpackV`**
+(`try_multi_unpack`), tried after the two eliding paths: it compiles the rvalue
+into a temp and the op runs the tree-walker's STRICT destructure — an array
+value is length-checked and its elements distributed **box-free** via
+`vm_arr_elem` (skind-dispatched: sound for a general/flat/dyn element), a
+non-array SPREADs to every target. AST-free: the target slots (with `-1` for
+`_`) live in the **`Chunk::unpack_targets`** pool, and the strict-length caret
+in the loc side table records the enclosing `Expr14`'s span — matching the
+tree-walker, whose loc-less IdList lvalue makes the error inherit the Expr14
+loc via `Construct::eval`. So the WHOLE IdList branch is native (no residual
+`EvalStmt`); a typed/const target still falls back. **Effect: `73_multi_unpack`
+(the array-value form) 0.30x vs the tree-walker.** A
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
 sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)

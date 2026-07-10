@@ -1,0 +1,22 @@
+# multi-assign destructure of an array VALUE: a, b, c = arr (the MultiUnpackV
+# op - F-1c). Distinct from 22_multi_assign, which destructures an array
+# LITERAL (elided at compile time); here the rvalue is a runtime array value,
+# so it is a strict length-checked unpack every iteration.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 600000 * scale;
+var arr = [0, 0, 0];
+var s = 0;
+
+for (var i = 0; i < N; i++) {
+    arr[0] = i;
+    arr[1] = i + 1;
+    arr[2] = i + 2;
+    var a, b, c = arr;
+    s += a + b + c;
+    s = s % 1000000007;
+}
+
+print("result:", s);

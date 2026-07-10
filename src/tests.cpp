@@ -6230,6 +6230,54 @@ static const std::vector<test> tests =
     },
 
     {
+        /* F-1: multi-assign of an array VALUE (not a literal) -> MultiUnpackV;
+         * the differential reruns this under -vm (strict length distribute). */
+        "Multi-assign destructures an array value",
+        {
+            "var arr = [10, 20, 30];",
+            "var x, y, z = arr;",
+            "assert(x == 10 && y == 20 && z == 30);",
+            "var s = 0;",
+            "for (var i = 0; i < 4; i++) {",
+            "    var a, b = [i, i * 2];",
+            "    var p, q = a > 0 ? [a, b] : [0, 0];",
+            "    s += p + q;",
+            "}",
+            "assert(s == 18);",   /* i=1:1+2, 2:2+4, 3:3+6 = 3+6+9 */
+        },
+    },
+
+    {
+        /* F-1: MultiUnpackV `_` placeholder skips its slot but counts to arity */
+        "Multi-assign array value with underscore",
+        {
+            "var arr = [7, 8, 9];",
+            "var p, _, r = arr;",
+            "assert(p == 7 && r == 9);",
+        },
+    },
+
+    {
+        /* F-1: a non-array (scalar) rvalue spreads to every target */
+        "Multi-assign scalar-value spread",
+        {
+            "var v = 5;",
+            "var a, b, c = v;",
+            "assert(a == 5 && b == 5 && c == 5);",
+        },
+    },
+
+    {
+        /* F-1: strict length mismatch on an array value throws (both engines) */
+        "Multi-assign array value strict length error",
+        {
+            "var arr = [1, 2];",
+            "var a, b, c = arr;",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
         /* native dict foreach (VM DictIterInit/DictIterNext; -vm rerun via the
          * differential). Assertions are order-independent - a dict's iteration
          * order is unspecified. */

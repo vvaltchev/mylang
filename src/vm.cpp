@@ -187,6 +187,19 @@ vm_throw_unpack_len(const Chunk &chunk, size_t pc, size_type m, int_type nvars)
                                  std::to_string(nvars) + " variables"), s, en);
 }
 
+/* The MULTI-ASSIGN strict-unpack length error (F-1) - the same message the
+ * tree-walker's handle_single_expr14 throws, WITHOUT the "foreach:" prefix. */
+[[noreturn]] static ML_NOINLINE void
+vm_throw_multi_unpack_len(const Chunk &chunk, size_t pc, size_type m,
+                          size_t nvars)
+{
+    Loc s, en;
+    chunk.loc_at(pc, s, en);
+    throw TypeErrorEx(intern_msg("cannot unpack an array of length " +
+                                 std::to_string(m) + " into " +
+                                 std::to_string(nvars) + " variables"), s, en);
+}
+
 /* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
  * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
  * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
@@ -1234,6 +1247,33 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     e.loc_end = le;
                 }
                 throw;
+            }
+            pc++;
+            break;
+        }
+
+        case OpCode::MultiUnpackV: {
+
+            /* Multi-assign `a, b, c = <rvalue>` (F-1): the tree-walker's STRICT
+             * destructure, AST-free. An ARRAY rvalue must have EXACTLY as many
+             * elements as targets (else the length TypeErrorEx, caret from the
+             * side table); each element (box-free for a flat scalar via
+             * vm_arr_elem) writes to its target slot (-1 == `_`, skipped). A
+             * NON-array rvalue SPREADS to every target. */
+            const EvalValue &rval = ctx.frame->at(in.a.slot).get();
+            const std::vector<int32_t> &targets = chunk.unpack_targets[in.target];
+            if (rval.is<SharedArrayObj>()) {
+                const size_type m = rval.get_ref<SharedArrayObj>().size();
+                if (m != static_cast<size_type>(targets.size()))
+                    vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
+                for (size_t i = 0; i < targets.size(); i++)
+                    if (targets[i] >= 0)
+                        ctx.frame->at(targets[i]).put(
+                            vm_arr_elem(rval, static_cast<size_type>(i)));
+            } else {
+                for (int32_t t : targets)
+                    if (t >= 0)
+                        ctx.frame->at(t).put(rval);
             }
             pc++;
             break;

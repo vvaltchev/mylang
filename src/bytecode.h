@@ -263,6 +263,21 @@ enum class OpCode : unsigned char {
     StoreElemValue,
 
     /*
+     * Native multi-assign / IdList destructure `a, b, c = <rvalue>` (F-1): the
+     * rvalue is compiled into `a.slot`; `target` indexes `Chunk::unpack_targets`
+     * (the target frame slots, -1 for a `_` placeholder). vm_multi_unpack does
+     * the tree-walker's STRICT rule: if the rvalue is an ARRAY, its length must
+     * EXACTLY match the target count (else a "cannot unpack an array of length M
+     * into N variables" TypeErrorEx, loc from the side table), and each element
+     * (arr_elem_boxed - box-free for a flat scalar) is written to its target;
+     * a NON-array rvalue SPREADS to every target. Handles the const-literal
+     * (LiteralObj), for-init, and runtime-array-value forms uniformly - the
+     * array-elide fast paths (try_multi_literal_store / _scalar_spread) still
+     * take the non-const LITERAL / proven-scalar cases first. AST-free.
+     */
+    MultiUnpackV,
+
+    /*
      * Native NESTED general store `a[i][j] = v` / `a[i][j] OP= v` (residual): a
      * Subscript lvalue whose base is another Subscript over a slotted base.
      * `target2` = the outer base's (local) slot, `a` = KEY1 (i) temp, `b` = KEY2
@@ -844,4 +859,9 @@ struct Chunk {
      * standalone `P(..)` construction). Program-lifetime AST-owned pointers,
      * indexed by the Instr. */
     std::vector<const StructTypeDef *> struct_defs;
+
+    /* Target frame slots for each MultiUnpackV (`a, b, c = <rvalue>`), in
+     * order, with -1 for a `_` placeholder. `Instr::target` indexes this. Pure
+     * data (ints) - serializable. */
+    std::vector<std::vector<int32_t>> unpack_targets;
 };

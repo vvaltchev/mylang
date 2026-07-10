@@ -557,6 +557,20 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "][" << RI(in.b, false) << "] " << o << " " << D(in.target);
             break;
         }
+        case OpCode::MultiUnpackV: {
+            row << "multi.unpack ";
+            const std::vector<int32_t> &tg = chunk.unpack_targets[in.target];
+            for (size_t i = 0; i < tg.size(); i++) {
+                if (i)
+                    row << ", ";
+                if (tg[i] < 0)
+                    row << "_";
+                else
+                    row << "r" << tg[i];
+            }
+            row << " = " << RI(in.a, false);
+            break;
+        }
         case OpCode::EvalToSlot:
             row << "eval.slot    " << D(in.target) << " = " << node1(in.node);
             break;

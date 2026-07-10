@@ -1184,6 +1184,60 @@ struct Codegen {
         return true;
     }
 
+    /* Multi-assign `a, b, c = <rvalue>` GENERAL (F-1): the array-elide fast
+     * paths (literal / scalar-spread) didn't apply - the rvalue is a CONST
+     * array literal (a folded LiteralObj), a runtime array VALUE (a subscript /
+     * var / call), or a dyn. Compile the rvalue into a temp + emit MultiUnpackV
+     * (target slots in `chunk.unpack_targets`); the op does the tree-walker's
+     * STRICT destructure (array -> length-checked distribute; else spread).
+     * Every target must be a real or `_` slot, resolved-local, non-const,
+     * non-typed (or dyn) - a typed/const/map target falls back. */
+    bool try_multi_unpack(const Expr14 *e, const IdList *il,
+                          std::vector<Instr> &ops)
+    {
+        const size_t n = il->elems.size();
+        if (n == 0)
+            return false;
+        for (const auto &t : il->elems) {
+            if (t->is_underscore())
+                continue;               /* `_` is a skipped slot */
+            if (t->sym.kind != SymKind::local || t->is_const
+                || (t->decl_type != DeclType::none
+                    && t->decl_type != DeclType::dyn))
+                return false;
+        }
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        int rslot;
+        if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+            ops.resize(omark);
+            next_temp = save_top;
+            chunk.consts.resize(cmark);
+            return false;
+        }
+
+        std::vector<int32_t> targets;
+        targets.reserve(n);
+        for (const auto &t : il->elems)
+            targets.push_back(t->is_underscore()
+                                  ? -1 : static_cast<int32_t>(t->sym.slot));
+        Instr in;
+        in.op = OpCode::MultiUnpackV;
+        /* The strict-length caret matches the tree-walker: its IdList lvalue
+         * carries no loc, so the error stamps the enclosing Expr14's span
+         * (`a, b, c = <rvalue>`) via Construct::eval - so record `e`, not il. */
+        in.node = e;
+        in.a = slot_op(rslot);
+        in.target = static_cast<int>(chunk.unpack_targets.size());
+        chunk.unpack_targets.push_back(std::move(targets));
+        ops.push_back(in);
+
+        next_temp = save_top;
+        return true;
+    }
+
     bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
     {
         /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
@@ -1229,6 +1283,8 @@ struct Codegen {
                 if (try_multi_literal_store(e, il, ops))
                     return true;
                 if (try_multi_scalar_spread(e, il, ops))
+                    return true;
+                if (try_multi_unpack(e, il, ops))
                     return true;
                 return false;
             }
@@ -4198,6 +4254,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
+        case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
         case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
         case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
             /* node used ONLY for the caret now (div/mod; the missing-key
