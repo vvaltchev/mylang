@@ -3085,6 +3085,15 @@ struct Codegen {
                     continue;
                 }
             }
+            /* A func-VALUE call statement -> CallValueV (result discarded);
+             * rejects a Direct{Call,BuiltinCall}Expr internally (F-3). */
+            if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
+                int dst;
+                if (try_native_value_call(call, dst, chunk.code)) {
+                    any_native = true;
+                    continue;
+                }
+            }
             /* `return <expr>;` -> ReturnV / SetPend-to-finally (Inc 2c). */
             if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
                 if (try_native_return(ret, chunk.code)) {
@@ -4129,6 +4138,15 @@ struct Codegen {
                 dynamic_cast<const DirectBuiltinCallExpr *>(s)) {
             int dst;
             if (try_native_builtin(bc, dst, chunk.code))
+                return;
+        }
+        /* A func-VALUE call statement (a call through a Func-typed var/closure,
+         * result discarded) -> CallValueV (F-3, phonebook's `cmdfunc(data)`).
+         * try_native_value_call rejects a Direct{Call,BuiltinCall}Expr, so this
+         * only catches a plain CallExpr the two handlers above didn't. */
+        if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
+            int dst;
+            if (try_native_value_call(call, dst, chunk.code))
                 return;
         }
         /* `return <expr>;` -> ReturnV (its expr compiled natively). */

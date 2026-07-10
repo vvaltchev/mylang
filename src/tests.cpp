@@ -6453,6 +6453,39 @@ static const std::vector<test> tests =
     },
 
     {
+        /* F-3: a DISCARDED call statement through a func-VALUE var (not a
+         * global-slot function) -> CallValueV. The callee mutates its array
+         * param by reference (the observable side effect). */
+        "Func-value call statement (discarded result)",
+        {
+            "func addit(a) { append(a, 1); }",
+            "var fn = addit;",
+            "var arr = [];",
+            "fn(arr);",
+            "fn(arr);",
+            "fn(arr);",
+            "assert(len(arr) == 3);",
+        },
+    },
+
+    {
+        /* F-3: dispatch through a func-value picked from an array<func> in a
+         * loop (the phonebook cmdfunc shape), each call's result discarded. */
+        "Func-value dispatch table call statement",
+        {
+            "func add_op(st, x) { st[0] = st[0] + x; }",
+            "func sub_op(st, x) { st[0] = st[0] - x; }",
+            "var ops = [add_op, sub_op];",
+            "var st = [0];",
+            "for (var i = 0; i < 6; i++) {",
+            "    var fn = ops[i % 2];",
+            "    fn(st, i);",
+            "}",
+            "assert(st[0] == -3);",   /* 0-1+2-3+4-5 */
+        },
+    },
+
+    {
         /* native const-literal materialization (VM LoadLiteralObjV): a mutable
          * `var` literal is a FRESH deep copy each eval (so a loop's per-iter
          * mutation never leaks), a `const` shares the deep read-only value.

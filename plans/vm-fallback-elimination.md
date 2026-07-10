@@ -111,8 +111,18 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
     still for the common homogeneous-flat case, sound for the general/mixed
     case. Regression test + shopping parity added.
 - **F-3 · indirect call statement** `cmdfunc(data)` - a discarded-result call
-  through a func-VALUE var (`phonebook`). *DIAGNOSE: likely `opt func` from
-  `find()`, not proven callable → no `CallValueV`.*
+  through a func-VALUE var (`phonebook`). ✅ DONE (2026-07-11). DIAGNOSED: the
+  EXPRESSION-position value call was already native (`CallValueV`); the gap was
+  that a discarded call STATEMENT had no handler for a plain `CallExpr` (only
+  `DirectCallExpr`/`DirectBuiltinCallExpr`), so it fell to `EvalStmt`. FIX: both
+  `gen_stmt` and the loop-body stmt compiler now route a plain-`CallExpr`
+  statement to `try_native_value_call` (which rejects a `Direct*` internally),
+  discarding the result. (The `opt func` narrowing was a red herring - the
+  callee's kind is `Func` even when `opt`, so `vm_direct_func` was already set.)
+  phonebook's `cmdfunc(data)` is now `call.val`; the only remaining `EvalStmt`
+  is the DEAD `load_data` base template (its live `load_data$0` instance is
+  native). Bench `76_funcval_dispatch` VM 0.93x vs the tree-walker (call-bound,
+  so modest; the win is removing the dispatch overhead + the fallback).
 - **F-4 · flat `array<PodStruct>` literal** `[P(a), P(b)]` (synth).
   *`MakeArrayV` doesn't build a flat struct array from constructor elements.*
 - **F-5 · reflection builtins** `show`/`type`/`typestr`/`decltype` as a

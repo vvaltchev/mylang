@@ -3066,7 +3066,13 @@ global slot) goes native via **`CallValueV`**: the callee EXPRESSION is compiled
 into a temp (callee-first, matching the tree-walker), then the args run, and the
 op reads the temp's `FuncObject` and `vm_call_func`s it — so
 `11_closure_counter` (1.09x → 1.00x, no longer a VM loss) and `12_higher_order`
-(0.54x) go native. A **baked const array/dict/struct literal** (a `LiteralObj` —
+(0.54x) go native. This covers both an EXPRESSION-position value call and a
+**discarded call STATEMENT** `fn(args);` (F-3, phonebook's `cmdfunc(data)` — a
+func picked from a dict/array and dispatched; `gen_stmt` + the loop-body stmt
+compiler route a plain-`CallExpr` statement to `try_native_value_call` after the
+`Direct{Call,BuiltinCall}Expr` handlers, its result discarded). Modest speed
+(the call is `do_func_call`-bound, both engines), but it removes phonebook's last
+live `EvalStmt` (`76_funcval_dispatch` VM 0.93x vs the tree-walker). A **baked const array/dict/struct literal** (a `LiteralObj` —
 what a fully-const `var a = [1,2,3]` / `d = {}` folds to) materializes via
 **`LoadLiteralObjV`**, which calls the shared **`eval_literal_obj`** (the
 immutable-share vs fresh-mutable-clone logic + the general/flat_s `arr_hint`

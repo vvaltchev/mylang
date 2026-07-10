@@ -1,0 +1,22 @@
+# DISCARDED call statement through a func-VALUE var (phonebook's cmdfunc(data)
+# shape): a function picked from an array<func> is called for its side effect,
+# the result discarded. The VM dispatches it via CallValueV (no node->eval of
+# the call) instead of a tree-walker EvalStmt fallback.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+
+func add_op(st, x) { st[0] = st[0] + x; }
+func sub_op(st, x) { st[0] = st[0] - x; }
+var ops = [add_op, sub_op];
+
+var st = [0];
+
+for (var i = 0; i < N; i++) {
+    var fn = ops[i % 2];
+    fn(st, i);              # indirect call statement, result discarded
+}
+
+print("result:", st[0]);
