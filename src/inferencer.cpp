@@ -1472,11 +1472,13 @@ void Inferencer::annotate_hints(Construct *n)
                 fe->container_is_dict = true;
         }
 
-        /* A non-indexed SINGLE-var foreach over a DYN container (can't prove
-         * array OR dict): the VM's runtime-dispatching ForeachDyn iterator
-         * (array element / dict key, box-free). 2-var / indexed dyn falls back
-         * (rarer). */
-        if (!fe->indexed && fe->ids && fe->ids->elems.size() == 1
+        /* A non-indexed 1- or 2-var foreach over a DYN container (can't prove
+         * array OR dict): the VM's runtime-dispatching ForeachDyn iterator. It
+         * dispatches at runtime - 1-var binds the array element / dict key; a
+         * 2-var STRICT-unpacks an array element into the two vars, or binds a
+         * dict key+value (box-free). Indexed / >2-var dyn falls back (rarer). */
+        if (!fe->indexed && fe->ids
+            && (fe->ids->elems.size() == 1 || fe->ids->elems.size() == 2)
             && !fe->container_is_array && !fe->container_is_dict) {
             StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
             if (c->kind == StaticTypeKind::Dyn)

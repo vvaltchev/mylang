@@ -486,6 +486,7 @@ struct DictIterState {
 struct DynIterState {
     EvalValue container;   /* pins the array OR dict for the loop */
     bool is_dict = false;
+    int nvars = 1;         /* 1 (element/key) or 2 (unpack / key+value) */
     size_type idx = 0, size = 0;               /* array cursor + snapshot */
     DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
 };
@@ -970,6 +971,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 && static_cast<size_t>(in.target) < dyn_iters.size());
             DynIterState &st = dyn_iters[in.target];
             st.container = ctx.frame->at(in.target2).get();
+            st.nvars = static_cast<int>(in.a.lit);   /* 1 or 2 loop vars */
             if (st.container.is<SharedArrayObj>()) {
                 st.is_dict = false;
                 st.idx = 0;
@@ -999,9 +1001,25 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     pc = static_cast<size_t>(in.target);
                     break;
                 }
-                if (in.a.slot >= 0)
-                    ctx.frame->at(in.a.slot).put(
-                        vm_arr_elem(st.container, st.idx));
+                if (st.nvars == 1) {
+                    if (in.a.slot >= 0)
+                        ctx.frame->at(in.a.slot).put(
+                            vm_arr_elem(st.container, st.idx));
+                } else {
+                    /* 2-var over an ARRAY: the element must be an array of
+                     * EXACTLY 2, unpacked into the vars - do_iter's STRICT
+                     * destructure (same messages/loc via the side table). */
+                    const EvalValue elem = vm_arr_elem(st.container, st.idx);
+                    if (!elem.is<SharedArrayObj>())
+                        vm_throw_unpack_nonarray(chunk, pc, st.nvars);
+                    const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
+                    if (sub.size() != static_cast<size_type>(st.nvars))
+                        vm_throw_unpack_len(chunk, pc, sub.size(), st.nvars);
+                    if (in.a.slot >= 0)
+                        ctx.frame->at(in.a.slot).put(vm_arr_elem(elem, 0));
+                    if (in.b.slot >= 0)
+                        ctx.frame->at(in.b.slot).put(vm_arr_elem(elem, 1));
+                }
                 st.idx++;
             } else {
                 DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
@@ -1011,6 +1029,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 }
                 if (in.a.slot >= 0)
                     ctx.frame->at(in.a.slot).put(st.it->first);
+                if (st.nvars == 2 && in.b.slot >= 0)
+                    ctx.frame->at(in.b.slot).put(st.it->second.get());
                 ++st.it;
             }
             pc++;

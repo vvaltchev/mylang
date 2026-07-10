@@ -3956,29 +3956,36 @@ struct Codegen {
     }
 
     /*
-     * Native SINGLE-var `foreach (e in <dyn container>)` via a runtime-
-     * dispatching live iterator (ForeachDynInit/ForeachDynNext): the
-     * array-vs-dict choice is made at runtime, then the loop var binds the
-     * array element or the dict key box-free. Same shape as the dict foreach;
-     * a `_` binds nothing (slot -1). 2-var / indexed dyn foreach falls back.
+     * Native `foreach (e in <dyn container>)` / `foreach (k, v in <dyn>)` via a
+     * runtime-dispatching live iterator (ForeachDynInit/ForeachDynNext): the
+     * array-vs-dict choice is made at runtime, then (1-var) the loop var binds
+     * the array element or the dict key box-free, or (2-var) an array element
+     * is STRICT-unpacked into the two vars and a dict binds key+value - matching
+     * do_iter. A `_` binds nothing (slot -1). Indexed / >2-var falls back.
      */
     bool try_native_dyn_foreach(const ForeachStmt *fe)
     {
-        if (!fe->container_is_dyn || !fe->ids
-            || fe->ids->elems.size() != 1)
+        if (!fe->container_is_dyn || fe->indexed || !fe->ids
+            || (fe->ids->elems.size() != 1 && fe->ids->elems.size() != 2))
             return false;
 
-        const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
-        if (!id)
+        auto slot_of = [&](size_t i, int &out) -> bool {
+            const Identifier *id =
+                dynamic_cast<const Identifier *>(fe->ids->elems[i].get());
+            if (!id)
+                return false;
+            if (id->is_underscore()) { out = -1; return true; }
+            if (id->sym.kind != SymKind::local)
+                return false;
+            out = id->sym.slot;
+            return true;
+        };
+        const int nvars = static_cast<int>(fe->ids->elems.size());
+        int e_slot = -1, v_slot = -1;
+        if (!slot_of(0, e_slot))
             return false;
-        int e_slot;
-        if (id->is_underscore())
-            e_slot = -1;
-        else if (id->sym.kind != SymKind::local)
+        if (nvars == 2 && !slot_of(1, v_slot))
             return false;
-        else
-            e_slot = id->sym.slot;
 
         const size_t start = chunk.code.size();
         reset_temps();
@@ -3998,6 +4005,7 @@ struct Codegen {
         init.node = fe->container.get();   /* extract_locs -> the caret */
         init.target = iter_id;
         init.target2 = dsrc;
+        init.a = int_lit(nvars);           /* 1 or 2 loop vars */
         chunk.code.push_back(init);
 
         const int lnext = here();          /* test + bind + advance */
@@ -4005,6 +4013,11 @@ struct Codegen {
         nx.op = OpCode::ForeachDynNext;
         nx.target2 = iter_id;
         nx.a = slot_op(e_slot);            /* -1 == `_` */
+        nx.b = slot_op(v_slot);            /* 2-var value/2nd slot (-1 if 1-var) */
+        /* A 2-var array element is strict-unpacked, so Next can throw; record
+         * the container caret (do_iter uses container->start/end). */
+        if (nvars == 2)
+            nx.node = fe->container.get();
         const size_t nx_i = chunk.code.size();
         chunk.code.push_back(nx);          /* .target (end_pc) backpatched */
 
@@ -4251,6 +4264,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
+        case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:

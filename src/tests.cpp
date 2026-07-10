@@ -6358,6 +6358,53 @@ static const std::vector<test> tests =
     },
 
     {
+        /* F-2a: a 2-var foreach over a DYN container that is a DICT (the
+         * phonebook shape - a func param dispatched indirectly, so `d` is dyn).
+         * The VM's ForeachDyn iterator dispatches at runtime and binds key +
+         * value box-free. Differential reruns under -vm. */
+        "Foreach 2-var over a dyn dict container",
+        {
+            "func sumkv(d) {",
+            "    var s = 0;",
+            "    foreach (var k, v in d) { s += k + v; }",
+            "    return s;",
+            "}",
+            "var m = {1: 10, 2: 20, 3: 30};",
+            "assert(sumkv(m) == 66);",    /* (1+2+3)+(10+20+30) */
+        },
+    },
+
+    {
+        /* F-2a: a 2-var foreach over a DYN container that is an ARRAY -> each
+         * element is STRICT-unpacked into the two vars (do_iter semantics). */
+        "Foreach 2-var over a dyn array container (strict unpack)",
+        {
+            /* `c` is dyn (explicitly-dyn arg), so the unpacked a/b are dyn and
+             * the accumulator must be `dyn` too (mandatory-dyn). */
+            "func sump(c) {",
+            "    var dyn s = 0;",
+            "    foreach (var a, b in c) { s += a * b; }",
+            "    return s;",
+            "}",
+            "var dyn dc = [[1, 2], [3, 4], [5, 6]];",
+            "assert(sump(dc) == 44);",    /* 2 + 12 + 30 */
+        },
+    },
+
+    {
+        /* F-2a: the strict-length error path of a 2-var dyn-array unpack (a
+         * sub-array of the wrong length) - compile-time-unprovable (dyn), so it
+         * throws at runtime on BOTH engines with the same message + caret. */
+        "Foreach 2-var dyn array wrong sub-length throws",
+        {
+            "func f(c) { foreach (var a, b in c) print(a, b); }",
+            "var dyn dc = [[1, 2], [3]];",
+            "f(dc);",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
         /* native const-literal materialization (VM LoadLiteralObjV): a mutable
          * `var` literal is a FRESH deep copy each eval (so a loop's per-iter
          * mutation never leaks), a `const` shares the deep read-only value.

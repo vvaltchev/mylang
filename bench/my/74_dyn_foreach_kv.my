@@ -1,0 +1,24 @@
+# 2-var foreach over a DYN container (the phonebook cmd_view shape): the
+# container's static type is `dyn`, so array-vs-dict is dispatched at runtime by
+# the VM's ForeachDyn iterator, binding key + value box-free. Here it is always
+# a dict; a `dyn` container also forces a dyn accumulator (boxed, both engines).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 200000 * scale;
+
+var d = {};
+for (var i = 0; i < 100; i++)
+    d[i] = i * 2;
+
+var dyn dd = d;          # a dyn container -> runtime array/dict dispatch
+var dyn total = 0;
+
+for (var r = 0; r < N; r++) {
+    foreach (var k, v in dd) {
+        total += k + v;
+    }
+}
+
+print("result:", total % 1000000007);

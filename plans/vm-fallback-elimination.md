@@ -76,8 +76,17 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
   - **F-1c** `a, b = <array VALUE>` (`shopping`: `= products[pnum]`) — native,
     the strict-unpack-a-value op this needed.
 - **F-2 · foreach** (two shapes):
-  - **F-2a** `foreach (var k, v in data)` - dict 2-var (`phonebook`). *DIAGNOSE:
-    should be D3-native; a body op or the 2-var-`var` form is blocking it.*
+  - **F-2a** `foreach (var k, v in data)` - dict 2-var (`phonebook`). ✅ DONE
+    (2026-07-11). DIAGNOSED: a proven-dict 2-var foreach was ALREADY native
+    (DictIter*); the blocker was that `cmd_view` is dispatched INDIRECTLY (via
+    the `cmdfunc` func-value, F-3), so its `data` param is never concretely
+    instantiated and stays `dyn` → the 2-var DYN-container foreach fell back
+    (ForeachDyn was single-var only). FIX: extend `ForeachDynInit`/`Next` +
+    `DynIterState` to a var count (1 or 2); a 2-var dict binds key+value, a
+    2-var array element is STRICT-unpacked (do_iter's messages/caret). The
+    inferencer now stamps `container_is_dyn` for a 1- OR 2-var non-indexed dyn
+    foreach. Bench `74_dyn_foreach_kv` VM 0.54x vs the tree-walker; phonebook
+    `cmd_view` verified native + end-to-end parity.
   - **F-2b** `foreach (i, name, price in indexed products)` - indexed + 2-elem
     unpack (`shopping`). *Nativizable: combine the indexed + unpack lowerings.*
   - **F-2 BUG (found + FIXED 2026-07-10, pre-existing)** — `UnpackElemInt`/

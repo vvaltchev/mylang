@@ -470,11 +470,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::ForeachDynInit:
             row << "fe.dyn.init  I" << in.target << " <- " << D(in.target2)
-                << "  ; array|dict runtime dispatch";
+                << "  ; array|dict runtime dispatch, " << in.a.lit << "-var";
             break;
         case OpCode::ForeachDynNext:
-            row << "fe.dyn.next  I" << in.target2 << " e=" << in.a.slot
-                << " -> L" << in.target;
+            row << "fe.dyn.next  I" << in.target2 << " e=" << in.a.slot;
+            if (in.b.slot >= 0)
+                row << " v=" << in.b.slot;
+            row << " -> L" << in.target;
             break;
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
