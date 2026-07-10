@@ -80,17 +80,18 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
     should be D3-native; a body op or the 2-var-`var` form is blocking it.*
   - **F-2b** `foreach (i, name, price in indexed products)` - indexed + 2-elem
     unpack (`shopping`). *Nativizable: combine the indexed + unpack lowerings.*
-  - **F-2 BUG (found 2026-07-10, pre-existing)** — `UnpackElemInt`/
+  - **F-2 BUG (found + FIXED 2026-07-10, pre-existing)** — `UnpackElemInt`/
     `UnpackElemFloat` (the already-native `foreach (a, b in pairs)` strict
     unpack) blindly read the sub-array via `flat_ints()`/`flat_floats()`, but a
     MIXED-numeric sub-array literal `[int, float]` is typed `array<float>` by
     the inferencer (int∨float join) yet built GENERAL storage at runtime → the
-    flat accessor ASSERTS / crashes (`shopping`: `[pnum, q]`; minimal repro:
-    `append(lst,[i,f]); foreach(a,b in lst){}`). The differential is green only
-    because no `-rt` test uses a mixed sub-array. Fix as part of F-2: either read
-    each scalar via `arr_elem_at` (skind-dispatched, box-then-unbox — still
-    box-free for the common flat case) or only stamp `unpack_elem_th` when the
-    sub-arrays are PROVABLY flat (all-same-scalar element type).
+    flat accessor ASSERTED / crashed (`shopping`: `[pnum, q]`; minimal repro:
+    `append(lst,[i,f]); foreach(a,b in lst){}`). The differential was green only
+    because no `-rt` test used a mixed sub-array. FIX: the op now guards the raw
+    read on `sub.skind()` == the expected flat kind; else it binds each
+    element's actual boxed value via `vm_arr_elem` (skind-dispatched) — box-free
+    still for the common homogeneous-flat case, sound for the general/mixed
+    case. Regression test + shopping parity added.
 - **F-3 · indirect call statement** `cmdfunc(data)` - a discarded-result call
   through a func-VALUE var (`phonebook`). *DIAGNOSE: likely `opt func` from
   `find()`, not proven callable → no `CallValueV`.*

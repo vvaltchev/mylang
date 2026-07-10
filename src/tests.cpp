@@ -6336,6 +6336,28 @@ static const std::vector<test> tests =
     },
 
     {
+        /* Foreach unpack of a MIXED-numeric sub-array: inference types the
+         * element `array<float>` (int|float join) but the `[int, float]`
+         * literal builds GENERAL storage, so UnpackElemFloat must NOT blindly
+         * read flat_floats() (it asserted/crashed - a pre-existing VM bug). The
+         * boxed fallback binds each element's actual value: an int stays int, a
+         * float stays float, matching the tree-walker's bind_loop_var. */
+        "Foreach unpack of a mixed int/float sub-array (box-safe)",
+        {
+            "var lst = [];",
+            "var fi = 3;",
+            "var ff = 2.5;",
+            "append(lst, [fi, ff]);",
+            "append(lst, [fi + 1, ff + 1.0]);",
+            "var si = 0;",
+            "var sf = 0.0;",
+            "foreach (var a, b in lst) { si += a; sf += b; }",
+            "assert(si == 7);",           /* 3 + 4, still int */
+            "assert(sf > 5.9 && sf < 6.1);",  /* 2.5 + 3.5 */
+        },
+    },
+
+    {
         /* native const-literal materialization (VM LoadLiteralObjV): a mutable
          * `var` literal is a FRESH deep copy each eval (so a loop's per-iter
          * mutation never leaks), a `const` shares the deep read-only value.

@@ -1040,14 +1040,27 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (sub.size() != static_cast<size_type>(N))
                 vm_throw_unpack_len(chunk, pc, sub.size(), N);
             const size_type off = sub.offset();
-            if (is_int)
+            const auto sk = sub.skind();
+            if (is_int && sk == SharedArrayObj::Storage::ints) {
                 for (int_type k = 0; k < N; k++)
                     write_int_slot(&ctx, in.target + k,
                                    sub.flat_ints()[off + k]);
-            else
+            } else if (!is_int && sk == SharedArrayObj::Storage::floats) {
                 for (int_type k = 0; k < N; k++)
                     write_float_slot(&ctx, in.target + k,
                                      sub.flat_floats()[off + k]);
+            } else {
+                /* The sub-array's storage is NOT the expected flat kind: a
+                 * general / mixed-numeric literal (e.g. `[int, float]`, which
+                 * inference types array<float> by int|float join but builds
+                 * GENERAL), or a flat array of the OTHER scalar kind. Bind each
+                 * element's ACTUAL boxed value (vm_arr_elem is skind-dispatched)
+                 * - byte-identical to do_iter's bind_loop_var, so an int stays
+                 * an int even under UnpackElemFloat. */
+                for (int_type k = 0; k < N; k++)
+                    ctx.frame->at(in.target + k).put(
+                        vm_arr_elem(elem, static_cast<size_type>(k)));
+            }
             pc++;
             break;
         }

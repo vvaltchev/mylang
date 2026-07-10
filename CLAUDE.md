@@ -2991,12 +2991,19 @@ pairs)` over a proven `array<array<int>>` / `array<array<float>>` (flat
 sub-arrays) is native too: the outer array iterates counted, and per element a
 **`UnpackElemInt`/`UnpackElemFloat`** op reads `pairs[i]` (a general element = a
 flat sub-array), strict-checks its length == the loop-var count `N`, and writes
-its `N` scalars BOX-FREE into the consecutive loop-var slots (`base..+N-1`) —
-matching `do_iter`'s strict destructure (same two `TypeErrorEx`s, same container
-loc, via the loc side table so the op is `node`-free). Stamped by the inferencer
-as `ForeachStmt::unpack_elem_th` (i/f); a `_` (breaks slot↔position), a
-non-consecutive/non-int-float target, or a general/opt sub-array fall back.
-~1.2x: `20_foreach_unpack` 0.87x→0.73x vs the tree-walker.
+its `N` scalars into the consecutive loop-var slots (`base..+N-1`) — matching
+`do_iter`'s strict destructure (same two `TypeErrorEx`s, same container loc, via
+the loc side table so the op is `node`-free). **Storage-kind guarded:** the
+BOX-FREE raw read (`flat_ints`/`flat_floats`) fires only when the sub-array's
+`skind()` actually IS that flat kind; ELSE (a MIXED-numeric literal like
+`[int, float]`, which inference types `array<float>` by int|float join but
+builds GENERAL storage, or a flat array of the OTHER scalar kind) it binds each
+element's ACTUAL boxed value via `vm_arr_elem` — so an int stays an int under
+`UnpackElemFloat`, byte-identical to `bind_loop_var` (blindly reading
+`flat_floats()` on the general sub-array asserted/crashed — a fixed bug).
+Stamped by the inferencer as `ForeachStmt::unpack_elem_th` (i/f); a `_` (breaks
+slot↔position), a non-consecutive/non-int-float target, or a general/opt
+sub-array fall back. ~1.2x: `20_foreach_unpack` 0.87x→0.73x vs the tree-walker.
 **Dict `foreach (k, v in d)` / `foreach (k in d)`** is native via a **LIVE
 dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
 but a while-shaped loop over two ops: **`DictIterInit`** pins the dict
