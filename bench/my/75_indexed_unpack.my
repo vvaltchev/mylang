@@ -1,0 +1,22 @@
+# INDEXED + general-value unpack (shopping's shape): `foreach (i, name, val in
+# indexed rows)` over an array<array<str>> - the index var is the loop counter
+# and the two str vars bind box-free (the VM's UnpackElemValue). Distinct from
+# 20_foreach_unpack, which unpacks a flat array<array<int>> (UnpackElemInt).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 100000 * scale;
+
+var rows = [];
+for (var j = 0; j < 50; j++)
+    append(rows, ["item" + str(j), str(j * 2)]);
+
+var acc = 0;
+for (var r = 0; r < N; r++) {
+    foreach (var i, name, val in indexed rows) {
+        acc += i + len(name) + len(val);
+    }
+}
+
+print("result:", acc % 1000000007);

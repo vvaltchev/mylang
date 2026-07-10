@@ -1485,26 +1485,33 @@ void Inferencer::annotate_hints(Construct *n)
                 fe->container_is_dyn = true;
         }
 
-        /* A non-indexed 2+-var STRICT-unpack foreach over a proven
-         * array<array<int>> / array<array<float>> (non-opt flat sub-arrays):
-         * the VM iterates the outer array counted and destructures each flat
-         * sub-array's scalars box-free into the consecutive loop-var slots
-         * (UnpackElemInt/Float). A general/opt/dyn sub-array leaves it none ->
-         * the tree-walker's strict do_iter fallback. The runtime size check
-         * (each sub-array must have exactly N elements) keeps it strict;
-         * N is the loop-var count, not matched statically (arrays vary). */
-        const bool unpack_form = !fe->indexed && fe->ids
-                              && fe->ids->elems.size() >= 2;
-        if (unpack_form) {
+        /* A STRICT-unpack foreach over a proven array<array<...>>: the VM
+         * iterates the outer array counted and destructures each sub-array into
+         * the consecutive loop-var slots. A flat int/float sub-array reads its
+         * scalars BOX-FREE (UnpackElemInt/Float); any other sub-array (general /
+         * dyn / str / mixed, incl. shopping's [str, float]) binds each element's
+         * value box-free (UnpackElemValue). The `indexed` form counts the index
+         * var as the counter, so the unpack width is elems - (indexed?1:0), which
+         * must be >= 2. The runtime size check keeps it strict (arrays vary, so
+         * the width is not matched statically). A `_`/non-local target bails in
+         * codegen; only the outer-is-array-of-arrays proof is here. */
+        const int nunpack = fe->ids
+            ? static_cast<int>(fe->ids->elems.size()) - (fe->indexed ? 1 : 0)
+            : 0;
+        if (fe->ids && nunpack >= 2) {
             StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
             if (c->kind == StaticTypeKind::Array) {
                 StaticTypeRef el = static_type_resolve(c->elem);
                 if (!el->opt && el->kind == StaticTypeKind::Array) {
                     StaticTypeRef sub = static_type_resolve(el->elem);
-                    if (!sub->opt && sub->kind == StaticTypeKind::Int)
+                    if (!fe->indexed && !sub->opt
+                        && sub->kind == StaticTypeKind::Int)
                         fe->unpack_elem_th = TypeHint::i;
-                    else if (!sub->opt && sub->kind == StaticTypeKind::Float)
+                    else if (!fe->indexed && !sub->opt
+                             && sub->kind == StaticTypeKind::Float)
                         fe->unpack_elem_th = TypeHint::f;
+                    else
+                        fe->unpack_elem_value = true;
                 }
             }
         }
@@ -3132,13 +3139,23 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
     auto sym_of = [&](size_t i) { return id_sym[ids[i].get()]; };
 
     if (fe->indexed) {
-        /* enumerate-style: first id is the int index, the rest the element */
+        /* enumerate-style: first id is the int index, the rest the element -
+         * OR, when there is more than one non-index var, the element is
+         * DESTRUCTURED into them (an array element unpacked into its scalars),
+         * matching do_iter (id_start=1 then the same tuple-unpack the
+         * non-indexed 2+-var path does). Types the vars as the sub-array's
+         * ELEMENT type, not the sub-array itself. */
         contribute(sym_of(0), A.int_ty(), ids[0]->start);
         StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
                     : c->kind == StaticTypeKind::Str ? A.str_ty()
                     : c->kind == StaticTypeKind::Dict ? c->key : A.dyn_ty();
+        StaticTypeRef bind = el;
+        if (ids.size() > 2) {   /* index + 2+ targets -> unpack the element */
+            StaticTypeRef re = static_type_resolve(el);
+            bind = re->kind == StaticTypeKind::Array ? re->elem : el;
+        }
         for (size_t i = 1; i < ids.size(); i++)
-            contribute(sym_of(i), el, ids[i]->start);
+            contribute(sym_of(i), bind, ids[i]->start);
         return;
     }
 

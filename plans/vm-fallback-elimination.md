@@ -88,7 +88,16 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
     foreach. Bench `74_dyn_foreach_kv` VM 0.54x vs the tree-walker; phonebook
     `cmd_view` verified native + end-to-end parity.
   - **F-2b** `foreach (i, name, price in indexed products)` - indexed + 2-elem
-    unpack (`shopping`). *Nativizable: combine the indexed + unpack lowerings.*
+    unpack (`shopping`). ✅ DONE (2026-07-11). Added a general-value unpack op
+    `UnpackElemValue` (the analogue of `UnpackElemInt/Float` for a general / dyn
+    / str / mixed sub-array like shopping's `[str, float]`), and extended
+    `try_native_foreach_unpack` + the inferencer stamp to cover the `indexed`
+    form (index var = the loop counter, the unpack targets follow it). Also
+    FIXED a latent front-end bug: `accumulate_foreach` typed an indexed 3+var
+    loop's targets as the whole sub-array (`array<dyn>`) instead of its element
+    type (`dyn`/`str`) - shopping survived only via lenient builtins, never
+    arithmetic. shopping is now ZERO-fallback (both F-1c and F-2b gone). Bench
+    `75_indexed_unpack` VM 0.71x vs the tree-walker.
   - **F-2 BUG (found + FIXED 2026-07-10, pre-existing)** — `UnpackElemInt`/
     `UnpackElemFloat` (the already-native `foreach (a, b in pairs)` strict
     unpack) blindly read the sub-array via `flat_ints()`/`flat_floats()`, but a

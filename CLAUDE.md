@@ -3001,9 +3001,21 @@ builds GENERAL storage, or a flat array of the OTHER scalar kind) it binds each
 element's ACTUAL boxed value via `vm_arr_elem` — so an int stays an int under
 `UnpackElemFloat`, byte-identical to `bind_loop_var` (blindly reading
 `flat_floats()` on the general sub-array asserted/crashed — a fixed bug).
-Stamped by the inferencer as `ForeachStmt::unpack_elem_th` (i/f); a `_` (breaks
-slot↔position), a non-consecutive/non-int-float target, or a general/opt
-sub-array fall back. ~1.2x: `20_foreach_unpack` 0.87x→0.73x vs the tree-walker.
+Stamped by the inferencer as `ForeachStmt::unpack_elem_th` (i/f). A
+**general / dyn / str / mixed** sub-array (`array<array<dyn>>`,
+`array<array<str>>`) — where the flat scalar path doesn't apply — is the
+**`UnpackElemValue`** variant (`ForeachStmt::unpack_elem_value`): same op shape,
+each element binds its boxed value via `vm_arr_elem`. This variant ALSO carries
+the **`indexed` unpack** `foreach (i, name, price in indexed products)`
+(shopping's F-2b shape): the index var is the loop counter and the unpack
+targets follow it (`unpack_base = base + 1`, width `N - 1`). The inferencer's
+`accumulate_foreach` was fixed to type an indexed 3+var loop's targets as the
+sub-array's ELEMENT type (`dyn`/`str`), not the whole sub-array — matching
+`do_iter` (which destructures the element), a latent front-end bug shopping
+survived only because it used the vars in lenient builtins (`rpad`/`str`), never
+arithmetic. A `_` (breaks slot↔position) or a non-consecutive/non-local target
+falls back. `20_foreach_unpack` (flat) 0.80x, `75_indexed_unpack` (indexed str)
+0.71x vs the tree-walker.
 **Dict `foreach (k, v in d)` / `foreach (k in d)`** is native via a **LIVE
 dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
 but a while-shaped loop over two ops: **`DictIterInit`** pins the dict

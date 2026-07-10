@@ -3774,13 +3774,20 @@ struct Codegen {
      */
     bool try_native_foreach_unpack(const ForeachStmt *fe)
     {
-        if (fe->unpack_elem_th == TypeHint::none || fe->indexed || !fe->ids
-            || fe->ids->elems.size() < 2)
+        const bool flat = fe->unpack_elem_th != TypeHint::none;
+        if ((!flat && !fe->unpack_elem_value) || !fe->ids)
             return false;
 
         /* All loop vars must be real (non-`_`), resolved-local, CONSECUTIVE
-         * slots (guaranteed for `var x, y` - declared in order; verified). */
+         * slots from `base` (guaranteed for `var x, y` - declared in order;
+         * verified). For an INDEXED loop, ids[0] is the index var (= the loop
+         * counter, read by the body) and ids[1..] are the unpack targets; the
+         * unpack width is N - 1 and must be >= 2. Non-indexed: all N are unpack
+         * targets, width N, counter is a temp. */
         const int N = static_cast<int>(fe->ids->elems.size());
+        const int nunpack = N - (fe->indexed ? 1 : 0);
+        if (nunpack < 2)
+            return false;
         int base = -1;
         for (int k = 0; k < N; k++) {
             const Identifier *id =
@@ -3792,6 +3799,7 @@ struct Codegen {
             else if (id->sym.slot != base + k)
                 return false;
         }
+        const int unpack_base = base + (fe->indexed ? 1 : 0);
 
         const size_t start = chunk.code.size();
         reset_temps();
@@ -3816,7 +3824,9 @@ struct Codegen {
         ln.target2 = c;
         chunk.code.push_back(ln);
 
-        const int i = alloc_temp();
+        /* The counter: for an indexed loop it IS the index var (base, read by
+         * the body); otherwise a fresh temp. */
+        const int i = fe->indexed ? base : alloc_temp();
         Instr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
@@ -3824,7 +3834,7 @@ struct Codegen {
         chunk.code.push_back(z);
 
         const int saved_base = temp_base;
-        temp_base = next_temp;   /* reserve c/n/i */
+        temp_base = next_temp;   /* reserve c/n/(i) */
 
         const size_t jt = emit_cmp(OpCode::JumpUnlessIntCmp,
                                    fe->container.get(), Op::lt,
@@ -3832,16 +3842,20 @@ struct Codegen {
 
         const int lbody = here();
 
-        /* Per element: read pairs[i] (a flat sub-array), strict-check its
-         * length == N, and write its N scalars box-free into base..base+N-1. */
+        /* Per element: read pairs[i] (a sub-array), strict-check its length ==
+         * nunpack, and write its scalars into unpack_base..+nunpack-1 - box-free
+         * raw for a flat int/float sub-array (UnpackElemInt/Float), else each
+         * element's boxed value (UnpackElemValue, for a general/dyn/str/mixed
+         * sub-array like shopping's [str, float]). */
         Instr up;
         up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
-                                                  : OpCode::UnpackElemFloat;
+              : fe->unpack_elem_th == TypeHint::f ? OpCode::UnpackElemFloat
+                                                  : OpCode::UnpackElemValue;
         up.node = fe->container.get();
-        up.target = base;
+        up.target = unpack_base;
         up.target2 = c;
         up.a = slot_op(i);
-        up.b = int_lit(N);
+        up.b = int_lit(nunpack);
         chunk.code.push_back(up);
 
         push_loop();
@@ -4256,6 +4270,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::CallValueV:
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
+        case OpCode::UnpackElemValue:
         case OpCode::SliceV:
         case OpCode::StoreGlobalV:   /* compound/inc-dec (plain: node null) */
         case OpCode::StoreCaptureV:

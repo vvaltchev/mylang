@@ -6405,6 +6405,54 @@ static const std::vector<test> tests =
     },
 
     {
+        /* F-2b: INDEXED + general-value unpack over array<array<str>> - the
+         * index var is the loop counter and the two str vars bind box-free
+         * (UnpackElemValue); the inferencer types them `str` (the sub-array
+         * element type), so string ops type-check. */
+        "Foreach indexed general unpack over array<array<str>>",
+        {
+            "var rows = [[\"a\", \"x\"], [\"b\", \"y\"], [\"c\", \"z\"]];",
+            "var idxsum = 0;",
+            "var s = \"\";",
+            "foreach (var i, k, v in indexed rows) {",
+            "    idxsum += i;",
+            "    s += k + v;",
+            "}",
+            "assert(idxsum == 3);",       /* 0+1+2 */
+            "assert(s == \"axbycz\");",
+        },
+    },
+
+    {
+        /* F-2b: INDEXED + heterogeneous [str, int] unpack (shopping's shape):
+         * the unpacked vars are `dyn`, so an arithmetic accumulator must be
+         * `dyn` (mandatory-dyn); a str accumulator absorbs a dyn (str + x). */
+        "Foreach indexed unpack of a heterogeneous [str, int] row",
+        {
+            "var rows = [[\"a\", 10], [\"b\", 20], [\"c\", 30]];",
+            "var dyn total = 0;",
+            "var names = \"\";",
+            "foreach (var i, name, qty in indexed rows) {",
+            "    total += qty;",
+            "    names += name;",
+            "}",
+            "assert(total == 60);",       /* 10+20+30 */
+            "assert(names == \"abc\");",
+        },
+    },
+
+    {
+        /* F-2b: non-indexed general-value unpack (a proven array<array<str>>). */
+        "Foreach general-value unpack (non-indexed)",
+        {
+            "var rows = [[\"x\", \"1\"], [\"y\", \"2\"]];",
+            "var s = \"\";",
+            "foreach (var k, v in rows) { s += k + v; }",
+            "assert(s == \"x1y2\");",
+        },
+    },
+
+    {
         /* native const-literal materialization (VM LoadLiteralObjV): a mutable
          * `var` literal is a FRESH deep copy each eval (so a loop's per-iter
          * mutation never leaks), a `const` shares the deep read-only value.

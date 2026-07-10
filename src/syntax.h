@@ -1569,6 +1569,14 @@ public:
      * (UnpackElemInt/Float), with the strict size check. `none` = not this form
      * (a `_`, general/opt sub-array, etc. -> fall back). */
     TypeHint unpack_elem_th = TypeHint::none;
+    /* Set by the inferencer for a STRICT-unpack loop (indexed or not) over a
+     * proven array<array<...>> whose sub-array is NOT a flat int/float (a
+     * general / dyn / str / mixed sub-array, e.g. shopping's [str, float]): the
+     * VM unpacks each element's values box-free (UnpackElemValue) into the
+     * consecutive loop-var slots. Distinct from unpack_elem_th (flat scalars);
+     * this is the general-value analogue, and unlike unpack_elem_th it also
+     * covers the `indexed` form (index var = counter, the rest unpacked). */
+    bool unpack_elem_value = false;
     /* Set by the inferencer to the (POD) struct def for a single, non-indexed
      * loop over a proven flat array<PodStruct>. The VM iterates it counted and,
      * when the body reads ONLY the loop var's SCALAR FIELDS (`p.x`), reads them
@@ -1595,6 +1603,7 @@ public:
         c->container_is_dict = container_is_dict;
         c->container_is_dyn = container_is_dyn;
         c->unpack_elem_th = unpack_elem_th;
+        c->unpack_elem_value = unpack_elem_value;
         c->container_struct_def = container_struct_def;
         return c;
     }

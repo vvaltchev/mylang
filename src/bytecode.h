@@ -204,6 +204,18 @@ enum class OpCode : unsigned char {
     UnpackElemFloat,
 
     /*
+     * The GENERAL-value analogue of UnpackElemInt/Float (F-2b): the sub-array is
+     * NOT flat int/float (a general / dyn / str / mixed element, e.g. shopping's
+     * [str, float]), so each element binds its BOXED value (vm_arr_elem) into
+     * the target slot instead of a raw scalar. Also serves the INDEXED unpack
+     * `foreach (i, name, price in indexed products)` (the index var is the loop
+     * counter; the unpack targets start after it). Same operands as UnpackElem*:
+     *   target2 = outer array slot, a = index operand, target = first unpack
+     *   slot, b = the unpack width, node = the container (strict-throw loc).
+     */
+    UnpackElemValue,
+
+    /*
      * Native array-element store `a[i] = v` / `a[i] OP= v` (Phase 5): `target2`
      * = the array slot, `a` = the int index operand, `b` = the value operand,
      * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith

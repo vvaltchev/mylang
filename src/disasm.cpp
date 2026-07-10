@@ -480,8 +480,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
-            row << (in.op == OpCode::UnpackElemInt ? "unpack.elem.i"
-                                                   : "unpack.elem.f")
+        case OpCode::UnpackElemValue:
+            row << (in.op == OpCode::UnpackElemInt   ? "unpack.elem.i"
+                    : in.op == OpCode::UnpackElemFloat ? "unpack.elem.f"
+                                                       : "unpack.elem.v")
                 << " r" << in.target << ".." << (in.target + in.b.lit - 1)
                 << " = " << D(in.target2) << "[" << RI(in.a, false)
                 << "] (" << in.b.lit << ")";

@@ -1038,15 +1038,17 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::UnpackElemInt:
-        case OpCode::UnpackElemFloat: {
+        case OpCode::UnpackElemFloat:
+        case OpCode::UnpackElemValue: {
 
             /* STRICT foreach-unpack: read pairs[i] (a general outer element = a
-             * flat sub-array), check it is an array of EXACTLY N, write its
-             * N scalars BOX-FREE into the consecutive loop-var slots
-             * base..base+N-1 - matching do_iter's strict destructure element
-             * for element. `i` is the loop counter (in-range), so the outer
-             * read never OOB; the only throws are the two strict errors. */
+             * sub-array), check it is an array of EXACTLY N, write its N scalars
+             * into the consecutive loop-var slots base..base+N-1 - matching
+             * do_iter's strict destructure element for element. `i` is the loop
+             * counter (in-range), so the outer read never OOB; the only throws
+             * are the two strict errors. */
             const bool is_int = in.op == OpCode::UnpackElemInt;
+            const bool is_float = in.op == OpCode::UnpackElemFloat;
             const EvalValue &base_v = ctx.frame->at(in.target2).get();
             ML_VM_CHECK(base_v.is<SharedArrayObj>());
             const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
@@ -1065,18 +1067,19 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 for (int_type k = 0; k < N; k++)
                     write_int_slot(&ctx, in.target + k,
                                    sub.flat_ints()[off + k]);
-            } else if (!is_int && sk == SharedArrayObj::Storage::floats) {
+            } else if (is_float && sk == SharedArrayObj::Storage::floats) {
                 for (int_type k = 0; k < N; k++)
                     write_float_slot(&ctx, in.target + k,
                                      sub.flat_floats()[off + k]);
             } else {
-                /* The sub-array's storage is NOT the expected flat kind: a
-                 * general / mixed-numeric literal (e.g. `[int, float]`, which
-                 * inference types array<float> by int|float join but builds
-                 * GENERAL), or a flat array of the OTHER scalar kind. Bind each
-                 * element's ACTUAL boxed value (vm_arr_elem is skind-dispatched)
-                 * - byte-identical to do_iter's bind_loop_var, so an int stays
-                 * an int even under UnpackElemFloat. */
+                /* UnpackElemValue (a general/dyn/str/mixed sub-array), OR a flat
+                 * op whose sub-array's storage is NOT the expected kind (a
+                 * mixed-numeric `[int, float]` literal - inference types it
+                 * array<float> by int|float join but builds GENERAL - or a flat
+                 * array of the OTHER scalar kind). Bind each element's ACTUAL
+                 * boxed value (vm_arr_elem is skind-dispatched) - byte-identical
+                 * to do_iter's bind_loop_var, so an int stays int / a str stays
+                 * str. */
                 for (int_type k = 0; k < N; k++)
                     ctx.frame->at(in.target + k).put(
                         vm_arr_elem(elem, static_cast<size_type>(k)));
