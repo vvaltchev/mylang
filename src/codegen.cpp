@@ -469,6 +469,28 @@ struct Codegen {
         return static_cast<int>(chunk.ast_nodes.size()) - 1;
     }
 
+    /* Pool a value-ABI builtin call's AST-free data (the Builtin + the ArgLocs
+     * carets/hint pulled off the DirectBuiltinCallExpr) and return its
+     * Chunk::builtin_calls index - so CallBuiltinV carries a serializable index,
+     * not a `node`. See Chunk::BuiltinCall. */
+    int add_builtin_call(const DirectBuiltinCallExpr *dc)
+    {
+        Chunk::BuiltinCall bc;
+        bc.builtin = dc->builtin;
+        bc.name = nullptr;
+        if (const Identifier *id =
+                dynamic_cast<const Identifier *>(dc->what.get()))
+            bc.name = id->uid;
+        bc.start = dc->args->start;
+        bc.end = dc->args->end;
+        bc.arr_hint = dc->args->arr_hint;
+        bc.args.reserve(dc->args->elems.size());
+        for (const auto &el : dc->args->elems)
+            bc.args.push_back(ArgLoc{el->start, el->end});
+        chunk.builtin_calls.push_back(std::move(bc));
+        return static_cast<int>(chunk.builtin_calls.size()) - 1;
+    }
+
     size_t emit(OpCode op, const Construct *node = nullptr,
                 int target = -1, int target2 = -1)
     {
@@ -1776,7 +1798,9 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr cv;
         cv.op = OpCode::CallBuiltinV;
-        cv.node_idx = add_ast_node(dc);
+        /* AST-free: the builtin + its arg carets live in the builtin_calls pool
+         * (index in target2), so no node. */
+        cv.target2 = add_builtin_call(dc);
         cv.target = dst;
         cv.a = int_lit(argbase);
         cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
@@ -4481,7 +4505,6 @@ static void extract_locs(Chunk &chunk)
         case OpCode::EvalStmt:
         case OpCode::EvalToSlot:
         case OpCode::JumpIfFalse:
-        case OpCode::CallBuiltinV:
         case OpCode::CallBuiltinLV:
         case OpCode::CallBuiltinLVElem:
         case OpCode::EmplaceStruct:

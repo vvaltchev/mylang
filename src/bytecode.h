@@ -898,13 +898,50 @@ struct Chunk {
     std::vector<std::vector<int32_t>> unpack_targets;
 
     /*
+     * BUILTIN-CALL POOL (AST-free builtin dispatch). A value-ABI builtin call
+     * (CallBuiltinV) needs only its Builtin (the baked func pointers) and the
+     * AST-free ArgLocs data - the whole-args caret, the per-arg carets, and the
+     * array-repr hint - all pulled out of the DirectBuiltinCallExpr into a pool
+     * entry, so the op is a bare index (`Instr::target2`), holding NO `node`.
+     * The Builtin's function pointer is resolve-at-load like struct_defs (a
+     * serializer stores the builtin's registered name/id and re-binds on load);
+     * everything else is pure data. This is what lets a read-only builtin call
+     * lower with an empty ast_nodes pool.
+     */
+    struct BuiltinCall {
+        Builtin builtin;              /* the baked func_v (+ func_lv) pointers */
+        const UniqueId *name;         /* the builtin's name (disasm; a serializer
+                                       * re-binds the func ptr from it on load) */
+        Loc start, end;               /* the whole-args caret (arity/generic) */
+        ArrHint arr_hint;             /* the array-repr hint (range/array/…) */
+        std::vector<ArgLoc> args;     /* per-arg carets, [0, n) */
+    };
+    std::vector<BuiltinCall> builtin_calls;
+
+    /* Build the AST-free ArgLocs a func_v takes, from pool entry `idx`. Read on
+     * the CallBuiltinV hot path (cheap: two Locs + two pointers, no copy). */
+    ArgLocs arglocs_at(int idx) const
+    {
+        const BuiltinCall &bc = builtin_calls[static_cast<size_t>(idx)];
+        ArgLocs al;
+        al.start = bc.start;
+        al.end = bc.end;
+        al.args = bc.args.data();
+        al.arr_hint = bc.arr_hint;
+        return al;
+    }
+
+    /*
      * AST-NODE POOL - the ONE non-serializable pool, holding the raw
      * `Construct *` of every op that still needs the AST at RUNTIME (an
      * `Instr::node_idx` indexes it, so `Instr` itself holds NO raw Construct*):
      *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (they re-enter
      *     the tree-walker via `node->eval`);
-     *   - the builtin call ops (CallBuiltinV/LV/LVElem, EmplaceStruct, the
-     *     map/filter pair) - the args `ExprList` for per-arg error carets;
+     *   - the MUTATING / map-filter builtin ops (CallBuiltinLV/LVElem,
+     *     EmplaceStruct, the map/filter pair) - the args `ExprList` for per-arg
+     *     carets AND (append/push) the arg NODE to self-evaluate. The read-only
+     *     value-ABI call (CallBuiltinV) is NO LONGER here: it pools its Builtin +
+     *     carets in `builtin_calls` (serializable), so it holds no node;
      *   - a handful of store ops that read `node` for their OOB/div0 caret.
      * A program that lowers 100% natively (no fallback, no dev-builtin) leaves
      * this EMPTY - so a non-empty `ast_nodes` is EXACTLY the "not yet fully

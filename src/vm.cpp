@@ -200,24 +200,6 @@ vm_throw_multi_unpack_len(const Chunk &chunk, size_t pc, size_type m,
                                  std::to_string(nvars) + " variables"), s, en);
 }
 
-/* Build the AST-free ArgLocs a func_v takes, from a builtin call's arg
- * ExprList: the whole-args caret + repr hint, each arg's caret into `buf`. The
- * VM's analogue of types.cpp's build_arglocs (the tree-walker adapter's). */
-static inline ArgLocs
-vm_build_arglocs(ExprList *el, ArgLoc *buf, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        buf[i].start = el->elems[i]->start;
-        buf[i].end = el->elems[i]->end;
-    }
-    ArgLocs al;
-    al.start = el->start;
-    al.end = el->end;
-    al.args = buf;
-    al.arr_hint = el->arr_hint;
-    return al;
-}
-
 /* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
  * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
  * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
@@ -225,15 +207,15 @@ vm_build_arglocs(ExprList *el, ArgLoc *buf, size_t n)
  * vector code out of vm_run_chunk, so it stays small enough to inline the hot
  * int/float operand helpers. */
 static ML_NOINLINE EvalValue
-vm_call_builtin_big(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
+vm_call_builtin_big(EvalContext &ctx, const Chunk &chunk, int bc_idx,
                     int_type base, int_type n)
 {
+    const Chunk::BuiltinCall &bc = chunk.builtin_calls[bc_idx];
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
     for (int_type i = 0; i < n; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
-    std::vector<ArgLoc> locbuf(static_cast<size_t>(n));
-    ArgLocs al = vm_build_arglocs(dc->args.get(), locbuf.data(), n);
-    return dc->builtin.func_v(&ctx, &al, heapbuf.data(), n);
+    ArgLocs al = chunk.arglocs_at(bc_idx);
+    return bc.builtin.func_v(&ctx, &al, heapbuf.data(), n);
 }
 
 /* Build an array LITERAL from the register run [base,base+n). ML_NOINLINE and
@@ -1442,31 +1424,28 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::CallBuiltinV: {
 
             /* Native builtin call (value ABI): copy the pre-evaluated args from
-             * the register run into a buffer and call func_v (the args ExprList
-             * is passed for error locs only, never evaluated). The try/catch
-             * stamps the args-list loc onto a loc-less error, exactly as
-             * DirectBuiltinCallExpr::do_eval does. */
-            const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
+             * the register run into a buffer and call func_v with the AST-free
+             * ArgLocs (carets/hint) from the builtin_calls pool - NO node. The
+             * try/catch stamps the args-list loc onto a loc-less error, exactly
+             * as DirectBuiltinCallExpr::do_eval does. */
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.target2];
             const int_type base = in.a.lit, n = in.b.lit;
             try {
                 if (n <= 8) {
                     EvalValue stackbuf[8];
                     for (int_type i = 0; i < n; i++)
                         stackbuf[i] = ctx.frame->at(base + i).get();
-                    ArgLoc locbuf[8];
-                    ArgLocs al =
-                        vm_build_arglocs(dc->args.get(), locbuf, n);
+                    ArgLocs al = chunk.arglocs_at(in.target2);
                     ctx.frame->at(in.target).put(
-                        dc->builtin.func_v(&ctx, &al, stackbuf, n));
+                        bc.builtin.func_v(&ctx, &al, stackbuf, n));
                 } else {
                     ctx.frame->at(in.target).put(
-                        vm_call_builtin_big(ctx, dc, base, n));
+                        vm_call_builtin_big(ctx, chunk, in.target2, base, n));
                 }
             } catch (Exception &e) {
                 if (!e.loc_start) {
-                    e.loc_start = dc->args->start;
-                    e.loc_end = dc->args->end;
+                    e.loc_start = bc.start;
+                    e.loc_end = bc.end;
                 }
                 throw;
             }

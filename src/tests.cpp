@@ -13314,8 +13314,9 @@ dev_builtin_reserved_in_script()
 /*
  * The Instr::node field is GONE: a runtime-node op holds a `node_idx` into
  * Chunk::ast_nodes. Verify (a) a FULLY-NATIVE chunk has an EMPTY pool (the
- * "serializable" signal), (b) a chunk with a builtin call pools that node and
- * every node_idx is a valid, non-null pool entry.
+ * "serializable" signal), (b) a value-ABI builtin call is now AST-FREE too - it
+ * pools its Builtin + arg carets into Chunk::builtin_calls (a serializable pool)
+ * and leaves ast_nodes EMPTY, and every node_idx is a valid, non-null entry.
  */
 static bool
 ast_node_pool_minimal()
@@ -13367,11 +13368,17 @@ ast_node_pool_minimal()
     if (!native.ast_nodes.empty() || !indices_valid(native))
         return false;
 
-    /* (b) a builtin call pools its node; indices all valid */
+    /* (b) a value-ABI builtin call (print) is AST-FREE: it pools into
+     * builtin_calls, leaves ast_nodes EMPTY, and every node_idx stays valid. The
+     * pooled entry carries the builtin's name (a serializer re-binds from it). */
     Chunk withb;
     if (!compile({"var s = 5;", "print(s);"}, withb))
         return false;
-    if (withb.ast_nodes.empty() || !indices_valid(withb))
+    if (!withb.ast_nodes.empty() || withb.builtin_calls.empty()
+        || !indices_valid(withb))
+        return false;
+    if (!withb.builtin_calls[0].name
+        || std::string(withb.builtin_calls[0].name->val) != "print")
         return false;
 
     return true;

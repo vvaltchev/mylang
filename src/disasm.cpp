@@ -54,6 +54,13 @@ std::string callee_name(const Construct *node)
     return "?";
 }
 
+/* A CallBuiltinV's callee name from the AST-free builtin_calls pool. */
+std::string builtin_call_name(const Chunk &ch, int idx)
+{
+    const UniqueId *n = ch.builtin_calls[static_cast<size_t>(idx)].name;
+    return n ? std::string(n->val) : "?";
+}
+
 /* A call's argument registers as `(a, b, c)` from the run [base, base+n). */
 std::string arglist(const Chunk &ch, int_type base, int_type n)
 {
@@ -293,6 +300,14 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         for (size_t i = 0; i < ch.struct_defs.size(); i++)
             s << ";   #" << i << "  " << ch.struct_defs[i]->name->val
               << "\n";
+    }
+    if (!ch.builtin_calls.empty()) {
+        s << "; -- builtin_calls (" << ch.builtin_calls.size() << ") --\n";
+        for (size_t i = 0; i < ch.builtin_calls.size(); i++) {
+            const auto &bc = ch.builtin_calls[i];
+            s << ";   #" << i << "  " << (bc.name ? bc.name->val : "?")
+              << "  (" << bc.args.size() << " args)\n";
+        }
     }
     if (!ch.ast_nodes.empty()) {
         /* The ONE non-serializable pool: the AST nodes ops still need at
@@ -590,9 +605,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::CallBuiltinV:
             row << "call.blt.v   " << D(in.target) << " = "
-                << callee_name(chunk.node_at(in.node_idx))
+                << builtin_call_name(chunk, in.target2)
                 << arglist(chunk, in.a.lit, in.b.lit);
-            cmt(row, chunk.node_at(in.node_idx));
             break;
         case OpCode::CallBuiltinLV:
             row << "call.blt.lv  " << D(in.target) << " = "
