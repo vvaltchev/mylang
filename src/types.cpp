@@ -427,6 +427,20 @@ inline auto make_builtin_lv(const char *name)
     return make_pair(UniqueId::get(name), LValue(b, false));
 }
 
+/* Custom-func mutating registration (append/push): NON-const analogue of
+ * make_const_builtin_lv. `f` is a CUSTOM tree-walker `func` (not the generic
+ * adapter) - append/push need it so construct-in-place (which needs the ctor
+ * NODE) lives there, letting `flv` be REST-NATIVE (value from `rest`, no node).
+ * Both engines share the append logic: the tree-walker via `f`, the VM via the
+ * rest-native `flv` (CallBuiltinLV). */
+inline auto make_builtin_lv_custom(const char *name, decltype(Builtin::func) f,
+                                   decltype(Builtin::func_lv) flv)
+{
+    Builtin b{f};
+    b.func_lv = flv;
+    return make_pair(UniqueId::get(name), LValue(b, false));
+}
+
 /* Rest-native registration (insert/erase): the `rest` args - the TAIL ARGS BY
  * VALUE (args 1..n, everything after the arg0 lvalue) - are pre-evaluated.
  * DirectBuiltinCallExpr::lvalue_rest_native must be set for these so the VM's
@@ -573,9 +587,10 @@ EvalContext::SymbolsType EvalContext::builtins =
      * array(1000000) isn't baked into the AST. */
     make_builtin_v<builtin_array>("array"),
 
-    /* Array builtins */
-    make_builtin_lv<builtin_append>("append"),
-    make_builtin_lv<builtin_append>("push"),   /* push() aliases append() */
+    /* Array builtins. append/push: a CUSTOM tree-walker func (append_tw, for
+     * construct-in-place) + the rest-native func_lv core (builtin_append). */
+    make_builtin_lv_custom("append", append_tw, builtin_append),
+    make_builtin_lv_custom("push", append_tw, builtin_append),
     make_builtin_lv<builtin_pop>("pop"),
 
     /* Generic-container builtins */

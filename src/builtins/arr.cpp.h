@@ -326,20 +326,14 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target,
     if (arr.is_slice())
         arr.clone_internal_vec();
 
-    /* The element to append. A REST-NATIVE call (the VM's plain per-op case)
-     * hands the value in `rest[0]`, ALREADY evaluated - so no node->eval, and no
-     * construct-in-place (a ctor `append(a, P(..))` is EmplaceStruct in the VM,
-     * a value here). A SELF-EVAL call (`rest == nullptr`: the tree-walker, or a
-     * subscript-target op) evaluates arg1 off the node - which is ALSO where the
-     * construct-in-place fast path fires (`append(flat_struct_arr, S(..))`
-     * builds straight into the byte buffer, no temp StructObject; the arg is
-     * evaluated INSIDE on success, normally below on a miss - never twice). */
-    if (!rest && arr.skind() == SharedArrayObj::Storage::structs &&
-        try_construct_into_struct_array(ctx, arr, arg1)) {
-        arr.invalidate_hash();   /* built in-place; nothing to fold in */
-        return lval->get();
-    }
-
+    /* The element to append: the pre-evaluated `rest[0]` for a REST-NATIVE call
+     * (the VM's plain per-op case + the tree-walker `func` append_tw, which
+     * delegates here after its own construct-in-place check) - no node->eval;
+     * else (`rest == nullptr`: a residual self-eval CallBuiltinLV whose value
+     * didn't lower, or the LVElem subscript-target op) self-eval'd off arg1.
+     * CONSTRUCT-IN-PLACE is NOT here - `append(flat_struct_arr, S(..))` needs
+     * the ctor NODE, so it lives in append_tw (tree-walker) and EmplaceStruct
+     * (VM); a plain value hits the flat/general append paths below. */
     EvalValue self_elem;
     if (!rest)
         self_elem = RValue(arg1->eval(ctx));
@@ -392,6 +386,48 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target,
     arr.get_vec().emplace_back(elem, ctx->const_ctx);
     arr_append_maintain_hash(arr, elem);
     return lval->get();
+}
+
+/*
+ * Tree-walker (and const-eval) `func` for append/push: the SELF-EVAL entry that
+ * holds the NODE. Its job is the CONSTRUCT-IN-PLACE fast path -
+ * `append(flat_struct_arr, S(..))` builds the new element straight into the byte
+ * buffer, no temporary StructObject - which needs the ctor NODE, so it CAN'T
+ * live in the rest-native func_lv core (builtin_append). For any other value it
+ * self-evals arg1 and delegates to builtin_append REST-NATIVE (`&val`, 1), so
+ * the append logic is written once. The VM reaches construct-in-place via its
+ * own EmplaceStruct op; a plain value via a rest-native CallBuiltinLV.
+ */
+static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 2)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg0 = exprList->elems[0].get();
+    Construct *arg1 = exprList->elems[1].get();
+
+    const EvalValue a0v = arg0->eval(ctx);
+    LValue *target = a0v.is<LValue *>() ? a0v.get<LValue *>() : nullptr;
+
+    /* Construct-in-place: only a mutable FLAT struct array + a struct-ctor arg
+     * (try_construct_into_struct_array returns false otherwise). Mirrors the
+     * old in-builtin fast path (slice clone first, then build into the bytes). */
+    if (target && target->is<SharedArrayObj>() && !target->is_const_var()) {
+        SharedArrayObj &arr = target->getval<SharedArrayObj>();
+        if (!arr.is_readonly() &&
+            arr.skind() == SharedArrayObj::Storage::structs) {
+            if (arr.is_slice())
+                arr.clone_internal_vec();
+            if (try_construct_into_struct_array(ctx, arr, arg1)) {
+                arr.invalidate_hash();   /* built in-place; nothing to fold in */
+                return target->get();
+            }
+        }
+    }
+
+    /* Any other value: self-eval it and delegate to the rest-native core. */
+    const EvalValue val = RValue(arg1->eval(ctx));
+    return builtin_append(ctx, exprList, target, &val, 1);
 }
 
 EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList, LValue *target,
