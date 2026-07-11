@@ -15,14 +15,14 @@
 
 #include <cctype>
 
-EvalValue builtin_split(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_split(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg_str = exprList->elems[0].get();
-    Construct *arg_delim = exprList->elems[1].get();
+    const ArgLoc *arg_str = exprList->arg(0);
+    const ArgLoc *arg_delim = exprList->arg(1);
 
     const EvalValue &val_str = args[0];
     const EvalValue &val_delim = args[1];
@@ -71,14 +71,14 @@ EvalValue builtin_split(EvalContext *ctx, ExprList *exprList,
     return SharedArrayObj(move(vec));
 }
 
-EvalValue builtin_join(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t nargs)
 {
     if (nargs != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg_arr = exprList->elems[0].get();
-    Construct *arg_delim = exprList->elems[1].get();
+    const ArgLoc *arg_arr = exprList->arg(0);
+    const ArgLoc *arg_delim = exprList->arg(1);
 
     const EvalValue &val_arr = args[0];
     const EvalValue &val_delim = args[1];
@@ -112,13 +112,13 @@ EvalValue builtin_join(EvalContext *ctx, ExprList *exprList,
     return SharedStr(move(result));
 }
 
-EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_splitlines(EvalContext *ctx, const ArgLocs *exprList,
                              const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
@@ -164,13 +164,13 @@ EvalValue builtin_splitlines(EvalContext *ctx, ExprList *exprList,
     return SharedArrayObj(move(vec));
 }
 
-EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_ord(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
@@ -185,13 +185,13 @@ EvalValue builtin_ord(EvalContext *ctx, ExprList *exprList,
     return static_cast<int_type>(static_cast<unsigned char>(str[0]));
 }
 
-EvalValue builtin_chr(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_chr(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t nargs)
 {
     if (nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (!val.is<int_type>())
@@ -222,14 +222,14 @@ builtin_find_str(const SharedStr &str, const SharedStr &substr)
 
 template <bool leftpad>
 static EvalValue
-generic_pad(EvalContext *ctx, ExprList *exprList,
+generic_pad(EvalContext *ctx, const ArgLocs *exprList,
             const EvalValue *args, size_t nargs)
 {
     if (nargs < 2 || nargs > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &strval = args[0];
     const EvalValue &nval = args[1];
     char pad_char = ' ';
@@ -242,7 +242,7 @@ generic_pad(EvalContext *ctx, ExprList *exprList,
 
     if (nargs == 3) {
 
-        Construct *arg2 = exprList->elems[2].get();
+        const ArgLoc *arg2 = exprList->arg(2);
         const EvalValue &padc = args[2];
 
         if (!padc.is<SharedStr>())
@@ -278,25 +278,25 @@ generic_pad(EvalContext *ctx, ExprList *exprList,
     return strval;
 }
 
-EvalValue builtin_lpad(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_lpad(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     return generic_pad<true>(ctx, exprList, args, n);
 }
 
-EvalValue builtin_rpad(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_rpad(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     return generic_pad<false>(ctx, exprList, args, n);
 }
 
-EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_lstrip(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
@@ -317,13 +317,13 @@ EvalValue builtin_lstrip(EvalContext *ctx, ExprList *exprList,
     return SharedStr(shared_str, shared_str.offset() + s, str.size() - s);
 }
 
-EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_rstrip(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
@@ -344,13 +344,13 @@ EvalValue builtin_rstrip(EvalContext *ctx, ExprList *exprList,
     return SharedStr(shared_str, shared_str.offset(), l);
 }
 
-EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_strip(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (!val.is<SharedStr>())
@@ -376,14 +376,14 @@ EvalValue builtin_strip(EvalContext *ctx, ExprList *exprList,
     return SharedStr(shared_str, shared_str.offset() + s, l - s);
 }
 
-EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_startswith(EvalContext *ctx, const ArgLocs *exprList,
                              const EvalValue *args, size_t n)
 {
     if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &val0 = args[0];
     const EvalValue &val1 = args[1];
 
@@ -403,14 +403,14 @@ EvalValue builtin_startswith(EvalContext *ctx, ExprList *exprList,
     return false;
 }
 
-EvalValue builtin_endswith(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_endswith(EvalContext *ctx, const ArgLocs *exprList,
                            const EvalValue *args, size_t n)
 {
     if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &val0 = args[0];
     const EvalValue &val1 = args[1];
 

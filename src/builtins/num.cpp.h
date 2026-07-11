@@ -20,13 +20,13 @@ static std::random_device rdev;
 static std::mt19937_64 mt_engine(rdev());
 
 
-EvalValue builtin_int(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_int(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (val.is<int_type>()) {
@@ -67,13 +67,13 @@ EvalValue builtin_int(EvalContext *ctx, ExprList *exprList,
     }
 }
 
-EvalValue builtin_float(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_float(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (val.is<float_type>()) {
@@ -105,13 +105,13 @@ EvalValue builtin_float(EvalContext *ctx, ExprList *exprList,
     }
 }
 
-EvalValue builtin_abs(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_abs(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (e.is<int_type>()) {
@@ -201,13 +201,13 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr)
 }
 
 template <bool is_max>
-EvalValue b_min_max(EvalContext *ctx, ExprList *exprList,
+EvalValue b_min_max(EvalContext *ctx, const ArgLocs *exprList,
                     const EvalValue *args, size_t n)
 {
     if (n == 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *first_arg = exprList->elems[0].get();
+    const ArgLoc *first_arg = exprList->arg(0);
     EvalValue val = args[0];
 
     if (n == 1) {
@@ -242,13 +242,13 @@ EvalValue b_min_max(EvalContext *ctx, ExprList *exprList,
     return val;
 }
 
-EvalValue builtin_min(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_min(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     return b_min_max<false>(ctx, exprList, args, n);
 }
 
-EvalValue builtin_max(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_max(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     return b_min_max<true>(ctx, exprList, args, n);
@@ -256,7 +256,7 @@ EvalValue builtin_max(EvalContext *ctx, ExprList *exprList,
 
 template <size_type N, typename funcT>
 static EvalValue
-float_func(EvalContext *ctx, ExprList *exprList,
+float_func(EvalContext *ctx, const ArgLocs *exprList,
            const EvalValue *args, size_t n, funcT f)
 {
     if (n != N)
@@ -266,7 +266,7 @@ float_func(EvalContext *ctx, ExprList *exprList,
 
     for (size_type i = 0; i < N; i++) {
 
-        Construct *arg = exprList->elems[i].get();
+        const ArgLoc *arg = exprList->arg(i);
         const EvalValue &v = args[i];
 
         if (v.is<float_type>())
@@ -294,20 +294,20 @@ float_func(EvalContext *ctx, ExprList *exprList,
 /* The std::<name> overload for float_type (double), selected by an explicit
  * function-pointer cast (the name is overloaded for float/double/long dbl). */
 #define INST_FLOAT_BUILTIN_1(name)                                      \
-    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList,      \
+    EvalValue builtin_##name(EvalContext *ctx, const ArgLocs *exprList,      \
                              const EvalValue *args, size_t n) {         \
         return float_func<1>(ctx, exprList, args, n,                   \
             static_cast<float_type (*)(float_type)>(std::name));        \
     }
 
 #define INST_FLOAT_BUILTIN_1_ex(name, funcT, funcName)                  \
-    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList,      \
+    EvalValue builtin_##name(EvalContext *ctx, const ArgLocs *exprList,      \
                              const EvalValue *args, size_t n) {         \
         return float_func<1, funcT>(ctx, exprList, args, n, funcName);  \
     }
 
 #define INST_FLOAT_BUILTIN_2(name)                                      \
-    EvalValue builtin_##name(EvalContext *ctx, ExprList *exprList,      \
+    EvalValue builtin_##name(EvalContext *ctx, const ArgLocs *exprList,      \
                              const EvalValue *args, size_t n) {         \
         return float_func<2>(ctx, exprList, args, n,                   \
             static_cast<float_type (*)(float_type, float_type)>(std::name)); \
@@ -335,13 +335,13 @@ INST_FLOAT_BUILTIN_1_ex(isfinite, bool (*)(float_type), std::isfinite);
 INST_FLOAT_BUILTIN_1_ex(isnormal, bool (*)(float_type), std::isnormal);
 INST_FLOAT_BUILTIN_1_ex(isnan, bool (*)(float_type), std::isnan);
 
-EvalValue builtin_round(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_round(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n < 1)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &v0 = args[0];
     float_type x;
 
@@ -361,7 +361,7 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList,
         if (n != 2)
             throw InvalidArgumentEx(exprList->start, exprList->end);
 
-        Construct *arg1 = exprList->elems[1].get();
+        const ArgLoc *arg1 = exprList->arg(1);
         const EvalValue &v1 = args[1];
 
         if (!v1.is<int_type>() || v1.get<int_type>() < 0) {
@@ -378,14 +378,14 @@ EvalValue builtin_round(EvalContext *ctx, ExprList *exprList,
     }
 }
 
-EvalValue builtin_rand(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_rand(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &v0 = args[0];
     const EvalValue &v1 = args[1];
 
@@ -408,14 +408,14 @@ EvalValue builtin_rand(EvalContext *ctx, ExprList *exprList,
     return distrib(mt_engine);
 }
 
-EvalValue builtin_randf(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_randf(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &v0 = args[0];
     const EvalValue &v1 = args[1];
 

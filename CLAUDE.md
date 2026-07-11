@@ -3275,7 +3275,15 @@ native** (a plain CallV would BYPASS the cache and recompute the exponential).
 A **read-only builtin** with the VALUE ABI (`Builtin::func_v` — args
 pre-evaluated, no `node->eval`; set by `make_const_builtin_v`, which also
 registers a generic adapter as the tree-walker's `func`) dispatches natively via
-`CallBuiltinV`. A **mutating builtin** (append/pop/insert/erase/intptr) uses the
+`CallBuiltinV`. **`func_v` is AST-FREE**: instead of an `ExprList *`, it takes an
+**`ArgLocs`** (`evalvalue.h`) — the whole-args caret + per-arg carets
+(`arg(i)->start/end`) + the array-repr `arr_hint`, i.e. EXACTLY the source-loc
+data a builtin's error messages used to reach through the arg nodes, and nothing
+executable. The tree-walker adapter builds it from the real `ExprList`
+(`build_arglocs`, types.cpp); the VM builds it (`vm_build_arglocs`, vm.cpp) —
+today from `dc->args` (the node), next from a serializable `Chunk` pool — so a
+migrated builtin holds NO AST pointer, and its carets are byte-identical in both
+engines. A **mutating builtin** (append/pop/insert/erase/intptr) uses the
 **lvalue ABI** (`Builtin::func_lv` — a UNION with `func_v`, discriminated by
 `DirectBuiltinCallExpr::lvalue_arg0`): it gets arg0 as an `LValue*` target,
 dispatching via **`CallBuiltinLV`** when arg0 is a slotted identifier

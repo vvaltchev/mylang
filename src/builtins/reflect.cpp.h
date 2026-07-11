@@ -273,7 +273,7 @@ std::string reflect_layout(const StructTypeDef *def)
  * Excludes builtins (use :help builtins). See the file header for the const
  * scalar / script-slot limits.
  */
-EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_globals(EvalContext *ctx, const ArgLocs *exprList,
                           const EvalValue *args, size_t n)
 {
     if (n != 0)
@@ -326,13 +326,13 @@ EvalValue builtin_globals(EvalContext *ctx, ExprList *exprList,
  * constructor), as a string. Accepts a function value, a struct type
  * descriptor, or a struct instance (its type's constructor).
  */
-EvalValue builtin_signature(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_signature(EvalContext *ctx, const ArgLocs *exprList,
                             const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (e.is<intrusive_ptr<FuncObject>>())
@@ -398,13 +398,13 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
  * struct instance. (The legacy `reflect_layout` string renderer is kept for the
  * REPL `:layout`-style introspection.)
  */
-EvalValue builtin_layout(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_layout(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (e.is<StructTypeDef *>())
@@ -424,13 +424,13 @@ EvalValue builtin_layout(EvalContext *ctx, ExprList *exprList,
  * a runtime scope walk; what each clone specializes on is shown by the trace /
  * :globals.
  */
-EvalValue builtin_specializations(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_specializations(EvalContext *ctx, const ArgLocs *exprList,
                                   const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<intrusive_ptr<FuncObject>>())
@@ -507,13 +507,13 @@ EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
  * "autoconst", "autopure", "arrays", "fold", or "all"); on is truthy/falsy.
  * Throws InvalidValueEx on an unknown category. Returns none.
  */
-EvalValue builtin_trace(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_trace(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *a0 = exprList->elems[0].get();
+    const ArgLoc *a0 = exprList->arg(0);
     const EvalValue &name = args[0];
     const EvalValue &on = args[1];
 
@@ -527,7 +527,7 @@ EvalValue builtin_trace(EvalContext *ctx, ExprList *exprList,
 }
 
 /* traceoff(): disable all trace categories. Returns none. */
-EvalValue builtin_traceoff(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_traceoff(EvalContext *ctx, const ArgLocs *exprList,
                            const EvalValue *args, size_t n)
 {
     if (n != 0)
@@ -537,7 +537,7 @@ EvalValue builtin_traceoff(EvalContext *ctx, ExprList *exprList,
 }
 
 /* tracing(): the active trace categories as a sorted array<str>. */
-EvalValue builtin_tracing(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_tracing(EvalContext *ctx, const ArgLocs *exprList,
                           const EvalValue *args, size_t n)
 {
     if (n != 0)

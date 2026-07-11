@@ -29,13 +29,34 @@ class EvalContext;
 class FuncObject;
 struct StructTypeDef;   /* a struct type descriptor (structtype.h) */
 class StructObject;     /* a struct instance (structtype.h) */
+enum class ArrHint : unsigned char;   /* defined in syntax.h */
+
+/*
+ * The AST-FREE data a value-ABI builtin (func_v) needs besides its (already-
+ * evaluated) arg VALUES: the source carets for its error messages and the
+ * array-repr hint. It replaces the `ExprList *` a func_v used to take purely for
+ * locs/hint - so a builtin reports the SAME carets without any AST pointer. The
+ * tree-walker fills it from the real ExprList (per-arg `elems[i]->start/end`);
+ * the VM fills it from a serializable Chunk pool. `arg(i)` is the i-th arg's
+ * caret; `start`/`end` the whole args-list caret (arity / generic errors).
+ */
+struct ArgLoc { Loc start, end; };
+struct ArgLocs {
+    Loc start, end;                     /* the args-list caret */
+    const ArgLoc *args = nullptr;       /* per-arg carets, [0, n) */
+    ArrHint arr_hint;                   /* the array-repr hint (range/array/…) */
+    const ArgLoc *arg(size_t i) const { return &args[i]; }
+};
 /*
  * A builtin. `func` is the ORIGINAL ABI (self-evaluates the unevaluated arg
  * nodes) - always set; the tree-walker calls it. `func_v` is the VM's
  * VALUE ABI: the args are ALREADY evaluated into `args[0..n)` and passed by
- * value (no node->eval); `exprList` is handed over for LOCS + arity ONLY (never
- * evaluated). It is non-null only for a migrated, read-only builtin; the VM's
- * CallBuiltinV uses it, else it falls back to `func` via EvalToSlot. A MUTATING
+ * value (no node->eval); the AST-FREE `ArgLocs` carries the error carets +
+ * repr hint it used to reach through the arg nodes (built by the tree-walker
+ * adapter from the ExprList, by the VM from a serializable Chunk pool - so a
+ * value-ABI builtin holds NO AST pointer). It is non-null only for a migrated,
+ * read-only builtin; the VM's CallBuiltinV uses it, else it falls back to
+ * `func` via EvalToSlot. A MUTATING
  * builtin (append/pop/...) uses the `func_lv` form below instead (arg0 is an
  * lvalue); an AST builtin (defined/type) needs the arg node, so it keeps the
  * union null and stays a fallback. For a migrated builtin `func` is a generic
@@ -61,7 +82,7 @@ struct Builtin {
      * Null (union zero) == not migrated: the VM falls back to func (EvalStmt).
      */
     union {
-        EvalValue (*func_v)(EvalContext *, ExprList *, const EvalValue *,
+        EvalValue (*func_v)(EvalContext *, const ArgLocs *, const EvalValue *,
                             size_t);
         EvalValue (*func_lv)(EvalContext *, ExprList *, LValue *,
                              const EvalValue *, size_t);

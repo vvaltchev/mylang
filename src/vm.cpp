@@ -200,6 +200,24 @@ vm_throw_multi_unpack_len(const Chunk &chunk, size_t pc, size_type m,
                                  std::to_string(nvars) + " variables"), s, en);
 }
 
+/* Build the AST-free ArgLocs a func_v takes, from a builtin call's arg
+ * ExprList: the whole-args caret + repr hint, each arg's caret into `buf`. The
+ * VM's analogue of types.cpp's build_arglocs (the tree-walker adapter's). */
+static inline ArgLocs
+vm_build_arglocs(ExprList *el, ArgLoc *buf, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        buf[i].start = el->elems[i]->start;
+        buf[i].end = el->elems[i]->end;
+    }
+    ArgLocs al;
+    al.start = el->start;
+    al.end = el->end;
+    al.args = buf;
+    al.arr_hint = el->arr_hint;
+    return al;
+}
+
 /* Cold path for a value-ABI builtin with > 8 args: heap-allocate the arg
  * buffer. ML_NOINLINE so the hot CallBuiltinV case (the common n <= 8, a stack
  * buffer) carries NO std::vector ctor/dtor - that overhead, paid on every
@@ -213,7 +231,9 @@ vm_call_builtin_big(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
     for (int_type i = 0; i < n; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
-    return dc->builtin.func_v(&ctx, dc->args.get(), heapbuf.data(), n);
+    std::vector<ArgLoc> locbuf(static_cast<size_t>(n));
+    ArgLocs al = vm_build_arglocs(dc->args.get(), locbuf.data(), n);
+    return dc->builtin.func_v(&ctx, &al, heapbuf.data(), n);
 }
 
 /* Build an array LITERAL from the register run [base,base+n). ML_NOINLINE and
@@ -1434,8 +1454,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     EvalValue stackbuf[8];
                     for (int_type i = 0; i < n; i++)
                         stackbuf[i] = ctx.frame->at(base + i).get();
+                    ArgLoc locbuf[8];
+                    ArgLocs al =
+                        vm_build_arglocs(dc->args.get(), locbuf, n);
                     ctx.frame->at(in.target).put(
-                        dc->builtin.func_v(&ctx, dc->args.get(), stackbuf, n));
+                        dc->builtin.func_v(&ctx, &al, stackbuf, n));
                 } else {
                     ctx.frame->at(in.target).put(
                         vm_call_builtin_big(ctx, dc, base, n));

@@ -46,13 +46,13 @@ static const std::array<SharedStr, Type::t_count> TypeNames =
     string("struct"),
 };
 
-EvalValue builtin_exit(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    const Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<int_type>())
@@ -142,28 +142,28 @@ EvalValue builtin_kindstr(EvalContext *ctx, ExprList *exprList)
  * TypeNames), keeping the two engines byte-identical on the differential. The
  * ExprList is passed for arity/locs only; args[0] is the pre-evaluated value.
  */
-EvalValue builtin_type_v(EvalContext *, ExprList *el, const EvalValue *args,
+EvalValue builtin_type_v(EvalContext *, const ArgLocs *el, const EvalValue *args,
                          size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(el->start, el->end);
     return make_runtime_type_value(args[0]);
 }
-EvalValue builtin_decltype_v(EvalContext *, ExprList *el, const EvalValue *args,
+EvalValue builtin_decltype_v(EvalContext *, const ArgLocs *el, const EvalValue *args,
                              size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(el->start, el->end);
     return make_runtime_type_value(args[0]);
 }
-EvalValue builtin_typestr_v(EvalContext *, ExprList *el, const EvalValue *args,
+EvalValue builtin_typestr_v(EvalContext *, const ArgLocs *el, const EvalValue *args,
                             size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(el->start, el->end);
     return SharedStr(reflect_typeof(args[0]));
 }
-EvalValue builtin_kindstr_v(EvalContext *, ExprList *el, const EvalValue *args,
+EvalValue builtin_kindstr_v(EvalContext *, const ArgLocs *el, const EvalValue *args,
                             size_t n)
 {
     if (n != 1)
@@ -281,6 +281,28 @@ inline auto make_builtin_customv(const char *name, decltype(Builtin::func) f,
 }
 
 /*
+ * Build the AST-FREE ArgLocs a func_v now takes, from the tree-walker's real
+ * ExprList: the whole-args caret + the array-repr hint, and each arg's caret
+ * into `locbuf` (caller-provided, [0, n)). The VM builds the same struct from a
+ * serializable Chunk pool - so a builtin's carets are identical in both engines
+ * with no AST pointer in the value-ABI signature.
+ */
+static inline ArgLocs
+build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        locbuf[i].start = exprList->elems[i]->start;
+        locbuf[i].end = exprList->elems[i]->end;
+    }
+    ArgLocs al;
+    al.start = exprList->start;
+    al.end = exprList->end;
+    al.args = locbuf;
+    al.arr_hint = exprList->arr_hint;
+    return al;
+}
+
+/*
  * Cold n>8 path for the adapter below: heap-allocate the arg buffer.
  * ML_NOINLINE and NON-template (fv is a runtime arg) so the hot adapter body
  * carries no std::vector ctor/dtor - that overhead, paid on every
@@ -294,7 +316,9 @@ builtin_v_adapter_big(decltype(Builtin::func_v) fv, EvalContext *ctx,
     std::vector<EvalValue> heapbuf(n);
     for (size_t i = 0; i < n; i++)
         heapbuf[i] = RValue(exprList->elems[i]->eval(ctx));
-    return fv(ctx, exprList, heapbuf.data(), n);
+    std::vector<ArgLoc> locbuf(n);
+    ArgLocs al = build_arglocs(exprList, locbuf.data(), n);
+    return fv(ctx, &al, heapbuf.data(), n);
 }
 
 /*
@@ -314,7 +338,9 @@ EvalValue builtin_v_adapter(EvalContext *ctx, ExprList *exprList)
     EvalValue stackbuf[8];
     for (size_t i = 0; i < n; i++)
         stackbuf[i] = RValue(exprList->elems[i]->eval(ctx));
-    return FV(ctx, exprList, stackbuf, n);
+    ArgLoc locbuf[8];
+    ArgLocs al = build_arglocs(exprList, locbuf, n);
+    return FV(ctx, &al, stackbuf, n);
 }
 
 template <decltype(Builtin::func_v) FV>

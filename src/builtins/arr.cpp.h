@@ -37,13 +37,13 @@ static const char *const flat_array_violation_msg =
  *                    -> flat int, a float -> flat float, else general. For a
  *                    callback-built array use make_array().
  */
-EvalValue builtin_array(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t nargs)
 {
     if (nargs < 1 || nargs > 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<int_type>())
@@ -120,13 +120,13 @@ EvalValue builtin_array(EvalContext *ctx, ExprList *exprList,
  * unboxed int/float vector while they stay that one scalar kind, and the array
  * promotes to general the moment a callback returns something else.
  */
-EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
                              const EvalValue *args, size_t nargs)
 {
     if (nargs != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<int_type>())
@@ -138,7 +138,7 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList,
         throw InvalidValueEx("Expected non-negative integer",
                              arg0->start, arg0->end);
 
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &fval = args[1];
 
     if (!fval.is<intrusive_ptr<FuncObject>>())
@@ -219,13 +219,13 @@ EvalValue builtin_make_array(EvalContext *ctx, ExprList *exprList,
  * pin the representation and catch regressions. Not const: it reflects a
  * runtime fact and must not fold.
  */
-EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_array_storage(EvalContext *ctx, const ArgLocs *exprList,
                                 const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<SharedArrayObj>())
@@ -256,13 +256,13 @@ EvalValue builtin_array_storage(EvalContext *ctx, ExprList *exprList,
  * that must be re-copied per eval). Compare `var dyn d = [1,2,3]`, where the
  * dyn declaration already builds general from the start.
  */
-EvalValue builtin_dynarray(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_dynarray(EvalContext *ctx, const ArgLocs *exprList,
                            const EvalValue *args, size_t nargs)
 {
     if (nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<SharedArrayObj>())
@@ -452,13 +452,13 @@ EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList, LValue *target,
     return last;
 }
 
-EvalValue builtin_top(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_top(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t nargs)
 {
     if (nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<SharedArrayObj>())
@@ -584,14 +584,14 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     return true;
 }
 
-EvalValue builtin_range(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n < 1 || n > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     int_type end, start = 0, step = 1;
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &val0 = args[0];
 
     if (!val0.is<int_type>())
@@ -599,7 +599,7 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList,
 
     if (n >= 2) {
 
-        Construct *arg1 = exprList->elems[1].get();
+        const ArgLoc *arg1 = exprList->arg(1);
         const EvalValue &val1 = args[1];
 
         if (!val1.is<int_type>())
@@ -610,7 +610,7 @@ EvalValue builtin_range(EvalContext *ctx, ExprList *exprList,
 
         if (n == 3) {
 
-            Construct *arg2 = exprList->elems[2].get();
+            const ArgLoc *arg2 = exprList->arg(2);
             const EvalValue &val2 = args[2];
 
             if (!val2.is<int_type>())
@@ -1046,13 +1046,13 @@ EvalValue builtin_reverse_lv(EvalContext *ctx, ExprList *exprList,
     return reverse_core(ctx, exprList, RValue(EvalValue(target)), target);
 }
 
-EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t nargs)
 {
     if (nargs < 1 || nargs > 2)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &val0 = args[0];
 
     if (!val0.is<SharedArrayObj>())
@@ -1151,7 +1151,7 @@ EvalValue builtin_sum(EvalContext *ctx, ExprList *exprList,
 
     } else {
 
-        Construct *arg1 = exprList->elems[1].get();
+        const ArgLoc *arg1 = exprList->arg(1);
         const EvalValue &val1 = args[1];
 
         if (!val1.is<intrusive_ptr<FuncObject>>())

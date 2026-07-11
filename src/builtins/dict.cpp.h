@@ -37,7 +37,7 @@ builtin_find_dict(const intrusive_ptr<DictObject> &obj, const EvalValue &key)
  */
 static EvalValue
 dict_get_impl(EvalContext *ctx,
-              ExprList *exprList,
+              const ArgLocs *exprList,
               const EvalValue *args,
               size_t n,
               bool throw_if_absent)
@@ -45,8 +45,8 @@ dict_get_impl(EvalContext *ctx,
     if (n != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &d = args[0];
     const EvalValue &key = args[1];
 
@@ -66,13 +66,13 @@ dict_get_impl(EvalContext *ctx,
     return none;
 }
 
-EvalValue builtin_get(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_get(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     return dict_get_impl(ctx, exprList, args, n, false);
 }
 
-EvalValue builtin_get_throw(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_get_throw(EvalContext *ctx, const ArgLocs *exprList,
                             const EvalValue *args, size_t n)
 {
     return dict_get_impl(ctx, exprList, args, n, true);
@@ -179,7 +179,7 @@ dict_kvpairs(const DictObject::inner_type &data, ArrHint /*hint*/)
 
 static EvalValue
 dict_1arg_func(EvalContext *ctx,
-               ExprList *exprList,
+               const ArgLocs *exprList,
                const EvalValue *args,
                size_t n,
                EvalValue (*f)(const DictObject::inner_type &, ArrHint))
@@ -187,7 +187,7 @@ dict_1arg_func(EvalContext *ctx,
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &val0 = args[0];
 
     if (!val0.is<intrusive_ptr<DictObject>>())
@@ -202,34 +202,34 @@ dict_1arg_func(EvalContext *ctx,
 }
 
 EvalValue
-builtin_keys(EvalContext *ctx, ExprList *exprList,
+builtin_keys(EvalContext *ctx, const ArgLocs *exprList,
              const EvalValue *args, size_t n)
 {
     return dict_1arg_func(ctx, exprList, args, n, &dict_keys);
 }
 
 EvalValue
-builtin_values(EvalContext *ctx, ExprList *exprList,
+builtin_values(EvalContext *ctx, const ArgLocs *exprList,
                const EvalValue *args, size_t n)
 {
     return dict_1arg_func(ctx, exprList, args, n, &dict_values);
 }
 
 EvalValue
-builtin_kvpairs(EvalContext *ctx, ExprList *exprList,
+builtin_kvpairs(EvalContext *ctx, const ArgLocs *exprList,
                 const EvalValue *args, size_t n)
 {
     return dict_1arg_func(ctx, exprList, args, n, &dict_kvpairs);
 }
 
 EvalValue
-builtin_dict(EvalContext *ctx, ExprList *exprList,
+builtin_dict(EvalContext *ctx, const ArgLocs *exprList,
              const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &e = args[0];
     DictObject::inner_type data;
 
@@ -300,19 +300,19 @@ builtin_dict(EvalContext *ctx, ExprList *exprList,
  * like every dict insert) so a mutable container key can't later be mutated and
  * corrupt the map. Symmetric with make_array; a const-foldable (const) builtin.
  */
-EvalValue builtin_make_dict(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
                             const EvalValue *args, size_t nargs)
 {
     if (nargs != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array of keys", arg0->start, arg0->end);
 
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &fval = args[1];
 
     if (!fval.is<intrusive_ptr<FuncObject>>())

@@ -17,7 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-EvalValue builtin_print(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_print(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
@@ -28,13 +28,13 @@ EvalValue builtin_print(EvalContext *ctx, ExprList *exprList,
     return none;
 }
 
-EvalValue builtin_write(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_write(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n < 1 || n > 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &e = args[0];
 
     if (!e.is<SharedStr>())
@@ -45,7 +45,7 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList,
 
     if (n == 2) {
 
-        Construct *arg1 = exprList->elems[1].get();
+        const ArgLoc *arg1 = exprList->arg(1);
         const EvalValue &fstr = args[1];
 
         if (!fstr.is<SharedStr>())
@@ -64,7 +64,7 @@ EvalValue builtin_write(EvalContext *ctx, ExprList *exprList,
     return none;
 }
 
-EvalValue builtin_writeln(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_writeln(EvalContext *ctx, const ArgLocs *exprList,
                           const EvalValue *args, size_t n)
 {
     builtin_write(ctx, exprList, args, n);
@@ -72,7 +72,7 @@ EvalValue builtin_writeln(EvalContext *ctx, ExprList *exprList,
     return none;
 }
 
-EvalValue builtin_read(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_read(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     if (n > 1)
@@ -83,7 +83,7 @@ EvalValue builtin_read(EvalContext *ctx, ExprList *exprList,
 
     if (n == 1) {
 
-        Construct *arg0 = exprList->elems[0].get();
+        const ArgLoc *arg0 = exprList->arg(0);
         const EvalValue &fstr = args[0];
 
         if (!fstr.is<SharedStr>())
@@ -100,7 +100,7 @@ EvalValue builtin_read(EvalContext *ctx, ExprList *exprList,
     return SharedStr(string(std::istreambuf_iterator<char>(*s), {}));
 }
 
-EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_readln(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 0)
@@ -111,7 +111,7 @@ EvalValue builtin_readln(EvalContext *ctx, ExprList *exprList,
     return SharedStr(move(str));
 }
 
-EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_readlines(EvalContext *ctx, const ArgLocs *exprList,
                             const EvalValue *args, size_t n)
 {
     if (n > 1)
@@ -124,7 +124,7 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList,
 
     if (n == 1) {
 
-        Construct *arg0 = exprList->elems[0].get();
+        const ArgLoc *arg0 = exprList->arg(0);
         const EvalValue &fstr = args[0];
 
         if (!fstr.is<SharedStr>())
@@ -146,13 +146,13 @@ EvalValue builtin_readlines(EvalContext *ctx, ExprList *exprList,
     return SharedArrayObj(move(vec));
 }
 
-EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_writelines(EvalContext *ctx, const ArgLocs *exprList,
                              const EvalValue *args, size_t nargs)
 {
     if (nargs < 1 || nargs > 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &val = args[0];
 
     if (!val.is<SharedArrayObj>())
@@ -163,7 +163,7 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList,
 
     if (nargs == 2) {
 
-        Construct *arg1 = exprList->elems[1].get();
+        const ArgLoc *arg1 = exprList->arg(1);
         const EvalValue &fstr = args[1];
 
         if (!fstr.is<SharedStr>())
@@ -193,13 +193,13 @@ EvalValue builtin_writelines(EvalContext *ctx, ExprList *exprList,
  * (0) otherwise (e.g. it did not exist) - so it is safe to call for cleanup
  * without checking first. Throws only on a bad argument.
  */
-EvalValue builtin_remove(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_remove(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
     const EvalValue &fstr = args[0];
 
     if (!fstr.is<SharedStr>())
@@ -214,7 +214,7 @@ EvalValue builtin_remove(EvalContext *ctx, ExprList *exprList,
  * (so a caller can append "/name"). Portable: honors $TMPDIR / %TEMP% / %TMP%,
  * falling back to "/tmp". Like Python's tempfile.gettempdir().
  */
-EvalValue builtin_tmpdir(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_tmpdir(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 0)

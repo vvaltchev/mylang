@@ -22,7 +22,7 @@ EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
     return !arg->eval(ctx).is<UndefinedId>();
 }
 
-EvalValue builtin_len(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_len(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     if (n != 1)
@@ -32,7 +32,7 @@ EvalValue builtin_len(EvalContext *ctx, ExprList *exprList,
     return e.get_type()->len(e);
 }
 
-EvalValue builtin_str(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_str(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
     if (n < 1)
@@ -51,7 +51,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList,
 
         if (n == 2) {
 
-            Construct *arg1 = exprList->elems[1].get();
+            const ArgLoc *arg1 = exprList->arg(1);
             const EvalValue &p = args[1];
 
             if (!p.is<int_type>() || p.get<int_type>() < 0 || p.get<int_type>() > 64) {
@@ -74,8 +74,8 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList,
             const int slen = snprintf(nullptr, 0, "%.*f", precision, fval);
 
             if (slen < 0)
-                throw InternalErrorEx(exprList->elems[0]->start,
-                                      exprList->elems[0]->end);
+                throw InternalErrorEx(exprList->arg(0)->start,
+                                      exprList->arg(0)->end);
 
             std::vector<char> buf(static_cast<size_t>(slen) + 1);
             snprintf(buf.data(), buf.size(), "%.*f", precision, fval);
@@ -101,7 +101,7 @@ EvalValue builtin_str(EvalContext *ctx, ExprList *exprList,
  * inside the expression, before it is "runtime-ized"), while 1/runtime(0)
  * throws at run time. Useful in tests, and to opt an expression out of folding.
  */
-EvalValue builtin_runtime(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_runtime(EvalContext *ctx, const ArgLocs *exprList,
                           const EvalValue *args, size_t n)
 {
     if (n != 1)
@@ -142,13 +142,13 @@ EvalValue builtin_isconstdecl(EvalContext *ctx, ExprList *exprList)
  * object that is effectively pure (explicitly `pure`, OR proven pure by the
  * resolver), resp. *explicitly* declared `pure`. The arg is evaluated.
  */
-EvalValue builtin_ispure(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_ispure(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &v = args[0];
 
     if (!v.is<intrusive_ptr<FuncObject>>())
@@ -157,13 +157,13 @@ EvalValue builtin_ispure(EvalContext *ctx, ExprList *exprList,
     return v.get<intrusive_ptr<FuncObject>>()->func->effective_pure;
 }
 
-EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_ispuredecl(EvalContext *ctx, const ArgLocs *exprList,
                              const EvalValue *args, size_t n)
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
     const EvalValue &v = args[0];
 
     if (!v.is<intrusive_ptr<FuncObject>>())
@@ -172,7 +172,7 @@ EvalValue builtin_ispuredecl(EvalContext *ctx, ExprList *exprList,
     return v.get<intrusive_ptr<FuncObject>>()->func->explicit_pure;
 }
 
-EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_clone(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t n)
 {
     if (n != 1)
@@ -195,7 +195,7 @@ EvalValue builtin_clone(EvalContext *ctx, ExprList *exprList,
  * runtime (non-const) builtin: it produces a mutable value that must be copied
  * fresh per evaluation anyway, so folding it would only bloat the tree.
  */
-EvalValue builtin_deepclone(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_deepclone(EvalContext *ctx, const ArgLocs *exprList,
                             const EvalValue *args, size_t n)
 {
     if (n != 1)
@@ -219,7 +219,7 @@ EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList, LValue *target,
     return e.get_type()->intptr(e);
 }
 
-EvalValue builtin_assert(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_assert(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
     if (n != 1)
@@ -324,14 +324,14 @@ EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList, LValue *target,
     }
 }
 
-EvalValue builtin_find(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_find(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     if (n < 2 || n > 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &container_val = args[0];
     const EvalValue &elem_val = args[1];
 
@@ -349,7 +349,7 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList,
 
         if (n == 3) {
 
-            Construct *arg2 = exprList->elems[2].get();
+            const ArgLoc *arg2 = exprList->arg(2);
             const EvalValue &keyval = args[2];
 
             if (!keyval.is<intrusive_ptr<FuncObject>>())
@@ -377,7 +377,7 @@ EvalValue builtin_find(EvalContext *ctx, ExprList *exprList,
     }
 }
 
-EvalValue builtin_hash(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_hash(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     if (n != 1)
