@@ -550,6 +550,17 @@ enum class OpCode : unsigned char {
     LoadBuiltinV,
 
     /*
+     * `defined(g)` where `g` is a GLOBAL-table symbol: `target` = the dst temp,
+     * `target2` = the global slot. Reads `gfuncs->defined[target2]` as a bool -
+     * the genuine runtime property a global's definedness is (false before its
+     * decl executes, true after). AST-free (the slot is known at codegen; never
+     * throws). The always-bound cases (param/local/capture/builtin) fold to
+     * `true` at resolve time (try_fold_defined); this native op is what keeps
+     * the ONE runtime `defined` case off the EvalToSlot fallback.
+     */
+    DefinedGlobalV,
+
+    /*
      * PLAIN assignment to a GLOBAL-table slot `g = <expr>` (a top-level var a
      * function reads - the write counterpart of LoadGlobalV): the value temp is
      * in `a`, `target` = the GlobalFuncTable slot index. Writes

@@ -259,9 +259,27 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
     `typestr`/`kindstr`) in a scalar-expression position. These are COMPILE-TIME
     ONLY: with full AOT inference they fold to a literal (a script is a closed
     world — `defined(name)` is knowable, `type(x)` is the inferred static type),
-    so they never reach codegen. TODAY there's a FOLD GAP (`defined(param)`
-    didn't fold → EvalToSlot) — close it so every AST-builtin call is a literal
-    before codegen. Then EvalToSlot is unreachable.
+    so they never reach codegen. **`defined` FOLD GAP CLOSED** (`try_fold_defined`,
+    resolver): `defined(name)` now folds to `true` when `name` resolves to a
+    LOCAL (param bound at every call; a resolved local is reached only after its
+    decl ran — no per-slot liveness), a CAPTURE (snapshot at creation), or an
+    unshadowed BUILTIN — all always-bound, sound in script + REPL with no gating.
+    **The one legitimately-non-foldable case is `defined(GLOBAL)`** — a global's
+    slot has a runtime `defined`-flag set only when its decl executes, so
+    `defined(g)` is genuinely `false` before / `true` after that runs (a real
+    runtime property, NOT a fold gap). **DONE — `defined(global)` now lowers to a
+    native `DefinedGlobalV`** op (`try_native_defined_global`, codegen) that
+    reads `gfuncs->defined[slot]` as a bool (the slot is known at codegen —
+    AST-free, `node_idx` stays -1, never throws). `type`/`decltype`/`typestr`/
+    `kindstr` fold via `fold_type_query` (or, non-folded, dispatch as a dual-ABI
+    `CallBuiltinV`, never EvalToSlot); `isconst`/`isconstdecl` fold via
+    `fold_isconst` (always). **So in a SCRIPT every AST-builtin path is folded or
+    native — EvalToSlot is unreachable.** The ONE residual emitter is the
+    **dev-only `show`** (an AST decompiler with no value ABI), which is a
+    compile-time error in a script (so never in `.myv`) and only reachable in the
+    REPL / test harness. Deleting EvalToSlot outright therefore waits on a
+    decision for `show` (give it a native/rejected path, or keep EvalToSlot as a
+    dev-only affordance) — step (e).
   - `EvalStmt` — the general statement fallback. After AOT + full `dyn` (below),
     the only bodies that reached it (untyped template bases) no longer exist as
     chunks, so it too is unreachable.
@@ -310,8 +328,10 @@ front-end + compilation-model:
 5. **AST builtins fold away (see the EvalToSlot bullet above)** — they are
    compile-time-only and must be literals before codegen under full AOT.
 Order: (a) `!x` nativization **[DONE — boxed `UnaryV`]**; (b) close the
-AST-builtin fold gap → EvalToSlot unreachable; (c) AOT chunk compilation (all
-upfront, `-vd` off the chunk set);
+AST-builtin fold gap → EvalToSlot unreachable **[DONE in SCRIPT — `defined`
+folds (bound) + `DefinedGlobalV` (global); all other AST builtins fold/dual-ABI;
+only dev-only `show` still emits EvalToSlot, never in a script/.myv]**; (c) AOT
+chunk compilation (all upfront, `-vd` off the chunk set);
 (d) first-class `dyn` instances + the `int OP dyn`→concrete inference rule;
 (e) audit each fallback op is unemitted, then DELETE + abort-guard. Each step
 `-rt` (differential) + samples byte-identical.

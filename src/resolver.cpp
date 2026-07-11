@@ -443,6 +443,36 @@ private:
     }
 
     /*
+     * Fold `defined(name)` -> true when `name` resolves to a symbol that is
+     * ALWAYS bound: a LOCAL (a param bound at every call - an omitted trailing
+     * opt still binds `none`; a var/for/foreach/catch local, which a resolved
+     * reference can only reach AFTER its decl ran - forward resolution - and
+     * whose slot has no per-slot liveness, so it holds a defined value, never
+     * UndefinedId), a CAPTURE (snapshot at closure creation), or an unshadowed
+     * BUILTIN (`SymKind::builtin` only exists in a fully-slotted SCRIPT). All
+     * three are sound in both script and REPL mode with no gating. A GLOBAL is
+     * NOT foldable (its slot's defined-flag is set only when its decl executes -
+     * `defined(g)` is false before that runs, true after - a genuine runtime
+     * property); an UNRESOLVED name (a live REPL map global, or a script typo)
+     * and a non-identifier arg are also left as a runtime `defined()` call.
+     * Returns true iff it folded. Closes the AST-builtin fold gap that made
+     * `s + defined(p)` emit a VM EvalToSlot (see plans/vm-fallback-
+     * elimination.md).
+     */
+    bool try_fold_defined(unique_ptr<Construct> &slot, CallExpr *ce)
+    {
+        auto *id = dynamic_cast<Identifier *>(ce->args->elems[0].get());
+        if (!id)
+            return false;
+        const SymKind k = id->sym.kind;
+        if (k != SymKind::local && k != SymKind::capture
+                && k != SymKind::builtin)
+            return false;
+        MakeConstructFromConstVal(EvalValue(true), slot, false);
+        return true;
+    }
+
+    /*
      * Register every effectively-pure NAMED function into `cctx`, so that
      * fold_reads can evaluate their constant-argument calls at compile time.
      * Does not descend into function bodies (a pure func contains no funcs, and
@@ -946,6 +976,11 @@ private:
                 fold_isconst(slot, ce, fc,
                              callee->get_str() == "isconstdecl");
                 return;
+            }
+            if (callee && ce->args && ce->args->elems.size() == 1
+                    && callee->get_str() == "defined"
+                    && try_fold_defined(slot, ce)) {
+                return;   /* folded; else fall through to normal arg handling */
             }
 
             bool all_const = ce->args != nullptr;

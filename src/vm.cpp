@@ -2014,6 +2014,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
+        case OpCode::DefinedGlobalV:
+            /* defined(global): the slot's defined-flag IS the answer (false
+             * before the decl ran, true after) - byte-identical to
+             * builtin_defined evaluating the identifier to an UndefinedId or
+             * not. AST-free, never throws. */
+            ctx.frame->at(in.target).put(
+                EvalValue(ctx.gfuncs->defined[in.target2] != 0));
+            pc++;
+            break;
+
         case OpCode::StoreGlobalV: {
             LValue &lv = ctx.gfuncs->slots[in.target];
             if (in.aop == Op::invalid) {

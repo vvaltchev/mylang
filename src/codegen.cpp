@@ -1041,6 +1041,8 @@ struct Codegen {
          * (CheckFuncV + MapFilterV); value-ABI builtins get CallBuiltinV. */
         if (const DirectBuiltinCallExpr *bc =
                 dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
+            if (try_native_defined_global(bc, out_slot, ops))
+                return true;
             if (try_native_map_filter(bc, out_slot, ops))
                 return true;
             if (try_native_builtin(bc, out_slot, ops))
@@ -1809,6 +1811,35 @@ struct Codegen {
     /* Native builtin call -> CallBuiltinV, but only for a builtin with the
      * VALUE ABI (func_v is set - a migrated, read-only builtin); a mutating /
      * AST / un-migrated builtin stays the EvalToSlot fallback. */
+    /* `defined(g)` where `g` is a GLOBAL-table symbol -> DefinedGlobalV (reads
+     * gfuncs->defined[slot], the genuine runtime property). The always-bound
+     * cases (param/local/capture/builtin) already folded to `true` at resolve
+     * time (try_fold_defined), so the only `defined` call reaching codegen has a
+     * global (or an unresolved / non-identifier) arg; a non-global one declines
+     * here and falls to the EvalToSlot fallback. AST-free (the slot is known;
+     * never throws). */
+    bool try_native_defined_global(const DirectBuiltinCallExpr *dc,
+                                   int &out_slot, std::vector<Instr> &ops)
+    {
+        const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
+        if (!callee || callee->get_str() != "defined")
+            return false;
+        if (!dc->args || dc->args->elems.size() != 1)
+            return false;
+        const Identifier *arg =
+            dynamic_cast<Identifier *>(dc->args->elems[0].get());
+        if (!arg || arg->sym.kind != SymKind::global)
+            return false;
+        const int dst = alloc_temp();
+        Instr in;
+        in.op = OpCode::DefinedGlobalV;
+        in.target = dst;
+        in.target2 = arg->sym.slot;
+        ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
     bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
                             std::vector<Instr> &ops)
     {
@@ -2362,7 +2393,8 @@ struct Codegen {
             if (const DirectBuiltinCallExpr *bc =
                     dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
                 int t;
-                if (try_native_builtin(bc, t, ops))   /* value ABI */
+                if (try_native_defined_global(bc, t, ops)   /* defined(global) */
+                        || try_native_builtin(bc, t, ops))  /* value ABI */
                     out = slot_op(t);
                 else
                     out = eval_to_temp(e, ops);        /* old ABI fallback */

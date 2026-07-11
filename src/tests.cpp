@@ -537,6 +537,40 @@ static const std::vector<test> tests =
     },
 
     {
+        /* defined() of an always-bound symbol (param/local/capture/builtin) is
+         * folded to true at resolve time (AST-builtin fold gap, VM zero-fallback
+         * endgame) - a param binds at every call, a resolved local is reached
+         * only after its decl ran, a capture is snapshot at closure creation, an
+         * unshadowed builtin is always present. Result must be byte-identical to
+         * the un-folded runtime defined() (the differential VM run covers -vm). */
+        "defined() folds for always-bound symbols",
+        {
+            "func fp(int p) { return defined(p); }",       /* param -> true */
+            "assert(fp(5) == 1);",
+            "func fl(int n) { var y = n * 2; return defined(y); }",  /* local */
+            "assert(fl(3) == 1);",
+            "func fb() { return defined(len); }",          /* builtin -> true */
+            "assert(fb() == 1);",
+            "func mk(int s) { return func [s]() { return defined(s); }; }",
+            "var cc = mk(7);",                              /* capture -> true */
+            "assert(cc() == 1);",
+        },
+    },
+
+    {
+        /* defined() of a GLOBAL is NOT folded (its slot's defined-flag is set
+         * only when its decl executes): false before the decl runs, true after -
+         * a genuine runtime property that must stay a runtime defined() call. */
+        "defined() of a global is execution-order-dependent (not folded)",
+        {
+            "func gt() { return defined(gg); }",
+            "assert(gt() == 0);",     /* gg not declared yet */
+            "var gg = 42;",
+            "assert(gt() == 1);",     /* now declared */
+        },
+    },
+
+    {
         "simple func",
         {
             "func add(a, b) {",
@@ -12375,7 +12409,7 @@ struct VmOpCounts {
     size_t storei = 0, storef = 0, loadev = 0, evalslot = 0, evalstmt = 0;
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, unaryv = 0, loadglobalv = 0;
-    size_t subscriptv = 0;
+    size_t subscriptv = 0, definedg = 0;
     size_t memberv = 0, callv = 0, callbuiltinv = 0, callbuiltinlv = 0;
     size_t dictstore = 0, dictloadi = 0, dictloadf = 0, storememberv = 0;
     size_t storeelem2 = 0, storeev = 0;
@@ -12445,6 +12479,7 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::JumpUnlessTrueV:  c.jutv++; break;
             case OpCode::LogV:             c.logv++; break;
             case OpCode::UnaryV:           c.unaryv++; break;
+            case OpCode::DefinedGlobalV:   c.definedg++; break;
             case OpCode::LoadGlobalV:      c.loadglobalv++; break;
             case OpCode::SubscriptV:       c.subscriptv++; break;
             case OpCode::MemberV:          c.memberv++; break;
@@ -13118,6 +13153,27 @@ static bool vm_codegen_shapes()
         return false;
     const bool unary_val_ok = unv.unaryv == 1 && unv.evalslot == 0;
 
+    /* defined(param)/defined(local) fold to a literal at resolve time -> the
+     * function body has NO EvalToSlot for the AST-builtin call (the fold-gap
+     * fix that keeps AST builtins out of codegen). */
+    VmOpCounts df;
+    if (!codegen_func_counts({
+            "func f(int p) { var y = p + 1; return defined(p) + defined(y); }",
+        }, df))
+        return false;
+    const bool defined_fold_ok = df.evalslot == 0 && df.callbuiltinv == 0;
+
+    /* defined(GLOBAL) does NOT fold (execution-order dependent) but is native:
+     * a DefinedGlobalV op reading gfuncs->defined[slot], NOT an EvalToSlot. */
+    VmOpCounts dg;
+    if (!codegen_func_counts({
+            "var gg = 0;",
+            "func gt() { return defined(gg); }",
+        }, dg))
+        return false;
+    const bool defined_global_ok =
+        dg.definedg == 1 && dg.evalslot == 0 && dg.callbuiltinv == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -13131,7 +13187,8 @@ static bool vm_codegen_shapes()
         && struct_member_ok && nested_store_ok && global_store_ok
         && universal_store_ok && try_native_ok && try_finally_native_ok
         && ret_finally_native_ok && break_finally_native_ok
-        && chain_finally_native_ok && unary_cond_ok && unary_val_ok;
+        && chain_finally_native_ok && unary_cond_ok && unary_val_ok
+        && defined_fold_ok && defined_global_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

@@ -760,6 +760,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
              * disassembly shows the global slot (g<n>). */
             row << "load.global  " << D(in.target) << ", g" << in.target2;
             break;
+        case OpCode::DefinedGlobalV:
+            row << "defined.g    " << D(in.target) << " = defined(g"
+                << in.target2 << ")";
+            break;
         case OpCode::StoreGlobalV:
             row << "store.global g" << in.target
                 << (in.aop == Op::invalid ? " = " : " OP= ")
