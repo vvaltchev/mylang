@@ -722,9 +722,23 @@ struct Codegen {
             if (sdef && ce->args
                 && ce->args->elems.size() == sdef->fields.size()
                 && ce->args->elems.size() <= 16) {
+                /* Every arg must be a scalar the coerce can't throw on: a
+                 * typed int/float (th) OR a scalar LITERAL (int/float/bool) -
+                 * the latter covers an AUTO-CONST-folded arg (`var a=1; P(a,a)`),
+                 * whose folded literal never got a `th` stamp (auto-const runs
+                 * after inference). A literal's type is self-evident and
+                 * inference already rejected a non-fitting one, so coerce is
+                 * safe. A nested-struct-field arg (th none, not a scalar
+                 * literal) or a dyn arg fails and falls back. */
+                auto typed_scalar = [](const Construct *a) {
+                    return a->th == TypeHint::i || a->th == TypeHint::f
+                        || dynamic_cast<const LiteralInt *>(a)
+                        || dynamic_cast<const LiteralFloat *>(a)
+                        || dynamic_cast<const LiteralBool *>(a);
+                };
                 bool all_typed = true;
                 for (const auto &a : ce->args->elems)
-                    if (a->th != TypeHint::i && a->th != TypeHint::f) {
+                    if (!typed_scalar(a.get())) {
                         all_typed = false;
                         break;
                     }
@@ -756,12 +770,14 @@ struct Codegen {
          * MakeArrayV: compile the element run, then build the array. A
          * fully-const literal is a baked LoadConstV (boxed_literal above) or a
          * LiteralObj (left to the fallback), so only a literal with element
-         * NODES reaches here. A flat struct array (arr_hint flat_s) is left to
-         * the fallback - the ArrHint-only op can't carry its struct def; its
-         * struct-ctor elements can't lower anyway. */
+         * NODES reaches here. A FLAT STRUCT array (arr_hint flat_s, e.g.
+         * `[P(a,b), P(c,d)]`, F-4) lowers too: each `P(..)` element compiles to
+         * a StructCtorV producing a POD StructObject, and build_array_from_values
+         * packs a run of same-type POD structs into flat mode-5 storage
+         * VALUE-DRIVEN (it reads the struct def off the first element, so the
+         * op needs no def). If a struct-ctor element can't lower (a dyn / nested
+         * arg), emit_args_range fails below and this bails to the fallback. */
         if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e)) {
-            if (la->arr_hint == ArrHint::flat_s)
-                return false;
             const size_t cmark = chunk.consts.size();
             int base;
             if (!emit_args_range(la->elems, base, ops)) {

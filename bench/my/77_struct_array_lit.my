@@ -1,0 +1,20 @@
+# a flat array<PodStruct> LITERAL `[P(a,b), P(c,d)]` built per iteration - the
+# VM lowers it to StructCtorV elements + MakeArrayV (packing the POD structs
+# into flat mode-5 storage), where the tree-walker (and the old VM) fell back to
+# an EvalStmt. Distinct from 58_structs, which append()s structs one at a time.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+struct P { int x; int y; }
+
+var N = 500000 * scale;
+var acc = 0;
+
+for (var i = 0; i < N; i++) {
+    var row = [P(i, i + 1), P(i + 2, i + 3)];
+    acc += row[0].x + row[1].y;
+    acc = acc % 1000000007;
+}
+
+print("result:", acc);

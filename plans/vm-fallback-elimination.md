@@ -123,8 +123,25 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
   is the DEAD `load_data` base template (its live `load_data$0` instance is
   native). Bench `76_funcval_dispatch` VM 0.93x vs the tree-walker (call-bound,
   so modest; the win is removing the dispatch overhead + the fallback).
-- **F-4 · flat `array<PodStruct>` literal** `[P(a), P(b)]` (synth).
-  *`MakeArrayV` doesn't build a flat struct array from constructor elements.*
+- **F-4 · flat `array<PodStruct>` literal** `[P(a), P(b)]` (synth). ✅ DONE
+  (2026-07-11). Removed the `MakeArrayV` `flat_s` bail: each `P(..)` element
+  already lowers to a `StructCtorV` (a POD `StructObject`), and
+  `build_array_from_values` packs a run of same-type POD structs into flat
+  mode-5 storage VALUE-DRIVEN (the def comes off the first element, so the op
+  needs no def). Also relaxed the `StructCtorV` arg gate to accept a scalar
+  LITERAL (not only a `th`-stamped operand) so an AUTO-CONST-folded arg
+  (`var a=1; [P(a,a)]`, whose folded literal has no `th`) lowers too.
+  **⚠ TRACKED REGRESSION:** `77_struct_array_lit` (a struct-array literal in a
+  hot loop) is VM **1.20x SLOWER** than the tree-walker - the tree-walker's
+  `LiteralArray::do_eval` is already an optimal single dispatch (mode-5
+  packing), so splitting it into `StructCtorV`×N + `MakeArrayV` + the temp-slot
+  round-trip just adds op dispatch. NOT a foundational miss (the ops are
+  AST-free, no gratuitous box/unbox - unlike the reverted foreach), and it is
+  required for the zero-fallback serialization goal. No EXISTING bench regresses
+  (F-4 fires only on struct-array literals; broad geomean unchanged at 0.52x).
+  **Erasing follow-up:** a fused `MakeStructArrayV` op that coerces the ctor
+  field-args STRAIGHT into the flat buffer (no intermediate `StructObject`s, the
+  `EmplaceStruct` pattern) would be FASTER than the tree-walker - deferred.
 - **F-5 · reflection builtins** `show`/`type`/`typestr`/`decltype` as a
   NON-folded runtime call (synth `typestr(n)`). *INHERENT - an AST builtin with
   an unevaluated operand; the one construct that genuinely needs the node.*

@@ -3111,8 +3111,20 @@ register run (the same contiguous-run pattern native calls use for args, via
 **`build_array_from_values`** core — flat (int/float/bool) or general per the
 `ArrHint` carried in `target2`, box-free, never throwing (so `node`-free) — and
 is retargeted straight into the lvalue slot for `var a = [..]` (no `MoveV`). A
-flat STRUCT-array literal (`ArrHint::flat_s`) stays fallback (its ctor elements
-don't lower, and the def isn't in the op). So a per-iteration array literal
+**flat STRUCT-array literal** `[P(a,b), P(c,d)]` (`ArrHint::flat_s`, F-4) lowers
+too: each `P(..)` element compiles to a `StructCtorV` (a POD `StructObject`) and
+`build_array_from_values` packs a run of same-type POD structs into flat mode-5
+storage VALUE-DRIVEN (the def comes off the first element, so the op carries no
+def). The `StructCtorV` arg gate accepts a scalar LITERAL (not only a
+`th`-stamped operand), so an auto-const-folded arg (`var a=1; [P(a,a)]`, whose
+folded literal has no `th`) lowers as well. **⚠ Tracked regression:**
+`77_struct_array_lit` (a struct-array literal in a hot loop) is VM ~1.2x slower
+than the tree-walker's already-optimal single-dispatch `LiteralArray::do_eval`
+(splitting into N `StructCtorV` + `MakeArrayV` + a temp-slot round-trip adds
+dispatch) — AST-free and needed for the zero-fallback endgame; a fused
+`MakeStructArrayV` (coerce ctor args straight into the flat buffer, no
+intermediate `StructObject`s — the `EmplaceStruct` pattern) would erase it.
+So a per-iteration array literal
 (`22_multi_assign` 1.05x→0.89x; matrix/sieve/wordcount) no longer falls back to
 `EvalStmt`. A **dict LITERAL** `{k0: v0, ..}` is the twin **`MakeDictV`**: the
 key/value pairs compile INTERLEAVED into the run (`[k0,v0,k1,v1,..]`, key at

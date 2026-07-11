@@ -6486,6 +6486,52 @@ static const std::vector<test> tests =
     },
 
     {
+        /* F-4: a flat array<PodStruct> LITERAL `[P(a,b), ..]` with non-const
+         * ctor args -> MakeArrayV (each P(..) a StructCtorV; the array packs the
+         * POD structs into flat mode-5 storage value-driven). The differential
+         * reruns under -vm. */
+        "Flat struct array literal (non-const args)",
+        {
+            "struct P { int x; int y; }",
+            "func mk(n) { return [P(n, n * 2), P(n + 1, n * 2 + 1)]; }",
+            "var arr = mk(7);",
+            "assert(array_storage(arr) == \"struct\");",
+            "assert(arr[0].x == 7 && arr[0].y == 14);",
+            "assert(arr[1].x == 8 && arr[1].y == 15);",
+        },
+    },
+
+    {
+        /* F-4: the auto-const-var-arg case - `var a=1` is folded AFTER inference,
+         * so its literal has no `th`; the StructCtorV gate accepts a scalar
+         * literal so `[P(a,a), ..]` still lowers (mirrors const args). */
+        "Flat struct array literal with auto-const args",
+        {
+            "struct P { int x; int y; }",
+            "var a = 5;",
+            "var b = 10;",
+            "var arr = [P(a, b), P(a + 1, b + 1), P(a + 2, b + 2)];",
+            "assert(array_storage(arr) == \"struct\");",
+            "assert(arr[2].x == 7 && arr[2].y == 12);",
+        },
+    },
+
+    {
+        /* F-4: a per-iteration flat struct array literal in a loop stays a fresh
+         * flat array each iteration (no leak), field access correct. */
+        "Flat struct array literal built in a loop",
+        {
+            "struct P { int x; int y; }",
+            "var tot = 0;",
+            "for (var i = 0; i < 4; i++) {",
+            "    var row = [P(i, i), P(i * 2, i * 2)];",
+            "    tot += row[0].x + row[1].x;",
+            "}",
+            "assert(tot == 18);",   /* sum i + 2i = 3i for i=0..3 = 18 */
+        },
+    },
+
+    {
         /* native const-literal materialization (VM LoadLiteralObjV): a mutable
          * `var` literal is a FRESH deep copy each eval (so a loop's per-iter
          * mutation never leaks), a `const` shares the deep read-only value.
