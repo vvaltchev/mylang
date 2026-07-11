@@ -776,12 +776,14 @@ static void comparator_heapsort(Vec &vec, Cmp cmp)
  * non-lvalue arg0) - used to sort a const's COPY (is_const_var) and to write a
  * sorted SLICE back to its parent slot. Shared by the tree-walker/const-eval
  * `func` (sort_arr, which eval's arg0) and the VM's `func_lv` (sort_lv, handed
- * the slot's LValue* by CallBuiltinLV). The cmp arg (arg1) is self-eval'd off
- * exprList in both paths.
+ * the slot's LValue* by CallBuiltinLV). The cmp arg (arg1) is the pre-evaluated
+ * `rest[0]` for a REST-NATIVE VM call (no node->eval), else self-eval'd off
+ * exprList (`rest == nullptr`: the tree-walker). `rest` outlives this call (the
+ * caller's stackbuf / register run), so the cmp FuncObject stays alive.
  */
 static EvalValue
 sort_core(EvalContext *ctx, ExprList *exprList, EvalValue val0, LValue *lval,
-          bool reverse)
+          bool reverse, const EvalValue *rest = nullptr)
 {
     if (exprList->elems.size() == 0)
         throw InvalidArgumentEx(exprList->start, exprList->end);
@@ -874,7 +876,10 @@ sort_core(EvalContext *ctx, ExprList *exprList, EvalValue val0, LValue *lval,
     } else {
 
         Construct *arg1 = exprList->elems[1].get();
-        const EvalValue &val1 = RValue(arg1->eval(ctx));
+        EvalValue self_cmp;
+        if (!rest)
+            self_cmp = RValue(arg1->eval(ctx));
+        const EvalValue &val1 = rest ? rest[0] : self_cmp;
 
         if (!val1.is<intrusive_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
@@ -944,14 +949,16 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 }
 
 /* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* is handed in (never
- * null - CallBuiltinLV fires only for a slotted-id arg0). rest is unused: the
- * cmp arg self-evals off exprList like the tree-walker. */
+ * null - CallBuiltinLV fires only for a slotted-id arg0). sort is REST-NATIVE-
+ * CAPABLE: the cmp arg is pre-evaluated in `rest[0]` (n_rest == 1) so sort_core
+ * does zero node->eval; a `sort(a)` with no cmp has an empty rest run (n_rest ==
+ * 0), which sort_core's no-cmp branch never reads. */
 static EvalValue
 sort_lv(EvalContext *ctx, ExprList *exprList, LValue *target,
         const EvalValue *rest, size_t n_rest, bool reverse)
 {
     return sort_core(ctx, exprList, RValue(EvalValue(target)), target,
-                     reverse);
+                     reverse, rest);
 }
 
 EvalValue builtin_sort(EvalContext *ctx, ExprList *exprList)

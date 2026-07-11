@@ -152,16 +152,19 @@ static bool is_lvalue_rest_native_builtin(std::string_view name)
 }
 
 /*
- * A REST-NATIVE-CAPABLE mutating builtin (append/push): its single value arg CAN
- * be pre-evaluated, but only in the PLAIN case (the ctor case is EmplaceStruct,
- * the subscript-target case is CallBuiltinLVElem). So the codegen decides PER-OP
- * whether to compile the value into a rest run (see lvalue_rest_capable). NOT in
- * this set: insert/erase (rest-native ALWAYS), pop/intptr (no value args),
- * sort/reverse (their cmp arg is self-eval'd off the node).
+ * A REST-NATIVE-CAPABLE mutating builtin: its value arg(s) CAN be pre-evaluated,
+ * but the codegen decides PER-OP whether to (see lvalue_rest_capable). Two here:
+ *   - append/push: the single value, PLAIN case only (the ctor case is
+ *     EmplaceStruct, the subscript-target case is CallBuiltinLVElem).
+ *   - sort/rev_sort: the OPTIONAL cmp arg - pre-evaluated into rest[0] (an empty
+ *     run for the no-cmp `sort(a)`); sort_core uses rest instead of node->eval.
+ * NOT here: insert/erase (rest-native ALWAYS), pop/intptr/reverse (no value
+ * args - they hold the node only for carets, freed later by func_lv->ArgLocs).
  */
 static bool is_lvalue_rest_capable_builtin(std::string_view name)
 {
-    return name == "append" || name == "push";
+    return name == "append" || name == "push"
+        || name == "sort" || name == "rev_sort";
 }
 
 /*
