@@ -1951,6 +1951,43 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::UnaryV: {
+            /* Boxed unary over a dyn/general operand - mirrors Expr02::do_eval
+             * (clone the operand, apply). `-str`/`~str` throw a type error via
+             * the Type vtable -> stamp the loc side table. */
+            EvalValue s;
+            EvalValue v = boxed_operand(in.a, &ctx, s).clone();
+            try {
+                switch (in.aop) {
+                case Op::plus:
+                    if (v.is<bool>())
+                        v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+                    break;
+                case Op::minus:
+                    if (v.is<bool>())
+                        v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+                    v.get_type()->opneg(v);
+                    break;
+                case Op::lnot:
+                    v = EvalValue(!v.is_true());
+                    break;
+                case Op::bnot:
+                    if (v.is<bool>())
+                        v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+                    v.get_type()->bnot(v);
+                    break;
+                default:
+                    throw InternalErrorEx();
+                }
+            } catch (Exception &e) {
+                vm_stamp_loc(chunk, pc, e);
+                throw;
+            }
+            ctx.frame->at(in.target).put(std::move(v));
+            pc++;
+            break;
+        }
+
         case OpCode::LoadGlobalV:
             /* AST-free: the hot read is a gfuncs slot; the cold undefined
              * error takes its NAME from gfuncs's slot->name list and its loc

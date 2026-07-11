@@ -751,6 +751,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.a, false) << " " << opsym(in.aop) << " "
                 << RI(in.b, false) << "   ; boxed";
             break;
+        case OpCode::UnaryV:
+            row << "unary.v      " << D(in.target) << " = "
+                << opsym(in.aop) << RI(in.a, false) << "   ; boxed";
+            break;
         case OpCode::LoadGlobalV:
             /* AST-free: the global name lives in gfuncs, not the chunk, so a
              * disassembly shows the global slot (g<n>). */

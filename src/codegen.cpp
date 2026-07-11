@@ -1116,6 +1116,35 @@ struct Codegen {
             return k && emit_boxed_chain(t->elems, k, e, out_slot, ops);
         }
         char k = 0;
+        /* Boxed UNARY (`!x`/`-x`/`~x`/`+x`) over a dyn/general operand -> UnaryV
+         * (a typed int/float unary is the M8 path at the top). Expr02 is a
+         * MultiOpConstruct with a single (op, operand): op==invalid is just the
+         * operand (compile it), else the unary op. */
+        if (const Expr02 *u = dynamic_cast<const Expr02 *>(e)) {
+            if (u->elems.size() != 1)
+                return false;
+            const Op op = u->elems[0].first;
+            const Construct *operand = u->elems[0].second.get();
+            if (op == Op::invalid)
+                return compile_boxed_expr(operand, out_slot, ops);
+            if (op != Op::lnot && op != Op::minus && op != Op::bnot
+                && op != Op::plus)
+                return false;
+            int oslot;
+            if (!compile_boxed_expr(operand, oslot, ops))
+                return false;
+            const int t = alloc_temp();
+            Instr in;
+            in.op = OpCode::UnaryV;
+            in.node_idx = add_ast_node(e);   /* loc for a `-str`/`~str` error */
+            in.target = t;
+            in.a = slot_op(oslot);
+            in.aop = op;
+            ops.push_back(in);
+            out_slot = t;
+            return true;
+        }
+
         if (dynamic_cast<const Expr03 *>(e) || dynamic_cast<const Expr04 *>(e)
             || dynamic_cast<const Expr05 *>(e)
             || dynamic_cast<const Expr08 *>(e)
@@ -4490,6 +4519,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::BinOpV:
         case OpCode::CompoundV:
         case OpCode::CmpV:
+        case OpCode::UnaryV:         /* node = operand expr (`-str`/`~str` caret) */
         case OpCode::LoadGlobalV:
         case OpCode::CallValueV:
         case OpCode::UnpackElemInt:

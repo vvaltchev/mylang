@@ -524,6 +524,18 @@ enum class OpCode : unsigned char {
     LogV,
 
     /*
+     * Boxed UNARY op `dst = <unaryop> a` for a dyn/general operand (the typed
+     * int/float unary is the M8 TypedScalarExpr path). `a` = the operand
+     * (slot/immediate), `aop` = the unary Op: `lnot` (`!` -> !is_true(), a bool),
+     * `minus` (`-` -> opneg, a bool promotes to int), `bnot` (`~` -> bitwise not,
+     * bool->int), `plus` (`+` -> bool->int else no-op). Mirrors Expr02::do_eval
+     * (clone the operand, apply). Type errors (`-str`, `~str`) stamp the loc
+     * side table. This is what an `if (!x)` / `var b = !s` over a dyn/string
+     * operand lowers to (was a JumpIfFalse / EvalToSlot fallback).
+     */
+    UnaryV,
+
+    /*
      * Boxed NON-LOCAL leaf loads (the boxed path's operand can be a global /
      * captured / builtin value, not only a resolved-local slot): read the value
      * into a temp `target` from `target2` = the table index. Mirror

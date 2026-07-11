@@ -244,8 +244,17 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
   isn't fully AOT yet; once it is (see *THE AOT / ZERO-FALLBACK ENDGAME* below)
   none are reachable and the opcodes are deleted. Current live emitters (all
   fixable, not fundamental):
-  - `JumpIfFalse` — a unary-`!` condition (`if (!x)`): `compile_boxed_expr`
-    doesn't lower Expr02. Nativize it (boxed `!` → a slot + `JumpUnlessTrueV`).
+  - `JumpIfFalse` — **DONE (a `!x` condition is now native).** A unary op over a
+    dyn/general operand (`!x`, `-x`, `~x`, `+x`) now lowers to a boxed
+    **`UnaryV`** op (`compile_boxed_expr` handles `Expr02`), so `if (!x)` is
+    `unary.v r = !x` + `jmp.ifnot.v` (native) and `var b = !x` is `unary.v` +
+    `move` — no `JumpIfFalse` / `EvalToSlot`. Verified: no `!x` condition emits
+    `JumpIfFalse` in any bench/sample; `-str`/`~str` type-error carets +
+    backtraces are byte-identical between engines. The `JumpIfFalse` op still
+    has OTHER emitters (a fallback body drags its loop's condition to the
+    fallback form — e.g. `array<bool>` element ops in the sieve, a `for` with a
+    `return` in its body); those are the array/loop nativization items, not a
+    `!x` gap.
   - `EvalToSlot` — an AST builtin (`defined`/`isconst`/`type`/`decltype`/
     `typestr`/`kindstr`) in a scalar-expression position. These are COMPILE-TIME
     ONLY: with full AOT inference they fold to a literal (a script is a closed
@@ -300,8 +309,9 @@ front-end + compilation-model:
    special-casing.
 5. **AST builtins fold away (see the EvalToSlot bullet above)** — they are
    compile-time-only and must be literals before codegen under full AOT.
-Order: (a) `!x` nativization; (b) close the AST-builtin fold gap → EvalToSlot
-unreachable; (c) AOT chunk compilation (all upfront, `-vd` off the chunk set);
+Order: (a) `!x` nativization **[DONE — boxed `UnaryV`]**; (b) close the
+AST-builtin fold gap → EvalToSlot unreachable; (c) AOT chunk compilation (all
+upfront, `-vd` off the chunk set);
 (d) first-class `dyn` instances + the `int OP dyn`→concrete inference rule;
 (e) audit each fallback op is unemitted, then DELETE + abort-guard. Each step
 `-rt` (differential) + samples byte-identical.
