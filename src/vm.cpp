@@ -164,6 +164,23 @@ vm_store_base(EvalContext &ctx, int kind, int slot,
     return &ctx.frame->at(slot);                /* local */
 }
 
+/* Map a flat-store's BASE arith op (Op::invalid = plain, else plus/minus/…) to
+ * the Expr14 op vm_subscript_store expects (Op::assign / addeq / …) - the
+ * StoreElem* universal fallback boxes its operands and dispatches through the
+ * shared store, which uses the Expr14 op convention (like DictStore). */
+static inline Op vm_base_to_expr14_op(Op base)
+{
+    switch (base) {
+    case Op::invalid: return Op::assign;
+    case Op::plus:    return Op::addeq;
+    case Op::minus:   return Op::subeq;
+    case Op::times:   return Op::muleq;
+    case Op::div:     return Op::diveq;
+    case Op::mod:     return Op::modeq;
+    default:          return Op::assign;
+    }
+}
+
 /* The two STRICT foreach-unpack errors (UnpackElem*), matching do_iter's
  * messages + loc (the container's, from the loc side table) BYTE-for-byte, so
  * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. */
@@ -1153,11 +1170,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * for a flat bool array (P1: plain assign only - no compound
              * for bool; the value operand is the bool's 0/1, written to bvec).
              * Anything else (const / read-only / general / float / dyn, or a
-             * COMPOUND on a bool array) falls back to node - sound because a
-             * compiled rvalue is side-effect-free, so re-eval is exact. The base
-             * may be a global/capture array (in.target = the slot kind). */
+             * COMPOUND on a bool array) takes the UNIVERSAL vm_subscript_store
+             * fallback (box the already-computed index/value operands, map the
+             * base op back to its Expr14 op) - AST-free and byte-identical to
+             * the tree-walker (the same path StoreElemValue uses). The base may
+             * be a global/capture array (in.target = the slot kind); the caret
+             * comes from the loc side table. */
+            Loc ls, le;
+            chunk.loc_at(pc, ls, le);
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 const auto sk = arr.skind();
@@ -1169,12 +1191,12 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        throw OutOfBoundsEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
+                        throw OutOfBoundsEx(ls, le);
                     const int_type rhs = read_int_operand(in.b, &ctx);
                     /* div/mod by zero throws BEFORE any clone (tree-walker
                      * throws during the op eval, before the COW). */
                     if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0)
-                        throw DivisionByZeroEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
+                        throw DivisionByZeroEx(ls, le);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
@@ -1200,15 +1222,19 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     break;
                 }
             }
-            chunk.node_at(in.node_idx)->eval(&ctx);
+            vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
+                               EvalValue(read_int_operand(in.b, &ctx)),
+                               vm_base_to_expr14_op(in.aop), ls, le);
             pc++;
             break;
         }
 
         case OpCode::StoreElemFloat: {
 
+            Loc ls, le;
+            chunk.loc_at(pc, ls, le);
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::floats
@@ -1217,10 +1243,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        throw OutOfBoundsEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
+                        throw OutOfBoundsEx(ls, le);
                     const float_type rhs = read_float_operand(in.b, &ctx);
                     if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0.0)
-                        throw DivisionByZeroEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
+                        throw DivisionByZeroEx(ls, le);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
@@ -1240,7 +1266,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     break;
                 }
             }
-            chunk.node_at(in.node_idx)->eval(&ctx);
+            vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
+                               EvalValue(read_float_operand(in.b, &ctx)),
+                               vm_base_to_expr14_op(in.aop), ls, le);
             pc++;
             break;
         }

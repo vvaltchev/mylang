@@ -219,19 +219,24 @@ enum class OpCode : unsigned char {
      * Native array-element store `a[i] = v` / `a[i] OP= v` (Phase 5): `target2`
      * = the array slot, `a` = the int index operand, `b` = the value operand,
      * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith
-     * op: a[i] = a[i] <aop> v), `node` = the Expr14 (loc/fallback). For a FLAT
-     * mutable int/float array it stores/updates the scalar directly, mirroring
-     * try_flat_subscript_store (bounds, negative wrap, div/mod-by-zero checked
-     * BEFORE any clone like the tree-walker, COW: a slice clones, an aliased
-     * non-slice clones its live slices; then invalidate the hash). A flat
-     * BOOL array is handled too (P1), PLAIN-assign only (`aop == invalid`) -
-     * bool has no compound - writing the value operand's 0/1 to bvec.
-     * For a const/read-only / general / float-in-StoreElemInt / dyn-laundered
-     * base, or a compound on a bool array, falls back to `node->eval` - SOUND
-     * because a compiled rvalue has no side effects, so re-evaluating it is
-     * exact. Value ops are emitted before the index ops so a both-throw case
-     * matches the tree-walker (rhs before index). Int / float value variants
-     * (the int variant carries bool arrays too; LoadElemInt reads them).
+     * op: a[i] = a[i] <aop> v). For a FLAT mutable int/float array it
+     * stores/updates the scalar directly, mirroring try_flat_subscript_store
+     * (bounds, negative wrap, div/mod-by-zero checked BEFORE any clone like the
+     * tree-walker, COW: a slice clones, an aliased non-slice clones its live
+     * slices; then invalidate the hash). A flat BOOL array is handled too (P1),
+     * PLAIN-assign only (`aop == invalid`) - bool has no compound - writing the
+     * value operand's 0/1 to bvec. For a const/read-only / general /
+     * float-in-StoreElemInt / dyn-laundered base, or a compound on a bool array,
+     * it BOXES the already-computed index/value operands and dispatches through
+     * the UNIVERSAL vm_subscript_store (the same shared store StoreElemValue /
+     * DictStore use, mapping the base op back to its Expr14 op) - AST-FREE and
+     * byte-identical to the tree-walker's flat->general path. So NO node: the
+     * OOB/div0 caret comes from the loc side table (the Expr14 loc - the same
+     * single loc the pre-AST-free op recorded; OOB's narrower subscript caret in
+     * the tree-walker is a pre-existing single-loc limitation). Value ops are
+     * emitted before the index ops so a both-throw case matches the tree-walker
+     * (rhs before index). Int / float value variants (the int variant carries
+     * bool arrays too; LoadElemInt reads them).
      */
     StoreElemInt,
     StoreElemFloat,

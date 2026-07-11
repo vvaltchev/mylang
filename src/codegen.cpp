@@ -4459,6 +4459,8 @@ static void extract_locs(Chunk &chunk)
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
+        case OpCode::StoreElemInt:   /* node = the Expr14 (OOB/div0 + store caret) */
+        case OpCode::StoreElemFloat:
         case OpCode::CheckFuncV:     /* node = arg0 (Expected-function caret) */
         case OpCode::MapFilterV:     /* node = arg1 (unsupported-container caret) */
         case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
@@ -4510,8 +4512,6 @@ static void extract_locs(Chunk &chunk)
         case OpCode::CallBuiltinLV:
         case OpCode::CallBuiltinLVElem:
         case OpCode::EmplaceStruct:
-        case OpCode::StoreElemInt:
-        case OpCode::StoreElemFloat:
             break;
         default:
             in.node_idx = -1;
