@@ -1873,11 +1873,14 @@ struct Codegen {
 
         const Construct *a0 = dc->args->elems[0].get();
 
-        /* 2c: a SUBSCRIPT lvalue target `append/push/pop(a[i], ...)` (self-eval
-         * only - not rest-native). Compile the index natively; the element's
-         * LValue* is formed at runtime by Type::subscript (reuses the tree-
-         * walker's exact COW). Needs a slotted-id base + a compilable index; a
-         * nested base / rest-native builtin falls through to EvalToSlot. */
+        /* 2c: a SUBSCRIPT lvalue target `append/push/pop(a[i], ...)`. Compile
+         * [index, value args...] into a CONTIGUOUS run (REST-NATIVE: the
+         * element's LValue* is formed at runtime by Type::subscript - the tree-
+         * walker's exact COW - then func_lv gets the value via rest, no
+         * self-eval): `b` = the run base, run[0] = the index, run[1..] = the
+         * values (append/push have 1, pop has 0). Needs a slotted-id base + all
+         * args to lower; a nested base / non-lowerable arg falls through to
+         * EvalToSlot. */
         if (!dc->lvalue_rest_native && !a0->is_id()) {
             if (auto *sub = dynamic_cast<const Subscript *>(a0)) {
                 const Construct *base = sub->what.get();
@@ -1889,21 +1892,37 @@ struct Codegen {
                     case SymKind::capture: bkind = 2; break;
                     default: break;
                     }
-                int idxslot;
-                if (bkind >= 0 &&
-                    compile_boxed_expr(sub->index.get(), idxslot, ops)) {
-                    const int dst = alloc_temp();
-                    Instr cv;
-                    cv.op = OpCode::CallBuiltinLVElem;
-                    cv.node_idx = add_ast_node(dc);
-                    cv.target = dst;
-                    cv.target2 =
-                        static_cast<const Identifier *>(base)->sym.slot;
-                    cv.a = int_lit(bkind);
-                    cv.b = slot_op(idxslot);
-                    ops.push_back(cv);
-                    out_slot = dst;
-                    return true;
+                if (bkind >= 0) {
+                    const int nvals =
+                        static_cast<int>(dc->args->elems.size()) - 1;
+                    const size_t mark = ops.size();
+                    const int save_top = next_temp;
+                    const int runbase = next_temp;
+                    next_temp += 1 + nvals;
+                    if (next_temp > max_temp)
+                        max_temp = next_temp;
+                    bool ok =
+                        compile_to_run_slot(sub->index.get(), runbase, ops);
+                    for (int i = 0; ok && i < nvals; i++)
+                        ok = compile_to_run_slot(
+                            dc->args->elems[1 + i].get(),
+                            runbase + 1 + i, ops);
+                    if (ok) {
+                        const int dst = alloc_temp();
+                        Instr cv;
+                        cv.op = OpCode::CallBuiltinLVElem;
+                        cv.node_idx = add_ast_node(dc);
+                        cv.target = dst;
+                        cv.target2 =
+                            static_cast<const Identifier *>(base)->sym.slot;
+                        cv.a = int_lit(bkind);
+                        cv.b = int_lit(runbase);
+                        ops.push_back(cv);
+                        out_slot = dst;
+                        return true;
+                    }
+                    ops.resize(mark);
+                    next_temp = save_top;
                 }
             }
         }
@@ -1970,17 +1989,21 @@ struct Codegen {
                 return false;   /* a rest arg didn't lower -> fall back */
             rest_op = true;
         } else if (dc->lvalue_rest_capable) {
-            /* Pre-evaluate the value PER-OP - EXCEPT when arg1 is a struct ctor
-             * whose EmplaceStruct fell through (a field didn't lower): keep it
-             * self-eval so the tree-walker's construct-in-place still fires (the
-             * VM's CallBuiltinLV self-eval path calls try_construct_into_struct_
-             * array). emit_args_range self-rolls-back, so a non-lowerable value
-             * just leaves rest_op false -> self-eval. */
+            /* Pre-evaluate the value(s) PER-OP. A rest-capable builtin
+             * (append/push/sort/rev_sort) must NEVER become a self-eval
+             * CallBuiltinLV - its func_lv is rest-native-only (no node). So two
+             * cases fall back to the tree-walker (EvalToSlot) instead: (a) arg1
+             * is a struct ctor whose EmplaceStruct fell through - append_tw does
+             * the construct-in-place there; (b) a value/cmp that doesn't lower to
+             * a register run. Otherwise it's rest-native. */
             auto *ctor = dc->args->elems.size() == 2
                 ? dynamic_cast<const CallExpr *>(dc->args->elems[1].get())
                 : nullptr;
-            if (!(ctor && ctor->vm_struct_ctor_def))
-                rest_op = emit_args_range(dc->args->elems, restbase, ops, 1);
+            if (ctor && ctor->vm_struct_ctor_def)
+                return false;   /* ctor-fallthrough -> EvalToSlot (append_tw) */
+            if (!emit_args_range(dc->args->elems, restbase, ops, 1))
+                return false;   /* didn't lower -> EvalToSlot (no self-eval) */
+            rest_op = true;
         }
 
         const int dst = alloc_temp();

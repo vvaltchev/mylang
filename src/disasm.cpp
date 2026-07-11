@@ -642,13 +642,23 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             cmt(row, chunk.node_at(in.node_idx));
             break;
         }
-        case OpCode::CallBuiltinLVElem:
-            row << "call.blt.lve " << D(in.target) << " = "
-                << callee_name(chunk.node_at(in.node_idx)) << "("
-                << lval_ref(in.a.lit, in.target2) << "[" << RI(in.b, false)
-                << "], ...)";
+        case OpCode::CallBuiltinLVElem: {
+            /* `b` = the run base: run[0] = the index, run[1..] = the value args
+             * (append/push 1, pop 0). */
+            const auto *dc = static_cast<const DirectBuiltinCallExpr *>(
+                chunk.node_at(in.node_idx));
+            const int nvals =
+                dc && dc->args
+                    ? static_cast<int>(dc->args->elems.size()) - 1 : 0;
+            row << "call.blt.lve " << D(in.target) << " = " << callee_name(dc)
+                << "(" << lval_ref(in.a.lit, in.target2) << "["
+                << reg(chunk, in.b.lit) << "]";
+            for (int i = 0; i < nvals; i++)
+                row << ", " << reg(chunk, in.b.lit + 1 + i);
+            row << ")";
             cmt(row, chunk.node_at(in.node_idx));
             break;
+        }
         case OpCode::CallV:
             /* AST-free: the callee is a global slot (its name lives in gfuncs,
              * not the chunk), so show g<n>. */

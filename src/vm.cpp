@@ -1679,7 +1679,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * form the base's LValue* (by kind), then the ELEMENT's LValue* via
              * the runtime Type::subscript - the SAME COW path the tree-walker's
              * Subscript::do_eval uses, given the identical base LValue* - and
-             * call func_lv (which self-evaluates its remaining args). A
+             * call func_lv REST-NATIVE. `b` = the run base: run[0] = the index,
+             * run[1..] = the pre-evaluated value args (append/push 1, pop 0). A
              * non-lvalue element (a flat scalar / read-only / missing dict key,
              * which throws) gives a null target -> NotLValueEx, like the
              * tree-walker. */
@@ -1693,19 +1694,25 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             default: base = &(*ctx.captures)[in.target2]; break;
             }
             const Construct *sub = dc->args->elems[0].get();
+            const int_type n_rest =
+                static_cast<int_type>(dc->args->elems.size()) - 1;
             try {
                 EvalValue holder;   /* keeps the subscript result alive */
                 LValue *elem = nullptr;
                 if (base) {
-                    const EvalValue &idx = ctx.frame->at(in.b.slot).get();
+                    const EvalValue &idx = ctx.frame->at(in.b.lit).get();
                     holder = base->get().get_type()->subscript(
                         EvalValue(base), idx, /*for_write=*/false);
                     if (holder.is<LValue *>())
                         elem = holder.get<LValue *>();
                 }
+                EvalValue restbuf[8];   /* n_rest is small (append 1, pop 0) */
+                for (int_type i = 0; i < n_rest; i++)
+                    restbuf[i] = ctx.frame->at(in.b.lit + 1 + i).get();
                 ctx.frame->at(in.target).put(
                     dc->builtin.func_lv(&ctx, dc->args.get(), elem,
-                                        nullptr, 0));
+                                        n_rest ? restbuf : nullptr,
+                                        static_cast<size_t>(n_rest)));
             } catch (Exception &e) {
                 if (!e.loc_start) {
                     e.loc_start = sub->start;
