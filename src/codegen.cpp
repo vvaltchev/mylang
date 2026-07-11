@@ -4477,6 +4477,19 @@ struct Codegen {
             if (try_native_throw(th, chunk.code))
                 return;
         }
+        /* A standalone braced block `{ ... }` statement: a SCOPE-FREE block runs
+         * its statements directly in the current context (no child EvalContext -
+         * every decl is a frame slot), exactly like an if/loop body, so compile
+         * them into this chunk (each still natively or per-statement fallback).
+         * A non-scope-free block (a capture / nested func / slot-overflow decl)
+         * needs its own context, which vm_run_chunk doesn't build, so it falls
+         * back. Matches the tree-walker's Block::do_eval scope-free path. */
+        if (const Block *blk = dynamic_cast<const Block *>(s)) {
+            if (blk->scope_free) {
+                gen_stmts(blk->elems);
+                return;
+            }
+        }
         emit(OpCode::EvalStmt, s);
     }
 
