@@ -1500,6 +1500,9 @@ void Inferencer::annotate_hints(Construct *n)
                 } else if (!el->opt && el->kind == StaticTypeKind::Float) {
                     fe->elem_th = TypeHint::f;          /* flat float path */
                     fe->container_is_array = true;
+                } else if (!el->opt && el->kind == StaticTypeKind::Bool) {
+                    fe->elem_is_bool = true;            /* flat bool -> LoadElemBool */
+                    fe->container_is_array = true;
                 } else if (el->kind == StaticTypeKind::Str
                         || el->kind == StaticTypeKind::Array
                         || el->kind == StaticTypeKind::Dict

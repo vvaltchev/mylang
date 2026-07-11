@@ -422,6 +422,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "load.elem.f  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";
             break;
+        case OpCode::LoadElemBool:
+            row << "load.elem.b  " << D(in.target) << " = " << D(in.target2)
+                << "[" << RI(in.a, false) << "]   ; bool";
+            break;
         case OpCode::LoadElemValue:
             row << "load.elem.v  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";

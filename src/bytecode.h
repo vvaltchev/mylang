@@ -114,6 +114,17 @@ enum class OpCode : unsigned char {
     LoadElemFloat,
 
     /*
+     * Native flat-`array<bool>` element read `a[i]` into the loop var as a real
+     * BOOL (the bool-foreach analogue of LoadElemInt/Float): `target2` = the
+     * array slot, `a` = the int index/counter, `target` = the loop var slot.
+     * Reads `flat_bools()[offset + i]` and binds `EvalValue(bool)` - so the loop
+     * var is a bool, matching the tree-walker (`print(x)` -> true/false, not
+     * 1/0). `i` is loop-bounded (< ArrLen), so no bounds check; the base is a
+     * proven flat bool array (elem_is_bool), so no type dispatch.
+     */
+    LoadElemBool,
+
+    /*
      * Array length into an int slot: slot[target] = size(slot[target2]). The
      * native-foreach loop bound over a flat array, evaluated once. `target2`
      * holds a flat array (guaranteed by ForeachStmt::elem_th), so it reads

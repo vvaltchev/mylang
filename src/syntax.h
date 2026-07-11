@@ -1591,6 +1591,10 @@ public:
      * the sound case: a single, non-indexed loop var over a flat array<int> /
      * array<float>). `none` -> the VM iterates via the tree-walker fallback. */
     TypeHint elem_th = TypeHint::none;
+    /* Set by the inferencer for a proven flat `array<bool>` element: the loop
+     * var is read as a real BOOL via LoadElemBool (distinct from elem_th i/f -
+     * a bool must bind as bool, not 0/1). Rides `container_is_array`. */
+    bool elem_is_bool = false;
     /* Set by the inferencer for a single, non-indexed loop var over a proven
      * array with a GENERAL element (str/array/dict/dyn) OR a flat int/float
      * (elem_th i/f). A general element goes native via LoadElemValue (bind the
@@ -1654,6 +1658,7 @@ public:
         c->indexed = indexed;
         c->elem_th = elem_th;
         c->container_is_array = container_is_array;
+        c->elem_is_bool = elem_is_bool;
         c->container_is_str = container_is_str;
         c->container_is_dict = container_is_dict;
         c->container_is_dyn = container_is_dyn;

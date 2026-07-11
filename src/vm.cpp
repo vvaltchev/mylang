@@ -1000,6 +1000,22 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::LoadElemBool: {
+            /* bool-foreach loop var: bind a[i] as a real BOOL (not 0/1), so
+             * `print(x)` shows true/false. `i` is loop-bounded (< ArrLen); the
+             * base is a proven flat array<bool> (elem_is_bool). */
+            const SharedArrayObj &arr =
+                ctx.frame->at(in.target2).get().get_ref<SharedArrayObj>();
+            const int_type idx = read_int_operand(in.a, &ctx);
+            const bool b =
+                arr.skind() == SharedArrayObj::Storage::bools
+                    ? arr.flat_bools()[arr.offset() + idx] != 0
+                    : arr.get_view()[idx].get().get<bool>();  /* general fallbk */
+            ctx.frame->at(in.target).put(EvalValue(b));
+            pc++;
+            break;
+        }
+
         case OpCode::LoadElemValue: {
 
             /* a[i] (an array-valued element of a GENERAL array) into a temp

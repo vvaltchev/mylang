@@ -3902,6 +3902,7 @@ struct Codegen {
         Instr ld;
         ld.op = fe->elem_th == TypeHint::i ? OpCode::LoadElemInt
               : fe->elem_th == TypeHint::f ? OpCode::LoadElemFloat
+              : fe->elem_is_bool           ? OpCode::LoadElemBool
                                            : OpCode::LoadElemValue;
         ld.node_idx = add_ast_node(fe->container.get());
         ld.target = x_slot;

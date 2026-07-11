@@ -2778,6 +2778,19 @@ static const std::vector<test> tests =
         "  if (c == \"o\") { break; }",
         "  r = r + c; }",
         "assert(r == \"he\");" } },
+    /* Native `array<bool>` foreach (LoadElemBool): the loop var binds a real
+     * BOOL (not 0/1), so `str(x)` is "true"/"false" and `x == true` holds.
+     * Single-var + indexed, both engines (differential). */
+    { "foreach over an array<bool> binds real bools",
+      { "var a = [true, false, true];",
+        "var c = 0; var s = \"\";",
+        "foreach (var x in a) { if (x) { c = c + 1; } s = s + str(x); }",
+        "assert(c == 2);",
+        "assert(s == \"truefalsetrue\");",
+        "var r = \"\";",
+        "foreach (var i, x in indexed [false, true]) {",
+        "  r = r + str(i) + str(x); }",
+        "assert(r == \"0false1true\");" } },
     { "member access on a non-dict is a type error",
       { "var x = 5; var y = x.foo;" }, &typeid(TypeMismatchEx) },
     { "duplicate declaration in the same block is rejected",
