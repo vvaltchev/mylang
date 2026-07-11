@@ -188,6 +188,57 @@ the loc table (removes `StoreElemInt`/`Float` from the pool), and the builtin op
 to a by-name + arg-loc encoding (removes their `ExprList` need) - then only true
 `EvalStmt` fallbacks + dev-`show` keep a node.
 
+**AST-FREE BUILTIN + STORE MIGRATION: ✅ mostly DONE (2026-07-12).** The value-ABI
+path and two more op families are now AST-free, so a builtin-and-array-heavy
+native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
+`ast_nodes`:
+- **`func_v` no longer names the AST.** Its signature took an `ExprList *` purely
+  for carets + the repr hint; it now takes an AST-free **`ArgLocs`** (evalvalue.h)
+  — the whole-args + per-arg carets + `arr_hint`. The tree-walker adapter builds
+  it from the real `ExprList` (`build_arglocs`), the VM from a pool
+  (`vm_build_arglocs`→pool). All ~68 `func_v` builtins migrated
+  (`elems[i].get()`→`arg(i)`); the lvalue-ABI (`func_lv`) + AST builtins keep
+  `ExprList *`. (This DID touch the builtin sigs — cleaner than the earlier
+  "loc-handle only" plan, and it makes the value-ABI itself node-free.)
+- **`CallBuiltinV` → the serializable `Chunk::builtin_calls` pool** (`target2`
+  indexes `{Builtin, name, carets, arr_hint, per-arg carets}`); the pooled `name`
+  (`UniqueId*`) is what a `.myv` writer re-binds the func ptr from. No `node`; the
+  hot path is leaner (per-arg loc copy moved to codegen). `-vd` renders
+  `call.blt.v r4 = print(r3)` + a `builtin_calls` dump.
+- **`CheckFuncV` / `MapFilterV` → the loc side table** (single-caret ops, like
+  SubscriptV/MemberV).
+- **flat `StoreElemInt` / `StoreElemFloat` → node-free.** The `node->eval`
+  fallback (const/read-only/general/dyn/bool-compound) now routes to the UNIVERSAL
+  `vm_subscript_store` (box the already-computed index/value operands, map the
+  base op → Expr14 op via `vm_base_to_expr14_op`) — the same differential-proven
+  store StoreElemValue/DictStore use; the OOB/div0 caret moved to the loc table.
+  (The tree-walker's flat OOB uses the narrower *subscript* loc while the VM
+  records the *statement* loc — a pre-existing single-loc divergence, unchanged.)
+
+**STILL node-holding (the residual `ast_nodes` users):**
+- The **mutating builtin ops** `CallBuiltinLV` / `CallBuiltinLVElem` /
+  `EmplaceStruct`: `insert`/`erase` (rest-native) + `pop`/`intptr` (no value
+  args) need `node` only for carets → could go the `builtin_calls` pool; but
+  **`append`/`push` SELF-EVAL their value arg off the node** (construct-in-place
+  is EmplaceStruct's job, so the residual plain `append(a, expr)` could become
+  REST-NATIVE — pre-evaluate `expr`, share the core with insert/erase — then
+  node-free). That rest-native conversion of append/push is the next increment.
+- The **genuine fallback ops** `EvalStmt` / `EvalToSlot` / `JumpIfFalse`: they
+  re-enter `node->eval`, so they inherently need the node (reached by true
+  fallbacks + dev-`show` + a flat struct-array literal). These are the LEGITIMATE
+  residual.
+- **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
+  the field is the splice-STABLE handle codegen needs to associate an op with its
+  node before the op's final pc is known (ops build in local buffers, then
+  splice). `extract_locs` (post-assembly, pcs known) already turns node_idx into
+  the pc-keyed loc side table; the same pass can build a **pc-keyed `ast_nodes`
+  side table** (`{pc, Construct*}`, like `locs`/`inline_ctxs`) for the residual
+  node ops — after which the runtime looks up `node_at(pc)` and node_idx can be
+  dropped from the runtime Instr. Doing this cleanly (without a second
+  codegen-vs-runtime Instr representation) is the final step, best done once the
+  mutating-builtin group above is also off ast_nodes so only cold fallback paths
+  remain.
+
 ## Remaining work (current — 2026-07-07)
 
 The tracker rows above are kept current (struck as they land). The Part A/B/C
