@@ -3885,19 +3885,35 @@ omitting it is a compile error.
 ## Conventions
 
 - **NEVER do anything LAZILY unless the maintainer explicitly asked for it.**
-  The default is DETERMINISTIC, ALL-UPFRONT (AOT) — the maintainer wants ~95% of
-  work decided at compile time, before any bytecode runs, not deferred to "the
-  first time it's needed." Do NOT introduce lazy/on-demand/first-touch
-  computation, caching, compilation, or allocation on your own initiative; if a
-  lazy design seems warranted, PROPOSE it and get explicit sign-off first. The
-  ONLY approved lazy exception to date is the **per-frame pure-call cache** (a
-  lazily-populated `PureCache`, sound because frame-scoped — see the recursion
-  section); it was reviewed and approved case-by-case. **Known deviation to
-  FIX:** the VM currently compiles each function's `Chunk` LAZILY on its first
-  call (`vm_func_chunk` / `g_func_chunks`) — this was never approved and is
-  slated to become AOT (all reachable chunks compiled upfront in
-  `codegen_program`; see the endgame plan in
+  As a decision heuristic, ~95% of the time on THIS project the right call is
+  the NON-lazy one — so default to non-lazy / deterministic / upfront, and only
+  consider a lazy design after explicit sign-off. (The "95%" describes how to
+  bias YOUR choices, NOT a fraction of the work.) Do NOT introduce
+  lazy/on-demand/first-touch computation, caching, compilation, or allocation on
+  your own initiative; if one seems warranted, PROPOSE it, get sign-off first.
+  The ONLY approved lazy exception to date is the **per-frame pure-call cache**
+  (a lazily-populated `PureCache`, sound because frame-scoped — see recursion),
+  reviewed + approved case-by-case. **Known deviation to FIX:** the VM
+  compiles each function's `Chunk` LAZILY on its first call (`vm_func_chunk` /
+  `g_func_chunks`) — never approved; the AST must be compiled **100% to bytecode
+  BEFORE the VM runs** (full AOT — all reachable chunks built upfront in
+  `codegen_program`, not 95%; see the endgame plan in
   `plans/vm-fallback-elimination.md`). When in doubt: upfront, not lazy.
+
+- **The TYPE MODEL is C++ (static everywhere), with `dyn` as the one variant.**
+  Every type is decided at COMPILE time and NEVER changes at runtime. `var` is
+  C++'s `auto` — a statically-inferred concrete type, not a dynamic slot. A
+  function with un-annotated params is a TEMPLATE, monomorphized per concrete
+  call signature (like a C++ template), so `foo(x)` called with `int` and with
+  `str` is two separate typed instances. **`dyn` is the ONE variant type — big,
+  fat, and slower** — the deliberate escape hatch: a `dyn` variable's STATIC
+  type is `dyn` forever (it does NOT change), but the runtime VALUE it holds may
+  be a different concrete type moment to moment (checked at runtime; a mismatch
+  is a runtime error). So "types don't change" holds even for `dyn`: the type
+  stays `dyn`, only the boxed value's dynamic type varies. This is WHY it ALL
+  AOT-compiles upfront (all types + template instances — incl. a `dyn`
+  instance — known before any bytecode runs) and why a native op must have
+  BOTH a typed fast tier and a boxed `dyn`/variant tier, never an AST fallback.
 
 - **A breaking language change must update `samples/` too, in the SAME change.**
   The extensionless scripts in `samples/` (`fib`, `gcd`, `loop`, `phonebook`,
