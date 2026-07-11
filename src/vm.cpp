@@ -1850,6 +1850,28 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
+        case OpCode::StrLen:
+            /* n = char count of the string (foreach bound over a proven str).
+             * get_view() accounts for a slice's offset. */
+            ctx.frame->at(in.target).put(EvalValue(static_cast<int_type>(
+                ctx.frame->at(in.target2).get()
+                    .get_ref<SharedStr>().get_view().size())));
+            pc++;
+            break;
+
+        case OpCode::LoadStrChar: {
+            /* x = a fresh 1-char string of the container's i-th char - matches
+             * the tree-walker's SharedStr(string(&view[i], 1)). `i` is
+             * loop-bounded (< StrLen), so view[i] is in range. */
+            const std::string_view view = ctx.frame->at(in.target2).get()
+                .get_ref<SharedStr>().get_view();
+            const int_type i = read_int_operand(in.a, &ctx);
+            ctx.frame->at(in.target).put(
+                EvalValue(SharedStr(std::string(&view[i], 1))));
+            pc++;
+            break;
+        }
+
         case OpCode::LoadImmInt:
             ctx.frame->at(in.target).put(
                 EvalValue(static_cast<int_type>(in.a.lit)));

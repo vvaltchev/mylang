@@ -3026,7 +3026,14 @@ inferencer stamps `ForeachStmt::container_is_array`. Both the **single-var**
 (`foreach (e in a)`) and the **INDEXED 2-var** (`foreach (i, e in indexed a)`)
 forms are native: for indexed, the index var IS the loop counter (the body
 reads it) and the element loads into the 2nd var. (Flat `array<bool>` still
-falls back.) A **flat `array<PodStruct>` foreach** whose body reads the loop var
+falls back.) A **foreach over a proven STRING**
+(`ForeachStmt::container_is_str`) is the same counted-loop shape with two string
+ops: **`StrLen`** (the char count
+bound, once) and **`LoadStrChar`** (bind char i as a fresh 1-char string, box-
+free — matching `SharedStr(string(&view[i], 1))`); single-var and indexed 2-var
+both native (`str.len`/`load.strchar` in `-vd`). Neither op can throw (i is
+loop-bounded), so both are node/loc-free. A **flat `array<PodStruct>` foreach**
+whose body reads the loop var
 ONLY as SCALAR FIELDS (`p.x`) is native via a **DIRECT read**: the loop var is
 NEVER materialized — the counted loop runs and each `p.field` compiles to
 **`LoadStructFieldInt`/`LoadStructFieldFloat`**, a scalar read STRAIGHT from the

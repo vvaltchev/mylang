@@ -479,6 +479,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "arr.len      " << D(in.target) << " = len("
                 << D(in.target2) << ")";
             break;
+        case OpCode::StrLen:
+            row << "str.len      " << D(in.target) << " = len("
+                << D(in.target2) << ")   ; str chars";
+            break;
+        case OpCode::LoadStrChar:
+            row << "load.strchar " << D(in.target) << " = "
+                << D(in.target2) << "[" << RI(in.a, false) << "]";
+            break;
         case OpCode::StoreElemInt:
             row << "store.elem.i " << bref(in.target, in.target2) << "["
                 << RI(in.a, false) << "] " << store_op(in.aop) << " "

@@ -378,8 +378,22 @@ only dev-only `show` still emits EvalToSlot, never in a script/.myv]**;
 dyn instances already native; the dyn accumulator via dyn-into-concrete COERCION
 (`coerces_dyn` + strict `coerce_to_decl_type`), NOT `int OP dyn`->int (a first
 attempt, reverted); D4-overflow foo$dyn deferred]**;
-(e) audit each fallback op is unemitted, then DELETE + abort-guard. Each step
-`-rt` (differential) + samples byte-identical.
+(e) audit each fallback op is unemitted, then DELETE + abort-guard **[AUDIT
+DONE — the premise was WRONG: the ops are NOT unemitted. Instrumenting the whole
+`-rt` run caught ~199 `EvalStmt` + 8 `EvalToSlot` + 2 `JumpIfFalse` across ~15
+construct categories, so they CANNOT be deleted. But the BENCHES/SAMPLES
+compiled chunks are 100% native, and every REAL-CODE construct is native — the
+remaining `-rt` fallbacks are (1) DELIBERATE error tests (the tree-walker
+produces the exact runtime error), (2) REPL open-world (map-based names),
+(3) `-nti` (inference off): the fallback ops are the by-DESIGN completeness net
+for those, not real-code gaps. Tractable real-code categories nativized:
+**standalone `{ }` block statements** (scope-free → `gen_stmts`; the biggest
+single category, -34) and
+**string `foreach`** (`container_is_str` + `StrLen`/`LoadStrChar` counted loop,
+single + indexed). A broad script (structs / blocks / foreach / dyn / closures)
+now compiles with ZERO fallbacks. So op DELETION stays deferred (the net is
+needed for REPL/-nti/errors); "real scripts fully native" is the achieved
+milestone]**. Each step `-rt` (differential) + samples byte-identical.
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then

@@ -122,6 +122,22 @@ enum class OpCode : unsigned char {
     ArrLen,
 
     /*
+     * String CHAR count into an int slot: slot[target] = length(slot[target2]).
+     * The native `foreach (c in s)` loop bound (ForeachStmt::container_is_str),
+     * evaluated once. `target2` holds a SharedStr, so it reads its view size.
+     */
+    StrLen,
+
+    /*
+     * Native string-CHAR read `s[i]` into the loop var: slot[target] = a 1-char
+     * SharedStr of `slot[target2]`'s i-th char (`a` = the int index). The string
+     * foreach analogue of LoadElemValue - a fresh 1-char string, byte-identical
+     * to the tree-walker's `SharedStr(string(&view[i], 1))`. `i` is loop-bounded
+     * (`< StrLen`), so no bounds check.
+     */
+    LoadStrChar,
+
+    /*
      * Native array-VALUE-element read `a[i]` into a temp slot (Phase 5, for a
      * nested subscript `a[i][j]`): `target2` = the (general) array slot, `a` =
      * the int index, `target` = the dst temp; `node` = the Subscript. Reads the

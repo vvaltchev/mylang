@@ -3274,7 +3274,8 @@ struct Codegen {
                 }
             } else if (const ForeachStmt *fe =
                            dynamic_cast<const ForeachStmt *>(s)) {
-                if (try_native_foreach(fe) || try_native_foreach_unpack(fe)
+                if (try_native_foreach(fe) || try_native_foreach_str(fe)
+                    || try_native_foreach_unpack(fe)
                     || try_native_struct_foreach(fe)
                     || try_native_dict_foreach(fe)
                     || try_native_dyn_foreach(fe)) {
@@ -3939,6 +3940,107 @@ struct Codegen {
     }
 
     /*
+     * Native foreach over a proven STRING (container_is_str): a counted loop
+     * over the char count (StrLen bound), each iteration binding char i as a
+     * fresh 1-char string (LoadStrChar) into the loop var - the string analogue
+     * of the general-array path (LoadElemValue). Single-var puts the char in
+     * ids[0]; an indexed 2-var uses ids[0] as the counter/index and ids[1] as
+     * the char. Mirrors try_native_foreach exactly bar the two ops. Neither
+     * StrLen nor LoadStrChar can throw (i is loop-bounded), so no loc/node.
+     */
+    bool try_native_foreach_str(const ForeachStmt *fe)
+    {
+        if (!fe->container_is_str)
+            return false;
+
+        const int elem_id = fe->indexed ? 1 : 0;
+        const Identifier *id =
+            dynamic_cast<const Identifier *>(fe->ids->elems[elem_id].get());
+        if (!id || id->sym.kind != SymKind::local)
+            return false;
+        const int x_slot = id->sym.slot;
+        int idx_slot = -1;
+        if (fe->indexed) {
+            const Identifier *ix =
+                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+            if (!ix || ix->sym.kind != SymKind::local)
+                return false;
+            idx_slot = ix->sym.slot;
+        }
+
+        const size_t start = chunk.code.size();
+        reset_temps();
+
+        int csrc;
+        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
+            chunk.code.resize(start);
+            return false;
+        }
+        const int c = alloc_temp();
+        Instr mv;
+        mv.op = OpCode::MoveV;
+        mv.target = c;
+        mv.target2 = csrc;
+        chunk.code.push_back(mv);
+
+        const int n = alloc_temp();
+        Instr ln;
+        ln.op = OpCode::StrLen;
+        ln.target = n;
+        ln.target2 = c;
+        chunk.code.push_back(ln);
+
+        const int i = fe->indexed ? idx_slot : alloc_temp();
+        Instr z;
+        z.op = OpCode::LoadImmInt;
+        z.target = i;
+        z.a = int_lit(0);
+        chunk.code.push_back(z);
+
+        const int saved_base = temp_base;
+        temp_base = next_temp;
+
+        const size_t jt = emit_cmp(OpCode::JumpUnlessIntCmp,
+                                   fe->container.get(), Op::lt,
+                                   slot_op(i), slot_op(n));
+
+        const int lbody = here();
+
+        Instr ld;
+        ld.op = OpCode::LoadStrChar;
+        ld.target = x_slot;
+        ld.target2 = c;
+        ld.a = slot_op(i);
+        chunk.code.push_back(ld);
+
+        push_loop();
+        if (!compile_scalar_body(body_stmts(fe->body.get()))) {
+            loops.pop_back();
+            temp_base = saved_base;
+            chunk.code.resize(start);
+            return false;
+        }
+
+        const int lcont = here();
+
+        Instr fstep;
+        fstep.op = OpCode::ForLoopStep;
+        fstep.node_idx = add_ast_node(fe->container.get());
+        fstep.aop = Op::lt;
+        fstep.target = lbody;
+        fstep.target2 = i;
+        fstep.a = slot_op(n);
+        fstep.b = int_lit(1);
+        chunk.code.push_back(fstep);
+
+        const int lend = here();
+        chunk.code[jt].target = lend;
+        pop_loop(lend, lcont);
+        temp_base = saved_base;
+        return true;
+    }
+
+    /*
      * Native foreach over a flat array<PodStruct> whose body reads the loop var
      * ONLY as scalar-field reads (struct_fe_body_ok). The loop var is NEVER
      * materialized: the counted loop over the array runs, and each `p.field` in
@@ -4385,6 +4487,7 @@ struct Codegen {
         }
         if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
             if (!try_native_foreach(fe)         /* flat/general array */
+                && !try_native_foreach_str(fe)  /* string chars */
                 && !try_native_foreach_unpack(fe) /* strict array destructure */
                 && !try_native_struct_foreach(fe) /* flat struct fields */
                 && !try_native_dict_foreach(fe)   /* live dict iterator */

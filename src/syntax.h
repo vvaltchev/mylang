@@ -1598,6 +1598,11 @@ public:
      * is the flat-scalar fast path. Flat bool / POD-struct arrays are NOT set
      * (they need a raw scalar read, not a boxed LoadElemValue). */
     bool container_is_array = false;
+    /* Set by the inferencer for a 1-var (or indexed 2-var) loop over a proven
+     * STRING: the VM iterates chars with a counted loop (StrLen bound +
+     * LoadStrChar per iteration, binding each char as a fresh 1-char string),
+     * exactly like the general-array path. */
+    bool container_is_str = false;
     /* Set by the inferencer for a non-indexed 1- or 2-var loop over a proven
      * DICT: the VM iterates it natively with a LIVE unordered_map iterator
      * (DictIterInit/DictIterNext), binding the key (1-var) or key+value (2-var)
@@ -1649,6 +1654,7 @@ public:
         c->indexed = indexed;
         c->elem_th = elem_th;
         c->container_is_array = container_is_array;
+        c->container_is_str = container_is_str;
         c->container_is_dict = container_is_dict;
         c->container_is_dyn = container_is_dyn;
         c->unpack_elem_th = unpack_elem_th;

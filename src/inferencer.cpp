@@ -1522,6 +1522,11 @@ void Inferencer::annotate_hints(Construct *n)
                     if (sd->is_pod())
                         fe->container_struct_def = sd;
                 }
+            } else if (c->kind == StaticTypeKind::Str) {
+                /* `foreach (c in s)` / indexed `foreach (i, c in s)`: the VM
+                 * iterates chars with a counted loop (StrLen + LoadStrChar),
+                 * each char a fresh 1-char string. */
+                fe->container_is_str = true;
             }
         }
 
