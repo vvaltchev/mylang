@@ -1741,24 +1741,30 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::CheckFuncV:
-            /* map/filter's arg0 guard: throw (arg0's caret) if it isn't a
-             * function, BEFORE arg1's code runs - the tree-walker's order. */
+            /* map/filter's arg0 guard: throw (arg0's caret, from the loc side
+             * table) if it isn't a function, BEFORE arg1's code runs - the
+             * tree-walker's order. AST-free. */
             if (!ctx.frame->at(in.a.slot).get()
-                     .is<intrusive_ptr<FuncObject>>())
-                throw TypeErrorEx("Expected function",
-                                  chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
+                     .is<intrusive_ptr<FuncObject>>()) {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
+                throw TypeErrorEx("Expected function", s, en);
+            }
             pc++;
             break;
 
-        case OpCode::MapFilterV:
-            /* map/filter over the pre-validated function + the container. */
+        case OpCode::MapFilterV: {
+            /* map/filter over the pre-validated function + the container; the
+             * unsupported-container caret comes from the loc side table. */
+            Loc s, en;
+            chunk.loc_at(pc, s, en);
             ctx.frame->at(in.target).put(
                 vm_map_filter(&ctx, ctx.frame->at(in.a.slot).get(),
                               ctx.frame->at(in.b.slot).get(),
-                              in.target2 != 0,
-                              chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end));
+                              in.target2 != 0, s, en));
             pc++;
             break;
+        }
 
         case OpCode::ReturnV:
             /* `return <expr>`: the value is already in a.slot (a bare return

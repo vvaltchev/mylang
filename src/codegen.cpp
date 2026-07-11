@@ -4459,6 +4459,8 @@ static void extract_locs(Chunk &chunk)
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
+        case OpCode::CheckFuncV:     /* node = arg0 (Expected-function caret) */
+        case OpCode::MapFilterV:     /* node = arg1 (unsupported-container caret) */
         case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
         case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
             /* node used ONLY for the caret now (div/mod; the missing-key
@@ -4508,8 +4510,6 @@ static void extract_locs(Chunk &chunk)
         case OpCode::CallBuiltinLV:
         case OpCode::CallBuiltinLVElem:
         case OpCode::EmplaceStruct:
-        case OpCode::CheckFuncV:
-        case OpCode::MapFilterV:
         case OpCode::StoreElemInt:
         case OpCode::StoreElemFloat:
             break;
