@@ -132,7 +132,7 @@ boxed_operand(const Operand &o, EvalContext *ctx, EvalValue &scratch)
 /* Stamp an unlocated in-flight exception with the op's caret from the loc side
  * table (used by the catch of an AST-free op whose runtime function threw with
  * no loc). Cold - the error path only. */
-static ML_NOINLINE void
+static ML_COLD void
 vm_stamp_loc(const Chunk &chunk, size_t pc, Exception &e)
 {
     if (!e.loc_start)
@@ -184,7 +184,7 @@ static inline Op vm_base_to_expr14_op(Op base)
 /* The two STRICT foreach-unpack errors (UnpackElem*), matching do_iter's
  * messages + loc (the container's, from the loc side table) BYTE-for-byte, so
  * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. */
-[[noreturn]] static ML_NOINLINE void
+[[noreturn]] static ML_COLD void
 vm_throw_unpack_nonarray(const Chunk &chunk, size_t pc, int_type nvars)
 {
     Loc s, en;
@@ -194,7 +194,7 @@ vm_throw_unpack_nonarray(const Chunk &chunk, size_t pc, int_type nvars)
                                  " variables"), s, en);
 }
 
-[[noreturn]] static ML_NOINLINE void
+[[noreturn]] static ML_COLD void
 vm_throw_unpack_len(const Chunk &chunk, size_t pc, size_type m, int_type nvars)
 {
     Loc s, en;
@@ -208,7 +208,7 @@ vm_throw_unpack_len(const Chunk &chunk, size_t pc, size_type m, int_type nvars)
  * [[noreturn]] ML_NOINLINE helpers so the STORE/LOAD hot paths carry no loc_at
  * (a binary search) and no throw/string code inline - only a call on the cold
  * error path, which also keeps vm_run_chunk's hot body compact. */
-[[noreturn]] static ML_NOINLINE void
+[[noreturn]] static ML_COLD void
 vm_throw_oob(const Chunk &chunk, size_t pc)
 {
     Loc s, en;
@@ -216,7 +216,7 @@ vm_throw_oob(const Chunk &chunk, size_t pc)
     throw OutOfBoundsEx(s, en);
 }
 
-[[noreturn]] static ML_NOINLINE void
+[[noreturn]] static ML_COLD void
 vm_throw_div0(const Chunk &chunk, size_t pc)
 {
     Loc s, en;
@@ -226,7 +226,7 @@ vm_throw_div0(const Chunk &chunk, size_t pc)
 
 /* The MULTI-ASSIGN strict-unpack length error (F-1) - the same message the
  * tree-walker's handle_single_expr14 throws, WITHOUT the "foreach:" prefix. */
-[[noreturn]] static ML_NOINLINE void
+[[noreturn]] static ML_COLD void
 vm_throw_multi_unpack_len(const Chunk &chunk, size_t pc, size_type m,
                           size_t nvars)
 {
@@ -243,7 +243,7 @@ vm_throw_multi_unpack_len(const Chunk &chunk, size_t pc, size_type m,
  * CallBuiltinV, measurably regressed a builtin-heavy loop. Also keeps the
  * vector code out of vm_run_chunk, so it stays small enough to inline the hot
  * int/float operand helpers. */
-static ML_NOINLINE EvalValue
+static ML_COLD EvalValue
 vm_call_builtin_big(EvalContext &ctx, const Chunk &chunk, int bc_idx,
                     int_type base, int_type n)
 {
@@ -339,7 +339,7 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
  * and call func_lv with `target` + `rest` - zero node->eval. ML_NOINLINE keeps
  * the (cold) CallBuiltinLV case out of vm_run_chunk's hot body. n_rest is small
  * for a valid call (insert 2, erase 1); >8 (a wrong-arity call) heaps. */
-static ML_NOINLINE EvalValue
+static ML_COLD EvalValue
 vm_call_builtin_lv_rest(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
                         LValue *target, int_type base)
 {
@@ -363,7 +363,7 @@ vm_call_builtin_lv_rest(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
  * = the container arg, ctor = the struct construction with vm_struct_ctor_def).
  * ML_NOINLINE keeps this (cold) path out of vm_run_chunk's hot body;
  * a struct with >8 fields heaps. */
-static ML_NOINLINE EvalValue
+static ML_COLD EvalValue
 vm_do_emplace(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
               LValue *target, int_type base)
 {

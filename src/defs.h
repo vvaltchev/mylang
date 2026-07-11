@@ -93,6 +93,21 @@ typedef intptr_t int_type;
 #endif
 
 /*
+ * A COLD, never-inlined helper for a RARE path (a runtime error, a rare op's
+ * body). Beyond ML_NOINLINE, the `cold` attribute tells GCC/clang the CALL SITE
+ * is unlikely, so the block that calls it is moved OUT-OF-LINE (a cold section)
+ * - which DENSIFIES a big hot dispatch function (vm_run_chunk): the rare-op case
+ * bodies stop pushing the hot int/loop handlers apart, the layout regression the
+ * growing switch caused (see [[vm-dispatch-frontend-regression]]). Attributes
+ * only - no logic change. (MSVC has no equivalent; NOINLINE is the fallback.)
+ */
+#if defined(_MSC_VER)
+#  define ML_COLD __declspec(noinline)
+#else
+#  define ML_COLD __attribute__((cold, noinline))
+#endif
+
+/*
  * ML_CHECK / ML_CHECK_MSG - the project's defense-in-depth assertion macros.
  *
  * Use these (NOT bare assert) to state an invariant the code RELIES ON but a
