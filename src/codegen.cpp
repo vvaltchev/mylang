@@ -456,12 +456,25 @@ struct Codegen {
 
     int here() const { return static_cast<int>(chunk.code.size()); }
 
+    /* Pool an AST node an op needs at RUNTIME (fallback / builtin / a store's
+     * caret) and return its Chunk::ast_nodes index; -1 for a null node (no
+     * entry). A COMPACTION pass after extract_locs drops the loc-only nodes it
+     * nulled and any codegen-rollback orphans, so the surviving pool is minimal
+     * (empty for a fully-native chunk). See Chunk::ast_nodes. */
+    int add_ast_node(const Construct *n)
+    {
+        if (!n)
+            return -1;
+        chunk.ast_nodes.push_back(n);
+        return static_cast<int>(chunk.ast_nodes.size()) - 1;
+    }
+
     size_t emit(OpCode op, const Construct *node = nullptr,
                 int target = -1, int target2 = -1)
     {
         Instr in;
         in.op = op;
-        in.node = node;
+        in.node_idx = add_ast_node(node);
         in.target = target;
         in.target2 = target2;
         chunk.code.push_back(in);
@@ -659,7 +672,7 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr in;
         in.op = OpCode::MakeStructArrayV;
-        in.node = la->elems[0].get();   /* a ctor: defensive coerce loc (nulled) */
+        in.node_idx = add_ast_node(la->elems[0].get());   /* a ctor: defensive coerce loc (nulled) */
         in.target = dst;
         in.a = int_lit(base);
         in.b = int_lit(n);
@@ -729,7 +742,7 @@ struct Codegen {
             const int t = alloc_temp();
             Instr in;
             in.op = op;
-            in.node = id;              /* for the undefined-global loc/name */
+            in.node_idx = add_ast_node(id);              /* for the undefined-global loc/name */
             in.target = t;
             in.target2 = id->sym.slot;
             ops.push_back(in);
@@ -742,7 +755,7 @@ struct Codegen {
             const int t = alloc_temp();
             Instr in;
             in.op = OpCode::LoadConstV;
-            in.node = e;
+            in.node_idx = add_ast_node(e);
             in.target = t;
             in.target2 = add_const(lit);
             ops.push_back(in);
@@ -824,7 +837,7 @@ struct Codegen {
                     const int dst = alloc_temp();
                     Instr in;
                     in.op = OpCode::StructCtorV;
-                    in.node = ce;   /* loc for a defensive throw (nulled) */
+                    in.node_idx = add_ast_node(ce);   /* loc for a defensive throw (nulled) */
                     in.target = dst;
                     in.a = int_lit(base);
                     in.b = int_lit(
@@ -931,7 +944,7 @@ struct Codegen {
             const int t = alloc_temp();
             Instr in;
             in.op = OpCode::SubscriptV;
-            in.node = sub;
+            in.node_idx = add_ast_node(sub);
             in.target = t;
             in.target2 = base_slot;
             in.a = slot_op(idx_slot);
@@ -948,7 +961,7 @@ struct Codegen {
             const int t = alloc_temp();
             Instr in;
             in.op = OpCode::MemberV;
-            in.node = m;                 /* extract_locs nulls it */
+            in.node_idx = add_ast_node(m);                 /* extract_locs nulls it */
             in.target = t;
             in.target2 = base_slot;
             in.a = int_lit(add_member_key(m));   /* AST-free: pool index */
@@ -974,7 +987,7 @@ struct Codegen {
             const int t = alloc_temp();
             Instr in;
             in.op = OpCode::SliceV;
-            in.node = sl;                /* extract_locs nulls it */
+            in.node_idx = add_ast_node(sl);                /* extract_locs nulls it */
             in.target = t;
             in.target2 = base_slot;
             in.a = slot_op(start_slot);  /* -1 == absent */
@@ -1137,7 +1150,7 @@ struct Codegen {
             in.op = k == 'a' ? OpCode::BinOpV
                   : k == 'c' ? OpCode::CmpV
                              : OpCode::LogV;
-            in.node = k == 'l' ? node : elems[i].second.get();
+            in.node_idx = add_ast_node(k == 'l' ? node : elems[i].second.get());
             in.target = t;
             in.a = acc_op;
             in.b = rhs_op;
@@ -1244,7 +1257,7 @@ struct Codegen {
         for (int i = 0; i < n; i++) {
             Instr mv;
             mv.op = OpCode::MoveV;
-            mv.node = e;
+            mv.node_idx = add_ast_node(e);
             mv.target = il->elems[i]->sym.slot;
             mv.target2 = snap_base + i;
             ops.push_back(mv);
@@ -1292,7 +1305,7 @@ struct Codegen {
         for (int i = 0; i < n; i++) {
             Instr mv;
             mv.op = OpCode::MoveV;
-            mv.node = e;
+            mv.node_idx = add_ast_node(e);
             mv.target = il->elems[i]->sym.slot;
             mv.target2 = vslot;
             ops.push_back(mv);
@@ -1345,7 +1358,7 @@ struct Codegen {
         /* The strict-length caret matches the tree-walker: its IdList lvalue
          * carries no loc, so the error stamps the enclosing Expr14's span
          * (`a, b, c = <rvalue>`) via Construct::eval - so record `e`, not il. */
-        in.node = e;
+        in.node_idx = add_ast_node(e);
         in.a = slot_op(rslot);
         in.target = static_cast<int>(chunk.unpack_targets.size());
         chunk.unpack_targets.push_back(std::move(targets));
@@ -1373,7 +1386,7 @@ struct Codegen {
                 Instr in;
                 in.op = id->sym.kind == SymKind::global
                             ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = id->sym.slot;
                 in.a = int_lit(1);
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
@@ -1486,7 +1499,7 @@ struct Codegen {
             }
             Instr in;
             in.op = store_op;
-            in.node = s;               /* loc: compound may throw (div/undef) */
+            in.node_idx = add_ast_node(s);               /* loc: compound may throw (div/undef) */
             in.target = lv->sym.slot;
             in.a = rhs_op;
             in.aop = cbase;
@@ -1505,7 +1518,7 @@ struct Codegen {
             }
             Instr in;
             in.op = OpCode::CompoundV;
-            in.node = s;
+            in.node_idx = add_ast_node(s);
             in.target = lv->sym.slot;
             in.b = rhs_op;
             in.aop = cbase;
@@ -1545,7 +1558,7 @@ struct Codegen {
             } else {
                 Instr in;
                 in.op = OpCode::MoveV;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = lv->sym.slot;
                 in.target2 = rslot;
                 ops.push_back(in);
@@ -1583,7 +1596,7 @@ struct Codegen {
         const int t = alloc_temp();
         Instr in;
         in.op = OpCode::LoadElemValue;
-        in.node = e;
+        in.node_idx = add_ast_node(e);
         in.target = t;
         in.target2 = inner;
         in.a = idx;
@@ -1599,7 +1612,7 @@ struct Codegen {
         const int t = alloc_temp();
         Instr in;
         in.op = OpCode::EvalToSlot;
-        in.node = e;
+        in.node_idx = add_ast_node(e);
         in.target = t;
         ops.push_back(in);
         return slot_op(t);
@@ -1687,7 +1700,7 @@ struct Codegen {
          * routes through the per-frame pure-call cache; else a plain call. */
         cv.op = dynamic_cast<const CachedCallExpr *>(dc)
                     ? OpCode::CachedCallV : OpCode::CallV;
-        cv.node = dc;
+        cv.node_idx = add_ast_node(dc);
         cv.target = dst;
         cv.target2 = dc->direct_func_slot;
         cv.a = int_lit(argbase);
@@ -1732,7 +1745,7 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr cv;
         cv.op = OpCode::CallValueV;
-        cv.node = call;
+        cv.node_idx = add_ast_node(call);
         cv.target = dst;
         cv.target2 = callee_slot;
         cv.a = int_lit(argbase);
@@ -1763,7 +1776,7 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr cv;
         cv.op = OpCode::CallBuiltinV;
-        cv.node = dc;
+        cv.node_idx = add_ast_node(dc);
         cv.target = dst;
         cv.a = int_lit(argbase);
         cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
@@ -1797,7 +1810,7 @@ struct Codegen {
         }
         Instr chk;
         chk.op = OpCode::CheckFuncV;
-        chk.node = dc->args->elems[0].get();   /* arg0's caret */
+        chk.node_idx = add_ast_node(dc->args->elems[0].get());   /* arg0's caret */
         chk.a = slot_op(t0);
         ops.push_back(chk);
 
@@ -1812,7 +1825,7 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr in;
         in.op = OpCode::MapFilterV;
-        in.node = dc->args->elems[1].get();    /* arg1's caret (container) */
+        in.node_idx = add_ast_node(dc->args->elems[1].get());    /* arg1's caret (container) */
         in.target = dst;
         in.target2 = dc->map_filter_kind == 2 ? 1 : 0;   /* is_filter */
         in.a = slot_op(t0);
@@ -1858,7 +1871,7 @@ struct Codegen {
                     const int dst = alloc_temp();
                     Instr cv;
                     cv.op = OpCode::CallBuiltinLVElem;
-                    cv.node = dc;
+                    cv.node_idx = add_ast_node(dc);
                     cv.target = dst;
                     cv.target2 =
                         static_cast<const Identifier *>(base)->sym.slot;
@@ -1898,7 +1911,7 @@ struct Codegen {
                     const int dst = alloc_temp();
                     Instr cv;
                     cv.op = OpCode::EmplaceStruct;
-                    cv.node = dc;
+                    cv.node_idx = add_ast_node(dc);
                     cv.target = dst;
                     cv.target2 =
                         static_cast<const Identifier *>(a0)->sym.slot;
@@ -1926,7 +1939,7 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr cv;
         cv.op = OpCode::CallBuiltinLV;
-        cv.node = dc;
+        cv.node_idx = add_ast_node(dc);
         cv.target = dst;
         cv.target2 = static_cast<const Identifier *>(a0)->sym.slot;
         cv.a = int_lit(kind);
@@ -2082,7 +2095,7 @@ struct Codegen {
 
         Instr rv;
         rv.op = OpCode::ReturnV;
-        rv.node = ret;
+        rv.node_idx = add_ast_node(ret);
         rv.a = slot_op(vslot);
         ops.push_back(rv);
         return true;
@@ -2102,7 +2115,7 @@ struct Codegen {
         }
         Instr in;
         in.op = OpCode::Throw;
-        in.node = th;                 /* throw-site loc (extract_locs) */
+        in.node_idx = add_ast_node(th);                 /* throw-site loc (extract_locs) */
         in.a = slot_op(vslot);
         ops.push_back(in);
         return true;
@@ -2114,7 +2127,7 @@ struct Codegen {
     {
         Instr in;
         in.op = OpCode::Rethrow;
-        in.node = rt;                 /* rethrow-site loc (extract_locs) */
+        in.node_idx = add_ast_node(rt);                 /* rethrow-site loc (extract_locs) */
         ops.push_back(in);
     }
 
@@ -2136,7 +2149,7 @@ struct Codegen {
             tt = alloc_temp();
             Instr in;
             in.op = op;
-            in.node = m;                 /* extract_locs records + nulls */
+            in.node_idx = add_ast_node(m);                 /* extract_locs records + nulls */
             in.target = tt;
             in.target2 = dslot;
             /* the member NAME (a dict key) goes into the CONST POOL; `a` as an
@@ -2154,7 +2167,7 @@ struct Codegen {
             tt = alloc_temp();
             Instr in;
             in.op = op;
-            in.node = sub;
+            in.node_idx = add_ast_node(sub);
             in.target = tt;
             in.target2 = dslot;
             in.a = slot_op(kslot);
@@ -2227,7 +2240,7 @@ struct Codegen {
             const int tt = alloc_temp();
             Instr in;
             in.op = OpCode::LoadElemInt;
-            in.node = e;
+            in.node_idx = add_ast_node(e);
             in.target = tt;
             in.target2 = aslot;
             in.a = idx;
@@ -2280,7 +2293,7 @@ struct Codegen {
                 const int tt = alloc_temp();
                 Instr in;
                 in.op = OpCode::IntBin;
-                in.node = e;
+                in.node_idx = add_ast_node(e);
                 in.target = tt;
                 in.a = acc;
                 in.b = rhs;
@@ -2299,7 +2312,7 @@ struct Codegen {
             const int tt = alloc_temp();
             Instr in;                    /* tt = 0 - op */
             in.op = OpCode::IntBin;
-            in.node = e;
+            in.node_idx = add_ast_node(e);
             in.target = tt;
             in.a = int_lit(0);
             in.b = op;
@@ -2326,7 +2339,7 @@ struct Codegen {
                 && !dst.is_lit) {
                 Instr in;
                 in.op = OpCode::IntBin;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
                 in.a = dst;
                 in.b = int_lit(1);
@@ -2347,7 +2360,7 @@ struct Codegen {
                         return false;
                     Instr in;
                     in.op = OpCode::StoreElemInt;
-                    in.node = sub;   /* subscript loc for OOB (matches TW) */
+                    in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
                     in.target = akind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = aslot;
                     in.a = idx;
@@ -2378,7 +2391,7 @@ struct Codegen {
                         return false;
                     Instr in;
                     in.op = OpCode::DictStore;
-                    in.node = sub;
+                    in.node_idx = add_ast_node(sub);
                     in.target = dkind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = dslot;
                     in.a = slot_op(kslot);
@@ -2424,7 +2437,7 @@ struct Codegen {
                     return false;
                 Instr in;
                 in.op = OpCode::StoreElem2V;
-                in.node = sub;   /* outer subscript, for its loc (extract_locs) */
+                in.node_idx = add_ast_node(sub);   /* outer subscript, for its loc (extract_locs) */
                 in.target = vslot;
                 in.target2 = aslot;
                 in.a = slot_op(k1slot);
@@ -2454,7 +2467,7 @@ struct Codegen {
                     return false;
                 Instr in;
                 in.op = OpCode::DictStore;
-                in.node = sub;   /* the subscript, for its loc (extract_locs) */
+                in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
                 in.target = dkind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = dslot;
                 in.a = slot_op(kslot);
@@ -2503,7 +2516,7 @@ struct Codegen {
                     if (vok && compile_int_expr(sub->index.get(), idx, ops)) {
                         Instr in;
                         in.op = OpCode::StoreElemInt;
-                        in.node = s;
+                        in.node_idx = add_ast_node(s);
                         in.target = akind;   /* 0 local / 1 global / 2 cap */
                         in.target2 = aslot;
                         in.a = idx;
@@ -2538,7 +2551,7 @@ struct Codegen {
                     return false;
                 Instr in;
                 in.op = OpCode::StoreElemValue;
-                in.node = sub;   /* the subscript, for its loc (extract_locs) */
+                in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
                 in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = aslot;
                 in.a = slot_op(kslot);
@@ -2571,13 +2584,13 @@ struct Codegen {
                     return false;
                 Instr kin;               /* the member name as a string key */
                 kin.op = OpCode::LoadConstV;
-                kin.node = m;
+                kin.node_idx = add_ast_node(m);
                 kin.target = alloc_temp();
                 kin.target2 = add_const(m->memId);
                 ops.push_back(kin);
                 Instr in;
                 in.op = OpCode::DictStore;
-                in.node = m;             /* for its loc (extract_locs) */
+                in.node_idx = add_ast_node(m);             /* for its loc (extract_locs) */
                 in.target = dkind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = dslot;
                 in.a = slot_op(kin.target);
@@ -2633,14 +2646,14 @@ struct Codegen {
             } else if (r.is_lit) {
                 Instr in;
                 in.op = OpCode::LoadImmInt;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
                 in.a = r;
                 ops.push_back(in);
             } else {
                 Instr in;                /* dst = r + 0 (slot copy) */
                 in.op = OpCode::IntBin;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
                 in.a = r;
                 in.b = int_lit(0);
@@ -2665,7 +2678,7 @@ struct Codegen {
             return false;
         Instr in;
         in.op = OpCode::IntBin;
-        in.node = s;
+        in.node_idx = add_ast_node(s);
         in.target = dst.slot;
         in.a = dst;
         in.b = rhs;
@@ -2727,7 +2740,7 @@ struct Codegen {
             const int tt = alloc_temp();
             Instr in;
             in.op = OpCode::LoadElemFloat;
-            in.node = e;
+            in.node_idx = add_ast_node(e);
             in.target = tt;
             in.target2 = aslot;
             in.a = idx;
@@ -2775,7 +2788,7 @@ struct Codegen {
                 const int tt = alloc_temp();
                 Instr in;
                 in.op = OpCode::FloatBin;
-                in.node = e;
+                in.node_idx = add_ast_node(e);
                 in.target = tt;
                 in.a = acc;
                 in.b = rhs;
@@ -2794,7 +2807,7 @@ struct Codegen {
             const int tt = alloc_temp();
             Instr in;                    /* tt = 0.0 - op */
             in.op = OpCode::FloatBin;
-            in.node = e;
+            in.node_idx = add_ast_node(e);
             in.target = tt;
             in.a = float_lit(0);
             in.b = op;
@@ -2816,7 +2829,7 @@ struct Codegen {
                 && id->sym.kind == SymKind::local && id->th == TypeHint::f) {
                 Instr in;
                 in.op = OpCode::FloatBin;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = id->sym.slot;
                 in.a = slot_op(id->sym.slot);
                 in.b = float_lit(1);
@@ -2836,7 +2849,7 @@ struct Codegen {
                         return false;
                     Instr in;
                     in.op = OpCode::StoreElemFloat;
-                    in.node = sub;   /* subscript loc for OOB (matches TW) */
+                    in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
                     in.target2 = aslot;
                     in.a = idx;
                     in.b = float_lit(1);
@@ -2877,7 +2890,7 @@ struct Codegen {
                 return false;
             Instr in;
             in.op = OpCode::StoreElemFloat;
-            in.node = s;
+            in.node_idx = add_ast_node(s);
             in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
             in.target2 = aslot;
             in.a = idx;
@@ -2905,14 +2918,14 @@ struct Codegen {
             } else if (r.is_lit) {
                 Instr in;
                 in.op = OpCode::LoadImmFloat;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = dslot;
                 in.a = r;
                 ops.push_back(in);
             } else {
                 Instr in;                /* dst = r + 0.0 (slot copy) */
                 in.op = OpCode::FloatBin;
-                in.node = s;
+                in.node_idx = add_ast_node(s);
                 in.target = dslot;
                 in.a = r;
                 in.b = float_lit(0);
@@ -2937,7 +2950,7 @@ struct Codegen {
             return false;
         Instr in;
         in.op = OpCode::FloatBin;
-        in.node = s;
+        in.node_idx = add_ast_node(s);
         in.target = dslot;
         in.a = slot_op(dslot);
         in.b = rhs;
@@ -3037,7 +3050,7 @@ struct Codegen {
         if (compile_boxed_expr(cond, cslot, chunk.code)) {
             Instr in;
             in.op = OpCode::JumpUnlessTrueV;
-            in.node = cond;
+            in.node_idx = add_ast_node(cond);
             in.target2 = cslot;
             exit_jumps.push_back(chunk.code.size());
             chunk.code.push_back(in);
@@ -3303,7 +3316,7 @@ struct Codegen {
                 if (compile_boxed_expr(f->condExpr.get(), cslot, chunk.code)) {
                     Instr in;
                     in.op = OpCode::JumpUnlessTrueV;
-                    in.node = f->condExpr.get();
+                    in.node_idx = add_ast_node(f->condExpr.get());
                     in.target2 = cslot;
                     jf = chunk.code.size();
                     chunk.code.push_back(in);
@@ -3465,7 +3478,7 @@ struct Codegen {
     {
         Instr t;
         t.op = opc;
-        t.node = node;
+        t.node_idx = add_ast_node(node);
         t.aop = cmp;
         t.a = a;
         t.b = b;
@@ -3578,7 +3591,7 @@ struct Codegen {
         /* Fused back-edge: i += step; if (i <cmp> bound) goto lbody. */
         Instr fstep;
         fstep.op = OpCode::ForLoopStep;
-        fstep.node = f;
+        fstep.node_idx = add_ast_node(f);
         fstep.aop = f->cmp_op;
         fstep.target = lbody;
         fstep.target2 = f->i_slot;
@@ -3720,7 +3733,7 @@ struct Codegen {
         const int n = alloc_temp();
         Instr ln;
         ln.op = OpCode::ArrLen;
-        ln.node = fe->container.get();
+        ln.node_idx = add_ast_node(fe->container.get());
         ln.target = n;
         ln.target2 = c;
         chunk.code.push_back(ln);
@@ -3754,7 +3767,7 @@ struct Codegen {
         ld.op = fe->elem_th == TypeHint::i ? OpCode::LoadElemInt
               : fe->elem_th == TypeHint::f ? OpCode::LoadElemFloat
                                            : OpCode::LoadElemValue;
-        ld.node = fe->container.get();
+        ld.node_idx = add_ast_node(fe->container.get());
         ld.target = x_slot;
         ld.target2 = c;
         ld.a = slot_op(i);
@@ -3775,7 +3788,7 @@ struct Codegen {
          * iteration instead of a separate compare + increment + jump). */
         Instr fstep;
         fstep.op = OpCode::ForLoopStep;
-        fstep.node = fe->container.get();
+        fstep.node_idx = add_ast_node(fe->container.get());
         fstep.aop = Op::lt;
         fstep.target = lbody;
         fstep.target2 = i;
@@ -3832,7 +3845,7 @@ struct Codegen {
         const int n = alloc_temp();
         Instr ln;
         ln.op = OpCode::ArrLen;
-        ln.node = fe->container.get();
+        ln.node_idx = add_ast_node(fe->container.get());
         ln.target = n;
         ln.target2 = c;
         chunk.code.push_back(ln);
@@ -3876,7 +3889,7 @@ struct Codegen {
         const int lcont = here();
         Instr fstep;
         fstep.op = OpCode::ForLoopStep;
-        fstep.node = fe->container.get();
+        fstep.node_idx = add_ast_node(fe->container.get());
         fstep.aop = Op::lt;
         fstep.target = lbody;
         fstep.target2 = i;
@@ -3946,7 +3959,7 @@ struct Codegen {
         const int n = alloc_temp();
         Instr ln;
         ln.op = OpCode::ArrLen;
-        ln.node = fe->container.get();
+        ln.node_idx = add_ast_node(fe->container.get());
         ln.target = n;
         ln.target2 = c;
         chunk.code.push_back(ln);
@@ -3978,7 +3991,7 @@ struct Codegen {
         up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
               : fe->unpack_elem_th == TypeHint::f ? OpCode::UnpackElemFloat
                                                   : OpCode::UnpackElemValue;
-        up.node = fe->container.get();
+        up.node_idx = add_ast_node(fe->container.get());
         up.target = unpack_base;
         up.target2 = c;
         up.a = slot_op(i);
@@ -3996,7 +4009,7 @@ struct Codegen {
         const int lcont = here();
         Instr fstep;
         fstep.op = OpCode::ForLoopStep;
-        fstep.node = fe->container.get();
+        fstep.node_idx = add_ast_node(fe->container.get());
         fstep.aop = Op::lt;
         fstep.target = lbody;
         fstep.target2 = i;
@@ -4061,7 +4074,7 @@ struct Codegen {
 
         Instr init;
         init.op = OpCode::DictIterInit;
-        init.node = fe->container.get();
+        init.node_idx = add_ast_node(fe->container.get());
         init.target = iter_id;
         init.target2 = dsrc;
         chunk.code.push_back(init);
@@ -4143,7 +4156,7 @@ struct Codegen {
 
         Instr init;
         init.op = OpCode::ForeachDynInit;
-        init.node = fe->container.get();   /* extract_locs -> the caret */
+        init.node_idx = add_ast_node(fe->container.get());   /* extract_locs -> the caret */
         init.target = iter_id;
         init.target2 = dsrc;
         init.a = int_lit(nvars);           /* 1 or 2 loop vars */
@@ -4158,7 +4171,7 @@ struct Codegen {
         /* A 2-var array element is strict-unpacked, so Next can throw; record
          * the container caret (do_iter uses container->start/end). */
         if (nvars == 2)
-            nx.node = fe->container.get();
+            nx.node_idx = add_ast_node(fe->container.get());
         const size_t nx_i = chunk.code.size();
         chunk.code.push_back(nx);          /* .target (end_pc) backpatched */
 
@@ -4384,15 +4397,16 @@ static void extract_locs(Chunk &chunk)
 {
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
         Instr &in = chunk.code[pc];
-        if (!in.node)
+        const Construct *node = chunk.node_at(in.node_idx);
+        if (!node)
             continue;
         /* P8 Inc 4: an op spliced from an INLINED body records that body's
          * inlined-at chain, so a backtrace crossing it shows the virtual
          * frames. Recorded BEFORE the switch nulls the node; pc-ascending, so
          * inline_ctxs stays sorted. (Rare - only inlined ops have one.) */
-        if (in.node->inline_ctx)
+        if (node->inline_ctx)
             chunk.inline_ctxs.push_back(
-                {static_cast<uint32_t>(pc), in.node->inline_ctx});
+                {static_cast<uint32_t>(pc), node->inline_ctx});
         switch (in.op) {
         case OpCode::IntBin:
         case OpCode::FloatBin:
@@ -4429,8 +4443,8 @@ static void extract_locs(Chunk &chunk)
              * undefined-global error - the operation itself is AST-free):
              * record the loc -> AST-free. */
             chunk.locs.push_back(
-                {static_cast<uint32_t>(pc), in.node->start, in.node->end});
-            in.node = nullptr;
+                {static_cast<uint32_t>(pc), node->start, node->end});
+            in.node_idx = -1;
             break;
         case OpCode::JumpUnlessIntCmp:
         case OpCode::JumpUnlessFloatCmp:
@@ -4442,7 +4456,7 @@ static void extract_locs(Chunk &chunk)
             /* node not needed for a caret: LogV never throws; MemberV's carets
              * (and name/uid/optional) live in the member-key pool; ArrLen /
              * DictIterInit never throw with a node loc. Drop it. */
-            in.node = nullptr;
+            in.node_idx = -1;
             break;
         case OpCode::CallV:
         case OpCode::CachedCallV: {
@@ -4450,16 +4464,61 @@ static void extract_locs(Chunk &chunk)
              * undefined-callee caret); the backtrace call-site uses its start
              * (== the call's). NotCallableEx is unreachable for a CallV (a
              * proven global func slot), so its caret is moot. */
-            const CallExpr *call = static_cast<const CallExpr *>(in.node);
+            const CallExpr *call = static_cast<const CallExpr *>(node);
             chunk.locs.push_back({static_cast<uint32_t>(pc),
                                   call->what->start, call->what->end});
-            in.node = nullptr;
+            in.node_idx = -1;
             break;
         }
+        /* The ops that genuinely READ the node at RUNTIME - KEEP node_idx (these
+         * populate ast_nodes): the fallbacks (node->eval / vm_eval_cond), the
+         * builtin-call ops (the args ExprList for per-arg carets), and the flat
+         * int/float element store (node->start for its OOB/div0 caret; the
+         * general/dict stores above use the loc side table instead, so they were
+         * nulled). Everything NOT listed anywhere here sets a node it never uses
+         * at runtime - the default nulls it, so a fully-native chunk's pool is
+         * empty (the accurate "not serializable yet" signal). */
+        case OpCode::EvalStmt:
+        case OpCode::EvalToSlot:
+        case OpCode::JumpIfFalse:
+        case OpCode::CallBuiltinV:
+        case OpCode::CallBuiltinLV:
+        case OpCode::CallBuiltinLVElem:
+        case OpCode::EmplaceStruct:
+        case OpCode::CheckFuncV:
+        case OpCode::MapFilterV:
+        case OpCode::StoreElemInt:
+        case OpCode::StoreElemFloat:
+            break;
         default:
+            in.node_idx = -1;
             break;
         }
     }
+}
+
+/*
+ * After extract_locs nulled every loc-only op's node_idx, rebuild ast_nodes to
+ * hold ONLY the entries still referenced by a live Instr::node_idx (the
+ * runtime-node ops - fallbacks / builtin calls / a store's caret), remapping
+ * indices in pc order. Drops the loc-only nodes AND any codegen-rollback
+ * orphans, so a fully-native chunk ends with an EMPTY pool - the accurate
+ * "not yet serializable" signal. (add_ast_node gives each op a unique index, so
+ * no two ops share an entry; a duplicate would just copy the node, still sound.)
+ */
+static void compact_ast_nodes(Chunk &chunk)
+{
+    if (chunk.ast_nodes.empty())
+        return;
+    std::vector<const Construct *> live;
+    for (Instr &in : chunk.code) {
+        if (in.node_idx < 0)
+            continue;
+        const int ni = static_cast<int>(live.size());
+        live.push_back(chunk.ast_nodes[static_cast<size_t>(in.node_idx)]);
+        in.node_idx = ni;
+    }
+    chunk.ast_nodes = std::move(live);
 }
 
 }  /* namespace */
@@ -4487,6 +4546,7 @@ codegen_chunk(const Block *block, int slot_count)
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     extract_locs(cg.chunk);   /* move div/mod carets to the loc side table */
+    compact_ast_nodes(cg.chunk);   /* minimize the AST-node pool (see above) */
     return std::move(cg.chunk);
 }
 

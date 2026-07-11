@@ -294,6 +294,16 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   #" << i << "  " << ch.struct_defs[i]->name->val
               << "\n";
     }
+    if (!ch.ast_nodes.empty()) {
+        /* The ONE non-serializable pool: the AST nodes ops still need at
+         * runtime (fallbacks / builtin calls / a store's caret). A fully-native
+         * chunk has NONE - so this section appearing IS the ".myv can't drop the
+         * AST yet" signal. Rendered by the shared decompiler. */
+        s << "; -- ast_nodes (" << ch.ast_nodes.size()
+          << ", NOT serializable) --\n";
+        for (size_t i = 0; i < ch.ast_nodes.size(); i++)
+            s << ";   #" << i << "  " << node1(ch.ast_nodes[i]) << "\n";
+    }
     if (!ch.locs.empty()) {
         s << "; -- locs (" << ch.locs.size() << ") --\n";
         for (const auto &l : ch.locs)
@@ -366,7 +376,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 
         switch (in.op) {
         case OpCode::EvalStmt:
-            row << "eval.stmt    " << node1(in.node);
+            row << "eval.stmt    " << node1(chunk.node_at(in.node_idx));
             break;
         case OpCode::Jump:
             row << "jmp          L" << in.target;
@@ -410,7 +420,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "end.finally";
             break;
         case OpCode::JumpIfFalse:
-            row << "jmp.ifnot    (" << node1(in.node) << "), L" << in.target;
+            row << "jmp.ifnot    (" << node1(chunk.node_at(in.node_idx)) << "), L" << in.target;
             break;
         case OpCode::LoopBackEdge:
             row << "loop.back    cont=L" << in.target << " brk=L" << in.target2;
@@ -576,40 +586,40 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::EvalToSlot:
-            row << "eval.slot    " << D(in.target) << " = " << node1(in.node);
+            row << "eval.slot    " << D(in.target) << " = " << node1(chunk.node_at(in.node_idx));
             break;
         case OpCode::CallBuiltinV:
             row << "call.blt.v   " << D(in.target) << " = "
-                << callee_name(in.node)
+                << callee_name(chunk.node_at(in.node_idx))
                 << arglist(chunk, in.a.lit, in.b.lit);
-            cmt(row, in.node);
+            cmt(row, chunk.node_at(in.node_idx));
             break;
         case OpCode::CallBuiltinLV:
             row << "call.blt.lv  " << D(in.target) << " = "
-                << callee_name(in.node)
+                << callee_name(chunk.node_at(in.node_idx))
                 << "(" << lval_ref(in.a.lit, in.target2) << ", ...)";
-            cmt(row, in.node);
+            cmt(row, chunk.node_at(in.node_idx));
             break;
         case OpCode::EmplaceStruct: {
             const auto *dc =
-                static_cast<const DirectBuiltinCallExpr *>(in.node);
+                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
             const auto *ctor =
                 static_cast<const CallExpr *>(dc->args->elems[1].get());
             const int nf = static_cast<int>(ctor->args->elems.size());
             row << "emplace      " << D(in.target) << " = "
-                << callee_name(in.node) << "("
+                << callee_name(chunk.node_at(in.node_idx)) << "("
                 << lval_ref(in.a.lit, in.target2) << " <- "
                 << std::string(ctor->vm_struct_ctor_def->name->val)
                 << arglist(chunk, in.b.lit, nf) << ")";
-            cmt(row, in.node);
+            cmt(row, chunk.node_at(in.node_idx));
             break;
         }
         case OpCode::CallBuiltinLVElem:
             row << "call.blt.lve " << D(in.target) << " = "
-                << callee_name(in.node) << "("
+                << callee_name(chunk.node_at(in.node_idx)) << "("
                 << lval_ref(in.a.lit, in.target2) << "[" << RI(in.b, false)
                 << "], ...)";
-            cmt(row, in.node);
+            cmt(row, chunk.node_at(in.node_idx));
             break;
         case OpCode::CallV:
             /* AST-free: the callee is a global slot (its name lives in gfuncs,
@@ -728,16 +738,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::LoadCaptureV:
             row << "load.capture " << D(in.target) << ", "
-                << node_name(in.node);
+                << node_name(chunk.node_at(in.node_idx));
             break;
         case OpCode::LoadBuiltinV:
             row << "load.builtin " << D(in.target) << ", "
-                << node_name(in.node);
+                << node_name(chunk.node_at(in.node_idx));
             break;
         case OpCode::SubscriptV:
             row << "subscript.v  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";
-            cmt(row, in.node);
+            cmt(row, chunk.node_at(in.node_idx));
             break;
         case OpCode::MemberV:
             /* AST-free: the member name comes from the member-key pool. */

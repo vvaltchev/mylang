@@ -13311,12 +13311,80 @@ dev_builtin_reserved_in_script()
         && !rejected(false, user_shadow, n2);
 }
 
+/*
+ * The Instr::node field is GONE: a runtime-node op holds a `node_idx` into
+ * Chunk::ast_nodes. Verify (a) a FULLY-NATIVE chunk has an EMPTY pool (the
+ * "serializable" signal), (b) a chunk with a builtin call pools that node and
+ * every node_idx is a valid, non-null pool entry.
+ */
+static bool
+ast_node_pool_minimal()
+{
+    auto compile = [](const std::vector<const char *> &lines,
+                      Chunk &out) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get());
+            resolve_names(root.get());
+            specialize_types(root.get());
+            const Block *b = dynamic_cast<const Block *>(root.get());
+            if (!b)
+                return false;
+            out = codegen_program(b);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+
+    auto indices_valid = [](const Chunk &ch) -> bool {
+        for (const Instr &in : ch.code) {
+            if (in.node_idx < -1)
+                return false;
+            if (in.node_idx >= static_cast<int>(ch.ast_nodes.size()))
+                return false;   /* out-of-range index */
+            if (in.node_idx >= 0 && !ch.ast_nodes[in.node_idx])
+                return false;   /* references a null pool entry */
+        }
+        return true;
+    };
+
+    /* (a) a fully-native int loop (no builtins, no fallback) -> EMPTY pool */
+    Chunk native;
+    if (!compile({"var s = 0;",
+                  "for (var i = 0; i < 10; i++) s += i * i;",
+                  "var out = s;"}, native))
+        return false;
+    if (!native.ast_nodes.empty() || !indices_valid(native))
+        return false;
+
+    /* (b) a builtin call pools its node; indices all valid */
+    Chunk withb;
+    if (!compile({"var s = 5;", "print(s);"}, withb))
+        return false;
+    if (withb.ast_nodes.empty() || !indices_valid(withb))
+        return false;
+
+    return true;
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "builtins: dev-only show() reserved in a script",
       dev_builtin_reserved_in_script },
+    { "vm: Instr node-drop - ast_nodes pool empty for native code",
+      ast_node_pool_minimal },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
     { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },

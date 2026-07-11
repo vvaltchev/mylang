@@ -15,14 +15,15 @@ class Block;
  * and immediates (`#N`), and the instructions are the fused superinstructions
  * (a for-loop counter is ONE `for.step`, not three ops).
  *
- * A fallback op that still carries a `Construct*` - `eval.stmt` / `eval.slot` /
- * `jmp.if.not` / a non-array element op - renders that node via the SHARED AST
- * decompiler (`render_construct_code`, coderender.h), so the AST constructs
- * still embedded in the bytecode are represented with the same code as the AST
- * dump, not a duplicate. As those fallbacks become native ops (the no-fallback
- * end-goal), the disassembly loses its `Construct*` rows and becomes pure
- * bytecode - the disassembler is how we track that progress and audit each
- * bench for wasted cycles.
+ * A runtime-node op - a fallback (`eval.stmt` / `eval.slot` / `jmp.if.not`), a
+ * builtin call, or a flat-store caret - holds its AST node as an INDEX into
+ * `Chunk::ast_nodes` (the `Instr` itself has NO `Construct*` - that is what lets
+ * the bytecode serialize). The disassembler renders that node via the SHARED AST
+ * decompiler (`render_construct_code`, coderender.h) so it reads as the AST
+ * dump, not a duplicate, and dumps the `ast_nodes` pool itself (labelled NOT
+ * serializable). As those ops become native (the no-fallback end-goal) the pool
+ * shrinks toward EMPTY - a fully-native chunk has an empty `ast_nodes`, the
+ * accurate "the AST can be dropped" signal for a stored-bytecode `.myv`.
  *
  * `cap_names` is a CLOSURE's capture list - its anonymous capture-struct field
  * names, in `cN` slot order: the header prints them (`; captures (anon struct):

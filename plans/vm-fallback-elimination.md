@@ -168,16 +168,25 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
     `-nti` now reports `"str"`, not `"hi"`). No new storage. So the ONLY
     node-holding reflection residual is the dev-only `show` (deliberate).
 
-**`node`-field status:** the fallback ops (EvalStmt/EvalToSlot/JumpIfFalse)
-hold `node` to re-enter `node->eval`; the **builtin call ops** hold it for
-per-arg carets (freed by the AST-free-locs / builtin-loc-handle refactor). So
-the order to a `node`-free `Instr` is: (a) nativize F-1..F-4 (mechanical); (b)
-AST-free-locs frees the builtin ops; (c) F-5 (reflection builtins) is the one
-INHERENTLY-node construct - either give it a small serializable "reflect these
-static types" encoding, or accept a `Chunk::ast_nodes` pool for it (a pool of
-`Construct*` blocks freeing the AST but still lets `Instr` shed the field). Only
-after (a)+(b)+(c) is `node` unused → removable, and only with F-5 encoded (not
-pooled) is the bytecode fully AST-free / serializable.
+**`node`-field status: ✅ DROPPED (2026-07-11).** `Instr` no longer holds a raw
+`Construct*` - the field is a 4-byte **`node_idx`** into a new **`Chunk::ast_nodes`**
+pool (`std::vector<const Construct*>`), so the instruction stream has no AST
+pointer to serialize. `Codegen::add_ast_node` pools during codegen; `extract_locs`
+nulls the loc-only ops (their caret is in the loc side table) and a KEEP-list
+marks the genuine runtime-node ops (the fallbacks, the builtin-call ops for their
+args `ExprList`, the flat int/float store's OOB/div0 caret), `default` nulling
+the rest; `compact_ast_nodes` then rebuilds the pool with only the live entries.
+So a **fully-native chunk ends with an EMPTY pool** - a non-empty `ast_nodes` is
+EXACTLY the "this chunk still needs the AST" signal (`-vd` dumps it *NOT
+serializable*). This is the ONE non-serializable pool left; everything else
+(`locs` / `member_keys` / `catch_types` / `literal_objs` / `closure_defs` /
+`struct_defs` / `unpack_targets`) is plain data or by-name re-internable. So the
+`.myv` writer's rule is simple: a chunk with an empty `ast_nodes` serializes; a
+non-empty one keeps its AST (a fallback / a dev-only `show` / an unmigrated
+caret). Remaining to a 100%-serializable image: migrate the flat-store caret to
+the loc table (removes `StoreElemInt`/`Float` from the pool), and the builtin ops
+to a by-name + arg-loc encoding (removes their `ExprList` need) - then only true
+`EvalStmt` fallbacks + dev-`show` keep a node.
 
 ## Remaining work (current — 2026-07-07)
 

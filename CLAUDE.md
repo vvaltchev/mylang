@@ -3472,9 +3472,10 @@ the loc, records it and **NULLs `node`** — making them AST-free. It migrated t
 div/mod carets of `IntBin`/`FloatBin` (throw via `vm_throw_div0(chunk, pc)`,
 which uses `loc_at`, not `node`) and dropped the dead `node` from the
 non-throwing `JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/`ForLoopStep`. So the whole
-register/loop CORE is now `node`-free; the `Instr::node` FIELD stays until the
-remaining users (the `EvalStmt`/`JumpIfFalse` fallbacks, the element/dict/call
-op-data) are migrated too, at which point `Instr` loses the 8-byte field.
+register/loop CORE is now `node`-free. **The `Instr::node` field is now GONE**
+(see *AST-node pool* below): `Instr` holds a 4-byte `node_idx` index into
+`Chunk::ast_nodes`, NOT a raw `Construct*` — so the bytecode has no AST pointer
+to serialize.
 
 **Foundation step 2 — op-data into the CONST POOL (member key, started).**
 `DictLoadInt`/`DictLoadFloat` (the typed `d.k` / `d[k]` read) are now fully
@@ -3554,10 +3555,26 @@ resolved by what each needs (so the ONLY node-holder left is dev-only `show`):
   object is a serializable `LiteralObj`). So the reflection residual is now ONLY
   the dev-only `show` (above), which deliberately keeps its AST.
 
-A fallback op can hold its node as an index into a
-`Chunk::ast_nodes` pool, so `Instr` can shed the 8-byte `node` field WITHOUT
-first nativizing exceptions - the node-drop and the VM-exception work are
-~orthogonal (see `plans/vm-fallback-elimination.md`).
+**The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
+The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index
+into `Chunk::ast_nodes` (a `vector<const Construct*>`), so a serialized `.myv`
+has no AST pointer in its instruction stream. The pool holds ONLY the nodes an
+op still needs at RUNTIME: the fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`,
+`node->eval`), the builtin-call ops (`CallBuiltinV`/`LV`/`LVElem`,
+`EmplaceStruct`, `CheckFuncV`/`MapFilterV` — the args `ExprList` for per-arg
+carets), and the flat int/float element store (`node->start` for its OOB/div0
+caret). Built during codegen (`Codegen::add_ast_node` appends + returns the
+index; the pool absorbs codegen rollbacks harmlessly), then **`extract_locs`
+nulls** the loc-only ops' `node_idx` (their caret is in the loc side table) and
+an explicit KEEP-list marks the genuine runtime-node ops, `default` nulling the
+rest; a final **`compact_ast_nodes`** rebuilds the pool with only the still-live
+entries (dropping the loc-only + rollback orphans). So a **fully-native chunk
+ends with an EMPTY pool** — a non-empty `ast_nodes` is EXACTLY the "this chunk
+still needs the AST, a `.myv` writer must keep it or reject" signal (`-vd` dumps
+it labelled *NOT serializable*). This is the ONE remaining non-serializable pool
+(the loc / member-key / catch-type / literal-obj / closure-def / struct-def /
+unpack-target pools are all plain data or by-name-re-internable). The node-drop
+was ~orthogonal to the VM-exception work (see `plans/vm-fallback-elimination.md`).
 
 **A THIRD side table — `Chunk::inline_ctxs` (`pc → InlineCtx*`, P8 Inc 4).**
 Same shape/cost as `locs` (sorted, binary-searched, throw path only), populated
@@ -3572,11 +3589,13 @@ vs inline-table discussion in `plans/vm-exceptions.md`).
 **The disassembler dumps the WHOLE serializable image, not just funcs
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
-first, then each chunk's code, then that chunk's serializable POOLS + side
-tables (`consts`, `member_keys`, `catch_types`, `literal_objs`, `closure_defs`,
-`struct_defs`, `locs`, `inline_ctxs` - non-empty ones only). This is the audit
-surface for the `.myv` stored-bytecode endgame: everything a serialized file
-must hold is visible in the dump.
+first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
+`member_keys`, `catch_types`, `literal_objs`, `closure_defs`, `struct_defs`,
+`unpack_targets`, the `ast_nodes` pool - labelled *NOT serializable* -, `locs`,
+`inline_ctxs` - non-empty ones only). This is the audit surface for the `.myv`
+stored-bytecode endgame: everything a serialized file must hold is visible in the
+dump, and a non-empty `ast_nodes` is the one section that says the AST can't yet
+be dropped for that chunk.
 
 ## Invariants & hazards (defense in depth)
 

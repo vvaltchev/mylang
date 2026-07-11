@@ -688,13 +688,13 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::EvalStmt: {
 
-            EvalValue &&tmp = in.node->eval(&ctx);
+            EvalValue &&tmp = chunk.node_at(in.node_idx)->eval(&ctx);
 
             /* An unresolved name surfaces as an UndefinedId sentinel, which
              * Block::do_eval turns into UndefinedVariableEx. */
             if (tmp.is<UndefinedId>())
                 throw UndefinedVariableEx(tmp.get<UndefinedId>().id,
-                                          in.node->start, in.node->end);
+                                          chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
 
             /* A `return` from a function body (this statement was a ReturnStmt,
              * or a fallback loop/block that returned) stops the chunk; the
@@ -713,7 +713,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
 
         case OpCode::JumpIfFalse:
-            if (vm_eval_cond(in.node, &ctx))
+            if (vm_eval_cond(chunk.node_at(in.node_idx), &ctx))
                 pc++;
             else
                 pc = in.target;
@@ -916,7 +916,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             } else {
                 /* base_array is PROVEN at this op, so the base is always an
                  * array here - the old node->eval_int fallback was unreachable
-                 * (an invariant net; freeing it drops in.node). */
+                 * (an invariant net; freeing it dropped the op's node). */
                 throw InternalErrorEx();
             }
             pc++;
@@ -1155,7 +1155,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * compiled rvalue is side-effect-free, so re-eval is exact. The base
              * may be a global/capture array (in.target = the slot kind). */
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 const auto sk = arr.skind();
@@ -1167,12 +1167,12 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        throw OutOfBoundsEx(in.node->start, in.node->end);
+                        throw OutOfBoundsEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
                     const int_type rhs = read_int_operand(in.b, &ctx);
                     /* div/mod by zero throws BEFORE any clone (tree-walker
                      * throws during the op eval, before the COW). */
                     if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0)
-                        throw DivisionByZeroEx(in.node->start, in.node->end);
+                        throw DivisionByZeroEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
@@ -1198,7 +1198,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     break;
                 }
             }
-            in.node->eval(&ctx);
+            chunk.node_at(in.node_idx)->eval(&ctx);
             pc++;
             break;
         }
@@ -1206,7 +1206,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::StoreElemFloat: {
 
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::floats
@@ -1215,10 +1215,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        throw OutOfBoundsEx(in.node->start, in.node->end);
+                        throw OutOfBoundsEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
                     const float_type rhs = read_float_operand(in.b, &ctx);
                     if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0.0)
-                        throw DivisionByZeroEx(in.node->start, in.node->end);
+                        throw DivisionByZeroEx(chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
@@ -1238,7 +1238,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     break;
                 }
             }
-            in.node->eval(&ctx);
+            chunk.node_at(in.node_idx)->eval(&ctx);
             pc++;
             break;
         }
@@ -1252,7 +1252,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * (`d[k]`) comes from the loc side table (recorded by extract_locs
              * from node = the Subscript). */
             LValue &dlv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
             const EvalValue &key = ctx.frame->at(in.a.slot).get();
             const EvalValue &val = ctx.frame->at(in.b.slot).get();
             Loc ls, le;
@@ -1302,7 +1302,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * slot_rmw - matches the tree-walker for ANY base). AST-free: the
              * subscript's caret comes from the loc side table. */
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, in.node);
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
             const EvalValue &idx = ctx.frame->at(in.a.slot).get();
             const EvalValue &val = ctx.frame->at(in.b.slot).get();
             Loc ls, le;
@@ -1414,7 +1414,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* A scalar-result call evaluated into a temp (native builtin/call
              * dispatch): the result is then read as an int/float operand. */
-            ctx.frame->at(in.target).put(RValue(in.node->eval(&ctx)));
+            ctx.frame->at(in.target).put(RValue(chunk.node_at(in.node_idx)->eval(&ctx)));
             pc++;
             break;
         }
@@ -1427,7 +1427,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * stamps the args-list loc onto a loc-less error, exactly as
              * DirectBuiltinCallExpr::do_eval does. */
             const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(in.node);
+                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
             const int_type base = in.a.lit, n = in.b.lit;
             try {
                 if (n <= 8) {
@@ -1553,7 +1553,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * Mirrors Identifier::do_eval for each kind: a not-yet-defined
              * global -> null target -> NotLValueEx, like the tree-walker. */
             const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(in.node);
+                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
             LValue *target;
             switch (in.a.lit) {
             case 0:   /* local */
@@ -1592,7 +1592,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * StructObject); vm_emplace_struct handles the flat path + the
              * general fallback and matches the tree-walker append. */
             const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(in.node);
+                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
             LValue *target;
             switch (in.a.lit) {
             case 0:  target = &ctx.frame->at(in.target2); break;
@@ -1625,7 +1625,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * which throws) gives a null target -> NotLValueEx, like the
              * tree-walker. */
             const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(in.node);
+                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
             LValue *base;
             switch (in.a.lit) {
             case 0:  base = &ctx.frame->at(in.target2); break;
@@ -1744,7 +1744,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (!ctx.frame->at(in.a.slot).get()
                      .is<intrusive_ptr<FuncObject>>())
                 throw TypeErrorEx("Expected function",
-                                  in.node->start, in.node->end);
+                                  chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
             pc++;
             break;
 
@@ -1754,7 +1754,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 vm_map_filter(&ctx, ctx.frame->at(in.a.slot).get(),
                               ctx.frame->at(in.b.slot).get(),
                               in.target2 != 0,
-                              in.node->start, in.node->end));
+                              chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end));
             pc++;
             break;
 

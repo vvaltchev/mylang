@@ -723,7 +723,10 @@ struct Operand {
 
 struct Instr {
     OpCode op;
-    const Construct *node = nullptr;  /* fallback op: the AST node; null else */
+    /* Index into Chunk::ast_nodes for an op that still needs the AST at runtime
+     * (fallback / builtin-call / a store's caret); -1 == none. NO raw Construct*
+     * in the Instr - that is what lets the bytecode be serialized. */
+    int32_t node_idx = -1;
     int target = -1;    /* Jump/JumpIfFalse dest; LoopBackEdge cont; IntBin dst
                          * slot; JumpUnlessIntCmp jump dest */
     int target2 = -1;   /* LoopBackEdge exit dest */
@@ -893,4 +896,28 @@ struct Chunk {
      * order, with -1 for a `_` placeholder. `Instr::target` indexes this. Pure
      * data (ints) - serializable. */
     std::vector<std::vector<int32_t>> unpack_targets;
+
+    /*
+     * AST-NODE POOL - the ONE non-serializable pool, holding the raw
+     * `Construct *` of every op that still needs the AST at RUNTIME (an
+     * `Instr::node_idx` indexes it, so `Instr` itself holds NO raw Construct*):
+     *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (they re-enter
+     *     the tree-walker via `node->eval`);
+     *   - the builtin call ops (CallBuiltinV/LV/LVElem, EmplaceStruct, the
+     *     map/filter pair) - the args `ExprList` for per-arg error carets;
+     *   - a handful of store ops that read `node` for their OOB/div0 caret.
+     * A program that lowers 100% natively (no fallback, no dev-builtin) leaves
+     * this EMPTY - so a non-empty `ast_nodes` is EXACTLY the "not yet fully
+     * serializable" signal (a `.myv` writer must reject it or keep the AST).
+     * Program-lifetime AST-owned pointers, like closure_defs / struct_defs.
+     * Built during codegen (add_ast_node), then COMPACTED after extract_locs so
+     * the loc-only nodes it dropped (and any codegen-rollback orphans) leave no
+     * dead entries. `node_at` returns nullptr for the -1 (no-node) sentinel.
+     */
+    std::vector<const Construct *> ast_nodes;
+
+    const Construct *node_at(int idx) const
+    {
+        return idx < 0 ? nullptr : ast_nodes[static_cast<size_t>(idx)];
+    }
 };
