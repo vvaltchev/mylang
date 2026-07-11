@@ -217,12 +217,36 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
 
 **STILL node-holding (the residual `ast_nodes` users):**
 - The **mutating builtin ops** `CallBuiltinLV` / `CallBuiltinLVElem` /
-  `EmplaceStruct`: `insert`/`erase` (rest-native) + `pop`/`intptr` (no value
-  args) need `node` only for carets → could go the `builtin_calls` pool; but
-  **`append`/`push` SELF-EVAL their value arg off the node** (construct-in-place
-  is EmplaceStruct's job, so the residual plain `append(a, expr)` could become
-  REST-NATIVE — pre-evaluate `expr`, share the core with insert/erase — then
-  node-free). That rest-native conversion of append/push is the next increment.
+  `EmplaceStruct`. FULLY SCOPED (2026-07-12) — it is bigger than "append rest-
+  native"; do it as a dedicated careful effort (core builtins, `-rt`+samples
+  gated), NOT a session-end rush:
+  1. **FOUR self-eval builtins to convert**, not two: `append`/`push` self-eval
+     the VALUE + do construct-in-place (`try_construct_into_struct_array`, needs
+     the ctor NODE); `sort`/`rev_sort`/`reverse` self-eval the CMP-func arg off
+     the node (`sort_core`/`reverse_core` read `exprList->elems[1]`). `pop`/
+     `intptr` (no value args) + `insert`/`erase` (already rest-native) are ready.
+  2. **`lvalue_rest_native` is OVERLOADED** as "insert/erase (rest-native) vs
+     append/push/pop (self-eval)". The `EmplaceStruct` gate (codegen ~1929) and
+     the `CallBuiltinLVElem` subscript-target gate (~1881) BOTH key off
+     `!dc->lvalue_rest_native`. So flipping append/push to rest-native SILENTLY
+     BREAKS both gates - they must be re-discriminated (by the builtin identity /
+     the ctor-shape check moved BEFORE the rest run), or insert/erase would start
+     matching EmplaceStruct and append's ctor case would build a temp
+     StructObject (losing emplace).
+  3. **Construct-in-place must stay for the TREE-WALKER** (the default engine) -
+     so append/push need a CUSTOM `func` (like sort's `sort_arr`, holding the
+     node for the ctor path) + a rest-native `func_lv` core; the generic
+     `builtin_lv_adapter` can't hold append-specific ctor logic. `builtin_append`
+     already has (unused) `rest`/`n_rest` params - branch on `rest == nullptr`
+     (tree-walker self-eval + emplace) vs `rest != nullptr` (VM pre-evaluated
+     value).
+  4. THEN migrate the `func_lv` signature `ExprList *` → `ArgLocs` (parallel to
+     the func_v migration - all func_lv builtins; carets from ArgLocs) so no
+     func_lv needs the node, THEN pool `CallBuiltinLV`/`LVElem`/`EmplaceStruct`
+     into `builtin_calls` (like CallBuiltinV) - node-free.
+  Order: (a) append/push rest-native value + gate re-discrimination [+ keep
+  emplace]; (b) sort/reverse cmp-arg rest-native; (c) func_lv→ArgLocs; (d) pool.
+  Each step `-rt` (1421+1266) + samples byte-identical.
 - The **genuine fallback ops** `EvalStmt` / `EvalToSlot` / `JumpIfFalse`: they
   re-enter `node->eval`, so they inherently need the node (reached by true
   fallbacks + dev-`show` + a flat struct-array literal). These are the LEGITIMATE
