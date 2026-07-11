@@ -3657,6 +3657,31 @@ instrumentation (see `plans/function-templates.md`).
   instrumentation on CI* (this + the Linux core-dump artifact), not a bisect.
   `Frame` gained a `size` field (the constructed-slot count) for the bound.
 
+- **The interpreter RECURSES on the C stack — Windows needs a bigger stack
+  reserve.** Both engines recurse: the tree-walker (`do_eval`) and the VM
+  (`vm_run_chunk` is re-entered per recursive call, via `do_func_call`). Deep
+  recursion (the ackermann test, deep `fib`) needs more than **Windows' 1 MB
+  default** stack; Linux and macOS default to **8 MB**, which is why they never
+  hit this. The **fix is a linker flag** — `CMakeLists.txt` sets
+  `/STACK:8388608` (8 MB) for the MSVC build, giving Windows parity (legitimate
+  provisioning for an interpreter, not a workaround). This was a **Windows-CI-
+  only crash** the VM's ackermann test hit (exit 127), that **no Linux tool
+  reproduces** (ASan and `ML_VM_CHECK` do not catch a stack-DEPTH overflow — it
+  is not a slot-bounds bug); it surfaced only after P8 added a `try/catch` EH
+  frame to `vm_run_chunk` (MSVC Debug's EH + `/RTC` + no-scoped-local-overlap
+  frame is much larger than GCC/clang's, tipping it over 1 MB). **Complementary
+  hygiene (keep the recursive frame lean anyway):** an op whose handler needs a
+  sizable stack buffer puts it in an `ML_NOINLINE` helper (e.g. `vm_make_array` /
+  `vm_struct_ctor` / `vm_make_struct_array_op` — the buffer lives in the HELPER's
+  frame, alive only during that op, NOT reserved in every recursive
+  `vm_run_chunk` frame), never inline in the `vm_run_chunk` switch. **To
+  reproduce/measure a deep-recursion stack cost on Linux:** run `-rt` under a
+  smaller stack (`( ulimit -s 1024 && ./mylang -rt )`) — ASan then reports a
+  `stack-overflow in vm_run_chunk`; and `g++ -fstack-usage` (grep the `.su` for
+  `vm_run_chunk`), optionally with `-fstack-reuse=none` to mimic MSVC's
+  no-overlap frame (still an under-estimate — MSVC Debug's EH/`/RTC` overhead is
+  extra).
+
 - **`RECYCLE=1` — the adversarial allocator.** `make RECYCLE=1 TESTS=1` builds a
   `Construct` allocator (a size-keyed LIFO free-list, `syntax.cpp`) that hands a
   just-freed node's address straight back to the next allocation, so any

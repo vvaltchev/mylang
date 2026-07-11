@@ -216,27 +216,83 @@ vm_call_builtin_big(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
     return dc->builtin.func_v(&ctx, dc->args.get(), heapbuf.data(), n);
 }
 
-/* Cold helper for a large array LITERAL (n>16): copy the element values from
- * register run into a heap buffer and build. Keeps the vector code out of the
- * hot vm_run_chunk switch, like vm_call_builtin_big. */
+/* Build an array LITERAL from the register run [base,base+n). ML_NOINLINE and
+ * off vm_run_chunk's body ON PURPOSE: the element buffer (a stack buffer for the
+ * common small n, a heap one past 16) must NOT live in vm_run_chunk's frame -
+ * that frame is MULTIPLIED by VM recursion depth (each recursive call is a
+ * vm_run_chunk frame), and its scoped case-block locals do NOT overlap on every
+ * toolchain (MSVC Debug), so a big inline buffer there overflows a deep
+ * recursion on a small (1MB Windows) stack. The buffer lives here instead. */
 static ML_NOINLINE EvalValue
-vm_make_array_big(EvalContext &ctx, int_type base, int_type n, ArrHint hint)
+vm_make_array(EvalContext &ctx, int_type base, int_type n, ArrHint hint)
 {
+    if (n <= 16) {
+        EvalValue stackbuf[16];
+        for (int_type i = 0; i < n; i++)
+            stackbuf[i] = ctx.frame->at(base + i).get();
+        return build_array_from_values(stackbuf, n, hint, nullptr, false);
+    }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
     for (int_type i = 0; i < n; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
     return build_array_from_values(heapbuf.data(), n, hint, nullptr, false);
 }
 
-/* Cold helper for a large dict LITERAL (npairs>8): copy the interleaved
- * key/value run [base, base + 2*npairs) into a heap buffer and build. */
+/* Build a dict LITERAL from the interleaved key/value run [base, base+2*npairs).
+ * ML_NOINLINE + off vm_run_chunk's frame for the same recursion-stack reason as
+ * vm_make_array (the key/value buffer must not inflate the recursive frame). */
 static ML_NOINLINE EvalValue
-vm_make_dict_big(EvalContext &ctx, int_type base, int_type npairs)
+vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
 {
+    if (npairs <= 8) {
+        EvalValue stackbuf[16];
+        for (int_type i = 0; i < 2 * npairs; i++)
+            stackbuf[i] = ctx.frame->at(base + i).get();
+        return build_dict_from_pairs(stackbuf, npairs, false);
+    }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(2 * npairs));
     for (int_type i = 0; i < 2 * npairs; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
     return build_dict_from_pairs(heapbuf.data(), npairs, false);
+}
+
+/* Construct a POD struct P(x,y) from its field-arg run. ML_NOINLINE + off
+ * vm_run_chunk's frame for the recursion-stack reason above; the caller wraps it
+ * in the defensive loc-stamp try/catch (the throw propagates out of here). */
+static ML_NOINLINE EvalValue
+vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base, int_type nf)
+{
+    if (nf <= 16) {
+        EvalValue vals[16];
+        for (int_type i = 0; i < nf; i++)
+            vals[i] = ctx.frame->at(base + i).get();
+        return EvalValue(construct_struct_from_values(def, vals, nf));
+    }
+    std::vector<EvalValue> heapbuf(static_cast<size_t>(nf));
+    for (int_type i = 0; i < nf; i++)
+        heapbuf[i] = ctx.frame->at(base + i).get();
+    return EvalValue(construct_struct_from_values(def, heapbuf.data(), nf));
+}
+
+/* Build a FLAT array<PodStruct> literal from the N structs' interleaved
+ * field-arg run [base, base+N*M). ML_NOINLINE + off vm_run_chunk's frame for the
+ * recursion-stack reason above (the fused op's field-value buffer must not
+ * inflate the recursive frame). The caller wraps the defensive loc-stamp. */
+static ML_NOINLINE EvalValue
+vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
+                        int_type n)
+{
+    const size_t total = static_cast<size_t>(n) * def->fields.size();
+    if (total <= 32) {
+        EvalValue stackbuf[32];
+        for (size_t k = 0; k < total; k++)
+            stackbuf[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
+        return vm_make_struct_array(def, static_cast<size_t>(n), stackbuf);
+    }
+    std::vector<EvalValue> heapbuf(total);
+    for (size_t k = 0; k < total; k++)
+        heapbuf[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
+    return vm_make_struct_array(def, static_cast<size_t>(n), heapbuf.data());
 }
 
 /* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
@@ -1397,41 +1453,22 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::MakeArrayV: {
 
-            /* Build an array LITERAL from the element run [base,base+n) via the
-             * shared build core the tree-walker's LiteralArray::do_eval uses -
-             * so both engines build byte-identically. `target2` = the ArrHint;
-             * is_const is false (the VM runs at runtime). Never throws. */
-            const int_type base = in.a.lit, n = in.b.lit;
-            const ArrHint hint = static_cast<ArrHint>(in.target2);
-            if (n <= 16) {
-                EvalValue stackbuf[16];
-                for (int_type i = 0; i < n; i++)
-                    stackbuf[i] = ctx.frame->at(base + i).get();
-                ctx.frame->at(in.target).put(
-                    build_array_from_values(stackbuf, n, hint, nullptr, false));
-            } else {
-                ctx.frame->at(in.target).put(
-                    vm_make_array_big(ctx, base, n, hint));
-            }
+            /* Build an array LITERAL via vm_make_array (its element buffer is
+             * kept OUT of vm_run_chunk's frame - see that helper; the frame is
+             * multiplied by VM recursion depth). `target2` = the ArrHint; never
+             * throws. */
+            ctx.frame->at(in.target).put(vm_make_array(
+                ctx, in.a.lit, in.b.lit, static_cast<ArrHint>(in.target2)));
             pc++;
             break;
         }
 
         case OpCode::MakeDictV: {
 
-            /* Build a dict LITERAL from the interleaved key/value run
-             * [base, base + 2*npairs) via the shared build core (which freezes
-             * each key). is_const false; never throws (all values hashable). */
-            const int_type base = in.a.lit, np = in.b.lit;
-            if (np <= 8) {
-                EvalValue stackbuf[16];
-                for (int_type i = 0; i < 2 * np; i++)
-                    stackbuf[i] = ctx.frame->at(base + i).get();
-                ctx.frame->at(in.target).put(
-                    build_dict_from_pairs(stackbuf, np, false));
-            } else {
-                ctx.frame->at(in.target).put(vm_make_dict_big(ctx, base, np));
-            }
+            /* Build a dict LITERAL via vm_make_dict (key/value buffer kept out
+             * of vm_run_chunk's frame). Never throws (all values hashable). */
+            ctx.frame->at(in.target).put(
+                vm_make_dict(ctx, in.a.lit, in.b.lit));
             pc++;
             break;
         }
@@ -1451,19 +1488,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::StructCtorV: {
-            /* Standalone POD struct construction P(x,y): the field arg values
-             * are in the run [a.lit, a.lit + b.lit). Coerce them into the POD
-             * bytes; the typed-arg gate means coerce won't throw, but
-             * a defensive throw is stamped with the ctor's loc (side table). */
+            /* Standalone POD struct construction P(x,y) via vm_struct_ctor (its
+             * field buffer kept out of vm_run_chunk's frame). The typed-arg gate
+             * means coerce won't throw; a defensive throw is stamped with the
+             * ctor's loc (side table). */
             StructTypeDef *def =
                 const_cast<StructTypeDef *>(chunk.struct_defs[in.target2]);
-            const int_type base = in.a.lit, nf = in.b.lit;
-            EvalValue vals[16];
-            for (int_type i = 0; i < nf; i++)
-                vals[i] = ctx.frame->at(base + i).get();
             try {
-                ctx.frame->at(in.target).put(EvalValue(
-                    construct_struct_from_values(def, vals, nf)));
+                ctx.frame->at(in.target).put(
+                    vm_struct_ctor(ctx, def, in.a.lit, in.b.lit));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
@@ -1473,29 +1506,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::MakeStructArrayV: {
-            /* Build a FLAT array<PodStruct> literal `[P(..), P(..), ..]` in one
-             * op: N structs' field args are interleaved in the run [a.lit,
-             * a.lit + N*M), M = def->fields.size(). vm_make_struct_array coerces
-             * them STRAIGHT into a flat byte buffer - no per-element
-             * StructObject. All-scalar-field gate => coerce can't throw; a
-             * defensive throw gets the ctor loc (side table). */
+            /* Build a FLAT array<PodStruct> literal `[P(..), ..]` in one op via
+             * vm_make_struct_array_op (field-value buffer kept out of
+             * vm_run_chunk's frame - it coerces STRAIGHT into a flat byte buffer,
+             * no per-element StructObject). All-scalar-field gate => coerce can't
+             * throw; a defensive throw gets the ctor loc (side table). */
             StructTypeDef *def =
                 const_cast<StructTypeDef *>(chunk.struct_defs[in.target2]);
-            const int_type base = in.a.lit, n = in.b.lit;
-            const size_t total =
-                static_cast<size_t>(n) * def->fields.size();
-            EvalValue stackbuf[32];
-            std::vector<EvalValue> heapbuf;
-            EvalValue *vals = stackbuf;
-            if (total > 32) {
-                heapbuf.resize(total);
-                vals = heapbuf.data();
-            }
-            for (size_t k = 0; k < total; k++)
-                vals[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
             try {
                 ctx.frame->at(in.target).put(
-                    vm_make_struct_array(def, static_cast<size_t>(n), vals));
+                    vm_make_struct_array_op(ctx, def, in.a.lit, in.b.lit));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;

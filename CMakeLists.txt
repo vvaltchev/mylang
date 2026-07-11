@@ -40,6 +40,19 @@ add_executable(mylang ${SOURCES})
 
 target_include_directories(mylang PUBLIC "src")
 
+# The interpreter recurses on the C stack - the tree-walker (do_eval) and the
+# bytecode VM (vm_run_chunk re-entered per recursive call). Deep recursion (e.g.
+# the ackermann test) needs a stack bigger than WINDOWS' 1 MB default (Linux and
+# macOS default to 8 MB, which is why they never hit this). Give the MSVC binary
+# an 8 MB stack RESERVE for parity - a legitimate provisioning for an
+# interpreter, not a workaround. (MSVC Debug's larger per-frame overhead - no
+# scoped-local overlap + /RTC guards + a big try/catch EH frame in vm_run_chunk -
+# makes the VM's deep recursion overflow 1 MB where GCC/clang fit; see the
+# vm_run_chunk stack note in CLAUDE.md.)
+if (MSVC)
+   target_link_options(mylang PUBLIC "/STACK:8388608")
+endif()
+
 if (TESTS)
    target_compile_definitions(mylang PUBLIC "TESTS")
 endif()
