@@ -1309,18 +1309,17 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * (`d[k]`) comes from the loc side table (recorded by extract_locs
              * from node = the Subscript). */
             LValue &dlv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
             const EvalValue &key = ctx.frame->at(in.a.slot).get();
             const EvalValue &val = ctx.frame->at(in.b.slot).get();
-            Loc ls, le;
-            chunk.loc_at(pc, ls, le);
+            /* Loc looked up LAZILY on the throw path only (a successful store -
+             * the hot case - pays no loc_at binary search); vm_subscript_store
+             * uses it only when it throws. */
             try {
-                vm_subscript_store(&dlv, key, val, in.aop, ls, le);
+                vm_subscript_store(&dlv, key, val, in.aop, Loc(), Loc());
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = ls;
-                    e.loc_end = le;
-                }
+                if (!e.loc_start)
+                    chunk.loc_at(pc, e.loc_start, e.loc_end);
                 throw;
             }
             pc++;
@@ -1359,18 +1358,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * slot_rmw - matches the tree-walker for ANY base). AST-free: the
              * subscript's caret comes from the loc side table. */
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, chunk.node_at(in.node_idx));
+                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
             const EvalValue &idx = ctx.frame->at(in.a.slot).get();
             const EvalValue &val = ctx.frame->at(in.b.slot).get();
-            Loc ls, le;
-            chunk.loc_at(pc, ls, le);
+            /* Loc looked up LAZILY on the throw path only (see DictStore). */
             try {
-                vm_subscript_store(&alv, idx, val, in.aop, ls, le);
+                vm_subscript_store(&alv, idx, val, in.aop, Loc(), Loc());
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = ls;
-                    e.loc_end = le;
-                }
+                if (!e.loc_start)
+                    chunk.loc_at(pc, e.loc_start, e.loc_end);
                 throw;
             }
             pc++;
@@ -1386,15 +1382,13 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             const EvalValue &k1 = ctx.frame->at(in.a.slot).get();
             const EvalValue &k2 = ctx.frame->at(in.b.slot).get();
             const EvalValue &val = ctx.frame->at(in.target).get();
-            Loc ls, le;
-            chunk.loc_at(pc, ls, le);
+            /* Loc looked up LAZILY on the throw path only (see DictStore). */
             try {
-                vm_nested_subscript_store(&alv, k1, k2, val, in.aop, ls, le);
+                vm_nested_subscript_store(&alv, k1, k2, val, in.aop,
+                                          Loc(), Loc());
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = ls;
-                    e.loc_end = le;
-                }
+                if (!e.loc_start)
+                    chunk.loc_at(pc, e.loc_start, e.loc_end);
                 throw;
             }
             pc++;
