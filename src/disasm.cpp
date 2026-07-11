@@ -609,23 +609,20 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << arglist(chunk, in.a.lit, in.b.lit);
             break;
         case OpCode::CallBuiltinLV: {
-            /* A valid `b` (is_lit) is a rest-run base: this op is REST-NATIVE
-             * (its value args are pre-evaluated in the run) - show them; else
-             * self-eval (the builtin reads its args off the node -> `...`). */
-            const auto *dc = static_cast<const DirectBuiltinCallExpr *>(
-                chunk.node_at(in.node_idx));
+            /* AST-free: name + arg count from the builtin_calls pool (a.slot).
+             * A valid `b` (is_lit) is a rest-run base (rest-native) - show its
+             * values; `b` unset = no value args (pop/intptr). */
+            const int bcidx = in.a.slot;
             row << "call.blt.lv  " << D(in.target) << " = "
-                << callee_name(dc) << "(" << lval_ref(in.a.lit, in.target2);
-            if (in.b.is_lit && dc && dc->args) {
-                const int nrest =
-                    static_cast<int>(dc->args->elems.size()) - 1;
+                << builtin_call_name(chunk, bcidx)
+                << "(" << lval_ref(in.a.lit, in.target2);
+            if (in.b.is_lit) {
+                const int nrest = static_cast<int>(
+                    chunk.builtin_calls[bcidx].args.size()) - 1;
                 for (int i = 0; i < nrest; i++)
                     row << ", " << reg(chunk, in.b.lit + i);
-                row << ")";
-            } else {
-                row << ", ...)";
             }
-            cmt(row, chunk.node_at(in.node_idx));
+            row << ")";
             break;
         }
         case OpCode::EmplaceStruct: {
@@ -643,20 +640,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::CallBuiltinLVElem: {
-            /* `b` = the run base: run[0] = the index, run[1..] = the value args
-             * (append/push 1, pop 0). */
-            const auto *dc = static_cast<const DirectBuiltinCallExpr *>(
-                chunk.node_at(in.node_idx));
+            /* AST-free: name/arg count from the pool (a.slot). `b` = the run
+             * base: run[0] = the index, run[1..] = the value args (append 1,
+             * pop 0). */
+            const int bcidx = in.a.slot;
             const int nvals =
-                dc && dc->args
-                    ? static_cast<int>(dc->args->elems.size()) - 1 : 0;
-            row << "call.blt.lve " << D(in.target) << " = " << callee_name(dc)
+                static_cast<int>(chunk.builtin_calls[bcidx].args.size()) - 1;
+            row << "call.blt.lve " << D(in.target) << " = "
+                << builtin_call_name(chunk, bcidx)
                 << "(" << lval_ref(in.a.lit, in.target2) << "["
                 << reg(chunk, in.b.lit) << "]";
             for (int i = 0; i < nvals; i++)
                 row << ", " << reg(chunk, in.b.lit + 1 + i);
             row << ")";
-            cmt(row, chunk.node_at(in.node_idx));
             break;
         }
         case OpCode::CallV:

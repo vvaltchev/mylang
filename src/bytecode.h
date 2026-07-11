@@ -345,16 +345,18 @@ enum class OpCode : unsigned char {
     CallBuiltinV,
 
     /*
-     * Native MUTATING-BUILTIN call (append/pop/insert/erase/intptr) with the
-     * lvalue ABI: `node` = the DirectBuiltinCallExpr (baked `builtin.func_lv`
-     * + its args ExprList); `target` = the dst slot; `target2` = arg0's slot;
-     * `a.lit` = arg0's slot KIND (0 local / 1 global / 2 capture). The handler
-     * forms arg0's LValue* straight from the matching table (mirroring
-     * Identifier::do_eval: a not-yet-defined global gives a null target ->
-     * NotLValueEx, as the tree-walker does) and calls func_lv, which mutates
-     * through it and self-evaluates its remaining args (so append keeps
-     * construct-in-place). Emitted only when arg0 is a slotted identifier
-     * (Phase 1); a subscript/member lvalue target stays EvalToSlot for now.
+     * Native MUTATING-BUILTIN call (append/push/pop/insert/erase/intptr/sort/
+     * reverse) with the lvalue ABI. AST-FREE: the Builtin (`func_lv`) + the
+     * ArgLocs (carets + nargs) come from the `builtin_calls` pool (index in
+     * `a.slot`; `a.lit` = arg0's slot KIND 0/1/2). `target` = the dst; `target2`
+     * = arg0's slot; `b` (when is_lit) = a rest-run base of pre-evaluated value
+     * args (REST-NATIVE - insert/erase always, a plain append/push/sort per-op),
+     * unset for a no-value-arg builtin (pop/intptr). The handler forms arg0's
+     * LValue* from the matching table (a not-yet-defined global -> null target ->
+     * NotLValueEx, as the tree-walker) and calls func_lv, which NEVER self-evals
+     * a node (append's construct-in-place is the tree-walker's append_tw + the
+     * VM's EmplaceStruct). Emitted only when arg0 is a slotted identifier; a
+     * subscript target is CallBuiltinLVElem.
      */
     CallBuiltinLV,
 
@@ -932,6 +934,7 @@ struct Chunk {
         al.start = bc.start;
         al.end = bc.end;
         al.args = bc.args.data();
+        al.nargs = bc.args.size();   /* total arg count (a func_lv reads this) */
         al.arr_hint = bc.arr_hint;
         return al;
     }
@@ -942,12 +945,11 @@ struct Chunk {
      * `Instr::node_idx` indexes it, so `Instr` itself holds NO raw Construct*):
      *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (they re-enter
      *     the tree-walker via `node->eval`);
-     *   - the MUTATING / map-filter builtin ops (CallBuiltinLV/LVElem,
-     *     EmplaceStruct, the map/filter pair) - the args `ExprList` for per-arg
-     *     carets AND (append/push) the arg NODE to self-evaluate. The read-only
-     *     value-ABI call (CallBuiltinV) is NO LONGER here: it pools its Builtin +
-     *     carets in `builtin_calls` (serializable), so it holds no node;
-     *   - a handful of store ops that read `node` for their OOB/div0 caret.
+     *   - EmplaceStruct - the ONLY builtin op left here: it needs the ctor node
+     *     (its vm_struct_ctor_def + field-arg carets). The value-ABI (CallBuiltinV)
+     *     AND the mutating lvalue-ABI (CallBuiltinLV / CallBuiltinLVElem) calls
+     *     are NO LONGER here - they pool their Builtin + ArgLocs in
+     *     `builtin_calls` (serializable), so they hold no node.
      * A program that lowers 100% natively (no fallback, no dev-builtin) leaves
      * this EMPTY - so a non-empty `ast_nodes` is EXACTLY the "not yet fully
      * serializable" signal (a `.myv` writer must reject it or keep the AST).

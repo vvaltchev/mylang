@@ -1911,11 +1911,13 @@ struct Codegen {
                         const int dst = alloc_temp();
                         Instr cv;
                         cv.op = OpCode::CallBuiltinLVElem;
-                        cv.node_idx = add_ast_node(dc);
+                        /* AST-free: builtin + carets in the pool (a.slot); a.lit
+                         * = the base slot kind, b = the run base. */
                         cv.target = dst;
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
                         cv.a = int_lit(bkind);
+                        cv.a.slot = add_builtin_call(dc);
                         cv.b = int_lit(runbase);
                         ops.push_back(cv);
                         out_slot = dst;
@@ -2009,10 +2011,12 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr cv;
         cv.op = OpCode::CallBuiltinLV;
-        cv.node_idx = add_ast_node(dc);
+        /* AST-free: the Builtin + arg carets live in the builtin_calls pool
+         * (index in a.slot; a.lit carries the arg0 slot kind). */
         cv.target = dst;
         cv.target2 = static_cast<const Identifier *>(a0)->sym.slot;
         cv.a = int_lit(kind);
+        cv.a.slot = add_builtin_call(dc);
         if (rest_op)
             cv.b = int_lit(restbase);
         ops.push_back(cv);
@@ -4555,9 +4559,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::EvalStmt:
         case OpCode::EvalToSlot:
         case OpCode::JumpIfFalse:
-        case OpCode::CallBuiltinLV:
-        case OpCode::CallBuiltinLVElem:
-        case OpCode::EmplaceStruct:
+        case OpCode::EmplaceStruct:   /* needs the ctor node (def + field carets) */
             break;
         default:
             in.node_idx = -1;

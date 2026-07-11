@@ -334,31 +334,6 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
     return vm_make_struct_array(def, static_cast<size_t>(n), heapbuf.data());
 }
 
-/* Build the AST-free ArgLocs a func_lv takes, from a mutating builtin call's arg
- * ExprList: the whole-args caret, the total arg count (`nargs` - a func_lv's
- * arity check reads this, since a self-eval builtin gets n_rest==0 regardless),
- * the repr hint, and each arg's caret into `buf` (up to `cap`; the func_lv
- * builtins only read arg(0)/arg(1) after their arity check). The func_v path
- * reads its ArgLocs from the builtin_calls pool; this func_lv path still builds
- * it from the node - to be pooled next. */
-static inline ArgLocs
-vm_lv_arglocs(ExprList *el, ArgLoc *buf, size_t cap)
-{
-    const size_t n = el->elems.size();
-    const size_t fill = n < cap ? n : cap;
-    for (size_t i = 0; i < fill; i++) {
-        buf[i].start = el->elems[i]->start;
-        buf[i].end = el->elems[i]->end;
-    }
-    ArgLocs al;
-    al.start = el->start;
-    al.end = el->end;
-    al.args = buf;
-    al.nargs = n;
-    al.arr_hint = el->arr_hint;
-    return al;
-}
-
 /* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
  * the `rest` args - the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
  * lvalue) - from the register run [base, base+n_rest) into a buffer and call
@@ -366,24 +341,24 @@ vm_lv_arglocs(ExprList *el, ArgLoc *buf, size_t cap)
  * CallBuiltinLV case out of vm_run_chunk's hot body. n_rest is small for a valid
  * call (insert 2, erase 1); >8 (a wrong-arity call) heaps. */
 static ML_COLD EvalValue
-vm_call_builtin_lv_rest(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
+vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk &chunk, int bc_idx,
                         LValue *target, int_type base)
 {
-    const int_type n_rest = static_cast<int_type>(dc->args->elems.size()) - 1;
-    ArgLoc locbuf[4];
-    ArgLocs al = vm_lv_arglocs(dc->args.get(), locbuf, 4);
+    const Chunk::BuiltinCall &bc = chunk.builtin_calls[bc_idx];
+    const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
+    ArgLocs al = chunk.arglocs_at(bc_idx);
     if (n_rest <= 8) {
         EvalValue stackbuf[8];
         for (int_type i = 0; i < n_rest; i++)
             stackbuf[i] = ctx.frame->at(base + i).get();
-        return dc->builtin.func_lv(&ctx, &al, target, stackbuf,
-                                   static_cast<size_t>(n_rest));
+        return bc.builtin.func_lv(&ctx, &al, target, stackbuf,
+                                  static_cast<size_t>(n_rest));
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n_rest));
     for (int_type i = 0; i < n_rest; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
-    return dc->builtin.func_lv(&ctx, &al, target, heapbuf.data(),
-                               static_cast<size_t>(n_rest));
+    return bc.builtin.func_lv(&ctx, &al, target, heapbuf.data(),
+                              static_cast<size_t>(n_rest));
 }
 
 /* Cold helper for EmplaceStruct (Phase 2b): copy the ctor's field arg values
@@ -1624,17 +1599,14 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::CallBuiltinLV: {
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*
-             * from its slot table (by kind), then call func_lv - which mutates
-             * through it. A REST-NATIVE builtin (insert/erase) gets its `rest`
-             * args - the TAIL ARGS BY VALUE (args 1..n, everything after the
-             * arg0 lvalue) - pre-evaluated from the register run at `b` (no
-             * node->eval); a self-eval one (append/push/pop/intptr) gets
-             * rest=null and reads its args off the node (so append keeps
-             * construct-in-place). Mirrors Identifier::do_eval for each kind: a
-             * not-yet-defined global -> null target -> NotLValueEx, like the
-             * tree-walker. */
-            const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
+             * from its slot table (by kind = a.lit), then call func_lv - which
+             * mutates through it. AST-FREE: the Builtin + carets come from the
+             * builtin_calls pool (a.slot). A REST-NATIVE op (`b` set) gets its
+             * value args from the register run at `b`; a `b`-unset op (pop/intptr
+             * - no value args) gets an empty rest. Mirrors Identifier::do_eval
+             * for each kind: a not-yet-defined global -> null target ->
+             * NotLValueEx, like the tree-walker. */
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.a.slot];
             LValue *target;
             switch (in.a.lit) {
             case 0:   /* local */
@@ -1648,25 +1620,20 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 target = &(*ctx.captures)[in.target2];
                 break;
             }
-            /* PER-OP rest-native: a valid `b` (a compiled rest-run base) marks
-             * THIS op rest-native - insert/erase (always) OR a plain
-             * append/push whose value the codegen pre-evaluated (rest-capable).
-             * `b` unset = NO value args (pop/intptr): func_lv gets an empty rest
-             * (the ArgLocs give it its carets/arity - never a self-eval node). */
             try {
                 if (in.b.is_lit) {
                     ctx.frame->at(in.target).put(
-                        vm_call_builtin_lv_rest(ctx, dc, target, in.b.lit));
+                        vm_call_builtin_lv_rest(ctx, chunk, in.a.slot, target,
+                                                in.b.lit));
                 } else {
-                    ArgLoc locbuf[4];
-                    ArgLocs al = vm_lv_arglocs(dc->args.get(), locbuf, 4);
+                    ArgLocs al = chunk.arglocs_at(in.a.slot);
                     ctx.frame->at(in.target).put(
-                        dc->builtin.func_lv(&ctx, &al, target, nullptr, 0));
+                        bc.builtin.func_lv(&ctx, &al, target, nullptr, 0));
                 }
             } catch (Exception &e) {
                 if (!e.loc_start) {
-                    e.loc_start = dc->args->start;
-                    e.loc_end = dc->args->end;
+                    e.loc_start = bc.start;
+                    e.loc_end = bc.end;
                 }
                 throw;
             }
@@ -1714,9 +1681,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * run[1..] = the pre-evaluated value args (append/push 1, pop 0). A
              * non-lvalue element (a flat scalar / read-only / missing dict key,
              * which throws) gives a null target -> NotLValueEx, like the
-             * tree-walker. */
-            const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
+             * tree-walker. AST-FREE: Builtin + carets from the pool (a.slot). */
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.a.slot];
             LValue *base;
             switch (in.a.lit) {
             case 0:  base = &ctx.frame->at(in.target2); break;
@@ -1724,9 +1690,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                          ? &ctx.gfuncs->slots[in.target2] : nullptr; break;
             default: base = &(*ctx.captures)[in.target2]; break;
             }
-            const Construct *sub = dc->args->elems[0].get();
-            const int_type n_rest =
-                static_cast<int_type>(dc->args->elems.size()) - 1;
+            const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
                 EvalValue holder;   /* keeps the subscript result alive */
                 LValue *elem = nullptr;
@@ -1740,16 +1704,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 EvalValue restbuf[8];   /* n_rest is small (append 1, pop 0) */
                 for (int_type i = 0; i < n_rest; i++)
                     restbuf[i] = ctx.frame->at(in.b.lit + 1 + i).get();
-                ArgLoc locbuf[4];
-                ArgLocs al = vm_lv_arglocs(dc->args.get(), locbuf, 4);
+                ArgLocs al = chunk.arglocs_at(in.a.slot);
                 ctx.frame->at(in.target).put(
-                    dc->builtin.func_lv(&ctx, &al, elem,
-                                        n_rest ? restbuf : nullptr,
-                                        static_cast<size_t>(n_rest)));
+                    bc.builtin.func_lv(&ctx, &al, elem,
+                                       n_rest ? restbuf : nullptr,
+                                       static_cast<size_t>(n_rest)));
             } catch (Exception &e) {
                 if (!e.loc_start) {
-                    e.loc_start = sub->start;
-                    e.loc_end = sub->end;
+                    /* the subscript's caret = arg0 (the a[i] target). */
+                    e.loc_start = bc.args[0].start;
+                    e.loc_end = bc.args[0].end;
                 }
                 throw;
             }
