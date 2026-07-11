@@ -381,19 +381,31 @@ attempt, reverted); D4-overflow foo$dyn deferred]**;
 (e) audit each fallback op is unemitted, then DELETE + abort-guard **[AUDIT
 DONE — the premise was WRONG: the ops are NOT unemitted. Instrumenting the whole
 `-rt` run caught ~199 `EvalStmt` + 8 `EvalToSlot` + 2 `JumpIfFalse` across ~15
-construct categories, so they CANNOT be deleted. But the BENCHES/SAMPLES
-compiled chunks are 100% native, and every REAL-CODE construct is native — the
-remaining `-rt` fallbacks are (1) DELIBERATE error tests (the tree-walker
-produces the exact runtime error), (2) REPL open-world (map-based names),
-(3) `-nti` (inference off): the fallback ops are the by-DESIGN completeness net
-for those, not real-code gaps. Tractable real-code categories nativized:
-**standalone `{ }` block statements** (scope-free → `gen_stmts`; the biggest
-single category, -34) and
-**string `foreach`** (`container_is_str` + `StrLen`/`LoadStrChar` counted loop,
-single + indexed). A broad script (structs / blocks / foreach / dyn / closures)
-now compiles with ZERO fallbacks. So op DELETION stays deferred (the net is
-needed for REPL/-nti/errors); "real scripts fully native" is the achieved
-milestone]**. Each step `-rt` (differential) + samples byte-identical.
+construct categories, so they CANNOT be deleted. The `-vm` differential is
+SCRIPT-mode + inference-ON (the `repl:` tests are a separate list; `check()`
+never sets `-nti`), so those fallbacks are NOT REPL/-nti — they are (1)
+DELIBERATE error tests (the tree-walker produces the exact runtime error — an
+undefined-NAME call `undefined_fn(..)`, a not-an-lvalue assign `true = false`),
+plus (2) a SMALL set of genuine real-code construct gaps. Per-construct audit
+(reproduced each in a normal correct script) — REMAINING SCRIPT-MODE REAL-CODE
+GAPS: `foreach` over `array<bool>` (the flat bool byte needs a scalar read, no
+`LoadElemBool`); a SLICE ASSIGNMENT `a[i:j] = [..]` (slice READS are native
+`SliceV`, stores aren't); a NAMED nested func that CAPTURES an outer local (an
+anonymous capturing lambda IS native, e.g. `adder`); a 3+-var dict `foreach`;
+`D4`-overflow (>64 DISTINCT type signatures — the base tree-walks; rare, needs
+65+ types). CONFIRMED NATIVE (not gaps): the whole exception path (P8), an
+undefined-GLOBAL read (`LoadGlobalV` throws), compound dict-member assign,
+multi-assign/swap, 2-var array-unpack `foreach`, discarded mutating builtins,
+nested/boxed struct construction, closures + non-capturing nested funcs. The
+BENCHES/SAMPLES compiled chunks are 100% native (verified `-vd` + a broad
+structs/blocks/foreach/dyn/closures script → ZERO fallbacks). Tractable
+categories nativized this step: **standalone `{ }` block statements**
+(scope-free → `gen_stmts`; biggest category, -34) and **string `foreach`**
+(`container_is_str` + `StrLen`/`LoadStrChar`). Op DELETION stays deferred (the
+net is still needed for the error paths + `-nti -vm` + the few real gaps above);
+"typical scripts fully native" is the achieved milestone. NEXT tractable
+real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
+(differential) + samples byte-identical.
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then
