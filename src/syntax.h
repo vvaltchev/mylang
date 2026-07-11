@@ -743,6 +743,16 @@ public:
      * flat struct array's bytes - no temporary StructObject. */
     const StructTypeDef *vm_struct_ctor_def = nullptr;
 
+    /* Set by the inferencer's fold_type_query when this is a type-query builtin
+     * call (type/decltype/typestr/kindstr) whose answer it BAKED into args[0] (a
+     * LiteralStr/LiteralObj). The call is then equivalent to args[0], so the VM
+     * codegen ELIDES it (emits the baked constant, no builtin call). NOT set
+     * under -nti (no fold ran), so a `typestr("hi")` there stays a real call
+     * that builds from the runtime value (returns "str", not "hi") - which is
+     * why a content check on args[0] alone would be unsound and this flag is
+     * needed. */
+    bool tq_folded = false;
+
     CallExpr() : Construct("CallExpr") { }
     explicit CallExpr(const char *name) : Construct(name) { }
     void serialize(ostream &s, int level = 0) const override;
@@ -756,6 +766,7 @@ public:
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
+        c->tq_folded = tq_folded;
         return c;
     }
 };
@@ -858,6 +869,7 @@ public:
         c->lvalue_arg0 = lvalue_arg0;
         c->lvalue_rest_native = lvalue_rest_native;
         c->map_filter_kind = map_filter_kind;
+        c->tq_folded = tq_folded;
         return c;
     }
 };

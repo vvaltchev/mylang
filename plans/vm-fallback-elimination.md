@@ -155,15 +155,18 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
     flag so it works there. So `show` NEVER reaches serialized bytecode - the
     `.myv` goal is unblocked without nativizing it. (`:show` is a REPL
     meta-command, never a builtin, unchanged.)
-  - **`type`/`typestr`/`kindstr`/`decltype` — PENDING (not dev-only; real script
-    features).** The inferencer already FOLDS them to a baked literal
-    (`typestr("int")`, `type(<LiteralObj>)`) in the common case, so: (1) ELIDE
-    the folded call at codegen (emit the constant, drop the call - AST-free +
-    faster); (2) migrate the rare non-folded path (`-nti` / still-`Unknown` arg
-    type) to the VALUE ABI (`func_v`), building the `Type`/string from the
-    pre-evaluated value. Neither needs the node. No new storage - struct defs
-    are already in `Chunk::struct_defs` and carried by each struct value's
-    `def`; the folded `Type` object is a serializable `LiteralObj`.
+  - **`type`/`typestr`/`kindstr`/`decltype` — ✅ DONE (2026-07-11).** (1) The
+    inferencer's `fold_type_query` sets `CallExpr::tq_folded` when it bakes the
+    answer into `args[0]`; both engines then ELIDE the folded call (return the
+    baked literal - the VM a `LoadConstV`/`LoadLiteralObjV`, the tree-walker in
+    `do_eval`), so the common case is a plain constant, no call, AST-free +
+    faster. (2) The rare non-folded query (`-nti` / `Unknown` arg) is a dual-ABI
+    builtin (`make_builtin_customv`): a custom `func` + a `func_v` (the VM's
+    `CallBuiltinV`), BOTH always building the `Type`/string from the runtime
+    value. The flag (not a node `dynamic_cast<Literal>` check) is what keeps it
+    `-nti`-correct AND fixed a latent tree-walker bug (`typestr("hi")` under
+    `-nti` now reports `"str"`, not `"hi"`). No new storage. So the ONLY
+    node-holding reflection residual is the dev-only `show` (deliberate).
 
 **`node`-field status:** the fallback ops (EvalStmt/EvalToSlot/JumpIfFalse)
 hold `node` to re-enter `node->eval`; the **builtin call ops** hold it for

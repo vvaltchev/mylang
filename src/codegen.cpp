@@ -989,6 +989,19 @@ struct Codegen {
             if (try_native_call(dc, out_slot, ops))
                 return true;
 
+        /* A FOLDED type query (type/decltype/typestr/kindstr): the inferencer
+         * BAKED the answer into args[0] (a LiteralStr/LiteralObj) and the
+         * builtin just returns it - so ELIDE the call and compile that baked
+         * literal directly (LoadConstV / LoadLiteralObjV), no builtin call,
+         * AST-free. (tq_folded is set only when the fold ran, so a -nti
+         * `typestr("hi")` is NOT elided - it stays a real call building from the
+         * value.) The NON-folded type query is a value-ABI builtin below. */
+        if (const DirectBuiltinCallExpr *bc =
+                dynamic_cast<const DirectBuiltinCallExpr *>(e))
+            if (bc->tq_folded && bc->args && bc->args->elems.size() == 1)
+                return compile_boxed_expr(bc->args->elems[0].get(), out_slot,
+                                          ops);
+
         /* A native builtin call. map/filter get the validate-first sequence
          * (CheckFuncV + MapFilterV); value-ABI builtins get CallBuiltinV. */
         if (const DirectBuiltinCallExpr *bc =

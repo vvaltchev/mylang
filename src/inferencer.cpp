@@ -3487,6 +3487,9 @@ bool Inferencer::fold_type_query(CallExpr *call)
         args->elems[0] = make_unique<LiteralStr>(std::string_view(
             is_kindstr ? std::string(static_type_kind_string(t)) :
                 static_type_to_string(t)));
+    /* The call now just returns args[0] (the baked literal), so the VM codegen
+     * can ELIDE it to a plain constant load - mark it. */
+    call->tq_folded = true;
     return true;
 }
 

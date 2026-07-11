@@ -86,26 +86,28 @@ static EvalValue make_runtime_type_value(const EvalValue &v)
  * time (a baked const LiteralObj) and these hand it back; the body below runs
  * only under -nti, building a flat Type from the runtime value.
  */
+/*
+ * NOTE: a FOLDED type query never reaches these `func` bodies - both engines
+ * elide it (return the baked args[0]): the VM at codegen, the tree-walker in
+ * CallExpr/DirectBuiltinCallExpr::do_eval (keyed on CallExpr::tq_folded). So
+ * these run ONLY for a NON-folded query (a `dyn`/Unknown-typed arg, or -nti),
+ * where they build the type from the runtime VALUE - identical to the func_v
+ * forms. (A node-based `dynamic_cast<Literal...>` "is it folded?" check would be
+ * WRONG here: a user's own `typestr("hi")` arg is also a literal, so under -nti
+ * it must still report "str", not "hi".)
+ */
 EvalValue builtin_type(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg = exprList->elems[0].get();
-    if (dynamic_cast<LiteralObj *>(arg))   /* folded Type object */
-        return RValue(arg->eval(ctx));
-    return make_runtime_type_value(RValue(arg->eval(ctx)));
+    return make_runtime_type_value(RValue(exprList->elems[0]->eval(ctx)));
 }
 
 EvalValue builtin_decltype(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg = exprList->elems[0].get();
-    if (dynamic_cast<LiteralObj *>(arg))   /* folded Type object */
-        return RValue(arg->eval(ctx));
-    return make_runtime_type_value(RValue(arg->eval(ctx)));
+    return make_runtime_type_value(RValue(exprList->elems[0]->eval(ctx)));
 }
 
 /*
@@ -121,22 +123,52 @@ EvalValue builtin_typestr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    Construct *arg = exprList->elems[0].get();
-    if (dynamic_cast<LiteralStr *>(arg))   /* folded by the inferencer */
-        return RValue(arg->eval(ctx));
-    return SharedStr(reflect_typeof(RValue(arg->eval(ctx))));
+    return SharedStr(reflect_typeof(RValue(exprList->elems[0]->eval(ctx))));
 }
 
 EvalValue builtin_kindstr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+    return TypeNames[RValue(exprList->elems[0]->eval(ctx)).get_type()->t];
+}
 
-    Construct *arg = exprList->elems[0].get();
-    if (dynamic_cast<LiteralStr *>(arg))   /* folded by the inferencer */
-        return RValue(arg->eval(ctx));
-    return TypeNames[RValue(arg->eval(ctx)).get_type()->t];
+/*
+ * Value-ABI (func_v) forms of the four type queries, for the VM's CallBuiltinV.
+ * The VM only reaches these for a NON-FOLDED query (the FOLDED case is elided at
+ * codegen to a plain constant - the baked literal - so it never becomes a call
+ * there). So these always build from the runtime VALUE - the exact NON-folded
+ * branch of the func bodies above (make_runtime_type_value / reflect_typeof /
+ * TypeNames), keeping the two engines byte-identical on the differential. The
+ * ExprList is passed for arity/locs only; args[0] is the pre-evaluated value.
+ */
+EvalValue builtin_type_v(EvalContext *, ExprList *el, const EvalValue *args,
+                         size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(el->start, el->end);
+    return make_runtime_type_value(args[0]);
+}
+EvalValue builtin_decltype_v(EvalContext *, ExprList *el, const EvalValue *args,
+                             size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(el->start, el->end);
+    return make_runtime_type_value(args[0]);
+}
+EvalValue builtin_typestr_v(EvalContext *, ExprList *el, const EvalValue *args,
+                            size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(el->start, el->end);
+    return SharedStr(reflect_typeof(args[0]));
+}
+EvalValue builtin_kindstr_v(EvalContext *, ExprList *el, const EvalValue *args,
+                            size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(el->start, el->end);
+    return TypeNames[args[0].get_type()->t];
 }
 
 const std::array<Type *, Type::t_count> AllTypes =
@@ -231,6 +263,22 @@ bool is_dev_builtin(const UniqueId *uid)
     return g_dev_builtin_ids.count(uid) != 0;
 }
 bool g_dev_builtins_allowed = false;
+
+/*
+ * A builtin with a CUSTOM tree-walker `func` AND a value-ABI `func_v` (for the
+ * VM's CallBuiltinV) - the two are DIFFERENT implementations, unlike
+ * make_builtin_v (where `func` is a generic adapter over `func_v`). Used by the
+ * type queries: the `func` distinguishes a folded arg (return it) from a runtime
+ * one (build from it) via the NODE, while `func_v` always builds from the value
+ * (the VM only reaches it non-folded - the folded case is elided at codegen).
+ */
+inline auto make_builtin_customv(const char *name, decltype(Builtin::func) f,
+                                 decltype(Builtin::func_v) fv)
+{
+    Builtin b{f};
+    b.func_v = fv;
+    return make_pair(UniqueId::get(name), LValue(b, false));
+}
 
 /*
  * Cold n>8 path for the adapter below: heap-allocate the arg buffer.
@@ -471,10 +519,10 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* Compile-time type queries (folded by the inferencer; the runtime body is
      * a -nti fallback). decltype(var) takes a variable; typestr/kindstr take an
      * expression - the full structural string vs the bare kind. */
-    make_builtin("type", builtin_type),
-    make_builtin("decltype", builtin_decltype),
-    make_builtin("typestr", builtin_typestr),
-    make_builtin("kindstr", builtin_kindstr),
+    make_builtin_customv("type", builtin_type, builtin_type_v),
+    make_builtin_customv("decltype", builtin_decltype, builtin_decltype_v),
+    make_builtin_customv("typestr", builtin_typestr, builtin_typestr_v),
+    make_builtin_customv("kindstr", builtin_kindstr, builtin_kindstr_v),
 
     /* Runtime reflection (see builtins/reflect.cpp.h) */
     make_builtin_v<builtin_globals>("globals"),

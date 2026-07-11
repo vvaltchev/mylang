@@ -2018,6 +2018,24 @@ static const std::vector<test> tests =
             "assert(kindstr({1:2}) == \"dict\");",
         },
     },
+    {
+        /* Folded type queries: the inferencer bakes the answer into a literal
+         * and BOTH engines elide the call (the VM to a constant load, the
+         * tree-walker in do_eval) - so this runs identically under the
+         * differential, including in an EXPRESSION position and on a struct. */
+        "type queries fold + elide, values correct",
+        {
+            "var x = 5;",
+            "var s = typestr(x) + \"!\";",   /* in an expression */
+            "assert(s == \"int!\");",
+            "assert(kindstr([1, 2, 3]) == \"array\");",
+            "assert(decltype(x).name == \"int\");",
+            "struct Q { int a; float b; }",
+            "var q = Q(1, 2.0);",
+            "assert(typestr(q) == \"Q\" && kindstr(q) == \"struct\");",
+            "assert(type(q).kind == \"struct\");",
+        },
+    },
     { "exit() with no args is rejected",
       { "exit();" }, &typeid(InvalidNumberOfArgsEx) },
     { "exit() with a non-integer is a type error",

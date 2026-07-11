@@ -1249,6 +1249,14 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
 
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    /* A FOLDED type query (type/decltype/typestr/kindstr): the inferencer baked
+     * the answer into args[0], so the call just returns it - hand it back
+     * WITHOUT dispatching to the builtin. Consistent with the VM's codegen
+     * elision; and it is what lets the builtin `func` always build-from-value
+     * (the non-folded case), since the folded literal never reaches it. */
+    if (tq_folded)
+        return RValue(args->elems[0]->eval(ctx));
+
     EvalValue callable_storage;
 
     /* Point an undefined-callee error at the callee, not the whole call. */
@@ -1357,6 +1365,10 @@ EvalValue CachedCallExpr::do_eval(EvalContext *ctx, bool rec) const
  */
 EvalValue DirectBuiltinCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    /* A folded type query returns its baked args[0] (see CallExpr::do_eval). */
+    if (tq_folded)
+        return RValue(args->elems[0]->eval(ctx));
+
     try {
         return builtin.func(ctx, args.get());
     } catch (Exception &e) {

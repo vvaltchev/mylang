@@ -1309,10 +1309,20 @@ decisions behind it: `plans/type-inference.md`,
   `typestr` (`static_type_to_string`) / `kindstr` (`static_type_kind_string` -
   the bare kind,
   matching runtime `TypeNames`), or a baked **const `LiteralObj` Type object**
-  (`build_type_value(StaticType)`, recursive) for `type`/`decltype`. The runtime
-  builtin (`types.cpp`) returns args[0]; under `-nti` it builds from the runtime
-  value instead (`make_runtime_type_value` - a flat Type; `reflect_typeof` for
-  the strings). `Type` is a native composite type (`native_struct_type_def`,
+  (`build_type_value(StaticType)`, recursive) for `type`/`decltype`. It also sets
+  **`CallExpr::tq_folded`**, so the call (which now just returns `args[0]`) is
+  **ELIDED by BOTH engines** — the VM at codegen (a `LoadConstV`/
+  `LoadLiteralObjV` of the baked literal, no builtin call), the tree-walker in
+  `CallExpr`/`DirectBuiltinCallExpr::do_eval`. The **runtime builtins run ONLY
+  for a NON-folded query** (an `Unknown`-typed arg, or `-nti`, where no fold
+  ran): both the tree-walker `func` AND the VM's `func_v` (a **dual-ABI**
+  `make_builtin_customv` registration) always build the `Type`/string from the
+  runtime VALUE (`make_runtime_type_value` - a flat Type; `reflect_typeof` for
+  the strings). The `tq_folded` FLAG - not a node `dynamic_cast<Literal>` check -
+  is what keeps this `-nti`-correct: a user's own `typestr("hi")` is a literal
+  too, so under `-nti` it must still report `"str"`, not `"hi"` (the old
+  node-check heuristic was a latent tree-walker bug, now fixed). `Type` is a
+  native composite type (`native_struct_type_def`,
   recursive via `opt Type` elem/key/val) registered in `struct_by_name` and
   typed by `builtin_result`. So `type(a)?.elem?.kind` works (the `opt Type`
   elem/key/val are read with optional chaining `?.`, or narrowed with `if`);
@@ -3511,8 +3521,8 @@ fallbacks in several more shapes — **F-1..F-4, all now NATIVE**: the multi-ass
 / IdList forms (`MultiUnpackV`), the residual `foreach` shapes (2-var dyn
 container, indexed general-value unpack), the discarded-result indirect call
 (`CallValueV` as a statement), and the flat `array<PodStruct>` literal (the
-fused `MakeStructArrayV`). **The residual is the reflection builtins**, split by
-what they need:
+fused `MakeStructArrayV`). **The last residual was the reflection builtins**,
+resolved by what each needs (so the ONLY node-holder left is dev-only `show`):
 - **`show()` — DEV-ONLY builtin** (the `make_dev_builtin` category, `types.cpp`;
   `is_dev_builtin` / `g_dev_builtins_allowed`, `eval.h`): it decompiles the AST,
   which a compiled script does not retain, so it is a DELIBERATE dev affordance —
@@ -3523,13 +3533,26 @@ what they need:
   serialized script bytecode — it keeps its AST node without blocking the
   `Construct*`-free `.myv` goal. The REPL uses the `:show` meta-command (never a
   bytecode builtin) unchanged.
-- **`type`/`typestr`/`kindstr`/`decltype` — still fallback ops** (pending): the
-  inferencer already folds them to a baked literal (`typestr("int")`) in the
-  common case, so the plan is to ELIDE the folded call at codegen (emit the
-  constant) and migrate the rare non-folded path (`-nti` / `Unknown` arg type)
-  to the value ABI (`func_v`, building the `Type`/string from the pre-evaluated
-  value). Neither needs the node; no new storage (struct defs are already in
-  `Chunk::struct_defs` + the value's own `def`).
+- **`type`/`typestr`/`kindstr`/`decltype` — DONE (AST-free).** Two moves:
+  (1) the inferencer's `fold_type_query` already bakes the answer into `args[0]`
+  (a `LiteralStr`/`LiteralObj`) in the common case and sets **`CallExpr::tq_folded`**
+  — so both engines **ELIDE** the folded call (return the baked `args[0]`): the
+  VM at codegen (a plain `LoadConstV`/`LoadLiteralObjV`, no call), the
+  tree-walker in `CallExpr`/`DirectBuiltinCallExpr::do_eval`. The flag (not a
+  `dynamic_cast<Literal>` node check) is what makes it `-nti`-correct: under
+  `-nti` no fold runs, so a user's `typestr("hi")` is NOT elided and must report
+  `"str"`, not `"hi"`. (2) The rare NON-folded query (`-nti` / a still-`Unknown`
+  arg type) is a **dual-ABI builtin** (`make_builtin_customv`): a custom `func`
+  (tree-walker) and a `func_v` (the VM's `CallBuiltinV`), BOTH always building
+  the `Type`/string from the runtime VALUE (`make_runtime_type_value` /
+  `reflect_typeof` / `TypeNames`) — the folded literal never reaches them (it's
+  elided), so there is no node-based folded/non-folded ambiguity and the two
+  engines stay byte-identical. This also fixed a latent tree-walker `-nti` bug
+  (the old `dynamic_cast<LiteralStr>` heuristic wrongly returned a user
+  string-literal arg instead of its type). No new storage (struct defs are
+  already in `Chunk::struct_defs` + each value's own `def`; the folded `Type`
+  object is a serializable `LiteralObj`). So the reflection residual is now ONLY
+  the dev-only `show` (above), which deliberately keeps its AST.
 
 A fallback op can hold its node as an index into a
 `Chunk::ast_nodes` pool, so `Instr` can shed the 8-byte `node` field WITHOUT
