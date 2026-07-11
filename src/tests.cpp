@@ -571,6 +571,25 @@ static const std::vector<test> tests =
     },
 
     {
+        /* A template used as a VALUE (stored/passed, dispatched INDIRECTLY) is
+         * NOT a dead base template: its indirect call runs the base body, so the
+         * AOT compile keeps its chunk. A DIRECT call to the same template is
+         * redirected to a concrete instance. Both must run identically on the
+         * tree-walker AND the VM (the differential harness runs this twice). */
+        "indirect dispatch of a template runs the base (kept, not skipped)",
+        {
+            "func inc(x) { return x + 1; }",
+            "func twice(x) { return x + x; }",
+            "assert(inc(10) == 11);",           /* direct -> instance */
+            "var ops = {\"i\": inc, \"t\": twice};",  /* value use -> base kept */
+            "assert(ops[\"i\"](4) == 5);",      /* indirect -> runs base */
+            "assert(ops[\"t\"](4) == 8);",
+            "var g = inc;",
+            "assert(g(20) == 21);",             /* indirect via a var */
+        },
+    },
+
+    {
         "simple func",
         {
             "func add(a, b) {",

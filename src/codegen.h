@@ -4,7 +4,21 @@
 
 #include "bytecode.h"
 
+#include <vector>
+
 class Block;
+class Construct;
+class FuncDeclStmt;
+
+/*
+ * Collect every FuncDeclStmt reachable from `c` - a COMPLETE walk, so a lambda
+ * in ANY expression position (a `return func[..]{..}`, a `var f = func..`, a
+ * call arg, a ternary branch, ...) is found too, not only top-level / body-
+ * statement functions. Each FuncDeclStmt's own body is recursed for nested
+ * closures. Used by the VM's AOT precompile and the -vd dump.
+ */
+void collect_funcs(const Construct *c,
+                   std::vector<const FuncDeclStmt *> &out);
 
 /*
  * Lower a Block's statements to a bytecode Chunk. `slot_count` is the frame's
@@ -16,3 +30,19 @@ Chunk codegen_chunk(const Block *block, int slot_count);
 
 /* The root/main wrapper: codegen_chunk(root, root->slot_count). */
 Chunk codegen_program(const Block *root);
+
+/*
+ * Compile ONE function's body to a runnable chunk, applying the VM's
+ * compile gate. Returns true (and fills `out`) iff the body is a natively-
+ * runnable chunk; false when the function must tree-walk instead:
+ *   - a BASE TEMPLATE (`is_template_base`): a monomorphization source, never
+ *     called → never compiled (so it is absent from the compiled chunk set, and
+ *     hence from -vd — faithfully, not filtered);
+ *   - a non-block or NON-scope-free body (a closure / nested-func body needs its
+ *     own child EvalContext, which vm_run_chunk doesn't build);
+ *   - an ALL-FALLBACK body (only EvalStmt / control-flow ops): running it via
+ *     the VM would only add dispatch over the tree-walker, no win.
+ * This is the single source of truth for "which functions have bytecode",
+ * shared by the VM's AOT precompile (vm.cpp) and the -vd dump (disasm.cpp).
+ */
+bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out);

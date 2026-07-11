@@ -4688,3 +4688,91 @@ codegen_program(const Block *root)
 {
     return codegen_chunk(root, root->slot_count);
 }
+
+void
+collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
+{
+    if (!c)
+        return;
+    if (const FuncDeclStmt *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
+        out.push_back(fn);
+        collect_funcs(fn->body.get(), out);   /* nested closures within */
+        return;
+    }
+    auto rec = [&](const Construct *ch) { collect_funcs(ch, out); };
+    if (const Block *b = dynamic_cast<const Block *>(c)) {
+        for (const auto &e : b->elems) rec(e.get());
+    } else if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c)) {
+        rec(sc->elem.get());
+    } else if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+        for (auto &p : mo->elems) rec(p.second.get());
+    } else if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c)) {
+        for (auto &p : ts->elems) rec(p.second.get());
+    } else if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
+        for (auto &e : me->elems) rec(e.get());
+    } else if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+        rec(e->lvalue.get()); rec(e->rvalue.get());
+    } else if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
+        rec(ce->what.get()); rec(ce->args.get());
+    } else if (auto *sub = dynamic_cast<const Subscript *>(c)) {
+        rec(sub->what.get()); rec(sub->index.get());
+    } else if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+        rec(m->what.get());
+    } else if (auto *ret = dynamic_cast<const ReturnStmt *>(c)) {
+        rec(ret->elem.get());
+    } else if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
+        rec(iff->condExpr.get()); rec(iff->thenBlock.get());
+        rec(iff->elseBlock.get());
+    } else if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+        rec(w->condExpr.get()); rec(w->body.get());
+    } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+        rec(f->init.get()); rec(f->cond.get()); rec(f->inc.get());
+        rec(f->body.get());
+    } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+        rec(fr->init.get()); rec(fr->bound.get()); rec(fr->step.get());
+        rec(fr->body.get());
+    } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+        rec(fe->container.get()); rec(fe->body.get());
+    } else if (auto *te = dynamic_cast<const TernaryExpr *>(c)) {
+        rec(te->condExpr.get()); rec(te->thenExpr.get());
+        rec(te->elseExpr.get());
+    } else if (auto *co = dynamic_cast<const CoalesceExpr *>(c)) {
+        rec(co->lhs.get()); rec(co->rhs.get());
+    }
+}
+
+bool
+codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
+{
+    /* A base template is a monomorphization source, never called → no chunk. */
+    if (fn->is_template_base)
+        return false;
+    if (!fn->body || !fn->body->is_block())
+        return false;
+
+    const Block *body = static_cast<const Block *>(fn->body.get());
+
+    /* vm_run_chunk runs the body's statements directly in the call's args
+     * context (no per-block child EvalContext), which is correct only for a
+     * SCOPE-FREE body (every decl is a frame slot - no capture / nested func).
+     * A non-scope-free body needs its own child context, so it tree-walks. */
+    if (!body->scope_free)
+        return false;
+
+    Chunk ck = codegen_chunk(body, fn->frame_size);
+
+    /* Keep the chunk iff it has at least one REAL op - anything that is not a
+     * pure fallback (EvalStmt) or control-flow op (JumpIfFalse / Jump /
+     * LoopBackEdge / Halt). An all-fallback body gains nothing from the VM (an
+     * EvalStmt is `node->eval`, same as the tree-walker, plus dispatch), so it
+     * stays tree-walked; a body of native calls / stores / loads (which has no
+     * arith/loop op) still compiles. */
+    for (const Instr &in : ck.code)
+        if (in.op != OpCode::EvalStmt && in.op != OpCode::JumpIfFalse
+            && in.op != OpCode::Jump && in.op != OpCode::LoopBackEdge
+            && in.op != OpCode::Halt) {
+            out = std::move(ck);
+            return true;
+        }
+    return false;
+}

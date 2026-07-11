@@ -1353,6 +1353,18 @@ public:
     bool effective_pure = false;
 
     /*
+     * Set by the inferencer for a BASE TEMPLATE's decl (a function with >=1
+     * un-annotated template param - `FuncInfo::is_template`). A base template is
+     * a monomorphization SOURCE, not a runnable function: every call to it is
+     * redirected to a concrete `name$N` instance (a separate FuncDeclStmt with
+     * this false), so the base is NEVER called and NEVER compiled. The AOT
+     * codegen (`codegen_program`) skips it, so it is absent from the compiled
+     * chunk set - and therefore from `-vd` (faithfully: it does not exist as a
+     * chunk, it is not filtered). A clone (an instance) leaves this false.
+     */
+    bool is_template_base = false;
+
+    /*
      * Set by the inliner when it unrolls this (pure, self-recursive, >=2
      * self-call) function: a call to it caches its result in the CALLER's frame
      * (see PureCache, eval.h), so the duplicate self-calls the unroll brings

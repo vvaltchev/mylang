@@ -3399,10 +3399,27 @@ nested forms) goes native instead of falling back — e.g. `30_str_index_iterate
 the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
 −71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** runs these
 loops inside **function bodies** too: `do_func_call` is hooked to run a callee's
-body via `vm_run_chunk` when it's a scope-free block (compiled once, cached on
-the `FuncDeclStmt` in `g_func_chunks`), reusing all of `do_func_call`'s
-frame/param/backtrace machinery — so `55_float_sum` (a loop in a function) is
-−62%. The compile gate (`vm_func_chunk`) is "the body has at least one REAL op"
+body via `vm_run_chunk` when it's a scope-free block (its chunk cached on the
+`FuncDeclStmt`, stored in `g_func_chunks`), reusing all of `do_func_call`'s
+frame/param/backtrace machinery. **Compilation is AOT, not lazy**
+(`vm_precompile_all`, called at the top of `vm_execute`): it walks
+`collect_funcs` and compiles EVERY function body UPFRONT, stamping each
+`FuncDeclStmt::vm_chunk` + `vm_chunk_tried`, so `do_func_call` reads a
+precomputed pointer and never compiles at call time (the maintainer's no-lazy
+rule + a `.myv`-serialization prerequisite; the lazy `vm_func_chunk` miss path
+is now a never-hit safety net). The per-function compile + gate is the shared
+**`codegen_func_body`** (codegen.cpp) — the single source of truth for "which
+functions have bytecode", used by BOTH the precompile AND the `-vd` dump, so
+`-vd` faithfully shows the real compiled chunk set. A **dead base template is
+absent** from that set (not filtered): the inferencer marks
+`FuncDeclStmt::is_template_base` for a template NEVER used as a value
+(`!value_used` — all its calls are direct and were redirected to `name$N`
+instances, so the base never runs); a VALUE-used template (dict/var/arg-
+dispatched INDIRECTLY, e.g. phonebook's `cmd_*`) is NOT marked, so its base
+keeps its chunk (the indirect call runs the base body). So `55_float_sum` (a
+loop in a function) is
+−62%. The compile gate (`codegen_func_body`) is "not a base template, a
+scope-free block body, and the body has at least one REAL op"
 — anything but the pure fallback/control ops (`EvalStmt`/`JumpIfFalse`/`Jump`/
 `LoopBackEdge`/`Halt`) — so a body of native **calls/stores/loads** (`CallV`,
 `DictStore`, `CallBuiltinV`, `SliceV`, a `ReturnV` over a native expr, …), which
@@ -3893,12 +3910,12 @@ omitting it is a compile error.
   your own initiative; if one seems warranted, PROPOSE it, get sign-off first.
   The ONLY approved lazy exception to date is the **per-frame pure-call cache**
   (a lazily-populated `PureCache`, sound because frame-scoped — see recursion),
-  reviewed + approved case-by-case. **Known deviation to FIX:** the VM
-  compiles each function's `Chunk` LAZILY on its first call (`vm_func_chunk` /
-  `g_func_chunks`) — never approved; the AST must be compiled **100% to bytecode
-  BEFORE the VM runs** (full AOT — all reachable chunks built upfront in
-  `codegen_program`, not 95%; see the endgame plan in
-  `plans/vm-fallback-elimination.md`). When in doubt: upfront, not lazy.
+  reviewed + approved case-by-case. **The former lazy-VM-compile deviation is
+  FIXED:** the VM now compiles EVERY function body to its `Chunk` UPFRONT
+  (`vm_precompile_all` at the top of `vm_execute`), so the AST is 100% bytecode
+  before the VM runs (full AOT); `do_func_call` reads a precomputed
+  `FuncDeclStmt::vm_chunk` and never compiles at call time. When in doubt:
+  upfront, not lazy.
 
 - **The TYPE MODEL is C++ (static everywhere), with `dyn` as the one variant.**
   Every type is decided at COMPILE time and NEVER changes at runtime. `var` is

@@ -445,6 +445,8 @@ static bool g_vm_executing = false;
  */
 static std::unordered_map<const FuncDeclStmt *, Chunk> g_func_chunks;
 
+static void vm_precompile_all(const Block *root);   /* AOT: defined below */
+
 /*
  * Execute the optimized program via the bytecode VM. It builds the program's
  * root EvalContext exactly as Block::do_eval does for the root block
@@ -473,6 +475,11 @@ vm_execute(const Construct *root_c)
     g_func_chunks.clear();
 
     const Chunk chunk = codegen_program(root);
+
+    /* AOT: compile every function body upfront (no lazy per-call compile) - the
+     * maintainer's no-lazy rule + a `.myv`-serialization prerequisite. After
+     * this, do_func_call reads a precomputed vm_chunk and never compiles. */
+    vm_precompile_all(root);
 
     EvalContext ctx(nullptr, /*const_ctx=*/false);
 
@@ -527,44 +534,43 @@ vm_func_chunk(const FuncDeclStmt *fdecl)
                  "vm_func_chunk outside vm_execute: a compile-time fold "
                  "reached the VM body hook (const-eval gate bypassed)");
 
-    if (!fdecl->body || !fdecl->body->is_block())
-        return nullptr;
-
-    const Block *body = static_cast<const Block *>(fdecl->body.get());
-
-    /* vm_run_chunk runs the body's statements directly in the call's args
-     * context (no per-block child EvalContext), which is correct only for a
-     * SCOPE-FREE body (every decl is a frame slot - no capture / nested func).
-     * A non-scope-free body needs its own child context, so tree-walk it. */
-    if (!body->scope_free)
-        return nullptr;
-
     auto it = g_func_chunks.find(fdecl);
     if (it != g_func_chunks.end())
         return &it->second;
-    Chunk ck = codegen_chunk(body, fdecl->frame_size);
 
-    /* Compile the body iff it has at least one REAL op - anything that is not a
-     * pure fallback (EvalStmt) or control-flow op (JumpIfFalse / Jump /
-     * LoopBackEdge / Halt). An all-fallback body gains nothing from the VM: an
-     * EvalStmt is `node->eval`, same as the tree-walker, plus dispatch), so it
-     * stays tree-walked; but a body of native calls / stores / loads (CallV,
-     * DictStore, CallBuiltinV, SliceV, a ReturnV over a native expr) - which
-     * has NO arith/loop op - now compiles, where the old arith/loop-only gate
-     * left it on the tree-walker. */
-    bool has_native = false;
-    for (const Instr &in : ck.code) {
-        if (in.op != OpCode::EvalStmt && in.op != OpCode::JumpIfFalse
-            && in.op != OpCode::Jump && in.op != OpCode::LoopBackEdge
-            && in.op != OpCode::Halt) {
-            has_native = true;
-            break;
-        }
-    }
-    if (!has_native)
+    /* The compile + gate (base-template / scope-free / has-native) is the
+     * shared codegen_func_body, so the VM's compiled set is byte-identical to
+     * what -vd dumps. AOT (vm_precompile_all) fills g_func_chunks for the whole
+     * program upfront, so this lazy miss path is only a safety net for a func
+     * the precompile walk didn't reach (there should be none). */
+    Chunk ck;
+    if (!codegen_func_body(fdecl, ck))
         return nullptr;
-
     return &g_func_chunks.emplace(fdecl, std::move(ck)).first->second;
+}
+
+/*
+ * AOT (no lazy): compile EVERY function body in the program to its chunk
+ * upfront, before execution, so no chunk is ever built lazily on first call
+ * (the maintainer's no-lazy rule; also a prerequisite for serialized `.myv`
+ * bytecode). Walks all FuncDeclStmts (collect_funcs order), stamps each with
+ * its compiled chunk (or null → tree-walked) plus `vm_chunk_tried = true`, so
+ * do_func_call reads the precomputed pointer and never enters the lazy branch.
+ * Base templates get null (codegen_func_body skips them) → never compiled →
+ * absent from the compiled chunk set (and from -vd). Runs inside vm_execute
+ * (g_vm_executing true, the AST final), so vm_func_chunk's guard is satisfied.
+ */
+static void
+vm_precompile_all(const Block *root)
+{
+    std::vector<const FuncDeclStmt *> funcs;
+    for (const auto &e : root->elems)
+        collect_funcs(e.get(), funcs);
+
+    for (const FuncDeclStmt *fn : funcs) {
+        fn->vm_chunk = vm_func_chunk(fn);   /* compiles + caches (or null) */
+        fn->vm_chunk_tried = true;
+    }
 }
 
 /* Per-loop LIVE dict-iterator state (DictIterInit/DictIterNext): the

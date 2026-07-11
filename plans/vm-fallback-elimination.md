@@ -294,11 +294,27 @@ already gives full native `dyn`** — `func foo(dyn x){ var dyn s=x; for(..)
 s=s+x; return s; }` compiles to a fully-native chunk (`bin.v s = s + x ; boxed`,
 `for.step`, no fallback). So the hard runtime part is done; the gaps are
 front-end + compilation-model:
-1. **AOT chunk compilation (NO lazy).** Compile every reachable func's `Chunk`
-   UPFRONT in `codegen_program` (what `-vd`'s `collect_funcs` walks), NOT
-   lazily on first call. The current `vm_func_chunk`/`g_func_chunks` first-call
-   compile is a maintainer-unapproved deviation (see the no-lazy rule in
-   CLAUDE.md) and is REQUIRED to be AOT for `.myv` serialization anyway.
+1. **AOT chunk compilation (NO lazy). DONE.** `vm_precompile_all` (vm.cpp),
+   called at the top of `vm_execute` (AST final), walks `collect_funcs` and
+   compiles EVERY function body upfront — stamping each `FuncDeclStmt::vm_chunk`
+   + `vm_chunk_tried=true`, so `do_func_call` reads a precomputed pointer and
+   NEVER lazily compiles (the lazy `vm_func_chunk` miss path is now only a
+   never-hit safety net). The compile + gate is the shared `codegen_func_body`
+   (codegen.cpp), the single source of truth for "which functions have
+   bytecode", used by BOTH the precompile and `-vd` — so `-vd` drives off the
+   real compiled chunk set. **Dead base templates are ABSENT** (not filtered):
+   the inferencer marks `FuncDeclStmt::is_template_base` for a template that is
+   NEVER used as a value (`!value_used`) — then all its calls are direct and
+   were redirected to `name$N` instances, so the base never runs → no chunk →
+   absent from `-vd`. A VALUE-used template (dict/var/arg-dispatched INDIRECTLY,
+   e.g. phonebook's `cmd_*`, `76`'s `add_op`) is NOT marked — its indirect call
+   runs the base body, so it keeps its chunk (compiled + shown), no regression.
+   Verified: the only `-vd` change vs before is dead base templates (fib/gcd/
+   is_prime/…, and a fully-const-folded `pure func heavy`) vanishing; every
+   live instance + indirectly-dispatched base remains; suite + differential +
+   all sample/bench outputs byte-identical. (The residual `!value_used`-but-
+   still-runs cases — a D4 overflow >64, an uninstantiable direct call — just
+   tree-walk instead of VM-run; first-class `foo$dyn` (item 2) erases them.)
 2. **First-class `dyn` INSTANCE, decided upfront.** A template `foo(x)` called
    with an int arg AND a dyn arg must produce TWO instances — `foo$int` (typed
    native) and `foo$dyn` (dyn native, compiled exactly like the explicit
@@ -330,8 +346,10 @@ front-end + compilation-model:
 Order: (a) `!x` nativization **[DONE — boxed `UnaryV`]**; (b) close the
 AST-builtin fold gap → EvalToSlot unreachable **[DONE in SCRIPT — `defined`
 folds (bound) + `DefinedGlobalV` (global); all other AST builtins fold/dual-ABI;
-only dev-only `show` still emits EvalToSlot, never in a script/.myv]**; (c) AOT
-chunk compilation (all upfront, `-vd` off the chunk set);
+only dev-only `show` still emits EvalToSlot, never in a script/.myv]**;
+(c) AOT chunk compilation (all upfront, `-vd` off the chunk set) **[DONE —
+`vm_precompile_all` + shared `codegen_func_body`; dead base templates absent via
+`is_template_base` on `!value_used` templates]**;
 (d) first-class `dyn` instances + the `int OP dyn`→concrete inference rule;
 (e) audit each fallback op is unemitted, then DELETE + abort-guard. Each step
 `-rt` (differential) + samples byte-identical.

@@ -117,61 +117,8 @@ std::string store_op(Op aop)
     return aop == Op::invalid ? std::string("=") : opsym(aop) + "=";
 }
 
-/* Find every FuncDeclStmt reachable from `c` - a COMPLETE walk, so a lambda in
- * ANY expression position (a `return func[..]{..}`, a `var f = func..`, a call
- * arg, a ternary branch, ...) is disassembled too, not only top-level / body-
- * statement functions. Each FuncDeclStmt's own body is recursed for further
- * nested closures. */
-void collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
-{
-    if (!c)
-        return;
-    if (const FuncDeclStmt *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
-        out.push_back(fn);
-        collect_funcs(fn->body.get(), out);   /* nested closures within */
-        return;
-    }
-    auto rec = [&](const Construct *ch) { collect_funcs(ch, out); };
-    if (const Block *b = dynamic_cast<const Block *>(c)) {
-        for (const auto &e : b->elems) rec(e.get());
-    } else if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c)) {
-        rec(sc->elem.get());
-    } else if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
-        for (auto &p : mo->elems) rec(p.second.get());
-    } else if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c)) {
-        for (auto &p : ts->elems) rec(p.second.get());
-    } else if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
-        for (auto &e : me->elems) rec(e.get());
-    } else if (auto *e = dynamic_cast<const Expr14 *>(c)) {
-        rec(e->lvalue.get()); rec(e->rvalue.get());
-    } else if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
-        rec(ce->what.get()); rec(ce->args.get());
-    } else if (auto *sub = dynamic_cast<const Subscript *>(c)) {
-        rec(sub->what.get()); rec(sub->index.get());
-    } else if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
-        rec(m->what.get());
-    } else if (auto *ret = dynamic_cast<const ReturnStmt *>(c)) {
-        rec(ret->elem.get());
-    } else if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
-        rec(iff->condExpr.get()); rec(iff->thenBlock.get());
-        rec(iff->elseBlock.get());
-    } else if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
-        rec(w->condExpr.get()); rec(w->body.get());
-    } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
-        rec(f->init.get()); rec(f->cond.get()); rec(f->inc.get());
-        rec(f->body.get());
-    } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
-        rec(fr->init.get()); rec(fr->bound.get()); rec(fr->step.get());
-        rec(fr->body.get());
-    } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
-        rec(fe->container.get()); rec(fe->body.get());
-    } else if (auto *te = dynamic_cast<const TernaryExpr *>(c)) {
-        rec(te->condExpr.get()); rec(te->thenExpr.get());
-        rec(te->elseExpr.get());
-    } else if (auto *co = dynamic_cast<const CoalesceExpr *>(c)) {
-        rec(co->lhs.get()); rec(co->rhs.get());
-    }
-}
+/* collect_funcs moved to codegen.cpp (shared with the VM's AOT precompile);
+ * declared in codegen.h. */
 
 /* Every StructDeclStmt reachable from `c` (a custom type definition). Structs
  * appear only as STATEMENTS, so only the statement-containers are walked. */
@@ -845,11 +792,18 @@ std::string disassemble_program(const Block *root)
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
 
+    /* Drive off the COMPILED CHUNK SET, not the raw AST walk: codegen_func_body
+     * compiles a function ONLY if it has bytecode (skips a base template - a
+     * monomorphization source that is never called/compiled - a non-scope-free
+     * closure, and an all-fallback body). So a base template shows NO chunk
+     * because it HAS none (it does not exist as a chunk), not because we filter
+     * it - a faithful bytecode image. (When every function is native, this set
+     * equals all non-template functions.) */
     int anon = 0;
     for (const FuncDeclStmt *fn : funcs) {
-        if (!fn->body || !fn->body->is_block())
+        Chunk ck;
+        if (!codegen_func_body(fn, ck))
             continue;
-        const Block *body = static_cast<const Block *>(fn->body.get());
 
         /* The capture list IS the closure's anonymous struct: its field names,
          * in declaration order (== the cN capture-slot order). */
@@ -868,8 +822,7 @@ std::string disassemble_program(const Block *root)
             title = (cap_names.empty() ? "lambda#" : "closure#")
                     + std::to_string(anon++);
 
-        s << "\n" << disassemble(codegen_chunk(body, fn->frame_size), title,
-                                 cap_names);
+        s << "\n" << disassemble(ck, title, cap_names);
     }
     return s.str();
 }

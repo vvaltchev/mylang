@@ -939,6 +939,26 @@ void Inferencer::infer_one(Block *rootBlock)
                 s->type = A.with_opt(s->type, true);
         }
     }
+    /*
+     * Mark a DEAD base TEMPLATE's decl so the AOT codegen / -vd skip it: it is a
+     * monomorphization source with no runtime reachability, so it must not exist
+     * as a compiled chunk. "Dead" = a template that is NEVER used as a VALUE
+     * (`!value_used`): then every call to it is a DIRECT call, all of which the
+     * instantiation pass redirected to a concrete `name$N` instance - so the
+     * base never runs. A VALUE-used template (stored in a dict, passed to a
+     * builtin, bound to a var) can be dispatched INDIRECTLY - that call is NOT
+     * redirected, so it runs the base body - so it is kept (compiled + shown).
+     * (Its instances, if any, have is_template=false and are unaffected.) The
+     * residual case a `!value_used` template still runs the base - a D4 overflow
+     * (>64 instances) or an uninstantiable direct call - just tree-walks instead
+     * of VM-running (correct, only slower); the planned first-class dyn instance
+     * (foo$dyn) erases even that. Keyed off the name SYM's value_used.
+     */
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        if (s->func && s->func->is_template && !s->value_used && s->func->decl)
+            s->func->decl->is_template_base = true;
+    }
     for (auto &up : all_funcs) {
         /*
          * An Unknown return means the function has return statement(s) whose
