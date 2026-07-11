@@ -238,10 +238,73 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
   **REMAINING: `EmplaceStruct`** - the one builtin op still node-holding (it needs
   the ctor's `vm_struct_ctor_def` + field-arg carets); a separate pooling
   (`struct_defs` + a field-caret pool).
-- The **genuine fallback ops** `EvalStmt` / `EvalToSlot` / `JumpIfFalse`: they
-  re-enter `node->eval`, so they inherently need the node (reached by true
-  fallbacks + dev-`show` + a flat struct-array literal). These are the LEGITIMATE
-  residual.
+- The **fallback ops** `EvalStmt` / `EvalToSlot` / `JumpIfFalse` re-enter
+  `node->eval`. **DIRECTIVE (2026-07-12): 100% of them MUST be removed
+  — there is NO "legitimate residual."** They exist only because the front-end
+  isn't fully AOT yet; once it is (see *THE AOT / ZERO-FALLBACK ENDGAME* below)
+  none are reachable and the opcodes are deleted. Current live emitters (all
+  fixable, not fundamental):
+  - `JumpIfFalse` — a unary-`!` condition (`if (!x)`): `compile_boxed_expr`
+    doesn't lower Expr02. Nativize it (boxed `!` → a slot + `JumpUnlessTrueV`).
+  - `EvalToSlot` — an AST builtin (`defined`/`isconst`/`type`/`decltype`/
+    `typestr`/`kindstr`) in a scalar-expression position. These are COMPILE-TIME
+    ONLY: with full AOT inference they fold to a literal (a script is a closed
+    world — `defined(name)` is knowable, `type(x)` is the inferred static type),
+    so they never reach codegen. TODAY there's a FOLD GAP (`defined(param)`
+    didn't fold → EvalToSlot) — close it so every AST-builtin call is a literal
+    before codegen. Then EvalToSlot is unreachable.
+  - `EvalStmt` — the general statement fallback. After AOT + full `dyn` (below),
+    the only bodies that reached it (untyped template bases) no longer exist as
+    chunks, so it too is unreachable.
+  After each is proven unemitted (an emitter audit), DELETE the opcode + abort-
+  guard any residual with an `ML_CHECK(false)`-style assert (NOT
+  `__builtin_unreachable` — that's UB if reached; we want a loud abort).
+
+**THE AOT / ZERO-FALLBACK ENDGAME (maintainer directive, 2026-07-12).** The VM
+must be a fully AOT, zero-fallback engine, everything decided upfront by type
+inference before any bytecode runs. Good news: the VM's **boxed value tier
+already gives full native `dyn`** — `func foo(dyn x){ var dyn s=x; for(..)
+s=s+x; return s; }` compiles to a fully-native chunk (`bin.v s = s + x ; boxed`,
+`for.step`, no fallback). So the hard runtime part is done; the gaps are
+front-end + compilation-model:
+1. **AOT chunk compilation (NO lazy).** Compile every reachable func's `Chunk`
+   UPFRONT in `codegen_program` (what `-vd`'s `collect_funcs` walks), NOT
+   lazily on first call. The current `vm_func_chunk`/`g_func_chunks` first-call
+   compile is a maintainer-unapproved deviation (see the no-lazy rule in
+   CLAUDE.md) and is REQUIRED to be AOT for `.myv` serialization anyway.
+2. **First-class `dyn` INSTANCE, decided upfront.** A template `foo(x)` called
+   with an int arg AND a dyn arg must produce TWO instances — `foo$int` (typed
+   native) and `foo$dyn` (dyn native, compiled exactly like the explicit
+   `func foo(dyn x)` above) — BOTH minted upfront by `instantiate_round`, BOTH
+   AOT-compiled. The D4 overflow (>64 instances) routes to `foo$dyn`, NEVER to a
+   tree-walker base. (Template *instantiation* is already upfront; a dyn-arg
+   call errors or falls to the base — that's the gap.)
+3. **`dyn` SEMANTIC — the mandatory-`dyn` rule STANDS (NO carve-out).** The
+   maintainer's ruling on `foo(x){ var s=0; s=s+x; }`: `x`'s type is fixed
+   upfront per instance. `var s` stays its inferred CONCRETE type (`int`) — it
+   CANNOT silently become `dyn` (mandatory-`dyn` still forbids that). In the
+   `foo$dyn`, `s = s + x` (s:int, x:dyn) is a RUNTIME-CHECKED operation:
+   at runtime `s + x` works iff `x`'s value is `+`-compatible with int, else a
+   RUNTIME error — it does NOT poison `s` to dyn at compile time. A dyn operand
+   used against a concrete-typed target is a runtime-checked coercion, not
+   contagion. (Inference: `int OP dyn` assigned back to an int local keeps
+   the local int; today it wrongly infers it `dyn` → `DynRequiredEx`.) The
+   `int` instance is unaffected.
+4. **Base templates GENUINELY DON'T EXIST as chunks — NOT hidden in `-vd`.**
+   With (1)+(2), every call targets an instance (typed/dyn); the base template
+   is never called → never AOT-compiled → not in the bytecode image. `-vd` must
+   be a FAITHFUL representation of what EXISTS (the compiled chunk set = the
+   instances), so it shows no base because there IS none — NOT because we
+   filter it out. (Drive `-vd` off the AOT-compiled chunk set, not a raw AST
+   walk.) The maintainer explicitly rejects hiding: a faithful dump, no
+   special-casing.
+5. **AST builtins fold away (see the EvalToSlot bullet above)** — they are
+   compile-time-only and must be literals before codegen under full AOT.
+Order: (a) `!x` nativization; (b) close the AST-builtin fold gap → EvalToSlot
+unreachable; (c) AOT chunk compilation (all upfront, `-vd` off the chunk set);
+(d) first-class `dyn` instances + the `int OP dyn`→concrete inference rule;
+(e) audit each fallback op is unemitted, then DELETE + abort-guard. Each step
+`-rt` (differential) + samples byte-identical.
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then

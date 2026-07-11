@@ -3884,6 +3884,21 @@ omitting it is a compile error.
 
 ## Conventions
 
+- **NEVER do anything LAZILY unless the maintainer explicitly asked for it.**
+  The default is DETERMINISTIC, ALL-UPFRONT (AOT) — the maintainer wants ~95% of
+  work decided at compile time, before any bytecode runs, not deferred to "the
+  first time it's needed." Do NOT introduce lazy/on-demand/first-touch
+  computation, caching, compilation, or allocation on your own initiative; if a
+  lazy design seems warranted, PROPOSE it and get explicit sign-off first. The
+  ONLY approved lazy exception to date is the **per-frame pure-call cache** (a
+  lazily-populated `PureCache`, sound because frame-scoped — see the recursion
+  section); it was reviewed and approved case-by-case. **Known deviation to
+  FIX:** the VM currently compiles each function's `Chunk` LAZILY on its first
+  call (`vm_func_chunk` / `g_func_chunks`) — this was never approved and is
+  slated to become AOT (all reachable chunks compiled upfront in
+  `codegen_program`; see the endgame plan in
+  `plans/vm-fallback-elimination.md`). When in doubt: upfront, not lazy.
+
 - **A breaking language change must update `samples/` too, in the SAME change.**
   The extensionless scripts in `samples/` (`fib`, `gcd`, `loop`, `phonebook`,
   `primes`, `primes2`, `rand_sort`, `shopping`, `strloop`, …) are part of the
