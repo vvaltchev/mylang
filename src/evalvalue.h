@@ -43,7 +43,13 @@ enum class ArrHint : unsigned char;   /* defined in syntax.h */
 struct ArgLoc { Loc start, end; };
 struct ArgLocs {
     Loc start, end;                     /* the args-list caret */
-    const ArgLoc *args = nullptr;       /* per-arg carets, [0, n) */
+    const ArgLoc *args = nullptr;       /* per-arg carets, [0, nargs) */
+    size_t nargs = 0;                   /* the TOTAL arg count (incl. arg0 for a
+                                         * func_lv) - a func_v also gets it as its
+                                         * own `n` param, but a SELF-EVAL func_lv
+                                         * (pop/intptr) is passed n_rest==0
+                                         * regardless of arity, so its arity check
+                                         * must read this, not n_rest. */
     ArrHint arr_hint;                   /* the array-repr hint (range/array/…) */
     const ArgLoc *arg(size_t i) const { return &args[i]; }
 };
@@ -85,11 +91,13 @@ struct Builtin {
     union {
         EvalValue (*func_v)(EvalContext *, const ArgLocs *, const EvalValue *,
                             size_t);
-        /* `rest`/`n_rest` = the TAIL ARGS BY VALUE (args 1..n, everything after
-         * the arg0 `target` lvalue), pre-evaluated; null == the builtin
-         * self-evaluates them off `exprList`. (Name from the rest-parameter
-         * idiom: target = the head/first arg, rest = the tail of the list.) */
-        EvalValue (*func_lv)(EvalContext *, ExprList *, LValue *,
+        /* AST-FREE like func_v: the carets/arity come from `ArgLocs` (not an
+         * ExprList). `rest`/`n_rest` = the TAIL ARGS BY VALUE (args 1..n,
+         * everything after the arg0 `target` lvalue), pre-evaluated; a func_lv
+         * NEVER self-evaluates off a node now (append/push construct-in-place is
+         * the tree-walker's append_tw + the VM's EmplaceStruct). (Name from the
+         * rest-parameter idiom: target = the head/first arg, rest = the tail.) */
+        EvalValue (*func_lv)(EvalContext *, const ArgLocs *, LValue *,
                              const EvalValue *, size_t);
     };
 

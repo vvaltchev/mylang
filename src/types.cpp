@@ -17,6 +17,13 @@
 #include "types/float.cpp.h"
 #include "types/dict.cpp.h"
 #include "types/struct.cpp.h"
+
+/* Build the AST-free ArgLocs a func_v/func_lv takes, from an ExprList. Defined
+ * below (after the type tables), forward-declared here so a builtin's custom
+ * tree-walker `func` (append_tw / sort_arr / reverse_arr) can build one to hand
+ * to the shared, now-ArgLocs core. */
+static inline ArgLocs build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n);
+
 #include "builtins/str.cpp.h"
 #include "builtins/io.cpp.h"
 #include "builtins/num.cpp.h"
@@ -298,6 +305,7 @@ build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n)
     al.start = exprList->start;
     al.end = exprList->end;
     al.args = locbuf;
+    al.nargs = n;
     al.arr_hint = exprList->arr_hint;
     return al;
 }
@@ -375,9 +383,12 @@ EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
         if (a0.is<LValue *>())
             target = a0.get<LValue *>();
     }
-    /* SELF-EVAL form (append/push/pop/intptr): no pre-evaluated rest - the
-     * builtin reads args 1..n off exprList itself (append needs the node). */
-    return FLV(ctx, exprList, target, nullptr, 0);
+    /* NO-VALUE-ARG form (pop/intptr - both 1-arg): no rest; the builtin uses
+     * arg0 (target) + the ArgLocs carets/arity only (no self-eval of a node). */
+    const size_t n = exprList->elems.size();
+    ArgLoc locbuf[4];
+    ArgLocs al = build_arglocs(exprList, locbuf, n < 4 ? n : 4);
+    return FLV(ctx, &al, target, nullptr, 0);
 }
 
 /* Cold >8-rest path for the REST-NATIVE lvalue adapter (heap arg buffer). */
@@ -388,7 +399,9 @@ builtin_lv_v_adapter_big(decltype(Builtin::func_lv) flv, EvalContext *ctx,
     std::vector<EvalValue> heapbuf(n_rest);
     for (size_t i = 0; i < n_rest; i++)
         heapbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
-    return flv(ctx, exprList, target, heapbuf.data(), n_rest);
+    std::vector<ArgLoc> locbuf(exprList->elems.size());
+    ArgLocs al = build_arglocs(exprList, locbuf.data(), locbuf.size());
+    return flv(ctx, &al, target, heapbuf.data(), n_rest);
 }
 
 /*
@@ -416,7 +429,9 @@ EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
     EvalValue stackbuf[8];
     for (size_t i = 0; i < n_rest; i++)
         stackbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
-    return FLV(ctx, exprList, target, stackbuf, n_rest);
+    ArgLoc locbuf[8];
+    ArgLocs al = build_arglocs(exprList, locbuf, total < 8 ? total : 8);
+    return FLV(ctx, &al, target, stackbuf, n_rest);
 }
 
 template <decltype(Builtin::func_lv) FLV>

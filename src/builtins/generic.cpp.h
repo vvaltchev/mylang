@@ -204,13 +204,13 @@ EvalValue builtin_deepclone(EvalContext *ctx, const ArgLocs *exprList,
     return make_deep_mutable_clone(args[0]);
 }
 
-EvalValue builtin_intptr(EvalContext *ctx, ExprList *exprList, LValue *target,
-                         const EvalValue *rest, size_t n_rest)
+EvalValue builtin_intptr(EvalContext *ctx, const ArgLocs *exprList,
+                         LValue *target, const EvalValue *rest, size_t n_rest)
 {
-    if (exprList->elems.size() != 1)
+    if (exprList->nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
 
     if (!target)
         throw NotLValueEx(arg->start, arg->end);
@@ -237,14 +237,14 @@ EvalValue builtin_assert(EvalContext *ctx, const ArgLocs *exprList,
  * `n_rest` = the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
  * lvalue), pre-evaluated. erase is REST-NATIVE, so it reads its index from
  * `rest[0]` (zero node->eval), unlike self-eval append. */
-EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList, LValue *target,
-                        const EvalValue *rest, size_t n_rest)
+EvalValue builtin_erase(EvalContext *ctx, const ArgLocs *exprList,
+                        LValue *target, const EvalValue *rest, size_t n_rest)
 {
-    if (exprList->elems.size() != 2)
+    if (exprList->nargs != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &index_val = rest[0];   /* value ABI: pre-evaluated */
 
     if (!target)
@@ -282,14 +282,14 @@ EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList, LValue *target,
     }
 }
 
-EvalValue builtin_insert(EvalContext *ctx, ExprList *exprList, LValue *target,
-                         const EvalValue *rest, size_t n_rest)
+EvalValue builtin_insert(EvalContext *ctx, const ArgLocs *exprList,
+                         LValue *target, const EvalValue *rest, size_t n_rest)
 {
-    if (exprList->elems.size() != 3)
+    if (exprList->nargs != 3)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
     const EvalValue &index_val = rest[0];   /* value ABI: pre-evaluated */
     const EvalValue &val = rest[1];
 

@@ -298,14 +298,14 @@ static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
  * `rest`/`n_rest` = the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
  * lvalue), pre-evaluated. append is SELF-EVAL, so `rest` is null and it reads
  * arg1 off `exprList` (it needs the ctor node for construct-in-place). */
-EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target,
-                         const EvalValue *rest, size_t n_rest)
+EvalValue builtin_append(EvalContext *ctx, const ArgLocs *exprList,
+                         LValue *target, const EvalValue *rest, size_t n_rest)
 {
-    if (exprList->elems.size() != 2)
+    if (exprList->nargs != 2)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
-    Construct *arg1 = exprList->elems[1].get();
+    const ArgLoc *arg0 = exprList->arg(0);
+    const ArgLoc *arg1 = exprList->arg(1);
 
     if (!target)
         throw NotLValueEx(arg0->start, arg0->end);
@@ -326,18 +326,14 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target,
     if (arr.is_slice())
         arr.clone_internal_vec();
 
-    /* The element to append: the pre-evaluated `rest[0]` for a REST-NATIVE call
-     * (the VM's plain per-op case + the tree-walker `func` append_tw, which
-     * delegates here after its own construct-in-place check) - no node->eval;
-     * else (`rest == nullptr`: a residual self-eval CallBuiltinLV whose value
-     * didn't lower, or the LVElem subscript-target op) self-eval'd off arg1.
-     * CONSTRUCT-IN-PLACE is NOT here - `append(flat_struct_arr, S(..))` needs
-     * the ctor NODE, so it lives in append_tw (tree-walker) and EmplaceStruct
-     * (VM); a plain value hits the flat/general append paths below. */
-    EvalValue self_elem;
-    if (!rest)
-        self_elem = RValue(arg1->eval(ctx));
-    const EvalValue &elem = rest ? rest[0] : self_elem;
+    /* The element to append is the pre-evaluated `rest[0]` - append is now
+     * REST-NATIVE (no node->eval): the tree-walker via append_tw (which delegates
+     * here after its own construct-in-place check), the VM via a rest-native
+     * CallBuiltinLV / CallBuiltinLVElem. CONSTRUCT-IN-PLACE (`append(struct_arr,
+     * S(..))`) needs the ctor NODE, so it lives in append_tw (tree-walker) and
+     * EmplaceStruct (VM); a plain value hits the flat/general paths below. */
+    ML_CHECK(rest && n_rest == 1);
+    const EvalValue &elem = rest[0];
 
     /*
      * Flat fast path: append a matching scalar straight into the unboxed
@@ -425,18 +421,21 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
         }
     }
 
-    /* Any other value: self-eval it and delegate to the rest-native core. */
+    /* Any other value: self-eval it and delegate to the rest-native core (which
+     * takes an AST-free ArgLocs - build it from the ExprList). */
     const EvalValue val = RValue(arg1->eval(ctx));
-    return builtin_append(ctx, exprList, target, &val, 1);
+    ArgLoc locbuf[2];
+    ArgLocs al = build_arglocs(exprList, locbuf, 2);
+    return builtin_append(ctx, &al, target, &val, 1);
 }
 
-EvalValue builtin_pop(EvalContext *ctx, ExprList *exprList, LValue *target,
+EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
                       const EvalValue *rest, size_t n_rest)
 {
-    if (exprList->elems.size() != 1)
+    if (exprList->nargs != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
-    Construct *arg = exprList->elems[0].get();
+    const ArgLoc *arg = exprList->arg(0);
 
     if (!target)
         throw NotLValueEx(arg->start, arg->end);
@@ -818,13 +817,13 @@ static void comparator_heapsort(Vec &vec, Cmp cmp)
  * caller's stackbuf / register run), so the cmp FuncObject stays alive.
  */
 static EvalValue
-sort_core(EvalContext *ctx, ExprList *exprList, EvalValue val0, LValue *lval,
+sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lval,
           bool reverse, const EvalValue *rest = nullptr)
 {
-    if (exprList->elems.size() == 0)
+    if (exprList->nargs == 0)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
@@ -856,7 +855,7 @@ sort_core(EvalContext *ctx, ExprList *exprList, EvalValue val0, LValue *lval,
 
     arr.invalidate_hash();   /* sort reorders -> order-dependent hash changes */
 
-    if (exprList->elems.size() == 1) {
+    if (exprList->nargs == 1) {
 
         /*
          * Flat fast path: sort the unboxed int/float vector directly with the
@@ -911,11 +910,11 @@ sort_core(EvalContext *ctx, ExprList *exprList, EvalValue val0, LValue *lval,
 
     } else {
 
-        Construct *arg1 = exprList->elems[1].get();
-        EvalValue self_cmp;
-        if (!rest)
-            self_cmp = RValue(arg1->eval(ctx));
-        const EvalValue &val1 = rest ? rest[0] : self_cmp;
+        /* The cmp is the pre-evaluated rest[0] (sort is now rest-native - no
+         * node->eval; sort_arr pre-evals it for the tree-walker). */
+        const ArgLoc *arg1 = exprList->arg(1);
+        ML_CHECK(rest);
+        const EvalValue &val1 = rest[0];
 
         if (!val1.is<intrusive_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
@@ -972,16 +971,27 @@ sort_core(EvalContext *ctx, ExprList *exprList, EvalValue val0, LValue *lval,
     return arr;
 }
 
-/* `func` entry (tree-walker / const-eval): eval arg0 - an lvalue or a value. */
+/* `func` entry (tree-walker / const-eval): eval arg0 - an lvalue or a value -
+ * and PRE-EVAL the cmp arg (sort_core is now AST-free: it takes ArgLocs + the
+ * cmp via rest, never a node). */
 static EvalValue
 sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 {
-    if (exprList->elems.size() == 0)
+    const size_t n = exprList->elems.size();
+    if (n == 0)
         throw InvalidArgumentEx(exprList->start, exprList->end);
-    const EvalValue &val0_lval = exprList->elems[0]->eval(ctx);
+    const EvalValue val0_lval = exprList->elems[0]->eval(ctx);
     LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
                                             : nullptr;
-    return sort_core(ctx, exprList, RValue(val0_lval), lval, reverse);
+    EvalValue cmp;   /* pre-evaluated cmp arg (sort(a, cmp)) */
+    const EvalValue *rest = nullptr;
+    if (n >= 2) {
+        cmp = RValue(exprList->elems[1]->eval(ctx));
+        rest = &cmp;
+    }
+    ArgLoc locbuf[2];
+    ArgLocs al = build_arglocs(exprList, locbuf, n < 2 ? n : 2);
+    return sort_core(ctx, &al, RValue(val0_lval), lval, reverse, rest);
 }
 
 /* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* is handed in (never
@@ -990,7 +1000,7 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
  * does zero node->eval; a `sort(a)` with no cmp has an empty rest run (n_rest ==
  * 0), which sort_core's no-cmp branch never reads. */
 static EvalValue
-sort_lv(EvalContext *ctx, ExprList *exprList, LValue *target,
+sort_lv(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
         const EvalValue *rest, size_t n_rest, bool reverse)
 {
     return sort_core(ctx, exprList, RValue(EvalValue(target)), target,
@@ -1007,13 +1017,13 @@ EvalValue builtin_rev_sort(EvalContext *ctx, ExprList *exprList)
     return sort_arr(ctx, exprList, true);
 }
 
-EvalValue builtin_sort_lv(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_sort_lv(EvalContext *ctx, const ArgLocs *exprList,
                           LValue *target, const EvalValue *rest, size_t n)
 {
     return sort_lv(ctx, exprList, target, rest, n, false);
 }
 
-EvalValue builtin_rev_sort_lv(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_rev_sort_lv(EvalContext *ctx, const ArgLocs *exprList,
                               LValue *target, const EvalValue *rest, size_t n)
 {
     return sort_lv(ctx, exprList, target, rest, n, true);
@@ -1022,13 +1032,13 @@ EvalValue builtin_rev_sort_lv(EvalContext *ctx, ExprList *exprList,
 /* reverse core - `lval` (or null) as in sort_core (slice write-back). Preserves
  * the original reverse (no const-copy: reverse has no 'const' contract). */
 static EvalValue
-reverse_core(EvalContext *ctx, ExprList *exprList, EvalValue val0,
+reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
              LValue *lval)
 {
-    if (exprList->elems.size() != 1)
+    if (exprList->nargs != 1)
         throw InvalidArgumentEx(exprList->start, exprList->end);
 
-    Construct *arg0 = exprList->elems[0].get();
+    const ArgLoc *arg0 = exprList->arg(0);
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
@@ -1076,16 +1086,18 @@ reverse_core(EvalContext *ctx, ExprList *exprList, EvalValue val0,
     return arr;
 }
 
-/* `func` entry: eval arg0 (lvalue or value). */
+/* `func` entry: eval arg0 (lvalue or value); build ArgLocs for the core. */
 static EvalValue
 reverse_arr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidArgumentEx(exprList->start, exprList->end);
-    const EvalValue &val0_lval = exprList->elems[0]->eval(ctx);
+    const EvalValue val0_lval = exprList->elems[0]->eval(ctx);
     LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
                                             : nullptr;
-    return reverse_core(ctx, exprList, RValue(val0_lval), lval);
+    ArgLoc locbuf[1];
+    ArgLocs al = build_arglocs(exprList, locbuf, 1);
+    return reverse_core(ctx, &al, RValue(val0_lval), lval);
 }
 
 EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
@@ -1094,7 +1106,7 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
 }
 
 /* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* handed in. */
-EvalValue builtin_reverse_lv(EvalContext *ctx, ExprList *exprList,
+EvalValue builtin_reverse_lv(EvalContext *ctx, const ArgLocs *exprList,
                              LValue *target, const EvalValue *rest, size_t n)
 {
     return reverse_core(ctx, exprList, RValue(EvalValue(target)), target);

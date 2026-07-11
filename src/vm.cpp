@@ -334,6 +334,31 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
     return vm_make_struct_array(def, static_cast<size_t>(n), heapbuf.data());
 }
 
+/* Build the AST-free ArgLocs a func_lv takes, from a mutating builtin call's arg
+ * ExprList: the whole-args caret, the total arg count (`nargs` - a func_lv's
+ * arity check reads this, since a self-eval builtin gets n_rest==0 regardless),
+ * the repr hint, and each arg's caret into `buf` (up to `cap`; the func_lv
+ * builtins only read arg(0)/arg(1) after their arity check). The func_v path
+ * reads its ArgLocs from the builtin_calls pool; this func_lv path still builds
+ * it from the node - to be pooled next. */
+static inline ArgLocs
+vm_lv_arglocs(ExprList *el, ArgLoc *buf, size_t cap)
+{
+    const size_t n = el->elems.size();
+    const size_t fill = n < cap ? n : cap;
+    for (size_t i = 0; i < fill; i++) {
+        buf[i].start = el->elems[i]->start;
+        buf[i].end = el->elems[i]->end;
+    }
+    ArgLocs al;
+    al.start = el->start;
+    al.end = el->end;
+    al.args = buf;
+    al.nargs = n;
+    al.arr_hint = el->arr_hint;
+    return al;
+}
+
 /* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
  * the `rest` args - the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
  * lvalue) - from the register run [base, base+n_rest) into a buffer and call
@@ -345,17 +370,19 @@ vm_call_builtin_lv_rest(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
                         LValue *target, int_type base)
 {
     const int_type n_rest = static_cast<int_type>(dc->args->elems.size()) - 1;
+    ArgLoc locbuf[4];
+    ArgLocs al = vm_lv_arglocs(dc->args.get(), locbuf, 4);
     if (n_rest <= 8) {
         EvalValue stackbuf[8];
         for (int_type i = 0; i < n_rest; i++)
             stackbuf[i] = ctx.frame->at(base + i).get();
-        return dc->builtin.func_lv(&ctx, dc->args.get(), target, stackbuf,
+        return dc->builtin.func_lv(&ctx, &al, target, stackbuf,
                                    static_cast<size_t>(n_rest));
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n_rest));
     for (int_type i = 0; i < n_rest; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
-    return dc->builtin.func_lv(&ctx, dc->args.get(), target, heapbuf.data(),
+    return dc->builtin.func_lv(&ctx, &al, target, heapbuf.data(),
                                static_cast<size_t>(n_rest));
 }
 
@@ -1624,14 +1651,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             /* PER-OP rest-native: a valid `b` (a compiled rest-run base) marks
              * THIS op rest-native - insert/erase (always) OR a plain
              * append/push whose value the codegen pre-evaluated (rest-capable).
-             * `b` unset (self-eval) hands func_lv the node so it reads its args
-             * off it (append's construct-in-place / pop-intptr / sort's cmp). */
+             * `b` unset = NO value args (pop/intptr): func_lv gets an empty rest
+             * (the ArgLocs give it its carets/arity - never a self-eval node). */
             try {
-                ctx.frame->at(in.target).put(
-                    in.b.is_lit
-                        ? vm_call_builtin_lv_rest(ctx, dc, target, in.b.lit)
-                        : dc->builtin.func_lv(&ctx, dc->args.get(), target,
-                                              nullptr, 0));
+                if (in.b.is_lit) {
+                    ctx.frame->at(in.target).put(
+                        vm_call_builtin_lv_rest(ctx, dc, target, in.b.lit));
+                } else {
+                    ArgLoc locbuf[4];
+                    ArgLocs al = vm_lv_arglocs(dc->args.get(), locbuf, 4);
+                    ctx.frame->at(in.target).put(
+                        dc->builtin.func_lv(&ctx, &al, target, nullptr, 0));
+                }
             } catch (Exception &e) {
                 if (!e.loc_start) {
                     e.loc_start = dc->args->start;
@@ -1709,8 +1740,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 EvalValue restbuf[8];   /* n_rest is small (append 1, pop 0) */
                 for (int_type i = 0; i < n_rest; i++)
                     restbuf[i] = ctx.frame->at(in.b.lit + 1 + i).get();
+                ArgLoc locbuf[4];
+                ArgLocs al = vm_lv_arglocs(dc->args.get(), locbuf, 4);
                 ctx.frame->at(in.target).put(
-                    dc->builtin.func_lv(&ctx, dc->args.get(), elem,
+                    dc->builtin.func_lv(&ctx, &al, elem,
                                         n_rest ? restbuf : nullptr,
                                         static_cast<size_t>(n_rest)));
             } catch (Exception &e) {
