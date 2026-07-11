@@ -3288,13 +3288,25 @@ engines. A **mutating builtin** (append/pop/insert/erase/intptr) uses the
 `DirectBuiltinCallExpr::lvalue_arg0`): it gets arg0 as an `LValue*` target,
 dispatching via **`CallBuiltinLV`** when arg0 is a slotted identifier
 (local/global/capture — the op forms the `LValue*` straight from the table). The
-value args (1..n) come in one of two forms (Phase 2a): a **rest-native** builtin
-(`insert`/`erase`, `make_builtin_lv_v` + `lvalue_rest_native`) has them
-pre-evaluated in `rest`/`n_rest` (the VM compiles a register run, base in
-`Instr::b`; `vm_call_builtin_lv_rest` copies by value) — **zero `node->eval`**;
-a **self-eval** builtin (`append`/`push` — construct-in-place needs the node;
-`pop`/`intptr` — no value args, `make_builtin_lv`) gets `rest == nullptr` and
-reads its args off `exprList`. **`append(struct_arr, Ctor(args))` fuses to an
+value args (1..n) — the `rest` args, i.e. the **TAIL ARGS BY VALUE** (everything
+after the arg0 lvalue) — come in one of three forms, decided **PER-OP** (the VM
+reads `in.b.is_lit` — a valid `b` = a compiled rest run = this op is rest-native
+— NOT a per-builtin flag): (1) a **rest-native** builtin (`insert`/`erase`,
+`make_builtin_lv_v` + `lvalue_rest_native`, ALWAYS) has them pre-evaluated in
+`rest`/`n_rest` (the VM compiles a register run, base in `Instr::b`;
+`vm_call_builtin_lv_rest` copies by value) — **zero `node->eval`**; (2) a
+**rest-native-CAPABLE** builtin (`append`/`push`, `lvalue_rest_capable`) has its
+single value arg pre-evaluated too, but only in the PLAIN case — the codegen
+compiles the value into a rest run PER-OP and marks that op, while the ctor case
+(`EmplaceStruct`) and the subscript-target case (`CallBuiltinLVElem`) stay
+self-eval (see below); (3) a **self-eval** call (`rest == nullptr`) reads its
+args off `exprList` — the tree-walker's append/push (so construct-in-place fires),
+`pop`/`intptr` (no value args), `sort`/`reverse` (their cmp arg), and any
+append/push op the codegen left self-eval (a ctor-fallthrough, a subscript
+target). This **per-op** design is what lets `append`'s three call shapes coexist
+(a plain `append(a, x)` is rest-native = no `node->eval`, while `append(a, P(..))`
+= `EmplaceStruct` and `append(a[i], x)` = `CallBuiltinLVElem` keep the node) —
+the necessary step toward a node-free `CallBuiltinLV`. **`append(struct_arr, Ctor(args))` fuses to an
 `EmplaceStruct` op (Phase 2b)**: the inferencer stamps a POD struct construction
 with `CallExpr::vm_struct_ctor_def`; the codegen recognizes append/push of such
 a ctor, compiles the ctor's field-arg VALUES into a register run, and emits

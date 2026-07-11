@@ -852,6 +852,16 @@ public:
      * and passes it as `rest`. A self-eval one (append/push/pop/intptr) leaves
      * this false and reads its args off the node. Needs lvalue_arg0. */
     bool lvalue_rest_native = false;
+    /* A REST-NATIVE-CAPABLE mutating builtin (append/push): its single value arg
+     * CAN be pre-evaluated (rest-native) - but only in the PLAIN case, since the
+     * construct-in-place ctor case is EmplaceStruct and the subscript-target case
+     * is CallBuiltinLVElem (self-eval). So unlike lvalue_rest_native (insert/erase
+     * = ALWAYS rest-native), this is a CAPABILITY: the codegen decides PER-OP
+     * whether to compile the value into a rest run, marking that specific
+     * CallBuiltinLV op (via a valid `b` restbase). The VM handler then chooses
+     * rest vs self-eval per-op (`in.b.is_lit`), NOT from this flag. Needs
+     * lvalue_arg0; mutually exclusive with lvalue_rest_native. */
+    bool lvalue_rest_capable = false;
     /* 0 = not map/filter; 1 = map; 2 = filter. Set by the devirtualize pass
      * from the callee name, so the codegen can emit the validate-first
      * CheckFuncV + MapFilterV sequence (map/filter must validate arg0 before
@@ -869,6 +879,7 @@ public:
         c->builtin = builtin;
         c->lvalue_arg0 = lvalue_arg0;
         c->lvalue_rest_native = lvalue_rest_native;
+        c->lvalue_rest_capable = lvalue_rest_capable;
         c->map_filter_kind = map_filter_kind;
         c->tq_folded = tq_folded;
         return c;

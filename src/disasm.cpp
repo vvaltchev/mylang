@@ -608,12 +608,26 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << builtin_call_name(chunk, in.target2)
                 << arglist(chunk, in.a.lit, in.b.lit);
             break;
-        case OpCode::CallBuiltinLV:
+        case OpCode::CallBuiltinLV: {
+            /* A valid `b` (is_lit) is a rest-run base: this op is REST-NATIVE
+             * (its value args are pre-evaluated in the run) - show them; else
+             * self-eval (the builtin reads its args off the node -> `...`). */
+            const auto *dc = static_cast<const DirectBuiltinCallExpr *>(
+                chunk.node_at(in.node_idx));
             row << "call.blt.lv  " << D(in.target) << " = "
-                << callee_name(chunk.node_at(in.node_idx))
-                << "(" << lval_ref(in.a.lit, in.target2) << ", ...)";
+                << callee_name(dc) << "(" << lval_ref(in.a.lit, in.target2);
+            if (in.b.is_lit && dc && dc->args) {
+                const int nrest =
+                    static_cast<int>(dc->args->elems.size()) - 1;
+                for (int i = 0; i < nrest; i++)
+                    row << ", " << reg(chunk, in.b.lit + i);
+                row << ")";
+            } else {
+                row << ", ...)";
+            }
             cmt(row, chunk.node_at(in.node_idx));
             break;
+        }
         case OpCode::EmplaceStruct: {
             const auto *dc =
                 static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));

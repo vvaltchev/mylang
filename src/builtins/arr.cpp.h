@@ -326,17 +326,24 @@ EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target,
     if (arr.is_slice())
         arr.clone_internal_vec();
 
-    /* Build-hot fast path: `append(flat_struct_arr, S(...))` constructs the new
-     * element straight into the byte buffer (no temporary StructObject). The
-     * arg is evaluated INSIDE on success; on a miss it is evaluated normally
-     * below, so it is never evaluated twice. */
-    if (arr.skind() == SharedArrayObj::Storage::structs &&
+    /* The element to append. A REST-NATIVE call (the VM's plain per-op case)
+     * hands the value in `rest[0]`, ALREADY evaluated - so no node->eval, and no
+     * construct-in-place (a ctor `append(a, P(..))` is EmplaceStruct in the VM,
+     * a value here). A SELF-EVAL call (`rest == nullptr`: the tree-walker, or a
+     * subscript-target op) evaluates arg1 off the node - which is ALSO where the
+     * construct-in-place fast path fires (`append(flat_struct_arr, S(..))`
+     * builds straight into the byte buffer, no temp StructObject; the arg is
+     * evaluated INSIDE on success, normally below on a miss - never twice). */
+    if (!rest && arr.skind() == SharedArrayObj::Storage::structs &&
         try_construct_into_struct_array(ctx, arr, arg1)) {
         arr.invalidate_hash();   /* built in-place; nothing to fold in */
         return lval->get();
     }
 
-    const EvalValue &elem = RValue(arg1->eval(ctx));
+    EvalValue self_elem;
+    if (!rest)
+        self_elem = RValue(arg1->eval(ctx));
+    const EvalValue &elem = rest ? rest[0] : self_elem;
 
     /*
      * Flat fast path: append a matching scalar straight into the unboxed

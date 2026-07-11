@@ -1950,14 +1950,37 @@ struct Codegen {
             }
         }
 
-        /* REST-NATIVE (insert/erase): compile the value args (1..n) into a
-         * register run so func_lv has zero node->eval; `b` carries its base.
-         * A self-eval builtin (append/push/pop/intptr) leaves `b` unused and
-         * reads its args off the node. */
+        /* PER-OP rest-native decision. Compile the value args (1..n) into a
+         * register run so func_lv has ZERO node->eval; `b` carries its base and
+         * MARKS this op rest-native (the VM reads `in.b.is_lit`, not a
+         * per-builtin flag). Two ways to become rest-native:
+         *   - lvalue_rest_native (insert/erase): ALWAYS - a rest arg that can't
+         *     lower fails the whole native call (fall back to the tree-walker).
+         *   - lvalue_rest_capable (append/push): the PLAIN case reached here (the
+         *     ctor case took EmplaceStruct above, the subscript-target case took
+         *     CallBuiltinLVElem above) - pre-evaluate the value PER-OP; if it
+         *     can't lower, DON'T fail - leave `b` unset and let func_lv self-eval
+         *     arg1 off the node (a self-eval CallBuiltinLV, as before).
+         * pop/intptr (no value args) and sort/reverse (cmp self-eval'd) are
+         * neither, so they stay self-eval. */
         int restbase = 0;
+        bool rest_op = false;
         if (dc->lvalue_rest_native) {
             if (!emit_args_range(dc->args->elems, restbase, ops, 1))
                 return false;   /* a rest arg didn't lower -> fall back */
+            rest_op = true;
+        } else if (dc->lvalue_rest_capable) {
+            /* Pre-evaluate the value PER-OP - EXCEPT when arg1 is a struct ctor
+             * whose EmplaceStruct fell through (a field didn't lower): keep it
+             * self-eval so the tree-walker's construct-in-place still fires (the
+             * VM's CallBuiltinLV self-eval path calls try_construct_into_struct_
+             * array). emit_args_range self-rolls-back, so a non-lowerable value
+             * just leaves rest_op false -> self-eval. */
+            auto *ctor = dc->args->elems.size() == 2
+                ? dynamic_cast<const CallExpr *>(dc->args->elems[1].get())
+                : nullptr;
+            if (!(ctor && ctor->vm_struct_ctor_def))
+                rest_op = emit_args_range(dc->args->elems, restbase, ops, 1);
         }
 
         const int dst = alloc_temp();
@@ -1967,7 +1990,7 @@ struct Codegen {
         cv.target = dst;
         cv.target2 = static_cast<const Identifier *>(a0)->sym.slot;
         cv.a = int_lit(kind);
-        if (dc->lvalue_rest_native)
+        if (rest_op)
             cv.b = int_lit(restbase);
         ops.push_back(cv);
         out_slot = dst;

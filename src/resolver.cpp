@@ -152,6 +152,19 @@ static bool is_lvalue_rest_native_builtin(std::string_view name)
 }
 
 /*
+ * A REST-NATIVE-CAPABLE mutating builtin (append/push): its single value arg CAN
+ * be pre-evaluated, but only in the PLAIN case (the ctor case is EmplaceStruct,
+ * the subscript-target case is CallBuiltinLVElem). So the codegen decides PER-OP
+ * whether to compile the value into a rest run (see lvalue_rest_capable). NOT in
+ * this set: insert/erase (rest-native ALWAYS), pop/intptr (no value args),
+ * sort/reverse (their cmp arg is self-eval'd off the node).
+ */
+static bool is_lvalue_rest_capable_builtin(std::string_view name)
+{
+    return name == "append" || name == "push";
+}
+
+/*
  * Coerce a const-folded value to a declared scalar type when inlining a typed
  * var/const (`float f = 3` -> 3.0). Mirrors eval.cpp's coerce_to_decl_type (a
  * separate TU); the inferencer has already validated assignability, so this only
@@ -4187,6 +4200,8 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                 d->lvalue_arg0 = is_lvalue_arg_builtin(id->get_str());
                 d->lvalue_rest_native =
                     is_lvalue_rest_native_builtin(id->get_str());
+                d->lvalue_rest_capable =
+                    is_lvalue_rest_capable_builtin(id->get_str());
                 d->map_filter_kind = id->get_str() == "map"    ? 1
                                    : id->get_str() == "filter" ? 2 : 0;
                 d->tq_folded = call->tq_folded;   /* folded type query -> elide */

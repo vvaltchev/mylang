@@ -1621,9 +1621,14 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 target = &(*ctx.captures)[in.target2];
                 break;
             }
+            /* PER-OP rest-native: a valid `b` (a compiled rest-run base) marks
+             * THIS op rest-native - insert/erase (always) OR a plain
+             * append/push whose value the codegen pre-evaluated (rest-capable).
+             * `b` unset (self-eval) hands func_lv the node so it reads its args
+             * off it (append's construct-in-place / pop-intptr / sort's cmp). */
             try {
                 ctx.frame->at(in.target).put(
-                    dc->lvalue_rest_native
+                    in.b.is_lit
                         ? vm_call_builtin_lv_rest(ctx, dc, target, in.b.lit)
                         : dc->builtin.func_lv(&ctx, dc->args.get(), target,
                                               nullptr, 0));
