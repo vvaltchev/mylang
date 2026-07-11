@@ -211,6 +211,28 @@ inline auto make_builtin(const char *name, decltype(Builtin::func) f)
 }
 
 /*
+ * The DEV-ONLY builtin category (see eval.h): registers a runtime builtin like
+ * make_builtin AND records its interned name in g_dev_builtin_ids - the single
+ * source of truth for is_dev_builtin(). Such a builtin inherently needs the AST
+ * (e.g. show() decompiles it), so it is reserved to the dev harnesses (REPL /
+ * tests); a script call to it is a compile-time error (inferencer). Defined
+ * BEFORE the `builtins` map so g_dev_builtin_ids is initialized first (its
+ * static-init runs top-down in this TU) when make_dev_builtin populates it.
+ */
+static std::set<const UniqueId *> g_dev_builtin_ids;
+inline auto make_dev_builtin(const char *name, decltype(Builtin::func) f)
+{
+    const UniqueId *uid = UniqueId::get(name);
+    g_dev_builtin_ids.insert(uid);
+    return make_pair(uid, LValue(Builtin{f}, false));
+}
+bool is_dev_builtin(const UniqueId *uid)
+{
+    return g_dev_builtin_ids.count(uid) != 0;
+}
+bool g_dev_builtins_allowed = false;
+
+/*
  * Cold n>8 path for the adapter below: heap-allocate the arg buffer.
  * ML_NOINLINE and NON-template (fv is a runtime arg) so the hot adapter body
  * carries no std::vector ctor/dtor - that overhead, paid on every
@@ -459,7 +481,9 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_signature>("signature"),
     make_builtin_v<builtin_layout>("layout"),
     make_builtin_v<builtin_specializations>("specializations"),
-    make_builtin("show", builtin_show),
+    /* show() is a DEV-ONLY builtin (it decompiles the AST): available in the
+     * REPL / tests, a compile-time error in a script (use :show at the REPL). */
+    make_dev_builtin("show", builtin_show),
 
     /* Diagnostic tracing (see trace.h) */
     make_builtin_v<builtin_trace>("trace"),

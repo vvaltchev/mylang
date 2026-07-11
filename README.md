@@ -188,8 +188,11 @@ inspecting the language and its compiler:
   `:show <function>` "decompiles" a function's final optimized AST back into
   code (folded consts, inlined bodies, dead code gone), and its `name$N` clones
   too. (These build on the reflection *builtins* `globals()`, `typestr()` /
-  `kindstr()`, `signature()`, `layout()`, `specializations()`, `show()`, usable
-  from scripts too.)
+  `kindstr()`, `signature()`, `layout()`, `specializations()`, usable from
+  scripts too. **`show()` is a *dev-only* builtin** — it decompiles the AST,
+  which a compiled script does not keep, so it is available only at the REPL
+  (use `:show`) and in the test harness; calling `show()` in a script is a
+  compile-time error.)
 - **The compiler's reasoning** — `:trace <category> on` narrates the optimizer
   as your next input compiles: `:trace infer on` shows how each type is
   inferred, and `inline` / `specialize` / `template` / `autoconst` / `autopure`
@@ -2328,7 +2331,10 @@ Accepts a struct **type descriptor** or an **instance**. (`StructLayout` /
 `StructField` are the first *native composite types* — the same mechanism will
 back `Type` objects for `type()` / `decltype()`.)
 
-#### `show(f)`
+#### `show(f)` — dev-only (REPL / tests)
+**`show()` is a dev-only builtin: it is a compile-time error to call it in a
+script** (it decompiles the AST, which a compiled script does not retain). Use
+it at the REPL — usually as the `:show` meta-command — or in the test harness.
 Render function `f`'s **final optimized AST** back into synthetic MyLang-like
 code — the closest thing to "showing the disassembly". You see what actually
 runs: dead code removed, folded constants as literals (`func g() {

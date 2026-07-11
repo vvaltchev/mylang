@@ -142,9 +142,28 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
   It now BEATS the tree-walker: `77_struct_array_lit` VM **0.85x** (1.2x FASTER)
   / 0.70x CPython. A mixed / nested-struct-field / non-scalar-arg literal
   declines the fused op and falls to the per-element path, then `EvalStmt`.
-- **F-5 · reflection builtins** `show`/`type`/`typestr`/`decltype` as a
-  NON-folded runtime call (synth `typestr(n)`). *INHERENT - an AST builtin with
-  an unevaluated operand; the one construct that genuinely needs the node.*
+- **F-5 · reflection builtins** — split by what they actually need (diagnosed
+  2026-07-11; the earlier "one INHERENTLY-node case" was too pessimistic):
+  - **`show()` — DONE, made a DEV-ONLY builtin.** It decompiles the AST, so it
+    genuinely needs the node - but a compiled SCRIPT doesn't retain the AST, so
+    rather than force the AST into script bytecode, `show()` is now reserved to
+    the DEV harnesses (REPL + tests, which keep the AST). `make_dev_builtin`
+    (`types.cpp`) registers it + records the name in `g_dev_builtin_ids`;
+    `is_dev_builtin` / `g_dev_builtins_allowed` (`eval.h`); the inferencer's
+    `reject_dev_builtins` (structural pass, fires even under -nti) makes a script
+    call a compile-time `SyntaxErrorEx`, while the REPL / `-rt` runner set the
+    flag so it works there. So `show` NEVER reaches serialized bytecode - the
+    `.myv` goal is unblocked without nativizing it. (`:show` is a REPL
+    meta-command, never a builtin, unchanged.)
+  - **`type`/`typestr`/`kindstr`/`decltype` — PENDING (not dev-only; real script
+    features).** The inferencer already FOLDS them to a baked literal
+    (`typestr("int")`, `type(<LiteralObj>)`) in the common case, so: (1) ELIDE
+    the folded call at codegen (emit the constant, drop the call - AST-free +
+    faster); (2) migrate the rare non-folded path (`-nti` / still-`Unknown` arg
+    type) to the VALUE ABI (`func_v`), building the `Type`/string from the
+    pre-evaluated value. Neither needs the node. No new storage - struct defs
+    are already in `Chunk::struct_defs` and carried by each struct value's
+    `def`; the folded `Type` object is a serializable `LiteralObj`.
 
 **`node`-field status:** the fallback ops (EvalStmt/EvalToSlot/JumpIfFalse)
 hold `node` to re-enter `node->eval`; the **builtin call ops** hold it for

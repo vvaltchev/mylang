@@ -2747,7 +2747,9 @@ behind a thin terminal shell:
   typed-scalar/annotation hints as the var's type. A precedence-aware
   expression printer + statement walker, with a comment fallback for any
   unhandled node (best-effort, NOT round-trippable). Backs the `show(f)` builtin
-  and the REPL `:show <name>` (which also renders the `<name>$N` clones). It
+  (a **dev-only** builtin — see the reflection-builtins note below; reserved in
+  scripts) and the REPL `:show <name>` (which also renders the `<name>$N`
+  clones). It
   reads literal values via the public `ival()`/`fval()`/`bval()`/`strval()`/
   `literal_value()` accessors on the `Literal*` nodes. `render_func_code` takes
   an optional per-param inferred-type list: `:show` passes
@@ -3503,14 +3505,32 @@ became an `InternalErrorEx` net). So the ONLY remaining `node` users are: the
 builtin calls (`CallBuiltinV`/`LV`/`LVElem`/`EmplaceStruct` - a baked func ptr +
 the args `ExprList` for per-arg error carets; freed by the builtin loc-handle
 refactor) and the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`). P8
-exceptions are fully native (they no longer reach a fallback op), but they were
-NOT the last: a verified `-vd` audit (the FALLBACK-OP AUDIT in
-`plans/vm-fallback-elimination.md`) finds LIVE `EvalStmt` fallbacks still
-emitted for several multi-assign / IdList forms, a couple of `foreach` shapes
-(dict 2-var, indexed-unpack), a discarded-result indirect call, the flat
-`array<PodStruct>` literal, and the reflection builtins
-(`show`/`type`/`typestr`/`decltype`) as non-folded calls - the last being the
-one INHERENTLY-node case.
+exceptions are fully native (they no longer reach a fallback op). The FALLBACK-OP
+AUDIT (`plans/vm-fallback-elimination.md`) that followed found LIVE `EvalStmt`
+fallbacks in several more shapes — **F-1..F-4, all now NATIVE**: the multi-assign
+/ IdList forms (`MultiUnpackV`), the residual `foreach` shapes (2-var dyn
+container, indexed general-value unpack), the discarded-result indirect call
+(`CallValueV` as a statement), and the flat `array<PodStruct>` literal (the
+fused `MakeStructArrayV`). **The residual is the reflection builtins**, split by
+what they need:
+- **`show()` — DEV-ONLY builtin** (the `make_dev_builtin` category, `types.cpp`;
+  `is_dev_builtin` / `g_dev_builtins_allowed`, `eval.h`): it decompiles the AST,
+  which a compiled script does not retain, so it is a DELIBERATE dev affordance —
+  available in the REPL and the test harness (both keep the AST; both set
+  `g_dev_builtins_allowed`), a **compile-time error in a script** (the
+  inferencer's `reject_dev_builtins`, run in the structural pass so it fires even
+  under `-nti`; a user `func show` shadow is left alone). So `show` NEVER reaches
+  serialized script bytecode — it keeps its AST node without blocking the
+  `Construct*`-free `.myv` goal. The REPL uses the `:show` meta-command (never a
+  bytecode builtin) unchanged.
+- **`type`/`typestr`/`kindstr`/`decltype` — still fallback ops** (pending): the
+  inferencer already folds them to a baked literal (`typestr("int")`) in the
+  common case, so the plan is to ELIDE the folded call at codegen (emit the
+  constant) and migrate the rare non-folded path (`-nti` / `Unknown` arg type)
+  to the value ABI (`func_v`, building the `Type`/string from the pre-evaluated
+  value). Neither needs the node; no new storage (struct defs are already in
+  `Chunk::struct_defs` + the value's own `def`).
+
 A fallback op can hold its node as an index into a
 `Chunk::ast_nodes` pool, so `Instr` can shed the 8-byte `node` field WITHOUT
 first nativizing exceptions - the node-drop and the VM-exception work are
@@ -3720,7 +3740,13 @@ instrumentation (see `plans/function-templates.md`).
    safe to run during const-eval, otherwise `make_builtin(...)` in the
    `builtins` map (runtime only —
    I/O, `rand`, mutation, `exit`, …). Const builtins are what const-folding is
-   allowed to call.
+   allowed to call. **A builtin that inherently needs the AST** (like `show()`,
+   which decompiles it) should instead be a **dev-only builtin**:
+   `make_dev_builtin(...)` — it registers like `make_builtin` but records the
+   name in `g_dev_builtin_ids`, so the inferencer (`reject_dev_builtins`) makes a
+   SCRIPT call a compile-time error while the REPL / test harness (which set
+   `g_dev_builtins_allowed`) allow it. This keeps the AST out of serialized
+   script bytecode.
 3. Document it in `README.md` (const vs. non-const section) and add a test in
    `src/tests.cpp`.
 

@@ -239,6 +239,7 @@ private:
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
     void lower_named_args(Construct *n);        /* desugar named-arg calls */
     void lower_call_named_args(CallExpr *call); /* ...for one call */
+    void reject_dev_builtins(Construct *n);     /* DEV-only builtins in a script */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(StaticTypeRef t, bool deep);
 
@@ -878,6 +879,13 @@ void Inferencer::infer_one(Block *rootBlock)
      */
     for (auto &e : rootBlock->elems)
         lower_named_args(e.get());
+
+    /* Reserve DEV-only builtins (show()) in a script - a compile-time error,
+     * even under -nti (this runs before the checks_enabled early return). A
+     * no-op in the REPL / test runner (they set g_dev_builtins_allowed). */
+    if (!g_dev_builtins_allowed)
+        for (auto &e : rootBlock->elems)
+            reject_dev_builtins(e.get());
 
     if (!checks_enabled)
         return;
@@ -2017,6 +2025,34 @@ void Inferencer::lower_named_args(Construct *n)
 
     if (auto *call = dynamic_cast<CallExpr *>(n))
         lower_call_named_args(call);
+}
+
+/*
+ * Reject a call to a DEV-ONLY builtin (show()) in a SCRIPT - such builtins need
+ * the AST and are reserved to the dev harnesses (REPL / tests), so a script use
+ * is a compile-time error. Runs in the structural pass (so it fires even under
+ * -nti); the caller gates it on !g_dev_builtins_allowed, so it is a no-op in the
+ * REPL / test runner. A user symbol of the same name (a `func show(){}` shadow)
+ * has a non-null id_sym entry and is left alone - it is the user's function.
+ */
+void Inferencer::reject_dev_builtins(Construct *n)
+{
+    if (!n)
+        return;
+
+    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+        if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+            auto it = id_sym.find(cid);
+            const bool user_shadow = (it != id_sym.end() && it->second);
+            if (!user_shadow && is_dev_builtin(cid->uid))
+                throw SyntaxErrorEx(cid->start,
+                    intern_msg("'" + std::string(cid->uid->val) +
+                        "' is a dev-only builtin (REPL / tests only); it is not "
+                        "available in a script"));
+        }
+    }
+
+    for_each_child(n, [this](Construct *c) { reject_dev_builtins(c); });
 }
 
 /* --------------------------- type computation ---------------------------- */

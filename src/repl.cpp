@@ -153,7 +153,15 @@ struct ReplEngine::Impl {
     }
 };
 
-ReplEngine::ReplEngine() : impl(new Impl) { }
+ReplEngine::ReplEngine() : impl(new Impl)
+{
+    /* The REPL is a DEV environment: dev-only builtins (show()) that need the
+     * AST are allowed here (the REPL retains its input ASTs). A script leaves
+     * this false, so a script call to show() is a compile-time error. Covers
+     * both the interactive REPL and the headless repl: tests (both build a
+     * ReplEngine). */
+    g_dev_builtins_allowed = true;
+}
 ReplEngine::~ReplEngine() = default;
 
 void

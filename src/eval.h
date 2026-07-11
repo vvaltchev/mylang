@@ -322,6 +322,19 @@ LValue &builtin_slot(int index);
 /* did the builtin come from const_builtins (visible during const-eval)? */
 bool builtin_is_const(int index);
 
+/*
+ * DEV-ONLY builtins (the `show()` category): builtins that inherently need the
+ * AST (e.g. show() decompiles it), so they are a DEV affordance - available in
+ * the REPL and the test harness (both keep the AST), but RESERVED in an actual
+ * script, where a call to one is a COMPILE-TIME error. This is what lets a
+ * compiled script serialize to pure bytecode (no Construct*) while the dev tools
+ * keep their AST access. `is_dev_builtin` tests membership (by interned name);
+ * `g_dev_builtins_allowed` is the process-wide dev-harness flag (default false;
+ * the -rt runner and the REPL set it true, a script leaves it false).
+ */
+bool is_dev_builtin(const UniqueId *uid);
+extern bool g_dev_builtins_allowed;
+
 /* The VALUE-read path of `base.member` (a struct field / const / dict key /
  * optional-none), shared by MemberExpr::do_eval and the VM's MemberV. */
 class MemberExpr;

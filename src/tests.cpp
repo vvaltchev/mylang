@@ -13241,10 +13241,64 @@ static bool vm_disasm_closure_shape()
     }
 }
 
+/*
+ * A DEV-ONLY builtin (show()) is reserved in a SCRIPT (a compile-time
+ * SyntaxErrorEx) but allowed in a DEV harness (g_dev_builtins_allowed). This
+ * can't be a plain check() test - the whole -rt run sets the flag true - so it
+ * flips the flag itself and asserts both directions. A user shadow
+ * (`func show`) is left alone.
+ */
+static bool
+dev_builtin_reserved_in_script()
+{
+    auto rejected = [](bool dev_allowed, const char *const *lines,
+                       size_t n) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < n; i++) {
+            if (i)
+                src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        const bool saved = g_dev_builtins_allowed;
+        g_dev_builtins_allowed = dev_allowed;
+        bool threw = false;
+        try {
+            infer_types(root.get());
+        } catch (const SyntaxErrorEx &) {
+            threw = true;
+        }
+        g_dev_builtins_allowed = saved;
+        return threw;
+    };
+
+    static const char *call_show[] = {
+        "func f(x) => x + 1;",
+        "print(show(f));",   /* no var decl: avoids a mandatory-dyn error */
+    };
+    static const char *user_shadow[] = {
+        "func show(x) => x * 2;",   /* the user's own function, not the builtin */
+        "var r = show(21);",
+    };
+    const size_t n1 = sizeof(call_show) / sizeof(call_show[0]);
+    const size_t n2 = sizeof(user_shadow) / sizeof(user_shadow[0]);
+
+    /* script (dev off) rejects; dev on allows; a user shadow is never rejected */
+    return rejected(false, call_show, n1)
+        && !rejected(true, call_show, n1)
+        && !rejected(false, user_shadow, n2);
+}
+
 static const std::vector<extra_check> extra_checks =
 {
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
+    { "builtins: dev-only show() reserved in a script",
+      dev_builtin_reserved_in_script },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
     { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
@@ -13365,6 +13419,12 @@ void run_tests(bool dump_syntax_tree)
 {
     size_t pass_count = 0;
     int err_line;
+
+    /* The test harness is a DEV environment (like the REPL): dev-only builtins
+     * (show()) are allowed here so the optimizer-introspection tests can use
+     * show() to assert on the rendered optimized AST. A script leaves this
+     * false, so show() is a compile-time error there. */
+    g_dev_builtins_allowed = true;
 
     g_exec_engine = ExecEngine::TreeWalk;   /* the oracle */
 

@@ -109,12 +109,14 @@ const BuiltinDoc builtin_docs[] = {
 { "specializations", "reflect", "specializations(f)",
   "The <name>$N / <name>$sN template-instance & specialization clones derived "
   "from f.", nullptr },
-{ "show", "reflect", "show(x)",
-  "Render x's FINAL optimized AST back into synthetic MyLang code.",
-  "A function value renders its whole declaration; any other argument is an "
-  "EXPRESSION whose optimized tree is rendered (show(2+3*4) -> 14). Dead code "
-  "is gone, folded consts are literals, inlined bodies are spliced in. In the "
-  "REPL, :show <name> also renders the <name>$N clones with their inferred "
+{ "show", "reflect", "show(x)  [dev-only]",
+  "Render x's FINAL optimized AST back into synthetic MyLang code (DEV-ONLY).",
+  "DEV-ONLY: it decompiles the AST, so it is reserved to the REPL and the test "
+  "harness - calling show() in a script is a compile-time error (use :show at "
+  "the REPL). A function value renders its whole declaration; any other argument "
+  "is an EXPRESSION whose optimized tree is rendered (show(2+3*4) -> 14). Dead "
+  "code is gone, folded consts are literals, inlined bodies are spliced in. In "
+  "the REPL, :show <name> also renders the <name>$N clones with their inferred "
   "param/return types, syntax-highlighted." },
 { "array_storage", "reflect", "array_storage(a)",
   "The array's storage, by element type: \"int\"/\"float\"/\"bool\"/\"struct\"/"
