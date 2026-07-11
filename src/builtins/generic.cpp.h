@@ -233,6 +233,10 @@ EvalValue builtin_assert(EvalContext *ctx, const ArgLocs *exprList,
     return none;
 }
 
+/* func_lv (mutating) ABI: `target` = arg0's lvalue (the container); `rest`/
+ * `n_rest` = the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
+ * lvalue), pre-evaluated. erase is REST-NATIVE, so it reads its index from
+ * `rest[0]` (zero node->eval), unlike self-eval append. */
 EvalValue builtin_erase(EvalContext *ctx, ExprList *exprList, LValue *target,
                         const EvalValue *rest, size_t n_rest)
 {

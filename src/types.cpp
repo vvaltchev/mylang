@@ -393,11 +393,12 @@ builtin_lv_v_adapter_big(decltype(Builtin::func_lv) flv, EvalContext *ctx,
 
 /*
  * REST-NATIVE lvalue adapter (insert/erase): arg0 -> LValue* target as above,
- * PLUS the value args (1..n) pre-evaluated by VALUE into a buffer, so the
- * builtin has ZERO node->eval. Both engines reach it - the tree-walker as the
- * builtin's `func`, the VM as CallBuiltinLV (which forms the same rest run in
- * registers). arg0 is evaluated first (a pure slot reference), then the rest,
- * matching the old self-eval order.
+ * PLUS the `rest` args - the TAIL ARGS BY VALUE (args 1..n, everything after
+ * the arg0 lvalue) - pre-evaluated by VALUE into a buffer, so the builtin has
+ * ZERO node->eval. Both engines reach it - the tree-walker as the builtin's
+ * `func`, the VM as CallBuiltinLV (which forms the same rest run in registers).
+ * arg0 is evaluated first (a pure slot reference), then the rest, matching the
+ * old self-eval order.
  */
 template <decltype(Builtin::func_lv) FLV>
 EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
@@ -426,7 +427,8 @@ inline auto make_builtin_lv(const char *name)
     return make_pair(UniqueId::get(name), LValue(b, false));
 }
 
-/* Rest-native registration (insert/erase): the value args are pre-evaluated.
+/* Rest-native registration (insert/erase): the `rest` args - the TAIL ARGS BY
+ * VALUE (args 1..n, everything after the arg0 lvalue) - are pre-evaluated.
  * DirectBuiltinCallExpr::lvalue_rest_native must be set for these so the VM's
  * CallBuiltinLV forms the rest run too (see resolver.cpp). */
 template <decltype(Builtin::func_lv) FLV>

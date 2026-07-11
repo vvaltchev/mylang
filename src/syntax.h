@@ -846,7 +846,8 @@ public:
      * builtin.func_lv, and arg0 must be handed over as an LValue*, not a value.
      * Discriminates the Builtin union (func_v vs func_lv) for the VM. */
     bool lvalue_arg0 = false;
-    /* A REST-NATIVE mutating builtin (insert/erase): its value args (1..n) are
+    /* A REST-NATIVE mutating builtin (insert/erase): its `rest` args - the TAIL
+     * ARGS BY VALUE (args 1..n, everything after the arg0 lvalue) - are
      * pre-evaluated, so the VM's CallBuiltinLV forms a register run for them
      * and passes it as `rest`. A self-eval one (append/push/pop/intptr) leaves
      * this false and reads its args off the node. Needs lvalue_arg0. */

@@ -73,8 +73,9 @@ struct Builtin {
      * tree-walker), never by reading both:
      *   func_v  - a READ-ONLY builtin: args pre-evaluated by VALUE, no lvalue.
      *   func_lv - a MUTATING builtin: arg0 handed over as an LValue* target,
-     *             plus the value args (1..n) either pre-evaluated in `rest`/
-     *             `n_rest` (a REST-NATIVE builtin: insert/erase, via
+     *             plus the "REST" args - the TAIL ARGS BY VALUE, i.e. args 1..n,
+     *             everything after the arg0 lvalue - either pre-evaluated in
+     *             `rest`/`n_rest` (a REST-NATIVE builtin: insert/erase, via
      *             make_builtin_lv_v + lvalue_rest_native) or `rest == nullptr`
      *             for a SELF-EVAL builtin (append/push/pop/intptr), which reads
      *             its args off `exprList` - so append keeps construct-in-place,
@@ -84,6 +85,10 @@ struct Builtin {
     union {
         EvalValue (*func_v)(EvalContext *, const ArgLocs *, const EvalValue *,
                             size_t);
+        /* `rest`/`n_rest` = the TAIL ARGS BY VALUE (args 1..n, everything after
+         * the arg0 `target` lvalue), pre-evaluated; null == the builtin
+         * self-evaluates them off `exprList`. (Name from the rest-parameter
+         * idiom: target = the head/first arg, rest = the tail of the list.) */
         EvalValue (*func_lv)(EvalContext *, ExprList *, LValue *,
                              const EvalValue *, size_t);
     };

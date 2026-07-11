@@ -294,6 +294,10 @@ static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
     }
 }
 
+/* func_lv (mutating) ABI: `target` = arg0's lvalue (the array to append to);
+ * `rest`/`n_rest` = the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
+ * lvalue), pre-evaluated. append is SELF-EVAL, so `rest` is null and it reads
+ * arg1 off `exprList` (it needs the ctor node for construct-in-place). */
 EvalValue builtin_append(EvalContext *ctx, ExprList *exprList, LValue *target,
                          const EvalValue *rest, size_t n_rest)
 {

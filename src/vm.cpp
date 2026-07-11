@@ -335,10 +335,11 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
 }
 
 /* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
- * the value args (1..n) from the register run [base, base+n_rest) into a buffer
- * and call func_lv with `target` + `rest` - zero node->eval. ML_NOINLINE keeps
- * the (cold) CallBuiltinLV case out of vm_run_chunk's hot body. n_rest is small
- * for a valid call (insert 2, erase 1); >8 (a wrong-arity call) heaps. */
+ * the `rest` args - the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
+ * lvalue) - from the register run [base, base+n_rest) into a buffer and call
+ * func_lv with `target` + `rest`, zero node->eval. ML_NOINLINE keeps the (cold)
+ * CallBuiltinLV case out of vm_run_chunk's hot body. n_rest is small for a valid
+ * call (insert 2, erase 1); >8 (a wrong-arity call) heaps. */
 static ML_COLD EvalValue
 vm_call_builtin_lv_rest(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
                         LValue *target, int_type base)
@@ -1597,12 +1598,14 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*
              * from its slot table (by kind), then call func_lv - which mutates
-             * through it. A REST-NATIVE builtin (insert/erase) gets its value
-             * args pre-evaluated from the register run at `b` (no node->eval);
-             * a self-eval one (append/push/pop/intptr) gets rest=null and reads
-             * its args off the node (so append keeps construct-in-place).
-             * Mirrors Identifier::do_eval for each kind: a not-yet-defined
-             * global -> null target -> NotLValueEx, like the tree-walker. */
+             * through it. A REST-NATIVE builtin (insert/erase) gets its `rest`
+             * args - the TAIL ARGS BY VALUE (args 1..n, everything after the
+             * arg0 lvalue) - pre-evaluated from the register run at `b` (no
+             * node->eval); a self-eval one (append/push/pop/intptr) gets
+             * rest=null and reads its args off the node (so append keeps
+             * construct-in-place). Mirrors Identifier::do_eval for each kind: a
+             * not-yet-defined global -> null target -> NotLValueEx, like the
+             * tree-walker. */
             const DirectBuiltinCallExpr *dc =
                 static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
             LValue *target;
