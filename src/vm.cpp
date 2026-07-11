@@ -204,6 +204,26 @@ vm_throw_unpack_len(const Chunk &chunk, size_t pc, size_type m, int_type nvars)
                                  std::to_string(nvars) + " variables"), s, en);
 }
 
+/* Cold out-of-bounds / div-by-zero throws (loc from the side table). Kept as
+ * [[noreturn]] ML_NOINLINE helpers so the STORE/LOAD hot paths carry no loc_at
+ * (a binary search) and no throw/string code inline - only a call on the cold
+ * error path, which also keeps vm_run_chunk's hot body compact. */
+[[noreturn]] static ML_NOINLINE void
+vm_throw_oob(const Chunk &chunk, size_t pc)
+{
+    Loc s, en;
+    chunk.loc_at(pc, s, en);
+    throw OutOfBoundsEx(s, en);
+}
+
+[[noreturn]] static ML_NOINLINE void
+vm_throw_div0(const Chunk &chunk, size_t pc)
+{
+    Loc s, en;
+    chunk.loc_at(pc, s, en);
+    throw DivisionByZeroEx(s, en);
+}
+
 /* The MULTI-ASSIGN strict-unpack length error (F-1) - the same message the
  * tree-walker's handle_single_expr14 throws, WITHOUT the "foreach:" prefix. */
 [[noreturn]] static ML_NOINLINE void
@@ -1175,9 +1195,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * base op back to its Expr14 op) - AST-free and byte-identical to
              * the tree-walker (the same path StoreElemValue uses). The base may
              * be a global/capture array (in.target = the slot kind); the caret
-             * comes from the loc side table. */
-            Loc ls, le;
-            chunk.loc_at(pc, ls, le);
+             * comes from the loc side table - looked up LAZILY, only on the cold
+             * throw/fallback paths, so the hot store pays no binary search. */
             LValue &alv =
                 *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
             if (alv.is<SharedArrayObj>()) {
@@ -1191,12 +1210,12 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        throw OutOfBoundsEx(ls, le);
+                        vm_throw_oob(chunk, pc);
                     const int_type rhs = read_int_operand(in.b, &ctx);
                     /* div/mod by zero throws BEFORE any clone (tree-walker
                      * throws during the op eval, before the COW). */
                     if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0)
-                        throw DivisionByZeroEx(ls, le);
+                        vm_throw_div0(chunk, pc);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
@@ -1222,17 +1241,21 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     break;
                 }
             }
-            vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
-                               EvalValue(read_int_operand(in.b, &ctx)),
-                               vm_base_to_expr14_op(in.aop), ls, le);
+            {
+                Loc ls, le;
+                chunk.loc_at(pc, ls, le);
+                vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
+                                   EvalValue(read_int_operand(in.b, &ctx)),
+                                   vm_base_to_expr14_op(in.aop), ls, le);
+            }
             pc++;
             break;
         }
 
         case OpCode::StoreElemFloat: {
 
-            Loc ls, le;
-            chunk.loc_at(pc, ls, le);
+            /* Caret from the loc side table, looked up LAZILY on the cold
+             * throw/fallback paths only (see StoreElemInt). */
             LValue &alv =
                 *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
             if (alv.is<SharedArrayObj>()) {
@@ -1243,10 +1266,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        throw OutOfBoundsEx(ls, le);
+                        vm_throw_oob(chunk, pc);
                     const float_type rhs = read_float_operand(in.b, &ctx);
                     if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0.0)
-                        throw DivisionByZeroEx(ls, le);
+                        vm_throw_div0(chunk, pc);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
@@ -1266,9 +1289,13 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     break;
                 }
             }
-            vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
-                               EvalValue(read_float_operand(in.b, &ctx)),
-                               vm_base_to_expr14_op(in.aop), ls, le);
+            {
+                Loc ls, le;
+                chunk.loc_at(pc, ls, le);
+                vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
+                                   EvalValue(read_float_operand(in.b, &ctx)),
+                                   vm_base_to_expr14_op(in.aop), ls, le);
+            }
             pc++;
             break;
         }
