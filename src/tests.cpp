@@ -1716,6 +1716,28 @@ static const std::vector<test> tests =
         "assert(s == [2,3,4]);",
         "assert(a == [1,2,99,3,4,5]);" } },
 
+    /* Subscript-target mutating builtins `append/push/pop(a[i], ...)` (the VM's
+     * CallBuiltinLVElem): mutate an ELEMENT that is itself a container, via the
+     * runtime Type::subscript LValue. Differential-covered (tw vs vm). */
+    { "append: subscript target `append(m[i], x)` (array element)",
+      { "var m = [[1,2],[3]];",
+        "var i = 0;",
+        "append(m[i], 9);",
+        "append(m[1], 8);",
+        "assert(m == [[1,2,9],[3,8]]);" } },
+    { "push: subscript target `push(m[i], x)`",
+      { "var m = [[1],[2]];",
+        "push(m[0], 5);",
+        "assert(m == [[1,5],[2]]);" } },
+    { "pop: subscript target `pop(m[i])`",
+      { "var m = [[1,2,3],[4]];",
+        "pop(m[0]);",
+        "assert(m == [[1,2],[4]]);" } },
+    { "append: subscript target on a DICT value `append(d[k], x)`",
+      { "var d = {\"a\": [1], \"b\": [2]};",
+        "append(d[\"a\"], 7);",
+        "assert(d[\"a\"] == [1,7]);" } },
+
     /* erase()/insert() error paths. */
     {
         "erase() with the wrong number of arguments is rejected",
