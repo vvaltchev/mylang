@@ -1365,6 +1365,19 @@ public:
     bool is_template_base = false;
 
     /*
+     * Set by the inferencer for ANY base template's decl (every
+     * `FuncInfo::is_template`, value-used or not - a superset of
+     * is_template_base). `specialize_types` SKIPS a template base's body: a base
+     * is a monomorphization shell, not run with fixed types - it is CLONED per
+     * concrete signature (each clone specialized separately) and, when
+     * value-used, run GENERICALLY (boxed) for indirect dispatch. Specializing it
+     * (e.g. `int OP dyn` -> a typed-int node) would corrupt a clone of a
+     * DIFFERENT signature (a float instance's eval_int on a float param) and an
+     * indirect call with a non-int arg. A clone (an instance) leaves this false.
+     */
+    bool is_template = false;
+
+    /*
      * Set by the inliner when it unrolls this (pure, self-recursive, >=2
      * self-call) function: a call to it caches its result in the CALLER's frame
      * (see PureCache, eval.h), so the duplicate self-calls the unroll brings

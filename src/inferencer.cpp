@@ -63,6 +63,21 @@ struct TypeSym {
     bool is_param = false;
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
+    /*
+     * dyn-into-concrete COERCION. `int OP dyn` is `dyn` (see binop_result), so a
+     * `var s = 0; s = s + x` (x dyn) contributes `dyn` to `s`. Rather than widen
+     * `s` to dyn (which would demand `var dyn s`), a `dyn` value is treated as
+     * ASSIGNABLE to a concrete NUMERIC local - a runtime-checked coercion: `s`
+     * keeps the type of its non-dyn contributions and the store coerces the dyn
+     * value to it (error if not that type). `round_got_dyn` records a dyn
+     * contribution THIS round (order-independent - the numeric-vs-dyn decision is
+     * made at commit, not at the contribution); `coerces_dyn` (sticky) is the
+     * final "this concrete var receives a dyn -> the runtime must coerce" — the
+     * inferencer stamps `decl_id->decl_type` so `coerce_to_decl_type` fires.
+     */
+    bool round_got_dyn = false;
+    bool coerces_dyn = false;
+    Identifier *decl_id = nullptr;   /* the decl Identifier (for decl_type stamp) */
     /* Structural-pass bookkeeping for safe var-bound-lambda monomorphization:
      * how many times the name is written (decl + assigns), and whether it is
      * ever referenced in a non-callee (value) position. A write-once,
@@ -956,8 +971,33 @@ void Inferencer::infer_one(Block *rootBlock)
      */
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
-        if (s->func && s->func->is_template && !s->value_used && s->func->decl)
-            s->func->decl->is_template_base = true;
+        if (s->func && s->func->is_template && s->func->decl) {
+            /* ANY template base -> skip specialization (a monomorphization
+             * shell). A DEAD one (never value-used) -> also skip codegen. */
+            s->func->decl->is_template = true;
+            if (!s->value_used)
+                s->func->decl->is_template_base = true;
+        }
+        /*
+         * dyn-into-concrete coercion: a plain `var` that keeps a NUMERIC type
+         * while receiving a `dyn` value (coerces_dyn) needs the runtime to
+         * coerce that value to its type - exactly what an EXPLICIT `int s` /
+         * `float s` does via `coerce_to_decl_type`. Stamp the decl Identifier's
+         * `decl_type` (only when NOT already annotated), so resolve_names
+         * propagates it to the uses and the store fast paths coerce. A `dyn`
+         * value holding the right numeric type stores fine; a mismatched one
+         * (e.g. a float into an int var) is the runtime error the maintainer's
+         * rule wants. Skip a param (bound, not decl_type-coerced) and a pinned
+         * REPL global.
+         */
+        if (s->coerces_dyn && !s->is_param && !s->pinned && s->decl_id &&
+                s->decl_id->decl_type == DeclType::none) {
+            const StaticTypeRef ty = static_type_resolve(s->type);
+            if (ty->kind == StaticTypeKind::Int)
+                s->decl_id->decl_type = DeclType::i;
+            else if (ty->kind == StaticTypeKind::Float)
+                s->decl_id->decl_type = DeclType::f;
+        }
     }
     for (auto &up : all_funcs) {
         /*
@@ -1809,6 +1849,8 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
             sym->ann_struct = id->decl_struct;   /* set when ann == strct */
             sym->ann_annot = id->decl_annot;     /* set when parameterized */
         }
+        sym->decl_id = id;       /* for a post-inference decl_type stamp
+                                  * (dyn-into-concrete coercion) */
         id_sym[id] = sym;        /* the decl write is counted in walk_struct
                                   * (declare_target runs twice via hoist) */
     };
@@ -2254,6 +2296,24 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return t;
     }
 
+    /*
+     * A TypedScalarExpr (M8) - normally inference runs BEFORE specialization, so
+     * type_of never meets one; but a REPL RETAINS a prior input's
+     * POST-specialization body, and a template instance CLONED from it in a
+     * later input re-enters inference (like the inliner's cross-input
+     * TypedScalarExpr handling). Its result type is known from cat/kind: a
+     * comparison / logical / `!` yields bool, arithmetic / negation the operand
+     * `kind` (int or float). Without this, such a node fell through to `dyn`,
+     * spuriously forcing an accumulator var to `dyn` -> DynRequiredEx.
+     */
+    if (auto *ts = dynamic_cast<const TypedScalarExpr *>(e)) {
+        if (ts->cat == TypedScalarExpr::Cat::cmp ||
+            ts->cat == TypedScalarExpr::Cat::logical ||
+            ts->cat == TypedScalarExpr::Cat::lnot)
+            return A.bool_ty();
+        return ts->kind == TypeHint::f ? A.float_ty() : A.int_ty();
+    }
+
     if (auto *idc = dynamic_cast<const IncDecExpr *>(e)) {
         /* `x++` / `++x` yields `x +/- 1` (int stays int, float stays float);
          * binop_result defers on an Unknown operand. The check pass enforces
@@ -2445,6 +2505,18 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
     if (op == Op::plus && strip(a)->kind == StaticTypeKind::Str)
         return A.str_ty();
 
+    /*
+     * A `dyn` operand makes the arithmetic result `dyn` - `int + dyn` is the
+     * NATURAL result of mixing a concrete with a variant. It does NOT get forced
+     * to the concrete type: a fresh `var r = 3 + d` (d dyn) then correctly
+     * infers `dyn` (must be declared `var dyn r`). The accumulator case
+     * `var s = 0; s = s + x` keeps `s` int NOT by typing `s + x` int, but by the
+     * ASSIGNMENT: a `dyn` value is *assignable* to a concrete-typed local (a
+     * runtime-checked COERCION - `contribute`/`static_type_assignable` +
+     * `coerce_to_decl_type`), so `s` (int, from `0`) coerces the `dyn` rhs and
+     * stays int, erroring at runtime only if the value isn't int. See the
+     * *dyn-into-concrete coercion* handling in `contribute` / the check pass.
+     */
     if (is_dyn(a) || is_dyn(b))
         return A.dyn_ty();
 
@@ -2758,6 +2830,7 @@ void Inferencer::reset_round()
         TypeSym *s = up.get();
         if (s->func || s->pinned)   /* pinned: a prior input's fixed type */
             continue;
+        s->round_got_dyn = false;   /* dyn-into-concrete coercion tracking */
         /* A scalar annotation pins the type: seed the accumulator with the
          * declared type so it stays fixed (contribute() keeps it and checks
          * assignability). dyn next, else bottom. */
@@ -2777,6 +2850,22 @@ void Inferencer::commit_round()
         TypeSym *s = up.get();
         if (s->func || s->pinned)
             continue;
+        /*
+         * dyn-into-concrete coercion decision (see contribute): a dyn value was
+         * assigned to this plain `var`. If the NON-dyn contributions gave a
+         * NUMERIC type (int/float), the var keeps it and coerces the dyn at
+         * runtime (coerces_dyn, sticky). Otherwise (a non-numeric concrete, or
+         * no concrete contribution at all) the dyn folds back in -> the var is
+         * `dyn` (-> DynRequiredEx unless declared `dyn`).
+         */
+        if (s->round_got_dyn && !s->dyn_decl) {
+            const StaticTypeRef ac = static_type_resolve(s->acc);
+            if (ac->kind == StaticTypeKind::Int ||
+                ac->kind == StaticTypeKind::Float)
+                s->coerces_dyn = true;   /* keep numeric acc; runtime coerces */
+            else
+                s->acc = A.dyn_ty();     /* non-numeric / dyn-only -> dyn */
+        }
         if (!static_type_equal(s->acc, s->type)) {
             changed = true;
             if (s->name)
@@ -2862,6 +2951,23 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
                          loc, Loc());
         }
         s->acc = d;                  /* pinned: never widens */
+        return;
+    }
+
+    /*
+     * dyn-into-concrete COERCION: a `dyn` value assigned to a plain `var` does
+     * NOT widen it to dyn. Record the dyn contribution (round_got_dyn) but do
+     * NOT join it - the accumulator collects only the NON-dyn contributions. At
+     * commit, a NUMERIC accumulator + a dyn contribution means the var keeps its
+     * numeric type and coerces the dyn value at runtime (coerces_dyn); a var
+     * with ONLY dyn contributions (or a non-numeric one) folds the dyn back in
+     * and becomes `dyn` -> DynRequiredEx. A `dyn`-declared var is unaffected
+     * (its acc is seeded dyn and it accumulates normally). Order-independent:
+     * the numeric-vs-dyn decision is made at commit from the collected concrete
+     * type, not from the acc's transient state when the dyn arrived.
+     */
+    if (!s->dyn_decl && is_dyn(t)) {
+        s->round_got_dyn = true;
         return;
     }
 
@@ -4192,7 +4298,12 @@ static void specialize_children(Construct *n)
         return;
     }
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
-        if (fd->body) fd->body = specialize(std::move(fd->body));
+        /* A base template's body is a monomorphization shell - never
+         * specialized (see FuncDeclStmt::is_template): it is cloned per concrete
+         * signature (each clone specializes separately) and, when value-used,
+         * run boxed for indirect dispatch. Specializing it would corrupt those. */
+        if (fd->body && !fd->is_template)
+            fd->body = specialize(std::move(fd->body));
         return;
     }
     if (auto *ld = dynamic_cast<LiteralDict *>(n)) {

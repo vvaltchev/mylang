@@ -2839,14 +2839,35 @@ try_pod_struct_store(EvalContext *ctx, Construct *lvalue, Op op,
  */
 static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
 {
+    /*
+     * Coerce a value to a typed variable's/param's declared type. WIDENING is
+     * implicit (int/bool -> float, bool -> int); NARROWING is NOT (a `float`
+     * into an `int` THROWS, it never truncates) - use an explicit int(x) to
+     * narrow. A statically-typed rvalue can only be a widening one (the check
+     * pass rejects a narrowing assignment/arg at compile time), so a throw here
+     * fires ONLY for a `dyn` value whose RUNTIME type doesn't fit: `int s = 0;
+     * s = s + x` over a `dyn` x holding a float -> a runtime error (`x` isn't
+     * int). `none` passes through - nullability (opt) is checked separately.
+     */
     if (dt == DeclType::f) {
+        if (v.is<float_type>() || v.is<NoneVal>())
+            return v;
         if (v.is<int_type>())
             return EvalValue(static_cast<float_type>(v.get<int_type>()));
         if (v.is<bool>())
             return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
-    } else if (dt == DeclType::i) {
+        throw TypeErrorEx(
+            "cannot store a non-numeric value in a 'float' variable "
+            "(use float(...) to convert)");
+    }
+    if (dt == DeclType::i) {
+        if (v.is<int_type>() || v.is<NoneVal>())
+            return v;
         if (v.is<bool>())
             return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+        throw TypeErrorEx(
+            "cannot store a non-int value in an 'int' variable "
+            "(a float doesn't narrow implicitly - use int(...) to convert)");
     }
     return v;
 }

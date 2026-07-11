@@ -2162,6 +2162,30 @@ static const std::vector<test> tests =
     { "++/--: a dyn holding a non-number throws at runtime",
       { "var dyn d = \"s\"; d++;" }, &typeid(TypeErrorEx) },
 
+    /* dyn-into-concrete COERCION: `int + dyn` is `dyn` (the natural result), but
+     * a `dyn` value is ASSIGNABLE to a concrete NUMERIC local - a runtime-checked
+     * coercion. So a `var s = 0; s = s + x` accumulator KEEPS `s` int (its type
+     * comes from the `0`, not `s + x`): the store coerces the dyn rhs to int,
+     * erroring only if the runtime value isn't int. runtime() keeps the value a
+     * genuine runtime dyn (unfolded). Runs on BOTH engines (differential). */
+    { "dyn value coerces into an int local (dyn holding an int)",
+      { "func acc(x) { var s = 0; s = s + x; return s; }",
+        "assert(acc(runtime(40)) == 40);",
+        "var dyn d = runtime(2); assert(acc(d) == 2);" } },
+    { "dyn value into an int local: a float doesn't narrow, throws",
+      { "func acc(x) { var s = 0; s = s + x; return s; }",
+        "acc(runtime(2.5));" }, &typeid(TypeErrorEx) },
+    { "int(x) is the explicit narrowing cast for a dyn arithmetic operand",
+      { "func acc(x) { var s = 0; s = s + int(x); return s; }",
+        "assert(acc(runtime(2.5)) == 2);" } },
+    /* A FRESH `var` whose ONLY source is `int + dyn` (= dyn) must be declared
+     * `dyn` - the plain `var` cannot silently infer dyn. */
+    { "a plain var from int + dyn requires an explicit dyn",
+      { "var dyn d = runtime(10); var s = 3 + d;" }, &typeid(DynRequiredEx) },
+    { "var dyn holds the full int + dyn result (no coercion to int)",
+      { "var dyn d = runtime(2.5); var dyn r = 3 + d;",
+        "assert(r == 5.5);" } },
+
     /* error cases (compile-time unless noted) */
     { "++ on a bool is a type error",
       { "var b = true; b++;" }, &typeid(TypeMismatchEx) },

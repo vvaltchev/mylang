@@ -895,6 +895,31 @@ slot = "now a string";           # ok, because it's dyn
     infer `dyn` (see the first key rule above) — so `var x = someBuiltin;` or
     `var x = runtime(v);` must be written `var dyn x = ...`.
 
+    **A concrete `var` can *receive* a `dyn` value — a runtime-checked
+    coercion.** `int OP dyn` is itself `dyn` (mixing a concrete with a variant
+    gives a variant), but a `dyn` value is *assignable* to a concrete numeric
+    variable: the variable keeps its type and the value is coerced at the
+    assignment — a `TypeError` if the runtime type doesn't fit (a `float` into
+    an `int` does **not** narrow; use `int(x)`). So an accumulator over a `dyn`
+    keeps its concrete type without an explicit `dyn`:
+
+    ```
+    func total(x) {         # x may be instantiated int, or dyn (indirect call)
+        var s = 0;          # s is int (its type comes from 0, not from s + x)
+        s = s + x;          # s = <dyn>; coerces to int, works iff x is an int
+        return s;
+    }
+    total(40);              # -> 40
+    var dyn d = runtime(2);
+    total(d);               # -> 2 (d holds int); non-int d -> runtime error
+    ```
+
+    But a **fresh** `var` whose only source is `int + dyn` *is* `dyn`, so it
+    must say so: `var r = 3 + d;` is an error (declare `var dyn r`), whereas
+    `var dyn r = 3 + d;` holds the actual result (int/float/…). Arithmetic can't
+    be guaranteed to work across dynamic types (there is no operator
+    overloading), so narrowing a `dyn` for arithmetic is explicit: `s + int(x)`.
+
     **Nullability is orthogonal to `dyn`.** A bare `dyn` is *non-null* (proven
     never `none`, so usable without a check); `none` is allowed only with
     `opt dyn`. The four combinations: `x` (typed, non-null), `opt x` (typed,

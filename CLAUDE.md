@@ -1162,6 +1162,14 @@ decisions behind it: `plans/type-inference.md`,
   gets `none` becomes `opt dyn`). `runtime(x)` returns `Dyn`
   (its documented opt-out: it defers to runtime). `==`/`!=` are always
   well-typed (→ int); ordering is numeric-or-string. `str + anything` → str.
+  **`int OP dyn` → `dyn`** — the NATURAL result of mixing a concrete with a
+  variant; it is NOT forced to the concrete type. So a FRESH `var r = 3 + d`
+  (d dyn) correctly infers `dyn` → `DynRequiredEx` (must be `var dyn r`), and
+  `var dyn r = 3 + d` holds the actual result (int/float/…). The accumulator
+  `var s = 0; s = s + x` keeps `s` int NOT by typing `s + x` int but by the
+  **dyn-into-concrete COERCION** (see the mandatory-`dyn` section): `s`'s type
+  comes from its non-dyn contribution (`0`), and the `dyn` rhs is a
+  runtime-checked coercion.
   Higher-order builtins (`map(func,c)`, `filter(func,c)`, `sort(c,func)`,
   `make_dict(keys,gen)`,...) feed the container's element type into the
   callback's params (named **or** inline lambda; `callee_funcinfo`) — for
@@ -1219,7 +1227,13 @@ decisions behind it: `plans/type-inference.md`,
   non-strict passes). **Runtime:** `coerce_to_decl_type` (`eval.cpp`) does the
   numeric widenings (float←int/bool, int←bool) so a typed-float var/param holds
   a float — at the decl/assign (`handle_single_expr14`, `op == assign`, lvalue's
-  `decl_type`) and at param bind (`bind_param`). Auto-const inlining
+  `decl_type`) and at param bind (`bind_param`). **It NARROWS NOTHING and ERRORS
+  on a bad type** (a `float` into an `int` throws, never truncates — use an
+  explicit `int(x)`); a statically-typed rvalue can only be widening (the check
+  pass rejects a narrowing at compile time), so the throw fires ONLY for a `dyn`
+  value whose *runtime* type doesn't fit (the dyn-into-concrete coercion below).
+  `none` passes through (nullability is a separate `opt` check). Auto-const
+  inlining
   (`resolver.cpp`) and the parser's const-scalar inlining both coerce too (their
   own `coerce_decl_scalar`/`check_coerce_const_scalar` copies, since a `const`
   scalar is inlined *before* the inferencer runs — that path also does the
@@ -1365,6 +1379,25 @@ decisions behind it: `plans/type-inference.md`,
   `dyn`), foreach loop vars (type derived from the container), and func names.
   Runs **after** the check pass, so a var that is `dyn` *because of* a real type
   error surfaces that error first. See `plans/type-driven-specialization.md`.
+- **dyn-into-concrete COERCION** (a plain `var` accepts a `dyn` value). `int OP
+  dyn` is `dyn` (above), so `var s = 0; s = s + x` (x `dyn`) contributes `dyn`
+  to `s`. Rather than widen `s` to dyn (which mandatory-`dyn` would then
+  reject), a `dyn` value is **assignable to a concrete NUMERIC local** — a
+  runtime-checked COERCION: `s` keeps the type of its NON-dyn contributions and
+  the store coerces the dyn value to it (a wrong runtime type — a float into an
+  int — throws; use `int(x)` to narrow). So `var s = 0; s = s + x` keeps `s`
+  int, works iff `x` is an int at runtime. Mechanism: `contribute` records a
+  `dyn` contribution (`round_got_dyn`) but does NOT join it (the accumulator
+  collects only non-dyn contributions); `commit_round` decides — a NUMERIC
+  accumulator + a dyn contribution → keep numeric and set `coerces_dyn`
+  (sticky); a non-numeric / dyn-only var → fold the dyn back in → `dyn` →
+  `DynRequiredEx`. For a `coerces_dyn` var the inferencer STAMPS the decl
+  `Identifier::decl_type` (i/f) — so `resolve_names` propagates it and the
+  store's `coerce_to_decl_type` fires, exactly like an explicit `int s`.
+  Order-independent (the numeric-vs-dyn decision is at commit, not when the dyn
+  arrived). A FRESH `var r = 3 + d` (only a dyn contribution) correctly stays
+  `dyn` → `DynRequiredEx`; `var dyn r = 3 + d` holds the actual result.
+  (`TypeSym::{round_got_dyn,coerces_dyn,decl_id}`.)
 - **Mandatory `opt` for params** (`enforce_nonnull_params`, same gate/timing as
   mandatory-`dyn`): a parameter that can receive `none` from *some* call path,
   if not declared `opt`, throws `OptRequiredEx` **at the param's declaration**
@@ -1475,6 +1508,14 @@ float-heavy reductions; the once-slower-than-Python primes benchmark is now
 faster. `th` is copied by `copy_base_fields` (clones/inliner preserve it), and
 the typed eval's `get<int_type>()` throws `TypeError` if inference were ever
 wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
+**A base template's body is NOT specialized** (`FuncDeclStmt::is_template`,
+skipped in `specialize_types`): it is a monomorphization shell, cloned per
+signature (each clone specialized separately) and run boxed for indirect
+dispatch — specializing it would corrupt a different-signature clone (a float
+instance's `eval_int` on a float param). `type_of` learned the `TypedScalarExpr`
+case (a REPL retains a post-specialization body a later-input clone re-enters
+inference on) — a defensive robustness fix (the inliner already handles
+cross-input `TypedScalarExpr`).
 
 **Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
 (via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),

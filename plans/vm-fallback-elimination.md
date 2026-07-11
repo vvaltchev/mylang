@@ -315,24 +315,48 @@ front-end + compilation-model:
    all sample/bench outputs byte-identical. (The residual `!value_used`-but-
    still-runs cases — a D4 overflow >64, an uninstantiable direct call — just
    tree-walk instead of VM-run; first-class `foo$dyn` (item 2) erases them.)
-2. **First-class `dyn` INSTANCE, decided upfront.** A template `foo(x)` called
-   with an int arg AND a dyn arg must produce TWO instances — `foo$int` (typed
-   native) and `foo$dyn` (dyn native, compiled exactly like the explicit
-   `func foo(dyn x)` above) — BOTH minted upfront by `instantiate_round`, BOTH
-   AOT-compiled. The D4 overflow (>64 instances) routes to `foo$dyn`, NEVER to a
-   tree-walker base. (Template *instantiation* is already upfront; a dyn-arg
-   call errors or falls to the base — that's the gap.)
-3. **`dyn` SEMANTIC — the mandatory-`dyn` rule STANDS (NO carve-out).** The
-   maintainer's ruling on `foo(x){ var s=0; s=s+x; }`: `x`'s type is fixed
-   upfront per instance. `var s` stays its inferred CONCRETE type (`int`) — it
-   CANNOT silently become `dyn` (mandatory-`dyn` still forbids that). In the
-   `foo$dyn`, `s = s + x` (s:int, x:dyn) is a RUNTIME-CHECKED operation:
-   at runtime `s + x` works iff `x`'s value is `+`-compatible with int, else a
-   RUNTIME error — it does NOT poison `s` to dyn at compile time. A dyn operand
-   used against a concrete-typed target is a runtime-checked coercion, not
-   contagion. (Inference: `int OP dyn` assigned back to an int local keeps
-   the local int; today it wrongly infers it `dyn` → `DynRequiredEx`.) The
-   `int` instance is unaffected.
+2. **First-class `dyn` INSTANCE, decided upfront. DONE (already worked).** A
+   template `foo(x)` called with a `dyn` arg already mints a native `foo$dyn(dyn
+   x)` (the boxed tier: `bin.v ; boxed`), coexisting with `foo$int` — verified
+   `-vd`/`:show`. An INDIRECTLY-dispatched template (dict/var, `76`'s `add_op`,
+   phonebook `cmd_*`) runs its base body compiled NATIVELY (the boxed tier, no
+   fallback) — see step (c)'s value-used-keeps-the-chunk. So dyn dispatch is
+   already fallback-free. (Residual: a D4 overflow >64 still tree-walks the base
+   — rare, a tracked follow-up.)
+3. **`dyn` SEMANTIC — dyn-into-concrete COERCION (NOT `int OP dyn`->int).**
+   DONE. The maintainer's ruling on `foo(x){ var s=0; s=s+x; }`: `var s` is
+   `int`, and `s = s + x` works iff x's runtime value is int, else a runtime
+   error.
+   The RIGHT framing (a first `int OP dyn`->int attempt was WRONG — it made
+   `var dyn r = 3 + d` wrongly throw, forcing `3+d` to int even in a dyn
+   context; reverted): **`int OP dyn` is `dyn`** (the natural result). `s` keeps
+   int because a `dyn` value is **assignable to a concrete NUMERIC local** — a
+   runtime-checked coercion:
+   - **Inference (`contribute`/`commit_round`):** a `dyn` contribution to a
+     plain `var` is RECORDED (`round_got_dyn`) but NOT joined; the accumulator
+     collects only non-dyn contributions. At commit: a NUMERIC accumulator + a
+     dyn contribution → keep numeric, set `coerces_dyn` (sticky); a
+     non-numeric / dyn-only var → fold the dyn back in → `dyn` (DynRequiredEx).
+     So
+     `var s = 0; s = s + x` → int; `var r = 3 + d` → dyn (declare it).
+   - **Runtime:** the inferencer stamps the coerces_dyn var's decl
+     `Identifier::decl_type` (i/f), so `resolve_names` propagates it and the
+     store's `coerce_to_decl_type` fires — exactly like an explicit `int s`.
+     `coerce_to_decl_type` is now STRICT: it widens (int/bool->float, bool->int)
+     but NEVER narrows — a `float` into an `int` THROWS (use `int(x)`); `none`
+     passes through. Both engines share the store path, so the differential
+     covers the VM. NO new op, NO binop change, NO specializer change.
+   - **A base template's body is NOT specialized** (`FuncDeclStmt::is_template`,
+     skipped in `specialize_types`): a monomorphization shell, cloned per
+     signature (each clone specializes separately) — specializing it would
+     corrupt a different-signature clone (a float instance's `eval_int` on a
+     float param). `type_of` learned the `TypedScalarExpr` case (a defensive
+     robustness fix). Both kept from the earlier attempt.
+   - **Known pre-existing limitation** (unchanged by this work): the inliner
+     drops a typed PARAM's coercion when it splices the body (a widening
+     `f(float x); f(runtime(3))` inlined keeps the int too), so an inlined
+     typed-param call with a dyn arg does not run the strict coercion — a
+     separate inliner fix.
 4. **Base templates GENUINELY DON'T EXIST as chunks — NOT hidden in `-vd`.**
    With (1)+(2), every call targets an instance (typed/dyn); the base template
    is never called → never AOT-compiled → not in the bytecode image. `-vd` must
@@ -350,7 +374,10 @@ only dev-only `show` still emits EvalToSlot, never in a script/.myv]**;
 (c) AOT chunk compilation (all upfront, `-vd` off the chunk set) **[DONE —
 `vm_precompile_all` + shared `codegen_func_body`; dead base templates absent via
 `is_template_base` on `!value_used` templates]**;
-(d) first-class `dyn` instances + the `int OP dyn`→concrete inference rule;
+(d) first-class `dyn` instances + the `int OP dyn`→int inference rule **[DONE —
+dyn instances already native; the dyn accumulator via dyn-into-concrete COERCION
+(`coerces_dyn` + strict `coerce_to_decl_type`), NOT `int OP dyn`->int (a first
+attempt, reverted); D4-overflow foo$dyn deferred]**;
 (e) audit each fallback op is unemitted, then DELETE + abort-guard. Each step
 `-rt` (differential) + samples byte-identical.
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
