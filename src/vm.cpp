@@ -1472,6 +1472,38 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::MakeStructArrayV: {
+            /* Build a FLAT array<PodStruct> literal `[P(..), P(..), ..]` in one
+             * op: N structs' field args are interleaved in the run [a.lit,
+             * a.lit + N*M), M = def->fields.size(). vm_make_struct_array coerces
+             * them STRAIGHT into a flat byte buffer - no per-element
+             * StructObject. All-scalar-field gate => coerce can't throw; a
+             * defensive throw gets the ctor loc (side table). */
+            StructTypeDef *def =
+                const_cast<StructTypeDef *>(chunk.struct_defs[in.target2]);
+            const int_type base = in.a.lit, n = in.b.lit;
+            const size_t total =
+                static_cast<size_t>(n) * def->fields.size();
+            EvalValue stackbuf[32];
+            std::vector<EvalValue> heapbuf;
+            EvalValue *vals = stackbuf;
+            if (total > 32) {
+                heapbuf.resize(total);
+                vals = heapbuf.data();
+            }
+            for (size_t k = 0; k < total; k++)
+                vals[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
+            try {
+                ctx.frame->at(in.target).put(
+                    vm_make_struct_array(def, static_cast<size_t>(n), vals));
+            } catch (Exception &e) {
+                vm_stamp_loc(chunk, pc, e);
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::LoadStructFieldInt:
             /* pts[i].f (scalar int/bool field) read straight from the flat
              * struct-array bytes into a slot - the struct-foreach direct read,

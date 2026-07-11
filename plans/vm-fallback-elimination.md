@@ -131,17 +131,17 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
   needs no def). Also relaxed the `StructCtorV` arg gate to accept a scalar
   LITERAL (not only a `th`-stamped operand) so an AUTO-CONST-folded arg
   (`var a=1; [P(a,a)]`, whose folded literal has no `th`) lowers too.
-  **⚠ TRACKED REGRESSION:** `77_struct_array_lit` (a struct-array literal in a
-  hot loop) is VM **1.20x SLOWER** than the tree-walker - the tree-walker's
-  `LiteralArray::do_eval` is already an optimal single dispatch (mode-5
-  packing), so splitting it into `StructCtorV`×N + `MakeArrayV` + the temp-slot
-  round-trip just adds op dispatch. NOT a foundational miss (the ops are
-  AST-free, no gratuitous box/unbox - unlike the reverted foreach), and it is
-  required for the zero-fallback serialization goal. No EXISTING bench regresses
-  (F-4 fires only on struct-array literals; broad geomean unchanged at 0.52x).
-  **Erasing follow-up:** a fused `MakeStructArrayV` op that coerces the ctor
-  field-args STRAIGHT into the flat buffer (no intermediate `StructObject`s, the
-  `EmplaceStruct` pattern) would be FASTER than the tree-walker - deferred.
+  **Regression ERASED (2026-07-11) by the fused `MakeStructArrayV`:** the
+  initial lowering (per-element `StructCtorV`×N + `MakeArrayV`) was VM ~1.2x
+  SLOWER than the tree-walker's already-optimal single-dispatch
+  `LiteralArray::do_eval` (splitting one dispatch into N+1 ops + a temp-slot
+  round-trip). The fused op (`try_make_struct_array` -> `MakeStructArrayV` ->
+  `vm_make_struct_array`) compiles the N structs' field args INTERLEAVED into
+  one run and coerces them STRAIGHT into the flat byte buffer - NO intermediate
+  `StructObject` per element (the `EmplaceStruct` pattern for a whole literal).
+  It now BEATS the tree-walker: `77_struct_array_lit` VM **0.85x** (1.2x FASTER)
+  / 0.70x CPython. A mixed / nested-struct-field / non-scalar-arg literal
+  declines the fused op and falls to the per-element path, then `EvalStmt`.
 - **F-5 · reflection builtins** `show`/`type`/`typestr`/`decltype` as a
   NON-folded runtime call (synth `typestr(n)`). *INHERENT - an AST builtin with
   an unevaluated operand; the one construct that genuinely needs the node.*

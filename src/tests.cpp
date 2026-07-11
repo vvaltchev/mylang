@@ -6532,6 +6532,22 @@ static const std::vector<test> tests =
     },
 
     {
+        /* F-4: a NESTED-POD-struct field arg (`Q(..)`, not a scalar) makes the
+         * fused MakeStructArrayV decline; the per-element path (and StructCtorV)
+         * also decline, so it falls back to the tree-walker - byte-identical
+         * under the differential. */
+        "Flat struct array literal with a nested struct field falls back",
+        {
+            "struct Q { int a; int b; }",
+            "struct P { Q q; int y; }",
+            "var arr = [P(Q(1, 2), 3), P(Q(4, 5), 6)];",
+            "assert(array_storage(arr) == \"struct\");",
+            "assert(arr[0].q.a == 1 && arr[0].q.b == 2 && arr[0].y == 3);",
+            "assert(arr[1].q.b == 5 && arr[1].y == 6);",
+        },
+    },
+
+    {
         /* native const-literal materialization (VM LoadLiteralObjV): a mutable
          * `var` literal is a FRESH deep copy each eval (so a loop's per-iter
          * mutation never leaks), a `const` shares the deep read-only value.

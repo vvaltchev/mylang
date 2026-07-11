@@ -639,6 +639,23 @@ enum class OpCode : unsigned char {
     StructCtorV,
 
     /*
+     * Build a FLAT array<PodStruct> LITERAL `[P(a,b), P(c,d), ..]` into `target`
+     * in ONE op - the FUSED form of N StructCtorV + MakeArrayV (F-4). The N
+     * structs' field args are compiled INTERLEAVED into the register run
+     * [a.lit, a.lit + N*M) (struct i's field j at base + i*M + j, M =
+     * def->fields.size()); `b.lit` = N; `target2` = the Chunk::struct_defs index.
+     * vm_make_struct_array coerces the values STRAIGHT into a contiguous flat
+     * byte buffer (no intermediate StructObject per element, unlike the
+     * StructCtorV path) and builds the flat mode-5 array - so it BEATS the
+     * tree-walker's LiteralArray::do_eval (which allocates N StructObjects then
+     * packs them). Emitted only when every element is a same-POD-struct ctor
+     * with all-scalar field args (coerce can't throw); a defensive throw is
+     * stamped with the ctor loc (loc side table). This is the EmplaceStruct
+     * pattern for a whole literal.
+     */
+    MakeStructArrayV,
+
+    /*
      * Branch on a BOXED bool slot: if NOT slot[target2].is_true(), pc = target.
      * A boxed condition (`if (a == b)`, `while (x != none)`, `if (x)`) compiles
      * to <boxed expr into a slot> + this. Mirrors the tree-walker's is_true()

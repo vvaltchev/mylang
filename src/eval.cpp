@@ -1019,6 +1019,27 @@ construct_struct_from_values(StructTypeDef *def,
     return intrusive_ptr<StructObject>(obj);
 }
 
+EvalValue vm_make_struct_array(StructTypeDef *def, size_t n,
+                               const EvalValue *vals)
+{
+    const size_t M = def->fields.size();
+    const int stride = def->size;
+    /* Coerce every struct's fields STRAIGHT into the contiguous flat buffer -
+     * no per-element StructObject (the whole point of the fused op). vals is
+     * interleaved: struct i's field j at vals[i*M + j]. */
+    std::vector<char> buf(n * static_cast<size_t>(stride));
+    for (size_t i = 0; i < n; i++) {
+        char *base = buf.data() + i * static_cast<size_t>(stride);
+        for (size_t j = 0; j < M; j++) {
+            EvalValue v = coerce_struct_field(def->fields[j], vals[i * M + j],
+                                              Loc(), Loc());
+            pod_store_field(def->fields[j], base, v);
+        }
+    }
+    return SharedArrayObj(
+        SharedArrayObj::svec_type(std::move(buf), def, stride));
+}
+
 static EvalValue
 construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
 {

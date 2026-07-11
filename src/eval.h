@@ -349,6 +349,14 @@ intrusive_ptr<StructObject>
 construct_struct_from_values(StructTypeDef *def,
                              const EvalValue *vals, size_t n);
 
+/* VM MakeStructArrayV: build a FLAT array<PodStruct> literal from N structs'
+ * field VALUES (interleaved: struct i's field j at vals[i*M + j], M =
+ * def->fields.size()). Coerces straight into a contiguous flat byte buffer -
+ * NO intermediate StructObject per element - then builds the mode-5 flat array.
+ * Only emitted for all-scalar-field POD ctors, so coerce cannot throw. */
+EvalValue vm_make_struct_array(StructTypeDef *def, size_t n,
+                               const EvalValue *vals);
+
 /* VM P2/P4: native subscript element store `c[k] = v` / `c[k] OP= v` for a dict
  * or a general array (any base - type-dispatched Type::subscript(for_write)
  * + slot_rmw). AST-free: the not-an-lvalue caret is a Loc pair (from the loc

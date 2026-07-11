@@ -229,6 +229,20 @@ Operand slot_op(int slot)
     return o;
 }
 
+/* A struct-ctor field arg the POD coerce can't throw on: a typed int/float
+ * (th) OR a scalar LITERAL (int/float/bool) - the latter covers an auto-const-
+ * folded arg whose literal never got a `th` stamp (auto-const runs after
+ * inference). A scalar literal's type is self-evident and inference already
+ * rejected a non-fitting one, so coerce is safe. Shared by the StructCtorV and
+ * MakeStructArrayV gates. */
+bool is_typed_scalar_arg(const Construct *a)
+{
+    return a->th == TypeHint::i || a->th == TypeHint::f
+        || dynamic_cast<const LiteralInt *>(a)
+        || dynamic_cast<const LiteralFloat *>(a)
+        || dynamic_cast<const LiteralBool *>(a);
+}
+
 /*
  * Read `e` as a LEAF int operand: a resolved-local int frame slot, or an int
  * literal. Returns false for anything else. Only `SymKind::local` slots are
@@ -588,6 +602,74 @@ struct Codegen {
      * (num_bin_op) directly, no node->eval, so a `dyn`/string scalar expr is
      * native. Self-truncating: on a nested failure the caller discards.
      */
+    /*
+     * The FUSED flat-struct-array literal `[P(a,b), P(c,d), ..]` -> a single
+     * MakeStructArrayV (F-4, erases the split-op regression). Every element must
+     * be a ctor of the SAME POD struct (vm_struct_ctor_def), arity == nfields,
+     * every field arg a typed scalar (is_typed_scalar_arg - so coerce can't
+     * throw). The N structs' field args are compiled INTERLEAVED into one run
+     * [base, base + N*M) (struct i's field j at base + i*M + j), and the op
+     * coerces them straight into a flat byte buffer. A mixed / nested / non-
+     * scalar-arg literal declines here and falls to StructCtorV + MakeArrayV.
+     */
+    bool try_make_struct_array(const LiteralArray *la, int &out_slot,
+                               std::vector<Instr> &ops)
+    {
+        const int n = static_cast<int>(la->elems.size());
+        if (n == 0)
+            return false;
+        const StructTypeDef *sdef = nullptr;
+        for (const auto &el : la->elems) {
+            const CallExpr *ce = dynamic_cast<const CallExpr *>(el.get());
+            if (!ce || !ce->vm_struct_ctor_def || !ce->args)
+                return false;
+            if (!sdef)
+                sdef = ce->vm_struct_ctor_def;
+            else if (ce->vm_struct_ctor_def != sdef)
+                return false;
+            if (ce->args->elems.size() != sdef->fields.size())
+                return false;
+            for (const auto &a : ce->args->elems)
+                if (!is_typed_scalar_arg(a.get()))
+                    return false;
+        }
+        const int M = static_cast<int>(sdef->fields.size());
+
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        const int base = next_temp;
+        next_temp += n * M;
+        if (next_temp > max_temp)
+            max_temp = next_temp;
+
+        for (int i = 0; i < n; i++) {
+            const CallExpr *ce =
+                static_cast<const CallExpr *>(la->elems[i].get());
+            for (int j = 0; j < M; j++)
+                if (!compile_to_run_slot(ce->args->elems[j].get(),
+                                         base + i * M + j, ops)) {
+                    ops.resize(mark);
+                    next_temp = save_top;
+                    chunk.consts.resize(cmark);
+                    return false;
+                }
+        }
+
+        const int dst = alloc_temp();
+        Instr in;
+        in.op = OpCode::MakeStructArrayV;
+        in.node = la->elems[0].get();   /* a ctor: defensive coerce loc (nulled) */
+        in.target = dst;
+        in.a = int_lit(base);
+        in.b = int_lit(n);
+        in.target2 = static_cast<int>(chunk.struct_defs.size());
+        chunk.struct_defs.push_back(sdef);
+        ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
     bool compile_boxed_expr(const Construct *e, int &out_slot,
                             std::vector<Instr> &ops)
     {
@@ -722,23 +804,13 @@ struct Codegen {
             if (sdef && ce->args
                 && ce->args->elems.size() == sdef->fields.size()
                 && ce->args->elems.size() <= 16) {
-                /* Every arg must be a scalar the coerce can't throw on: a
-                 * typed int/float (th) OR a scalar LITERAL (int/float/bool) -
-                 * the latter covers an AUTO-CONST-folded arg (`var a=1; P(a,a)`),
-                 * whose folded literal never got a `th` stamp (auto-const runs
-                 * after inference). A literal's type is self-evident and
-                 * inference already rejected a non-fitting one, so coerce is
-                 * safe. A nested-struct-field arg (th none, not a scalar
-                 * literal) or a dyn arg fails and falls back. */
-                auto typed_scalar = [](const Construct *a) {
-                    return a->th == TypeHint::i || a->th == TypeHint::f
-                        || dynamic_cast<const LiteralInt *>(a)
-                        || dynamic_cast<const LiteralFloat *>(a)
-                        || dynamic_cast<const LiteralBool *>(a);
-                };
+                /* Every arg must be a scalar the coerce can't throw on
+                 * (is_typed_scalar_arg): a typed int/float OR a scalar literal.
+                 * A nested-struct-field arg (th none, not a scalar literal) or a
+                 * dyn arg fails and falls back. */
                 bool all_typed = true;
                 for (const auto &a : ce->args->elems)
-                    if (!typed_scalar(a.get())) {
+                    if (!is_typed_scalar_arg(a.get())) {
                         all_typed = false;
                         break;
                     }
@@ -766,17 +838,33 @@ struct Codegen {
             }
         }
 
+        /* A FLAT STRUCT array literal `[P(a,b), P(c,d)]` (arr_hint flat_s, F-4)
+         * whose elements are all same-POD-struct ctors with all-scalar field
+         * args -> the FUSED MakeStructArrayV (coerce the field args straight
+         * into the flat buffer, no intermediate StructObject per element). This
+         * BEATS the tree-walker; try it before the per-element StructCtorV +
+         * MakeArrayV path below (which stays the fallback for a mixed / nested /
+         * non-scalar-arg literal). */
+        if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e))
+            if (la->arr_hint == ArrHint::flat_s) {
+                int r;
+                if (try_make_struct_array(la, r, ops)) {
+                    out_slot = r;
+                    return true;
+                }
+            }
+
         /* An array LITERAL `[a, b, ..]` whose elements aren't all const ->
          * MakeArrayV: compile the element run, then build the array. A
          * fully-const literal is a baked LoadConstV (boxed_literal above) or a
          * LiteralObj (left to the fallback), so only a literal with element
-         * NODES reaches here. A FLAT STRUCT array (arr_hint flat_s, e.g.
-         * `[P(a,b), P(c,d)]`, F-4) lowers too: each `P(..)` element compiles to
-         * a StructCtorV producing a POD StructObject, and build_array_from_values
-         * packs a run of same-type POD structs into flat mode-5 storage
-         * VALUE-DRIVEN (it reads the struct def off the first element, so the
-         * op needs no def). If a struct-ctor element can't lower (a dyn / nested
-         * arg), emit_args_range fails below and this bails to the fallback. */
+         * NODES reaches here. A FLAT STRUCT array whose fused op above declined
+         * (a nested/dyn field arg) still lowers here: each `P(..)` element
+         * compiles to a StructCtorV producing a POD StructObject, and
+         * build_array_from_values packs a run of same-type POD structs into flat
+         * mode-5 storage VALUE-DRIVEN (the def comes off the first element). If a
+         * struct-ctor element can't lower either, emit_args_range fails and this
+         * bails to the fallback. */
         if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e)) {
             const size_t cmark = chunk.consts.size();
             int base;
@@ -1434,6 +1522,7 @@ struct Codegen {
                     || ops.back().op == OpCode::MakeDictV
                     || ops.back().op == OpCode::MakeClosureV
                     || ops.back().op == OpCode::StructCtorV
+                    || ops.back().op == OpCode::MakeStructArrayV
                     || ops.back().op == OpCode::SliceV)) {
                 /* These read their operand slots BEFORE writing `target`, and
                  * the local lvalue slot can't overlap the temp run - so writing
@@ -4312,6 +4401,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreElemValue:
         case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
+        case OpCode::MakeStructArrayV: /* node = a ctor (defensive coerce loc) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
         case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */

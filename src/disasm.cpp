@@ -657,6 +657,15 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << in.target2 << "]("
                 << arglist(chunk, in.a.lit, in.b.lit) << ")";
             break;
+        case OpCode::MakeStructArrayV: {
+            const size_t nf =
+                chunk.struct_defs[in.target2]->fields.size();
+            row << "make.structarr " << D(in.target) << " = struct_defs["
+                << in.target2 << "][" << in.b.lit << "]("
+                << arglist(chunk, in.a.lit,
+                           in.b.lit * static_cast<int_type>(nf)) << ")";
+            break;
+        }
         case OpCode::LoadImmInt:
             row << "load         " << D(in.target) << ", #" << in.a.lit;
             break;
