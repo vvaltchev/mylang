@@ -1076,6 +1076,7 @@ struct Chunk {
         undefined_var,      /* UndefinedVariableEx(name, loc) */
         not_lvalue,         /* NotLValueEx(loc) */
         rebind_builtin,     /* CannotRebindBuiltinEx(loc) */
+        rebind_const,       /* CannotRebindConstEx(loc) */
     };
     struct ThrowSite {
         ThrowKind kind;

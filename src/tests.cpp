@@ -289,6 +289,20 @@ static const std::vector<test> tests =
     },
 
     {
+        /* A COMPOUND rebind of a runtime const throws CannotRebindConstEx too;
+         * the VM lowers this (and the plain rebind above) to a native
+         * ThrowRuntimeV - the rhs is evaluated FIRST (its side effects run),
+         * THEN the throw, byte-identical to the tree-walker (differential runs
+         * this under -vm). */
+        "cannot rebind consts existing at runtime 4 (compound)",
+        {
+            "const arr = [1, 2, 3];",
+            "arr += [4];",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
         "const re-decl in nested scope fails",
         {
             "const a = 1; { const a = 2; }",

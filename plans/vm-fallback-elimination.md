@@ -574,9 +574,13 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
    global — `AutoConst` gained a `repl_mode` flag). RESIDUAL: only a REPL
    unresolved `defined`, and the rare `defined(<non-identifier>)` misuse
    (`defined(a[0])`).
-2. **`const` reassignment of a runtime const** (a `const`-bound func/array being
-   rebound) — must throw `CannotRebindConstEx`; `compile_boxed_stmt:1873` leaves
-   it to the tree-walker.
+2. **`const` reassignment of a runtime const** — ✅ **DONE (2026-07-13)**. A
+   plain OR compound rebind of a `const`-bound func/array/dict (`const c = [..];
+   c = x` / `c += x`) now lowers to a native `ThrowRuntimeV` with a new
+   `ThrowKind::rebind_const` → `CannotRebindConstEx`. `compile_boxed_stmt`
+   compiles the rhs FIRST (its side effects run) then emits the throw with the
+   lvalue's caret — byte-identical to the tree-walker's rhs-then-throw order (a
+   const *scalar* is inlined, so its rebind is the bad-lvalue throw instead).
 3. **Two residual inc-dec / store shapes** — a dyn **MEMBER** inc-dec (`d.f++`,
    almost always a `NotLValueEx` on a POD field), and a member-in-the-middle
    nested store (`d.a[0].f = v`, a genuine `NotLValueEx` path in both engines).

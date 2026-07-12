@@ -1876,12 +1876,29 @@ struct Codegen {
             next_temp = st;
         }
 
-        /* A reassignment of a CONST (a runtime const - a func/array kept in a
-         * slot) must throw CannotRebindConstEx; the boxed store would skip that
-         * runtime check. Leave a const lvalue to the tree-walker (throws with
-         * the lvalue's exact loc). */
-        if (lv->is_const)
+        /* A reassignment (plain OR compound) of a CONST runtime symbol (a
+         * func/array/dict kept in a slot; a const SCALAR is inlined + its
+         * reassign hits the bad-lvalue throw above) must throw
+         * CannotRebindConstEx. The tree-walker evaluates the RHS first, THEN
+         * throws, so compile the rhs (for its side effects + its own throw) and
+         * emit a native ThrowRuntimeV with the lvalue's caret - byte-identical.
+         * A `const` DECL (pInConstDecl) was already handled above (DeclConstV);
+         * this is only a REBIND. */
+        if (lv->is_const) {
+            const size_t om = ops.size();
+            const size_t cm = chunk.consts.size();
+            const int st = next_temp;
+            int rslot;
+            if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                emit_throw(Chunk::ThrowKind::rebind_const,
+                           e->lvalue->start, e->lvalue->end, nullptr, ops);
+                return true;
+            }
+            ops.resize(om);
+            chunk.consts.resize(cm);
+            next_temp = st;
             return false;
+        }
 
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();

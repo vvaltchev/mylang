@@ -3703,14 +3703,19 @@ UNRESOLVED name in an rvalue/callee position (`var y = foobar` /
 (`0 = 99`, `true = false`, a const-inlined `K = 6`) or a BUILTIN (`print = 5`),
 and a REQUIRES-lvalue builtin (`append`/`push`/`pop`/`insert`/`erase`/`intptr`)
 on a provably-non-lvalue arg0 (`append([1,2], 3)` — the only lvalues are
-id/subscript/member). New op **`ThrowRuntimeV`** + a serializable
+id/subscript/member), and a **REBIND of a runtime `const`** (`const c = [..]; c
+= x` / `c += x`, a func/array/dict kept in a slot → `CannotRebindConstEx`; a
+const *scalar* is inlined, so its rebind hits the bad-lvalue throw instead). New
+op **`ThrowRuntimeV`** + a serializable
 `Chunk::throws` pool (`{ThrowKind, Loc, name}`) throws the pooled exception with
 the exact caret
 — byte-identical, AST-free. Codegen: an `SymKind::unresolved` id in
 `compile_boxed_expr` (a CALL with an unresolved callee throws before its args,
 matching `what->eval` first); a bad-lvalue in `compile_boxed_stmt` (rhs compiled
 FIRST for its side effects, then the throw, matching the tree-walker's rhs-then-
-target order); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
+target order); the same rhs-first + throw for a `const` rebind (the rhs's side
+effects run before `CannotRebindConstEx`, for both a plain and a compound
+rebind); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
 `builtin_requires_lvalue_arg0`, which EXCLUDES `sort`/`rev_sort`/`reverse` —
 they accept a value arg0 and sort the copy). The bare-LEAF guard keeps a
 discarded `foobar;` a no-op.

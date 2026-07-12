@@ -1756,6 +1756,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     throw NotLValueEx(t.start, t.end);
                 case Chunk::ThrowKind::rebind_builtin:
                     throw CannotRebindBuiltinEx(t.start, t.end);
+                case Chunk::ThrowKind::rebind_const:
+                    throw CannotRebindConstEx(t.start, t.end);
             }
             break;   /* unreachable */
         }
