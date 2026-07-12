@@ -4181,10 +4181,12 @@ make_typed(TypedScalarExpr::Cat cat, TypeHint kind, TypeHint result_th,
            MultiOpConstruct *mo)
 {
     auto t = std::make_unique<TypedScalarExpr>(cat, kind);
-    t->start = mo->start;
-    t->end = mo->end;
-    t->is_const = mo->is_const;
-    t->th = result_th;
+    /* copy_base_fields carries start/end/is_const AND inline_ctx (+arr_hint) -
+     * the latter matters for a specialized node INSIDE an inlined body: without
+     * it the op loses its inlined-at chain, so a VM backtrace crossing it (which
+     * relies on the op's node, not a Block wrapper) drops the virtual frame. */
+    mo->copy_base_fields(*t);
+    t->th = result_th;               /* override: the RESULT type hint */
     t->elems = std::move(mo->elems);
     return t;
 }

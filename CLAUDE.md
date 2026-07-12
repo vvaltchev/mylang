@@ -3757,13 +3757,35 @@ table can't hold: the SUBSCRIPT loc for a subscript-internal throw
 identical to the tree-walker. Only a dyn **MEMBER** inc-dec (`d.f++`) stays on
 the fallback (almost always a `NotLValueEx` on a POD field anyway).
 
+**Non-tail block-body inline (`InlinedCallExpr`) → native.** A `y = f(args)`
+whose block-bodied `f` inlined with a residual that couldn't collapse to a
+ternary (a leading side-effecting statement, a reassigned local) is an
+`InlinedCall(Block(...))` — the callee's body run behind its OWN return
+boundary (a `return v` inside yields THIS expr's value, not the enclosing
+function's; `InlinedCallExpr::do_eval` swaps `ctx->flow`). The VM lowers it via
+a **scoped return boundary** in the codegen (an `inline_returns` stack, like the
+loop stack): `compile_boxed_expr` inits a result slot to `none` (a fall-through
+body yields none), compiles the body's statements inline, and `try_native_
+return` — gated on `inline_returns` — redirects each `return` to "**MoveV into
+the result slot + Jump to the body end**" instead of `ReturnV`-ing the whole
+chunk. A body statement/return that can't lower (a try crossed INSIDE the
+boundary) fails the whole inline → the tree-walker runs the `InlinedCallExpr`
+(byte-identical). This surfaced + FIXED a latent bug: `make_typed`
+(`specialize_types`) hand-copied base fields and **dropped `inline_ctx`**, so a
+specialized arith node inside an inlined body lost its inlined-at chain — the
+tree-walker hid it (the Block wrapper flushes) but the VM's flat body has no
+wrapper, so a backtrace crossing it dropped the virtual frame; `make_typed` now
+uses `copy_base_fields`. So an error inside a native InlinedCall shows the
+byte-identical virtual `f$0` frame.
+
 **Residual `EvalStmt`:** the harder niche shapes (a member-subscript-member
 nested store `d.a[0].f=v` — a genuine `NotLValueEx` path in both engines, a dyn
-**MEMBER** inc-dec statement `d.f++`); the **`InlinedCallExpr`** block form; and
-the dev-only **`show`** (script-excluded by `reject_dev_builtins`, so never in
-serialized bytecode). None appear in `bench/` or `samples/` (both stay 100%
-native). The `_`-in-unpack / indexed dict `foreach`, the ≥3-level nested store,
-the dyn scalar/element inc-dec, and `append` to a struct member are all now
+**MEMBER** inc-dec statement `d.f++`); an `InlinedCallExpr` whose return crosses
+a try INSIDE the boundary (rare); and the dev-only **`show`** (script-excluded
+by `reject_dev_builtins`, so never in serialized bytecode). None appear in
+`bench/` or `samples/` (both stay 100% native). The `_`-in-unpack / indexed
+dict `foreach`, the ≥3-level nested store, the dyn scalar/element inc-dec,
+`append` to a struct member, and the common `InlinedCallExpr` are all now
 native (above).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**

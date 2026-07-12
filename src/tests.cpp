@@ -3331,6 +3331,34 @@ static const std::vector<test> tests =
       { "func bad(a) { if (a > 0) return a; return 1 / 0; }",
         "func c(p) { return bad(p); }",
         "c(0);" }, &typeid(DivisionByZeroEx) },
+    /* A body with a leading SIDE-EFFECTING statement (a global write) + a
+     * return does NOT collapse to a ternary - it stays an InlinedCall(Block).
+     * The VM lowers it via a SCOPED return boundary (the body's `return`s yield
+     * this expr's value + jump to the body end, not ReturnV the whole chunk).
+     * These run under BOTH engines (differential), so they pin the native
+     * InlinedCall path byte-identical to the tree-walker. */
+    { "block-inline: side-effecting body stays InlinedCall (value)",
+      { "var g = 0;",
+        "func f(a) { g = 99; return a + 1; }",
+        "func c(n) { var y = f(n); return y; }",
+        "assert(c(5) == 6);",
+        "assert(g == 99);",
+        "assert(c(10) == 11);" } },
+    { "block-inline: InlinedCall fall-through body yields none",
+      { "var g = 0;",
+        "func f(a) { g = a; }",           /* no return -> none */
+        "func c(n) { var y = f(n); return y; }",
+        "assert(c(7) == none);",
+        "assert(g == 7);" } },
+    /* An error INSIDE a native InlinedCall body still throws with the right
+     * exception AND backtrace (the inlined-at virtual frame): the specialized
+     * arith node inside the body must keep its inline_ctx (make_typed now uses
+     * copy_base_fields), else the VM drops the virtual frame. */
+    { "block-inline: error inside a side-effecting InlinedCall body throws",
+      { "var g = 0;",
+        "func f(a) { g = 99; return 100 / a; }",
+        "func c(n) { var y = f(n); return y; }",
+        "c(0);" }, &typeid(DivisionByZeroEx) },
     /* ---- v3: recursion unroll + per-frame pure-call cache ----
      * A pure tree-recursive function (>=2 self-calls) is unrolled in place and
      * its duplicate self-calls dedup in the per-frame cache. Correctness must be

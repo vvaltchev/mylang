@@ -666,6 +666,22 @@ struct Codegen {
     };
     std::vector<TryFrame> trys;
 
+    /* An INLINED-CALL return boundary (InlinedCallExpr): the callee's body runs
+     * with its OWN return scope - a `return v` inside it yields THIS expression's
+     * value (into `rslot`) and JUMPs to the body's end, rather than ReturnV-ing
+     * the whole chunk (mirrors InlinedCallExpr::do_eval's FlowState swap). Innermost
+     * last (a nested inlined call pushes another). `try_base` = trys.size() when
+     * the boundary opened: a return that crosses a finally INSIDE the boundary
+     * (deeper than try_base) can't be redirected cheaply, so it bails the inline
+     * (rare). `jumps` collects the redirected returns' Jumps, backpatched to the
+     * body end. */
+    struct InlineRet {
+        int rslot;
+        size_t try_base;
+        std::vector<size_t> jumps;
+    };
+    std::vector<InlineRet> inline_returns;
+
     /* Push a loop frame, recording the current try-nesting depth so a
      * break/continue inside can tell which trys it crosses (step 3). */
     void push_loop()
@@ -879,6 +895,54 @@ struct Codegen {
                 return false;
             }
             out_slot = dst;
+            return true;
+        }
+
+        /* A NON-TAIL block-body inline (`y = f(args)` where f block-inlines with
+         * a residual that couldn't collapse to a ternary): the callee's body
+         * runs behind its OWN return boundary - a `return v` inside it yields
+         * THIS expression's value, not the enclosing function's (mirrors
+         * InlinedCallExpr::do_eval's FlowState swap). Lower it to a scoped return
+         * boundary: init a result slot to `none` (a fall-through body yields
+         * none), compile the body's statements inline, and redirect each `return`
+         * to "MoveV into the result slot + Jump to the body end" (try_native_
+         * return, gated on inline_returns). A body statement or return that
+         * can't lower (e.g. a try crossed inside the boundary) fails the whole
+         * inline -> the tree-walker runs the InlinedCallExpr (byte-identical). */
+        if (const InlinedCallExpr *ic =
+                dynamic_cast<const InlinedCallExpr *>(e)) {
+            const size_t omark = ops.size();
+            const size_t cmark = chunk.consts.size();
+            const int st = next_temp;
+            const int rslot = alloc_temp();
+            Instr ld;
+            ld.op = OpCode::LoadConstV;
+            ld.target = rslot;
+            ld.target2 = add_const(EvalValue());   /* none (fall-through) */
+            ops.push_back(ld);
+            /* Reserve rslot below temp_base so the body's per-stmt reset_temps
+             * can't reuse it. */
+            const int saved_base = temp_base;
+            temp_base = next_temp;
+            if (temp_base > max_temp)
+                max_temp = temp_base;
+            inline_returns.push_back({rslot, trys.size(), {}});
+            const bool ok = compile_scalar_body(body_stmts(ic->elem.get()),
+                                                /*is_loop_body=*/false);
+            const InlineRet ir = inline_returns.back();
+            inline_returns.pop_back();
+            temp_base = saved_base;
+            if (!ok) {
+                ops.resize(omark);
+                chunk.consts.resize(cmark);
+                next_temp = st;
+                return false;
+            }
+            const int lend = here();
+            for (size_t j : ir.jumps)
+                ops[j].target = lend;
+            next_temp = rslot + 1;      /* keep rslot live for the consumer */
+            out_slot = rslot;
             return true;
         }
 
@@ -2580,6 +2644,32 @@ struct Codegen {
             ops.push_back(ld);
         }
 
+        /* Inside an INLINED-CALL boundary: a `return v` doesn't ReturnV the
+         * chunk - it yields v as this expression's value (MoveV into the
+         * boundary's rslot) then JUMPs to the body's end. Only when the return
+         * crosses NO try inside the boundary (trys.size() == try_base): a
+         * finally between the return and the boundary would need inlining up to
+         * the boundary (not the function), which is left to the fallback. */
+        if (!inline_returns.empty()) {
+            InlineRet &ir = inline_returns.back();
+            if (trys.size() != ir.try_base) {
+                ops.resize(mark);
+                next_temp = save_top;
+                return false;
+            }
+            Instr mv;
+            mv.op = OpCode::MoveV;
+            mv.target = ir.rslot;
+            mv.target2 = vslot;
+            ops.push_back(mv);
+            ir.jumps.push_back(ops.size());
+            Instr jp;
+            jp.op = OpCode::Jump;
+            ops.push_back(jp);           /* .target backpatched to body end */
+            next_temp = save_top;
+            return true;
+        }
+
         /* P8 Inc 2c: a return crosses ALL enclosing trys (up to the function).
          * If none has a finally, ReturnV stops the chunk - destroying the whole
          * handler stack, so no explicit handler-pop is needed. Otherwise inline
@@ -3902,6 +3992,15 @@ struct Codegen {
                 if (try_native_return(ret, chunk.code)) {
                     any_native = true;
                     continue;
+                }
+                /* Inside an INLINED-CALL boundary a return MUST be redirected
+                 * (yield the expr value); try_native_return declined (a try
+                 * crossed within the boundary), and the fallback EvalStmt would
+                 * wrongly ReturnV the whole chunk - so fail the body and let the
+                 * entire InlinedCallExpr tree-walk (byte-identical). */
+                if (!inline_returns.empty()) {
+                    chunk.code.resize(start);
+                    return false;
                 }
                 /* try_native_return declined (a nested-try return, or an
                  * uncompilable value): it falls back to a tree-walked EvalStmt

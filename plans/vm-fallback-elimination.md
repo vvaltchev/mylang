@@ -523,6 +523,23 @@ real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
   node for its TWO error carets — the subscript loc for a subscript-internal
   KeyNotFound/OOB vs the inc-dec loc for its own NotLValue/TypeError, which the
   one-loc side table can't both hold).
+  **(g) the `InlinedCallExpr` block form (2026-07-13, DONE the common case).**
+  A `y = f(args)` whose block-bodied `f` inlined with a residual that couldn't
+  collapse to a ternary (a leading side-effecting statement / a reassigned
+  local) stays an `InlinedCall(Block(...))` - the body run behind its OWN return
+  boundary. Lowered via a **scoped return boundary**: an `inline_returns`
+  codegen stack (like the loop stack); `compile_boxed_expr` inits a result slot
+  to none, compiles the body inline, and `try_native_return` (gated on
+  `inline_returns`) redirects each `return v` to "MoveV into the result slot +
+  Jump to the body end" instead of ReturnV-ing the whole chunk. A return that
+  crosses a try INSIDE the boundary fails the whole inline -> the tree-walker
+  runs it (byte-identical). FIXED a latent bug this surfaced: `make_typed`
+  (specialize) hand-copied base fields and DROPPED `inline_ctx`, so a
+  specialized arith node inside an inlined body lost its inlined-at chain (the
+  tree-walker hid it - the Block wrapper flushes - but the VM's flat body has no
+  wrapper); now uses `copy_base_fields`, so an error inside a native InlinedCall
+  shows the byte-identical virtual `f$0` frame. STILL fallback: an
+  InlinedCallExpr whose return crosses a try inside the boundary (rare).
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then
