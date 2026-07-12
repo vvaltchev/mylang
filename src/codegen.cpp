@@ -285,6 +285,29 @@ bool as_int_operand(const Construct *e, Operand &out)
     return false;
 }
 
+/* An inc-dec `x++`/`--a[i]` USED AS A VALUE lowers to read-lvalue + mutate (or
+ * mutate + read for prefix), which evaluates the lvalue's slot/index TWICE (once
+ * to read, once in the store). That is sound only if the lvalue has no side
+ * effect and reads the SAME storage both times - so gate on a bare resolved-id
+ * scalar (local/global/capture; the slot itself), or a flat int/float subscript
+ * whose index is an `as_int_operand` leaf (a local slot or int literal, so the
+ * two evals agree). A dict/member/complex-index inc-dec-as-value falls back. */
+bool incdec_lvalue_pure(const Construct *lv)
+{
+    if (const Identifier *id = dynamic_cast<const Identifier *>(lv))
+        return !id->is_const
+            && (id->sym.kind == SymKind::local
+                || id->sym.kind == SymKind::global
+                || id->sym.kind == SymKind::capture);
+    if (const Subscript *sub = dynamic_cast<const Subscript *>(lv)) {
+        Operand idx;
+        return sub->base_array
+            && (sub->th == TypeHint::i || sub->th == TypeHint::f)
+            && as_int_operand(sub->index.get(), idx);
+    }
+    return false;
+}
+
 Operand float_lit(float_type v)
 {
     Operand o;
@@ -778,6 +801,40 @@ struct Codegen {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             next_temp = save_top;
+        }
+
+        /* An inc-dec USED AS A VALUE (`y = x++`, `y = a[i]++`, `y = ++x`): the
+         * result is the OLD value (postfix) or the NEW value (prefix). Lower it
+         * to read-lvalue + mutate (postfix) / mutate + read (prefix), reusing the
+         * statement compilers for the in-place mutation. Gated on a side-effect-
+         * free lvalue (incdec_lvalue_pure) so the read and the store's second
+         * eval of the slot/index agree; a MoveV copies the scalar, so the
+         * captured `dst` is unaffected by the mutation that follows. */
+        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(e)) {
+            if (!incdec_lvalue_pure(inc->lvalue.get()))
+                return false;
+            const size_t omark = ops.size();
+            const size_t cmark = chunk.consts.size();
+            const int st = next_temp;
+            const int dst = alloc_temp();
+            auto emit_mut = [&]() {
+                return compile_int_stmt(inc, ops)
+                    || compile_float_stmt(inc, ops)
+                    || compile_boxed_stmt(inc, ops);
+            };
+            const bool ok = inc->is_prefix
+                ? (emit_mut()
+                   && compile_to_run_slot(inc->lvalue.get(), dst, ops))
+                : (compile_to_run_slot(inc->lvalue.get(), dst, ops)
+                   && emit_mut());
+            if (!ok) {
+                ops.resize(omark);
+                chunk.consts.resize(cmark);
+                next_temp = st;
+                return false;
+            }
+            out_slot = dst;
+            return true;
         }
 
         if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {

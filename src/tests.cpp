@@ -2154,6 +2154,13 @@ static const std::vector<test> tests =
         "a[i]++; assert(a == [10, 21, 30]);",
         "var b = [5, 6, 7]; var j = 2; var o = b[j]++;",
         "assert(o == 7 && b == [5, 6, 8]);" } },
+    /* inc-dec USED AS A VALUE with a resolved-local / subscript lvalue is native
+     * on the VM (compile_boxed_expr IncDecExpr case): postfix -> old, prefix ->
+     * new, evaluated once. */
+    { "++/--: as a value on locals and array elements (native VM path)",
+      { "var x = 5; var y = x++ + ++x; assert(y == 12 && x == 7);",
+        "var a = [1.0, 2.0]; var p = a[0]++; var q = --a[1];",
+        "assert(p == 1.0 && a[0] == 2.0 && q == 1.0 && a[1] == 1.0);" } },
     { "++/--: on a struct field",
       { "struct P { int x; int y; }",
         "var p = P(1, 2); var o = p.x++; assert(o == 1 && p.x == 2);",
