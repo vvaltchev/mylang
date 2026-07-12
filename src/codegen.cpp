@@ -1838,7 +1838,17 @@ struct Codegen {
                     && lv->sym.kind != SymKind::global
                     && lv->sym.kind != SymKind::capture))
             return false;
-        if (lv->decl_type != DeclType::none && lv->decl_type != DeclType::dyn)
+        /* A typed INT/FLOAT scalar target needs coerce_to_decl_type at the store
+         * (numeric WIDENING - float<-int/bool, int<-bool - or a runtime
+         * NARROWING throw for a dyn value whose type doesn't fit). The native
+         * scalar case is already handled by compile_int/float_stmt; a dyn rhs
+         * reaches here and is left to the tree-walker for the coerce. Every
+         * OTHER declared type (bool/str/array/dict/struct/typed-container)
+         * coerces to a NO-OP (coerce_to_decl_type returns the value unchanged -
+         * the type is proven at compile time), so a plain boxed store is
+         * byte-identical: allow it (`str s = ..`, `array<int> a = ..`,
+         * `Point p = P(..)`, ...). */
+        if (lv->decl_type == DeclType::i || lv->decl_type == DeclType::f)
             return false;
         /* A CONST DECL (a const arr/dict/func kept as a runtime symbol; const
          * SCALARS are inlined, so never here). `pInConstDecl` on the Expr14

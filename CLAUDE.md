@@ -3170,8 +3170,11 @@ The
 compound/inc-dec variant carries a `node` for its caret (div/undefined, via the
 loc side table); the plain assign is node-free. Compile in `compile_boxed_stmt`
 (the gate now also accepts a `SymKind::global` lvalue; a global `IncDecExpr`
-statement is handled at its top). A TYPED global (needs `coerce_to_decl_type`)
-and a `const` global (must throw `CannotRebindConstEx`) fall back to `EvalStmt`.
+statement is handled at its top). An **INT/FLOAT-TYPED** global (needs
+`coerce_to_decl_type`'s numeric widen / dyn-narrow throw) and a `const` global
+(must throw `CannotRebindConstEx`) fall back to `EvalStmt`; a **non-scalar-typed
+global** (`array<int> g`, `str g`, …) is native (its coerce is a no-op — see the
+typed-decl note below).
 Script-only (no `SymKind::global` in the REPL), so never emitted there; **not**
 a pure-target retarget candidate (it writes the table, not a temp). A closure
 **CAPTURE write** `cap = v` / `cap += v` / `cap++` (a counter `start++`) is the
@@ -3778,15 +3781,34 @@ wrapper, so a backtrace crossing it dropped the virtual frame; `make_typed` now
 uses `copy_base_fields`. So an error inside a native InlinedCall shows the
 byte-identical virtual `f$0` frame.
 
+**Typed NON-SCALAR decls/assigns → native (a plain boxed store).** An
+explicitly-typed decl/reassign/compound whose declared type is `bool` / `str` /
+`array<…>` / `dict<…>` / a struct (`str s = ..`, `array<int> a = ..`,
+`Point p = P(..)`, `s += ".."`, and their global/capture/const forms) is now a
+plain `StoreGlobalV`/`StoreCaptureV`/`DeclConstV`/retarget store, NOT an
+`EvalStmt`. Sound because **`coerce_to_decl_type` is a no-op for every declared
+type EXCEPT `int`/`float`** (`eval.cpp` — it returns the value unchanged; the
+type is proven at compile time by the inferencer), and the tree-walker's
+decl path only calls the coerce for `DeclType::i`/`f` (`handle_single_expr14`).
+So `compile_boxed_stmt`'s decl-type gate now declines ONLY `i`/`f` (which need
+the runtime numeric widen / dyn-narrow throw and whose native scalar case is
+already handled by `compile_int/float_stmt`); everything else falls through to
+the ordinary boxed store, byte-identical. A typed array/dict keeps its FLAT
+storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
+`LoadLiteralObjV` regardless of the decl), and an uninitialized `array<int> a;`
+/ `str s;` / `Point p;` is already desugared (at parse) to a zero-value literal
+/ zero-struct ctor rvalue, so it lowers the same way.
+
 **Residual `EvalStmt`:** the harder niche shapes (a member-subscript-member
 nested store `d.a[0].f=v` — a genuine `NotLValueEx` path in both engines, a dyn
-**MEMBER** inc-dec statement `d.f++`); an `InlinedCallExpr` whose return crosses
-a try INSIDE the boundary (rare); and the dev-only **`show`** (script-excluded
-by `reject_dev_builtins`, so never in serialized bytecode). None appear in
-`bench/` or `samples/` (both stay 100% native). The `_`-in-unpack / indexed
-dict `foreach`, the ≥3-level nested store, the dyn scalar/element inc-dec,
-`append` to a struct member, and the common `InlinedCallExpr` are all now
-native (above).
+**MEMBER** inc-dec statement `d.f++`, an **int/float**-typed decl fed a `dyn`
+value — left to the tree-walker for `coerce_to_decl_type`); an `InlinedCallExpr`
+whose return crosses a try INSIDE the boundary (rare); and the dev-only
+**`show`** (script-excluded by `reject_dev_builtins`, so never in serialized
+bytecode). None appear in `bench/` or `samples/` (both stay 100% native). The
+`_`-in-unpack / indexed dict `foreach`, the ≥3-level nested store, the dyn
+scalar/element inc-dec, `append` to a struct member, the common
+`InlinedCallExpr`, and typed NON-scalar decls are all now native (above).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index

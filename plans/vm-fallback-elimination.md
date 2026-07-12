@@ -540,6 +540,19 @@ real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
   wrapper); now uses `copy_base_fields`, so an error inside a native InlinedCall
   shows the byte-identical virtual `f$0` frame. STILL fallback: an
   InlinedCallExpr whose return crosses a try inside the boundary (rare).
+  **(h) typed NON-SCALAR decls/assigns (2026-07-13, DONE).** An explicitly-typed
+  `str`/`bool`/`array<…>`/`dict<…>`/struct decl/reassign/compound (`str s = ..`,
+  `array<int> a = ..`, `Point p = P(..)`, `s += ".."`, global/capture/const
+  forms) fell to `EvalStmt` because `compile_boxed_stmt` declined ANY
+  `decl_type ∉ {none,dyn}`. But `coerce_to_decl_type` is a NO-OP for every type
+  EXCEPT int/float (it returns the value unchanged; the type is proven at compile
+  time), and the tree-walker's decl path only coerces for `DeclType::i`/`f`. So
+  the gate now declines ONLY `i`/`f` (numeric widen / dyn-narrow throw, whose
+  native scalar case is compile_int/float_stmt); everything else is a plain boxed
+  store, byte-identical. Flat array/dict storage is preserved (the ArrHint rides
+  the rvalue), and an uninitialized typed decl is already a zero-value/zero-ctor
+  rvalue at parse. STILL fallback: an int/float-typed decl fed a `dyn` value
+  (left to the coerce).
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then

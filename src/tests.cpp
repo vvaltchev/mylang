@@ -9388,6 +9388,53 @@ static const std::vector<test> tests =
         "  return [Pair(1, 2), Pair(3, 4)];",
         "}",
         "var ps = build(); assert(ps[0].a == 1); assert(ps[1].b == 4);" } },
+    /* ---- typed NON-SCALAR decls/assigns are a plain (native) store ----
+     * coerce_to_decl_type is a NO-OP for everything but int/float (the type is
+     * proven at compile time), so a `str`/`array`/`dict`/`bool` typed decl,
+     * reassign and compound is a byte-identical boxed store. These run under
+     * BOTH engines (differential), pinning the VM's native store path. */
+    { "typed decl: str decl + reassign + compound (native store)",
+      { "str s = \"hello\";",
+        "s = s + \" world\";",
+        "s += \"!\";",
+        "assert(s == \"hello world!\");" } },
+    { "typed decl: array<int> decl + element store + uninit-flat append",
+      { "array<int> a = [1, 2, 3];",
+        "a[0] = 10;",
+        "assert(a == [10, 2, 3]);",
+        "array<int> b;",              /* zero-inits to an empty FLAT array */
+        "append(b, 7); append(b, 8);",
+        "assert(b == [7, 8]);",
+        "assert(array_storage(b) == \"int\");" } },
+    { "typed decl: dict<str,int> decl + insert",
+      { "dict<str, int> d = {\"x\": 1};",
+        "d[\"y\"] = 2;",
+        "assert(d[\"x\"] + d[\"y\"] == 3);" } },
+    { "typed decl: bool decl + reassign (native store, no coerce)",
+      { "bool flag = true;",
+        "flag = false;",
+        "assert(flag == false);" } },
+    /* A typed NON-SCALAR GLOBAL (a function reads it) stores natively too. */
+    { "typed decl: str/array globals a function reads",
+      { "array<int> g = [1, 2, 3];",
+        "func total() { var s = 0; foreach (var x in g) s += x; return s; }",
+        "g[0] = 100;",
+        "assert(total() == 105);",
+        "str name = \"bob\";",
+        "func greet() => \"hi \" + name;",
+        "assert(greet() == \"hi bob\");" } },
+    /* A typed INT/FLOAT scalar still coerces: a float widens int->float, and a
+     * dyn value that doesn't fit throws at runtime (the native path must NOT
+     * eat that - it's left to the coerce). */
+    { "typed decl: float widens an int initializer",
+      { "float f = 3; assert(f == 3.0); f = 5; assert(f == 5.0);" } },
+    /* The int/float COERCE path is unchanged (it still declines to the tree-
+     * walker for the runtime widen/narrow-throw): a dyn value flowing into an
+     * int accumulator that turns out to be a float throws TypeErrorEx at
+     * RUNTIME - both engines identically. */
+    { "typed decl: dyn-into-int coerce still throws at runtime",
+      { "func acc(dyn x) { var s = 0; s = s + x; return s; }",
+        "acc(2.5);" }, &typeid(TypeErrorEx) },
     /* ----------------- POD structs (C byte layout) ---------------------- */
     { "struct POD: mixed scalar kinds (bool/int/float) construct + read",
       { "struct V { bool b; int i; float f; }",
