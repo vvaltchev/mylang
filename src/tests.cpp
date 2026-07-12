@@ -1462,6 +1462,25 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* GENERIC N-level (>= 3) nested store -> StoreElemChainV (the depth-2
+         * fast path stays StoreElem2V). Assign / compound / var indices / a flat
+         * or general innermost - all via one op. */
+        "deep nested store a[i][j][k] (generic StoreElemChainV)",
+        {
+            "var c = [[[1, 2, 3]]];",
+            "c[0][0][0] = 9; assert(c[0][0][0] == 9);",
+            "c[0][0][1] += 10; assert(c[0][0][1] == 12);",
+            "var i = 0; var j = 0; var k = 2; c[i][j][k] = 99;",
+            "assert(c[0][0][2] == 99);",
+            "var d = [[[[5]]]]; d[0][0][0][0] = 7;",   /* 4-level */
+            "assert(d[0][0][0][0] == 7);",
+            "var g = [[[\"a\"]]]; g[0][0][0] = \"z\";",   /* general inner */
+            "assert(g[0][0][0] == \"z\");",
+            "var c2 = [[[1]]]; var alias = c2; c2[0][0][0] = 42;",
+            "assert(alias[0][0][0] == 42);",       /* alias shares */
+        },
+    },
+    {
         "global array/dict base store (a function reads the global)",
         {
             "var a = [0, 0, 0]; var d = {0: 0, 1: 0};",

@@ -2929,34 +2929,85 @@ struct Codegen {
         if (const Subscript *sub =
                 dynamic_cast<const Subscript *>(e->lvalue.get())) {
 
-            /* NESTED store `a[i][j] = v` / `a[i][j] OP= v` -> StoreElem2V: the
-             * base is another Subscript over a SLOTTED base. Reads `a[i]` as a
-             * reference then stores `[j]` into it (flat OR general inner);
-             * vm_nested_subscript_store matches the tree-walker's two-level
-             * lvalue chain. Value first (rhs), then key1 (inner i), key2 (j) -
-             * the tree-walker's rhs-then-lvalue, a(slot)-then-i-then-j order. */
-            if (const Subscript *inner =
-                    dynamic_cast<const Subscript *>(sub->what.get())) {
-                int aslot;
+            /* NESTED store `a[k0][k1]...[kn] = v` / `OP= v`: the base is another
+             * Subscript. Collect the whole chain (outermost-first) down to a
+             * slotted base. A depth-2 store over a LOCAL array keeps the tuned
+             * StoreElem2V (value, k1, k2); anything deeper (or a global/capture
+             * base) -> the GENERIC StoreElemChainV (value, then keys base-to-
+             * innermost). Matches the tree-walker's rhs-then-lvalue eval order. */
+            if (dynamic_cast<const Subscript *>(sub->what.get())) {
                 switch (e->op) {
                 case Op::assign: case Op::addeq: case Op::subeq:
                 case Op::muleq:  case Op::diveq: case Op::modeq: break;
                 default: return false;
                 }
-                if (!as_array_slot(inner->what.get(), aslot))
+                std::vector<const Subscript *> chain;   /* outermost-first */
+                const Construct *cur = sub;
+                while (auto *s = dynamic_cast<const Subscript *>(cur)) {
+                    chain.push_back(s);
+                    cur = s->what.get();
+                }
+                const int nkeys = static_cast<int>(chain.size());
+
+                /* Depth-2 fast path (local array base) -> StoreElem2V. */
+                int aslot;
+                if (nkeys == 2 && as_array_slot(cur, aslot)) {
+                    const Subscript *inner = chain[1];
+                    int vslot, k1slot, k2slot;
+                    if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
+                        || !compile_boxed_expr(inner->index.get(), k1slot, ops)
+                        || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                        return false;
+                    Instr in;
+                    in.op = OpCode::StoreElem2V;
+                    in.node_idx = add_ast_node(sub);   /* outer subscript loc */
+                    in.target = vslot;
+                    in.target2 = aslot;
+                    in.a = slot_op(k1slot);
+                    in.b = slot_op(k2slot);
+                    in.aop = e->op;
+                    ops.push_back(in);
+                    return true;
+                }
+
+                /* Generic N-level -> StoreElemChainV. */
+                int bslot, bkind;
+                if (!as_container_base(cur, bslot, bkind))
                     return false;
-                int vslot, k1slot, k2slot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-                    || !compile_boxed_expr(inner->index.get(), k1slot, ops)
-                    || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                const size_t omark = ops.size();
+                const size_t cmark = chunk.consts.size();
+                const int st = next_temp;
+                int vslot;
+                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)) {
+                    ops.resize(omark);
+                    chunk.consts.resize(cmark);
+                    next_temp = st;
                     return false;
+                }
+                const int keybase = next_temp;
+                next_temp += nkeys;
+                if (next_temp > max_temp)
+                    max_temp = next_temp;
+                bool ok = true;
+                for (int k = 0; k < nkeys && ok; k++)
+                    /* base-to-innermost: chain is outermost-first, so index k
+                     * (from the base) is chain[nkeys-1-k]'s index. */
+                    ok = compile_to_run_slot(chain[nkeys - 1 - k]->index.get(),
+                                             keybase + k, ops);
+                if (!ok) {
+                    ops.resize(omark);
+                    chunk.consts.resize(cmark);
+                    next_temp = st;
+                    return false;
+                }
                 Instr in;
-                in.op = OpCode::StoreElem2V;
-                in.node_idx = add_ast_node(sub);   /* outer subscript, for its loc (extract_locs) */
+                in.op = OpCode::StoreElemChainV;
+                in.node_idx = add_ast_node(sub);   /* outer subscript loc */
                 in.target = vslot;
-                in.target2 = aslot;
-                in.a = slot_op(k1slot);
-                in.b = slot_op(k2slot);
+                in.target2 = bslot;
+                in.a = int_lit(bkind);
+                in.a.slot = nkeys;
+                in.b = int_lit(keybase);
                 in.aop = e->op;
                 ops.push_back(in);
                 return true;
@@ -5097,6 +5148,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::DictStore:      /* node = the Subscript (its caret) */
         case OpCode::StoreElemValue:
         case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
+        case OpCode::StoreElemChainV: /* node = the outer Subscript (its caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::MakeStructArrayV: /* node = a ctor (defensive coerce loc) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */

@@ -329,7 +329,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 
     /* Terse operand helpers bound to this chunk (names + immediates), and the
      * `; source` comment column an op carries its AST snippet in. */
-    auto D  = [&](int slot)                 { return reg(chunk, slot); };
+    /* int_type, not int: a slot sometimes rides an Operand's int_type `lit`
+     * (e.g. StoreElemChainV's run base, CallValueGenericV's callee temp) - a
+     * widening call is warning-free on all three compilers (MSVC C4244). */
+    auto D  = [&](int_type slot)            { return reg(chunk, slot); };
     auto RI = [&](const Operand &o, bool f) { return reg_or_imm(chunk, o, f); };
     auto cmt = [&](std::ostream &r, const Construct *n) {
         if (n)
@@ -566,6 +569,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "][" << RI(in.b, false) << "] " << o << " " << D(in.target);
             break;
         }
+        case OpCode::StoreElemChainV:
+            row << "store.chain " << D(in.target2) << "[..x" << in.a.slot
+                << " @" << D(in.b.lit) << "] " << store_op(in.aop) << " "
+                << D(in.target);
+            break;
         case OpCode::MultiUnpackV: {
             row << "multi.unpack ";
             const std::vector<int32_t> &tg = chunk.unpack_targets[in.target];

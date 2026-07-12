@@ -146,8 +146,11 @@ vm_stamp_loc(const Chunk &chunk, size_t pc, Exception &e)
  * loc side table) - matching the tree-walker's base-read of an undefined name.
  * Cold on the global-undefined path only; the common local/global paths inline.
  */
+/* `kind` is int_type, not int: two callers pass an Operand's int_type `lit`
+ * (StoreElemChainV / StoreLValueChainV) - a widening param keeps every call
+ * warning-free on all three compilers (MSVC C4244). */
 static LValue *
-vm_store_base(EvalContext &ctx, int kind, int slot,
+vm_store_base(EvalContext &ctx, int_type kind, int slot,
               const Chunk &chunk, size_t pc, const Construct *node)
 {
     if (kind == 1) {                            /* global */
@@ -333,6 +336,29 @@ vm_struct_ctor_boxed(EvalContext &ctx, StructTypeDef *def, int_type base,
         heapbuf[i] = ctx.frame->at(base + i).get();
     return EvalValue(construct_struct_boxed_from_values(
         def, heapbuf.data(), static_cast<size_t>(nargs), locs));
+}
+
+/* GENERIC N-level nested store (StoreElemChainV): gather the `nkeys` key values
+ * from the run [kbase, kbase+nkeys) and call vm_subscript_chain_store.
+ * ML_NOINLINE + off vm_run_chunk's frame (the key buffer must not inflate the
+ * recursive frame). The caller wraps the loc-stamp. */
+static ML_NOINLINE void
+vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
+                  int_type nkeys, const EvalValue &val, Op op)
+{
+    if (nkeys <= 8) {
+        EvalValue keybuf[8];
+        for (int_type k = 0; k < nkeys; k++)
+            keybuf[k] = ctx.frame->at(kbase + k).get();
+        vm_subscript_chain_store(base, keybuf, static_cast<size_t>(nkeys),
+                                 val, op, Loc(), Loc());
+        return;
+    }
+    std::vector<EvalValue> keyheap(static_cast<size_t>(nkeys));
+    for (int_type k = 0; k < nkeys; k++)
+        keyheap[k] = ctx.frame->at(kbase + k).get();
+    vm_subscript_chain_store(base, keyheap.data(), static_cast<size_t>(nkeys),
+                             val, op, Loc(), Loc());
 }
 
 /* Build a FLAT array<PodStruct> literal from the N structs' interleaved
@@ -1433,6 +1459,24 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             try {
                 vm_nested_subscript_store(&alv, k1, k2, val, in.aop,
                                           Loc(), Loc());
+            } catch (Exception &e) {
+                if (!e.loc_start)
+                    chunk.loc_at(pc, e.loc_start, e.loc_end);
+                throw;
+            }
+            pc++;
+            break;
+        }
+
+        case OpCode::StoreElemChainV: {
+            /* GENERIC N-level nested store a[k0][k1]...[kn] = v / OP= v: form the
+             * base LValue* (by slot kind), then walk the keys run. AST-free: the
+             * outer subscript's caret comes from the loc side table. */
+            LValue *base = vm_store_base(ctx, in.a.lit, in.target2,
+                                         chunk, pc, nullptr);
+            const EvalValue &val = ctx.frame->at(in.target).get();
+            try {
+                vm_chain_store_op(ctx, base, in.b.lit, in.a.slot, val, in.aop);
             } catch (Exception &e) {
                 if (!e.loc_start)
                     chunk.loc_at(pc, e.loc_start, e.loc_end);

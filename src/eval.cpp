@@ -3041,6 +3041,46 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
     return slot_rmw(*elv.get<LValue *>(), op, value);
 }
 
+/*
+ * GENERIC N-level nested store `a[k0][k1]...[kn] = v` / `OP= v` (the VM's
+ * StoreElemChainV; vm_nested_subscript_store is the n==2 special case): walk
+ * keys[0 .. nkeys-2] as READS (for_write=false), descending to the innermost
+ * container exactly like the tree-walker's nested Subscript chain (assign_target
+ * is consumed only at the OUTERMOST), then store keys[nkeys-1] into it - a FLAT
+ * inner via flat_store_core, a GENERAL inner's element via slot_rmw. `keys` are
+ * in BASE-to-innermost order (keys[0] applies to the base). COW propagates back
+ * through the element LValues' container back-pointers, byte-identical to the
+ * tree-walker.
+ */
+EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
+                                   size_t nkeys, const EvalValue &value, Op op,
+                                   Loc lstart, Loc lend)
+{
+    EvalValue cur = EvalValue(base);   /* wraps the current container LValue* */
+    for (size_t k = 0; k + 1 < nkeys; k++) {
+        Type *t = cur.get<LValue *>()->get().get_type();
+        EvalValue next = t->subscript(cur, keys[k], /*for_write=*/false);
+        if (!next.is<LValue *>())        /* a flat scalar can't be indexed */
+            throw NotLValueEx(lstart, lend);
+        cur = std::move(next);
+    }
+
+    LValue *inner = cur.get<LValue *>();
+    SharedArrayObj *arr;
+    if (flat_writable_array(inner, arr)) {
+        EvalValue fout;
+        if (flat_store_core(inner, *arr, keys[nkeys - 1], value, op,
+                            fout, lstart, lend, lstart, lend))
+            return fout;
+    }
+    Type *t = inner->get().get_type();
+    const bool for_write = (op == Op::assign);
+    EvalValue elv = t->subscript(cur, keys[nkeys - 1], for_write);
+    if (!elv.is<LValue *>())
+        throw NotLValueEx(lstart, lend);
+    return slot_rmw(*elv.get<LValue *>(), op, value);
+}
+
 /* Read scalar field #fidx of element `idx` of a flat array<PodStruct> straight
  * from the bytes (the VM's LoadStructFieldInt/Float, the struct-foreach direct
  * read). `arrv` is the array value; the codegen proved it flat-struct + `idx`

@@ -346,6 +346,17 @@ enum class OpCode : unsigned char {
     StoreElem2V,
 
     /*
+     * GENERIC N-level (>= 3) nested store `a[k0][k1]...[kn] = v` / `OP= v` - the
+     * arbitrary-depth generalization of StoreElem2V (which stays the tuned 2-
+     * level fast path). `target2` = the base's (local) slot, `a.lit` = the base
+     * SLOT KIND (0 loc / 1 gbl / 2 cap), `a.slot` = nkeys, `b.lit` = the KEYS run
+     * base (nkeys temps, BASE-to-innermost), `target` = the VALUE temp, `aop` =
+     * the op. vm_subscript_chain_store walks keys[0..n-2] as reads then stores
+     * keys[n-1]. AST-free: caret from the loc side table (the outer Subscript).
+     */
+    StoreElemChainV,
+
+    /*
      * Typed DICT scalar READ `d[k]` / `d.k` into a temp (P3), when inference
      * proved the value is a non-null int/float. `target2` = the dict's (local)
      * slot, `target` = the dst temp; `node` = the Subscript or MemberExpr - a

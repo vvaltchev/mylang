@@ -410,6 +410,12 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &value, Op op,
                                     Loc lstart, Loc lend);
 
+/* VM (StoreElemChainV): GENERIC N-level nested store `a[k0][k1]...[kn] = v` /
+ * `OP= v`; `keys` are base-to-innermost. See eval.cpp. */
+EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
+                                   size_t nkeys, const EvalValue &value, Op op,
+                                   Loc lstart, Loc lend);
+
 /* VM (MapFilterV) + tree-walker shared map/filter core: apply a (pre-validated)
  * function to each element of a container. See eval.cpp. */
 EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
