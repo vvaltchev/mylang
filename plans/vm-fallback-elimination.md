@@ -892,24 +892,46 @@ STEP 1 ✅ DONE (2026-07-14): the rule.**
   genuinely works there — would have been broken gratuitously (the
   `show` precedent). README documents the rule under `defined` +
   `isconst`.
-- **STEP 2 (OPEN — the op rework needs one more maintainer call):** with
-  lazy callees impossible, pre-evaluate the args into a register run +
-  pooled ArgLocs and dispatch FuncObject → vm_call_func, struct →
-  construct-from-values, func_v Builtin → func_v(values). TWO remaining
-  ExprList-ABI callees block full AST-freedom:
-  (1) **map/filter** indirectly (`var dyn m = map; m(f, a)`): the direct
-  form validates arg0 BEFORE evaluating arg1 (tested order); values are
-  eager, so an invalid arg0 + side-effecting arg1 diverges. Options:
-  accept eager-args semantics for INDIRECT builtin calls (a documented
-  divergence) or keep the node for this case.
-  (2) **mutating builtins** indirectly (`var dyn f = append; f(a, 2)`):
-  arg0 must be an LVALUE; a pre-evaluated value copy bumps use_count so
-  COW would clone and the append silently mutate the copy — worse than
-  an error. Options: BAN indirect calls of lvalue-arg0 builtins (an
-  explicit error; RECOMMENDED — the shape is rare and a silent-no-op
-  trap otherwise) or compile an lvalue descriptor for a slotted-id arg0
-  (leaves subscript/member arg0 divergent). Until decided, the op keeps
-  its node; Tier 2 = the fallback ops + this one op.
+- **STEP 2 — DECIDED (2026-07-14). The blocker analysis was CORRECTED by
+  measurement before deciding; the earlier COW claim was WRONG:**
+  * VERIFIED FACTS (both engines, pinned by probes): (i) plain assignment
+    ALIASES (`var b = a; b[0] = 9` bleeds; same intptr); (ii) a regular
+    function CAN mutate an array param — the param is a VALUE-copied
+    handle and `v[0]=99` / `append(v,55)` reach the caller's array — so a
+    value-passed arg0 to append DOES mutate the original for a PLAIN
+    array (the earlier "use_count>1 → COW clones → silent no-op" claim
+    was false; the ban recommendation is WITHDRAWN); (iii) the ONE real
+    lvalue dependence is the SLICE WRITE-BACK: direct `append(slice, 9)`
+    clones + writes the new array back INTO THE SLOT (`s` becomes
+    [1,2,9]) while the same mutation through a value copy leaves the
+    caller's slice untouched; (iv) const is enforced by the DEEP
+    read-only flag, which travels with the value (not lvalue-dependent).
+  * DECISION (maintainer): (1) indirect `map`/`filter` get EAGER-ARGS
+    semantics (the direct form keeps the tested validate-before-arg1
+    order); (2) NO ban and NO new syntax (`&`/byref) — mylang's by-ref
+    encoding already EXISTS as a VALUE: an `EvalValue` holding `LValue*`
+    (the internal `t_lval`), which is exactly what `Identifier::do_eval`
+    hands a builtin today. The VM learns to PRODUCE that value natively:
+    indirect-call arg0 compiles in LVALUE-PRESERVING mode (a slotted id →
+    box `&slot`; a subscript/member → the element/field `LValue*` via the
+    runtime `subscript(for_write=false)` / `vm_member_lvalue`, the
+    CallBuiltinLVElem formations; anything else → a plain value). The
+    shared dispatch hands a `func_lv` callee `args[0]`'s `LValue*` (null →
+    NotLValueEx) — so slice write-back, const, and literal-arg0 errors
+    reproduce byte-identically, because the builtin receives the same
+    `LValue*` it gets today.
+  * MECHANICS: a KIND tag on `Builtin` (value/lvalue/map/filter/lazy —
+    fits the EvalValue payload) so an indirect callee's ABI is decidable
+    from the VALUE at runtime; a callable-CHECK op between the callee and
+    the arg run (a non-callable callee must throw BEFORE evaluating args,
+    like the tree-walker); FuncObject → the vm_call_func values path;
+    struct → a values twin of construct_struct (per-arg carets pooled);
+    the tree-walker's INDIRECT dispatch changes ONLY for map/filter
+    (eager, per (1)) — every other tree-walker path keeps its node and is
+    trivially byte-identical; the lazy builtins stay node-dispatched in
+    the tree-walker (the REPL keeps working) and are script-unreachable
+    (step 1), a tripwire error in the VM op. Then the op drops its node →
+    Tier 2 is ONLY the three fallback ops.
 
 **F2. The brace-less-body func/struct decl CRASH — ✅ DONE (2026-07-14,
 `pWrapDeclBody` in parser.cpp).**
