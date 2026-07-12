@@ -742,6 +742,18 @@ struct Codegen {
         return static_cast<int>(chunk.member_keys.size()) - 1;
     }
 
+    /* Pool the per-step subscript carets of a nested store (StoreElem2V /
+     * StoreElemChainV), INSIDE-OUT to match the keys. Returns the pool index. */
+    int add_chain_locs(const std::vector<const Construct *> &nodes)
+    {
+        std::vector<std::pair<Loc, Loc>> v;
+        v.reserve(nodes.size());
+        for (const Construct *n : nodes)
+            v.push_back({n->start, n->end});
+        chunk.chain_locs.push_back(std::move(v));
+        return static_cast<int>(chunk.chain_locs.size()) - 1;
+    }
+
     /*
      * BOXED general-value expression (the zero-fallback / dyn tier) -> ops,
      * result left in `out_slot` (a resolved-local slot, or a temp). Handles a
@@ -3162,10 +3174,12 @@ struct Codegen {
                         return false;
                     Instr in;
                     in.op = OpCode::StoreElem2V;
-                    in.node_idx = add_ast_node(sub);   /* outer subscript loc */
                     in.target = one;                   /* the boxed-1 value slot */
                     in.target2 = aslot;
                     in.a = slot_op(k1slot);
+                    /* a.lit = chain_locs idx (inner k1 loc, outer k2 loc) - the
+                     * per-step carets for a byte-identical intermediate throw. */
+                    in.a.lit = add_chain_locs({inner, sub});
                     in.b = slot_op(k2slot);
                     in.aop = inc->is_inc ? Op::addeq : Op::subeq;
                     ops.push_back(in);
@@ -3321,10 +3335,11 @@ struct Codegen {
                         return false;
                     Instr in;
                     in.op = OpCode::StoreElem2V;
-                    in.node_idx = add_ast_node(sub);   /* outer subscript loc */
                     in.target = vslot;
                     in.target2 = aslot;
                     in.a = slot_op(k1slot);
+                    /* a.lit = chain_locs idx (inner k1 loc, outer k2 loc). */
+                    in.a.lit = add_chain_locs({inner, sub});
                     in.b = slot_op(k2slot);
                     in.aop = e->op;
                     ops.push_back(in);
@@ -3361,13 +3376,19 @@ struct Codegen {
                     next_temp = st;
                     return false;
                 }
+                /* Per-step carets INSIDE-OUT (matching the keys): key k is
+                 * chain[nkeys-1-k]'s subscript node. nkeys is derived from the
+                 * pool entry's size, so a.slot holds the pool index. */
+                std::vector<const Construct *> locnodes;
+                locnodes.reserve(static_cast<size_t>(nkeys));
+                for (int k = 0; k < nkeys; k++)
+                    locnodes.push_back(chain[nkeys - 1 - k]);
                 Instr in;
                 in.op = OpCode::StoreElemChainV;
-                in.node_idx = add_ast_node(sub);   /* outer subscript loc */
                 in.target = vslot;
                 in.target2 = bslot;
                 in.a = int_lit(bkind);
-                in.a.slot = nkeys;
+                in.a.slot = add_chain_locs(locnodes);   /* nkeys = entry size */
                 in.b = int_lit(keybase);
                 in.aop = e->op;
                 ops.push_back(in);
@@ -5604,8 +5625,6 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreCaptureV:
         case OpCode::DictStore:      /* node = the Subscript (its caret) */
         case OpCode::StoreElemValue:
-        case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
-        case OpCode::StoreElemChainV: /* node = the outer Subscript (its caret) */
         case OpCode::StoreLValueChainV: /* node = the outer lvalue (its caret) */
         case OpCode::IncDecCheckedV:  /* node = the inc-dec (TypeError caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */

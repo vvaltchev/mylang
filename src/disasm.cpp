@@ -581,7 +581,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::StoreElemChainV:
-            row << "store.chain " << D(in.target2) << "[..x" << in.a.slot
+            row << "store.chain " << D(in.target2) << "[..x"
+                << chunk.chain_locs[in.a.slot].size()
                 << " @" << D(in.b.lit) << "] " << store_op(in.aop) << " "
                 << D(in.target);
             break;

@@ -1070,6 +1070,16 @@ struct Chunk {
     std::vector<std::vector<ChainStep>> chain_steps;
 
     /*
+     * PER-STEP LOCS for a pure-subscript nested store (StoreElem2V /
+     * StoreElemChainV). One entry per op, INSIDE-OUT (matching the keys): each
+     * pair is a subscript node's caret. A throw AT step k (an intermediate OOB /
+     * KeyNotFound, or the final store) uses step k's loc - byte-identical to the
+     * tree-walker's per-node stamp (the outer op's single side-table loc was an
+     * off-by-a-few-cols imprecision for an INTERMEDIATE throw).
+     */
+    std::vector<std::vector<std::pair<Loc, Loc>>> chain_locs;
+
+    /*
      * CATCH-TYPE POOL (P8). One entry per `catch (A, B, ...)` clause with a type
      * list: the interned type NAMES a CatchTest matches the in-flight
      * exception's name against (a user struct-type name or a built-in error

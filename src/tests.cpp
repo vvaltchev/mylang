@@ -5420,6 +5420,16 @@ static const std::vector<test> tests =
         &typeid(OutOfBoundsEx), 19, 0, 24, 0,
     },
     {
+        /* A nested store whose INTERMEDIATE subscript is out of bounds marks
+         * the INNER `a[9]` (cols 24-27), not the whole `a[9][0]` - matching the
+         * tree-walker's per-node stamp. The VM's StoreElem2V/StoreElemChainV now
+         * carry PER-STEP carets (chain_locs pool), fixing a pre-existing single-
+         * loc imprecision (the outer op's loc was used for an inner throw). */
+        "err loc: nested store intermediate OOB marks the inner subscript",
+        { "var a = [[1, 2], [3, 4]]; a[9][0] = 5;" },
+        &typeid(OutOfBoundsEx), 27, 0, 32, 0,
+    },
+    {
         "err loc: calling a defined non-function is a type error",
         { "var x = 5; x(1, 2);" },
         &typeid(TypeMismatchEx), 12, 0, 14, 0,

@@ -3142,10 +3142,21 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
 EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &key2,
                                     const EvalValue &value, Op op,
-                                    Loc lstart, Loc lend)
+                                    const std::pair<Loc, Loc> *locs)
 {
-    EvalValue inner = outer_base->get().get_type()->subscript(
-        EvalValue(outer_base), key1, /*for_write=*/false);
+    /* `locs[0]` = the INNER subscript caret, `locs[1]` = the OUTER's - read ONLY
+     * on the throw path (a pointer keeps the hot store cheap). The INNER read
+     * `a[i]` throws locs[0], the FINAL store `[j]` locs[1] - byte-identical to
+     * the tree-walker's per-node stamp. */
+    EvalValue inner;
+    try {
+        inner = outer_base->get().get_type()->subscript(
+            EvalValue(outer_base), key1, /*for_write=*/false);
+    } catch (Exception &e) {
+        if (!e.loc_start) { e.loc_start = locs[0].first;
+                            e.loc_end = locs[0].second; }
+        throw;
+    }
 
     /* A FLAT inner array (`[[1,2],[3,4]]`: general outer, flat int inners) has
      * no element LValue - store the scalar straight into its buffer, exactly
@@ -3155,23 +3166,30 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
         if (flat_writable_array(inner.get<LValue *>(), arr)) {
             EvalValue fout;
             if (flat_store_core(inner.get<LValue *>(), *arr, key2, value, op,
-                                fout, lstart, lend, lstart, lend))
+                                fout, locs[1].first, locs[1].second,
+                                locs[1].first, locs[1].second))
                 return fout;
             /* a compound op on a flat struct array: defer to the general path
              * below, which raises the same error as the tree-walker. */
         }
     }
 
-    /* GENERAL inner (array<dyn>/array<array>): the element IS an LValue. */
-    Type *t = inner.is<LValue *>()
-        ? inner.get<LValue *>()->get().get_type()
-        : inner.get_type();
-
-    const bool for_write = (op == Op::assign);
-    EvalValue elv = t->subscript(inner, key2, for_write);
-    if (!elv.is<LValue *>())
-        throw NotLValueEx(lstart, lend);
-    return slot_rmw(*elv.get<LValue *>(), op, value);
+    /* GENERAL inner (array<dyn>/array<array>): the element IS an LValue. The
+     * final store's loc-less throws are stamped the OUTER subscript's caret. */
+    try {
+        Type *t = inner.is<LValue *>()
+            ? inner.get<LValue *>()->get().get_type()
+            : inner.get_type();
+        const bool for_write = (op == Op::assign);
+        EvalValue elv = t->subscript(inner, key2, for_write);
+        if (!elv.is<LValue *>())
+            throw NotLValueEx(locs[1].first, locs[1].second);
+        return slot_rmw(*elv.get<LValue *>(), op, value);
+    } catch (Exception &e) {
+        if (!e.loc_start) { e.loc_start = locs[1].first;
+                            e.loc_end = locs[1].second; }
+        throw;
+    }
 }
 
 /*
@@ -3187,31 +3205,51 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
  */
 EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
                                    size_t nkeys, const EvalValue &value, Op op,
-                                   Loc lstart, Loc lend)
+                                   const std::pair<Loc, Loc> *steplocs)
 {
     EvalValue cur = EvalValue(base);   /* wraps the current container LValue* */
+    /* Each INTERMEDIATE read throws with ITS subscript node's loc (byte-
+     * identical to the tree-walker's per-node stamp); a loc-less internal OOB /
+     * KeyNotFound is stamped here. The FINAL store's throws are loc-less and the
+     * CALLER stamps them the outer/side-table loc (== the outermost subscript
+     * = steplocs[nkeys-1]). */
     for (size_t k = 0; k + 1 < nkeys; k++) {
+        const Loc ks = steplocs[k].first, ke = steplocs[k].second;
         Type *t = cur.get<LValue *>()->get().get_type();
-        EvalValue next = t->subscript(cur, keys[k], /*for_write=*/false);
-        if (!next.is<LValue *>())        /* a flat scalar can't be indexed */
-            throw NotLValueEx(lstart, lend);
+        EvalValue next;
+        try {
+            next = t->subscript(cur, keys[k], /*for_write=*/false);
+        } catch (Exception &e) {
+            if (!e.loc_start) { e.loc_start = ks; e.loc_end = ke; }
+            throw;
+        }
+        if (!next.is<LValue *>())         /* a flat scalar can't be indexed */
+            throw NotLValueEx(ks, ke);
         cur = std::move(next);
     }
 
+    const Loc fs = steplocs[nkeys - 1].first, fe = steplocs[nkeys - 1].second;
     LValue *inner = cur.get<LValue *>();
     SharedArrayObj *arr;
     if (flat_writable_array(inner, arr)) {
         EvalValue fout;
         if (flat_store_core(inner, *arr, keys[nkeys - 1], value, op,
-                            fout, lstart, lend, lstart, lend))
+                            fout, fs, fe, fs, fe))
             return fout;
     }
-    Type *t = inner->get().get_type();
-    const bool for_write = (op == Op::assign);
-    EvalValue elv = t->subscript(cur, keys[nkeys - 1], for_write);
-    if (!elv.is<LValue *>())
-        throw NotLValueEx(lstart, lend);
-    return slot_rmw(*elv.get<LValue *>(), op, value);
+    /* The FINAL store's throws (subscript OOB/KeyNotFound, slot_rmw type) are
+     * loc-less; stamp them the OUTERMOST subscript's caret. */
+    try {
+        Type *t = inner->get().get_type();
+        const bool for_write = (op == Op::assign);
+        EvalValue elv = t->subscript(cur, keys[nkeys - 1], for_write);
+        if (!elv.is<LValue *>())
+            throw NotLValueEx(fs, fe);
+        return slot_rmw(*elv.get<LValue *>(), op, value);
+    } catch (Exception &e) {
+        if (!e.loc_start) { e.loc_start = fs; e.loc_end = fe; }
+        throw;
+    }
 }
 
 /* Read scalar field #fidx of element `idx` of a flat array<PodStruct> straight

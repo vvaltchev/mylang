@@ -3279,8 +3279,14 @@ gated on the inferencer's `MemberExpr::base_struct`; a **nested store**
 `a[i][j] = v` → **`StoreElem2V`** (`vm_nested_subscript_store` reads `a[i]` as a
 reference then stores `[j]` into it — a FLAT inner via the shared
 `flat_store_core`, a GENERAL inner via the element LValue; COW writes back
-through the inner element). Both ride the loc side table / member-key pool
-(AST-free). **A store's base may be a GLOBAL or CAPTURE container**, not only a
+through the inner element), the generic N-level `a[k0]..[kn] = v` →
+**`StoreElemChainV`** (`vm_subscript_chain_store` over a key temp run). Both are
+AST-free with **PER-STEP subscript carets** in the **`Chunk::chain_locs`** pool
+(a `{Loc,Loc}` per step, inside-out; a pointer, deref only on the throw path so
+the hot store stays cheap): an INTERMEDIATE `a[9]` OOB carets the inner
+subscript, the FINAL store the outer — byte-identical to the tree-walker's
+per-node stamp (this replaced an earlier single-outer-loc imprecision where an
+inner throw showed the whole `a[i][j]` span). **A store's base may be a GLOBAL or CAPTURE container**, not only a
 frame local: `as_container_base` (codegen) returns a slot **KIND** (0 local / 1
 global / 2 capture) which the store ops carry in `in.target`, and
 `vm_store_base`

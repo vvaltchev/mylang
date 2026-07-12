@@ -344,21 +344,20 @@ vm_struct_ctor_boxed(EvalContext &ctx, StructTypeDef *def, int_type base,
  * recursive frame). The caller wraps the loc-stamp. */
 static ML_NOINLINE void
 vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
-                  int_type nkeys, const EvalValue &val, Op op)
+                  const std::pair<Loc, Loc> *steplocs, size_t nkeys,
+                  const EvalValue &val, Op op)
 {
     if (nkeys <= 8) {
         EvalValue keybuf[8];
-        for (int_type k = 0; k < nkeys; k++)
-            keybuf[k] = ctx.frame->at(kbase + k).get();
-        vm_subscript_chain_store(base, keybuf, static_cast<size_t>(nkeys),
-                                 val, op, Loc(), Loc());
+        for (size_t k = 0; k < nkeys; k++)
+            keybuf[k] = ctx.frame->at(kbase + static_cast<int_type>(k)).get();
+        vm_subscript_chain_store(base, keybuf, nkeys, val, op, steplocs);
         return;
     }
-    std::vector<EvalValue> keyheap(static_cast<size_t>(nkeys));
-    for (int_type k = 0; k < nkeys; k++)
-        keyheap[k] = ctx.frame->at(kbase + k).get();
-    vm_subscript_chain_store(base, keyheap.data(), static_cast<size_t>(nkeys),
-                             val, op, Loc(), Loc());
+    std::vector<EvalValue> keyheap(nkeys);
+    for (size_t k = 0; k < nkeys; k++)
+        keyheap[k] = ctx.frame->at(kbase + static_cast<int_type>(k)).get();
+    vm_subscript_chain_store(base, keyheap.data(), nkeys, val, op, steplocs);
 }
 
 /* GENERAL nested lvalue-chain store (StoreLValueChainV): walk the mixed
@@ -1632,38 +1631,31 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* a[i][j] = v / OP= v (nested general store): read a[i] as a
              * reference then store [j] into it (two-level vm_subscript_store).
-             * AST-free: the outer subscript's caret comes from the side table. */
+             * AST-free: the per-step carets (inner k1, outer k2) come from the
+             * chain_locs pool (idx in a.lit), so an intermediate `a[i]` OOB and
+             * the final store carry their OWN subscript loc. */
             LValue &alv = ctx.frame->at(in.target2);
             const EvalValue &k1 = ctx.frame->at(in.a.slot).get();
             const EvalValue &k2 = ctx.frame->at(in.b.slot).get();
             const EvalValue &val = ctx.frame->at(in.target).get();
-            /* Loc looked up LAZILY on the throw path only (see DictStore). */
-            try {
-                vm_nested_subscript_store(&alv, k1, k2, val, in.aop,
-                                          Loc(), Loc());
-            } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk.loc_at(pc, e.loc_start, e.loc_end);
-                throw;
-            }
+            vm_nested_subscript_store(&alv, k1, k2, val, in.aop,
+                                      chunk.chain_locs[in.a.lit].data());
             pc++;
             break;
         }
 
         case OpCode::StoreElemChainV: {
             /* GENERIC N-level nested store a[k0][k1]...[kn] = v / OP= v: form the
-             * base LValue* (by slot kind), then walk the keys run. AST-free: the
-             * outer subscript's caret comes from the loc side table. */
+             * base LValue* (by slot kind = a.lit), then walk the keys run
+             * ([b.lit, +nkeys)). AST-free: the per-step subscript carets are in
+             * the chain_locs pool (idx in a.slot; nkeys = its size), so each
+             * step's throw carries ITS OWN subscript loc. */
             LValue *base = vm_store_base(ctx, in.a.lit, in.target2,
                                          chunk, pc, nullptr);
             const EvalValue &val = ctx.frame->at(in.target).get();
-            try {
-                vm_chain_store_op(ctx, base, in.b.lit, in.a.slot, val, in.aop);
-            } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk.loc_at(pc, e.loc_start, e.loc_end);
-                throw;
-            }
+            const auto &cl = chunk.chain_locs[in.a.slot];
+            vm_chain_store_op(ctx, base, in.b.lit, cl.data(), cl.size(),
+                              val, in.aop);
             pc++;
             break;
         }

@@ -433,17 +433,20 @@ LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
                          const Loc &mstart, const Loc &mend,
                          const Loc &bstart, const Loc &bend);
 
-/* VM (StoreElem2V): native NESTED store `a[i][j] = v` / `OP= v`. See eval.cpp. */
+/* VM (StoreElem2V): native NESTED store `a[i][j] = v` / `OP= v`. `locs[0]`/
+ * `locs[1]` are the inner/outer subscript carets (deref only on a throw). See
+ * eval.cpp. */
 EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &key2,
                                     const EvalValue &value, Op op,
-                                    Loc lstart, Loc lend);
+                                    const std::pair<Loc, Loc> *locs);
 
 /* VM (StoreElemChainV): GENERIC N-level nested store `a[k0][k1]...[kn] = v` /
- * `OP= v`; `keys` are base-to-innermost. See eval.cpp. */
+ * `OP= v`; `keys` + `steplocs` are base-to-innermost (steplocs[k] is that
+ * subscript's caret). See eval.cpp. */
 EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
                                    size_t nkeys, const EvalValue &value, Op op,
-                                   Loc lstart, Loc lend);
+                                   const std::pair<Loc, Loc> *steplocs);
 
 /* VM (MapFilterV) + tree-walker shared map/filter core: apply a (pre-validated)
  * function to each element of a container. See eval.cpp. */
