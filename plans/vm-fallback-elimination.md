@@ -561,14 +561,19 @@ The script-mode constructs that STILL keep an `ast_nodes` entry (an
 -likely-to-appear first. These are what remains between "bench/samples are 100%
 native" and "ALL scripts serialize with an empty `ast_nodes`".
 
-1. **AST builtins in value/statement position** (`EvalToSlot`, `eval_to_temp`,
-   codegen.cpp ~2889; a discarded one → `EvalStmt`). `defined(x)` ALWAYS (its
-   arg is unevaluated, so no `func_v` — `try_native_builtin` declines at 2229).
-   `isconst`/`isconstdecl`/`ispure`/`ispuredecl` and `type`/`decltype`/
-   `typestr`/`kindstr` ONLY when not compile-time-folded (an `Unknown`-typed
-   arg, or `-nti`); normally they fold/elide, so the live residual is essentially
-   `defined`. `show` is compile-rejected in scripts (dev-only), so it never
-   reaches script bytecode. — the most common real-code residual.
+1. **AST builtins in value/statement position** — ✅ **DONE (2026-07-13)** for
+   the live residual. `isconst`/`isconstdecl` always FOLD (`fold_isconst`);
+   `ispure`/`ispuredecl` are native (`make_builtin_v`, `func_v`);
+   `type`/`decltype`/`typestr`/`kindstr` fold/elide or are native (dual-ABI
+   `func_v`); `show` is compile-rejected in scripts (dev-only). `defined` was the
+   real holdout: `defined(local/param/capture/builtin)` folds to `true`,
+   `defined(global)` → `DefinedGlobalV`, and now `defined(<never-declared>)`
+   folds to `false` in a SCRIPT (`try_fold_defined` — the runtime map is empty +
+   asserted, so an unresolved name is never defined; byte-identical to
+   `arg->eval` → UndefinedId; NOT in the REPL, where it may be a live map
+   global — `AutoConst` gained a `repl_mode` flag). RESIDUAL: only a REPL
+   unresolved `defined`, and the rare `defined(<non-identifier>)` misuse
+   (`defined(a[0])`).
 2. **`const` reassignment of a runtime const** (a `const`-bound func/array being
    rebound) — must throw `CannotRebindConstEx`; `compile_boxed_stmt:1873` leaves
    it to the tree-walker.

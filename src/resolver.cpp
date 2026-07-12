@@ -308,12 +308,13 @@ class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
     AnalysisInfo *analysis;   /* -a: record auto-const/dead/folded, or null */
+    bool repl_mode;     /* REPL: an unresolved name may be a map global */
 
 public:
 
     explicit AutoConst(AnalysisInfo *a = nullptr,
-                       EvalContext *prior_pure = nullptr)
-        : cctx(nullptr, true), analysis(a)
+                       EvalContext *prior_pure = nullptr, bool repl = false)
+        : cctx(nullptr, true), analysis(a), repl_mode(repl)
     {
         /* REPL: seed the fold context with the prior inputs' effectively-pure
          * functions (and their template/spec instances) so a call to one folds
@@ -453,11 +454,14 @@ private:
      * three are sound in both script and REPL mode with no gating. A GLOBAL is
      * NOT foldable (its slot's defined-flag is set only when its decl executes -
      * `defined(g)` is false before that runs, true after - a genuine runtime
-     * property); an UNRESOLVED name (a live REPL map global, or a script typo)
-     * and a non-identifier arg are also left as a runtime `defined()` call.
-     * Returns true iff it folded. Closes the AST-builtin fold gap that made
-     * `s + defined(p)` emit a VM EvalToSlot (see plans/vm-fallback-
-     * elimination.md).
+     * property, left for DefinedGlobalV). An UNRESOLVED name folds to `false` in
+     * a SCRIPT (the runtime symbols map is empty + asserted, so it can never be
+     * defined at runtime; byte-identical to `arg->eval` yielding UndefinedId) -
+     * but NOT in the REPL, where it may be a live open-world map global. A
+     * non-identifier arg (`defined(a[0])`, a rare misuse) is still left as a
+     * runtime `defined()` call. Returns true iff it folded. Closes the
+     * AST-builtin fold gap that made `s + defined(p)` emit a VM EvalToSlot (see
+     * plans/vm-fallback-elimination.md).
      */
     bool try_fold_defined(unique_ptr<Construct> &slot, CallExpr *ce)
     {
@@ -465,11 +469,25 @@ private:
         if (!id)
             return false;
         const SymKind k = id->sym.kind;
-        if (k != SymKind::local && k != SymKind::capture
-                && k != SymKind::builtin)
-            return false;
-        MakeConstructFromConstVal(EvalValue(true), slot, false);
-        return true;
+        /* An ALWAYS-BOUND name (a param/local/capture, or a builtin) is defined
+         * -> fold to `true`. A GLOBAL is a genuine runtime property (its decl
+         * may not have run) -> left for DefinedGlobalV. */
+        if (k == SymKind::local || k == SymKind::capture
+                || k == SymKind::builtin) {
+            MakeConstructFromConstVal(EvalValue(true), slot, false);
+            return true;
+        }
+        /* An UNRESOLVED name in a SCRIPT is never defined at runtime (the
+         * runtime symbols map is empty and asserted so - see eval.h), so
+         * `defined(x)` is a constant `false` - eliminating the AST-builtin call.
+         * NOT in the REPL, where an unresolved name may be an open-world map
+         * global. `arg->eval` would return the UndefinedId sentinel, which is
+         * exactly what builtin_defined tests, so this is byte-identical. */
+        if (k == SymKind::unresolved && !repl_mode) {
+            MakeConstructFromConstVal(EvalValue(false), slot, false);
+            return true;
+        }
+        return false;
     }
 
     /*
@@ -1163,7 +1181,7 @@ public:
          * counts just collected; the top-level frame's in main_st.writes).
          * prior_pure seeds the fold context so cross-input pure calls fold. */
         if (auto *rb = dynamic_cast<Block *>(root))
-            AutoConst(analysis, prior_pure).run(rb, main_st.writes);
+            AutoConst(analysis, prior_pure, repl_mode).run(rb, main_st.writes);
     }
 
 private:

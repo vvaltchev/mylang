@@ -595,6 +595,21 @@ static const std::vector<test> tests =
     },
 
     {
+        /* defined() of a name NEVER declared folds to `false` at resolve time in
+         * a SCRIPT (the runtime symbols map is empty + asserted, so an unresolved
+         * name can never be defined) - eliminating the AST-builtin call. Result
+         * is byte-identical to the un-folded runtime defined() (== UndefinedId ->
+         * false); the differential VM run covers -vm. */
+        "defined() of a genuinely-undefined name folds to false",
+        {
+            "assert(defined(never_declared_anywhere) == 0);",
+            "var used = 0;",
+            "if (defined(missing_flag)) used = 1;",   /* dead branch dropped */
+            "assert(used == 0);",
+        },
+    },
+
+    {
         /* A template used as a VALUE (stored/passed, dispatched INDIRECTLY) is
          * NOT a dead base template: its indirect call runs the base body, so the
          * AOT compile keeps its chunk. A DIRECT call to the same template is
