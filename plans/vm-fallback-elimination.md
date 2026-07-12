@@ -553,6 +553,64 @@ real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
   the rvalue), and an uninitialized typed decl is already a zero-value/zero-ctor
   rvalue at parse. STILL fallback: an int/float-typed decl fed a `dyn` value
   (left to the coerce).
+
+### CANONICAL residual fallback list (2026-07-13, after step (h))
+
+The script-mode constructs that STILL keep an `ast_nodes` entry (an
+`EvalStmt`/`EvalToSlot`/`JumpIfFalse`), assessed from the codegen dispatch, most
+-likely-to-appear first. These are what remains between "bench/samples are 100%
+native" and "ALL scripts serialize with an empty `ast_nodes`".
+
+1. **AST builtins in value/statement position** (`EvalToSlot`, `eval_to_temp`,
+   codegen.cpp ~2889; a discarded one → `EvalStmt`). `defined(x)` ALWAYS (its
+   arg is unevaluated, so no `func_v` — `try_native_builtin` declines at 2229).
+   `isconst`/`isconstdecl`/`ispure`/`ispuredecl` and `type`/`decltype`/
+   `typestr`/`kindstr` ONLY when not compile-time-folded (an `Unknown`-typed
+   arg, or `-nti`); normally they fold/elide, so the live residual is essentially
+   `defined`. `show` is compile-rejected in scripts (dev-only), so it never
+   reaches script bytecode. — the most common real-code residual.
+2. **`const` reassignment of a runtime const** (a `const`-bound func/array being
+   rebound) — must throw `CannotRebindConstEx`; `compile_boxed_stmt:1873` leaves
+   it to the tree-walker.
+3. **Two residual inc-dec / store shapes** — a dyn **MEMBER** inc-dec (`d.f++`,
+   almost always a `NotLValueEx` on a POD field), and a member-in-the-middle
+   nested store (`d.a[0].f = v`, a genuine `NotLValueEx` path in both engines).
+4. **`foreach` where all six handlers decline** — a non-local loop/unpack var
+   (global/capture), an **indexed** dyn-container foreach, a **>2-var** dyn
+   foreach, a container not proven array/str/dict/dyn (an `opt` container, or a
+   struct-typed one outside the flat-struct fast path), or a body
+   `compile_scalar_body` can't lower.
+5. **`for` / `for-range` declines** — a **float loop var** (for-range doesn't
+   specialize it yet), or an init/cond/inc/body that can't lower.
+6. **`InlinedCallExpr` whose `return` crosses a `try` INSIDE the boundary** —
+   rare; the scoped-return-boundary lowering bails.
+7. **Non-scope-free `Block`** — a block declaring a capturing closure / nested
+   named func, or overflowing the slot budget: it needs its own `EvalContext`
+   (which `vm_run_chunk` doesn't build), so only `scope_free` blocks inline
+   (`gen_stmt:5327`).
+8. **Capturing named func decl** — bound to a *local* slot via `declare_masking`
+   (not a global slot), so the `MakeClosureV`+`StoreGlobalV` path (global-only,
+   `gen_stmt:5269`) declines. Plus the edge declines of `throw`/`try`/`return`
+   on an un-liftable value/flow.
+
+**NOT a distinct category (a clarification of an earlier note):**
+- **"Nested-in-native"** — `compile_scalar_body` deliberately lets a *flow-free*
+  statement it can't lower run as an `EvalStmt` INSIDE an otherwise-native loop
+  (rather than failing the whole loop), keeping the loop native around it. That
+  is a good *mechanism*, but the fallback statement itself is STILL one of
+  1–8 above and STILL keeps an `ast_nodes` entry — so for the empty-`ast_nodes`
+  goal it is NOT free; it is exactly residual 1–8 relocated into a loop body.
+  (The earlier "not a real script gap" phrasing was about the loop-nativization
+  mechanism, not the serialization count — corrected here.)
+- **REPL-only** — every top-level `FuncDecl`/`StructDecl`/global assign is
+  map-resident in the REPL, so all fall back; a *script* slots them natively.
+  Irrelevant to `.myv`.
+- **Whole-function tree-walk** (coarser than an `EvalStmt`): a function whose
+  body is non-scope-free (captures / nests a func — i.e. residual 7/8 at the
+  body level) gets NO chunk at all (`codegen_func_body`'s gate) and runs entirely
+  tree-walked. That function has zero bytecode, a *bigger* serialization gap than
+  a single `EvalStmt`, and is tied to residuals 7/8.
+
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then
