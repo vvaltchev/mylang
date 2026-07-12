@@ -2185,6 +2185,15 @@ static const std::vector<test> tests =
       { "var x = 5; var y = x++ + ++x; assert(y == 12 && x == 7);",
         "var a = [1.0, 2.0]; var p = a[0]++; var q = --a[1];",
         "assert(p == 1.0 && a[0] == 2.0 && q == 1.0 && a[1] == 1.0);" } },
+    /* inc-dec as a VALUE on a proven int/float MEMBER or NESTED subscript is
+     * native too (read the lvalue, then the compound-store mutate). */
+    { "++/--: as a value on a member / nested subscript (native VM path)",
+      { "struct P { int x; float y; } var p = P(5, 1.5);",
+        "var o = p.x++; assert(o == 5 && p.x == 6);",
+        "var q = ++p.x; assert(q == 7 && p.x == 7);",
+        "var r = p.y++; assert(r == 1.5 && p.y == 2.5);",
+        "var b = [[1, 2], [3, 4]]; var s = b[0][1]++;",
+        "assert(s == 2 && b[0][1] == 3);" } },
     { "++/--: on a struct field",
       { "struct P { int x; int y; }",
         "var p = P(1, 2); var o = p.x++; assert(o == 1 && p.x == 2);",

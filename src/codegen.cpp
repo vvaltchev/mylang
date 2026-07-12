@@ -312,9 +312,31 @@ bool incdec_lvalue_pure(const Construct *lv)
                 || id->sym.kind == SymKind::capture);
     if (const Subscript *sub = dynamic_cast<const Subscript *>(lv)) {
         Operand idx;
+        /* A flat `a[i]` (slot base + immediate index), OR a NESTED `a[i][j]`
+         * whose inner base `a[i]` is a Subscript over a slotted array with an
+         * immediate index - both re-eval the same side-effect-free slot/index
+         * in the read and the store. */
+        if (const Subscript *inner =
+                dynamic_cast<const Subscript *>(sub->what.get())) {
+            Operand k1, k2;
+            return dynamic_cast<const Identifier *>(inner->what.get())
+                && as_int_operand(inner->index.get(), k1)
+                && as_int_operand(sub->index.get(), k2);
+        }
         return sub->base_array
             && (sub->th == TypeHint::i || sub->th == TypeHint::f)
             && as_int_operand(sub->index.get(), idx);
+    }
+    /* A struct/dict field on a slotted-id base (`p.x`, `d.k`): the value read
+     * (MemberV) + the mutate (StoreMemberV/DictStore) both re-eval `p`, a
+     * side-effect-free slot read. The emit_mut `th`-gate keeps a dyn field on
+     * the fallback (inc-dec is int/float-only). */
+    if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(lv)) {
+        const Identifier *base = dynamic_cast<const Identifier *>(m->what.get());
+        return (m->base_struct || m->base_dict) && base
+            && (base->sym.kind == SymKind::local
+                || base->sym.kind == SymKind::global
+                || base->sym.kind == SymKind::capture);
     }
     return false;
 }
