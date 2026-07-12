@@ -3971,9 +3971,16 @@ storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 / zero-struct ctor rvalue, so it lowers the same way.
 
 **Residual `EvalStmt`:** the harder niche shapes (an optional `d?.f++`);
-an `InlinedCallExpr` whose
-return crosses a try INSIDE the boundary (rare); and the dev-only **`show`**
+and the dev-only **`show`**
 (script-excluded by `reject_dev_builtins`, so never in serialized bytecode).
+The `InlinedCallExpr` return-across-try residue is CLOSED: a `return`
+crossing trys INSIDE the inline boundary inlines each crossed try's
+handler-pop + finally at the return (bounded at the BOUNDARY, not the
+function — the same `inline_crossed_finallys` chaining a real return uses,
+with the value copied to a protected temp before the finallys), then yields
+via the boundary's MoveV+Jump. Flow across NESTED trys (any depth) was
+already fully chained by `inline_crossed_finallys` — pinned by a
+2-finally break/return test.
 None appear in `bench/` or `samples/` (both stay 100% native). The `_`-in-unpack
 / indexed dict `foreach`, the ≥3-level SUBSCRIPT nested store, the **general
 member/subscript lvalue-chain store** (`a[i].f=v` / `q.p.x=v` / `d.a[0].f=v`),

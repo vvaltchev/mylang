@@ -3600,6 +3600,39 @@ static const std::vector<test> tests =
         "func f(a) { g = 99; return 100 / a; }",
         "func c(n) { var y = f(n); return y; }",
         "c(0);" }, &typeid(DivisionByZeroEx) },
+    /* A `return` CROSSING a try INSIDE the inline boundary: the crossed
+     * finally is inlined at the return (bounded at the BOUNDARY, not the
+     * function), then the value - copied to a protected temp BEFORE the
+     * finally, which may overwrite it - yields the expression. Was the
+     * InlinedCallExpr fallback residue; now native on the VM. */
+    { "block-inline: a return crossing a try/finally inside the boundary",
+      { "var t = 0;",
+        "func g(x) { try { return x + 1; } finally { t++; } }",
+        "var y = g(5);",
+        "assert(y == 6); assert(t == 1);",
+        "assert(g(9) == 10); assert(t == 2);" } },
+    { "block-inline: the crossed finally overwriting the value is too late",
+      { "var t = 0;",
+        "func g() { try { return t; } finally { t = 5; } }",
+        "var y = g();",
+        "assert(y == 0);",              /* the OLD t, copied pre-finally */
+        "assert(t == 5);" } },
+    /* Flow crossing NESTED trys (2 finallys) is fully chained - break AND
+     * return pop each handler + run each finally innermost-first (the old
+     * one-try limit is gone; pinned here since no test covered depth 2). */
+    { "try: break and return crossing TWO finallys chain both",
+      { "var lg = \"\"; var i = 0;",
+        "while (i < 3) {",
+        "  try { try { i++; if (i == 2) break; lg += \"a\"; }",
+        "        finally { lg += \"1\"; } }",
+        "  finally { lg += \"2\"; }",
+        "}",
+        "assert(lg == \"a1212\"); assert(i == 2);",
+        "func f() {",
+        "  try { try { return \"R\"; } finally { lg += \"x\"; } }",
+        "  finally { lg += \"y\"; }",
+        "}",
+        "assert(f() == \"R\"); assert(lg == \"a1212xy\");" } },
     /* A NESTED inlined error: a tree-recursive `f` unrolls (its self-calls
      * inline), so an error deep in an inlined self-call reconstructs a chain of
      * virtual `f$0` frames. Exercises the VM's flattened inline_frames pool

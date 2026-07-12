@@ -2738,17 +2738,11 @@ struct Codegen {
      * rolls back to the EvalStmt fallback.
      */
     /*
-     * P8 Inc 2c step 3: emit a break/continue, crossing at most ONE enclosing
-     * try (popping its handler + routing through its finally). Returns false if
-     * it crosses MORE than one try (handler-pop + finally chaining not yet
-     * supported) - the caller then fails the whole body so the region
-     * tree-walks. Precondition: loops non-empty (checked by the caller).
-     */
-    /*
      * P8 Inc 2c: at a flow op (return / break / continue) that crosses the
      * innermost `crossed` trys, INLINE each crossed try's handler-pop + finally
-     * here, innermost first. Interleaving the pops with the finallys gives the
-     * correct throw-in-finally-during-unwind semantics: while T_i's finally
+     * here, innermost first — ANY nesting depth (each level chains). The
+     * interleaved pops give the correct throw-in-finally-during-unwind
+     * semantics: while T_i's finally
      * runs, T_i's handler is popped but the OUTER trys' handlers stay live, so
      * a throw in T_i's finally dispatches to the enclosing handler (like the
      * tree-walker). A crossed try's finally is compiled with the exited trys
@@ -2829,16 +2823,37 @@ struct Codegen {
 
         /* Inside an INLINED-CALL boundary: a `return v` doesn't ReturnV the
          * chunk - it yields v as this expression's value (MoveV into the
-         * boundary's rslot) then JUMPs to the body's end. Only when the return
-         * crosses NO try inside the boundary (trys.size() == try_base): a
-         * finally between the return and the boundary would need inlining up to
-         * the boundary (not the function), which is left to the fallback. */
+         * boundary's rslot) then JUMPs to the body's end. A return that
+         * crosses trys INSIDE the boundary (trys.size() > try_base) inlines
+         * each crossed try's handler-pop + finally first - bounded at the
+         * BOUNDARY, not the function - exactly like a real return's crossed
+         * finallys (the value is copied to a protected temp beforehand, since
+         * a finally may overwrite it), mirroring InlinedCallExpr::do_eval's
+         * FlowState-swap + the try scope guards. */
         if (!inline_returns.empty()) {
             InlineRet &ir = inline_returns.back();
-            if (trys.size() != ir.try_base) {
-                ops.resize(mark);
-                next_temp = save_top;
-                return false;
+            const size_t crossed = trys.size() - ir.try_base;
+            if (crossed > 0) {
+                const int vtmp = alloc_temp();
+                Instr cp;
+                cp.op = OpCode::MoveV;
+                cp.target = vtmp;
+                cp.target2 = vslot;
+                ops.push_back(cp);
+
+                const int saved_base = temp_base;
+                temp_base = vtmp + 1;
+                if (temp_base > max_temp)
+                    max_temp = temp_base;
+                next_temp = temp_base;
+                const bool ok = inline_crossed_finallys(crossed);
+                temp_base = saved_base;
+                if (!ok) {
+                    ops.resize(mark);
+                    next_temp = save_top;
+                    return false;
+                }
+                vslot = vtmp;            /* the boundary reads the copy */
             }
             Instr mv;
             mv.op = OpCode::MoveV;
@@ -4317,8 +4332,9 @@ struct Codegen {
                     continue;
                 }
                 /* Inside an INLINED-CALL boundary a return MUST be redirected
-                 * (yield the expr value); try_native_return declined (a try
-                 * crossed within the boundary), and the fallback EvalStmt would
+                 * (yield the expr value); try_native_return declined (an
+                 * uncompilable return value or crossed finally), and the
+                 * fallback EvalStmt would
                  * wrongly ReturnV the whole chunk - so fail the body and let the
                  * entire InlinedCallExpr tree-walk (byte-identical). */
                 if (!inline_returns.empty()) {

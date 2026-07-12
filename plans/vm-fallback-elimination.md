@@ -833,7 +833,20 @@ is deleted.
    (measured: `s += runtime(2.5)` stores 2.5 in BOTH engines - the
    documented op==assign-only coerce), so those lower as-is. Pool-test
    case (f) + a caret pin + float/global/bool-widen tests.
-7. Nested-try flow (chained finally inlining) + inline-return-across-try.
+7. ✅ **DONE (2026-07-14)** Nested-try flow + inline-return-across-try.
+   AUDIT CORRECTION: flow across NESTED trys was ALREADY general —
+   `inline_crossed_finallys` chains every crossed try's handler-pop +
+   finally innermost-first at any depth (the "at most ONE try" comment
+   was STALE; deleted, behavior pinned by a 2-finally break/return
+   test). The real residue was the `InlinedCallExpr` return crossing a
+   try INSIDE the boundary (reachable: a ≤CALL_WEIGHT body like
+   `func g(x) { try { return x+1; } finally { t++; } }` block-inlines;
+   its return bailed the whole inline to EvalStmt). Now
+   `try_native_return`'s boundary branch inlines the crossed finallys
+   (bounded at try_base, value copied to a protected temp first — the
+   finally may overwrite it, pinned) then MoveV+Jump. The
+   compile_scalar_body decline path stays as the safety for an
+   uncompilable value/finally.
 8. Foreach residual shapes (indexed dyn, >2-var dyn, unproven container).
 9. Restructure gen_if/gen_while onto per-statement granularity, then DELETE
    each Tier-1 site as its residue provably empties.
