@@ -844,6 +844,38 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::IncDecCheckedV: {
+            /* A dyn/general scalar `--d`/`d++`: throw if not int/float
+             * (inc-dec is int/float-ONLY), else apply +-1 in place. Slot kind:
+             * 0 local / 1 global (defined-guarded) / 2 capture. */
+            LValue *lvp;
+            if (in.target2 == 1) {
+                if (!ctx.gfuncs->defined[in.target]) {
+                    Loc s, en;
+                    chunk.loc_at(pc, s, en);
+                    throw UndefinedVariableEx(
+                        ctx.gfuncs->names[in.target]->val, s, en);
+                }
+                lvp = &ctx.gfuncs->slots[in.target];
+            } else if (in.target2 == 2) {
+                lvp = &(*ctx.captures)[in.target];
+            } else {
+                lvp = &ctx.frame->at(in.target);
+            }
+            LValue &lv = *lvp;
+            EvalValue nv = lv.get();
+            if (!nv.is<int_type>() && !nv.is<float_type>()) {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
+                throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
+            }
+            num_bin_op(nv, EvalValue(static_cast<int_type>(1)),
+                       binop_pmf(in.a.lit ? Op::plus : Op::minus));
+            lv.put(std::move(nv));
+            pc++;
+            break;
+        }
+
         case OpCode::IntBin: {
 
             const int_type a = read_int_operand(in.a, &ctx);

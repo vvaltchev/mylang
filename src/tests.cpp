@@ -2244,6 +2244,21 @@ static const std::vector<test> tests =
       { "var dyn d = 5; d++; assert(d == 6); --d; assert(d == 5);" } },
     { "++/--: a dyn holding a non-number throws at runtime",
       { "var dyn d = \"s\"; d++;" }, &typeid(TypeErrorEx) },
+    /* A DYN scalar inc-dec is native (VM: IncDecCheckedV) and int/float-CHECKED
+     * — a compound `+= 1` would string-concat, but `++` must throw. Covers a
+     * local, a global (a function reads it), and a capture; float too. */
+    { "++/--: dyn scalar is int/float-checked (local/global/capture)",
+      { "var dyn a = 5; a++; --a; a++; assert(a == 6);",
+        "var dyn fl = 2.5; fl++; assert(fl == 3.5);",
+        "var dyn g = 10; func rg() { return g; } g++; assert(g == 11);",
+        "func mk() { var dyn c = 1; return func[c]() { c++; return c; }; }",
+        "var ctr = mk(); assert(ctr() == 2); assert(ctr() == 3);" } },
+    /* Regression: a TOP-LEVEL global dyn `++` on a non-number ran StoreGlobalV-
+     * compound (concat `"s1"`) instead of throwing — a latent VM/tree-walker
+     * divergence, now IncDecCheckedV. Both engines throw. */
+    { "++/--: a top-level global dyn on a string throws (not concat)",
+      { "var dyn g = \"s\"; func rg() { return g; } g++;" },
+      &typeid(TypeErrorEx) },
 
     /* dyn-into-concrete COERCION: `int + dyn` is `dyn` (the natural result), but
      * a `dyn` value is ASSIGNABLE to a concrete NUMERIC local - a runtime-checked

@@ -75,6 +75,17 @@ enum class OpCode : unsigned char {
     IntBin,
 
     /*
+     * A DYN/general inc-dec STATEMENT `--d`/`d++` on a scalar slot: `target` =
+     * the slot, `target2` = the slot KIND (0 local / 2 capture), `a.lit` = 1 for
+     * `++` / 0 for `--`. Reads the value, THROWS TypeErrorEx (loc side table) if
+     * it isn't int/float — inc-dec is int/float-ONLY, unlike a compound `+= 1`
+     * (which would concat a string) — then applies ±1 and writes back. The
+     * value is discarded (statement). A proven int/float local is handled by
+     * IntBin/FloatBin; a struct/dict MEMBER or subscript dyn inc-dec falls back.
+     */
+    IncDecCheckedV,
+
+    /*
      * Fused compare-and-branch: if NOT (a <aop> b) then pc = target, else fall
      * through. a/b are int Operands, aop a comparison Op. One dispatch replaces
      * the tree-walker's eval_cond -> TypedScalarExpr -> Identifier chain (this

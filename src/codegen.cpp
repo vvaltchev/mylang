@@ -1631,18 +1631,45 @@ struct Codegen {
                 dynamic_cast<const Identifier *>(inc->lvalue.get());
             if (id && !id->is_const
                 && (id->decl_type == DeclType::none
-                    || id->decl_type == DeclType::dyn)
-                && (id->sym.kind == SymKind::global
-                    || id->sym.kind == SymKind::capture)) {
-                Instr in;
-                in.op = id->sym.kind == SymKind::global
-                            ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
-                in.node_idx = add_ast_node(s);
-                in.target = id->sym.slot;
-                in.a = int_lit(1);
-                in.aop = inc->is_inc ? Op::plus : Op::minus;
-                ops.push_back(in);
-                return true;
+                    || id->decl_type == DeclType::dyn)) {
+                const bool numeric = inc->th == TypeHint::i
+                                  || inc->th == TypeHint::f;
+                /* A PROVEN int/float global/capture -> StoreGlobalV/StoreCaptureV
+                 * compound (`x += 1`; the operand is numeric so `+` == inc-dec).
+                 * A proven int/float LOCAL was handled by compile_int/float_stmt
+                 * (IntBin/FloatBin) before this. */
+                if (numeric && (id->sym.kind == SymKind::global
+                                || id->sym.kind == SymKind::capture)) {
+                    Instr in;
+                    in.op = id->sym.kind == SymKind::global
+                                ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
+                    in.node_idx = add_ast_node(s);
+                    in.target = id->sym.slot;
+                    in.a = int_lit(1);
+                    in.aop = inc->is_inc ? Op::plus : Op::minus;
+                    ops.push_back(in);
+                    return true;
+                }
+                /* A DYN/general scalar (local/global/capture) -> the int/float-
+                 * CHECKED inc-dec: a compound `+= 1` would CONCAT a string, but
+                 * `d++` must THROW (inc-dec is int/float-only). */
+                if (!numeric) {
+                    int kind;
+                    switch (id->sym.kind) {
+                    case SymKind::local:   kind = 0; break;
+                    case SymKind::capture: kind = 2; break;
+                    case SymKind::global:  kind = 1; break;
+                    default: return false;      /* builtin / unresolved */
+                    }
+                    Instr in;
+                    in.op = OpCode::IncDecCheckedV;
+                    in.node_idx = add_ast_node(s);   /* TypeError caret */
+                    in.target = id->sym.slot;
+                    in.target2 = kind;
+                    in.a = int_lit(inc->is_inc ? 1 : 0);
+                    ops.push_back(in);
+                    return true;
+                }
             }
             return false;
         }
@@ -5199,6 +5226,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreElemValue:
         case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
         case OpCode::StoreElemChainV: /* node = the outer Subscript (its caret) */
+        case OpCode::IncDecCheckedV:  /* node = the inc-dec (TypeError caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::MakeStructArrayV: /* node = a ctor (defensive coerce loc) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
