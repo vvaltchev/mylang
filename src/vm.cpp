@@ -2322,6 +2322,23 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
+        case OpCode::CoerceNumV:
+            /* dst = coerce_to_decl_type(src, i/f): the typed-store numeric
+             * coerce (the coerces_dyn accumulator's plain assign) - widen
+             * float <- int/bool / int <- bool, pass none, THROW TypeError on
+             * a non-fitting dyn value. Caret = the Expr14 span (loc table),
+             * matching the tree-walker's stamp. */
+            try {
+                ctx.frame->at(in.target).put(
+                    vm_coerce_decl_num(ctx.frame->at(in.a.slot).get(),
+                                       in.target2 != 0));
+            } catch (Exception &e) {
+                vm_stamp_loc(chunk, pc, e);
+                throw;
+            }
+            pc++;
+            break;
+
         case OpCode::BinOpV: {
             /* Clone the left operand, then num_bin_op mutates the clone (so
              * `a + b` never corrupts a) - byte-identical to the tree-walker's

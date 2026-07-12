@@ -2454,6 +2454,26 @@ static const std::vector<test> tests =
     { "dyn value into an int local: a float doesn't narrow, throws",
       { "func acc(x) { var s = 0; s = s + x; return s; }",
         "acc(runtime(2.5));" }, &typeid(TypeErrorEx) },
+    /* The coerces_dyn store is NATIVE under -vm (CoerceNumV - it was the last
+     * EvalStmt in an accumulator body): the narrowing throw's caret is the
+     * whole `s = s + v` Expr14 span, byte-identical in both engines. */
+    { "err loc: the dyn-narrowing coerce marks the whole assignment",
+      { "func acc(v) { var s = 0; s = s + v; return s; }",
+        "acc(runtime(2.5));" }, &typeid(TypeErrorEx), 26, 1, 35, 1 },
+    /* A FLOAT accumulator widens a dyn int (float <- int), and a GLOBAL
+     * coerces_dyn accumulator (a function reads it) stores through the
+     * global table with the same coerce. */
+    { "dyn coerces into float and GLOBAL numeric accumulators",
+      { "func facc(v) { var f = 0.5; f = f + v; return f; }",
+        "assert(facc(runtime(2)) == 2.5);",
+        "var g = 0;",
+        "func rg() { return g; }",
+        "var dyn d = runtime(5);",
+        "g = g + d;",
+        "assert(rg() == 5);",
+        "var dyn t = runtime(true);",
+        "func iacc(v) { var s = 0; s = s + v; return s; }",
+        "assert(iacc(t) == 1);" } },     /* bool widens into the int acc */
     { "int(x) is the explicit narrowing cast for a dyn arithmetic operand",
       { "func acc(x) { var s = 0; s = s + int(x); return s; }",
         "assert(acc(runtime(2.5)) == 2);" } },
@@ -14156,6 +14176,17 @@ ast_node_pool_minimal()
                   "var r = defined(a[0]);"}, defd))
         return false;
     if (!defd.node_table.empty() || !table_valid(defd))
+        return false;
+
+    /* (f) the coerces_dyn accumulator store (`s = s + d`, d dyn) lowers
+     * AST-free (CoerceNumV; it was an EvalStmt - the last fallback in a
+     * plain accumulator body). */
+    Chunk coerce;
+    if (!compile({"var dyn d = runtime(2);",
+                  "var s = 0;",
+                  "s = s + d;"}, coerce))
+        return false;
+    if (!coerce.node_table.empty() || !table_valid(coerce))
         return false;
 
     /* (d) EmplaceStruct (append(struct_arr, Ctor(..))) is AST-FREE: the ctor

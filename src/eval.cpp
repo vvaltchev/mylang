@@ -2907,6 +2907,14 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
     return v;
 }
 
+/* VM (CoerceNumV): the typed-store numeric coerce - the SAME
+ * coerce_to_decl_type the tree-walker's op==assign path runs, so the widen /
+ * pass-none / narrowing-throw behavior is byte-identical by construction. */
+EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float)
+{
+    return coerce_to_decl_type(v, is_float ? DeclType::f : DeclType::i);
+}
+
 /*
  * VM P2/P4: native SUBSCRIPT element store `c[k] = v` / `c[k] OP= v` for a dict
  * (P2) OR a general array (P4). `base_lv` = the container's LValue (a slot),

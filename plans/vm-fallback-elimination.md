@@ -819,7 +819,17 @@ is deleted.
    lowers); `for (;;)` is an unconditional native loop (exit via
    break/return); a boxed inc (`out += "x"`) uses the three-tier
    statement dispatch. Four new tests incl. the order pin.
-6. Typed i/f decl/assign coerce store (a coerce flag on the store path).
+6. ✅ **DONE (2026-07-14)** Typed i/f coerce store → **`CoerceNumV`**
+   (dst = coerce_to_decl_type(src) — the exported vm_coerce_decl_num, so
+   widen/none/narrow-throw is byte-identical by construction; a LOCAL
+   lvalue fuses coerce+store, a global/capture coerces into a temp; caret
+   = the Expr14 span via the loc table). The live producer is the
+   coerces_dyn accumulator (`var s = 0; s = s + d`) — the last EvalStmt
+   in a plain accumulator body; an EXPLICIT `int x = <dyn>` is
+   compile-rejected (TypeMismatchEx) and a COMPOUND doesn't coerce
+   (measured: `s += runtime(2.5)` stores 2.5 in BOTH engines - the
+   documented op==assign-only coerce), so those lower as-is. Pool-test
+   case (f) + a caret pin + float/global/bool-widen tests.
 7. Nested-try flow (chained finally inlining) + inline-return-across-try.
 8. Foreach residual shapes (indexed dyn, >2-var dyn, unproven container).
 9. Restructure gen_if/gen_while onto per-statement granularity, then DELETE

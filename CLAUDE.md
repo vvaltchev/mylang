@@ -3905,18 +3905,24 @@ plain `StoreGlobalV`/`StoreCaptureV`/`DeclConstV`/retarget store, NOT an
 type EXCEPT `int`/`float`** (`eval.cpp` — it returns the value unchanged; the
 type is proven at compile time by the inferencer), and the tree-walker's
 decl path only calls the coerce for `DeclType::i`/`f` (`handle_single_expr14`).
-So `compile_boxed_stmt`'s decl-type gate now declines ONLY `i`/`f` (which need
-the runtime numeric widen / dyn-narrow throw and whose native scalar case is
-already handled by `compile_int/float_stmt`); everything else falls through to
-the ordinary boxed store, byte-identical. A typed array/dict keeps its FLAT
+The `i`/`f` decline is gone too: a typed int/float PLAIN assign fed a boxed
+value now lowers to **`CoerceNumV`** (dst = `coerce_to_decl_type(src)` — the
+widen / pass-none / dyn-narrowing-throw, the exact function the tree-walker
+runs; for a LOCAL lvalue the op IS the store, a global/capture store coerces
+into a temp first; the Expr14-span caret rides the loc side table). Its live
+producer is the inferencer's `coerces_dyn` accumulator stamp — `var s = 0;
+s = s + d` was the last `EvalStmt` in a plain accumulator body (an EXPLICIT
+`int x = <dyn>` is compile-rejected, so it never reaches codegen). A COMPOUND
+(`s += d`) does NOT coerce (`handle_single_expr14` coerces `op == assign`
+only) and lowers as a plain `CompoundV`/`StoreGlobalV` compound.
+A typed array/dict keeps its FLAT
 storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 `LoadLiteralObjV` regardless of the decl), and an uninitialized `array<int> a;`
 / `str s;` / `Point p;` is already desugared (at parse) to a zero-value literal
 / zero-struct ctor rvalue, so it lowers the same way.
 
-**Residual `EvalStmt`:** the harder niche shapes (an **int/float**-typed decl
-fed a `dyn` value — left to the tree-walker for `coerce_to_decl_type`; an
-optional `d?.f++`); an `InlinedCallExpr` whose
+**Residual `EvalStmt`:** the harder niche shapes (an optional `d?.f++`);
+an `InlinedCallExpr` whose
 return crosses a try INSIDE the boundary (rare); and the dev-only **`show`**
 (script-excluded by `reject_dev_builtins`, so never in serialized bytecode).
 None appear in `bench/` or `samples/` (both stay 100% native). The `_`-in-unpack

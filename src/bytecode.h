@@ -618,6 +618,25 @@ enum class OpCode : unsigned char {
     BinOpV,
 
     /*
+     * slot[target] = coerce_to_decl_type(RValue(slot[a]), int/float) - the
+     * typed-store numeric coerce for a PLAIN assign to a `decl_type` i/f
+     * variable. The live producer of that shape is the inferencer's
+     * coerces_dyn accumulator stamp (`var s = 0; s = s + dyn` keeps `s` int
+     * and the store runtime-coerces the dyn value); an EXPLICIT `int x = dyn`
+     * is compile-rejected (TypeMismatchEx), so it never reaches codegen.
+     * WIDENs (float <- int/bool, int <- bool), passes `none`, THROWS
+     * TypeErrorEx on a non-fitting dyn runtime value (never narrows) - the
+     * exact coerce_to_decl_type the tree-walker's handle_single_expr14
+     * op==assign path runs. `target2` = 1 for float / 0 for int. For a LOCAL
+     * lvalue this op IS the store (target = the lvalue slot); a
+     * global/capture store coerces into a temp first. Caret via the loc side
+     * table (the whole Expr14 span, matching the tree-walker's stamp). A
+     * COMPOUND (`s += v`) does NOT coerce - handle_single_expr14 coerces
+     * op==assign only - so it lowers as a plain CompoundV/StoreGlobalV.
+     */
+    CoerceNumV,
+
+    /*
      * Materialize a baked const array/dict/struct literal (a LiteralObj):
      * slot[target] = eval_literal_obj(literal_objs[target2]) - an immutable
      * share or a fresh mutable deep clone (plus the general/flat_s cases). This

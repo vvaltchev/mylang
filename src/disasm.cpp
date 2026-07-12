@@ -823,6 +823,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::MoveV:
             row << "move         " << D(in.target) << " = " << D(in.target2);
             break;
+        case OpCode::CoerceNumV:
+            row << "coerce.num   " << D(in.target) << " = "
+                << (in.target2 ? "float(" : "int(") << RI(in.a, false)
+                << ")   ; typed-store widen/check";
+            break;
         case OpCode::BinOpV:
             row << "bin.v        " << D(in.target) << " = "
                 << RI(in.a, false) << " " << opsym(in.aop) << " "

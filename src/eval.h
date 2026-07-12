@@ -415,6 +415,12 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
                       const UniqueId *memUid, bool is_inc,
                       Loc mstart, Loc mend, Loc id_start, Loc id_end);
 
+/* VM (CoerceNumV): the typed-store numeric coerce - the same
+ * coerce_to_decl_type the tree-walker's op==assign path runs (widen float <-
+ * int/bool and int <- bool, pass none, THROW on a non-fitting dyn value).
+ * See eval.cpp. */
+EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float);
+
 /* Form the member LValue* of `dval.member` for a ROOTED base (a mutable boxed
  * struct field / a dict value); nullptr for a POD field / readonly / non-
  * struct-non-dict (a value read). Shared by vm_incdec_member and the VM's

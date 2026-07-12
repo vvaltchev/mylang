@@ -1901,18 +1901,21 @@ struct Codegen {
                     && lv->sym.kind != SymKind::global
                     && lv->sym.kind != SymKind::capture))
             return false;
-        /* A typed INT/FLOAT scalar target needs coerce_to_decl_type at the store
-         * (numeric WIDENING - float<-int/bool, int<-bool - or a runtime
-         * NARROWING throw for a dyn value whose type doesn't fit). The native
-         * scalar case is already handled by compile_int/float_stmt; a dyn rhs
-         * reaches here and is left to the tree-walker for the coerce. Every
-         * OTHER declared type (bool/str/array/dict/struct/typed-container)
-         * coerces to a NO-OP (coerce_to_decl_type returns the value unchanged -
-         * the type is proven at compile time), so a plain boxed store is
-         * byte-identical: allow it (`str s = ..`, `array<int> a = ..`,
-         * `Point p = P(..)`, ...). */
-        if (lv->decl_type == DeclType::i || lv->decl_type == DeclType::f)
-            return false;
+        /* A typed INT/FLOAT scalar target needs coerce_to_decl_type at the
+         * store on a PLAIN assign (numeric WIDENING - float<-int/bool,
+         * int<-bool - or a runtime NARROWING throw for a dyn value whose type
+         * doesn't fit): CoerceNumV, below. The live producer is the
+         * inferencer's coerces_dyn accumulator stamp (`var s = 0; s = s + d`
+         * with a dyn `d` - the proven-scalar case went to
+         * compile_int/float_stmt already, and an EXPLICIT `int x = <dyn>` is
+         * compile-rejected). A COMPOUND does NOT coerce
+         * (handle_single_expr14 coerces op==assign only), so it lowers below
+         * as a plain CompoundV / StoreGlobalV compound. Every OTHER declared
+         * type (bool/str/array/dict/struct/typed-container) coerces to a
+         * NO-OP, so a plain boxed store is byte-identical. */
+        const bool coerce_num = is_assign
+            && (lv->decl_type == DeclType::i
+                || lv->decl_type == DeclType::f);
         /* A CONST DECL (a const arr/dict/func kept as a runtime symbol; const
          * SCALARS are inlined, so never here). `pInConstDecl` on the Expr14
          * distinguishes it from a REASSIGN (which has no such flag and must
@@ -1985,6 +1988,20 @@ struct Codegen {
                     chunk.consts.resize(cmark);
                     return false;
                 }
+                /* A typed i/f target: coerce into a FRESH temp first (never
+                 * in place - rslot may be a live local, not a temp), then
+                 * store the coerced value. */
+                if (coerce_num) {
+                    const int ct = alloc_temp();
+                    Instr co;
+                    co.op = OpCode::CoerceNumV;
+                    co.node_idx = add_ast_node(s);   /* the Expr14 caret */
+                    co.target = ct;
+                    co.target2 = lv->decl_type == DeclType::f ? 1 : 0;
+                    co.a = slot_op(rslot);
+                    ops.push_back(co);
+                    rslot = ct;
+                }
                 Instr in;
                 in.op = store_op;
                 in.target = lv->sym.slot;   /* global-table / capture slot */
@@ -2035,6 +2052,19 @@ struct Codegen {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             return false;
+        }
+
+        /* A typed i/f LOCAL: CoerceNumV IS the store (dst = the lvalue slot,
+         * src = the compiled rvalue) - the retarget/MoveV is subsumed. */
+        if (coerce_num) {
+            Instr co;
+            co.op = OpCode::CoerceNumV;
+            co.node_idx = add_ast_node(s);           /* the Expr14 caret */
+            co.target = lv->sym.slot;
+            co.target2 = lv->decl_type == DeclType::f ? 1 : 0;
+            co.a = slot_op(rslot);
+            ops.push_back(co);
+            return true;
         }
 
         if (rslot != lv->sym.slot) {
@@ -5780,6 +5810,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::MapFilterV:     /* node = arg1 (unsupported-container caret) */
         case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
         case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
+        case OpCode::CoerceNumV:    /* node = the Expr14 (narrow-throw caret) */
         /* the checked inc-decs: dual carets in incdec_sites; the side-table
          * loc = the undefined-global-base caret (vm_store_base). */
         case OpCode::IncDecElemCheckedV:
