@@ -2259,6 +2259,29 @@ static const std::vector<test> tests =
     { "++/--: a top-level global dyn on a string throws (not concat)",
       { "var dyn g = \"s\"; func rg() { return g; } g++;" },
       &typeid(TypeErrorEx) },
+    /* A DYN-container element inc-dec `c[k]++` (VM: IncDecElemCheckedV) forms
+     * the element LValue and is int/float-CHECKED. Covers a dyn dict + a dyn
+     * general array, both ++ and --. */
+    { "++/--: dyn subscript element is int/float-checked",
+      { "func mkd() { var d = {\"a\": 1, \"b\": 2}; return d; }",
+        "var dyn dd = mkd(); dd[\"a\"]++; dd[\"b\"]--;",
+        "assert(dd[\"a\"] == 2); assert(dd[\"b\"] == 1);",
+        "var dyn e = [10, 20, 30]; e[1]++; --e[2];",
+        "assert(e[1] == 21); assert(e[2] == 29);" } },
+    /* A dyn dict element inc-dec on a STRING value throws (int/float-only). */
+    { "++/--: dyn dict element holding a string throws",
+      { "func mkd() { var d = {\"a\": \"s\"}; return d; }",
+        "var dyn dd = mkd(); dd[\"a\"]++;" }, &typeid(TypeErrorEx) },
+    /* A dyn dict element inc-dec on a MISSING key throws KeyNotFound (the read
+     * is non-vivifying, matching a compound `d[k] += 1`). */
+    { "++/--: dyn dict element on a missing key throws",
+      { "func mkd() { var d = {\"a\": 1}; return d; }",
+        "var dyn dd = mkd(); dd[\"z\"]++;" }, &typeid(KeyNotFoundEx) },
+    /* A dyn aliasing a FLAT array: its element has no boxed LValue, so an
+     * element inc-dec is a NotLValue error (byte-identical in both engines). */
+    { "++/--: dyn aliasing a flat array element is not an lvalue",
+      { "var a = [1, 2, 3]; var dyn e = a; e[0]++;" },
+      &typeid(NotLValueEx) },
 
     /* dyn-into-concrete COERCION: `int + dyn` is `dyn` (the natural result), but
      * a `dyn` value is ASSIGNABLE to a concrete NUMERIC local - a runtime-checked

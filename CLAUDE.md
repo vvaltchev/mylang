@@ -3740,15 +3740,31 @@ tree-walker's reused-object bind, so `append(o, p)` / `q = p` go native;
 scalar-field-only bodies keep the faster direct read), and a **compound
 multi-target assign** (`a, b += rhs` — `MultiUnpackV` gained a base op: each
 target reads its current value, applies the op with its element/scalar, writes
-back). A **dyn** inc-dec (any lvalue) stays on the fallback (the int/float-only
-runtime check).
+back). A **dyn SCALAR** inc-dec (`d++` on a dyn/general local/global/capture) is
+native via **`IncDecCheckedV`** (reads the value, THROWS `TypeErrorEx` unless
+int/float — inc-dec is int/float-ONLY, unlike a compound `+= 1` which would
+concat a string — then ±1), and a **dyn ELEMENT** inc-dec `c[k]++`/`c[k]--` (a
+dyn dict / general array / dyn base — anything NOT a proven flat int/float
+element, which `compile_int/float_stmt` already handle) via
+**`IncDecElemCheckedV`**: it forms the element LValue via the runtime
+`subscript(for_write=false)` and does the same int/float-checked ±1, mirroring
+`IncDecExpr::do_eval`'s dyn read-modify-write (a flat scalar element has no
+LValue → `NotLValueEx`, exactly as the tree-walker). It KEEPS its node (the
+IncDecExpr) — the only op that needs TWO distinct error carets the one-loc side
+table can't hold: the SUBSCRIPT loc for a subscript-internal throw
+(`KeyNotFound`/OOB) vs the INC-DEC loc for its own `NotLValue`/`const`/
+`TypeError` — reading `node->start/end` + its `Subscript` child's loc, byte-
+identical to the tree-walker. Only a dyn **MEMBER** inc-dec (`d.f++`) stays on
+the fallback (almost always a `NotLValueEx` on a POD field anyway).
 
-**Residual `EvalStmt`:** the harder niche shapes (an `append` to a struct MEMBER
-`append(s.f, x)`, a ≥3-level / member-subscript-member nested store
-`c[0][0][0]=v` / `d.a[0].f=v`, a dyn/member inc-dec statement, a `_`-in-unpack /
-3-var dict `foreach`); the **`InlinedCallExpr`** block form; and the dev-only
-**`show`** (script-excluded by `reject_dev_builtins`, so never in serialized
-bytecode). None appear in `bench/` or `samples/` (both stay 100% native).
+**Residual `EvalStmt`:** the harder niche shapes (a member-subscript-member
+nested store `d.a[0].f=v` — a genuine `NotLValueEx` path in both engines, a dyn
+**MEMBER** inc-dec statement `d.f++`); the **`InlinedCallExpr`** block form; and
+the dev-only **`show`** (script-excluded by `reject_dev_builtins`, so never in
+serialized bytecode). None appear in `bench/` or `samples/` (both stay 100%
+native). The `_`-in-unpack / indexed dict `foreach`, the ≥3-level nested store,
+the dyn scalar/element inc-dec, and `append` to a struct member are all now
+native (above).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index
@@ -3757,8 +3773,10 @@ has no AST pointer in its instruction stream. The pool holds ONLY the nodes an
 op still needs at RUNTIME: the fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`,
 `node->eval`), the builtin-call ops (`CallBuiltinV`/`LV`/`LVElem`,
 `EmplaceStruct`, `CheckFuncV`/`MapFilterV` — the args `ExprList` for per-arg
-carets), and the flat int/float element store (`node->start` for its OOB/div0
-caret). Built during codegen (`Codegen::add_ast_node` appends + returns the
+carets), `CallValueGenericV` (its args + callee), `IncDecElemCheckedV` (its
+DUAL error carets — subscript vs inc-dec loc, above), and the flat int/float
+element store (`node->start` for its OOB/div0 caret). Built during codegen
+(`Codegen::add_ast_node` appends + returns the
 index; the pool absorbs codegen rollbacks harmlessly), then **`extract_locs`
 nulls** the loc-only ops' `node_idx` (their caret is in the loc side table) and
 an explicit KEEP-list marks the genuine runtime-node ops, `default` nulling the

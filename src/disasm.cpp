@@ -589,6 +589,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "incdec.chk   " << D(in.target)
                 << (in.a.lit ? " ++" : " --") << "   ; dyn, int/float-checked";
             break;
+        case OpCode::IncDecElemCheckedV: {
+            static const char *bk[] = {"loc", "gbl", "cap"};
+            row << "incdec.elem  " << bk[in.target & 3] << "[" << in.target2
+                << "][" << RI(in.a, false) << "]"
+                << (in.aop == Op::plus ? " ++" : " --")
+                << "   ; dyn elem, int/float-checked";
+            break;
+        }
         case OpCode::MultiUnpackV: {
             row << "multi.unpack ";
             const std::vector<int32_t> &tg = chunk.unpack_targets[in.target];

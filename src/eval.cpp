@@ -2950,6 +2950,44 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
 }
 
 /*
+ * VM IncDecElemCheckedV: `c[k]++` / `c[k]--` on a DYN/unproven base. Mirrors
+ * IncDecExpr::do_eval's dyn read-modify-write path: form the element LValue via
+ * the runtime subscript(for_write=false) (a general array / dict has a boxed
+ * element; a flat scalar element has none -> NotLValueEx, matching the tree-
+ * walker), enforce int/float (inc-dec is int/float-ONLY - a string throws
+ * rather than concatenating), then apply ±1. The value is discarded (a
+ * statement). TWO distinct carets, exactly as the tree-walker: a subscript-
+ * internal throw (KeyNotFound/OOB) gets the SUBSCRIPT loc (`sub_*`), while the
+ * inc-dec's own checks (NotLValue/const/TypeError) get the INC-DEC loc (`id_*`).
+ */
+void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
+                    Loc sub_start, Loc sub_end, Loc id_start, Loc id_end)
+{
+    EvalValue elv;
+    try {
+        elv = base_lv->get().get_type()->subscript(
+            EvalValue(base_lv), key, /*for_write=*/false);
+    } catch (Exception &e) {
+        /* A subscript-internal throw (KeyNotFound/OOB) is loc-less; stamp the
+         * SUBSCRIPT loc (the tree-walker's stamp_operand_loc on the lvalue). */
+        if (!e.loc_start) { e.loc_start = sub_start; e.loc_end = sub_end; }
+        throw;
+    }
+    if (!elv.is<LValue *>())
+        throw NotLValueEx(id_start, id_end);
+    LValue *lv = elv.get<LValue *>();
+    if (lv->is_const_var())
+        throw CannotChangeConstEx(id_start, id_end);
+    EvalValue old = lv->get();
+    if (!old.is<int_type>() && !old.is<float_type>())
+        throw TypeErrorEx("'++'/'--' requires an int or float",
+                          id_start, id_end);
+    const EvalValue one{static_cast<int_type>(1)};
+    apply_compound_op(old, one, is_inc ? Op::addeq : Op::subeq);
+    lv->put(std::move(old));
+}
+
+/*
  * VM StoreMemberV: native `s.member = v` / `s.member OP= v` for a STRUCT base (a
  * dict member store goes through DictStore). Mirrors try_pod_struct_store (a POD
  * field: coerce + byte store) + the boxed-field lvalue store the tree-walker's

@@ -81,9 +81,23 @@ enum class OpCode : unsigned char {
      * it isn't int/float — inc-dec is int/float-ONLY, unlike a compound `+= 1`
      * (which would concat a string) — then applies ±1 and writes back. The
      * value is discarded (statement). A proven int/float local is handled by
-     * IntBin/FloatBin; a struct/dict MEMBER or subscript dyn inc-dec falls back.
+     * IntBin/FloatBin; a struct/dict MEMBER dyn inc-dec falls back.
      */
     IncDecCheckedV,
+
+    /*
+     * CHECKED subscript inc-dec `c[k]++` / `c[k]--` for a DYN/unproven base
+     * (a proven flat-int array / dict goes through StoreElemInt / DictStore).
+     * target = the base slot kind (0 local / 1 global / 2 capture), target2 =
+     * the base slot, a = the key temp, aop = plus/minus. Mirrors
+     * IncDecExpr::do_eval's dyn path: forms the element LValue via the runtime
+     * Type::subscript(for_write=false) (a general array / dict has a boxed
+     * element; a flat scalar element has none -> NotLValueEx, exactly as the
+     * tree-walker), THROWS if it isn't int/float, then applies ±1 (int/float-
+     * ONLY, so byte-identical to the dyn scalar IncDecCheckedV). The value is
+     * discarded (statement). Carets via the loc side table.
+     */
+    IncDecElemCheckedV,
 
     /*
      * Fused compare-and-branch: if NOT (a <aop> b) then pc = target, else fall

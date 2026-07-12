@@ -1671,6 +1671,34 @@ struct Codegen {
                     return true;
                 }
             }
+            /* A DYN/general-element subscript `c[k]++` / `c[k]--` (`c` dyn, or a
+             * general array<str>/dict-via-dyn - anything NOT a proven flat
+             * int/float element, which compile_int/float_stmt already handled
+             * via StoreElemInt/Float/DictStore). The CHECKED element inc-dec
+             * forms the boxed element LValue and enforces int/float (a flat
+             * scalar element has no LValue -> NotLValueEx, exactly as the tree-
+             * walker's dyn path). Gating on `sub->th != i/f` is what excludes
+             * the flat case (its element is proven numeric, handled earlier). */
+            if (const Subscript *sub =
+                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                if (sub->th == TypeHint::i || sub->th == TypeHint::f)
+                    return false;
+                int bslot, bkind;
+                if (!as_container_base(sub->what.get(), bslot, bkind))
+                    return false;
+                int kslot;
+                if (!compile_boxed_expr(sub->index.get(), kslot, ops))
+                    return false;
+                Instr in;
+                in.op = OpCode::IncDecElemCheckedV;
+                in.node_idx = add_ast_node(s);   /* the inc-dec span (carets) */
+                in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
+                in.target2 = bslot;
+                in.a = slot_op(kslot);
+                in.aop = inc->is_inc ? Op::plus : Op::minus;
+                ops.push_back(in);
+                return true;
+            }
             return false;
         }
 
@@ -5366,6 +5394,15 @@ static void extract_locs(Chunk &chunk)
         case OpCode::EvalToSlot:
         case OpCode::JumpIfFalse:
         case OpCode::EmplaceStruct:   /* needs the ctor node (def + field carets) */
+            break;
+        case OpCode::IncDecElemCheckedV:
+            /* KEEP the node (the IncDecExpr): a dyn `c[k]++` has TWO distinct
+             * error carets - the SUBSCRIPT loc for a subscript-internal throw
+             * (KeyNotFound/OOB) and the INC-DEC loc for the inc-dec's own
+             * checks (NotLValue/TypeError/const) - which the loc side table
+             * (one loc per pc) can't both hold. The handler reads node->start/
+             * end (inc-dec) and its Subscript child's loc, byte-identical to
+             * the tree-walker's dyn read-modify-write path. */
             break;
         default:
             in.node_idx = -1;

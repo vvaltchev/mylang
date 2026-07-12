@@ -876,6 +876,26 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::IncDecElemCheckedV: {
+            /* `c[k]++` / `c[k]--` on a dyn/unproven base: form the element
+             * LValue, enforce int/float, apply +-1 (statement). Base kind in
+             * .target (0 loc / 1 gbl / 2 cap), base slot in .target2, key temp
+             * in .a, +/- in .aop. Keeps the node (IncDecExpr) for its TWO error
+             * carets: the SUBSCRIPT loc (subscript-internal KeyNotFound/OOB) and
+             * the INC-DEC loc (its own NotLValue/const/TypeError). */
+            const Construct *node = chunk.ast_nodes[in.node_idx];
+            const IncDecExpr *inc = static_cast<const IncDecExpr *>(node);
+            const Subscript *sub =
+                static_cast<const Subscript *>(inc->lvalue.get());
+            LValue *blv =
+                vm_store_base(ctx, in.target, in.target2, chunk, pc, node);
+            const EvalValue &key = ctx.frame->at(in.a.slot).get();
+            vm_incdec_elem(blv, key, in.aop == Op::plus,
+                           sub->start, sub->end, inc->start, inc->end);
+            pc++;
+            break;
+        }
+
         case OpCode::IntBin: {
 
             const int_type a = read_int_operand(in.a, &ctx);

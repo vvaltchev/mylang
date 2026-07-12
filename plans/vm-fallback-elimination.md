@@ -507,11 +507,22 @@ real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
   bind, since its COW guard only avoids overwriting a captured/stored element;
   scalar-field bodies keep the direct read); a **compound multi-target assign**
   (`a, b += rhs` — `MultiUnpackV` gained a base op: read each target, apply,
-  write back, `_` skipped). **STILL fallback** (harder/rarer): `append` to a
-  MEMBER (`append(s.f, x)` — a member LValue), a ≥3-level / member-subscript-
-  member nested store (`c[0][0][0]=v`, `d.a[0].f=v`), a dyn/member inc-dec
-  statement, a `_`-in-unpack `foreach` (needs a per-position slot map, not
-  consecutive), a 3-var dict `foreach`. NONE in bench/ or samples/ (all native).
+  write back, `_` skipped). **STILL fallback** (harder/rarer): a member-subscript-
+  member nested store (`d.a[0].f=v` — a genuine `NotLValueEx` path in both
+  engines), a dyn **MEMBER** inc-dec statement (`d.f++` — almost always a
+  `NotLValueEx` on a POD field). NONE in bench/ or samples/ (all native).
+  **(f) the remaining niche (2026-07-13, DONE).** `append`/`push` to a struct
+  MEMBER (`CallBuiltinLVMember`), a ≥3-level / generic nested store
+  (`StoreElemChainV`), the `_`-in-unpack `foreach` (`UnpackElemTargets` — a
+  per-position `Chunk::unpack_targets` slot map, `-1` == `_`), the INDEXED dict
+  `foreach` (`foreach (i, k[, v] in indexed d)` — the live-iterator lowering
+  plus an int index counter; also fixed a latent front-end mis-typing of the
+  value as the key type), the dyn SCALAR inc-dec (`IncDecCheckedV`, int/float-
+  checked), and the dyn ELEMENT inc-dec (`c[k]++` → `IncDecElemCheckedV`: forms
+  the element LValue via the runtime subscript, int/float-checked; KEEPS its
+  node for its TWO error carets — the subscript loc for a subscript-internal
+  KeyNotFound/OOB vs the inc-dec loc for its own NotLValue/TypeError, which the
+  one-loc side table can't both hold).
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then
