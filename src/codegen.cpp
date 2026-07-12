@@ -2248,10 +2248,60 @@ struct Codegen {
             }
         }
 
+        /* A struct-MEMBER lvalue target `append/push/pop/insert/erase(s.f, ...)`
+         * -> CallBuiltinLVMember: the base is a slotted-id STRUCT; the value args
+         * compile into a rest run (NO index — unlike the subscript case). The
+         * handler forms the boxed field LValue* via vm_member_lvalue. A dict
+         * member / POD field / non-slotted base falls through (a POD field has no
+         * LValue; the runtime check throws the tree-walker's exact error). */
         if (!a0->is_id()) {
-            /* arg0 is not a slotted id. A SUBSCRIPT target was handled above; a
-             * MEMBER target (`append(s.f, x)`) is a valid lvalue not yet native
-             * -> fall back. Anything ELSE (a literal, a call/arith result — the
+            if (auto *m = dynamic_cast<const MemberExpr *>(a0)) {
+                const Construct *base = m->what.get();
+                int bkind = -1;
+                if (m->base_struct && base->is_id())
+                    switch (static_cast<const Identifier *>(base)->sym.kind) {
+                    case SymKind::local:   bkind = 0; break;
+                    case SymKind::global:  bkind = 1; break;
+                    case SymKind::capture: bkind = 2; break;
+                    default: break;
+                    }
+                if (bkind >= 0) {
+                    const int nvals =
+                        static_cast<int>(dc->args->elems.size()) - 1;
+                    const size_t mark = ops.size();
+                    const int save_top = next_temp;
+                    const int runbase = next_temp;
+                    next_temp += nvals;
+                    if (next_temp > max_temp)
+                        max_temp = next_temp;
+                    bool ok = true;
+                    for (int i = 0; ok && i < nvals; i++)
+                        ok = compile_to_run_slot(dc->args->elems[1 + i].get(),
+                                                 runbase + i, ops);
+                    if (ok) {
+                        const int dst = alloc_temp();
+                        Instr cv;
+                        cv.op = OpCode::CallBuiltinLVMember;
+                        cv.target = dst;
+                        cv.target2 =
+                            static_cast<const Identifier *>(base)->sym.slot;
+                        cv.a = int_lit(bkind);
+                        cv.a.slot = add_builtin_call(dc);
+                        chunk.builtin_calls[cv.a.slot].member = m->memUid;
+                        cv.b = int_lit(runbase);
+                        ops.push_back(cv);
+                        out_slot = dst;
+                        return true;
+                    }
+                    ops.resize(mark);
+                    next_temp = save_top;
+                }
+            }
+        }
+
+        if (!a0->is_id()) {
+            /* arg0 is not a slotted id. A SUBSCRIPT/MEMBER target was handled
+             * above; anything ELSE (a literal, a call/arith result — the
              * only lvalues in MyLang are id / subscript / member) is PROVABLY
              * not an lvalue, so a REQUIRES-lvalue builtin always throws
              * NotLValueEx(arg0 loc) after evaluating its args -> a native

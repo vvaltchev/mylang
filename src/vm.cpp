@@ -1868,6 +1868,48 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CallBuiltinLVMember: {
+
+            /* Mutating builtin with a struct-MEMBER target `append(s.f, x)`:
+             * form the base's LValue* (by kind), the boxed FIELD LValue* via
+             * vm_member_lvalue (same checks as the tree-walker's MemberExpr),
+             * then call func_lv REST-NATIVE. `b` = the rest run (values, NO
+             * index — unlike LVElem). AST-free: Builtin + carets + field name
+             * from the pool (a.slot). */
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.a.slot];
+            LValue *base;
+            switch (in.a.lit) {
+            case 0:  base = &ctx.frame->at(in.target2); break;
+            case 1:  base = ctx.gfuncs->defined[in.target2]
+                         ? &ctx.gfuncs->slots[in.target2] : nullptr; break;
+            default: base = &(*ctx.captures)[in.target2]; break;
+            }
+            const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
+            try {
+                LValue *field = nullptr;
+                if (base)
+                    field = vm_member_lvalue(base, bc.member,
+                                             bc.args[0].start, bc.args[0].end,
+                                             bc.args[0].start, bc.args[0].end);
+                EvalValue restbuf[8];   /* append/push 1 value arg */
+                for (int_type i = 0; i < n_rest; i++)
+                    restbuf[i] = ctx.frame->at(in.b.lit + i).get();
+                ArgLocs al = chunk.arglocs_at(in.a.slot);
+                ctx.frame->at(in.target).put(
+                    bc.builtin.func_lv(&ctx, &al, field,
+                                       n_rest ? restbuf : nullptr,
+                                       static_cast<size_t>(n_rest)));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = bc.args[0].start;
+                    e.loc_end = bc.args[0].end;
+                }
+                throw;
+            }
+            pc++;
+            break;
+        }
+
         case OpCode::CallV:
         case OpCode::CachedCallV: {
 

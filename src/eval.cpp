@@ -2957,6 +2957,30 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
  * uid + carets from the member-key pool. Returns the stored value. A const /
  * read-only struct throws NotLValueEx (the tree-walker's general-path error).
  */
+/* The boxed field LValue* of `base.member` for a MUTATING builtin arg0
+ * (`append(s.f, x)` — the VM's CallBuiltinLVMember). Throws exactly like the
+ * tree-walker's MemberExpr on a non-struct base / missing member / const|
+ * read-only|POD field (a POD scalar field has no LValue). Mirrors
+ * vm_member_store's boxed branch. */
+LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
+                         const Loc &mstart, const Loc &mend,
+                         const Loc &bstart, const Loc &bend)
+{
+    const EvalValue &dval = base_lv->get();
+    if (!dval.is<intrusive_ptr<StructObject>>())
+        throw TypeErrorEx("Expected struct object", bstart, bend);
+    StructObject &obj = *dval.get<intrusive_ptr<StructObject>>().get();
+    const int slot = obj.def->slot_of(memUid);
+    if (slot < 0)
+        throw TypeErrorEx(
+            intern_msg("Struct '" + string(obj.def->name->val) +
+                       "' has no member '" + string(memUid->val) + "'"),
+            mstart, mend);
+    if (base_lv->is_const_var() || obj.is_readonly() || obj.is_pod())
+        throw NotLValueEx(mstart, mend);
+    return &obj.fields[slot];
+}
+
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const EvalValue &value,
                           const Loc &mstart, const Loc &mend,

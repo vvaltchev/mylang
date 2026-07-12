@@ -439,6 +439,18 @@ enum class OpCode : unsigned char {
     CallBuiltinLVElem,
 
     /*
+     * Mutating builtin with a struct-MEMBER lvalue target `append(s.f, x)`:
+     * `a.lit` = the base's slot KIND, `target2` = the base's slot, `a.slot` =
+     * the builtin_calls pool index (its `.member` is the field name, `.args` the
+     * carets), `b` = the REST run base (pre-evaluated value args, rest-native).
+     * The handler forms the base's LValue*, then the boxed FIELD LValue* via
+     * vm_member_lvalue (the SAME check the tree-walker's MemberExpr does), and
+     * calls func_lv REST-NATIVE. A POD/const/read-only/missing field -> the same
+     * throw the tree-walker raises. AST-free.
+     */
+    CallBuiltinLVMember,
+
+    /*
      * Native USER-function call (no node->eval): the args are already evaluated
      * into a contiguous register run [a.lit, a.lit + b.lit); `target2` = the
      * callee's GLOBAL-table slot (a DirectCallExpr with vm_direct_func, so the
@@ -1059,6 +1071,8 @@ struct Chunk {
         Loc start, end;               /* the whole-args caret (arity/generic) */
         ArrHint arr_hint;             /* the array-repr hint (range/array/…) */
         std::vector<ArgLoc> args;     /* per-arg carets, [0, n) */
+        const UniqueId *member = nullptr;  /* CallBuiltinLVMember: arg0's field
+                                            * name `append(s.f, x)` (else null) */
     };
     std::vector<BuiltinCall> builtin_calls;
 

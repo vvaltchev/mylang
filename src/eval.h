@@ -404,6 +404,12 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const Loc &mstart, const Loc &mend,
                           const Loc &bstart, const Loc &bend);
 
+/* The boxed field LValue* of `base.member` for a mutating builtin arg0
+ * (`append(s.f, x)` — CallBuiltinLVMember). See eval.cpp. */
+LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
+                         const Loc &mstart, const Loc &mend,
+                         const Loc &bstart, const Loc &bend);
+
 /* VM (StoreElem2V): native NESTED store `a[i][j] = v` / `OP= v`. See eval.cpp. */
 EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &key2,

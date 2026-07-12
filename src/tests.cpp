@@ -9109,6 +9109,21 @@ static const std::vector<test> tests =
       { "struct Bag { array items; }",
         "var b = Bag([1, 2, 3]); assert(b.items == [1, 2, 3]);",
         "assert(len(b.items) == 3);" } },
+    /* A mutating builtin on a struct-MEMBER lvalue `append(s.f, x)` (VM:
+     * CallBuiltinLVMember - forms the boxed field LValue). append/push/insert/
+     * erase; a const struct's field throws NotLValueEx. Differential covers -vm. */
+    { "struct: append/insert/erase to an array field (native member lvalue)",
+      { "struct Bag { array items; }",
+        "var b = Bag([]);",
+        "for (var i = 0; i < 3; i++) { append(b.items, i); }",
+        "assert(b.items == [0, 1, 2]);",
+        "insert(b.items, 0, 9); assert(b.items == [9, 0, 1, 2]);",
+        "erase(b.items, 1); assert(b.items == [9, 1, 2]);",
+        "push(b.items, 5); assert(b.items == [9, 1, 2, 5]);" } },
+    { "struct: mutating a const struct's field fails",
+      { "struct Bag { array items; } const b = Bag([1, 2]);",
+        "append(b.items, 3);" },
+      &typeid(NotLValueEx) },
     { "struct: a struct flowing through a dyn var",
       { "struct Point { int x; int y; } var dyn d = Point(5, 6);",
         /* d is declared dyn, so its STATIC kind is dyn (kindstr is a

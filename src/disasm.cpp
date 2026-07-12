@@ -643,6 +643,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << ")";
             break;
         }
+        case OpCode::CallBuiltinLVMember: {
+            const int bcidx = in.a.slot;
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[bcidx];
+            const int nvals = static_cast<int>(bc.args.size()) - 1;
+            row << "call.blt.lvm " << D(in.target) << " = "
+                << builtin_call_name(chunk, bcidx) << "("
+                << lval_ref(in.a.lit, in.target2) << "."
+                << (bc.member ? bc.member->val : "?");
+            for (int i = 0; i < nvals; i++)
+                row << ", " << reg(chunk, in.b.lit + i);
+            row << ")";
+            break;
+        }
         case OpCode::CallV:
             /* AST-free: the callee is a global slot (its name lives in gfuncs,
              * not the chunk), so show g<n>. */
