@@ -335,6 +335,18 @@ bool builtin_is_const(int index);
 bool is_dev_builtin(const UniqueId *uid);
 extern bool g_dev_builtins_allowed;
 
+/*
+ * LAZY-ARG builtins (`defined`/`isconst`/`isconstdecl`): the argument is NOT
+ * evaluated - a NODE property a runtime value can't reproduce - so calling one
+ * INDIRECTLY (through a dyn value) is impossible to honor AST-free. In a
+ * SCRIPT, using such a name as a VALUE (assigned / stored / passed - anything
+ * but the callee of a direct call) is a COMPILE-TIME error (the inferencer's
+ * reject_dev_builtins walk, same g_dev_builtins_allowed gate: the REPL keeps
+ * the AST and allows the indirect form, like `show`). Maintainer-decided rule
+ * (2026-07-14) - see plans/vm-fallback-elimination.md, fork F1.
+ */
+bool is_lazy_builtin(const UniqueId *uid);
+
 /* The VALUE-read path of `base.member` (a struct field / const / dict key /
  * optional-none), shared by MemberExpr::do_eval and the VM's MemberV. */
 class MemberExpr;

@@ -870,25 +870,46 @@ is deleted.
 ### FORK DECISIONS + fix sketches (maintainer-approved, 2026-07-14)
 
 **F1. `CallValueGenericV` (the last non-fallback node op) — DECIDED: a
-LAZY-ARG builtin cannot be called INDIRECTLY (a language rule).**
-- The problem: a dyn callee resolving to `defined`/`isconst`/`isconstdecl`/
-  `decltype` needs the UNEVALUATED args (`var dyn f = defined; f(x)` must
-  not evaluate `x`), which pre-evaluated register-run values cannot
-  reproduce; `show` is already script-rejected; `type`/`typestr`/`kindstr`
-  are dual-ABI (value path exists) and stay callable.
-- The fix: (a) enforce in the SHARED `dispatch_call_value` (eval.cpp) — a
-  Builtin callee from the lazy set throws a clear runtime error naming the
-  builtin, byte-identical in both engines; (b) where provable, also a
-  compile-time reject of the lazy builtins used as VALUES (the
-  `reject_dev_builtins` precedent). (c) With lazy callees impossible,
-  rework the op: pre-evaluate the args into a register run + pooled
-  ArgLocs; dispatch FuncObject → vm_call_func, struct → construct-from-
-  values (`boxed_ctors`-style carets), func_v Builtin → func_v(values).
-  OPEN implementation detail: the LVALUE-ABI builtins (`append`/`pop`/… -
-  arg0 must be an LValue, which values lose) either JOIN the
-  no-indirect-call rule or get a compiled lvalue DESCRIPTOR (the
-  CallBuiltinLV kind/slot encoding) - settle when implementing. Then the
-  op drops its node → Tier 2 is ONLY the fallback ops.
+LAZY-ARG builtin cannot be called INDIRECTLY (a language rule).
+STEP 1 ✅ DONE (2026-07-14): the rule.**
+- The problem: a dyn callee resolving to a LAZY builtin needs the
+  UNEVALUATED args (`var dyn f = defined; f(x)` must not evaluate `x`),
+  which pre-evaluated register-run values cannot reproduce. The lazy set
+  was pinned by reading each runtime body: **`defined` / `isconst` /
+  `isconstdecl`** (pure NODE properties). `decltype` is NOT lazy after
+  all — like `type`/`typestr`/`kindstr` it is dual-ABI (its `func_v`
+  builds from the runtime value), so all four type queries stay usable
+  as values; `show` was already script-rejected.
+- IMPLEMENTED as a COMPILE-TIME reject only (`is_lazy_builtin` +
+  `mark_lazy_builtin` in types.cpp; the value-use check rides the
+  `reject_dev_builtins` walk, same `g_dev_builtins_allowed` gate): in a
+  script, a lazy builtin's name in any position but a direct-call callee
+  is a `SyntaxErrorEx` ("takes an unevaluated argument; it cannot be
+  used as a value"). The originally-sketched RUNTIME check in
+  `dispatch_call_value` was dropped as unnecessary-and-harmful: a script
+  can no longer PRODUCE such a value (every route into a dyn is a value
+  position), and the REPL — which retains the AST, so the indirect form
+  genuinely works there — would have been broken gratuitously (the
+  `show` precedent). README documents the rule under `defined` +
+  `isconst`.
+- **STEP 2 (OPEN — the op rework needs one more maintainer call):** with
+  lazy callees impossible, pre-evaluate the args into a register run +
+  pooled ArgLocs and dispatch FuncObject → vm_call_func, struct →
+  construct-from-values, func_v Builtin → func_v(values). TWO remaining
+  ExprList-ABI callees block full AST-freedom:
+  (1) **map/filter** indirectly (`var dyn m = map; m(f, a)`): the direct
+  form validates arg0 BEFORE evaluating arg1 (tested order); values are
+  eager, so an invalid arg0 + side-effecting arg1 diverges. Options:
+  accept eager-args semantics for INDIRECT builtin calls (a documented
+  divergence) or keep the node for this case.
+  (2) **mutating builtins** indirectly (`var dyn f = append; f(a, 2)`):
+  arg0 must be an LVALUE; a pre-evaluated value copy bumps use_count so
+  COW would clone and the append silently mutate the copy — worse than
+  an error. Options: BAN indirect calls of lvalue-arg0 builtins (an
+  explicit error; RECOMMENDED — the shape is rare and a silent-no-op
+  trap otherwise) or compile an lvalue descriptor for a slotted-id arg0
+  (leaves subscript/member arg0 divergent). Until decided, the op keeps
+  its node; Tier 2 = the fallback ops + this one op.
 
 **F2. The brace-less-body func/struct decl CRASH — ✅ DONE (2026-07-14,
 `pWrapDeclBody` in parser.cpp).**

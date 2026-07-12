@@ -3879,20 +3879,26 @@ byte-identical (FuncObject → do_func_call, Builtin → its ExprList ABI, struc
 construct, else `NotCallableEx`). `extract_locs` records the op's CALL-SITE loc
 (for a FuncObject body's backtrace) WHILE keeping the node — the LAST
 non-fallback node-keeping op. A Func-TYPED callee still uses the leaner
-register-run `CallValueV`. **The AGREED path to AST-freedom (maintainer,
-2026-07-14):** a LAZY-ARG builtin **cannot be called INDIRECTLY** (through a
-dyn value) — the lazy set is `defined`/`isconst`/`isconstdecl`/`decltype`
-(unevaluated-arg semantics that pre-evaluated values cannot reproduce; `show`
-is already script-rejected, and `type`/`typestr`/`kindstr` are dual-ABI so
-they stay callable). Enforced in the shared `dispatch_call_value` (a runtime
-error naming the builtin — byte-identical in both engines) plus, where
-provable, a compile-time reject of those builtins used as VALUES. Whether the
-LVALUE-ABI builtins (`append`/`pop`/… — arg0 must be an lvalue, which
-pre-evaluated values lose) join the rule or get a compiled lvalue-descriptor
-(the CallBuiltinLV kind/slot encoding) is an implementation-time detail; with
-that settled, `CallValueGenericV` pre-evaluates its args into a register run
-+ pooled carets and drops its node. Not yet implemented — see
-plans/vm-fallback-elimination.md (the fork list).
+register-run `CallValueV`. **The LAZY-ARG rule (fork F1 step 1, LANDED
+2026-07-14):** a LAZY-ARG builtin — **`defined`/`isconst`/`isconstdecl`**,
+whose argument is a NODE property that is never evaluated (`decltype` turned
+out NOT lazy: like `type`/`typestr`/`kindstr` it is dual-ABI, its `func_v`
+builds from the runtime value, so the type queries stay usable as values;
+`show` was already script-rejected) — **cannot be used as a VALUE in a
+script** (only called directly): `var dyn f = defined;`, `[isconst]`, or
+passing one as an argument is a compile-time `SyntaxErrorEx`. Implemented as
+a COMPILE-TIME reject only (`is_lazy_builtin`/`mark_lazy_builtin`,
+types.cpp; the check rides the `reject_dev_builtins` walk, same
+`g_dev_builtins_allowed` gate — the REPL retains the AST, so the indirect
+form keeps working there, the `show` precedent). A runtime check in
+`dispatch_call_value` is unnecessary: a script can no longer produce such a
+value. Documented in README (`defined`, `isconst`). **Step 2 (OPEN):** the
+op's AST-free rework (pre-evaluated args + pooled carets) still needs one
+maintainer call on the two residual ExprList-ABI callees — indirect
+`map`/`filter` (eager args would reorder the tested validate-before-arg1)
+and indirect MUTATING builtins (a pre-evaluated arg0 loses lvalue-ness and
+would COW-clone — a silent-no-op trap; recommendation: ban them) — see
+plans/vm-fallback-elimination.md fork F1. Until then the op keeps its node.
 
 **Niche STATEMENTS → native (a further sweep).** Several residual real shapes
 went native: an **inc-dec STATEMENT on an int/float member/nested subscript**
@@ -4282,7 +4288,11 @@ instrumentation (see `plans/function-templates.md`).
    name in `g_dev_builtin_ids`, so the inferencer (`reject_dev_builtins`) makes a
    SCRIPT call a compile-time error while the REPL / test harness (which set
    `g_dev_builtins_allowed`) allow it. This keeps the AST out of serialized
-   script bytecode.
+   script bytecode. **A builtin whose argument is a NODE property (never
+   evaluated — `defined`/`isconst`/`isconstdecl`) must additionally be wrapped
+   in `mark_lazy_builtin(...)`** at registration: a script may only CALL it
+   directly — using the name as a VALUE is a compile error (the F1 rule; an
+   indirect dyn call could never reproduce the lazy semantics AST-free).
 3. Document it in `README.md` (const vs. non-const section) and add a test in
    `src/tests.cpp`.
 

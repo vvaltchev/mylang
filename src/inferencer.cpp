@@ -2125,7 +2125,28 @@ void Inferencer::reject_dev_builtins(Construct *n)
                     intern_msg("'" + std::string(cid->uid->val) +
                         "' is a dev-only builtin (REPL / tests only); it is not "
                         "available in a script"));
+            /* The CALLEE position is the one LEGAL use of a LAZY-ARG builtin
+             * (defined/isconst/isconstdecl): walk the args only, skipping the
+             * callee id, so the value-use check below doesn't fire on it. */
+            reject_dev_builtins(call->args.get());
+            return;
         }
+    }
+
+    /* A LAZY-ARG builtin used as a VALUE (`var dyn f = defined;`,
+     * `[isconst]`, an argument, ...): its semantics need the UNEVALUATED
+     * argument node, which an indirect (dyn) call can never supply - a script
+     * compile error (fork F1, maintainer-decided). A user symbol shadowing
+     * the name is untouched; the REPL (g_dev_builtins_allowed) keeps the
+     * indirect form working via its retained AST. */
+    if (auto *id = dynamic_cast<Identifier *>(n)) {
+        auto it = id_sym.find(id);
+        const bool user_shadow = (it != id_sym.end() && it->second);
+        if (!user_shadow && is_lazy_builtin(id->uid))
+            throw SyntaxErrorEx(id->start,
+                intern_msg("'" + std::string(id->uid->val) +
+                    "' takes an unevaluated argument; it cannot be used as a "
+                    "value (only called directly)"));
     }
 
     for_each_child(n, [this](Construct *c) { reject_dev_builtins(c); });

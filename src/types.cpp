@@ -272,6 +272,30 @@ bool is_dev_builtin(const UniqueId *uid)
 bool g_dev_builtins_allowed = false;
 
 /*
+ * The LAZY-ARG builtin category (see eval.h): a builtin whose argument is
+ * NOT evaluated - a NODE property (`defined`'s UndefinedId probe,
+ * `isconst`/`isconstdecl`'s `is_const` flag) that a runtime VALUE can never
+ * reproduce, so an INDIRECT call through a dyn value cannot be honored
+ * AST-free. The inferencer (reject_dev_builtins) makes a script VALUE-use of
+ * such a name a compile error - the callee position stays the one legal use.
+ * (The REPL keeps the AST, so it allows the indirect form - the `show`
+ * precedent; gated by the same g_dev_builtins_allowed.) NOTE the type
+ * queries (type/decltype/typestr/kindstr) are NOT lazy - they are dual-ABI
+ * (func_v builds from the runtime value), so they stay usable as values.
+ */
+static std::set<const UniqueId *> g_lazy_builtin_ids;
+template <typename P>
+static inline P mark_lazy_builtin(P p)
+{
+    g_lazy_builtin_ids.insert(p.first);
+    return p;
+}
+bool is_lazy_builtin(const UniqueId *uid)
+{
+    return g_lazy_builtin_ids.count(uid) != 0;
+}
+
+/*
  * A builtin with a CUSTOM tree-walker `func` AND a value-ABI `func_v` (for the
  * VM's CallBuiltinV) - the two are DIFFERENT implementations, unlike
  * make_builtin_v (where `func` is a generic adapter over `func_v`). Used by the
@@ -471,7 +495,7 @@ inline auto make_builtin_lv_v(const char *name)
 const EvalContext::SymbolsType EvalContext::const_builtins =
 {
     /* Generic builtins */
-    make_const_builtin("defined", builtin_defined),
+    mark_lazy_builtin(make_const_builtin("defined", builtin_defined)),
     make_const_builtin_v<builtin_len>("len"),
     make_const_builtin_v<builtin_str>("str"),
     make_const_builtin_v<builtin_int>("int"),
@@ -566,8 +590,8 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_assert>("assert"),
     make_builtin_v<builtin_exit>("exit"),
     make_builtin_v<builtin_runtime>("runtime"), /* optimization barrier */
-    make_builtin("isconst", builtin_isconst),
-    make_builtin("isconstdecl", builtin_isconstdecl),
+    mark_lazy_builtin(make_builtin("isconst", builtin_isconst)),
+    mark_lazy_builtin(make_builtin("isconstdecl", builtin_isconstdecl)),
     make_builtin_v<builtin_ispure>("ispure"),
     make_builtin_v<builtin_ispuredecl>("ispuredecl"),
     make_builtin_lv<builtin_intptr>("intptr"),

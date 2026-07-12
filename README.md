@@ -1806,7 +1806,12 @@ const arguments are passed to them.
 
 #### `defined(symbol)`
 Check if `symbol` is defined. Returns `true` if the symbol is defined, `false`
-otherwise.
+otherwise. `defined` inspects its argument **unevaluated** (a lazy-arg
+builtin), so in a script it can only be **called directly** — using the bare
+name as a *value* (`var dyn f = defined;`, storing it in a container, passing
+it as an argument) is a compile-time error, since an indirect call could not
+preserve the unevaluated-argument semantics. (The interactive REPL still
+allows it.) The same rule applies to `isconst` and `isconstdecl`.
 
 #### `len(container)`
 Return the number of elements in the given container.
@@ -2229,6 +2234,9 @@ a constant expression, a variable promoted by
 literal/constant expression, but NOT a variable that is constant merely via
 auto-const. So `const c = 1` gives `isconstdecl(c) == true`, while a write-once
 `var v = 1` gives `isconst(v) == true` but `isconstdecl(v) == false`.
+Like `defined`, both inspect their argument **unevaluated**, so in a script
+they can only be called directly — never used as values (a compile-time
+error).
 
 #### `ispure(func)` / `ispuredecl(func)`
 `ispure()` is true when `func` evaluates to a function object that is

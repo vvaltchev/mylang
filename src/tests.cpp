@@ -14190,6 +14190,67 @@ dev_builtin_reserved_in_script()
 }
 
 /*
+ * Fork F1 (maintainer-decided): a LAZY-ARG builtin (defined/isconst/
+ * isconstdecl - the argument is a NODE property, never evaluated) cannot be
+ * used as a VALUE in a script - only called directly. An indirect (dyn) call
+ * could never reproduce the lazy semantics AST-free. The REPL (dev flag on)
+ * keeps the indirect form, like show; a user shadow is untouched; the callee
+ * position stays legal.
+ */
+static bool
+lazy_builtin_value_use_rejected()
+{
+    auto rejected = [](bool dev_allowed,
+                       std::initializer_list<const char *> lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        bool first = true;
+        for (const char *l : lines) {
+            if (!first)
+                src += '\n';
+            first = false;
+            src += l;
+        }
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        const bool saved = g_dev_builtins_allowed;
+        g_dev_builtins_allowed = dev_allowed;
+        bool threw = false;
+        try {
+            infer_types(root.get());
+        } catch (const SyntaxErrorEx &) {
+            threw = true;
+        }
+        g_dev_builtins_allowed = saved;
+        return threw;
+    };
+
+    /* value uses: assigned to a dyn, stored in an array, passed as an arg */
+    if (!rejected(false, { "var dyn f = defined;" }))
+        return false;
+    if (!rejected(false, { "var a = [isconst];" }))
+        return false;
+    if (!rejected(false, { "print(isconstdecl);" }))
+        return false;
+
+    /* the callee position stays legal (no reject at this phase) */
+    if (rejected(false, { "var a = 1; print(defined(a));" }))
+        return false;
+    /* the REPL / dev harness allows the value use (its AST is retained) */
+    if (rejected(true, { "var dyn f = defined;" }))
+        return false;
+    /* a user symbol shadowing the name is untouched (isconst is a runtime
+     * builtin, so a user func may shadow it) */
+    if (rejected(false, { "func isconst(x) => 2;",
+                          "var r = isconst(21);" }))
+        return false;
+
+    return true;
+}
+
+/*
  * The residual AST nodes live in the pc-keyed Chunk::node_table (the indexed
  * ast_nodes pool + the live Instr::node_idx are dropped after codegen by
  * build_node_table). Verify (a) a FULLY-NATIVE chunk has an EMPTY table (the
@@ -14333,6 +14394,8 @@ static const std::vector<extra_check> extra_checks =
       vm_codegen_shapes },
     { "builtins: dev-only show() reserved in a script",
       dev_builtin_reserved_in_script },
+    { "builtins: lazy-arg builtins are not values in a script (F1)",
+      lazy_builtin_value_use_rejected },
     { "vm: node_table (pc-keyed) empty for native code, ast_nodes dropped",
       ast_node_pool_minimal },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
