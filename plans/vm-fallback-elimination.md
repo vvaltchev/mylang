@@ -641,17 +641,21 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
   tree-walked. That function has zero bytecode, a *bigger* serialization gap than
   a single `EvalStmt`, and is tied to residuals 7/8.
 
-- **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
-  the field is the splice-STABLE handle codegen needs to associate an op with its
-  node before the op's final pc is known (ops build in local buffers, then
-  splice). `extract_locs` (post-assembly, pcs known) already turns node_idx into
-  the pc-keyed loc side table; the same pass can build a **pc-keyed `ast_nodes`
-  side table** (`{pc, Construct*}`, like `locs`/`inline_ctxs`) for the residual
-  node ops — after which the runtime looks up `node_at(pc)` and node_idx can be
-  dropped from the runtime Instr. Doing this cleanly (without a second
-  codegen-vs-runtime Instr representation) is the final step, best done once the
-  mutating-builtin group above is also off ast_nodes so only cold fallback paths
-  remain.
+- **Dropping the `ast_nodes` POOL for a pc-keyed side table** — ✅ **DONE
+  (2026-07-13).** `Instr::node_idx` stays the splice-STABLE handle codegen needs
+  (ops grow + roll back before an op's final pc is known, and an index survives
+  that where a pc would not), indexing a now CODEGEN-TRANSIENT `ast_nodes`.
+  After `extract_locs` (post-assembly, pcs final), **`build_node_table`**
+  flattens surviving `{pc → ast_nodes[node_idx]}` into a pc-keyed `node_table`
+  (`{pc, Construct*}`, like `locs`/`inline_ctxs`, binary-searched by
+  `node_at_pc`), NULLS every live `node_idx`, and CLEARS `ast_nodes`. So the
+  finished chunk carries NO indexed pool and NO live per-`Instr` `node_idx`; the
+  runtime looks a residual node up by pc on the cold path only. ONE `Instr`
+  layout (no codegen-vs-runtime split — `node_idx` is a codegen-only handle,
+  always `-1` at runtime). All `bench/` + `samples/` keep an EMPTY node_table
+  (except the two struct benches' one `EmplaceStruct` ctor node each, same as
+  before). `node_table` is now the LAST non-serializable side table (the audit
+  signal for a `.myv` writer).
 
 ## Remaining work (current — 2026-07-07)
 

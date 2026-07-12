@@ -13969,11 +13969,13 @@ dev_builtin_reserved_in_script()
 }
 
 /*
- * The Instr::node field is GONE: a runtime-node op holds a `node_idx` into
- * Chunk::ast_nodes. Verify (a) a FULLY-NATIVE chunk has an EMPTY pool (the
- * "serializable" signal), (b) a value-ABI builtin call is now AST-FREE too - it
- * pools its Builtin + arg carets into Chunk::builtin_calls (a serializable pool)
- * and leaves ast_nodes EMPTY, and every node_idx is a valid, non-null entry.
+ * The residual AST nodes live in the pc-keyed Chunk::node_table (the indexed
+ * ast_nodes pool + the live Instr::node_idx are dropped after codegen by
+ * build_node_table). Verify (a) a FULLY-NATIVE chunk has an EMPTY table (the
+ * "serializable" signal) + no live node_idx, (b) a value-ABI builtin call is
+ * AST-FREE too - it pools its Builtin + arg carets into Chunk::builtin_calls (a
+ * serializable pool) and leaves node_table EMPTY, and every node_table entry is
+ * non-null.
  */
 static bool
 ast_node_pool_minimal()
@@ -14004,35 +14006,37 @@ ast_node_pool_minimal()
         return true;
     };
 
-    auto indices_valid = [](const Chunk &ch) -> bool {
-        for (const Instr &in : ch.code) {
-            if (in.node_idx < -1)
-                return false;
-            if (in.node_idx >= static_cast<int>(ch.ast_nodes.size()))
-                return false;   /* out-of-range index */
-            if (in.node_idx >= 0 && !ch.ast_nodes[in.node_idx])
-                return false;   /* references a null pool entry */
-        }
+    /* After build_node_table: the ast_nodes pool is DROPPED (empty), every
+     * runtime node_idx is nulled (-1), and each node_table entry is non-null. */
+    auto table_valid = [](const Chunk &ch) -> bool {
+        if (!ch.ast_nodes.empty())
+            return false;          /* the indexed pool is dropped at runtime */
+        for (const Instr &in : ch.code)
+            if (in.node_idx != -1)
+                return false;      /* no live per-Instr node_idx at runtime */
+        for (const auto &ne : ch.node_table)
+            if (!ne.node)
+                return false;      /* a null residual node */
         return true;
     };
 
-    /* (a) a fully-native int loop (no builtins, no fallback) -> EMPTY pool */
+    /* (a) a fully-native int loop (no builtins, no fallback) -> EMPTY table */
     Chunk native;
     if (!compile({"var s = 0;",
                   "for (var i = 0; i < 10; i++) s += i * i;",
                   "var out = s;"}, native))
         return false;
-    if (!native.ast_nodes.empty() || !indices_valid(native))
+    if (!native.node_table.empty() || !table_valid(native))
         return false;
 
     /* (b) a value-ABI builtin call (print) is AST-FREE: it pools into
-     * builtin_calls, leaves ast_nodes EMPTY, and every node_idx stays valid. The
-     * pooled entry carries the builtin's name (a serializer re-binds from it). */
+     * builtin_calls, leaves node_table EMPTY. The pooled entry carries the
+     * builtin's name (a serializer re-binds from it). */
     Chunk withb;
     if (!compile({"var s = 5;", "print(s);"}, withb))
         return false;
-    if (!withb.ast_nodes.empty() || withb.builtin_calls.empty()
-        || !indices_valid(withb))
+    if (!withb.node_table.empty() || withb.builtin_calls.empty()
+        || !table_valid(withb))
         return false;
     if (!withb.builtin_calls[0].name
         || std::string(withb.builtin_calls[0].name->val) != "print")
@@ -14047,7 +14051,7 @@ static const std::vector<extra_check> extra_checks =
       vm_codegen_shapes },
     { "builtins: dev-only show() reserved in a script",
       dev_builtin_reserved_in_script },
-    { "vm: Instr node-drop - ast_nodes pool empty for native code",
+    { "vm: node_table (pc-keyed) empty for native code, ast_nodes dropped",
       ast_node_pool_minimal },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
     { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },

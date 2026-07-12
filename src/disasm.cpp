@@ -273,15 +273,15 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
               << "  (" << bc.args.size() << " args)\n";
         }
     }
-    if (!ch.ast_nodes.empty()) {
-        /* The ONE non-serializable pool: the AST nodes ops still need at
-         * runtime (fallbacks / builtin calls / a store's caret). A fully-native
-         * chunk has NONE - so this section appearing IS the ".myv can't drop the
-         * AST yet" signal. Rendered by the shared decompiler. */
-        s << "; -- ast_nodes (" << ch.ast_nodes.size()
+    if (!ch.node_table.empty()) {
+        /* The ONE non-serializable side table: the AST nodes ops still need at
+         * runtime (fallbacks / builtin calls / a store's caret), pc-keyed. A
+         * fully-native chunk has NONE - so this section appearing IS the ".myv
+         * can't drop the AST yet" signal. Rendered by the shared decompiler. */
+        s << "; -- node_table (" << ch.node_table.size()
           << ", NOT serializable) --\n";
-        for (size_t i = 0; i < ch.ast_nodes.size(); i++)
-            s << ";   #" << i << "  " << node1(ch.ast_nodes[i]) << "\n";
+        for (const auto &ne : ch.node_table)
+            s << ";   pc" << ne.pc << "  " << node1(ne.node) << "\n";
     }
     if (!ch.locs.empty()) {
         s << "; -- locs (" << ch.locs.size() << ") --\n";
@@ -362,7 +362,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 
         switch (in.op) {
         case OpCode::EvalStmt:
-            row << "eval.stmt    " << node1(chunk.node_at(in.node_idx));
+            row << "eval.stmt    " << node1(chunk.node_at_pc(pc));
             break;
         case OpCode::Jump:
             row << "jmp          L" << in.target;
@@ -406,7 +406,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "end.finally";
             break;
         case OpCode::JumpIfFalse:
-            row << "jmp.ifnot    (" << node1(chunk.node_at(in.node_idx)) << "), L" << in.target;
+            row << "jmp.ifnot    (" << node1(chunk.node_at_pc(pc)) << "), L" << in.target;
             break;
         case OpCode::LoopBackEdge:
             row << "loop.back    cont=L" << in.target << " brk=L" << in.target2;
@@ -636,7 +636,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::EvalToSlot:
-            row << "eval.slot    " << D(in.target) << " = " << node1(chunk.node_at(in.node_idx));
+            row << "eval.slot    " << D(in.target) << " = " << node1(chunk.node_at_pc(pc));
             break;
         case OpCode::CallBuiltinV:
             row << "call.blt.v   " << D(in.target) << " = "
@@ -662,16 +662,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         }
         case OpCode::EmplaceStruct: {
             const auto *dc =
-                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
+                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at_pc(pc));
             const auto *ctor =
                 static_cast<const CallExpr *>(dc->args->elems[1].get());
             const int nf = static_cast<int>(ctor->args->elems.size());
             row << "emplace      " << D(in.target) << " = "
-                << callee_name(chunk.node_at(in.node_idx)) << "("
+                << callee_name(chunk.node_at_pc(pc)) << "("
                 << lval_ref(in.a.lit, in.target2) << " <- "
                 << std::string(ctor->vm_struct_ctor_def->name->val)
                 << arglist(chunk, in.b.lit, nf) << ")";
-            cmt(row, chunk.node_at(in.node_idx));
+            cmt(row, chunk.node_at_pc(pc));
             break;
         }
         case OpCode::CallBuiltinLVElem: {
@@ -852,16 +852,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::LoadCaptureV:
             row << "load.capture " << D(in.target) << ", "
-                << node_name(chunk.node_at(in.node_idx));
+                << node_name(chunk.node_at_pc(pc));
             break;
         case OpCode::LoadBuiltinV:
             row << "load.builtin " << D(in.target) << ", "
-                << node_name(chunk.node_at(in.node_idx));
+                << node_name(chunk.node_at_pc(pc));
             break;
         case OpCode::SubscriptV:
             row << "subscript.v  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";
-            cmt(row, chunk.node_at(in.node_idx));
+            cmt(row, chunk.node_at_pc(pc));
             break;
         case OpCode::MemberV:
             /* AST-free: the member name comes from the member-key pool. */

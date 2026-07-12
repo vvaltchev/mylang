@@ -1196,28 +1196,56 @@ struct Chunk {
     }
 
     /*
-     * AST-NODE POOL - the ONE non-serializable pool, holding the raw
-     * `Construct *` of every op that still needs the AST at RUNTIME (an
-     * `Instr::node_idx` indexes it, so `Instr` itself holds NO raw Construct*):
-     *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (they re-enter
-     *     the tree-walker via `node->eval`);
-     *   - EmplaceStruct - the ONLY builtin op left here: it needs the ctor node
-     *     (its vm_struct_ctor_def + field-arg carets). The value-ABI (CallBuiltinV)
-     *     AND the mutating lvalue-ABI (CallBuiltinLV / CallBuiltinLVElem) calls
-     *     are NO LONGER here - they pool their Builtin + ArgLocs in
-     *     `builtin_calls` (serializable), so they hold no node.
-     * A program that lowers 100% natively (no fallback, no dev-builtin) leaves
-     * this EMPTY - so a non-empty `ast_nodes` is EXACTLY the "not yet fully
-     * serializable" signal (a `.myv` writer must reject it or keep the AST).
-     * Program-lifetime AST-owned pointers, like closure_defs / struct_defs.
-     * Built during codegen (add_ast_node), then COMPACTED after extract_locs so
-     * the loc-only nodes it dropped (and any codegen-rollback orphans) leave no
-     * dead entries. `node_at` returns nullptr for the -1 (no-node) sentinel.
+     * AST-NODE POOL - CODEGEN-TRANSIENT, holding the raw `Construct *` of every
+     * op that still needs the AST at RUNTIME. `Instr::node_idx` indexes it (a
+     * SPLICE-STABLE handle codegen needs before an op's final pc is known: ops
+     * grow + roll back, and node_idx survives that where a pc would not). After
+     * codegen, `build_node_table` FLATTENS the live entries into the pc-keyed
+     * `node_table` side table (below) and CLEARS this pool, so the finished
+     * (runtime / serialized) chunk carries NO indexed pool - the runtime looks
+     * a node up by pc (`node_at_pc`), on the cold path only. `node_at` (index)
+     * is thus a CODEGEN-ONLY accessor. See `node_table`.
      */
     std::vector<const Construct *> ast_nodes;
 
     const Construct *node_at(int idx) const
     {
         return idx < 0 ? nullptr : ast_nodes[static_cast<size_t>(idx)];
+    }
+
+    /*
+     * AST-NODE SIDE TABLE (pc-keyed) - the runtime home of the residual node
+     * ops, SAME shape/cost as `locs` / `inline_ctxs`: `{pc, Construct*}` sorted
+     * by pc (build_node_table iterates pc-ascending), binary-searched by
+     * `node_at_pc` ONLY on the cold path (a fallback's `node->eval`, a builtin
+     * op's ctor/args). The ops that still need the AST at runtime are:
+     *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (`node->eval`);
+     *   - EmplaceStruct (the ctor node: vm_struct_ctor_def + field carets);
+     *   - the two checked-element/member inc-decs + the flat elem store (dual
+     *     carets the loc table can't hold) etc. - see build_node_table's list.
+     * A 100%-native chunk leaves this EMPTY - a non-empty `node_table` is EXACTLY
+     * the "not yet fully serializable" signal (its `Construct*` is still an AST
+     * pointer; a serializing backend keeps the AST or rejects the chunk). This
+     * is the last non-`locs` side table off the AST-node POOL - the `Instr` no
+     * longer carries a live `node_idx` at runtime (build_node_table clears it).
+     */
+    struct NodeEntry { uint32_t pc; const Construct *node; };
+    std::vector<NodeEntry> node_table;
+
+    /* The AST node of the op at `pc` (exact match; nullptr if none). Binary
+     * search - O(log n), throw / fallback path only. */
+    const Construct *node_at_pc(size_t pc) const
+    {
+        size_t lo = 0, hi = node_table.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (node_table[mid].pc < pc)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < node_table.size() && node_table[lo].pc == pc)
+            return node_table[lo].node;
+        return nullptr;
     }
 };

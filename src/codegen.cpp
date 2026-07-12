@@ -5748,19 +5748,24 @@ static void extract_locs(Chunk &chunk)
  * "not yet serializable" signal. (add_ast_node gives each op a unique index, so
  * no two ops share an entry; a duplicate would just copy the node, still sound.)
  */
-static void compact_ast_nodes(Chunk &chunk)
+/* Flatten every op that STILL needs its AST node at runtime (node_idx >= 0
+ * after extract_locs nulled the loc-only ones) into the pc-keyed `node_table`
+ * side table, then DROP the indexed `ast_nodes` pool + the live `node_idx`s.
+ * After this the runtime looks a node up by pc (node_at_pc), the last AST
+ * reference off the per-Instr field. pc-ascending, so node_table stays sorted. */
+static void build_node_table(Chunk &chunk)
 {
-    if (chunk.ast_nodes.empty())
-        return;
-    std::vector<const Construct *> live;
-    for (Instr &in : chunk.code) {
+    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+        Instr &in = chunk.code[pc];
         if (in.node_idx < 0)
             continue;
-        const int ni = static_cast<int>(live.size());
-        live.push_back(chunk.ast_nodes[static_cast<size_t>(in.node_idx)]);
-        in.node_idx = ni;
+        chunk.node_table.push_back(
+            {static_cast<uint32_t>(pc),
+             chunk.ast_nodes[static_cast<size_t>(in.node_idx)]});
+        in.node_idx = -1;   /* dead now: the runtime uses node_at_pc(pc) */
     }
-    chunk.ast_nodes = std::move(live);
+    chunk.ast_nodes.clear();
+    chunk.ast_nodes.shrink_to_fit();
 }
 
 }  /* namespace */
@@ -5788,7 +5793,7 @@ codegen_chunk(const Block *block, int slot_count)
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     extract_locs(cg.chunk);   /* move div/mod carets to the loc side table */
-    compact_ast_nodes(cg.chunk);   /* minimize the AST-node pool (see above) */
+    build_node_table(cg.chunk);   /* flatten residual nodes -> pc-keyed table */
     return std::move(cg.chunk);
 }
 

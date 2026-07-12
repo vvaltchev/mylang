@@ -3614,10 +3614,11 @@ the loc, records it and **NULLs `node`** — making them AST-free. It migrated t
 div/mod carets of `IntBin`/`FloatBin` (throw via `vm_throw_div0(chunk, pc)`,
 which uses `loc_at`, not `node`) and dropped the dead `node` from the
 non-throwing `JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/`ForLoopStep`. So the whole
-register/loop CORE is now `node`-free. **The `Instr::node` field is now GONE**
-(see *AST-node pool* below): `Instr` holds a 4-byte `node_idx` index into
-`Chunk::ast_nodes`, NOT a raw `Construct*` — so the bytecode has no AST pointer
-to serialize.
+register/loop CORE is now `node`-free. **The runtime `Instr` holds no live AST
+reference** (see *AST-node side table* below): a residual node is looked up by pc
+in the pc-keyed `node_table`, and the codegen-transient `node_idx` handle is
+nulled after codegen — so the bytecode has no AST pointer in its instruction
+stream.
 
 **Foundation step 2 — op-data into the CONST POOL (member key, started).**
 `DictLoadInt`/`DictLoadFloat` (the typed `d.k` / `d[k]` read) are now fully
@@ -3718,7 +3719,8 @@ surfaced a **pre-existing tree-walker bug**: auto-const promoting a write-once
 INDEX var (`var i=1; a[i]++`) dropped its decl but `fold_reads` had no
 `IncDecExpr` case, dangling the promoted `i` — fixed by folding the READS in an
 inc-dec lvalue like an assignment lvalue. **Net: all of `bench/` and `samples/`
-lower with an EMPTY `ast_nodes` pool (100% native, serializable).**
+lower with an EMPTY `node_table` (100% native, serializable) — except the two
+struct benches that keep one `EmplaceStruct` ctor node each.**
 
 **Error-path constructs → native throwing ops (`ThrowRuntimeV`).** The
 always-throwing constructs the tree-walker ran and threw on are now native: an
@@ -3847,29 +3849,35 @@ the dyn scalar/element/member inc-dec, `append` to a struct member, the common
 `InlinedCallExpr`, typed NON-scalar decls, `defined(<never-declared>)`, and a
 runtime-`const` rebind are all now native (above).
 
-**The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
-The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index
-into `Chunk::ast_nodes` (a `vector<const Construct*>`), so a serialized `.myv`
-has no AST pointer in its instruction stream. The pool holds ONLY the nodes an
-op still needs at RUNTIME: the fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`,
-`node->eval`), the builtin-call ops (`CallBuiltinV`/`LV`/`LVElem`,
-`EmplaceStruct`, `CheckFuncV`/`MapFilterV` — the args `ExprList` for per-arg
-carets), `CallValueGenericV` (its args + callee), `IncDecElemCheckedV`/
-`IncDecMemberCheckedV` (their DUAL error carets — subscript/member vs inc-dec
-loc, above), and the flat int/float
-element store (`node->start` for its OOB/div0 caret). Built during codegen
-(`Codegen::add_ast_node` appends + returns the
-index; the pool absorbs codegen rollbacks harmlessly), then **`extract_locs`
-nulls** the loc-only ops' `node_idx` (their caret is in the loc side table) and
-an explicit KEEP-list marks the genuine runtime-node ops, `default` nulling the
-rest; a final **`compact_ast_nodes`** rebuilds the pool with only the still-live
-entries (dropping the loc-only + rollback orphans). So a **fully-native chunk
-ends with an EMPTY pool** — a non-empty `ast_nodes` is EXACTLY the "this chunk
-still needs the AST, a `.myv` writer must keep it or reject" signal (`-vd` dumps
-it labelled *NOT serializable*). This is the ONE remaining non-serializable pool
-(the loc / member-key / catch-type / literal-obj / closure-def / struct-def /
-unpack-target pools are all plain data or by-name-re-internable). The node-drop
-was ~orthogonal to the VM-exception work (see `plans/vm-fallback-elimination.md`).
+**The AST-NODE SIDE TABLE — `Chunk::node_table` (the indexed `ast_nodes` POOL is
+DROPPED).** A runtime-node op looks its `Construct*` up by **pc** in the
+pc-keyed **`node_table`** (`{pc, Construct*}`, sorted, binary-searched by
+`node_at_pc` on the COLD path only — SAME shape/cost as `locs` / `inline_ctxs`),
+NOT via a per-`Instr` index into a pool. The residual nodes are: the fallbacks
+(`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`), the builtin-call ops
+(`CallBuiltinV`/`LV`/`LVElem`, `EmplaceStruct`, `CheckFuncV`/`MapFilterV` — the
+args `ExprList` for per-arg carets), `CallValueGenericV` (its args + callee),
+`IncDecElemCheckedV`/`IncDecMemberCheckedV` (their DUAL error carets —
+subscript/member vs inc-dec loc, above), and the flat int/float element store
+(`node->start` for its OOB/div0 caret). **How it's built:** `Instr::node_idx`
+(a 4-byte index into a CODEGEN-TRANSIENT `Chunk::ast_nodes`, appended by
+`Codegen::add_ast_node`) is the SPLICE-STABLE handle codegen needs before an
+op's final pc is known (ops grow + roll back, and an index survives that where a
+pc would not); `extract_locs` nulls the loc-only ops' `node_idx` (their caret is
+in the loc side table) and a KEEP-list marks the genuine runtime-node ops; then
+**`build_node_table`** (post-`extract_locs`, pcs final) flattens each surviving
+`{pc → ast_nodes[node_idx]}` into `node_table`, NULLS every live `node_idx`, and
+CLEARS `ast_nodes`. So the finished chunk carries NO indexed pool and NO live
+per-`Instr` `node_idx` — the runtime uses `node_at_pc(pc)` (`node_idx` stays a
+codegen-only handle, always `-1` at runtime; one `Instr` layout, no codegen-vs-
+runtime split). A **fully-native chunk ends with an EMPTY `node_table`** — a
+non-empty one is EXACTLY the "this chunk still needs the AST, a `.myv` writer
+must keep it or reject" signal (`-vd` dumps it labelled *NOT serializable*).
+This is the ONE remaining non-serializable side table (the loc / member-key /
+catch-type / literal-obj / closure-def / struct-def / unpack-target / chain-locs
+/ inline-frames pools are all plain data or by-name-re-internable). The
+node-drop was ~orthogonal to the VM-exception work (see
+`plans/vm-fallback-elimination.md`).
 
 **A THIRD side table — `Chunk::inline_ctxs` (`pc → inline_frames index`, P8 Inc
 4).** Same shape/cost as `locs` (sorted, binary-searched, throw path only),
@@ -3896,12 +3904,12 @@ still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
 `member_keys`, `catch_types`, `literal_objs`, `closure_defs`, `struct_defs`,
-`unpack_targets`, `chain_locs`, the `ast_nodes` pool - labelled *NOT
+`unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT
 serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
 ones only). This is the audit surface for the `.myv` stored-bytecode endgame:
 everything a serialized file must hold is visible in the dump, and — now that
 `inline_ctxs` is flattened into the serializable `inline_frames` pool — a
-non-empty `ast_nodes` is the ONE remaining section that says the AST can't yet
+non-empty `node_table` is the ONE remaining section that says the AST can't yet
 be dropped for that chunk.
 
 ## Invariants & hazards (defense in depth)

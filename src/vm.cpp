@@ -875,13 +875,14 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
         case OpCode::EvalStmt: {
 
-            EvalValue &&tmp = chunk.node_at(in.node_idx)->eval(&ctx);
+            const Construct *node = chunk.node_at_pc(pc);
+            EvalValue &&tmp = node->eval(&ctx);
 
             /* An unresolved name surfaces as an UndefinedId sentinel, which
              * Block::do_eval turns into UndefinedVariableEx. */
             if (tmp.is<UndefinedId>())
                 throw UndefinedVariableEx(tmp.get<UndefinedId>().id,
-                                          chunk.node_at(in.node_idx)->start, chunk.node_at(in.node_idx)->end);
+                                          node->start, node->end);
 
             /* A `return` from a function body (this statement was a ReturnStmt,
              * or a fallback loop/block that returned) stops the chunk; the
@@ -900,7 +901,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
 
         case OpCode::JumpIfFalse:
-            if (vm_eval_cond(chunk.node_at(in.node_idx), &ctx))
+            if (vm_eval_cond(chunk.node_at_pc(pc), &ctx))
                 pc++;
             else
                 pc = in.target;
@@ -974,7 +975,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * in .a, +/- in .aop. Keeps the node (IncDecExpr) for its TWO error
              * carets: the SUBSCRIPT loc (subscript-internal KeyNotFound/OOB) and
              * the INC-DEC loc (its own NotLValue/const/TypeError). */
-            const Construct *node = chunk.ast_nodes[in.node_idx];
+            const Construct *node = chunk.node_at_pc(pc);
             const IncDecExpr *inc = static_cast<const IncDecExpr *>(node);
             const Subscript *sub =
                 static_cast<const Subscript *>(inc->lvalue.get());
@@ -993,7 +994,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * the node (IncDecExpr -> MemberExpr child) for its TWO carets: the
              * MEMBER loc (a KeyNotFound) and the INC-DEC loc (its own NotLValue/
              * const/TypeError). */
-            const Construct *node = chunk.ast_nodes[in.node_idx];
+            const Construct *node = chunk.node_at_pc(pc);
             const IncDecExpr *inc = static_cast<const IncDecExpr *>(node);
             const MemberExpr *m =
                 static_cast<const MemberExpr *>(inc->lvalue.get());
@@ -1776,7 +1777,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             /* A scalar-result call evaluated into a temp (native builtin/call
              * dispatch): the result is then read as an int/float operand. */
-            ctx.frame->at(in.target).put(RValue(chunk.node_at(in.node_idx)->eval(&ctx)));
+            ctx.frame->at(in.target).put(RValue(chunk.node_at_pc(pc)->eval(&ctx)));
             pc++;
             break;
         }
@@ -2000,7 +2001,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * StructObject); vm_emplace_struct handles the flat path + the
              * general fallback and matches the tree-walker append. */
             const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at(in.node_idx));
+                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at_pc(pc));
             LValue *target;
             switch (in.a.lit) {
             case 0:  target = &ctx.frame->at(in.target2); break;
@@ -2204,7 +2205,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * catches. `node` = the CallExpr (its args ExprList + callee caret). */
             const EvalValue &callee = ctx.frame->at(in.a.lit).get();
             const CallExpr *node =
-                static_cast<const CallExpr *>(chunk.node_at(in.node_idx));
+                static_cast<const CallExpr *>(chunk.node_at_pc(pc));
             EvalValue res =
                 dispatch_call_value(&ctx, callee, node, &chunk, pc, true);
             if (g_vm_exc_pending) {                /* FuncObject cross-frame */
