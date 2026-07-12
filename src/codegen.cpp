@@ -2,6 +2,9 @@
 
 #include "codegen.h"
 #include "syntax.h"
+#ifdef ML_DBG_FB
+#include "coderender.h"
+#endif
 
 #include <vector>
 
@@ -241,6 +244,24 @@ bool is_typed_scalar_arg(const Construct *a)
         || dynamic_cast<const LiteralInt *>(a)
         || dynamic_cast<const LiteralFloat *>(a)
         || dynamic_cast<const LiteralBool *>(a);
+}
+
+/* A field arg for POD field `fd` that `coerce_struct_field` provably cannot
+ * throw on: either a typed scalar (above) for a scalar field, OR a NESTED POD
+ * struct construction `Q(..)` whose type IS the field's struct type (an
+ * embedded `f_struct` field of a POD parent). The nested StructCtorV produces
+ * exactly a `Q` StructObject, so the parent's `coerce_struct_field` f_struct
+ * branch (def->name == fd.struct_ty) always passes - no per-arg loc needed.
+ * (A dyn arg, a non-matching struct, or a general/boxed field arg fails and the
+ * whole ctor falls back to the tree-walker, which reports the exact arg loc.) */
+bool pod_ctor_arg_safe(const Construct *a, const FieldDef &fd)
+{
+    if (fd.kind == FieldKind::f_struct) {
+        const CallExpr *ce = dynamic_cast<const CallExpr *>(a);
+        return ce && ce->vm_struct_ctor_def
+            && ce->vm_struct_ctor_def->name == fd.struct_ty;
+    }
+    return is_typed_scalar_arg(a);
 }
 
 /*
@@ -500,6 +521,17 @@ struct Codegen {
         in.target = target;
         in.target2 = target2;
         chunk.code.push_back(in);
+#ifdef ML_DBG_FB
+        if ((op == OpCode::EvalStmt || op == OpCode::EvalToSlot
+             || op == OpCode::JumpIfFalse) && node && getenv("ML_DBG_FB")) {
+            std::string r = ::render_construct_code(node);
+            if (r.size() > 78) r = r.substr(0, 75) + "...";
+            fprintf(stderr, "FB %-13s | %s\n",
+                    op == OpCode::EvalStmt ? "EvalStmt"
+                    : op == OpCode::EvalToSlot ? "EvalToSlot" : "JumpIfFalse",
+                    r.c_str());
+        }
+#endif
         return chunk.code.size() - 1;
     }
 
@@ -839,13 +871,15 @@ struct Codegen {
             if (sdef && ce->args
                 && ce->args->elems.size() == sdef->fields.size()
                 && ce->args->elems.size() <= 16) {
-                /* Every arg must be a scalar the coerce can't throw on
-                 * (is_typed_scalar_arg): a typed int/float OR a scalar literal.
-                 * A nested-struct-field arg (th none, not a scalar literal) or a
-                 * dyn arg fails and falls back. */
+                /* Every arg must be one coerce can't throw on
+                 * (pod_ctor_arg_safe): a typed scalar for a scalar field, OR a
+                 * NESTED POD-struct construction of the exact field type for an
+                 * embedded struct field (`L(P(1,2), P(3,4))`). A dyn/general arg
+                 * fails and falls back. */
                 bool all_typed = true;
-                for (const auto &a : ce->args->elems)
-                    if (!is_typed_scalar_arg(a.get())) {
+                for (size_t ai = 0; ai < ce->args->elems.size(); ai++)
+                    if (!pod_ctor_arg_safe(ce->args->elems[ai].get(),
+                                           sdef->fields[ai])) {
                         all_typed = false;
                         break;
                     }
