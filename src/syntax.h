@@ -750,6 +750,13 @@ public:
      * falling back to the tree-walker's construct_struct. */
     const StructTypeDef *vm_struct_boxed_def = nullptr;
 
+    /* Set by the inferencer when the callee's static type is `dyn` (callable at
+     * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a
+     * generic value-call that dispatches on the runtime callee (FuncObject /
+     * Builtin / struct descriptor / non-callable), byte-identical to the
+     * tree-walker's CallExpr::do_eval. */
+    bool vm_dyn_callee = false;
+
     /* Set by the inferencer's fold_type_query when this is a type-query builtin
      * call (type/decltype/typestr/kindstr) whose answer it BAKED into args[0] (a
      * LiteralStr/LiteralObj). The call is then equivalent to args[0], so the VM
@@ -774,6 +781,7 @@ public:
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
         c->vm_struct_boxed_def = vm_struct_boxed_def;
+        c->vm_dyn_callee = vm_dyn_callee;
         c->tq_folded = tq_folded;
         return c;
     }
@@ -805,6 +813,7 @@ public:
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
         c->vm_struct_boxed_def = vm_struct_boxed_def;
+        c->vm_dyn_callee = vm_dyn_callee;
         return c;
     }
 };
@@ -831,6 +840,7 @@ public:
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
         c->vm_struct_boxed_def = vm_struct_boxed_def;
+        c->vm_dyn_callee = vm_dyn_callee;
         return c;
     }
 };

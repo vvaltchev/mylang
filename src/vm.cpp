@@ -1876,6 +1876,32 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::CallValueGenericV: {
+            /* Generic indirect call of a DYN callee: read the callee (evaluated
+             * into `a.lit`) and dispatch on its runtime type via the shared
+             * dispatch_call_value (FuncObject / Builtin / struct / non-callable)
+             * - byte-identical to CallExpr::do_eval. A FuncObject body runs
+             * native (as_signal routes its cross-frame VM exception); a Builtin/
+             * struct/non-callable error is a plain C++ throw the boundary
+             * catches. `node` = the CallExpr (its args ExprList + callee caret). */
+            const EvalValue &callee = ctx.frame->at(in.a.lit).get();
+            const CallExpr *node =
+                static_cast<const CallExpr *>(chunk.node_at(in.node_idx));
+            EvalValue res =
+                dispatch_call_value(&ctx, callee, node, &chunk, pc, true);
+            if (g_vm_exc_pending) {                /* FuncObject cross-frame */
+                vm_flush_inline(chunk, pc, *g_vm_exc_pending);
+                if (vm_dispatch_exc(handlers, pc)) {
+                    vm_exc = std::move(g_vm_exc_pending);
+                    continue;
+                }
+                return;
+            }
+            ctx.frame->at(in.target).put(std::move(res));
+            pc++;
+            break;
+        }
+
         case OpCode::CheckFuncV:
             /* map/filter's arg0 guard: throw (arg0's caret, from the loc side
              * table) if it isn't a function, BEFORE arg1's code runs - the

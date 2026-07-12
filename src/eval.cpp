@@ -1265,6 +1265,53 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
     return target->get();
 }
 
+/*
+ * Shared call DISPATCH: `callable` is the ALREADY-evaluated callee value, `node`
+ * the CallExpr (for its args + carets). A Builtin runs its ExprList ABI, a
+ * FuncObject calls do_func_call (its body runs native under -vm via the hook), a
+ * struct descriptor constructs; anything else is NotCallableEx at the callee's
+ * caret. Reused by the tree-walker's CallExpr::do_eval (ck=null, as_signal=false)
+ * AND the VM's generic value-call op (CallValueGenericV: &chunk, pc,
+ * as_signal=true) so the two engines dispatch byte-identically.
+ */
+EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
+                              const CallExpr *node, const Chunk *ck,
+                              size_t pc, bool as_signal)
+{
+    try {
+
+        if (callable.is<Builtin>())
+            return callable.get<Builtin>().func(ctx, node->args.get());
+
+        if (callable.is<intrusive_ptr<FuncObject>>()) {
+            return do_func_call(
+                ctx,
+                *callable.get<intrusive_ptr<FuncObject>>().get(),
+                node->args->elems,
+                node->start,     /* call site = the CallExpr's location */
+                node->inline_ctx,/* virtual frames if this call is inlined */
+                ck, pc, as_signal
+            );
+        }
+
+        /* Calling a struct type descriptor constructs an instance. By this
+         * point a named call has been desugared to positional. */
+        if (callable.is<StructTypeDef *>())
+            return construct_struct(ctx, callable.get<StructTypeDef *>(),
+                                    node->args.get());
+
+    } catch (Exception &e) {
+
+        if (!e.loc_start) {
+            e.loc_start = node->args->start;
+            e.loc_end = node->args->end;
+        }
+        throw;
+    }
+
+    throw NotCallableEx(node->what->start, node->what->end);
+}
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     /* A FOLDED type query (type/decltype/typestr/kindstr): the inferencer baked
@@ -1285,39 +1332,8 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
         throw;
     }
 
-    const EvalValue &callable = callable_storage;
-
-    try {
-
-        if (callable.is<Builtin>())
-            return callable.get<Builtin>().func(ctx, args.get());
-
-        if (callable.is<intrusive_ptr<FuncObject>>()) {
-            return do_func_call(
-                ctx,
-                *callable.get<intrusive_ptr<FuncObject>>().get(),
-                args->elems,
-                start,           /* call site = this CallExpr's location */
-                inline_ctx       /* virtual frames if this call is inlined */
-            );
-        }
-
-        /* Calling a struct type descriptor constructs an instance. By this
-         * point a named call has been desugared to positional. */
-        if (callable.is<StructTypeDef *>())
-            return construct_struct(ctx, callable.get<StructTypeDef *>(),
-                                    args.get());
-
-    } catch (Exception &e) {
-
-        if (!e.loc_start) {
-            e.loc_start = args->start;
-            e.loc_end = args->end;
-        }
-        throw;
-    }
-
-    throw NotCallableEx(what->start, what->end);
+    return dispatch_call_value(ctx, callable_storage, this,
+                               nullptr, 0, false);
 }
 
 /*

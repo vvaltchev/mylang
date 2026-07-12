@@ -646,6 +646,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "call.val     " << D(in.target) << " = " << D(in.target2)
                 << arglist(chunk, in.a.lit, in.b.lit);
             break;
+        case OpCode::CallValueGenericV:
+            /* generic dyn-callee dispatch; args bound from the node. */
+            row << "call.val.dyn " << D(in.target) << " = " << D(in.a.lit)
+                << "(...)   ; dyn dispatch";
+            break;
         case OpCode::CheckFuncV:
             row << "check.func   " << RI(in.a, false)
                 << "  ; throw if not a function";

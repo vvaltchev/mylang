@@ -1983,7 +1983,7 @@ struct Codegen {
         if (dynamic_cast<const DirectCallExpr *>(call)
             || dynamic_cast<const DirectBuiltinCallExpr *>(call))
             return false;
-        if (!call->vm_direct_func || !call->args)
+        if ((!call->vm_direct_func && !call->vm_dyn_callee) || !call->args)
             return false;
 
         const size_t mark = ops.size();
@@ -1996,6 +1996,24 @@ struct Codegen {
             return false;
         }
 
+        /* A DYN callee: compile only the callee (native load), then dispatch on
+         * its runtime type via CallValueGenericV (the args are bound from the
+         * node — a dyn callee may be a builtin/struct that needs the arg AST, so
+         * they can't be pre-evaluated into a register run here). */
+        if (!call->vm_direct_func) {
+            const int dstg = alloc_temp();
+            Instr cvg;
+            cvg.op = OpCode::CallValueGenericV;
+            cvg.node_idx = add_ast_node(call);   /* args ExprList + callee caret */
+            cvg.target = dstg;
+            cvg.a = int_lit(callee_slot);
+            ops.push_back(cvg);
+            out_slot = dstg;
+            return true;
+        }
+
+        /* A Func-typed callee (always a FuncObject): pre-evaluate the args into a
+         * register run and call it natively (CallValueV). */
         int argbase;
         if (!emit_args_range(call->args->elems, argbase, ops)) {
             ops.resize(mark);
@@ -5000,6 +5018,14 @@ static void extract_locs(Chunk &chunk)
          * nulled). Everything NOT listed anywhere here sets a node it never uses
          * at runtime - the default nulls it, so a fully-native chunk's pool is
          * empty (the accurate "not serializable yet" signal). */
+        case OpCode::CallValueGenericV:
+            /* KEEP the node (its args ExprList + callee caret are used at
+             * runtime by dispatch_call_value) AND record the CALL-SITE loc:
+             * do_func_call resolves loc_at(pc) for a FuncObject callee's
+             * backtrace call-site (== the CallExpr's start). */
+            chunk.locs.push_back(
+                {static_cast<uint32_t>(pc), node->start, node->end});
+            break;   /* node_idx kept */
         case OpCode::EvalStmt:
         case OpCode::EvalToSlot:
         case OpCode::JumpIfFalse:

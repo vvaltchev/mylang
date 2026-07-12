@@ -720,6 +720,19 @@ enum class OpCode : unsigned char {
     ThrowRuntimeV,
 
     /*
+     * Generic INDIRECT call of a `dyn` callee (`Instr::a` = the callee temp;
+     * `node_idx` = the CallExpr). Reads the callee value and dispatches on its
+     * RUNTIME type via the shared `dispatch_call_value` — a FuncObject (its body
+     * runs native via the do_func_call hook), a Builtin (its ExprList ABI), a
+     * struct descriptor (construct), else NotCallableEx at the callee caret —
+     * byte-identical to the tree-walker's CallExpr::do_eval. This op KEEPS its
+     * node: a dyn callee may resolve to an AST builtin (`defined` — needs the
+     * unevaluated arg node) or a mutating builtin (needs an lvalue arg), so the
+     * arg AST is intrinsically required; only the callee LOAD is native.
+     */
+    CallValueGenericV,
+
+    /*
      * Build a FLAT array<PodStruct> LITERAL `[P(a,b), P(c,d), ..]` into `target`
      * in ONE op - the FUSED form of N StructCtorV + MakeArrayV (F-4). The N
      * structs' field args are compiled INTERLEAVED into the register run

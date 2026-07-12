@@ -355,6 +355,16 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             const Construct *arg0, const CallExpr *ctor,
                             const EvalValue *vals, size_t n);
 
+/* Shared call DISPATCH for an already-evaluated callee value (the VM's
+ * CallValueGenericV + the tree-walker's CallExpr::do_eval): FuncObject /
+ * Builtin / struct descriptor / non-callable, byte-identical. `ck`/`pc` +
+ * `as_signal` route a FuncObject body's cross-frame VM exception (null / false
+ * for the tree-walker). See eval.cpp. */
+struct Chunk;
+EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
+                              const CallExpr *node, const Chunk *ck,
+                              size_t pc, bool as_signal);
+
 /* VM StructCtorV: construct a POD struct standalone `P(x, y)` from its field
  * VALUES (a register run). Only emitted for a typed-scalar-arg POD
  * construction, so coerce cannot throw here. See eval.cpp. */

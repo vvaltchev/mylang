@@ -470,6 +470,30 @@ static const std::vector<test> tests =
         },
     },
 
+    /* A DYN callee is dispatched generically at runtime (VM: CallValueGenericV,
+     * byte-identical to the tree-walker's CallExpr::do_eval) - it may hold a
+     * FUNC, a read-only BUILTIN, a MUTATING builtin, an AST builtin, or a STRUCT
+     * descriptor; a non-callable value throws NotCallableEx. The differential
+     * exercises each under -vm. */
+    {
+        "dyn callee: generic dispatch over func / builtin / struct",
+        {
+            "struct P { int x; int y; }",
+            "var dyn f = func(n) => n * 2; assert(f(21) == 42);",
+            "var dyn b = len; assert(b(\"hello\") == 5);",
+            "var arr = [1, 2]; var dyn m = append; m(arr, 3);",
+            "assert(arr == [1, 2, 3]);",
+            /* c(..) is a dyn call, so its result is dyn (needs `var dyn`). */
+            "var dyn c = P; var dyn p = c(4, 5);",
+            "assert(p.x == 4 && p.y == 5);",
+        },
+    },
+    {
+        "dyn callee: a non-callable value throws NotCallableEx",
+        { "var dyn a = 5; a(1);" },
+        &typeid(NotCallableEx), 16, 0, 18, 0,
+    },
+
     {
         "rebind of const builtins is not allowed",
         {

@@ -1474,6 +1474,9 @@ void Inferencer::annotate_hints(Construct *n)
     if (auto *call = dynamic_cast<CallExpr *>(n)) {
         StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
         call->vm_direct_func = ct->kind == StaticTypeKind::Func;
+        /* A `dyn` callee is resolved at runtime (func / builtin / struct desc /
+         * non-callable): the VM dispatches it generically (CallValueGenericV). */
+        call->vm_dyn_callee = ct->kind == StaticTypeKind::Dyn;
     }
 
     /* Native-foreach hint: a single, non-indexed loop var over a flat
