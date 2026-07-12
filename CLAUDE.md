@@ -3558,12 +3558,20 @@ loops (each condition/statement dispatched by its own kind) and **counted `for`
 loops** — the last via a **fused `ForLoopStep`** superinstruction (`i += step` +
 test + branch in one dispatch, matching the tree-walker's raw-C `ForRangeStmt`
 counter; a naive 3-op encoding regressed +28%, the fused op wins). A counted
-loop's **bound may be non-trivial** — `for (i; i < len(s); i++)`, `i < f()` —
-not just a slot/immediate: `try_native_for_range` compiles such a bound once
-a reserved temp (the for-range specializer proved it loop-immutable) that
+loop's **bound AND step may be non-trivial** — `for (i; i < len(s); i++)`,
+`i < f()`, `i += st[0]` —
+not just a slot/immediate: `try_native_for_range` compiles each once into
+a reserved temp (the for-range specializer proved them loop-immutable) that
 `ForLoopStep` re-reads each iteration, so a `len()`-bounded counted loop (and
 nested forms) goes native instead of falling back — e.g. `30_str_index_iterate`
-1.03x→0.80x vs the tree-walker. This is where
+1.03x→0.80x vs the tree-walker. **The temps compile AFTER the loop's `init`**,
+matching `ForRangeStmt::do_eval`'s init → bound → step order — compiling the
+bound first evaluated it BEFORE a side-effecting init that changed it (a real
+wrong-result `-vm` divergence, pinned by the "init evaluates BEFORE the
+once-read bound" test). A general (non-range) `for` also lowers with **no
+cond** (`for (;;)` — an unconditional loop exiting via break/return, like the
+tree-walker) and with a **BOXED increment** (`out += "x"`, a dyn `d++` — the
+same three-tier statement dispatch as any body statement). This is where
 the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
 −71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** runs these
 loops inside **function bodies** too: `do_func_call` is hooked to run a callee's

@@ -808,7 +808,17 @@ is deleted.
    (c) resolver: hoist bare-stmt bodies too. Once fixed, `gen_stmt`'s
    non-global-FuncDeclStmt fallback is provably DEAD in scripts (the
    REPL never runs codegen) → delete it. See the fork list (step 10).
-5. for(;;) + boxed inc + non-operand for-range step. [EASY]
+5. ✅ **DONE (2026-07-14)** for(;;) + boxed inc + non-operand for-range
+   step — all native. AND a real WRONG-RESULT `-vm` bug found + fixed
+   while here: `try_native_for_range` compiled a non-trivial bound temp
+   BEFORE the init, but `ForRangeStmt::do_eval` runs init → bound → step,
+   so a side-effecting init that changes the bound diverged
+   (`for (var i = drop(x); i < len(x); i++)` gave 3 on -vm vs the
+   tree-walker's 2). The init now emits FIRST; the step gets the same
+   compiled-temp path as the bound (a subscript-read step `i += st[0]`
+   lowers); `for (;;)` is an unconditional native loop (exit via
+   break/return); a boxed inc (`out += "x"`) uses the three-tier
+   statement dispatch. Four new tests incl. the order pin.
 6. Typed i/f decl/assign coerce store (a coerce flag on the store path).
 7. Nested-try flow (chained finally inlining) + inline-return-across-try.
 8. Foreach residual shapes (indexed dyn, >2-var dyn, unproven container).

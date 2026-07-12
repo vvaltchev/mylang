@@ -2747,6 +2747,32 @@ static const std::vector<test> tests =
       { "var s = 0; for (var i = 0; i <= 5; i++) { s += i; } assert(s == 15);",
         "var t = 0; for (var i = 5; i > 0; i--) { t += i; }",
         "assert(t == 15);" } },
+    /* ForRangeStmt::do_eval order is init -> bound -> step: a side-effecting
+     * INIT that changes the (once-evaluated) bound must be honored. This was
+     * a real -vm WRONG-RESULT divergence (the codegen compiled the bound temp
+     * BEFORE the init, reading len 3 where the tree-walker read 2). */
+    { "for-range: the init evaluates BEFORE the once-read bound",
+      { "func drop(v) { pop(v); return 0; }",
+        "var x = [1, 2, 3]; var s = 0;",
+        "for (var i = drop(x); i < len(x); i++) { s += 1; }",
+        "assert(s == 2);" } },
+    /* A loop-immutable but NON-OPERAND step (a subscript read) evaluates once
+     * into a reserved temp, like the bound. */
+    { "for-range: a subscript-read step evaluates once (native)",
+      { "var st = [3]; var s = 0;",
+        "for (var i = 0; i < 10; i += st[0]) { s += i; }",
+        "assert(s == 18);" } },                          /* 0+3+6+9 */
+    /* `for (;;)` (no cond) is an unconditional native loop: it exits via
+     * break/return, or genuinely runs forever - like the tree-walker. */
+    { "for(;;): no-cond loop exits via break / return",
+      { "var i = 0; for (;;) { i++; if (i > 3) { break; } } assert(i == 4);",
+        "func f() { for (;;) { return 7; } } assert(f() == 7);" } },
+    /* A BOXED loop increment (a string compound) takes the same three-tier
+     * statement dispatch as any other statement. */
+    { "for: a boxed (string-compound) increment compiles",
+      { "var out = \"\"; var n = 0;",
+        "for (var i = 0; i < 3; out += \"x\") { i++; n += 1; }",
+        "assert(out == \"xxx\"); assert(n == 3);" } },
     { "for-range: a len(arr) bound (pure builtin, arr not mutated)",
       { "var a = [10, 20, 30, 40]; var s = 0;",
         "for (var i = 0; i < len(a); i++) { s += a[i]; }",

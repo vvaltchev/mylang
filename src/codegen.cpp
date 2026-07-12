@@ -4604,19 +4604,29 @@ struct Codegen {
         const size_t start = chunk.code.size();
         const int saved_base = temp_base;
 
+        /* `init` FIRST (`var i = start`, once): ForRangeStmt::do_eval's order
+         * is init -> bound -> step, and the init may have SIDE EFFECTS a
+         * non-trivial bound reads (`for (var i = drop(x); i < len(x); i++)`
+         * with drop popping x) - compiling the bound first evaluated it
+         * BEFORE the init, a real wrong-result -vm divergence (pinned by the
+         * "for-range evaluates init before the bound" test). */
+        emit_init(f->init.get());
+
         /* The bound + step are loop-immutable (the for-range specializer proved
-         * it), so evaluate ONCE. A simple int operand (a slot or immediate) is
-         * used directly; a non-trivial bound - `len(s)`/`f()`/an arith chain -
-         * compiles into a temp reserved for the whole loop, which ForLoopStep
-         * re-reads each iteration (its value is fixed). This is what lets a
-         * `for (i; i < len(x); i++)` counted loop go native instead of falling
-         * back to node->eval. */
+         * it), so evaluate ONCE - after the init. A simple int operand (a slot
+         * or immediate) is used directly; a non-trivial bound OR step -
+         * `len(s)`/`f()`/an arith chain/a subscript read - compiles into a
+         * temp reserved for the whole loop, which ForLoopStep re-reads each
+         * iteration (its value is fixed). This is what lets a
+         * `for (i; i < len(x); i++)` counted loop (and a non-operand step
+         * `i += st[0]`) go native instead of falling back to node->eval. */
         Operand bound;
         if (!as_int_operand(f->bound.get(), bound)) {
             reset_temps();
             int bslot;
             if (!compile_boxed_expr(f->bound.get(), bslot, chunk.code)) {
                 chunk.code.resize(start);
+                temp_base = saved_base;
                 return false;
             }
             bound = slot_op(bslot);
@@ -4625,15 +4635,19 @@ struct Codegen {
         Operand step;
         if (f->step) {
             if (!as_int_operand(f->step.get(), step)) {
-                chunk.code.resize(start);
-                temp_base = saved_base;
-                return false;
+                reset_temps();
+                int sslot;
+                if (!compile_boxed_expr(f->step.get(), sslot, chunk.code)) {
+                    chunk.code.resize(start);
+                    temp_base = saved_base;
+                    return false;
+                }
+                step = slot_op(sslot);
+                temp_base = next_temp;   /* reserve the step temp too */
             }
         } else {
             step = int_lit(1);
         }
-
-        emit_init(f->init.get());                   /* `var i = start`, once */
 
         const Operand ci = slot_op(f->i_slot);
 
@@ -4677,18 +4691,16 @@ struct Codegen {
      *   <init once>  Lstart: <cond> JmpUnlessCmp -> Lend ; <body> ; <inc> ;
      *   Jump Lstart ; Lend:
      * The cond re-runs each iteration; the inc runs after the body. Fires when
-     * the cond is an int/float comparison, the body compiles (scalar / nested /
-     * flow-free EvalStmt - the any_native gate applies), and the inc is a
-     * compilable scalar statement. Self-truncating. The loop var must be a
-     * frame slot (so running init/inc in place is sound, no child scope) - the
-     * operand compilers enforce that. A break/continue/return in the body isn't
-     * flow-free, so the whole loop falls back (correct).
+     * the cond compiles (int/float compare, split `&&`, or a boxed truthiness
+     * test) OR is ABSENT (`for (;;)` - no exit branch; it leaves via a native
+     * break/return/throw, or genuinely runs forever, like the tree-walker),
+     * the body compiles (scalar / nested / flow-free EvalStmt - the any_native
+     * gate applies), and the inc is a compilable int/float/boxed statement.
+     * Self-truncating. The loop var must be a frame slot (so running init/inc
+     * in place is sound, no child scope) - the operand compilers enforce that.
      */
     bool try_native_for(const ForStmt *f)
     {
-        if (!f->cond)
-            return false;   /* no cond (infinite loop) -> fall back */
-
         const size_t start = chunk.code.size();
 
         if (f->init)
@@ -4699,9 +4711,12 @@ struct Codegen {
         /* The condition -> native compare-branch(es) to the exit, sharing the
          * while path's helper: an int/float compare, a split `A && B`, or a
          * boxed truthiness test (a bool var / `||` / dyn). Bails the loop only
-         * if even the boxed path can't compile the cond. */
+         * if even the boxed path can't compile the cond. NO cond (`for (;;)`)
+         * = an unconditional loop: no exit branch at all - it leaves via a
+         * break / return / throw in the body (or genuinely runs forever),
+         * exactly like the tree-walker's missing-cond ForStmt. */
         std::vector<size_t> exit_jumps;
-        if (!emit_cond_jumps(f->cond.get(), exit_jumps)) {
+        if (f->cond && !emit_cond_jumps(f->cond.get(), exit_jumps)) {
             chunk.code.resize(start);
             return false;
         }
@@ -4715,7 +4730,9 @@ struct Codegen {
 
         const int lcont = here();   /* continue -> the inc, then re-test */
 
-        /* The increment, each iteration after the body (int or float). */
+        /* The increment, each iteration after the body (int, float, or a
+         * BOXED statement - a dyn `d++`, a string compound `s += "x"`: the
+         * same three-tier dispatch every statement gets). */
         if (f->inc) {
             reset_temps();
             const size_t imark = chunk.code.size();
@@ -4723,9 +4740,13 @@ struct Codegen {
                 chunk.code.resize(imark);
                 reset_temps();
                 if (!compile_float_stmt(f->inc.get(), chunk.code)) {
-                    loops.pop_back();
-                    chunk.code.resize(start);
-                    return false;
+                    chunk.code.resize(imark);
+                    reset_temps();
+                    if (!compile_boxed_stmt(f->inc.get(), chunk.code)) {
+                        loops.pop_back();
+                        chunk.code.resize(start);
+                        return false;
+                    }
                 }
             }
         }
