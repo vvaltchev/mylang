@@ -1288,6 +1288,33 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::UnpackElemTargets: {
+            /* STRICT foreach-unpack with a per-position target list (a `_`
+             * placeholder / non-consecutive slots): read pairs[i] (a general
+             * outer element = a sub-array), check length == N, then bind each
+             * element box-free (vm_arr_elem) to targets[k] (skip -1 == `_`). */
+            const EvalValue &base_v = ctx.frame->at(in.target2).get();
+            ML_VM_CHECK(base_v.is<SharedArrayObj>());
+            const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
+            const int_type idx = read_int_operand(in.a, &ctx);
+            const EvalValue &elem =
+                outer.get_vec()[outer.offset() + idx].get();
+            const int_type N = in.b.lit;
+            if (!elem.is<SharedArrayObj>())
+                vm_throw_unpack_nonarray(chunk, pc, N);
+            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
+            if (sub.size() != static_cast<size_type>(N))
+                vm_throw_unpack_len(chunk, pc, sub.size(), N);
+            const std::vector<int32_t> &targets =
+                chunk.unpack_targets[in.target];
+            for (int_type k = 0; k < N; k++)
+                if (targets[k] >= 0)
+                    ctx.frame->at(targets[k]).put(
+                        vm_arr_elem(elem, static_cast<size_type>(k)));
+            pc++;
+            break;
+        }
+
         case OpCode::StoreElemInt: {
 
             /* a[i] = v / a[i] OP= v for a flat mutable int array (mirrors the

@@ -3076,9 +3076,15 @@ targets follow it (`unpack_base = base + 1`, width `N - 1`). The inferencer's
 sub-array's ELEMENT type (`dyn`/`str`), not the whole sub-array — matching
 `do_iter` (which destructures the element), a latent front-end bug shopping
 survived only because it used the vars in lenient builtins (`rpad`/`str`), never
-arithmetic. A `_` (breaks slot↔position) or a non-consecutive/non-local target
-falls back. `20_foreach_unpack` (flat) 0.80x, `75_indexed_unpack` (indexed str)
-0.71x vs the tree-walker.
+arithmetic. A **`_` placeholder or a non-consecutive slot layout** (the loop
+vars don't land in one contiguous run — a `_` gets NO slot) takes the
+**`UnpackElemTargets`** variant: same op shape, but the per-position target
+slots live in the **`Chunk::unpack_targets`** pool (`-1` for a `_`, which is
+skipped) and each element binds box-free via `vm_arr_elem` (flat or general —
+so it covers int/float/str/dyn sub-arrays uniformly). Handles the non-indexed
+`foreach (a, _, c in pairs)` AND the indexed `foreach (i, _, v in indexed
+rows)`. A non-local target still falls back. `20_foreach_unpack` (flat) 0.80x,
+`75_indexed_unpack` (indexed str) 0.71x vs the tree-walker.
 **Dict `foreach (k, v in d)` / `foreach (k in d)`** is native via a **LIVE
 dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
 but a while-shaped loop over two ops: **`DictIterInit`** pins the dict

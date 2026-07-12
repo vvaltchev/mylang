@@ -4689,18 +4689,41 @@ struct Codegen {
         const int nunpack = N - (fe->indexed ? 1 : 0);
         if (nunpack < 2)
             return false;
+        /* Build the per-unpack-position target slots (-1 for a `_` placeholder).
+         * `base` is ids[0]'s slot (the counter for an indexed loop). A `_` or a
+         * non-consecutive layout switches to UnpackElemTargets (a targets pool);
+         * the all-real consecutive case keeps the tuned UnpackElem run. */
         int base = -1;
+        const int first = fe->indexed ? 1 : 0;
+        std::vector<int32_t> targets;
+        bool consecutive = true;
         for (int k = 0; k < N; k++) {
             const Identifier *id =
                 dynamic_cast<const Identifier *>(fe->ids->elems[k].get());
-            if (!id || id->is_underscore() || id->sym.kind != SymKind::local)
+            if (!id)
                 return false;
-            if (k == 0)
+            if (k < first) {                 /* the index var: real local */
+                if (id->is_underscore() || id->sym.kind != SymKind::local)
+                    return false;
                 base = id->sym.slot;
-            else if (id->sym.slot != base + k)
+                continue;
+            }
+            const int pos = static_cast<int>(targets.size());
+            if (id->is_underscore()) {
+                targets.push_back(-1);
+                consecutive = false;
+                continue;
+            }
+            if (id->sym.kind != SymKind::local)
                 return false;
+            targets.push_back(id->sym.slot);
+            if (pos == 0) {
+                if (first == 0) base = id->sym.slot;
+            } else if (id->sym.slot != targets[0] + pos) {
+                consecutive = false;
+            }
         }
-        const int unpack_base = base + (fe->indexed ? 1 : 0);
+        const int unpack_base = consecutive ? targets[0] : -1;
 
         const size_t start = chunk.code.size();
         reset_temps();
@@ -4749,11 +4772,19 @@ struct Codegen {
          * element's boxed value (UnpackElemValue, for a general/dyn/str/mixed
          * sub-array like shopping's [str, float]). */
         Instr up;
-        up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
-              : fe->unpack_elem_th == TypeHint::f ? OpCode::UnpackElemFloat
-                                                  : OpCode::UnpackElemValue;
+        if (consecutive) {
+            up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
+                  : fe->unpack_elem_th == TypeHint::f ? OpCode::UnpackElemFloat
+                                                      : OpCode::UnpackElemValue;
+            up.target = unpack_base;
+        } else {
+            /* A `_` (or non-consecutive layout): per-position targets pool,
+             * each element bound box-free (vm_arr_elem, flat or general). */
+            up.op = OpCode::UnpackElemTargets;
+            up.target = static_cast<int>(chunk.unpack_targets.size());
+            chunk.unpack_targets.push_back(targets);
+        }
         up.node_idx = add_ast_node(fe->container.get());
-        up.target = unpack_base;
         up.target2 = c;
         up.a = slot_op(i);
         up.b = int_lit(nunpack);
@@ -5219,6 +5250,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
         case OpCode::UnpackElemValue:
+        case OpCode::UnpackElemTargets:
         case OpCode::SliceV:
         case OpCode::StoreGlobalV:   /* compound/inc-dec (plain: node null) */
         case OpCode::StoreCaptureV:

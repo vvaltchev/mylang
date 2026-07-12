@@ -267,6 +267,17 @@ enum class OpCode : unsigned char {
     UnpackElemValue,
 
     /*
+     * The `_`-aware / non-consecutive analogue of UnpackElemValue: instead of a
+     * consecutive `target..+width` run, `target` indexes a Chunk::unpack_targets
+     * per-position slot list (-1 == `_`, skipped). Handles `foreach (var a, _, b
+     * in pairs)` (a `_` gets NO slot, so a/b aren't consecutive-by-position).
+     * `target2` = outer array slot, `a` = index, `b` = the position count (the
+     * strict length). Each element binds box-free via vm_arr_elem (flat or
+     * general). node = the container (strict-throw loc).
+     */
+    UnpackElemTargets,
+
+    /*
      * Native array-element store `a[i] = v` / `a[i] OP= v` (Phase 5): `target2`
      * = the array slot, `a` = the int index operand, `b` = the value operand,
      * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith

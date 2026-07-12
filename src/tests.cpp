@@ -7129,6 +7129,31 @@ static const std::vector<test> tests =
     },
 
     {
+        /* `_` unpack native op (UnpackElemTargets): a leading `_` (skipped) +
+         * a real target, over an array-typed var (so the VM lowers it, not a
+         * const fold). Box-free bind of the general element. */
+        "Underscore leading placeholder in foreach unpack (general)",
+        {
+            "var rows = [[\"x\", 10], [\"y\", 20], [\"z\", 30]];",
+            "var s = 0;",
+            "foreach (var _, v in rows) { s += v; }",
+            "assert(s == 60);",
+        },
+    },
+
+    {
+        /* `_` in the middle with real slots on both sides, flat int sub-arrays,
+         * over a named var. Exercises the targets pool [r _ r]. */
+        "Underscore middle placeholder in foreach unpack (flat int)",
+        {
+            "var pairs = [[1,2,3],[4,5,6],[7,8,9]];",
+            "var s = 0;",
+            "foreach (var a, _, c in pairs) { s += a * c; }",
+            "assert(s == 3 + 24 + 63);",   /* 1*3 + 4*6 + 7*9 */
+        },
+    },
+
+    {
         "Underscore placeholder as a lone foreach var iterates",
         {
             "var n = 0;",

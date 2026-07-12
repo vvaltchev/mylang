@@ -110,6 +110,18 @@ samples use is native). Goal: nativize each → `node` becomes unused → drop i
     element's actual boxed value via `vm_arr_elem` (skind-dispatched) — box-free
     still for the common homogeneous-flat case, sound for the general/mixed
     case. Regression test + shopping parity added.
+  - **F-2c** `foreach (a, _, c in pairs)` — a `_` PLACEHOLDER or a
+    non-consecutive loop-var layout. ✅ DONE (2026-07-13). The existing
+    `UnpackElem{Int,Float,Value}` ops write a CONTIGUOUS slot run, but a `_`
+    gets no slot (resolver skips it) and can sit between real targets, so the
+    run isn't contiguous → the old codegen fell back. Added `UnpackElemTargets`:
+    same op shape, but a per-position target-slot list lives in the
+    `Chunk::unpack_targets` pool (`-1` == `_`, skipped) and each element binds
+    box-free via `vm_arr_elem` (flat or general — one op for int/float/str/dyn
+    sub-arrays). `try_native_foreach_unpack` builds the targets vector, detects
+    `_`/non-consecutive, and emits the tuned contiguous op OR the targets op;
+    covers the non-indexed and indexed forms. node-free (loc side table). Tests
+    added for leading-`_` general + middle-`_` flat-int.
 - **F-3 · indirect call statement** `cmdfunc(data)` - a discarded-result call
   through a func-VALUE var (`phonebook`). ✅ DONE (2026-07-11). DIAGNOSED: the
   EXPRESSION-position value call was already native (`CallValueV`); the gap was

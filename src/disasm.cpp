@@ -488,6 +488,17 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << " = " << D(in.target2) << "[" << RI(in.a, false)
                 << "] (" << in.b.lit << ")";
             break;
+        case OpCode::UnpackElemTargets: {
+            row << "unpack.elem.t targets#" << in.target << " = "
+                << D(in.target2) << "[" << RI(in.a, false) << "] ("
+                << in.b.lit << ") [";
+            const std::vector<int32_t> &tg = chunk.unpack_targets[in.target];
+            for (size_t k = 0; k < tg.size(); k++)
+                row << (k ? " " : "") << (tg[k] < 0 ? "_" : ("r" +
+                    std::to_string(tg[k])));
+            row << "]";
+            break;
+        }
         case OpCode::DictLoadInt:
         case OpCode::DictLoadFloat: {
             const char *mn = in.op == OpCode::DictLoadInt
