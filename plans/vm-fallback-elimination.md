@@ -793,7 +793,21 @@ is deleted.
    InvalidNumberOfArgsEx, args caret. Tests: value+effects, discarded
    statement, arg-throw caret pin, wrong-arity caret pin, node_table-empty
    pool case (e). Every `defined` form is now fold/native.
-4. FuncDeclStmt → LOCAL slot: MakeClosureV + slot bind. [EASY]
+4. ~~FuncDeclStmt → LOCAL slot: MakeClosureV + slot bind~~ — **RESCOPED
+   (2026-07-14): it is a pre-existing LANGUAGE BUG, not a lowering gap.**
+   A named func can NEVER capture (the grammar rejects `func f[x]`
+   everywhere), so the only script route to a masked (local-sym) named
+   func is a func decl as a BRACE-LESS `if`/loop body —
+   `hoist_scoped_decls` only scans Block statement lists, so the name is
+   `declare_masking`'d and `FuncDeclStmt::do_eval`'s `ctx->emplace` hits
+   the asserted-empty script map: `if (c) func g() => 1;` and
+   `while (i < 1) func g() => 1;` ABORT the tree-walker today (braced
+   forms work — they hoist to scoped globals). Fix is a maintainer fork:
+   (a) parser: func/struct decls legal only as block-level statements;
+   (b) parser: normalize brace-less bodies to implicit Blocks;
+   (c) resolver: hoist bare-stmt bodies too. Once fixed, `gen_stmt`'s
+   non-global-FuncDeclStmt fallback is provably DEAD in scripts (the
+   REPL never runs codegen) → delete it. See the fork list (step 10).
 5. for(;;) + boxed inc + non-operand for-range step. [EASY]
 6. Typed i/f decl/assign coerce store (a coerce flag on the store path).
 7. Nested-try flow (chained finally inlining) + inline-return-across-try.
