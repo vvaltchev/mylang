@@ -40,7 +40,7 @@ Chunk codegen_program(const Block *root);
  *     hence from -vd — faithfully, not filtered);
  *   - a non-block or NON-scope-free body (a closure / nested-func body needs its
  *     own child EvalContext, which vm_run_chunk doesn't build);
- *   - an ALL-FALLBACK body (only EvalStmt / control-flow ops): running it via
+ *   - a body with no real op (only control-flow ops): running it via
  *     the VM would only add dispatch over the tree-walker, no win.
  * This is the single source of truth for "which functions have bytecode",
  * shared by the VM's AOT precompile (vm.cpp) and the -vd dump (disasm.cpp).

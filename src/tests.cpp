@@ -13345,8 +13345,9 @@ static bool frame_over_64_slots()
 struct VmOpCounts {
     size_t jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
     size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0, arrlen = 0;
-    size_t storei = 0, storef = 0, loadev = 0, evalstmt = 0;
+    size_t storei = 0, storef = 0, loadev = 0;
     size_t jinn = 0, munpack = 0, idchain = 0, retv = 0, makeclosure = 0;
+    size_t checkfunc = 0, mapfilter = 0;
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, unaryv = 0, loadglobalv = 0;
     size_t subscriptv = 0, definedg = 0;
@@ -13408,12 +13409,13 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::StoreElemInt:     c.storei++; break;
             case OpCode::StoreElemFloat:   c.storef++; break;
             case OpCode::LoadElemValue:    c.loadev++; break;
-            case OpCode::EvalStmt:         c.evalstmt++; break;
             case OpCode::JumpIfNotNoneV:   c.jinn++;   break;
             case OpCode::MultiUnpackV:     c.munpack++; break;
             case OpCode::IncDecChainV:     c.idchain++; break;
             case OpCode::ReturnV:          c.retv++;   break;
             case OpCode::MakeClosureV:     c.makeclosure++; break;
+            case OpCode::CheckFuncV:       c.checkfunc++; break;
+            case OpCode::MapFilterV:       c.mapfilter++; break;
             case OpCode::LoadConstV:       c.loadconstv++; break;
             case OpCode::MoveV:            c.movev++; break;
             case OpCode::BinOpV:           c.binopv++; break;
@@ -13510,7 +13512,7 @@ static bool vm_codegen_shapes()
      * Halt. */
     const bool native_ok =
         a.juic == 2 && a.intbin == 4 && a.back == 0 &&
-        a.evalstmt == 0 && a.jmp >= 1 && a.halt == 1;
+        a.jmp >= 1 && a.halt == 1;
 
     /* 2) a NESTED FUNC DECL in a loop body is NATIVE (MakeClosureV +
      * StoreGlobalV to its scoped-global slot, re-bound each iteration
@@ -13524,13 +13526,14 @@ static bool vm_codegen_shapes()
         }, b))
         return false;
     const bool fallback_ok =
-        b.evalstmt == 0 && b.juic == 1 && b.intbin >= 1 && b.makeclosure >= 1;
+        b.juic == 1 && b.intbin >= 1 && b.makeclosure >= 1;
 
-    /* 2b) the whole-statement fallback NET still exists for a genuinely
-     * uncompilable shape: `show()` (dev-only, allowed under the -rt
-     * harness; compile-rejected in a real script) in a loop CONDITION
-     * fails emit_cond_jumps -> the WHOLE while is one EvalStmt, no per-op
-     * fallback (EvalToSlot/JumpIfFalse are deleted). */
+    /* 2b) `show()` - the LAST node-ABI builtin - FOLDS at compile time
+     * (fold_show_calls: a named function renders via render_func_code, a
+     * non-identifier expression via render_construct_code, both -> a
+     * LiteralStr), so it NEVER reaches codegen (there is no fallback op to
+     * reach). Here the folded string makes the whole while-condition const
+     * -> the loop DCEs / compiles with zero loop ops. */
     VmOpCounts b2;
     if (!codegen_counts({
             "func g2() => 1;",
@@ -13538,8 +13541,10 @@ static bool vm_codegen_shapes()
             "while (len(show(g2)) < 0) { i += 1; }",
         }, b2))
         return false;
-    const bool fallback_net_ok =
-        b2.evalstmt == 1 && b2.back == 0 && b2.juic == 0;
+    /* codegen SUCCEEDING is the pin: an unfolded show() has no ABI and
+     * would abort compilation (throw_not_lowered); the fold left only a
+     * LiteralStr, so the loop lowers like any const-condition while. */
+    const bool fallback_net_ok = b2.halt == 1;
 
     /* 3) a NESTED-expr plain assignment goes native and allocates a temp:
      * `s = i*i + 1` -> IntBin{t=i*i}, IntBin{s=t+1} (+ i++). */
@@ -13659,7 +13664,7 @@ static bool vm_codegen_shapes()
     /* 11) NESTED loops + an `if` in a loop body compile fully native - two
      * ForLoopStep (outer+inner), no EvalStmt in the hot path. The `if` here
      * has a comparison condition, so it is a native JumpUnlessIntCmp (an
-     * evalstmt==0 witnesses that the whole nest lowered, no fallback). */
+     * fallback op even exists - zero-AST by construction). */
     VmOpCounts nl;
     if (!codegen_counts({
             "var a = array(10, 0); var s = 0;",
@@ -13669,7 +13674,7 @@ static bool vm_codegen_shapes()
         }, nl))
         return false;
     const bool nested_native_ok =
-        nl.flstep == 2 && nl.loadei == 1 && nl.evalstmt == 0
+        nl.flstep == 2 && nl.loadei == 1
         && nl.juic >= 1;
 
     /* 12) a COMPOUND array store `a[i] += b[i]` compiles native: one
@@ -13683,7 +13688,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool compound_store_ok =
         cs.storei == 1 && cs.loadei == 1 && cs.flstep == 1
-        && cs.evalstmt == 0;
+       ;
 
     /* 13) a 2-D read `m[i][j]` in nested loops lowers fully native: the outer
      * m[i] via LoadElemValue, the inner [j] via LoadElemInt, two ForLoopStep,
@@ -13698,7 +13703,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool read_2d_ok =
         d2.loadev == 1 && d2.loadei == 1 && d2.flstep == 2
-        && d2.evalstmt == 0;
+       ;
 
     /* 14) a scalar-returning migrated BUILTIN in a loop body (`s += sqrt(i)`)
      * lowers native: a CallBuiltinV for the call (the value ABI), a
@@ -13711,16 +13716,14 @@ static bool vm_codegen_shapes()
         return false;
     const bool builtin_dispatch_ok =
         bd.callbuiltinv == 1 && bd.fbin == 1 && bd.flstep == 1
-        && bd.evalstmt == 0;
+       ;
 
     /* 15) a native loop with a FLOW-FREE fallback body statement still goes
-     * native AROUND the EvalStmt: the counted `for` compiles (ForLoopStep) with
-     * the native `s += i` and an EvalStmt for the still-fallback `map(...)` (an
-     * order-dependent builtin that must stay on the old ABI - it validates its
-     * function arg before evaluating the container; most other flow-free
-     * statements, incl. array literals/append/general stores, struct
-     * construction, AND sort/reverse, are now native). This lets a matrix/sieve
-     * outer loop go native despite a fallback body statement. */
+     * native INCLUDING a discarded `map(...)` statement: the loop-body
+     * DISCARD tier compiles any expression statement into a scratch temp
+     * and drops the result (map lowers via CheckFuncV + MapFilterV - its
+     * validate-arg0-before-arg1 order preserved), so the counted `for`
+     * (ForLoopStep) has NO fallback op - there is none to have. */
     VmOpCounts ab;
     if (!codegen_counts({
             "var s = 0; var a = [3, 1, 2];",
@@ -13728,7 +13731,8 @@ static bool vm_codegen_shapes()
         }, ab))
         return false;
     const bool array_build_ok =
-        ab.flstep == 1 && ab.intbin >= 1 && ab.evalstmt >= 1;
+        ab.flstep == 1 && ab.intbin >= 1 && ab.mapfilter == 1
+        && ab.checkfunc == 1;
 
     /* 16) a GENERAL (non-range) `for` whose cond isn't the counted `i<bound`
      * shape (`f*f <= 100`) still compiles native, lowered to the while form: a
@@ -13742,7 +13746,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool general_for_ok =
         gf.juic == 1 && gf.intbin >= 3 && gf.jmp >= 1 && gf.flstep == 0
-        && gf.evalstmt == 0;
+       ;
 
     /* 17) break/continue in a native loop compile to native Jumps (Gap B), NOT
      * a whole-loop fallback: a counted `for` with `if(i==3) continue;` +
@@ -13768,7 +13772,7 @@ static bool vm_codegen_shapes()
         }, cc))
         return false;
     const bool compound_cond_ok =
-        cc.juic == 2 && cc.evalstmt == 0 && cc.intbin >= 1 && cc.back == 0;
+        cc.juic == 2 && cc.intbin >= 1 && cc.back == 0;
 
     /* 19) the BOXED general-value path: `s = s + "x"` (a string-build loop)
      * lowers to native boxed ops (LoadConstV for "x", BinOpV for the concat via
@@ -13782,7 +13786,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool boxed_ok =
         bx.binopv == 1 && bx.loadconstv >= 1 && bx.flstep == 1
-        && bx.evalstmt == 0;
+       ;
 
     /* 20) boxed COMPOUND-assign: `s += "x"` -> a CompoundV read-modify-write
      * (num_bin_op in place), not a fallback EvalStmt. */
@@ -13794,7 +13798,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool boxed_compound_ok =
         bxc.compoundv == 1 && bxc.loadconstv >= 1 && bxc.flstep == 1
-        && bxc.evalstmt == 0;
+       ;
 
     /* 21) boxed COMPARISON in a condition: `if (x == 5)` (x dyn) -> a CmpV
      * (the boxed comparison) + a JumpUnlessTrueV branch, no fallback. */
@@ -13805,7 +13809,7 @@ static bool vm_codegen_shapes()
         }, bxcmp))
         return false;
     const bool boxed_cmp_ok =
-        bxcmp.cmpv == 1 && bxcmp.jutv == 1 && bxcmp.evalstmt == 0;
+        bxcmp.cmpv == 1 && bxcmp.jutv == 1;
 
     /* 22) boxed LOGICAL condition: `if (x > 0 && x < 20)` (x dyn) -> two
      * CmpV + a LogV + a JumpUnlessTrueV, no fallback. */
@@ -13817,7 +13821,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool boxed_log_ok =
         bxlog.cmpv == 2 && bxlog.logv == 1 && bxlog.jutv == 1
-        && bxlog.evalstmt == 0;
+       ;
 
     /* 23) a boxed NON-LOCAL leaf: `s = s + g` where g is a GLOBAL (read by a
      * function, so escaped) -> a LoadGlobalV feeding a BinOpV. */
@@ -13914,7 +13918,7 @@ static bool vm_codegen_shapes()
                 " while (flag && j < 3) { s += j; j += 1; } i += 1; }",
         }, bvc))
         return false;
-    const bool bool_cond_ok = bvc.jutv >= 1 && bvc.evalstmt == 0;
+    const bool bool_cond_ok = bvc.jutv >= 1;
 
     /* 31) a for-loop whose init reads a VARIABLE (`for (var k = i; ...)`)
      * compiles the init via a boxed move (MoveV), NOT an eval.stmt - the raw
@@ -13927,7 +13931,7 @@ static bool vm_codegen_shapes()
                 " for (var k = i; k < 4; k++) s += k;",
         }, vif))
         return false;
-    const bool var_init_ok = vif.evalstmt == 0 && vif.movev >= 1;
+    const bool var_init_ok = vif.movev >= 1;
 
     /* 32) a const-folded `if (true) { ... }` inside a loop leaves a bare nested
      * block `{ ... }`; the loop-body compiler compiles a scope-free bare block
@@ -13941,7 +13945,7 @@ static bool vm_codegen_shapes()
                 " { if (1 < 2) { s = s + 1; s = s * 2; } }",
         }, blk))
         return false;
-    const bool block_ok = blk.evalstmt == 0 && blk.intbin >= 2;
+    const bool block_ok = blk.intbin >= 2;
 
     /* 33) a DICT MEMBER store `d.k = v` compiles to a DictStore (like `d["k"]`),
      * the member name a string key - not an EvalStmt fallback. */
@@ -13951,7 +13955,7 @@ static bool vm_codegen_shapes()
             "for (var i = 0; i < 3; i++) { d.x = d.x + i; }",
         }, dms))
         return false;
-    const bool dict_member_ok = dms.evalstmt == 0 && dms.dictstore >= 1;
+    const bool dict_member_ok = dms.dictstore >= 1;
 
     /* 34) a STRUCT field store `s.f = v` / `s.f OP= v` compiles to StoreMemberV
      * (a POD field: coerce + byte store), not an EvalStmt fallback. */
@@ -13963,7 +13967,7 @@ static bool vm_codegen_shapes()
         }, sms))
         return false;
     const bool struct_member_ok =
-        sms.evalstmt == 0 && sms.storememberv >= 2;
+        sms.storememberv >= 2;
 
     /* 35) a NESTED store `a[i][j] = v` / `a[i][j] OP= v` (matrix) compiles to
      * StoreElem2V (two-level lvalue), not an EvalStmt fallback. */
@@ -13974,7 +13978,7 @@ static bool vm_codegen_shapes()
                 " for (var j = 0; j < 2; j++) { m[i][j] = i + j; } }",
         }, n2))
         return false;
-    const bool nested_store_ok = n2.evalstmt == 0 && n2.storeelem2 >= 1;
+    const bool nested_store_ok = n2.storeelem2 >= 1;
 
     /* 36) a GLOBAL array-base store `a[i]=v` (a top-level array a function
      * reads is a global slot, not a main-frame local) compiles native - a
@@ -13986,7 +13990,7 @@ static bool vm_codegen_shapes()
             "for (var i = 0; i < 3; i++) { a[i] = i * 2; }",
         }, gs))
         return false;
-    const bool global_store_ok = gs.evalstmt == 0 && gs.storei >= 1;
+    const bool global_store_ok = gs.storei >= 1;
 
     /* 37) a DYN / unproven-base store `d[i]=v` compiles to the UNIVERSAL
      * StoreElemValue (vm_subscript_store dispatches flat/general/dict at
@@ -13997,13 +14001,11 @@ static bool vm_codegen_shapes()
             "for (var i = 0; i < 3; i++) { d[i] = i * 2; }",
         }, uv))
         return false;
-    const bool universal_store_ok = uv.evalstmt == 0 && uv.storeev >= 1;
+    const bool universal_store_ok = uv.storeev >= 1;
 
     /* 38) a try/catch region (P8 Inc 0) lowers natively: PushHandler + one
-     * CatchTest per clause + the enclosing counted loop stays native (for.step).
-     * The `throw` inside is still a fallback EvalStmt (Inc 0), so evalstmt > 0 -
-     * that's expected; what's asserted is the try STRUCTURE is native ops, not
-     * one big EvalStmt for the whole try/catch. A try/FINALLY still falls back. */
+     * CatchTest per clause + the enclosing counted loop stays native
+     * (for.step); the `throw` inside is a native Throw op (P8 Inc 1). */
     VmOpCounts tc;
     if (!codegen_counts({
             "struct E { int v; }",
@@ -14016,7 +14018,7 @@ static bool vm_codegen_shapes()
      * whole try/catch loop has ZERO fallback. */
     const bool try_native_ok =
         tc.pushhandler == 1 && tc.catchtest == 1 && tc.flstep == 1
-        && tc.throwop == 1 && tc.evalstmt == 0;
+        && tc.throwop == 1;
 
     /* P8 Inc 2b: try/finally lowers natively - a handler region + SetPend on
      * each exit + one EndFinally, zero fallback. */
@@ -14029,7 +14031,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool try_finally_native_ok =
         tf.pushhandler == 1 && tf.endfinally == 1 && tf.setpend >= 2
-        && tf.evalstmt == 0;
+       ;
 
     /* P8 Inc 2c: a `return` crossing a finally is native - it INLINES the
      * finally at the return site (so `setpend` stays the plain-finally
@@ -14046,7 +14048,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool ret_finally_native_ok =
         fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend == 2
-        && fr.evalstmt == 0;
+       ;
 
     /* A `break` crossing a finally likewise INLINES the finally at the break
      * site + jumps to the loop exit. The finally `s += 100` is an IntBin,
@@ -14066,7 +14068,7 @@ static bool vm_codegen_shapes()
         return false;
     const bool break_finally_native_ok =
         bf.pushhandler == 1 && bf.endfinally == 1 && bf.setpend == 2
-        && bf.intbin >= 3 && bf.evalstmt == 0;
+        && bf.intbin >= 3;
 
     /* Chaining: a return crossing TWO nested finallys is native - each is
      * inlined at the return (innermost first), so ZERO fallback. Two trys ->
@@ -14083,7 +14085,7 @@ static bool vm_codegen_shapes()
         }, cf))
         return false;
     const bool chain_finally_native_ok =
-        cf.pushhandler == 2 && cf.endfinally == 2 && cf.evalstmt == 0;
+        cf.pushhandler == 2 && cf.endfinally == 2;
 
     /* boxed UNARY `!` in a condition: `if (!x)` (x dyn) -> a UnaryV (the
      * boxed unary) feeding a JumpUnlessTrueV branch, no fallback. */
@@ -14094,7 +14096,7 @@ static bool vm_codegen_shapes()
         }, un))
         return false;
     const bool unary_cond_ok =
-        un.unaryv == 1 && un.jutv == 1 && un.evalstmt == 0;
+        un.unaryv == 1 && un.jutv == 1;
 
     /* boxed unary `!` in a value position: `var b = !x` (x dyn) -> a UnaryV
      * + a MoveV, no fallback. */
@@ -14104,7 +14106,7 @@ static bool vm_codegen_shapes()
             "var b = !x;",
         }, unv))
         return false;
-    const bool unary_val_ok = unv.unaryv == 1 && unv.evalstmt == 0;
+    const bool unary_val_ok = unv.unaryv == 1;
 
     /* defined(param)/defined(local) fold to a literal at resolve time -> the
      * function body has NO fallback for the AST-builtin call (the fold-gap
@@ -14114,7 +14116,7 @@ static bool vm_codegen_shapes()
             "func f(int p) { var y = p + 1; return defined(p) + defined(y); }",
         }, df))
         return false;
-    const bool defined_fold_ok = df.evalstmt == 0 && df.callbuiltinv == 0;
+    const bool defined_fold_ok = df.callbuiltinv == 0;
 
     /* defined(GLOBAL) does NOT fold (execution-order dependent) but is
      * native: a DefinedGlobalV op reading gfuncs->defined[slot]. */
@@ -14125,7 +14127,7 @@ static bool vm_codegen_shapes()
         }, dg))
         return false;
     const bool defined_global_ok =
-        dg.definedg == 1 && dg.evalstmt == 0 && dg.callbuiltinv == 0;
+        dg.definedg == 1 && dg.callbuiltinv == 0;
 
     /* `a ?? b` in a native body lowers to MoveV + JumpIfNotNoneV (the ??
      * short-circuit) + the rhs into the same dst - no fallback (the old
@@ -14135,7 +14137,7 @@ static bool vm_codegen_shapes()
             "func co(opt dyn v) { var dyn r = v ?? 5; return r; }",
         }, co))
         return false;
-    const bool coalesce_ok = co.jinn == 1 && co.evalstmt == 0;
+    const bool coalesce_ok = co.jinn == 1;
 
     /* a CHAINED boxed comparison `x == 5 == 1` (a >2-operand
      * MultiOpConstruct) lowers to two CmpV, left-to-right - no fallback. */
@@ -14145,7 +14147,7 @@ static bool vm_codegen_shapes()
             "var dyn r = x == 5 == 1;",
         }, ch))
         return false;
-    const bool chained_cmp_ok = ch.cmpv == 2 && ch.evalstmt == 0;
+    const bool chained_cmp_ok = ch.cmpv == 2;
 
     /* an ASSIGNMENT used as an expression `a = (b = a + 1) + 2` lowers
      * native (the inner store writes b's slot, the outer reads it). */
@@ -14155,7 +14157,7 @@ static bool vm_codegen_shapes()
             "a = (b = a + 1) + 2;",
         }, ax))
         return false;
-    const bool assign_expr_ok = ax.binopv == 2 && ax.evalstmt == 0;
+    const bool assign_expr_ok = ax.binopv == 2;
 
     /* a TYPED IdList reassign `fa, fb = [1, 2]` (float targets - the
      * literal-eliding path declines a coerced target) is a MultiUnpackV
@@ -14166,7 +14168,7 @@ static bool vm_codegen_shapes()
             "fa, fb = [1, 2];",
         }, mu))
         return false;
-    const bool typed_unpack_ok = mu.munpack == 1 && mu.evalstmt == 0;
+    const bool typed_unpack_ok = mu.munpack == 1;
 
     /* an EXPRESSION body - `func f(..) => expr`, desugared at parse to
      * `{ return expr; }` - COMPILES to a chunk (a ReturnV over the native
@@ -14179,7 +14181,7 @@ static bool vm_codegen_shapes()
             "var dyn keep = inc1;",   /* value-used: the body must be real */
         }, eb))
         return false;
-    const bool expr_body_chunk_ok = eb.retv == 1 && eb.evalstmt == 0;
+    const bool expr_body_chunk_ok = eb.retv == 1;
 
     /* an impure-index inc-dec VALUE (`a[f()]++` in an expression) lowers
      * to ONE IncDecChainV (the key temp evaluated once) - no fallback. */
@@ -14190,7 +14192,7 @@ static bool vm_codegen_shapes()
             "var y = a[f()]++;",
         }, idc))
         return false;
-    const bool incdec_chain_ok = idc.idchain == 1 && idc.evalstmt == 0;
+    const bool incdec_chain_ok = idc.idchain == 1;
 
     return native_ok && fallback_ok && fallback_net_ok
         && nested_ok && bool_safe
@@ -14539,17 +14541,14 @@ ast_node_pool_minimal()
         return true;
     };
 
-    /* After build_node_table: the ast_nodes pool is DROPPED (empty), every
-     * runtime node_idx is nulled (-1), and each node_table entry is non-null. */
+    /* ZERO-AST by construction: the node_table/ast_nodes members are DELETED
+     * from Chunk, so the only checkable residue is a live per-Instr node_idx -
+     * verify_ast_free (codegen) already asserts none survive; re-check here so
+     * the invariant is pinned by a test, not only an assert. */
     auto table_valid = [](const Chunk &ch) -> bool {
-        if (!ch.ast_nodes.empty())
-            return false;          /* the indexed pool is dropped at runtime */
         for (const Instr &in : ch.code)
             if (in.node_idx != -1)
                 return false;      /* no live per-Instr node_idx at runtime */
-        for (const auto &ne : ch.node_table)
-            if (!ne.node)
-                return false;      /* a null residual node */
         return true;
     };
 
@@ -14559,7 +14558,7 @@ ast_node_pool_minimal()
                   "for (var i = 0; i < 10; i++) s += i * i;",
                   "var out = s;"}, native))
         return false;
-    if (!native.node_table.empty() || !table_valid(native))
+    if (!table_valid(native))
         return false;
 
     /* (b) a value-ABI builtin call (print) is AST-FREE: it pools into
@@ -14568,7 +14567,7 @@ ast_node_pool_minimal()
     Chunk withb;
     if (!compile({"var s = 5;", "print(s);"}, withb))
         return false;
-    if (!withb.node_table.empty() || withb.builtin_calls.empty()
+    if (withb.builtin_calls.empty()
         || !table_valid(withb))
         return false;
     if (!withb.builtin_calls[0].name
@@ -14584,7 +14583,7 @@ ast_node_pool_minimal()
                   "dd[\"a\"]++;",
                   "dd.a++;"}, incdec))
         return false;
-    if (!incdec.node_table.empty() || incdec.incdec_sites.size() != 2
+    if (incdec.incdec_sites.size() != 2
         || !table_valid(incdec))
         return false;
     /* the member form carries the key */
@@ -14598,7 +14597,7 @@ ast_node_pool_minimal()
     if (!compile({"var a = [10];",
                   "var r = defined(a[0]);"}, defd))
         return false;
-    if (!defd.node_table.empty() || !table_valid(defd))
+    if (!table_valid(defd))
         return false;
 
     /* (f) the coerces_dyn accumulator store (`s = s + d`, d dyn) lowers
@@ -14609,7 +14608,7 @@ ast_node_pool_minimal()
                   "var s = 0;",
                   "s = s + d;"}, coerce))
         return false;
-    if (!coerce.node_table.empty() || !table_valid(coerce))
+    if (!table_valid(coerce))
         return false;
 
     /* (g) an INDIRECT (dyn-callee) call lowers AST-FREE (F1 step 2): the
@@ -14620,7 +14619,7 @@ ast_node_pool_minimal()
                   "var a = [1, 2];",
                   "f(a, 3);"}, indir))
         return false;
-    if (!indir.node_table.empty() || indir.call_sites.empty()
+    if (indir.call_sites.empty()
         || !table_valid(indir))
         return false;
     if (indir.call_sites[0].a0_form != Chunk::CallSite::A0::slot)
@@ -14636,7 +14635,7 @@ ast_node_pool_minimal()
                   "var a = [];",
                   "append(a, P(1, 2));"}, emp, &emp_root))
         return false;
-    if (!emp.node_table.empty() || emp.emplace_sites.size() != 1
+    if (emp.emplace_sites.size() != 1
         || !table_valid(emp))
         return false;
     if (!emp.emplace_sites[0].def

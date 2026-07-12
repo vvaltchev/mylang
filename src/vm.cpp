@@ -624,7 +624,7 @@ static void vm_precompile_all(const Block *root);   /* AOT: defined below */
  * (ctx == nullptr): the implicit "main" Frame for slotted top-level vars, and
  * the program-wide GlobalFuncTable for top-level functions / escaped globals.
  * Both live for the whole run. run_chunk then drives the chunk; in Phase 0
- * every instruction is a fallback EvalStmt, so this is byte-identical to
+ * every construct once ran via a fallback op, so this is byte-identical to
  * root->eval(nullptr) - which the differential harness enforces.
  */
 void
@@ -916,29 +916,6 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         const Instr &in = chunk.code[pc];
 
         switch (in.op) {
-
-        case OpCode::EvalStmt: {
-
-            const Construct *node = chunk.node_at_pc(pc);
-            EvalValue &&tmp = node->eval(&ctx);
-
-            /* An unresolved name surfaces as an UndefinedId sentinel, which
-             * Block::do_eval turns into UndefinedVariableEx. */
-            if (tmp.is<UndefinedId>())
-                throw UndefinedVariableEx(tmp.get<UndefinedId>().id,
-                                          node->start, node->end);
-
-            /* A `return` from a function body (this statement was a ReturnStmt,
-             * or a fallback loop/block that returned) stops the chunk; the
-             * caller reads ctx->flow->value. break/continue in a loop body are
-             * consumed by the following LoopBackEdge, not here; main never sets
-             * a flow signal at the top level. */
-            if (ctx.flow->type == FlowState::ret)
-                return;
-
-            pc++;
-            break;
-        }
 
         case OpCode::Jump:
             pc = in.target;
@@ -2472,7 +2449,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::ReturnV:
             /* `return <expr>`: the value is already in a.slot (a bare return
              * loaded `none`). Set flow and STOP the chunk, as an
-             * EvalStmt(ReturnStmt) does; do_func_call reads flow->value. */
+             * tree-walked return does; do_func_call reads flow->value. */
             ctx.flow->value = ctx.frame->at(in.a.slot).get();
             ctx.flow->type = FlowState::ret;
             return;

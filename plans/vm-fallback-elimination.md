@@ -252,11 +252,41 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
   (`struct_defs` + a field-caret pool).
 - The **fallback ops**: was `EvalStmt` / `EvalToSlot` / `JumpIfFalse`
   re-entering `node->eval`. **DIRECTIVE (2026-07-12): 100% of them MUST be
-  removed.** ✅ **DONE (2026-07-14): `EvalToSlot` + `JumpIfFalse` are DELETED**
-  (see the Tier-1 endgame audit below); **`EvalStmt` remains as THE single
-  fallback op** — whole-statement granularity only, reachable only by
-  show()-in-tests + the R4 value form. Historical per-op notes (how each
-  became unreachable):
+  removed.** ✅ **ALL THREE ARE DELETED.** 2026-07-14: `EvalToSlot` +
+  `JumpIfFalse` (the Tier-1 endgame below). **2026-07-15 (the NO-FAIL
+  CODEGEN, maintainer-directed): `EvalStmt` too** — the opcode, its handler,
+  `Chunk::node_table` + `node_at_pc`, and the Chunk-resident `ast_nodes`
+  pool (now Codegen-object scratch; `verify_ast_free` asserts every
+  `node_idx` nulled) are gone. Two moves made the codegen TOTAL:
+  (1) **show() folds at compile time** (`fold_show_calls`, end of
+  specialize_types, the FINAL tree — show already RETURNED a string, so
+  the call becomes a LiteralStr: a named top-level function via
+  render_func_code, a non-identifier expression via render_construct_code;
+  self-gated on a SymKind::builtin callee → scripts/harness only, the REPL
+  keeps the runtime builtin and `:show` is untouched); (2) the decline
+  nets are **`throw_not_lowered`/`NotLoweredEx`** — an ALWAYS-ON compile
+  abort naming the construct: lower or refuse loudly, a gap can never
+  hide as a silent tree-walk again. Flipping the nets FLUSHED OUT the true
+  residual gaps, each then nativized: typed `!x` as a value (Cat::lnot →
+  UnaryV; undetected while expr bodies had no chunks), empty loop/foreach
+  bodies (the obsolete all-fallback gate dropped), the loop-body DISCARD
+  tier (a discarded `map(...)`/ctor statement; inert leaves skip; an
+  unresolved/global bare id keeps throw-or-noop semantics), an
+  unresolved-lvalue assignment in a function (rhs effects then the pooled
+  UndefinedVariableEx), zero-arg lvalue builtins (`intptr()` → pooled
+  InvalidNumberOfArgsEx), sort-family VALUE arg0 (`sort(clone(a))` →
+  materialized temp), the CHECKED POD ctor (`Point(dynval, 2)` via
+  StructCtorBoxedV's per-arg carets — construct_struct_boxed_from_values
+  dispatches on is_pod; `append(arr, P(dyn))` compiles the ctor as a rest
+  value), the dyn-base member store (`p.x = 5`, single-member
+  StoreLValueChainV; proven bases keep StoreMemberV/DictStore priority),
+  and UNIVERSAL foreach (ForeachDyn's container_is_dyn gate dropped — it
+  runtime-dispatches array|dict like do_iter, covering the lone `_`,
+  1-var-indexed-array, >2-var none-padded dict residues). Verified: suite
+  1525/1525 + differential 1369/1369 (g++/clang debug, RECYCLE+ASan,
+  release), the 1000-program nested fuzzer 0 diverged, bench+samples run
+  both engines, VM/TW geomean 0.56x (unchanged). Historical per-op notes
+  (how each became unreachable):
   - `JumpIfFalse` — **DONE (a `!x` condition is now native).** A unary op over a
     dyn/general operand (`!x`, `-x`, `~x`, `+x`) now lowers to a boxed
     **`UnaryV`** op (`compile_boxed_expr` handles `Expr02`), so `if (!x)` is

@@ -3022,22 +3022,23 @@ the proof. Before calling it done:
 >    index, not behind a `node_idx`, not in a `node_table`, not ANYWHERE.
 > 2. **Every `Construct*` object is FREED after compilation.** The whole AST is
 >    droppable. If a chunk pins even one `Construct*`, the goal is NOT met.
-> 3. **A native op must NEVER call `node->eval(...)` at runtime.** The
->    tree-walker fallback op (`EvalStmt` — the ONLY one left; `EvalToSlot`
->    and `JumpIfFalse` are DELETED) re-enters the AST and is **BANNED in a
->    compiled script** — every construct MUST be lowered to real bytecode.
->    "It falls back to the tree-walker for that construct" is a FAILURE, not
->    an acceptable state.
+> 3. **A native op must NEVER call `node->eval(...)` at runtime — and none
+>    CAN: the fallback ops are ALL DELETED** (`EvalStmt`, `EvalToSlot`,
+>    `JumpIfFalse` — the opcodes no longer exist). The codegen is NO-FAIL: a
+>    statement none of the compilers accept THROWS `NotLoweredEx` at compile
+>    time (`throw_not_lowered`, always-on, release included) — a compiled
+>    chunk structurally cannot re-enter the AST, and a future lowering gap
+>    is a loud compile refusal, never a silent tree-walk.
 > 4. **All information an op needs at runtime is extracted into POOLED,
 >    SERIALIZABLE, AST-FREE data DURING compilation** — source `Loc`s in the loc
 >    side table, member keys / catch types / literals / struct defs / arg carets
 >    in their pools, etc. Pooled data is plain values (ints, strings, `Loc`s,
 >    interned `UniqueId*`), NEVER a `Construct*`.
 > 5. **A "loc-keyed" or "pc-keyed" table of `Construct*` is STILL A VIOLATION.**
->    Relocating the pointers from an indexed pool into a `{pc, Construct*}` side
->    table does NOT count as dropping the AST. The pointers themselves must be
->    GONE. Do not "work around" a fallback by keeping the node under a different
->    name.
+>    (The former `Chunk::node_table` and the `ast_nodes` pool are DELETED —
+>    `Chunk` holds no `Construct*`-typed member except the Tier-4
+>    `closure_defs` residual; `verify_ast_free` asserts every `Instr`'s
+>    codegen-transient `node_idx` was nulled when codegen finishes.)
 > 6. **During compilation you MAY hold `Construct*`** — e.g. an
 >    `unordered_map<const Instr*, const Construct*>` (or the current `node_idx`
 >    handle) to associate an op with its node before its final pc is known. That
@@ -3054,9 +3055,9 @@ the proof. Before calling it done:
 >    load-bearing invariant the whole VM exists to satisfy.
 > 9. **When you find a construct that isn't natively lowered, NATIVIZE IT.** Do
 >    not add a node-holding op. Do not relocate the node. Extract its loc/data
->    to a pool and emit real bytecode. If a construct is genuinely too rare/hard
->    to nativize now, that is a TRACKED GAP to a `.myv` writer — never a
->    permanent node-holder.
+>    to a pool and emit real bytecode. (Since the no-fail contract landed, an
+>    unlowered construct is a NotLoweredEx compile abort, so a gap cannot hide
+>    — fix it by lowering, never by re-adding a fallback.)
 > 10. **Say it once more: after compilation, NO AST NODES, NO `Construct*`, NO
 >     pointers, NO indexes, NO tables — the AST is FREED and the script runs on
 >     bytecode + pooled data alone.**
@@ -3813,16 +3814,25 @@ container, indexed general-value unpack), the discarded-result indirect call
 (`CallValueV` as a statement), and the flat `array<PodStruct>` literal (the
 fused `MakeStructArrayV`). **The last residual was the reflection builtins**,
 resolved by what each needs (so the ONLY node-holder left is dev-only `show`):
-- **`show()` — DEV-ONLY builtin** (the `make_dev_builtin` category, `types.cpp`;
-  `is_dev_builtin` / `g_dev_builtins_allowed`, `eval.h`): it decompiles the AST,
-  which a compiled script does not retain, so it is a DELIBERATE dev affordance —
-  available in the REPL and the test harness (both keep the AST; both set
-  `g_dev_builtins_allowed`), a **compile-time error in a script** (the
-  inferencer's `reject_dev_builtins`, run in the structural pass so it fires even
-  under `-nti`; a user `func show` shadow is left alone). So `show` NEVER reaches
-  serialized script bytecode — it keeps its AST node without blocking the
-  `Construct*`-free `.myv` goal. The REPL uses the `:show` meta-command (never a
-  bytecode builtin) unchanged.
+- **`show()` — DEV-ONLY builtin, now COMPILE-TIME-FOLDED** (the
+  `make_dev_builtin` category, `types.cpp`; `is_dev_builtin` /
+  `g_dev_builtins_allowed`, `eval.h`): it decompiles the AST — and since it
+  RETURNS a string, `fold_show_calls` (end of `specialize_types`, the final
+  tree) replaces the whole call with that string as a `LiteralStr`: a
+  directly-named top-level function renders via `render_func_code(decl)`, a
+  non-identifier expression via `render_construct_code(arg)` (the arg is never
+  evaluated, so folding moves no side effect — byte-identical to the runtime
+  builtin's answer over the same final tree). Self-gating: the callee must be
+  a resolved `SymKind::builtin` identifier, so the fold fires in
+  scripts/harness only; the REPL (map-resident builtins) keeps the runtime
+  builtin and its **`:show` meta-command is UNCHANGED**. `show` is still a
+  **compile-time error in a script** (`reject_dev_builtins`, structural pass,
+  `-nti` included; a user `func show` shadow is left alone). With the fold,
+  show NEVER reaches codegen — which is what allowed deleting the last
+  fallback op (see *THE NO-FAIL CODEGEN* below). The residue an identifier
+  arg that is NOT a named top-level function (a var holding a func) stays a
+  runtime call: fine under the tree-walker/REPL, a NotLoweredEx compile abort
+  under -vm (harness-only territory).
 - **`type`/`typestr`/`kindstr`/`decltype` — DONE (AST-free).** Two moves:
   (1) the inferencer's `fold_type_query` already bakes the answer into `args[0]`
   (a `LiteralStr`/`LiteralObj`) in the common case and sets **`CallExpr::tq_folded`**
@@ -4101,16 +4111,47 @@ global) now lowers via the shared `emit_func_decl`/`emit_struct_decl`
 (MakeClosureV/LoadConstV + StoreGlobalV — re-bound each iteration,
 exactly as the tree-walker re-evals the decl; gen_stmt already covered
 top-level/function-body decls, the loop/if body compiler did not).
-**Residual `EvalStmt` users:** the dev-only **`show`**
-(script-excluded by `reject_dev_builtins`, so never in serialized
-bytecode; reachable only under the `-rt` harness) and any
-genuinely-uncompilable future shape (whole-statement, byte-identical).
-The seven `EvalStmt` emit sites left in the codegen are all DECLINE
-NETS (whole-statement, on a sub-compile returning false), and the only
-known trigger in script-legal code is `show` — a compiled real program
-audits to an EMPTY `node_table` (the serializability signal).
-Codegen-shape tests pin all five roots (`jinn`/`munpack`/`idchain`
-counters) + the whole-statement fallback behavior.
+**THE NO-FAIL CODEGEN (2026-07-15, maintainer-directed): `EvalStmt` is
+DELETED — there is NO fallback op AT ALL.** Two moves made the codegen
+total: (1) **`show()` folds at COMPILE time** (`fold_show_calls`, end of
+`specialize_types` — the tree is final there, so the fold renders exactly
+what the runtime builtin rendered; show already RETURNED a string, so the
+call becomes a `LiteralStr`): a directly-named top-level function →
+`render_func_code(decl)`, a non-identifier expression →
+`render_construct_code(arg)`; self-gating on a `SymKind::builtin` callee,
+so it fires in scripts/harness only — the REPL (map-resident builtins)
+keeps the runtime builtin and **`:show` is untouched** (a meta-command,
+never codegen). A user `func show` shadow is `SymKind::global` → never
+folded. (2) The former decline NETS are **`throw_not_lowered` /
+`NotLoweredEx`** — an always-on (release included) compile ABORT naming
+the construct: every statement/expression either lowers or the compiler
+REFUSES loudly; a future gap cannot hide as a silent tree-walk. Flipping
+the nets flushed out + fixed the last REAL gaps, each now native: a
+typed `!x` as a VALUE (`Cat::lnot` → boxed UnaryV — undetected while
+expr bodies had no chunks), EMPTY loop/foreach bodies (the obsolete
+"all-fallback body" gate dropped), the loop-body DISCARD tier (any
+expression statement — a discarded `map(...)`, a ctor — compiles into a
+scratch temp; inert leaves skip, an unresolved/global bare id keeps its
+throw-or-noop semantics), an unresolved-lvalue assignment in a function
+(rhs side effects, then the pooled UndefinedVariableEx), zero-arg lvalue
+builtins (`intptr()` → pooled InvalidNumberOfArgsEx), the sort family
+with a VALUE arg0 (`sort(clone(a))` — materialized into a temp slot),
+the CHECKED POD ctor (`Point(dynval, 2)` — routed through
+StructCtorBoxedV's pooled per-arg carets; `construct_struct_boxed_from_
+values` dispatches on `is_pod`, and a non-qualifying `append(arr,
+P(dyn))` compiles the ctor as a rest VALUE), a dyn-base member store
+(`p.x = 5` in a dyn-param body — a single-MEMBER StoreLValueChainV;
+proven bases keep StoreMemberV/DictStore priority), and **foreach is
+UNIVERSAL** (the ForeachDyn ops lost their `container_is_dyn` gate —
+they runtime-dispatch array|dict exactly like `do_iter`, so they are the
+catch-all tried after the fast forms: a lone `_`, a 1-var indexed array,
+a >2-var none-padded dict all lower). **Deleted with the op:**
+`Chunk::node_table` + `node_at_pc`, the `Chunk::ast_nodes` pool (now a
+CODEGEN-object scratch; `build_node_table` became `verify_ast_free` —
+every `node_idx` must be nulled when codegen finishes), the disasm
+`node_table` section (the "NOT serializable" signal is now a compile
+refusal instead), and the `ML_DBG_FB` hook. `Chunk`'s only remaining
+`Construct*`-typed member is the Tier-4 `closure_defs` residual.
 The `InlinedCallExpr` return-across-try residue is CLOSED: a `return`
 crossing trys INSIDE the inline boundary inlines each crossed try's
 handler-pop + finally at the return (bounded at the BOUNDARY, not the

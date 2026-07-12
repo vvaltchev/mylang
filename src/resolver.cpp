@@ -2171,7 +2171,7 @@ alloc_inline_ctx(InlineCtx ic)
  * hold a call and are skipped. Mirrors for_each_child but yields replaceable
  * unique_ptr<Construct>& slots.
  */
-static void
+void
 for_each_child_slot(Construct *c,
                     const std::function<void(unique_ptr<Construct> &)> &fn)
 {
@@ -2201,6 +2201,12 @@ for_each_child_slot(Construct *c,
         fn(n->body);
     } else if (auto *n = dynamic_cast<ForeachStmt *>(c)) {
         fn(n->container); fn(n->body);
+    } else if (auto *n = dynamic_cast<ForRangeStmt *>(c)) {
+        /* post-specialize node (fold_show_calls walks the FINAL tree) */
+        if (n->init) fn(n->init);
+        fn(n->bound);
+        if (n->step) fn(n->step);
+        fn(n->body);
     } else if (auto *n = dynamic_cast<Subscript *>(c)) {
         fn(n->what); fn(n->index);
     } else if (auto *n = dynamic_cast<Slice *>(c)) {

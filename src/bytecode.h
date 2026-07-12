@@ -11,11 +11,13 @@
  * The VM consumes the ALREADY-OPTIMIZED AST (post infer / resolve_names /
  * specialize_types) and lowers it to a flat instruction list, removing the
  * tree-walker's per-node virtual-dispatch tax. It is built strictly
- * incrementally behind an AST-fallback opcode: EvalStmt (and, later, EvalExpr)
- * just call the node's existing eval(), so the VM runs the WHOLE language from
- * day one, and native opcodes replace the fallbacks one tested step at a time.
+ * incrementally - ORIGINALLY behind AST-fallback opcodes that ran the WHOLE
+ * language from day one while native opcodes replaced them one tested step at
+ * a time; those fallback ops are since DELETED: the codegen is NO-FAIL (every
+ * construct lowers natively, or compilation refuses with NotLoweredEx), so no
+ * op can re-enter the AST.
  *
- * Phase 0: EvalStmt + Halt. Phase 1 adds native control flow (Jump /
+ * Phase 0: fallback + Halt. Phase 1 adds native control flow (Jump /
  * LoopBackEdge). Phase 2 adds a REGISTER machine over the frame
  * slots (the VM's registers ARE the resolved-local slots, so there is no value
  * stack) with native int ops (IntBin / JumpUnlessIntCmp) and fused
@@ -35,15 +37,6 @@
 enum class Pend : unsigned char { normal, reraise };
 
 enum class OpCode : unsigned char {
-
-    /*
-     * AST fallback (the incremental-safety pillar): evaluate `node` with the
-     * tree-walker. EvalStmt runs a statement - its value is discarded, and an
-     * UndefinedId result throws UndefinedVariableEx as Block::do_eval. It does
-     * NOT act on FlowState: an in-flight break/continue set by a loop body is
-     * consumed by the following LoopBackEdge, not here.
-     */
-    EvalStmt,
 
     /* Unconditional jump: pc = `target`. */
     Jump,
@@ -472,7 +465,7 @@ enum class OpCode : unsigned char {
      * for error locs); `target` = the dst slot. Copies the arg values into a
      * buffer and calls func_v. Emitted only for a builtin that HAS func_v (a
      * migrated, read-only builtin); a mutating / AST builtin takes another
-     * path (CallBuiltinLV* / EvalStmt).
+     * path (CallBuiltinLV*).
      */
     CallBuiltinV,
 
@@ -596,7 +589,7 @@ enum class OpCode : unsigned char {
      * Native `return <expr>;` (no node->eval of the return): `a` = the slot
      * holding the already-evaluated return value (a bare `return;` loads `none`
      * into it first). Sets ctx->flow to {ret, value} and STOPS the chunk
-     * (returns from vm_run_chunk), exactly as an EvalStmt(ReturnStmt) does - so
+     * (returns from vm_run_chunk), exactly as the tree-walker's return - so
      * do_func_call reads flow->value. The return EXPRESSION is compiled by
      * compile_boxed_expr, so its own calls (`return f(x)`) become CallV.
      */
@@ -733,7 +726,7 @@ enum class OpCode : unsigned char {
      * gfuncs->slots[target] and marks defined[target]=1 - byte-identical to the
      * tree-walker's decl (bind + define) AND reassign (overwrite), which for a
      * plain assign are the same put(). Never throws (a typed/const/compound
-     * global write falls back to EvalStmt). Script-only (no SymKind::global
+     * global write takes CoerceNumV). Script-only (no SymKind::global
      * exist in the REPL), so gfuncs is never null here.
      */
     StoreGlobalV,
@@ -743,7 +736,8 @@ enum class OpCode : unsigned char {
      * <LiteralObj>`). Materialize the rvalue (`a`) then BIND the slot as a
      * CONST LValue - `target` = the slot, `target2` = 0 (a main-frame LOCAL
      * slot) or 1 (a GLOBAL slot). Binding CONST (not a plain put) is what makes
-     * a later rebind still throw CannotRebindConstEx (a rebind stays EvalStmt).
+     * a later rebind still throw CannotRebindConstEx (a rebind lowers to the
+     * pooled rebind_const throw).
      * Only a DECL reaches here (Expr14 with pInConstDecl); a const reassign
      * never does. Const SCALARS are inlined, so they never appear.
      */
@@ -853,7 +847,7 @@ enum class OpCode : unsigned char {
      * throws on — an undefined name in an rvalue/callee position, an assignment
      * to a non-lvalue (a literal) or a builtin, an lvalue-builtin on a literal
      * arg0. The codegen emits it (after compiling any side-effecting rvalue) in
-     * place of an EvalStmt fallback, so the same exception fires at the same
+     * place of a tree-walked fallback, so the same exception fires at the same
      * point with the byte-identical caret — AST-free.
      */
     ThrowRuntimeV,
@@ -990,9 +984,12 @@ struct Operand {
 
 struct Instr {
     OpCode op;
-    /* Index into Chunk::ast_nodes for an op that still needs the AST at runtime
-     * (fallback / builtin-call / a store's caret); -1 == none. NO raw Construct*
-     * in the Instr - that is what lets the bytecode be serialized. */
+    /* CODEGEN-TRANSIENT: index into the Codegen object's ast_nodes registry
+     * (the splice-stable handle extract_locs uses to harvest an op's error
+     * carets into the loc side table). verify_ast_free asserts every one is
+     * -1 when codegen finishes - at runtime NO op references an AST node
+     * (the fallback ops are deleted), which is what lets the bytecode be
+     * serialized. */
     int32_t node_idx = -1;
     int target = -1;    /* Jump dest; LoopBackEdge cont; IntBin dst
                          * slot; JumpUnlessIntCmp jump dest */
@@ -1313,8 +1310,8 @@ struct Chunk {
      * entry, so the op is a bare index (`Instr::target2`), holding NO `node`.
      * The Builtin's function pointer is resolve-at-load like struct_defs (a
      * serializer stores the builtin's registered name/id and re-binds on load);
-     * everything else is pure data. This is what lets a read-only builtin call
-     * lower with an empty ast_nodes pool.
+     * everything else is pure data. This is what makes a read-only builtin
+     * call fully serializable.
      */
     struct BuiltinCall {
         Builtin builtin;              /* the baked func_v (+ func_lv) pointers */
@@ -1392,56 +1389,4 @@ struct Chunk {
         return al;
     }
 
-    /*
-     * AST-NODE POOL - CODEGEN-TRANSIENT, holding the raw `Construct *` of every
-     * op that still needs the AST at RUNTIME. `Instr::node_idx` indexes it (a
-     * SPLICE-STABLE handle codegen needs before an op's final pc is known: ops
-     * grow + roll back, and node_idx survives that where a pc would not). After
-     * codegen, `build_node_table` FLATTENS the live entries into the pc-keyed
-     * `node_table` side table (below) and CLEARS this pool, so the finished
-     * (runtime / serialized) chunk carries NO indexed pool - the runtime looks
-     * a node up by pc (`node_at_pc`), on the cold path only. `node_at` (index)
-     * is thus a CODEGEN-ONLY accessor. See `node_table`.
-     */
-    std::vector<const Construct *> ast_nodes;
-
-    const Construct *node_at(int idx) const
-    {
-        return idx < 0 ? nullptr : ast_nodes[static_cast<size_t>(idx)];
-    }
-
-    /*
-     * AST-NODE SIDE TABLE (pc-keyed) - the runtime home of the residual node
-     * ops, SAME shape/cost as `locs` / `inline_ctxs`: `{pc, Construct*}` sorted
-     * by pc (build_node_table iterates pc-ascending), binary-searched by
-     * `node_at_pc` ONLY on the cold path (a fallback's `node->eval`). The ONLY
-     * op that still needs the AST at runtime is the ONE fallback op -
-     * EvalStmt (`node->eval`; EvalToSlot + JumpIfFalse are DELETED - every
-     * expression/condition either lowers or fails its whole statement to
-     * EvalStmt); every native op is AST-free.
-     * A 100%-native chunk leaves this EMPTY - a non-empty `node_table` is EXACTLY
-     * the "not yet fully serializable" signal (its `Construct*` is still an AST
-     * pointer; a serializing backend keeps the AST or rejects the chunk). This
-     * is the last non-`locs` side table off the AST-node POOL - the `Instr` no
-     * longer carries a live `node_idx` at runtime (build_node_table clears it).
-     */
-    struct NodeEntry { uint32_t pc; const Construct *node; };
-    std::vector<NodeEntry> node_table;
-
-    /* The AST node of the op at `pc` (exact match; nullptr if none). Binary
-     * search - O(log n), throw / fallback path only. */
-    const Construct *node_at_pc(size_t pc) const
-    {
-        size_t lo = 0, hi = node_table.size();
-        while (lo < hi) {
-            const size_t mid = (lo + hi) / 2;
-            if (node_table[mid].pc < pc)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        if (lo < node_table.size() && node_table[lo].pc == pc)
-            return node_table[lo].node;
-        return nullptr;
-    }
 };

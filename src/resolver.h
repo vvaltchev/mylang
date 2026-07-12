@@ -3,6 +3,8 @@
 #pragma once
 
 #include <unordered_set>
+#include <functional>
+#include <memory>
 
 class Construct;
 class UniqueId;
@@ -55,6 +57,16 @@ struct AnalysisInfo;
  * folding stays sound.
  */
 class EvalContext;
+/*
+ * Enumerate the Construct-typed child SLOTS of `c` (replaceable
+ * unique_ptr<Construct>& positions), complete over every node kind incl. the
+ * post-specialize ForRangeStmt. Shared by the inliner's substitution/refold
+ * walks and fold_show_calls (inferencer.cpp). Defined in resolver.cpp.
+ */
+void for_each_child_slot(
+        Construct *c,
+        const std::function<void(std::unique_ptr<Construct> &)> &fn);
+
 void resolve_names(Construct *root,
                    bool enable_inline = true,
                    int inline_threshold = 24,

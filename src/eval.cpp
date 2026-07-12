@@ -1027,6 +1027,24 @@ construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
 {
     const size_t nfields = def->fields.size();
     auto obj = make_intrusive<StructObject>(def);
+
+    /* A POD def reaches here too (StructCtorBoxedV doubles as the CHECKED
+     * POD ctor - a dyn/unproven field arg whose coerce CAN throw and must
+     * report the arg's caret, which StructCtorV's typed-only gate cannot):
+     * coerce with the carets, then store into the POD bytes. */
+    if (def->is_pod()) {
+        for (size_t i = 0; i < nfields; i++) {
+            const Loc s = (i < nargs && locs) ? locs[i].start : Loc();
+            const Loc e = (i < nargs && locs) ? locs[i].end : Loc();
+            EvalValue v = coerce_struct_field(def->fields[i],
+                                              i < nargs ? vals[i]
+                                                        : EvalValue(),
+                                              s, e);
+            obj->pod_set(static_cast<int>(i), v);
+        }
+        return intrusive_ptr<StructObject>(obj);
+    }
+
     obj->fields.reserve(nfields);
     for (size_t i = 0; i < nfields; i++) {
         const FieldDef &fd = def->fields[i];

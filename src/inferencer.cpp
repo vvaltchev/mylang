@@ -8,6 +8,8 @@
 #include "evalvalue.h"
 #include "eval.h"
 #include "trace.h"
+#include "resolver.h"     /* for_each_child_slot (fold_show_calls) */
+#include "coderender.h"   /* render_func_code / render_construct_code */
 
 #include <unordered_map>
 #include <unordered_set>
@@ -4769,6 +4771,77 @@ void collect_array_analysis(Construct *root, AnalysisInfo &out)
     inf.collect_arrays(out);
 }
 
+/* ---- show() compile-time fold (the no-fail-codegen prerequisite) --------
+ *
+ * `show(x)` is a NODE-property builtin (it decompiles the optimized AST) and
+ * the LAST node-ABI builtin - the one construct the codegen cannot lower.
+ * Fold it here, on the FINAL tree (end of specialize_types - what the runtime
+ * builtin would render), so it NEVER reaches codegen:
+ *   - `show(<named top-level function>)`  -> render_func_code(decl)
+ *   - `show(<non-identifier expression>)` -> render_construct_code(arg)
+ * both replace the call with a LiteralStr - byte-identical to the runtime
+ * builtin's answer (which renders the same final tree; the arg is never
+ * evaluated, so folding moves no side effect). SELF-GATING: the callee must
+ * be a resolved SymKind::builtin identifier - true only in SCRIPT mode (the
+ * harness included; a user `func show` shadow is SymKind::global), never in
+ * the REPL (map-resident builtins), which keeps its runtime builtin. The
+ * residue - an identifier that is NOT a named top-level function (a var
+ * holding a func; REPL-style dynamism) - stays a runtime call: fine under
+ * the tree-walker, a LOUD compile abort under -vm codegen (show is
+ * compile-rejected in real scripts; only the -rt harness can reach this).
+ */
+static const FuncDeclStmt *
+show_named_func(const Block *root, const UniqueId *uid)
+{
+    for (const auto &e : root->elems)
+        if (auto *fd = dynamic_cast<const FuncDeclStmt *>(e.get()))
+            if (fd->id && fd->id->uid == uid)
+                return fd;
+    return nullptr;
+}
+
+static void
+fold_show_slot(unique_ptr<Construct> &slot, const Block *root)
+{
+    if (!slot)
+        return;
+
+    /* bottom-up: an arg's own show() folds first */
+    for_each_child_slot(slot.get(),
+        [&](unique_ptr<Construct> &ch) { fold_show_slot(ch, root); });
+
+    auto *ce = dynamic_cast<CallExpr *>(slot.get());
+    if (!ce || !ce->args || ce->args->elems.size() != 1)
+        return;
+    auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+    if (!callee || callee->sym.kind != SymKind::builtin
+            || callee->get_str() != "show")
+        return;
+
+    Construct *arg = ce->args->elems[0].get();
+    std::string code;
+    if (auto *id = dynamic_cast<Identifier *>(arg)) {
+        const FuncDeclStmt *fd = show_named_func(root, id->uid);
+        if (!fd)
+            return;              /* not a named func: leave for the runtime */
+        code = render_func_code(fd);
+    } else {
+        code = render_construct_code(arg);
+    }
+
+    auto lit = make_unique<LiteralStr>(std::string_view(code));
+    lit->start = ce->start;
+    lit->end = ce->end;
+    lit->inline_ctx = ce->inline_ctx;
+    slot = move(lit);
+}
+
+static void fold_show_calls(Block *root)
+{
+    for (auto &e : root->elems)
+        fold_show_slot(e, root);
+}
+
 void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
                       AnalysisInfo *analyze)
 {
@@ -4801,6 +4874,10 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
 
     for (auto &e : blk->elems)
         e = specialize(std::move(e));
+
+    /* The tree is FINAL now - fold every foldable show() (see above), so the
+     * codegen never sees the one remaining node-ABI builtin. */
+    fold_show_calls(blk);
 
     g_fr_pure.clear();
     g_specialize_analyze = nullptr;

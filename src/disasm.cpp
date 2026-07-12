@@ -77,43 +77,9 @@ std::string arglist(const Chunk &ch, int_type base, int_type n)
     return s + ")";
 }
 
-/* The Identifier name behind a load/global/capture/builtin op's node. */
-std::string node_name(const Construct *node)
-{
-    if (auto *id = dynamic_cast<const Identifier *>(node))
-        return std::string(id->get_str());
-    return "?";
-}
-
 std::string opsym(Op op)
 {
     return OpString[static_cast<int>(op)];
-}
-
-/* A fallback op's still-embedded Construct*, rendered by the SHARED AST
- * decompiler and collapsed to one trimmed, truncated line so the op stays a
- * single disassembly row. */
-std::string node1(const Construct *node)
-{
-    if (!node)
-        return "<null>";
-    const std::string code = render_construct_code(node);
-    std::string out;
-    bool space = false;
-    for (char c : code) {
-        if (c == '\n' || c == '\t' || c == ' ') {
-            space = true;
-            continue;
-        }
-        if (space && !out.empty())
-            out += ' ';
-        space = false;
-        out += c;
-    }
-    const size_t cap = 66;
-    if (out.size() > cap)
-        out = out.substr(0, cap - 3) + "...";
-    return out;
 }
 
 std::string store_op(Op aop)
@@ -329,16 +295,6 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
               << "\n";
         }
     }
-    if (!ch.node_table.empty()) {
-        /* The ONE non-serializable side table: the AST nodes ops still need at
-         * runtime (fallbacks / builtin calls / a store's caret), pc-keyed. A
-         * fully-native chunk has NONE - so this section appearing IS the ".myv
-         * can't drop the AST yet" signal. Rendered by the shared decompiler. */
-        s << "; -- node_table (" << ch.node_table.size()
-          << ", NOT serializable) --\n";
-        for (const auto &ne : ch.node_table)
-            s << ";   pc" << ne.pc << "  " << node1(ne.node) << "\n";
-    }
     if (!ch.locs.empty()) {
         s << "; -- locs (" << ch.locs.size() << ") --\n";
         for (const auto &l : ch.locs)
@@ -394,10 +350,6 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
      * widening call is warning-free on all three compilers (MSVC C4244). */
     auto D  = [&](int_type slot)            { return reg(chunk, slot); };
     auto RI = [&](const Operand &o, bool f) { return reg_or_imm(chunk, o, f); };
-    auto cmt = [&](std::ostream &r, const Construct *n) {
-        if (n)
-            r << "   ; " << node1(n);
-    };
     /* arg0's lvalue target for a CallBuiltinLV, by slot kind (a.lit). */
     auto lval_ref = [&](int_type kind, int_type slot) -> std::string {
         if (kind == 0) return "&" + reg(chunk, slot);        /* local */
@@ -417,9 +369,6 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         std::ostringstream row;
 
         switch (in.op) {
-        case OpCode::EvalStmt:
-            row << "eval.stmt    " << node1(chunk.node_at_pc(pc));
-            break;
         case OpCode::Jump:
             row << "jmp          L" << in.target;
             break;
@@ -928,17 +877,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.a, false);
             break;
         case OpCode::LoadCaptureV:
-            row << "load.capture " << D(in.target) << ", "
-                << node_name(chunk.node_at_pc(pc));
+            row << "load.capture " << D(in.target) << ", cap[" << in.target2
+                << "]";
             break;
         case OpCode::LoadBuiltinV:
-            row << "load.builtin " << D(in.target) << ", "
-                << node_name(chunk.node_at_pc(pc));
+            row << "load.builtin " << D(in.target) << ", builtin["
+                << in.target2 << "]";
             break;
         case OpCode::SubscriptV:
             row << "subscript.v  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a, false) << "]";
-            cmt(row, chunk.node_at_pc(pc));
             break;
         case OpCode::MemberV:
             /* AST-free: the member name comes from the member-key pool. */

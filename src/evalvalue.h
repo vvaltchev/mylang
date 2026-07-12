@@ -86,7 +86,7 @@ struct Builtin {
      *             for a SELF-EVAL builtin (append/push/pop/intptr), which reads
      *             its args off `exprList` - so append keeps construct-in-place,
      *             which needs the arg node.
-     * Null (union zero) == not migrated: the VM falls back to func (EvalStmt).
+     * Null (union zero) == an AST builtin (its call folds at compile time).
      */
     union {
         EvalValue (*func_v)(EvalContext *, const ArgLocs *, const EvalValue *,

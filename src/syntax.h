@@ -1660,7 +1660,7 @@ public:
      * it with a runtime-dispatching LIVE iterator (ForeachDynInit/Next) that
      * checks array-vs-dict once at init, then binds the element (array) or key
      * (dict) box-free. An unsupported runtime container throws. Keeps the dyn
-     * foreach off the tree-walker fallback (an EvalStmt). */
+     * foreach off the tree-walker (native ops instead). */
     bool container_is_dyn = false;
     /* Set by the inferencer (i/f) for a non-indexed 2+-var STRICT-unpack loop
      * over a proven array<array<int>> / array<array<float>> (flat sub-arrays):

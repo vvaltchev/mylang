@@ -6,6 +6,28 @@
 /* eval.cpp's AST-shape purity check (see eval.h) - declared here to avoid
  * pulling the whole eval.h into the codegen TU. */
 bool construct_no_side_effects(const Construct *c);
+
+/*
+ * The NO-FAIL contract: after show() is compile-time-folded
+ * (fold_show_calls, inferencer.cpp), EVERY construct a script can produce
+ * has a native lowering - so a statement none of the compilers accept is a
+ * CODEGEN BUG, not a "fallback": throw loudly (always-on, not an assert; a
+ * release build must refuse too) instead of emitting a tree-walking op.
+ * This replaced the EvalStmt safety nets - the opcode itself is DELETED, so
+ * a compiled chunk structurally CANNOT re-enter the AST.
+ */
+struct NotLoweredEx : public Exception {
+    explicit NotLoweredEx(const Construct *s)
+        : Exception("InternalErrorEx",
+                    intern_msg("codegen: construct not lowered natively: "
+                               + std::string(s->name)),
+                    s->start, s->end) { }
+};
+
+[[noreturn]] static void throw_not_lowered(const Construct *s)
+{
+    throw NotLoweredEx(s);
+}
 #ifdef ML_DBG_FB
 #include "coderender.h"
 #endif
@@ -537,17 +559,23 @@ struct Codegen {
 
     int here() const { return static_cast<int>(chunk.code.size()); }
 
-    /* Pool an AST node an op needs at RUNTIME (fallback / builtin / a store's
-     * caret) and return its Chunk::ast_nodes index; -1 for a null node (no
-     * entry). A COMPACTION pass after extract_locs drops the loc-only nodes it
-     * nulled and any codegen-rollback orphans, so the surviving pool is minimal
-     * (empty for a fully-native chunk). See Chunk::ast_nodes. */
+    /* CODEGEN-SCRATCH node registry: `Instr::node_idx` indexes it - the
+     * splice-stable handle an op uses to reach its node before its final pc
+     * is known (ops grow + roll back; an index survives that where a pc
+     * would not). It exists ONLY until extract_locs harvests the locs;
+     * verify_ast_free then asserts every node_idx was nulled. It lives on
+     * the CODEGEN object, NOT the Chunk - the finished chunk holds NO
+     * Construct* (EvalStmt / node_table are deleted, so nothing at runtime
+     * can reference a node). */
+    std::vector<const Construct *> ast_nodes;
+
+    /* Register an op's AST node for loc extraction; -1 for null. */
     int add_ast_node(const Construct *n)
     {
         if (!n)
             return -1;
-        chunk.ast_nodes.push_back(n);
-        return static_cast<int>(chunk.ast_nodes.size()) - 1;
+        ast_nodes.push_back(n);
+        return static_cast<int>(ast_nodes.size()) - 1;
     }
 
     /* Pool a value-ABI builtin call's AST-free data (the Builtin + the ArgLocs
@@ -581,15 +609,6 @@ struct Codegen {
         in.target = target;
         in.target2 = target2;
         chunk.code.push_back(in);
-#ifdef ML_DBG_FB
-        if (op == OpCode::EvalStmt && node && getenv("ML_DBG_FB")) {
-            std::string r = ::render_construct_code(node);
-            if (r.size() > 78) r = r.substr(0, 75) + "...";
-            fprintf(stderr, "FB %-13s | %s\n",
-                    "EvalStmt",
-                    r.c_str());
-        }
-#endif
         return chunk.code.size() - 1;
     }
 
@@ -638,7 +657,7 @@ struct Codegen {
      * to the loop exit (Lend), `conts` to the loop's continue point (a while's
      * cond re-test, a for's increment / the fused ForLoopStep). A stack, so a
      * break in a NESTED loop targets the innermost loop. (`return` needs no
-     * entry: it runs as an EvalStmt whose flow==ret stops the chunk - see
+     * entry: its flow==ret stops the chunk - see
      * compile_scalar_body / vm_run_chunk.)
      */
     struct LoopFrame {
@@ -702,7 +721,7 @@ struct Codegen {
     }
 
     /* A loop's init (`var i = start`), emitted ONCE: native (a LoadImmInt /
-     * store) when it is a resolved-local scalar decl, else a fallback EvalStmt.
+     * store) when it is a resolved-local scalar decl.
      * Native-izing the once-run init doesn't speed the loop, but it keeps the
      * `i = start` off the tree-walker and reads cleanly in the disassembly. */
     bool emit_init(const Construct *init)
@@ -721,7 +740,7 @@ struct Codegen {
          * value) - the int path rejects a bare identifier rhs (it can't prove
          * int-not-bool for a raw int store), but a boxed move preserves the
          * rhs's real type. An UNCOMPILABLE init (exotic) fails the whole
-         * loop to the statement-level EvalStmt - no per-init fallback op. */
+         * loop to a NotLoweredEx compile abort - no per-init fallback. */
         if (compile_boxed_stmt(init, chunk.code))
             return true;
         chunk.code.resize(mark);
@@ -1143,7 +1162,16 @@ struct Codegen {
          * boxed ctor already folded to a LiteralObj, so only a runtime-arg one
          * reaches here. */
         if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
-            const StructTypeDef *bdef = ce->vm_struct_boxed_def;
+            /* ...and the CHECKED POD ctor: a POD construction whose typed
+             * gate failed above (a dyn/general arg - the coerce CAN throw
+             * and needs the arg's caret) takes the same pooled-caret op;
+             * construct_struct_boxed_from_values dispatches on is_pod. */
+            const StructTypeDef *bdef = ce->vm_struct_boxed_def
+                ? ce->vm_struct_boxed_def
+                : (ce->vm_struct_ctor_def && ce->args
+                       && ce->args->elems.size()
+                              == ce->vm_struct_ctor_def->fields.size()
+                       ? ce->vm_struct_ctor_def : nullptr);
             if (bdef && ce->args && ce->args->elems.size() <= 16) {
                 const size_t cmark = chunk.consts.size();
                 int base;
@@ -1486,6 +1514,26 @@ struct Codegen {
          * so both forms reach here. emit_boxed_chain handles both. */
         if (const TypedScalarExpr *t =
                 dynamic_cast<const TypedScalarExpr *>(e)) {
+            /* A typed `!x` (Cat::lnot) as a VALUE boxes a real BOOL - the
+             * boxed UnaryV (its !is_true == the typed eval's `!= 0` boxing).
+             * Was undetected while expr-bodied functions had no chunks
+             * (`func neg(bool b) => !b` never compiled); the no-fail contract
+             * flushed it out. */
+            if (t->cat == TypedScalarExpr::Cat::lnot && t->elems.size() == 1) {
+                int oslot;
+                if (!compile_boxed_expr(t->elems[0].second.get(), oslot, ops))
+                    return false;
+                const int dst = alloc_temp();
+                Instr in;
+                in.op = OpCode::UnaryV;
+                in.node_idx = add_ast_node(e);
+                in.target = dst;
+                in.a = slot_op(oslot);
+                in.aop = Op::lnot;
+                ops.push_back(in);
+                out_slot = dst;
+                return true;
+            }
             const char k = t->cat == TypedScalarExpr::Cat::arith   ? 'a'
                          : t->cat == TypedScalarExpr::Cat::cmp     ? 'c'
                          : t->cat == TypedScalarExpr::Cat::logical ? 'l'
@@ -1635,7 +1683,7 @@ struct Codegen {
      * is box-free for int/float elements. Snapshot-FIRST (all elements compiled
      * before any target write) makes it swap-safe (`a, b = [b, a]`), matching
      * the tree-walker (build array, then bind each). Returns false (-> the
-     * statement stays an EvalStmt, i.e. the tree-walker's strict
+     * statement uses MultiUnpackV, the tree-walker's strict
      * handle_single_expr14) unless: the rvalue is a LiteralArray of EXACTLY the
      * target count (an arity mismatch stays a runtime strict error via the
      * fallback), and every target is a real (non-`_`), resolved-local,
@@ -1967,24 +2015,38 @@ struct Codegen {
          * const-inlined `K = 6`) -> NotLValueEx(lvalue loc); a BUILTIN-name
          * target (`print = 5`) -> CannotRebindBuiltinEx(lvalue loc). Compile the
          * rhs for its side effects (+ its own throw), THEN throw. Plain assign
-         * only; a compound / unliftable-rhs falls back to EvalStmt. */
+         * only; a compound rhs takes the compound store path. */
         if (is_assign) {
             Chunk::ThrowKind tk = Chunk::ThrowKind::not_lvalue;
+            const UniqueId *tname = nullptr;
+            Loc tstart = e->lvalue->start, tend = e->lvalue->end;
             bool bad = dynamic_cast<const Literal *>(e->lvalue.get()) != nullptr;
             if (const Identifier *bl =
-                    dynamic_cast<const Identifier *>(e->lvalue.get()))
+                    dynamic_cast<const Identifier *>(e->lvalue.get())) {
                 if (bl->sym.kind == SymKind::builtin) {
                     tk = Chunk::ThrowKind::rebind_builtin;
                     bad = true;
+                } else if (bl->sym.kind == SymKind::unresolved) {
+                    /* An assignment to an UNDECLARED name in a FUNCTION (a
+                     * top-level one is an implicit-global DECL and never
+                     * unresolved): the tree-walker evaluates the rhs FIRST
+                     * (its side effects run), then doAssign's UndefinedId
+                     * check throws - loc-less, stamped with the Expr14 span
+                     * by Construct::eval. Mirror exactly. */
+                    tk = Chunk::ThrowKind::undefined_var;
+                    tname = bl->uid;
+                    tstart = e->start;
+                    tend = e->end;
+                    bad = true;
                 }
+            }
             if (bad) {
                 const size_t om = ops.size();
                 const size_t cm = chunk.consts.size();
                 const int st = next_temp;
                 int rslot;
                 if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
-                    emit_throw(tk, e->lvalue->start, e->lvalue->end,
-                               nullptr, ops);
+                    emit_throw(tk, tstart, tend, tname, ops);
                     return true;
                 }
                 ops.resize(om);
@@ -2249,8 +2311,8 @@ struct Codegen {
      * gathers those values and calls do_func_call (no node->eval of the call).
      * Only a DirectCallExpr the inferencer proved a user function
      * (vm_direct_func); an arg compile_boxed_expr can't lower (a nested call, a
-     * complex expression) rolls the whole call back to the EvalStmt
-     * fallback. Args are evaluated left-to-right, once each.
+     * complex expression) declines the native call form. Args are evaluated
+     * left-to-right, once each.
      */
     /* Evaluate a call's args into a fresh contiguous register run
      * [argbase, argbase+n) via compile_boxed_expr, left-to-right, once each;
@@ -2685,8 +2747,18 @@ struct Codegen {
     bool try_native_mutating_builtin(const DirectBuiltinCallExpr *dc,
                                      int &out_slot, std::vector<Instr> &ops)
     {
-        if (!dc->builtin.func_lv || !dc->args || dc->args->elems.empty())
+        if (!dc->builtin.func_lv || !dc->args)
             return false;
+
+        /* ZERO args (`intptr()`, `append()`): the builtin's own arity check
+         * throws InvalidNumberOfArgsEx at the args caret - the tree-walker's
+         * exact runtime behavior, lowered as a pooled throw. */
+        if (dc->args->elems.empty()) {
+            emit_throw(Chunk::ThrowKind::bad_args,
+                       dc->args->start, dc->args->end, nullptr, ops);
+            out_slot = alloc_temp();   /* dead: the op always throws */
+            return true;
+        }
 
         const Construct *a0 = dc->args->elems[0].get();
 
@@ -2797,14 +2869,16 @@ struct Codegen {
             }
         }
 
+        int kind = -1;
+        int a0slot = -1;
         if (!a0->is_id()) {
             /* arg0 is not a slotted id. A SUBSCRIPT/MEMBER target was handled
              * above; anything ELSE (a literal, a call/arith result — the
              * only lvalues in MyLang are id / subscript / member) is PROVABLY
              * not an lvalue, so a REQUIRES-lvalue builtin always throws
              * NotLValueEx(arg0 loc) after evaluating its args -> a native
-             * ThrowRuntimeV. (sort/rev_sort/reverse ACCEPT a value arg0, so they
-             * are excluded — they fall back and sort the value copy.) */
+             * ThrowRuntimeV; the sort family (value-arg0-accepting) instead
+             * materializes arg0 into a temp below. */
             const Identifier *cid =
                 dynamic_cast<const Identifier *>(dc->what.get());
             if (cid && builtin_requires_lvalue_arg0(cid->get_str())
@@ -2830,16 +2904,28 @@ struct Codegen {
                 ops.resize(om);
                 chunk.consts.resize(cm);
                 next_temp = st;
+                return false;
             }
-            return false;
-        }
-
-        int kind;
-        switch (static_cast<const Identifier *>(a0)->sym.kind) {
-        case SymKind::local:   kind = 0; break;
-        case SymKind::global:  kind = 1; break;
-        case SymKind::capture: kind = 2; break;
-        default: return false;   /* builtin / unresolved -> fall back */
+            /* sort/rev_sort/reverse ACCEPT a VALUE arg0 (a fresh clone / a
+             * call result: the tree-walker sorts that unaliased value in
+             * place and returns it). Materialize it into a TEMP slot - the
+             * temp IS the "lvalue" (kind 0), invisible to the script, so
+             * func_lv sorts the same fresh value the tree-walker does. */
+            {
+                int vslot;
+                if (!compile_boxed_expr(a0, vslot, ops))
+                    return false;
+                kind = 0;
+                a0slot = vslot;
+            }
+        } else {
+            switch (static_cast<const Identifier *>(a0)->sym.kind) {
+            case SymKind::local:   kind = 0; break;
+            case SymKind::global:  kind = 1; break;
+            case SymKind::capture: kind = 2; break;
+            default: return false;   /* builtin / unresolved -> fall back */
+            }
+            a0slot = static_cast<const Identifier *>(a0)->sym.slot;
         }
 
         /* EMPLACE (Phase 2b): append(struct_arr, Ctor(args)) with a POD struct
@@ -2922,11 +3008,11 @@ struct Codegen {
              * is a struct ctor whose EmplaceStruct fell through - append_tw does
              * the construct-in-place there; (b) a value/cmp that doesn't lower to
              * a register run. Otherwise it's rest-native. */
-            auto *ctor = dc->args->elems.size() == 2
-                ? dynamic_cast<const CallExpr *>(dc->args->elems[1].get())
-                : nullptr;
-            if (ctor && ctor->vm_struct_ctor_def)
-                return false; /* ctor-fallthrough -> tree-walker append_tw */
+            /* (A qualifying POD-ctor arg1 took EmplaceStruct above; a
+             * NON-qualifying one - a dyn field arg - compiles as a VALUE in
+             * the rest run via the checked ctor op: observably identical to
+             * append_tw's construct-in-place, incl. the throw-before-append
+             * ordering.) */
             if (!emit_args_range(dc->args->elems, restbase, ops, 1))
                 return false;   /* didn't lower -> tree-walker (no self-eval) */
             rest_op = true;
@@ -2938,7 +3024,7 @@ struct Codegen {
         /* AST-free: the Builtin + arg carets live in the builtin_calls pool
          * (index in a.slot; a.lit carries the arg0 slot kind). */
         cv.target = dst;
-        cv.target2 = static_cast<const Identifier *>(a0)->sym.slot;
+        cv.target2 = a0slot;
         cv.a = int_lit(kind);
         cv.a.slot = add_builtin_call(dc);
         if (rest_op)
@@ -2953,7 +3039,7 @@ struct Codegen {
      * value expr compiles via compile_boxed_expr - so a `return f(x)` becomes a
      * CallV, `return a+b` a BinOpV, etc. A bare `return;` loads `none`. An expr
      * compile_boxed_expr can't lower (e.g. a ternary from a recursion unroll)
-     * rolls back to the EvalStmt fallback.
+     * declines (the statement aborts if nothing lowers it).
      */
     /*
      * P8 Inc 2c: at a flow op (return / break / continue) that crosses the
@@ -3405,14 +3491,29 @@ struct Codegen {
             }
         }
         const int nsteps = static_cast<int>(chain.size());
-        if (nsteps < 2)
-            return false;            /* a single s.f / a[i] is a specific path */
         int nmember = 0;
         for (const Construct *c : chain)
             if (dynamic_cast<const MemberExpr *>(c))
                 nmember++;
+        /* A single-SUBSCRIPT step is StoreElemValue's job (the universal
+         * store, incl. a dyn base); a single MEMBER step reaches here only
+         * when the PROVEN paths (StoreMemberV / DictStore, base_struct /
+         * base_dict) declined - i.e. an UNPROVEN (dyn / template) base:
+         * `p.x = 5` in a dyn-param body. The chain final-step dispatch
+         * mirrors the tree-walker exactly (POD byte store / boxed field /
+         * dict vivify / "Expected struct object"). */
+        if (nsteps < 2 && nmember == 0)
+            return false;
         if (nmember == 0)
             return false;            /* pure-subscript chain -> StoreElem* */
+        if (nsteps == 1) {
+            /* keep the PROVEN single-member stores on their tuned ops
+             * (StoreMemberV / DictStore, tried after this call): only an
+             * UNPROVEN base takes the 1-step chain. */
+            auto *m1 = static_cast<const MemberExpr *>(chain[0]);
+            if (m1->base_struct || m1->base_dict)
+                return false;
+        }
         /* An OPTIONAL member (`a?.b`) short-circuits a none base - not handled
          * by the chain walk; leave it to the tree-walker. */
         for (const Construct *c : chain)
@@ -4515,12 +4616,12 @@ struct Codegen {
      * dispatched by its OWN kind: an int/float scalar statement, a NESTED
      * `for`/`while` loop, or an `if`. A FLOW-FREE statement that isn't natively
      * compilable (an array-building decl `var row = array(n,0)`, a general
-     * store `c[i] = row`, a void call) runs as a fallback EvalStmt WITHIN the
+     * store `c[i] = row`, a void call) lowers via its own native op WITHIN the
      * native loop, so the loop still goes native around it. SELF-TRUNCATING: a
      * flow-AFFECTING unsupported statement (break/continue/return, or a nested
      * loop/if that can't compile) resizes chunk.code back to the body start and
      * returns false, so the caller falls the whole loop back. Also returns
-     * false when NO statement compiled natively (an all-EvalStmt body: the
+     * false only when a statement cannot compile at all (the
      * tree-walker's tight counter beats a native loop that only dispatches
      * fallbacks).
      */
@@ -4645,7 +4746,7 @@ struct Codegen {
                  * the if but keeps its braced body), or an explicit block. A
                  * scope_free block runs inline in the same frame, so compile
                  * its statements in place (nested blocks recurse). Without this
-                 * the whole enclosing loop fell back to one EvalStmt. */
+                 * the whole enclosing loop failed to lower. */
                 if (blk->scope_free && compile_scalar_body(body_stmts(blk))) {
                     any_native = true;
                     continue;
@@ -4679,12 +4780,11 @@ struct Codegen {
             }
 
             /* An assignment/decl (Expr14), a call statement (CallExpr), or a
-             * `return` (ReturnStmt) runs as a fallback EvalStmt WITHIN the
-             * native loop. Expr14/CallExpr don't touch the loop's FlowState; a
-             * return sets flow==ret, which the EvalStmt handler acts on by
-             * stopping the chunk (a return abandons the loop). Anything
-             * else (a nested loop/if that couldn't compile, a block) falls the
-             * whole loop back. */
+             * `return` (ReturnStmt) lowers via ReturnV WITHIN the
+             * native loop. Expr14/CallExpr don't touch the loop's FlowState;
+             * a return sets flow==ret and stops the chunk (abandoning the
+             * loop). Anything else that can't compile fails the whole loop
+             * (-> the enclosing statement's NotLoweredEx). */
             /* A user-function call statement -> CallV (result discarded). */
             if (const DirectCallExpr *dc =
                     dynamic_cast<const DirectCallExpr *>(s)) {
@@ -4720,20 +4820,21 @@ struct Codegen {
                 }
                 /* Inside an INLINED-CALL boundary a return MUST be redirected
                  * (yield the expr value); try_native_return declined (an
-                 * uncompilable return value or crossed finally), and the
-                 * fallback EvalStmt would
-                 * wrongly ReturnV the whole chunk - so fail the body and let the
-                 * entire InlinedCallExpr tree-walk (byte-identical). */
+                 * uncompilable return value or crossed finally) - so fail
+                 * the body and let the entire InlinedCallExpr tree-walk
+                 * (byte-identical). */
                 if (!inline_returns.empty()) {
                     chunk.code.resize(start);
                     return false;
                 }
                 /* try_native_return declined (a nested-try return, or an
-                 * uncompilable value): it falls back to a tree-walked EvalStmt
-                 * that STOPS the chunk on flow==ret. That's fine only if NO
-                 * finally is crossed; if any enclosing try has a finally, the
-                 * fallback would SKIP it, so fail the whole body and let the
-                 * try region tree-walk (which runs the finally correctly). */
+                 * uncompilable value). If any enclosing try has a finally, a
+                 * partial lowering could SKIP it - fail the whole body and
+                 * let the try region tree-walk (runs the finally correctly)
+                 * ... which itself fails to lower -> NotLoweredEx: with the
+                 * no-fail contract this path must be unreachable (all return
+                 * values compile; crossed finallys inline). Kept as the
+                 * conservative guard. */
                 for (const auto &tf : trys)
                     if (tf.has_finally) {
                         chunk.code.resize(start);
@@ -4777,30 +4878,46 @@ struct Codegen {
                 }
             }
 
-            if (dynamic_cast<const Expr14 *>(s)
-                || dynamic_cast<const CallExpr *>(s)
-                || dynamic_cast<const ReturnStmt *>(s)
-                || dynamic_cast<const ThrowStmt *>(s)) {
-                /* A `throw` runs as a fallback EvalStmt (P8 Inc 0: still a C++
-                 * throw) - safe inside a native loop/region: the vm_run_chunk
-                 * boundary routes it to an active handler, or propagates it. */
-                emit(OpCode::EvalStmt, s);
-                continue;
+            /* The DISCARD tier (mirrors gen_stmt's tail): a bare leaf
+             * (Identifier / scalar literal) statement is a deliberate no-op
+             * (the tree-walker never RValue-s a discarded statement); any
+             * OTHER expression statement compiles into a scratch temp and
+             * drops the result - `map(f, a);` in a loop body, a discarded
+             * ctor, `s[k];` - with the byte-identical throw carets. This is
+             * the terminal tier: what it can't compile fails the whole
+             * body (-> the enclosing statement's not-lowered abort). */
+            {
+                /* Same inert-leaf rule as gen_stmt's tail: always-bound ids /
+                 * literals are no-ops; an unresolved or global id compiles
+                 * (throw / defined-checked load), result discarded. */
+                const Identifier *bid = dynamic_cast<const Identifier *>(s);
+                const bool inert =
+                    dynamic_cast<const Literal *>(s)
+                    || (bid && bid->sym.kind != SymKind::unresolved
+                            && bid->sym.kind != SymKind::global);
+                if (inert)
+                    continue;
+                const size_t emark = chunk.code.size();
+                const int st2 = next_temp;
+                int dst;
+                if (compile_boxed_expr(s, dst, chunk.code)) {
+                    any_native = true;
+                    continue;
+                }
+                chunk.code.resize(emark);
+                next_temp = st2;
             }
 
             chunk.code.resize(start);
             return false;
         }
-        /* An all-fallback LOOP body: not worth a native loop (the tree-walker's
-         * tight counter beats one that only dispatches EvalStmts). This gate
-         * does NOT apply to an `if` then/else block (is_loop_body=false): the
-         * `if` provides its own native branch, so an all-fallback branch - e.g.
-         * `if (n%f==0) return false;` - must still compile so the enclosing
-         * loop can go native around it. */
-        if (is_loop_body && !any_native) {
-            chunk.code.resize(start);
-            return false;
-        }
+        /* (The old "all-fallback loop body isn't worth a native loop" gate is
+         * GONE with the fallback ops: every statement lowers, so any_native
+         * is bookkeeping only, and an EMPTY body - `while (cond);`,
+         * `foreach (...) { }` - compiles to zero body ops, correctly.) */
+        (void)any_native;
+        (void)is_loop_body;
+        (void)start;
         return true;
     }
 
@@ -4842,10 +4959,9 @@ struct Codegen {
                     jf = chunk.code.size();
                     chunk.code.push_back(in);
                 } else {
-                    /* an uncompilable cond (exotic: show()-in-tests, an
-                     * impure-lvalue inc-dec value): fail the whole `if` -
-                     * the statement-level EvalStmt handles it (JumpIfFalse
-                     * is gone). */
+                    /* an uncompilable cond: fail the whole `if` (-> the
+                     * statement-level NotLoweredEx; must be unreachable
+                     * under the no-fail contract). */
                     chunk.code.resize(start);
                     return false;
                 }
@@ -4873,8 +4989,8 @@ struct Codegen {
     }
 
     /* P8 Inc 0: true if `c` contains a break/continue/return/rethrow that could
-     * cross a try boundary (leaking a handler). Inc 0 falls such a try back to
-     * EvalStmt (flow-crossing-try is a later increment). Conservative: flags a
+     * cross a try boundary (leaking a handler); flow-crossing-try lowering
+     * (Inc 2c) handles those natively now. Conservative: flags a
      * break/continue even inside a NESTED loop in the body (safe, rare in a try
      * body). Does NOT descend into a nested function (its flow is local). */
     /*
@@ -5019,8 +5135,8 @@ struct Codegen {
      *           <body ops> Jump Lstart ; Lend:
      * Fires when the condition is an int/float comparison and every body
      * statement compiles (scalar / nested loop / if). Self-truncating: any
-     * failure resizes chunk.code back to the start and returns false (-> a
-     * whole-statement EvalStmt, or the enclosing body falls back).
+     * failure resizes chunk.code back to the start and returns false (-> the
+     * enclosing statement's NotLoweredEx, or the enclosing body falls back).
      */
     bool try_native_scalar_while(const WhileStmt *w)
     {
@@ -5159,8 +5275,8 @@ struct Codegen {
      * the cond compiles (int/float compare, split `&&`, or a boxed truthiness
      * test) OR is ABSENT (`for (;;)` - no exit branch; it leaves via a native
      * break/return/throw, or genuinely runs forever, like the tree-walker),
-     * the body compiles (scalar / nested / flow-free EvalStmt - the any_native
-     * gate applies), and the inc is a compilable int/float/boxed statement.
+     * the body compiles (scalar / nested / the discard tier), and the inc
+     * is a compilable int/float/boxed statement.
      * Self-truncating. The loop var must be a frame slot (so running init/inc
      * in place is sound, no child scope) - the operand compilers enforce that.
      */
@@ -5859,7 +5975,14 @@ struct Codegen {
      */
     bool try_native_dyn_foreach(const ForeachStmt *fe)
     {
-        if (!fe->container_is_dyn || !fe->ids || fe->ids->elems.empty())
+        /* No container_is_dyn gate: ForeachDynInit/Next RUNTIME-dispatch
+         * array|dict and mirror do_iter's bind rules for ANY id list (any
+         * var count, `indexed`, `_`, dict none-padding), so this is the
+         * UNIVERSAL foreach - tried LAST, after the specific fast forms, it
+         * also covers the residual proven shapes (a lone `_`, a 1-var
+         * indexed array, a >2-var dict with none-pad, ...). A non-iterable
+         * container throws the tree-walker's TypeErrorEx from Init. */
+        if (!fe->ids || fe->ids->elems.empty())
             return false;
 
         /* Collect the per-var frame slots (-1 == `_`) into an unpack_targets
@@ -5952,12 +6075,12 @@ struct Codegen {
          * function-body statements, not only loop bodies. A resolved-local
          * int/float scalar decl/assign/`++`/compound-assign lowers to register
          * ops; an `if` with a native compare condition + native branches lowers
-         * to compares/jumps (compile_native_if, else a whole-if EvalStmt);
-         * a loop
-         * tries its native form. Anything else - a return, a call, a complex
-         * expression - stays a fallback EvalStmt (tree-walked). Each attempt is
-         * self-truncating (resets to `mark` on failure). This is what makes a
-         * scalar-arithmetic FUNCTION body native, not only a loop body. */
+         * to compares/jumps (compile_native_if); a loop tries its native
+         * form; a return/call/expression statement its own op or the discard
+         * tier. Each attempt is self-truncating (resets to `mark` on
+         * failure); what nothing lowers is a NotLoweredEx compile abort.
+         * This is what makes a scalar-arithmetic FUNCTION body native, not
+         * only a loop body. */
         reset_temps();
         const size_t mark = chunk.code.size();
         if (compile_int_stmt(s, chunk.code))
@@ -5973,25 +6096,23 @@ struct Codegen {
         chunk.code.resize(mark);
 
         if (const IfStmt *f = dynamic_cast<const IfStmt *>(s)) {
-            if (!compile_native_if(f)) {
-                chunk.code.resize(mark);
-                emit(OpCode::EvalStmt, s);   /* whole-if fallback (rare) */
-            }
+            if (!compile_native_if(f))
+                throw_not_lowered(s);
             return;
         }
         if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
             if (!try_native_scalar_while(w))
-                emit(OpCode::EvalStmt, s);   /* whole-while fallback (rare) */
+                throw_not_lowered(s);
             return;
         }
         if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
-            if (!try_native_for_range(fr))     /* else the counted loop falls */
-                emit(OpCode::EvalStmt, s);      /* back to the tree-walker */
+            if (!try_native_for_range(fr))
+                throw_not_lowered(s);
             return;
         }
         if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
             if (!try_native_for(fs))           /* general (non-range) for */
-                emit(OpCode::EvalStmt, s);
+                throw_not_lowered(s);
             return;
         }
         if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
@@ -6001,7 +6122,7 @@ struct Codegen {
                 && !try_native_struct_foreach(fe) /* flat struct fields */
                 && !try_native_dict_foreach(fe)   /* live dict iterator */
                 && !try_native_dyn_foreach(fe))   /* runtime array|dict */
-                emit(OpCode::EvalStmt, s);
+                throw_not_lowered(s);
             return;
         }
         /* A user-function call statement (result discarded) -> CallV. */
@@ -6040,8 +6161,8 @@ struct Codegen {
          * NAMED func decl ALWAYS has a global slot (top-level hoist or a
          * scoped global): the grammar rejects a capture list on a named func,
          * and the brace-less-body masked route was removed by pWrapDeclBody
-         * (parser.cpp) - so the old non-global EvalStmt fallback is provably
-         * dead (the REPL, whose names ARE map-resident, never runs codegen);
+         * (parser.cpp) - so a non-global named decl is provably impossible
+         * here (the REPL, whose names ARE map-resident, never runs codegen);
          * ML_CHECK guards the invariant. */
         if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(s)) {
             if (fd->id) {
@@ -6097,9 +6218,21 @@ struct Codegen {
          * tree-walker never RValue-s a discarded statement - so an undefined
          * name must stay its harmless no-op (an UndefinedId sentinel), NOT a
          * LoadGlobalV that would throw. A non-liftable expr (an AST/dev builtin,
-         * an inc-dec, an unresolved name) rolls back to EvalStmt below. */
-        if (!dynamic_cast<const Identifier *>(s)
-            && !dynamic_cast<const Literal *>(s)) {
+         * an inc-dec, an unresolved name) compiles or aborts below. */
+        {
+            /* A discarded INERT leaf - a scalar literal, or an id that is
+             * ALWAYS bound (local/param/capture/builtin) - is a no-op, as
+             * Block::do_eval (it never RValue-s the result). An UNRESOLVED
+             * id must throw UndefinedVariableEx and a GLOBAL id throws iff
+             * not yet defined - both exactly what compile_boxed_expr's leaf
+             * paths emit (ThrowRuntimeV / LoadGlobalV), result discarded. */
+            const Identifier *bid = dynamic_cast<const Identifier *>(s);
+            const bool inert =
+                dynamic_cast<const Literal *>(s)
+                || (bid && bid->sym.kind != SymKind::unresolved
+                        && bid->sym.kind != SymKind::global);
+            if (inert)
+                return;
             const size_t emark = chunk.code.size();
             const int st = next_temp;
             int dst;
@@ -6109,7 +6242,7 @@ struct Codegen {
             next_temp = st;
         }
 
-        emit(OpCode::EvalStmt, s);
+        throw_not_lowered(s);
     }
 
 };
@@ -6145,14 +6278,18 @@ intern_inline_ctx(const InlineCtx *ic, Chunk &chunk,
     return idx;
 }
 
-static void extract_locs(Chunk &chunk)
+static void extract_locs(Chunk &chunk,
+                         const std::vector<const Construct *> &ast_nodes)
 {
+    auto node_at = [&](int32_t idx) -> const Construct * {
+        return idx < 0 ? nullptr : ast_nodes[static_cast<size_t>(idx)];
+    };
     /* InlineCtx* -> inline_frames index, shared across ops so a chain reused by
      * many spliced ops is flattened once. */
     std::unordered_map<const InlineCtx *, int32_t> inline_memo;
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
         Instr &in = chunk.code[pc];
-        const Construct *node = chunk.node_at(in.node_idx);
+        const Construct *node = node_at(in.node_idx);
         if (!node)
             continue;
         /* P8 Inc 4: an op spliced from an INLINED body records that body's
@@ -6266,8 +6403,6 @@ static void extract_locs(Chunk &chunk)
             in.node_idx = -1;
             break;
         }
-        case OpCode::EvalStmt:
-            break;
         default:
             in.node_idx = -1;
             break;
@@ -6289,19 +6424,16 @@ static void extract_locs(Chunk &chunk)
  * side table, then DROP the indexed `ast_nodes` pool + the live `node_idx`s.
  * After this the runtime looks a node up by pc (node_at_pc), the last AST
  * reference off the per-Instr field. pc-ascending, so node_table stays sorted. */
-static void build_node_table(Chunk &chunk)
+/* After extract_locs, NO op may still reference an AST node: every native op
+ * is pool/loc-based and the fallback ops are deleted. Enforce the invariant -
+ * a live node_idx here is a codegen bug (an op emitted with a node that no
+ * extract_locs case handles). */
+static void verify_ast_free(Chunk &chunk)
 {
-    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
-        Instr &in = chunk.code[pc];
-        if (in.node_idx < 0)
-            continue;
-        chunk.node_table.push_back(
-            {static_cast<uint32_t>(pc),
-             chunk.ast_nodes[static_cast<size_t>(in.node_idx)]});
-        in.node_idx = -1;   /* dead now: the runtime uses node_at_pc(pc) */
+    for (Instr &in : chunk.code) {
+        ML_CHECK(in.node_idx == -1);
+        (void)in;
     }
-    chunk.ast_nodes.clear();
-    chunk.ast_nodes.shrink_to_fit();
 }
 
 }  /* namespace */
@@ -6328,8 +6460,8 @@ codegen_chunk(const Block *block, int slot_count)
     cg.chunk.n_dyn_iters = cg.max_dyn_iters;
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
-    extract_locs(cg.chunk);   /* move div/mod carets to the loc side table */
-    build_node_table(cg.chunk);   /* flatten residual nodes -> pc-keyed table */
+    extract_locs(cg.chunk, cg.ast_nodes);   /* carets -> the loc side table */
+    verify_ast_free(cg.chunk);    /* the finished chunk holds NO Construct* */
     return std::move(cg.chunk);
 }
 
@@ -6411,15 +6543,12 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
 
     Chunk ck = codegen_chunk(body, fn->frame_size);
 
-    /* Keep the chunk iff it has at least one REAL op - anything that is not a
-     * pure fallback (EvalStmt) or control-flow op (Jump /
-     * LoopBackEdge / Halt). An all-fallback body gains nothing from the VM (an
-     * EvalStmt is `node->eval`, same as the tree-walker, plus dispatch), so it
-     * stays tree-walked; a body of native calls / stores / loads (which has no
-     * arith/loop op) still compiles. */
+    /* Keep the chunk iff it has at least one REAL op - anything that is not
+     * a control-flow op (Jump / LoopBackEdge / Halt). An empty/no-op body
+     * gains nothing from the VM, so it stays tree-walked; a body of native
+     * calls / stores / loads (no arith/loop op) still compiles. */
     for (const Instr &in : ck.code)
-        if (in.op != OpCode::EvalStmt
-            && in.op != OpCode::Jump && in.op != OpCode::LoopBackEdge
+        if (in.op != OpCode::Jump && in.op != OpCode::LoopBackEdge
             && in.op != OpCode::Halt) {
             out = std::move(ck);
             return true;
