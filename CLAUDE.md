@@ -3286,7 +3286,8 @@ AST-free with **PER-STEP subscript carets** in the **`Chunk::chain_locs`** pool
 the hot store stays cheap): an INTERMEDIATE `a[9]` OOB carets the inner
 subscript, the FINAL store the outer — byte-identical to the tree-walker's
 per-node stamp (this replaced an earlier single-outer-loc imprecision where an
-inner throw showed the whole `a[i][j]` span). **A store's base may be a GLOBAL or CAPTURE container**, not only a
+inner throw showed the whole `a[i][j]` span). **A store's base may be a GLOBAL
+or CAPTURE container**, not only a
 frame local: `as_container_base` (codegen) returns a slot **KIND** (0 local / 1
 global / 2 capture) which the store ops carry in `in.target`, and
 `vm_store_base`

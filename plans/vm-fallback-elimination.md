@@ -598,12 +598,12 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
    lvalue). The final step dispatches struct (`vm_member_store`) / dict member
    (`vm_subscript_store(memId)` == `d["f"]=v`, auto-vivify) / subscript
    (`vm_subscript_store`); per-step locs make ALL carets byte-identical. Works
-   for boxed structs / dict values, throws NotLValue for POD, all byte-identical.
+   for boxed structs / dict values, throws NotLValue for POD, byte-identical.
    Only an optional `d?.f++` still falls back (rare). **The pre-existing
    StoreElem2V/StoreElemChainV single-loc imprecision (an inner-subscript throw
    showed the whole `a[i][j]` span) is now FIXED too** (2026-07-13): both carry
-   per-step subscript carets in a new `Chunk::chain_locs` pool (a `{Loc,Loc}` per
-   step, deref only on the throw path — a pointer, so no hot-store regression:
+   per-step subscript carets in a new `Chunk::chain_locs` pool (a `{Loc,Loc}`
+   per step, deref only on the throw path — a pointer, no hot-store regression:
    matrix -vm 0.18s unchanged).
 4. **`foreach` where all six handlers decline** — a non-local loop/unpack var
    (global/capture), an **indexed** dyn-container foreach, a **>2-var** dyn
