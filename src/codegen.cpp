@@ -1334,6 +1334,8 @@ struct Codegen {
                 dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
             if (try_native_defined_global(bc, out_slot, ops))
                 return true;
+            if (try_native_defined_expr(bc, out_slot, ops))
+                return true;
             if (try_native_map_filter(bc, out_slot, ops))
                 return true;
             if (try_native_builtin(bc, out_slot, ops))
@@ -2306,6 +2308,48 @@ struct Codegen {
         return true;
     }
 
+    /* `defined(<non-identifier expr>)`: only a bare Identifier can evaluate
+     * to the UndefinedId sentinel (Identifier::do_eval is its SOLE producer -
+     * eval.cpp), so for any other arg builtin_defined is exactly "evaluate
+     * the arg (its effects/throws included), then true". Lowered as: compile
+     * the arg into a scratch temp (result discarded) + LoadConstV true. A
+     * WRONG-ARITY call (`defined(a,b)`) throws InvalidNumberOfArgsEx BEFORE
+     * evaluating any arg -> a bare ThrowRuntimeV(bad_args) with the args
+     * caret. The identifier forms never reach here (try_fold_defined /
+     * DefinedGlobalV); an unresolved name INSIDE the arg throws via its own
+     * lowering, matching the tree-walker's RValue. AST-free. */
+    bool try_native_defined_expr(const DirectBuiltinCallExpr *dc,
+                                 int &out_slot, std::vector<Instr> &ops)
+    {
+        const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
+        if (!callee || callee->get_str() != "defined" || !dc->args)
+            return false;
+        if (dc->args->elems.size() != 1) {
+            emit_throw(Chunk::ThrowKind::bad_args,
+                       dc->args->start, dc->args->end, nullptr, ops);
+            out_slot = alloc_temp();   /* dead: the op always throws */
+            return true;
+        }
+        if (dynamic_cast<const Identifier *>(dc->args->elems[0].get()))
+            return false;              /* id forms: fold / DefinedGlobalV */
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+        int t;
+        if (!compile_boxed_expr(dc->args->elems[0].get(), t, ops)) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+        const int dst = alloc_temp();
+        Instr in;
+        in.op = OpCode::LoadConstV;
+        in.target = dst;
+        in.target2 = add_const(EvalValue(true));
+        ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
     bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
                             std::vector<Instr> &ops)
     {
@@ -2992,6 +3036,7 @@ struct Codegen {
                     dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
                 int t;
                 if (try_native_defined_global(bc, t, ops)   /* defined(global) */
+                        || try_native_defined_expr(bc, t, ops)
                         || try_native_builtin(bc, t, ops))  /* value ABI */
                     out = slot_op(t);
                 else

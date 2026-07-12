@@ -3475,7 +3475,16 @@ by the kind-packed `Instr::a`; the whole-args caret rides the loc side
 table), so a struct-append chunk serializes with an empty `node_table`.
 An **AST builtin**
 (defined/type/…, needs the arg node) keeps the union null and stays
-`EvalToSlot`. **The read-only builtin migration to `func_v` is
+`EvalToSlot` — EXCEPT `defined`, now fully lowered: only a bare `Identifier`
+can evaluate to the `UndefinedId` sentinel (`Identifier::do_eval` is its sole
+producer), so `defined(<non-identifier expr>)` is exactly "evaluate the arg
+(effects/throws included), then `true`" (`try_native_defined_expr`: compile
+the arg + `LoadConstV true`, AST-free), and a wrong-arity `defined(a, b)` —
+which throws BEFORE evaluating any arg — is a bare
+`ThrowRuntimeV(bad_args)` → `InvalidNumberOfArgsEx` with the args caret.
+With `try_fold_defined` (identifiers) + `DefinedGlobalV` (globals), every
+`defined` form is now fold/native.
+**The read-only builtin migration to `func_v` is
 complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose
 args are plain values now dispatches via `CallBuiltinV`. **`sort`/`rev_sort`/
 `reverse`** — whose arg0 is an `LValue` (slice write-back + a const's copy) —
@@ -3899,14 +3908,15 @@ storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 
 **Residual `EvalStmt`:** the harder niche shapes (an **int/float**-typed decl
 fed a `dyn` value — left to the tree-walker for `coerce_to_decl_type`; an
-optional `d?.f++`; a non-identifier `defined(a[0])`); an `InlinedCallExpr` whose
+optional `d?.f++`); an `InlinedCallExpr` whose
 return crosses a try INSIDE the boundary (rare); and the dev-only **`show`**
 (script-excluded by `reject_dev_builtins`, so never in serialized bytecode).
 None appear in `bench/` or `samples/` (both stay 100% native). The `_`-in-unpack
 / indexed dict `foreach`, the ≥3-level SUBSCRIPT nested store, the **general
 member/subscript lvalue-chain store** (`a[i].f=v` / `q.p.x=v` / `d.a[0].f=v`),
 the dyn scalar/element/member inc-dec, `append` to a struct member, the common
-`InlinedCallExpr`, typed NON-scalar decls, `defined(<never-declared>)`, and a
+`InlinedCallExpr`, typed NON-scalar decls, EVERY `defined` form (fold /
+`DefinedGlobalV` / the non-identifier arg / wrong arity), and a
 runtime-`const` rebind are all now native (above).
 
 **The AST-NODE SIDE TABLE — `Chunk::node_table` (the indexed `ast_nodes` POOL is

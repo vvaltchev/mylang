@@ -1879,6 +1879,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     throw CannotRebindBuiltinEx(t.start, t.end);
                 case Chunk::ThrowKind::rebind_const:
                     throw CannotRebindConstEx(t.start, t.end);
+                case Chunk::ThrowKind::bad_args:
+                    throw InvalidNumberOfArgsEx(t.start, t.end);
             }
             break;   /* unreachable */
         }

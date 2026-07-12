@@ -45,6 +45,19 @@ std::string reg_or_imm(const Chunk &ch, const Operand &o, bool /*is_float*/)
     return s.str();
 }
 
+/* A ThrowRuntimeV site's kind, for the op render + the throws pool dump. */
+static const char *throw_kind_name(Chunk::ThrowKind k)
+{
+    switch (k) {
+    case Chunk::ThrowKind::undefined_var:  return "undefined_var";
+    case Chunk::ThrowKind::not_lvalue:     return "not_lvalue";
+    case Chunk::ThrowKind::rebind_builtin: return "rebind_builtin";
+    case Chunk::ThrowKind::rebind_const:   return "rebind_const";
+    case Chunk::ThrowKind::bad_args:       return "bad_args";
+    }
+    return "?";
+}
+
 /* A CallBuiltinV's callee name from the AST-free builtin_calls pool. */
 std::string builtin_call_name(const Chunk &ch, int idx)
 {
@@ -249,11 +262,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- throws (" << ch.throws.size() << ") --\n";
         for (size_t i = 0; i < ch.throws.size(); i++) {
             const auto &t = ch.throws[i];
-            s << ";   #" << i << "  "
-              << (t.kind == Chunk::ThrowKind::undefined_var ? "undefined_var"
-                  : t.kind == Chunk::ThrowKind::not_lvalue ? "not_lvalue"
-                  : t.kind == Chunk::ThrowKind::rebind_const ? "rebind_const"
-                  : "rebind_builtin")
+            s << ";   #" << i << "  " << throw_kind_name(t.kind)
               << (t.name ? " " + std::string(t.name->val) : "") << "\n";
         }
     }
@@ -778,11 +787,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         }
         case OpCode::ThrowRuntimeV: {
             const Chunk::ThrowSite &t = chunk.throws[in.target];
-            const char *k =
-                t.kind == Chunk::ThrowKind::undefined_var ? "undefined_var"
-                : t.kind == Chunk::ThrowKind::not_lvalue ? "not_lvalue"
-                : "rebind_builtin";
-            row << "throw.rt      " << k;
+            row << "throw.rt      " << throw_kind_name(t.kind);
             if (t.name)
                 row << " '" << std::string(t.name->val) << "'";
             break;

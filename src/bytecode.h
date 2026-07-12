@@ -1186,6 +1186,9 @@ struct Chunk {
         not_lvalue,         /* NotLValueEx(loc) */
         rebind_builtin,     /* CannotRebindBuiltinEx(loc) */
         rebind_const,       /* CannotRebindConstEx(loc) */
+        bad_args,           /* InvalidNumberOfArgsEx(loc) - a wrong-arity
+                             * AST-builtin call that throws BEFORE its args
+                             * evaluate (defined(a,b)) */
     };
     struct ThrowSite {
         ThrowKind kind;

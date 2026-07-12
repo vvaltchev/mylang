@@ -784,9 +784,15 @@ is deleted.
    100% AST-free; `ast_node_pool_minimal` case (d) pins it (and its first
    draft dereferenced the AST-owned StructTypeDef after freeing the tree —
    ASan caught it, a live proof of Tier-4 item 3's lifetime rule).
-3. `defined(<non-identifier>)` = eval-arg-then-true (builtin_defined only
-   tests UndefinedId, which only a bare Identifier can produce) → kills the
-   Tier-1 #2 EvalToSlot residue + the bare-statement catch. [EASY]
+3. ✅ **DONE (2026-07-14)** `defined(<non-identifier>)` = eval-arg-then-true
+   (builtin_defined only tests UndefinedId, whose SOLE producer is
+   Identifier::do_eval — proven by grep) → `try_native_defined_expr`
+   (compile the arg + LoadConstV true, wired into compile_boxed_expr AND
+   compile_int_expr's builtin chain). A WRONG-ARITY `defined(a,b)` (throws
+   BEFORE evaluating args) → `ThrowRuntimeV` kind `bad_args` →
+   InvalidNumberOfArgsEx, args caret. Tests: value+effects, discarded
+   statement, arg-throw caret pin, wrong-arity caret pin, node_table-empty
+   pool case (e). Every `defined` form is now fold/native.
 4. FuncDeclStmt → LOCAL slot: MakeClosureV + slot bind. [EASY]
 5. for(;;) + boxed inc + non-operand for-range step. [EASY]
 6. Typed i/f decl/assign coerce store (a coerce flag on the store path).

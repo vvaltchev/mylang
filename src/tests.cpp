@@ -624,6 +624,39 @@ static const std::vector<test> tests =
     },
 
     {
+        /* defined(<non-identifier expr>): only a bare Identifier can evaluate
+         * to the UndefinedId sentinel, so any other arg == "evaluate the arg,
+         * then true" - the VM lowers it natively (compile the arg + load true,
+         * AST-free) and the arg's SIDE EFFECTS still run exactly once. */
+        "defined(expr) evaluates the arg and yields true (value + effects)",
+        {
+            "var a = [10, 20];",
+            "var r = defined(a[0]); assert(r == true);",
+            "defined(a[1]);",                     /* discarded statement form */
+            "var c = 0;",
+            "func f() { c = c + 1; return 5; }",
+            "assert(defined(f()) == true); assert(c == 1);",
+        },
+    },
+    {
+        /* An error EVALUATING the arg propagates (both engines): the caret
+         * marks the arg. */
+        "err loc: defined(expr) whose arg throws marks the arg",
+        { "var a = [10];",
+          "var r = defined(a[5]);" },
+        &typeid(OutOfBoundsEx), 17, 2, 22, 2,
+    },
+    {
+        /* A wrong-arity defined() throws InvalidNumberOfArgsEx BEFORE its args
+         * evaluate - the VM lowers it to a bare ThrowRuntimeV(bad_args) with
+         * the args caret. */
+        "err loc: defined(a, b) wrong arity marks the args",
+        { "var a = 1; var b = 2;",
+          "var r = defined(a, b);" },
+        &typeid(InvalidNumberOfArgsEx), 17, 2, 22, 2,
+    },
+
+    {
         /* A template used as a VALUE (stored/passed, dispatched INDIRECTLY) is
          * NOT a dead base template: its indirect call runs the base body, so the
          * AOT compile keeps its chunk. A DIRECT call to the same template is
@@ -14088,6 +14121,15 @@ ast_node_pool_minimal()
     /* the member form carries the key */
     if (!incdec.incdec_sites[1].memUid
         || std::string(incdec.incdec_sites[1].memUid->val) != "a")
+        return false;
+
+    /* (e) defined(<non-identifier>) lowers AST-free (arg eval + true; the
+     * old lowering was an EvalToSlot node fallback). */
+    Chunk defd;
+    if (!compile({"var a = [10];",
+                  "var r = defined(a[0]);"}, defd))
+        return false;
+    if (!defd.node_table.empty() || !table_valid(defd))
         return false;
 
     /* (d) EmplaceStruct (append(struct_arr, Ctor(..))) is AST-FREE: the ctor
