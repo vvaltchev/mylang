@@ -3695,14 +3695,27 @@ FIRST for its side effects, then the throw, matching the tree-walker's rhs-then-
 target order); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
 `builtin_requires_lvalue_arg0`, which EXCLUDES `sort`/`rev_sort`/`reverse` —
 they accept a value arg0 and sort the copy). The bare-LEAF guard keeps a
-discarded `foobar;` a no-op. **Residual `EvalStmt`:** a **dyn-callee
-not-callable** (`var dyn a = 5; a(1)` — needs a GENERIC value-call op, since a
-dyn callee may hold a `FuncObject`, a `Builtin`, or a struct descriptor, not
-just a func — `CallValueV` handles only `FuncObject`; deferred); a few **niche**
-real shapes (a
-member/dyn inc-dec statement, a ≥3-level nested store, a whole-`p` struct-array
-`foreach`); the **`InlinedCallExpr`** block form; and the dev-only **`show`**
-(script-excluded by `reject_dev_builtins`, so never in serialized bytecode).
+discarded `foobar;` a no-op.
+
+**A DYN callee → a generic value-call (`CallValueGenericV`).** An indirect call
+of a `dyn` callee (`var dyn a = len; a("hi")`, `a(1)` on a non-func) is native.
+A dyn callee is resolved at RUNTIME and may be a `FuncObject`, a read-only
+`Builtin`, a MUTATING builtin (needs an lvalue arg), an AST builtin (`defined` —
+needs the unevaluated arg node), or a struct descriptor, so the dispatch is
+intrinsically AST-dependent and a fully AST-free lowering is IMPOSSIBLE — the op
+KEEPS its CallExpr node (its args ExprList + callee caret), but the callee LOAD
+is native and a `FuncObject` body runs native (the do_func_call hook). The
+dispatch is the shared **`dispatch_call_value`** helper (`eval.cpp`) reused by
+BOTH the tree-walker's `CallExpr::do_eval` AND the op, so the two engines are
+byte-identical (FuncObject → do_func_call, Builtin → its ExprList ABI, struct →
+construct, else `NotCallableEx`). `extract_locs` records the op's CALL-SITE loc
+(for a FuncObject body's backtrace) WHILE keeping the node — the one op that
+does both. A Func-TYPED callee still uses the leaner register-run `CallValueV`.
+
+**Residual `EvalStmt`:** a few **niche** real shapes (a member/dyn inc-dec
+statement, a ≥3-level nested store, a whole-`p` struct-array `foreach`); the
+**`InlinedCallExpr`** block form; and the dev-only **`show`** (script-excluded
+by `reject_dev_builtins`, so never in serialized bytecode).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index

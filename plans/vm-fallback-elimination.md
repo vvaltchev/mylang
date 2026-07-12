@@ -463,18 +463,26 @@ real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
     `builtin_requires_lvalue_arg0` EXCLUDES sort/rev_sort/reverse (they accept a
     value arg0 — a differential regression on `sort(clone(a))` caught this).
   3 loc-pinned err-loc tests (both engines). -rt EvalStmt 111→85.
-  **DEFERRED — dyn-callee not-callable** (`var dyn a=5; a(1)`): ATTEMPTED via a
-  `CheckCallableV` guard + extending `try_native_value_call` to a dyn callee,
-  but REVERTED — a dyn callee may hold a `FuncObject`, a `Builtin`
-  (`var dyn a=len; a("hello")`), or a struct descriptor, and
-  `CallValueV`/`CheckCallableV` only
-  handle `FuncObject` (the differential caught `a("hello")` returning a throw
-  instead of 5). Nativizing it needs a GENERIC value-call op (builtin `func_v`
-  dispatch + struct construction + FuncObject), a separate feature — NOT an
-  error-path throw. The rest of the -rt error-ish inventory (`nonexistent=5`,
-  `map(lambda,a)`, `P(1)` arity, `Point("s",2)`) reproduces NATIVE / compile-
-  error standalone — they fall back only in a specific test's context, not as
-  constructs.
+  **(e) dyn-callee → a GENERIC value-call (2026-07-13, DONE).** An indirect call
+  of a `dyn` callee (`var dyn a=len; a("hi")`, `a(1)` on a non-func) is native
+  via **`CallValueGenericV`** (`CallExpr::vm_dyn_callee`). A first attempt (a
+  `CheckCallableV` guard over `FuncObject` only) was REVERTED — a dyn callee may
+  hold a `FuncObject`, a read-only `Builtin` (`len`), a MUTATING builtin (needs
+  an lvalue arg), an AST builtin (`defined` — needs the unevaluated arg node),
+  or a struct descriptor, so the dispatch is intrinsically AST-dependent and a
+  fully AST-free lowering is IMPOSSIBLE. The op therefore KEEPS its CallExpr
+  node (args + callee caret) but the callee LOAD is native and a `FuncObject`
+  body runs native (the hook). The dispatch is the shared
+  **`dispatch_call_value`**
+  (eval.cpp), reused by the tree-walker's `CallExpr::do_eval` AND the op → the
+  two engines are byte-identical over all six runtime callee kinds (func /
+  read-only builtin / mutating builtin / AST builtin / struct / non-callable,
+  incl. backtraces + arity/type errors). `extract_locs` records the op's
+  CALL-SITE loc (for a FuncObject body's backtrace) WHILE keeping the node — the
+  one op that does both. A Func-TYPED callee still uses the register-run
+  `CallValueV`. -rt EvalStmt 85→83. The rest of the -rt error-ish inventory
+  (`nonexistent=5`, `map(lambda,a)`, `P(1)` arity, `Point("s",2)`) reproduces
+  NATIVE / compile-error standalone — context-only fallbacks, not constructs.
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then
