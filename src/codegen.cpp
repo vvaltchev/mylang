@@ -2748,6 +2748,42 @@ struct Codegen {
              * node->start/end (generic - works for an IncDecExpr node). */
             if (const Subscript *sub =
                     dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                /* A NESTED subscript `a[i][j]++`/`--` -> StoreElem2V compound
+                 * (== `a[i][j] += 1`), with a synthesized boxed 1. Checked
+                 * FIRST: `a[i][j]` is base_array too, but its base `a[i]` is a
+                 * Subscript (not a slot), so the flat path below would bail.
+                 * The inner base is a Subscript over a slotted array; matches
+                 * the Expr14 nested-store path (value first, then k1, then k2). */
+                if (const Subscript *inner =
+                        dynamic_cast<const Subscript *>(sub->what.get())) {
+                    /* int/float-ONLY (like all inc-dec): a dyn element must fall
+                     * back (`+= 1` would concat a string; `++` throws). */
+                    if (inc->th != TypeHint::i && inc->th != TypeHint::f)
+                        return false;
+                    int aslot;
+                    if (!as_array_slot(inner->what.get(), aslot))
+                        return false;
+                    const int one = alloc_temp();
+                    Instr ld;
+                    ld.op = OpCode::LoadConstV;
+                    ld.target = one;
+                    ld.target2 = add_const(EvalValue((int_type)1));
+                    ops.push_back(ld);
+                    int k1slot, k2slot;
+                    if (!compile_boxed_expr(inner->index.get(), k1slot, ops)
+                        || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                        return false;
+                    Instr in;
+                    in.op = OpCode::StoreElem2V;
+                    in.node_idx = add_ast_node(sub);   /* outer subscript loc */
+                    in.target = one;                   /* the boxed-1 value slot */
+                    in.target2 = aslot;
+                    in.a = slot_op(k1slot);
+                    in.b = slot_op(k2slot);
+                    in.aop = inc->is_inc ? Op::addeq : Op::subeq;
+                    ops.push_back(in);
+                    return true;
+                }
                 if (sub->th == TypeHint::i && sub->base_array) {
                     int aslot, akind;
                     Operand idx;
@@ -2796,6 +2832,56 @@ struct Codegen {
                     ops.push_back(in);
                     return true;
                 }
+            }
+
+            /* A struct/dict MEMBER `p.x++` / `d.k++` -> the compound member
+             * store (== `p.x += 1`), with a synthesized boxed 1. Mirrors the
+             * Expr14 member-store path (StoreMemberV / DictStore). Gated on a
+             * PROVEN int/float lvalue (`inc->th`): inc-dec is int/float-ONLY, so
+             * a dyn/general field must fall back (`b.v++` on a string throws,
+             * but `b.v += 1` would concat) - the compound store is equivalent
+             * only when the field is numeric. */
+            if (inc->th != TypeHint::i && inc->th != TypeHint::f)
+                return false;
+            if (const MemberExpr *m =
+                    dynamic_cast<const MemberExpr *>(inc->lvalue.get())) {
+                if (!m->base_struct && !m->base_dict)
+                    return false;
+                int bslot, bkind;
+                if (!as_container_base(m->what.get(), bslot, bkind))
+                    return false;
+                const int one = alloc_temp();
+                Instr ld;
+                ld.op = OpCode::LoadConstV;
+                ld.target = one;
+                ld.target2 = add_const(EvalValue((int_type)1));
+                ops.push_back(ld);
+                const Op cop = inc->is_inc ? Op::addeq : Op::subeq;
+                Instr in;
+                if (m->base_dict) {
+                    Instr kin;               /* the member name as a string key */
+                    kin.op = OpCode::LoadConstV;
+                    kin.node_idx = add_ast_node(m);
+                    kin.target = alloc_temp();
+                    kin.target2 = add_const(m->memId);
+                    ops.push_back(kin);
+                    in.op = OpCode::DictStore;
+                    in.node_idx = add_ast_node(m);
+                    in.target = bkind;
+                    in.target2 = bslot;
+                    in.a = slot_op(kin.target);
+                    in.b = slot_op(one);
+                    in.aop = cop;
+                } else {
+                    in.op = OpCode::StoreMemberV;
+                    in.target = bkind;
+                    in.target2 = bslot;
+                    in.a = int_lit(add_member_key(m));
+                    in.b = slot_op(one);
+                    in.aop = cop;
+                }
+                ops.push_back(in);
+                return true;
             }
             return false;
         }

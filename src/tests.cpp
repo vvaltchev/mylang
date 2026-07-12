@@ -2189,6 +2189,21 @@ static const std::vector<test> tests =
       { "struct P { int x; int y; }",
         "var p = P(1, 2); var o = p.x++; assert(o == 1 && p.x == 2);",
         "--p.y; assert(p.y == 1);" } },
+    /* inc-dec STATEMENT on a proven int/float MEMBER or a NESTED subscript is
+     * native on the VM (== `lvalue += 1`, via the compound-store path); a
+     * dyn/general lvalue falls back (inc-dec is int/float-only, so it must
+     * runtime-check). Differential covers both. */
+    { "++/--: statement on a member / nested subscript (native)",
+      { "struct P { int x; float y; }",
+        "var p = P(1, 1.5); p.x++; --p.x; p.x++; assert(p.x == 2);",
+        "p.y++; assert(p.y == 2.5);",
+        "var b = [[1, 2], [3, 4]]; b[0][1]++; b[1][0]--;",
+        "assert(b == [[1, 3], [2, 4]]);",
+        "var g = [[0, 0]]; for (var i = 0; i < 3; i++) { g[0][1]++; }",
+        "assert(g[0][1] == 3);" } },
+    { "++/--: on a dyn holding a non-number throws (via fallback)",
+      { "struct B { dyn v; } var b = B(\"s\"); b.v++;" },
+      &typeid(TypeErrorEx) },
     { "++/--: on a default-dict element (pins the value type, like += 1)",
       { "var d = dict(0);",
         "foreach (var k in [\"a\", \"b\", \"a\"]) { d[k]++; }",
