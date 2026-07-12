@@ -2996,9 +2996,9 @@ the proof. Before calling it done:
 >    testing). A plain script run (`mylang file.my`, `-vm`, and the eventual
 >    `.myv`) has ZERO AST at runtime.
 > 8. **The endgame is a serializable `.myv` file** (`mylang -c file.my` →
->    binary, run with no AST). That is IMPOSSIBLE while any `Construct*` survives
->    codegen. So this rule is not aspirational polish — it is the load-bearing
->    invariant the whole VM exists to satisfy.
+>    binary, run with no AST). That is IMPOSSIBLE while any `Construct*`
+>    survives codegen. So this rule is not aspirational polish — it is the
+>    load-bearing invariant the whole VM exists to satisfy.
 > 9. **When you find a construct that isn't natively lowered, NATIVIZE IT.** Do
 >    not add a node-holding op. Do not relocate the node. Extract its loc/data
 >    to a pool and emit real bytecode. If a construct is genuinely too rare/hard
