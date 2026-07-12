@@ -313,6 +313,28 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base, int_type nf)
     return EvalValue(construct_struct_from_values(def, heapbuf.data(), nf));
 }
 
+/* Construct a BOXED struct `B(a, x)` from its field-arg run [base, base+nargs).
+ * ML_NOINLINE + off vm_run_chunk's frame (recursion-stack reason). Unlike the
+ * POD ctor, a field coerce CAN throw - the caller passes `locs` so the throw
+ * reports the offending arg's caret (byte-identical to construct_struct). */
+static ML_NOINLINE EvalValue
+vm_struct_ctor_boxed(EvalContext &ctx, StructTypeDef *def, int_type base,
+                     int_type nargs, const ArgLoc *locs)
+{
+    if (nargs <= 16) {
+        EvalValue vals[16];
+        for (int_type i = 0; i < nargs; i++)
+            vals[i] = ctx.frame->at(base + i).get();
+        return EvalValue(construct_struct_boxed_from_values(
+            def, vals, static_cast<size_t>(nargs), locs));
+    }
+    std::vector<EvalValue> heapbuf(static_cast<size_t>(nargs));
+    for (int_type i = 0; i < nargs; i++)
+        heapbuf[i] = ctx.frame->at(base + i).get();
+    return EvalValue(construct_struct_boxed_from_values(
+        def, heapbuf.data(), static_cast<size_t>(nargs), locs));
+}
+
 /* Build a FLAT array<PodStruct> literal from the N structs' interleaved
  * field-arg run [base, base+N*M). ML_NOINLINE + off vm_run_chunk's frame for the
  * recursion-stack reason above (the fused op's field-value buffer must not
@@ -1577,6 +1599,21 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
+            pc++;
+            break;
+        }
+
+        case OpCode::StructCtorBoxedV: {
+            /* Boxed (non-POD) struct construction B(a,x) via
+             * vm_struct_ctor_boxed. A field coerce CAN throw (a dyn-laundered
+             * wrong value); the per-arg carets come from the boxed_ctors pool so
+             * the throw's caret matches the tree-walker's construct_struct. */
+            const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in.target2];
+            StructTypeDef *def = const_cast<StructTypeDef *>(bc.def);
+            ctx.frame->at(in.target).put(vm_struct_ctor_boxed(
+                ctx, def, in.a.lit,
+                static_cast<int_type>(bc.arg_locs.size()),
+                bc.arg_locs.data()));
             pc++;
             break;
         }

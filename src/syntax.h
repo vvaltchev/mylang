@@ -743,6 +743,13 @@ public:
      * flat struct array's bytes - no temporary StructObject. */
     const StructTypeDef *vm_struct_ctor_def = nullptr;
 
+    /* Analogue for a BOXED (non-POD) struct construction: the inferencer stamps
+     * the constructed `StructTypeDef *` here (null for POD - that uses
+     * vm_struct_ctor_def instead). The VM lowers it to StructCtorBoxedV (build
+     * the boxed StructObject from a value run + per-arg locs), rather than
+     * falling back to the tree-walker's construct_struct. */
+    const StructTypeDef *vm_struct_boxed_def = nullptr;
+
     /* Set by the inferencer's fold_type_query when this is a type-query builtin
      * call (type/decltype/typestr/kindstr) whose answer it BAKED into args[0] (a
      * LiteralStr/LiteralObj). The call is then equivalent to args[0], so the VM
@@ -766,6 +773,7 @@ public:
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
+        c->vm_struct_boxed_def = vm_struct_boxed_def;
         c->tq_folded = tq_folded;
         return c;
     }
@@ -796,6 +804,7 @@ public:
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
+        c->vm_struct_boxed_def = vm_struct_boxed_def;
         return c;
     }
 };
@@ -821,6 +830,7 @@ public:
         c->direct_func_slot = direct_func_slot;
         c->vm_direct_func = vm_direct_func;
         c->vm_struct_ctor_def = vm_struct_ctor_def;
+        c->vm_struct_boxed_def = vm_struct_boxed_def;
         return c;
     }
 };

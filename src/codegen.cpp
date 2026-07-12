@@ -907,6 +907,39 @@ struct Codegen {
             }
         }
 
+        /* A BOXED (non-POD) struct construction `B(a, x)` -> StructCtorBoxedV.
+         * Every field arg compiles into the register run (compile_to_run_slot
+         * handles ids / subscripts / nested ctors / literals); the boxed_ctors
+         * pool carries the def + per-arg carets (a field coerce CAN throw on a
+         * dyn-laundered value, and must report the arg's caret). A const-arg
+         * boxed ctor already folded to a LiteralObj, so only a runtime-arg one
+         * reaches here. */
+        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+            const StructTypeDef *bdef = ce->vm_struct_boxed_def;
+            if (bdef && ce->args && ce->args->elems.size() <= 16) {
+                const size_t cmark = chunk.consts.size();
+                int base;
+                if (!emit_args_range(ce->args->elems, base, ops)) {
+                    chunk.consts.resize(cmark);
+                    return false;
+                }
+                Chunk::BoxedCtor bc;
+                bc.def = bdef;
+                for (const auto &a : ce->args->elems)
+                    bc.arg_locs.push_back({ a->start, a->end });
+                const int dst = alloc_temp();
+                Instr in;
+                in.op = OpCode::StructCtorBoxedV;
+                in.target = dst;
+                in.a = int_lit(base);
+                in.target2 = static_cast<int>(chunk.boxed_ctors.size());
+                chunk.boxed_ctors.push_back(std::move(bc));
+                ops.push_back(in);
+                out_slot = dst;
+                return true;
+            }
+        }
+
         /* A FLAT STRUCT array literal `[P(a,b), P(c,d)]` (arr_hint flat_s, F-4)
          * whose elements are all same-POD-struct ctors with all-scalar field
          * args -> the FUSED MakeStructArrayV (coerce the field args straight

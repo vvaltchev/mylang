@@ -8954,6 +8954,20 @@ static const std::vector<test> tests =
       { "struct B { dyn? tag; int n; } var b = B(none, 0);",
         "for (var i = 0; i < 3; i++) { b.tag = i; b.n += i; }",
         "assert(b.tag == 2); assert(b.n == 3);" } },
+    /* Native BOXED (non-POD) struct construction with RUNTIME args
+     * (StructCtorBoxedV): a const-arg construction folds to a LiteralObj, so
+     * this exercises the runtime path (an `array`/`dyn` field makes B boxed).
+     * The per-field coerce carets are pooled, so a dyn-laundered wrong value
+     * throws with the offending arg's caret (differential = byte-identical). */
+    { "struct: boxed construction with runtime args (native StructCtorBoxedV)",
+      { "struct Bag { array items; int n; }",
+        "func mk(int x) { var a = [x, x * 2]; return Bag(a, x); }",
+        "var b = mk(3);",
+        "assert(b.items == [3, 6]); assert(b.n == 3);",
+        "struct W { dyn tag; str s; }",
+        "func mkw(x, str t) { return W(x, t); }",
+        "var w = mkw([1, 2], \"hi\");",
+        "assert(w.tag == [1, 2]); assert(w.s == \"hi\");" } },
     { "struct: assignment aliases (mutation is shared, Python-like)",
       { "struct Point { int x; int y; } var p = Point(1, 2); var q = p;",
         "p.x = 9; assert(q.x == 9);" } },

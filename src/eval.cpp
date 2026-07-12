@@ -1019,6 +1019,24 @@ construct_struct_from_values(StructTypeDef *def,
     return intrusive_ptr<StructObject>(obj);
 }
 
+intrusive_ptr<StructObject>
+construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
+                                  size_t nargs, const ArgLoc *locs)
+{
+    const size_t nfields = def->fields.size();
+    auto obj = make_intrusive<StructObject>(def);
+    obj->fields.reserve(nfields);
+    for (size_t i = 0; i < nfields; i++) {
+        const FieldDef &fd = def->fields[i];
+        const Loc s = (i < nargs && locs) ? locs[i].start : Loc();
+        const Loc e = (i < nargs && locs) ? locs[i].end : Loc();
+        /* an omitted trailing opt field binds to none */
+        EvalValue v = i < nargs ? vals[i] : EvalValue();
+        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e), false);
+    }
+    return intrusive_ptr<StructObject>(obj);
+}
+
 EvalValue vm_make_struct_array(StructTypeDef *def, size_t n,
                                const EvalValue *vals)
 {

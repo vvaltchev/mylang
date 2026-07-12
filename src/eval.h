@@ -362,6 +362,15 @@ intrusive_ptr<StructObject>
 construct_struct_from_values(StructTypeDef *def,
                              const EvalValue *vals, size_t n);
 
+/* VM StructCtorBoxedV: construct a BOXED (non-POD) struct from its field VALUES
+ * (`vals[0..nargs)`), mirroring construct_struct's boxed loop. A field coerce
+ * CAN throw (a dyn-laundered wrong value); `locs[i]` gives that arg's caret
+ * (null == use empty locs). Omitted trailing opt fields (nargs < nfields) bind
+ * none. See eval.cpp. */
+intrusive_ptr<StructObject>
+construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
+                                  size_t nargs, const ArgLoc *locs);
+
 /* VM MakeStructArrayV: build a FLAT array<PodStruct> literal from N structs'
  * field VALUES (interleaved: struct i's field j at vals[i*M + j], M =
  * def->fields.size()). Coerces straight into a contiguous flat byte buffer -

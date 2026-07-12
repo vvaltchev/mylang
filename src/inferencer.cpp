@@ -3930,6 +3930,8 @@ void Inferencer::check_struct_construction(CallExpr *call,
      * POD); a boxed struct stays the normal build+append path. */
     if (def->is_pod())
         call->vm_struct_ctor_def = def;
+    else
+        call->vm_struct_boxed_def = def;   /* VM: StructCtorBoxedV */
 
     size_t min_args = 0;
     for (size_t i = 0; i < nfields; i++)

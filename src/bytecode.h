@@ -696,6 +696,18 @@ enum class OpCode : unsigned char {
     StructCtorV,
 
     /*
+     * Construct a BOXED (non-POD) struct `B(a, x)` into `target`: the field arg
+     * values are in the register run at [a.lit, a.lit + nargs), where nargs =
+     * boxed_ctors[target2].arg_locs.size(); `target2` = the index into
+     * Chunk::boxed_ctors (the StructTypeDef* + per-arg carets). Unlike the POD
+     * ctor, a boxed field's coerce CAN throw (a dyn-laundered wrong value), so
+     * the per-arg carets are pooled (serializable, no `node`) and the throw
+     * reports the offending arg's caret - byte-identical to the tree-walker's
+     * construct_struct. Omitted trailing opt fields (nargs < nfields) bind none.
+     */
+    StructCtorBoxedV,
+
+    /*
      * Build a FLAT array<PodStruct> LITERAL `[P(a,b), P(c,d), ..]` into `target`
      * in ONE op - the FUSED form of N StructCtorV + MakeArrayV (F-4). The N
      * structs' field args are compiled INTERLEAVED into the register run
@@ -948,6 +960,16 @@ struct Chunk {
      * standalone `P(..)` construction). Program-lifetime AST-owned pointers,
      * indexed by the Instr. */
     std::vector<const StructTypeDef *> struct_defs;
+
+    /* BOXED-struct-ctor pool for StructCtorBoxedV: the constructed def plus the
+     * per-arg carets a field coerce throws with (a dyn-laundered wrong value).
+     * The def pointer is AST-owned/program-lifetime (re-bindable by name on
+     * load); the ArgLocs are pure data - so this pool is serializable. */
+    struct BoxedCtor {
+        const StructTypeDef *def;
+        std::vector<ArgLoc> arg_locs;   /* provided args [0, nargs) */
+    };
+    std::vector<BoxedCtor> boxed_ctors;
 
     /* Target frame slots for each MultiUnpackV (`a, b, c = <rvalue>`), in
      * order, with -1 for a `_` placeholder. `Instr::target` indexes this. Pure

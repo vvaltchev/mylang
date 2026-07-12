@@ -248,6 +248,12 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   #" << i << "  " << ch.struct_defs[i]->name->val
               << "\n";
     }
+    if (!ch.boxed_ctors.empty()) {
+        s << "; -- boxed_ctors (" << ch.boxed_ctors.size() << ") --\n";
+        for (size_t i = 0; i < ch.boxed_ctors.size(); i++)
+            s << ";   #" << i << "  " << ch.boxed_ctors[i].def->name->val
+              << "  (" << ch.boxed_ctors[i].arg_locs.size() << " args)\n";
+    }
     if (!ch.builtin_calls.empty()) {
         s << "; -- builtin_calls (" << ch.builtin_calls.size() << ") --\n";
         for (size_t i = 0; i < ch.builtin_calls.size(); i++) {
@@ -660,6 +666,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << in.target2 << "]("
                 << arglist(chunk, in.a.lit, in.b.lit) << ")";
             break;
+        case OpCode::StructCtorBoxedV: {
+            const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in.target2];
+            row << "struct.ctor.b " << D(in.target) << " = "
+                << std::string(bc.def->name->val) << "("
+                << arglist(chunk, in.a.lit,
+                           static_cast<int_type>(bc.arg_locs.size())) << ")";
+            break;
+        }
         case OpCode::MakeStructArrayV: {
             const size_t nf =
                 chunk.struct_defs[in.target2]->fields.size();
