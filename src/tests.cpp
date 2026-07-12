@@ -13485,7 +13485,7 @@ static bool codegen_func_counts(const std::vector<const char *> &lines,
         const Block *body = static_cast<const Block *>(fn->body.get());
         if (!body->scope_free)
             return false;
-        const Chunk chunk = codegen_chunk(body, fn->frame_size);
+        const Chunk chunk = codegen_chunk(body, fn->desc->frame_size);
         c.n_temps = chunk.n_temps;
         count_chunk_ops(chunk, c);
     } catch (...) {
@@ -14374,7 +14374,8 @@ static bool vm_disasm_closure_shape()
         bool halt_dropped = false;
         if (f && f->body && f->body->is_block()) {
             Chunk ch = codegen_chunk(
-                static_cast<const Block *>(f->body.get()), f->frame_size);
+                static_cast<const Block *>(f->body.get()),
+                f->desc->frame_size);
             halt_dropped = !ch.code.empty()
                         && ch.code.back().op == OpCode::ReturnV;
         }

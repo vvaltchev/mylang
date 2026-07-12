@@ -653,7 +653,7 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
 {
     unique_ptr<Construct> cl = tmpl->decl->clone();
     auto *fc = static_cast<FuncDeclStmt *>(cl.get());
-    fc->display_name = tmpl->decl->id
+    fc->desc->display_name = tmpl->decl->id
         ? std::string(tmpl->decl->id->get_str()) : std::string("<lambda>");
     /* Name the instance `<base>$<n>` so it is readable and INSPECTABLE
      * (typestr(f$0), :show f$0). The counter is per base NAME and monotonic for
@@ -666,6 +666,7 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
         ? clone_name_counter[tmpl->decl->id->uid]++
         : tmpl_clone_counter++;
     fc->id = make_unique<Identifier>(base + "$" + std::to_string(n));
+    fc->sync_params();   /* re-snapshot desc->name from the synthetic id */
 
     /* clone() ran every node's ctor, so the clone is a genuinely DISTINCT node
      * from the template (a fresh node_id) - the property the whole monomorph-
@@ -978,7 +979,7 @@ void Inferencer::infer_one(Block *rootBlock)
              * shell). A DEAD one (never value-used) -> also skip codegen. */
             s->func->decl->is_template = true;
             if (!s->value_used)
-                s->func->decl->is_template_base = true;
+                s->func->decl->desc->is_template_base = true;
         }
         /*
          * dyn-into-concrete coercion: a plain `var` that keeps a NUMERIC type
@@ -4429,7 +4430,7 @@ static void fr_collect_pure_funcs(Construct *c)
     if (!c)
         return;
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(c))
-        if (fd->id && fd->effective_pure)
+        if (fd->id && fd->desc->effective_pure)
             g_fr_pure.insert(fd->id->uid);
     Inferencer::for_each_child(c, fr_collect_pure_funcs);
 }
@@ -4866,9 +4867,10 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
             const EvalValue &v = kv.second->get();
             if (!v.is<intrusive_ptr<FuncObject>>())
                 continue;
-            const FuncDeclStmt *fd = v.get<intrusive_ptr<FuncObject>>()->func;
-            if (fd && fd->id && fd->effective_pure)
-                g_fr_pure.insert(fd->id->uid);
+            const FuncDescriptor *fd =
+                v.get<intrusive_ptr<FuncObject>>()->func;
+            if (fd && fd->name && fd->effective_pure)
+                g_fr_pure.insert(fd->name);
         }
     }
 

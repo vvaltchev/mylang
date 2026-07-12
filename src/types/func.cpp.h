@@ -88,21 +88,23 @@ FuncObject::FuncObject(const FuncObject &rhs)
 {
 }
 
-FuncObject::FuncObject(const FuncDeclStmt *func, EvalContext *ctx)
+FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     : func(func)
     , capture_ctx(get_root_ctx(ctx), false, true)
 {
-    if (!func->captures)
+    if (func->captures.empty())
         return;
 
     /* Snapshot each captured outer variable into a capture slot, in declaration
      * order (the resolver assigns SymKind::capture indices in the same order).
-     * The value is a copy (RValue), mutable unless made in a const context. */
-    capture_slots.reserve(func->captures->elems.size());
+     * The value is a copy (RValue), mutable unless made in a const context.
+     * The source is the descriptor's RESOLVED kind/slot (read_sym) - no
+     * capture Identifier is evaluated, so closure creation is AST-free. */
+    capture_slots.reserve(func->captures.size());
 
-    for (const auto &capture : func->captures->elems) {
+    for (const auto &cap : func->captures) {
         capture_slots.emplace_back(
-            RValue(capture->eval(ctx)),
+            RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
             ctx->const_ctx
         );
     }

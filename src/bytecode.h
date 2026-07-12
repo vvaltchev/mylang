@@ -1231,10 +1231,10 @@ struct Chunk {
     };
     std::vector<LiteralObjEntry> literal_objs;
 
-    /* Lambda definitions for MakeClosureV (the FuncDeclStmt* of each `func[..]`
-     * expression). Program-lifetime AST-owned pointers; the Instr carries the
-     * index, so it holds no raw Construct*. */
-    std::vector<const FuncDeclStmt *> closure_defs;
+    /* Function DESCRIPTORS for MakeClosureV (the FuncDescriptor of each
+     * `func[..]` expression / named decl) - the serializable runtime identity
+     * (funcdesc.h), NOT an AST node. The Instr carries the index. */
+    std::vector<const FuncDescriptor *> closure_defs;
 
     /* Struct type descriptors for StructCtorV (the StructTypeDef* of each
      * standalone `P(..)` construction). Program-lifetime AST-owned pointers,

@@ -676,7 +676,7 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
                 const FuncObject &obj =
                     *const_value.get<intrusive_ptr<FuncObject>>().get();
 
-                if (obj.func->is_const)
+                if (obj.func->pure_ctx)
                     v->is_const = true;
             }
         }
@@ -996,9 +996,8 @@ pTryDesugarNamedCall(ParseContext &c, CallExpr *call)
 
     const FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
     std::vector<ParamSpec> params;
-    if (fo.func->params)
-        for (const auto &p : fo.func->params->elems)
-            params.push_back({ p->uid, p->opt_mod });
+    for (const auto &p : fo.func->params)
+        params.push_back({ p.name, p.opt });
 
     desugar_named_call(call, params);
 }
@@ -2277,8 +2276,8 @@ pAcceptFuncDecl(ParseContext &c,
     unique_ptr<FuncDeclStmt> func(new FuncDeclStmt);
     func->start = start;
     func->is_const = is_pure;
-    func->explicit_pure = is_pure;
-    func->effective_pure = is_pure;
+    func->desc->explicit_pure = is_pure;
+    func->desc->effective_pure = is_pure;
 
     if (fl & pFlags::pInStmt) {
 
@@ -2340,6 +2339,11 @@ pAcceptFuncDecl(ParseContext &c,
     }
 
     func->end = c.get_loc() + 1;
+
+    /* Snapshot the parse-time param/name metadata into the runtime descriptor
+     * BEFORE the pure registration below - a parse-time const-eval call binds
+     * its params from the descriptor. */
+    func->sync_params();
 
     if (c.const_eval && is_pure && func->id)
         func->eval(c.const_ctx);

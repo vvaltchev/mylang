@@ -115,25 +115,26 @@ static std::string reflect_field_type(const FieldDef &f)
 }
 
 /* One parameter's "[const] [opt] [TYPE|dyn] name" declared form. */
-static std::string reflect_param_str(const Identifier *p)
+static std::string reflect_param_str(const FuncDescriptor::ParamDesc &p)
 {
     std::string s;
-    if (p->const_param)
+    if (p.cnst)
         s += "const ";
-    if (p->opt_mod)
+    if (p.opt)
         s += "opt ";
-    if (const char *t = reflect_decl_type_kw(p->decl_type)) {
+    if (const char *t = reflect_decl_type_kw(p.decl_type)) {
         s += t;
         s += " ";
-    } else if (p->dyn_mod) {
+    } else if (p.dyn_mod) {
         s += "dyn ";
     }
-    s += std::string(p->get_str());
+    s += std::string(p.name->val);
     return s;
 }
 
-/* A function's declared signature, e.g. "pure func hypot(float a, float b)". */
-std::string reflect_func_sig(const FuncDeclStmt *f)
+/* A function's declared signature, e.g. "pure func hypot(float a, float b)".
+ * Reads the RUNTIME descriptor (funcdesc.h), not the AST. */
+std::string reflect_func_sig(const FuncDescriptor *f)
 {
     std::string s;
     if (f->explicit_pure)
@@ -141,16 +142,13 @@ std::string reflect_func_sig(const FuncDeclStmt *f)
     s += "func ";
     s += !f->display_name.empty()
             ? f->display_name
-            : (f->id ? std::string(f->id->get_str())
-                     : std::string("<lambda>"));
+            : (f->name ? std::string(f->name->val)
+                       : std::string("<lambda>"));
     s += "(";
-    if (f->params) {
-        const auto &ps = f->params->elems;
-        for (size_t i = 0; i < ps.size(); i++) {
-            if (i)
-                s += ", ";
-            s += reflect_param_str(ps[i].get());
-        }
+    for (size_t i = 0; i < f->params.size(); i++) {
+        if (i)
+            s += ", ";
+        s += reflect_param_str(f->params[i]);
     }
     s += ")";
     return s;
@@ -436,11 +434,11 @@ EvalValue builtin_specializations(EvalContext *ctx, const ArgLocs *exprList,
     if (!e.is<intrusive_ptr<FuncObject>>())
         throw TypeErrorEx("Expected a function", arg->start, arg->end);
 
-    const FuncDeclStmt *f = e.get<intrusive_ptr<FuncObject>>()->func;
+    const FuncDescriptor *f = e.get<intrusive_ptr<FuncObject>>()->func;
     const std::string name =
         !f->display_name.empty()
             ? f->display_name
-            : (f->id ? std::string(f->id->get_str()) : std::string());
+            : (f->name ? std::string(f->name->val) : std::string());
 
     std::vector<std::pair<const UniqueId *, const LValue *>> syms;
     get_root_ctx(ctx)->collect_symbols(syms);
@@ -450,13 +448,13 @@ EvalValue builtin_specializations(EvalContext *ctx, const ArgLocs *exprList,
         const EvalValue &v = kv.second->get();
         if (!v.is<intrusive_ptr<FuncObject>>())
             continue;
-        const FuncDeclStmt *g = v.get<intrusive_ptr<FuncObject>>()->func;
+        const FuncDescriptor *g = v.get<intrusive_ptr<FuncObject>>()->func;
         if (g == f || g->display_name != name)
             continue;
         /* a clone has a synthetic id ($specN/$tmplN) + the original name in
          * display_name; the original itself has an empty display_name so it is
          * skipped by the display_name test above. */
-        out.push_back(std::string(g->id->get_str()));
+        out.push_back(std::string(g->name->val));
     }
     std::sort(out.begin(), out.end());
 
@@ -489,9 +487,11 @@ EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
         const EvalValue lv = arg->eval(ctx);
         if (lv.is<LValue *>()) {
             const EvalValue &v = lv.get<LValue *>()->get();
+            /* desc->decl: show() is a dev/REPL builtin - the REPL retains
+             * its input ASTs, so the decl is alive here. */
             if (v.is<intrusive_ptr<FuncObject>>())
-                return SharedStr(
-                    render_func_code(v.get<intrusive_ptr<FuncObject>>()->func));
+                return SharedStr(render_func_code(
+                    v.get<intrusive_ptr<FuncObject>>()->func->decl));
         }
     }
 

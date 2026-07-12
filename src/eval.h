@@ -5,6 +5,7 @@
 #include "defs.h"
 #include "evalvalue.h"
 #include "uniqueid.h"
+#include "funcdesc.h"
 
 #include <map>
 #include <new>
@@ -286,11 +287,13 @@ public:
                 bool repl = false);
 
     LValue *lookup(const Identifier *id);
+    LValue *lookup(const UniqueId *uid);
     bool erase(const Identifier *id);
 
     void emplace(const Identifier *id, const EvalValue &val, bool is_const);
     void emplace(const Identifier *id, EvalValue &&val, bool is_const);
     void emplace(const std::string_view &id, EvalValue &&val, bool is_const);
+    void emplace(const UniqueId *uid, EvalValue &&val, bool is_const);
 
     bool empty() const { return symbols.empty(); }
     void copy_symbols_from(const EvalContext &ctx) { symbols = ctx.symbols; }
@@ -580,11 +583,26 @@ get_root_ctx(EvalContext *ctx)
     return ctx;
 }
 
+/*
+ * Read a RESOLVED symbol (kind/slot) from `ctx` exactly as Identifier::do_eval
+ * does for that kind - the descriptor-based twin used by the AST-free paths
+ * (the FuncObject ctor's capture snapshot). `uid` backs the unresolved map
+ * fallback (REPL globals) and the UndefinedId sentinel. Defined in eval.cpp.
+ */
+EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
+                   const UniqueId *uid);
+
 class FuncObject : public RefCounted {
 
 public:
 
-    const FuncDeclStmt *const func;
+    /*
+     * The function's RUNTIME identity (funcdesc.h) - NOT an AST node. Binding,
+     * frame sizing, purity, backtraces, and reflection all read the
+     * descriptor; the tree-walker reaches the body via `func->decl` (null
+     * after the -vm AST teardown, where every call runs the compiled chunk).
+     */
+    const FuncDescriptor *const func;
     /*
      * Per-instance storage for captured outer variables (an explicit `[x,y]`
      * capture list), filled once at closure creation in declaration order. A
@@ -602,7 +620,7 @@ public:
      */
     EvalContext capture_ctx;
 
-    FuncObject(const FuncDeclStmt *func, EvalContext *ctx);
+    FuncObject(const FuncDescriptor *func, EvalContext *ctx);
     FuncObject(const FuncObject &rhs);
 };
 

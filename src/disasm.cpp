@@ -207,9 +207,9 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
     if (!ch.closure_defs.empty()) {
         s << "; -- closure_defs (" << ch.closure_defs.size() << ") --\n";
         for (size_t i = 0; i < ch.closure_defs.size(); i++) {
-            const FuncDeclStmt *fd = ch.closure_defs[i];
+            const FuncDescriptor *fd = ch.closure_defs[i];
             s << ";   #" << i << "  "
-              << (fd->id ? std::string(fd->id->get_str()) : "<lambda>") << "\n";
+              << (fd->name ? std::string(fd->name->val) : "<lambda>") << "\n";
         }
     }
     if (!ch.struct_defs.empty()) {

@@ -955,8 +955,10 @@ ReplEngine::Impl::cmd_show(const string &arg)
 
     auto func_of = [](const LValue *lv) -> const FuncDeclStmt * {
         const EvalValue &v = lv->get();
+        /* desc->decl: the REPL retains its input ASTs, so a committed
+         * function's decl is always alive here. */
         return v.is<intrusive_ptr<FuncObject>>()
-                   ? v.get<intrusive_ptr<FuncObject>>()->func
+                   ? v.get<intrusive_ptr<FuncObject>>()->func->decl
                    : nullptr;
     };
     auto render = [&](const FuncDeclStmt *f) {
@@ -976,7 +978,7 @@ ReplEngine::Impl::cmd_show(const string &arg)
         std::vector<std::pair<string, const FuncDeclStmt *>> clones;
         for (const auto &kv : syms) {
             const FuncDeclStmt *g = func_of(kv.second);
-            if (g && g != base && g->display_name == arg)
+            if (g && g != base && g->desc->display_name == arg)
                 clones.emplace_back(string(kv.first->val), g);
         }
         std::sort(clones.begin(), clones.end(),
@@ -1041,7 +1043,7 @@ ReplEngine::Impl::gc_redefined_instances(
     std::set<string> redefined;
     for (const auto &e : blk->elems)
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get()))
-            if (fd->id && fd->display_name.empty() &&
+            if (fd->id && fd->desc->display_name.empty() &&
                 before.count(fd->id->uid))
                 redefined.insert(string(fd->id->get_str()));
     if (redefined.empty())
@@ -1060,8 +1062,10 @@ ReplEngine::Impl::gc_redefined_instances(
         const EvalValue &v = kv.second->get();
         if (!v.is<intrusive_ptr<FuncObject>>())
             continue;
-        const FuncDeclStmt *fd = v.get<intrusive_ptr<FuncObject>>()->func;
-        if (fd->display_name.empty() || !redefined.count(fd->display_name))
+        const FuncDeclStmt *fd =
+            v.get<intrusive_ptr<FuncObject>>()->func->decl;
+        if (fd->desc->display_name.empty()
+                || !redefined.count(fd->desc->display_name))
             continue;                       /* not a redefined func's clone */
         if (infer.instance_has_consumer(fd))
             continue;                       /* still used by a function */

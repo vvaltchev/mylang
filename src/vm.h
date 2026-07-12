@@ -7,6 +7,7 @@
 
 class Construct;
 class FuncDeclStmt;
+struct FuncDescriptor;
 class EvalContext;
 struct RuntimeException;
 
@@ -32,7 +33,7 @@ extern std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * functions off the VM path (no per-call cost). do_func_call caches the result
  * on the FuncDeclStmt so this runs at most once per function per run.
  */
-const Chunk *vm_func_chunk(const FuncDeclStmt *fdecl);
+const Chunk *vm_func_chunk(const FuncDescriptor *fdesc);
 
 /*
  * Drive a chunk against `ctx` (a function body's args context, or main). Runs

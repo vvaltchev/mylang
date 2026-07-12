@@ -12,6 +12,7 @@
 
 class EvalValue;
 class FuncDeclStmt;
+struct FuncDescriptor;
 struct StructTypeDef;
 
 /* The runtime STRUCTURAL type of a value ("array<int>", "dict<K,V>", a struct
@@ -19,7 +20,7 @@ struct StructTypeDef;
 std::string reflect_typeof(const EvalValue &e);
 
 /* A function's declared signature ("pure func f(int a, opt b)"). */
-std::string reflect_func_sig(const FuncDeclStmt *f);
+std::string reflect_func_sig(const FuncDescriptor *f);
 
 /* A struct type's constructor signature ("Point(int x, int y)"). */
 std::string reflect_struct_ctor(const StructTypeDef *def);

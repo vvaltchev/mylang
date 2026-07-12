@@ -107,11 +107,16 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx,
 
 LValue *EvalContext::lookup(const Identifier *id)
 {
+    return lookup(id->uid);
+}
+
+LValue *EvalContext::lookup(const UniqueId *uid)
+{
     /* The map is a resolution path ONLY in const-eval and the REPL. In a script
      * it must be empty (every name slotted), so this is reached only by a
      * genuinely-undefined name and must find nothing - assert that. */
     ML_CHECK(in_const_eval() || repl_mode || symbols.empty());
-    auto &&it = symbols.find(id->uid);
+    auto &&it = symbols.find(uid);
 
     if (it != symbols.end())
         return &it->second;
@@ -152,6 +157,12 @@ void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_c
 {
     ML_CHECK(in_const_eval() || repl_mode);
     symbols.emplace(UniqueId::get(id), LValue(move(val), is_const));
+}
+
+void EvalContext::emplace(const UniqueId *uid, EvalValue &&val, bool is_const)
+{
+    ML_CHECK(in_const_eval() || repl_mode);
+    symbols.emplace(uid, LValue(move(val), is_const));
 }
 
 void EvalContext::collect_symbols(
@@ -342,6 +353,48 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
 }
 
 /*
+ * The descriptor-based twin of Identifier::do_eval (above): read a resolved
+ * symbol by kind/slot, with the same map-walk fallback (by uid) for an
+ * unresolved name. Keep the two in lockstep - the FuncObject ctor's capture
+ * snapshot must read a captured name EXACTLY as an Identifier read would.
+ */
+EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
+                   const UniqueId *uid)
+{
+    if (kind == SymKind::local && ctx->frame)
+        return EvalValue(&ctx->frame->at(slot));
+
+    if (kind == SymKind::global && ctx->gfuncs) {
+        if (ctx->gfuncs->defined[slot])
+            return EvalValue(&ctx->gfuncs->slots[slot]);
+
+        return UndefinedId{uid->val};
+    }
+
+    if (kind == SymKind::capture && ctx->captures)
+        return EvalValue(&(*ctx->captures)[slot]);
+
+    if (kind == SymKind::builtin) {
+        if (ctx && ctx->const_ctx && !builtin_is_const(slot))
+            return UndefinedId{uid->val};
+
+        return EvalValue(&builtin_slot(slot));
+    }
+
+    while (ctx) {
+
+        LValue *lval = ctx->lookup(uid);
+
+        if (lval)
+            return EvalValue(lval);
+
+        ctx = ctx->parent;
+    }
+
+    return UndefinedId{uid->val};
+}
+
+/*
  * return / break / continue no longer use C++ exceptions: they set the
  * EvalContext's FlowState (see eval.h) and unwind via ordinary returns.
  * rethrow is genuinely exceptional (it re-throws a real exception object from
@@ -372,40 +425,26 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt);
  *
  * A param with an explicit numeric type coerces a widening argument to it
  * (`func f(float x); f(3)` binds 3.0), via the same rule as a typed variable.
+ *
+ * The param is a FuncDescriptor::ParamDesc - the descriptor's parse-time
+ * snapshot of the param Identifier - so binding reads no AST node.
  */
 static inline void
 bind_param(EvalContext *args_ctx,
            Frame *frame,
            int idx,
-           const Identifier *param,
+           const FuncDescriptor::ParamDesc &param,
            EvalValue val,
            bool is_const)
 {
-    if (param->decl_type == DeclType::f || param->decl_type == DeclType::i)
-        val = coerce_to_decl_type(val, param->decl_type);
+    if (param.decl_type == DeclType::f || param.decl_type == DeclType::i)
+        val = coerce_to_decl_type(val, param.decl_type);
 
     if (frame) {
         frame->at(idx) = LValue(move(val), is_const);
     } else {
-        args_ctx->emplace(param, move(val), is_const);
+        args_ctx->emplace(param.name, move(val), is_const);
     }
-}
-
-/*
- * The minimum number of arguments a call must supply: 1 + the index of the last
- * non-`opt` parameter (0 if every parameter is `opt`). Trailing `opt` params
- * may be omitted by the caller; an omitted one binds to `none`. A non-opt param
- * after an opt one simply raises the minimum to include it (it can't be
- * skipped), so `f(x, opt y, z)` still requires all three.
- */
-static size_t
-min_required_args(const vector<unique_ptr<Identifier>> &params)
-{
-    size_t n = 0;
-    for (size_t i = 0; i < params.size(); i++)
-        if (!params[i]->opt_mod)
-            n = i + 1;
-    return n;
 }
 
 /*
@@ -419,12 +458,12 @@ min_required_args(const vector<unique_ptr<Identifier>> &params)
  * arguments; any trailing `opt` parameter it omits is bound to `none`.
  */
 static void
-do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     const vector<unique_ptr<Construct>> &args,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)   /* precomputed: see FuncDeclStmt */
+                    size_t min_args)   /* precomputed: FuncDescriptor::min_args */
 {
     const size_t nparams = funcParams.size();
     if (args.size() > nparams || args.size() < min_args)
@@ -439,15 +478,15 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
          */
         bind_param(
             args_ctx, frame, static_cast<int>(i),
-            funcParams[i].get(),
+            funcParams[i],
             i < args.size() ? RValue(args[i]->eval(ctx)) : EvalValue(),
-            funcParams[i]->const_param
+            funcParams[i].cnst
         );
     }
 }
 
 static void
-do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     const vector<EvalValue> &args,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
@@ -461,7 +500,7 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
     for (size_t i = 0; i < nparams; i++) {
         bind_param(
             args_ctx, frame, static_cast<int>(i),
-            funcParams[i].get(),
+            funcParams[i],
             i < args.size() ? args[i] : EvalValue(), ctx->const_ctx
         );
     }
@@ -481,7 +520,7 @@ struct VmArgs {
 };
 
 static void
-do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     const VmArgs &args,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
@@ -495,17 +534,17 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
     for (size_t i = 0; i < nparams; i++) {
         if (i < args.size())
             bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i].get(),
+                       funcParams[i],
                        args[i], ctx->const_ctx);
         else
             bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i].get(),
+                       funcParams[i],
                        EvalValue(), ctx->const_ctx);
     }
 }
 
 static void
-do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     const EvalValue &arg,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
@@ -518,13 +557,13 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
 
     for (size_t i = 0; i < nparams; i++)
         bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i].get(),
+                       funcParams[i],
                    i == 0 ? arg : EvalValue(), ctx->const_ctx);
 }
 
 
 static void
-do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
+do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     const pair<EvalValue, EvalValue> &args,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
@@ -537,7 +576,7 @@ do_func_bind_params(const vector<unique_ptr<Identifier>> &funcParams,
 
     for (size_t i = 0; i < nparams; i++)
         bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i].get(),
+                       funcParams[i],
                    i == 0 ? args.first : i == 1 ? args.second : EvalValue(),
                    ctx->const_ctx);
 }
@@ -555,18 +594,17 @@ static void
 vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
                  size_t call_pc, Loc call_site, const InlineCtx *call_site_inl)
 {
-    if (obj.func->is_const)
+    if (obj.func->pure_ctx)
         if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
             undefEx->in_pure_func = true;
 
     BacktraceFrame bf;
     bf.name = !obj.func->display_name.empty()
                   ? obj.func->display_name
-                  : obj.func->id ? string(obj.func->id->get_str())
-                                 : "<lambda>";
-    if (obj.func->params)
-        for (const auto &p : obj.func->params->elems)
-            bf.params.push_back(string(p->get_str()));
+                  : obj.func->name ? string(obj.func->name->val)
+                                   : "<lambda>";
+    for (const auto &p : obj.func->params)
+        bf.params.push_back(string(p.name->val));
     if (call_ck) {
         Loc end_ignored;
         call_ck->loc_at(call_pc, bf.call_site, end_ignored);
@@ -654,15 +692,11 @@ do_func_call(EvalContext *ctx,
         args_ctx.frame = &frame;
     }
 
-    if (obj.func->params) {
-        const auto &funcParams = obj.func->params->elems;
-        if (obj.func->min_args_cache < 0)
-            obj.func->min_args_cache =
-                static_cast<int>(min_required_args(funcParams));
+    if (!obj.func->params.empty()) {
         do_func_bind_params(
-            funcParams, args, ctx, &args_ctx,
+            obj.func->params, args, ctx, &args_ctx,
             obj.func->resolved ? &frame : nullptr,
-            static_cast<size_t>(obj.func->min_args_cache)
+            static_cast<size_t>(obj.func->min_args)
         );
     }
 
@@ -675,7 +709,8 @@ do_func_call(EvalContext *ctx,
          * Skipped when a compiled chunk exists (-vm: the ReturnV chunk IS the
          * native form of the same body). */
         Construct *eb;
-        if (!vm_ck && (eb = func_expr_body(obj.func)) != nullptr) {
+        if (!vm_ck && obj.func->decl
+                && (eb = func_expr_body(obj.func->decl)) != nullptr) {
             return do_func_return(eb->eval(&args_ctx), eb);
         }
 
@@ -686,10 +721,16 @@ do_func_call(EvalContext *ctx,
          * same `ret`); otherwise the tree-walker runs it. Either way the
          * return value is read from the FlowState below.
          */
-        if (vm_ck)
+        if (vm_ck) {
             vm_run_chunk(*vm_ck, args_ctx);
-        else
-            obj.func->body->eval(&args_ctx);
+        } else {
+            /* Tree-walk the body. After the -vm AST teardown every callable
+             * function has a chunk and decl is null - reaching here without
+             * one is a compiler bug, not a fallback. */
+            ML_CHECK_MSG(obj.func->decl,
+                         "call to a chunk-less function after AST teardown");
+            obj.func->decl->body->eval(&args_ctx);
+        }
 
     } catch (Exception &e) {
         /* The tree-walker / expression-body path (a real C++ throw). Record
@@ -4348,7 +4389,7 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue func(
-        intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(this, ctx))
+        intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(desc, ctx))
     );
 
     if (id) {
@@ -5566,9 +5607,10 @@ void run_weight_bench()
         body->elems.push_back(move(r));
         fd->body = move(body);
     }
-    fd->resolved = true;
-    fd->frame_size = 2;
-    FuncObject fobj(fd.get(), &ctx);
+    fd->sync_params();
+    fd->desc->resolved = true;
+    fd->desc->frame_size = 2;
+    FuncObject fobj(fd->desc, &ctx);
     std::vector<unique_ptr<Construct>> cargs;
     cargs.push_back(wb_id(0));
     cargs.push_back(wb_id(1));

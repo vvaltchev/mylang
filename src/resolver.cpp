@@ -300,7 +300,7 @@ static int count_uid(const Construct *c, const UniqueId *uid)
  * so it is NOT included - unrolling it would only grow the body. */
 static bool func_is_cacheable_recursive(const FuncDeclStmt *fd)
 {
-    return fd->effective_pure && fd->id && fd->body
+    return fd->desc->effective_pure && fd->id && fd->body
         && count_uid(fd->body.get(), fd->id->uid) >= 2;
 }
 
@@ -335,7 +335,7 @@ public:
                      * compile time (it could be fib(40)); see func_is_self_
                      * recursive. Its purity is still used for inlining/CSE. */
                     !func_is_self_recursive(
-                        v.get<intrusive_ptr<FuncObject>>()->func)) {
+                        v.get<intrusive_ptr<FuncObject>>()->func->decl)) {
                     try {
                         cctx.emplace(kv.first->val, EvalValue(v), true);
                     } catch (const Exception &) { /* dup: skip */ }
@@ -511,7 +511,8 @@ private:
              * (fib(40)) could hang. A recursive pure func keeps its purity flag
              * (for inlining/CSE) but its const-arg recursion folds only via the
              * depth/budget-bounded unroll. */
-            if (fd->effective_pure && fd->id && !func_is_self_recursive(fd)) {
+            if (fd->desc->effective_pure && fd->id
+                    && !func_is_self_recursive(fd)) {
                 try {
                     fd->eval(&cctx);
                 } catch (const Exception &) {
@@ -1878,15 +1879,15 @@ Resolver::process_function(FuncDeclStmt *fd)
      * func_mutates_input).
      */
     if (func_mutates_input(fd)) {
-        if (fd->effective_pure && fd->id)
+        if (fd->desc->effective_pure && fd->id)
             TRACE(autopure, 0, std::string(fd->id->get_str()) +
                   "  mutates a reference parameter -> NOT pure");
-        fd->effective_pure = false;
+        fd->desc->effective_pure = false;
     }
     /* Auto-pure: a non-pure function with no captures whose body is effectively
      * pure (and mutates no input) is promoted, so ispure() sees it and its
      * const-arg calls can fold (in the auto-const pass). */
-    else if (!fd->effective_pure
+    else if (!fd->desc->effective_pure
             && (!fd->captures || fd->captures->elems.empty())
             && fd->body) {
         /*
@@ -1905,7 +1906,7 @@ Resolver::process_function(FuncDeclStmt *fd)
             added_self = true;
         }
         if (func_body_is_pure(fd->body.get(), pure_func_names)) {
-            fd->effective_pure = true;
+            fd->desc->effective_pure = true;
             if (fd->id)
                 TRACE(autopure, 0, std::string(fd->id->get_str()) +
                       "  reads only consts/params -> effective pure");
@@ -1916,12 +1917,12 @@ Resolver::process_function(FuncDeclStmt *fd)
 
     /* record any proven-pure function (auto OR explicit) so a LATER function
      * that calls it is recognized pure too (see func_body_is_pure). */
-    if (fd->effective_pure && fd->id)
+    if (fd->desc->effective_pure && fd->id)
         pure_func_names.insert(fd->id->uid);
 
     if (st.slottable && st.next_slot > 0) {
-        fd->resolved = true;
-        fd->frame_size = st.next_slot;
+        fd->desc->resolved = true;
+        fd->desc->frame_size = st.next_slot;
         fd->slot_writes = move(st.writes);
     }
 }
@@ -1945,6 +1946,16 @@ Resolver::walk(Construct *c, FuncState *cur)
             for (auto &cap : fd->captures->elems) {
                 resolve_ref(cur, cap.get());
             }
+
+            /* Snapshot the RESOLVED capture sources into the descriptor: the
+             * FuncObject ctor reads kind/slot (read_sym), never the capture
+             * Identifiers, so closure creation is AST-free. Unresolved (REPL
+             * top-level) captures keep the by-name map fallback via `name`. */
+            fd->desc->captures.clear();
+            fd->desc->captures.reserve(fd->captures->elems.size());
+            for (auto &cap : fd->captures->elems)
+                fd->desc->captures.push_back(
+                    { cap->uid, cap->sym.kind, cap->sym.slot });
         }
 
         /* A hoisted top-level function already has a GLOBAL slot (resolved via
@@ -2432,12 +2443,12 @@ public:
                 if (!v.is<intrusive_ptr<FuncObject>>())
                     continue;
                 FuncDeclStmt *fd = const_cast<FuncDeclStmt *>(
-                    v.get<intrusive_ptr<FuncObject>>()->func);
+                    v.get<intrusive_ptr<FuncObject>>()->func->decl);
                 /* only PURE prior functions: an impure one reads/writes mutable
                  * global state, so inlining it across inputs is unsound (the
                  * state may differ at the new site) - and its result isn't
                  * "known at compile time" anyway, so folding gains nothing. */
-                if (!fd->id || !fd->effective_pure)
+                if (!fd->id || !fd->desc->effective_pure)
                     continue;
                 /* A prior body is POST-specialization, so it may hold a
                  * ForRangeStmt whose i_slot the inliner's substitution / tail
@@ -2959,7 +2970,8 @@ private:
 
     bool block_inlinable_decl(const FuncDeclStmt *fd)
     {
-        if (!fd->body || !fd->body->is_block() || !fd->id || !fd->resolved)
+        if (!fd->body || !fd->body->is_block() || !fd->id
+                || !fd->desc->resolved)
             return false;
         if (!(!fd->captures || fd->captures->elems.empty())
                 || contains_func(fd->body.get())
@@ -3098,7 +3110,7 @@ private:
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(slot.get())) {
             if (fd->body)
                 walk(fd->body, depth,
-                     fd->resolved ? &fd->frame_size : nullptr);
+                     fd->desc->resolved ? &fd->desc->frame_size : nullptr);
             return;
         }
 
@@ -3420,7 +3432,7 @@ private:
             return;
 
         FuncDeclStmt *f = it->second;
-        if (!f->resolved)
+        if (!f->desc->resolved)
             return;       /* its locals aren't slotted: nothing to remap into */
 
         /*
@@ -3444,7 +3456,7 @@ private:
                 return;
             if (!rec_orig.count(f))
                 rec_orig[f] = f->body->clone();
-            f->cache_results = true;
+            f->desc->cache_results = true;
         }
 
         const int nparams = f->params
@@ -3483,7 +3495,8 @@ private:
              * it at each param use is sound, and a temp-free body can become an
              * expressible ternary. Otherwise temp-bind (capture-once). */
             const bool subst = tail_arg_ok(uses, arg)
-                || (f->effective_pure && body_weight(arg) <= ARG_SUBST_MAX);
+                || (f->desc->effective_pure
+                    && body_weight(arg) <= ARG_SUBST_MAX);
             if (!subst) {
                 needs_temp[i] = true;
                 ntemps++;
@@ -3494,7 +3507,7 @@ private:
          * caller's frame, and the arg temps above those; the frame grows by
          * both (capped at 64). With no caller frame (fsize null) nothing that
          * needs a slot can be inlined. */
-        const int nlocals = f->frame_size - nparams;
+        const int nlocals = f->desc->frame_size - nparams;
         const int grow = nlocals + ntemps;
         if (grow > 0 && !fsize)
             return;
@@ -3649,7 +3662,7 @@ private:
             return;
         FuncDeclStmt *f = it->second;
 
-        if (!f->resolved)
+        if (!f->desc->resolved)
             return;       /* its locals aren't slotted: nothing to remap into */
 
         auto *body = dynamic_cast<const Block *>(f->body.get());
@@ -3690,7 +3703,7 @@ private:
                 return;
         }
 
-        const int nlocals = f->frame_size - nparams;
+        const int nlocals = f->desc->frame_size - nparams;
         if (*fsize + nlocals > MAX_FRAME_SLOTS)
             return;       /* would overflow the 64-slot frame */
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
@@ -4041,7 +4054,7 @@ private:
             return;
 
         FuncDeclStmt *f = it->second;
-        if (!f->resolved)
+        if (!f->desc->resolved)
             return;
 
         const size_t nparams = f->params ? f->params->elems.size() : 0;
@@ -4135,11 +4148,12 @@ private:
          * keeps the original for backtraces. `base` is f's own original name
          * (f may itself be a template-instance clone, whose display_name is the
          * user's name). The counter is monotonic, so names never collide. */
-        const std::string base = !f->display_name.empty()
-            ? f->display_name : std::string(f->id->get_str());
-        fc->display_name = base;
+        const std::string base = !f->desc->display_name.empty()
+            ? f->desc->display_name : std::string(f->id->get_str());
+        fc->desc->display_name = base;
         fc->id = make_unique<Identifier>(
             base + "$s" + std::to_string(spec_counter++));
+        fc->sync_params();   /* re-snapshot desc->name from the synthetic id */
 
         auto *body = dynamic_cast<Block *>(fc->body.get());
         if (!body)
@@ -4344,7 +4358,8 @@ collect_cacheable_slots(Construct *c, std::unordered_set<int> &out)
     if (!c)
         return;
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
-        if (fd->id && fd->id->sym.kind == SymKind::global && fd->cache_results)
+        if (fd->id && fd->id->sym.kind == SymKind::global
+                && fd->desc->cache_results)
             out.insert(fd->id->sym.slot);
         if (fd->body)
             collect_cacheable_slots(fd->body.get(), out);
@@ -4472,7 +4487,8 @@ void collect_resolver_analysis(Construct *root, AnalysisInfo &out)
 
         if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
 
-            if (fd->id && fd->effective_pure && !fd->explicit_pure)
+            if (fd->id && fd->desc->effective_pure
+                    && !fd->desc->explicit_pure)
                 out.mark(fd->id->start,
                          static_cast<int>(fd->id->get_str().length()),
                          AnnoKind::auto_const);

@@ -7,6 +7,7 @@
 #include "parser.h"
 #include "uniqueid.h"
 #include "structtype.h"
+#include "funcdesc.h"
 
 enum pFlags : unsigned {
 
@@ -54,46 +55,9 @@ enum class ArrHint : unsigned char {
     dflt, general, flat_i, flat_f, flat_b, flat_s
 };
 
-/*
- * Explicit type annotation on a declaration / parameter (e.g. `int x = 5;`,
- * `func f(str s)`). `none` = no annotation (plain `var`/inferred). The scalar
- * kinds pin the symbol's static type and check assignability (with bool<=int<=
- * float coercion); `arr`/`dict` are generic kind constraints whose element/key/
- * value types are still inferred. Set by the parser onto the decl/param
- * Identifier; read by the inferencer (typing/checking) and the runtime
- * (coercion + zero-value default-init). See the README "explicit types".
- */
-enum class DeclType : unsigned char {
-    none, b, i, f, s, arr, dict,
-    strct,   /* a user struct type; the exact type is in `decl_struct` */
-    dyn,     /* `dyn` as a type (used inside a TypeAnnot, e.g. `array<dyn>`) */
-};
-
-/*
- * Result of the name-resolution pass (resolver.cpp) for an Identifier.
- *
- * `local` means the identifier was resolved to a fixed slot in the current
- * function call's Frame (see eval.h), so it's an O(1) array index instead of a
- * scope-chain map lookup. `unresolved` (the default) means "fall back to the
- * runtime EvalContext map walk" - used for the few things the resolver doesn't
- * handle: builtins, REPL globals, and genuinely-undefined names.
- */
-enum class SymKind : unsigned char {
-    unresolved,
-    local,      /* slot in the CURRENT call's Frame (ctx->frame) */
-    global,     /* slot in the program-wide global table (ctx->gfuncs) - a
-                 * top-level function/variable, reachable from any call depth */
-    capture,    /* slot in the closure's per-instance capture vector
-                 * (ctx->captures) - a captured outer variable, snapshot at
-                 * closure creation, persists across calls to that closure */
-    builtin,    /* slot in the program-wide builtin table (builtin_slot) - a
-                 * builtin not shadowed by a user symbol; a global constant */
-};
-
-struct ResolvedSym {
-    SymKind kind = SymKind::unresolved;
-    int slot = -1;          /* index into Frame::slots when kind == local */
-};
+/* DeclType / SymKind / ResolvedSym / FuncDescriptor moved to funcdesc.h (the
+ * serializable runtime function descriptor lives outside the AST headers'
+ * node classes - see plans/vm-ast-free-runtime.md). */
 
 struct InlineCtx;
 
@@ -1339,50 +1303,28 @@ public:
     unique_ptr<Construct> body;
 
     /*
-     * Filled in by the name-resolution pass (resolver.cpp). When `resolved` is
-     * true, do_func_call builds a Frame of `frame_size` slots (params first,
-     * then locals) instead of an EvalContext map, and body references to those
-     * symbols are O(1) slot reads.
-     *
+     * The function's RUNTIME identity (funcdesc.h): every field the runtime
+     * reads - resolved/frame_size (Frame build), the param/capture metadata
+     * (binding, closure creation, signature()), purity flags, display_name,
+     * the compiled chunk - lives in the DESCRIPTOR, not on this node, so a
+     * FuncObject holds no AST pointer and the `-vm` teardown can free the
+     * tree. The decl OWNS it (`desc_owner`) until vm_compile moves ownership
+     * into the VmProgram; `desc` is the stable raw alias the compiler passes
+     * write through (resolver: resolved/frame_size/captures/effective_pure;
+     * inliner: cache_results/display_name; precompile: vm_chunk).
+     * sync_params() (parse end + clone) snapshots the param Identifiers.
+     */
+    unique_ptr<FuncDescriptor> desc_owner;
+    FuncDescriptor *const desc;
+
+    /*
      * `slot_writes[i]` counts how many times slot i is written in the body: for
      * a param that's body reassignments only (so 0 == never reassigned); for a
      * local it includes the declaration (so 1 == declared once, never
      * reassigned == write-once). Slots 0..params-1 are the params. Used by the
-     * auto-const folder and to detect auto-const parameters.
+     * auto-const folder and to detect auto-const parameters. COMPILE-only.
      */
-    bool resolved = false;
-    int frame_size = 0;
     std::vector<int> slot_writes;
-
-    /*
-     * The minimum number of arguments a call must pass (1 + index of the last
-     * non-opt param; trailing opt params are skippable). Lazily cached on the
-     * first call so the per-call arity check is a field read, not a param-list
-     * walk. -1 = not computed yet; a clone leaves it -1 and recomputes once.
-     */
-    mutable int min_args_cache = -1;
-
-    /*
-     * Purity. `explicit_pure` is set by the parser for a `pure func`.
-     * `effective_pure` is `explicit_pure` OR a function the resolver proves
-     * effectively pure (reads only consts + its params, calls only const
-     * builtins / pure funcs, no captures). isconst()/ispure() read these; an
-     * effectively-pure function's calls fold when given constant arguments.
-     */
-    bool explicit_pure = false;
-    bool effective_pure = false;
-
-    /*
-     * Set by the inferencer for a BASE TEMPLATE's decl (a function with >=1
-     * un-annotated template param - `FuncInfo::is_template`). A base template is
-     * a monomorphization SOURCE, not a runnable function: every call to it is
-     * redirected to a concrete `name$N` instance (a separate FuncDeclStmt with
-     * this false), so the base is NEVER called and NEVER compiled. The AOT
-     * codegen (`codegen_program`) skips it, so it is absent from the compiled
-     * chunk set - and therefore from `-vd` (faithfully: it does not exist as a
-     * chunk, it is not filtered). A clone (an instance) leaves this false.
-     */
-    bool is_template_base = false;
 
     /*
      * Set by the inferencer for ANY base template's decl (every
@@ -1397,38 +1339,38 @@ public:
      */
     bool is_template = false;
 
-    /*
-     * Set by the inliner when it unrolls this (pure, self-recursive, >=2
-     * self-call) function: a call to it caches its result in the CALLER's frame
-     * (see PureCache, eval.h), so the duplicate self-calls the unroll brings
-     * into one frame compute once. Off by default - no call pays the cache
-     * check unless the inliner enabled it for this function.
-     */
-    bool cache_results = false;
+    FuncDeclStmt()
+        : Construct("FuncDeclStmt")
+        , desc_owner(make_unique<FuncDescriptor>())
+        , desc(desc_owner.get())
+    {
+        desc->decl = this;
+    }
 
     /*
-     * Name to show in a backtrace, when it should differ from `id`. Empty for
-     * normal functions (the backtrace uses `id`). A specialization clone has a
-     * synthetic `id` (so its call resolves to the clone) but sets this to the
-     * original function's name, so errors still report the user's name.
+     * Snapshot the parse-time param/name metadata into the descriptor: called
+     * at the end of pAcceptFuncDecl (so a parse-time const-eval call binds
+     * from the descriptor) and by clone(). min_args is computed here too (1 +
+     * the index of the last non-opt param; trailing opt params are
+     * skippable) - no lazy per-call recompute.
      */
-    std::string display_name;
+    void sync_params() {
+        desc->name = id ? id->uid : nullptr;
+        desc->pure_ctx = is_const;
+        desc->params.clear();
+        desc->min_args = 0;
+        if (params) {
+            desc->params.reserve(params->elems.size());
+            for (size_t i = 0; i < params->elems.size(); i++) {
+                const Identifier *p = params->elems[i].get();
+                desc->params.push_back({p->uid, p->opt_mod, p->const_param,
+                                        p->dyn_mod, p->decl_type});
+                if (!p->opt_mod)
+                    desc->min_args = static_cast<int>(i) + 1;
+            }
+        }
+    }
 
-    /*
-     * The bytecode VM's per-function compiled body chunk (Phase 4), an opaque
-     * pointer so syntax.h needn't include the VM headers. Filled UPFRONT under
-     * -vm by vm_precompile_all (AOT; the lazy vm_func_chunk miss path is a
-     * never-hit safety net): `vm_chunk_tried` guards the one-time compile,
-     * `vm_chunk` is the resulting `const Chunk *` (null when the body has no
-     * real op - an all-fallback body stays tree-walked). An `=> expr` body,
-     * desugared to `{ return expr; }`, compiles like any block body. The
-     * chunk storage lives in vm.cpp, cleared per run; a clone resets these (it
-     * has its own body). NOT used in the REPL.
-     */
-    mutable const void *vm_chunk = nullptr;
-    mutable bool vm_chunk_tried = false;
-
-    FuncDeclStmt() : Construct("FuncDeclStmt") { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1439,12 +1381,18 @@ public:
         c->captures = clone_as(captures);
         c->params = clone_as(params);
         c->body = clone_as(body);
-        c->resolved = resolved;
-        c->frame_size = frame_size;
         c->slot_writes = slot_writes;
-        c->explicit_pure = explicit_pure;
-        c->effective_pure = effective_pure;
-        c->display_name = display_name;
+        /* A fresh descriptor for the clone (its own runtime identity): copy
+         * the compile results, re-snapshot the params from the cloned
+         * Identifiers, leave the chunk unset (the clone has its own body).
+         * The capture kinds/slots re-resolve when the clone is processed. */
+        c->desc->resolved = desc->resolved;
+        c->desc->frame_size = desc->frame_size;
+        c->desc->explicit_pure = desc->explicit_pure;
+        c->desc->effective_pure = desc->effective_pure;
+        c->desc->display_name = desc->display_name;
+        c->desc->captures = desc->captures;
+        c->sync_params();
         return c;
     }
 };

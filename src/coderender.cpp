@@ -512,8 +512,8 @@ struct Renderer {
      * clone shows `func f$0(...)`), then its body. */
     void func(const FuncDeclStmt *f, int level)
     {
-        if (f->explicit_pure || f->effective_pure)
-            o << (f->explicit_pure ? "pure " : "/* pure */ ");
+        if (f->desc->explicit_pure || f->desc->effective_pure)
+            o << (f->desc->explicit_pure ? "pure " : "/* pure */ ");
         if (!ret_type.empty())                       /* inferred return type */
             o << ret_type << " ";
         o << "func ";

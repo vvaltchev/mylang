@@ -1094,7 +1094,7 @@ struct Codegen {
             in.op = OpCode::MakeClosureV;
             in.target = t;
             in.target2 = static_cast<int>(chunk.closure_defs.size());
-            chunk.closure_defs.push_back(fd);
+            chunk.closure_defs.push_back(fd->desc);
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -4644,7 +4644,7 @@ struct Codegen {
         mk.op = OpCode::MakeClosureV;
         mk.target = t;
         mk.target2 = static_cast<int>(chunk.closure_defs.size());
-        chunk.closure_defs.push_back(fd);
+        chunk.closure_defs.push_back(fd->desc);
         ops.push_back(mk);
         Instr st;                     /* aop invalid == plain assign+defined */
         st.op = OpCode::StoreGlobalV;
@@ -6527,7 +6527,7 @@ bool
 codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
 {
     /* A base template is a monomorphization source, never called → no chunk. */
-    if (fn->is_template_base)
+    if (fn->desc->is_template_base)
         return false;
     if (!fn->body || !fn->body->is_block())
         return false;
@@ -6541,7 +6541,7 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
     if (!body->scope_free)
         return false;
 
-    Chunk ck = codegen_chunk(body, fn->frame_size);
+    Chunk ck = codegen_chunk(body, fn->desc->frame_size);
 
     /* Keep the chunk iff it has at least one REAL op - anything that is not
      * a control-flow op (Jump / LoopBackEdge / Halt). An empty/no-op body

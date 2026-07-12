@@ -614,7 +614,7 @@ static bool g_vm_executing = false;
  * `vm_chunk` pointers stay valid as more functions are compiled. Script-only
  * (the VM is not used in the REPL).
  */
-static std::unordered_map<const FuncDeclStmt *, Chunk> g_func_chunks;
+static std::unordered_map<const FuncDescriptor *, Chunk> g_func_chunks;
 
 static void vm_precompile_all(const Block *root);   /* AOT: defined below */
 
@@ -691,7 +691,7 @@ vm_execute(const Construct *root_c)
  * Block::do_eval with no offsetting win.
  */
 const Chunk *
-vm_func_chunk(const FuncDeclStmt *fdecl)
+vm_func_chunk(const FuncDescriptor *fdesc)
 {
     /*
      * A chunk may be compiled ONLY while executing the final AST. If we are
@@ -705,7 +705,7 @@ vm_func_chunk(const FuncDeclStmt *fdecl)
                  "vm_func_chunk outside vm_execute: a compile-time fold "
                  "reached the VM body hook (const-eval gate bypassed)");
 
-    auto it = g_func_chunks.find(fdecl);
+    auto it = g_func_chunks.find(fdesc);
     if (it != g_func_chunks.end())
         return &it->second;
 
@@ -715,9 +715,10 @@ vm_func_chunk(const FuncDeclStmt *fdecl)
      * program upfront, so this lazy miss path is only a safety net for a func
      * the precompile walk didn't reach (there should be none). */
     Chunk ck;
-    if (!codegen_func_body(fdecl, ck))
+    ML_CHECK_MSG(fdesc->decl, "vm_func_chunk on a descriptor with no decl");
+    if (!codegen_func_body(fdesc->decl, ck))
         return nullptr;
-    return &g_func_chunks.emplace(fdecl, std::move(ck)).first->second;
+    return &g_func_chunks.emplace(fdesc, std::move(ck)).first->second;
 }
 
 /*
@@ -739,8 +740,9 @@ vm_precompile_all(const Block *root)
         collect_funcs(e.get(), funcs);
 
     for (const FuncDeclStmt *fn : funcs) {
-        fn->vm_chunk = vm_func_chunk(fn);   /* compiles + caches (or null) */
-        fn->vm_chunk_tried = true;
+        /* compiles + caches (or null); stamped on the DESCRIPTOR */
+        fn->desc->vm_chunk = vm_func_chunk(fn->desc);
+        fn->desc->vm_chunk_tried = true;
     }
 }
 
@@ -1890,9 +1892,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             /* func[caps]{..} in expression position: create the FuncObject +
              * snapshot the captures from ctx - byte-identical to
              * FuncDeclStmt::do_eval for a lambda. The def is a program-lifetime
-             * FuncDeclStmt* from the pool (the Instr holds only the index). The
-             * ctor never throws (a resolved closure's captures are defined),
-             * so no loc. */
+             * FuncDescriptor* from the pool (the Instr holds only the index) -
+             * no AST. The ctor never throws (a resolved closure's captures are
+             * defined), so no loc. */
             ctx.frame->at(in.target).put(EvalValue(intrusive_ptr<FuncObject>(
                 make_intrusive<FuncObject>(chunk.closure_defs[in.target2],
                                            &ctx))));
