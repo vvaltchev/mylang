@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -37,6 +38,16 @@ void infer_types(Construct *root, bool enable = true, bool strict = true);
  * plans/type-driven-specialization.md.
  */
 void dump_type_info(Construct *root, std::ostream &os);
+
+/*
+ * The COMPLETE per-node child visitor (every Construct edge, incl. try/catch
+ * bodies, slices, dict literals) - the inferencer's own walker, exported for
+ * walks that must not miss a node: the VM's AOT precompile and the
+ * descriptor/struct-def ownership transfer (vm_compile). Calls `f` on each
+ * DIRECT child of `c` (some may be null-skipped internally).
+ */
+void for_each_child_of(Construct *c,
+                       const std::function<void (Construct *)> &f);
 
 /*
  * M8 specialization pass: rewrite hot scalar expression nodes (int/float

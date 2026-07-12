@@ -936,7 +936,7 @@ std::string disassemble_program(const Block *root)
     if (!structs.empty()) {
         s << "; ===== types (" << structs.size() << ") =====\n";
         for (const StructDeclStmt *sd : structs)
-            dump_struct_type(sd->def.get(), s);
+            dump_struct_type(sd->def, s);
         s << "\n";
     }
 

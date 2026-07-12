@@ -11,6 +11,11 @@ using std::string_view;
  * plain increment is fine. */
 uint64_t Construct::next_node_id = 1;
 
+/* LIVE node count (see syntax.h): maintained by the class operator new/delete
+ * in ASSERTS and RECYCLE builds; stays 0 in an ASSERTS=0 build (no class
+ * allocator there, and vm_ast_teardown is a no-op). */
+uint64_t Construct::live_nodes = 0;
+
 #ifdef RECYCLE_ALLOC
 
 /*
@@ -31,6 +36,7 @@ uint64_t Construct::next_node_id = 1;
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 
 /* Detect ASan portably. __SANITIZE_ADDRESS__ is GCC's (and clang's) macro;
@@ -79,6 +85,7 @@ std::unordered_map<std::size_t, std::vector<void *>> &recycle_bins()
 
 void *Construct::operator new(std::size_t n)
 {
+    live_nodes++;
     auto &bin = recycle_bins()[n];
     void *base;
 
@@ -102,13 +109,47 @@ void Construct::operator delete(void *p) noexcept
     if (!p)
         return;
 
+    live_nodes--;
     void *base = static_cast<char *>(p) - RECYCLE_HDR;
     std::size_t n = *static_cast<std::size_t *>(base);
+    std::memset(p, 0, n);               /* the teardown-proof zeroing */
     RECYCLE_POISON(p, n);               /* trap a dangling access till reuse */
     recycle_bins()[n].push_back(base);  /* never freed; reused by next new(n) */
 }
 
-#endif   /* RECYCLE_ALLOC */
+#elif !defined(NDEBUG)
+
+/*
+ * ASSERTS builds (debug AND default release - NDEBUG only under ASSERTS=0):
+ * count live nodes and ZERO a freed node's bytes. This backs the -vm AST
+ * teardown proof (vm_ast_teardown): after codegen the driver destroys the
+ * whole AST, asserts live_nodes == 0, and any residual Construct* now reads
+ * zeroed, freed memory - a loud crash, not a silent tree-walk. Plain
+ * malloc-backed new/delete otherwise (the sized delete gives memset its
+ * length with no header). See plans/vm-ast-free-runtime.md.
+ */
+#include <cstdlib>
+#include <cstring>
+#include <new>
+
+void *Construct::operator new(std::size_t n)
+{
+    void *p = ::operator new(n);
+    live_nodes++;
+    return p;
+}
+
+void Construct::operator delete(void *p, std::size_t n) noexcept
+{
+    if (!p)
+        return;
+
+    live_nodes--;
+    std::memset(p, 0, n);               /* the teardown-proof zeroing */
+    ::operator delete(p);
+}
+
+#endif   /* RECYCLE_ALLOC / !NDEBUG */
 
 string
 escape_str(const string_view &v)
@@ -497,7 +538,7 @@ unique_ptr<Construct> StructDeclStmt::clone() const
     auto c = make_unique<StructDeclStmt>();
     copy_base_fields(*c);
     c->id = clone_as(id);
-    c->def = make_unique<StructTypeDef>(*def);
+    c->set_def(make_unique<StructTypeDef>(*def));
     return c;
 }
 

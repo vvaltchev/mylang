@@ -312,12 +312,16 @@ parse_args(int argc, char **argv)
 int main(int argc, char **argv)
 {
     /*
-     * The AST owns every StructTypeDef, and an uncaught struct exception's
-     * payload references its def (to print field names). So `root` must outlive
-     * the catch handlers below: declared here, not inside the try, or unwinding
-     * would free the def before format_exception() renders the value.
+     * An uncaught struct exception's payload references its StructTypeDef (to
+     * print field names), and values unwinding out of the run may reference
+     * FuncDescriptors. Under the tree-walker the AST owns both; under -vm
+     * vm_compile MOVES them into the VmProgram. So BOTH `root` and `prog`
+     * must outlive the catch handlers below: declared here, not inside the
+     * try, or unwinding would free the defs before format_exception() renders
+     * the value.
      */
     unique_ptr<Construct> root;
+    VmProgram prog;
 
     try {
 
@@ -441,7 +445,12 @@ int main(int argc, char **argv)
              * VM too (Phase 4), not just the top-level chunk. */
             if (opt_vm) {
                 g_exec_engine = ExecEngine::Vm;
-                vm_execute(root.get());
+                prog = vm_compile(root.get());
+                /* ASSERTS builds: free + zero the WHOLE AST and assert
+                 * zero live nodes (no-op under ASSERTS=0) - the ZERO-AST
+                 * proof; the VM runs without the tree. */
+                vm_ast_teardown(root, prog);
+                vm_run(prog);
             } else {
                 root->eval(nullptr);
             }

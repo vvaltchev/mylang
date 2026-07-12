@@ -329,6 +329,11 @@ nothing to register).
 - `parser.cpp` / `parser.h` — recursive-descent parser, const-folding woven in.
   `pBlock()` is the
   entry point.
+- `funcdesc.h` — **`FuncDescriptor`**, the SERIALIZABLE runtime function
+  identity (name/params/captures/frame data/purity/chunk pointer), plus the
+  `DeclType`/`SymKind`/`ResolvedSym` enums it needs (moved here from
+  syntax.h). The runtime call model reads ONLY this - see the value-model
+  section and plans/vm-ast-free-runtime.md.
 - `syntax.h` / `syntax.cpp` — the `Construct` AST node hierarchy, its
   `serialize()` (what `-s` prints), and `clone()` (a deep copy of a subtree,
   used by inlining; pure virtual so every concrete node must provide one — see
@@ -2045,18 +2050,27 @@ sanitizers never reproduced it.)
   `Exception` that doesn't already carry one — this is how runtime errors get
   pointed at source.
   Override `do_eval`, not `eval`.
-- **Function call scoping is lexical/closure-based.** `do_func_call` binds
-  params into an
-  `args_ctx` whose parent is the function's **`capture_ctx`**, not the call
-  site. A `FuncObject` holds the `FuncDeclStmt *`, the per-instance
-  **`capture_slots`** (captured values, read via `SymKind::capture`; see the
-  *capture slotting* bullet above), and that `capture_ctx` — an empty context
-  parented to the *root* whose only job is to link the body's `args_ctx` to root
-  (for `gfuncs` + the builtins map). So functions cannot see caller locals or
-  globals, only
-  captures (and, for pure funcs, only consts + params).
-  Builtins are different: they receive the **caller's `ctx`** and the
-  **unevaluated** `ExprList`.
+- **Function call scoping is lexical/closure-based, and the call model is
+  AST-FREE.** `do_func_call` binds params into an `args_ctx` whose parent is
+  the function's **`capture_ctx`**, not the call site. A `FuncObject` holds a
+  **`const FuncDescriptor *`** (funcdesc.h — NEVER a `FuncDeclStmt*`), the
+  per-instance **`capture_slots`** (captured values, read via
+  `SymKind::capture`; snapshot at creation from the descriptor's RESOLVED
+  capture kind/slot list via `read_sym`, the descriptor twin of
+  `Identifier::do_eval` — no capture Identifier is evaluated), and that
+  `capture_ctx` — an empty context parented to the *root* whose only job is
+  to link the body's `args_ctx` to root (for `gfuncs` + the builtins map).
+  Binding reads the descriptor's `ParamDesc` snapshot (uid, opt, const,
+  decl_type); the tree-walker reaches the body via `desc->decl` (null after
+  the `-vm` AST teardown, where every call runs the compiled chunk). The
+  descriptor is created by the `FuncDeclStmt` ctor, param-synced at parse end
+  (`sync_params`, also after a template/spec clone gets its synthetic id),
+  and holds the SINGLE storage of `resolved`/`frame_size`/`min_args`/purity/
+  `display_name`/`cache_results`/`vm_chunk` — the compiler passes write it
+  directly (no decl-side copy to drift). So functions cannot see caller
+  locals or globals, only captures (and, for pure funcs, only consts +
+  params). Builtins are different: they receive the **caller's `ctx`** and
+  the **unevaluated** `ExprList`.
 - **Devirtualized direct calls (`DirectCallExpr`, `syntax.h`).** When the
   resolver proves a `CallExpr`'s callee is an identifier bound to a global-table
   slot (a top-level/scoped function, an escaped global, or a struct descriptor),
@@ -2093,11 +2107,12 @@ sanitizers never reproduced it.)
   loop, where the per-call dispatch dominated); negligible where the builtin body
   dominates (`sort`, big-array `sum`). Like `DirectCallExpr`, it is a separate
   node so `CallExpr::do_eval` is untouched; never created in the REPL.
-- **Trailing `opt` parameters are skippable at the call site.** The four
+- **Trailing `opt` parameters are skippable at the call site.** The
   `do_func_bind_params` overloads (`eval.cpp`) accept any arg count in
-  `[min_required_args(params), nparams]` and bind each omitted trailing param to
-  `none`. `min_required_args` is `1 + the index of the last non-opt param` (0 if
-  all opt), keyed off `Identifier::opt_mod` — so a non-opt param *after* an opt
+  `[FuncDescriptor::min_args, nparams]` and bind each omitted trailing param
+  to `none`. `min_args` is `1 + the index of the last non-opt param` (0 if
+  all opt), computed EAGERLY by `sync_params` (the old lazily-cached
+  `min_args_cache` is gone) — so a non-opt param *after* an opt
   one raises the minimum and can't be skipped (`f(x, opt y, z)` still needs 3).
   The inferencer's `check_call` enforces the same `[min, nparams]` range
   (`WrongArgCountEx` with a "MIN to MAX" message); no per-call type contribution
@@ -2490,7 +2505,10 @@ but the per-element `StructObject` allocation is gone (build overhead
   `intrusive_ptr<StructObject>`) is an **instance**. `TypeStruct` /
   `TypeStructType` in `src/types/struct.cpp.h`; wired through `ValueU`,
   `TypeToEnum`, `TypeNames`, `AllTypes`.
-- **`structtype.h`** defines `StructTypeDef` (AST-owned, program-lifetime:
+- **`structtype.h`** defines `StructTypeDef` (owned by its `StructDeclStmt`
+  under the tree-walker; under `-vm`, `vm_compile` MOVES ownership into the
+  `VmProgram` so it outlives the AST teardown — the decl keeps a raw `def`
+  alias. Program-lifetime either way:
   `name`, `fields` as `FieldDef{name, FieldKind, struct_ty, is_opt, slot,
   offset, annot}`, folded `consts`, plus the `Layout`/`size`/`align` fields the
   POD phases will fill) and `StructObject` (`RefCounted`: `def`, `readonly`, and
@@ -3036,8 +3054,8 @@ the proof. Before calling it done:
 >    interned `UniqueId*`), NEVER a `Construct*`.
 > 5. **A "loc-keyed" or "pc-keyed" table of `Construct*` is STILL A VIOLATION.**
 >    (The former `Chunk::node_table` and the `ast_nodes` pool are DELETED —
->    `Chunk` holds no `Construct*`-typed member except the Tier-4
->    `closure_defs` residual; `verify_ast_free` asserts every `Instr`'s
+>    `Chunk` holds NO `Construct*`-typed member AT ALL (`closure_defs` holds
+>    `FuncDescriptor*`); `verify_ast_free` asserts every `Instr`'s
 >    codegen-transient `node_idx` was nulled when codegen finishes.)
 > 6. **During compilation you MAY hold `Construct*`** — e.g. an
 >    `unordered_map<const Instr*, const Construct*>` (or the current `node_idx`
@@ -3062,13 +3080,22 @@ the proof. Before calling it done:
 >     pointers, NO indexes, NO tables — the AST is FREED and the script runs on
 >     bytecode + pooled data alone.**
 >
-> The CANONICAL, code-derived inventory of everything still violating this —
-> the fallback emit sites, the node-keeping ops, the chunk-less bodies, and
-> the AST-anchored call model (`closure_defs` holding `FuncDeclStmt*`,
-> `do_func_call` binding params via the AST, AST-owned `StructTypeDef`s) —
-> lives in **`plans/vm-fallback-elimination.md`, "THE COMPLETE AST-RETENTION
-> INVENTORY"** (four tiers + the execution order + the maintainer-decided
-> forks). Keep it current as items land.
+> **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
+> plans/vm-ast-free-runtime.md): the call model runs on the serializable
+> **`FuncDescriptor`** (funcdesc.h) — `FuncObject::func` points at it, never
+> at a `FuncDeclStmt`; params bind from its `ParamDesc` snapshot, captures
+> snapshot via its resolved kind/slot list (`read_sym`), backtraces and the
+> reflection builtins read it, `Chunk::closure_defs` holds descriptors, and
+> chunks are keyed/stamped on the descriptor. `vm_compile` MOVES every
+> descriptor + `StructTypeDef` into the **`VmProgram`** image, and the script
+> driver then calls **`vm_ast_teardown`** (ASSERTS builds, debug AND default
+> release; a no-op under ASSERTS=0): every descriptor's compile-time `decl`
+> back-pointer is NULLED, the whole AST is destroyed — each freed node
+> `memset(0)`ed by the Construct class `operator delete` — and
+> `Construct::live_nodes == 0` is ML_CHECKed. The VM then runs with the AST
+> provably gone. The historical inventory lives in
+> `plans/vm-fallback-elimination.md`; the descriptor/teardown design in
+> `plans/vm-ast-free-runtime.md`.
 
 MyLang's performance philosophy is a two-front strategy, in this deliberate
 order — the same order a real C/C++ compiler works in:
@@ -3342,9 +3369,10 @@ native. A **CLOSURE** `func [caps] (params) {..}` in expression position (a
 returned / var-bound / call-arg lambda, `id == null`) builds via
 **`MakeClosureV`**: `make_intrusive<FuncObject>(def, &ctx)` snapshots the
 captures from `ctx` — byte-identical to `FuncDeclStmt::do_eval` for a lambda —
-where `def` is a program-lifetime `FuncDeclStmt*` from a `Chunk::closure_defs`
-pool (the `Instr` holds only the index, no raw `Construct*`; the ctor never
-throws for a resolved closure, so no loc). A **top-level `func f(..){}` decl
+where `def` is a program-lifetime **`FuncDescriptor*`** from a
+`Chunk::closure_defs` pool (the `Instr` holds only the index, and the pool
+holds NO `Construct*`; the ctor never throws for a resolved closure, so no
+loc). A **top-level `func f(..){}` decl
 STATEMENT** bound into a hoisted GLOBAL slot reuses the same op — `gen_stmt`
 emits `MakeClosureV` (the `FuncObject`) + **`StoreGlobalV`** (write the slot +
 mark `defined`), byte-identical to `FuncDeclStmt::do_eval`'s global-bind
@@ -3649,43 +3677,43 @@ tree-walker) and with a **BOXED increment** (`out += "x"`, a dyn `d++` — the
 same three-tier statement dispatch as any body statement). This is where
 the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
 −71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** runs these
-loops inside **function bodies** too: `do_func_call` is hooked to run a callee's
-body via `vm_run_chunk` when it's a scope-free block (its chunk cached on the
-`FuncDeclStmt`, stored in `g_func_chunks`), reusing all of `do_func_call`'s
-frame/param/backtrace machinery. **Compilation is AOT, not lazy**
-(`vm_precompile_all`, called at the top of `vm_execute`): it walks
-`collect_funcs` and compiles EVERY function body UPFRONT, stamping each
-`FuncDeclStmt::vm_chunk` + `vm_chunk_tried`, so `do_func_call` reads a
-precomputed pointer and never compiles at call time (the maintainer's no-lazy
-rule + a `.myv`-serialization prerequisite; the lazy `vm_func_chunk` miss path
-is now a never-hit safety net). The per-function compile + gate is the shared
-**`codegen_func_body`** (codegen.cpp) — the single source of truth for "which
-functions have bytecode", used by BOTH the precompile AND the `-vd` dump, so
-`-vd` faithfully shows the real compiled chunk set. A **dead base template is
-absent** from that set (not filtered): the inferencer marks
-`FuncDeclStmt::is_template_base` for a template NEVER used as a value
+loops inside **function bodies** too: `do_func_call` runs a callee's body via
+`vm_run_chunk` (the chunk stamped on the function's **`FuncDescriptor`**,
+stored in `g_func_chunks` keyed by descriptor), reusing all of
+`do_func_call`'s frame/param/backtrace machinery. **Compilation is AOT, not
+lazy** (`vm_precompile_all`, run by `vm_compile`): it walks `collect_funcs`
+(which recurses via the COMPLETE `for_each_child_of`, so a func declared in a
+try body / slice / anywhere is not missed) and compiles EVERY function body
+UPFRONT, stamping each descriptor's `vm_chunk` + `vm_chunk_tried`, so
+`do_func_call` reads a precomputed pointer and never compiles at call time
+(the maintainer's no-lazy rule + a `.myv`-serialization prerequisite; the lazy
+`vm_func_chunk` miss path is a never-hit safety net). The per-function compile
++ gate is the shared **`codegen_func_body`** (codegen.cpp) — the single source
+of truth for "which functions have bytecode", used by BOTH the precompile AND
+the `-vd` dump, so `-vd` faithfully shows the real compiled chunk set. A
+**dead base template is the ONLY exclusion** from that set: the inferencer
+marks `FuncDescriptor::is_template_base` for a template NEVER used as a value
 (`!value_used` — all its calls are direct and were redirected to `name$N`
 instances, so the base never runs); a VALUE-used template (dict/var/arg-
 dispatched INDIRECTLY, e.g. phonebook's `cmd_*`) is NOT marked, so its base
 keeps its chunk (the indirect call runs the base body). So `55_float_sum` (a
-loop in a function) is
-−62%. The compile gate (`codegen_func_body`) is "not a base template, a
-scope-free block body, and the body has at least one REAL op"
-— anything but the pure fallback/control ops (`EvalStmt`/`Jump`/
-`LoopBackEdge`/`Halt`) — so a body of native **calls/stores/loads** (`CallV`,
-`DictStore`, `CallBuiltinV`, `SliceV`, a `ReturnV` over a native expr, …), which
-has NO arith/loop op, compiles too (the old arith/loop-only gate left those on
-the tree-walker); an all-fallback body still tree-walks (the VM would only add
-dispatch). A function chunk (`codegen_chunk`) whose body ends in a `ReturnV`
+loop in a function) is −62%. **EVERY other callable body keeps its chunk**
+(post-teardown the chunk is the only way to run it): the old "has at least
+one REAL op" gate is dropped (an empty body is a bare `Halt` returning none),
+a ZERO-SLOT function (a param-less, local-less closure — `next_slot == 0`, so
+the resolver leaves it `resolved == false`) runs its chunk through a
+temps-only frame (`do_func_call`'s chunk hook is NOT gated on `resolved`),
+and the one genuinely un-compilable body — the pathological un-slottable
+>64-param function (its blocks are never `scope_free`) — is a loud
+compile-time `NotLoweredEx`, never a silent tree-walk. A function chunk
+(`codegen_chunk`) whose body ends in a `ReturnV`
 OMITS the trailing `Halt`: `ReturnV` already `return`s from `vm_run_chunk`, so
 the `Halt` would be dead AND unreferenced (the codegen emits no jump to the
 chunk end past a return — an if whose branches all return leaves no merge
 `Jump`, a loop-exit targets the following op). A FALL-THROUGH body (`main`, a
 void function, a trailing loop/if) keeps the `Halt` as its implicit-return-
 `none` terminator + jump target. Recursion with arith stays ~neutral (`fib`
-−0.08%). A non-scope-free
-body (captures / nested func) still tree-walks (it needs its own child context,
-which `vm_run_chunk` doesn't build).
+−0.08%).
 
 **Phase 5** widens native coverage: array element read/write
 (`a[i]` / `a[i]=v` → `LoadElem`/`StoreElem`, mirroring the flat-array
@@ -4151,7 +4179,8 @@ CODEGEN-object scratch; `build_node_table` became `verify_ast_free` —
 every `node_idx` must be nulled when codegen finishes), the disasm
 `node_table` section (the "NOT serializable" signal is now a compile
 refusal instead), and the `ML_DBG_FB` hook. `Chunk`'s only remaining
-`Construct*`-typed member is the Tier-4 `closure_defs` residual.
+`Construct*`-typed member is GONE too since the FuncDescriptor step
+(`closure_defs` holds descriptors).
 The `InlinedCallExpr` return-across-try residue is CLOSED: a `return`
 crossing trys INSIDE the inline boundary inlines each crossed try's
 handler-pop + finally at the return (bounded at the BOUNDARY, not the
@@ -4394,16 +4423,32 @@ instrumentation (see `plans/function-templates.md`).
   repro was there under the existing RECYCLE lane the whole time.
 
 - **The VM body hook must not compile a chunk during compile-time folding.**
-  `do_func_call`'s Phase-4 hook lazily compiles a function body to a `Chunk`
-  (raw `Construct*` node pointers) and caches it on the `FuncDeclStmt`. During
+  `do_func_call`'s Phase-4 hook reads (and, via the never-hit safety net, can
+  compile) a function body's `Chunk`, stamped on the `FuncDescriptor`. During
   `resolve_names` (AutoConst / the inliner's refold) the tree is STILL being
   mutated, so a fold that reached the hook would cache pointers into nodes the
   optimizer then frees → a UAF (exactly the bug above). Two layers stop it: the
   **`!ctx->in_const_eval()` gate** in `do_func_call` (a fold's ctx is rooted at
   the const `cctx`, so `in_const_eval()` is true and the hook is skipped) and a
-  **`g_vm_executing` assert in `vm_func_chunk`** (set only for the duration of
-  `vm_execute`), so any future fold path that slips past the gate fails LOUDLY
-  instead of corrupting memory.
+  **`g_vm_executing` assert in `vm_func_chunk`** (set only inside
+  `vm_compile`/`vm_run`), so any future fold path that slips past the gate
+  fails LOUDLY instead of corrupting memory.
+
+- **The ZERO-AST teardown proof (`vm_ast_teardown`, plans/vm-ast-free-
+  runtime.md).** In every ASSERTS build (debug AND the default release; a
+  no-op under `ASSERTS=0`), a `-vm` SCRIPT run destroys the ENTIRE AST between
+  compilation and execution: `vm_compile` MOVES every `FuncDescriptor` +
+  `StructTypeDef` into the `VmProgram` image (the in-memory shape of the
+  future `.myv`), then the driver NULLs each descriptor's `decl` back-pointer,
+  `root.reset()`s the tree, and ML_CHECKs `Construct::live_nodes == 0`. The
+  Construct class `operator new/delete` (defined in all non-NDEBUG builds;
+  the RECYCLE allocator maintains the same counter) count live nodes and
+  `memset(0)` every freed node, so a residual `Construct*` anywhere reads
+  zeroed, freed memory — a loud crash, never a silent dependence. The REPL
+  and the `-rt` harness retain their ASTs by design (`vm_execute` =
+  compile+run with no teardown); `mylang.cpp` owns the `VmProgram` OUTSIDE
+  the try block for the same reason `root` is out there — an uncaught struct
+  exception's payload references its (now program-owned) `StructTypeDef`.
 
 - **CI maximizes correctness checks (it does not time anything).** Every CI lane
   builds with `ASSERTS` on (C asserts + `ML_CHECK` + stdlib container
@@ -4518,10 +4563,11 @@ omitting it is a compile error.
   (a lazily-populated `PureCache`, sound because frame-scoped — see recursion),
   reviewed + approved case-by-case. **The former lazy-VM-compile deviation is
   FIXED:** the VM now compiles EVERY function body to its `Chunk` UPFRONT
-  (`vm_precompile_all` at the top of `vm_execute`), so the AST is 100% bytecode
+  (`vm_precompile_all`, run by `vm_compile`), so the AST is 100% bytecode
   before the VM runs (full AOT); `do_func_call` reads a precomputed
-  `FuncDeclStmt::vm_chunk` and never compiles at call time. When in doubt:
-  upfront, not lazy.
+  `FuncDescriptor::vm_chunk` and never compiles at call time (the old lazy
+  `min_args_cache` is gone too — `min_args` computes at `sync_params`). When
+  in doubt: upfront, not lazy.
 
 - **The TYPE MODEL is C++ (static everywhere), with `dyn` as the one variant.**
   Every type is decided at COMPILE time and NEVER changes at runtime. `var` is

@@ -1731,7 +1731,7 @@ void Inferencer::hoist_globals(Block *rootBlock)
  */
 void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
 {
-    StructTypeDef *def = sd->def.get();
+    StructTypeDef *def = sd->def;
     struct_by_name[def->name] = def;
 
     if (sd->id) {
@@ -4936,4 +4936,13 @@ std::string ReplInfer::func_return_type(const FuncDeclStmt *fn)
 bool ReplInfer::instance_has_consumer(const FuncDeclStmt *fn)
 {
     return impl->inf.instance_has_consumer(fn);
+}
+
+/* The exported COMPLETE child visitor (inferencer.h) - a thin wrapper over
+ * Inferencer::for_each_child so external walks (the VM's AOT precompile /
+ * ownership transfer) cannot miss a node. */
+void for_each_child_of(Construct *c,
+                       const std::function<void (Construct *)> &f)
+{
+    Inferencer::for_each_child(c, f);
 }

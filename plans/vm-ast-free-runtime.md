@@ -45,7 +45,8 @@ model. Fields:
   bool dyn_mod; DeclType decl_type;}>` — binding + `signature()`
 - `captures`: `vector<CaptureDesc{const UniqueId *name; SymKind kind;
   int slot;}>` — closure creation snapshots WITHOUT the capture Identifiers
-- `resolved`, `frame_size`, `min_args_cache` — MOVED from FuncDeclStmt
+- `resolved`, `frame_size`, `min_args` (computed eagerly at sync_params;
+  the lazy min_args_cache is gone) — MOVED from FuncDeclStmt
   (single storage: the resolver/inliner write the descriptor directly, so a
   compile-time fold that calls the function mid-pipeline reads current data)
 - `explicit_pure`, `effective_pure`, `cache_results`, `pure_ctx`
@@ -66,7 +67,9 @@ descriptor — there is no second copy to drift.
 - `vector<unique_ptr<FuncDescriptor>>` (moved from the decls)
 - `vector<unique_ptr<StructTypeDef>>` (moved from the StructDeclStmts;
   the decl keeps a raw alias for compile-time reads)
-- the per-function chunk storage (was `g_func_chunks`), keyed by descriptor.
+- (per-function chunks stay in vm.cpp's per-program `g_func_chunks`
+  storage, now KEYED BY DESCRIPTOR and stamped on `desc->vm_chunk`; they
+  serialize alongside the descriptors when the `.myv` writer lands.)
 
 `vm_execute(root)` splits into `vm_compile(root) -> VmProgram` (codegen +
 AOT precompile + ownership transfer) and `vm_run(program)`. The `-rt`
@@ -93,8 +96,42 @@ a compile-time `NotLoweredEx` instead of a silent tree-walk.
   pointer now reads zeroed, freed memory (ASan/RECYCLE lanes make a stale
   deref loud). Then `vm_run(program)` executes — conclusively AST-free.
 - Scope: script mode only. The REPL and the `-rt` harness retain their ASTs
-  by design (decompilation, differential testing); release builds skip the
-  teardown (the user asked for it in debug builds).
+  by design (decompilation, differential testing). The gate is `!NDEBUG` =
+  every ASSERTS build - debug AND the default release (matching the
+  project's checks-on-everywhere ethos; CI release lanes run the proof too);
+  only an explicit `ASSERTS=0` perf build skips it.
+
+## Status: ✅ DONE (2026-07-15, all six steps)
+
+- FuncDescriptor landed (commit `vm: FuncDescriptor - the runtime call model
+  reads NO AST node`); VmProgram + StructTypeDef transfer + the vm_compile/
+  vm_run split + universal chunks + vm_ast_teardown landed on top.
+- Findings while flipping the proof on:
+  - The ZERO-SLOT function class (a param-less, local-less closure -
+    `next_slot == 0`, so the resolver leaves `resolved == false`) NEVER took
+    the VM chunk hook - it silently tree-walked under -vm since Phase 4. The
+    hook is no longer gated on `resolved` (a temps-only frame is built), and
+    the no-real-op chunk gate is dropped; pinned by the three "vm: zero-slot"
+    tests.
+  - That unmasked a pre-existing caret imprecision: IncDecElem/
+    IncDecMemberCheckedV recorded the WHOLE inc-dec span for the
+    undefined-global-BASE error where the tree-walker marks the BASE
+    identifier - the loc-source node is now the base (the existing
+    "marks the base" test caught it the moment the closure ran natively).
+  - `collect_funcs` used a hand-kept dynamic_cast chain that MISSED try/catch
+    bodies and slices - a func declared there escaped the AOT precompile
+    (hidden by the lazy safety net). It now recurses via the exported
+    complete walker `for_each_child_of` (inferencer.h).
+  - The only un-compilable body left - the un-slottable >64-param function
+    (never `scope_free`) - is a compile-time NotLoweredEx under -vm.
+- Gates: -rt 1528/1528 + differential 1372/1372 on g++/clang debug
+  (ASan+UBSan), RECYCLE+ASan, release+VM_HARDENING; nested_fuzz 300/300 vs
+  CPython against the TEARDOWN build (every run frees the AST); bench/ +
+  samples/ sweeps clean under the teardown; bench gate VM/TW geomean 0.56x
+  (unchanged), my/py 0.26x.
+- Deliberately out of scope: `10_recursion_deep` under a debug+ASan -vm build
+  stack-overflows at scale 1 - PRE-EXISTING at the prior CI-green commit
+  (verified at HEAD~1), a debug-frame depth cost, not a teardown issue.
 
 ## Execution order
 

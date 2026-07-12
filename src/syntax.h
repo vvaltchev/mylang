@@ -88,7 +88,22 @@ public:
      */
     static void *operator new(std::size_t n);
     static void operator delete(void *p) noexcept;
+#elif !defined(NDEBUG)
+    /*
+     * ASSERTS builds: track the LIVE node count and memset(0) every freed
+     * node - the backing for the -vm AST-teardown proof (vm_ast_teardown:
+     * after codegen the whole AST is destroyed, the count must hit ZERO, and
+     * any residual pointer reads zeroed, freed memory). Defined in syntax.cpp.
+     * See plans/vm-ast-free-runtime.md. (RECYCLE has its own new/delete above,
+     * which maintain the same counter + ASan-poison the freed node.)
+     */
+    static void *operator new(std::size_t n);
+    static void operator delete(void *p, std::size_t n) noexcept;
 #endif
+
+    /* LIVE Construct count (ASSERTS/RECYCLE builds; always-defined so the
+     * teardown code compiles everywhere). ++ in operator new, -- in delete. */
+    static uint64_t live_nodes;
 
     bool is_const;
     Loc start;
@@ -1428,7 +1443,21 @@ class StructDeclStmt final: public Construct {
 
 public:
     unique_ptr<Identifier> id;
-    unique_ptr<StructTypeDef> def;
+
+    /*
+     * The struct's type descriptor. The decl OWNS it (`def_owner`) until
+     * vm_compile MOVES ownership into the VmProgram - struct instances,
+     * t_structtype const-pool values, and the chunk pools all reference it,
+     * so it must outlive the AST under -vm. `def` is the stable raw alias
+     * every reader uses; it stays valid across the transfer.
+     */
+    unique_ptr<StructTypeDef> def_owner;
+    StructTypeDef *def = nullptr;
+
+    void set_def(unique_ptr<StructTypeDef> d) {
+        def_owner = move(d);
+        def = def_owner.get();
+    }
 
     StructDeclStmt() : Construct("StructDeclStmt", true) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;

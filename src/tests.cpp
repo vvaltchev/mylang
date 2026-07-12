@@ -2511,6 +2511,23 @@ static const std::vector<test> tests =
         "var dyn g = [1];" },
       &typeid(UndefinedVariableEx), 12, 1, 14, 1 },
 
+    /* ZERO-SLOT bodies (no params, no locals -> the resolver leaves them
+     * `resolved == false`) now run their CHUNK under -vm (the chunk hook is
+     * no longer gated on `resolved`) - post-AST-teardown the chunk is the
+     * only way to run them. Pin the three shapes the gate change chunked:
+     * a capturing zero-param closure, a no-capture lambda, an empty body. */
+    { "vm: zero-slot capturing closure body runs (counter)",
+      { "func mk(start) => func [start] { start++; return start; };",
+        "var c = mk(0);",
+        "assert(c() == 1);",
+        "assert(c() == 2);" } },
+    { "vm: zero-slot no-capture lambda runs",
+      { "var f = func() => 42;",
+        "assert(f() == 42);" } },
+    { "vm: empty function body returns none",
+      { "func e() { }",
+        "assert(str(e()) == \"<none>\");" } },
+
     /* dyn-into-concrete COERCION: `int + dyn` is `dyn` (the natural result), but
      * a `dyn` value is ASSIGNABLE to a concrete NUMERIC local - a runtime-checked
      * coercion. So a `var s = 0; s = s + x` accumulator KEEPS `s` int (its type

@@ -2489,7 +2489,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         throw SyntaxErrorEx(c.get_loc(), "Expected struct name, got",
                             &c.get_tok());
 
-    stmt->def = make_unique<StructTypeDef>();
+    stmt->set_def(make_unique<StructTypeDef>());
     stmt->def->name = stmt->id->uid;
 
     pExpectOp(c, Op::braceL);
@@ -2612,7 +2612,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     /* reject an infinitely-recursive struct (a non-opt self/mutual struct
      * field) with a clear "box it as 'dyn?'" message - before compute_layout,
      * which would otherwise just silently box the back-edge */
-    check_struct_no_recursion(stmt->def.get(), field_locs,
+    check_struct_no_recursion(stmt->def, field_locs,
                               c.const_eval ? c.const_ctx : nullptr);
 
     /* decide POD vs boxed storage and assign POD field byte offsets */

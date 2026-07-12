@@ -662,32 +662,38 @@ do_func_call(EvalContext *ctx,
     Frame frame;
     const Chunk *vm_ck = nullptr;
 
-    if (obj.func->resolved) {
-
-        /*
-         * Phase 4: under -vm, run a loop-bearing (scope-free block) body as a
-         * native chunk. The chunk is compiled once and cached on the
-         * FuncDeclStmt (vm_chunk_tried), so this is a field read per call, not
-         * a per-call compile/lookup - which is what keeps expression/recursion-
-         * heavy functions (chunk == null) off the VM path with no overhead. The
-         * frame grows by the chunk's register-machine temps.
-         */
-        /*
-         * NOT during const-eval: AutoConst / the inliner's refold fold pure
-         * calls at COMPILE time (resolve_names), while the tree is still being
-         * transformed - compiling a body into a chunk there would cache
-         * (on the FuncDeclStmt) pointers into nodes the inliner then frees, and
-         * running it re-reads freed memory (a RECYCLE/ASan use-after-poison).
-         * The VM is a RUNTIME engine; const-eval always uses the tree-walker.
-         */
-        if (g_exec_engine == ExecEngine::Vm && !ctx->in_const_eval()) {
-            if (!obj.func->vm_chunk_tried) {
-                obj.func->vm_chunk = vm_func_chunk(obj.func);
-                obj.func->vm_chunk_tried = true;
-            }
-            vm_ck = static_cast<const Chunk *>(obj.func->vm_chunk);
+    /*
+     * Phase 4: under -vm, run the body as a native chunk. Compiled AOT
+     * (vm_precompile_all) and stamped on the DESCRIPTOR, so this is a field
+     * read per call. NOT gated on `resolved`: a zero-slot function (a
+     * param-less, local-less closure - next_slot == 0, so the resolver leaves
+     * it unresolved) still has a chunk, and after the AST teardown the chunk
+     * is the ONLY way to run it.
+     */
+    /*
+     * NOT during const-eval: AutoConst / the inliner's refold fold pure
+     * calls at COMPILE time (resolve_names), while the tree is still being
+     * transformed - compiling a body into a chunk there would cache
+     * (on the descriptor) pointers into nodes the inliner then frees, and
+     * running it re-reads freed memory (a RECYCLE/ASan use-after-poison).
+     * The VM is a RUNTIME engine; const-eval always uses the tree-walker.
+     */
+    if (g_exec_engine == ExecEngine::Vm && !ctx->in_const_eval()) {
+        if (!obj.func->vm_chunk_tried) {
+            obj.func->vm_chunk = vm_func_chunk(obj.func);
+            obj.func->vm_chunk_tried = true;
         }
+        vm_ck = static_cast<const Chunk *>(obj.func->vm_chunk);
+    }
 
+    /*
+     * When the function was resolved, params live in a flat slot Frame (O(1)
+     * access) instead of the args context map; the frame also carries the
+     * chunk's register-machine temps. An unresolved-but-chunked body (the
+     * zero-slot closure) gets a temps-only frame. The Frame lives on this
+     * stack frame for the whole call; nested blocks inherit the pointer.
+     */
+    if (obj.func->resolved || vm_ck) {
         frame.init(obj.func->frame_size + (vm_ck ? vm_ck->n_temps : 0));
         args_ctx.frame = &frame;
     }
@@ -4359,7 +4365,7 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     /* Bind the struct name to its type descriptor (a const t_structtype value
      * holding the AST-owned StructTypeDef*), like a func name. */
-    EvalValue desc(def.get());
+    EvalValue desc(def);
 
     if (id) {
 

@@ -801,6 +801,14 @@ From `codegen_func_body`'s gates (codegen.cpp:5859):
 
 ### Tier 4 — the runtime call model itself is AST-anchored
 
+> ✅ **DONE (2026-07-15) — see `plans/vm-ast-free-runtime.md`.** All four
+> items landed: `FuncObject`/`do_func_call`/`closure_defs` run on the
+> serializable `FuncDescriptor`; `StructTypeDef` ownership moves into the
+> `VmProgram` at `vm_compile`; `node_table` was already deleted with the
+> no-fail codegen; and the debug-build `vm_ast_teardown` FREES + memset(0)s
+> the entire AST before `vm_run`, ML_CHECKing `Construct::live_nodes == 0`.
+> The ZERO-AST rule is machine-proven on every ASSERTS `-vm` script run.
+
 1. **`Chunk::closure_defs` holds `const FuncDeclStmt *`** — a `Construct*`
    POOL, explicitly against the ZERO-AST rule ("pooled data is plain values …
    NEVER a Construct*"). `MakeClosureV` builds `FuncObject(def, &ctx)` from it.

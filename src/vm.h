@@ -4,8 +4,11 @@
 
 #include "bytecode.h"   /* Chunk */
 #include <memory>
+#include <vector>
 
 class Construct;
+class UniqueId;
+struct StructTypeDef;
 class FuncDeclStmt;
 struct FuncDescriptor;
 class EvalContext;
@@ -26,12 +29,11 @@ struct RuntimeException;
 extern std::unique_ptr<RuntimeException> g_vm_exc_pending;
 
 /*
- * The compiled body chunk for a block-bodied function (Phase 4), lazily built +
- * cached (the storage lives in vm.cpp, cleared per run). Returns null when the
- * body isn't worth running natively - an expression body, or a block with NO
- * register ops - so it stays tree-walked; that keeps expression/recursion-heavy
- * functions off the VM path (no per-call cost). do_func_call caches the result
- * on the FuncDeclStmt so this runs at most once per function per run.
+ * The compiled body chunk for a function (Phase 4); the storage lives in
+ * vm.cpp, keyed by DESCRIPTOR, cleared per program. Null only for a
+ * never-called template base; EVERY other body compiles (post-teardown the
+ * chunk is the only way to run it - the no-fail rule). Filled AOT by
+ * vm_precompile_all; this entry point is the never-hit lazy safety net.
  */
 const Chunk *vm_func_chunk(const FuncDescriptor *fdesc);
 
@@ -42,13 +44,57 @@ const Chunk *vm_func_chunk(const FuncDescriptor *fdesc);
 void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
 
 /*
+ * The COMPLETE compiled program image (plans/vm-ast-free-runtime.md): the root
+ * chunk, the root-context data the run needs (slot count + the global table's
+ * names), and - crucially - OWNERSHIP of every FuncDescriptor and
+ * StructTypeDef, MOVED here from the AST by vm_compile. After that transfer
+ * the whole AST is droppable: closures build from descriptor pools, struct
+ * instances/type values point at program-owned defs, and every function body
+ * is a precompiled chunk. This is the in-memory shape of the future `.myv`
+ * file (per-function chunks are keyed by descriptor in vm.cpp's per-run
+ * storage; they serialize alongside the descriptors).
+ */
+struct VmProgram {
+    Chunk root;
+    int root_slot_count = 0;
+    std::vector<const UniqueId *> global_func_names;
+    std::vector<std::unique_ptr<FuncDescriptor>> funcs;
+    std::vector<std::unique_ptr<StructTypeDef>> structs;
+};
+
+/*
  * The runtime bytecode VM - the -vm execution engine (plans/bytecode-vm.md).
  * `root` is the OPTIMIZED program AST (post infer / resolve_names /
  * specialize_types), exactly what the tree-walker's root->eval(nullptr) runs.
  * vm_execute lowers it to bytecode and drives it through the SAME root context
  * the tree-walker builds, so observable behavior is identical.
+ *
+ * It is two phases the script driver may call separately:
+ *   vm_compile - codegen the root, AOT-precompile every function body, and
+ *                TRANSFER descriptor/struct-def ownership into the returned
+ *                VmProgram (the AST keeps raw aliases; nothing the runtime
+ *                reads lives in the tree anymore);
+ *   vm_run     - build the root EvalContext/Frame/GlobalFuncTable from the
+ *                program image alone and execute.
+ * Between the two, a debug-build script run DESTROYS the whole AST (the
+ * teardown proof in mylang.cpp). vm_execute = compile + run (the -rt
+ * harness's path, AST retained for the differential oracle).
  */
+VmProgram vm_compile(const Construct *root);
+void vm_run(VmProgram &prog);
 void vm_execute(const Construct *root);
+
+/*
+ * THE ZERO-AST PROOF (ASSERTS builds; a no-op under ASSERTS=0): called by the
+ * script driver between vm_compile and vm_run. NULLs every descriptor's
+ * compile-time `decl` back-pointer, DESTROYS the whole AST (the normal
+ * recursive unique_ptr teardown - each freed node is memset(0) by the class
+ * operator delete), and ML_CHECKs that the process-wide live Construct count
+ * is ZERO. The VM then runs with the AST provably gone: everything it needs
+ * is self-contained in the VmProgram (+ the per-descriptor chunks). The REPL
+ * and the -rt harness never call this (they retain their ASTs by design).
+ */
+void vm_ast_teardown(std::unique_ptr<Construct> &root, VmProgram &prog);
 
 /*
  * Which engine the test harness (tests.cpp check()) runs a program with, so the

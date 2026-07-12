@@ -2,6 +2,7 @@
 
 #include "vm.h"
 #include "codegen.h"
+#include "inferencer.h"
 #include "bytecode.h"
 #include "syntax.h"
 #include "eval.h"
@@ -627,51 +628,90 @@ static void vm_precompile_all(const Block *root);   /* AOT: defined below */
  * every construct once ran via a fallback op, so this is byte-identical to
  * root->eval(nullptr) - which the differential harness enforces.
  */
-void
-vm_execute(const Construct *root_c)
+/* Mark the program as EXECUTING for a scope, so vm_func_chunk's guard knows
+ * any chunk it compiles is over the final AST (save/restore, not a bare set,
+ * in case of re-entry; restored even on an exception). */
+struct ExecGuard {
+    bool prev;
+    ExecGuard() : prev(g_vm_executing) { g_vm_executing = true; }
+    ~ExecGuard() { g_vm_executing = prev; }
+};
+
+VmProgram
+vm_compile(const Construct *root_c)
 {
     const Block *root = static_cast<const Block *>(root_c);
+    ExecGuard exec_guard;
 
-    /* Mark the program as EXECUTING for the duration, so vm_func_chunk's guard
-     * knows any chunk it compiles is over the final AST (save/restore, not a
-     * bare set, in case of re-entry; restored even on an exception). */
-    struct ExecGuard {
-        bool prev;
-        ExecGuard() : prev(g_vm_executing) { g_vm_executing = true; }
-        ~ExecGuard() { g_vm_executing = prev; }
-    } exec_guard;
-
-    /* Fresh per run: drop any prior program's function chunks (and their stale
-     * FuncDeclStmt::vm_chunk pointers, whose functions are long freed). */
+    /* Fresh per program: drop any prior program's function chunks (and their
+     * stale descriptor vm_chunk pointers, whose functions are long freed). */
     g_func_chunks.clear();
 
-    const Chunk chunk = codegen_program(root);
+    VmProgram prog;
+    prog.root = codegen_program(root);
 
     /* AOT: compile every function body upfront (no lazy per-call compile) - the
      * maintainer's no-lazy rule + a `.myv`-serialization prerequisite. After
      * this, do_func_call reads a precomputed vm_chunk and never compiles. */
     vm_precompile_all(root);
 
+    /* Root-context data the run needs, copied OUT of the root Block. */
+    prog.root_slot_count = root->slot_count;
+    prog.global_func_names = root->global_func_names;
+
+    /* OWNERSHIP TRANSFER (plans/vm-ast-free-runtime.md): move every function
+     * descriptor and struct type def out of the AST into the program image,
+     * so the tree is droppable. The decls keep their raw aliases (desc/def),
+     * which stay valid - a unique_ptr move does not relocate the pointee. The
+     * walks use the COMPLETE child visitor, so no decl is missed. */
+    std::vector<const FuncDeclStmt *> funcs;
+    for (const auto &e : root->elems)
+        collect_funcs(e.get(), funcs);
+    for (const FuncDeclStmt *fn : funcs)
+        if (fn->desc_owner)
+            prog.funcs.push_back(
+                std::move(const_cast<FuncDeclStmt *>(fn)->desc_owner));
+
+    std::function<void (Construct *)> take_structs = [&](Construct *c) {
+        if (!c)
+            return;
+        if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+            if (sd->def_owner)
+                prog.structs.push_back(std::move(sd->def_owner));
+            return;
+        }
+        for_each_child_of(c, take_structs);
+    };
+    for (const auto &e : root->elems)
+        take_structs(e.get());
+
+    return prog;
+}
+
+void
+vm_run(VmProgram &prog)
+{
+    ExecGuard exec_guard;
     EvalContext ctx(nullptr, /*const_ctx=*/false);
 
     /* The frame holds the resolved locals plus the register machine's scratch
-     * temps [slot_count, slot_count + n_temps); the tree-walker fallback only
-     * ever touches slots < slot_count, so the extra temps never collide. */
+     * temps [slot_count, slot_count + n_temps); the extra temps never collide
+     * with the named slots. */
     std::unique_ptr<Frame> root_frame;
-    if (root->slot_count || chunk.n_temps) {
+    if (prog.root_slot_count || prog.root.n_temps) {
         root_frame = std::make_unique<Frame>();
-        root_frame->init(root->slot_count + chunk.n_temps);
+        root_frame->init(prog.root_slot_count + prog.root.n_temps);
         ctx.frame = root_frame.get();
     }
 
     std::unique_ptr<GlobalFuncTable> gtable;
-    if (!root->global_func_names.empty()) {
+    if (!prog.global_func_names.empty()) {
         gtable = std::make_unique<GlobalFuncTable>();
-        gtable->init(root->global_func_names);
+        gtable->init(prog.global_func_names);
         ctx.gfuncs = gtable.get();
     }
 
-    vm_run_chunk(chunk, ctx);
+    vm_run_chunk(prog.root, ctx);
 
     /* Inc v2: a top-level-uncaught exception propagated to here as the pending
      * signal (main's boundary found no handler and converted it). Convert it
@@ -681,6 +721,34 @@ vm_execute(const Construct *root_c)
         std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
         ex->rethrow();
     }
+}
+
+void
+vm_execute(const Construct *root_c)
+{
+    VmProgram prog = vm_compile(root_c);
+    vm_run(prog);
+}
+
+void
+vm_ast_teardown(std::unique_ptr<Construct> &root, VmProgram &prog)
+{
+#ifndef NDEBUG
+    /* The tree is about to die: no descriptor may point back into it. */
+    for (auto &fd : prog.funcs)
+        fd->decl = nullptr;
+
+    root.reset();
+
+    /* NOTHING survived: every Construct ever allocated is freed (and zeroed
+     * by operator delete). A nonzero count means some structure still owns a
+     * node - a runtime AST dependence this proof exists to catch. */
+    ML_CHECK_MSG(Construct::live_nodes == 0,
+                 "AST teardown: Construct nodes still alive under -vm");
+#else
+    (void) root;
+    (void) prog;
+#endif
 }
 
 /*
