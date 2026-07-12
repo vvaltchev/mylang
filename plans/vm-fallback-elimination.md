@@ -766,7 +766,13 @@ is deleted.
 
 ### Execution order (each its own commit)
 
-1. Pool the IncDec dual carets → ops 3/4 AST-free. [EASY]
+1. ✅ **DONE (2026-07-13)** Pool the IncDec dual carets → ops 3/4 AST-free:
+   the serializable `Chunk::incdec_sites` pool ({lvalue caret, inc-dec
+   caret, memId, memUid}, `Instr::b` = the index, O(1) — faster than the
+   old `node_at_pc` binary search); the undefined-global-base caret via the
+   loc side table (`vm_store_base`, node=null). Dual carets + the undefined
+   base now PINNED by four `err loc:` tests; `ast_node_pool_minimal` case
+   (c) asserts an empty node_table for both shapes.
 2. Pool EmplaceStruct (def + carets) → op 2 AST-free; `bench/`+`samples/`
    reach a literally-empty node_table. [EASY]
 3. `defined(<non-identifier>)` = eval-arg-then-true (builtin_defined only

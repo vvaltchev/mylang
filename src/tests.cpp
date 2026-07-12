@@ -2382,6 +2382,31 @@ static const std::vector<test> tests =
       { "struct P { int x; int y; }",
         "func mkp() { return P(1, 2); }",
         "var dyn p = mkp(); p.x++;" }, &typeid(NotLValueEx) },
+    /* The checked inc-dec DUAL carets, pinned (they come from the incdec_sites
+     * pool under -vm, the node in the tree-walker — must be byte-identical):
+     * a subscript-INTERNAL throw (missing key) marks the SUBSCRIPT `dd["z"]`,
+     * the inc-dec's OWN throw (non-numeric value) the WHOLE `dd["a"]++`. */
+    { "err loc: dyn elem ++ missing key marks the subscript",
+      { "func mkd() { var d = {\"a\": 1}; return d; }",
+        "var dyn dd = mkd(); dd[\"z\"]++;" },
+      &typeid(KeyNotFoundEx), 21, 2, 29, 2 },
+    { "err loc: dyn elem ++ on a string marks the whole inc-dec",
+      { "func mkd() { var d = {\"a\": \"s\"}; return d; }",
+        "var dyn dd = mkd(); dd[\"a\"]++;" },
+      &typeid(TypeErrorEx), 21, 2, 30, 2 },
+    /* The member twin: a missing key marks the MEMBER `dd.missing`. */
+    { "err loc: dyn member ++ missing key marks the member",
+      { "func mkd() { var d = {\"cnt\": 1}; return d; }",
+        "var dyn dd = mkd(); dd.missing++;" },
+      &typeid(KeyNotFoundEx), 21, 2, 31, 2 },
+    /* An UNDEFINED global base (`g` read by f before its decl runs): the
+     * VM's vm_store_base uses the loc side table — must match the tree-
+     * walker's identifier caret. */
+    { "err loc: dyn elem ++ on an undefined global base marks the base",
+      { "func f() { g[0]++; }",
+        "f();",
+        "var dyn g = [1];" },
+      &typeid(UndefinedVariableEx), 12, 1, 14, 1 },
 
     /* dyn-into-concrete COERCION: `int + dyn` is `dyn` (the natural result), but
      * a `dyn` value is ASSIGNABLE to a concrete NUMERIC local - a runtime-checked
@@ -14040,6 +14065,23 @@ ast_node_pool_minimal()
         return false;
     if (!withb.builtin_calls[0].name
         || std::string(withb.builtin_calls[0].name->val) != "print")
+        return false;
+
+    /* (c) the checked inc-dec ops (dyn element + dyn member) are AST-FREE:
+     * their dual carets (+ the member key) pool into incdec_sites, leaving
+     * node_table EMPTY (they were node-kept for the two-caret problem). */
+    Chunk incdec;
+    if (!compile({"func mkd() { var d = {\"a\": 1}; return d; }",
+                  "var dyn dd = mkd();",
+                  "dd[\"a\"]++;",
+                  "dd.a++;"}, incdec))
+        return false;
+    if (!incdec.node_table.empty() || incdec.incdec_sites.size() != 2
+        || !table_valid(incdec))
+        return false;
+    /* the member form carries the key */
+    if (!incdec.incdec_sites[1].memUid
+        || std::string(incdec.incdec_sites[1].memUid->val) != "a")
         return false;
 
     return true;

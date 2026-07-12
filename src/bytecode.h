@@ -95,7 +95,10 @@ enum class OpCode : unsigned char {
      * element; a flat scalar element has none -> NotLValueEx, exactly as the
      * tree-walker), THROWS if it isn't int/float, then applies ±1 (int/float-
      * ONLY, so byte-identical to the dyn scalar IncDecCheckedV). The value is
-     * discarded (statement). Carets via the loc side table.
+     * discarded (statement). AST-FREE: its TWO error carets - the SUBSCRIPT
+     * loc (a subscript-internal KeyNotFound/OOB) vs the INC-DEC loc (its own
+     * NotLValue/TypeError) - come from the incdec_sites pool (`b` = the
+     * index); the undefined-global-base caret from the loc side table.
      */
     IncDecElemCheckedV,
 
@@ -106,9 +109,10 @@ enum class OpCode : unsigned char {
      * plus/minus. Mirrors IncDecExpr::do_eval's dyn path over MemberExpr's
      * lvalue logic: a mutable boxed STRUCT field or a DICT value is an lvalue
      * (read, check int/float, ±1); a POD field / readonly / a missing dict key
-     * throws (NotLValueEx / KeyNotFoundEx), exactly as the tree-walker. KEEPS
-     * its node (the IncDecExpr) for its TWO error carets - the MEMBER loc for a
-     * KeyNotFound vs the INC-DEC loc for its own NotLValue/TypeError.
+     * throws (NotLValueEx / KeyNotFoundEx), exactly as the tree-walker.
+     * AST-FREE: the member key + its TWO error carets - the MEMBER loc for a
+     * KeyNotFound vs the INC-DEC loc for its own NotLValue/TypeError - come
+     * from the incdec_sites pool (`b` = the index).
      */
     IncDecMemberCheckedV,
 
@@ -1066,6 +1070,25 @@ struct Chunk {
     std::vector<MemberKey> member_keys;
 
     /*
+     * CHECKED-INC-DEC SITE POOL (IncDecElemCheckedV / IncDecMemberCheckedV).
+     * The dual error carets a one-loc-per-pc side table can't hold: `lstart/
+     * lend` = the SUBSCRIPT/MEMBER child's caret (a subscript-internal
+     * KeyNotFound/OOB, a member KeyNotFound), `istart/iend` = the INC-DEC
+     * expr's own caret (its NotLValue / const / TypeError). The member form
+     * also carries the member key (`memId` the name as a dict-key value,
+     * `memUid` the interned name; elem leaves them empty/null). Indexed by
+     * `Instr::b` (an immediate) - O(1), no node, fully serializable (Locs +
+     * a string key + a re-internable name).
+     */
+    struct IncDecSite {
+        Loc lstart, lend;              /* the subscript/member child's caret */
+        Loc istart, iend;              /* the whole inc-dec expr's caret */
+        EvalValue memId;               /* member form: the name as a dict key */
+        const UniqueId *memUid = nullptr;   /* member form: interned name */
+    };
+    std::vector<IncDecSite> incdec_sites;
+
+    /*
      * LVALUE-CHAIN STEP POOL (StoreLValueChainV). One entry per general nested
      * store `base.step1.step2... = v` mixing MEMBER and SUBSCRIPT steps (a
      * pure-subscript chain keeps StoreElem2V/StoreElemChainV). Each step is a
@@ -1221,8 +1244,8 @@ struct Chunk {
      * op's ctor/args). The ops that still need the AST at runtime are:
      *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (`node->eval`);
      *   - EmplaceStruct (the ctor node: vm_struct_ctor_def + field carets);
-     *   - the two checked-element/member inc-decs + the flat elem store (dual
-     *     carets the loc table can't hold) etc. - see build_node_table's list.
+     *   - CallValueGenericV (a dyn callee may be a Builtin whose ABI takes the
+     *     unevaluated args ExprList) - see extract_locs's KEEP list.
      * A 100%-native chunk leaves this EMPTY - a non-empty `node_table` is EXACTLY
      * the "not yet fully serializable" signal (its `Construct*` is still an AST
      * pointer; a serializing backend keeps the AST or rejects the chunk). This

@@ -742,6 +742,25 @@ struct Codegen {
         return static_cast<int>(chunk.member_keys.size()) - 1;
     }
 
+    /* Pool a checked inc-dec's dual carets (+ the member key for the member
+     * form): lvalue-child caret + the whole inc-dec caret. Returns the index
+     * (carried in Instr::b), so the op is AST-free. */
+    int add_incdec_site(const Construct *lchild, const IncDecExpr *inc,
+                        const MemberExpr *m = nullptr)
+    {
+        Chunk::IncDecSite s;
+        s.lstart = lchild->start;
+        s.lend = lchild->end;
+        s.istart = inc->start;
+        s.iend = inc->end;
+        if (m) {
+            s.memId = m->memId;
+            s.memUid = m->memUid;
+        }
+        chunk.incdec_sites.push_back(std::move(s));
+        return static_cast<int>(chunk.incdec_sites.size()) - 1;
+    }
+
     /* Pool the per-step subscript carets of a nested store (StoreElem2V /
      * StoreElemChainV), INSIDE-OUT to match the keys. Returns the pool index. */
     int add_chain_locs(const std::vector<const Construct *> &nodes)
@@ -1767,10 +1786,13 @@ struct Codegen {
                     return false;
                 Instr in;
                 in.op = OpCode::IncDecElemCheckedV;
-                in.node_idx = add_ast_node(s);   /* the inc-dec span (carets) */
+                /* extract_locs: the inc-dec span -> the loc side table (the
+                 * undefined-global-base caret) + inline_ctx; then node-free. */
+                in.node_idx = add_ast_node(s);
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
                 in.a = slot_op(kslot);
+                in.b = int_lit(add_incdec_site(sub, inc));   /* dual carets */
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -1792,9 +1814,12 @@ struct Codegen {
                     return false;
                 Instr in;
                 in.op = OpCode::IncDecMemberCheckedV;
-                in.node_idx = add_ast_node(s);   /* the inc-dec span (carets) */
+                /* extract_locs: the inc-dec span -> the loc side table (the
+                 * undefined-global-base caret) + inline_ctx; then node-free. */
+                in.node_idx = add_ast_node(s);
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
+                in.b = int_lit(add_incdec_site(m, inc, m));  /* key + carets */
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -5668,6 +5693,10 @@ static void extract_locs(Chunk &chunk)
         case OpCode::MapFilterV:     /* node = arg1 (unsupported-container caret) */
         case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
         case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
+        /* the checked inc-decs: dual carets in incdec_sites; the side-table
+         * loc = the undefined-global-base caret (vm_store_base). */
+        case OpCode::IncDecElemCheckedV:
+        case OpCode::IncDecMemberCheckedV:
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
@@ -5721,16 +5750,6 @@ static void extract_locs(Chunk &chunk)
         case OpCode::EvalToSlot:
         case OpCode::JumpIfFalse:
         case OpCode::EmplaceStruct:   /* needs the ctor node (def + field carets) */
-            break;
-        case OpCode::IncDecElemCheckedV:
-        case OpCode::IncDecMemberCheckedV:
-            /* KEEP the node (the IncDecExpr): a dyn `c[k]++` / `d.f++` has TWO
-             * distinct error carets - the SUBSCRIPT/MEMBER loc for an internal
-             * throw (KeyNotFound/OOB) and the INC-DEC loc for the inc-dec's own
-             * checks (NotLValue/TypeError/const) - which the loc side table
-             * (one loc per pc) can't both hold. The handler reads node->start/
-             * end (inc-dec) and its Subscript/MemberExpr child's loc, byte-
-             * identical to the tree-walker's dyn read-modify-write path. */
             break;
         default:
             in.node_idx = -1;

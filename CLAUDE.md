@@ -3832,18 +3832,22 @@ element, which `compile_int/float_stmt` already handle) via
 **`IncDecElemCheckedV`**: it forms the element LValue via the runtime
 `subscript(for_write=false)` and does the same int/float-checked ±1, mirroring
 `IncDecExpr::do_eval`'s dyn read-modify-write (a flat scalar element has no
-LValue → `NotLValueEx`, exactly as the tree-walker). It KEEPS its node (the
-IncDecExpr) — the only op that needs TWO distinct error carets the one-loc side
-table can't hold: the SUBSCRIPT loc for a subscript-internal throw
+LValue → `NotLValueEx`, exactly as the tree-walker). It is **AST-FREE**: its
+TWO distinct error carets — the SUBSCRIPT loc for a subscript-internal throw
 (`KeyNotFound`/OOB) vs the INC-DEC loc for its own `NotLValue`/`const`/
-`TypeError` — reading `node->start/end` + its `Subscript` child's loc, byte-
-identical to the tree-walker. A **dyn MEMBER** inc-dec `d.f++`/`d.f--` (a dyn/
-general base holding a struct or dict) is the exact twin, **`IncDecMemberCheckedV`**:
+`TypeError` — which a one-loc-per-pc side table can't hold, live in the
+serializable **`Chunk::incdec_sites`** pool (`Instr::b` = the index, O(1));
+the undefined-global-BASE caret comes from the loc side table
+(`vm_store_base`, node = null). A **dyn MEMBER** inc-dec `d.f++`/`d.f--` (a
+dyn/general base holding a struct or dict) is the exact twin,
+**`IncDecMemberCheckedV`**:
 it forms the member LValue like `MemberExpr::do_eval`'s rooted-base path (a
 mutable boxed STRUCT field or a DICT value is an lvalue; a POD field / readonly
 / a missing dict key throws `NotLValueEx`/`KeyNotFoundEx`), int/float-checks,
-±1. Same node-kept dual-loc (the MEMBER loc for a `KeyNotFound` vs the INC-DEC
-loc for `NotLValue`/`TypeError`). Both cover a proven-struct NON-numeric member
+±1. Same pool-carried dual-loc (the MEMBER loc for a `KeyNotFound` vs the
+INC-DEC loc for `NotLValue`/`TypeError`), plus the member key
+(`memId`/`memUid` ride in the same `incdec_sites` entry). Both cover a
+proven-struct NON-numeric member
 too (`s.name++` on a str field → `TypeError`, `th != i/f` so it isn't the M8
 `StoreMemberV` path). An optional `d?.f++` still falls back (rare).
 
@@ -3902,13 +3906,14 @@ runtime-`const` rebind are all now native (above).
 DROPPED).** A runtime-node op looks its `Construct*` up by **pc** in the
 pc-keyed **`node_table`** (`{pc, Construct*}`, sorted, binary-searched by
 `node_at_pc` on the COLD path only — SAME shape/cost as `locs` / `inline_ctxs`),
-NOT via a per-`Instr` index into a pool. The residual nodes are: the fallbacks
-(`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`), the builtin-call ops
-(`CallBuiltinV`/`LV`/`LVElem`, `EmplaceStruct`, `CheckFuncV`/`MapFilterV` — the
-args `ExprList` for per-arg carets), `CallValueGenericV` (its args + callee),
-`IncDecElemCheckedV`/`IncDecMemberCheckedV` (their DUAL error carets —
-subscript/member vs inc-dec loc, above), and the flat int/float element store
-(`node->start` for its OOB/div0 caret). **How it's built:** `Instr::node_idx`
+NOT via a per-`Instr` index into a pool. The residual nodes are now ONLY: the
+fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`),
+`EmplaceStruct` (the ctor node: def + field carets), and `CallValueGenericV`
+(its args `ExprList` + callee — a dyn callee may be a Builtin whose ABI takes
+the unevaluated args). The builtin-call ops read the `builtin_calls` pool,
+`CheckFuncV`/`MapFilterV` and the flat int/float element stores the loc side
+table, and the checked inc-decs the `incdec_sites` pool — all AST-free.
+**How it's built:** `Instr::node_idx`
 (a 4-byte index into a CODEGEN-TRANSIENT `Chunk::ast_nodes`, appended by
 `Codegen::add_ast_node`) is the SPLICE-STABLE handle codegen needs before an
 op's final pc is known (ops grow + roll back, and an index survives that where a
@@ -3952,7 +3957,8 @@ still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
-`member_keys`, `catch_types`, `literal_objs`, `closure_defs`, `struct_defs`,
+`member_keys`, `incdec_sites`, `catch_types`, `literal_objs`, `closure_defs`,
+`struct_defs`,
 `unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT
 serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
 ones only). This is the audit surface for the `.myv` stored-bytecode endgame:

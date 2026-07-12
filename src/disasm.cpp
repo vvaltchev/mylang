@@ -261,6 +261,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   #" << i << "  "
               << (t.kind == Chunk::ThrowKind::undefined_var ? "undefined_var"
                   : t.kind == Chunk::ThrowKind::not_lvalue ? "not_lvalue"
+                  : t.kind == Chunk::ThrowKind::rebind_const ? "rebind_const"
                   : "rebind_builtin")
               << (t.name ? " " + std::string(t.name->val) : "") << "\n";
         }
@@ -271,6 +272,18 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             const auto &bc = ch.builtin_calls[i];
             s << ";   #" << i << "  " << (bc.name ? bc.name->val : "?")
               << "  (" << bc.args.size() << " args)\n";
+        }
+    }
+    if (!ch.incdec_sites.empty()) {
+        s << "; -- incdec_sites (" << ch.incdec_sites.size() << ") --\n";
+        for (size_t i = 0; i < ch.incdec_sites.size(); i++) {
+            const auto &is = ch.incdec_sites[i];
+            s << ";   #" << i << "  lval@" << is.lstart.line << ":"
+              << is.lstart.col << "  incdec@" << is.istart.line << ":"
+              << is.istart.col;
+            if (is.memUid)
+                s << "  ." << is.memUid->val;
+            s << "\n";
         }
     }
     if (!ch.node_table.empty()) {
@@ -616,8 +629,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         }
         case OpCode::IncDecMemberCheckedV: {
             static const char *bk[] = {"loc", "gbl", "cap"};
+            const Chunk::IncDecSite &is = chunk.incdec_sites[in.b.lit];
             row << "incdec.membr " << bk[in.target & 3] << "[" << in.target2
-                << "].<member>" << (in.aop == Op::plus ? " ++" : " --")
+                << "]." << (is.memUid ? is.memUid->val : "<member>")
+                << (in.aop == Op::plus ? " ++" : " --")
                 << "   ; dyn member, int/float-checked";
             break;
         }

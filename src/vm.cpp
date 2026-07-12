@@ -972,36 +972,32 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             /* `c[k]++` / `c[k]--` on a dyn/unproven base: form the element
              * LValue, enforce int/float, apply +-1 (statement). Base kind in
              * .target (0 loc / 1 gbl / 2 cap), base slot in .target2, key temp
-             * in .a, +/- in .aop. Keeps the node (IncDecExpr) for its TWO error
-             * carets: the SUBSCRIPT loc (subscript-internal KeyNotFound/OOB) and
-             * the INC-DEC loc (its own NotLValue/const/TypeError). */
-            const Construct *node = chunk.node_at_pc(pc);
-            const IncDecExpr *inc = static_cast<const IncDecExpr *>(node);
-            const Subscript *sub =
-                static_cast<const Subscript *>(inc->lvalue.get());
+             * in .a, +/- in .aop. AST-FREE: its TWO error carets - the
+             * SUBSCRIPT loc (a subscript-internal KeyNotFound/OOB) vs the
+             * INC-DEC loc (its own NotLValue/const/TypeError) - come from the
+             * incdec_sites pool (`b`); the undefined-global-base caret from
+             * the loc side table (vm_store_base, node = null). */
+            const Chunk::IncDecSite &site = chunk.incdec_sites[in.b.lit];
             LValue *blv =
-                vm_store_base(ctx, in.target, in.target2, chunk, pc, node);
+                vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
             const EvalValue &key = ctx.frame->at(in.a.slot).get();
             vm_incdec_elem(blv, key, in.aop == Op::plus,
-                           sub->start, sub->end, inc->start, inc->end);
+                           site.lstart, site.lend, site.istart, site.iend);
             pc++;
             break;
         }
 
         case OpCode::IncDecMemberCheckedV: {
             /* `d.f++` / `d.f--` on a dyn/unproven base: form the member LValue
-             * (struct field / dict value), enforce int/float, apply +-1. Keeps
-             * the node (IncDecExpr -> MemberExpr child) for its TWO carets: the
-             * MEMBER loc (a KeyNotFound) and the INC-DEC loc (its own NotLValue/
-             * const/TypeError). */
-            const Construct *node = chunk.node_at_pc(pc);
-            const IncDecExpr *inc = static_cast<const IncDecExpr *>(node);
-            const MemberExpr *m =
-                static_cast<const MemberExpr *>(inc->lvalue.get());
+             * (struct field / dict value), enforce int/float, apply +-1.
+             * AST-FREE: the member key + its TWO carets - the MEMBER loc (a
+             * KeyNotFound) vs the INC-DEC loc (its own NotLValue/const/
+             * TypeError) - come from the incdec_sites pool (`b`). */
+            const Chunk::IncDecSite &site = chunk.incdec_sites[in.b.lit];
             LValue *blv =
-                vm_store_base(ctx, in.target, in.target2, chunk, pc, node);
-            vm_incdec_member(blv, m->memId, m->memUid, in.aop == Op::plus,
-                             m->start, m->end, inc->start, inc->end);
+                vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
+            vm_incdec_member(blv, site.memId, site.memUid, in.aop == Op::plus,
+                             site.lstart, site.lend, site.istart, site.iend);
             pc++;
             break;
         }
