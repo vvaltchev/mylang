@@ -2998,10 +2998,11 @@ the proof. Before calling it done:
 > 2. **Every `Construct*` object is FREED after compilation.** The whole AST is
 >    droppable. If a chunk pins even one `Construct*`, the goal is NOT met.
 > 3. **A native op must NEVER call `node->eval(...)` at runtime.** The
->    tree-walker fallback ops (`EvalStmt` / `EvalToSlot` / `JumpIfFalse`) that
->    re-enter the AST are **BANNED in a compiled script** — every construct MUST
->    be lowered to real bytecode. "It falls back to the tree-walker for that
->    construct" is a FAILURE, not an acceptable state.
+>    tree-walker fallback op (`EvalStmt` — the ONLY one left; `EvalToSlot`
+>    and `JumpIfFalse` are DELETED) re-enters the AST and is **BANNED in a
+>    compiled script** — every construct MUST be lowered to real bytecode.
+>    "It falls back to the tree-walker for that construct" is a FAILURE, not
+>    an acceptable state.
 > 4. **All information an op needs at runtime is extracted into POOLED,
 >    SERIALIZABLE, AST-FREE data DURING compilation** — source `Loc`s in the loc
 >    side table, member keys / catch types / literals / struct defs / arg carets
@@ -3520,8 +3521,9 @@ container-arg caret + the per-field coerce carets + the callee name, indexed
 by the kind-packed `Instr::a`; the whole-args caret rides the loc side
 table), so a struct-append chunk serializes with an empty `node_table`.
 An **AST builtin**
-(defined/type/…, needs the arg node) keeps the union null and stays
-`EvalToSlot` — EXCEPT `defined`, now fully lowered: only a bare `Identifier`
+(defined/type/…, needs the arg node) keeps the union null (its call site
+falls back whole) — EXCEPT `defined`, now fully lowered: only a bare
+`Identifier`
 can evaluate to the `UndefinedId` sentinel (`Identifier::do_eval` is its sole
 producer), so `defined(<non-identifier expr>)` is exactly "evaluate the arg
 (effects/throws included), then `true`" (`try_native_defined_expr`: compile
@@ -3551,7 +3553,7 @@ shared **`vm_map_filter`** in generic.cpp.h, declared in eval.h — map builds a
 fresh array, filter keeps truthy elements; array→array, dict→dict — the SAME
 core the tree-walker's `builtin_map`/`builtin_filter` now call). The
 devirtualize pass sets `DirectBuiltinCallExpr::map_filter_kind` from the callee
-name. So the residual old-ABI (`func`, `EvalToSlot`) floor is now exactly ONE
+name. So the residual old-ABI (`func`, node-based) floor is now exactly ONE
 principled group — the **AST builtins** (`defined`/`isconst`/`isconstdecl`/
 `type`/`decltype`/`typestr`/`kindstr`/`show`: an unevaluated / node-property
 operand, inherently node-based).
@@ -3583,10 +3585,11 @@ smallest sensible step is acceptable, an accidental one is not.
 + `Halt`, building the root `EvalContext`/`Frame`/`GlobalFuncTable` exactly as
 `Block::do_eval`'s root path — byte-identical to `root->eval(nullptr)`.
 **Phase 1** added native control flow (`Jump`/`JumpIfFalse`/`LoopBackEdge`) and
-flattens **top-level `if`/`while`** to jumps; conditions/bodies still fall back
-(one `do_eval` each), so break/continue/nested loops go through the body's own
-FlowState, which `LoopBackEdge` consumes — identical to `While`/`IfStmt`. `for`
-is left fallback (its child-context loop-var scope mustn't be dropped).
+flattened **top-level `if`/`while`** to jumps; conditions/bodies still fell back
+(one `do_eval` each). (`JumpIfFalse` and its Phase-1 gen_if/gen_while flatten
+forms are since DELETED — an if/while that can't lower natively now falls back
+WHOLE-statement via EvalStmt; `LoopBackEdge` survives for flow-consuming
+loop shapes.)
 **Phase 2** is a **REGISTER machine over the frame slots** (the VM's registers
 ARE the resolved-local slots — NO value stack), with fused superinstructions:
 `IntBin` (3-address `dst = a <arith> b`, operands = slot or int immediate) and
@@ -3642,7 +3645,7 @@ keeps its chunk (the indirect call runs the base body). So `55_float_sum` (a
 loop in a function) is
 −62%. The compile gate (`codegen_func_body`) is "not a base template, a
 scope-free block body, and the body has at least one REAL op"
-— anything but the pure fallback/control ops (`EvalStmt`/`JumpIfFalse`/`Jump`/
+— anything but the pure fallback/control ops (`EvalStmt`/`Jump`/
 `LoopBackEdge`/`Halt`) — so a body of native **calls/stores/loads** (`CallV`,
 `DictStore`, `CallBuiltinV`, `SliceV`, a `ReturnV` over a native expr, …), which
 has NO arith/loop op, compiles too (the old arith/loop-only gate left those on
@@ -3774,9 +3777,9 @@ frame backtraces are byte-identical). **The foreach / array-read ops
 dead non-array `node->eval` else-branch - unreachable, `base_array` is proven -
 became an `InternalErrorEx` net). The builtin-call ops
 (`CallBuiltinV`/`LV`/`LVElem`) read the serializable `builtin_calls` pool and
-`EmplaceStruct` the `emplace_sites` pool, so the ONLY remaining `node` users
-are the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`) and
-`CallValueGenericV`. P8
+`EmplaceStruct` the `emplace_sites` pool, so the ONLY remaining `node` user
+is the single fallback op (`EvalStmt`) — `CallValueGenericV` reads the
+`call_sites` pool. P8
 exceptions are fully native (they no longer reach a fallback op). The FALLBACK-OP
 AUDIT (`plans/vm-fallback-elimination.md`) that followed found LIVE `EvalStmt`
 fallbacks in several more shapes — **F-1..F-4, all now NATIVE**: the multi-assign
@@ -3818,7 +3821,7 @@ resolved by what each needs (so the ONLY node-holder left is dev-only `show`):
 
 **Script-mode real-code fallbacks — a further sweep (all now NATIVE).** After
 F-1..F-4, a `ML_DBG_FB` audit hook in codegen `emit()` (compiled out by default;
-logs the rendered construct behind any `EvalStmt`/`EvalToSlot`/`JumpIfFalse`)
+logs the rendered construct behind an `EvalStmt`)
 found the remaining SCRIPT-mode shapes a real program can hit, each now native:
 a **`foreach` over `array<bool>`** (`LoadElemBool`, a real-bool bind, above); a
 **nested / boxed struct construction** (`StructCtorV`'s widened
@@ -3937,7 +3940,7 @@ in a non-arg0 position throws at its own position under the VM
 (`ThrowRuntimeV` in the run) but at the consumer in the tree-walker, so a
 LATER arg's side effects may run in one engine and not the other — both
 throw the same `UndefinedVariableEx`. **With this, `node_table`'s only
-users are the three fallback ops** (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`).
+user is the ONE fallback op** (`EvalStmt`).
 
 **Niche STATEMENTS → native (a further sweep).** Several residual real shapes
 went native: an **inc-dec STATEMENT on an int/float member/nested subscript**
@@ -4026,9 +4029,38 @@ storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 / `str s;` / `Point p;` is already desugared (at parse) to a zero-value literal
 / zero-struct ctor rvalue, so it lowers the same way.
 
-**Residual `EvalStmt`:** the harder niche shapes (an optional `d?.f++`);
-and the dev-only **`show`**
-(script-excluded by `reject_dev_builtins`, so never in serialized bytecode).
+**The Tier-1 endgame (2026-07-14): `EvalToSlot` + `JumpIfFalse` are
+DELETED; `EvalStmt` is THE single fallback op.** The last live expression/
+statement roots went native first: **coalesce** `a ?? b` (a
+`compile_boxed_expr` case: MoveV lhs into the dst — reserved BELOW the
+scratch temps — + the new **`JumpIfNotNoneV`** op to skip the rhs, so the
+`??` short-circuit is preserved); **chained boxed comparisons**
+`x == y == z` (the `emit_boxed_chain` 2-operand limit removed — the chain
+loop already accumulates left-to-right like the tree-walker);
+**assignment as an EXPRESSION** `a = (b = x + 1) + 2` (an `Expr14` case in
+`compile_boxed_expr` for a resolved-local non-const id target: run the
+int/float/boxed STATEMENT compilers, then use the target's slot as the
+operand — this exposed and fixed a retarget-guard bug where the
+plain-assign retarget could steal an inner store's dst: it now requires
+`rslot >= temp_base`); and the **typed IdList destructure** `fa, fb =
+[1, 2]` with int/float-annotated targets (`try_multi_unpack` accepts
+them; a per-target coerce vector rides the serializable
+**`Chunk::unpack_coerce`** pool — parallel to `unpack_targets`,
+`Instr::b` indexes it — and MultiUnpackV runs `vm_coerce_decl_num` per
+store, same TypeErrorEx + caret as the tree-walker). With those native,
+the two per-fragment fallback ops became unreachable and were REMOVED
+(opcodes, handlers, `vm_eval_cond`, `eval_to_temp`, the Phase-1
+`gen_if`/`gen_while` flatten forms, disasm renders). Decline semantics
+now: an operand/condition/loop-init that can't lower fails its WHOLE
+statement to one `EvalStmt` (`emit_init` returns bool; `compile_native_if`
+failure → a whole-if `EvalStmt` in `gen_stmt`) — never a per-op node
+fallback. **Residual `EvalStmt` users:** the dev-only **`show`**
+(script-excluded by `reject_dev_builtins`, so never in serialized
+bytecode; reachable only under the `-rt` harness) and the **impure-lvalue
+inc-dec VALUE form** (`y = a[f()]++` — `incdec_lvalue_pure` declines a
+side-effecting index; rare, whole-statement, byte-identical). Codegen-
+shape tests pin all four roots (`jinn`/`munpack` counters) + the
+whole-statement fallback behavior.
 The `InlinedCallExpr` return-across-try residue is CLOSED: a `return`
 crossing trys INSIDE the inline boundary inlines each crossed try's
 handler-pop + finally at the return (bounded at the BOUNDARY, not the
@@ -4050,7 +4082,7 @@ DROPPED).** A runtime-node op looks its `Construct*` up by **pc** in the
 pc-keyed **`node_table`** (`{pc, Construct*}`, sorted, binary-searched by
 `node_at_pc` on the COLD path only — SAME shape/cost as `locs` / `inline_ctxs`),
 NOT via a per-`Instr` index into a pool. The residual nodes are now ONLY the
-three fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`).
+ONE fallback op (`EvalStmt`, `node->eval`).
 The builtin-call ops read the `builtin_calls` pool,
 `EmplaceStruct` the `emplace_sites` pool (ctor def + container/field carets),
 `CallValueGenericV` the `call_sites` pool (carets + arg0's lvalue

@@ -16,21 +16,6 @@
 /* The harness's engine switch (see vm.h). Default: the tree-walker. */
 ExecEngine g_exec_engine = ExecEngine::TreeWalk;
 
-/*
- * Evaluate a condition node the same way the tree-walker's eval_cond does: the
- * unboxed int path when inference proved it a non-null int, else the boxed
- * is_true path. Mirrored here (eval_cond is a static inline in eval.cpp) so the
- * VM's JumpIfFalse costs exactly what an `if`/`while` test costs tree-walked -
- * no regression. The differential harness proves the two agree.
- */
-static inline bool
-vm_eval_cond(const Construct *c, EvalContext *ctx)
-{
-    if (c->th == TypeHint::i)
-        return c->eval_int(ctx) != 0;
-    return RValue(c->eval(ctx)).is_true();
-}
-
 /* Read a register operand as an int: an immediate, or a frame slot's int (a
  * bool slot reads as 0/1, mirroring Identifier::eval_int). The register machine
  * uses the frame slots directly - no value stack. */
@@ -906,13 +891,6 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc = in.target;
             break;
 
-        case OpCode::JumpIfFalse:
-            if (vm_eval_cond(chunk.node_at_pc(pc), &ctx))
-                pc++;
-            else
-                pc = in.target;
-            break;
-
         case OpCode::LoopBackEdge: {
 
             /* Mirror While/ForStmt::do_eval's post-body flow handling. */
@@ -1725,12 +1703,28 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * NON-array rvalue SPREADS to every target. */
             const EvalValue &rval = ctx.frame->at(in.a.slot).get();
             const std::vector<int32_t> &targets = chunk.unpack_targets[in.target];
+            /* Typed targets (R5): a PLAIN assign coerces each stored value
+             * per target (widen / dyn-narrowing throw, Expr14-span caret);
+             * a compound doesn't coerce. Kinds from the unpack_coerce pool. */
+            const std::vector<unsigned char> *coerce =
+                in.b.is_lit ? &chunk.unpack_coerce[in.b.lit] : nullptr;
             /* A COMPOUND `a, b OP= rhs` (in.aop != invalid): each target reads
              * its CURRENT value, applies the op with its element/scalar, writes
              * back — else a plain distribute. */
             const bool compound = in.aop != Op::invalid;
+            size_t ti = 0;
             auto store = [&](int32_t t, const EvalValue &v) {
                 if (!compound) {
+                    if (coerce && (*coerce)[ti]) {
+                        try {
+                            ctx.frame->at(t).put(vm_coerce_decl_num(
+                                v, (*coerce)[ti] == 2));
+                        } catch (Exception &e) {
+                            vm_stamp_loc(chunk, pc, e);
+                            throw;
+                        }
+                        return;
+                    }
                     ctx.frame->at(t).put(v);
                     return;
                 }
@@ -1747,14 +1741,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 const size_type m = rval.get_ref<SharedArrayObj>().size();
                 if (m != static_cast<size_type>(targets.size()))
                     vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
-                for (size_t i = 0; i < targets.size(); i++)
+                for (size_t i = 0; i < targets.size(); i++) {
+                    ti = i;
                     if (targets[i] >= 0)
                         store(targets[i],
                               vm_arr_elem(rval, static_cast<size_type>(i)));
+                }
             } else {
-                for (int32_t t : targets)
-                    if (t >= 0)
-                        store(t, rval);
+                for (size_t i = 0; i < targets.size(); i++) {
+                    ti = i;
+                    if (targets[i] >= 0)
+                        store(targets[i], rval);
+                }
             }
             pc++;
             break;
@@ -1795,15 +1793,6 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             }
             write_scalar_slot(&ctx, in.target, is_int,
                               r.is<LValue *>() ? r.get<LValue *>()->get() : r);
-            pc++;
-            break;
-        }
-
-        case OpCode::EvalToSlot: {
-
-            /* A scalar-result call evaluated into a temp (native builtin/call
-             * dispatch): the result is then read as an int/float operand. */
-            ctx.frame->at(in.target).put(RValue(chunk.node_at_pc(pc)->eval(&ctx)));
             pc++;
             break;
         }
@@ -2785,6 +2774,14 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         case OpCode::JumpUnlessTrueV:
             if (!ctx.frame->at(in.target2).get().is_true())
                 pc = in.target;
+            else
+                pc++;
+            break;
+
+        case OpCode::JumpIfNotNoneV:
+            /* `a ?? b` short-circuit: a non-none lhs skips the rhs. */
+            if (!ctx.frame->at(in.a.slot).get().is<NoneVal>())
+                pc = static_cast<size_t>(in.target);
             else
                 pc++;
             break;

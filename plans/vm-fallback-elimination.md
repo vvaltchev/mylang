@@ -250,12 +250,13 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
   **REMAINING: `EmplaceStruct`** - the one builtin op still node-holding (it needs
   the ctor's `vm_struct_ctor_def` + field-arg carets); a separate pooling
   (`struct_defs` + a field-caret pool).
-- The **fallback ops** `EvalStmt` / `EvalToSlot` / `JumpIfFalse` re-enter
-  `node->eval`. **DIRECTIVE (2026-07-12): 100% of them MUST be removed
-  — there is NO "legitimate residual."** They exist only because the front-end
-  isn't fully AOT yet; once it is (see *THE AOT / ZERO-FALLBACK ENDGAME* below)
-  none are reachable and the opcodes are deleted. Current live emitters (all
-  fixable, not fundamental):
+- The **fallback ops**: was `EvalStmt` / `EvalToSlot` / `JumpIfFalse`
+  re-entering `node->eval`. **DIRECTIVE (2026-07-12): 100% of them MUST be
+  removed.** ✅ **DONE (2026-07-14): `EvalToSlot` + `JumpIfFalse` are DELETED**
+  (see the Tier-1 endgame audit below); **`EvalStmt` remains as THE single
+  fallback op** — whole-statement granularity only, reachable only by
+  show()-in-tests + the R4 value form. Historical per-op notes (how each
+  became unreachable):
   - `JumpIfFalse` — **DONE (a `!x` condition is now native).** A unary op over a
     dyn/general operand (`!x`, `-x`, `~x`, `+x`) now lowers to a boxed
     **`UnaryV`** op (`compile_boxed_expr` handles `Expr02`), so `if (!x)` is
@@ -266,7 +267,8 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
     has OTHER emitters (a fallback body drags its loop's condition to the
     fallback form — e.g. `array<bool>` element ops in the sieve, a `for` with a
     `return` in its body); those are the array/loop nativization items, not a
-    `!x` gap.
+    `!x` gap. **(Superseded: JumpIfFalse is now DELETED — an if/while whose
+    condition can't lower falls back WHOLE-statement via EvalStmt.)**
   - `EvalToSlot` — an AST builtin (`defined`/`isconst`/`type`/`decltype`/
     `typestr`/`kindstr`) in a scalar-expression position. These are COMPILE-TIME
     ONLY: with full AOT inference they fold to a literal (a script is a closed
@@ -289,9 +291,9 @@ native chunk (e.g. `for(i;i<len(a);i++) a[i]=i*i; print(a)`) ends with an EMPTY
     native — EvalToSlot is unreachable.** The ONE residual emitter is the
     **dev-only `show`** (an AST decompiler with no value ABI), which is a
     compile-time error in a script (so never in `.myv`) and only reachable in the
-    REPL / test harness. Deleting EvalToSlot outright therefore waits on a
-    decision for `show` (give it a native/rejected path, or keep EvalToSlot as a
-    dev-only affordance) — step (e).
+    REPL / test harness. **(Superseded: EvalToSlot is now DELETED — `show`
+    in a scalar position fails its expression and the whole containing
+    STATEMENT falls to EvalStmt, which the -rt differential accepts.)**
   - `EvalStmt` — the general statement fallback. After AOT + full `dyn` (below),
     the only bodies that reached it (untyped template bases) no longer exist as
     chunks, so it too is unreachable.
@@ -1006,17 +1008,42 @@ scripts).
 
 **Live expression ROOTS (every recursive residue — loop init/cond/inc/
 body, return/throw values, try bodies, call args — funnels into these):**
-- R1 **`CoalesceExpr`** (`a ?? b`): NO compile_boxed_expr case at all.
-- R2 **Chained comparisons** (`a < b < c`, `a == b != c`):
-  `emit_boxed_chain` k=='c' rejects >2 operands; the shapes are legal
-  (bool promotes) and run in the tree-walker.
-- R3 **Assignment as an EXPRESSION / chained assign** (`x = y = 5`).
+- R1 **`CoalesceExpr`** (`a ?? b`) — ✅ DONE (2026-07-14): a
+  `compile_boxed_expr` case lowers it to MoveV(lhs→dst) +
+  **`JumpIfNotNoneV`** (a new op: skip the rhs when dst is non-none) +
+  the rhs into the same dst — short-circuit preserved (pinned by the
+  se()-counter test). The dst is reserved BELOW the scratch temps so
+  the rhs compile can't clobber it.
+- R2 **Chained comparisons** (`a < b < c`, `a == b != c`) — ✅ DONE
+  (2026-07-14): the `emit_boxed_chain` k=='c' 2-operand limit was
+  simply removed — the chain loop already accumulates left-to-right
+  (CmpV per step, bool promoting), exactly the tree-walker's order.
+- R3 **Assignment as an EXPRESSION / chained assign** (`x = y = 5`) —
+  ✅ DONE (2026-07-14): a compile_boxed_expr `Expr14` case for a
+  resolved-LOCAL non-const id target dispatches the int/float/boxed
+  STATEMENT compilers, then yields the target's slot as the operand.
+  This exposed + fixed a RETARGET-GUARD bug: the plain-assign retarget
+  (`var a = <rvalue-op>` steals the op's dst) must require the op's
+  dst to be a TEMP (`rslot >= temp_base`) — without that,
+  `a = (b = [1,2])` retargeted b's MakeArrayV to a and b was never
+  assigned (a wrong result the suite missed; probe-caught).
 - R4 **Inc-dec with an IMPURE lvalue** (`a[f()]++` as value or statement:
-  `incdec_lvalue_pure` declines a side-effecting index).
+  `incdec_lvalue_pure` declines a side-effecting index) — the STATEMENT
+  form is native (IncDecElemCheckedV etc.); the VALUE form REMAINS the
+  one documented EvalStmt user besides show(): rare (a side-effecting
+  index inside an inc-dec used as a value), and the whole containing
+  statement falls back, byte-identical.
 
 **Live statement roots:**
 - R5 **Typed/const-target IdList destructure** (`int a; int b;
-  a, b = src` — MultiUnpackV declines coerced targets).
+  a, b = src`) — ✅ DONE (2026-07-14): `try_multi_unpack` now accepts
+  typed int/float targets; a per-target coerce vector (0/1/2 =
+  none/int/float) lives in the serializable **`Chunk::unpack_coerce`**
+  pool (parallel to `unpack_targets`, `Instr::b` indexes it) and the
+  MultiUnpackV handler runs `vm_coerce_decl_num` per store (the throw
+  stamps the loc side table — same TypeErrorEx + caret as the
+  tree-walker). The literal-eliding path still declines coerced
+  targets (they need the runtime widen), falling to MultiUnpackV.
 - R6 **`show()` under the -rt harness** (g_dev_builtins_allowed=true, so
   the differential compiles it; a SCRIPT compile-rejects it) — the ONE
   sanctioned EvalStmt consumer. It never has th==i/f (returns str), so
@@ -1052,6 +1079,24 @@ remains as THE single fallback op, reachable only by show()-in-tests
 (the REPL never compiles). Execution order: R1 coalesce → R2 chained
 cmp → R3 assign-expr → R5 typed IdList → R4 impure-lvalue inc-dec →
 the D deletions + op removal, each its own commit.
+
+**✅ EXECUTED (2026-07-14).** R1/R2/R3/R5 landed (above); R4's VALUE
+form stays a documented EvalStmt user (statement form native). The op
+removal is DONE: **`EvalToSlot` + `JumpIfFalse` are DELETED** (opcodes,
+handlers, disasm renders, `vm_eval_cond`, `eval_to_temp`, and the
+Phase-1 `gen_if`/`gen_while` flatten forms). The new decline behavior:
+an int/float builtin operand that can't lower **fails its expression**
+(no per-operand fallback op); an `if` whose condition can't compile
+fails `compile_native_if` → gen_stmt emits a **whole-if EvalStmt**; a
+`while` that can't lower natively is a **whole-while EvalStmt**; an
+uncompilable loop **init** (`emit_init` now returns bool) fails the
+whole loop the same way. So `EvalStmt` is THE single fallback op, and
+the only node-holding op left in any compiled chunk — reachable only by
+show()-in-tests, the R4 value form, and future gaps. Suite 1522/1522 +
+differential 1366/1366 green on g++/clang debug, RECYCLE+ASan, and
+release; bench/ + samples/ still lower with an EMPTY node_table. New
+codegen-shape tests pin R1/R2/R3/R5 (jinn/munpack counters) and the
+whole-statement fallback behavior (the R4-value probe).
 
 ### The wrong-result bug this audit caught (fixed, step 5 — recorded here
 ### because it is the method's poster child)

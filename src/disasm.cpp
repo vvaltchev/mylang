@@ -443,9 +443,6 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::EndFinally:
             row << "end.finally";
             break;
-        case OpCode::JumpIfFalse:
-            row << "jmp.ifnot    (" << node1(chunk.node_at_pc(pc)) << "), L" << in.target;
-            break;
         case OpCode::LoopBackEdge:
             row << "loop.back    cont=L" << in.target << " brk=L" << in.target2;
             break;
@@ -681,9 +678,6 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << " = " << RI(in.a, false);
             break;
         }
-        case OpCode::EvalToSlot:
-            row << "eval.slot    " << D(in.target) << " = " << node1(chunk.node_at_pc(pc));
-            break;
         case OpCode::CallBuiltinV:
             row << "call.blt.v   " << D(in.target) << " = "
                 << builtin_call_name(chunk, in.target2)
@@ -931,6 +925,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  " << D(in.target2) << ", L" << in.target;
+            break;
+        case OpCode::JumpIfNotNoneV:
+            row << "jmp.notnone  " << RI(in.a, false) << ", L" << in.target
+                << "   ; ?? short-circuit";
             break;
         case OpCode::Halt:
             row << "halt";

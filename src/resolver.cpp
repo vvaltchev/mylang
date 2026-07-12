@@ -460,8 +460,8 @@ private:
      * but NOT in the REPL, where it may be a live open-world map global. A
      * non-identifier arg (`defined(a[0])`, a rare misuse) is still left as a
      * runtime `defined()` call. Returns true iff it folded. Closes the
-     * AST-builtin fold gap that made `s + defined(p)` emit a VM EvalToSlot (see
-     * plans/vm-fallback-elimination.md).
+     * AST-builtin fold gap that made `s + defined(p)` emit a VM node
+     * fallback (see plans/vm-fallback-elimination.md).
      */
     bool try_fold_defined(unique_ptr<Construct> &slot, CallExpr *ce)
     {

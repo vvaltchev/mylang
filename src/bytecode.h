@@ -16,7 +16,7 @@
  * day one, and native opcodes replace the fallbacks one tested step at a time.
  *
  * Phase 0: EvalStmt + Halt. Phase 1 adds native control flow (Jump /
- * JumpIfFalse / LoopBackEdge). Phase 2 adds a REGISTER machine over the frame
+ * LoopBackEdge). Phase 2 adds a REGISTER machine over the frame
  * slots (the VM's registers ARE the resolved-local slots, so there is no value
  * stack) with native int ops (IntBin / JumpUnlessIntCmp) and fused
  * superinstructions, so a resolved-local int scalar loop runs with no
@@ -47,12 +47,6 @@ enum class OpCode : unsigned char {
 
     /* Unconditional jump: pc = `target`. */
     Jump,
-
-    /*
-     * Evaluate `node` as a condition (fallback: the same typed-or-boxed path as
-     * the tree-walker's eval_cond). If FALSE, pc = `target`; else fall through.
-     */
-    JumpIfFalse,
 
     /*
      * Placed right after a loop body; reads ctx->flow and branches, mirroring
@@ -448,25 +442,13 @@ enum class OpCode : unsigned char {
     DictLoadFloat,
 
     /*
-     * Evaluate a scalar-returning CALL (a builtin - via the baked
-     * DirectBuiltinCallExpr fn pointer - or a user function) into a temp slot
-     * as an RValue (Phase 5): `target` = the dst temp, `node` = the CallExpr.
-     * The result is then an ordinary int/float operand, so a loop body like
-     * `s += sqrt(i)` / `s += f(i)` goes native instead of falling back whole.
-     * The call still evaluates its own args (the builtin ABI takes the
-     * unevaluated ExprList) - a fully Construct*-free builtin dispatch (args
-     * pre-evaluated into slots) is later work.
-     */
-    EvalToSlot,
-
-    /*
      * Native BUILTIN call with the VALUE ABI (no node->eval): the args are
      * already evaluated into the register run [a.lit, a.lit+b.lit); `node` =
      * the DirectBuiltinCallExpr (its baked `builtin.func_v` + its args ExprList
      * for error locs); `target` = the dst slot. Copies the arg values into a
      * buffer and calls func_v. Emitted only for a builtin that HAS func_v (a
-     * migrated, read-only builtin); a mutating / AST / un-migrated one stays
-     * EvalToSlot.
+     * migrated, read-only builtin); a mutating / AST builtin takes another
+     * path (CallBuiltinLV* / EvalStmt).
      */
     CallBuiltinV,
 
@@ -511,7 +493,8 @@ enum class OpCode : unsigned char {
      * LValue* - and calls func_lv, which self-evaluates its remaining args. A
      * non-lvalue element (a flat scalar / read-only) gives a null target ->
      * NotLValueEx. Emitted for append/push/pop (self-eval, not rest-native)
-     * with a slotted-id base; a nested base / insert/erase stay EvalToSlot.
+     * with a slotted-id base; a nested base / insert/erase decline (the
+     * statement falls back whole).
      */
     CallBuiltinLVElem,
 
@@ -537,7 +520,7 @@ enum class OpCode : unsigned char {
      * NotCallableEx loc if the slot was reassigned to a non-function). Gathers
      * the arg values and calls vm_call_func -> do_func_call, which runs the
      * callee's body via its own chunk (Phase 4) or the tree-walker. Builtins
-     * (DirectBuiltinCallExpr) and struct constructors stay EvalToSlot/EvalStmt.
+     * (DirectBuiltinCallExpr) and struct constructors take their own ops.
      */
     CallV,
 
@@ -690,7 +673,7 @@ enum class OpCode : unsigned char {
      * bool->int), `plus` (`+` -> bool->int else no-op). Mirrors Expr02::do_eval
      * (clone the operand, apply). Type errors (`-str`, `~str`) stamp the loc
      * side table. This is what an `if (!x)` / `var b = !s` over a dyn/string
-     * operand lowers to (was a JumpIfFalse / EvalToSlot fallback).
+     * operand lowers to (was a node->eval fallback).
      */
     UnaryV,
 
@@ -715,7 +698,7 @@ enum class OpCode : unsigned char {
      * decl executes, true after). AST-free (the slot is known at codegen; never
      * throws). The always-bound cases (param/local/capture/builtin) fold to
      * `true` at resolve time (try_fold_defined); this native op is what keeps
-     * the ONE runtime `defined` case off the EvalToSlot fallback.
+     * the ONE runtime `defined` case native (no node->eval).
      */
     DefinedGlobalV,
 
@@ -915,6 +898,15 @@ enum class OpCode : unsigned char {
     JumpUnlessTrueV,
 
     /*
+     * Null-coalescing short-circuit: if slot[a] is NOT none, pc = target.
+     * `a ?? b` compiles to <lhs into dst> + this (skip the rhs) + <rhs into
+     * dst> - CoalesceExpr::do_eval's exact semantics (the rhs is never
+     * evaluated for a non-none lhs). A pure none test - never throws, so it
+     * is node/loc-free.
+     */
+    JumpIfNotNoneV,
+
+    /*
      * VM exceptions (P8 Inc 0). A `try/catch` (no finally) lowers to a handler
      * region; `throw` + runtime errors still go through the C++ boundary in
      * vm_run_chunk, which routes them into the handler stack. All AST-free
@@ -978,7 +970,7 @@ struct Instr {
      * (fallback / builtin-call / a store's caret); -1 == none. NO raw Construct*
      * in the Instr - that is what lets the bytecode be serialized. */
     int32_t node_idx = -1;
-    int target = -1;    /* Jump/JumpIfFalse dest; LoopBackEdge cont; IntBin dst
+    int target = -1;    /* Jump dest; LoopBackEdge cont; IntBin dst
                          * slot; JumpUnlessIntCmp jump dest */
     int target2 = -1;   /* LoopBackEdge exit dest */
     Op aop = Op::invalid;   /* IntBin: arith op; JumpUnlessIntCmp: compare op */
@@ -1253,6 +1245,16 @@ struct Chunk {
      * data (ints) - serializable. */
     std::vector<std::vector<int32_t>> unpack_targets;
 
+    /* Per-target numeric-coerce kinds for a TYPED MultiUnpackV destructure
+     * (`int a; float b; a, b = src` - R5): 0 = none, 1 = int, 2 = float,
+     * parallel to the unpack_targets entry. A PLAIN multi-assign coerces each
+     * stored element/spread value via coerce_to_decl_type (the widen /
+     * dyn-narrowing throw, caret = the Expr14 span from the loc side table);
+     * a COMPOUND does NOT coerce (op==assign only, like the single-var
+     * store - measured). `Instr::b` (an immediate) indexes this; absent
+     * (`!b.is_lit`) == no typed targets. Pure data - serializable. */
+    std::vector<std::vector<unsigned char>> unpack_coerce;
+
     /*
      * BUILTIN-CALL POOL (AST-free builtin dispatch). A value-ABI builtin call
      * (CallBuiltinV) needs only its Builtin (the baked func pointers) and the
@@ -1363,9 +1365,10 @@ struct Chunk {
      * ops, SAME shape/cost as `locs` / `inline_ctxs`: `{pc, Construct*}` sorted
      * by pc (build_node_table iterates pc-ascending), binary-searched by
      * `node_at_pc` ONLY on the cold path (a fallback's `node->eval`). The ONLY
-     * ops that still need the AST at runtime are the three fallback ops -
-     * EvalStmt / EvalToSlot / JumpIfFalse (`node->eval`); every native op is
-     * AST-free (F1 step 2 closed the last one, CallValueGenericV).
+     * op that still needs the AST at runtime is the ONE fallback op -
+     * EvalStmt (`node->eval`; EvalToSlot + JumpIfFalse are DELETED - every
+     * expression/condition either lowers or fails its whole statement to
+     * EvalStmt); every native op is AST-free.
      * A 100%-native chunk leaves this EMPTY - a non-empty `node_table` is EXACTLY
      * the "not yet fully serializable" signal (its `Construct*` is still an AST
      * pointer; a serializing backend keeps the AST or rejects the chunk). This

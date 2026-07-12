@@ -195,7 +195,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::SliceV:
     case OpCode::CallV:       case OpCode::CachedCallV:
     case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
-    case OpCode::EvalToSlot:  case OpCode::ArrLen:
+    case OpCode::ArrLen:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemValue: case OpCode::MakeArrayV:
     case OpCode::MakeDictV:      case OpCode::MakeClosureV:
@@ -578,13 +578,11 @@ struct Codegen {
         in.target2 = target2;
         chunk.code.push_back(in);
 #ifdef ML_DBG_FB
-        if ((op == OpCode::EvalStmt || op == OpCode::EvalToSlot
-             || op == OpCode::JumpIfFalse) && node && getenv("ML_DBG_FB")) {
+        if (op == OpCode::EvalStmt && node && getenv("ML_DBG_FB")) {
             std::string r = ::render_construct_code(node);
             if (r.size() > 78) r = r.substr(0, 75) + "...";
             fprintf(stderr, "FB %-13s | %s\n",
-                    op == OpCode::EvalStmt ? "EvalStmt"
-                    : op == OpCode::EvalToSlot ? "EvalToSlot" : "JumpIfFalse",
+                    "EvalStmt",
                     r.c_str());
         }
 #endif
@@ -703,27 +701,27 @@ struct Codegen {
      * store) when it is a resolved-local scalar decl, else a fallback EvalStmt.
      * Native-izing the once-run init doesn't speed the loop, but it keeps the
      * `i = start` off the tree-walker and reads cleanly in the disassembly. */
-    void emit_init(const Construct *init)
+    bool emit_init(const Construct *init)
     {
         reset_temps();
         const size_t mark = chunk.code.size();
         if (compile_int_stmt(init, chunk.code))
-            return;
+            return true;
         chunk.code.resize(mark);
         reset_temps();
         if (compile_float_stmt(init, chunk.code))
-            return;
+            return true;
         chunk.code.resize(mark);
         reset_temps();
         /* Boxed decl-init: `var k = i` (an int/bool leaf, or a dyn/string
          * value) - the int path rejects a bare identifier rhs (it can't prove
          * int-not-bool for a raw int store), but a boxed move preserves the
-         * rhs's real type. Runs ONCE per loop entry; keeps a var-initialized
-         * for-loop off the EvalStmt fallback. */
+         * rhs's real type. An UNCOMPILABLE init (exotic) fails the whole
+         * loop to the statement-level EvalStmt - no per-init fallback op. */
         if (compile_boxed_stmt(init, chunk.code))
-            return;
+            return true;
         chunk.code.resize(mark);
-        emit(OpCode::EvalStmt, init);
+        return false;
     }
 
     int add_const(const EvalValue &v)
@@ -1398,6 +1396,84 @@ struct Codegen {
             return true;
         }
 
+        /* Null-coalescing `a ?? b` as a VALUE (R1 of the Tier-1 endgame):
+         * evaluate the lhs into `dst`; a NON-none lhs skips the rhs entirely
+         * (the short-circuit - CoalesceExpr::do_eval's exact semantics, the
+         * rhs never evaluated); else the rhs lands in `dst`. `dst` is
+         * reserved below both sides' scratch, like the ternary.
+         * JumpIfNotNoneV is a pure none test - no node, no loc. */
+        if (const CoalesceExpr *co = dynamic_cast<const CoalesceExpr *>(e)) {
+            const size_t mark = ops.size();
+            const int save_top = next_temp;
+            const int dst = alloc_temp();
+            const int scratch = next_temp;
+
+            int lslot;
+            if (!compile_boxed_expr(co->lhs.get(), lslot, ops)) {
+                ops.resize(mark); next_temp = save_top; return false;
+            }
+            Instr mvl;
+            mvl.op = OpCode::MoveV; mvl.target = dst; mvl.target2 = lslot;
+            ops.push_back(mvl);
+            Instr jn;
+            jn.op = OpCode::JumpIfNotNoneV;
+            jn.a = slot_op(dst);
+            const size_t jn_i = ops.size();
+            ops.push_back(jn);
+            next_temp = scratch;
+
+            int rslot;
+            if (!compile_boxed_expr(co->rhs.get(), rslot, ops)) {
+                ops.resize(mark); next_temp = save_top; return false;
+            }
+            Instr mvr;
+            mvr.op = OpCode::MoveV; mvr.target = dst; mvr.target2 = rslot;
+            ops.push_back(mvr);
+            next_temp = scratch;
+
+            ops[jn_i].target = static_cast<int>(ops.size());   /* merge */
+            out_slot = dst;
+            return true;
+        }
+
+        /* An ASSIGNMENT as an EXPRESSION (`x = y = 5`, `var z = (q += 7)` -
+         * R3 of the Tier-1 endgame): compile the assignment via the ordinary
+         * STATEMENT dispatch (int/float/boxed - the same three tiers
+         * gen_stmt uses), then the expression's value is the target's stored
+         * value: Expr14::do_eval returns the (coerced) rval, and after the
+         * store a LOCAL target's slot holds exactly that - the same handle
+         * for a container, so aliasing (`a = (b = [1,2])`, same intptr) is
+         * identical. Only a resolved-LOCAL identifier target; a global/
+         * capture/IdList target declines (the readback would need an extra
+         * load - rare shapes). */
+        if (const Expr14 *e14 = dynamic_cast<const Expr14 *>(e)) {
+            const Identifier *lv =
+                dynamic_cast<const Identifier *>(e14->lvalue.get());
+            if (!lv || lv->sym.kind != SymKind::local || lv->is_const)
+                return false;
+            const size_t mark = ops.size();
+            const int save_top = next_temp;
+            if (compile_int_stmt(e14, ops)) {
+                out_slot = lv->sym.slot;
+                return true;
+            }
+            ops.resize(mark);
+            next_temp = save_top;
+            if (compile_float_stmt(e14, ops)) {
+                out_slot = lv->sym.slot;
+                return true;
+            }
+            ops.resize(mark);
+            next_temp = save_top;
+            if (compile_boxed_stmt(e14, ops)) {
+                out_slot = lv->sym.slot;
+                return true;
+            }
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+
         /* An arith (`a+b`) / comparison (`a<b`) / logical (`a&&b`) chain, as a
          * raw ExprNN OR a TypedScalarExpr - `A && B` of comparisons specializes
          * to a logical even when the comparisons are boxed over a dyn operand,
@@ -1473,8 +1549,6 @@ struct Codegen {
         char k, const Construct *node, int &out_slot, std::vector<Instr> &ops)
     {
         if (elems.empty() || elems[0].first != Op::invalid)
-            return false;
-        if (k == 'c' && elems.size() != 2)   /* only a 2-operand comparison */
             return false;
         for (size_t i = 1; i < elems.size(); i++) {
             const Op op = elems[i].first;
@@ -1675,13 +1749,20 @@ struct Codegen {
         const size_t n = il->elems.size();
         if (n == 0)
             return false;
+        bool any_coerce = false;
         for (const auto &t : il->elems) {
             if (t->is_underscore())
                 continue;               /* `_` is a skipped slot */
-            if (t->sym.kind != SymKind::local || t->is_const
-                || (t->decl_type != DeclType::none
-                    && t->decl_type != DeclType::dyn))
+            if (t->sym.kind != SymKind::local || t->is_const)
                 return false;
+            /* A typed int/float target coerces per stored value on a PLAIN
+             * assign (R5); every other declared type is a no-op coerce. A
+             * COMPOUND doesn't coerce (op==assign only - measured), so its
+             * typed targets lower as-is. */
+            if (compound_op == Op::invalid
+                && (t->decl_type == DeclType::i
+                    || t->decl_type == DeclType::f))
+                any_coerce = true;
         }
 
         const size_t omark = ops.size();
@@ -1710,6 +1791,18 @@ struct Codegen {
         in.a = slot_op(rslot);
         in.target = static_cast<int>(chunk.unpack_targets.size());
         chunk.unpack_targets.push_back(std::move(targets));
+        if (any_coerce) {
+            std::vector<unsigned char> kinds;
+            kinds.reserve(n);
+            for (const auto &t : il->elems)
+                kinds.push_back(
+                    t->is_underscore()               ? 0
+                    : t->decl_type == DeclType::i    ? 1
+                    : t->decl_type == DeclType::f    ? 2
+                                                     : 0);
+            in.b = int_lit(static_cast<int>(chunk.unpack_coerce.size()));
+            chunk.unpack_coerce.push_back(std::move(kinds));
+        }
         ops.push_back(in);
 
         next_temp = save_top;
@@ -2072,8 +2165,14 @@ struct Codegen {
              * an op THIS statement emitted (ops grew past omark). A LEAF rvalue
              * (a bare local) emits no op, so ops.back() would be the PREVIOUS
              * statement's op - retargeting it would corrupt it (the `var t = s`
-             * bug). A leaf falls to MoveV. */
-            if (ops.size() > omark && ops.back().target == rslot
+             * bug). A leaf falls to MoveV. And ONLY a TEMP result
+             * (rslot >= temp_base, like compile_to_run_slot's guard): an
+             * assignment-as-expression (`a = (b = [1,2])`, R3) produces the
+             * INNER TARGET's local slot with its store as ops.back() -
+             * retargeting that would STEAL b's store (b never assigned; the
+             * probe caught it as an intptr aliasing divergence). */
+            if (ops.size() > omark && rslot >= temp_base
+                && ops.back().target == rslot
                 && (ops.back().op == OpCode::BinOpV
                     || ops.back().op == OpCode::LoadConstV
                     || ops.back().op == OpCode::LoadLiteralObjV
@@ -2138,26 +2237,13 @@ struct Codegen {
         return true;
     }
 
-    /* Emit EvalToSlot{temp = node->eval}, returning the temp as an operand, so
-     * a scalar-result call becomes a native int/float operand. */
-    Operand eval_to_temp(const Construct *e, std::vector<Instr> &ops)
-    {
-        const int t = alloc_temp();
-        Instr in;
-        in.op = OpCode::EvalToSlot;
-        in.node_idx = add_ast_node(e);
-        in.target = t;
-        ops.push_back(in);
-        return slot_op(t);
-    }
-
     /*
      * Native user-function call `dst = f(args...)` -> CallV: evaluate each arg
      * into a contiguous register run [argbase, argbase+n), then one CallV that
      * gathers those values and calls do_func_call (no node->eval of the call).
      * Only a DirectCallExpr the inferencer proved a user function
      * (vm_direct_func); an arg compile_boxed_expr can't lower (a nested call, a
-     * complex expression) rolls the whole call back to the EvalStmt/EvalToSlot
+     * complex expression) rolls the whole call back to the EvalStmt
      * fallback. Args are evaluated left-to-right, once each.
      */
     /* Evaluate a call's args into a fresh contiguous register run
@@ -2433,13 +2519,13 @@ struct Codegen {
 
     /* Native builtin call -> CallBuiltinV, but only for a builtin with the
      * VALUE ABI (func_v is set - a migrated, read-only builtin); a mutating /
-     * AST / un-migrated builtin stays the EvalToSlot fallback. */
+     * AST builtin declines (its call site falls back whole). */
     /* `defined(g)` where `g` is a GLOBAL-table symbol -> DefinedGlobalV (reads
      * gfuncs->defined[slot], the genuine runtime property). The always-bound
      * cases (param/local/capture/builtin) already folded to `true` at resolve
      * time (try_fold_defined), so the only `defined` call reaching codegen has a
      * global (or an unresolved / non-identifier) arg; a non-global one declines
-     * here and falls to the EvalToSlot fallback. AST-free (the slot is known;
+     * here (the call site falls back whole). AST-free (the slot is known;
      * never throws). */
     bool try_native_defined_global(const DirectBuiltinCallExpr *dc,
                                    int &out_slot, std::vector<Instr> &ops)
@@ -2588,8 +2674,8 @@ struct Codegen {
      * slotted identifier (local/global/capture) - the common `append(a, x)`
      * form. The value args are NOT compiled here: func_lv self-evaluates them,
      * which is what keeps append's construct-in-place fast path (it needs the
-     * arg node). A subscript/member/other arg0 (or an unresolved one) falls
-     * back to EvalToSlot - Phase 2 will nativize those lvalue targets. */
+     * arg node). A subscript/member/other arg0 (or an unresolved one)
+     * declines - the whole statement falls back. */
     bool try_native_mutating_builtin(const DirectBuiltinCallExpr *dc,
                                      int &out_slot, std::vector<Instr> &ops)
     {
@@ -2604,8 +2690,8 @@ struct Codegen {
          * walker's exact COW - then func_lv gets the value via rest, no
          * self-eval): `b` = the run base, run[0] = the index, run[1..] = the
          * values (append/push have 1, pop has 0). Needs a slotted-id base + all
-         * args to lower; a nested base / non-lowerable arg falls through to
-         * EvalToSlot. */
+         * args to lower; a nested base / non-lowerable arg declines (the
+         * statement falls back whole). */
         if (!dc->lvalue_rest_native && !a0->is_id()) {
             if (auto *sub = dynamic_cast<const Subscript *>(a0)) {
                 const Construct *base = sub->what.get();
@@ -2825,7 +2911,8 @@ struct Codegen {
             /* Pre-evaluate the value(s) PER-OP. A rest-capable builtin
              * (append/push/sort/rev_sort) must NEVER become a self-eval
              * CallBuiltinLV - its func_lv is rest-native-only (no node). So two
-             * cases fall back to the tree-walker (EvalToSlot) instead: (a) arg1
+             * cases fall back to the tree-walker (whole-statement)
+             * instead: (a) arg1
              * is a struct ctor whose EmplaceStruct fell through - append_tw does
              * the construct-in-place there; (b) a value/cmp that doesn't lower to
              * a register run. Otherwise it's rest-native. */
@@ -2833,9 +2920,9 @@ struct Codegen {
                 ? dynamic_cast<const CallExpr *>(dc->args->elems[1].get())
                 : nullptr;
             if (ctor && ctor->vm_struct_ctor_def)
-                return false;   /* ctor-fallthrough -> EvalToSlot (append_tw) */
+                return false; /* ctor-fallthrough -> tree-walker append_tw */
             if (!emit_args_range(dc->args->elems, restbase, ops, 1))
-                return false;   /* didn't lower -> EvalToSlot (no self-eval) */
+                return false;   /* didn't lower -> tree-walker (no self-eval) */
             rest_op = true;
         }
 
@@ -3195,9 +3282,9 @@ struct Codegen {
             return true;
         }
 
-        /* A scalar-result BUILTIN call -> eval into a temp; the result is then
-         * a native int operand. Builtins ONLY: a builtin is cheap, so the
-         * loop-nativization it enables outweighs the EvalToSlot box/unbox. A
+        /* A scalar-result BUILTIN call -> CallBuiltinV into a temp; the
+         * result is then a native int operand. Builtins ONLY: a builtin is
+         * cheap, so the loop-nativization it enables outweighs the boxing. A
          * user call whose body is tree-walked (a closure) would only add the
          * boxing on top of the call (see 11_closure_counter); a cheap/inlinable
          * user call (`func f(x)=>x+1`) is already inlined away. */
@@ -3207,11 +3294,15 @@ struct Codegen {
                 int t;
                 if (try_native_defined_global(bc, t, ops)   /* defined(global) */
                         || try_native_defined_expr(bc, t, ops)
-                        || try_native_builtin(bc, t, ops))  /* value ABI */
+                        || try_native_builtin(bc, t, ops)) { /* value ABI */
                     out = slot_op(t);
-                else
-                    out = eval_to_temp(e, ops);        /* old ABI fallback */
-                return true;
+                    return true;
+                }
+                /* An unliftable builtin call (a nested lvalue arg0, an arg
+                 * that can't lower): decline - the statement-level dispatch
+                 * falls back whole (EvalToSlot is gone; every live builtin
+                 * is value/lvalue-native, so this residue is exotic). */
+                return false;
             }
 
         /* An int-returning native user-function call -> CallV, its result an
@@ -3968,17 +4059,18 @@ struct Codegen {
             return true;
         }
 
-        /* A scalar-result BUILTIN call -> CallBuiltinV (value ABI) or eval into
-         * a temp (old ABI); the result is a native float operand. */
+        /* A scalar-result BUILTIN call -> CallBuiltinV (value ABI); the
+         * result is a native float operand. An unliftable one declines
+         * (EvalToSlot is gone - the statement falls back whole). */
         if (e->th == TypeHint::f)
             if (const DirectBuiltinCallExpr *bc =
                     dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
                 int t;
-                if (try_native_builtin(bc, t, ops))
+                if (try_native_builtin(bc, t, ops)) {
                     out = slot_op(t);
-                else
-                    out = eval_to_temp(e, ops);
-                return true;
+                    return true;
+                }
+                return false;
             }
 
         /* A float-returning native user-function call -> CallV. */
@@ -4522,8 +4614,9 @@ struct Codegen {
     /*
      * An `if` inside a native body -> jumps, with native then/else. The
      * condition is a native int/float compare (JumpUnless*Cmp -> Lelse when
-     * false) when it is one, else a fallback JumpIfFalse{cond} (eval_cond) - so
-     * `if (flag)` / `if (a[i])` work too. Self-truncating like the loops.
+     * false) when it is one, else a boxed JumpUnlessTrueV - so `if (flag)` /
+     * `if (a[i])` work too. An uncompilable condition fails the whole `if`
+     * (no per-cond fallback op). Self-truncating like the loops.
      */
     bool compile_native_if(const IfStmt *f)
     {
@@ -4546,8 +4639,8 @@ struct Codegen {
                 chunk.code.resize(start);
                 reset_temps();
                 int cslot;
-                /* BOXED condition -> compute a bool slot + branch-unless-true;
-                 * else the tree-walker cond (JumpIfFalse). */
+                /* BOXED condition -> compute a bool slot + branch-unless-
+                 * true; the last resort before failing the whole `if`. */
                 if (compile_boxed_expr(f->condExpr.get(), cslot, chunk.code)) {
                     Instr in;
                     in.op = OpCode::JumpUnlessTrueV;
@@ -4556,8 +4649,12 @@ struct Codegen {
                     jf = chunk.code.size();
                     chunk.code.push_back(in);
                 } else {
+                    /* an uncompilable cond (exotic: show()-in-tests, an
+                     * impure-lvalue inc-dec value): fail the whole `if` -
+                     * the statement-level EvalStmt handles it (JumpIfFalse
+                     * is gone). */
                     chunk.code.resize(start);
-                    jf = emit(OpCode::JumpIfFalse, f->condExpr.get());
+                    return false;
                 }
             }
         }
@@ -4729,8 +4826,8 @@ struct Codegen {
      *           <body ops> Jump Lstart ; Lend:
      * Fires when the condition is an int/float comparison and every body
      * statement compiles (scalar / nested loop / if). Self-truncating: any
-     * failure resizes chunk.code back to the start and returns false (-> the
-     * Phase 1 fallback in gen_while, or the enclosing body falls back).
+     * failure resizes chunk.code back to the start and returns false (-> a
+     * whole-statement EvalStmt, or the enclosing body falls back).
      */
     bool try_native_scalar_while(const WhileStmt *w)
     {
@@ -4781,7 +4878,11 @@ struct Codegen {
          * with drop popping x) - compiling the bound first evaluated it
          * BEFORE the init, a real wrong-result -vm divergence (pinned by the
          * "for-range evaluates init before the bound" test). */
-        emit_init(f->init.get());
+        if (!emit_init(f->init.get())) {
+            chunk.code.resize(start);
+            temp_base = saved_base;
+            return false;
+        }
 
         /* The bound + step are loop-immutable (the for-range specializer proved
          * it), so evaluate ONCE - after the init. A simple int operand (a slot
@@ -4874,8 +4975,10 @@ struct Codegen {
     {
         const size_t start = chunk.code.size();
 
-        if (f->init)
-            emit_init(f->init.get());                /* declare the var, once */
+        if (f->init && !emit_init(f->init.get())) { /* declare the var, once */
+            chunk.code.resize(start);
+            return false;
+        }
 
         const int lstart = here();
 
@@ -5656,7 +5759,8 @@ struct Codegen {
          * function-body statements, not only loop bodies. A resolved-local
          * int/float scalar decl/assign/`++`/compound-assign lowers to register
          * ops; an `if` with a native compare condition + native branches lowers
-         * to compares/jumps (compile_native_if, else fallback gen_if); a loop
+         * to compares/jumps (compile_native_if, else a whole-if EvalStmt);
+         * a loop
          * tries its native form. Anything else - a return, a call, a complex
          * expression - stays a fallback EvalStmt (tree-walked). Each attempt is
          * self-truncating (resets to `mark` on failure). This is what makes a
@@ -5676,14 +5780,15 @@ struct Codegen {
         chunk.code.resize(mark);
 
         if (const IfStmt *f = dynamic_cast<const IfStmt *>(s)) {
-            if (compile_native_if(f))
-                return;
-            chunk.code.resize(mark);
-            gen_if(f);
+            if (!compile_native_if(f)) {
+                chunk.code.resize(mark);
+                emit(OpCode::EvalStmt, s);   /* whole-if fallback (rare) */
+            }
             return;
         }
         if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
-            gen_while(w);
+            if (!try_native_scalar_while(w))
+                emit(OpCode::EvalStmt, s);   /* whole-while fallback (rare) */
             return;
         }
         if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
@@ -5837,42 +5942,6 @@ struct Codegen {
         emit(OpCode::EvalStmt, s);
     }
 
-    void gen_if(const IfStmt *f)
-    {
-        /* JumpIfFalse cond -> Lelse ; then ; Jump Lend ; Lelse: else ; Lend: */
-        const size_t jf = emit(OpCode::JumpIfFalse, f->condExpr.get());
-
-        if (f->thenBlock)
-            emit(OpCode::EvalStmt, f->thenBlock.get());
-
-        if (f->elseBlock) {
-            const size_t j = emit(OpCode::Jump);
-            chunk.code[jf].target = here();          /* Lelse */
-            emit(OpCode::EvalStmt, f->elseBlock.get());
-            chunk.code[j].target = here();           /* Lend */
-        } else {
-            chunk.code[jf].target = here();          /* Lend */
-        }
-    }
-
-    void gen_while(const WhileStmt *w)
-    {
-        if (try_native_scalar_while(w))    /* Phase 2 register fast path */
-            return;
-
-        /* Phase 1 fallback: Lstart JumpIfFalse cond->Lend body LoopBackEdge */
-        const int lstart = here();
-        const size_t jf = emit(OpCode::JumpIfFalse, w->condExpr.get());
-
-        if (w->body)
-            emit(OpCode::EvalStmt, w->body.get());
-
-        const size_t be = emit(OpCode::LoopBackEdge, nullptr, lstart);
-
-        const int lend = here();
-        chunk.code[jf].target = lend;
-        chunk.code[be].target2 = lend;
-    }
 };
 
 /*
@@ -6026,8 +6095,6 @@ static void extract_locs(Chunk &chunk)
             break;
         }
         case OpCode::EvalStmt:
-        case OpCode::EvalToSlot:
-        case OpCode::JumpIfFalse:
             break;
         default:
             in.node_idx = -1;
@@ -6173,13 +6240,13 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
     Chunk ck = codegen_chunk(body, fn->frame_size);
 
     /* Keep the chunk iff it has at least one REAL op - anything that is not a
-     * pure fallback (EvalStmt) or control-flow op (JumpIfFalse / Jump /
+     * pure fallback (EvalStmt) or control-flow op (Jump /
      * LoopBackEdge / Halt). An all-fallback body gains nothing from the VM (an
      * EvalStmt is `node->eval`, same as the tree-walker, plus dispatch), so it
      * stays tree-walked; a body of native calls / stores / loads (which has no
      * arith/loop op) still compiles. */
     for (const Instr &in : ck.code)
-        if (in.op != OpCode::EvalStmt && in.op != OpCode::JumpIfFalse
+        if (in.op != OpCode::EvalStmt
             && in.op != OpCode::Jump && in.op != OpCode::LoopBackEdge
             && in.op != OpCode::Halt) {
             out = std::move(ck);

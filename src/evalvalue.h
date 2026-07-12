@@ -61,13 +61,13 @@ struct ArgLocs {
  * repr hint it used to reach through the arg nodes (built by the tree-walker
  * adapter from the ExprList, by the VM from a serializable Chunk pool - so a
  * value-ABI builtin holds NO AST pointer). It is non-null only for a migrated,
- * read-only builtin; the VM's CallBuiltinV uses it, else it falls back to
- * `func` via EvalToSlot. A MUTATING
+ * read-only builtin; the VM's CallBuiltinV uses it. A MUTATING
  * builtin (append/pop/...) uses the `func_lv` form below instead (arg0 is an
  * lvalue); an AST builtin (defined/type) needs the arg node, so it keeps the
- * union null and stays a fallback. For a migrated builtin `func` is a generic
- * adapter (make_const_builtin_v / make_builtin_lv) that prepares the args and
- * calls the native form - so the two engines share one implementation.
+ * union null (its call site falls back whole). For a migrated builtin
+ * `func` is a generic adapter (make_const_builtin_v / make_builtin_lv) that
+ * prepares the args and calls the native form - so the two engines share
+ * one implementation.
  */
 struct Builtin {
     EvalValue (*func)(EvalContext *, ExprList *);
