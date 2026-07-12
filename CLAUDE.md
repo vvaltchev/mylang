@@ -3882,13 +3882,14 @@ chain is FLATTENED into the **`Chunk::inline_frames`** pool — each entry pure
 data (`callee_name` + `params` + `call_site` loc + a **parent index** into the
 same pool, `-1` == root; a parent always has a lower index) — and the side table
 maps `pc → a pool index`. `intern_inline_ctx` (codegen) flattens each op's chain
-in `extract_locs`, deduping shared chains via a memo (interning the parent first,
-so the pool is topologically ordered); `vm_flush_inline` walks the pool by parent
-index, pushing the SAME `BacktraceFrame`s a tree-walker `flush_inline_frames`
-over the `InlineCtx` chain would (byte-identical, single AND nested/recursion-
-unroll inlines). This is the analogue of the `chain_locs` per-step-loc pool — the
-last non-`locs` side table off the AST. (The tree-walker still uses the
-`InlineCtx*`-based `flush_inline_frames` directly, from `node->inline_ctx`.)
+in `extract_locs`, deduping shared chains via a memo (interning the parent
+first, so the pool is topologically ordered); `vm_flush_inline` walks the pool
+by parent index, pushing the SAME `BacktraceFrame`s a tree-walker
+`flush_inline_frames` over the `InlineCtx` chain would (byte-identical, single
+AND nested/recursion-unroll inlines). This is the analogue of the `chain_locs`
+per-step-loc pool — the last non-`locs` side table off the AST. (The tree-walker
+still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
+`node->inline_ctx`.)
 
 **The disassembler dumps the WHOLE serializable image, not just funcs
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
