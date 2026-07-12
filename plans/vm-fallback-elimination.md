@@ -483,6 +483,23 @@ real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
   `CallValueV`. -rt EvalStmt 85→83. The rest of the -rt error-ish inventory
   (`nonexistent=5`, `map(lambda,a)`, `P(1)` arity, `Point("s",2)`) reproduces
   NATIVE / compile-error standalone — context-only fallbacks, not constructs.
+
+  **(e) niche STATEMENTS (2026-07-13, DONE the clean set).** Nativized: an
+  **inc-dec STATEMENT on an int/float member/nested subscript** (`p.x++`,
+  `a[i][j]++` == `lvalue += 1` → StoreMemberV / DictStore / StoreElem2V; gated
+  on a proven int/float `th`, so a dyn field falls back — inc-dec is int/float-
+  only, `d++` on a string throws but `+= 1` would concat); its **VALUE form**
+  (`o = p.x++`, `incdec_lvalue_pure` widened to member/nested); a **whole-`p`
+  flat-struct-array `foreach`** (**`LoadStructElemV`** materializes a fresh
+  StructObject per iteration — byte-identical to the tree-walker's reused-object
+  bind, since its COW guard only avoids overwriting a captured/stored element;
+  scalar-field bodies keep the direct read); a **compound multi-target assign**
+  (`a, b += rhs` — `MultiUnpackV` gained a base op: read each target, apply,
+  write back, `_` skipped). **STILL fallback** (harder/rarer): `append` to a
+  MEMBER (`append(s.f, x)` — a member LValue), a ≥3-level / member-subscript-
+  member nested store (`c[0][0][0]=v`, `d.a[0].f=v`), a dyn/member inc-dec
+  statement, a `_`-in-unpack `foreach` (needs a per-position slot map, not
+  consecutive), a 3-var dict `foreach`. NONE in bench/ or samples/ (all native).
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then

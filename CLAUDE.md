@@ -3712,10 +3712,28 @@ construct, else `NotCallableEx`). `extract_locs` records the op's CALL-SITE loc
 (for a FuncObject body's backtrace) WHILE keeping the node — the one op that
 does both. A Func-TYPED callee still uses the leaner register-run `CallValueV`.
 
-**Residual `EvalStmt`:** a few **niche** real shapes (a member/dyn inc-dec
-statement, a ≥3-level nested store, a whole-`p` struct-array `foreach`); the
-**`InlinedCallExpr`** block form; and the dev-only **`show`** (script-excluded
-by `reject_dev_builtins`, so never in serialized bytecode).
+**Niche STATEMENTS → native (a further sweep).** Several residual real shapes
+went native: an **inc-dec STATEMENT on an int/float member/nested subscript**
+(`p.x++`, `a[i][j]++` == the compound store `lvalue += 1`, via
+compile_int_stmt's IncDecExpr handler → StoreMemberV / DictStore / StoreElem2V;
+gated on a PROVEN int/float lvalue — inc-dec is int/float-only, so a dyn field
+falls back), the **VALUE form** of those (`o = p.x++` — `incdec_lvalue_pure`
+widened to a member/nested lvalue), a **whole-`p` flat-struct-array `foreach`**
+(`foreach (var p in a)` using `p` as a value — **`LoadStructElemV`**
+materializes a fresh StructObject per iteration, byte-identical to the
+tree-walker's reused-object bind, so `append(o, p)` / `q = p` go native;
+scalar-field-only bodies keep the faster direct read), and a **compound
+multi-target assign** (`a, b += rhs` — `MultiUnpackV` gained a base op: each
+target reads its current value, applies the op with its element/scalar, writes
+back). A **dyn** inc-dec (any lvalue) stays on the fallback (the int/float-only
+runtime check).
+
+**Residual `EvalStmt`:** the harder niche shapes (an `append` to a struct MEMBER
+`append(s.f, x)`, a ≥3-level / member-subscript-member nested store
+`c[0][0][0]=v` / `d.a[0].f=v`, a dyn/member inc-dec statement, a `_`-in-unpack /
+3-var dict `foreach`); the **`InlinedCallExpr`** block form; and the dev-only
+**`show`** (script-excluded by `reject_dev_builtins`, so never in serialized
+bytecode). None appear in `bench/` or `samples/` (both stay 100% native).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index
