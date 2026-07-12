@@ -657,6 +657,133 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
   before). `node_table` is now the LAST non-serializable side table (the audit
   signal for a `.myv` writer).
 
+## ⛔ THE COMPLETE AST-RETENTION INVENTORY (2026-07-13, code-derived)
+
+Supersedes the canonical list above for the ZERO-AST goal. Compiled by reading
+every codegen dispatch path (no `-vd`, no `ML_DBG_FB`). A `-vm` script retains
+AST in FOUR tiers, not just the fallback-op list — all four must reach zero for
+`.myv`. Codegen input is always SCRIPT-mode trees (the REPL never calls
+codegen; `-rt`'s differential runs `check()` in script mode), so every
+reachable path below is script-reachable unless proven otherwise.
+
+### Tier 1 — fallback-op EMIT SITES in codegen.cpp (re-enter the tree-walker)
+
+1. **`emit_init`:726 → EvalStmt** — loop init failing int+float+boxed stmt
+   compile (a typed i/f decl fed dyn; an rhs `compile_boxed_expr` declines).
+2. **`eval_to_temp`:2086 → EvalToSlot**, from `compile_int_expr`:2952 /
+   `compile_float_expr`:3719 — a `th==i/f` `DirectBuiltinCallExpr` failing
+   `try_native_builtin`: an AST-ABI builtin (`defined(a[0])` — non-identifier
+   arg), or `emit_args_range` failing on an arg.
+3. **`compile_scalar_body`:4240 → EvalStmt** — a flow-free Expr14/CallExpr/
+   Return/Throw inside a native region that every native path declined (each
+   such shape is itself one of the residues here; the mechanism keeps the
+   loop native around it).
+4. **`compile_native_if`:4298 → JumpIfFalse** — an `if` cond failing
+   int+float+boxed compile (`if (defined(a[0]))` …).
+5. **`gen_stmt`:5404 → EvalStmt** — ForRangeStmt declined: bound not an int
+   operand AND not boxed-compilable; a loop-immutable but NON-OPERAND step
+   (`i += a[j]` — `as_int_operand` only, no temp path); body failure.
+6. **`gen_stmt`:5409 → EvalStmt** — ForStmt declined: NO cond (`for(;;)`);
+   cond failing `emit_cond_jumps`; an inc that only compiles BOXED
+   (`s += "x"` — int+float tried only); body failure.
+7. **`gen_stmt`:5419 → EvalStmt** — Foreach: all six handlers decline
+   (indexed dyn container, >2-var dyn, container not proven
+   array/str/dict/dyn e.g. `opt`, non-local vars, body failure).
+8. **`gen_stmt`:5542 → EvalStmt** — the catch-all: typed i/f decl fed dyn;
+   `d?.f++`; bare `defined(a[0]);`; InlinedCallExpr w/ a return crossing an
+   inner try; a NON-scope-free standalone Block; a FuncDeclStmt bound to a
+   LOCAL slot (top-level `func f[cap]`); IdList destructure w/ a typed/const
+   target; Return/Throw/Try declines.
+9. **`gen_if`:5548/5551/5556 → JumpIfFalse + EvalStmt×2** — reached only
+   when `compile_native_if` failed (= a BRANCH failed `compile_scalar_body`);
+   then the whole cond + both branch Blocks fall back.
+10. **`gen_while`:5570/5573 → JumpIfFalse + EvalStmt** — reached when
+    `try_native_scalar_while` failed (cond or body); the whole cond + body
+    fall back.
+
+Notes: `compile_native_try` itself declines ONLY on (a) a non-slot catch var
+(REPL-only — script catch vars are always frame slots) or (b) a body/catch/
+finally `compile_scalar_body` failure (recursive residue). `break`/`continue`
+crossing NESTED trys (`emit_break_cont` false) and a `return` crossing >1 try /
+any finally fail the enclosing body (→ sites 5/6/10). Sites 9/10 are STRUCTURAL
+waste even before full elimination: they fall back the WHOLE branch/body where
+per-statement dispatch (the `gen_stmt` catch-all granularity) would keep the
+compilable statements native.
+
+### Tier 2 — native ops KEEPING a `Construct*` at runtime (node_table)
+
+Exactly the `extract_locs` KEEP list + `build_node_table` survivors (verified
+against every `node_at_pc` consumer in vm.cpp):
+
+1. `EvalStmt` / `EvalToSlot` / `JumpIfFalse` — the Tier-1 ops themselves.
+2. **`EmplaceStruct`** — vm.cpp:2001. Node uses (vm_emplace_struct, eval.cpp):
+   `ctor->vm_struct_ctor_def` (→ struct_defs pool), `arg0->start/end`
+   (container caret), `cargs->elems[i]->start/end` (per-field coerce carets).
+   ALL pure data → poolable (the `boxed_ctors` `{def, ArgLoc[]}` shape). The
+   ONLY node in all of `bench/` + `samples/`.
+3. **`IncDecElemCheckedV`** — vm.cpp:975. Node uses: the Subscript child's
+   `start/end` + the IncDecExpr's `start/end` (dual carets). Pure data →
+   poolable (a dual-loc entry).
+4. **`IncDecMemberCheckedV`** — vm.cpp:994. Same + the member uid. Poolable.
+5. **`CallValueGenericV`** — vm.cpp:2205. The CallExpr node feeds
+   `dispatch_call_value`: a DYN callee may resolve to a Builtin whose ABI takes
+   the UNEVALUATED `ExprList` (`defined`/`isconst`/`decltype` need lazy args;
+   an lvalue builtin needs arg0 as an LVALUE). NOT poolable as-is — a genuine
+   DESIGN FORK (see Tier 4 notes / the fork list).
+
+### Tier 3 — whole bodies with NO chunk (100% tree-walked, coarser than any op)
+
+From `codegen_func_body`'s gates (codegen.cpp:5859):
+1. **Non-scope-free function bodies** (`!body->scope_free`: a capturing
+   closure / nested named func / slot overflow in the body) — the WHOLE
+   function runs `do_eval`. The body-level twin of the non-scope-free Block.
+2. **Expression-bodied functions** (`!fn->body->is_block()`) — e.g. a
+   non-inlined `func [c](x) => x + c` closure body. No chunk.
+3. The **all-fallback gate** (no REAL op → no chunk) — self-erasing once
+   Tier 1 empties, but until then a fallback-heavy body is chunk-less.
+4. Base templates (`is_template_base`) — correct (dead code, never runs).
+
+### Tier 4 — the runtime call model itself is AST-anchored
+
+1. **`Chunk::closure_defs` holds `const FuncDeclStmt *`** — a `Construct*`
+   POOL, explicitly against the ZERO-AST rule ("pooled data is plain values …
+   NEVER a Construct*"). `MakeClosureV` builds `FuncObject(def, &ctx)` from it.
+2. **`FuncObject` / `do_func_call` read the `FuncDeclStmt` at call time**
+   (params via the param `Identifier` nodes, body, frame_size, cache flags) —
+   EVERY function call is AST-anchored, chunk or not.
+3. **`StructTypeDef*`** (struct_defs / consts / literal_objs.arr_hint_struct /
+   boxed_ctors) — NOT a `Construct`, but AST-OWNED (by its `StructDeclStmt`),
+   so freeing the AST today would dangle it. `.myv` needs the defs owned by
+   the program image, not the tree.
+4. **`Chunk::node_table`** — the `{pc, Construct*}` side table itself; must
+   END EMPTY for every script chunk and then be deleted outright.
+
+Zero-AST therefore = empty Tier 1 (every construct lowers) + pooled Tier 2 +
+chunked Tier 3 (VM scope ops for non-scope-free bodies) + a serializable
+FUNCTION DESCRIPTOR replacing `FuncDeclStmt`/`closure_defs` at runtime
+(Tier 4) — at which point the AST is freed after codegen and `node_table`
+is deleted.
+
+### Execution order (each its own commit)
+
+1. Pool the IncDec dual carets → ops 3/4 AST-free. [EASY]
+2. Pool EmplaceStruct (def + carets) → op 2 AST-free; `bench/`+`samples/`
+   reach a literally-empty node_table. [EASY]
+3. `defined(<non-identifier>)` = eval-arg-then-true (builtin_defined only
+   tests UndefinedId, which only a bare Identifier can produce) → kills the
+   Tier-1 #2 EvalToSlot residue + the bare-statement catch. [EASY]
+4. FuncDeclStmt → LOCAL slot: MakeClosureV + slot bind. [EASY]
+5. for(;;) + boxed inc + non-operand for-range step. [EASY]
+6. Typed i/f decl/assign coerce store (a coerce flag on the store path).
+7. Nested-try flow (chained finally inlining) + inline-return-across-try.
+8. Foreach residual shapes (indexed dyn, >2-var dyn, unproven container).
+9. Restructure gen_if/gen_while onto per-statement granularity, then DELETE
+   each Tier-1 site as its residue provably empties.
+10. DESIGN FORKS (maintainer): CallValueGenericV lazy-arg builtins; VM scope
+    ops for non-scope-free blocks/bodies; the function-descriptor model
+    (closure_defs / do_func_call / expression bodies). These are the .myv
+    load-bearing architecture.
+
 ## Remaining work (current — 2026-07-07)
 
 The tracker rows above are kept current (struck as they land). The Part A/B/C
