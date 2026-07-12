@@ -265,12 +265,15 @@ enum class OpCode : unsigned char {
     DictIterNext,
 
     /*
-     * Native SINGLE-var `foreach (e in <dyn container>)`: the container's
+     * Native `foreach (<ids> in [indexed] <dyn container>)`: the container's
      * static type is dyn, so the array-vs-dict choice is at RUNTIME. A live
      * iterator like DictIter, over a `Chunk::n_dyn_iters` state pool indexed by
-     * `target` (a codegen-assigned iter_id).
+     * `target` (a codegen-assigned iter_id). GENERAL over the id list: any
+     * var count, the `indexed` form, and `_` placeholders — the per-var frame
+     * slots (-1 == `_`) live in the unpack_targets pool.
      *
-     * ForeachDynInit: `target` = iter_id; `target2` = the container slot. Pins
+     * ForeachDynInit: `target` = iter_id; `target2` = the container slot;
+     * `a` = nvars | (indexed << 8); `b` = the unpack_targets pool index. Pins
      * the container; if an array -> {arr, idx=0, size}; if a dict ->
      * {dict, it=begin}; else throws TypeErrorEx via the loc side table (the
      * container caret; `node` recorded by extract_locs, then nulled).
@@ -278,10 +281,14 @@ enum class OpCode : unsigned char {
     ForeachDynInit,
 
     /*
-     * ForeachDynNext: `target2` = iter_id; `a` = the loop-var slot (`_` = -1);
-     * `target` = end_pc. On exhaustion jumps to end_pc; else binds the loop var
-     * BOX-FREE - the array ELEMENT (arr_elem_at) or the dict KEY (it->first) -
-     * then advances. Never throws (node-free).
+     * ForeachDynNext: `target2` = iter_id; `target` = end_pc. On exhaustion
+     * jumps to end_pc; else binds the loop vars from the state (slots in the
+     * unpack_targets entry, -1 skipped) exactly as do_iter: `indexed` binds
+     * targets[0] = the iteration counter; an ARRAY element binds the single
+     * remaining var BOX-FREE (arr_elem_at) or STRICT-unpacks an array element
+     * into N remaining vars (the two do_iter TypeErrorEx's, carets via the
+     * loc side table); a DICT binds key [, value [, none...]] (do_iter's
+     * count=2 padding). Then advances.
      */
     ForeachDynNext,
 

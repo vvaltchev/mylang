@@ -4432,8 +4432,15 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
         } else {
 
-            /* A single loop var (or the value slot of an `indexed` loop). */
-            bind_loop_var(ctx, decl, ids->elems[id_start].get(), elems[0]);
+            /* A single loop var (or the value slot of an `indexed` loop).
+             * A 1-var `indexed` loop has NO value var (ids[0] IS the index,
+             * bound above) - bind nothing, consistent with the dict path's
+             * empty bind loop for the same shape. (Was an out-of-bounds
+             * `ids->elems[1]` read -> an abort under container hardening /
+             * UB in a plain release.) */
+            if (id_start < ids->elems.size())
+                bind_loop_var(ctx, decl, ids->elems[id_start].get(),
+                              elems[0]);
         }
 
     } else {

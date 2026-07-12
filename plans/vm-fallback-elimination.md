@@ -847,7 +847,21 @@ is deleted.
    finally may overwrite it, pinned) then MoveV+Jump. The
    compile_scalar_body decline path stays as the safety for an
    uncompilable value/finally.
-8. Foreach residual shapes (indexed dyn, >2-var dyn, unproven container).
+8. ✅ **DONE (2026-07-14)** Foreach residual shapes. The ForeachDyn
+   iterator is now GENERAL over the id list (any var count, `indexed`,
+   `_` placeholders): the per-var slots ride an unpack_targets pool
+   entry, Init packs `nvars | indexed << 8`, Next binds from the state
+   exactly as do_iter (array single-bind / strict N-unpack; dict
+   key/value/none-pad; indexed counter in targets[0]). The inferencer
+   stamp widened to any-var/indexed dyn containers. "Unproven container"
+   has NO valid-script residue (an `opt` container foreach is
+   compile-rejected — NullabilityEx; verified). A non-local loop var
+   (global/capture) still falls back (rare). AND another pre-existing
+   CRASH found+fixed: a 1-var `indexed` foreach over an ARRAY
+   (`foreach (i in indexed a)`) read `ids->elems[1]` OUT OF BOUNDS in
+   do_iter's single-bind (abort under container hardening, UB in plain
+   release; the dict path handled the same shape fine) — now binds
+   nothing beyond the index, both engines, pinned.
 9. Restructure gen_if/gen_while onto per-statement granularity, then DELETE
    each Tier-1 site as its residue provably empties.
 10. THE DESIGN FORKS — **DECIDED by the maintainer (2026-07-14)**; each

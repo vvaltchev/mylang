@@ -5438,27 +5438,29 @@ struct Codegen {
      */
     bool try_native_dyn_foreach(const ForeachStmt *fe)
     {
-        if (!fe->container_is_dyn || fe->indexed || !fe->ids
-            || (fe->ids->elems.size() != 1 && fe->ids->elems.size() != 2))
+        if (!fe->container_is_dyn || !fe->ids || fe->ids->elems.empty())
             return false;
 
-        auto slot_of = [&](size_t i, int &out) -> bool {
+        /* Collect the per-var frame slots (-1 == `_`) into an unpack_targets
+         * pool entry - GENERAL over the id list: any var count, `indexed`
+         * (targets[0] is the iteration counter), `_` placeholders. A non-local
+         * var (global/capture - rare) falls back. */
+        std::vector<int32_t> targets;
+        targets.reserve(fe->ids->elems.size());
+        for (const auto &el : fe->ids->elems) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(fe->ids->elems[i].get());
+                dynamic_cast<const Identifier *>(el.get());
             if (!id)
                 return false;
-            if (id->is_underscore()) { out = -1; return true; }
+            if (id->is_underscore()) {
+                targets.push_back(-1);
+                continue;
+            }
             if (id->sym.kind != SymKind::local)
                 return false;
-            out = id->sym.slot;
-            return true;
-        };
-        const int nvars = static_cast<int>(fe->ids->elems.size());
-        int e_slot = -1, v_slot = -1;
-        if (!slot_of(0, e_slot))
-            return false;
-        if (nvars == 2 && !slot_of(1, v_slot))
-            return false;
+            targets.push_back(id->sym.slot);
+        }
+        const int nvars = static_cast<int>(targets.size());
 
         const size_t start = chunk.code.size();
         reset_temps();
@@ -5473,23 +5475,25 @@ struct Codegen {
 
         const int iter_id = alloc_dyn_iter();
 
+        const int tgt_idx = static_cast<int>(chunk.unpack_targets.size());
+        chunk.unpack_targets.push_back(std::move(targets));
+
         Instr init;
         init.op = OpCode::ForeachDynInit;
         init.node_idx = add_ast_node(fe->container.get());   /* extract_locs -> the caret */
         init.target = iter_id;
         init.target2 = dsrc;
-        init.a = int_lit(nvars);           /* 1 or 2 loop vars */
+        init.a = int_lit(nvars | (fe->indexed ? 256 : 0));
+        init.b = int_lit(tgt_idx);         /* the per-var slots (-1 == `_`) */
         chunk.code.push_back(init);
 
         const int lnext = here();          /* test + bind + advance */
         Instr nx;
         nx.op = OpCode::ForeachDynNext;
-        nx.target2 = iter_id;
-        nx.a = slot_op(e_slot);            /* -1 == `_` */
-        nx.b = slot_op(v_slot);            /* 2-var value/2nd slot (-1 if 1-var) */
-        /* A 2-var array element is strict-unpacked, so Next can throw; record
-         * the container caret (do_iter uses container->start/end). */
-        if (nvars == 2)
+        nx.target2 = iter_id;              /* targets ride the iterator state */
+        /* A multi-var array element is strict-unpacked, so Next can throw;
+         * record the container caret (do_iter uses container->start/end). */
+        if (nvars - (fe->indexed ? 1 : 0) >= 2)
             nx.node_idx = add_ast_node(fe->container.get());
         const size_t nx_i = chunk.code.size();
         chunk.code.push_back(nx);          /* .target (end_pc) backpatched */

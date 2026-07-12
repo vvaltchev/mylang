@@ -3198,22 +3198,33 @@ are typed distinctly (the tree-walker hid it by binding dynamically). A `dyn`
 container falls back; `_`/keys-only bind a slot of `-1` (skip). ~1.5x on
 `62_dict_word_count`
 (0.71x→0.64x vs the tree-walker).
-**A 1- or 2-var `foreach (e in <dyn>)` / `foreach (k, v in <dyn>)`** — the
+**A `foreach (<ids> in [indexed] <dyn>)`** — the
 container's static type is `dyn`, so array-vs-dict can't be proven — is native
 via a runtime-dispatching LIVE iterator, **`ForeachDynInit`**/**`ForeachDynNext`**
-(like the dict pair, over a **`Chunk::n_dyn_iters`** `DynIterState` pool): Init
-pins the container, records the var count (`in.a.lit`), and chooses ONCE — an
+(like the dict pair, over a **`Chunk::n_dyn_iters`** `DynIterState` pool),
+**GENERAL over the id list**: any var count, the `indexed` form, and `_`
+placeholders. Init
+pins the container, records the loop shape (`in.a.lit` packs
+`nvars | indexed << 8`; the per-var frame slots — `-1` == `_` — are an
+`unpack_targets` pool entry, `in.b`), and chooses ONCE — an
 array (`{idx, size}`) or a dict (`{it}`), else throws `TypeErrorEx` (loc side
-table); Next binds BOX-FREE and advances. For **1 var** it binds the array
-ELEMENT (`vm_arr_elem` → `arr_elem_at`) or the dict KEY. For **2 vars** it
-matches `do_iter`: a dict binds KEY+VALUE; an ARRAY element is STRICT-unpacked
-into the two vars (the element must be an array of exactly 2 — the same
-non-array / wrong-length `TypeErrorEx`s, container caret via the side table,
-recorded on the Next op). The inferencer stamps `ForeachStmt::container_is_dyn`
-for a 1- or 2-var non-indexed foreach over a `Dyn` container (indexed / >2-var
-falls back). This is the **F-2a** win — a `dyn`-param function dispatched
+table); Next binds BOX-FREE from the state and advances, exactly as
+`do_iter`: `indexed` binds `targets[0]` = the iteration counter; an ARRAY
+element binds a single remaining var (`vm_arr_elem` → `arr_elem_at`) or is
+STRICT-unpacked into N remaining vars (the same non-array / wrong-length
+`TypeErrorEx`s, container caret via the side table, recorded on the Next op);
+a DICT binds key [, value [, `none`-padded further vars]] (`do_iter`'s
+count-2 padding). The inferencer stamps `ForeachStmt::container_is_dyn`
+for ANY foreach over a `Dyn` container (a non-local — global/capture — loop
+var still falls back, rare). An `opt` container is compile-REJECTED
+(`NullabilityEx`), so "unproven container" has no valid-script residue.
+This is the **F-2a** win — a `dyn`-param function dispatched
 indirectly (its param never gets a concrete container type, e.g. phonebook's
-`cmd_view`) now iterates natively instead of an `EvalStmt` fallback. **~1.8x
+`cmd_view`) now iterates natively instead of an `EvalStmt` fallback.
+**Related fix:** a 1-var `indexed` foreach (`foreach (i in indexed a)`) has
+NO value var — `do_iter`'s single-bind read `ids->elems[1]` OUT OF BOUNDS
+and ABORTED (container hardening; UB in a plain release); it now binds
+nothing beyond the index, consistent with the dict path. **~1.8x
 CPython** on `66_dyn_foreach` (single-var; VM 0.59x the tree-walker) and **~3x
 CPython** on `74_dyn_foreach_kv` (2-var dict; VM 0.54x the tree-walker) — the
 box-free bind is the win. **User-function calls** go

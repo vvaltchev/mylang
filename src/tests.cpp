@@ -7093,6 +7093,53 @@ static const std::vector<test> tests =
     },
 
     {
+        /* The GENERAL dyn foreach (any var count, `indexed`, `_`): the
+         * ForeachDyn iterator now covers the residual shapes - indexed dyn
+         * (array + dict), a 3-var strict unpack with `_`, and the dict
+         * key/value/none padding - all binding exactly as do_iter. Every
+         * assert is dict-iteration-order independent. */
+        "Foreach dyn general: indexed, N-var, `_`, dict none-pad",
+        {
+            "func mk() { return {\"a\": 1, \"b\": 2}; }",
+            "var dyn d = mk();",
+            "var si = 0; var sv = 0;",
+            "foreach (var i, k, v in indexed d) { si += i; sv += v; }",
+            "assert(si == 1); assert(sv == 3);",   /* 0+1 / 1+2, any order */
+            "var dyn arr = runtime([[1, 2, 3], [4, 5, 6]]);",
+            "var s1 = 0; var s3 = 0;",
+            "foreach (var a, _, c in arr) { s1 += a; s3 += c; }",
+            "assert(s1 == 5); assert(s3 == 9);",
+            "var dyn a2 = runtime([10, 20, 30]);",
+            "var ti = 0; var tv = 0;",
+            "foreach (var i, v in indexed a2) { ti += i; tv += v; }",
+            "assert(ti == 3); assert(tv == 60);",
+            "var kk = 0; var vv = 0; var nn = 0;",
+            "foreach (var k, v, x in d) {",
+            "    kk += 1; vv += v; if (x == none) nn += 1;",
+            "}",
+            "assert(kk == 2); assert(vv == 3); assert(nn == 2);",
+        },
+    },
+
+    {
+        /* A 1-var `indexed` foreach has NO value var (ids[0] IS the index):
+         * do_iter's single-bind read ids->elems[1] OUT OF BOUNDS and ABORTED
+         * (container hardening; UB in a plain release) - fixed to bind
+         * nothing, consistent with the dict path's empty bind loop. */
+        "Foreach 1-var indexed binds only the index (was an abort)",
+        {
+            "var a = [10, 20, 30];",
+            "var s = 0;",
+            "foreach (var i in indexed a) { s += i; }",
+            "assert(s == 3);",            /* 0+1+2; elements unread */
+            "var d = {\"x\": 1, \"y\": 2};",
+            "var t = 0;",
+            "foreach (var i in indexed d) { t += i; }",
+            "assert(t == 1);",            /* 0+1 */
+        },
+    },
+
+    {
         /* F-2b: INDEXED + general-value unpack over array<array<str>> - the
          * index var is the loop counter and the two str vars bind box-free
          * (UnpackElemValue); the inferencer types them `str` (the sub-array

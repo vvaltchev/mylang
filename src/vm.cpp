@@ -716,15 +716,20 @@ struct DictIterState {
     DictObject::inner_type::iterator it;
 };
 
-/* Per-loop LIVE state for a native single-var `foreach (e in <dyn>)`: the
+/* Per-loop LIVE state for a native `foreach (<ids> in [indexed] <dyn>)`: the
  * array-vs-dict choice is made ONCE at ForeachDynInit and recorded here (the
  * pinned `container` keeps the array/dict alive for the loop). One per native
- * ForeachDyn (Chunk::n_dyn_iters), indexed by the codegen-assigned iter_id. */
+ * ForeachDyn (Chunk::n_dyn_iters), indexed by the codegen-assigned iter_id.
+ * `targets` points into the chunk's unpack_targets pool (immutable at
+ * runtime): the per-var frame slots, -1 == a `_` placeholder. */
 struct DynIterState {
     EvalValue container;   /* pins the array OR dict for the loop */
     bool is_dict = false;
-    int nvars = 1;         /* 1 (element/key) or 2 (unpack / key+value) */
+    bool indexed = false;  /* ids[0] is the iteration counter */
+    int nvars = 1;         /* TOTAL loop vars (incl. the indexed counter) */
+    const std::vector<int32_t> *targets = nullptr;   /* per-var slots */
     size_type idx = 0, size = 0;               /* array cursor + snapshot */
+    int_type counter = 0;                      /* dict `indexed` counter */
     DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
 };
 
@@ -1291,14 +1296,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::ForeachDynInit: {
-            /* Dispatch the DYN container once: pin it, and set up an array or
-             * dict cursor. An unsupported runtime value throws (loc side
-             * table). */
+            /* Dispatch the DYN container once: pin it, record the loop shape
+             * (nvars | indexed, the per-var target slots from the
+             * unpack_targets pool), and set up an array or dict cursor. An
+             * unsupported runtime value throws (loc side table). */
             ML_VM_CHECK(in.target >= 0
                 && static_cast<size_t>(in.target) < dyn_iters.size());
             DynIterState &st = dyn_iters[in.target];
             st.container = ctx.frame->at(in.target2).get();
-            st.nvars = static_cast<int>(in.a.lit);   /* 1 or 2 loop vars */
+            st.nvars = static_cast<int>(in.a.lit & 0xff);
+            st.indexed = (in.a.lit >> 8) != 0;
+            st.targets = &chunk.unpack_targets[in.b.lit];
+            st.counter = 0;
             if (st.container.is<SharedArrayObj>()) {
                 st.is_dict = false;
                 st.idx = 0;
@@ -1318,34 +1327,48 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::ForeachDynNext: {
-            /* On exhaustion jump to end_pc; else bind the loop var BOX-FREE -
-             * the array element (arr_elem_at) or the dict key - and advance. */
+            /* On exhaustion jump to end_pc; else bind the loop vars from the
+             * state (targets slots, -1 == `_` skipped) exactly as do_iter:
+             * `indexed` binds targets[0] = the counter; an ARRAY element binds
+             * the single remaining var BOX-FREE (vm_arr_elem) or STRICT-
+             * unpacks an array element into the N remaining vars; a DICT
+             * binds key [, value [, none...]] (do_iter's count=2 padding).
+             * Then advance. */
             ML_VM_CHECK(in.target2 >= 0
                 && static_cast<size_t>(in.target2) < dyn_iters.size());
             DynIterState &st = dyn_iters[in.target2];
+            const std::vector<int32_t> &tg = *st.targets;
+            const size_t tb = st.indexed ? 1 : 0;    /* first value var */
+            const size_t nv = static_cast<size_t>(st.nvars) - tb;
+            auto bind = [&](size_t i, const EvalValue &v) {
+                if (tg[i] >= 0)
+                    ctx.frame->at(tg[i]).put(v);
+            };
             if (!st.is_dict) {
                 if (st.idx >= st.size) {
                     pc = static_cast<size_t>(in.target);
                     break;
                 }
-                if (st.nvars == 1) {
-                    if (in.a.slot >= 0)
-                        ctx.frame->at(in.a.slot).put(
-                            vm_arr_elem(st.container, st.idx));
-                } else {
-                    /* 2-var over an ARRAY: the element must be an array of
-                     * EXACTLY 2, unpacked into the vars - do_iter's STRICT
+                if (st.indexed)
+                    bind(0, EvalValue(
+                        static_cast<int_type>(st.idx)));
+                if (nv == 1) {
+                    bind(tb, vm_arr_elem(st.container, st.idx));
+                } else if (nv >= 2) {
+                    /* N-var over an ARRAY: the element must be an array of
+                     * EXACTLY nv, unpacked into the vars - do_iter's STRICT
                      * destructure (same messages/loc via the side table). */
                     const EvalValue elem = vm_arr_elem(st.container, st.idx);
                     if (!elem.is<SharedArrayObj>())
-                        vm_throw_unpack_nonarray(chunk, pc, st.nvars);
+                        vm_throw_unpack_nonarray(chunk, pc,
+                                                 static_cast<int>(nv));
                     const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-                    if (sub.size() != static_cast<size_type>(st.nvars))
-                        vm_throw_unpack_len(chunk, pc, sub.size(), st.nvars);
-                    if (in.a.slot >= 0)
-                        ctx.frame->at(in.a.slot).put(vm_arr_elem(elem, 0));
-                    if (in.b.slot >= 0)
-                        ctx.frame->at(in.b.slot).put(vm_arr_elem(elem, 1));
+                    if (sub.size() != static_cast<size_type>(nv))
+                        vm_throw_unpack_len(chunk, pc, sub.size(),
+                                            static_cast<int>(nv));
+                    for (size_t i = 0; i < nv; i++)
+                        bind(tb + i, vm_arr_elem(elem,
+                                                 static_cast<size_type>(i)));
                 }
                 st.idx++;
             } else {
@@ -1354,10 +1377,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     pc = static_cast<size_t>(in.target);
                     break;
                 }
-                if (in.a.slot >= 0)
-                    ctx.frame->at(in.a.slot).put(st.it->first);
-                if (st.nvars == 2 && in.b.slot >= 0)
-                    ctx.frame->at(in.b.slot).put(st.it->second.get());
+                if (st.indexed)
+                    bind(0, EvalValue(st.counter++));
+                /* do_iter's count==2 else-branch: key, value, then `none`
+                 * for any further vars. */
+                if (nv >= 1)
+                    bind(tb, st.it->first);
+                if (nv >= 2)
+                    bind(tb + 1, st.it->second.get());
+                for (size_t i = 2; i < nv; i++)
+                    bind(tb + i, none);
                 ++st.it;
             }
             pc++;

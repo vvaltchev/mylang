@@ -495,15 +495,21 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "dict.iter.n  I" << in.target2 << " k=" << in.a.slot
                 << " v=" << in.b.slot << " -> L" << in.target;
             break;
-        case OpCode::ForeachDynInit:
+        case OpCode::ForeachDynInit: {
+            const std::vector<int32_t> &tg = chunk.unpack_targets[in.b.lit];
             row << "fe.dyn.init  I" << in.target << " <- " << D(in.target2)
-                << "  ; array|dict runtime dispatch, " << in.a.lit << "-var";
+                << "  ; array|dict runtime dispatch, "
+                << (in.a.lit & 0xff) << "-var"
+                << ((in.a.lit >> 8) ? ", indexed" : "") << ", [";
+            for (size_t i = 0; i < tg.size(); i++) {
+                if (i) row << ", ";
+                if (tg[i] < 0) row << "_"; else row << "r" << tg[i];
+            }
+            row << "]";
             break;
+        }
         case OpCode::ForeachDynNext:
-            row << "fe.dyn.next  I" << in.target2 << " e=" << in.a.slot;
-            if (in.b.slot >= 0)
-                row << " v=" << in.b.slot;
-            row << " -> L" << in.target;
+            row << "fe.dyn.next  I" << in.target2 << " -> L" << in.target;
             break;
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
