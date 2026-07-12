@@ -412,6 +412,14 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
                       const UniqueId *memUid, bool is_inc,
                       Loc mstart, Loc mend, Loc id_start, Loc id_end);
 
+/* Form the member LValue* of `dval.member` for a ROOTED base (a mutable boxed
+ * struct field / a dict value); nullptr for a POD field / readonly / non-
+ * struct-non-dict (a value read). Shared by vm_incdec_member and the VM's
+ * StoreLValueChainV walk. See eval.cpp. */
+LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
+                             const UniqueId *memUid, bool for_write,
+                             Loc mstart, Loc mend);
+
 /* VM (StoreMemberV): native `s.member = v` / `OP= v` for a STRUCT base (a dict
  * member store goes through DictStore). See eval.cpp. */
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,

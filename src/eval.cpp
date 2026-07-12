@@ -2998,36 +2998,53 @@ void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
  * carets like vm_incdec_elem: the MEMBER loc for a KeyNotFound, the INC-DEC loc
  * for its own NotLValue/const/TypeError.
  */
-void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
-                      const UniqueId *memUid, bool is_inc,
-                      Loc mstart, Loc mend, Loc id_start, Loc id_end)
+/*
+ * Form the LValue* of `dval.member` exactly like MemberExpr::do_eval's for a
+ * ROOTED base (the base is a slot, so is_lvalue_rooted holds): a mutable boxed
+ * STRUCT field, or a DICT value (present / default-vivified; a missing key with
+ * no default vivifies `none` when `for_write`, else throws KeyNotFoundEx with
+ * the MEMBER loc). Returns nullptr when the member is a VALUE read (a POD field,
+ * a readonly instance, a non-struct-non-dict base) - the caller turns that into
+ * NotLValueEx. Shared by vm_incdec_member and vm_lvalue_chain_store.
+ */
+LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
+                             const UniqueId *memUid, bool for_write,
+                             Loc mstart, Loc mend)
 {
-    const EvalValue &dval = base_lv->get();
-    LValue *lv = nullptr;
-
     if (dval.is<intrusive_ptr<StructObject>>()) {
         const auto &obj = dval.get<intrusive_ptr<StructObject>>();
         const int slot = obj->def->slot_of(memUid);
-        /* a mutable, boxed field is an lvalue; a POD field / readonly instance
-         * is a value read -> stays null -> NotLValueEx below (as the tree-
-         * walker's member_read result would fail the inc-dec's lvalue check). */
         if (slot >= 0 && !obj->is_pod() && !obj->is_readonly())
-            lv = &obj->fields[slot];
-    } else if (dval.is<intrusive_ptr<DictObject>>()) {
+            return &obj->fields[slot];
+        return nullptr;
+    }
+    if (dval.is<intrusive_ptr<DictObject>>()) {
         const auto &obj = dval.get<intrusive_ptr<DictObject>>();
         if (!obj->is_readonly()) {
             DictObject::inner_type &data = obj->get_ref();
             const auto &it = data.find(memId);
             if (it != data.end())
-                lv = &it->second;
-            else if (obj->get_has_default())
-                lv = &(*data.emplace(memId,
+                return &it->second;
+            if (obj->get_has_default())
+                return &(*data.emplace(memId,
                     LValue(obj->get_default(), false)).first).second;
-            else
-                throw KeyNotFoundEx(mstart, mend);   /* for_write=false */
+            if (for_write)
+                return &(*data.emplace(memId,
+                    LValue(none, false)).first).second;
+            throw KeyNotFoundEx(mstart, mend);
         }
     }
+    return nullptr;
+}
 
+void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
+                      const UniqueId *memUid, bool is_inc,
+                      Loc mstart, Loc mend, Loc id_start, Loc id_end)
+{
+    /* inc-dec is a READ-modify-write, so for_write=false (no auto-vivify), and
+     * a POD field / readonly / missing key with no default is not an lvalue. */
+    LValue *lv = vm_member_lvalue_ref(base_lv->get(), memId, memUid,
+                                      /*for_write=*/false, mstart, mend);
     if (!lv)
         throw NotLValueEx(id_start, id_end);
     if (lv->is_const_var())

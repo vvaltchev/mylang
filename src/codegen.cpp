@@ -3001,6 +3001,114 @@ struct Codegen {
     }
 
     /*
+     * A GENERAL nested lvalue-chain store `base.s1.s2... = v` / `OP= v` mixing
+     * MEMBER and SUBSCRIPT steps (`a[i].f=v`, `q.p.x=v`, `d.a[0].f=v`,
+     * `s.f[i]=v`) -> StoreLValueChainV. A single `s.f`/`a[i]` and a pure-
+     * subscript chain are handled by the specific paths (StoreMemberV / DictStore
+     * / StoreElem*), so this fires ONLY on a ≥2-step chain with ≥1 MEMBER step
+     * and a slotted base. Compiles the rhs, then each subscript step's key into a
+     * temp (INSIDE-OUT, matching the tree-walker's chained lvalue eval), builds
+     * the chain_steps pool entry, and emits the op. Byte-identical: the runtime
+     * walk uses the same Type::subscript / member-lvalue / vm_member_store /
+     * vm_subscript_store the tree-walker's chained do_eval does.
+     */
+    bool try_native_chain_store(const Expr14 *e, std::vector<Instr> &ops)
+    {
+        switch (e->op) {
+        case Op::assign: case Op::addeq: case Op::subeq:
+        case Op::muleq:  case Op::diveq: case Op::modeq: break;
+        default: return false;
+        }
+        /* Decompose the lvalue OUTSIDE-IN into member/subscript steps down to a
+         * base. `chain` is outermost-first; reverse for inside-out. */
+        std::vector<const Construct *> chain;   /* outermost-first */
+        const Construct *cur = e->lvalue.get();
+        for (;;) {
+            if (dynamic_cast<const MemberExpr *>(cur)) {
+                chain.push_back(cur);
+                cur = static_cast<const MemberExpr *>(cur)->what.get();
+            } else if (dynamic_cast<const Subscript *>(cur)) {
+                chain.push_back(cur);
+                cur = static_cast<const Subscript *>(cur)->what.get();
+            } else {
+                break;
+            }
+        }
+        const int nsteps = static_cast<int>(chain.size());
+        if (nsteps < 2)
+            return false;            /* a single s.f / a[i] is a specific path */
+        int nmember = 0;
+        for (const Construct *c : chain)
+            if (dynamic_cast<const MemberExpr *>(c))
+                nmember++;
+        if (nmember == 0)
+            return false;            /* pure-subscript chain -> StoreElem* */
+        /* An OPTIONAL member (`a?.b`) short-circuits a none base - not handled
+         * by the chain walk; leave it to the tree-walker. */
+        for (const Construct *c : chain)
+            if (auto *m = dynamic_cast<const MemberExpr *>(c))
+                if (m->optional)
+                    return false;
+        int bslot, bkind;
+        if (!as_container_base(cur, bslot, bkind))
+            return false;
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int st = next_temp;
+
+        int vslot;
+        if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)) {
+            ops.resize(omark);
+            chunk.consts.resize(cmark);
+            next_temp = st;
+            return false;
+        }
+
+        /* Build the steps INSIDE-OUT (base -> final): chain[nsteps-1-i]. A
+         * subscript step compiles its key into a temp NOW (matching the
+         * tree-walker's key eval order: innermost first); a member step records
+         * its member-key pool index. */
+        std::vector<Chunk::ChainStep> steps;
+        steps.reserve(static_cast<size_t>(nsteps));
+        bool ok = true;
+        for (int i = 0; i < nsteps && ok; i++) {
+            const Construct *c = chain[nsteps - 1 - i];
+            if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+                steps.push_back({true, add_member_key(m), c->start, c->end});
+            } else {
+                const Subscript *sub = static_cast<const Subscript *>(c);
+                int kslot;
+                if (!compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                    ok = false;
+                    break;
+                }
+                steps.push_back({false, kslot, c->start, c->end});
+            }
+        }
+        if (!ok) {
+            ops.resize(omark);
+            chunk.consts.resize(cmark);
+            next_temp = st;
+            return false;
+        }
+
+        const int steps_idx = static_cast<int>(chunk.chain_steps.size());
+        chunk.chain_steps.push_back(std::move(steps));
+
+        Instr in;
+        in.op = OpCode::StoreLValueChainV;
+        in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
+        in.target = vslot;                             /* value temp */
+        in.target2 = bslot;                            /* base slot */
+        in.a = int_lit(bkind);                         /* base kind */
+        in.a.slot = steps_idx;                         /* chain_steps pool idx */
+        in.aop = e->op;
+        ops.push_back(in);
+        return true;
+    }
+
+    /*
      * Compile statement `s` to native int op(s). Handles `x++`/`x--`, a
      * compound assignment `x OP= <int expr>` (rhs may be nested), and a plain
      * `x = <definitely-int expr>`. Returns false otherwise (a plain assign of a
@@ -3168,6 +3276,13 @@ struct Codegen {
         const Expr14 *e = dynamic_cast<const Expr14 *>(s);
         if (!e)
             return false;
+
+        /* A GENERAL member/subscript lvalue CHAIN (`a[i].f=v`, `q.p.x=v`,
+         * `s.f[i]=v`) - tried first, but gated to fire ONLY on a ≥2-step chain
+         * with ≥1 member step (the simple single-step and pure-subscript-chain
+         * stores below handle everything else). */
+        if (try_native_chain_store(e, ops))
+            return true;
 
         /* Native array-element store `a[i] = v` / `a[i] OP= v` (int element).
          * The value is compiled BEFORE the index (tree-walker: rhs then index).
@@ -5491,6 +5606,7 @@ static void extract_locs(Chunk &chunk)
         case OpCode::StoreElemValue:
         case OpCode::StoreElem2V:    /* node = the outer Subscript (its caret) */
         case OpCode::StoreElemChainV: /* node = the outer Subscript (its caret) */
+        case OpCode::StoreLValueChainV: /* node = the outer lvalue (its caret) */
         case OpCode::IncDecCheckedV:  /* node = the inc-dec (TypeError caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::MakeStructArrayV: /* node = a ctor (defensive coerce loc) */

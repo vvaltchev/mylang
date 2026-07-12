@@ -586,14 +586,21 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
    `IncDecElemCheckedV` — forms the member LValue like `MemberExpr::do_eval`'s
    rooted-base path, int/float-checked, dual-loc node-kept; a dict value / boxed
    struct field works, a POD field / missing key throws exactly as the tree-
-   walker; also covers a proven-struct non-numeric member). REMAINING: the
-   **member-in-the-middle nested store** `a[i].f=v` / `q.p.x=v` / `d.a[0].f=v` —
-   NOT just a NotLValue path (that was imprecise: it WORKS for boxed structs,
-   `game.players[i].score=0`; throws only for POD). It needs a general
-   lvalue-CHAIN store op that walks mixed member+subscript steps as lvalue refs
-   (subsuming StoreElem2V/StoreElemChainV/StoreMemberV) — a bigger design,
-   deliberately deferred rather than rushed. An optional `d?.f++` also falls
-   back.
+   walker; also covers a proven-struct non-numeric member). The **member-in-the-
+   middle nested store** `a[i].f=v` / `q.p.x=v` / `s.f[i]=v` / `d.a[0].f=v`: ✅
+   **DONE (2026-07-13)** via `StoreLValueChainV`. `try_native_chain_store`
+   decomposes the lvalue into a slotted base + a `Chunk::chain_steps` list (a
+   member = a member_keys pool idx, a subscript = a pre-evaluated key temp, each
+   with its own node loc). `vm_chain_lvalue_store_op` carries `cur` as an
+   `LValue*` ref OR a plain VALUE — exactly the tree-walker's chained do_eval (an
+   immutable intermediate is a value READ the walk continues on, failing
+   NotLValue only at the FINAL store, so `q.p.x` on nested-POD carets the whole
+   lvalue). The final step dispatches struct (`vm_member_store`) / dict member
+   (`vm_subscript_store(memId)` == `d["f"]=v`, auto-vivify) / subscript
+   (`vm_subscript_store`); per-step locs make ALL carets byte-identical (the
+   pre-existing StoreElem2V/ChainV single-loc imprecision is NOT copied). Works
+   for boxed structs / dict values, throws NotLValue for POD, all byte-identical.
+   Only an optional `d?.f++` still falls back (rare).
 4. **`foreach` where all six handlers decline** — a non-local loop/unpack var
    (global/capture), an **indexed** dyn-container foreach, a **>2-var** dyn
    foreach, a container not proven array/str/dict/dyn (an `opt` container, or a

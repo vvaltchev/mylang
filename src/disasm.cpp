@@ -585,6 +585,18 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << " @" << D(in.b.lit) << "] " << store_op(in.aop) << " "
                 << D(in.target);
             break;
+        case OpCode::StoreLValueChainV: {
+            static const char *bk[] = {"loc", "gbl", "cap"};
+            row << "store.lvchain " << bk[in.a.lit & 3] << "[" << in.target2
+                << "]";
+            const std::vector<Chunk::ChainStep> &st =
+                chunk.chain_steps[in.a.slot];
+            for (const Chunk::ChainStep &s : st)
+                row << (s.is_member ? ".<m#" : "[r")
+                    << s.operand << (s.is_member ? ">" : "]");
+            row << " " << store_op(in.aop) << " " << D(in.target);
+            break;
+        }
         case OpCode::IncDecCheckedV:
             row << "incdec.chk   " << D(in.target)
                 << (in.a.lit ? " ++" : " --") << "   ; dyn, int/float-checked";

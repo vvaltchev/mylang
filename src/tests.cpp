@@ -1509,6 +1509,54 @@ static const std::vector<test> tests =
             "assert(alias[0][0][0] == 42);",       /* alias shares */
         },
     },
+
+    {
+        /* GENERAL lvalue-chain store (StoreLValueChainV): a nested store mixing
+         * MEMBER and SUBSCRIPT steps - subscript-then-member (a[i].f), member-
+         * then-member (q.p.x), member-then-subscript (s.f[i]), and 3-deep
+         * (b.items[0].x). Works for BOXED structs / dict values; runs on both
+         * engines (differential). */
+        "general lvalue-chain store: mixed member/subscript steps",
+        {
+            "struct P { int x; array t; }",   /* boxed (has a ref field) */
+            "var a = [P(1, []), P(2, [])];",
+            "a[0].x = 99; assert(a[0].x == 99); assert(a[1].x == 2);",
+            "a[1].x += 8; assert(a[1].x == 10);",   /* compound */
+            "struct Q { P p; array t2; }",
+            "var q = Q(P(5, []), []);",
+            "q.p.x = 42; assert(q.p.x == 42);",     /* member.member */
+            "struct Box { array items; }",
+            "var b = Box([1, 2, 3]);",
+            "b.items[1] = 88; assert(b.items[1] == 88);",   /* member.subscript */
+            "var b2 = Box([P(1, []), P(2, [])]);",
+            "b2.items[0].x = 77; assert(b2.items[0].x == 77);",  /* 3-deep */
+        },
+    },
+    {
+        /* Chain store where the FINAL member is a DICT (auto-vivify), and a
+         * dict-in-the-middle (`d.a[0].f` — d.a a list, d.a[0] a dict). */
+        "general lvalue-chain store: dict members auto-vivify",
+        {
+            "var dyn d = {\"a\": [{}, 3, 4]};",
+            "d.a[0].f1 = 3;",                       /* d.a[0] a dict; vivify f1 */
+            "d.a[0].f2 = [11, 22];",
+            "assert(d.a[0].f1 == 3); assert(d.a[0].f2[1] == 22);",
+            "var e = {\"outer\": {\"inner\": 1}};",
+            "e.outer.inner = 99; assert(e.outer.inner == 99);",  /* dict.dict */
+            "e.outer.inner += 1; assert(e.outer.inner == 100);", /* compound */
+        },
+    },
+    /* Error paths (byte-identical carets on both engines): a POD nested field
+     * (no lvalue), an intermediate OOB, an intermediate missing dict key. */
+    { "general lvalue-chain store: POD nested member is not an lvalue",
+      { "struct P { int x; int y; } struct Q { P p; }",   /* both POD */
+        "var q = Q(P(1, 2)); q.p.x = 5;" }, &typeid(NotLValueEx) },
+    { "general lvalue-chain store: intermediate out of bounds",
+      { "struct P { int x; array t; } var a = [P(1, [])]; a[9].x = 5;" },
+      &typeid(OutOfBoundsEx) },
+    { "general lvalue-chain store: intermediate missing dict key",
+      { "struct P { int x; array t; } var d = {\"p\": P(1, [])};",
+        "d.missing.x = 5;" }, &typeid(KeyNotFoundEx) },
     {
         "global array/dict base store (a function reads the global)",
         {

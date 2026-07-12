@@ -361,6 +361,91 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
                              val, op, Loc(), Loc());
 }
 
+/* GENERAL nested lvalue-chain store (StoreLValueChainV): walk the mixed
+ * member/subscript steps (chunk.chain_steps[steps_idx]) from `base`, reading
+ * each intermediate step as an lvalue REF (for_write=false), then store the
+ * final step (member: vm_member_store; subscript: vm_subscript_store). All
+ * throws are loc-less (Loc()) and the CALLER stamps the outer lvalue loc, like
+ * StoreElemChainV. ML_NOINLINE + off vm_run_chunk's frame (the recursion-stack
+ * hygiene reason above). */
+static ML_NOINLINE void
+vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
+                         int_type steps_idx, const EvalValue &value, Op op)
+{
+    const std::vector<Chunk::ChainStep> &steps = chunk.chain_steps[steps_idx];
+    const size_t n = steps.size();
+    /* `cur` is EITHER an LValue* wrapper (a mutable ref into a live container) OR
+     * a plain VALUE - exactly like the tree-walker's chained do_eval, where an
+     * immutable step (a POD field, a readonly instance) yields a value read and
+     * the walk CONTINUES on it, only failing NotLValue at the FINAL store. */
+    EvalValue cur = EvalValue(base);
+
+    for (size_t i = 0; i + 1 < n; i++) {
+        const Chunk::ChainStep &step = steps[i];
+        /* A throw AT this step (OOB / KeyNotFound / TypeError / NotLValue)
+         * carries THIS step's node loc - byte-identical to the tree-walker's
+         * per-node stamp (an internal throw is loc-less, so stamp it here). */
+        try {
+            if (step.is_member) {
+                const Chunk::MemberKey &mk = chunk.member_keys[step.operand];
+                const EvalValue cval =
+                    cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
+                /* for_write=false: an intermediate member is READ to walk into.
+                 * A mutable boxed field / dict value -> an lvalue REF; else the
+                 * tree-walker reads a VALUE (member_read: a POD/readonly copy,
+                 * or a TypeError for a non-struct/dict base) and continues. */
+                LValue *next = vm_member_lvalue_ref(cval, mk.memId, mk.memUid,
+                    /*for_write=*/false, step.lstart, step.lend);
+                if (next)
+                    cur = EvalValue(next);
+                else
+                    cur = member_read_core(cval, mk.memId, mk.memUid,
+                        mk.optional, step.lstart, step.lend,
+                        step.lstart, step.lend);
+            } else {
+                const EvalValue &key = ctx.frame->at(step.operand).get();
+                Type *ct = cur.is<LValue *>()
+                    ? cur.get<LValue *>()->get().get_type() : cur.get_type();
+                cur = ct->subscript(cur, key, /*for_write=*/false);
+            }
+        } catch (Exception &ex) {
+            if (!ex.loc_start) { ex.loc_start = step.lstart;
+                                 ex.loc_end = step.lend; }
+            throw;
+        }
+    }
+
+    const Chunk::ChainStep &last = steps[n - 1];   /* node = the whole lvalue */
+    try {
+        /* The final store needs a live lvalue; a VALUE-walked chain (a POD /
+         * readonly intermediate) can't be stored into -> NotLValueEx at the
+         * whole-lvalue loc, exactly as the tree-walker's handle_single_expr14. */
+        if (!cur.is<LValue *>())
+            throw NotLValueEx(last.lstart, last.lend);
+        LValue *curlv = cur.get<LValue *>();
+        if (last.is_member) {
+            const Chunk::MemberKey &mk = chunk.member_keys[last.operand];
+            /* A DICT member store `d.f = v` IS `d["f"] = v` (auto-vivify on a
+             * plain assign; KeyNotFound on a compound of a missing key) - route
+             * it through vm_subscript_store with the member name as the key, as
+             * the tree-walker's DictStore does. A STRUCT member (POD byte /
+             * boxed field) goes through vm_member_store. */
+            if (curlv->get().is<intrusive_ptr<DictObject>>())
+                vm_subscript_store(curlv, mk.memId, value, op,
+                                   last.lstart, last.lend);
+            else
+                vm_member_store(curlv, mk.memUid, op, value,
+                                last.lstart, last.lend, last.lstart, last.lend);
+        } else {
+            const EvalValue &key = ctx.frame->at(last.operand).get();
+            vm_subscript_store(curlv, key, value, op, last.lstart, last.lend);
+        }
+    } catch (Exception &ex) {
+        if (!ex.loc_start) { ex.loc_start = last.lstart; ex.loc_end = last.lend; }
+        throw;
+    }
+}
+
 /* Build a FLAT array<PodStruct> literal from the N structs' interleaved
  * field-arg run [base, base+N*M). ML_NOINLINE + off vm_run_chunk's frame for the
  * recursion-stack reason above (the fused op's field-value buffer must not
@@ -1574,6 +1659,27 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             const EvalValue &val = ctx.frame->at(in.target).get();
             try {
                 vm_chain_store_op(ctx, base, in.b.lit, in.a.slot, val, in.aop);
+            } catch (Exception &e) {
+                if (!e.loc_start)
+                    chunk.loc_at(pc, e.loc_start, e.loc_end);
+                throw;
+            }
+            pc++;
+            break;
+        }
+
+        case OpCode::StoreLValueChainV: {
+            /* GENERAL nested store `base.step1.step2... = v` mixing MEMBER +
+             * SUBSCRIPT steps. Form the base LValue* (by slot kind = a.lit),
+             * walk the steps (chain_steps pool idx = a.slot), store the final.
+             * AST-free: all carets come from the loc side table (the outer
+             * lvalue node), matching StoreElemChainV. */
+            LValue *base = vm_store_base(ctx, in.a.lit, in.target2,
+                                         chunk, pc, nullptr);
+            const EvalValue &val = ctx.frame->at(in.target).get();
+            try {
+                vm_chain_lvalue_store_op(ctx, chunk, base, in.a.slot, val,
+                                         in.aop);
             } catch (Exception &e) {
                 if (!e.loc_start)
                     chunk.loc_at(pc, e.loc_start, e.loc_end);

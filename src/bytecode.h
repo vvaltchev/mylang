@@ -113,6 +113,21 @@ enum class OpCode : unsigned char {
     IncDecMemberCheckedV,
 
     /*
+     * GENERAL nested lvalue-chain store `base.step1.step2... = v` / `OP= v`
+     * mixing MEMBER and SUBSCRIPT steps (`a[i].f=v`, `q.p.x=v`, `d.a[0].f=v`,
+     * `s.f[i]=v`). A pure-subscript chain keeps StoreElem2V/StoreElemChainV; a
+     * single `s.f`/`a[i]` keeps StoreMemberV/StoreElemValue - this is the
+     * ≥2-step chain with ≥1 MEMBER step. target = value temp, target2 = base
+     * slot, a.lit = base kind (0 loc/1 gbl/2 cap), a.slot = chain_steps pool
+     * index, aop = the Expr14 op. Walks each intermediate step as an lvalue REF
+     * (for_write=false), then stores the final step (member: vm_member_store;
+     * subscript: vm_subscript_store) - byte-identical to the tree-walker's
+     * chained lvalue eval. All carets use the outer lvalue loc (the loc side
+     * table), matching StoreElemChainV.
+     */
+    StoreLValueChainV,
+
+    /*
      * Fused compare-and-branch: if NOT (a <aop> b) then pc = target, else fall
      * through. a/b are int Operands, aop a comparison Op. One dispatch replaces
      * the tree-walker's eval_cond -> TypedScalarExpr -> Identifier chain (this
@@ -1036,6 +1051,23 @@ struct Chunk {
         Loc bstart, bend;         /* the base caret ("Expected dict object") */
     };
     std::vector<MemberKey> member_keys;
+
+    /*
+     * LVALUE-CHAIN STEP POOL (StoreLValueChainV). One entry per general nested
+     * store `base.step1.step2... = v` mixing MEMBER and SUBSCRIPT steps (a
+     * pure-subscript chain keeps StoreElem2V/StoreElemChainV). Each step is a
+     * member (`operand` = a member_keys pool index) or a subscript (`operand` =
+     * the frame temp holding the pre-evaluated key). Inside-out (base -> final).
+     */
+    struct ChainStep {
+        bool is_member;
+        int32_t operand;   /* member: member_keys idx; subscript: key temp reg */
+        Loc lstart, lend;  /* this step's NODE loc - a throw AT this step (OOB /
+                            * KeyNotFound / NotLValue) uses it, byte-identical to
+                            * the tree-walker's per-node stamp (the final step's
+                            * node is the whole lvalue). */
+    };
+    std::vector<std::vector<ChainStep>> chain_steps;
 
     /*
      * CATCH-TYPE POOL (P8). One entry per `catch (A, B, ...)` clause with a type

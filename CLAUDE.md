@@ -3297,7 +3297,24 @@ GENERAL array, a **DYN / captured / unproven** base, or a flat int array whose
 index isn't int-compilable (the flat `StoreElemInt` path rolls back and falls
 through) — while a **proven flat int/float array keeps its unboxed
 `StoreElemInt`/`StoreElemFloat`** (the catch-all excludes `th==f && base_array`,
-left to `compile_float_stmt`). **P8 exceptions are now fully native** (see
+left to `compile_float_stmt`). A **GENERAL nested lvalue-chain store** mixing
+MEMBER and SUBSCRIPT steps (`a[i].f=v`, `q.p.x=v`, `s.f[i]=v`, `d.a[0].f=v`) →
+**`StoreLValueChainV`** (`try_native_chain_store` decomposes the lvalue into a
+slotted base + a `Chunk::chain_steps` list — a member is a `member_keys` pool
+index, a subscript a pre-evaluated key temp, each with its own node loc). The
+runtime walk (`vm_chain_lvalue_store_op`) carries `cur` as EITHER an `LValue*`
+ref OR a plain VALUE — exactly the tree-walker's chained `do_eval`, where an
+immutable intermediate (a POD field, a readonly instance) is a value READ
+(`member_read_core`) the walk continues on, only failing `NotLValueEx` at the
+FINAL store (so `q.p.x` on nested-POD carets the whole lvalue, not the inner
+step). The final step dispatches: a struct → `vm_member_store` (POD byte / boxed
+field), a **DICT member `d.f=v` → `vm_subscript_store(memId)`** (== `d["f"]=v`,
+auto-vivify), a subscript → `vm_subscript_store`. Each step's throw uses ITS
+node's loc (a subscript-only chain keeps the tuned `StoreElem2V`/
+`StoreElemChainV`; a single `s.f`/`a[i]` keeps `StoreMemberV`/`StoreElemValue`).
+So a member-in-the-middle nested store — which WORKS for boxed structs / dict
+values, throws for POD — is native, byte-identical incl. carets. **P8 exceptions
+are now fully native** (see
 `plans/vm-exceptions.md`): try/catch/finally + throw + rethrow + all
 flow-crossing-try (incl. nested-finally chaining) are native ops; a VM-detected
 runtime error (div/mod-by-zero at `IntBin`/`FloatBin`) native-dispatches via
@@ -3811,19 +3828,17 @@ storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 / `str s;` / `Point p;` is already desugared (at parse) to a zero-value literal
 / zero-struct ctor rvalue, so it lowers the same way.
 
-**Residual `EvalStmt`:** the harder niche shapes (a **member-in-the-middle
-nested store** `a[i].f=v` / `q.p.x=v` / `d.a[0].f=v` — works for BOXED structs,
-throws `NotLValueEx` for POD; needs a general lvalue-CHAIN store op mixing
-member+subscript steps, deferred; an **int/float**-typed decl fed a `dyn` value
-— left to the tree-walker for `coerce_to_decl_type`; an optional `d?.f++`; a
-non-identifier `defined(a[0])`); an `InlinedCallExpr` whose return crosses a try
-INSIDE the boundary (rare); and the dev-only **`show`** (script-excluded by
-`reject_dev_builtins`, so never in serialized bytecode). None appear in `bench/`
-or `samples/` (both stay 100% native). The `_`-in-unpack / indexed dict
-`foreach`, the ≥3-level SUBSCRIPT nested store, the dyn scalar/element/member
-inc-dec, `append` to a struct member, the common `InlinedCallExpr`, typed
-NON-scalar decls, `defined(<never-declared>)`, and a runtime-`const` rebind are
-all now native (above).
+**Residual `EvalStmt`:** the harder niche shapes (an **int/float**-typed decl
+fed a `dyn` value — left to the tree-walker for `coerce_to_decl_type`; an
+optional `d?.f++`; a non-identifier `defined(a[0])`); an `InlinedCallExpr` whose
+return crosses a try INSIDE the boundary (rare); and the dev-only **`show`**
+(script-excluded by `reject_dev_builtins`, so never in serialized bytecode).
+None appear in `bench/` or `samples/` (both stay 100% native). The `_`-in-unpack
+/ indexed dict `foreach`, the ≥3-level SUBSCRIPT nested store, the **general
+member/subscript lvalue-chain store** (`a[i].f=v` / `q.p.x=v` / `d.a[0].f=v`),
+the dyn scalar/element/member inc-dec, `append` to a struct member, the common
+`InlinedCallExpr`, typed NON-scalar decls, `defined(<never-declared>)`, and a
+runtime-`const` rebind are all now native (above).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index
