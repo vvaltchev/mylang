@@ -1536,15 +1536,18 @@ void Inferencer::annotate_hints(Construct *n)
             }
         }
 
-        /* A non-indexed 1- or 2-var foreach over a proven DICT -> the VM's
+        /* A 1- or 2-var (key[+value]) foreach over a proven DICT -> the VM's
          * native live iterator (DictIterInit/DictIterNext). The map value is
          * always a boxed LValue, so both the key and the value bind the general
          * EvalValue box (box-free copy, like LoadElemValue) - no key/value
-         * TypeHint is needed. A `dyn` container that can't be proven a dict is
-         * left to the tree-walker fallback. */
-        const bool dict_form = !fe->indexed && fe->ids
-                            && (fe->ids->elems.size() == 1
-                                || fe->ids->elems.size() == 2);
+         * TypeHint is needed. The INDEXED form (`foreach (i, k[, v] in indexed
+         * d)`) adds an int index counter, so it carries one extra var (ids.size
+         * 2 or 3). A `dyn` container that can't be proven a dict is left to the
+         * tree-walker fallback. */
+        const int dict_off = fe->indexed ? 1 : 0;
+        const int dict_nkv = fe->ids
+            ? static_cast<int>(fe->ids->elems.size()) - dict_off : 0;
+        const bool dict_form = fe->ids && (dict_nkv == 1 || dict_nkv == 2);
         if (dict_form) {
             StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
             if (c->kind == StaticTypeKind::Dict)
@@ -3319,9 +3322,21 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
          * non-indexed 2+-var path does). Types the vars as the sub-array's
          * ELEMENT type, not the sub-array itself. */
         contribute(sym_of(0), A.int_ty(), ids[0]->start);
+        if (c->kind == StaticTypeKind::Dict) {
+            /* A dict's "element" is the (key, value) PAIR - do_iter binds
+             * ids[1]=key, ids[2]=value (count==2), NOT a destructured single
+             * element. So the two targets are key + value respectively, never
+             * both the key. (Fixing a latent front-end mis-typing the
+             * tree-walker hid because it binds dynamically at runtime.) */
+            if (ids.size() >= 2)
+                contribute(sym_of(1), c->key, ids[1]->start);
+            if (ids.size() >= 3)
+                contribute(sym_of(2), c->val, ids[2]->start);
+            return;
+        }
         StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
                     : c->kind == StaticTypeKind::Str ? A.str_ty()
-                    : c->kind == StaticTypeKind::Dict ? c->key : A.dyn_ty();
+                    : A.dyn_ty();
         StaticTypeRef bind = el;
         if (ids.size() > 2) {   /* index + 2+ targets -> unpack the element */
             StaticTypeRef re = static_type_resolve(el);

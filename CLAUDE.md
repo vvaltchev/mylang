@@ -3102,8 +3102,17 @@ tree-walker's range-for, and the only difference (`++it` timing) is observable
 only under mutation-during-iteration, which is UB in both engines (dicts don't
 COW, so a body write hits the same map either way — a snapshot would DIVERGE, so
 we DON'T snapshot). The inferencer stamps `ForeachStmt::container_is_dict` for a
-non-indexed 1/2-var loop over a proven `Dict` type; a `dyn` container falls
-`_`/keys-only bind a slot of `-1` (skip). ~1.5x on `62_dict_word_count`
+1/2-var (key[+value]) loop over a proven `Dict` type — and the **INDEXED** form
+`foreach (i, k[, v] in indexed d)` too: `ids[0]` is an int index counter
+(`LoadImmInt 0` before the loop, `IntBin += 1` at each `continue` point, so it
+holds the iteration number during the body, matching `do_iter`), and the
+key/value follow it. Fixing this also fixed a **latent front-end mis-typing**:
+`accumulate_foreach` typed an indexed dict's two targets as a destructured
+element (both the KEY type), but `do_iter` binds `ids[1]=key`, `ids[2]=value`
+(count==2) — so `v` was wrongly `str` for a `dict<str,int>`; now key + value
+are typed distinctly (the tree-walker hid it by binding dynamically). A `dyn`
+container falls back; `_`/keys-only bind a slot of `-1` (skip). ~1.5x on
+`62_dict_word_count`
 (0.71x→0.64x vs the tree-walker).
 **A 1- or 2-var `foreach (e in <dyn>)` / `foreach (k, v in <dyn>)`** — the
 container's static type is `dyn`, so array-vs-dict can't be proven — is native

@@ -4819,14 +4819,23 @@ struct Codegen {
     /*
      * Native dict `foreach` via a LIVE iterator (DictIterInit/DictIterNext) - a
      * dict has no O(1) index, so it's a while-shaped loop, not the counted
-     * array one. 1 var binds the key (keys-only), 2 vars key + value; a `_`
-     * in either position binds nothing (slot -1). Break/continue/return flow
-     * through the same FlowState machinery as the array foreach.
+     * array one. Non-indexed: 1 var binds the key (keys-only), 2 vars key +
+     * value. INDEXED (`foreach (i, k[, v] in indexed d)`): ids[0] is the index
+     * counter (a plain int local, init 0, `+= 1` each continue), and the
+     * key/value follow it - matching do_iter's `id_start`/count==2 binding. A
+     * `_` in a key/value position binds nothing (slot -1). Break/continue/
+     * return flow through the same FlowState machinery as the array foreach.
      */
     bool try_native_dict_foreach(const ForeachStmt *fe)
     {
-        if (!fe->container_is_dict || !fe->ids
-            || (fe->ids->elems.size() != 1 && fe->ids->elems.size() != 2))
+        if (!fe->container_is_dict || !fe->ids)
+            return false;
+        const int nvars = static_cast<int>(fe->ids->elems.size());
+        /* index offset: an indexed loop's ids[0] is the counter, key/value
+         * follow. So valid var counts are 1/2 (non-indexed) or 2/3 (indexed). */
+        const int off = fe->indexed ? 1 : 0;
+        const int nkv = nvars - off;   /* key[+value] target count */
+        if (nkv != 1 && nkv != 2)
             return false;
 
         /* Resolve the key/value target slots. `_` -> -1 (bind nothing); any
@@ -4842,10 +4851,20 @@ struct Codegen {
             out = id->sym.slot;
             return true;
         };
+        /* The index counter must be a real (non-`_`) int local. */
+        int idx_slot = -1;
+        if (off) {
+            const Identifier *id0 =
+                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+            if (!id0 || id0->is_underscore()
+                || id0->sym.kind != SymKind::local)
+                return false;
+            idx_slot = id0->sym.slot;
+        }
         int k_slot = -1, v_slot = -1;
-        if (!slot_of(0, k_slot))
+        if (!slot_of(off, k_slot))
             return false;
-        if (fe->ids->elems.size() == 2 && !slot_of(1, v_slot))
+        if (nkv == 2 && !slot_of(off + 1, v_slot))
             return false;
 
         const size_t start = chunk.code.size();
@@ -4861,6 +4880,17 @@ struct Codegen {
         }
         const int saved_base = temp_base;
         temp_base = next_temp;      /* reserve dsrc for DictIterInit */
+
+        /* Indexed: the counter starts at 0 (the first iteration's index),
+         * incremented at each continue point (below) - so it holds the
+         * iteration number during the body, byte-identical to do_iter. */
+        if (off) {
+            Instr z;
+            z.op = OpCode::LoadImmInt;
+            z.target = idx_slot;
+            z.a = int_lit(0);
+            chunk.code.push_back(z);
+        }
 
         const int iter_id = alloc_dict_iter();
 
@@ -4888,7 +4918,17 @@ struct Codegen {
             return false;
         }
 
-        const int lcont = here();   /* continue -> back to DictIterNext */
+        const int lcont = here();   /* continue -> increment, back to Next */
+        if (off) {
+            /* index += 1 (idx_slot = idx_slot + 1), then loop. */
+            Instr inc;
+            inc.op = OpCode::IntBin;
+            inc.aop = Op::plus;
+            inc.target = idx_slot;
+            inc.a = slot_op(idx_slot);
+            inc.b = int_lit(1);
+            chunk.code.push_back(inc);
+        }
         Instr jb;
         jb.op = OpCode::Jump;
         jb.target = lnext;

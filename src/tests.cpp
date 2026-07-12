@@ -6596,6 +6596,54 @@ static const std::vector<test> tests =
     },
 
     {
+        /* INDEXED dict foreach (VM: DictIterInit/Next + an int index counter):
+         * index + key + value. The value must type as V (int), not the key
+         * type - a latent front-end mis-typing this exercises. */
+        "Indexed dict foreach binds index + key + value",
+        {
+            "var d = {\"a\": 10, \"b\": 20, \"c\": 30};",
+            "var si = 0; var sv = 0;",
+            "foreach (var i, k, v in indexed d) { si += i; sv += v; }",
+            "assert(si == 3);",           /* 0+1+2 */
+            "assert(sv == 60);",          /* 10+20+30 */
+        },
+    },
+
+    {
+        /* Indexed dict foreach, 2-var (index + key) and a `_` value slot.
+         * Dicts are UNORDERED (std::unordered_map - the iteration order
+         * differs across libstdc++ / libc++ / MSVC STL), so every assert must
+         * be order-INDEPENDENT: sums over the whole iteration, never an
+         * index-value pairing (an `i * v` product broke macOS/Windows CI). */
+        "Indexed dict foreach: index+key, and underscore value",
+        {
+            "var d = {1: 100, 2: 200};",
+            "var sik = 0;",
+            "foreach (var i, k in indexed d) { sik += i + k; }",
+            "assert(sik == 4);",          /* (0+1) + (1+2), any order */
+            "var si = 0; var sv = 0;",
+            "foreach (var i, _, v in indexed d) { si += i; sv += v; }",
+            "assert(si == 1);",           /* 0+1: `_` skipped, i counts */
+            "assert(sv == 300);",         /* 100+200, any order */
+        },
+    },
+
+    {
+        /* Indexed dict foreach continue still advances the index counter.
+         * Skip BY INDEX and sum the INDEXES (order-independent): the visited
+         * indexes are always 0,1,2 whatever the key order. */
+        "Indexed dict foreach continue advances the index",
+        {
+            "var d = {\"a\": 5, \"b\": 6, \"c\": 7};",
+            "var si = 0; var n = 0;",
+            "foreach (var i, k, v in indexed d) { if (i == 1) continue;"
+            " si += i; n += 1; }",
+            "assert(si == 2);",           /* 0 + 2 (index 1 skipped) */
+            "assert(n == 2);",
+        },
+    },
+
+    {
         /* a counted loop with a NON-TRIVIAL bound (len(s)) goes native: the VM
          * caches the bound once, like the tree-walker's ForRangeStmt. */
         "For-range with a len() bound",
