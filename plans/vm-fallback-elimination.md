@@ -592,7 +592,7 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
    decomposes the lvalue into a slotted base + a `Chunk::chain_steps` list (a
    member = a member_keys pool idx, a subscript = a pre-evaluated key temp, each
    with its own node loc). `vm_chain_lvalue_store_op` carries `cur` as an
-   `LValue*` ref OR a plain VALUE — exactly the tree-walker's chained do_eval (an
+   `LValue*` ref OR a plain VALUE — exactly the tree-walker's chained do_eval, an
    immutable intermediate is a value READ the walk continues on, failing
    NotLValue only at the FINAL store, so `q.p.x` on nested-POD carets the whole
    lvalue). The final step dispatches struct (`vm_member_store`) / dict member
