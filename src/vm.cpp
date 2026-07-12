@@ -352,23 +352,20 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
  * throws are loc-less (Loc()) and the CALLER stamps the outer lvalue loc, like
  * StoreElemChainV. ML_NOINLINE + off vm_run_chunk's frame (the recursion-stack
  * hygiene reason above). */
-static ML_NOINLINE void
-vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
-                         int_type steps_idx, const EvalValue &value, Op op)
+/* The INTERMEDIATE-step walk shared by StoreLValueChainV and IncDecChainV:
+ * advance `cur` through steps[0 .. upto). `cur` is EITHER an LValue* wrapper
+ * (a mutable ref into a live container) OR a plain VALUE - exactly like the
+ * tree-walker's chained do_eval, where an immutable step (a POD field, a
+ * readonly instance) yields a value read and the walk CONTINUES on it, only
+ * failing NotLValue at the FINAL step. A throw AT a step (OOB / KeyNotFound /
+ * TypeError) carries THAT step's node loc - byte-identical to the
+ * tree-walker's per-node stamp (an internal throw is loc-less). */
+static void
+vm_chain_walk(EvalContext &ctx, const Chunk &chunk, EvalValue &cur,
+              const std::vector<Chunk::ChainStep> &steps, size_t upto)
 {
-    const std::vector<Chunk::ChainStep> &steps = chunk.chain_steps[steps_idx];
-    const size_t n = steps.size();
-    /* `cur` is EITHER an LValue* wrapper (a mutable ref into a live container) OR
-     * a plain VALUE - exactly like the tree-walker's chained do_eval, where an
-     * immutable step (a POD field, a readonly instance) yields a value read and
-     * the walk CONTINUES on it, only failing NotLValue at the FINAL store. */
-    EvalValue cur = EvalValue(base);
-
-    for (size_t i = 0; i + 1 < n; i++) {
+    for (size_t i = 0; i < upto; i++) {
         const Chunk::ChainStep &step = steps[i];
-        /* A throw AT this step (OOB / KeyNotFound / TypeError / NotLValue)
-         * carries THIS step's node loc - byte-identical to the tree-walker's
-         * per-node stamp (an internal throw is loc-less, so stamp it here). */
         try {
             if (step.is_member) {
                 const Chunk::MemberKey &mk = chunk.member_keys[step.operand];
@@ -398,6 +395,16 @@ vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
             throw;
         }
     }
+}
+
+static ML_NOINLINE void
+vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
+                         int_type steps_idx, const EvalValue &value, Op op)
+{
+    const std::vector<Chunk::ChainStep> &steps = chunk.chain_steps[steps_idx];
+    const size_t n = steps.size();
+    EvalValue cur = EvalValue(base);
+    vm_chain_walk(ctx, chunk, cur, steps, n - 1);
 
     const Chunk::ChainStep &last = steps[n - 1];   /* node = the whole lvalue */
     try {
@@ -428,6 +435,52 @@ vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
         if (!ex.loc_start) { ex.loc_start = last.lstart; ex.loc_end = last.lend; }
         throw;
     }
+}
+
+/* IncDecChainV (the R4 value form): root -> intermediate walk -> the final
+ * step's exact IncDecExpr tier semantics (vm_incdec_final, eval.cpp). A kind-3
+ * root seeds the walk with a VALUE (a compiled rvalue base keeps its
+ * rvalue-ness); the result (old for postfix / new for prefix) lands in `dst`
+ * (-1 = statement, discarded). ML_NOINLINE: off vm_run_chunk's recursive
+ * frame (the recursion-stack hygiene rule). */
+static ML_NOINLINE void
+vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
+                   size_t pc)
+{
+    const Chunk::IncDecChain &site = chunk.incdec_chains[in.b.lit];
+    const std::vector<Chunk::ChainStep> &steps = site.steps;
+    const size_t n = steps.size();
+
+    EvalValue cur;
+    if (in.a.lit == 3)
+        cur = ctx.frame->at(in.target2).get();      /* rvalue root: a VALUE */
+    else
+        cur = EvalValue(
+            vm_store_base(ctx, in.a.lit, in.target2, chunk, pc, nullptr));
+
+    vm_chain_walk(ctx, chunk, cur, steps, n - 1);
+
+    const Chunk::ChainStep &last = steps[n - 1];
+    EvalValue memId;
+    const UniqueId *memUid = nullptr;
+    EvalValue key;
+    if (last.is_member) {
+        const Chunk::MemberKey &mk = chunk.member_keys[last.operand];
+        memId = mk.memId;
+        memUid = mk.memUid;
+    } else {
+        key = ctx.frame->at(last.operand).get();
+    }
+
+    EvalValue r = vm_incdec_final(cur, last.is_member, memId, memUid, key,
+                                  site.tier2, in.aop == Op::plus,
+                                  site.is_prefix,
+                                  site.allow_flat, site.allow_pod,
+                                  last.lstart, last.lend,
+                                  site.kstart, site.kend,
+                                  site.id_start, site.id_end);
+    if (in.target >= 0)
+        ctx.frame->at(in.target).put(std::move(r));
 }
 
 /* Build a FLAT array<PodStruct> literal from the N structs' interleaved
@@ -970,6 +1023,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
         }
+
+        case OpCode::IncDecChainV:
+            vm_incdec_chain_op(ctx, chunk, in, pc);
+            pc++;
+            break;
 
         case OpCode::IncDecMemberCheckedV: {
             /* `d.f++` / `d.f--` on a dyn/unproven base: form the member LValue

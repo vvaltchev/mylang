@@ -311,6 +311,24 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << "\n";
         }
     }
+    if (!ch.incdec_chains.empty()) {
+        s << "; -- incdec_chains (" << ch.incdec_chains.size() << ") --\n";
+        for (size_t i = 0; i < ch.incdec_chains.size(); i++) {
+            const auto &ic = ch.incdec_chains[i];
+            s << ";   #" << i << "  steps=";
+            for (const Chunk::ChainStep &st : ic.steps)
+                s << (st.is_member ? ".<m#" : "[r")
+                  << st.operand << (st.is_member ? ">" : "]");
+            s << (ic.tier2 ? "  tier2" : "  dyn")
+              << (ic.is_prefix ? " pre" : " post");
+            if (ic.allow_flat)
+                s << " flat-ok";
+            if (ic.allow_pod)
+                s << " pod-ok";
+            s << "  incdec@" << ic.id_start.line << ":" << ic.id_start.col
+              << "\n";
+        }
+    }
     if (!ch.node_table.empty()) {
         /* The ONE non-serializable side table: the AST nodes ops still need at
          * runtime (fallbacks / builtin calls / a store's caret), pc-keyed. A
@@ -662,6 +680,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "]." << (is.memUid ? is.memUid->val : "<member>")
                 << (in.aop == Op::plus ? " ++" : " --")
                 << "   ; dyn member, int/float-checked";
+            break;
+        }
+        case OpCode::IncDecChainV: {
+            static const char *bk[] = {"loc", "gbl", "cap", "val"};
+            const Chunk::IncDecChain &ic = chunk.incdec_chains[in.b.lit];
+            row << "incdec.chain " << D(in.target) << " = "
+                << bk[in.a.lit & 3] << "[" << in.target2 << "]";
+            for (const Chunk::ChainStep &st : ic.steps)
+                row << (st.is_member ? ".<m#" : "[r")
+                    << st.operand << (st.is_member ? ">" : "]");
+            row << (in.aop == Op::plus ? " ++" : " --")
+                << (ic.is_prefix ? "   ; prefix" : "   ; postfix")
+                << (ic.tier2 ? ", typed" : ", dyn-checked");
             break;
         }
         case OpCode::MultiUnpackV: {

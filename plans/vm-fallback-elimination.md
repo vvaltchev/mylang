@@ -744,8 +744,27 @@ From `codegen_func_body`'s gates (codegen.cpp:5859):
 1. **Non-scope-free function bodies** (`!body->scope_free`: a capturing
    closure / nested named func / slot overflow in the body) — the WHOLE
    function runs `do_eval`. The body-level twin of the non-scope-free Block.
-2. **Expression-bodied functions** (`!fn->body->is_block()`) — e.g. a
-   non-inlined `func [c](x) => x + c` closure body. No chunk.
+   (D2 proved every SCRIPT block scope-free post-F2, so in a script this is
+   empty; the gate stays as the safety net.)
+2. **Expression-bodied functions** — ✅ DONE (2026-07-14): `func f(x) =>
+   expr` is now parse-time SUGAR for `{ return expr; }` (maintainer
+   decision) — the parser's arrow branch desugars, so EVERY function body
+   is a Block and compiles to a chunk (a `ReturnV` over the native expr;
+   `codegen_func_body`'s is_block gate passes naturally). The passes that
+   optimized the sugar look through the wrapper via **`func_expr_body`**
+   (syntax.h — matches the hand-written twin too, deliberately: the two
+   spellings are indistinguishable): the EXPRESSION inliner (classification
+   + splice + `-it` size gate all on the inner expr — byte-identical
+   optimizer decisions, `-a` coloring diff-verified empty), `do_func_call`'s
+   direct-eval fast path (tree-walker perf preserved; under `-vm` the chunk
+   runs — the native form), coderender (`=> expr;` rendering). Two Inliner
+   rules found + fixed during this: a `funcs`-registered (expr-engine) func
+   stays OUT of `block_funcs` (block-inline is CALL_WEIGHT-gated and
+   bypassed `-it`), and **`refold` never folds a LAZY builtin**
+   (`defined(gg)` tolerates UndefinedId, so a cctx eval "succeeded" with a
+   compile-time answer to a runtime-order question — caught by the
+   defined-order test the moment hand-written `{ return defined(gg); }`
+   became expr-inlinable).
 3. The **all-fallback gate** (no REAL op → no chunk) — self-erasing once
    Tier 1 empties, but until then a fallback-heavy body is chunk-less.
 4. Base templates (`is_template_base`) — correct (dead code, never runs).
@@ -1028,11 +1047,20 @@ body, return/throw values, try bodies, call args — funnels into these):**
   `a = (b = [1,2])` retargeted b's MakeArrayV to a and b was never
   assigned (a wrong result the suite missed; probe-caught).
 - R4 **Inc-dec with an IMPURE lvalue** (`a[f()]++` as value or statement:
-  `incdec_lvalue_pure` declines a side-effecting index) — the STATEMENT
-  form is native (IncDecElemCheckedV etc.); the VALUE form REMAINS the
-  one documented EvalStmt user besides show(): rare (a side-effecting
-  index inside an inc-dec used as a value), and the whole containing
-  statement falls back, byte-identical.
+  `incdec_lvalue_pure` declines a side-effecting index) — ✅ DONE
+  (2026-07-14, maintainer-directed): the VALUE form is native via
+  **`IncDecChainV`** + the serializable `Chunk::incdec_chains` pool: the
+  lvalue decomposes into a root (container slot, or a compiled RVALUE
+  temp whose VALUE seed keeps rvalue-ness — `mk()[0]++` still throws
+  NotLValueEx) + member/subscript steps with each key compiled ONCE; the
+  runtime walk is the shared StoreLValueChainV intermediate walk
+  (`vm_chain_walk`), and the final step runs `vm_incdec_final`
+  (eval.cpp) — IncDecExpr::do_eval's EXACT tiers: tier 2 = compound
+  `±= 1` (flat/POD gated by the codegen-computed `allow_flat`/`allow_pod`
+  = no_side_effects(final base), the tree-walker's own AST-shape gate)
+  then old = new ∓ 1 with no re-read; tier 3 = the checked RMW. Probed
+  byte-identical across flat/dict/dyn/nested/member/rvalue-root shapes
+  (incl. the POD-member NotLValue and general-2D NotLValue corners).
 
 **Live statement roots:**
 - R5 **Typed/const-target IdList destructure** (`int a; int b;
@@ -1092,7 +1120,9 @@ fails `compile_native_if` → gen_stmt emits a **whole-if EvalStmt**; a
 uncompilable loop **init** (`emit_init` now returns bool) fails the
 whole loop the same way. So `EvalStmt` is THE single fallback op, and
 the only node-holding op left in any compiled chunk — reachable only by
-show()-in-tests, the R4 value form, and future gaps. Suite 1522/1522 +
+show()-in-tests, the R4 value form, and future gaps. (SUPERSEDED
+2026-07-14: R4-value is now native too — IncDecChainV, below — so the
+residue is show()-in-tests + future gaps only.) Suite 1522/1522 +
 differential 1366/1366 green on g++/clang debug, RECYCLE+ASan, and
 release; bench/ + samples/ still lower with an EMPTY node_table. New
 codegen-shape tests pin R1/R2/R3/R5 (jinn/munpack counters) and the

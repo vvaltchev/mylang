@@ -2311,7 +2311,24 @@ pAcceptFuncDecl(ParseContext &c,
 
     if (pAcceptOp(c, Op::arrow)) {
 
-        func->body = pExpr14(c, fl);
+        /*
+         * `=> expr` is pure SUGAR for `{ return expr; }`: desugar at parse so
+         * every function body is a Block (ONE body shape - the VM compiles it
+         * to a chunk, and no later pass needs an expression-body special
+         * case). The passes that optimize the sugar look through the wrapper
+         * via func_expr_body (syntax.h); the synthetic nodes carry the
+         * expression's locs so carets/backtraces are unchanged.
+         */
+        unique_ptr<Construct> ex = pExpr14(c, fl);
+        auto rs = make_unique<ReturnStmt>();
+        rs->start = ex->start;
+        rs->end = ex->end;
+        rs->elem = move(ex);
+        auto blk = make_unique<Block>();
+        blk->start = rs->start;
+        blk->end = rs->end;
+        blk->elems.push_back(move(rs));
+        func->body = move(blk);
 
     } else if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody)) {
 

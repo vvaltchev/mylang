@@ -2399,8 +2399,14 @@ public:
                 add_unique(funcs, fd);
             else if (specializable_decl(fd))
                 add_unique(spec_funcs, fd);
-            /* independent: a block body can be both specialized and inlined */
-            if (block_inlinable_decl(fd))
+            /* independent: a block body can be both specialized and inlined.
+             * But a func in `funcs` (the -it-gated EXPRESSION engine - a
+             * single-return body, either spelling) stays OUT of the block
+             * engine: it would bypass the -it gate (block-inline is
+             * CALL_WEIGHT-gated), and the expression splice already covers
+             * every call site. A single-return body the expr engine REFUSES
+             * (recursive - the unroll; a param-mutator) still registers. */
+            if (block_inlinable_decl(fd) && !funcs.count(fd->id->uid))
                 add_unique(block_funcs, fd);
         }
 
@@ -2437,7 +2443,7 @@ public:
                     funcs.emplace(kv.first, fd);
                 else if (specializable_decl(fd))
                     spec_funcs.emplace(kv.first, fd);
-                if (block_inlinable_decl(fd))
+                if (block_inlinable_decl(fd) && !funcs.count(kv.first))
                     block_funcs.emplace(kv.first, fd);
             }
         }
@@ -2501,14 +2507,17 @@ private:
 
     static bool inlinable_decl(const FuncDeclStmt *fd)
     {
-        return fd->body
-            && !fd->body->is_block()                       /* => expr body */
+        /* An EXPRESSION body: `=> expr`, now parsed as `{ return expr; }` -
+         * func_expr_body looks through the sugar (and matches the
+         * hand-written twin, deliberately: same spelling, same optimizer). */
+        const Construct *eb = fd->body ? func_expr_body(fd) : nullptr;
+        return eb != nullptr
             && (!fd->captures || fd->captures->elems.empty())
             /* No nested function: a closure in the body may capture this
              * function's parameters, which substitution would break. */
-            && !contains_func(fd->body.get())
+            && !contains_func(eb)
             /* not recursive / does not reference its own name */
-            && count_uses(fd->body.get(), fd->id->uid) == 0
+            && count_uses(eb, fd->id->uid) == 0
             /* A body that REASSIGNS a SCALAR param - `x++`, `x = ...`,
              * `x += ...` where the target is the param itself - can't be
              * inlined: the param is a by-value copy, so the call leaves the
@@ -3145,12 +3154,19 @@ private:
         if (ce->args->elems.size() != nparams)
             return;
 
-        const int bsz = node_count(f->body.get());
+        /* The body EXPRESSION (the splice source): the `=> expr` sugar's
+         * inner expr - the Block/Return wrapper is not spliced (it would put
+         * a statement in expression position) and is not counted (the size
+         * gate measures the expression, exactly as before the desugar). */
+        Construct *fexpr = func_expr_body(f);
+        ML_CHECK(fexpr != nullptr);   /* inlinable_decl guaranteed it */
+
+        const int bsz = node_count(fexpr);
         if (bsz > max_nodes)
             return;
 
         for (size_t i = 0; i < nparams; i++) {
-            const int uses = count_uses(f->body.get(),
+            const int uses = count_uses(fexpr,
                                         f->params->elems[i]->uid);
             if (!sub_ok(uses, ce->args->elems[i].get()))
                 return;
@@ -3181,7 +3197,7 @@ private:
             { std::string(f->id->get_str()), param_names(f),
               ce->start, ce->inline_ctx });
 
-        unique_ptr<Construct> body = f->body->clone();
+        unique_ptr<Construct> body = fexpr->clone();
 
         for (size_t i = 0; i < nparams; i++)
             substitute(body, f->params->elems[i]->uid,
@@ -3965,6 +3981,15 @@ private:
             for (size_t i = 0; i < ce->args->elems.size(); i++)
                 if (!(lval0 && i == 0))          /* skip the lvalue first arg */
                     refold(ce->args->elems[i]);
+            /* NEVER fold a LAZY builtin (defined/isconst/isconstdecl): its
+             * arg is a NODE property. `defined(g)` in particular TOLERATES an
+             * UndefinedId arg, so a cctx eval "succeeds" - answering false at
+             * compile time for a global whose definedness is a RUNTIME,
+             * execution-order-dependent property. (An inlined `return
+             * defined(gg)` body exposed this; the resolver's try_fold_defined
+             * already folded every soundly-foldable case.) */
+            if (callee && is_lazy_builtin(callee->uid))
+                return;
         } else {
             for_each_child_slot(cc,
                 [&](unique_ptr<Construct> &ch) { refold(ch); });

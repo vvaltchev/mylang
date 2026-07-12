@@ -1416,11 +1416,12 @@ public:
 
     /*
      * The bytecode VM's per-function compiled body chunk (Phase 4), an opaque
-     * pointer so syntax.h needn't include the VM headers. Lazily filled on the
-     * first call under -vm by vm_func_chunk (vm.cpp): `vm_chunk_tried` guards a
-     * one-time compile, `vm_chunk` is the resulting `const Chunk *` (null when
-     * the body has no register ops worth running natively - it then stays
-     * tree-walked, so an expression/recursion-heavy func pays nothing). The
+     * pointer so syntax.h needn't include the VM headers. Filled UPFRONT under
+     * -vm by vm_precompile_all (AOT; the lazy vm_func_chunk miss path is a
+     * never-hit safety net): `vm_chunk_tried` guards the one-time compile,
+     * `vm_chunk` is the resulting `const Chunk *` (null when the body has no
+     * real op - an all-fallback body stays tree-walked). An `=> expr` body,
+     * desugared to `{ return expr; }`, compiles like any block body. The
      * chunk storage lives in vm.cpp, cleared per run; a clone resets these (it
      * has its own body). NOT used in the REPL.
      */
@@ -1447,6 +1448,27 @@ public:
         return c;
     }
 };
+
+/*
+ * `func f(..) => expr` parses as SUGAR for `{ return expr; }` (one body shape
+ * everywhere: every function body is a Block, so the VM compiles it to a
+ * chunk and no pass needs an expression-body special case). The passes that
+ * OPTIMIZE the sugar - the expression inliner, do_func_call's direct-eval
+ * fast path, coderender's `=>` rendering - look through it with this: the
+ * inner expression when the body is exactly `{ return <expr>; }`
+ * (hand-written or desugared: the two spellings are deliberately
+ * indistinguishable), else null. Tag-based (no dynamic_cast) - it runs on
+ * do_func_call's hot path.
+ */
+static inline Construct *func_expr_body(const FuncDeclStmt *fd)
+{
+    if (!fd->body || !fd->body->is_block())
+        return nullptr;
+    const Block *b = static_cast<const Block *>(fd->body.get());
+    if (b->elems.size() != 1 || b->elems[0]->ct != ConstructType::ret)
+        return nullptr;
+    return static_cast<const ReturnStmt *>(b->elems[0].get())->elem.get();
+}
 
 /*
  * A `struct Name { ... }` declaration (plans/structs.md). Owns the

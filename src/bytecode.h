@@ -111,6 +111,30 @@ enum class OpCode : unsigned char {
     IncDecMemberCheckedV,
 
     /*
+     * GENERAL inc-dec over an arbitrary lvalue CHAIN, VALUE form (the R4
+     * residue: `y = a[f()]++`, `z = ++d[kf()]`, `y = a[f()][g()]++`,
+     * `y = a[f()].x++`, `y = mk()[0]++` - an inc-dec whose lvalue has a
+     * side-effecting index/base, so the read+mutate double-compile of the
+     * pure value path is unsound). The ROOT is a slot (`target2`, kind in
+     * `a.lit`: 0 local / 1 global / 2 capture) or a compiled RVALUE temp
+     * (kind 3 - seeding the walk with a VALUE reproduces the tree-walker's
+     * rvalue-ness, so `mk()[0]++` still throws NotLValueEx); the member/
+     * subscript steps + tier/flags/carets live in the `incdec_chains` pool
+     * (`b` = the index; each subscript key is a pre-evaluated temp, so
+     * every side effect runs EXACTLY ONCE, in source order). The walk is
+     * the StoreLValueChainV intermediate walk; the FINAL step runs
+     * IncDecExpr::do_eval's exact tier semantics (vm_incdec_final,
+     * eval.cpp): tier 2 (a proven int/float lvalue) = the compound-store
+     * `±= 1` (flat_store_core when the codegen proved the base
+     * side-effect-free, exactly try_flat's gate; else the general
+     * subscript/member lvalue + slot_rmw) then old = new ∓ 1 derived with
+     * NO re-read; tier 3 (dyn) = the checked read-modify-write (NotLValue/
+     * const/TypeError at the INC-DEC caret). `target` = the dst slot
+     * (-1 = statement, value discarded), `aop` = plus/minus (inc/dec).
+     */
+    IncDecChainV,
+
+    /*
      * GENERAL nested lvalue-chain store `base.step1.step2... = v` / `OP= v`
      * mixing MEMBER and SUBSCRIPT steps (`a[i].f=v`, `q.p.x=v`, `d.a[0].f=v`,
      * `s.f[i]=v`). A pure-subscript chain keeps StoreElem2V/StoreElemChainV; a
@@ -1149,6 +1173,32 @@ struct Chunk {
                             * node is the whole lvalue). */
     };
     std::vector<std::vector<ChainStep>> chain_steps;
+
+    /*
+     * INC-DEC CHAIN POOL (IncDecChainV). One entry per general inc-dec value
+     * form: the lvalue's steps (same shape as chain_steps - a subscript key is
+     * a pre-evaluated frame temp, so a side-effecting index runs once), the
+     * TIER (`tier2` = the inferencer proved the lvalue int/float, so the
+     * compound-store semantics apply; else the dyn checked semantics), the
+     * prefix/postfix flag, the codegen-proven `allow_flat`/`allow_pod` gates
+     * (= no_side_effects(final step's base AST) - the tree-walker's
+     * try_flat_subscript_store / try_pod_struct_store gate, an AST-shape
+     * property, so it is compile-time data), and the carets: `id_*` = the
+     * whole inc-dec expr (its NotLValue/const/TypeError in tier 3),
+     * `k*` = the final subscript's INDEX node (the "Expected integer as
+     * subscript" caret in flat_store_core). Fully serializable (Locs, ints,
+     * member_keys indexes, temp regs).
+     */
+    struct IncDecChain {
+        std::vector<ChainStep> steps;  /* inside-out; >= 1 */
+        bool tier2 = false;            /* lvalue proven int/float */
+        bool is_prefix = false;
+        bool allow_flat = false;   /* final subscript may take the flat path */
+        bool allow_pod = false;    /* final member may take the POD byte path */
+        Loc id_start, id_end;          /* the inc-dec expr's caret */
+        Loc kstart, kend;              /* the final subscript index's caret */
+    };
+    std::vector<IncDecChain> incdec_chains;
 
     /*
      * PER-STEP LOCS for a pure-subscript nested store (StoreElem2V /

@@ -535,15 +535,18 @@ struct Renderer {
         ptypes = nullptr;
         ret_type.clear();
 
-        if (auto *b = dynamic_cast<const Block *>(f->body.get())) {
+        /* A single-return body - the `=> expr` sugar's parsed form (or its
+         * hand-written twin) - renders back as `=> expr;`, the idiomatic
+         * spelling. */
+        if (const Construct *eb = func_expr_body(f)) {
+            o << "=> ";
+            expr(eb, 0);
+            o << ";";
+        } else if (auto *b = dynamic_cast<const Block *>(f->body.get())) {
             o << "{\n";
             for (const auto &e : b->elems)
                 stmt(e.get(), level + 1);
             o << ind(level) << "}";
-        } else if (f->body) {
-            o << "=> ";
-            expr(f->body.get(), 0);
-            o << ";";
         } else {
             o << "{ }";
         }

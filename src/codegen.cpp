@@ -2,6 +2,10 @@
 
 #include "codegen.h"
 #include "syntax.h"
+
+/* eval.cpp's AST-shape purity check (see eval.h) - declared here to avoid
+ * pulling the whole eval.h into the codegen TU. */
+bool construct_no_side_effects(const Construct *c);
 #ifdef ML_DBG_FB
 #include "coderender.h"
 #endif
@@ -902,7 +906,7 @@ struct Codegen {
          * captured `dst` is unaffected by the mutation that follows. */
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(e)) {
             if (!incdec_lvalue_pure(inc->lvalue.get()))
-                return false;
+                return try_incdec_chain(inc, out_slot, ops);
             const size_t omark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int st = next_temp;
@@ -921,7 +925,9 @@ struct Codegen {
                 ops.resize(omark);
                 chunk.consts.resize(cmark);
                 next_temp = st;
-                return false;
+                /* a pure lvalue the statement/read compilers still declined:
+                 * the chain op is the catch-all there too. */
+                return try_incdec_chain(inc, out_slot, ops);
             }
             out_slot = dst;
             return true;
@@ -3469,6 +3475,119 @@ struct Codegen {
         in.a.slot = steps_idx;                         /* chain_steps pool idx */
         in.aop = e->op;
         ops.push_back(in);
+        return true;
+    }
+
+    /*
+     * The R4 VALUE-form catch-all: an inc-dec used as a value whose lvalue the
+     * pure read+mutate path declined (a side-effecting subscript index/base -
+     * `y = a[f()]++`, `z = ++d[kf()]`, `y = a[f()][g()]++`, `y = a[f()].x++`,
+     * `y = mk()[0]++` - or a shape it doesn't cover). Decomposes the lvalue
+     * into a root + member/subscript steps (each subscript KEY compiled into a
+     * temp ONCE, in the tree-walker's eval order: root first, then keys
+     * inside-out), pools the steps + tier/flags/carets in `incdec_chains`, and
+     * emits ONE IncDecChainV. The runtime walk + final-step semantics
+     * (vm_incdec_final) mirror IncDecExpr::do_eval's tiers byte-identically -
+     * including the AST-shape-dependent flat/POD gates (`allow_flat`/
+     * `allow_pod` = no_side_effects(final base), try_flat/try_pod's own gate)
+     * and a compiled RVALUE root's rvalue-ness (kind 3 seeds the walk with a
+     * VALUE, so `mk()[0]++` still throws NotLValueEx).
+     */
+    bool try_incdec_chain(const IncDecExpr *inc, int &out_slot,
+                          std::vector<Instr> &ops)
+    {
+        /* Decompose OUTSIDE-IN, like try_native_chain_store. */
+        std::vector<const Construct *> chain;   /* outermost-first */
+        const Construct *root = inc->lvalue.get();
+        for (;;) {
+            if (auto *m = dynamic_cast<const MemberExpr *>(root)) {
+                if (m->optional)
+                    return false;   /* d?.f++ is compile-rejected anyway */
+                chain.push_back(root);
+                root = m->what.get();
+            } else if (dynamic_cast<const Subscript *>(root)) {
+                chain.push_back(root);
+                root = static_cast<const Subscript *>(root)->what.get();
+            } else {
+                break;
+            }
+        }
+        if (chain.empty())
+            return false;           /* a bare id: the pure path's territory */
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int st = next_temp;
+
+        /* The ROOT: a container slot (kind 0/1/2), else compile the expression
+         * into a temp (kind 3 - an RVALUE root; the walk seeds a VALUE from it,
+         * reproducing the tree-walker's non-lvalue base semantics). Compiled
+         * FIRST, before any key - the tree-walker's eval order. */
+        int bslot, bkind;
+        if (!as_container_base(root, bslot, bkind)) {
+            if (!compile_boxed_expr(root, bslot, ops)) {
+                ops.resize(omark);
+                chunk.consts.resize(cmark);
+                next_temp = st;
+                return false;
+            }
+            bkind = 3;
+        }
+
+        /* Steps INSIDE-OUT; a subscript key compiles into a temp NOW (once). */
+        std::vector<Chunk::ChainStep> steps;
+        steps.reserve(chain.size());
+        const size_t nsteps = chain.size();
+        for (size_t i = 0; i < nsteps; i++) {
+            const Construct *cn = chain[nsteps - 1 - i];
+            if (auto *m = dynamic_cast<const MemberExpr *>(cn)) {
+                steps.push_back({true, add_member_key(m), cn->start, cn->end});
+            } else {
+                const Subscript *sub = static_cast<const Subscript *>(cn);
+                int kslot;
+                if (!compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                    ops.resize(omark);
+                    chunk.consts.resize(cmark);
+                    next_temp = st;
+                    return false;
+                }
+                steps.push_back({false, kslot, cn->start, cn->end});
+            }
+        }
+
+        /* The site: tier + the AST-shape flat/POD gates + carets. */
+        Chunk::IncDecChain site;
+        const Construct *fin = chain[0];        /* outermost == final step */
+        site.tier2 = inc->th == TypeHint::i || inc->th == TypeHint::f;
+        site.is_prefix = inc->is_prefix;
+        if (auto *fsub = dynamic_cast<const Subscript *>(fin)) {
+            site.allow_flat = construct_no_side_effects(fsub->what.get());
+            site.kstart = fsub->index->start;
+            site.kend = fsub->index->end;
+        } else {
+            auto *fmem = static_cast<const MemberExpr *>(fin);
+            site.allow_pod = construct_no_side_effects(fmem->what.get());
+        }
+        site.id_start = inc->start;
+        site.id_end = inc->end;
+        site.steps = std::move(steps);
+
+        const int site_idx = static_cast<int>(chunk.incdec_chains.size());
+        chunk.incdec_chains.push_back(std::move(site));
+
+        const int dst = alloc_temp();
+        Instr in;
+        in.op = OpCode::IncDecChainV;
+        /* extract_locs: the inc-dec span -> the loc side table (the
+         * undefined-global-root caret) + inline_ctx; then node-free. */
+        in.node_idx = add_ast_node(inc);
+        in.target = dst;
+        in.target2 = bslot;
+        in.a = int_lit(bkind);          /* root kind: 0/1/2, 3 = rvalue temp */
+        in.b = int_lit(site_idx);       /* incdec_chains pool idx */
+        in.aop = inc->is_inc ? Op::plus : Op::minus;
+        ops.push_back(in);
+        out_slot = dst;
         return true;
     }
 
@@ -6043,6 +6162,8 @@ static void extract_locs(Chunk &chunk)
          * loc = the undefined-global-base caret (vm_store_base). */
         case OpCode::IncDecElemCheckedV:
         case OpCode::IncDecMemberCheckedV:
+        case OpCode::IncDecChainV:   /* carets in incdec_chains; side-table loc
+                                      * = the undefined-global-root caret */
             /* node used ONLY for the caret now (div/mod; the missing-key
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold

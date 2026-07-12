@@ -3796,10 +3796,10 @@ static const std::vector<test> tests =
       { "int ix = 0; int iy = 0;",
         "var dyn da = [1.5, 2];",
         "ix, iy = da;" }, &typeid(TypeErrorEx) },
-    /* An UNCOMPILABLE loop condition (an impure-lvalue inc-dec value - the
-     * R4 value form) falls back WHOLE-statement (one EvalStmt; the per-op
-     * JumpIfFalse/EvalToSlot fallbacks are deleted) - same behavior. */
-    { "vm: uncompilable cond falls back whole-statement",
+    /* An impure-lvalue inc-dec VALUE in a loop condition - the R4 value
+     * form, now native via IncDecChainV (the side-effecting index runs
+     * EXACTLY once per iteration; the flat element mutates in place). */
+    { "vm: impure-index inc-dec value in a loop cond (IncDecChainV)",
       { "var a = [0, 1, 2, 3, 4];",
         "var j = 0;",
         "func nx() { j += 1; return j - 1; }",
@@ -3807,6 +3807,46 @@ static const std::vector<test> tests =
         "while (a[nx()]++ < 3) n += 1;",
         "assert(n == 3); assert(j == 4);",
         "assert(a == [1, 2, 3, 4, 4]);" } },
+    /* The R4 value-form family over every container tier: flat array
+     * (postfix + prefix), dict element via an impure key, a dyn GENERAL
+     * array, and a boxed-struct member reached through an impure index -
+     * each side effect runs once, results/mutations match the tree-walker
+     * (the differential harness runs this under both engines). */
+    { "vm: impure-lvalue inc-dec values (R4) across container tiers",
+      { "var a = [10, 20, 30];",
+        "var i = 0;",
+        "func f() { i += 1; return i - 1; }",
+        "var y = a[f()]++;",
+        "assert(y == 10); assert(a == [11, 20, 30]); assert(i == 1);",
+        "var z = ++a[f()];",
+        "assert(z == 21); assert(a == [11, 21, 30]); assert(i == 2);",
+        "var d = {\"k\": 5};",
+        "func kf() { i += 1; return \"k\"; }",
+        "var w = d[kf()]++;",
+        "assert(w == 5); assert(d[\"k\"] == 6); assert(i == 3);",
+        "var dyn g = [1.5, 2.5];",
+        "var dyn v = g[f() - 4]++;",
+        "assert(v == 2.5); assert(g[1] == 3.5); assert(i == 4);",
+        "struct B { dyn q; int n; }",
+        "var arr = [B([1], 5), B([2], 7)];",
+        "var u = arr[f() - 5].n++;",
+        "assert(u == 7); assert(arr[1].n == 8); assert(i == 5);" } },
+    /* A POD-struct member through an impure index is NOT an lvalue (the
+     * tree-walker's try_pod gate is AST-shape-dependent) - both engines
+     * throw NotLValueEx. */
+    { "vm: impure-index POD member inc-dec throws NotLValue",
+      { "struct P { int x; int y; }",
+        "var ps = [P(1,2), P(3,4)];",
+        "var i = 0;",
+        "func f() { i += 1; return i - 1; }",
+        "var u = ps[f()].x++;" }, &typeid(NotLValueEx) },
+    /* An RVALUE root (`mk()[0]++`) keeps its rvalue-ness through the
+     * compiled chain (a kind-3 VALUE seed) - NotLValueEx, as the
+     * tree-walker's non-LValue base subscript. */
+    { "vm: rvalue-root inc-dec value throws NotLValue",
+      { "func mk() { return [9, 8]; }",
+        "var dyn z = 0;",
+        "z = mk()[0]++;" }, &typeid(NotLValueEx) },
     { "v3 recursion: a non-negative-base recursion folds negatives safely",
       { "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
         "assert(fib(7) == 13);" } },
@@ -13306,7 +13346,7 @@ struct VmOpCounts {
     size_t jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
     size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0, arrlen = 0;
     size_t storei = 0, storef = 0, loadev = 0, evalstmt = 0;
-    size_t jinn = 0, munpack = 0;
+    size_t jinn = 0, munpack = 0, idchain = 0, retv = 0;
     size_t loadconstv = 0, movev = 0, binopv = 0, compoundv = 0;
     size_t cmpv = 0, jutv = 0, logv = 0, unaryv = 0, loadglobalv = 0;
     size_t subscriptv = 0, definedg = 0;
@@ -13371,6 +13411,8 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::EvalStmt:         c.evalstmt++; break;
             case OpCode::JumpIfNotNoneV:   c.jinn++;   break;
             case OpCode::MultiUnpackV:     c.munpack++; break;
+            case OpCode::IncDecChainV:     c.idchain++; break;
+            case OpCode::ReturnV:          c.retv++;   break;
             case OpCode::LoadConstV:       c.loadconstv++; break;
             case OpCode::MoveV:            c.movev++; break;
             case OpCode::BinOpV:           c.binopv++; break;
@@ -14114,6 +14156,30 @@ static bool vm_codegen_shapes()
         return false;
     const bool typed_unpack_ok = mu.munpack == 1 && mu.evalstmt == 0;
 
+    /* an EXPRESSION body - `func f(..) => expr`, desugared at parse to
+     * `{ return expr; }` - COMPILES to a chunk (a ReturnV over the native
+     * expr; before the desugar an expr body had NO chunk and tree-walked
+     * under -vm). The tree-walker still runs it via the func_expr_body
+     * direct-eval fast path. */
+    VmOpCounts eb;
+    if (!codegen_func_counts({
+            "func inc1(int x) => x + 1;",
+            "var dyn keep = inc1;",   /* value-used: the body must be real */
+        }, eb))
+        return false;
+    const bool expr_body_chunk_ok = eb.retv == 1 && eb.evalstmt == 0;
+
+    /* an impure-index inc-dec VALUE (`a[f()]++` in an expression) lowers
+     * to ONE IncDecChainV (the key temp evaluated once) - no fallback. */
+    VmOpCounts idc;
+    if (!codegen_counts({
+            "var a = [1, 2, 3]; var j = 0;",
+            "func f() { j += 1; return j - 1; }",
+            "var y = a[f()]++;",
+        }, idc))
+        return false;
+    const bool incdec_chain_ok = idc.idchain == 1 && idc.evalstmt == 0;
+
     return native_ok && fallback_ok && nested_ok && bool_safe
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
@@ -14129,7 +14195,8 @@ static bool vm_codegen_shapes()
         && ret_finally_native_ok && break_finally_native_ok
         && chain_finally_native_ok && unary_cond_ok && unary_val_ok
         && defined_fold_ok && defined_global_ok && coalesce_ok
-        && chained_cmp_ok && assign_expr_ok && typed_unpack_ok;
+        && chained_cmp_ok && assign_expr_ok && typed_unpack_ok
+        && incdec_chain_ok && expr_body_chunk_ok;
 }
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:

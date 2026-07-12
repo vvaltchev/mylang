@@ -457,6 +457,31 @@ LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
                              const UniqueId *memUid, bool for_write,
                              Loc mstart, Loc mend);
 
+/* AST-shape purity check (id / scalar-literal / subscript / member / arith
+ * chains only) - the gate try_flat_subscript_store / try_pod_struct_store key
+ * on. Exported for the codegen's IncDecChainV allow_flat/allow_pod flags,
+ * which must encode the tree-walker's OWN compile-shape-dependent semantics.
+ * See eval.cpp (no_side_effects). */
+bool construct_no_side_effects(const Construct *c);
+
+/* VM IncDecChainV's FINAL-step semantics: given the walked-to container ref
+ * `cur` (an LValue* wrapper or a plain VALUE - the StoreLValueChainV walk
+ * convention) and the final member/subscript step, run IncDecExpr::do_eval's
+ * exact tier logic and return the expression's value (old for postfix, new
+ * for prefix). Tier 2 (`tier2`, a proven int/float lvalue) mirrors
+ * handle_single_expr14's compound `±= 1` - the flat/POD fast stores only when
+ * the codegen-proven allow_flat/allow_pod gate holds (try_flat/try_pod's
+ * no_side_effects AST gate) - then derives old = new ∓ 1 with NO re-read;
+ * tier 3 (dyn) mirrors the checked read-modify-write (NotLValue / const /
+ * TypeError at the INC-DEC caret `id_*`). See eval.cpp. */
+EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
+                          const EvalValue &memId, const UniqueId *memUid,
+                          const EvalValue &key,
+                          bool tier2, bool is_inc, bool is_prefix,
+                          bool allow_flat, bool allow_pod,
+                          Loc lstart, Loc lend, Loc kstart, Loc kend,
+                          Loc id_start, Loc id_end);
+
 /* VM (StoreMemberV): native `s.member = v` / `OP= v` for a STRUCT base (a dict
  * member store goes through DictStore). See eval.cpp. */
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,

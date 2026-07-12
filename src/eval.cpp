@@ -668,13 +668,15 @@ do_func_call(EvalContext *ctx,
 
     try {
 
-        if (!obj.func->body->is_block()) {
-
-            /* Single-expression body: `func f(...) => expr;` */
-            return do_func_return(
-                obj.func->body->eval(&args_ctx),
-                obj.func->body.get()
-            );
+        /* An expression body - `func f(...) => expr;`, now parsed as
+         * `{ return expr; }` (and its hand-written twin): evaluate the inner
+         * expression DIRECTLY, skipping the Block statement loop + FlowState
+         * round-trip - the old `=>` fast path, via the shared looker-through.
+         * Skipped when a compiled chunk exists (-vm: the ReturnV chunk IS the
+         * native form of the same body). */
+        Construct *eb;
+        if (!vm_ck && (eb = func_expr_body(obj.func)) != nullptr) {
+            return do_func_return(eb->eval(&args_ctx), eb);
         }
 
         /*
@@ -2805,6 +2807,11 @@ no_side_effects(const Construct *c)
     return false;
 }
 
+bool construct_no_side_effects(const Construct *c)
+{
+    return no_side_effects(c);
+}
+
 /*
  * Flat-array element store CORE: `blv` holds a flat (non-general, non-const,
  * non-read-only) SharedArrayObj `arr`; store `rval` (op) at index `idx_v`. The
@@ -3244,6 +3251,165 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
     const EvalValue one{static_cast<int_type>(1)};
     apply_compound_op(old, one, is_inc ? Op::addeq : Op::subeq);
     lv->put(std::move(old));
+}
+
+/*
+ * VM IncDecChainV's FINAL step (see eval.h): IncDecExpr::do_eval's exact tier
+ * semantics over the walked-to container ref. `cur` is an LValue* wrapper or a
+ * plain VALUE (the chain-walk convention: a value-walked chain reproduces the
+ * tree-walker's rvalue-ness, so the final ref of an rvalue base is an rvalue).
+ *
+ * Tier 2 (a proven int/float lvalue) == handle_single_expr14(`±= 1`) then
+ * old = new ∓ 1 (apply_compound_op - so a dyn-laundered non-numeric derives
+ * or throws EXACTLY as the tree-walker's derive does):
+ *   - final SUBSCRIPT: the flat path (flat_store_core) ONLY when the codegen
+ *     proved the base AST side-effect-free (`allow_flat` - try_flat's gate);
+ *     else the general subscript(for_write=false) lvalue + slot_rmw (a flat
+ *     element read through an impure base is an RVALUE -> NotLValueEx at the
+ *     LVALUE caret, the tree-walker's doAssign error).
+ *   - final MEMBER: the POD byte store (vm_member_store) ONLY under
+ *     `allow_pod` (try_pod's gate) for a struct base; else the general member
+ *     lvalue (vm_member_lvalue_ref; a POD/readonly field is a VALUE read -
+ *     run member_read_core for its non-container TypeError, then NotLValueEx).
+ *
+ * Tier 3 (dyn / un-hinted) == the dyn read-modify-write: form the final ref
+ * READ-style, then NotLValue / const / non-int-float TypeError at the INC-DEC
+ * caret (`id_*`), ±1, return old (postfix) / new (prefix).
+ */
+EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
+                          const EvalValue &memId, const UniqueId *memUid,
+                          const EvalValue &key,
+                          bool tier2, bool is_inc, bool is_prefix,
+                          bool allow_flat, bool allow_pod,
+                          Loc lstart, Loc lend, Loc kstart, Loc kend,
+                          Loc id_start, Loc id_end)
+{
+    const Op cop = is_inc ? Op::addeq : Op::subeq;
+    const EvalValue one{static_cast<int_type>(1)};
+
+    if (tier2) {
+
+        EvalValue nv;
+        bool have_nv = false;
+
+        if (is_member) {
+
+            const EvalValue &cval =
+                cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
+
+            if (allow_pod && cur.is<LValue *>() &&
+                cval.is<intrusive_ptr<StructObject>>() &&
+                cval.get<intrusive_ptr<StructObject>>()->is_pod()) {
+
+                /* try_pod_struct_store's case: a rooted POD struct with a
+                 * side-effect-free base - byte-store the field. */
+                nv = vm_member_store(cur.get<LValue *>(), memUid, cop, one,
+                                     lstart, lend, lstart, lend);
+                have_nv = true;
+
+            } else {
+
+                /* The general path: the member lvalue (boxed field / dict
+                 * value); a VALUE read (POD via impure base, readonly, or a
+                 * non-container base's TypeError) fails NotLValue at the
+                 * LVALUE caret, exactly as the tree-walker's doAssign. */
+                LValue *lv = vm_member_lvalue_ref(cval, memId, memUid,
+                                                  /*for_write=*/false,
+                                                  lstart, lend);
+                if (!lv) {
+                    member_read_core(cval, memId, memUid, false,
+                                     lstart, lend, lstart, lend);
+                    throw NotLValueEx(lstart, lend);
+                }
+                nv = slot_rmw(*lv, cop, one);
+                have_nv = true;
+            }
+
+        } else {
+
+            if (allow_flat && cur.is<LValue *>()) {
+                SharedArrayObj *arr;
+                if (flat_writable_array(cur.get<LValue *>(), arr)) {
+                    EvalValue out;
+                    if (flat_store_core(cur.get<LValue *>(), *arr, key, one,
+                                        cop, out, lstart, lend, kstart, kend)) {
+                        nv = out;
+                        have_nv = true;
+                    }
+                }
+            }
+
+            if (!have_nv) {
+                EvalValue elv;
+                try {
+                    Type *ct = cur.is<LValue *>()
+                        ? cur.get<LValue *>()->get().get_type()
+                        : cur.get_type();
+                    elv = ct->subscript(cur, key, /*for_write=*/false);
+                } catch (Exception &e) {
+                    if (!e.loc_start) {
+                        e.loc_start = lstart;
+                        e.loc_end = lend;
+                    }
+                    throw;
+                }
+                if (!elv.is<LValue *>())
+                    throw NotLValueEx(lstart, lend);
+                nv = slot_rmw(*elv.get<LValue *>(), cop, one);
+                have_nv = true;
+            }
+        }
+
+        if (is_prefix)
+            return nv;
+
+        EvalValue old = nv;     /* old = new -/+ 1 (no operand re-read) */
+        apply_compound_op(old, one, is_inc ? Op::subeq : Op::addeq);
+        return old;
+    }
+
+    /* Tier 3 (dyn): the checked read-modify-write. */
+    LValue *lv;
+
+    if (is_member) {
+        const EvalValue &cval =
+            cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
+        lv = vm_member_lvalue_ref(cval, memId, memUid, /*for_write=*/false,
+                                  lstart, lend);
+        if (!lv) {
+            member_read_core(cval, memId, memUid, false,
+                             lstart, lend, lstart, lend);
+            throw NotLValueEx(id_start, id_end);
+        }
+    } else {
+        EvalValue elv;
+        try {
+            Type *ct = cur.is<LValue *>()
+                ? cur.get<LValue *>()->get().get_type()
+                : cur.get_type();
+            elv = ct->subscript(cur, key, /*for_write=*/false);
+        } catch (Exception &e) {
+            if (!e.loc_start) { e.loc_start = lstart; e.loc_end = lend; }
+            throw;
+        }
+        if (!elv.is<LValue *>())
+            throw NotLValueEx(id_start, id_end);
+        lv = elv.get<LValue *>();
+    }
+
+    if (lv->is<Builtin>())
+        throw CannotRebindBuiltinEx();
+    if (lv->is_const_var())
+        throw CannotChangeConstEx(id_start, id_end);
+
+    EvalValue old = lv->get();
+    if (!old.is<int_type>() && !old.is<float_type>())
+        throw TypeErrorEx("'++'/'--' requires an int or float",
+                          id_start, id_end);
+    EvalValue nv = old;
+    apply_compound_op(nv, one, cop);
+    lv->put(move(nv));
+    return is_prefix ? lv->get() : old;
 }
 
 /*

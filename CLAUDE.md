@@ -526,6 +526,31 @@ dispatches statements
 (`if`/`while`/`for`/`foreach`/`func`/`try`/`throw`/`return`/braced
 block/expression-statement).
 
+**`func f(x) => expr` is parse-time SUGAR for `func f(x) { return expr; }`.**
+The parser's arrow branch (`pAcceptFuncDecl`) desugars immediately — the body
+is ALWAYS a `Block` (one body shape everywhere: the VM compiles every function
+body to a chunk; no later pass needs an expression-body special case; the
+synthetic `ReturnStmt`/`Block` carry the expression's locs so carets and
+backtraces are unchanged). The passes that OPTIMIZE the sugar look through the
+wrapper via **`func_expr_body(fd)`** (`syntax.h`: the inner expression iff the
+body is exactly `{ return <expr>; }` — hand-written or desugared, the two
+spellings are deliberately indistinguishable; tag-based, no dynamic_cast):
+the EXPRESSION inliner's classification + splice (`inlinable_decl`, the clone
+/ size gate / per-param use counts all run on the inner expr, so the `-it`
+threshold measures what it always measured), `do_func_call`'s direct-eval
+fast path (the tree-walker evaluates the inner expr with no Block loop /
+FlowState round-trip — skipped under `-vm` when the body's chunk exists,
+which is the native form of the same body), and coderender (a single-return
+body renders back as `=> expr;`). Two Inliner rules keep the engines
+disjoint and sound: a func registered in `funcs` (the `-it`-gated expression
+engine) stays OUT of `block_funcs` (block-inline is CALL_WEIGHT-gated and
+would bypass `-it`; a single-return body the expr engine REFUSES — a
+recursive one, for the unroll; a param-mutator — still reaches the block
+engines), and **`refold` never folds a LAZY builtin call**
+(`defined`/`isconst`/`isconstdecl` — `defined(g)` tolerates an UndefinedId
+arg, so a cctx eval "succeeds" and would answer a RUNTIME-order-dependent
+question at compile time; exposed by an inlined `return defined(gg)` body).
+
 **Bitwise / shift operators (`~ & ^ | << >> >>>`) are int-only.** New `Type`
 virtuals `band`/`bor`/`bxor`/`shl`/`shr`/`ushr` (binary) and `bnot` (unary) —
 base `Type` throws `TypeErrorEx`, only `TypeInt` implements them, so a `float`
@@ -4054,13 +4079,28 @@ the two per-fragment fallback ops became unreachable and were REMOVED
 now: an operand/condition/loop-init that can't lower fails its WHOLE
 statement to one `EvalStmt` (`emit_init` returns bool; `compile_native_if`
 failure → a whole-if `EvalStmt` in `gen_stmt`) — never a per-op node
-fallback. **Residual `EvalStmt` users:** the dev-only **`show`**
-(script-excluded by `reject_dev_builtins`, so never in serialized
-bytecode; reachable only under the `-rt` harness) and the **impure-lvalue
-inc-dec VALUE form** (`y = a[f()]++` — `incdec_lvalue_pure` declines a
-side-effecting index; rare, whole-statement, byte-identical). Codegen-
-shape tests pin all four roots (`jinn`/`munpack` counters) + the
-whole-statement fallback behavior.
+fallback. **R4 is now NATIVE too — `IncDecChainV`** (the impure-lvalue
+inc-dec VALUE form, `y = a[f()]++` / `++d[kf()]` / `a[f()][g()]++` /
+`a[f()].x++` / `mk()[0]++`): the codegen decomposes the lvalue into a
+root (a container slot, or a compiled RVALUE temp — kind 3, whose VALUE
+seed keeps the tree-walker's rvalue-ness, so `mk()[0]++` still throws
+NotLValueEx) plus member/subscript steps with each KEY compiled into a
+temp ONCE (side effects run exactly once, in source order), pooled in
+the serializable **`Chunk::incdec_chains`** (steps + tier + prefix +
+the `allow_flat`/`allow_pod` gates — `no_side_effects(final base)`,
+the tree-walker's own AST-shape-dependent try_flat/try_pod gate, so it
+is compile-time data — + carets). The runtime walk is the shared
+StoreLValueChainV intermediate walk (`vm_chain_walk`); the final step
+runs `vm_incdec_final` (eval.cpp) — IncDecExpr::do_eval's EXACT tier
+semantics: tier 2 (proven int/float) = the compound `±= 1`
+(flat_store_core / member-store / general-lvalue slot_rmw) then
+old = new ∓ 1 derived with NO re-read; tier 3 (dyn) = the checked
+read-modify-write. **Residual `EvalStmt` users:** the dev-only
+**`show`** (script-excluded by `reject_dev_builtins`, so never in
+serialized bytecode; reachable only under the `-rt` harness) and any
+genuinely-uncompilable future shape (whole-statement, byte-identical).
+Codegen-shape tests pin all five roots (`jinn`/`munpack`/`idchain`
+counters) + the whole-statement fallback behavior.
 The `InlinedCallExpr` return-across-try residue is CLOSED: a `return`
 crossing trys INSIDE the inline boundary inlines each crossed try's
 handler-pop + finally at the return (bounded at the BOUNDARY, not the
@@ -4088,7 +4128,8 @@ The builtin-call ops read the `builtin_calls` pool,
 `CallValueGenericV` the `call_sites` pool (carets + arg0's lvalue
 descriptor — F1 step 2),
 `CheckFuncV`/`MapFilterV` and the flat int/float element stores the loc side
-table, and the checked inc-decs the `incdec_sites` pool — all AST-free.
+table, and the checked inc-decs the `incdec_sites` / `incdec_chains`
+pools — all AST-free.
 **How it's built:** `Instr::node_idx`
 (a 4-byte index into a CODEGEN-TRANSIENT `Chunk::ast_nodes`, appended by
 `Codegen::add_ast_node`) is the SPLICE-STABLE handle codegen needs before an
@@ -4133,7 +4174,8 @@ still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
-`member_keys`, `incdec_sites`, `emplace_sites`, `call_sites`, `catch_types`,
+`member_keys`, `incdec_sites`, `incdec_chains`, `emplace_sites`,
+`call_sites`, `catch_types`,
 `literal_objs`, `closure_defs`, `struct_defs`,
 `unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT
 serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
