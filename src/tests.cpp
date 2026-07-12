@@ -6462,6 +6462,25 @@ static const std::vector<test> tests =
     },
 
     {
+        /* A COMPOUND multi-target `a, b OP= rhs` -> MultiUnpackV with the base
+         * op: each target OP= its element (array rhs) / the scalar (non-array),
+         * a `_` target skipped. Native on the VM; the differential covers it. */
+        "Multi-assign compound (a, b += rhs)",
+        {
+            "var a = 1; var b = 2; a, b += [3, 10];",
+            "assert(a == 4 && b == 12);",
+            "var c = 1; var d = 2; c, d += 5;",
+            "assert(c == 6 && d == 7);",
+            "var e = 10; var f = 20; e, f -= [1, 2];",
+            "assert(e == 9 && f == 18);",
+            "var g = 1; var h = 3; g, _, h += [10, 20, 30];",
+            "assert(g == 11 && h == 33);",
+            "var p = 1.5; var q = 2.5; p, q += [0.5, 0.5];",
+            "assert(p == 2.0 && q == 3.0);",
+        },
+    },
+
+    {
         /* F-1: multi-assign of an array VALUE (not a literal) -> MultiUnpackV;
          * the differential reruns this under -vm (strict length distribute). */
         "Multi-assign destructures an array value",

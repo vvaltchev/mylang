@@ -1452,18 +1452,36 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * NON-array rvalue SPREADS to every target. */
             const EvalValue &rval = ctx.frame->at(in.a.slot).get();
             const std::vector<int32_t> &targets = chunk.unpack_targets[in.target];
+            /* A COMPOUND `a, b OP= rhs` (in.aop != invalid): each target reads
+             * its CURRENT value, applies the op with its element/scalar, writes
+             * back — else a plain distribute. */
+            const bool compound = in.aop != Op::invalid;
+            auto store = [&](int32_t t, const EvalValue &v) {
+                if (!compound) {
+                    ctx.frame->at(t).put(v);
+                    return;
+                }
+                EvalValue nv = ctx.frame->at(t).get();
+                try {
+                    num_bin_op(nv, v, binop_pmf(in.aop));
+                } catch (Exception &e) {
+                    vm_stamp_loc(chunk, pc, e);
+                    throw;
+                }
+                ctx.frame->at(t).put(std::move(nv));
+            };
             if (rval.is<SharedArrayObj>()) {
                 const size_type m = rval.get_ref<SharedArrayObj>().size();
                 if (m != static_cast<size_type>(targets.size()))
                     vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
                 for (size_t i = 0; i < targets.size(); i++)
                     if (targets[i] >= 0)
-                        ctx.frame->at(targets[i]).put(
-                            vm_arr_elem(rval, static_cast<size_type>(i)));
+                        store(targets[i],
+                              vm_arr_elem(rval, static_cast<size_type>(i)));
             } else {
                 for (int32_t t : targets)
                     if (t >= 0)
-                        ctx.frame->at(t).put(rval);
+                        store(t, rval);
             }
             pc++;
             break;

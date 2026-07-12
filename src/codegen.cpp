@@ -1572,7 +1572,8 @@ struct Codegen {
      * Every target must be a real or `_` slot, resolved-local, non-const,
      * non-typed (or dyn) - a typed/const/map target falls back. */
     bool try_multi_unpack(const Expr14 *e, const IdList *il,
-                          std::vector<Instr> &ops)
+                          std::vector<Instr> &ops,
+                          Op compound_op = Op::invalid)
     {
         const size_t n = il->elems.size();
         if (n == 0)
@@ -1608,6 +1609,7 @@ struct Codegen {
          * carries no loc, so the error stamps the enclosing Expr14's span
          * (`a, b, c = <rvalue>`) via Construct::eval - so record `e`, not il. */
         in.node_idx = add_ast_node(e);
+        in.aop = compound_op;   /* invalid == plain assign; else `t OP= elem` */
         in.a = slot_op(rslot);
         in.target = static_cast<int>(chunk.unpack_targets.size());
         chunk.unpack_targets.push_back(std::move(targets));
@@ -1667,6 +1669,15 @@ struct Codegen {
                     return true;
                 return false;
             }
+        }
+
+        /* A COMPOUND multi-target `a, b OP= rhs`: each target OP= its element
+         * (an array rhs) or the scalar (a non-array rhs) — MultiUnpackV with the
+         * base op. */
+        if (!is_assign && cbase != Op::invalid) {
+            if (const IdList *il =
+                    dynamic_cast<const IdList *>(e->lvalue.get()))
+                return try_multi_unpack(e, il, ops, cbase);
         }
 
         /* An assignment whose TARGET is not an lvalue always throws (the tree-
