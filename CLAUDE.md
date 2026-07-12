@@ -1867,10 +1867,30 @@ sanitizers never reproduced it.)
   visible after it — previously only TOP-LEVEL block funcs leaked; function-
   nested ones already didn't). A **capturing** named func is excluded (it closes
   over locals, so it is the enclosing scope's local via `declare_masking`, as
-  before). **Known limitation (pre-existing):** mutual recursion between *sibling
+  before) — though NOTE that the grammar rejects a capture list on a NAMED
+  func everywhere (`func f[x]()` is a SyntaxError; captures are for closure
+  EXPRESSIONS only), so that exclusion is dead in practice.
+  **Known limitation (pre-existing):** mutual recursion between *sibling
   nested* functions doesn't resolve (each function's body resolves in its own
   scope stack, which doesn't see the enclosing scope's scoped globals) — it was
   already broken (a runtime `UndefinedVariableEx`), and stays so.
+  **KNOWN CRASH (2026-07-14, fix agreed):** a func (or struct) decl as a
+  **BRACE-LESS** `if`/loop body — `if (c) func g() => 1;`,
+  `while (i < 1) func g() => 1;` — ABORTS the tree-walker:
+  `hoist_scoped_decls` only pre-scans **Block** statement lists, so a
+  bare-statement body's decl is never hoisted to a scoped global; it falls to
+  `declare_masking` (a local map entry) and `FuncDeclStmt::do_eval`'s
+  `ctx->emplace` then trips the asserted-EMPTY script map
+  (`in_const_eval() || repl_mode`). The braced forms
+  (`if (c) { func g() => 1; }`) hoist and work. **The AGREED fix (maintainer,
+  2026-07-14): the PARSER normalizes a brace-less `if`/`while`/`for`/`foreach`
+  body to an implicit single-statement `Block`** — semantics-neutral for every
+  other statement (a single non-decl statement's block is `scope_free`, so it
+  runs in place), it routes the decl through the normal hoist, and it makes
+  the VM codegen's non-global-`FuncDeclStmt` fallback provably DEAD in scripts
+  (the REPL never runs codegen) so that emit path can be deleted. Not yet
+  implemented — see plans/vm-fallback-elimination.md (execution order, the
+  rescoped step 4).
   **Scope, still map-bound:** lambdas (anonymous — no name binding; their
   params/locals ARE slotted) and, in the **REPL** (top-level names stay
   redefinable), all top-level names; template-instance clones, inserted before
@@ -3007,6 +3027,14 @@ the proof. Before calling it done:
 > 10. **Say it once more: after compilation, NO AST NODES, NO `Construct*`, NO
 >     pointers, NO indexes, NO tables — the AST is FREED and the script runs on
 >     bytecode + pooled data alone.**
+>
+> The CANONICAL, code-derived inventory of everything still violating this —
+> the fallback emit sites, the node-keeping ops, the chunk-less bodies, and
+> the AST-anchored call model (`closure_defs` holding `FuncDeclStmt*`,
+> `do_func_call` binding params via the AST, AST-owned `StructTypeDef`s) —
+> lives in **`plans/vm-fallback-elimination.md`, "THE COMPLETE AST-RETENTION
+> INVENTORY"** (four tiers + the execution order + the maintainer-decided
+> forks). Keep it current as items land.
 
 MyLang's performance philosophy is a two-front strategy, in this deliberate
 order — the same order a real C/C++ compiler works in:
@@ -3824,15 +3852,29 @@ of a `dyn` callee (`var dyn a = len; a("hi")`, `a(1)` on a non-func) is native.
 A dyn callee is resolved at RUNTIME and may be a `FuncObject`, a read-only
 `Builtin`, a MUTATING builtin (needs an lvalue arg), an AST builtin (`defined` —
 needs the unevaluated arg node), or a struct descriptor, so the dispatch is
-intrinsically AST-dependent and a fully AST-free lowering is IMPOSSIBLE — the op
+AST-dependent TODAY — the op
 KEEPS its CallExpr node (its args ExprList + callee caret), but the callee LOAD
 is native and a `FuncObject` body runs native (the do_func_call hook). The
 dispatch is the shared **`dispatch_call_value`** helper (`eval.cpp`) reused by
 BOTH the tree-walker's `CallExpr::do_eval` AND the op, so the two engines are
 byte-identical (FuncObject → do_func_call, Builtin → its ExprList ABI, struct →
 construct, else `NotCallableEx`). `extract_locs` records the op's CALL-SITE loc
-(for a FuncObject body's backtrace) WHILE keeping the node — the one op that
-does both. A Func-TYPED callee still uses the leaner register-run `CallValueV`.
+(for a FuncObject body's backtrace) WHILE keeping the node — the LAST
+non-fallback node-keeping op. A Func-TYPED callee still uses the leaner
+register-run `CallValueV`. **The AGREED path to AST-freedom (maintainer,
+2026-07-14):** a LAZY-ARG builtin **cannot be called INDIRECTLY** (through a
+dyn value) — the lazy set is `defined`/`isconst`/`isconstdecl`/`decltype`
+(unevaluated-arg semantics that pre-evaluated values cannot reproduce; `show`
+is already script-rejected, and `type`/`typestr`/`kindstr` are dual-ABI so
+they stay callable). Enforced in the shared `dispatch_call_value` (a runtime
+error naming the builtin — byte-identical in both engines) plus, where
+provable, a compile-time reject of those builtins used as VALUES. Whether the
+LVALUE-ABI builtins (`append`/`pop`/… — arg0 must be an lvalue, which
+pre-evaluated values lose) join the rule or get a compiled lvalue-descriptor
+(the CallBuiltinLV kind/slot encoding) is an implementation-time detail; with
+that settled, `CallValueGenericV` pre-evaluates its args into a register run
++ pooled carets and drops its node. Not yet implemented — see
+plans/vm-fallback-elimination.md (the fork list).
 
 **Niche STATEMENTS → native (a further sweep).** Several residual real shapes
 went native: an **inc-dec STATEMENT on an int/float member/nested subscript**

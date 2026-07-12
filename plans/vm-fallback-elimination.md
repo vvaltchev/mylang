@@ -669,32 +669,39 @@ reachable path below is script-reachable unless proven otherwise.
 
 ### Tier 1 — fallback-op EMIT SITES in codegen.cpp (re-enter the tree-walker)
 
+(Line numbers are as of 2026-07-13; residues struck as they land.)
+
 1. **`emit_init`:726 → EvalStmt** — loop init failing int+float+boxed stmt
-   compile (a typed i/f decl fed dyn; an rhs `compile_boxed_expr` declines).
+   compile. ~~a typed i/f decl fed dyn~~ (CoerceNumV, step 6); residue: an
+   rhs `compile_boxed_expr` declines (shrinks with every expr lowering).
 2. **`eval_to_temp`:2086 → EvalToSlot**, from `compile_int_expr`:2952 /
    `compile_float_expr`:3719 — a `th==i/f` `DirectBuiltinCallExpr` failing
-   `try_native_builtin`: an AST-ABI builtin (`defined(a[0])` — non-identifier
-   arg), or `emit_args_range` failing on an arg.
+   `try_native_builtin`: ~~`defined(a[0])`~~ (native, step 3); residue:
+   `emit_args_range` failing on an arg (recursive; shrinks).
 3. **`compile_scalar_body`:4240 → EvalStmt** — a flow-free Expr14/CallExpr/
    Return/Throw inside a native region that every native path declined (each
    such shape is itself one of the residues here; the mechanism keeps the
    loop native around it).
 4. **`compile_native_if`:4298 → JumpIfFalse** — an `if` cond failing
-   int+float+boxed compile (`if (defined(a[0]))` …).
-5. **`gen_stmt`:5404 → EvalStmt** — ForRangeStmt declined: bound not an int
-   operand AND not boxed-compilable; a loop-immutable but NON-OPERAND step
-   (`i += a[j]` — `as_int_operand` only, no temp path); body failure.
-6. **`gen_stmt`:5409 → EvalStmt** — ForStmt declined: NO cond (`for(;;)`);
-   cond failing `emit_cond_jumps`; an inc that only compiles BOXED
-   (`s += "x"` — int+float tried only); body failure.
+   int+float+boxed compile (shrinks with every expr lowering).
+5. **`gen_stmt`:5404 → EvalStmt** — ForRangeStmt declined: ~~a non-operand
+   step~~ (compiled-temp, step 5); residue: a bound/step that even the boxed
+   path can't compile; body failure. (The init-order WRONG-RESULT bug found
+   here is FIXED — see step 5.)
+6. **`gen_stmt`:5409 → EvalStmt** — ForStmt declined: ~~NO cond~~,
+   ~~a boxed-only inc~~ (both native, step 5); residue: cond failing
+   `emit_cond_jumps`; body failure.
 7. **`gen_stmt`:5419 → EvalStmt** — Foreach: all six handlers decline
    (indexed dyn container, >2-var dyn, container not proven
    array/str/dict/dyn e.g. `opt`, non-local vars, body failure).
-8. **`gen_stmt`:5542 → EvalStmt** — the catch-all: typed i/f decl fed dyn;
-   `d?.f++`; bare `defined(a[0]);`; InlinedCallExpr w/ a return crossing an
-   inner try; a NON-scope-free standalone Block; a FuncDeclStmt bound to a
-   LOCAL slot (top-level `func f[cap]`); IdList destructure w/ a typed/const
-   target; Return/Throw/Try declines.
+8. **`gen_stmt`:5542 → EvalStmt** — the catch-all: ~~typed i/f decl fed
+   dyn~~ (step 6); ~~bare `defined(a[0]);`~~ (step 3); residue: `d?.f++`;
+   InlinedCallExpr w/ a return crossing an inner try; a NON-scope-free
+   standalone Block; a FuncDeclStmt bound to a LOCAL slot (ONLY reachable
+   via the brace-less-body CRASH — see the rescoped step 4: once the parser
+   normalization lands this residue is provably dead and the path is
+   deletable); IdList destructure w/ a typed/const target; Return/Throw/Try
+   declines.
 9. **`gen_if`:5548/5551/5556 → JumpIfFalse + EvalStmt×2** — reached only
    when `compile_native_if` failed (= a BRANCH failed `compile_scalar_body`);
    then the whole cond + both branch Blocks fall back.
@@ -717,20 +724,17 @@ Exactly the `extract_locs` KEEP list + `build_node_table` survivors (verified
 against every `node_at_pc` consumer in vm.cpp):
 
 1. `EvalStmt` / `EvalToSlot` / `JumpIfFalse` — the Tier-1 ops themselves.
-2. **`EmplaceStruct`** — vm.cpp:2001. Node uses (vm_emplace_struct, eval.cpp):
-   `ctor->vm_struct_ctor_def` (→ struct_defs pool), `arg0->start/end`
-   (container caret), `cargs->elems[i]->start/end` (per-field coerce carets).
-   ALL pure data → poolable (the `boxed_ctors` `{def, ArgLoc[]}` shape). The
-   ONLY node in all of `bench/` + `samples/`.
-3. **`IncDecElemCheckedV`** — vm.cpp:975. Node uses: the Subscript child's
-   `start/end` + the IncDecExpr's `start/end` (dual carets). Pure data →
-   poolable (a dual-loc entry).
-4. **`IncDecMemberCheckedV`** — vm.cpp:994. Same + the member uid. Poolable.
+2. ~~**`EmplaceStruct`**~~ — ✅ AST-free (step 2: the `emplace_sites` pool —
+   was the ONLY node in all of `bench/` + `samples/`; the corpus now dumps
+   ZERO node_table sections).
+3. ~~**`IncDecElemCheckedV`**~~ — ✅ AST-free (step 1: `incdec_sites`).
+4. ~~**`IncDecMemberCheckedV`**~~ — ✅ AST-free (step 1).
 5. **`CallValueGenericV`** — vm.cpp:2205. The CallExpr node feeds
    `dispatch_call_value`: a DYN callee may resolve to a Builtin whose ABI takes
    the UNEVALUATED `ExprList` (`defined`/`isconst`/`decltype` need lazy args;
-   an lvalue builtin needs arg0 as an LVALUE). NOT poolable as-is — a genuine
-   DESIGN FORK (see Tier 4 notes / the fork list).
+   an lvalue builtin needs arg0 as an LVALUE). NOT poolable as-is — the
+   maintainer DECIDED the fix (2026-07-14): see fork F1 in the fork list.
+   **THE LAST non-fallback node-keeping op.**
 
 ### Tier 3 — whole bodies with NO chunk (100% tree-walked, coarser than any op)
 
@@ -802,12 +806,11 @@ is deleted.
    `declare_masking`'d and `FuncDeclStmt::do_eval`'s `ctx->emplace` hits
    the asserted-empty script map: `if (c) func g() => 1;` and
    `while (i < 1) func g() => 1;` ABORT the tree-walker today (braced
-   forms work — they hoist to scoped globals). Fix is a maintainer fork:
-   (a) parser: func/struct decls legal only as block-level statements;
-   (b) parser: normalize brace-less bodies to implicit Blocks;
-   (c) resolver: hoist bare-stmt bodies too. Once fixed, `gen_stmt`'s
-   non-global-FuncDeclStmt fallback is provably DEAD in scripts (the
-   REPL never runs codegen) → delete it. See the fork list (step 10).
+   forms work — they hoist to scoped globals). **DECIDED (2026-07-14),
+   option (b): the parser normalizes brace-less bodies to implicit
+   Blocks** — see fork F2 below for the full fix sketch. Once fixed,
+   `gen_stmt`'s non-global-FuncDeclStmt fallback is provably DEAD in
+   scripts (the REPL never runs codegen) → delete it.
 5. ✅ **DONE (2026-07-14)** for(;;) + boxed inc + non-operand for-range
    step — all native. AND a real WRONG-RESULT `-vm` bug found + fixed
    while here: `try_native_for_range` compiled a non-trivial bound temp
@@ -834,10 +837,84 @@ is deleted.
 8. Foreach residual shapes (indexed dyn, >2-var dyn, unproven container).
 9. Restructure gen_if/gen_while onto per-statement granularity, then DELETE
    each Tier-1 site as its residue provably empties.
-10. DESIGN FORKS (maintainer): CallValueGenericV lazy-arg builtins; VM scope
-    ops for non-scope-free blocks/bodies; the function-descriptor model
-    (closure_defs / do_func_call / expression bodies). These are the .myv
-    load-bearing architecture.
+10. THE DESIGN FORKS — **DECIDED by the maintainer (2026-07-14)**; each
+    below with its agreed fix, ready to implement.
+
+### FORK DECISIONS + fix sketches (maintainer-approved, 2026-07-14)
+
+**F1. `CallValueGenericV` (the last non-fallback node op) — DECIDED: a
+LAZY-ARG builtin cannot be called INDIRECTLY (a language rule).**
+- The problem: a dyn callee resolving to `defined`/`isconst`/`isconstdecl`/
+  `decltype` needs the UNEVALUATED args (`var dyn f = defined; f(x)` must
+  not evaluate `x`), which pre-evaluated register-run values cannot
+  reproduce; `show` is already script-rejected; `type`/`typestr`/`kindstr`
+  are dual-ABI (value path exists) and stay callable.
+- The fix: (a) enforce in the SHARED `dispatch_call_value` (eval.cpp) — a
+  Builtin callee from the lazy set throws a clear runtime error naming the
+  builtin, byte-identical in both engines; (b) where provable, also a
+  compile-time reject of the lazy builtins used as VALUES (the
+  `reject_dev_builtins` precedent). (c) With lazy callees impossible,
+  rework the op: pre-evaluate the args into a register run + pooled
+  ArgLocs; dispatch FuncObject → vm_call_func, struct → construct-from-
+  values (`boxed_ctors`-style carets), func_v Builtin → func_v(values).
+  OPEN implementation detail: the LVALUE-ABI builtins (`append`/`pop`/… -
+  arg0 must be an LValue, which values lose) either JOIN the
+  no-indirect-call rule or get a compiled lvalue DESCRIPTOR (the
+  CallBuiltinLV kind/slot encoding) - settle when implementing. Then the
+  op drops its node → Tier 2 is ONLY the fallback ops.
+
+**F2. The brace-less-body func/struct decl CRASH — DECIDED: the PARSER
+normalizes a brace-less `if`/`while`/`for`/`foreach` body to an implicit
+single-statement `Block`.**
+- The bug (found 2026-07-14, reproduced): `if (c) func g() => 1;` and
+  `while (i < 1) func g() => 1;` ABORT the tree-walker —
+  `hoist_scoped_decls` only pre-scans Block statement lists, so the decl
+  is `declare_masking`'d and `FuncDeclStmt::do_eval`'s `ctx->emplace`
+  trips the asserted-empty script map (`in_const_eval() || repl_mode`,
+  eval.cpp:147). Braced bodies hoist to scoped globals and work. (A named
+  func can NEVER capture — the grammar rejects `func f[x]` — so this
+  crash is the ONLY script route to a masked named func.)
+- The fix: wrap the single-statement body in a synthetic `Block` at parse
+  (the `if`/`while`/`for`/`foreach` body-parsing sites in `pStmt`, loc =
+  the statement's own). Semantics-neutral otherwise: a single non-decl
+  statement's block resolves `scope_free` → runs in place; a decl body
+  becomes block-scoped, which is what the braced form already does. `-s`
+  dumps gain a Block node (cosmetic). Then `gen_stmt`'s
+  non-global-FuncDeclStmt fallback is provably DEAD in scripts (the REPL
+  never runs codegen) → delete the path (or make it an InternalErrorEx
+  tripwire).
+
+**F3. Tier 3/4 — the `.myv` load-bearing architecture — DECIDED: design
+first, in its own plan file, before any code.**
+- Scope: VM scope ops (a child-EvalContext push/pop or a resolver change)
+  for non-scope-free blocks AND bodies; a SERIALIZABLE function descriptor
+  replacing `FuncDeclStmt` at runtime (params/frame_size/flags as pure
+  data + a chunk reference) so `closure_defs` stops holding `Construct*`
+  and `do_func_call` stops reading param `Identifier` nodes; expression
+  bodies compiled (a one-`ReturnV` chunk); `StructTypeDef` ownership moved
+  from the `StructDeclStmt` to the program image (the test-caught UAF in
+  `ast_node_pool_minimal`'s first draft is the demonstration: deref of an
+  AST-owned def after the tree died).
+
+### The wrong-result bug this audit caught (fixed, step 5 — recorded here
+### because it is the method's poster child)
+
+`try_native_for_range` compiled a non-trivial BOUND into its reserved temp
+BEFORE emitting the init ops, but `ForRangeStmt::do_eval` (eval.cpp) runs
+**init → bound → step**. With a side-effecting init that changes the bound:
+
+    func drop(v) { pop(v); return 0; }
+    var x = [1, 2, 3]; var s = 0;
+    for (var i = drop(x); i < len(x); i++) s += 1;
+
+the tree-walker (spec) reads `len(x)` AFTER the pop → 2 iterations; the VM
+read 3 → **s == 3 vs 2, a silent wrong result**. The fix: `emit_init` runs
+FIRST, then the bound temp, then the step temp (matching do_eval's order);
+pinned by the "for-range: the init evaluates BEFORE the once-read bound"
+test. The lesson for future ops: when an op caches a value the tree-walker
+evaluates lazily/in-order, the CODEGEN EMISSION ORDER is the RUNTIME
+EVALUATION ORDER — always check the do_eval it mirrors, side effects
+included.
 
 ## Remaining work (current — 2026-07-07)
 
