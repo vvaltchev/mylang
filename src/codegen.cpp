@@ -1763,6 +1763,30 @@ struct Codegen {
                 ops.push_back(in);
                 return true;
             }
+            /* A DYN/general-MEMBER `d.f++` / `d.f--` (`d` dyn/general holding a
+             * struct or dict - a PROVEN int/float member is handled by
+             * compile_int/float_stmt via StoreMemberV/DictStore). The CHECKED
+             * member inc-dec forms the member LValue (struct field / dict value)
+             * and enforces int/float; a POD field / missing key throws exactly as
+             * the tree-walker. Gated on `inc->th != i/f` (excludes the proven
+             * numeric case), a slotted base, and a non-optional member. */
+            if (const MemberExpr *m =
+                    dynamic_cast<const MemberExpr *>(inc->lvalue.get())) {
+                if (inc->th == TypeHint::i || inc->th == TypeHint::f
+                        || m->optional)
+                    return false;
+                int bslot, bkind;
+                if (!as_container_base(m->what.get(), bslot, bkind))
+                    return false;
+                Instr in;
+                in.op = OpCode::IncDecMemberCheckedV;
+                in.node_idx = add_ast_node(s);   /* the inc-dec span (carets) */
+                in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
+                in.target2 = bslot;
+                in.aop = inc->is_inc ? Op::plus : Op::minus;
+                ops.push_back(in);
+                return true;
+            }
             return false;
         }
 
@@ -5538,13 +5562,14 @@ static void extract_locs(Chunk &chunk)
         case OpCode::EmplaceStruct:   /* needs the ctor node (def + field carets) */
             break;
         case OpCode::IncDecElemCheckedV:
-            /* KEEP the node (the IncDecExpr): a dyn `c[k]++` has TWO distinct
-             * error carets - the SUBSCRIPT loc for a subscript-internal throw
-             * (KeyNotFound/OOB) and the INC-DEC loc for the inc-dec's own
+        case OpCode::IncDecMemberCheckedV:
+            /* KEEP the node (the IncDecExpr): a dyn `c[k]++` / `d.f++` has TWO
+             * distinct error carets - the SUBSCRIPT/MEMBER loc for an internal
+             * throw (KeyNotFound/OOB) and the INC-DEC loc for the inc-dec's own
              * checks (NotLValue/TypeError/const) - which the loc side table
              * (one loc per pc) can't both hold. The handler reads node->start/
-             * end (inc-dec) and its Subscript child's loc, byte-identical to
-             * the tree-walker's dyn read-modify-write path. */
+             * end (inc-dec) and its Subscript/MemberExpr child's loc, byte-
+             * identical to the tree-walker's dyn read-modify-write path. */
             break;
         default:
             in.node_idx = -1;

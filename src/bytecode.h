@@ -100,6 +100,19 @@ enum class OpCode : unsigned char {
     IncDecElemCheckedV,
 
     /*
+     * CHECKED MEMBER inc-dec `d.f++` / `d.f--` for a DYN/unproven base (`d.f`
+     * where `d` is dyn/general holding a struct or dict). target = the base slot
+     * kind (0 local / 1 global / 2 capture), target2 = the base slot, aop =
+     * plus/minus. Mirrors IncDecExpr::do_eval's dyn path over MemberExpr's
+     * lvalue logic: a mutable boxed STRUCT field or a DICT value is an lvalue
+     * (read, check int/float, ±1); a POD field / readonly / a missing dict key
+     * throws (NotLValueEx / KeyNotFoundEx), exactly as the tree-walker. KEEPS
+     * its node (the IncDecExpr) for its TWO error carets - the MEMBER loc for a
+     * KeyNotFound vs the INC-DEC loc for its own NotLValue/TypeError.
+     */
+    IncDecMemberCheckedV,
+
+    /*
      * Fused compare-and-branch: if NOT (a <aop> b) then pc = target, else fall
      * through. a/b are int Operands, aop a comparison Op. One dispatch replaces
      * the tree-walker's eval_cond -> TypedScalarExpr -> Identifier chain (this

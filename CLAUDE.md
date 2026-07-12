@@ -3762,8 +3762,15 @@ IncDecExpr) — the only op that needs TWO distinct error carets the one-loc sid
 table can't hold: the SUBSCRIPT loc for a subscript-internal throw
 (`KeyNotFound`/OOB) vs the INC-DEC loc for its own `NotLValue`/`const`/
 `TypeError` — reading `node->start/end` + its `Subscript` child's loc, byte-
-identical to the tree-walker. Only a dyn **MEMBER** inc-dec (`d.f++`) stays on
-the fallback (almost always a `NotLValueEx` on a POD field anyway).
+identical to the tree-walker. A **dyn MEMBER** inc-dec `d.f++`/`d.f--` (a dyn/
+general base holding a struct or dict) is the exact twin, **`IncDecMemberCheckedV`**:
+it forms the member LValue like `MemberExpr::do_eval`'s rooted-base path (a
+mutable boxed STRUCT field or a DICT value is an lvalue; a POD field / readonly
+/ a missing dict key throws `NotLValueEx`/`KeyNotFoundEx`), int/float-checks,
+±1. Same node-kept dual-loc (the MEMBER loc for a `KeyNotFound` vs the INC-DEC
+loc for `NotLValue`/`TypeError`). Both cover a proven-struct NON-numeric member
+too (`s.name++` on a str field → `TypeError`, `th != i/f` so it isn't the M8
+`StoreMemberV` path). An optional `d?.f++` still falls back (rare).
 
 **Non-tail block-body inline (`InlinedCallExpr`) → native.** A `y = f(args)`
 whose block-bodied `f` inlined with a residual that couldn't collapse to a
@@ -3804,16 +3811,19 @@ storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 / `str s;` / `Point p;` is already desugared (at parse) to a zero-value literal
 / zero-struct ctor rvalue, so it lowers the same way.
 
-**Residual `EvalStmt`:** the harder niche shapes (a member-subscript-member
-nested store `d.a[0].f=v` — a genuine `NotLValueEx` path in both engines, a dyn
-**MEMBER** inc-dec statement `d.f++`, an **int/float**-typed decl fed a `dyn`
-value — left to the tree-walker for `coerce_to_decl_type`); an `InlinedCallExpr`
-whose return crosses a try INSIDE the boundary (rare); and the dev-only
-**`show`** (script-excluded by `reject_dev_builtins`, so never in serialized
-bytecode). None appear in `bench/` or `samples/` (both stay 100% native). The
-`_`-in-unpack / indexed dict `foreach`, the ≥3-level nested store, the dyn
-scalar/element inc-dec, `append` to a struct member, the common
-`InlinedCallExpr`, and typed NON-scalar decls are all now native (above).
+**Residual `EvalStmt`:** the harder niche shapes (a **member-in-the-middle
+nested store** `a[i].f=v` / `q.p.x=v` / `d.a[0].f=v` — works for BOXED structs,
+throws `NotLValueEx` for POD; needs a general lvalue-CHAIN store op mixing
+member+subscript steps, deferred; an **int/float**-typed decl fed a `dyn` value
+— left to the tree-walker for `coerce_to_decl_type`; an optional `d?.f++`; a
+non-identifier `defined(a[0])`); an `InlinedCallExpr` whose return crosses a try
+INSIDE the boundary (rare); and the dev-only **`show`** (script-excluded by
+`reject_dev_builtins`, so never in serialized bytecode). None appear in `bench/`
+or `samples/` (both stay 100% native). The `_`-in-unpack / indexed dict
+`foreach`, the ≥3-level SUBSCRIPT nested store, the dyn scalar/element/member
+inc-dec, `append` to a struct member, the common `InlinedCallExpr`, typed
+NON-scalar decls, `defined(<never-declared>)`, and a runtime-`const` rebind are
+all now native (above).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index
@@ -3822,8 +3832,9 @@ has no AST pointer in its instruction stream. The pool holds ONLY the nodes an
 op still needs at RUNTIME: the fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`,
 `node->eval`), the builtin-call ops (`CallBuiltinV`/`LV`/`LVElem`,
 `EmplaceStruct`, `CheckFuncV`/`MapFilterV` — the args `ExprList` for per-arg
-carets), `CallValueGenericV` (its args + callee), `IncDecElemCheckedV` (its
-DUAL error carets — subscript vs inc-dec loc, above), and the flat int/float
+carets), `CallValueGenericV` (its args + callee), `IncDecElemCheckedV`/
+`IncDecMemberCheckedV` (their DUAL error carets — subscript/member vs inc-dec
+loc, above), and the flat int/float
 element store (`node->start` for its OOB/div0 caret). Built during codegen
 (`Codegen::add_ast_node` appends + returns the
 index; the pool absorbs codegen rollbacks harmlessly), then **`extract_locs`

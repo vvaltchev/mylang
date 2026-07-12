@@ -2988,6 +2988,60 @@ void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
 }
 
 /*
+ * VM IncDecMemberCheckedV: `d.f++` / `d.f--` on a DYN/unproven base. Forms the
+ * member LValue exactly like MemberExpr::do_eval's for_write=false path for a
+ * ROOTED base (the base is a slot, so is_lvalue_rooted holds): a mutable boxed
+ * STRUCT field, or a DICT value (present / default-vivified; a missing key with
+ * no default throws KeyNotFoundEx with the MEMBER loc). A POD field / readonly
+ * instance / non-struct-non-dict base has no lvalue -> NotLValueEx (the INC-DEC
+ * loc), matching the tree-walker. Then int/float-checked ±1 (discarded). Two
+ * carets like vm_incdec_elem: the MEMBER loc for a KeyNotFound, the INC-DEC loc
+ * for its own NotLValue/const/TypeError.
+ */
+void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
+                      const UniqueId *memUid, bool is_inc,
+                      Loc mstart, Loc mend, Loc id_start, Loc id_end)
+{
+    const EvalValue &dval = base_lv->get();
+    LValue *lv = nullptr;
+
+    if (dval.is<intrusive_ptr<StructObject>>()) {
+        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
+        const int slot = obj->def->slot_of(memUid);
+        /* a mutable, boxed field is an lvalue; a POD field / readonly instance
+         * is a value read -> stays null -> NotLValueEx below (as the tree-
+         * walker's member_read result would fail the inc-dec's lvalue check). */
+        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly())
+            lv = &obj->fields[slot];
+    } else if (dval.is<intrusive_ptr<DictObject>>()) {
+        const auto &obj = dval.get<intrusive_ptr<DictObject>>();
+        if (!obj->is_readonly()) {
+            DictObject::inner_type &data = obj->get_ref();
+            const auto &it = data.find(memId);
+            if (it != data.end())
+                lv = &it->second;
+            else if (obj->get_has_default())
+                lv = &(*data.emplace(memId,
+                    LValue(obj->get_default(), false)).first).second;
+            else
+                throw KeyNotFoundEx(mstart, mend);   /* for_write=false */
+        }
+    }
+
+    if (!lv)
+        throw NotLValueEx(id_start, id_end);
+    if (lv->is_const_var())
+        throw CannotChangeConstEx(id_start, id_end);
+    EvalValue old = lv->get();
+    if (!old.is<int_type>() && !old.is<float_type>())
+        throw TypeErrorEx("'++'/'--' requires an int or float",
+                          id_start, id_end);
+    const EvalValue one{static_cast<int_type>(1)};
+    apply_compound_op(old, one, is_inc ? Op::addeq : Op::subeq);
+    lv->put(std::move(old));
+}
+
+/*
  * VM StoreMemberV: native `s.member = v` / `s.member OP= v` for a STRUCT base (a
  * dict member store goes through DictStore). Mirrors try_pod_struct_store (a POD
  * field: coerce + byte store) + the boxed-field lvalue store the tree-walker's

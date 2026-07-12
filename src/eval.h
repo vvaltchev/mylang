@@ -404,6 +404,14 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
 void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
                     Loc sub_start, Loc sub_end, Loc id_start, Loc id_end);
 
+/* VM (IncDecMemberCheckedV): `d.f++` / `d.f--` on a dyn/unproven base - forms
+ * the member LValue (struct field / dict value), enforces int/float, applies
+ * ±1 (statement). Two carets: member loc (KeyNotFound) vs inc-dec loc
+ * (NotLValue/TypeError). See eval.cpp. */
+void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
+                      const UniqueId *memUid, bool is_inc,
+                      Loc mstart, Loc mend, Loc id_start, Loc id_end);
+
 /* VM (StoreMemberV): native `s.member = v` / `OP= v` for a STRUCT base (a dict
  * member store goes through DictStore). See eval.cpp. */
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,

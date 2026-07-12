@@ -896,6 +896,24 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::IncDecMemberCheckedV: {
+            /* `d.f++` / `d.f--` on a dyn/unproven base: form the member LValue
+             * (struct field / dict value), enforce int/float, apply +-1. Keeps
+             * the node (IncDecExpr -> MemberExpr child) for its TWO carets: the
+             * MEMBER loc (a KeyNotFound) and the INC-DEC loc (its own NotLValue/
+             * const/TypeError). */
+            const Construct *node = chunk.ast_nodes[in.node_idx];
+            const IncDecExpr *inc = static_cast<const IncDecExpr *>(node);
+            const MemberExpr *m =
+                static_cast<const MemberExpr *>(inc->lvalue.get());
+            LValue *blv =
+                vm_store_base(ctx, in.target, in.target2, chunk, pc, node);
+            vm_incdec_member(blv, m->memId, m->memUid, in.aop == Op::plus,
+                             m->start, m->end, inc->start, inc->end);
+            pc++;
+            break;
+        }
+
         case OpCode::IntBin: {
 
             const int_type a = read_int_operand(in.a, &ctx);

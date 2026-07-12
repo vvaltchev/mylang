@@ -2311,6 +2311,29 @@ static const std::vector<test> tests =
     { "++/--: dyn aliasing a flat array element is not an lvalue",
       { "var a = [1, 2, 3]; var dyn e = a; e[0]++;" },
       &typeid(NotLValueEx) },
+    /* A dyn MEMBER inc-dec `d.f++` (VM: IncDecMemberCheckedV): forms the member
+     * LValue (a dict value / a boxed struct field) and is int/float-checked. */
+    { "++/--: dyn member is int/float-checked (dict value + boxed field)",
+      { "func mkd() { var d = {\"cnt\": 5}; return d; }",
+        "var dyn dd = mkd(); dd.cnt++; dd.cnt--; dd.cnt++;",
+        "assert(dd.cnt == 6);",
+        "struct P { int x; array t; }",     /* boxed struct (non-POD field) */
+        "func mkp() { return P(10, []); }",
+        "var dyn p = mkp(); p.x++;",
+        "assert(p.x == 11);" } },
+    /* A dyn dict MEMBER on a string value throws (int/float-only). */
+    { "++/--: dyn dict member holding a string throws",
+      { "func mkd() { var d = {\"cnt\": \"s\"}; return d; }",
+        "var dyn dd = mkd(); dd.cnt++;" }, &typeid(TypeErrorEx) },
+    /* A dyn dict MEMBER on a missing key throws KeyNotFound. */
+    { "++/--: dyn dict member on a missing key throws",
+      { "func mkd() { var d = {\"cnt\": 1}; return d; }",
+        "var dyn dd = mkd(); dd.missing++;" }, &typeid(KeyNotFoundEx) },
+    /* A dyn holding a POD struct: its field has no boxed LValue -> NotLValue. */
+    { "++/--: dyn POD-struct member is not an lvalue",
+      { "struct P { int x; int y; }",
+        "func mkp() { return P(1, 2); }",
+        "var dyn p = mkp(); p.x++;" }, &typeid(NotLValueEx) },
 
     /* dyn-into-concrete COERCION: `int + dyn` is `dyn` (the natural result), but
      * a `dyn` value is ASSIGNABLE to a concrete NUMERIC local - a runtime-checked

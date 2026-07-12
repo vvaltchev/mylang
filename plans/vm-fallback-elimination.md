@@ -581,9 +581,19 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
    compiles the rhs FIRST (its side effects run) then emits the throw with the
    lvalue's caret — byte-identical to the tree-walker's rhs-then-throw order (a
    const *scalar* is inlined, so its rebind is the bad-lvalue throw instead).
-3. **Two residual inc-dec / store shapes** — a dyn **MEMBER** inc-dec (`d.f++`,
-   almost always a `NotLValueEx` on a POD field), and a member-in-the-middle
-   nested store (`d.a[0].f = v`, a genuine `NotLValueEx` path in both engines).
+3. **Two residual inc-dec / store shapes** — a dyn **MEMBER** inc-dec (`d.f++`):
+   ✅ **DONE (2026-07-13)** via `IncDecMemberCheckedV` (the twin of
+   `IncDecElemCheckedV` — forms the member LValue like `MemberExpr::do_eval`'s
+   rooted-base path, int/float-checked, dual-loc node-kept; a dict value / boxed
+   struct field works, a POD field / missing key throws exactly as the tree-
+   walker; also covers a proven-struct non-numeric member). REMAINING: the
+   **member-in-the-middle nested store** `a[i].f=v` / `q.p.x=v` / `d.a[0].f=v` —
+   NOT just a NotLValue path (that was imprecise: it WORKS for boxed structs,
+   `game.players[i].score=0`; throws only for POD). It needs a general
+   lvalue-CHAIN store op that walks mixed member+subscript steps as lvalue refs
+   (subsuming StoreElem2V/StoreElemChainV/StoreMemberV) — a bigger design,
+   deliberately deferred rather than rushed. An optional `d?.f++` also falls
+   back.
 4. **`foreach` where all six handlers decline** — a non-local loop/unpack var
    (global/capture), an **indexed** dyn-container foreach, a **>2-var** dyn
    foreach, a container not proven array/str/dict/dyn (an `opt` container, or a
