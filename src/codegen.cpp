@@ -3277,7 +3277,17 @@ struct Codegen {
                     if (vok && compile_int_expr(sub->index.get(), idx, ops)) {
                         Instr in;
                         in.op = OpCode::StoreElemInt;
-                        in.node_idx = add_ast_node(s);
+                        /* OOB/type errors carry the SUBSCRIPT loc (matching the
+                         * tree-walker's flat_store_core), a COMPOUND div0 the
+                         * Expr14 loc (stamped by Construct::eval). A PLAIN assign
+                         * can't div0, so the subscript loc is fully correct;
+                         * only a compound needs the Expr14 (its OOB then trails
+                         * the tree-walker by the `OP= rhs` width - a rare edge). */
+                        in.node_idx = add_ast_node(
+                            aop == Op::invalid ? static_cast<const Construct *>(
+                                                     sub)
+                                               : static_cast<const Construct *>(
+                                                     s));
                         in.target = akind;   /* 0 local / 1 global / 2 cap */
                         in.target2 = aslot;
                         in.a = idx;
@@ -3651,7 +3661,12 @@ struct Codegen {
                 return false;
             Instr in;
             in.op = OpCode::StoreElemFloat;
-            in.node_idx = add_ast_node(s);
+            /* PLAIN assign -> the SUBSCRIPT loc (OOB/type, matching the tree-
+             * walker); a COMPOUND -> the Expr14 loc (for its div0). See the
+             * StoreElemInt note. */
+            in.node_idx = add_ast_node(
+                aop == Op::invalid ? static_cast<const Construct *>(sub)
+                                   : static_cast<const Construct *>(s));
             in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
             in.target2 = aslot;
             in.a = idx;
@@ -5434,7 +5449,8 @@ static void extract_locs(Chunk &chunk)
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
-        case OpCode::StoreElemInt:   /* node = the Expr14 (OOB/div0 + store caret) */
+        case OpCode::StoreElemInt:   /* node = the SUBSCRIPT (plain: OOB/type) or
+                                      * the Expr14 (compound: its div0 caret) */
         case OpCode::StoreElemFloat:
         case OpCode::CheckFuncV:     /* node = arg0 (Expected-function caret) */
         case OpCode::MapFilterV:     /* node = arg1 (unsupported-container caret) */

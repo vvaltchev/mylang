@@ -5310,6 +5310,16 @@ static const std::vector<test> tests =
         &typeid(DivisionByZeroEx), 30, 0, 41, 0,
     },
     {
+        /* A flat-int array element STORE out of bounds marks the SUBSCRIPT
+         * `g[8]` (cols 19-22), not the whole `g[8] = 1` assignment - matching
+         * the tree-walker's flat_store_core. The VM's StoreElemInt carries the
+         * subscript loc for a PLAIN assign (it can't div0); pinned so both
+         * engines stay byte-identical (was off-by-one in the VM). */
+        "err loc: flat array store out of bounds marks the subscript",
+        { "var g = [10, 20]; g[8] = 1;" },
+        &typeid(OutOfBoundsEx), 19, 0, 24, 0,
+    },
+    {
         "err loc: calling a defined non-function is a type error",
         { "var x = 5; x(1, 2);" },
         &typeid(TypeMismatchEx), 12, 0, 14, 0,
