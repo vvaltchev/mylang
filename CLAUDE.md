@@ -3458,9 +3458,9 @@ args off `exprList` — the tree-walker's append/push (so construct-in-place fir
 `pop`/`intptr` (no value args), `sort`/`reverse` (their cmp arg), and any
 append/push op the codegen left self-eval (a ctor-fallthrough, a subscript
 target). This **per-op** design is what lets `append`'s three call shapes coexist
-(a plain `append(a, x)` is rest-native = no `node->eval`, while `append(a, P(..))`
-= `EmplaceStruct` and `append(a[i], x)` = `CallBuiltinLVElem` keep the node) —
-the necessary step toward a node-free `CallBuiltinLV`. **`append(struct_arr, Ctor(args))` fuses to an
+(a plain `append(a, x)` is rest-native = no `node->eval`, `append(a, P(..))`
+= `EmplaceStruct`, `append(a[i], x)` = `CallBuiltinLVElem`).
+**`append(struct_arr, Ctor(args))` fuses to an
 `EmplaceStruct` op (Phase 2b)**: the inferencer stamps a POD struct construction
 with `CallExpr::vm_struct_ctor_def`; the codegen recognizes append/push of such
 a ctor, compiles the ctor's field-arg VALUES into a register run, and emits
@@ -3468,7 +3468,12 @@ a ctor, compiles the ctor's field-arg VALUES into a register run, and emits
 `vm_emplace_struct` (eval.cpp) coerces those values straight into the flat
 `array<Struct>`'s bytes — **no temp `StructObject`** (a non-flat `array<dyn>`
 target falls back to build+append, matching the tree-walker). So a
-`append(pts, Point(i, i*2))` build loop is fully native. An **AST builtin**
+`append(pts, Point(i, i*2))` build loop is fully native. **`EmplaceStruct` is
+AST-FREE** (the `Chunk::emplace_sites` pool: the ctor's POD def + the
+container-arg caret + the per-field coerce carets + the callee name, indexed
+by the kind-packed `Instr::a`; the whole-args caret rides the loc side
+table), so a struct-append chunk serializes with an empty `node_table`.
+An **AST builtin**
 (defined/type/…, needs the arg node) keeps the union null and stays
 `EvalToSlot`. **The read-only builtin migration to `func_v` is
 complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose
@@ -3704,10 +3709,11 @@ frame backtraces are byte-identical). **The foreach / array-read ops
 (`LoadElem*`, `ArrLen`, `DictIter*`, `ForeachDyn*`, `UnpackElem*`,
 `LoadStructField*`) are now node-free too** (the loc side table; `LoadElem*`'s
 dead non-array `node->eval` else-branch - unreachable, `base_array` is proven -
-became an `InternalErrorEx` net). So the ONLY remaining `node` users are: the
-builtin calls (`CallBuiltinV`/`LV`/`LVElem`/`EmplaceStruct` - a baked func ptr +
-the args `ExprList` for per-arg error carets; freed by the builtin loc-handle
-refactor) and the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`). P8
+became an `InternalErrorEx` net). The builtin-call ops
+(`CallBuiltinV`/`LV`/`LVElem`) read the serializable `builtin_calls` pool and
+`EmplaceStruct` the `emplace_sites` pool, so the ONLY remaining `node` users
+are the fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`) and
+`CallValueGenericV`. P8
 exceptions are fully native (they no longer reach a fallback op). The FALLBACK-OP
 AUDIT (`plans/vm-fallback-elimination.md`) that followed found LIVE `EvalStmt`
 fallbacks in several more shapes — **F-1..F-4, all now NATIVE**: the multi-assign
@@ -3767,9 +3773,10 @@ effect-free lvalue so the two evals of the slot/index agree). This last one
 surfaced a **pre-existing tree-walker bug**: auto-const promoting a write-once
 INDEX var (`var i=1; a[i]++`) dropped its decl but `fold_reads` had no
 `IncDecExpr` case, dangling the promoted `i` — fixed by folding the READS in an
-inc-dec lvalue like an assignment lvalue. **Net: all of `bench/` and `samples/`
-lower with an EMPTY `node_table` (100% native, serializable) — except the two
-struct benches that keep one `EmplaceStruct` ctor node each.**
+inc-dec lvalue like an assignment lvalue. **Net: ALL of `bench/` and `samples/`
+lower with an EMPTY `node_table` (100% native, serializable) — the struct
+benches' last `EmplaceStruct` ctor node is gone too (its def + carets moved
+into the serializable `emplace_sites` pool).**
 
 **Error-path constructs → native throwing ops (`ThrowRuntimeV`).** The
 always-throwing constructs the tree-walker ran and threw on are now native: an
@@ -3907,10 +3914,11 @@ DROPPED).** A runtime-node op looks its `Construct*` up by **pc** in the
 pc-keyed **`node_table`** (`{pc, Construct*}`, sorted, binary-searched by
 `node_at_pc` on the COLD path only — SAME shape/cost as `locs` / `inline_ctxs`),
 NOT via a per-`Instr` index into a pool. The residual nodes are now ONLY: the
-fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`),
-`EmplaceStruct` (the ctor node: def + field carets), and `CallValueGenericV`
+fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`) and
+`CallValueGenericV`
 (its args `ExprList` + callee — a dyn callee may be a Builtin whose ABI takes
 the unevaluated args). The builtin-call ops read the `builtin_calls` pool,
+`EmplaceStruct` the `emplace_sites` pool (ctor def + container/field carets),
 `CheckFuncV`/`MapFilterV` and the flat int/float element stores the loc side
 table, and the checked inc-decs the `incdec_sites` pool — all AST-free.
 **How it's built:** `Instr::node_idx`
@@ -3957,8 +3965,8 @@ still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
-`member_keys`, `incdec_sites`, `catch_types`, `literal_objs`, `closure_defs`,
-`struct_defs`,
+`member_keys`, `incdec_sites`, `emplace_sites`, `catch_types`, `literal_objs`,
+`closure_defs`, `struct_defs`,
 `unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT
 serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
 ones only). This is the audit surface for the `.myv` stored-bytecode endgame:

@@ -494,28 +494,29 @@ vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk &chunk, int bc_idx,
 }
 
 /* Cold helper for EmplaceStruct (Phase 2b): copy the ctor's field arg values
- * from the register run [base, base+nf) and give them to vm_emplace_struct (a0
- * = the container arg, ctor = the struct construction with vm_struct_ctor_def).
- * ML_NOINLINE keeps this (cold) path out of vm_run_chunk's hot body;
- * a struct with >8 fields heaps. */
+ * from the register run [base, base+nf) and give them to vm_emplace_struct.
+ * AST-FREE: the ctor def + the container/field carets come from the
+ * emplace_sites pool entry. ML_NOINLINE keeps this (cold) path out of
+ * vm_run_chunk's hot body; a struct with >8 fields heaps. */
 static ML_COLD EvalValue
-vm_do_emplace(EvalContext &ctx, const DirectBuiltinCallExpr *dc,
+vm_do_emplace(EvalContext &ctx, const Chunk::EmplaceSite &site,
               LValue *target, int_type base)
 {
-    const Construct *arg0 = dc->args->elems[0].get();
-    const CallExpr *ctor =
-        static_cast<const CallExpr *>(dc->args->elems[1].get());
-    const size_t nf = ctor->args->elems.size();
+    const size_t nf = site.field_locs.size();
     if (nf <= 8) {
         EvalValue stackbuf[8];
         for (size_t i = 0; i < nf; i++)
             stackbuf[i] = ctx.frame->at(base + i).get();
-        return vm_emplace_struct(&ctx, target, arg0, ctor, stackbuf, nf);
+        return vm_emplace_struct(&ctx, target, site.a0_start, site.a0_end,
+                                 site.def, site.field_locs.data(),
+                                 stackbuf, nf);
     }
     std::vector<EvalValue> heapbuf(nf);
     for (size_t i = 0; i < nf; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
-    return vm_emplace_struct(&ctx, target, arg0, ctor, heapbuf.data(), nf);
+    return vm_emplace_struct(&ctx, target, site.a0_start, site.a0_end,
+                             site.def, site.field_locs.data(),
+                             heapbuf.data(), nf);
 }
 
 /* Map an arith/bitwise Op to its num_bin_op Type method, for the boxed BinOpV
@@ -1995,11 +1996,13 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * run at `b`: form arg0's LValue* (like CallBuiltinLV), then coerce
              * the values straight into the flat struct array's bytes (no temp
              * StructObject); vm_emplace_struct handles the flat path + the
-             * general fallback and matches the tree-walker append. */
-            const DirectBuiltinCallExpr *dc =
-                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at_pc(pc));
+             * general fallback and matches the tree-walker append. AST-FREE:
+             * the ctor def + carets from the emplace_sites pool (`a` packs
+             * kind | idx << 2); the whole-args caret from the loc table. */
+            const Chunk::EmplaceSite &site =
+                chunk.emplace_sites[in.a.lit >> 2];
             LValue *target;
-            switch (in.a.lit) {
+            switch (in.a.lit & 3) {
             case 0:  target = &ctx.frame->at(in.target2); break;
             case 1:  target = ctx.gfuncs->defined[in.target2]
                          ? &ctx.gfuncs->slots[in.target2] : nullptr; break;
@@ -2007,12 +2010,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             }
             try {
                 ctx.frame->at(in.target).put(
-                    vm_do_emplace(ctx, dc, target, in.b.lit));
+                    vm_do_emplace(ctx, site, target, in.b.lit));
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = dc->args->start;
-                    e.loc_end = dc->args->end;
-                }
+                vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             pc++;

@@ -348,12 +348,15 @@ EvalValue member_read_core(const EvalValue &base, const EvalValue &memId,
 
 /* VM Phase 2b: append a POD struct built from the pre-evaluated ctor arg values
  * `vals` into `target` (a flat array<Struct> - coerced into the bytes - or a
- * general array - fallback build+append). `ctor` carries vm_struct_ctor_def and
- * the field arg locs; `arg0` the container arg (loc). See eval.cpp. */
+ * general array - fallback build+append). AST-FREE: `cdef` is the ctor's POD
+ * def, `flocs` the per-field coerce carets, `a0s`/`a0e` the container arg's
+ * caret (the lvalue/array errors) - the VM passes them from its emplace_sites
+ * pool entry. See eval.cpp. */
 class CallExpr;
 EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
-                            const Construct *arg0, const CallExpr *ctor,
-                            const EvalValue *vals, size_t n);
+                            Loc a0s, Loc a0e, const StructTypeDef *cdef,
+                            const ArgLoc *flocs, const EvalValue *vals,
+                            size_t n);
 
 /* Shared call DISPATCH for an already-evaluated callee value (the VM's
  * CallValueGenericV + the tree-walker's CallExpr::do_eval): FuncObject /

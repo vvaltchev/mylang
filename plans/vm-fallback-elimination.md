@@ -653,8 +653,9 @@ native" and "ALL scripts serialize with an empty `ast_nodes`".
   runtime looks a residual node up by pc on the cold path only. ONE `Instr`
   layout (no codegen-vs-runtime split — `node_idx` is a codegen-only handle,
   always `-1` at runtime). All `bench/` + `samples/` keep an EMPTY node_table
-  (except the two struct benches' one `EmplaceStruct` ctor node each, same as
-  before). `node_table` is now the LAST non-serializable side table (the audit
+  (the struct benches' last `EmplaceStruct` node moved into the serializable
+  `emplace_sites` pool — see the execution-order step 2 below).
+  `node_table` is now the LAST non-serializable side table (the audit
   signal for a `.myv` writer).
 
 ## ⛔ THE COMPLETE AST-RETENTION INVENTORY (2026-07-13, code-derived)
@@ -773,8 +774,16 @@ is deleted.
    loc side table (`vm_store_base`, node=null). Dual carets + the undefined
    base now PINNED by four `err loc:` tests; `ast_node_pool_minimal` case
    (c) asserts an empty node_table for both shapes.
-2. Pool EmplaceStruct (def + carets) → op 2 AST-free; `bench/`+`samples/`
-   reach a literally-empty node_table. [EASY]
+2. ✅ **DONE (2026-07-13)** Pool EmplaceStruct (def + carets) → op 2
+   AST-free via the serializable `Chunk::emplace_sites` pool ({ctor POD
+   def, callee name, container-arg caret, per-field coerce carets},
+   `Instr::a` packs `kind | idx << 2`); the whole-args caret rides the loc
+   side table (`vm_stamp_loc`). vm_emplace_struct's signature is now
+   node-free. VERIFIED: a `-vd` sweep over ALL of `bench/my/*` +
+   `samples/*` shows ZERO `node_table` sections — the whole corpus is
+   100% AST-free; `ast_node_pool_minimal` case (d) pins it (and its first
+   draft dereferenced the AST-owned StructTypeDef after freeing the tree —
+   ASan caught it, a live proof of Tier-4 item 3's lifetime rule).
 3. `defined(<non-identifier>)` = eval-arg-then-true (builtin_defined only
    tests UndefinedId, which only a bare Identifier can produce) → kills the
    Tier-1 #2 EvalToSlot residue + the bare-statement catch. [EASY]

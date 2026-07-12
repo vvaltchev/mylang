@@ -482,10 +482,12 @@ enum class OpCode : unsigned char {
     /*
      * Emplace-append a struct (Phase 2b): `append(struct_arr, Ctor(args))` with
      * the ctor's arg VALUES already in a register run [b.lit, b.lit+nfields).
-     * `a.lit` = arg0's slot KIND (like CallBuiltinLV, forms the target ptr);
-     * `target2` = arg0's slot; `target` = the dst slot; `node` = the append
-     * DirectBuiltinCallExpr (args[1] is the ctor, carrying vm_struct_ctor_def
-     * + the field arg locs). vm_emplace_struct coerces the values straight into
+     * `a.lit` = arg0's slot KIND packed with the emplace_sites pool index
+     * (`kind | idx << 2`; the kind forms the target ptr like CallBuiltinLV);
+     * `target2` = arg0's slot; `target` = the dst slot. AST-FREE: the ctor's
+     * POD def, the container-arg caret, and the per-field coerce carets come
+     * from the emplace_sites pool; the whole-args caret (the catch) from the
+     * loc side table. vm_emplace_struct coerces the values straight into
      * the flat POD-struct array's bytes (no temporary StructObject); a non-flat
      * target falls back to building the struct + a general append.
      */
@@ -1159,6 +1161,22 @@ struct Chunk {
     };
     std::vector<BoxedCtor> boxed_ctors;
 
+    /* EMPLACE-STRUCT SITE POOL (EmplaceStruct: `append(struct_arr, Ctor(..))`).
+     * Everything vm_emplace_struct needed from the node: the ctor's POD def
+     * (AST-owned/program-lifetime, re-bindable by name on load like
+     * struct_defs), the CONTAINER arg's caret (the NotLValue / Expected-array
+     * / const errors), the ctor's per-FIELD coerce carets, and the callee
+     * name (disasm / a serializer). The whole-args caret (the handler's
+     * catch) rides the loc side table. Indexed by the kind-packed `Instr::a`
+     * (`kind | idx << 2`), so the op is AST-free. */
+    struct EmplaceSite {
+        const StructTypeDef *def;
+        const UniqueId *bname;           /* append / push (the callee name) */
+        Loc a0_start, a0_end;            /* the container arg's caret */
+        std::vector<ArgLoc> field_locs;  /* the ctor's per-field carets */
+    };
+    std::vector<EmplaceSite> emplace_sites;
+
     /* Always-throw sites for ThrowRuntimeV (`Instr::target` indexes this): the
      * runtime exception an always-throwing construct raises, as pure data — the
      * kind, the caret, and (for an undefined name) the interned name. Fully
@@ -1240,10 +1258,9 @@ struct Chunk {
      * AST-NODE SIDE TABLE (pc-keyed) - the runtime home of the residual node
      * ops, SAME shape/cost as `locs` / `inline_ctxs`: `{pc, Construct*}` sorted
      * by pc (build_node_table iterates pc-ascending), binary-searched by
-     * `node_at_pc` ONLY on the cold path (a fallback's `node->eval`, a builtin
-     * op's ctor/args). The ops that still need the AST at runtime are:
+     * `node_at_pc` ONLY on the cold path (a fallback's `node->eval`). The ops
+     * that still need the AST at runtime are:
      *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (`node->eval`);
-     *   - EmplaceStruct (the ctor node: vm_struct_ctor_def + field carets);
      *   - CallValueGenericV (a dyn callee may be a Builtin whose ABI takes the
      *     unevaluated args ExprList) - see extract_locs's KEEP list.
      * A 100%-native chunk leaves this EMPTY - a non-empty `node_table` is EXACTLY

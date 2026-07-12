@@ -2564,6 +2564,27 @@ struct Codegen {
             if (ctor && ctor->vm_struct_ctor_def && ctor->args) {
                 int fieldbase;
                 if (emit_args_range(ctor->args->elems, fieldbase, ops)) {
+                    /* Pool the ctor def + carets (AST-free op): the container
+                     * arg's caret, the per-field coerce carets, the callee
+                     * name; `a` packs the base kind with the pool index. The
+                     * whole-args caret rides the loc side table
+                     * (extract_locs). */
+                    Chunk::EmplaceSite site;
+                    site.def = ctor->vm_struct_ctor_def;
+                    site.bname = nullptr;
+                    if (const Identifier *cid =
+                            dynamic_cast<const Identifier *>(dc->what.get()))
+                        site.bname = cid->uid;
+                    site.a0_start = a0->start;
+                    site.a0_end = a0->end;
+                    site.field_locs.reserve(ctor->args->elems.size());
+                    for (const auto &fe : ctor->args->elems)
+                        site.field_locs.push_back(
+                            ArgLoc{fe->start, fe->end});
+                    const int sidx =
+                        static_cast<int>(chunk.emplace_sites.size());
+                    chunk.emplace_sites.push_back(std::move(site));
+
                     const int dst = alloc_temp();
                     Instr cv;
                     cv.op = OpCode::EmplaceStruct;
@@ -2571,7 +2592,7 @@ struct Codegen {
                     cv.target = dst;
                     cv.target2 =
                         static_cast<const Identifier *>(a0)->sym.slot;
-                    cv.a = int_lit(kind);
+                    cv.a = int_lit(kind | (sidx << 2));
                     cv.b = int_lit(fieldbase);
                     ops.push_back(cv);
                     out_slot = dst;
@@ -5746,10 +5767,19 @@ static void extract_locs(Chunk &chunk)
             chunk.locs.push_back(
                 {static_cast<uint32_t>(pc), node->start, node->end});
             break;   /* node_idx kept */
+        case OpCode::EmplaceStruct: {
+            /* The ctor def + container/field carets are in the emplace_sites
+             * pool; record the WHOLE-ARGS caret (the handler's catch stamps a
+             * loc-less throw with it) -> AST-free. */
+            const auto *dc = static_cast<const DirectBuiltinCallExpr *>(node);
+            chunk.locs.push_back({static_cast<uint32_t>(pc),
+                                  dc->args->start, dc->args->end});
+            in.node_idx = -1;
+            break;
+        }
         case OpCode::EvalStmt:
         case OpCode::EvalToSlot:
         case OpCode::JumpIfFalse:
-        case OpCode::EmplaceStruct:   /* needs the ctor node (def + field carets) */
             break;
         default:
             in.node_idx = -1;

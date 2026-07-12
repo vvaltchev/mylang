@@ -14005,8 +14005,12 @@ dev_builtin_reserved_in_script()
 static bool
 ast_node_pool_minimal()
 {
-    auto compile = [](const std::vector<const char *> &lines,
-                      Chunk &out) -> bool {
+    /* `keep` (optional) receives the AST root, so a case that inspects
+     * AST-OWNED pool data (an EmplaceSite's StructTypeDef, owned by the
+     * StructDeclStmt) can hold the tree alive across the check - exactly the
+     * lifetime rule a `.myv` writer must respect. */
+    auto compile = [](const std::vector<const char *> &lines, Chunk &out,
+                      unique_ptr<Construct> *keep = nullptr) -> bool {
         std::string src;
         std::vector<Tok> toks;
         for (size_t i = 0; i < lines.size(); i++) {
@@ -14025,6 +14029,8 @@ ast_node_pool_minimal()
             if (!b)
                 return false;
             out = codegen_program(b);
+            if (keep)
+                *keep = std::move(root);
         } catch (...) {
             return false;
         }
@@ -14082,6 +14088,24 @@ ast_node_pool_minimal()
     /* the member form carries the key */
     if (!incdec.incdec_sites[1].memUid
         || std::string(incdec.incdec_sites[1].memUid->val) != "a")
+        return false;
+
+    /* (d) EmplaceStruct (append(struct_arr, Ctor(..))) is AST-FREE: the ctor
+     * def + container/field carets pool into emplace_sites, leaving node_table
+     * EMPTY (it was the LAST node in bench/'s and samples/'s chunks). The AST
+     * is kept alive for the def->name deref (the def is AST-owned). */
+    Chunk emp;
+    unique_ptr<Construct> emp_root;
+    if (!compile({"struct P { int x; int y; }",
+                  "var a = [];",
+                  "append(a, P(1, 2));"}, emp, &emp_root))
+        return false;
+    if (!emp.node_table.empty() || emp.emplace_sites.size() != 1
+        || !table_valid(emp))
+        return false;
+    if (!emp.emplace_sites[0].def
+        || std::string(emp.emplace_sites[0].def->name->val) != "P"
+        || emp.emplace_sites[0].field_locs.size() != 2)
         return false;
 
     return true;

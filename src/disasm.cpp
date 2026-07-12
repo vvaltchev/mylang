@@ -45,15 +45,6 @@ std::string reg_or_imm(const Chunk &ch, const Operand &o, bool /*is_float*/)
     return s.str();
 }
 
-/* The callee's source name for a CallExpr node (`len`, `print`, `fib`, ...). */
-std::string callee_name(const Construct *node)
-{
-    if (auto *call = dynamic_cast<const CallExpr *>(node))
-        if (auto *id = dynamic_cast<const Identifier *>(call->what.get()))
-            return std::string(id->get_str());
-    return "?";
-}
-
 /* A CallBuiltinV's callee name from the AST-free builtin_calls pool. */
 std::string builtin_call_name(const Chunk &ch, int idx)
 {
@@ -272,6 +263,16 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             const auto &bc = ch.builtin_calls[i];
             s << ";   #" << i << "  " << (bc.name ? bc.name->val : "?")
               << "  (" << bc.args.size() << " args)\n";
+        }
+    }
+    if (!ch.emplace_sites.empty()) {
+        s << "; -- emplace_sites (" << ch.emplace_sites.size() << ") --\n";
+        for (size_t i = 0; i < ch.emplace_sites.size(); i++) {
+            const auto &es = ch.emplace_sites[i];
+            s << ";   #" << i << "  "
+              << (es.bname ? es.bname->val : "append") << " <- "
+              << es.def->name->val
+              << "  (" << es.field_locs.size() << " fields)\n";
         }
     }
     if (!ch.incdec_sites.empty()) {
@@ -676,17 +677,15 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::EmplaceStruct: {
-            const auto *dc =
-                static_cast<const DirectBuiltinCallExpr *>(chunk.node_at_pc(pc));
-            const auto *ctor =
-                static_cast<const CallExpr *>(dc->args->elems[1].get());
-            const int nf = static_cast<int>(ctor->args->elems.size());
+            /* AST-free: the def / name / field count come from the
+             * emplace_sites pool (`a` packs kind | idx << 2). */
+            const Chunk::EmplaceSite &es = chunk.emplace_sites[in.a.lit >> 2];
+            const int nf = static_cast<int>(es.field_locs.size());
             row << "emplace      " << D(in.target) << " = "
-                << callee_name(chunk.node_at_pc(pc)) << "("
-                << lval_ref(in.a.lit, in.target2) << " <- "
-                << std::string(ctor->vm_struct_ctor_def->name->val)
+                << (es.bname ? es.bname->val : "append") << "("
+                << lval_ref(in.a.lit & 3, in.target2) << " <- "
+                << std::string(es.def->name->val)
                 << arglist(chunk, in.b.lit, nf) << ")";
-            cmt(row, chunk.node_at_pc(pc));
             break;
         }
         case OpCode::CallBuiltinLVElem: {

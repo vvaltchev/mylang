@@ -1193,30 +1193,31 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
  * builtin_append's construct-in-place (try_construct_into_struct_array): the
  * FAST path coerces the values straight into a flat array<Struct>'s bytes; a
  * non-flat target (an array<dyn> holding structs) FALLS BACK to building the
- * StructObject and a general append. `ctor` carries `vm_struct_ctor_def` (the
- * POD def, inferencer-stamped) and the per-field arg locs; `arg0` is the
- * container arg (for the lvalue/array errors). Result matches the tree-walker's
- * append byte-for-byte (the differential proves it).
+ * StructObject and a general append. AST-FREE: `cdef` is the ctor's POD def
+ * (inferencer-stamped at codegen), `flocs` the per-field coerce carets, and
+ * `a0s`/`a0e` the container arg's caret (the lvalue/array errors) - all from
+ * the VM's emplace_sites pool. Result matches the tree-walker's append
+ * byte-for-byte (the differential proves it).
  */
 EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
-                            const Construct *arg0, const CallExpr *ctor,
-                            const EvalValue *vals, size_t n)
+                            Loc a0s, Loc a0e, const StructTypeDef *cdef,
+                            const ArgLoc *flocs, const EvalValue *vals,
+                            size_t n)
 {
     if (!target)
-        throw NotLValueEx(arg0->start, arg0->end);
+        throw NotLValueEx(a0s, a0e);
     if (!target->is<SharedArrayObj>())
-        throw TypeErrorEx("Expected array", arg0->start, arg0->end);
+        throw TypeErrorEx("Expected array", a0s, a0e);
     if (target->is_const_var())
-        throw CannotChangeConstEx(arg0->start, arg0->end);
+        throw CannotChangeConstEx(a0s, a0e);
 
     SharedArrayObj &arr = target->getval<SharedArrayObj>();
     if (arr.is_readonly())
-        throw CannotChangeConstEx(arg0->start, arg0->end);
+        throw CannotChangeConstEx(a0s, a0e);
     if (arr.is_slice())
         arr.clone_internal_vec();
 
-    StructTypeDef *def = const_cast<StructTypeDef *>(ctor->vm_struct_ctor_def);
-    const ExprList *cargs = ctor->args.get();
+    StructTypeDef *def = const_cast<StructTypeDef *>(cdef);
     ML_CHECK(def && def->is_pod() && n == def->fields.size());
 
     /* FAST: a flat POD-struct array of this exact def - coerce into the bytes,
@@ -1228,7 +1229,7 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
         for (size_t i = 0; i < n; i++) {
             EvalValue v = coerce_struct_field(
                 def->fields[i], vals[i],
-                cargs->elems[i]->start, cargs->elems[i]->end);
+                flocs[i].start, flocs[i].end);
             pod_store_field(def->fields[i], tmp, v);
         }
         auto &sv = arr.flat_structs();
@@ -1246,7 +1247,7 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
     for (size_t i = 0; i < n; i++)
         obj->pod_set(static_cast<int>(i), coerce_struct_field(
             def->fields[i], vals[i],
-            cargs->elems[i]->start, cargs->elems[i]->end));
+            flocs[i].start, flocs[i].end));
     const EvalValue elem(intrusive_ptr<StructObject>{obj});
 
     if (arr.skind() == SharedArrayObj::Storage::structs &&
@@ -1259,7 +1260,7 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
         arr.get_vec().emplace_back(elem, ctx->const_ctx);
     } else {
         throw TypeErrorEx("Cannot append a struct to this array",
-                          arg0->start, arg0->end);
+                          a0s, a0e);
     }
     arr.invalidate_hash();
     return target->get();
