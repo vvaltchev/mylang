@@ -9312,6 +9312,20 @@ static const std::vector<test> tests =
         "foreach (var p in a) { append(saved, p); }",
         "assert(saved[0].x == 1); assert(saved[1].x == 2);",
         "assert(saved[2].x == 3);" } },
+    /* WHOLE-`p` foreach over a flat struct array (VM: LoadStructElemV
+     * materializes a fresh StructObject per iteration) - the body uses p as a
+     * value (append / assign / nested field), not only scalar fields. */
+    { "struct array: whole-element foreach (native materialize)",
+      { "struct Q { int v; } struct P { Q a; int y; }",
+        "var a = [P(Q(1), 2), P(Q(3), 4)]; var o = [];",
+        "foreach (var p in a) { append(o, p); }",
+        "assert(o[0].a.v == 1 && o[1].y == 4);",
+        "var last = P(Q(0), 0);",
+        "foreach (var p in a) { last = p; }",
+        "assert(last.a.v == 3 && last.y == 4);",
+        "var t = 0;",
+        "foreach (var p in a) { t = t + p.a.v + p.y; }",
+        "assert(t == 10);" } },
     { "struct array: a mixed literal falls back to general",
       { "struct P { int x; }",
         "var dyn a = [P(1), 5];",

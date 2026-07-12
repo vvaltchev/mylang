@@ -1664,6 +1664,16 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc++;
             break;
 
+        case OpCode::LoadStructElemV:
+            /* Whole-`p` foreach bind: materialize a fresh StructObject from the
+             * flat struct-array element into the loop var. target = loop var,
+             * target2 = the array slot, a = the counter. */
+            ctx.frame->at(in.target).put(
+                vm_struct_elem(ctx.frame->at(in.target2).get(),
+                               read_int_operand(in.a, &ctx)));
+            pc++;
+            break;
+
         case OpCode::LoadStructFieldFloat:
             write_float_slot(&ctx, in.target,
                 vm_struct_field_float(ctx.frame->at(in.target2).get(),

@@ -3073,6 +3073,21 @@ float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
     return v;
 }
 
+/* Materialize element `idx` of a flat array<PodStruct> as a FRESH StructObject
+ * (the VM's LoadStructElemV - the whole-`p` foreach bind). Byte-identical to the
+ * tree-walker's reused-object bind (its COW guard only avoids overwriting a
+ * captured/stored element - a fresh alloc satisfies that trivially). `idx` is
+ * loop-bounded, so no bounds check. */
+EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx)
+{
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    const auto &sv = arr.flat_structs();
+    auto obj = make_intrusive<StructObject>(sv.def);
+    std::memcpy(obj->bytes.data(),
+                sv.buf.data() + (arr.offset() + idx) * sv.stride, sv.stride);
+    return EvalValue(intrusive_ptr<StructObject>(obj));
+}
+
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,

@@ -454,6 +454,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << D(in.target) << " = " << D(in.target2) << "["
                 << RI(in.a, false) << "].fld" << in.b.lit;
             break;
+        case OpCode::LoadStructElemV:
+            row << "load.selem   " << D(in.target) << " = " << D(in.target2)
+                << "[" << RI(in.a, false) << "]   ; struct";
+            break;
         case OpCode::DictIterInit:
             row << "dict.iter.i  I" << in.target << " <- " << D(in.target2);
             break;

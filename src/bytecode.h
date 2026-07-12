@@ -175,6 +175,19 @@ enum class OpCode : unsigned char {
     LoadStructFieldFloat,
 
     /*
+     * Native WHOLE-element bind from a flat array<PodStruct> `foreach (var p in
+     * a)` whose body uses `p` as a value (not only scalar-field reads): `target`
+     * = the loop var slot, `target2` = the struct-array slot, `a` = the int
+     * index/counter. Materializes a FRESH StructObject from element i's bytes
+     * (make_intrusive + memcpy) into the loop var - byte-identical to the
+     * tree-walker's reused-object bind (its COW guard only ever avoids
+     * overwriting a captured/stored element, which a fresh alloc trivially
+     * satisfies; the values match). `i` is loop-bounded, so no bounds check;
+     * node-free.
+     */
+    LoadStructElemV,
+
+    /*
      * Native dict `foreach` via a LIVE unordered_map iterator (a dict has no
      * O(1) index, so it can't use the counted-loop machine). The per-loop
      * iterator STATE lives in a `vm_run_chunk`-local vector sized by

@@ -4430,9 +4430,13 @@ struct Codegen {
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
-        if (!struct_fe_body_ok(fe->body.get(), x_slot,
-                               fe->container_struct_def, false))
-            return false;
+        /* If every loop-var use is a SCALAR-FIELD read (p.x), take the DIRECT
+         * read path (p never materialized). Otherwise the body uses `p` as a
+         * whole value (print(p), append(o, p), q = p, p.a.x nested), so
+         * MATERIALIZE a fresh StructObject per iteration (LoadStructElemV) into
+         * `p`'s slot and compile the body normally. */
+        const bool whole_p = !struct_fe_body_ok(fe->body.get(), x_slot,
+                                                fe->container_struct_def, false);
 
         const size_t start = chunk.code.size();
         reset_temps();
@@ -4472,12 +4476,23 @@ struct Codegen {
                                    slot_op(i), slot_op(n));
         const int lbody = here();
 
-        /* No element load - p is never materialized. Activate the direct-read
-         * mapping so a p.field read -> LoadStructField*(c[i].fld). */
-        sfe_loop_slot = x_slot;
-        sfe_arr_slot = c;
-        sfe_ctr_slot = i;
-        sfe_def = fe->container_struct_def;
+        if (whole_p) {
+            /* Materialize p = c[i] (a fresh StructObject) at the top of each
+             * iteration; the body reads p's slot normally (no sfe mapping). */
+            Instr ld;
+            ld.op = OpCode::LoadStructElemV;
+            ld.target = x_slot;
+            ld.target2 = c;
+            ld.a = slot_op(i);
+            chunk.code.push_back(ld);
+        } else {
+            /* No element load - p is never materialized. Activate the direct-
+             * read mapping so a p.field read -> LoadStructField*(c[i].fld). */
+            sfe_loop_slot = x_slot;
+            sfe_arr_slot = c;
+            sfe_ctr_slot = i;
+            sfe_def = fe->container_struct_def;
+        }
 
         push_loop();
         const bool body_ok = compile_scalar_body(body_stmts(fe->body.get()));
