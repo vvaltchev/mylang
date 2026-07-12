@@ -997,6 +997,62 @@ first, in its own plan file, before any code.**
   `ast_node_pool_minimal`'s first draft is the demonstration: deref of an
   AST-owned def after the tree died).
 
+### TIER-1 ENDGAME AUDIT (2026-07-14, post F1/F2 — the remaining
+### reachable fallback shapes, probed + code-verified)
+
+The three fallback ops' remaining REACHABLE feeders, after everything
+above landed. Probes pinned each claim (both engines + `-vd` on crafted
+scripts).
+
+**Live expression ROOTS (every recursive residue — loop init/cond/inc/
+body, return/throw values, try bodies, call args — funnels into these):**
+- R1 **`CoalesceExpr`** (`a ?? b`): NO compile_boxed_expr case at all.
+- R2 **Chained comparisons** (`a < b < c`, `a == b != c`):
+  `emit_boxed_chain` k=='c' rejects >2 operands; the shapes are legal
+  (bool promotes) and run in the tree-walker.
+- R3 **Assignment as an EXPRESSION / chained assign** (`x = y = 5`).
+- R4 **Inc-dec with an IMPURE lvalue** (`a[f()]++` as value or statement:
+  `incdec_lvalue_pure` declines a side-effecting index).
+
+**Live statement roots:**
+- R5 **Typed/const-target IdList destructure** (`int a; int b;
+  a, b = src` — MultiUnpackV declines coerced targets).
+- R6 **`show()` under the -rt harness** (g_dev_builtins_allowed=true, so
+  the differential compiles it; a SCRIPT compile-rejects it) — the ONE
+  sanctioned EvalStmt consumer. It never has th==i/f (returns str), so
+  it can NEVER need EvalToSlot; a cond/`if` use falls to the statement
+  catch-all.
+
+**DEAD paths (proven; delete or assert):**
+- D1 `d?.f++` in EVERY form — the inferencer rejects it (NullabilityEx:
+  the `?.` result is always optional, even null-narrowed). The
+  documented residue was stale.
+- D2 The NON-scope-free Block/body: `scope_free = false` requires a
+  slot-less decl, whose ONLY producer is `declare_masking`, whose ONLY
+  caller is the non-global named-func walk — script-unreachable post-F2
+  (capture-slotting removed the old capture reason; named funcs can't
+  capture; nested named decls hoist to scoped globals). In a SCRIPT,
+  EVERY block is scope_free → gen_stmt's Block fallback is dead AND
+  Tier 3's "non-scope-free bodies" reduces to EXPRESSION-bodied
+  functions only.
+- D3 Foreach non-local loop vars (a foreach header always DECLARES fresh
+  locals in a script; map vars are REPL-only, and the REPL never runs
+  codegen).
+- D4 compile_native_try's non-slot catch var (REPL-only).
+
+**The op-removal end state (maintainer-directed, 2026-07-14):** after
+R1-R5 land — (a) `EvalToSlot` becomes unreachable (its only feeders were
+recursive arg/operand declines + AST builtins in scalar positions, none
+of which survive) → DELETE the op + eval_to_temp; (b) `JumpIfFalse`
+becomes unreachable (a cond that fails the boxed path no longer exists
+except show-in-cond, which falls to the STATEMENT catch-all) → DELETE
+the op + the Phase-1 gen_if/gen_while forms (an if/while whose native
+form fails falls back WHOLE via the gen_stmt catch-all); (c) `EvalStmt`
+remains as THE single fallback op, reachable only by show()-in-tests
+(the REPL never compiles). Execution order: R1 coalesce → R2 chained
+cmp → R3 assign-expr → R5 typed IdList → R4 impure-lvalue inc-dec →
+the D deletions + op removal, each its own commit.
+
 ### The wrong-result bug this audit caught (fixed, step 5 — recorded here
 ### because it is the method's poster child)
 
