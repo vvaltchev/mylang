@@ -964,6 +964,19 @@ private:
             return;
         }
 
+        if (auto *inc = dynamic_cast<IncDecExpr *>(c)) {
+            /* Fold READS in the inc-dec lvalue (a subscript INDEX, or a
+             * subscript/member BASE) but never the mutated target itself -
+             * exactly like an assignment lvalue. Without this, `a[i]++` keeps
+             * `i` after auto-const drops its write-once decl -> a dangling read
+             * ("Expected integer as subscript" from a stale slot). Same bug
+             * class as the ReturnStmt / Expr14-lvalue folds. A bare `x++` target
+             * is a WRITE, so x is never write-once/promoted - fold_lvalue_reads
+             * correctly skips a bare-id lvalue. */
+            fold_lvalue_reads(inc->lvalue, fc);
+            return;
+        }
+
         if (auto *sc = dynamic_cast<SingleChildConstruct *>(c)) {
             fold_reads(sc->elem, fc);
             return;

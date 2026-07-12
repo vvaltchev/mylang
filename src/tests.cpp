@@ -2145,6 +2145,15 @@ static const std::vector<test> tests =
         "++a[0]; assert(a[0] == 2);",
         "assert(array_storage(a) == \"int\");",   /* stays flat */
         "var b = [[1, 2], [3, 4]]; b[0][1]++; assert(b[0][1] == 3);" } },
+    /* An `a[i]++` whose INDEX is a write-once var that auto-const promotes: the
+     * folder must fold the promoted `i` inside the inc-dec lvalue (a read), else
+     * its dropped decl leaves a dangling `i` ("Expected integer as subscript").
+     * Regression for the fold_reads IncDecExpr case; both engines. */
+    { "++/--: on an array element with an auto-const index",
+      { "var a = [10, 20, 30]; var i = 1;",
+        "a[i]++; assert(a == [10, 21, 30]);",
+        "var b = [5, 6, 7]; var j = 2; var o = b[j]++;",
+        "assert(o == 7 && b == [5, 6, 8]);" } },
     { "++/--: on a struct field",
       { "struct P { int x; int y; }",
         "var p = P(1, 2); var o = p.x++; assert(o == 1 && p.x == 2);",
