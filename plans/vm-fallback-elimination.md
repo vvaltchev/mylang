@@ -920,18 +920,39 @@ STEP 1 ✅ DONE (2026-07-14): the rule.**
     NotLValueEx) — so slice write-back, const, and literal-arg0 errors
     reproduce byte-identically, because the builtin receives the same
     `LValue*` it gets today.
-  * MECHANICS: a KIND tag on `Builtin` (value/lvalue/map/filter/lazy —
-    fits the EvalValue payload) so an indirect callee's ABI is decidable
-    from the VALUE at runtime; a callable-CHECK op between the callee and
-    the arg run (a non-callable callee must throw BEFORE evaluating args,
-    like the tree-walker); FuncObject → the vm_call_func values path;
-    struct → a values twin of construct_struct (per-arg carets pooled);
-    the tree-walker's INDIRECT dispatch changes ONLY for map/filter
-    (eager, per (1)) — every other tree-walker path keeps its node and is
-    trivially byte-identical; the lazy builtins stay node-dispatched in
-    the tree-walker (the REPL keeps working) and are script-unreachable
-    (step 1), a tripwire error in the VM op. Then the op drops its node →
-    Tier 2 is ONLY the three fallback ops.
+  * ✅ **STEP 2 LANDED (2026-07-14).** As decided, with two
+    implementation-time discoveries that refined the design:
+    - Frame slots can't hold an LValue*-boxed value (LValue::type_checks
+      also bans t_undefid) — the first cut (three lvalue-preserving load
+      ops materializing raw values into the run) ASSERTED immediately. The
+      final design carries arg0 as a **DESCRIPTOR** in the new
+      `Chunk::CallSite` pool (forms none/slot/elem/member/undef + the
+      ArgLocs carets): the dispatch RE-DERIVES the LValue* only for a
+      func_lv callee (the CallBuiltinLV model); an elem/member arg0's
+      VALUE fills run[0] via the ordinary SubscriptV/MemberV at its
+      position (throws keep argument order; the elem INDEX rides a
+      reserved temp; the func_lv re-derive repeats the subscript —
+      idempotent, and a between-args container mutation THROWS where the
+      tree-walker's stale LValue* is UB, safer). Slice write-back / const
+      / literal-arg0 of an indirect append/sort are byte-identical
+      (pinned).
+    - `dispatch_call_value` serves EVERY tree-walked builtin call
+      (const-eval, REPL, unspecialized direct calls), not just indirect
+      ones — the first eager cut hijacked direct `sort(a)` in const-eval
+      (UBSan caught a null-LValue deref). The eager path is gated on the
+      inferencer's `CallExpr::vm_dyn_callee` stamp — the true "indirect"
+      marker; direct tree-walked calls keep the node ABI (map's
+      validate-first, sort's custom arg0).
+    Mechanics as decided: `Builtin::Kind` (value/lvalue/map/filter/lazy/
+    node; 16→24 bytes, inside the EvalValue payload), `CheckCallableV`
+    before the arg run, `construct_struct_v`, and ONE shared
+    `dispatch_builtin_values` both engines call. Tests: slice write-back,
+    elem-arg0 re-derive, literal/const arg0 errors, the eager-vs-direct
+    map order pin, indirect struct arity, pool case (g). KNOWN CORNER
+    (documented): an UNRESOLVED id in a non-arg0 position throws at its
+    position under the VM but at the consumer in the tree-walker (later
+    args' side effects may differ; same exception either way). **Tier 2
+    is now ONLY the three fallback ops** — every native op is AST-free.
 
 **F2. The brace-less-body func/struct decl CRASH — ✅ DONE (2026-07-14,
 `pWrapDeclBody` in parser.cpp).**

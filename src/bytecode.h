@@ -852,17 +852,42 @@ enum class OpCode : unsigned char {
     ThrowRuntimeV,
 
     /*
-     * Generic INDIRECT call of a `dyn` callee (`Instr::a` = the callee temp;
-     * `node_idx` = the CallExpr). Reads the callee value and dispatches on its
-     * RUNTIME type via the shared `dispatch_call_value` — a FuncObject (its body
-     * runs native via the do_func_call hook), a Builtin (its ExprList ABI), a
-     * struct descriptor (construct), else NotCallableEx at the callee caret —
-     * byte-identical to the tree-walker's CallExpr::do_eval. This op KEEPS its
-     * node: a dyn callee may resolve to an AST builtin (`defined` — needs the
-     * unevaluated arg node) or a mutating builtin (needs an lvalue arg), so the
-     * arg AST is intrinsically required; only the callee LOAD is native.
+     * Generic INDIRECT call of a `dyn` callee — AST-FREE (F1 step 2).
+     * `target` = dst; `target2` = the callee temp; `a` = the arg-run base;
+     * `b` = nargs | (call_sites pool idx << 12). The CallSite entry carries
+     * the ArgLocs data (whole-args caret + per-arg carets + arr_hint) AND
+     * arg0's LVALUE DESCRIPTOR — the by-ref encoding: frame slots can't hold
+     * an LValue*-boxed value (LValue::type_checks), so instead of
+     * materializing the tree-walker's raw arg value, the op RE-DERIVES
+     * arg0's LValue* at dispatch, only when the callee turns out func_lv
+     * (the CallBuiltinLV/LVElem/LVMember model). Args 1..n-1 are
+     * pre-evaluated into the run; arg0's VALUE fill depends on its form —
+     * elem/member fill run[0] via the ordinary SubscriptV/MemberV (throws at
+     * arg0's position, the tree-walker's order; the elem INDEX rides a
+     * RESERVED temp the descriptor re-reads), slot/undef leave run[0] for
+     * the dispatch to derive (an undefined global/unresolved name surfaces
+     * at the CONSUMER — bind/adapter — like the tree-walker's raw
+     * UndefinedId). Dispatch: FuncObject → vm_call_func (run[0] filled with
+     * the derived RValue first); struct → construct_struct_v; Builtin →
+     * dispatch_builtin_values by Kind (value / lvalue / EAGER map-filter /
+     * lazy tripwire) — the same shared code the tree-walker's indirect
+     * branch calls, so both engines agree. A CheckCallableV precedes the
+     * arg run (a non-callable callee throws BEFORE the args evaluate). The
+     * call-site loc rides the loc side table (do_func_call backtraces).
      */
     CallValueGenericV,
+
+    /*
+     * Throw NotCallableEx (callee caret via the loc side table) unless the
+     * value in slot `a` is callable — a FuncObject, a Builtin, or a struct
+     * type descriptor. Emitted between an indirect call's callee and its arg
+     * run: the tree-walker's dispatch throws NotCallableEx BEFORE any arg
+     * evaluates, and the eager arg run would otherwise reorder that. (The
+     * earlier FuncObject-only CheckCallableV was reverted for rejecting
+     * builtin callees; this one admits all three callable kinds.)
+     */
+    CheckCallableV,
+
 
     /*
      * Build a FLAT array<PodStruct> LITERAL `[P(a,b), P(c,d), ..]` into `target`
@@ -1266,6 +1291,56 @@ struct Chunk {
     }
 
     /*
+     * INDIRECT-CALL SITE POOL (CallValueGenericV, F1 step 2). The ArgLocs
+     * data (whole-args caret + per-arg carets + arr_hint) PLUS arg0's LVALUE
+     * DESCRIPTOR — the by-ref encoding: how the dispatch re-derives arg0's
+     * LValue* when the runtime callee turns out func_lv (a mutating builtin),
+     * exactly like CallBuiltinLV/LVElem/LVMember form theirs. `a0_form`:
+     *   none   - arg0 is not an lvalue shape (a call/literal/arith - its
+     *            VALUE is in run[0]; a func_lv callee gets a null target ->
+     *            NotLValueEx, like the tree-walker's non-LValue* raw value);
+     *   slot   - a slotted id (a0_kind 0 loc/1 gbl/2 cap/3 builtin; a0_slot);
+     *            run[0] is left to the dispatch (an UNDEFINED global
+     *            surfaces at the consumer - bind/adapter - as the
+     *            tree-walker's raw UndefinedId does);
+     *   elem   - base[idx]: a0_kind/a0_slot = the base, a0_operand = the
+     *            RESERVED index temp; run[0] holds the element VALUE (filled
+     *            by an ordinary SubscriptV at arg0's position - OOB/key
+     *            throws in order); the re-derive repeats the subscript
+     *            (idempotent; a between-args container mutation makes it
+     *            throw where the tree-walker's stale LValue* is UB - safer);
+     *   member - base.member: a0_operand = the member_keys pool idx; run[0]
+     *            via MemberV;
+     *   undef  - an unresolved name (a0_name): value-consumers throw
+     *            UndefinedVariableEx at the consumer, func_lv gets null.
+     * Pure data + a re-internable name - serializable.
+     */
+    struct CallSite {
+        Loc start, end;                  /* the whole-args caret */
+        std::vector<ArgLoc> args;        /* per-arg carets */
+        ArrHint arr_hint = ArrHint::dflt;
+        enum class A0 : unsigned char { none, slot, elem, member, undef };
+        A0 a0_form = A0::none;
+        unsigned char a0_kind = 0;       /* 0 loc / 1 gbl / 2 cap / 3 builtin */
+        int32_t a0_slot = -1;            /* the id/base slot */
+        int32_t a0_operand = -1;         /* elem: index temp; member: key idx */
+        const UniqueId *a0_name = nullptr;   /* undef: the name */
+    };
+    std::vector<CallSite> call_sites;
+
+    ArgLocs call_arglocs_at(int idx) const
+    {
+        const CallSite &cs = call_sites[static_cast<size_t>(idx)];
+        ArgLocs al;
+        al.start = cs.start;
+        al.end = cs.end;
+        al.args = cs.args.data();
+        al.nargs = cs.args.size();
+        al.arr_hint = cs.arr_hint;
+        return al;
+    }
+
+    /*
      * AST-NODE POOL - CODEGEN-TRANSIENT, holding the raw `Construct *` of every
      * op that still needs the AST at RUNTIME. `Instr::node_idx` indexes it (a
      * SPLICE-STABLE handle codegen needs before an op's final pc is known: ops
@@ -1287,11 +1362,10 @@ struct Chunk {
      * AST-NODE SIDE TABLE (pc-keyed) - the runtime home of the residual node
      * ops, SAME shape/cost as `locs` / `inline_ctxs`: `{pc, Construct*}` sorted
      * by pc (build_node_table iterates pc-ascending), binary-searched by
-     * `node_at_pc` ONLY on the cold path (a fallback's `node->eval`). The ops
-     * that still need the AST at runtime are:
-     *   - the fallback ops EvalStmt / EvalToSlot / JumpIfFalse (`node->eval`);
-     *   - CallValueGenericV (a dyn callee may be a Builtin whose ABI takes the
-     *     unevaluated args ExprList) - see extract_locs's KEEP list.
+     * `node_at_pc` ONLY on the cold path (a fallback's `node->eval`). The ONLY
+     * ops that still need the AST at runtime are the three fallback ops -
+     * EvalStmt / EvalToSlot / JumpIfFalse (`node->eval`); every native op is
+     * AST-free (F1 step 2 closed the last one, CallValueGenericV).
      * A 100%-native chunk leaves this EMPTY - a non-empty `node_table` is EXACTLY
      * the "not yet fully serializable" signal (its `Construct*` is still an AST
      * pointer; a serializing backend keeps the AST or rejects the chunk). This

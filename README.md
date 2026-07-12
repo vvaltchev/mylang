@@ -2082,6 +2082,14 @@ a key and a value, but the result will still be an array. For example:
 map(func(k, v) => [k, v+1], {"a": 3, "b": 4}) == [["a",4],["b",5]]
 ```
 
+A **direct** `map(...)` call validates that its first argument is a function
+*before* evaluating the second argument. An **indirect** call — through a
+`dyn` variable holding the builtin (`var dyn m = map; m(f, c)`) — is
+**eager-args**: like every indirect builtin call, all arguments are evaluated
+first, then the builtin's own checks run. The results are identical for
+well-formed calls; the difference is only observable when an invalid first
+argument is combined with a side-effecting second one.
+
 #### `filter(func, container)`
 Filter the elements of `container` through `func(elem)` and return a container
 of the same type. For example:

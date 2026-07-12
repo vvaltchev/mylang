@@ -507,6 +507,76 @@ static const std::vector<test> tests =
         { "var dyn a = 5; a(1);" },
         &typeid(NotCallableEx), 16, 0, 18, 0,
     },
+    /* F1 step 2: the indirect call is AST-FREE, with arg0's LVALUE carried by
+     * the CallSite DESCRIPTOR (the by-ref encoding). The lvalue-dependent
+     * behaviors must match the DIRECT call byte-for-byte: the SLICE
+     * write-back (append/sort on a slice clone + store the new array back
+     * into the SLOT), an element arg0 (descriptor re-derive), a literal arg0
+     * (NotLValueEx), a const arg0 (CannotChangeConstEx). Both engines. */
+    {
+        "dyn callee by-ref: slice write-back through indirect append/sort",
+        {
+            "var dyn f = append;",
+            "var a = [1, 2, 3, 4]; var s = a[0:2];",
+            "f(s, 9);",
+            "assert(s == [1, 2, 9]);",       /* the slot got the new array */
+            "assert(a == [1, 2, 3, 4]);",    /* the parent is untouched */
+            "var dyn srt = sort;",
+            "var b = [3, 1, 2, 9]; var t = b[0:3];",
+            "srt(t);",
+            "assert(t == [1, 2, 3]);",
+            "assert(b == [3, 1, 2, 9]);",
+        },
+    },
+    {
+        "dyn callee by-ref: element arg0 (descriptor re-derive) mutates",
+        {
+            "var dyn g = append;",
+            "var m = [[1], [2]];",
+            "g(m[0], 7);",
+            "assert(m == [[1, 7], [2]]);",
+        },
+    },
+    {
+        "dyn callee by-ref: a literal arg0 to a mutating builtin throws",
+        { "var dyn f = append; f([1, 2], 3);" },
+        &typeid(NotLValueEx),
+    },
+    {
+        "dyn callee by-ref: a const arg0 to a mutating builtin throws",
+        { "const K = [5]; var dyn f = append; f(K, 6);" },
+        &typeid(CannotChangeConstEx),
+    },
+    /* F1 step 2, the EAGER-ARGS language rule: an INDIRECT builtin call
+     * evaluates its args before the builtin's own checks - `m(42, se())`
+     * with a dyn `m = map` runs se() then throws; the DIRECT call keeps the
+     * tested validate-before-arg1 order (se() NOT run). Both engines. */
+    {
+        "dyn callee: indirect map/filter is eager-args; direct stays lazy",
+        {
+            "var c = 0;",
+            "func se() { c = c + 1; return [1, 2]; }",
+            "var dyn m = map;",
+            "var caught = 0;",
+            "try { m(runtime(42), se()); } catch (TypeErrorEx) { caught = 1; }",
+            "assert(c == 1); assert(caught == 1);",   /* eager: se() ran */
+            "var caught2 = 0;",
+            "try { map(runtime(42), se()); } catch (TypeErrorEx)"
+            " { caught2 = 1; }",
+            "assert(c == 1); assert(caught2 == 1);",  /* direct: se() NOT run */
+            "var dyn flt = filter;",
+            "assert(flt(func(x) => x > 1, [1, 2, 3]) == [2, 3]);",
+            "assert(m(func(x) => x * 2, [1, 2]) == [2, 4]);",
+        },
+    },
+    {
+        /* An indirect struct construction runs the FULL runtime checks (the
+         * compile-time ones can't see through dyn): wrong arity throws. */
+        "dyn callee: indirect struct construction checks arity",
+        { "struct P { int x; int y; }",
+          "var dyn c = P; var dyn p = c(1);" },
+        &typeid(InvalidNumberOfArgsEx),
+    },
 
     {
         "rebind of const builtins is not allowed",
@@ -14366,6 +14436,20 @@ ast_node_pool_minimal()
         return false;
     if (!coerce.node_table.empty() || !table_valid(coerce))
         return false;
+
+    /* (g) an INDIRECT (dyn-callee) call lowers AST-FREE (F1 step 2): the
+     * carets + arg0's lvalue descriptor ride the call_sites pool - it was
+     * the LAST non-fallback node-keeping op. */
+    Chunk indir;
+    if (!compile({"var dyn f = append;",
+                  "var a = [1, 2];",
+                  "f(a, 3);"}, indir))
+        return false;
+    if (!indir.node_table.empty() || indir.call_sites.empty()
+        || !table_valid(indir))
+        return false;
+    if (indir.call_sites[0].a0_form != Chunk::CallSite::A0::slot)
+        return false;               /* arg0 = the slotted id `a` (by-ref) */
 
     /* (d) EmplaceStruct (append(struct_arr, Ctor(..))) is AST-FREE: the ctor
      * def + container/field carets pool into emplace_sites, leaving node_table

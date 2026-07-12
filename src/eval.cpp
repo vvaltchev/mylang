@@ -1103,6 +1103,55 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
     return intrusive_ptr<StructObject>(obj);
 }
 
+/*
+ * The VALUES twin of construct_struct, for an INDIRECT (dyn-callee)
+ * construction (`var dyn c = P; c(1, 2)` - the VM's CallValueGenericV): the
+ * args are pre-evaluated (raw - an arg may be LValue*-boxed; RValue'd here),
+ * UNVALIDATED at compile time, so the full runtime checks run - the same
+ * arity range, trailing-opt none-fill, and per-field coerce (with the pooled
+ * per-arg carets) construct_struct does, mirrored line for line.
+ */
+EvalValue construct_struct_v(StructTypeDef *def, const ArgLocs *al,
+                             const EvalValue *args, size_t nargs)
+{
+    const size_t nfields = def->fields.size();
+
+    size_t min_args = 0;
+    for (size_t i = 0; i < nfields; i++)
+        if (!def->fields[i].is_opt)
+            min_args = i + 1;
+
+    if (nargs < min_args || nargs > nfields)
+        throw InvalidNumberOfArgsEx(al->start, al->end);
+
+    auto obj = make_intrusive<StructObject>(def);   /* resizes bytes if POD */
+
+    if (def->is_pod()) {
+        /* POD has no opt fields, so nargs == nfields. */
+        for (size_t i = 0; i < nfields; i++) {
+            EvalValue v = coerce_struct_field(
+                def->fields[i], RValue(args[i]),
+                al->arg(i)->start, al->arg(i)->end);
+            obj->pod_set(static_cast<int>(i), v);
+        }
+        return EvalValue(intrusive_ptr<StructObject>(obj));
+    }
+
+    obj->fields.reserve(nfields);
+
+    for (size_t i = 0; i < nfields; i++) {
+        const FieldDef &fd = def->fields[i];
+        const Loc s = i < nargs ? al->arg(i)->start : al->start;
+        const Loc e = i < nargs ? al->arg(i)->end : al->end;
+        /* an omitted trailing opt field binds to none */
+        EvalValue v = i < nargs ? RValue(args[i]) : EvalValue();
+        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e),
+                                 false);
+    }
+
+    return EvalValue(intrusive_ptr<StructObject>(obj));
+}
+
 void pod_store_field(const FieldDef &f, char *base, const EvalValue &v)
 {
     char *p = base + f.offset;
@@ -1267,8 +1316,90 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
 }
 
 /*
+ * F1 step 2: the VALUES dispatch of an INDIRECT builtin call, shared by the
+ * tree-walker's dyn-callee branch (map/filter only there - the other kinds
+ * keep their node path, whose adapters are byte-identical to this) and the
+ * VM's CallValueGenericV (all kinds). `args` are RAW values: arg0 may be an
+ * LValue*-boxed value (the lvalue-preserving compile / Identifier::do_eval)
+ * for a func_lv callee; every by-value consumer RValues (which also turns an
+ * UndefinedId into UndefinedVariableEx, like the adapters).
+ */
+EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
+                                  const ArgLocs *al, const EvalValue *args,
+                                  size_t n)
+{
+    switch (b.kind) {
+
+    case Builtin::Kind::value: {
+        /* The generic func_v adapter's exact behavior: RValue each arg
+         * left-to-right, then the native form. */
+        EvalValue stackbuf[8];
+        std::vector<EvalValue> heapbuf;
+        EvalValue *buf = stackbuf;
+        if (n > 8) {
+            heapbuf.resize(n);
+            buf = heapbuf.data();
+        }
+        for (size_t i = 0; i < n; i++)
+            buf[i] = RValue(args[i]);
+        return b.func_v(ctx, al, buf, n);
+    }
+
+    case Builtin::Kind::lvalue: {
+        /* The lvalue adapters' exact behavior: arg0's LValue* if it IS one
+         * (else null -> the builtin throws NotLValueEx / its arity error),
+         * the rest RValued by value. */
+        LValue *target = (n && args[0].is<LValue *>())
+                             ? args[0].get<LValue *>() : nullptr;
+        const size_t n_rest = n ? n - 1 : 0;
+        EvalValue stackbuf[8];
+        std::vector<EvalValue> heapbuf;
+        EvalValue *buf = stackbuf;
+        if (n_rest > 8) {
+            heapbuf.resize(n_rest);
+            buf = heapbuf.data();
+        }
+        for (size_t i = 0; i < n_rest; i++)
+            buf[i] = RValue(args[i + 1]);
+        return b.func_lv(ctx, al, target, n_rest ? buf : nullptr, n_rest);
+    }
+
+    case Builtin::Kind::map:
+    case Builtin::Kind::filter: {
+        /* EAGER-ARGS by language rule (INDIRECT calls only; the direct form
+         * keeps builtin_map's validate-before-arg1 order): arity first (like
+         * builtin_map, before any evaluation), then the func check with
+         * arg0's caret, then the shared core. */
+        if (n != 2)
+            throw InvalidArgumentEx(al->start, al->end);
+        const EvalValue f = RValue(args[0]);
+        if (!f.is<intrusive_ptr<FuncObject>>())
+            throw TypeErrorEx("Expected function",
+                              al->arg(0)->start, al->arg(0)->end);
+        const EvalValue c = RValue(args[1]);
+        return vm_map_filter(ctx, f, c, b.kind == Builtin::Kind::filter,
+                             al->arg(1)->start, al->arg(1)->end);
+    }
+
+    case Builtin::Kind::lazy:
+    case Builtin::Kind::node:
+        /* Unreachable from a SCRIPT: a lazy builtin can't be a value (the F1
+         * step 1 compile reject) and no node-kind builtin remains; the REPL
+         * dispatches these via its retained node, never through here. A
+         * loud, honest error as the tripwire. */
+        throw TypeErrorEx(
+            "this builtin cannot be called indirectly", al->start, al->end);
+    }
+
+    throw InternalErrorEx();   /* unreachable (all kinds handled) */
+}
+
+/*
  * Shared call DISPATCH: `callable` is the ALREADY-evaluated callee value, `node`
- * the CallExpr (for its args + carets). A Builtin runs its ExprList ABI, a
+ * the CallExpr (for its args + carets). A Builtin runs its ExprList ABI -
+ * EXCEPT an INDIRECT (vm_dyn_callee) call of a non-lazy builtin, which is
+ * EAGER-ARGS by language rule (F1 step 2) and
+ * routes through the shared values dispatch so both engines agree; a
  * FuncObject calls do_func_call (its body runs native under -vm via the hook), a
  * struct descriptor constructs; anything else is NotCallableEx at the callee's
  * caret. Reused by the tree-walker's CallExpr::do_eval (ck=null, as_signal=false)
@@ -1281,8 +1412,56 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
 {
     try {
 
-        if (callable.is<Builtin>())
-            return callable.get<Builtin>().func(ctx, node->args.get());
+        if (callable.is<Builtin>()) {
+            const Builtin &b = callable.get<Builtin>();
+            /* The eager path applies ONLY to a genuinely INDIRECT call (a
+             * dyn-typed callee - the inferencer's vm_dyn_callee stamp): this
+             * dispatch ALSO serves every tree-walked DIRECT builtin call
+             * (const-eval, the REPL, an unspecialized CallExpr), which must
+             * keep the node ABI - map's validate-before-arg1, sort's custom
+             * value-or-lvalue arg0 - unchanged. */
+            if (node->vm_dyn_callee
+                && b.kind != Builtin::Kind::lazy
+                && b.kind != Builtin::Kind::node) {
+                /* An INDIRECT builtin call is EAGER-ARGS by language rule
+                 * (F1 step 2): evaluate the args RAW, left-to-right (an
+                 * id/subscript/member arg keeps its LValue* / UndefinedId -
+                 * the by-ref encoding), then the SHARED values dispatch -
+                 * the same code the VM's CallValueGenericV runs, so the two
+                 * engines agree on the func_lv by-ref arg0, the map/filter
+                 * order, and where an undefined name surfaces (the
+                 * consumer). The lazy kinds keep the node path (the REPL's
+                 * indirect defined/isconst/show - scripts compile-reject
+                 * their value uses). */
+                ExprList *ael = node->args.get();
+                const size_t n = ael->elems.size();
+                EvalValue vbuf[8];
+                ArgLoc lbuf[8];
+                std::vector<EvalValue> vheap;
+                std::vector<ArgLoc> lheap;
+                EvalValue *argv = vbuf;
+                ArgLoc *locs = lbuf;
+                if (n > 8) {
+                    vheap.resize(n);
+                    lheap.resize(n);
+                    argv = vheap.data();
+                    locs = lheap.data();
+                }
+                for (size_t i = 0; i < n; i++) {
+                    argv[i] = ael->elems[i]->eval(ctx);
+                    locs[i] = ArgLoc{ael->elems[i]->start,
+                                     ael->elems[i]->end};
+                }
+                ArgLocs al;
+                al.start = ael->start;
+                al.end = ael->end;
+                al.args = locs;
+                al.nargs = n;
+                al.arr_hint = ael->arr_hint;
+                return dispatch_builtin_values(ctx, b, &al, argv, n);
+            }
+            return b.func(ctx, node->args.get());
+        }
 
         if (callable.is<intrusive_ptr<FuncObject>>()) {
             return do_func_call(

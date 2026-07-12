@@ -102,17 +102,39 @@ struct Builtin {
     };
 
     /*
+     * The ABI KIND, so an INDIRECT (dyn-callee) call can dispatch from the
+     * VALUE alone - a direct call knows the kind at compile time
+     * (DirectBuiltinCallExpr::lvalue_arg0), an indirect one does not (F1
+     * step 2). Fits the EvalValue payload (Builtin grows 16 -> 24 <= the
+     * 24-byte union max member; EvalValue stays 32).
+     *   value   - func_v live (a migrated read-only builtin).
+     *   lvalue  - func_lv live (arg0 handed over as an LValue*).
+     *   map / filter - the validate-order pair: a DIRECT call checks arg0 is
+     *             a function BEFORE evaluating arg1; an INDIRECT call is
+     *             EAGER-ARGS by language rule (dispatch_builtin_values).
+     *   lazy    - the arg is a NODE property (defined/isconst/isconstdecl;
+     *             dev-only show): value-uses are compile-rejected in scripts,
+     *             the REPL dispatches via its retained node.
+     *   node    - ExprList-only, none of the above (no live builtin is left
+     *             in this kind - a tripwire for an unmigrated straggler).
+     */
+    enum class Kind : unsigned char { node, value, lvalue, map, filter, lazy };
+    Kind kind = Kind::node;
+
+    /*
      * Explicit ctors so no construction leaves the anonymous union member
      * uninitialized - aggregate init `Builtin{f}` / `Builtin{nullptr}` used to,
      * which -Wmissing-field-initializers (rightly) flagged. Both pointers null
      * == "not migrated" (the VM falls back to `func`). A MUTATING builtin is
-     * built via the 1-arg ctor (func set, union zeroed) then `b.func_lv = FLV`.
-     * Only ctors are user-declared, so Builtin stays trivially COPYABLE (the
-     * union's bit-copy of a t_builtin value is unaffected).
+     * built via the 1-arg ctor (func set, union zeroed) then `b.func_lv = FLV`
+     * + `b.kind = Kind::lvalue`. Only ctors are user-declared, so Builtin
+     * stays trivially COPYABLE (the union's bit-copy of a t_builtin value is
+     * unaffected; a default member initializer doesn't change that).
      */
     Builtin() : func(nullptr), func_v(nullptr) { }
     explicit Builtin(decltype(func) f) : func(f), func_v(nullptr) { }
-    Builtin(decltype(func) f, decltype(func_v) fv) : func(f), func_v(fv) { }
+    Builtin(decltype(func) f, decltype(func_v) fv)
+        : func(f), func_v(fv), kind(fv ? Kind::value : Kind::node) { }
 };
 
 /* Base typedefs for non-generic template types */

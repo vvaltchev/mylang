@@ -2249,6 +2249,83 @@ struct Codegen {
      * (callee-first, matching the tree-walker), then the args into a register
      * run, and emit CallValueV. The runtime value is a FuncObject (the Func
      * static type proves it), so no dispatch is needed. */
+    /* Compile an INDIRECT call's arg0: fill the CallSite's LVALUE DESCRIPTOR
+     * (the by-ref encoding the dispatch re-derives a func_lv target from)
+     * and, for the elem/member/none forms, the VALUE into run slot `dst` at
+     * arg0's position (the ordinary SubscriptV/MemberV/boxed compile, so an
+     * OOB/missing-key/undefined-base throw fires in argument order, like the
+     * tree-walker's raw arg eval). The slot/undef forms leave run[0] to the
+     * dispatch: an undefined global/unresolved name surfaces at the CONSUMER
+     * (bind/adapter), exactly where the tree-walker's raw UndefinedId does.
+     * An elem's INDEX temp stays live for the dispatch re-derive (all later
+     * arg scratch is allocated above it). */
+    bool compile_indirect_arg0(const Construct *e, int dst,
+                               Chunk::CallSite &cs, std::vector<Instr> &ops)
+    {
+        if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+            switch (id->sym.kind) {
+            case SymKind::local:   cs.a0_kind = 0; break;
+            case SymKind::global:  cs.a0_kind = 1; break;
+            case SymKind::capture: cs.a0_kind = 2; break;
+            case SymKind::builtin: cs.a0_kind = 3; break;
+            default:
+                /* unresolved (incl. `_`): the raw UndefinedId semantics */
+                cs.a0_form = Chunk::CallSite::A0::undef;
+                cs.a0_name = id->uid;
+                return true;
+            }
+            cs.a0_form = Chunk::CallSite::A0::slot;
+            cs.a0_slot = id->sym.slot;
+            return true;
+        }
+        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+            int bslot, bkind;
+            if (as_container_base(sub->what.get(), bslot, bkind)) {
+                /* base value first, then the index - Subscript::do_eval's
+                 * order; the index temp is re-read by the dispatch. */
+                int bval, kslot;
+                if (compile_boxed_expr(sub->what.get(), bval, ops)
+                    && compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                    Instr in;
+                    in.op = OpCode::SubscriptV;
+                    in.node_idx = add_ast_node(sub);   /* subscript caret */
+                    in.target = dst;
+                    in.target2 = bval;
+                    in.a = slot_op(kslot);
+                    ops.push_back(in);
+                    cs.a0_form = Chunk::CallSite::A0::elem;
+                    cs.a0_kind = static_cast<unsigned char>(bkind);
+                    cs.a0_slot = bslot;
+                    cs.a0_operand = kslot;
+                    return true;
+                }
+            }
+            /* an unsupported base/index: the plain value path below */
+        }
+        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+            int bslot, bkind;
+            if (as_container_base(m->what.get(), bslot, bkind)) {
+                int bval;
+                if (compile_boxed_expr(m->what.get(), bval, ops)) {
+                    const int mk = add_member_key(m);
+                    Instr in;
+                    in.op = OpCode::MemberV;
+                    in.target = dst;
+                    in.target2 = bval;
+                    in.a = int_lit(mk);
+                    ops.push_back(in);
+                    cs.a0_form = Chunk::CallSite::A0::member;
+                    cs.a0_kind = static_cast<unsigned char>(bkind);
+                    cs.a0_slot = bslot;
+                    cs.a0_operand = mk;
+                    return true;
+                }
+            }
+        }
+        cs.a0_form = Chunk::CallSite::A0::none;
+        return compile_to_run_slot(e, dst, ops);
+    }
+
     bool try_native_value_call(const CallExpr *call, int &out_slot,
                                std::vector<Instr> &ops)
     {
@@ -2268,17 +2345,65 @@ struct Codegen {
             return false;
         }
 
-        /* A DYN callee: compile only the callee (native load), then dispatch on
-         * its runtime type via CallValueGenericV (the args are bound from the
-         * node — a dyn callee may be a builtin/struct that needs the arg AST, so
-         * they can't be pre-evaluated into a register run here). */
+        /* A DYN callee - AST-FREE (F1 step 2): CheckCallableV (a non-callable
+         * throws BEFORE the args evaluate, the tree-walker's order), then the
+         * args into a register run - arg0 via its lvalue DESCRIPTOR (the
+         * by-ref encoding, so a runtime func_lv callee gets the true LValue*:
+         * slice write-back / const / NotLValueEx byte-identical) - then
+         * CallValueGenericV dispatching on the runtime callee with the
+         * pooled CallSite carets. */
         if (!call->vm_direct_func) {
+            const size_t n = call->args->elems.size();
+            if (n > 0xfff) {              /* the nargs|site<<12 packing bound */
+                ops.resize(mark);
+                next_temp = save_top;
+                return false;
+            }
+            Instr chk;
+            chk.op = OpCode::CheckCallableV;
+            chk.node_idx = add_ast_node(call->what.get());  /* callee caret */
+            chk.a = slot_op(callee_slot);
+            ops.push_back(chk);
+
+            /* Build the site LOCALLY and push it after the args compile: a
+             * nested indirect call inside an arg registers its own site,
+             * which may reallocate the pool (a reference would dangle). */
+            Chunk::CallSite cs;
+            cs.start = call->args->start;
+            cs.end = call->args->end;
+            cs.arr_hint = call->args->arr_hint;
+            cs.args.reserve(n);
+            for (const auto &el : call->args->elems)
+                cs.args.push_back(ArgLoc{el->start, el->end});
+
+            const int argbase = next_temp;
+            next_temp += static_cast<int>(n);
+            if (next_temp > max_temp)
+                max_temp = next_temp;
+            bool ok = true;
+            for (size_t i = 0; ok && i < n; i++) {
+                const Construct *ae = call->args->elems[i].get();
+                const int dst = argbase + static_cast<int>(i);
+                ok = i == 0 ? compile_indirect_arg0(ae, dst, cs, ops)
+                            : compile_to_run_slot(ae, dst, ops);
+            }
+            if (!ok) {
+                ops.resize(mark);
+                next_temp = save_top;
+                return false;
+            }
+            const int site = static_cast<int>(chunk.call_sites.size());
+            chunk.call_sites.push_back(std::move(cs));
+
             const int dstg = alloc_temp();
             Instr cvg;
             cvg.op = OpCode::CallValueGenericV;
-            cvg.node_idx = add_ast_node(call);   /* args ExprList + callee caret */
+            cvg.node_idx = add_ast_node(call);   /* call-site loc (extract) */
             cvg.target = dstg;
-            cvg.a = int_lit(callee_slot);
+            cvg.target2 = callee_slot;
+            cvg.a = int_lit(argbase);
+            cvg.b = int_lit(static_cast<int_type>(n)
+                            | (static_cast<int_type>(site) << 12));
             ops.push_back(cvg);
             out_slot = dstg;
             return true;
@@ -5839,6 +5964,12 @@ static void extract_locs(Chunk &chunk)
         case OpCode::Throw:          /* node = ThrowStmt (throw-site loc) */
         case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
         case OpCode::CoerceNumV:    /* node = the Expr14 (narrow-throw caret) */
+        case OpCode::CheckCallableV: /* node = the callee (NotCallable caret) */
+        case OpCode::CallValueGenericV: /* node = the CallExpr: the CALL-SITE
+                                     * loc (a FuncObject callee's backtrace via
+                                     * do_func_call's loc_at); the op is now
+                                     * AST-FREE (pooled ArgLocs + the lvalue-
+                                     * preserving arg run) - F1 step 2. */
         /* the checked inc-decs: dual carets in incdec_sites; the side-table
          * loc = the undefined-global-base caret (vm_store_base). */
         case OpCode::IncDecElemCheckedV:
@@ -5884,14 +6015,6 @@ static void extract_locs(Chunk &chunk)
          * nulled). Everything NOT listed anywhere here sets a node it never uses
          * at runtime - the default nulls it, so a fully-native chunk's pool is
          * empty (the accurate "not serializable yet" signal). */
-        case OpCode::CallValueGenericV:
-            /* KEEP the node (its args ExprList + callee caret are used at
-             * runtime by dispatch_call_value) AND record the CALL-SITE loc:
-             * do_func_call resolves loc_at(pc) for a FuncObject callee's
-             * backtrace call-site (== the CallExpr's start). */
-            chunk.locs.push_back(
-                {static_cast<uint32_t>(pc), node->start, node->end});
-            break;   /* node_idx kept */
         case OpCode::EmplaceStruct: {
             /* The ctor def + container/field carets are in the emplace_sites
              * pool; record the WHOLE-ARGS caret (the handler's catch stamps a

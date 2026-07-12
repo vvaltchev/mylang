@@ -3892,13 +3892,52 @@ types.cpp; the check rides the `reject_dev_builtins` walk, same
 `g_dev_builtins_allowed` gate — the REPL retains the AST, so the indirect
 form keeps working there, the `show` precedent). A runtime check in
 `dispatch_call_value` is unnecessary: a script can no longer produce such a
-value. Documented in README (`defined`, `isconst`). **Step 2 (OPEN):** the
-op's AST-free rework (pre-evaluated args + pooled carets) still needs one
-maintainer call on the two residual ExprList-ABI callees — indirect
-`map`/`filter` (eager args would reorder the tested validate-before-arg1)
-and indirect MUTATING builtins (a pre-evaluated arg0 loses lvalue-ness and
-would COW-clone — a silent-no-op trap; recommendation: ban them) — see
-plans/vm-fallback-elimination.md fork F1. Until then the op keeps its node.
+value. Documented in README (`defined`, `isconst`). **Step 2 (LANDED
+2026-07-14) — the op is AST-FREE.** Two pieces:
+(1) **Every `Builtin` carries a `Kind` tag** (value / lvalue / map / filter /
+lazy / node — `evalvalue.h`; Builtin grows 16→24 bytes, still inside the
+24-byte `EvalValue` payload), so an indirect callee's ABI is decidable from
+the VALUE at runtime (a direct call knows it at compile time; an indirect
+one cannot). Every `make_*` registration stamps it.
+(2) **Args pre-evaluated + the `Chunk::CallSite` pool** (`b` = nargs |
+site << 12): the ArgLocs data (whole-args + per-arg carets, arr_hint) PLUS
+**arg0's LVALUE DESCRIPTOR** — the by-ref encoding. Frame slots can't hold
+an `LValue*`-boxed value (`LValue::type_checks`), so instead of
+materializing the tree-walker's raw arg value the dispatch RE-DERIVES
+arg0's `LValue*` from the descriptor, only when the callee turns out
+`func_lv` (the `CallBuiltinLV`/`LVElem`/`LVMember` model): forms none
+(a non-lvalue expr → null target → `NotLValueEx`), slot (id kind+slot; an
+undefined GLOBAL surfaces at the CONSUMER as the tree-walker's raw
+`UndefinedId` does), elem (base kind/slot + a RESERVED index temp; run[0]
+holds the element VALUE, filled by an ordinary `SubscriptV` at arg0's
+position so OOB/key throws keep argument order; the func_lv re-derive
+repeats the subscript — idempotent, and a between-args container mutation
+THROWS where the tree-walker's stale `LValue*` is UB — safer), member
+(member_keys idx; run[0] via `MemberV`), undef (a pooled name). So the
+SLICE WRITE-BACK, const, and literal-arg0 errors of an indirect
+`append`/`sort` are byte-identical to the direct call. A **`CheckCallableV`**
+op sits between the callee and the arg run (a non-callable callee throws
+`NotCallableEx` BEFORE the args evaluate, the tree-walker's order — the
+earlier FuncObject-only version was reverted for rejecting builtin callees;
+this one admits all three callable kinds). Dispatch: FuncObject →
+`vm_call_func` (run[0] filled with the derived RValue — an undefined name
+throws at BIND); struct → **`construct_struct_v`** (the values twin of
+construct_struct: full runtime arity + per-field coerce with pooled
+carets); Builtin → **`dispatch_builtin_values`** by Kind. **The EAGER-ARGS
+language rule:** an INDIRECT builtin call evaluates its args first, then
+the builtin's checks run — implemented in the ONE shared
+`dispatch_builtin_values` (eval.cpp) that BOTH engines call (the
+tree-walker's `dispatch_call_value` routes a `vm_dyn_callee`-stamped call
+with a non-lazy Builtin through raw left-to-right arg evals + the same
+dispatch; a DIRECT tree-walked call — const-eval, REPL, unspecialized —
+keeps the node ABI, so `map`'s validate-before-arg1 and `sort`'s custom
+arg0 are unchanged there). README documents the rule under `map`. Known
+corner (documented, not observable in well-formed code): an UNRESOLVED id
+in a non-arg0 position throws at its own position under the VM
+(`ThrowRuntimeV` in the run) but at the consumer in the tree-walker, so a
+LATER arg's side effects may run in one engine and not the other — both
+throw the same `UndefinedVariableEx`. **With this, `node_table`'s only
+users are the three fallback ops** (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`).
 
 **Niche STATEMENTS → native (a further sweep).** Several residual real shapes
 went native: an **inc-dec STATEMENT on an int/float member/nested subscript**
@@ -4010,12 +4049,12 @@ runtime-`const` rebind are all now native (above).
 DROPPED).** A runtime-node op looks its `Construct*` up by **pc** in the
 pc-keyed **`node_table`** (`{pc, Construct*}`, sorted, binary-searched by
 `node_at_pc` on the COLD path only — SAME shape/cost as `locs` / `inline_ctxs`),
-NOT via a per-`Instr` index into a pool. The residual nodes are now ONLY: the
-fallbacks (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`) and
-`CallValueGenericV`
-(its args `ExprList` + callee — a dyn callee may be a Builtin whose ABI takes
-the unevaluated args). The builtin-call ops read the `builtin_calls` pool,
+NOT via a per-`Instr` index into a pool. The residual nodes are now ONLY the
+three fallback ops (`EvalStmt`/`EvalToSlot`/`JumpIfFalse`, `node->eval`).
+The builtin-call ops read the `builtin_calls` pool,
 `EmplaceStruct` the `emplace_sites` pool (ctor def + container/field carets),
+`CallValueGenericV` the `call_sites` pool (carets + arg0's lvalue
+descriptor — F1 step 2),
 `CheckFuncV`/`MapFilterV` and the flat int/float element stores the loc side
 table, and the checked inc-decs the `incdec_sites` pool — all AST-free.
 **How it's built:** `Instr::node_idx`
@@ -4062,8 +4101,8 @@ still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
-`member_keys`, `incdec_sites`, `emplace_sites`, `catch_types`, `literal_objs`,
-`closure_defs`, `struct_defs`,
+`member_keys`, `incdec_sites`, `emplace_sites`, `call_sites`, `catch_types`,
+`literal_objs`, `closure_defs`, `struct_defs`,
 `unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT
 serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
 ones only). This is the audit surface for the `.myv` stored-bytecode endgame:

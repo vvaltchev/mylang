@@ -2223,18 +2223,150 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
         }
 
         case OpCode::CallValueGenericV: {
-            /* Generic indirect call of a DYN callee: read the callee (evaluated
-             * into `a.lit`) and dispatch on its runtime type via the shared
-             * dispatch_call_value (FuncObject / Builtin / struct / non-callable)
-             * - byte-identical to CallExpr::do_eval. A FuncObject body runs
-             * native (as_signal routes its cross-frame VM exception); a Builtin/
-             * struct/non-callable error is a plain C++ throw the boundary
-             * catches. `node` = the CallExpr (its args ExprList + callee caret). */
-            const EvalValue &callee = ctx.frame->at(in.a.lit).get();
-            const CallExpr *node =
-                static_cast<const CallExpr *>(chunk.node_at_pc(pc));
-            EvalValue res =
-                dispatch_call_value(&ctx, callee, node, &chunk, pc, true);
+            /* Generic indirect call of a DYN callee - AST-FREE (F1 step 2):
+             * args 1..n-1 pre-evaluated in the run [a.lit+1, +nargs-1);
+             * arg0 is described by the CallSite's LVALUE DESCRIPTOR (the
+             * by-ref encoding - frame slots can't hold an LValue*-boxed
+             * value, so the LValue* is re-derived at dispatch, only for a
+             * func_lv callee; an elem/member arg0's VALUE was filled into
+             * run[0] at its position by SubscriptV/MemberV). Dispatch on the
+             * runtime callee: FuncObject -> vm_call_func (run[0] filled with
+             * the derived value first - an undefined name throws at BIND,
+             * the tree-walker's raw-UndefinedId order); struct ->
+             * construct_struct_v; Builtin -> dispatch_builtin_values by
+             * Kind - the same shared code the tree-walker's indirect branch
+             * calls, so both engines agree. CheckCallableV already threw
+             * for a non-callable BEFORE the args evaluated. A loc-less
+             * builtin throw is stamped with the args caret, mirroring
+             * dispatch_call_value's catch. */
+            const EvalValue &callee = ctx.frame->at(in.target2).get();
+            const int_type argbase = in.a.lit;
+            const size_t nargs = static_cast<size_t>(in.b.lit & 0xfff);
+            const int site_i = static_cast<int>(in.b.lit >> 12);
+            const Chunk::CallSite &cs = chunk.call_sites[site_i];
+            ArgLocs al = chunk.call_arglocs_at(site_i);
+
+            /* arg0's VALUE from the descriptor: run[0] for the filled forms
+             * (none/elem/member), the slot's value for `slot` (an undefined
+             * global -> UndefinedId, surfacing at the CONSUMER's RValue),
+             * the UndefinedId for `undef`. */
+            auto a0_value = [&]() -> EvalValue {
+                switch (cs.a0_form) {
+                case Chunk::CallSite::A0::slot:
+                    switch (cs.a0_kind) {
+                    case 0:  return ctx.frame->at(cs.a0_slot).get();
+                    case 1:
+                        if (ctx.gfuncs->defined[cs.a0_slot])
+                            return ctx.gfuncs->slots[cs.a0_slot].get();
+                        return EvalValue(
+                            UndefinedId{ctx.gfuncs->names[cs.a0_slot]->val});
+                    case 2:  return (*ctx.captures)[cs.a0_slot].get();
+                    default: return builtin_slot(cs.a0_slot).get();
+                    }
+                case Chunk::CallSite::A0::undef:
+                    return EvalValue(UndefinedId{cs.a0_name->val});
+                default:
+                    return ctx.frame->at(argbase).get();
+                }
+            };
+            /* arg0's LValue* for a func_lv callee (null -> NotLValueEx in
+             * the builtin, like a non-LValue* raw value). `holder` keeps an
+             * elem's subscript result alive across the call. */
+            EvalValue holder;
+            auto a0_lvalue = [&]() -> LValue * {
+                switch (cs.a0_form) {
+                case Chunk::CallSite::A0::slot:
+                    switch (cs.a0_kind) {
+                    case 0:  return &ctx.frame->at(cs.a0_slot);
+                    case 1:  return ctx.gfuncs->defined[cs.a0_slot]
+                                 ? &ctx.gfuncs->slots[cs.a0_slot] : nullptr;
+                    case 2:  return &(*ctx.captures)[cs.a0_slot];
+                    default: return &builtin_slot(cs.a0_slot);
+                    }
+                case Chunk::CallSite::A0::elem: {
+                    LValue *base = vm_store_base(ctx, cs.a0_kind, cs.a0_slot,
+                                                 chunk, pc, nullptr);
+                    const EvalValue &key =
+                        ctx.frame->at(cs.a0_operand).get();
+                    holder = base->get().get_type()->subscript(
+                        EvalValue(base), key, /*for_write=*/false);
+                    return holder.is<LValue *>()
+                               ? holder.get<LValue *>() : nullptr;
+                }
+                case Chunk::CallSite::A0::member: {
+                    const Chunk::MemberKey &mk =
+                        chunk.member_keys[cs.a0_operand];
+                    LValue *base = vm_store_base(ctx, cs.a0_kind, cs.a0_slot,
+                                                 chunk, pc, nullptr);
+                    return vm_member_lvalue_ref(base->get(), mk.memId,
+                                                mk.memUid,
+                                                /*for_write=*/false,
+                                                mk.mstart, mk.mend);
+                }
+                default:
+                    return nullptr;
+                }
+            };
+
+            EvalValue res;
+            try {
+                if (callee.is<intrusive_ptr<FuncObject>>()) {
+                    if (nargs)
+                        ctx.frame->at(argbase).put(RValue(a0_value()));
+                    res = vm_call_func(
+                        &ctx,
+                        *callee.get<intrusive_ptr<FuncObject>>().get(),
+                        &ctx.frame->at(argbase), nargs, &chunk, pc);
+                } else {
+                    /* Builtin / struct: the raw values (arg0 from the
+                     * descriptor - may be UndefinedId, RValued by need). */
+                    EvalValue stackbuf[8];
+                    std::vector<EvalValue> heapbuf;
+                    EvalValue *buf = stackbuf;
+                    if (nargs > 8) {
+                        heapbuf.resize(nargs);
+                        buf = heapbuf.data();
+                    }
+                    if (nargs)
+                        buf[0] = a0_value();
+                    for (size_t i = 1; i < nargs; i++)
+                        buf[i] = ctx.frame->at(argbase
+                                               + static_cast<int>(i)).get();
+                    if (callee.is<Builtin>()) {
+                        const Builtin &b = callee.get<Builtin>();
+                        if (b.kind == Builtin::Kind::lvalue) {
+                            /* the by-ref path: derive arg0's true LValue* */
+                            LValue *target = nargs ? a0_lvalue() : nullptr;
+                            EvalValue rest[8];
+                            std::vector<EvalValue> resth;
+                            EvalValue *rp = rest;
+                            const size_t nr = nargs ? nargs - 1 : 0;
+                            if (nr > 8) {
+                                resth.resize(nr);
+                                rp = resth.data();
+                            }
+                            for (size_t i = 0; i < nr; i++)
+                                rp[i] = RValue(buf[i + 1]);
+                            res = b.func_lv(&ctx, &al, target,
+                                            nr ? rp : nullptr, nr);
+                        } else {
+                            res = dispatch_builtin_values(&ctx, b, &al,
+                                                          buf, nargs);
+                        }
+                    } else if (callee.is<StructTypeDef *>()) {
+                        res = construct_struct_v(
+                            callee.get<StructTypeDef *>(), &al, buf, nargs);
+                    } else {
+                        throw NotCallableEx();   /* net: CheckCallableV ran */
+                    }
+                }
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = al.start;
+                    e.loc_end = al.end;
+                }
+                throw;
+            }
             if (g_vm_exc_pending) {                /* FuncObject cross-frame */
                 vm_flush_inline(chunk, pc, *g_vm_exc_pending);
                 if (vm_dispatch_exc(handlers, pc)) {
@@ -2244,6 +2376,22 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 return;
             }
             ctx.frame->at(in.target).put(std::move(res));
+            pc++;
+            break;
+        }
+
+        case OpCode::CheckCallableV: {
+            /* An indirect call's callable guard: throw NotCallableEx (callee
+             * caret, loc side table) unless slot `a` holds a FuncObject, a
+             * Builtin, or a struct type descriptor - BEFORE the arg run
+             * evaluates, matching the tree-walker's dispatch order. */
+            const EvalValue &cv = ctx.frame->at(in.a.slot).get();
+            if (!cv.is<intrusive_ptr<FuncObject>>() && !cv.is<Builtin>()
+                && !cv.is<StructTypeDef *>()) {
+                Loc s, en;
+                chunk.loc_at(pc, s, en);
+                throw NotCallableEx(s, en);
+            }
             pc++;
             break;
         }

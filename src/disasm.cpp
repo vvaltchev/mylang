@@ -284,6 +284,21 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
               << "  (" << es.field_locs.size() << " fields)\n";
         }
     }
+    if (!ch.call_sites.empty()) {
+        s << "; -- call_sites (" << ch.call_sites.size() << ") --\n";
+        static const char *fm[] = {"none", "slot", "elem", "member", "undef"};
+        for (size_t i = 0; i < ch.call_sites.size(); i++) {
+            const auto &cs = ch.call_sites[i];
+            s << ";   #" << i << "  " << cs.args.size() << " args, a0="
+              << fm[static_cast<int>(cs.a0_form)];
+            if (cs.a0_form == Chunk::CallSite::A0::slot
+                || cs.a0_form == Chunk::CallSite::A0::elem
+                || cs.a0_form == Chunk::CallSite::A0::member)
+                s << " k" << static_cast<int>(cs.a0_kind)
+                  << "[" << cs.a0_slot << "]";
+            s << "\n";
+        }
+    }
     if (!ch.incdec_sites.empty()) {
         s << "; -- incdec_sites (" << ch.incdec_sites.size() << ") --\n";
         for (size_t i = 0; i < ch.incdec_sites.size(); i++) {
@@ -748,9 +763,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << arglist(chunk, in.a.lit, in.b.lit);
             break;
         case OpCode::CallValueGenericV:
-            /* generic dyn-callee dispatch; args bound from the node. */
-            row << "call.val.dyn " << D(in.target) << " = " << D(in.a.lit)
-                << "(...)   ; dyn dispatch";
+            /* generic dyn-callee dispatch, AST-free: args pre-evaluated in
+             * the run (arg0 lvalue-preserving), carets pooled. */
+            row << "call.val.dyn " << D(in.target) << " = " << D(in.target2)
+                << arglist(chunk, in.a.lit,
+                           static_cast<int>(in.b.lit & 0xfff))
+                << "   ; runtime dispatch, site #" << (in.b.lit >> 12);
+            break;
+        case OpCode::CheckCallableV:
+            row << "check.call   " << RI(in.a, false)
+                << "  ; throw if not callable";
             break;
         case OpCode::CheckFuncV:
             row << "check.func   " << RI(in.a, false)

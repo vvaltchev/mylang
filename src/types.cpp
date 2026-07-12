@@ -236,6 +236,19 @@ inline auto make_const_builtin_lv(const char *name, decltype(Builtin::func) f,
 {
     Builtin b{f};        /* the custom func (value-or-lvalue arg0) */
     b.func_lv = flv;     /* the VM's lvalue form */
+    b.kind = Builtin::Kind::lvalue;
+    return make_pair(UniqueId::get(name), LValue(b, true));
+}
+
+/* map/filter: the ExprList `func` serves the DIRECT form (which validates
+ * arg0 is a function BEFORE evaluating arg1 - the tested order); the KIND
+ * tag lets an INDIRECT (dyn-callee) call dispatch EAGER-ARGS to the shared
+ * vm_map_filter core (dispatch_builtin_values) - the F1 step 2 rule. */
+inline auto make_const_builtin_mf(const char *name, decltype(Builtin::func) f,
+                                  bool is_filter)
+{
+    Builtin b{f};
+    b.kind = is_filter ? Builtin::Kind::filter : Builtin::Kind::map;
     return make_pair(UniqueId::get(name), LValue(b, true));
 }
 
@@ -263,7 +276,9 @@ inline auto make_dev_builtin(const char *name, decltype(Builtin::func) f)
 {
     const UniqueId *uid = UniqueId::get(name);
     g_dev_builtin_ids.insert(uid);
-    return make_pair(uid, LValue(Builtin{f}, false));
+    Builtin b{f};
+    b.kind = Builtin::Kind::lazy;   /* node-dependent (decompiles the AST) */
+    return make_pair(uid, LValue(b, false));
 }
 bool is_dev_builtin(const UniqueId *uid)
 {
@@ -288,7 +303,9 @@ template <typename P>
 static inline P mark_lazy_builtin(P p)
 {
     g_lazy_builtin_ids.insert(p.first);
-    return p;
+    Builtin b = p.second.get().template get<Builtin>();
+    b.kind = Builtin::Kind::lazy;
+    return make_pair(p.first, LValue(b, p.second.is_const_var()));
 }
 bool is_lazy_builtin(const UniqueId *uid)
 {
@@ -463,6 +480,7 @@ inline auto make_builtin_lv(const char *name)
 {
     Builtin b{builtin_lv_adapter<FLV>};   /* func set; the union is zeroed */
     b.func_lv = FLV;                      /* the mutating-form pointer */
+    b.kind = Builtin::Kind::lvalue;
     return make_pair(UniqueId::get(name), LValue(b, false));
 }
 
@@ -477,6 +495,7 @@ inline auto make_builtin_lv_custom(const char *name, decltype(Builtin::func) f,
 {
     Builtin b{f};
     b.func_lv = flv;
+    b.kind = Builtin::Kind::lvalue;
     return make_pair(UniqueId::get(name), LValue(b, false));
 }
 
@@ -489,6 +508,7 @@ inline auto make_builtin_lv_v(const char *name)
 {
     Builtin b{builtin_lv_v_adapter<FLV>};
     b.func_lv = FLV;
+    b.kind = Builtin::Kind::lvalue;
     return make_pair(UniqueId::get(name), LValue(b, false));
 }
 
@@ -512,8 +532,8 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin_lv("rev_sort", builtin_rev_sort, builtin_rev_sort_lv),
     make_const_builtin_lv("reverse", builtin_reverse, builtin_reverse_lv),
     make_const_builtin_v<builtin_sum>("sum"),
-    make_const_builtin("map", builtin_map),
-    make_const_builtin("filter", builtin_filter),
+    make_const_builtin_mf("map", builtin_map, false),
+    make_const_builtin_mf("filter", builtin_filter, true),
 
     /* Dictionary builtins */
     make_const_builtin_v<builtin_keys>("keys"),

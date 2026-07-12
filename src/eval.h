@@ -370,6 +370,22 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             const ArgLoc *flocs, const EvalValue *vals,
                             size_t n);
 
+/* F1 step 2: the VALUES dispatch of an INDIRECT builtin call, keyed on
+ * Builtin::Kind - value (func_v), lvalue (func_lv; arg0 may be an
+ * LValue*-boxed value, the by-ref encoding), map/filter (EAGER-ARGS by
+ * language rule, via the shared vm_map_filter core), lazy/node (a tripwire -
+ * script-unreachable). Shared by the tree-walker's indirect map/filter branch
+ * and the VM's CallValueGenericV, so both engines agree. See eval.cpp. */
+EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
+                                  const ArgLocs *al, const EvalValue *args,
+                                  size_t n);
+
+/* The VALUES twin of construct_struct for an INDIRECT construction (args
+ * pre-evaluated + unvalidated: the full runtime arity/coerce checks run, with
+ * the pooled per-arg carets). See eval.cpp. */
+EvalValue construct_struct_v(StructTypeDef *def, const ArgLocs *al,
+                             const EvalValue *args, size_t nargs);
+
 /* Shared call DISPATCH for an already-evaluated callee value (the VM's
  * CallValueGenericV + the tree-walker's CallExpr::do_eval): FuncObject /
  * Builtin / struct descriptor / non-callable, byte-identical. `ck`/`pc` +
