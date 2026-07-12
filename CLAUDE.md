@@ -3025,8 +3025,11 @@ general `elem = view[i].get()`, ~1.7x on a general-array foreach loop; the
 inferencer stamps `ForeachStmt::container_is_array`. Both the **single-var**
 (`foreach (e in a)`) and the **INDEXED 2-var** (`foreach (i, e in indexed a)`)
 forms are native: for indexed, the index var IS the loop counter (the body
-reads it) and the element loads into the 2nd var. (Flat `array<bool>` still
-falls back.) A **foreach over a proven STRING**
+reads it) and the element loads into the 2nd var. A flat **`array<bool>`** binds
+each element as a REAL bool (not 0/1) via **`LoadElemBool`**
+(`ForeachStmt::elem_is_bool`), so `print(x)`/`str(x)` show `true`/`false` and
+`x == true` holds — matching `arr_elem_boxed`'s bool case. A **foreach over a
+proven STRING**
 (`ForeachStmt::container_is_str`) is the same counted-loop shape with two string
 ops: **`StrLen`** (the char count
 bound, once) and **`LoadStrChar`** (bind char i as a fresh 1-char string, box-
@@ -3231,9 +3234,21 @@ field args compile into a register run, then `construct_struct_from_values`
 coerces them into the POD bytes (the `StructTypeDef*` is a `Chunk::struct_defs`
 index, so node-free). It's gated on **every arg a typed scalar** (`th==i/f`) —
 the inferencer already rejected a non-fitting typed arg, so `coerce` can't throw
-and no per-arg loc is needed; a nested-struct-field arg (`Q(..)`, `th==none`) or
+and no per-arg loc is needed; a **nested POD-struct-field arg** (`L(P(1,2),
+P(3,4))`) is accepted too (`pod_ctor_arg_safe`: the nested `StructCtorV`
+produces exactly that struct type, so the parent's `coerce` can't throw), while
 a `dyn` arg falls back to the tree-walker, which reports the exact arg loc (the
-`append`-fused ctor is `EmplaceStruct`). This exposed a latent VM bug: `a[i] =
+`append`-fused ctor is `EmplaceStruct`). A **BOXED (non-POD) construction**
+`B(a, x)` with runtime args — an `array`/`dyn`/`opt` field makes B boxed (a
+const-arg one folds to a `LiteralObj`) — is **`StructCtorBoxedV`**
+(`CallExpr::vm_struct_boxed_def`, copied onto the `DirectCallExpr` in
+`devirtualize_calls`): the field args compile into a register run, then
+`construct_struct_boxed_from_values` mirrors `construct_struct`'s boxed loop
+(coerce + emplace, none-fill omitted trailing opt fields). Here a field coerce
+CAN throw (a dyn-laundered wrong value), so the **per-arg carets** are pooled in
+a new serializable `Chunk::boxed_ctors` (`{def, ArgLoc[]}`) and the throw
+reports the offending arg's caret — byte-identical to the tree-walker, AST-free.
+The POD path exposed a latent VM bug: `a[i] =
 <struct>` into a **flat struct array** has no boxed element LValue, so the
 general `StoreElemValue` path (`subscript(for_write)`) wrongly raised
 `NotLValueEx`; `vm_subscript_store` now byte-stores a flat POD-struct element
@@ -3639,6 +3654,36 @@ resolved by what each needs (so the ONLY node-holder left is dev-only `show`):
   already in `Chunk::struct_defs` + each value's own `def`; the folded `Type`
   object is a serializable `LiteralObj`). So the reflection residual is now ONLY
   the dev-only `show` (above), which deliberately keeps its AST.
+
+**Script-mode real-code fallbacks — a further sweep (all now NATIVE).** After
+F-1..F-4, a `ML_DBG_FB` audit hook in codegen `emit()` (compiled out by default;
+logs the rendered construct behind any `EvalStmt`/`EvalToSlot`/`JumpIfFalse`)
+found the remaining SCRIPT-mode shapes a real program can hit, each now native:
+a **`foreach` over `array<bool>`** (`LoadElemBool`, a real-bool bind, above); a
+**nested / boxed struct construction** (`StructCtorV`'s widened
+`pod_ctor_arg_safe` gate + the new `StructCtorBoxedV`, above); a **bare
+discarded-value expression statement** (`s[3];`, `a[i:j];`, `x + y;` —
+`gen_stmt` compiles it into a scratch temp and drops the result, so an OOB /
+missing-key / type error still throws with the byte-identical caret; a bare LEAF
+identifier / scalar literal is skipped, since the tree-walker never RValue-s a
+discarded statement, so an undefined name stays its harmless `UndefinedId` no-op
+rather than a `LoadGlobalV` throw); and an **inc-dec used as a VALUE**
+(`y = x++`, `y = a[i]++` — `compile_boxed_expr`'s `IncDecExpr` case lowers it to
+read-lvalue + mutate (postfix) / mutate + read (prefix), reusing the statement
+compilers for the in-place mutation, gated by `incdec_lvalue_pure` on a side-
+effect-free lvalue so the two evals of the slot/index agree). This last one
+surfaced a **pre-existing tree-walker bug**: auto-const promoting a write-once
+INDEX var (`var i=1; a[i]++`) dropped its decl but `fold_reads` had no
+`IncDecExpr` case, dangling the promoted `i` — fixed by folding the READS in an
+inc-dec lvalue like an assignment lvalue. **Net: all of `bench/` and `samples/`
+lower with an EMPTY `ast_nodes` pool (100% native, serializable).** The residual
+`EvalStmt` uses are then only: **error-path** constructs the VM can't pre-detect
+(a bare lvalue-builtin on a literal, an undefined-name call, a not-callable, a
+rebind of a builtin/literal — they throw, via the tree-walker for now), a few
+**niche** shapes (a member/dyn inc-dec statement, a ≥3-level nested store, a
+whole-`p` struct-array `foreach`), the residual **`InlinedCallExpr`** block
+form, and the dev-only **`show`** (script-excluded by `reject_dev_builtins`, so
+never in serialized script bytecode).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index

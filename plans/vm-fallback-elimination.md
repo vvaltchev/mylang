@@ -406,6 +406,44 @@ net is still needed for the error paths + `-nti -vm` + the few real gaps above);
 "typical scripts fully native" is the achieved milestone. NEXT tractable
 real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
 (differential) + samples byte-identical.
+
+  **(e) continued — script-mode real-code sweep (2026-07-13).** Re-audited via
+  the `ML_DBG_FB` `emit()` hook (compiled out by default; logs the rendered
+  construct behind any fallback op) over the whole `-rt` run. Started at 161
+  `EvalStmt` / 143 distinct; nativized, in order:
+  - **`array<bool>` foreach → `LoadElemBool`** (binds a REAL bool, not 0/1;
+    `ForeachStmt::elem_is_bool`). Single + indexed.
+  - **Nested POD struct construction `L(P(1,2),P(3,4))` → `StructCtorV`** (gate
+    widened to `pod_ctor_arg_safe`: a nested POD-struct-ctor arg of the exact
+    field type; the nested ctor's value embeds via `pod_store_field`'s memcpy,
+    coerce still can't throw). Recurses to any depth.
+  - **Boxed (non-POD) construction `B(a,x)` → new `StructCtorBoxedV`**
+    (`CallExpr::vm_struct_boxed_def`, copied onto the `DirectCallExpr` in
+    `devirtualize_calls` — the missing copy is why it first didn't fire). A
+    boxed field coerce CAN throw (dyn-launder), so **per-arg carets** are pooled
+    in a serializable `Chunk::boxed_ctors` (`{def, ArgLoc[]}`) — byte-identical
+    caret, AST-free. None-fills omitted trailing opt fields.
+  - **Bare discarded-value expression statement** (`s[3];`, `a[i:j];`,
+    `x + y;`) → `gen_stmt` compiles it to a scratch temp and drops the result
+    (eval-for-value == eval-for-effect). SKIPS a bare leaf (Identifier / scalar
+    Literal): the tree-walker never RValue-s a discarded statement, so an
+    undefined name must stay its harmless `UndefinedId` no-op, not a
+    `LoadGlobalV` throw.
+  - **inc-dec used as a VALUE** (`y = x++`, `y = a[i]++`) → `compile_boxed_expr`
+    `IncDecExpr` case: read-lvalue + mutate (postfix) / mutate + read (prefix),
+    reusing the statement compilers; gated `incdec_lvalue_pure` (side-effect-
+    free lvalue). This surfaced + fixed a **pre-existing auto-const bug**:
+    `fold_reads` had no `IncDecExpr` case, so a promoted write-once INDEX var
+    (`var i=1; a[i]++`) dangled — fixed by folding the inc-dec lvalue's READS.
+  Result: **161 → 111 `EvalStmt`, 143 → 96 distinct.** `bench/` + `samples/`
+  stay 100% native (empty `ast_nodes`). The residual 96 are: ~40 DELIBERATE
+  error tests (undefined-name, rebind, not-callable, OOB, lvalue-builtin-on-
+  literal, wrong-type/arity ctor — they throw, via the tree-walker for now),
+  ~15 niche real shapes (member/dyn inc-dec statement, ≥3-level nested store,
+  whole-`p` struct-array `foreach`, struct/nested-array literal in some
+  contexts, IdList compound `+=`), 5 `InlinedCallExpr` block forms, `assert(..)`
+  with an unliftable arg, and the dev-only `show` (script-excluded). Op DELETION
+  still deferred (the error paths need native throwing ops first).
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then
