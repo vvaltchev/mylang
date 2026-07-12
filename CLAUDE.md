@@ -1874,23 +1874,30 @@ sanitizers never reproduced it.)
   nested* functions doesn't resolve (each function's body resolves in its own
   scope stack, which doesn't see the enclosing scope's scoped globals) — it was
   already broken (a runtime `UndefinedVariableEx`), and stays so.
-  **KNOWN CRASH (2026-07-14, fix agreed):** a func (or struct) decl as a
-  **BRACE-LESS** `if`/loop body — `if (c) func g() => 1;`,
-  `while (i < 1) func g() => 1;` — ABORTS the tree-walker:
+  **FIXED CRASH (2026-07-14, `pWrapDeclBody` in parser.cpp):** a func (or
+  struct) decl as a **BRACE-LESS** `if`/loop body — `if (c) func g() => 1;`,
+  `while (i < 1) func g() => 1;` — ABORTED the tree-walker:
   `hoist_scoped_decls` only pre-scans **Block** statement lists, so a
-  bare-statement body's decl is never hoisted to a scoped global; it falls to
+  bare-statement body's decl was never hoisted to a scoped global; it fell to
   `declare_masking` (a local map entry) and `FuncDeclStmt::do_eval`'s
-  `ctx->emplace` then trips the asserted-EMPTY script map
-  (`in_const_eval() || repl_mode`). The braced forms
-  (`if (c) { func g() => 1; }`) hoist and work. **The AGREED fix (maintainer,
-  2026-07-14): the PARSER normalizes a brace-less `if`/`while`/`for`/`foreach`
-  body to an implicit single-statement `Block`** — semantics-neutral for every
-  other statement (a single non-decl statement's block is `scope_free`, so it
-  runs in place), it routes the decl through the normal hoist, and it makes
-  the VM codegen's non-global-`FuncDeclStmt` fallback provably DEAD in scripts
-  (the REPL never runs codegen) so that emit path can be deleted. Not yet
-  implemented — see plans/vm-fallback-elimination.md (execution order, the
-  rescoped step 4).
+  `ctx->emplace` tripped the asserted-EMPTY script map
+  (`in_const_eval() || repl_mode`). The fix is a **TARGETED parser
+  normalization**: `pWrapDeclBody` wraps a brace-less body in a synthetic
+  single-statement `Block` **only when it is a func/struct decl** (the
+  crashing shapes, which nothing could have depended on). It is deliberately
+  NOT the blanket wrap first proposed, because a brace-less body **decl LEAKS
+  into the enclosing scope by long-standing behavior** — `if (c) var x = 5;
+  print(x)` prints 5, `if (c) const K = 7;` keeps `K` visible, a `while`-body
+  `var` too (all verified + pinned by tests) — and a blanket wrap would have
+  silently broken that. Two more preserved subtleties: the `if` applies the
+  wrap only to the RUNTIME statement, so a const-folded
+  `if (true) func g() => 1;` still folds to the bare decl (the feature-flag
+  pattern keeps `g` in the enclosing scope); and a PURE expr-bodied `g` is
+  const-folded/inlined at its call sites regardless of scope (a pre-existing
+  fold-vs-scope quirk, identical in both engines — the block-scoping tests
+  must use an IMPURE func). With the masked route gone, a SCRIPT's named
+  func/struct decl ALWAYS has a global slot — the VM codegen's `gen_stmt`
+  now `ML_CHECK`s that invariant instead of falling back.
   **Scope, still map-bound:** lambdas (anonymous — no name binding; their
   params/locals ARE slotted) and, in the **REPL** (top-level names stay
   redefinable), all top-level names; template-instance clones, inserted before

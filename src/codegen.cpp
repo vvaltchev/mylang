@@ -5593,10 +5593,16 @@ struct Codegen {
          * hoisted top-level / scoped function) -> MakeClosureV (create the
          * FuncObject, snapshotting captures) + StoreGlobalV (write the slot +
          * mark defined) - byte-identical to FuncDeclStmt::do_eval's global-bind
-         * `slots[slot] = LValue(func, false); defined = 1`. A capturing named
-         * func (local slot) or the REPL (map) falls back to EvalStmt. */
+         * `slots[slot] = LValue(func, false); defined = 1`. In a SCRIPT a
+         * NAMED func decl ALWAYS has a global slot (top-level hoist or a
+         * scoped global): the grammar rejects a capture list on a named func,
+         * and the brace-less-body masked route was removed by pWrapDeclBody
+         * (parser.cpp) - so the old non-global EvalStmt fallback is provably
+         * dead (the REPL, whose names ARE map-resident, never runs codegen);
+         * ML_CHECK guards the invariant. */
         if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(s)) {
-            if (fd->id && fd->id->sym.kind == SymKind::global) {
+            if (fd->id) {
+                ML_CHECK(fd->id->sym.kind == SymKind::global);
                 const int t = alloc_temp();
                 Instr mk;
                 mk.op = OpCode::MakeClosureV;
@@ -5617,11 +5623,13 @@ struct Codegen {
          * the program-lifetime StructTypeDef*) into the const pool -> LoadConst
          * + StoreGlobalV. The tree-walker binds it CONST, but that flag is
          * unobservable at runtime (a reassign `P = x` is a compile-time error,
-         * `isconst` folds), so a plain StoreGlobalV is differential-identical
-         * (the REPL, map-resident structs, falls back). */
+         * `isconst` folds), so a plain StoreGlobalV is differential-identical.
+         * Like a func decl, a SCRIPT struct decl is always global (structs
+         * never capture; pWrapDeclBody closed the brace-less-body route). */
         const StructDeclStmt *sd = dynamic_cast<const StructDeclStmt *>(s);
         if (sd) {
-            if (sd->id && sd->id->sym.kind == SymKind::global) {
+            if (sd->id) {
+                ML_CHECK(sd->id->sym.kind == SymKind::global);
                 const int t = alloc_temp();
                 Instr ld;
                 ld.op = OpCode::LoadConstV;

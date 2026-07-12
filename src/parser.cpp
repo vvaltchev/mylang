@@ -2095,6 +2095,35 @@ pAcceptBracedBlock(ParseContext &c,
     return false;
 }
 
+/*
+ * A func/struct decl as a BRACE-LESS `if`/loop body must behave exactly like
+ * its braced form (block-scoped, hoisted by the resolver's Block pre-scan):
+ * without a Block wrapper the decl bypasses `hoist_scoped_decls` (which only
+ * scans Block statement lists), falls to `declare_masking`, and the decl's
+ * do_eval map-emplace ABORTS a script (the asserted-empty runtime map) -
+ * `if (c) func g() => 1;` crashed. Wrap it in a synthetic single-statement
+ * Block. ONLY these two decl kinds are wrapped: a brace-less VAR/CONST body
+ * (`if (c) var x = 5;`) deliberately keeps its historical enclosing-scope
+ * binding (`x` stays visible after the `if` - verified, pre-existing), and
+ * every other statement is scope-neutral anyway. The `if` applies this only
+ * to the RUNTIME statement (after const-folding): a const-true
+ * `if (true) func g() => 1;` keeps folding to the bare decl in the enclosing
+ * scope, preserving the working feature-flag pattern.
+ */
+static unique_ptr<Construct> pWrapDeclBody(unique_ptr<Construct> stmt)
+{
+    if (!stmt)
+        return stmt;
+    if (!dynamic_cast<FuncDeclStmt *>(stmt.get())
+        && !dynamic_cast<StructDeclStmt *>(stmt.get()))
+        return stmt;
+    auto blk = make_unique<Block>();
+    blk->start = stmt->start;
+    blk->end = stmt->end;
+    blk->elems.push_back(move(stmt));
+    return blk;
+}
+
 bool
 pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 {
@@ -2149,7 +2178,11 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         }
 
         if (t)
-            ret = move(ifstmt->thenBlock);
+            ret = move(ifstmt->thenBlock);   /* NOT wrapped: keeps the
+                                              * `if (true) func g()...`
+                                              * feature-flag decl leaking to
+                                              * the enclosing scope, as it
+                                              * always did */
         else
             ret = move(ifstmt->elseBlock);
 
@@ -2162,6 +2195,10 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             ret = make_unique<NopConstruct>();
 
     } else {
+        /* A RUNTIME if: a brace-less func/struct decl branch gets its Block
+         * wrapper (the crash fix - see pWrapDeclBody). */
+        ifstmt->thenBlock = pWrapDeclBody(move(ifstmt->thenBlock));
+        ifstmt->elseBlock = pWrapDeclBody(move(ifstmt->elseBlock));
         ret = move(ifstmt);
     }
 
@@ -2187,7 +2224,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     pExpectOp(c, Op::parenR);
 
     if (!pAcceptBracedBlock(c, whileStmt->body, fl | pFlags::pInLoop))
-        whileStmt->body = pStmt(c, fl | pFlags::pInLoop);
+        whileStmt->body = pWrapDeclBody(pStmt(c, fl | pFlags::pInLoop));
 
     whileStmt->start = start;
     whileStmt->end = c.get_loc();
@@ -2975,7 +3012,7 @@ pAcceptForeachStmt(ParseContext &c,
     stmt->end = c.get_loc();
 
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
-        stmt->body = pStmt(c, fl | pFlags::pInLoop);
+        stmt->body = pWrapDeclBody(pStmt(c, fl | pFlags::pInLoop));
 
     if (c.const_eval && stmt->container->is_const) {
 
@@ -3033,7 +3070,7 @@ pAcceptForStmt(ParseContext &c,
     pExpectOp(c, Op::parenR);
 
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
-        stmt->body = pStmt(c, fl);
+        stmt->body = pWrapDeclBody(pStmt(c, fl));
 
     stmt->end = c.get_loc();
     ret = move(stmt);

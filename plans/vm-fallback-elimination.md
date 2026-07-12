@@ -863,26 +863,36 @@ LAZY-ARG builtin cannot be called INDIRECTLY (a language rule).**
   CallBuiltinLV kind/slot encoding) - settle when implementing. Then the
   op drops its node → Tier 2 is ONLY the fallback ops.
 
-**F2. The brace-less-body func/struct decl CRASH — DECIDED: the PARSER
-normalizes a brace-less `if`/`while`/`for`/`foreach` body to an implicit
-single-statement `Block`.**
-- The bug (found 2026-07-14, reproduced): `if (c) func g() => 1;` and
-  `while (i < 1) func g() => 1;` ABORT the tree-walker —
+**F2. The brace-less-body func/struct decl CRASH — ✅ DONE (2026-07-14,
+`pWrapDeclBody` in parser.cpp).**
+- The bug (reproduced): `if (c) func g() => 1;` and
+  `while (i < 1) func g() => 1;` ABORTED the tree-walker —
   `hoist_scoped_decls` only pre-scans Block statement lists, so the decl
-  is `declare_masking`'d and `FuncDeclStmt::do_eval`'s `ctx->emplace`
-  trips the asserted-empty script map (`in_const_eval() || repl_mode`,
+  was `declare_masking`'d and `FuncDeclStmt::do_eval`'s `ctx->emplace`
+  tripped the asserted-empty script map (`in_const_eval() || repl_mode`,
   eval.cpp:147). Braced bodies hoist to scoped globals and work. (A named
   func can NEVER capture — the grammar rejects `func f[x]` — so this
-  crash is the ONLY script route to a masked named func.)
-- The fix: wrap the single-statement body in a synthetic `Block` at parse
-  (the `if`/`while`/`for`/`foreach` body-parsing sites in `pStmt`, loc =
-  the statement's own). Semantics-neutral otherwise: a single non-decl
-  statement's block resolves `scope_free` → runs in place; a decl body
-  becomes block-scoped, which is what the braced form already does. `-s`
-  dumps gain a Block node (cosmetic). Then `gen_stmt`'s
-  non-global-FuncDeclStmt fallback is provably DEAD in scripts (the REPL
-  never runs codegen) → delete the path (or make it an InternalErrorEx
-  tripwire).
+  crash was the ONLY script route to a masked named func.)
+- **The implemented fix is NARROWER than first proposed**, because
+  implementation-time probing disproved the "semantics-neutral" premise
+  of a blanket wrap: a brace-less body DECL **leaks into the enclosing
+  scope by long-standing behavior** (`if (c) var x = 5; print(x)` → 5;
+  `if (c) const K = 7;` keeps K; a `while`-body `var` too). So
+  `pWrapDeclBody` wraps a brace-less body in a synthetic single-statement
+  Block ONLY when it is a FuncDeclStmt/StructDeclStmt (the crashing
+  shapes, which nothing could have depended on); var/const bodies keep
+  the leak (pinned by tests). Two more preserved subtleties: the `if`
+  wraps only the RUNTIME statement — a const-true
+  `if (true) func g() => 1;` still folds to the bare decl (the
+  feature-flag pattern keeps g visible); and a PURE expr-bodied func is
+  const-folded at its call sites REGARDLESS of scope (a pre-existing
+  fold-vs-scope quirk, both engines identical — block-scoping tests must
+  use an IMPURE func).
+- With the masked route gone, a SCRIPT named func/struct decl ALWAYS has
+  a global slot: `gen_stmt` now `ML_CHECK`s that invariant (the EvalStmt
+  fallback for it is deleted). Tests: the crash shapes (if/for/while +
+  struct), braced-equivalence (impure g → UndefinedVariableEx after the
+  block in BOTH forms), and the leak pins. Samples unaffected (swept).
 
 **F3. Tier 3/4 — the `.myv` load-bearing architecture — DECIDED: design
 first, in its own plan file, before any code.**

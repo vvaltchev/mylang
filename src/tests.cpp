@@ -2551,6 +2551,43 @@ static const std::vector<test> tests =
       { "var n = 0;",
         "func f() { struct Q { int y; } n = n + 1; return Q(n).y; }",
         "assert(f() == 1); assert(f() == 2);" } },
+    /* A func/struct decl as a BRACE-LESS if/loop body used to ABORT (the
+     * decl bypassed hoist_scoped_decls' Block pre-scan, fell to
+     * declare_masking, and the do_eval map-emplace tripped the
+     * asserted-empty script map). The parser now wraps it in a synthetic
+     * single-statement Block (pWrapDeclBody), so it is block-scoped exactly
+     * like the braced form. */
+    { "brace-less if/loop body func/struct decl runs (was a crash)",
+      { "var dyn c = runtime(1);",
+        "if (c) func g() => 1;",
+        "if (c) struct S { int x; }",
+        "var i = 0;",
+        "for (; i < 2; i++) func h() => 1;",
+        "var j = 0;",
+        "while (j > 0) func w() => 1;",
+        "assert(i == 2); assert(j == 0);" } },
+    /* An IMPURE g (a pure expr-bodied one is const-folded at the call site
+     * regardless of scope - a pre-existing fold quirk, same in both forms &
+     * engines). */
+    { "brace-less body func decl is block-scoped like the braced form",
+      { "var dyn c = runtime(1);",
+        "if (c) func g() { print(\"side\"); }",
+        "g();" }, &typeid(UndefinedVariableEx) },
+    /* ONLY func/struct decl bodies are wrapped: a brace-less VAR/CONST body
+     * keeps its historical enclosing-scope binding, and a CONST-TRUE if
+     * still folds to the bare decl (the feature-flag pattern `if (DEBUG)
+     * func g()...` keeps leaking g to the enclosing scope). */
+    { "brace-less var/const bodies keep the enclosing-scope binding",
+      { "var dyn c = runtime(1);",
+        "if (c) var x = 5;",
+        "assert(x == 5);",
+        "if (c) const K = 7;",
+        "assert(K == 7);",
+        "var i = 0;",
+        "while (i < 1) var y = i++;",
+        "assert(y == 0);",
+        "if (1) func g() => 41;",     /* const-true: folds to the bare decl */
+        "assert(g() == 41);" } },
 
     /* Devirtualized direct calls (DirectCallExpr): a global-slot callee is
      * called straight from the slot. Exercises the FuncObject fast path (global
