@@ -3676,14 +3676,33 @@ surfaced a **pre-existing tree-walker bug**: auto-const promoting a write-once
 INDEX var (`var i=1; a[i]++`) dropped its decl but `fold_reads` had no
 `IncDecExpr` case, dangling the promoted `i` — fixed by folding the READS in an
 inc-dec lvalue like an assignment lvalue. **Net: all of `bench/` and `samples/`
-lower with an EMPTY `ast_nodes` pool (100% native, serializable).** The residual
-`EvalStmt` uses are then only: **error-path** constructs the VM can't pre-detect
-(a bare lvalue-builtin on a literal, an undefined-name call, a not-callable, a
-rebind of a builtin/literal — they throw, via the tree-walker for now), a few
-**niche** shapes (a member/dyn inc-dec statement, a ≥3-level nested store, a
-whole-`p` struct-array `foreach`), the residual **`InlinedCallExpr`** block
-form, and the dev-only **`show`** (script-excluded by `reject_dev_builtins`, so
-never in serialized script bytecode).
+lower with an EMPTY `ast_nodes` pool (100% native, serializable).**
+
+**Error-path constructs → native throwing ops (`ThrowRuntimeV`).** The
+always-throwing constructs the tree-walker ran and threw on are now native: an
+UNRESOLVED name in an rvalue/callee position (`var y = foobar` /
+`undefined_fn()` / `undef(5)` / a `_` read), an assignment to a scalar LITERAL
+(`0 = 99`, `true = false`, a const-inlined `K = 6`) or a BUILTIN (`print = 5`),
+and a REQUIRES-lvalue builtin (`append`/`push`/`pop`/`insert`/`erase`/`intptr`)
+on a provably-non-lvalue arg0 (`append([1,2], 3)` — the only lvalues are
+id/subscript/member). New op **`ThrowRuntimeV`** + a serializable
+`Chunk::throws` pool (`{ThrowKind, Loc, name}`) throws the pooled exception with
+the exact caret
+— byte-identical, AST-free. Codegen: an `SymKind::unresolved` id in
+`compile_boxed_expr` (a CALL with an unresolved callee throws before its args,
+matching `what->eval` first); a bad-lvalue in `compile_boxed_stmt` (rhs compiled
+FIRST for its side effects, then the throw, matching the tree-walker's rhs-then-
+target order); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
+`builtin_requires_lvalue_arg0`, which EXCLUDES `sort`/`rev_sort`/`reverse` —
+they accept a value arg0 and sort the copy). The bare-LEAF guard keeps a
+discarded `foobar;` a no-op. **Residual `EvalStmt`:** a **dyn-callee
+not-callable** (`var dyn a = 5; a(1)` — needs a GENERIC value-call op, since a
+dyn callee may hold a `FuncObject`, a `Builtin`, or a struct descriptor, not
+just a func — `CallValueV` handles only `FuncObject`; deferred); a few **niche**
+real shapes (a
+member/dyn inc-dec statement, a ≥3-level nested store, a whole-`p` struct-array
+`foreach`); the **`InlinedCallExpr`** block form; and the dev-only **`show`**
+(script-excluded by `reject_dev_builtins`, so never in serialized bytecode).
 
 **The AST-NODE POOL — `Chunk::ast_nodes` (the `Instr::node` field is GONE).**
 The last raw `Construct*` in `Instr` is replaced by a 4-byte **`node_idx`** index

@@ -444,6 +444,37 @@ real-code gap: `array<bool>` foreach (a `LoadElemBool`)]**. Each step `-rt`
   contexts, IdList compound `+=`), 5 `InlinedCallExpr` block forms, `assert(..)`
   with an unliftable arg, and the dev-only `show` (script-excluded). Op DELETION
   still deferred (the error paths need native throwing ops first).
+
+  **(e) error-path constructs → native throwing ops (2026-07-13).** The always-
+  throwing constructs are now native via a new **`ThrowRuntimeV`** op + a
+  serializable `Chunk::throws` pool (`{ThrowKind, Loc, name}`): it throws the
+  pooled exception with the exact caret, byte-identical, AST-free. Nativized:
+  - **undefined name** in an rvalue/callee position (`var y=foobar`,
+    `undefined_fn()`, `undef(5)`, a `_` read) → `undefined_var` with the
+    id/callee caret. A CALL with an unresolved callee throws BEFORE its args
+    (matching `what->eval` first); a bare `foobar;` stays a no-op (the leaf
+    guard).
+  - **assign to a non-lvalue** — a scalar LITERAL (`0=99`, `true=false`, a
+    const-inlined `K=6`) → `not_lvalue`, a BUILTIN (`print=5`) →
+    `rebind_builtin`. The rhs compiles FIRST (side effects + its own throw),
+    then the throw — matching the tree-walker's rhs-then-target order.
+  - **lvalue-builtin on a non-lvalue arg0** (`append([1,2],3)`, insert/erase/
+    pop/intptr) → `not_lvalue` at arg0's caret, after compiling the args.
+    `builtin_requires_lvalue_arg0` EXCLUDES sort/rev_sort/reverse (they accept a
+    value arg0 — a differential regression on `sort(clone(a))` caught this).
+  3 loc-pinned err-loc tests (both engines). -rt EvalStmt 111→85.
+  **DEFERRED — dyn-callee not-callable** (`var dyn a=5; a(1)`): ATTEMPTED via a
+  `CheckCallableV` guard + extending `try_native_value_call` to a dyn callee,
+  but REVERTED — a dyn callee may hold a `FuncObject`, a `Builtin`
+  (`var dyn a=len; a("hello")`), or a struct descriptor, and
+  `CallValueV`/`CheckCallableV` only
+  handle `FuncObject` (the differential caught `a("hello")` returning a throw
+  instead of 5). Nativizing it needs a GENERIC value-call op (builtin `func_v`
+  dispatch + struct construction + FuncObject), a separate feature — NOT an
+  error-path throw. The rest of the -rt error-ish inventory (`nonexistent=5`,
+  `map(lambda,a)`, `P(1)` arity, `Point("s",2)`) reproduces NATIVE / compile-
+  error standalone — they fall back only in a specific test's context, not as
+  constructs.
 - **Removing `Instr::node_idx` itself** (the user's core "it's cheating" ask):
   the field is the splice-STABLE handle codegen needs to associate an op with its
   node before the op's final pc is known (ops build in local buffers, then
