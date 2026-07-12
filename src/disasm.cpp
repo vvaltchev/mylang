@@ -254,6 +254,17 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   #" << i << "  " << ch.boxed_ctors[i].def->name->val
               << "  (" << ch.boxed_ctors[i].arg_locs.size() << " args)\n";
     }
+    if (!ch.throws.empty()) {
+        s << "; -- throws (" << ch.throws.size() << ") --\n";
+        for (size_t i = 0; i < ch.throws.size(); i++) {
+            const auto &t = ch.throws[i];
+            s << ";   #" << i << "  "
+              << (t.kind == Chunk::ThrowKind::undefined_var ? "undefined_var"
+                  : t.kind == Chunk::ThrowKind::not_lvalue ? "not_lvalue"
+                  : "rebind_builtin")
+              << (t.name ? " " + std::string(t.name->val) : "") << "\n";
+        }
+    }
     if (!ch.builtin_calls.empty()) {
         s << "; -- builtin_calls (" << ch.builtin_calls.size() << ") --\n";
         for (size_t i = 0; i < ch.builtin_calls.size(); i++) {
@@ -672,6 +683,17 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << std::string(bc.def->name->val) << "("
                 << arglist(chunk, in.a.lit,
                            static_cast<int_type>(bc.arg_locs.size())) << ")";
+            break;
+        }
+        case OpCode::ThrowRuntimeV: {
+            const Chunk::ThrowSite &t = chunk.throws[in.target];
+            const char *k =
+                t.kind == Chunk::ThrowKind::undefined_var ? "undefined_var"
+                : t.kind == Chunk::ThrowKind::not_lvalue ? "not_lvalue"
+                : "rebind_builtin";
+            row << "throw.rt      " << k;
+            if (t.name)
+                row << " '" << std::string(t.name->val) << "'";
             break;
         }
         case OpCode::MakeStructArrayV: {

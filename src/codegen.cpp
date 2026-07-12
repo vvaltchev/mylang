@@ -292,6 +292,17 @@ bool as_int_operand(const Construct *e, Operand &out)
  * scalar (local/global/capture; the slot itself), or a flat int/float subscript
  * whose index is an `as_int_operand` leaf (a local slot or int literal, so the
  * two evals agree). A dict/member/complex-index inc-dec-as-value falls back. */
+/* A mutating builtin that REQUIRES its arg0 to be an lvalue and throws
+ * NotLValueEx on a value — append/push/pop/insert/erase/intptr. EXCLUDES
+ * sort/rev_sort/reverse (also lvalue-arg builtins, but they ACCEPT a value arg0
+ * — a const's copy — so a non-lvalue arg0 there is not an error). Used to decide
+ * whether a provably-non-lvalue arg0 is an always-throw (ThrowRuntimeV). */
+bool builtin_requires_lvalue_arg0(std::string_view name)
+{
+    return name == "append" || name == "push" || name == "pop"
+        || name == "insert" || name == "erase" || name == "intptr";
+}
+
 bool incdec_lvalue_pure(const Construct *lv)
 {
     if (const Identifier *id = dynamic_cast<const Identifier *>(lv))
@@ -566,6 +577,18 @@ struct Codegen {
         return t;
     }
 
+    /* Emit a ThrowRuntimeV for an always-throwing construct: pool the exception
+     * kind + caret (+ name) and append the op. AST-free. See Chunk::ThrowSite. */
+    void emit_throw(Chunk::ThrowKind kind, Loc s, Loc e,
+                    const UniqueId *name, std::vector<Instr> &ops)
+    {
+        Instr in;
+        in.op = OpCode::ThrowRuntimeV;
+        in.target = static_cast<int>(chunk.throws.size());
+        chunk.throws.push_back({ kind, s, e, name });
+        ops.push_back(in);
+    }
+
     void reset_temps() { next_temp = temp_base; }
 
     /* A distinct persistent dict-iterator state slot per native dict foreach.
@@ -837,10 +860,37 @@ struct Codegen {
             return true;
         }
 
+        /* A CALL whose callee is an UNRESOLVED name (`undef(5)`) throws
+         * UndefinedVariableEx when the callee evaluates — BEFORE the args (the
+         * tree-walker's `what->eval` first). Native ThrowRuntimeV with the
+         * callee's caret; the args are never compiled (never evaluated). */
+        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+            const Identifier *callee =
+                dynamic_cast<const Identifier *>(ce->what.get());
+            if (callee && callee->sym.kind == SymKind::unresolved) {
+                emit_throw(Chunk::ThrowKind::undefined_var,
+                           callee->start, callee->end, callee->uid, ops);
+                out_slot = alloc_temp();   /* dead: the op always throws */
+                return true;
+            }
+        }
+
         if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
             if (id->sym.kind == SymKind::local) {
                 out_slot = id->sym.slot;
                 return true;   /* the slot IS the operand - no op */
+            }
+            /* An UNRESOLVED name in an rvalue position always throws
+             * UndefinedVariableEx (the tree-walker's RValue of the UndefinedId
+             * sentinel) -> a native ThrowRuntimeV with the id's own caret. (A
+             * bare `foobar;` discarded statement is skipped by the discarded-
+             * expr path's leaf guard, so this only fires in a genuine rvalue
+             * position - an assignment rhs, an operand, an arg, a callee.) */
+            if (id->sym.kind == SymKind::unresolved) {
+                emit_throw(Chunk::ThrowKind::undefined_var,
+                           id->start, id->end, id->uid, ops);
+                out_slot = alloc_temp();   /* dead: the op always throws */
+                return true;
             }
             /* A global / capture / builtin leaf -> load into a temp. */
             OpCode op;
@@ -1596,6 +1646,40 @@ struct Codegen {
                 return false;
             }
         }
+
+        /* An assignment whose TARGET is not an lvalue always throws (the tree-
+         * walker evaluates the rhs first, then handle_single_expr14 rejects the
+         * target): a scalar LITERAL target (`0 = 99`, `true = false`, or a
+         * const-inlined `K = 6`) -> NotLValueEx(lvalue loc); a BUILTIN-name
+         * target (`print = 5`) -> CannotRebindBuiltinEx(lvalue loc). Compile the
+         * rhs for its side effects (+ its own throw), THEN throw. Plain assign
+         * only; a compound / unliftable-rhs falls back to EvalStmt. */
+        if (is_assign) {
+            Chunk::ThrowKind tk = Chunk::ThrowKind::not_lvalue;
+            bool bad = dynamic_cast<const Literal *>(e->lvalue.get()) != nullptr;
+            if (const Identifier *bl =
+                    dynamic_cast<const Identifier *>(e->lvalue.get()))
+                if (bl->sym.kind == SymKind::builtin) {
+                    tk = Chunk::ThrowKind::rebind_builtin;
+                    bad = true;
+                }
+            if (bad) {
+                const size_t om = ops.size();
+                const size_t cm = chunk.consts.size();
+                const int st = next_temp;
+                int rslot;
+                if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                    emit_throw(tk, e->lvalue->start, e->lvalue->end,
+                               nullptr, ops);
+                    return true;
+                }
+                ops.resize(om);
+                chunk.consts.resize(cm);
+                next_temp = st;
+                return false;
+            }
+        }
+
         const Identifier *lv =
             dynamic_cast<const Identifier *>(e->lvalue.get());
         if (!lv || (lv->sym.kind != SymKind::local
@@ -2113,8 +2197,43 @@ struct Codegen {
             }
         }
 
-        if (!a0->is_id())
+        if (!a0->is_id()) {
+            /* arg0 is not a slotted id. A SUBSCRIPT target was handled above; a
+             * MEMBER target (`append(s.f, x)`) is a valid lvalue not yet native
+             * -> fall back. Anything ELSE (a literal, a call/arith result — the
+             * only lvalues in MyLang are id / subscript / member) is PROVABLY
+             * not an lvalue, so a REQUIRES-lvalue builtin always throws
+             * NotLValueEx(arg0 loc) after evaluating its args -> a native
+             * ThrowRuntimeV. (sort/rev_sort/reverse ACCEPT a value arg0, so they
+             * are excluded — they fall back and sort the value copy.) */
+            const Identifier *cid =
+                dynamic_cast<const Identifier *>(dc->what.get());
+            if (cid && builtin_requires_lvalue_arg0(cid->get_str())
+                && !dynamic_cast<const Subscript *>(a0)
+                && !dynamic_cast<const MemberExpr *>(a0)) {
+                const size_t om = ops.size();
+                const size_t cm = chunk.consts.size();
+                const int st = next_temp;
+                bool ok = true;
+                for (const auto &a : dc->args->elems) {   /* side effects */
+                    int tmp;
+                    if (!compile_boxed_expr(a.get(), tmp, ops)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    emit_throw(Chunk::ThrowKind::not_lvalue,
+                               a0->start, a0->end, nullptr, ops);
+                    out_slot = alloc_temp();   /* dead: always throws */
+                    return true;
+                }
+                ops.resize(om);
+                chunk.consts.resize(cm);
+                next_temp = st;
+            }
             return false;
+        }
 
         int kind;
         switch (static_cast<const Identifier *>(a0)->sym.kind) {

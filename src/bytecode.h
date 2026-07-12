@@ -708,6 +708,18 @@ enum class OpCode : unsigned char {
     StructCtorBoxedV,
 
     /*
+     * Unconditionally THROW a runtime error whose kind/loc/name are pooled in
+     * Chunk::throws[target] (a serializable `{ThrowKind, Loc, name}`). This is
+     * the native form of an always-throwing construct the tree-walker runs and
+     * throws on — an undefined name in an rvalue/callee position, an assignment
+     * to a non-lvalue (a literal) or a builtin, an lvalue-builtin on a literal
+     * arg0. The codegen emits it (after compiling any side-effecting rvalue) in
+     * place of an EvalStmt fallback, so the same exception fires at the same
+     * point with the byte-identical caret — AST-free.
+     */
+    ThrowRuntimeV,
+
+    /*
      * Build a FLAT array<PodStruct> LITERAL `[P(a,b), P(c,d), ..]` into `target`
      * in ONE op - the FUSED form of N StructCtorV + MakeArrayV (F-4). The N
      * structs' field args are compiled INTERLEAVED into the register run
@@ -970,6 +982,22 @@ struct Chunk {
         std::vector<ArgLoc> arg_locs;   /* provided args [0, nargs) */
     };
     std::vector<BoxedCtor> boxed_ctors;
+
+    /* Always-throw sites for ThrowRuntimeV (`Instr::target` indexes this): the
+     * runtime exception an always-throwing construct raises, as pure data — the
+     * kind, the caret, and (for an undefined name) the interned name. Fully
+     * serializable (the `name` re-interns from its string). */
+    enum class ThrowKind : unsigned char {
+        undefined_var,      /* UndefinedVariableEx(name, loc) */
+        not_lvalue,         /* NotLValueEx(loc) */
+        rebind_builtin,     /* CannotRebindBuiltinEx(loc) */
+    };
+    struct ThrowSite {
+        ThrowKind kind;
+        Loc start, end;
+        const UniqueId *name = nullptr;   /* undefined_var only */
+    };
+    std::vector<ThrowSite> throws;
 
     /* Target frame slots for each MultiUnpackV (`a, b, c = <rvalue>`), in
      * order, with -1 for a `_` placeholder. `Instr::target` indexes this. Pure

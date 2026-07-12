@@ -5196,6 +5196,24 @@ static const std::vector<test> tests =
         { "var a = 3; append(a, 10);" },
         &typeid(TypeErrorEx), 19, 0, 21, 0,
     },
+    /* Always-throwing error constructs the VM lowers to a native ThrowRuntimeV
+     * (not an EvalStmt fallback): the caret must stay byte-identical to the
+     * tree-walker's runtime throw. The differential runs each under -vm too. */
+    {
+        "err loc: assigning to a literal is a not-an-lvalue error",
+        { "0 = 99;" },
+        &typeid(NotLValueEx), 1, 0, 3, 0,
+    },
+    {
+        "err loc: rebinding a builtin marks the builtin name",
+        { "print = 5;" },
+        &typeid(CannotRebindBuiltinEx), 1, 0, 7, 0,
+    },
+    {
+        "err loc: an lvalue-builtin on a literal marks arg0",
+        { "append([1, 2], 3);" },
+        &typeid(NotLValueEx), 8, 0, 15, 0,
+    },
     {
         "err loc: uncaught user exception points at the throw",
         { "struct Boom { int x; } throw Boom(42);" },

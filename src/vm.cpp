@@ -1603,6 +1603,22 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             break;
         }
 
+        case OpCode::ThrowRuntimeV: {
+            /* An always-throwing construct (undefined name, assign to a
+             * non-lvalue / a builtin) — throw the pooled exception with its
+             * exact caret, byte-identical to the tree-walker. */
+            const Chunk::ThrowSite &t = chunk.throws[in.target];
+            switch (t.kind) {
+                case Chunk::ThrowKind::undefined_var:
+                    throw UndefinedVariableEx(t.name->val, t.start, t.end);
+                case Chunk::ThrowKind::not_lvalue:
+                    throw NotLValueEx(t.start, t.end);
+                case Chunk::ThrowKind::rebind_builtin:
+                    throw CannotRebindBuiltinEx(t.start, t.end);
+            }
+            break;   /* unreachable */
+        }
+
         case OpCode::StructCtorBoxedV: {
             /* Boxed (non-POD) struct construction B(a,x) via
              * vm_struct_ctor_boxed. A field coerce CAN throw (a dyn-laundered
