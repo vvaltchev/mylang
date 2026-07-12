@@ -2959,6 +2959,55 @@ the proof. Before calling it done:
 
 ## Execution strategy: strip compile-time overhead first, THEN a bytecode VM
 
+> ## ⛔ THE ABSOLUTE, NON-NEGOTIABLE RULE — ZERO AST AT RUNTIME ⛔
+>
+> **AFTER COMPILATION IS DONE, A SCRIPT RUNS WITH *ZERO* AST NODES. NONE.**
+>
+> This is the WHOLE POINT of the bytecode VM. Read it ten times:
+>
+> 1. **After codegen, there is NO `Construct*` reachable from the runtime
+>    image.** Not in `Instr`, not in a pool, not in a side table, not behind an
+>    index, not behind a `node_idx`, not in a `node_table`, not ANYWHERE.
+> 2. **Every `Construct*` object is FREED after compilation.** The whole AST is
+>    droppable. If a chunk pins even one `Construct*`, the goal is NOT met.
+> 3. **A native op must NEVER call `node->eval(...)` at runtime.** The
+>    tree-walker fallback ops (`EvalStmt` / `EvalToSlot` / `JumpIfFalse`) that
+>    re-enter the AST are **BANNED in a compiled script** — every construct MUST
+>    be lowered to real bytecode. "It falls back to the tree-walker for that
+>    construct" is a FAILURE, not an acceptable state.
+> 4. **All information an op needs at runtime is extracted into POOLED,
+>    SERIALIZABLE, AST-FREE data DURING compilation** — source `Loc`s in the loc
+>    side table, member keys / catch types / literals / struct defs / arg carets
+>    in their pools, etc. Pooled data is plain values (ints, strings, `Loc`s,
+>    interned `UniqueId*`), NEVER a `Construct*`.
+> 5. **A "loc-keyed" or "pc-keyed" table of `Construct*` is STILL A VIOLATION.**
+>    Relocating the pointers from an indexed pool into a `{pc, Construct*}` side
+>    table does NOT count as dropping the AST. The pointers themselves must be
+>    GONE. Do not "work around" a fallback by keeping the node under a different
+>    name.
+> 6. **During compilation you MAY hold `Construct*`** — e.g. an
+>    `unordered_map<const Instr*, const Construct*>` (or the current `node_idx`
+>    handle) to associate an op with its node before its final pc is known. That
+>    is fine, and often simpler than indices. **But it is a COMPILE-TIME-ONLY
+>    scratch structure; it is destroyed when codegen finishes.** The finished
+>    chunk carries none of it.
+> 7. **The ONLY exceptions are the REPL and the `-rt` test harness** (they
+>    retain the AST for their own reasons — decompilation, differential
+>    testing). A plain script run (`mylang file.my`, `-vm`, and the eventual
+>    `.myv`) has ZERO AST at runtime.
+> 8. **The endgame is a serializable `.myv` file** (`mylang -c file.my` →
+>    binary, run with no AST). That is IMPOSSIBLE while any `Construct*` survives
+>    codegen. So this rule is not aspirational polish — it is the load-bearing
+>    invariant the whole VM exists to satisfy.
+> 9. **When you find a construct that isn't natively lowered, NATIVIZE IT.** Do
+>    not add a node-holding op. Do not relocate the node. Extract its loc/data
+>    to a pool and emit real bytecode. If a construct is genuinely too rare/hard
+>    to nativize now, that is a TRACKED GAP to a `.myv` writer — never a
+>    permanent node-holder.
+> 10. **Say it once more: after compilation, NO AST NODES, NO `Construct*`, NO
+>     pointers, NO indexes, NO tables — the AST is FREED and the script runs on
+>     bytecode + pooled data alone.**
+
 MyLang's performance philosophy is a two-front strategy, in this deliberate
 order — the same order a real C/C++ compiler works in:
 
