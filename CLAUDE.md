@@ -4095,10 +4095,20 @@ runs `vm_incdec_final` (eval.cpp) — IncDecExpr::do_eval's EXACT tier
 semantics: tier 2 (proven int/float) = the compound `±= 1`
 (flat_store_core / member-store / general-lvalue slot_rmw) then
 old = new ∓ 1 derived with NO re-read; tier 3 (dyn) = the checked
-read-modify-write. **Residual `EvalStmt` users:** the dev-only
-**`show`** (script-excluded by `reject_dev_builtins`, so never in
-serialized bytecode; reachable only under the `-rt` harness) and any
+read-modify-write. A follow-up closed the LAST real-code emitter: a
+**nested named func/struct decl inside a loop/if body** (a scoped
+global) now lowers via the shared `emit_func_decl`/`emit_struct_decl`
+(MakeClosureV/LoadConstV + StoreGlobalV — re-bound each iteration,
+exactly as the tree-walker re-evals the decl; gen_stmt already covered
+top-level/function-body decls, the loop/if body compiler did not).
+**Residual `EvalStmt` users:** the dev-only **`show`**
+(script-excluded by `reject_dev_builtins`, so never in serialized
+bytecode; reachable only under the `-rt` harness) and any
 genuinely-uncompilable future shape (whole-statement, byte-identical).
+The seven `EvalStmt` emit sites left in the codegen are all DECLINE
+NETS (whole-statement, on a sub-compile returning false), and the only
+known trigger in script-legal code is `show` — a compiled real program
+audits to an EMPTY `node_table` (the serializability signal).
 Codegen-shape tests pin all five roots (`jinn`/`munpack`/`idchain`
 counters) + the whole-statement fallback behavior.
 The `InlinedCallExpr` return-across-try residue is CLOSED: a `return`

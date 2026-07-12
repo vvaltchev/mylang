@@ -1061,6 +1061,17 @@ body, return/throw values, try bodies, call args — funnels into these):**
   then old = new ∓ 1 with no re-read; tier 3 = the checked RMW. Probed
   byte-identical across flat/dict/dyn/nested/member/rvalue-root shapes
   (incl. the POD-member NotLValue and general-2D NotLValue corners).
+  A follow-up closed the LAST real-code EvalStmt emitter found while
+  CONFIRMING the zero-fallback claim: a nested named func/struct decl
+  inside a LOOP/IF body (a scoped global) failed compile_scalar_body
+  and dropped the whole loop to EvalStmt — now lowered by the shared
+  emit_func_decl/emit_struct_decl (gen_stmt's top-level lowering,
+  factored; a loop-body decl re-binds per iteration, as the
+  tree-walker re-evals it). After it: the seven remaining EvalStmt
+  emit sites are all whole-statement DECLINE NETS whose only known
+  script-legal trigger is dev-only show() (harness-only); pinned by
+  the reshaped codegen tests (nested-decl loop = native; the net
+  witnessed via a show()-bearing condition under the harness).
 
 **Live statement roots:**
 - R5 **Typed/const-target IdList destructure** (`int a; int b;

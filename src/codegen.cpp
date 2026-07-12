@@ -4524,6 +4524,57 @@ struct Codegen {
      * tree-walker's tight counter beats a native loop that only dispatches
      * fallbacks).
      */
+    /* A named `func f(..){..}` decl STATEMENT -> MakeClosureV (create the
+     * FuncObject, snapshotting captures) + StoreGlobalV (write the slot +
+     * mark defined) - byte-identical to FuncDeclStmt::do_eval's global-bind
+     * `slots[slot] = LValue(func, false); defined = 1`. In a SCRIPT a NAMED
+     * func decl ALWAYS has a global slot (top-level hoist or a scoped
+     * global - hoist_scoped_decls covers nested decls, incl. inside loop/if
+     * bodies): the grammar rejects a capture list on a named func, and
+     * pWrapDeclBody closed the brace-less-body masked route - ML_CHECK
+     * guards the invariant. Shared by gen_stmt (top-level / function-body
+     * statements) and compile_scalar_body (loop/if bodies - a decl there
+     * re-binds each iteration, exactly as the tree-walker re-evals it). */
+    void emit_func_decl(const FuncDeclStmt *fd, std::vector<Instr> &ops)
+    {
+        ML_CHECK(fd->id->sym.kind == SymKind::global);
+        const int t = alloc_temp();
+        Instr mk;
+        mk.op = OpCode::MakeClosureV;
+        mk.target = t;
+        mk.target2 = static_cast<int>(chunk.closure_defs.size());
+        chunk.closure_defs.push_back(fd);
+        ops.push_back(mk);
+        Instr st;                     /* aop invalid == plain assign+defined */
+        st.op = OpCode::StoreGlobalV;
+        st.target = fd->id->sym.slot;
+        st.a = slot_op(t);
+        ops.push_back(st);
+    }
+
+    /* A `struct P {..}` decl STATEMENT: bake the type descriptor (a trivial
+     * t_structtype value holding the program-lifetime StructTypeDef*) into
+     * the const pool -> LoadConstV + StoreGlobalV. The tree-walker binds it
+     * CONST, but that flag is unobservable at runtime (a reassign `P = x` is
+     * a compile-time error, `isconst` folds), so a plain StoreGlobalV is
+     * differential-identical. Like a func decl, a SCRIPT struct decl is
+     * always global (structs never capture). Shared like emit_func_decl. */
+    void emit_struct_decl(const StructDeclStmt *sd, std::vector<Instr> &ops)
+    {
+        ML_CHECK(sd->id->sym.kind == SymKind::global);
+        const int t = alloc_temp();
+        Instr ld;
+        ld.op = OpCode::LoadConstV;
+        ld.target = t;
+        ld.target2 = add_const(EvalValue(sd->def.get()));
+        ops.push_back(ld);
+        Instr st;
+        st.op = OpCode::StoreGlobalV;
+        st.target = sd->id->sym.slot;
+        st.a = slot_op(t);
+        ops.push_back(st);
+    }
+
     bool compile_scalar_body(const std::vector<const Construct *> &stmts,
                              bool is_loop_body = true)
     {
@@ -4701,6 +4752,29 @@ struct Codegen {
                 emit_rethrow(rt, chunk.code);
                 any_native = true;
                 continue;
+            }
+
+            /* A nested named func/struct decl (a scoped global - inside a
+             * loop body it re-binds each iteration, as the tree-walker
+             * re-evals the decl; a fresh FuncObject per iteration). This was
+             * the last REAL-code whole-loop fallback (gen_stmt handled the
+             * top-level/function-body decls; the loop/if body compiler did
+             * not). */
+            if (const FuncDeclStmt *fdd =
+                    dynamic_cast<const FuncDeclStmt *>(s)) {
+                if (fdd->id) {
+                    emit_func_decl(fdd, chunk.code);
+                    any_native = true;
+                    continue;
+                }
+            }
+            if (const StructDeclStmt *sdd =
+                    dynamic_cast<const StructDeclStmt *>(s)) {
+                if (sdd->id) {
+                    emit_struct_decl(sdd, chunk.code);
+                    any_native = true;
+                    continue;
+                }
             }
 
             if (dynamic_cast<const Expr14 *>(s)
@@ -5971,19 +6045,7 @@ struct Codegen {
          * ML_CHECK guards the invariant. */
         if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(s)) {
             if (fd->id) {
-                ML_CHECK(fd->id->sym.kind == SymKind::global);
-                const int t = alloc_temp();
-                Instr mk;
-                mk.op = OpCode::MakeClosureV;
-                mk.target = t;
-                mk.target2 = static_cast<int>(chunk.closure_defs.size());
-                chunk.closure_defs.push_back(fd);
-                chunk.code.push_back(mk);
-                Instr st;             /* aop invalid == plain assign+defined */
-                st.op = OpCode::StoreGlobalV;
-                st.target = fd->id->sym.slot;
-                st.a = slot_op(t);
-                chunk.code.push_back(st);
+                emit_func_decl(fd, chunk.code);
                 return;
             }
         }
@@ -5998,18 +6060,7 @@ struct Codegen {
         const StructDeclStmt *sd = dynamic_cast<const StructDeclStmt *>(s);
         if (sd) {
             if (sd->id) {
-                ML_CHECK(sd->id->sym.kind == SymKind::global);
-                const int t = alloc_temp();
-                Instr ld;
-                ld.op = OpCode::LoadConstV;
-                ld.target = t;
-                ld.target2 = add_const(EvalValue(sd->def.get()));
-                chunk.code.push_back(ld);
-                Instr st;
-                st.op = OpCode::StoreGlobalV;
-                st.target = sd->id->sym.slot;
-                st.a = slot_op(t);
-                chunk.code.push_back(st);
+                emit_struct_decl(sd, chunk.code);
                 return;
             }
         }
