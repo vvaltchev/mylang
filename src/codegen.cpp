@@ -4661,6 +4661,28 @@ struct Codegen {
                 return;
             }
         }
+
+        /* A bare EXPRESSION statement whose value is discarded (`s[3];`,
+         * `a[i:j];`, `x + y;`, `flag ? f() : g();`): compile it into a scratch
+         * temp and drop the result - evaluating for value then discarding is the
+         * same as evaluating for effect, so any error (OOB / missing-key / type)
+         * still throws natively with the right caret. SKIP a bare leaf
+         * (Identifier / scalar Literal): it has no side effect, and the
+         * tree-walker never RValue-s a discarded statement - so an undefined
+         * name must stay its harmless no-op (an UndefinedId sentinel), NOT a
+         * LoadGlobalV that would throw. A non-liftable expr (an AST/dev builtin,
+         * an inc-dec, an unresolved name) rolls back to EvalStmt below. */
+        if (!dynamic_cast<const Identifier *>(s)
+            && !dynamic_cast<const Literal *>(s)) {
+            const size_t emark = chunk.code.size();
+            const int st = next_temp;
+            int dst;
+            if (compile_boxed_expr(s, dst, chunk.code))
+                return;
+            chunk.code.resize(emark);
+            next_temp = st;
+        }
+
         emit(OpCode::EvalStmt, s);
     }
 
