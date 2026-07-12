@@ -290,12 +290,16 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
               << l.start.col << "\n";
     }
     if (!ch.inline_ctxs.empty()) {
-        s << "; -- inline_ctxs (" << ch.inline_ctxs.size() << ") --\n";
+        s << "; -- inline_ctxs (" << ch.inline_ctxs.size() << ", "
+          << ch.inline_frames.size() << " frames) --\n";
         for (const auto &ie : ch.inline_ctxs) {
             s << ";   pc" << ie.pc << " -> ";
-            for (const InlineCtx *ic = ie.ic; ic; ic = ic->parent)
-                s << ic->callee_name << "@" << ic->call_site.line
-                  << (ic->parent ? " < " : "");
+            for (int32_t i = ie.frame; i >= 0;
+                 i = ch.inline_frames[i].parent) {
+                const auto &f = ch.inline_frames[i];
+                s << f.callee_name << "@" << f.call_site.line
+                  << (f.parent >= 0 ? " < " : "");
+            }
             s << "\n";
         }
     }

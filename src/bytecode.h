@@ -1005,21 +1005,34 @@ struct Chunk {
     /*
      * INLINED-FRAME side table (P8 Inc 4 - backtrace parity for inlined code).
      * An op physically spliced from an INLINED function body records that
-     * body's `InlineCtx` "inlined-at" chain here, so a backtrace crossing it
-     * reconstructs the virtual inlined frames - the tree-walker gets them from
+     * body's "inlined-at" chain here, so a backtrace crossing it reconstructs
+     * the virtual inlined frames - the tree-walker gets them from
      * `node->inline_ctx` via `Construct::eval`, which native ops have no hook
-     * for. SAME shape/cost as `locs`: `{pc, InlineCtx*}`, sorted by pc, read
-     * ONLY on the throw path (via inline_ctx_at). The `InlineCtx*` is
-     * program-lifetime AST-owned (like closure_defs / struct_defs); a
-     * serializing backend would flatten the chain to interned strings + a
-     * parent-index array (a separate axis from `locs`, which is pure data).
+     * for. SAME shape/cost as `locs`: sorted by pc, read ONLY on the throw path
+     * (via inline_ctx_at).
+     *
+     * SERIALIZABLE (no AST pointer): the `InlineCtx*` chain is FLATTENED into
+     * the `inline_frames` POOL (each entry pure data: name + params + call-site
+     * loc + a PARENT INDEX into the same pool, -1 == root; a parent always has a
+     * lower index), and the side table maps `pc -> a pool index`. `extract_locs`
+     * interns each op's chain (deduping shared chains). This is the analogue of
+     * the `chain_locs` per-step-loc pool - the last non-`locs` side table off
+     * the AST.
      */
-    struct InlineEntry { uint32_t pc; const InlineCtx *ic; };
+    struct InlineFrame {
+        std::string callee_name;
+        std::vector<std::string> params;
+        Loc call_site;
+        int32_t parent = -1;   /* index into inline_frames, -1 == root */
+    };
+    std::vector<InlineFrame> inline_frames;
+
+    struct InlineEntry { uint32_t pc; int32_t frame; };  /* frame = pool index */
     std::vector<InlineEntry> inline_ctxs;
 
-    /* The inlined-at chain of the op at `pc` (exact match; null if none).
-     * Binary search - O(log n), throw path only. */
-    const InlineCtx *inline_ctx_at(size_t pc) const
+    /* The inline_frames index of the op at `pc`'s chain (exact match; -1 if
+     * none). Binary search - O(log n), throw path only. */
+    int32_t inline_frame_at(size_t pc) const
     {
         size_t lo = 0, hi = inline_ctxs.size();
         while (lo < hi) {
@@ -1030,8 +1043,8 @@ struct Chunk {
                 hi = mid;
         }
         if (lo < inline_ctxs.size() && inline_ctxs[lo].pc == pc)
-            return inline_ctxs[lo].ic;
-        return nullptr;
+            return inline_ctxs[lo].frame;
+        return -1;
     }
 
     /*

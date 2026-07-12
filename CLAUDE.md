@@ -3871,25 +3871,36 @@ it labelled *NOT serializable*). This is the ONE remaining non-serializable pool
 unpack-target pools are all plain data or by-name-re-internable). The node-drop
 was ~orthogonal to the VM-exception work (see `plans/vm-fallback-elimination.md`).
 
-**A THIRD side table — `Chunk::inline_ctxs` (`pc → InlineCtx*`, P8 Inc 4).**
-Same shape/cost as `locs` (sorted, binary-searched, throw path only), populated
-by `extract_locs` from an op's `node->inline_ctx`: it records the "inlined-at"
-chain of any op spliced from an inlined body, so a backtrace crossing inlined
-code shows the virtual frames under the VM too (`vm_flush_inline`, flushed at
-`vm_raise` / a call-op signal-propagation / the boundary catch). Unlike `locs`
-(pure data), its `InlineCtx*` is an AST pointer - a serializing backend would
-flatten the chain to interned strings + a parent-index array (see the loc-table
-vs inline-table discussion in `plans/vm-exceptions.md`).
+**A THIRD side table — `Chunk::inline_ctxs` (`pc → inline_frames index`, P8 Inc
+4).** Same shape/cost as `locs` (sorted, binary-searched, throw path only),
+populated by `extract_locs` from an op's `node->inline_ctx`: it records the
+"inlined-at" chain of any op spliced from an inlined body, so a backtrace
+crossing inlined code shows the virtual frames under the VM too
+(`vm_flush_inline`, flushed at `vm_raise` / a call-op signal-propagation / the
+boundary catch). **It is now SERIALIZABLE (no AST pointer):** the `InlineCtx*`
+chain is FLATTENED into the **`Chunk::inline_frames`** pool — each entry pure
+data (`callee_name` + `params` + `call_site` loc + a **parent index** into the
+same pool, `-1` == root; a parent always has a lower index) — and the side table
+maps `pc → a pool index`. `intern_inline_ctx` (codegen) flattens each op's chain
+in `extract_locs`, deduping shared chains via a memo (interning the parent first,
+so the pool is topologically ordered); `vm_flush_inline` walks the pool by parent
+index, pushing the SAME `BacktraceFrame`s a tree-walker `flush_inline_frames`
+over the `InlineCtx` chain would (byte-identical, single AND nested/recursion-
+unroll inlines). This is the analogue of the `chain_locs` per-step-loc pool — the
+last non-`locs` side table off the AST. (The tree-walker still uses the
+`InlineCtx*`-based `flush_inline_frames` directly, from `node->inline_ctx`.)
 
 **The disassembler dumps the WHOLE serializable image, not just funcs
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
 `member_keys`, `catch_types`, `literal_objs`, `closure_defs`, `struct_defs`,
-`unpack_targets`, the `ast_nodes` pool - labelled *NOT serializable* -, `locs`,
-`inline_ctxs` - non-empty ones only). This is the audit surface for the `.myv`
-stored-bytecode endgame: everything a serialized file must hold is visible in the
-dump, and a non-empty `ast_nodes` is the one section that says the AST can't yet
+`unpack_targets`, `chain_locs`, the `ast_nodes` pool - labelled *NOT
+serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
+ones only). This is the audit surface for the `.myv` stored-bytecode endgame:
+everything a serialized file must hold is visible in the dump, and — now that
+`inline_ctxs` is flattened into the serializable `inline_frames` pool — a
+non-empty `ast_nodes` is the ONE remaining section that says the AST can't yet
 be dropped for that chunk.
 
 ## Invariants & hazards (defense in depth)

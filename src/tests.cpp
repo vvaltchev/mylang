@@ -3459,6 +3459,16 @@ static const std::vector<test> tests =
         "func f(a) { g = 99; return 100 / a; }",
         "func c(n) { var y = f(n); return y; }",
         "c(0);" }, &typeid(DivisionByZeroEx) },
+    /* A NESTED inlined error: a tree-recursive `f` unrolls (its self-calls
+     * inline), so an error deep in an inlined self-call reconstructs a chain of
+     * virtual `f$0` frames. Exercises the VM's flattened inline_frames pool
+     * (walked by parent index in vm_flush_inline) - the backtrace is byte-
+     * identical to the tree-walker's (verified out of band; the differential
+     * here checks the exception propagates through the nested pool correctly). */
+    { "block-inline: error in a NESTED inlined frame throws (pool walk)",
+      { "func f(n) { if (n <= 0) return 1 / n; return f(n-1) + f(n-2); }",
+        "func c() { return f(2); }",
+        "c();" }, &typeid(DivisionByZeroEx) },
     /* ---- v3: recursion unroll + per-frame pure-call cache ----
      * A pure tree-recursive function (>=2 self-calls) is unrolled in place and
      * its duplicate self-calls dedup in the per-frame cache. Correctness must be

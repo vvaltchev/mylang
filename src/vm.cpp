@@ -797,10 +797,17 @@ static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
 {
     if (e.inline_origin_emitted)
         return;
-    if (const InlineCtx *ic = chunk.inline_ctx_at(pc)) {
-        flush_inline_frames(ic, e);
-        e.inline_origin_emitted = true;
+    int32_t idx = chunk.inline_frame_at(pc);
+    if (idx < 0)
+        return;
+    /* Walk the flattened inline_frames pool by parent index (innermost callee
+     * first) - same BacktraceFrames as flush_inline_frames over the InlineCtx
+     * chain, but AST-free (serializable pool). */
+    for (int32_t i = idx; i >= 0; i = chunk.inline_frames[i].parent) {
+        const Chunk::InlineFrame &f = chunk.inline_frames[i];
+        e.backtrace.push_back({f.callee_name, f.params, f.call_site});
     }
+    e.inline_origin_emitted = true;
 }
 
 /*

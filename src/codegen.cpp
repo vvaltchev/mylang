@@ -5590,20 +5590,46 @@ struct Codegen {
  * (fallback node->eval, op-data like a member key) keep their node until those
  * uses are migrated too.
  */
+/* FLATTEN an InlineCtx chain into the serializable inline_frames pool, deduping
+ * shared chains via `memo`. Interns the PARENT first, so a frame's parent always
+ * has a lower index (a clean topological order). Returns the pool index (-1 for
+ * a null chain). Off the recursive codegen frame (chains can nest). */
+static ML_NOINLINE int32_t
+intern_inline_ctx(const InlineCtx *ic, Chunk &chunk,
+                  std::unordered_map<const InlineCtx *, int32_t> &memo)
+{
+    if (!ic)
+        return -1;
+    auto it = memo.find(ic);
+    if (it != memo.end())
+        return it->second;
+    const int32_t parent = intern_inline_ctx(ic->parent, chunk, memo);
+    const int32_t idx = static_cast<int32_t>(chunk.inline_frames.size());
+    chunk.inline_frames.push_back(
+        {ic->callee_name, ic->params, ic->call_site, parent});
+    memo[ic] = idx;
+    return idx;
+}
+
 static void extract_locs(Chunk &chunk)
 {
+    /* InlineCtx* -> inline_frames index, shared across ops so a chain reused by
+     * many spliced ops is flattened once. */
+    std::unordered_map<const InlineCtx *, int32_t> inline_memo;
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
         Instr &in = chunk.code[pc];
         const Construct *node = chunk.node_at(in.node_idx);
         if (!node)
             continue;
         /* P8 Inc 4: an op spliced from an INLINED body records that body's
-         * inlined-at chain, so a backtrace crossing it shows the virtual
-         * frames. Recorded BEFORE the switch nulls the node; pc-ascending, so
-         * inline_ctxs stays sorted. (Rare - only inlined ops have one.) */
+         * inlined-at chain (FLATTENED into inline_frames), so a backtrace
+         * crossing it shows the virtual frames. Recorded BEFORE the switch nulls
+         * the node; pc-ascending, so inline_ctxs stays sorted. (Rare - only
+         * inlined ops have one.) */
         if (node->inline_ctx)
             chunk.inline_ctxs.push_back(
-                {static_cast<uint32_t>(pc), node->inline_ctx});
+                {static_cast<uint32_t>(pc),
+                 intern_inline_ctx(node->inline_ctx, chunk, inline_memo)});
         switch (in.op) {
         case OpCode::IntBin:
         case OpCode::FloatBin:
