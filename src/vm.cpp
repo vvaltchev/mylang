@@ -838,7 +838,8 @@ struct VmActivation {
      * error where the old per-call C-stack model segfaulted. */
     /* `ck` sizes the frame's iterator slices (n_dict_iters/n_dyn_iters);
      * it is the chunk the frame RUNS. */
-    Frame *push_window(int_type n, const Chunk *ck, bool boundary)
+    ML_ALWAYS_INLINE Frame *push_window(int_type n, const Chunk *ck,
+                                        bool boundary)
     {
         if (used + n > cap)
             throw StackOverflowEx();
@@ -894,7 +895,7 @@ struct VmActivation {
      * out: the caller reads any resume fields it needs BEFORE calling (they
      * are stable), we clean by reference, then pop_back (a cheap dtor - the
      * rare owning fields are null on the hot path). */
-    void pop_window()
+    ML_ALWAYS_INLINE void pop_window()
     {
         ML_CHECK(!records.empty());
         VmCallRec &rec = records.back();

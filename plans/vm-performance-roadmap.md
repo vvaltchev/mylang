@@ -292,9 +292,19 @@ Run over the finished chunk, before locs extraction:
 
 ## Part 4 — top-10 by expected geomean impact
 
-1. **C1 native in-VM call stack** — ~30% of callback benches is
-   do_func_call; doubles the call-bound dozen (09/10/11/12/34/35/63/64/
-   67/76 + samples). Est. geomean +10-15%. Big project; stage it.
+1. **C1 native in-VM call stack — ✅ DONE (2026-07-16), including C2/D.**
+   Landed as plans/vm-native-call-stack.md phases A-E: in-VM calls,
+   VmInvoker for builtin callbacks, catchable StackOverflowEx, O(1)
+   C-stack. Final interleaved full-suite A/B vs 69fef27: PARITY
+   (VM-wall 0.999-1.008 across rounds) with recursion 0.68x, sort 0.85x,
+   map/make_dict 0.85-0.88x, fib 0.86x. The projected +10-15% geomean did
+   NOT materialize: the old do_func_call cost was largely matched by the
+   new record/window protocol on tiny bodies, and a ~5% regression had to
+   be recovered in four measured steps (the full-suite hard rule dates
+   from that recovery). The wins are structural (exceptions walk records,
+   zero-copy C-stack, the frame model B1/E-class work needs) plus the
+   call-bench improvements above. Zero-copy binding (Phase E) was
+   MEASURED AND DECLINED (bind = ~1.6% of the most call-bound bench).
 2. **A1 computed-goto dispatch (+A2 hot/cold split, A3 ordering)** —
    recovers the measured 10-30% regression on 26 dispatch-bound benches
    and lifts everything else. Est. +8-15% broad.

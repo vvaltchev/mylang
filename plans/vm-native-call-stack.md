@@ -267,8 +267,25 @@ next call immediately overwrites (param slots), which today's model cannot.
   The big phase; gated hard on the differential suite's error tests.
 - **D. Boundary invoker (C2)**: vm_invoke for map/filter/sort/make_dict/
   find callbacks (boundary frames).
-- **E. Zero-copy arg windows**: codegen arranges arg runs at window top;
-  fast_bind + exact-arity calls rebase without copying.
+- **E. Zero-copy arg windows — MEASURED AND DECLINED (2026-07-16).** The
+  premise assumed arg-copy cost mattered; the line-level profile on the
+  MOST call-bound bench (10_recursion_deep, 27M calls) shows the fast_bind
+  copy loop is **~1.6% of the bench (~2 instructions per 1-arg call)**,
+  while the surrounding protocol (record fill, window bookkeeping, slot
+  reset) is ~35%. Zero-copy's ceiling is therefore ~1.5% on one bench and
+  ~0 elsewhere - against real costs: codegen must place arg runs at the
+  window top, and overlapping windows change REFERENCE LIFETIMES of the
+  arg slots (they become callee params), which can flip a COW
+  clone-on-write decision - an intptr()-observable semantic drift. Not
+  worth it; declined with data, like the .rodata-table experiment.
+  What WAS taken from the phase: push_window/pop_window are
+  ML_ALWAYS_INLINE into their (noinline, out-of-loop) callers - the call
+  framing was ~10-15 instr/call of the protocol. Measured ~neutral at
+  suite level (within run wobble; the call benches hold their wins:
+  recursion 0.68x, sort 0.85x, map 0.85x, make_dict 0.88x vs 69fef27),
+  kept as the structurally right shape. Per-call machinery now ~50 instr;
+  cutting deeper means a dedicated leaf-call convention - future work,
+  not this plan.
 - **F. Measure + docs**: full A/B (call benches at scale 10 best-of-7,
   suite geomean, cachegrind), CLAUDE.md (call model, stack semantics,
   README recursion-limit note), roadmap C1/C2/G1 status.
