@@ -1610,6 +1610,11 @@ real call, but stops being tree-walked wholesale).
 
 ## Part C — VM optimizations (native but sub-optimal)
 
+> **SUPERSEDED (2026-07-15) by `plans/vm-performance-roadmap.md`** — the
+> full post-zero-AST performance deep-dive (regression decomposition,
+> profiles, and the ranked opportunity catalog). The items below are
+> absorbed there (C1 -> F1, C2 -> A1, C3 -> D2, C4 -> B2, C5 -> B4).
+
 Independent of fallbacks — these speed code that is ALREADY native:
 
 1. **Typed operands into member/subscript/builtin reads.** P3 is the biggest
