@@ -220,14 +220,29 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
 
 ### E. A post-codegen optimizer (the "LLVM pass" the maintainer invited)
 
-Run over the finished chunk, before locs extraction:
+**DONE (2026-07-16) — `peephole_chunk` (codegen.cpp), design + field
+tables in `plans/vm-peephole.md`.** Runs BEFORE `extract_locs` (so the
+loc/inline_ctxs side tables build from the compacted code — no side-table
+remap, only Instr pc fields), iterated ≤4 rounds. MEASURED (full-suite
+interleaved A/B vs 6ee507c): **VM-wall geomean 0.987** (a broad −4-14%
+across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
+3761→3587 (−4.6%), MoveVs −31%, fib$0's chunk 68→56 (−18%). Fuzzer
+400/400, matrix green.
 
-- **E1. Copy propagation / MoveV elimination.** The codegen already
-  retargets ad-hoc; a systematic pass catches the rest (ternary arms,
-  coalesce, arg staging into runs).
-- **E2. Dead-temp elimination + temp REUSE (linear-scan over temps).**
-  Shrinks `n_temps`, so every call's `Frame::init` constructs fewer
-  48-byte LValues — recursion pays Frame::init per call.
+- **E1. Copy propagation / MoveV elimination — DONE.** Backward temp
+  liveness (single-word bitset over `[slot_count, +n_temps)`, barrier
+  ops read all temps, handler pcs absorbed into every op's live-out)
+  proves the arm temp dead; `<producer dst=tX>; MoveV d=tX` (adjacent,
+  no branch entering the move) retargets the producer to d and deletes
+  the move. The USE/DEF table (`visit_use_def`) and the retargetable-dst
+  whitelist are AUDITED per op against disasm/vm.cpp — an unlisted op is
+  a conservative barrier, never a guess.
+- **E2. Dead-temp elimination / temp reuse — EVALUATED + DEFERRED.**
+  The native call stack already made per-call temp cost ~nil (an in-VM
+  window push constructs no slots; pop resets by scanning content, not
+  by n_temps; boundary Frame::init is rare) — full dense renumbering
+  needs the complete slot-field visitor for a ~nil measured win. See
+  the plan file.
 - **E3. Jump threading — v1 TRIED + DECLINED (2026-07-16).** An
   in-place `thread_jumps` pass (retarget every branch pc-field through
   chains of plain `Jump`s, hop cap 8, no instruction deletion) was
@@ -248,6 +263,9 @@ Run over the finished chunk, before locs extraction:
   Verdict: threading only makes sense INSIDE the full E1-E4 peephole
   (instruction deletion + pc remap), where the dead Jumps are actually
   removed and frames shrink — not as a standalone retargeting pass.
+  **[RESOLVED: the peephole (see section E) now does exactly this —
+  threading + jump-to-next + unreachable deletion + int branch-over-jump
+  inversion, with compaction; measured 0.987 as part of the pass.]**
   **Correctness trap for that future pass (fuzzer-caught here, the
   differential suite missed it):** an Instr "target" field is NOT always
   a pc — `ForLoopStep::target2` is the COUNTER SLOT; threading it

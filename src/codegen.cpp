@@ -6618,6 +6618,431 @@ static void specialize_arith_ops(Chunk &ck)
     }
 }
 
+/* ============ The post-codegen PEEPHOLE pass (roadmap E1-E4) ============
+ *
+ * plans/vm-peephole.md. Runs BEFORE extract_locs, so the loc/inline_ctxs
+ * side tables are built from the ALREADY-compacted code and the pass only
+ * ever rewrites Instr pc fields (every pool is operand-indexed, never
+ * pc-indexed; Instr::node_idx handles ride inside the moved Instr structs).
+ * Compile-time only - no new runtime ops, so vm_run_chunk is untouched.
+ */
+
+/*
+ * THE pc-field table - the single audited enumeration of every Instr field
+ * that holds a pc, used by remapping (MANDATORY for correctness), threading,
+ * and the CFG successor walk. Audited 2026-07-16 against every `pc = in->`
+ * site in vm.cpp. THE TRAP (fuzzer-caught in E-v1): a "target" field is NOT
+ * always a pc - ForLoopStep::target2 is the COUNTER SLOT, JumpUnlessTrueV's
+ * target2 the value slot, SetPend::target a Pend enum. A new branching op
+ * MUST be added here, and ALWAYS run tests/nested_fuzz.py after touching
+ * this pass.
+ */
+template <typename F>
+static void visit_pc_fields(Instr &in, F f)
+{
+    switch (in.op) {
+    case OpCode::Jump:
+    case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp:
+    case OpCode::JumpUnlessTrueV:      /* target2 = the value SLOT */
+    case OpCode::JumpIfNotNoneV:       /* a = the value operand */
+    case OpCode::ForLoopStep:          /* target2 = the COUNTER SLOT */
+    case OpCode::DictIterNext:
+    case OpCode::ForeachDynNext:
+    case OpCode::CatchTest:            /* a.lit = catch_types idx */
+    case OpCode::PushHandler:          /* -> the runtime handler's catch_pc */
+        f(in.target);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Ops that never continue at pc+1. Throw/Reraise/Rethrow also never fall
+ * through, but control can resume at handler pcs - keeping their fall-through
+ * edge is CONSERVATIVE (it only keeps more ops alive / extends liveness). */
+static bool op_falls_through(OpCode op)
+{
+    switch (op) {
+    case OpCode::Jump:
+    case OpCode::Halt:
+    case OpCode::ReturnV:
+        return false;
+    default:
+        return true;
+    }
+}
+
+/* Retarget through a chain of plain Jumps (hop cap for degenerate cycles;
+ * a self-Jump - `while(true);` - is left intact). */
+static int pp_thread(const Chunk &ck, int t)
+{
+    int hops = 0;
+    while (hops++ < 8
+           && t >= 0 && static_cast<size_t>(t) < ck.code.size()
+           && ck.code[t].op == OpCode::Jump
+           && ck.code[t].target != t)
+        t = ck.code[t].target;
+    return t;
+}
+
+/* `JumpUnlessIntCmp(C)` inversion for branch-over-jump. INT ONLY: float
+ * compares don't invert under NaN (`!(a<b)` is not `a>=b`). */
+static Op invert_int_cmp(Op o)
+{
+    switch (o) {
+    case Op::lt:    return Op::ge;
+    case Op::le:    return Op::gt;
+    case Op::gt:    return Op::le;
+    case Op::ge:    return Op::lt;
+    case Op::eq:    return Op::noteq;
+    case Op::noteq: return Op::eq;
+    default:        return Op::invalid;
+    }
+}
+
+/*
+ * E1's USE/DEF model over TEMP slots. `visit_use_def` reports each op's frame-
+ * slot reads (u) and writes (d) - layouts verified against disasm.cpp/vm.cpp
+ * per op. An op NOT in the verified set is a BARRIER (returns false): treated
+ * as reading EVERY temp, so liveness stays sound without a complete table
+ * (the pool-target ops - MultiUnpackV, UnpackElem*, IncDecChainV, the LV
+ * builtin family, stores - reference slots through pools/runs; barrier'ing
+ * them costs optimization, never correctness).
+ */
+template <typename U, typename D>
+static bool visit_use_def(const Instr &in, U u, D d)
+{
+    const auto opnd = [&](const Operand &o) {
+        if (!o.is_lit && o.slot >= 0)
+            u(static_cast<int>(o.slot));
+    };
+    const auto run = [&](int base, int cnt) {
+        for (int i = 0; i < cnt; i++)
+            u(base + i);
+    };
+    switch (in.op) {
+    case OpCode::Jump: case OpCode::Halt: case OpCode::PopHandler:
+    case OpCode::PushHandler: case OpCode::SetPend: case OpCode::EndFinally:
+    case OpCode::Reraise: case OpCode::Rethrow: case OpCode::ThrowRuntimeV:
+        return true;
+    case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
+        opnd(in.a); opnd(in.b); d(in.target); return true;
+    case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
+        opnd(in.a); opnd(in.b); return true;
+    case OpCode::JumpUnlessTrueV:
+        u(in.target2); return true;
+    case OpCode::JumpIfNotNoneV:
+        opnd(in.a); return true;
+    case OpCode::ForLoopStep:
+        u(in.target2); opnd(in.a); opnd(in.b); d(in.target2); return true;
+    case OpCode::MoveV:
+        u(in.target2); d(in.target); return true;
+    case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
+    case OpCode::LoadConstV: case OpCode::LoadLiteralObjV:
+    case OpCode::LoadGlobalV: case OpCode::LoadCaptureV:
+    case OpCode::LoadBuiltinV: case OpCode::DefinedGlobalV:
+    case OpCode::MakeClosureV:   /* captures snapshot NAMED locals, not temps */
+        d(in.target); return true;
+    case OpCode::UnaryV: case OpCode::CoerceNumV:
+        opnd(in.a); d(in.target); return true;
+    case OpCode::CompoundV:
+        u(in.target); opnd(in.b); d(in.target); return true;
+    case OpCode::MathFnV:
+        opnd(in.a); opnd(in.b); d(in.target); return true;
+    case OpCode::SubscriptV: case OpCode::MemberV:
+    case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadStrChar:
+        u(in.target2); opnd(in.a); d(in.target); return true;
+    case OpCode::ArrLen: case OpCode::StrLen:
+        u(in.target2); d(in.target); return true;
+    case OpCode::SliceV:
+        u(in.target2);
+        if (in.a.slot >= 0) u(static_cast<int>(in.a.slot));
+        if (in.b.slot >= 0) u(static_cast<int>(in.b.slot));
+        d(in.target); return true;
+    case OpCode::ReturnV:
+        opnd(in.a); return true;
+    case OpCode::StoreGlobalV: case OpCode::StoreCaptureV:
+        /* target = the GLOBAL/CAPTURE index, NOT a frame slot - no def */
+        opnd(in.a); return true;
+    case OpCode::CallV: case OpCode::CachedCallV: case OpCode::CallBuiltinV:
+        run(static_cast<int>(in.a.lit), static_cast<int>(in.b.lit));
+        d(in.target); return true;
+    case OpCode::CallValueV:
+        u(in.target2);
+        run(static_cast<int>(in.a.lit), static_cast<int>(in.b.lit));
+        d(in.target); return true;
+    case OpCode::MakeArrayV: case OpCode::StructCtorV:
+        run(static_cast<int>(in.a.lit), static_cast<int>(in.b.lit));
+        d(in.target); return true;
+    case OpCode::MakeDictV:
+        run(static_cast<int>(in.a.lit), 2 * static_cast<int>(in.b.lit));
+        d(in.target); return true;
+    case OpCode::AppendV:
+        if (in.a.lit == 0)             /* arg0 kind 0 = a frame slot */
+            u(in.target2);
+        u(static_cast<int>(in.b.lit)); /* the value's SLOT (lit-encoded) */
+        d(in.target); return true;
+    default:
+        return false;                  /* BARRIER - reads everything */
+    }
+}
+
+/* Producer ops whose ONLY frame-slot write is `target` (verified above) and
+ * whose semantics don't otherwise depend on the dst - safe to retarget. */
+static bool retargetable_dst(OpCode op)
+{
+    switch (op) {
+    case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
+    case OpCode::UnaryV: case OpCode::CoerceNumV: case OpCode::MoveV:
+    case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
+    case OpCode::LoadConstV: case OpCode::LoadLiteralObjV:
+    case OpCode::LoadGlobalV: case OpCode::LoadCaptureV:
+    case OpCode::LoadBuiltinV: case OpCode::DefinedGlobalV:
+    case OpCode::MakeClosureV: case OpCode::MathFnV:
+    case OpCode::SubscriptV: case OpCode::MemberV:
+    case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadStrChar: case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::SliceV: case OpCode::CallV: case OpCode::CachedCallV:
+    case OpCode::CallValueV: case OpCode::CallBuiltinV:
+    case OpCode::MakeArrayV: case OpCode::MakeDictV: case OpCode::StructCtorV:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void peephole_chunk(Chunk &ck)
+{
+    std::vector<Instr> &code = ck.code;
+    if (code.empty())
+        return;
+
+    /* Threading can expose a jump-to-next, whose deletion can expose more -
+     * iterate to a (cheap) fixpoint. */
+    for (int round = 0; round < 4; round++) {
+
+        bool changed = false;
+        const size_t n = code.size();
+
+        /*
+         * E1: MoveV elimination. Backward liveness over the TEMP slots
+         * (single-word bitset; a chunk with > 64 temps skips E1), then
+         * `<producer dst=tX>; MoveV d=tX` - adjacent, tX a temp dead after
+         * the move, no branch entering at the move - retargets the producer
+         * to d and deletes the move. A barrier op reads every temp; when the
+         * chunk has handlers, every op may (via a throw) continue at any
+         * handler pc, so each op's live-out absorbs the handlers' live-in.
+         */
+        if (ck.n_temps > 0 && ck.n_temps <= 64) {
+
+            const int tbase = ck.slot_count;
+            const uint64_t all = ck.n_temps == 64
+                ? ~uint64_t(0) : ((uint64_t(1) << ck.n_temps) - 1);
+            const auto bit = [&](int slot) -> uint64_t {
+                return (slot >= tbase && slot < tbase + ck.n_temps)
+                    ? (uint64_t(1) << (slot - tbase)) : 0;
+            };
+
+            std::vector<char> is_tgt(n + 1, 0);
+            std::vector<int> handler_pcs;
+            for (Instr &in : code) {
+                visit_pc_fields(in, [&](int &t) {
+                    if (t >= 0 && static_cast<size_t>(t) <= n)
+                        is_tgt[t] = 1;
+                });
+                if (in.op == OpCode::PushHandler)
+                    handler_pcs.push_back(in.target);
+            }
+
+            std::vector<uint64_t> live_in(n, 0);
+            for (bool liv_changed = true; liv_changed; ) {
+                liv_changed = false;
+                uint64_t hlive = 0;
+                for (int h : handler_pcs)
+                    if (h >= 0 && static_cast<size_t>(h) < n)
+                        hlive |= live_in[h];
+                for (size_t r = 0; r < n; r++) {
+                    const size_t p = n - 1 - r;
+                    Instr &in = code[p];
+                    uint64_t out = hlive;
+                    visit_pc_fields(in, [&](int &t) {
+                        if (t >= 0 && static_cast<size_t>(t) < n)
+                            out |= live_in[t];
+                    });
+                    if (op_falls_through(in.op) && p + 1 < n)
+                        out |= live_in[p + 1];
+                    uint64_t use = 0, def = 0;
+                    const bool known = visit_use_def(in,
+                        [&](int s) { use |= bit(s); },
+                        [&](int s) { def |= bit(s); });
+                    const uint64_t lin =
+                        known ? ((out & ~def) | use) : all;
+                    if (lin != live_in[p]) {
+                        live_in[p] = lin;
+                        liv_changed = true;
+                    }
+                }
+            }
+
+            for (size_t p = 0; p + 1 < n; p++) {
+                Instr &prod = code[p];
+                Instr &m = code[p + 1];
+                if (m.op != OpCode::MoveV || is_tgt[p + 1]
+                    || !retargetable_dst(prod.op)
+                    || prod.target != m.target2
+                    || m.target == m.target2)
+                    continue;
+                const uint64_t sb = bit(m.target2);
+                if (!sb)
+                    continue;             /* src not a temp */
+                /* live-out of the move = live-in of its fall-through +
+                 * the handler absorption (MoveV cannot throw, but stay
+                 * uniform/conservative). */
+                uint64_t hlive = 0;
+                for (int h : handler_pcs)
+                    if (h >= 0 && static_cast<size_t>(h) < n)
+                        hlive |= live_in[h];
+                const uint64_t mout =
+                    (p + 2 < n ? live_in[p + 2] : 0) | hlive;
+                if (mout & sb)
+                    continue;             /* src still read later */
+                prod.target = m.target;   /* produce straight into d */
+                m.op = OpCode::Jump;      /* neutralize: jump-to-next... */
+                m.target = static_cast<int>(p) + 2;   /* ...deleted below */
+                changed = true;
+            }
+        }
+
+        /* E3a: thread every pc field through Jump chains. */
+        for (Instr &in : code)
+            visit_pc_fields(in, [&](int &t) {
+                const int nt = pp_thread(ck, t);
+                if (nt != t) {
+                    t = nt;
+                    changed = true;
+                }
+            });
+
+        /* Branch-target map (post-threading). */
+        std::vector<char> is_tgt(n + 1, 0);
+        for (Instr &in : code)
+            visit_pc_fields(in, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) <= n)
+                    is_tgt[t] = 1;
+            });
+
+        std::vector<char> del(n, 0);
+
+        /* E3d: INT branch-over-jump inversion. `junless(C) L1; jmp L2; L1:`
+         * with nothing else entering the jmp -> `junless(!C) L2` + the jmp
+         * marked deleted (the inverted branch's fall-through must land at
+         * L1 = i+2, which deleting the jmp produces). */
+        for (size_t i = 0; i + 1 < n; i++) {
+            Instr &b = code[i];
+            const Instr &j = code[i + 1];
+            if (b.op != OpCode::JumpUnlessIntCmp || j.op != OpCode::Jump)
+                continue;
+            if (b.target != static_cast<int>(i) + 2 || is_tgt[i + 1])
+                continue;
+            const Op inv = invert_int_cmp(b.aop);
+            if (inv == Op::invalid)
+                continue;
+            b.aop = inv;
+            b.target = j.target;
+            del[i + 1] = 1;
+            changed = true;
+        }
+
+        /* The del-aware fall-through successor: the next surviving pc
+         * (compaction collapses deleted ops away, so this IS the runtime
+         * successor). */
+        const auto next_live = [&](size_t i) -> size_t {
+            size_t k = i + 1;
+            while (k < n && del[k])
+                k++;
+            return k;
+        };
+
+        /* E3b: a Jump to its own (del-aware) next op is a no-op. */
+        for (size_t i = 0; i < n; i++) {
+            Instr &in = code[i];
+            if (!del[i] && in.op == OpCode::Jump
+                && in.target == static_cast<int>(next_live(i))) {
+                del[i] = 1;
+                changed = true;
+            }
+        }
+
+        /* E3c: reachability DFS from pc 0 over the del-aware CFG; anything
+         * unvisited is dead (the Jumps threading obsoleted, a merge tail
+         * every path returns past, ...). */
+        {
+            std::vector<char> reach(n, 0);
+            std::vector<size_t> stack;
+            const auto push = [&](size_t p) {
+                while (p < n && del[p])   /* land past deleted ops */
+                    p++;
+                if (p < n && !reach[p]) {
+                    reach[p] = 1;
+                    stack.push_back(p);
+                }
+            };
+            push(0);
+            while (!stack.empty()) {
+                const size_t p = stack.back();
+                stack.pop_back();
+                Instr &in = code[p];
+                visit_pc_fields(in, [&](int &t) {
+                    if (t >= 0)
+                        push(static_cast<size_t>(t));
+                });
+                if (op_falls_through(in.op))
+                    push(p + 1);
+            }
+            for (size_t i = 0; i < n; i++)
+                if (!reach[i] && !del[i]) {
+                    del[i] = 1;
+                    changed = true;
+                }
+        }
+
+        /* Compact: drop deleted ops, remap every pc field via the
+         * prefix-sum map (a field pointing AT a deleted op remaps to the
+         * first survivor at-or-after it - exactly where execution
+         * continues for a deleted jump-to-next). */
+        if (std::count(del.begin(), del.end(), 1) > 0) {
+            std::vector<int> newpc(n + 1);
+            int live = 0;
+            for (size_t i = 0; i < n; i++) {
+                newpc[i] = live;
+                if (!del[i])
+                    live++;
+            }
+            newpc[n] = live;
+            std::vector<Instr> out;
+            out.reserve(live);
+            for (size_t i = 0; i < n; i++)
+                if (!del[i])
+                    out.push_back(code[i]);
+            for (Instr &in : out)
+                visit_pc_fields(in, [&](int &t) {
+                    if (t >= 0 && static_cast<size_t>(t) <= n)
+                        t = newpc[t];
+                });
+            code = std::move(out);
+        }
+
+        if (!changed)
+            break;
+    }
+}
+
 Chunk
 codegen_chunk(const Block *block, int slot_count)
 {
@@ -6640,6 +7065,9 @@ codegen_chunk(const Block *block, int slot_count)
     cg.chunk.n_dyn_iters = cg.max_dyn_iters;
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
+    peephole_chunk(cg.chunk);     /* E1-E4 - BEFORE extract_locs, so the loc/
+                                   * inline_ctxs side tables build from the
+                                   * compacted code (no side-table remap) */
     extract_locs(cg.chunk, cg.ast_nodes);   /* carets -> the loc side table */
     specialize_arith_ops(cg.chunk);   /* B1/B2 - AFTER extract_locs: an
                                        * in-place op swap, no pc shifts, and

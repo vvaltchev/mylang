@@ -1,0 +1,124 @@
+# The post-codegen peephole pass (roadmap E1-E4)
+
+Status: Inc 1 (infra + E3) and Inc 2 (E1 MoveV elimination) DONE
+(2026-07-16); E2 evaluated + deferred (see below); E4 = the framework
+itself. Measured numbers in the roadmap E-section.
+
+Static results (bench/ + samples/): total instrs 3761 → 3587 (−4.6%),
+MoveVs 399 → 275 (−31%), fib$0's chunk 68 → 56 instrs (−18% — every
+ternary-arm `producer; move; jmp` collapsed to `producer-into-dst; jmp`).
+
+## What this is
+
+The systematic post-codegen optimizer over a finished `Chunk` — the
+"LLVM pass" the maintainer invited: instruction DELETION with pc
+remapping, jump threading done right (E-v1's standalone retargeting was
+measured a decline — see roadmap E3 — because the dead Jumps stayed),
+copy propagation over the `MoveV`s the codegen's ad-hoc retargeting
+misses, and dead-temp shrinking so every call constructs a smaller
+frame. Compile-time only: ZERO new runtime ops, so `vm_run_chunk`'s text
+is untouched (the front-end/layout hazard is limited to LTO-level
+shifts).
+
+## Placement (the ordering that avoids side-table remapping)
+
+`codegen_chunk` tail: **emit → PEEPHOLE → extract_locs →
+specialize_arith_ops → verify_ast_free**.
+
+Running BEFORE `extract_locs` is the load-bearing choice: the loc side
+table, `inline_ctxs`, and the `node_idx` nulling all happen on the
+ALREADY-COMPACTED code, so the pass never remaps a side table — only
+`Instr` pc fields. (`Instr::node_idx` handles are indices into the
+codegen-transient `ast_nodes`, carried inside the moved `Instr` structs,
+so deletion shifts them for free; a deleted op's entry is simply never
+read.) `specialize_arith_ops` stays after `extract_locs` and changes no
+pcs. All pools (`consts`, `builtin_calls`, `throws`, …) are indexed by
+Instr OPERANDS, never by pc — untouched by deletion.
+
+## The pc-field table (the E-v1 trap, centralized)
+
+`visit_pc_fields(Instr&, F)` is THE single audited enumeration of every
+Instr field that holds a pc — used by remapping (mandatory), threading,
+and the CFG successor walk. Audited 2026-07-16 by grepping every
+`pc = in->...` in vm.cpp:
+
+| op                  | pc field  | NOT a pc                       |
+|---------------------|-----------|--------------------------------|
+| Jump                | target    |                                |
+| JumpUnlessIntCmp    | target    | a, b = operands                |
+| JumpUnlessFloatCmp  | target    | a, b = operands                |
+| JumpUnlessTrueV     | target    | target2 = the value SLOT       |
+| JumpIfNotNoneV      | target    | a = the value operand          |
+| ForLoopStep         | target    | **target2 = the COUNTER SLOT** |
+| DictIterNext        | target    | a/b = binds, iter id           |
+| ForeachDynNext      | target    | shape/targets operands         |
+| CatchTest           | target    | a.lit = catch_types idx        |
+| PushHandler         | target    | (feeds the runtime handler)    |
+
+`SetPend::target` is a **Pend enum value**, not a pc. No other op reads
+a pc from a field (verified against every `pc =` site in vm.cpp). A new
+branching op MUST be added here or `ml_peephole` static checks/tests
+will not save you — the fuzzer will (13/300 caught ForLoopStep::target2
+in E-v1); ALWAYS run nested_fuzz.py after touching this pass.
+
+## CFG + successors
+
+Successor edges for reachability and liveness: every op falls through
+(`pc+1`) except `Jump` (target only), `ReturnV`/`Halt` (none),
+`Throw`/`Reraise`/`Rethrow` (none — control resumes only at handler
+pcs, which are edges from their `PushHandler.target`). Branch ops have
+`{target, pc+1}`. `EndFinally`'s reraise path dispatches to a handler
+pc (a PushHandler edge) or C++-rethrows; its normal path falls through.
+
+## Increments
+
+- **Inc 1 — infra + E3 (jump cleanup).** `visit_pc_fields`, reach DFS,
+  `compact_chunk` (drop marked ops, build old→new pc map, rewrite pc
+  fields). Rules: thread jump chains (the E-v1 logic, now the skipped
+  Jumps actually DIE), delete jump-to-next, delete unreachable ops,
+  invert an INT branch-over-jump (`i.jmp.ifnot C L1; jmp L2; L1:` →
+  `i.jmp.ifnot !C L2`). Float compare inversion is EXCLUDED — NaN:
+  `!(a<b)` is not `a>=b`. JumpUnlessTrueV has no inverted form — skip.
+- **Inc 2 — E1 (copy prop / MoveV elimination).** Backward liveness
+  over TEMP slots only (bit-set per pc, fixpoint over the CFG). Rule:
+  `<producer dst=tX>; MoveV d=tX` (adjacent, no branch target between,
+  tX dead after the move, producer's dst rewritable) → retarget
+  producer to d, delete the MoveV. Plus dead-STORE deletion for a
+  side-effect-free whitelist (MoveV/LoadImm*/LoadConstV/the specialized
+  arith ops... — pre-specialization that's MoveV/LoadImm*/LoadConstV
+  only; IntBin can throw on div) writing a dead temp.
+- **Inc 3 — E2 (temp shrink): EVALUATED + DEFERRED.** The native call
+  stack already made the per-call temp cost ~nil: an in-VM window push
+  does NOT construct slots (segments are constructed once; pop resets
+  only REFERENCE slots by scanning content, independent of n_temps), so
+  shrinking n_temps saves only segment stack SPACE. Boundary calls
+  (main, builtin callbacks) do construct `frame_size` LValues, but they
+  are rare. Full dense renumbering needs the complete slot-field
+  visitor (every op) for a ~nil measured win — not worth the risk
+  today. Revisit if a profile ever shows window space or boundary
+  Frame::init.
+- **E4 (fusion framework).** The pass IS the framework — a fusion rule
+  is another match/rewrite over the instruction window. No new fusions
+  ship with this change (B1/B2 stays a separate in-place rewrite;
+  candidates recorded below).
+
+## Quantified expectations (measured before building)
+
+fib$0's 68-instr chunk: ~6 MoveV+Jump pairs from ternary arms, ~9-12
+MoveVs per chunk across recursion/matrix benches. The BULK of fib's
+body is `bin.v`/`cmp.v` (BOXED — the ternary-arm/condition lowering
+boxes even int-proven operands: a TYPED TERNARY lowering in
+compile_int/float_expr is the bigger fib win, recorded as an F-class
+follow-up, NOT this pass). So the peephole's expected effect is a
+MODEST wall win + smaller chunks/frames; the hard rule applies — a
+full-suite interleaved A/B decides, and a null result with clean
+infrastructure is an acceptable outcome (the infra is what E4 fusions
+and the typed-ternary rewrite build on).
+
+## Follow-ups recorded
+
+- TYPED TERNARY VALUE lowering (`cond ? a : b` with th==i/f arms) in
+  compile_int_expr/compile_float_expr — fib's unrolled body is ~20
+  boxed ops that would become IntBin/JumpUnlessIntCmp.
+- E4 fusion candidates (post-infra): cmp+branch over boxed bools,
+  LoadImm+IntBin RI forms the specializer misses.

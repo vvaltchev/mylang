@@ -13788,6 +13788,19 @@ static bool vm_codegen_shapes()
         return false;
     const bool mathfn_ok = mf.mathfnv == 5 && mf.callbuiltinv == 0;
 
+    /* 14c) the E1-E4 PEEPHOLE (plans/vm-peephole.md): a ternary's arms
+     * produce STRAIGHT into the assignment's dst (the arm-temp MoveV is
+     * eliminated by liveness-checked producer retargeting), leaving one
+     * arm-skip Jump and zero moves. */
+    VmOpCounts pp;
+    if (!codegen_counts({
+            "var a = 5; var b = 3;",
+            "var dyn c = a < b;",
+            "var r = c ? a + 1 : b + 2;",
+        }, pp))
+        return false;
+    const bool peephole_ok = pp.movev == 0 && pp.jmp == 1;
+
     /* 15) a native loop with a FLOW-FREE fallback body statement still goes
      * native INCLUDING a discarded `map(...)` statement: the loop-body
      * DISCARD tier compiles any expression statement into a scratch temp
@@ -14269,7 +14282,8 @@ static bool vm_codegen_shapes()
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
         && nested_native_ok && compound_store_ok && read_2d_ok
-        && builtin_dispatch_ok && mathfn_ok && array_build_ok && general_for_ok
+        && builtin_dispatch_ok && mathfn_ok && peephole_ok
+        && array_build_ok && general_for_ok
         && break_cont_ok && compound_cond_ok && boxed_ok
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok

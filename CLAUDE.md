@@ -195,15 +195,35 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
-**Jump threading was TRIED + DECLINED** (see roadmap E3): the codegen
-already emits direct branches (the pass retargeted instructions in 1 of
-77 benches), and the binary-layout perturbation cost a consistent +3.2%
-VM-wall suite-wide. Threading belongs inside the future full peephole
-(instruction deletion + pc remap), not standalone. Trap recorded there
-for that pass: an Instr "target" field is NOT always a pc -
-`ForLoopStep::target2` is the COUNTER SLOT (fuzzer-caught; the
-differential suite missed it - always run nested_fuzz.py after a
-codegen-pass change).
+**THE POST-CODEGEN PEEPHOLE (`peephole_chunk`, codegen.cpp; design +
+field tables in plans/vm-peephole.md).** Runs in `codegen_chunk` BEFORE
+`extract_locs` - the load-bearing ordering: the loc/`inline_ctxs` side
+tables are built from the ALREADY-compacted code, so the pass only ever
+rewrites Instr pc fields (every pool is operand-indexed; `node_idx`
+handles ride inside the moved Instr structs). Iterated <=4 rounds, each:
+(E1) **MoveV elimination** - backward TEMP liveness (a single-word
+bitset over `[slot_count, slot_count+n_temps)`; >64 temps skips; an op
+not in the audited `visit_use_def` table is a BARRIER that reads every
+temp; when the chunk has handlers every op's live-out absorbs the
+handler pcs' live-in, since any throw may resume there), then
+`<producer dst=tX>; MoveV d=tX` (adjacent, tX a dead-after temp, no
+branch entering the move, producer in the audited `retargetable_dst`
+whitelist) retargets the producer to d and deletes the move; (E3)
+jump-chain threading, INT-only branch-over-jump inversion (float
+compares don't invert under NaN), jump-to-next deletion, reachability
+DFS, then compaction with a prefix-sum pc remap over `visit_pc_fields`.
+**`visit_pc_fields` is THE single audited pc-field enumeration** (a
+"target" field is NOT always a pc - `ForLoopStep::target2` is the
+COUNTER SLOT, `JumpUnlessTrueV::target2` the value slot,
+`SetPend::target` a Pend enum; the E-v1 fuzzer catch) - a new branching
+op MUST be added there, and ALWAYS run tests/nested_fuzz.py after a
+codegen-pass change. E2 (temp renumbering) was evaluated + DEFERRED (the
+native call stack made per-call temp cost ~nil - see the plan); E4 =
+this pass IS the fusion framework (no new fusions shipped). Measured
+(full-suite interleaved A/B): VM-wall geomean **0.987**, instrs -4.6%,
+MoveVs -31%, fib$0's chunk 68->56; the earlier STANDALONE
+threading-without-deletion attempt was a measured DECLINE (+3.2%, 1/77
+benches affected - roadmap E3 records it).
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
