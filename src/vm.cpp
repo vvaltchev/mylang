@@ -1059,34 +1059,6 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             pc = in->target;
             VM_NEXT;
 
-        VM_CASE(LoopBackEdge): {
-
-            /* Mirror While/ForStmt::do_eval's post-body flow handling. */
-            FlowState &fs = *ctx.flow;
-
-            switch (fs.type) {
-
-            case FlowState::ret:
-                return;             /* a return propagating out of the loop -
-                                     * stops the whole chunk (function body) */
-
-            case FlowState::brk:
-                fs.type = FlowState::none;
-                pc = in->target2;    /* exit loop */
-                break;
-
-            case FlowState::cont:
-                fs.type = FlowState::none;
-                pc = in->target;     /* continue dest */
-                break;
-
-            default:                /* none */
-                pc = in->target;     /* continue dest */
-                break;
-            }
-
-        }
-        VM_NEXT;
 
         VM_CASE(IncDecCheckedV): {
             /* A dyn/general scalar `--d`/`d++`: throw if not int/float

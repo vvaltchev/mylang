@@ -3659,9 +3659,11 @@ smallest sensible step is acceptable, an accidental one is not.
 **Phase 1** added native control flow (`Jump`/`JumpIfFalse`/`LoopBackEdge`) and
 flattened **top-level `if`/`while`** to jumps; conditions/bodies still fell back
 (one `do_eval` each). (`JumpIfFalse` and its Phase-1 gen_if/gen_while flatten
-forms are since DELETED — an if/while that can't lower natively now falls back
-WHOLE-statement via EvalStmt; `LoopBackEdge` survives for flow-consuming
-loop shapes.)
+forms are since DELETED; `LoopBackEdge` is DELETED too — once the no-fail
+codegen removed every fallback body, nothing could set a brk/cont/ret
+FlowState inside a chunk and codegen had already stopped emitting it, so
+the VM's only remaining FlowState use is ReturnV's value hand-off to
+do_func_call — see plans/vm-native-call-stack.md Phase A.)
 **Phase 2** is a **REGISTER machine over the frame slots** (the VM's registers
 ARE the resolved-local slots — NO value stack), with fused superinstructions:
 `IntBin` (3-address `dst = a <arith> b`, operands = slot or int immediate) and

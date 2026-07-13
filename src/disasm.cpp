@@ -416,9 +416,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::EndFinally:
             row << "end.finally";
             break;
-        case OpCode::LoopBackEdge:
-            row << "loop.back    cont=L" << in.target << " brk=L" << in.target2;
-            break;
+
         case OpCode::IntBin:
             row << "i.bin        " << D(in.target) << " = "
                 << RI(in.a, false) << " " << opsym(in.aop) << " "

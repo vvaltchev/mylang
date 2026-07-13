@@ -18,7 +18,7 @@
  * op can re-enter the AST.
  *
  * Phase 0: fallback + Halt. Phase 1 adds native control flow (Jump /
- * LoopBackEdge). Phase 2 adds a REGISTER machine over the frame
+ * the since-deleted LoopBackEdge). Phase 2 adds a REGISTER machine over the frame
  * slots (the VM's registers ARE the resolved-local slots, so there is no value
  * stack) with native int ops (IntBin / JumpUnlessIntCmp) and fused
  * superinstructions, so a resolved-local int scalar loop runs with no
@@ -41,16 +41,11 @@ enum class OpCode : unsigned char {
     /* Unconditional jump: pc = `target`. */
     Jump,
 
-    /*
-     * Placed right after a loop body; reads ctx->flow and branches, mirroring
-     * While/ForStmt::do_eval exactly. `target` = the continue destination (a
-     * while's re-test, a for's increment), `target2` = the loop exit:
-     *   ret  -> pc = target2 (leave flow set; it propagates out of the loop)
-     *   brk  -> flow = none, pc = target2
-     *   cont -> flow = none, pc = target
-     *   none -> pc = target
-     */
-    LoopBackEdge,
+    /* (LoopBackEdge - the Phase-1 flow-consuming back edge - is DELETED:
+     * since the no-fail codegen removed every fallback body, nothing set a
+     * brk/cont/ret FlowState inside a chunk, and codegen had already
+     * stopped emitting it. Native loops branch with Jump/JumpUnless*;
+     * `return` is ReturnV. See plans/vm-native-call-stack.md Phase A.) */
 
     /*
      * Native 3-address int op (register machine): slot[target] = a <aop> b,
@@ -979,8 +974,8 @@ enum class OpCode : unsigned char {
  * silently mis-dispatching table.
  */
 #define ML_FOR_EACH_OPCODE(X) \
-    X(Jump) X(LoopBackEdge) X(IntBin) X(IncDecCheckedV) \
-    X(IncDecElemCheckedV) X(IncDecMemberCheckedV) X(IncDecChainV) \
+    X(Jump) X(IntBin) X(IncDecCheckedV) X(IncDecElemCheckedV) \
+    X(IncDecMemberCheckedV) X(IncDecChainV) \
     X(StoreLValueChainV) X(JumpUnlessIntCmp) X(FloatBin) \
     X(JumpUnlessFloatCmp) X(ForLoopStep) X(LoadElemInt) X(LoadElemFloat) \
     X(LoadElemBool) X(ArrLen) X(StrLen) X(LoadStrChar) X(LoadElemValue) \
@@ -1053,9 +1048,9 @@ struct Instr {
      * (the fallback ops are deleted), which is what lets the bytecode be
      * serialized. */
     int32_t node_idx = -1;
-    int target = -1;    /* Jump dest; LoopBackEdge cont; IntBin dst
+    int target = -1;    /* Jump dest; IntBin dst
                          * slot; JumpUnlessIntCmp jump dest */
-    int target2 = -1;   /* LoopBackEdge exit dest */
+    int target2 = -1;   /* secondary operand (op-specific) */
     Op aop = Op::invalid;   /* IntBin: arith op; JumpUnlessIntCmp: compare op */
     Operand a;              /* IntBin / JumpUnlessIntCmp: left operand */
     Operand b;              /* IntBin / JumpUnlessIntCmp: right operand */

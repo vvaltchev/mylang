@@ -13360,7 +13360,7 @@ static bool frame_over_64_slots()
  * See plans/bytecode-vm.md.
  */
 struct VmOpCounts {
-    size_t jmp = 0, back = 0, juic = 0, intbin = 0, halt = 0;
+    size_t jmp = 0, juic = 0, intbin = 0, halt = 0;
     size_t fbin = 0, jufc = 0, flstep = 0, loadei = 0, loadef = 0, arrlen = 0;
     size_t storei = 0, storef = 0, loadev = 0;
     size_t jinn = 0, munpack = 0, idchain = 0, retv = 0, makeclosure = 0;
@@ -13414,7 +13414,6 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
         for (const Instr &in : chunk.code) {
             switch (in.op) {
             case OpCode::Jump:             c.jmp++;    break;
-            case OpCode::LoopBackEdge:     c.back++;   break;
             case OpCode::JumpUnlessIntCmp: c.juic++;   break;
             case OpCode::IntBin:           c.intbin++; break;
             case OpCode::FloatBin:         c.fbin++;   break;
@@ -13528,7 +13527,7 @@ static bool vm_codegen_shapes()
      * branches (s+=100, s-=1) + a Jump over the else - no fallback; one
      * Halt. */
     const bool native_ok =
-        a.juic == 2 && a.intbin == 4 && a.back == 0 &&
+        a.juic == 2 && a.intbin == 4 &&
         a.jmp >= 1 && a.halt == 1;
 
     /* 2) a NESTED FUNC DECL in a loop body is NATIVE (MakeClosureV +
@@ -13572,7 +13571,7 @@ static bool vm_codegen_shapes()
         }, c))
         return false;
     const bool nested_ok =
-        c.juic == 1 && c.intbin >= 3 && c.n_temps >= 1 && c.back == 0;
+        c.juic == 1 && c.intbin >= 3 && c.n_temps >= 1;
 
     /* 4) bool-safety: a plain assign of a BOOL value must NOT become a native
      * int-write (that would corrupt the bool slot). It stays a fallback
@@ -13586,7 +13585,7 @@ static bool vm_codegen_shapes()
             "while (i < 5) { b = flag; i++; }",
         }, d))
         return false;
-    const bool bool_safe = d.juic == 1 && d.intbin == 1 && d.back == 0;
+    const bool bool_safe = d.juic == 1 && d.intbin == 1;
 
     /* 5) a pure-FLOAT loop compiles to the float register ops (FloatBin +
      * JumpUnlessFloatCmp), no fallback, no int ops. */
@@ -13597,7 +13596,7 @@ static bool vm_codegen_shapes()
         }, f))
         return false;
     const bool float_ok =
-        f.jufc == 1 && f.fbin >= 3 && f.back == 0
+        f.jufc == 1 && f.fbin >= 3
         && f.juic == 0 && f.intbin == 0;
 
     /* 6) a MIXED int/float loop compiles per-statement: an int condition + an
@@ -13609,8 +13608,7 @@ static bool vm_codegen_shapes()
         }, m))
         return false;
     const bool mixed_ok =
-        m.juic == 1 && m.jufc == 0 && m.intbin == 1 && m.fbin == 1
-        && m.back == 0;
+        m.juic == 1 && m.jufc == 0 && m.intbin == 1 && m.fbin == 1;
 
     /* 7) a counted `for` compiles to the fused register loop: an initial
      * JumpUnlessIntCmp + a ForLoopStep back-edge (NOT a separate IntBin
@@ -13622,8 +13620,7 @@ static bool vm_codegen_shapes()
         }, g))
         return false;
     const bool for_ok =
-        g.flstep == 1 && g.juic == 1 && g.intbin >= 1
-        && g.back == 0 && g.jmp == 0;
+        g.flstep == 1 && g.juic == 1 && g.intbin >= 1 && g.jmp == 0;
 
     /* 8) a DECL with an arith rvalue inside a loop body compiles natively (the
      * register machine treats `var t = <int expr>` like a plain assign to t's
@@ -13635,7 +13632,7 @@ static bool vm_codegen_shapes()
         }, h))
         return false;
     const bool decl_ok =
-        h.juic == 1 && h.intbin >= 3 && h.back == 0;
+        h.juic == 1 && h.intbin >= 3;
 
     /* 9) an array-element READ `a[i]` in a loop compiles to a native LoadElemInt
      * (no fallback for the read), and the float element variant to LoadElemFloat
@@ -13789,7 +13786,7 @@ static bool vm_codegen_shapes()
         }, cc))
         return false;
     const bool compound_cond_ok =
-        cc.juic == 2 && cc.intbin >= 1 && cc.back == 0;
+        cc.juic == 2 && cc.intbin >= 1;
 
     /* 19) the BOXED general-value path: `s = s + "x"` (a string-build loop)
      * lowers to native boxed ops (LoadConstV for "x", BinOpV for the concat via
