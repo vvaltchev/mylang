@@ -116,6 +116,24 @@ a mystery segfault. Still gated by `ASSERTS` (a no-op under `NDEBUG`). CMake:
 `-DVM_HARDENING=ON/OFF` (default follows the build type). See *Invariants &
 hazards*.
 
+**VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
+(`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
+code-label addresses generated in enum order from `ML_FOR_EACH_OPCODE`
+(bytecode.h, order/coverage static-asserted) and a `goto *tbl[op]` at the
+tail of every handler (`VM_NEXT`), so each opcode gets its OWN indirect
+branch instead of one 92-target switch hub. `make CGOTO=0` (CMake
+`-DCGOTO=OFF`) forces the portable `switch` dispatch - the A/B lever, and
+what MSVC always compiles (no computed goto there). The SAME handler bodies
+compile either way via `VM_CASE`/`VM_NEXT`/`VM_NEXT_COLD` (see vm.cpp's
+"DISPATCH MODE" comment; the _COLD variant is a direct-goto trampoline for
+the cross-frame exception sites - clang forbids an INDIRECT goto from
+exiting a scope with live destructors, which is also why each handler's
+terminal dispatch sits AFTER its case braces). Measured (release,
+ASSERTS=0, scale 10, best-of-7): ~10% geomean on the dispatch-bound loop
+benches (up to -22% on 44_primes_sqrt/07_nested_loops), suite my/py
+0.26x -> 0.25x, VM/TW 0.56x -> 0.53x; cachegrind -11-12% instructions and
+-25-42% indirect-branch mispredicts on untouched loops.
+
 CMake is also supported (used by CI):
 `cmake -DTESTS=1 -DCMAKE_BUILD_TYPE=Debug .. && cmake --build .`
 (`-DGCOV=ON` for a coverage build, GCC only). It enables LTO via

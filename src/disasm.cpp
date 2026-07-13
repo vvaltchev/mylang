@@ -369,6 +369,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         std::ostringstream row;
 
         switch (in.op) {
+        case OpCode::OpCount_:      /* sentinel - never emitted; the case
+                                     * keeps this switch's -Wswitch
+                                     * exhaustiveness (a new op must add its
+                                     * render here) */
+            row << "??";
+            break;
         case OpCode::Jump:
             row << "jmp          L" << in.target;
             break;

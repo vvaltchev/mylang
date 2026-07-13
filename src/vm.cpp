@@ -604,6 +604,55 @@ static NumBinOp cmp_pmf(Op op)
  * so any future fold path that slips past that gate fails LOUDLY here instead
  * of corrupting memory. See defs.h ML_VM_CHECK / CLAUDE.md.
  */
+
+/*
+ * DISPATCH MODE - computed-goto (direct-threaded) vs switch.
+ *
+ * GCC/clang builds dispatch vm_run_chunk via the "labels as values"
+ * extension: a static table of code-label addresses (`vm_optbl`, generated
+ * in enum order from ML_FOR_EACH_OPCODE - order/coverage static-asserted in
+ * bytecode.h) and a `goto *tbl[op]` at the TAIL OF EVERY HANDLER (VM_NEXT).
+ * That removes the switch's bounds check and - the real win - gives each
+ * handler its OWN indirect branch, so the BTB predicts per-op-PAIR
+ * transitions instead of one 92-target mega-hub (whose mispredicts grew
+ * +33% on cachegrind as ops were added - see plans/vm-performance-roadmap
+ * A1/A2 and the falsified layout experiments recorded there). MSVC (no
+ * computed goto) and a `make CGOTO=0` build keep the original switch: the
+ * SAME handler bodies compile either way through VM_CASE/VM_NEXT, so there
+ * is exactly one copy of the VM's semantics.
+ *
+ * VM_NEXT re-reads `in` and dispatches (cgoto) or `continue`s to the loop
+ * top (switch) - semantically identical because the dispatch loop has an
+ * EMPTY tail. It terminates every handler AND replaces the old vm_raise
+ * `continue;`s (which may sit INSIDE a handler's inner switch - which is
+ * why the switch flavor is `continue`, never `break`: it must reach the
+ * dispatch loop, not fall out of the inner switch).
+ */
+#if defined(__GNUC__) && !defined(ML_NO_CGOTO)
+#  define ML_CGOTO 1
+#endif
+
+#ifdef ML_CGOTO
+#  define VM_CASE(N)  lbl_##N
+#  define VM_NEXT     goto *vm_optbl[static_cast<size_t>(                    \
+                          (in = &chunk.code[pc])->op)]
+   /* A VM_NEXT that must EXIT a scope holding live non-trivially-
+    * destructible locals (the call ops' cross-frame exception dispatch).
+    * clang forbids an INDIRECT goto from exiting such a scope (it cannot
+    * emit the cleanups), so these COLD sites take a DIRECT goto to a
+    * per-function trampoline that re-dispatches - destructors run, and
+    * only the cold exception path shares a dispatch point. */
+#  define VM_NEXT_COLD  goto vm_dispatch_cold
+#else
+#  define VM_CASE(N)  case OpCode::N
+   /* `continue`, not `break`: at outer case level the two are equivalent
+    * (empty loop tail), but a VM_NEXT INSIDE a handler's inner switch (the
+    * vm_raise paths in IntBin/FloatBin) must reach the dispatch loop, not
+    * fall out of the inner switch into the slot write. */
+#  define VM_NEXT       continue
+#  define VM_NEXT_COLD  continue
+#endif
+
 static bool g_vm_executing = false;
 
 /*
@@ -981,17 +1030,36 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
   vm_resume:
     try {
 
+    const Instr *in;
+
+#ifdef ML_CGOTO
+    /* The label-address dispatch table, generated in ENUM ORDER from
+     * ML_FOR_EACH_OPCODE (bytecode.h, order/coverage static-asserted
+     * there). Static: label addresses are link-time constants and the
+     * table is shared by every (recursive) activation. */
+#define ML_OP_LBLADDR(N) &&VM_CASE(N),
+    static const void *const vm_optbl[] = {
+        ML_FOR_EACH_OPCODE(ML_OP_LBLADDR)
+    };
+#undef ML_OP_LBLADDR
+    static_assert(sizeof(vm_optbl) / sizeof(vm_optbl[0])
+                      == static_cast<size_t>(OpCode::OpCount_),
+                  "vm_optbl must cover every opcode");
+  vm_dispatch_cold:      /* direct-goto re-dispatch target (VM_NEXT_COLD) */
+    VM_NEXT;
+#else
     for (; ; ) {
 
-        const Instr &in = chunk.code[pc];
+        in = &chunk.code[pc];
 
-        switch (in.op) {
+        switch (in->op) {
+#endif
 
-        case OpCode::Jump:
-            pc = in.target;
-            break;
+        VM_CASE(Jump):
+            pc = in->target;
+            VM_NEXT;
 
-        case OpCode::LoopBackEdge: {
+        VM_CASE(LoopBackEdge): {
 
             /* Mirror While/ForStmt::do_eval's post-body flow handling. */
             FlowState &fs = *ctx.flow;
@@ -1004,39 +1072,39 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
 
             case FlowState::brk:
                 fs.type = FlowState::none;
-                pc = in.target2;    /* exit loop */
+                pc = in->target2;    /* exit loop */
                 break;
 
             case FlowState::cont:
                 fs.type = FlowState::none;
-                pc = in.target;     /* continue dest */
+                pc = in->target;     /* continue dest */
                 break;
 
             default:                /* none */
-                pc = in.target;     /* continue dest */
+                pc = in->target;     /* continue dest */
                 break;
             }
 
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::IncDecCheckedV: {
+        VM_CASE(IncDecCheckedV): {
             /* A dyn/general scalar `--d`/`d++`: throw if not int/float
              * (inc-dec is int/float-ONLY), else apply +-1 in place. Slot kind:
              * 0 local / 1 global (defined-guarded) / 2 capture. */
             LValue *lvp;
-            if (in.target2 == 1) {
-                if (!ctx.gfuncs->defined[in.target]) {
+            if (in->target2 == 1) {
+                if (!ctx.gfuncs->defined[in->target]) {
                     Loc s, en;
                     chunk.loc_at(pc, s, en);
                     throw UndefinedVariableEx(
-                        ctx.gfuncs->names[in.target]->val, s, en);
+                        ctx.gfuncs->names[in->target]->val, s, en);
                 }
-                lvp = &ctx.gfuncs->slots[in.target];
-            } else if (in.target2 == 2) {
-                lvp = &(*ctx.captures)[in.target];
+                lvp = &ctx.gfuncs->slots[in->target];
+            } else if (in->target2 == 2) {
+                lvp = &(*ctx.captures)[in->target];
             } else {
-                lvp = &ctx.frame->at(in.target);
+                lvp = &ctx.frame->at(in->target);
             }
             LValue &lv = *lvp;
             EvalValue nv = lv.get();
@@ -1046,13 +1114,13 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
             }
             num_bin_op(nv, EvalValue(static_cast<int_type>(1)),
-                       binop_pmf(in.a.lit ? Op::plus : Op::minus));
+                       binop_pmf(in->a.lit ? Op::plus : Op::minus));
             lv.put(std::move(nv));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::IncDecElemCheckedV: {
+        VM_CASE(IncDecElemCheckedV): {
             /* `c[k]++` / `c[k]--` on a dyn/unproven base: form the element
              * LValue, enforce int/float, apply +-1 (statement). Base kind in
              * .target (0 loc / 1 gbl / 2 cap), base slot in .target2, key temp
@@ -1061,43 +1129,43 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * INC-DEC loc (its own NotLValue/const/TypeError) - come from the
              * incdec_sites pool (`b`); the undefined-global-base caret from
              * the loc side table (vm_store_base, node = null). */
-            const Chunk::IncDecSite &site = chunk.incdec_sites[in.b.lit];
+            const Chunk::IncDecSite &site = chunk.incdec_sites[in->b.lit];
             LValue *blv =
-                vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
-            const EvalValue &key = ctx.frame->at(in.a.slot).get();
-            vm_incdec_elem(blv, key, in.aop == Op::plus,
+                vm_store_base(ctx, in->target, in->target2, chunk, pc, nullptr);
+            const EvalValue &key = ctx.frame->at(in->a.slot).get();
+            vm_incdec_elem(blv, key, in->aop == Op::plus,
                            site.lstart, site.lend, site.istart, site.iend);
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::IncDecChainV:
-            vm_incdec_chain_op(ctx, chunk, in, pc);
+        VM_CASE(IncDecChainV):
+            vm_incdec_chain_op(ctx, chunk, *in, pc);
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::IncDecMemberCheckedV: {
+        VM_CASE(IncDecMemberCheckedV): {
             /* `d.f++` / `d.f--` on a dyn/unproven base: form the member LValue
              * (struct field / dict value), enforce int/float, apply +-1.
              * AST-FREE: the member key + its TWO carets - the MEMBER loc (a
              * KeyNotFound) vs the INC-DEC loc (its own NotLValue/const/
              * TypeError) - come from the incdec_sites pool (`b`). */
-            const Chunk::IncDecSite &site = chunk.incdec_sites[in.b.lit];
+            const Chunk::IncDecSite &site = chunk.incdec_sites[in->b.lit];
             LValue *blv =
-                vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
-            vm_incdec_member(blv, site.memId, site.memUid, in.aop == Op::plus,
+                vm_store_base(ctx, in->target, in->target2, chunk, pc, nullptr);
+            vm_incdec_member(blv, site.memId, site.memUid, in->aop == Op::plus,
                              site.lstart, site.lend, site.istart, site.iend);
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::IntBin: {
+        VM_CASE(IntBin): {
 
-            const int_type a = read_int_operand(in.a, &ctx);
-            const int_type b = read_int_operand(in.b, &ctx);
+            const int_type a = read_int_operand(in->a, &ctx);
+            const int_type b = read_int_operand(in->b, &ctx);
             int_type r;
 
-            switch (in.aop) {
+            switch (in->aop) {
             case Op::plus:  r = a + b; break;
             case Op::minus: r = a - b; break;
             case Op::times: r = a * b; break;
@@ -1105,14 +1173,14 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 if (b == 0) {
                     vm_raise(chunk, pc, handlers, vm_exc,
                              std::make_unique<DivisionByZeroEx>());
-                    continue;          /* native-dispatched: skip the write */
+                    VM_NEXT;          /* native-dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
                 if (b == 0) {
                     vm_raise(chunk, pc, handlers, vm_exc,
                              std::make_unique<DivisionByZeroEx>());
-                    continue;
+                    VM_NEXT;
                 }
                 r = a % b; break;
             case Op::band: r = a & b;          break;
@@ -1124,18 +1192,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             default: throw InternalErrorEx();
             }
 
-            write_int_slot(&ctx, in.target, r);
+            write_int_slot(&ctx, in->target, r);
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::JumpUnlessIntCmp: {
+        VM_CASE(JumpUnlessIntCmp): {
 
-            const int_type a = read_int_operand(in.a, &ctx);
-            const int_type b = read_int_operand(in.b, &ctx);
+            const int_type a = read_int_operand(in->a, &ctx);
+            const int_type b = read_int_operand(in->b, &ctx);
             bool cond;
 
-            switch (in.aop) {
+            switch (in->aop) {
             case Op::lt: cond = a <  b; break;
             case Op::gt: cond = a >  b; break;
             case Op::le: cond = a <= b; break;
@@ -1147,17 +1215,17 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (cond)
                 pc++;
             else
-                pc = in.target;
-            break;
+                pc = in->target;
         }
+        VM_NEXT;
 
-        case OpCode::FloatBin: {
+        VM_CASE(FloatBin): {
 
-            const float_type a = read_float_operand(in.a, &ctx);
-            const float_type b = read_float_operand(in.b, &ctx);
+            const float_type a = read_float_operand(in->a, &ctx);
+            const float_type b = read_float_operand(in->b, &ctx);
             float_type r;
 
-            switch (in.aop) {
+            switch (in->aop) {
             case Op::plus:  r = a + b; break;
             case Op::minus: r = a - b; break;
             case Op::times: r = a * b; break;
@@ -1165,31 +1233,31 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 if (b == 0.0) {
                     vm_raise(chunk, pc, handlers, vm_exc,
                              std::make_unique<DivisionByZeroEx>());
-                    continue;          /* native-dispatched: skip the write */
+                    VM_NEXT;          /* native-dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
                 if (b == 0.0) {
                     vm_raise(chunk, pc, handlers, vm_exc,
                              std::make_unique<DivisionByZeroEx>());
-                    continue;
+                    VM_NEXT;
                 }
                 r = std::fmod(a, b); break;
             default: throw InternalErrorEx();
             }
 
-            write_float_slot(&ctx, in.target, r);
+            write_float_slot(&ctx, in->target, r);
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::JumpUnlessFloatCmp: {
+        VM_CASE(JumpUnlessFloatCmp): {
 
-            const float_type a = read_float_operand(in.a, &ctx);
-            const float_type b = read_float_operand(in.b, &ctx);
+            const float_type a = read_float_operand(in->a, &ctx);
+            const float_type b = read_float_operand(in->b, &ctx);
             bool cond;
 
-            switch (in.aop) {
+            switch (in->aop) {
             case Op::lt: cond = a <  b; break;
             case Op::gt: cond = a >  b; break;
             case Op::le: cond = a <= b; break;
@@ -1201,24 +1269,24 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (cond)
                 pc++;
             else
-                pc = in.target;
-            break;
+                pc = in->target;
         }
+        VM_NEXT;
 
-        case OpCode::ForLoopStep: {
+        VM_CASE(ForLoopStep): {
 
             /* i += step (or -=); if (i <aop> bound) loop back, else exit. One
              * dispatch for the whole counter (see bytecode.h). */
-            LValue &ilv = ctx.frame->at(in.target2);
+            LValue &ilv = ctx.frame->at(in->target2);
             int_type i = ilv.getval<int_type>();
-            const int_type step = read_int_operand(in.b, &ctx);
+            const int_type step = read_int_operand(in->b, &ctx);
 
-            i = (in.aop == Op::lt || in.aop == Op::le) ? i + step : i - step;
+            i = (in->aop == Op::lt || in->aop == Op::le) ? i + step : i - step;
             ilv.getval<int_type>() = i;   /* counter slot always holds int */
 
-            const int_type bound = read_int_operand(in.a, &ctx);
+            const int_type bound = read_int_operand(in->a, &ctx);
             bool go;
-            switch (in.aop) {
+            switch (in->aop) {
             case Op::lt: go = i <  bound; break;
             case Op::le: go = i <= bound; break;
             case Op::ge: go = i >= bound; break;
@@ -1226,20 +1294,20 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             }
 
             if (go)
-                pc = in.target;
+                pc = in->target;
             else
                 pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LoadElemInt: {
+        VM_CASE(LoadElemInt): {
 
             /* a[i] into a temp (mirrors Subscript::eval_int for a flat array;
              * a dict / general base falls back to the node). */
-            const EvalValue &base = ctx.frame->at(in.target2).get();
+            const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in.a, &ctx);
+                int_type idx = read_int_operand(in->a, &ctx);
                 if (idx < 0)
                     idx += arr.size();
                 if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
@@ -1255,7 +1323,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     v = arr.flat_bools()[at] ? 1 : 0;
                 else
                     v = arr.get_vec()[at].getval<int_type>();
-                write_int_slot(&ctx, in.target, v);
+                write_int_slot(&ctx, in->target, v);
             } else {
                 /* base_array is PROVEN at this op, so the base is always an
                  * array here - the old node->eval_int fallback was unreachable
@@ -1263,15 +1331,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw InternalErrorEx();
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LoadElemFloat: {
+        VM_CASE(LoadElemFloat): {
 
-            const EvalValue &base = ctx.frame->at(in.target2).get();
+            const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in.a, &ctx);
+                int_type idx = read_int_operand(in->a, &ctx);
                 if (idx < 0)
                     idx += arr.size();
                 if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
@@ -1287,41 +1355,41 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     v = static_cast<float_type>(arr.flat_ints()[at]);
                 else
                     v = arr.get_vec()[at].getval<float_type>();
-                write_float_slot(&ctx, in.target, v);
+                write_float_slot(&ctx, in->target, v);
             } else {
                 throw InternalErrorEx();   /* unreachable: base_array proven */
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LoadElemBool: {
+        VM_CASE(LoadElemBool): {
             /* bool-foreach loop var: bind a[i] as a real BOOL (not 0/1), so
              * `print(x)` shows true/false. `i` is loop-bounded (< ArrLen); the
              * base is a proven flat array<bool> (elem_is_bool). */
             const SharedArrayObj &arr =
-                ctx.frame->at(in.target2).get().get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in.a, &ctx);
+                ctx.frame->at(in->target2).get().get_ref<SharedArrayObj>();
+            const int_type idx = read_int_operand(in->a, &ctx);
             const bool b =
                 arr.skind() == SharedArrayObj::Storage::bools
                     ? arr.flat_bools()[arr.offset() + idx] != 0
                     : arr.get_view()[idx].get().get<bool>();  /* general fallbk */
-            ctx.frame->at(in.target).put(EvalValue(b));
+            ctx.frame->at(in->target).put(EvalValue(b));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LoadElemValue: {
+        VM_CASE(LoadElemValue): {
 
             /* a[i] (an array-valued element of a GENERAL array) into a temp
              * slot, so a 2-D read `a[i][k]` is native (both indices). The base
              * is a PROVEN general array (base_array + a general element type),
              * so the old non-general node->eval fallback was unreachable. */
-            const EvalValue &base = ctx.frame->at(in.target2).get();
+            const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::general) {
-                    int_type idx = read_int_operand(in.a, &ctx);
+                    int_type idx = read_int_operand(in->a, &ctx);
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
@@ -1329,67 +1397,67 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                         chunk.loc_at(pc, ls, le);
                         throw OutOfBoundsEx(ls, le);
                     }
-                    ctx.frame->at(in.target).put(
+                    ctx.frame->at(in->target).put(
                         arr.get_vec()[arr.offset() + idx].get());
                     pc++;
-                    break;
+                    VM_NEXT;
                 }
             }
             throw InternalErrorEx();   /* unreachable: base_array general proven */
         }
 
-        case OpCode::DictIterInit: {
+        VM_CASE(DictIterInit): {
 
             /* Pin the dict (an intrusive_ptr copy keeps it alive for the loop,
              * matching the tree-walker's lifetime-extended `cval`) and set the
              * live iterator to begin(). The inferencer proved a Dict static
              * type; the ML_VM_CHECKs are the hardening net. */
-            ML_VM_CHECK(in.target >= 0
-                && static_cast<size_t>(in.target) < dict_iters.size());
-            const EvalValue &base = ctx.frame->at(in.target2).get();
+            ML_VM_CHECK(in->target >= 0
+                && static_cast<size_t>(in->target) < dict_iters.size());
+            const EvalValue &base = ctx.frame->at(in->target2).get();
             ML_VM_CHECK(base.is<intrusive_ptr<DictObject>>());
-            DictIterState &st = dict_iters[in.target];
+            DictIterState &st = dict_iters[in->target];
             st.dict = base.get<intrusive_ptr<DictObject>>();
             st.it = st.dict->get_ref().begin();
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::DictIterNext: {
+        VM_CASE(DictIterNext): {
 
             /* Test the live iterator: on end jump to end_pc; else bind the key
              * (and value) box-free - a plain EvalValue copy (LoadElemValue),
              * matching the tree-walker's `elems = {p.first, p.second.get()}` -
              * then advance. A slot of -1 is a `_` placeholder / the keys-only
              * 1-var form (bind nothing). */
-            ML_VM_CHECK(in.target2 >= 0
-                && static_cast<size_t>(in.target2) < dict_iters.size());
-            DictIterState &st = dict_iters[in.target2];
+            ML_VM_CHECK(in->target2 >= 0
+                && static_cast<size_t>(in->target2) < dict_iters.size());
+            DictIterState &st = dict_iters[in->target2];
             if (st.it == st.dict->get_ref().end()) {
-                pc = static_cast<size_t>(in.target);
-                break;
+                pc = static_cast<size_t>(in->target);
+                VM_NEXT;
             }
-            if (in.a.slot >= 0)
-                ctx.frame->at(in.a.slot).put(st.it->first);
-            if (in.b.slot >= 0)
-                ctx.frame->at(in.b.slot).put(st.it->second.get());
+            if (in->a.slot >= 0)
+                ctx.frame->at(in->a.slot).put(st.it->first);
+            if (in->b.slot >= 0)
+                ctx.frame->at(in->b.slot).put(st.it->second.get());
             ++st.it;
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::ForeachDynInit: {
+        VM_CASE(ForeachDynInit): {
             /* Dispatch the DYN container once: pin it, record the loop shape
              * (nvars | indexed, the per-var target slots from the
              * unpack_targets pool), and set up an array or dict cursor. An
              * unsupported runtime value throws (loc side table). */
-            ML_VM_CHECK(in.target >= 0
-                && static_cast<size_t>(in.target) < dyn_iters.size());
-            DynIterState &st = dyn_iters[in.target];
-            st.container = ctx.frame->at(in.target2).get();
-            st.nvars = static_cast<int>(in.a.lit & 0xff);
-            st.indexed = (in.a.lit >> 8) != 0;
-            st.targets = &chunk.unpack_targets[in.b.lit];
+            ML_VM_CHECK(in->target >= 0
+                && static_cast<size_t>(in->target) < dyn_iters.size());
+            DynIterState &st = dyn_iters[in->target];
+            st.container = ctx.frame->at(in->target2).get();
+            st.nvars = static_cast<int>(in->a.lit & 0xff);
+            st.indexed = (in->a.lit >> 8) != 0;
+            st.targets = &chunk.unpack_targets[in->b.lit];
             st.counter = 0;
             if (st.container.is<SharedArrayObj>()) {
                 st.is_dict = false;
@@ -1406,10 +1474,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     "foreach: expected an array or dict", s, en);
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::ForeachDynNext: {
+        VM_CASE(ForeachDynNext): {
             /* On exhaustion jump to end_pc; else bind the loop vars from the
              * state (targets slots, -1 == `_` skipped) exactly as do_iter:
              * `indexed` binds targets[0] = the counter; an ARRAY element binds
@@ -1417,9 +1485,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * unpacks an array element into the N remaining vars; a DICT
              * binds key [, value [, none...]] (do_iter's count=2 padding).
              * Then advance. */
-            ML_VM_CHECK(in.target2 >= 0
-                && static_cast<size_t>(in.target2) < dyn_iters.size());
-            DynIterState &st = dyn_iters[in.target2];
+            ML_VM_CHECK(in->target2 >= 0
+                && static_cast<size_t>(in->target2) < dyn_iters.size());
+            DynIterState &st = dyn_iters[in->target2];
             const std::vector<int32_t> &tg = *st.targets;
             const size_t tb = st.indexed ? 1 : 0;    /* first value var */
             const size_t nv = static_cast<size_t>(st.nvars) - tb;
@@ -1429,8 +1497,8 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             };
             if (!st.is_dict) {
                 if (st.idx >= st.size) {
-                    pc = static_cast<size_t>(in.target);
-                    break;
+                    pc = static_cast<size_t>(in->target);
+                    VM_NEXT;
                 }
                 if (st.indexed)
                     bind(0, EvalValue(
@@ -1449,16 +1517,17 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     if (sub.size() != static_cast<size_type>(nv))
                         vm_throw_unpack_len(chunk, pc, sub.size(),
                                             static_cast<int>(nv));
-                    for (size_t i = 0; i < nv; i++)
+                    for (size_t i = 0; i < nv; i++) {
                         bind(tb + i, vm_arr_elem(elem,
                                                  static_cast<size_type>(i)));
+                }
                 }
                 st.idx++;
             } else {
                 DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
                 if (st.it == d.get_ref().end()) {
-                    pc = static_cast<size_t>(in.target);
-                    break;
+                    pc = static_cast<size_t>(in->target);
+                    VM_NEXT;
                 }
                 if (st.indexed)
                     bind(0, EvalValue(st.counter++));
@@ -1468,17 +1537,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     bind(tb, st.it->first);
                 if (nv >= 2)
                     bind(tb + 1, st.it->second.get());
-                for (size_t i = 2; i < nv; i++)
+                for (size_t i = 2; i < nv; i++) {
                     bind(tb + i, none);
+                }
                 ++st.it;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::UnpackElemInt:
-        case OpCode::UnpackElemFloat:
-        case OpCode::UnpackElemValue: {
+        VM_CASE(UnpackElemInt):
+        VM_CASE(UnpackElemFloat):
+        VM_CASE(UnpackElemValue): {
 
             /* STRICT foreach-unpack: read pairs[i] (a general outer element = a
              * sub-array), check it is an array of EXACTLY N, write its N scalars
@@ -1486,15 +1556,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * do_iter's strict destructure element for element. `i` is the loop
              * counter (in-range), so the outer read never OOB; the only throws
              * are the two strict errors. */
-            const bool is_int = in.op == OpCode::UnpackElemInt;
-            const bool is_float = in.op == OpCode::UnpackElemFloat;
-            const EvalValue &base_v = ctx.frame->at(in.target2).get();
+            const bool is_int = in->op == OpCode::UnpackElemInt;
+            const bool is_float = in->op == OpCode::UnpackElemFloat;
+            const EvalValue &base_v = ctx.frame->at(in->target2).get();
             ML_VM_CHECK(base_v.is<SharedArrayObj>());
             const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in.a, &ctx);
+            const int_type idx = read_int_operand(in->a, &ctx);
             const EvalValue &elem =
                 outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in.b.lit;
+            const int_type N = in->b.lit;
             if (!elem.is<SharedArrayObj>())
                 vm_throw_unpack_nonarray(chunk, pc, N);
             const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
@@ -1503,13 +1573,15 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             const size_type off = sub.offset();
             const auto sk = sub.skind();
             if (is_int && sk == SharedArrayObj::Storage::ints) {
-                for (int_type k = 0; k < N; k++)
-                    write_int_slot(&ctx, in.target + k,
+                for (int_type k = 0; k < N; k++) {
+                    write_int_slot(&ctx, in->target + k,
                                    sub.flat_ints()[off + k]);
+                }
             } else if (is_float && sk == SharedArrayObj::Storage::floats) {
-                for (int_type k = 0; k < N; k++)
-                    write_float_slot(&ctx, in.target + k,
+                for (int_type k = 0; k < N; k++) {
+                    write_float_slot(&ctx, in->target + k,
                                      sub.flat_floats()[off + k]);
+                }
             } else {
                 /* UnpackElemValue (a general/dyn/str/mixed sub-array), OR a flat
                  * op whose sub-array's storage is NOT the expected kind (a
@@ -1519,42 +1591,44 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                  * boxed value (vm_arr_elem is skind-dispatched) - byte-identical
                  * to do_iter's bind_loop_var, so an int stays int / a str stays
                  * str. */
-                for (int_type k = 0; k < N; k++)
-                    ctx.frame->at(in.target + k).put(
+                for (int_type k = 0; k < N; k++) {
+                    ctx.frame->at(in->target + k).put(
                         vm_arr_elem(elem, static_cast<size_type>(k)));
+                }
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::UnpackElemTargets: {
+        VM_CASE(UnpackElemTargets): {
             /* STRICT foreach-unpack with a per-position target list (a `_`
              * placeholder / non-consecutive slots): read pairs[i] (a general
              * outer element = a sub-array), check length == N, then bind each
              * element box-free (vm_arr_elem) to targets[k] (skip -1 == `_`). */
-            const EvalValue &base_v = ctx.frame->at(in.target2).get();
+            const EvalValue &base_v = ctx.frame->at(in->target2).get();
             ML_VM_CHECK(base_v.is<SharedArrayObj>());
             const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in.a, &ctx);
+            const int_type idx = read_int_operand(in->a, &ctx);
             const EvalValue &elem =
                 outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in.b.lit;
+            const int_type N = in->b.lit;
             if (!elem.is<SharedArrayObj>())
                 vm_throw_unpack_nonarray(chunk, pc, N);
             const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
             if (sub.size() != static_cast<size_type>(N))
                 vm_throw_unpack_len(chunk, pc, sub.size(), N);
             const std::vector<int32_t> &targets =
-                chunk.unpack_targets[in.target];
-            for (int_type k = 0; k < N; k++)
+                chunk.unpack_targets[in->target];
+            for (int_type k = 0; k < N; k++) {
                 if (targets[k] >= 0)
                     ctx.frame->at(targets[k]).put(
                         vm_arr_elem(elem, static_cast<size_type>(k)));
+                }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreElemInt: {
+        VM_CASE(StoreElemInt): {
 
             /* a[i] = v / a[i] OP= v for a flat mutable int array (mirrors the
              * int path of try_flat_subscript_store, COW), and a[i] = <bool>
@@ -1565,27 +1639,28 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * fallback (box the already-computed index/value operands, map the
              * base op back to its Expr14 op) - AST-free and byte-identical to
              * the tree-walker (the same path StoreElemValue uses). The base may
-             * be a global/capture array (in.target = the slot kind); the caret
+             * be a global/capture array (in->target = the slot kind); the caret
              * comes from the loc side table - looked up LAZILY, only on the cold
              * throw/fallback paths, so the hot store pays no binary search. */
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
+                *vm_store_base(ctx, in->target, in->target2, chunk, pc,
+                               nullptr);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 const auto sk = arr.skind();
                 const bool is_bool = sk == SharedArrayObj::Storage::bools;
                 if ((sk == SharedArrayObj::Storage::ints
-                     || (is_bool && in.aop == Op::invalid))
+                     || (is_bool && in->aop == Op::invalid))
                     && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in.a, &ctx);
+                    int_type idx = read_int_operand(in->a, &ctx);
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
                         vm_throw_oob(chunk, pc);
-                    const int_type rhs = read_int_operand(in.b, &ctx);
+                    const int_type rhs = read_int_operand(in->b, &ctx);
                     /* div/mod by zero throws BEFORE any clone (tree-walker
                      * throws during the op eval, before the COW). */
-                    if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0)
+                    if ((in->aop == Op::div || in->aop == Op::mod) && rhs == 0)
                         vm_throw_div0(chunk, pc);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
@@ -1595,10 +1670,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                         arr.flat_bools()[arr.offset() + idx] = rhs ? 1 : 0;
                         arr.invalidate_hash();
                         pc++;
-                        break;
+                        VM_NEXT;
                     }
                     int_type &el = arr.flat_ints()[arr.offset() + idx];
-                    switch (in.aop) {
+                    switch (in->aop) {
                     case Op::invalid: el = rhs;  break;
                     case Op::plus:    el += rhs; break;
                     case Op::minus:   el -= rhs; break;
@@ -1609,44 +1684,47 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     }
                     arr.invalidate_hash();
                     pc++;
-                    break;
+                    VM_NEXT;
                 }
             }
             {
                 Loc ls, le;
                 chunk.loc_at(pc, ls, le);
-                vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
-                                   EvalValue(read_int_operand(in.b, &ctx)),
-                                   vm_base_to_expr14_op(in.aop), ls, le);
+                vm_subscript_store(&alv,
+                                   EvalValue(read_int_operand(in->a, &ctx)),
+                                   EvalValue(read_int_operand(in->b, &ctx)),
+                                   vm_base_to_expr14_op(in->aop), ls, le);
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreElemFloat: {
+        VM_CASE(StoreElemFloat): {
 
             /* Caret from the loc side table, looked up LAZILY on the cold
              * throw/fallback paths only (see StoreElemInt). */
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
+                *vm_store_base(ctx, in->target, in->target2, chunk, pc,
+                               nullptr);
             if (alv.is<SharedArrayObj>()) {
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::floats
                     && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in.a, &ctx);
+                    int_type idx = read_int_operand(in->a, &ctx);
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
                         vm_throw_oob(chunk, pc);
-                    const float_type rhs = read_float_operand(in.b, &ctx);
-                    if ((in.aop == Op::div || in.aop == Op::mod) && rhs == 0.0)
+                    const float_type rhs = read_float_operand(in->b, &ctx);
+                    if ((in->aop == Op::div || in->aop == Op::mod)
+                            && rhs == 0.0)
                         vm_throw_div0(chunk, pc);
                     if (arr.is_slice())
                         arr.clone_internal_vec();
                     else if (arr.use_count() > 1)
                         arr.clone_aliased_slices(arr.offset() + idx);
                     float_type &el = arr.flat_floats()[arr.offset() + idx];
-                    switch (in.aop) {
+                    switch (in->aop) {
                     case Op::invalid: el = rhs;               break;
                     case Op::plus:    el += rhs;              break;
                     case Op::minus:   el -= rhs;              break;
@@ -1657,21 +1735,22 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     }
                     arr.invalidate_hash();
                     pc++;
-                    break;
+                    VM_NEXT;
                 }
             }
             {
                 Loc ls, le;
                 chunk.loc_at(pc, ls, le);
-                vm_subscript_store(&alv, EvalValue(read_int_operand(in.a, &ctx)),
-                                   EvalValue(read_float_operand(in.b, &ctx)),
-                                   vm_base_to_expr14_op(in.aop), ls, le);
+                vm_subscript_store(&alv,
+                                   EvalValue(read_int_operand(in->a, &ctx)),
+                                   EvalValue(read_float_operand(in->b, &ctx)),
+                                   vm_base_to_expr14_op(in->aop), ls, le);
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::DictStore: {
+        VM_CASE(DictStore): {
 
             /* d[k] = v / d[k] OP= v (P2): store via the shared, type-dispatched
              * vm_subscript_store (auto-vivify / COW / key-freeze / throw -
@@ -1680,36 +1759,37 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * (`d[k]`) comes from the loc side table (recorded by extract_locs
              * from node = the Subscript). */
             LValue &dlv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
-            const EvalValue &key = ctx.frame->at(in.a.slot).get();
-            const EvalValue &val = ctx.frame->at(in.b.slot).get();
+                *vm_store_base(ctx, in->target, in->target2, chunk, pc,
+                               nullptr);
+            const EvalValue &key = ctx.frame->at(in->a.slot).get();
+            const EvalValue &val = ctx.frame->at(in->b.slot).get();
             /* Loc looked up LAZILY on the throw path only (a successful store -
              * the hot case - pays no loc_at binary search); vm_subscript_store
              * uses it only when it throws. */
             try {
-                vm_subscript_store(&dlv, key, val, in.aop, Loc(), Loc());
+                vm_subscript_store(&dlv, key, val, in->aop, Loc(), Loc());
             } catch (Exception &e) {
                 if (!e.loc_start)
                     chunk.loc_at(pc, e.loc_start, e.loc_end);
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreMemberV: {
+        VM_CASE(StoreMemberV): {
             /* s.member = v / s.member OP= v for a STRUCT base (a dict member
              * store uses DictStore). vm_member_store does the POD/boxed-field
              * store; AST-free - the member uid + carets come from the pool. */
-            const Chunk::MemberKey &mk = chunk.member_keys[in.a.lit];
-            const EvalValue &val = ctx.frame->at(in.b.slot).get();
+            const Chunk::MemberKey &mk = chunk.member_keys[in->a.lit];
+            const EvalValue &val = ctx.frame->at(in->b.slot).get();
             try {
                 /* base inside the try so an undefined-global throw is stamped
-                 * with the member caret; base may be global/capture (in.target
+                 * with the member caret; base may be global/capture (in->target
                  * = kind). */
-                LValue *blv = vm_store_base(ctx, in.target, in.target2,
+                LValue *blv = vm_store_base(ctx, in->target, in->target2,
                                             chunk, pc, nullptr);
-                vm_member_store(blv, mk.memUid, in.aop, val,
+                vm_member_store(blv, mk.memUid, in->aop, val,
                                 mk.mstart, mk.mend, mk.bstart, mk.bend);
             } catch (Exception &e) {
                 if (!e.loc_start) {          /* a compound div/mod is loc-less */
@@ -1719,86 +1799,87 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreElemValue: {
+        VM_CASE(StoreElemValue): {
 
             /* a[i] = v / a[i] OP= v for a GENERAL array (P4): store via the
              * shared, type-dispatched vm_subscript_store (bounds check + COW +
              * slot_rmw - matches the tree-walker for ANY base). AST-free: the
              * subscript's caret comes from the loc side table. */
             LValue &alv =
-                *vm_store_base(ctx, in.target, in.target2, chunk, pc, nullptr);
-            const EvalValue &idx = ctx.frame->at(in.a.slot).get();
-            const EvalValue &val = ctx.frame->at(in.b.slot).get();
+                *vm_store_base(ctx, in->target, in->target2, chunk, pc,
+                               nullptr);
+            const EvalValue &idx = ctx.frame->at(in->a.slot).get();
+            const EvalValue &val = ctx.frame->at(in->b.slot).get();
             /* Loc looked up LAZILY on the throw path only (see DictStore). */
             try {
-                vm_subscript_store(&alv, idx, val, in.aop, Loc(), Loc());
+                vm_subscript_store(&alv, idx, val, in->aop, Loc(), Loc());
             } catch (Exception &e) {
                 if (!e.loc_start)
                     chunk.loc_at(pc, e.loc_start, e.loc_end);
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreElem2V: {
+        VM_CASE(StoreElem2V): {
 
             /* a[i][j] = v / OP= v (nested general store): read a[i] as a
              * reference then store [j] into it (two-level vm_subscript_store).
              * AST-free: the per-step carets (inner k1, outer k2) come from the
              * chain_locs pool (idx in a.lit), so an intermediate `a[i]` OOB and
              * the final store carry their OWN subscript loc. */
-            LValue &alv = ctx.frame->at(in.target2);
-            const EvalValue &k1 = ctx.frame->at(in.a.slot).get();
-            const EvalValue &k2 = ctx.frame->at(in.b.slot).get();
-            const EvalValue &val = ctx.frame->at(in.target).get();
-            vm_nested_subscript_store(&alv, k1, k2, val, in.aop,
-                                      chunk.chain_locs[in.a.lit].data());
+            LValue &alv = ctx.frame->at(in->target2);
+            const EvalValue &k1 = ctx.frame->at(in->a.slot).get();
+            const EvalValue &k2 = ctx.frame->at(in->b.slot).get();
+            const EvalValue &val = ctx.frame->at(in->target).get();
+            vm_nested_subscript_store(&alv, k1, k2, val, in->aop,
+                                      chunk.chain_locs[in->a.lit].data());
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreElemChainV: {
+        VM_CASE(StoreElemChainV): {
             /* GENERIC N-level nested store a[k0][k1]...[kn] = v / OP= v: form the
              * base LValue* (by slot kind = a.lit), then walk the keys run
              * ([b.lit, +nkeys)). AST-free: the per-step subscript carets are in
              * the chain_locs pool (idx in a.slot; nkeys = its size), so each
              * step's throw carries ITS OWN subscript loc. */
-            LValue *base = vm_store_base(ctx, in.a.lit, in.target2,
+            LValue *base = vm_store_base(ctx, in->a.lit, in->target2,
                                          chunk, pc, nullptr);
-            const EvalValue &val = ctx.frame->at(in.target).get();
-            const auto &cl = chunk.chain_locs[in.a.slot];
-            vm_chain_store_op(ctx, base, in.b.lit, cl.data(), cl.size(),
-                              val, in.aop);
+            const EvalValue &val = ctx.frame->at(in->target).get();
+            const auto &cl = chunk.chain_locs[in->a.slot];
+            vm_chain_store_op(ctx, base, in->b.lit, cl.data(), cl.size(),
+                              val, in->aop);
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreLValueChainV: {
+        VM_CASE(StoreLValueChainV): {
             /* GENERAL nested store `base.step1.step2... = v` mixing MEMBER +
              * SUBSCRIPT steps. Form the base LValue* (by slot kind = a.lit),
              * walk the steps (chain_steps pool idx = a.slot), store the final.
              * AST-free: all carets come from the loc side table (the outer
              * lvalue node), matching StoreElemChainV. */
-            LValue *base = vm_store_base(ctx, in.a.lit, in.target2,
+            LValue *base = vm_store_base(ctx, in->a.lit, in->target2,
                                          chunk, pc, nullptr);
-            const EvalValue &val = ctx.frame->at(in.target).get();
+            const EvalValue &val = ctx.frame->at(in->target).get();
             try {
-                vm_chain_lvalue_store_op(ctx, chunk, base, in.a.slot, val,
-                                         in.aop);
+                vm_chain_lvalue_store_op(ctx, chunk, base, in->a.slot, val,
+                                         in->aop);
             } catch (Exception &e) {
                 if (!e.loc_start)
                     chunk.loc_at(pc, e.loc_start, e.loc_end);
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::MultiUnpackV: {
+        VM_CASE(MultiUnpackV): {
 
             /* Multi-assign `a, b, c = <rvalue>` (F-1): the tree-walker's STRICT
              * destructure, AST-free. An ARRAY rvalue must have EXACTLY as many
@@ -1806,17 +1887,18 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * side table); each element (box-free for a flat scalar via
              * vm_arr_elem) writes to its target slot (-1 == `_`, skipped). A
              * NON-array rvalue SPREADS to every target. */
-            const EvalValue &rval = ctx.frame->at(in.a.slot).get();
-            const std::vector<int32_t> &targets = chunk.unpack_targets[in.target];
+            const EvalValue &rval = ctx.frame->at(in->a.slot).get();
+            const std::vector<int32_t> &targets =
+                chunk.unpack_targets[in->target];
             /* Typed targets (R5): a PLAIN assign coerces each stored value
              * per target (widen / dyn-narrowing throw, Expr14-span caret);
              * a compound doesn't coerce. Kinds from the unpack_coerce pool. */
             const std::vector<unsigned char> *coerce =
-                in.b.is_lit ? &chunk.unpack_coerce[in.b.lit] : nullptr;
-            /* A COMPOUND `a, b OP= rhs` (in.aop != invalid): each target reads
+                in->b.is_lit ? &chunk.unpack_coerce[in->b.lit] : nullptr;
+            /* A COMPOUND `a, b OP= rhs` (in->aop != invalid): each target reads
              * its CURRENT value, applies the op with its element/scalar, writes
              * back — else a plain distribute. */
-            const bool compound = in.aop != Op::invalid;
+            const bool compound = in->aop != Op::invalid;
             size_t ti = 0;
             auto store = [&](int32_t t, const EvalValue &v) {
                 if (!compound) {
@@ -1835,7 +1917,7 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 }
                 EvalValue nv = ctx.frame->at(t).get();
                 try {
-                    num_bin_op(nv, v, binop_pmf(in.aop));
+                    num_bin_op(nv, v, binop_pmf(in->aop));
                 } catch (Exception &e) {
                     vm_stamp_loc(chunk, pc, e);
                     throw;
@@ -1860,35 +1942,35 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 }
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::DictLoadInt:
-        case OpCode::DictLoadFloat: {
+        VM_CASE(DictLoadInt):
+        VM_CASE(DictLoadFloat): {
 
             /* Typed dict scalar read d[k] / d.k (P3), AST-FREE (foundation 2):
-             * the KEY comes from the CONST POOL for a member `d.k` (in.a is an
+             * the KEY comes from the CONST POOL for a member `d.k` (in->a is an
              * immediate = the consts index of the interned name) or from a temp
-             * slot for a subscript `d[k]` (in.a is a slot) - distinguished by
-             * in.a.is_lit, no `node`. A PRESENT key reads the scalar via
+             * slot for a subscript `d[k]` (in->a is a slot) - distinguished by
+             * in->a.is_lit, no `node`. A PRESENT key reads the scalar via
              * dict_present_value (hot); a MISSING key / non-dict base goes
              * through the shared Type::subscript (the tree-walker's exact
              * default-dict insert / KeyNotFoundEx / not-subscriptable logic),
              * its loc taken from the loc side table, NOT node->eval. */
-            const bool is_int = in.op == OpCode::DictLoadInt;
-            const EvalValue &key = in.a.is_lit
-                ? chunk.consts[in.a.lit]
-                : ctx.frame->at(in.a.slot).get();
-            const EvalValue &base = ctx.frame->at(in.target2).get();
+            const bool is_int = in->op == OpCode::DictLoadInt;
+            const EvalValue &key = in->a.is_lit
+                ? chunk.consts[in->a.lit]
+                : ctx.frame->at(in->a.slot).get();
+            const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<intrusive_ptr<DictObject>>())
                 if (const EvalValue *v = dict_present_value(
                         base.get_ref<intrusive_ptr<DictObject>>(), key)) {
-                    write_scalar_slot(&ctx, in.target, is_int, *v);
+                    write_scalar_slot(&ctx, in->target, is_int, *v);
                     pc++;
-                    break;
+                    VM_NEXT;
                 }
             /* cold: missing key (default insert / throw) or a non-dict base. */
-            LValue &dlv = ctx.frame->at(in.target2);
+            LValue &dlv = ctx.frame->at(in->target2);
             EvalValue r;
             try {
                 r = base.get_type()->subscript(EvalValue(&dlv), key, false);
@@ -1896,32 +1978,33 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
-            write_scalar_slot(&ctx, in.target, is_int,
+            write_scalar_slot(&ctx, in->target, is_int,
                               r.is<LValue *>() ? r.get<LValue *>()->get() : r);
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CallBuiltinV: {
+        VM_CASE(CallBuiltinV): {
 
             /* Native builtin call (value ABI): copy the pre-evaluated args from
              * the register run into a buffer and call func_v with the AST-free
              * ArgLocs (carets/hint) from the builtin_calls pool - NO node. The
              * try/catch stamps the args-list loc onto a loc-less error, exactly
              * as DirectBuiltinCallExpr::do_eval does. */
-            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.target2];
-            const int_type base = in.a.lit, n = in.b.lit;
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in->target2];
+            const int_type base = in->a.lit, n = in->b.lit;
             try {
                 if (n <= 8) {
                     EvalValue stackbuf[8];
-                    for (int_type i = 0; i < n; i++)
+                    for (int_type i = 0; i < n; i++) {
                         stackbuf[i] = ctx.frame->at(base + i).get();
-                    ArgLocs al = chunk.arglocs_at(in.target2);
-                    ctx.frame->at(in.target).put(
+                }
+                    ArgLocs al = chunk.arglocs_at(in->target2);
+                    ctx.frame->at(in->target).put(
                         bc.builtin.func_v(&ctx, &al, stackbuf, n));
                 } else {
-                    ctx.frame->at(in.target).put(
-                        vm_call_builtin_big(ctx, chunk, in.target2, base, n));
+                    ctx.frame->at(in->target).put(
+                        vm_call_builtin_big(ctx, chunk, in->target2, base, n));
                 }
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -1931,68 +2014,68 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::MakeArrayV: {
+        VM_CASE(MakeArrayV): {
 
             /* Build an array LITERAL via vm_make_array (its element buffer is
              * kept OUT of vm_run_chunk's frame - see that helper; the frame is
              * multiplied by VM recursion depth). `target2` = the ArrHint; never
              * throws. */
-            ctx.frame->at(in.target).put(vm_make_array(
-                ctx, in.a.lit, in.b.lit, static_cast<ArrHint>(in.target2)));
+            ctx.frame->at(in->target).put(vm_make_array(
+                ctx, in->a.lit, in->b.lit, static_cast<ArrHint>(in->target2)));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::MakeDictV: {
+        VM_CASE(MakeDictV): {
 
             /* Build a dict LITERAL via vm_make_dict (key/value buffer kept out
              * of vm_run_chunk's frame). Never throws (all values hashable). */
-            ctx.frame->at(in.target).put(
-                vm_make_dict(ctx, in.a.lit, in.b.lit));
+            ctx.frame->at(in->target).put(
+                vm_make_dict(ctx, in->a.lit, in->b.lit));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::MakeClosureV: {
+        VM_CASE(MakeClosureV): {
             /* func[caps]{..} in expression position: create the FuncObject +
              * snapshot the captures from ctx - byte-identical to
              * FuncDeclStmt::do_eval for a lambda. The def is a program-lifetime
              * FuncDescriptor* from the pool (the Instr holds only the index) -
              * no AST. The ctor never throws (a resolved closure's captures are
              * defined), so no loc. */
-            ctx.frame->at(in.target).put(EvalValue(intrusive_ptr<FuncObject>(
-                make_intrusive<FuncObject>(chunk.closure_defs[in.target2],
+            ctx.frame->at(in->target).put(EvalValue(intrusive_ptr<FuncObject>(
+                make_intrusive<FuncObject>(chunk.closure_defs[in->target2],
                                            &ctx))));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StructCtorV: {
+        VM_CASE(StructCtorV): {
             /* Standalone POD struct construction P(x,y) via vm_struct_ctor (its
              * field buffer kept out of vm_run_chunk's frame). The typed-arg gate
              * means coerce won't throw; a defensive throw is stamped with the
              * ctor's loc (side table). */
             StructTypeDef *def =
-                const_cast<StructTypeDef *>(chunk.struct_defs[in.target2]);
+                const_cast<StructTypeDef *>(chunk.struct_defs[in->target2]);
             try {
-                ctx.frame->at(in.target).put(
-                    vm_struct_ctor(ctx, def, in.a.lit, in.b.lit));
+                ctx.frame->at(in->target).put(
+                    vm_struct_ctor(ctx, def, in->a.lit, in->b.lit));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::ThrowRuntimeV: {
+        VM_CASE(ThrowRuntimeV): {
             /* An always-throwing construct (undefined name, assign to a
              * non-lvalue / a builtin) — throw the pooled exception with its
              * exact caret, byte-identical to the tree-walker. */
-            const Chunk::ThrowSite &t = chunk.throws[in.target];
+            const Chunk::ThrowSite &t = chunk.throws[in->target];
             switch (t.kind) {
                 case Chunk::ThrowKind::undefined_var:
                     throw UndefinedVariableEx(t.name->val, t.start, t.end);
@@ -2005,72 +2088,73 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 case Chunk::ThrowKind::bad_args:
                     throw InvalidNumberOfArgsEx(t.start, t.end);
             }
-            break;   /* unreachable */
+            VM_NEXT;   /* unreachable */
         }
 
-        case OpCode::StructCtorBoxedV: {
+        VM_CASE(StructCtorBoxedV): {
             /* Boxed (non-POD) struct construction B(a,x) via
              * vm_struct_ctor_boxed. A field coerce CAN throw (a dyn-laundered
              * wrong value); the per-arg carets come from the boxed_ctors pool so
              * the throw's caret matches the tree-walker's construct_struct. */
-            const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in.target2];
+            const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in->target2];
             StructTypeDef *def = const_cast<StructTypeDef *>(bc.def);
-            ctx.frame->at(in.target).put(vm_struct_ctor_boxed(
-                ctx, def, in.a.lit,
+            ctx.frame->at(in->target).put(vm_struct_ctor_boxed(
+                ctx, def, in->a.lit,
                 static_cast<int_type>(bc.arg_locs.size()),
                 bc.arg_locs.data()));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::MakeStructArrayV: {
+        VM_CASE(MakeStructArrayV): {
             /* Build a FLAT array<PodStruct> literal `[P(..), ..]` in one op via
              * vm_make_struct_array_op (field-value buffer kept out of
              * vm_run_chunk's frame - it coerces STRAIGHT into a flat byte buffer,
              * no per-element StructObject). All-scalar-field gate => coerce can't
              * throw; a defensive throw gets the ctor loc (side table). */
             StructTypeDef *def =
-                const_cast<StructTypeDef *>(chunk.struct_defs[in.target2]);
+                const_cast<StructTypeDef *>(chunk.struct_defs[in->target2]);
             try {
-                ctx.frame->at(in.target).put(
-                    vm_make_struct_array_op(ctx, def, in.a.lit, in.b.lit));
+                ctx.frame->at(in->target).put(
+                    vm_make_struct_array_op(ctx, def, in->a.lit, in->b.lit));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LoadStructFieldInt:
+        VM_CASE(LoadStructFieldInt):
             /* pts[i].f (scalar int/bool field) read straight from the flat
              * struct-array bytes into a slot - the struct-foreach direct read,
              * no StructObject. target2 = the array slot, a = the counter, b =
              * the field index. */
-            write_int_slot(&ctx, in.target,
-                vm_struct_field_int(ctx.frame->at(in.target2).get(),
-                                    read_int_operand(in.a, &ctx), in.b.lit));
+            write_int_slot(&ctx, in->target,
+                vm_struct_field_int(ctx.frame->at(in->target2).get(),
+                                    read_int_operand(in->a, &ctx), in->b.lit));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadStructElemV:
+        VM_CASE(LoadStructElemV):
             /* Whole-`p` foreach bind: materialize a fresh StructObject from the
              * flat struct-array element into the loop var. target = loop var,
              * target2 = the array slot, a = the counter. */
-            ctx.frame->at(in.target).put(
-                vm_struct_elem(ctx.frame->at(in.target2).get(),
-                               read_int_operand(in.a, &ctx)));
+            ctx.frame->at(in->target).put(
+                vm_struct_elem(ctx.frame->at(in->target2).get(),
+                               read_int_operand(in->a, &ctx)));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadStructFieldFloat:
-            write_float_slot(&ctx, in.target,
-                vm_struct_field_float(ctx.frame->at(in.target2).get(),
-                                      read_int_operand(in.a, &ctx), in.b.lit));
+        VM_CASE(LoadStructFieldFloat):
+            write_float_slot(&ctx, in->target,
+                vm_struct_field_float(ctx.frame->at(in->target2).get(),
+                                      read_int_operand(in->a, &ctx),
+                                      in->b.lit));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::CallBuiltinLV: {
+        VM_CASE(CallBuiltinLV): {
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*
              * from its slot table (by kind = a.lit), then call func_lv - which
@@ -2080,28 +2164,28 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * - no value args) gets an empty rest. Mirrors Identifier::do_eval
              * for each kind: a not-yet-defined global -> null target ->
              * NotLValueEx, like the tree-walker. */
-            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.a.slot];
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in->a.slot];
             LValue *target;
-            switch (in.a.lit) {
+            switch (in->a.lit) {
             case 0:   /* local */
-                target = &ctx.frame->at(in.target2);
+                target = &ctx.frame->at(in->target2);
                 break;
             case 1:   /* global */
-                target = ctx.gfuncs->defined[in.target2]
-                             ? &ctx.gfuncs->slots[in.target2] : nullptr;
+                target = ctx.gfuncs->defined[in->target2]
+                             ? &ctx.gfuncs->slots[in->target2] : nullptr;
                 break;
             default:  /* capture */
-                target = &(*ctx.captures)[in.target2];
+                target = &(*ctx.captures)[in->target2];
                 break;
             }
             try {
-                if (in.b.is_lit) {
-                    ctx.frame->at(in.target).put(
-                        vm_call_builtin_lv_rest(ctx, chunk, in.a.slot, target,
-                                                in.b.lit));
+                if (in->b.is_lit) {
+                    ctx.frame->at(in->target).put(
+                        vm_call_builtin_lv_rest(ctx, chunk, in->a.slot, target,
+                                                in->b.lit));
                 } else {
-                    ArgLocs al = chunk.arglocs_at(in.a.slot);
-                    ctx.frame->at(in.target).put(
+                    ArgLocs al = chunk.arglocs_at(in->a.slot);
+                    ctx.frame->at(in->target).put(
                         bc.builtin.func_lv(&ctx, &al, target, nullptr, 0));
                 }
             } catch (Exception &e) {
@@ -2112,10 +2196,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::EmplaceStruct: {
+        VM_CASE(EmplaceStruct): {
 
             /* append(struct_arr, Ctor(args)) with the ctor's field VALUES in
              * run at `b`: form arg0's LValue* (like CallBuiltinLV), then coerce
@@ -2125,26 +2209,26 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * the ctor def + carets from the emplace_sites pool (`a` packs
              * kind | idx << 2); the whole-args caret from the loc table. */
             const Chunk::EmplaceSite &site =
-                chunk.emplace_sites[in.a.lit >> 2];
+                chunk.emplace_sites[in->a.lit >> 2];
             LValue *target;
-            switch (in.a.lit & 3) {
-            case 0:  target = &ctx.frame->at(in.target2); break;
-            case 1:  target = ctx.gfuncs->defined[in.target2]
-                         ? &ctx.gfuncs->slots[in.target2] : nullptr; break;
-            default: target = &(*ctx.captures)[in.target2]; break;
+            switch (in->a.lit & 3) {
+            case 0:  target = &ctx.frame->at(in->target2); break;
+            case 1:  target = ctx.gfuncs->defined[in->target2]
+                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
+            default: target = &(*ctx.captures)[in->target2]; break;
             }
             try {
-                ctx.frame->at(in.target).put(
-                    vm_do_emplace(ctx, site, target, in.b.lit));
+                ctx.frame->at(in->target).put(
+                    vm_do_emplace(ctx, site, target, in->b.lit));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CallBuiltinLVElem: {
+        VM_CASE(CallBuiltinLVElem): {
 
             /* Mutating builtin with a subscript target a[i]/d[k] (Phase 2c):
              * form the base's LValue* (by kind), then the ELEMENT's LValue* via
@@ -2155,30 +2239,31 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * non-lvalue element (a flat scalar / read-only / missing dict key,
              * which throws) gives a null target -> NotLValueEx, like the
              * tree-walker. AST-FREE: Builtin + carets from the pool (a.slot). */
-            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.a.slot];
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in->a.slot];
             LValue *base;
-            switch (in.a.lit) {
-            case 0:  base = &ctx.frame->at(in.target2); break;
-            case 1:  base = ctx.gfuncs->defined[in.target2]
-                         ? &ctx.gfuncs->slots[in.target2] : nullptr; break;
-            default: base = &(*ctx.captures)[in.target2]; break;
+            switch (in->a.lit) {
+            case 0:  base = &ctx.frame->at(in->target2); break;
+            case 1:  base = ctx.gfuncs->defined[in->target2]
+                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
+            default: base = &(*ctx.captures)[in->target2]; break;
             }
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
                 EvalValue holder;   /* keeps the subscript result alive */
                 LValue *elem = nullptr;
                 if (base) {
-                    const EvalValue &idx = ctx.frame->at(in.b.lit).get();
+                    const EvalValue &idx = ctx.frame->at(in->b.lit).get();
                     holder = base->get().get_type()->subscript(
                         EvalValue(base), idx, /*for_write=*/false);
                     if (holder.is<LValue *>())
                         elem = holder.get<LValue *>();
                 }
                 EvalValue restbuf[8];   /* n_rest is small (append 1, pop 0) */
-                for (int_type i = 0; i < n_rest; i++)
-                    restbuf[i] = ctx.frame->at(in.b.lit + 1 + i).get();
-                ArgLocs al = chunk.arglocs_at(in.a.slot);
-                ctx.frame->at(in.target).put(
+                for (int_type i = 0; i < n_rest; i++) {
+                    restbuf[i] = ctx.frame->at(in->b.lit + 1 + i).get();
+                }
+                ArgLocs al = chunk.arglocs_at(in->a.slot);
+                ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, elem,
                                        n_rest ? restbuf : nullptr,
                                        static_cast<size_t>(n_rest)));
@@ -2191,10 +2276,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CallBuiltinLVMember: {
+        VM_CASE(CallBuiltinLVMember): {
 
             /* Mutating builtin with a struct-MEMBER target `append(s.f, x)`:
              * form the base's LValue* (by kind), the boxed FIELD LValue* via
@@ -2202,13 +2287,13 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * then call func_lv REST-NATIVE. `b` = the rest run (values, NO
              * index — unlike LVElem). AST-free: Builtin + carets + field name
              * from the pool (a.slot). */
-            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in.a.slot];
+            const Chunk::BuiltinCall &bc = chunk.builtin_calls[in->a.slot];
             LValue *base;
-            switch (in.a.lit) {
-            case 0:  base = &ctx.frame->at(in.target2); break;
-            case 1:  base = ctx.gfuncs->defined[in.target2]
-                         ? &ctx.gfuncs->slots[in.target2] : nullptr; break;
-            default: base = &(*ctx.captures)[in.target2]; break;
+            switch (in->a.lit) {
+            case 0:  base = &ctx.frame->at(in->target2); break;
+            case 1:  base = ctx.gfuncs->defined[in->target2]
+                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
+            default: base = &(*ctx.captures)[in->target2]; break;
             }
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
@@ -2218,10 +2303,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                                              bc.args[0].start, bc.args[0].end,
                                              bc.args[0].start, bc.args[0].end);
                 EvalValue restbuf[8];   /* append/push 1 value arg */
-                for (int_type i = 0; i < n_rest; i++)
-                    restbuf[i] = ctx.frame->at(in.b.lit + i).get();
-                ArgLocs al = chunk.arglocs_at(in.a.slot);
-                ctx.frame->at(in.target).put(
+                for (int_type i = 0; i < n_rest; i++) {
+                    restbuf[i] = ctx.frame->at(in->b.lit + i).get();
+                }
+                ArgLocs al = chunk.arglocs_at(in->a.slot);
+                ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, field,
                                        n_rest ? restbuf : nullptr,
                                        static_cast<size_t>(n_rest)));
@@ -2233,11 +2319,11 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CallV:
-        case OpCode::CachedCallV: {
+        VM_CASE(CallV):
+        VM_CASE(CachedCallV): {
 
             /* Native user-function call: the args occupy the contiguous run
              * [a.lit, a.lit+b.lit) of THIS frame's slots - pass a view (no
@@ -2253,24 +2339,24 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * callee-identifier loc, which matches the tree-walker), and the
              * backtrace call-site is resolved lazily inside do_func_call (pass
              * &chunk, pc - no per-call lookup on the success path). */
-            if (!ctx.gfuncs->defined[in.target2]) {
+            if (!ctx.gfuncs->defined[in->target2]) {
                 Loc s, en;
                 chunk.loc_at(pc, s, en);
                 throw UndefinedVariableEx(
-                    ctx.gfuncs->names[in.target2]->val, s, en);
+                    ctx.gfuncs->names[in->target2]->val, s, en);
             }
-            const EvalValue &callee = ctx.gfuncs->slots[in.target2].get();
+            const EvalValue &callee = ctx.gfuncs->slots[in->target2].get();
             if (!callee.is<intrusive_ptr<FuncObject>>()) {
                 Loc s, en;
                 chunk.loc_at(pc, s, en);
                 throw NotCallableEx(s, en);
             }
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
-            LValue *ap = &ctx.frame->at(in.a.lit);
+            LValue *ap = &ctx.frame->at(in->a.lit);
             EvalValue res =
-                in.op == OpCode::CachedCallV
-                    ? vm_cached_call(&ctx, fo, ap, in.b.lit, &chunk, pc)
-                    : vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc);
+                in->op == OpCode::CachedCallV
+                    ? vm_cached_call(&ctx, fo, ap, in->b.lit, &chunk, pc)
+                    : vm_call_func(&ctx, fo, ap, in->b.lit, &chunk, pc);
             /* Inc v2: the callee (or something it called) is unwinding
              * cross-frame - route to a same-frame handler, or return to keep
              * propagating (this frame's do_func_call captures it). Inc 4: if
@@ -2280,43 +2366,43 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 vm_flush_inline(chunk, pc, *g_vm_exc_pending);
                 if (vm_dispatch_exc(handlers, pc)) {
                     vm_exc = std::move(g_vm_exc_pending);
-                    continue;
+                    VM_NEXT_COLD;
                 }
                 return;
             }
-            ctx.frame->at(in.target).put(std::move(res));
+            ctx.frame->at(in->target).put(std::move(res));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CallValueV: {
+        VM_CASE(CallValueV): {
             /* Indirect call of a func VALUE: the callee was evaluated into
              * target2 (a FuncObject - proven by the Func static type). Read it
              * and call vm_call_func; a dyn-laundered non-func throws
              * NotCallableEx via the loc side table (the call-site loc). */
-            const EvalValue &callee = ctx.frame->at(in.target2).get();
+            const EvalValue &callee = ctx.frame->at(in->target2).get();
             if (!callee.is<intrusive_ptr<FuncObject>>()) {
                 Loc s, en;
                 chunk.loc_at(pc, s, en);
                 throw NotCallableEx(s, en);
             }
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
-            LValue *ap = &ctx.frame->at(in.a.lit);
-            EvalValue res = vm_call_func(&ctx, fo, ap, in.b.lit, &chunk, pc);
+            LValue *ap = &ctx.frame->at(in->a.lit);
+            EvalValue res = vm_call_func(&ctx, fo, ap, in->b.lit, &chunk, pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
                 vm_flush_inline(chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
                 if (vm_dispatch_exc(handlers, pc)) {
                     vm_exc = std::move(g_vm_exc_pending);
-                    continue;
+                    VM_NEXT_COLD;
                 }
                 return;
             }
-            ctx.frame->at(in.target).put(std::move(res));
+            ctx.frame->at(in->target).put(std::move(res));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CallValueGenericV: {
+        VM_CASE(CallValueGenericV): {
             /* Generic indirect call of a DYN callee - AST-FREE (F1 step 2):
              * args 1..n-1 pre-evaluated in the run [a.lit+1, +nargs-1);
              * arg0 is described by the CallSite's LVALUE DESCRIPTOR (the
@@ -2333,10 +2419,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * for a non-callable BEFORE the args evaluated. A loc-less
              * builtin throw is stamped with the args caret, mirroring
              * dispatch_call_value's catch. */
-            const EvalValue &callee = ctx.frame->at(in.target2).get();
-            const int_type argbase = in.a.lit;
-            const size_t nargs = static_cast<size_t>(in.b.lit & 0xfff);
-            const int site_i = static_cast<int>(in.b.lit >> 12);
+            const EvalValue &callee = ctx.frame->at(in->target2).get();
+            const int_type argbase = in->a.lit;
+            const size_t nargs = static_cast<size_t>(in->b.lit & 0xfff);
+            const int site_i = static_cast<int>(in->b.lit >> 12);
             const Chunk::CallSite &cs = chunk.call_sites[site_i];
             ArgLocs al = chunk.call_arglocs_at(site_i);
 
@@ -2423,9 +2509,10 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                     }
                     if (nargs)
                         buf[0] = a0_value();
-                    for (size_t i = 1; i < nargs; i++)
+                    for (size_t i = 1; i < nargs; i++) {
                         buf[i] = ctx.frame->at(argbase
                                                + static_cast<int>(i)).get();
+                }
                     if (callee.is<Builtin>()) {
                         const Builtin &b = callee.get<Builtin>();
                         if (b.kind == Builtin::Kind::lvalue) {
@@ -2439,8 +2526,9 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                                 resth.resize(nr);
                                 rp = resth.data();
                             }
-                            for (size_t i = 0; i < nr; i++)
+                            for (size_t i = 0; i < nr; i++) {
                                 rp[i] = RValue(buf[i + 1]);
+                }
                             res = b.func_lv(&ctx, &al, target,
                                             nr ? rp : nullptr, nr);
                         } else {
@@ -2465,21 +2553,21 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 vm_flush_inline(chunk, pc, *g_vm_exc_pending);
                 if (vm_dispatch_exc(handlers, pc)) {
                     vm_exc = std::move(g_vm_exc_pending);
-                    continue;
+                    VM_NEXT_COLD;
                 }
                 return;
             }
-            ctx.frame->at(in.target).put(std::move(res));
+            ctx.frame->at(in->target).put(std::move(res));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CheckCallableV: {
+        VM_CASE(CheckCallableV): {
             /* An indirect call's callable guard: throw NotCallableEx (callee
              * caret, loc side table) unless slot `a` holds a FuncObject, a
              * Builtin, or a struct type descriptor - BEFORE the arg run
              * evaluates, matching the tree-walker's dispatch order. */
-            const EvalValue &cv = ctx.frame->at(in.a.slot).get();
+            const EvalValue &cv = ctx.frame->at(in->a.slot).get();
             if (!cv.is<intrusive_ptr<FuncObject>>() && !cv.is<Builtin>()
                 && !cv.is<StructTypeDef *>()) {
                 Loc s, en;
@@ -2487,206 +2575,206 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 throw NotCallableEx(s, en);
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CheckFuncV:
+        VM_CASE(CheckFuncV):
             /* map/filter's arg0 guard: throw (arg0's caret, from the loc side
              * table) if it isn't a function, BEFORE arg1's code runs - the
              * tree-walker's order. AST-free. */
-            if (!ctx.frame->at(in.a.slot).get()
+            if (!ctx.frame->at(in->a.slot).get()
                      .is<intrusive_ptr<FuncObject>>()) {
                 Loc s, en;
                 chunk.loc_at(pc, s, en);
                 throw TypeErrorEx("Expected function", s, en);
             }
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::MapFilterV: {
+        VM_CASE(MapFilterV): {
             /* map/filter over the pre-validated function + the container; the
              * unsupported-container caret comes from the loc side table. */
             Loc s, en;
             chunk.loc_at(pc, s, en);
-            ctx.frame->at(in.target).put(
-                vm_map_filter(&ctx, ctx.frame->at(in.a.slot).get(),
-                              ctx.frame->at(in.b.slot).get(),
-                              in.target2 != 0, s, en));
+            ctx.frame->at(in->target).put(
+                vm_map_filter(&ctx, ctx.frame->at(in->a.slot).get(),
+                              ctx.frame->at(in->b.slot).get(),
+                              in->target2 != 0, s, en));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::ReturnV:
+        VM_CASE(ReturnV):
             /* `return <expr>`: the value is already in a.slot (a bare return
              * loaded `none`). Set flow and STOP the chunk, as an
              * tree-walked return does; do_func_call reads flow->value. */
-            ctx.flow->value = ctx.frame->at(in.a.slot).get();
+            ctx.flow->value = ctx.frame->at(in->a.slot).get();
             ctx.flow->type = FlowState::ret;
             return;
 
-        case OpCode::ArrLen:
+        VM_CASE(ArrLen):
             /* n = size(array). The base is a flat array (ForeachStmt::elem_th
              * guarantees array<int>/array<float>), so read size() directly. */
-            ctx.frame->at(in.target).put(EvalValue(static_cast<int_type>(
-                ctx.frame->at(in.target2).get()
+            ctx.frame->at(in->target).put(EvalValue(static_cast<int_type>(
+                ctx.frame->at(in->target2).get()
                     .get_ref<SharedArrayObj>().size())));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::StrLen:
+        VM_CASE(StrLen):
             /* n = char count of the string (foreach bound over a proven str).
              * get_view() accounts for a slice's offset. */
-            ctx.frame->at(in.target).put(EvalValue(static_cast<int_type>(
-                ctx.frame->at(in.target2).get()
+            ctx.frame->at(in->target).put(EvalValue(static_cast<int_type>(
+                ctx.frame->at(in->target2).get()
                     .get_ref<SharedStr>().get_view().size())));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadStrChar: {
+        VM_CASE(LoadStrChar): {
             /* x = a fresh 1-char string of the container's i-th char - matches
              * the tree-walker's SharedStr(string(&view[i], 1)). `i` is
              * loop-bounded (< StrLen), so view[i] is in range. */
-            const std::string_view view = ctx.frame->at(in.target2).get()
+            const std::string_view view = ctx.frame->at(in->target2).get()
                 .get_ref<SharedStr>().get_view();
-            const int_type i = read_int_operand(in.a, &ctx);
-            ctx.frame->at(in.target).put(
+            const int_type i = read_int_operand(in->a, &ctx);
+            ctx.frame->at(in->target).put(
                 EvalValue(SharedStr(std::string(&view[i], 1))));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LoadImmInt:
-            ctx.frame->at(in.target).put(
-                EvalValue(static_cast<int_type>(in.a.lit)));
+        VM_CASE(LoadImmInt):
+            ctx.frame->at(in->target).put(
+                EvalValue(static_cast<int_type>(in->a.lit)));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadImmFloat:
-            ctx.frame->at(in.target).put(
-                EvalValue(static_cast<float_type>(in.a.flit)));
+        VM_CASE(LoadImmFloat):
+            ctx.frame->at(in->target).put(
+                EvalValue(static_cast<float_type>(in->a.flit)));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadConstV:
-            ctx.frame->at(in.target).put(chunk.consts[in.target2]);
+        VM_CASE(LoadConstV):
+            ctx.frame->at(in->target).put(chunk.consts[in->target2]);
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadLiteralObjV: {
+        VM_CASE(LoadLiteralObjV): {
             /* Materialize a baked const array/dict/struct literal via shared
              * eval_literal_obj (immutable share vs a fresh mutable clone, plus
              * the general/flat_s arr_hint cases) - byte-identical to
              * LiteralObj::do_eval. */
-            const Chunk::LiteralObjEntry &lo = chunk.literal_objs[in.target2];
-            ctx.frame->at(in.target).put(
+            const Chunk::LiteralObjEntry &lo = chunk.literal_objs[in->target2];
+            ctx.frame->at(in->target).put(
                 eval_literal_obj(lo.value, lo.immutable, lo.arr_hint,
                                  lo.arr_hint_struct));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::MoveV:
+        VM_CASE(MoveV):
             /* Alias, not clone (a container assignment shares the handle;
              * matches doAssign's `x = RValue(rval)` - COW protects later). */
-            ctx.frame->at(in.target).put(
-                ctx.frame->at(in.target2).get());
+            ctx.frame->at(in->target).put(
+                ctx.frame->at(in->target2).get());
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::CoerceNumV:
+        VM_CASE(CoerceNumV):
             /* dst = coerce_to_decl_type(src, i/f): the typed-store numeric
              * coerce (the coerces_dyn accumulator's plain assign) - widen
              * float <- int/bool / int <- bool, pass none, THROW TypeError on
              * a non-fitting dyn value. Caret = the Expr14 span (loc table),
              * matching the tree-walker's stamp. */
             try {
-                ctx.frame->at(in.target).put(
-                    vm_coerce_decl_num(ctx.frame->at(in.a.slot).get(),
-                                       in.target2 != 0));
+                ctx.frame->at(in->target).put(
+                    vm_coerce_decl_num(ctx.frame->at(in->a.slot).get(),
+                                       in->target2 != 0));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::BinOpV: {
+        VM_CASE(BinOpV): {
             /* Clone the left operand, then num_bin_op mutates the clone (so
              * `a + b` never corrupts a) - byte-identical to the tree-walker's
              * eval_first_rvalue().clone() + num_binop_loc chain (int/float
              * promotion, string `+` concat, bitwise). */
             EvalValue sa, sb;
-            EvalValue val = boxed_operand(in.a, &ctx, sa).clone();
+            EvalValue val = boxed_operand(in->a, &ctx, sa).clone();
             try {
-                num_bin_op(val, boxed_operand(in.b, &ctx, sb),
-                           binop_pmf(in.aop));
+                num_bin_op(val, boxed_operand(in->b, &ctx, sb),
+                           binop_pmf(in->aop));
             } catch (Exception &e) {
                 /* Stamp the operand loc (side table) like stamp_operand_loc, so
                  * a div-zero / type error points where the tree-walker does. */
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
-            ctx.frame->at(in.target).put(std::move(val));
+            ctx.frame->at(in->target).put(std::move(val));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CompoundV: {
+        VM_CASE(CompoundV): {
             /* dst OP= b: COPY the lvalue (a container shares its handle, so the
              * op mutates it in place), apply num_bin_op, store back - identical
              * to doAssign's compound branch. `b` may be an immediate. */
             EvalValue sb;
-            EvalValue nv = ctx.frame->at(in.target).get();
+            EvalValue nv = ctx.frame->at(in->target).get();
             try {
-                num_bin_op(nv, boxed_operand(in.b, &ctx, sb),
-                           binop_pmf(in.aop));
+                num_bin_op(nv, boxed_operand(in->b, &ctx, sb),
+                           binop_pmf(in->aop));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
-            ctx.frame->at(in.target).put(std::move(nv));
+            ctx.frame->at(in->target).put(std::move(nv));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::CmpV: {
+        VM_CASE(CmpV): {
             /* dst = (a <cmp> b) as a bool - copy a, num_bin_op with the
              * comparison PMF, store is_true() (= Expr06/Expr07::do_eval). */
             EvalValue sa, sb;
-            EvalValue val = boxed_operand(in.a, &ctx, sa);
+            EvalValue val = boxed_operand(in->a, &ctx, sa);
             try {
-                num_bin_op(val, boxed_operand(in.b, &ctx, sb),
-                           cmp_pmf(in.aop));
+                num_bin_op(val, boxed_operand(in->b, &ctx, sb),
+                           cmp_pmf(in->aop));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
-            ctx.frame->at(in.target).put(EvalValue(val.is_true()));
+            ctx.frame->at(in->target).put(EvalValue(val.is_true()));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LogV: {
+        VM_CASE(LogV): {
             /* Eager (MyLang &&/|| don't short-circuit at runtime) - both
              * operands are already computed (a slot or an immediate); combine
              * truthiness. */
             EvalValue sa, sb;
-            const bool a = boxed_operand(in.a, &ctx, sa).is_true();
-            const bool b = boxed_operand(in.b, &ctx, sb).is_true();
-            ctx.frame->at(in.target).put(
-                EvalValue(in.aop == Op::land ? (a && b) : (a || b)));
+            const bool a = boxed_operand(in->a, &ctx, sa).is_true();
+            const bool b = boxed_operand(in->b, &ctx, sb).is_true();
+            ctx.frame->at(in->target).put(
+                EvalValue(in->aop == Op::land ? (a && b) : (a || b)));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::UnaryV: {
+        VM_CASE(UnaryV): {
             /* Boxed unary over a dyn/general operand - mirrors Expr02::do_eval
              * (clone the operand, apply). `-str`/`~str` throw a type error via
              * the Type vtable -> stamp the loc side table. */
             EvalValue s;
-            EvalValue v = boxed_operand(in.a, &ctx, s).clone();
+            EvalValue v = boxed_operand(in->a, &ctx, s).clone();
             try {
-                switch (in.aop) {
+                switch (in->aop) {
                 case Op::plus:
                     if (v.is<bool>())
                         v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
@@ -2711,71 +2799,71 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
-            ctx.frame->at(in.target).put(std::move(v));
+            ctx.frame->at(in->target).put(std::move(v));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::LoadGlobalV:
+        VM_CASE(LoadGlobalV):
             /* AST-free: the hot read is a gfuncs slot; the cold undefined
              * error takes its NAME from gfuncs's slot->name list and its loc
              * from the side table - no `node`. */
-            if (!ctx.gfuncs->defined[in.target2]) {
+            if (!ctx.gfuncs->defined[in->target2]) {
                 Loc s, en;
                 chunk.loc_at(pc, s, en);
                 throw UndefinedVariableEx(
-                    ctx.gfuncs->names[in.target2]->val, s, en);
+                    ctx.gfuncs->names[in->target2]->val, s, en);
             }
-            ctx.frame->at(in.target).put(
-                ctx.gfuncs->slots[in.target2].get());
+            ctx.frame->at(in->target).put(
+                ctx.gfuncs->slots[in->target2].get());
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadCaptureV:
-            ctx.frame->at(in.target).put(
-                (*ctx.captures)[in.target2].get());
+        VM_CASE(LoadCaptureV):
+            ctx.frame->at(in->target).put(
+                (*ctx.captures)[in->target2].get());
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::LoadBuiltinV:
-            ctx.frame->at(in.target).put(builtin_slot(in.target2).get());
+        VM_CASE(LoadBuiltinV):
+            ctx.frame->at(in->target).put(builtin_slot(in->target2).get());
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::DefinedGlobalV:
+        VM_CASE(DefinedGlobalV):
             /* defined(global): the slot's defined-flag IS the answer (false
              * before the decl ran, true after) - byte-identical to
              * builtin_defined evaluating the identifier to an UndefinedId or
              * not. AST-free, never throws. */
-            ctx.frame->at(in.target).put(
-                EvalValue(ctx.gfuncs->defined[in.target2] != 0));
+            ctx.frame->at(in->target).put(
+                EvalValue(ctx.gfuncs->defined[in->target2] != 0));
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::StoreGlobalV: {
-            LValue &lv = ctx.gfuncs->slots[in.target];
-            if (in.aop == Op::invalid) {
+        VM_CASE(StoreGlobalV): {
+            LValue &lv = ctx.gfuncs->slots[in->target];
+            if (in->aop == Op::invalid) {
                 /* g = <expr>: write the shared global slot + mark defined -
                  * exactly slot_rmw(op==assign) (put(RValue)) + the decl's
                  * defined=1. Serves both a decl and a reassign (idempotent). */
-                lv.put(RValue(ctx.frame->at(in.a.slot).get()));
-                ctx.gfuncs->defined[in.target] = 1;
+                lv.put(RValue(ctx.frame->at(in->a.slot).get()));
+                ctx.gfuncs->defined[in->target] = 1;
             } else {
                 /* g OP= rhs / g++ (aop = the base op, rhs in `a`): a compound
                  * requires the slot already DEFINED (else UndefinedVariableEx,
                  * like the tree-walker falling through its defined guard), then
                  * copy-modify-store via num_bin_op - identical to CompoundV. */
-                if (!ctx.gfuncs->defined[in.target]) {
+                if (!ctx.gfuncs->defined[in->target]) {
                     Loc s, en;
                     chunk.loc_at(pc, s, en);
                     throw UndefinedVariableEx(
-                        ctx.gfuncs->names[in.target]->val, s, en);
+                        ctx.gfuncs->names[in->target]->val, s, en);
                 }
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in.a, &ctx, sb),
-                               binop_pmf(in.aop));
+                    num_bin_op(nv, boxed_operand(in->a, &ctx, sb),
+                               binop_pmf(in->aop));
                 } catch (Exception &e) {
                     vm_stamp_loc(chunk, pc, e);
                     throw;
@@ -2783,37 +2871,37 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 lv.put(std::move(nv));
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::DeclConstV: {
+        VM_CASE(DeclConstV): {
             /* const arr/dict/func decl: bind the slot as a CONST LValue (so a
              * later rebind still throws), local (target2==0) or global (==1).
              * The rvalue value is already materialized in `a`. */
-            EvalValue v = ctx.frame->at(in.a.slot).get();
-            if (in.target2 == 0) {
-                ctx.frame->at(in.target) = LValue(std::move(v), true);
+            EvalValue v = ctx.frame->at(in->a.slot).get();
+            if (in->target2 == 0) {
+                ctx.frame->at(in->target) = LValue(std::move(v), true);
             } else {
-                ctx.gfuncs->slots[in.target] = LValue(std::move(v), true);
-                ctx.gfuncs->defined[in.target] = 1;
+                ctx.gfuncs->slots[in->target] = LValue(std::move(v), true);
+                ctx.gfuncs->defined[in->target] = 1;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::StoreCaptureV: {
+        VM_CASE(StoreCaptureV): {
             /* cap = <expr> / cap OP= v / cap++ : write the called closure's
              * per-instance capture slot. A capture is ALWAYS defined (snapshot
              * at closure creation), so - unlike a global - no defined check. */
-            LValue &lv = (*ctx.captures)[in.target];
-            if (in.aop == Op::invalid) {
-                lv.put(RValue(ctx.frame->at(in.a.slot).get()));
+            LValue &lv = (*ctx.captures)[in->target];
+            if (in->aop == Op::invalid) {
+                lv.put(RValue(ctx.frame->at(in->a.slot).get()));
             } else {
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in.a, &ctx, sb),
-                               binop_pmf(in.aop));
+                    num_bin_op(nv, boxed_operand(in->a, &ctx, sb),
+                               binop_pmf(in->aop));
                 } catch (Exception &e) {
                     vm_stamp_loc(chunk, pc, e);
                     throw;
@@ -2821,100 +2909,100 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 lv.put(std::move(nv));
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::SubscriptV: {
+        VM_CASE(SubscriptV): {
             /* base[idx] read via the runtime Type::subscript (any base type -
              * array / dict / string), an LValue* to the base slot passed like
              * Subscript::do_eval, for_write=false, RValue'd into dst. */
-            LValue &base_lv = ctx.frame->at(in.target2);
-            const EvalValue &idx = ctx.frame->at(in.a.slot).get();
+            LValue &base_lv = ctx.frame->at(in->target2);
+            const EvalValue &idx = ctx.frame->at(in->a.slot).get();
             try {
                 Type *t = base_lv.get().get_type();
-                ctx.frame->at(in.target).put(
+                ctx.frame->at(in->target).put(
                     RValue(t->subscript(EvalValue(&base_lv), idx, false)));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);   /* AST-free: loc side table */
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::MemberV: {
+        VM_CASE(MemberV): {
             /* base.member value read via the shared member_read_core (struct
              * field / const / dict key / optional); AST-free - the name
-             * key/uid, optional flag and carets come from the pool (in.a). */
-            const Chunk::MemberKey &mk = chunk.member_keys[in.a.lit];
-            ctx.frame->at(in.target).put(
-                member_read_core(ctx.frame->at(in.target2).get(), mk.memId,
+             * key/uid, optional flag and carets come from the pool (in->a). */
+            const Chunk::MemberKey &mk = chunk.member_keys[in->a.lit];
+            ctx.frame->at(in->target).put(
+                member_read_core(ctx.frame->at(in->target2).get(), mk.memId,
                                  mk.memUid, mk.optional, mk.mstart, mk.mend,
                                  mk.bstart, mk.bend));
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::SliceV: {
+        VM_CASE(SliceV): {
             /* base[start:end] via the runtime Type::slice (which RValues the
              * base + registers the COW slice view) - mirrors Slice::do_eval. An
              * absent bound (slot -1) passes `none`. The slice() throws (a
              * non-int index) get the caret from the loc side table. */
-            const EvalValue &base = ctx.frame->at(in.target2).get();
-            const EvalValue start = in.a.slot >= 0
-                ? ctx.frame->at(in.a.slot).get() : EvalValue();
-            const EvalValue end = in.b.slot >= 0
-                ? ctx.frame->at(in.b.slot).get() : EvalValue();
+            const EvalValue &base = ctx.frame->at(in->target2).get();
+            const EvalValue start = in->a.slot >= 0
+                ? ctx.frame->at(in->a.slot).get() : EvalValue();
+            const EvalValue end = in->b.slot >= 0
+                ? ctx.frame->at(in->b.slot).get() : EvalValue();
             try {
-                ctx.frame->at(in.target).put(
+                ctx.frame->at(in->target).put(
                     base.get_type()->slice(base, start, end));
             } catch (Exception &e) {
                 vm_stamp_loc(chunk, pc, e);
                 throw;
             }
             pc++;
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::JumpUnlessTrueV:
-            if (!ctx.frame->at(in.target2).get().is_true())
-                pc = in.target;
+        VM_CASE(JumpUnlessTrueV):
+            if (!ctx.frame->at(in->target2).get().is_true())
+                pc = in->target;
             else
                 pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::JumpIfNotNoneV:
+        VM_CASE(JumpIfNotNoneV):
             /* `a ?? b` short-circuit: a non-none lhs skips the rhs. */
-            if (!ctx.frame->at(in.a.slot).get().is<NoneVal>())
-                pc = static_cast<size_t>(in.target);
+            if (!ctx.frame->at(in->a.slot).get().is<NoneVal>())
+                pc = static_cast<size_t>(in->target);
             else
                 pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::Throw: {
+        VM_CASE(Throw): {
             /* P8 Inc 1: raise the value in slot `a`. vm_raise builds the native
              * dispatch (a same-frame catch jump, no C++ throw - the 42 win) or
              * C++-throws to the caller's boundary (cross-frame, like the
              * tree-walker) - the SAME path a runtime error takes. */
             Loc ls, le;
             chunk.loc_at(pc, ls, le);
-            const EvalValue &tv = ctx.frame->at(in.a.slot).get();
+            const EvalValue &tv = ctx.frame->at(in->a.slot).get();
             vm_raise(chunk, pc, handlers, vm_exc,
                      vm_make_thrown_exc(tv, ls, le));
-            continue;                          /* re-dispatch (or unreached) */
+            VM_NEXT;                          /* re-dispatch (or unreached) */
         }
 
-        case OpCode::PushHandler:
-            handlers.push_back({ static_cast<uint32_t>(in.target) });
+        VM_CASE(PushHandler):
+            handlers.push_back({ static_cast<uint32_t>(in->target) });
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::PopHandler:
+        VM_CASE(PopHandler):
             handlers.pop_back();      /* the try body exited normally */
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::CatchTest: {
+        VM_CASE(CatchTest): {
             /* vm_exc holds the caught exception. Match its type name against
              * this clause (a.lit = catch_types idx, or -1 = catch-all). On a
              * match: bind `catch (T as e)` (target2 = slot, -1 if none), jump to
@@ -2922,36 +3010,37 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
              * Reraise. vm_exc is KEPT (not cleared) so a `rethrow` in the catch
              * body can re-raise it; a new throw overwrites it. */
             bool match;
-            if (in.a.lit < 0) {
+            if (in->a.lit < 0) {
                 match = true;
             } else {
                 const std::vector<std::string> &names =
-                    chunk.catch_types[in.a.lit];
+                    chunk.catch_types[in->a.lit];
                 const std::string_view en = vm_exc_name(vm_exc.get());
                 match = false;
-                for (const std::string &nm : names)
+                for (const std::string &nm : names) {
                     if (nm == en) { match = true; break; }
+                }
             }
             if (match) {
-                if (in.target2 >= 0)
-                    ctx.frame->at(in.target2).put(
+                if (in->target2 >= 0)
+                    ctx.frame->at(in->target2).put(
                         vm_catch_bind_val(vm_exc.get()));
-                pc = static_cast<size_t>(in.target);
+                pc = static_cast<size_t>(in->target);
             } else {
                 pc++;
             }
-            break;
         }
+        VM_NEXT;
 
-        case OpCode::Reraise:
+        VM_CASE(Reraise):
             /* No clause matched: re-raise vm_exc to the OUTER handler (native
              * jump), or C++-throw to propagate. Mirrors saved_ex->rethrow(). */
             if (vm_dispatch_exc(handlers, pc))
-                break;
+                VM_NEXT;
             vm_exc->rethrow();
-            break;                    /* unreachable ([[noreturn]]) */
+            VM_NEXT;                    /* unreachable ([[noreturn]]) */
 
-        case OpCode::Rethrow:
+        VM_CASE(Rethrow):
             /* `rethrow` in a catch body: re-raise the being-handled vm_exc with
              * the rethrow-site loc (like do_catch's RethrowEx handling), to the
              * OUTER handler (native) or C++-propagate. */
@@ -2962,19 +3051,19 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
                 vm_exc->loc_end = le;
             }
             if (vm_dispatch_exc(handlers, pc))
-                break;
+                VM_NEXT;
             vm_exc->rethrow();
-            break;                    /* unreachable ([[noreturn]]) */
+            VM_NEXT;                    /* unreachable ([[noreturn]]) */
 
-        case OpCode::SetPend:
+        VM_CASE(SetPend):
             /* Record what the shared `finally` must resume - normal or reraise
              * (Inc 2b). Flow ops inline their finally, so ret/brk/cont never
              * reach the shared finally. */
-            vm_pend = static_cast<Pend>(in.target);
+            vm_pend = static_cast<Pend>(in->target);
             pc++;
-            break;
+            VM_NEXT;
 
-        case OpCode::EndFinally:
+        VM_CASE(EndFinally):
             /* End of the SHARED finally block: resume the pending action. Only
              * the NORMAL and RERAISE exits reach here - a return/break/continue
              * crossing this try INLINES its own copy of the finally (Inc 2c),
@@ -2982,17 +3071,22 @@ vm_run_chunk(const Chunk &chunk, EvalContext &ctx)
             if (vm_pend == Pend::reraise) {
                 /* finally didn't handle the exception → re-raise it. */
                 if (vm_dispatch_exc(handlers, pc))
-                    break;
+                    VM_NEXT;
                 vm_exc->rethrow();
             } else {
                 pc++;                                 /* fall through to Lend */
             }
-            break;
+            VM_NEXT;
 
-        case OpCode::Halt:
+        VM_CASE(Halt):
             return;
-        }
-    }
+#ifndef ML_CGOTO
+        case OpCode::OpCount_:      /* sentinel - never emitted (switch
+                                     * exhaustiveness; cgoto has no entry) */
+            throw InternalErrorEx();
+        }   /* switch */
+    }       /* for */
+#endif
 
     } catch (RuntimeException &e) {
         /* An exception reached the boundary: a fallback `throw`, a runtime-

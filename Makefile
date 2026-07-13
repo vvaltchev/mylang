@@ -101,6 +101,15 @@ ifeq ($(RECYCLE),1)
 	BASE_FLAGS += -DRECYCLE_ALLOC
 endif
 
+# VM dispatch: computed-goto (direct-threaded) on GCC/clang, default ON.
+# `make CGOTO=0` forces the portable switch dispatch (what MSVC always
+# uses) - the A/B lever for measuring the threaded dispatch. See vm.cpp's
+# "DISPATCH MODE" comment.
+CGOTO ?= 1
+ifeq ($(CGOTO),0)
+	BASE_FLAGS += -DML_NO_CGOTO
+endif
+
 # VM hardening (ML_VM_CHECK): HEAVY per-op VM invariants - a frame-slot bounds
 # check on every register access, an operand type-tag check - too hot for a
 # plain release, invaluable for exposing a LAYOUT-DEPENDENT UB (a bad slot index

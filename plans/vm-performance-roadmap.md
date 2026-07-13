@@ -97,12 +97,26 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
 
 ### A. Dispatch engine (broad; recovers the known regression)
 
-- **A1. Computed-goto / direct-threaded dispatch** (GCC/clang `&&label`
-  table; keep the `switch` for MSVC behind an ifdef). Kills the
-  range-check and gives each handler its OWN indirect branch (the BTB
-  predicts per-op-pair patterns instead of one mega-hub). Classic 10-20%
-  on dispatch-bound interpreters; our own data says the hub costs us
-  ~10-30% per loop bench since the switch doubled.
+- **A1. Computed-goto / direct-threaded dispatch — ✅ DONE (2026-07-16),
+  measured A/B.** GCC/clang dispatch via a `&&label` table (generated in
+  enum order from ML_FOR_EACH_OPCODE, order/coverage static-asserted) with
+  the dispatch at each handler's tail; `make CGOTO=0` / MSVC keep the
+  switch (same bodies via VM_CASE/VM_NEXT). A/B (same commit, CGOTO=1 vs
+  0, scale 10 best-of-7): **-10.4% geomean over the 15-bench dispatch set**
+  (01 -22%, 07 -22%, 44 -21%, 06 -18%, 54/61 -17%, 60 -1%; call-bound
+  fib/map_filter/dict_insert ~flat as expected). Cachegrind: instructions
+  -11-12%, indirect-branch mispredicts -25-42% on untouched loops (44:
+  87.5M -> 51.1M, BELOW the peak-era 94.7M). Suite: my/py 0.26x -> 0.25x
+  (run.py: 3.9x -> 4.0-4.2x across runs), VM/TW 0.56x -> 0.53x. Two
+  portability rules learned: an INDIRECT goto may not exit a scope with
+  live destructors under clang - so every handler's terminal dispatch sits
+  AFTER its case braces, and the 3 cold cross-frame-exception sites use a
+  direct-goto trampoline (VM_NEXT_COLD); and in switch mode VM_NEXT must
+  be `continue` (a `break` inside a handler's inner switch would fall out
+  into the slot write - caught by -Wmaybe-uninitialized under LTO).
+  Bonus: the switch-mode refactor itself measured ~4% FASTER than the
+  old HEAD on the loop set (favorable layout from the `in->` pointer
+  form), so the total recovery vs pre-change is ~14% on those benches.
 - **A2. Hot/cold handler split — ONLY together with A1, never alone.**
   HISTORY (2026-07-08, transcript + `vm-dispatch-frontend-regression`
   memory): the standalone cold-split experiment (10 fat ops into an

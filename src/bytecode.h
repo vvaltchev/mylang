@@ -959,7 +959,69 @@ enum class OpCode : unsigned char {
 
     /* Stop the program. */
     Halt,
+
+    /*
+     * SENTINEL - the opcode count, never emitted or executed. Backs the
+     * computed-goto dispatch table's size/order static checks (see
+     * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
+     * with an unreachable case so its -Wswitch exhaustiveness stays intact.
+     */
+    OpCount_,
 };
+
+/*
+ * Every opcode, IN ENUM ORDER - the single generation point for the
+ * computed-goto dispatch table (vm.cpp builds `vm_optbl` from it, one
+ * `&&lbl_<Op>` per entry). KEEP IN EXACT ENUM ORDER when adding an op:
+ * `ml_opcode_list_in_order()` below static-asserts every listed name sits
+ * at its own enum index and that the list covers the whole enum (OpCount_),
+ * so a missing, extra, or misplaced entry is a COMPILE error, never a
+ * silently mis-dispatching table.
+ */
+#define ML_FOR_EACH_OPCODE(X) \
+    X(Jump) X(LoopBackEdge) X(IntBin) X(IncDecCheckedV) \
+    X(IncDecElemCheckedV) X(IncDecMemberCheckedV) X(IncDecChainV) \
+    X(StoreLValueChainV) X(JumpUnlessIntCmp) X(FloatBin) \
+    X(JumpUnlessFloatCmp) X(ForLoopStep) X(LoadElemInt) X(LoadElemFloat) \
+    X(LoadElemBool) X(ArrLen) X(StrLen) X(LoadStrChar) X(LoadElemValue) \
+    X(LoadStructFieldInt) X(LoadStructFieldFloat) X(LoadStructElemV) \
+    X(DictIterInit) X(DictIterNext) X(ForeachDynInit) X(ForeachDynNext) \
+    X(UnpackElemInt) X(UnpackElemFloat) X(UnpackElemValue) \
+    X(UnpackElemTargets) X(StoreElemInt) X(StoreElemFloat) X(DictStore) \
+    X(StoreMemberV) X(StoreElemValue) X(MultiUnpackV) X(StoreElem2V) \
+    X(StoreElemChainV) X(DictLoadInt) X(DictLoadFloat) X(CallBuiltinV) \
+    X(CallBuiltinLV) X(EmplaceStruct) X(CallBuiltinLVElem) \
+    X(CallBuiltinLVMember) X(CallV) X(CachedCallV) X(CallValueV) \
+    X(CheckFuncV) X(MapFilterV) X(ReturnV) X(LoadImmInt) X(LoadImmFloat) \
+    X(LoadConstV) X(MoveV) X(BinOpV) X(CoerceNumV) X(LoadLiteralObjV) \
+    X(CompoundV) X(CmpV) X(LogV) X(UnaryV) X(LoadGlobalV) X(LoadCaptureV) \
+    X(LoadBuiltinV) X(DefinedGlobalV) X(StoreGlobalV) X(DeclConstV) \
+    X(StoreCaptureV) X(SubscriptV) X(MemberV) X(SliceV) X(MakeArrayV) \
+    X(MakeDictV) X(MakeClosureV) X(StructCtorV) X(StructCtorBoxedV) \
+    X(ThrowRuntimeV) X(CallValueGenericV) X(CheckCallableV) \
+    X(MakeStructArrayV) X(JumpUnlessTrueV) X(JumpIfNotNoneV) X(Throw) \
+    X(PushHandler) X(PopHandler) X(CatchTest) X(Reraise) X(Rethrow) \
+    X(SetPend) X(EndFinally) X(Halt)
+
+namespace ml_opcheck {
+#define ML_OPCODE_ENUMV(N) OpCode::N,
+constexpr OpCode ml_op_order[] = { ML_FOR_EACH_OPCODE(ML_OPCODE_ENUMV) };
+#undef ML_OPCODE_ENUMV
+constexpr bool ml_opcode_list_in_order()
+{
+    constexpr size_t n = sizeof(ml_op_order) / sizeof(ml_op_order[0]);
+    if (n != static_cast<size_t>(OpCode::OpCount_))
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (static_cast<size_t>(ml_op_order[i]) != i)
+            return false;
+    return true;
+}
+static_assert(ml_opcode_list_in_order(),
+              "ML_FOR_EACH_OPCODE is out of sync with enum OpCode - keep the "
+              "list in EXACT enum order (see the comment above it)");
+}   /* namespace ml_opcheck */
+
 
 /*
  * A register-machine operand: a resolved-local frame SLOT (the VM's registers

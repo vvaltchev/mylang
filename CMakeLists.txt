@@ -87,6 +87,14 @@ if (RECYCLE)
    target_compile_definitions(mylang PUBLIC "RECYCLE_ALLOC")
 endif()
 
+# VM dispatch: computed-goto (direct-threaded) on GCC/clang, default ON.
+# -DCGOTO=OFF forces the portable switch dispatch (what MSVC always uses) -
+# the A/B lever for the threaded dispatch. Parity with the Makefile's CGOTO.
+set(CGOTO ON CACHE BOOL "Computed-goto VM dispatch (GCC/clang)")
+if (NOT CGOTO)
+   target_compile_definitions(mylang PUBLIC "ML_NO_CGOTO")
+endif()
+
 # VM hardening (ML_VM_CHECK): HEAVY per-op VM invariants - a frame-slot bounds
 # check on every register access + an operand type-tag check. Default follows
 # the build type (ON for Debug, OFF for an optimized build, for speed);
