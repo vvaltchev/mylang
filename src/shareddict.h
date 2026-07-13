@@ -6,12 +6,21 @@
 #include "flatval.h"
 #include "intrusiveptr.h"
 #include <unordered_map>
+#include "poolalloc.h"
 
 template <class EvalValueT, class LValueT>
 class DictObjectTempl : public RefCounted {
 
 public:
-    typedef std::unordered_map<EvalValueT, LValueT> inner_type;
+    /* H2 v2: the NODE-POOLED map (poolalloc.h) - a chained unordered_map
+     * heap-allocated a ~96-byte node per insert; the pool serves those
+     * from program-lifetime free lists. Node-pointer stability (what the
+     * held-LValue* runtime paths rely on) is untouched - rehash moves
+     * only the bucket array. */
+    typedef std::unordered_map<
+        EvalValueT, LValueT,
+        std::hash<EvalValueT>, std::equal_to<EvalValueT>,
+        PoolAlloc<std::pair<const EvalValueT, LValueT>>> inner_type;
 
 private:
     inner_type data;

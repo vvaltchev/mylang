@@ -4,6 +4,7 @@
 
 #include "defs.h"
 #include "evalvalue.h"
+#include "poolalloc.h"
 #include "uniqueid.h"
 #include "funcdesc.h"
 
@@ -89,7 +90,12 @@ struct PureCacheKeyHash {
     }
 };
 
-typedef std::unordered_map<PureCacheKey, EvalValue, PureCacheKeyHash> PureCache;
+/* Node-POOLED (poolalloc.h) like the dict map: a recursion's per-frame
+ * cache inserts a node per novel call - the pool serves + reuses them. */
+typedef std::unordered_map<PureCacheKey, EvalValue, PureCacheKeyHash,
+                           std::equal_to<PureCacheKey>,
+                           PoolAlloc<std::pair<const PureCacheKey,
+                                               EvalValue>>> PureCache;
 
 struct Frame {
     static constexpr int INLINE_SLOTS = 8;

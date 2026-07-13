@@ -195,6 +195,28 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**H2 v2 - THE unordered_map NODE POOL (`PoolAlloc`, poolalloc.h; the
+core in types.cpp - the global-mutable-state home).** A chained
+`unordered_map` heap-allocates a ~96-byte node PER INSERT (hash + the
+32-byte EvalValue key + 48-byte LValue + next) and frees it on erase.
+`PoolAlloc` serves single-element allocations from PROGRAM-LIFETIME
+per-size-class free lists over chunked arenas (single-threaded, no
+locks; multi-element allocations - the bucket-pointer arrays - pass
+through to operator new; arena blocks stay reachable for leak
+checkers; teardown-order-safe: the free-list heads are POD). Wired
+into BOTH hot maps: the dict's `inner_type` (shareddict.h) and the
+per-frame `PureCache` (eval.h). Node-POINTER STABILITY is untouched
+(rehash moves only the bucket array), so every held-LValue*/iterator
+invariant holds - a pure drop-in; the FLAT open-addressing map was
+REJECTED by the maintainer for exactly that stability reason.
+**UNDER ASAN THE POOL COMPILES TO PASS-THROUGH** (poolalloc.h: pooled
+reuse would mask a node use-after-free from AddressSanitizer - the
+RECYCLE philosophy from the other direction), so the ASan lanes keep
+their bug-finding power; test a pool-ACTIVE debug build with
+`make ASAN=0 UBSAN=0 OPT=0 TESTS=1`. Measured: 67_make_dict 0.770x,
+23_dict_insert 0.929x, 10_recursion_deep 0.968x, suite VM-wall 0.987,
+my/py 4.70-4.71x.
+
 **B3 - THE 32-BYTE PACKED `Instr` (bytecode.h).** `sizeof(Instr) == 32`
 (static_asserted), down from 56: `slot` and `lit` are mutually exclusive
 (is_lit discriminates), so each operand is ONE 8-byte payload (`pa`/`pb`,

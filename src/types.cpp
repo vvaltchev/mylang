@@ -4,6 +4,7 @@
 #include "vm.h"    /* VmInvoker - the prepared callback invoker */
 #include "bitops.h"
 #include "hashing.h"
+#include "poolalloc.h"
 #include "env.h"      /* env_get - shared by builtins/io.cpp.h (tmpdir) */
 
 #include <unordered_map>
@@ -218,6 +219,66 @@ const EvalValue empty_arr(SharedArrayObj(empty_arr_actual, 0, 0));
 const EvalValue none;
 
 std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
+
+/* ---------- The unordered_map NODE POOL (poolalloc.h; H2 v2) ----------
+ * Single-threaded per-size-class free lists over chunked arenas. The
+ * arenas are PROGRAM-LIFETIME by design (a freed node is immediately
+ * reusable by any dict / pure cache; nothing returns to malloc) -
+ * g_pool_blocks keeps them reachable so leak checkers report
+ * still-reachable, not lost. Teardown-order-safe: pool_free_one during
+ * static destruction touches only the POD free-list heads + block
+ * memory (the blocks are never freed). Compiled to pass-through under
+ * ASan (see poolalloc.h - reuse would mask a node use-after-free). */
+namespace {
+
+struct PoolFreeNode { PoolFreeNode *next; };
+constexpr size_t POOL_CLASS_STEP = 16;
+constexpr size_t POOL_NCLASSES = 10;      /* classes: 16..160 bytes */
+constexpr size_t POOL_BLOCK_BYTES = 4096;
+PoolFreeNode *g_pool_free[POOL_NCLASSES];
+std::vector<void *> g_pool_blocks;        /* leak-checker visibility */
+
+} /* anon namespace */
+
+void *pool_alloc_one(size_t size)
+{
+    const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
+
+    if (cls == 0 || cls > POOL_NCLASSES)
+        return ::operator new(size);      /* out-of-range: plain heap */
+
+    PoolFreeNode *&head = g_pool_free[cls - 1];
+
+    if (!head) {
+        const size_t csz = cls * POOL_CLASS_STEP;
+        const size_t count = POOL_BLOCK_BYTES / csz;
+        char *block = static_cast<char *>(::operator new(count * csz));
+        g_pool_blocks.push_back(block);
+        for (size_t i = 0; i < count; i++) {
+            auto *n = reinterpret_cast<PoolFreeNode *>(block + i * csz);
+            n->next = head;
+            head = n;
+        }
+    }
+
+    PoolFreeNode *n = head;
+    head = n->next;
+    return n;
+}
+
+void pool_free_one(void *p, size_t size) noexcept
+{
+    const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
+
+    if (cls == 0 || cls > POOL_NCLASSES) {
+        ::operator delete(p);
+        return;
+    }
+
+    auto *n = static_cast<PoolFreeNode *>(p);
+    n->next = g_pool_free[cls - 1];
+    g_pool_free[cls - 1] = n;
+}
 
 inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
 {

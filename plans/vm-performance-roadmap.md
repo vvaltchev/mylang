@@ -461,13 +461,28 @@ across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
   0.096→0.086s (0.896x; my/py 0.47x → 0.42x), broad −4-10% on
   unpack/foreach/dispatch/closures, suite VM-wall geomean **0.992**,
   my/py 4.49-4.50x → **4.57-4.58x** (both runs — the best to date).
-  **Still open (H2 v2, DESIGN-LEVEL, needs maintainer sign-off):** a
-  flat open-addressing dict (replacing `std::unordered_map` — kills the
-  node alloc per insert AND the bucket-chain probe; iteration order may
-  change freely, dicts are spec'd unordered), and reserve()
-  sizing (no principled size source exists today). 23_dict_insert
-  (0.59x, insert-bound: node alloc + rehash growth) is the bench gated
-  on it.
+  **H2 v2 — DONE (2026-07-17): the NODE-POOL allocator. The flat
+  open-addressing map was REJECTED by the maintainer** (rightly: it
+  would break the element-pointer stability the runtime relies on —
+  dict values are LValues written through held `LValue*`, and the VM's
+  DictIterState holds live iterators — for a lookup win Amdahl caps at
+  ~10-15% of the dict benches). Instead `PoolAlloc` (poolalloc.h; the
+  core in types.cpp): single-element node allocations come from
+  program-lifetime per-size-class free lists over chunked arenas
+  (single-threaded, no locks; bucket arrays pass through to operator
+  new; blocks stay reachable for leak checkers). Wired into BOTH hot
+  unordered_maps: the dict's `inner_type` (shareddict.h) and the
+  per-frame `PureCache` (eval.h). Node-pointer stability is untouched
+  (rehash moves only the bucket array) — a pure drop-in, zero semantic
+  audit. **UNDER ASAN THE POOL IS PASS-THROUGH** (reuse would mask a
+  node use-after-free; the debug lanes keep their bug-finding power —
+  the RECYCLE philosophy from the other direction); a dedicated
+  ASAN=0 debug lane exercises pool+asserts. MEASURED (full-suite
+  interleaved A/B vs 69a1a5d): 67_make_dict 0.061→0.047s (**0.770x**),
+  23_dict_insert 0.929x, 24_dict_lookup 0.944x, 10_recursion_deep
+  0.968x (the PureCache share), suite VM-wall geomean **0.987**, my/py
+  4.66-4.69x → **4.70-4.71x**. reserve() sizing stays unexplored (no
+  principled size source).
 - **H3. Strings — v1 DONE (2026-07-17): reserve + borrow in
   join/split.** From bench 31's callgrind profile: `builtin_join` grew
   its result string unreserved (realloc+memcpy per growth step) and
