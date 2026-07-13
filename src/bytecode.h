@@ -956,6 +956,29 @@ enum class OpCode : unsigned char {
     Halt,
 
     /*
+     * B1/B2 SPECIALIZED ARITHMETIC (plans/vm-performance-roadmap.md): the
+     * per-operator, per-operand-shape variants of IntBin/FloatBin, selected
+     * by specialize_arith_ops (codegen.cpp) as an in-place post-codegen
+     * rewrite. Each removes IntBin's inner 11-way `aop` switch (a second
+     * data-dependent indirect branch per arith op) AND the two `is_lit`
+     * operand-decode branches - a tight 3-address handler under the
+     * computed-goto dispatch. RR = both operands slots; RI = b is an
+     * immediate (a lit-first COMMUTATIVE op is operand-swapped into RI at
+     * specialize time; lit-first non-commutative stays IntBin). Div stays
+     * IntBin (zero check + rare); IntModRI is selected only for a NONZERO
+     * immediate (the `s % 1000000007` checksum shape - no zero check
+     * needed); shifts call bit_shl/bit_shr for the exact count semantics.
+     * FloatBin keeps div (and any bool-literal oddity); float `+`/`*`
+     * operand-swap is exact for IEEE values (NaN payloads are not
+     * observable in-language).
+     */
+    IntAddRR, IntAddRI, IntSubRR, IntSubRI, IntMulRR, IntMulRI,
+    IntAndRR, IntAndRI, IntOrRR, IntOrRI, IntXorRR, IntXorRI,
+    IntShlRR, IntShlRI, IntShrRR, IntShrRI,
+    IntModRI,
+    FloatAddRR, FloatAddRI, FloatSubRR, FloatSubRI, FloatMulRR, FloatMulRI,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -996,7 +1019,12 @@ enum class OpCode : unsigned char {
     X(ThrowRuntimeV) X(CallValueGenericV) X(CheckCallableV) \
     X(MakeStructArrayV) X(JumpUnlessTrueV) X(JumpIfNotNoneV) X(Throw) \
     X(PushHandler) X(PopHandler) X(CatchTest) X(Reraise) X(Rethrow) \
-    X(SetPend) X(EndFinally) X(Halt)
+    X(SetPend) X(EndFinally) X(Halt) \
+    X(IntAddRR) X(IntAddRI) X(IntSubRR) X(IntSubRI) X(IntMulRR) \
+    X(IntMulRI) X(IntAndRR) X(IntAndRI) X(IntOrRR) X(IntOrRI) \
+    X(IntXorRR) X(IntXorRI) X(IntShlRR) X(IntShlRI) X(IntShrRR) \
+    X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
+    X(FloatSubRI) X(FloatMulRR) X(FloatMulRI)
 
 namespace ml_opcheck {
 #define ML_OPCODE_ENUMV(N) OpCode::N,

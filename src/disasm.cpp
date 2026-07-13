@@ -82,6 +82,26 @@ std::string opsym(Op op)
     return OpString[static_cast<int>(op)];
 }
 
+/* The baked operator of a B1/B2 specialized arith op (bytecode.h). */
+const char *spec_arith_sym(OpCode op)
+{
+    switch (op) {
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI: return "+";
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI: return "-";
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI: return "*";
+    case OpCode::IntAndRR: case OpCode::IntAndRI: return "&";
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:  return "|";
+    case OpCode::IntXorRR: case OpCode::IntXorRI: return "^";
+    case OpCode::IntShlRR: case OpCode::IntShlRI: return "<<";
+    case OpCode::IntShrRR: case OpCode::IntShrRI: return ">>";
+    case OpCode::IntModRI: return "%";
+    default: return "?";
+    }
+}
+
 std::string store_op(Op aop)
 {
     return aop == Op::invalid ? std::string("=") : opsym(aop) + "=";
@@ -421,6 +441,28 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "i.bin        " << D(in.target) << " = "
                 << RI(in.a, false) << " " << opsym(in.aop) << " "
                 << RI(in.b, false);
+            break;
+        /* B1/B2 specialized arithmetic: same 3-address render, the operator
+         * baked in the opcode (the shape is visible from the operands). */
+        case OpCode::IntAddRR: case OpCode::IntAddRI:
+        case OpCode::IntSubRR: case OpCode::IntSubRI:
+        case OpCode::IntMulRR: case OpCode::IntMulRI:
+        case OpCode::IntAndRR: case OpCode::IntAndRI:
+        case OpCode::IntOrRR:  case OpCode::IntOrRI:
+        case OpCode::IntXorRR: case OpCode::IntXorRI:
+        case OpCode::IntShlRR: case OpCode::IntShlRI:
+        case OpCode::IntShrRR: case OpCode::IntShrRI:
+        case OpCode::IntModRI:
+            row << "i.bin        " << D(in.target) << " = "
+                << RI(in.a, false) << " " << spec_arith_sym(in.op) << " "
+                << RI(in.b, false);
+            break;
+        case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+        case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+        case OpCode::FloatMulRR: case OpCode::FloatMulRI:
+            row << "f.bin        " << D(in.target) << " = "
+                << RI(in.a, true) << " " << spec_arith_sym(in.op) << " "
+                << RI(in.b, true);
             break;
         case OpCode::JumpUnlessIntCmp:
             row << "i.jmp.ifnot  " << RI(in.a, false) << " "

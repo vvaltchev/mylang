@@ -13416,7 +13416,21 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::Jump:             c.jmp++;    break;
             case OpCode::JumpUnlessIntCmp: c.juic++;   break;
             case OpCode::IntBin:           c.intbin++; break;
+            /* B1/B2 specialized variants count as their general class. */
+            case OpCode::IntAddRR: case OpCode::IntAddRI:
+            case OpCode::IntSubRR: case OpCode::IntSubRI:
+            case OpCode::IntMulRR: case OpCode::IntMulRI:
+            case OpCode::IntAndRR: case OpCode::IntAndRI:
+            case OpCode::IntOrRR:  case OpCode::IntOrRI:
+            case OpCode::IntXorRR: case OpCode::IntXorRI:
+            case OpCode::IntShlRR: case OpCode::IntShlRI:
+            case OpCode::IntShrRR: case OpCode::IntShrRI:
+            case OpCode::IntModRI:         c.intbin++; break;
             case OpCode::FloatBin:         c.fbin++;   break;
+            case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+            case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+            case OpCode::FloatMulRR: case OpCode::FloatMulRI:
+                                           c.fbin++;   break;
             case OpCode::JumpUnlessFloatCmp: c.jufc++; break;
             case OpCode::ForLoopStep:      c.flstep++; break;
             case OpCode::LoadElemInt:      c.loadei++; break;

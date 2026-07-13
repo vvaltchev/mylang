@@ -6440,6 +6440,91 @@ static void verify_ast_free(Chunk &chunk)
 
 }  /* namespace */
 
+/*
+ * B1/B2 (plans/vm-performance-roadmap.md): rewrite general IntBin/FloatBin
+ * ops into their per-operator, per-shape variants (see the enum comment in
+ * bytecode.h). IN PLACE - opcode + (for a lit-first commutative op) an
+ * operand swap only, so pcs, the loc side table, and every pool stay
+ * untouched. Runs on the FINISHED chunk, after extract_locs.
+ */
+static void specialize_arith_ops(Chunk &ck)
+{
+    for (Instr &in : ck.code) {
+
+        if (in.op == OpCode::IntBin) {
+
+            /* Normalize a lit-first COMMUTATIVE op to reg-first (RI). */
+            if (in.a.is_lit && !in.b.is_lit) {
+                switch (in.aop) {
+                case Op::plus: case Op::times: case Op::band:
+                case Op::bor:  case Op::bxor:
+                    std::swap(in.a, in.b);
+                    break;
+                default:
+                    break;
+                }
+            }
+            if (in.a.is_lit)
+                continue;                 /* lit-first non-commutative */
+            const bool ri = in.b.is_lit;
+
+            switch (in.aop) {
+            case Op::plus:  in.op = ri ? OpCode::IntAddRI
+                                       : OpCode::IntAddRR; break;
+            case Op::minus: in.op = ri ? OpCode::IntSubRI
+                                       : OpCode::IntSubRR; break;
+            case Op::times: in.op = ri ? OpCode::IntMulRI
+                                       : OpCode::IntMulRR; break;
+            case Op::band:  in.op = ri ? OpCode::IntAndRI
+                                       : OpCode::IntAndRR; break;
+            case Op::bor:   in.op = ri ? OpCode::IntOrRI
+                                       : OpCode::IntOrRR; break;
+            case Op::bxor:  in.op = ri ? OpCode::IntXorRI
+                                       : OpCode::IntXorRR; break;
+            case Op::shl:   in.op = ri ? OpCode::IntShlRI
+                                       : OpCode::IntShlRR; break;
+            case Op::shr:   in.op = ri ? OpCode::IntShrRI
+                                       : OpCode::IntShrRR; break;
+            case Op::mod:
+                /* Only the NONZERO-immediate form (no zero check needed -
+                 * the checksum shape); mod-by-reg / mod-by-zero keep
+                 * IntBin's checked path + its div0 loc. */
+                if (ri && in.b.lit != 0)
+                    in.op = OpCode::IntModRI;
+                break;
+            default:
+                break;                    /* div / ushr: keep IntBin */
+            }
+
+        } else if (in.op == OpCode::FloatBin) {
+
+            if (in.a.is_lit && !in.b.is_lit) {
+                switch (in.aop) {
+                case Op::plus: case Op::times:
+                    std::swap(in.a, in.b);
+                    break;
+                default:
+                    break;
+                }
+            }
+            if (in.a.is_lit)
+                continue;
+            const bool ri = in.b.is_lit;
+
+            switch (in.aop) {
+            case Op::plus:  in.op = ri ? OpCode::FloatAddRI
+                                       : OpCode::FloatAddRR; break;
+            case Op::minus: in.op = ri ? OpCode::FloatSubRI
+                                       : OpCode::FloatSubRR; break;
+            case Op::times: in.op = ri ? OpCode::FloatMulRI
+                                       : OpCode::FloatMulRR; break;
+            default:
+                break;                    /* div/mod: keep FloatBin */
+            }
+        }
+    }
+}
+
 Chunk
 codegen_chunk(const Block *block, int slot_count)
 {
@@ -6463,6 +6548,11 @@ codegen_chunk(const Block *block, int slot_count)
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     extract_locs(cg.chunk, cg.ast_nodes);   /* carets -> the loc side table */
+    specialize_arith_ops(cg.chunk);   /* B1/B2 - AFTER extract_locs: an
+                                       * in-place op swap, no pc shifts, and
+                                       * a stale IntBin div0 loc entry for a
+                                       * specialized (non-throwing) op is
+                                       * never queried */
     verify_ast_free(cg.chunk);    /* the finished chunk holds NO Construct* */
     return std::move(cg.chunk);
 }

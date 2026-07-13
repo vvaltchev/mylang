@@ -23,11 +23,9 @@ ExecEngine g_exec_engine = ExecEngine::TreeWalk;
  * bool slot reads as 0/1, mirroring Identifier::eval_int). The register machine
  * uses the frame slots directly - no value stack. */
 static ML_ALWAYS_INLINE int_type
-read_int_operand(const Operand &o, EvalContext *ctx)
+read_int_slot(EvalContext *ctx, int_type slot)
 {
-    if (o.is_lit)
-        return o.lit;
-    const LValue &lv = ctx->frame->at(o.slot);
+    const LValue &lv = ctx->frame->at(slot);
     if (lv.is<bool>())
         return lv.getval<bool>() ? 1 : 0;
     /* A th==i operand must hold an int here; anything else is an inference bug
@@ -35,6 +33,14 @@ read_int_operand(const Operand &o, EvalContext *ctx)
      * the raw getval misreads the union. */
     ML_VM_CHECK(lv.is<int_type>());
     return lv.getval<int_type>();
+}
+
+static ML_ALWAYS_INLINE int_type
+read_int_operand(const Operand &o, EvalContext *ctx)
+{
+    if (o.is_lit)
+        return o.lit;
+    return read_int_slot(ctx, o.slot);
 }
 
 /* Write an int result into a frame slot: overwrite the int in place when the
@@ -52,11 +58,9 @@ write_int_slot(EvalContext *ctx, int_type slot, int_type v)
 /* The float analogues: read an operand as float (an int/bool slot promotes,
  * mirroring Identifier::eval_float) and write a float result into a slot. */
 static ML_ALWAYS_INLINE float_type
-read_float_operand(const Operand &o, EvalContext *ctx)
+read_float_slot(EvalContext *ctx, int_type slot)
 {
-    if (o.is_lit)
-        return o.flit;
-    const LValue &lv = ctx->frame->at(o.slot);
+    const LValue &lv = ctx->frame->at(slot);
     if (lv.is<int_type>())
         return static_cast<float_type>(lv.getval<int_type>());
     if (lv.is<bool>())
@@ -65,6 +69,14 @@ read_float_operand(const Operand &o, EvalContext *ctx)
      * above); a wrong-typed / garbage slot fails before the raw union read. */
     ML_VM_CHECK(lv.is<float_type>());
     return lv.getval<float_type>();
+}
+
+static ML_ALWAYS_INLINE float_type
+read_float_operand(const Operand &o, EvalContext *ctx)
+{
+    if (o.is_lit)
+        return o.flit;
+    return read_float_slot(ctx, o.slot);
 }
 
 static ML_ALWAYS_INLINE void
@@ -1832,6 +1844,87 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             pc++;
         }
         VM_NEXT;
+
+        /*
+         * B1/B2 specialized arithmetic (see bytecode.h): per-operator,
+         * per-shape variants of IntBin/FloatBin - no inner `aop` switch, no
+         * `is_lit` operand decode. Selected post-codegen by
+         * specialize_arith_ops; none of these can throw (div stays IntBin;
+         * IntModRI's immediate is nonzero by selection - ML_VM_CHECKed;
+         * shifts go through bit_shl/bit_shr for the exact count semantics,
+         * incl. the negative-count InvalidValueEx, which reaches the
+         * boundary walk like any C++ throw).
+         */
+#define ML_IRR(NAME, EXPR)                                                   \
+        VM_CASE(NAME): {                                                     \
+            const int_type a = read_int_slot(&ctx, in->a.slot);              \
+            const int_type b = read_int_slot(&ctx, in->b.slot);              \
+            write_int_slot(&ctx, in->target, (EXPR));                        \
+            pc++;                                                            \
+        }                                                                    \
+        VM_NEXT;
+#define ML_IRI(NAME, EXPR)                                                   \
+        VM_CASE(NAME): {                                                     \
+            const int_type a = read_int_slot(&ctx, in->a.slot);              \
+            const int_type b = in->b.lit;                                    \
+            write_int_slot(&ctx, in->target, (EXPR));                        \
+            pc++;                                                            \
+        }                                                                    \
+        VM_NEXT;
+#define ML_FRR(NAME, EXPR)                                                   \
+        VM_CASE(NAME): {                                                     \
+            const float_type a = read_float_slot(&ctx, in->a.slot);          \
+            const float_type b = read_float_slot(&ctx, in->b.slot);          \
+            write_float_slot(&ctx, in->target, (EXPR));                      \
+            pc++;                                                            \
+        }                                                                    \
+        VM_NEXT;
+#define ML_FRI(NAME, EXPR)                                                   \
+        VM_CASE(NAME): {                                                     \
+            const float_type a = read_float_slot(&ctx, in->a.slot);          \
+            const float_type b = in->b.flit;                                 \
+            write_float_slot(&ctx, in->target, (EXPR));                      \
+            pc++;                                                            \
+        }                                                                    \
+        VM_NEXT;
+
+        ML_IRR(IntAddRR, a + b)
+        ML_IRI(IntAddRI, a + b)
+        ML_IRR(IntSubRR, a - b)
+        ML_IRI(IntSubRI, a - b)
+        ML_IRR(IntMulRR, a * b)
+        ML_IRI(IntMulRI, a * b)
+        ML_IRR(IntAndRR, a & b)
+        ML_IRI(IntAndRI, a & b)
+        ML_IRR(IntOrRR,  a | b)
+        ML_IRI(IntOrRI,  a | b)
+        ML_IRR(IntXorRR, a ^ b)
+        ML_IRI(IntXorRI, a ^ b)
+        ML_IRR(IntShlRR, bit_shl(a, b))
+        ML_IRI(IntShlRI, bit_shl(a, b))
+        ML_IRR(IntShrRR, bit_shr(a, b))
+        ML_IRI(IntShrRI, bit_shr(a, b))
+
+        VM_CASE(IntModRI): {
+            /* selected only for a NONZERO immediate - no zero check */
+            ML_VM_CHECK(in->b.lit != 0);
+            write_int_slot(&ctx, in->target,
+                           read_int_slot(&ctx, in->a.slot) % in->b.lit);
+            pc++;
+        }
+        VM_NEXT;
+
+        ML_FRR(FloatAddRR, a + b)
+        ML_FRI(FloatAddRI, a + b)
+        ML_FRR(FloatSubRR, a - b)
+        ML_FRI(FloatSubRI, a - b)
+        ML_FRR(FloatMulRR, a * b)
+        ML_FRI(FloatMulRI, a * b)
+
+#undef ML_IRR
+#undef ML_IRI
+#undef ML_FRR
+#undef ML_FRI
 
         VM_CASE(IntBin): {
 
