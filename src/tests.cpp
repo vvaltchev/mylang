@@ -13485,7 +13485,10 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
                                            c.fbin++;   break;
             case OpCode::JumpUnlessFloatCmp: c.jufc++; break;
             case OpCode::ForLoopStep:      c.flstep++; break;
-            case OpCode::LoadElemInt:      c.loadei++; break;
+            /* E4: a fusion counts as the pair's FIRST op (test stability) */
+            case OpCode::LoadElemInt:
+            case OpCode::JumpUnlessElemInt: c.loadei++; break;
+            case OpCode::IntAddModRI:      c.intbin++; break;
             case OpCode::ArrLen:           c.arrlen++; break;
             case OpCode::LoadElemFloat:    c.loadef++; break;
             case OpCode::StoreElemInt:     c.storei++; break;

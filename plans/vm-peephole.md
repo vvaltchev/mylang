@@ -155,5 +155,24 @@ and the typed-ternary rewrite build on).
      zero moves). MEASURED (full-suite interleaved A/B vs 28108d2):
      09_fib_recursive 0.006→0.004s (**0.67x**), suite VM-wall geomean
      0.990, broad −3-9% on arith/call benches; my/py 4.46-4.47x.
-- E4 fusion candidates (post-infra): cmp+branch over boxed bools,
-  LoadImm+IntBin RI forms the specializer misses.
+- E4 fusions — **DONE (2026-07-17), profile-driven.** A scratch op-pair
+  profiler (CGOTO=0 build, reverted after use) counted 760M executed
+  adjacent-pair dispatches over the bench suite; the distribution is
+  FLAT (top pairs 2-5%, half of them unfusible control shapes). Two
+  fusions shipped, chosen by coverage-per-op-added AND caret safety:
+  1. **IntAddModRI** (`IntBin(+) t = a+b; IntBin(%) dst = t%IMM` →
+     `dst = (a+b)%IMM`, 3.4% of dispatches — the checksum shape).
+     Never throws (imm nonzero + int32-gated; the add wraps) —
+     loc/node-free.
+  2. **JumpUnlessElemInt** (`LoadElemInt t = arr[i];
+     JumpUnlessTrueV t, L` → one load+test+branch, 1.7% — the sieve
+     test). Keeps the LOAD's node in place, so the OOB caret is
+     byte-identical; the temp must be dead on BOTH successor paths.
+  Both rules run in the liveness block (temp-dead + no-branch-target
+  conditions; conservative against same-round mutations). **REJECTED:
+  `BinOpV→CompoundV` (2.9%)** — two distinct throw sources with
+  different carets cannot share one pc's loc entry; fusing it would
+  break byte-identical error reporting. MEASURED (full-suite
+  interleaved A/B vs 0e8266f): 68_nested 0.957x, 60_bit_sieve 0.958x,
+  broad −3-4%, suite VM-wall geomean **0.981**, my/py 4.70-4.71x →
+  **4.75x** (both runs).

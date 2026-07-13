@@ -6585,6 +6585,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::MakeStructArrayV: /* node = a ctor (defensive coerce loc) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
         case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
+        case OpCode::JumpUnlessElemInt:  /* E4 fusion - keeps the load's
+                                          * OOB caret */
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
@@ -6814,6 +6816,7 @@ static void visit_pc_fields(Instr &in, F f)
     case OpCode::ForeachDynNext:
     case OpCode::CatchTest:            /* a.lit = catch_types idx */
     case OpCode::PushHandler:          /* -> the runtime handler's catch_pc */
+    case OpCode::JumpUnlessElemInt:    /* E4 fusion; target2 = the BASE slot */
         f(in.target);
         break;
     default:
@@ -6896,6 +6899,10 @@ static bool visit_use_def(const Instr &in, U u, D d)
         opnd(in.a()); opnd(in.b()); return true;
     case OpCode::JumpUnlessTrueV:
         u(in.target2); return true;
+    case OpCode::IntAddModRI:          /* E4: target2 = the IMM, not a slot */
+        opnd(in.a()); opnd(in.b()); d(in.target); return true;
+    case OpCode::JumpUnlessElemInt:    /* E4: base + idx reads, no def */
+        u(in.target2); opnd(in.a()); return true;
     case OpCode::JumpIfNotNoneV:
         opnd(in.a()); return true;
     case OpCode::ForLoopStep:
@@ -6974,6 +6981,7 @@ static bool retargetable_dst(OpCode op)
     case OpCode::SliceV: case OpCode::CallV: case OpCode::CachedCallV:
     case OpCode::CallValueV: case OpCode::CallBuiltinV:
     case OpCode::MakeArrayV: case OpCode::MakeDictV: case OpCode::StructCtorV:
+    case OpCode::IntAddModRI:
         return true;
     default:
         return false;
@@ -7119,6 +7127,69 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 m.op = OpCode::Jump;     /* neutralize: jump-to-next... */
                 m.target = static_cast<int>(q) + 1;  /* ...deleted below */
                 changed = true;
+            }
+
+            /*
+             * E4 FUSIONS (bytecode.h) - adjacent pairs whose intermediate
+             * temp is dead collapse into one superinstruction. NOTE the
+             * peephole runs BEFORE specialize_arith_ops, so the add/mod
+             * pair is still generic IntBin here. Liveness/is_tgt reuse is
+             * conservative after this round's earlier mutations (removed
+             * writes only overstate liveness).
+             */
+            for (size_t p = 0; p + 1 < n; p++) {
+                CgInstr &op1 = code[p];
+                CgInstr &op2 = code[p + 1];
+                if (is_tgt[p + 1])
+                    continue;
+
+                /* IntBin(+) t = a + b; IntBin(%) dst = t % IMM  ->
+                 * IntAddModRI dst = (a + b) % IMM (never throws: imm
+                 * nonzero, int32-ranged; the add wraps). */
+                if (op1.op == OpCode::IntBin && op1.aop == Op::plus
+                    && op2.op == OpCode::IntBin && op2.aop == Op::mod
+                    && op2.b_is_lit() && op2.b_lit() != 0
+                    && op2.b_lit() == static_cast<int32_t>(op2.b_lit())
+                    && !op2.a_is_lit() && op2.a_slot() == op1.target
+                    && bit(op1.target)) {
+                    const uint64_t tout =
+                        (p + 2 < n ? live_in[p + 2] : 0) | hlive;
+                    if (!(tout & bit(op1.target))) {
+                        CgInstr f = op1;   /* keeps a/b operands */
+                        f.op = OpCode::IntAddModRI;
+                        f.target = op2.target;
+                        f.target2 = static_cast<int>(op2.b_lit());
+                        f.node_idx = -1;   /* never throws - loc-free */
+                        op1 = f;
+                        op2.op = OpCode::Jump;
+                        op2.target = static_cast<int>(p) + 2;
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                /* LoadElemInt t = arr[i]; JumpUnlessTrueV t, L  ->
+                 * JumpUnlessElemInt arr[i], L (the sieve test). The temp
+                 * must be dead on BOTH successor paths; op1's node/loc
+                 * (the OOB caret) rides along in place. */
+                if (op1.op == OpCode::LoadElemInt
+                    && op2.op == OpCode::JumpUnlessTrueV
+                    && op2.target2 == op1.target
+                    && bit(op1.target)) {
+                    const int btgt = op2.target;
+                    uint64_t tout =
+                        (p + 2 < n ? live_in[p + 2] : 0) | hlive;
+                    if (btgt >= 0 && static_cast<size_t>(btgt) < n)
+                        tout |= live_in[btgt];
+                    if (!(tout & bit(op1.target))) {
+                        op1.op = OpCode::JumpUnlessElemInt;
+                        op1.target = btgt;  /* target2=base, a=idx stay */
+                        op2.op = OpCode::Jump;
+                        op2.target = static_cast<int>(p) + 2;
+                        changed = true;
+                        continue;
+                    }
+                }
             }
         }
 

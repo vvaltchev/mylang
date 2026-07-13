@@ -314,6 +314,22 @@ ops). Measured (full-suite interleaved A/B): 09_fib_recursive
 0.006->0.004s (**0.67x**), suite VM-wall geomean 0.990 (broad -3-9%
 on the arith/call benches).
 
+**E4 FUSIONS (in the peephole; plans/vm-peephole.md).** Two profile-
+chosen superinstructions (a scratch op-pair profiler counted 760M
+executed adjacent pairs over the suite; the distribution is flat, so
+only the caret-safe top pairs shipped): **`IntAddModRI`** (`dst =
+(a+b) % IMM`, the checksum shape - never throws: imm nonzero +
+int32-gated in `target2`, the add wraps; loc/node-free) and
+**`JumpUnlessElemInt`** (`if (arr[i]) ...` - LoadElemInt +
+JumpUnlessTrueV in one dispatch; keeps the LOAD's node in place so the
+OOB caret is byte-identical; the elem temp must be liveness-dead on
+BOTH successor paths). The fusion rules run inside the peephole's
+liveness block; `BinOpV→CompoundV` was REJECTED - two throw sources
+with different carets can't share one pc's loc entry. A NEW fusion op
+with a pc field MUST be added to `visit_pc_fields` (JumpUnlessElemInt
+is). Measured: 68_nested/60_bit_sieve -4%, suite VM-wall 0.981, my/py
+4.75x.
+
 **THE POST-CODEGEN PEEPHOLE (`peephole_chunk`, codegen.cpp; design +
 field tables in plans/vm-peephole.md).** Runs in `codegen_chunk` BEFORE
 `extract_locs` - the load-bearing ordering: the loc/`inline_ctxs` side

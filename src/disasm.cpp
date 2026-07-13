@@ -486,6 +486,17 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << opsym(in.aop) << " " << RI(in.a(), false)
                 << " -> L" << in.target;
             break;
+        case OpCode::IntAddModRI:
+            /* E4 fusion */
+            row << "i.addmod     " << D(in.target) << " = ("
+                << RI(in.a(), false) << " + " << RI(in.b(), false)
+                << ") % #" << in.target2;
+            break;
+        case OpCode::JumpUnlessElemInt:
+            /* E4 fusion */
+            row << "jmp.ifnotel  " << D(in.target2) << "["
+                << RI(in.a(), false) << "], L" << in.target;
+            break;
         case OpCode::LoadElemInt:
             row << "load.elem.i  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a(), false) << "]";

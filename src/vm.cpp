@@ -2177,6 +2177,56 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
         VM_NEXT;
 
+        VM_CASE(IntAddModRI): {
+            /* E4 fusion: dst = (a + b) % imm - the checksum shape. Never
+             * throws (imm nonzero by selection, the add wraps). */
+            const int_type av = in->a_is_lit()
+                ? in->a_lit() : read_int_slot(&ctx, in->a_slot());
+            const int_type bv = in->b_is_lit()
+                ? in->b_lit() : read_int_slot(&ctx, in->b_slot());
+            ML_VM_CHECK(in->target2 != 0);
+            write_int_slot(&ctx, in->target,
+                           (av + bv) % static_cast<int_type>(in->target2));
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(JumpUnlessElemInt): {
+            /* E4 fusion: `if (arr[i]) ...` - LoadElemInt + JumpUnlessTrueV in
+             * one dispatch (the sieve test). Same read/bounds as LoadElemInt
+             * (whose node/loc this op KEPT - the OOB caret is byte-identical);
+             * the elem temp was proven dead on both paths, so nothing is
+             * written. */
+            const EvalValue &base = ctx.frame->at(in->target2).get();
+            if (base.is<SharedArrayObj>()) {
+                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+                int_type idx = read_int_operand(in->a(), &ctx);
+                if (idx < 0)
+                    idx += arr.size();
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
+                }
+                const size_type at = arr.offset() + idx;
+                int_type v;
+                if (arr.skind() == SharedArrayObj::Storage::ints)
+                    v = arr.flat_ints()[at];
+                else if (arr.skind() == SharedArrayObj::Storage::bools)
+                    v = arr.flat_bools()[at] ? 1 : 0;
+                else
+                    v = arr.get_vec()[at].getval<int_type>();
+                if (v == 0) {
+                    pc = in->target;
+                    VM_NEXT;
+                }
+            } else {
+                throw InternalErrorEx();   /* base proven an array */
+            }
+            pc++;
+        }
+        VM_NEXT;
+
         VM_CASE(LoadElemInt): {
 
             /* a[i] into a temp (mirrors Subscript::eval_int for a flat array;

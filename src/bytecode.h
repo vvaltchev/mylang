@@ -1027,6 +1027,27 @@ enum class OpCode : unsigned char {
     LoadMemberInt, LoadMemberFloat,
 
     /*
+     * E4 FUSIONS (plans/vm-peephole.md) - adjacent-pair superinstructions the
+     * peephole's fusion rules synthesize, CHOSEN FROM THE DYNAMIC PAIR
+     * PROFILE (760M dispatches over the bench suite; each rule requires the
+     * intermediate temp DEAD - the existing liveness - and no branch target
+     * on the second op):
+     *
+     * IntAddModRI - `IntAdd{RR,RI} t = a + b; IntModRI dst = t % imm` (3.4%
+     * of all dispatches: the checksum shape `s = (s + x) % M`) fuses to
+     * `dst = (a + b) % imm`. NEVER THROWS (the ModRI imm is nonzero by
+     * selection; the add wraps) - loc/node-free. The int32 imm rides in
+     * `target2` (gated on fitting; 1e9+7 does), operands in a/b.
+     *
+     * JumpUnlessElemInt - `LoadElemInt t = arr[i]; JumpUnlessTrueV t, L`
+     * (1.7%: the sieve test `if (a[i]) ...`) fuses to "load + test + branch"
+     * in one dispatch. Keeps the LOAD's node/loc (the OOB caret) - the
+     * fused op is written over the load in place, so node_idx rides along.
+     * target = L, target2 = the array base slot, a = the index operand.
+     */
+    IntAddModRI, JumpUnlessElemInt,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1073,7 +1094,7 @@ enum class OpCode : unsigned char {
     X(IntXorRR) X(IntXorRI) X(IntShlRR) X(IntShlRI) X(IntShrRR) \
     X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
     X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV) \
-    X(LoadMemberInt) X(LoadMemberFloat)
+    X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin
