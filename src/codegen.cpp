@@ -537,6 +537,10 @@ bool boxed_literal(const Construct *e, EvalValue &out)
  */
 struct Codegen {
 
+    /* The CODEGEN-side instruction vector (CgInstr = Instr + the transient
+     * node_idx handle); codegen_chunk SLICES it into code at the end,
+     * so the runtime Chunk never holds a node handle AT THE TYPE LEVEL. */
+    std::vector<CgInstr> code;
     Chunk chunk;
 
     /* Temp (scratch register) allocator. temp_base == the frame's slot_count;
@@ -559,7 +563,7 @@ struct Codegen {
     int sfe_ctr_slot = -1;
     const StructTypeDef *sfe_def = nullptr;
 
-    int here() const { return static_cast<int>(chunk.code.size()); }
+    int here() const { return static_cast<int>(code.size()); }
 
     /* CODEGEN-SCRATCH node registry: `Instr::node_idx` indexes it - the
      * splice-stable handle an op uses to reach its node before its final pc
@@ -605,13 +609,13 @@ struct Codegen {
     size_t emit(OpCode op, const Construct *node = nullptr,
                 int target = -1, int target2 = -1)
     {
-        Instr in;
+        CgInstr in;
         in.op = op;
         in.node_idx = add_ast_node(node);
         in.target = target;
         in.target2 = target2;
-        chunk.code.push_back(in);
-        return chunk.code.size() - 1;
+        code.push_back(in);
+        return code.size() - 1;
     }
 
     int alloc_temp()
@@ -625,9 +629,9 @@ struct Codegen {
     /* Emit a ThrowRuntimeV for an always-throwing construct: pool the exception
      * kind + caret (+ name) and append the op. AST-free. See Chunk::ThrowSite. */
     void emit_throw(Chunk::ThrowKind kind, Loc s, Loc e,
-                    const UniqueId *name, std::vector<Instr> &ops)
+                    const UniqueId *name, std::vector<CgInstr> &ops)
     {
-        Instr in;
+        CgInstr in;
         in.op = OpCode::ThrowRuntimeV;
         in.target = static_cast<int>(chunk.throws.size());
         chunk.throws.push_back({ kind, s, e, name });
@@ -716,9 +720,9 @@ struct Codegen {
     void pop_loop(int lend, int lcont)
     {
         for (size_t j : loops.back().breaks)
-            chunk.code[j].target = lend;
+            code[j].target = lend;
         for (size_t j : loops.back().conts)
-            chunk.code[j].target = lcont;
+            code[j].target = lcont;
         loops.pop_back();
     }
 
@@ -729,23 +733,23 @@ struct Codegen {
     bool emit_init(const Construct *init)
     {
         reset_temps();
-        const size_t mark = chunk.code.size();
-        if (compile_int_stmt(init, chunk.code))
+        const size_t mark = code.size();
+        if (compile_int_stmt(init, code))
             return true;
-        chunk.code.resize(mark);
+        code.resize(mark);
         reset_temps();
-        if (compile_float_stmt(init, chunk.code))
+        if (compile_float_stmt(init, code))
             return true;
-        chunk.code.resize(mark);
+        code.resize(mark);
         reset_temps();
         /* Boxed decl-init: `var k = i` (an int/bool leaf, or a dyn/string
          * value) - the int path rejects a bare identifier rhs (it can't prove
          * int-not-bool for a raw int store), but a boxed move preserves the
          * rhs's real type. An UNCOMPILABLE init (exotic) fails the whole
          * loop to a NotLoweredEx compile abort - no per-init fallback. */
-        if (compile_boxed_stmt(init, chunk.code))
+        if (compile_boxed_stmt(init, code))
             return true;
-        chunk.code.resize(mark);
+        code.resize(mark);
         return false;
     }
 
@@ -818,7 +822,7 @@ struct Codegen {
      * scalar-arg literal declines here and falls to StructCtorV + MakeArrayV.
      */
     bool try_make_struct_array(const LiteralArray *la, int &out_slot,
-                               std::vector<Instr> &ops)
+                               std::vector<CgInstr> &ops)
     {
         const int n = static_cast<int>(la->elems.size());
         if (n == 0)
@@ -862,7 +866,7 @@ struct Codegen {
         }
 
         const int dst = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = OpCode::MakeStructArrayV;
         in.node_idx = add_ast_node(la->elems[0].get());   /* a ctor: defensive coerce loc (nulled) */
         in.target = dst;
@@ -876,7 +880,7 @@ struct Codegen {
     }
 
     bool compile_boxed_expr(const Construct *e, int &out_slot,
-                            std::vector<Instr> &ops)
+                            std::vector<CgInstr> &ops)
     {
         /*
          * Typed-arg lowering: a th==i/f node computes its int/float value via
@@ -904,7 +908,7 @@ struct Codegen {
                 }
                 /* an immediate result (a bare literal) -> materialize a slot */
                 const int t = alloc_temp();
-                Instr ld;
+                CgInstr ld;
                 ld.op = e->th == TypeHint::i ? OpCode::LoadImmInt
                                              : OpCode::LoadImmFloat;
                 ld.target = t;
@@ -971,7 +975,7 @@ struct Codegen {
             const size_t cmark = chunk.consts.size();
             const int st = next_temp;
             const int rslot = alloc_temp();
-            Instr ld;
+            CgInstr ld;
             ld.op = OpCode::LoadConstV;
             ld.target = rslot;
             ld.target2 = add_const(EvalValue());   /* none (fall-through) */
@@ -1043,7 +1047,7 @@ struct Codegen {
                 default: return false;
             }
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = op;
             in.node_idx = add_ast_node(id);              /* for the undefined-global loc/name */
             in.target = t;
@@ -1056,7 +1060,7 @@ struct Codegen {
         EvalValue lit;
         if (boxed_literal(e, lit)) {
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::LoadConstV;
             in.node_idx = add_ast_node(e);
             in.target = t;
@@ -1072,7 +1076,7 @@ struct Codegen {
          * fresh mutable clone, plus the general/flat_s cases). Node-free. */
         if (const LiteralObj *lo = dynamic_cast<const LiteralObj *>(e)) {
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::LoadLiteralObjV;
             in.target = t;
             in.target2 = static_cast<int>(chunk.literal_objs.size());
@@ -1092,7 +1096,7 @@ struct Codegen {
             if (fd->id)
                 return false;
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::MakeClosureV;
             in.target = t;
             in.target2 = static_cast<int>(chunk.closure_defs.size());
@@ -1140,7 +1144,7 @@ struct Codegen {
                         return false;
                     }
                     const int dst = alloc_temp();
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::StructCtorV;
                     in.node_idx = add_ast_node(ce);   /* loc for a defensive throw (nulled) */
                     in.target = dst;
@@ -1186,7 +1190,7 @@ struct Codegen {
                 for (const auto &a : ce->args->elems)
                     bc.arg_locs.push_back({ a->start, a->end });
                 const int dst = alloc_temp();
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::StructCtorBoxedV;
                 in.target = dst;
                 in.set_a(int_lit(base));
@@ -1233,7 +1237,7 @@ struct Codegen {
                 return false;
             }
             const int dst = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::MakeArrayV;
             in.target = dst;
             in.set_a(int_lit(base));
@@ -1270,7 +1274,7 @@ struct Codegen {
                 return false;
             }
             const int dst = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::MakeDictV;
             in.target = dst;
             in.set_a(int_lit(base));
@@ -1289,7 +1293,7 @@ struct Codegen {
                 || !compile_boxed_expr(sub->index.get(), idx_slot, ops))
                 return false;
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::SubscriptV;
             in.node_idx = add_ast_node(sub);
             in.target = t;
@@ -1306,7 +1310,7 @@ struct Codegen {
             if (!compile_boxed_expr(m->what.get(), base_slot, ops))
                 return false;
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::MemberV;
             in.node_idx = add_ast_node(m);                 /* extract_locs nulls it */
             in.target = t;
@@ -1332,7 +1336,7 @@ struct Codegen {
                 && !compile_boxed_expr(sl->end_idx.get(), end_slot, ops))
                 return false;
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::SliceV;
             in.node_idx = add_ast_node(sl);                /* extract_locs nulls it */
             in.target = t;
@@ -1397,7 +1401,7 @@ struct Codegen {
             if (!compile_boxed_expr(t->condExpr.get(), cslot, ops)) {
                 ops.resize(mark); next_temp = save_top; return false;
             }
-            Instr jf;
+            CgInstr jf;
             jf.op = OpCode::JumpUnlessTrueV;
             jf.target2 = cslot;
             const size_t jf_i = ops.size();
@@ -1408,11 +1412,11 @@ struct Codegen {
             if (!compile_boxed_expr(t->thenExpr.get(), aslot, ops)) {
                 ops.resize(mark); next_temp = save_top; return false;
             }
-            Instr mva;
+            CgInstr mva;
             mva.op = OpCode::MoveV; mva.target = dst; mva.target2 = aslot;
             ops.push_back(mva);
             const size_t jmp_i = ops.size();
-            Instr jend; jend.op = OpCode::Jump;
+            CgInstr jend; jend.op = OpCode::Jump;
             ops.push_back(jend);
             next_temp = scratch;
 
@@ -1422,7 +1426,7 @@ struct Codegen {
             if (!compile_boxed_expr(t->elseExpr.get(), bslot, ops)) {
                 ops.resize(mark); next_temp = save_top; return false;
             }
-            Instr mvb;
+            CgInstr mvb;
             mvb.op = OpCode::MoveV; mvb.target = dst; mvb.target2 = bslot;
             ops.push_back(mvb);
             next_temp = scratch;
@@ -1448,10 +1452,10 @@ struct Codegen {
             if (!compile_boxed_expr(co->lhs.get(), lslot, ops)) {
                 ops.resize(mark); next_temp = save_top; return false;
             }
-            Instr mvl;
+            CgInstr mvl;
             mvl.op = OpCode::MoveV; mvl.target = dst; mvl.target2 = lslot;
             ops.push_back(mvl);
-            Instr jn;
+            CgInstr jn;
             jn.op = OpCode::JumpIfNotNoneV;
             jn.set_a(slot_op(dst));
             const size_t jn_i = ops.size();
@@ -1462,7 +1466,7 @@ struct Codegen {
             if (!compile_boxed_expr(co->rhs.get(), rslot, ops)) {
                 ops.resize(mark); next_temp = save_top; return false;
             }
-            Instr mvr;
+            CgInstr mvr;
             mvr.op = OpCode::MoveV; mvr.target = dst; mvr.target2 = rslot;
             ops.push_back(mvr);
             next_temp = scratch;
@@ -1526,7 +1530,7 @@ struct Codegen {
                 if (!compile_boxed_expr(t->elems[0].second.get(), oslot, ops))
                     return false;
                 const int dst = alloc_temp();
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::UnaryV;
                 in.node_idx = add_ast_node(e);
                 in.target = dst;
@@ -1561,7 +1565,7 @@ struct Codegen {
             if (!compile_boxed_expr(operand, oslot, ops))
                 return false;
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::UnaryV;
             in.node_idx = add_ast_node(e);   /* loc for a `-str`/`~str` error */
             in.target = t;
@@ -1602,7 +1606,7 @@ struct Codegen {
      */
     bool emit_boxed_chain(
         const std::vector<std::pair<Op, unique_ptr<Construct>>> &elems,
-        char k, const Construct *node, int &out_slot, std::vector<Instr> &ops)
+        char k, const Construct *node, int &out_slot, std::vector<CgInstr> &ops)
     {
         if (elems.empty() || elems[0].first != Op::invalid)
             return false;
@@ -1622,7 +1626,7 @@ struct Codegen {
             if (!boxed_operand(elems[i].second.get(), rhs_op, ops))
                 return false;
             const int t = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = k == 'a' ? OpCode::BinOpV
                   : k == 'c' ? OpCode::CmpV
                              : OpCode::LogV;
@@ -1645,7 +1649,7 @@ struct Codegen {
      * lower.
      */
     bool boxed_operand(const Construct *e, Operand &out,
-                       std::vector<Instr> &ops)
+                       std::vector<CgInstr> &ops)
     {
         if (auto *li = dynamic_cast<const LiteralInt *>(e)) {
             out = int_lit(li->ival());
@@ -1695,7 +1699,7 @@ struct Codegen {
      * target all fall back - byte-identical under the differential.
      */
     bool try_multi_literal_store(const Expr14 *e, const IdList *il,
-                                 std::vector<Instr> &ops)
+                                 std::vector<CgInstr> &ops)
     {
         const LiteralArray *la =
             dynamic_cast<const LiteralArray *>(e->rvalue.get());
@@ -1731,7 +1735,7 @@ struct Codegen {
         /* distribute: every snapshot is now computed, so the writes are
          * simultaneous (swap-safe). */
         for (int i = 0; i < n; i++) {
-            Instr mv;
+            CgInstr mv;
             mv.op = OpCode::MoveV;
             mv.node_idx = add_ast_node(e);
             mv.target = il->elems[i]->sym.slot;
@@ -1750,7 +1754,7 @@ struct Codegen {
      * Float/Str/None; NOT LiteralObj, which is an array/dict). An array / dyn
      * rvalue falls back to the strict `handle_single_expr14` destructure. */
     bool try_multi_scalar_spread(const Expr14 *e, const IdList *il,
-                                 std::vector<Instr> &ops)
+                                 std::vector<CgInstr> &ops)
     {
         const Construct *rv = e->rvalue.get();
         const bool scalar = rv->th == TypeHint::i || rv->th == TypeHint::f
@@ -1779,7 +1783,7 @@ struct Codegen {
             return false;
         }
         for (int i = 0; i < n; i++) {
-            Instr mv;
+            CgInstr mv;
             mv.op = OpCode::MoveV;
             mv.node_idx = add_ast_node(e);
             mv.target = il->elems[i]->sym.slot;
@@ -1799,7 +1803,7 @@ struct Codegen {
      * Every target must be a real or `_` slot, resolved-local, non-const,
      * non-typed (or dyn) - a typed/const/map target falls back. */
     bool try_multi_unpack(const Expr14 *e, const IdList *il,
-                          std::vector<Instr> &ops,
+                          std::vector<CgInstr> &ops,
                           Op compound_op = Op::invalid)
     {
         const size_t n = il->elems.size();
@@ -1837,7 +1841,7 @@ struct Codegen {
         for (const auto &t : il->elems)
             targets.push_back(t->is_underscore()
                                   ? -1 : static_cast<int32_t>(t->sym.slot));
-        Instr in;
+        CgInstr in;
         in.op = OpCode::MultiUnpackV;
         /* The strict-length caret matches the tree-walker: its IdList lvalue
          * carries no loc, so the error stamps the enclosing Expr14's span
@@ -1865,7 +1869,7 @@ struct Codegen {
         return true;
     }
 
-    bool compile_boxed_stmt(const Construct *s, std::vector<Instr> &ops)
+    bool compile_boxed_stmt(const Construct *s, std::vector<CgInstr> &ops)
     {
         /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
          * a compound StoreGlobalV/StoreCaptureV (x += 1 / x -= 1). A LOCAL
@@ -1886,7 +1890,7 @@ struct Codegen {
                  * (IntBin/FloatBin) before this. */
                 if (numeric && (id->sym.kind == SymKind::global
                                 || id->sym.kind == SymKind::capture)) {
-                    Instr in;
+                    CgInstr in;
                     in.op = id->sym.kind == SymKind::global
                                 ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
                     in.node_idx = add_ast_node(s);
@@ -1907,7 +1911,7 @@ struct Codegen {
                     case SymKind::global:  kind = 1; break;
                     default: return false;      /* builtin / unresolved */
                     }
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::IncDecCheckedV;
                     in.node_idx = add_ast_node(s);   /* TypeError caret */
                     in.target = id->sym.slot;
@@ -1935,7 +1939,7 @@ struct Codegen {
                 int kslot;
                 if (!compile_boxed_expr(sub->index.get(), kslot, ops))
                     return false;
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::IncDecElemCheckedV;
                 /* extract_locs: the BASE's span -> the loc side table (the
                  * undefined-global-base caret - the tree-walker marks the
@@ -1964,7 +1968,7 @@ struct Codegen {
                 int bslot, bkind;
                 if (!as_container_base(m->what.get(), bslot, bkind))
                     return false;
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::IncDecMemberCheckedV;
                 /* extract_locs: the inc-dec span -> the loc side table (the
                  * undefined-global-base caret) + inline_ctx; then node-free. */
@@ -2093,7 +2097,7 @@ struct Codegen {
             const int st = next_temp;
             int rslot;
             if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::DeclConstV;
                 in.target = lv->sym.slot;
                 in.target2 = lv->sym.kind == SymKind::global ? 1 : 0;
@@ -2157,7 +2161,7 @@ struct Codegen {
                  * store the coerced value. */
                 if (coerce_num) {
                     const int ct = alloc_temp();
-                    Instr co;
+                    CgInstr co;
                     co.op = OpCode::CoerceNumV;
                     co.node_idx = add_ast_node(s);   /* the Expr14 caret */
                     co.target = ct;
@@ -2166,7 +2170,7 @@ struct Codegen {
                     ops.push_back(co);
                     rslot = ct;
                 }
-                Instr in;
+                CgInstr in;
                 in.op = store_op;
                 in.target = lv->sym.slot;   /* global-table / capture slot */
                 in.set_a(slot_op(rslot));      /* aop invalid == plain assign */
@@ -2181,7 +2185,7 @@ struct Codegen {
                 chunk.consts.resize(cmark);
                 return false;
             }
-            Instr in;
+            CgInstr in;
             in.op = store_op;
             in.node_idx = add_ast_node(s);               /* loc: compound may throw (div/undef) */
             in.target = lv->sym.slot;
@@ -2200,7 +2204,7 @@ struct Codegen {
                 chunk.consts.resize(cmark);
                 return false;
             }
-            Instr in;
+            CgInstr in;
             in.op = OpCode::CompoundV;
             in.node_idx = add_ast_node(s);
             in.target = lv->sym.slot;
@@ -2221,7 +2225,7 @@ struct Codegen {
         /* A typed i/f LOCAL: CoerceNumV IS the store (dst = the lvalue slot,
          * src = the compiled rvalue) - the retarget/MoveV is subsumed. */
         if (coerce_num) {
-            Instr co;
+            CgInstr co;
             co.op = OpCode::CoerceNumV;
             co.node_idx = add_ast_node(s);           /* the Expr14 caret */
             co.target = lv->sym.slot;
@@ -2259,7 +2263,7 @@ struct Codegen {
                  * `a=a[1:]`, whose operand slots are read first). */
                 ops.back().target = lv->sym.slot;
             } else {
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::MoveV;
                 in.node_idx = add_ast_node(s);
                 in.target = lv->sym.slot;
@@ -2284,7 +2288,7 @@ struct Codegen {
      * the temp and never write back, so store codegen keeps as_array_slot.
      */
     bool compile_array_base(const Construct *e, int &out_slot,
-                            std::vector<Instr> &ops)
+                            std::vector<CgInstr> &ops)
     {
         if (as_array_slot(e, out_slot))
             return true;
@@ -2297,7 +2301,7 @@ struct Codegen {
             || !compile_int_expr(sub->index.get(), idx, ops))
             return false;
         const int t = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = OpCode::LoadElemValue;
         in.node_idx = add_ast_node(e);
         in.target = t;
@@ -2328,7 +2332,7 @@ struct Codegen {
      * back ops/next_temp). Shared by emit_args_range (call arg runs) and the
      * array/dict literal builders. */
     bool compile_to_run_slot(const Construct *e, int dst,
-                             std::vector<Instr> &ops)
+                             std::vector<CgInstr> &ops)
     {
         const int sub = next_temp;
         int out;
@@ -2341,7 +2345,7 @@ struct Codegen {
                    && op_writes_pure_target(ops.back().op)) {
             ops.back().target = dst;
         } else {
-            Instr mv;
+            CgInstr mv;
             mv.op = OpCode::MoveV;
             mv.target = dst;
             mv.target2 = out;
@@ -2352,7 +2356,7 @@ struct Codegen {
     }
 
     bool emit_args_range(const std::vector<unique_ptr<Construct>> &elems,
-                         int &argbase, std::vector<Instr> &ops, int start = 0)
+                         int &argbase, std::vector<CgInstr> &ops, int start = 0)
     {
         const size_t mark = ops.size();
         const int save_top = next_temp;
@@ -2375,7 +2379,7 @@ struct Codegen {
     }
 
     bool try_native_call(const DirectCallExpr *dc, int &out_slot,
-                         std::vector<Instr> &ops)
+                         std::vector<CgInstr> &ops)
     {
         if (!dc->vm_direct_func || dc->direct_func_slot < 0 || !dc->args)
             return false;
@@ -2385,7 +2389,7 @@ struct Codegen {
             return false;
 
         const int dst = alloc_temp();
-        Instr cv;
+        CgInstr cv;
         /* A CachedCallExpr (a pure tree-recursive callee the unroll dedups)
          * routes through the per-frame pure-call cache; else a plain call. */
         cv.op = dynamic_cast<const CachedCallExpr *>(dc)
@@ -2417,7 +2421,7 @@ struct Codegen {
      * An elem's INDEX temp stays live for the dispatch re-derive (all later
      * arg scratch is allocated above it). */
     bool compile_indirect_arg0(const Construct *e, int dst,
-                               Chunk::CallSite &cs, std::vector<Instr> &ops)
+                               Chunk::CallSite &cs, std::vector<CgInstr> &ops)
     {
         if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
             switch (id->sym.kind) {
@@ -2443,7 +2447,7 @@ struct Codegen {
                 int bval, kslot;
                 if (compile_boxed_expr(sub->what.get(), bval, ops)
                     && compile_boxed_expr(sub->index.get(), kslot, ops)) {
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::SubscriptV;
                     in.node_idx = add_ast_node(sub);   /* subscript caret */
                     in.target = dst;
@@ -2465,7 +2469,7 @@ struct Codegen {
                 int bval;
                 if (compile_boxed_expr(m->what.get(), bval, ops)) {
                     const int mk = add_member_key(m);
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::MemberV;
                     in.target = dst;
                     in.target2 = bval;
@@ -2484,7 +2488,7 @@ struct Codegen {
     }
 
     bool try_native_value_call(const CallExpr *call, int &out_slot,
-                               std::vector<Instr> &ops)
+                               std::vector<CgInstr> &ops)
     {
         if (dynamic_cast<const DirectCallExpr *>(call)
             || dynamic_cast<const DirectBuiltinCallExpr *>(call))
@@ -2516,7 +2520,7 @@ struct Codegen {
                 next_temp = save_top;
                 return false;
             }
-            Instr chk;
+            CgInstr chk;
             chk.op = OpCode::CheckCallableV;
             chk.node_idx = add_ast_node(call->what.get());  /* callee caret */
             chk.set_a(slot_op(callee_slot));
@@ -2553,7 +2557,7 @@ struct Codegen {
             chunk.call_sites.push_back(std::move(cs));
 
             const int dstg = alloc_temp();
-            Instr cvg;
+            CgInstr cvg;
             cvg.op = OpCode::CallValueGenericV;
             cvg.node_idx = add_ast_node(call);   /* call-site loc (extract) */
             cvg.target = dstg;
@@ -2576,7 +2580,7 @@ struct Codegen {
         }
 
         const int dst = alloc_temp();
-        Instr cv;
+        CgInstr cv;
         cv.op = OpCode::CallValueV;
         cv.node_idx = add_ast_node(call);
         cv.target = dst;
@@ -2599,7 +2603,7 @@ struct Codegen {
      * here (the call site falls back whole). AST-free (the slot is known;
      * never throws). */
     bool try_native_defined_global(const DirectBuiltinCallExpr *dc,
-                                   int &out_slot, std::vector<Instr> &ops)
+                                   int &out_slot, std::vector<CgInstr> &ops)
     {
         const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
         if (!callee || callee->get_str() != "defined")
@@ -2611,7 +2615,7 @@ struct Codegen {
         if (!arg || arg->sym.kind != SymKind::global)
             return false;
         const int dst = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = OpCode::DefinedGlobalV;
         in.target = dst;
         in.target2 = arg->sym.slot;
@@ -2631,7 +2635,7 @@ struct Codegen {
      * DefinedGlobalV); an unresolved name INSIDE the arg throws via its own
      * lowering, matching the tree-walker's RValue. AST-free. */
     bool try_native_defined_expr(const DirectBuiltinCallExpr *dc,
-                                 int &out_slot, std::vector<Instr> &ops)
+                                 int &out_slot, std::vector<CgInstr> &ops)
     {
         const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
         if (!callee || callee->get_str() != "defined" || !dc->args)
@@ -2653,7 +2657,7 @@ struct Codegen {
             return false;
         }
         const int dst = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = OpCode::LoadConstV;
         in.target = dst;
         in.target2 = add_const(EvalValue(true));
@@ -2674,7 +2678,7 @@ struct Codegen {
      * NEVER THROWS for a numeric operand, so it is loc- and node-free.
      */
     bool try_math_fn(const DirectBuiltinCallExpr *dc, int &out_slot,
-                     std::vector<Instr> &ops)
+                     std::vector<CgInstr> &ops)
     {
         struct Ent { const UniqueId *uid; MathFn fn; int nargs; };
         static const std::vector<Ent> tbl = [] {
@@ -2722,7 +2726,7 @@ struct Codegen {
                 return false;
             }
             const int dst = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::MathFnV;
             in.target = dst;
             in.target2 = static_cast<int>(e.fn);
@@ -2737,7 +2741,7 @@ struct Codegen {
     }
 
     bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
-                            std::vector<Instr> &ops)
+                            std::vector<CgInstr> &ops)
     {
         /* A mutating builtin's union holds func_lv (which aliases func_v's
          * storage, so the null test below can't distinguish it) - its arg0 is
@@ -2752,7 +2756,7 @@ struct Codegen {
             return false;
 
         const int dst = alloc_temp();
-        Instr cv;
+        CgInstr cv;
         cv.op = OpCode::CallBuiltinV;
         /* AST-free: the builtin + its arg carets live in the builtin_calls pool
          * (index in target2), so no node. */
@@ -2771,7 +2775,7 @@ struct Codegen {
      * container) into t1, then MapFilterV(dst, t0, t1). Both are read-only, so
      * this is an EXPRESSION-position lowering (compile_boxed_expr). */
     bool try_native_map_filter(const DirectBuiltinCallExpr *dc, int &out_slot,
-                               std::vector<Instr> &ops)
+                               std::vector<CgInstr> &ops)
     {
         if (dc->map_filter_kind == 0 || !dc->args
             || dc->args->elems.size() != 2)
@@ -2788,7 +2792,7 @@ struct Codegen {
             chunk.consts.resize(cmark);
             return false;
         }
-        Instr chk;
+        CgInstr chk;
         chk.op = OpCode::CheckFuncV;
         chk.node_idx = add_ast_node(dc->args->elems[0].get());   /* arg0's caret */
         chk.set_a(slot_op(t0));
@@ -2803,7 +2807,7 @@ struct Codegen {
         }
 
         const int dst = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = OpCode::MapFilterV;
         in.node_idx = add_ast_node(dc->args->elems[1].get());    /* arg1's caret (container) */
         in.target = dst;
@@ -2822,7 +2826,7 @@ struct Codegen {
      * arg node). A subscript/member/other arg0 (or an unresolved one)
      * declines - the whole statement falls back. */
     bool try_native_mutating_builtin(const DirectBuiltinCallExpr *dc,
-                                     int &out_slot, std::vector<Instr> &ops)
+                                     int &out_slot, std::vector<CgInstr> &ops)
     {
         if (!dc->builtin.func_lv || !dc->args)
             return false;
@@ -2875,7 +2879,7 @@ struct Codegen {
                             runbase + 1 + i, ops);
                     if (ok) {
                         const int dst = alloc_temp();
-                        Instr cv;
+                        CgInstr cv;
                         cv.op = OpCode::CallBuiltinLVElem;
                         /* AST-free: builtin + carets in the pool (a.slot); a.lit
                          * = the base slot kind, b = the run base. */
@@ -2926,7 +2930,7 @@ struct Codegen {
                                                  runbase + i, ops);
                     if (ok) {
                         const int dst = alloc_temp();
-                        Instr cv;
+                        CgInstr cv;
                         cv.op = OpCode::CallBuiltinLVMember;
                         cv.target = dst;
                         cv.target2 =
@@ -3039,7 +3043,7 @@ struct Codegen {
                     chunk.emplace_sites.push_back(std::move(site));
 
                     const int dst = alloc_temp();
-                    Instr cv;
+                    CgInstr cv;
                     cv.op = OpCode::EmplaceStruct;
                     cv.node_idx = add_ast_node(dc);
                     cv.target = dst;
@@ -3095,7 +3099,7 @@ struct Codegen {
         }
 
         const int dst = alloc_temp();
-        Instr cv;
+        CgInstr cv;
         cv.op = OpCode::CallBuiltinLV;
         /* D1: the plain `append(a, x)` / `push(a, x)` shape (rest-native,
          * exactly one value arg) gets the dedicated AppendV - same operand
@@ -3155,9 +3159,9 @@ struct Codegen {
             /* pop this try's handler, unless the flow op is in the INNERMOST
              * try's catch body (the dispatch already popped it there). */
             if (!(j == 0 && tf.in_catch)) {
-                Instr ph;
+                CgInstr ph;
                 ph.op = OpCode::PopHandler;
-                chunk.code.push_back(ph);
+                code.push_back(ph);
             }
             if (tf.finally_body) {
                 trys.resize(ti);                    /* active trys = [0, T_i) */
@@ -3195,7 +3199,7 @@ struct Codegen {
         return true;
     }
 
-    bool try_native_return(const ReturnStmt *ret, std::vector<Instr> &ops)
+    bool try_native_return(const ReturnStmt *ret, std::vector<CgInstr> &ops)
     {
         const size_t mark = ops.size();
         const int save_top = next_temp;
@@ -3209,7 +3213,7 @@ struct Codegen {
             }
         } else {
             vslot = alloc_temp();
-            Instr ld;
+            CgInstr ld;
             ld.op = OpCode::LoadConstV;
             ld.target = vslot;
             ld.target2 = add_const(EvalValue());   /* none */
@@ -3230,7 +3234,7 @@ struct Codegen {
             const size_t crossed = trys.size() - ir.try_base;
             if (crossed > 0) {
                 const int vtmp = alloc_temp();
-                Instr cp;
+                CgInstr cp;
                 cp.op = OpCode::MoveV;
                 cp.target = vtmp;
                 cp.target2 = vslot;
@@ -3250,13 +3254,13 @@ struct Codegen {
                 }
                 vslot = vtmp;            /* the boundary reads the copy */
             }
-            Instr mv;
+            CgInstr mv;
             mv.op = OpCode::MoveV;
             mv.target = ir.rslot;
             mv.target2 = vslot;
             ops.push_back(mv);
             ir.jumps.push_back(ops.size());
-            Instr jp;
+            CgInstr jp;
             jp.op = OpCode::Jump;
             ops.push_back(jp);           /* .target backpatched to body end */
             next_temp = save_top;
@@ -3288,7 +3292,7 @@ struct Codegen {
              * f() first), and read by ReturnV after. Then protect the copy by
              * raising the temp base above it. */
             const int vtmp = alloc_temp();
-            Instr mv;
+            CgInstr mv;
             mv.op = OpCode::MoveV;
             mv.target = vtmp;
             mv.target2 = vslot;
@@ -3309,7 +3313,7 @@ struct Codegen {
             vslot = vtmp;                        /* ReturnV reads the copy */
         }
 
-        Instr rv;
+        CgInstr rv;
         rv.op = OpCode::ReturnV;
         rv.node_idx = add_ast_node(ret);
         rv.set_a(slot_op(vslot));
@@ -3319,7 +3323,7 @@ struct Codegen {
 
     /* P8 Inc 1: `throw <expr>` -> compile the value into a temp + a native Throw
      * op (a same-frame catch is a native jump, no C++ throw). Self-cleaning. */
-    bool try_native_throw(const ThrowStmt *th, std::vector<Instr> &ops)
+    bool try_native_throw(const ThrowStmt *th, std::vector<CgInstr> &ops)
     {
         const size_t mark = ops.size();
         const int save_top = next_temp;
@@ -3329,7 +3333,7 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
-        Instr in;
+        CgInstr in;
         in.op = OpCode::Throw;
         in.node_idx = add_ast_node(th);                 /* throw-site loc (extract_locs) */
         in.set_a(slot_op(vslot));
@@ -3339,9 +3343,9 @@ struct Codegen {
 
     /* P8 Inc 2a: `rethrow` (only in a catch body) -> a native Rethrow op
      * (re-raise vm_exc with the rethrow-site loc). Always succeeds. */
-    void emit_rethrow(const RethrowStmt *rt, std::vector<Instr> &ops)
+    void emit_rethrow(const RethrowStmt *rt, std::vector<CgInstr> &ops)
     {
-        Instr in;
+        CgInstr in;
         in.op = OpCode::Rethrow;
         in.node_idx = add_ast_node(rt);                 /* rethrow-site loc (extract_locs) */
         ops.push_back(in);
@@ -3354,7 +3358,7 @@ struct Codegen {
      * wrong-th / non-local base, so the caller falls through to the array/boxed
      * path. `th` guards the value type (i for DictLoadInt, f for Float). */
     bool try_dict_scalar_load(const Construct *e, int &tt,
-                              std::vector<Instr> &ops, OpCode op, TypeHint th)
+                              std::vector<CgInstr> &ops, OpCode op, TypeHint th)
     {
         if (e->th != th)
             return false;
@@ -3363,7 +3367,7 @@ struct Codegen {
             if (!m->base_dict || !as_array_slot(m->what.get(), dslot))
                 return false;
             tt = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = op;
             in.node_idx = add_ast_node(m);                 /* extract_locs records + nulls */
             in.target = tt;
@@ -3381,7 +3385,7 @@ struct Codegen {
                 || !compile_boxed_expr(sub->index.get(), kslot, ops))
                 return false;
             tt = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = op;
             in.node_idx = add_ast_node(sub);
             in.target = tt;
@@ -3399,7 +3403,7 @@ struct Codegen {
      * (struct_fe_body_ok) already proved the base is the loop var + the field a
      * scalar, so this can't misfire. */
     bool try_sfe_field(const MemberExpr *m, Operand &out,
-                       std::vector<Instr> &ops, OpCode fieldop)
+                       std::vector<CgInstr> &ops, OpCode fieldop)
     {
         if (sfe_loop_slot < 0)
             return false;
@@ -3413,7 +3417,7 @@ struct Codegen {
             return false;
         const int fidx = static_cast<int>(f - sfe_def->fields.data());
         const int tt = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = fieldop;
         in.target = tt;
         in.target2 = sfe_arr_slot;
@@ -3434,7 +3438,7 @@ struct Codegen {
      * `?.` stays on the boxed MemberV path.
      */
     bool try_member_scalar(const MemberExpr *m, Operand &out,
-                           std::vector<Instr> &ops, OpCode op)
+                           std::vector<CgInstr> &ops, OpCode op)
     {
         if (!m->base_struct || m->optional)
             return false;
@@ -3443,7 +3447,7 @@ struct Codegen {
         if (!bid || bid->sym.kind != SymKind::local)
             return false;
         const int tt = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = op;
         in.target = tt;
         in.target2 = bid->sym.slot;
@@ -3465,7 +3469,7 @@ struct Codegen {
      * bin.v/cmp.v/jmp.ifnot.v chains into IntBin/JumpUnlessIntCmp.
      */
     bool try_typed_ternary(const Construct *e, Operand &out,
-                           std::vector<Instr> &ops, bool flt)
+                           std::vector<CgInstr> &ops, bool flt)
     {
         const TernaryExpr *t = dynamic_cast<const TernaryExpr *>(e);
         if (!t)
@@ -3486,7 +3490,7 @@ struct Codegen {
                 Operand a, b;
                 Op cmp;
                 if (compile_int_cond(t->condExpr.get(), ops, a, cmp, b)) {
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::JumpUnlessIntCmp;
                     in.aop = cmp; in.set_a(a); in.set_b(b);
                     cj = ops.size();
@@ -3497,7 +3501,7 @@ struct Codegen {
                     next_temp = scratch;
                     if (compile_float_cond(t->condExpr.get(), ops,
                                            a, cmp, b)) {
-                        Instr in;
+                        CgInstr in;
                         in.op = OpCode::JumpUnlessFloatCmp;
                         in.aop = cmp; in.set_a(a); in.set_b(b);
                         cj = ops.size();
@@ -3517,7 +3521,7 @@ struct Codegen {
                 next_temp = save_top;
                 return false;
             }
-            Instr in;
+            CgInstr in;
             in.op = OpCode::JumpUnlessTrueV;
             in.target2 = cslot;
             cj = ops.size();
@@ -3527,7 +3531,7 @@ struct Codegen {
 
         /* dst = <operand>: a lit -> LoadImm, a slot -> MoveV (E1 retargets). */
         const auto store_arm = [&](const Operand &o) {
-            Instr in;
+            CgInstr in;
             if (o.is_lit) {
                 in.op = flt ? OpCode::LoadImmFloat : OpCode::LoadImmInt;
                 in.target = dst;
@@ -3550,7 +3554,7 @@ struct Codegen {
         store_arm(a1);
         const size_t jmp_i = ops.size();
         {
-            Instr j;
+            CgInstr j;
             j.op = OpCode::Jump;
             ops.push_back(j);
         }
@@ -3573,7 +3577,7 @@ struct Codegen {
     }
 
     bool compile_int_expr(const Construct *e, Operand &out,
-                          std::vector<Instr> &ops)
+                          std::vector<CgInstr> &ops)
     {
         if (as_int_operand(e, out))
             return true;
@@ -3608,7 +3612,7 @@ struct Codegen {
                 || !compile_int_expr(sub->index.get(), idx, ops))
                 return false;
             const int tt = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::LoadElemInt;
             in.node_idx = add_ast_node(e);
             in.target = tt;
@@ -3667,7 +3671,7 @@ struct Codegen {
                 if (!compile_int_expr(t->elems[i].second.get(), rhs, ops))
                     return false;
                 const int tt = alloc_temp();
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::IntBin;
                 in.node_idx = add_ast_node(e);
                 in.target = tt;
@@ -3686,7 +3690,7 @@ struct Codegen {
             if (!compile_int_expr(t->elems[0].second.get(), op, ops))
                 return false;
             const int tt = alloc_temp();
-            Instr in;                    /* tt = 0 - op */
+            CgInstr in;                    /* tt = 0 - op */
             in.op = OpCode::IntBin;
             in.node_idx = add_ast_node(e);
             in.target = tt;
@@ -3713,7 +3717,7 @@ struct Codegen {
      * walk uses the same Type::subscript / member-lvalue / vm_member_store /
      * vm_subscript_store the tree-walker's chained do_eval does.
      */
-    bool try_native_chain_store(const Expr14 *e, std::vector<Instr> &ops)
+    bool try_native_chain_store(const Expr14 *e, std::vector<CgInstr> &ops)
     {
         switch (e->op) {
         case Op::assign: case Op::addeq: case Op::subeq:
@@ -3812,7 +3816,7 @@ struct Codegen {
         const int steps_idx = static_cast<int>(chunk.chain_steps.size());
         chunk.chain_steps.push_back(std::move(steps));
 
-        Instr in;
+        CgInstr in;
         in.op = OpCode::StoreLValueChainV;
         in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
         in.target = vslot;                             /* value temp */
@@ -3840,7 +3844,7 @@ struct Codegen {
      * VALUE, so `mk()[0]++` still throws NotLValueEx).
      */
     bool try_incdec_chain(const IncDecExpr *inc, int &out_slot,
-                          std::vector<Instr> &ops)
+                          std::vector<CgInstr> &ops)
     {
         /* Decompose OUTSIDE-IN, like try_native_chain_store. */
         std::vector<const Construct *> chain;   /* outermost-first */
@@ -3922,7 +3926,7 @@ struct Codegen {
         chunk.incdec_chains.push_back(std::move(site));
 
         const int dst = alloc_temp();
-        Instr in;
+        CgInstr in;
         in.op = OpCode::IncDecChainV;
         /* extract_locs: the inc-dec span -> the loc side table (the
          * undefined-global-root caret) + inline_ctx; then node-free. */
@@ -3943,13 +3947,13 @@ struct Codegen {
      * `x = <definitely-int expr>`. Returns false otherwise (a plain assign of a
      * bare/ bool rhs, a decl, a call, ...) so the loop falls back.
      */
-    bool compile_int_stmt(const Construct *s, std::vector<Instr> &ops)
+    bool compile_int_stmt(const Construct *s, std::vector<CgInstr> &ops)
     {
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             Operand dst;
             if (inc->th == TypeHint::i && as_int_operand(inc->lvalue.get(), dst)
                 && !dst.is_lit) {
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::IntBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
@@ -3980,7 +3984,7 @@ struct Codegen {
                     if (!as_array_slot(inner->what.get(), aslot))
                         return false;
                     const int one = alloc_temp();
-                    Instr ld;
+                    CgInstr ld;
                     ld.op = OpCode::LoadConstV;
                     ld.target = one;
                     ld.target2 = add_const(EvalValue((int_type)1));
@@ -3989,7 +3993,7 @@ struct Codegen {
                     if (!compile_boxed_expr(inner->index.get(), k1slot, ops)
                         || !compile_boxed_expr(sub->index.get(), k2slot, ops))
                         return false;
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::StoreElem2V;
                     in.target = one;                   /* the boxed-1 value slot */
                     in.target2 = aslot;
@@ -4008,7 +4012,7 @@ struct Codegen {
                     if (!as_container_base(sub->what.get(), aslot, akind)
                         || !compile_int_expr(sub->index.get(), idx, ops))
                         return false;
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::StoreElemInt;
                     in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
                     in.target = akind;   /* base kind: 0 loc / 1 gbl / 2 cap */
@@ -4031,7 +4035,7 @@ struct Codegen {
                     if (!as_container_base(sub->what.get(), dslot, dkind))
                         return false;
                     const int vtemp = alloc_temp();   /* the boxed 1 (value) */
-                    Instr ld;
+                    CgInstr ld;
                     ld.op = OpCode::LoadConstV;
                     ld.target = vtemp;
                     ld.target2 = add_const(EvalValue((int_type)1));
@@ -4039,7 +4043,7 @@ struct Codegen {
                     int kslot;
                     if (!compile_boxed_expr(sub->index.get(), kslot, ops))
                         return false;
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::DictStore;
                     in.node_idx = add_ast_node(sub);
                     in.target = dkind;   /* base kind: 0 loc / 1 gbl / 2 cap */
@@ -4069,15 +4073,15 @@ struct Codegen {
                 if (!as_container_base(m->what.get(), bslot, bkind))
                     return false;
                 const int one = alloc_temp();
-                Instr ld;
+                CgInstr ld;
                 ld.op = OpCode::LoadConstV;
                 ld.target = one;
                 ld.target2 = add_const(EvalValue((int_type)1));
                 ops.push_back(ld);
                 const Op cop = inc->is_inc ? Op::addeq : Op::subeq;
-                Instr in;
+                CgInstr in;
                 if (m->base_dict) {
-                    Instr kin;               /* the member name as a string key */
+                    CgInstr kin;               /* the member name as a string key */
                     kin.op = OpCode::LoadConstV;
                     kin.node_idx = add_ast_node(m);
                     kin.target = alloc_temp();
@@ -4150,7 +4154,7 @@ struct Codegen {
                         || !compile_boxed_expr(inner->index.get(), k1slot, ops)
                         || !compile_boxed_expr(sub->index.get(), k2slot, ops))
                         return false;
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::StoreElem2V;
                     in.target = vslot;
                     in.target2 = aslot;
@@ -4199,7 +4203,7 @@ struct Codegen {
                 locnodes.reserve(static_cast<size_t>(nkeys));
                 for (int k = 0; k < nkeys; k++)
                     locnodes.push_back(chain[nkeys - 1 - k]);
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::StoreElemChainV;
                 in.target = vslot;
                 in.target2 = bslot;
@@ -4230,7 +4234,7 @@ struct Codegen {
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
                     || !compile_boxed_expr(sub->index.get(), kslot, ops))
                     return false;
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::DictStore;
                 in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
                 in.target = dkind;   /* base kind: 0 local / 1 global / 2 cap */
@@ -4279,7 +4283,7 @@ struct Codegen {
                         vok = compile_int_expr(e->rvalue.get(), val, ops);
                     }
                     if (vok && compile_int_expr(sub->index.get(), idx, ops)) {
-                        Instr in;
+                        CgInstr in;
                         in.op = OpCode::StoreElemInt;
                         /* OOB/type errors carry the SUBSCRIPT loc (matching the
                          * tree-walker's flat_store_core), a COMPOUND div0 the
@@ -4324,7 +4328,7 @@ struct Codegen {
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
                     || !compile_boxed_expr(sub->index.get(), kslot, ops))
                     return false;
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::StoreElemValue;
                 in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
                 in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
@@ -4357,13 +4361,13 @@ struct Codegen {
                 int vslot;
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
                     return false;
-                Instr kin;               /* the member name as a string key */
+                CgInstr kin;               /* the member name as a string key */
                 kin.op = OpCode::LoadConstV;
                 kin.node_idx = add_ast_node(m);
                 kin.target = alloc_temp();
                 kin.target2 = add_const(m->memId);
                 ops.push_back(kin);
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::DictStore;
                 in.node_idx = add_ast_node(m);             /* for its loc (extract_locs) */
                 in.target = dkind;       /* base kind: 0 local / 1 gbl / 2 cap */
@@ -4390,7 +4394,7 @@ struct Codegen {
                 int vslot;
                 if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
                     return false;
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::StoreMemberV;
                 in.target = skind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = sslot;
@@ -4419,14 +4423,14 @@ struct Codegen {
                 && ops.back().target == r.slot) {
                 ops.back().target = dst.slot;
             } else if (r.is_lit) {
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::LoadImmInt;
                 in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
                 in.set_a(r);
                 ops.push_back(in);
             } else {
-                Instr in;                /* dst = r + 0 (slot copy) */
+                CgInstr in;                /* dst = r + 0 (slot copy) */
                 in.op = OpCode::IntBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
@@ -4451,7 +4455,7 @@ struct Codegen {
         Operand rhs;                     /* dst = dst <arith> rhs (rhs nested) */
         if (!compile_int_expr(e->rvalue.get(), rhs, ops))
             return false;
-        Instr in;
+        CgInstr in;
         in.op = OpCode::IntBin;
         in.node_idx = add_ast_node(s);
         in.target = dst.slot;
@@ -4467,7 +4471,7 @@ struct Codegen {
      * any operand-computation ops (a nested `(x+1) < N`) to `ops`. False for a
      * non-int / non-comparison condition.
      */
-    bool compile_int_cond(const Construct *cond, std::vector<Instr> &ops,
+    bool compile_int_cond(const Construct *cond, std::vector<CgInstr> &ops,
                           Operand &a, Op &cmp, Operand &b)
     {
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
@@ -4485,7 +4489,7 @@ struct Codegen {
      * destination is never a bool slot. */
 
     bool compile_float_expr(const Construct *e, Operand &out,
-                            std::vector<Instr> &ops)
+                            std::vector<CgInstr> &ops)
     {
         if (as_float_operand(e, out))
             return true;
@@ -4519,7 +4523,7 @@ struct Codegen {
                 || !compile_int_expr(sub->index.get(), idx, ops))
                 return false;
             const int tt = alloc_temp();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::LoadElemFloat;
             in.node_idx = add_ast_node(e);
             in.target = tt;
@@ -4570,7 +4574,7 @@ struct Codegen {
                 if (!compile_float_expr(t->elems[i].second.get(), rhs, ops))
                     return false;
                 const int tt = alloc_temp();
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(e);
                 in.target = tt;
@@ -4589,7 +4593,7 @@ struct Codegen {
             if (!compile_float_expr(t->elems[0].second.get(), op, ops))
                 return false;
             const int tt = alloc_temp();
-            Instr in;                    /* tt = 0.0 - op */
+            CgInstr in;                    /* tt = 0.0 - op */
             in.op = OpCode::FloatBin;
             in.node_idx = add_ast_node(e);
             in.target = tt;
@@ -4604,14 +4608,14 @@ struct Codegen {
         return false;
     }
 
-    bool compile_float_stmt(const Construct *s, std::vector<Instr> &ops)
+    bool compile_float_stmt(const Construct *s, std::vector<CgInstr> &ops)
     {
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             const Identifier *id =
                 dynamic_cast<const Identifier *>(inc->lvalue.get());
             if (inc->th == TypeHint::f && id
                 && id->sym.kind == SymKind::local && id->th == TypeHint::f) {
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(s);
                 in.target = id->sym.slot;
@@ -4631,7 +4635,7 @@ struct Codegen {
                     if (!as_array_slot(sub->what.get(), aslot)
                         || !compile_int_expr(sub->index.get(), idx, ops))
                         return false;
-                    Instr in;
+                    CgInstr in;
                     in.op = OpCode::StoreElemFloat;
                     in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
                     in.target2 = aslot;
@@ -4672,7 +4676,7 @@ struct Codegen {
             if (!compile_float_expr(e->rvalue.get(), val, ops)
                 || !compile_int_expr(sub->index.get(), idx, ops))
                 return false;
-            Instr in;
+            CgInstr in;
             in.op = OpCode::StoreElemFloat;
             /* PLAIN assign -> the SUBSCRIPT loc (OOB/type, matching the tree-
              * walker); a COMPOUND -> the Expr14 loc (for its div0). See the
@@ -4705,14 +4709,14 @@ struct Codegen {
                 && ops.back().target == r.slot) {
                 ops.back().target = dslot;
             } else if (r.is_lit) {
-                Instr in;
+                CgInstr in;
                 in.op = OpCode::LoadImmFloat;
                 in.node_idx = add_ast_node(s);
                 in.target = dslot;
                 in.set_a(r);
                 ops.push_back(in);
             } else {
-                Instr in;                /* dst = r + 0.0 (slot copy) */
+                CgInstr in;                /* dst = r + 0.0 (slot copy) */
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dslot;
@@ -4737,7 +4741,7 @@ struct Codegen {
         Operand rhs;                     /* dst = dst <arith> rhs */
         if (!compile_float_expr(e->rvalue.get(), rhs, ops))
             return false;
-        Instr in;
+        CgInstr in;
         in.op = OpCode::FloatBin;
         in.node_idx = add_ast_node(s);
         in.target = dslot;
@@ -4748,7 +4752,7 @@ struct Codegen {
         return true;
     }
 
-    bool compile_float_cond(const Construct *cond, std::vector<Instr> &ops,
+    bool compile_float_cond(const Construct *cond, std::vector<CgInstr> &ops,
                             Operand &a, Op &cmp, Operand &b)
     {
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
@@ -4785,20 +4789,20 @@ struct Codegen {
             Operand a, b;
             Op cmp;
             reset_temps();
-            const size_t mark = chunk.code.size();
-            if (compile_int_cond(cond, chunk.code, a, cmp, b)) {
+            const size_t mark = code.size();
+            if (compile_int_cond(cond, code, a, cmp, b)) {
                 exit_jumps.push_back(
                     emit_cmp(OpCode::JumpUnlessIntCmp, cond, cmp, a, b));
                 return true;
             }
-            chunk.code.resize(mark);
+            code.resize(mark);
             reset_temps();
-            if (compile_float_cond(cond, chunk.code, a, cmp, b)) {
+            if (compile_float_cond(cond, code, a, cmp, b)) {
                 exit_jumps.push_back(
                     emit_cmp(OpCode::JumpUnlessFloatCmp, cond, cmp, a, b));
                 return true;
             }
-            chunk.code.resize(mark);
+            code.resize(mark);
             /* fall through to boxed */
         }
 
@@ -4812,7 +4816,7 @@ struct Codegen {
             for (size_t i = 1; i < t->elems.size(); i++)
                 if (t->elems[i].first != Op::land) { all_and = false; break; }
             if (all_and) {
-                const size_t mark = chunk.code.size();
+                const size_t mark = code.size();
                 const size_t nexit = exit_jumps.size();
                 bool ok = true;
                 for (const auto &pr : t->elems)
@@ -4822,7 +4826,7 @@ struct Codegen {
                     }
                 if (ok)
                     return true;
-                chunk.code.resize(mark);
+                code.resize(mark);
                 exit_jumps.resize(nexit);
                 /* fall through to boxed */
             }
@@ -4835,17 +4839,17 @@ struct Codegen {
          * bool-var loop cond used to bail the WHOLE loop to an eval.stmt). */
         int cslot;
         reset_temps();
-        const size_t mark = chunk.code.size();
-        if (compile_boxed_expr(cond, cslot, chunk.code)) {
-            Instr in;
+        const size_t mark = code.size();
+        if (compile_boxed_expr(cond, cslot, code)) {
+            CgInstr in;
             in.op = OpCode::JumpUnlessTrueV;
             in.node_idx = add_ast_node(cond);
             in.target2 = cslot;
-            exit_jumps.push_back(chunk.code.size());
-            chunk.code.push_back(in);
+            exit_jumps.push_back(code.size());
+            code.push_back(in);
             return true;
         }
-        chunk.code.resize(mark);
+        code.resize(mark);
         return false;
     }
 
@@ -4864,7 +4868,7 @@ struct Codegen {
     }
 
     /*
-     * Compile a loop/if body's statements DIRECTLY into chunk.code (so any
+     * Compile a loop/if body's statements DIRECTLY into code (so any
      * jumps a nested loop / if emits are chunk-absolute, no relocation), each
      * dispatched by its OWN kind: an int/float scalar statement, a NESTED
      * `for`/`while` loop, or an `if`. A FLOW-FREE statement that isn't natively
@@ -4872,7 +4876,7 @@ struct Codegen {
      * store `c[i] = row`, a void call) lowers via its own native op WITHIN the
      * native loop, so the loop still goes native around it. SELF-TRUNCATING: a
      * flow-AFFECTING unsupported statement (break/continue/return, or a nested
-     * loop/if that can't compile) resizes chunk.code back to the body start and
+     * loop/if that can't compile) resizes code back to the body start and
      * returns false, so the caller falls the whole loop back. Also returns
      * false only when a statement cannot compile at all (the
      * tree-walker's tight counter beats a native loop that only dispatches
@@ -4889,17 +4893,17 @@ struct Codegen {
      * guards the invariant. Shared by gen_stmt (top-level / function-body
      * statements) and compile_scalar_body (loop/if bodies - a decl there
      * re-binds each iteration, exactly as the tree-walker re-evals it). */
-    void emit_func_decl(const FuncDeclStmt *fd, std::vector<Instr> &ops)
+    void emit_func_decl(const FuncDeclStmt *fd, std::vector<CgInstr> &ops)
     {
         ML_CHECK(fd->id->sym.kind == SymKind::global);
         const int t = alloc_temp();
-        Instr mk;
+        CgInstr mk;
         mk.op = OpCode::MakeClosureV;
         mk.target = t;
         mk.target2 = static_cast<int>(chunk.closure_defs.size());
         chunk.closure_defs.push_back(fd->desc);
         ops.push_back(mk);
-        Instr st;                     /* aop invalid == plain assign+defined */
+        CgInstr st;                     /* aop invalid == plain assign+defined */
         st.op = OpCode::StoreGlobalV;
         st.target = fd->id->sym.slot;
         st.set_a(slot_op(t));
@@ -4913,16 +4917,16 @@ struct Codegen {
      * a compile-time error, `isconst` folds), so a plain StoreGlobalV is
      * differential-identical. Like a func decl, a SCRIPT struct decl is
      * always global (structs never capture). Shared like emit_func_decl. */
-    void emit_struct_decl(const StructDeclStmt *sd, std::vector<Instr> &ops)
+    void emit_struct_decl(const StructDeclStmt *sd, std::vector<CgInstr> &ops)
     {
         ML_CHECK(sd->id->sym.kind == SymKind::global);
         const int t = alloc_temp();
-        Instr ld;
+        CgInstr ld;
         ld.op = OpCode::LoadConstV;
         ld.target = t;
         ld.target2 = add_const(EvalValue(sd->def));
         ops.push_back(ld);
-        Instr st;
+        CgInstr st;
         st.op = OpCode::StoreGlobalV;
         st.target = sd->id->sym.slot;
         st.set_a(slot_op(t));
@@ -4932,31 +4936,31 @@ struct Codegen {
     bool compile_scalar_body(const std::vector<const Construct *> &stmts,
                              bool is_loop_body = true)
     {
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         bool any_native = false;
         for (const Construct *s : stmts) {
             reset_temps();
-            const size_t mark = chunk.code.size();
-            if (compile_int_stmt(s, chunk.code)) {
+            const size_t mark = code.size();
+            if (compile_int_stmt(s, code)) {
                 any_native = true;
                 continue;
             }
-            chunk.code.resize(mark);
+            code.resize(mark);
             reset_temps();
-            if (compile_float_stmt(s, chunk.code)) {
+            if (compile_float_stmt(s, code)) {
                 any_native = true;
                 continue;
             }
-            chunk.code.resize(mark);
+            code.resize(mark);
             reset_temps();
-            if (compile_boxed_stmt(s, chunk.code)) {   /* dyn/string assign */
+            if (compile_boxed_stmt(s, code)) {   /* dyn/string assign */
                 any_native = true;
                 continue;
             }
-            chunk.code.resize(mark);
+            code.resize(mark);
 
             /* Nested native control flow. Each is itself self-truncating, so on
-             * failure chunk.code is already back at `mark`. */
+             * failure code is already back at `mark`. */
             if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
                 if (try_native_for_range(fr)) {
                     any_native = true;
@@ -5006,7 +5010,7 @@ struct Codegen {
                 }
             }
 
-            chunk.code.resize(mark);
+            code.resize(mark);
 
             /* break / continue -> a native Jump to the enclosing loop's exit /
              * continue point (backpatched by pop_loop). Needs an enclosing
@@ -5017,7 +5021,7 @@ struct Codegen {
              * region tree-walks. */
             if (dynamic_cast<const BreakStmt *>(s)) {
                 if (loops.empty() || !emit_break_cont(/*is_break=*/true)) {
-                    chunk.code.resize(start);
+                    code.resize(start);
                     return false;
                 }
                 any_native = true;
@@ -5025,7 +5029,7 @@ struct Codegen {
             }
             if (dynamic_cast<const ContinueStmt *>(s)) {
                 if (loops.empty() || !emit_break_cont(/*is_break=*/false)) {
-                    chunk.code.resize(start);
+                    code.resize(start);
                     return false;
                 }
                 any_native = true;
@@ -5042,7 +5046,7 @@ struct Codegen {
             if (const DirectCallExpr *dc =
                     dynamic_cast<const DirectCallExpr *>(s)) {
                 int dst;
-                if (try_native_call(dc, dst, chunk.code)) {
+                if (try_native_call(dc, dst, code)) {
                     any_native = true;
                     continue;
                 }
@@ -5051,7 +5055,7 @@ struct Codegen {
             if (const DirectBuiltinCallExpr *bc =
                     dynamic_cast<const DirectBuiltinCallExpr *>(s)) {
                 int dst;
-                if (try_native_builtin(bc, dst, chunk.code)) {
+                if (try_native_builtin(bc, dst, code)) {
                     any_native = true;
                     continue;
                 }
@@ -5060,14 +5064,14 @@ struct Codegen {
              * rejects a Direct{Call,BuiltinCall}Expr internally (F-3). */
             if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
                 int dst;
-                if (try_native_value_call(call, dst, chunk.code)) {
+                if (try_native_value_call(call, dst, code)) {
                     any_native = true;
                     continue;
                 }
             }
             /* `return <expr>;` -> ReturnV / SetPend-to-finally (Inc 2c). */
             if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
-                if (try_native_return(ret, chunk.code)) {
+                if (try_native_return(ret, code)) {
                     any_native = true;
                     continue;
                 }
@@ -5077,7 +5081,7 @@ struct Codegen {
                  * the body and let the entire InlinedCallExpr tree-walk
                  * (byte-identical). */
                 if (!inline_returns.empty()) {
-                    chunk.code.resize(start);
+                    code.resize(start);
                     return false;
                 }
                 /* try_native_return declined (a nested-try return, or an
@@ -5090,20 +5094,20 @@ struct Codegen {
                  * conservative guard. */
                 for (const auto &tf : trys)
                     if (tf.has_finally) {
-                        chunk.code.resize(start);
+                        code.resize(start);
                         return false;
                     }
             }
             /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
             if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
-                if (try_native_throw(th, chunk.code)) {
+                if (try_native_throw(th, code)) {
                     any_native = true;
                     continue;
                 }
             }
             /* `rethrow;` (in a catch body) -> a native Rethrow op (P8 Inc 2a). */
             if (const RethrowStmt *rt = dynamic_cast<const RethrowStmt *>(s)) {
-                emit_rethrow(rt, chunk.code);
+                emit_rethrow(rt, code);
                 any_native = true;
                 continue;
             }
@@ -5117,7 +5121,7 @@ struct Codegen {
             if (const FuncDeclStmt *fdd =
                     dynamic_cast<const FuncDeclStmt *>(s)) {
                 if (fdd->id) {
-                    emit_func_decl(fdd, chunk.code);
+                    emit_func_decl(fdd, code);
                     any_native = true;
                     continue;
                 }
@@ -5125,7 +5129,7 @@ struct Codegen {
             if (const StructDeclStmt *sdd =
                     dynamic_cast<const StructDeclStmt *>(s)) {
                 if (sdd->id) {
-                    emit_struct_decl(sdd, chunk.code);
+                    emit_struct_decl(sdd, code);
                     any_native = true;
                     continue;
                 }
@@ -5150,18 +5154,18 @@ struct Codegen {
                             && bid->sym.kind != SymKind::global);
                 if (inert)
                     continue;
-                const size_t emark = chunk.code.size();
+                const size_t emark = code.size();
                 const int st2 = next_temp;
                 int dst;
-                if (compile_boxed_expr(s, dst, chunk.code)) {
+                if (compile_boxed_expr(s, dst, code)) {
                     any_native = true;
                     continue;
                 }
-                chunk.code.resize(emark);
+                code.resize(emark);
                 next_temp = st2;
             }
 
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
         /* (The old "all-fallback loop body isn't worth a native loop" gate is
@@ -5183,39 +5187,39 @@ struct Codegen {
      */
     bool compile_native_if(const IfStmt *f)
     {
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
 
         size_t jf;                    /* the conditional jump, patched to Lelse */
         Operand ca, cb;
         Op cmp;
         reset_temps();
-        if (compile_int_cond(f->condExpr.get(), chunk.code, ca, cmp, cb)) {
+        if (compile_int_cond(f->condExpr.get(), code, ca, cmp, cb)) {
             jf = emit_cmp(OpCode::JumpUnlessIntCmp, f->condExpr.get(),
                           cmp, ca, cb);
         } else {
-            chunk.code.resize(start);
+            code.resize(start);
             reset_temps();
-            if (compile_float_cond(f->condExpr.get(), chunk.code, ca, cmp, cb)) {
+            if (compile_float_cond(f->condExpr.get(), code, ca, cmp, cb)) {
                 jf = emit_cmp(OpCode::JumpUnlessFloatCmp, f->condExpr.get(),
                               cmp, ca, cb);
             } else {
-                chunk.code.resize(start);
+                code.resize(start);
                 reset_temps();
                 int cslot;
                 /* BOXED condition -> compute a bool slot + branch-unless-
                  * true; the last resort before failing the whole `if`. */
-                if (compile_boxed_expr(f->condExpr.get(), cslot, chunk.code)) {
-                    Instr in;
+                if (compile_boxed_expr(f->condExpr.get(), cslot, code)) {
+                    CgInstr in;
                     in.op = OpCode::JumpUnlessTrueV;
                     in.node_idx = add_ast_node(f->condExpr.get());
                     in.target2 = cslot;
-                    jf = chunk.code.size();
-                    chunk.code.push_back(in);
+                    jf = code.size();
+                    code.push_back(in);
                 } else {
                     /* an uncompilable cond: fail the whole `if` (-> the
                      * statement-level NotLoweredEx; must be unreachable
                      * under the no-fail contract). */
-                    chunk.code.resize(start);
+                    code.resize(start);
                     return false;
                 }
             }
@@ -5223,20 +5227,20 @@ struct Codegen {
 
         if (f->thenBlock
             && !compile_scalar_body(body_stmts(f->thenBlock.get()), false)) {
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         if (f->elseBlock) {
             const size_t j = emit(OpCode::Jump);
-            chunk.code[jf].target = here();          /* Lelse */
+            code[jf].target = here();          /* Lelse */
             if (!compile_scalar_body(body_stmts(f->elseBlock.get()), false)) {
-                chunk.code.resize(start);
+                code.resize(start);
                 return false;
             }
-            chunk.code[j].target = here();           /* Lend */
+            code[j].target = here();           /* Lend */
         } else {
-            chunk.code[jf].target = here();          /* Lend */
+            code[jf].target = here();          /* Lend */
         }
         return true;
     }
@@ -5262,10 +5266,10 @@ struct Codegen {
     /* Emit SetPend <p> (Inc 2b): the pending action a following finally runs. */
     void emit_setpend(Pend p)
     {
-        Instr in;
+        CgInstr in;
         in.op = OpCode::SetPend;
         in.target = static_cast<int>(p);
-        chunk.code.push_back(in);
+        code.push_back(in);
     }
 
     bool compile_native_try(const TryCatchStmt *t)
@@ -5278,7 +5282,7 @@ struct Codegen {
             if (asId && asId->sym.kind != SymKind::local)
                 return false;
         }
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         const size_t ct_start = chunk.catch_types.size();
         const size_t trys_depth = trys.size();
 
@@ -5297,7 +5301,7 @@ struct Codegen {
             }
         };
         auto bail = [&]() {
-            chunk.code.resize(start);
+            code.resize(start);
             chunk.catch_types.resize(ct_start);
             trys.resize(trys_depth);
             return false;
@@ -5314,7 +5318,7 @@ struct Codegen {
         emit(OpCode::PopHandler);
         exit_to(Pend::normal);                         /* normal try exit */
 
-        chunk.code[ph].target = static_cast<int>(here());   /* Lcatch */
+        code[ph].target = static_cast<int>(here());   /* Lcatch */
 
         std::vector<size_t> tests;
         for (const auto &cs : t->catchStmts) {
@@ -5327,12 +5331,12 @@ struct Codegen {
                 chunk.catch_types.push_back(std::move(names));
             }
             const Identifier *asId = cs.first.asId.get();
-            Instr in;
+            CgInstr in;
             in.op = OpCode::CatchTest;
             in.set_a(int_lit(types_idx));
             in.target2 = asId ? asId->sym.slot : -1;   /* bind slot / -1 */
-            tests.push_back(chunk.code.size());         /* patch .target below */
-            chunk.code.push_back(in);
+            tests.push_back(code.size());         /* patch .target below */
+            code.push_back(in);
         }
         exit_to(Pend::reraise);                        /* no clause matched */
 
@@ -5341,7 +5345,7 @@ struct Codegen {
         trys.back().in_catch = true;
         size_t ci = 0;
         for (const auto &cs : t->catchStmts) {
-            chunk.code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
+            code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
             if (!compile_scalar_body(body_stmts(cs.second.get()), false))
                 return bail();
             exit_to(Pend::normal);                     /* catch body done */
@@ -5354,7 +5358,7 @@ struct Codegen {
              * only (flow ops inline their own copy - Inc 2c). */
             const int lfin = static_cast<int>(here());
             for (size_t j : to_fin)
-                chunk.code[j].target = lfin;
+                code[j].target = lfin;
             if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
                 return bail();
             emit(OpCode::EndFinally);
@@ -5362,7 +5366,7 @@ struct Codegen {
 
         const int lend = static_cast<int>(here());
         for (size_t j : to_end)
-            chunk.code[j].target = lend;
+            code[j].target = lend;
         return true;
     }
 
@@ -5370,58 +5374,58 @@ struct Codegen {
     size_t emit_cmp(OpCode opc, const Construct *node, Op cmp,
                     const Operand &a, const Operand &b)
     {
-        Instr t;
+        CgInstr t;
         t.op = opc;
         t.node_idx = add_ast_node(node);
         t.aop = cmp;
         t.set_a(a);
         t.set_b(b);
-        const size_t at = chunk.code.size();
-        chunk.code.push_back(t);
+        const size_t at = code.size();
+        code.push_back(t);
         return at;
     }
 
     /*
      * A resolved-local scalar (int OR float) loop -> native register ops emitted
-     * DIRECTLY into chunk.code:
+     * DIRECTLY into code:
      *   Lstart: <cond ops> JumpUnless{Int,Float}Cmp{a,cmp,b -> Lend}
      *           <body ops> Jump Lstart ; Lend:
      * Fires when the condition is an int/float comparison and every body
      * statement compiles (scalar / nested loop / if). Self-truncating: any
-     * failure resizes chunk.code back to the start and returns false (-> the
+     * failure resizes code back to the start and returns false (-> the
      * enclosing statement's NotLoweredEx, or the enclosing body falls back).
      */
     bool try_native_scalar_while(const WhileStmt *w)
     {
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         const int lstart = here();
 
         /* The condition -> native compare-branch(es) to the exit; a compound
          * `A && B` becomes one branch per conjunct (see emit_cond_jumps). */
         std::vector<size_t> exit_jumps;
         if (!emit_cond_jumps(w->condExpr.get(), exit_jumps)) {
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         push_loop();
         if (!compile_scalar_body(body_stmts(w->body.get()))) {
             loops.pop_back();
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         emit(OpCode::Jump, nullptr, lstart);
         const int lend = here();
         for (size_t j : exit_jumps)
-            chunk.code[j].target = lend;
+            code[j].target = lend;
         pop_loop(lend, lstart);   /* continue -> the cond re-test (Lstart) */
         return true;
     }
 
     /*
      * A counted int for-loop (ForRangeStmt) -> native register ops emitted
-     * directly into chunk.code. `init` runs ONCE as a fallback (it declares `i`
+     * directly into code. `init` runs ONCE as a fallback (it declares `i`
      * - a frame slot - so running it in place writes the same slot);
      * `bound`/`step` must be simple int operands (a slot or literal, both
      * loop-immutable, so reading them each iteration matches the once-evaluated
@@ -5431,7 +5435,7 @@ struct Codegen {
      */
     bool try_native_for_range(const ForRangeStmt *f)
     {
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         const int saved_base = temp_base;
 
         /* `init` FIRST (`var i = start`, once): ForRangeStmt::do_eval's order
@@ -5441,7 +5445,7 @@ struct Codegen {
          * BEFORE the init, a real wrong-result -vm divergence (pinned by the
          * "for-range evaluates init before the bound" test). */
         if (!emit_init(f->init.get())) {
-            chunk.code.resize(start);
+            code.resize(start);
             temp_base = saved_base;
             return false;
         }
@@ -5458,8 +5462,8 @@ struct Codegen {
         if (!as_int_operand(f->bound.get(), bound)) {
             reset_temps();
             int bslot;
-            if (!compile_boxed_expr(f->bound.get(), bslot, chunk.code)) {
-                chunk.code.resize(start);
+            if (!compile_boxed_expr(f->bound.get(), bslot, code)) {
+                code.resize(start);
                 temp_base = saved_base;
                 return false;
             }
@@ -5471,8 +5475,8 @@ struct Codegen {
             if (!as_int_operand(f->step.get(), step)) {
                 reset_temps();
                 int sslot;
-                if (!compile_boxed_expr(f->step.get(), sslot, chunk.code)) {
-                    chunk.code.resize(start);
+                if (!compile_boxed_expr(f->step.get(), sslot, code)) {
+                    code.resize(start);
                     temp_base = saved_base;
                     return false;
                 }
@@ -5493,7 +5497,7 @@ struct Codegen {
         push_loop();
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
             loops.pop_back();
-            chunk.code.resize(start);
+            code.resize(start);
             temp_base = saved_base;
             return false;
         }
@@ -5501,7 +5505,7 @@ struct Codegen {
         const int lcont = here();   /* continue -> the fused step (i+=; test) */
 
         /* Fused back-edge: i += step; if (i <cmp> bound) goto lbody. */
-        Instr fstep;
+        CgInstr fstep;
         fstep.op = OpCode::ForLoopStep;
         fstep.node_idx = add_ast_node(f);
         fstep.aop = f->cmp_op;
@@ -5509,10 +5513,10 @@ struct Codegen {
         fstep.target2 = f->i_slot;
         fstep.set_a(bound);
         fstep.set_b(step);
-        chunk.code.push_back(fstep);
+        code.push_back(fstep);
 
         const int lend = here();
-        chunk.code[jt].target = lend;
+        code[jt].target = lend;
         pop_loop(lend, lcont);
         temp_base = saved_base;
         return true;
@@ -5535,10 +5539,10 @@ struct Codegen {
      */
     bool try_native_for(const ForStmt *f)
     {
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
 
         if (f->init && !emit_init(f->init.get())) { /* declare the var, once */
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
@@ -5553,14 +5557,14 @@ struct Codegen {
          * exactly like the tree-walker's missing-cond ForStmt. */
         std::vector<size_t> exit_jumps;
         if (f->cond && !emit_cond_jumps(f->cond.get(), exit_jumps)) {
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         push_loop();
         if (!compile_scalar_body(body_stmts(f->body.get()))) {
             loops.pop_back();
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
@@ -5571,16 +5575,16 @@ struct Codegen {
          * same three-tier dispatch every statement gets). */
         if (f->inc) {
             reset_temps();
-            const size_t imark = chunk.code.size();
-            if (!compile_int_stmt(f->inc.get(), chunk.code)) {
-                chunk.code.resize(imark);
+            const size_t imark = code.size();
+            if (!compile_int_stmt(f->inc.get(), code)) {
+                code.resize(imark);
                 reset_temps();
-                if (!compile_float_stmt(f->inc.get(), chunk.code)) {
-                    chunk.code.resize(imark);
+                if (!compile_float_stmt(f->inc.get(), code)) {
+                    code.resize(imark);
                     reset_temps();
-                    if (!compile_boxed_stmt(f->inc.get(), chunk.code)) {
+                    if (!compile_boxed_stmt(f->inc.get(), code)) {
                         loops.pop_back();
-                        chunk.code.resize(start);
+                        code.resize(start);
                         return false;
                     }
                 }
@@ -5590,7 +5594,7 @@ struct Codegen {
         emit(OpCode::Jump, nullptr, lstart);
         const int lend = here();
         for (size_t j : exit_jumps)
-            chunk.code[j].target = lend;
+            code[j].target = lend;
         pop_loop(lend, lcont);
         return true;
     }
@@ -5633,41 +5637,41 @@ struct Codegen {
             idx_slot = ix->sym.slot;
         }
 
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         reset_temps();
 
         /* Snapshot the container into a temp: the tree-walker evals it ONCE
          * before the loop, so a body reassignment of the container var must not
          * change what we iterate. */
         int csrc;
-        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
-            chunk.code.resize(start);
+        if (!compile_boxed_expr(fe->container.get(), csrc, code)) {
+            code.resize(start);
             return false;
         }
         const int c = alloc_temp();
-        Instr mv;
+        CgInstr mv;
         mv.op = OpCode::MoveV;
         mv.target = c;
         mv.target2 = csrc;
-        chunk.code.push_back(mv);
+        code.push_back(mv);
 
         const int n = alloc_temp();
-        Instr ln;
+        CgInstr ln;
         ln.op = OpCode::ArrLen;
         ln.node_idx = add_ast_node(fe->container.get());
         ln.target = n;
         ln.target2 = c;
-        chunk.code.push_back(ln);
+        code.push_back(ln);
 
         /* The counter: for an indexed foreach it IS the index var (ids[0], read
          * by the body); otherwise a fresh temp. Either way it starts at 0 and
          * the ForLoopStep increments it. */
         const int i = fe->indexed ? idx_slot : alloc_temp();
-        Instr z;
+        CgInstr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
         z.set_a(int_lit(0));
-        chunk.code.push_back(z);
+        code.push_back(z);
 
         /* Reserve c/n/i for the whole loop - a body statement's reset_temps()
          * must not reuse their slots. */
@@ -5684,7 +5688,7 @@ struct Codegen {
         /* x = c[i] : a direct flat int/float element load into the loop var,
          * re-run at the top of every iteration (the ForLoopStep re-enters
          * here). */
-        Instr ld;
+        CgInstr ld;
         ld.op = fe->elem_th == TypeHint::i ? OpCode::LoadElemInt
               : fe->elem_th == TypeHint::f ? OpCode::LoadElemFloat
               : fe->elem_is_bool           ? OpCode::LoadElemBool
@@ -5693,13 +5697,13 @@ struct Codegen {
         ld.target = x_slot;
         ld.target2 = c;
         ld.set_a(slot_op(i));
-        chunk.code.push_back(ld);
+        code.push_back(ld);
 
         push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
@@ -5708,7 +5712,7 @@ struct Codegen {
         /* Fused back-edge: i += 1; if (i < n) goto lbody (the same
          * superinstruction the native for-range uses - one dispatch per
          * iteration instead of a separate compare + increment + jump). */
-        Instr fstep;
+        CgInstr fstep;
         fstep.op = OpCode::ForLoopStep;
         fstep.node_idx = add_ast_node(fe->container.get());
         fstep.aop = Op::lt;
@@ -5716,10 +5720,10 @@ struct Codegen {
         fstep.target2 = i;
         fstep.set_a(slot_op(n));
         fstep.set_b(int_lit(1));
-        chunk.code.push_back(fstep);
+        code.push_back(fstep);
 
         const int lend = here();
-        chunk.code[jt].target = lend;
+        code[jt].target = lend;
         pop_loop(lend, lcont);
         temp_base = saved_base;
         return true;
@@ -5754,34 +5758,34 @@ struct Codegen {
             idx_slot = ix->sym.slot;
         }
 
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         reset_temps();
 
         int csrc;
-        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
-            chunk.code.resize(start);
+        if (!compile_boxed_expr(fe->container.get(), csrc, code)) {
+            code.resize(start);
             return false;
         }
         const int c = alloc_temp();
-        Instr mv;
+        CgInstr mv;
         mv.op = OpCode::MoveV;
         mv.target = c;
         mv.target2 = csrc;
-        chunk.code.push_back(mv);
+        code.push_back(mv);
 
         const int n = alloc_temp();
-        Instr ln;
+        CgInstr ln;
         ln.op = OpCode::StrLen;
         ln.target = n;
         ln.target2 = c;
-        chunk.code.push_back(ln);
+        code.push_back(ln);
 
         const int i = fe->indexed ? idx_slot : alloc_temp();
-        Instr z;
+        CgInstr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
         z.set_a(int_lit(0));
-        chunk.code.push_back(z);
+        code.push_back(z);
 
         const int saved_base = temp_base;
         temp_base = next_temp;
@@ -5792,24 +5796,24 @@ struct Codegen {
 
         const int lbody = here();
 
-        Instr ld;
+        CgInstr ld;
         ld.op = OpCode::LoadStrChar;
         ld.target = x_slot;
         ld.target2 = c;
         ld.set_a(slot_op(i));
-        chunk.code.push_back(ld);
+        code.push_back(ld);
 
         push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         const int lcont = here();
 
-        Instr fstep;
+        CgInstr fstep;
         fstep.op = OpCode::ForLoopStep;
         fstep.node_idx = add_ast_node(fe->container.get());
         fstep.aop = Op::lt;
@@ -5817,10 +5821,10 @@ struct Codegen {
         fstep.target2 = i;
         fstep.set_a(slot_op(n));
         fstep.set_b(int_lit(1));
-        chunk.code.push_back(fstep);
+        code.push_back(fstep);
 
         const int lend = here();
-        chunk.code[jt].target = lend;
+        code[jt].target = lend;
         pop_loop(lend, lcont);
         temp_base = saved_base;
         return true;
@@ -5854,35 +5858,35 @@ struct Codegen {
         const bool whole_p = !struct_fe_body_ok(fe->body.get(), x_slot,
                                                 fe->container_struct_def, false);
 
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         reset_temps();
 
         int csrc;
-        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
-            chunk.code.resize(start);
+        if (!compile_boxed_expr(fe->container.get(), csrc, code)) {
+            code.resize(start);
             return false;
         }
         const int c = alloc_temp();
-        Instr mv;
+        CgInstr mv;
         mv.op = OpCode::MoveV;
         mv.target = c;
         mv.target2 = csrc;
-        chunk.code.push_back(mv);
+        code.push_back(mv);
 
         const int n = alloc_temp();
-        Instr ln;
+        CgInstr ln;
         ln.op = OpCode::ArrLen;
         ln.node_idx = add_ast_node(fe->container.get());
         ln.target = n;
         ln.target2 = c;
-        chunk.code.push_back(ln);
+        code.push_back(ln);
 
         const int i = alloc_temp();
-        Instr z;
+        CgInstr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
         z.set_a(int_lit(0));
-        chunk.code.push_back(z);
+        code.push_back(z);
 
         const int saved_base = temp_base;
         temp_base = next_temp;
@@ -5895,12 +5899,12 @@ struct Codegen {
         if (whole_p) {
             /* Materialize p = c[i] (a fresh StructObject) at the top of each
              * iteration; the body reads p's slot normally (no sfe mapping). */
-            Instr ld;
+            CgInstr ld;
             ld.op = OpCode::LoadStructElemV;
             ld.target = x_slot;
             ld.target2 = c;
             ld.set_a(slot_op(i));
-            chunk.code.push_back(ld);
+            code.push_back(ld);
         } else {
             /* No element load - p is never materialized. Activate the direct-
              * read mapping so a p.field read -> LoadStructField*(c[i].fld). */
@@ -5920,12 +5924,12 @@ struct Codegen {
         if (!body_ok) {
             loops.pop_back();
             temp_base = saved_base;
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         const int lcont = here();
-        Instr fstep;
+        CgInstr fstep;
         fstep.op = OpCode::ForLoopStep;
         fstep.node_idx = add_ast_node(fe->container.get());
         fstep.aop = Op::lt;
@@ -5933,10 +5937,10 @@ struct Codegen {
         fstep.target2 = i;
         fstep.set_a(slot_op(n));
         fstep.set_b(int_lit(1));
-        chunk.code.push_back(fstep);
+        code.push_back(fstep);
 
         const int lend = here();
-        chunk.code[jt].target = lend;
+        code[jt].target = lend;
         pop_loop(lend, lcont);
         temp_base = saved_base;
         return true;
@@ -6002,37 +6006,37 @@ struct Codegen {
         }
         const int unpack_base = consecutive ? targets[0] : -1;
 
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         reset_temps();
 
         int csrc;
-        if (!compile_boxed_expr(fe->container.get(), csrc, chunk.code)) {
-            chunk.code.resize(start);
+        if (!compile_boxed_expr(fe->container.get(), csrc, code)) {
+            code.resize(start);
             return false;
         }
         const int c = alloc_temp();
-        Instr mv;
+        CgInstr mv;
         mv.op = OpCode::MoveV;
         mv.target = c;
         mv.target2 = csrc;
-        chunk.code.push_back(mv);
+        code.push_back(mv);
 
         const int n = alloc_temp();
-        Instr ln;
+        CgInstr ln;
         ln.op = OpCode::ArrLen;
         ln.node_idx = add_ast_node(fe->container.get());
         ln.target = n;
         ln.target2 = c;
-        chunk.code.push_back(ln);
+        code.push_back(ln);
 
         /* The counter: for an indexed loop it IS the index var (base, read by
          * the body); otherwise a fresh temp. */
         const int i = fe->indexed ? base : alloc_temp();
-        Instr z;
+        CgInstr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
         z.set_a(int_lit(0));
-        chunk.code.push_back(z);
+        code.push_back(z);
 
         const int saved_base = temp_base;
         temp_base = next_temp;   /* reserve c/n/(i) */
@@ -6048,7 +6052,7 @@ struct Codegen {
          * raw for a flat int/float sub-array (UnpackElemInt/Float), else each
          * element's boxed value (UnpackElemValue, for a general/dyn/str/mixed
          * sub-array like shopping's [str, float]). */
-        Instr up;
+        CgInstr up;
         if (consecutive) {
             up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
                   : fe->unpack_elem_th == TypeHint::f ? OpCode::UnpackElemFloat
@@ -6065,18 +6069,18 @@ struct Codegen {
         up.target2 = c;
         up.set_a(slot_op(i));
         up.set_b(int_lit(nunpack));
-        chunk.code.push_back(up);
+        code.push_back(up);
 
         push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         const int lcont = here();
-        Instr fstep;
+        CgInstr fstep;
         fstep.op = OpCode::ForLoopStep;
         fstep.node_idx = add_ast_node(fe->container.get());
         fstep.aop = Op::lt;
@@ -6084,10 +6088,10 @@ struct Codegen {
         fstep.target2 = i;
         fstep.set_a(slot_op(n));
         fstep.set_b(int_lit(1));
-        chunk.code.push_back(fstep);
+        code.push_back(fstep);
 
         const int lend = here();
-        chunk.code[jt].target = lend;
+        code[jt].target = lend;
         pop_loop(lend, lcont);
         temp_base = saved_base;
         return true;
@@ -6144,15 +6148,15 @@ struct Codegen {
         if (nkv == 2 && !slot_of(off + 1, v_slot))
             return false;
 
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         reset_temps();
 
         /* Compile the dict container into a slot; DictIterInit's intrusive_ptr
          * copy IS the once-eval snapshot (a body reassign of the container var
          * can't change what we iterate). */
         int dsrc;
-        if (!compile_boxed_expr(fe->container.get(), dsrc, chunk.code)) {
-            chunk.code.resize(start);
+        if (!compile_boxed_expr(fe->container.get(), dsrc, code)) {
+            code.resize(start);
             return false;
         }
         const int saved_base = temp_base;
@@ -6162,57 +6166,57 @@ struct Codegen {
          * incremented at each continue point (below) - so it holds the
          * iteration number during the body, byte-identical to do_iter. */
         if (off) {
-            Instr z;
+            CgInstr z;
             z.op = OpCode::LoadImmInt;
             z.target = idx_slot;
             z.set_a(int_lit(0));
-            chunk.code.push_back(z);
+            code.push_back(z);
         }
 
         const int iter_id = alloc_dict_iter();
 
-        Instr init;
+        CgInstr init;
         init.op = OpCode::DictIterInit;
         init.node_idx = add_ast_node(fe->container.get());
         init.target = iter_id;
         init.target2 = dsrc;
-        chunk.code.push_back(init);
+        code.push_back(init);
 
         const int lnext = here();   /* test + bind + advance */
-        Instr nx;
+        CgInstr nx;
         nx.op = OpCode::DictIterNext;
         nx.target2 = iter_id;
         nx.set_a(slot_op(k_slot));     /* -1 == `_`/keys-only-unused */
         nx.set_b(slot_op(v_slot));
-        const size_t nx_i = chunk.code.size();
-        chunk.code.push_back(nx);   /* .target (end_pc) backpatched below */
+        const size_t nx_i = code.size();
+        code.push_back(nx);   /* .target (end_pc) backpatched below */
 
         push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         const int lcont = here();   /* continue -> increment, back to Next */
         if (off) {
             /* index += 1 (idx_slot = idx_slot + 1), then loop. */
-            Instr inc;
+            CgInstr inc;
             inc.op = OpCode::IntBin;
             inc.aop = Op::plus;
             inc.target = idx_slot;
             inc.set_a(slot_op(idx_slot));
             inc.set_b(int_lit(1));
-            chunk.code.push_back(inc);
+            code.push_back(inc);
         }
-        Instr jb;
+        CgInstr jb;
         jb.op = OpCode::Jump;
         jb.target = lnext;
-        chunk.code.push_back(jb);
+        code.push_back(jb);
 
         const int lend = here();
-        chunk.code[nx_i].target = lend;
+        code[nx_i].target = lend;
         pop_loop(lend, lcont);
         temp_base = saved_base;
         return true;
@@ -6259,12 +6263,12 @@ struct Codegen {
         }
         const int nvars = static_cast<int>(targets.size());
 
-        const size_t start = chunk.code.size();
+        const size_t start = code.size();
         reset_temps();
 
         int dsrc;
-        if (!compile_boxed_expr(fe->container.get(), dsrc, chunk.code)) {
-            chunk.code.resize(start);
+        if (!compile_boxed_expr(fe->container.get(), dsrc, code)) {
+            code.resize(start);
             return false;
         }
         const int saved_base = temp_base;
@@ -6275,42 +6279,42 @@ struct Codegen {
         const int tgt_idx = static_cast<int>(chunk.unpack_targets.size());
         chunk.unpack_targets.push_back(std::move(targets));
 
-        Instr init;
+        CgInstr init;
         init.op = OpCode::ForeachDynInit;
         init.node_idx = add_ast_node(fe->container.get());   /* extract_locs -> the caret */
         init.target = iter_id;
         init.target2 = dsrc;
         init.set_a(int_lit(nvars | (fe->indexed ? 256 : 0)));
         init.set_b(int_lit(tgt_idx));         /* the per-var slots (-1 == `_`) */
-        chunk.code.push_back(init);
+        code.push_back(init);
 
         const int lnext = here();          /* test + bind + advance */
-        Instr nx;
+        CgInstr nx;
         nx.op = OpCode::ForeachDynNext;
         nx.target2 = iter_id;              /* targets ride the iterator state */
         /* A multi-var array element is strict-unpacked, so Next can throw;
          * record the container caret (do_iter uses container->start/end). */
         if (nvars - (fe->indexed ? 1 : 0) >= 2)
             nx.node_idx = add_ast_node(fe->container.get());
-        const size_t nx_i = chunk.code.size();
-        chunk.code.push_back(nx);          /* .target (end_pc) backpatched */
+        const size_t nx_i = code.size();
+        code.push_back(nx);          /* .target (end_pc) backpatched */
 
         push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
             loops.pop_back();
             temp_base = saved_base;
-            chunk.code.resize(start);
+            code.resize(start);
             return false;
         }
 
         const int lcont = here();
-        Instr jb;
+        CgInstr jb;
         jb.op = OpCode::Jump;
         jb.target = lnext;
-        chunk.code.push_back(jb);
+        code.push_back(jb);
 
         const int lend = here();
-        chunk.code[nx_i].target = lend;
+        code[nx_i].target = lend;
         pop_loop(lend, lcont);
         temp_base = saved_base;
         return true;
@@ -6335,18 +6339,18 @@ struct Codegen {
          * This is what makes a scalar-arithmetic FUNCTION body native, not
          * only a loop body. */
         reset_temps();
-        const size_t mark = chunk.code.size();
-        if (compile_int_stmt(s, chunk.code))
+        const size_t mark = code.size();
+        if (compile_int_stmt(s, code))
             return;
-        chunk.code.resize(mark);
+        code.resize(mark);
         reset_temps();
-        if (compile_float_stmt(s, chunk.code))
+        if (compile_float_stmt(s, code))
             return;
-        chunk.code.resize(mark);
+        code.resize(mark);
         reset_temps();
-        if (compile_boxed_stmt(s, chunk.code))   /* dyn/string scalar assign */
+        if (compile_boxed_stmt(s, code))   /* dyn/string scalar assign */
             return;
-        chunk.code.resize(mark);
+        code.resize(mark);
 
         if (const IfStmt *f = dynamic_cast<const IfStmt *>(s)) {
             if (!compile_native_if(f))
@@ -6382,14 +6386,14 @@ struct Codegen {
         if (const DirectCallExpr *dc =
                 dynamic_cast<const DirectCallExpr *>(s)) {
             int dst;
-            if (try_native_call(dc, dst, chunk.code))
+            if (try_native_call(dc, dst, code))
                 return;
         }
         /* A builtin call statement (result discarded) -> CallBuiltinV. */
         if (const DirectBuiltinCallExpr *bc =
                 dynamic_cast<const DirectBuiltinCallExpr *>(s)) {
             int dst;
-            if (try_native_builtin(bc, dst, chunk.code))
+            if (try_native_builtin(bc, dst, code))
                 return;
         }
         /* A func-VALUE call statement (a call through a Func-typed var/closure,
@@ -6398,12 +6402,12 @@ struct Codegen {
          * only catches a plain CallExpr the two handlers above didn't. */
         if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
             int dst;
-            if (try_native_value_call(call, dst, chunk.code))
+            if (try_native_value_call(call, dst, code))
                 return;
         }
         /* `return <expr>;` -> ReturnV (its expr compiled natively). */
         if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
-            if (try_native_return(ret, chunk.code))
+            if (try_native_return(ret, code))
                 return;
         }
         /* A `func f(..) {..}` decl statement bound into a GLOBAL slot (a
@@ -6419,7 +6423,7 @@ struct Codegen {
          * ML_CHECK guards the invariant. */
         if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(s)) {
             if (fd->id) {
-                emit_func_decl(fd, chunk.code);
+                emit_func_decl(fd, code);
                 return;
             }
         }
@@ -6434,7 +6438,7 @@ struct Codegen {
         const StructDeclStmt *sd = dynamic_cast<const StructDeclStmt *>(s);
         if (sd) {
             if (sd->id) {
-                emit_struct_decl(sd, chunk.code);
+                emit_struct_decl(sd, code);
                 return;
             }
         }
@@ -6445,7 +6449,7 @@ struct Codegen {
         }
         /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
         if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
-            if (try_native_throw(th, chunk.code))
+            if (try_native_throw(th, code))
                 return;
         }
         /* A standalone braced block `{ ... }` statement: a SCOPE-FREE block runs
@@ -6486,12 +6490,12 @@ struct Codegen {
                         && bid->sym.kind != SymKind::global);
             if (inert)
                 return;
-            const size_t emark = chunk.code.size();
+            const size_t emark = code.size();
             const int st = next_temp;
             int dst;
-            if (compile_boxed_expr(s, dst, chunk.code))
+            if (compile_boxed_expr(s, dst, code))
                 return;
-            chunk.code.resize(emark);
+            code.resize(emark);
             next_temp = st;
         }
 
@@ -6531,7 +6535,7 @@ intern_inline_ctx(const InlineCtx *ic, Chunk &chunk,
     return idx;
 }
 
-static void extract_locs(Chunk &chunk,
+static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
                          const std::vector<const Construct *> &ast_nodes)
 {
     auto node_at = [&](int32_t idx) -> const Construct * {
@@ -6540,8 +6544,8 @@ static void extract_locs(Chunk &chunk,
     /* InlineCtx* -> inline_frames index, shared across ops so a chain reused by
      * many spliced ops is flattened once. */
     std::unordered_map<const InlineCtx *, int32_t> inline_memo;
-    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
-        Instr &in = chunk.code[pc];
+    for (size_t pc = 0; pc < code.size(); pc++) {
+        CgInstr &in = code[pc];
         const Construct *node = node_at(in.node_idx);
         if (!node)
             continue;
@@ -6681,9 +6685,9 @@ static void extract_locs(Chunk &chunk,
  * is pool/loc-based and the fallback ops are deleted. Enforce the invariant -
  * a live node_idx here is a codegen bug (an op emitted with a node that no
  * extract_locs case handles). */
-static void verify_ast_free(Chunk &chunk)
+static void verify_ast_free(const std::vector<CgInstr> &code)
 {
-    for (Instr &in : chunk.code) {
+    for (const CgInstr &in : code) {
         ML_CHECK(in.node_idx == -1);
         (void)in;
     }
@@ -6834,14 +6838,14 @@ static bool op_falls_through(OpCode op)
 
 /* Retarget through a chain of plain Jumps (hop cap for degenerate cycles;
  * a self-Jump - `while(true);` - is left intact). */
-static int pp_thread(const Chunk &ck, int t)
+static int pp_thread(const std::vector<CgInstr> &code, int t)
 {
     int hops = 0;
     while (hops++ < 8
-           && t >= 0 && static_cast<size_t>(t) < ck.code.size()
-           && ck.code[t].op == OpCode::Jump
-           && ck.code[t].target != t)
-        t = ck.code[t].target;
+           && t >= 0 && static_cast<size_t>(t) < code.size()
+           && code[t].op == OpCode::Jump
+           && code[t].target != t)
+        t = code[t].target;
     return t;
 }
 
@@ -6976,9 +6980,8 @@ static bool retargetable_dst(OpCode op)
     }
 }
 
-static void peephole_chunk(Chunk &ck)
+static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
 {
-    std::vector<Instr> &code = ck.code;
     if (code.empty())
         return;
 
@@ -7010,7 +7013,7 @@ static void peephole_chunk(Chunk &ck)
 
             std::vector<char> is_tgt(n + 1, 0);
             std::vector<int> handler_pcs;
-            for (Instr &in : code) {
+            for (CgInstr &in : code) {
                 visit_pc_fields(in, [&](int &t) {
                     if (t >= 0 && static_cast<size_t>(t) <= n)
                         is_tgt[t] = 1;
@@ -7055,7 +7058,7 @@ static void peephole_chunk(Chunk &ck)
                     hlive |= live_in[h];
 
             for (size_t q = 0; q < n; q++) {
-                Instr &m = code[q];
+                CgInstr &m = code[q];
                 if (m.op != OpCode::MoveV || m.target == m.target2)
                     continue;
                 const int src = m.target2;
@@ -7093,7 +7096,7 @@ static void peephole_chunk(Chunk &ck)
                         ok = false;
                         break;
                     }
-                    Instr &p = code[j - 1];
+                    CgInstr &p = code[j - 1];
                     if (!op_falls_through(p.op) || !retargetable_dst(p.op)
                         || p.target != src) {
                         ok = false;
@@ -7104,7 +7107,7 @@ static void peephole_chunk(Chunk &ck)
                 if (!ok)
                     continue;
                 if (q > 0 && op_falls_through(code[q - 1].op)) {
-                    Instr &p = code[q - 1];
+                    CgInstr &p = code[q - 1];
                     if (!retargetable_dst(p.op) || p.target != src)
                         continue;
                     prods.push_back(q - 1);
@@ -7120,9 +7123,9 @@ static void peephole_chunk(Chunk &ck)
         }
 
         /* E3a: thread every pc field through Jump chains. */
-        for (Instr &in : code)
+        for (CgInstr &in : code)
             visit_pc_fields(in, [&](int &t) {
-                const int nt = pp_thread(ck, t);
+                const int nt = pp_thread(code, t);
                 if (nt != t) {
                     t = nt;
                     changed = true;
@@ -7131,7 +7134,7 @@ static void peephole_chunk(Chunk &ck)
 
         /* Branch-target map (post-threading). */
         std::vector<char> is_tgt(n + 1, 0);
-        for (Instr &in : code)
+        for (CgInstr &in : code)
             visit_pc_fields(in, [&](int &t) {
                 if (t >= 0 && static_cast<size_t>(t) <= n)
                     is_tgt[t] = 1;
@@ -7144,8 +7147,8 @@ static void peephole_chunk(Chunk &ck)
          * marked deleted (the inverted branch's fall-through must land at
          * L1 = i+2, which deleting the jmp produces). */
         for (size_t i = 0; i + 1 < n; i++) {
-            Instr &b = code[i];
-            const Instr &j = code[i + 1];
+            CgInstr &b = code[i];
+            const CgInstr &j = code[i + 1];
             if (b.op != OpCode::JumpUnlessIntCmp || j.op != OpCode::Jump)
                 continue;
             if (b.target != static_cast<int>(i) + 2 || is_tgt[i + 1])
@@ -7225,12 +7228,12 @@ static void peephole_chunk(Chunk &ck)
                     live++;
             }
             newpc[n] = live;
-            std::vector<Instr> out;
+            std::vector<CgInstr> out;
             out.reserve(live);
             for (size_t i = 0; i < n; i++)
                 if (!del[i])
                     out.push_back(code[i]);
-            for (Instr &in : out)
+            for (CgInstr &in : out)
                 visit_pc_fields(in, [&](int &t) {
                     if (t >= 0 && static_cast<size_t>(t) <= n)
                         t = newpc[t];
@@ -7257,24 +7260,29 @@ codegen_chunk(const Block *block, int slot_count)
      * not a ReturnV - a void fn, a trailing loop/if) keeps the Halt as
      * its implicit-return-`none` terminator + jump target. Saves one dead instr
      * per always-returning function. */
-    if (cg.chunk.code.empty()
-        || cg.chunk.code.back().op != OpCode::ReturnV)
+    if (cg.code.empty()
+        || cg.code.back().op != OpCode::ReturnV)
         cg.emit(OpCode::Halt);
     cg.chunk.n_temps = cg.max_temp - slot_count;
     cg.chunk.n_dict_iters = cg.max_dict_iters;
     cg.chunk.n_dyn_iters = cg.max_dyn_iters;
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
-    peephole_chunk(cg.chunk);     /* E1-E4 - BEFORE extract_locs, so the loc/
-                                   * inline_ctxs side tables build from the
-                                   * compacted code (no side-table remap) */
-    extract_locs(cg.chunk, cg.ast_nodes);   /* carets -> the loc side table */
+    peephole_chunk(cg.code, cg.chunk);   /* E1-E4 - BEFORE extract_locs, so
+                                          * the loc/inline_ctxs side tables
+                                          * build from the compacted code (no
+                                          * side-table remap) */
+    extract_locs(cg.code, cg.chunk, cg.ast_nodes);   /* carets -> loc table */
+    verify_ast_free(cg.code);     /* every node handle consumed */
+    /* B3 stage 2: SLICE the runtime Instr sub-objects out of the codegen's
+     * CgInstr vector - the runtime Chunk cannot hold a node handle AT THE
+     * TYPE LEVEL (CgInstr, bytecode.h). */
+    cg.chunk.code.assign(cg.code.begin(), cg.code.end());
     specialize_arith_ops(cg.chunk);   /* B1/B2 - AFTER extract_locs: an
                                        * in-place op swap, no pc shifts, and
                                        * a stale IntBin div0 loc entry for a
                                        * specialized (non-throwing) op is
                                        * never queried */
-    verify_ast_free(cg.chunk);    /* the finished chunk holds NO Construct* */
     return std::move(cg.chunk);
 }
 

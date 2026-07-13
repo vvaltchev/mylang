@@ -14676,9 +14676,10 @@ ast_node_pool_minimal()
      * verify_ast_free (codegen) already asserts none survive; re-check here so
      * the invariant is pinned by a test, not only an assert. */
     auto table_valid = [](const Chunk &ch) -> bool {
-        for (const Instr &in : ch.code)
-            if (in.node_idx != -1)
-                return false;      /* no live per-Instr node_idx at runtime */
+        /* (the "no live per-Instr node handle" check is now TYPE-LEVEL:
+         * the runtime Instr has no node_idx field at all - B3 stage 2's
+         * CgInstr split; verify_ast_free checks the codegen-side handles
+         * were consumed.) */
         return true;
     };
 

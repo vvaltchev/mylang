@@ -170,8 +170,18 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
   TEST-SOURCE STRINGS in tests.cpp (`d.a = 5;` → `d.set_a(5);`,
   `f(d.a)` → `f(d.a())`) — when regex-editing C++ that EMBEDS MyLang
   code, audit string literals explicitly. Stage 2 (the CgInstr
-  node_idx split, below) is the architectural follow-up. Original
-  design analysis kept below for reference.** Measured today:
+  node_idx split) is DONE too: the runtime `Instr` has NO node_idx
+  field AT ALL — codegen builds a `vector<CgInstr>` (Instr + the
+  transient handle), extract_locs/verify_ast_free consume it, and
+  codegen_chunk SLICES the Instr sub-objects into Chunk::code, so
+  "no op references an AST node at runtime" is a TYPE-LEVEL guarantee
+  (the tests' node_idx scan became structurally impossible and was
+  retired). Verified by BYTE-IDENTICAL `-vd` dumps across all of
+  bench/ + samples/ — which caught a real refactor bug -rt could not
+  (pp_thread still read the now-empty Chunk::code, silently WEAKENING
+  the peephole; an optimization no-op is invisible to correctness
+  tests — dump-diffing is the right net for output-preserving
+  refactors). Original design analysis kept below for reference.** Measured today:
   `sizeof(Instr) == 56` (OpCode is already 1 byte; `Op aop` is 4, needs
   1; each 16-byte Operand carries 9 bytes of information — the 8-byte
   lit/flit union forces alignment padding around the 2 tag bytes + the

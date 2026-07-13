@@ -211,8 +211,16 @@ slot AND lit as TWO independent ints at once - they use the DUAL view
 (`set_a_dual(lo, hi)`, `a_dual_lo()`/`a_dual_hi()`: int32 halves of the
 payload; an op uses EITHER the plain view OR the dual view, never both).
 Measured: VM-wall geomean 0.970 (broad -2-4%), my/py 4.67-4.68x.
-`node_idx` stays (it fills what would otherwise be padding); the CgInstr
-codegen-only split is the planned follow-up (roadmap B3).
+**Stage 2: the runtime `Instr` has NO `node_idx` AT ALL** - codegen
+builds a `vector<CgInstr>` (`CgInstr : Instr` + the transient handle,
+implicitly constructible from Instr so plain emit sites are unchanged),
+`extract_locs`/`verify_ast_free` consume it, and `codegen_chunk` SLICES
+the Instr sub-objects into `Chunk::code` (specialize_arith_ops runs on
+the sliced chunk) - the zero-AST-at-runtime rule is enforced by the TYPE
+SYSTEM for instructions. A refactor of this kind is verified by
+BYTE-IDENTICAL `-vd` dumps over bench/ + samples/ (which caught
+pp_thread still reading the now-empty Chunk::code - a silent peephole
+WEAKENING that -rt cannot see; dump-diff output-preserving refactors).
 
 **H3 - join/split reserve + borrow (engine-shared, str.cpp.h).**
 `builtin_join` on GENERAL storage (a string array is always general)

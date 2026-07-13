@@ -1147,15 +1147,6 @@ struct Instr {
     Op aop = Op::invalid;   /* IntBin: arith op; JumpUnlessIntCmp: compare op */
     /* a: bit0 = is_lit, bits1-2 = lit_kind; b: bit3 = is_lit, bits4-5. */
     uint8_t opflags = 0;
-    /* CODEGEN-TRANSIENT: index into the Codegen object's ast_nodes registry
-     * (the splice-stable handle extract_locs uses to harvest an op's error
-     * carets into the loc side table). verify_ast_free asserts every one is
-     * -1 when codegen finishes - at runtime NO op references an AST node,
-     * which is what lets the bytecode be serialized. Under the 32-byte pack
-     * it occupies what would otherwise be padding (the CgInstr split - see
-     * the roadmap B3 entry - is a follow-up for type-level cleanliness,
-     * not bytes). */
-    int32_t node_idx = -1;
     int target = -1;    /* Jump dest; IntBin dst
                          * slot; JumpUnlessIntCmp jump dest */
     int target2 = -1;   /* secondary operand (op-specific) */
@@ -1267,6 +1258,25 @@ struct Instr {
 static_assert(sizeof(Instr) == 32,
               "the B3 packed instruction - two per cache line; a new field "
               "must fit the layout above, not grow it");
+
+/*
+ * The CODEGEN-ONLY instruction (B3 stage 2): `node_idx` indexes the Codegen
+ * object's ast_nodes registry - the splice-stable handle extract_locs uses
+ * to harvest an op's error carets into the loc side table (ops vectors are
+ * rolled back / spliced / compacted during codegen, so the association must
+ * ride INSIDE the element). The runtime `Instr` above cannot hold it AT THE
+ * TYPE LEVEL: codegen builds a vector<CgInstr>, extract_locs/verify_ast_free
+ * consume it, and codegen_chunk SLICES the Instr sub-objects into
+ * Chunk::code - so "no op references an AST node at runtime" is enforced by
+ * the type system, not an assert (verify_ast_free still checks the handles
+ * were all CONSUMED). Implicitly constructible from Instr so plain emit
+ * sites need no change.
+ */
+struct CgInstr : Instr {
+    int32_t node_idx = -1;
+    CgInstr() = default;
+    CgInstr(const Instr &i) : Instr(i) {}
+};
 
 struct Chunk {
     std::vector<Instr> code;
