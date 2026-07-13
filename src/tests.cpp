@@ -13471,7 +13471,8 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
             case OpCode::CallBuiltinV:     c.callbuiltinv++; break;
-            case OpCode::CallBuiltinLV:    c.callbuiltinlv++; break;
+            case OpCode::CallBuiltinLV:
+            case OpCode::AppendV:          c.callbuiltinlv++; break;
             case OpCode::Halt:             c.halt++;   break;
             default:                                   break;
             }

@@ -199,12 +199,19 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
 
 ### D. Builtin ABI marshaling
 
-- **D1. Append/push fast op.** `vm_call_builtin_lv_rest` is ~23% of
-  13_array_append. `append(a, x)` deserves a dedicated `AppendV` op:
-  arg0's LValue* formed from the slot (as today) and the VALUE taken
-  straight from its register — no rest-run copy, no ArgLocs deref, no
-  builtin function-pointer call. (append/pop/len are the dict/array
-  workhorses; len already folds into ArrLen where proven.)
+- **D1. Append/push fast op. DONE (2026-07-16).** `vm_call_builtin_lv_rest`
+  was ~23% of 13_array_append. `AppendV` (shares CallBuiltinLV's operand
+  layout, selected in the codegen when the rest-native callee is
+  `append`/`push` with exactly one value arg): arg0's LValue* formed from
+  the slot, the VALUE read straight from its register, and the never-
+  throwing shared core `arr_append_fast` (arr.cpp.h — flat int/float/
+  bool/POD-struct/general + incremental hash maintenance; `builtin_append`
+  is refactored over the same core, so both engines share one append) run
+  inline — no rest-run copy, no ArgLocs deref, no builtin fn-pointer call.
+  Any decline (const/readonly/slice/flat-mismatch/non-array/undefined
+  global) falls to the full `vm_call_builtin_lv_rest`, byte-identical.
+  MEASURED (full-suite interleaved A/B vs b1b2): VM-wall geomean 0.983,
+  13_array_append 0.062→0.051s (0.82x), suite 4.49-4.50x CPython.
 - **D2. Pass builtin value-args as a slot WINDOW, not copies.**
   `CallBuiltinV` copies each arg EvalValue into a buffer; a `const
   LValue *args + n` view over the frame run (exactly VmArgs) removes a
@@ -221,8 +228,33 @@ Run over the finished chunk, before locs extraction:
 - **E2. Dead-temp elimination + temp REUSE (linear-scan over temps).**
   Shrinks `n_temps`, so every call's `Frame::init` constructs fewer
   48-byte LValues — recursion pays Frame::init per call.
-- **E3. Jump threading / fallthrough cleanup** (jump-to-jump, jump-to-
-  next, branch-over-jump inversion).
+- **E3. Jump threading — v1 TRIED + DECLINED (2026-07-16).** An
+  in-place `thread_jumps` pass (retarget every branch pc-field through
+  chains of plain `Jump`s, hop cap 8, no instruction deletion) was
+  implemented, debugged, validated (full matrix + fuzzer 300/300), and
+  MEASURED — then reverted. Two findings, both permanent lessons:
+  1. **The benefit potential is ~zero.** The codegen already emits
+     direct branches: across ALL 77 benches the pass retargeted
+     instructions in exactly ONE program (68_nested, 24 instrs; every
+     other bench's dump was byte-identical). Jump-to-jump chains barely
+     exist in real chunks, so threading alone cannot pay for anything.
+  2. **The cost was a consistent +3.2% VM-wall suite-wide** (interleaved
+     full-suite A/B, 2 runs each: base 4.45-4.49x, head 4.38x twice) —
+     smeared across benches the pass provably didn't touch, i.e. the
+     known LTO/code-layout front-end effect from perturbing the binary
+     (see the dispatch-front-end memory note), not the pass's runtime.
+     Even 68_nested got slower (1.047x): the layout smear swamps 24
+     saved dispatches.
+  Verdict: threading only makes sense INSIDE the full E1-E4 peephole
+  (instruction deletion + pc remap), where the dead Jumps are actually
+  removed and frames shrink — not as a standalone retargeting pass.
+  **Correctness trap for that future pass (fuzzer-caught here, the
+  differential suite missed it):** an Instr "target" field is NOT always
+  a pc — `ForLoopStep::target2` is the COUNTER SLOT; threading it
+  corrupted the loop var whenever the slot number equaled some Jump's pc
+  (13/300 diverged, a Frame::at bounds abort). Verify each op's field
+  semantics in its vm.cpp handler before treating it as a pc, and ALWAYS
+  run nested_fuzz.py after a codegen-pass change.
 - **E4. The fusion pass** — pattern-match adjacent ops into the B4
   superinstructions instead of hand-coding each shape in the codegen (one
   place to add patterns, codegen stays simple).

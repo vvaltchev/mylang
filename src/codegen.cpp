@@ -3023,6 +3023,22 @@ struct Codegen {
         const int dst = alloc_temp();
         Instr cv;
         cv.op = OpCode::CallBuiltinLV;
+        /* D1: the plain `append(a, x)` / `push(a, x)` shape (rest-native,
+         * exactly one value arg) gets the dedicated AppendV - same operand
+         * layout, the marshaling deleted; every rare/error shape inside it
+         * falls back to the pooled full-builtin path. A user `func append`
+         * shadow never gets here (only an UNSHADOWED builtin devirtualizes
+         * to DirectBuiltinCallExpr). */
+        if (rest_op && dc->args->elems.size() == 2) {
+            if (const Identifier *bid =
+                    dynamic_cast<const Identifier *>(dc->what.get())) {
+                static const UniqueId *const uid_append =
+                    UniqueId::get("append");
+                static const UniqueId *const uid_push = UniqueId::get("push");
+                if (bid->uid == uid_append || bid->uid == uid_push)
+                    cv.op = OpCode::AppendV;
+            }
+        }
         /* AST-free: the Builtin + arg carets live in the builtin_calls pool
          * (index in a.slot; a.lit carries the arg0 slot kind). */
         cv.target = dst;
@@ -6439,6 +6455,7 @@ static void verify_ast_free(Chunk &chunk)
 }
 
 }  /* namespace */
+
 
 /*
  * B1/B2 (plans/vm-performance-roadmap.md): rewrite general IntBin/FloatBin

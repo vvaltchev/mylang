@@ -164,6 +164,29 @@ path; shifts call `bit_shl`/`bit_shr`. Measured: VM-wall geomean -6.3%,
 suite 4.09-4.17x -> **4.45-4.48x vs CPython** (01_while_loop -25%,
 03_int_arith -20%, mandelbrot -19%, bit benches -18%).
 
+**D1 - `AppendV` (the append/push fast op).** `append(a, x)`/`push(a, x)`
+with one value arg emits `AppendV` (CallBuiltinLV's operand layout: the
+builtin_calls pool idx, arg0's kind+slot, the value's slot) instead of
+`CallBuiltinLV`+rest-run: the handler forms arg0's `LValue*` from the slot
+and runs **`arr_append_fast`** (arr.cpp.h) inline - the shared
+NEVER-THROWING append core (flat int/float/bool/POD-struct-match/general +
+`arr_append_maintain_hash`; returns false for null/non-array/const/
+readonly/slice/flat-mismatch) that `builtin_append` itself now uses after
+its slice-clone step, so both engines share ONE append implementation. Any
+decline falls back to the full `vm_call_builtin_lv_rest`, byte-identical
+(the flat-mismatch TypeErrorEx, COW, carets). Measured: VM-wall 0.983,
+13_array_append 0.82x, suite 4.49-4.50x.
+
+**Jump threading was TRIED + DECLINED** (see roadmap E3): the codegen
+already emits direct branches (the pass retargeted instructions in 1 of
+77 benches), and the binary-layout perturbation cost a consistent +3.2%
+VM-wall suite-wide. Threading belongs inside the future full peephole
+(instruction deletion + pc remap), not standalone. Trap recorded there
+for that pass: an Instr "target" field is NOT always a pc -
+`ForLoopStep::target2` is the COUNTER SLOT (fuzzer-caught; the
+differential suite missed it - always run nested_fuzz.py after a
+codegen-pass change).
+
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
 code-label addresses generated in enum order from `ML_FOR_EACH_OPCODE`

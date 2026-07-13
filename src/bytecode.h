@@ -979,6 +979,18 @@ enum class OpCode : unsigned char {
     FloatAddRR, FloatAddRI, FloatSubRR, FloatSubRI, FloatMulRR, FloatMulRI,
 
     /*
+     * D1 (plans/vm-performance-roadmap.md): the dedicated `append(a, x)` /
+     * `push(a, x)` op - the CallBuiltinLV shape (a.slot = builtin_calls pool
+     * idx, a.lit = arg0's slot KIND, target2 = arg0's slot, b.lit = the
+     * value's slot, target = the result dst) with the marshaling deleted:
+     * arr_append_fast appends a fitting element straight into the array
+     * (flat or general, hash maintained); any other shape (const/readonly/
+     * slice/non-array/flat mismatch/undefined global) falls back to the
+     * FULL builtin path with the pooled carets - byte-identical errors.
+     */
+    AppendV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1024,7 +1036,7 @@ enum class OpCode : unsigned char {
     X(IntMulRI) X(IntAndRR) X(IntAndRI) X(IntOrRR) X(IntOrRI) \
     X(IntXorRR) X(IntXorRI) X(IntShlRR) X(IntShlRI) X(IntShrRR) \
     X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
-    X(FloatSubRI) X(FloatMulRR) X(FloatMulRI)
+    X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV)
 
 namespace ml_opcheck {
 #define ML_OPCODE_ENUMV(N) OpCode::N,

@@ -302,6 +302,67 @@ static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
  * `rest`/`n_rest` = the TAIL ARGS BY VALUE (args 1..n, everything after the arg0
  * lvalue), pre-evaluated. append is SELF-EVAL, so `rest` is null and it reads
  * arg1 off `exprList` (it needs the ctor node for construct-in-place). */
+/*
+ * The never-throwing append core shared by builtin_append and the VM's
+ * AppendV fast path: append a FITTING element to a plain mutable array
+ * (flat int/float/bool/POD-struct match, or general) and return true.
+ * False = the caller must take the full builtin path: null/non-array/
+ * const/readonly/slice arg0, or a flat-storage type mismatch (the
+ * dyn-launder ERROR case - the builtin throws it with proper carets).
+ * `is_const` is the general-path element flag (ctx->const_ctx from the
+ * builtin; false from the VM's runtime op).
+ */
+bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
+{
+    if (!lval || !lval->is<SharedArrayObj>() || lval->is_const_var())
+        return false;
+
+    SharedArrayObj &arr = lval->getval<SharedArrayObj>();
+
+    if (arr.is_readonly() || arr.is_slice())
+        return false;
+
+    switch (arr.skind()) {
+    case SharedArrayObj::Storage::ints:
+        if (!elem.is<int_type>())
+            return false;
+        arr.flat_ints().push_back(elem.get<int_type>());
+        break;
+    case SharedArrayObj::Storage::floats:
+        if (elem.is<float_type>())
+            arr.flat_floats().push_back(elem.get<float_type>());
+        else if (elem.is<int_type>())
+            arr.flat_floats().push_back(
+                static_cast<float_type>(elem.get<int_type>()));
+        else
+            return false;
+        break;
+    case SharedArrayObj::Storage::bools:
+        if (!elem.is<bool>())
+            return false;
+        arr.flat_bools().push_back(elem.get<bool>() ? 1 : 0);
+        break;
+    case SharedArrayObj::Storage::structs: {
+        if (!elem.is<intrusive_ptr<StructObject>>())
+            return false;
+        const StructObject &o = *elem.get<intrusive_ptr<StructObject>>().get();
+        auto &sv = arr.flat_structs();
+        if (!o.is_pod() || o.def != sv.def)
+            return false;
+        const size_t at = sv.buf.size();
+        sv.buf.resize(at + sv.stride);
+        std::memcpy(sv.buf.data() + at, o.bytes.data(), sv.stride);
+        break;
+    }
+    default:                              /* general */
+        arr.get_vec().emplace_back(elem, is_const);
+        break;
+    }
+
+    arr_append_maintain_hash(arr, elem);
+    return true;
+}
+
 EvalValue builtin_append(EvalContext *ctx, const ArgLocs *exprList,
                          LValue *target, const EvalValue *rest, size_t n_rest)
 {
@@ -339,53 +400,14 @@ EvalValue builtin_append(EvalContext *ctx, const ArgLocs *exprList,
     ML_CHECK(rest && n_rest == 1);
     const EvalValue &elem = rest[0];
 
-    /*
-     * Flat fast path: append a matching scalar straight into the unboxed
-     * vector, no promotion. Growing in place is sound for aliases (they share
-     * the mutation) and slices (they keep their off/len). A non-fitting element
-     * on a flat array is the dyn-laundering case - it errors rather than
-     * promoting (see flat_array_violation_msg).
-     */
-    if (arr.skind() == SharedArrayObj::Storage::ints && elem.is<int_type>()) {
-        arr.flat_ints().push_back(elem.get<int_type>());
-        arr_append_maintain_hash(arr, elem);
+    /* The shared core (arr_append_fast) does every SUCCESS path - flat
+     * int/float/bool/POD-struct-match and general - with the hash upkeep.
+     * The only way it fails HERE (arg0 already validated + de-sliced above)
+     * is a flat-storage type mismatch: the dyn-laundering ERROR. */
+    if (arr_append_fast(lval, elem, ctx->const_ctx))
         return lval->get();
-    }
-    if (arr.skind() == SharedArrayObj::Storage::floats &&
-        (elem.is<float_type>() || elem.is<int_type>())) {
-        arr.flat_floats().push_back(elem.is<int_type>()
-            ? static_cast<float_type>(elem.get<int_type>())
-            : elem.get<float_type>());
-        arr_append_maintain_hash(arr, elem);
-        return lval->get();
-    }
-    if (arr.skind() == SharedArrayObj::Storage::bools && elem.is<bool>()) {
-        arr.flat_bools().push_back(elem.get<bool>() ? 1 : 0);
-        arr_append_maintain_hash(arr, elem);
-        return lval->get();
-    }
-    /* flat POD-struct array: append the element's bytes (the hot path that
-     * keeps a built-up array<Struct> unboxed). */
-    if (arr.skind() == SharedArrayObj::Storage::structs &&
-        elem.is<intrusive_ptr<StructObject>>() &&
-        elem.get<intrusive_ptr<StructObject>>()->is_pod() &&
-        elem.get<intrusive_ptr<StructObject>>()->def ==
-            arr.flat_structs().def) {
-        auto &sv = arr.flat_structs();
-        const StructObject &o = *elem.get<intrusive_ptr<StructObject>>().get();
-        const size_t at = sv.buf.size();
-        sv.buf.resize(at + sv.stride);
-        std::memcpy(sv.buf.data() + at, o.bytes.data(), sv.stride);
-        arr_append_maintain_hash(arr, elem);
-        return lval->get();
-    }
 
-    if (arr.skind() != SharedArrayObj::Storage::general)
-        throw TypeErrorEx(flat_array_violation_msg, arg0->start, arg1->end);
-
-    arr.get_vec().emplace_back(elem, ctx->const_ctx);
-    arr_append_maintain_hash(arr, elem);
-    return lval->get();
+    throw TypeErrorEx(flat_array_violation_msg, arg0->start, arg1->end);
 }
 
 /*

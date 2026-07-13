@@ -2921,6 +2921,39 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             pc++;
             VM_NEXT;
 
+        VM_CASE(AppendV): {
+            /* D1: `append(a, x)` / `push(a, x)` - the CallBuiltinLV shape
+             * with the marshaling deleted. arr_append_fast appends a fitting
+             * element in place (flat or general, hash maintained); any other
+             * shape (const/readonly/slice/non-array/flat mismatch/undefined
+             * global -> null target) falls back to the FULL builtin via the
+             * pooled carets - byte-identical errors and result. */
+            LValue *target;
+            switch (in->a.lit) {
+            case 0:  target = &ctx.frame->at(in->target2); break;
+            case 1:  target = ctx.gfuncs->defined[in->target2]
+                                  ? &ctx.gfuncs->slots[in->target2]
+                                  : nullptr;                     break;
+            default: target = &(*ctx.captures)[in->target2];    break;
+            }
+            const EvalValue &elem = ctx.frame->at(in->b.lit).get();
+            if (target && arr_append_fast(target, elem, false)) {
+                ctx.frame->at(in->target).put(target->get());
+                pc++;
+                VM_NEXT;
+            }
+            try {
+                ctx.frame->at(in->target).put(
+                    vm_call_builtin_lv_rest(ctx, *chunk, in->a.slot, target,
+                                            in->b.lit));
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
+            pc++;
+        }
+        VM_NEXT;
+
         VM_CASE(CallBuiltinLV): {
 
             /* Native mutating-builtin call (lvalue ABI): form arg0's LValue*

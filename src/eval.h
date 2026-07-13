@@ -468,6 +468,11 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
  * See eval.cpp. */
 EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float);
 
+/* The never-throwing append core (arr.cpp.h) shared by builtin_append and
+ * the VM's AppendV: true = appended (flat or general, hash maintained);
+ * false = take the full builtin path (errors/odd shapes, proper carets). */
+bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const);
+
 /* Form the member LValue* of `dval.member` for a ROOTED base (a mutable boxed
  * struct field / a dict value); nullptr for a POD field / readonly / non-
  * struct-non-dict (a value read). Shared by vm_incdec_member and the VM's

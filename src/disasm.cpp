@@ -709,6 +709,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << builtin_call_name(chunk, in.target2)
                 << arglist(chunk, in.a.lit, in.b.lit);
             break;
+        case OpCode::AppendV:
+            /* D1: same shape as call.blt.lv, the append fast op */
+            row << "append.v     " << D(in.target) << " = "
+                << builtin_call_name(chunk, in.a.slot)
+                << "(" << lval_ref(in.a.lit, in.target2) << ", "
+                << D(static_cast<int_type>(in.b.lit)) << ")";
+            break;
         case OpCode::CallBuiltinLV: {
             /* AST-free: name + arg count from the builtin_calls pool (a.slot).
              * A valid `b` (is_lit) is a rest-run base (rest-native) - show its
