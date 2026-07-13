@@ -706,7 +706,7 @@ do_func_call(EvalContext *ctx,
     if (vm_ck) {
         const int_type total =
             obj.func->frame_size + static_cast<int_type>(vm_ck->n_temps);
-        if (Frame *w = vm_window_push(total)) {
+        if (Frame *w = vm_window_push(total, vm_ck)) {
             wguard.engaged = true;
             args_ctx.frame = w;
         } else {

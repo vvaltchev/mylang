@@ -128,9 +128,13 @@ struct FuncDescriptor {
      * The bytecode VM's compiled body chunk (an opaque `const Chunk *`; this
      * header stays VM-agnostic). Filled UPFRONT under -vm by
      * vm_precompile_all; `vm_chunk_tried` guards the one-time compile.
+     * `fast_bind` (computed with the chunk): NO param needs per-param work
+     * beyond the value copy - no i/f-typed param (coercion) - so an
+     * exact-arity in-VM call binds with a plain copy loop.
      */
     mutable const void *vm_chunk = nullptr;
     mutable bool vm_chunk_tried = false;
+    mutable bool fast_bind = false;
 
     /*
      * COMPILE-TIME / tree-walker back-pointer to the owning decl (body eval,

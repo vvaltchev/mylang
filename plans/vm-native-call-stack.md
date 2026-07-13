@@ -208,7 +208,27 @@ next call immediately overwrites (param slots), which today's model cannot.
 
 ## Phases (each lands -rt green + differential + A/B measured)
 
-> Status: **A ✅ DONE** (LoopBackEdge deleted - opcode/handler/disasm/test
+> Status (2026-07-16): **A+B+C ✅ DONE** — see the phase notes below and the
+> commit messages. Phase C landed the FULL in-VM protocol: segmented window
+> stack (address-stable across callbacks - the relocation design was
+> CORRECTED here: builtins hold frame pointers across user callbacks),
+> per-frame state in call records (handlers/iters watermarked; exc/pend/
+> pure-cache per record - the cache STASH exists because the shared view
+> Frame would otherwise leak it into global memoization, caught by A/B),
+> CallV/CachedCallV/CallValueV push frames IN-LOOP with a fast_bind copy
+> loop, ReturnV/Halt pop (FlowState gone from in-VM returns), and the
+> boundary catch is the FRAME WALK (one landing pad per activation,
+> byte-identical backtraces incl. inline flushes at each call pc).
+> Catchable StackOverflowEx replaces the recursion segfault (README).
+> Measured (scale 10, best-of-7): recursion_deep -38%, exc_crossframe
+> -15% vs pre-phase; builtin-CALLBACK benches (sort/map/make_dict) still
+> pay do_func_call per element (+10-24%) - THE Phase D target (vm_invoke);
+> pure loops show ±5-13% layout drift (the known front-end sensitivity).
+> Net suite ~flat until D lands. clang portability: an indirect goto may
+> not exit a destructor scope - CachedCallV's pending key lives at LOOP
+> scope; every handler-terminal dispatch stays outside its case braces.
+>
+> Earlier: **A ✅ DONE** (LoopBackEdge deleted - opcode/handler/disasm/test
 > counters; the VM's only FlowState use left is ReturnV's hand-off).
 > **B ✅ DONE** (Frame::point_at view mode + VmActivation owning the slot
 > stack; main's frame lives on it and every top-level builtin/op accesses

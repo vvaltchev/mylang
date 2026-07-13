@@ -1596,8 +1596,18 @@ exceptions that can be caught with `try-catch` blocks is:
   * OutOfBoundsEx
   * KeyNotFoundEx
   * CannotOpenFileEx
+  * StackOverflowEx
 
 Other exceptions like `SyntaxErrorEx` cannot be caught, instead.
+
+`StackOverflowEx` ("Maximum call depth exceeded") is raised by the bytecode
+VM (`-vm`) when a call recurses past the VM stack limit — a clean, catchable
+error with a normal backtrace, where a runaway recursion previously crashed
+the process. The limit defaults to 1M value slots (roughly 50-100K frames,
+far deeper than the old process-stack bound) and can be changed with the
+`MYLANG_VM_STACK` environment variable (a slot count). The tree-walking
+engine still relies on the process stack, so an uncatchable crash remains
+possible there for extreme depths.
 It's also possible in `MyLang` to catch ANY exception use a catch-anything
 block:
 

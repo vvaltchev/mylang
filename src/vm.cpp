@@ -688,6 +688,37 @@ struct ExecGuard {
     ~ExecGuard() { g_vm_executing = prev; }
 };
 
+/* Per-loop LIVE dict-iterator state (DictIterInit/DictIterNext): the
+ * intrusive_ptr pins the dict alive for the loop, the iterator persists across
+ * iterations. One per native dict foreach in the chunk (Chunk::n_dict_iters),
+ * indexed by the codegen-assigned iter_id. Local to vm_run_chunk, so a `return`
+ * / exception mid-loop releases it when the frame unwinds - no cleanup op. */
+struct DictIterState {
+    intrusive_ptr<DictObject> dict;
+    DictObject::inner_type::iterator it;
+};
+/* Per-loop LIVE state for a native `foreach (<ids> in [indexed] <dyn>)`: the
+ * array-vs-dict choice is made ONCE at ForeachDynInit and recorded here (the
+ * pinned `container` keeps the array/dict alive for the loop). One per native
+ * ForeachDyn (Chunk::n_dyn_iters), indexed by the codegen-assigned iter_id.
+ * `targets` points into the chunk's unpack_targets pool (immutable at
+ * runtime): the per-var frame slots, -1 == a `_` placeholder. */
+struct DynIterState {
+    EvalValue container;   /* pins the array OR dict for the loop */
+    bool is_dict = false;
+    bool indexed = false;  /* ids[0] is the iteration counter */
+    int nvars = 1;         /* TOTAL loop vars (incl. the indexed counter) */
+    const std::vector<int32_t> *targets = nullptr;   /* per-var slots */
+    size_type idx = 0, size = 0;               /* array cursor + snapshot */
+    int_type counter = 0;                      /* dict `indexed` counter */
+    DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
+};
+/* P8 Inc 0: an active `try` region on the VM handler stack. `catch_pc` is where
+ * the boundary jumps on a caught exception (the CatchTest chain). */
+struct VmHandler {
+    uint32_t catch_pc;
+};
+
 /*
  * The VM's SLOT STACK (plans/vm-native-call-stack.md): every VM frame is a
  * WINDOW of a segment. SEGMENTED, not relocating, because C++ builtins hold
@@ -706,13 +737,44 @@ struct VmStackSeg {
     explicit VmStackSeg(size_t cap) : slots(cap) { }
 };
 
-/* One VM frame's stack bookkeeping (Phase C grows this into the full call
- * record - callee identity, return pc, per-frame exception state). */
+/*
+ * One VM frame's CALL RECORD. A BOUNDARY record (boundary == 1) is a frame
+ * entered from C++ (main, or do_func_call for a builtin-callback / generic
+ * call) - popping it returns control to C++, and its ret_* fields are
+ * unused. An in-VM record (CallV/CachedCallV/CallValueV) resumes the parent
+ * frame directly: ret_chunk/ret_pc, the result into parent slot `dst`.
+ */
 struct VmCallRec {
     LValue *window;                   /* stable - segments never move */
     int_type nslots;
     int seg;                          /* owning segment index */
     int_type seg_top_before;          /* watermark to restore on pop */
+
+    const Chunk *run_chunk = nullptr; /* the chunk THIS frame executes */
+
+    /* Resume state (in-VM records only). */
+    const Chunk *ret_chunk = nullptr;
+    size_t ret_pc = 0;                /* the pc AFTER the call op */
+    int_type dst = -1;                /* parent slot for the return value */
+    const FuncDescriptor *desc = nullptr;   /* callee (backtrace); null for
+                                             * the root/main frame */
+    std::vector<LValue> *caller_captures = nullptr;  /* ctx.captures to
+                                                      * restore on pop */
+
+    /* Per-FRAME exception/iterator state (was vm_run_chunk locals - one
+     * frame per invocation then; watermarks into the activation's shared
+     * stacks now). */
+    uint32_t handler_base = 0;
+    uint32_t diter_base = 0, dyiter_base = 0;
+    std::unique_ptr<RuntimeException> exc;  /* in-flight caught exception */
+    Pend pend = Pend::normal;               /* finally resume action */
+
+    /* CachedCallV: the {func, args} key to store the (scalar) result under
+     * in the CALLER's cache when this frame pops. */
+    std::unique_ptr<PureCacheKey> cache_key;
+
+    unsigned char boundary = 0;
+
     /* The CALLER's per-frame pure-call cache, stashed while a callee runs:
      * eval.cpp reaches the cache as `ctx->frame->pure_cache`, and the view
      * Frame is SHARED across the whole activation - without the stash the
@@ -736,11 +798,15 @@ struct VmActivation {
     std::vector<std::unique_ptr<VmStackSeg>> segs;
     int cur_seg = -1;
     std::vector<VmCallRec> records;
+    /* Shared per-frame stacks, sliced by the records' watermarks. */
+    std::vector<VmHandler> handlers;
+    std::vector<DictIterState> dict_iters;
+    std::vector<DynIterState> dyn_iters;
     Frame view_frame;                 /* the loop's window into the stack */
     int_type used = 0;                /* live slots, for the depth cap */
     int_type cap;                     /* MYLANG_VM_STACK (slots) */
 
-    VmActivation() : cap(stack_cap()) { }
+    VmActivation() : cap(stack_cap()) { records.reserve(32); }
 
     /* The configurable depth cap (slots). One env read per process. */
     static int_type stack_cap()
@@ -759,7 +825,9 @@ struct VmActivation {
     /* Allocate an n-slot frame window and repoint the view Frame at it.
      * Throws the CATCHABLE StackOverflowEx at the cap - a clean, located
      * error where the old per-call C-stack model segfaulted. */
-    Frame *push_window(int_type n)
+    /* `ck` sizes the frame's iterator slices (n_dict_iters/n_dyn_iters);
+     * it is the chunk the frame RUNS. */
+    Frame *push_window(int_type n, const Chunk *ck, bool boundary)
     {
         if (used + n > cap)
             throw StackOverflowEx();
@@ -788,11 +856,21 @@ struct VmActivation {
         rec.nslots = n;
         rec.seg = cur_seg;
         rec.seg_top_before = sg->top;
+        rec.boundary = boundary;
+        rec.run_chunk = ck;
+        rec.handler_base = static_cast<uint32_t>(handlers.size());
+        rec.diter_base = static_cast<uint32_t>(dict_iters.size());
+        rec.dyiter_base = static_cast<uint32_t>(dyn_iters.size());
+        if (ck->n_dict_iters)
+            dict_iters.resize(dict_iters.size() + ck->n_dict_iters);
+        if (ck->n_dyn_iters)
+            dyn_iters.resize(dyn_iters.size() + ck->n_dyn_iters);
         sg->top += n;
         used += n;
         /* Stash the CALLER's pure cache; the callee's frame starts with
          * none (per-frame scoping - see VmCallRec::caller_cache). */
-        rec.caller_cache = std::move(view_frame.pure_cache);
+        if (view_frame.pure_cache)
+            rec.caller_cache = std::move(view_frame.pure_cache);
         LValue *const window = rec.window;
         records.push_back(std::move(rec));
         view_frame.point_at(window, static_cast<int>(n));
@@ -802,14 +880,32 @@ struct VmActivation {
     /* Release the TOP window: reset its slots to none (drop references -
      * the old Frame-dtor point), restore the watermark, repoint the view
      * at the new top (if any). */
-    void pop_window()
+    VmCallRec pop_window()
     {
         ML_CHECK(!records.empty());
         VmCallRec rec = std::move(records.back());
         records.pop_back();
 
-        for (int_type i = 0; i < rec.nslots; i++)
-            rec.window[i] = LValue();
+        /* Release the window's REFERENCES (the old Frame-dtor point). A
+         * slot holding a trivial value (int/float/bool/none - no refcount,
+         * no slice registration) is left STALE: unobservable, since a slot
+         * can only be read after its decl re-binds it (the no-hoist rule),
+         * and COW/use_count semantics only see reference types. */
+        for (int_type i = 0; i < rec.nslots; i++) {
+            LValue &lv = rec.window[i];
+            if (lv.get().get_type()->t >= Type::t_str)
+                lv = LValue();
+        }
+
+        /* Per-frame state dies with the frame. A normal return has already
+         * popped its handlers (the codegen emits the crossed-try pops); the
+         * exceptional walk truncates whatever is left. */
+        if (handlers.size() != rec.handler_base)
+            handlers.resize(rec.handler_base);
+        if (dict_iters.size() != rec.diter_base)
+            dict_iters.resize(rec.diter_base);
+        if (dyn_iters.size() != rec.dyiter_base)
+            dyn_iters.resize(rec.dyiter_base);
 
         segs[rec.seg]->top = rec.seg_top_before;
         used -= rec.nslots;
@@ -817,13 +913,15 @@ struct VmActivation {
 
         /* The popped frame's cache dies HERE (per-frame scoping); the
          * caller's stashed cache comes back into the view. */
-        view_frame.pure_cache = std::move(rec.caller_cache);
+        if (rec.caller_cache || view_frame.pure_cache)
+            view_frame.pure_cache = std::move(rec.caller_cache);
 
         if (!records.empty()) {
             const VmCallRec &tp = records.back();
             view_frame.point_at(tp.window, static_cast<int>(tp.nslots));
             cur_seg = tp.seg;
         }
+        return rec;
     }
 };
 
@@ -833,11 +931,13 @@ struct VmActivation {
  * the engine flag set but no VM run active). */
 static VmActivation *g_vm_act = nullptr;
 
-Frame *vm_window_push(int_type nslots)
+Frame *vm_window_push(int_type nslots, const Chunk *ck)
 {
     if (!g_vm_act)
         return nullptr;
-    return g_vm_act->push_window(nslots);
+    /* A do_func_call entry is a BOUNDARY frame: popping it returns control
+     * to C++ (the in-VM protocol never pops past it). */
+    return g_vm_act->push_window(nslots, ck, /*boundary=*/true);
 }
 
 void vm_window_pop()
@@ -917,7 +1017,8 @@ vm_run(VmProgram &prog)
 
     const int_type main_slots = prog.root_slot_count + prog.root.n_temps;
     if (main_slots)
-        ctx.frame = act.push_window(main_slots);
+        ctx.frame = act.push_window(main_slots, &prog.root,
+                                    /*boundary=*/true);
 
     std::unique_ptr<GlobalFuncTable> gtable;
     if (!prog.global_func_names.empty()) {
@@ -1026,41 +1127,13 @@ vm_precompile_all(const Block *root)
         /* compiles + caches (or null); stamped on the DESCRIPTOR */
         fn->desc->vm_chunk = vm_func_chunk(fn->desc);
         fn->desc->vm_chunk_tried = true;
+        bool fast = true;
+        for (const auto &p : fn->desc->params)
+            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+                fast = false;
+        fn->desc->fast_bind = fast;
     }
 }
-
-/* Per-loop LIVE dict-iterator state (DictIterInit/DictIterNext): the
- * intrusive_ptr pins the dict alive for the loop, the iterator persists across
- * iterations. One per native dict foreach in the chunk (Chunk::n_dict_iters),
- * indexed by the codegen-assigned iter_id. Local to vm_run_chunk, so a `return`
- * / exception mid-loop releases it when the frame unwinds - no cleanup op. */
-struct DictIterState {
-    intrusive_ptr<DictObject> dict;
-    DictObject::inner_type::iterator it;
-};
-
-/* Per-loop LIVE state for a native `foreach (<ids> in [indexed] <dyn>)`: the
- * array-vs-dict choice is made ONCE at ForeachDynInit and recorded here (the
- * pinned `container` keeps the array/dict alive for the loop). One per native
- * ForeachDyn (Chunk::n_dyn_iters), indexed by the codegen-assigned iter_id.
- * `targets` points into the chunk's unpack_targets pool (immutable at
- * runtime): the per-var frame slots, -1 == a `_` placeholder. */
-struct DynIterState {
-    EvalValue container;   /* pins the array OR dict for the loop */
-    bool is_dict = false;
-    bool indexed = false;  /* ids[0] is the iteration counter */
-    int nvars = 1;         /* TOTAL loop vars (incl. the indexed counter) */
-    const std::vector<int32_t> *targets = nullptr;   /* per-var slots */
-    size_type idx = 0, size = 0;               /* array cursor + snapshot */
-    int_type counter = 0;                      /* dict `indexed` counter */
-    DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
-};
-
-/* P8 Inc 0: an active `try` region on the VM handler stack. `catch_pc` is where
- * the boundary jumps on a caught exception (the CatchTest chain). */
-struct VmHandler {
-    uint32_t catch_pc;
-};
 
 /* The in-flight exception's type NAME for catch-matching (a user struct
  * exception's type name, else the built-in name). Mirrors do_catch's ex_name. */
@@ -1099,16 +1172,42 @@ vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
     throw TypeErrorEx("Can only throw a struct instance", estart, eend);
 }
 
-/* P8: pop the innermost active handler and set `pc` to its catch-dispatch;
- * false (pc unchanged) if none → the caller C++-throws (cross-frame). Shared by
- * the native Throw and the boundary. Inc 0/1: a handler is just a catch_pc. */
-static bool vm_dispatch_exc(std::vector<VmHandler> &handlers, size_t &pc)
+/* P8: pop the innermost handler OF THE CURRENT FRAME (entries below the
+ * record's watermark belong to outer frames - those are reached by the
+ * boundary catch's frame walk, never here) and set `pc` to its
+ * catch-dispatch; false (pc unchanged) if this frame has none. */
+static bool vm_dispatch_exc(VmActivation &act, const VmCallRec &cur,
+                            size_t &pc)
 {
-    if (handlers.empty())
+    if (act.handlers.size() <= cur.handler_base)
         return false;
-    pc = handlers.back().catch_pc;
-    handlers.pop_back();
+    pc = act.handlers.back().catch_pc;
+    act.handlers.pop_back();
     return true;
+}
+
+/*
+ * Append the frame a WALK is popping to the exception's backtrace - the
+ * record-based twin of vm_capture_frame (eval.cpp): name/params from the
+ * callee DESCRIPTOR, the call-site caret from the PARENT's chunk at the call
+ * op (ret_pc - 1), the pure-func UndefinedVariableEx tag from pure_ctx.
+ */
+static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
+{
+    if (rec.desc->pure_ctx)
+        if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
+            undefEx->in_pure_func = true;
+
+    BacktraceFrame bf;
+    bf.name = !rec.desc->display_name.empty()
+                  ? rec.desc->display_name
+                  : rec.desc->name ? std::string(rec.desc->name->val)
+                                   : "<lambda>";
+    for (const auto &p : rec.desc->params)
+        bf.params.push_back(std::string(p.name->val));
+    Loc end_ignored;
+    rec.ret_chunk->loc_at(rec.ret_pc - 1, bf.call_site, end_ignored);
+    e.backtrace.push_back(std::move(bf));
 }
 
 /* Inc v2: the in-flight cross-frame exception signal (see vm.h). */
@@ -1150,8 +1249,7 @@ static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
  * error); the non-error path never calls it. Returns iff it native-dispatched.
  */
 static void
-vm_raise(const Chunk &chunk, size_t &pc, std::vector<VmHandler> &handlers,
-         std::unique_ptr<RuntimeException> &vm_exc,
+vm_raise(const Chunk &chunk, size_t &pc, VmActivation &act, VmCallRec &cur,
          std::unique_ptr<RuntimeException> ex)
 {
     if (!ex->loc_start) {
@@ -1161,33 +1259,159 @@ vm_raise(const Chunk &chunk, size_t &pc, std::vector<VmHandler> &handlers,
         ex->loc_end = en;
     }
     vm_flush_inline(chunk, pc, *ex);       /* frames if raised in inlined */
-    if (vm_dispatch_exc(handlers, pc)) {
-        vm_exc = std::move(ex);            /* same-frame: native jump */
+    if (vm_dispatch_exc(act, cur, pc)) {
+        cur.exc = std::move(ex);           /* same-frame: native jump */
         return;
     }
-    vm_exc = std::move(ex);                /* no handler → C++ propagate */
-    vm_exc->rethrow();
+    cur.exc = std::move(ex);       /* no handler in THIS frame: C++ throw to
+                                    * the boundary catch, whose frame WALK
+                                    * finds an outer handler or leaves */
+    cur.exc->rethrow();
 }
 
 void
 vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 {
-    /* The CURRENT chunk - reseatable LOOP STATE (Phase C of the native call
-     * stack: an in-VM call switches it to the callee's chunk; a return
-     * switches it back). Every op reads the current chunk through it. */
+    /* The CURRENT chunk - reseatable LOOP STATE (the native call stack: an
+     * in-VM call switches it to the callee's chunk; a pop switches it
+     * back). Every op reads the current chunk through it. */
     const Chunk *chunk = &chunk0;
 
-    /* Sized once from the chunk; empty (no alloc) for a no-dict-foreach
-     * chunk-> */
-    std::vector<DictIterState> dict_iters(chunk->n_dict_iters);
-    std::vector<DynIterState> dyn_iters(chunk->n_dyn_iters);
-    /* P8: active `try` regions + the in-flight caught exception. Empty/null when
-     * no try is active (the common case), so no cost for exception-free code. */
-    std::vector<VmHandler> handlers;
-    std::unique_ptr<RuntimeException> vm_exc;
-    /* P8 Inc 2b: the pending action the shared `finally` must resume - normal
-     * or reraise (set by SetPend, consumed by EndFinally). */
-    Pend vm_pend = Pend::normal;
+    /*
+     * Every invocation runs on an ACTIVATION whose TOP record is this
+     * entry's BOUNDARY frame - normally pushed by the caller (vm_run for
+     * main, do_func_call for a chunked body). A stray entry (no activation,
+     * or no matching record: a plain-Frame fallback body, a 0-slot main)
+     * gets a 0-slot boundary record - the SLOTS stay wherever ctx.frame
+     * points; only the per-frame handler/iterator/exception state lives in
+     * the record. Per-frame state (was locals here, one frame per
+     * invocation): handlers/iterators are watermarked slices of the
+     * activation's shared stacks; exc/pend live in the record.
+     */
+    std::unique_ptr<VmActivation> local_act;
+    struct EntryGuard {
+        VmActivation *prev = nullptr;
+        bool swapped = false, pushed = false;
+        ~EntryGuard() {
+            if (pushed)
+                g_vm_act->pop_window();
+            if (swapped)
+                g_vm_act = prev;
+        }
+    } entry_guard;
+
+    if (!g_vm_act) {
+        local_act = std::make_unique<VmActivation>();
+        entry_guard.prev = g_vm_act;
+        entry_guard.swapped = true;
+        g_vm_act = local_act.get();
+    }
+    if (g_vm_act->records.empty()
+            || g_vm_act->records.back().run_chunk != chunk) {
+        g_vm_act->push_window(0, chunk, /*boundary=*/true);
+        entry_guard.pushed = true;
+    }
+
+    VmActivation &act = *g_vm_act;
+    size_t pc = 0;
+    /* CachedCallV's pending {func,args} key between the cache miss and the
+     * frame push. LOOP-scope (like `in`): clang forbids an INDIRECT goto
+     * from exiting a scope with a live non-trivial local, and every label
+     * lives inside this one, so no dispatch ever exits it. */
+    std::unique_ptr<PureCacheKey> pending_key;
+    auto cur_rec = [&]() -> VmCallRec & { return act.records.back(); };
+    auto diter = [&](int_type i) -> DictIterState & {
+        return act.dict_iters[cur_rec().diter_base + i];
+    };
+    auto dyiter = [&](int_type i) -> DynIterState & {
+        return act.dyn_iters[cur_rec().dyiter_base + i];
+    };
+
+    /*
+     * THE IN-VM CALL (plans/vm-native-call-stack.md): push the callee's
+     * frame window + record and CONTINUE THE LOOP in the callee's chunk -
+     * no do_func_call, no EvalContext, no C++ recursion. Everything
+     * do_func_call did for a chunked body happens here, cheaper:
+     *  - arity: two compares against the descriptor (same
+     *    InvalidNumberOfArgsEx, reaching the boundary walk like any bind
+     *    throw did);
+     *  - bind: the args already sit in the caller's contiguous run
+     *    (STABLE across the push - segments never move); an omitted
+     *    trailing opt param binds none; a typed i/f param coerces via
+     *    vm_coerce_decl_num (the tree-walker's exact coercion); runtime
+     *    bindings are non-const (do_func_bind_params' value overloads
+     *    bound with ctx->const_ctx == false). A bind throw pops the
+     *    half-built frame WITHOUT capturing a backtrace frame for it -
+     *    do_func_call's bind ran BEFORE its try, so a bind error never
+     *    recorded the callee.
+     * ReturnV/Halt pop the record: result into the parent's dst slot,
+     * resume at ret_chunk/ret_pc.
+     */
+    auto enter_call = [&](FuncObject &fo, const Chunk *cck, int_type argbase,
+                          size_t nargs, int_type dst,
+                          std::unique_ptr<PureCacheKey> ckey) {
+        const FuncDescriptor *d = fo.func;
+        const size_t nparams = d->params.size();
+        if (nargs > nparams || nargs < static_cast<size_t>(d->min_args))
+            throw InvalidNumberOfArgsEx();
+
+        LValue *argrun = nargs ? &ctx.frame->at(argbase) : nullptr;
+        const int_type total =
+            d->frame_size + static_cast<int_type>(cck->n_temps);
+        Frame *w = act.push_window(total, cck, /*boundary=*/false);
+        VmCallRec &rec = act.records.back();
+        rec.ret_chunk = chunk;
+        rec.ret_pc = pc + 1;
+        rec.dst = dst;
+        rec.desc = d;
+        rec.caller_captures = ctx.captures;
+        rec.cache_key = std::move(ckey);
+
+        if (d->fast_bind) {
+            /* No typed param anywhere: a plain copy loop (+ none-fill for
+             * omitted trailing opt params). Cannot throw. */
+            for (size_t i = 0; i < nargs; i++)
+                w->at(static_cast<int_type>(i)) =
+                    LValue(argrun[i].get(), false);
+            for (size_t i = nargs; i < nparams; i++)
+                w->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
+        } else {
+            try {
+                for (size_t i = 0; i < nparams; i++) {
+                    const FuncDescriptor::ParamDesc &p = d->params[i];
+                    EvalValue val = i < nargs ? argrun[i].get()
+                                              : EvalValue();
+                    if (p.decl_type == DeclType::i
+                            || p.decl_type == DeclType::f)
+                        val = vm_coerce_decl_num(
+                            val, p.decl_type == DeclType::f);
+                    w->at(static_cast<int_type>(i)) =
+                        LValue(std::move(val), false);
+                }
+            } catch (...) {
+                act.pop_window();
+                throw;
+            }
+        }
+
+        ctx.captures = &fo.capture_slots;
+        chunk = cck;
+        pc = 0;
+    };
+
+    /* Pop the TOP (in-VM) frame with `res` as its return value: store a
+     * cached call's SCALAR result in the caller's cache (pure_cache_call's
+     * exact rule), write the parent's dst slot, resume after the call. */
+    auto leave_call = [&](EvalValue res) {
+        VmCallRec dead = act.pop_window();
+        ctx.captures = dead.caller_captures;
+        chunk = dead.ret_chunk;
+        pc = dead.ret_pc;
+        if (dead.cache_key && res.get_type()->t < Type::t_str)
+            ctx.frame->ensure_pure_cache().emplace(
+                std::move(*dead.cache_key), res);
+        ctx.frame->at(dead.dst).put(std::move(res));
+    };
 
     /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
      * RuntimeException thrown by any op (a runtime-library error, a fallback
@@ -1197,7 +1421,6 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
      * wraps the dispatch loop directly - no cold-wrapper needed. Body
      * deliberately NOT reindented (a 1270-line switch; indentation is cosmetic).
      * `pc` lives out here so the catch can set it before `goto vm_resume`. */
-    size_t pc = 0;
   vm_resume:
     try {
 
@@ -1314,14 +1537,14 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             case Op::times: r = a * b; break;
             case Op::div:
                 if (b == 0) {
-                    vm_raise(*chunk, pc, handlers, vm_exc,
+                    vm_raise(*chunk, pc, act, cur_rec(),
                              std::make_unique<DivisionByZeroEx>());
                     VM_NEXT;          /* native-dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
                 if (b == 0) {
-                    vm_raise(*chunk, pc, handlers, vm_exc,
+                    vm_raise(*chunk, pc, act, cur_rec(),
                              std::make_unique<DivisionByZeroEx>());
                     VM_NEXT;
                 }
@@ -1374,14 +1597,14 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             case Op::times: r = a * b; break;
             case Op::div:
                 if (b == 0.0) {
-                    vm_raise(*chunk, pc, handlers, vm_exc,
+                    vm_raise(*chunk, pc, act, cur_rec(),
                              std::make_unique<DivisionByZeroEx>());
                     VM_NEXT;          /* native-dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
                 if (b == 0.0) {
-                    vm_raise(*chunk, pc, handlers, vm_exc,
+                    vm_raise(*chunk, pc, act, cur_rec(),
                              std::make_unique<DivisionByZeroEx>());
                     VM_NEXT;
                 }
@@ -1556,10 +1779,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * live iterator to begin(). The inferencer proved a Dict static
              * type; the ML_VM_CHECKs are the hardening net. */
             ML_VM_CHECK(in->target >= 0
-                && static_cast<size_t>(in->target) < dict_iters.size());
+                && in->target < static_cast<int_type>(chunk->n_dict_iters));
             const EvalValue &base = ctx.frame->at(in->target2).get();
             ML_VM_CHECK(base.is<intrusive_ptr<DictObject>>());
-            DictIterState &st = dict_iters[in->target];
+            DictIterState &st = diter(in->target);
             st.dict = base.get<intrusive_ptr<DictObject>>();
             st.it = st.dict->get_ref().begin();
             pc++;
@@ -1574,8 +1797,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * then advance. A slot of -1 is a `_` placeholder / the keys-only
              * 1-var form (bind nothing). */
             ML_VM_CHECK(in->target2 >= 0
-                && static_cast<size_t>(in->target2) < dict_iters.size());
-            DictIterState &st = dict_iters[in->target2];
+                && in->target2 < static_cast<int_type>(chunk->n_dict_iters));
+            DictIterState &st = diter(in->target2);
             if (st.it == st.dict->get_ref().end()) {
                 pc = static_cast<size_t>(in->target);
                 VM_NEXT;
@@ -1595,8 +1818,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * unpack_targets pool), and set up an array or dict cursor. An
              * unsupported runtime value throws (loc side table). */
             ML_VM_CHECK(in->target >= 0
-                && static_cast<size_t>(in->target) < dyn_iters.size());
-            DynIterState &st = dyn_iters[in->target];
+                && in->target < static_cast<int_type>(chunk->n_dyn_iters));
+            DynIterState &st = dyiter(in->target);
             st.container = ctx.frame->at(in->target2).get();
             st.nvars = static_cast<int>(in->a.lit & 0xff);
             st.indexed = (in->a.lit >> 8) != 0;
@@ -1629,8 +1852,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * binds key [, value [, none...]] (do_iter's count=2 padding).
              * Then advance. */
             ML_VM_CHECK(in->target2 >= 0
-                && static_cast<size_t>(in->target2) < dyn_iters.size());
-            DynIterState &st = dyn_iters[in->target2];
+                && in->target2 < static_cast<int_type>(chunk->n_dyn_iters));
+            DynIterState &st = dyiter(in->target2);
             const std::vector<int32_t> &tg = *st.targets;
             const size_t tb = st.indexed ? 1 : 0;    /* first value var */
             const size_t nv = static_cast<size_t>(st.nvars) - tb;
@@ -2495,6 +2718,54 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 throw NotCallableEx(s, en);
             }
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+
+            if (!fo.func->vm_chunk_tried) {       /* AOT net, as before */
+                fo.func->vm_chunk = vm_func_chunk(fo.func);
+                fo.func->vm_chunk_tried = true;
+            }
+            const Chunk *cck =
+                static_cast<const Chunk *>(fo.func->vm_chunk);
+
+            if (cck) {
+                /* IN-VM call. CachedCallV first consults the CALLER's
+                 * per-frame pure cache (vm_cached_call's exact flow: key =
+                 * {desc, arg values}; a hit is returned by copy; a miss
+                 * runs the call carrying the key, stored on pop). The key
+                 * rides the loop-scope pending_key so the dispatches below
+                 * exit no destructor scope (the clang indirect-goto rule). */
+                pending_key.reset();
+                bool cache_hit = false;
+                if (in->op == OpCode::CachedCallV && ctx.frame
+                        && g_pure_cache_enabled) {
+                    std::vector<EvalValue> vals;
+                    const size_t n = static_cast<size_t>(in->b.lit);
+                    vals.reserve(n);
+                    const LValue *ap0 = n ? &ctx.frame->at(in->a.lit)
+                                          : nullptr;
+                    for (size_t i = 0; i < n; i++)
+                        vals.push_back(ap0[i].get());
+                    PureCacheKey key{ fo.func, std::move(vals) };
+                    PureCache &cache = ctx.frame->ensure_pure_cache();
+                    auto it = cache.find(key);
+                    if (it != cache.end()) {
+                        ctx.frame->at(in->target).put(EvalValue(it->second));
+                        pc++;
+                        cache_hit = true;
+                    } else {
+                        pending_key =
+                            std::make_unique<PureCacheKey>(std::move(key));
+                    }
+                }
+                if (cache_hit)
+                    VM_NEXT;
+                enter_call(fo, cck, in->a.lit,
+                           static_cast<size_t>(in->b.lit), in->target,
+                           std::move(pending_key));
+                VM_NEXT;
+            }
+
+            /* No chunk (a never-called template base reached indirectly -
+             * do_func_call ML_CHECKs): the legacy boundary call. */
             LValue *ap = &ctx.frame->at(in->a.lit);
             EvalValue res =
                 in->op == OpCode::CachedCallV
@@ -2507,8 +2778,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * as the exception passes through. */
             if (g_vm_exc_pending) {
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(handlers, pc)) {
-                    vm_exc = std::move(g_vm_exc_pending);
+                if (vm_dispatch_exc(act, cur_rec(), pc)) {
+                    cur_rec().exc = std::move(g_vm_exc_pending);
                     VM_NEXT_COLD;
                 }
                 return;
@@ -2530,13 +2801,26 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 throw NotCallableEx(s, en);
             }
             FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+
+            if (!fo.func->vm_chunk_tried) {       /* AOT net, as before */
+                fo.func->vm_chunk = vm_func_chunk(fo.func);
+                fo.func->vm_chunk_tried = true;
+            }
+            if (const Chunk *cck =
+                    static_cast<const Chunk *>(fo.func->vm_chunk)) {
+                enter_call(fo, cck, in->a.lit,
+                           static_cast<size_t>(in->b.lit), in->target,
+                           nullptr);
+                VM_NEXT;
+            }
+
             LValue *ap = &ctx.frame->at(in->a.lit);
             EvalValue res = vm_call_func(&ctx, fo, ap, in->b.lit, chunk,
                                          pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
-                if (vm_dispatch_exc(handlers, pc)) {
-                    vm_exc = std::move(g_vm_exc_pending);
+                if (vm_dispatch_exc(act, cur_rec(), pc)) {
+                    cur_rec().exc = std::move(g_vm_exc_pending);
                     VM_NEXT_COLD;
                 }
                 return;
@@ -2695,8 +2979,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             if (g_vm_exc_pending) {                /* FuncObject cross-frame */
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(handlers, pc)) {
-                    vm_exc = std::move(g_vm_exc_pending);
+                if (vm_dispatch_exc(act, cur_rec(), pc)) {
+                    cur_rec().exc = std::move(g_vm_exc_pending);
                     VM_NEXT_COLD;
                 }
                 return;
@@ -2748,13 +3032,19 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
         VM_NEXT;
 
-        VM_CASE(ReturnV):
-            /* `return <expr>`: the value is already in a.slot (a bare return
-             * loaded `none`). Set flow and STOP the chunk, as an
-             * tree-walked return does; do_func_call reads flow->value. */
-            ctx.flow->value = ctx.frame->at(in->a.slot).get();
-            ctx.flow->type = FlowState::ret;
-            return;
+        VM_CASE(ReturnV): {
+            /* `return <expr>`: the value is in a.slot (a bare return loaded
+             * `none`). An in-VM frame pops - result into the parent's dst
+             * slot, resume after the call op. The BOUNDARY frame keeps the
+             * do_func_call contract: set flow, stop the invocation. */
+            if (cur_rec().boundary) {
+                ctx.flow->value = ctx.frame->at(in->a.slot).get();
+                ctx.flow->type = FlowState::ret;
+                return;
+            }
+            leave_call(ctx.frame->at(in->a.slot).get());
+            VM_NEXT;
+        }
 
         VM_CASE(ArrLen):
             /* n = size(array). The base is a flat array (ForeachStmt::elem_th
@@ -3131,18 +3421,18 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             Loc ls, le;
             chunk->loc_at(pc, ls, le);
             const EvalValue &tv = ctx.frame->at(in->a.slot).get();
-            vm_raise(*chunk, pc, handlers, vm_exc,
+            vm_raise(*chunk, pc, act, cur_rec(),
                      vm_make_thrown_exc(tv, ls, le));
             VM_NEXT;                          /* re-dispatch (or unreached) */
         }
 
         VM_CASE(PushHandler):
-            handlers.push_back({ static_cast<uint32_t>(in->target) });
+            act.handlers.push_back({ static_cast<uint32_t>(in->target) });
             pc++;
             VM_NEXT;
 
         VM_CASE(PopHandler):
-            handlers.pop_back();      /* the try body exited normally */
+            act.handlers.pop_back();  /* the try body exited normally */
             pc++;
             VM_NEXT;
 
@@ -3159,7 +3449,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             } else {
                 const std::vector<std::string> &names =
                     chunk->catch_types[in->a.lit];
-                const std::string_view en = vm_exc_name(vm_exc.get());
+                const std::string_view en = vm_exc_name(cur_rec().exc.get());
                 match = false;
                 for (const std::string &nm : names) {
                     if (nm == en) { match = true; break; }
@@ -3168,7 +3458,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             if (match) {
                 if (in->target2 >= 0)
                     ctx.frame->at(in->target2).put(
-                        vm_catch_bind_val(vm_exc.get()));
+                        vm_catch_bind_val(cur_rec().exc.get()));
                 pc = static_cast<size_t>(in->target);
             } else {
                 pc++;
@@ -3179,9 +3469,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(Reraise):
             /* No clause matched: re-raise vm_exc to the OUTER handler (native
              * jump), or C++-throw to propagate. Mirrors saved_ex->rethrow(). */
-            if (vm_dispatch_exc(handlers, pc))
+            if (vm_dispatch_exc(act, cur_rec(), pc))
                 VM_NEXT;
-            vm_exc->rethrow();
+            cur_rec().exc->rethrow();
             VM_NEXT;                    /* unreachable ([[noreturn]]) */
 
         VM_CASE(Rethrow):
@@ -3191,19 +3481,19 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             {
                 Loc ls, le;
                 chunk->loc_at(pc, ls, le);
-                vm_exc->loc_start = ls;
-                vm_exc->loc_end = le;
+                cur_rec().exc->loc_start = ls;
+                cur_rec().exc->loc_end = le;
             }
-            if (vm_dispatch_exc(handlers, pc))
+            if (vm_dispatch_exc(act, cur_rec(), pc))
                 VM_NEXT;
-            vm_exc->rethrow();
+            cur_rec().exc->rethrow();
             VM_NEXT;                    /* unreachable ([[noreturn]]) */
 
         VM_CASE(SetPend):
             /* Record what the shared `finally` must resume - normal or reraise
              * (Inc 2b). Flow ops inline their finally, so ret/brk/cont never
              * reach the shared finally. */
-            vm_pend = static_cast<Pend>(in->target);
+            cur_rec().pend = static_cast<Pend>(in->target);
             pc++;
             VM_NEXT;
 
@@ -3212,18 +3502,22 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * the NORMAL and RERAISE exits reach here - a return/break/continue
              * crossing this try INLINES its own copy of the finally (Inc 2c),
              * so `vm_pend` is only ever normal or reraise here. */
-            if (vm_pend == Pend::reraise) {
+            if (cur_rec().pend == Pend::reraise) {
                 /* finally didn't handle the exception → re-raise it. */
-                if (vm_dispatch_exc(handlers, pc))
+                if (vm_dispatch_exc(act, cur_rec(), pc))
                     VM_NEXT;
-                vm_exc->rethrow();
+                cur_rec().exc->rethrow();
             } else {
                 pc++;                                 /* fall through to Lend */
             }
             VM_NEXT;
 
         VM_CASE(Halt):
-            return;
+            /* End of a fall-through body (an implicit `return none`). */
+            if (cur_rec().boundary)
+                return;
+            leave_call(EvalValue());
+            VM_NEXT;
 #ifndef ML_CGOTO
         case OpCode::OpCount_:      /* sentinel - never emitted (switch
                                      * exhaustiveness; cgoto has no entry) */
@@ -3233,21 +3527,44 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 #endif
 
     } catch (RuntimeException &e) {
-        /* An exception reached the boundary: a fallback `throw`, a runtime-
-         * library error (div0/OOB/KeyNotFound/…), or a callee's C++-thrown
-         * uncaught throw. With an active try, route it to the innermost
-         * handler's catch-dispatch (like TryCatchStmt catching a
-         * RuntimeException). Else (Inc v2) CONVERT it to the pending-exception
-         * SIGNAL and RETURN - do_func_call captures this frame + propagates it
-         * WITHOUT a C++ throw per frame; only this one landing-pad ran. */
-        /* Inc 4: a library error thrown FROM an inlined op flushes its virtual
-         * frames here (the raise happened in C++, not via vm_raise). */
+        /*
+         * An exception reached the boundary: a native `throw` with no
+         * same-frame handler, a runtime-library error (div0/OOB/
+         * KeyNotFound/...), or a C++ throw out of a callee boundary. The
+         * FRAME WALK (the native call stack): starting at the CURRENT
+         * frame, dispatch to a handler in it; else - for an IN-VM frame -
+         * append its backtrace frame (exactly what its do_func_call catch
+         * used to record), pop it, flush the CALL op's inlined frames at
+         * the parent's call pc (what the caller's signal check used to do),
+         * and continue in the parent. Reaching the invocation's BOUNDARY
+         * frame converts to the pending-exception SIGNAL and returns -
+         * do_func_call above captures that frame and propagates, exactly
+         * the Inc-v2 contract. ONE landing pad per invocation, however
+         * many in-VM frames the exception crosses.
+         */
+        /* Inc 4: a library error thrown FROM an inlined op flushes its
+         * virtual frames here (the raise happened in C++, not vm_raise). */
         vm_flush_inline(*chunk, pc, e);
-        if (!vm_dispatch_exc(handlers, pc)) {
-            g_vm_exc_pending.reset(e.clone());
-            return;
+        std::unique_ptr<RuntimeException> ex(e.clone());
+
+        for (;;) {
+            VmCallRec &cur = cur_rec();
+            if (vm_dispatch_exc(act, cur, pc)) {
+                cur.exc = std::move(ex);       /* like saved_ex */
+                goto vm_resume;    /* re-enter at the CatchTest chain (the
+                                    * handler frame IS the current frame:
+                                    * `chunk` is already right) */
+            }
+            if (cur.boundary) {
+                g_vm_exc_pending = std::move(ex);
+                return;
+            }
+            vm_capture_rec_frame(*ex, cur);
+            VmCallRec dead = act.pop_window();
+            ctx.captures = dead.caller_captures;
+            chunk = dead.ret_chunk;
+            pc = dead.ret_pc - 1;              /* the call op */
+            vm_flush_inline(*chunk, pc, *ex);
         }
-        vm_exc.reset(e.clone());               /* like saved_ex */
-        goto vm_resume;                        /* re-enter at the CatchTest chain */
     }
 }

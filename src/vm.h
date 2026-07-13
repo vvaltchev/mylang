@@ -52,7 +52,7 @@ void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
  * falls back to a plain Frame); throws the catchable StackOverflowEx at the
  * MYLANG_VM_STACK cap. Window addresses are STABLE (segments never move).
  */
-Frame *vm_window_push(int_type nslots);
+Frame *vm_window_push(int_type nslots, const Chunk *ck);
 void vm_window_pop();
 
 /*
