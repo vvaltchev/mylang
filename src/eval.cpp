@@ -689,19 +689,42 @@ do_func_call(EvalContext *ctx,
     /*
      * When the function was resolved, params live in a flat slot Frame (O(1)
      * access) instead of the args context map; the frame also carries the
-     * chunk's register-machine temps. An unresolved-but-chunked body (the
-     * zero-slot closure) gets a temps-only frame. The Frame lives on this
-     * stack frame for the whole call; nested blocks inherit the pointer.
+     * chunk's register-machine temps. A CHUNKED body's frame is a WINDOW of
+     * the VM activation's segmented slot stack (vm_window_push - no per-call
+     * Frame construction; the guard pops it on every exit path, releasing
+     * the window's references exactly where the Frame dtor did). Fallbacks:
+     * no live activation -> a plain Frame; unchunked resolved body -> the
+     * plain Frame as always. An unresolved-but-chunked body (the zero-slot
+     * closure) gets a temps-only window.
      */
-    if (obj.func->resolved || vm_ck) {
-        frame.init(obj.func->frame_size + (vm_ck ? vm_ck->n_temps : 0));
+    struct WindowGuard {
+        bool engaged = false;
+        ~WindowGuard() { if (engaged) vm_window_pop(); }
+    } wguard;
+    Frame *bindframe = nullptr;
+
+    if (vm_ck) {
+        const int_type total =
+            obj.func->frame_size + static_cast<int_type>(vm_ck->n_temps);
+        if (Frame *w = vm_window_push(total)) {
+            wguard.engaged = true;
+            args_ctx.frame = w;
+        } else {
+            frame.init(static_cast<int>(total));
+            args_ctx.frame = &frame;
+        }
+        if (obj.func->resolved)
+            bindframe = args_ctx.frame;
+    } else if (obj.func->resolved) {
+        frame.init(obj.func->frame_size);
         args_ctx.frame = &frame;
+        bindframe = &frame;
     }
 
     if (!obj.func->params.empty()) {
         do_func_bind_params(
             obj.func->params, args, ctx, &args_ctx,
-            obj.func->resolved ? &frame : nullptr,
+            bindframe,
             static_cast<size_t>(obj.func->min_args)
         );
     }

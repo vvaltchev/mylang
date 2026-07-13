@@ -246,6 +246,7 @@ struct ShadowingEx : public Exception {
 
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
+DECL_RUNTIME_EX(StackOverflowEx, "Maximum call depth exceeded")
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")
 DECL_RUNTIME_EX(NotLValueEx, "Not an lvalue error")
 DECL_RUNTIME_EX(TypeErrorEx, "Type error")

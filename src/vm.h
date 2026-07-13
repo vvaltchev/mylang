@@ -12,6 +12,7 @@ struct StructTypeDef;
 class FuncDeclStmt;
 struct FuncDescriptor;
 class EvalContext;
+struct Frame;
 struct RuntimeException;
 
 /*
@@ -42,6 +43,17 @@ const Chunk *vm_func_chunk(const FuncDescriptor *fdesc);
  * until Halt or an in-flight `return`; the caller reads ctx->flow->value.
  */
 void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
+
+/*
+ * Allocate / release a callee frame WINDOW on the current activation's
+ * segmented slot stack (plans/vm-native-call-stack.md): do_func_call binds a
+ * chunked body's params into the returned view Frame instead of constructing
+ * a per-call Frame. push returns null when no activation is live (the caller
+ * falls back to a plain Frame); throws the catchable StackOverflowEx at the
+ * MYLANG_VM_STACK cap. Window addresses are STABLE (segments never move).
+ */
+Frame *vm_window_push(int_type nslots);
+void vm_window_pop();
 
 /*
  * The COMPLETE compiled program image (plans/vm-ast-free-runtime.md): the root

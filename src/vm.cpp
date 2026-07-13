@@ -9,8 +9,10 @@
 #include "errors.h"
 #include "backtrace.h"   /* flush_inline_frames (Inc 4 backtrace parity) */
 #include "bitops.h"
+#include "env.h"    /* env_get - the MYLANG_VM_STACK cap */
 
 #include <memory>
+#include <cstdlib>   /* atoll */
 #include <cmath>
 #include <unordered_map>
 
@@ -687,19 +689,162 @@ struct ExecGuard {
 };
 
 /*
+ * The VM's SLOT STACK (plans/vm-native-call-stack.md): every VM frame is a
+ * WINDOW of a segment. SEGMENTED, not relocating, because C++ builtins hold
+ * frame LValue* / EvalValue& ACROSS user-code callbacks (sort's arg0 over
+ * its comparator calls, map/filter's container reference over per-element
+ * calls) - a relocating stack would dangle them, so a window's address must
+ * be stable for its whole lifetime. A frame never spans segments; a frame
+ * larger than SEG_SLOTS gets a dedicated segment of exactly its size.
+ * Segment slots are constructed ONCE and REUSED window-over-window; a pop
+ * resets the window's slots to none (releasing references exactly where the
+ * old per-call Frame's destructor did).
+ */
+struct VmStackSeg {
+    std::vector<LValue> slots;
+    int_type top = 0;                 /* allocation watermark */
+    explicit VmStackSeg(size_t cap) : slots(cap) { }
+};
+
+/* One VM frame's stack bookkeeping (Phase C grows this into the full call
+ * record - callee identity, return pc, per-frame exception state). */
+struct VmCallRec {
+    LValue *window;                   /* stable - segments never move */
+    int_type nslots;
+    int seg;                          /* owning segment index */
+    int_type seg_top_before;          /* watermark to restore on pop */
+    /* The CALLER's per-frame pure-call cache, stashed while a callee runs:
+     * eval.cpp reaches the cache as `ctx->frame->pure_cache`, and the view
+     * Frame is SHARED across the whole activation - without the stash the
+     * cache would outlive its frame and become global memoization, which
+     * the per-frame design explicitly forbids (see PureCache, eval.h). */
+    std::unique_ptr<PureCache> caller_cache;
+};
+
+/*
  * A VM ACTIVATION (plans/vm-native-call-stack.md): one run of VM frames
- * entered from C++. Phase B scope: it owns the SLOT STACK (main's frame
- * window lives here instead of a standalone Frame) and the VIEW Frame the
- * dispatch loop + builtins access slots through (Frame::point_at - a
- * non-owning window; repointing per frame is two stores). Later phases add
- * the call records + per-frame handler/iterator watermarks that turn
- * CallV/ReturnV into in-VM pushes/pops.
+ * entered from C++ (vm_run). It owns the segmented slot stack, the call
+ * records, and the VIEW Frame the dispatch loop + builtins access slots
+ * through (Frame::point_at - a non-owning window; repointing per frame is
+ * two stores). do_func_call allocates a callee's frame window from here
+ * (vm_window_push/pop) instead of constructing a Frame per call; Phase C's
+ * later increments move the call protocol itself in-loop.
  */
 struct VmActivation {
-    std::vector<LValue> slots;   /* THE stack; sized once in Phase B (main
-                                  * only), grown at call boundaries later */
-    Frame view_frame;            /* the loop's window into `slots` */
+    static constexpr int_type SEG_SLOTS = 16 * 1024;
+
+    std::vector<std::unique_ptr<VmStackSeg>> segs;
+    int cur_seg = -1;
+    std::vector<VmCallRec> records;
+    Frame view_frame;                 /* the loop's window into the stack */
+    int_type used = 0;                /* live slots, for the depth cap */
+    int_type cap;                     /* MYLANG_VM_STACK (slots) */
+
+    VmActivation() : cap(stack_cap()) { }
+
+    /* The configurable depth cap (slots). One env read per process. */
+    static int_type stack_cap()
+    {
+        static const int_type cap = [] {
+            if (auto v = env_get("MYLANG_VM_STACK")) {
+                const long long n = atoll(v->c_str());
+                if (n > 0)
+                    return static_cast<int_type>(n);
+            }
+            return static_cast<int_type>(1) << 20;   /* 1M slots (~48MB) */
+        }();
+        return cap;
+    }
+
+    /* Allocate an n-slot frame window and repoint the view Frame at it.
+     * Throws the CATCHABLE StackOverflowEx at the cap - a clean, located
+     * error where the old per-call C-stack model segfaulted. */
+    Frame *push_window(int_type n)
+    {
+        if (used + n > cap)
+            throw StackOverflowEx();
+
+        VmStackSeg *sg = cur_seg >= 0 ? segs[cur_seg].get() : nullptr;
+        if (!sg || sg->top + n > static_cast<int_type>(sg->slots.size())) {
+            /* Advance to (or create) a segment with room. Reuse an already-
+             * allocated successor when its capacity fits (the common pop/
+             * push cycle at a segment edge); else append a fresh one. */
+            const size_t need = static_cast<size_t>(
+                n > SEG_SLOTS ? n : SEG_SLOTS);
+            if (cur_seg + 1 < static_cast<int>(segs.size())
+                    && segs[cur_seg + 1]->slots.size() >= need) {
+                cur_seg++;
+            } else {
+                segs.insert(segs.begin() + (cur_seg + 1),
+                            std::make_unique<VmStackSeg>(need));
+                cur_seg++;
+            }
+            sg = segs[cur_seg].get();
+            ML_CHECK(sg->top == 0);
+        }
+
+        VmCallRec rec;
+        rec.window = sg->slots.data() + sg->top;
+        rec.nslots = n;
+        rec.seg = cur_seg;
+        rec.seg_top_before = sg->top;
+        sg->top += n;
+        used += n;
+        /* Stash the CALLER's pure cache; the callee's frame starts with
+         * none (per-frame scoping - see VmCallRec::caller_cache). */
+        rec.caller_cache = std::move(view_frame.pure_cache);
+        LValue *const window = rec.window;
+        records.push_back(std::move(rec));
+        view_frame.point_at(window, static_cast<int>(n));
+        return &view_frame;
+    }
+
+    /* Release the TOP window: reset its slots to none (drop references -
+     * the old Frame-dtor point), restore the watermark, repoint the view
+     * at the new top (if any). */
+    void pop_window()
+    {
+        ML_CHECK(!records.empty());
+        VmCallRec rec = std::move(records.back());
+        records.pop_back();
+
+        for (int_type i = 0; i < rec.nslots; i++)
+            rec.window[i] = LValue();
+
+        segs[rec.seg]->top = rec.seg_top_before;
+        used -= rec.nslots;
+        cur_seg = rec.seg;
+
+        /* The popped frame's cache dies HERE (per-frame scoping); the
+         * caller's stashed cache comes back into the view. */
+        view_frame.pure_cache = std::move(rec.caller_cache);
+
+        if (!records.empty()) {
+            const VmCallRec &tp = records.back();
+            view_frame.point_at(tp.window, static_cast<int>(tp.nslots));
+            cur_seg = tp.seg;
+        }
+    }
 };
+
+/* The CURRENT activation (single-threaded; set for the duration of vm_run).
+ * Null outside VM execution - do_func_call's window push falls back to a
+ * plain per-call Frame then (e.g. a harness helper calling eval_func with
+ * the engine flag set but no VM run active). */
+static VmActivation *g_vm_act = nullptr;
+
+Frame *vm_window_push(int_type nslots)
+{
+    if (!g_vm_act)
+        return nullptr;
+    return g_vm_act->push_window(nslots);
+}
+
+void vm_window_pop()
+{
+    ML_CHECK(g_vm_act);
+    g_vm_act->pop_window();
+}
 
 VmProgram
 vm_compile(const Construct *root_c)
@@ -759,17 +904,20 @@ vm_run(VmProgram &prog)
     EvalContext ctx(nullptr, /*const_ctx=*/false);
 
     /* Main's frame - the resolved locals plus the register machine's scratch
-     * temps [slot_count, slot_count + n_temps) - lives on the ACTIVATION's
-     * slot stack, accessed through the non-owning view Frame (Phase B of the
-     * native call stack: proves the window/view model against every builtin
-     * and helper before the call protocol changes). */
+     * temps [slot_count, slot_count + n_temps) - is the activation's FIRST
+     * frame window; every callee's window stacks above it (vm_window_push
+     * from do_func_call). The activation is announced in g_vm_act for the
+     * run (restored even on an exception). */
     VmActivation act;
-    const int main_slots = prog.root_slot_count + prog.root.n_temps;
-    if (main_slots) {
-        act.slots.resize(main_slots);
-        act.view_frame.point_at(act.slots.data(), main_slots);
-        ctx.frame = &act.view_frame;
-    }
+    struct ActGuard {
+        VmActivation *prev;
+        ActGuard(VmActivation *a) : prev(g_vm_act) { g_vm_act = a; }
+        ~ActGuard() { g_vm_act = prev; }
+    } act_guard(&act);
+
+    const int_type main_slots = prog.root_slot_count + prog.root.n_temps;
+    if (main_slots)
+        ctx.frame = act.push_window(main_slots);
 
     std::unique_ptr<GlobalFuncTable> gtable;
     if (!prog.global_func_names.empty()) {
