@@ -195,6 +195,22 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**H2 - the dict/slot-write micro pair (engine-shared).** From bench 62's
+callgrind profile (`counts[key] += 1` cost ~1130 instrs; the insert-alloc
+hypothesis was wrong - 62 is UPDATE-bound): (1) **`LValue::put` has an
+INLINE fast path** (evalvalue.h) - a put with no container back-pointer
+(frame slots, dict values, globals, captures - the overwhelmingly common
+case) assigns directly; only the array-element COW path calls the
+out-of-line `put_slow` (every put used to pay an out-of-line
+`get_value_for_put()` call, on every slot write VM-wide). (2) **String
+equality has an IDENTITY shortcut** (`str_views_eq`, str.cpp.h): equal
+data pointer + size == equal, no memcmp - the hot case is a string-keyed
+dict probe, whose stored key is the SAME StrObj as the probing value (the
+key freeze returns strings as-is). Measured: 62_dict_word_count 0.896x
+(my/py 0.42x), broad -4-10%, suite VM-wall 0.992, my/py 4.57-4.58x. The
+design-level flat open-addressing dict (23_dict_insert's node allocs)
+stays a maintainer-sign-off item - roadmap H2 v2.
+
 **H1 - STRUCT CREATION (dst-slot reuse + typed member reads).** Two
 pieces (plans/vm-performance-roadmap.md H1): (1) **`vm_struct_ctor`
 constructs INTO the dst slot with REUSE** - when the slot's current value

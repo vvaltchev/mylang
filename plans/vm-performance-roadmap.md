@@ -153,11 +153,48 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
   path; the codegen knows the shape statically. Include `ModConstI`
   (`s % 1000000007` appears in nearly every bench's checksum loop) and
   `AddI dst, src, #1` (i++ shapes outside ForLoopStep).
-- **B3. Shrink `Instr` 56 -> <=32 bytes.** Operand is 16 bytes x2; pack
-  to {i32 slot-or-imm + 2 flag bits}; move the RARE wide fields (float
-  immediates, big literals) to the const pool. Halves the bytecode
-  D-cache footprint and speeds decode. (Do AFTER A1/B1/B2 — encoding
-  churn is cheapest once the opcode set settles.)
+- **B3. Shrink `Instr` 56 -> 32 bytes — DESIGN SETTLED (2026-07-17),
+  awaiting the maintainer's green light to implement.** Measured today:
+  `sizeof(Instr) == 56` (OpCode is already 1 byte; `Op aop` is 4, needs
+  1; each 16-byte Operand carries 9 bytes of information — the 8-byte
+  lit/flit union forces alignment padding around the 2 tag bytes + the
+  4-byte slot).
+  **The packing (two observations):** (1) `slot` and `lit` are MUTUALLY
+  EXCLUSIVE (`is_lit` discriminates) — slot moves INTO the 8-byte
+  union; (2) the per-operand tag bits (`is_lit` + `lit_kind`, 2 bits
+  each) hoist into ONE shared flags byte on Instr, and `aop` becomes
+  `enum Op : unsigned char`. Result: op(1) aop(1) flags(1) pad(1)
+  target(4) target2(4) node_idx(4) a_payload(8) b_payload(8) = **32
+  exactly, zero pad waste** — two instructions per cache line instead
+  of one straddling two.
+  **Mechanics:** do NOT hand-edit the hundreds of `in->a.slot` /
+  `a.is_lit` consumer sites — `Instr` gains accessors (`a_slot()`,
+  `a_lit()`, `a_flit()`, `a_is_lit()`, `a_kind()`, b-twins) and the
+  consumers rewrite one-for-one with no logic change. The hazard class
+  is E-v1's (a mis-mapped field = silent corruption), so it ships only
+  with the full fuzzer + differential + matrix treatment.
+  **`node_idx` removal (analyzed with B3, 2026-07-17):** the field is
+  the codegen-transient splice-stable AST handle (extract_locs /
+  verify_ast_free), 4 dead bytes at runtime. The clean removal is a
+  CODEGEN-ONLY subclass — `struct CgInstr : Instr { int32_t node_idx; }`
+  — codegen works on `vector<CgInstr>` (field accesses compile
+  unchanged via inheritance; ~50 signatures change), the peephole +
+  extract_locs run on it, and codegen_chunk's tail SLICES the Instr
+  sub-objects into the chunk. Type-level zero-AST enforcement (the
+  runtime Instr structurally cannot reference the AST) + `.myv` hygiene.
+  BUT the size arithmetic says it's FREE PADDING under the 32-byte
+  pack: the packed header with node_idx is exactly 16; without it, 12
+  pads back to 16 for the 8-aligned payloads — STILL 32. Going below 32
+  needs int16 target/target2 (overflow guards; a 24-byte stride
+  straddles lines every ~8th instr) — dubious marginal win. So: do the
+  CgInstr split WITH B3 as the architectural cleanup, not for bytes.
+  **Honest payoff estimate:** a D-cache/bandwidth effect on the
+  bytecode stream; hot loop bodies (5-15 ops) fit L1 at either size, so
+  the win concentrates in big chunks / call-heavy chunk switching /
+  image size. Expect low single digits geomean AT BEST, plausibly ~0 —
+  the same magnitude as layout noise, so it needs pooled interleaved
+  A/Bs to even resolve. Also a `.myv` prerequisite-ish cleanup (smaller
+  serialized files, no dead field).
 - **B4. More fused superinstructions, chosen from PROFILES not vibes:**
   compare+branch for BOXED conditions (`CmpV`+`JumpUnlessTrueV` pairs),
   `LoadElemInt`+`IntBin` (a[i] feeding arith — the sieve/matrix inner
@@ -375,10 +412,35 @@ across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
   `bytes` (the fresh path's second alloc), the design-level
   inline-POD-in-EvalValue, and global/capture struct bases for
   LoadMember* (local-only today).
-- **H2. Dict insert path** (47/62 wordcount 0.49-0.61, 26_dict_insert):
-  `unordered_map<EvalValue,LValue>` node alloc per insert + hash dispatch
-  via Type vtable. Consider reserve() from ArrHint-style size hints, and
-  a flat open-addressing map (design-level).
+- **H2. Dict path — v1 DONE (2026-07-17): two engine-shared micro-fixes
+  from the callgrind profile** (bench 62 spent ~1130 instrs per
+  `counts[key] += 1`; the roadmap's insert-alloc hypothesis was wrong
+  for 62 — it does 18 inserts then 2M UPDATES; the real spread was
+  dispatch ~23%, compound-RMW machinery ~15%, the boxed key read ~12%,
+  hashtable find ~8%, string eq with memcmp ~6%):
+  1. **`LValue::put` inline fast path** (evalvalue.h): the
+     overwhelmingly common put is a plain slot write (no container
+     back-pointer — frame slots, dict values, globals, captures), yet
+     EVERY put paid an out-of-line `get_value_for_put()` call (LTO kept
+     it a standalone symbol). The container-less path is now inline;
+     the array-element COW path takes the out-of-line `put_slow`.
+     Shows up VM-wide (every slot write).
+  2. **The string IDENTITY shortcut** (`str_views_eq`, str.cpp.h): two
+     views over the same memory range are equal with no memcmp. The hot
+     case is a string-keyed dict probe — the stored key is the SAME
+     StrObj as the probing value (the key freeze returns strings
+     as-is), so every hit compared equal bytes through memcmp.
+  MEASURED (full-suite interleaved A/B vs def0580): 62_dict_word_count
+  0.096→0.086s (0.896x; my/py 0.47x → 0.42x), broad −4-10% on
+  unpack/foreach/dispatch/closures, suite VM-wall geomean **0.992**,
+  my/py 4.49-4.50x → **4.57-4.58x** (both runs — the best to date).
+  **Still open (H2 v2, DESIGN-LEVEL, needs maintainer sign-off):** a
+  flat open-addressing dict (replacing `std::unordered_map` — kills the
+  node alloc per insert AND the bucket-chain probe; iteration order may
+  change freely, dicts are spec'd unordered), and reserve()
+  sizing (no principled size source exists today). 23_dict_insert
+  (0.59x, insert-bound: node alloc + rehash growth) is the bench gated
+  on it.
 - **H3. Strings** (31_split_join 0.83, 32_build_join 0.66, 28_concat):
   split() building per-token SharedStr allocations; join with a single
   size-precomputed buffer (partially done); `+=` chains via a rope/

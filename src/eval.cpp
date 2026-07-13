@@ -4788,13 +4788,13 @@ EvalValue &LValue::get_value_for_put()
     return val;
 }
 
-void LValue::put(const EvalValue &v)
+void LValue::put_slow(const EvalValue &v)
 {
     get_value_for_put() = v;
     type_checks();
 }
 
-void LValue::put(EvalValue &&v)
+void LValue::put_slow(EvalValue &&v)
 {
     get_value_for_put() = move(v);
     type_checks();

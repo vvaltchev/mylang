@@ -201,11 +201,24 @@ void TypeStr::ge(EvalValue &a, const EvalValue &b)
     );
 }
 
+/* H2: the IDENTITY shortcut - two views over the SAME memory range are equal
+ * with no memcmp. The hot case is a string-keyed dict probe: the stored key
+ * is the SAME StrObj as the probing value (the key freeze returns strings
+ * as-is), so every hit compared equal bytes through memcmp before this. */
+static inline bool str_views_eq(const std::string_view &va,
+                                const std::string_view &vb)
+{
+    if (va.size() != vb.size())
+        return false;
+    return va.data() == vb.data() || va == vb;
+}
+
 void TypeStr::eq(EvalValue &a, const EvalValue &b)
 {
     if (b.is<SharedStr>()) {
 
-        a = a.get<SharedStr>().get_view() == b.get<SharedStr>().get_view();
+        a = str_views_eq(a.get<SharedStr>().get_view(),
+                         b.get<SharedStr>().get_view());
 
     } else {
 
@@ -217,7 +230,8 @@ void TypeStr::noteq(EvalValue &a, const EvalValue &b)
 {
     if (b.is<SharedStr>()) {
 
-        a = a.get<SharedStr>().get_view() != b.get<SharedStr>().get_view();
+        a = !str_views_eq(a.get<SharedStr>().get_view(),
+                          b.get<SharedStr>().get_view());
 
     } else {
 

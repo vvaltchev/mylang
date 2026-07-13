@@ -601,6 +601,8 @@ private:
 
     LValue clone();
     EvalValue &get_value_for_put();
+    void put_slow(const EvalValue &v);   /* container-backed (COW) put */
+    void put_slow(EvalValue &&v);
 
     void type_checks() const {
         assert(val.get_type()->t != Type::t_lval);
@@ -632,8 +634,27 @@ public:
         type_checks();
     }
 
-    void put(const EvalValue &v);
-    void put(EvalValue &&v);
+    /* The overwhelmingly common put is a plain slot write (no container
+     * back-pointer - frame slots, dict values, globals, captures): keep THAT
+     * inline (H2: the out-of-line get_value_for_put call showed up on every
+     * VM slot write); an ARRAY-ELEMENT put (container set - the COW path)
+     * takes the out-of-line slow put. */
+    void put(const EvalValue &v) {
+        if (!container) {
+            val = v;
+            type_checks();
+            return;
+        }
+        put_slow(v);
+    }
+    void put(EvalValue &&v) {
+        if (!container) {
+            val = static_cast<EvalValue &&>(v);
+            type_checks();
+            return;
+        }
+        put_slow(static_cast<EvalValue &&>(v));
+    }
 
     bool is_const_var() const { return is_const; }
     const EvalValue &get() const { return val; }
