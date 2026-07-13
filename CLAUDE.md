@@ -195,6 +195,18 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**H3 - join/split reserve + borrow (engine-shared, str.cpp.h).**
+`builtin_join` on GENERAL storage (a string array is always general)
+borrows each element by const ref (no boxed copy / SharedStr refcount
+round-trip per part) and RESERVES the exact result size from a
+type-checking pre-pass, so the append loop never reallocates; the flat-
+storage branch keeps the kind-aware `arr_elem_at` loop (same TypeError,
+empty flat still ""). `builtin_split` pre-counts the pieces (a memchr
+scan, no stores) and reserves its LValue result vector. Measured:
+47_wordcount 0.882x (my/py 0.51x), suite VM-wall 0.990, my/py
+4.59-4.60x; 31_str_split_join ~flat (growth was already amortized there
+- the residual is the inherent per-piece slice LValue).
+
 **H2 - the dict/slot-write micro pair (engine-shared).** From bench 62's
 callgrind profile (`counts[key] += 1` cost ~1130 instrs; the insert-alloc
 hypothesis was wrong - 62 is UPDATE-bound): (1) **`LValue::put` has an

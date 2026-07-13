@@ -441,11 +441,27 @@ across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
   sizing (no principled size source exists today). 23_dict_insert
   (0.59x, insert-bound: node alloc + rehash growth) is the bench gated
   on it.
-- **H3. Strings** (31_split_join 0.83, 32_build_join 0.66, 28_concat):
-  split() building per-token SharedStr allocations; join with a single
-  size-precomputed buffer (partially done); `+=` chains via a rope/
-  builder. These are builtin-body C++ optimizations, same on both
-  engines.
+- **H3. Strings — v1 DONE (2026-07-17): reserve + borrow in
+  join/split.** From bench 31's callgrind profile: `builtin_join` grew
+  its result string unreserved (realloc+memcpy per growth step) and
+  COPIED each element (a boxed EvalValue + SharedStr refcount round-trip
+  per part); `builtin_split` grew its 48-byte-LValue result vector
+  unreserved. Fixes (str.cpp.h, engine-shared): join on GENERAL storage
+  (a string array is always general) borrows each element by const ref
+  and computes the exact result size in a type-checking pre-pass, then
+  reserves — the append loop never reallocates (the flat-storage branch
+  keeps the old kind-aware loop: elements fail the string check with the
+  same TypeError; an empty flat array still joins to ""); split
+  pre-counts the pieces (a memchr-driven scan, no stores) and reserves.
+  MEASURED (full-suite interleaved A/B vs ec91830): 47_wordcount
+  0.034→0.030s (0.882x; my/py 0.51x), 32_str_build_join 0.957x (my/py
+  0.72x), 31_str_split_join ~flat (its 1000-piece CSV amortizes vector
+  growth well, and the pre-count scan offsets the savings — the
+  remaining cost is the inherent per-piece slice LValue + refcount),
+  suite VM-wall geomean 0.990, my/py 4.56x → **4.59-4.60x** (both
+  runs — the best to date). Deeper string work (a rope/builder for
+  `+=` chains, a lazy split) is NOT justified by the numbers — every
+  string bench beats CPython (0.00-0.80x).
 - **H4. `LValue::get_value_for_put`** (7.4% of append): the per-write
   alias/slice/COW test. A container PROVEN unaliased at codegen (a local
   never copied/sliced — inferencer escape data) could take a pre-checked

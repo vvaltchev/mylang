@@ -41,6 +41,15 @@ EvalValue builtin_split(EvalContext *ctx, const ArgLocs *exprList,
 
     if (delim.size()) {
 
+        /* H3: pre-count the pieces (a memchr-driven scan, no stores) and
+         * reserve - the emplace loop then never reallocates the 48-byte
+         * LValue vector (the reallocs dominated 31_str_split_join). */
+        size_t pieces = 1;
+        for (size_t p = 0; (p = str.find(delim, p)) != string::npos;
+             p += delim.size())
+            pieces++;
+        vec.reserve(pieces);
+
         size_t last = 0, next = 0;
 
         while ((next = str.find(delim, last)) != string::npos) {
@@ -90,12 +99,47 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
 
     const string_view delim = val_delim.get<SharedStr>().get_view();
-    /* Read kind-aware (arr_elem_at) so a flat int/float array doesn't promote -
-     * its elements aren't strings, so each one is a clean TypeError below. */
     const SharedArrayObj &arr = val_arr.get<SharedArrayObj>();
     const size_type n = arr.size();
     string result;
 
+    if (arr.skind() == SharedArrayObj::Storage::general) {
+
+        /* H3: a string array is ALWAYS general storage, so borrow each
+         * element by const ref (no per-part EvalValue copy / SharedStr
+         * refcount round-trip) and RESERVE the exact result size (a
+         * type-checking size pass first) - the append loop then never
+         * reallocates. */
+        const ArrayConstView &view = arr.get_view();
+        size_t total = n ? (n - 1) * delim.size() : 0;
+
+        for (size_type i = 0; i < n; i++) {
+
+            const EvalValue &val = view[i].get();
+
+            if (!val.is<SharedStr>())
+                throw TypeErrorEx("Expected string",
+                                  arg_arr->start, arg_arr->end);
+
+            total += val.get<SharedStr>().get_view().size();
+        }
+
+        result.reserve(total);
+
+        for (size_type i = 0; i < n; i++) {
+
+            result += view[i].get().get<SharedStr>().get_view();
+
+            if (i != n - 1)
+                result += delim;
+        }
+
+        return SharedStr(move(result));
+    }
+
+    /* A FLAT (int/float/bool/struct) array: read kind-aware (arr_elem_at, no
+     * promotion) - its elements aren't strings, so each one is a clean
+     * TypeError below (an EMPTY flat array joins to ""). */
     for (size_type i = 0; i < n; i++) {
 
         const EvalValue val = arr_elem_at(arr, i);
