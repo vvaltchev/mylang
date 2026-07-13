@@ -89,6 +89,42 @@ write_float_slot(EvalContext *ctx, int_type slot, float_type v)
         lv.put(EvalValue(v));
 }
 
+/*
+ * F1 - MathFnV's out-of-line body (loop-body text rule: the libm call
+ * dominates, so the selector switch lives in its own frame, not in
+ * vm_run_chunk's). Never throws: every entry is float(float[,float]) with
+ * libm NaN/inf semantics (no domain checks - matching float_func's builtins
+ * exactly), and the operands are inference-proven numeric.
+ */
+ML_NOINLINE static float_type
+vm_math_fn(const Instr &in, EvalContext *ctx)
+{
+    const float_type x = read_float_operand(in.a, ctx);
+    switch (static_cast<MathFn>(in.target2)) {
+    case MathFn::sqrt_:    return std::sqrt(x);
+    case MathFn::cbrt_:    return std::cbrt(x);
+    case MathFn::sin_:     return std::sin(x);
+    case MathFn::cos_:     return std::cos(x);
+    case MathFn::tan_:     return std::tan(x);
+    case MathFn::asin_:    return std::asin(x);
+    case MathFn::acos_:    return std::acos(x);
+    case MathFn::atan_:    return std::atan(x);
+    case MathFn::exp_:     return std::exp(x);
+    case MathFn::exp2_:    return std::exp2(x);
+    case MathFn::log_:     return std::log(x);
+    case MathFn::log2_:    return std::log2(x);
+    case MathFn::log10_:   return std::log10(x);
+    case MathFn::ceil_:    return std::ceil(x);
+    case MathFn::floor_:   return std::floor(x);
+    case MathFn::trunc_:   return std::trunc(x);
+    case MathFn::tofloat_: return x;   /* float(x): the read already widened */
+    case MathFn::fabs_:    return std::fabs(x);
+    case MathFn::pow_:     return std::pow(x, read_float_operand(in.b, ctx));
+    }
+    ML_CHECK(false);       /* a selector the codegen never emits */
+    return 0.0;
+}
+
 /* Write a boxed scalar `v` into a slot as an int OR float, with the same
  * int/bool -> promotion the tree-walker's eval_int/eval_float dict reads use.
  * Shared by DictLoadInt/Float's present-key and missing-key (default) paths. */
@@ -1920,6 +1956,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         ML_FRI(FloatSubRI, a - b)
         ML_FRR(FloatMulRR, a * b)
         ML_FRI(FloatMulRI, a * b)
+
+        VM_CASE(MathFnV): {
+            write_float_slot(&ctx, in->target, vm_math_fn(*in, &ctx));
+            pc++;
+        }
+        VM_NEXT;
 
 #undef ML_IRR
 #undef ML_IRI

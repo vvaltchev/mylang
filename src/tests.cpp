@@ -4199,6 +4199,27 @@ static const std::vector<test> tests =
       { "pow(2.0);" }, &typeid(InvalidArgumentEx) },
 
     {
+        /* RUNTIME (non-const) args in a loop, so the args can't const-fold
+         * and the VM's typed MathFnV path (F1) actually executes - pinning
+         * that it matches the builtins bit-for-bit, incl. the libm NaN/inf
+         * edges (sqrt(-x) -> nan, log(0) -> -inf; no domain throw). */
+        "math builtins over runtime args (the VM MathFnV path)",
+        {
+            "var s = 0.0; var nans = 0; var infs = 0;",
+            "for (var i = 0; i < 5; i++) {",
+            "    var x = float(i);",
+            "    s += sqrt(x) + pow(x, 2.0) + floor(x) + abs(1.5 - x);",
+            "    if (isnan(sqrt(0.0 - x - 1.0))) nans += 1;",
+            "    if (isinf(log(x * 0.0))) infs += 1;",
+            "}",
+            "assert(abs(s - (6.146264369941973 + 30.0 + 10.0 + 6.5)) < 1e-9);",
+            "assert(nans == 5);",
+            "assert(infs == 5);",
+            "assert(float(3) == 3.0);",
+        },
+    },
+
+    {
         "isnan / isinf / isfinite / isnormal",
         {
             "assert(isfinite(1.0));",
@@ -13373,6 +13394,7 @@ struct VmOpCounts {
     size_t storeelem2 = 0, storeev = 0;
     size_t pushhandler = 0, catchtest = 0, throwop = 0;
     size_t setpend = 0, endfinally = 0;
+    size_t mathfnv = 0;
     int n_temps = 0;
 };
 
@@ -13471,6 +13493,7 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::DictLoadFloat:    c.dictloadf++;  break;
             case OpCode::CallV:            c.callv++; break;
             case OpCode::CallBuiltinV:     c.callbuiltinv++; break;
+            case OpCode::MathFnV:          c.mathfnv++; break;
             case OpCode::CallBuiltinLV:
             case OpCode::AppendV:          c.callbuiltinlv++; break;
             case OpCode::Halt:             c.halt++;   break;
@@ -13735,8 +13758,10 @@ static bool vm_codegen_shapes()
        ;
 
     /* 14) a scalar-returning migrated BUILTIN in a loop body (`s += sqrt(i)`)
-     * lowers native: a CallBuiltinV for the call (the value ABI), a
-     * FloatBin for the +=, a ForLoopStep, no fallback EvalStmt. */
+     * lowers native - and a MATH builtin gets the typed MathFnV (F1), not
+     * the generic CallBuiltinV marshal - plus a FloatBin for the +=, a
+     * ForLoopStep, no fallback EvalStmt. A non-math builtin (`len`) keeps
+     * CallBuiltinV (test 28). */
     VmOpCounts bd;
     if (!codegen_counts({
             "var s = 0.0;",
@@ -13744,8 +13769,24 @@ static bool vm_codegen_shapes()
         }, bd))
         return false;
     const bool builtin_dispatch_ok =
-        bd.callbuiltinv == 1 && bd.fbin == 1 && bd.flstep == 1
+        bd.mathfnv == 1 && bd.callbuiltinv == 0 && bd.fbin == 1
+        && bd.flstep == 1
        ;
+
+    /* 14b) F1 coverage: every MathFn shape - 1-arg fns, `float(int)`,
+     * `abs(float)` (fabs), 2-arg `pow` - lowers to MathFnV; `abs(int)`
+     * (int result) and `float("3")` (string parse) DECLINE to the generic
+     * builtin; a wrong-arity `pow(x)` declines (throws at runtime). */
+    VmOpCounts mf;
+    if (!codegen_counts({
+            "var s = 0.0;",
+            "for (var i = 1; i < 4; i++) {",
+            "    var x = float(i);",
+            "    s += sqrt(x) + pow(x, 2.0) + abs(0.0 - x) + floor(x);",
+            "}",
+        }, mf))
+        return false;
+    const bool mathfn_ok = mf.mathfnv == 5 && mf.callbuiltinv == 0;
 
     /* 15) a native loop with a FLOW-FREE fallback body statement still goes
      * native INCLUDING a discarded `map(...)` statement: the loop-body
@@ -14228,7 +14269,7 @@ static bool vm_codegen_shapes()
         && float_ok && mixed_ok && for_ok && decl_ok
         && read_int_ok && read_flt_ok && write_int_ok && write_flt_ok
         && nested_native_ok && compound_store_ok && read_2d_ok
-        && builtin_dispatch_ok && array_build_ok && general_for_ok
+        && builtin_dispatch_ok && mathfn_ok && array_build_ok && general_for_ok
         && break_cont_ok && compound_cond_ok && boxed_ok
         && boxed_compound_ok && boxed_cmp_ok && boxed_log_ok
         && boxed_global_ok && boxed_subscript_ok && boxed_member_ok

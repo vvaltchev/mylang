@@ -991,6 +991,25 @@ enum class OpCode : unsigned char {
     AppendV,
 
     /*
+     * F1 (plans/vm-performance-roadmap.md): a TYPED math-builtin call -
+     * `sqrt(x)`/`sin(x)`/`log(x)`/`float(x)`/`abs(float)`/`pow(x,y)` with a
+     * float-proven result and float-compilable arg(s). Reads the operand(s)
+     * RAW (read_float_operand - an int operand promotes), calls the C
+     * function, writes the raw double via write_float_slot - the whole
+     * CallBuiltinV marshal (arg moves into the run, the buffer copy, the
+     * ArgLocs, the builtin fn-pointer call, the boxed result store) is
+     * deleted. NEVER THROWS: the 1/2-arg float builtins have no domain
+     * checks (libm NaN/inf semantics) and their only errors - arity,
+     * non-numeric arg - are excluded at compile time (arity gated at
+     * selection; the arg PROVEN numeric by inference, tag-checked under
+     * VM_HARDENING like every float operand). So the op is loc- AND
+     * node-free. Layout: target = dst, target2 = the MathFn selector,
+     * a = x, b = y (2-arg only). Selected by try_math_fn (codegen.cpp)
+     * ahead of the generic CallBuiltinV lowering.
+     */
+    MathFnV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1036,7 +1055,20 @@ enum class OpCode : unsigned char {
     X(IntMulRI) X(IntAndRR) X(IntAndRI) X(IntOrRR) X(IntOrRI) \
     X(IntXorRR) X(IntXorRI) X(IntShlRR) X(IntShlRI) X(IntShrRR) \
     X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
-    X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV)
+    X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV)
+
+/*
+ * MathFnV's function selector (Instr::target2). The names match the builtin
+ * names (tofloat_ is the numeric `float(x)` conversion; fabs_ is `abs` on a
+ * float-proven operand). All are float(float[,float]) with NO domain throw -
+ * a new entry must keep that contract (MathFnV is loc/node-free).
+ */
+enum class MathFn : int {
+    sqrt_, cbrt_, sin_, cos_, tan_, asin_, acos_, atan_,
+    exp_, exp2_, log_, log2_, log10_, ceil_, floor_, trunc_,
+    tofloat_, fabs_,
+    pow_,   /* the only 2-arg entry (Instr::b = y) */
+};
 
 namespace ml_opcheck {
 #define ML_OPCODE_ENUMV(N) OpCode::N,

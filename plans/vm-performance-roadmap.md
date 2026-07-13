@@ -261,11 +261,27 @@ Run over the finished chunk, before locs extraction:
 
 ### F. Widen the typed (unboxed) tier
 
-- **F1. Typed member/subscript/builtin-result reads feeding arith**
-  (the old Part C1): `bin.v` chains where one operand is a `member.v` /
-  `call.blt.v` result box+unbox per element. 40_math_builtins (.42, zero
-  fallbacks) is gated on exactly this. Typed variants: `CallBuiltinIntV`
-  (sqrt/abs/len -> int/float dst), `MemberIntV` beyond dicts.
+- **F1. Typed math-builtin calls — DONE (2026-07-16, `MathFnV`).** The
+  40_math_builtins gap was NOT boxed arith (the loop's `f.bin` chain was
+  already typed — the typed compilers route builtin results through temps)
+  but the per-call `CallBuiltinV` marshal: a boxed `move` per arg into the
+  run, the arg-buffer copy, the ArgLocs, the builtin fn-pointer call, the
+  boxed result store. `MathFnV` (target2 = a `MathFn` selector) deletes all
+  of it: `read_float_operand` (an int arg promotes, like FloatBin's), a
+  direct libm call in the ML_NOINLINE `vm_math_fn` (loop-body text rule),
+  `write_float_slot`. Selected by `try_math_fn` (codegen.cpp) ahead of the
+  generic lowering, gated on: an unshadowed builtin, exact arity (wrong
+  arity must throw → generic), th==f on the call (so `abs(int)` → int and
+  `float("3")` → str-parse stay generic), float-compilable args. NEVER
+  THROWS (the float builtins have no domain checks — libm NaN/inf — and
+  arity/type errors are excluded at compile time), so loc- AND node-free.
+  Covers sqrt/cbrt/sin/cos/tan/asin/acos/atan/exp/exp2/log/log2/log10/
+  ceil/floor/trunc/float/abs-on-float + 2-arg pow. MEASURED (full-suite
+  interleaved A/B vs 11e6d43): 40_math_builtins 0.030→0.015s (**0.50x
+  VM-wall — my/py 0.42x → 0.19-0.20x, ~5x CPython**), suite VM-wall
+  geomean 0.999 (the ±5-13% per-bench spread is layout jitter, netting
+  to zero). Still open in F1's original scope: typed MEMBER reads beyond
+  dicts (MemberIntV) — no bench is gated on it today.
 - **F2. Bool-typed conditions.** `while (flag)` boxes through
   JumpUnlessTrueV; a `JumpUnlessBool` on a proven-bool slot reads the
   byte directly.

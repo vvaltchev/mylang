@@ -716,6 +716,23 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "(" << lval_ref(in.a.lit, in.target2) << ", "
                 << D(static_cast<int_type>(in.b.lit)) << ")";
             break;
+        case OpCode::MathFnV: {
+            /* F1: the typed math-builtin call (selector in target2) */
+            static const char *const mf_names[] = {
+                "sqrt", "cbrt", "sin", "cos", "tan", "asin", "acos",
+                "atan", "exp", "exp2", "log", "log2", "log10", "ceil",
+                "floor", "trunc", "float", "abs", "pow",
+            };
+            const size_t fi = static_cast<size_t>(in.target2);
+            row << "math.v       " << D(in.target) << " = "
+                << (fi < sizeof(mf_names) / sizeof(mf_names[0])
+                        ? mf_names[fi] : "?")
+                << "(" << RI(in.a, false);
+            if (static_cast<MathFn>(in.target2) == MathFn::pow_)
+                row << ", " << RI(in.b, false);
+            row << ")";
+            break;
+        }
         case OpCode::CallBuiltinLV: {
             /* AST-free: name + arg count from the builtin_calls pool (a.slot).
              * A valid `b` (is_lit) is a rest-run base (rest-native) - show its

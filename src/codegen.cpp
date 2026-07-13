@@ -2661,6 +2661,80 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * F1 (roadmap): a float-proven MATH-builtin call whose arg(s) compile as
+     * float expressions lowers to MathFnV - raw operand read (an int operand
+     * promotes at runtime, like FloatBin's), direct C call, raw float write.
+     * Deletes the whole CallBuiltinV marshal for the sqrt/sin/cos/log class.
+     * Gated on: an UNSHADOWED builtin (DirectBuiltinCallExpr guarantees it),
+     * the exact arity (a wrong-arity call must throw at runtime -> decline to
+     * the generic path), and the call node's th == f (so `abs(int)` - an
+     * int result - and `float("3")` - a string parse - stay generic). The op
+     * NEVER THROWS for a numeric operand, so it is loc- and node-free.
+     */
+    bool try_math_fn(const DirectBuiltinCallExpr *dc, int &out_slot,
+                     std::vector<Instr> &ops)
+    {
+        struct Ent { const UniqueId *uid; MathFn fn; int nargs; };
+        static const std::vector<Ent> tbl = [] {
+            std::vector<Ent> v;
+            const auto add = [&v](const char *n, MathFn f, int na) {
+                v.push_back({UniqueId::get(n), f, na});
+            };
+            add("sqrt", MathFn::sqrt_, 1);  add("cbrt", MathFn::cbrt_, 1);
+            add("sin", MathFn::sin_, 1);    add("cos", MathFn::cos_, 1);
+            add("tan", MathFn::tan_, 1);    add("asin", MathFn::asin_, 1);
+            add("acos", MathFn::acos_, 1);  add("atan", MathFn::atan_, 1);
+            add("exp", MathFn::exp_, 1);    add("exp2", MathFn::exp2_, 1);
+            add("log", MathFn::log_, 1);    add("log2", MathFn::log2_, 1);
+            add("log10", MathFn::log10_, 1);
+            add("ceil", MathFn::ceil_, 1);  add("floor", MathFn::floor_, 1);
+            add("trunc", MathFn::trunc_, 1);
+            add("float", MathFn::tofloat_, 1);
+            add("abs", MathFn::fabs_, 1);   /* th==f gate -> float abs */
+            add("pow", MathFn::pow_, 2);
+            return v;
+        }();
+
+        if (!dc->args || dc->lvalue_arg0)
+            return false;
+
+        const Identifier *bid =
+            dynamic_cast<const Identifier *>(dc->what.get());
+        if (!bid)
+            return false;
+
+        for (const Ent &e : tbl) {
+            if (e.uid != bid->uid)
+                continue;
+            if (static_cast<int>(dc->args->elems.size()) != e.nargs)
+                return false;      /* wrong arity throws -> generic path */
+            Operand x, y;
+            const size_t mark = ops.size();
+            if (!compile_float_expr(dc->args->elems[0].get(), x, ops)) {
+                ops.resize(mark);
+                return false;
+            }
+            if (e.nargs == 2
+                && !compile_float_expr(dc->args->elems[1].get(), y, ops)) {
+                ops.resize(mark);
+                return false;
+            }
+            const int dst = alloc_temp();
+            Instr in;
+            in.op = OpCode::MathFnV;
+            in.target = dst;
+            in.target2 = static_cast<int>(e.fn);
+            in.a = x;
+            if (e.nargs == 2)
+                in.b = y;
+            ops.push_back(in);
+            out_slot = dst;
+            return true;
+        }
+        return false;
+    }
+
     bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
                             std::vector<Instr> &ops)
     {
@@ -4298,13 +4372,15 @@ struct Codegen {
         }
 
         /* A scalar-result BUILTIN call -> CallBuiltinV (value ABI); the
-         * result is a native float operand. An unliftable one declines
-         * (EvalToSlot is gone - the statement falls back whole). */
+         * result is a native float operand. A MATH builtin (sqrt/sin/...)
+         * gets the marshal-free MathFnV first (F1). An unliftable one
+         * declines (EvalToSlot is gone - the statement falls back whole). */
         if (e->th == TypeHint::f)
             if (const DirectBuiltinCallExpr *bc =
                     dynamic_cast<const DirectBuiltinCallExpr *>(e)) {
                 int t;
-                if (try_native_builtin(bc, t, ops)) {
+                if (try_math_fn(bc, t, ops)
+                        || try_native_builtin(bc, t, ops)) {
                     out = slot_op(t);
                     return true;
                 }

@@ -177,6 +177,24 @@ decline falls back to the full `vm_call_builtin_lv_rest`, byte-identical
 (the flat-mismatch TypeErrorEx, COW, carets). Measured: VM-wall 0.983,
 13_array_append 0.82x, suite 4.49-4.50x.
 
+**F1 - `MathFnV` (typed math-builtin calls).** A float-proven math-builtin
+call (`sqrt`/`cbrt`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`exp`/`exp2`/
+`log`/`log2`/`log10`/`ceil`/`floor`/`trunc`/`float`/`abs`-on-float +
+2-arg `pow`) whose args compile as float expressions lowers to `MathFnV`
+(`target2` = a `MathFn` selector, bytecode.h): raw operand read
+(`read_float_operand` - an int arg promotes), a direct libm call in the
+ML_NOINLINE `vm_math_fn` (loop-body text rule), raw `write_float_slot` -
+the whole `CallBuiltinV` marshal (per-arg boxed moves into the run, the
+arg-buffer copy, ArgLocs, the builtin fn-pointer call, the boxed store)
+is deleted. Selected by `try_math_fn` (codegen.cpp) ahead of the generic
+lowering; gated on an unshadowed builtin, EXACT arity (a wrong-arity call
+must throw -> generic path), and `th == f` on the call node (so
+`abs(int)` -> int result and `float("str")` -> parse stay generic). The
+op NEVER THROWS (the float builtins have no domain checks - libm NaN/inf
+semantics - and arity/type errors are compile-time-excluded), so it is
+loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
+0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
+
 **Jump threading was TRIED + DECLINED** (see roadmap E3): the codegen
 already emits direct branches (the pass retargeted instructions in 1 of
 77 benches), and the binary-layout perturbation cost a consistent +3.2%
