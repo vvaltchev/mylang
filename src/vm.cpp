@@ -1309,35 +1309,51 @@ static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
     e.inline_origin_emitted = true;
 }
 
+/* fwd (defined below CachedCallV's probe) - vm_raise now walks natively. */
+static ML_COLD bool
+vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+               size_t &pc, std::unique_ptr<RuntimeException> ex);
+
 /*
- * Raise an exception FROM a VM op - a `throw`, or a runtime error the op
- * detects itself (div/mod-by-zero, a flat-array bounds fault). Native-dispatch
- * to a same-frame handler (set `pc` to its catch + stash `vm_exc`, NO C++ throw
- * - the caller then `continue`s to re-dispatch at the CatchTest chain); or, no
- * active handler in this frame, C++-throw so it propagates to the caller's
- * boundary (cross-frame, like the tree-walker). Stamps the op's caret from the
- * loc side table when the exception carries none. Cold path only (a real
- * error); the non-error path never calls it. Returns iff it native-dispatched.
+ * Raise an exception FROM a VM op - a `throw` / `rethrow` / reraise, or a
+ * runtime error the op detects itself (div/mod-by-zero). G1
+ * (plans/vm-performance-roadmap.md): the ENTIRE propagation is the native
+ * FRAME WALK (vm_unwind_walk) - dispatch to a handler in the current frame,
+ * else pop in-VM records (capturing their backtrace frames) until a handler
+ * or the activation's BOUNDARY record; only the boundary converts to the
+ * g_vm_exc_pending signal. NO C++ throw anywhere on this path - a
+ * 16-frame-deep `throw` is pointer work, not unwinding (69_exc_crossframe;
+ * the old shape C++-threw to the boundary catch when no SAME-frame handler
+ * existed, paying one landing pad + an exception clone per cross-frame
+ * raise). Stamps the op's caret from the loc side table when the exception
+ * carries none; flushes the raise site's inlined frames (both exactly as
+ * the boundary catch did for a C++-thrown error). Cold path only. Returns
+ * true = dispatched (chunk/pc point at the handler - the CALLER MUST refresh
+ * `code` before dispatching); false = boundary reached (signal set - the
+ * caller returns, do_func_call captures + propagates).
  */
-static void
-vm_raise(const Chunk &chunk, size_t &pc, VmActivation &act, VmCallRec &cur,
+static bool
+vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
          std::unique_ptr<RuntimeException> ex)
 {
     if (!ex->loc_start) {
         Loc s, en;
-        chunk.loc_at(pc, s, en);
+        chunk->loc_at(pc, s, en);
         ex->loc_start = s;
         ex->loc_end = en;
     }
-    vm_flush_inline(chunk, pc, *ex);       /* frames if raised in inlined */
+    vm_flush_inline(*chunk, pc, *ex);      /* frames if raised in inlined */
+
+    /* The SAME-FRAME fast path first (the pre-G1 shape, kept out of the
+     * ML_COLD walk: a same-frame `throw`+catch loop - 42_exceptions - pays
+     * only this dispatch; routing it through the cold-section walk cost a
+     * measured +12% there). Not cold-marked itself for the same reason. */
+    VmCallRec &cur = act.records.back();
     if (vm_dispatch_exc(act, cur, pc)) {
-        cur.exc = std::move(ex);           /* same-frame: native jump */
-        return;
+        cur.exc = std::move(ex);
+        return true;                       /* chunk unchanged */
     }
-    cur.exc = std::move(ex);       /* no handler in THIS frame: C++ throw to
-                                    * the boundary catch, whose frame WALK
-                                    * finds an outer handler or leaves */
-    cur.exc->rethrow();
+    return vm_unwind_walk(act, ctx, chunk, pc, std::move(ex));
 }
 
 /* The desc-based twin of do_func_call's vm_capture_frame for the invoke
@@ -1980,15 +1996,19 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             case Op::times: r = a * b; break;
             case Op::div:
                 if (b == 0) {
-                    vm_raise(*chunk, pc, act, cur_rec(),
-                             std::make_unique<DivisionByZeroEx>());
-                    VM_NEXT;          /* native-dispatched: skip the write */
+                    if (!vm_raise(chunk, pc, act, ctx,
+                                  std::make_unique<DivisionByZeroEx>()))
+                        return;       /* boundary: signal set */
+                    code = chunk->code.data();
+                    VM_NEXT;          /* dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
                 if (b == 0) {
-                    vm_raise(*chunk, pc, act, cur_rec(),
-                             std::make_unique<DivisionByZeroEx>());
+                    if (!vm_raise(chunk, pc, act, ctx,
+                                  std::make_unique<DivisionByZeroEx>()))
+                        return;
+                    code = chunk->code.data();
                     VM_NEXT;
                 }
                 r = a % b; break;
@@ -2040,15 +2060,19 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             case Op::times: r = a * b; break;
             case Op::div:
                 if (b == 0.0) {
-                    vm_raise(*chunk, pc, act, cur_rec(),
-                             std::make_unique<DivisionByZeroEx>());
-                    VM_NEXT;          /* native-dispatched: skip the write */
+                    if (!vm_raise(chunk, pc, act, ctx,
+                                  std::make_unique<DivisionByZeroEx>()))
+                        return;       /* boundary: signal set */
+                    code = chunk->code.data();
+                    VM_NEXT;          /* dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
                 if (b == 0.0) {
-                    vm_raise(*chunk, pc, act, cur_rec(),
-                             std::make_unique<DivisionByZeroEx>());
+                    if (!vm_raise(chunk, pc, act, ctx,
+                                  std::make_unique<DivisionByZeroEx>()))
+                        return;
+                    code = chunk->code.data();
                     VM_NEXT;
                 }
                 r = std::fmod(a, b); break;
@@ -3881,9 +3905,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             Loc ls, le;
             chunk->loc_at(pc, ls, le);
             const EvalValue &tv = ctx.frame->at(in->a.slot).get();
-            vm_raise(*chunk, pc, act, cur_rec(),
-                     vm_make_thrown_exc(tv, ls, le));
-            VM_NEXT;                          /* re-dispatch (or unreached) */
+            if (!vm_raise(chunk, pc, act, ctx,
+                          vm_make_thrown_exc(tv, ls, le)))
+                return;                       /* boundary: signal set */
+            code = chunk->code.data();
+            VM_NEXT;                          /* re-dispatch at the handler */
         }
 
         VM_CASE(PushHandler):
@@ -3927,12 +3953,15 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_NEXT;
 
         VM_CASE(Reraise):
-            /* No clause matched: re-raise vm_exc to the OUTER handler (native
-             * jump), or C++-throw to propagate. Mirrors saved_ex->rethrow(). */
-            if (vm_dispatch_exc(act, cur_rec(), pc))
-                VM_NEXT;
-            cur_rec().exc->rethrow();
-            VM_NEXT;                    /* unreachable ([[noreturn]]) */
+            /* No clause matched: re-raise vm_exc - the native WALK finds the
+             * outer handler (same or ANY caller frame) or reaches the boundary
+             * (G1: no C++ throw; the walk's first step IS the old same-frame
+             * dispatch, and the boundary catch used to flush the reraise pc's
+             * inlined frames + clone - vm_raise does the flush, sans clone). */
+            if (!vm_raise(chunk, pc, act, ctx, std::move(cur_rec().exc)))
+                return;                 /* boundary: signal set */
+            code = chunk->code.data();
+            VM_NEXT;
 
         VM_CASE(Rethrow):
             /* `rethrow` in a catch body: re-raise the being-handled vm_exc with
@@ -3944,10 +3973,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 cur_rec().exc->loc_start = ls;
                 cur_rec().exc->loc_end = le;
             }
-            if (vm_dispatch_exc(act, cur_rec(), pc))
-                VM_NEXT;
-            cur_rec().exc->rethrow();
-            VM_NEXT;                    /* unreachable ([[noreturn]]) */
+            if (!vm_raise(chunk, pc, act, ctx, std::move(cur_rec().exc)))
+                return;                 /* boundary: signal set */
+            code = chunk->code.data();
+            VM_NEXT;
 
         VM_CASE(SetPend):
             /* Record what the shared `finally` must resume - normal or reraise
@@ -3963,10 +3992,13 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * crossing this try INLINES its own copy of the finally (Inc 2c),
              * so `vm_pend` is only ever normal or reraise here. */
             if (cur_rec().pend == Pend::reraise) {
-                /* finally didn't handle the exception → re-raise it. */
-                if (vm_dispatch_exc(act, cur_rec(), pc))
-                    VM_NEXT;
-                cur_rec().exc->rethrow();
+                /* finally didn't handle the exception → re-raise it (the
+                 * native walk, like Reraise - G1). */
+                if (!vm_raise(chunk, pc, act, ctx,
+                              std::move(cur_rec().exc)))
+                    return;             /* boundary: signal set */
+                code = chunk->code.data();
+                VM_NEXT;
             } else {
                 pc++;                                 /* fall through to Lend */
             }

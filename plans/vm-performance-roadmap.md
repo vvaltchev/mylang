@@ -306,13 +306,34 @@ across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
 
 ### G. Exceptions endgame
 
-- **G1. Cross-frame propagation without ANY landing pad** — rides C1: an
-  in-VM frame stack makes an unhandled exception a WALK of the VM stack
-  (pop frames, check handler tables) with zero C++ unwinding. Today each
-  crossed frame converts throw->signal at ONE boundary but still enters
-  do_func_call's machinery per frame. 69_exc_crossframe (my/py 1.88, the
-  only real CPython LOSS left) is the target; CPython's zero-cost-try /
-  cheap-raise is the bar.
+- **G1. Cross-frame propagation without ANY landing pad — DONE
+  (2026-07-17).** `vm_raise` (vm.cpp) now runs the native FRAME WALK
+  (`vm_unwind_walk`) directly: dispatch in the current frame, else pop
+  in-VM records (capturing their backtrace frames) until a handler or
+  the activation's BOUNDARY record — only the boundary converts to the
+  `g_vm_exc_pending` signal. NO C++ throw anywhere on the VM-raised
+  path (the old shape C++-threw to the boundary catch whenever no
+  SAME-frame handler existed — one landing pad + an exception CLONE per
+  cross-frame raise). All six raise sites walk: `Throw`, `Reraise`,
+  `Rethrow`, `EndFinally`'s reraise, and the IntBin/FloatBin div0
+  pair; a dispatch that lands in another frame refreshes the cached
+  `code` pointer before re-dispatching. The boundary catch remains for
+  the type-system C++ throws the VM can't pre-detect (OOB /
+  KeyNotFound / boxed TypeErrorEx) and now ALSO avoids per-frame
+  landing pads (it always did, post-C1). Backtraces byte-identical
+  (differential-pinned; the walk pushes the same frames the boundary
+  path did, minus the clone). **The same-frame FAST PATH stays out of
+  the cold walk** (vm_raise dispatches in the current frame first, and
+  is itself NOT cold-marked): the first G1 shape routed same-frame
+  throws through the ML_COLD walk and cost a MEASURED, persistent +12%
+  on 42_exceptions (a cold-section call per throw) - restored, 42 back
+  to 0.95x. MEASURED (full-suite interleaved A/B vs a2f16b1; the first
+  round's +1.2% VM-wall read was machine drift - the drift-immune
+  per-run my/py IMPROVED while wall "regressed", and a pooled
+  best-of-4 showed 1.001 - the fixed version measured cleanly):
+  69_exc_crossframe 0.055→0.031s (**0.564x; my/py 1.43x → 0.80x — the
+  last CPython-losing bench now WINS**), 42_exceptions 0.947x,
+  suite VM-wall geomean **0.985**, my/py 4.50-4.51x.
 
 ### H. Runtime / library-level (engine-neutral; caps several laggards)
 

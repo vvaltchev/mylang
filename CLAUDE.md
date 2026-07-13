@@ -3627,19 +3627,23 @@ So a member-in-the-middle nested store — which WORKS for boxed structs / dict
 values, throws for POD — is native, byte-identical incl. carets. **P8 exceptions
 are now fully native** (see
 `plans/vm-exceptions.md`): try/catch/finally + throw + rethrow + all
-flow-crossing-try (incl. nested-finally chaining) are native ops; a VM-detected
-runtime error (div/mod-by-zero at `IntBin`/`FloatBin`) native-dispatches via
-`vm_raise` with no C++ throw (bench 70 ~140× the tree-walker); and a CROSS-FRAME
-throw propagates as a global SIGNAL (`g_vm_exc_pending`) — a frame's boundary
-converts an unhandled C++ throw to the signal + returns, `do_func_call` captures
-its frame (`vm_capture_frame`) + propagates via a `do_func_call` `as_signal`
-param the VM call ops read, so N crossed frames pay ONE C++ landing-pad, not N
-(bench 69 ~25×). Backtraces are byte-identical, inclusive of INLINED virtual
-frames (a `Chunk::inline_ctxs` `pc→InlineCtx` side table, flushed by
-`vm_flush_inline`). The only executed-code fallback left is the TYPE-SYSTEM C++
-throws the VM can't pre-detect (OOB / KeyNotFound / a boxed `TypeErrorEx`); a
-same-frame catch of those is native (boundary dispatch), a cross-frame one pays
-one landing-pad to the boundary before the signal takes over.
+flow-crossing-try (incl. nested-finally chaining) are native ops. **G1
+(2026-07-17): a VM-RAISED exception NEVER C++-throws, cross-frame included.**
+`vm_raise` (the shared raise for `Throw`/`Reraise`/`Rethrow`/`EndFinally`'s
+reraise and the IntBin/FloatBin div0 pair) dispatches to a SAME-frame handler
+first (the un-cold fast path — routing it through the cold walk cost a
+measured +12% on 42_exceptions), else runs the native FRAME WALK
+(`vm_unwind_walk`) directly: pop in-VM records (capturing their backtrace
+frames), dispatch at the first frame with a handler (the caller refreshes the
+cached `code` pointer), or convert to the `g_vm_exc_pending` SIGNAL at the
+activation's BOUNDARY record — pointer work end to end, no landing pad, no
+exception clone (69_exc_crossframe 0.564x VM-wall, my/py 1.43x → **0.80x** —
+the last CPython-losing bench now wins). Backtraces are byte-identical,
+inclusive of INLINED virtual frames (`Chunk::inline_ctxs`, flushed by
+`vm_flush_inline`). The boundary catch remains ONLY for the TYPE-SYSTEM C++
+throws the VM can't pre-detect (OOB / KeyNotFound / a boxed `TypeErrorEx`):
+a same-frame catch of those is native (boundary dispatch), a cross-frame one
+pays one landing-pad to the boundary before the walk takes over.
 
 A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
 e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
