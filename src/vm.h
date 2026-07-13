@@ -56,6 +56,51 @@ Frame *vm_window_push(int_type nslots, const Chunk *ck);
 void vm_window_pop();
 
 /*
+ * Phase D: run a builtin's USER-CALLBACK (eval_func's funnel) as a boundary
+ * frame on the current activation - no per-element do_func_call/
+ * EvalContext. False = not available (no activation / const-eval / no
+ * chunk); the caller falls back to do_func_call. May throw exactly what
+ * do_func_call would (arity, bind coercion, the callee's exceptions with
+ * this frame's backtrace entry appended).
+ */
+class FuncObject;
+bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
+                   const EvalValue *argv, size_t n, EvalValue &out);
+
+/*
+ * Phase D, the LOOP form (roadmap C2): a builtin that invokes the SAME
+ * callback per element (map/filter/sort's comparator/make_dict/find/
+ * make_array) prepares the call ONCE - one boundary window push, one
+ * captures switch - and each invoke() just REBINDS the param slots and
+ * re-enters the dispatch loop: no per-element do_func_call, EvalContext,
+ * window push/pop, or record churn. Reference slots are reset between
+ * elements (per-call frame-death semantics preserved - COW/use_count
+ * behavior stays byte-identical to fresh frames). RAII: the dtor pops the
+ * window and restores captures even when a callback throws. When !ready()
+ * (tree-walk engine, const-eval, no activation, chunk-less callee) the
+ * builtin falls back to eval_func per element.
+ */
+struct VmActivation;
+class VmInvoker {
+public:
+    VmInvoker(EvalContext *ctx, FuncObject &obj);
+    ~VmInvoker();
+    VmInvoker(const VmInvoker &) = delete;
+    bool ready() const { return ready_; }
+    EvalValue invoke(const EvalValue *argv, size_t n);
+
+private:
+    bool ready_ = false;
+    VmActivation *act_ = nullptr;
+    EvalContext *c_ = nullptr;
+    const Chunk *cck_ = nullptr;
+    const FuncDescriptor *desc_ = nullptr;
+    Frame *w_ = nullptr;
+    std::vector<LValue> *saved_caps_ = nullptr;
+};
+void vm_window_pop();
+
+/*
  * The COMPLETE compiled program image (plans/vm-ast-free-runtime.md): the root
  * chunk, the root-context data the run needs (slot count + the global table's
  * names), and - crucially - OWNERSHIP of every FuncDescriptor and

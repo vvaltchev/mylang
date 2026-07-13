@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "eval.h"
+#include "vm.h"    /* VmInvoker - the prepared callback invoker */
 #include "bitops.h"
 #include "hashing.h"
 #include "env.h"      /* env_get - shared by builtins/io.cpp.h (tmpdir) */

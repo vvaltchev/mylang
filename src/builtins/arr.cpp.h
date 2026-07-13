@@ -178,9 +178,13 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
         mode = 3;
     };
 
+    VmInvoker inv(ctx, funcObj);   /* prepared per-loop invoker (vm.h) */
+
     for (int_type i = 0; i < n; i++) {
 
-        const EvalValue r = eval_func(ctx, funcObj, EvalValue(i));
+        const EvalValue iv(i);
+        const EvalValue r = inv.ready() ? inv.invoke(&iv, 1)
+                                        : eval_func(ctx, funcObj, iv);
 
         if (mode == 0) {
             if (r.is<int_type>()) {
@@ -718,9 +722,14 @@ builtin_find_arr(const SharedArrayObj &arr,
 
     if (key) {
 
+        VmInvoker inv(ctx, *key);   /* prepared per-loop invoker (vm.h) */
+
         for (size_type i = 0; i < n; i++) {
 
-            if (eval_func(ctx, *key, arr_elem_at(arr, i)) == v)
+            const EvalValue e = arr_elem_at(arr, i);
+            const EvalValue r = inv.ready() ? inv.invoke(&e, 1)
+                                            : eval_func(ctx, *key, e);
+            if (r == v)
                 return static_cast<int_type>(i);
         }
 
@@ -927,12 +936,23 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
          * terminates for ANY comparator (see its note). Run it directly over
          * the unboxed int/float vector when flat - no promotion.
          */
+        /* Prepared per-loop invoker (VmInvoker, vm.h): the comparator frame
+         * is pushed once; each comparison rebinds two slots. Falls back to
+         * eval_func when unavailable (tree-walk / const-eval). */
+        VmInvoker inv(ctx, funcObj);
+        auto cmp2 = [&](const EvalValue &a, const EvalValue &b) {
+            if (inv.ready()) {
+                const EvalValue argv[2] = { a, b };
+                return inv.invoke(argv, 2).is_true();
+            }
+            return eval_func(ctx, funcObj, make_pair(a, b)).is_true();
+        };
+
         switch (arr.skind()) {
             case SharedArrayObj::Storage::ints: {
                 auto &v = arr.flat_ints();
                 comparator_heapsort(v, [&](int_type a, int_type b) {
-                    const bool lt = eval_func(ctx, funcObj,
-                        make_pair(EvalValue(a), EvalValue(b))).is_true();
+                    const bool lt = cmp2(EvalValue(a), EvalValue(b));
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -940,8 +960,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
             case SharedArrayObj::Storage::floats: {
                 auto &v = arr.flat_floats();
                 comparator_heapsort(v, [&](float_type a, float_type b) {
-                    const bool lt = eval_func(ctx, funcObj,
-                        make_pair(EvalValue(a), EvalValue(b))).is_true();
+                    const bool lt = cmp2(EvalValue(a), EvalValue(b));
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -949,18 +968,17 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
             case SharedArrayObj::Storage::bools: {
                 auto &v = arr.flat_bools();
                 comparator_heapsort(v, [&](unsigned char a, unsigned char b) {
-                    const bool lt = eval_func(ctx, funcObj,
-                        make_pair(EvalValue(static_cast<bool>(a)),
-                                  EvalValue(static_cast<bool>(b)))).is_true();
+                    const bool lt = cmp2(EvalValue(static_cast<bool>(a)),
+                                         EvalValue(static_cast<bool>(b)));
                     return reverse ? !lt : lt;
                 });
                 break;
             }
             default: {
                 auto &vec = arr.get_vec();
-                comparator_heapsort(vec, [&](const LValue &a, const LValue &b) {
-                    const bool lt = eval_func(ctx, funcObj,
-                        make_pair(a.get(), b.get())).is_true();
+                comparator_heapsort(vec,
+                                    [&](const LValue &a, const LValue &b) {
+                    const bool lt = cmp2(a.get(), b.get());
                     return reverse ? !lt : lt;
                 });
                 break;

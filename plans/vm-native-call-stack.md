@@ -208,7 +208,26 @@ next call immediately overwrites (param slots), which today's model cannot.
 
 ## Phases (each lands -rt green + differential + A/B measured)
 
-> Status (2026-07-16): **A+B+C ✅ DONE** — see the phase notes below and the
+> Status (2026-07-16): **A+B+C+D ✅ DONE, regression ERASED at 0.999.**
+> The maintainer's controlled full-suite measurement caught a consistent
+> ~5% suite regression after Phase C (4.14x -> 3.99x my/py) - recovered in
+> four measured steps (interleaved full-suite A/B vs 69fef27 each time,
+> the new hard rule): 1.051 -> 1.031 (loop-body text moved to ML_NOINLINE
+> helpers) -> vm_try_invoke per-element was cost-parity (WRONG granularity)
+> -> 1.030 with VmInvoker, the PREPARED per-loop callback invoker (push
+> once, rebind slots per element; map/filter/sort/make_dict/find/
+> make_array) - sort/map/make_dict flipped to 0.79-0.88x - -> 1.022
+> (record push/pop churn slimmed: emplace-in-place, reference-based pop)
+> -> **0.999** (the CODE-POINTER CACHE: `chunk` became reseatable in inc 1,
+> so `chunk->code.data()` could no longer be hoisted - a double-load on
+> EVERY dispatch, +1.7-2.1% instructions on pure loops whose wall impact
+> the front-end amplified to +10-17%; cached as loop state, refreshed at
+> the four chunk-change sites). Net vs 69fef27: suite PARITY plus
+> recursion 0.68x, sort 0.81x, fib 0.86x, make_dict 0.88x, map 0.89x,
+> catchable StackOverflowEx, O(1) C-stack depth. Phase E (zero-copy arg
+> windows) remains the next win.
+>
+> Earlier: **A+B+C ✅ DONE** — see the phase notes below and the
 > commit messages. Phase C landed the FULL in-VM protocol: segmented window
 > stack (address-stable across callbacks - the relocation design was
 > CORRECTED here: builtins hold frame pointers across user callbacks),

@@ -414,6 +414,11 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
 {
     FuncObject &funcObj = *func_val.get<intrusive_ptr<FuncObject>>().get();
 
+    /* Prepared per-loop callback invoker (VmInvoker, vm.h): under -vm the
+     * callback frame is pushed ONCE and each element just rebinds the param
+     * slot(s); tree-walk/const-eval fall back to eval_func per element. */
+    VmInvoker inv(ctx, funcObj);
+
     if (container.is<SharedArrayObj>()) {
 
         /* Read element-by-element WITHOUT promoting flat storage (arr_elem_at);
@@ -424,10 +429,11 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
 
         for (size_type i = 0; i < n; i++) {
             const EvalValue e = arr_elem_at(arr, i);
+            const EvalValue r = inv.ready() ? inv.invoke(&e, 1)
+                                            : eval_func(ctx, funcObj, e);
             if (!is_filter)
-                result.emplace_back(eval_func(ctx, funcObj, e),
-                                    ctx->const_ctx);
-            else if (eval_func(ctx, funcObj, e).is_true())
+                result.emplace_back(r, ctx->const_ctx);
+            else if (r.is_true())
                 result.emplace_back(e, ctx->const_ctx);
         }
 
@@ -438,21 +444,26 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
         const DictObject::inner_type &data =
             container.get<intrusive_ptr<DictObject>>()->get_ref();
 
+        auto call_kv = [&](const EvalValue &k, const EvalValue &v) {
+            if (inv.ready()) {
+                const EvalValue argv[2] = { k, v };
+                return inv.invoke(argv, 2);
+            }
+            return eval_func(ctx, funcObj, make_pair(k, v));
+        };
+
         if (!is_filter) {
 
             SharedArrayObj::vec_type result;
             for (auto const &e : data)
-                result.emplace_back(
-                    eval_func(ctx, funcObj,
-                              make_pair(e.first, e.second.get())),
-                    ctx->const_ctx);
+                result.emplace_back(call_kv(e.first, e.second.get()),
+                                    ctx->const_ctx);
             return SharedArrayObj(move(result));
         }
 
         DictObject::inner_type result;
         for (auto const &e : data)
-            if (eval_func(ctx, funcObj,
-                          make_pair(e.first, e.second.get())).is_true())
+            if (call_kv(e.first, e.second.get()).is_true())
                 result.insert(e);
         return make_intrusive<DictObject>(move(result));
     }

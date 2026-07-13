@@ -798,6 +798,10 @@ EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const vector<EvalValue> &args)
 {
+    EvalValue r;
+    if (vm_try_invoke(ctx, obj, args.data(), args.size(), r))
+        return r;
+
     return do_func_call(ctx, obj, args);
 }
 
@@ -819,6 +823,9 @@ EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const EvalValue &arg)
 {
+    EvalValue r;
+    if (vm_try_invoke(ctx, obj, &arg, 1, r))
+        return r;
     return do_func_call(ctx, obj, arg);
 }
 
@@ -826,6 +833,10 @@ EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const pair<EvalValue, EvalValue> &args)
 {
+    EvalValue r;
+    const EvalValue argv[2] = { args.first, args.second };
+    if (vm_try_invoke(ctx, obj, argv, 2, r))
+        return r;
     return do_func_call(ctx, obj, args);
 }
 
