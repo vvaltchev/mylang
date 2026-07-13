@@ -964,6 +964,15 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "." << chunk.member_keys[in.a.lit].memId.get_type()
                               ->to_string(chunk.member_keys[in.a.lit].memId);
             break;
+        case OpCode::LoadMemberInt:
+        case OpCode::LoadMemberFloat:
+            /* H1: typed standalone struct-member read */
+            row << (in.op == OpCode::LoadMemberInt ? "load.mem.i   "
+                                                   : "load.mem.f   ")
+                << D(in.target) << " = " << D(in.target2) << "."
+                << chunk.member_keys[in.a.lit].memId.get_type()
+                       ->to_string(chunk.member_keys[in.a.lit].memId);
+            break;
         case OpCode::SliceV:
             row << "slice.v      " << D(in.target) << " = " << D(in.target2)
                 << "[";

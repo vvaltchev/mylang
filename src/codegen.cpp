@@ -3427,6 +3427,35 @@ struct Codegen {
     }
 
     /*
+     * H1: the TYPED standalone struct-member read `p.x` (th==i/f) - a proven
+     * non-opt STRUCT base (`MemberExpr::base_struct`) in a resolved LOCAL
+     * slot lowers to LoadMemberInt/Float: the POD fast path reads the scalar
+     * straight from the instance's bytes, so the consuming arith stays
+     * IntBin/FloatBin (bench 64's body was 5 member.v + 6 boxed ops per
+     * iteration). A non-local base (global/capture - rare) or an optional
+     * `?.` stays on the boxed MemberV path.
+     */
+    bool try_member_scalar(const MemberExpr *m, Operand &out,
+                           std::vector<Instr> &ops, OpCode op)
+    {
+        if (!m->base_struct || m->optional)
+            return false;
+        const Identifier *bid =
+            dynamic_cast<const Identifier *>(m->what.get());
+        if (!bid || bid->sym.kind != SymKind::local)
+            return false;
+        const int tt = alloc_temp();
+        Instr in;
+        in.op = op;
+        in.target = tt;
+        in.target2 = bid->sym.slot;
+        in.a = int_lit(add_member_key(m));
+        ops.push_back(in);
+        out = slot_op(tt);
+        return true;
+    }
+
+    /*
      * A TYPED ternary VALUE `cond ? a : b` with th==i/f (F-class follow-up
      * from plans/vm-peephole.md): a typed-compare condition emits ONE native
      * JumpUnless{Int,Float}Cmp to the else arm (any other condition boxes to
@@ -3555,9 +3584,12 @@ struct Codegen {
             return true;
 
         if (e->th == TypeHint::i)
-            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e))
+            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldInt))
                     return true;
+                if (try_member_scalar(m, out, ops, OpCode::LoadMemberInt))
+                    return true;
+            }
 
         int dtt;
         if (try_dict_scalar_load(e, dtt, ops, OpCode::DictLoadInt,
@@ -4464,9 +4496,12 @@ struct Codegen {
             return true;
 
         if (e->th == TypeHint::f)
-            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e))
+            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldFloat))
                     return true;
+                if (try_member_scalar(m, out, ops, OpCode::LoadMemberFloat))
+                    return true;
+            }
 
         int dtt;
         if (try_dict_scalar_load(e, dtt, ops, OpCode::DictLoadFloat,

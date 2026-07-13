@@ -418,6 +418,11 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
 /* VM StructCtorV: construct a POD struct standalone `P(x, y)` from its field
  * VALUES (a register run). Only emitted for a typed-scalar-arg POD
  * construction, so coerce cannot throw here. See eval.cpp. */
+/* Coerce + runtime-validate one struct field value (eval.cpp; shared with the
+ * VM's pre-coercing vm_struct_ctor - H1). */
+struct FieldDef;
+EvalValue coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e);
+
 intrusive_ptr<StructObject>
 construct_struct_from_values(StructTypeDef *def,
                              const EvalValue *vals, size_t n);

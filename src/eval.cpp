@@ -936,8 +936,9 @@ static void stamp_operand_loc(const Construct *c, Exception &e);
  */
 /* Coerce + runtime-validate one field value. The inferencer already checks a
  * statically-known construction, but this guards a `dyn`-laundered value and
- * makes a parse-time (const) construction type-safe (so it can fold). */
-static EvalValue
+ * makes a parse-time (const) construction type-safe (so it can fold).
+ * Non-static: the VM's vm_struct_ctor (vm.cpp) pre-coerces with it (H1). */
+EvalValue
 coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
 {
     if (v.is<NoneVal>()) {

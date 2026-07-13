@@ -195,6 +195,32 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**H1 - STRUCT CREATION (dst-slot reuse + typed member reads).** Two
+pieces (plans/vm-performance-roadmap.md H1): (1) **`vm_struct_ctor`
+constructs INTO the dst slot with REUSE** - when the slot's current value
+is a same-def, non-readonly POD instance with `use_count() == 1` (the
+slot's handle is the only owner), the fields are coerced into a stack
+buffer (BEFORE dst is touched - throw-safety) and written over ITS bytes:
+zero allocations in the steady-state `var p = Point(...)`-in-a-loop
+shape (the same overwrite-in-place + COW-guard trick the flat-struct-
+array foreach uses; an aliased/const/other-def dst takes the fresh path,
+pinned by a dedicated aliasing test). `coerce_struct_field` is exported
+from eval.cpp for the pre-coercion; the fresh path stores the coerced
+bytes directly (construct_struct_from_values would coerce twice).
+(2) **`LoadMemberInt`/`LoadMemberFloat`** - the MEASURED discovery was
+that allocation was NOT the dominant cost: bench 64's body was 5
+`member.v` + 6 boxed arith per iteration, because a STANDALONE struct
+member read had no typed lowering (only the foreach-array
+LoadStructField* and dict DictLoad* pairs existed). The new pair (the VM
+analog of the tree-walker's M8 `MemberExpr::eval_int/eval_float`,
+`try_member_scalar` in codegen.cpp: th==i/f + `MemberExpr::base_struct`
++ a resolved-LOCAL base) reads a POD field's scalar straight from the
+instance's bytes via the member_keys pool; the boxed-struct/dict/const-
+member residue falls to the shared `member_read_core` +
+`write_scalar_slot` (fallback throws stamped with the pooled member
+caret). Measured (both, full-suite interleaved A/B): 64_struct_create
+0.095->0.074s (0.779x; my/py 0.63x -> 0.48x), suite VM-wall 0.999.
+
 **TYPED TERNARY (M8 + codegen).** `specialize_children` (the M8
 specializer's recursion, inferencer.cpp) descends into `TernaryExpr` /
 `CoalesceExpr` - previously ABSENT, so a ternary's cond/arms were never

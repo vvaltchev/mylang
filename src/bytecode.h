@@ -1010,6 +1010,22 @@ enum class OpCode : unsigned char {
     MathFnV,
 
     /*
+     * H1 (plans/vm-performance-roadmap.md): the TYPED standalone struct-member
+     * READ `p.x` (th==i / th==f, a proven non-opt struct base in a LOCAL slot)
+     * - the standalone twin of the flat-array LoadStructField* pair, and the
+     * VM analog of the tree-walker's M8 MemberExpr::eval_int/eval_float. The
+     * fast path reads a POD field's scalar STRAIGHT from the instance's bytes
+     * (slot_of + a raw load - no boxed temp, so the consuming arith stays
+     * IntBin/FloatBin instead of a member.v + bin.v boxed chain); any other
+     * shape (a boxed struct's field, a dict base, a const member) falls to
+     * the shared member_read_core + the write_scalar_slot promotion/type-
+     * check, byte-identical to the tree-walker's Construct::eval_int/float
+     * fallback. Layout: target = dst, target2 = the base slot, a.lit = the
+     * member_keys pool index (uid + carets). AST-free.
+     */
+    LoadMemberInt, LoadMemberFloat,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1055,7 +1071,8 @@ enum class OpCode : unsigned char {
     X(IntMulRI) X(IntAndRR) X(IntAndRI) X(IntOrRR) X(IntOrRI) \
     X(IntXorRR) X(IntXorRI) X(IntShlRR) X(IntShlRI) X(IntShrRR) \
     X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
-    X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV)
+    X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV) \
+    X(LoadMemberInt) X(LoadMemberFloat)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

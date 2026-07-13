@@ -579,6 +579,36 @@ static const std::vector<test> tests =
     },
 
     {
+        /* H1 (vm_struct_ctor's dst-slot reuse): re-constructing into a loop
+         * var whose PREVIOUS instance is still ALIASED (use_count > 1) must
+         * allocate fresh - the alias keeps its value; an unaliased iteration
+         * may overwrite in place (unobservable). Pins the COW guard for both
+         * engines (the tree-walker never reuses; the differential rerun
+         * proves the VM matches it). */
+        "struct construction into a loop var never mutates an alias",
+        {
+            "struct P { int x; int y; }",
+            "var dyn keep = P(9, 9);",
+            "var out = [];",
+            "for (var i = 0; i < 4; i++) {",
+            "    var p = P(i, i * 10);",
+            "    if (i == 1) keep = p;",
+            "    append(out, p.x * 100 + p.y);",
+            "}",
+            "assert(keep.x == 1);",
+            "assert(keep.y == 10);",
+            "assert(out == [0, 110, 220, 330]);",
+            /* the same-def gate: alternating defs in ONE slot */
+            "struct Q { int a; int b; }",
+            "var dyn s = P(0, 0);",
+            "for (var i = 0; i < 4; i++) {",
+            "    if (i % 2 == 0) s = P(i, 1); else s = Q(i, 2);",
+            "}",
+            "assert(s.a == 3 && s.b == 2);",
+        },
+    },
+
+    {
         "rebind of const builtins is not allowed",
         {
             "len = 5;",
@@ -13494,6 +13524,10 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::CallV:            c.callv++; break;
             case OpCode::CallBuiltinV:     c.callbuiltinv++; break;
             case OpCode::MathFnV:          c.mathfnv++; break;
+            /* H1: typed struct-member reads count as the member.v they
+             * replace */
+            case OpCode::LoadMemberInt:
+            case OpCode::LoadMemberFloat:  c.memberv++; break;
             case OpCode::CallBuiltinLV:
             case OpCode::AppendV:          c.callbuiltinlv++; break;
             case OpCode::Halt:             c.halt++;   break;

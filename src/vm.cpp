@@ -334,22 +334,66 @@ vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
     return build_dict_from_pairs(heapbuf.data(), npairs, false);
 }
 
-/* Construct a POD struct P(x,y) from its field-arg run. ML_NOINLINE + off
- * vm_run_chunk's frame for the recursion-stack reason above; the caller wraps it
- * in the defensive loc-stamp try/catch (the throw propagates out of here). */
-static ML_NOINLINE EvalValue
-vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base, int_type nf)
+/* Construct a POD struct P(x,y) from its field-arg run, INTO the dst slot.
+ * ML_NOINLINE + off vm_run_chunk's frame for the recursion-stack reason above;
+ * the caller wraps it in the defensive loc-stamp try/catch (the throw
+ * propagates out of here).
+ *
+ * H1 (plans/vm-performance-roadmap.md) - DST-SLOT REUSE: the hot standalone-
+ * construction shape is `var p = Point(...)` in a loop, where the dst slot
+ * still holds LAST iteration's same-def POD instance and nothing else does
+ * (`use_count() == 1` - the slot's handle is the only owner; readonly
+ * excluded). Overwrite ITS bytes instead of paying the two heap allocations
+ * (the StructObject + its `bytes` vector) plus the two frees per
+ * construction - the same overwrite-in-place + COW-guard trick the flat-
+ * struct-array foreach uses (do_iter). An aliased (`var q = p;`), captured,
+ * const, other-def, or non-struct dst takes the fresh-allocation path, so a
+ * held instance is never mutated. The fields are coerced into a stack
+ * buffer BEFORE dst is touched (a defensive coerce throw leaves the old
+ * value intact - construct_struct_from_values orders the same way). */
+static ML_NOINLINE void
+vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
+               int_type nf, int_type dst)
 {
+    const auto build = [&](const EvalValue *vals) {
+        LValue &d = ctx.frame->at(dst);
+        const EvalValue &cur = d.get();
+        if (cur.is<intrusive_ptr<StructObject>>()) {
+            const intrusive_ptr<StructObject> &so =
+                cur.get<intrusive_ptr<StructObject>>();
+            if (so->def == def && !so->readonly && so.use_count() == 1) {
+                char *bytes = so->bytes.data();
+                for (int_type i = 0; i < nf; i++)
+                    pod_store_field(def->fields[static_cast<size_t>(i)],
+                                    bytes, vals[i]);
+                return;                    /* dst already holds the struct */
+            }
+        }
+        /* Fresh path: the values are ALREADY coerced (above), so store the
+         * bytes directly - construct_struct_from_values would coerce again. */
+        auto obj = make_intrusive<StructObject>(def);
+        char *bytes = obj->bytes.data();
+        for (int_type i = 0; i < nf; i++)
+            pod_store_field(def->fields[static_cast<size_t>(i)],
+                            bytes, vals[i]);
+        d.put(EvalValue(intrusive_ptr<StructObject>(obj)));
+    };
+
     if (nf <= 16) {
         EvalValue vals[16];
         for (int_type i = 0; i < nf; i++)
-            vals[i] = ctx.frame->at(base + i).get();
-        return EvalValue(construct_struct_from_values(def, vals, nf));
+            vals[i] = coerce_struct_field(def->fields[static_cast<size_t>(i)],
+                                          ctx.frame->at(base + i).get(),
+                                          Loc(), Loc());
+        build(vals);
+        return;
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(nf));
     for (int_type i = 0; i < nf; i++)
-        heapbuf[i] = ctx.frame->at(base + i).get();
-    return EvalValue(construct_struct_from_values(def, heapbuf.data(), nf));
+        heapbuf[i] = coerce_struct_field(def->fields[static_cast<size_t>(i)],
+                                         ctx.frame->at(base + i).get(),
+                                         Loc(), Loc());
+    build(heapbuf.data());
 }
 
 /* Construct a BOXED struct `B(a, x)` from its field-arg run [base, base+nargs).
@@ -2894,8 +2938,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             StructTypeDef *def =
                 const_cast<StructTypeDef *>(chunk->struct_defs[in->target2]);
             try {
-                ctx.frame->at(in->target).put(
-                    vm_struct_ctor(ctx, def, in->a.lit, in->b.lit));
+                vm_struct_ctor(ctx, def, in->a.lit, in->b.lit, in->target);
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -3857,6 +3900,96 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 member_read_core(ctx.frame->at(in->target2).get(), mk.memId,
                                  mk.memUid, mk.optional, mk.mstart, mk.mend,
                                  mk.bstart, mk.bend));
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(LoadMemberInt): {
+            /* H1: typed standalone struct-member read `p.x` (th==i). The POD
+             * fast path reads the scalar straight from the instance's bytes -
+             * the VM analog of MemberExpr::eval_int; anything else falls to
+             * the shared member_read_core + write_scalar_slot (its int
+             * type-check/promotion == the tree-walker's boxed fallback). */
+            const Chunk::MemberKey &mk = chunk->member_keys[in->a.lit];
+            const EvalValue &b = ctx.frame->at(in->target2).get();
+            if (b.is<intrusive_ptr<StructObject>>()) {
+                const StructObject &o =
+                    *b.get<intrusive_ptr<StructObject>>().get();
+                const int fs = o.def->slot_of(mk.memUid);
+                if (fs >= 0 && o.is_pod()) {
+                    const FieldDef &f = o.def->fields[fs];
+                    const char *p = o.bytes.data() + f.offset;
+                    if (f.kind == FieldKind::f_int) {
+                        int_type v;
+                        std::memcpy(&v, p, sizeof v);
+                        write_int_slot(&ctx, in->target, v);
+                        pc++;
+                        VM_NEXT;
+                    }
+                    if (f.kind == FieldKind::f_bool) {
+                        write_int_slot(&ctx, in->target,
+                            static_cast<unsigned char>(*p) != 0 ? 1 : 0);
+                        pc++;
+                        VM_NEXT;
+                    }
+                }
+            }
+            try {
+                write_scalar_slot(&ctx, in->target, /*is_int=*/true,
+                    member_read_core(b, mk.memId, mk.memUid, mk.optional,
+                                     mk.mstart, mk.mend, mk.bstart, mk.bend));
+            } catch (Exception &e) {
+                /* write_scalar_slot's get<> throw is loc-less - give it the
+                 * member's caret (member_read_core's own throws carry it) */
+                if (!e.loc_start) {
+                    e.loc_start = mk.mstart;
+                    e.loc_end = mk.mend;
+                }
+                throw;
+            }
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(LoadMemberFloat): {
+            /* the eval_float twin (th==f) */
+            const Chunk::MemberKey &mk = chunk->member_keys[in->a.lit];
+            const EvalValue &b = ctx.frame->at(in->target2).get();
+            if (b.is<intrusive_ptr<StructObject>>()) {
+                const StructObject &o =
+                    *b.get<intrusive_ptr<StructObject>>().get();
+                const int fs = o.def->slot_of(mk.memUid);
+                if (fs >= 0 && o.is_pod()) {
+                    const FieldDef &f = o.def->fields[fs];
+                    const char *p = o.bytes.data() + f.offset;
+                    if (f.kind == FieldKind::f_float) {
+                        float_type v;
+                        std::memcpy(&v, p, sizeof v);
+                        write_float_slot(&ctx, in->target, v);
+                        pc++;
+                        VM_NEXT;
+                    }
+                    if (f.kind == FieldKind::f_int) {
+                        int_type v;
+                        std::memcpy(&v, p, sizeof v);
+                        write_float_slot(&ctx, in->target,
+                                         static_cast<float_type>(v));
+                        pc++;
+                        VM_NEXT;
+                    }
+                }
+            }
+            try {
+                write_scalar_slot(&ctx, in->target, /*is_int=*/false,
+                    member_read_core(b, mk.memId, mk.memUid, mk.optional,
+                                     mk.mstart, mk.mend, mk.bstart, mk.bend));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = mk.mstart;
+                    e.loc_end = mk.mend;
+                }
+                throw;
+            }
             pc++;
         }
         VM_NEXT;

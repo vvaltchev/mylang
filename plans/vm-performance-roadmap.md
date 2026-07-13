@@ -298,8 +298,9 @@ across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
   interleaved A/B vs 11e6d43): 40_math_builtins 0.030→0.015s (**0.50x
   VM-wall — my/py 0.42x → 0.19-0.20x, ~5x CPython**), suite VM-wall
   geomean 0.999 (the ±5-13% per-bench spread is layout jitter, netting
-  to zero). Still open in F1's original scope: typed MEMBER reads beyond
-  dicts (MemberIntV) — no bench is gated on it today.
+  to zero). The "typed MEMBER reads beyond dicts" residue of F1's
+  original scope is DONE under H1 (LoadMemberInt/Float — and the "no
+  bench is gated on it" claim was wrong: 64_struct_create was).
 - **F2. Bool-typed conditions.** `while (flag)` boxes through
   JumpUnlessTrueV; a `JumpUnlessBool` on a proven-bool slot reads the
   byte directly.
@@ -337,10 +338,43 @@ across ~17 benches; my/py 4.41-4.44 → 4.45x), bench+samples instrs
 
 ### H. Runtime / library-level (engine-neutral; caps several laggards)
 
-- **H1. Struct creation** (64_struct_create 0.61, 77 0.65): per-instance
-  `StructObject` heap alloc + intrusive count. Options: a small-object
-  pool for StructObjects; construct-in-place into locals; and (design-
-  level, below) inline POD structs in EvalValue.
+- **H1. Struct creation — v1 DONE (2026-07-17): DST-SLOT REUSE.** The
+  hot standalone shape is `var p = Point(...)` in a loop: the dst slot
+  still holds LAST iteration's same-def POD instance, and a construction
+  paid TWO heap allocations (the `StructObject` + its `bytes` vector)
+  plus two frees per instance. `vm_struct_ctor` (vm.cpp) now constructs
+  INTO the dst slot: when the slot's current value is a same-def,
+  non-readonly POD instance with `use_count() == 1` (the slot's handle
+  is the only owner), the fields are coerced into a stack buffer and
+  written over ITS bytes — zero allocations in steady state. An aliased
+  (`var q = p`), captured, const, other-def, or non-struct dst takes the
+  fresh path, so a held instance is never mutated — the same
+  overwrite-in-place + COW-guard trick the flat-struct-array foreach has
+  always used (do_iter). Coercion happens BEFORE dst is touched (a
+  defensive throw leaves the old value intact); the fresh path stores
+  the pre-coerced bytes directly (no double coerce). Alias-soundness
+  pinned by a dedicated test (both engines).
+  **The MEASURED discovery: allocation was NOT the dominant cost.** The
+  reuse alone A/B'd ~neutral on 64_struct_create — the dump showed the
+  body was 5 `member.v` + 6 boxed arith per iteration: the FIELD READS
+  were boxed, because the VM had no typed lowering for a standalone
+  struct member (only the foreach-array LoadStructField* and the dict
+  DictLoad* pairs; the F1 note claiming "no bench is gated on
+  MemberIntV" was wrong — 64 was). **`LoadMemberInt`/`LoadMemberFloat`**
+  (the VM analog of the tree-walker's M8 `MemberExpr::eval_int/float`):
+  a th==i/f member on a proven non-opt struct base in a local slot
+  reads a POD field's scalar straight from the instance's bytes
+  (member_keys pool for uid/carets; the boxed-struct/dict/const-member
+  residue falls to the shared member_read_core + write_scalar_slot,
+  fallback throws stamped with the pooled member caret). With it, 64's
+  whole body is typed (load.mem + IntBin/FloatBin, zero boxed ops).
+  MEASURED (both changes, full-suite interleaved A/B vs b462642):
+  64_struct_create 0.095→0.074s (**0.779x; my/py 0.63x → 0.48x**),
+  58_structs 0.875x, suite VM-wall geomean 0.999 (neutral).
+  Still open (H1 v2, if ever justified): an inline small-buffer for
+  `bytes` (the fresh path's second alloc), the design-level
+  inline-POD-in-EvalValue, and global/capture struct bases for
+  LoadMember* (local-only today).
 - **H2. Dict insert path** (47/62 wordcount 0.49-0.61, 26_dict_insert):
   `unordered_map<EvalValue,LValue>` node alloc per insert + hash dispatch
   via Type vtable. Consider reserve() from ArrHint-style size hints, and
