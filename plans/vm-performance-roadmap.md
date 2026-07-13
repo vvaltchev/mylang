@@ -330,6 +330,12 @@ enables 8.
 
 ## Part 5 — ground rules for this work
 
+- **FULL-SUITE ONLY (hard rule, 2026-07-16):** perf claims come from full
+  bench/run.py runs of both binaries, same session, interleaved and
+  repeated; three-digit geomeans. A subset probe or a cross-session my/py
+  comparison masked a real ~5% suite regression during C1 Phase C - the
+  maintainer's controlled re-run (multiple full runs per commit) caught it.
+
 - Every step: differential `-rt` green + `run.py --vm --baseline` gate;
   cachegrind Irefs on 01/44/60 + one callback bench recorded in the
   commit message (wall clock on WSL2 is too noisy for 3% decisions).

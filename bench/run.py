@@ -350,22 +350,22 @@ def main():
 
     if ratios:
         gm_v = geomean(ratios)
-        gm = colorize_ratio(gm_v, "%.2fx" % gm_v)
+        gm = colorize_ratio(gm_v, "%.3fx" % gm_v)
         if gm_v >= 1.0:
-            tail = "MyLang is ~%.1fx slower" % gm_v
+            tail = "MyLang is ~%.2fx slower" % gm_v
         else:
-            tail = "MyLang is ~%.1fx faster" % (1.0 / gm_v)
+            tail = "MyLang is ~%.2fx faster" % (1.0 / gm_v)
         print("-" * len(hdr))
         print("geomean my/py over %d paired benchmarks: %s (%s)"
               % (len(ratios), gm, tail))
 
     if speedups:
         sp_v = geomean(speedups)
-        sp = colorize_ratio(sp_v, "%.2fx" % sp_v)
+        sp = colorize_ratio(sp_v, "%.3fx" % sp_v)
         if sp_v < 1.0:
-            tail = "current is ~%.1fx FASTER than baseline" % (1.0 / sp_v)
+            tail = "current is ~%.2fx FASTER than baseline" % (1.0 / sp_v)
         else:
-            tail = "current is ~%.1fx SLOWER than baseline" % sp_v
+            tail = "current is ~%.2fx SLOWER than baseline" % sp_v
         print("geomean cur/base over %d benchmarks: %s (%s)"
               % (len(speedups), sp, tail))
 

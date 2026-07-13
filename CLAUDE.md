@@ -305,6 +305,17 @@ enumerated there. (Floats match: both are 64-bit IEEE `double`.)
 `bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
+**THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16).** Any
+claim about a VM perf change is made ONLY from FULL-SUITE `bench/run.py`
+runs, BOTH binaries built and run in the SAME session, repeated (>=2 runs
+each, interleaved A/B/A/B to cancel machine drift) — never from a bench
+subset probe, never by comparing my/py prints across sessions (the CPython
+denominator drifts several percent day to day on this box; it masked a real
+~5% Phase-C regression as "noise" once). Compare the VM WALL-CLOCK per bench
+(the my column) between the binaries, plus the my/py geomean, which run.py
+now prints with THREE digits (0.256x / ~3.91x) for exactly this. A phase
+does not land on a probe geomean.
+
 **`--vm` — the bytecode-VM performance gate.** `run.py --vm` runs the current
 mylang binary with `-vm` (the bytecode VM). Combined with `--baseline <the same
 binary>`, the baseline runs WITHOUT `-vm` (the tree-walker), so the `cur/base`

@@ -1269,6 +1269,176 @@ vm_raise(const Chunk &chunk, size_t &pc, VmActivation &act, VmCallRec &cur,
     cur.exc->rethrow();
 }
 
+/*
+ * THE LOOP-BODY TEXT RULE (learned twice now, hard way): vm_run_chunk's
+ * measured floor is its CODE LAYOUT - growing the function regressed
+ * UNTOUCHED pure loops ~10% wall with +1.7% instructions and BETTER
+ * branch prediction (the front-end effect, see the roadmap A2 notes). So
+ * everything the native call stack added lives in these ML_NOINLINE
+ * helpers: one CALL per call-op / invocation / unwind, and the dispatch
+ * core keeps its size. Measured under the full-suite interleaved rule.
+ */
+
+/* The per-invocation entry: ensure an activation + this entry's BOUNDARY
+ * record (see the comment in vm_run_chunk). Returns the activation. */
+static ML_NOINLINE VmActivation *
+vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
+                    bool &swapped, bool &pushed)
+{
+    if (!g_vm_act) {
+        own = std::make_unique<VmActivation>();
+        swapped = true;
+        g_vm_act = own.get();
+    }
+    if (g_vm_act->records.empty()
+            || g_vm_act->records.back().run_chunk != chunk) {
+        g_vm_act->push_window(0, chunk, /*boundary=*/true);
+        pushed = true;
+    }
+    return g_vm_act;
+}
+
+/*
+ * THE IN-VM CALL (plans/vm-native-call-stack.md): push the callee's frame
+ * window + record and continue the loop in the callee's chunk - no
+ * do_func_call, no EvalContext, no C++ recursion. Arity = two compares
+ * (the same InvalidNumberOfArgsEx, reaching the unwind walk like any bind
+ * throw did). Bind: the args already sit in the caller's contiguous run
+ * (STABLE across the push - segments never move); fast_bind is a plain
+ * copy loop (+ none-fill for omitted trailing opt params); a typed i/f
+ * param coerces via vm_coerce_decl_num (the tree-walker's exact coercion);
+ * runtime bindings are non-const (do_func_bind_params' value overloads
+ * bound with ctx->const_ctx == false). A bind throw pops the half-built
+ * frame WITHOUT capturing a backtrace frame for it - do_func_call's bind
+ * ran BEFORE its try, so a bind error never recorded the callee.
+ */
+static ML_NOINLINE void
+vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+              size_t &pc, FuncObject &fo, const Chunk *cck,
+              int_type argbase, size_t nargs, int_type dst,
+              std::unique_ptr<PureCacheKey> ckey)
+{
+    const FuncDescriptor *d = fo.func;
+    const size_t nparams = d->params.size();
+    if (nargs > nparams || nargs < static_cast<size_t>(d->min_args))
+        throw InvalidNumberOfArgsEx();
+
+    LValue *argrun = nargs ? &ctx.frame->at(argbase) : nullptr;
+    const int_type total =
+        d->frame_size + static_cast<int_type>(cck->n_temps);
+    Frame *w = act.push_window(total, cck, /*boundary=*/false);
+    VmCallRec &rec = act.records.back();
+    rec.ret_chunk = chunk;
+    rec.ret_pc = pc + 1;
+    rec.dst = dst;
+    rec.desc = d;
+    rec.caller_captures = ctx.captures;
+    rec.cache_key = std::move(ckey);
+
+    if (d->fast_bind) {
+        for (size_t i = 0; i < nargs; i++)
+            w->at(static_cast<int_type>(i)) =
+                LValue(argrun[i].get(), false);
+        for (size_t i = nargs; i < nparams; i++)
+            w->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
+    } else {
+        try {
+            for (size_t i = 0; i < nparams; i++) {
+                const FuncDescriptor::ParamDesc &p = d->params[i];
+                EvalValue val = i < nargs ? argrun[i].get()
+                                          : EvalValue();
+                if (p.decl_type == DeclType::i
+                        || p.decl_type == DeclType::f)
+                    val = vm_coerce_decl_num(
+                        val, p.decl_type == DeclType::f);
+                w->at(static_cast<int_type>(i)) =
+                    LValue(std::move(val), false);
+            }
+        } catch (...) {
+            act.pop_window();
+            throw;
+        }
+    }
+
+    ctx.captures = &fo.capture_slots;
+    chunk = cck;
+    pc = 0;
+}
+
+/* Pop the TOP (in-VM) frame with `res` as its return value: store a cached
+ * call's SCALAR result in the caller's cache (pure_cache_call's exact
+ * rule), write the parent's dst slot, resume after the call. */
+static ML_NOINLINE void
+vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+              size_t &pc, EvalValue res)
+{
+    VmCallRec dead = act.pop_window();
+    ctx.captures = dead.caller_captures;
+    chunk = dead.ret_chunk;
+    pc = dead.ret_pc;
+    if (dead.cache_key && res.get_type()->t < Type::t_str)
+        ctx.frame->ensure_pure_cache().emplace(
+            std::move(*dead.cache_key), res);
+    ctx.frame->at(dead.dst).put(std::move(res));
+}
+
+/* CachedCallV's cache probe (vm_cached_call's exact flow): a HIT writes the
+ * result copy into dst and returns true; a MISS leaves the {func, args} key
+ * in `pending` for vm_enter_call to carry (stored on pop). */
+static ML_NOINLINE bool
+vm_cache_probe(EvalContext &ctx, const Instr *in, const FuncDescriptor *d,
+               std::unique_ptr<PureCacheKey> &pending)
+{
+    std::vector<EvalValue> vals;
+    const size_t n = static_cast<size_t>(in->b.lit);
+    vals.reserve(n);
+    const LValue *ap0 = n ? &ctx.frame->at(in->a.lit) : nullptr;
+    for (size_t i = 0; i < n; i++)
+        vals.push_back(ap0[i].get());
+    PureCacheKey key{ d, std::move(vals) };
+    PureCache &cache = ctx.frame->ensure_pure_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        ctx.frame->at(in->target).put(EvalValue(it->second));
+        return true;
+    }
+    pending = std::make_unique<PureCacheKey>(std::move(key));
+    return false;
+}
+
+/*
+ * The exceptional FRAME WALK (cold; the invocation's single landing pad):
+ * dispatch to a handler in the current frame, else - for an in-VM frame -
+ * append its backtrace frame (exactly what its do_func_call catch used to
+ * record), pop it, flush the CALL op's inlined frames at the parent's call
+ * pc (what the caller's signal check used to do), and continue in the
+ * parent. Reaching the invocation's BOUNDARY frame converts to the
+ * g_vm_exc_pending signal (false) - do_func_call above captures that frame
+ * and propagates, the Inc-v2 contract. True = dispatched (chunk/pc set).
+ */
+static ML_COLD bool
+vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+               size_t &pc, std::unique_ptr<RuntimeException> ex)
+{
+    for (;;) {
+        VmCallRec &cur = act.records.back();
+        if (vm_dispatch_exc(act, cur, pc)) {
+            cur.exc = std::move(ex);           /* like saved_ex */
+            return true;
+        }
+        if (cur.boundary) {
+            g_vm_exc_pending = std::move(ex);
+            return false;
+        }
+        vm_capture_rec_frame(*ex, cur);
+        VmCallRec dead = act.pop_window();
+        ctx.captures = dead.caller_captures;
+        chunk = dead.ret_chunk;
+        pc = dead.ret_pc - 1;                  /* the call op */
+        vm_flush_inline(*chunk, pc, *ex);
+    }
+}
+
 void
 vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 {
@@ -1290,29 +1460,18 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
      */
     std::unique_ptr<VmActivation> local_act;
     struct EntryGuard {
-        VmActivation *prev = nullptr;
         bool swapped = false, pushed = false;
         ~EntryGuard() {
             if (pushed)
                 g_vm_act->pop_window();
             if (swapped)
-                g_vm_act = prev;
+                g_vm_act = nullptr;
         }
     } entry_guard;
 
-    if (!g_vm_act) {
-        local_act = std::make_unique<VmActivation>();
-        entry_guard.prev = g_vm_act;
-        entry_guard.swapped = true;
-        g_vm_act = local_act.get();
-    }
-    if (g_vm_act->records.empty()
-            || g_vm_act->records.back().run_chunk != chunk) {
-        g_vm_act->push_window(0, chunk, /*boundary=*/true);
-        entry_guard.pushed = true;
-    }
-
-    VmActivation &act = *g_vm_act;
+    VmActivation &act = *vm_enter_invocation(chunk, local_act,
+                                             entry_guard.swapped,
+                                             entry_guard.pushed);
     size_t pc = 0;
     /* CachedCallV's pending {func,args} key between the cache miss and the
      * frame push. LOOP-scope (like `in`): clang forbids an INDIRECT goto
@@ -1327,91 +1486,6 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         return act.dyn_iters[cur_rec().dyiter_base + i];
     };
 
-    /*
-     * THE IN-VM CALL (plans/vm-native-call-stack.md): push the callee's
-     * frame window + record and CONTINUE THE LOOP in the callee's chunk -
-     * no do_func_call, no EvalContext, no C++ recursion. Everything
-     * do_func_call did for a chunked body happens here, cheaper:
-     *  - arity: two compares against the descriptor (same
-     *    InvalidNumberOfArgsEx, reaching the boundary walk like any bind
-     *    throw did);
-     *  - bind: the args already sit in the caller's contiguous run
-     *    (STABLE across the push - segments never move); an omitted
-     *    trailing opt param binds none; a typed i/f param coerces via
-     *    vm_coerce_decl_num (the tree-walker's exact coercion); runtime
-     *    bindings are non-const (do_func_bind_params' value overloads
-     *    bound with ctx->const_ctx == false). A bind throw pops the
-     *    half-built frame WITHOUT capturing a backtrace frame for it -
-     *    do_func_call's bind ran BEFORE its try, so a bind error never
-     *    recorded the callee.
-     * ReturnV/Halt pop the record: result into the parent's dst slot,
-     * resume at ret_chunk/ret_pc.
-     */
-    auto enter_call = [&](FuncObject &fo, const Chunk *cck, int_type argbase,
-                          size_t nargs, int_type dst,
-                          std::unique_ptr<PureCacheKey> ckey) {
-        const FuncDescriptor *d = fo.func;
-        const size_t nparams = d->params.size();
-        if (nargs > nparams || nargs < static_cast<size_t>(d->min_args))
-            throw InvalidNumberOfArgsEx();
-
-        LValue *argrun = nargs ? &ctx.frame->at(argbase) : nullptr;
-        const int_type total =
-            d->frame_size + static_cast<int_type>(cck->n_temps);
-        Frame *w = act.push_window(total, cck, /*boundary=*/false);
-        VmCallRec &rec = act.records.back();
-        rec.ret_chunk = chunk;
-        rec.ret_pc = pc + 1;
-        rec.dst = dst;
-        rec.desc = d;
-        rec.caller_captures = ctx.captures;
-        rec.cache_key = std::move(ckey);
-
-        if (d->fast_bind) {
-            /* No typed param anywhere: a plain copy loop (+ none-fill for
-             * omitted trailing opt params). Cannot throw. */
-            for (size_t i = 0; i < nargs; i++)
-                w->at(static_cast<int_type>(i)) =
-                    LValue(argrun[i].get(), false);
-            for (size_t i = nargs; i < nparams; i++)
-                w->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
-        } else {
-            try {
-                for (size_t i = 0; i < nparams; i++) {
-                    const FuncDescriptor::ParamDesc &p = d->params[i];
-                    EvalValue val = i < nargs ? argrun[i].get()
-                                              : EvalValue();
-                    if (p.decl_type == DeclType::i
-                            || p.decl_type == DeclType::f)
-                        val = vm_coerce_decl_num(
-                            val, p.decl_type == DeclType::f);
-                    w->at(static_cast<int_type>(i)) =
-                        LValue(std::move(val), false);
-                }
-            } catch (...) {
-                act.pop_window();
-                throw;
-            }
-        }
-
-        ctx.captures = &fo.capture_slots;
-        chunk = cck;
-        pc = 0;
-    };
-
-    /* Pop the TOP (in-VM) frame with `res` as its return value: store a
-     * cached call's SCALAR result in the caller's cache (pure_cache_call's
-     * exact rule), write the parent's dst slot, resume after the call. */
-    auto leave_call = [&](EvalValue res) {
-        VmCallRec dead = act.pop_window();
-        ctx.captures = dead.caller_captures;
-        chunk = dead.ret_chunk;
-        pc = dead.ret_pc;
-        if (dead.cache_key && res.get_type()->t < Type::t_str)
-            ctx.frame->ensure_pure_cache().emplace(
-                std::move(*dead.cache_key), res);
-        ctx.frame->at(dead.dst).put(std::move(res));
-    };
 
     /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
      * RuntimeException thrown by any op (a runtime-library error, a fallback
@@ -2727,40 +2801,20 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 static_cast<const Chunk *>(fo.func->vm_chunk);
 
             if (cck) {
-                /* IN-VM call. CachedCallV first consults the CALLER's
-                 * per-frame pure cache (vm_cached_call's exact flow: key =
-                 * {desc, arg values}; a hit is returned by copy; a miss
-                 * runs the call carrying the key, stored on pop). The key
-                 * rides the loop-scope pending_key so the dispatches below
-                 * exit no destructor scope (the clang indirect-goto rule). */
+                /* IN-VM call. CachedCallV first probes the CALLER's
+                 * per-frame pure cache (vm_cached_call's exact flow); the
+                 * miss key rides the loop-scope pending_key so no dispatch
+                 * exits a destructor scope (the clang indirect-goto rule). */
                 pending_key.reset();
-                bool cache_hit = false;
                 if (in->op == OpCode::CachedCallV && ctx.frame
-                        && g_pure_cache_enabled) {
-                    std::vector<EvalValue> vals;
-                    const size_t n = static_cast<size_t>(in->b.lit);
-                    vals.reserve(n);
-                    const LValue *ap0 = n ? &ctx.frame->at(in->a.lit)
-                                          : nullptr;
-                    for (size_t i = 0; i < n; i++)
-                        vals.push_back(ap0[i].get());
-                    PureCacheKey key{ fo.func, std::move(vals) };
-                    PureCache &cache = ctx.frame->ensure_pure_cache();
-                    auto it = cache.find(key);
-                    if (it != cache.end()) {
-                        ctx.frame->at(in->target).put(EvalValue(it->second));
-                        pc++;
-                        cache_hit = true;
-                    } else {
-                        pending_key =
-                            std::make_unique<PureCacheKey>(std::move(key));
-                    }
-                }
-                if (cache_hit)
+                        && g_pure_cache_enabled
+                        && vm_cache_probe(ctx, in, fo.func, pending_key)) {
+                    pc++;
                     VM_NEXT;
-                enter_call(fo, cck, in->a.lit,
-                           static_cast<size_t>(in->b.lit), in->target,
-                           std::move(pending_key));
+                }
+                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a.lit,
+                              static_cast<size_t>(in->b.lit), in->target,
+                              std::move(pending_key));
                 VM_NEXT;
             }
 
@@ -2808,9 +2862,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             if (const Chunk *cck =
                     static_cast<const Chunk *>(fo.func->vm_chunk)) {
-                enter_call(fo, cck, in->a.lit,
-                           static_cast<size_t>(in->b.lit), in->target,
-                           nullptr);
+                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a.lit,
+                              static_cast<size_t>(in->b.lit), in->target,
+                              nullptr);
                 VM_NEXT;
             }
 
@@ -3042,7 +3096,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 ctx.flow->type = FlowState::ret;
                 return;
             }
-            leave_call(ctx.frame->at(in->a.slot).get());
+            vm_leave_call(act, ctx, chunk, pc,
+                          ctx.frame->at(in->a.slot).get());
             VM_NEXT;
         }
 
@@ -3516,7 +3571,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* End of a fall-through body (an implicit `return none`). */
             if (cur_rec().boundary)
                 return;
-            leave_call(EvalValue());
+            vm_leave_call(act, ctx, chunk, pc, EvalValue());
             VM_NEXT;
 #ifndef ML_CGOTO
         case OpCode::OpCount_:      /* sentinel - never emitted (switch
@@ -3545,26 +3600,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         /* Inc 4: a library error thrown FROM an inlined op flushes its
          * virtual frames here (the raise happened in C++, not vm_raise). */
         vm_flush_inline(*chunk, pc, e);
-        std::unique_ptr<RuntimeException> ex(e.clone());
-
-        for (;;) {
-            VmCallRec &cur = cur_rec();
-            if (vm_dispatch_exc(act, cur, pc)) {
-                cur.exc = std::move(ex);       /* like saved_ex */
-                goto vm_resume;    /* re-enter at the CatchTest chain (the
-                                    * handler frame IS the current frame:
-                                    * `chunk` is already right) */
-            }
-            if (cur.boundary) {
-                g_vm_exc_pending = std::move(ex);
-                return;
-            }
-            vm_capture_rec_frame(*ex, cur);
-            VmCallRec dead = act.pop_window();
-            ctx.captures = dead.caller_captures;
-            chunk = dead.ret_chunk;
-            pc = dead.ret_pc - 1;              /* the call op */
-            vm_flush_inline(*chunk, pc, *ex);
-        }
+        if (vm_unwind_walk(act, ctx, chunk, pc,
+                           std::unique_ptr<RuntimeException>(e.clone())))
+            goto vm_resume;    /* dispatched (chunk/pc set at the handler) */
+        return;                /* signal set; do_func_call captures + goes on */
     }
 }
