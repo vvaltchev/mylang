@@ -195,6 +195,22 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**TYPED TERNARY (M8 + codegen).** `specialize_children` (the M8
+specializer's recursion, inferencer.cpp) descends into `TernaryExpr` /
+`CoalesceExpr` - previously ABSENT, so a ternary's cond/arms were never
+M8-specialized and BOTH engines ran them boxed (the recursion-unroll's
+guard ternaries - fib's whole body - were the visible cost). And a
+th==i/f `TernaryExpr` VALUE lowers natively (`try_typed_ternary`,
+codegen.cpp): a typed-compare condition emits one
+`JumpUnless{Int,Float}Cmp` to the else arm (any other condition boxes
+to `JumpUnlessTrueV`, arms still typed), both arms compile through the
+typed compilers into a common dst via MoveV/LoadImm, and the peephole's
+E1 join-move rule retargets the movs away - so fib$0's unrolled body is
+FULLY native (50 instrs of i.bin/i.jmp.ifnot/call.cached; zero boxed
+ops). Measured (full-suite interleaved A/B): 09_fib_recursive
+0.006->0.004s (**0.67x**), suite VM-wall geomean 0.990 (broad -3-9%
+on the arith/call benches).
+
 **THE POST-CODEGEN PEEPHOLE (`peephole_chunk`, codegen.cpp; design +
 field tables in plans/vm-peephole.md).** Runs in `codegen_chunk` BEFORE
 `extract_locs` - the load-bearing ordering: the loc/`inline_ctxs` side

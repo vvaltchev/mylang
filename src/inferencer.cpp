@@ -4351,6 +4351,20 @@ static void specialize_children(Construct *n)
         if (r->elem) r->elem = specialize(std::move(r->elem));
         return;
     }
+    if (auto *te = dynamic_cast<TernaryExpr *>(n)) {
+        /* Previously ABSENT - a ternary's cond/arms were never M8-specialized
+         * (both engines ran them boxed; the recursion-unroll's guard ternaries
+         * were the visible cost). Same for `??` below. */
+        te->condExpr = specialize(std::move(te->condExpr));
+        te->thenExpr = specialize(std::move(te->thenExpr));
+        te->elseExpr = specialize(std::move(te->elseExpr));
+        return;
+    }
+    if (auto *co = dynamic_cast<CoalesceExpr *>(n)) {
+        co->lhs = specialize(std::move(co->lhs));
+        co->rhs = specialize(std::move(co->rhs));
+        return;
+    }
     if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
         /* A base template's body is a monomorphization shell - never
          * specialized (see FuncDeclStmt::is_template): it is cloned per concrete

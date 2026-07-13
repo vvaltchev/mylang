@@ -3426,10 +3426,132 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * A TYPED ternary VALUE `cond ? a : b` with th==i/f (F-class follow-up
+     * from plans/vm-peephole.md): a typed-compare condition emits ONE native
+     * JumpUnless{Int,Float}Cmp to the else arm (any other condition boxes to
+     * a JumpUnlessTrueV - same shape as the boxed ternary's, arms still
+     * typed); each arm compiles through the TYPED compilers and lands in a
+     * common dst (MoveV/LoadImm - the E1 peephole then retargets the arm
+     * producers into dst and deletes the moves). This is what turns the
+     * recursion-unroll's guard ternaries (fib's whole body) from boxed
+     * bin.v/cmp.v/jmp.ifnot.v chains into IntBin/JumpUnlessIntCmp.
+     */
+    bool try_typed_ternary(const Construct *e, Operand &out,
+                           std::vector<Instr> &ops, bool flt)
+    {
+        const TernaryExpr *t = dynamic_cast<const TernaryExpr *>(e);
+        if (!t)
+            return false;
+
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+        const int dst = alloc_temp();       /* reserved BELOW the scratch */
+        const int scratch = next_temp;
+
+        /* The branch-to-else: a typed comparison natively, else boxed
+         * truthiness (JumpUnlessTrueV, the boxed ternary's own shape). */
+        size_t cj = ops.size();
+        bool emitted = false;
+        if (const TypedScalarExpr *c =
+                dynamic_cast<const TypedScalarExpr *>(t->condExpr.get())) {
+            if (c->cat == TypedScalarExpr::Cat::cmp) {
+                Operand a, b;
+                Op cmp;
+                if (compile_int_cond(t->condExpr.get(), ops, a, cmp, b)) {
+                    Instr in;
+                    in.op = OpCode::JumpUnlessIntCmp;
+                    in.aop = cmp; in.a = a; in.b = b;
+                    cj = ops.size();
+                    ops.push_back(in);
+                    emitted = true;
+                } else {
+                    ops.resize(mark);
+                    next_temp = scratch;
+                    if (compile_float_cond(t->condExpr.get(), ops,
+                                           a, cmp, b)) {
+                        Instr in;
+                        in.op = OpCode::JumpUnlessFloatCmp;
+                        in.aop = cmp; in.a = a; in.b = b;
+                        cj = ops.size();
+                        ops.push_back(in);
+                        emitted = true;
+                    } else {
+                        ops.resize(mark);
+                        next_temp = scratch;
+                    }
+                }
+            }
+        }
+        if (!emitted) {
+            int cslot;
+            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops)) {
+                ops.resize(mark);
+                next_temp = save_top;
+                return false;
+            }
+            Instr in;
+            in.op = OpCode::JumpUnlessTrueV;
+            in.target2 = cslot;
+            cj = ops.size();
+            ops.push_back(in);
+        }
+        next_temp = scratch;
+
+        /* dst = <operand>: a lit -> LoadImm, a slot -> MoveV (E1 retargets). */
+        const auto store_arm = [&](const Operand &o) {
+            Instr in;
+            if (o.is_lit) {
+                in.op = flt ? OpCode::LoadImmFloat : OpCode::LoadImmInt;
+                in.target = dst;
+                in.a = o;
+            } else {
+                in.op = OpCode::MoveV;
+                in.target = dst;
+                in.target2 = static_cast<int>(o.slot);
+            }
+            ops.push_back(in);
+        };
+
+        Operand a1;
+        if (!(flt ? compile_float_expr(t->thenExpr.get(), a1, ops)
+                  : compile_int_expr(t->thenExpr.get(), a1, ops))) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+        store_arm(a1);
+        const size_t jmp_i = ops.size();
+        {
+            Instr j;
+            j.op = OpCode::Jump;
+            ops.push_back(j);
+        }
+        next_temp = scratch;
+
+        ops[cj].target = static_cast<int>(ops.size());     /* else arm */
+
+        Operand a2;
+        if (!(flt ? compile_float_expr(t->elseExpr.get(), a2, ops)
+                  : compile_int_expr(t->elseExpr.get(), a2, ops))) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+        store_arm(a2);
+        next_temp = scratch;
+        ops[jmp_i].target = static_cast<int>(ops.size());  /* merge */
+        out = slot_op(dst);
+        return true;
+    }
+
     bool compile_int_expr(const Construct *e, Operand &out,
                           std::vector<Instr> &ops)
     {
         if (as_int_operand(e, out))
+            return true;
+
+        if (e->th == TypeHint::i && try_typed_ternary(e, out, ops, false))
             return true;
 
         if (e->th == TypeHint::i)
@@ -4336,6 +4458,9 @@ struct Codegen {
                             std::vector<Instr> &ops)
     {
         if (as_float_operand(e, out))
+            return true;
+
+        if (e->th == TypeHint::f && try_typed_ternary(e, out, ops, true))
             return true;
 
         if (e->th == TypeHint::f)

@@ -139,8 +139,21 @@ and the typed-ternary rewrite build on).
 
 ## Follow-ups recorded
 
-- TYPED TERNARY VALUE lowering (`cond ? a : b` with th==i/f arms) in
-  compile_int_expr/compile_float_expr — fib's unrolled body is ~20
-  boxed ops that would become IntBin/JumpUnlessIntCmp.
+- TYPED TERNARY VALUE lowering — **DONE (2026-07-17)**, two layers:
+  1. **The M8 walker gap (both engines):** `specialize_children`
+     (inferencer.cpp) had NO TernaryExpr/CoalesceExpr case, so a
+     ternary's cond/arms were NEVER M8-specialized — the tree-walker
+     ran them boxed too (the recursion-unroll's guard ternaries, i.e.
+     fib's whole body, were the visible cost). Fixed: both now recurse.
+  2. **`try_typed_ternary` (codegen.cpp):** a th==i/f TernaryExpr in
+     the typed compilers emits a native JumpUnless{Int,Float}Cmp to the
+     else arm (a non-compare condition boxes to JumpUnlessTrueV, arms
+     still typed) and both arms produce into a common dst via
+     MoveV/LoadImm — which THIS pass's E1 join-move rule then retargets
+     away. fib$0's chunk: 68 (pre-peephole) → 56 (peephole) → **50,
+     fully native** (i.bin/i.jmp.ifnot/call.cached, zero boxed ops,
+     zero moves). MEASURED (full-suite interleaved A/B vs 28108d2):
+     09_fib_recursive 0.006→0.004s (**0.67x**), suite VM-wall geomean
+     0.990, broad −3-9% on arith/call benches; my/py 4.46-4.47x.
 - E4 fusion candidates (post-infra): cmp+branch over boxed bools,
   LoadImm+IntBin RI forms the specializer misses.
