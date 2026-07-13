@@ -208,6 +208,13 @@ next call immediately overwrites (param slots), which today's model cannot.
 
 ## Phases (each lands -rt green + differential + A/B measured)
 
+> Status: **A ✅ DONE** (LoopBackEdge deleted - opcode/handler/disasm/test
+> counters; the VM's only FlowState use left is ReturnV's hand-off).
+> **B ✅ DONE** (Frame::point_at view mode + VmActivation owning the slot
+> stack; main's frame lives on it and every top-level builtin/op accesses
+> slots through the view window - differential green on all lanes, dispatch
+> benches neutral, geomean 0.973 on the probe set). C is next.
+
 - **A. Dead-code prep**: delete LoopBackEdge (opcode/handler/disasm/test
   counter; static_asserts keep the table honest); move the ReturnV comment
   to the new semantics. Zero-risk, isolates the mechanical enum churn.

@@ -686,6 +686,21 @@ struct ExecGuard {
     ~ExecGuard() { g_vm_executing = prev; }
 };
 
+/*
+ * A VM ACTIVATION (plans/vm-native-call-stack.md): one run of VM frames
+ * entered from C++. Phase B scope: it owns the SLOT STACK (main's frame
+ * window lives here instead of a standalone Frame) and the VIEW Frame the
+ * dispatch loop + builtins access slots through (Frame::point_at - a
+ * non-owning window; repointing per frame is two stores). Later phases add
+ * the call records + per-frame handler/iterator watermarks that turn
+ * CallV/ReturnV into in-VM pushes/pops.
+ */
+struct VmActivation {
+    std::vector<LValue> slots;   /* THE stack; sized once in Phase B (main
+                                  * only), grown at call boundaries later */
+    Frame view_frame;            /* the loop's window into `slots` */
+};
+
 VmProgram
 vm_compile(const Construct *root_c)
 {
@@ -743,14 +758,17 @@ vm_run(VmProgram &prog)
     ExecGuard exec_guard;
     EvalContext ctx(nullptr, /*const_ctx=*/false);
 
-    /* The frame holds the resolved locals plus the register machine's scratch
-     * temps [slot_count, slot_count + n_temps); the extra temps never collide
-     * with the named slots. */
-    std::unique_ptr<Frame> root_frame;
-    if (prog.root_slot_count || prog.root.n_temps) {
-        root_frame = std::make_unique<Frame>();
-        root_frame->init(prog.root_slot_count + prog.root.n_temps);
-        ctx.frame = root_frame.get();
+    /* Main's frame - the resolved locals plus the register machine's scratch
+     * temps [slot_count, slot_count + n_temps) - lives on the ACTIVATION's
+     * slot stack, accessed through the non-owning view Frame (Phase B of the
+     * native call stack: proves the window/view model against every builtin
+     * and helper before the call protocol changes). */
+    VmActivation act;
+    const int main_slots = prog.root_slot_count + prog.root.n_temps;
+    if (main_slots) {
+        act.slots.resize(main_slots);
+        act.view_frame.point_at(act.slots.data(), main_slots);
+        ctx.frame = &act.view_frame;
     }
 
     std::unique_ptr<GlobalFuncTable> gtable;

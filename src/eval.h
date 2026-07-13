@@ -116,6 +116,22 @@ struct Frame {
         return *pure_cache;
     }
 
+    /*
+     * VIEW mode (the VM activation, plans/vm-native-call-stack.md): point
+     * this frame at EXTERNALLY-OWNED slot storage (a window of the
+     * activation's slot stack). The frame owns nothing in this mode - the
+     * dtor destroys only placement-built inline slots (none here; the
+     * ML_CHECK proves init() was never called on it) - so repointing per
+     * VM frame is two stores. `size` keeps the ML_VM_CHECK slot-bounds
+     * guard exact per window.
+     */
+    void point_at(LValue *s, int n)
+    {
+        ML_CHECK(inline_count == 0 && heap_buf.empty());
+        slots = s;
+        size = n;
+    }
+
     /* Make `slots` point at storage holding exactly `frame_size` slots. */
     /*
      * Bounds-checked slot access. Under VM hardening (debug + CI-release) a
