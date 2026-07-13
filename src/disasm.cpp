@@ -399,7 +399,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "jmp          L" << in.target;
             break;
         case OpCode::Throw:
-            row << "throw        " << D(in.a.slot);
+            row << "throw        " << D(in.a_slot());
             break;
         case OpCode::PushHandler:
             row << "try.push     catch=L" << in.target;
@@ -409,10 +409,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::CatchTest: {
             row << "catch.test   ";
-            if (in.a.lit < 0)
+            if (in.a_lit() < 0)
                 row << "(any)";
             else {
-                const auto &names = chunk.catch_types[in.a.lit];
+                const auto &names = chunk.catch_types[in.a_lit()];
                 for (size_t i = 0; i < names.size(); i++)
                     row << (i ? "|" : "") << names[i];
             }
@@ -439,8 +439,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 
         case OpCode::IntBin:
             row << "i.bin        " << D(in.target) << " = "
-                << RI(in.a, false) << " " << opsym(in.aop) << " "
-                << RI(in.b, false);
+                << RI(in.a(), false) << " " << opsym(in.aop) << " "
+                << RI(in.b(), false);
             break;
         /* B1/B2 specialized arithmetic: same 3-address render, the operator
          * baked in the opcode (the shape is visible from the operands). */
@@ -454,78 +454,78 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::IntShrRR: case OpCode::IntShrRI:
         case OpCode::IntModRI:
             row << "i.bin        " << D(in.target) << " = "
-                << RI(in.a, false) << " " << spec_arith_sym(in.op) << " "
-                << RI(in.b, false);
+                << RI(in.a(), false) << " " << spec_arith_sym(in.op) << " "
+                << RI(in.b(), false);
             break;
         case OpCode::FloatAddRR: case OpCode::FloatAddRI:
         case OpCode::FloatSubRR: case OpCode::FloatSubRI:
         case OpCode::FloatMulRR: case OpCode::FloatMulRI:
             row << "f.bin        " << D(in.target) << " = "
-                << RI(in.a, true) << " " << spec_arith_sym(in.op) << " "
-                << RI(in.b, true);
+                << RI(in.a(), true) << " " << spec_arith_sym(in.op) << " "
+                << RI(in.b(), true);
             break;
         case OpCode::JumpUnlessIntCmp:
-            row << "i.jmp.ifnot  " << RI(in.a, false) << " "
-                << opsym(in.aop) << " " << RI(in.b, false)
+            row << "i.jmp.ifnot  " << RI(in.a(), false) << " "
+                << opsym(in.aop) << " " << RI(in.b(), false)
                 << ", L" << in.target;
             break;
         case OpCode::FloatBin:
             row << "f.bin        " << D(in.target) << " = "
-                << RI(in.a, true) << " " << opsym(in.aop) << " "
-                << RI(in.b, true);
+                << RI(in.a(), true) << " " << opsym(in.aop) << " "
+                << RI(in.b(), true);
             break;
         case OpCode::JumpUnlessFloatCmp:
-            row << "f.jmp.ifnot  " << RI(in.a, true) << " "
-                << opsym(in.aop) << " " << RI(in.b, true)
+            row << "f.jmp.ifnot  " << RI(in.a(), true) << " "
+                << opsym(in.aop) << " " << RI(in.b(), true)
                 << ", L" << in.target;
             break;
         case OpCode::ForLoopStep:
             row << "for.step     " << D(in.target2) << " "
                 << (in.aop == Op::lt || in.aop == Op::le ? "+=" : "-=") << " "
-                << RI(in.b, false) << ", if " << D(in.target2) << " "
-                << opsym(in.aop) << " " << RI(in.a, false)
+                << RI(in.b(), false) << ", if " << D(in.target2) << " "
+                << opsym(in.aop) << " " << RI(in.a(), false)
                 << " -> L" << in.target;
             break;
         case OpCode::LoadElemInt:
             row << "load.elem.i  " << D(in.target) << " = " << D(in.target2)
-                << "[" << RI(in.a, false) << "]";
+                << "[" << RI(in.a(), false) << "]";
             break;
         case OpCode::LoadElemFloat:
             row << "load.elem.f  " << D(in.target) << " = " << D(in.target2)
-                << "[" << RI(in.a, false) << "]";
+                << "[" << RI(in.a(), false) << "]";
             break;
         case OpCode::LoadElemBool:
             row << "load.elem.b  " << D(in.target) << " = " << D(in.target2)
-                << "[" << RI(in.a, false) << "]   ; bool";
+                << "[" << RI(in.a(), false) << "]   ; bool";
             break;
         case OpCode::LoadElemValue:
             row << "load.elem.v  " << D(in.target) << " = " << D(in.target2)
-                << "[" << RI(in.a, false) << "]";
+                << "[" << RI(in.a(), false) << "]";
             break;
         case OpCode::LoadStructFieldInt:
         case OpCode::LoadStructFieldFloat:
             row << "load.sfield" << (in.op == OpCode::LoadStructFieldInt
                                         ? "i " : "f ")
                 << D(in.target) << " = " << D(in.target2) << "["
-                << RI(in.a, false) << "].fld" << in.b.lit;
+                << RI(in.a(), false) << "].fld" << in.b_lit();
             break;
         case OpCode::LoadStructElemV:
             row << "load.selem   " << D(in.target) << " = " << D(in.target2)
-                << "[" << RI(in.a, false) << "]   ; struct";
+                << "[" << RI(in.a(), false) << "]   ; struct";
             break;
         case OpCode::DictIterInit:
             row << "dict.iter.i  I" << in.target << " <- " << D(in.target2);
             break;
         case OpCode::DictIterNext:
-            row << "dict.iter.n  I" << in.target2 << " k=" << in.a.slot
-                << " v=" << in.b.slot << " -> L" << in.target;
+            row << "dict.iter.n  I" << in.target2 << " k=" << in.a_slot()
+                << " v=" << in.b_slot() << " -> L" << in.target;
             break;
         case OpCode::ForeachDynInit: {
-            const std::vector<int32_t> &tg = chunk.unpack_targets[in.b.lit];
+            const std::vector<int32_t> &tg = chunk.unpack_targets[in.b_lit()];
             row << "fe.dyn.init  I" << in.target << " <- " << D(in.target2)
                 << "  ; array|dict runtime dispatch, "
-                << (in.a.lit & 0xff) << "-var"
-                << ((in.a.lit >> 8) ? ", indexed" : "") << ", [";
+                << (in.a_lit() & 0xff) << "-var"
+                << ((in.a_lit() >> 8) ? ", indexed" : "") << ", [";
             for (size_t i = 0; i < tg.size(); i++) {
                 if (i) row << ", ";
                 if (tg[i] < 0) row << "_"; else row << "r" << tg[i];
@@ -542,14 +542,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << (in.op == OpCode::UnpackElemInt   ? "unpack.elem.i"
                     : in.op == OpCode::UnpackElemFloat ? "unpack.elem.f"
                                                        : "unpack.elem.v")
-                << " r" << in.target << ".." << (in.target + in.b.lit - 1)
-                << " = " << D(in.target2) << "[" << RI(in.a, false)
-                << "] (" << in.b.lit << ")";
+                << " r" << in.target << ".." << (in.target + in.b_lit() - 1)
+                << " = " << D(in.target2) << "[" << RI(in.a(), false)
+                << "] (" << in.b_lit() << ")";
             break;
         case OpCode::UnpackElemTargets: {
             row << "unpack.elem.t targets#" << in.target << " = "
-                << D(in.target2) << "[" << RI(in.a, false) << "] ("
-                << in.b.lit << ") [";
+                << D(in.target2) << "[" << RI(in.a(), false) << "] ("
+                << in.b_lit() << ") [";
             const std::vector<int32_t> &tg = chunk.unpack_targets[in.target];
             for (size_t k = 0; k < tg.size(); k++)
                 row << (k ? " " : "") << (tg[k] < 0 ? "_" : ("r" +
@@ -564,11 +564,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             /* AST-free: a member's key is const-pool[a.lit] (an immediate), a
              * subscript's key is a temp slot. `node` is null (loc table). */
             row << mn << D(in.target) << " = " << D(in.target2) << "[";
-            if (in.a.is_lit)
-                row << chunk.consts[in.a.lit].get_type()->to_string(
-                           chunk.consts[in.a.lit]);
+            if (in.a_is_lit())
+                row << chunk.consts[in.a_lit()].get_type()->to_string(
+                           chunk.consts[in.a_lit()]);
             else
-                row << RI(in.a, false);
+                row << RI(in.a(), false);
             row << "]";
             break;
         }
@@ -582,17 +582,17 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::LoadStrChar:
             row << "load.strchar " << D(in.target) << " = "
-                << D(in.target2) << "[" << RI(in.a, false) << "]";
+                << D(in.target2) << "[" << RI(in.a(), false) << "]";
             break;
         case OpCode::StoreElemInt:
             row << "store.elem.i " << bref(in.target, in.target2) << "["
-                << RI(in.a, false) << "] " << store_op(in.aop) << " "
-                << RI(in.b, false);
+                << RI(in.a(), false) << "] " << store_op(in.aop) << " "
+                << RI(in.b(), false);
             break;
         case OpCode::StoreElemFloat:
             row << "store.elem.f " << bref(in.target, in.target2) << "["
-                << RI(in.a, false) << "] " << store_op(in.aop) << " "
-                << RI(in.b, true);
+                << RI(in.a(), false) << "] " << store_op(in.aop) << " "
+                << RI(in.b(), true);
             break;
         case OpCode::DictStore: {
             /* aop is the Expr14 op (assign/addeq/...), not the arith form. */
@@ -602,7 +602,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                             in.aop == Op::muleq  ? "*=" :
                             in.aop == Op::diveq  ? "/=" : "%=";
             row << "dict.store   " << bref(in.target, in.target2) << "["
-                << RI(in.a, false) << "] " << o << " " << RI(in.b, false);
+                << RI(in.a(), false) << "] " << o << " " << RI(in.b(), false);
             break;
         }
         case OpCode::StoreMemberV: {
@@ -613,9 +613,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                             in.aop == Op::muleq  ? "*=" :
                             in.aop == Op::diveq  ? "/=" : "%=";
             row << "member.store " << bref(in.target, in.target2) << "."
-                << chunk.member_keys[in.a.lit].memId.get_type()
-                       ->to_string(chunk.member_keys[in.a.lit].memId)
-                << " " << o << " " << RI(in.b, false);
+                << chunk.member_keys[in.a_lit()].memId.get_type()
+                       ->to_string(chunk.member_keys[in.a_lit()].memId)
+                << " " << o << " " << RI(in.b(), false);
             break;
         }
         case OpCode::StoreElemValue: {
@@ -625,7 +625,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                             in.aop == Op::muleq  ? "*=" :
                             in.aop == Op::diveq  ? "/=" : "%=";
             row << "store.elem.v " << bref(in.target, in.target2) << "["
-                << RI(in.a, false) << "] " << o << " " << RI(in.b, false);
+                << RI(in.a(), false) << "] " << o << " " << RI(in.b(), false);
             break;
         }
         case OpCode::StoreElem2V: {
@@ -634,22 +634,22 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                             in.aop == Op::subeq  ? "-=" :
                             in.aop == Op::muleq  ? "*=" :
                             in.aop == Op::diveq  ? "/=" : "%=";
-            row << "store.elem2 " << D(in.target2) << "[" << RI(in.a, false)
-                << "][" << RI(in.b, false) << "] " << o << " " << D(in.target);
+            row << "store.elem2 " << D(in.target2) << "[" << RI(in.a(), false)
+                << "][" << RI(in.b(), false) << "] " << o << " " << D(in.target);
             break;
         }
         case OpCode::StoreElemChainV:
             row << "store.chain " << D(in.target2) << "[..x"
-                << chunk.chain_locs[in.a.slot].size()
-                << " @" << D(in.b.lit) << "] " << store_op(in.aop) << " "
+                << chunk.chain_locs[in.a_dual_lo()].size()
+                << " @" << D(in.b_lit()) << "] " << store_op(in.aop) << " "
                 << D(in.target);
             break;
         case OpCode::StoreLValueChainV: {
             static const char *bk[] = {"loc", "gbl", "cap"};
-            row << "store.lvchain " << bk[in.a.lit & 3] << "[" << in.target2
+            row << "store.lvchain " << bk[in.a_dual_hi() & 3] << "[" << in.target2
                 << "]";
             const std::vector<Chunk::ChainStep> &st =
-                chunk.chain_steps[in.a.slot];
+                chunk.chain_steps[in.a_dual_lo()];
             for (const Chunk::ChainStep &s : st)
                 row << (s.is_member ? ".<m#" : "[r")
                     << s.operand << (s.is_member ? ">" : "]");
@@ -658,19 +658,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         }
         case OpCode::IncDecCheckedV:
             row << "incdec.chk   " << D(in.target)
-                << (in.a.lit ? " ++" : " --") << "   ; dyn, int/float-checked";
+                << (in.a_lit() ? " ++" : " --") << "   ; dyn, int/float-checked";
             break;
         case OpCode::IncDecElemCheckedV: {
             static const char *bk[] = {"loc", "gbl", "cap"};
             row << "incdec.elem  " << bk[in.target & 3] << "[" << in.target2
-                << "][" << RI(in.a, false) << "]"
+                << "][" << RI(in.a(), false) << "]"
                 << (in.aop == Op::plus ? " ++" : " --")
                 << "   ; dyn elem, int/float-checked";
             break;
         }
         case OpCode::IncDecMemberCheckedV: {
             static const char *bk[] = {"loc", "gbl", "cap"};
-            const Chunk::IncDecSite &is = chunk.incdec_sites[in.b.lit];
+            const Chunk::IncDecSite &is = chunk.incdec_sites[in.b_lit()];
             row << "incdec.membr " << bk[in.target & 3] << "[" << in.target2
                 << "]." << (is.memUid ? is.memUid->val : "<member>")
                 << (in.aop == Op::plus ? " ++" : " --")
@@ -679,9 +679,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         }
         case OpCode::IncDecChainV: {
             static const char *bk[] = {"loc", "gbl", "cap", "val"};
-            const Chunk::IncDecChain &ic = chunk.incdec_chains[in.b.lit];
+            const Chunk::IncDecChain &ic = chunk.incdec_chains[in.b_lit()];
             row << "incdec.chain " << D(in.target) << " = "
-                << bk[in.a.lit & 3] << "[" << in.target2 << "]";
+                << bk[in.a_lit() & 3] << "[" << in.target2 << "]";
             for (const Chunk::ChainStep &st : ic.steps)
                 row << (st.is_member ? ".<m#" : "[r")
                     << st.operand << (st.is_member ? ">" : "]");
@@ -701,20 +701,20 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 else
                     row << "r" << tg[i];
             }
-            row << " = " << RI(in.a, false);
+            row << " = " << RI(in.a(), false);
             break;
         }
         case OpCode::CallBuiltinV:
             row << "call.blt.v   " << D(in.target) << " = "
                 << builtin_call_name(chunk, in.target2)
-                << arglist(chunk, in.a.lit, in.b.lit);
+                << arglist(chunk, in.a_lit(), in.b_lit());
             break;
         case OpCode::AppendV:
             /* D1: same shape as call.blt.lv, the append fast op */
             row << "append.v     " << D(in.target) << " = "
-                << builtin_call_name(chunk, in.a.slot)
-                << "(" << lval_ref(in.a.lit, in.target2) << ", "
-                << D(static_cast<int_type>(in.b.lit)) << ")";
+                << builtin_call_name(chunk, in.a_dual_lo())
+                << "(" << lval_ref(in.a_dual_hi(), in.target2) << ", "
+                << D(static_cast<int_type>(in.b_lit())) << ")";
             break;
         case OpCode::MathFnV: {
             /* F1: the typed math-builtin call (selector in target2) */
@@ -727,9 +727,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "math.v       " << D(in.target) << " = "
                 << (fi < sizeof(mf_names) / sizeof(mf_names[0])
                         ? mf_names[fi] : "?")
-                << "(" << RI(in.a, false);
+                << "(" << RI(in.a(), false);
             if (static_cast<MathFn>(in.target2) == MathFn::pow_)
-                row << ", " << RI(in.b, false);
+                row << ", " << RI(in.b(), false);
             row << ")";
             break;
         }
@@ -737,15 +737,15 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             /* AST-free: name + arg count from the builtin_calls pool (a.slot).
              * A valid `b` (is_lit) is a rest-run base (rest-native) - show its
              * values; `b` unset = no value args (pop/intptr). */
-            const int bcidx = in.a.slot;
+            const int bcidx = in.a_dual_lo();
             row << "call.blt.lv  " << D(in.target) << " = "
                 << builtin_call_name(chunk, bcidx)
-                << "(" << lval_ref(in.a.lit, in.target2);
-            if (in.b.is_lit) {
+                << "(" << lval_ref(in.a_dual_hi(), in.target2);
+            if (in.b_is_lit()) {
                 const int nrest = static_cast<int>(
                     chunk.builtin_calls[bcidx].args.size()) - 1;
                 for (int i = 0; i < nrest; i++)
-                    row << ", " << reg(chunk, in.b.lit + i);
+                    row << ", " << reg(chunk, in.b_lit() + i);
             }
             row << ")";
             break;
@@ -753,41 +753,41 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::EmplaceStruct: {
             /* AST-free: the def / name / field count come from the
              * emplace_sites pool (`a` packs kind | idx << 2). */
-            const Chunk::EmplaceSite &es = chunk.emplace_sites[in.a.lit >> 2];
+            const Chunk::EmplaceSite &es = chunk.emplace_sites[in.a_lit() >> 2];
             const int nf = static_cast<int>(es.field_locs.size());
             row << "emplace      " << D(in.target) << " = "
                 << (es.bname ? es.bname->val : "append") << "("
-                << lval_ref(in.a.lit & 3, in.target2) << " <- "
+                << lval_ref(in.a_lit() & 3, in.target2) << " <- "
                 << std::string(es.def->name->val)
-                << arglist(chunk, in.b.lit, nf) << ")";
+                << arglist(chunk, in.b_lit(), nf) << ")";
             break;
         }
         case OpCode::CallBuiltinLVElem: {
             /* AST-free: name/arg count from the pool (a.slot). `b` = the run
              * base: run[0] = the index, run[1..] = the value args (append 1,
              * pop 0). */
-            const int bcidx = in.a.slot;
+            const int bcidx = in.a_dual_lo();
             const int nvals =
                 static_cast<int>(chunk.builtin_calls[bcidx].args.size()) - 1;
             row << "call.blt.lve " << D(in.target) << " = "
                 << builtin_call_name(chunk, bcidx)
-                << "(" << lval_ref(in.a.lit, in.target2) << "["
-                << reg(chunk, in.b.lit) << "]";
+                << "(" << lval_ref(in.a_dual_hi(), in.target2) << "["
+                << reg(chunk, in.b_lit()) << "]";
             for (int i = 0; i < nvals; i++)
-                row << ", " << reg(chunk, in.b.lit + 1 + i);
+                row << ", " << reg(chunk, in.b_lit() + 1 + i);
             row << ")";
             break;
         }
         case OpCode::CallBuiltinLVMember: {
-            const int bcidx = in.a.slot;
+            const int bcidx = in.a_dual_lo();
             const Chunk::BuiltinCall &bc = chunk.builtin_calls[bcidx];
             const int nvals = static_cast<int>(bc.args.size()) - 1;
             row << "call.blt.lvm " << D(in.target) << " = "
                 << builtin_call_name(chunk, bcidx) << "("
-                << lval_ref(in.a.lit, in.target2) << "."
+                << lval_ref(in.a_dual_hi(), in.target2) << "."
                 << (bc.member ? bc.member->val : "?");
             for (int i = 0; i < nvals; i++)
-                row << ", " << reg(chunk, in.b.lit + i);
+                row << ", " << reg(chunk, in.b_lit() + i);
             row << ")";
             break;
         }
@@ -795,50 +795,50 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             /* AST-free: the callee is a global slot (its name lives in gfuncs,
              * not the chunk), so show g<n>. */
             row << "call.v       " << D(in.target) << " = g" << in.target2
-                << arglist(chunk, in.a.lit, in.b.lit);
+                << arglist(chunk, in.a_lit(), in.b_lit());
             break;
         case OpCode::CachedCallV:
             row << "call.cached  " << D(in.target) << " = g" << in.target2
-                << arglist(chunk, in.a.lit, in.b.lit);
+                << arglist(chunk, in.a_lit(), in.b_lit());
             break;
         case OpCode::CallValueV:
             /* the callee is a func VALUE in a temp (target2), not a slot. */
             row << "call.val     " << D(in.target) << " = " << D(in.target2)
-                << arglist(chunk, in.a.lit, in.b.lit);
+                << arglist(chunk, in.a_lit(), in.b_lit());
             break;
         case OpCode::CallValueGenericV:
             /* generic dyn-callee dispatch, AST-free: args pre-evaluated in
              * the run (arg0 lvalue-preserving), carets pooled. */
             row << "call.val.dyn " << D(in.target) << " = " << D(in.target2)
-                << arglist(chunk, in.a.lit,
-                           static_cast<int>(in.b.lit & 0xfff))
-                << "   ; runtime dispatch, site #" << (in.b.lit >> 12);
+                << arglist(chunk, in.a_lit(),
+                           static_cast<int>(in.b_lit() & 0xfff))
+                << "   ; runtime dispatch, site #" << (in.b_lit() >> 12);
             break;
         case OpCode::CheckCallableV:
-            row << "check.call   " << RI(in.a, false)
+            row << "check.call   " << RI(in.a(), false)
                 << "  ; throw if not callable";
             break;
         case OpCode::CheckFuncV:
-            row << "check.func   " << RI(in.a, false)
+            row << "check.func   " << RI(in.a(), false)
                 << "  ; throw if not a function";
             break;
         case OpCode::MapFilterV:
             row << (in.target2 ? "filter       " : "map          ")
-                << D(in.target) << " = " << RI(in.a, false) << "("
-                << RI(in.b, false) << ")";
+                << D(in.target) << " = " << RI(in.a(), false) << "("
+                << RI(in.b(), false) << ")";
             break;
         case OpCode::ReturnV:
-            row << "return.v     " << RI(in.a, false);
+            row << "return.v     " << RI(in.a(), false);
             break;
         case OpCode::MakeArrayV:
             row << "make.arr     " << D(in.target) << " = "
-                << arglist(chunk, in.a.lit, in.b.lit)
+                << arglist(chunk, in.a_lit(), in.b_lit())
                 << "  ; array literal, hint " << in.target2;
             break;
         case OpCode::MakeDictV:
             row << "make.dict    " << D(in.target) << " = "
-                << arglist(chunk, in.a.lit, 2 * in.b.lit)
-                << "  ; dict literal (" << in.b.lit << " pairs)";
+                << arglist(chunk, in.a_lit(), 2 * in.b_lit())
+                << "  ; dict literal (" << in.b_lit() << " pairs)";
             break;
         case OpCode::MakeClosureV:
             row << "make.closure " << D(in.target) << " = closure_defs["
@@ -847,13 +847,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::StructCtorV:
             row << "struct.ctor  " << D(in.target) << " = struct_defs["
                 << in.target2 << "]("
-                << arglist(chunk, in.a.lit, in.b.lit) << ")";
+                << arglist(chunk, in.a_lit(), in.b_lit()) << ")";
             break;
         case OpCode::StructCtorBoxedV: {
             const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in.target2];
             row << "struct.ctor.b " << D(in.target) << " = "
                 << std::string(bc.def->name->val) << "("
-                << arglist(chunk, in.a.lit,
+                << arglist(chunk, in.a_lit(),
                            static_cast<int_type>(bc.arg_locs.size())) << ")";
             break;
         }
@@ -868,16 +868,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             const size_t nf =
                 chunk.struct_defs[in.target2]->fields.size();
             row << "make.structarr " << D(in.target) << " = struct_defs["
-                << in.target2 << "][" << in.b.lit << "]("
-                << arglist(chunk, in.a.lit,
-                           in.b.lit * static_cast<int_type>(nf)) << ")";
+                << in.target2 << "][" << in.b_lit() << "]("
+                << arglist(chunk, in.a_lit(),
+                           in.b_lit() * static_cast<int_type>(nf)) << ")";
             break;
         }
         case OpCode::LoadImmInt:
-            row << "load         " << D(in.target) << ", #" << in.a.lit;
+            row << "load         " << D(in.target) << ", #" << in.a_lit();
             break;
         case OpCode::LoadImmFloat:
-            row << "load         " << D(in.target) << ", #" << in.a.flit;
+            row << "load         " << D(in.target) << ", #" << in.a_flit();
             break;
         case OpCode::LoadConstV: {
             const EvalValue &c = chunk.consts[in.target2];
@@ -897,31 +897,31 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::CoerceNumV:
             row << "coerce.num   " << D(in.target) << " = "
-                << (in.target2 ? "float(" : "int(") << RI(in.a, false)
+                << (in.target2 ? "float(" : "int(") << RI(in.a(), false)
                 << ")   ; typed-store widen/check";
             break;
         case OpCode::BinOpV:
             row << "bin.v        " << D(in.target) << " = "
-                << RI(in.a, false) << " " << opsym(in.aop) << " "
-                << RI(in.b, false) << "   ; boxed";
+                << RI(in.a(), false) << " " << opsym(in.aop) << " "
+                << RI(in.b(), false) << "   ; boxed";
             break;
         case OpCode::CompoundV:
             row << "compound.v   " << D(in.target) << " " << opsym(in.aop)
-                << "= " << RI(in.b, false) << "   ; boxed";
+                << "= " << RI(in.b(), false) << "   ; boxed";
             break;
         case OpCode::CmpV:
             row << "cmp.v        " << D(in.target) << " = "
-                << RI(in.a, false) << " " << opsym(in.aop) << " "
-                << RI(in.b, false) << "   ; boxed";
+                << RI(in.a(), false) << " " << opsym(in.aop) << " "
+                << RI(in.b(), false) << "   ; boxed";
             break;
         case OpCode::LogV:
             row << "log.v        " << D(in.target) << " = "
-                << RI(in.a, false) << " " << opsym(in.aop) << " "
-                << RI(in.b, false) << "   ; boxed";
+                << RI(in.a(), false) << " " << opsym(in.aop) << " "
+                << RI(in.b(), false) << "   ; boxed";
             break;
         case OpCode::UnaryV:
             row << "unary.v      " << D(in.target) << " = "
-                << opsym(in.aop) << RI(in.a, false) << "   ; boxed";
+                << opsym(in.aop) << RI(in.a(), false) << "   ; boxed";
             break;
         case OpCode::LoadGlobalV:
             /* AST-free: the global name lives in gfuncs, not the chunk, so a
@@ -935,16 +935,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::StoreGlobalV:
             row << "store.global g" << in.target
                 << (in.aop == Op::invalid ? " = " : " OP= ")
-                << RI(in.a, false);
+                << RI(in.a(), false);
             break;
         case OpCode::DeclConstV:
             row << "decl.const   " << (in.target2 ? "g" : "r") << in.target
-                << " = " << RI(in.a, false) << "  ; const";
+                << " = " << RI(in.a(), false) << "  ; const";
             break;
         case OpCode::StoreCaptureV:
             row << "store.cap    " << CAP(in.target)
                 << (in.aop == Op::invalid ? " = " : " OP= ")
-                << RI(in.a, false);
+                << RI(in.a(), false);
             break;
         case OpCode::LoadCaptureV:
             row << "load.capture " << D(in.target) << ", cap[" << in.target2
@@ -956,13 +956,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::SubscriptV:
             row << "subscript.v  " << D(in.target) << " = " << D(in.target2)
-                << "[" << RI(in.a, false) << "]";
+                << "[" << RI(in.a(), false) << "]";
             break;
         case OpCode::MemberV:
             /* AST-free: the member name comes from the member-key pool. */
             row << "member.v     " << D(in.target) << " = " << D(in.target2)
-                << "." << chunk.member_keys[in.a.lit].memId.get_type()
-                              ->to_string(chunk.member_keys[in.a.lit].memId);
+                << "." << chunk.member_keys[in.a_lit()].memId.get_type()
+                              ->to_string(chunk.member_keys[in.a_lit()].memId);
             break;
         case OpCode::LoadMemberInt:
         case OpCode::LoadMemberFloat:
@@ -970,22 +970,22 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << (in.op == OpCode::LoadMemberInt ? "load.mem.i   "
                                                    : "load.mem.f   ")
                 << D(in.target) << " = " << D(in.target2) << "."
-                << chunk.member_keys[in.a.lit].memId.get_type()
-                       ->to_string(chunk.member_keys[in.a.lit].memId);
+                << chunk.member_keys[in.a_lit()].memId.get_type()
+                       ->to_string(chunk.member_keys[in.a_lit()].memId);
             break;
         case OpCode::SliceV:
             row << "slice.v      " << D(in.target) << " = " << D(in.target2)
                 << "[";
-            if (in.a.slot >= 0) row << D(in.a.slot);
+            if (in.a_slot() >= 0) row << D(in.a_slot());
             row << ":";
-            if (in.b.slot >= 0) row << D(in.b.slot);
+            if (in.b_slot() >= 0) row << D(in.b_slot());
             row << "]";
             break;
         case OpCode::JumpUnlessTrueV:
             row << "jmp.ifnot.v  " << D(in.target2) << ", L" << in.target;
             break;
         case OpCode::JumpIfNotNoneV:
-            row << "jmp.notnone  " << RI(in.a, false) << ", L" << in.target
+            row << "jmp.notnone  " << RI(in.a(), false) << ", L" << in.target
                 << "   ; ?? short-circuit";
             break;
         case OpCode::Halt:

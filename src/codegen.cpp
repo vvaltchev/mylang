@@ -866,8 +866,8 @@ struct Codegen {
         in.op = OpCode::MakeStructArrayV;
         in.node_idx = add_ast_node(la->elems[0].get());   /* a ctor: defensive coerce loc (nulled) */
         in.target = dst;
-        in.a = int_lit(base);
-        in.b = int_lit(n);
+        in.set_a(int_lit(base));
+        in.set_b(int_lit(n));
         in.target2 = static_cast<int>(chunk.struct_defs.size());
         chunk.struct_defs.push_back(sdef);
         ops.push_back(in);
@@ -908,7 +908,7 @@ struct Codegen {
                 ld.op = e->th == TypeHint::i ? OpCode::LoadImmInt
                                              : OpCode::LoadImmFloat;
                 ld.target = t;
-                ld.a = top;
+                ld.set_a(top);
                 ops.push_back(ld);
                 out_slot = t;
                 return true;
@@ -1144,9 +1144,9 @@ struct Codegen {
                     in.op = OpCode::StructCtorV;
                     in.node_idx = add_ast_node(ce);   /* loc for a defensive throw (nulled) */
                     in.target = dst;
-                    in.a = int_lit(base);
-                    in.b = int_lit(
-                        static_cast<int>(ce->args->elems.size()));
+                    in.set_a(int_lit(base));
+                    in.set_b(int_lit(
+                        static_cast<int>(ce->args->elems.size())));
                     in.target2 = static_cast<int>(chunk.struct_defs.size());
                     chunk.struct_defs.push_back(sdef);
                     ops.push_back(in);
@@ -1189,7 +1189,7 @@ struct Codegen {
                 Instr in;
                 in.op = OpCode::StructCtorBoxedV;
                 in.target = dst;
-                in.a = int_lit(base);
+                in.set_a(int_lit(base));
                 in.target2 = static_cast<int>(chunk.boxed_ctors.size());
                 chunk.boxed_ctors.push_back(std::move(bc));
                 ops.push_back(in);
@@ -1236,8 +1236,8 @@ struct Codegen {
             Instr in;
             in.op = OpCode::MakeArrayV;
             in.target = dst;
-            in.a = int_lit(base);
-            in.b = int_lit(static_cast<int>(la->elems.size()));
+            in.set_a(int_lit(base));
+            in.set_b(int_lit(static_cast<int>(la->elems.size())));
             in.target2 = static_cast<int>(la->arr_hint);
             ops.push_back(in);
             out_slot = dst;
@@ -1273,8 +1273,8 @@ struct Codegen {
             Instr in;
             in.op = OpCode::MakeDictV;
             in.target = dst;
-            in.a = int_lit(base);
-            in.b = int_lit(npairs);
+            in.set_a(int_lit(base));
+            in.set_b(int_lit(npairs));
             ops.push_back(in);
             out_slot = dst;
             return true;
@@ -1294,7 +1294,7 @@ struct Codegen {
             in.node_idx = add_ast_node(sub);
             in.target = t;
             in.target2 = base_slot;
-            in.a = slot_op(idx_slot);
+            in.set_a(slot_op(idx_slot));
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -1311,7 +1311,7 @@ struct Codegen {
             in.node_idx = add_ast_node(m);                 /* extract_locs nulls it */
             in.target = t;
             in.target2 = base_slot;
-            in.a = int_lit(add_member_key(m));   /* AST-free: pool index */
+            in.set_a(int_lit(add_member_key(m)));   /* AST-free: pool index */
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -1337,8 +1337,8 @@ struct Codegen {
             in.node_idx = add_ast_node(sl);                /* extract_locs nulls it */
             in.target = t;
             in.target2 = base_slot;
-            in.a = slot_op(start_slot);  /* -1 == absent */
-            in.b = slot_op(end_slot);
+            in.set_a(slot_op(start_slot));  /* -1 == absent */
+            in.set_b(slot_op(end_slot));
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -1453,7 +1453,7 @@ struct Codegen {
             ops.push_back(mvl);
             Instr jn;
             jn.op = OpCode::JumpIfNotNoneV;
-            jn.a = slot_op(dst);
+            jn.set_a(slot_op(dst));
             const size_t jn_i = ops.size();
             ops.push_back(jn);
             next_temp = scratch;
@@ -1530,7 +1530,7 @@ struct Codegen {
                 in.op = OpCode::UnaryV;
                 in.node_idx = add_ast_node(e);
                 in.target = dst;
-                in.a = slot_op(oslot);
+                in.set_a(slot_op(oslot));
                 in.aop = Op::lnot;
                 ops.push_back(in);
                 out_slot = dst;
@@ -1565,7 +1565,7 @@ struct Codegen {
             in.op = OpCode::UnaryV;
             in.node_idx = add_ast_node(e);   /* loc for a `-str`/`~str` error */
             in.target = t;
-            in.a = slot_op(oslot);
+            in.set_a(slot_op(oslot));
             in.aop = op;
             ops.push_back(in);
             out_slot = t;
@@ -1628,8 +1628,8 @@ struct Codegen {
                              : OpCode::LogV;
             in.node_idx = add_ast_node(k == 'l' ? node : elems[i].second.get());
             in.target = t;
-            in.a = acc_op;
-            in.b = rhs_op;
+            in.set_a(acc_op);
+            in.set_b(rhs_op);
             in.aop = elems[i].first;
             ops.push_back(in);
             acc_op = slot_op(t);   /* the result temp feeds the next op */
@@ -1844,7 +1844,7 @@ struct Codegen {
          * (`a, b, c = <rvalue>`) via Construct::eval - so record `e`, not il. */
         in.node_idx = add_ast_node(e);
         in.aop = compound_op;   /* invalid == plain assign; else `t OP= elem` */
-        in.a = slot_op(rslot);
+        in.set_a(slot_op(rslot));
         in.target = static_cast<int>(chunk.unpack_targets.size());
         chunk.unpack_targets.push_back(std::move(targets));
         if (any_coerce) {
@@ -1856,7 +1856,7 @@ struct Codegen {
                     : t->decl_type == DeclType::i    ? 1
                     : t->decl_type == DeclType::f    ? 2
                                                      : 0);
-            in.b = int_lit(static_cast<int>(chunk.unpack_coerce.size()));
+            in.set_b(int_lit(static_cast<int>(chunk.unpack_coerce.size())));
             chunk.unpack_coerce.push_back(std::move(kinds));
         }
         ops.push_back(in);
@@ -1891,7 +1891,7 @@ struct Codegen {
                                 ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
                     in.node_idx = add_ast_node(s);
                     in.target = id->sym.slot;
-                    in.a = int_lit(1);
+                    in.set_a(int_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
                     ops.push_back(in);
                     return true;
@@ -1912,7 +1912,7 @@ struct Codegen {
                     in.node_idx = add_ast_node(s);   /* TypeError caret */
                     in.target = id->sym.slot;
                     in.target2 = kind;
-                    in.a = int_lit(inc->is_inc ? 1 : 0);
+                    in.set_a(int_lit(inc->is_inc ? 1 : 0));
                     ops.push_back(in);
                     return true;
                 }
@@ -1943,8 +1943,8 @@ struct Codegen {
                 in.node_idx = add_ast_node(sub->what.get());
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
-                in.a = slot_op(kslot);
-                in.b = int_lit(add_incdec_site(sub, inc));   /* dual carets */
+                in.set_a(slot_op(kslot));
+                in.set_b(int_lit(add_incdec_site(sub, inc)));   /* dual carets */
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -1971,7 +1971,7 @@ struct Codegen {
                 in.node_idx = add_ast_node(m->what.get());
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
-                in.b = int_lit(add_incdec_site(m, inc, m));  /* key + carets */
+                in.set_b(int_lit(add_incdec_site(m, inc, m)));  /* key + carets */
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -2097,7 +2097,7 @@ struct Codegen {
                 in.op = OpCode::DeclConstV;
                 in.target = lv->sym.slot;
                 in.target2 = lv->sym.kind == SymKind::global ? 1 : 0;
-                in.a = slot_op(rslot);
+                in.set_a(slot_op(rslot));
                 ops.push_back(in);
                 return true;
             }
@@ -2162,14 +2162,14 @@ struct Codegen {
                     co.node_idx = add_ast_node(s);   /* the Expr14 caret */
                     co.target = ct;
                     co.target2 = lv->decl_type == DeclType::f ? 1 : 0;
-                    co.a = slot_op(rslot);
+                    co.set_a(slot_op(rslot));
                     ops.push_back(co);
                     rslot = ct;
                 }
                 Instr in;
                 in.op = store_op;
                 in.target = lv->sym.slot;   /* global-table / capture slot */
-                in.a = slot_op(rslot);      /* aop invalid == plain assign */
+                in.set_a(slot_op(rslot));      /* aop invalid == plain assign */
                 ops.push_back(in);
                 return true;
             }
@@ -2185,7 +2185,7 @@ struct Codegen {
             in.op = store_op;
             in.node_idx = add_ast_node(s);               /* loc: compound may throw (div/undef) */
             in.target = lv->sym.slot;
-            in.a = rhs_op;
+            in.set_a(rhs_op);
             in.aop = cbase;
             ops.push_back(in);
             return true;
@@ -2204,7 +2204,7 @@ struct Codegen {
             in.op = OpCode::CompoundV;
             in.node_idx = add_ast_node(s);
             in.target = lv->sym.slot;
-            in.b = rhs_op;
+            in.set_b(rhs_op);
             in.aop = cbase;
             ops.push_back(in);
             return true;
@@ -2226,7 +2226,7 @@ struct Codegen {
             co.node_idx = add_ast_node(s);           /* the Expr14 caret */
             co.target = lv->sym.slot;
             co.target2 = lv->decl_type == DeclType::f ? 1 : 0;
-            co.a = slot_op(rslot);
+            co.set_a(slot_op(rslot));
             ops.push_back(co);
             return true;
         }
@@ -2302,7 +2302,7 @@ struct Codegen {
         in.node_idx = add_ast_node(e);
         in.target = t;
         in.target2 = inner;
-        in.a = idx;
+        in.set_a(idx);
         ops.push_back(in);
         out_slot = t;
         return true;
@@ -2393,8 +2393,8 @@ struct Codegen {
         cv.node_idx = add_ast_node(dc);
         cv.target = dst;
         cv.target2 = dc->direct_func_slot;
-        cv.a = int_lit(argbase);
-        cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
+        cv.set_a(int_lit(argbase));
+        cv.set_b(int_lit(static_cast<int>(dc->args->elems.size())));
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -2448,7 +2448,7 @@ struct Codegen {
                     in.node_idx = add_ast_node(sub);   /* subscript caret */
                     in.target = dst;
                     in.target2 = bval;
-                    in.a = slot_op(kslot);
+                    in.set_a(slot_op(kslot));
                     ops.push_back(in);
                     cs.a0_form = Chunk::CallSite::A0::elem;
                     cs.a0_kind = static_cast<unsigned char>(bkind);
@@ -2469,7 +2469,7 @@ struct Codegen {
                     in.op = OpCode::MemberV;
                     in.target = dst;
                     in.target2 = bval;
-                    in.a = int_lit(mk);
+                    in.set_a(int_lit(mk));
                     ops.push_back(in);
                     cs.a0_form = Chunk::CallSite::A0::member;
                     cs.a0_kind = static_cast<unsigned char>(bkind);
@@ -2519,7 +2519,7 @@ struct Codegen {
             Instr chk;
             chk.op = OpCode::CheckCallableV;
             chk.node_idx = add_ast_node(call->what.get());  /* callee caret */
-            chk.a = slot_op(callee_slot);
+            chk.set_a(slot_op(callee_slot));
             ops.push_back(chk);
 
             /* Build the site LOCALLY and push it after the args compile: a
@@ -2558,9 +2558,9 @@ struct Codegen {
             cvg.node_idx = add_ast_node(call);   /* call-site loc (extract) */
             cvg.target = dstg;
             cvg.target2 = callee_slot;
-            cvg.a = int_lit(argbase);
-            cvg.b = int_lit(static_cast<int_type>(n)
-                            | (static_cast<int_type>(site) << 12));
+            cvg.set_a(int_lit(argbase));
+            cvg.set_b(int_lit(static_cast<int_type>(n)
+                              | (static_cast<int_type>(site) << 12)));
             ops.push_back(cvg);
             out_slot = dstg;
             return true;
@@ -2581,8 +2581,8 @@ struct Codegen {
         cv.node_idx = add_ast_node(call);
         cv.target = dst;
         cv.target2 = callee_slot;
-        cv.a = int_lit(argbase);
-        cv.b = int_lit(static_cast<int>(call->args->elems.size()));
+        cv.set_a(int_lit(argbase));
+        cv.set_b(int_lit(static_cast<int>(call->args->elems.size())));
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -2726,9 +2726,9 @@ struct Codegen {
             in.op = OpCode::MathFnV;
             in.target = dst;
             in.target2 = static_cast<int>(e.fn);
-            in.a = x;
+            in.set_a(x);
             if (e.nargs == 2)
-                in.b = y;
+                in.set_b(y);
             ops.push_back(in);
             out_slot = dst;
             return true;
@@ -2758,8 +2758,8 @@ struct Codegen {
          * (index in target2), so no node. */
         cv.target2 = add_builtin_call(dc);
         cv.target = dst;
-        cv.a = int_lit(argbase);
-        cv.b = int_lit(static_cast<int>(dc->args->elems.size()));
+        cv.set_a(int_lit(argbase));
+        cv.set_b(int_lit(static_cast<int>(dc->args->elems.size())));
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -2791,7 +2791,7 @@ struct Codegen {
         Instr chk;
         chk.op = OpCode::CheckFuncV;
         chk.node_idx = add_ast_node(dc->args->elems[0].get());   /* arg0's caret */
-        chk.a = slot_op(t0);
+        chk.set_a(slot_op(t0));
         ops.push_back(chk);
 
         int t1;
@@ -2808,8 +2808,8 @@ struct Codegen {
         in.node_idx = add_ast_node(dc->args->elems[1].get());    /* arg1's caret (container) */
         in.target = dst;
         in.target2 = dc->map_filter_kind == 2 ? 1 : 0;   /* is_filter */
-        in.a = slot_op(t0);
-        in.b = slot_op(t1);
+        in.set_a(slot_op(t0));
+        in.set_b(slot_op(t1));
         ops.push_back(in);
         out_slot = dst;
         return true;
@@ -2882,9 +2882,8 @@ struct Codegen {
                         cv.target = dst;
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
-                        cv.a = int_lit(bkind);
-                        cv.a.slot = add_builtin_call(dc);
-                        cv.b = int_lit(runbase);
+                        cv.set_a_dual(add_builtin_call(dc), bkind);
+                        cv.set_b(int_lit(runbase));
                         ops.push_back(cv);
                         out_slot = dst;
                         return true;
@@ -2932,10 +2931,10 @@ struct Codegen {
                         cv.target = dst;
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
-                        cv.a = int_lit(bkind);
-                        cv.a.slot = add_builtin_call(dc);
-                        chunk.builtin_calls[cv.a.slot].member = m->memUid;
-                        cv.b = int_lit(runbase);
+                        const int bc = add_builtin_call(dc);
+                        cv.set_a_dual(bc, bkind);
+                        chunk.builtin_calls[bc].member = m->memUid;
+                        cv.set_b(int_lit(runbase));
                         ops.push_back(cv);
                         out_slot = dst;
                         return true;
@@ -3046,8 +3045,8 @@ struct Codegen {
                     cv.target = dst;
                     cv.target2 =
                         static_cast<const Identifier *>(a0)->sym.slot;
-                    cv.a = int_lit(kind | (sidx << 2));
-                    cv.b = int_lit(fieldbase);
+                    cv.set_a(int_lit(kind | (sidx << 2)));
+                    cv.set_b(int_lit(fieldbase));
                     ops.push_back(cv);
                     out_slot = dst;
                     return true;
@@ -3059,7 +3058,7 @@ struct Codegen {
 
         /* PER-OP rest-native decision. Compile the value args (1..n) into a
          * register run so func_lv has ZERO node->eval; `b` carries its base and
-         * MARKS this op rest-native (the VM reads `in.b.is_lit`, not a
+         * MARKS this op rest-native (the VM reads `in.b_is_lit()`, not a
          * per-builtin flag). Two ways to become rest-native:
          *   - lvalue_rest_native (insert/erase): ALWAYS - a rest arg that can't
          *     lower fails the whole native call (fall back to the tree-walker).
@@ -3118,10 +3117,9 @@ struct Codegen {
          * (index in a.slot; a.lit carries the arg0 slot kind). */
         cv.target = dst;
         cv.target2 = a0slot;
-        cv.a = int_lit(kind);
-        cv.a.slot = add_builtin_call(dc);
+        cv.set_a_dual(add_builtin_call(dc), kind);
         if (rest_op)
-            cv.b = int_lit(restbase);
+            cv.set_b(int_lit(restbase));
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -3314,7 +3312,7 @@ struct Codegen {
         Instr rv;
         rv.op = OpCode::ReturnV;
         rv.node_idx = add_ast_node(ret);
-        rv.a = slot_op(vslot);
+        rv.set_a(slot_op(vslot));
         ops.push_back(rv);
         return true;
     }
@@ -3334,7 +3332,7 @@ struct Codegen {
         Instr in;
         in.op = OpCode::Throw;
         in.node_idx = add_ast_node(th);                 /* throw-site loc (extract_locs) */
-        in.a = slot_op(vslot);
+        in.set_a(slot_op(vslot));
         ops.push_back(in);
         return true;
     }
@@ -3373,7 +3371,7 @@ struct Codegen {
             /* the member NAME (a dict key) goes into the CONST POOL; `a` as an
              * immediate = its index, so the handler needs no AST (a.is_lit
              * distinguishes a member key from a subscript's key temp). */
-            in.a = int_lit(add_const(m->memId));
+            in.set_a(int_lit(add_const(m->memId)));
             ops.push_back(in);
             return true;
         }
@@ -3388,7 +3386,7 @@ struct Codegen {
             in.node_idx = add_ast_node(sub);
             in.target = tt;
             in.target2 = dslot;
-            in.a = slot_op(kslot);
+            in.set_a(slot_op(kslot));
             ops.push_back(in);
             return true;
         }
@@ -3419,8 +3417,8 @@ struct Codegen {
         in.op = fieldop;
         in.target = tt;
         in.target2 = sfe_arr_slot;
-        in.a = slot_op(sfe_ctr_slot);
-        in.b = int_lit(fidx);
+        in.set_a(slot_op(sfe_ctr_slot));
+        in.set_b(int_lit(fidx));
         ops.push_back(in);
         out = slot_op(tt);
         return true;
@@ -3449,7 +3447,7 @@ struct Codegen {
         in.op = op;
         in.target = tt;
         in.target2 = bid->sym.slot;
-        in.a = int_lit(add_member_key(m));
+        in.set_a(int_lit(add_member_key(m)));
         ops.push_back(in);
         out = slot_op(tt);
         return true;
@@ -3490,7 +3488,7 @@ struct Codegen {
                 if (compile_int_cond(t->condExpr.get(), ops, a, cmp, b)) {
                     Instr in;
                     in.op = OpCode::JumpUnlessIntCmp;
-                    in.aop = cmp; in.a = a; in.b = b;
+                    in.aop = cmp; in.set_a(a); in.set_b(b);
                     cj = ops.size();
                     ops.push_back(in);
                     emitted = true;
@@ -3501,7 +3499,7 @@ struct Codegen {
                                            a, cmp, b)) {
                         Instr in;
                         in.op = OpCode::JumpUnlessFloatCmp;
-                        in.aop = cmp; in.a = a; in.b = b;
+                        in.aop = cmp; in.set_a(a); in.set_b(b);
                         cj = ops.size();
                         ops.push_back(in);
                         emitted = true;
@@ -3533,7 +3531,7 @@ struct Codegen {
             if (o.is_lit) {
                 in.op = flt ? OpCode::LoadImmFloat : OpCode::LoadImmInt;
                 in.target = dst;
-                in.a = o;
+                in.set_a(o);
             } else {
                 in.op = OpCode::MoveV;
                 in.target = dst;
@@ -3615,7 +3613,7 @@ struct Codegen {
             in.node_idx = add_ast_node(e);
             in.target = tt;
             in.target2 = aslot;
-            in.a = idx;
+            in.set_a(idx);
             ops.push_back(in);
             out = slot_op(tt);
             return true;
@@ -3673,8 +3671,8 @@ struct Codegen {
                 in.op = OpCode::IntBin;
                 in.node_idx = add_ast_node(e);
                 in.target = tt;
-                in.a = acc;
-                in.b = rhs;
+                in.set_a(acc);
+                in.set_b(rhs);
                 in.aop = t->elems[i].first;
                 ops.push_back(in);
                 acc = slot_op(tt);
@@ -3692,8 +3690,8 @@ struct Codegen {
             in.op = OpCode::IntBin;
             in.node_idx = add_ast_node(e);
             in.target = tt;
-            in.a = int_lit(0);
-            in.b = op;
+            in.set_a(int_lit(0));
+            in.set_b(op);
             in.aop = Op::minus;
             ops.push_back(in);
             out = slot_op(tt);
@@ -3819,8 +3817,8 @@ struct Codegen {
         in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
         in.target = vslot;                             /* value temp */
         in.target2 = bslot;                            /* base slot */
-        in.a = int_lit(bkind);                         /* base kind */
-        in.a.slot = steps_idx;                         /* chain_steps pool idx */
+        /* DUAL operand: lo = the chain_steps pool idx, hi = the base kind */
+        in.set_a_dual(steps_idx, bkind);
         in.aop = e->op;
         ops.push_back(in);
         return true;
@@ -3931,8 +3929,8 @@ struct Codegen {
         in.node_idx = add_ast_node(inc);
         in.target = dst;
         in.target2 = bslot;
-        in.a = int_lit(bkind);          /* root kind: 0/1/2, 3 = rvalue temp */
-        in.b = int_lit(site_idx);       /* incdec_chains pool idx */
+        in.set_a(int_lit(bkind));          /* root kind: 0/1/2, 3 = rvalue temp */
+        in.set_b(int_lit(site_idx));       /* incdec_chains pool idx */
         in.aop = inc->is_inc ? Op::plus : Op::minus;
         ops.push_back(in);
         out_slot = dst;
@@ -3955,8 +3953,8 @@ struct Codegen {
                 in.op = OpCode::IntBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
-                in.a = dst;
-                in.b = int_lit(1);
+                in.set_a(dst);
+                in.set_b(int_lit(1));
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -3995,11 +3993,11 @@ struct Codegen {
                     in.op = OpCode::StoreElem2V;
                     in.target = one;                   /* the boxed-1 value slot */
                     in.target2 = aslot;
-                    in.a = slot_op(k1slot);
-                    /* a.lit = chain_locs idx (inner k1 loc, outer k2 loc) - the
-                     * per-step carets for a byte-identical intermediate throw. */
-                    in.a.lit = add_chain_locs({inner, sub});
-                    in.b = slot_op(k2slot);
+                    /* DUAL: lo = the k1 temp slot, hi = the chain_locs idx
+                     * (inner k1 loc, outer k2 loc - the per-step carets for a
+                     * byte-identical intermediate throw). */
+                    in.set_a_dual(k1slot, add_chain_locs({inner, sub}));
+                    in.set_b(slot_op(k2slot));
                     in.aop = inc->is_inc ? Op::addeq : Op::subeq;
                     ops.push_back(in);
                     return true;
@@ -4015,8 +4013,8 @@ struct Codegen {
                     in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
                     in.target = akind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = aslot;
-                    in.a = idx;
-                    in.b = int_lit(1);
+                    in.set_a(idx);
+                    in.set_b(int_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
                     ops.push_back(in);
                     return true;
@@ -4046,8 +4044,8 @@ struct Codegen {
                     in.node_idx = add_ast_node(sub);
                     in.target = dkind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = dslot;
-                    in.a = slot_op(kslot);
-                    in.b = slot_op(vtemp);
+                    in.set_a(slot_op(kslot));
+                    in.set_b(slot_op(vtemp));
                     in.aop = inc->is_inc ? Op::addeq : Op::subeq;
                     ops.push_back(in);
                     return true;
@@ -4089,15 +4087,15 @@ struct Codegen {
                     in.node_idx = add_ast_node(m);
                     in.target = bkind;
                     in.target2 = bslot;
-                    in.a = slot_op(kin.target);
-                    in.b = slot_op(one);
+                    in.set_a(slot_op(kin.target));
+                    in.set_b(slot_op(one));
                     in.aop = cop;
                 } else {
                     in.op = OpCode::StoreMemberV;
                     in.target = bkind;
                     in.target2 = bslot;
-                    in.a = int_lit(add_member_key(m));
-                    in.b = slot_op(one);
+                    in.set_a(int_lit(add_member_key(m)));
+                    in.set_b(slot_op(one));
                     in.aop = cop;
                 }
                 ops.push_back(in);
@@ -4156,10 +4154,9 @@ struct Codegen {
                     in.op = OpCode::StoreElem2V;
                     in.target = vslot;
                     in.target2 = aslot;
-                    in.a = slot_op(k1slot);
-                    /* a.lit = chain_locs idx (inner k1 loc, outer k2 loc). */
-                    in.a.lit = add_chain_locs({inner, sub});
-                    in.b = slot_op(k2slot);
+                    /* DUAL: lo = the k1 temp slot, hi = the chain_locs idx. */
+                    in.set_a_dual(k1slot, add_chain_locs({inner, sub}));
+                    in.set_b(slot_op(k2slot));
                     in.aop = e->op;
                     ops.push_back(in);
                     return true;
@@ -4206,9 +4203,10 @@ struct Codegen {
                 in.op = OpCode::StoreElemChainV;
                 in.target = vslot;
                 in.target2 = bslot;
-                in.a = int_lit(bkind);
-                in.a.slot = add_chain_locs(locnodes);   /* nkeys = entry size */
-                in.b = int_lit(keybase);
+                /* DUAL: lo = the chain_locs idx (nkeys = entry size), hi =
+                 * the base kind. */
+                in.set_a_dual(add_chain_locs(locnodes), bkind);
+                in.set_b(int_lit(keybase));
                 in.aop = e->op;
                 ops.push_back(in);
                 return true;
@@ -4237,8 +4235,8 @@ struct Codegen {
                 in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
                 in.target = dkind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = dslot;
-                in.a = slot_op(kslot);
-                in.b = slot_op(vslot);
+                in.set_a(slot_op(kslot));
+                in.set_b(slot_op(vslot));
                 in.aop = e->op;
                 ops.push_back(in);
                 return true;
@@ -4296,8 +4294,8 @@ struct Codegen {
                                                      s));
                         in.target = akind;   /* 0 local / 1 global / 2 cap */
                         in.target2 = aslot;
-                        in.a = idx;
-                        in.b = val;
+                        in.set_a(idx);
+                        in.set_b(val);
                         in.aop = aop;
                         ops.push_back(in);
                         return true;
@@ -4331,8 +4329,8 @@ struct Codegen {
                 in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
                 in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = aslot;
-                in.a = slot_op(kslot);
-                in.b = slot_op(vslot);
+                in.set_a(slot_op(kslot));
+                in.set_b(slot_op(vslot));
                 in.aop = e->op;
                 ops.push_back(in);
                 return true;
@@ -4370,8 +4368,8 @@ struct Codegen {
                 in.node_idx = add_ast_node(m);             /* for its loc (extract_locs) */
                 in.target = dkind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = dslot;
-                in.a = slot_op(kin.target);
-                in.b = slot_op(vslot);
+                in.set_a(slot_op(kin.target));
+                in.set_b(slot_op(vslot));
                 in.aop = e->op;
                 ops.push_back(in);
                 return true;
@@ -4396,8 +4394,8 @@ struct Codegen {
                 in.op = OpCode::StoreMemberV;
                 in.target = skind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = sslot;
-                in.a = int_lit(add_member_key(m));   /* AST-free: pool index */
-                in.b = slot_op(vslot);
+                in.set_a(int_lit(add_member_key(m)));   /* AST-free: pool index */
+                in.set_b(slot_op(vslot));
                 in.aop = e->op;
                 ops.push_back(in);
                 return true;
@@ -4425,15 +4423,15 @@ struct Codegen {
                 in.op = OpCode::LoadImmInt;
                 in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
-                in.a = r;
+                in.set_a(r);
                 ops.push_back(in);
             } else {
                 Instr in;                /* dst = r + 0 (slot copy) */
                 in.op = OpCode::IntBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dst.slot;
-                in.a = r;
-                in.b = int_lit(0);
+                in.set_a(r);
+                in.set_b(int_lit(0));
                 in.aop = Op::plus;
                 ops.push_back(in);
             }
@@ -4457,8 +4455,8 @@ struct Codegen {
         in.op = OpCode::IntBin;
         in.node_idx = add_ast_node(s);
         in.target = dst.slot;
-        in.a = dst;
-        in.b = rhs;
+        in.set_a(dst);
+        in.set_b(rhs);
         in.aop = arith;
         ops.push_back(in);
         return true;
@@ -4526,7 +4524,7 @@ struct Codegen {
             in.node_idx = add_ast_node(e);
             in.target = tt;
             in.target2 = aslot;
-            in.a = idx;
+            in.set_a(idx);
             ops.push_back(in);
             out = slot_op(tt);
             return true;
@@ -4576,8 +4574,8 @@ struct Codegen {
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(e);
                 in.target = tt;
-                in.a = acc;
-                in.b = rhs;
+                in.set_a(acc);
+                in.set_b(rhs);
                 in.aop = t->elems[i].first;
                 ops.push_back(in);
                 acc = slot_op(tt);
@@ -4595,8 +4593,8 @@ struct Codegen {
             in.op = OpCode::FloatBin;
             in.node_idx = add_ast_node(e);
             in.target = tt;
-            in.a = float_lit(0);
-            in.b = op;
+            in.set_a(float_lit(0));
+            in.set_b(op);
             in.aop = Op::minus;
             ops.push_back(in);
             out = slot_op(tt);
@@ -4617,8 +4615,8 @@ struct Codegen {
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(s);
                 in.target = id->sym.slot;
-                in.a = slot_op(id->sym.slot);
-                in.b = float_lit(1);
+                in.set_a(slot_op(id->sym.slot));
+                in.set_b(float_lit(1));
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -4637,8 +4635,8 @@ struct Codegen {
                     in.op = OpCode::StoreElemFloat;
                     in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
                     in.target2 = aslot;
-                    in.a = idx;
-                    in.b = float_lit(1);
+                    in.set_a(idx);
+                    in.set_b(float_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
                     ops.push_back(in);
                     return true;
@@ -4684,8 +4682,8 @@ struct Codegen {
                                    : static_cast<const Construct *>(s));
             in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
             in.target2 = aslot;
-            in.a = idx;
-            in.b = val;
+            in.set_a(idx);
+            in.set_b(val);
             in.aop = aop;
             ops.push_back(in);
             return true;
@@ -4711,15 +4709,15 @@ struct Codegen {
                 in.op = OpCode::LoadImmFloat;
                 in.node_idx = add_ast_node(s);
                 in.target = dslot;
-                in.a = r;
+                in.set_a(r);
                 ops.push_back(in);
             } else {
                 Instr in;                /* dst = r + 0.0 (slot copy) */
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dslot;
-                in.a = r;
-                in.b = float_lit(0);
+                in.set_a(r);
+                in.set_b(float_lit(0));
                 in.aop = Op::plus;
                 ops.push_back(in);
             }
@@ -4743,8 +4741,8 @@ struct Codegen {
         in.op = OpCode::FloatBin;
         in.node_idx = add_ast_node(s);
         in.target = dslot;
-        in.a = slot_op(dslot);
-        in.b = rhs;
+        in.set_a(slot_op(dslot));
+        in.set_b(rhs);
         in.aop = arith;
         ops.push_back(in);
         return true;
@@ -4904,7 +4902,7 @@ struct Codegen {
         Instr st;                     /* aop invalid == plain assign+defined */
         st.op = OpCode::StoreGlobalV;
         st.target = fd->id->sym.slot;
-        st.a = slot_op(t);
+        st.set_a(slot_op(t));
         ops.push_back(st);
     }
 
@@ -4927,7 +4925,7 @@ struct Codegen {
         Instr st;
         st.op = OpCode::StoreGlobalV;
         st.target = sd->id->sym.slot;
-        st.a = slot_op(t);
+        st.set_a(slot_op(t));
         ops.push_back(st);
     }
 
@@ -5331,7 +5329,7 @@ struct Codegen {
             const Identifier *asId = cs.first.asId.get();
             Instr in;
             in.op = OpCode::CatchTest;
-            in.a = int_lit(types_idx);
+            in.set_a(int_lit(types_idx));
             in.target2 = asId ? asId->sym.slot : -1;   /* bind slot / -1 */
             tests.push_back(chunk.code.size());         /* patch .target below */
             chunk.code.push_back(in);
@@ -5376,8 +5374,8 @@ struct Codegen {
         t.op = opc;
         t.node_idx = add_ast_node(node);
         t.aop = cmp;
-        t.a = a;
-        t.b = b;
+        t.set_a(a);
+        t.set_b(b);
         const size_t at = chunk.code.size();
         chunk.code.push_back(t);
         return at;
@@ -5509,8 +5507,8 @@ struct Codegen {
         fstep.aop = f->cmp_op;
         fstep.target = lbody;
         fstep.target2 = f->i_slot;
-        fstep.a = bound;
-        fstep.b = step;
+        fstep.set_a(bound);
+        fstep.set_b(step);
         chunk.code.push_back(fstep);
 
         const int lend = here();
@@ -5668,7 +5666,7 @@ struct Codegen {
         Instr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
-        z.a = int_lit(0);
+        z.set_a(int_lit(0));
         chunk.code.push_back(z);
 
         /* Reserve c/n/i for the whole loop - a body statement's reset_temps()
@@ -5694,7 +5692,7 @@ struct Codegen {
         ld.node_idx = add_ast_node(fe->container.get());
         ld.target = x_slot;
         ld.target2 = c;
-        ld.a = slot_op(i);
+        ld.set_a(slot_op(i));
         chunk.code.push_back(ld);
 
         push_loop();
@@ -5716,8 +5714,8 @@ struct Codegen {
         fstep.aop = Op::lt;
         fstep.target = lbody;
         fstep.target2 = i;
-        fstep.a = slot_op(n);
-        fstep.b = int_lit(1);
+        fstep.set_a(slot_op(n));
+        fstep.set_b(int_lit(1));
         chunk.code.push_back(fstep);
 
         const int lend = here();
@@ -5782,7 +5780,7 @@ struct Codegen {
         Instr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
-        z.a = int_lit(0);
+        z.set_a(int_lit(0));
         chunk.code.push_back(z);
 
         const int saved_base = temp_base;
@@ -5798,7 +5796,7 @@ struct Codegen {
         ld.op = OpCode::LoadStrChar;
         ld.target = x_slot;
         ld.target2 = c;
-        ld.a = slot_op(i);
+        ld.set_a(slot_op(i));
         chunk.code.push_back(ld);
 
         push_loop();
@@ -5817,8 +5815,8 @@ struct Codegen {
         fstep.aop = Op::lt;
         fstep.target = lbody;
         fstep.target2 = i;
-        fstep.a = slot_op(n);
-        fstep.b = int_lit(1);
+        fstep.set_a(slot_op(n));
+        fstep.set_b(int_lit(1));
         chunk.code.push_back(fstep);
 
         const int lend = here();
@@ -5883,7 +5881,7 @@ struct Codegen {
         Instr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
-        z.a = int_lit(0);
+        z.set_a(int_lit(0));
         chunk.code.push_back(z);
 
         const int saved_base = temp_base;
@@ -5901,7 +5899,7 @@ struct Codegen {
             ld.op = OpCode::LoadStructElemV;
             ld.target = x_slot;
             ld.target2 = c;
-            ld.a = slot_op(i);
+            ld.set_a(slot_op(i));
             chunk.code.push_back(ld);
         } else {
             /* No element load - p is never materialized. Activate the direct-
@@ -5933,8 +5931,8 @@ struct Codegen {
         fstep.aop = Op::lt;
         fstep.target = lbody;
         fstep.target2 = i;
-        fstep.a = slot_op(n);
-        fstep.b = int_lit(1);
+        fstep.set_a(slot_op(n));
+        fstep.set_b(int_lit(1));
         chunk.code.push_back(fstep);
 
         const int lend = here();
@@ -6033,7 +6031,7 @@ struct Codegen {
         Instr z;
         z.op = OpCode::LoadImmInt;
         z.target = i;
-        z.a = int_lit(0);
+        z.set_a(int_lit(0));
         chunk.code.push_back(z);
 
         const int saved_base = temp_base;
@@ -6065,8 +6063,8 @@ struct Codegen {
         }
         up.node_idx = add_ast_node(fe->container.get());
         up.target2 = c;
-        up.a = slot_op(i);
-        up.b = int_lit(nunpack);
+        up.set_a(slot_op(i));
+        up.set_b(int_lit(nunpack));
         chunk.code.push_back(up);
 
         push_loop();
@@ -6084,8 +6082,8 @@ struct Codegen {
         fstep.aop = Op::lt;
         fstep.target = lbody;
         fstep.target2 = i;
-        fstep.a = slot_op(n);
-        fstep.b = int_lit(1);
+        fstep.set_a(slot_op(n));
+        fstep.set_b(int_lit(1));
         chunk.code.push_back(fstep);
 
         const int lend = here();
@@ -6167,7 +6165,7 @@ struct Codegen {
             Instr z;
             z.op = OpCode::LoadImmInt;
             z.target = idx_slot;
-            z.a = int_lit(0);
+            z.set_a(int_lit(0));
             chunk.code.push_back(z);
         }
 
@@ -6184,8 +6182,8 @@ struct Codegen {
         Instr nx;
         nx.op = OpCode::DictIterNext;
         nx.target2 = iter_id;
-        nx.a = slot_op(k_slot);     /* -1 == `_`/keys-only-unused */
-        nx.b = slot_op(v_slot);
+        nx.set_a(slot_op(k_slot));     /* -1 == `_`/keys-only-unused */
+        nx.set_b(slot_op(v_slot));
         const size_t nx_i = chunk.code.size();
         chunk.code.push_back(nx);   /* .target (end_pc) backpatched below */
 
@@ -6204,8 +6202,8 @@ struct Codegen {
             inc.op = OpCode::IntBin;
             inc.aop = Op::plus;
             inc.target = idx_slot;
-            inc.a = slot_op(idx_slot);
-            inc.b = int_lit(1);
+            inc.set_a(slot_op(idx_slot));
+            inc.set_b(int_lit(1));
             chunk.code.push_back(inc);
         }
         Instr jb;
@@ -6282,8 +6280,8 @@ struct Codegen {
         init.node_idx = add_ast_node(fe->container.get());   /* extract_locs -> the caret */
         init.target = iter_id;
         init.target2 = dsrc;
-        init.a = int_lit(nvars | (fe->indexed ? 256 : 0));
-        init.b = int_lit(tgt_idx);         /* the per-var slots (-1 == `_`) */
+        init.set_a(int_lit(nvars | (fe->indexed ? 256 : 0)));
+        init.set_b(int_lit(tgt_idx));         /* the per-var slots (-1 == `_`) */
         chunk.code.push_back(init);
 
         const int lnext = here();          /* test + bind + advance */
@@ -6708,19 +6706,19 @@ static void specialize_arith_ops(Chunk &ck)
         if (in.op == OpCode::IntBin) {
 
             /* Normalize a lit-first COMMUTATIVE op to reg-first (RI). */
-            if (in.a.is_lit && !in.b.is_lit) {
+            if (in.a_is_lit() && !in.b_is_lit()) {
                 switch (in.aop) {
                 case Op::plus: case Op::times: case Op::band:
                 case Op::bor:  case Op::bxor:
-                    std::swap(in.a, in.b);
+                    in.swap_ab();
                     break;
                 default:
                     break;
                 }
             }
-            if (in.a.is_lit)
+            if (in.a_is_lit())
                 continue;                 /* lit-first non-commutative */
-            const bool ri = in.b.is_lit;
+            const bool ri = in.b_is_lit();
 
             switch (in.aop) {
             case Op::plus:  in.op = ri ? OpCode::IntAddRI
@@ -6743,7 +6741,7 @@ static void specialize_arith_ops(Chunk &ck)
                 /* Only the NONZERO-immediate form (no zero check needed -
                  * the checksum shape); mod-by-reg / mod-by-zero keep
                  * IntBin's checked path + its div0 loc. */
-                if (ri && in.b.lit != 0)
+                if (ri && in.b_lit() != 0)
                     in.op = OpCode::IntModRI;
                 break;
             default:
@@ -6752,18 +6750,18 @@ static void specialize_arith_ops(Chunk &ck)
 
         } else if (in.op == OpCode::FloatBin) {
 
-            if (in.a.is_lit && !in.b.is_lit) {
+            if (in.a_is_lit() && !in.b_is_lit()) {
                 switch (in.aop) {
                 case Op::plus: case Op::times:
-                    std::swap(in.a, in.b);
+                    in.swap_ab();
                     break;
                 default:
                     break;
                 }
             }
-            if (in.a.is_lit)
+            if (in.a_is_lit())
                 continue;
-            const bool ri = in.b.is_lit;
+            const bool ri = in.b_is_lit();
 
             switch (in.aop) {
             case Op::plus:  in.op = ri ? OpCode::FloatAddRI
@@ -6889,15 +6887,15 @@ static bool visit_use_def(const Instr &in, U u, D d)
         return true;
     case OpCode::IntBin: case OpCode::FloatBin:
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
-        opnd(in.a); opnd(in.b); d(in.target); return true;
+        opnd(in.a()); opnd(in.b()); d(in.target); return true;
     case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
-        opnd(in.a); opnd(in.b); return true;
+        opnd(in.a()); opnd(in.b()); return true;
     case OpCode::JumpUnlessTrueV:
         u(in.target2); return true;
     case OpCode::JumpIfNotNoneV:
-        opnd(in.a); return true;
+        opnd(in.a()); return true;
     case OpCode::ForLoopStep:
-        u(in.target2); opnd(in.a); opnd(in.b); d(in.target2); return true;
+        u(in.target2); opnd(in.a()); opnd(in.b()); d(in.target2); return true;
     case OpCode::MoveV:
         u(in.target2); d(in.target); return true;
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
@@ -6907,45 +6905,45 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::MakeClosureV:   /* captures snapshot NAMED locals, not temps */
         d(in.target); return true;
     case OpCode::UnaryV: case OpCode::CoerceNumV:
-        opnd(in.a); d(in.target); return true;
+        opnd(in.a()); d(in.target); return true;
     case OpCode::CompoundV:
-        u(in.target); opnd(in.b); d(in.target); return true;
+        u(in.target); opnd(in.b()); d(in.target); return true;
     case OpCode::MathFnV:
-        opnd(in.a); opnd(in.b); d(in.target); return true;
+        opnd(in.a()); opnd(in.b()); d(in.target); return true;
     case OpCode::SubscriptV: case OpCode::MemberV:
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadStrChar:
-        u(in.target2); opnd(in.a); d(in.target); return true;
+        u(in.target2); opnd(in.a()); d(in.target); return true;
     case OpCode::ArrLen: case OpCode::StrLen:
         u(in.target2); d(in.target); return true;
     case OpCode::SliceV:
         u(in.target2);
-        if (in.a.slot >= 0) u(static_cast<int>(in.a.slot));
-        if (in.b.slot >= 0) u(static_cast<int>(in.b.slot));
+        if (in.a_slot() >= 0) u(static_cast<int>(in.a_slot()));
+        if (in.b_slot() >= 0) u(static_cast<int>(in.b_slot()));
         d(in.target); return true;
     case OpCode::ReturnV:
-        opnd(in.a); return true;
+        opnd(in.a()); return true;
     case OpCode::StoreGlobalV: case OpCode::StoreCaptureV:
         /* target = the GLOBAL/CAPTURE index, NOT a frame slot - no def */
-        opnd(in.a); return true;
+        opnd(in.a()); return true;
     case OpCode::CallV: case OpCode::CachedCallV: case OpCode::CallBuiltinV:
-        run(static_cast<int>(in.a.lit), static_cast<int>(in.b.lit));
+        run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
     case OpCode::CallValueV:
         u(in.target2);
-        run(static_cast<int>(in.a.lit), static_cast<int>(in.b.lit));
+        run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
     case OpCode::MakeArrayV: case OpCode::StructCtorV:
-        run(static_cast<int>(in.a.lit), static_cast<int>(in.b.lit));
+        run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
     case OpCode::MakeDictV:
-        run(static_cast<int>(in.a.lit), 2 * static_cast<int>(in.b.lit));
+        run(static_cast<int>(in.a_lit()), 2 * static_cast<int>(in.b_lit()));
         d(in.target); return true;
     case OpCode::AppendV:
-        if (in.a.lit == 0)             /* arg0 kind 0 = a frame slot */
+        if (in.a_lit() == 0)             /* arg0 kind 0 = a frame slot */
             u(in.target2);
-        u(static_cast<int>(in.b.lit)); /* the value's SLOT (lit-encoded) */
+        u(static_cast<int>(in.b_lit())); /* the value's SLOT (lit-encoded) */
         d(in.target); return true;
     default:
         return false;                  /* BARRIER - reads everything */

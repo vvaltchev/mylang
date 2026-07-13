@@ -99,7 +99,7 @@ write_float_slot(EvalContext *ctx, int_type slot, float_type v)
 ML_NOINLINE static float_type
 vm_math_fn(const Instr &in, EvalContext *ctx)
 {
-    const float_type x = read_float_operand(in.a, ctx);
+    const float_type x = read_float_operand(in.a(), ctx);
     switch (static_cast<MathFn>(in.target2)) {
     case MathFn::sqrt_:    return std::sqrt(x);
     case MathFn::cbrt_:    return std::cbrt(x);
@@ -119,7 +119,7 @@ vm_math_fn(const Instr &in, EvalContext *ctx)
     case MathFn::trunc_:   return std::trunc(x);
     case MathFn::tofloat_: return x;   /* float(x): the read already widened */
     case MathFn::fabs_:    return std::fabs(x);
-    case MathFn::pow_:     return std::pow(x, read_float_operand(in.b, ctx));
+    case MathFn::pow_:     return std::pow(x, read_float_operand(in.b(), ctx));
     }
     ML_CHECK(false);       /* a selector the codegen never emits */
     return 0.0;
@@ -542,16 +542,16 @@ static ML_NOINLINE void
 vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
                    size_t pc)
 {
-    const Chunk::IncDecChain &site = chunk.incdec_chains[in.b.lit];
+    const Chunk::IncDecChain &site = chunk.incdec_chains[in.b_lit()];
     const std::vector<Chunk::ChainStep> &steps = site.steps;
     const size_t n = steps.size();
 
     EvalValue cur;
-    if (in.a.lit == 3)
+    if (in.a_lit() == 3)
         cur = ctx.frame->at(in.target2).get();      /* rvalue root: a VALUE */
     else
         cur = EvalValue(
-            vm_store_base(ctx, in.a.lit, in.target2, chunk, pc, nullptr));
+            vm_store_base(ctx, in.a_lit(), in.target2, chunk, pc, nullptr));
 
     vm_chain_walk(ctx, chunk, cur, steps, n - 1);
 
@@ -1721,9 +1721,9 @@ vm_cache_probe(EvalContext &ctx, const Instr *in, const FuncDescriptor *d,
                std::unique_ptr<PureCacheKey> &pending)
 {
     std::vector<EvalValue> vals;
-    const size_t n = static_cast<size_t>(in->b.lit);
+    const size_t n = static_cast<size_t>(in->b_lit());
     vals.reserve(n);
-    const LValue *ap0 = n ? &ctx.frame->at(in->a.lit) : nullptr;
+    const LValue *ap0 = n ? &ctx.frame->at(in->a_lit()) : nullptr;
     for (size_t i = 0; i < n; i++)
         vals.push_back(ap0[i].get());
     PureCacheKey key{ d, std::move(vals) };
@@ -1896,7 +1896,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
             }
             num_bin_op(nv, EvalValue(static_cast<int_type>(1)),
-                       binop_pmf(in->a.lit ? Op::plus : Op::minus));
+                       binop_pmf(in->a_lit() ? Op::plus : Op::minus));
             lv.put(std::move(nv));
             pc++;
         }
@@ -1911,10 +1911,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * INC-DEC loc (its own NotLValue/const/TypeError) - come from the
              * incdec_sites pool (`b`); the undefined-global-base caret from
              * the loc side table (vm_store_base, node = null). */
-            const Chunk::IncDecSite &site = chunk->incdec_sites[in->b.lit];
+            const Chunk::IncDecSite &site = chunk->incdec_sites[in->b_lit()];
             LValue *blv =
                 vm_store_base(ctx, in->target, in->target2, *chunk, pc, nullptr);
-            const EvalValue &key = ctx.frame->at(in->a.slot).get();
+            const EvalValue &key = ctx.frame->at(in->a_slot()).get();
             vm_incdec_elem(blv, key, in->aop == Op::plus,
                            site.lstart, site.lend, site.istart, site.iend);
             pc++;
@@ -1932,7 +1932,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * AST-FREE: the member key + its TWO carets - the MEMBER loc (a
              * KeyNotFound) vs the INC-DEC loc (its own NotLValue/const/
              * TypeError) - come from the incdec_sites pool (`b`). */
-            const Chunk::IncDecSite &site = chunk->incdec_sites[in->b.lit];
+            const Chunk::IncDecSite &site = chunk->incdec_sites[in->b_lit()];
             LValue *blv =
                 vm_store_base(ctx, in->target, in->target2, *chunk, pc, nullptr);
             vm_incdec_member(blv, site.memId, site.memUid, in->aop == Op::plus,
@@ -1953,32 +1953,32 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
          */
 #define ML_IRR(NAME, EXPR)                                                   \
         VM_CASE(NAME): {                                                     \
-            const int_type a = read_int_slot(&ctx, in->a.slot);              \
-            const int_type b = read_int_slot(&ctx, in->b.slot);              \
+            const int_type a = read_int_slot(&ctx, in->a_slot());              \
+            const int_type b = read_int_slot(&ctx, in->b_slot());              \
             write_int_slot(&ctx, in->target, (EXPR));                        \
             pc++;                                                            \
         }                                                                    \
         VM_NEXT;
 #define ML_IRI(NAME, EXPR)                                                   \
         VM_CASE(NAME): {                                                     \
-            const int_type a = read_int_slot(&ctx, in->a.slot);              \
-            const int_type b = in->b.lit;                                    \
+            const int_type a = read_int_slot(&ctx, in->a_slot());              \
+            const int_type b = in->b_lit();                                    \
             write_int_slot(&ctx, in->target, (EXPR));                        \
             pc++;                                                            \
         }                                                                    \
         VM_NEXT;
 #define ML_FRR(NAME, EXPR)                                                   \
         VM_CASE(NAME): {                                                     \
-            const float_type a = read_float_slot(&ctx, in->a.slot);          \
-            const float_type b = read_float_slot(&ctx, in->b.slot);          \
+            const float_type a = read_float_slot(&ctx, in->a_slot());          \
+            const float_type b = read_float_slot(&ctx, in->b_slot());          \
             write_float_slot(&ctx, in->target, (EXPR));                      \
             pc++;                                                            \
         }                                                                    \
         VM_NEXT;
 #define ML_FRI(NAME, EXPR)                                                   \
         VM_CASE(NAME): {                                                     \
-            const float_type a = read_float_slot(&ctx, in->a.slot);          \
-            const float_type b = in->b.flit;                                 \
+            const float_type a = read_float_slot(&ctx, in->a_slot());          \
+            const float_type b = in->b_flit();                                 \
             write_float_slot(&ctx, in->target, (EXPR));                      \
             pc++;                                                            \
         }                                                                    \
@@ -2003,9 +2003,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(IntModRI): {
             /* selected only for a NONZERO immediate - no zero check */
-            ML_VM_CHECK(in->b.lit != 0);
+            ML_VM_CHECK(in->b_lit() != 0);
             write_int_slot(&ctx, in->target,
-                           read_int_slot(&ctx, in->a.slot) % in->b.lit);
+                           read_int_slot(&ctx, in->a_slot()) % in->b_lit());
             pc++;
         }
         VM_NEXT;
@@ -2030,8 +2030,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(IntBin): {
 
-            const int_type a = read_int_operand(in->a, &ctx);
-            const int_type b = read_int_operand(in->b, &ctx);
+            const int_type a = read_int_operand(in->a(), &ctx);
+            const int_type b = read_int_operand(in->b(), &ctx);
             int_type r;
 
             switch (in->aop) {
@@ -2072,8 +2072,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(JumpUnlessIntCmp): {
 
-            const int_type a = read_int_operand(in->a, &ctx);
-            const int_type b = read_int_operand(in->b, &ctx);
+            const int_type a = read_int_operand(in->a(), &ctx);
+            const int_type b = read_int_operand(in->b(), &ctx);
             bool cond;
 
             switch (in->aop) {
@@ -2094,8 +2094,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(FloatBin): {
 
-            const float_type a = read_float_operand(in->a, &ctx);
-            const float_type b = read_float_operand(in->b, &ctx);
+            const float_type a = read_float_operand(in->a(), &ctx);
+            const float_type b = read_float_operand(in->b(), &ctx);
             float_type r;
 
             switch (in->aop) {
@@ -2130,8 +2130,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(JumpUnlessFloatCmp): {
 
-            const float_type a = read_float_operand(in->a, &ctx);
-            const float_type b = read_float_operand(in->b, &ctx);
+            const float_type a = read_float_operand(in->a(), &ctx);
+            const float_type b = read_float_operand(in->b(), &ctx);
             bool cond;
 
             switch (in->aop) {
@@ -2156,12 +2156,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * dispatch for the whole counter (see bytecode.h). */
             LValue &ilv = ctx.frame->at(in->target2);
             int_type i = ilv.getval<int_type>();
-            const int_type step = read_int_operand(in->b, &ctx);
+            const int_type step = read_int_operand(in->b(), &ctx);
 
             i = (in->aop == Op::lt || in->aop == Op::le) ? i + step : i - step;
             ilv.getval<int_type>() = i;   /* counter slot always holds int */
 
-            const int_type bound = read_int_operand(in->a, &ctx);
+            const int_type bound = read_int_operand(in->a(), &ctx);
             bool go;
             switch (in->aop) {
             case Op::lt: go = i <  bound; break;
@@ -2184,7 +2184,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in->a, &ctx);
+                int_type idx = read_int_operand(in->a(), &ctx);
                 if (idx < 0)
                     idx += arr.size();
                 if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
@@ -2216,7 +2216,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in->a, &ctx);
+                int_type idx = read_int_operand(in->a(), &ctx);
                 if (idx < 0)
                     idx += arr.size();
                 if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
@@ -2246,7 +2246,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * base is a proven flat array<bool> (elem_is_bool). */
             const SharedArrayObj &arr =
                 ctx.frame->at(in->target2).get().get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in->a, &ctx);
+            const int_type idx = read_int_operand(in->a(), &ctx);
             const bool b =
                 arr.skind() == SharedArrayObj::Storage::bools
                     ? arr.flat_bools()[arr.offset() + idx] != 0
@@ -2266,7 +2266,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::general) {
-                    int_type idx = read_int_operand(in->a, &ctx);
+                    int_type idx = read_int_operand(in->a(), &ctx);
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
@@ -2314,10 +2314,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 pc = static_cast<size_t>(in->target);
                 VM_NEXT;
             }
-            if (in->a.slot >= 0)
-                ctx.frame->at(in->a.slot).put(st.it->first);
-            if (in->b.slot >= 0)
-                ctx.frame->at(in->b.slot).put(st.it->second.get());
+            if (in->a_slot() >= 0)
+                ctx.frame->at(in->a_slot()).put(st.it->first);
+            if (in->b_slot() >= 0)
+                ctx.frame->at(in->b_slot()).put(st.it->second.get());
             ++st.it;
             pc++;
         }
@@ -2332,9 +2332,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 && in->target < static_cast<int_type>(chunk->n_dyn_iters));
             DynIterState &st = dyiter(in->target);
             st.container = ctx.frame->at(in->target2).get();
-            st.nvars = static_cast<int>(in->a.lit & 0xff);
-            st.indexed = (in->a.lit >> 8) != 0;
-            st.targets = &chunk->unpack_targets[in->b.lit];
+            st.nvars = static_cast<int>(in->a_lit() & 0xff);
+            st.indexed = (in->a_lit() >> 8) != 0;
+            st.targets = &chunk->unpack_targets[in->b_lit()];
             st.counter = 0;
             if (st.container.is<SharedArrayObj>()) {
                 st.is_dict = false;
@@ -2438,10 +2438,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const EvalValue &base_v = ctx.frame->at(in->target2).get();
             ML_VM_CHECK(base_v.is<SharedArrayObj>());
             const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in->a, &ctx);
+            const int_type idx = read_int_operand(in->a(), &ctx);
             const EvalValue &elem =
                 outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in->b.lit;
+            const int_type N = in->b_lit();
             if (!elem.is<SharedArrayObj>())
                 vm_throw_unpack_nonarray(*chunk, pc, N);
             const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
@@ -2485,10 +2485,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const EvalValue &base_v = ctx.frame->at(in->target2).get();
             ML_VM_CHECK(base_v.is<SharedArrayObj>());
             const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in->a, &ctx);
+            const int_type idx = read_int_operand(in->a(), &ctx);
             const EvalValue &elem =
                 outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in->b.lit;
+            const int_type N = in->b_lit();
             if (!elem.is<SharedArrayObj>())
                 vm_throw_unpack_nonarray(*chunk, pc, N);
             const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
@@ -2529,12 +2529,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 if ((sk == SharedArrayObj::Storage::ints
                      || (is_bool && in->aop == Op::invalid))
                     && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in->a, &ctx);
+                    int_type idx = read_int_operand(in->a(), &ctx);
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
                         vm_throw_oob(*chunk, pc);
-                    const int_type rhs = read_int_operand(in->b, &ctx);
+                    const int_type rhs = read_int_operand(in->b(), &ctx);
                     /* div/mod by zero throws BEFORE any clone (tree-walker
                      * throws during the op eval, before the COW). */
                     if ((in->aop == Op::div || in->aop == Op::mod) && rhs == 0)
@@ -2568,8 +2568,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 Loc ls, le;
                 chunk->loc_at(pc, ls, le);
                 vm_subscript_store(&alv,
-                                   EvalValue(read_int_operand(in->a, &ctx)),
-                                   EvalValue(read_int_operand(in->b, &ctx)),
+                                   EvalValue(read_int_operand(in->a(), &ctx)),
+                                   EvalValue(read_int_operand(in->b(), &ctx)),
                                    vm_base_to_expr14_op(in->aop), ls, le);
             }
             pc++;
@@ -2587,12 +2587,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 SharedArrayObj &arr = alv.getval<SharedArrayObj>();
                 if (arr.skind() == SharedArrayObj::Storage::floats
                     && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in->a, &ctx);
+                    int_type idx = read_int_operand(in->a(), &ctx);
                     if (idx < 0)
                         idx += arr.size();
                     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
                         vm_throw_oob(*chunk, pc);
-                    const float_type rhs = read_float_operand(in->b, &ctx);
+                    const float_type rhs = read_float_operand(in->b(), &ctx);
                     if ((in->aop == Op::div || in->aop == Op::mod)
                             && rhs == 0.0)
                         vm_throw_div0(*chunk, pc);
@@ -2619,8 +2619,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 Loc ls, le;
                 chunk->loc_at(pc, ls, le);
                 vm_subscript_store(&alv,
-                                   EvalValue(read_int_operand(in->a, &ctx)),
-                                   EvalValue(read_float_operand(in->b, &ctx)),
+                                   EvalValue(read_int_operand(in->a(), &ctx)),
+                                   EvalValue(read_float_operand(in->b(), &ctx)),
                                    vm_base_to_expr14_op(in->aop), ls, le);
             }
             pc++;
@@ -2638,8 +2638,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             LValue &dlv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            const EvalValue &key = ctx.frame->at(in->a.slot).get();
-            const EvalValue &val = ctx.frame->at(in->b.slot).get();
+            const EvalValue &key = ctx.frame->at(in->a_slot()).get();
+            const EvalValue &val = ctx.frame->at(in->b_slot()).get();
             /* Loc looked up LAZILY on the throw path only (a successful store -
              * the hot case - pays no loc_at binary search); vm_subscript_store
              * uses it only when it throws. */
@@ -2658,8 +2658,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* s.member = v / s.member OP= v for a STRUCT base (a dict member
              * store uses DictStore). vm_member_store does the POD/boxed-field
              * store; AST-free - the member uid + carets come from the pool. */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a.lit];
-            const EvalValue &val = ctx.frame->at(in->b.slot).get();
+            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
+            const EvalValue &val = ctx.frame->at(in->b_slot()).get();
             try {
                 /* base inside the try so an undefined-global throw is stamped
                  * with the member caret; base may be global/capture (in->target
@@ -2688,8 +2688,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             LValue &alv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            const EvalValue &idx = ctx.frame->at(in->a.slot).get();
-            const EvalValue &val = ctx.frame->at(in->b.slot).get();
+            const EvalValue &idx = ctx.frame->at(in->a_slot()).get();
+            const EvalValue &val = ctx.frame->at(in->b_slot()).get();
             /* Loc looked up LAZILY on the throw path only (see DictStore). */
             try {
                 vm_subscript_store(&alv, idx, val, in->aop, Loc(), Loc());
@@ -2710,11 +2710,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * chain_locs pool (idx in a.lit), so an intermediate `a[i]` OOB and
              * the final store carry their OWN subscript loc. */
             LValue &alv = ctx.frame->at(in->target2);
-            const EvalValue &k1 = ctx.frame->at(in->a.slot).get();
-            const EvalValue &k2 = ctx.frame->at(in->b.slot).get();
+            const EvalValue &k1 = ctx.frame->at(in->a_dual_lo()).get();
+            const EvalValue &k2 = ctx.frame->at(in->b_slot()).get();
             const EvalValue &val = ctx.frame->at(in->target).get();
             vm_nested_subscript_store(&alv, k1, k2, val, in->aop,
-                                      chunk->chain_locs[in->a.lit].data());
+                                      chunk->chain_locs[in->a_dual_hi()].data());
             pc++;
         }
         VM_NEXT;
@@ -2725,11 +2725,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * ([b.lit, +nkeys)). AST-free: the per-step subscript carets are in
              * the chain_locs pool (idx in a.slot; nkeys = its size), so each
              * step's throw carries ITS OWN subscript loc. */
-            LValue *base = vm_store_base(ctx, in->a.lit, in->target2,
+            LValue *base = vm_store_base(ctx, in->a_dual_hi(), in->target2,
                                          *chunk, pc, nullptr);
             const EvalValue &val = ctx.frame->at(in->target).get();
-            const auto &cl = chunk->chain_locs[in->a.slot];
-            vm_chain_store_op(ctx, base, in->b.lit, cl.data(), cl.size(),
+            const auto &cl = chunk->chain_locs[in->a_dual_lo()];
+            vm_chain_store_op(ctx, base, in->b_lit(), cl.data(), cl.size(),
                               val, in->aop);
             pc++;
         }
@@ -2741,11 +2741,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * walk the steps (chain_steps pool idx = a.slot), store the final.
              * AST-free: all carets come from the loc side table (the outer
              * lvalue node), matching StoreElemChainV. */
-            LValue *base = vm_store_base(ctx, in->a.lit, in->target2,
+            LValue *base = vm_store_base(ctx, in->a_dual_hi(), in->target2,
                                          *chunk, pc, nullptr);
             const EvalValue &val = ctx.frame->at(in->target).get();
             try {
-                vm_chain_lvalue_store_op(ctx, *chunk, base, in->a.slot, val,
+                vm_chain_lvalue_store_op(ctx, *chunk, base, in->a_dual_lo(), val,
                                          in->aop);
             } catch (Exception &e) {
                 if (!e.loc_start)
@@ -2764,14 +2764,14 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * side table); each element (box-free for a flat scalar via
              * vm_arr_elem) writes to its target slot (-1 == `_`, skipped). A
              * NON-array rvalue SPREADS to every target. */
-            const EvalValue &rval = ctx.frame->at(in->a.slot).get();
+            const EvalValue &rval = ctx.frame->at(in->a_slot()).get();
             const std::vector<int32_t> &targets =
                 chunk->unpack_targets[in->target];
             /* Typed targets (R5): a PLAIN assign coerces each stored value
              * per target (widen / dyn-narrowing throw, Expr14-span caret);
              * a compound doesn't coerce. Kinds from the unpack_coerce pool. */
             const std::vector<unsigned char> *coerce =
-                in->b.is_lit ? &chunk->unpack_coerce[in->b.lit] : nullptr;
+                in->b_is_lit() ? &chunk->unpack_coerce[in->b_lit()] : nullptr;
             /* A COMPOUND `a, b OP= rhs` (in->aop != invalid): each target reads
              * its CURRENT value, applies the op with its element/scalar, writes
              * back — else a plain distribute. */
@@ -2829,15 +2829,15 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * the KEY comes from the CONST POOL for a member `d.k` (in->a is an
              * immediate = the consts index of the interned name) or from a temp
              * slot for a subscript `d[k]` (in->a is a slot) - distinguished by
-             * in->a.is_lit, no `node`. A PRESENT key reads the scalar via
+             * in->a_is_lit(), no `node`. A PRESENT key reads the scalar via
              * dict_present_value (hot); a MISSING key / non-dict base goes
              * through the shared Type::subscript (the tree-walker's exact
              * default-dict insert / KeyNotFoundEx / not-subscriptable logic),
              * its loc taken from the loc side table, NOT node->eval. */
             const bool is_int = in->op == OpCode::DictLoadInt;
-            const EvalValue &key = in->a.is_lit
-                ? chunk->consts[in->a.lit]
-                : ctx.frame->at(in->a.slot).get();
+            const EvalValue &key = in->a_is_lit()
+                ? chunk->consts[in->a_lit()]
+                : ctx.frame->at(in->a_slot()).get();
             const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<intrusive_ptr<DictObject>>())
                 if (const EvalValue *v = dict_present_value(
@@ -2869,7 +2869,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * try/catch stamps the args-list loc onto a loc-less error, exactly
              * as DirectBuiltinCallExpr::do_eval does. */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->target2];
-            const int_type base = in->a.lit, n = in->b.lit;
+            const int_type base = in->a_lit(), n = in->b_lit();
             try {
                 if (n <= 8) {
                     EvalValue stackbuf[8];
@@ -2901,7 +2901,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * multiplied by VM recursion depth). `target2` = the ArrHint; never
              * throws. */
             ctx.frame->at(in->target).put(vm_make_array(
-                ctx, in->a.lit, in->b.lit, static_cast<ArrHint>(in->target2)));
+                ctx, in->a_lit(), in->b_lit(), static_cast<ArrHint>(in->target2)));
             pc++;
         }
         VM_NEXT;
@@ -2911,7 +2911,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* Build a dict LITERAL via vm_make_dict (key/value buffer kept out
              * of vm_run_chunk's frame). Never throws (all values hashable). */
             ctx.frame->at(in->target).put(
-                vm_make_dict(ctx, in->a.lit, in->b.lit));
+                vm_make_dict(ctx, in->a_lit(), in->b_lit()));
             pc++;
         }
         VM_NEXT;
@@ -2938,7 +2938,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             StructTypeDef *def =
                 const_cast<StructTypeDef *>(chunk->struct_defs[in->target2]);
             try {
-                vm_struct_ctor(ctx, def, in->a.lit, in->b.lit, in->target);
+                vm_struct_ctor(ctx, def, in->a_lit(), in->b_lit(), in->target);
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -2975,7 +2975,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const Chunk::BoxedCtor &bc = chunk->boxed_ctors[in->target2];
             StructTypeDef *def = const_cast<StructTypeDef *>(bc.def);
             ctx.frame->at(in->target).put(vm_struct_ctor_boxed(
-                ctx, def, in->a.lit,
+                ctx, def, in->a_lit(),
                 static_cast<int_type>(bc.arg_locs.size()),
                 bc.arg_locs.data()));
             pc++;
@@ -2992,7 +2992,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 const_cast<StructTypeDef *>(chunk->struct_defs[in->target2]);
             try {
                 ctx.frame->at(in->target).put(
-                    vm_make_struct_array_op(ctx, def, in->a.lit, in->b.lit));
+                    vm_make_struct_array_op(ctx, def, in->a_lit(), in->b_lit()));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -3008,7 +3008,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * the field index. */
             write_int_slot(&ctx, in->target,
                 vm_struct_field_int(ctx.frame->at(in->target2).get(),
-                                    read_int_operand(in->a, &ctx), in->b.lit));
+                                    read_int_operand(in->a(), &ctx), in->b_lit()));
             pc++;
             VM_NEXT;
 
@@ -3018,15 +3018,15 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * target2 = the array slot, a = the counter. */
             ctx.frame->at(in->target).put(
                 vm_struct_elem(ctx.frame->at(in->target2).get(),
-                               read_int_operand(in->a, &ctx)));
+                               read_int_operand(in->a(), &ctx)));
             pc++;
             VM_NEXT;
 
         VM_CASE(LoadStructFieldFloat):
             write_float_slot(&ctx, in->target,
                 vm_struct_field_float(ctx.frame->at(in->target2).get(),
-                                      read_int_operand(in->a, &ctx),
-                                      in->b.lit));
+                                      read_int_operand(in->a(), &ctx),
+                                      in->b_lit()));
             pc++;
             VM_NEXT;
 
@@ -3038,14 +3038,14 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * global -> null target) falls back to the FULL builtin via the
              * pooled carets - byte-identical errors and result. */
             LValue *target;
-            switch (in->a.lit) {
+            switch (in->a_dual_hi()) {
             case 0:  target = &ctx.frame->at(in->target2); break;
             case 1:  target = ctx.gfuncs->defined[in->target2]
                                   ? &ctx.gfuncs->slots[in->target2]
                                   : nullptr;                     break;
             default: target = &(*ctx.captures)[in->target2];    break;
             }
-            const EvalValue &elem = ctx.frame->at(in->b.lit).get();
+            const EvalValue &elem = ctx.frame->at(in->b_lit()).get();
             if (target && arr_append_fast(target, elem, false)) {
                 ctx.frame->at(in->target).put(target->get());
                 pc++;
@@ -3053,8 +3053,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             try {
                 ctx.frame->at(in->target).put(
-                    vm_call_builtin_lv_rest(ctx, *chunk, in->a.slot, target,
-                                            in->b.lit));
+                    vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(), target,
+                                            in->b_lit()));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -3073,9 +3073,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * - no value args) gets an empty rest. Mirrors Identifier::do_eval
              * for each kind: a not-yet-defined global -> null target ->
              * NotLValueEx, like the tree-walker. */
-            const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a.slot];
+            const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
             LValue *target;
-            switch (in->a.lit) {
+            switch (in->a_dual_hi()) {
             case 0:   /* local */
                 target = &ctx.frame->at(in->target2);
                 break;
@@ -3088,12 +3088,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 break;
             }
             try {
-                if (in->b.is_lit) {
+                if (in->b_is_lit()) {
                     ctx.frame->at(in->target).put(
-                        vm_call_builtin_lv_rest(ctx, *chunk, in->a.slot, target,
-                                                in->b.lit));
+                        vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(), target,
+                                                in->b_lit()));
                 } else {
-                    ArgLocs al = chunk->arglocs_at(in->a.slot);
+                    ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                     ctx.frame->at(in->target).put(
                         bc.builtin.func_lv(&ctx, &al, target, nullptr, 0));
                 }
@@ -3118,9 +3118,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * the ctor def + carets from the emplace_sites pool (`a` packs
              * kind | idx << 2); the whole-args caret from the loc table. */
             const Chunk::EmplaceSite &site =
-                chunk->emplace_sites[in->a.lit >> 2];
+                chunk->emplace_sites[in->a_lit() >> 2];
             LValue *target;
-            switch (in->a.lit & 3) {
+            switch (in->a_lit() & 3) {
             case 0:  target = &ctx.frame->at(in->target2); break;
             case 1:  target = ctx.gfuncs->defined[in->target2]
                          ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
@@ -3128,7 +3128,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             try {
                 ctx.frame->at(in->target).put(
-                    vm_do_emplace(ctx, site, target, in->b.lit));
+                    vm_do_emplace(ctx, site, target, in->b_lit()));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -3148,9 +3148,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * non-lvalue element (a flat scalar / read-only / missing dict key,
              * which throws) gives a null target -> NotLValueEx, like the
              * tree-walker. AST-FREE: Builtin + carets from the pool (a.slot). */
-            const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a.slot];
+            const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
             LValue *base;
-            switch (in->a.lit) {
+            switch (in->a_dual_hi()) {
             case 0:  base = &ctx.frame->at(in->target2); break;
             case 1:  base = ctx.gfuncs->defined[in->target2]
                          ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
@@ -3161,7 +3161,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 EvalValue holder;   /* keeps the subscript result alive */
                 LValue *elem = nullptr;
                 if (base) {
-                    const EvalValue &idx = ctx.frame->at(in->b.lit).get();
+                    const EvalValue &idx = ctx.frame->at(in->b_lit()).get();
                     holder = base->get().get_type()->subscript(
                         EvalValue(base), idx, /*for_write=*/false);
                     if (holder.is<LValue *>())
@@ -3169,9 +3169,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 }
                 EvalValue restbuf[8];   /* n_rest is small (append 1, pop 0) */
                 for (int_type i = 0; i < n_rest; i++) {
-                    restbuf[i] = ctx.frame->at(in->b.lit + 1 + i).get();
+                    restbuf[i] = ctx.frame->at(in->b_lit() + 1 + i).get();
                 }
-                ArgLocs al = chunk->arglocs_at(in->a.slot);
+                ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                 ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, elem,
                                        n_rest ? restbuf : nullptr,
@@ -3196,9 +3196,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * then call func_lv REST-NATIVE. `b` = the rest run (values, NO
              * index — unlike LVElem). AST-free: Builtin + carets + field name
              * from the pool (a.slot). */
-            const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a.slot];
+            const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
             LValue *base;
-            switch (in->a.lit) {
+            switch (in->a_dual_hi()) {
             case 0:  base = &ctx.frame->at(in->target2); break;
             case 1:  base = ctx.gfuncs->defined[in->target2]
                          ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
@@ -3213,9 +3213,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                                              bc.args[0].start, bc.args[0].end);
                 EvalValue restbuf[8];   /* append/push 1 value arg */
                 for (int_type i = 0; i < n_rest; i++) {
-                    restbuf[i] = ctx.frame->at(in->b.lit + i).get();
+                    restbuf[i] = ctx.frame->at(in->b_lit() + i).get();
                 }
-                ArgLocs al = chunk->arglocs_at(in->a.slot);
+                ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                 ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, field,
                                        n_rest ? restbuf : nullptr,
@@ -3281,8 +3281,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                     pc++;
                     VM_NEXT;
                 }
-                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a.lit,
-                              static_cast<size_t>(in->b.lit), in->target,
+                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
+                              static_cast<size_t>(in->b_lit()), in->target,
                               std::move(pending_key));
                 code = chunk->code.data();
                 VM_NEXT;
@@ -3290,11 +3290,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
             /* No chunk (a never-called template base reached indirectly -
              * do_func_call ML_CHECKs): the legacy boundary call. */
-            LValue *ap = &ctx.frame->at(in->a.lit);
+            LValue *ap = &ctx.frame->at(in->a_lit());
             EvalValue res =
                 in->op == OpCode::CachedCallV
-                    ? vm_cached_call(&ctx, fo, ap, in->b.lit, chunk, pc)
-                    : vm_call_func(&ctx, fo, ap, in->b.lit, chunk, pc);
+                    ? vm_cached_call(&ctx, fo, ap, in->b_lit(), chunk, pc)
+                    : vm_call_func(&ctx, fo, ap, in->b_lit(), chunk, pc);
             /* Inc v2: the callee (or something it called) is unwinding
              * cross-frame - route to a same-frame handler, or return to keep
              * propagating (this frame's do_func_call captures it). Inc 4: if
@@ -3332,15 +3332,15 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             if (const Chunk *cck =
                     static_cast<const Chunk *>(fo.func->vm_chunk)) {
-                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a.lit,
-                              static_cast<size_t>(in->b.lit), in->target,
+                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
+                              static_cast<size_t>(in->b_lit()), in->target,
                               nullptr);
                 code = chunk->code.data();
                 VM_NEXT;
             }
 
-            LValue *ap = &ctx.frame->at(in->a.lit);
-            EvalValue res = vm_call_func(&ctx, fo, ap, in->b.lit, chunk,
+            LValue *ap = &ctx.frame->at(in->a_lit());
+            EvalValue res = vm_call_func(&ctx, fo, ap, in->b_lit(), chunk,
                                          pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
                 vm_flush_inline(*chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
@@ -3373,9 +3373,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * builtin throw is stamped with the args caret, mirroring
              * dispatch_call_value's catch. */
             const EvalValue &callee = ctx.frame->at(in->target2).get();
-            const int_type argbase = in->a.lit;
-            const size_t nargs = static_cast<size_t>(in->b.lit & 0xfff);
-            const int site_i = static_cast<int>(in->b.lit >> 12);
+            const int_type argbase = in->a_lit();
+            const size_t nargs = static_cast<size_t>(in->b_lit() & 0xfff);
+            const int site_i = static_cast<int>(in->b_lit() >> 12);
             const Chunk::CallSite &cs = chunk->call_sites[site_i];
             ArgLocs al = chunk->call_arglocs_at(site_i);
 
@@ -3520,7 +3520,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * caret, loc side table) unless slot `a` holds a FuncObject, a
              * Builtin, or a struct type descriptor - BEFORE the arg run
              * evaluates, matching the tree-walker's dispatch order. */
-            const EvalValue &cv = ctx.frame->at(in->a.slot).get();
+            const EvalValue &cv = ctx.frame->at(in->a_slot()).get();
             if (!cv.is<intrusive_ptr<FuncObject>>() && !cv.is<Builtin>()
                 && !cv.is<StructTypeDef *>()) {
                 Loc s, en;
@@ -3535,7 +3535,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* map/filter's arg0 guard: throw (arg0's caret, from the loc side
              * table) if it isn't a function, BEFORE arg1's code runs - the
              * tree-walker's order. AST-free. */
-            if (!ctx.frame->at(in->a.slot).get()
+            if (!ctx.frame->at(in->a_slot()).get()
                      .is<intrusive_ptr<FuncObject>>()) {
                 Loc s, en;
                 chunk->loc_at(pc, s, en);
@@ -3550,8 +3550,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             Loc s, en;
             chunk->loc_at(pc, s, en);
             ctx.frame->at(in->target).put(
-                vm_map_filter(&ctx, ctx.frame->at(in->a.slot).get(),
-                              ctx.frame->at(in->b.slot).get(),
+                vm_map_filter(&ctx, ctx.frame->at(in->a_slot()).get(),
+                              ctx.frame->at(in->b_slot()).get(),
                               in->target2 != 0, s, en));
             pc++;
         }
@@ -3563,12 +3563,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * slot, resume after the call op. The BOUNDARY frame keeps the
              * do_func_call contract: set flow, stop the invocation. */
             if (cur_rec().boundary) {
-                ctx.flow->value = ctx.frame->at(in->a.slot).get();
+                ctx.flow->value = ctx.frame->at(in->a_slot()).get();
                 ctx.flow->type = FlowState::ret;
                 return;
             }
             vm_leave_call(act, ctx, chunk, pc,
-                          ctx.frame->at(in->a.slot).get());
+                          ctx.frame->at(in->a_slot()).get());
             code = chunk->code.data();
             VM_NEXT;
         }
@@ -3597,7 +3597,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * loop-bounded (< StrLen), so view[i] is in range. */
             const std::string_view view = ctx.frame->at(in->target2).get()
                 .get_ref<SharedStr>().get_view();
-            const int_type i = read_int_operand(in->a, &ctx);
+            const int_type i = read_int_operand(in->a(), &ctx);
             ctx.frame->at(in->target).put(
                 EvalValue(SharedStr(std::string(&view[i], 1))));
             pc++;
@@ -3606,13 +3606,13 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(LoadImmInt):
             ctx.frame->at(in->target).put(
-                EvalValue(static_cast<int_type>(in->a.lit)));
+                EvalValue(static_cast<int_type>(in->a_lit())));
             pc++;
             VM_NEXT;
 
         VM_CASE(LoadImmFloat):
             ctx.frame->at(in->target).put(
-                EvalValue(static_cast<float_type>(in->a.flit)));
+                EvalValue(static_cast<float_type>(in->a_flit())));
             pc++;
             VM_NEXT;
 
@@ -3650,7 +3650,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * matching the tree-walker's stamp. */
             try {
                 ctx.frame->at(in->target).put(
-                    vm_coerce_decl_num(ctx.frame->at(in->a.slot).get(),
+                    vm_coerce_decl_num(ctx.frame->at(in->a_slot()).get(),
                                        in->target2 != 0));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
@@ -3665,9 +3665,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * eval_first_rvalue().clone() + num_binop_loc chain (int/float
              * promotion, string `+` concat, bitwise). */
             EvalValue sa, sb;
-            EvalValue val = boxed_operand(in->a, &ctx, sa).clone();
+            EvalValue val = boxed_operand(in->a(), &ctx, sa).clone();
             try {
-                num_bin_op(val, boxed_operand(in->b, &ctx, sb),
+                num_bin_op(val, boxed_operand(in->b(), &ctx, sb),
                            binop_pmf(in->aop));
             } catch (Exception &e) {
                 /* Stamp the operand loc (side table) like stamp_operand_loc, so
@@ -3687,7 +3687,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             EvalValue sb;
             EvalValue nv = ctx.frame->at(in->target).get();
             try {
-                num_bin_op(nv, boxed_operand(in->b, &ctx, sb),
+                num_bin_op(nv, boxed_operand(in->b(), &ctx, sb),
                            binop_pmf(in->aop));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
@@ -3702,9 +3702,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* dst = (a <cmp> b) as a bool - copy a, num_bin_op with the
              * comparison PMF, store is_true() (= Expr06/Expr07::do_eval). */
             EvalValue sa, sb;
-            EvalValue val = boxed_operand(in->a, &ctx, sa);
+            EvalValue val = boxed_operand(in->a(), &ctx, sa);
             try {
-                num_bin_op(val, boxed_operand(in->b, &ctx, sb),
+                num_bin_op(val, boxed_operand(in->b(), &ctx, sb),
                            cmp_pmf(in->aop));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
@@ -3720,8 +3720,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * operands are already computed (a slot or an immediate); combine
              * truthiness. */
             EvalValue sa, sb;
-            const bool a = boxed_operand(in->a, &ctx, sa).is_true();
-            const bool b = boxed_operand(in->b, &ctx, sb).is_true();
+            const bool a = boxed_operand(in->a(), &ctx, sa).is_true();
+            const bool b = boxed_operand(in->b(), &ctx, sb).is_true();
             ctx.frame->at(in->target).put(
                 EvalValue(in->aop == Op::land ? (a && b) : (a || b)));
             pc++;
@@ -3733,7 +3733,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * (clone the operand, apply). `-str`/`~str` throw a type error via
              * the Type vtable -> stamp the loc side table. */
             EvalValue s;
-            EvalValue v = boxed_operand(in->a, &ctx, s).clone();
+            EvalValue v = boxed_operand(in->a(), &ctx, s).clone();
             try {
                 switch (in->aop) {
                 case Op::plus:
@@ -3807,7 +3807,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 /* g = <expr>: write the shared global slot + mark defined -
                  * exactly slot_rmw(op==assign) (put(RValue)) + the decl's
                  * defined=1. Serves both a decl and a reassign (idempotent). */
-                lv.put(RValue(ctx.frame->at(in->a.slot).get()));
+                lv.put(RValue(ctx.frame->at(in->a_slot()).get()));
                 ctx.gfuncs->defined[in->target] = 1;
             } else {
                 /* g OP= rhs / g++ (aop = the base op, rhs in `a`): a compound
@@ -3823,7 +3823,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in->a, &ctx, sb),
+                    num_bin_op(nv, boxed_operand(in->a(), &ctx, sb),
                                binop_pmf(in->aop));
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
@@ -3839,7 +3839,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* const arr/dict/func decl: bind the slot as a CONST LValue (so a
              * later rebind still throws), local (target2==0) or global (==1).
              * The rvalue value is already materialized in `a`. */
-            EvalValue v = ctx.frame->at(in->a.slot).get();
+            EvalValue v = ctx.frame->at(in->a_slot()).get();
             if (in->target2 == 0) {
                 ctx.frame->at(in->target) = LValue(std::move(v), true);
             } else {
@@ -3856,12 +3856,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * at closure creation), so - unlike a global - no defined check. */
             LValue &lv = (*ctx.captures)[in->target];
             if (in->aop == Op::invalid) {
-                lv.put(RValue(ctx.frame->at(in->a.slot).get()));
+                lv.put(RValue(ctx.frame->at(in->a_slot()).get()));
             } else {
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in->a, &ctx, sb),
+                    num_bin_op(nv, boxed_operand(in->a(), &ctx, sb),
                                binop_pmf(in->aop));
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
@@ -3878,7 +3878,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * array / dict / string), an LValue* to the base slot passed like
              * Subscript::do_eval, for_write=false, RValue'd into dst. */
             LValue &base_lv = ctx.frame->at(in->target2);
-            const EvalValue &idx = ctx.frame->at(in->a.slot).get();
+            const EvalValue &idx = ctx.frame->at(in->a_slot()).get();
             try {
                 Type *t = base_lv.get().get_type();
                 ctx.frame->at(in->target).put(
@@ -3894,8 +3894,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(MemberV): {
             /* base.member value read via the shared member_read_core (struct
              * field / const / dict key / optional); AST-free - the name
-             * key/uid, optional flag and carets come from the pool (in->a). */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a.lit];
+             * key/uid, optional flag and carets come from the pool (in->a()). */
+            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
             ctx.frame->at(in->target).put(
                 member_read_core(ctx.frame->at(in->target2).get(), mk.memId,
                                  mk.memUid, mk.optional, mk.mstart, mk.mend,
@@ -3910,7 +3910,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * the VM analog of MemberExpr::eval_int; anything else falls to
              * the shared member_read_core + write_scalar_slot (its int
              * type-check/promotion == the tree-walker's boxed fallback). */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a.lit];
+            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
             const EvalValue &b = ctx.frame->at(in->target2).get();
             if (b.is<intrusive_ptr<StructObject>>()) {
                 const StructObject &o =
@@ -3953,7 +3953,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(LoadMemberFloat): {
             /* the eval_float twin (th==f) */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a.lit];
+            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
             const EvalValue &b = ctx.frame->at(in->target2).get();
             if (b.is<intrusive_ptr<StructObject>>()) {
                 const StructObject &o =
@@ -4000,10 +4000,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * absent bound (slot -1) passes `none`. The slice() throws (a
              * non-int index) get the caret from the loc side table. */
             const EvalValue &base = ctx.frame->at(in->target2).get();
-            const EvalValue start = in->a.slot >= 0
-                ? ctx.frame->at(in->a.slot).get() : EvalValue();
-            const EvalValue end = in->b.slot >= 0
-                ? ctx.frame->at(in->b.slot).get() : EvalValue();
+            const EvalValue start = in->a_slot() >= 0
+                ? ctx.frame->at(in->a_slot()).get() : EvalValue();
+            const EvalValue end = in->b_slot() >= 0
+                ? ctx.frame->at(in->b_slot()).get() : EvalValue();
             try {
                 ctx.frame->at(in->target).put(
                     base.get_type()->slice(base, start, end));
@@ -4024,7 +4024,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(JumpIfNotNoneV):
             /* `a ?? b` short-circuit: a non-none lhs skips the rhs. */
-            if (!ctx.frame->at(in->a.slot).get().is<NoneVal>())
+            if (!ctx.frame->at(in->a_slot()).get().is<NoneVal>())
                 pc = static_cast<size_t>(in->target);
             else
                 pc++;
@@ -4037,7 +4037,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * tree-walker) - the SAME path a runtime error takes. */
             Loc ls, le;
             chunk->loc_at(pc, ls, le);
-            const EvalValue &tv = ctx.frame->at(in->a.slot).get();
+            const EvalValue &tv = ctx.frame->at(in->a_slot()).get();
             if (!vm_raise(chunk, pc, act, ctx,
                           vm_make_thrown_exc(tv, ls, le)))
                 return;                       /* boundary: signal set */
@@ -4063,11 +4063,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * Reraise. vm_exc is KEPT (not cleared) so a `rethrow` in the catch
              * body can re-raise it; a new throw overwrites it. */
             bool match;
-            if (in->a.lit < 0) {
+            if (in->a_lit() < 0) {
                 match = true;
             } else {
                 const std::vector<std::string> &names =
-                    chunk->catch_types[in->a.lit];
+                    chunk->catch_types[in->a_lit()];
                 const std::string_view en = vm_exc_name(cur_rec().exc.get());
                 match = false;
                 for (const std::string &nm : names) {

@@ -3,7 +3,9 @@
 
 #include "defs.h"
 
-enum class Op : int {
+/* : unsigned char - Instr::aop stores an Op in ONE byte (B3, the 32-byte
+ * Instr repack); ~90 values fit with room to spare. */
+enum class Op : unsigned char {
 
     invalid     = 0,
 

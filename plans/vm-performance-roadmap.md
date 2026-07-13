@@ -153,8 +153,25 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
   path; the codegen knows the shape statically. Include `ModConstI`
   (`s % 1000000007` appears in nearly every bench's checksum loop) and
   `AddI dst, src, #1` (i++ shapes outside ForLoopStep).
-- **B3. Shrink `Instr` 56 -> 32 bytes — DESIGN SETTLED (2026-07-17),
-  awaiting the maintainer's green light to implement.** Measured today:
+- **B3. Shrink `Instr` 56 -> 32 bytes — DONE (2026-07-17, stage 1).
+  MEASURED (full-suite interleaved A/B vs 94e84f7): VM-wall geomean
+  **0.970** — a broad −2-4% (well ABOVE the "low single digits at
+  best" estimate below; the D-cache effect is real), my/py 4.57-4.59x
+  → **4.67-4.68x** on both runs. Implementation notes: `Operand`
+  survives as the codegen-side value type; `Instr` stores packed
+  payloads + a shared flags byte behind accessors (`a_slot()`/
+  `a_lit()`/`a_flit()`/`a_is_lit()`/`a_kind()`, `set_a()`, and the
+  unpacking `a()` for pass-by-const-ref sites); `static_assert(sizeof
+  (Instr) == 32)`. SEVEN ops (the CallBuiltinLV family incl. AppendV +
+  the chain stores) used the fat Operand's slot AND lit as TWO
+  independent fields at once — they now use the DUAL payload view
+  (`set_a_dual(lo, hi)` / `a_dual_lo()` / `a_dual_hi()`, int32 halves).
+  TRAP FOR THE RECORD: the mechanical regex rewrite corrupted MyLang
+  TEST-SOURCE STRINGS in tests.cpp (`d.a = 5;` → `d.set_a(5);`,
+  `f(d.a)` → `f(d.a())`) — when regex-editing C++ that EMBEDS MyLang
+  code, audit string literals explicitly. Stage 2 (the CgInstr
+  node_idx split, below) is the architectural follow-up. Original
+  design analysis kept below for reference.** Measured today:
   `sizeof(Instr) == 56` (OpCode is already 1 byte; `Op aop` is 4, needs
   1; each 16-byte Operand carries 9 bytes of information — the 8-byte
   lit/flit union forces alignment padding around the 2 tag bytes + the

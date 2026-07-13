@@ -195,6 +195,25 @@ semantics - and arity/type errors are compile-time-excluded), so it is
 loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
 0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
 
+**B3 - THE 32-BYTE PACKED `Instr` (bytecode.h).** `sizeof(Instr) == 32`
+(static_asserted), down from 56: `slot` and `lit` are mutually exclusive
+(is_lit discriminates), so each operand is ONE 8-byte payload (`pa`/`pb`,
+default -1 = the old unset slot); the per-operand tag bits live in the
+shared `opflags` byte; `Op` is `: unsigned char`. Exactly two
+instructions per cache line. `Operand` SURVIVES as the codegen-side
+VALUE type (int_lit()/slot_op()/float_lit(), all compile_* plumbing
+unchanged) - an Instr packs one via `set_a()`/`set_b()` and unpacks via
+`a()`/`b()` (the cold pass-by-const-ref sites); the HOT readers use the
+direct accessors `a_slot()`/`a_lit()`/`a_flit()`/`a_is_lit()`/`a_kind()`.
+SEVEN ops (the CallBuiltinLV family incl. AppendV, and the chain stores
+StoreElem2V/StoreElemChainV/StoreLValueChainV) used the fat Operand's
+slot AND lit as TWO independent ints at once - they use the DUAL view
+(`set_a_dual(lo, hi)`, `a_dual_lo()`/`a_dual_hi()`: int32 halves of the
+payload; an op uses EITHER the plain view OR the dual view, never both).
+Measured: VM-wall geomean 0.970 (broad -2-4%), my/py 4.67-4.68x.
+`node_idx` stays (it fills what would otherwise be padding); the CgInstr
+codegen-only split is the planned follow-up (roadmap B3).
+
 **H3 - join/split reserve + borrow (engine-shared, str.cpp.h).**
 `builtin_join` on GENERAL storage (a string array is always general)
 borrows each element by const ref (no boxed copy / SharedStr refcount

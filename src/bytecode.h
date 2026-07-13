@@ -3,6 +3,7 @@
 #pragma once
 
 #include "syntax.h"
+#include <cstring>   /* memcpy - the packed flit accessors (B3) */
 
 #include <vector>
 
@@ -1128,22 +1129,144 @@ struct Operand {
     };
 };
 
+/*
+ * B3 (plans/vm-performance-roadmap.md): the PACKED 32-byte instruction -
+ * exactly two per cache line (the old shape was 56 bytes: two 16-byte
+ * Operands whose 8-byte lit/flit unions forced alignment padding around
+ * their 2 tag bytes + 4-byte slot). The packing: `slot` and `lit` are
+ * MUTUALLY EXCLUSIVE (is_lit discriminates), so each operand is ONE 8-byte
+ * payload; the two tag bits per operand live in the shared `opflags` byte;
+ * `aop` is a 1-byte enum. `Operand` (above) SURVIVES as the codegen-side
+ * VALUE type (int_lit()/slot_op()/float_lit(), the compile_* plumbing) -
+ * an Instr packs one in via set_a/set_b and hands one back via a()/b();
+ * the HOT readers use the direct field accessors (a_slot()/a_lit()/...)
+ * so no unpacking happens in the dispatch loop.
+ */
 struct Instr {
     OpCode op;
+    Op aop = Op::invalid;   /* IntBin: arith op; JumpUnlessIntCmp: compare op */
+    /* a: bit0 = is_lit, bits1-2 = lit_kind; b: bit3 = is_lit, bits4-5. */
+    uint8_t opflags = 0;
     /* CODEGEN-TRANSIENT: index into the Codegen object's ast_nodes registry
      * (the splice-stable handle extract_locs uses to harvest an op's error
      * carets into the loc side table). verify_ast_free asserts every one is
-     * -1 when codegen finishes - at runtime NO op references an AST node
-     * (the fallback ops are deleted), which is what lets the bytecode be
-     * serialized. */
+     * -1 when codegen finishes - at runtime NO op references an AST node,
+     * which is what lets the bytecode be serialized. Under the 32-byte pack
+     * it occupies what would otherwise be padding (the CgInstr split - see
+     * the roadmap B3 entry - is a follow-up for type-level cleanliness,
+     * not bytes). */
     int32_t node_idx = -1;
     int target = -1;    /* Jump dest; IntBin dst
                          * slot; JumpUnlessIntCmp jump dest */
     int target2 = -1;   /* secondary operand (op-specific) */
-    Op aop = Op::invalid;   /* IntBin: arith op; JumpUnlessIntCmp: compare op */
-    Operand a;              /* IntBin / JumpUnlessIntCmp: left operand */
-    Operand b;              /* IntBin / JumpUnlessIntCmp: right operand */
+    /* The packed operand payloads: a frame SLOT (as a small int; -1 = the
+     * default "unset" slot, preserving the old default Operand's slot),
+     * an int/bool immediate, or a float immediate's bits. */
+    int64_t pa = -1;
+    int64_t pb = -1;
+
+    bool a_is_lit() const { return opflags & 1; }
+    bool b_is_lit() const { return opflags & 8; }
+    Operand::LitKind a_kind() const {
+        return static_cast<Operand::LitKind>((opflags >> 1) & 3);
+    }
+    Operand::LitKind b_kind() const {
+        return static_cast<Operand::LitKind>((opflags >> 4) & 3);
+    }
+    int a_slot() const { return static_cast<int>(pa); }
+    int b_slot() const { return static_cast<int>(pb); }
+    int_type a_lit() const { return static_cast<int_type>(pa); }
+    int_type b_lit() const { return static_cast<int_type>(pb); }
+    float_type a_flit() const {
+        float_type f;
+        std::memcpy(&f, &pa, sizeof f);
+        return f;
+    }
+    float_type b_flit() const {
+        float_type f;
+        std::memcpy(&f, &pb, sizeof f);
+        return f;
+    }
+
+    /* Unpack a full codegen-side Operand (the cold pass-by-const-ref
+     * sites); the hot readers use the field accessors above. */
+    Operand a() const {
+        Operand o;
+        o.is_lit = a_is_lit();
+        o.lit_kind = a_kind();
+        if (o.is_lit) {
+            if (o.lit_kind == Operand::LitKind::f)
+                o.flit = a_flit();
+            else
+                o.lit = a_lit();
+        } else {
+            o.slot = a_slot();
+        }
+        return o;
+    }
+    Operand b() const {
+        Operand o;
+        o.is_lit = b_is_lit();
+        o.lit_kind = b_kind();
+        if (o.is_lit) {
+            if (o.lit_kind == Operand::LitKind::f)
+                o.flit = b_flit();
+            else
+                o.lit = b_lit();
+        } else {
+            o.slot = b_slot();
+        }
+        return o;
+    }
+
+    void set_a(const Operand &o) {
+        opflags = static_cast<uint8_t>(
+            (opflags & ~0x07u)
+            | (o.is_lit ? 1u : 0u)
+            | (static_cast<unsigned>(o.lit_kind) << 1));
+        if (o.is_lit && o.lit_kind == Operand::LitKind::f)
+            std::memcpy(&pa, &o.flit, sizeof pa);
+        else
+            pa = o.is_lit ? o.lit : o.slot;
+    }
+    void set_b(const Operand &o) {
+        opflags = static_cast<uint8_t>(
+            (opflags & ~0x38u)
+            | (o.is_lit ? 8u : 0u)
+            | (static_cast<unsigned>(o.lit_kind) << 4));
+        if (o.is_lit && o.lit_kind == Operand::LitKind::f)
+            std::memcpy(&pb, &o.flit, sizeof pb);
+        else
+            pb = o.is_lit ? o.lit : o.slot;
+    }
+    /*
+     * The DUAL form: a few ops (the CallBuiltinLV family incl. AppendV, and
+     * the chain stores) used the old 16-byte Operand's `slot` AND `lit` as
+     * TWO independent int fields at once (pool idx + arg0-slot kind, chain
+     * idx + base kind, ...). The packed payload carries both as int32
+     * halves via these DEDICATED accessors - an op uses EITHER the plain
+     * a_slot()/a_lit() view OR the dual view, never both (documented per
+     * op at its emit site). Both halves are int32-range by construction
+     * (pool indices, frame slots, 0-2 kinds).
+     */
+    int a_dual_lo() const { return static_cast<int>(static_cast<int32_t>(pa)); }
+    int a_dual_hi() const { return static_cast<int>(pa >> 32); }
+    void set_a_dual(int lo, int hi) {
+        pa = static_cast<int64_t>(static_cast<uint32_t>(lo))
+             | (static_cast<int64_t>(hi) << 32);
+        opflags = static_cast<uint8_t>(opflags & ~0x07u);  /* not a lit */
+    }
+
+    void swap_ab() {
+        const Operand ta = a(), tb = b();
+        set_a(tb);
+        set_b(ta);
+    }
 };
+
+static_assert(sizeof(Instr) == 32,
+              "the B3 packed instruction - two per cache line; a new field "
+              "must fit the layout above, not grow it");
 
 struct Chunk {
     std::vector<Instr> code;
