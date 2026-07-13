@@ -34,6 +34,7 @@ struct NotLoweredEx : public Exception {
 #endif
 
 #include <vector>
+#include <algorithm>   /* std::count (peephole_chunk) */
 
 namespace {
 
