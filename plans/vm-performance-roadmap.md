@@ -311,9 +311,14 @@ Run over the finished chunk, before locs extraction:
 3. **C2 callback frame reuse in map/filter/sort/make_dict** — the cheap
    80% of C1 for the higher-order benches specifically; fixes the four
    "VM slower than TW" rows. Est. +3-5% now, keeps value under C1.
-4. **B1+B2 opcode specialization (per-op arith, reg/imm variants,
-   ModConst)** — removes a second switch + 2 decode branches from THE
-   hottest ops. Est. +3-6% broad, synergistic with A1.
+4. **B1+B2 opcode specialization — ✅ DONE (2026-07-16, commit aa372a8).**
+   23 per-op/per-shape variants selected by the in-place post-codegen
+   specialize_arith_ops pass. Measured (interleaved full-suite A/B):
+   VM-wall geomean **-6.3%**, suite 4.09-4.17x -> **4.45-4.48x vs
+   CPython** - past the pre-C1 peak; 01_while -25%, 03_int -20%,
+   mandelbrot -19%, bit benches -18%, broad collateral wins. Exceeded
+   the +3-6% estimate (the inner switch + decode branches were worth
+   more under computed-goto than projected).
 5. **D1 AppendV (+D2 arg windows)** — ~23% marshaling tax on append-
    heavy code (13, wordcount, matrix, sieve builders). Est. +2-4%.
 6. **E1-E4 post-codegen peephole pass** — move/dead-temp elimination,

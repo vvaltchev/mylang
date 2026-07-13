@@ -286,9 +286,13 @@ next call immediately overwrites (param slots), which today's model cannot.
   kept as the structurally right shape. Per-call machinery now ~50 instr;
   cutting deeper means a dedicated leaf-call convention - future work,
   not this plan.
-- **F. Measure + docs**: full A/B (call benches at scale 10 best-of-7,
-  suite geomean, cachegrind), CLAUDE.md (call model, stack semantics,
-  README recursion-limit note), roadmap C1/C2/G1 status.
+- **F. Measure + docs — ✅ DONE (2026-07-16).** Every phase carried its
+  own interleaved full-suite A/B (the hard rule born mid-project);
+  CLAUDE.md gained the native-call-stack section (call model, per-frame
+  record state, VmInvoker, StackOverflowEx/MYLANG_VM_STACK, the code-
+  pointer-cache lesson) and the corrected C-stack invariant; README
+  documents StackOverflowEx; the roadmap carries C1/C2 status with the
+  honest outcome. THE PLAN IS COMPLETE (A-F, 100%).
 
 ## Falsifiable risks (and the planned probes)
 

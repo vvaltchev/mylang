@@ -116,6 +116,54 @@ a mystery segfault. Still gated by `ASSERTS` (a no-op under `NDEBUG`). CMake:
 `-DVM_HARDENING=ON/OFF` (default follows the build type). See *Invariants &
 hazards*.
 
+**THE NATIVE IN-VM CALL STACK (plans/vm-native-call-stack.md, phases A-F
+complete).** A VM->VM call (`CallV`/`CachedCallV`/`CallValueV` with a
+chunked callee) is a STATE CHANGE inside the dispatch loop, not a C++
+call: `vm_enter_call` pushes a **call record** + a frame **window** on the
+activation's SEGMENTED slot stack (segments never move - C++ builtins hold
+frame pointers across user callbacks, so windows must be address-stable),
+binds args with a `fast_bind` copy loop (or the coercing loop for typed
+params), switches `chunk`/`pc`/`captures`, and dispatches; `ReturnV`/`Halt`
+pop the record and write the parent's result slot directly (FlowState is
+gone from in-VM returns; the deleted `LoopBackEdge` was its last reader).
+Per-frame state (handler stack, dict/dyn iterator pools, in-flight caught
+exception, finally-pend, the per-frame `PureCache` - stashed/restored so
+the shared view Frame can't leak it into global memoization) lives in the
+records as watermarked slices of shared stacks. The exceptional path is a
+FRAME WALK at the activation's single landing pad: dispatch to a handler in
+the current frame, else capture that record's backtrace frame (descriptor
+name/params + `loc_at(ret_chunk, ret_pc-1)` + the pure tag), pop, flush the
+call op's inlined frames, continue - byte-identical backtraces
+(differential-pinned). Boundary frames (main, `do_func_call` entries)
+convert to the `g_vm_exc_pending` signal as before. Builtin->callback loops
+(map/filter/sort's comparator/make_dict/find/make_array) use
+**`VmInvoker`** (vm.h): the callee frame is pushed ONCE per loop and each
+element just rebinds the param slots through the activation's reusable
+invoke context (its OWN FlowState - reusing the caller's would let a
+callback's boundary return corrupt the enclosing frame's flow); single-shot
+callbacks use `vm_try_invoke` (eval_func's gate). Runaway recursion throws
+the CATCHABLE **`StackOverflowEx`** at the `MYLANG_VM_STACK` slot cap
+(default 1M; README) instead of exhausting the C stack. The `code` pointer
+is cached LOOP STATE (making `chunk` reseatable killed the compiler's hoist
+of `chunk->code.data()` - a double-load per dispatch, front-end-amplified;
+refreshed only at the four chunk-change sites). Zero-copy arg binding was
+MEASURED AND DECLINED (the bind is ~2 instructions per 1-arg call; the
+protocol around it is what costs - see the plan's Phase E verdict).
+Net (interleaved full-suite A/B): suite parity with the pre-C1 baseline
+plus recursion 0.68x, sort/map 0.85x, make_dict 0.88x, fib 0.86x.
+
+**B1/B2 SPECIALIZED ARITHMETIC (`specialize_arith_ops`, codegen.cpp).** 23
+per-operator, per-shape variants of `IntBin`/`FloatBin` (Int Add/Sub/Mul/
+And/Or/Xor/Shl/Shr x RR/RI, IntModRI nonzero-imm only, Float Add/Sub/Mul x
+RR/RI - see the enum comment in bytecode.h), selected by an IN-PLACE
+post-codegen rewrite run AFTER `extract_locs` (opcode swap + a lit-first
+commutative op's operand swap into RI; no pc shifts, no loc/pool
+interaction). Each removes IntBin's inner 11-way `aop` switch AND both
+`is_lit` operand-decode branches. Div/mod-by-reg keep the checked IntBin
+path; shifts call `bit_shl`/`bit_shr`. Measured: VM-wall geomean -6.3%,
+suite 4.09-4.17x -> **4.45-4.48x vs CPython** (01_while_loop -25%,
+03_int_arith -20%, mandelbrot -19%, bit benches -18%).
+
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
 code-label addresses generated in enum order from `ML_FOR_EACH_OPCODE`
@@ -3707,11 +3755,12 @@ cond** (`for (;;)` — an unconditional loop exiting via break/return, like the
 tree-walker) and with a **BOXED increment** (`out += "x"`, a dyn `d++` — the
 same three-tier statement dispatch as any body statement). This is where
 the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
-−71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** runs these
-loops inside **function bodies** too: `do_func_call` runs a callee's body via
-`vm_run_chunk` (the chunk stamped on the function's **`FuncDescriptor`**,
-stored in `g_func_chunks` keyed by descriptor), reusing all of
-`do_func_call`'s frame/param/backtrace machinery. **Compilation is AOT, not
+−71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** ran these
+loops inside **function bodies** too (via `do_func_call`); since the NATIVE
+CALL STACK landed (see its section below) a VM->VM call never goes through
+`do_func_call` at all - the chunk is stamped on the function's
+**`FuncDescriptor`** (stored in `g_func_chunks`, keyed by descriptor) and
+the dispatch loop pushes/pops call records itself. **Compilation is AOT, not
 lazy** (`vm_precompile_all`, run by `vm_compile`): it walks `collect_funcs`
 (which recurses via the COMPLETE `for_each_child_of`, so a func declared in a
 try body / slice / anywhere is not missed) and compiles EVERY function body
@@ -4398,9 +4447,14 @@ instrumentation (see `plans/function-templates.md`).
   instrumentation on CI* (this + the Linux core-dump artifact), not a bisect.
   `Frame` gained a `size` field (the constructed-slot count) for the bound.
 
-- **The interpreter RECURSES on the C stack — Windows needs a bigger stack
-  reserve.** Both engines recurse: the tree-walker (`do_eval`) and the VM
-  (`vm_run_chunk` is re-entered per recursive call, via `do_func_call`). Deep
+- **The TREE-WALKER recurses on the C stack — Windows needs a bigger stack
+  reserve.** The tree-walker (`do_eval`) recurses per call; the VM no
+  longer does (the native call stack runs VM->VM calls inside ONE
+  `vm_run_chunk` activation - C-stack depth is O(1) per activation, and a
+  runaway recursion throws the CATCHABLE `StackOverflowEx` at the
+  `MYLANG_VM_STACK` slot cap instead of crashing). The C++ recursion that
+  remains under `-vm` is per BOUNDARY entry (a builtin callback re-entering
+  the loop), not per call. Deep
   recursion (the ackermann test, deep `fib`) needs more than **Windows' 1 MB
   default** stack; Linux and macOS default to **8 MB**, which is why they never
   hit this. The **fix is a linker flag** — `CMakeLists.txt` sets
