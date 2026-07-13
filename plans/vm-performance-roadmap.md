@@ -103,13 +103,22 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
   predicts per-op-pair patterns instead of one mega-hub). Classic 10-20%
   on dispatch-bound interpreters; our own data says the hub costs us
   ~10-30% per loop bench since the switch doubled.
-- **A2. Hot/cold handler split.** The 92-case body is one giant function;
-  cold, code-heavy handlers (throw paths, Foreach*Init, MakeStructArrayV,
-  chain stores, IncDec* checked forms) should be `ML_NOINLINE` helpers so
-  the hot core (IntBin/FloatBin/cmp-branches/ForLoopStep/Load*/Store*/
-  Move/Call) fits registers + I-cache. Several already are; audit ALL
-  cases >~50 instructions. Measure register spills in the main loop
-  (`-fverbose-asm` / count stack traffic per hot handler).
+- **A2. Hot/cold handler split — ONLY together with A1, never alone.**
+  HISTORY (2026-07-08, transcript + `vm-dispatch-frontend-regression`
+  memory): the standalone cold-split experiment (10 fat ops into an
+  `ML_NOINLINE vm_cold_op`) DID shrink vm_run_chunk 6952 -> 5803 static
+  instructions yet made the regression WORSE (NEW/OLD 1.168 vs 1.125) -
+  measured, reverted. Lesson: perturbing the one-big-switch layout in
+  isolation is a coin flip. Under COMPUTED-GOTO the calculus changes
+  (each handler is its own block with its own dispatch tail; keeping the
+  hot ones small is then a local property, not a global-layout gamble),
+  so do the split as part of the A1 conversion and A/B the pair.
+  ALSO FALSIFIED (2026-07-08/09, "Revert to the switches"): converting
+  the big switches to `.rodata` array lookups - the audit showed the hot
+  dispatch switches are ALREADY jump tables (`notrack jmp *%rax`), and
+  the value-map conversions (binop_pmf/cmp_pmf) measured ~2-3% SLOWER.
+  Computed-goto is NEITHER of those: it was explained + tracked as the
+  big lever on 2026-07-10 but never implemented.
 - **A3. Hot-case ordering + pc-as-pointer.** Keep the hot opcodes first
   in the enum (jump-table locality); iterate `const Instr *ip` instead of
   `code[pc]` indexing (saves an index-scale per op; pc reconstructed only
@@ -119,9 +128,12 @@ broad + ~1.7x on 10. The plan below is sized accordingly.
 
 - **B1. Split IntBin/FloatBin by operator.** `IntAdd/IntSub/IntMul/...`
   (and float twins) remove the per-execution inner 11-way switch on
-  `aop`. With A1 each becomes a tight 3-address handler. Div/mod keep
-  their zero checks in their own handlers (the hot add/sub/mul lose the
-  branch entirely).
+  `aop`. (That inner switch IS already a jump table - the .rodata audit
+  proved the compiler does that - but it is still a second data-dependent
+  indirect branch + table load per arith op; a per-op opcode turns it
+  into straight-line code.) With A1 each becomes a tight 3-address
+  handler. Div/mod keep their zero checks in their own handlers (the hot
+  add/sub/mul lose the branch entirely).
 - **B2. Immediate-variant opcodes.** `IntAddRR/IntAddRI` (reg-reg,
   reg-imm) etc. remove BOTH `is_lit` operand-decode branches from the hot
   path; the codegen knows the shape statically. Include `ModConstI`
