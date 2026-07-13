@@ -80,13 +80,18 @@ pc (a PushHandler edge) or C++-rethrows; its normal path falls through.
   `i.jmp.ifnot !C L2`). Float compare inversion is EXCLUDED — NaN:
   `!(a<b)` is not `a>=b`. JumpUnlessTrueV has no inverted form — skip.
 - **Inc 2 — E1 (copy prop / MoveV elimination).** Backward liveness
-  over TEMP slots only (bit-set per pc, fixpoint over the CFG). Rule:
-  `<producer dst=tX>; MoveV d=tX` (adjacent, no branch target between,
-  tX dead after the move, producer's dst rewritable) → retarget
-  producer to d, delete the MoveV. Plus dead-STORE deletion for a
-  side-effect-free whitelist (MoveV/LoadImm*/LoadConstV/the specialized
-  arith ops... — pre-specialization that's MoveV/LoadImm*/LoadConstV
-  only; IntBin can throw on div) writing a dead temp.
+  over TEMP slots only (bit-set per pc, fixpoint over the CFG). The
+  generalized rule handles BOTH move shapes: for a `MoveV d=tX` (tX a
+  temp, dead after the move), EVERY predecessor must be a retargetable
+  producer of tX — the fall-through one directly (the ARM-move shape,
+  `prod; move; jmp`, fib's), and each branch into the move must be a
+  plain `Jump` (a conditional entering the join disqualifies) whose own
+  fall-through predecessor is such a producer and which nothing else
+  enters (the JOIN-move shape: both ternary arms produce tX, one move
+  at the join — all producers retarget to d). Then delete the move
+  (neutralized to a jump-to-next; the same round's deletion removes
+  it). Dead-STORE deletion (side-effect-free whitelist writing a dead
+  temp) remains a future rule.
 - **Inc 3 — E2 (temp shrink): EVALUATED + DEFERRED.** The native call
   stack already made the per-call temp cost ~nil: an in-VM window push
   does NOT construct slots (segments are constructed once; pop resets
@@ -114,6 +119,23 @@ MODEST wall win + smaller chunks/frames; the hard rule applies — a
 full-suite interleaved A/B decides, and a null result with clean
 infrastructure is an acceptable outcome (the infra is what E4 fusions
 and the typed-ternary rewrite build on).
+
+## Post-land lessons (the red-CI fix, 2026-07-17)
+
+1. **Op-count tests are COUPLED to this pass** — a peephole improvement
+   legitimately BREAKS stale pins. The first landing turned all 4 CI
+   lanes red on two pins the pass had IMPROVED: `break`/`continue`
+   jumps now INVERT away (`if(i==3) continue` → one
+   `i.jmp.ifnot i != 3 -> for.step`, zero plain Jumps), and an
+   always-returning try body's normal fall-out (`try.pop; set.pend
+   normal; jmp`) is unreachable (the return inlines its finally) and is
+   deleted — `setpend` drops 2→1. When a codegen-shape test fails after
+   a peephole change, DUMP the shape and decide improved-vs-broken;
+   re-pin only after reading the bytecode.
+2. **Read the `-rt` HEADLINE (`Tests passed: N/M`), never a bare tail**
+   — the differential line prints [PASS] independently AFTER a failing
+   headline, and `tail -3` showed exactly the wrong two lines. The
+   red push happened because of this misread; grep the headline.
 
 ## Follow-ups recorded
 

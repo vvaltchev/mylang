@@ -6890,31 +6890,72 @@ static void peephole_chunk(Chunk &ck)
                 }
             }
 
-            for (size_t p = 0; p + 1 < n; p++) {
-                Instr &prod = code[p];
-                Instr &m = code[p + 1];
-                if (m.op != OpCode::MoveV || is_tgt[p + 1]
-                    || !retargetable_dst(prod.op)
-                    || prod.target != m.target2
-                    || m.target == m.target2)
+            uint64_t hlive = 0;
+            for (int h : handler_pcs)
+                if (h >= 0 && static_cast<size_t>(h) < n)
+                    hlive |= live_in[h];
+
+            for (size_t q = 0; q < n; q++) {
+                Instr &m = code[q];
+                if (m.op != OpCode::MoveV || m.target == m.target2)
                     continue;
-                const uint64_t sb = bit(m.target2);
+                const int src = m.target2;
+                const uint64_t sb = bit(src);
                 if (!sb)
                     continue;             /* src not a temp */
-                /* live-out of the move = live-in of its fall-through +
-                 * the handler absorption (MoveV cannot throw, but stay
-                 * uniform/conservative). */
-                uint64_t hlive = 0;
-                for (int h : handler_pcs)
-                    if (h >= 0 && static_cast<size_t>(h) < n)
-                        hlive |= live_in[h];
+                /* live-out of the move = live-in of its fall-through + the
+                 * handler absorption (MoveV cannot throw; stay uniform). */
                 const uint64_t mout =
-                    (p + 2 < n ? live_in[p + 2] : 0) | hlive;
+                    (q + 1 < n ? live_in[q + 1] : 0) | hlive;
                 if (mout & sb)
                     continue;             /* src still read later */
-                prod.target = m.target;   /* produce straight into d */
-                m.op = OpCode::Jump;      /* neutralize: jump-to-next... */
-                m.target = static_cast<int>(p) + 2;   /* ...deleted below */
+
+                /* EVERY predecessor of the move must be a retargetable
+                 * producer of src: the fall-through one directly, and each
+                 * branch into the move must be a plain Jump (a conditional
+                 * entering the join disqualifies) whose own fall-through
+                 * predecessor is such a producer (the arm's tail; nothing
+                 * else may enter that Jump). Covers both the arm-move shape
+                 * (`prod; move; jmp` per arm) and the JOIN-move shape
+                 * (`prod; jmp Lq` / `prod` fall-through + one move at Lq). */
+                std::vector<size_t> prods;
+                bool ok = true;
+                for (size_t j = 0; j < n && ok; j++) {
+                    if (j == q)
+                        continue;
+                    bool hits = false;
+                    visit_pc_fields(code[j], [&](int &t) {
+                        if (t == static_cast<int>(q))
+                            hits = true;
+                    });
+                    if (!hits)
+                        continue;
+                    if (code[j].op != OpCode::Jump || is_tgt[j] || j == 0) {
+                        ok = false;
+                        break;
+                    }
+                    Instr &p = code[j - 1];
+                    if (!op_falls_through(p.op) || !retargetable_dst(p.op)
+                        || p.target != src) {
+                        ok = false;
+                        break;
+                    }
+                    prods.push_back(j - 1);
+                }
+                if (!ok)
+                    continue;
+                if (q > 0 && op_falls_through(code[q - 1].op)) {
+                    Instr &p = code[q - 1];
+                    if (!retargetable_dst(p.op) || p.target != src)
+                        continue;
+                    prods.push_back(q - 1);
+                }
+                if (prods.empty())
+                    continue;
+                for (size_t p : prods)   /* produce straight into d */
+                    code[p].target = m.target;
+                m.op = OpCode::Jump;     /* neutralize: jump-to-next... */
+                m.target = static_cast<int>(q) + 1;  /* ...deleted below */
                 changed = true;
             }
         }

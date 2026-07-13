@@ -13788,15 +13788,19 @@ static bool vm_codegen_shapes()
         return false;
     const bool mathfn_ok = mf.mathfnv == 5 && mf.callbuiltinv == 0;
 
-    /* 14c) the E1-E4 PEEPHOLE (plans/vm-peephole.md): a ternary's arms
-     * produce STRAIGHT into the assignment's dst (the arm-temp MoveV is
-     * eliminated by liveness-checked producer retargeting), leaving one
-     * arm-skip Jump and zero moves. */
+    /* 14c) the E1-E4 PEEPHOLE (plans/vm-peephole.md): a RUNTIME ternary's
+     * arms produce STRAIGHT into the assignment's dst - the join-point
+     * MoveV is eliminated by retargeting BOTH arm producers (liveness-
+     * checked) - leaving one arm-skip Jump and zero moves. (The source
+     * must be runtime: a const-foldable ternary disappears entirely, which
+     * is the parser/AutoConst's job, not the peephole's.) */
     VmOpCounts pp;
     if (!codegen_counts({
-            "var a = 5; var b = 3;",
-            "var dyn c = a < b;",
-            "var r = c ? a + 1 : b + 2;",
+            "var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "    var r = i < 2 ? i + 1 : i + 7;",
+            "    s += r;",
+            "}",
         }, pp))
         return false;
     const bool peephole_ok = pp.movev == 0 && pp.jmp == 1;
@@ -13842,8 +13846,11 @@ static bool vm_codegen_shapes()
             " s += i; }",
         }, bk))
         return false;
+    /* The peephole INVERTS both flow jumps (branch-over-jump): `if(i==3)
+     * continue;` becomes ONE `i.jmp.ifnot i != 3 -> for.step` - so ZERO
+     * plain Jumps remain. */
     const bool break_cont_ok =
-        bk.flstep == 1 && bk.jmp >= 2 && bk.juic >= 3 && bk.intbin >= 1;
+        bk.flstep == 1 && bk.jmp == 0 && bk.juic >= 3 && bk.intbin >= 1;
 
     /* 18) a COMPOUND loop condition `while (A && B)` lowers to one native
      * compare-branch per conjunct (both to the exit) - so
@@ -14129,8 +14136,12 @@ static bool vm_codegen_shapes()
             "}",
         }, fr))
         return false;
+    /* ONE SetPend: the try body always returns (the return INLINES its
+     * finally), so the normal fall-out path (try.pop + set.pend normal +
+     * jmp) is unreachable and the peephole deletes it - only the handler
+     * entry's `set.pend reraise` + the shared finally remain. */
     const bool ret_finally_native_ok =
-        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend == 2
+        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend == 1
        ;
 
     /* A `break` crossing a finally likewise INLINES the finally at the break
