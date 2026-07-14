@@ -721,8 +721,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << arglist(chunk, in.a_lit(), in.b_lit());
             break;
         case OpCode::AppendV:
-            /* D1: same shape as call.blt.lv, the append fast op */
-            row << "append.v     " << D(in.target) << " = "
+            /* D1: same shape as call.blt.lv, the append fast op; a -1 dst =
+             * a DISCARDED result (the peephole's dead-dst rule) */
+            row << "append.v     "
+                << (in.target < 0 ? std::string("_") : D(in.target)) << " = "
                 << builtin_call_name(chunk, in.a_dual_lo())
                 << "(" << lval_ref(in.a_dual_hi(), in.target2) << ", "
                 << D(static_cast<int_type>(in.b_lit())) << ")";

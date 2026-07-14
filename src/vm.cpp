@@ -1612,6 +1612,25 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
  * record (see the comment in vm_run_chunk). Returns the activation. */
 static ML_NOINLINE VmActivation *
 vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
+                    bool &swapped, bool &pushed);
+
+/* Call-cluster #2: the COMMON re-entry (a builtin callback re-running its
+ * prepared chunk per element - VmInvoker's loop) finds the activation set
+ * and its own boundary record on top: two loads + two compares, INLINE, no
+ * out-of-line call. Anything else takes the NOINLINE setup below. */
+static ML_ALWAYS_INLINE VmActivation *
+vm_enter_invocation_fast(const Chunk *chunk,
+                         std::unique_ptr<VmActivation> &own,
+                         bool &swapped, bool &pushed)
+{
+    VmActivation *a = g_vm_act;
+    if (a && !a->records.empty() && a->records.back().run_chunk == chunk)
+        return a;
+    return vm_enter_invocation(chunk, own, swapped, pushed);
+}
+
+static ML_NOINLINE VmActivation *
+vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
                     bool &swapped, bool &pushed)
 {
     if (!g_vm_act) {
@@ -1800,9 +1819,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
     } entry_guard;
 
-    VmActivation &act = *vm_enter_invocation(chunk, local_act,
-                                             entry_guard.swapped,
-                                             entry_guard.pushed);
+    VmActivation &act = *vm_enter_invocation_fast(chunk, local_act,
+                                                  entry_guard.swapped,
+                                                  entry_guard.pushed);
 
     /*
      * The CURRENT chunk's instruction array, cached as loop state: `chunk`
@@ -3097,14 +3116,21 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             const EvalValue &elem = ctx.frame->at(in->b_lit()).get();
             if (target && arr_append_fast(target, elem, false)) {
-                ctx.frame->at(in->target).put(target->get());
+                /* Call-cluster #4: a DISCARDED result (`append(a, x);` as a
+                 * statement - the peephole proved the dst temp dead and set
+                 * it to -1) skips materializing the array handle: one
+                 * intrusive refcount round-trip + 32B copy per append. */
+                if (in->target >= 0)
+                    ctx.frame->at(in->target).put(target->get());
                 pc++;
                 VM_NEXT;
             }
             try {
-                ctx.frame->at(in->target).put(
-                    vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(), target,
-                                            in->b_lit()));
+                EvalValue res =
+                    vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(),
+                                            target, in->b_lit());
+                if (in->target >= 0)
+                    ctx.frame->at(in->target).put(std::move(res));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;

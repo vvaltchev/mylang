@@ -7168,6 +7168,21 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                     }
                 }
 
+                /* Call-cluster #4: an AppendV whose dst is a DEAD temp
+                 * (the statement form `append(a, x);`) drops the result
+                 * materialization - dst = -1, the handler skips the put
+                 * (an intrusive refcount round-trip + 32B array-handle
+                 * copy per append). */
+                if (op1.op == OpCode::AppendV && op1.target >= 0
+                    && bit(op1.target)) {
+                    const uint64_t aout =
+                        (p + 1 < n ? live_in[p + 1] : 0) | hlive;
+                    if (!(aout & bit(op1.target))) {
+                        op1.target = -1;
+                        changed = true;
+                    }
+                }
+
                 /* LoadElemInt t = arr[i]; JumpUnlessTrueV t, L  ->
                  * JumpUnlessElemInt arr[i], L (the sieve test). The temp
                  * must be dead on BOTH successor paths; op1's node/loc

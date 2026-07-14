@@ -15,6 +15,35 @@ State: geomean 4.70-4.75x; ONE bench again loses to CPython
 append/strings/struct-literals (13 at 0.79, 31/32 at 0.81/0.70, 77 at
 0.64). VM/TW geomean 0.457 (the VM is ~2.2x the tree-walker).
 
+**Status update (2026-07-17, same day): items 1-4 (the call cluster)
+were implemented and measured — the OUTCOME differs from the plan and
+is instructive:**
+- **#4 (discard-aware AppendV): DONE, a clean win** — the peephole's
+  dead-dst rule sets dst = -1 (the statement form `append(a, x);`), the
+  handler skips the array-handle put. 13_array_append 0.047s / 0.74x
+  my/py (best ever).
+- **#2: the INLINE fast path shipped** (`vm_enter_invocation_fast`: the
+  common callback re-entry is two loads + two compares inline, no
+  out-of-line call). 34_sort 0.072s / 0.82x, 35_map_filter 0.79x (best
+  evers). The DEEPER per-element entry cost (vm_run_chunk's own
+  prologue for a 3-op callback body) remains — splitting the entry
+  would move the 1300-line loop body, a layout gamble not taken.
+- **#3 (inline trivial-type EvalValue assign): TRIED TWICE + DECLINED.**
+  v1 (trivial-first pre-test) regressed the REFERENCE-heavy benches
+  (the pre-test taxes every non-trivial assign); v2 (same-type-first,
+  branch-neutral per case) regressed BROADLY with my/py agreeing —
+  the operators are inlined at ~hundreds of sites, so ANY textual
+  growth of them perturbs the whole binary (the front-end lesson at
+  its purest). The original operators were already well-shaped.
+  Reverted both.
+- **#1 (slim enter/leave): EVALUATED, mostly absorbed** — the record
+  fill is leaner than profiled (the double-init is ~1 dead store; the
+  binds were #3's territory). The remaining idea worth a future look:
+  a per-chunk "possibly-reference slots" list so vm_leave_call's
+  O(nslots) reset scan skips all-scalar frames (fib-class).
+  MEASURED (the shipped #2+#4, full-suite interleaved A/B vs 83ac551):
+  suite VM-wall geomean **0.984**, my/py 4.74-4.75x → **4.78-4.82x**.
+
 **The top-10, ordered by expected value (evidence per item):**
 
 1. **Slim the in-VM call protocol.** `vm_enter_call` + `vm_leave_call`
