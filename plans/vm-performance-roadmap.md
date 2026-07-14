@@ -1,4 +1,79 @@
 # VM performance roadmap: from 3.9x to 5x+ over CPython
+# (2026-07-17: currently 4.70-4.75x - see the RE-PROFILE section below)
+
+## 2026-07-17 RE-PROFILE — the CURRENT top-10 (post-E4, suite 4.70-4.75x)
+
+Fresh session at HEAD 83ac551 (release, scale 1): full-suite my/py +
+VM/TW runs, callgrind on the six worst my/py laggards, plus the E4
+op-pair profile (760M dispatches). Everything below Part 1 of this file
+is the HISTORICAL 2026-07-15 deep-dive — kept for the record; its
+"where the time goes" numbers are superseded by these.
+
+State: geomean 4.70-4.75x; ONE bench again loses to CPython
+(76_funcval_dispatch 1.10x); the laggard cluster is call/callback-bound
+(34_sort_cmp 0.87, 67_make_dict 0.86, 35_map_filter 0.81) plus
+append/strings/struct-literals (13 at 0.79, 31/32 at 0.81/0.70, 77 at
+0.64). VM/TW geomean 0.457 (the VM is ~2.2x the tree-walker).
+
+**The top-10, ordered by expected value (evidence per item):**
+
+1. **Slim the in-VM call protocol.** `vm_enter_call` + `vm_leave_call`
+   = 11.1% of 76_funcval (plus the arg/return `LValue::put`s at 8.8%);
+   every call-bound bench pays it (76/10/09/12/63). The VmCallRec fill
+   is ~15 fields per call — audit which are needed on the COMMON path
+   (no handlers, no iterators, no cache) and split a fast record fill.
+2. **One-entry-per-loop for callback RUNS, not just windows.**
+   `VmInvoker::invoke` is 19-24% of 34/35/67 AND each invoke re-enters
+   `vm_run_chunk` (vm_enter_invocation 5.1% + EntryGuard dtor 4.3% on
+   35): the activation setup is per-ELEMENT. Keep the entry state
+   alive across the loop (the invoker owns the activation already) —
+   a lightweight re-entry that skips vm_enter_invocation.
+3. **Inline the trivial-type EvalValue assign.** `LValue::put` +
+   `EvalValue::operator=` show 4-17% on EVERY profiled bench even
+   after the H2 inline (the residual is the type-erased move/copy
+   dispatch). An inline is-trivial (`type->t < t_str` both sides)
+   bit-copy fast path in the assign operators themselves.
+4. **Discard-aware AppendV.** `append(a, x);` as a statement still
+   materializes the RESULT: the handler puts the ARRAY HANDLE into a
+   discarded dst temp — an intrusive refcount round-trip + 32B copy
+   per append (`TypeImpl<SharedArrayObj>::copy_assign` 5.7% of 13).
+   dst == -1 → skip the put. Trivial, ~5-8% of bench 13.
+5. **dst-slot REUSE for container literals** (the H1 struct trick,
+   generalized): `MakeArrayV`/`MakeStructArrayV`/`MakeDictV` into a
+   loop var whose previous same-shape container has use_count()==1
+   overwrite it in place. 77_struct_array_lit spends 13%+ in
+   malloc/free building + freeing a fresh array per iteration
+   (22_multi_assign-class loops too).
+6. **Pool the intrusive OBJECT HEADERS** via the existing
+   `pool_alloc_one`: StrObj (32_build_join: 12% malloc/free making a
+   StrObj per `str(i)`), StructObject (64), SharedArrayObj/DictObject
+   shells, ExceptionObject (69). The H2 v2 pool generalized from map
+   nodes to the runtime's small fixed-size objects.
+7. **Flat string-array storage** (`Storage::strs`: a
+   `vector<SharedStr>` = 24B/elem vs the 48B LValue): helps split's
+   per-piece emplace (31), keys() of string dicts (27), join reads.
+   A real storage-kind addition — design-level, like flat_s was.
+8. **Typed dict-foreach bodies.** The E4 pair profile's #1-2 pairs
+   (Jump→ForeachDynNext→BinOpV, 10.5% of ALL suite dispatches) are
+   74/66's BOXED loop bodies over dyn containers. Their my/py already
+   wins (0.37x/0.55x) so this is absolute-time, not ratio, value —
+   typed binds for a proven dict<K,int/float> foreach would convert
+   the BinOpV chains to IntBin.
+9. **The residual fusion batch** (from the same pair profile):
+   ForLoopStep→LoadElemInt 2.8%, LoadStructFieldInt↔IntAddRR 2.7%,
+   IntAddRR→ForLoopStep 3.1% — each ~0.5% suite; only worth it as a
+   batch after 1-6.
+10. **An inline cache on CallValueV** for 76 specifically: the
+    dict-dispatched func VALUE is usually the SAME FuncObject as the
+    last call at that site — cache {FuncObject* → validated} per op
+    (a per-op slot in a side pool) and skip re-validation, bringing an
+    indirect call to near-CallV cost. 76 is the only CPython loss.
+
+Expected: items 1-4 are the call-cluster (~the 5x gap by themselves if
+they deliver ~half their profile shares); 5-6 are the alloc cluster;
+7-10 are targeted. The hard rule applies to every one.
+
+---
 
 Deep-dive (2026-07-15, HEAD 98d5d70, release `OPT=1 ASSERTS=0`, WSL2 —
 wall clock via `bench/run.py`, deterministic counts via cachegrind /

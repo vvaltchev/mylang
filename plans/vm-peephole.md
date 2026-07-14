@@ -1,8 +1,11 @@
 # The post-codegen peephole pass (roadmap E1-E4)
 
-Status: Inc 1 (infra + E3) and Inc 2 (E1 MoveV elimination) DONE
-(2026-07-16); E2 evaluated + deferred (see below); E4 = the framework
-itself. Measured numbers in the roadmap E-section.
+Status: COMPLETE. Inc 1 (infra + E3) + Inc 2 (E1 MoveV elimination)
+DONE 2026-07-16; E2 evaluated + deferred; the typed-ternary follow-up
+and the first TWO E4 fusions (IntAddModRI, JumpUnlessElemInt) DONE
+2026-07-17 — see the Follow-ups section below and the roadmap E entry.
+Remaining fusion candidates live in the roadmap's 2026-07-17 top-10
+(item 9).
 
 Static results (bench/ + samples/): total instrs 3761 → 3587 (−4.6%),
 MoveVs 399 → 275 (−31%), fib$0's chunk 68 → 56 instrs (−18% — every
@@ -102,10 +105,10 @@ pc (a PushHandler edge) or C++-rethrows; its normal path falls through.
   visitor (every op) for a ~nil measured win — not worth the risk
   today. Revisit if a profile ever shows window space or boundary
   Frame::init.
-- **E4 (fusion framework).** The pass IS the framework — a fusion rule
-  is another match/rewrite over the instruction window. No new fusions
-  ship with this change (B1/B2 stays a separate in-place rewrite;
-  candidates recorded below).
+- **E4 (fusion framework → fusions).** The pass IS the framework — a
+  fusion rule is another match/rewrite over the instruction window.
+  The first two fusions SHIPPED 2026-07-17 (see Follow-ups below);
+  B1/B2 stays a separate in-place rewrite.
 
 ## Quantified expectations (measured before building)
 
