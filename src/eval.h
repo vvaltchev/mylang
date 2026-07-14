@@ -628,6 +628,8 @@ class FuncObject : public RefCounted {
 
 public:
 
+    ML_POOL_NEW_DELETE
+
     /*
      * The function's RUNTIME identity (funcdesc.h) - NOT an AST node. Binding,
      * frame sizing, purity, backtraces, and reflection all read the

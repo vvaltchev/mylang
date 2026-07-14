@@ -233,7 +233,9 @@ namespace {
 
 struct PoolFreeNode { PoolFreeNode *next; };
 constexpr size_t POOL_CLASS_STEP = 16;
-constexpr size_t POOL_NCLASSES = 10;      /* classes: 16..160 bytes */
+constexpr size_t POOL_NCLASSES = 16;      /* classes: 16..256 bytes (#6
+                                           * raised it from 160: FuncObject
+                                           * is ~176-200) */
 constexpr size_t POOL_BLOCK_BYTES = 4096;
 PoolFreeNode *g_pool_free[POOL_NCLASSES];
 std::vector<void *> g_pool_blocks;        /* leak-checker visibility */
@@ -242,6 +244,9 @@ std::vector<void *> g_pool_blocks;        /* leak-checker visibility */
 
 void *pool_alloc_one(size_t size)
 {
+#ifdef ML_POOLALLOC_PASSTHROUGH
+    return ::operator new(size);     /* ASan: keep full UAF coverage */
+#endif
     const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
 
     if (cls == 0 || cls > POOL_NCLASSES)
@@ -268,6 +273,10 @@ void *pool_alloc_one(size_t size)
 
 void pool_free_one(void *p, size_t size) noexcept
 {
+#ifdef ML_POOLALLOC_PASSTHROUGH
+    ::operator delete(p);
+    return;
+#endif
     const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
 
     if (cls == 0 || cls > POOL_NCLASSES) {

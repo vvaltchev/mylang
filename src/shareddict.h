@@ -12,6 +12,8 @@ template <class EvalValueT, class LValueT>
 class DictObjectTempl : public RefCounted {
 
 public:
+
+    ML_POOL_NEW_DELETE
     /* H2 v2: the NODE-POOLED map (poolalloc.h) - a chained unordered_map
      * heap-allocated a ~96-byte node per insert; the pool serves those
      * from program-lifetime free lists. Node-pointer stability (what the

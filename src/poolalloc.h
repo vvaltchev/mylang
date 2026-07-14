@@ -47,6 +47,19 @@
 void *pool_alloc_one(size_t size);
 void pool_free_one(void *p, size_t size) noexcept;
 
+/*
+ * Class-scope pooled allocation (top-10 #6): the runtime's small, fixed-size
+ * intrusive HEAP OBJECTS (StrObj, SharedObject, DictObject, StructObject,
+ * FuncObject, ExceptionObject) churn per value - a StrObj per str(i), a
+ * StructObject per standalone construction, a FuncObject per closure. Sized
+ * class operator new/delete route them through the same program-lifetime
+ * free lists as the map nodes (an oversized class falls back to plain new
+ * inside pool_alloc_one automatically; the ASan pass-through gate lives in
+ * the pool core, so sanitizer lanes keep full UAF coverage). The explicit
+ * placement forms are re-declared because a class operator new hides them.
+ */
+#define ML_POOL_NEW_DELETE                                                      static void *operator new(size_t sz) { return pool_alloc_one(sz); }         static void operator delete(void *p, size_t sz) noexcept {                      pool_free_one(p, sz);                                                   }                                                                           static void *operator new(size_t, void *p) noexcept { return p; }           static void operator delete(void *, void *) noexcept {}
+
 template <typename T>
 struct PoolAlloc {
 

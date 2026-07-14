@@ -3,6 +3,7 @@
 #pragma once
 
 #include "defs.h"
+#include "poolalloc.h"
 #include "flatval.h"
 #include "intrusiveptr.h"
 #include <string>
@@ -19,6 +20,9 @@ private:
      * get_ref() hands out the wrapped string.
      */
     struct StrObj final : RefCounted {
+
+        ML_POOL_NEW_DELETE
+
         inner_type s;
         /*
          * Strings are immutable, so their hash never changes - cache it on the

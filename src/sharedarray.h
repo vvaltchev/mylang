@@ -3,6 +3,7 @@
 #pragma once
 
 #include "defs.h"
+#include "poolalloc.h"
 #include "flatval.h"
 #include "intrusiveptr.h"
 #include "errors.h"
@@ -91,6 +92,9 @@ private:
     static constexpr size_type all_slices = static_cast<size_type>(-1);
 
     struct SharedObject final : RefCounted {
+
+        ML_POOL_NEW_DELETE
+
 
         Storage kind;
 

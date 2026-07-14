@@ -3,6 +3,7 @@
 #pragma once
 
 #include "defs.h"
+#include "poolalloc.h"
 #include "flatval.h"
 #include "errors.h"
 #include "intrusiveptr.h"   /* RefCounted: held in the value model as t_ex */
@@ -18,6 +19,8 @@ class ExceptionObjectTempl : public RuntimeException, public RefCounted {
     EvalValueT data;
 
 public:
+
+    ML_POOL_NEW_DELETE
 
     ExceptionObjectTempl(const std::string &name,
                          const EvalValueT &data = EvalValueT())

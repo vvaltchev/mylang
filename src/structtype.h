@@ -3,6 +3,7 @@
 #pragma once
 
 #include "defs.h"
+#include "poolalloc.h"
 #include "evalvalue.h"
 #include "uniqueid.h"
 #include <vector>
@@ -232,7 +233,10 @@ struct StructTypeDef {
  */
 class StructObject : public RefCounted {
 
+
 public:
+
+    ML_POOL_NEW_DELETE
 
     StructTypeDef *def = nullptr;
     bool readonly = false;
