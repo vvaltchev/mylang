@@ -67,17 +67,31 @@ is instructive:**
    discarded dst temp — an intrusive refcount round-trip + 32B copy
    per append (`TypeImpl<SharedArrayObj>::copy_assign` 5.7% of 13).
    dst == -1 → skip the put. Trivial, ~5-8% of bench 13.
-5. **dst-slot REUSE for container literals** (the H1 struct trick,
-   generalized): `MakeArrayV`/`MakeStructArrayV`/`MakeDictV` into a
-   loop var whose previous same-shape container has use_count()==1
-   overwrite it in place. 77_struct_array_lit spends 13%+ in
-   malloc/free building + freeing a fresh array per iteration
-   (22_multi_assign-class loops too).
-6. **Pool the intrusive OBJECT HEADERS** via the existing
-   `pool_alloc_one`: StrObj (32_build_join: 12% malloc/free making a
-   StrObj per `str(i)`), StructObject (64), SharedArrayObj/DictObject
-   shells, ExceptionObject (69). The H2 v2 pool generalized from map
-   nodes to the runtime's small fixed-size objects.
+5. **dst-slot REUSE for container literals — DONE (2026-07-17) for
+   `MakeStructArrayV`** (the H1 struct trick, generalized): a
+   loop-carried `[P(..), P(..)]` whose previous same-def, same-count
+   flat struct array has use_count()==1 (covers aliases AND live
+   slices) overwrites its BYTES in place. Deliberately NOT extended to
+   `MakeArrayV`/`MakeDictV`: their storage is VALUE-driven, so reusing
+   a prior representation could diverge from what a fresh build would
+   produce (`array_storage()` is observable) — a reuse there needs a
+   provably-deterministic-representation gate first. Alias-soundness
+   pinned by a dedicated test. MEASURED (A/B vs the #6 head):
+   77_struct_array_lit 0.089→0.074s (**0.53x my/py**, was 0.64x),
+   suite VM-wall geomean 0.983, my/py → 4.87-4.88x.
+6. **Pool the intrusive OBJECT HEADERS — DONE (2026-07-17):**
+   `ML_POOL_NEW_DELETE` (poolalloc.h — sized class operator new/delete
+   routing through `pool_alloc_one`; explicit placement forms
+   re-declared since a class operator new hides them) on StrObj,
+   SharedObject, DictObjectTempl, StructObject, FuncObject,
+   ExceptionObjectTempl; the pool's class cap raised 160→256 bytes
+   (FuncObject is ~176-200; an oversized class falls back to plain new
+   automatically). The ASan pass-through gate MOVED INTO the pool core
+   (pool_alloc_one/pool_free_one), so class-pooled objects keep full
+   sanitizer UAF coverage too. MEASURED (A/B vs 303909f): suite
+   VM-wall geomean **0.982**, my/py 4.78-4.79x → **4.83-4.85x**;
+   the beneficiaries' my/py: 41_str_int_conv 0.29x, 64_struct_create
+   0.44x, 63_closures 0.55x, 32_str_build_join 0.68x.
 7. **Flat string-array storage** (`Storage::strs`: a
    `vector<SharedStr>` = 24B/elem vs the 48B LValue): helps split's
    per-piece emplace (31), keys() of string dicts (27), join reads.

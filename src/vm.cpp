@@ -582,21 +582,64 @@ vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
  * field-arg run [base, base+N*M). ML_NOINLINE + off vm_run_chunk's frame for the
  * recursion-stack reason above (the fused op's field-value buffer must not
  * inflate the recursive frame). The caller wraps the defensive loc-stamp. */
-static ML_NOINLINE EvalValue
+static ML_NOINLINE void
 vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
-                        int_type n)
+                        int_type n, int_type dst)
 {
     const size_t total = static_cast<size_t>(n) * def->fields.size();
+
+    const auto build = [&](const EvalValue *vals) {
+        LValue &d = ctx.frame->at(dst);
+        const EvalValue &cur = d.get();
+        /* Top-10 #5 (the H1 dst-reuse trick for a CONTAINER literal): a
+         * loop-carried `pts = [P(..), P(..)]` leaves LAST iteration's
+         * same-def, same-count flat struct array in the dst slot with the
+         * slot as its only owner (use_count() == 1 covers aliases AND live
+         * slices - a slice holds its own handle) - overwrite its BYTES
+         * instead of allocating a fresh SharedObject + buffer and freeing
+         * the old pair (13%+ of 77_struct_array_lit was malloc/free).
+         * Representation is DETERMINISTIC here (the op's gate proves one
+         * POD def and a fixed count), so reuse cannot diverge from what a
+         * fresh build would produce; struct arrays are not hash-cached.
+         * The fields coerce into the caller's value buffer BEFORE dst is
+         * touched (coerce is defensively throwing). */
+        if (cur.is<SharedArrayObj>()) {
+            const SharedArrayObj &arr = cur.get_ref<SharedArrayObj>();
+            if (arr.skind() == SharedArrayObj::Storage::structs
+                && !arr.is_slice()
+                && arr.use_count() == 1
+                && !arr.is_readonly()
+                && arr.flat_structs().def == def
+                && arr.size() == static_cast<size_type>(n)) {
+                const size_t M = def->fields.size();
+                const int stride = def->size;
+                SharedArrayObj &ma = d.getval<SharedArrayObj>();
+                char *out = ma.flat_structs().buf.data();
+                for (size_t i = 0; i < static_cast<size_t>(n); i++) {
+                    char *b = out + i * static_cast<size_t>(stride);
+                    for (size_t j = 0; j < M; j++)
+                        pod_store_field(def->fields[j], b,
+                            coerce_struct_field(def->fields[j],
+                                                vals[i * M + j],
+                                                Loc(), Loc()));
+                }
+                return;
+            }
+        }
+        d.put(vm_make_struct_array(def, static_cast<size_t>(n), vals));
+    };
+
     if (total <= 32) {
         EvalValue stackbuf[32];
         for (size_t k = 0; k < total; k++)
             stackbuf[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
-        return vm_make_struct_array(def, static_cast<size_t>(n), stackbuf);
+        build(stackbuf);
+        return;
     }
     std::vector<EvalValue> heapbuf(total);
     for (size_t k = 0; k < total; k++)
         heapbuf[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
-    return vm_make_struct_array(def, static_cast<size_t>(n), heapbuf.data());
+    build(heapbuf.data());
 }
 
 /* Cold helper for a REST-NATIVE mutating builtin (insert/erase, Phase 2a): copy
@@ -3060,8 +3103,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             StructTypeDef *def =
                 const_cast<StructTypeDef *>(chunk->struct_defs[in->target2]);
             try {
-                ctx.frame->at(in->target).put(
-                    vm_make_struct_array_op(ctx, def, in->a_lit(), in->b_lit()));
+                vm_make_struct_array_op(ctx, def, in->a_lit(), in->b_lit(),
+                                        in->target);
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;

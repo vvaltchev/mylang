@@ -579,6 +579,25 @@ static const std::vector<test> tests =
     },
 
     {
+        /* Top-10 #5 (vm_make_struct_array_op's dst reuse): a loop-carried
+         * flat struct-array LITERAL whose previous value is still ALIASED
+         * must build fresh - the alias keeps its contents. */
+        "struct-array literal into a loop var never mutates an alias",
+        {
+            "struct P { int x; int y; }",
+            "var dyn keep = [P(9, 9)];",
+            "var total = 0;",
+            "for (var i = 0; i < 4; i++) {",
+            "    var a = [P(i, 1), P(i, 2)];",
+            "    if (i == 1) keep = a;",
+            "    total += a[0].x * 10 + a[1].y;",
+            "}",
+            "assert(keep[0].x == 1 && keep[1].y == 2);",
+            "assert(total == 68);",
+        },
+    },
+
+    {
         /* H1 (vm_struct_ctor's dst-slot reuse): re-constructing into a loop
          * var whose PREVIOUS instance is still ALIASED (use_count > 1) must
          * allocate fresh - the alias keeps its value; an unaliased iteration
