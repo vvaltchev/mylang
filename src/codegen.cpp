@@ -7168,12 +7168,17 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                     }
                 }
 
-                /* Call-cluster #4: an AppendV whose dst is a DEAD temp
-                 * (the statement form `append(a, x);`) drops the result
-                 * materialization - dst = -1, the handler skips the put
-                 * (an intrusive refcount round-trip + 32B array-handle
-                 * copy per append). */
-                if (op1.op == OpCode::AppendV && op1.target >= 0
+                /* Call-cluster #4 (+ the #10 follow-up): an op whose dst
+                 * is a DEAD temp drops the result materialization - dst =
+                 * -1, the handler (or vm_leave_call, for the in-VM call
+                 * ops) skips the put. AppendV: an array-handle refcount
+                 * round-trip per `append(a, x);`. The CALL ops: a put per
+                 * discarded call statement (`fn(st, i);` - bench 76's
+                 * shape; CachedCallV keeps its dst - the CACHE path needs
+                 * the slot). */
+                if ((op1.op == OpCode::AppendV || op1.op == OpCode::CallV
+                     || op1.op == OpCode::CallValueV)
+                    && op1.target >= 0
                     && bit(op1.target)) {
                     const uint64_t aout =
                         (p + 1 < n ? live_in[p + 1] : 0) | hlive;

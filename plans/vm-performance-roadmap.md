@@ -106,11 +106,20 @@ is instructive:**
    ForLoopStep→LoadElemInt 2.8%, LoadStructFieldInt↔IntAddRR 2.7%,
    IntAddRR→ForLoopStep 3.1% — each ~0.5% suite; only worth it as a
    batch after 1-6.
-10. **An inline cache on CallValueV** for 76 specifically: the
-    dict-dispatched func VALUE is usually the SAME FuncObject as the
-    last call at that site — cache {FuncObject* → validated} per op
-    (a per-op slot in a side pool) and skip re-validation, bringing an
-    indirect call to near-CallV cost. 76 is the only CPython loss.
+10. **An inline cache on CallValueV — PREMISE FALSIFIED (2026-07-17),
+    pivoted.** Code inspection: the op's "validation" is already three
+    hot loads (the FuncObject tag compare + the descriptor-memoized
+    `vm_chunk_tried`/`vm_chunk` — no per-call map lookup exists), ~8
+    instructions of 76's ~2,400/iteration; an IC cannot pay. 76's REAL
+    costs: (a) the callee bodies are VALUE-USED template BASES running
+    fully boxed — the actual fix is
+    plans/value-template-instantiation.md (maintainer-approved, in
+    progress) — and (b) enter/leave at ~270 instr/call. SHIPPED from
+    the pivot: the dead-dst rule extended to `CallV`/`CallValueV` (a
+    discarded call statement `fn(st, i);` skips the result put;
+    `CachedCallV` keeps its dst for the cache path; `vm_leave_call` +
+    both legacy boundary paths guard dst >= 0). MEASURED: 76 my/py
+    1.12x → 1.05x, suite VM-wall 0.999, my/py → 4.85-4.87x.
 
 Expected: items 1-4 are the call-cluster (~the 5x gap by themselves if
 they deliver ~half their profile shares); 5-6 are the alloc cluster;

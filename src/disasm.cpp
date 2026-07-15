@@ -807,7 +807,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::CallV:
             /* AST-free: the callee is a global slot (its name lives in gfuncs,
              * not the chunk), so show g<n>. */
-            row << "call.v       " << D(in.target) << " = g" << in.target2
+            row << "call.v       "
+                << (in.target < 0 ? std::string("_") : D(in.target))
+                << " = g" << in.target2
                 << arglist(chunk, in.a_lit(), in.b_lit());
             break;
         case OpCode::CachedCallV:
@@ -816,7 +818,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::CallValueV:
             /* the callee is a func VALUE in a temp (target2), not a slot. */
-            row << "call.val     " << D(in.target) << " = " << D(in.target2)
+            row << "call.val     "
+                << (in.target < 0 ? std::string("_") : D(in.target))
+                << " = " << D(in.target2)
                 << arglist(chunk, in.a_lit(), in.b_lit());
             break;
         case OpCode::CallValueGenericV:

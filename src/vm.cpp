@@ -1772,7 +1772,9 @@ vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
     act.pop_window();
     if (ckey && res.get_type()->t < Type::t_str)
         ctx.frame->ensure_pure_cache().emplace(std::move(*ckey), res);
-    ctx.frame->at(dst).put(std::move(res));
+    if (dst >= 0)                /* -1 = a DISCARDED call statement's dst
+                                  * (the peephole's dead-dst rule) */
+        ctx.frame->at(dst).put(std::move(res));
 }
 
 /* CachedCallV's cache probe (vm_cached_call's exact flow): a HIT writes the
@@ -3427,7 +3429,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 }
                 return;
             }
-            ctx.frame->at(in->target).put(std::move(res));
+            if (in->target >= 0)     /* -1 = a discarded call statement
+                                      * (CallV only - CachedCallV keeps
+                                      * its dst for the cache path) */
+                ctx.frame->at(in->target).put(std::move(res));
             pc++;
         }
         VM_NEXT;
@@ -3469,7 +3474,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 }
                 return;
             }
-            ctx.frame->at(in->target).put(std::move(res));
+            if (in->target >= 0)     /* -1 = a discarded call statement */
+                ctx.frame->at(in->target).put(std::move(res));
             pc++;
         }
         VM_NEXT;
