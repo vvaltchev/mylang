@@ -1865,6 +1865,37 @@ visible. **Not yet specialized:** a pure-user-func bound with a *container* arg
 
 ### Function templates (monomorphization)
 
+**VALUE-USED templates instantiate too (plans/value-template-
+instantiation.md).** A template stored in a container/var and called
+INDIRECTLY (`ops = [add_op, sub_op]; fn = ops[i%2]; fn(st, i)`) gets a
+typed instance when every such call agrees on ONE settled signature: the
+`Func` StaticType carries a **finfo set** (`StaticType::finfos`, seeded
+by `func_static_type` for a template, UNIONED by `join`, copied by
+`with_opt` - metadata, never part of equal/assignable), which rides the
+ordinary lattice through array/dict elements and var joins, so each
+indirect call's callee type names its candidate templates with no new
+dataflow machinery. `value_instantiate_round` (run beside
+`instantiate_round`) checks per-template UNIFORMITY over the attributed
+sites, makes the instance through the ordinary clone machinery
+(`tmpl_cache`/`make_template_clone` - same `$N` naming/display_name),
+REDIRECTS every value-use Identifier IN PLACE (uid + id_sym rebind), and
+seeds the clone's params with the signature each fixpoint round (a
+phantom call - no direct call feeds them). **ESCAPES disable it**
+(`FuncInfo::value_escaped`): a join that DROPS the finfo set (collapse
+to dyn / conflict - recorded in the arena's `escaped_finfos` ledger,
+drained per round), an ARG-position value use (any call/builtin arg -
+`map(f, ...)`, `runtime(f)`), or a capture-list use - an untracked call
+site could reach the typed instance with a mismatched signature, so an
+escaped template keeps its boxed base (sound, as before). Non-uniform
+signatures across sites → no instantiation. All value uses redirect to
+ONE instance, so `ops[0] == add_op` identities hold. v1 is INPUT-LOCAL
+in the REPL (a prior input's array called later keeps the base -
+correct, unoptimized; pinned by a `repl:` test). This closed the last
+CPython-losing bench (76_funcval_dispatch 1.05-1.12x → **0.68x**; its
+callee bodies 6 boxed ops → 4 typed).
+
+
+
 A **named** function with ≥1 *template param* — un-annotated, non-`dyn`,
 non-`opt` — is a **template** (`FuncInfo::is_template`, set in
 `declare_funcdecl`): not type-checked in isolation, but **instantiated per

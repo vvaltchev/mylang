@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "statictype.h"
+#include <algorithm>
 #include "uniqueid.h"
 #include "defs.h"       /* ML_CHECK */
 
@@ -138,6 +139,7 @@ StaticTypeRef StaticTypeArena::with_opt(StaticTypeRef t, bool optflag)
     c->ret = t->ret;
     c->struct_def = t->struct_def;
     c->struct_name = t->struct_name;
+    c->finfos = t->finfos;             /* value-template tracking rides */
     return c;
 }
 
@@ -377,21 +379,36 @@ bool static_type_assignable(StaticTypeRef src, StaticTypeRef dst)
 
 /* -------------------------------- join ----------------------------------- */
 
+/* Record a dropped finfo set (see the header comment) - called at every
+ * join outcome that does NOT produce a Func from a finfo-carrying input. */
+static void note_escaped_into(std::vector<void *> &ledger, StaticTypeRef t)
+{
+    if (t && t->kind == StaticTypeKind::Func)
+        for (void *fi : t->finfos)
+            ledger.push_back(fi);
+}
+
 StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
 {
+    const auto note_escaped = [this](StaticTypeRef t) {
+        note_escaped_into(escaped_finfos, t);
+    };
     a = static_type_resolve(a);
     b = static_type_resolve(b);
 
     if (static_type_equal(a, b))
         return a;
 
-    if (a->kind == StaticTypeKind::Dyn || b->kind == StaticTypeKind::Dyn)
+    if (a->kind == StaticTypeKind::Dyn || b->kind == StaticTypeKind::Dyn) {
         /* Nullability is orthogonal to dyn (Phase B): collapsing a mix to dyn
          * keeps the opt bit, so `dyn | none` / `dyn | opt T` is `opt dyn`. */
+        note_escaped(a);
+        note_escaped(b);
         return with_opt(g_dyn[0],
                         a->opt || b->opt ||
                         a->kind == StaticTypeKind::None ||
                         b->kind == StaticTypeKind::None);
+    }
 
     if (a->kind == StaticTypeKind::Unknown)
         return b;
@@ -428,8 +445,11 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
         return ground(k, anyopt);
     }
 
-    if (a->kind != b->kind)
+    if (a->kind != b->kind) {
+        note_escaped(a);                  /* a finfo-carrying Func lost here */
+        note_escaped(b);
         return nullptr;                   /* irreconcilable conflict */
+    }
 
     switch (a->kind) {
 
@@ -459,8 +479,11 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
              * concretes fall to dyn) so a func-valued var assigned the "same"
              * function across fixpoint rounds does not spuriously conflict.
              * Different arity: a real conflict. */
-            if (a->params.size() != b->params.size())
+            if (a->params.size() != b->params.size()) {
+                note_escaped(a);
+                note_escaped(b);
                 return nullptr;
+            }
             std::vector<StaticTypeRef> ps;
             std::vector<bool> popt;
             for (size_t i = 0; i < a->params.size(); i++) {
@@ -470,7 +493,15 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
                                (i < b->param_opt.size() && b->param_opt[i]));
             }
             StaticTypeRef rj = join(a->ret, b->ret);
-            return func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
+            StaticTypeRef fj = func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
+            /* Union the value-template sets (plans/value-template-
+             * instantiation.md) - the set rides the ordinary lattice flow. */
+            fj->finfos = a->finfos;
+            for (void *fi : b->finfos)
+                if (std::find(fj->finfos.begin(), fj->finfos.end(), fi)
+                        == fj->finfos.end())
+                    fj->finfos.push_back(fi);
+            return fj;
         }
 
         default:

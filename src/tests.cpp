@@ -579,6 +579,72 @@ static const std::vector<test> tests =
     },
 
     {
+        /* VALUE-TEMPLATE INSTANTIATION (plans/value-template-
+         * instantiation.md): templates stored in an array and called
+         * INDIRECTLY with one uniform signature get typed instances; the
+         * containers hold the instances (identity consistent), results are
+         * byte-identical. */
+        "value-used templates instantiate on a uniform signature",
+        {
+            "func add_op(st, x) { st[0] = st[0] + x; }",
+            "func sub_op(st, x) { st[0] = st[0] - x; }",
+            "var ops = [add_op, sub_op];",
+            "var st = [0];",
+            "for (var i = 0; i < 10; i++) {",
+            "    var fn = ops[i % 2];",
+            "    fn(st, i);",
+            "}",
+            "assert(st[0] == -5);",
+            /* identity: the array element and the (redirected) name agree */
+            "assert(ops[0] == add_op);",
+        },
+    },
+
+    {
+        /* NON-uniform signatures across the indirect sites: NO value
+         * instantiation - the base keeps running, results unchanged. */
+        "value-used templates with mixed signatures stay dynamic",
+        {
+            "func pick(a, b) { return a; }",
+            "var fs = [pick];",
+            "var f1 = fs[0];",
+            "var r1 = f1(1, 2);",
+            "var r2 = f1(\"x\", \"y\");",
+            "assert(r1 == 1);",
+            "assert(r2 == \"x\");",
+        },
+    },
+
+    {
+        /* ESCAPE: the template's value laundered through dyn and called
+         * with a DIFFERENT signature than the tracked sites - must still
+         * work (the escape mark keeps the boxed base running). */
+        "value-template escape via dyn keeps the base sound",
+        {
+            "func idf(v) { return v; }",
+            "var fs = [idf];",
+            "var g = fs[0];",
+            "assert(g(5) == 5);",
+            "var dyn d = idf;",
+            "assert(d(\"s\") == \"s\");",
+        },
+    },
+
+    {
+        /* ARG-position value use (a higher-order builtin) escapes too:
+         * map(template, arr) keeps today's behavior. */
+        "value-template passed to map() stays sound",
+        {
+            "func dbl(v) { return v * 2; }",
+            "var fs = [dbl];",
+            "var h = fs[0];",
+            "assert(h(3) == 6);",
+            "var m = map(dbl, [1.5, 2.5]);",
+            "assert(m == [3.0, 5.0]);",
+        },
+    },
+
+    {
         /* Top-10 #5 (vm_make_struct_array_op's dst reuse): a loop-carried
          * flat struct-array LITERAL whose previous value is still ALIASED
          * must build fresh - the alias keeps its contents. */
@@ -12085,6 +12151,18 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    { "value-used templates across inputs stay sound",
+      /* v1 value-instantiation is INPUT-LOCAL (uses + calls in one input
+       * instantiate; an input-1 array called from input 2 keeps the boxed
+       * base) - this pins the CORRECTNESS of both shapes. The cross-input
+       * OPTIMIZATION gap is recorded in the plan file. */
+      { { "func vv_add(st, x) { st[0] = st[0] + x; }", "" },
+        { "var vv_ops = [vv_add]", "" },
+        { "var vv_st = [0]", "" },
+        { "var vv_f = vv_ops[0]", "" },
+        { "vv_f(vv_st, 7)", "" },
+        { "vv_st[0]", "=> 7" } } },
+
     { "a var persists across inputs",
       { { "var x = 5", "=> 5" },
         { "x + 1", "=> 6" },

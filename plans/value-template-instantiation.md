@@ -1,6 +1,13 @@
 # Value-used template instantiation (top-10 #10's real fix)
 
-Status: IN PROGRESS (2026-07-17). Maintainer-approved.
+Status: DONE (2026-07-17). Maintainer-approved; landed with the full
+test-obligation set. MEASURED (full-suite interleaved A/B):
+76_funcval_dispatch 0.105→0.067s (**0.68x my/py, was 1.05-1.12x — the
+last CPython-losing bench now wins**; its callee bodies went from 6
+boxed ops to 4 typed ones), suite VM-wall geomean 0.996, my/py 4.87x.
+KNOWN GAP (v2 candidate): value-instantiation is INPUT-LOCAL in the
+REPL — an input-1 array called indirectly from input 2 keeps the boxed
+base (correct, unoptimized); pinned by the `repl:` test.
 
 ## The problem
 

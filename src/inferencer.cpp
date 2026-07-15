@@ -135,6 +135,16 @@ struct FuncInfo {
      * a template parameter - it is the explicit "one instantiation, any type".
      */
     bool is_template = false;
+
+    /*
+     * Value-template tracking (plans/value-template-instantiation.md): the
+     * template's VALUE escaped precise tracking (a join dropped its finfo
+     * set, or it was passed as a call/builtin ARGUMENT or captured) - an
+     * untracked call site could then reach a typed instance with a
+     * mismatched signature, so an escaped template is never
+     * value-instantiated (its base keeps running, as before).
+     */
+    bool value_escaped = false;
 };
 
 struct Scope {
@@ -225,6 +235,11 @@ private:
      * past MAX_TMPL_INSTANCES distinct signatures, further calls run
      * dynamically (no clone) - a backstop for runaway polymorphism (D4). */
     std::unordered_map<FuncInfo *, int> tmpl_inst_count;
+    /* Value-instantiated clones' uniform signatures - seeded into the
+     * clone's params each fixpoint round (no direct call feeds them). */
+    std::map<FuncInfo *, std::vector<StaticTypeRef>> value_inst_sigs;
+    /* Templates already value-instantiated (their uses redirected). */
+    std::set<FuncInfo *> value_inst_done;
     std::unordered_set<FuncInfo *> tmpl_cap_warned;
 
     /* Flow-sensitive null narrowing (check pass only): inside the proven branch
@@ -286,6 +301,10 @@ private:
     void mark_lambda_templates();   /* safe var-bound lambdas -> templates */
     void run_fixpoint(Block *root);             /* the Jacobi loop, extracted */
     bool instantiate_round(Block *root);     /* clone + redirect; progress? */
+    bool value_instantiate_round(Block *root);  /* value-used templates (see
+                                                 * plans/value-template-
+                                                 * instantiation.md) */
+    void drain_escapes();       /* arena escape ledger -> value_escaped */
     FuncDeclStmt *make_template_clone(FuncInfo *tmpl, const std::string &key,
                                       Block *root);
     std::string template_sig_key(FuncInfo *tmpl,
@@ -606,6 +625,21 @@ void Inferencer::run_fixpoint(Block *rootBlock)
         cur_func = nullptr;
         for (auto &e : rootBlock->elems)
             accumulate(e.get());
+        /* Value-instantiated clones have NO direct call to feed their
+         * params - seed each with its uniform observed signature (a
+         * phantom call, once per round; see the plan). */
+        for (auto &kv : value_inst_sigs) {
+            FuncInfo *cfi = kv.first;
+            const std::vector<StaticTypeRef> &sig = kv.second;
+            size_t k = 0;
+            for (TypeSym *p : cfi->params) {
+                if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+                    continue;
+                if (k < sig.size())
+                    contribute(p, sig[k], Loc());
+                k++;
+            }
+        }
         changed = false;
         commit_round();          /* sets `changed` if any type moved */
         if (!changed)
@@ -854,6 +888,222 @@ bool Inferencer::instantiate_round(Block *rootBlock)
     return progress;
 }
 
+void Inferencer::drain_escapes()
+{
+    for (void *p : A.escaped_finfos)
+        static_cast<FuncInfo *>(p)->value_escaped = true;
+    A.escaped_finfos.clear();
+}
+
+/*
+ * Value-used template instantiation (plans/value-template-instantiation.md).
+ * A template whose VALUE flows (through vars/containers - the finfo set on
+ * its Func static type rides the ordinary lattice) to indirect call sites
+ * that all agree on ONE settled signature is instantiated for that
+ * signature, and EVERY value use of its name is redirected (in place) to
+ * the instance - so the containers hold the TYPED clone and the indirect
+ * calls run its typed body. Escapes (a set-dropping join, an arg-position
+ * use, a capture) disable it - the base keeps running, as before.
+ */
+bool Inferencer::value_instantiate_round(Block *rootBlock)
+{
+    /* 1) Every VALUE USE of a template identifier: a non-callee Identifier
+     * resolving to a template FuncInfo. An ARG-position use (any call's
+     * argument - incl. builtins: map/filter/runtime/...) or a CAPTURE-list
+     * use ESCAPES the template (an untracked consumer). */
+    struct Use { Identifier *id; TypeSym *sym; bool in_func; };
+    std::map<FuncInfo *, std::vector<Use>> uses;
+
+    std::function<void(Construct *, bool)> walk =
+        [&](Construct *n, bool in_func) {
+        if (!n)
+            return;
+        if (auto *call = dynamic_cast<CallExpr *>(n)) {
+            /* the callee position is NOT a value use; ARG uses escape */
+            walk(call->what.get(), in_func);   /* nested callee exprs */
+            for (auto &a : call->args->elems) {
+                if (auto *id = dynamic_cast<Identifier *>(a.get())) {
+                    auto it = id_sym.find(id);
+                    if (it != id_sym.end() && it->second && it->second->func
+                            && it->second->func->is_template) {
+                        it->second->func->value_escaped = true;
+                        continue;
+                    }
+                }
+                walk(a.get(), in_func);
+            }
+            return;
+        }
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+            if (fd->captures)
+                for (auto &cap : fd->captures->elems) {
+                    if (auto *id = dynamic_cast<Identifier *>(cap.get())) {
+                        auto it = id_sym.find(id);
+                        if (it != id_sym.end() && it->second
+                                && it->second->func
+                                && it->second->func->is_template)
+                            it->second->func->value_escaped = true;
+                    }
+                }
+            for_each_child(n, [&](Construct *c) { walk(c, true); });
+            return;
+        }
+        if (auto *id = dynamic_cast<Identifier *>(n)) {
+            auto it = id_sym.find(id);
+            if (it != id_sym.end() && it->second && it->second->func
+                    && it->second->func->is_template)
+                uses[it->second->func].push_back({ id, it->second, in_func });
+            return;
+        }
+        for_each_child(n, [&](Construct *c) { walk(c, in_func); });
+    };
+    for (auto &e : rootBlock->elems)
+        walk(e.get(), false);
+
+    if (uses.empty())
+        return false;
+
+    /* 2) Every INDIRECT call (no direct FuncInfo) whose callee type carries
+     * a finfo set: attribute its signature to each member. */
+    struct Site { CallExpr *call; bool in_func; };
+    std::map<FuncInfo *, std::vector<Site>> sites;
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+    for (auto &cp : calls) {
+        if (callee_funcinfo(cp.first->what.get()))
+            continue;                       /* a direct call */
+        StaticTypeRef ct =
+            static_type_resolve(type_of(cp.first->what.get()));
+        if (!ct || ct->kind != StaticTypeKind::Func)
+            continue;
+        for (void *p : ct->finfos)
+            sites[static_cast<FuncInfo *>(p)].push_back(
+                { cp.first, cp.second });
+    }
+
+    bool progress = false;
+
+    for (auto &kv : uses) {
+        FuncInfo *tmpl = kv.first;
+        if (!tmpl->is_template || tmpl->value_escaped || !tmpl->decl)
+            continue;
+        if (value_inst_done.count(tmpl))
+            continue;
+        auto st = sites.find(tmpl);
+        if (st == sites.end() || st->second.empty())
+            continue;               /* no attributed call - can't know a sig */
+
+        /* 3) UNIFORMITY: every attributed call must have the same settled,
+         * arity-legal signature over the TEMPLATE params. */
+        const size_t nparams = tmpl->params.size();
+        size_t min_args = 0;
+        for (size_t i = 0; i < nparams; i++)
+            if (!tmpl->params[i]->opt_decl)
+                min_args = i + 1;
+
+        std::vector<StaticTypeRef> sig;
+        bool ok = true, first = true;
+        for (const Site &site : st->second) {
+            const size_t nargs = site.call->args->elems.size();
+            if (nargs < min_args || nargs > nparams) { ok = false; break; }
+            std::vector<StaticTypeRef> s1;
+            for (size_t i = 0; i < nparams; i++) {
+                TypeSym *p = tmpl->params[i];
+                if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+                    continue;              /* not a template param */
+                StaticTypeRef t = i < nargs
+                    ? static_type_resolve(
+                          type_of(site.call->args->elems[i].get()))
+                    : A.none_ty();
+                if (is_unknown(t)) { ok = false; break; }
+                s1.push_back(t);
+            }
+            if (!ok)
+                break;
+            if (first) {
+                sig = std::move(s1);
+                first = false;
+            } else if (sig.size() != s1.size()
+                       || !std::equal(sig.begin(), sig.end(), s1.begin(),
+                                      [](StaticTypeRef a, StaticTypeRef b) {
+                                          return static_type_equal(a, b);
+                                      })) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok || first)
+            continue;
+
+        /* A dyn in the signature would make the clone no better than the
+         * base - leave the base running. */
+        bool has_dyn = false;
+        for (StaticTypeRef t : sig)
+            if (type_has_dyn(t, /*deep=*/false))
+                has_dyn = true;
+        if (has_dyn)
+            continue;
+
+        /* 4) Get-or-make the instance (the ordinary template machinery). */
+        const std::string key = template_sig_key(tmpl, sig);
+        const UniqueId *clone_name = nullptr;
+        TypeSym *clone_sym = nullptr;
+        auto itc = tmpl_cache.find(key);
+        if (itc != tmpl_cache.end()) {
+            auto gs = global->syms.find(itc->second);
+            if (gs != global->syms.end() && gs->second && gs->second->func) {
+                clone_name = itc->second;
+                clone_sym = gs->second;
+            }
+        }
+        if (!clone_sym) {
+            static const int MAX_TMPL_INSTANCES = 64;
+            if (tmpl_inst_count[tmpl] >= MAX_TMPL_INSTANCES)
+                continue;
+            FuncDeclStmt *clone = make_template_clone(tmpl, key, rootBlock);
+            clone_name = clone->id->uid;
+            auto cs = id_sym.find(clone->id.get());
+            clone_sym = (cs != id_sym.end()) ? cs->second : nullptr;
+            if (!clone_sym) {
+                auto gs = global->syms.find(clone_name);
+                clone_sym = (gs != global->syms.end()) ? gs->second : nullptr;
+            }
+            tmpl_inst_count[tmpl]++;
+        }
+        if (!clone_sym || !clone_sym->func)
+            continue;
+
+        value_inst_sigs[clone_sym->func] = sig;
+        value_inst_done.insert(tmpl);
+
+        if (trace_enabled(TraceCat::templ)) {
+            std::string ss;
+            for (size_t i = 0; i < sig.size(); i++) {
+                if (i) ss += ", ";
+                ss += static_type_to_string(sig[i]);
+            }
+            const std::string nm = tmpl->decl->id
+                ? std::string(tmpl->decl->id->get_str())
+                : std::string("<lambda>");
+            TRACE(templ, 0, "value-instantiate " + nm + "(" + ss + ") -> " +
+                  std::string(clone_name->val));
+        }
+
+        /* 5) Redirect EVERY value use IN PLACE (uid + sym rebind - the
+         * Identifier node keeps its loc, so carets are unchanged). */
+        for (const Use &u : kv.second) {
+            u.id->uid = clone_name;
+            id_sym[u.id] = clone_sym;
+            if (u.in_func)
+                clone_sym->func->has_func_consumer = true;
+        }
+        progress = true;
+    }
+
+    return progress;
+}
+
 /* ------------------------------ run / passes ----------------------------- */
 
 /*
@@ -920,10 +1170,14 @@ void Inferencer::infer_one(Block *rootBlock)
      * (or itself), which surface only once its own params are settled.
      */
     for (int round = 0; round < 64; round++) {
-        if (!instantiate_round(rootBlock))
+        drain_escapes();
+        const bool p1 = instantiate_round(rootBlock);
+        const bool p2 = value_instantiate_round(rootBlock);
+        if (!p1 && !p2)
             break;
         run_fixpoint(rootBlock);
     }
+    drain_escapes();
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
      * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called
@@ -2165,7 +2419,10 @@ StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
         ps.push_back(p->dyn_decl ? A.dyn_ty() : p->type);
         popt.push_back(p->opt_decl);
     }
-    return A.func_of(ps, popt, fi->ret);
+    StaticTypeRef t = A.func_of(ps, popt, fi->ret);
+    if (fi->is_template)
+        t->finfos.push_back(fi);   /* value-template tracking (see the plan) */
+    return t;
 }
 
 /*
