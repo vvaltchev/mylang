@@ -2393,6 +2393,25 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                     pc++;
                     VM_NEXT;
                 }
+                if (arr.skind() == SharedArrayObj::Storage::strs) {
+                    /* Flat STRING array (top-10 #7): an array<str> is a
+                     * general-ELEMENT type statically but may hold flat strs
+                     * storage - bind a boxed SharedStr copy (a handle;
+                     * strings are immutable, so a copy == the tree-walker's
+                     * reference bind). */
+                    int_type idx = read_int_operand(in->a(), &ctx);
+                    if (idx < 0)
+                        idx += arr.size();
+                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                        Loc ls, le;
+                        chunk->loc_at(pc, ls, le);
+                        throw OutOfBoundsEx(ls, le);
+                    }
+                    ctx.frame->at(in->target).put(EvalValue(
+                        SharedStr(arr.flat_strs()[arr.offset() + idx])));
+                    pc++;
+                    VM_NEXT;
+                }
             }
             throw InternalErrorEx();   /* unreachable: base_array general proven */
         }

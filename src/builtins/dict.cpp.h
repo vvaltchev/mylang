@@ -140,6 +140,23 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
         return SharedArrayObj(move(v));
     }
 
+    /* Top-10 #7: VALUE-driven flat strings under a dflt hint only (an
+     * explicit `general` hint means an array<dyn> destination and must
+     * stay general) - a string dict's keys()/values() halve their
+     * per-element memory. */
+    if (hint == ArrHint::dflt && !data.empty()) {
+        bool all_str = true;
+        for (auto const &e : data)
+            if (!DICT_ELEM(e).is<SharedStr>()) { all_str = false; break; }
+        if (all_str) {
+            SharedArrayObj::tvec_type v;
+            v.reserve(data.size());
+            for (auto const &e : data)
+                v.push_back(SharedStr(DICT_ELEM(e).get<SharedStr>()));
+            return SharedArrayObj(move(v));
+        }
+    }
+
     SharedArrayObj::vec_type result;
     result.reserve(data.size());
     for (auto const &e : data)

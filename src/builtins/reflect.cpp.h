@@ -181,6 +181,7 @@ static std::string reflect_array_type(const SharedArrayObj &a)
         case SharedArrayObj::Storage::structs:
             return std::string("array<") +
                    std::string(a.flat_structs().def->name->val) + ">";
+        case SharedArrayObj::Storage::strs:    return "array<str>";
         default:
             break;                                    /* general */
     }

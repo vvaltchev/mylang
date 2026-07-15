@@ -37,13 +37,17 @@ EvalValue builtin_split(EvalContext *ctx, const ArgLocs *exprList,
     const string_view &str = shared_str.get_view();
     const string_view delim = val_delim.get<SharedStr>().get_view();
 
-    SharedArrayObj::vec_type vec;
+    /* Top-10 #7: split's pieces are ALWAYS strings, so build the FLAT
+     * string array (24-byte SharedStr slices instead of 48-byte LValues -
+     * half the memory and the reallocs of 31_str_split_join). A const-eval
+     * split's result is frozen object-level by make_const_clone (flat
+     * storage has no per-element const, exactly like flat ints). */
+    SharedArrayObj::tvec_type vec;
 
     if (delim.size()) {
 
         /* H3: pre-count the pieces (a memchr-driven scan, no stores) and
-         * reserve - the emplace loop then never reallocates the 48-byte
-         * LValue vector (the reallocs dominated 31_str_split_join). */
+         * reserve - the emplace loop then never reallocates. */
         size_t pieces = 1;
         for (size_t p = 0; (p = str.find(delim, p)) != string::npos;
              p += delim.size())
@@ -54,27 +58,17 @@ EvalValue builtin_split(EvalContext *ctx, const ArgLocs *exprList,
 
         while ((next = str.find(delim, last)) != string::npos) {
 
-            vec.emplace_back(
-                SharedStr(shared_str, last, next-last),
-                ctx->const_ctx
-            );
+            vec.emplace_back(shared_str, last, next - last);
 
             last = next + delim.size();
         }
 
-        vec.emplace_back(
-            SharedStr(shared_str, last, str.size() - last),
-            ctx->const_ctx
-        );
+        vec.emplace_back(shared_str, last, str.size() - last);
 
     } else {
 
-        for (size_t i = 0; i < str.size(); i++) {
-            vec.emplace_back(
-                SharedStr(shared_str, i, 1),
-                ctx->const_ctx
-            );
-        }
+        for (size_t i = 0; i < str.size(); i++)
+            vec.emplace_back(shared_str, i, 1);
     }
 
     return SharedArrayObj(move(vec));
@@ -102,6 +96,25 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
     const SharedArrayObj &arr = val_arr.get<SharedArrayObj>();
     const size_type n = arr.size();
     string result;
+
+    if (arr.skind() == SharedArrayObj::Storage::strs) {
+
+        /* Top-10 #7: a FLAT string array (split's own output - the
+         * split+join round-trip) joins straight from the SharedStr vector:
+         * no boxing, no type checks (every element IS a string). */
+        const auto &tv = arr.flat_strs();
+        const size_type base = arr.offset();
+        size_t total = n ? (n - 1) * delim.size() : 0;
+        for (size_type i = 0; i < n; i++)
+            total += tv[base + i].get_view().size();
+        result.reserve(total);
+        for (size_type i = 0; i < n; i++) {
+            result += tv[base + i].get_view();
+            if (i != n - 1)
+                result += delim;
+        }
+        return SharedStr(move(result));
+    }
 
     if (arr.skind() == SharedArrayObj::Storage::general) {
 
@@ -170,17 +183,15 @@ EvalValue builtin_splitlines(EvalContext *ctx, const ArgLocs *exprList,
 
     const SharedStr &shared_str = val.get<SharedStr>();
     const string_view &str = shared_str.get_view();
-    SharedArrayObj::vec_type vec;
+    /* Top-10 #7: flat string storage, like split(). */
+    SharedArrayObj::tvec_type vec;
     size_type i, start = 0;
 
     for (i = 0; i < str.size(); i++) {
 
         if (str[i] == '\r') {
 
-            vec.emplace_back(
-                SharedStr(shared_str, start, i - start),
-                ctx->const_ctx
-            );
+            vec.emplace_back(shared_str, start, i - start);
 
             if (i + 1 < str.size() && str[i + 1] == '\n')
                 i++;
@@ -189,20 +200,14 @@ EvalValue builtin_splitlines(EvalContext *ctx, const ArgLocs *exprList,
 
         } else if (str[i] == '\n') {
 
-            vec.emplace_back(
-                SharedStr(shared_str, start, i - start),
-                ctx->const_ctx
-            );
+            vec.emplace_back(shared_str, start, i - start);
 
             start = i + 1;
         }
     }
 
     if (!str.empty()) {
-        vec.emplace_back(
-            SharedStr(shared_str, start, i - start),
-            ctx->const_ctx
-        );
+        vec.emplace_back(shared_str, start, i - start);
     }
 
     return SharedArrayObj(move(vec));

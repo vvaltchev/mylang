@@ -45,6 +45,22 @@ void SharedArrayObjTempl<LValueT>::promote_structs_to_general()
 }
 
 template <class LValueT>
+void SharedArrayObjTempl<LValueT>::promote_strs_to_general()
+{
+    if (shobj->kind != Storage::strs)
+        return;
+
+    const size_type n = size();
+    const size_type base = offset();
+    vec_type nv;
+    nv.reserve(n);
+    for (size_type i = 0; i < n; i++)
+        nv.emplace_back(EvalValue(SharedStr(shobj->tvec[base + i])), false);
+
+    *this = SharedArrayObjTempl(move(nv));
+}
+
+template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_internal_vec()
 {
     /*
@@ -95,6 +111,15 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
             );
             *this = SharedArrayObjTempl(
                 svec_type(move(nb), shobj->svec.def, stride));
+            return;
+        }
+
+        case Storage::strs: {
+            tvec_type nv(
+                shobj->tvec.cbegin() + offset(),
+                shobj->tvec.cbegin() + offset() + size()
+            );
+            *this = SharedArrayObjTempl(move(nv));
             return;
         }
 
@@ -216,6 +241,10 @@ EvalValue TypeArr::intptr(const EvalValue &a)
             return reinterpret_cast<int_type>(&arr.flat_floats());
         case SharedArrayObj::Storage::bools:
             return reinterpret_cast<int_type>(&arr.flat_bools());
+        case SharedArrayObj::Storage::structs:
+            return reinterpret_cast<int_type>(&arr.flat_structs());
+        case SharedArrayObj::Storage::strs:
+            return reinterpret_cast<int_type>(&arr.flat_strs());
         default:
             return reinterpret_cast<int_type>(&arr.get_vec());
     }
@@ -379,6 +408,8 @@ static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i)
             return EvalValue(static_cast<bool>(arr.flat_bools()[at]));
         case SharedArrayObj::Storage::structs:
             return struct_elem_at(arr, i);   /* materialize a StructObject */
+        case SharedArrayObj::Storage::strs:
+            return EvalValue(SharedStr(arr.flat_strs()[at]));
         default:
             return arr.get_vec()[at].get();
     }
@@ -548,6 +579,18 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval,
      * it can't be a mutate-in-place container target either. So every read that
      * reaches here (print(a[i]), a dyn context, a builtin arg, ...) stays flat.
      */
+    /* A plain-assignment WRITE target (for_write) on a flat STRING array
+     * PROMOTES (the value-driven strs model) - through the ORIGINAL LValue,
+     * never the RValue() temp above (promoting the temp freed the fresh
+     * general vector with it - an ASan-caught UAF). Reads stay flat. */
+    if (arr.skind() == SharedArrayObj::Storage::strs && for_write
+            && what_lval.is<LValue *>() && !arr.is_readonly()) {
+        LValue *base = what_lval.get<LValue *>();
+        base->getval<SharedArrayObj>().promote_strs_to_general();
+        /* re-enter on the (now general) slot value */
+        return subscript(what_lval, idx_val, for_write);
+    }
+
     if (arr.skind() != SharedArrayObj::Storage::general)
         return arr_elem_at(arr, idx);
 

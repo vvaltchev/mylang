@@ -133,8 +133,13 @@ template <bool is_max>
 EvalValue b_min_max_arr(const SharedArrayObj &arr)
 {
     /* Flat fast path: scan the unboxed int/float vector directly, no promotion
-     * and no per-element virtual compare (see plans/typed-arrays.md). */
-    if (arr.skind() != SharedArrayObj::Storage::general) {
+     * and no per-element virtual compare (see plans/typed-arrays.md).
+     * strs/structs take the general path below (a LOCAL handle promote -
+     * min/max of strings compares lexically as before; the else-chain here
+     * would misread their union member). */
+    if (arr.skind() != SharedArrayObj::Storage::general
+        && arr.skind() != SharedArrayObj::Storage::strs
+        && arr.skind() != SharedArrayObj::Storage::structs) {
 
         const size_type n = arr.size(), off = arr.offset();
 
@@ -173,7 +178,12 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr)
         return EvalValue(best);
     }
 
-    const ArrayConstView &arr_view = arr.get_view();
+    /* strs/structs: promote a LOCAL handle copy (the caller's array keeps
+     * its flat storage) and run the general compare loop. */
+    SharedArrayObj marr = arr;
+    if (marr.skind() != SharedArrayObj::Storage::general)
+        (void)marr.get_vec();          /* promotes strs/structs in place */
+    const ArrayConstView &arr_view = marr.get_view();
     EvalValue val;
 
     if (arr_view.size() > 0) {

@@ -1908,6 +1908,14 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
             /* array<POD struct>: flat storage (the def lets even an empty
              * `[]` start flat); a boxed-struct array stays general. */
             hint = ArrHint::flat_s;
+        else if (!el->opt && el->kind == StaticTypeKind::Str)
+            /* array<str> (top-10 #7): NO hint - the value keeps its natural
+             * storage (a split()/keys() result stays FLAT strs; a plain
+             * general literal stays general). Forcing `general` here used
+             * to general-ify a baked flat-strs literal; the strs promote-
+             * on-write model makes a later non-string element write safe
+             * without it. */
+            return;
         else
             hint = ArrHint::general;
     } else if (ty->kind == StaticTypeKind::Dyn) {
@@ -2468,6 +2476,8 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
                 const StructTypeDef *def = arr.flat_structs().def;
                 return A.array_of(A.struct_ty(def, def->name));
             }
+            if (arr.skind() == SharedArrayObj::Storage::strs)
+                return A.array_of(A.str_ty());
 
             ArrayConstView view = arr.get_view();
             if (view.size() == 0)

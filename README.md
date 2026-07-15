@@ -2270,11 +2270,18 @@ to the same object.
 
 #### `array_storage(array)`
 Return the array's internal storage, named by the element type: `"int"`,
-`"float"`, `"bool"`, or `"struct"` for a compact *flat* (unboxed) array (8 bytes
-per element for int/float, **one byte** per element for bool, packed C structs
-for `struct`), or `"general"` for the boxed representation otherwise. This is
-purely an introspection aid (mainly for tests) — flat and general arrays behave
+`"float"`, `"bool"`, `"struct"`, or `"str"` for a compact *flat* (unboxed)
+array (8 bytes per element for int/float, **one byte** per element for bool,
+packed C structs for `struct`, 24-byte shared string handles for `"str"`), or
+`"general"` for the boxed representation otherwise. This is purely an
+introspection aid (mainly for tests) — flat and general arrays behave
 identically; the only observable difference is speed and memory.
+
+Flat **string** arrays are *value-driven*: `split()`, `splitlines()`, and a
+string dict's `keys()`/`values()` produce them. Unlike the type-driven flat
+scalars, a flat string array never rejects a mutation — writing a non-string
+element (or any operation without a flat fast path) silently converts it to
+the `"general"` representation first (the same model as `"struct"` arrays).
 
 An array's storage is **decided once, at creation, from its proven static
 type** — it is never converted afterward (no runtime "promotion", so no

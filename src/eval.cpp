@@ -1976,6 +1976,16 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
                 SharedArrayObj::svec_type(move(nb), sv.def, sv.stride));
         }
 
+        /* Flat STRING array: strings are immutable, so a handle copy IS a
+         * full mutable-top copy - stays flat. */
+        if (arr.skind() == SharedArrayObj::Storage::strs) {
+            const auto &tv = arr.flat_strs();
+            return SharedArrayObj(SharedArrayObj::tvec_type(
+                tv.cbegin() + arr.offset(),
+                tv.cbegin() + arr.offset() + arr.size()
+            ));
+        }
+
         const ArrayConstView &view = arr.get_view();
 
         SharedArrayObj::vec_type vec;
@@ -2122,6 +2132,18 @@ make_const_clone(const EvalValue &v)
             return arr;
         }
 
+        /* Flat STRING array: strings are immutable - nothing to recurse
+         * into; a handle copy + readonly is the deep const clone. */
+        if (src.skind() == SharedArrayObj::Storage::strs) {
+            const auto &tv = src.flat_strs();
+            SharedArrayObj arr(SharedArrayObj::tvec_type(
+                tv.cbegin() + src.offset(),
+                tv.cbegin() + src.offset() + src.size()
+            ));
+            arr.set_readonly();
+            return arr;
+        }
+
         const ArrayConstView &view = src.get_view();
 
         SharedArrayObj::vec_type vec;
@@ -2199,6 +2221,11 @@ make_general_array_clone(const SharedArrayObj &src)
         const auto &fv = src.flat_floats();
         for (size_type i = 0; i < m; i++)
             gv.emplace_back(EvalValue(fv[src.offset() + i]), false);
+    } else if (src.skind() == SharedArrayObj::Storage::strs) {
+        const auto &tv = src.flat_strs();
+        for (size_type i = 0; i < m; i++)
+            gv.emplace_back(EvalValue(SharedStr(tv[src.offset() + i])),
+                            false);
     } else {
         const auto &bv = src.flat_bools();
         for (size_type i = 0; i < m; i++)
@@ -2233,6 +2260,8 @@ arr_elem_boxed(const SharedArrayObj &a, size_type i)
                         sv.stride);
             return intrusive_ptr<StructObject>(obj);
         }
+        case SharedArrayObj::Storage::strs:
+            return EvalValue(SharedStr(a.flat_strs()[a.offset() + i]));
         default:
             return a.get_view()[i].get();
     }
@@ -2968,6 +2997,39 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
         std::memcpy(sv.buf.data() + (arr.offset() + idx) * sv.stride,
                     o.bytes.data(), sv.stride);
         out = r;
+        return true;
+    }
+
+    /*
+     * Flat STRING array (top-10 #7, the value-driven model): a plain store
+     * of a STRING keeps it flat; ANYTHING else (a non-string value, a
+     * compound op) PROMOTES to general and defers to the general path -
+     * never the flat scalars' dyn-launder error.
+     */
+    if (arr.skind() == SharedArrayObj::Storage::strs) {
+
+        const EvalValue r0 = RValue(rval);
+        if (op != Op::assign || !r0.is<SharedStr>()) {
+            arr.promote_strs_to_general();
+            return false;                 /* general path handles it */
+        }
+
+        if (!idx_v.is<int_type>())
+            throw TypeErrorEx("Expected integer as subscript",
+                              idx_start, idx_end);
+        int_type idx = idx_v.get<int_type>();
+        if (idx < 0)
+            idx += arr.size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+            throw OutOfBoundsEx(sub_start, sub_end);
+
+        if (arr.is_slice())
+            arr.clone_internal_vec();
+        else if (arr.use_count() > 1)
+            arr.clone_aliased_slices(arr.offset() + idx);
+
+        arr.flat_strs()[arr.offset() + idx] = SharedStr(r0.get<SharedStr>());
+        out = r0;
         return true;
     }
 
@@ -4994,6 +5056,19 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
                             sv.buf.data() + (base + i) * sv.stride, sv.stride);
 
                 const EvalValue elem(reuse);
+                if (!do_iter(&loopCtx, i, &elem, 1))
+                    break;
+            }
+
+        } else if (arr.skind() == SharedArrayObj::Storage::strs) {
+
+            /* Flat STRING array (top-10 #7): bind each element as a boxed
+             * SharedStr copy (a handle, not a byte copy). */
+            const auto &tv = arr.flat_strs();
+            const size_type n = arr.size(), base = arr.offset();
+
+            for (size_type i = 0; i < n; i++) {
+                const EvalValue elem((SharedStr(tv[base + i])));
                 if (!do_iter(&loopCtx, i, &elem, 1))
                     break;
             }

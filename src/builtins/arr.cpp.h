@@ -244,6 +244,8 @@ EvalValue builtin_array_storage(EvalContext *ctx, const ArgLocs *exprList,
             return SharedStr(string("bool"));
         case SharedArrayObj::Storage::structs:
             return SharedStr(string("struct"));
+        case SharedArrayObj::Storage::strs:
+            return SharedStr(string("str"));
         default:
             return SharedStr(string("general"));
     }
@@ -354,6 +356,18 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
         std::memcpy(sv.buf.data() + at, o.bytes.data(), sv.stride);
         break;
     }
+    case SharedArrayObj::Storage::strs:
+        /* Flat strings follow the STRUCT model, not the scalar one: a
+         * non-string element PROMOTES to general (never throws, unlike the
+         * type-driven flat scalars' dyn-launder error) - value-driven
+         * storage may lose flatness, it never rejects. */
+        if (elem.is<SharedStr>()) {
+            arr.flat_strs().push_back(SharedStr(elem.get<SharedStr>()));
+        } else {
+            arr.promote_strs_to_general();
+            arr.get_vec().emplace_back(elem, is_const);
+        }
+        break;
     default:                              /* general */
         arr.get_vec().emplace_back(elem, is_const);
         break;
@@ -1172,7 +1186,9 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
      * 1-arg (no callback) form - a user reducer needs boxed EvalValues.
      */
     if (nargs == 1 &&
-        arr.skind() != SharedArrayObj::Storage::general)
+        arr.skind() != SharedArrayObj::Storage::general &&
+        arr.skind() != SharedArrayObj::Storage::strs &&
+        arr.skind() != SharedArrayObj::Storage::structs)
     {
         const size_type off = arr.offset(), n = arr.size();
 
@@ -1203,7 +1219,13 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         return EvalValue(acc);
     }
 
-    const ArrayConstView &view = arr.get_view();
+    /* A flat-strs array reaches the general path via promotion on a local
+     * HANDLE copy (the caller's array keeps its storage): sum of strings
+     * concatenates through the general `+=` loop, as it always did. */
+    SharedArrayObj marr = arr;
+    if (marr.skind() == SharedArrayObj::Storage::strs)
+        marr.promote_strs_to_general();
+    const ArrayConstView &view = marr.get_view();
 
     if (view.size() == 0)
         return none; /* sum of an empty array is none, like min()/max() */

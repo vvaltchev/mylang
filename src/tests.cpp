@@ -579,6 +579,40 @@ static const std::vector<test> tests =
     },
 
     {
+        /* FLAT STRING ARRAYS (top-10 #7): split()/splitlines()/a string
+         * dict's keys()/values() build 24-byte SharedStr storage; reads/
+         * joins/foreach stay flat; a NON-string element write PROMOTES to
+         * general (the struct model - never the flat scalars' dyn-launder
+         * error); COW/slices behave like any flat kind. */
+        "flat string arrays: creation, reads, promote-on-write, COW",
+        {
+            "var q = \"a,b,c\";",
+            "var p = split(q + \"\", \",\");",     /* runtime split */
+            "assert(array_storage(p) == \"str\");",
+            "assert(p[1] == \"b\");",
+            "assert(join(p, \"-\") == \"a-b-c\");",
+            "var t = \"\";",
+            "foreach (var e in p) t += e;",
+            "assert(t == \"abc\");",
+            "append(p, \"d\");",                    /* stays flat */
+            "assert(array_storage(p) == \"str\" && len(p) == 4);",
+            "p[0] = 5;",                              /* promotes, works */
+            "assert(array_storage(p) == \"general\");",
+            "assert(p == [5, \"b\", \"c\", \"d\"]);",
+            /* slices share storage (COW) like any flat kind */
+            "var u = split(\"x.y.z\" + q[0:0], \".\");",
+            "var sl = u[0:2];",
+            "assert(intptr(sl) == intptr(u));",
+            "assert(sl == [\"x\", \"y\"]);",
+            /* a string dict's keys/values are flat; sum() still concats */
+            "var ds = {\"k\": \"v\"};",
+            "assert(array_storage(keys(ds)) == \"str\");",
+            "assert(array_storage(values(ds)) == \"str\");",
+            "assert(sum(u) == \"xyz\");",
+        },
+    },
+
+    {
         /* VALUE-TEMPLATE INSTANTIATION (plans/value-template-
          * instantiation.md): templates stored in an array and called
          * INDIRECTLY with one uniform signature get typed instances; the
@@ -4849,7 +4883,8 @@ static const std::vector<test> tests =
             "assert(array_storage(vf) == \"float\");",
             "var ds = {\"a\": 1, \"b\": 2};",
             "var ks = keys(ds); var vs = values(ds);",
-            "assert(array_storage(ks) == \"general\");",   /* str keys */
+            /* top-10 #7: string keys extract FLAT (24B SharedStr slots) */
+            "assert(array_storage(ks) == \"str\");",   /* str keys */
             "assert(array_storage(vs) == \"int\");",      /* int values */
             "assert(sort(ks) == [\"a\", \"b\"]);",
             /* empty-dict-then-fill: one compilation infers dict<int,int> */

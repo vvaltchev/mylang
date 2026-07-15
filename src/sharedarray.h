@@ -5,6 +5,7 @@
 #include "defs.h"
 #include "poolalloc.h"
 #include "flatval.h"
+#include "sharedstr.h"
 #include "intrusiveptr.h"
 #include "errors.h"
 #include <vector>
@@ -54,6 +55,13 @@ public:
     typedef std::vector<int_type>     ivec_type;
     typedef std::vector<float_type>   fvec_type;
     typedef std::vector<unsigned char> bvec_type;   /* one byte per bool */
+    /* Flat STRING storage (top-10 #7): 24-byte SharedStr handles instead of
+     * 48-byte LValues - split()'s pieces and a string dict's keys()/values()
+     * halve their memory. VALUE-driven like flat structs (no inference
+     * hint), and like structs a cold/unhandled op AUTO-PROMOTES to general
+     * via get_vec() - so every array op works with no dedicated case, and a
+     * non-string store simply promotes (never throws). */
+    typedef std::vector<SharedStr>    tvec_type;
 
     /*
      * Flat storage for an array of POD structs (plans/structs.md phase 7): the
@@ -85,7 +93,7 @@ public:
      * the hot ops branch on the kind and touch the flat vector directly.
      */
     enum class Storage : unsigned char {
-        general, ints, floats, bools, structs
+        general, ints, floats, bools, structs, strs
     };
 
 private:
@@ -109,6 +117,7 @@ private:
             fvec_type fvec;    /* kind == floats */
             bvec_type bvec;    /* kind == bools */
             svec_type svec;    /* kind == structs */
+            tvec_type tvec;    /* kind == strs */
         };
 
         std::unordered_set<SharedArrayObjTempl *> slices;
@@ -150,6 +159,9 @@ private:
         SharedObject(svec_type &&a) : kind(Storage::structs) {
             new (&svec) svec_type(move(a));
         }
+        SharedObject(tvec_type &&a) : kind(Storage::strs) {
+            new (&tvec) tvec_type(move(a));
+        }
 
         ~SharedObject() {
             switch (kind) {
@@ -158,6 +170,7 @@ private:
                 case Storage::floats:  fvec.~fvec_type(); break;
                 case Storage::bools:   bvec.~bvec_type(); break;
                 case Storage::structs: svec.~svec_type(); break;
+                case Storage::strs:    tvec.~tvec_type(); break;
             }
         }
 
@@ -218,6 +231,14 @@ public:
                   ? static_cast<size_type>(shobj->svec.buf.size() /
                                            shobj->svec.stride)
                   : 0)
+        , slice(false)
+    { }
+
+    /* Flat STRING storage (top-10 #7). */
+    SharedArrayObjTempl(tvec_type &&arr)
+        : shobj(make_intrusive<SharedObject>(move(arr)))
+        , off(0)
+        , len(shobj->tvec.size())
         , slice(false)
     { }
 
@@ -317,6 +338,7 @@ public:
      * op works on a struct array without a dedicated case.
      */
     void promote_structs_to_general();
+    void promote_strs_to_general();     /* flat strings (top-10 #7) */
 
     /*
      * General (vector<LValue>) access. mylang does NOT promote flat int/float
@@ -334,6 +356,8 @@ public:
          * flat scalar array reaching here is an invariant violation. */
         if (shobj->kind == Storage::structs)
             promote_structs_to_general();
+        if (shobj->kind == Storage::strs)
+            promote_strs_to_general();  /* same cold-path model as structs */
         if (shobj->kind != Storage::general)
             throw InternalErrorEx();
         return shobj->vec;
@@ -384,6 +408,15 @@ public:
     const svec_type &flat_structs() const {
         ML_CHECK(shobj && shobj->kind == Storage::structs);
         return shobj->svec;
+    }
+
+    tvec_type &flat_strs() {
+        ML_CHECK(shobj && shobj->kind == Storage::strs);
+        return shobj->tvec;
+    }
+    const tvec_type &flat_strs() const {
+        ML_CHECK(shobj && shobj->kind == Storage::strs);
+        return shobj->tvec;
     }
 
     int_type use_count() const { return shobj.use_count(); }
@@ -441,6 +474,7 @@ public:
                     ? static_cast<size_type>(shobj->svec.buf.size() /
                                              shobj->svec.stride)
                     : 0;
+            case Storage::strs:   return shobj->tvec.size();
             default:              return shobj->vec.size();
         }
     }

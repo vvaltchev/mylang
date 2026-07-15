@@ -2562,6 +2562,26 @@ are unchanged.
   it truncates a grown array. `clone_aliased_slices` therefore clones each slice
   while its `slice` flag is still set, so `offset()`/`size()` report the slice
   range.)
+- **Flat STRING storage (`Storage::strs`, top-10 #7)** - a
+  `vector<SharedStr>` (24B handles vs 48B LValues), following the STRUCT
+  model, NOT the scalar one: VALUE-driven creation (`split()`/
+  `splitlines()` always; a string dict's `keys()`/`values()` under a
+  dflt hint; plain literals stay general), and any cold/unhandled op
+  AUTO-PROMOTES via `get_vec()` - a non-string element write PROMOTES
+  (flat_store_core stores a plain str flat, anything else promotes +
+  defers to the general path; `TypeArr::subscript` promotes on
+  for_write THROUGH THE ORIGINAL LVALUE - promoting the RValue() temp
+  freed the fresh vector with it, an ASan-caught UAF). `array<str>`
+  destinations get NO ArrHint (dflt - the value keeps its storage; the
+  old forced `general` would general-ify a baked flat literal).
+  `array_storage()` reports `"str"`. Fast paths: arr_elem_at/boxed,
+  join (direct SharedStr reads), foreach (a tree-walker do_iter branch
+  + the VM LoadElemValue strs arm), clone/const-clone stay flat
+  (strings are immutable - a handle copy IS the deep copy); sum/min/max
+  promote a LOCAL handle copy (the caller keeps flat; min/max's old
+  `!= general` guard mis-read the union for strs AND structs - a
+  latent pre-existing struct-array InternalError, fixed the same way).
+
 - **Flat (unboxed) int/float/bool storage.** `SharedObject` carries a `Storage
   kind` (`general`/`ints`/`floats`/`bools`) and an **anonymous union** of `vec`
   (the `vector<LValue>`, 48-byte slots), `ivec` (`vector<int_type>`), `fvec`

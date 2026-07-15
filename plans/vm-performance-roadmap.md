@@ -92,10 +92,35 @@ is instructive:**
    VM-wall geomean **0.982**, my/py 4.78-4.79x → **4.83-4.85x**;
    the beneficiaries' my/py: 41_str_int_conv 0.29x, 64_struct_create
    0.44x, 63_closures 0.55x, 32_str_build_join 0.68x.
-7. **Flat string-array storage** (`Storage::strs`: a
-   `vector<SharedStr>` = 24B/elem vs the 48B LValue): helps split's
-   per-piece emplace (31), keys() of string dicts (27), join reads.
-   A real storage-kind addition — design-level, like flat_s was.
+7. **Flat string-array storage — DONE (2026-07-17).** `Storage::strs`
+   (`vector<SharedStr>`, 24B/elem vs the 48B LValue), following the
+   STRUCT model: VALUE-driven creation (split()/splitlines()/a string
+   dict's keys()/values(); plain literals stay general - v1 scope), and
+   a cold/unhandled op AUTO-PROMOTES via get_vec() - a non-string
+   element write PROMOTES (never the flat scalars' dyn-launder error).
+   Fast paths: arr_elem_at/boxed, join (reads the SharedStr vector
+   directly), foreach (tree-walker branch + the VM's LoadElemValue strs
+   arm), flat_store_core plain str stores, clone/const-clone/intptr/
+   min-max/sum (local-handle promote). `array_storage` reports "str"
+   (README updated). TRAPS hit + fixed during the build: promoting
+   through the RValue() TEMP freed the fresh vector (an ASan UAF - the
+   promote must go through the ORIGINAL LValue, and only on for_write);
+   sum/min-max's `!= general` flat guards mis-read the union for
+   strs/structs (min/max of a STRUCT array was a LATENT pre-existing
+   InternalError, now fixed by the same local-promote). MEASURED
+   (full-suite interleaved A/B vs 156a6af): 31_str_split_join
+   0.035→0.029s (**my/py 0.81x → 0.67x**), 47_wordcount 0.47x, suite
+   VM-wall geomean 1.001 (neutral; 27 turned out int-keyed - already
+   flat).
+8. **Typed dict-foreach bodies — PREMISE DISSOLVED (2026-07-17),
+   declined.** Inspection: a foreach over a PROVEN dict<K,int/float>
+   already types its key/value vars (accumulate_foreach) - the body IS
+   IntBin today. The boxed bodies the pair profile counted (66/74, 10.5%
+   of dispatches) are EXPLICIT `var dyn` containers - deliberately
+   dynamic, untypeable at compile time BY DESIGN (and both already beat
+   CPython: 0.55x/0.37x). The remaining idea (fusing
+   ForeachDynNext→BinOpV) is in the rejected two-throw-sources/one-loc
+   class. Nothing to build.
 8. **Typed dict-foreach bodies.** The E4 pair profile's #1-2 pairs
    (Jump→ForeachDynNext→BinOpV, 10.5% of ALL suite dispatches) are
    74/66's BOXED loop bodies over dyn containers. Their my/py already
