@@ -613,6 +613,59 @@ static const std::vector<test> tests =
     },
 
     {
+        /* FLAT STRING ARRAYS: sort/rev_sort/reverse run DIRECTLY over the
+         * SharedStr vector (stay flat). This pins the macOS-CI bug: the
+         * old default branch promoted a LOCAL handle copy (get_vec), so
+         * the CALLER's array kept the unsorted flat storage - masked on
+         * libstdc++ (keys() happened to iterate pre-sorted), exposed by
+         * libc++'s different unordered_map order. Sources are UNSORTED
+         * runtime splits, so no platform ordering can hide a no-op sort. */
+        "flat string arrays: sort, rev_sort, comparator sort, reverse",
+        {
+            "var p = split(\"c,a,b\" + \"\", \",\");",
+            "assert(array_storage(p) == \"str\");",
+            "sort(p);",
+            "assert(p == [\"a\", \"b\", \"c\"]);",
+            "assert(array_storage(p) == \"str\");",   /* stayed flat */
+            "rev_sort(p);",
+            "assert(p == [\"c\", \"b\", \"a\"]);",
+            "reverse(p);",
+            "assert(p == [\"a\", \"b\", \"c\"]);",
+            "assert(array_storage(p) == \"str\");",
+            /* user comparator (by length, then lexical) - heapsort path */
+            "var w = split(\"ccc,a,bb\" + \"\", \",\");",
+            "sort(w, func (x, y) => len(x) < len(y));",
+            "assert(w == [\"a\", \"bb\", \"ccc\"]);",
+            "assert(array_storage(w) == \"str\");",
+            /* the exact CI shape: sort the keys of a string dict */
+            "var d = {\"b\": 5, \"a\": 3};",
+            "var k = keys(d);",
+            "sort(k);",
+            "assert(k == [\"a\", \"b\"]);",
+        },
+    },
+
+    {
+        /* PRE-EXISTING struct-array sort orphan (latent since flat_s):
+         * sort(struct_arr, cmp) promoted a LOCAL handle (get_vec) and
+         * sorted the promoted copy - the caller's array stayed UNSORTED.
+         * Fixed by writing the promoted handle back through the lvalue;
+         * found by the strs twin of the same hazard. */
+        "flat struct arrays: comparator sort mutates the caller's array",
+        {
+            "struct P { int x; }",
+            "var a = [P(2), P(1), P(3)];",
+            "assert(array_storage(a) == \"struct\");",
+            "sort(a, func (p, q) => p.x < q.x);",
+            "assert(a[0].x == 1 && a[1].x == 2 && a[2].x == 3);",
+            "assert(array_storage(a) == \"general\");",  /* promoted */
+            "var b = [P(1), P(2)];",
+            "reverse(b);",
+            "assert(b[0].x == 2 && b[1].x == 1);",
+        },
+    },
+
+    {
         /* VALUE-TEMPLATE INSTANTIATION (plans/value-template-
          * instantiation.md): templates stored in an array and called
          * INDIRECTLY with one uniform signature get typed instances; the

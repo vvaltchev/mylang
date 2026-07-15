@@ -934,11 +934,35 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                     sort(v.begin(), v.end(), std::greater<unsigned char>());
                 return arr;
             }
+            case SharedArrayObj::Storage::strs: {
+                /* Sort the SharedStr vector DIRECTLY (lexicographic view
+                 * compare == TypeStr::lt): stays flat, and avoids the
+                 * promote-a-local-handle orphan (a promote reseats *this,
+                 * so the caller's array would keep the unsorted flat
+                 * storage - the macOS-CI bug: libc++'s dict order exposed
+                 * what libstdc++'s already-sorted keys() masked). */
+                auto &v = arr.flat_strs();
+                sort(v.begin(), v.end(),
+                     [reverse](const SharedStr &a, const SharedStr &b) {
+                    return reverse ? b.get_view() < a.get_view()
+                                   : a.get_view() < b.get_view();
+                });
+                return arr;
+            }
             default:
                 break;
         }
 
+        /* get_vec() PROMOTES a flat struct array - and the promote reseats
+         * THIS local handle, so the caller's variable would keep the old
+         * flat storage. Write the promoted handle back through the lvalue
+         * (the slice path above does the same put). */
+        const bool promoting =
+            arr.skind() != SharedArrayObj::Storage::general;
         auto &vec = arr.get_vec();
+
+        if (promoting && lval)
+            lval->put(val0);
 
         if (!reverse) {
 
@@ -1010,8 +1034,33 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 });
                 break;
             }
+            case SharedArrayObj::Storage::strs: {
+                /* Directly over the SharedStr vector - stays flat, no
+                 * promote (see the no-cmp strs note). Each compare boxes
+                 * two handle copies for the callback. */
+                auto &v = arr.flat_strs();
+                comparator_heapsort(v,
+                                    [&](const SharedStr &a,
+                                        const SharedStr &b) {
+                    const bool lt = cmp2(EvalValue(SharedStr(a)),
+                                         EvalValue(SharedStr(b)));
+                    return reverse ? !lt : lt;
+                });
+                break;
+            }
             default: {
+                /* get_vec() promotes a flat STRUCT array by reseating this
+                 * LOCAL handle - without the put below, the caller's array
+                 * kept the UNSORTED flat storage (a pre-existing bug for
+                 * sort(struct_arr, cmp), latent since flat_s landed; found
+                 * by the strs twin of the same hazard). */
+                const bool promoting =
+                    arr.skind() != SharedArrayObj::Storage::general;
                 auto &vec = arr.get_vec();
+
+                if (promoting && lval)
+                    lval->put(val0);
+
                 comparator_heapsort(vec,
                                     [&](const LValue &a, const LValue &b) {
                     const bool lt = cmp2(a.get(), b.get());
@@ -1130,8 +1179,21 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
             reverse(v.begin(), v.end());
             break;
         }
+        case SharedArrayObj::Storage::strs: {
+            auto &v = arr.flat_strs();
+            reverse(v.begin(), v.end());
+            break;
+        }
         default: {
+            /* struct promote reseats the local handle - write back (see
+             * sort_core's default). */
+            const bool promoting =
+                arr.skind() != SharedArrayObj::Storage::general;
             auto &vec = arr.get_vec();
+
+            if (promoting && lval)
+                lval->put(val0);
+
             reverse(vec.begin(), vec.end());
             break;
         }
