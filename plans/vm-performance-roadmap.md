@@ -46,6 +46,14 @@ is instructive:**
   MEASURED (the shipped #2+#4, full-suite interleaved A/B vs 83ac551):
   suite VM-wall geomean **0.984**, my/py 4.74-4.75x → **4.78-4.82x**.
 
+**B3 stage 3 (the 16-byte two-tier instruction): BUILT + MEASURED +
+REVERTED (2026-07-18)** - correct on the full validation set, but
+VM-wall geomean **1.122** / my/py 4.89x → 4.44x (dispatch-bound loops
++30-78%). The negative result and its design record live in
+plans/vm-optimizations-deferred.md (Rejected); the actionable residue:
+compact encoding belongs to the `.myv` FILE format, decoded to the
+fixed 32B Instr at load.
+
 **The top-10, ordered by expected value (evidence per item):**
 
 1. **Slim the in-VM call protocol.** `vm_enter_call` + `vm_leave_call`

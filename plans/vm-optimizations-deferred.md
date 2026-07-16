@@ -46,6 +46,29 @@ differential + `tests/nested_fuzz.py`.
 
 ## Rejected (do not revisit without new evidence)
 
+- **The two-tier 16-byte instruction (B3 stage 3) — BUILT, MEASURED,
+  REVERTED (2026-07-18).** The full design was implemented and proven
+  CORRECT (1541 -rt + differential + 400-program fuzz + six configs
+  green): `PInstr` 16B (int16 targets, int32 payloads, dual16 halves,
+  narrow FLOAT32 lits when losslessly representable), a 16-byte
+  EXTENSION WORD carrying 64-bit payloads (op-byte = an ExtWord canary,
+  consumed by the owning handler - never dispatched, no flag in the
+  main loop, position-implicit), a()/b() resolving wide transparently,
+  narrow gates on every direct-reader op, and a late `pack_chunk` (the
+  peephole/fusions kept working on the fat 32B form). MEASURED
+  (full-suite interleaved A/B vs 354a770): **VM-wall geomean 1.122
+  (+12.2%), my/py 4.89x → 4.44x** - the dispatch-bound tier regressed
+  30-78% (04_float_arith 1.78x, 59_bit_hash 1.73x, 61_popcount 1.50x,
+  sieves 1.33-1.41x), INCLUDING benches whose handlers were untouched
+  (the specialized bit ops) - i.e. the loss is decode ALU + the
+  whole-dispatch-loop code-layout perturbation, and the density bought
+  nothing back (hot loops are L1-resident; B3's 56→32 step had already
+  captured the real win). This is the local confirmation of the
+  literature (CPython wordcode variable→fixed for speed; Lua/LuaJIT
+  fixed 32-bit; Shi/Gregg dispatch count >> byte density). Bytecode
+  DENSITY is a WIRE-format concern: apply compact encoding to the
+  `.myv` FILE, decode to the fixed 32-byte Instr at load.
+
 - **Flat open-addressing dict** — REJECTED by the maintainer
   (node-pointer stability); the approved form was the H2 v2
   `unordered_map` pool allocator (`poolalloc.h`), which shipped.
