@@ -1,110 +1,88 @@
 # VM optimizations — deferred (parking lot)
 
-These are perf ideas **parked** while we pursue the `.myv` serialization endgame
-(zero AST fallback → exceptions first; see `plans/vm-exceptions.md` and the END
-GOAL in `plans/bytecode-vm.md`). They are perf-only, **orthogonal to the
-bytecode format** (none blocks or is blocked by `.myv`), so we return to them
-after the fallbacks are gone. Ordered by the assessment below, not by ID.
+The CURRENT backlog of perf ideas that are real but not scheduled. The
+live, evidence-ordered work list is the RE-PROFILE top-10 in
+`plans/vm-performance-roadmap.md`; this file holds only what is parked.
+(2026-07-17 cleanup: most of the original entries here have since been
+MERGED — see the closed ledger at the bottom.)
 
-Ground rules for ALL of these (from the maintainer): a change must be
-**perf-neutral-or-better in the worst case**, verified by the `bench/run.py --vm
---baseline <same release binary>` wall-clock geomean (reliable on the dev WSL2 —
-benches are consistent — even though it has **no PMU**; see
-`[[vm-dispatch-frontend-regression]]`). Correctness is always gated by the 1220
-`-rt` VM differential + the `nested_fuzz.py` three-way fuzzer.
+Ground rules (maintainer): a change must be perf-neutral-or-better in
+the worst case, verified by the FULL-SUITE interleaved A/B rule
+(CLAUDE.md, Benchmarks). Correctness is gated by the `-rt` VM
+differential + `tests/nested_fuzz.py`.
 
 ---
 
-## C2 — computed-goto (threaded) dispatch  ·  the one real lever, RISKY here
+## Open
 
-Replace the central `switch (in.op)` in `vm_run_chunk` with GCC/clang
-labels-as-values: a `static const void* table[]` of per-op code labels, and each
-handler ENDS with its own `goto *table[chunk.code[pc].op]`. Instead of ONE
-shared indirect dispatch branch (which sees every op→op transition blended and
-mispredicts), there is one dispatch branch PER handler, each of which the CPU's
-indirect predictor can specialize to the local bytecode correlations (after
-`IntBin` usually `IntBin`/`ForLoopStep`, …). Classic 10–20% on dispatch-bound
-loops (Ertl & Gregg 2003); also drops the switch's implicit bounds check.
+- **The residual fusion batch (roadmap #9).** From the E4 op-pair
+  profile: ForLoopStep→LoadElemInt 2.8%, LoadStructFieldInt↔IntAddRR
+  2.7%, IntAddRR→ForLoopStep 3.1% of suite dispatches — each ~0.5%
+  suite, so only worth doing AS A BATCH (one measured landing). All are
+  caret-safe shapes (the loads keep their node/loc like
+  JumpUnlessElemInt did). New pc-field ops MUST join `visit_pc_fields`.
+- **Per-chunk "possibly-reference slots" list** (roadmap #1's residual):
+  `vm_leave_call`'s O(nslots) reset scan could skip all-scalar frames
+  (the fib-class) if codegen recorded which slots can ever hold a
+  non-trivial value.
+- **E2 — peephole temp renumbering** (`plans/vm-peephole.md`):
+  evaluated + deferred — the native call stack made per-call temp cost
+  ~nil, so compacting `n_temps` buys little. Revisit only if a profile
+  shows frame-size cost.
+- **H1 v2 — inline small-buffer for BOXED structs** (roadmap, alloc
+  study): a boxed instance's `vector<LValue>` fields could live inline
+  under N slots. Only if a boxed-struct bench ever matters.
+- **Value-template v2 — REPL cross-input value instantiation**
+  (`plans/value-template-instantiation.md` known gap): an input-1 array
+  called indirectly from input 2 keeps the boxed base (correct,
+  unoptimized; pinned by a `repl:` test).
+- **C3 residual — builtin arg-view ABI**: pass the frame run to
+  `func_v` by view instead of copying into the stack `EvalValue[8]`.
+  Marginal (scalar args copy cheap; only non-trivial args pay a
+  refcount bump) and touches all ~84 signatures; its valuable half
+  (AST-free carets) already shipped as `ArgLocs`/`builtin_calls`.
+- **Machine-code JIT (x86-64/arm64)** — the far-future endgame
+  (`[[vm-endgame]]`): eliminates dispatch wholesale. Requires the
+  serializable `.myv` bytecode first (now unblocked: zero-AST holds).
+- **A PMU box.** WSL2 has no hardware counters, so front-end/layout
+  effects (the dominant residual on dispatch-bound loops — see
+  `[[vm-dispatch-frontend-regression]]`) only show as wall-clock deltas
+  whose cause can't be confirmed. Any further layout-sensitive work
+  wants `perf stat` on bare metal.
 
-- **GCC/clang only** → ships behind `#if defined(__GNUC__)`, `switch` kept for
-  MSVC. Two dispatch paths to keep in sync.
-- **Pair with a cold-handler split**: hoist rarely-taken code (error throws,
-  big cold ops) out of the hot loop body so the hot handlers pack densely into
-  I-cache.
-- **Uncertain HERE**: modern ITTAGE predictors already predict the single switch
-  branch well (CPython 3.11's win was small); and the front-end effect is
-  **unmeasurable on WSL2 (no PMU)** — only wall-clock is available. So it's a
-  MEASURED EXPERIMENT (implement, verify the 1220 differential, keep only if the
-  `--vm` geomean is neutral-or-better), NOT a blind commit. ~64-handler
-  mechanical conversion (each `case`→label, each `break`→threaded dispatch,
-  `in`/ `pc` re-read per label) → bug-risk, but differential-caught.
-- **This is also the DIRECT fix** for the 2026-07-08 dispatch-slowdown
-  regression (a bigger op set stops regressing the hot ops' branch prediction
-  once each op has its own dispatch branch). So it should be done BEFORE adding
-  more ops (e.g. C4).
+## Rejected (do not revisit without new evidence)
 
-## C3 — builtin arg-view ABI  ·  MARGINAL, broad churn
+- **Flat open-addressing dict** — REJECTED by the maintainer
+  (node-pointer stability); the approved form was the H2 v2
+  `unordered_map` pool allocator (`poolalloc.h`), which shipped.
+- **BinOpV→CompoundV fusion** — two throw sources with different carets
+  cannot share one pc's loc entry (the E4 class rule).
+- **Zero-copy arg binding** (native-call-stack Phase E) — measured and
+  declined: the bind is ~2 instructions; the protocol around it is
+  what costs.
+- **EvalValue assign-operator surgery** (re-profile #3) — tried twice,
+  declined twice: the operators inline at hundreds of sites, ANY
+  textual growth perturbs the whole binary.
+- **Node-level superinstructions on the TREE-WALKER** — killed by the
+  cachegrind study (~1 instr/iter). The VM-side analogue is alive as
+  the E4 peephole fusion framework, gated per-fusion by wall clock.
 
-`CallBuiltinV` copies the n pre-evaluated args from the frame run into a stack
-`EvalValue[8]` before calling `func_v(ctx, ExprList*, args, n)`. Idea: pass the
-frame run by pointer/view (the `VmArgs` view already does this for user `CallV`)
-so no per-arg `EvalValue` copy.
-- **Low value-to-churn**: the copy is cheap for the SCALAR builtins that
-  dominate hot loops (only non-trivial string/array args pay a refcount bump),
-  and the change touches all **84** `func_v` signatures.
-- Its genuinely-valuable half — freeing the builtin ops' `Instr::node` (the args
-  `ExprList` carried only for per-arg error carets) — is the **builtin
-  loc-handle refactor**, which belongs with the AST-free / `.myv` work
-  (`plans/vm-fallback-elimination.md` item 2), NOT here.
+## Closed ledger (merged / superseded — the original entries)
 
-## C4 — `ModConst` (fuse `x = x % C`)  ·  MINOR, likely net-negative now
-
-`s = s % 1000000007` appears in nearly every bench. Already native (`IntBin`
-with an immediate second operand); a dedicated `ModConst` would bake the divisor
-+ skip the operand decode and the div-zero check (C is known-nonzero).
-- **Adds a NEW op** → per `[[vm-dispatch-frontend-regression]]` that risks a
-  front-end regression that dwarfs the tiny decode saving on a switch dispatch.
-  The plan itself calls it "minor". **Defer until AFTER C2** (computed-goto
-  makes op-set size front-end-neutral), or skip.
-
-## C1 — typed operands into member/subscript/builtin READS  ·  LARGELY DONE
-
-Landed as the typed dict / struct / element read ops (`DictLoadInt/Float`,
-`LoadStructFieldInt/Float`, `LoadElemInt/Float`). Residual: a boxed builtin
-RESULT feeding a typed arith chain still boxes (`40_math_builtins` gate) — a
-typed-result builtin variant would remove a box+unbox per hot read. Small.
-
-## C5 — don't re-box a bool comparison feeding a branch  ·  LARGELY DONE
-
-Done via `JumpUnlessIntCmp`/`JumpUnlessFloatCmp` (fused compare+branch) and
-`JumpUnlessTrueV`. Residual audit: any `BinOpV`(compare)+`JumpIfFalse` pair that
-should be a fused `CmpV`+branch.
-
----
-
-## Bigger / further-out
-
-- **Superinstruction fusion** — mostly KILLED by a cachegrind study: fusing a
-  typed operator's operand reads saved ~1 instr/iter (0.03%), because it only
-  trades a well-predicted monomorphic vcall for an equal-length inline branch.
-  The per-node dispatch tax can only be removed WHOLESALE (that's C2 / the JIT),
-  not by node-level superinstructions. Revisit only with a PMU.
-- **Machine-code JIT (x86-64 / arm64)** — the far-future endgame
-  (`[[vm-endgame]]`, "no cheating: ops must lower to real machine code"). C2
-  threaded dispatch is the last interpreter stop before it; a JIT eliminates
-  dispatch entirely by emitting each handler's code inline. Requires the
-  AST-free serializable bytecode first.
-- **`Instr` shrink** — dropping the 8-byte `node` field (~12% smaller `Instr` →
-  hotter instruction stream). This is now folded into the `.myv` / AST-free
-  endgame (a fallback op's node → a serializable pool index, or the construct is
-  nativized), NOT a standalone perf item. See
-  `plans/vm-fallback-elimination.md`.
-
-## Need first: a PMU
-
-The single most valuable enabler is a machine with **hardware performance
-counters** (branch-misprediction / DSB / I-cache counters). On WSL2 (no PMU) the
-front-end effects that dominate these micro-changes are invisible to cachegrind
-(instruction count) and only show as wall-clock deltas whose CAUSE we can't
-confirm. Any of C2/C4 (dispatch/layout-sensitive) should ideally be measured on
-a bare-metal Linux box with `perf stat`.
+- **C2 computed-goto dispatch** → SHIPPED as `CGOTO` (default 1;
+  ~10% geomean on dispatch-bound loops, −25-42% indirect-branch
+  mispredicts). MSVC keeps the switch, as planned.
+- **C4 `ModConst`** → SUPERSEDED by B1/B2's `IntModRI` (nonzero-imm
+  mod, part of the 23-variant specialized-arith batch).
+- **C1 typed reads** → DONE (DictLoad*/LoadStructField*/LoadElem* +
+  H1's LoadMemberInt/Float); its residual (a boxed builtin result
+  feeding typed arith, the 40_math_builtins gate) → DONE as F1
+  `MathFnV`.
+- **C5 bool-compare re-boxing** → DONE (JumpUnless{Int,Float}Cmp,
+  JumpUnlessTrueV, the typed-ternary lowering; `JumpIfFalse` itself is
+  deleted).
+- **`Instr` shrink** → DONE as B3 (56→32 bytes, static_asserted; the
+  node handle is codegen-only `CgInstr`).
+- **The "parked while fallbacks remain" premise** → obsolete: the
+  no-fail codegen deleted every fallback op; zero-AST is machine-proven
+  (`vm_ast_teardown`).

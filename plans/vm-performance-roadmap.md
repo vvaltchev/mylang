@@ -1,5 +1,7 @@
 # VM performance roadmap: from 3.9x to 5x+ over CPython
-# (2026-07-17: currently 4.70-4.75x - see the RE-PROFILE section below)
+# (2026-07-17 end of day: 4.85x; top-10 items 1-8+10 closed, #9 parked
+#  - see the RE-PROFILE section below; parking lot:
+#  plans/vm-optimizations-deferred.md)
 
 ## 2026-07-17 RE-PROFILE — the CURRENT top-10 (post-E4, suite 4.70-4.75x)
 
@@ -121,16 +123,12 @@ is instructive:**
    CPython: 0.55x/0.37x). The remaining idea (fusing
    ForeachDynNext→BinOpV) is in the rejected two-throw-sources/one-loc
    class. Nothing to build.
-8. **Typed dict-foreach bodies.** The E4 pair profile's #1-2 pairs
-   (Jump→ForeachDynNext→BinOpV, 10.5% of ALL suite dispatches) are
-   74/66's BOXED loop bodies over dyn containers. Their my/py already
-   wins (0.37x/0.55x) so this is absolute-time, not ratio, value —
-   typed binds for a proven dict<K,int/float> foreach would convert
-   the BinOpV chains to IntBin.
-9. **The residual fusion batch** (from the same pair profile):
-   ForLoopStep→LoadElemInt 2.8%, LoadStructFieldInt↔IntAddRR 2.7%,
-   IntAddRR→ForLoopStep 3.1% — each ~0.5% suite; only worth it as a
-   batch after 1-6.
+9. **The residual fusion batch — STILL OPEN (parked)** (from the
+   same pair profile): ForLoopStep→LoadElemInt 2.8%,
+   LoadStructFieldInt↔IntAddRR 2.7%, IntAddRR→ForLoopStep 3.1% —
+   each ~0.5% suite; only worth it as one measured BATCH. The last
+   open item of this list; tracked in
+   plans/vm-optimizations-deferred.md.
 10. **An inline cache on CallValueV — PREMISE FALSIFIED (2026-07-17),
     pivoted.** Code inspection: the op's "validation" is already three
     hot loads (the FuncObject tag compare + the descriptor-memoized
