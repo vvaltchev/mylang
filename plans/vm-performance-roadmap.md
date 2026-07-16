@@ -3,7 +3,67 @@
 #  RE-PROFILE section below; parking lot:
 #  plans/vm-optimizations-deferred.md)
 
-## 2026-07-17 RE-PROFILE — the CURRENT top-10 (post-E4, suite 4.70-4.75x)
+## 2026-07-18 RE-PROFILE — the CURRENT top-10 (suite 4.89x, all benches
+## beat CPython; everything below this section is historical)
+
+Method: the my/py laggard board (interleaved full-suite runs, best-of),
+per-bench VM/TW ratios (--vm --baseline, same binary: VM = 2.26x the
+tree-walker), callgrind on the eight worst laggards (release + symbols;
+binary verified BYTE-IDENTICAL to the measured baseline - a first pass
+accidentally profiled the reverted-16B stale build and was redone).
+Laggards: 34_sort_custom_cmp 0.89x vm/tw, 67_make_dict 0.81, 27/35 0.80,
+69_exc_crossframe 0.77, 32 0.72, 76 0.72, 13_array_append 0.71, 31 0.64,
+23_dict_insert 0.60, 11_closure_counter 0.58.
+
+1. **Flat storage for an empty-`[]` array with a KNOWN element type.**
+   FOUND BROKEN: `array<int> e = []` + push stays GENERAL (48B LValues)
+   - only the uninitialized `array<int> c;` form gets flat storage; the
+   explicit empty literal never receives the ArrHint, and the inferred
+   `var a = []` (typed array<int> by the fixpoint, -dti confirms)
+   doesn't either. Bench 13's exact shape: realloc_insert<LValue> 6.7%
+   + LValue::put 9.8% + the general arr_append_fast path. Fix at
+   set_array_repr_hint (stamp flat_i/f/b on an empty literal when the
+   destination element type is known) - existing machinery, low risk.
+2. **A per-chunk "reference-slots" list - TWO consumers.** Codegen
+   records which frame slots can EVER hold a non-trivial (>= t_str)
+   value; (a) VmInvoker::invoke's per-ELEMENT window scan (`for i <
+   total: if t >= t_str: win[i] = LValue()`) - invoke is 17-25% of
+   34/35/67 and the scan runs per callback element; (b) vm_leave_call's
+   O(nslots) reset scan (7.6% of 11; the fib-class all-scalar frames
+   skip entirely). The old roadmap-#1 residual, now evidenced twice.
+3. **Descriptor-based LAZY BacktraceFrame.** Today every unwound frame
+   captures {string name, vector<string> params} EVEN WHEN THE
+   EXCEPTION IS CAUGHT and the backtrace never renders - 69's
+   malloc/_int_free 13.4% + the string emplace 3.2%. Capture {const
+   FuncDescriptor *, Loc} (descriptors are program-lifetime, so this is
+   post-teardown-safe) and stringify in format_backtrace. Byte-identical
+   output; kills allocs on every caught throw (69/70/72/42).
+4. **Pool the exception objects** (ML_POOL_NEW_DELETE on the
+   DECL_RUNTIME_EX classes + ExceptionObjectTempl): the residual
+   make_unique<RuntimeException> malloc/free per throw on the same
+   benches. Pairs with #3.
+5. **dict reserve(n) where n is known**: builtin_make_dict (the keys
+   array's length), dict-from-pairs, MakeDictV literals. Kills the
+   rehash chain inside _M_insert_unique_node (7.4% of 23, 6.6% of 67).
+   The approved pool allocator covers the nodes; reserve covers the
+   bucket-array churn.
+6. **Int-int fast path in the StoreCaptureV/StoreGlobalV COMPOUND
+   arms** (mirror slot_rmw's local int fast path): 11's capture++ loop
+   pays num_bin_op's PMF per iteration (9.2%).
+7. **vm_enter_call lean record fill** (the call cluster's residual):
+   enter 12.8% + leave 7.6% + VmCallRec emplace 4.3% on 11. A fast
+   fill for the common no-handler/no-iterator/no-cache case.
+8. **Per-element invocation entry residue**: EntryGuard dtor 4.5% of
+   35 - extend vm_enter_invocation_fast so the guard state persists
+   across a VmInvoker loop instead of re-arming per element.
+9. **join() raw-copy build**: resize-once + memcpy instead of
+   per-piece _M_append (15% of 31 incl. the irreducible data move);
+   modest.
+10. **Sort-comparator boxing**: cmp2 boxes two EvalValues per compare
+    over a flat array (34's lambda ~10%); an int-specialized compare
+    path would need a typed-comparator contract - complex, last.
+
+## 2026-07-17 RE-PROFILE — the top-10 (post-E4, suite 4.70-4.75x) [CLOSED]
 
 Fresh session at HEAD 83ac551 (release, scale 1): full-suite my/py +
 VM/TW runs, callgrind on the six worst my/py laggards, plus the E4
