@@ -1,6 +1,6 @@
 # VM performance roadmap: from 3.9x to 5x+ over CPython
-# (2026-07-17 end of day: 4.85x; top-10 items 1-8+10 closed, #9 parked
-#  - see the RE-PROFILE section below; parking lot:
+# (2026-07-17 end of day: 4.89-4.93x; ALL top-10 items closed - see the
+#  RE-PROFILE section below; parking lot:
 #  plans/vm-optimizations-deferred.md)
 
 ## 2026-07-17 RE-PROFILE — the CURRENT top-10 (post-E4, suite 4.70-4.75x)
@@ -123,12 +123,26 @@ is instructive:**
    CPython: 0.55x/0.37x). The remaining idea (fusing
    ForeachDynNext→BinOpV) is in the rejected two-throw-sources/one-loc
    class. Nothing to build.
-9. **The residual fusion batch — STILL OPEN (parked)** (from the
-   same pair profile): ForLoopStep→LoadElemInt 2.8%,
-   LoadStructFieldInt↔IntAddRR 2.7%, IntAddRR→ForLoopStep 3.1% —
-   each ~0.5% suite; only worth it as one measured BATCH. The last
-   open item of this list; tracked in
-   plans/vm-optimizations-deferred.md.
+9. **The residual fusion batch — DONE (2026-07-17).** Three fused
+   superinstructions in one measured landing (the last open item):
+   **IntAddStep** (an int accumulate tail `s = s + x` fused into the
+   counted-loop ForLoopStep - add + step + test + branch in one
+   dispatch; declines when a `continue` targets the step),
+   **ForStepElemInt** (the back-edge `a[i]` load, indexed by the
+   counter, fused into the step - the original load stays for the
+   entry path and the fused target lands past it; the load's OOB
+   caret rides the fused pc, pinned byte-identical), and
+   **StructFieldAddInt** (`dst = other + a[i].f`, GENERAL 3-address -
+   65's adds chain through temps, so the accumulator-only shape would
+   never fire). The BONUS root-cause find: `LoadStructFieldInt/Float`,
+   `LoadMemberInt/Float`, `LoadStructElemV`, `LoadElemBool` were
+   MISSING from the peephole's `visit_use_def` - liveness BARRIERS
+   that made every temp look live inside a struct-loop body and had
+   silently blocked the E4 IntAddModRI fusion there since it landed.
+   MEASURED (full-suite interleaved A/B vs 9836e27):
+   65_struct_field_sum 0.069→0.054s (**0.783x**), 02_for_loop 0.75x,
+   14_array_subscript 0.905x, suite VM-wall geomean **0.987**, my/py
+   4.82-4.85x → **4.89-4.93x**.
 10. **An inline cache on CallValueV — PREMISE FALSIFIED (2026-07-17),
     pivoted.** Code inspection: the op's "validation" is already three
     hot loads (the FuncObject tag compare + the descriptor-memoized

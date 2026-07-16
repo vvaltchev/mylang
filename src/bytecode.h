@@ -1048,6 +1048,39 @@ enum class OpCode : unsigned char {
     IntAddModRI, JumpUnlessElemInt,
 
     /*
+     * The #9 RESIDUAL FUSION BATCH (roadmap; same pair-profile method):
+     *
+     * IntAddStep - `IntBin(+) s = s + x; ForLoopStep(step imm 1)` (the
+     * accumulate-then-step loop tail) in one dispatch. Gated on the
+     * accumulator shape (add dst == add a, both slots) and the i++/i--
+     * step. NEVER THROWS (the add wraps; the step never throws) -
+     * loc/node-free. Encoding: `target` = the loop pc, `target2` = the
+     * counter slot, `aop` = the compare, a_dual = (add dst, BOUND: an
+     * int32 imm when a_is_lit else a slot - this op's private use of the
+     * a-lit bit alongside the dual view), b = the add's rhs operand.
+     *
+     * ForStepElemInt - `ForLoopStep(step imm 1)` whose branch target is a
+     * `LoadElemInt` indexed BY THE COUNTER (the `for i: ... a[i]` back
+     * edge): on a taken back edge the element load runs in the SAME
+     * dispatch and control lands PAST the original load (target = load pc
+     * + 1); the original load stays in place for the loop-entry path. The
+     * load's OOB caret rides along (this op's loc = the load's node, like
+     * JumpUnlessElemInt). Encoding: `target2` = counter, `aop` = compare,
+     * a = the bound operand (as ForLoopStep), b_dual = (array slot, elem
+     * dst slot).
+     *
+     * StructFieldAddInt - `LoadStructFieldInt t = a[i].f; IntBin(+)
+     * dst = other + t` (bench 65's reduction - the adds chain through
+     * temps, so this is GENERAL 3-address, the accumulator being the
+     * special case) fuses to `dst = other + a[i].f` when t is a dead-
+     * after temp. The field read is proven no-fault (the struct-foreach
+     * guarantee) and the add wraps - loc/node-free. Encoding: `target` =
+     * the add's dst, `target2` = the struct-array slot, a = the index
+     * operand, b_dual = (field index, the other add operand's slot).
+     */
+    IntAddStep, ForStepElemInt, StructFieldAddInt,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1094,7 +1127,8 @@ enum class OpCode : unsigned char {
     X(IntXorRR) X(IntXorRI) X(IntShlRR) X(IntShlRI) X(IntShrRR) \
     X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
     X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV) \
-    X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt)
+    X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt) \
+    X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin
@@ -1267,6 +1301,13 @@ struct Instr {
         pa = static_cast<int64_t>(static_cast<uint32_t>(lo))
              | (static_cast<int64_t>(hi) << 32);
         opflags = static_cast<uint8_t>(opflags & ~0x07u);  /* not a lit */
+    }
+    int b_dual_lo() const { return static_cast<int>(static_cast<int32_t>(pb)); }
+    int b_dual_hi() const { return static_cast<int>(pb >> 32); }
+    void set_b_dual(int lo, int hi) {
+        pb = static_cast<int64_t>(static_cast<uint32_t>(lo))
+             | (static_cast<int64_t>(hi) << 32);
+        opflags = static_cast<uint8_t>(opflags & ~0x38u);  /* not a lit */
     }
 
     void swap_ab() {

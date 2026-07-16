@@ -15,12 +15,6 @@ differential + `tests/nested_fuzz.py`.
 
 ## Open
 
-- **The residual fusion batch (roadmap #9).** From the E4 op-pair
-  profile: ForLoopStep→LoadElemInt 2.8%, LoadStructFieldInt↔IntAddRR
-  2.7%, IntAddRR→ForLoopStep 3.1% of suite dispatches — each ~0.5%
-  suite, so only worth doing AS A BATCH (one measured landing). All are
-  caret-safe shapes (the loads keep their node/loc like
-  JumpUnlessElemInt did). New pc-field ops MUST join `visit_pc_fields`.
 - **Per-chunk "possibly-reference slots" list** (roadmap #1's residual):
   `vm_leave_call`'s O(nslots) reset scan could skip all-scalar frames
   (the fib-class) if codegen recorded which slots can ever hold a
@@ -68,6 +62,11 @@ differential + `tests/nested_fuzz.py`.
   the E4 peephole fusion framework, gated per-fusion by wall clock.
 
 ## Closed ledger (merged / superseded — the original entries)
+
+- **The residual fusion batch (roadmap #9)** → SHIPPED 2026-07-17
+  (IntAddStep / ForStepElemInt / StructFieldAddInt + the
+  `visit_use_def` barrier fix for the struct/member loads; suite
+  VM-wall 0.987, 65_struct_field_sum 0.783x, my/py → 4.89-4.93x).
 
 - **C2 computed-goto dispatch** → SHIPPED as `CGOTO` (default 1;
   ~10% geomean on dispatch-bound loops, −25-42% indirect-branch

@@ -6587,6 +6587,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
         case OpCode::JumpUnlessElemInt:  /* E4 fusion - keeps the load's
                                           * OOB caret */
+        case OpCode::ForStepElemInt:     /* #9 fusion - the embedded back-edge
+                                          * load's OOB caret */
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
         case OpCode::LoadElemValue:
@@ -6817,6 +6819,8 @@ static void visit_pc_fields(Instr &in, F f)
     case OpCode::CatchTest:            /* a.lit = catch_types idx */
     case OpCode::PushHandler:          /* -> the runtime handler's catch_pc */
     case OpCode::JumpUnlessElemInt:    /* E4 fusion; target2 = the BASE slot */
+    case OpCode::IntAddStep:           /* #9 fusion; target2 = COUNTER slot */
+    case OpCode::ForStepElemInt:       /* #9 fusion; target2 = COUNTER slot */
         f(in.target);
         break;
     default:
@@ -6903,6 +6907,17 @@ static bool visit_use_def(const Instr &in, U u, D d)
         opnd(in.a()); opnd(in.b()); d(in.target); return true;
     case OpCode::JumpUnlessElemInt:    /* E4: base + idx reads, no def */
         u(in.target2); opnd(in.a()); return true;
+    case OpCode::IntAddStep:           /* #9: a_dual = (add dst, bound) */
+        u(in.a_dual_lo()); opnd(in.b()); u(in.target2);
+        if (!in.a_is_lit())
+            u(in.a_dual_hi());
+        d(in.a_dual_lo()); d(in.target2); return true;
+    case OpCode::ForStepElemInt:       /* #9: b_dual = (array, elem dst) */
+        u(in.target2); opnd(in.a()); u(in.b_dual_lo());
+        d(in.target2); d(in.b_dual_hi()); return true;
+    case OpCode::StructFieldAddInt:    /* #9: b_dual = (field, other) */
+        u(in.target2); opnd(in.a()); u(in.b_dual_hi());
+        d(in.target); return true;
     case OpCode::JumpIfNotNoneV:
         opnd(in.a()); return true;
     case OpCode::ForLoopStep:
@@ -6924,8 +6939,16 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::SubscriptV: case OpCode::MemberV:
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
-    case OpCode::LoadStrChar:
+    case OpCode::LoadElemBool: case OpCode::LoadStrChar:
+    /* the struct reads (were BARRIERS, which made every temp look live
+     * inside a struct-loop body and silently blocked the E4 IntAddModRI
+     * fusion there - found by #9 F-C): */
+    case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:
+    case OpCode::LoadStructElemV:
         u(in.target2); opnd(in.a()); d(in.target); return true;
+    case OpCode::LoadMemberInt: case OpCode::LoadMemberFloat:
+        /* a = the member_keys pool idx (a lit), not a slot */
+        u(in.target2); d(in.target); return true;
     case OpCode::ArrLen: case OpCode::StrLen:
         u(in.target2); d(in.target); return true;
     case OpCode::SliceV:
@@ -7140,6 +7163,38 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
             for (size_t p = 0; p + 1 < n; p++) {
                 CgInstr &op1 = code[p];
                 CgInstr &op2 = code[p + 1];
+
+                /* #9 F-B: ForLoopStep(step imm 1) whose branch target is a
+                 * LoadElemInt indexed by the counter -> ForStepElemInt (the
+                 * back-edge load runs in the step's dispatch; the original
+                 * load stays for the loop-entry path, and the fused target
+                 * lands past it). Placed BEFORE the is_tgt guard - no op2
+                 * involved. The ascending scan makes this safe against the
+                 * JumpUnlessElemInt rule: the load's pc < the step's pc, so
+                 * a load that can sieve-fuse already did this round, and
+                 * once fused here, target = load pc + 1 marks it a branch
+                 * target (is_tgt next round) - the sieve rule then declines
+                 * at the load forever. */
+                if (op1.op == OpCode::ForLoopStep
+                    && op1.b_is_lit() && op1.b_lit() == 1
+                    && op1.target >= 0
+                    && static_cast<size_t>(op1.target) < n) {
+                    CgInstr &ld = code[op1.target];
+                    if (ld.op == OpCode::LoadElemInt
+                        && !ld.a_is_lit()
+                        && ld.a_slot() == op1.target2) {
+                        CgInstr f = op1;   /* keeps aop, target2, a(bound) */
+                        f.op = OpCode::ForStepElemInt;
+                        f.target = op1.target + 1;
+                        f.set_b_dual(ld.target2 /* array */,
+                                     ld.target  /* elem dst */);
+                        f.node_idx = ld.node_idx;   /* the OOB caret */
+                        op1 = f;
+                        changed = true;
+                        continue;
+                    }
+                }
+
                 if (is_tgt[p + 1])
                     continue;
 
@@ -7160,6 +7215,74 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                         f.target = op2.target;
                         f.target2 = static_cast<int>(op2.b_lit());
                         f.node_idx = -1;   /* never throws - loc-free */
+                        op1 = f;
+                        op2.op = OpCode::Jump;
+                        op2.target = static_cast<int>(p) + 2;
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                /* #9 F-A: IntBin(+) accumulator `s = s + x` falling into a
+                 * ForLoopStep(step imm 1) -> IntAddStep (add + step + test
+                 * + branch, one dispatch). The is_tgt[p+1] guard above
+                 * excludes loops with `continue` (it targets the step); a
+                 * branch to the ADD is fine (add-then-step is what it
+                 * expects). Never throws - node-free. */
+                if (op1.op == OpCode::IntBin && op1.aop == Op::plus
+                    && op2.op == OpCode::ForLoopStep
+                    && op2.b_is_lit() && op2.b_lit() == 1
+                    && !op1.a_is_lit() && op1.a_slot() == op1.target
+                    && (op2.a_is_lit()
+                          ? (op2.a_kind() != Operand::LitKind::f
+                             && op2.a_lit()
+                                == static_cast<int32_t>(op2.a_lit()))
+                          : op2.a_slot() >= 0)) {
+                    CgInstr f;
+                    f.op = OpCode::IntAddStep;
+                    f.aop = op2.aop;
+                    f.target = op2.target;
+                    f.target2 = op2.target2;
+                    f.set_a_dual(op1.target,
+                                 op2.a_is_lit()
+                                     ? static_cast<int>(op2.a_lit())
+                                     : op2.a_slot());
+                    if (op2.a_is_lit())
+                        f.opflags |= 1;    /* bound is an int32 imm (this
+                                            * op's private a-lit use) */
+                    f.set_b(op1.b());      /* the add's rhs operand */
+                    f.node_idx = -1;       /* never throws */
+                    op1 = f;
+                    op2.op = OpCode::Jump;
+                    op2.target = static_cast<int>(p) + 2;
+                    changed = true;
+                    continue;
+                }
+
+                /* #9 F-C: LoadStructFieldInt t = a[i].f; IntBin(+)
+                 * dst = other + t (either operand order, general
+                 * 3-address - 65's adds chain through temps) with t a
+                 * dead-after temp -> StructFieldAddInt
+                 * `dst = other + a[i].f`. EXACTLY one operand is t (both
+                 * == t would read the pre-load value). No-fault read +
+                 * wrapping add - node-free. */
+                if (op1.op == OpCode::LoadStructFieldInt
+                    && op2.op == OpCode::IntBin && op2.aop == Op::plus
+                    && !op2.a_is_lit() && !op2.b_is_lit()
+                    && (op2.a_slot() == op1.target)
+                       != (op2.b_slot() == op1.target)
+                    && bit(op1.target)) {
+                    const uint64_t tout =
+                        (p + 2 < n ? live_in[p + 2] : 0) | hlive;
+                    if (!(tout & bit(op1.target))) {
+                        const int other = op2.a_slot() == op1.target
+                            ? op2.b_slot() : op2.a_slot();
+                        CgInstr f = op1;   /* keeps target2(arr), a(idx) */
+                        f.op = OpCode::StructFieldAddInt;
+                        f.target = op2.target;   /* the add's dst */
+                        f.set_b_dual(static_cast<int>(op1.b_lit()),
+                                     other);
+                        f.node_idx = -1;
                         op1 = f;
                         op2.op = OpCode::Jump;
                         op2.target = static_cast<int>(p) + 2;

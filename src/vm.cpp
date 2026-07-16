@@ -2291,6 +2291,104 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
         VM_NEXT;
 
+        VM_CASE(IntAddStep): {
+            /* #9 fusion: accumulate-then-step - `s += x; i++/i--; test;
+             * branch` in one dispatch. Never throws (the add wraps). */
+            const int_type bv = read_int_operand(in->b(), &ctx);
+            const int adst = in->a_dual_lo();
+            write_int_slot(&ctx, adst, read_int_slot(&ctx, adst) + bv);
+
+            LValue &ilv = ctx.frame->at(in->target2);
+            int_type i = ilv.getval<int_type>();
+            i = (in->aop == Op::lt || in->aop == Op::le) ? i + 1 : i - 1;
+            ilv.getval<int_type>() = i;
+
+            const int_type bound = in->a_is_lit()
+                ? static_cast<int_type>(in->a_dual_hi())
+                : read_int_slot(&ctx, in->a_dual_hi());
+            bool go;
+            switch (in->aop) {
+            case Op::lt: go = i <  bound; break;
+            case Op::le: go = i <= bound; break;
+            case Op::ge: go = i >= bound; break;
+            default:     go = i >  bound; break;   /* gt */
+            }
+
+            if (go)
+                pc = in->target;
+            else
+                pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(ForStepElemInt): {
+            /* #9 fusion: step + test + the back-edge element load in one
+             * dispatch (`for i: ... a[i]`). On a taken branch the load runs
+             * here (idx = the freshly-stepped counter) and control lands
+             * PAST the original load (target = load pc + 1); the exit path
+             * does NOT load (the counter is out of range there). The OOB
+             * caret is the LOAD's (this pc's loc entry). */
+            LValue &ilv = ctx.frame->at(in->target2);
+            int_type i = ilv.getval<int_type>();
+            i = (in->aop == Op::lt || in->aop == Op::le) ? i + 1 : i - 1;
+            ilv.getval<int_type>() = i;
+
+            const int_type bound = read_int_operand(in->a(), &ctx);
+            bool go;
+            switch (in->aop) {
+            case Op::lt: go = i <  bound; break;
+            case Op::le: go = i <= bound; break;
+            case Op::ge: go = i >= bound; break;
+            default:     go = i >  bound; break;   /* gt */
+            }
+
+            if (!go) {
+                pc++;
+                VM_NEXT;
+            }
+
+            const EvalValue &base = ctx.frame->at(in->b_dual_lo()).get();
+            if (base.is<SharedArrayObj>()) {
+                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+                int_type idx = i;
+                if (idx < 0)
+                    idx += arr.size();
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
+                }
+                const size_type at = arr.offset() + idx;
+                int_type v;
+                if (arr.skind() == SharedArrayObj::Storage::ints)
+                    v = arr.flat_ints()[at];
+                else if (arr.skind() == SharedArrayObj::Storage::bools)
+                    v = arr.flat_bools()[at] ? 1 : 0;
+                else
+                    v = arr.get_vec()[at].getval<int_type>();
+                write_int_slot(&ctx, in->b_dual_hi(), v);
+            } else {
+                throw InternalErrorEx();   /* base proven an array */
+            }
+            pc = in->target;
+        }
+        VM_NEXT;
+
+        VM_CASE(StructFieldAddInt): {
+            /* #9 fusion: `dst = other + a[i].f` (general 3-address - the
+             * struct-foreach reduction chains adds through temps). The
+             * field read is proven no-fault; the add wraps. b_dual =
+             * (field idx, other slot). */
+            const int_type add =
+                vm_struct_field_int(ctx.frame->at(in->target2).get(),
+                                    read_int_operand(in->a(), &ctx),
+                                    in->b_dual_lo());
+            write_int_slot(&ctx, in->target,
+                           read_int_slot(&ctx, in->b_dual_hi()) + add);
+            pc++;
+        }
+        VM_NEXT;
+
         VM_CASE(LoadElemInt): {
 
             /* a[i] into a temp (mirrors Subscript::eval_int for a flat array;

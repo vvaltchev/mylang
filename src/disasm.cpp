@@ -497,6 +497,30 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "jmp.ifnotel  " << D(in.target2) << "["
                 << RI(in.a(), false) << "], L" << in.target;
             break;
+        case OpCode::IntAddStep:
+            /* #9 fusion: a_dual = (add dst, bound) */
+            row << "i.addstep    " << D(in.a_dual_lo()) << " += "
+                << RI(in.b(), false) << "; " << D(in.target2)
+                << (in.aop == Op::lt || in.aop == Op::le ? "++" : "--")
+                << ", if " << D(in.target2) << " " << opsym(in.aop) << " "
+                << (in.a_is_lit() ? "#" : "r")
+                << in.a_dual_hi() << " -> L" << in.target;
+            break;
+        case OpCode::ForStepElemInt:
+            /* #9 fusion: b_dual = (array, elem dst) */
+            row << "for.step.el  " << D(in.target2)
+                << (in.aop == Op::lt || in.aop == Op::le ? "++" : "--")
+                << ", if " << D(in.target2) << " " << opsym(in.aop) << " "
+                << RI(in.a(), false) << ": " << D(in.b_dual_hi()) << " = "
+                << D(in.b_dual_lo()) << "[" << D(in.target2)
+                << "] -> L" << in.target;
+            break;
+        case OpCode::StructFieldAddInt:
+            /* #9 fusion: b_dual = (field idx, other slot) */
+            row << "sf.add       " << D(in.target) << " = "
+                << D(in.b_dual_hi()) << " + " << D(in.target2) << "["
+                << RI(in.a(), false) << "].f" << in.b_dual_lo();
+            break;
         case OpCode::LoadElemInt:
             row << "load.elem.i  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a(), false) << "]";

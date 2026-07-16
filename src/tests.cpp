@@ -646,6 +646,53 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #9 FUSION BATCH (roadmap; plans/vm-peephole.md): IntAddStep (an
+         * accumulate tail fused into the counted-loop step), ForStepElemInt
+         * (the back-edge a[i] load fused into the step; the original load
+         * stays for the entry path), StructFieldAddInt (a struct-field
+         * read feeding an add). Results must be byte-identical on both
+         * engines; a `continue` targets the step, so that loop must NOT
+         * fuse the add (and still compute correctly). */
+        "vm: #9 fusions - addstep/step-elem/struct-field-add results",
+        {
+            "var a = [10, 20, 30, 40];",
+            "var s = 0;",
+            "for (var i = 0; i < 4; i++) s = s + a[i];",
+            "assert(s == 100);",
+            "var b = [1, 2, 3];",
+            "for (var i = 0; i < 3; i++) b[i] = b[i] * 2 + 1;",
+            "assert(b == [3, 5, 7]);",
+            "var t = 0;",
+            "for (var i = 3; i > 0; i--) t = t + i;",
+            "assert(t == 6);",
+            "var u = 0;",
+            "for (var i = 0; i < 6; i++) {",
+            "    if (i == 2) continue;",
+            "    u = u + i;",
+            "}",
+            "assert(u == 13);",
+            "struct P { int x; int y; }",
+            "var ps = [P(1,2), P(3,4)];",
+            "var q = 0;",
+            "foreach (var p in ps) q = (q + p.x + p.y) % 1000;",
+            "assert(q == 10);",
+        },
+    },
+
+    {
+        /* #9 ForStepElemInt keeps the LOAD's OOB caret: the back-edge
+         * fused load throws with the SUBSCRIPT's span (i==3 here),
+         * byte-identical to the tree-walker's rhs-read caret. */
+        "vm: #9 fused back-edge load keeps the OOB caret",
+        {
+            "var a = [1, 2, 3];",
+            "for (var i = 0; i < 5; i++) a[i] = a[i] + 1;",
+        },
+        &typeid(OutOfBoundsEx),
+        36, 2, 41, 2,
+    },
+
+    {
         /* PRE-EXISTING struct-array sort orphan (latent since flat_s):
          * sort(struct_arr, cmp) promoted a LOCAL handle (get_vec) and
          * sorted the promoted copy - the caller's array stayed UNSORTED.
@@ -13610,6 +13657,7 @@ struct VmOpCounts {
     size_t pushhandler = 0, catchtest = 0, throwop = 0;
     size_t setpend = 0, endfinally = 0;
     size_t mathfnv = 0;
+    size_t iaddstep = 0, forstepel = 0, sfadd = 0;   /* #9 fusions */
     int n_temps = 0;
 };
 
@@ -13712,6 +13760,9 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c)
             case OpCode::CallV:            c.callv++; break;
             case OpCode::CallBuiltinV:     c.callbuiltinv++; break;
             case OpCode::MathFnV:          c.mathfnv++; break;
+            case OpCode::IntAddStep:       c.iaddstep++; break;
+            case OpCode::ForStepElemInt:   c.forstepel++; break;
+            case OpCode::StructFieldAddInt: c.sfadd++; break;
             /* H1: typed struct-member reads count as the member.v they
              * replace */
             case OpCode::LoadMemberInt:
@@ -13871,8 +13922,9 @@ static bool vm_codegen_shapes()
         m.juic == 1 && m.jufc == 0 && m.intbin == 1 && m.fbin == 1;
 
     /* 7) a counted `for` compiles to the fused register loop: an initial
-     * JumpUnlessIntCmp + a ForLoopStep back-edge (NOT a separate IntBin
-     * increment + Jump), plus the native body IntBin. */
+     * JumpUnlessIntCmp + the back edge - which for an accumulate body is
+     * the #9 IntAddStep superinstruction (the trailing `s += t` fused
+     * INTO the step; the body's `t = i*i` stays an IntBin). */
     VmOpCounts g;
     if (!codegen_counts({
             "var s = 0;",
@@ -13880,7 +13932,8 @@ static bool vm_codegen_shapes()
         }, g))
         return false;
     const bool for_ok =
-        g.flstep == 1 && g.juic == 1 && g.intbin >= 1 && g.jmp == 0;
+        g.iaddstep == 1 && g.flstep == 0 && g.juic == 1
+        && g.intbin >= 1 && g.jmp == 0;
 
     /* 8) a DECL with an arith rvalue inside a loop body compiles natively (the
      * register machine treats `var t = <int expr>` like a plain assign to t's
@@ -13904,7 +13957,7 @@ static bool vm_codegen_shapes()
         }, ai))
         return false;
     const bool read_int_ok =
-        ai.loadei == 1 && ai.flstep == 1 && ai.intbin >= 1;
+        ai.loadei == 1 && ai.iaddstep == 1 && ai.flstep == 0;
 
     VmOpCounts af;
     if (!codegen_counts({
@@ -13960,9 +14013,11 @@ static bool vm_codegen_shapes()
             "for (var i = 0; i < 5; i++) a[i] += b[i];",
         }, cs))
         return false;
+    /* the back edge fuses the b[i] load (#9 ForStepElemInt); the
+     * original load stays in place for the loop-entry path. */
     const bool compound_store_ok =
-        cs.storei == 1 && cs.loadei == 1 && cs.flstep == 1
-       ;
+        cs.storei == 1 && cs.loadei == 1 && cs.forstepel == 1
+        && cs.flstep == 0;
 
     /* 13) a 2-D read `m[i][j]` in nested loops lowers fully native: the outer
      * m[i] via LoadElemValue, the inner [j] via LoadElemInt, two ForLoopStep,
@@ -13975,9 +14030,11 @@ static bool vm_codegen_shapes()
             "  for (var j = 0; j < 3; j++) s += m[i][j];",
         }, d2))
         return false;
+    /* the inner `s += t` + step fuse to IntAddStep (#9); the outer
+     * step stays a plain ForLoopStep. */
     const bool read_2d_ok =
-        d2.loadev == 1 && d2.loadei == 1 && d2.flstep == 2
-       ;
+        d2.loadev == 1 && d2.loadei == 1 && d2.flstep == 1
+        && d2.iaddstep == 1;
 
     /* 14) a scalar-returning migrated BUILTIN in a loop body (`s += sqrt(i)`)
      * lowers native - and a MATH builtin gets the typed MathFnV (F1), not
@@ -14179,8 +14236,9 @@ static bool vm_codegen_shapes()
             "foreach (var x in a) s = s + x;",
         }, fe))
         return false;
+    /* the foreach accumulate tail fuses too (#9 IntAddStep) */
     const bool foreach_ok = fe.arrlen == 1 && fe.loadei == 1
-        && fe.flstep == 1 && fe.intbin >= 1;
+        && fe.iaddstep == 1 && fe.flstep == 0;
 
     /* 27) a native user-function call: a large (non-inlined) function called in
      * a loop with a non-const int arg lowers to a CallV, not an EvalStmt
@@ -14557,7 +14615,8 @@ static bool vm_disasm_shape()
         if (!b)
             return false;
         const std::string d = disassemble(codegen_program(b), "main");
-        return d.find("for.step") != std::string::npos
+        /* the accumulate-for's add+step fuse to the #9 IntAddStep */
+        return d.find("i.addstep") != std::string::npos
             && d.find("i.bin") != std::string::npos
             && d.find("i.jmp.ifnot") != std::string::npos
             && d.find("call.blt.v") != std::string::npos  /* print(s) native */

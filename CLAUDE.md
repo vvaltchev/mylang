@@ -314,6 +314,27 @@ ops). Measured (full-suite interleaved A/B): 09_fib_recursive
 0.006->0.004s (**0.67x**), suite VM-wall geomean 0.990 (broad -3-9%
 on the arith/call benches).
 
+**THE #9 FUSION BATCH (2026-07-17, the top-10 list's last item).**
+Three more pair-profile superinstructions in the peephole's fusion
+block: **`IntAddStep`** (an int accumulate tail `s = s + x` fused into
+the counted-loop `ForLoopStep` - add+step+test+branch in ONE dispatch;
+never fires when a `continue` targets the step, since that pc is a
+branch target), **`ForStepElemInt`** (the back-edge `a[i]` load,
+indexed BY THE COUNTER, fused into the step: the original load stays
+in place for the loop-entry path and the fused op's target lands past
+it; the load's OOB caret rides the fused pc - and the ascending scan +
+the is_tgt map make it compose safely with JumpUnlessElemInt), and
+**`StructFieldAddInt`** (`dst = other + a[i].f`, GENERAL 3-address -
+the struct reduction chains adds through temps, so an accumulator-only
+shape would never fire; b_dual = field idx + other slot). The batch's
+ROOT-CAUSE bonus: `LoadStructFieldInt/Float`, `LoadMemberInt/Float`,
+`LoadStructElemV`, `LoadElemBool` were MISSING from `visit_use_def` -
+liveness BARRIERS that made every temp look live in a struct-loop body
+and silently blocked IntAddModRI there since E4 landed (audit any new
+op into that table, not only visit_pc_fields). Measured: 65_struct_
+field_sum 0.783x, 02_for_loop 0.75x, suite VM-wall geomean 0.987,
+my/py **4.89-4.93x**.
+
 **E4 FUSIONS (in the peephole; plans/vm-peephole.md).** Two profile-
 chosen superinstructions (a scratch op-pair profiler counted 760M
 executed adjacent pairs over the suite; the distribution is flat, so
