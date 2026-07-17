@@ -646,6 +646,33 @@ static const std::vector<test> tests =
     },
 
     {
+        /* 2026-07-18 profile #1: an EMPTY `[]` whose destination type is a
+         * known scalar array - ANNOTATED or INFERRED - starts FLAT (the
+         * const-fold bakes [] before inference, so only the ArrHint can
+         * restore the representation; this was broken for everything but
+         * flat_s - the whole grow-from-empty class ran general). */
+        "flat arrays: an empty [] with a known element type starts flat",
+        {
+            "var a = [];",                       /* inferred array<int> */
+            "for (var i = 0; i < 4; i++) push(a, i * 10);",
+            "assert(array_storage(a) == \"int\");",
+            "assert(a == [0, 10, 20, 30]);",
+            "array<float> f = [];",              /* annotated */
+            "append(f, 1.5); append(f, 2.5);",
+            "assert(array_storage(f) == \"float\");",
+            "assert(sum(f) == 4.0);",
+            "array<bool> b = [];",
+            "append(b, true); append(b, false);",
+            "assert(array_storage(b) == \"bool\");",
+            "var dyn d = [];",                   /* dyn dest stays general */
+            "append(d, 1); append(d, \"x\");",
+            "assert(array_storage(d) == \"general\");",
+            "const c = [];",                     /* const: unchanged */
+            "assert(len(c) == 0);",
+        },
+    },
+
+    {
         /* #9 FUSION BATCH (roadmap; plans/vm-peephole.md): IntAddStep (an
          * accumulate tail fused into the counted-loop step), ForStepElemInt
          * (the back-edge a[i] load fused into the step; the original load

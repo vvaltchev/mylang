@@ -592,25 +592,41 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
  */
 static void
 vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
-                 size_t call_pc, Loc call_site, const InlineCtx *call_site_inl)
+                 size_t call_pc, Loc call_site, const InlineCtx *call_site_inl,
+                 bool in_const_eval = false)
 {
     if (obj.func->pure_ctx)
         if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
             undefEx->in_pure_func = true;
 
-    BacktraceFrame bf;
-    bf.name = !obj.func->display_name.empty()
-                  ? obj.func->display_name
-                  : obj.func->name ? string(obj.func->name->val)
-                                   : "<lambda>";
-    for (const auto &p : obj.func->params)
-        bf.params.push_back(string(p.name->val));
+    Loc cs = call_site;
     if (call_ck) {
         Loc end_ignored;
-        call_ck->loc_at(call_pc, bf.call_site, end_ignored);
-    } else
-        bf.call_site = call_site;
-    e.backtrace.push_back(move(bf));
+        call_ck->loc_at(call_pc, cs, end_ignored);
+    }
+    if (!in_const_eval) {
+        /* profile #3: the LAZY frame - no strings at capture time (the
+         * descriptor outlives the render: AST/VmProgram-owned, and both are
+         * declared OUTSIDE the driver's try; format_backtrace stringifies). */
+        e.backtrace.emplace_back(obj.func, cs);
+    } else {
+        /* A COMPILE-TIME fold (AutoConst / the inliner's refold) may run a
+         * THROWAWAY clone whose descriptor dies with the fold, while the
+         * early-failure rule propagates the exception out of resolve_names -
+         * a lazy frame would dangle (ASan-caught). Capture the strings
+         * eagerly here; const-eval throws are one-shot compile aborts, so
+         * the cost is irrelevant. */
+        const FuncDescriptor *d = obj.func;
+        std::vector<std::string> ps;
+        ps.reserve(d->params.size());
+        for (const auto &p : d->params)
+            ps.push_back(string(p.name->val));
+        e.backtrace.emplace_back(
+            !d->display_name.empty()
+                ? d->display_name
+                : d->name ? string(d->name->val) : "<lambda>",
+            std::move(ps), cs);
+    }
 
     if (call_site_inl) {
         flush_inline_frames(call_site_inl, e);
@@ -764,7 +780,8 @@ do_func_call(EvalContext *ctx,
     } catch (Exception &e) {
         /* The tree-walker / expression-body path (a real C++ throw). Record
          * this frame + any inlined-call virtual frames, then re-throw. */
-        vm_capture_frame(e, obj, call_ck, call_pc, call_site, call_site_inl);
+        vm_capture_frame(e, obj, call_ck, call_pc, call_site, call_site_inl,
+                         ctx && ctx->in_const_eval());
         throw;
     }
 
@@ -2302,6 +2319,23 @@ EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
         value.is<SharedArrayObj>() && value.get<SharedArrayObj>().size() == 0) {
         StructTypeDef *def = const_cast<StructTypeDef *>(arr_hint_struct);
         return SharedArrayObj(SharedArrayObj::svec_type({}, def, def->size));
+    }
+
+    /* The SCALAR twin (2026-07-18 profile #1): an empty baked `[]` whose
+     * destination is a known array<int>/<float>/<bool> - annotated OR
+     * inferred (`var a = []; push(a, i)` fixpoints to array<int>) - starts
+     * FLAT. The const-fold baked it before inference (element type
+     * unknowable), so only the hint can restore the representation; without
+     * this arm the entire grow-from-empty class ran on 48-byte general
+     * LValues (bench 13's shape). */
+    if (value.is<SharedArrayObj>()
+        && value.get<SharedArrayObj>().size() == 0) {
+        if (arr_hint == ArrHint::flat_i)
+            return SharedArrayObj(SharedArrayObj::ivec_type{});
+        if (arr_hint == ArrHint::flat_f)
+            return SharedArrayObj(SharedArrayObj::fvec_type{});
+        if (arr_hint == ArrHint::flat_b)
+            return SharedArrayObj(SharedArrayObj::bvec_type{});
     }
 
     return immutable ? value : make_mutable_clone(value);

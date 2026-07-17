@@ -1356,6 +1356,19 @@ struct Chunk {
      */
     int n_dict_iters = 0;
 
+    /*
+     * 2026-07-18 profile #2: the slots of THIS chunk's frame that can EVER
+     * hold a NON-TRIVIAL (>= t_str, refcounted) value - the param slots
+     * (minus int/float-coerced ones) plus every dst of a non-scalar-writing
+     * op; a chunk with an unauditable (barrier) op lists ALL slots. Sorted.
+     * pop_window's and VmInvoker::invoke's reference-release scans iterate
+     * ONLY these instead of the whole window - the fib-class all-scalar
+     * frame and the tight comparator skip the O(nslots) walk entirely. A
+     * VM_HARDENING build re-scans the full window and asserts nothing
+     * non-trivial survived outside the list (the audit net).
+     */
+    std::vector<int32_t> ref_slots;
+
     /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
      * ForeachDyn in the chunk. See the ForeachDyn ops. */
     int n_dyn_iters = 0;

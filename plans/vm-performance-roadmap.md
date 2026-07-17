@@ -1,4 +1,5 @@
-# VM performance roadmap: from 3.9x to 5x+ over CPython
+# VM performance roadmap: from 3.9x to 5x+ over CPython — **GOAL HIT
+# 2026-07-18: 5.02x** (the profile top-4 batch; every bench beats CPython)
 # (2026-07-17 end of day: 4.89-4.93x; ALL top-10 items closed - see the
 #  RE-PROFILE section below; parking lot:
 #  plans/vm-optimizations-deferred.md)
@@ -14,6 +15,20 @@ accidentally profiled the reverted-16B stale build and was redone).
 Laggards: 34_sort_custom_cmp 0.89x vm/tw, 67_make_dict 0.81, 27/35 0.80,
 69_exc_crossframe 0.77, 32 0.72, 76 0.72, 13_array_append 0.71, 31 0.64,
 23_dict_insert 0.60, 11_closure_counter 0.58.
+
+**Items 1-4 DONE (2026-07-18, one measured batch): suite my/py 4.90x →
+5.02x — THE 5x GOAL — VM-wall geomean 0.978.** Per item: #1 the empty-[]
+flat fix (eval_literal_obj gained the flat_i/f/b arms; 13_array_append
+0.045→0.015s, 0.333x); #2 Chunk::ref_slots (audited op_writes_scalar set
++ non-coerced param slots; pop_window + VmInvoker::invoke iterate only
+those; a VM_HARDENING re-scan asserts the list missed nothing — ran green
+across the whole differential); #3 lazy descriptor-based BacktraceFrames
+(strings only at format time; a COMPILE-TIME fold capture stays eager —
+its throwaway clone descriptors die with the fold, ASan-caught; vm_execute
+retains its VmPrograms for the session so harness-caught exceptions render
+safely); #4 ML_POOL_NEW_DELETE on RuntimeException (inherited by every
+subclass; covers the VM signal-path make_unique/clone). 69_exc_crossframe
+0.667x, 70/72 0.83-0.88x, 11_closure_counter 0.955x.
 
 1. **Flat storage for an empty-`[]` array with a KNOWN element type.**
    FOUND BROKEN: `array<int> e = []` + push stays GENERAL (48B LValues)

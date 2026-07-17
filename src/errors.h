@@ -2,6 +2,7 @@
 #pragma once
 
 #include "defs.h"
+#include "poolalloc.h"
 
 #include <string>
 #include <string_view>
@@ -66,10 +67,28 @@ class Construct;
  * function's name and parameter names; `call_site` is where it called the
  * next, deeper one.
  */
+struct FuncDescriptor;
+
 struct BacktraceFrame {
+    /*
+     * The LAZY (hot-path) form: `desc` set means name/params render at
+     * FORMAT time from the program-lifetime FuncDescriptor - capture
+     * allocates NOTHING, so a CAUGHT exception (whose backtrace never
+     * renders) pays no string churn (2026-07-18 profile #3: 13% of the
+     * exception benches was this malloc/free). desc == null is the eager
+     * string form, kept for the INLINE (virtual) frames - their source
+     * strings are AST-owned and must be copied at capture.
+     */
+    const FuncDescriptor *desc = nullptr;
     std::string name;
     std::vector<std::string> params;
     Loc call_site;
+
+    BacktraceFrame() = default;
+    BacktraceFrame(const FuncDescriptor *d, Loc cs)
+        : desc(d), call_site(cs) {}
+    BacktraceFrame(std::string n, std::vector<std::string> p, Loc cs)
+        : name(std::move(n)), params(std::move(p)), call_site(cs) {}
 };
 
 /*
@@ -119,6 +138,19 @@ struct Exception {
 };
 
 struct RuntimeException : public Exception {
+
+    /*
+     * 2026-07-18 profile #4: pool the exception OBJECTS. Inherited by every
+     * subclass (the DECL_RUNTIME_EX classes, ExceptionObjectTempl), so the
+     * VM's signal-path make_unique/clone() allocations come from the
+     * program-lifetime pool instead of malloc (13% of the exception benches
+     * was this churn). Sized delete through the virtual dtor passes the
+     * most-derived size, so the pool's size classes stay exact; an
+     * oversized class falls back to plain new automatically. (A C++
+     * `throw X` value still uses the EH runtime's own allocation - only
+     * explicit new/clone routes through this.)
+     */
+    ML_POOL_NEW_DELETE
 
     RuntimeException(const char *name,
                      const char *msg,

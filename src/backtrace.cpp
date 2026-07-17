@@ -2,6 +2,7 @@
 
 #include "backtrace.h"
 #include "errors.h"
+#include "funcdesc.h"
 
 #include <algorithm>
 #include <sstream>
@@ -17,6 +18,10 @@ using std::vector;
  * the result can still exceed it for a very long name (then alignment grows).
  */
 static constexpr size_t MAX_FRAME_WIDTH = 60;
+
+/* Resolve a frame's name/params - from the program-lifetime descriptor
+ * for the LAZY form (profile #3), else the frame's own strings. */
+static string frame_display(const BacktraceFrame &bf);
 
 /* Build "name(p1, p2, ...)", truncating the param list to fit (see above). */
 static string
@@ -46,6 +51,23 @@ frame_name(const string &name, const vector<string> &params)
 
     /* Not even one param fits (or the name alone is too long). */
     return name + "(...)";
+}
+
+static string
+frame_display(const BacktraceFrame &bf)
+{
+    if (!bf.desc)
+        return frame_name(bf.name, bf.params);
+
+    const FuncDescriptor *d = bf.desc;
+    const string n = !d->display_name.empty()
+                         ? d->display_name
+                         : d->name ? string(d->name->val) : "<lambda>";
+    vector<string> ps;
+    ps.reserve(d->params.size());
+    for (const auto &p : d->params)
+        ps.push_back(string(p.name->val));
+    return frame_name(n, ps);
 }
 
 static int
@@ -82,7 +104,7 @@ format_backtrace(const Exception &e)
     for (size_t i = 0; i < bt.size(); i++) {
         const int line = (i == 0) ? e.loc_start.line
                                   : bt[i - 1].call_site.line;
-        frames.push_back({ frame_name(bt[i].name, bt[i].params), line });
+        frames.push_back({ frame_display(bt[i]), line });
     }
     frames.push_back({ "main()", bt.back().call_site.line });
 

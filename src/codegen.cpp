@@ -7460,6 +7460,61 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
     }
 }
 
+/* Ops whose frame-slot dst is ALWAYS a trivial (int/float/bool/none)
+ * value - the audited set behind Chunk::ref_slots (profile #2). Anything
+ * not listed is treated as possibly-reference (conservative). Computed
+ * before specialize_arith_ops, so only the generic forms appear here. */
+static bool op_writes_scalar(OpCode op)
+{
+    switch (op) {
+    case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::IntAddModRI: case OpCode::IntAddStep:
+    case OpCode::ForLoopStep: case OpCode::ForStepElemInt:
+    case OpCode::StructFieldAddInt: case OpCode::MathFnV:
+    case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElemBool:
+    case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
+    case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:
+    case OpCode::LoadMemberInt: case OpCode::LoadMemberFloat:
+    case OpCode::CmpV: case OpCode::LogV: case OpCode::DefinedGlobalV:
+    case OpCode::CoerceNumV:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
+{
+    const int total = chunk.slot_count + chunk.n_temps;
+    std::vector<char> is_ref(total, 0);
+    bool bail = false;
+
+    for (const CgInstr &in : code) {
+        const bool known = visit_use_def(
+            in, [](int) {},
+            [&](int dslot) {
+                if (dslot >= 0 && dslot < total
+                    && !op_writes_scalar(in.op))
+                    is_ref[dslot] = 1;
+            });
+        if (!known) {
+            /* A barrier op writes slots we can't enumerate (pool-target
+             * unpacks, LV builtins, iterators): every slot is a candidate
+             * - identical to the old full scan. */
+            bail = true;
+            break;
+        }
+    }
+
+    chunk.ref_slots.clear();
+    for (int i = 0; i < total; i++)
+        if (bail || is_ref[i])
+            chunk.ref_slots.push_back(i);
+}
+
 Chunk
 codegen_chunk(const Block *block, int slot_count)
 {
@@ -7491,6 +7546,8 @@ codegen_chunk(const Block *block, int slot_count)
     /* B3 stage 2: SLICE the runtime Instr sub-objects out of the codegen's
      * CgInstr vector - the runtime Chunk cannot hold a node handle AT THE
      * TYPE LEVEL (CgInstr, bytecode.h). */
+    compute_ref_slots(cg.code, cg.chunk);   /* profile #2 - the audited
+                                             * reference-slot list */
     cg.chunk.code.assign(cg.code.begin(), cg.code.end());
     specialize_arith_ops(cg.chunk);   /* B1/B2 - AFTER extract_locs: an
                                        * in-place op swap, no pc shifts, and
@@ -7553,6 +7610,20 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
      * Halt returning none): after the AST teardown the chunk is the only way
      * to run the body, so there is no "not worth it" tier anymore. */
     out = codegen_chunk(body, fn->desc->frame_size);
+
+    /* Param slots join ref_slots unless the param is int/float-COERCED
+     * (bind_param's coerce guarantees those never hold a reference). The
+     * BIND writes refs into param slots, which no chunk op accounts for. */
+    std::vector<int32_t> merged;
+    const auto &params = fn->desc->params;
+    for (size_t i = 0; i < params.size(); i++)
+        if (params[i].decl_type != DeclType::i
+            && params[i].decl_type != DeclType::f)
+            merged.push_back(static_cast<int32_t>(i));
+    merged.insert(merged.end(), out.ref_slots.begin(), out.ref_slots.end());
+    std::sort(merged.begin(), merged.end());
+    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+    out.ref_slots = std::move(merged);
     return true;
 }
 

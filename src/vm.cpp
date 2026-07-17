@@ -1039,11 +1039,30 @@ struct VmActivation {
          * slot holding a trivial value (int/float/bool/none - no refcount,
          * no slice registration) is left STALE: unobservable, since a slot
          * can only be read after its decl re-binds it (the no-hoist rule),
-         * and COW/use_count semantics only see reference types. */
-        for (int_type i = 0; i < rec.nslots; i++) {
-            LValue &lv = rec.window[i];
-            if (lv.get().get_type()->t >= Type::t_str)
-                lv = LValue();
+         * and COW/use_count semantics only see reference types.
+         * Profile #2: iterate ONLY the chunk's audited ref_slots (params +
+         * non-scalar-write dsts) - an all-scalar frame (fib-class) skips
+         * the O(nslots) walk. A hardened build re-scans the whole window
+         * and asserts the list missed nothing. */
+        if (rec.run_chunk) {
+            for (const int32_t s : rec.run_chunk->ref_slots) {
+                if (s >= rec.nslots)
+                    break;               /* sorted */
+                LValue &lv = rec.window[s];
+                if (lv.get().get_type()->t >= Type::t_str)
+                    lv = LValue();
+            }
+#if ML_VM_HARDENING
+            for (int_type i = 0; i < rec.nslots; i++)
+                ML_VM_CHECK(rec.window[i].get().get_type()->t
+                            < Type::t_str);
+#endif
+        } else {
+            for (int_type i = 0; i < rec.nslots; i++) {
+                LValue &lv = rec.window[i];
+                if (lv.get().get_type()->t >= Type::t_str)
+                    lv = LValue();
+            }
         }
 
         /* Per-frame state dies with the frame. A normal return has already
@@ -1200,8 +1219,20 @@ vm_run(VmProgram &prog)
 void
 vm_execute(const Construct *root_c)
 {
-    VmProgram prog = vm_compile(root_c);
-    vm_run(prog);
+    /*
+     * The program is RETAINED for the session (a static list), not a local:
+     * profile #3's lazy BacktraceFrames hold `FuncDescriptor *` into the
+     * program image, and an exception unwinding out of vm_run must still
+     * render its backtrace at the caller's catch - a local VmProgram would
+     * die during the unwind and dangle the frames. The harness/REPL already
+     * retain their ASTs for the same class of reason; the SCRIPT driver
+     * keeps its VmProgram outside the try (mylang.cpp), so this list is
+     * the harness-entry analogue. Bounded by the number of vm_execute
+     * calls per process (the -rt suite: ~1400 small programs).
+     */
+    static std::vector<VmProgram> retained;
+    retained.push_back(vm_compile(root_c));
+    vm_run(retained.back());
 }
 
 void
@@ -1356,16 +1387,10 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
         if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
             undefEx->in_pure_func = true;
 
-    BacktraceFrame bf;
-    bf.name = !rec.desc->display_name.empty()
-                  ? rec.desc->display_name
-                  : rec.desc->name ? std::string(rec.desc->name->val)
-                                   : "<lambda>";
-    for (const auto &p : rec.desc->params)
-        bf.params.push_back(std::string(p.name->val));
-    Loc end_ignored;
-    rec.ret_chunk->loc_at(rec.ret_pc - 1, bf.call_site, end_ignored);
-    e.backtrace.push_back(std::move(bf));
+    /* profile #3: the LAZY frame - no strings at capture time */
+    Loc cs, end_ignored;
+    rec.ret_chunk->loc_at(rec.ret_pc - 1, cs, end_ignored);
+    e.backtrace.emplace_back(rec.desc, cs);
 }
 
 /* Inc v2: the in-flight cross-frame exception signal (see vm.h). */
@@ -1453,13 +1478,8 @@ vm_capture_desc_frame(Exception &e, const FuncDescriptor *d)
         if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
             undefEx->in_pure_func = true;
 
-    BacktraceFrame bf;
-    bf.name = !d->display_name.empty()
-                  ? d->display_name
-                  : d->name ? std::string(d->name->val) : "<lambda>";
-    for (const auto &p : d->params)
-        bf.params.push_back(std::string(p.name->val));
-    e.backtrace.push_back(std::move(bf));
+    /* profile #3: the LAZY frame - no strings at capture time */
+    e.backtrace.emplace_back(d, Loc());
 }
 
 /*
@@ -1630,13 +1650,22 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
         res = std::move(c_->flow->value);
     }
 
-    /* Per-call frame death for REFERENCES (see the class comment). */
+    /* Per-call frame death for REFERENCES (see the class comment).
+     * Profile #2: only the chunk's audited ref_slots - this scan runs per
+     * CALLBACK ELEMENT (sort's comparator, map/filter/make_dict), where
+     * the old whole-window walk was a measured cost. */
     LValue *win = w_->slots;
     const int_type total = static_cast<int_type>(w_->size);
-    for (int_type i = 0; i < total; i++) {
-        if (win[i].get().get_type()->t >= Type::t_str)
-            win[i] = LValue();
+    for (const int32_t sidx : cck_->ref_slots) {
+        if (sidx >= total)
+            break;                       /* sorted */
+        if (win[sidx].get().get_type()->t >= Type::t_str)
+            win[sidx] = LValue();
     }
+#if ML_VM_HARDENING
+    for (int_type i = 0; i < total; i++)
+        ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
+#endif
 
     return res;
 }

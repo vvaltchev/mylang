@@ -149,6 +149,15 @@ of `chunk->code.data()` - a double-load per dispatch, front-end-amplified;
 refreshed only at the four chunk-change sites). Zero-copy arg binding was
 MEASURED AND DECLINED (the bind is ~2 instructions per 1-arg call; the
 protocol around it is what costs - see the plan's Phase E verdict).
+**`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
+slots that can EVER hold a >= t_str value (non-coerced params + every dst
+of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists
+all slots). `pop_window`'s and `VmInvoker::invoke`'s reference-release
+scans iterate ONLY these — the fib-class all-scalar frame and the
+per-element comparator skip the O(nslots) walk; a VM_HARDENING build
+re-scans the full window and ASSERTS the list missed nothing (the audit
+net, green across the differential). A NEW op that writes a frame slot
+must join `visit_use_def` AND be classified in `op_writes_scalar`.
 Net (interleaved full-suite A/B): suite parity with the pre-C1 baseline
 plus recursion 0.68x, sort/map 0.85x, make_dict 0.88x, fib 0.86x.
 
@@ -1633,7 +1642,12 @@ decisions behind it: `plans/type-inference.md`,
   existing `ArrHint` path makes a typed array flat - and an **empty** typed
   array now starts flat too (`LiteralArray::do_eval` honors
   `flat_i`/`flat_f`/`flat_b` for `elems.empty()`, matching the existing `flat_s`
-  case), so `array<int> a; append(a, 5)` stays unboxed. Generic `array a` /
+  case), so `array<int> a; append(a, 5)` stays unboxed. **The explicit/
+  inferred `= []` form too (2026-07-18 profile #1):** `eval_literal_obj`
+  gained the flat_i/f/b empty-array arms (only flat_s existed), so
+  `array<int> e = []` AND the inferred `var a = []; push(a, i)` (typed
+  array<int> by the fixpoint) start flat — the whole grow-from-empty class
+  ran on general 48-byte LValues before (bench 13: 3x faster fixed). Generic `array a` /
   `dict d` (no `<...>`) are unchanged (element inferred). See
   `plans/typed-containers-syntax.md`.
 - **Compile-time TYPE QUERIES: `type`/`decltype` (-> `Type` object),
@@ -2978,6 +2992,24 @@ and two macros:
   `StructTypeDef` (owned by the AST), so `main` (`mylang.cpp`) declares the
   `root` AST **outside** the `try` — unwinding must not free the def before the
   catch handler renders the value.
+- **Backtrace frames are LAZY (2026-07-18 profile #3).** A captured
+  `BacktraceFrame` holds `{const FuncDescriptor *desc, Loc call_site}` — NO
+  strings; `format_backtrace` stringifies from the program-lifetime
+  descriptor at RENDER time, so a CAUGHT exception (backtrace never shown)
+  allocates nothing per frame (13% of the exception benches was that
+  malloc churn). The eager string form survives for the INLINE (virtual)
+  frames (their sources are AST-owned) and for a capture DURING CONST-EVAL
+  (`do_func_call`'s catch passes `ctx->in_const_eval()`): a compile-time
+  pure-fold can run a THROWAWAY clone whose descriptor dies with the fold
+  while the early-failure rule propagates the exception — a lazy frame
+  would dangle (ASan-caught during development). `vm_execute` (the
+  harness/REPL entry) RETAINS its VmPrograms in a session-static list for
+  the same reason: descriptors must outlive any exception's render.
+  RuntimeException also carries **ML_POOL_NEW_DELETE** (profile #4) —
+  inherited by every subclass, so the VM signal-path's make_unique/clone
+  exception objects come from the pool (a C++ `throw X` value still uses
+  the EH runtime's own allocation).
+
 - **Backtrace.** `Exception::backtrace` (a `vector<BacktraceFrame>`, `errors.h`)
   is filled as the exception unwinds: `do_func_call`'s `catch (Exception &)`
   records each frame innermost-first, capturing the function's name+params **as
