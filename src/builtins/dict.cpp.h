@@ -273,6 +273,7 @@ builtin_dict(EvalContext *ctx, const ArgLocs *exprList,
      * (unboxed int/float) pair like [1, 2] is read directly - no promotion. */
     const SharedArrayObj &outer = e.get<SharedArrayObj>();
     const size_type on = outer.size();
+    data.reserve(on);   /* profile #5: kill the insert rehash chain */
 
     for (size_type i = 0; i < on; i++) {
 
@@ -340,6 +341,7 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
     const SharedArrayObj &keys = e.get<SharedArrayObj>();
     const size_type n = keys.size();
     DictObject::inner_type data;
+    data.reserve(n);   /* profile #5: kill the insert rehash chain */
 
     VmInvoker inv(ctx, funcObj);   /* prepared per-loop invoker (vm.h) */
 

@@ -57,11 +57,14 @@ subclass; covers the VM signal-path make_unique/clone). 69_exc_crossframe
    DECL_RUNTIME_EX classes + ExceptionObjectTempl): the residual
    make_unique<RuntimeException> malloc/free per throw on the same
    benches. Pairs with #3.
-5. **dict reserve(n) where n is known**: builtin_make_dict (the keys
-   array's length), dict-from-pairs, MakeDictV literals. Kills the
-   rehash chain inside _M_insert_unique_node (7.4% of 23, 6.6% of 67).
-   The approved pool allocator covers the nodes; reserve covers the
-   bucket-array churn.
+5. **dict reserve(n) where n is known — DONE (2026-07-18).** Three
+   one-line `data.reserve(n)` calls: builtin_make_dict (the keys
+   array's length), builtin_dict's pairs form, and the shared
+   build_dict_from_pairs (dict literals + MakeDictV). 23_dict_insert's
+   `d[k]=v` growth loop is inherently unreservable (n unknown) and was
+   left alone. MEASURED (full-suite interleaved A/B vs aee25a6):
+   67_make_dict 0.049→0.043s (**0.878x**), 35_map_filter 0.864x, suite
+   VM-wall geomean **0.987**, my/py steady at ~5.0x.
 6. **Int-int fast path in the StoreCaptureV/StoreGlobalV COMPOUND
    arms** (mirror slot_rmw's local int fast path): 11's capture++ loop
    pays num_bin_op's PMF per iteration (9.2%).

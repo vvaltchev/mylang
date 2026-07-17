@@ -5173,6 +5173,7 @@ EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
                                 bool is_const)
 {
     DictObject::inner_type data;
+    data.reserve(npairs);   /* profile #5: kill the insert rehash chain */
     for (size_t i = 0; i < npairs; i++)
         data.emplace(make_const_clone(pairs[2 * i]),
                      LValue(pairs[2 * i + 1], is_const));
