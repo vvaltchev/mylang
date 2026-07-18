@@ -933,7 +933,18 @@ struct VmActivation {
 
     std::vector<std::unique_ptr<VmStackSeg>> segs;
     int cur_seg = -1;
+    /* The call-record stack. `records` is PHYSICAL storage that grows only to
+     * the high-water mark; `rec_n` is the LIVE count. A push REUSES the
+     * already-constructed record at rec_n (growing by one only at a new peak),
+     * a pop resets its owning fields + decrements - so the ~140-byte record's
+     * 3 unique_ptrs are NOT default-constructed/destructed per call (the
+     * emplace_back construct was ~6% of a deep-recursion profile). RAII is
+     * kept (the unique_ptrs live in the reused objects, null between uses;
+     * pop_window frees any the exceptional/cache path left set). */
     std::vector<VmCallRec> records;
+    size_t rec_n = 0;                 /* live records; records[rec_n..] reused */
+    ML_ALWAYS_INLINE VmCallRec &back_rec() { return records[rec_n - 1]; }
+    ML_ALWAYS_INLINE bool no_recs() const { return rec_n == 0; }
     /*
      * The REUSABLE context for builtin->callback invocations (vm_invoke,
      * Phase D): constructed ONCE per activation (vm_run parents it to the
@@ -999,8 +1010,10 @@ struct VmActivation {
             ML_CHECK(sg->top == 0);
         }
 
-        records.emplace_back();          /* fill IN PLACE - no struct move */
-        VmCallRec &rec = records.back();
+        /* REUSE the constructed record at rec_n; grow only at a new peak. */
+        if (rec_n == records.size())
+            records.emplace_back();      /* one-time construct at high-water */
+        VmCallRec &rec = records[rec_n++];   /* fill IN PLACE - no move */
         rec.window = sg->slots.data() + sg->top;
         rec.nslots = n;
         rec.seg = cur_seg;
@@ -1010,6 +1023,19 @@ struct VmActivation {
         rec.handler_base = static_cast<uint32_t>(handlers.size());
         rec.diter_base = static_cast<uint32_t>(dict_iters.size());
         rec.dyiter_base = static_cast<uint32_t>(dyn_iters.size());
+        /* An IN-VM push (boundary=false) is followed by vm_enter_call setting
+         * every resume field; a BOUNDARY push has no such follow-up, so on a
+         * REUSED record its resume fields would be stale - clear them (they
+         * are provably unused for a boundary frame, but staleness is a
+         * future-change hazard, and a boundary push is rare/off the hot
+         * recursion path). */
+        if (boundary) {
+            rec.ret_chunk = nullptr;
+            rec.ret_pc = 0;
+            rec.dst = -1;
+            rec.desc = nullptr;
+            rec.caller_captures = nullptr;
+        }
         if (ck->n_dict_iters)
             dict_iters.resize(dict_iters.size() + ck->n_dict_iters);
         if (ck->n_dyn_iters)
@@ -1029,12 +1055,13 @@ struct VmActivation {
      * at the new top (if any). */
     /* Pop the top record WITHOUT moving the (unique_ptr-bearing) struct
      * out: the caller reads any resume fields it needs BEFORE calling (they
-     * are stable), we clean by reference, then pop_back (a cheap dtor - the
-     * rare owning fields are null on the hot path). */
+     * are stable), we clean by reference, then decrement rec_n (the record
+     * object is REUSED by the next push - we free its owning fields here, the
+     * equivalent of the old pop_back dtor, but keep the object). */
     ML_ALWAYS_INLINE void pop_window()
     {
-        ML_CHECK(!records.empty());
-        VmCallRec &rec = records.back();
+        ML_CHECK(rec_n != 0);
+        VmCallRec &rec = back_rec();
 
         /* Release the window's REFERENCES (the old Frame-dtor point). A
          * slot holding a trivial value (int/float/bool/none - no refcount,
@@ -1085,10 +1112,20 @@ struct VmActivation {
         if (rec.caller_cache || view_frame.pure_cache)
             view_frame.pure_cache = std::move(rec.caller_cache);
 
-        records.pop_back();
+        /* Free any owning state the frame still holds - the reuse-equivalent
+         * of the old pop_back dtor. On the HOT path all three are already
+         * null (cache_key moved out by vm_leave_call, caller_cache moved out
+         * above, exc never set), so these are cheap null resets; the
+         * exceptional-walk / cached-call paths may leave one set, and freeing
+         * it here matches the old dtor exactly. pend must reset so a reused
+         * record does not inherit a stale finally-pend. */
+        rec.exc.reset();
+        rec.cache_key.reset();
+        rec.pend = Pend::normal;
+        rec_n--;
 
-        if (!records.empty()) {
-            const VmCallRec &tp = records.back();
+        if (rec_n) {
+            const VmCallRec &tp = back_rec();
             view_frame.point_at(tp.window, static_cast<int>(tp.nslots));
             cur_seg = tp.seg;
         }
@@ -1461,7 +1498,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
      * ML_COLD walk: a same-frame `throw`+catch loop - 42_exceptions - pays
      * only this dispatch; routing it through the cold-section walk cost a
      * measured +12% there). Not cold-marked itself for the same reason. */
-    VmCallRec &cur = act.records.back();
+    VmCallRec &cur = act.back_rec();
     if (vm_dispatch_exc(act, cur, pc)) {
         cur.exc = std::move(ex);
         return true;                       /* chunk unchanged */
@@ -1697,7 +1734,7 @@ vm_enter_invocation_fast(const Chunk *chunk,
                          bool &swapped, bool &pushed)
 {
     VmActivation *a = g_vm_act;
-    if (a && !a->records.empty() && a->records.back().run_chunk == chunk)
+    if (a && !a->no_recs() && a->back_rec().run_chunk == chunk)
         return a;
     return vm_enter_invocation(chunk, own, swapped, pushed);
 }
@@ -1711,8 +1748,8 @@ vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
         swapped = true;
         g_vm_act = own.get();
     }
-    if (g_vm_act->records.empty()
-            || g_vm_act->records.back().run_chunk != chunk) {
+    if (g_vm_act->no_recs()
+            || g_vm_act->back_rec().run_chunk != chunk) {
         g_vm_act->push_window(0, chunk, /*boundary=*/true);
         pushed = true;
     }
@@ -1748,7 +1785,7 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
     const int_type total =
         d->frame_size + static_cast<int_type>(cck->n_temps);
     Frame *w = act.push_window(total, cck, /*boundary=*/false);
-    VmCallRec &rec = act.records.back();
+    VmCallRec &rec = act.back_rec();
     rec.ret_chunk = chunk;
     rec.ret_pc = pc + 1;
     rec.dst = dst;
@@ -1793,7 +1830,7 @@ static ML_NOINLINE void
 vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
               size_t &pc, EvalValue res)
 {
-    VmCallRec &dead = act.records.back();
+    VmCallRec &dead = act.back_rec();
     ctx.captures = dead.caller_captures;
     chunk = dead.ret_chunk;
     pc = dead.ret_pc;
@@ -1846,7 +1883,7 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
                size_t &pc, std::unique_ptr<RuntimeException> ex)
 {
     for (;;) {
-        VmCallRec &cur = act.records.back();
+        VmCallRec &cur = act.back_rec();
         if (vm_dispatch_exc(act, cur, pc)) {
             cur.exc = std::move(ex);           /* like saved_ex */
             return true;
@@ -1913,7 +1950,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
      * from exiting a scope with a live non-trivial local, and every label
      * lives inside this one, so no dispatch ever exits it. */
     std::unique_ptr<PureCacheKey> pending_key;
-    auto cur_rec = [&]() -> VmCallRec & { return act.records.back(); };
+    auto cur_rec = [&]() -> VmCallRec & { return act.back_rec(); };
     auto diter = [&](int_type i) -> DictIterState & {
         return act.dict_iters[cur_rec().diter_base + i];
     };

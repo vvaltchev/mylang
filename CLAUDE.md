@@ -129,7 +129,18 @@ gone from in-VM returns; the deleted `LoopBackEdge` was its last reader).
 Per-frame state (handler stack, dict/dyn iterator pools, in-flight caught
 exception, finally-pend, the per-frame `PureCache` - stashed/restored so
 the shared view Frame can't leak it into global memoization) lives in the
-records as watermarked slices of shared stacks. The exceptional path is a
+records as watermarked slices of shared stacks. **The record stack is
+REUSE-based (N6 call-path lean):** `records` is PHYSICAL storage grown only
+to the high-water mark, and a live-count `rec_n` indexes it - a push REUSES
+the already-constructed record (`records[rec_n++]`), so the ~140-byte
+`VmCallRec`'s 3 `unique_ptr`s are NOT default-constructed/destructed per
+call (the `emplace_back` construct was ~6% of a deep-recursion profile, and
+reuse also kills the vector realloc-move churn - `10_recursion_deep`
+**-18%** JIT-off, suite-neutral). A pop frees any owning field the
+exceptional/cache path left set (`exc`/`cache_key` reset, `pend` normalized
+- RAII kept, the reuse-equivalent of the old `pop_back` dtor) then
+decrements; a BOUNDARY push clears the resume fields `vm_enter_call` would
+otherwise set, so a reused record carries no stale resume state. The exceptional path is a
 FRAME WALK at the activation's single landing pad: dispatch to a handler in
 the current frame, else capture that record's backtrace frame (descriptor
 name/params + `loc_at(ret_chunk, ret_pc-1)` + the pure tag), pop, flush the
