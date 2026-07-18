@@ -323,9 +323,21 @@ prove → the VM instruction stays (the only fallback). NO runtime bail.
   helper call clobbers r10/r11 (the N5 cache), so rdi + the cache regs are
   saved by the shared `emit_call_prologue`. NOT `op_fully_native` (it can
   throw), so a store-containing run keeps its interpreted originals. Byte-
-  identical carets + catchable (frame-walk) verified. NEXT: the dict/string
-  store + read ops (Amdahl-bound — mostly keeps the loop native, since the op
-  itself is `unordered_map`/`std::string` C++).
+  identical carets + catchable (frame-walk) verified. The **DICT store**
+  (`DictStore` -> `jit_dict_store`) landed on the SAME shape: the fragment leas
+  the base/key/value slots (the key/value are BOXED EvalValues in slots - no
+  marshaling) and calls the interpreter's `vm_subscript_store`; the base/key/
+  value slots are disqualified from N5 caching so their slots stay current.
+  Measured `23_dict_insert` **~6.5% wall / 12% fewer instructions** - a REAL,
+  if modest, win (the first wall-clock A/B mis-read it as 0% under allocation
+  noise; the DETERMINISTIC callgrind I-count + a 25-run min/median resolved it
+  - see the "prove the code ran + distrust a surprising result" rule in
+  CLAUDE.md). So dispatch IS a real chunk of the dict tier; the BIGGER headroom
+  is the boxed-value/alloc model (N7), confirmed by `bench/cpp/` (a hand-C++
+  translation of every bench: dict-tier `my/cpp` ~5x, so ~5x of the gap to
+  native C++ is the value model, not dispatch). NEXT (still Amdahl-bound): the
+  dict/string READ ops + string stores; and general-array reads (which would
+  let `62_dict_word_count`'s `words[i%nw]` loop go native too).
 - **delete the interpreted originals** for a fully-native run. (DONE.) A run
   is DELETABLE iff every op is `op_fully_native` (a non-throwing int op - no
   re-interpret bail, no jit_raise; excludes reg-shift / LoadElem / all float

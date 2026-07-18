@@ -569,6 +569,18 @@ it out AFTER `jit_compile_chunk`, so `&chunk` dangles (an ASan SEGV the
 OOB-store regression test caught). Measured (same-binary before/after, both
 JIT-on): 43_sieve 0.63-0.69x, 14_array_subscript 0.74-0.78x, 46_matrix 0.82x,
 56_sieve_bool 0.79-0.90x (~1.3x on write benches); suite geomean 0.97-0.99x.
+The **DICT store** `d[k] = v` / `d[k] OP= v` (LOCAL base) is the same shape -
+`DictStore` -> `jit_dict_store` (vm.cpp), which runs the interpreter's exact
+`vm_subscript_store`. The key/value are BOXED EvalValues in frame slots, so
+the fragment just leas their addresses (no marshaling; an EvalValue is the
+first `LValue` member); the base/key/value slots are DISQUALIFIED from N5
+register caching (a cached int key - a counter used as `d[i]` - would leave
+its slot stale). So a dict insert/update loop stays native instead of
+splitting at the store. Measured (`23_dict_insert`, resolved with the
+DETERMINISTIC callgrind I-count + a 25-run min+median after wall-clock noise
+first mis-read it as 0%): **~6.5% wall / 12% fewer instructions** - dispatch
+IS a real chunk of the dict tier, but the BIGGER headroom is the boxed-value/
+alloc model (`my/cpp` ~5x in `bench/cpp/` - the N7 arc), not dispatch.
 **`-vdj`:** decodes `push`/`pop`/`call`/`sqrtsd`/`nop`/`E8`-rel32/`lea`/`test`/
 group-1 `cmp`/`sub imm`, and shows big `movabs` constants in hex (a `call rax`
 had rendered as `dec rax`; a helper-call `lea rdi` had cascade-misdecoded as

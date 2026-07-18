@@ -76,3 +76,8 @@ extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
                                   int aop) noexcept;
 extern "C" int jit_store_elem_float(LValue *base, int_type idx,
                                     double rhs, int aop) noexcept;
+/* d[k] = v / d[k] OP= v: base dict LValue* + the key/value slot EvalValue*s
+ * (boxed - the fragment leas the slot addresses) + the Expr14 op. */
+class EvalValue;
+extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
+                              const EvalValue *val, int op) noexcept;
