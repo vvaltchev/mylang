@@ -232,6 +232,53 @@ next time control reaches the run head.
   this is the first phase with real compiler-ish complexity — evaluate
   honestly whether the win justifies it.
 
+## The path to 10x — why it is NOT the N-series (N6/N7 sketch)
+
+MEASURED reality (same-binary JIT off→on): the JIT already delivers
+**3–5x on the code it compiles** (01_while 0.235x, autoconst_dce
+0.211x = the per-op ceiling, already hit), but the suite geomean is
+only ~1.2x. This is **Amdahl, not underperformance**: the non-scalar
+benches (dict/string/call/alloc) spend their time in NATIVE C++ the JIT
+calls into unchanged — `unordered_map::insert`, `std::string` growth,
+`EvalValue` refcount churn, `vm_enter_call`. Dispatch was never their
+bottleneck, so removing it is invisible. N1–N5 attack *dispatch*; even
+at infinite speedup on the ~35% dispatch-bound fraction the suite caps
+near **1.5–1.7x** (≈7–8x CPython). The remaining multiple to 10x lives
+in the other 60%, and needs two fundamentally larger arcs:
+
+- **N6 — call inlining / a lean native call.** Today any user call
+  splits a run (`vm_enter_call` is never compiled), so fib / recursion
+  / closures / higher-order callbacks get ~nothing from the JIT.
+  N6a (tractable): a NATIVE fast path for a call to a small, resolved,
+  scalar-only user function — a lean window bump + arg copy + `call`
+  into the callee's fragment, skipping the ~270-instr `vm_enter_call`
+  record machinery on the common no-handler/no-iterator path. N6b
+  (harder): true INLINING of a small callee's fragment into the
+  caller's (the native analogue of the tree-walker inliner) so the
+  call vanishes — bounded depth for recursion, the per-frame PureCache
+  still dedups the frontier. Targets 09_fib, 10_recursion, 11/12/63
+  closures, 34/35/67 callbacks. Expected: meaningful on the ~15–20% of
+  the suite that is call-bound.
+- **N7 — allocation elimination / unboxing (the CPython-killer).**
+  CPython is slow *because of boxing*; we already win 5x on lighter
+  values, but our arrays/dicts/strings/temporaries still heap-allocate
+  and refcount. N7 = escape analysis: a temporary array/dict/string
+  (or a boxed struct) that does NOT escape its creating scope is
+  stack-allocated or elided, and its refcount traffic removed
+  (LuaJIT's allocation sinking, PyPy's virtuals — their decisive
+  non-numeric win). This is the lever for the dict/string/wordcount
+  tier. HONESTLY: it likely needs a different IR than the per-op
+  bytecode-fragment model — an SSA-ish trace over a hot region where
+  an allocation's lifetime can be proven — i.e. a TRACING tier, not an
+  incremental native op. Research-grade scope; the biggest single
+  source of the remaining multiple, and the biggest project.
+
+So: **N5 pushes the arithmetic tier toward native-C (≈7–8x suite); 10x
+is a real but SEPARATE goal built on N6 (calls) + N7 (allocation), not
+on making the scalar JIT more perfect.** Sequence after N5: N6a (lean
+call) is the next tractable step; N7 is the big arc, evaluated on its
+own merits when the call tier is done.
+
 ## Deferred (explicitly out of scope until the above earns it)
 
 - arm64 (macOS Apple Silicon: MAP_JIT + jit-write-protect dance),
