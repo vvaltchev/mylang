@@ -209,6 +209,11 @@ void dump_struct_type(const StructTypeDef *def, std::ostringstream &s)
  * Only non-empty sections print, to keep a plain function's dump terse. */
 void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
 {
+    /* One blank line + a header: these are the SERIALIZABLE pools/side
+     * tables the ops reference by index/pc - the audit surface for the
+     * `.myv` stored-bytecode file, NOT needed to read the code above
+     * (names/values are already inlined at the use sites). */
+    s << "\n; ===== serializable pools (what a .myv file stores) =====\n";
     if (!ch.consts.empty()) {
         s << "; -- consts (" << ch.consts.size() << ") --\n";
         for (size_t i = 0; i < ch.consts.size(); i++)
@@ -270,7 +275,11 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         }
     }
     if (!ch.builtin_calls.empty()) {
-        s << "; -- builtin_calls (" << ch.builtin_calls.size() << ") --\n";
+        /* one entry per builtin call SITE: the name + the per-arg source
+         * carets a runtime type/arity error points at (the carets aren't
+         * shown here; the name is already inline at the `call.blt` op). */
+        s << "; -- builtin_calls: per-call-site name + arg carets ("
+          << ch.builtin_calls.size() << ") --\n";
         for (size_t i = 0; i < ch.builtin_calls.size(); i++) {
             const auto &bc = ch.builtin_calls[i];
             s << ";   [" << i << "]" << "  " << (bc.name ? bc.name->val : "?")
@@ -333,7 +342,11 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         }
     }
     if (!ch.locs.empty()) {
-        s << "; -- locs (" << ch.locs.size() << ") --\n";
+        /* a throwing op's SOURCE caret, looked up by pc only on the error
+         * path: `pcN -> line:col` = op N's error points at that source
+         * line:col. */
+        s << "; -- locs: throwing-op pc -> source line:col ("
+          << ch.locs.size() << ") --\n";
         for (const auto &l : ch.locs)
             s << ";   pc" << l.pc << " -> " << l.start.line << ":"
               << l.start.col << "\n";
@@ -615,6 +628,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                       << "\n";
         }
     }
+    s << "\n";   /* separate the header block from the code */
 
     /* A capture slot as its field name (the anon capture-struct field), else
      * `cN`. */
