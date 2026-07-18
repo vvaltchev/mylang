@@ -1,11 +1,20 @@
 # Native x86-64 AOT — incremental, on-the-fly, never-complete (design)
 
-Status: N0+N1 LANDED (2026-07-18): the emitter, the W^X NativeCode
-buffer, EnterNative + insertion/remap, the straight-line int tier, the
--nj / MYLANG_JIT=0 kill switch, the bail + engagement tests. Measured:
-07_nested_loops 0.692x, 68_nested 0.787x, suite VM-wall 0.998, my/py
-4.97x → 5.04x; JIT-off neutral. NEXT: N2 (intra-run branches + the
-native back edge). Maintainer direction: build
+Status: N0+N1+N2 LANDED (2026-07-18). N2 = intra-run branches + the
+NATIVE BACK EDGE: a run may now contain Jump/JumpUnlessIntCmp/
+ForLoopStep/IntAddStep and interior branch targets, so a whole int loop
+iterates in machine code (internal branches -> fragment-local jcc/jmp
+patched from a per-run label[]; a target outside the run -> exit_pc).
+No single-entry constraint is needed: interior ops survive as
+interpreted originals, so an external branch/bail just resumes
+interpreted. MEASURED (same-binary JIT off vs on, the cleanest control -
+the kill switch exists for it): VM-wall geomean 0.895, my/py 4.97x ->
+5.47x. 01_while 0.190x, 50_autoconst_dce 0.227x, 02_for 0.333x, 06_if
+0.450x, 03_int 0.632x, 68_nested 0.692x. (The cross-binary A/B agreed
+on the headline - 5.04x -> 5.47x - but its tiny-magnitude per-bench
+deltas at 4-15ms are NOISE; the same-binary control shows no real
+regression, incl. 07_nested_loops, which is FASTER same-binary.) NEXT:
+N3 (the SSE float tier). Maintainer direction: build
 it VERY incrementally, accept that it may never cover everything (the
 interpreter is the permanent, tested fallback — "never complete" is a
 feature, not a debt), never serialize machine code (AOT always runs

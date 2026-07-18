@@ -13895,7 +13895,33 @@ static bool jit_engagement()
     } catch (...) {
         return false;
     }
-    return g_jit_frags > before;
+    if (g_jit_frags == before)
+        return false;
+
+    /* N2: a whole int LOOP compiles to ONE fragment (the native back
+     * edge) and computes correctly through it. */
+    const unsigned long b2 = g_jit_frags;
+    std::string src2;
+    std::vector<Tok> t2;
+    for (const char *l : {
+            "var acc = 0;",
+            "for (var i = 0; i < 100; i++) acc = acc + i * i;" }) {
+        if (!src2.empty()) src2 += '\n';
+        src2 += l;
+    }
+    lexer(src2, 1, t2);
+    try {
+        ParseContext pc(TokenStream(t2), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        vm_execute(root.get());
+    } catch (...) {
+        return false;
+    }
+    return g_jit_frags > b2;
 #else
     return true;   /* off-platform: the JIT never engages, by design */
 #endif

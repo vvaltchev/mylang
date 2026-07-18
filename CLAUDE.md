@@ -414,12 +414,25 @@ facts (LValue stride 48, payload/type offsets via
 `EvalValue::jit_payload_off/jit_type_off` + a runtime probe, the int
 Type singleton) are baked as immediates. Gated
 `#if __x86_64__ && !_WIN32`; kill switch `-nj` / `MYLANG_JIT=0` (the
-same-binary A/B lever). Measured (N1, full-suite interleaved A/B vs the
-pre-AOT release): 07_nested_loops **0.692x**, 68_nested 0.787x,
-03_int_arith 0.938x, 43_sieve 0.946x, suite VM-wall geomean 0.998,
-my/py 4.97x → **5.04x**; the JIT-OFF configuration measures neutral
-(the one-new-opcode front-end risk). N2 (intra-run branches + the
-native back edge) is where loops stop dispatching per iteration.
+same-binary A/B lever). The indirect call into a fragment goes through
+`jit_enter` (no_sanitize("function") / gcc no_sanitize_undefined):
+UBSan's -fsanitize=function would else read a CFI type signature from
+the (absent) word before the fragment and fault on the guard page - a
+CI-only crash root-caused via a `setarch -R` (ASLR-off) repro.
+**N2 - the NATIVE BACK EDGE:** a run may contain
+Jump/JumpUnlessIntCmp/ForLoopStep/IntAddStep and interior branch
+targets (`op_is_branch` + `emit_branch`), so a whole int loop iterates
+in machine code - internal branches are fragment-local jcc/jmp patched
+from a per-run `label[]` (`emit_cond_jump`; signed `cc_for`/`cc_negate`
+tables), a target outside the run is an `exit_pc`. NO single-entry
+constraint: every interior op survives as its interpreted original, so
+an external branch or a bail simply resumes interpreted. Measured
+(SAME-BINARY JIT off vs on, the cleanest control): VM-wall geomean
+**0.895**, my/py 4.97x → **5.47x**; 01_while_loop 0.190x,
+50_autoconst_dce 0.227x, 02_for_loop 0.333x, 06_if_branch 0.450x,
+68_nested 0.692x. (Cross-binary A/B tiny-magnitude per-bench deltas are
+NOISE - always confirm JIT deltas same-binary via the kill switch.)
+N3 = the SSE float tier.
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
