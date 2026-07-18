@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <vector>
 #include <functional>
+#include <unordered_set>
 
 namespace {
 
@@ -565,10 +566,15 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
     s << "       . ---- native x86-64 (rdi=frame slots, rsi=int-tag,"
       << " r8=float-tag; xmm=SSE) ----\n";
     uint32_t p = 0, mi = 0;
+    bool first = true;
     while (p < frag.len) {
-        /* each op boundary: show the SOURCE VM op these instructions run */
+        /* each op boundary: a blank line, then the SOURCE VM op these
+         * instructions implement (blank line groups the fragment by op). */
         while (mi < frag.marks.size() && frag.marks[mi].off == p) {
             const uint32_t vpc = frag.marks[mi].vm_pc;
+            if (!first)
+                s << "       .\n";
+            first = false;
             s << "       . ; vm pc " << vpc << ": " << render_row(vpc)
               << "\n";
             mi++;
@@ -584,6 +590,8 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
                  << "; " << cmt;
         s << line.str() << "\n";
     }
+    /* close the native block so it doesn't run into the next VM op */
+    s << "       . ---- end native ----\n";
 }
 
 }  // namespace
@@ -1439,11 +1447,150 @@ const char *mnemonic_color(const std::string &m)
     return "\033[38;5;78m";                         /* mem/other - green   */
 }
 
+/* An operand identifier that is a REGISTER (a machine reg OR a VM slot
+ * `rN`/`gN`/`cN`/`xmmN`) - colored muted, so a source VARIABLE name (any
+ * other identifier) stands out. `byte`/`type` are plumbing keywords. */
+bool is_reg_token(const std::string &id)
+{
+    static const std::unordered_set<std::string> x86 = {
+        "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+        "eax","ebx","ecx","edx","esi","edi","ebp","esp",
+        "al","bl","cl","dl" };
+    if (x86.count(id))
+        return true;
+    const auto tail_digits = [&](size_t from) {
+        if (id.size() <= from)
+            return false;
+        for (size_t x = from; x < id.size(); x++)
+            if (!isdigit((unsigned char)id[x]))
+                return false;
+        return true;
+    };
+    if ((id[0] == 'r' || id[0] == 'g' || id[0] == 'c') && tail_digits(1))
+        return true;                             /* rN/gN/cN + r8..r15 */
+    if (id.compare(0, 3, "xmm") == 0 && tail_digits(3))
+        return true;
+    return false;
+}
+
+bool is_kw_token(const std::string &id)
+{
+    return id == "byte" || id == "type" || id == "ptr" || id == "word"
+        || id == "qword" || id == "dword";
+}
+
+/* Color the operand run (from index `i` to EOL): immediates, `L<n>`
+ * labels, registers (gray), source VARIABLES (cyan), keywords, comments,
+ * punctuation. Shared by the VM ops and the native disasm. */
+void scan_operands(std::ostringstream &o, const std::string &line, size_t i)
+{
+    while (i < line.size()) {
+        const char c = line[i];
+        if (c == ';') {                              /* inline comment -> EOL */
+            o << "\033[38;5;245m" << line.substr(i) << RST;
+            return;
+        }
+        if (c == ' ') { o << c; i++; continue; }
+        if (isdigit((unsigned char)c)
+            || (c == '-' && i + 1 < line.size()
+                && isdigit((unsigned char)line[i + 1]))) {
+            size_t k = i + 1;                        /* immediate / number */
+            while (k < line.size()
+                   && (isdigit((unsigned char)line[k]) || line[k] == 'x'
+                       || (line[k] >= 'a' && line[k] <= 'f')
+                       || line[k] == '.'))
+                k++;
+            o << "\033[38;5;150m" << line.substr(i, k - i) << RST;
+            i = k;
+            continue;
+        }
+        if (isalpha((unsigned char)c) || c == '_') {
+            size_t k = i;
+            while (k < line.size()
+                   && (isalnum((unsigned char)line[k]) || line[k] == '_'))
+                k++;
+            const std::string id = line.substr(i, k - i);
+            bool label = id.size() > 1 && id[0] == 'L';
+            for (size_t x = 1; label && x < id.size(); x++)
+                if (!isdigit((unsigned char)id[x]))
+                    label = false;
+            const bool field = i > 0 && line[i - 1] == '.';   /* `.type` */
+            const char *col =
+                label                       ? "\033[38;5;213m"   /* pink   */
+              : field || is_kw_token(id)    ? "\033[38;5;244m"   /* gray   */
+              : is_reg_token(id)            ? "\033[38;5;244m"   /* gray   */
+                                            : "\033[38;5;81m";   /* VAR cyan */
+            o << col << id << RST;
+            i = k;
+            continue;
+        }
+        o << "\033[38;5;243m" << c << RST;           /* operator / punct */
+        i++;
+    }
+}
+
 std::string hl_line(const std::string &line)
 {
     size_t i = 0;
     while (i < line.size() && line[i] == ' ')
         i++;
+
+    /* A native-fragment line (-vdj): `. ---- ...`, `. ; vm pc N: <op>`,
+     * `.   +off: mnemonic operands ; cmt`, or a bare `.`. */
+    if (i < line.size() && line[i] == '.') {
+        std::ostringstream o;
+        o << line.substr(0, i) << "\033[38;5;238m.\033[0m";   /* the marker */
+        size_t k = i + 1;
+        while (k < line.size() && line[k] == ' ') o << line[k++];
+        if (k >= line.size())
+            return o.str();                          /* bare `.` */
+        if (line[k] == '-' || line[k] == ';') {
+            /* a `---- ... ----` rule or a `; vm pc N: <op>` marker: dim
+             * the rule/marker prefix, then colorize the trailing VM op. */
+            const size_t colon = line.find(": ", k);
+            if (line[k] == ';' && colon != std::string::npos) {
+                o << "\033[38;5;245m" << line.substr(k, colon + 2 - k) << RST;
+                size_t p2 = colon + 2;               /* the rendered VM op: */
+                size_t mm = p2;                      /* mnemonic then operands */
+                while (mm < line.size()
+                       && (islower((unsigned char)line[mm]) || line[mm] == '.'
+                           || isdigit((unsigned char)line[mm])))
+                    mm++;
+                if (mm > p2) {
+                    o << mnemonic_color(line.substr(p2, mm - p2))
+                      << line.substr(p2, mm - p2) << RST;
+                    p2 = mm;
+                }
+                scan_operands(o, line, p2);
+            } else {
+                o << "\033[38;5;238m" << line.substr(k) << RST;
+            }
+            return o.str();
+        }
+        /* an instruction line: `+off:` (dim), mnemonic (category), operands */
+        if (line[k] == '+') {
+            size_t e = line.find(':', k);
+            if (e != std::string::npos) e++;
+            else e = k;
+            o << "\033[38;5;240m" << line.substr(k, e - k) << RST;
+            k = e;
+            while (k < line.size() && line[k] == ' ') o << line[k++];
+            size_t m = k;
+            while (m < line.size()
+                   && (islower((unsigned char)line[m]) || isdigit(
+                           (unsigned char)line[m])))
+                m++;
+            if (m > k) {
+                const std::string mn = line.substr(k, m - k);
+                o << mnemonic_color(mn) << mn << RST;
+                k = m;
+            }
+            scan_operands(o, line, k);
+            return o.str();
+        }
+        scan_operands(o, line, k);
+        return o.str();
+    }
 
     /* whole-line comment / section header */
     if (i < line.size() && line[i] == ';') {
@@ -1481,43 +1628,7 @@ std::string hl_line(const std::string &line)
         i = m;
     }
 
-    /* operands - a token scan */
-    while (i < line.size()) {
-        const char c = line[i];
-        if (c == ';') {                              /* inline comment -> EOL */
-            o << "\033[38;5;245m" << line.substr(i) << RST;
-            break;
-        }
-        if (c == ' ') {
-            o << c;
-            i++;
-            continue;
-        }
-        if (c == '#' || isdigit((unsigned char)c)) {  /* immediate / number */
-            size_t k = i + (c == '#' ? 1 : 0);
-            while (k < line.size() && isdigit((unsigned char)line[k]))
-                k++;
-            o << "\033[38;5;150m" << line.substr(i, k - i) << RST;
-            i = k;
-            continue;
-        }
-        if (isalpha((unsigned char)c) || c == '_') {  /* reg / name / label */
-            size_t k = i;
-            while (k < line.size()
-                   && (isalnum((unsigned char)line[k]) || line[k] == '_'))
-                k++;
-            const std::string id = line.substr(i, k - i);
-            bool label = id.size() > 1 && id[0] == 'L';
-            for (size_t x = 1; label && x < id.size(); x++)
-                if (!isdigit((unsigned char)id[x]))
-                    label = false;
-            o << (label ? "\033[38;5;213m" : "\033[38;5;80m") << id << RST;
-            i = k;
-            continue;
-        }
-        o << "\033[38;5;243m" << c << RST;           /* operator / punct */
-        i++;
-    }
+    scan_operands(o, line, i);
     return o.str();
 }
 
