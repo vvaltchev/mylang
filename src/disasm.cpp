@@ -2,7 +2,8 @@
 
 #include "disasm.h"
 #include "codegen.h"
-#include "eval.h"      /* builtin_slot / find_builtin_name */      /* codegen_program / codegen_chunk */
+#include "eval.h"      /* builtin_slot / builtin_slot_name */
+#include "jit.h"       /* jit_type_singletons (-vdj) */      /* codegen_program / codegen_chunk */
 #include "coderender.h"   /* render_construct_code - shared AST decompiler */
 #include "syntax.h"
 #include "structtype.h"   /* StructTypeDef / FieldDef (the custom-type dump) */
@@ -400,10 +401,12 @@ std::string mem_disp(int base_reg, int32_t disp, const SlotNamer &nm)
 /* Decode ONE instruction at code[p]; append its mnemonic to `out` and
  * advance p. Covers jit.cpp's emitted forms. */
 void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
-                const SlotNamer &nm)
+                std::string &cmt, const SlotNamer &nm,
+                const void *ti, const void *tf, const void *ta)
 {
     const uint32_t start = p;
     std::ostringstream o;
+    cmt.clear();
     bool pf_f2 = false, pf_66 = false;
     while (p < n && (c[p] == 0xF2 || c[p] == 0xF3 || c[p] == 0x66)) {
         if (c[p] == 0xF2) pf_f2 = true;
@@ -449,12 +452,24 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
 
     switch (op) {
     case 0xB8: case 0xB9: case 0xBA: case 0xBB:
-    case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-        if (W) o << "movabs " << gp64((op - 0xB8) + (B ? 8 : 0))
-                 << ", 0x" << std::hex << rd64();
-        else   o << "mov e" << (gp64((op-0xB8)+(B?8:0))+1) << ", 0x"
-                 << std::hex << rd32();     /* mov eNN, imm32 (exit pc) */
-        break;
+    case 0xBC: case 0xBD: case 0xBE: case 0xBF: {
+        const int rr = (op - 0xB8) + (B ? 8 : 0);
+        if (W) {
+            const uint64_t imm = rd64();
+            const void *pv = reinterpret_cast<const void *>(imm);
+            const char *tag = pv == ti ? "<int-tag>" : pv == tf ? "<float-tag>"
+                            : pv == ta ? "<array-tag>" : nullptr;
+            if (tag) { o << "movabs " << gp64(rr) << ", " << tag;
+                       cmt = "the Type-tag constant"; }
+            else       o << "movabs " << gp64(rr) << ", "
+                         << int64_t(imm);          /* base-10 value */
+        } else {
+            const uint32_t imm = rd32();            /* mov eNN, imm32 = the
+                                                     * resume VM pc (exit) */
+            o << "mov e" << (gp64(rr) + 1) << ", " << imm;
+            cmt = "return: resume at vm pc " + std::to_string(imm);
+        }
+        break; }
     case 0xC3: o << "ret"; break;
     case 0x8B: modrm(regf, rm); o << "mov " << gp64(regf) << ", " << rm;
         break;
@@ -529,24 +544,32 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
 }
 
 void disasm_native_frag(std::ostream &s, const uint8_t *code,
-                        const NativeCode::Frag &frag, const SlotNamer &nm)
+                        const NativeCode::Frag &frag, const SlotNamer &nm,
+                        const std::function<std::string(size_t)> &render_row)
 {
-    s << "       . ---- native fragment (" << std::dec << frag.len
-      << " bytes) ----\n";
+    const void *ti = nullptr, *tf = nullptr, *ta = nullptr;
+    jit_type_singletons(ti, tf, ta);
+    s << "       . ---- native x86-64 (rdi=frame slots, rsi=int-tag,"
+      << " r8=float-tag; xmm=SSE) ----\n";
     uint32_t p = 0, mi = 0;
     while (p < frag.len) {
+        /* each op boundary: show the SOURCE VM op these instructions run */
         while (mi < frag.marks.size() && frag.marks[mi].off == p) {
-            s << "       . ; vm pc " << frag.marks[mi].vm_pc << "\n";
+            const uint32_t vpc = frag.marks[mi].vm_pc;
+            s << "       . ; vm pc " << vpc << ": " << render_row(vpc)
+              << "\n";
             mi++;
         }
         const uint32_t st = p;
-        std::string mn;
-        decode_one(code, frag.len, p, mn, nm);
-        std::ostringstream bytes;
-        for (uint32_t k = st; k < p; k++) bytes << hex2(code[k]) << " ";
-        s << "       . +" << std::setw(3) << std::setfill(' ') << std::dec
-          << st << ": " << std::left << std::setw(30) << bytes.str()
-          << mn << std::right << "\n";
+        std::string mn, cmt;
+        decode_one(code, frag.len, p, mn, cmt, nm, ti, tf, ta);
+        std::ostringstream line;
+        line << "       .   +" << std::setw(3) << std::setfill(' ')
+             << std::dec << st << ": " << mn;
+        if (!cmt.empty())
+            line << std::string(mn.size() < 26 ? 26 - mn.size() : 1, ' ')
+                 << "; " << cmt;
+        s << line.str() << "\n";
     }
 }
 
@@ -628,7 +651,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         return std::string(builtin_slot_name(static_cast<int>(idx)));
     };
 
-    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+    /* Render ONE VM op's mnemonic (shared by the main listing and the
+     * -vdj native fragment's `; vm pc N: <op>` markers). */
+    auto render_row = [&](size_t pc) -> std::string {
         const Instr &in = chunk.code[pc];
         std::ostringstream row;
 
@@ -1282,8 +1307,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "halt";
             break;
         }
+        return row.str();
+    };
 
-        s << std::setw(4) << pc << "  " << row.str() << "\n";
+    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+        const Instr &in = chunk.code[pc];
+        s << std::setw(4) << pc << "  " << render_row(pc) << "\n";
 
         /* -vdj: after an EnterNative line, disassemble its fragment. */
         if (in.op == OpCode::EnterNative && chunk.native.base
@@ -1294,7 +1323,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                     disasm_native_frag(
                         s, static_cast<const uint8_t *>(chunk.native.base)
                                + fr.start, fr,
-                        [&chunk](int sl) { return reg(chunk, sl); });
+                        [&chunk](int sl) { return reg(chunk, sl); },
+                        render_row);
                     break;
                 }
         }
