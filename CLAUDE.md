@@ -432,7 +432,20 @@ an external branch or a bail simply resumes interpreted. Measured
 50_autoconst_dce 0.227x, 02_for_loop 0.333x, 06_if_branch 0.450x,
 68_nested 0.692x. (Cross-binary A/B tiny-magnitude per-bench deltas are
 NOISE - always confirm JIT deltas same-binary via the kill switch.)
-N3 = the SSE float tier.
+**N3 - the SSE FLOAT tier:** FloatBin(add/sub/mul) +
+FloatAdd/Sub/MulRR/RI, LoadImmFloat, JumpUnlessFloatCmp lower to
+movsd/addsd/subsd/mulsd/ucomisd. A float slot READ type-dispatches
+(float -> movsd fast path; int -> cvtsi2sd promote; bool/other ->
+BAIL - matching read_float_slot); a WRITE is the two-store (t_float
+singleton held in r8, set once at entry when the run has float ops, +
+movsd payload). Float ORDERING compares (lt/le/gt/ge; eq/noteq not
+eligible) use the ucomisd OPERAND-SWAP trick so an unordered (NaN)
+compare correctly does NOT satisfy it and jumps - byte-identical to the
+tree-walker's IEEE semantics. div/mod stay interpreted (float div
+THROWS on 0; mod is a libm call). Measured (same-binary JIT off vs on):
+VM-wall geomean **0.812**, my/py 5.00x -> **5.55x**; 54_mandelbrot
+**0.344x**, 55_float_sum 0.867x. N4 = container reads (LoadElem*) with
+a bounds bail + MathFnV glue.
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of

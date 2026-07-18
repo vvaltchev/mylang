@@ -95,7 +95,8 @@ static_assert(sizeof(LValue) == 48, "the emitter's slot stride");
 struct JitLayout {
     long off_payload;   /* &slot.val.<union> - &slot  (ival/fval at +0) */
     long off_type;      /* &slot.val.type    - &slot */
-    const void *t_int;  /* the int Type singleton */
+    const void *t_int;    /* the int Type singleton */
+    const void *t_float;  /* the float Type singleton (N3) */
 };
 
 /* Runtime-computed via public accessors (LValue mixes access specifiers,
@@ -115,6 +116,8 @@ static const JitLayout &jit_layout()
             + static_cast<long>(EvalValue::jit_payload_off());
         l.off_type = val_off + static_cast<long>(EvalValue::jit_type_off());
         l.t_int = probe.get().get_type();
+        LValue fprobe(EvalValue(static_cast<float_type>(1.0)), false);
+        l.t_float = fprobe.get().get_type();
         return l;
     }();
     return L;
@@ -170,7 +173,69 @@ struct Emitter {
     }
     /* mov eax, imm32; ret   (the exit/bail sequence: resume pc out) */
     void exit_pc(uint32_t pc) { u8(0xB8); u32(pc); u8(0xC3); }
+
+    /* ---- N3 SSE float ---- (xmm0=a/acc, xmm1=b; r8 = t_float) */
+    /* movsd xmm<r>, [rdi+disp] */
+    void fload(uint8_t r, int32_t d)
+    {
+        u8(0xF2); u8(0x0F); u8(0x10);
+        u8(static_cast<uint8_t>(0x87 | (r << 3))); u32(uint32_t(d));
+    }
+    /* movsd [rdi+disp], xmm<r> */
+    void fstore(uint8_t r, int32_t d)
+    {
+        u8(0xF2); u8(0x0F); u8(0x11);
+        u8(static_cast<uint8_t>(0x87 | (r << 3))); u32(uint32_t(d));
+    }
+    /* addsd/subsd/mulsd xmm0, xmm1 (op = 0x58/0x5C/0x59) */
+    void farith(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC1); }
+    /* cvtsi2sd xmm<r>, qword [rdi+disp]  (int -> double) */
+    void cvt(uint8_t r, int32_t d)
+    {
+        u8(0xF2); u8(0x48); u8(0x0F); u8(0x2A);
+        u8(static_cast<uint8_t>(0x87 | (r << 3))); u32(uint32_t(d));
+    }
+    /* movq xmm<r>, rax  (double bits GP -> xmm) */
+    void movq_xmm(uint8_t r)
+    {
+        u8(0x66); u8(0x48); u8(0x0F); u8(0x6E);
+        u8(static_cast<uint8_t>(0xC0 | (r << 3)));
+    }
+    /* ucomisd xmm<d>, xmm<s> */
+    void ucomisd(uint8_t d, uint8_t s)
+    {
+        u8(0x66); u8(0x0F); u8(0x2E);
+        u8(static_cast<uint8_t>(0xC0 | (d << 3) | s));
+    }
+    /* mov rax, [rdi+disp]  (a slot's type ptr) */
+    void load_type(int32_t d)
+    {
+        u8(0x48); u8(0x8B); u8(0x87); u32(uint32_t(d));
+    }
+    /* cmp rax, r8 (t_float) / cmp rax, rsi (t_int) */
+    void cmp_rax_r8()  { u8(0x4C); u8(0x39); u8(0xC0); }
+    void cmp_rax_rsi() { u8(0x48); u8(0x39); u8(0xF0); }
+    /* mov [rdi+disp], r8  (store t_float as a slot's type) */
+    void store_r8_type(int32_t d)
+    {
+        u8(0x4C); u8(0x89); u8(0x87); u32(uint32_t(d));
+    }
+    /* movabs r8, imm64 (REX.WB) */
+    void movabs_r8(uint64_t imm)
+    {
+        u8(0x49); u8(0xB8); u64(imm);
+    }
+    /* a short rel8 jcc/jmp with the rel patched to here later */
+    size_t j8(uint8_t op) { u8(op); const size_t at = pos(); u8(0); return at; }
+    void patch8(size_t at, size_t target)
+    {
+        b[at] = static_cast<uint8_t>(target - (at + 1));
+    }
 };
+
+enum XReg : uint8_t { X0 = 0, X1 = 1 };   /* GP r8 = t_float (float
+                                           * fragments); baked in the
+                                           * encodings above/below */
 
 enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RSI = 6 };
 
@@ -224,19 +289,59 @@ static Op cc_negate(Op o)
  * exit_pc(remap[target]) (skip the exit when NOT jumping). */
 struct Fixup { size_t site; size_t target_pc; };
 
+/* Emit "jump to target_pc when <near_op> holds". INTERNAL -> a local
+ * near jcc (rel32 patched from label[]); EXTERNAL -> `<short_neg_op> +6`
+ * over a 6-byte exit_pc (skip the exit when the condition does NOT hold).
+ * near_op is the 2nd byte of `0F 8x`; short_neg_op the 1-byte short jcc
+ * of the NEGATED condition. */
+static void emit_cond_jump_raw(Emitter &e, uint8_t near_op,
+                               uint8_t short_neg_op, size_t target_pc,
+                               size_t begin, size_t end,
+                               const std::vector<int> &remap,
+                               std::vector<Fixup> &fixups)
+{
+    if (target_pc >= begin && target_pc < end) {
+        e.u8(0x0F); e.u8(near_op);
+        fixups.push_back({ e.pos(), target_pc });
+        e.u32(0);
+    } else {
+        e.u8(short_neg_op);
+        e.u8(0x06);                          /* skip the 6-byte exit */
+        e.exit_pc(static_cast<uint32_t>(remap[target_pc]));
+    }
+}
+
+/* Integer branch: jump to target when `cc` holds. */
 static void emit_cond_jump(Emitter &e, Op cc, size_t target_pc,
                            size_t begin, size_t end,
                            const std::vector<int> &remap,
                            std::vector<Fixup> &fixups)
 {
-    if (target_pc >= begin && target_pc < end) {
-        e.u8(0x0F); e.u8(cc_for(cc).near_op);
-        fixups.push_back({ e.pos(), target_pc });
-        e.u32(0);
-    } else {
-        e.u8(cc_for(cc_negate(cc)).short_op);
-        e.u8(0x06);                          /* skip the 6-byte exit */
-        e.exit_pc(static_cast<uint32_t>(remap[target_pc]));
+    emit_cond_jump_raw(e, cc_for(cc).near_op,
+                       cc_for(cc_negate(cc)).short_op,
+                       target_pc, begin, end, remap, fixups);
+}
+
+/* Float ORDERING compare via ucomisd (N3). Jump-to-target when
+ * (a cmp b) is FALSE. The swap trick avoids the NaN trap: a<b is emitted
+ * as b>a so an unordered (NaN) compare correctly does NOT satisfy it and
+ * jumps. Returns swap (ucomisd operand order) + the jump-when-false near
+ * opcode (jbe 0x86 / jb 0x82) and its negated short (ja 0x77 / jae 0x73).
+ * eq/noteq are not eligible (NaN-fiddly, rare in float loops). */
+struct FCmp { bool swap; uint8_t near_op, short_neg_op; };
+
+static bool float_cmp_eligible(Op o)
+{
+    return o == Op::lt || o == Op::le || o == Op::gt || o == Op::ge;
+}
+
+static FCmp float_cmp(Op o)
+{
+    switch (o) {
+    case Op::lt: return { true,  0x86, 0x77 };   /* a<b: b>a; !ja=jbe */
+    case Op::le: return { true,  0x82, 0x73 };   /* a<=b: b>=a; !jae=jb */
+    case Op::gt: return { false, 0x86, 0x77 };
+    default:     return { false, 0x82, 0x73 };   /* ge */
     }
 }
 
@@ -260,6 +365,20 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::Jump: case OpCode::JumpUnlessIntCmp:
     case OpCode::ForLoopStep: case OpCode::IntAddStep:
         return true;
+    /* N3: the SSE float tier. add/sub/mul only (div/mod THROW on 0 /
+     * are a libm call -> interpreted); a float READ handles an int-in-a-
+     * float-slot via cvtsi2sd (matching read_float_slot) and BAILS on
+     * bool/other. */
+    case OpCode::FloatBin:
+        return in.aop == Op::plus || in.aop == Op::minus
+            || in.aop == Op::times;
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+    case OpCode::LoadImmFloat:
+        return true;
+    case OpCode::JumpUnlessFloatCmp:
+        return float_cmp_eligible(in.aop);
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -332,6 +451,57 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
     }
     e.store(RSI, a.type);        /* the int Type singleton */
     e.store(src_reg, a.payload);
+}
+
+/* Load a float OPERAND into xmm<r>. A lit: movabs the double bits +
+ * movq. A slot: type-dispatch matching read_float_slot - float -> movsd
+ * (the fast path), int -> cvtsi2sd (promote), anything else (bool/str)
+ * -> BAIL (the interpreter re-runs the op; rare in a float loop). r8
+ * holds t_float, rsi holds t_int (both set once at fragment entry). */
+static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
+                            float_type flit, int slot, uint32_t bail_pc)
+{
+    if (is_lit) {
+        uint64_t bits;
+        std::memcpy(&bits, &flit, sizeof bits);
+        e.movabs(RAX, bits);
+        e.movq_xmm(xr);
+        return;
+    }
+    const SlotAddr a = slot_addr(slot);
+    e.load_type(a.type);                 /* rax = slot type */
+    e.cmp_rax_r8();                       /* == t_float ? */
+    const size_t j_notf = e.j8(0x75);     /* jne -> not float */
+    e.fload(xr, a.payload);               /* FAST: movsd xmm, [payload] */
+    const size_t j_done1 = e.j8(0xEB);    /* jmp done */
+    e.patch8(j_notf, e.pos());
+    e.cmp_rax_rsi();                      /* == t_int ? */
+    const size_t j_int = e.j8(0x74);      /* je -> promote */
+    e.exit_pc(bail_pc);                   /* neither -> bail */
+    e.patch8(j_int, e.pos());
+    e.cvt(xr, a.payload);                 /* cvtsi2sd xmm, [payload] */
+    e.patch8(j_done1, e.pos());
+}
+
+/* Store xmm<r> (a float result) into a scalar dst: t_float type +
+ * the double payload. A ref-listed dst (should not happen for a th==f
+ * scalar-writer) type-checks + bails, mirroring store_dst. */
+static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
+                             int dst, uint32_t bail_pc)
+{
+    const SlotAddr a = slot_addr(dst);
+    if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                           static_cast<int32_t>(dst))) {
+        e.load_type(a.type);
+        e.cmp_rax_r8();
+        const size_t j_ok = e.j8(0x74);   /* je -> already float, store */
+        e.exit_pc(bail_pc);
+        e.patch8(j_ok, e.pos());
+        e.fstore(xr, a.payload);
+        return;
+    }
+    e.store_r8_type(a.type);              /* type = t_float */
+    e.fstore(xr, a.payload);              /* payload = the double */
 }
 
 /* Emit one op; returns false if (unexpectedly) unhandled. */
@@ -434,6 +604,32 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::LoadImmFloat:
+        emit_float_load(e, X0, true, in.a_flit(), 0, pc);
+        emit_float_store(e, ck, X0, in.target, pc);
+        return true;
+
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI: {
+        uint8_t fop;   /* 0x58 addsd / 0x5C subsd / 0x59 mulsd */
+        switch (in.op) {
+        case OpCode::FloatAddRR: case OpCode::FloatAddRI: fop = 0x58; break;
+        case OpCode::FloatSubRR: case OpCode::FloatSubRI: fop = 0x5C; break;
+        case OpCode::FloatMulRR: case OpCode::FloatMulRI: fop = 0x59; break;
+        default:   /* FloatBin: by aop (add/sub/mul only - eligible) */
+            fop = in.aop == Op::plus ? 0x58
+                : in.aop == Op::minus ? 0x5C : 0x59;
+            break;
+        }
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
+        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        e.farith(fop);
+        emit_float_store(e, ck, X0, in.target, pc);
+        return true;
+    }
+
     default:
         return false;
     }
@@ -515,6 +711,19 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::JumpUnlessFloatCmp: {
+        /* jump to target when (a cmp b) is FALSE (the ordering compares;
+         * the swap trick makes NaN correctly jump - see float_cmp). */
+        const FCmp fc = float_cmp(in.aop);
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
+        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+        emit_cond_jump_raw(e, fc.near_op, fc.short_neg_op,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+        return;
+    }
+
     default:
         e.u8(0xCC);   /* unreachable by selection */
         return;
@@ -524,7 +733,25 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 static bool op_is_branch(OpCode op)
 {
     return op == OpCode::Jump || op == OpCode::JumpUnlessIntCmp
-        || op == OpCode::ForLoopStep || op == OpCode::IntAddStep;
+        || op == OpCode::ForLoopStep || op == OpCode::IntAddStep
+        || op == OpCode::JumpUnlessFloatCmp;
+}
+
+static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
+{
+    for (size_t pc = begin; pc < end; pc++) {
+        switch (ck.code[pc].op) {
+        case OpCode::FloatBin:
+        case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+        case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+        case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+        case OpCode::LoadImmFloat: case OpCode::JumpUnlessFloatCmp:
+            return true;
+        default:
+            break;
+        }
+    }
+    return false;
 }
 
 struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
@@ -582,6 +809,8 @@ void jit_compile_chunk(Chunk &chunk)
         const size_t begin = runs[r].begin, end = runs[r].end;
         frag_off[r] = e.pos();
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+        if (run_has_float(chunk, begin, end))     /* r8 = t_float (N3) */
+            e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
 
         std::vector<size_t> label(end - begin, 0);
         std::vector<Fixup> fixups;

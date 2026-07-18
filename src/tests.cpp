@@ -647,6 +647,25 @@ static const std::vector<test> tests =
     },
 
     {
+        /* NATIVE AOT N3 (plans/native-aot.md): float ordering compares
+         * over a NaN must all be FALSE (IEEE) on the VM+JIT exactly as
+         * on the tree-walker - the ucomisd swap trick avoids the NaN
+         * trap. The counter loop keeps the compares inside a fragment. */
+        "jit: NaN float compares are all false (VM+JIT == tree-walker)",
+        {
+            "var x = sqrt(0.0 - 1.0);",   /* NaN */
+            "var lt = 0; var gt = 0; var ge = 0; var le = 0;",
+            "for (var i = 0; i < 4; i++) {",
+            "    if (x < 1.0) lt = lt + 1;",
+            "    if (x > 1.0) gt = gt + 1;",
+            "    if (x >= 1.0) ge = ge + 1;",
+            "    if (x <= 1.0) le = le + 1;",
+            "}",
+            "assert(lt == 0 && gt == 0 && ge == 0 && le == 0);",
+        },
+    },
+
+    {
         /* NATIVE AOT N1 (plans/native-aot.md): a negative shift count
          * inside a JIT-eligible run BAILS to the interpreter, which
          * re-executes the op and throws InvalidValueEx with the normal
