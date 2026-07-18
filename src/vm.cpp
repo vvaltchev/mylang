@@ -479,8 +479,13 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
         LValue &d = ctx.frame->at(dst);
         const EvalValue &cur = d.get();
         if (cur.is<intrusive_ptr<StructObject>>()) {
+            /* get_ref (NOT get<T>): a by-value get() would COPY the handle,
+             * bumping use_count to 2, so the reuse check below could never
+             * fire - H1 dst-reuse was silently dead, allocating a fresh
+             * StructObject every `var p = Point(..)` iteration. The sibling
+             * container-literal H1 (below) already uses get_ref. */
             const intrusive_ptr<StructObject> &so =
-                cur.get<intrusive_ptr<StructObject>>();
+                cur.get_ref<intrusive_ptr<StructObject>>();
             if (so->def == def && !so->readonly && so.use_count() == 1) {
                 char *bytes = so->bytes.data();
                 for (int_type i = 0; i < nf; i++)
