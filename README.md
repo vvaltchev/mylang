@@ -1601,7 +1601,8 @@ exceptions that can be caught with `try-catch` blocks is:
 Other exceptions like `SyntaxErrorEx` cannot be caught, instead.
 
 `StackOverflowEx` ("Maximum call depth exceeded") is raised by the bytecode
-VM (`-vm`) when a call recurses past the VM stack limit — a clean, catchable
+VM (the DEFAULT engine; `-tw` selects the tree-walking interpreter instead)
+when a call recurses past the VM stack limit — a clean, catchable
 error with a normal backtrace, where a runaway recursion previously crashed
 the process. The limit defaults to 1M value slots (roughly 50-100K frames,
 far deeper than the old process-stack bound) and can be changed with the

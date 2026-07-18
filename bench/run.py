@@ -225,10 +225,16 @@ def main():
                     help="a 2nd mylang binary to compare against (before/after); "
                          "adds base(s) and cur/base (speedup) columns")
     ap.add_argument("--vm", action="store_true",
-                    help="run the current mylang with -vm (the bytecode VM). "
-                         "Pair with --baseline <same binary> to gate the VM "
-                         "vs the tree-walker: cur/base = VM/tree-walk "
-                         "(<1 == VM faster). The baseline is NOT given -vm.")
+                    help="run the current mylang with an explicit -vm (the "
+                         "DEFAULT engine since 2026-07-18 - useful for a "
+                         "pre-flip binary, whose default was the "
+                         "tree-walker). Pair with --baseline <same binary> "
+                         "to gate the VM vs the tree-walker: cur/base = "
+                         "VM/tree-walk (<1 == VM faster). With --vm the "
+                         "baseline runs -tw (it must be a post-flip binary).")
+    ap.add_argument("--tw", action="store_true",
+                    help="run the current mylang with -tw (the tree-walking "
+                         "interpreter).")
     ap.add_argument("--python", default=sys.executable,
                     help="python interpreter to compare against")
     ap.add_argument("--timeout", type=float, default=120.0,
@@ -259,11 +265,14 @@ def main():
         sys.exit("no benchmarks matched")
 
     scale_arg = str(args.scale)
-    print("mylang : %s%s" % (mylang, "  (engine: -vm bytecode VM)"
-                             if args.vm else ""))
+    print("mylang : %s%s" % (mylang,
+                             "  (engine: -vm bytecode VM)" if args.vm
+                             else "  (engine: -tw tree-walker)" if args.tw
+                             else "  (engine: the default = bytecode VM)"))
     if has_base:
         print("baseline: %s%s" % (args.baseline,
-                                  "  (engine: tree-walker)" if args.vm else ""))
+                                  "  (engine: -tw tree-walker)"
+                                  if args.vm else ""))
     print("python : %s" % args.python)
     print("scale  : %d    repeat (best of): %d\n" % (args.scale, args.repeat))
 
@@ -288,15 +297,22 @@ def main():
         my_path = os.path.join(MY_DIR, name + ".my")
         py_path = os.path.join(PY_DIR, name + ".py")
 
-        # The current mylang runs under -vm when requested; the baseline never
-        # does, so `--vm --baseline <same binary>` gates VM against tree-walker.
-        my_cmd = [mylang] + (["-vm"] if args.vm else []) + [my_path, scale_arg]
+        # Engine flags (the VM is the binary's DEFAULT since 2026-07-18):
+        # --vm passes it explicitly (needed for a PRE-flip binary, whose
+        # default was the tree-walker - the cross-flip A/B recipe is `--vm`
+        # on both sides); --tw runs the tree-walker. With --vm the BASELINE
+        # runs -tw, so `--vm --baseline <same binary>` still gates the VM
+        # against the tree-walker exactly as before the flip.
+        eng = ["-vm"] if args.vm else (["-tw"] if args.tw else [])
+        my_cmd = [mylang] + eng + [my_path, scale_arg]
         my_t, my_out, my_err = time_cmd(my_cmd, args.repeat, args.timeout)
 
         base_t = None
         if has_base:
+            beng = ["-tw"] if args.vm else []
             base_t, _bout, _berr = time_cmd(
-                [args.baseline, my_path, scale_arg], args.repeat, args.timeout)
+                [args.baseline] + beng + [my_path, scale_arg],
+                args.repeat, args.timeout)
 
         if os.path.isfile(py_path):
             # -B: don't read/write __pycache__. MyLang re-parses its source on

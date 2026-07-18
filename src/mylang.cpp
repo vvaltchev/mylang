@@ -37,7 +37,8 @@ static bool opt_debug_ti;
 static bool opt_analyze;
 static bool opt_no_color;
 static bool opt_repl;
-static bool opt_vm;   /* execute via the bytecode VM instead of the tree-walker */
+static bool opt_vm;   /* -vm: explicit VM (the DEFAULT since 2026-07-18) */
+static bool opt_tw;   /* -tw: run via the TREE-WALKER instead of the VM */
 static bool opt_vm_disasm;   /* -vd: print the bytecode disassembly, no run */
 
 static std::vector<string> lines;
@@ -74,9 +75,10 @@ void help()
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
-    cout << "  -vm      Execute via the bytecode VM (experimental; default is"
+    cout << "  -vm      Execute via the bytecode VM (the DEFAULT)." << endl;
+    cout << "  -tw      Execute via the tree-walking interpreter instead"
          << endl;
-    cout << "           the tree-walker). See plans/bytecode-vm.md" << endl;
+    cout << "           of the VM. See plans/bytecode-vm.md" << endl;
     cout << "  -vd      Dump the VM bytecode disassembly, then exit" << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
     cout << " -dti      Dump inferred types of all identifiers, then exit"
@@ -218,7 +220,23 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "-vm")) {
 
-            opt_vm = true;   /* run via the bytecode VM (plans/bytecode-vm) */
+            opt_vm = true;   /* explicit VM - the default; kept for scripts/
+                              * CI written before the 2026-07-18 flip */
+
+            if (opt_vm && opt_tw) {
+                cout << "-vm and -tw are mutually exclusive" << endl;
+                exit(1);
+            }
+
+        } else if (!strcmp(arg, "-tw")) {
+
+            opt_tw = true;   /* run via the tree-walker (the pre-flip
+                              * default; also the const-eval/REPL engine) */
+
+            if (opt_vm && opt_tw) {
+                cout << "-vm and -tw are mutually exclusive" << endl;
+                exit(1);
+            }
 
         } else if (!strcmp(arg, "-vd")) {
 
@@ -438,12 +456,15 @@ int main(int argc, char **argv)
                 return 0;
             }
 
-            /* Execution engine: the tree-walker by default, or the bytecode VM
-             * when -vm is given. The VM runs the SAME optimized AST (it lowers
-             * `root`), so behavior is identical - see plans/bytecode-vm.md.
-             * g_exec_engine tells do_func_call to run function bodies via the
-             * VM too (Phase 4), not just the top-level chunk. */
-            if (opt_vm) {
+            /* Execution engine: the bytecode VM by DEFAULT (flipped
+             * 2026-07-18 - full parity + ~2.2x the tree-walker on the
+             * bench geomean, the two documented flip conditions), or the
+             * tree-walker under -tw. The VM runs the SAME optimized AST
+             * (it lowers `root`), so behavior is identical - see
+             * plans/bytecode-vm.md. g_exec_engine tells do_func_call to
+             * run function bodies via the VM too, not just the top-level
+             * chunk. */
+            if (!opt_tw) {
                 g_exec_engine = ExecEngine::Vm;
                 prog = vm_compile(root.get());
                 /* ASSERTS builds: free + zero the WHOLE AST and assert

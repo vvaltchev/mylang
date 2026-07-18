@@ -442,8 +442,12 @@ Running scripts:
                                  # (recursion still unrolls; for measurement)
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
 ./build/mylang -nr FILE          # parse/validate only, don't run
-./build/mylang -vm FILE          # execute via the bytecode VM (experimental;
-                                 # default is the tree-walker) — bytecode-vm.md
+./build/mylang -vm FILE          # execute via the bytecode VM — the
+                                 # DEFAULT engine (flipped 2026-07-18);
+                                 # kept for pre-flip scripts/CI
+./build/mylang -tw FILE          # execute via the TREE-WALKER instead (the
+                                 # pre-flip default; still the const-eval +
+                                 # REPL engine, and the differential oracle)
 ./build/mylang -vd FILE          # dump the VM bytecode disassembly (the
                                  # bytecode analogue of -s), exit — disasm.h;
                                  # dumps 100% of the serializable image: the
@@ -590,10 +594,13 @@ denominator drifts several percent day to day on this box; it masked a real
 now prints with THREE digits (0.256x / ~3.91x) for exactly this. A phase
 does not land on a probe geomean.
 
-**`--vm` — the bytecode-VM performance gate.** `run.py --vm` runs the current
-mylang binary with `-vm` (the bytecode VM). Combined with `--baseline <the same
-binary>`, the baseline runs WITHOUT `-vm` (the tree-walker), so the `cur/base`
-column and geomean are **VM / tree-walker** (<1 == VM faster). This is the
+**`--vm` — the bytecode-VM performance gate.** `run.py` measures the VM by
+DEFAULT (the binary's default engine since the 2026-07-18 flip); `--vm`
+passes the flag explicitly (needed for a PRE-flip binary in a cross-flip
+A/B — pass `--vm` on both sides), and `--tw` runs the tree-walker. Combined
+with `--baseline <the same post-flip binary>`, `--vm` gives the baseline
+`-tw`, so the `cur/base` column and geomean are **VM / tree-walker** (<1 ==
+VM faster). This is the
 per-phase performance gate for the VM build-out (see "Execution strategy" +
 `plans/bytecode-vm.md`): run it release + `ASSERTS=0` at the end of each phase;
 a phase must not regress the tree-walker unless the regression is flagged as
@@ -3998,11 +4005,16 @@ the base slot; the handler forms the element `LValue*` by calling the runtime
 `Type::subscript(base, idx, for_write=false)` directly — the SAME COW the
 tree-walker's `Subscript::do_eval` uses — then `func_lv`. Still fallbacks: a
 MEMBER target (`append(s.f, x)`), `insert`/`erase` with a subscript target, a
-NESTED base (`a[i][j]`), and struct construction. Gated by
-the
-`-vm` flag (the tree-walker is the default); once the VM is at full parity
-**and** faster on the bench geomean, the default flips and `-tw` selects the
-tree-walker. Implemented in its **own files** — `bytecode.h` (the `OpCode`
+NESTED base (`a[i][j]`), and struct construction. **THE DEFAULT
+FLIPPED 2026-07-18**: a script/`-e` run executes on the VM (both documented
+conditions long met — full parity + the VM ~2.2x the tree-walker on the
+bench geomean, suite 5.0x CPython); `-tw` selects the tree-walker, `-vm` is
+accepted as the explicit default (pre-flip scripts/CI), the two are
+mutually exclusive. The REPL and parse-time const-eval remain tree-walker
+by design (they need the AST). `tests/nested_fuzz.py`'s tw lane passes
+`-tw` explicitly; `bench/run.py` runs the VM by default (`--tw` for the
+tree-walker; `--vm --baseline <same post-flip binary>` still gates VM vs
+tree-walker — the baseline now gets `-tw`). Implemented in its **own files** — `bytecode.h` (the `OpCode`
 enum — named `OpCode`, since `Op` is already the operator enum in
 `operators.h` — plus `Instr`/`Chunk`), `codegen.{h,cpp}` (`codegen_program`,
 AST→`Chunk` lowering), `vm.{h,cpp}` (`vm_execute` + the `g_exec_engine`

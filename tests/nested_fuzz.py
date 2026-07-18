@@ -15,7 +15,9 @@ It generates random, DEEPLY-NESTED MyLang programs full of side effects (fixed
 + growing arrays, a dict, many scalar accumulators, per-level temp variables,
 break/continue) together with their EXACT Python twins, then checks
 
-        tree-walker result  ==  VM (-vm) result  ==  CPython result
+        tree-walker (-tw) result  ==  VM result  ==  CPython result
+   (the VM is the script DEFAULT since 2026-07-18; -tw selects the
+   tree-walker, so the tw lane must pass it explicitly)
 
 for every program. The generator stays strictly inside the documented
 MyLang/Python equivalence subset (see bench/README.md), so a mismatch is a real
@@ -557,7 +559,7 @@ def main():
 
         results = {}
         if "tw" in engines:
-            results["tw"] = run([args.mylang], my_path)
+            results["tw"] = run([args.mylang, "-tw"], my_path)
         if "vm" in engines:
             results["vm"] = run([args.mylang, "-vm"], my_path)
         if "py" in engines:

@@ -15284,7 +15284,8 @@ void run_tests(bool dump_syntax_tree)
 
     g_exec_engine = ExecEngine::TreeWalk;
 
-    cout << "VM differential (same " << tests.size() << " tests via -vm): "
+    cout << "VM differential (same " << tests.size()
+         << " tests via the -vm engine, the script DEFAULT): "
          << vm_pass << "/" << tests.size() << " ";
     cout << (vm_pass == tests.size() ? "[ PASS ]" : "[ FAIL ]") << endl;
 
