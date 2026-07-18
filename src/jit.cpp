@@ -1348,6 +1348,51 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
     return false;
 }
 
+/* Approach A: an op the fragment handles WITHOUT ever returning an interior
+ * pc - a non-throwing int op (arith / imm-shift / mod-by-nonzero-imm /
+ * loop / branch / imm-load). Such an op has no re-interpret bail AND no
+ * jit_raise (so no per-op caret is needed). A run built ONLY of these can
+ * have its interpreted originals DELETED - the interpreter never re-runs
+ * them. EXCLUDED (they can bail-to-reinterpret or jit_raise, so their
+ * originals must stay): reg-shift (negative-count raise), LoadElem (slice/
+ * kind re-interpret + OOB raise), every float op (float_load's bool/other
+ * safety-net bail), generic IntBin (div/mod can throw). */
+static bool op_fully_native(OpCode op)
+{
+    switch (op) {
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+    case OpCode::IntModRI: case OpCode::IntAddModRI:
+    case OpCode::LoadImmInt: case OpCode::Jump:
+    case OpCode::JumpUnlessIntCmp: case OpCode::ForLoopStep:
+    case OpCode::IntAddStep:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The pc TARGET of a branch-family op (the audited list that the nc rebuild
+ * remaps), or -1. Used by the single-entry check. */
+static int branch_pc_target(const Instr &in)
+{
+    switch (in.op) {
+    case OpCode::Jump: case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp: case OpCode::JumpUnlessTrueV:
+    case OpCode::JumpIfNotNoneV: case OpCode::ForLoopStep:
+    case OpCode::DictIterNext: case OpCode::ForeachDynNext:
+    case OpCode::CatchTest: case OpCode::PushHandler:
+    case OpCode::JumpUnlessElemInt: case OpCode::IntAddStep:
+    case OpCode::ForStepElemInt:
+        return in.target;
+    default:
+        return -1;
+    }
+}
+
 struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
 
 static constexpr size_t MIN_RUN = 4;
@@ -1380,14 +1425,52 @@ void jit_compile_chunk(Chunk &chunk)
     if (runs.empty())
         return;
 
-    /* pc remap: every run head gains one inserted EnterNative. */
+    /* Approach A: a run is DELETABLE (its interpreted originals removed - no
+     * double copy) iff the fragment NEVER returns an interior pc, i.e. every
+     * op is `op_fully_native` (no re-interpret bail, no jit_raise) AND the
+     * run is SINGLE-ENTRY (no branch from OUTSIDE it targets an INTERIOR pc;
+     * an external branch to the HEAD is fine - it hits the EnterNative). A
+     * deletable run's ops are dropped from the rebuilt bytecode. */
+    std::vector<char> deletable(runs.size(), 0);
+    for (size_t r = 0; r < runs.size(); r++) {
+        const size_t b = runs[r].begin, en = runs[r].end;
+        bool ok = true;
+        for (size_t p = b; p < en && ok; p++)
+            if (!op_fully_native(chunk.code[p].op))
+                ok = false;
+        for (size_t p = 0; p < n && ok; p++) {   /* single-entry */
+            const int t = branch_pc_target(chunk.code[p]);
+            if (t > static_cast<int>(b) && t < static_cast<int>(en)
+                    && (p < b || p >= en))
+                ok = false;                       /* external -> interior */
+        }
+        deletable[r] = ok;
+    }
+
+    /* pc remap: every run head gains one inserted EnterNative; a DELETABLE
+     * run's interior ops are removed, so every one of its pcs maps to the
+     * EnterNative (only the head is ever a target - single-entry). */
     std::vector<int> remap(n + 1);
     {
-        size_t r = 0;
-        int shift = 0;
-        for (size_t pc = 0; pc <= n; pc++) {
-            if (r < runs.size() && pc == runs[r].begin) { shift++; r++; }
-            remap[pc] = static_cast<int>(pc) + shift;
+        size_t r = 0, pc = 0;
+        int np = 0;                               /* next NEW pc */
+        while (pc <= n) {
+            if (r < runs.size() && pc == runs[r].begin) {
+                const size_t b = runs[r].begin, en = runs[r].end;
+                const int en_pc = np++;           /* the EnterNative */
+                if (deletable[r]) {
+                    for (size_t p = b; p < en; p++)
+                        remap[p] = en_pc;         /* all -> EnterNative */
+                } else {
+                    for (size_t p = b; p < en; p++)
+                        remap[p] = np++;          /* ops kept after it */
+                }
+                pc = en;
+                r++;
+                continue;
+            }
+            remap[pc] = np++;
+            pc++;
         }
     }
 
@@ -1467,8 +1550,8 @@ void jit_compile_chunk(Chunk &chunk)
     std::vector<Instr> nc;
     nc.reserve(n + runs.size());
     {
-        size_t r = 0;
-        for (size_t pc = 0; pc < n; pc++) {
+        size_t r = 0, pc = 0;
+        while (pc < n) {
             if (r < runs.size() && pc == runs[r].begin) {
                 Instr en;
                 en.op = OpCode::EnterNative;
@@ -1478,7 +1561,10 @@ void jit_compile_chunk(Chunk &chunk)
                 off.lit = static_cast<int_type>(frag_off[r]);
                 en.set_a(off);
                 nc.push_back(en);
+                const bool del = deletable[r];
+                const size_t rend = runs[r].end;
                 r++;
+                if (del) { pc = rend; continue; }  /* drop the originals */
             }
             Instr in = chunk.code[pc];
             switch (in.op) {
@@ -1502,6 +1588,7 @@ void jit_compile_chunk(Chunk &chunk)
                 break;
             }
             nc.push_back(in);
+            pc++;
         }
     }
     chunk.code = std::move(nc);

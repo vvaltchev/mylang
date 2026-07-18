@@ -300,8 +300,17 @@ prove → the VM instruction stays (the only fallback). NO runtime bail.
   div-by-reg isn't compiled), so nothing to convert there yet.
 - **arrays/dicts/strings**: don't nativize the data structures — CALL the
   same C++ the interpreter calls (a helper per op). (NEXT.)
-- **delete the interpreted originals** for a fully-native run (single-entry;
-  a rare interior external target splits the run). (IN PROGRESS.)
+- **delete the interpreted originals** for a fully-native run. (DONE.) A run
+  is DELETABLE iff every op is `op_fully_native` (a non-throwing int op - no
+  re-interpret bail, no jit_raise; excludes reg-shift / LoadElem / all float
+  / generic IntBin) AND it is SINGLE-ENTRY (no branch from OUTSIDE targets an
+  INTERIOR pc; a branch to the head hits the EnterNative). Such a run's ops
+  are dropped from the rebuilt bytecode (the remap maps every run pc to the
+  EnterNative), so `-vd` of a native int loop is now just `enter.nat` (use
+  `-vdj` to see the fragment) - no double copy, `.myv`-ready. Non-fully-
+  native runs (float, array reads) keep their originals until their hard
+  cases are nativized. Validated: nested_fuzz 5000, 6-config matrix, a
+  `jit:` regression test.
 
 ## Native MyLang calls (`call <offset>`) — the design
 
