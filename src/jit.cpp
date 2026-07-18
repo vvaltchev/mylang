@@ -189,6 +189,57 @@ static void op_rr(Emitter &e, Op aop)
     }
 }
 
+/* Condition-code opcodes for `a <cmp> b` (near 0F 8x / short 7x forms)
+ * and the negation. int_type is SIGNED, so the signed jcc set. */
+struct CC { uint8_t near_op, short_op; };
+
+static CC cc_for(Op o)
+{
+    switch (o) {
+    case Op::lt:    return { 0x8C, 0x7C };   /* jl  */
+    case Op::le:    return { 0x8E, 0x7E };   /* jle */
+    case Op::gt:    return { 0x8F, 0x7F };   /* jg  */
+    case Op::ge:    return { 0x8D, 0x7D };   /* jge */
+    case Op::eq:    return { 0x84, 0x74 };   /* je  */
+    default:        return { 0x85, 0x75 };   /* jne (noteq) */
+    }
+}
+
+static Op cc_negate(Op o)
+{
+    switch (o) {
+    case Op::lt:    return Op::ge;
+    case Op::le:    return Op::gt;
+    case Op::gt:    return Op::le;
+    case Op::ge:    return Op::lt;
+    case Op::eq:    return Op::noteq;
+    default:        return Op::eq;           /* noteq */
+    }
+}
+
+/* A branch that jumps to `target_pc` when `cc` holds (else falls
+ * through). INTERNAL target (inside [begin,end)) -> a fragment-local
+ * near jcc whose rel32 is patched from `label[]` afterwards (recorded in
+ * `fixups`). EXTERNAL target -> `j<negated cc> +6` over a 6-byte
+ * exit_pc(remap[target]) (skip the exit when NOT jumping). */
+struct Fixup { size_t site; size_t target_pc; };
+
+static void emit_cond_jump(Emitter &e, Op cc, size_t target_pc,
+                           size_t begin, size_t end,
+                           const std::vector<int> &remap,
+                           std::vector<Fixup> &fixups)
+{
+    if (target_pc >= begin && target_pc < end) {
+        e.u8(0x0F); e.u8(cc_for(cc).near_op);
+        fixups.push_back({ e.pos(), target_pc });
+        e.u32(0);
+    } else {
+        e.u8(cc_for(cc_negate(cc)).short_op);
+        e.u8(0x06);                          /* skip the 6-byte exit */
+        e.exit_pc(static_cast<uint32_t>(remap[target_pc]));
+    }
+}
+
 /* -------------------------- run selection --------------------------- */
 
 static bool imm_shift_ok(int_type v) { return v >= 0; }
@@ -202,6 +253,12 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
     case OpCode::IntShlRR: case OpCode::IntShrRR:
     case OpCode::LoadImmInt:
+    /* N2: control flow - intra-run branches become fragment-local
+     * jumps, so a whole int loop iterates in machine code (the native
+     * back edge). A branch to a pc OUTSIDE the run exits to the
+     * interpreter (exit_pc). */
+    case OpCode::Jump: case OpCode::JumpUnlessIntCmp:
+    case OpCode::ForLoopStep: case OpCode::IntAddStep:
         return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
@@ -384,6 +441,92 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
 /* ------------------------- the chunk pass --------------------------- */
 
+/* Emit a control-flow op. `pc` is the OLD pc; label[]/fixups resolve
+ * internal targets, remap[] the external exits. The counter/accumulator
+ * stores use store_dst (their slots are scalar-writers -> not ref-listed
+ * -> the branchless two-store; RSI holds t_int, set once at fragment
+ * entry and preserved across the loop). */
+static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
+                        uint32_t pc, size_t begin, size_t end,
+                        const std::vector<int> &remap,
+                        std::vector<Fixup> &fixups)
+{
+    switch (in.op) {
+
+    case OpCode::Jump: {
+        const size_t tgt = static_cast<size_t>(in.target);
+        if (tgt >= begin && tgt < end) {
+            e.u8(0xE9);
+            fixups.push_back({ e.pos(), tgt });
+            e.u32(0);
+        } else {
+            e.exit_pc(static_cast<uint32_t>(remap[in.target]));
+        }
+        return;
+    }
+
+    case OpCode::JumpUnlessIntCmp: {
+        /* jump to target when (a cmp b) is FALSE == when negate(cmp). */
+        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+        emit_cond_jump(e, cc_negate(in.aop),
+                       static_cast<size_t>(in.target), begin, end,
+                       remap, fixups);
+        return;
+    }
+
+    case OpCode::ForLoopStep: {
+        /* i (target2) += step (b)  [lt/le]  or -= step  [ge/gt]; then
+         * jump to target (the back edge) when (i aop bound(a)). */
+        const bool up = in.aop == Op::lt || in.aop == Op::le;
+        e.load(RAX, slot_addr(in.target2).payload);
+        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        op_rr(e, up ? Op::plus : Op::minus);     /* rax += / -= rcx */
+        store_dst(e, ck, RAX, in.target2, pc);
+        load_operand(e, RCX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+        emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
+                       begin, end, remap, fixups);
+        return;
+    }
+
+    case OpCode::IntAddStep: {
+        /* adst (a_dual_lo) += rhs (b); i (target2) ++/-- ; jump to
+         * target when (i aop bound). bound = a_dual_hi (imm if a_is_lit
+         * else slot). step is always 1. */
+        const bool up = in.aop == Op::lt || in.aop == Op::le;
+        const int adst = in.a_dual_lo();
+        e.load(RAX, slot_addr(adst).payload);
+        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        op_rr(e, Op::plus);
+        store_dst(e, ck, RAX, adst, pc);
+        e.load(RAX, slot_addr(in.target2).payload);
+        e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
+        store_dst(e, ck, RAX, in.target2, pc);
+        if (in.a_is_lit())
+            e.movabs(RCX, static_cast<uint64_t>(
+                              static_cast<int_type>(in.a_dual_hi())));
+        else
+            e.load(RCX, slot_addr(in.a_dual_hi()).payload);
+        e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
+        emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
+                       begin, end, remap, fixups);
+        return;
+    }
+
+    default:
+        e.u8(0xCC);   /* unreachable by selection */
+        return;
+    }
+}
+
+static bool op_is_branch(OpCode op)
+{
+    return op == OpCode::Jump || op == OpCode::JumpUnlessIntCmp
+        || op == OpCode::ForLoopStep || op == OpCode::IntAddStep;
+}
+
 struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
 
 static constexpr size_t MIN_RUN = 4;
@@ -395,43 +538,19 @@ void jit_compile_chunk(Chunk &chunk)
 
     const size_t n = chunk.code.size();
 
-    /* Branch targets (any pc field) split runs: a fragment has exactly
-     * one entry, its head. visit_pc_fields is the audited enumeration -
-     * shared with the peephole via codegen.cpp; a local copy of the walk
-     * would drift, so it lives in bytecode.h... it does not: re-walk the
-     * few branching ops here against the SAME field list. */
-    std::vector<char> is_tgt(n + 1, 0);
-    for (const Instr &in : chunk.code) {
-        switch (in.op) {
-        case OpCode::Jump:
-        case OpCode::JumpUnlessIntCmp:
-        case OpCode::JumpUnlessFloatCmp:
-        case OpCode::JumpUnlessTrueV:
-        case OpCode::JumpIfNotNoneV:
-        case OpCode::ForLoopStep:
-        case OpCode::DictIterNext:
-        case OpCode::ForeachDynNext:
-        case OpCode::CatchTest:
-        case OpCode::PushHandler:
-        case OpCode::JumpUnlessElemInt:
-        case OpCode::IntAddStep:
-        case OpCode::ForStepElemInt:
-            if (in.target >= 0 && static_cast<size_t>(in.target) <= n)
-                is_tgt[in.target] = 1;
-            break;
-        default:
-            break;
-        }
-    }
-
-    /* Maximal straight-line runs of eligible ops; an interior branch
-     * target truncates (the pc becomes a new run's head). */
+    /* N2: maximal contiguous runs of eligible ops. Branch TARGETS inside
+     * a run are fine now (a fragment-local jump); the run is entered
+     * natively ONLY at its head (via the inserted EnterNative), and every
+     * interior op ALSO survives as an interpreted original, so an external
+     * branch to an interior pc (or a bail) simply resumes interpreted -
+     * no single-entry constraint is needed for correctness. A branch to a
+     * pc outside its run exits to the interpreter (exit_pc). */
     std::vector<Run> runs;
     size_t i = 0;
     while (i < n) {
         if (!jit_op_eligible(chunk.code[i])) { i++; continue; }
         size_t j = i + 1;
-        while (j < n && jit_op_eligible(chunk.code[j]) && !is_tgt[j])
+        while (j < n && jit_op_eligible(chunk.code[j]))
             j++;
         if (j - i >= MIN_RUN)
             runs.push_back({i, j});
@@ -451,18 +570,40 @@ void jit_compile_chunk(Chunk &chunk)
         }
     }
 
-    /* Emit the fragments (exits/bails in NEW pc space). */
+    /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
+     * across the loop - no op clobbers it - so the native back edge, a
+     * jump to label[begin] AFTER this movabs, keeps it live); record each
+     * op's fragment offset in label[]; branch ops emit local jumps
+     * (patched from label[] after) or exit_pc; a trailing exit_pc handles
+     * fall-through off the end. */
     Emitter e;
     std::vector<size_t> frag_off(runs.size());
     for (size_t r = 0; r < runs.size(); r++) {
+        const size_t begin = runs[r].begin, end = runs[r].end;
         frag_off[r] = e.pos();
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-        for (size_t pc = runs[r].begin; pc < runs[r].end; pc++) {
-            if (!emit_op(e, chunk, chunk.code[pc],
-                         static_cast<uint32_t>(remap[pc])))
-                { e.b.clear(); return; }   /* selection bug: give up */
+
+        std::vector<size_t> label(end - begin, 0);
+        std::vector<Fixup> fixups;
+        for (size_t pc = begin; pc < end; pc++) {
+            label[pc - begin] = e.pos();
+            const Instr &in = chunk.code[pc];
+            if (op_is_branch(in.op)) {
+                emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
+                            begin, end, remap, fixups);
+            } else if (!emit_op(e, chunk, in,
+                                static_cast<uint32_t>(remap[pc]))) {
+                e.b.clear();
+                return;                    /* selection bug: give up */
+            }
         }
-        e.exit_pc(static_cast<uint32_t>(remap[runs[r].end]));
+        e.exit_pc(static_cast<uint32_t>(remap[end]));   /* fall-through */
+
+        for (const Fixup &f : fixups) {    /* patch internal jumps */
+            const size_t dst = label[f.target_pc - begin];
+            e.patch32(f.site,
+                      static_cast<uint32_t>(dst - (f.site + 4)));
+        }
         g_jit_frags++;
     }
 
