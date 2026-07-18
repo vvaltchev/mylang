@@ -379,6 +379,44 @@ native only WITHIN a frame. It buys nothing on call overhead; it is the
 status quo, not a native call. The real native call is the `call <offset>`
 design above, gated on fully-native callee bodies.
 
+## The endgame INVERSION: native CONTAINERS with bytecode islands
+
+Today's model is "BYTECODE with native ISLANDS" (a bytecode chunk, some runs
+replaced by `EnterNative`). The maintainer's endgame is the INVERSE: "NATIVE
+with bytecode ISLANDS" - EVERY function becomes a single `call`-able native
+BLOB (a native container), and the ops that CAN'T be nativized are delegated,
+NOT left to keep the whole function interpreted. Never sacrifice
+whole-function nativization for a few un-nativizable ops. The delegation
+mechanisms (compose freely):
+- **A native C++ HANDLER per hard op** (approach A - ref-release, exceptions,
+  and next: array/dict/string ops = CALL the same C++ the interpreter runs).
+- **A GENERIC bytecode-block executor** - `vm_exec_block(ctx, chunk, from_pc,
+  to_pc)` runs a maximal single-entry/single-exit run of un-nativizable ops
+  in the interpreter and returns (exception status via the checked-return).
+  The native container `call`s it for each island. This is the catch-all: any
+  op the JIT doesn't lower natively becomes a call into the VM for that block.
+- **The island BYTECODE is kept** (in the chunk, or a const blob the native
+  code points to / inline `.byte`) - this is NOT the double-copy anti-pattern:
+  the island bytecode is the ACTUAL implementation of those ops (stored once),
+  REACHED only via the native `call`, never as a parallel interpreted path.
+  (Delete-originals removes the bytecode of a FULLY-native run; a MIXED
+  function keeps its island bytecode - the two are complementary.)
+- **Operands via registers, not immediates** - pass an island's live values /
+  a pc in registers where it avoids re-reading the chunk.
+
+So the endgame: 100% of functions are native containers; a fully-native run
+is pure machine code, a mixed function is machine code + `vm_exec_block`-call
+islands. Native `call <offset>` then applies to EVERY function (not only
+pure-int ones), because every function is a `call`-able native blob.
+
+**Codegen technique - COPY-AND-PATCH (deferred, but the likely path there).**
+Hand-emitting each op's bytes (today) is verbose + fragile. The alternative:
+pre-compile a TEMPLATE per op (a C++ stencil compiled to machine code), then
+at JIT time COPY the template and PATCH its operand holes - the "copy-and-
+patch" JIT (Xu & Kjolstad 2021; CPython 3.13's JIT). It scales the op
+coverage far faster than hand-assembly and is how "native container for every
+op" becomes tractable. Evaluate when the hand-emitted tier's op set gets wide.
+
 ## The path to 10x — why it is NOT the N-series (N6/N7 sketch)
 
 MEASURED reality (same-binary JIT off→on): the JIT already delivers
