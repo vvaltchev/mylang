@@ -153,6 +153,13 @@ static const JitLayout &jit_layout()
     return L;
 }
 
+/* -vdj: the Type-tag singletons the emitter bakes (see jit.h). */
+void jit_type_singletons(const void *&ti, const void *&tf, const void *&ta)
+{
+    const JitLayout &L = jit_layout();
+    ti = L.t_int; tf = L.t_float; ta = L.t_arr;
+}
+
 /* ---------------------------- the emitter ---------------------------- */
 
 /*
@@ -1033,6 +1040,11 @@ void jit_compile_chunk(Chunk &chunk)
 
 void jit_compile_chunk(Chunk &)
 {
+}
+
+void jit_type_singletons(const void *&ti, const void *&tf, const void *&ta)
+{
+    ti = tf = ta = nullptr;
 }
 
 #endif

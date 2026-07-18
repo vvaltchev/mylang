@@ -30,6 +30,13 @@ extern bool g_jit_enabled;
  * interleave the native code with the VM ops. Off (zero cost) normally. */
 extern bool g_jit_annotate;
 
+/* The Type-tag singletons the emitter bakes into `movabs` immediates
+ * (rsi = int, r8 = float, r9 = array). The -vdj disassembler compares an
+ * immediate against these to label it `<int-tag>` etc. rather than a raw
+ * address. All null off-platform (no fragments there). */
+void jit_type_singletons(const void *&t_int, const void *&t_float,
+                         const void *&t_arr);
+
 /* Fragments compiled process-wide (tests / -vd audit). */
 extern unsigned long g_jit_frags;
 
