@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "disasm.h"
-#include "codegen.h"      /* codegen_program / codegen_chunk */
+#include "codegen.h"
+#include "eval.h"      /* builtin_slot / find_builtin_name */      /* codegen_program / codegen_chunk */
 #include "coderender.h"   /* render_construct_code - shared AST decompiler */
 #include "syntax.h"
 #include "structtype.h"   /* StructTypeDef / FieldDef (the custom-type dump) */
@@ -31,16 +32,30 @@ std::string reg(const Chunk &ch, int_type slot)
  * `#N`. The immediate is rendered by its lit_kind (int / float / bool), so a
  * boxed op's `#3` / `#1.5` / `#true` prints correctly. (`is_float` is now
  * subsumed by lit_kind, kept only for call-site compatibility.) */
+/* A float literal that reads AS a float: an integral value keeps a
+ * trailing ".0" (so `2.0` doesn't render as the int-looking `2`). */
+std::string flit_str(float_type f)
+{
+    std::ostringstream s;
+    s << f;
+    const std::string t = s.str();
+    if (t.find('.') == std::string::npos && t.find('e') == std::string::npos
+            && t.find("inf") == std::string::npos
+            && t.find("nan") == std::string::npos)
+        return t + ".0";
+    return t;
+}
+
 std::string reg_or_imm(const Chunk &ch, const Operand &o, bool /*is_float*/)
 {
     if (!o.is_lit)
         return reg(ch, o.slot);
     std::ostringstream s;
-    s << "#";
     switch (o.lit_kind) {
-    case Operand::LitKind::f: s << o.flit; break;
+    case Operand::LitKind::f: s << flit_str(o.flit); break;
     case Operand::LitKind::b: s << (o.lit ? "true" : "false"); break;
-    default:                  s << o.lit; break;
+    default:                  s << o.lit; break;   /* decimal; no marker
+                                                    * (slots are rN/names) */
     }
     return s.str();
 }
@@ -195,21 +210,21 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
     if (!ch.consts.empty()) {
         s << "; -- consts (" << ch.consts.size() << ") --\n";
         for (size_t i = 0; i < ch.consts.size(); i++)
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << ch.consts[i].get_type()->to_string_repr(ch.consts[i]) << "\n";
     }
     if (!ch.member_keys.empty()) {
         s << "; -- member_keys (" << ch.member_keys.size() << ") --\n";
         for (size_t i = 0; i < ch.member_keys.size(); i++) {
             const auto &mk = ch.member_keys[i];
-            s << ";   #" << i << "  " << (mk.optional ? "?." : ".")
+            s << ";   [" << i << "]" << "  " << (mk.optional ? "?." : ".")
               << mk.memId.get_type()->to_string(mk.memId) << "\n";
         }
     }
     if (!ch.catch_types.empty()) {
         s << "; -- catch_types (" << ch.catch_types.size() << ") --\n";
         for (size_t i = 0; i < ch.catch_types.size(); i++) {
-            s << ";   #" << i << "  ";
+            s << ";   [" << i << "]" << "  ";
             for (size_t j = 0; j < ch.catch_types[i].size(); j++)
                 s << (j ? ", " : "") << ch.catch_types[i][j];
             s << "\n";
@@ -219,7 +234,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- literal_objs (" << ch.literal_objs.size() << ") --\n";
         for (size_t i = 0; i < ch.literal_objs.size(); i++) {
             const auto &lo = ch.literal_objs[i];
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << lo.value.get_type()->to_string_repr(lo.value)
               << (lo.immutable ? "  (immutable)" : "") << "\n";
         }
@@ -228,27 +243,27 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- closure_defs (" << ch.closure_defs.size() << ") --\n";
         for (size_t i = 0; i < ch.closure_defs.size(); i++) {
             const FuncDescriptor *fd = ch.closure_defs[i];
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << (fd->name ? std::string(fd->name->val) : "<lambda>") << "\n";
         }
     }
     if (!ch.struct_defs.empty()) {
         s << "; -- struct_defs (" << ch.struct_defs.size() << ") --\n";
         for (size_t i = 0; i < ch.struct_defs.size(); i++)
-            s << ";   #" << i << "  " << ch.struct_defs[i]->name->val
+            s << ";   [" << i << "]" << "  " << ch.struct_defs[i]->name->val
               << "\n";
     }
     if (!ch.boxed_ctors.empty()) {
         s << "; -- boxed_ctors (" << ch.boxed_ctors.size() << ") --\n";
         for (size_t i = 0; i < ch.boxed_ctors.size(); i++)
-            s << ";   #" << i << "  " << ch.boxed_ctors[i].def->name->val
+            s << ";   [" << i << "]" << "  " << ch.boxed_ctors[i].def->name->val
               << "  (" << ch.boxed_ctors[i].arg_locs.size() << " args)\n";
     }
     if (!ch.throws.empty()) {
         s << "; -- throws (" << ch.throws.size() << ") --\n";
         for (size_t i = 0; i < ch.throws.size(); i++) {
             const auto &t = ch.throws[i];
-            s << ";   #" << i << "  " << throw_kind_name(t.kind)
+            s << ";   [" << i << "]" << "  " << throw_kind_name(t.kind)
               << (t.name ? " " + std::string(t.name->val) : "") << "\n";
         }
     }
@@ -256,7 +271,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- builtin_calls (" << ch.builtin_calls.size() << ") --\n";
         for (size_t i = 0; i < ch.builtin_calls.size(); i++) {
             const auto &bc = ch.builtin_calls[i];
-            s << ";   #" << i << "  " << (bc.name ? bc.name->val : "?")
+            s << ";   [" << i << "]" << "  " << (bc.name ? bc.name->val : "?")
               << "  (" << bc.args.size() << " args)\n";
         }
     }
@@ -264,7 +279,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- emplace_sites (" << ch.emplace_sites.size() << ") --\n";
         for (size_t i = 0; i < ch.emplace_sites.size(); i++) {
             const auto &es = ch.emplace_sites[i];
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << (es.bname ? es.bname->val : "append") << " <- "
               << es.def->name->val
               << "  (" << es.field_locs.size() << " fields)\n";
@@ -275,7 +290,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         static const char *fm[] = {"none", "slot", "elem", "member", "undef"};
         for (size_t i = 0; i < ch.call_sites.size(); i++) {
             const auto &cs = ch.call_sites[i];
-            s << ";   #" << i << "  " << cs.args.size() << " args, a0="
+            s << ";   [" << i << "]" << "  " << cs.args.size() << " args, a0="
               << fm[static_cast<int>(cs.a0_form)];
             if (cs.a0_form == Chunk::CallSite::A0::slot
                 || cs.a0_form == Chunk::CallSite::A0::elem
@@ -289,7 +304,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- incdec_sites (" << ch.incdec_sites.size() << ") --\n";
         for (size_t i = 0; i < ch.incdec_sites.size(); i++) {
             const auto &is = ch.incdec_sites[i];
-            s << ";   #" << i << "  lval@" << is.lstart.line << ":"
+            s << ";   [" << i << "]" << "  lval@" << is.lstart.line << ":"
               << is.lstart.col << "  incdec@" << is.istart.line << ":"
               << is.istart.col;
             if (is.memUid)
@@ -301,7 +316,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- incdec_chains (" << ch.incdec_chains.size() << ") --\n";
         for (size_t i = 0; i < ch.incdec_chains.size(); i++) {
             const auto &ic = ch.incdec_chains[i];
-            s << ";   #" << i << "  steps=";
+            s << ";   [" << i << "]" << "  steps=";
             for (const Chunk::ChainStep &st : ic.steps)
                 s << (st.is_member ? ".<m#" : "[r")
                   << st.operand << (st.is_member ? ">" : "]");
@@ -549,6 +564,31 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
     }
     s << "; registers: a source var reads by NAME; `rN` is a scratch temp\n";
 
+    /* The frame's slot map: named locals (slot < slot_count) then the
+     * scratch-temp range. A `subscript.v r7 = r4[r5]` reads clearly once
+     * you can look r4/r5/r7 up here (temps have no source name). */
+    {
+        int named = 0;
+        for (int sl = 0; sl < chunk.slot_count; sl++)
+            if (static_cast<size_t>(sl) < chunk.slot_names.size()
+                    && !chunk.slot_names[sl].empty())
+                named++;
+        s << "; frame: " << chunk.slot_count << " locals + "
+          << chunk.n_temps << " temps = "
+          << (chunk.slot_count + chunk.n_temps) << " slots";
+        if (chunk.n_temps > 0)
+            s << "  (r" << chunk.slot_count << "..r"
+              << (chunk.slot_count + chunk.n_temps - 1) << " are temps)";
+        s << "\n";
+        if (named) {
+            for (int sl = 0; sl < chunk.slot_count; sl++)
+                if (static_cast<size_t>(sl) < chunk.slot_names.size()
+                        && !chunk.slot_names[sl].empty())
+                    s << ";   r" << sl << " -> " << chunk.slot_names[sl]
+                      << "\n";
+        }
+    }
+
     /* A capture slot as its field name (the anon capture-struct field), else
      * `cN`. */
     auto CAP = [&](int slot) -> std::string {
@@ -576,6 +616,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         if (kind == 1) return "g" + std::to_string(slot);    /* global */
         if (kind == 2) return "c" + std::to_string(slot);    /* capture */
         return reg(chunk, slot);                             /* local (or -1) */
+    };
+    /* A builtin-table entry as `name` when resolvable, else `builtin[N]`.
+     * Robust: a value-ABI adapter whose fn-pointer doesn't match the
+     * registry, or a non-Builtin slot, falls back to the index. */
+    auto BLT = [&](int_type idx) -> std::string {
+        return std::string(builtin_slot_name(static_cast<int>(idx)));
     };
 
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
@@ -684,7 +730,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             /* E4 fusion */
             row << "i.addmod     " << D(in.target) << " = ("
                 << RI(in.a(), false) << " + " << RI(in.b(), false)
-                << ") % #" << in.target2;
+                << ") % " << in.target2;
             break;
         case OpCode::JumpUnlessElemInt:
             /* E4 fusion */
@@ -697,7 +743,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.b(), false) << "; " << D(in.target2)
                 << (in.aop == Op::lt || in.aop == Op::le ? "++" : "--")
                 << ", if " << D(in.target2) << " " << opsym(in.aop) << " "
-                << (in.a_is_lit() ? "#" : "r")
+                << (in.a_is_lit() ? "" : "r")
                 << in.a_dual_hi() << " -> L" << in.target;
             break;
         case OpCode::ForStepElemInt:
@@ -781,7 +827,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "] (" << in.b_lit() << ")";
             break;
         case OpCode::UnpackElemTargets: {
-            row << "unpack.elem.t targets#" << in.target << " = "
+            row << "unpack.elem.t targets[" << in.target << "]" << " = "
                 << D(in.target2) << "[" << RI(in.a(), false) << "] ("
                 << in.b_lit() << ") [";
             const std::vector<int32_t> &tg = chunk.unpack_targets[in.target];
@@ -1052,7 +1098,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "call.val.dyn " << D(in.target) << " = " << D(in.target2)
                 << arglist(chunk, in.a_lit(),
                            static_cast<int>(in.b_lit() & 0xfff))
-                << "   ; runtime dispatch, site #" << (in.b_lit() >> 12);
+                << "   ; runtime dispatch, site [" << (in.b_lit() >> 12) << "]";
             break;
         case OpCode::CheckCallableV:
             row << "check.call   " << RI(in.a(), false)
@@ -1114,10 +1160,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::LoadImmInt:
-            row << "load         " << D(in.target) << ", #" << in.a_lit();
+            row << "load         " << D(in.target) << ", " << in.a_lit();
             break;
         case OpCode::LoadImmFloat:
-            row << "load         " << D(in.target) << ", #" << in.a_flit();
+            row << "load         " << D(in.target) << ", " << flit_str(in.a_flit());
             break;
         case OpCode::LoadConstV: {
             const EvalValue &c = chunk.consts[in.target2];
@@ -1191,8 +1237,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "]";
             break;
         case OpCode::LoadBuiltinV:
-            row << "load.builtin " << D(in.target) << ", builtin["
-                << in.target2 << "]";
+            row << "load.builtin " << D(in.target) << ", " << BLT(in.target2)
+                << "   ; = builtin[" << in.target2 << "]";
             break;
         case OpCode::SubscriptV:
             row << "subscript.v  " << D(in.target) << " = " << D(in.target2)

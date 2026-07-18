@@ -344,6 +344,11 @@ public:
  */
 int builtin_slot_index(const UniqueId *uid);
 LValue &builtin_slot(int index);
+
+/* The registered NAME of a builtin-table slot by index - works for ANY
+ * entry (a Builtin function OR a value like `argv`). For the
+ * disassembler's `load.builtin` annotation. */
+std::string_view builtin_slot_name(int index);
 /* did the builtin come from const_builtins (visible during const-eval)? */
 bool builtin_is_const(int index);
 
