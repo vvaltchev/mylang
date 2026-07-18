@@ -290,17 +290,80 @@ HELPER CALLS for the hard parts: ref-release, array/dict ops, exception
 raise) is compiled and the interpreted originals are DELETED; an op we can't
 prove → the VM instruction stays (the only fallback). NO runtime bail.
 - **ref-release**: `jit_put_int`/`jit_put_float` (DONE).
-- **exceptions (div0/OOB/shift)**: emit the check inline; on the fault path
-  `call jit_raise(chunk, pc, kind)` (noexcept: builds the exception, stamps
-  the caret from the loc table, sets `g_vm_exc_pending`, returns a
-  sentinel); `EnterNative` routes the sentinel to the frame-walk — exact
-  caret, no re-interpret. (NEXT.)
+- **exceptions (OOB / negative shift)**: the fragment stores a `JitRaiseKind`
+  to `g_vm_jit_raise` and exits to the op's pc; `EnterNative` raises the
+  matching exception via `vm_raise` — exact caret from the loc table, routes
+  through the same frame-walk (catchable), no re-interpret. Only GENUINE
+  exceptions convert (the LoadElem non-array/slice/wrong-kind bails are valid
+  non-exception cases → stay re-interpret). (DONE, c5ad01b.) NOTE: div0 is
+  NOT a current JIT site (IntModRI excludes imm 0/-1 at compile time,
+  div-by-reg isn't compiled), so nothing to convert there yet.
 - **arrays/dicts/strings**: don't nativize the data structures — CALL the
   same C++ the interpreter calls (a helper per op). (NEXT.)
 - **delete the interpreted originals** for a fully-native run (single-entry;
-  a rare interior external target splits the run). (NEXT.)
-Native MyLang calls (`vm_enter_call`) then reuse the same helper-call
-mechanism.
+  a rare interior external target splits the run). (IN PROGRESS.)
+
+## Native MyLang calls (`call <offset>`) — the design
+
+The GOAL (the maintainer's definition, not the "Model A" mislabel): a caller
+fragment does a real `call <callee fragment offset>`, the callee runs
+entirely in machine code and `ret`s — NO dispatch-loop round-trip per call.
+This removes the fragment exit + `EnterNative` re-entry and the CallV/ReturnV
+dispatch. It does NOT remove the frame-setup MEMORY work (window push +
+record + arg bind) — that is inherent (the profile's ~58%); native calls buy
+the ~33% dispatch slice plus staying in native across the call.
+
+**Prerequisite: a FULLY-NATIVE callee body** (a single `call`-able entry, no
+interpreted ops in the middle) — i.e. approach A / delete-originals applied
+to the callee's chunk. This is WHY delete-originals comes first: a native
+`call` needs a native blob to jump to.
+
+**Frame setup** (per call): the callee's slots live on the activation's
+SEGMENTED slot stack (address-stable — unchanged). The window push + record
+fill + arg bind is either emitted natively (a segment-room check + pointer
+bump + a store loop; the rare segment-OVERFLOW bails to a C++ helper — it
+allocates) or done by a lean noexcept C++ helper `jit_enter_call` (the same
+contract-legal helper-call the libm/ref-release paths use). Start with the
+helper (simplest, correct); nativize the common fast path later if the
+profile says the call setup is hot. `rdi` (the slots base) is repointed to
+the new window for the `call`, restored on return.
+
+**Exceptions across a native `call`-chain — the CHECKED-RETURN protocol.**
+A hand-emitted `ret`-chain has NO C++ unwind tables, so a C++ `throw` cannot
+traverse it — the exception MUST be signalled and unwound cooperatively:
+- The callee, on a raise (`jit_raise` or a helper that throws), sets the
+  pending signal and RETURNS to its native caller with an exception STATUS
+  in a register (`rax`: 0 = normal, non-0 = unwinding). The function RESULT
+  is written to the caller's dst SLOT (memory), so `rax` is free to carry
+  the status.
+- The caller fragment, after EVERY `call`, does `test rax, rax; jnz
+  <unwind>` — a load-free, perfectly-predicted, never-taken branch (~1
+  cycle; NOT a memory read of a global). On non-0 it does NOT continue: it
+  pops its own call-record (`pop_window` frees THIS frame's `ref_slots`
+  handles — the objects are on the activation, never the C++ stack) and
+  RETURNS `rax` to its caller. Frame by frame, the chain unwinds in machine
+  code; `pop_window` does all the ref-count cleanup exactly as the
+  interpreted walk does today. A frame WITH a handler catches instead of
+  propagating.
+- **Overhead (maintainer's concern):** ~1 cycle per call (the `test/jnz` on
+  `rax`), vs the ~10–20-cycle frame setup — small. TRY THIS FIRST; do not
+  pre-optimize. If it ever shows up: a `longjmp`-to-the-nearest-boundary
+  unwind (setjmp at each do_func_call/handler boundary; skips the per-call
+  check, but then each intervening frame's record must still be popped by
+  the boundary to free slots, and it can't observe an intermediate
+  same-frame handler — so it only helps the no-intermediate-handler case),
+  or a per-fragment landing-pad table. Measure before adding that
+  complexity.
+
+**Depth cap:** real `call`s grow the C++ stack per frame (unlike today's
+O(1)-per-activation state-change model), so the `MYLANG_VM_STACK` cap must be
+enforced at call setup (a catchable `StackOverflowEx`, as now).
+
+**What "Model A" was (rejected as a native-call story):** the current model —
+a call splits the run, C++ `vm_enter_call`/`leave` handles it, fragments are
+native only WITHIN a frame. It buys nothing on call overhead; it is the
+status quo, not a native call. The real native call is the `call <offset>`
+design above, gated on fully-native callee bodies.
 
 ## The path to 10x — why it is NOT the N-series (N6/N7 sketch)
 
