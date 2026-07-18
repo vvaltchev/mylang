@@ -58,6 +58,24 @@ bool g_jit_enabled = jit_default_enabled();
 bool g_jit_enabled = false;
 #endif
 
+/* Exempt the indirect call to JIT code from UBSan's function-type
+ * check (-fsanitize=function), which reads a CFI signature from before
+ * the target - absent in a raw fragment, so the read faults on the
+ * guard page below `base`. clang spells it no_sanitize("function");
+ * gcc has no such value, so disable all of UBSan for this one-line
+ * helper (no_sanitize_undefined). Both are no-ops without the
+ * sanitizer. */
+#if defined(__clang__)
+__attribute__((no_sanitize("function")))
+#elif defined(__GNUC__)
+__attribute__((no_sanitize_undefined))
+#endif
+size_t jit_enter(const void *frag, void *slots)
+{
+    typedef size_t (*NativeFrag)(void *);
+    return reinterpret_cast<NativeFrag>(const_cast<void *>(frag))(slots);
+}
+
 void NativeCode::release() noexcept
 {
 #if ML_JIT_SUPPORTED

@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <cstddef>   /* size_t (jit_enter) */
+
 struct Chunk;
 
 /* The kill switch: -nj / MYLANG_JIT=0; always false off-platform. */
@@ -28,3 +30,12 @@ extern bool g_jit_enabled;
 extern unsigned long g_jit_frags;
 
 void jit_compile_chunk(Chunk &chunk);
+
+/*
+ * Call a compiled fragment (frameless: slots base in, resume pc out).
+ * Marked no_sanitize("function") - the JIT fragment has no clang/UBSan
+ * CFI type header, so the -fsanitize=function check would read the
+ * (unmapped) word before the fragment and fault. class LValue is opaque
+ * here, so the arg is void* (the real ABI is size_t(LValue*)).
+ */
+size_t jit_enter(const void *frag, void *slots);
