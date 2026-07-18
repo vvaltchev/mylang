@@ -515,6 +515,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << D(in.b_dual_lo()) << "[" << D(in.target2)
                 << "] -> L" << in.target;
             break;
+        case OpCode::EnterNative:
+            /* native-AOT: the fragment entry (jit.cpp; bytes auditable
+             * via `objdump -D -b binary -m i386:x86-64` on the dump) */
+            row << "enter.nat    frag@+" << in.a_lit();
+            break;
         case OpCode::StructFieldAddInt:
             /* #9 fusion: b_dual = (field idx, other slot) */
             row << "sf.add       " << D(in.target) << " = "

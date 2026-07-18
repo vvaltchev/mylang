@@ -390,6 +390,37 @@ MoveVs -31%, fib$0's chunk 68->56; the earlier STANDALONE
 threading-without-deletion attempt was a measured DECLINE (+3.2%, 1/77
 benches affected - roadmap E3 records it).
 
+**NATIVE x86-64 AOT — N0/N1 (plans/native-aot.md; `jit.{h,cpp}`).** The
+incremental baseline tier: `jit_compile_chunk` runs LAST in
+`codegen_chunk` (after specialize_arith_ops; a `.myv` load will call it
+the same way), finds maximal STRAIGHT-LINE runs (>= 4 ops; any branch or
+branch TARGET splits) of the never-throwing int tier (the B1/B2
+specialized arithmetic, IntModRI/IntAddModRI with the imm 0/-1 idiv-trap
+exclusions, imm shifts with negative counts left interpreted,
+LoadImmInt), hand-emits each into a per-chunk mmap'd W^X buffer
+(`Chunk::native`, move-only, never serialized), INSERTS an `EnterNative`
+op at each run head (pc fields + locs/inline_ctxs remapped; the run's
+ORIGINAL ops stay in place), and flips the buffer RX. The three
+contracts: fragments NEVER throw or call anything that can (frameless
+leaves - every exceptional condition, e.g. a negative reg shift count,
+BAILS by returning the op's pc, and the interpreter re-executes it,
+throwing with the exact caret); reads are the release interpreter's raw
+proven-type loads (a bool payload is fully zeroed, so the raw int read
+is 0/1); writes to a dst OUTSIDE `Chunk::ref_slots` are TWO UNCONDITIONAL
+stores (type singleton + payload - sound: such a slot only ever holds
+trivial values), while a ref-listed dst (a reused temp that may hold a
+reference NOW - releasing it needs C++) gets a type-check + bail. Layout
+facts (LValue stride 48, payload/type offsets via
+`EvalValue::jit_payload_off/jit_type_off` + a runtime probe, the int
+Type singleton) are baked as immediates. Gated
+`#if __x86_64__ && !_WIN32`; kill switch `-nj` / `MYLANG_JIT=0` (the
+same-binary A/B lever). Measured (N1, full-suite interleaved A/B vs the
+pre-AOT release): 07_nested_loops **0.692x**, 68_nested 0.787x,
+03_int_arith 0.938x, 43_sieve 0.946x, suite VM-wall geomean 0.998,
+my/py 4.97x → **5.04x**; the JIT-OFF configuration measures neutral
+(the one-new-opcode front-end risk). N2 (intra-run branches + the
+native back edge) is where loops stop dispatching per iteration.
+
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
 code-label addresses generated in enum order from `ML_FOR_EACH_OPCODE`
@@ -609,12 +640,12 @@ neutral (geomean 1.00x), as it must be.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-one
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-two
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
 `eval.cpp`, `types.cpp`, `statictype.cpp`, `trace.cpp`, `coderender.cpp`,
 `backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
-`repl.cpp`, `codegen.cpp`, `vm.cpp`, `disasm.cpp`, `mylang.cpp`, `tests.cpp`
+`repl.cpp`, `codegen.cpp`, `vm.cpp`, `jit.cpp`, `disasm.cpp`, `mylang.cpp`, `tests.cpp`
 (six of them are the REPL — see "The interactive REPL" below; `trace.cpp` is the
 diagnostic tracer and `coderender.cpp` the optimized-AST "decompiler", both used
 by the REPL; `codegen.cpp`/`vm.cpp` are the bytecode-VM engine and `disasm.cpp`

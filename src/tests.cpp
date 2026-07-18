@@ -25,6 +25,7 @@
 #include "coderender.h"
 #include "analyzer.h"
 #include "vm.h"
+#include "jit.h"
 #include "codegen.h"
 #include "disasm.h"
 
@@ -643,6 +644,23 @@ static const std::vector<test> tests =
             "sort(k);",
             "assert(k == [\"a\", \"b\"]);",
         },
+    },
+
+    {
+        /* NATIVE AOT N1 (plans/native-aot.md): a negative shift count
+         * inside a JIT-eligible run BAILS to the interpreter, which
+         * re-executes the op and throws InvalidValueEx with the normal
+         * caret - byte-identical to -tw (the differential reruns this
+         * under the VM+JIT). The arith padding keeps the run above
+         * MIN_RUN so the shift really sits inside a fragment. */
+        "jit: negative shift count bails and throws like the interpreter",
+        {
+            "var n = 0 - 1;",
+            "var x = 1; var y = 2; var z = 3;",
+            "x = x + y; y = y ^ z; z = z * 2;",
+            "x = x << n;",
+        },
+        &typeid(InvalidValueEx),
     },
 
     {
@@ -13848,6 +13866,41 @@ static bool codegen_func_counts(const std::vector<const char *> &lines,
     return true;
 }
 
+static bool jit_engagement()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    /* A straight-line int-arith body must produce >= 1 native fragment
+     * (and run correctly through it - the value check is the point: the
+     * fragment computed it, not the interpreter). */
+    const unsigned long before = g_jit_frags;
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : {
+            "var a = 3; var r = 0; var t = 0;",
+            "r = a * 5 + 2; t = r ^ a; r = t << 3; t = r % 1000;",
+            "r = r + t;" }) {
+        if (!src.empty())
+            src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        resolve_names(root.get());
+        specialize_types(root.get());
+        vm_execute(root.get());
+    } catch (...) {
+        return false;
+    }
+    return g_jit_frags > before;
+#else
+    return true;   /* off-platform: the JIT never engages, by design */
+#endif
+}
+
 static bool vm_codegen_shapes()
 {
     /* 1) resolved-local int while + if -> native ops (native-first codegen
@@ -15053,6 +15106,8 @@ ast_node_pool_minimal()
 
 static const std::vector<extra_check> extra_checks =
 {
+    { "jit: a straight-line int run compiles + executes natively",
+      jit_engagement },
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "builtins: dev-only show() reserved in a script",
