@@ -770,43 +770,95 @@ enumerated there. (Floats match: both are 64-bit IEEE `double`.)
 `bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
-**THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16).** Any
-claim about a VM perf change is made ONLY from FULL-SUITE `bench/run.py`
-runs, BOTH binaries built and run in the SAME session, repeated (>=2 runs
-each, interleaved A/B/A/B to cancel machine drift) — never from a bench
-subset probe, never by comparing my/py prints across sessions (the CPython
-denominator drifts several percent day to day on this box; it masked a real
-~5% Phase-C regression as "noise" once). Compare the VM WALL-CLOCK per bench
-(the my column) between the binaries, plus the my/py geomean, which run.py
-now prints with THREE digits (0.256x / ~3.91x) for exactly this. A phase
-does not land on a probe geomean.
+**BENCHMARK-RUN DISCIPLINE — 1-vs-1 BY DEFAULT, the maintainer controls the
+deep runs (maintainer-set, 2026-07-19).** Do NOT run the bench suite over and
+over on your own initiative — `--repeat 3`, hand-rolled 25x loops, run-after-run
+to chase a fluctuating number — it WASTES the maintainer's time. Context: the
+`>=2 interleaved runs` rule below was set during the regression-prone AST→VM
+CONVERSION, where new bytecode kept introducing regressions and heavy A/B was
+warranted. For ordinary OPTIMIZATION work the default is lean:
+- **Run the basic 1-vs-1: ONE run before the change (or a series of changes),
+  ONE run after — then MOVE ON.** No extra repetitions, no larger scale, on
+  your own initiative. Bring the maintainer the data; HE interprets it. You do
+  NOT get to re-run because a number looks off or surprising.
+- **Escalating to more repetitions / larger scale / a deep perf session is the
+  MAINTAINER'S call, not yours.** He decides when to stop and focus on perf; you
+  cannot take that initiative. Only run heavier measurements when he explicitly
+  asks (and approves the repetitions/scale). The `>=2 interleaved` rule below
+  applies to those maintainer-initiated deep sessions (and to conversion work),
+  not to routine optimization.
+- **If a bench is too noisy to trust, the fix is a more RELIABLE BENCH, not more
+  runs.** There is a planned, dedicated effort to LOWER bench VOLATILITY
+  test-by-test, with various approaches per bench (bumping the scale of the
+  most-fluctuating ones, reducing allocation/OS-interference noise, etc.) — a
+  specific work item, done with the maintainer, so each bench gives a stable
+  signal from a single run. (TODO, agreed 2026-07-19.)
+- **Spend most of your time WRITING CODE and doing FUNCTIONAL testing** (`-rt`,
+  the fuzzer, samples, reading the diff for mistakes) — correctness errors have
+  been creeping in. Benchmarks are a small, final check, not the main activity.
+- **Do NOT revert a change that SHOULD optimize things** — especially one the
+  maintainer approved — because a measurement looks neutral. Bring the data and
+  let him decide (see the "ask before reverting" convention + the "distrust a
+  surprising result" rule below).
+- **CACHE the other-language bench results.** Python (and now C++, later
+  Ruby/Perl/Lua/maybe Java) don't change between MyLang edits, so their bench
+  timings must be cached in a GIT-IGNORED file and re-generated only when the
+  bench scripts themselves change OR on explicit request (a dedicated
+  `run.py`/`bench/cpp/run.py` option). A normal run then re-times ONLY MyLang
+  and reads the cached other-language numbers — this cuts the time to run the
+  whole suite roughly IN HALF. (TODO, agreed 2026-07-19.)
 
-**THE "PROVE THE CODE RAN" HARD RULE (maintainer-set, 2026-07-19).** NEVER
-draw a conclusion from a performance measurement until you have HARD DATA that
-the code path under test ACTUALLY EXECUTED in that measurement. If the code
-*might* not have run, you do not have a result — you have nothing. Re-iterate,
-INSTRUMENT (a counter, `-vd`/`-vdj`, callgrind), and debug until you are 100%
-sure it ran; ONLY THEN measure and reason. **The trap that set this rule:** a
-JIT change was declared "neutral, so dispatch doesn't matter for dict/string"
-from a `MYLANG_JIT=0` vs JIT-on A/B that came out 1.00x — but the JIT compiled
-**ZERO fragments** for those benches (the store split the loop into sub-MIN_RUN
-pieces), so BOTH sides ran the identical interpreted code. "JIT-on == JIT-off"
-proves NOTHING when the JIT never engaged; it is not evidence that dispatch is
-irrelevant, only that the same code ran twice. The conclusion happened to be
-right, but it was ASSERTED WITHOUT DATA. The valid test was to make the JIT
-actually engage (nativize the store so the loop compiled a fragment), PROVE it
-ran (an instrumentation counter: `native_entries=1`, `dict_store_calls=1.5M`
-from native, `compiled_frags=1`), and only then measure — which showed 1.00x,
-NOW a real result: removing all the dict-loop dispatch changes nothing, so the
-`unordered_map`+hash+box C++ work dominates (a `my/cpp` of ~5x in bench/cpp/
-locates that headroom in the value model / N7, not dispatch). Corollaries: a
-same-binary JIT on/off A/B is only meaningful once `compiled_frags > 0` AND the
-fragment is entered (confirm via `-vd` for the `enter.nat`, or a counter for
-the execution); a "neutral" result on an unverified path is INDISTINGUISHABLE
-from "the optimization didn't run" — treat it as the latter until proven
-otherwise. This is the general form of the JIT ref-store-bail lesson (all those
-"native builtins are neutral" numbers were interpreter-vs-interpreter): a
-NULL RESULT is only real once the code is PROVEN to have executed.
+**THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16; applies to
+DEEP, maintainer-initiated perf sessions — see the 1-vs-1 default above).** Any
+claim about a VM perf change is made ONLY from FULL-SUITE `bench/run.py`
+runs, BOTH binaries built and run in the SAME session — never from comparing
+my/py prints across sessions (the CPython denominator drifts several percent
+day to day on this box; it masked a real ~5% Phase-C regression as "noise"
+once). Compare the VM WALL-CLOCK per bench (the my column) between the
+binaries, plus the my/py geomean, which run.py prints with THREE digits
+(0.256x / ~3.91x) for exactly this. For a deep session the maintainer may ask
+for >=2 interleaved A/B/A/B runs to cancel machine drift; that is HIS call, not
+a routine default. A phase does not land on a probe geomean.
+
+**THE "PROVE THE CODE RAN + DISTRUST A SURPRISING RESULT" HARD RULE
+(maintainer-set, 2026-07-19).** Two joined rules, both learned the hard way in
+ONE investigation:
+
+(1) NEVER draw a conclusion from a performance measurement until you have HARD
+DATA that the code path under test ACTUALLY EXECUTED in that measurement. If
+the code *might* not have run, you do not have a result — you have nothing.
+INSTRUMENT (a counter, `-vd`/`-vdj` for the `enter.nat`, callgrind) and debug
+until you are 100% sure it ran; ONLY THEN measure. **The trap:** a JIT change
+was declared "dispatch doesn't matter for dict" from a `MYLANG_JIT=0` vs JIT-on
+A/B that came out ~1.00x — but the JIT compiled **ZERO fragments** for that
+bench (the store split the loop into sub-MIN_RUN pieces), so BOTH sides ran the
+identical interpreted code. "JIT-on == JIT-off" proves NOTHING when the JIT
+never engaged; a "neutral" result on an unverified path is INDISTINGUISHABLE
+from "the optimization didn't run" — treat it as the latter until proven. This
+is the general form of the ref-store-bail lesson (all those "native builtins
+are neutral" numbers were interpreter-vs-interpreter).
+
+(2) DISTRUST A SURPRISING RESULT — especially a null/zero one. When I finally
+made the JIT engage (nativized the dict store; PROVED it: `native_entries=1`,
+`dict_store_calls=1.5M` from native, `compiled_frags=1`) the first wall-clock
+A/B came out ~1.00x and I ACCEPTED IT ("dispatch removal changes nothing") — a
+SECOND methodological failure. It was WRONG: at low scale + few repeats on an
+allocation-heavy bench (1.5M `unordered_map` inserts), timing NOISE swamped the
+effect. Re-measured with rigor — 25 runs (min AND median agree at 0.934) plus
+the DETERMINISTIC callgrind instruction count (213.6M vs 242.7M = **12% fewer
+instructions**, zero timing noise) — the real answer is a stable **~6.5%
+wall-clock / 12%-instruction win**. So: (a) a surprising result (0% where the
+mechanism predicts non-zero) is a signal to RE-MEASURE, not to conclude; (b)
+for a SMALL effect on a NOISY (alloc/cache-bound) bench, best-of-N wall-clock
+is unreliable — reach for a DETERMINISTIC metric (callgrind I-refs) and/or many
+repeats where min AND median must agree; (c) the removed dispatch was ~12% of
+INSTRUCTIONS but only ~6.5% of TIME, because the removed ops are the CHEAP ones
+(predicted branches / L1 hits) while the time is the dict's alloc/cache-miss
+work — instruction-count and wall-clock deltas differ and BOTH are worth
+knowing. Net for the dict tier: dispatch is a real, capturable chunk (~6-12%);
+the BIGGER headroom is still the value model (boxing/alloc/refcount, `my/cpp`
+~5x in bench/cpp/ → the N7 arc) — but "dispatch is irrelevant here" was FALSE
+and was asserted twice without adequate data.
 
 **`--vm` — the bytecode-VM performance gate.** `run.py` measures the VM by
 DEFAULT (the binary's default engine since the 2026-07-18 flip); `--vm`
@@ -5225,6 +5277,18 @@ omitting it is a compile error.
   ever disabled a fold that the positional form would get, the feature is a
   regression and would be better not used at all. Hold any sugar to the same
   bar: it may add spelling, never subtract capability.
+- **ASK before reverting a working optimization the maintainer asked for, even
+  if it measures perf-neutral.** (Maintainer, 2026-07-19.) If an optimization is
+  CORRECT (tests green) and the maintainer requested it (or it came out of
+  fulfilling their request), do NOT unilaterally revert it just because a
+  measurement says it's neutral — PRESENT the data and ASK. They may want it
+  kept anyway (it's a building block — e.g. a native dict store is a prerequisite
+  for the model flip), or want it IMPROVED (extend its reach), not dropped. This
+  compounds with the "distrust a surprising result" rule above: the very
+  measurement that says "neutral" may itself be the noisy/unproven artifact — a
+  perf-neutral finding is exactly when you should double-check before acting on
+  it. (Concrete case: the native dict store was reverted as "0%", which turned
+  out to be measurement noise hiding a real ~6.5%.)
 - **Interactive `git rebase -i` is permitted in this repo** (the environment's
   general "no interactive flags" restriction is waived here by the maintainer) —
   use it to keep history clean / bisectable, e.g. squashing a fix into the
