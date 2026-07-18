@@ -339,6 +339,200 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
 
 }  /* namespace */
 
+/* ============ Native-AOT fragment disassembler (-vdj) ============
+ *
+ * Decodes exactly the x86-64 forms jit.cpp emits (a small, fixed set),
+ * interleaving each VM op's `; pc N` boundary from NativeCode::Frag::marks.
+ * An unrecognized byte prints `.byte` and advances 1; the next op mark
+ * resyncs, so a decode slip is bounded to one op. The slot-window layout
+ * (stride 48, payload +0, type +24) is stable and mirrored here for the
+ * `slot N` / `slot N.type` labels (cosmetic - the JIT itself bakes the
+ * runtime-probed offsets). */
+namespace {
+
+const char *gp64(int r)
+{
+    static const char *n[16] = { "rax","rcx","rdx","rbx","rsp","rbp",
+        "rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15" };
+    return (r >= 0 && r < 16) ? n[r] : "r?";
+}
+
+std::string hex2(uint8_t v)
+{
+    static const char *h = "0123456789abcdef";
+    return std::string(1, h[v >> 4]) + std::string(1, h[v & 15]);
+}
+
+/* [rdi+disp] -> a slot label; other bases -> [base+0xNN]. */
+std::string mem_disp(int base_reg, int32_t disp)
+{
+    if (base_reg == 7 /*rdi*/) {
+        const int stride = 48, poff = 0, toff = 24;
+        if (disp >= 0 && disp % stride == poff)
+            return "slot" + std::to_string(disp / stride);
+        if (disp >= 0 && disp % stride == toff)
+            return "slot" + std::to_string(disp / stride) + ".type";
+    }
+    std::ostringstream o;
+    o << "[" << gp64(base_reg) << (disp < 0 ? "-0x" : "+0x") << std::hex
+      << (disp < 0 ? -disp : disp) << "]";
+    return o.str();
+}
+
+/* Decode ONE instruction at code[p]; append its mnemonic to `out` and
+ * advance p. Covers jit.cpp's emitted forms. */
+void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out)
+{
+    const uint32_t start = p;
+    std::ostringstream o;
+    bool pf_f2 = false, pf_66 = false;
+    while (p < n && (c[p] == 0xF2 || c[p] == 0xF3 || c[p] == 0x66)) {
+        if (c[p] == 0xF2) pf_f2 = true;
+        if (c[p] == 0x66) pf_66 = true;
+        p++;
+    }
+    uint8_t rex = 0;
+    if (p < n && (c[p] & 0xF0) == 0x40) rex = c[p++];
+    const bool W = rex & 8, R = rex & 4, X = rex & 2, B = rex & 1;
+    if (p >= n) { p = start + 1; out = ".byte 0x" + hex2(c[start]); return; }
+    const uint8_t op = c[p++];
+    auto rd32 = [&]() -> int32_t {
+        int32_t v = 0;
+        for (int i = 0; i < 4 && p < n; i++) v |= int32_t(c[p++]) << (i*8);
+        return v;
+    };
+    auto rd64 = [&]() -> uint64_t {
+        uint64_t v = 0;
+        for (int i = 0; i < 8 && p < n; i++) v |= uint64_t(c[p++]) << (i*8);
+        return v;
+    };
+    /* modrm: returns reg field (+R) and formats the r/m as a string,
+     * consuming disp32/sib as needed. Only the mod=10 (disp32) and
+     * mod=11 (register) + one SIB form jit.cpp uses are handled. */
+    auto modrm = [&](int &regf, std::string &rm) {
+        const uint8_t m = c[p++];
+        const int mod = m >> 6, reg = ((m >> 3) & 7) + (R ? 8 : 0),
+                  rmf = (m & 7) + (B ? 8 : 0);
+        regf = reg;
+        if (mod == 3) { rm = gp64(rmf); return; }
+        if ((m & 7) == 4) {           /* SIB: [rcx + r9*8] (our only form) */
+            const uint8_t sib = c[p++];
+            const int idx = ((sib >> 3) & 7) + (X ? 8 : 0);
+            const int base = (sib & 7) + (B ? 8 : 0);
+            rm = std::string("[") + gp64(base) + "+" + gp64(idx) + "*8]";
+            return;
+        }
+        const int32_t d = (mod == 2) ? rd32()
+                        : (mod == 1) ? int8_t(c[p++]) : 0;
+        rm = mem_disp((m & 7), d);
+    };
+    int regf; std::string rm;
+
+    switch (op) {
+    case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+    case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+        if (W) o << "movabs " << gp64((op - 0xB8) + (B ? 8 : 0))
+                 << ", 0x" << std::hex << rd64();
+        else   o << "mov e" << (gp64((op-0xB8)+(B?8:0))+1) << ", 0x"
+                 << std::hex << rd32();     /* mov eNN, imm32 (exit pc) */
+        break;
+    case 0xC3: o << "ret"; break;
+    case 0x8B: modrm(regf, rm); o << "mov " << gp64(regf) << ", " << rm;
+        break;
+    case 0x89: modrm(regf, rm); o << "mov " << rm << ", " << gp64(regf);
+        break;
+    case 0x01: modrm(regf, rm); o << "add " << rm << ", " << gp64(regf);
+        break;
+    case 0x29: modrm(regf, rm); o << "sub " << rm << ", " << gp64(regf);
+        break;
+    case 0x21: modrm(regf, rm); o << "and " << rm << ", " << gp64(regf);
+        break;
+    case 0x09: modrm(regf, rm); o << "or "  << rm << ", " << gp64(regf);
+        break;
+    case 0x31: modrm(regf, rm); o << "xor " << rm << ", " << gp64(regf);
+        break;
+    case 0x39: modrm(regf, rm); o << "cmp " << rm << ", " << gp64(regf);
+        break;
+    case 0x99: o << (W ? "cqo" : "cdq"); break;
+    case 0xF7: { modrm(regf, rm);
+        o << ((regf & 7) == 7 ? "idiv " : "f7/? ") << rm; break; }
+    case 0xC1: { modrm(regf, rm); const uint8_t imm = c[p++];
+        o << ((regf & 7) == 4 ? "shl " : "sar ") << rm << ", " << int(imm);
+        break; }
+    case 0xD3: { modrm(regf, rm);
+        o << ((regf & 7) == 4 ? "shl " : "sar ") << rm << ", cl"; break; }
+    case 0xFF: { modrm(regf, rm);
+        o << ((regf & 7) == 0 ? "inc " : "dec ") << rm; break; }
+    case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
+        o << "cmp byte " << rm << ", " << int(imm); break; }
+    case 0xE9: { const int32_t d = rd32();
+        o << "jmp   -> +" << std::dec << (int32_t(p) + d); break; }
+    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
+    case 0x76: case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B:
+    case 0x7C: case 0x7D: case 0x7E: case 0x7F: case 0xEB: {
+        const int8_t d = int8_t(c[p++]);
+        static const char *js[16] = {"jo","jno","jb","jae","je","jne",
+            "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
+        const char *m = op == 0xEB ? "jmp" : js[op - 0x70];
+        o << m << "  -> +" << std::dec << (int32_t(p) + d); break; }
+    case 0x0F: {
+        const uint8_t o2 = c[p++];
+        if (o2 == 0xAF) { modrm(regf, rm);
+            o << "imul " << gp64(regf) << ", " << rm; }
+        else if (o2 >= 0x80 && o2 <= 0x8F) { const int32_t d = rd32();
+            static const char *j[16] = {"jo","jno","jb","jae","je","jne",
+                "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
+            o << j[o2 - 0x80] << "  -> +" << std::dec << (int32_t(p) + d); }
+        else if (o2 == 0x10) { modrm(regf, rm);
+            o << "movsd xmm" << (regf) << ", " << rm; }
+        else if (o2 == 0x11) { modrm(regf, rm);
+            o << "movsd " << rm << ", xmm" << regf; }
+        else if (o2 == 0x58 || o2 == 0x59 || o2 == 0x5C || o2 == 0x5E) {
+            modrm(regf, rm);
+            const char *m = o2==0x58?"addsd":o2==0x59?"mulsd":
+                            o2==0x5C?"subsd":"divsd";
+            o << m << " xmm" << regf << ", " << rm; }
+        else if (o2 == 0x2A) { modrm(regf, rm);
+            o << "cvtsi2sd xmm" << regf << ", " << rm; }
+        else if (o2 == 0x6E) { modrm(regf, rm);
+            o << "movq xmm" << regf << ", " << rm; }
+        else if (o2 == 0x2E) { modrm(regf, rm);
+            o << "ucomisd xmm" << regf << ", " << rm; }
+        else { o << ".0f 0x" << hex2(o2); }
+        break; }
+    default:
+        p = start + 1;
+        out = ".byte 0x" + hex2(c[start]);
+        return;
+    }
+    (void)pf_f2; (void)pf_66;
+    out = o.str();
+}
+
+void disasm_native_frag(std::ostream &s, const uint8_t *code,
+                        const NativeCode::Frag &frag)
+{
+    s << "       . ---- native fragment (" << std::dec << frag.len
+      << " bytes) ----\n";
+    uint32_t p = 0, mi = 0;
+    while (p < frag.len) {
+        while (mi < frag.marks.size() && frag.marks[mi].off == p) {
+            s << "       . ; vm pc " << frag.marks[mi].vm_pc << "\n";
+            mi++;
+        }
+        const uint32_t st = p;
+        std::string mn;
+        decode_one(code, frag.len, p, mn);
+        std::ostringstream bytes;
+        for (uint32_t k = st; k < p; k++) bytes << hex2(code[k]) << " ";
+        s << "       . +" << std::setw(3) << std::setfill(' ') << std::dec
+          << st << ": " << std::left << std::setw(30) << bytes.str()
+          << mn << std::right << "\n";
+    }
+}
+
+}  // namespace
+
 std::string disassemble(const Chunk &chunk, const std::string &title,
                         const std::vector<std::string> &cap_names)
 {
@@ -1040,6 +1234,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         }
 
         s << std::setw(4) << pc << "  " << row.str() << "\n";
+
+        /* -vdj: after an EnterNative line, disassemble its fragment. */
+        if (in.op == OpCode::EnterNative && chunk.native.base
+                && !chunk.native.frags.empty()) {
+            const uint32_t off = static_cast<uint32_t>(in.a_lit());
+            for (const NativeCode::Frag &fr : chunk.native.frags)
+                if (fr.start == off) {
+                    disasm_native_frag(
+                        s, static_cast<const uint8_t *>(chunk.native.base)
+                               + fr.start, fr);
+                    break;
+                }
+        }
     }
 
     /* The serializable POOLS + side tables this chunk carries (a `.myv` file

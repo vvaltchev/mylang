@@ -1364,14 +1364,24 @@ struct NativeCode {
     void *base = nullptr;
     size_t len = 0;
 
+    /* -vdj debug annotation: per fragment, the native byte offset (from
+     * `base`) where each VM op's machine code begins, paired with that
+     * op's (post-remap) pc. Populated ONLY when g_jit_annotate is set
+     * (the -vdj dump); empty on a normal run. The disassembler uses these
+     * to interleave "; pc N" markers and to resync its decode per op. */
+    struct OpMark { uint32_t off; uint32_t vm_pc; };
+    struct Frag { uint32_t start, len; std::vector<OpMark> marks; };
+    std::vector<Frag> frags;
+
     NativeCode() = default;
-    NativeCode(NativeCode &&o) noexcept : base(o.base), len(o.len) {
+    NativeCode(NativeCode &&o) noexcept
+        : base(o.base), len(o.len), frags(std::move(o.frags)) {
         o.base = nullptr;
         o.len = 0;
     }
     NativeCode &operator=(NativeCode &&o) noexcept {
         release();
-        base = o.base; len = o.len;
+        base = o.base; len = o.len; frags = std::move(o.frags);
         o.base = nullptr; o.len = 0;
         return *this;
     }

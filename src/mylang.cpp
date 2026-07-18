@@ -84,6 +84,10 @@ void help()
          << endl;
     cout << "           of the VM. See plans/bytecode-vm.md" << endl;
     cout << "  -vd      Dump the VM bytecode disassembly, then exit" << endl;
+    cout << "  -vdj     Like -vd, plus the native x86-64 disassembly of"
+         << endl;
+    cout << "           each JIT fragment interleaved with the VM ops"
+         << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
     cout << " -dti      Dump inferred types of all identifiers, then exit"
          << endl;
@@ -250,6 +254,14 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-vd")) {
 
             opt_vm_disasm = true;   /* dump the bytecode disassembly, no run */
+
+        } else if (!strcmp(arg, "-vdj")) {
+
+            opt_vm_disasm = true;      /* -vd + the native-AOT disasm: the
+                                        * dump is taken AFTER the JIT and
+                                        * interleaves each fragment's x86-64
+                                        * disassembly under its enter.nat */
+            g_jit_annotate = true;     /* record op marks during codegen */
 
         } else if (!strcmp(arg, "-dti")) {
 

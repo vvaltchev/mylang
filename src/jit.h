@@ -26,6 +26,10 @@ struct Chunk;
 /* The kill switch: -nj / MYLANG_JIT=0; always false off-platform. */
 extern bool g_jit_enabled;
 
+/* -vdj: record per-fragment op-boundary marks so the disassembler can
+ * interleave the native code with the VM ops. Off (zero cost) normally. */
+extern bool g_jit_annotate;
+
 /* Fragments compiled process-wide (tests / -vd audit). */
 extern unsigned long g_jit_frags;
 
