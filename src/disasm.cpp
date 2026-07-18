@@ -514,7 +514,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
         o << "cmp byte " << rm << ", " << int(imm); break; }
     case 0xE9: { const int32_t d = rd32();
-        o << "jmp   -> +" << std::dec << (int32_t(p) + d); break; }
+        o << "jmp +" << std::dec << (int32_t(p) + d); break; }
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
     case 0x76: case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B:
     case 0x7C: case 0x7D: case 0x7E: case 0x7F: case 0xEB: {
@@ -522,7 +522,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         static const char *js[16] = {"jo","jno","jb","jae","je","jne",
             "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
         const char *m = op == 0xEB ? "jmp" : js[op - 0x70];
-        o << m << "  -> +" << std::dec << (int32_t(p) + d); break; }
+        o << m << " +" << std::dec << (int32_t(p) + d); break; }
     case 0x0F: {
         const uint8_t o2 = c[p++];
         if (o2 == 0xAF) { modrm(regf, rm);
@@ -530,7 +530,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         else if (o2 >= 0x80 && o2 <= 0x8F) { const int32_t d = rd32();
             static const char *j[16] = {"jo","jno","jb","jae","je","jne",
                 "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
-            o << j[o2 - 0x80] << "  -> +" << std::dec << (int32_t(p) + d); }
+            o << j[o2 - 0x80] << " +" << std::dec << (int32_t(p) + d); }
         else if (o2 == 0x10) { modrm(regf, rm);
             o << "movsd xmm" << (regf) << ", " << rm; }
         else if (o2 == 0x11) { modrm(regf, rm);
