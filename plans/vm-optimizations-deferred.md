@@ -35,9 +35,11 @@ differential + `tests/nested_fuzz.py`.
   Marginal (scalar args copy cheap; only non-trivial args pay a
   refcount bump) and touches all ~84 signatures; its valuable half
   (AST-free carets) already shipped as `ArgLocs`/`builtin_calls`.
-- **Machine-code JIT (x86-64/arm64)** — the far-future endgame
-  (`[[vm-endgame]]`): eliminates dispatch wholesale. Requires the
-  serializable `.myv` bytecode first (now unblocked: zero-AST holds).
+- **Machine-code JIT (x86-64)** — now DESIGNED as the incremental
+  baseline-AOT tier: `plans/native-aot.md` (2026-07-18; EnterNative +
+  per-chunk RX side buffer, run-granularity fragments over the audited
+  scalar tier, bail-to-interpreter, never-throws rule, phases N0-N5).
+  Runs on-the-fly post-codegen/post-`.myv`-load; never serialized.
 - **A PMU box.** WSL2 has no hardware counters, so front-end/layout
   effects (the dominant residual on dispatch-bound loops — see
   `[[vm-dispatch-frontend-regression]]`) only show as wall-clock deltas

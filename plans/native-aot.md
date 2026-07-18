@@ -1,0 +1,226 @@
+# Native x86-64 AOT — incremental, on-the-fly, never-complete (design)
+
+Status: DESIGNED (2026-07-18), not started. Maintainer direction: build
+it VERY incrementally, accept that it may never cover everything (the
+interpreter is the permanent, tested fallback — "never complete" is a
+feature, not a debt), never serialize machine code (AOT always runs
+on-the-fly AFTER codegen or after a `.myv` load), POSIX-only for now
+(x86-64; Windows/arm64 deferred).
+
+## The shape: a baseline JIT over the register machine
+
+The model is V8's Sparkplug / JSC's Baseline tier: a 1:1-ish translator
+from bytecode to machine code with NO IR and NO global register
+allocation, sharing the interpreter's state layout completely. What
+makes it unusually clean HERE: **the VM's registers already ARE memory
+slots** (the frame window). Native code and the interpreter share all
+state with zero translation at the boundary — a native fragment that
+gives up just returns "resume interpreting at pc N". The entire
+deoptimization problem of real JITs reduces to `return pc`.
+
+The safety story is the one that carried AST→bytecode: the `-tw`
+differential oracle, the three-way fuzzer, the full-suite interleaved
+A/B rule — plus a kill switch that turns every phase into a same-binary
+A/B lever.
+
+## Decision record
+
+1. **Machine code lives in a SIDE BUFFER, not inside `Chunk::code`.**
+   The in-stream idea (x86 bytes in 32-byte `Instr` slots) was
+   considered and rejected: W^X is PAGE-granular and `Chunk::code` is
+   malloc'd vector storage (you'd make interpreter data executable, or
+   go RWX — forbidden on hardened macOS); and mixing instruction fetch
+   with the interpreter's DATA reads of neighboring slots on the same
+   cache lines trips x86's self-modifying-code machinery (pipeline
+   flushes). A per-chunk mmap'd buffer + an `EnterNative` opcode gives
+   the same incrementality and any-length fragments with none of that.
+2. **The unit is the RUN (maximal compilable sequence), not the op.**
+   A predicted call+ret costs ~2-4 cycles; one dispatch ~4-8 (more
+   mispredicted). Single-op fragments are break-even AT BEST. One
+   fragment entry must amortize over N ops (profit from N >= ~4), and
+   the real prize is a run containing its own BACK EDGE: the loop
+   iterates natively, zero dispatches per iteration.
+3. **Native code NEVER throws and never calls anything that can.**
+   Fragments are frameless leaf code with no unwind tables — a C++
+   exception propagating through them is std::terminate. EVERY
+   exceptional condition (a negative shift count, a trapping idiv
+   combination) is a BAIL: return the op's pc, the interpreter
+   re-executes that op and throws with the proper loc/caret. Error
+   behavior stays byte-identical by construction.
+4. **AOT is a pure post-load chunk transform.** It runs after
+   `codegen_chunk` AND after a `.myv` load, identically — `.myv` stays
+   portable and never contains machine code.
+5. **Hand-rolled emitter, zero deps.** Instruction encodings are ISA
+   facts (no copyright concern; original code). Copy-and-patch-style
+   stencils would need LLVM at build time — excluded by the no-deps
+   rule; our op set is small enough that a direct emitter is ~500-800
+   lines.
+
+## Runtime pieces
+
+- **`Chunk::native`**: an owning handle (mmap length + base; munmap
+  deleter; never copied, never serialized) for the chunk's fragment
+  buffer. Emitted into `PROT_READ|WRITE`, then flipped to
+  `PROT_READ|EXEC` (strict W^X; plain `mprotect` on Linux and macOS
+  x86-64 — `MAP_JIT`/`pthread_jit_write_protect_np` is an arm64-era
+  concern, deferred with arm64 itself).
+- **`OpCode::EnterNative`**: `a` = the byte offset of the fragment
+  entry. Handler:
+  `pc = ((NativeFrag)(base + off))(&ctx.frame->at(0));` then dispatch.
+  (One new opcode total — mind the documented front-end sensitivity:
+  the JIT-OFF configuration must be A/B-verified neutral too.)
+- **The fragment ABI**: `size_t frag(LValue *slots)` — System V; slots
+  base in `rdi`, resume pc returned in `rax`. Fragments use ONLY
+  caller-saved registers (rax rcx rdx rsi r8-r11, xmm0-5): no
+  prologue/epilogue beyond `ret`, nothing to preserve. v1 fragments
+  touch NOTHING but the slot window — no ctx, no chunk (everything
+  else is baked as immediates at emit time).
+
+## Slot access contracts (the correctness core)
+
+- **Reads** (`th`-proven int/float operands): the release interpreter
+  already does a RAW union load (`getval<int_type>`; the type-tag
+  check is VM_HARDENING-only). Native does the same:
+  `mov rax, [rdi + slot*sizeof(LValue) + offsetof(val.ival)]`. Bool
+  flows as int exactly as the interpreter's readers do (a bool-typed
+  slot read via the int path needs the same is<bool> promotion the
+  interpreter has — v1 can BAIL on a non-int tag instead, one compare,
+  keeping reads exact; measure which).
+- **Int/float slot WRITES are two unconditional stores** — store the
+  type-singleton pointer (an imm64 kept in a register per fragment),
+  store the payload. Sound because slots are NEVER reused across
+  variables (`next_slot` is monotonic — the resolver invariant): a
+  `th==i` destination only ever holds none/int/bool over its lifetime,
+  all trivial (no release needed), and storing value+type is exactly
+  what `LValue::put`'s inline fast path does for a trivial old value.
+  This is BRANCHLESS — simpler than the interpreter's own write path.
+  (v1 scope: FRAME slots only. Captures/globals keep the interpreter.)
+- **Layout dependencies**: `sizeof(LValue)`, the union payload offset,
+  and the `AllTypes` singleton addresses are baked as immediates —
+  static_asserts at the emitter pin them.
+
+## The v1 op set (the audited never-throw scalar tier)
+
+Exactly the set two prior audits produced (B1/B2 narrow gates,
+`op_writes_scalar`):
+
+- `IntAddRR/RI`, Sub, Mul, And, Or, Xor (2-4 instrs each, memory
+  operands through rax/rcx)
+- `IntShlRR/RI`, `IntShrRR/RI`: inline count checks; an out-of-range /
+  negative count BAILS (the interpreter's `bit_shl/bit_shr` throw
+  `InvalidValueEx` with the right caret; saturation semantics for
+  count >= 64 emitted inline for the non-throw cases)
+- `IntModRI`: `idiv` — the imm is nonzero by selection; imm == -1 is
+  EXCLUDED at selection (INT64_MIN % -1 traps #DE on x86; the
+  interpreter's -fwrapv path defines it)
+- `FloatAdd/Sub/MulRR/RI` (`movsd/addsd/subsd/mulsd`), int operand
+  promotion via `cvtsi2sd`
+- `JumpUnlessIntCmp` / `JumpUnlessFloatCmp` → `cmp`/`ucomisd` + `jcc`
+  to a fragment-local label (intra-run) or an exit (`mov eax, pc; ret`)
+- `ForLoopStep`, `IntAddStep`, `IntAddModRI` (imm != -1),
+  `LoadImmInt/Float`, `MoveV` between two PROVEN-scalar slots only,
+  `Jump` (intra-run: `jmp`; out: exit)
+- Explicitly NOT in v1: anything boxed, calls, containers
+  (`LoadElemInt` is the designated v2 candidate: type+skind+bounds
+  checks with a bail), div/mod by register (splits the run), captures,
+  globals, `MathFnV` (callable-from-native is v2 glue — `vm_math_fn`
+  never throws, but calling C++ needs ABI care).
+
+This covers the inner loops of 01, 02, 03, 05, 06, 07, 43, 45, 53, 56,
+57, 59, 60, 61, mandelbrot's kernel, and fib's unrolled body — the
+dispatch-bound tier.
+
+## Run discovery + patching (`aot_chunk`, post-codegen/post-load)
+
+1. Compute branch targets over the whole chunk (`visit_pc_fields` —
+   the existing audited enumeration).
+2. Find maximal runs of v1-compilable ops. v1 constraint: NO external
+   branch targets an interior pc (single entry at the head); intra-run
+   branches become fragment-local labels — a run containing its own
+   back edge iterates natively. Runs shorter than `MIN_RUN` (~4,
+   tunable by measurement) are skipped.
+3. For each run: emit the fragment (two passes for label fixups —
+   emit with rel32 placeholders, patch); every exit and every bail
+   site is `mov eax, <resume pc>; ret`.
+4. **INSERT** an `EnterNative` at the run head (do NOT overwrite the
+   first op: any op can bail on its very first execution — e.g. the
+   shift-count case — and the bail contract requires every interior
+   pc's original `Instr` intact for resumption). Inserting shifts pcs:
+   remap all pc fields + the pc-keyed side tables (locs, inline_ctxs)
+   with the compaction pass's existing prefix-sum machinery, run once
+   per chunk after all insertions.
+5. Flip the buffer RX. Store the handle on the chunk.
+
+Bail semantics recap: a bail returns the pc of the op that could not
+complete natively, WITHOUT side effects for that op (checks precede
+stores in the emitted sequence). The interpreter re-executes it fully
+(and throws if that's the outcome). Re-entry happens naturally the
+next time control reaches the run head.
+
+## Gating, config, CI
+
+- `#if defined(__x86_64__) && !defined(_WIN32)` — everything else
+  simply never creates fragments; zero behavior change.
+- **Kill switch**: `-nojit` + `MYLANG_JIT=0` env. This is also the
+  measurement lever: the per-phase A/B is THE SAME BINARY, JIT on vs
+  off (cleaner than cross-binary), on top of the usual cross-binary
+  full-suite rule vs the pre-JIT baseline.
+- VM_HARDENING: fragments bypass `Frame::at`/tag checks by
+  construction. The hardened lanes still exercise them (the checks
+  guard the interpreter's paths); CI adds a `MYLANG_JIT=0` variant of
+  one lane so both configurations stay green. RECYCLE/ASan lanes are
+  unaffected (no AST interaction); fragments run fine under valgrind.
+- `-vd` gains a per-chunk "native runs" section: each run's pc span,
+  fragment offset/size, and a hex dump of the bytes (external
+  `objdump -D -b binary -m i386:x86-64` disassembles it; an in-tree
+  x86 disassembler is NOT in scope).
+
+## Phases (each lands fully validated; stop when returns diminish)
+
+- **N0 — plumbing + emitter core.** The mmap/mprotect handle, the
+  byte emitter (the ~15 needed forms: mov r/m64, arithmetic r/r r/imm,
+  cmp, jcc/jmp rel32, movsd family, cvtsi2sd, idiv, ret), the
+  `EnterNative` op + handler, the kill switch, and ONE hand-written
+  smoke fragment behind a hidden test hook. Unit tests for the emitter
+  (encode → expected bytes).
+- **N1 — straight-line int runs.** No branches inside runs yet
+  (`MIN_RUN` gates profit). Differential + fuzzer green with JIT on;
+  full-suite A/B (JIT on/off + vs the pre-JIT binary) — expected
+  small-positive; the POINT of N1 is proving the contract, not speed.
+- **N2 — intra-run branches + the native back edge.** Loops iterate
+  natively. This is where the numbers move: expect 2-4x VM-wall on the
+  dispatch-bound benches, suite geomean +10-25% (v1, slots in memory).
+- **N3 — floats** (the SSE tier + promotion): mandelbrot/54/55-class.
+- **N4 — polish tier.** The bool-read promotion decision, shift bail
+  coverage tests, `LoadElemInt` (+bounds bail), `MathFnV` via a
+  C-call-safe glue, `MIN_RUN` tuning by measurement.
+- **N5 — fragment-local register caching.** Hot slots live in
+  registers within a fragment (load once, flush at every exit/bail).
+  Int loops approach native C. Only after N2 proves the structure;
+  this is the first phase with real compiler-ish complexity — evaluate
+  honestly whether the win justifies it.
+
+## Deferred (explicitly out of scope until the above earns it)
+
+- arm64 (macOS Apple Silicon: MAP_JIT + jit-write-protect dance),
+  Windows (VirtualAlloc/FlushInstructionCache).
+- Native calls (`CallV`/`vm_enter_call`), boxed ops, exceptions,
+  containers beyond LoadElemInt, captures/globals.
+- Profile-guided run selection (compile-on-Nth-entry); v1 compiles
+  eligible runs unconditionally at AOT time — measure whether compile
+  time ever matters (it won't for scripts this size).
+- Serializing fragments (never: `.myv` stays portable).
+
+## Risks, named
+
+- **Unwinding**: rule 3 is absolute — audit every emitted sequence and
+  every future "just call this helper" temptation against it.
+- **#DE traps**: idiv INT64_MIN/-1 and the imm==-1 exclusion; a
+  division-family op added later must re-check this.
+- **Layout drift**: LValue/union/AllTypes immediates — static_asserts
+  at the emitter + the differential catches semantic drift.
+- **Front-end/layout sensitivity** (the documented WSL2 lesson): the
+  JIT-OFF path must measure neutral vs the pre-JIT binary (one new
+  opcode + handler); measure, don't assume.
+- **The stale-binary trap**: every measurement per the hard rule —
+  same session, both binaries rebuilt, interleaved.
