@@ -460,8 +460,17 @@ silently drift. Measured (same-binary JIT off vs on): VM-wall geomean
 19_foreach_indexed 0.565x (foreach-over-array is a counted loop +
 LoadElemInt), sieve/matrix reads 0.92-0.95x.
 
-**`-vdj`** dumps the post-JIT image with each native fragment
-DISASSEMBLED (see the disasm section / the `-vdj` flag).
+**`-vdj` - the post-JIT dump (jit disassembler, disasm.cpp).** Like
+`-vd` but each `enter.nat` line is followed by its FRAGMENT's x86-64
+disassembly - hex bytes + mnemonics, `; vm pc N` markers linking the
+native code back to the VM ops it implements, and `slotN`/`slotN.type`
+labels for the frame-window accesses. A self-contained decoder for
+exactly the forms the emitter produces (unknown byte -> `.byte`, the
+next op mark resyncs); slot-window layout (stride 48, payload +0, type
++24) mirrored for the labels. The op-boundary MARKS are recorded during
+codegen ONLY when `g_jit_annotate` (set by `-vdj`) - zero cost on a
+normal run. The one dev tool that lets a human read the generated
+machine code alongside the bytecode.
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
@@ -528,6 +537,9 @@ Running scripts:
                                  # its POOLS (consts/catch_types/…/side tables);
                                  # closures + their capture struct shown, 256-
                                  # color syntax-highlighted on a TTY
+./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
+                                 # each JIT fragment, interleaved under its
+                                 # `enter.nat` line with `; vm pc N` markers
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang -dti FILE   # dump every identifier's inferred type + uses
 ./build/mylang -a FILE           # analyze: source colored by optimization

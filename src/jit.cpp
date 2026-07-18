@@ -46,6 +46,7 @@
 #endif
 
 unsigned long g_jit_frags = 0;
+bool g_jit_annotate = false;
 
 #if ML_JIT_SUPPORTED
 static bool jit_default_enabled()
@@ -925,8 +926,12 @@ void jit_compile_chunk(Chunk &chunk)
 
         std::vector<size_t> label(end - begin, 0);
         std::vector<Fixup> fixups;
+        std::vector<NativeCode::OpMark> marks;
         for (size_t pc = begin; pc < end; pc++) {
             label[pc - begin] = e.pos();
+            if (g_jit_annotate)
+                marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
+                                  static_cast<uint32_t>(remap[pc]) });
             const Instr &in = chunk.code[pc];
             if (op_is_branch(in.op)) {
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
@@ -944,7 +949,20 @@ void jit_compile_chunk(Chunk &chunk)
             e.patch32(f.site,
                       static_cast<uint32_t>(dst - (f.site + 4)));
         }
+        if (g_jit_annotate)
+            chunk.native.frags.push_back(
+                { static_cast<uint32_t>(frag_off[r]), 0, std::move(marks) });
         g_jit_frags++;
+    }
+
+    /* fill each fragment's byte length (start of the next, or the end) */
+    if (g_jit_annotate) {
+        for (size_t r = 0; r < chunk.native.frags.size(); r++) {
+            const uint32_t nxt = r + 1 < frag_off.size()
+                ? static_cast<uint32_t>(frag_off[r + 1])
+                : static_cast<uint32_t>(e.b.size());
+            chunk.native.frags[r].len = nxt - chunk.native.frags[r].start;
+        }
     }
 
     /* Rebuild the code vector with the EnterNative heads inserted and
