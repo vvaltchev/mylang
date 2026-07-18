@@ -644,17 +644,16 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
         read_slot(e, reg, slot);
 }
 
-/* Ref-listed store guard: bail ONLY when the slot CURRENTLY holds a real
- * reference (`type->t >= t_str` - a handle whose release needs C++). A
- * trivial current value (none/int/float/bool, `< t_str`) is safe to
- * overwrite in place, so it must NOT bail - the old `!= t_int/t_float`
- * check bailed on those too, so a reused temp whose first write found it
- * `none` dropped the WHOLE loop to the interpreter (the bench-40 bug).
- * Uses rcx as scratch (dead at every store site). NOTE (approach A): the
- * bail here will become a `call jit_put_scalar` helper (release + store,
- * stay native) - the guard/offsets are identical either way. */
-static void emit_ref_bail_check(Emitter &e, int32_t type_off,
-                                uint32_t bail_pc)
+/* Ref-listed store guard (approach A): a reused temp on the chunk's ref
+ * list may CURRENTLY hold a reference (`type->t >= t_str`), whose release
+ * needs C++. The store is therefore: TEST the current type; a REFERENCE ->
+ * call a noexcept put helper (release + store, stay native); a TRIVIAL
+ * current value (none/int/float/bool, `< t_str`) -> the fast two-store. It
+ * NEVER bails - a bail on the trivial case dropped the whole loop to the
+ * interpreter (the bench-40 bug: iteration 1 finds the temp holding a
+ * stale ref). emit_ref_check emits the test and returns the `jb` to be
+ * patched to the fast path. Uses rcx as scratch (dead at every store). */
+static size_t emit_ref_check(Emitter &e, int32_t type_off)
 {
     const JitLayout &L = jit_layout();
     e.load(RCX, type_off);                    /* rcx = current Type* */
@@ -662,24 +661,87 @@ static void emit_ref_bail_check(Emitter &e, int32_t type_off,
     e.u32(static_cast<uint32_t>(L.type_t_off));
     e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
     e.u32(static_cast<uint32_t>(L.t_str_val));
-    const size_t j = e.j8(0x72);               /* jb -> store (trivial value) */
-    e.exit_pc(bail_pc);
-    e.patch8(j, e.pos());
+    return e.j8(0x72);                         /* jb -> fast (trivial value) */
+}
+
+/* Approach-A slow-path helpers: release the slot's current value and store
+ * a scalar (int / float). Called from native ONLY on the ref path (cold,
+ * once per reused temp). noexcept: a scalar put never throws. */
+static void jit_put_int(LValue *lv, int_type v) noexcept
+{
+    lv->put(EvalValue(v));
+}
+
+/* A helper CALL clobbers every caller-saved GP reg. The fragment relies on
+ * rdi (slots base), rsi (t_int), r8 (t_float) AND the N5 cache regs
+ * r10/r11 (which hold a hot slot's LIVE in-register value). rdi + the cache
+ * regs are PUSHED across the call and popped after; rsi/r8 are constant
+ * singletons, re-materialised. (rax/rcx/rdx are per-op scratch - the store
+ * is the last thing in an op, so the next op reloads them.) 16-alignment:
+ * entry rsp % 16 == 8, so an ODD number of pushes lands aligned; 1 rdi +
+ * ncache pushes need a pad iff ncache is odd.
+ *
+ * MISSING THIS was a correctness bug: the int-store helper clobbered a
+ * cached accumulator/counter (r10/r11) in an int run (a float/libm run
+ * caches nothing, so it was masked), a nested_fuzz find. */
+static void emit_call_prologue(Emitter &e)
+{
+    e.push_reg(RDI);
+    for (const Emitter::CacheEnt &c : e.cache)
+        e.push_reg(c.reg);
+    if (e.cache.size() % 2 == 1)               /* pad: 1+ncache even */
+        { e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08); }   /* sub rsp,8 */
+}
+
+static void emit_call_epilogue(Emitter &e)
+{
+    if (e.cache.size() % 2 == 1)
+        { e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08); }   /* add rsp,8 */
+    for (size_t i = e.cache.size(); i-- > 0; )
+        e.pop_reg(e.cache[i].reg);
+    e.pop_reg(RDI);
+    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+    e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+}
+
+/* Emit a call to the INT put helper: rdi = &frame->slots[slot], rsi = the
+ * int value (src_reg). rdi still = the slots base after the prologue's
+ * pushes, so lea computes &slot; src_reg (rax/rdx) is not among the saved
+ * regs, so it survives. */
+static void emit_put_int_call(Emitter &e, const void *fn, int slot,
+                              uint8_t src_reg)
+{
+    emit_call_prologue(e);
+    e.mov_rr(RSI, src_reg);              /* rsi = the int value (2nd arg) */
+    e.lea_rdi(static_cast<int32_t>(static_cast<long>(slot)
+                                   * static_cast<long>(sizeof(LValue))));
+    e.call_relocs.push_back({ e.pos(), fn });
+    e.u8(0xE8); e.u32(0);                /* call rel32 (patched later) */
+    emit_call_epilogue(e);
 }
 
 /*
- * Store rax (or rdx for the idiv remainder) into the dst slot. A dst on the
- * chunk's ref list may CURRENTLY hold a reference (a reused temp); if so we
- * bail (approach A: a helper release). Everything else is the branchless
- * two-store (contract 3).
+ * Store rax (or rdx for the idiv remainder) into the dst slot. A ref-listed
+ * dst that currently holds a reference goes through jit_put_int (release +
+ * store); everything else is the branchless two-store (contract 3).
  */
 static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
                       int dst, uint32_t bail_pc)
 {
+    (void)bail_pc;                       /* no bail: helper on the ref path */
     const SlotAddr a = slot_addr(dst);
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                           static_cast<int32_t>(dst)))
-        emit_ref_bail_check(e, a.type, bail_pc);
+                           static_cast<int32_t>(dst))) {
+        const size_t jb_fast = emit_ref_check(e, a.type);
+        emit_put_int_call(e, reinterpret_cast<const void *>(jit_put_int),
+                          dst, src_reg);
+        const size_t jmp_done = e.j8(0xEB);   /* jmp done */
+        e.patch8(jb_fast, e.pos());           /* fast: */
+        e.store(RSI, a.type);                 /* the int Type singleton */
+        e.store(src_reg, a.payload);
+        e.patch8(jmp_done, e.pos());          /* done */
+        return;
+    }
     e.store(RSI, a.type);        /* the int Type singleton */
     e.store(src_reg, a.payload);
 }
@@ -817,20 +879,16 @@ static void jit_put_float(LValue *lv, double v) noexcept
     lv->put(EvalValue(v));
 }
 
-/* Emit a call to a scalar-put helper: rdi = &frame->slots[slot] (the arg),
- * the value already in xmm0. Saves/restores the slots base and re-loads the
- * type singletons, like emit_libm_call (the helper is in our .text - far
- * from the JIT buffer - so the reloc resolves via a trampoline). */
+/* Emit a call to the FLOAT put helper: rdi = &frame->slots[slot] (the arg),
+ * the value already in xmm0 (a GP-reg save can't touch it). */
 static void emit_put_scalar_call(Emitter &e, const void *fn, int slot)
 {
-    e.push_reg(RDI);                     /* save slots base + 16-align rsp */
+    emit_call_prologue(e);               /* save rdi + cache regs, align */
     e.lea_rdi(static_cast<int32_t>(static_cast<long>(slot)
                                    * static_cast<long>(sizeof(LValue))));
     e.call_relocs.push_back({ e.pos(), fn });
     e.u8(0xE8); e.u32(0);                /* call rel32 (patched later) */
-    e.pop_reg(RDI);
-    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-    e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+    emit_call_epilogue(e);
 }
 
 /* Load a float OPERAND into xmm<r>. A lit: movabs the double bits +
@@ -864,9 +922,9 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
 }
 
 /* Store xmm<r> (a float result) into a scalar dst: t_float type + the
- * double payload. A ref-listed dst (a reused temp - e.g. a float math temp
- * later holding a string) bails ONLY if it CURRENTLY holds a reference
- * (emit_ref_bail_check); a trivial current value is overwritten in place. */
+ * double payload. A ref-listed dst that currently holds a reference goes
+ * through jit_put_float (release + store); a trivial current value takes
+ * the fast two-store. NEVER bails (see emit_ref_check). */
 static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
                              int dst, uint32_t bail_pc)
 {
@@ -874,16 +932,7 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
     const SlotAddr a = slot_addr(dst);
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
-        /* Ref-listed dst: if it CURRENTLY holds a reference (type->t >=
-         * t_str), release+store via the helper (cold, once per temp); a
-         * trivial current value takes the fast two-store. NEVER bails. */
-        const JitLayout &L = jit_layout();
-        e.load(RCX, a.type);                  /* rcx = current Type* */
-        e.u8(0x8B); e.u8(0x89);               /* mov ecx, [rcx + type_t_off] */
-        e.u32(static_cast<uint32_t>(L.type_t_off));
-        e.u8(0x81); e.u8(0xF9);               /* cmp ecx, t_str_val */
-        e.u32(static_cast<uint32_t>(L.t_str_val));
-        const size_t jb_fast = e.j8(0x72);    /* jb -> fast (trivial value) */
+        const size_t jb_fast = emit_ref_check(e, a.type);
         emit_put_scalar_call(e, reinterpret_cast<const void *>(jit_put_float),
                              dst);            /* xmm0 holds the value */
         const size_t jmp_done = e.j8(0xEB);   /* jmp done */
@@ -937,12 +986,13 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
  * short-range branch will need there too. */
 static void emit_libm_call(Emitter &e, const void *fn)
 {
-    e.push_reg(RDI);                      /* save base; 16-aligns rsp */
+    /* args in xmm0[/xmm1] (GP-reg saves don't touch them). A MathFnV run
+     * caches nothing today, so the prologue is usually just `push rdi` -
+     * but going through it keeps the call correct if that ever changes. */
+    emit_call_prologue(e);
     e.call_relocs.push_back({ e.pos(), fn });   /* off = the E8 opcode */
     e.u8(0xE8); e.u32(0);                 /* call rel32 (patched later) */
-    e.pop_reg(RDI);
-    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
-    e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+    emit_call_epilogue(e);
 }
 
 /* Emit one op; returns false if (unexpectedly) unhandled. */
