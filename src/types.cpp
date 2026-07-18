@@ -756,6 +756,7 @@ EvalContext::SymbolsType EvalContext::builtins =
  * mutated (it outlives any one program, e.g. across -rt tests).
  */
 static std::vector<LValue> g_builtin_slots;
+static std::vector<const UniqueId *> g_builtin_names;   /* slot -> name */
 /* Per slot: did this builtin come from const_builtins? A const-eval context
  * (AutoConst / the inliner's refold) must see ONLY const builtins - mirroring
  * the const EvalContext, which loads only const_builtins - so a runtime-builtin
@@ -775,6 +776,7 @@ build_builtin_table_once()
             return;
         g_builtin_index[uid] = static_cast<int>(g_builtin_slots.size());
         g_builtin_slots.emplace_back(lv.get(), /*is_const=*/true);
+        g_builtin_names.push_back(uid);
         g_builtin_is_const.push_back(is_const ? 1 : 0);
     };
 
@@ -797,6 +799,18 @@ LValue &
 builtin_slot(int index)
 {
     return g_builtin_slots[index];
+}
+
+/* The registered NAME of a builtin-table slot (works for any entry -
+ * a Builtin function OR a value like `argv`, which find_builtin_name
+ * cannot resolve). For the disassembler's `load.builtin` annotation. */
+std::string_view
+builtin_slot_name(int index)
+{
+    build_builtin_table_once();
+    if (index >= 0 && static_cast<size_t>(index) < g_builtin_names.size())
+        return g_builtin_names[index]->val;
+    return "?";
 }
 
 bool
