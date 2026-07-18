@@ -237,6 +237,38 @@ their bug-finding power; test a pool-ACTIVE debug build with
 23_dict_insert 0.929x, 10_recursion_deep 0.968x, suite VM-wall 0.987,
 my/py 4.70-4.71x.
 
+**POOLING `std::vector`/`std::string` WAS INVESTIGATED AND REJECTED
+(2026-07-19).** The idea (extend `PoolAlloc` to the hot ELEMENT vectors -
+`SharedArrayObj`'s int/float/general/struct vectors, `std::string`,
+boxed-struct fields - to cut malloc churn + bench jitter) does NOT pay,
+for two MEASURED reasons: **(1) a custom allocator DEFEATS libstdc++'s
+trivially-copyable memmove fast path.** libstdc++ only bulk-`memcpy`s a
+vector grow/copy when the allocator is `std::allocator` (the
+`__is_default_allocator` check in `stl_uninitialized.h`); a
+`vector<int_type, PoolAlloc<>>` reserve/clone/concat falls back to an
+ELEMENT-WISE scalar copy loop - **+56% instructions on 17_array_concat**
+(callgrind: `__memcpy_avx_unaligned_erms` 35% -> `vector::reserve`
+element-wise 37%). So pooling can only ever apply to NON-trivial element
+types (`LValue`, `SharedStr`), where the copy is already element-wise -
+and there the win is ~0.5% (the malloc is a sliver of a non-trivial
+copy). The only way to pool the flat numeric arrays + strings without the
+memmove regression is a GLOBAL `operator new`/`delete` replacement (keeps
+`std::allocator`, so memmove survives) - a bigger, riskier change
+(reentrancy, size-header, global blast radius) that STILL wouldn't help,
+because **(2) the bench jitter is SCHEDULING-bound, not allocation-bound.**
+The benches that abort the variance gate or need a scale bump
+(04_float_arith, 01_while_loop, 26_dict_iterate, 52_cse_dedup) barely
+allocate - 04_float_arith allocates NOTHING in its hot loop and still
+swings 5%+ run-to-run. Pooling cannot touch scheduling/frequency noise;
+`nice` + best-of-N + the adaptive rep gate (bench/run.py) are the only
+levers for it. **Net: `malloc` is NOT the value-model bottleneck.** The
+suite geomean was flat (0.999x) even before the memmove regression was
+scoped out. The real gap to native C++ (my/cpp ~4.6x) is the value
+model's per-op cost: **EvalValue boxing/unboxing, intrusive_ptr
+retain/release churn, and virtual `Type`-op dispatch** - that is where
+performance work belongs, not the allocator. (Don't re-attempt container
+pooling; see poolalloc.h.)
+
 **B3 - THE 32-BYTE PACKED `Instr` (bytecode.h).** `sizeof(Instr) == 32`
 (static_asserted), down from 56: `slot` and `lit` are mutually exclusive
 (is_lit discriminates), so each operand is ONE 8-byte payload (`pa`/`pb`,
