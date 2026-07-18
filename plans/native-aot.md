@@ -257,6 +257,51 @@ next time control reaches the run head.
   `write_slot`/`load_operand`; the raw `slot_addr` reads that remain are on
   `bad()`-disqualified (`LoadElem` base/index) slots only.
 
+- **N6a — native math builtins + THE REF-STORE FIX (LANDED, and the
+  turning point).** `MathFnV` (`sqrt`/`sin`/`cos`/`log`/`exp`/`pow`/...)
+  became JIT-eligible: `sqrt`/float-cast → SSE (`sqrtsd`/`cvtsi2sd`), the
+  transcendentals → a libm call emitted as a bare 5-byte `E8 rel32` (no NOP
+  padding), patched post-mmap to libm directly (the anon mmap lands next to
+  libm — measured) or to an in-buffer trampoline (`movabs; jmp` — the
+  arm64-veneer shape). **But the real discovery was that the JIT was
+  BAILING across the suite and running interpreted.** A ref-listed scalar
+  store (a reused temp that later holds a string) tested `type == t_int/
+  t_float; jne BAIL` — which bailed on a TRIVIAL current value (`none` on
+  iteration 1) too, so the fragment bailed at the first store and the whole
+  loop ran interpreted (native UNUSED). Every "native builtins are neutral"
+  number was interpreter-vs-interpreter. **Fix = approach A**: test
+  `type->t >= t_str` (a REAL reference — offset/value probed into
+  `JitLayout`); a reference calls a noexcept helper (`jit_put_int`/
+  `jit_put_float`: release + store, stay native, cold/once-per-temp), a
+  trivial value takes the fast two-store — NEVER bails. Same-binary JIT off
+  vs on once fixed: `08_func_call` **0.49x**, `07_nested_loops` **0.58x**,
+  `40_math` **0.72x** (my/py 5.6x→**7.7x**), `49`/`51` ~0.7x, broad −3–7%,
+  no regressions. This validated **approach A** as the JIT's new contract
+  (see below).
+
+## Approach A — the JIT's contract (compile-time fallback, no runtime bail)
+
+The N0–N5 "keep the interpreted originals + bail-to-re-interpret" model is
+the AST-fallback anti-pattern: a double copy of every op, and one bail drops
+a whole loop to the interpreter (the bench-40/int-store bug). **The correct
+model, being rolled out:** the fallback is a COMPILE-TIME decision — a run
+we can PROVE is fully handleable in native (fast paths inline + noexcept C++
+HELPER CALLS for the hard parts: ref-release, array/dict ops, exception
+raise) is compiled and the interpreted originals are DELETED; an op we can't
+prove → the VM instruction stays (the only fallback). NO runtime bail.
+- **ref-release**: `jit_put_int`/`jit_put_float` (DONE).
+- **exceptions (div0/OOB/shift)**: emit the check inline; on the fault path
+  `call jit_raise(chunk, pc, kind)` (noexcept: builds the exception, stamps
+  the caret from the loc table, sets `g_vm_exc_pending`, returns a
+  sentinel); `EnterNative` routes the sentinel to the frame-walk — exact
+  caret, no re-interpret. (NEXT.)
+- **arrays/dicts/strings**: don't nativize the data structures — CALL the
+  same C++ the interpreter calls (a helper per op). (NEXT.)
+- **delete the interpreted originals** for a fully-native run (single-entry;
+  a rare interior external target splits the run). (NEXT.)
+Native MyLang calls (`vm_enter_call`) then reuse the same helper-call
+mechanism.
+
 ## The path to 10x — why it is NOT the N-series (N6/N7 sketch)
 
 MEASURED reality (same-binary JIT off→on): the JIT already delivers

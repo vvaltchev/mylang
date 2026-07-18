@@ -513,6 +513,38 @@ shift-by-register handler read its count raw - both fixed. The only raw
 `slot_addr` reads left are on `bad()`-disqualified `LoadElem` base/index
 slots (never cached). See plans/native-aot.md.
 
+**N6a - NATIVE MATH BUILTINS (`MathFnV`) + the REF-STORE FIX.** A typed
+math-builtin (`sqrt`/`sin`/`cos`/`log`/`exp`/`pow`/... - `MathFnV`) is now
+JIT-eligible: `sqrt`/float-cast lower to a pure SSE `sqrtsd`/`cvtsi2sd`, the
+transcendentals to a libm CALL. **The call is a bare 5-byte `E8 rel32`, no
+NOP padding** - patched after mmap to libm DIRECTLY (the anon `mmap(nullptr)`
+lands within +-2GB of libm - MEASURED, and how the kernel lays anon maps
+next to the loaded libs) or, out of range, to an out-of-line TRAMPOLINE in
+the same buffer (`movabs rax,fn; jmp rax`, always reachable - also the
+arm64-`BL`-veneer shape). **THE LOAD-BEARING FIX** (found because callgrind
+showed the interpreter STILL running bench 40 under JIT-on): a ref-listed
+scalar store (`store_dst`/`emit_float_store` - a reused temp that later
+holds a string, so it CAN hold a reference) used to `cmp type == t_int/
+t_float; jne BAIL`. That bailed on a TRIVIAL current value too (`none` on
+iteration 1), so the fragment bailed at the first store and the interpreter
+ran the WHOLE loop - the native code was UNUSED, and every "native builtins
+are perf-neutral" measurement was interpreter-vs-interpreter. The fix
+(**approach A**: a compile-time-proven native path, never a runtime bail):
+test `type->t >= t_str` (a REAL reference - offset + `t_str` value probed
+into `JitLayout`); a reference calls a noexcept C++ helper (`jit_put_int`/
+`jit_put_float` - release + store, STAY native, cold/once-per-temp), a
+trivial value takes the fast two-store. Effect (same-binary JIT off vs on):
+the JIT was silently bailing across the suite - `08_func_call` **0.49x**,
+`07_nested_loops` **0.58x**, `40_math_builtins` **0.72x** (my/py 5.6x ->
+**7.7x**), `49_autoconst_fold`/`51_purefunc_fold` ~0.7x, broad -3-7%; no
+regressions. This is the model for the whole JIT (approach A, see
+plans/native-aot.md): call the SAME C++ the interpreter calls (arrays/dicts/
+exceptions) from native, prove handling at COMPILE time, and DELETE the
+interpreted original - no double copy, no runtime re-interpret.
+**`-vdj`:** decodes `push`/`pop`/`call`/`sqrtsd`/`nop`/`E8`-rel32 and shows
+big `movabs` constants in hex (a `call rax` had rendered as `dec rax` - a
+ModRM `/digit` decode bug).
+
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
 code-label addresses generated in enum order from `ML_FOR_EACH_OPCODE`
