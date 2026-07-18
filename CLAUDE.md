@@ -540,7 +540,18 @@ the JIT was silently bailing across the suite - `08_func_call` **0.49x**,
 regressions. This is the model for the whole JIT (approach A, see
 plans/native-aot.md): call the SAME C++ the interpreter calls (arrays/dicts/
 exceptions) from native, prove handling at COMPILE time, and DELETE the
-interpreted original - no double copy, no runtime re-interpret.
+interpreted original - no double copy, no runtime re-interpret. **Landed on
+that model:** **`jit_raise`** - an OOB / negative-shift fragment stores a
+`JitRaiseKind` to `g_vm_jit_raise` + exits to the op's pc, and `EnterNative`
+raises via `vm_raise` (caret from the loc table, catchable) instead of
+re-interpreting; and **delete-originals** - a run that is `op_fully_native`
+(every op a non-throwing int op) AND single-entry has its interpreted ops
+DROPPED from the bytecode (the remap maps every run pc to the EnterNative),
+so `-vd` of a native int loop is just `enter.nat` (`-vdj` shows the fragment)
+- a `.myv`-ready no-double-copy shape. A HELPER CALL clobbers r10/r11 (the N5
+cache), so rdi + the active cache regs are pushed/popped around EVERY helper/
+libm call (a nested_fuzz-found reg-clobber; a float/libm run caches nothing,
+which masked it at first).
 **`-vdj`:** decodes `push`/`pop`/`call`/`sqrtsd`/`nop`/`E8`-rel32 and shows
 big `movabs` constants in hex (a `call rax` had rendered as `dec rax` - a
 ModRM `/digit` decode bug).
