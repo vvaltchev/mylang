@@ -295,8 +295,14 @@ struct Emitter {
     void push_reg(uint8_t r) { if (r >= 8) u8(0x41); u8(0x50 | (r & 7)); }
     void pop_reg(uint8_t r)  { if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
     void call_rax() { u8(0xFF); u8(0xD0); }   /* call rax (indirect) */
+    /* lea reg, [rdi + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
+     * rm = rdi = slots base). reg is a raw GP number (the Reg enum is
+     * declared after this struct, so lea_rdi passes 7). */
+    void lea(uint8_t reg, int32_t d)
+    { u8(0x48); u8(0x8D); u8(static_cast<uint8_t>(0x87 | (reg << 3)));
+      u32(uint32_t(d)); }
     /* lea rdi, [rdi + disp32]  (rdi = &frame->slots[slot], a helper arg) */
-    void lea_rdi(int32_t d) { u8(0x48); u8(0x8D); u8(0xBF); u32(uint32_t(d)); }
+    void lea_rdi(int32_t d) { lea(7, d); }
     /* cvtsi2sd xmm<r>, qword [rdi+disp]  (int -> double) */
     void cvt(uint8_t r, int32_t d)
     {
@@ -595,6 +601,13 @@ static bool jit_op_eligible(const Instr &in)
      * capture base (in.target != 0) isn't in the slot window -> interpreted.*/
     case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
         return in.target == 0;
+    /* Approach A: a DICT element store d[k] = v / d[k] OP= v. The fragment
+     * leas the base dict LValue* + the boxed key/value slot EvalValue*s and
+     * CALLS jit_dict_store (the interpreter's exact vm_subscript_store), so
+     * the counter loop no longer splits at the store. LOCAL base only.
+     * Measured ~6.5% wall / 12% fewer instrs on 23_dict_insert. */
+    case OpCode::DictStore:
+        return in.target == 0;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -859,6 +872,12 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             if (!in.b_is_lit()) bad(in.b_slot());    /* value is a FLOAT */
             if (!in.a_is_lit()) usei(in.a_slot());   /* index (int) */
             break;
+        case OpCode::DictStore:
+            /* the fragment passes &slot for base/key/value, so those slots
+             * must hold CURRENT EvalValues - a cached int key (a counter used
+             * as d[i]) would leave its slot stale. Disqualify all three. */
+            bad(in.target2); bad(in.a_slot()); bad(in.b_slot());
+            break;
         case OpCode::Jump:
             break;                       /* no slots */
         default:
@@ -1081,6 +1100,34 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
     e.patch8(j_ok, e.pos());
 }
 
+/* Approach A: a dict element store d[k] = v as a CALL to jit_dict_store. The
+ * key/value are BOXED EvalValues in frame slots, so the fragment just leas
+ * their addresses (EvalValue is the first LValue member). SysV: rdi=base
+ * LValue*, rsi=key EvalValue*, rdx=val EvalValue*, rcx=op. rdi written LAST
+ * (the key/val leas read rdi=slots). The key/val/base slots are disqualified
+ * from register caching (pick_cached_slots) so their slots hold CURRENT
+ * EvalValues - a cached int key (a counter used as d[i]) would be stale. */
+static void emit_dict_store(Emitter &e, const Instr &in, uint32_t pc)
+{
+    const auto off = [](int slot) {
+        return static_cast<int32_t>(static_cast<long>(slot)
+                                    * static_cast<long>(sizeof(LValue)));
+    };
+    emit_call_prologue(e);
+    e.lea(RSI, off(in.a_slot()));         /* rsi = &slot[key]  (rdi=slots) */
+    e.lea(RDX, off(in.b_slot()));         /* rdx = &slot[val]  (rdi=slots) */
+    e.lea_rdi(off(in.target2));           /* rdi = &slot[base] (LAST) */
+    e.movabs(RCX, static_cast<uint64_t>(static_cast<int>(in.aop)));
+    e.call_relocs.push_back(
+        { e.pos(), reinterpret_cast<const void *>(jit_dict_store) });
+    e.u8(0xE8); e.u32(0);
+    emit_call_epilogue(e);
+    e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+    const size_t j_ok = e.j8(0x74);
+    e.exit_pc(pc);
+    e.patch8(j_ok, e.pos());
+}
+
 /* Emit one op; returns false if (unexpectedly) unhandled. */
 static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     uint32_t pc)
@@ -1291,6 +1338,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     case OpCode::StoreElemFloat:
         emit_store_elem(e, ck, in, pc, /*is_float=*/true);
+        return true;
+    case OpCode::DictStore:
+        emit_dict_store(e, in, pc);
         return true;
 
     default:
