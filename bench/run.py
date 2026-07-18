@@ -27,6 +27,8 @@
 #   python3 bench/run.py --filter slice  # only benchmarks whose name matches
 #                                        # (comma-separated for several)
 #   python3 bench/run.py --mylang ./build/mylang
+#   python3 bench/run.py -cl cpp         # compare vs C++ (cached) instead of py
+#   python3 bench/run.py -cl cpp --refresh-cache   # re-time the C++ (recompile)
 #   python3 bench/run.py --baseline OLD  # also time a 2nd mylang binary and
 #                                        # report cur/base speedup (before/after)
 #   python3 bench/run.py --csv out.csv   # also write the table as CSV
@@ -34,6 +36,8 @@
 #                                        # first, regressions last)
 
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -42,6 +46,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 MY_DIR = os.path.join(HERE, "my")
 PY_DIR = os.path.join(HERE, "py")
+BENCH_H = os.path.join(HERE, "cpp", "bench.h")   # affects every C++ bench
 
 # Per-bench workload scale lives in a committed table (name -> multiplier), so a
 # noisy short bench can be made reliable by bumping ITS scale without touching
@@ -292,6 +297,10 @@ def bench_variance(times):
 # at 3 (cheap); only a noisy one pays for 5/8; if it's STILL over threshold at 8
 # it is genuinely unstable - give up. `--repeat N` overrides this with a fixed N.
 REP_STEPS = (3, 2, 3)   # cumulative: 3, 5, 8
+# Reps for the comparison language when (re)populating its cache. It has no
+# variance gate (we don't optimize it) - a fixed best-of-N min is plenty, and
+# it's a one-time cost per (bench, scale, source).
+COMP_REPS = 5
 
 
 def measure_adaptive(cmd, threshold, timeout, steps=REP_STEPS):
@@ -352,6 +361,129 @@ def results_match(a, b):
     return True
 
 
+# ------------------------- comparison languages ---------------------------
+#
+# MyLang is timed on every run; the COMPARISON language (python by default,
+# selectable with --complang) is timed ONCE and CACHED - it doesn't change
+# between MyLang edits, so re-timing it every run is wasted work (and doubles
+# the suite cost). The cache (bench/.bench_cache/<lang>.json, git-ignored) keys
+# each bench by its scale + a content hash of its source(s); a stale/missing
+# entry (source changed, scale changed, or --refresh-cache) is re-timed and
+# re-cached. Adding a language = one CompLang entry + a bench/<subdir>/.
+
+class CompLang:
+    """An interpreted comparison language: bench/<subdir>/<name><ext>, run as
+    `interp + [src, scale]`. Compiled languages subclass and override
+    prepare()/content_hash()."""
+    def __init__(self, name, subdir, ext, interp):
+        self.name = name
+        self.subdir = subdir
+        self.ext = ext
+        self.interp = interp        # argv prefix, e.g. [python, "-B"]
+
+    def src(self, bench):
+        return os.path.join(HERE, self.subdir, bench + self.ext)
+
+    def has(self, bench):
+        return os.path.isfile(self.src(bench))
+
+    def content_hash(self, bench):
+        """Hash of everything that affects this bench's output/time - the
+        source; compiled langs add their shared headers."""
+        return _file_hash(self.src(bench))
+
+    def prepare(self, bench):
+        """Return (run_argv_prefix, error_or_None). Interpreted: no build."""
+        return (self.interp + [self.src(bench)], None)
+
+
+class CppLang(CompLang):
+    """C++: compile bench/cpp/<name>.cpp (-O3 -fwrapv) on demand, run the
+    binary. The compile depends on bench/cpp/bench.h too."""
+    def __init__(self, cxx):
+        super().__init__("cpp", "cpp", ".cpp", [])
+        self.cxx = cxx
+
+    def content_hash(self, bench):
+        return _file_hash(self.src(bench)) + _file_hash(BENCH_H)
+
+    def prepare(self, bench):
+        src = self.src(bench)
+        exe = src[:-4]                       # strip .cpp
+        need = (not os.path.exists(exe)
+                or os.path.getmtime(exe) < os.path.getmtime(src)
+                or (os.path.exists(BENCH_H)
+                    and os.path.getmtime(exe) < os.path.getmtime(BENCH_H)))
+        if need:
+            r = subprocess.run([self.cxx, "-O3", "-fwrapv", "-std=c++17",
+                                "-o", exe, src], capture_output=True, text=True)
+            if r.returncode != 0:
+                return (None, "compile failed: " + r.stderr.strip()[:120])
+        return ([exe], None)
+
+
+def build_complangs(python, cxx):
+    """The registry. Extend with ruby/perl/lua/java by adding entries + the
+    matching bench/<subdir>/ trees."""
+    return {
+        "python": CompLang("python", "py", ".py", [python, "-B"]),
+        "cpp":    CppLang(cxx),
+        "ruby":   CompLang("ruby", "rb", ".rb", ["ruby"]),
+        "perl":   CompLang("perl", "pl", ".pl", ["perl"]),
+        "lua":    CompLang("lua", "lua", ".lua", ["lua"]),
+    }
+
+
+def _file_hash(path):
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha1(fh.read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+CACHE_DIR = os.path.join(HERE, ".bench_cache")
+
+
+def load_cache(lang):
+    try:
+        with open(os.path.join(CACHE_DIR, lang + ".json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(lang, cache):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, lang + ".json"), "w") as fh:
+            json.dump(cache, fh, indent=1, sort_keys=True)
+    except OSError:
+        pass
+
+
+def comp_time(lobj, bench, scale, reps, timeout, cache, refresh):
+    """Time the comparison language for `bench` at `scale`, via the cache.
+    Returns (min_time, output, error_or_None, from_cache). A hit (same scale +
+    same source hash, unless --refresh-cache) skips the run entirely."""
+    if not lobj.has(bench):
+        return (None, None, "no-" + lobj.name, False)
+    h = lobj.content_hash(bench)
+    ent = cache.get(bench)
+    if (not refresh and ent and ent.get("scale") == scale
+            and ent.get("hash") == h):
+        return (ent["time"], ent["out"], None, True)
+    prefix, err = lobj.prepare(bench)
+    if err:
+        return (None, None, err, False)
+    times, out, rerr = run_reps(prefix + [str(scale)], reps, timeout)
+    if rerr:
+        return (None, out, rerr, False)
+    t = min(times)
+    cache[bench] = {"scale": scale, "hash": h, "time": t, "out": out}
+    return (t, out, None, False)
+
+
 def main():
     ap = argparse.ArgumentParser(description="MyLang vs Python benchmarks")
     ap.add_argument("--scale", action="append", default=[], metavar="SPEC",
@@ -390,7 +522,18 @@ def main():
                     help="run the current mylang with -tw (the tree-walking "
                          "interpreter).")
     ap.add_argument("--python", default=sys.executable,
-                    help="python interpreter to compare against")
+                    help="python interpreter (for --complang python)")
+    ap.add_argument("-cl", "--complang", default="python",
+                    metavar="LANG",
+                    help="comparison language: python (default), cpp, ruby, "
+                         "perl, lua. Its results are CACHED (bench/.bench_cache/"
+                         "<lang>.json, git-ignored) - re-timed only when a bench "
+                         "source or its scale changes, or with --refresh-cache.")
+    ap.add_argument("--cxx", default="g++",
+                    help="C++ compiler for --complang cpp (default g++)")
+    ap.add_argument("--refresh-cache", action="store_true",
+                    help="ignore the comparison-language cache and re-time it "
+                         "(then re-cache)")
     ap.add_argument("--timeout", type=float, default=120.0,
                     help="per-run timeout in seconds (default 120)")
     ap.add_argument("--csv", default="",
@@ -404,6 +547,13 @@ def main():
     mylang = find_mylang(args.mylang)
     if not mylang:
         sys.exit("error: mylang binary not found; build it (make -j) or pass --mylang")
+
+    complangs = build_complangs(args.python, args.cxx)
+    if args.complang not in complangs:
+        sys.exit("error: --complang '%s' unknown (have: %s)"
+                 % (args.complang, ", ".join(sorted(complangs))))
+    lobj = complangs[args.complang]
+    cache = load_cache(lobj.name)
 
     has_base = bool(args.baseline)
     if has_base and not (os.path.isfile(args.baseline)
@@ -444,7 +594,11 @@ def main():
         print("baseline: %s%s" % (args.baseline,
                                   "  (engine: -tw tree-walker)"
                                   if args.vm else ""))
-    print("python : %s" % args.python)
+    comp_desc = args.python if lobj.name == "python" else (
+        "%s (%s)" % (lobj.name, args.cxx) if lobj.name == "cpp" else lobj.name)
+    print("compare: %-8s %s%s" % (lobj.name, comp_desc,
+                                  "  [--refresh-cache]" if args.refresh_cache
+                                  else "  (cached)"))
     scale_note = ("global %d" % global_scale if global_scale is not None
                   else "per-bench from scales.txt")
     reps_note = ("fixed %d" % args.repeat if args.repeat > 0
@@ -459,13 +613,15 @@ def main():
     if warn:
         print(warn + "\n")
 
+    comp_col = "%s(s)" % lobj.name       # e.g. python(s) / cpp(s)
+    ratio_col = "my/%s" % lobj.name       # e.g. my/py / my/cpp
     if has_base:
         hdr = "%-24s %10s %10s %8s %10s %8s  %s" % (
             "benchmark", "base(s)", "mylang(s)", "cur/base",
-            "python(s)", "my/py", "result")
+            comp_col, ratio_col, "result")
     else:
         hdr = "%-24s %10s %10s %8s  %s" % (
-            "benchmark", "mylang(s)", "python(s)", "my/py", "result")
+            "benchmark", "mylang(s)", comp_col, ratio_col, "result")
     print(hdr)
     print("-" * len(hdr))
 
@@ -475,7 +631,6 @@ def main():
     noisy = []        # (name, reps, variance) - needed >3 reps to settle; note
     for name in names:
         my_path = os.path.join(MY_DIR, name + ".my")
-        py_path = os.path.join(PY_DIR, name + ".py")
 
         # Engine flags (the VM is the binary's DEFAULT since 2026-07-18):
         # --vm passes it explicitly (needed for a PRE-flip binary, whose
@@ -500,6 +655,7 @@ def main():
             my_t, my_out, my_err, n_reps, my_v = measure_adaptive(
                 my_cmd, args.var_threshold, args.timeout)
         if my_err and my_err.startswith("variance"):
+            save_cache(lobj.name, cache)     # keep comp-times computed so far
             print()
             sys.exit("ABORTED at %s: %s\n  -> raise its scale in "
                      "bench/scales.txt (run bench/tune_scales.py), then re-run."
@@ -515,28 +671,26 @@ def main():
                 n_reps, args.timeout)
             base_t = min(bt) if bt else None
 
-        if os.path.isfile(py_path):
-            # -B: don't read/write __pycache__. MyLang re-parses its source on
-            # every run (it has no bytecode cache), so letting CPython reuse a
-            # cached .pyc across the repeat runs would be an unfair head start.
-            # With -B both re-parse every run.
-            pt, py_out, py_err = run_reps(
-                [args.python, "-B", py_path, scale_arg],
-                n_reps, args.timeout)
-            py_t = min(pt) if pt else None
-        else:
-            py_t, py_out, py_err = (None, None, "no-py")
+        # Comparison language (python by default): CACHED - re-timed only on a
+        # miss (source/scale changed, or --refresh-cache). Python's interp adds
+        # -B (no __pycache__) so it re-parses every run like MyLang - see the
+        # `[python, "-B"]` prefix in build_complangs. The compare runs at the
+        # SAME per-bench scale as MyLang, so the ratio is valid.
+        comp_reps = args.repeat if args.repeat > 0 else COMP_REPS
+        py_t, py_out, py_err, from_cache = comp_time(
+            lobj, name, scale, comp_reps, args.timeout, cache,
+            args.refresh_cache)
 
         if my_err:
             status = "MY " + my_err
-        elif py_err == "no-py":
+        elif py_err and py_err.startswith("no-"):
             status = "my-only"
         elif py_err:
-            status = "PY " + py_err
+            status = "%s %s" % (lobj.name.upper(), py_err)
         elif results_match(my_out, py_out):
-            status = "ok"
+            status = "ok" + ("~" if from_cache else "")   # ~ = cached compare
         else:
-            status = "DIFF: my=%r py=%r" % (my_out, py_out)
+            status = "DIFF: my=%r %s=%r" % (my_out, lobj.name, py_out)
         if n_reps > REP_STEPS[0]:
             status += " [%dr]" % n_reps        # needed extra reps to settle
 
@@ -568,16 +722,18 @@ def main():
         print(render_row(row, has_base))
         rows.append(row)
 
+    save_cache(lobj.name, cache)          # persist any (re)timed comp results
+
     if ratios:
         gm_v = geomean(ratios)
         gm = colorize_ratio(gm_v, "%.3fx" % gm_v)
         if gm_v >= 1.0:
-            tail = "MyLang is ~%.2fx slower" % gm_v
+            tail = "MyLang is ~%.2fx slower than %s" % (gm_v, lobj.name)
         else:
-            tail = "MyLang is ~%.2fx faster" % (1.0 / gm_v)
+            tail = "MyLang is ~%.2fx faster than %s" % (1.0 / gm_v, lobj.name)
         print("-" * len(hdr))
-        print("geomean my/py over %d paired benchmarks: %s (%s)"
-              % (len(ratios), gm, tail))
+        print("geomean my/%s over %d paired benchmarks: %s (%s)"
+              % (lobj.name, len(ratios), gm, tail))
 
     if speedups:
         sp_v = geomean(speedups)
@@ -613,17 +769,18 @@ def main():
             print(render_row(row, has_base))
 
     if args.csv:
+        cl = lobj.name
         with open(args.csv, "w") as f:
             if has_base:
                 f.write("benchmark,base_s,mylang_s,cur_over_base,"
-                        "python_s,my_over_py,status\n")
+                        "%s_s,my_over_%s,status\n" % (cl, cl))
                 for (name, base_s, my_s, py_s, speedup_s, ratio_s,
                      status, _sp, _ratio) in rows:
                     f.write("%s,%s,%s,%s,%s,%s,%s\n" %
                             (name, base_s, my_s, speedup_s.rstrip("x"), py_s,
                              ratio_s.rstrip("x"), status.replace(",", ";")))
             else:
-                f.write("benchmark,mylang_s,python_s,my_over_py,status\n")
+                f.write("benchmark,mylang_s,%s_s,my_over_%s,status\n" % (cl, cl))
                 for (name, _base_s, my_s, py_s, _speedup_s, ratio_s,
                      status, _sp, _ratio) in rows:
                     f.write("%s,%s,%s,%s,%s\n" %

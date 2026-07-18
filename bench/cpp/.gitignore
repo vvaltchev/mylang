@@ -1,0 +1,8 @@
+# The C++ benches are compiled ON DEMAND (bench/run.py --complang cpp, or
+# bench/cpp/run.py); the resulting binaries are per-machine, not committed.
+# Ignore everything except the sources + scripts.
+*
+!*.cpp
+!*.h
+!*.py
+!.gitignore
