@@ -588,6 +588,13 @@ static bool jit_op_eligible(const Instr &in)
      * caret). Unblocks the s += a[i] reduction loops. */
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
         return true;
+    /* Approach A: a flat-array element STORE `a[i] = v` / `a[i] OP= v`.
+     * Marshals base/index/value and CALLS jit_store_elem_int/float (the
+     * interpreter's EXACT store body - COW, bounds, universal fallback);
+     * keeps the loop native instead of splitting at the store. A global /
+     * capture base (in.target != 0) isn't in the slot window -> interpreted.*/
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+        return in.target == 0;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -842,6 +849,16 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
             bad(in.target2); bad(in.a_slot()); bad(in.target);
             break;
+        case OpCode::StoreElemInt:
+            bad(in.target2);             /* base slot holds an array */
+            if (!in.a_is_lit()) usei(in.a_slot());   /* index (int) */
+            if (!in.b_is_lit()) usei(in.b_slot());   /* value (int) */
+            break;
+        case OpCode::StoreElemFloat:
+            bad(in.target2);             /* base slot holds an array */
+            if (!in.b_is_lit()) bad(in.b_slot());    /* value is a FLOAT */
+            if (!in.a_is_lit()) usei(in.a_slot());   /* index (int) */
+            break;
         case OpCode::Jump:
             break;                       /* no slots */
         default:
@@ -1015,6 +1032,53 @@ static void raise_unless(Emitter &e, uint8_t pass_cond, int kind, uint32_t pc)
     const size_t sk = e.j8(pass_cond);
     emit_raise(e, kind, pc);
     e.patch8(sk, e.pos());
+}
+
+/* Approach A: a flat-array element STORE `a[i] = v` / `a[i] OP= v` as a CALL
+ * to jit_store_elem_int/float (the interpreter's exact store body - COW /
+ * bounds / universal fallback), keeping the surrounding loop native rather
+ * than splitting the run at the store. The SysV args:
+ *   int:   rdi=base, rsi=idx, rdx=rhs, rcx=aop
+ *   float: rdi=base, rsi=idx, xmm0=rhs, rdx=aop
+ * The int index (and int rhs) are resolved CACHE-AWARE while rdi is still the
+ * slots base; THEN the prologue saves rdi + the cache regs and rdi is
+ * re-pointed to &slots[base]. On a non-0 return (the helper caught + stashed
+ * a LOC-LESS raise in g_vm_jit_exc) the fragment exits to the op's pc and
+ * EnterNative raises it, stamping the caret from the live chunk - no chunk/pc
+ * is passed (the fragment can't hold the stack-built, moved-out chunk). */
+static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
+                            uint32_t pc, bool is_float)
+{
+    (void)ck;
+    const void *fn = is_float
+        ? reinterpret_cast<const void *>(jit_store_elem_float)
+        : reinterpret_cast<const void *>(jit_store_elem_int);
+    const int32_t base_off = static_cast<int32_t>(
+        static_cast<long>(in.target2) * static_cast<long>(sizeof(LValue)));
+
+    /* idx -> rsi (an int operand), read while rdi = the slots base */
+    load_operand(e, RSI, in.a_is_lit(), in.a_lit(), in.a_slot());
+    /* value: int -> rdx; float -> xmm0 (may BAIL on a non-numeric tag, as
+     * everywhere in the float tier - the value is proven numeric, so it
+     * won't in practice) */
+    if (is_float)
+        emit_float_load(e, X0, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+    else
+        load_operand(e, RDX, in.b_is_lit(), in.b_lit(), in.b_slot());
+
+    emit_call_prologue(e);               /* save rdi + cache, 16-align */
+    e.lea_rdi(base_off);                  /* rdi = &slots[base] (arg 0) */
+    /* aop is the last GP arg: rcx (int helper) / rdx (float helper) */
+    e.movabs(is_float ? RDX : RCX,
+             static_cast<uint64_t>(static_cast<int>(in.aop)));
+    e.call_relocs.push_back({ e.pos(), fn });
+    e.u8(0xE8); e.u32(0);                 /* call rel32 (patched later) */
+    emit_call_epilogue(e);                /* restore rdi + cache; re-mat rsi/r8*/
+
+    e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+    const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
+    e.exit_pc(pc);                        /* raised: EnterNative raises exc */
+    e.patch8(j_ok, e.pos());
 }
 
 /* Emit one op; returns false if (unexpectedly) unhandled. */
@@ -1222,6 +1286,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::StoreElemInt:
+        emit_store_elem(e, ck, in, pc, /*is_float=*/false);
+        return true;
+    case OpCode::StoreElemFloat:
+        emit_store_elem(e, ck, in, pc, /*is_float=*/true);
+        return true;
+
     default:
         return false;
     }
@@ -1340,6 +1411,7 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
         case OpCode::LoadImmFloat: case OpCode::JumpUnlessFloatCmp:
         case OpCode::LoadElemFloat:      /* writes a float -> needs r8 */
         case OpCode::MathFnV:            /* N6a: writes a float -> needs r8 */
+        case OpCode::StoreElemFloat:     /* reads a float rhs -> needs r8 */
             return true;
         default:
             break;

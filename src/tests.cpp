@@ -720,6 +720,47 @@ static const std::vector<test> tests =
     },
 
     {
+        /* APPROACH A - container-store helper ops (plans/native-aot.md): a
+         * flat-array element STORE `a[i] = v` / `a[i] OP= v` inside a JIT run
+         * no longer splits the run - the fragment CALLS jit_store_elem_int /
+         * jit_store_elem_float (the interpreter's exact store, COW included),
+         * keeping the whole write loop native. The differential reruns this
+         * under the VM+JIT and it must match the tree-walker. Covers a plain
+         * store, a COMPOUND store (a[i] += ..), a bool-array store, and a
+         * float-array store (the xmm-arg marshaling path). */
+        "jit: native array-element stores (int/float/bool, plain + compound)",
+        {
+            "var a = array(64);",
+            "for (var i = 0; i < 64; i++) a[i] = i * i;",
+            "for (var i = 0; i < 64; i++) a[i] += 1;",
+            "var s = 0; for (var i = 0; i < 64; i++) s = s + a[i];",
+            "assert(s == 85408);",             /* sum i*i + 1, i=0..63 */
+            "var f = array(32); var ff = 0.0;",
+            "for (var i = 0; i < 32; i++) f[i] = float(i) * 0.5;",
+            "for (var i = 0; i < 32; i++) f[i] -= 0.25;",
+            "for (var i = 0; i < 32; i++) ff = ff + f[i];",
+            "assert(ff == 240.0);",            /* sum 0.5i - 0.25, i=0..31 */
+            "var b = array(16);",              /* array(N) is a flat int arr */
+            "var flags = [false, false, false, false];",
+            "for (var i = 0; i < 4; i++) flags[i] = i % 2 == 0;",
+            "assert(flags[0] == true && flags[1] == false);",
+        },
+    },
+
+    {
+        /* Approach A: an OOB index in a NATIVE array-STORE run raises
+         * OutOfBoundsEx - the jit_store_elem_int helper CAUGHT it into
+         * g_vm_jit_exc and EnterNative re-raised it (byte-identical caret),
+         * NOT a re-interpret. The differential reruns under the VM+JIT. */
+        "jit: a native array-store OOB raises like the interpreter",
+        {
+            "var a = array(4);",
+            "for (var i = 0; i < 8; i++) a[i] = i;",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
         /* NATIVE AOT N5 (plans/native-aot.md) - register-caching soundness.
          * The fragment-local cache pins a hot int slot in r10/r11, loading
          * it ONCE at entry and flushing type+payload at EVERY exit. That is

@@ -264,6 +264,125 @@ vm_throw_div0(const Chunk &chunk, size_t pc)
     throw DivisionByZeroEx(s, en);
 }
 
+/* The store body below is shared by the interpreter (a valid chunk -> stamp
+ * the caret from the loc table) AND the JIT helper (chunk == null -> throw
+ * LOC-LESS; EnterNative re-stamps from the LIVE chunk at the returned pc -
+ * the JIT fragment can't hold a chunk pointer, since codegen builds the
+ * chunk on the STACK and MOVES it out after jit_compile_chunk). Cold. */
+[[noreturn]] static ML_COLD void
+vm_store_throw_oob(const Chunk *chunk, size_t pc)
+{
+    if (chunk)
+        vm_throw_oob(*chunk, pc);
+    throw OutOfBoundsEx();
+}
+
+[[noreturn]] static ML_COLD void
+vm_store_throw_div0(const Chunk *chunk, size_t pc)
+{
+    if (chunk)
+        vm_throw_div0(*chunk, pc);
+    throw DivisionByZeroEx();
+}
+
+/* The StoreElemInt/StoreElemFloat store body, SHARED by the interpreter
+ * handler AND the approach-A JIT helper (jit_store_elem_int/float, below):
+ * a[i] = v / a[i] OP= v for a flat mutable int/bool/float array (COW), else
+ * the UNIVERSAL vm_subscript_store fallback (const / readonly / general /
+ * dyn / a wrong-kind base). idx/rhs are the PRE-READ scalar operands (the
+ * caller resolved them from the Instr / the native fragment); the body
+ * THROWS on OOB / div0 / not-an-lvalue / etc. - the interpreter lets it
+ * propagate, the JIT helper catches it into g_vm_jit_exc. ML_ALWAYS_INLINE
+ * so the interpreter's hot handler carries no call and the ONLY out-of-line
+ * copy is the JIT helper's. (Reading rhs up front is byte-identical: an
+ * operand read is a pure slot/lit load, no side effect - so the OOB check
+ * still fires before any store, exactly as the lazy handler did.) */
+static ML_ALWAYS_INLINE void
+vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
+                       const Chunk *chunk, size_t pc)
+{
+    if (alv.is<SharedArrayObj>()) {
+        SharedArrayObj &arr = alv.getval<SharedArrayObj>();
+        const auto sk = arr.skind();
+        const bool is_bool = sk == SharedArrayObj::Storage::bools;
+        if ((sk == SharedArrayObj::Storage::ints
+             || (is_bool && aop == Op::invalid))
+            && !alv.is_const_var() && !arr.is_readonly()) {
+            if (idx < 0)
+                idx += arr.size();
+            if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                vm_store_throw_oob(chunk, pc);
+            if ((aop == Op::div || aop == Op::mod) && rhs == 0)
+                vm_store_throw_div0(chunk, pc);
+            if (arr.is_slice())
+                arr.clone_internal_vec();
+            else if (arr.use_count() > 1)
+                arr.clone_aliased_slices(arr.offset() + idx);
+            if (is_bool) {
+                arr.flat_bools()[arr.offset() + idx] = rhs ? 1 : 0;
+                arr.invalidate_hash();
+                return;
+            }
+            int_type &el = arr.flat_ints()[arr.offset() + idx];
+            switch (aop) {
+            case Op::invalid: el = rhs;  break;
+            case Op::plus:    el += rhs; break;
+            case Op::minus:   el -= rhs; break;
+            case Op::times:   el *= rhs; break;
+            case Op::div:     el /= rhs; break;
+            case Op::mod:     el %= rhs; break;
+            default: throw InternalErrorEx();
+            }
+            arr.invalidate_hash();
+            return;
+        }
+    }
+    Loc ls, le;
+    if (chunk)
+        chunk->loc_at(pc, ls, le);       /* JIT (null): loc-less -> stamped */
+    vm_subscript_store(&alv, EvalValue(idx), EvalValue(rhs),
+                       vm_base_to_expr14_op(aop), ls, le);
+}
+
+static ML_ALWAYS_INLINE void
+vm_store_elem_float_body(LValue &alv, int_type idx, float_type rhs, Op aop,
+                         const Chunk *chunk, size_t pc)
+{
+    if (alv.is<SharedArrayObj>()) {
+        SharedArrayObj &arr = alv.getval<SharedArrayObj>();
+        if (arr.skind() == SharedArrayObj::Storage::floats
+            && !alv.is_const_var() && !arr.is_readonly()) {
+            if (idx < 0)
+                idx += arr.size();
+            if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                vm_store_throw_oob(chunk, pc);
+            if ((aop == Op::div || aop == Op::mod) && rhs == 0.0)
+                vm_store_throw_div0(chunk, pc);
+            if (arr.is_slice())
+                arr.clone_internal_vec();
+            else if (arr.use_count() > 1)
+                arr.clone_aliased_slices(arr.offset() + idx);
+            float_type &el = arr.flat_floats()[arr.offset() + idx];
+            switch (aop) {
+            case Op::invalid: el = rhs;               break;
+            case Op::plus:    el += rhs;              break;
+            case Op::minus:   el -= rhs;              break;
+            case Op::times:   el *= rhs;              break;
+            case Op::div:     el /= rhs;              break;
+            case Op::mod:     el = std::fmod(el, rhs); break;
+            default: throw InternalErrorEx();
+            }
+            arr.invalidate_hash();
+            return;
+        }
+    }
+    Loc ls, le;
+    if (chunk)
+        chunk->loc_at(pc, ls, le);       /* JIT (null): loc-less -> stamped */
+    vm_subscript_store(&alv, EvalValue(idx), EvalValue(rhs),
+                       vm_base_to_expr14_op(aop), ls, le);
+}
+
 /* The MULTI-ASSIGN strict-unpack length error (F-1) - the same message the
  * tree-walker's handle_single_expr14 throws, WITHOUT the "foreach:" prefix. */
 [[noreturn]] static ML_COLD void
@@ -1438,6 +1557,49 @@ std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * re-interpreting an op that hit a proven exception; EnterNative raises. */
 int g_vm_jit_raise = 0;
 
+/* Approach A (container-store helper ops): a noexcept JIT helper that CAUGHT
+ * an arbitrary RuntimeException stashes a CLONE here (loc intact) and returns
+ * non-0; EnterNative raises it. Complements g_vm_jit_raise (a KIND a fragment
+ * can signal by itself) - this carries the exact object a C++ helper threw
+ * (OOB / div0 / NotLValue / CannotChangeConst / KeyNotFound / TypeError),
+ * whose type + message + caret can't be reconstructed from a kind. */
+static std::unique_ptr<RuntimeException> g_vm_jit_exc;
+
+/* The approach-A container-store JIT helpers (declared in jit.h). A native
+ * a[i]=v fragment marshals the base LValue*, index and value and CALLS one of
+ * these instead of splitting the run at the store - keeping the surrounding
+ * matrix/sieve loop native. They run vm_store_elem_*_body (the interpreter's
+ * EXACT store) with a NULL chunk, noexcept: a raise is thrown LOC-LESS,
+ * caught into g_vm_jit_exc, and reported by the return value; EnterNative
+ * re-stamps the caret from the LIVE chunk at the returned pc (a fragment
+ * can't hold a chunk pointer - the chunk is stack-built + moved out after
+ * jit_compile_chunk). aop is an int to keep the Op enum out of jit.h. */
+extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
+                                  int aop) noexcept
+{
+    try {
+        vm_store_elem_int_body(*base, idx, rhs, static_cast<Op>(aop),
+                               nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_store_elem_float(LValue *base, int_type idx, double rhs,
+                                    int aop) noexcept
+{
+    try {
+        vm_store_elem_float_body(*base, idx, rhs, static_cast<Op>(aop),
+                                 nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
@@ -2477,6 +2639,16 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                     return;                    /* boundary: signal set */
                 code = chunk->code.data();     /* dispatched to a handler */
             }
+            /* A container-store helper (jit_store_elem_int/float) CAUGHT a
+             * LOC-LESS exception; vm_raise stamps its caret from THIS chunk's
+             * loc table at the returned (store op) pc - byte-identical to the
+             * interpreted store's throw. Mutually exclusive with
+             * g_vm_jit_raise per exit. */
+            else if (g_vm_jit_exc) {
+                if (!vm_raise(chunk, pc, act, ctx, std::move(g_vm_jit_exc)))
+                    return;                    /* boundary: signal set */
+                code = chunk->code.data();     /* dispatched to a handler */
+            }
         }
         VM_NEXT;
 
@@ -2844,71 +3016,20 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(StoreElemInt): {
 
-            /* a[i] = v / a[i] OP= v for a flat mutable int array (mirrors the
-             * int path of try_flat_subscript_store, COW), and a[i] = <bool>
-             * for a flat bool array (P1: plain assign only - no compound
-             * for bool; the value operand is the bool's 0/1, written to bvec).
-             * Anything else (const / read-only / general / float / dyn, or a
-             * COMPOUND on a bool array) takes the UNIVERSAL vm_subscript_store
-             * fallback (box the already-computed index/value operands, map the
-             * base op back to its Expr14 op) - AST-free and byte-identical to
-             * the tree-walker (the same path StoreElemValue uses). The base may
-             * be a global/capture array (in->target = the slot kind); the caret
-             * comes from the loc side table - looked up LAZILY, only on the cold
-             * throw/fallback paths, so the hot store pays no binary search. */
+            /* a[i] = v / a[i] OP= v for a flat mutable int/bool array (COW),
+             * else the UNIVERSAL vm_subscript_store fallback (const / general
+             * / dyn). The store logic lives in vm_store_elem_int_body, SHARED
+             * with the approach-A JIT helper jit_store_elem_int - so a native
+             * store fragment runs byte-identical C++ (see plans/native-aot.md).
+             * The base may be a global/capture array (in->target = the slot
+             * kind); the caret comes from the loc side table, looked up LAZILY
+             * on the cold throw/fallback path only. */
             LValue &alv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            if (alv.is<SharedArrayObj>()) {
-                SharedArrayObj &arr = alv.getval<SharedArrayObj>();
-                const auto sk = arr.skind();
-                const bool is_bool = sk == SharedArrayObj::Storage::bools;
-                if ((sk == SharedArrayObj::Storage::ints
-                     || (is_bool && in->aop == Op::invalid))
-                    && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        vm_throw_oob(*chunk, pc);
-                    const int_type rhs = read_int_operand(in->b(), &ctx);
-                    /* div/mod by zero throws BEFORE any clone (tree-walker
-                     * throws during the op eval, before the COW). */
-                    if ((in->aop == Op::div || in->aop == Op::mod) && rhs == 0)
-                        vm_throw_div0(*chunk, pc);
-                    if (arr.is_slice())
-                        arr.clone_internal_vec();
-                    else if (arr.use_count() > 1)
-                        arr.clone_aliased_slices(arr.offset() + idx);
-                    if (is_bool) {
-                        arr.flat_bools()[arr.offset() + idx] = rhs ? 1 : 0;
-                        arr.invalidate_hash();
-                        pc++;
-                        VM_NEXT;
-                    }
-                    int_type &el = arr.flat_ints()[arr.offset() + idx];
-                    switch (in->aop) {
-                    case Op::invalid: el = rhs;  break;
-                    case Op::plus:    el += rhs; break;
-                    case Op::minus:   el -= rhs; break;
-                    case Op::times:   el *= rhs; break;
-                    case Op::div:     el /= rhs; break;
-                    case Op::mod:     el %= rhs; break;
-                    default: throw InternalErrorEx();
-                    }
-                    arr.invalidate_hash();
-                    pc++;
-                    VM_NEXT;
-                }
-            }
-            {
-                Loc ls, le;
-                chunk->loc_at(pc, ls, le);
-                vm_subscript_store(&alv,
-                                   EvalValue(read_int_operand(in->a(), &ctx)),
-                                   EvalValue(read_int_operand(in->b(), &ctx)),
-                                   vm_base_to_expr14_op(in->aop), ls, le);
-            }
+            vm_store_elem_int_body(alv, read_int_operand(in->a(), &ctx),
+                                   read_int_operand(in->b(), &ctx), in->aop,
+                                   chunk, pc);
             pc++;
         }
         VM_NEXT;
@@ -2920,46 +3041,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             LValue &alv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            if (alv.is<SharedArrayObj>()) {
-                SharedArrayObj &arr = alv.getval<SharedArrayObj>();
-                if (arr.skind() == SharedArrayObj::Storage::floats
-                    && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        vm_throw_oob(*chunk, pc);
-                    const float_type rhs = read_float_operand(in->b(), &ctx);
-                    if ((in->aop == Op::div || in->aop == Op::mod)
-                            && rhs == 0.0)
-                        vm_throw_div0(*chunk, pc);
-                    if (arr.is_slice())
-                        arr.clone_internal_vec();
-                    else if (arr.use_count() > 1)
-                        arr.clone_aliased_slices(arr.offset() + idx);
-                    float_type &el = arr.flat_floats()[arr.offset() + idx];
-                    switch (in->aop) {
-                    case Op::invalid: el = rhs;               break;
-                    case Op::plus:    el += rhs;              break;
-                    case Op::minus:   el -= rhs;              break;
-                    case Op::times:   el *= rhs;              break;
-                    case Op::div:     el /= rhs;              break;
-                    case Op::mod:     el = std::fmod(el, rhs); break;
-                    default: throw InternalErrorEx();
-                    }
-                    arr.invalidate_hash();
-                    pc++;
-                    VM_NEXT;
-                }
-            }
-            {
-                Loc ls, le;
-                chunk->loc_at(pc, ls, le);
-                vm_subscript_store(&alv,
-                                   EvalValue(read_int_operand(in->a(), &ctx)),
-                                   EvalValue(read_float_operand(in->b(), &ctx)),
-                                   vm_base_to_expr14_op(in->aop), ls, le);
-            }
+            vm_store_elem_float_body(alv, read_int_operand(in->a(), &ctx),
+                                     read_float_operand(in->b(), &ctx),
+                                     in->aop, chunk, pc);
             pc++;
         }
         VM_NEXT;

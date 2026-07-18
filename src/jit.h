@@ -20,8 +20,12 @@
 #pragma once
 
 #include <cstddef>   /* size_t (jit_enter) */
+#include <cstdint>   /* uint32_t (the store helpers' pc) */
+
+#include "defs.h"    /* int_type */
 
 struct Chunk;
+class LValue;
 
 /* The kill switch: -nj / MYLANG_JIT=0; always false off-platform. */
 extern bool g_jit_enabled;
@@ -58,3 +62,17 @@ size_t jit_enter(const void *frag, void *slots);
  * the loc table, no re-run). JR_NONE (0) on a normal fragment exit. */
 enum JitRaiseKind { JR_NONE = 0, JR_OOB = 1, JR_NEG_SHIFT = 2 };
 extern int g_vm_jit_raise;
+
+/* Approach A (container-store helper ops, plans/native-aot.md): a native
+ * a[i]=v / a[i] OP= v fragment marshals the base LValue*, the index and the
+ * value and CALLS one of these instead of splitting the run at the store, so
+ * the enclosing loop stays native. They run the interpreter's EXACT store
+ * body (vm.cpp), noexcept: a raised exception is thrown LOC-LESS, caught,
+ * stashed, and reported by a non-0 return (eax), which the fragment turns
+ * into an exit; EnterNative re-raises it (stamping the caret from the live
+ * chunk at the op's pc). `aop` is the base arith op (Op) as an int. No chunk
+ * arg: the fragment can't hold a chunk pointer (stack-built, moved out). */
+extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
+                                  int aop) noexcept;
+extern "C" int jit_store_elem_float(LValue *base, int_type idx,
+                                    double rhs, int aop) noexcept;
