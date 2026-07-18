@@ -552,9 +552,27 @@ so `-vd` of a native int loop is just `enter.nat` (`-vdj` shows the fragment)
 cache), so rdi + the active cache regs are pushed/popped around EVERY helper/
 libm call (a nested_fuzz-found reg-clobber; a float/libm run caches nothing,
 which masked it at first).
-**`-vdj`:** decodes `push`/`pop`/`call`/`sqrtsd`/`nop`/`E8`-rel32 and shows
-big `movabs` constants in hex (a `call rax` had rendered as `dec rax` - a
-ModRM `/digit` decode bug).
+**CONTAINER-STORE helper ops (LANDED):** `StoreElemInt`/`StoreElemFloat`
+(`a[i] = v` / `a[i] OP= v`, a flat mutable int/bool/float array, LOCAL base)
+are JIT-native - the fragment marshals base `LValue*` + (cache-aware) index +
+value and CALLS `jit_store_elem_int/float` (vm.cpp), which run the SHARED
+`vm_store_elem_*_body` (`ML_ALWAYS_INLINE`, the interpreter's EXACT store:
+COW + bounds + the universal `vm_subscript_store` fallback). The store no
+longer SPLITS the run - the whole matrix/sieve WRITE loop iterates natively.
+**A raise is thrown LOC-LESS** (the helper runs the body with a NULL chunk),
+caught into `g_vm_jit_exc` (an owned `RuntimeException`; complements
+`g_vm_jit_raise`, a KIND a fragment signals itself), returned non-0; the
+fragment `test eax; jnz` exits to the op's pc and `EnterNative` re-raises it,
+stamping the caret from the LIVE chunk's loc table. A fragment CANNOT bake a
+chunk pointer: `codegen_chunk` builds the chunk on the STACK and `std::move`s
+it out AFTER `jit_compile_chunk`, so `&chunk` dangles (an ASan SEGV the
+OOB-store regression test caught). Measured (same-binary before/after, both
+JIT-on): 43_sieve 0.63-0.69x, 14_array_subscript 0.74-0.78x, 46_matrix 0.82x,
+56_sieve_bool 0.79-0.90x (~1.3x on write benches); suite geomean 0.97-0.99x.
+**`-vdj`:** decodes `push`/`pop`/`call`/`sqrtsd`/`nop`/`E8`-rel32/`lea`/`test`/
+group-1 `cmp`/`sub imm`, and shows big `movabs` constants in hex (a `call rax`
+had rendered as `dec rax`; a helper-call `lea rdi` had cascade-misdecoded as
+`mov edi`).
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of

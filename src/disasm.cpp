@@ -498,6 +498,10 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         break;
     case 0x89: modrm(regf, rm); o << "mov " << rm << ", " << gp64(regf);
         break;
+    case 0x8D: modrm(regf, rm); o << "lea " << gp64(regf) << ", " << rm;
+        break;                                /* lea (a helper's &slot arg) */
+    case 0x85: modrm(regf, rm); o << "test " << rm << ", " << gp64(regf);
+        break;                                /* test (a helper's status) */
     case 0x01: modrm(regf, rm); o << "add " << rm << ", " << gp64(regf);
         break;
     case 0x29: modrm(regf, rm); o << "sub " << rm << ", " << gp64(regf);
@@ -527,14 +531,23 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         break; }
     case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
         o << "cmp byte " << rm << ", " << int(imm); break; }
+    /* group 1 (add/or/adc/sbb/and/sub/xor/cmp by the reg field) with an
+     * imm32 (0x81) or a sign-ext imm8 (0x83): the ref-check `cmp ecx, t_str`
+     * and the call prologue's `sub/add rsp, 8` alignment pad. */
+    case 0x81: case 0x83: { modrm(regf, rm);
+        static const char *g1[8] = {"add","or","adc","sbb",
+                                    "and","sub","xor","cmp"};
+        const int32_t imm = op == 0x81 ? rd32() : int8_t(c[p++]);
+        o << g1[regf & 7] << " " << rm << ", " << imm; break; }
     case 0x90: o << "nop"; break;
-    case 0xE8: { const int32_t d = rd32();   /* call rel32 (N6a direct
-                                              * libm call); target is
-                                              * external, show the signed
-                                              * displacement in hex */
+    case 0xE8: { const int32_t d = rd32();   /* call rel32: a C++ helper
+                                              * (a container store / ref
+                                              * release) or a libm fn; the
+                                              * target is external - show the
+                                              * signed displacement in hex */
         o << "call " << (d < 0 ? "-0x" : "+0x") << std::hex
           << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
-        cmt = "direct rel32 call (libm)"; break; }
+        cmt = "rel32 call (C++ helper / libm)"; break; }
     case 0xE9: { const int32_t d = rd32();
         o << "jmp +" << std::dec << (int32_t(p) + d); break; }
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:

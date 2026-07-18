@@ -299,7 +299,33 @@ prove → the VM instruction stays (the only fallback). NO runtime bail.
   NOT a current JIT site (IntModRI excludes imm 0/-1 at compile time,
   div-by-reg isn't compiled), so nothing to convert there yet.
 - **arrays/dicts/strings**: don't nativize the data structures — CALL the
-  same C++ the interpreter calls (a helper per op). (NEXT.)
+  same C++ the interpreter calls (a helper per op). STORE side STARTED:
+  `StoreElemInt`/`StoreElemFloat` (`a[i] = v` / `a[i] OP= v`, a flat mutable
+  int/bool/float array) are JIT-native (DONE). The fragment marshals the base
+  `LValue*`, the (cache-aware) index and value and CALLS `jit_store_elem_int/
+  float` (vm.cpp), which run `vm_store_elem_*_body` — the interpreter's EXACT
+  store (COW + bounds + the universal `vm_subscript_store` fallback), SHARED
+  (ML_ALWAYS_INLINE) so there is one store implementation. The store no longer
+  SPLITS the run: the whole matrix/sieve write loop iterates natively (its
+  arithmetic + counter + condition + the store, one run with a native back
+  edge). **Exceptions**: the helper runs the body with a NULL chunk, so a
+  raise (OOB / div0 / not-an-lvalue / cannot-change-const on a const/readonly
+  base / a dyn-laundered TypeError) is thrown LOC-LESS, caught into
+  `g_vm_jit_exc` (an owned RuntimeException; complements `g_vm_jit_raise`,
+  which carries a KIND a fragment can signal itself), and the helper returns
+  non-0; the fragment `test eax; jnz exit`s to the op's pc and EnterNative
+  re-raises it, stamping the caret from the LIVE chunk's loc table. A fragment
+  CANNOT hold a chunk pointer: `codegen_chunk` builds the chunk on the STACK
+  and `std::move`s it out AFTER `jit_compile_chunk`, so a baked `&chunk` is a
+  dangling stack address (an ASan SEGV caught by the OOB-store regression
+  test) — hence the loc-less-throw + EnterNative-stamps design. Local base
+  only (a global/capture base isn't in the slot window → interpreted). A
+  helper call clobbers r10/r11 (the N5 cache), so rdi + the cache regs are
+  saved by the shared `emit_call_prologue`. NOT `op_fully_native` (it can
+  throw), so a store-containing run keeps its interpreted originals. Byte-
+  identical carets + catchable (frame-walk) verified. NEXT: the dict/string
+  store + read ops (Amdahl-bound — mostly keeps the loop native, since the op
+  itself is `unordered_map`/`std::string` C++).
 - **delete the interpreted originals** for a fully-native run. (DONE.) A run
   is DELETABLE iff every op is `op_fully_native` (a non-throwing int op - no
   re-interpret bail, no jit_raise; excludes reg-shift / LoadElem / all float
