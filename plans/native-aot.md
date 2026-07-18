@@ -22,7 +22,17 @@ matching read_float_slot); WRITES are the two-store (t_float singleton
 in r8 + movsd payload). div/mod stay interpreted (they THROW on 0 /
 are a libm call). MEASURED (same-binary JIT off vs on): VM-wall geomean
 0.812, my/py 5.00x -> 5.55x; 54_mandelbrot 0.344x, 55_float_sum 0.867x.
-NEXT: N4 (LoadElemInt/Float with a bounds bail; MathFnV glue). Maintainer direction: build
+N4 DONE (flat array element READS): LoadElemInt/LoadElemFloat lower to
+a fragment that navigates slot -> shobj -> kind + data, unsigned-bounds-
+checks, and reads the raw scalar; a non-array / SLICE / wrong-kind /
+OOB / negative-index base BAILS to the interpreter (byte-identical
+throw/caret). The fragile SharedObject layout is baked via a co-located
+`jit_probe` accessor (sharedarray.h) that reads real members, so it
+can't silently drift. MEASURED (same-binary JIT off vs on): VM-wall
+geomean 0.897, my/py 5.05x -> 5.7x; 18_foreach_array 0.650x,
+19_foreach_indexed 0.565x (foreach-over-array lowers to a counted loop
+with LoadElemInt), sieve/matrix reads 0.92-0.95x. NEXT (optional):
+StoreElemInt/Float (unblocks the sieve/matrix WRITE side), MathFnV glue. Maintainer direction: build
 it VERY incrementally, accept that it may never cover everything (the
 interpreter is the permanent, tested fallback — "never complete" is a
 feature, not a debt), never serialize machine code (AOT always runs

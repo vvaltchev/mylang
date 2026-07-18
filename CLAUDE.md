@@ -444,8 +444,24 @@ compare correctly does NOT satisfy it and jumps - byte-identical to the
 tree-walker's IEEE semantics. div/mod stay interpreted (float div
 THROWS on 0; mod is a libm call). Measured (same-binary JIT off vs on):
 VM-wall geomean **0.812**, my/py 5.00x -> **5.55x**; 54_mandelbrot
-**0.344x**, 55_float_sum 0.867x. N4 = container reads (LoadElem*) with
-a bounds bail + MathFnV glue.
+**0.344x**, 55_float_sum 0.867x.
+
+**N4 - flat array element READS:** LoadElemInt/LoadElemFloat lower to a
+fragment that navigates the base slot -> SharedObject -> kind + the flat
+vector's data/finish pointers, unsigned-bounds-checks the index, and
+reads the raw scalar (`mov rax,[rcx+r9*8]` / `movsd`). A non-array,
+SLICE, wrong-kind (bool/general/str), OOB, or negative-index base BAILS
+(the interpreter re-runs the op with its exact OutOfBounds/type throw +
+caret). The fragile SharedObject layout is obtained via a co-located
+`SharedArrayObj::jit_probe()` accessor (sharedarray.h) that reads the
+real members - so the JIT bakes RUNTIME-correct offsets that can't
+silently drift. Measured (same-binary JIT off vs on): VM-wall geomean
+**0.897**, my/py 5.05x -> **5.7x**; 18_foreach_array 0.650x,
+19_foreach_indexed 0.565x (foreach-over-array is a counted loop +
+LoadElemInt), sieve/matrix reads 0.92-0.95x.
+
+**`-vdj`** dumps the post-JIT image with each native fragment
+DISASSEMBLED (see the disasm section / the `-vdj` flag).
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
