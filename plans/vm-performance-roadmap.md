@@ -848,3 +848,33 @@ enables 8.
 - Don't perturb dispatch-loop layout blind (the recorded 12.5% front-end
   lesson): land A1 FIRST, then re-baseline, then judge per-op changes.
 - No lazy anything; no third-party deps; MSVC keeps the switch dispatch.
+
+## TODO — pooled allocators for std containers (reduce alloc jitter + speed)
+
+(Maintainer, 2026-07-19.) Route the hot `std::` containers through CUSTOM
+OBJECT POOLS via a custom `Allocator`, the way `PoolAlloc` (poolalloc.h)
+already backs the dict's `unordered_map` node allocs and the per-frame
+`PureCache`. Extend that to the OTHER hot containers — `SharedArrayObj`'s
+element `vector`s (general + the flat `ivec`/`fvec`/`bvec`), `std::string`
+storage (`SharedStr`/`StrObj`), boxed-struct field vectors, the VM's
+segmented slot-stack segments, etc. — each with a per-size-class pool.
+
+Two wins:
+1. **Less benchmark JITTER.** The bench-variance work (bench/tune_scales.py)
+   found an irreducible ~3% wall-clock floor on the ALLOCATION-bound benches
+   (37_range_builtin, 23_dict_insert, the dict/str tier): it is malloc +
+   page-fault + memory-bandwidth noise that scaling the workload does NOT
+   reduce. A pooled allocator (reused, warm, no per-op malloc/free, fewer page
+   faults) should cut that floor, so those benches stabilize at a LOWER
+   variance / smaller scale — a direct payoff for the bench reliability effort.
+2. **Speed.** This is a concrete, incremental piece of the N7 (allocation
+   elimination / value-model) arc: fewer malloc/free round-trips on the
+   array/dict/string/temporary churn that bench/cpp/ pins as the real headroom
+   (dict-tier `my/cpp` ~5x is the value model, not dispatch).
+
+Notes / constraints: single-threaded (no lock needed, like PoolAlloc);
+node-POINTER stability must hold where an existing invariant needs it; under
+ASan the pool must compile to pass-through (the RECYCLE/ASan philosophy —
+poolalloc.h already does this) so use-after-free stays detectable; program-
+lifetime arenas, teardown-order-safe. Measure per-container with the (now
+stabilized) bench suite.
