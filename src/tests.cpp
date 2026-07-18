@@ -14840,17 +14840,18 @@ static bool disasm_highlight_shape()
 {
     const std::string plain =
         "; ===== main  (2 instr) =====\n"
-        "   0  i.bin        s = s + #1\n"
-        "   1  i.jmp.ifnot  i < #3, L4\n";
+        "   0  i.bin        s = r2 + 1\n"
+        "   1  i.jmp.ifnot  i < 3, L4\n";
     const std::string c = highlight_disasm(plain);
 
     const bool colored =
         c.find("\033[1;38;5;222m; =====") != std::string::npos      /* header */
         && c.find("\033[38;5;69mi.bin") != std::string::npos        /* arith */
         && c.find("\033[38;5;214mi.jmp.ifnot") != std::string::npos /* ctrl */
-        && c.find("\033[38;5;150m#1") != std::string::npos          /* immed. */
+        && c.find("\033[38;5;150m1") != std::string::npos           /* immed. */
         && c.find("\033[38;5;213mL4") != std::string::npos          /* label */
-        && c.find("\033[38;5;80ms") != std::string::npos;           /* reg */
+        && c.find("\033[38;5;81ms") != std::string::npos            /* VAR   */
+        && c.find("\033[38;5;244mr2") != std::string::npos;         /* reg   */
 
     std::string stripped;
     for (size_t i = 0; i < c.size(); ) {
