@@ -781,6 +781,33 @@ denominator drifts several percent day to day on this box; it masked a real
 now prints with THREE digits (0.256x / ~3.91x) for exactly this. A phase
 does not land on a probe geomean.
 
+**THE "PROVE THE CODE RAN" HARD RULE (maintainer-set, 2026-07-19).** NEVER
+draw a conclusion from a performance measurement until you have HARD DATA that
+the code path under test ACTUALLY EXECUTED in that measurement. If the code
+*might* not have run, you do not have a result — you have nothing. Re-iterate,
+INSTRUMENT (a counter, `-vd`/`-vdj`, callgrind), and debug until you are 100%
+sure it ran; ONLY THEN measure and reason. **The trap that set this rule:** a
+JIT change was declared "neutral, so dispatch doesn't matter for dict/string"
+from a `MYLANG_JIT=0` vs JIT-on A/B that came out 1.00x — but the JIT compiled
+**ZERO fragments** for those benches (the store split the loop into sub-MIN_RUN
+pieces), so BOTH sides ran the identical interpreted code. "JIT-on == JIT-off"
+proves NOTHING when the JIT never engaged; it is not evidence that dispatch is
+irrelevant, only that the same code ran twice. The conclusion happened to be
+right, but it was ASSERTED WITHOUT DATA. The valid test was to make the JIT
+actually engage (nativize the store so the loop compiled a fragment), PROVE it
+ran (an instrumentation counter: `native_entries=1`, `dict_store_calls=1.5M`
+from native, `compiled_frags=1`), and only then measure — which showed 1.00x,
+NOW a real result: removing all the dict-loop dispatch changes nothing, so the
+`unordered_map`+hash+box C++ work dominates (a `my/cpp` of ~5x in bench/cpp/
+locates that headroom in the value model / N7, not dispatch). Corollaries: a
+same-binary JIT on/off A/B is only meaningful once `compiled_frags > 0` AND the
+fragment is entered (confirm via `-vd` for the `enter.nat`, or a counter for
+the execution); a "neutral" result on an unverified path is INDISTINGUISHABLE
+from "the optimization didn't run" — treat it as the latter until proven
+otherwise. This is the general form of the JIT ref-store-bail lesson (all those
+"native builtins are neutral" numbers were interpreter-vs-interpreter): a
+NULL RESULT is only real once the code is PROVEN to have executed.
+
 **`--vm` — the bytecode-VM performance gate.** `run.py` measures the VM by
 DEFAULT (the binary's default engine since the 2026-07-18 flip); `--vm`
 passes the flag explicitly (needed for a PRE-flip binary in a cross-flip
