@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "vm.h"
+#include "jit.h"
 #include "codegen.h"
 #include "inferencer.h"
 #include "bytecode.h"
@@ -2409,11 +2410,14 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * either completes the whole run or BAILS at some interior
              * pc, whose ORIGINAL op the interpreter then re-executes
              * (incl. any throw, with the exact caret). Fragments never
-             * throw and touch nothing but the slot window. */
-            typedef size_t (*NativeFrag)(LValue *);
-            const auto frag = reinterpret_cast<NativeFrag>(
-                static_cast<char *>(chunk->native.base) + in->a_lit());
-            pc = frag(ctx.frame->slots);
+             * throw and touch nothing but the slot window. jit_enter (a
+             * no_sanitize("function") helper) makes the indirect call, so
+             * UBSan's -fsanitize=function does NOT read a CFI type
+             * signature from before the JIT fragment (which has none -
+             * the read faults on the guard page below `base`). */
+            pc = jit_enter(static_cast<char *>(chunk->native.base)
+                               + in->a_lit(),
+                           ctx.frame->slots);
         }
         VM_NEXT;
 
