@@ -13853,6 +13853,12 @@ static bool codegen_counts(const std::vector<const char *> &lines,
         src += lines[i];
     }
     lexer(src, 1, toks);
+    /* Count the CODEGEN ops (this asserts codegen shape, not the JIT): with
+     * the JIT on, approach A DELETES a fully-native run's ops from the
+     * bytecode (they live in the fragment), so count the PRE-JIT chunk. The
+     * JIT'd shape is covered by the jit:/differential tests. */
+    const bool jit_was = g_jit_enabled;
+    g_jit_enabled = false;
     try {
         ParseContext pc(TokenStream(toks), true);
         unique_ptr<Construct> root = pBlock(pc);
@@ -13861,14 +13867,15 @@ static bool codegen_counts(const std::vector<const char *> &lines,
         resolve_names(root.get());
         specialize_types(root.get());
         const Block *b = dynamic_cast<const Block *>(root.get());
-        if (!b)
-            return false;
+        if (!b) { g_jit_enabled = jit_was; return false; }
         const Chunk chunk = codegen_program(b);
         c.n_temps = chunk.n_temps;
         count_chunk_ops(chunk, c);
     } catch (...) {
+        g_jit_enabled = jit_was;
         return false;
     }
+    g_jit_enabled = jit_was;
     return true;
 }
 
@@ -14059,6 +14066,80 @@ static bool jit_engagement()
     return g_jit_frags > b2;
 #else
     return true;   /* off-platform: the JIT never engages, by design */
+#endif
+}
+
+/* Approach A: a FULLY-NATIVE run has its interpreted originals DELETED from
+ * the bytecode (no double copy) - an EnterNative replaces them, the ops live
+ * only in the fragment. A non-fully-native run (here, an array read that can
+ * bail-to-reinterpret) keeps its ops. Compile the SAME loop JIT-off vs
+ * JIT-on and compare the interpreted int-op count. */
+static bool jit_delete_originals()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    auto compile_loop = [](const std::vector<const char *> &lines, bool jit,
+                           bool &has_enter, size_t &int_ops) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const bool was = g_jit_enabled;
+        g_jit_enabled = jit;
+        has_enter = false; int_ops = 0;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get());
+            resolve_names(root.get());
+            specialize_types(root.get());
+            const Block *b = dynamic_cast<const Block *>(root.get());
+            if (!b) { g_jit_enabled = was; return false; }
+            const Chunk chunk = codegen_program(b);
+            for (const Instr &in : chunk.code) {
+                if (in.op == OpCode::EnterNative) has_enter = true;
+                switch (in.op) {
+                case OpCode::IntBin: case OpCode::IntAddRR:
+                case OpCode::IntMulRR: case OpCode::IntModRI:
+                case OpCode::JumpUnlessIntCmp: case OpCode::ForLoopStep:
+                case OpCode::IntAddStep:
+                    int_ops++; break;
+                default: break;
+                }
+            }
+        } catch (...) { g_jit_enabled = was; return false; }
+        g_jit_enabled = was;
+        return true;
+    };
+
+    /* A pure-int loop: JIT-off keeps its int ops, JIT-on DELETES them. */
+    const std::vector<const char *> pure = {
+        "var s = 0;",
+        "for (var i = 0; i < 100; i++) { s = s + i * i; s = s % 97; }",
+        "print(s);" };
+    bool en_off = false, en_on = false;
+    size_t io_off = 0, io_on = 0;
+    if (!compile_loop(pure, false, en_off, io_off)) return false;
+    if (!compile_loop(pure, true,  en_on,  io_on))  return false;
+    if (en_off || io_off == 0)          return false;   /* off: ops present */
+    if (!en_on || io_on >= io_off)      return false;   /* on: deleted */
+
+    /* An array-read loop is NOT deletable (LoadElem's slice/kind bail
+     * re-interprets), so it keeps its interpreted ops even JIT-on. */
+    const std::vector<const char *> arr = {
+        "var a = [1, 2, 3, 4, 5];",
+        "var s = 0;",
+        "for (var i = 0; i < 5; i++) { s = s + a[i] + i * i; }",
+        "print(s);" };
+    bool en_a = false; size_t io_a = 0;
+    if (!compile_loop(arr, true, en_a, io_a)) return false;
+    if (!en_a || io_a == 0) return false;   /* native, but ops KEPT (not deletable) */
+    return true;
+#else
+    return true;
 #endif
 }
 
@@ -14832,7 +14913,10 @@ static bool vm_codegen_shapes()
 
 /* The bytecode disassembler (-vd) renders a native int loop as smart assembly:
  * the fused for.step counter, the register i.bin ops, the fused compare/branch,
- * and a native builtin call (`print(s)` -> call.blt.v via the value ABI). */
+ * and a native builtin call (`print(s)` -> call.blt.v via the value ABI).
+ * The JIT is disabled here: this pins how the disassembler RENDERS these ops,
+ * and with the JIT on approach A deletes a fully-native loop's ops from the
+ * bytecode (they move into the fragment - -vdj shows them, not -vd). */
 static bool vm_disasm_shape()
 {
     std::string src;
@@ -14845,6 +14929,9 @@ static bool vm_disasm_shape()
         src += l;
     }
     lexer(src, 1, toks);
+    const bool jit_was = g_jit_enabled;
+    g_jit_enabled = false;
+    bool ok = false;
     try {
         ParseContext pc(TokenStream(toks), true);
         unique_ptr<Construct> root = pBlock(pc);
@@ -14853,18 +14940,20 @@ static bool vm_disasm_shape()
         resolve_names(root.get());
         specialize_types(root.get());
         const Block *b = dynamic_cast<const Block *>(root.get());
-        if (!b)
-            return false;
-        const std::string d = disassemble(codegen_program(b), "main");
-        /* the accumulate-for's add+step fuse to the #9 IntAddStep */
-        return d.find("i.addstep") != std::string::npos
-            && d.find("i.bin") != std::string::npos
-            && d.find("i.jmp.ifnot") != std::string::npos
-            && d.find("call.blt.v") != std::string::npos  /* print(s) native */
-            && d.find("halt") != std::string::npos;
+        if (b) {
+            const std::string d = disassemble(codegen_program(b), "main");
+            /* the accumulate-for's add+step fuse to the #9 IntAddStep */
+            ok = d.find("i.addstep") != std::string::npos
+                && d.find("i.bin") != std::string::npos
+                && d.find("i.jmp.ifnot") != std::string::npos
+                && d.find("call.blt.v") != std::string::npos  /* print native */
+                && d.find("halt") != std::string::npos;
+        }
     } catch (...) {
-        return false;
+        ok = false;
     }
+    g_jit_enabled = jit_was;
+    return ok;
 }
 
 /* -vd (disassemble_program) dumps 100% of the SERIALIZABLE image, not just the
@@ -15270,6 +15359,8 @@ static const std::vector<extra_check> extra_checks =
 {
     { "jit: a straight-line int run compiles + executes natively",
       jit_engagement },
+    { "jit: approach A deletes a fully-native run's interpreted originals",
+      jit_delete_originals },
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "builtins: dev-only show() reserved in a script",
