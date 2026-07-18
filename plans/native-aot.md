@@ -226,11 +226,36 @@ next time control reaches the run head.
 - **N4 — polish tier.** The bool-read promotion decision, shift bail
   coverage tests, `LoadElemInt` (+bounds bail), `MathFnV` via a
   C-call-safe glue, `MIN_RUN` tuning by measurement.
-- **N5 — fragment-local register caching.** Hot slots live in
-  registers within a fragment (load once, flush at every exit/bail).
-  Int loops approach native C. Only after N2 proves the structure;
-  this is the first phase with real compiler-ish complexity — evaluate
-  honestly whether the win justifies it.
+- **N5 — fragment-local register caching (LANDED).** Up to 2 hot
+  int-scalar slots are pinned in `r10`/`r11` per fragment: loaded ONCE at
+  entry (a back edge to the first op keeps them live across the loop),
+  read/written straight from the register, and flushed (type singleton +
+  payload, two stores) at EVERY exit/bail. Int loops approach native C
+  (`01_while` 0.098x same-binary at the loop-bound extreme, scale 200
+  best-of-3; the win is on the accumulator/counter locals). `pick_cached_slots` selects a slot iff
+  every use in the run is an int-scalar op AND it is a **resolved LOCAL**
+  (`< slot_count`).
+  **SOUNDNESS — cache ONLY resolved locals, never TEMPS.** A temp
+  (`>= slot_count`) is scratch the VM REUSES for different roles across run
+  boundaries: an int scratch inside one JIT run, a `foreach` general-array
+  SNAPSHOT / dict-iterator base / slice temp between runs. The eager
+  entry-load + exit-flush assumes the register OWNS the slot for the whole
+  fragment; that is false for a temp still LIVE as an array across the
+  boundary — the flush would overwrite the live array with the int register
+  + the `t_int` tag, corrupting the snapshot so a later `LoadElemValue`
+  throws `InternalErrorEx`. A resolved local has a stable identity and
+  (being counted only via proven-int ops) a stable int type, so it is
+  safely owned. This corruption was found by `tests/nested_fuzz.py` (not
+  `-rt`; a 30-line nested-loop-plus-2D-foreach program aliased a foreach
+  snapshot onto a cached temp) and is pinned by two `jit:` regression
+  tests. Two related classifier/emitter bugs were fixed alongside: the
+  `IntAddStep` classifier read the wrong operand fields (counting a literal
+  rhs VALUE as a slot index — a phantom that could cache/corrupt whatever
+  slot it collided with), and the shift-by-register handler read its count
+  operand raw (bypassing the cache for a pinned shift-count local). Every
+  emitter slot access now goes through the cache-aware `read_slot`/
+  `write_slot`/`load_operand`; the raw `slot_addr` reads that remain are on
+  `bad()`-disqualified (`LoadElem` base/index) slots only.
 
 ## The path to 10x — why it is NOT the N-series (N6/N7 sketch)
 

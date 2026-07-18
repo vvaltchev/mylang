@@ -472,6 +472,36 @@ codegen ONLY when `g_jit_annotate` (set by `-vdj`) - zero cost on a
 normal run. The one dev tool that lets a human read the generated
 machine code alongside the bytecode.
 
+**N5 - FRAGMENT-LOCAL REGISTER CACHING.** Up to 2 hot int-scalar slots
+are pinned in `r10`/`r11` per fragment (`pick_cached_slots`, jit.cpp):
+loaded ONCE at the fragment head (the native back edge jumps AFTER the
+entry loads, keeping them live across the loop), read/written straight
+from the register (`read_slot`/`write_slot`/`load_operand` are all
+cache-aware), and FLUSHED - the `t_int` singleton (held in rsi) to the
+type word + the register to the payload, two stores - at EVERY exit/bail
+(`flush_cache`, called by `exit_pc`). The accumulator/counter locals of
+an int loop never touch memory in the steady state (`01_while` 0.098x
+same-binary at the loop-bound extreme, scale 200 best-of-3). **SOUNDNESS - only resolved
+LOCALS are cached, never TEMPS.** A slot qualifies iff every use in the
+run is an int-scalar op AND it is a resolved local (`< slot_count`). A
+TEMP (`>= slot_count`) is scratch the VM REUSES across run boundaries -
+an int scratch inside one JIT run, a `foreach` general-array SNAPSHOT /
+dict-iterator base / slice temp between runs - so the eager
+entry-load/exit-flush (which assumes the register OWNS the slot for the
+whole fragment) would overwrite a temp still LIVE as an array with the
+int register + the `t_int` tag, corrupting the snapshot -> a later
+`LoadElemValue` `InternalErrorEx`. A resolved local has a stable identity
+and (counted only via proven-int ops) a stable int type. This corruption
+was a `tests/nested_fuzz.py` find, NOT a `-rt` one (the aliasing needs a
+specific temp-slot coincidence a hand-written test rarely hits), pinned
+by two `jit:` regression tests. The classifier's operand extraction must
+EXACTLY match the emitter's per-op layout: an earlier `IntAddStep`
+mismatch counted a literal rhs VALUE as a slot index (a phantom that
+could cache/corrupt whatever slot it collided with), and the
+shift-by-register handler read its count raw - both fixed. The only raw
+`slot_addr` reads left are on `bad()`-disqualified `LoadElem` base/index
+slots (never cached). See plans/native-aot.md.
+
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
 code-label addresses generated in enum order from `ML_FOR_EACH_OPCODE`

@@ -33,6 +33,8 @@
 #include "evalvalue.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <vector>
 
@@ -191,25 +193,64 @@ struct Emitter {
             b[at + i] = static_cast<uint8_t>(v >> (i * 8));
     }
 
-    /* mov <reg64>, [rdi + disp32]   (reg encoded in ModRM.reg) */
+    /* N5 register cache: a hot int slot pinned in a GP register for the
+     * fragment's life (load once at entry, flush type+payload at EVERY
+     * exit/bail). reg is a caller-saved GP (r10/r11) - free, so no
+     * prologue. */
+    struct CacheEnt { int slot; int32_t payload, type; uint8_t reg; };
+    std::vector<CacheEnt> cache;
+    int creg(int slot) const
+    {
+        for (const CacheEnt &c : cache)
+            if (c.slot == slot)
+                return c.reg;
+        return -1;
+    }
+
+    /* mov <reg64>, [rdi + disp32]  (reg 0-15; REX.R for r8-r15) */
     void load(uint8_t reg, int32_t disp)
     {
-        u8(0x48); u8(0x8B); u8(static_cast<uint8_t>(0x87 | (reg << 3)));
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(0x8B);
+        u8(static_cast<uint8_t>(0x87 | ((reg & 7) << 3)));
         u32(static_cast<uint32_t>(disp));
     }
-    /* mov [rdi + disp32], <reg64> */
+    /* mov [rdi + disp32], <reg64>  (reg 0-15) */
     void store(uint8_t reg, int32_t disp)
     {
-        u8(0x48); u8(0x89); u8(static_cast<uint8_t>(0x87 | (reg << 3)));
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(0x89);
+        u8(static_cast<uint8_t>(0x87 | ((reg & 7) << 3)));
         u32(static_cast<uint32_t>(disp));
+    }
+    /* mov <dst>, <src>  (GP reg-reg, both 0-15) */
+    void mov_rr(uint8_t dst, uint8_t src)
+    {
+        u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 0x04 : 0)
+                                | (dst >= 8 ? 0x01 : 0)));
+        u8(0x89);
+        u8(static_cast<uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7)));
+    }
+    /* Write every cached slot back to memory (type = t_int in rsi, then
+     * the payload). Emitted before each exit/bail so the interpreter
+     * resumes with the correct slot values. */
+    void flush_cache()
+    {
+        for (const CacheEnt &c : cache) {
+            store(6 /*rsi = t_int*/, c.type);
+            store(c.reg, c.payload);
+        }
     }
     /* movabs <reg64>, imm64 */
     void movabs(uint8_t reg, uint64_t imm)
     {
         u8(0x48); u8(static_cast<uint8_t>(0xB8 | reg)); u64(imm);
     }
-    /* mov eax, imm32; ret   (the exit/bail sequence: resume pc out) */
-    void exit_pc(uint32_t pc) { u8(0xB8); u32(pc); u8(0xC3); }
+    /* mov eax, imm32; ret - the exit/bail: flush the register cache
+     * (N5) so the interpreter sees the up-to-date slots, then return
+     * the resume pc. */
+    void exit_pc(uint32_t pc)
+    { flush_cache(); u8(0xB8); u32(pc); u8(0xC3); }
 
     /* ---- N3 SSE float ---- (xmm0=a/acc, xmm1=b; r8 = t_float) */
     /* movsd xmm<r>, [rdi+disp] */
@@ -291,7 +332,11 @@ struct Emitter {
     { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x10); u8(0x04); u8(0xC9); }
     /* `<short jcc> +6; exit_pc(pc)` - bail unless the PASS condition. */
     void bail_unless(uint8_t short_pass, uint32_t pc)
-    { u8(short_pass); u8(0x06); exit_pc(pc); }
+    {
+        const size_t sk = j8(short_pass);   /* jcc + rel8, skip exit_pc */
+        exit_pc(pc);                        /* may be > 6 bytes (N5 flush) */
+        patch8(sk, pos());
+    }
 
     /* a short rel8 jcc/jmp with the rel patched to here later */
     size_t j8(uint8_t op) { u8(op); const size_t at = pos(); u8(0); return at; }
@@ -373,9 +418,11 @@ static void emit_cond_jump_raw(Emitter &e, uint8_t near_op,
         fixups.push_back({ e.pos(), target_pc });
         e.u32(0);
     } else {
-        e.u8(short_neg_op);
-        e.u8(0x06);                          /* skip the 6-byte exit */
+        const size_t sk = e.j8(short_neg_op);  /* jcc + rel8, skip the
+                                                * exit_pc (grows past 6
+                                                * bytes with the N5 flush) */
         e.exit_pc(static_cast<uint32_t>(remap[target_pc]));
+        e.patch8(sk, e.pos());
     }
 }
 
@@ -484,13 +531,24 @@ static SlotAddr slot_addr(int slot)
 }
 
 /* Load operand a/b of `in` into `reg` (slot load or immediate). */
+/* Read a slot's int payload into `dst` - from its CACHE register (N5)
+ * if pinned, else from memory. */
+static void read_slot(Emitter &e, uint8_t dst, int slot)
+{
+    const int cr = e.creg(slot);
+    if (cr >= 0)
+        e.mov_rr(dst, static_cast<uint8_t>(cr));
+    else
+        e.load(dst, slot_addr(slot).payload);
+}
+
 static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
                          int_type lit, int slot)
 {
     if (is_lit)
         e.movabs(reg, static_cast<uint64_t>(lit));
     else
-        e.load(reg, slot_addr(slot).payload);
+        read_slot(e, reg, slot);
 }
 
 /*
@@ -526,6 +584,129 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
     }
     e.store(RSI, a.type);        /* the int Type singleton */
     e.store(src_reg, a.payload);
+}
+
+/* Write an int result into a slot - into its CACHE register (N5,
+ * payload only; the type flushes at exit) if pinned, else store_dst's
+ * memory two-store / ref-bail. */
+static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
+                       uint32_t bail_pc)
+{
+    const int cr = e.creg(slot);
+    if (cr >= 0) {
+        e.mov_rr(static_cast<uint8_t>(cr), src);
+        return;
+    }
+    store_dst(e, ck, src, slot, bail_pc);
+}
+
+/* N5: pick up to 2 hot INT-scalar slots to pin in registers for a run.
+ * A slot qualifies iff it is a RESOLVED LOCAL (< slot_count) and EVERY use
+ * in [begin,end) is an int-scalar read/write (the int-arith / loop ops);
+ * any float / array / member touch DISQUALIFIES it. Ranked by use count
+ * (>= 3), top 2 chosen.
+ *
+ * TEMPS (>= slot_count) are EXCLUDED: a temp is scratch the VM REUSES for
+ * different roles across run boundaries - an int scratch inside one JIT
+ * run, a foreach array-snapshot / dict-iterator base / slice temp between
+ * runs. The cache's eager entry-load + exit-flush assumes the register
+ * OWNS the slot for the whole fragment; that is false for a temp still
+ * live as an array across the boundary (the flush would overwrite the live
+ * array with the int register + t_int tag -> a corrupted snapshot -> a
+ * later LoadElemValue InternalErrorEx). A resolved local has a stable
+ * identity and (being counted here only via proven-int ops) a stable int
+ * type, so it is safely owned. */
+static std::vector<int>
+pick_cached_slots(const std::vector<Instr> &code, size_t begin,
+                  size_t end, int slot_count)
+{
+    std::unordered_map<int, int> use;    /* slot -> int-scalar use count */
+    std::unordered_set<int> disq;
+    const auto usei = [&](int s) { if (s >= 0) use[s]++; };
+    const auto bad  = [&](int s) { if (s >= 0) disq.insert(s); };
+
+    for (size_t pc = begin; pc < end; pc++) {
+        const Instr &in = code[pc];
+        switch (in.op) {
+        case OpCode::IntBin:
+        case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+        case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+        case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+        case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+        case OpCode::IntShlRR: case OpCode::IntShrRR:
+        case OpCode::IntShlRI: case OpCode::IntShrRI:
+        case OpCode::IntAddModRI:
+            if (!in.a_is_lit()) usei(in.a_slot());
+            if (!in.b_is_lit()) usei(in.b_slot());
+            usei(in.target);
+            break;
+        case OpCode::IntModRI:
+            usei(in.a_slot()); usei(in.target);
+            break;
+        case OpCode::JumpUnlessIntCmp:
+            if (!in.a_is_lit()) usei(in.a_slot());
+            if (!in.b_is_lit()) usei(in.b_slot());
+            break;
+        case OpCode::ForLoopStep:
+            usei(in.target2);
+            if (!in.a_is_lit()) usei(in.a_slot());
+            if (!in.b_is_lit()) usei(in.b_slot());
+            break;
+        case OpCode::IntAddStep:
+            /* operand layout MUST match the emitter (emit_branch): accum =
+             * a_dual_lo, counter = target2, rhs = b (b_slot unless b_is_lit),
+             * bound = a_dual_hi (slot unless the private a-lit flag, read as
+             * a_is_lit). Counting the wrong field - e.g. a bare `in.pb`,
+             * which for a LITERAL rhs is the literal VALUE - would treat that
+             * value as a slot index and cache/corrupt whatever slot it
+             * collides with (an array slot -> LoadElem InternalErrorEx). */
+            usei(in.a_dual_lo());      /* accumulator */
+            usei(in.target2);          /* counter */
+            if (!in.b_is_lit()) usei(in.b_slot());      /* rhs slot */
+            if (!in.a_is_lit()) usei(in.a_dual_hi());    /* bound slot */
+            break;
+        case OpCode::LoadImmInt:
+            usei(in.target);
+            break;
+        /* float / array touches disqualify the slots (not int-scalar) */
+        case OpCode::FloatBin:
+        case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+        case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+        case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+        case OpCode::JumpUnlessFloatCmp:
+            bad(in.a_slot()); bad(in.b_slot()); bad(in.target);
+            break;
+        case OpCode::LoadImmFloat:
+            bad(in.target);
+            break;
+        case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+            bad(in.target2); bad(in.a_slot()); bad(in.target);
+            break;
+        case OpCode::Jump:
+            break;                       /* no slots */
+        default:
+            return {};                   /* an unclassified op - be SAFE and
+                                          * cache nothing (a new eligible op
+                                          * that isn't handled here just
+                                          * turns caching off, never
+                                          * corrupts a slot) */
+        }
+    }
+
+    std::vector<std::pair<int, int>> cand;   /* (count, slot) */
+    for (const auto &kv : use)
+        if (kv.first < slot_count && !disq.count(kv.first)
+                && kv.second >= 3)
+            cand.push_back({ kv.second, kv.first });
+    std::sort(cand.begin(), cand.end(),
+              [](const std::pair<int,int> &a, const std::pair<int,int> &b) {
+                  return a.first != b.first ? a.first > b.first
+                                            : a.second < b.second;
+              });
+    std::vector<int> out;
+    for (size_t i = 0; i < cand.size() && i < 2; i++)
+        out.push_back(cand[i].second);
+    return out;
 }
 
 /* Load a float OPERAND into xmm<r>. A lit: movabs the double bits +
@@ -587,7 +768,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::LoadImmInt:
         e.movabs(RAX, static_cast<uint64_t>(in.a_lit()));
-        store_dst(e, ck, RAX, in.target, pc);
+        write_slot(e, ck, RAX, in.target, pc);
         return true;
 
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
@@ -603,10 +784,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         case OpCode::IntOrRR:  case OpCode::IntOrRI:  aop = Op::bor;   break;
         default:                                      aop = Op::bxor;  break;
         }
-        e.load(RAX, slot_addr(in.a_slot()).payload);
+        read_slot(e, RAX, in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         op_rr(e, aop);
-        store_dst(e, ck, RAX, in.target, pc);
+        write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
 
@@ -614,7 +795,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     case OpCode::IntShlRI: case OpCode::IntShrRI: {
         const bool shl =
             in.op == OpCode::IntShlRR || in.op == OpCode::IntShlRI;
-        e.load(RAX, slot_addr(in.a_slot()).payload);
+        read_slot(e, RAX, in.a_slot());
         if (in.b_is_lit()) {
             /* imm count: >= 0 by selection; saturate at compile time */
             const int_type c = in.b_lit();
@@ -631,7 +812,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u8(static_cast<uint8_t>(c));
             }
         } else {
-            e.load(RCX, slot_addr(in.b_slot()).payload);
+            read_slot(e, RCX, in.b_slot());   /* cache-aware (the classifier
+                                               * counts this shift count as a
+                                               * cacheable int use) */
             /* test rcx,rcx; js bail (negative count throws) */
             e.u8(0x48); e.u8(0x85); e.u8(0xC9);
             e.u8(0x0F); e.u8(0x88);
@@ -654,28 +837,28 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u8(shl ? 0xE0 : 0xF8);                     /* shl/sar rax,cl */
             e.patch32(jdone, static_cast<uint32_t>(e.pos() - (jdone + 4)));
         }
-        store_dst(e, ck, RAX, in.target, pc);
+        write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
 
     case OpCode::IntModRI: {
-        e.load(RAX, slot_addr(in.a_slot()).payload);
+        read_slot(e, RAX, in.a_slot());
         e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
         e.u8(0x48); e.u8(0x99);                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
-        store_dst(e, ck, RDX, in.target, pc);            /* remainder */
+        write_slot(e, ck, RDX, in.target, pc);            /* remainder */
         return true;
     }
 
     case OpCode::IntAddModRI: {
-        e.load(RAX, slot_addr(in.a_slot()).payload);
+        read_slot(e, RAX, in.a_slot());
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         op_rr(e, Op::plus);
         e.movabs(RCX, static_cast<uint64_t>(
                           static_cast<int_type>(in.target2)));
         e.u8(0x48); e.u8(0x99);                          /* cqo */
         e.u8(0x48); e.u8(0xF7); e.u8(0xF9);              /* idiv rcx */
-        store_dst(e, ck, RDX, in.target, pc);
+        write_slot(e, ck, RDX, in.target, pc);
         return true;
     }
 
@@ -743,7 +926,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_float_store(e, ck, X0, in.target, pc);
         } else {
             e.load_elem_int();                   /* mov rax,[rcx+r9*8] */
-            store_dst(e, ck, RAX, in.target, pc);
+            write_slot(e, ck, RAX, in.target, pc);
         }
         return true;
     }
@@ -794,10 +977,10 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         /* i (target2) += step (b)  [lt/le]  or -= step  [ge/gt]; then
          * jump to target (the back edge) when (i aop bound(a)). */
         const bool up = in.aop == Op::lt || in.aop == Op::le;
-        e.load(RAX, slot_addr(in.target2).payload);
+        read_slot(e, RAX, in.target2);
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         op_rr(e, up ? Op::plus : Op::minus);     /* rax += / -= rcx */
-        store_dst(e, ck, RAX, in.target2, pc);
+        write_slot(e, ck, RAX, in.target2, pc);
         load_operand(e, RCX, in.a_is_lit(), in.a_lit(), in.a_slot());
         e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
         emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
@@ -811,18 +994,18 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * else slot). step is always 1. */
         const bool up = in.aop == Op::lt || in.aop == Op::le;
         const int adst = in.a_dual_lo();
-        e.load(RAX, slot_addr(adst).payload);
+        read_slot(e, RAX, adst);
         load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
         op_rr(e, Op::plus);
-        store_dst(e, ck, RAX, adst, pc);
-        e.load(RAX, slot_addr(in.target2).payload);
+        write_slot(e, ck, RAX, adst, pc);
+        read_slot(e, RAX, in.target2);
         e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
-        store_dst(e, ck, RAX, in.target2, pc);
+        write_slot(e, ck, RAX, in.target2, pc);
         if (in.a_is_lit())
             e.movabs(RCX, static_cast<uint64_t>(
                               static_cast<int_type>(in.a_dual_hi())));
         else
-            e.load(RCX, slot_addr(in.a_dual_hi()).payload);
+            read_slot(e, RCX, in.a_dual_hi());
         e.u8(0x48); e.u8(0x39); e.u8(0xC8);      /* cmp rax, rcx */
         emit_cond_jump(e, in.aop, static_cast<size_t>(in.target),
                        begin, end, remap, fixups);
@@ -930,6 +1113,21 @@ void jit_compile_chunk(Chunk &chunk)
         e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
         if (run_has_float(chunk, begin, end))     /* r8 = t_float (N3) */
             e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+
+        /* N5: pin up to 2 hot int slots in r10/r11 for this run - load
+         * each ONCE here (the back edge jumps to the first op below, so
+         * the loop keeps them in registers; every exit flushes them). */
+        e.cache.clear();
+        {
+            static const uint8_t cregs[2] = { 10, 11 };
+            const std::vector<int> hot =
+                pick_cached_slots(chunk.code, begin, end, chunk.slot_count);
+            for (size_t h = 0; h < hot.size(); h++) {
+                const SlotAddr a = slot_addr(hot[h]);
+                e.cache.push_back({ hot[h], a.payload, a.type, cregs[h] });
+                e.load(cregs[h], a.payload);     /* entry load */
+            }
+        }
 
         std::vector<size_t> label(end - begin, 0);
         std::vector<Fixup> fixups;
