@@ -1,0 +1,3 @@
+# Per-machine comparison-language timing cache (bench/run.py regenerates it on
+# demand - when a bench source or its scale changes, or with --refresh-cache).
+.bench_cache/
