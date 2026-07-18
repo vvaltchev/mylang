@@ -13,6 +13,7 @@
 #include "errfmt.h"
 #include "trace.h"
 #include "vm.h"
+#include "jit.h"
 #include "disasm.h"
 
 #include <initializer_list>
@@ -76,6 +77,9 @@ void help()
          << endl;
     cout << "  -nr      Don't run, just validate" << endl;
     cout << "  -vm      Execute via the bytecode VM (the DEFAULT)." << endl;
+    cout << "  -nj      Disable the native x86-64 AOT tier (also"
+         << endl;
+    cout << "           MYLANG_JIT=0). See plans/native-aot.md" << endl;
     cout << "  -tw      Execute via the tree-walking interpreter instead"
          << endl;
     cout << "           of the VM. See plans/bytecode-vm.md" << endl;
@@ -227,6 +231,11 @@ parse_args(int argc, char **argv)
                 cout << "-vm and -tw are mutually exclusive" << endl;
                 exit(1);
             }
+
+        } else if (!strcmp(arg, "-nj")) {
+
+            g_jit_enabled = false;   /* native-AOT off (plans/native-aot.md);
+                                      * also MYLANG_JIT=0 */
 
         } else if (!strcmp(arg, "-tw")) {
 

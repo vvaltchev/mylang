@@ -1081,6 +1081,19 @@ enum class OpCode : unsigned char {
     IntAddStep, ForStepElemInt, StructFieldAddInt,
 
     /*
+     * Native-AOT (plans/native-aot.md): enter a compiled x86-64 fragment.
+     * `a` (int lit) = the byte offset of the fragment entry inside
+     * Chunk::native. The fragment (a frameless leaf: slots base in, resume
+     * pc out, caller-saved regs only) runs a whole straight-line RUN of
+     * proven-scalar ops - or bails early - and returns the pc where the
+     * interpreter resumes. Inserted by jit_compile_chunk AFTER all other
+     * passes (the peephole/liveness/ref_slots never see it); the run's
+     * ORIGINAL ops stay in place, so any bail pc resumes interpreted.
+     * Never emitted on unsupported platforms or when the JIT is off.
+     */
+    EnterNative,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1128,7 +1141,7 @@ enum class OpCode : unsigned char {
     X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
     X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV) \
     X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt) \
-    X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt)
+    X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin
@@ -1340,6 +1353,34 @@ struct CgInstr : Instr {
     CgInstr(const Instr &i) : Instr(i) {}
 };
 
+/*
+ * Native-AOT fragment buffer (plans/native-aot.md; jit.cpp): an mmap'd,
+ * W^X (RW -> RX flipped) region holding this chunk's compiled fragments.
+ * Move-only (munmap on release); NEVER serialized (`.myv` stays portable
+ * - the AOT pass re-runs after load); null on unsupported platforms or
+ * under -nj / MYLANG_JIT=0.
+ */
+struct NativeCode {
+    void *base = nullptr;
+    size_t len = 0;
+
+    NativeCode() = default;
+    NativeCode(NativeCode &&o) noexcept : base(o.base), len(o.len) {
+        o.base = nullptr;
+        o.len = 0;
+    }
+    NativeCode &operator=(NativeCode &&o) noexcept {
+        release();
+        base = o.base; len = o.len;
+        o.base = nullptr; o.len = 0;
+        return *this;
+    }
+    NativeCode(const NativeCode &) = delete;
+    NativeCode &operator=(const NativeCode &) = delete;
+    ~NativeCode() { release(); }
+    void release() noexcept;   /* munmap; jit.cpp (no-op when null) */
+};
+
 struct Chunk {
     std::vector<Instr> code;
     /*
@@ -1368,6 +1409,9 @@ struct Chunk {
      * non-trivial survived outside the list (the audit net).
      */
     std::vector<int32_t> ref_slots;
+
+    /* Native-AOT fragments (see NativeCode above). */
+    NativeCode native;
 
     /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
      * ForeachDyn in the chunk. See the ForeachDyn ops. */

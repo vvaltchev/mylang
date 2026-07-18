@@ -1,6 +1,11 @@
 # Native x86-64 AOT — incremental, on-the-fly, never-complete (design)
 
-Status: DESIGNED (2026-07-18), not started. Maintainer direction: build
+Status: N0+N1 LANDED (2026-07-18): the emitter, the W^X NativeCode
+buffer, EnterNative + insertion/remap, the straight-line int tier, the
+-nj / MYLANG_JIT=0 kill switch, the bail + engagement tests. Measured:
+07_nested_loops 0.692x, 68_nested 0.787x, suite VM-wall 0.998, my/py
+4.97x → 5.04x; JIT-off neutral. NEXT: N2 (intra-run branches + the
+native back edge). Maintainer direction: build
 it VERY incrementally, accept that it may never cover everything (the
 interpreter is the permanent, tested fallback — "never complete" is a
 feature, not a debt), never serialize machine code (AOT always runs
@@ -161,7 +166,7 @@ next time control reaches the run head.
 
 - `#if defined(__x86_64__) && !defined(_WIN32)` — everything else
   simply never creates fragments; zero behavior change.
-- **Kill switch**: `-nojit` + `MYLANG_JIT=0` env. This is also the
+- **Kill switch**: `-nj` + `MYLANG_JIT=0` env. This is also the
   measurement lever: the per-phase A/B is THE SAME BINARY, JIT on vs
   off (cleaner than cross-binary), on top of the usual cross-binary
   full-suite rule vs the pre-JIT baseline.

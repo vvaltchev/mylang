@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "codegen.h"
+#include "jit.h"
 #include "inferencer.h"
 #include "syntax.h"
 
@@ -7554,6 +7555,12 @@ codegen_chunk(const Block *block, int slot_count)
                                        * a stale IntBin div0 loc entry for a
                                        * specialized (non-throwing) op is
                                        * never queried */
+    jit_compile_chunk(cg.chunk);      /* native-AOT (plans/native-aot.md):
+                                       * LAST - needs the specialized ops +
+                                       * ref_slots; inserts EnterNative
+                                       * heads + remaps pcs itself. A
+                                       * `.myv` load will call it the same
+                                       * way. No-op off-platform / -nj. */
     return std::move(cg.chunk);
 }
 

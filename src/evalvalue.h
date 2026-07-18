@@ -227,6 +227,20 @@ class EvalValue final {
 
 public:
 
+    /*
+     * Native-AOT layout probes (jit.cpp): the emitter bakes these as x86
+     * addressing displacements. Class-internal offsetof (access-legal;
+     * EvalValue's data members share one access section, so the layout is
+     * standard and the offsets are well-defined).
+     */
+    static constexpr size_t jit_payload_off() {
+        return offsetof(EvalValue, val);
+    }
+    static constexpr size_t jit_type_off() {
+        return offsetof(EvalValue, type);
+    }
+
+
     EvalValue()
         : val(), type(AllTypes[Type::t_none]) { }
 

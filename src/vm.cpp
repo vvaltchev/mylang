@@ -2403,6 +2403,20 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
         VM_NEXT;
 
+        VM_CASE(EnterNative): {
+            /* Native-AOT (plans/native-aot.md): run the compiled fragment
+             * - a frameless leaf (slots base in rdi, resume pc out). It
+             * either completes the whole run or BAILS at some interior
+             * pc, whose ORIGINAL op the interpreter then re-executes
+             * (incl. any throw, with the exact caret). Fragments never
+             * throw and touch nothing but the slot window. */
+            typedef size_t (*NativeFrag)(LValue *);
+            const auto frag = reinterpret_cast<NativeFrag>(
+                static_cast<char *>(chunk->native.base) + in->a_lit());
+            pc = frag(ctx.frame->slots);
+        }
+        VM_NEXT;
+
         VM_CASE(StructFieldAddInt): {
             /* #9 fusion: `dst = other + a[i].f` (general 3-address - the
              * struct-foreach reduction chains adds through temps). The
