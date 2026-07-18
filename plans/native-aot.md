@@ -14,7 +14,15 @@ the kill switch exists for it): VM-wall geomean 0.895, my/py 4.97x ->
 on the headline - 5.04x -> 5.47x - but its tiny-magnitude per-bench
 deltas at 4-15ms are NOISE; the same-binary control shows no real
 regression, incl. 07_nested_loops, which is FASTER same-binary.) NEXT:
-N3 (the SSE float tier). Maintainer direction: build
+N3 DONE (the SSE float tier): FloatBin(add/sub/mul) +
+FloatAdd/Sub/MulRR/RI, LoadImmFloat, JumpUnlessFloatCmp (ordering,
+NaN-safe via the ucomisd operand-swap trick). Float slot READS
+type-dispatch (float->movsd fast, int->cvtsi2sd promote, else bail,
+matching read_float_slot); WRITES are the two-store (t_float singleton
+in r8 + movsd payload). div/mod stay interpreted (they THROW on 0 /
+are a libm call). MEASURED (same-binary JIT off vs on): VM-wall geomean
+0.812, my/py 5.00x -> 5.55x; 54_mandelbrot 0.344x, 55_float_sum 0.867x.
+NEXT: N4 (LoadElemInt/Float with a bounds bail; MathFnV glue). Maintainer direction: build
 it VERY incrementally, accept that it may never cover everything (the
 interpreter is the permanent, tested fallback — "never complete" is a
 feature, not a debt), never serialize machine code (AOT always runs
