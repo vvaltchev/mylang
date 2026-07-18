@@ -475,8 +475,11 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                             : pv == ta ? "<array-tag>" : nullptr;
             if (tag) { o << "movabs " << gp64(rr) << ", " << tag;
                        cmt = "the Type-tag constant"; }
-            else       o << "movabs " << gp64(rr) << ", "
-                         << int64_t(imm);          /* base-10 value */
+            else if (imm >= 1000)                  /* big values (addresses,
+                                                    * fn pointers) in HEX */
+                o << "movabs " << gp64(rr) << ", 0x" << std::hex << imm
+                  << std::dec;
+            else   o << "movabs " << gp64(rr) << ", " << int64_t(imm);
         } else {
             const uint32_t imm = rd32();            /* mov eNN, imm32 = the
                                                      * resume VM pc (exit) */
@@ -485,6 +488,12 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         }
         break; }
     case 0xC3: o << "ret"; break;
+    case 0x50: case 0x51: case 0x52: case 0x53:      /* push r64 */
+    case 0x54: case 0x55: case 0x56: case 0x57:
+        o << "push " << gp64((op - 0x50) + (B ? 8 : 0)); break;
+    case 0x58: case 0x59: case 0x5A: case 0x5B:      /* pop r64 */
+    case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+        o << "pop " << gp64((op - 0x58) + (B ? 8 : 0)); break;
     case 0x8B: modrm(regf, rm); o << "mov " << gp64(regf) << ", " << rm;
         break;
     case 0x89: modrm(regf, rm); o << "mov " << rm << ", " << gp64(regf);
@@ -509,10 +518,23 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         break; }
     case 0xD3: { modrm(regf, rm);
         o << ((regf & 7) == 4 ? "shl " : "sar ") << rm << ", cl"; break; }
-    case 0xFF: { modrm(regf, rm);
-        o << ((regf & 7) == 0 ? "inc " : "dec ") << rm; break; }
+    case 0xFF: { modrm(regf, rm);   /* group 5: /0 inc /1 dec /2 call
+                                     * /4 jmp /6 push (the reg field is the
+                                     * opcode extension, NOT a register) */
+        const int sub = regf & 7;
+        o << (sub == 0 ? "inc " : sub == 1 ? "dec " : sub == 2 ? "call "
+            : sub == 4 ? "jmp " : sub == 6 ? "push " : "ff/? ") << rm;
+        break; }
     case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
         o << "cmp byte " << rm << ", " << int(imm); break; }
+    case 0x90: o << "nop"; break;
+    case 0xE8: { const int32_t d = rd32();   /* call rel32 (N6a direct
+                                              * libm call); target is
+                                              * external, show the signed
+                                              * displacement in hex */
+        o << "call " << (d < 0 ? "-0x" : "+0x") << std::hex
+          << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
+        cmt = "direct rel32 call (libm)"; break; }
     case 0xE9: { const int32_t d = rd32();
         o << "jmp +" << std::dec << (int32_t(p) + d); break; }
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
@@ -535,6 +557,8 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             o << "movsd xmm" << (regf) << ", " << rm; }
         else if (o2 == 0x11) { modrm(regf, rm);
             o << "movsd " << rm << ", xmm" << regf; }
+        else if (o2 == 0x51) { modrm(regf, rm);   /* sqrtsd (N6a) */
+            o << "sqrtsd xmm" << regf << ", " << rm; }
         else if (o2 == 0x58 || o2 == 0x59 || o2 == 0x5C || o2 == 0x5E) {
             modrm(regf, rm);
             const char *m = o2==0x58?"addsd":o2==0x59?"mulsd":
