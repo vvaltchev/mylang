@@ -720,6 +720,85 @@ static const std::vector<test> tests =
     },
 
     {
+        /* NATIVE AOT N5 (plans/native-aot.md) - register-caching soundness.
+         * The fragment-local cache pins a hot int slot in r10/r11, loading
+         * it ONCE at entry and flushing type+payload at EVERY exit. That is
+         * sound ONLY for a RESOLVED LOCAL: a TEMP (>= slot_count) is scratch
+         * the VM REUSES across run boundaries - an int scratch inside a JIT
+         * run here, a foreach general-array SNAPSHOT between runs there. If
+         * such a temp were cached, the flush would overwrite the live array
+         * (with the int register + the t_int tag), corrupting the snapshot
+         * so a later LoadElemValue hit `InternalErrorEx`. This program
+         * (nested counted loops feeding int scratch temps, then a 2-D
+         * `foreach` over an array<array<int>> whose snapshot lands in the
+         * same temp) reproduced that corruption before temps were excluded
+         * from the cache; the differential reruns it under the VM+JIT, and
+         * the result must match the tree-walker (acc == 86). Found by
+         * tests/nested_fuzz.py (seed 116, depth 3). */
+        "jit: a reused temp (foreach snapshot) is never register-cached",
+        {
+            "var A = [1, 2, 3, 4, 5, 6, 7];",
+            "var G = [0];",
+            "var D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0};",
+            "var M = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];",
+            "var s0 = 0; var s1 = 1; var s2 = 2; var s3 = 3;",
+            "var s4 = 4; var s5 = 5; var s6 = 6;",
+            "func mix(a, b, c) => (a + b * c) % 100;",
+            "func rsum(n) { if (n <= 0) return 0;",
+            "               return (n + rsum(n - 1)) % 100; }",
+            "func gcd(a, b) { if (b == 0) return a; return gcd(b, a % b); }",
+            "func comp(x) => mix(x, x, 2);",
+            "for (var rep = 0; rep < 1; rep++) {",
+            "  if (len(G) > 0) erase(G, s4 % len(G));",
+            "  s5 = ((A[s2 % 7] & s4)) % 100;",
+            "  for (var v0 = 1; v0 < 8; v0 = v0 * 2) {",
+            "    s4 = (s4 + sum(clone(A))) % 100;",
+            "    for (var v1 = 1; v1 < 4; v1 = v1 * 2) {",
+            "      D[4] = (D[4] + 0) % 100;",
+            "      for (var v2 = 1; v2 < 8; v2 = v2 * 2) {",
+            "        s4 = ((len(G) | A[((v1 > s6)) % 7])) % 100;",
+            "      }",
+            "    }",
+            "  }",
+            "}",
+            "var acc = 0;",
+            "foreach (var x in A) acc = (acc + x) % 100;",
+            "foreach (var x in G) acc = (acc + x) % 100;",
+            "acc = (acc + len(G)) % 100;",
+            "foreach (var row in M) foreach (var x in row)",
+            "  acc = (acc + x) % 100;",
+            "acc = (acc + s0 + s1 + s2 + s3 + s4 + s5 + s6) % 100;",
+            "acc = (acc + D[0] + D[1] + D[2] + D[3] + D[4]) % 100;",
+            "assert(acc == 86);",
+        },
+    },
+
+    {
+        /* NATIVE AOT N5 - a shift-by-REGISTER (`w << k`, IntShlRR) reads its
+         * count operand cache-aware. The classifier counts the shift count
+         * `k` as a cacheable int use, so when `k` is pinned in r10/r11 the
+         * shift MUST read it from that register, not from the (stale-until-
+         * flush) slot memory. Reading it raw gave a wrong shift amount here
+         * (k is written to its cache register earlier in the same iteration,
+         * so memory lagged a step). w is kept mutable (a fresh slot, not an
+         * auto-const) so `w << k` stays a reg-first IntShlRR rather than
+         * folding to an `imm << slot` generic IntBin that never reaches the
+         * JIT. Result must match the tree-walker (s == 2700). */
+        "jit: a register-cached shift count is read from the cache, not slot",
+        {
+            "var s = 0; var w = 1;",
+            "for (var i = 0; i < 25; i++) {",
+            "  var k = 1 + (i & 3);",
+            "  w = (w + i) & 15;",
+            "  k = k + (k & 1);",
+            "  s = (s + (w << k)) & 1048575;",
+            "  s = (s + k * 7 + k) & 1048575;",
+            "}",
+            "assert(s == 2700);",
+        },
+    },
+
+    {
         /* 2026-07-18 profile #1: an EMPTY `[]` whose destination type is a
          * known scalar array - ANNOTATED or INFERRED - starts FLAT (the
          * const-fold bakes [] before inference, so only the ArrHint can
