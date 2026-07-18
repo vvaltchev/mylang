@@ -331,11 +331,16 @@ the new window for the `call`, restored on return.
 **Exceptions across a native `call`-chain — the CHECKED-RETURN protocol.**
 A hand-emitted `ret`-chain has NO C++ unwind tables, so a C++ `throw` cannot
 traverse it — the exception MUST be signalled and unwound cooperatively:
-- The callee, on a raise (`jit_raise` or a helper that throws), sets the
-  pending signal and RETURNS to its native caller with an exception STATUS
-  in a register (`rax`: 0 = normal, non-0 = unwinding). The function RESULT
-  is written to the caller's dst SLOT (memory), so `rax` is free to carry
-  the status.
+- SEPARATE CHANNELS - never overload one register with value + status (you
+  can't steal a bit from an int/float value set): the function RESULT is
+  written to the caller's dst SLOT (memory) - the existing `vm_leave_call`
+  convention - so the return register is FREE. The callee, on a raise
+  (`jit_raise` or a helper that throws), sets the pending signal and RETURNS
+  with an exception STATUS in the WHOLE `rax` register (0 = normal, non-0 =
+  unwinding / a kind) - a full value, no bit stolen. (A later optimization
+  that returns a scalar IN a register would need a DEDICATED status register
+  or the carry flag `stc`/`clc` + `jc`-immediately-after-`call`, never a bit
+  of the value register.)
 - The caller fragment, after EVERY `call`, does `test rax, rax; jnz
   <unwind>` — a load-free, perfectly-predicted, never-taken branch (~1
   cycle; NOT a memory read of a global). On non-0 it does NOT continue: it
