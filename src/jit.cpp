@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <cmath>
 #include <vector>
 
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -106,6 +107,8 @@ struct JitLayout {
     int data_off;         /* SharedObject: &elem_vec - shobj (the vector's
                            * _M_start is at +0, _M_finish at +8) */
     unsigned char kind_ints, kind_floats;   /* Storage enum values */
+    int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
+    int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
 };
 
 /* Runtime-computed via public accessors (LValue mixes access specifiers,
@@ -150,6 +153,14 @@ static const JitLayout &jit_layout()
             SharedArrayObj::Storage::ints);
         l.kind_floats = static_cast<unsigned char>(
             SharedArrayObj::Storage::floats);
+        /* Type::t offset + the t_str boundary: a slot whose current type has
+         * t >= t_str holds a REFERENCE (needs a C++ release before overwrite);
+         * < t_str is a trivial value (overwrite in place). */
+        l.type_t_off = static_cast<int>(
+            reinterpret_cast<const char *>(
+                &static_cast<const Type *>(l.t_int)->t)
+            - reinterpret_cast<const char *>(l.t_int));
+        l.t_str_val = static_cast<int>(Type::t_str);
         return l;
     }();
     return L;
@@ -199,6 +210,15 @@ struct Emitter {
      * prologue. */
     struct CacheEnt { int slot; int32_t payload, type; uint8_t reg; };
     std::vector<CacheEnt> cache;
+
+    /* N6a: a CALL-site relocation. A libm call reserves a fixed 12-byte
+     * slot (offset `off` in `b`) + records the target; after the buffer is
+     * placed (mmap gives the final base), patch_call rewrites the slot as a
+     * 5-byte `E8 rel32` DIRECT call (+ nop padding) when the target is in
+     * rel32 range - the default anon mmap lands next to libm, so it is - or
+     * the 12-byte indirect `movabs rax,imm; call rax` fallback otherwise. */
+    struct CallReloc { size_t off; const void *fn; };
+    std::vector<CallReloc> call_relocs;
     int creg(int slot) const
     {
         for (const CacheEnt &c : cache)
@@ -267,6 +287,16 @@ struct Emitter {
     }
     /* addsd/subsd/mulsd xmm0, xmm1 (op = 0x58/0x5C/0x59) */
     void farith(uint8_t op) { u8(0xF2); u8(0x0F); u8(op); u8(0xC1); }
+    /* sqrtsd xmm<d>, xmm<s>  (SSE2) */
+    void sqrtsd(uint8_t d, uint8_t s)
+    { u8(0xF2); u8(0x0F); u8(0x51);
+      u8(static_cast<uint8_t>(0xC0 | (d << 3) | s)); }
+    /* push/pop a GP reg (0x50+r / 0x58+r; REX.B for r8..r15) */
+    void push_reg(uint8_t r) { if (r >= 8) u8(0x41); u8(0x50 | (r & 7)); }
+    void pop_reg(uint8_t r)  { if (r >= 8) u8(0x41); u8(0x58 | (r & 7)); }
+    void call_rax() { u8(0xFF); u8(0xD0); }   /* call rax (indirect) */
+    /* lea rdi, [rdi + disp32]  (rdi = &frame->slots[slot], a helper arg) */
+    void lea_rdi(int32_t d) { u8(0x48); u8(0x8D); u8(0xBF); u32(uint32_t(d)); }
     /* cvtsi2sd xmm<r>, qword [rdi+disp]  (int -> double) */
     void cvt(uint8_t r, int32_t d)
     {
@@ -350,7 +380,7 @@ enum XReg : uint8_t { X0 = 0, X1 = 1 };   /* GP r8 = t_float (float
                                            * fragments); baked in the
                                            * encodings above/below */
 
-enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RSI = 6 };
+enum Reg : uint8_t { RAX = 0, RCX = 1, RDX = 2, RSI = 6, RDI = 7 };
 
 /* rax OP= rcx (reg-reg forms; 0x48 REX.W + opcode + ModRM(rcx->rax)) */
 static void op_rr(Emitter &e, Op aop)
@@ -464,6 +494,64 @@ static FCmp float_cmp(Op o)
 
 static bool imm_shift_ok(int_type v) { return v >= 0; }
 
+/* N6a native math builtins (MathFnV). Classify a selector by how it lowers:
+ *   MK_NONE = leave interpreted; MK_SSE = a pure SSE2 op (no call);
+ *   MK_CALL = a libm call (sin/cos/.../pow) - the reg-save/align path. */
+enum MathKind { MK_NONE = 0, MK_SSE, MK_CALL };
+
+static MathKind mathfn_kind(MathFn fn)
+{
+    switch (fn) {
+    case MathFn::sqrt_:                /* sqrtsd */
+    case MathFn::tofloat_:             /* float(x): the float read promotes */
+        return MK_SSE;
+    case MathFn::cbrt_:  case MathFn::sin_:   case MathFn::cos_:
+    case MathFn::tan_:   case MathFn::asin_:  case MathFn::acos_:
+    case MathFn::atan_:  case MathFn::exp_:   case MathFn::exp2_:
+    case MathFn::log_:   case MathFn::log2_:  case MathFn::log10_:
+    case MathFn::pow_:                  /* a libm CALL (2-arg for pow) */
+        return MK_CALL;
+    default:
+        return MK_NONE;   /* ceil/floor/trunc/fabs (roundsd = SSE4.1): later */
+    }
+}
+
+/* The libm entry point for a MK_CALL selector. The DOUBLE overloads (the
+ * C `::name(double)` functions) - baked as an immediate + `call rax`. pow
+ * is the only 2-arg one (x in xmm0, y in xmm1). */
+static const void *jit_math_fn_ptr(MathFn fn)
+{
+    switch (fn) {
+    case MathFn::cbrt_:  return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::cbrt));
+    case MathFn::sin_:   return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::sin));
+    case MathFn::cos_:   return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::cos));
+    case MathFn::tan_:   return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::tan));
+    case MathFn::asin_:  return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::asin));
+    case MathFn::acos_:  return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::acos));
+    case MathFn::atan_:  return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::atan));
+    case MathFn::exp_:   return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::exp));
+    case MathFn::exp2_:  return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::exp2));
+    case MathFn::log_:   return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::log));
+    case MathFn::log2_:  return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::log2));
+    case MathFn::log10_: return reinterpret_cast<const void *>(
+                                    static_cast<double (*)(double)>(std::log10));
+    case MathFn::pow_:   return reinterpret_cast<const void *>(
+                            static_cast<double (*)(double, double)>(std::pow));
+    default:             return nullptr;   /* not a MK_CALL selector */
+    }
+}
+
 static bool jit_op_eligible(const Instr &in)
 {
     switch (in.op) {
@@ -509,6 +597,11 @@ static bool jit_op_eligible(const Instr &in)
         return in.b_lit() != 0 && in.b_lit() != -1;
     case OpCode::IntAddModRI:
         return in.target2 != 0 && in.target2 != -1;
+    /* N6a: a typed math builtin (MathFnV). A pure-SSE selector (sqrt /
+     * float-cast) lowers with no call; the libm-call selectors are added
+     * in increment B. An unsupported selector stays interpreted. */
+    case OpCode::MathFnV:
+        return mathfn_kind(static_cast<MathFn>(in.target2)) != MK_NONE;
 
     default:
         return false;
@@ -551,37 +644,42 @@ static void load_operand(Emitter &e, uint8_t reg, bool is_lit,
         read_slot(e, reg, slot);
 }
 
+/* Ref-listed store guard: bail ONLY when the slot CURRENTLY holds a real
+ * reference (`type->t >= t_str` - a handle whose release needs C++). A
+ * trivial current value (none/int/float/bool, `< t_str`) is safe to
+ * overwrite in place, so it must NOT bail - the old `!= t_int/t_float`
+ * check bailed on those too, so a reused temp whose first write found it
+ * `none` dropped the WHOLE loop to the interpreter (the bench-40 bug).
+ * Uses rcx as scratch (dead at every store site). NOTE (approach A): the
+ * bail here will become a `call jit_put_scalar` helper (release + store,
+ * stay native) - the guard/offsets are identical either way. */
+static void emit_ref_bail_check(Emitter &e, int32_t type_off,
+                                uint32_t bail_pc)
+{
+    const JitLayout &L = jit_layout();
+    e.load(RCX, type_off);                    /* rcx = current Type* */
+    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
+    e.u32(static_cast<uint32_t>(L.type_t_off));
+    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
+    e.u32(static_cast<uint32_t>(L.t_str_val));
+    const size_t j = e.j8(0x72);               /* jb -> store (trivial value) */
+    e.exit_pc(bail_pc);
+    e.patch8(j, e.pos());
+}
+
 /*
- * Store rax (or rdx for the idiv remainder) into the dst slot. A dst on
- * the chunk's ref list may CURRENTLY hold a reference (a reused temp) -
- * overwriting it raw would leak the handle / dangle a slice
- * registration, so those get: cmp [type], rsi; jne bail(pc). Everything
- * else is the branchless two-store (contract 3).
+ * Store rax (or rdx for the idiv remainder) into the dst slot. A dst on the
+ * chunk's ref list may CURRENTLY hold a reference (a reused temp); if so we
+ * bail (approach A: a helper release). Everything else is the branchless
+ * two-store (contract 3).
  */
 static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
                       int dst, uint32_t bail_pc)
 {
     const SlotAddr a = slot_addr(dst);
-    const bool may_ref =
-        std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                           static_cast<int32_t>(dst));
-    if (may_ref) {
-        /* cmp [rdi + type], rsi ; jne bail */
-        e.u8(0x48); e.u8(0x39); e.u8(0xB7);
-        e.u32(static_cast<uint32_t>(a.type));
-        e.u8(0x0F); e.u8(0x85);
-        const size_t rel = e.pos();
-        e.u32(0);
-        /* stores, then skip the bail */
-        e.store(src_reg, a.payload);
-        e.u8(0xE9);                       /* jmp past the bail stub */
-        const size_t skip = e.pos();
-        e.u32(0);
-        e.patch32(rel, static_cast<uint32_t>(e.pos() - (rel + 4)));
-        e.exit_pc(bail_pc);
-        e.patch32(skip, static_cast<uint32_t>(e.pos() - (skip + 4)));
-        return;
-    }
+    if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                           static_cast<int32_t>(dst)))
+        emit_ref_bail_check(e, a.type, bail_pc);
     e.store(RSI, a.type);        /* the int Type singleton */
     e.store(src_reg, a.payload);
 }
@@ -709,6 +807,32 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
     return out;
 }
 
+/* Approach-A slow-path helper: release the slot's CURRENT value (whatever
+ * reference it holds) and store a scalar float. Called from native ONLY on
+ * the cold path where the store target is proven to hold a reference (once
+ * per reused temp - the fast two-store handles every subsequent write).
+ * noexcept: a scalar put never throws. */
+static void jit_put_float(LValue *lv, double v) noexcept
+{
+    lv->put(EvalValue(v));
+}
+
+/* Emit a call to a scalar-put helper: rdi = &frame->slots[slot] (the arg),
+ * the value already in xmm0. Saves/restores the slots base and re-loads the
+ * type singletons, like emit_libm_call (the helper is in our .text - far
+ * from the JIT buffer - so the reloc resolves via a trampoline). */
+static void emit_put_scalar_call(Emitter &e, const void *fn, int slot)
+{
+    e.push_reg(RDI);                     /* save slots base + 16-align rsp */
+    e.lea_rdi(static_cast<int32_t>(static_cast<long>(slot)
+                                   * static_cast<long>(sizeof(LValue))));
+    e.call_relocs.push_back({ e.pos(), fn });
+    e.u8(0xE8); e.u32(0);                /* call rel32 (patched later) */
+    e.pop_reg(RDI);
+    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+    e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+}
+
 /* Load a float OPERAND into xmm<r>. A lit: movabs the double bits +
  * movq. A slot: type-dispatch matching read_float_slot - float -> movsd
  * (the fast path), int -> cvtsi2sd (promote), anything else (bool/str)
@@ -739,25 +863,86 @@ static void emit_float_load(Emitter &e, uint8_t xr, bool is_lit,
     e.patch8(j_done1, e.pos());
 }
 
-/* Store xmm<r> (a float result) into a scalar dst: t_float type +
- * the double payload. A ref-listed dst (should not happen for a th==f
- * scalar-writer) type-checks + bails, mirroring store_dst. */
+/* Store xmm<r> (a float result) into a scalar dst: t_float type + the
+ * double payload. A ref-listed dst (a reused temp - e.g. a float math temp
+ * later holding a string) bails ONLY if it CURRENTLY holds a reference
+ * (emit_ref_bail_check); a trivial current value is overwritten in place. */
 static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
                              int dst, uint32_t bail_pc)
 {
+    (void)bail_pc;                        /* no bail: helper on the ref path */
     const SlotAddr a = slot_addr(dst);
     if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
                            static_cast<int32_t>(dst))) {
-        e.load_type(a.type);
-        e.cmp_rax_r8();
-        const size_t j_ok = e.j8(0x74);   /* je -> already float, store */
-        e.exit_pc(bail_pc);
-        e.patch8(j_ok, e.pos());
+        /* Ref-listed dst: if it CURRENTLY holds a reference (type->t >=
+         * t_str), release+store via the helper (cold, once per temp); a
+         * trivial current value takes the fast two-store. NEVER bails. */
+        const JitLayout &L = jit_layout();
+        e.load(RCX, a.type);                  /* rcx = current Type* */
+        e.u8(0x8B); e.u8(0x89);               /* mov ecx, [rcx + type_t_off] */
+        e.u32(static_cast<uint32_t>(L.type_t_off));
+        e.u8(0x81); e.u8(0xF9);               /* cmp ecx, t_str_val */
+        e.u32(static_cast<uint32_t>(L.t_str_val));
+        const size_t jb_fast = e.j8(0x72);    /* jb -> fast (trivial value) */
+        emit_put_scalar_call(e, reinterpret_cast<const void *>(jit_put_float),
+                             dst);            /* xmm0 holds the value */
+        const size_t jmp_done = e.j8(0xEB);   /* jmp done */
+        e.patch8(jb_fast, e.pos());           /* fast: */
+        e.store_r8_type(a.type);
         e.fstore(xr, a.payload);
+        e.patch8(jmp_done, e.pos());          /* done */
         return;
     }
     e.store_r8_type(a.type);              /* type = t_float */
     e.fstore(xr, a.payload);              /* payload = the double */
+}
+
+/* N6a: call a libm function `fn` (arg(s) already in xmm0[/xmm1], result
+ * comes back in xmm0). The libm double routines are NOEXCEPT (NaN/inf, no
+ * throw), so a call from a fragment keeps the never-unwind contract. What
+ * the call clobbers that the fragment relies on: rdi (slots base) - SAVED
+ * across the call; rsi (t_int) and r8 (t_float) - constant singletons,
+ * RE-materialised after; the xmm regs are all caller-saved but the JIT
+ * never keeps a float LIVE in a register across ops (floats are slot-
+ * backed - only the INT cache uses GP r10/r11, and a MathFnV run caches
+ * NOTHING per pick_cached_slots' default), so only xmm0 (arg->result)
+ * matters and it survives. Stack: at fragment entry rsp % 16 == 8 (the
+ * jit_enter call's return address) and the fragment makes no other pushes,
+ * so a single `push rdi` both saves the base AND 16-aligns rsp for the
+ * call. */
+/* Write `n` bytes of NOP at `dst` as the FEWEST canonical multi-byte NOPs
+ * (Intel/AMD recommended encodings, 1..9 bytes; chained above 9). A single
+ * wide NOP decodes to ONE (eliminated) uop - a run of `0x90`s would burn a
+ * decode/rename slot EACH. A general JIT utility (padding / a patched-out
+ * instruction / future alignment); `maybe_unused` since it has no caller
+ * today - the libm call is a bare 5-byte rel32 and loop alignment was
+ * removed as measured net-negative. */
+[[maybe_unused]] static void fill_nop(uint8_t *dst, size_t n)
+{
+    static const uint8_t nop[10][9] = {
+        {}, {0x90}, {0x66,0x90}, {0x0F,0x1F,0x00},
+        {0x0F,0x1F,0x40,0x00}, {0x0F,0x1F,0x44,0x00,0x00},
+        {0x66,0x0F,0x1F,0x44,0x00,0x00}, {0x0F,0x1F,0x80,0,0,0,0},
+        {0x0F,0x1F,0x84,0,0,0,0,0}, {0x66,0x0F,0x1F,0x84,0,0,0,0,0},
+    };
+    while (n) { const size_t k = n > 9 ? 9 : n;
+                std::memcpy(dst, nop[k], k); dst += k; n -= k; }
+}
+
+/* N6a: a libm call site is a bare 5-byte `E8 rel32` - NO padding. The rel32
+ * is patched once the buffer's address is known (jit_compile_chunk): to libm
+ * DIRECTLY when in +-2GB (the anon-mmap-next-to-libm case, ~always), else to
+ * an out-of-line TRAMPOLINE in the same buffer (`movabs rax, fn; jmp rax`,
+ * always rel32-reachable). The trampoline path is the arm64-style veneer the
+ * short-range branch will need there too. */
+static void emit_libm_call(Emitter &e, const void *fn)
+{
+    e.push_reg(RDI);                      /* save base; 16-aligns rsp */
+    e.call_relocs.push_back({ e.pos(), fn });   /* off = the E8 opcode */
+    e.u8(0xE8); e.u32(0);                 /* call rel32 (patched later) */
+    e.pop_reg(RDI);
+    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+    e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
 }
 
 /* Emit one op; returns false if (unexpectedly) unhandled. */
@@ -884,6 +1069,36 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
         emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
         e.farith(fop);
+        emit_float_store(e, ck, X0, in.target, pc);
+        return true;
+    }
+
+    case OpCode::MathFnV: {
+        /* N6a: a typed math builtin. Read the (int-promoting) float arg into
+         * xmm0, apply the SSE2 op, store. Only MK_SSE selectors reach here
+         * (jit_op_eligible gates it); the libm-call selectors are increment
+         * B. A MathFnV run caches nothing (pick_cached_slots' default), so
+         * emit_float_load reads the operand from memory (no stale cache). */
+        const MathFn fn = static_cast<MathFn>(in.target2);
+        if (mathfn_kind(fn) == MK_CALL) {
+            /* Load the arg(s) FIRST (a bail here re-runs the op cleanly),
+             * THEN the call sequence. pow is the only 2-arg selector:
+             * x in xmm0, y in xmm1 - the SysV order. */
+            emit_float_load(e, X0, in.a_is_lit(), in.a_flit(),
+                            in.a_slot(), pc);
+            if (fn == MathFn::pow_)
+                emit_float_load(e, X1, in.b_is_lit(), in.b_flit(),
+                                in.b_slot(), pc);
+            emit_libm_call(e, jit_math_fn_ptr(fn));
+            emit_float_store(e, ck, X0, in.target, pc);
+            return true;
+        }
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
+        switch (fn) {
+        case MathFn::sqrt_:    e.sqrtsd(X0, X0); break;
+        case MathFn::tofloat_: break;   /* float(x): the read already widened */
+        default:               e.u8(0xCC); break;   /* unreachable: MK_SSE */
+        }
         emit_float_store(e, ck, X0, in.target, pc);
         return true;
     }
@@ -1048,6 +1263,7 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
         case OpCode::FloatSubRI: case OpCode::FloatMulRI:
         case OpCode::LoadImmFloat: case OpCode::JumpUnlessFloatCmp:
         case OpCode::LoadElemFloat:      /* writes a float -> needs r8 */
+        case OpCode::MathFnV:            /* N6a: writes a float -> needs r8 */
             return true;
         default:
             break;
@@ -1219,6 +1435,20 @@ void jit_compile_chunk(Chunk &chunk)
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
 
+    /* Trampoline pool (out-of-line, one per DISTINCT libm fn): the rare
+     * rel32-out-of-range fallback for a call (and the arm64-style veneer a
+     * short-range branch will need there). Appended AFTER all fragments so
+     * it never shifts a fragment offset; the patch below routes a call
+     * through it only when libm is not directly reachable. */
+    std::unordered_map<const void *, size_t> tramp;
+    for (const Emitter::CallReloc &r : e.call_relocs) {
+        if (tramp.count(r.fn))
+            continue;
+        tramp[r.fn] = e.pos();
+        e.movabs(RAX, reinterpret_cast<uint64_t>(r.fn));   /* movabs rax, fn */
+        e.u8(0xFF); e.u8(0xE0);                            /* jmp rax */
+    }
+
     /* Map RW, copy, flip RX (strict W^X). */
     const size_t len = e.b.size();
     void *mem = mmap(nullptr, len, PROT_READ | PROT_WRITE,
@@ -1226,6 +1456,22 @@ void jit_compile_chunk(Chunk &chunk)
     if (mem == MAP_FAILED)
         return;   /* out of memory: the EnterNative ops... must NOT stay */
     std::memcpy(mem, e.b.data(), len);
+    /* Patch each call site's rel32 now the base is known: DIRECT to libm
+     * when in +-2GB (~always), else through the in-buffer trampoline (which
+     * is only KBs away, so it always fits). Only the 4-byte rel32 is
+     * written; the E8 opcode is already in place. */
+    for (const Emitter::CallReloc &r : e.call_relocs) {
+        uint8_t *dst = static_cast<uint8_t *>(mem) + r.off;
+        intptr_t rel = reinterpret_cast<intptr_t>(r.fn)
+                     - reinterpret_cast<intptr_t>(dst + 5);
+        if (rel < INT32_MIN || rel > INT32_MAX)
+            rel = reinterpret_cast<intptr_t>(
+                      static_cast<uint8_t *>(mem) + tramp[r.fn])
+                - reinterpret_cast<intptr_t>(dst + 5);
+        const int32_t r32 = static_cast<int32_t>(rel);
+        for (int i = 0; i < 4; i++)
+            dst[1 + i] = static_cast<uint8_t>(r32 >> (i * 8));
+    }
     if (mprotect(mem, len, PROT_READ | PROT_EXEC) != 0) {
         munmap(mem, len);
         return;
