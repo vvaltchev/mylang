@@ -208,6 +208,25 @@ next call immediately overwrites (param slots), which today's model cannot.
 
 ## Phases (each lands -rt green + differential + A/B measured)
 
+> N6 call-path lean (2026-07-18): the record stack is now REUSE-based.
+> A callgrind profile of the archetype call bench (10_recursion_deep, 2.7M
+> calls) showed the call cost is ~58% C++ machinery (vm_enter_call ~31% +
+> vm_leave_call ~21% + the `VmCallRec` emplace_back construct ~6%) and ~33%
+> dispatch - so a JIT native-call fragment (which cannot allocate/emplace/
+> unwind under the frameless-leaf contract) can never touch the dominant
+> term; the lean has to be in C++. Fix: `records` is PHYSICAL storage grown
+> only to the high-water mark, a live-count `rec_n` indexes it, a push
+> REUSES `records[rec_n++]` (the ~140-byte record's 3 unique_ptrs no longer
+> ctor/dtor per call, and the vector never realloc-moves in steady state),
+> a pop frees any owning field the exceptional/cache path left set + resets
+> pend + decrements (RAII kept), and a BOUNDARY push clears the resume
+> fields it would otherwise leave stale. Measured (interleaved full-suite
+> A/B vs a597a5f): **10_recursion_deep 0.82x, 51_purefunc_fold 0.83x,
+> 63_closures 0.90-0.93x, 69_exc_crossframe 0.88x, 76_funcval 0.92-0.94x**;
+> suite geomean 0.995-1.002x (neutral), my/py 6.10 -> 6.17x. Helps EVERY VM
+> call (JIT on or off - a call splits a native run anyway). This is the
+> foundation N6a (a native call site) sits on; N6a is the next step.
+>
 > Status (2026-07-16): **A+B+C+D ✅ DONE, regression ERASED at 0.999.**
 > The maintainer's controlled full-suite measurement caught a consistent
 > ~5% suite regression after Phase C (4.14x -> 3.99x my/py) - recovered in
