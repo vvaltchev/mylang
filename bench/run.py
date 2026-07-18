@@ -11,10 +11,19 @@
 #
 # Stdlib only - no third-party dependencies, matching the project's ethos.
 #
+# Each bench runs at its per-bench scale from bench/scales.txt (a short/noisy
+# bench can be made reliable by raising ITS scale - see bench/tune_scales.py),
+# with an ADAPTIVE rep count: 3 reps, and if the min isn't stable (the 2-fastest
+# gap exceeds --var-threshold) 2 more (5), then 3 more (8); still noisy at 8 ->
+# ABORT (that bench needs a bigger scale). The reported time is always the MIN.
+# We also best-effort raise our scheduling priority (nice) to cut preemption
+# noise - all languages benefit equally since they run as our children.
+#
 # Usage:
-#   python3 bench/run.py                 # run everything, scale 1
-#   python3 bench/run.py --scale 2       # 2x the per-benchmark workload
-#   python3 bench/run.py --repeat 5      # best of 5 runs (default 3)
+#   python3 bench/run.py                 # everything, per-bench scales
+#   python3 bench/run.py --scale 3       # force ALL benches to scale 3
+#   python3 bench/run.py --scale 23:5    # force bench 23 to scale 5 (repeatable)
+#   python3 bench/run.py --repeat 5      # fixed 5 reps (skip the adaptive gate)
 #   python3 bench/run.py --filter slice  # only benchmarks whose name matches
 #                                        # (comma-separated for several)
 #   python3 bench/run.py --mylang ./build/mylang
@@ -33,6 +42,53 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 MY_DIR = os.path.join(HERE, "my")
 PY_DIR = os.path.join(HERE, "py")
+
+# Per-bench workload scale lives in a committed table (name -> multiplier), so a
+# noisy short bench can be made reliable by bumping ITS scale without touching
+# the others. A bench absent from the table runs at DEFAULT_SCALE. tune_scales.py
+# rewrites this file; `--scale <name-or-number>:<N>` overrides it per run.
+SCALES_FILE = os.path.join(HERE, "scales.txt")
+DEFAULT_SCALE = 1
+
+
+def load_scales():
+    """Read bench/scales.txt -> {name: scale}. Lines are `name scale`; blank
+    lines and `#` comments are skipped. Missing/unreadable -> empty (all
+    benches then run at DEFAULT_SCALE)."""
+    table = {}
+    try:
+        with open(SCALES_FILE) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+                    table[parts[0]] = int(parts[1])
+    except OSError:
+        pass
+    return table
+
+
+def _scale_key_matches(key, name):
+    """A --scale override key matches a bench: a numeric key matches the NN
+    prefix (`23` -> `23_dict_insert`, leading zeros ignored); a non-numeric key
+    is a plain substring (`dict` -> every dict bench)."""
+    if key.isdigit():
+        num = name.split("_", 1)[0]
+        return num == key or num.lstrip("0") == key.lstrip("0")
+    return key in name
+
+
+def resolve_scale(name, table, overrides, global_scale):
+    """Scale for `name`: an explicit --scale override wins, then a bare global
+    --scale, then the table, then DEFAULT_SCALE."""
+    for key, val in overrides:
+        if _scale_key_matches(key, name):
+            return val
+    if global_scale is not None:
+        return global_scale
+    return table.get(name, DEFAULT_SCALE)
 
 # Color the my/py ratio on a TTY only (never when redirected / into the CSV).
 USE_COLOR = sys.stdout.isatty()
@@ -129,6 +185,27 @@ def geomean(vals):
     return prod ** (1.0 / len(vals))
 
 
+def raise_priority():
+    """Best-effort: raise THIS process's scheduling priority so the benchmark
+    subprocesses (children inherit our nice value) get preempted less - the
+    single biggest source of short-bench timing noise. All languages benefit
+    equally (mylang, python, C++, ...) since they all run as our children at
+    the same priority, so the my/py ratio stays fair.
+
+    Raising priority (a NEGATIVE nice) needs CAP_SYS_NICE; if we're not
+    privileged it fails and we just continue at normal priority (adaptive reps
+    + best-of-N still filter most noise). Returns the new nice value, or None
+    if we couldn't lower it. Run with `sudo` or grant the binary the cap
+    (`sudo setcap cap_sys_nice+ep $(which python3)`) to enable it."""
+    try:
+        cur = os.nice(0)
+        if cur <= -10:
+            return cur                      # already high enough
+        return os.nice(-10 - cur)           # target nice -10
+    except (OSError, AttributeError):
+        return None
+
+
 def find_mylang(explicit):
     if explicit:
         return explicit
@@ -162,26 +239,91 @@ def optimization_warning(mylang):
     return None
 
 
-def time_cmd(cmd, repeat, timeout):
-    """Run cmd `repeat` times; return (best_seconds, stdout, error_or_None)."""
-    best = None
+def run_reps(cmd, reps, timeout):
+    """Run cmd `reps` times; return (times_list, last_stdout, error_or_None).
+
+    times_list is the wall-clock of every rep (unsorted). We keep them all so
+    the caller can take the MIN (best-of, filters preemption spikes) AND assess
+    the variance (see bench_variance)."""
+    times = []
     out = ""
-    for _ in range(repeat):
+    for _ in range(reps):
         start = time.perf_counter()
         try:
             p = subprocess.run(cmd, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, timeout=timeout)
         except subprocess.TimeoutExpired:
-            return (None, "", "timeout")
+            return ([], "", "timeout")
         except OSError as e:
-            return (None, "", str(e))
+            return ([], "", str(e))
         elapsed = time.perf_counter() - start
         out = p.stdout.decode("utf-8", "replace").strip()
         if p.returncode != 0:
-            return (None, out, "exit %d" % p.returncode)
-        if best is None or elapsed < best:
-            best = elapsed
-    return (best, out, None)
+            return ([], out, "exit %d" % p.returncode)
+        times.append(elapsed)
+    return (times, out, None)
+
+
+def bench_variance(times):
+    """The variance metric used to decide if a bench is stable enough.
+
+    We always REPORT the MIN, so preemption (which only makes runs SLOWER)
+    can't hurt the reported number. What we must catch is a bench whose run is
+    too SHORT for the min to be reliable (timer granularity / fixed overhead).
+    Metric = (2nd-smallest - min) / min : the gap between the two FASTEST runs.
+    It asks 'have the fast runs converged?' and IGNORES every slower rep - so a
+    preempted spike never triggers a spurious scale bump.
+
+    Crucially this is REP-COUNT-INDEPENDENT: for run.py's 3 reps it equals the
+    (median-min)/min the design calls for, but it does NOT drift when the TUNER
+    takes more reps (a median would climb as N grows). So the tuner can average
+    over many reps for a STABLE decision that still matches run.py's 3-rep
+    check. Returns 0 for a degenerate (<=1 rep / zero min)."""
+    if len(times) < 2:
+        return 0.0
+    ts = sorted(times)
+    mn = ts[0]
+    return (ts[1] - mn) / mn if mn > 0 else 0.0
+
+
+# Dynamic rep schedule: start with 3, and if the variance gate isn't met, add
+# more reps (NOT more scale - sampling noise shrinks with reps, not workload
+# size) in growing steps: +2 (5 total), then +3 (8 total). A stable bench stops
+# at 3 (cheap); only a noisy one pays for 5/8; if it's STILL over threshold at 8
+# it is genuinely unstable - give up. `--repeat N` overrides this with a fixed N.
+REP_STEPS = (3, 2, 3)   # cumulative: 3, 5, 8
+
+
+def measure_adaptive(cmd, threshold, timeout, steps=REP_STEPS):
+    """Time `cmd` with the growing rep schedule until the 2-fastest-gap
+    variance clears `threshold`. Returns (best_time, stdout, error_or_None,
+    n_reps, variance). error_or_None is a 'variance ...' string if it never
+    settled (the caller gives up / aborts), or a run error."""
+    times = []
+    out = ""
+    v = 0.0
+    for step in steps:
+        more, o, err = run_reps(cmd, step, timeout)
+        if err:
+            return (None, o, err, len(times), 0.0)
+        times += more
+        out = o
+        v = bench_variance(times)
+        if v <= threshold:
+            return (min(times), out, None, len(times), v)
+    return (min(times), out,
+            "variance %.1f%% > %.1f%% after %d reps" %
+            (v * 100, threshold * 100, len(times)),
+            len(times), v)
+
+
+def measure_fixed(cmd, reps, timeout):
+    """--repeat N override: exactly N reps, no variance gate. Returns the same
+    tuple shape as measure_adaptive (never a 'variance' give-up)."""
+    times, out, err = run_reps(cmd, reps, timeout)
+    if err:
+        return (None, out, err, 0, 0.0)
+    return (min(times), out, None, len(times), bench_variance(times))
 
 
 def tokens(s):
@@ -212,10 +354,22 @@ def results_match(a, b):
 
 def main():
     ap = argparse.ArgumentParser(description="MyLang vs Python benchmarks")
-    ap.add_argument("--scale", type=int, default=1,
-                    help="workload multiplier passed to each script (default 1)")
-    ap.add_argument("--repeat", type=int, default=3,
-                    help="runs per benchmark, best time kept (default 3)")
+    ap.add_argument("--scale", action="append", default=[], metavar="SPEC",
+                    help="override the per-bench scale from bench/scales.txt. "
+                         "A bare int (--scale 3) sets ALL benches; "
+                         "<name-or-number>:<N> (--scale 23:5, repeatable) sets "
+                         "one. Without --scale, each bench uses its table scale.")
+    ap.add_argument("--repeat", type=int, default=0,
+                    help="force a FIXED rep count (min reported), skipping the "
+                         "adaptive 3->5->8 schedule. 0 (default) = adaptive: "
+                         "start at 3 reps, add more only if the variance gate "
+                         "isn't met.")
+    ap.add_argument("--var-threshold", type=float, default=0.05,
+                    help="max acceptable (2nd-min - min)/min per bench; if a "
+                         "bench is still over it after 8 reps, the run ABORTS "
+                         "(the bench needs a bigger table scale - run "
+                         "tune_scales.py). Default 0.05 = 5%% (a pre-pooled-"
+                         "allocator floor; tighten after the pooled-alloc TODO)")
     ap.add_argument("--filter", default="",
                     help="only run benchmarks whose name contains this substring "
                          "(comma-separated to match any of several)")
@@ -264,7 +418,24 @@ def main():
     if not names:
         sys.exit("no benchmarks matched")
 
-    scale_arg = str(args.scale)
+    # Parse --scale: a bare int is a global scale; <key>:<N> is a per-bench
+    # override (repeatable). Both may be present (per-bench wins).
+    table = load_scales()
+    overrides = []
+    global_scale = None
+    for spec in args.scale:
+        if ":" in spec:
+            key, val = spec.rsplit(":", 1)
+            try:
+                overrides.append((key, int(val)))
+            except ValueError:
+                sys.exit("error: bad --scale override %r (want <key>:<int>)" % spec)
+        else:
+            try:
+                global_scale = int(spec)
+            except ValueError:
+                sys.exit("error: bad --scale %r (want an int or <key>:<int>)" % spec)
+
     print("mylang : %s%s" % (mylang,
                              "  (engine: -vm bytecode VM)" if args.vm
                              else "  (engine: -tw tree-walker)" if args.tw
@@ -274,7 +445,15 @@ def main():
                                   "  (engine: -tw tree-walker)"
                                   if args.vm else ""))
     print("python : %s" % args.python)
-    print("scale  : %d    repeat (best of): %d\n" % (args.scale, args.repeat))
+    scale_note = ("global %d" % global_scale if global_scale is not None
+                  else "per-bench from scales.txt")
+    reps_note = ("fixed %d" % args.repeat if args.repeat > 0
+                 else "adaptive 3->5->8")
+    prio = raise_priority()
+    prio_note = ("nice %d (raised)" % prio if prio is not None and prio < 0
+                 else "normal (run with sudo / cap_sys_nice for less noise)")
+    print("scale  : %s    reps (min kept): %s    var<=%.1f%%    prio: %s\n"
+          % (scale_note, reps_note, args.var_threshold * 100, prio_note))
 
     warn = optimization_warning(mylang)
     if warn:
@@ -293,6 +472,7 @@ def main():
     rows = []
     ratios = []
     speedups = []
+    noisy = []        # (name, reps, variance) - needed >3 reps to settle; note
     for name in names:
         my_path = os.path.join(MY_DIR, name + ".my")
         py_path = os.path.join(PY_DIR, name + ".py")
@@ -304,24 +484,46 @@ def main():
         # runs -tw, so `--vm --baseline <same binary>` still gates the VM
         # against the tree-walker exactly as before the flip.
         eng = ["-vm"] if args.vm else (["-tw"] if args.tw else [])
+        scale = resolve_scale(name, table, overrides, global_scale)
+        scale_arg = str(scale)
         my_cmd = [mylang] + eng + [my_path, scale_arg]
-        my_t, my_out, my_err = time_cmd(my_cmd, args.repeat, args.timeout)
+
+        # Measure the PRIMARY binary: adaptive reps (3 -> 5 -> 8) until the
+        # variance gate is met, or --repeat N for a fixed count. If it never
+        # settles (still noisy at 8 reps), ABORT - the bench needs a bigger
+        # table scale (run tune_scales.py). base + python then run the SAME rep
+        # count at the SAME scale, so the A/B / ratio stay comparable.
+        if args.repeat > 0:
+            my_t, my_out, my_err, n_reps, my_v = measure_fixed(
+                my_cmd, args.repeat, args.timeout)
+        else:
+            my_t, my_out, my_err, n_reps, my_v = measure_adaptive(
+                my_cmd, args.var_threshold, args.timeout)
+        if my_err and my_err.startswith("variance"):
+            print()
+            sys.exit("ABORTED at %s: %s\n  -> raise its scale in "
+                     "bench/scales.txt (run bench/tune_scales.py), then re-run."
+                     % (name, my_err))
+        if n_reps > REP_STEPS[0]:
+            noisy.append((name, n_reps, my_v))
 
         base_t = None
         if has_base:
             beng = ["-tw"] if args.vm else []
-            base_t, _bout, _berr = time_cmd(
+            bt, _bout, _berr = run_reps(
                 [args.baseline] + beng + [my_path, scale_arg],
-                args.repeat, args.timeout)
+                n_reps, args.timeout)
+            base_t = min(bt) if bt else None
 
         if os.path.isfile(py_path):
             # -B: don't read/write __pycache__. MyLang re-parses its source on
             # every run (it has no bytecode cache), so letting CPython reuse a
             # cached .pyc across the repeat runs would be an unfair head start.
             # With -B both re-parse every run.
-            py_t, py_out, py_err = time_cmd(
+            pt, py_out, py_err = run_reps(
                 [args.python, "-B", py_path, scale_arg],
-                args.repeat, args.timeout)
+                n_reps, args.timeout)
+            py_t = min(pt) if pt else None
         else:
             py_t, py_out, py_err = (None, None, "no-py")
 
@@ -335,6 +537,8 @@ def main():
             status = "ok"
         else:
             status = "DIFF: my=%r py=%r" % (my_out, py_out)
+        if n_reps > REP_STEPS[0]:
+            status += " [%dr]" % n_reps        # needed extra reps to settle
 
         my_s = "%.3f" % my_t if my_t is not None else "-"
         py_s = "%.3f" % py_t if py_t is not None else "-"
@@ -384,6 +588,14 @@ def main():
             tail = "current is ~%.2fx SLOWER than baseline" % sp_v
         print("geomean cur/base over %d benchmarks: %s (%s)"
               % (len(speedups), sp, tail))
+
+    if noisy:
+        print("\nNOTE: %d bench(es) needed extra reps (>%d) to clear the %.1f%% "
+              "variance gate - a bit noisy at their current scale; if it "
+              "recurs, raise their scale in bench/scales.txt (tune_scales.py):"
+              % (len(noisy), REP_STEPS[0], args.var_threshold * 100))
+        for name, reps, v in noisy:
+            print("  %-24s %d reps, var %.1f%%" % (name, reps, v * 100))
 
     if args.sorted:
         # Ascending: biggest win first, worst regression last. Order by cur/base
