@@ -995,6 +995,28 @@ static void emit_libm_call(Emitter &e, const void *fn)
     emit_call_epilogue(e);
 }
 
+/* Approach A: a proven EXCEPTION in a fragment (OOB / negative shift).
+ * Store the raise KIND to g_vm_jit_raise, then exit to the op's pc - the
+ * EnterNative handler raises the matching exception (exact caret from the
+ * loc table), NEVER re-interpreting the op. rax is dead on the exit path
+ * (exit_pc flushes the cache, not rax). */
+static void emit_raise(Emitter &e, int kind, uint32_t pc)
+{
+    e.movabs(RAX, reinterpret_cast<uint64_t>(&g_vm_jit_raise));
+    e.u8(0xC7); e.u8(0x00);              /* mov dword [rax], kind */
+    e.u32(static_cast<uint32_t>(kind));
+    e.exit_pc(pc);
+}
+
+/* `<short jcc PASS> +skip; emit_raise` - raise UNLESS the pass condition
+ * holds (the exception analogue of Emitter::bail_unless). */
+static void raise_unless(Emitter &e, uint8_t pass_cond, int kind, uint32_t pc)
+{
+    const size_t sk = e.j8(pass_cond);
+    emit_raise(e, kind, pc);
+    e.patch8(sk, e.pos());
+}
+
 /* Emit one op; returns false if (unexpectedly) unhandled. */
 static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     uint32_t pc)
@@ -1066,7 +1088,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u8(0xE9);
             const size_t jdone = e.pos(); e.u32(0);
             e.patch32(js, static_cast<uint32_t>(e.pos() - (js + 4)));
-            e.exit_pc(pc);                               /* the bail */
+            emit_raise(e, JR_NEG_SHIFT, pc);             /* negative count:
+                                                          * RAISE InvalidValue
+                                                          * (no re-interpret) */
             e.patch32(jl, static_cast<uint32_t>(e.pos() - (jl + 4)));
             e.u8(0x48); e.u8(0xD3);
             e.u8(shl ? 0xE0 : 0xF8);                     /* shl/sar rax,cl */
@@ -1185,7 +1209,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         else
             e.mov_r9_slot(slot_addr(in.a_slot()).payload);
         e.cmp_r9_rdx();
-        e.bail_unless(0x72, pc);                 /* jb (idx < count) */
+        raise_unless(e, 0x72, JR_OOB, pc);       /* jb (idx < count) else
+                                                  * RAISE OutOfBounds (approach
+                                                  * A: no re-interpret) */
         if (is_float) {
             e.load_elem_float();                 /* movsd xmm0,[rcx+r9*8] */
             emit_float_store(e, ck, X0, in.target, pc);

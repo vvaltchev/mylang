@@ -50,3 +50,11 @@ void jit_compile_chunk(Chunk &chunk);
  * here, so the arg is void* (the real ABI is size_t(LValue*)).
  */
 size_t jit_enter(const void *frag, void *slots);
+
+/* Approach A: a native fragment that hits a proven EXCEPTION condition
+ * (a[i] out of bounds, a negative shift count) does NOT re-interpret the
+ * op - it stores a raise KIND here and returns the op's pc; the EnterNative
+ * handler then raises the matching exception via vm_raise (exact caret from
+ * the loc table, no re-run). JR_NONE (0) on a normal fragment exit. */
+enum JitRaiseKind { JR_NONE = 0, JR_OOB = 1, JR_NEG_SHIFT = 2 };
+extern int g_vm_jit_raise;

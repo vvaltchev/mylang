@@ -1434,6 +1434,10 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
 /* Inc v2: the in-flight cross-frame exception signal (see vm.h). */
 std::unique_ptr<RuntimeException> g_vm_exc_pending;
 
+/* Approach A: a native fragment sets this (a JitRaiseKind) instead of
+ * re-interpreting an op that hit a proven exception; EnterNative raises. */
+int g_vm_jit_raise = 0;
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
@@ -2455,6 +2459,24 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             pc = jit_enter(static_cast<char *>(chunk->native.base)
                                + in->a_lit(),
                            ctx.frame->slots);
+            /* Approach A: a native fragment that hit a proven exception
+             * (OOB / negative shift) set g_vm_jit_raise + returned the op's
+             * pc; raise it via vm_raise (the caret is stamped from the loc
+             * table at `pc`, byte-identical to the interpreted throw), NOT
+             * by re-interpreting the op. A temporary (not a named local)
+             * keeps no destructor live at the dispatch goto. */
+            if (g_vm_jit_raise) {
+                const int kind = g_vm_jit_raise;
+                g_vm_jit_raise = 0;
+                if (!vm_raise(chunk, pc, act, ctx,
+                        kind == JR_OOB
+                          ? std::unique_ptr<RuntimeException>(
+                                new OutOfBoundsEx())
+                          : std::unique_ptr<RuntimeException>(
+                                new InvalidValueEx("negative shift count"))))
+                    return;                    /* boundary: signal set */
+                code = chunk->code.data();     /* dispatched to a handler */
+            }
         }
         VM_NEXT;
 
