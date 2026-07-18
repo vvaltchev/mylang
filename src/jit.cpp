@@ -97,6 +97,12 @@ struct JitLayout {
     long off_type;      /* &slot.val.type    - &slot */
     const void *t_int;    /* the int Type singleton */
     const void *t_float;  /* the float Type singleton (N3) */
+    const void *t_arr;    /* the array Type singleton (N4) */
+    int slice_off;        /* SharedArrayObj: offset of `slice` (from payload) */
+    int kind_off;         /* SharedObject: &kind - shobj */
+    int data_off;         /* SharedObject: &elem_vec - shobj (the vector's
+                           * _M_start is at +0, _M_finish at +8) */
+    unsigned char kind_ints, kind_floats;   /* Storage enum values */
 };
 
 /* Runtime-computed via public accessors (LValue mixes access specifiers,
@@ -118,6 +124,29 @@ static const JitLayout &jit_layout()
         l.t_int = probe.get().get_type();
         LValue fprobe(EvalValue(static_cast<float_type>(1.0)), false);
         l.t_float = fprobe.get().get_type();
+
+        /* N4: the flat-array layout, via the co-located jit_probe (which
+         * reads real members, so it can't drift). Non-slice, flat-int/
+         * float arrays only; everything else BAILS at runtime. */
+        SharedArrayObj aprobe(SharedArrayObj::ivec_type{ 1, 2, 3 });
+        LValue alv(EvalValue(std::move(aprobe)), false);
+        const SharedArrayObj &arr = alv.get().get<SharedArrayObj>();
+        l.t_arr = alv.get().get_type();
+        /* `slice` is a public member; SharedArrayObj sits at payload+0 in
+         * the EvalValue union, so &arr.slice - &arr is the byte offset. */
+        l.slice_off = static_cast<int>(
+            reinterpret_cast<const char *>(&arr.slice) -
+            reinterpret_cast<const char *>(&arr));
+        const SharedArrayObj::JitProbe jp = arr.jit_probe();
+        const char *so = static_cast<const char *>(jp.shobj);
+        l.kind_off = static_cast<int>(
+            static_cast<const char *>(jp.kind) - so);
+        l.data_off = static_cast<int>(
+            static_cast<const char *>(jp.elem_vec) - so);
+        l.kind_ints = static_cast<unsigned char>(
+            SharedArrayObj::Storage::ints);
+        l.kind_floats = static_cast<unsigned char>(
+            SharedArrayObj::Storage::floats);
         return l;
     }();
     return L;
@@ -225,6 +254,37 @@ struct Emitter {
     {
         u8(0x49); u8(0xB8); u64(imm);
     }
+    /* ---- N4 array element access ---- */
+    /* mov r9, [rdi+disp] (a slot: shobj ptr or the index) */
+    void mov_r9_slot(int32_t d)
+    { u8(0x4C); u8(0x8B); u8(0x8F); u32(uint32_t(d)); }
+    /* movabs r9, imm64 (t_arr singleton or an index literal) */
+    void movabs_r9(uint64_t imm) { u8(0x49); u8(0xB9); u64(imm); }
+    /* cmp rax, r9 */
+    void cmp_rax_r9() { u8(0x4C); u8(0x39); u8(0xC8); }
+    /* cmp byte [rdi+disp], imm8  (the slice flag) */
+    void cmp_byte_rdi(int32_t d, uint8_t imm)
+    { u8(0x80); u8(0xBF); u32(uint32_t(d)); u8(imm); }
+    /* cmp byte [rax+disp], imm8  (the SharedObject kind) */
+    void cmp_byte_rax(int32_t d, uint8_t imm)
+    { u8(0x80); u8(0xB8); u32(uint32_t(d)); u8(imm); }
+    /* mov <rcx|rdx>, [rax+disp]  (the flat vector's start/finish ptr) */
+    void mov_rcx_rax(int32_t d)
+    { u8(0x48); u8(0x8B); u8(0x88); u32(uint32_t(d)); }
+    void mov_rdx_rax(int32_t d)
+    { u8(0x48); u8(0x8B); u8(0x90); u32(uint32_t(d)); }
+    void sub_rdx_rcx() { u8(0x48); u8(0x29); u8(0xCA); }
+    void sar_rdx_3()   { u8(0x48); u8(0xC1); u8(0xFA); u8(0x03); }
+    void cmp_r9_rdx()  { u8(0x49); u8(0x39); u8(0xD1); }
+    /* mov rax, [rcx + r9*8]   (int element) */
+    void load_elem_int()  { u8(0x4A); u8(0x8B); u8(0x04); u8(0xC9); }
+    /* movsd xmm0, [rcx + r9*8]  (float element) */
+    void load_elem_float()
+    { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x10); u8(0x04); u8(0xC9); }
+    /* `<short jcc> +6; exit_pc(pc)` - bail unless the PASS condition. */
+    void bail_unless(uint8_t short_pass, uint32_t pc)
+    { u8(short_pass); u8(0x06); exit_pc(pc); }
+
     /* a short rel8 jcc/jmp with the rel patched to here later */
     size_t j8(uint8_t op) { u8(op); const size_t at = pos(); u8(0); return at; }
     void patch8(size_t at, size_t target)
@@ -379,6 +439,12 @@ static bool jit_op_eligible(const Instr &in)
         return true;
     case OpCode::JumpUnlessFloatCmp:
         return float_cmp_eligible(in.aop);
+    /* N4: flat int/float array element READ `a[i]`. A non-array, a
+     * slice, a wrong-kind (bool/general/str) base, a negative or
+     * out-of-range index all BAIL to the interpreter (exact throw/
+     * caret). Unblocks the s += a[i] reduction loops. */
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -388,6 +454,7 @@ static bool jit_op_eligible(const Instr &in)
         return in.b_lit() != 0 && in.b_lit() != -1;
     case OpCode::IntAddModRI:
         return in.target2 != 0 && in.target2 != -1;
+
     default:
         return false;
     }
@@ -630,6 +697,49 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat: {
+        /* a[i] from a flat int/float array (N4). Navigate slot -> shobj
+         * -> kind + data, bounds-check, read the raw scalar. Every
+         * failing precondition BAILS (the interpreter re-runs the op with
+         * its exact OutOfBounds/type handling). target2 = the array slot,
+         * a() = the int index, target = the dst. r9 = t_arr then the
+         * index; rcx = data start; rdx = element count. */
+        const JitLayout &L = jit_layout();
+        const bool is_float = in.op == OpCode::LoadElemFloat;
+        const SlotAddr base = slot_addr(in.target2);
+
+        e.load(RAX, base.type);                  /* base an array? */
+        e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+        e.cmp_rax_r9();
+        e.bail_unless(0x74, pc);                 /* je (== t_arr) */
+        e.cmp_byte_rdi(base.payload + L.slice_off, 0);   /* not a slice? */
+        e.bail_unless(0x74, pc);                 /* je (slice==0) */
+        e.load(RAX, base.payload);               /* rax = shobj ptr */
+        e.cmp_byte_rax(L.kind_off,               /* right flat kind? */
+                       is_float ? L.kind_floats : L.kind_ints);
+        e.bail_unless(0x74, pc);                 /* je (kind matches) */
+        e.mov_rcx_rax(L.data_off);               /* rcx = _M_start */
+        e.mov_rdx_rax(L.data_off + 8);           /* rdx = _M_finish */
+        e.sub_rdx_rcx();
+        e.sar_rdx_3();                            /* rdx = element count */
+        if (in.a_is_lit())                        /* idx (unsigned bounds:
+                                                   * a negative index is
+                                                   * huge -> bails) */
+            e.movabs_r9(static_cast<uint64_t>(in.a_lit()));
+        else
+            e.mov_r9_slot(slot_addr(in.a_slot()).payload);
+        e.cmp_r9_rdx();
+        e.bail_unless(0x72, pc);                 /* jb (idx < count) */
+        if (is_float) {
+            e.load_elem_float();                 /* movsd xmm0,[rcx+r9*8] */
+            emit_float_store(e, ck, X0, in.target, pc);
+        } else {
+            e.load_elem_int();                   /* mov rax,[rcx+r9*8] */
+            store_dst(e, ck, RAX, in.target, pc);
+        }
+        return true;
+    }
+
     default:
         return false;
     }
@@ -746,6 +856,7 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
         case OpCode::FloatMulRR: case OpCode::FloatAddRI:
         case OpCode::FloatSubRI: case OpCode::FloatMulRI:
         case OpCode::LoadImmFloat: case OpCode::JumpUnlessFloatCmp:
+        case OpCode::LoadElemFloat:      /* writes a float -> needs r8 */
             return true;
         default:
             break;

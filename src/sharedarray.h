@@ -459,6 +459,28 @@ public:
     }
 
     bool is_slice() const { return slice; }
+
+    /*
+     * Native-AOT (jit.cpp) LAYOUT PROBE. Returns the runtime pointers the
+     * JIT's LoadElem fragment must navigate: the SharedObject, its `kind`
+     * byte, and the flat element vector (a std::vector whose first member
+     * is the data pointer). Co-located here with the layout ON PURPOSE -
+     * it reads the real members, so it CANNOT drift silently: a layout
+     * change relocates these pointers and the probe still returns the
+     * correct offsets. jit.cpp derives kind_off / data_field_off /
+     * slice_off from these + the object addresses. Only used by the probe
+     * (single call at startup), never on a hot path. */
+    struct JitProbe {
+        const void *shobj;      /* the SharedObject * */
+        const void *kind;       /* &shobj->kind */
+        const void *elem_vec;   /* &shobj->ivec (== the union base;
+                                 * fvec/etc. alias it) */
+    };
+    JitProbe jit_probe() const {
+        return { static_cast<const void *>(shobj.get()),
+                 static_cast<const void *>(&shobj->kind),
+                 static_cast<const void *>(&shobj->ivec) };
+    }
     size_type offset() const { return slice ? off : 0; }
 
     /* Element count without promoting (kind-aware). */

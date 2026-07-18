@@ -647,6 +647,43 @@ static const std::vector<test> tests =
     },
 
     {
+        /* NATIVE AOT N4 (plans/native-aot.md): a flat int/float array
+         * element READ a[i] runs in a fragment; a slice base, an OOB
+         * index, or a wrong-kind array BAILS to the interpreter (exact
+         * result/throw). Pinned against the tree-walker via the
+         * differential. */
+        "jit: array-read reductions + slice/OOB bail",
+        {
+            "var a = [10, 20, 30, 40, 50];",
+            "var s = 0;",
+            "for (var i = 0; i < 5; i++) s = s + a[i];",
+            "assert(s == 150);",
+            "var f = [1.5, 2.5, 3.5, 4.5];",
+            "var fs = 0.0;",
+            "for (var i = 0; i < 4; i++) fs = fs + f[i];",
+            "assert(fs == 12.0);",
+            /* a slice base bails to the interpreter - still correct */
+            "var b = a[1:4];",
+            "var bs = 0;",
+            "for (var i = 0; i < 3; i++) bs = bs + b[i];",
+            "assert(bs == 90);",
+        },
+    },
+
+    {
+        /* an OOB index inside a JIT array-read run throws OutOfBoundsEx
+         * (the fragment bails; the interpreter re-runs the load) with the
+         * byte-identical caret. */
+        "jit: array-read OOB bails and throws like the interpreter",
+        {
+            "var a = [1, 2, 3];",
+            "var s = 0;",
+            "for (var i = 0; i < 5; i++) s = s + a[i];",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
         /* NATIVE AOT N3 (plans/native-aot.md): float ordering compares
          * over a NaN must all be FALSE (IEEE) on the VM+JIT exactly as
          * on the tree-walker - the ucomisd swap trick avoids the NaN
