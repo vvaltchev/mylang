@@ -1549,19 +1549,12 @@ std::string hl_line(const std::string &line)
              * the rule/marker prefix, then colorize the trailing VM op. */
             const size_t colon = line.find(": ", k);
             if (line[k] == ';' && colon != std::string::npos) {
-                o << "\033[38;5;245m" << line.substr(k, colon + 2 - k) << RST;
-                size_t p2 = colon + 2;               /* the rendered VM op: */
-                size_t mm = p2;                      /* mnemonic then operands */
-                while (mm < line.size()
-                       && (islower((unsigned char)line[mm]) || line[mm] == '.'
-                           || isdigit((unsigned char)line[mm])))
-                    mm++;
-                if (mm > p2) {
-                    o << mnemonic_color(line.substr(p2, mm - p2))
-                      << line.substr(p2, mm - p2) << RST;
-                    p2 = mm;
-                }
-                scan_operands(o, line, p2);
+                /* This marker is a COMMENT: the VM op was REPLACED by the
+                 * native code below it, so it must NOT look like a live
+                 * instruction. A dark-gray gradient - the `; vm pc N:`
+                 * label darker than the (still legible) rendered op. */
+                o << "\033[38;5;240m" << line.substr(k, colon + 2 - k)
+                  << "\033[38;5;245m" << line.substr(colon + 2) << RST;
             } else {
                 o << "\033[38;5;238m" << line.substr(k) << RST;
             }
