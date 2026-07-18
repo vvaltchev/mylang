@@ -12,6 +12,7 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <functional>
 
 namespace {
 
@@ -378,15 +379,17 @@ std::string hex2(uint8_t v)
     return std::string(1, h[v >> 4]) + std::string(1, h[v & 15]);
 }
 
-/* [rdi+disp] -> a slot label; other bases -> [base+0xNN]. */
-std::string mem_disp(int base_reg, int32_t disp)
+/* [rdi+disp] -> the slot's NAME (via `nm`, the chunk's slot-namer),
+ * else [base+0xNN]. The frame window base is rdi. */
+using SlotNamer = std::function<std::string(int)>;
+std::string mem_disp(int base_reg, int32_t disp, const SlotNamer &nm)
 {
     if (base_reg == 7 /*rdi*/) {
         const int stride = 48, poff = 0, toff = 24;
         if (disp >= 0 && disp % stride == poff)
-            return "slot" + std::to_string(disp / stride);
+            return nm(disp / stride);
         if (disp >= 0 && disp % stride == toff)
-            return "slot" + std::to_string(disp / stride) + ".type";
+            return nm(disp / stride) + ".type";
     }
     std::ostringstream o;
     o << "[" << gp64(base_reg) << (disp < 0 ? "-0x" : "+0x") << std::hex
@@ -396,7 +399,8 @@ std::string mem_disp(int base_reg, int32_t disp)
 
 /* Decode ONE instruction at code[p]; append its mnemonic to `out` and
  * advance p. Covers jit.cpp's emitted forms. */
-void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out)
+void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
+                const SlotNamer &nm)
 {
     const uint32_t start = p;
     std::ostringstream o;
@@ -439,7 +443,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out)
         }
         const int32_t d = (mod == 2) ? rd32()
                         : (mod == 1) ? int8_t(c[p++]) : 0;
-        rm = mem_disp((m & 7), d);
+        rm = mem_disp((m & 7), d, nm);
     };
     int regf; std::string rm;
 
@@ -525,7 +529,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out)
 }
 
 void disasm_native_frag(std::ostream &s, const uint8_t *code,
-                        const NativeCode::Frag &frag)
+                        const NativeCode::Frag &frag, const SlotNamer &nm)
 {
     s << "       . ---- native fragment (" << std::dec << frag.len
       << " bytes) ----\n";
@@ -537,7 +541,7 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
         }
         const uint32_t st = p;
         std::string mn;
-        decode_one(code, frag.len, p, mn);
+        decode_one(code, frag.len, p, mn, nm);
         std::ostringstream bytes;
         for (uint32_t k = st; k < p; k++) bytes << hex2(code[k]) << " ";
         s << "       . +" << std::setw(3) << std::setfill(' ') << std::dec
@@ -1289,7 +1293,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 if (fr.start == off) {
                     disasm_native_frag(
                         s, static_cast<const uint8_t *>(chunk.native.base)
-                               + fr.start, fr);
+                               + fr.start, fr,
+                        [&chunk](int sl) { return reg(chunk, sl); });
                     break;
                 }
         }
