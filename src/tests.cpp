@@ -1159,6 +1159,19 @@ static const std::vector<test> tests =
         &typeid(CannotRebindBuiltinEx),
     },
 
+    /* A DECL name that collides with a const GLOBAL float builtin (`inf`/`nan`
+     * are const floats) must not UB: pIdentifier used to const-RESOLVE the decl
+     * name, folding it to a LiteralFloat, then static_cast<Identifier*> it
+     * (parser.cpp:750). A sanitized build ABORTED here; now the name stays a
+     * plain Identifier. Throws nothing (a bare, unused func decl). */
+    {
+        "a func decl named after a const float builtin does not UB",
+        {
+            "func inf() => 5;",
+            "func nan() => 7;",
+        },
+    },
+
     {
         "undefined variable",
         {

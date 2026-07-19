@@ -744,7 +744,14 @@ pIdentifier(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> ret;
 
-    if (!pAcceptId(c, ret))
+    /* resolve_const=false: this parses a DECLARATION name (a func / struct
+     * name - see the two callers), a fresh binding, NEVER a const reference.
+     * With const-resolution on, a name that collides with a const GLOBAL
+     * (e.g. `func inf()` / `struct nan` - `inf`/`nan` are const float builtins)
+     * would fold to a LiteralFloat, and the static_cast<Identifier*> below
+     * would be UB (a real bug, not just a UBSan finding: `id` would point at a
+     * LiteralFloat). A decl name must stay a plain Identifier. */
+    if (!pAcceptId(c, ret, false /* resolve_const */))
         return nullptr;
 
     return unique_ptr<Identifier>(static_cast<Identifier *>(ret.release()));
