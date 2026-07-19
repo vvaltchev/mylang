@@ -670,6 +670,31 @@ public:
         put_slow(static_cast<EvalValue &&>(v));
     }
 
+    /*
+     * Bind a FRESH value into this slot as a plain, non-const, non-container
+     * slot - an arg / param bind (or re-bind). The callee frame WINDOWS are
+     * reused across calls, so a slot may carry a prior frame's is_const or a
+     * stale reference; this resets both and releases the old value.
+     *
+     * Equivalent to `*this = LValue(v, false)` but with ONE EvalValue
+     * assignment: that idiom copy-CONSTRUCTED v into a temporary LValue and
+     * then MOVE-ASSIGNED the temp into the slot - the move-assign was a
+     * measured per-call hot spot on every VM arg bind (#60 Tier 1). `val = v`
+     * (copy or move) releases any old ref the slot held.
+     */
+    void rebind(const EvalValue &v) {
+        val = v;
+        container = nullptr;
+        is_const = false;
+        type_checks();
+    }
+    void rebind(EvalValue &&v) {
+        val = static_cast<EvalValue &&>(v);
+        container = nullptr;
+        is_const = false;
+        type_checks();
+    }
+
     bool is_const_var() const { return is_const; }
     const EvalValue &get() const { return val; }
     EvalValue get_rval() const { return val; }

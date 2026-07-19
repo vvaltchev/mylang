@@ -1948,16 +1948,16 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
      * params, i/f coercion; a bind throw pops WITHOUT capturing). */
     if (d->fast_bind) {
         for (size_t i = 0; i < n; i++)
-            w->at(static_cast<int_type>(i)) = LValue(argv[i], false);
+            w->at(static_cast<int_type>(i)).rebind(argv[i]);
         for (size_t i = n; i < nparams; i++)
-            w->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
+            w->at(static_cast<int_type>(i)).rebind(EvalValue());
     } else {
         for (size_t i = 0; i < nparams; i++) {
             const FuncDescriptor::ParamDesc &p = d->params[i];
             EvalValue val = i < n ? argv[i] : EvalValue();
             if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
                 val = vm_coerce_decl_num(val, p.decl_type == DeclType::f);
-            w->at(static_cast<int_type>(i)) = LValue(std::move(val), false);
+            w->at(static_cast<int_type>(i)).rebind(std::move(val));
         }
     }
 
@@ -2044,16 +2044,16 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
 
     if (fast_bind_) {
         for (size_t i = 0; i < n; i++)
-            w_->at(static_cast<int_type>(i)) = LValue(argv[i], false);
+            w_->at(static_cast<int_type>(i)).rebind(argv[i]);
         for (size_t i = n; i < nparams; i++)
-            w_->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
+            w_->at(static_cast<int_type>(i)).rebind(EvalValue());
     } else {
         for (size_t i = 0; i < nparams; i++) {
             const FuncDescriptor::ParamDesc &p = d->params[i];
             EvalValue val = i < n ? argv[i] : EvalValue();
             if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
                 val = vm_coerce_decl_num(val, p.decl_type == DeclType::f);
-            w_->at(static_cast<int_type>(i)) = LValue(std::move(val), false);
+            w_->at(static_cast<int_type>(i)).rebind(std::move(val));
         }
     }
 
@@ -2188,10 +2188,9 @@ vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
 
     if (d->fast_bind) {
         for (size_t i = 0; i < nargs; i++)
-            w->at(static_cast<int_type>(i)) =
-                LValue(argrun[i].get(), false);
+            w->at(static_cast<int_type>(i)).rebind(argrun[i].get());
         for (size_t i = nargs; i < nparams; i++)
-            w->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
+            w->at(static_cast<int_type>(i)).rebind(EvalValue());
     } else {
         try {
             for (size_t i = 0; i < nparams; i++) {
@@ -2202,8 +2201,7 @@ vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
                         || p.decl_type == DeclType::f)
                     val = vm_coerce_decl_num(
                         val, p.decl_type == DeclType::f);
-                w->at(static_cast<int_type>(i)) =
-                    LValue(std::move(val), false);
+                w->at(static_cast<int_type>(i)).rebind(std::move(val));
             }
         } catch (...) {
             act.pop_window();
