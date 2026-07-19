@@ -88,9 +88,18 @@ Total 592.4M Ir. Top:
    mutable `a` and the non-const-`a` comparison LHS already return a ref, left
    as-is). Additional: 62_dict_word_count -2.37% (cumulative ~-4.6% with the
    array borrow), 29_str_slice_readonly -2.49% (TypeStr::slice, was neutral),
-   47_wordcount -0.90%. -rt 1566/1566 + differential 1403/1403, nested_fuzz.
-   STILL TODO here: vm_store_base's dict-store base copy (~40M in the dict
-   bench, murky - callgrind inlined attribution).
+   47_wordcount -0.90%. Then the DICT ops (TypeDict: subscript + the read-only
+   len/eq-b/noteq-b/hash/to_string/pretty/is_true/use_count/intptr/clone): same
+   const-handle copy -> get_ref borrow. A dict doesn't COW, and operator->/get()
+   on a const intrusive_ptr yield a MUTABLE pointee, so subscript's borrow is
+   sound for read AND write (the auto-vivify/freeze-insert go through the
+   pointee). eq/noteq's non-const `a` LHS already returns a ref (left as-is).
+   Smaller wins (23_dict_insert -0.42%, 62_dict_word_count -0.32%,
+   26_dict_iterate -0.20%; make_dict/dict_member neutral - they use the typed
+   DictLoad path / make_dict builtin, not TypeDict::subscript). -rt 1566/1566 +
+   differential 1403/1403, nested_fuzz. DONE for all 3 container types. STILL
+   TODO: vm_store_base's dict-store base copy (~40M in the dict bench, murky -
+   callgrind inlined attribution).
 
 ## ===== STATUS: callback re-entry DONE 2026-07-20 (a + b landed) =====
 Both steps landed and measured (callgrind whole-program Ir, scale 1, vs the
