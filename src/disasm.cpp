@@ -3,7 +3,8 @@
 #include "disasm.h"
 #include "codegen.h"
 #include "eval.h"      /* builtin_slot / builtin_slot_name */
-#include "jit.h"       /* jit_type_singletons (-vdj) */      /* codegen_program / codegen_chunk */
+#include "jit.h"       /* jit_type_singletons (-vdj); JitCtx (native calls) */
+#include "funcdesc.h"  /* FuncDescriptor::vm_chunk (faithful native-call dump) */
 #include "coderender.h"   /* render_construct_code - shared AST decompiler */
 #include "syntax.h"
 #include "structtype.h"   /* StructTypeDef / FieldDef (the custom-type dump) */
@@ -14,6 +15,7 @@
 #include <iomanip>
 #include <vector>
 #include <functional>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace {
@@ -1415,23 +1417,64 @@ std::string disassemble_program(const Block *root)
         s << "\n";
     }
 
-    s << disassemble(codegen_program(root), "main");
-
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
 
-    /* Drive off the COMPILED CHUNK SET, not the raw AST walk: codegen_func_body
-     * compiles a function ONLY if it has bytecode (skips a base template - a
-     * monomorphization source that is never called/compiled - a non-scope-free
-     * closure, and an all-fallback body). So a base template shows NO chunk
-     * because it HAS none (it does not exist as a chunk), not because we filter
-     * it - a faithful bytecode image. (When every function is native, this set
-     * equals all non-template functions.) */
-    int anon = 0;
+    /* #55 STEP 2: dump EXACTLY what execution runs, native calls included. The
+     * VM's precompile (vm_precompile_all) codegens ALL bodies THEN jits ALL
+     * with a JitCtx (the slot->descriptor map) so a caller's native-call gate
+     * sees every callee's native_leaf flag; a per-function codegen+jit here
+     * (with no JitCtx) would show interpreted CallVs instead. Replicate that
+     * two-pass on THROWAWAY chunks, pointing each descriptor's `vm_chunk` at its
+     * local chunk for the gate's native_leaf check, and RESTORE it after (so a
+     * later execution / a test in the same process is unaffected). */
+    std::unordered_map<const FuncDescriptor *, Chunk> chunks;
+    std::vector<std::pair<const FuncDescriptor *, const void *>> saved;
+
+    /* Pass A: codegen every compiled body (jit=false) - the native_leaf flag is
+     * set by codegen_chunk. Point each desc->vm_chunk at its local chunk. */
     for (const FuncDeclStmt *fn : funcs) {
         Chunk ck;
-        if (!codegen_func_body(fn, ck))
+        /* codegen_func_body compiles ONLY a function with bytecode (skips a base
+         * template - a never-called monomorphization source - and a
+         * non-scope-free closure). A skipped function shows NO chunk because it
+         * HAS none, a faithful image. */
+        if (!codegen_func_body(fn, ck, /*jit=*/false))
+            continue;
+        auto it = chunks.emplace(fn->desc, std::move(ck)).first;
+        saved.push_back({ fn->desc, fn->desc->vm_chunk });
+        fn->desc->vm_chunk = &it->second;
+    }
+    Chunk main_ck = codegen_program(root, /*jit=*/false);
+
+    /* The global slot -> callee descriptor map (as vm_precompile_all builds). */
+    std::vector<const FuncDescriptor *> slot_desc(
+        root->global_func_names.size(), nullptr);
+    for (const FuncDeclStmt *fn : funcs)
+        if (fn->id && fn->id->sym.kind == SymKind::global) {
+            const int slot = fn->id->sym.slot;
+            if (slot >= 0 && static_cast<size_t>(slot) < slot_desc.size())
+                slot_desc[slot] = fn->desc;
+        }
+
+    /* Pass B: jit each body with its JitCtx (caller_desc = its own descriptor).
+     * Main gets no JitCtx - a call from main is never native (as at runtime). */
+    for (auto &kv : chunks) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &root->global_slot_reassigned;
+        jc.caller_desc = kv.first;
+        jit_compile_chunk(kv.second, &jc);
+    }
+    jit_compile_chunk(main_ck);
+
+    s << disassemble(main_ck, "main");
+
+    int anon = 0;
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it == chunks.end())
             continue;
 
         /* The capture list IS the closure's anonymous struct: its field names,
@@ -1451,8 +1494,12 @@ std::string disassemble_program(const Block *root)
             title = (cap_names.empty() ? "lambda#" : "closure#")
                     + std::to_string(anon++);
 
-        s << "\n" << disassemble(ck, title, cap_names);
+        s << "\n" << disassemble(it->second, title, cap_names);
     }
+
+    for (const auto &sv : saved)   /* leave the descriptors as we found them */
+        sv.first->vm_chunk = sv.second;
+
     return s.str();
 }
 
