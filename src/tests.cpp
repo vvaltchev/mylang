@@ -14641,6 +14641,22 @@ static bool jit_container()
                "catch (DivisionByZeroEx) { caught = true; }",
                "assert(caught);" }))
         return false;
+    /* (3) model-flip M4: a native LOOP around a boxed island - the loop
+     * control (native ops + the for.step back edge) iterates in machine code,
+     * only the island `s = s + b` calls jit_exec_block. Correct result. */
+    const unsigned long b1 = g_jit_container_calls;
+    if (!run({ "func lc(dyn s, int n) {",
+               "  for (var i = 0; i < n; i++) {",
+               "    var a = i * 2;",
+               "    var b = a + 3;",
+               "    s = s + b;",
+               "  }",
+               "  return s;",
+               "}",
+               "assert(lc(runtime(0), 5) == 35);" }))
+        return false;
+    if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
+        return false;
     return true;
 #else
     return true;

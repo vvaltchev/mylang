@@ -209,9 +209,34 @@ analysis-only). Commit per milestone.
   regression). The threshold is a "don't regress tiny hot functions" guard, not
   a cost model - M4 brings that.
 
-- **M4 — island-exit dispatch + island-internal control flow.** Islands with
-  boxed conditions / branches (`if`/`while` whose cond or body is an island); the
-  `BRANCHED(pc)` routing (#4). Now most mixed functions are containers.
+- **M4a — native BRANCHES/LOOPS in the container. ✅ LANDED.** `jit_try_container`
+  now admits native branch ops (`Jump`/`JumpUnlessIntCmp`/`ForLoopStep`/
+  `IntAddStep`/`JumpUnlessFloatCmp`) - the loop control - via `emit_branch` +
+  `label[]`/`fixups` (fragment-local jumps, the existing N2 back-edge machinery;
+  whole body = `begin=0,end=n` so every target is in-container). A back edge may
+  target the island START (the `call jit_exec_block`, a valid label) but not an
+  island interior (gated). The chunk rebuild remaps branch targets. So a native
+  LOOP iterates in machine code around a straight-line boxed island - the loop
+  control (test + step + back edge) is native, only the island calls the
+  interpreter. A container WITH a loop forms regardless of island size (the win);
+  a straight-line one keeps `MIN_CONTAINER_ISLAND`. MEASURED (callgrind, a
+  synthetic loop, container vs `-nj` - the per-run path gives no fragments there):
+  **−3.4% instructions** - a real but MODEST win, LIMITED by the per-island
+  `vm_dispatch` RE-ENTRY overhead (each island call re-enters the full dispatch
+  loop, eating most of the saved dispatch). Still gated to ONE island of simple
+  boxed ops + no calls, so it matches NO bench/sample (real loops have a
+  multi-island init+body or richer island ops) - zero suite impact; a mechanism
+  step + the M5 prerequisite (real functions have loops). Test: `jit_container`
+  sub-test 3 (a loop container runs + correct); differential + fuzzer.
+- **M4b (next) — widen to REAL loops + the BRANCHED island-exit.** (i) MULTIPLE
+  islands (an init MoveV + a body island is the common real shape) - each a
+  `call jit_exec_block`, the remap generalized per-island. (ii) Richer island op
+  sets (`SubscriptV`/`MemberV`/dict ops...). (iii) The `BRANCHED(pc)` island-exit
+  (#4): an `if`/`while` whose CONDITION is a boxed island that branches OUT to a
+  native block - `vm_exec_block` returns the branch-target pc, the container
+  routes it to that block's label. (iv) A LEANER island executor (the −3.4%
+  ceiling is the `vm_dispatch` re-entry - a bounded/lighter path would raise it).
+  Only then do real mixed functions become containers with a real win.
 
 - **M5 — native calls to EVERY function.** A container that makes calls, not just
   leaf-callee calls: the checked-return unwind protocol (#5) + (for recursion)
