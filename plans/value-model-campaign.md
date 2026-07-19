@@ -64,6 +64,34 @@ Total 592.4M Ir. Top:
    dtor}` (~3% in dict). Reduce copies of reference EvalValues on hot paths
    (borrow-by-ref where a copy is currently made). Case-by-case.
 
+## FIRST TARGET (maintainer's pick 2026-07-20): callback re-entry
+
+Concrete approach. `VmInvoker::invoke` re-enters `vm_run_chunk` per element; the
+window is pushed ONCE in the ctor, but each re-entry still pays the per-
+invocation setup: `EntryGuard` (a NON-inlined dtor, 4.56% - an LTO clone),
+`vm_enter_invocation_fast` (a call, though the fast path is cheap), the STEP-1
+`CtxGuard` (save/restore g_current_ctx - REDUNDANT: it is the same invoke_ctx
+every element), and the `pending_key` unique_ptr ctor/dtor (1.86%, always null
+for a callback with no CachedCallV). None of this needs re-doing per element.
+
+Options (measure each 1-vs-1, per the discipline):
+- (a) A `bool reentrant` param on `vm_run_chunk` (default false). When true
+  (VmInvoker/vm_try_invoke): `act = *g_vm_act` directly (skip
+  vm_enter_invocation_fast + EntryGuard - VmInvoker owns the window/activation),
+  and skip the CtxGuard (VmInvoker sets g_current_ctx = c_ ONCE in its ctor,
+  restores in its dtor). LOW-risk, but a runtime flag may not remove the dtor
+  CALLS (the guards still exist, just conditional) - measure.
+- (b) Extract the dispatch LOOP into a reusable inner driver that VmInvoker
+  calls per element with pre-built state (activation set once, per-element only
+  rebind + pc=0 + run-to-boundary). Removes ALL per-element setup but is an
+  invasive vm_run_chunk refactor (the loop's locals + the exception boundary).
+  Bigger win, higher risk.
+Recommend trying (a) first (contained), measure map/filter + sort + find; escalate
+to (b) only if (a)'s win is small AND the profile still shows the setup.
+Also hoist VmInvoker::invoke's arity check to the ctor (n is loop-fixed) - tiny,
+free. VERIFY: -rt + nested_fuzz (VmInvoker is on the sort/map/filter callback
+path); exceptions from a callback must still surface with the right frame.
+
 ## RECOMMENDATION (smallest high-value first step)
 **#1 (callback re-entry)** - it is the single biggest, most self-contained cost
 in a real bench (map/filter/sort), LOW-risk, and does not touch the value
