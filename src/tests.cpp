@@ -3113,6 +3113,26 @@ static const std::vector<test> tests =
     { "int(x) is the explicit narrowing cast for a dyn arithmetic operand",
       { "func acc(x) { var s = 0; s = s + int(x); return s; }",
         "assert(acc(runtime(2.5)) == 2);" } },
+    /* #60 lever 2: the boxed BinOpV/CompoundV/CmpV int-int fast path
+     * (vm_num_binop). runtime() defeats folding so the ops run boxed on a dyn
+     * operand; the differential pins the fast path == the tree-walker's PMF
+     * path. Covers arithmetic values, comparisons AS values, bitwise, shifts,
+     * compound, and a caught div0 (a fast-path throw must stay catchable). */
+    { "dyn (boxed) int arithmetic + comparisons-as-values match tree-walker",
+      { "var dyn a = runtime(20); var dyn b = runtime(3);",
+        "assert(a + b == 23 && a - b == 17 && a * b == 60);",
+        "assert(a / b == 6 && a % b == 2);",
+        "assert((a < b) == false && (a > b) == true && (a == b) == false);",
+        "assert((a >= b) == true && (a != b) == true);",
+        "assert((a & b) == 0 && (a | b) == 23 && (a ^ b) == 23);",
+        "assert((a << 2) == 80 && (a >> 1) == 10 && (a >>> 1) == 10);",
+        "var dyn s = a; s += b; s *= 2; s -= 1; assert(s == 45);" } },
+    { "dyn (boxed) div-by-zero at runtime is catchable (fast-path throw)",
+      { "var dyn a = runtime(5); var dyn z = runtime(0);",
+        "var caught = false;",
+        "try { var dyn q = a / z; } catch (DivisionByZeroEx as e)",
+        "  { caught = true; }",
+        "assert(caught);" } },
     /* A FRESH `var` whose ONLY source is `int + dyn` (= dyn) must be declared
      * `dyn` - the plain `var` cannot silently infer dyn. */
     { "a plain var from int + dyn requires an explicit dyn",
