@@ -1562,6 +1562,14 @@ std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * re-interpreting an op that hit a proven exception; EnterNative raises. */
 int g_vm_jit_raise = 0;
 
+/* #55 native calls: jit_frame_leave (the return-side leave core, shared by the
+ * interpreter's ReturnV and - later - the native ReturnV) stashes the PARENT's
+ * resume point here (a machine-code caller can't take C++ refs to the loop's
+ * chunk/pc locals). The interpreter's vm_leave_call reads them into its refs;
+ * EnterNative will read them when a native ReturnV rets the resume SENTINEL. */
+static const Chunk *g_vm_resume_chunk = nullptr;
+static size_t g_vm_resume_pc = 0;
+
 /* Approach A (container-store helper ops): a noexcept JIT helper that CAUGHT
  * an arbitrary RuntimeException stashes a CLONE here (loc intact) and returns
  * non-0; EnterNative raises it. Complements g_vm_jit_raise (a KIND a fragment
@@ -2035,17 +2043,23 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
     pc = 0;
 }
 
-/* Pop the TOP (in-VM) frame with `res` as its return value: store a cached
- * call's SCALAR result in the caller's cache (pure_cache_call's exact
- * rule), write the parent's dst slot, resume after the call. */
+/*
+ * The RETURN-side leave CORE (the twin of vm_frame_setup; #55). Pop the TOP
+ * in-VM frame with `res` as its return value: store a cached call's SCALAR
+ * result in the caller's cache (pure_cache_call's exact rule), pop the window,
+ * write the parent's dst slot. The PARENT's resume point goes into
+ * g_vm_resume_chunk/pc (NOT a C++ ref to the loop's chunk/pc locals) so this
+ * core is reusable by the native ReturnV (#55), whose fragment has no handle
+ * on those locals: the native ReturnV will read a slot into `res`, call this,
+ * and ret a SENTINEL that makes EnterNative apply the same globals.
+ */
 static ML_NOINLINE void
-vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
-              size_t &pc, EvalValue res)
+vm_frame_leave(VmActivation &act, EvalContext &ctx, EvalValue res)
 {
     VmCallRec &dead = act.back_rec();
     ctx.captures = dead.caller_captures;
-    chunk = dead.ret_chunk;
-    pc = dead.ret_pc;
+    g_vm_resume_chunk = dead.ret_chunk;
+    g_vm_resume_pc = dead.ret_pc;
     const int_type dst = dead.dst;
     std::unique_ptr<PureCacheKey> ckey = std::move(dead.cache_key);
     act.pop_window();
@@ -2054,6 +2068,19 @@ vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
     if (dst >= 0)                /* -1 = a DISCARDED call statement's dst
                                   * (the peephole's dead-dst rule) */
         ctx.frame->at(dst).put(std::move(res));
+}
+
+/* The interpreter's ReturnV/Halt: the leave core + the chunk/pc SWITCH back to
+ * the parent (from the resume globals vm_frame_leave set). The native ReturnV
+ * (#55) will instead ret a SENTINEL and let EnterNative apply the same globals
+ * - the reason the parent resume is a global, not a ref. */
+static ML_NOINLINE void
+vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+              size_t &pc, EvalValue res)
+{
+    vm_frame_leave(act, ctx, std::move(res));
+    chunk = g_vm_resume_chunk;
+    pc = g_vm_resume_pc;
 }
 
 /* CachedCallV's cache probe (vm_cached_call's exact flow): a HIT writes the
