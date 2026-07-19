@@ -69,21 +69,24 @@ public:
     bool is_slice(const EvalValue &a) override;
     EvalValue intptr(const EvalValue &a) override;
 
+    /* All these read-only ops take a CONST EvalValue, so get<SharedStr>()
+     * (the by-value const overload) would COPY the handle - a retain+release
+     * per call. get_ref<>() borrows; they only read the view/size/hash. */
     bool is_true(const EvalValue &a) override {
-        return a.get<SharedStr>().size() > 0;
+        return a.get_ref<SharedStr>().size() > 0;
     }
 
     int_type len(const EvalValue &a) override {
-        return a.get<SharedStr>().size();
+        return a.get_ref<SharedStr>().size();
     }
 
     string to_string(const EvalValue &a) override {
-        return string(a.get<SharedStr>().get_view());
+        return string(a.get_ref<SharedStr>().get_view());
     }
 
     /* Quoted + escaped, for rendering inside a container and the REPL echo. */
     string to_string_repr(const EvalValue &a) override {
-        return quote_str(a.get<SharedStr>().get_view());
+        return quote_str(a.get_ref<SharedStr>().get_view());
     }
 
     size_t hash(const EvalValue &a) override;
@@ -91,7 +94,7 @@ public:
 
 EvalValue TypeStr::clone(const EvalValue &a)
 {
-    const SharedStr &s = a.get<SharedStr>();
+    const SharedStr &s = a.get_ref<SharedStr>();
 
     if (s.is_slice())
         return s;
@@ -101,17 +104,19 @@ EvalValue TypeStr::clone(const EvalValue &a)
 
 int_type TypeStr::use_count(const EvalValue &a)
 {
-    return a.get<SharedStr>().use_count();
+    return a.get_ref<SharedStr>().use_count();
 }
 
 bool TypeStr::is_slice(const EvalValue &a)
 {
-    return a.get<SharedStr>().is_slice();
+    return a.get_ref<SharedStr>().is_slice();
 }
 
 EvalValue TypeStr::intptr(const EvalValue &a)
 {
-    return reinterpret_cast<int_type>(&a.get<SharedStr>().get_ref());
+    /* &get_ref() is the SHARED StrObj address (same for a borrow or a copy),
+     * so borrowing keeps intptr's identity semantics and drops the copy. */
+    return reinterpret_cast<int_type>(&a.get_ref<SharedStr>().get_ref());
 }
 
 void TypeStr::append(SharedStr &lval, const string_view &s)
@@ -137,7 +142,7 @@ void TypeStr::add(EvalValue &a, const EvalValue &b)
     SharedStr &lval = a.get<SharedStr>();
 
     if (b.is<SharedStr>())
-        append(lval, b.get<SharedStr>().get_view());
+        append(lval, b.get_ref<SharedStr>().get_view());
     else
         append(lval, b.to_string());
 }
@@ -167,7 +172,7 @@ void TypeStr::lt(EvalValue &a, const EvalValue &b)
         throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() < b.get<SharedStr>().get_view()
+        a.get<SharedStr>().get_view() < b.get_ref<SharedStr>().get_view()
     );
 }
 
@@ -177,7 +182,7 @@ void TypeStr::gt(EvalValue &a, const EvalValue &b)
         throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() > b.get<SharedStr>().get_view()
+        a.get<SharedStr>().get_view() > b.get_ref<SharedStr>().get_view()
     );
 }
 
@@ -187,7 +192,7 @@ void TypeStr::le(EvalValue &a, const EvalValue &b)
         throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() <= b.get<SharedStr>().get_view()
+        a.get<SharedStr>().get_view() <= b.get_ref<SharedStr>().get_view()
     );
 }
 
@@ -197,7 +202,7 @@ void TypeStr::ge(EvalValue &a, const EvalValue &b)
         throw TypeErrorEx("Expected a string on the right side");
 
     a = EvalValue(
-        a.get<SharedStr>().get_view() >= b.get<SharedStr>().get_view()
+        a.get<SharedStr>().get_view() >= b.get_ref<SharedStr>().get_view()
     );
 }
 
@@ -218,7 +223,7 @@ void TypeStr::eq(EvalValue &a, const EvalValue &b)
     if (b.is<SharedStr>()) {
 
         a = str_views_eq(a.get<SharedStr>().get_view(),
-                         b.get<SharedStr>().get_view());
+                         b.get_ref<SharedStr>().get_view());
 
     } else {
 
@@ -231,7 +236,7 @@ void TypeStr::noteq(EvalValue &a, const EvalValue &b)
     if (b.is<SharedStr>()) {
 
         a = !str_views_eq(a.get<SharedStr>().get_view(),
-                          b.get<SharedStr>().get_view());
+                          b.get_ref<SharedStr>().get_view());
 
     } else {
 
@@ -246,7 +251,9 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval,
         throw TypeErrorEx("Expected an integer as subscript");
 
     const EvalValue &what = RValue(what_lval);
-    const SharedStr &s = what.get<SharedStr>();
+    /* Borrow (get_ref): s is only read + the sub-view ctor below does its own
+     * StrObj retain, so a by-value get<> handle copy is pure churn. */
+    const SharedStr &s = what.get_ref<SharedStr>();
     int_type idx = idx_val.get<int_type>();
 
     if (idx < 0)
@@ -263,7 +270,8 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
                          const EvalValue &end_val)
 {
     const EvalValue &what = RValue(what_lval);
-    const SharedStr &s = what.get<SharedStr>();
+    /* Borrow (get_ref): read-only + the slice ctor retains the StrObj itself. */
+    const SharedStr &s = what.get_ref<SharedStr>();
     int_type start = 0, end = s.size();
 
     if (start_val.is<int_type>()) {
@@ -311,6 +319,7 @@ size_t TypeStr::hash(const EvalValue &a)
 {
     /* SharedStr caches the full-string hash on its shared object (strings are
      * immutable), so repeated dict probes with the same string key don't
-     * recompute it. */
-    return a.get<SharedStr>().hash();
+     * recompute it. get_ref borrows - the cache lives on the shared StrObj,
+     * so a borrow hashes/caches identically to the old by-value copy. */
+    return a.get_ref<SharedStr>().hash();
 }
