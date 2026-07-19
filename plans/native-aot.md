@@ -589,19 +589,51 @@ offset the emitter bakes.
    on the target benches (the "prove the code ran" rule); a `jit:` -rt test
    pins a native-call result + a backtrace; nested_fuzz differential.
 
+#### Maintainer guidance (2026-07-19) — the v2/v3 arc + the dyn answer
+
+- **DYN in native code is NOT supported today** (confirmed: `jit_op_eligible`
+  accepts only typed scalar/array/dict ops; every boxed/dyn op is `default:
+  return false` → it splits the run → interpreted). This IS the endorsed
+  "refuse unsupported ops" behavior — a COMPILE-TIME decision, no runtime bail.
+  A function with any unsupported op therefore fails the fully-native gate and
+  is simply not a native-call target (its eligible runs still get fragments as
+  today). **Until the model flip + bytecode islands, refusing to fully-nativize
+  such a function is the correct, sanctioned behavior.**
+- **A REASSIGNED function slot is DYNAMICALLY typed** (the maintainer's F1
+  framing). The endgame: dyn callees ALSO run natively — the native code CHECKS
+  the runtime value's type and, if it is a function of the matching signature,
+  does the call; if the signature isn't statically known, more work (emit VM
+  bytecode ISLANDS for the heavy case); if the value is NOT a function, the
+  type check fails and we RAISE `NotCallableEx` via the already-built native
+  raise mechanism (`g_vm_jit_exc`/`jit_raise`). This is a TYPE-CHECK-AND-DO,
+  not a silent fallback. → **v3** below.
+- **Recursion (v2): the stack is GROWABLE** — "it's an interpreted language,
+  just realloc the stack." The reconciliation to design in v2: real `call`s
+  grow the C (thread) stack, which realloc can't extend, so either the native
+  frames run on a DEDICATED growable stack the fragment switches to (realloc-
+  able, the maintainer's intent), or recursion keeps the state-machine model in
+  machine code. Not a v1 concern.
+- **Native functions THROW in v2** (F3): the checked-return unwind protocol
+  (status in `rax`, `test/jnz` after each call, frame-by-frame native pop, a
+  frame-with-handler catches) — deferred from v1 (v1 bodies are throw-free).
+
 #### v2 (later) — recursion + throwing callees
 
-Needs: (a) the CHECKED-RETURN unwind protocol (status in `rax`,
-`test/jnz` after each call, frame-by-frame native pop) for a callee that can
-throw or recurse; (b) a C-STACK depth guard on the native-call path that
-throws `StackOverflowEx` at a C-stack-safe depth WITHOUT diverging from the
-interpreter (options: a stack-pointer check vs a reserved limit; or lower the
-shared cap; or a deopt-to-interpreter at the limit — but that is a runtime
-fallback, so it needs the maintainer's explicit sign-off given the no-silent-
-fallback rule); (c) the self-recursion fully-native fixpoint (assume the
-self-call native, verify the body, commit or retract); (d) cross-function +
-mutual recursion (a call-graph fully-native fixpoint). Each is a separate,
-carefully-analyzed step.
+Needs: (a) the CHECKED-RETURN unwind protocol for a callee that can throw or
+recurse; (b) the growable native-call stack (above); (c) the self-recursion
+fully-native fixpoint (assume the self-call native, verify the body, commit or
+retract); (d) cross-function + mutual recursion (a call-graph fully-native
+fixpoint). Each a separate, carefully-analyzed step.
+
+#### v3 (later) — dyn / reassigned (non-write-once) callees
+
+A `CallV` whose callee slot is NOT write-once (dynamically typed) still lowers
+natively: emit a runtime TYPE CHECK on the resolved slot value — a `FuncObject`
+of the matching signature → the native `call` (its fragment if fully-native,
+else a bytecode-island call); a non-function → RAISE `NotCallableEx` via
+`g_vm_jit_exc` (the built mechanism); an unknown signature → the heavy path
+(VM bytecode island). This removes the v1 write-once restriction. Still no
+SILENT fallback — the type check either calls or raises, both compiled.
 
 ## The endgame INVERSION: native CONTAINERS with bytecode islands
 
