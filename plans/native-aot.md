@@ -417,69 +417,191 @@ native only WITHIN a frame. It buys nothing on call overhead; it is the
 status quo, not a native call. The real native call is the `call <offset>`
 design above, gated on fully-native callee bodies.
 
-### #55 — the STAGED implementation (in progress)
+### #55 — the STAGED implementation plan (careful analysis)
 
-The design above is the target; this is the concrete, testable increment
-order. The JIT is ON BY DEFAULT, so EVERY increment must keep `-rt` (1395x2)
-+ `tests/nested_fuzz.py` green; the `-nj` kill switch is the safety net, and a
-new op is JIT-eligible only once its native emission is differentially proven.
+The JIT is ON BY DEFAULT, so this is designed around one HARD constraint from
+the maintainer: **at compile time we must know EXACTLY what to emit — NO
+runtime-decided fallback that silently reverts to the interpreter.** A native
+call is emitted ONLY when it is PROVABLY valid at runtime; the one runtime
+"check" is a defensive `ML_CHECK` that a compile-time invariant still holds
+(it FIRES LOUDLY, it never silently deopts). Every increment keeps `-rt`
+(1395x2) + `tests/nested_fuzz.py` (tw==vm==cpython) green; the `-nj` kill
+switch is the backstop; a new op is JIT-eligible only once its emission is
+differentially proven; the `-vd`/`-vdj` dumps get eyeballed.
 
-**Design decisions (settled):**
-- **Activation reach:** a fragment needs the `VmActivation` to push the callee
-  window. Use a process global `g_current_act` set once at `vm_run` entry
-  (stable per activation — one activation per `vm_run`), NOT an ABI change to
-  `jit_enter` (rsi/rdi are already spoken for). A nested native call reuses the
-  same `g_current_act`.
-- **Callee address:** an INDIRECT `call` through the resolved callee's
-  `FuncDescriptor::vm_chunk->native.base + entry_off` — no cross-chunk patch
-  pass (compilation is per-chunk AOT; the callee's fragment may not exist when
-  the caller compiles). The callee is resolved at runtime anyway (a global
-  slot can be reassigned), so an indirect call is the natural shape.
-- **Frame setup/leave via C++ helpers first** (`jit_frame_setup` DONE —
-  vm.cpp; a `jit_frame_leave`): correct + simplest; nativize the hot fast path
-  only if the profile demands it (the design's guidance).
-- **Result via the caller's dst slot; status in the whole `rax`** (0 = normal,
-  non-0 = unwinding). Checked-return `test rax,rax; jnz <unwind>` after every
-  native `call`.
+#### Two findings that SHAPE the design (verified, 2026-07-19)
 
-**Increments:**
-1. **DONE — `vm_frame_setup`** (vm.cpp): the frame-setup core (arity, window
-   push, record, arg bind, capture switch), returns the callee window, no
-   chunk/pc switch. `vm_enter_call` = it + the switch. -rt green.
-2. **`g_current_act`** — set at `vm_run` entry / cleared on exit; the fragment
-   reads it for a native call.
-3. **The FULLY-NATIVE-BODY gate + entry offset.** A chunk qualifies iff its
-   WHOLE body is one deletable native run ending in `ReturnV` (so it is a
-   single `call`-able blob at a known offset). Record the entry offset on the
-   Chunk (or derive it: run 0's `frag_off`). `op_fully_native` must gain
-   `ReturnV` (and, for the recursive case, the native `CallV`).
-4. **Native `ReturnV`** (callee side): compute the return value into a reg,
-   call `jit_frame_leave(act, result_slot)` (pop window + write caller dst +
-   set chunk/pc to parent, the `vm_leave_call` body), then `ret` with `rax=0`.
-   A BOUNDARY frame keeps the `do_func_call` contract (flow=ret) — a native
-   ReturnV only fires for an in-VM frame, so gate on `!boundary` at compile
-   time (a boundary callee is entered from C++, never native-called).
-5. **Native `CallV`** (caller side), direct + fully-native callee only: flush
-   the N5 cache (call clobbers r10/r11), save the caller window (rdi) on the
-   C-stack, `mov rdi, jit_frame_setup(...)` (args already in the caller run),
-   `call [callee fragment addr]`, restore rdi, `test rax,rax; jnz <unwind>`,
-   reload the N5 cache. `dst` is written by the callee's `jit_frame_leave`.
-6. **The native UNWIND** (checked-return): on non-0 `rax`, the caller fragment
-   pops its own record (`jit_pop_frame` — frees `ref_slots`) and `ret`s `rax`
-   to ITS caller; a frame WITH a handler catches. This mirrors
-   `vm_unwind_walk` in machine code. Start WITHOUT native handlers (a fragment
-   with a try/catch is not fully-native → not native-called), so the only
-   unwind is propagate-to-boundary; the boundary (EnterNative / a C++ caller)
-   converts to `g_vm_exc_pending` as today.
-7. **Depth cap** at `jit_frame_setup` (already throws `StackOverflowEx` via
-   `push_window` — verify the loc-less throw path reaches the boundary).
-8. **Recursion** (`sumto`): once 4+5+6 hold for a leaf, a self-call is just a
-   native `CallV` to the same fragment — no new machinery. Differential-test
-   deep recursion + backtraces.
+**F1 — a top-level function's global slot is REASSIGNABLE.** `func f(){} f = g`
+rebinds `f` to `g` (and `f = 5` rebinds it to an int); only a re-*decl*
+(`var f = 9`) is a compile error. So the callee of a direct `CallV` is NOT
+compile-time-fixed in general — and the resolver does NOT currently track
+writes to a global function slot (it tracks LOCAL frame `slot_writes` for
+auto-const, not global reassignment). **Consequence:** a native call needs a
+WRITE-ONCE gate — proof the callee's global slot is never reassigned — which
+means ADDING that tracking (a per-global-slot "reassigned" flag set when a
+global function/struct slot appears as an assignment lvalue). A non-write-once
+callee → the interpreted `CallV` (a COMPILE-TIME decision, deterministic, not
+a runtime bail). The runtime `ML_CHECK` asserts the resolved callee IS the
+expected descriptor (write-once guarantees it; a violation is a loud abort,
+never a silent fallback).
 
-Test at each step: `-rt`, `nested_fuzz.py` (tw==vm==cpython), the backtrace
-tests (a native-call chain must produce byte-identical frames), and a
-same-binary JIT off/on A/B on 08_func_call / 10_recursion once it lands.
+**F2 — real `call`s grow the C-STACK per frame** (unlike today's
+O(1)-per-activation state-change model). The `MYLANG_VM_STACK` cap is 1M
+SLOTS; a small-frame recursion at 1M slots is ~200K–1M native frames × the
+per-frame C-stack (ret addr + saved regs) = tens of MB > the 8MB C-stack →
+a SEGFAULT before the clean slot-cap `StackOverflowEx`, AND a JIT-on-vs-off
+DIVERGENCE (interpreted recursion is O(1) C-stack, so it goes deeper). So
+deep RECURSION is NOT safe for a first cut. **A LEAF callee (no calls in its
+body) — or any acyclic call — is C-stack-BOUNDED** (one native frame at a
+time, depth = the static call nesting, not the runtime count). So **v1
+native-calls LEAF callees only**; recursion is v2 (needs a C-stack-pointer
+depth check with caps that don't diverge from the interpreter — see v2).
+
+**F3 (falls out of F2) — a fully-native body is THROW-FREE.** Every
+`op_fully_native` op is non-throwing today (imm shifts are `>=0`-gated,
+`IntModRI` is nonzero-imm, div/mod-by-reg is NOT fully-native), and `ReturnV`
+doesn't throw. So a fully-native LEAF callee CANNOT throw. The ONLY exception
+on the native-call path is `StackOverflowEx` from the callee's frame SETUP
+(`push_window` at the slot cap) — which fires BEFORE the callee body runs, at
+the CALLER's native `CallV`, and is handled by the EXISTING `g_vm_jit_exc`
+exit (the container-store model: helper catches loc-less, returns non-0, the
+fragment exits to the op pc, `EnterNative` re-raises). **So v1 needs NO
+checked-return / unwind protocol** — that whole delicate piece is deferred to
+v2 (recursion / throwing callees). This is the key simplification.
+
+#### v1 — native calls to fully-native LEAF callees
+
+**The exact COMPILE-TIME gate for lowering a `CallV` to a native call:**
+1. It is a DIRECT call (`vm_direct_func`, a `direct_func_slot >= 0`) — not
+   indirect/dyn/builtin/struct-ctor.
+2. Not `CachedCallV` (the pure-cache probe stays interpreted in v1).
+3. The callee's global slot is WRITE-ONCE (never reassigned — the new
+   resolver flag).
+4. The callee resolves at COMPILE time to a known `FuncDescriptor` whose chunk
+   is FULLY-NATIVE and a LEAF (`Chunk::native_leaf` — see below).
+5. Arity is fixed + correct (the inferencer already proved it for a direct
+   call → the callee's `push_window`/bind cannot arity-fail).
+If any fails → emit the interpreted `CallV` (unchanged). All five are
+compile-time facts; the emitted native call has no runtime "is it still
+native?" branch.
+
+**Compilation-ORDER (so a caller knows a callee's fully-native flag):** a
+LEAF's fully-native-ness depends only on its OWN ops (no calls), so it is
+computable from bytecode alone, independent of order. But `jit_compile_chunk`
+runs per-chunk inside `codegen_chunk`, so a caller may compile before its
+callee. **Fix:** compute + store `Chunk::native_leaf` (bool) + the entry
+offset during `codegen_chunk` (from the finished bytecode — a single deletable
+run [ops all `op_fully_native`, single-entry] covering the whole body and
+ending in `ReturnV`), and resolve the callee flag at the CALLER's jit time via
+the callee's descriptor (`desc->vm_chunk` is set by AOT precompile before the
+run). If `codegen_chunk`'s per-chunk order still leaves a callee's flag unset
+when a caller emits, the caller emits interpreted — but to keep it
+DETERMINISTIC (not order-dependent), compute ALL chunks' `native_leaf` flags
+in a pre-pass over their bytecode BEFORE any native-call emission. Concretely:
+`vm_precompile_all` already codegens every body; add a flag-computation sweep
+after it, THEN a native-call-emission sweep (or split `jit_compile_chunk` so
+its native-call decisions read pre-set flags). Verify byte-identical `-vd`
+over bench/ + samples/ (the dump-diff discipline) since this touches the
+compile flow.
+
+**The native-call ADDRESS:** an INDIRECT `call` through the callee's baked
+`FuncDescriptor*` → at runtime load `desc->vm_chunk->native.base +
+chunk->native_entry_off`, `call rax`. The descriptor is program-lifetime
+(baked immediate is stable); `native.base` is read at runtime (so a callee
+jit-compiled AFTER the caller is fine). No cross-chunk address patch pass.
+
+**`ret_chunk` for the record** (backtrace + a future unwind): the caller
+fragment holds NO chunk pointer (loc-less design), so it BAKES its own
+function's stable `FuncDescriptor*` and the helper reads `desc->vm_chunk` for
+`ret_chunk`; `ret_pc` = the `CallV` pc (a baked immediate).
+
+**`g_current_act`** — a process global set at `vm_run` entry, cleared on exit
+(stable per activation). The native `CallV` reads it to reach the segmented
+slot stack for the frame push. (No `jit_enter` ABI change: rsi=t_int,
+rdi=slots are spoken for.)
+
+**Emission — native `CallV` (caller side), v1:**
+- args are already in the caller run `[argbase, argbase+n)` (as today).
+- flush the N5 cache (r10/r11) — a `call` clobbers them.
+- call `jit_frame_setup(g_current_act, callee_desc, argbase, nargs, dst,
+  ret_chunk_from_baked_desc, callv_pc)` — a LEAN wrapper over `vm_frame_setup`
+  (fewer args than the 10-arg core; `ctx` reached via `act`) that also does
+  the runtime `ML_CHECK(callee slot value's desc == baked callee_desc)` (the
+  write-once invariant) and is `noexcept` (catches `StackOverflowEx` →
+  `g_vm_jit_exc`, returns null).
+- if it returned null → set the fragment's exit to the `CallV` pc (the
+  `g_vm_jit_exc` path — `EnterNative` re-raises). No `call` happens.
+- else: save caller `rdi`, `rdi = returned callee window`, indirect `call`
+  the callee fragment, restore `rdi`, reload the N5 cache, continue. `dst` is
+  written by the callee's native `ReturnV`. NO status check (leaf = throw-free
+  post-setup).
+
+**Emission — native `ReturnV` (callee side), v1:** `op_fully_native` gains
+`ReturnV`. Emit: read the return value slot, call `jit_frame_leave(act,
+value)` (the `vm_leave_call` body: pop window + write the parent's `dst` +
+stash the parent `ret_chunk`/`ret_pc` in resume globals), then `ret`. Two
+entry paths, one behavior:
+- entered by the interpreter (`vm_enter_call` → the callee chunk's
+  `EnterNative` → the fragment): the `ret` returns to `jit_enter`; the fragment
+  returned a SENTINEL resume pc; `EnterNative` recognizes it and resumes the
+  parent from the resume globals (`chunk`/`pc`/`code`).
+- entered by a native `call` (caller fragment): the `ret` returns INTO the
+  caller fragment right after the `call`; it continues natively (`dst` already
+  written, its `rdi` restored). It ignores the sentinel in `rax`.
+A BOUNDARY frame (`do_func_call` entry) is never native-called and its
+`ReturnV` keeps the flow-set contract — but a boundary callee's chunk is
+entered from C++, and the native ReturnV must NOT run for it. Gate: the native
+ReturnV only fires when `!cur_rec().boundary`; since that is a RUNTIME fact,
+either (a) keep `ReturnV` interpreted for a chunk that can be a boundary
+entry, or (b) have `jit_frame_leave` branch on `boundary` (set flow + return a
+DIFFERENT sentinel that makes `EnterNative` return from `vm_run_chunk`). (b)
+is cleaner and keeps ReturnV uniformly native — decide during impl, with a
+test that a boundary-entered fully-native function returns correctly.
+
+**ASSERTS (maintainer-mandated):** `ML_CHECK` the write-once callee identity
+at setup; `ML_CHECK` the callee window base == `act.view_frame.slots` after
+`push_window`; `ML_CHECK(native_leaf && native_entry_off valid)` when emitting
+a native call; a `VM_HARDENING` `ML_VM_CHECK` that the sentinel resume pc is
+only ever produced by a native `ReturnV`. `static_assert` any new layout
+offset the emitter bakes.
+
+#### v1 increments (each -rt + fuzzer green before commit)
+
+1. **DONE** — `vm_frame_setup` (the frame-setup core).
+2. Write-once tracking: a resolver flag per global function/struct slot,
+   set when it is an assignment lvalue; exposed for codegen. Test: `f = g`
+   marks `f` non-write-once.
+3. `Chunk::native_leaf` + `native_entry_off`, computed in `codegen_chunk`
+   from the bytecode (the whole-body-single-deletable-run-ending-in-ReturnV
+   check); `op_fully_native` gains `ReturnV`. `g_current_act`. No emission yet
+   — just the flags + `-vd` shows them.
+4. `jit_frame_leave` + `jit_frame_setup` (the lean native-call wrapper) C++
+   helpers, `noexcept`, with the ASSERTS + the resume-globals/sentinel
+   protocol; `EnterNative` handles the sentinel.
+5. Native `ReturnV` emission; make a fully-native leaf's body run its fragment
+   to a native return (entered via the interpreter first — no native caller
+   yet). Test: a leaf function called normally returns via its fragment;
+   -rt + fuzzer green; `-vdj` shows the `ret`.
+6. Native `CallV` emission (caller side) for a leaf callee meeting the gate.
+   Test: `for(i) t += add(i,1)` native-calls `add`; measure JIT off/on A/B on
+   08_func_call / 12_higher_order.
+7. Coverage: an instrumented counter (native call count) PROVES the path ran
+   on the target benches (the "prove the code ran" rule); a `jit:` -rt test
+   pins a native-call result + a backtrace; nested_fuzz differential.
+
+#### v2 (later) — recursion + throwing callees
+
+Needs: (a) the CHECKED-RETURN unwind protocol (status in `rax`,
+`test/jnz` after each call, frame-by-frame native pop) for a callee that can
+throw or recurse; (b) a C-STACK depth guard on the native-call path that
+throws `StackOverflowEx` at a C-stack-safe depth WITHOUT diverging from the
+interpreter (options: a stack-pointer check vs a reserved limit; or lower the
+shared cap; or a deopt-to-interpreter at the limit — but that is a runtime
+fallback, so it needs the maintainer's explicit sign-off given the no-silent-
+fallback rule); (c) the self-recursion fully-native fixpoint (assume the
+self-call native, verify the body, commit or retract); (d) cross-function +
+mutual recursion (a call-graph fully-native fixpoint). Each is a separate,
+carefully-analyzed step.
 
 ## The endgame INVERSION: native CONTAINERS with bytecode islands
 
