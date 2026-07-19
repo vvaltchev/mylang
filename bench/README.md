@@ -111,29 +111,33 @@ others. `bench/tune_scales.py` fine-tunes the table automatically.
 
 A normal run uses an **adaptive** rep count: 3 reps, and if the two fastest
 runs haven't converged (their gap exceeds `--var-threshold`, default 5%) it
-escalates **3 → 5 → 8 → 13 → 21**; still noisy at 21 aborts. It always reports
-the **min** (so a preemption spike, which only makes a run slower, can't hurt
-the number). A bench that needs more than its baseline is flagged in a closing
-NOTE — raise its scale so it settles at 3.
+escalates **3 → 5 → 8 → 13 → 21**. It always reports the **min** (so a
+preemption spike, which only makes a run slower, can't hurt the number).
+Needing more reps to settle is **not** a problem — it just buys more best-of
+samples — so it is not reported. The **only** volatility warning is a bench
+whose variance is *still* over the threshold after the last rep step: its min
+can't be trusted. Such a bench does **not** abort the run — it keeps its min,
+is flagged `NOISY[Nr]` on its row and in a closing WARNING, and the run
+continues.
 
-The common case is unchanged (3 → 5 → 8); the **13 / 21 tail** is a resilience
-step so a full run completes *reliably*. On a noisy box a transient scheduling
-burst can make a perfectly-scaled bench miss the gate at 8 reps, and across all
-76 benches that near-miss lands on *some* random bench most runs (even a ~1%
-per-bench abort chance compounds to ~50 %+ suite-wide). The abort is meant to
-flag a genuinely under-scaled bench, not a momentary spike, so the two extra
-best-of steps ride the burst out before giving up. A settled bench never
-reaches them, so they cost time only on a bench that was about to abort anyway.
+The common case is unchanged (3 → 5 → 8); the **13 / 21 tail** rides out a
+transient scheduling burst before flagging a bench. On a noisy box such a burst
+can make a perfectly-scaled bench miss the gate at 8 reps, and across all 76
+benches that near-miss lands on *some* random bench most runs — so a hard abort
+there would be a false positive most of the time. Instead the extra best-of
+steps give a jittery bench more chances to settle; a bench *still* over the gate
+at 21 is only flagged, never aborted. A settled bench never reaches the tail, so
+it costs time only on a genuinely noisy one.
 
 A **few** benches can't be lengthened by scale — their runtime is flat and
 startup-dominated (e.g. `52_cse_dedup` is const-folded to a ~2 ms loop no scale
 can grow; the real work is parse-time CSE), so the min stays short enough to be
 jittery at 3 reps. Such a bench gets a **starting rep count** in
 `bench/reps.txt` (same `name reps` format): its adaptive schedule begins there
-(then still escalates), and the "needed extra reps" NOTE is measured against
-ITS baseline, so a bench that settles at its baseline doesn't warn. Prefer
-scale; `reps.txt` is only for the genuinely scale-immune benches (today just
-`52_cse_dedup`, baseline 8).
+(then still escalates), giving its min more best-of samples from the start so it
+settles without ever tripping the WARNING above. Prefer scale; `reps.txt` is
+only for the genuinely scale-immune benches (a handful today — e.g.
+`52_cse_dedup` and `09_fib_recursive`, both const-folded to a flat ~ms loop).
 
 Python is run with **`-B`** (don't read or write `__pycache__`). MyLang has no
 bytecode cache — it re-parses its source on every run — so letting CPython
