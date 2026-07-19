@@ -1675,6 +1675,34 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk)
     return true;
 }
 
+/* plans/model-flip.md M1: partition the chunk into maximal NATIVE / ISLAND
+ * segments. An op is NATIVE iff it is an inserted EnterNative (a compiled run)
+ * or it is op_run_eligible (an op the container WOULD nativize - note this is a
+ * looser bar than "has a fragment today": a run below MIN_RUN gets no
+ * EnterNative but IS container-eligible, since a whole-function container pays
+ * no per-run EnterNative overhead). container_ready == every op native, i.e.
+ * the whole body could be a single native container. DUMP-ONLY today. */
+ContainerPlan jit_container_plan(const Chunk &chunk, const JitCtx *jc)
+{
+    ContainerPlan plan;
+    const size_t n = chunk.code.size();
+    for (size_t pc = 0; pc < n; pc++) {
+        const Instr &in = chunk.code[pc];
+        const bool native =
+            in.op == OpCode::EnterNative || op_run_eligible(in, jc);
+        if (native) plan.native_op_count++; else plan.island_op_count++;
+        if (!plan.segs.empty() && plan.segs.back().native == native)
+            plan.segs.back().end = pc + 1;
+        else
+            plan.segs.push_back({pc, pc + 1, native});
+    }
+    for (const ContainerSeg &s : plan.segs)
+        if (!s.native)
+            plan.island_count++;
+    plan.container_ready = !plan.segs.empty() && plan.island_count == 0;
+    return plan;
+}
+
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
     if (!g_jit_enabled || chunk.code.empty())
@@ -1942,6 +1970,11 @@ void jit_compile_chunk(Chunk &, const JitCtx *)
 bool jit_chunk_is_native_leaf(const Chunk &)
 {
     return false;
+}
+
+ContainerPlan jit_container_plan(const Chunk &, const JitCtx *)
+{
+    return {};   /* no native code off-platform -> no container plan */
 }
 
 void jit_type_singletons(const void *&ti, const void *&tf, const void *&ta)

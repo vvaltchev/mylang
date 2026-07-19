@@ -67,6 +67,33 @@ struct JitCtx {
 
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc = nullptr);
 
+/*
+ * plans/model-flip.md M1: the CONTAINER PLAN - a compile-time view of how a
+ * chunk partitions into NATIVE segments (maximal runs of native-eligible ops,
+ * incl. an already-inserted EnterNative) and ISLAND segments (maximal runs of
+ * un-nativizable ops). This is the analysis surface for the "native containers
+ * with bytecode islands" model flip: `container_ready` == "the whole body could
+ * be ONE native container" (every op native-eligible - a stronger bar than
+ * native_leaf, which also needs a single fully-native run ending in ReturnV).
+ * M1 is DUMP-ONLY (surfaced in -vd); later milestones consume the segments for
+ * whole-function emission. Segments are maximal runs (no basic-block splitting
+ * yet - that arrives when emission needs it). Empty (JIT unsupported) off
+ * platform. Pass the same JitCtx a caller's jit uses so a native CallV counts
+ * as native; null -> a CallV counts as an island (conservative).
+ */
+struct ContainerSeg {
+    size_t begin, end;   /* [begin, end) in the chunk's current pc space */
+    bool native;         /* true = native-eligible run (or EnterNative) */
+};
+struct ContainerPlan {
+    std::vector<ContainerSeg> segs;    /* ordered, cover [0,n); {} if JIT off */
+    bool container_ready = false;      /* >=1 seg AND every seg native */
+    int island_count = 0;
+    int island_op_count = 0;
+    int native_op_count = 0;
+};
+ContainerPlan jit_container_plan(const Chunk &chunk, const JitCtx *jc = nullptr);
+
 /* #55 STEP 2.1 layout offsets (probed in vm.cpp, which has the full defs; baked
  * as immediates by the emitter). */
 ptrdiff_t jit_off_desc_vm_chunk();      /* FuncDescriptor::vm_chunk */

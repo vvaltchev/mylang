@@ -33,8 +33,10 @@ class Block;
  * { ... }`) and the capture ops read a `cN` slot as its field name. Empty for a
  * non-capturing chunk.
  */
+struct JitCtx;
 std::string disassemble(const Chunk &chunk, const std::string &title,
-                        const std::vector<std::string> &cap_names = {});
+                        const std::vector<std::string> &cap_names = {},
+                        const JitCtx *jc = nullptr);
 
 /*
  * Disassemble a whole program - 100% of what a serialized `.myv` file would
