@@ -1,0 +1,17 @@
+# Per-bench STARTING rep count for bench/run.py (name reps).
+#
+# The SECONDARY volatility lever, for the rare bench whose runtime is FLAT and
+# too short to settle at 3 reps no matter its scale (see run.py's header). Such
+# a bench's adaptive schedule STARTS at the count below (then still escalates
+# +2/+3), and the "needed extra reps" note is measured against ITS baseline, so
+# a bench that settles AT its baseline never warns. PREFER SCALE (scales.txt);
+# reach for a reps baseline ONLY when scale genuinely can't lengthen the bench.
+#
+# A bench absent here starts at 3 (the global default); a value below 3 is
+# clamped up to 3 (this file only ever RAISES a baseline).
+
+# 52_cse_dedup is const-folded to a ~2ms runtime loop that NO scale can grow
+# (N=1500*scale trivial iterations; the real work is parse-time CSE). At ~2ms
+# the 2-fastest gap is jittery at 3 reps; 8 reps settles it reliably (measured
+# 15/15 draws < 5%, floor ~4.5%), while more reps than 8 don't help further.
+52_cse_dedup             8

@@ -19,6 +19,14 @@
 # We also best-effort raise our scheduling priority (nice) to cut preemption
 # noise - all languages benefit equally since they run as our children.
 #
+# A FEW benches can't be lengthened by scale (their runtime is flat - e.g.
+# 52_cse_dedup is const-folded to a ~2ms loop no scale can grow), so the min is
+# always short enough to be jittery at 3 reps. Such a bench gets a per-bench
+# STARTING rep count in bench/reps.txt (name reps) - its adaptive schedule
+# begins there (then still escalates +2/+3), and the "needed extra reps" note is
+# measured against ITS baseline, so a bench that settles AT its baseline doesn't
+# warn. PREFER SCALE; reps.txt is only for the genuinely scale-immune benches.
+#
 # Usage:
 #   python3 bench/run.py                 # everything, per-bench scales
 #   python3 bench/run.py --scale 3       # force ALL benches to scale 3
@@ -57,6 +65,12 @@ BENCH_H = os.path.join(HERE, "cpp", "bench.h")   # affects every C++ bench
 SCALES_FILE = os.path.join(HERE, "scales.txt")
 DEFAULT_SCALE = 1
 
+# A per-bench STARTING rep count (name -> reps), for the rare bench whose
+# runtime is flat and too short to settle at 3 reps no matter the scale (see the
+# header). A bench absent here starts at REP_STEPS[0] (3). This is the SECONDARY
+# lever - use it only when a bench genuinely can't be lengthened by scale.
+REPS_FILE = os.path.join(HERE, "reps.txt")
+
 
 def load_scales():
     """Read bench/scales.txt -> {name: scale}. Lines are `name scale`; blank
@@ -75,6 +89,33 @@ def load_scales():
     except OSError:
         pass
     return table
+
+
+def load_reps():
+    """Read bench/reps.txt -> {name: min_reps}. Same `name value` line format as
+    scales.txt (blank lines and `#` comments skipped); only entries with a
+    positive-int value are kept. Missing/unreadable -> empty (every bench then
+    starts at the global REP_STEPS[0])."""
+    table = {}
+    try:
+        with open(REPS_FILE) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 0:
+                    table[parts[0]] = int(parts[1])
+    except OSError:
+        pass
+    return table
+
+
+def resolve_reps(name, reps_table):
+    """Starting rep count for `name`: its reps.txt entry, else REP_STEPS[0] (3).
+    A configured value below that global default is clamped up to it - the
+    default 3 is the floor, reps.txt only ever RAISES a bench's baseline."""
+    return max(REP_STEPS[0], reps_table.get(name, REP_STEPS[0]))
 
 
 def _scale_key_matches(key, name):
@@ -305,11 +346,17 @@ REP_STEPS = (3, 2, 3)   # cumulative: 3, 5, 8
 COMP_REPS = 5
 
 
-def measure_adaptive(cmd, threshold, timeout, steps=REP_STEPS):
+def measure_adaptive(cmd, threshold, timeout, min_reps=REP_STEPS[0]):
     """Time `cmd` with the growing rep schedule until the 2-fastest-gap
     variance clears `threshold`. Returns (best_time, stdout, error_or_None,
     n_reps, variance). error_or_None is a 'variance ...' string if it never
-    settled (the caller gives up / aborts), or a run error."""
+    settled (the caller gives up / aborts), or a run error.
+
+    The schedule STARTS at `min_reps` (default the global REP_STEPS[0]=3) and
+    then escalates by the usual REP_STEPS increments (+2, +3). So the default
+    is the unchanged 3->5->8; a bench with a raised reps.txt baseline of B runs
+    B -> B+2 -> B+5 (see load_reps / the header)."""
+    steps = (min_reps,) + tuple(REP_STEPS[1:])
     times = []
     out = ""
     v = 0.0
@@ -634,6 +681,12 @@ def main():
     scales = {n: resolve_scale(n, table, overrides, global_scale) for n in names}
     comparable = [n for n in names if lobj.has(n)]
 
+    # Per-bench STARTING rep count (default 3, raised only by bench/reps.txt for
+    # the scale-immune benches). Used by the measure loop below; ignored under
+    # --repeat (a fixed count skips the adaptive gate entirely).
+    reps_table = load_reps()
+    min_reps_map = {n: resolve_reps(n, reps_table) for n in names}
+
     filt = " --filter %s" % args.filter if args.filter else ""
 
     if args.recompute:
@@ -710,8 +763,10 @@ def main():
     print("compare: %-8s %s  (cached)" % (lobj.name, comp_desc))
     scale_note = ("global %d" % global_scale if global_scale is not None
                   else "per-bench from scales.txt")
+    raised_reps = sum(1 for n in names if min_reps_map[n] > REP_STEPS[0])
     reps_note = ("fixed %d" % args.repeat if args.repeat > 0
-                 else "adaptive 3->5->8")
+                 else "adaptive 3->5->8" + ("" if not raised_reps
+                      else " (%d w/ raised reps.txt baseline)" % raised_reps))
     prio = raise_priority()
     prio_note = ("nice %d (raised)" % prio if prio is not None and prio < 0
                  else "normal (run with sudo / cap_sys_nice for less noise)")
@@ -757,18 +812,22 @@ def main():
         # settles (still noisy at 8 reps), ABORT - the bench needs a bigger
         # table scale (run tune_scales.py). base + python then run the SAME rep
         # count at the SAME scale, so the A/B / ratio stay comparable.
+        # A per-bench reps.txt baseline (default 3) is where the adaptive
+        # schedule STARTS; the "needed extra reps" note fires only when a bench
+        # escalates PAST its own baseline.
+        base_reps = min_reps_map[name]
         if args.repeat > 0:
             my_t, my_out, my_err, n_reps, my_v = measure_fixed(
                 my_cmd, args.repeat, args.timeout)
         else:
             my_t, my_out, my_err, n_reps, my_v = measure_adaptive(
-                my_cmd, args.var_threshold, args.timeout)
+                my_cmd, args.var_threshold, args.timeout, min_reps=base_reps)
         if my_err and my_err.startswith("variance"):
             print()
             sys.exit("ABORTED at %s: %s\n  -> raise its scale in "
                      "bench/scales.txt (run bench/tune_scales.py), then re-run."
                      % (name, my_err))
-        if n_reps > REP_STEPS[0]:
+        if n_reps > base_reps:
             noisy.append((name, n_reps, my_v))
 
         base_t = None
@@ -801,7 +860,7 @@ def main():
             status = "ok" + ("~" if from_cache else "")   # ~ = cached compare
         else:
             status = "DIFF: my=%r %s=%r" % (my_out, lobj.name, py_out)
-        if n_reps > REP_STEPS[0]:
+        if n_reps > base_reps:
             status += " [%dr]" % n_reps        # needed extra reps to settle
 
         my_s = "%.3f" % my_t if my_t is not None else "-"
@@ -857,12 +916,14 @@ def main():
               % (len(speedups), sp, tail))
 
     if noisy:
-        print("\nNOTE: %d bench(es) needed extra reps (>%d) to clear the %.1f%% "
-              "variance gate - a bit noisy at their current scale; if it "
-              "recurs, raise their scale in bench/scales.txt (tune_scales.py):"
-              % (len(noisy), REP_STEPS[0], args.var_threshold * 100))
+        print("\nNOTE: %d bench(es) needed extra reps (past their baseline) to "
+              "clear the %.1f%% variance gate - a bit noisy at their current "
+              "scale; if it recurs, raise their scale in bench/scales.txt "
+              "(tune_scales.py), or their reps baseline in bench/reps.txt:"
+              % (len(noisy), args.var_threshold * 100))
         for name, reps, v in noisy:
-            print("  %-24s %d reps, var %.1f%%" % (name, reps, v * 100))
+            print("  %-24s %d reps (base %d), var %.1f%%"
+                  % (name, reps, min_reps_map[name], v * 100))
 
     if args.sorted:
         # Ascending: biggest win first, worst regression last. Order by cur/base
