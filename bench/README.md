@@ -101,6 +101,31 @@ two implementations printed matching results (numeric tokens are compared with
 a tolerance so cosmetic float-formatting differences don't register as
 mismatches).
 
+### Per-bench scale, the variance gate, and the reps baseline
+
+Each bench runs at its own **scale** from `bench/scales.txt` (a committed
+`name scale` table; a bench absent from it runs at scale 1), so a too-short,
+noisy bench can be made reliable by raising just ITS scale — a longer run
+shrinks the fixed-overhead / scheduling-noise fraction — without touching the
+others. `bench/tune_scales.py` fine-tunes the table automatically.
+
+A normal run uses an **adaptive** rep count: 3 reps, and if the two fastest
+runs haven't converged (their gap exceeds `--var-threshold`, default 5%) it
+adds 2 (→5) then 3 (→8); still noisy at 8 aborts. It always reports the **min**
+(so a preemption spike, which only makes a run slower, can't hurt the number).
+A bench that needs more than its baseline is flagged in a closing NOTE — raise
+its scale so it settles at 3.
+
+A **few** benches can't be lengthened by scale — their runtime is flat and
+startup-dominated (e.g. `52_cse_dedup` is const-folded to a ~2 ms loop no scale
+can grow; the real work is parse-time CSE), so the min stays short enough to be
+jittery at 3 reps. Such a bench gets a **starting rep count** in
+`bench/reps.txt` (same `name reps` format): its adaptive schedule begins there
+(then still escalates), and the "needed extra reps" NOTE is measured against
+ITS baseline, so a bench that settles at its baseline doesn't warn. Prefer
+scale; `reps.txt` is only for the genuinely scale-immune benches (today just
+`52_cse_dedup`, baseline 8).
+
 Python is run with **`-B`** (don't read or write `__pycache__`). MyLang has no
 bytecode cache — it re-parses its source on every run — so letting CPython
 reuse a compiled `.pyc` across the repeated timing runs would be an unfair head

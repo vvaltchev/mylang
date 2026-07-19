@@ -29,20 +29,26 @@ import run  # noqa: E402  (bench/run.py - shared timing + variance)
 
 MAX_SCALE = 64          # never bump a single bench past this multiplier
 MAX_ITERS = 6           # bump attempts per bench before giving up
-# Tune with MARGIN: require the bench to settle within the first two rep steps
-# (3->5), NOT the full 3->5->8. A bench that needs all 8 reps is borderline -
-# a slightly noisier run.py invocation would then ABORT it. Bumping it so it
-# settles by 5 reps gives run.py a full step of headroom.
-SETTLE_TARGET = run.REP_STEPS[0] + run.REP_STEPS[1]     # 5
 
 
-def measure(mylang, my_path, scale, threshold, timeout):
-    """Does the bench SETTLE within run.py's OWN adaptive 3->5->8 gate at
-    `scale`? Returns (settled_bool, variance, n_reps, error_or_None). We use
-    the exact gate run.py uses so a scale the tuner accepts is one run.py won't
-    abort on - and a bench that settles in 3 reps needs no bump at all."""
+def settle_target(base_reps):
+    """Tune with MARGIN: require the bench to settle within ONE escalation step
+    of its baseline (baseline + REP_STEPS[1]), NOT the full 3->5->8. A bench
+    that needs the last step is borderline - a slightly noisier run.py
+    invocation would then ABORT it. Settling one step in gives run.py headroom.
+    For the default baseline 3 this is 5 (unchanged); a reps.txt baseline of B
+    gives B + REP_STEPS[1]."""
+    return base_reps + run.REP_STEPS[1]
+
+
+def measure(mylang, my_path, scale, threshold, timeout, min_reps):
+    """Does the bench SETTLE within run.py's OWN adaptive gate at `scale`
+    (started at this bench's `min_reps` baseline)? Returns (settled_bool,
+    variance, n_reps, error_or_None). We use the exact gate run.py uses so a
+    scale the tuner accepts is one run.py won't abort on - and a bench that
+    settles at its baseline needs no bump at all."""
     _best, _out, err, n_reps, v = run.measure_adaptive(
-        [mylang, my_path, str(scale)], threshold, timeout)
+        [mylang, my_path, str(scale)], threshold, timeout, min_reps=min_reps)
     if err and not err.startswith("variance"):
         return (False, None, n_reps, err)     # a real run error
     return (err is None, v, n_reps, None)
@@ -104,6 +110,7 @@ def main():
         names = [n for n in names if any(s in n for s in subs)]
 
     table = run.load_scales()
+    reps_table = run.load_reps()     # per-bench reps baselines (scale-immune)
     thr = args.var_threshold
     print("tuning %d benches with %s (run.py's adaptive gate, target var<=%.1f%%)"
           "\n" % (len(names), mylang, thr * 100))
@@ -113,18 +120,23 @@ def main():
     for name in names:
         my_path = os.path.join(run.MY_DIR, name + ".my")
         start_scale = table.get(name, run.DEFAULT_SCALE)
+        # A reps.txt bench starts its gate at that baseline; accept it settling
+        # within one escalation step OF that baseline (so we don't chase a
+        # scale bump on a bench the reps baseline already handles).
+        base_reps = run.resolve_reps(name, reps_table)
+        target = settle_target(base_reps)
         scale = start_scale
         last_v = None
         last_reps = 0
         for _ in range(MAX_ITERS):
             settled, v, n_reps, err = measure(mylang, my_path, scale, thr,
-                                              args.timeout)
+                                              args.timeout, base_reps)
             if err:
                 failed.append((name, "run error: %s" % err))
                 break
             last_v = v
             last_reps = n_reps
-            if settled and n_reps <= SETTLE_TARGET:
+            if settled and n_reps <= target:
                 if scale != start_scale:
                     changed.append((name, start_scale, scale, v))
                 table[name] = scale
