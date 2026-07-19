@@ -333,7 +333,15 @@ buffer (BEFORE dst is touched - throw-safety) and written over ITS bytes:
 zero allocations in the steady-state `var p = Point(...)`-in-a-loop
 shape (the same overwrite-in-place + COW-guard trick the flat-struct-
 array foreach uses; an aliased/const/other-def dst takes the fresh path,
-pinned by a dedicated aliasing test). `coerce_struct_field` is exported
+pinned by a dedicated aliasing test). **GOTCHA (fixed 2026-07-19): the
+reuse check must read the dst handle via `get_ref<T>()`, NEVER
+`get<T>()`** - a by-value `get<>` COPIES the intrusive_ptr, bumping
+`use_count()` to 2, so `use_count() == 1` was never true and H1 was
+SILENTLY DEAD (a fresh StructObject + `bytes` vector malloc'd every
+`var p = Point(..)` iteration, unmeasured until a value-model profile).
+The fix restored it: **64_struct_create -28% instructions / 0.16->0.12s**.
+Any `use_count()`-based reuse/COW guard has this trap - the sibling
+container-literal H1 already used `get_ref`. `coerce_struct_field` is exported
 from eval.cpp for the pre-coercion; the fresh path stores the coerced
 bytes directly (construct_struct_from_values would coerce twice).
 (2) **`LoadMemberInt`/`LoadMemberFloat`** - the MEASURED discovery was
