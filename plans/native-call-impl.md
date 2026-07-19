@@ -8,6 +8,20 @@ step-by-step. HARD constraint (maintainer): at compile time we know EXACTLY
 what to emit — NO runtime-decided silent fallback. Prioritize the SMALLEST
 progress step, not the highest-value one (CLAUDE.md).
 
+## STATUS
+
+- **STEP 1 (native ReturnV): DONE 2026-07-19.** A fully-native LEAF body's
+  `ReturnV` runs IN the fragment (calls `jit_ret`; in-VM pop-to-parent OR
+  boundary-flow), via a resume SENTINEL `EnterNative` applies.
+  `Chunk::native_leaf`/`native_entry_off` computed + shown in `-vd`. -rt
+  1556/1556 + VM differential 1396/1396 green; a `jit:` coverage test PROVES
+  both the in-VM and boundary native returns ran (`g_jit_native_returns`).
+  Found a PRE-EXISTING latent bug (NOT this work): a template compile poisons
+  the NEXT in-process compile's M8 specialization (typed arith -> boxed BinOpV,
+  not native) - correctness-safe, perf-only, deferred (see
+  [[template-compile-pollutes-next-specialization]] / the note below).
+- **STEP 2 (native CallV): NEXT.** See below.
+
 ## Current state (all committed; HEAD = e3e111c "extract vm_frame_leave")
 
 FOUNDATIONS DONE (all -rt 1395x2 green, behavior-identical):

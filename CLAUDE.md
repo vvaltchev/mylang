@@ -626,6 +626,31 @@ group-1 `cmp`/`sub imm`, and shows big `movabs` constants in hex (a `call rax`
 had rendered as `dec rax`; a helper-call `lea rdi` had cascade-misdecoded as
 `mov edi`).
 
+**#55 STEP 1 — NATIVE `ReturnV` (plans/native-call-impl.md).** A fully-native
+LEAF body's `ReturnV` runs IN the fragment instead of the interpreter: the
+fragment `flush_cache`s (so the result slot is in memory), then
+`call jit_ret(res_slot); ret`. **`jit_ret`** (vm.cpp, `extern "C" noexcept`,
+baked as a call target) reads the result from the CURRENT callee window via
+`g_current_ctx->frame` (the running `vm_run_chunk`'s ctx - set + restored per
+invocation by a `CtxGuard`; a builtin callback re-enters with the invoke ctx),
+then either **pops the in-VM frame** (`vm_frame_leave` - writes the parent's dst
++ sets the `g_vm_resume_chunk/pc` globals) OR, at a **BOUNDARY** frame
+(`g_vm_act->back_rec().boundary` - a `do_func_call`/callback callee), sets
+`ctx.flow` (the callback contract, exactly the interpreted ReturnV's two paths).
+It returns a resume **SENTINEL** (`static_cast<size_t>(-1)` in-VM, `-2` boundary
+- a pc no remapped chunk pc can equal); `EnterNative`, on the sentinel, switches
+`chunk`/`pc`/`code` to the parent, or `return`s to stop the invocation. A whole
+body that is a single fully-native run ending in `ReturnV` is a
+**`Chunk::native_leaf`** (fragment offset in `native_entry_off`; shown in `-vd`)
+- a LEAF (makes no calls, C-stack-bounded) a caller fragment can `call`
+directly (STEP 2). `ReturnV` is `jit_op_eligible` + `op_fully_native` (rets a
+sentinel, never an interior pc, so its interpreted original is deletable) + in
+`pick_cached_slots` (its result slot is an int use; a FLOAT result slot is
+always disqualified by the float op that produced it, so it is never int-cached
+here). Coverage: `g_jit_native_returns` (a `jit:` test asserts both the in-VM
+and the boundary path ran). STEP 2 (a caller fragment's native `call` into a
+`native_leaf`) is next.
+
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
 code-label addresses generated in enum order from `ML_FOR_EACH_OPCODE`

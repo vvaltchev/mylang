@@ -81,3 +81,20 @@ extern "C" int jit_store_elem_float(LValue *base, int_type idx,
 class EvalValue;
 extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
                               const EvalValue *val, int op) noexcept;
+
+/*
+ * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
+ * ReturnV runs IN the fragment. The fragment flushes its register cache and
+ * calls this with the result value's frame slot; jit_ret reads that slot from
+ * the CURRENT callee window, then either pops the frame (an in-VM call -
+ * vm_frame_leave writes the parent's dst + sets the resume globals) or, at a
+ * BOUNDARY frame, sets flow (the do_func_call / callback contract). It returns
+ * a resume SENTINEL the EnterNative handler applies (switch to the parent, or
+ * stop the invocation). Defined in vm.cpp (it needs the in-VM call stack) and
+ * baked as a call target by the emitter. noexcept: a fully-native leaf body is
+ * throw-free, so the pop/leave here cannot throw. */
+extern "C" size_t jit_ret(int_type res_slot) noexcept;
+
+/* #55: native ReturnVs executed process-wide (a `jit:` coverage counter that
+ * PROVES the native return path actually ran, not the interpreter). */
+extern unsigned long g_jit_native_returns;

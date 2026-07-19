@@ -1570,6 +1570,22 @@ int g_vm_jit_raise = 0;
 static const Chunk *g_vm_resume_chunk = nullptr;
 static size_t g_vm_resume_pc = 0;
 
+/* #55 native calls: the EvalContext of the CURRENTLY EXECUTING vm_run_chunk
+ * (set + restored at each entry - a builtin callback re-enters with the invoke
+ * ctx), so the native ReturnV helper (jit_ret) reaches the right frame / flow /
+ * captures; the fragment holds no ctx handle. The matching activation is the
+ * existing g_vm_act. */
+static EvalContext *g_current_ctx = nullptr;
+
+/* #55: jit_ret's return values - a resume PC no real chunk pc can equal (a
+ * remapped pc is always small). IN-VM: EnterNative switches to the parent
+ * (g_vm_resume_chunk/pc). BOUNDARY: EnterNative stops the invocation. */
+static const size_t JIT_RET_SENTINEL = static_cast<size_t>(-1);
+static const size_t JIT_RET_BOUNDARY = static_cast<size_t>(-2);
+
+/* #55: native ReturnVs executed process-wide (a coverage counter - see jit.h). */
+unsigned long g_jit_native_returns = 0;
+
 /* Approach A (container-store helper ops): a noexcept JIT helper that CAUGHT
  * an arbitrary RuntimeException stashes a CLONE here (loc intact) and returns
  * non-0; EnterNative raises it. Complements g_vm_jit_raise (a KIND a fragment
@@ -2070,6 +2086,35 @@ vm_frame_leave(VmActivation &act, EvalContext &ctx, EvalValue res)
         ctx.frame->at(dst).put(std::move(res));
 }
 
+/*
+ * #55 native calls: the native ReturnV. The fragment flushed its register
+ * cache and calls this with the result value's frame slot; g_current_ctx (the
+ * running vm_run_chunk's ctx) + g_vm_act (its activation) locate the frame.
+ * IN-VM frame: read the result from the CALLEE window (still current), pop it
+ * (vm_frame_leave writes the parent's dst + sets the resume globals), and
+ * return the resume SENTINEL - EnterNative switches to the parent. BOUNDARY
+ * frame: set flow (the do_func_call / callback contract, like the interpreted
+ * ReturnV boundary path) and return the boundary sentinel - EnterNative stops
+ * the invocation; the C++ caller (vm_try_invoke / VmInvoker) pops the window.
+ * noexcept: a fully-native leaf body is throw-free, so nothing here throws.
+ */
+extern "C" size_t jit_ret(int_type res_slot) noexcept
+{
+    g_jit_native_returns++;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    ML_CHECK(res_slot >= 0
+             && res_slot < static_cast<int_type>(ctx.frame->size));
+    EvalValue res = ctx.frame->at(res_slot).get();
+    if (act.back_rec().boundary) {
+        ctx.flow->value = std::move(res);
+        ctx.flow->type = FlowState::ret;
+        return JIT_RET_BOUNDARY;
+    }
+    vm_frame_leave(act, ctx, std::move(res));
+    return JIT_RET_SENTINEL;
+}
+
 /* The interpreter's ReturnV/Halt: the leave core + the chunk/pc SWITCH back to
  * the parent (from the resume globals vm_frame_leave set). The native ReturnV
  * (#55) will instead ret a SENTINEL and let EnterNative apply the same globals
@@ -2173,6 +2218,15 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
     VmActivation &act = *vm_enter_invocation_fast(chunk, local_act,
                                                   entry_guard.swapped,
                                                   entry_guard.pushed);
+
+    /* #55 native calls: announce THIS invocation's ctx for jit_ret (the native
+     * ReturnV helper), restored on every exit incl. a throw. A nested callback
+     * (a builtin re-entering with the invoke ctx) saves/restores the outer. */
+    struct CtxGuard {
+        EvalContext *prev;
+        CtxGuard(EvalContext *c) : prev(g_current_ctx) { g_current_ctx = c; }
+        ~CtxGuard() { g_current_ctx = prev; }
+    } ctx_guard(&ctx);
 
     /*
      * The CURRENT chunk's instruction array, cached as loop state: `chunk`
@@ -2694,6 +2748,20 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             pc = jit_enter(static_cast<char *>(chunk->native.base)
                                + in->a_lit(),
                            ctx.frame->slots);
+            /* #55: a native ReturnV returned a resume SENTINEL. IN-VM: switch
+             * to the parent (the globals vm_frame_leave set). BOUNDARY: stop
+             * this invocation (the do_func_call / callback contract) - exactly
+             * the interpreted ReturnV's two paths. Checked BEFORE the raise
+             * flags (a return set neither). */
+            if (pc == JIT_RET_SENTINEL) {
+                ML_CHECK(g_vm_resume_chunk != nullptr);
+                chunk = g_vm_resume_chunk;
+                pc = g_vm_resume_pc;
+                code = chunk->code.data();
+                VM_NEXT;
+            }
+            if (pc == JIT_RET_BOUNDARY)
+                return;
             /* Approach A: a native fragment that hit a proven exception
              * (OOB / negative shift) set g_vm_jit_raise + returned the op's
              * pc; raise it via vm_raise (the caret is stamped from the loc

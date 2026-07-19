@@ -574,6 +574,11 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::Jump: case OpCode::JumpUnlessIntCmp:
     case OpCode::ForLoopStep: case OpCode::IntAddStep:
         return true;
+    /* #55: a native ReturnV - a fully-native leaf body's return runs in the
+     * fragment (calls jit_ret: pop/leave, or boundary-flow; rets a resume
+     * sentinel EnterNative applies). A run TERMINATOR, never a branch. */
+    case OpCode::ReturnV:
+        return true;
     /* N3: the SSE float tier. add/sub/mul only (div/mod THROW on 0 /
      * are a libm call -> interpreted); a float READ handles an int-in-a-
      * float-slot via cvtsi2sd (matching read_float_slot) and BAILS on
@@ -847,6 +852,14 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             break;
         case OpCode::LoadImmInt:
             usei(in.target);
+            break;
+        case OpCode::ReturnV:
+            /* the result value slot is read by the return. Counting it as an
+             * int use is SAFE: a FLOAT result slot is always disqualified by
+             * the float op that produced it (bad()), and a slot reachable
+             * only via ReturnV is used once (< the 3-use cache threshold) - so
+             * no float slot is ever cached as an int here. */
+            usei(in.a_slot());
             break;
         /* float / array touches disqualify the slots (not int-scalar) */
         case OpCode::FloatBin:
@@ -1343,6 +1356,25 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_dict_store(e, in, pc);
         return true;
 
+    case OpCode::ReturnV:
+        /* #55: flush the cache (jit_ret reads the result slot from MEMORY),
+         * then call jit_ret(res_slot) and RET its resume sentinel. rdi (the
+         * slots base) is dead after - we ret - so it carries the arg; jit_ret
+         * uses g_current_ctx->frame, not rdi. rsp must be 16-aligned at the
+         * call (entry rsp%16==8, no pushes yet -> sub 8; restore before ret so
+         * ret pops the real return address). No prologue/epilogue: we ret, so
+         * nothing needs preserving. */
+        e.flush_cache();
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08);   /* sub rsp, 8 */
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_ret) });
+        e.u8(0xE8); e.u32(0);                             /* call jit_ret */
+        e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);   /* add rsp, 8 */
+        e.u8(0xC3);                                        /* ret (rax=sentinel)*/
+        return true;
+
     default:
         return false;
     }
@@ -1491,6 +1523,10 @@ static bool op_fully_native(OpCode op)
     case OpCode::LoadImmInt: case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp: case OpCode::ForLoopStep:
     case OpCode::IntAddStep:
+    /* #55: a native ReturnV never returns an interior pc (it rets a resume
+     * SENTINEL, not a re-interpret pc), so the interpreted original can be
+     * dropped from a deletable run - exactly the fully-native contract. */
+    case OpCode::ReturnV:
         return true;
     default:
         return false;
@@ -1665,6 +1701,16 @@ void jit_compile_chunk(Chunk &chunk)
                 : static_cast<uint32_t>(e.b.size());
             chunk.native.frags[r].len = nxt - chunk.native.frags[r].start;
         }
+    }
+
+    /* #55 native calls: is this chunk's WHOLE body a single fully-native run
+     * ending in ReturnV? Then it is a LEAF a caller can `call` directly - a
+     * native_leaf (STEP 2 consumes it; -vd shows it). Read chunk.code (still
+     * the ORIGINAL - the rebuild is below), so code[n-1] is the last op. */
+    if (runs.size() == 1 && runs[0].begin == 0 && runs[0].end == n
+            && deletable[0] && chunk.code[n - 1].op == OpCode::ReturnV) {
+        chunk.native_leaf = true;
+        chunk.native_entry_off = frag_off[0];
     }
 
     /* Rebuild the code vector with the EnterNative heads inserted and

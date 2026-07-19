@@ -83,6 +83,24 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #55: a fully-native LEAF body (>=4 int ops ending in return) called
+         * in a loop - its ReturnV runs in the JIT fragment under -vm. Both
+         * engines must agree (the differential); the `jit:` extra_check proves
+         * the native return path actually executed. */
+        "native leaf call (in-VM ReturnV)",
+        {
+            "func leaf(a, b) {",
+            "  var t = a * b;",
+            "  var u = t + a;",
+            "  return u - b;",
+            "}",
+            "var acc = 0;",
+            "for (var i = 1; i <= 50; i++) acc = acc + leaf(i, 2);",
+            "assert(acc == 3725);",
+        },
+    },
+
+    {
         "if stmt",
         {
             "var a = 1;",
@@ -14224,6 +14242,83 @@ static bool jit_delete_originals()
 #endif
 }
 
+/* #55: a fully-native LEAF body's ReturnV runs IN the fragment (jit_ret), not
+ * the interpreter. PROVE it ran (g_jit_native_returns bumps) on BOTH paths -
+ * an in-VM call (leaf-in-a-loop) and a BOUNDARY callback (a sort comparator) -
+ * with correct results (the differential `tests` entry checks the values; here
+ * we assert the native return path actually executed). */
+static bool jit_native_return()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;   /* JIT off (e.g. MYLANG_JIT=0): nothing to prove */
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        /* the boundary callback path (VmInvoker) gates on the Vm engine, so
+         * run under it - restored on every exit (as the differential does). */
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    /* IN-VM path: a >=4-op TYPED leaf (t=x*y; u=t+x; return u-y) called in a
+     * loop. Its whole body is a native_leaf, so each call's ReturnV runs in the
+     * fragment via jit_ret. Both functions are TYPED (not templates) with
+     * DISTINCT names/params: an untyped-template compile poisons a LATER
+     * compile's specialization (a pre-existing cross-compile inferencer state
+     * issue - see [[jit-native-return-cross-compile]]); typed bodies avoid it. */
+    const unsigned long b0 = g_jit_native_returns;
+    if (!run({ "func fma(int x, int y) {",
+               "  var t = x * y;",
+               "  var u = t + x;",
+               "  return u - y;",
+               "}",
+               "var acc = 0;",
+               "for (var i = 1; i <= 50; i++) acc = acc + fma(i, 2);",
+               "assert(acc == 3725);" }))
+        return false;
+    if (g_jit_native_returns <= b0)
+        return false;   /* the native ReturnV did NOT run - a silent regression */
+
+    /* BOUNDARY path: a TYPED comparator-shape function invoked per element via
+     * VmInvoker (a boundary frame). Its native ReturnV takes the flow
+     * (boundary) path in jit_ret. */
+    const unsigned long b1 = g_jit_native_returns;
+    if (!run({ "func fcmp(int p, int q) {",
+               "  var d = p * 3;",
+               "  var e = q * 5;",
+               "  var f = d - e;",
+               "  return f + p;",
+               "}",
+               "var arr = [5, 2, 8, 1, 9, 3, 7, 4, 6, 0];",
+               "sort(arr, fcmp);" }))
+        return false;
+    if (g_jit_native_returns <= b1)
+        return false;   /* the boundary native ReturnV did NOT run */
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool vm_codegen_shapes()
 {
     /* 1) resolved-local int while + if -> native ops (native-first codegen
@@ -15442,6 +15537,8 @@ static const std::vector<extra_check> extra_checks =
       jit_engagement },
     { "jit: approach A deletes a fully-native run's interpreted originals",
       jit_delete_originals },
+    { "jit: native ReturnV runs in the fragment (in-VM + boundary paths)",
+      jit_native_return },
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "builtins: dev-only show() reserved in a script",
