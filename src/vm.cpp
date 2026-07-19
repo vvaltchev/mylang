@@ -1778,6 +1778,15 @@ vm_capture_desc_frame(Exception &e, const FuncDescriptor *d)
     e.backtrace.emplace_back(d, Loc());
 }
 
+/* #60 (b): the bare dispatch loop, split out of vm_run_chunk so a builtin
+ * CALLBACK loop (VmInvoker / vm_try_invoke) that already owns the activation +
+ * boundary window + g_current_ctx re-enters it PER ELEMENT with ZERO entry
+ * setup (no EntryGuard construct/destruct, no vm_enter_invocation_fast, no
+ * CtxGuard). vm_run_chunk = the entry prologue + this. `act` is the caller's
+ * activation (the top boundary record is this invocation's frame). */
+static void vm_dispatch(const Chunk &chunk0, EvalContext &ctx,
+                        VmActivation &act);
+
 /*
  * Phase D (plans/vm-native-call-stack.md): a builtin's USER-CALLBACK call
  * (map/filter/sort's comparator/make_dict's generator/find's keyfunc, via
@@ -1822,8 +1831,9 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
             c.captures = caps;
         }
     } restore{act, c, c.captures, g_current_ctx};
-    /* #60: announce the callback ctx once so the reentrant vm_run_chunk skips
-     * the per-invocation CtxGuard store (jit_ret reads g_current_ctx). */
+    /* #60: announce the callback ctx here (vm_dispatch runs without a CtxGuard,
+     * so this is the store the entry prologue would otherwise do; jit_ret reads
+     * g_current_ctx). */
     g_current_ctx = &c;
 
     /* Bind from the pre-evaluated values (do_func_bind_params' value
@@ -1847,8 +1857,10 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
     c.captures = &obj.capture_slots;
     c.flow->type = FlowState::none;
 
+    /* #60 (b): re-enter the dispatch loop DIRECTLY - the window + captures +
+     * g_current_ctx are already set up above, so no vm_run_chunk entry setup. */
     try {
-        vm_run_chunk(*cck, c, /*reentrant=*/true);
+        vm_dispatch(*cck, c, act);
     } catch (Exception &e) {
         vm_capture_desc_frame(e, d);
         throw;
@@ -1901,7 +1913,7 @@ VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
     saved_caps_ = c_->captures;
     c_->captures = &obj.capture_slots;
     /* #60: own g_current_ctx for the whole loop - each invoke() re-enters
-     * vm_run_chunk reentrant, which then skips the per-element CtxGuard. */
+     * vm_dispatch directly (no per-element CtxGuard); jit_ret reads it. */
     saved_gctx_ = g_current_ctx;
     g_current_ctx = c_;
     ready_ = true;
@@ -1940,8 +1952,11 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
 
     c_->flow->type = FlowState::none;
 
+    /* #60 (b): re-enter the dispatch loop DIRECTLY - the ctor already owns the
+     * activation, the boundary window (w_), the captures switch and
+     * g_current_ctx, so no per-element vm_run_chunk entry setup is paid. */
     try {
-        vm_run_chunk(*cck_, *c_, /*reentrant=*/true);
+        vm_dispatch(*cck_, *c_, *act_);
     } catch (Exception &e) {
         vm_capture_desc_frame(e, d);
         throw;
@@ -2296,11 +2311,8 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 }
 
 void
-vm_run_chunk(const Chunk &chunk0, EvalContext &ctx, bool reentrant)
+vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 {
-    /* The CURRENT chunk - reseatable LOOP STATE (the native call stack: an
-     * in-VM call switches it to the callee's chunk; a pop switches it
-     * back). Every op reads the current chunk through it. */
     const Chunk *chunk = &chunk0;
 
     /*
@@ -2325,29 +2337,32 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx, bool reentrant)
         }
     } entry_guard;
 
-    /* #60 reentrant: a builtin CALLBACK loop (VmInvoker / vm_try_invoke)
-     * already owns the activation + boundary window on top of g_vm_act, so
-     * skip the per-element enter setup (entry_guard stays swapped=pushed=
-     * false, a no-op dtor). Otherwise take the normal invocation entry. */
-    VmActivation &act = reentrant
-        ? *g_vm_act
-        : *vm_enter_invocation_fast(chunk, local_act, entry_guard.swapped,
-                                    entry_guard.pushed);
+    VmActivation &act = *vm_enter_invocation_fast(chunk, local_act,
+                                                  entry_guard.swapped,
+                                                  entry_guard.pushed);
 
     /* #55 native calls: announce THIS invocation's ctx for jit_ret (the native
      * ReturnV helper), restored on every exit incl. a throw. A nested callback
-     * (a builtin re-entering with the invoke ctx) saves/restores the outer.
-     * #60: a reentrant caller already set g_current_ctx = &ctx once for the
-     * whole loop, so the guard is inactive (no per-element store/restore). */
+     * (a builtin re-entering with the invoke ctx) saves/restores the outer. */
     struct CtxGuard {
         EvalContext *prev;
-        bool active;
-        CtxGuard(EvalContext *c, bool a) : prev(g_current_ctx), active(a) {
-            if (active)
-                g_current_ctx = c;
-        }
-        ~CtxGuard() { if (active) g_current_ctx = prev; }
-    } ctx_guard(&ctx, !reentrant);
+        CtxGuard(EvalContext *c) : prev(g_current_ctx) { g_current_ctx = c; }
+        ~CtxGuard() { g_current_ctx = prev; }
+    } ctx_guard(&ctx);
+
+    /* #60 (b): the entry setup above is per-INVOCATION; the dispatch loop is
+     * split into vm_dispatch so a callback loop re-enters it directly (see the
+     * forward decl / VmInvoker::invoke). */
+    vm_dispatch(chunk0, ctx, act);
+}
+
+static void
+vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
+{
+    /* The CURRENT chunk - reseatable LOOP STATE (the native call stack: an
+     * in-VM call switches it to the callee's chunk; a pop switches it
+     * back). Every op reads the current chunk through it. */
+    const Chunk *chunk = &chunk0;
 
     /*
      * The CURRENT chunk's instruction array, cached as loop state: `chunk`
