@@ -26,6 +26,30 @@ are machine code; its un-nativizable regions ("islands") are reached by a
 the DRIVER**; the interpreter is called only per-island. Per-op dispatch on the
 island ops collapses to ONE call per island (block-level dispatch, not op-level).
 
+## THE STRATEGIC ARC — the flip is a MILESTONE toward full-native AOT
+
+**This is NOT primarily a short-term perf play — it is the structural framework
+for full-native AOT compilation** (maintainer, 2026-07-21). The point is:
+
+- The flip makes EVERY function a native CONTAINER — a `call`-able machine-code
+  blob whose un-nativized regions are bytecode ISLANDS. That is the *shape* a
+  fully-AOT-compiled program has: native code with a shrinking set of
+  interpreter escapes.
+- **Bytecode islands become progressively RARER as we give more ops native
+  code** — EXACTLY like the AST→VM conversion removed its fallbacks (`EvalStmt`
+  / `EvalToSlot` / `JumpIfFalse`) one op at a time until the codegen was no-fail.
+  Each op we teach the JIT to emit natively shrinks the islands; in the limit the
+  islands vanish and the program is 100% native (full-native AOT). The island
+  executor (`vm_exec_block`) is the *general* escape hatch that lets us ship the
+  framework NOW and nativize ops incrementally, never blocked on covering
+  everything at once.
+- So an INDIVIDUAL step's perf (e.g. loop containers measuring marginal — see
+  M4b) is secondary; what matters is that the framework is in place and the
+  island set is monotonically shrinkable. The end state — every function a
+  native blob, calling each other natively (M5), islands → ~zero — is the
+  milestone. Judge the arc by "are islands shrinking / is the call graph going
+  native", not only by a single milestone's benchmark delta.
+
 Concretely, the flip changes three things:
 1. **One `EnterNative` per function** (at pc 0), not one per eligible run — the
    fragment spans the whole body.
