@@ -97,31 +97,35 @@ for a mixed body, the per-island BLOCKER opcodes (the distinct un-eligible ops �
 the actionable "what to nativize next" list). This is the data structure every
 later milestone consumes AND the prioritization tool. Surfaced in `-vd`.
 
-### 2. `vm_exec_block` — the generic island executor — M2
+### 2. `vm_exec_block` — the generic island executor — M2 ✅ LANDED
 `BlockStatus vm_exec_block(EvalContext &ctx, VmActivation &act, const Chunk
-*chunk, size_t from_pc, size_t to_pc)` runs a single-entry island of interpreted
-ops and returns a status:
-- **FELL_THROUGH** — ran `[from_pc, to_pc)` and stopped at `to_pc` (the next
-  block leader): the container continues at `to_pc`'s native label.
-- **BRANCHED(pc)** — an island branch targeted a leader OUTSIDE `[from_pc,to_pc)`;
-  the container routes `pc` → that block's native label (the exit dispatch, #4).
-- **RETURNED** — hit a `ReturnV` (flow set): the container returns to
-  `EnterNative` (in-VM parent switch / boundary stop — the existing sentinels).
-- **RAISED** — an op threw; the executor CAUGHT it into `g_vm_jit_exc` (the
-  container has NO unwind tables — the store-helper contract), returns RAISED;
-  the container's raise stub exits so `EnterNative` re-raises with the caret.
+&chunk, size_t from_pc, size_t *resume_pc)` runs a single-entry island of
+interpreted ops in the CURRENT frame and returns a status:
+- **FellThrough** — the island ended at an `ExitBlock` terminator; `*resume_pc`
+  = the pc the container continues at (its next block).
+- **Returned** — hit a `ReturnV`/`Halt`: the function returns (value in
+  `ctx.flow`); the container does its own native return.
+- **Raised** — an UNCAUGHT throw: `g_vm_exc_pending` is set; the container's
+  raise stub exits so the exception propagates with the caret. An exception
+  CAUGHT within the island (its own handler stack) just continues → FellThrough.
 
-Design tension (settle with the maintainer AFTER M1 makes the island shapes
-visible): the executor must NOT perturb `vm_dispatch`'s codegen for pure-native
-loops (they never call it, but a shared body must keep its layout). Two options:
-(a) factor the 1270-line dispatch switch into a `vm_dispatch_body.cpp.h`
-`#include`d by BOTH `vm_dispatch` (unbounded) and `vm_exec_block` (bounded, a
-`to_pc` stop compiled in) — one handler source of truth, the stop compiled out
-of the unbounded copy; or (b) a bounded variant that reuses handlers another
-way. (a) is the clean design but a big mechanical refactor; decide with real
-island data. NOTE the islands are the SLOW ops by construction (dyn/boxed/
-container/call), so `vm_exec_block`'s own overhead is negligible there — the
-constraint is purely about not regressing the pure-native `vm_dispatch`.
+**Chosen: option (b) — reuse `vm_dispatch` unchanged + a terminator op** (not
+the `.cpp.h` split of option a, which relocates the whole hot switch and is the
+*bigger* layout risk to `vm_dispatch` — the exact thing to avoid). Two minimal
+touches: (1) `vm_dispatch` gained a `size_t start_pc = 0` param (one line, no
+hot-loop effect); (2) a new `ExitBlock` terminator op whose handler stashes the
+resume pc and `return`s (structurally identical to how `Halt`/the boundary
+sentinels already return). `vm_exec_block` = flip the current frame's `boundary`
+bit (so an island `ReturnV`/`Halt`/uncaught-throw HANDS BACK here instead of
+popping the frame — the container owns the frame's real return), call
+`vm_dispatch(chunk, from_pc)`, restore, classify. It reuses the FULL interpreter
+(all handlers, nested calls, the per-frame handler stack) with ZERO duplication.
+Pinned by the `vm_exec_block_selftest` `-rt` test (fall-through, an internal
+boxed branch taken + not-taken, a return, an uncaught div0 → Raised). GOTCHA:
+never hold a `VmCallRec&` across `vm_dispatch` (a nested call can realloc the
+records vector) — re-fetch `back_rec()` to restore. NOTE the `BRANCHED(pc)`
+multi-exit case (an island branch to a native block) is deferred to **M4**
+(the exit-dispatch); an M3 straight-line island is single-exit at its ExitBlock.
 
 ### 3. Whole-function container EMISSION — M3+
 Emit ONE fragment spanning the whole body. Per basic block, a native label. A
@@ -170,10 +174,14 @@ analysis-only). Commit per milestone.
   over the POST-jit chunk, so an island is a run of interpreted ops BETWEEN the
   inserted `EnterNative`s (accurate to the runtime structure).
 
-- **M2 — `vm_exec_block` executor (standalone).** The bounded island executor
-  (#2). Decide (a) vs (b) with the maintainer using M1's visible island shapes.
-  Tested by calling it DIRECTLY from C++ over a known island: fall-through,
-  branch-out, return, exception-caught. NOT wired to the emitter yet.
+- **M2 — `vm_exec_block` executor (standalone). ✅ LANDED.** Option (b): the
+  `ExitBlock` terminator op + a `start_pc` param on `vm_dispatch` + the
+  boundary-flip executor (see #2). Tested DIRECTLY from C++ (`vm_exec_block_
+  selftest`, vm.cpp) over hand-built islands — fall-through, an internal boxed
+  branch (taken + not), a return, an uncaught div0. NOT wired to the emitter yet
+  (M3). The only runtime footprint on real programs is the new (never-emitted)
+  opcode — a dispatch-table/layout perturbation (the documented front-end
+  effect); measure cross-binary in a deep session, its value lands with M3.
 
 - **M3 — whole-function container for the simplest MIXED shape.** A leaf
   function that is native-except-ONE-straight-line-island (no island-internal

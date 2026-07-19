@@ -918,6 +918,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
              * via `objdump -D -b binary -m i386:x86-64` on the dump) */
             row << "enter.nat    frag@+" << in.a_lit();
             break;
+        case OpCode::ExitBlock:
+            /* model-flip M2: an island's fall-through exit; a_lit = the pc the
+             * container resumes at. Not emitted by codegen yet (M3). */
+            row << "exit.block   -> L" << in.a_lit();
+            break;
         case OpCode::StructFieldAddInt:
             /* #9 fusion: b_dual = (field idx, other slot) */
             row << "sf.add       " << D(in.target) << " = "

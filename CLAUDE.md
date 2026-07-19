@@ -5123,20 +5123,28 @@ next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
 `plans/model-flip.md`.
 
 **THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
-(`plans/model-flip.md`, M1 landed).** The endgame inversion of the JIT: flip
+(`plans/model-flip.md`, M1+M2 landed).** The endgame inversion of the JIT: flip
 "BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
 `EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
 ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
-un-nativizable regions become islands reached via `call vm_exec_block(from,to)`;
+un-nativizable regions become islands reached via `call vm_exec_block(from)`;
 the native code DRIVES, the interpreter is called only per-island (block-level
 dispatch, not per-op). This universalizes native `call <offset>` (not just leaf
 callees) and is the platform for the N7 unboxing arc. Milestones **M1**
-(container-plan analysis + `-vd`, no runtime change — LANDED) → M2
-(`vm_exec_block` island executor) → M3 (whole-function container, simplest mixed
-shape) → M4 (island-exit dispatch + branches) → M5 (native calls to EVERY
-function: the checked-return unwind + growable native stack) → M6
-(delete-originals / `.myv`-ready). Builds on `plans/native-call-impl.md` (v1
-native calls) and `plans/native-aot.md` (approach A, the fragment ABI).
+(container-plan analysis + `-vd`, no runtime change — LANDED) → **M2**
+(`vm_exec_block` island executor — LANDED) → M3 (whole-function container,
+simplest mixed shape) → M4 (island-exit dispatch + branches) → M5 (native calls
+to EVERY function: the checked-return unwind + growable native stack) → M6
+(delete-originals / `.myv`-ready). **M2:** `vm_exec_block(ctx, act, chunk,
+from_pc, *resume)` (vm.cpp) runs a single-entry interpreted ISLAND and hands
+control back to the container — chosen model **(b)**: reuse `vm_dispatch`
+unchanged (a `start_pc` param + a new `ExitBlock` terminator op that `return`s
+with the resume pc), and FLIP the current frame's `boundary` bit for the run so
+an island `ReturnV`/`Halt`/uncaught-throw hands back (set flow / signal) instead
+of popping the frame — the container owns the real return; a caught island
+exception continues. Returns `FellThrough`/`Returned`/`Raised`. NOT emitted by
+codegen yet (M3 wires it). Builds on `plans/native-call-impl.md` (v1 native
+calls) and `plans/native-aot.md` (approach A, the fragment ABI).
 
 ## Invariants & hazards (defense in depth)
 

@@ -1716,6 +1716,14 @@ int g_vm_jit_raise = 0;
 static const Chunk *g_vm_resume_chunk = nullptr;
 static size_t g_vm_resume_pc = 0;
 
+/* model-flip M2 (plans/model-flip.md): the ISLAND fall-through resume pc. An
+ * ExitBlock sets it (the container's next-block pc) and returns from
+ * vm_dispatch; vm_exec_block reads it to distinguish a fall-through exit
+ * (g_vm_block_resume != NONE) from a ReturnV/Halt (flow) or a raise. NONE
+ * (SIZE_MAX) between islands - cleared by vm_exec_block before each run. */
+static const size_t VM_BLOCK_NONE = static_cast<size_t>(-1);
+static size_t g_vm_block_resume = VM_BLOCK_NONE;
+
 /* #55 native calls: the EvalContext of the CURRENTLY EXECUTING vm_run_chunk
  * (set + restored at each entry - a builtin callback re-enters with the invoke
  * ctx), so the native ReturnV helper (jit_ret) reaches the right frame / flow /
@@ -1892,7 +1900,7 @@ vm_capture_desc_frame(Exception &e, const FuncDescriptor *d)
  * CtxGuard). vm_run_chunk = the entry prologue + this. `act` is the caller's
  * activation (the top boundary record is this invocation's frame). */
 static void vm_dispatch(const Chunk &chunk0, EvalContext &ctx,
-                        VmActivation &act);
+                        VmActivation &act, size_t start_pc = 0);
 
 /*
  * Phase D (plans/vm-native-call-stack.md): a builtin's USER-CALLBACK call
@@ -2464,7 +2472,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 }
 
 static void
-vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
+vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
+            size_t start_pc)
 {
     /* The CURRENT chunk - reseatable LOOP STATE (the native call stack: an
      * in-VM call switches it to the callee's chunk; a pop switches it
@@ -2480,7 +2489,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
      * enter/leave call, the unwind dispatch (vm_resume), and entry.
      */
     const Instr *code = chunk->code.data();
-    size_t pc = 0;
+    size_t pc = start_pc;   /* model-flip: vm_exec_block enters mid-chunk */
     /* CachedCallV's pending {func,args} key between the cache miss and the
      * frame push. LOOP-scope (like `in`): clang forbids an INDIRECT goto
      * from exiting a scope with a live non-trivial local, and every label
@@ -4973,6 +4982,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
             vm_leave_call(act, ctx, chunk, pc, EvalValue());
             code = chunk->code.data();
             VM_NEXT;
+
+        VM_CASE(ExitBlock):
+            /* model-flip M2 (plans/model-flip.md): an island's fall-through
+             * exit. Hand control back to the native container (vm_exec_block):
+             * stash the resume pc (the next block the container continues at)
+             * and return from the dispatch loop. ONLY reached via vm_exec_block
+             * - the codegen doesn't emit it yet (M3). A terminator (rets),
+             * never a fall-through, so no VM_NEXT. */
+            g_vm_block_resume = static_cast<size_t>(in->a_lit());
+            return;
 #ifndef ML_CGOTO
         case OpCode::OpCount_:      /* sentinel - never emitted (switch
                                      * exhaustiveness; cgoto has no entry) */
@@ -5006,3 +5025,141 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
         return;                /* signal set; do_func_call captures + goes on */
     }
 }
+
+/* =====================================================================
+ * model-flip M2 (plans/model-flip.md): the interpreted-ISLAND executor.
+ * The endgame flips "bytecode with native islands" into "native with
+ * bytecode islands": every function becomes ONE call-able native container
+ * whose un-nativizable regions are ISLANDS reached via a `call vm_exec_block`.
+ * This is that executor + its self-test; the emitter wiring is M3.
+ * ===================================================================== */
+
+/* How an island run by vm_exec_block ended. */
+enum class BlockStatus {
+    FellThrough,   /* ExitBlock: island done -> container continues (resume pc)*/
+    Returned,      /* ReturnV/Halt: the function returns (value in ctx.flow)    */
+    Raised,        /* an UNCAUGHT throw: g_vm_exc_pending set (container raises)*/
+};
+
+/*
+ * Run a single-entry ISLAND of interpreted ops starting at from_pc in the
+ * CURRENT frame, then hand control back to the native container. It reuses the
+ * FULL vm_dispatch (every handler, nested calls, the per-frame handler stack) -
+ * the island is real interpreted execution, not a second interpreter. The one
+ * trick: the current frame's `boundary` bit is flipped for the run, so an island
+ * ReturnV/Halt or an UNCAUGHT throw HANDS BACK here (set flow / set the signal,
+ * then return) instead of popping the frame - the CONTAINER owns the frame's
+ * actual return. A fall-through island ends with an ExitBlock (-> FellThrough,
+ * *resume_pc = the next block). An exception CAUGHT within the island is handled
+ * by the handler stack and the island simply continues (-> FellThrough); only an
+ * uncaught one -> Raised. Do NOT hold a VmCallRec& across vm_dispatch (a nested
+ * call can grow+realloc the records vector); re-fetch back_rec() to restore.
+ */
+[[maybe_unused]] static BlockStatus
+vm_exec_block(EvalContext &ctx, VmActivation &act, const Chunk &chunk,
+              size_t from_pc, size_t *resume_pc)
+{
+    const unsigned char saved_boundary = act.back_rec().boundary;
+    act.back_rec().boundary = 1;         /* ReturnV/Halt/throw -> hand back */
+    const size_t saved_resume = g_vm_block_resume;
+    g_vm_block_resume = VM_BLOCK_NONE;
+
+    vm_dispatch(chunk, ctx, act, from_pc);
+
+    act.back_rec().boundary = saved_boundary;   /* re-fetch (realloc-safe) */
+    const size_t got = g_vm_block_resume;
+    g_vm_block_resume = saved_resume;
+
+    if (got != VM_BLOCK_NONE) {
+        if (resume_pc)
+            *resume_pc = got;
+        return BlockStatus::FellThrough;
+    }
+    if (g_vm_exc_pending)
+        return BlockStatus::Raised;
+    return BlockStatus::Returned;        /* ReturnV set flow.ret; Halt -> none */
+}
+
+#ifdef TESTS
+/* Hand-build tiny islands and drive vm_exec_block over each - the M2 unit
+ * test (no emitter wiring yet). */
+bool vm_exec_block_selftest()
+{
+    auto lit = [](int_type v) {
+        Operand o; o.is_lit = true; o.lit_kind = Operand::LitKind::i; o.lit = v;
+        return o;
+    };
+    auto sl = [](int s) { Operand o; o.is_lit = false; o.slot = s; return o; };
+    auto imm = [&](int slot, int_type v) {
+        Instr in; in.op = OpCode::LoadImmInt; in.target = slot; in.set_a(lit(v));
+        return in;
+    };
+
+    struct Res { BlockStatus st; size_t resume; EvalValue slot0; FlowState flow;};
+    auto run = [](std::vector<Instr> ops, int nslots) -> Res {
+        Chunk ck;
+        ck.code = std::move(ops);
+        ck.slot_count = nslots;
+        VmActivation act;
+        VmActivation *prev = g_vm_act;
+        g_vm_act = &act;
+        EvalContext ctx(nullptr, /*const_ctx=*/false);
+        ctx.frame = act.push_window(nslots, &ck, /*boundary=*/false);
+        g_vm_exc_pending.reset();
+        ctx.flow->type = FlowState::none;
+        size_t resume = VM_BLOCK_NONE;
+        const BlockStatus st = vm_exec_block(ctx, act, ck, 0, &resume);
+        Res r{ st, resume, ctx.frame->at(0).get(), *ctx.flow };
+        if (st == BlockStatus::Raised)
+            g_vm_exc_pending.reset();       /* consume the test's exception */
+        act.pop_window();
+        g_vm_act = prev;
+        return r;
+    };
+    auto is_int = [](const EvalValue &v, int_type n) {
+        return v.get_type()->t == Type::t_int && v.get<int_type>() == n;
+    };
+
+    bool ok = true;
+
+    /* (1) fall-through: LoadImmInt r0=42; ExitBlock -> resume 2. */
+    {
+        Instr ex; ex.op = OpCode::ExitBlock; ex.set_a(lit(2));
+        const Res r = run({ imm(0, 42), ex }, 1);
+        ok = ok && r.st == BlockStatus::FellThrough && r.resume == 2
+             && is_int(r.slot0, 42);
+    }
+    /* (2) internal boxed branch (NOT taken): r0=1; JumpUnlessTrueV r0 -> L3;
+     *     r0=99; ExitBlock -> resume 4. r0 true, so it falls to r0=99. */
+    {
+        Instr j; j.op = OpCode::JumpUnlessTrueV; j.target2 = 0; j.target = 3;
+        Instr ex; ex.op = OpCode::ExitBlock; ex.set_a(lit(4));
+        const Res r = run({ imm(0, 1), j, imm(0, 99), ex }, 1);
+        ok = ok && r.st == BlockStatus::FellThrough && r.resume == 4
+             && is_int(r.slot0, 99);
+    }
+    /* (2b) same branch TAKEN: r0=0 -> jump past r0=99, r0 stays 0. */
+    {
+        Instr j; j.op = OpCode::JumpUnlessTrueV; j.target2 = 0; j.target = 3;
+        Instr ex; ex.op = OpCode::ExitBlock; ex.set_a(lit(4));
+        const Res r = run({ imm(0, 0), j, imm(0, 99), ex }, 1);
+        ok = ok && r.st == BlockStatus::FellThrough && is_int(r.slot0, 0);
+    }
+    /* (3) a return: LoadImmInt r0=7; ReturnV r0 -> Returned, flow.value == 7. */
+    {
+        Instr ret; ret.op = OpCode::ReturnV; ret.set_a(sl(0));
+        const Res r = run({ imm(0, 7), ret }, 1);
+        ok = ok && r.st == BlockStatus::Returned
+             && r.flow.type == FlowState::ret && is_int(r.flow.value, 7);
+    }
+    /* (4) an uncaught throw: r0=10; r1=0; IntBin r2 = r0 / r1 -> Raised. */
+    {
+        Instr d; d.op = OpCode::IntBin; d.aop = Op::div; d.target = 2;
+        d.set_a(sl(0)); d.set_b(sl(1));
+        const Res r = run({ imm(0, 10), imm(1, 0), d }, 3);
+        ok = ok && r.st == BlockStatus::Raised;
+    }
+
+    return ok;
+}
+#endif  /* TESTS */
