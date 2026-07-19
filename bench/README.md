@@ -83,7 +83,7 @@ source)* — so a MyLang edit never re-times it; only a scale change or a real
 re-times a comparison mid-measurement — that would perturb MyLang's timing).
 Re-timing is the separate `--recompute` step:
 `bench/run.py -cl <lang> --recompute [--filter …]` re-caches the stale entries
-(or all, with `--refresh-cache`) and exits. You rarely need it — the comparison
+(or all, with `--force`) and exits. You rarely need it — the comparison
 sources almost never change.
 
 `--baseline` is the way to measure whether a change actually helped: build the

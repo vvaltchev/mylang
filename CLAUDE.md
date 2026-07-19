@@ -888,7 +888,7 @@ warranted. For ordinary OPTIMIZATION work the default is lean:
   **fails fast** if any comparison entry is stale/missing, naming the
   `--recompute` command — it NEVER re-times a comparison inline. Re-timing is a
   **separate, explicit step**: `bench/run.py -cl <lang> --recompute [--filter …]`
-  (re)caches the stale entries — or all, with `--refresh-cache` — then exits
+  (re)caches the stale entries — or all, with `--force` — then exits
   without timing MyLang. This is the load-bearing fix for a real asymmetry: a
   comparison subprocess re-run inline used to interleave with the variance-
   gated MyLang reps of the *next* bench and perturb them (so a stale Python
