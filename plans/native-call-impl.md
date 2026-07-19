@@ -20,7 +20,20 @@ progress step, not the highest-value one (CLAUDE.md).
   the NEXT in-process compile's M8 specialization (typed arith -> boxed BinOpV,
   not native) - correctness-safe, perf-only, deferred (see
   [[template-compile-pollutes-next-specialization]] / the note below).
-- **STEP 2 (native CallV): NEXT.** See below.
+- **STEP 2.0 (codegen/jit split - the ordering foundation): DONE 2026-07-19**
+  (commit 26f261d). `jit_chunk_is_native_leaf` predicate; codegen sets the flag;
+  `jit` param threaded; vm_precompile_all codegens ALL then jits ALL; main jit'd
+  after. Pure refactor - `-vd` BYTE-IDENTICAL across 76 benches + samples, -rt
+  1557/1557 + differential green. So every callee's `native_leaf` flag is now
+  available before any caller is jit'd.
+- **STEP 2.1 (the native CallV itself): NEXT.** See "Slice 2.1" below - the
+  gate + baked descriptors + jit_call_setup + the call ABI. Note the one tricky
+  sub-problem: `jit_op_eligible(const Instr&)` can't evaluate the gate (needs
+  program context - the slot->desc map, write-once flags, callee native_leaf),
+  so the run builder must consult a `JitCtx` (threaded into jit_compile_chunk)
+  to decide CallV eligibility per-call. Layout offsets for
+  `FuncDescriptor::vm_chunk` / `Chunk::native.base` / `Chunk::native_entry_off`
+  need co-located probes (like `SharedArrayObj::jit_probe`).
 
 ## Current state (all committed; HEAD = e3e111c "extract vm_frame_leave")
 
