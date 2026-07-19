@@ -21,6 +21,7 @@
 
 #include <cstddef>   /* size_t (jit_enter) */
 #include <cstdint>   /* uint32_t (the store helpers' pc) */
+#include <vector>    /* JitCtx's slot tables (#55 STEP 2.1) */
 
 #include "defs.h"    /* int_type */
 
@@ -44,7 +45,54 @@ void jit_type_singletons(const void *&t_int, const void *&t_float,
 /* Fragments compiled process-wide (tests / -vd audit). */
 extern unsigned long g_jit_frags;
 
-void jit_compile_chunk(Chunk &chunk);
+struct FuncDescriptor;   /* #55 STEP 2.1 - native call (pointers only here) */
+class LValue;
+
+/*
+ * #55 STEP 2.1: program context a caller's jit needs to decide+emit a NATIVE
+ * CallV (a compile-time decision - jit_op_eligible(Instr) alone can't see it).
+ *   slot_desc[global slot]      -> the callee FuncDescriptor* (null if that
+ *                                  slot isn't a native-callable function),
+ *   slot_reassigned[global slot]-> 1 if the slot is reassigned (NOT write-once),
+ *   caller_desc                 -> THIS chunk's own function descriptor (its
+ *                                  vm_chunk is the record's ret_chunk); null for
+ *                                  main -> no native call from main in v1.
+ * Null (the disasm / -rt / default path) -> no native calls emitted.
+ */
+struct JitCtx {
+    const std::vector<const FuncDescriptor *> *slot_desc = nullptr;
+    const std::vector<char> *slot_reassigned = nullptr;
+    const FuncDescriptor *caller_desc = nullptr;
+};
+
+void jit_compile_chunk(Chunk &chunk, const JitCtx *jc = nullptr);
+
+/* #55 STEP 2.1 layout offsets (probed in vm.cpp, which has the full defs; baked
+ * as immediates by the emitter). */
+ptrdiff_t jit_off_desc_vm_chunk();      /* FuncDescriptor::vm_chunk */
+ptrdiff_t jit_off_chunk_native_base();  /* Chunk::native.base */
+ptrdiff_t jit_off_chunk_native_entry(); /* Chunk::native_entry_off */
+
+/*
+ * #55 STEP 2.1: the native CallV setup helper (vm.cpp, extern "C" noexcept,
+ * baked as a call target). A caller fragment, at a native CallV, calls this to
+ * push the callee frame: resolve the FuncObject from the callee global slot
+ * (write-once => always a defined FuncObject, the gate proved it), then
+ * vm_frame_setup (ret_chunk = caller_desc->vm_chunk, ret_pc = callv_pc+1).
+ * Returns the callee window's slots ptr, which the caller loads into rdi before
+ * `call`ing the callee fragment; on StackOverflow (or any bind throw) it stashes
+ * the exception in g_vm_jit_exc and returns null, and the caller exits to
+ * callv_pc so EnterNative re-raises (caret from the loc table). noexcept: any
+ * RuntimeException is caught here, never a C++ throw out of native code.
+ */
+extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
+                                  size_t nargs, int_type dst,
+                                  const FuncDescriptor *caller_desc,
+                                  size_t callv_pc) noexcept;
+
+/* #55 STEP 2.1: native CallVs SET UP process-wide (a `jit:` coverage counter -
+ * proves the native call path actually ran). */
+extern unsigned long g_jit_native_calls;
 
 /*
  * #55 STEP 2: is this chunk's WHOLE body a single fully-native run ending in

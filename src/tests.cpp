@@ -101,6 +101,27 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #55 STEP 2.1: a native_leaf callee called from ANOTHER function - a
+         * function->function NATIVE call under -vm (the caller fragment `call`s
+         * the callee fragment). Both engines must agree; the `jit:` extra_check
+         * proves the native call path executed. runtime() keeps the arg
+         * non-const (no specialization to a clone). */
+        "native function-to-function call (native CallV)",
+        {
+            "func nl(int a, int b) {",
+            "  var t = a * b; var u = t + a; var v = u - b;",
+            "  var w = v * a; var x = w + b; return x - a;",
+            "}",
+            "func nc(int n) {",
+            "  var acc = 0;",
+            "  for (var i = 1; i <= n; i++) acc = acc + nl(i, n);",
+            "  return acc;",
+            "}",
+            "assert(nc(runtime(50)) == 2126650);",
+        },
+    },
+
+    {
         "if stmt",
         {
             "var a = 1;",
@@ -14441,6 +14462,65 @@ static bool cross_compile_specialize_stable()
     return true;
 }
 
+/* #55 STEP 2.1: a native_leaf callee called from ANOTHER function issues a
+ * NATIVE call (jit_call_setup) from the caller's fragment instead of an
+ * interpreted CallV. PROVE the native call ran (g_jit_native_calls bumps) with
+ * a correct result. runtime() keeps the arg non-const so the callee is not
+ * specialized to a clone (a const arg -> nleaf$0, a not-yet-native case). */
+static bool jit_native_call()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    const unsigned long b0 = g_jit_native_calls;
+    if (!run({ "func nleaf(int a, int b) {",
+               "  var t = a * b;",
+               "  var u = t + a;",
+               "  var v = u - b;",
+               "  var w = v * a;",
+               "  var x = w + b;",
+               "  return x - a;",
+               "}",
+               "func ncaller(int n) {",
+               "  var acc = 0;",
+               "  for (var i = 1; i <= n; i++) acc = acc + nleaf(i, n);",
+               "  return acc;",
+               "}",
+               "assert(ncaller(runtime(50)) == 2126650);" }))
+        return false;
+    if (g_jit_native_calls <= b0)
+        return false;   /* the native call did NOT run - a silent regression */
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool vm_codegen_shapes()
 {
     /* 1) resolved-local int while + if -> native ops (native-first codegen
@@ -15661,6 +15741,8 @@ static const std::vector<extra_check> extra_checks =
       jit_delete_originals },
     { "jit: native ReturnV runs in the fragment (in-VM + boundary paths)",
       jit_native_return },
+    { "jit: native CallV (function->function call in the fragment)",
+      jit_native_call },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

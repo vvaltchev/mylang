@@ -26,14 +26,32 @@ progress step, not the highest-value one (CLAUDE.md).
   after. Pure refactor - `-vd` BYTE-IDENTICAL across 76 benches + samples, -rt
   1557/1557 + differential green. So every callee's `native_leaf` flag is now
   available before any caller is jit'd.
-- **STEP 2.1 (the native CallV itself): NEXT.** See "Slice 2.1" below - the
-  gate + baked descriptors + jit_call_setup + the call ABI. Note the one tricky
-  sub-problem: `jit_op_eligible(const Instr&)` can't evaluate the gate (needs
-  program context - the slot->desc map, write-once flags, callee native_leaf),
-  so the run builder must consult a `JitCtx` (threaded into jit_compile_chunk)
-  to decide CallV eligibility per-call. Layout offsets for
-  `FuncDescriptor::vm_chunk` / `Chunk::native.base` / `Chunk::native_entry_off`
-  need co-located probes (like `SharedArrayObj::jit_probe`).
+- **STEP 2.1 (the native CallV itself): CORE WORKING 2026-07-20.** A function->
+  function direct call to a native_leaf issues a native `call` (jit_call_setup +
+  `call` the callee fragment) instead of an interpreted CallV. Verified: a
+  native_leaf `nl` called from `nc` in a loop -> 50 native calls (proven via
+  g_jit_native_calls), result correct (== -tw). -rt 1557/1557 + differential
+  green. Pieces: JitCtx (slot_desc / slot_reassigned / caller_desc) threaded
+  into jit_compile_chunk; callv_native_ok gate; op_run_eligible + relaxed
+  MIN_RUN for call-bearing runs (boxed arg-setup MoveVs split a call loop into
+  short runs, but a native call is worth a fragment regardless of length);
+  jit_call_setup (vm.cpp) + the emit ABI (push rdi; jit_call_setup; test/jnz SO
+  exit; load callee->vm_chunk->native.base+entry; call rcx; epilogue);
+  FuncDescriptor::vm_chunk / Chunk::native.base / native_entry_off offsets
+  probed in vm.cpp.
+  KNOWN v1 LIMITATIONS (missed optimizations, always a correct interpreted
+  fallback - NOT bugs):
+    * a CONST-ARG call specializes (`nc(50)` -> `nc$0` -> `nl$0`) and the clone's
+      call is NOT native-called yet (the gate didn't fire for the `$0` clone -
+      to investigate: is the clone in slot_desc, is its call a CallV vs
+      CachedCallV, is the clone native_leaf). Use a non-const arg (`runtime()`)
+      to hit the native path today. TODO Slice 2.2.
+    * a call FROM MAIN is never native (main has no stable descriptor for the
+      record's ret_chunk) - by design in v1.
+    * CachedCallV (the fib-unroll cache path) is not native in v1.
+    * -vd/-vdj does NOT show native calls (the disasm path builds no JitCtx) -
+      a disasm-fidelity gap, not a correctness one; coverage is via
+      g_jit_native_calls. TODO: thread a JitCtx into disassemble_program.
 
 ## Current state (all committed; HEAD = e3e111c "extract vm_frame_leave")
 

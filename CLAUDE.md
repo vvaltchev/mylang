@@ -648,8 +648,42 @@ sentinel, never an interior pc, so its interpreted original is deletable) + in
 `pick_cached_slots` (its result slot is an int use; a FLOAT result slot is
 always disqualified by the float op that produced it, so it is never int-cached
 here). Coverage: `g_jit_native_returns` (a `jit:` test asserts both the in-VM
-and the boundary path ran). STEP 2 (a caller fragment's native `call` into a
-`native_leaf`) is next.
+and the boundary path ran).
+
+**#55 STEP 2 — NATIVE `CallV` (plans/native-call-impl.md).** A function->
+function direct call to a `native_leaf` runs as a native `call` from the caller
+fragment, not an interpreted CallV. **2.0 (ordering foundation):**
+`jit_compile_chunk` moved OUT of `codegen_chunk` for the precompile - `codegen`
+sets the `native_leaf` FLAG (`jit_chunk_is_native_leaf`, from ops) and takes a
+`jit` param, and `vm_precompile_all` codegens ALL bodies THEN jits ALL, so every
+callee's flag exists before any caller is jit'd (a caller bakes the callee
+`FuncDescriptor*` and loads its `native.base+native_entry_off` at RUNTIME - the
+flag is the only compile-time need). **2.1 (the call):** a `JitCtx` (slot->desc
+map, `global_slot_reassigned`, the chunk's own `caller_desc`) is threaded into
+`jit_compile_chunk`; `callv_native_ok` is the COMPILE-TIME gate (a plain CallV,
+write-once global slot, callee `native_leaf`, function caller); `op_run_eligible`
+folds it into run-building, and a run holding a native call forms regardless of
+`MIN_RUN` (the boxed arg-setup MoveVs split a call loop into short runs, but the
+call's dispatch-removal is the point). The emit: `push rdi`; call **`jit_call_setup`**
+(vm.cpp - resolves the callee FuncObject from its global slot, `vm_frame_setup`
+with `ret_chunk = caller_desc->vm_chunk`, `ret_pc = pc+1`; catches
+StackOverflow/bind throw -> `g_vm_jit_exc` + null return); `test/jnz` (null ->
+`exit_pc` so EnterNative re-raises); load `callee->vm_chunk->native.base +
+native_entry_off` and `call` it directly (the callee's native ReturnV/jit_ret
+pops + writes OUR dst + rets a sentinel we IGNORE - a native_leaf never bails
+post-setup); epilogue. A call run is NOT N5-cached (`pick_cached_slots` -> {}),
+so args are in memory and no reload is needed; a call-bearing fragment is
+non-leaf (never native-CALLED), so its StackOverflow exit always returns to
+EnterNative. Layout offsets (`FuncDescriptor::vm_chunk`, `Chunk::native.base`,
+`Chunk::native_entry_off`) are probed in vm.cpp. C-stack is bounded (F2 v1):
+only LEAF callees are native-called, so a native call adds one fixed C frame; a
+recursive/non-leaf callee isn't `native_leaf` -> interpreted CallV. Coverage:
+`g_jit_native_calls` (a `jit:` test). Measured ~9% on an all-calls microbench
+(the win is dispatch removal; `vm_frame_setup` is shared with the interpreted
+path). **v1 limitations (missed optimizations, always a correct interpreted
+fallback):** a CONST-ARG call specializes (`f(50)` -> `f$0`) and the clone's
+call isn't native yet; a call FROM MAIN (no stable descriptor); `CachedCallV`;
+and `-vd`/`-vdj` don't show native calls (the disasm path builds no JitCtx).
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
