@@ -419,6 +419,11 @@ design above, gated on fully-native callee bodies.
 
 ### #55 — the STAGED implementation plan (careful analysis)
 
+> **The step-by-step EXECUTION guide (do-this-next, self-contained) is
+> `plans/native-call-impl.md`** — it has the exact emitter ABI, the native
+> `ReturnV`/`CallV` machine-code recipe, the helpers, ASSERTs, and tests. This
+> section is the design rationale behind it.
+
 The JIT is ON BY DEFAULT, so this is designed around one HARD constraint from
 the maintainer: **at compile time we must know EXACTLY what to emit — NO
 runtime-decided fallback that silently reverts to the interpreter.** A native
