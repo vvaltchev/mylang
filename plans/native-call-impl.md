@@ -39,19 +39,28 @@ progress step, not the highest-value one (CLAUDE.md).
   exit; load callee->vm_chunk->native.base+entry; call rcx; epilogue);
   FuncDescriptor::vm_chunk / Chunk::native.base / native_entry_off offsets
   probed in vm.cpp.
-  KNOWN v1 LIMITATIONS (missed optimizations, always a correct interpreted
-  fallback - NOT bugs):
-    * a CONST-ARG call specializes (`nc(50)` -> `nc$0` -> `nl$0`) and the clone's
-      call is NOT native-called yet (the gate didn't fire for the `$0` clone -
-      to investigate: is the clone in slot_desc, is its call a CallV vs
-      CachedCallV, is the clone native_leaf). Use a non-const arg (`runtime()`)
-      to hit the native path today. TODO Slice 2.2.
+  v1 NON-NATIVE cases (always a correct interpreted fallback - NOT bugs):
     * a call FROM MAIN is never native (main has no stable descriptor for the
       record's ret_chunk) - by design in v1.
-    * CachedCallV (the fib-unroll cache path) is not native in v1.
     * -vd/-vdj does NOT show native calls (the disasm path builds no JitCtx) -
-      a disasm-fidelity gap, not a correctness one; coverage is via
+      a disasm-fidelity gap, not correctness; coverage is via
       g_jit_native_calls. TODO: thread a JitCtx into disassemble_program.
+    * CachedCallV is excluded, but MOOT (its callee is a cacheable RECURSIVE
+      func -> never a native_leaf, so the gate would reject it anyway).
+
+  NOT a gap - the const-arg "clone" case (Slice 2.2 was a NON-ISSUE, 2026-07-20):
+  an earlier note claimed a const-arg call specialized to a `$0` clone that
+  failed to native-call. FALSE - a MISDIAGNOSIS from a REMOVED debug probe (the
+  "0 native calls" was the probe being gone, not the call not firing). Verified
+  exhaustively with live probes: a PURE callee + all-const args FOLDS at compile
+  time (`caller(50)` -> a literal - optimal, no call at all); an impure caller
+  or a runtime arg still native-calls (50/50, proven); an impure CALLEE (a
+  global store) is correctly not native_leaf -> not native-called; and a
+  native_leaf rarely specializes at all (`leaf(i, 7)` const-arg propagation on a
+  small int body doesn't shrink it -> no clone -> the original is native-called).
+  So every const-arg shape is handled correctly. (Same "prove the code ran /
+  distrust a surprising result" lesson as [[template-compile-pollutes-next-
+  specialization]] - verify a null result with a LIVE probe before noting it.)
 
 ## Current state (all committed; HEAD = e3e111c "extract vm_frame_leave")
 
