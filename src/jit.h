@@ -173,6 +173,14 @@ extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
                               const EvalValue *val, int op) noexcept;
 
 /*
+ * model-flip (nativize-ops): MoveV natively - `slots[dst] = slots[src].get()`,
+ * the interpreter's EXACT MoveV (an alias-copy, ref-aware via LValue::put; never
+ * throws). A boxed slot copy needs the type-erased copy path, so it CALLS this
+ * helper (like the store ops) rather than inlining. `slots` is the frame base
+ * (rdi). One island op fewer; the enclosing run no longer splits at a MoveV. */
+extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept;
+
+/*
  * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
  * ReturnV runs IN the fragment. The fragment flushes its register cache and
  * calls this with the result value's frame slot; jit_ret reads that slot from
