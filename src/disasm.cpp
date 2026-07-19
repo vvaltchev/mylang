@@ -102,6 +102,19 @@ std::string opsym(Op op)
     return OpString[static_cast<int>(op)];
 }
 
+/* The bare enum NAME of an opcode (for the M1 container-plan blocker list -
+ * the full mnemonic lives in render_row's per-op switch; here the enum spelling
+ * is the clearest "what op is blocking nativization"). */
+const char *opcode_name(OpCode op)
+{
+#define ML_OPCODE_NAME(N) case OpCode::N: return #N;
+    switch (op) {
+    ML_FOR_EACH_OPCODE(ML_OPCODE_NAME)
+    default: return "?";
+    }
+#undef ML_OPCODE_NAME
+}
+
 /* The baked operator of a B1/B2 specialized arith op (bytecode.h). */
 const char *spec_arith_sym(OpCode op)
 {
@@ -636,7 +649,8 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
 }  // namespace
 
 std::string disassemble(const Chunk &chunk, const std::string &title,
-                        const std::vector<std::string> &cap_names)
+                        const std::vector<std::string> &cap_names,
+                        const JitCtx *jc)
 {
     std::ostringstream s;
     s << "; ===== " << title << "  (" << chunk.code.size() << " instr, "
@@ -678,6 +692,50 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
     if (chunk.native_leaf)
         s << "; native_leaf: whole body -> one fragment @+"
           << chunk.native_entry_off << "  (call-able; #55)\n";
+    /* plans/model-flip.md M1: the container plan - how this body partitions
+     * into NATIVE / ISLAND segments, and whether it could be ONE native
+     * container. For a mixed body, list each island's pc span + the distinct
+     * un-nativizable opcodes blocking it (the "what to nativize next" surface).
+     * DUMP-ONLY; no emission consumes it yet. */
+    {
+        const ContainerPlan plan = jit_container_plan(chunk, jc);
+        if (!plan.segs.empty()) {
+            /* A native_leaf is container-ready by definition; its own header
+             * line already says so, so only note READY for the interesting
+             * not-a-leaf-yet-ready case (below MIN_RUN, multi-run, or no
+             * trailing ReturnV - all things the flip WOULD nativize). */
+            if (plan.container_ready && !chunk.native_leaf)
+                s << "; container plan: READY - whole body native ("
+                  << plan.native_op_count << " ops, "
+                  << plan.segs.size() << " native run"
+                  << (plan.segs.size() == 1 ? "" : "s") << ")\n";
+            else if (!plan.container_ready) {
+                s << "; container plan: NOT ready - " << plan.island_count
+                  << " island" << (plan.island_count == 1 ? "" : "s") << " ("
+                  << plan.island_op_count << " island ops, "
+                  << plan.native_op_count << " native ops)\n";
+                for (const ContainerSeg &sg : plan.segs) {
+                    if (sg.native)
+                        continue;
+                    s << ";   island [pc " << sg.begin << ".." << sg.end
+                      << "):";
+                    /* distinct blocker opcodes, in first-seen order */
+                    std::vector<OpCode> seen;
+                    for (size_t p = sg.begin; p < sg.end; p++) {
+                        const OpCode op = chunk.code[p].op;
+                        bool have = false;
+                        for (OpCode q : seen)
+                            if (q == op) { have = true; break; }
+                        if (!have) {
+                            seen.push_back(op);
+                            s << " " << opcode_name(op);
+                        }
+                    }
+                    s << "\n";
+                }
+            }
+        }
+    }
     s << "\n";   /* separate the header block from the code */
 
     /* A capture slot as its field name (the anon capture-struct field), else
@@ -1501,7 +1559,13 @@ std::string disassemble_program(const Block *root)
             title = (cap_names.empty() ? "lambda#" : "closure#")
                     + std::to_string(anon++);
 
-        s << "\n" << disassemble(it->second, title, cap_names);
+        /* Same JitCtx Pass B used, so the M1 container plan counts a native
+         * CallV as native (a null jc would show it as an island). */
+        JitCtx djc;
+        djc.slot_desc = &slot_desc;
+        djc.slot_reassigned = &root->global_slot_reassigned;
+        djc.caller_desc = fn->desc;
+        s << "\n" << disassemble(it->second, title, cap_names, &djc);
     }
 
     for (const auto &sv : saved)   /* leave the descriptors as we found them */

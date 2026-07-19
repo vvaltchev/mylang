@@ -15451,6 +15451,71 @@ static bool vm_disasm_native_call()
 #endif
 }
 
+/* plans/model-flip.md M1: -vd surfaces the CONTAINER PLAN - how a body
+ * partitions into native/island segments and whether it could be ONE native
+ * container. A dict-building body is MIXED (interpreted islands) -> "NOT ready"
+ * + the blocking island(s); a tiny all-arith body is fully native-ELIGIBLE but
+ * below MIN_RUN so it is not a native_leaf today -> "READY" (the flip would
+ * nativize it). DUMP-ONLY; no emission consumes it yet. */
+static bool vm_disasm_container_plan()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;   /* JIT off: no container plan emitted */
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : {
+            "func add(int a, int b) => a + b;",
+            "func wc(words) {",
+            "  var d = {};",
+            "  foreach (w in words) d[w] = 1;",
+            "  return d;",
+            "}",
+            "print(add(runtime(2), 3));",
+            "print(wc([\"a\"]));" }) {
+        if (!src.empty())
+            src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    bool ok = false;
+    auto section = [](const std::string &d, const char *hdr) -> std::string {
+        const size_t p = d.find(hdr);
+        if (p == std::string::npos)
+            return "";
+        const size_t e = d.find("; =====", p + 20);
+        return d.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    };
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (b) {
+            const std::string d = disassemble_program(b);
+            /* wc: a MIXED body -> NOT ready + at least one island line. */
+            const std::string wc = section(d, "; ===== func wc");
+            const bool wc_ok =
+                wc.find("container plan: NOT ready") != std::string::npos
+                && wc.find("island [pc") != std::string::npos;
+            /* add: 2 ops (< MIN_RUN) so not a native_leaf, but fully
+             * native-eligible -> the READY line. */
+            const std::string add = section(d, "; ===== func add");
+            const bool add_ok =
+                add.find("container plan: READY") != std::string::npos;
+            ok = wc_ok && add_ok;
+        }
+    } catch (...) {
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 /* -vd (disassemble_program) dumps 100% of the SERIALIZABLE image, not just the
  * code of funcs: the program's custom TYPES (struct defs - name, POD layout,
  * field offsets, folded consts) and each chunk's POOLS (consts, catch_types,
@@ -15874,6 +15939,8 @@ static const std::vector<extra_check> extra_checks =
     { "vm: -vd shows native calls (enter.nat at the call site)",
       vm_disasm_native_call },
     { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },
+    { "vm: -vd container plan (model-flip M1 analysis)",
+      vm_disasm_container_plan },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
     { "vm: disasm closures + halt-drop", vm_disasm_closure_shape },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },

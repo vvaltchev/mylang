@@ -5113,7 +5113,30 @@ ones only). This is the audit surface for the `.myv` stored-bytecode endgame:
 everything a serialized file must hold is visible in the dump, and — now that
 `inline_ctxs` is flattened into the serializable `inline_frames` pool — a
 non-empty `node_table` is the ONE remaining section that says the AST can't yet
-be dropped for that chunk.
+be dropped for that chunk. Each chunk's header also shows its **CONTAINER PLAN**
+(model-flip M1, `jit_container_plan`, `jit.cpp`): how the body partitions into
+NATIVE vs ISLAND segments and whether it could be ONE native container —
+`READY` (every op native-ELIGIBLE, a looser bar than `native_leaf`: it counts a
+sub-`MIN_RUN` run the flip WOULD nativize) or `NOT ready` with each blocking
+island's pc span + its distinct un-nativizable opcodes (the "what to nativize
+next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
+`plans/model-flip.md`.
+
+**THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
+(`plans/model-flip.md`, M1 landed).** The endgame inversion of the JIT: flip
+"BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
+`EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
+ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
+un-nativizable regions become islands reached via `call vm_exec_block(from,to)`;
+the native code DRIVES, the interpreter is called only per-island (block-level
+dispatch, not per-op). This universalizes native `call <offset>` (not just leaf
+callees) and is the platform for the N7 unboxing arc. Milestones **M1**
+(container-plan analysis + `-vd`, no runtime change — LANDED) → M2
+(`vm_exec_block` island executor) → M3 (whole-function container, simplest mixed
+shape) → M4 (island-exit dispatch + branches) → M5 (native calls to EVERY
+function: the checked-return unwind + growable native stack) → M6
+(delete-originals / `.myv`-ready). Builds on `plans/native-call-impl.md` (v1
+native calls) and `plans/native-aot.md` (approach A, the fragment ABI).
 
 ## Invariants & hazards (defense in depth)
 
