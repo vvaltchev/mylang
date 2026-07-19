@@ -417,6 +417,70 @@ native only WITHIN a frame. It buys nothing on call overhead; it is the
 status quo, not a native call. The real native call is the `call <offset>`
 design above, gated on fully-native callee bodies.
 
+### #55 — the STAGED implementation (in progress)
+
+The design above is the target; this is the concrete, testable increment
+order. The JIT is ON BY DEFAULT, so EVERY increment must keep `-rt` (1395x2)
++ `tests/nested_fuzz.py` green; the `-nj` kill switch is the safety net, and a
+new op is JIT-eligible only once its native emission is differentially proven.
+
+**Design decisions (settled):**
+- **Activation reach:** a fragment needs the `VmActivation` to push the callee
+  window. Use a process global `g_current_act` set once at `vm_run` entry
+  (stable per activation — one activation per `vm_run`), NOT an ABI change to
+  `jit_enter` (rsi/rdi are already spoken for). A nested native call reuses the
+  same `g_current_act`.
+- **Callee address:** an INDIRECT `call` through the resolved callee's
+  `FuncDescriptor::vm_chunk->native.base + entry_off` — no cross-chunk patch
+  pass (compilation is per-chunk AOT; the callee's fragment may not exist when
+  the caller compiles). The callee is resolved at runtime anyway (a global
+  slot can be reassigned), so an indirect call is the natural shape.
+- **Frame setup/leave via C++ helpers first** (`jit_frame_setup` DONE —
+  vm.cpp; a `jit_frame_leave`): correct + simplest; nativize the hot fast path
+  only if the profile demands it (the design's guidance).
+- **Result via the caller's dst slot; status in the whole `rax`** (0 = normal,
+  non-0 = unwinding). Checked-return `test rax,rax; jnz <unwind>` after every
+  native `call`.
+
+**Increments:**
+1. **DONE — `vm_frame_setup`** (vm.cpp): the frame-setup core (arity, window
+   push, record, arg bind, capture switch), returns the callee window, no
+   chunk/pc switch. `vm_enter_call` = it + the switch. -rt green.
+2. **`g_current_act`** — set at `vm_run` entry / cleared on exit; the fragment
+   reads it for a native call.
+3. **The FULLY-NATIVE-BODY gate + entry offset.** A chunk qualifies iff its
+   WHOLE body is one deletable native run ending in `ReturnV` (so it is a
+   single `call`-able blob at a known offset). Record the entry offset on the
+   Chunk (or derive it: run 0's `frag_off`). `op_fully_native` must gain
+   `ReturnV` (and, for the recursive case, the native `CallV`).
+4. **Native `ReturnV`** (callee side): compute the return value into a reg,
+   call `jit_frame_leave(act, result_slot)` (pop window + write caller dst +
+   set chunk/pc to parent, the `vm_leave_call` body), then `ret` with `rax=0`.
+   A BOUNDARY frame keeps the `do_func_call` contract (flow=ret) — a native
+   ReturnV only fires for an in-VM frame, so gate on `!boundary` at compile
+   time (a boundary callee is entered from C++, never native-called).
+5. **Native `CallV`** (caller side), direct + fully-native callee only: flush
+   the N5 cache (call clobbers r10/r11), save the caller window (rdi) on the
+   C-stack, `mov rdi, jit_frame_setup(...)` (args already in the caller run),
+   `call [callee fragment addr]`, restore rdi, `test rax,rax; jnz <unwind>`,
+   reload the N5 cache. `dst` is written by the callee's `jit_frame_leave`.
+6. **The native UNWIND** (checked-return): on non-0 `rax`, the caller fragment
+   pops its own record (`jit_pop_frame` — frees `ref_slots`) and `ret`s `rax`
+   to ITS caller; a frame WITH a handler catches. This mirrors
+   `vm_unwind_walk` in machine code. Start WITHOUT native handlers (a fragment
+   with a try/catch is not fully-native → not native-called), so the only
+   unwind is propagate-to-boundary; the boundary (EnterNative / a C++ caller)
+   converts to `g_vm_exc_pending` as today.
+7. **Depth cap** at `jit_frame_setup` (already throws `StackOverflowEx` via
+   `push_window` — verify the loc-less throw path reaches the boundary).
+8. **Recursion** (`sumto`): once 4+5+6 hold for a leaf, a self-call is just a
+   native `CallV` to the same fragment — no new machinery. Differential-test
+   deep recursion + backtraces.
+
+Test at each step: `-rt`, `nested_fuzz.py` (tw==vm==cpython), the backtrace
+tests (a native-call chain must produce byte-identical frames), and a
+same-binary JIT off/on A/B on 08_func_call / 10_recursion once it lands.
+
 ## The endgame INVERSION: native CONTAINERS with bytecode islands
 
 Today's model is "BYTECODE with native ISLANDS" (a bytecode chunk, some runs
