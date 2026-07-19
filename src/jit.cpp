@@ -31,6 +31,7 @@
 #include "jit.h"
 #include "bytecode.h"
 #include "evalvalue.h"
+#include "funcdesc.h"   /* FuncDescriptor::vm_chunk (native-call gate, STEP 2.1) */
 
 #include <algorithm>
 #include <unordered_map>
@@ -109,6 +110,10 @@ struct JitLayout {
     unsigned char kind_ints, kind_floats;   /* Storage enum values */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
+    /* #55 STEP 2.1 native-call member offsets (via the vm.cpp probes) */
+    int desc_vm_chunk;    /* FuncDescriptor::vm_chunk */
+    int chunk_native_base;/* Chunk::native.base */
+    int chunk_native_entry;/* Chunk::native_entry_off */
 };
 
 /* Runtime-computed via public accessors (LValue mixes access specifiers,
@@ -161,6 +166,10 @@ static const JitLayout &jit_layout()
                 &static_cast<const Type *>(l.t_int)->t)
             - reinterpret_cast<const char *>(l.t_int));
         l.t_str_val = static_cast<int>(Type::t_str);
+        /* #55 STEP 2.1: native-call member offsets (vm.cpp probes) */
+        l.desc_vm_chunk = static_cast<int>(jit_off_desc_vm_chunk());
+        l.chunk_native_base = static_cast<int>(jit_off_chunk_native_base());
+        l.chunk_native_entry = static_cast<int>(jit_off_chunk_native_entry());
         return l;
     }();
     return L;
@@ -1143,7 +1152,7 @@ static void emit_dict_store(Emitter &e, const Instr &in, uint32_t pc)
 
 /* Emit one op; returns false if (unexpectedly) unhandled. */
 static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
-                    uint32_t pc)
+                    uint32_t pc, const JitCtx *jc)
 {
     switch (in.op) {
 
@@ -1375,6 +1384,52 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xC3);                                        /* ret (rax=sentinel)*/
         return true;
 
+    case OpCode::CallV: {
+        /* #55 STEP 2.1: a NATIVE direct call (the run builder included it only
+         * when callv_native_ok). Push the callee frame via jit_call_setup, then
+         * `call` the callee's fragment directly; the callee's native ReturnV
+         * (jit_ret) pops its window + writes OUR dst slot + rets a sentinel we
+         * IGNORE (a native_leaf never bails post-setup). A call run is NOT
+         * N5-cached (pick_cached_slots -> {}), so the args already sit in memory
+         * and no cache flush/reload is needed. This fragment (holding a CallV)
+         * is non-leaf, so it is only ever entered via jit_enter/EnterNative -
+         * a StackOverflow exit therefore returns to EnterNative, which raises
+         * g_vm_jit_exc. */
+        const JitLayout &L = jit_layout();
+        const FuncDescriptor *callee = (*jc->slot_desc)[in.target2];
+
+        emit_call_prologue(e);              /* push rdi (empty cache: aligned) */
+        /* jit_call_setup(callee_slot, argbase, nargs, dst, caller_desc, pc): */
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(RCX, static_cast<uint64_t>(in.target));
+        e.movabs_r8(reinterpret_cast<uint64_t>(jc->caller_desc));
+        e.movabs_r9(static_cast<uint64_t>(pc));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_call_setup) });
+        e.u8(0xE8); e.u32(0);               /* call jit_call_setup -> rax */
+        e.u8(0x48); e.u8(0x85); e.u8(0xC0); /* test rax, rax */
+        const size_t j_ok = e.j8(0x75);     /* jnz over_SO (rax != null) */
+        emit_call_epilogue(e);              /* SO: restore rdi, re-mat rsi/r8 */
+        e.exit_pc(pc);                      /* -> EnterNative raises g_vm_jit_exc*/
+        e.patch8(j_ok, e.pos());            /* over_SO: */
+        e.mov_rr(RDI, RAX);                 /* rdi = callee window slots */
+        /* fragment entry = callee->vm_chunk->native.base + native_entry_off: */
+        e.movabs(RAX, reinterpret_cast<uint64_t>(callee));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x80); /* mov rax, [rax + desc.vm_chunk] */
+        e.u32(static_cast<uint32_t>(L.desc_vm_chunk));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88); /* mov rcx, [rax + chunk.native.base]*/
+        e.u32(static_cast<uint32_t>(L.chunk_native_base));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x90); /* mov rdx, [rax + native_entry_off]*/
+        e.u32(static_cast<uint32_t>(L.chunk_native_entry));
+        e.u8(0x48); e.u8(0x01); e.u8(0xD1); /* add rcx, rdx */
+        e.u8(0xFF); e.u8(0xD1);             /* call rcx (the callee fragment) */
+        emit_call_epilogue(e);              /* restore rdi, re-mat rsi/r8 */
+        return true;
+    }
+
     default:
         return false;
     }
@@ -1533,6 +1588,52 @@ static bool op_fully_native(OpCode op)
     }
 }
 
+/* #55 STEP 2.1: is THIS CallV a native-callable direct call? A COMPILE-TIME
+ * gate (never a runtime bail): a plain CallV (not CachedCallV) to a WRITE-ONCE
+ * global-slot function whose body is a `native_leaf`, from a FUNCTION caller
+ * (caller_desc != null - main has no stable descriptor, so no native call from
+ * main in v1). Needs the program context `jc`; null jc (disasm / -rt) -> no.
+ * NOT op_fully_native (StackOverflow exit), so a run holding it is
+ * non-deletable - the interpreted CallV survives, dead. */
+static bool callv_native_ok(const Instr &in, const JitCtx *jc)
+{
+    if (!jc || !jc->caller_desc || in.op != OpCode::CallV)
+        return false;
+    if (!jc->slot_desc || !jc->slot_reassigned)
+        return false;
+    const int slot = in.target2;
+    if (slot < 0 || static_cast<size_t>(slot) >= jc->slot_desc->size()
+            || static_cast<size_t>(slot) >= jc->slot_reassigned->size())
+        return false;
+    if ((*jc->slot_reassigned)[slot])          /* not write-once */
+        return false;
+    const FuncDescriptor *callee = (*jc->slot_desc)[slot];
+    if (!callee || !callee->vm_chunk)
+        return false;
+    return static_cast<const Chunk *>(callee->vm_chunk)->native_leaf;
+}
+
+/* An op that can be part of a native RUN: a plain eligible op, OR a CallV the
+ * STEP-2.1 gate accepts (native call). */
+static bool op_run_eligible(const Instr &in, const JitCtx *jc)
+{
+    return jit_op_eligible(in) || callv_native_ok(in, jc);
+}
+
+/* Does the run [begin,end) contain a native CallV? Such a run is worth a
+ * fragment even below MIN_RUN: the boxed arg-setup MoveVs split a call loop
+ * into short eligible runs, and the call's dispatch-removal is the whole point
+ * (MIN_RUN exists to avoid EnterNative overhead for a tiny ARITH run, not a
+ * call). */
+static bool run_has_native_call(const std::vector<Instr> &code, size_t begin,
+                                size_t end, const JitCtx *jc)
+{
+    for (size_t pc = begin; pc < end; pc++)
+        if (callv_native_ok(code[pc], jc))
+            return true;
+    return false;
+}
+
 /* The pc TARGET of a branch-family op (the audited list that the nc rebuild
  * remaps), or -1. Used by the single-entry check. */
 static int branch_pc_target(const Instr &in)
@@ -1574,7 +1675,7 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk)
     return true;
 }
 
-void jit_compile_chunk(Chunk &chunk)
+void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
     if (!g_jit_enabled || chunk.code.empty())
         return;
@@ -1591,11 +1692,12 @@ void jit_compile_chunk(Chunk &chunk)
     std::vector<Run> runs;
     size_t i = 0;
     while (i < n) {
-        if (!jit_op_eligible(chunk.code[i])) { i++; continue; }
+        if (!op_run_eligible(chunk.code[i], jc)) { i++; continue; }
         size_t j = i + 1;
-        while (j < n && jit_op_eligible(chunk.code[j]))
+        while (j < n && op_run_eligible(chunk.code[j], jc))
             j++;
-        if (j - i >= MIN_RUN)
+        if (j - i >= MIN_RUN
+                || run_has_native_call(chunk.code, i, j, jc))
             runs.push_back({i, j});
         i = j;
     }
@@ -1694,7 +1796,7 @@ void jit_compile_chunk(Chunk &chunk)
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
                             begin, end, remap, fixups);
             } else if (!emit_op(e, chunk, in,
-                                static_cast<uint32_t>(remap[pc]))) {
+                                static_cast<uint32_t>(remap[pc]), jc)) {
                 e.b.clear();
                 return;                    /* selection bug: give up */
             }
@@ -1833,7 +1935,7 @@ void jit_compile_chunk(Chunk &chunk)
 
 #else   /* !ML_JIT_SUPPORTED */
 
-void jit_compile_chunk(Chunk &)
+void jit_compile_chunk(Chunk &, const JitCtx *)
 {
 }
 

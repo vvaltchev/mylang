@@ -1497,12 +1497,32 @@ vm_precompile_all(const Block *root)
         fn->desc->fast_bind = fast;
     }
 
-    /* Pass B: JIT every compiled body. Order-independent (all flags set in
-     * Pass A; a caller bakes the callee DESCRIPTOR and loads its native entry
-     * at RUNTIME, by when every body is compiled). Main is jit'd by vm_compile
-     * after this, for the same reason. */
-    for (auto &kv : g_func_chunks)
-        jit_compile_chunk(kv.second);
+    /* #55 STEP 2.1: the global slot -> callee FuncDescriptor* map, so a
+     * caller's native-call gate can resolve + bake a callee. Only a function
+     * bound to a global slot is a native-call target; every other slot stays
+     * null (not native-callable). Sized like the global table. */
+    std::vector<const FuncDescriptor *> slot_desc(
+        root->global_func_names.size(), nullptr);
+    for (const FuncDeclStmt *fn : funcs)
+        if (fn->id && fn->id->sym.kind == SymKind::global) {
+            const int slot = fn->id->sym.slot;
+            if (slot >= 0 && static_cast<size_t>(slot) < slot_desc.size())
+                slot_desc[slot] = fn->desc;
+        }
+
+    /* Pass B: JIT every compiled body, each with its own JitCtx (caller_desc =
+     * the descriptor keying its chunk). Order-independent (all native_leaf
+     * flags set in Pass A; a caller bakes the callee DESCRIPTOR and loads its
+     * native entry at RUNTIME, by when every body is jit'd). Main is jit'd by
+     * vm_compile after this (with no JitCtx -> no native call from main in v1,
+     * since main has no stable descriptor for the record's ret_chunk). */
+    for (auto &kv : g_func_chunks) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &root->global_slot_reassigned;
+        jc.caller_desc = kv.first;
+        jit_compile_chunk(kv.second, &jc);
+    }
 }
 
 /* The in-flight exception's type NAME for catch-matching (a user struct
@@ -2132,6 +2152,64 @@ extern "C" size_t jit_ret(int_type res_slot) noexcept
     }
     vm_frame_leave(act, ctx, std::move(res));
     return JIT_RET_SENTINEL;
+}
+
+/* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
+unsigned long g_jit_native_calls = 0;
+
+/* #55 STEP 2.1: member offsets the native-call emitter bakes. Measured via a
+ * probe object (no offsetof-on-non-standard-layout warning); both types are
+ * default-constructible and cheap (a Chunk's NativeCode dtor is a no-op when
+ * base is null, which it is here). */
+ptrdiff_t jit_off_desc_vm_chunk()
+{
+    FuncDescriptor fd;
+    return reinterpret_cast<const char *>(&fd.vm_chunk)
+         - reinterpret_cast<const char *>(&fd);
+}
+ptrdiff_t jit_off_chunk_native_base()
+{
+    Chunk ck;
+    return reinterpret_cast<const char *>(&ck.native.base)
+         - reinterpret_cast<const char *>(&ck);
+}
+ptrdiff_t jit_off_chunk_native_entry()
+{
+    Chunk ck;
+    return reinterpret_cast<const char *>(&ck.native_entry_off)
+         - reinterpret_cast<const char *>(&ck);
+}
+
+/*
+ * #55 STEP 2.1: push the callee frame for a NATIVE CallV (see jit.h). The gate
+ * proved the callee slot is write-once + holds a native_leaf FuncObject, so the
+ * resolve can't miss; vm_frame_setup binds the args from the caller window at
+ * [argbase, argbase+nargs) and sets the record's ret_chunk/ret_pc (backtrace).
+ * Returns the callee window slots (the caller loads rdi from it, then `call`s
+ * the callee fragment). Any RuntimeException (StackOverflow at push, or a bind
+ * coercion the gate didn't exclude) is caught -> g_vm_jit_exc + null return; the
+ * caller exits to callv_pc and EnterNative re-raises with the call-site caret.
+ */
+extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
+                                  size_t nargs, int_type dst,
+                                  const FuncDescriptor *caller_desc,
+                                  size_t callv_pc) noexcept
+{
+    g_jit_native_calls++;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    FuncObject &fo = *ctx.gfuncs->slots[callee_slot].get()
+                          .get<intrusive_ptr<FuncObject>>().get();
+    try {
+        Frame *w = vm_frame_setup(
+            act, ctx, static_cast<const Chunk *>(caller_desc->vm_chunk),
+            callv_pc, fo, static_cast<const Chunk *>(fo.func->vm_chunk),
+            argbase, nargs, dst, nullptr);
+        return w->slots;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return nullptr;
+    }
 }
 
 /* The interpreter's ReturnV/Halt: the leave core + the chunk/pc SWITCH back to
