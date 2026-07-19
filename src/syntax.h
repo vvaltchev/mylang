@@ -1223,6 +1223,18 @@ public:
     std::vector<const UniqueId *> global_func_names;
 
     /*
+     * Parallel to global_func_names (by GLOBAL-table slot): 1 iff that slot is
+     * ever an assignment target AFTER its declaration (a function/global
+     * REASSIGNED - `f = g`), i.e. NOT write-once. The resolver fills it. The
+     * native-call JIT (#55) reads it: a direct call may lower to a native
+     * `call` only when its callee slot is write-once (the callee identity is
+     * then compile-time-fixed); a reassigned (dynamically-typed) callee stays
+     * interpreted in v1 (native in v3 via a runtime type check). Empty == none
+     * reassigned (or not the root block).
+     */
+    std::vector<char> global_slot_reassigned;
+
+    /*
      * Set by the resolver when every declaration in this block is a frame slot
      * (no map-bound decl: no capture, no nested-func name, no slot-budget
      * overflow). Such a block never touches the EvalContext map, so do_eval can
@@ -1242,6 +1254,7 @@ public:
         c->slot_start = slot_start;
         c->slot_count = slot_count;
         c->global_func_names = global_func_names;
+        c->global_slot_reassigned = global_slot_reassigned;
         c->scope_free = scope_free;
         return c;
     }

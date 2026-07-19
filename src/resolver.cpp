@@ -11,6 +11,7 @@
 #include <functional>
 #include <unordered_set>
 #include <unordered_map>
+#include <set>
 #include <vector>
 #include <deque>
 #include <string>
@@ -1174,9 +1175,16 @@ public:
         }
 
         /* Publish the global table's slot->name list to the root block, which
-         * sizes the runtime GlobalFuncTable and lets globals() enumerate it. */
-        if (auto *rb = dynamic_cast<Block *>(root))
+         * sizes the runtime GlobalFuncTable and lets globals() enumerate it;
+         * plus the write-once map (reassigned slots) for the native-call gate
+         * (#55): 1 == slot reassigned (NOT write-once). */
+        if (auto *rb = dynamic_cast<Block *>(root)) {
             rb->global_func_names = global_names;
+            rb->global_slot_reassigned.assign(global_names.size(), 0);
+            for (int s : reassigned_globals)
+                if (s >= 0 && s < static_cast<int>(global_names.size()))
+                    rb->global_slot_reassigned[static_cast<size_t>(s)] = 1;
+        }
 
         /* Promote write-once scalar vars to constants and fold (uses the write
          * counts just collected; the top-level frame's in main_st.writes).
@@ -1191,6 +1199,10 @@ private:
      * function's locals): a top-level VARIABLE among them gets a global-table
      * slot (so the function reads it as an O(1) slot, not a map walk). */
     std::unordered_set<const UniqueId *> escaped;
+    /* GLOBAL-table slots ever REASSIGNED (`f = g` after the decl) - i.e. NOT
+     * write-once. Filled by count_write; published to the root block's
+     * global_slot_reassigned for the native-call write-once gate (#55). */
+    std::set<int> reassigned_globals;
     /* The function-side USE sites of those escaped names (recorded while a
      * function body is resolved in pass 1, before the top-level pass has
      * assigned global slots). After pass 2, each is stamped SymKind::global if
@@ -1486,19 +1498,27 @@ private:
     /* Count an assignment to a resolved-local lvalue as a write of its slot. */
     void count_write(FuncState *cur, Construct *lvalue)
     {
-        if (!cur || !cur->slottable)
-            return;
-
-        auto bump = [&](Identifier *id) {
-            if (id && id->sym.kind == SymKind::local)
+        /* A write to a GLOBAL-table slot (a function/global REASSIGNED - the
+         * only writes to a global slot besides its decl, which never reaches
+         * here) makes it NOT write-once: recorded UNCONDITIONALLY (not gated
+         * on `cur->slottable`, so a reassign in any scope counts) for the
+         * native-call write-once gate (#55). A LOCAL write is counted into the
+         * frame's per-slot table (auto-const), which needs a slottable frame. */
+        auto note = [&](Identifier *id) {
+            if (!id)
+                return;
+            if (id->sym.kind == SymKind::global)
+                reassigned_globals.insert(id->sym.slot);
+            else if (id->sym.kind == SymKind::local
+                     && cur && cur->slottable)
                 cur->writes[id->sym.slot]++;
         };
 
         if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
-            bump(id);
+            note(id);
         } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
             for (auto &id : il->elems) {
-                bump(id.get());
+                note(id.get());
             }
         }
     }
