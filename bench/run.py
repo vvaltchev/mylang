@@ -14,10 +14,13 @@
 # Each bench runs at its per-bench scale from bench/scales.txt (a short/noisy
 # bench can be made reliable by raising ITS scale - see bench/tune_scales.py),
 # with an ADAPTIVE rep count: 3 reps, and if the min isn't stable (the 2-fastest
-# gap exceeds --var-threshold) escalate 3 -> 5 -> 8 -> 13 -> 21; still noisy at
-# 21 -> ABORT (that bench is genuinely unstable and needs a bigger scale). The
-# 13/21 tail rides out a transient scheduling burst so a well-scaled bench isn't
-# falsely aborted (see REP_STEPS). The reported time is always the MIN.
+# gap exceeds --var-threshold) escalate 3 -> 5 -> 8 -> 13 -> 21. Needing more
+# reps to settle is NOT a problem (more best-of samples) and is not reported;
+# only a bench whose variance is STILL over the threshold at 21 is flagged
+# (NOISY + a closing WARNING - its min is unreliable) - it does NOT abort the
+# run, so a full suite always completes. The 13/21 tail rides out a transient
+# scheduling burst so a well-scaled bench isn't falsely flagged (see REP_STEPS).
+# The reported time is always the MIN.
 # We also best-effort raise our scheduling priority (nice) to cut preemption
 # noise - all languages benefit equally since they run as our children.
 #
@@ -25,9 +28,9 @@
 # 52_cse_dedup is const-folded to a ~2ms loop no scale can grow), so the min is
 # always short enough to be jittery at 3 reps. Such a bench gets a per-bench
 # STARTING rep count in bench/reps.txt (name reps) - its adaptive schedule
-# begins there (then still escalates +2/+3), and the "needed extra reps" note is
-# measured against ITS baseline, so a bench that settles AT its baseline doesn't
-# warn. PREFER SCALE; reps.txt is only for the genuinely scale-immune benches.
+# begins there (then still escalates +2/+3), giving its min more best-of samples
+# from the start so it settles without ever tripping the variance WARNING.
+# PREFER SCALE; reps.txt is only for the genuinely scale-immune benches.
 #
 # Usage:
 #   python3 bench/run.py                 # everything, per-bench scales
@@ -339,21 +342,22 @@ def bench_variance(times):
 # Dynamic rep schedule: start with 3, and if the variance gate isn't met, add
 # more reps (NOT more scale - sampling noise shrinks with reps, not workload
 # size) in growing steps. A stable bench stops at 3 (cheap); only a noisy one
-# pays for more; if it's STILL over threshold at the LAST step it is genuinely
-# unstable - give up (ABORT). `--repeat N` overrides this with a fixed N.
+# pays for more. Needing more reps to settle is NORMAL (more best-of samples,
+# not a problem) and is not reported; a bench STILL over threshold at the LAST
+# step is genuinely unreliable and is FLAGGED (NOISY on its row + a closing
+# WARNING), but it does NOT abort the run - the min is kept and the suite
+# always completes. `--repeat N` overrides this with a fixed N.
 #
 # The common case is unchanged: 3 -> 5 -> 8. The two ADDED steps (-> 13 -> 21)
-# are a RESILIENCE tail against a false-positive abort. On a noisy box a
+# are a RESILIENCE tail against a false-positive flag. On a noisy box a
 # transient scheduling burst can make a WELL-SCALED bench miss the gate at 8
 # reps (its 2 fastest of 8 happen to straddle a spike) - and across a 76-bench
 # suite that near-miss lands on SOME random bench most runs (even ~1% per-bench
-# abort odds compound to ~1-0.99^76 ~= 50%+ suite-wide). The abort is meant to
-# flag a GENUINELY under-scaled bench, not a momentary burst, so we ride the
-# burst out with two more best-of steps before giving up: a bench that still
-# can't converge over 21 best-of samples really is unstable and needs a scale
-# bump. A settled bench never reaches them, so this only costs time on a bench
-# that was about to abort anyway. This is what lets a full `run.py` complete
-# reliably instead of aborting on a random short bench (see bench/README.md).
+# odds compound to ~1-0.99^76 ~= 50%+ suite-wide). The flag is meant to catch a
+# GENUINELY under-scaled bench, not a momentary burst, so we ride the burst out
+# with two more best-of steps: a bench that still can't converge over 21 best-of
+# samples really is unstable and wants a scale bump. A settled bench never
+# reaches them, so this only costs time on a bench that is genuinely noisy.
 REP_STEPS = (3, 2, 3, 5, 8)   # cumulative: 3, 5, 8, 13, 21
 # Reps for the comparison language when (re)populating its cache. It has no
 # variance gate (we don't optimize it) - a fixed best-of-N min is plenty, and
@@ -365,7 +369,8 @@ def measure_adaptive(cmd, threshold, timeout, min_reps=REP_STEPS[0]):
     """Time `cmd` with the growing rep schedule until the 2-fastest-gap
     variance clears `threshold`. Returns (best_time, stdout, error_or_None,
     n_reps, variance). error_or_None is a 'variance ...' string if it never
-    settled (the caller gives up / aborts), or a run error.
+    settled (the caller keeps the min + FLAGS it as NOISY, not aborts), or a
+    run error.
 
     The schedule STARTS at `min_reps` (default the global REP_STEPS[0]=3) and
     then escalates by the usual REP_STEPS increments (+2, +3). So the default
@@ -593,11 +598,12 @@ def main():
                          "start at 3 reps, add more only if the variance gate "
                          "isn't met.")
     ap.add_argument("--var-threshold", type=float, default=0.05,
-                    help="max acceptable (2nd-min - min)/min per bench; if a "
-                         "bench is still over it after 8 reps, the run ABORTS "
-                         "(the bench needs a bigger table scale - run "
-                         "tune_scales.py). Default 0.05 = 5%% (a pre-pooled-"
-                         "allocator floor; tighten after the pooled-alloc TODO)")
+                    help="max acceptable (2nd-min - min)/min per bench; a "
+                         "bench still over it after the last rep step is "
+                         "FLAGGED (NOISY + a closing WARNING - its min is "
+                         "unreliable), not aborted. Fix by bumping its table "
+                         "scale (run tune_scales.py). Default 0.05 = 5%% (a "
+                         "pre-pooled-allocator floor; tighten after pooled-alloc)")
     ap.add_argument("--filter", default="",
                     help="only run benchmarks whose name contains this substring "
                          "(comma-separated to match any of several)")
@@ -807,9 +813,10 @@ def main():
     rows = []
     ratios = []
     speedups = []
-    noisy = []        # (name, reps, variance) - needed >3 reps to settle; note
-    noisy_unsettled = []   # (name, reps, variance) - STILL over the gate at the
-                           # last rep step (kept the min + continued, not abort)
+    noisy_unsettled = []   # (name, reps, variance) - variance STILL over the
+                           # threshold at the LAST rep step (result unreliable;
+                           # kept the min + continued, not abort). Needing more
+                           # reps that DO settle is fine and is NOT flagged.
     for name in names:
         my_path = os.path.join(MY_DIR, name + ".my")
 
@@ -824,14 +831,14 @@ def main():
         scale_arg = str(scale)
         my_cmd = [mylang] + eng + [my_path, scale_arg]
 
-        # Measure the PRIMARY binary: adaptive reps (3 -> 5 -> 8) until the
-        # variance gate is met, or --repeat N for a fixed count. If it never
-        # settles (still noisy at 8 reps), ABORT - the bench needs a bigger
-        # table scale (run tune_scales.py). base + python then run the SAME rep
-        # count at the SAME scale, so the A/B / ratio stay comparable.
-        # A per-bench reps.txt baseline (default 3) is where the adaptive
-        # schedule STARTS; the "needed extra reps" note fires only when a bench
-        # escalates PAST its own baseline.
+        # Measure the PRIMARY binary: adaptive reps until the variance gate is
+        # met (or --repeat N for a fixed count). Needing more reps to settle is
+        # NOT a problem - it just buys more best-of samples - so it is not
+        # flagged; ONLY a bench whose variance never clears the threshold, even
+        # at the LAST rep step, is surfaced (kept-min + a NOISY flag, below).
+        # base + python then run the SAME rep count at the SAME scale, so the
+        # A/B / ratio stay comparable. A per-bench reps.txt baseline (default 3)
+        # is where the adaptive schedule STARTS.
         base_reps = min_reps_map[name]
         if args.repeat > 0:
             my_t, my_out, my_err, n_reps, my_v = measure_fixed(
@@ -845,14 +852,14 @@ def main():
         # see REP_STEPS). Instead we KEEP its min (already the best-of-21), flag
         # it, and CONTINUE - so a full run always completes. A genuinely
         # under-scaled bench is still surfaced, loudly, in the closing report.
-        unsettled = False
-        if my_err and my_err.startswith("variance"):
-            unsettled = True
+        # Unsettled = the variance is STILL over the threshold after the last
+        # rep step: the result is genuinely unreliable, so keep the min, flag
+        # it, and continue (don't abort). Settling within more reps is fine and
+        # is NOT flagged.
+        unsettled = bool(my_err) and my_err.startswith("variance")
+        if unsettled:
             my_err = None          # keep the min; treat as a (noisy) result
-            noisy.append((name, n_reps, my_v))
             noisy_unsettled.append((name, n_reps, my_v))
-        elif n_reps > base_reps:
-            noisy.append((name, n_reps, my_v))
 
         base_t = None
         if has_base:
@@ -886,8 +893,6 @@ def main():
             status = "DIFF: my=%r %s=%r" % (my_out, lobj.name, py_out)
         if unsettled:
             status += " NOISY[%dr]" % n_reps   # never cleared gate; min kept
-        elif n_reps > base_reps:
-            status += " [%dr]" % n_reps        # needed extra reps to settle
 
         my_s = "%.3f" % my_t if my_t is not None else "-"
         py_s = "%.3f" % py_t if py_t is not None else "-"
@@ -941,23 +946,17 @@ def main():
         print("geomean cur/base over %d benchmarks: %s (%s)"
               % (len(speedups), sp, tail))
 
-    if noisy:
-        print("\nNOTE: %d bench(es) needed extra reps (past their baseline) to "
-              "clear the %.1f%% variance gate - a bit noisy at their current "
-              "scale; if it recurs, raise their scale in bench/scales.txt "
-              "(tune_scales.py), or their reps baseline in bench/reps.txt:"
-              % (len(noisy), args.var_threshold * 100))
-        for name, reps, v in noisy:
-            tag = "  UNSETTLED" if (name, reps, v) in noisy_unsettled else ""
-            print("  %-24s %d reps (base %d), var %.1f%%%s"
-                  % (name, reps, min_reps_map[name], v * 100, tag))
-
+    # The ONLY volatility warning: a bench whose variance is STILL over the
+    # threshold after the LAST rep step - the min can't be trusted. Needing more
+    # (but bounded) reps to settle is normal and is NOT reported: more reps just
+    # means more best-of samples, not a problem. A recurring entry here wants a
+    # bigger scale (tune_scales.py) or reps baseline (bench/reps.txt).
     if noisy_unsettled:
-        print("\nWARNING: %d bench(es) never cleared the %.1f%% gate even at "
-              "the last rep step (kept the min, did NOT abort the run). A "
-              "transient scheduling burst can do this to a well-scaled bench; "
-              "if a bench recurs here, raise its scale in bench/scales.txt "
-              "(tune_scales.py) or its reps baseline in bench/reps.txt:"
+        print("\nWARNING: %d bench(es) still exceeded the %.1f%% variance gate "
+              "after the last rep step - their result is UNRELIABLE (kept the "
+              "min, did NOT abort the run). Raise the bench's scale in "
+              "bench/scales.txt (tune_scales.py) or its reps baseline in "
+              "bench/reps.txt:"
               % (len(noisy_unsettled), args.var_threshold * 100))
         for name, reps, v in noisy_unsettled:
             print("  %-24s %d reps, var %.1f%%" % (name, reps, v * 100))
