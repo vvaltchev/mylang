@@ -562,7 +562,16 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval,
         throw TypeErrorEx("Expected integer as subscript");
 
     const EvalValue &what = RValue(what_lval);
-    SharedArrayObj &&arr = what.get<SharedArrayObj>();
+    /*
+     * BORROW the array handle (get_ref, NOT get). `what` is const, so a
+     * get<SharedArrayObj>() would call the by-VALUE const overload and COPY the
+     * handle - an intrusive_ptr retain + later release on EVERY general/flat
+     * subscript READ (measured ~2.8% of a dict-word-count loop: the base array
+     * is re-read per iteration). `arr` is only READ here; the one mutable path
+     * (the LValue-array element back-pointer below) re-derives the array
+     * through the base LValue*, which is a ref, not a copy.
+     */
+    const SharedArrayObj &arr = what.get_ref<SharedArrayObj>();
     int_type idx = idx_val.get<int_type>();
 
     if (idx < 0)
@@ -594,20 +603,23 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval,
     if (arr.skind() != SharedArrayObj::Storage::general)
         return arr_elem_at(arr, idx);
 
-    SharedArrayObj::vec_type &vec = arr.get_vec();
-    LValue *ret = &vec[arr.offset() + idx];
-
     if (!what_lval.is<LValue *>() || arr.is_readonly()) {
         /*
          * Return a simple RValue when the input array was not an LValue, or
          * when it is read-only (a `const` value): a read still works, but an
          * assignment target is an rvalue, so `a[i] = x` fails with NotLValueEx.
+         * const get_vec() - no handle copy (arr is borrowed).
          */
-        return ret->get();
+        return arr.get_vec()[arr.offset() + idx].get();
     }
 
-    /* We deferenced a LValue array, so return element's LValue */
-    ret->container = what_lval.get<LValue *>();
+    /* We dereferenced an LValue array, so return the element's LValue with its
+     * container back-pointer. Get the MUTABLE vec through the base LValue* (a
+     * ref, not a handle copy - the array is already general, so no promote). */
+    LValue *base = what_lval.get<LValue *>();
+    SharedArrayObj::vec_type &vec = base->getval<SharedArrayObj>().get_vec();
+    LValue *ret = &vec[arr.offset() + idx];
+    ret->container = base;
     ret->container_idx = arr.offset() + idx;
     return ret;
 }
@@ -617,7 +629,10 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
                          const EvalValue &end_val)
 {
     const EvalValue &what = RValue(what_lval);
-    const SharedArrayObj &arr = what.get<SharedArrayObj>();
+    /* Borrow (get_ref), not copy: `arr` is only read (size/offset) and the
+     * slice-view ctor below does its OWN shobj retain, so the extra handle
+     * copy a by-value get<> makes is pure churn. */
+    const SharedArrayObj &arr = what.get_ref<SharedArrayObj>();
     int_type start = 0, end = arr.size();
 
     if (start_val.is<int_type>()) {

@@ -72,6 +72,19 @@ Total 592.4M Ir. Top:
 5. **intrusive_ptr retain/release churn.** Shows as `TypeImpl<T>::{copy_ctor,
    dtor}` (~3% in dict). Reduce copies of reference EvalValues on hot paths
    (borrow-by-ref where a copy is currently made). Case-by-case.
+   **IN PROGRESS 2026-07-20:** `TypeArr::subscript` + `TypeArr::slice` bound
+   `const SharedArrayObj &arr = what.get<SharedArrayObj>()` - `what` is const, so
+   `get<>()`'s by-VALUE const overload COPIED the array handle (retain+release)
+   on EVERY general-array index/slice. Changed to `get_ref<>()` (borrow); the one
+   mutable path (an LValue-array element's back-pointer) re-derives the mutable
+   vec through the base LValue* (a ref, no copy). Measured (callgrind Ir):
+   62_dict_word_count -2.31%, 47_wordcount -1.85%, 15_array_slice_readonly
+   -1.21%, 16_array_slice_write -1.13%; flat arrays + string slices neutral
+   (flat reads use native LoadElem*, string slice is TypeStr::slice). -rt
+   1566/1566 + differential 1403/1403, nested_fuzz. STILL TODO here: the
+   const-RHS string ops (`b.get<SharedStr>().get_view()` in eq/lt/gt/add copies
+   b's handle - ~16M in the dict-key compares), and vm_store_base's dict-store
+   base copy.
 
 ## ===== STATUS: callback re-entry DONE 2026-07-20 (a + b landed) =====
 Both steps landed and measured (callgrind whole-program Ir, scale 1, vs the
