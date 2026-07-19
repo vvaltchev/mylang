@@ -33,7 +33,7 @@ private:
          */
         mutable size_t hash_cache = 0;
         mutable bool hash_valid = false;
-        StrObj(inner_type &&str) : s(move(str)) { }
+        StrObj(inner_type &&str) : s(std::move(str)) { }
     };
 
     intrusive_ptr<StrObj> obj;
@@ -52,7 +52,7 @@ public:
     SharedStr(const inner_type &s) = delete;
 
     SharedStr(inner_type &&s)
-        : obj(make_intrusive<StrObj>(move(s)))
+        : obj(make_intrusive<StrObj>(std::move(s)))
         , off(0)
         , len(obj->s.size())
         , slice(false)

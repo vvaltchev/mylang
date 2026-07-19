@@ -438,7 +438,7 @@ public:
 
     LiteralStr(const std::string_view &v);
     LiteralStr(const EvalValue &v) : value(v) { }
-    LiteralStr(EvalValue &&v) : value(move(v)) { }
+    LiteralStr(EvalValue &&v) : value(std::move(v)) { }
 
     const EvalValue &strval() const { return value; }
 
@@ -511,7 +511,7 @@ public:
         , immutable(immutable) { }
     LiteralObj(EvalValue &&v, bool immutable = false)
         : Construct("LiteralObj", true)
-        , value(move(v))
+        , value(std::move(v))
         , immutable(immutable) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1468,7 +1468,7 @@ public:
     StructTypeDef *def = nullptr;
 
     void set_def(unique_ptr<StructTypeDef> d) {
-        def_owner = move(d);
+        def_owner = std::move(d);
         def = def_owner.get();
     }
 
@@ -1564,7 +1564,7 @@ public:
             AllowedExList ael;
             ael.exList = clone_as(cs.first.exList);
             ael.asId = clone_as(cs.first.asId);
-            c->catchStmts.emplace_back(move(ael), clone_as(cs.second));
+            c->catchStmts.emplace_back(std::move(ael), clone_as(cs.second));
         }
         return c;
     }

@@ -309,8 +309,8 @@ EvalValue builtin_globals(EvalContext *ctx, const ArgLocs *exprList,
     SharedArrayObj::vec_type vec;
     vec.reserve(names.size());
     for (std::string &n : names)
-        vec.emplace_back(SharedStr(move(n)), false);
-    return SharedArrayObj(move(vec));
+        vec.emplace_back(SharedStr(std::move(n)), false);
+    return SharedArrayObj(std::move(vec));
 }
 
 /*
@@ -386,7 +386,7 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
     lo->fields.emplace_back(EvalValue(static_cast<int_type>(qdef->align)),
                             false);
     lo->fields.emplace_back(EvalValue(qdef->is_pod()), false);
-    lo->fields.emplace_back(EvalValue(SharedArrayObj(move(fieldvec))), false);
+    lo->fields.emplace_back(EvalValue(SharedArrayObj(std::move(fieldvec))), false);
     return EvalValue(intrusive_ptr<StructObject>(lo));
 }
 
@@ -462,8 +462,8 @@ EvalValue builtin_specializations(EvalContext *ctx, const ArgLocs *exprList,
     SharedArrayObj::vec_type vec;
     vec.reserve(out.size());
     for (std::string &n : out)
-        vec.emplace_back(SharedStr(move(n)), false);
-    return SharedArrayObj(move(vec));
+        vec.emplace_back(SharedStr(std::move(n)), false);
+    return SharedArrayObj(std::move(vec));
 }
 
 /*
@@ -548,6 +548,6 @@ EvalValue builtin_tracing(EvalContext *ctx, const ArgLocs *exprList,
     SharedArrayObj::vec_type vec;
     vec.reserve(active.size());
     for (std::string &n : active)
-        vec.emplace_back(SharedStr(move(n)), false);
-    return SharedArrayObj(move(vec));
+        vec.emplace_back(SharedStr(std::move(n)), false);
+    return SharedArrayObj(std::move(vec));
 }

@@ -119,7 +119,7 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
             const EvalValue &kv = DICT_ELEM(e);
             v.push_back(kv.get<int_type>());
         }
-        return SharedArrayObj(move(v));
+        return SharedArrayObj(std::move(v));
     }
     if (hint == ArrHint::flat_f) {
         SharedArrayObj::fvec_type v;
@@ -128,7 +128,7 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
             const EvalValue &kv = DICT_ELEM(e);
             v.push_back(kv.get<float_type>());
         }
-        return SharedArrayObj(move(v));
+        return SharedArrayObj(std::move(v));
     }
     if (hint == ArrHint::flat_b) {
         SharedArrayObj::bvec_type v;
@@ -137,7 +137,7 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
             const EvalValue &kv = DICT_ELEM(e);
             v.push_back(kv.get<bool>() ? 1 : 0);
         }
-        return SharedArrayObj(move(v));
+        return SharedArrayObj(std::move(v));
     }
 
     /* Top-10 #7: VALUE-driven flat strings under a dflt hint only (an
@@ -153,7 +153,7 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
             v.reserve(data.size());
             for (auto const &e : data)
                 v.push_back(SharedStr(DICT_ELEM(e).get<SharedStr>()));
-            return SharedArrayObj(move(v));
+            return SharedArrayObj(std::move(v));
         }
     }
 
@@ -161,7 +161,7 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
     result.reserve(data.size());
     for (auto const &e : data)
         result.emplace_back(DICT_ELEM(e), false);
-    return SharedArrayObj(move(result));
+    return SharedArrayObj(std::move(result));
 
     #undef DICT_ELEM
 }
@@ -188,10 +188,10 @@ dict_kvpairs(const DictObject::inner_type &data, ArrHint /*hint*/)
         SharedArrayObj::vec_type pair_arr;
         pair_arr.emplace_back(e.first, false);
         pair_arr.emplace_back(e.second.get(), false);
-        result.emplace_back(SharedArrayObj(move(pair_arr)), false);
+        result.emplace_back(SharedArrayObj(std::move(pair_arr)), false);
     }
 
-    return SharedArrayObj(move(result));
+    return SharedArrayObj(std::move(result));
 }
 
 static EvalValue
@@ -305,7 +305,7 @@ builtin_dict(EvalContext *ctx, const ArgLocs *exprList,
         );
     }
 
-    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }
 
 /*
@@ -354,5 +354,5 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
         data.insert_or_assign(make_const_clone(k), LValue(v, false));
     }
 
-    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }

@@ -35,7 +35,7 @@ public:
     }
 
     void move_ctor(void *obj, void *other) override {
-        new (obj) T(move(*reinterpret_cast<T *>(other)));
+        new (obj) T(std::move(*reinterpret_cast<T *>(other)));
     }
 
     void copy_assign(void *obj, const void *other) override {
@@ -43,7 +43,7 @@ public:
     }
 
     void move_assign(void *obj, void *other) override {
-        *reinterpret_cast<T *>(obj) = move(*reinterpret_cast<T *>(other));
+        *reinterpret_cast<T *>(obj) = std::move(*reinterpret_cast<T *>(other));
     }
 };
 

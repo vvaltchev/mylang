@@ -491,7 +491,7 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
                            " (named arguments must follow parameter order)"),
                 anode->start, anode->end);
 
-        bound[slot] = move(args->elems[i]);
+        bound[slot] = std::move(args->elems[i]);
         last = static_cast<int>(slot);
     }
 
@@ -505,7 +505,7 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
     for (int slot = 0; slot <= last; slot++) {
         if (bound[slot]) {
             all_const = all_const && bound[slot]->is_const;
-            positional->elems.push_back(move(bound[slot]));
+            positional->elems.push_back(std::move(bound[slot]));
         } else {
             if (!params[slot].opt)
                 throw WrongArgCountEx(
@@ -517,7 +517,7 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
     }
 
     positional->is_const = all_const;
-    call->args = move(positional);
+    call->args = std::move(positional);
 }
 
 void StructDeclStmt::serialize(ostream &s, int level) const

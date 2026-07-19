@@ -133,7 +133,7 @@ void TypeStr::append(SharedStr &lval, const string_view &s)
         new_str += s;
 
         dtor(&lval); /* We have to manually destroy our fake "trivial" object */
-        new (&lval) SharedStr(move(new_str));
+        new (&lval) SharedStr(std::move(new_str));
     }
 }
 
@@ -163,7 +163,7 @@ void TypeStr::mul(EvalValue &a, const EvalValue &b)
             new_str += s;
     }
 
-    a = SharedStr(move(new_str));
+    a = SharedStr(std::move(new_str));
 }
 
 void TypeStr::lt(EvalValue &a, const EvalValue &b)

@@ -707,21 +707,21 @@ private:
                         continue;
                     }
 
-                    kept.push_back(move(e));
+                    kept.push_back(std::move(e));
                     continue;
                 }
 
                 fold_reads(e14->rvalue, fc);   /* assignment: rhs ... */
                 fold_lvalue_reads(e14->lvalue, fc);   /* ... and lvalue reads */
-                kept.push_back(move(e));
+                kept.push_back(std::move(e));
                 continue;
             }
 
             if (fold_child(e, fc))
-                kept.push_back(move(e));
+                kept.push_back(std::move(e));
         }
 
-        b->elems = move(kept);
+        b->elems = std::move(kept);
     }
 
     /*
@@ -766,10 +766,10 @@ private:
                         analysis->mark_dead(dead->start, dead->end);
                 }
                 unique_ptr<Construct> taken =
-                    t ? move(iff->thenBlock) : move(iff->elseBlock);
+                    t ? std::move(iff->thenBlock) : std::move(iff->elseBlock);
                 if (!taken || !fold_child(taken, fc))
                     return false;          /* no live branch (or folds away) */
-                slot = move(taken);        /* replace if with its live branch */
+                slot = std::move(taken);        /* replace if with its live branch */
                 return true;
             }
 
@@ -956,7 +956,7 @@ private:
                     }
                     if (remaining == 1
                             && produces_bool(mo->elems[drop].second.get())) {
-                        slot = move(mo->elems[drop].second);
+                        slot = std::move(mo->elems[drop].second);
                         TRACE(fold, 0, "drop non-contributing const operand");
                         return;
                     }
@@ -1943,7 +1943,7 @@ Resolver::process_function(FuncDeclStmt *fd)
     if (st.slottable && st.next_slot > 0) {
         fd->desc->resolved = true;
         fd->desc->frame_size = st.next_slot;
-        fd->slot_writes = move(st.writes);
+        fd->slot_writes = std::move(st.writes);
     }
 }
 
@@ -2622,8 +2622,8 @@ private:
             auto tern = make_unique<TernaryExpr>();
             tern->condExpr = iff->condExpr->clone();
             tern->thenExpr = r->elem->clone();
-            tern->elseExpr = move(acc);
-            acc = move(tern);
+            tern->elseExpr = std::move(acc);
+            acc = std::move(tern);
         }
         return acc;
     }
@@ -2663,7 +2663,7 @@ private:
                 r->th = ref->th;
                 r->start = ref->start;
                 r->end = ref->end;
-                ref = move(r);
+                ref = std::move(r);
             }
             return;
         }
@@ -2718,7 +2718,7 @@ private:
                 const int slot = lv->sym.slot;
                 if (count_slot_writes(body, slot) != 1)   /* not write-once */
                     continue;
-                unique_ptr<Construct> rv = move(e14->rvalue);
+                unique_ptr<Construct> rv = std::move(e14->rvalue);
                 body->elems.erase(body->elems.begin() +
                                   static_cast<long>(i));
                 for (size_t j = i; j < body->elems.size(); j++)
@@ -2796,8 +2796,8 @@ private:
         lit->th = TypeHint::i;
         auto mul = make_unique<Expr03>();
         mul->th = TypeHint::i;
-        mul->elems.emplace_back(Op::invalid, move(lit));
-        mul->elems.emplace_back(Op::times, move(e));
+        mul->elems.emplace_back(Op::invalid, std::move(lit));
+        mul->elems.emplace_back(Op::times, std::move(e));
         return mul;
     }
 
@@ -2824,10 +2824,10 @@ private:
                     && is_addsub_chain(base)) {
                 std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
                 for (auto &pr : base->elems)
-                    merged.push_back(move(pr));
+                    merged.push_back(std::move(pr));
                 for (size_t i = 1; i < mo->elems.size(); i++)
-                    merged.push_back(move(mo->elems[i]));
-                mo->elems = move(merged);
+                    merged.push_back(std::move(mo->elems[i]));
+                mo->elems = std::move(merged);
             }
 
         /* COLLECT: a constant + signed terms (like terms merged by coefficient
@@ -2847,11 +2847,11 @@ private:
                         t.coeff += sign;
                         return;
                     }
-            terms.push_back({ move(e), sign, grp });
+            terms.push_back({ std::move(e), sign, grp });
         };
-        add(move(mo->elems[0].second), 1);
+        add(std::move(mo->elems[0].second), 1);
         for (size_t i = 1; i < mo->elems.size(); i++)
-            add(move(mo->elems[i].second),
+            add(std::move(mo->elems[i].second),
                 mo->elems[i].first == Op::minus ? -1 : 1);
 
         /* nothing merged/cancelled and no flatten benefit: leave it (the common
@@ -2865,14 +2865,14 @@ private:
                 continue;
             const int_type s = t.coeff > 0 ? 1 : -1;
             const int_type mag = t.coeff > 0 ? t.coeff : -t.coeff;
-            out.emplace_back(s, mag == 1 ? move(t.expr)
-                                         : make_int_mul(mag, move(t.expr)));
+            out.emplace_back(s, mag == 1 ? std::move(t.expr)
+                                         : make_int_mul(mag, std::move(t.expr)));
         }
         if (constant != 0) {
             auto lit = make_unique<LiteralInt>(
                 constant < 0 ? -constant : constant);
             lit->th = TypeHint::i;
-            out.emplace_back(constant < 0 ? -1 : 1, move(lit));
+            out.emplace_back(constant < 0 ? -1 : 1, std::move(lit));
         }
 
         /* REBUILD a +/- chain. The base (elems[0]) must be positive (op
@@ -2880,7 +2880,7 @@ private:
         if (out.empty()) {
             auto z = make_unique<LiteralInt>(0);
             z->th = TypeHint::i;
-            slot = move(z);
+            slot = std::move(z);
             return;
         }
         int base_i = -1;
@@ -2892,20 +2892,20 @@ private:
         if (base_i < 0) {                    /* all negative: 0 - a - b ... */
             auto z = make_unique<LiteralInt>(0);
             z->th = TypeHint::i;
-            chain->elems.emplace_back(Op::invalid, move(z));
+            chain->elems.emplace_back(Op::invalid, std::move(z));
         } else {
-            chain->elems.emplace_back(Op::invalid, move(out[base_i].second));
+            chain->elems.emplace_back(Op::invalid, std::move(out[base_i].second));
         }
         for (size_t i = 0; i < out.size(); i++) {
             if (static_cast<int>(i) == base_i)
                 continue;
             chain->elems.emplace_back(out[i].first > 0 ? Op::plus : Op::minus,
-                                      move(out[i].second));
+                                      std::move(out[i].second));
         }
         if (chain->elems.size() == 1)
-            slot = move(chain->elems[0].second);   /* a single positive term */
+            slot = std::move(chain->elems[0].second);   /* a single positive term */
         else
-            slot = move(chain);
+            slot = std::move(chain);
     }
 
     /*
@@ -2925,10 +2925,10 @@ private:
             if (mo->elems[0].second->th == TypeHint::i && is_mul_chain(base)) {
                 std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
                 for (auto &pr : base->elems)
-                    merged.push_back(move(pr));
+                    merged.push_back(std::move(pr));
                 for (size_t i = 1; i < mo->elems.size(); i++)
-                    merged.push_back(move(mo->elems[i]));
-                mo->elems = move(merged);
+                    merged.push_back(std::move(mo->elems[i]));
+                mo->elems = std::move(merged);
             }
 
         int_type product = 1;
@@ -2940,14 +2940,14 @@ private:
             else {
                 if (expr_has_side_effect(pr.second.get()))
                     side_effects = true;
-                factors.push_back(move(pr.second));
+                factors.push_back(std::move(pr.second));
             }
         }
 
         if (product == 0 && !side_effects) {            /* x * 0 -> 0 */
             auto z = make_unique<LiteralInt>(0);
             z->th = TypeHint::i;
-            slot = move(z);
+            slot = std::move(z);
             return;
         }
         if (factors.empty())                            /* all constant */
@@ -2956,17 +2956,17 @@ private:
         /* rebuild factor0 (* factor1 ...) (* product) */
         auto chain = make_unique<Expr03>();
         chain->th = TypeHint::i;
-        chain->elems.emplace_back(Op::invalid, move(factors[0]));
+        chain->elems.emplace_back(Op::invalid, std::move(factors[0]));
         for (size_t i = 1; i < factors.size(); i++)
-            chain->elems.emplace_back(Op::times, move(factors[i]));
+            chain->elems.emplace_back(Op::times, std::move(factors[i]));
         if (product != 1)
             chain->elems.emplace_back(Op::times,
                 [&] { auto l = make_unique<LiteralInt>(product);
                       l->th = TypeHint::i; return l; }());
         if (chain->elems.size() == 1)
-            slot = move(chain->elems[0].second);        /* x * 1 -> x */
+            slot = std::move(chain->elems[0].second);        /* x * 1 -> x */
         else
-            slot = move(chain);
+            slot = std::move(chain);
     }
 
     /* Int-arithmetic algebraic simplification: combine constants, collect like
@@ -3253,7 +3253,7 @@ private:
               std::to_string(bsz) + " nodes -> splice");
 
         /* Replaces (frees) the old CallExpr; its args were already cloned. */
-        slot = move(body);
+        slot = std::move(body);
 
         /*
          * Re-fold: a const argument substituted into the body can make a
@@ -3364,7 +3364,7 @@ private:
                     unique_ptr<Construct> a = args[id->sym.slot]->clone();
                     a->start = id->start;     /* keep the param's source loc */
                     a->end = id->end;
-                    ref = move(a);
+                    ref = std::move(a);
                 } else {
                     id->sym.slot += off;
                 }
@@ -3555,7 +3555,7 @@ private:
                     "$a" + std::to_string(temp_base + t));
                 id->sym = ResolvedSym{ SymKind::local, temp_base + t };
                 id->th = ce->args->elems[i]->th;   /* keep M8 hint if any */
-                temp_reads.push_back(move(id));
+                temp_reads.push_back(std::move(id));
                 args.push_back(temp_reads.back().get());
                 t++;
             } else {
@@ -3585,9 +3585,9 @@ private:
                 "$a" + std::to_string(temp_base + t));
             lv->sym = ResolvedSym{ SymKind::local, temp_base + t };
             lv->th = ce->args->elems[i]->th;
-            asn->lvalue = move(lv);
+            asn->lvalue = std::move(lv);
             asn->rvalue = ce->args->elems[i]->clone();
-            blk->elems.insert(blk->elems.begin(), move(asn));
+            blk->elems.insert(blk->elems.begin(), std::move(asn));
         }
 
         if (fsize)
@@ -3612,15 +3612,15 @@ private:
             if (auto tern = guard_to_ternary(blk)) {
                 ce->copy_base_fields(*tern);   /* loc + th of the call site */
                 tag_inline(tern.get(), ic);
-                spliced = move(tern);
+                spliced = std::move(tern);
             }
         }
         if (!spliced) {
             tag_inline(body.get(), ic);
             auto ica = make_unique<InlinedCallExpr>();
             ce->copy_base_fields(*ica);   /* loc + inline_ctx of the call site */
-            ica->elem = move(body);
-            spliced = move(ica);
+            ica->elem = std::move(body);
+            spliced = std::move(ica);
         }
 
         if (analysis)
@@ -3634,7 +3634,7 @@ private:
               std::to_string(nlocals) + " local, +" +
               std::to_string(ntemps) + " arg-temp slot(s))");
 
-        slot = move(spliced);
+        slot = std::move(spliced);
         /* Re-scan to collapse nested calls in the spliced body. For a recursive
          * self-inline, bump rec_depth around the re-scan so the next level's
          * self-calls see the deeper bound (and stop at REC_UNROLL_LEVELS). Every
@@ -3756,7 +3756,7 @@ private:
               "  tail call -> splice (+" + std::to_string(nlocals) +
               " local slot(s))");
 
-        slot = move(spliced);   /* the ReturnStmt becomes f's (spliced) body */
+        slot = std::move(spliced);   /* the ReturnStmt becomes f's (spliced) body */
         refold(slot);
         walk(slot, depth + 1, fsize);   /* re-scan: nested tail/expr calls */
     }
@@ -4045,7 +4045,7 @@ private:
                 lit->start = c->start;
                 lit->end = c->end;
                 lit->inline_ctx = c->inline_ctx;
-                slot = move(lit);
+                slot = std::move(lit);
             }
         } catch (const Exception &) {
             /* not const-foldable / would throw: leave it for runtime */
@@ -4105,7 +4105,7 @@ private:
                 try {
                     EvalValue v = RValue(arg->eval(&cctx));
                     if (is_readonly_value(v))
-                        seed[static_cast<int>(i)] = move(v);
+                        seed[static_cast<int>(i)] = std::move(v);
                 } catch (const Exception &) {
                     /* not const-evaluable (a runtime local/global): skip */
                 }
@@ -4145,7 +4145,7 @@ private:
         what->start = ce->what->start;
         what->end = ce->what->end;
         what->sym = clone->id->sym;
-        ce->what = move(what);
+        ce->what = std::move(what);
 
         /* Re-point the devirtualized-call slot at the CLONE (the resolver set it
          * to the original function before this redirect). Script mode: the clone
@@ -4205,7 +4205,7 @@ private:
         }
 
         FuncDeclStmt *raw = fc;
-        new_funcs.push_back(move(clone));
+        new_funcs.push_back(std::move(clone));
         return raw;
     }
 
@@ -4265,7 +4265,7 @@ private:
                 unique_ptr<Construct> a = arg->clone();  /* fresh per use */
                 a->start = slot->start;   /* keep the param's source position */
                 a->end = slot->end;       /* so errors point as in the callee */
-                slot = move(a);
+                slot = std::move(a);
                 return;
             }
         }
@@ -4339,10 +4339,10 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                 d->map_filter_kind = id->get_str() == "map"    ? 1
                                    : id->get_str() == "filter" ? 2 : 0;
                 d->tq_folded = call->tq_folded;   /* folded type query -> elide */
-                d->what = move(call->what);
-                d->args = move(call->args);
+                d->what = std::move(call->what);
+                d->args = std::move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();
-                slot = move(d);
+                slot = std::move(d);
             } else if (call->direct_func_slot >= 0) {
                 /* Global-slot callee (function / struct / escaped global). A
                  * cacheable pure-recursive callee becomes a CachedCallExpr so
@@ -4354,13 +4354,13 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                         ? unique_ptr<DirectCallExpr>(new CachedCallExpr())
                         : make_unique<DirectCallExpr>();
                 call->copy_base_fields(*d);
-                d->what = move(call->what);
-                d->args = move(call->args);
+                d->what = std::move(call->what);
+                d->args = std::move(call->args);
                 d->direct_func_slot = call->direct_func_slot;
                 d->vm_direct_func = call->vm_direct_func;
                 d->vm_struct_ctor_def = call->vm_struct_ctor_def;
                 d->vm_struct_boxed_def = call->vm_struct_boxed_def;
-                slot = move(d);
+                slot = std::move(d);
             }
         }
     }

@@ -745,7 +745,7 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     cfi->is_template = false;             /* an instantiation is concrete */
 
     FuncDeclStmt *raw = fc;
-    rootBlock->elems.insert(rootBlock->elems.begin(), move(cl));
+    rootBlock->elems.insert(rootBlock->elems.begin(), std::move(cl));
     tmpl_cache[key] = fc->id->uid;       /* cache the stable NAME, not a node */
     return raw;
 }
@@ -882,7 +882,7 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         /* The old callee Identifier is about to be freed: drop its id_sym entry
          * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
         id_sym.erase(call->what.get());
-        call->what = move(what);
+        call->what = std::move(what);
         progress = true;
     }
     return progress;
@@ -5115,7 +5115,7 @@ fold_show_slot(unique_ptr<Construct> &slot, const Block *root)
     lit->start = ce->start;
     lit->end = ce->end;
     lit->inline_ctx = ce->inline_ctx;
-    slot = move(lit);
+    slot = std::move(lit);
 }
 
 static void fold_show_calls(Block *root)

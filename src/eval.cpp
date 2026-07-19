@@ -150,19 +150,19 @@ void EvalContext::emplace(const Identifier *id, const EvalValue &val, bool is_co
 void EvalContext::emplace(const Identifier *id, EvalValue &&val, bool is_const)
 {
     ML_CHECK(in_const_eval() || repl_mode);
-    symbols.emplace(id->uid, LValue(move(val), is_const));
+    symbols.emplace(id->uid, LValue(std::move(val), is_const));
 }
 
 void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_const)
 {
     ML_CHECK(in_const_eval() || repl_mode);
-    symbols.emplace(UniqueId::get(id), LValue(move(val), is_const));
+    symbols.emplace(UniqueId::get(id), LValue(std::move(val), is_const));
 }
 
 void EvalContext::emplace(const UniqueId *uid, EvalValue &&val, bool is_const)
 {
     ML_CHECK(in_const_eval() || repl_mode);
-    symbols.emplace(uid, LValue(move(val), is_const));
+    symbols.emplace(uid, LValue(std::move(val), is_const));
 }
 
 void EvalContext::collect_symbols(
@@ -441,9 +441,9 @@ bind_param(EvalContext *args_ctx,
         val = coerce_to_decl_type(val, param.decl_type);
 
     if (frame) {
-        frame->at(idx) = LValue(move(val), is_const);
+        frame->at(idx) = LValue(std::move(val), is_const);
     } else {
-        args_ctx->emplace(param.name, move(val), is_const);
+        args_ctx->emplace(param.name, std::move(val), is_const);
     }
 }
 
@@ -797,7 +797,7 @@ do_func_call(EvalContext *ctx,
         vm_capture_frame(*g_vm_exc_pending, obj, call_ck, call_pc, call_site,
                          call_site_inl);
         if (!as_signal) {
-            std::unique_ptr<RuntimeException> ex = move(g_vm_exc_pending);
+            std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
             ex->rethrow();
         }
         return none;                 /* signal in flight; caller checks it */
@@ -806,7 +806,7 @@ do_func_call(EvalContext *ctx,
     FlowState &fs = *args_ctx.flow;
 
     if (fs.type == FlowState::ret)
-        return move(fs.value);
+        return std::move(fs.value);
 
     return none;
 }
@@ -902,7 +902,7 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
     if (g_vm_exc_pending)
         return r;
     if (r.get_type()->t < Type::t_str)
-        cache.emplace(move(key), r);
+        cache.emplace(std::move(key), r);
     return r;
 }
 
@@ -1043,7 +1043,7 @@ const StructTypeDef *native_struct_layout_def()
             FieldDef f;
             f.name = UniqueId::get(n);
             f.kind = k;
-            f.annot = move(annot);
+            f.annot = std::move(annot);
             f.slot = static_cast<int>(d->fields.size());
             d->fields.push_back(f);
         };
@@ -1151,7 +1151,7 @@ construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
         const Loc e = (i < nargs && locs) ? locs[i].end : Loc();
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? vals[i] : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e), false);
+        obj->fields.emplace_back(coerce_struct_field(fd, std::move(v), s, e), false);
     }
     return intrusive_ptr<StructObject>(obj);
 }
@@ -1216,7 +1216,7 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? RValue(args->elems[i]->eval(ctx))
                                 : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e), false);
+        obj->fields.emplace_back(coerce_struct_field(fd, std::move(v), s, e), false);
     }
 
     return intrusive_ptr<StructObject>(obj);
@@ -1264,7 +1264,7 @@ EvalValue construct_struct_v(StructTypeDef *def, const ArgLocs *al,
         const Loc e = i < nargs ? al->arg(i)->end : al->end;
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? RValue(args[i]) : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e),
+        obj->fields.emplace_back(coerce_struct_field(fd, std::move(v), s, e),
                                  false);
     }
 
@@ -1883,13 +1883,13 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         }
     }
 
-    if (mode == 1) return SharedArrayObj(move(ivec));
-    if (mode == 2) return SharedArrayObj(move(fvec));
-    if (mode == 4) return SharedArrayObj(move(bvec));
+    if (mode == 1) return SharedArrayObj(std::move(ivec));
+    if (mode == 2) return SharedArrayObj(std::move(fvec));
+    if (mode == 4) return SharedArrayObj(std::move(bvec));
     if (mode == 5)
         return SharedArrayObj(
-            SharedArrayObj::svec_type(move(svecbuf), sdef, sstride));
-    return SharedArrayObj(move(gvec));
+            SharedArrayObj::svec_type(std::move(svecbuf), sdef, sstride));
+    return SharedArrayObj(std::move(gvec));
 }
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
@@ -1990,7 +1990,7 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
                 sv.buf.cbegin() + (arr.offset() + arr.size()) * sv.stride
             );
             return SharedArrayObj(
-                SharedArrayObj::svec_type(move(nb), sv.def, sv.stride));
+                SharedArrayObj::svec_type(std::move(nb), sv.def, sv.stride));
         }
 
         /* Flat STRING array: strings are immutable, so a handle copy IS a
@@ -2014,7 +2014,7 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
             );
         }
 
-        return SharedArrayObj(move(vec));
+        return SharedArrayObj(std::move(vec));
     }
 
     if (v.is<intrusive_ptr<DictObject>>()) {
@@ -2036,7 +2036,7 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
             );
         }
 
-        auto out = make_intrusive<DictObject>(move(data));
+        auto out = make_intrusive<DictObject>(std::move(data));
         if (obj->get_has_default())   /* preserve the default-dict default */
             out->set_default(
                 clone_to_mutable(obj->get_default(), through_readonly));
@@ -2108,7 +2108,7 @@ make_const_clone(const EvalValue &v)
                 iv.cbegin() + src.offset(),
                 iv.cbegin() + src.offset() + src.size()
             );
-            SharedArrayObj arr(move(nv));
+            SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
             return arr;
         }
@@ -2119,7 +2119,7 @@ make_const_clone(const EvalValue &v)
                 fv.cbegin() + src.offset(),
                 fv.cbegin() + src.offset() + src.size()
             );
-            SharedArrayObj arr(move(nv));
+            SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
             return arr;
         }
@@ -2130,7 +2130,7 @@ make_const_clone(const EvalValue &v)
                 bv.cbegin() + src.offset(),
                 bv.cbegin() + src.offset() + src.size()
             );
-            SharedArrayObj arr(move(nv));
+            SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
             return arr;
         }
@@ -2144,7 +2144,7 @@ make_const_clone(const EvalValue &v)
                 sv.buf.cbegin() + (src.offset() + src.size()) * sv.stride
             );
             SharedArrayObj arr(
-                SharedArrayObj::svec_type(move(nb), sv.def, sv.stride));
+                SharedArrayObj::svec_type(std::move(nb), sv.def, sv.stride));
             arr.set_readonly();
             return arr;
         }
@@ -2169,7 +2169,7 @@ make_const_clone(const EvalValue &v)
         for (unsigned i = 0; i < view.size(); i++)
             vec.emplace_back(make_const_clone(view[i].get()), false);
 
-        SharedArrayObj arr(move(vec));
+        SharedArrayObj arr(std::move(vec));
         arr.set_readonly();
         return arr;
     }
@@ -2186,7 +2186,7 @@ make_const_clone(const EvalValue &v)
             );
         }
 
-        auto obj = make_intrusive<DictObject>(move(data));
+        auto obj = make_intrusive<DictObject>(std::move(data));
         if (src_obj.get_has_default())   /* preserve the default-dict default */
             obj->set_default(make_const_clone(src_obj.get_default()));
         obj->set_readonly();
@@ -2250,7 +2250,7 @@ make_general_array_clone(const SharedArrayObj &src)
                             false);
     }
 
-    return SharedArrayObj(move(gv));
+    return SharedArrayObj(std::move(gv));
 }
 
 /*
@@ -2454,7 +2454,7 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
                 throw InternalErrorEx();
         }
 
-        return move(val);
+        return std::move(val);
 
     } catch (Exception &ex) {
         stamp_operand_loc(e.get(), ex);
@@ -2478,7 +2478,7 @@ EvalValue Expr05::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr08::do_eval(EvalContext *ctx, bool rec) const
@@ -2495,7 +2495,7 @@ EvalValue Expr08::do_eval(EvalContext *ctx, bool rec) const
         num_binop_loc(val, e.get(), ctx, &Type::band);
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr09::do_eval(EvalContext *ctx, bool rec) const
@@ -2512,7 +2512,7 @@ EvalValue Expr09::do_eval(EvalContext *ctx, bool rec) const
         num_binop_loc(val, e.get(), ctx, &Type::bxor);
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr10::do_eval(EvalContext *ctx, bool rec) const
@@ -2529,7 +2529,7 @@ EvalValue Expr10::do_eval(EvalContext *ctx, bool rec) const
         num_binop_loc(val, e.get(), ctx, &Type::bor);
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
@@ -2555,7 +2555,7 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
@@ -2578,7 +2578,7 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
@@ -2652,7 +2652,7 @@ EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
@@ -2672,7 +2672,7 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 /*
@@ -2914,7 +2914,7 @@ slot_rmw(LValue &lv, Op op, const EvalValue &rval)
 
             EvalValue nv = lv.get();
             apply_compound_op(nv, r, op);
-            lv.put(move(nv));
+            lv.put(std::move(nv));
         }
     }
 
@@ -3237,7 +3237,7 @@ try_pod_struct_store(EvalContext *ctx, Construct *lvalue, Op op,
 
     /* coerce + runtime-validate to the field's scalar type (throws on mismatch,
      * e.g. a dyn-laundered wrong type) */
-    newval = coerce_struct_field(obj.def->fields[slot], move(newval),
+    newval = coerce_struct_field(obj.def->fields[slot], std::move(newval),
                                  mem->start, mem->end);
     obj.pod_set(slot, newval);
 
@@ -3604,7 +3604,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           id_start, id_end);
     EvalValue nv = old;
     apply_compound_op(nv, one, cop);
-    lv->put(move(nv));
+    lv->put(std::move(nv));
     return is_prefix ? lv->get() : old;
 }
 
@@ -4307,7 +4307,7 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 
     EvalValue nv = old;
     apply_compound_op(nv, one, cop);
-    lv->put(move(nv));
+    lv->put(std::move(nv));
 
     return is_prefix ? lv->get() : old;
 }
@@ -4505,7 +4505,7 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
          * keeps structs in the redefinable map; gfuncs is null there). */
         if (id->sym.kind == SymKind::global && ctx->gfuncs) {
             GlobalFuncTable *gf = ctx->gfuncs;
-            gf->slots[id->sym.slot] = LValue(move(desc), true /* const */);
+            gf->slots[id->sym.slot] = LValue(std::move(desc), true /* const */);
             gf->defined[id->sym.slot] = 1;
             return none;
         }
@@ -4516,7 +4516,7 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
             ctx->erase(id.get());
         }
 
-        ctx->emplace(id.get(), move(desc), true /* const */);
+        ctx->emplace(id.get(), std::move(desc), true /* const */);
         return none;
     }
 
@@ -4540,7 +4540,7 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
          */
         if (id->sym.kind == SymKind::global && ctx->gfuncs) {
             GlobalFuncTable *gf = ctx->gfuncs;
-            gf->slots[id->sym.slot] = LValue(move(func), ctx->const_ctx);
+            gf->slots[id->sym.slot] = LValue(std::move(func), ctx->const_ctx);
             gf->defined[id->sym.slot] = 1;
             return none;
         }
@@ -4555,7 +4555,7 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
         ctx->emplace(
             id.get(),
-            move(func),
+            std::move(func),
             ctx->const_ctx
         );
 
@@ -4752,13 +4752,13 @@ do_catch(EvalContext *ctx,
                     /* Resolved catch variable: bind it into its slot. */
                     Frame *f = catch_ctx.frame;
                     f->slots[asId->sym.slot] =
-                        LValue(move(bind_val), ctx->const_ctx);
+                        LValue(std::move(bind_val), ctx->const_ctx);
 
                 } else {
 
                     catch_ctx.emplace(
                         asId,
-                        move(bind_val),
+                        std::move(bind_val),
                         ctx->const_ctx
                     );
                 }
@@ -4835,14 +4835,14 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 
     FlowState &fs = *ctx->flow;
     const FlowState::Type saved_type = fs.type;
-    EvalValue saved_val = move(fs.value);
+    EvalValue saved_val = std::move(fs.value);
     fs.type = FlowState::none;
 
     finallyBody->eval(ctx);                /* may throw / set its own flow */
 
     if (fs.type == FlowState::none) {
         fs.type = saved_type;              /* resume the suspended signal */
-        fs.value = move(saved_val);
+        fs.value = std::move(saved_val);
     } else {
         pending.reset();                   /* finally's own flow supersedes */
     }
@@ -4892,7 +4892,7 @@ void LValue::put_slow(const EvalValue &v)
 
 void LValue::put_slow(EvalValue &&v)
 {
-    get_value_for_put() = move(v);
+    get_value_for_put() = std::move(v);
     type_checks();
 }
 
@@ -5177,7 +5177,7 @@ EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
     for (size_t i = 0; i < npairs; i++)
         data.emplace(make_const_clone(pairs[2 * i]),
                      LValue(pairs[2 * i + 1], is_const));
-    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }
 
 EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
@@ -5643,8 +5643,8 @@ wb_bin(TypedScalarExpr::Cat cat, Op op,
 {
     auto e = make_unique<TypedScalarExpr>(cat, TypeHint::i);
     e->th = TypeHint::i;
-    e->elems.emplace_back(Op::invalid, move(a));
-    e->elems.emplace_back(op, move(b));
+    e->elems.emplace_back(Op::invalid, std::move(a));
+    e->elems.emplace_back(op, std::move(b));
     return e;
 }
 
@@ -5654,7 +5654,7 @@ wb_assign(int dst, unique_ptr<Construct> rhs)
     auto a = make_unique<Expr14>();
     a->op = Op::assign;
     a->lvalue = wb_id(dst);
-    a->rvalue = move(rhs);
+    a->rvalue = std::move(rhs);
     return a;
 }
 
@@ -5740,7 +5740,7 @@ void run_weight_bench()
         auto thn = make_unique<Block>();
         thn->elems.push_back(wb_assign(2,
             wb_bin(TypedScalarExpr::Cat::arith, Op::plus, wb_id(0), wb_id(1))));
-        iff->thenBlock = move(thn);
+        iff->thenBlock = std::move(thn);
     }
     double t_if = wb_time_eval(iff.get(), &ctx, M);
 
@@ -5755,8 +5755,8 @@ void run_weight_bench()
         auto r = make_unique<ReturnStmt>();
         r->elem = wb_bin(TypedScalarExpr::Cat::arith, Op::plus,
                          wb_id(0), wb_id(1));
-        body->elems.push_back(move(r));
-        fd->body = move(body);
+        body->elems.push_back(std::move(r));
+        fd->body = std::move(body);
     }
     fd->sync_params();
     fd->desc->resolved = true;
