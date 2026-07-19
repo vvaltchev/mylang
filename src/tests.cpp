@@ -14579,6 +14579,74 @@ static bool jit_native_call()
 #endif
 }
 
+/* model-flip M3 (plans/model-flip.md): a straight-line boxed LEAF compiles to a
+ * native CONTAINER - one EnterNative drives the body, the boxed ISLAND is a
+ * `call jit_exec_block`, the ReturnV is native. PROVE it ran (g_jit_container_
+ * calls bumps, the "prove the code ran" rule) with a correct result, AND that a
+ * throw from the island propagates + is catchable. dyn params keep the body
+ * boxed (an island); the block body keeps it above the inline threshold (so it
+ * stays a real call, not inlined away); runtime() keeps the args non-const. */
+static bool jit_container()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+
+    const unsigned long b0 = g_jit_container_calls;
+    /* (1) a boxed-island container, run in a loop; correct result. */
+    if (!run({ "func cleaf(dyn a, dyn b) {",
+               "  var dyn t = a * b;",
+               "  var dyn u = t + a;",
+               "  var dyn v = u - b;",
+               "  var dyn w = v * a;",
+               "  var dyn x = w + b;",
+               "  return x - a;",
+               "}",
+               "assert(cleaf(runtime(50), 50) == 125000);" }))
+        return false;
+    if (g_jit_container_calls <= b0)
+        return false;   /* the container's island call did NOT run */
+    /* (2) a throw from the island propagates out of the container + catchable. */
+    if (!run({ "func cx(dyn a, dyn b) {",
+               "  var dyn t = a + b; var dyn u = t + a; var dyn v = u + b;",
+               "  var dyn w = v + a; var dyn x = w + b;",
+               "  return x / b;",
+               "}",
+               "var caught = false;",
+               "try { var dyn z = cx(runtime(1), 0); }",
+               "catch (DivisionByZeroEx) { caught = true; }",
+               "assert(caught);" }))
+        return false;
+    return true;
+#else
+    return true;
+#endif
+}
+
 static bool vm_codegen_shapes()
 {
     /* 1) resolved-local int while + if -> native ops (native-first codegen
@@ -15925,6 +15993,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_return },
     { "jit: native CallV (function->function call in the fragment)",
       jit_native_call },
+    { "jit: native container + bytecode island (model-flip M3)",
+      jit_container },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",

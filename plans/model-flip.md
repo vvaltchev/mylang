@@ -127,12 +127,16 @@ records vector) — re-fetch `back_rec()` to restore. NOTE the `BRANCHED(pc)`
 multi-exit case (an island branch to a native block) is deferred to **M4**
 (the exit-dispatch); an M3 straight-line island is single-exit at its ExitBlock.
 
-### 3. Whole-function container EMISSION — M3+
-Emit ONE fragment spanning the whole body. Per basic block, a native label. A
-NATIVE block emits machine code (as today); its branches target other blocks'
-fragment-local labels (ALL targets are in-container now). An ISLAND block emits
-`emit_call_prologue` + set args (`chunk`, `from`, `to`) + `call vm_exec_block` +
-the STATUS dispatch (#4). One `EnterNative` at pc 0 enters the container.
+### 3. Whole-function container EMISSION — M3 (straight-line) ✅ / M4+ (branches)
+Emit ONE fragment spanning the whole body, entered by ONE `EnterNative` at pc 0.
+Native ops → machine code (via the existing `emit_op`); an ISLAND → a
+`call jit_exec_block(desc, island_pc)` (`emit_island_call`) with the status
+dispatch (#4). M3 does the STRAIGHT-LINE case (`jit_try_container`); M4 adds
+native branches/loops (fragment-local labels — the existing N2 back-edge
+machinery) and the island-exit dispatch, so a native LOOP can iterate in machine
+code around an island (the first real win). The container fragment bakes its own
+`FuncDescriptor` (like the native-call caller) so `jit_exec_block` reaches the
+container's chunk via `desc->vm_chunk`.
 
 ### 4. Island-exit STATUS dispatch — M4
 After `call vm_exec_block`, `test`/`jXX` on the returned `BlockStatus`:
@@ -183,11 +187,27 @@ analysis-only). Commit per milestone.
   opcode — a dispatch-table/layout perturbation (the documented front-end
   effect); measure cross-binary in a deep session, its value lands with M3.
 
-- **M3 — whole-function container for the simplest MIXED shape.** A leaf
-  function that is native-except-ONE-straight-line-island (no island-internal
-  branches): emit the container (native block → `call vm_exec_block` → native
-  block → native `ReturnV`), one `EnterNative` at pc 0. Proves the inversion end
-  to end on the smallest real case. Kill-switch A/B + differential + fuzzer.
+- **M3 — whole-function container for the simplest MIXED shape. ✅ LANDED.**
+  `jit_try_container` (jit.cpp, tried first in `jit_compile_chunk`) compiles a
+  leaf, STRAIGHT-LINE body (no branches/handlers/calls) that is exactly ONE
+  contiguous island of simple boxed scalar ops (`op_is_simple_island`: BinOpV/
+  CmpV/LogV/UnaryV/MoveV/CompoundV/LoadConstV/CoerceNumV) ending in `ReturnV`
+  into a native container: ONE `EnterNative` at pc 0 drives a fragment =
+  [native ops as machine code] + `call jit_exec_block(desc, island_pc)` for the
+  island (`emit_island_call`: prologue/`call`/epilogue + `test rax; jns` →
+  FellThrough continues, RAISED exits to re-raise) + native `ReturnV`. An
+  `ExitBlock` is inserted at the island's end; pcs + side tables remapped.
+  Proven end to end: `jit_container` `-rt` test (`g_jit_container_calls` bumps -
+  the "prove the code ran" rule - a correct result + a throw from the island
+  propagating + being catchable); differential + `nested_fuzz` 300 all-agree;
+  `-vdj` shows the full sequence. **A straight-line container is a MECHANISM
+  PROOF, not a win** (the island runs interpreted either way; the container only
+  ADDS EnterNative + call overhead - the win arrives in M4 when a native LOOP
+  segment iterates in machine code around the island). So it is gated OFF for
+  small bodies (`MIN_CONTAINER_ISLAND = 5`), which - verified - matches NO
+  bench/sample (the existing per-run path is byte-identical, zero suite
+  regression). The threshold is a "don't regress tiny hot functions" guard, not
+  a cost model - M4 brings that.
 
 - **M4 — island-exit dispatch + island-internal control flow.** Islands with
   boxed conditions / branches (`if`/`while` whose cond or body is an island); the

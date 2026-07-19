@@ -5123,7 +5123,7 @@ next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
 `plans/model-flip.md`.
 
 **THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
-(`plans/model-flip.md`, M1+M2 landed).** The endgame inversion of the JIT: flip
+(`plans/model-flip.md`, M1-M3 landed).** The endgame inversion of the JIT: flip
 "BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
 `EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
 ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
@@ -5132,19 +5132,31 @@ the native code DRIVES, the interpreter is called only per-island (block-level
 dispatch, not per-op). This universalizes native `call <offset>` (not just leaf
 callees) and is the platform for the N7 unboxing arc. Milestones **M1**
 (container-plan analysis + `-vd`, no runtime change — LANDED) → **M2**
-(`vm_exec_block` island executor — LANDED) → M3 (whole-function container,
-simplest mixed shape) → M4 (island-exit dispatch + branches) → M5 (native calls
-to EVERY function: the checked-return unwind + growable native stack) → M6
-(delete-originals / `.myv`-ready). **M2:** `vm_exec_block(ctx, act, chunk,
-from_pc, *resume)` (vm.cpp) runs a single-entry interpreted ISLAND and hands
-control back to the container — chosen model **(b)**: reuse `vm_dispatch`
+(`vm_exec_block` island executor — LANDED) → **M3** (whole-function container,
+simplest mixed shape — LANDED) → M4 (island-exit dispatch + branches/loops) → M5
+(native calls to EVERY function: the checked-return unwind + growable native
+stack) → M6 (delete-originals / `.myv`-ready). **M2:** `vm_exec_block(ctx, act,
+chunk, from_pc, *resume)` (vm.cpp) runs a single-entry interpreted ISLAND and
+hands control back to the container — chosen model **(b)**: reuse `vm_dispatch`
 unchanged (a `start_pc` param + a new `ExitBlock` terminator op that `return`s
 with the resume pc), and FLIP the current frame's `boundary` bit for the run so
 an island `ReturnV`/`Halt`/uncaught-throw hands back (set flow / signal) instead
 of popping the frame — the container owns the real return; a caught island
-exception continues. Returns `FellThrough`/`Returned`/`Raised`. NOT emitted by
-codegen yet (M3 wires it). Builds on `plans/native-call-impl.md` (v1 native
-calls) and `plans/native-aot.md` (approach A, the fragment ABI).
+exception continues. Returns `FellThrough`/`Returned`/`Raised`. **M3:**
+`jit_try_container` (jit.cpp, tried first in `jit_compile_chunk`) compiles a
+leaf STRAIGHT-LINE body that is exactly ONE contiguous island of simple boxed
+scalar ops (`op_is_simple_island`) ending in `ReturnV` into a container — ONE
+`EnterNative` at pc 0, the island as `call jit_exec_block(desc, island_pc)`
+(`emit_island_call`: `test rax; jns` → FellThrough continues / RAISED exits so
+`EnterNative` re-raises via the `g_vm_jit_exc` bridge), a native `ReturnV`, an
+inserted `ExitBlock` + pc/side-table remap. A straight-line container is a
+MECHANISM PROOF, not a win (the island runs interpreted either way — the win is
+M4's native loop around an island), so it is gated OFF for small bodies
+(`MIN_CONTAINER_ISLAND`), which matches NO bench/sample (zero suite regression).
+Proven by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
+throw-from-island propagating) + differential + fuzzer + `-vdj`. Builds on
+`plans/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
+(approach A, the fragment ABI).
 
 ## Invariants & hazards (defense in depth)
 

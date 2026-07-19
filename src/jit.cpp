@@ -1703,9 +1703,224 @@ ContainerPlan jit_container_plan(const Chunk &chunk, const JitCtx *jc)
     return plan;
 }
 
+/* ---------------------------------------------------------------------------
+ * model-flip M3 (plans/model-flip.md): the first NATIVE CONTAINER emission -
+ * the inversion "bytecode with native islands" -> "native with bytecode
+ * islands", on the simplest MIXED shape. A container fragment DRIVES the whole
+ * body; its ONE interpreted ISLAND becomes a `call jit_exec_block`, and the
+ * native ops (here just the trailing ReturnV, plus any straight-line native
+ * arithmetic) are machine code. One EnterNative at pc 0.
+ *
+ * The M3 gate is deliberately narrow (M4 widens it - branches/loops, richer
+ * island op sets; M5 - calls): a LEAF, STRAIGHT-LINE body (no branches, no
+ * handlers, no calls) that is exactly ONE contiguous island of SIMPLE boxed
+ * scalar ops surrounded by native non-branch ops, ending in ReturnV. Narrow
+ * enough that no bench/sample matches it (verified -vd byte-identical), so the
+ * existing per-run path is untouched; proven by a dedicated test + the
+ * differential + the fuzzer.
+ * ------------------------------------------------------------------------- */
+
+/* The boxed island ops M3 admits: pure scalar arithmetic/compare/logic/move/
+ * load/coerce - no control flow, no calls, no container builders. They run
+ * interpreted inside vm_exec_block (a throw is handled via the RAISED bridge);
+ * anything else declines the container (falls to the per-run path). */
+/* The minimum island size for M3 to form a container (see the gate below). */
+static constexpr size_t MIN_CONTAINER_ISLAND = 5;
+
+static bool op_is_simple_island(OpCode op)
+{
+    switch (op) {
+    case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
+    case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
+    case OpCode::LoadConstV: case OpCode::CoerceNumV:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Emit a container fragment's ISLAND CALL: `call jit_exec_block(desc,
+ * island_pc)` (SysV rdi=desc, rsi=island_pc), then branch on the result -
+ * FellThrough (a small resume pc) falls through to the next native op; RAISED
+ * (a high-bit-set sentinel) exits to island_pc so the EnterNative handler
+ * re-raises g_vm_jit_exc. The prologue/epilogue save+restore rdi (the slots
+ * base) around the call and re-materialise rsi=t_int / r8=t_float; the cache is
+ * empty in a container (no N5), so the prologue's single `push rdi` leaves rsp
+ * 16-aligned for the call. */
+static void emit_island_call(Emitter &e, const FuncDescriptor *desc,
+                             uint32_t island_pc)
+{
+    emit_call_prologue(e);                 /* push rdi (empty cache -> aligned) */
+    e.movabs(RDI, reinterpret_cast<uint64_t>(desc));        /* arg1 = desc */
+    e.movabs(RSI, island_pc);                               /* arg2 = from_pc */
+    e.call_relocs.push_back(
+        { e.pos(), reinterpret_cast<const void *>(jit_exec_block) });
+    e.u8(0xE8); e.u32(0);                                    /* call rel32 */
+    emit_call_epilogue(e);                 /* pop rdi; rsi=t_int; r8=t_float */
+    e.u8(0x48); e.u8(0x85); e.u8(0xC0);                      /* test rax, rax */
+    e.u8(0x79); const size_t jfix = e.pos(); e.u8(0);        /* jns +over (rel8)*/
+    e.u8(0xB8); e.u32(island_pc);                    /* mov eax, island_pc */
+    e.u8(0xC3);                                       /* ret -> EnterNative raise*/
+    e.b[jfix] = static_cast<uint8_t>(e.pos() - (jfix + 1)); /* patch the jns */
+}
+
+/* Try to compile `chunk` as an M3 native container. Returns true iff it
+ * matched the gate AND emitted successfully (chunk.code + chunk.native
+ * committed); false leaves `chunk` PRISTINE for the normal per-run path. */
+static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
+{
+    if (!jc || !jc->caller_desc)          /* need a descriptor to bake + reach */
+        return false;
+    const size_t n = chunk.code.size();
+    if (n < 2 || chunk.code[n - 1].op != OpCode::ReturnV)
+        return false;
+
+    /* Gate: exactly ONE contiguous island of simple boxed ops; every other op
+     * a native, non-branch, run-eligible op; no calls; ReturnV only last. */
+    size_t island_begin = n, island_end = 0;
+    bool in_island = false, island_seen = false;
+    for (size_t p = 0; p < n; p++) {
+        const OpCode op = chunk.code[p].op;
+        if (op == OpCode::CallV || op == OpCode::CachedCallV)
+            return false;                  /* M5 territory */
+        if (op_is_simple_island(op)) {
+            if (!in_island) {
+                if (island_seen) return false;   /* a 2nd island */
+                island_seen = true; in_island = true; island_begin = p;
+            }
+            island_end = p + 1;
+        } else {
+            in_island = false;
+            if (op_is_branch(op) || !op_run_eligible(chunk.code[p], jc))
+                return false;              /* branch / non-native -> decline */
+            if (op == OpCode::ReturnV && p != n - 1)
+                return false;
+        }
+    }
+    if (!island_seen)
+        return false;                      /* fully native -> the normal path */
+
+    /* A STRAIGHT-LINE container is a mechanism proof, not a win: the island
+     * runs interpreted either way, so the container only ADDS the EnterNative +
+     * jit_exec_block overhead (its win arrives in M4, when a native LOOP segment
+     * iterates in machine code around the island). So gate M3 OFF for small
+     * bodies - this keeps it from REGRESSING tiny hot functions (e.g. a 2-op
+     * callback like `sq(x)=>x*x`) and, verified, matches NO bench/sample. The
+     * threshold is a "don't regress" guard, not a cost model (M4 brings that). */
+    if (island_end - island_begin < MIN_CONTAINER_ISLAND)
+        return false;
+
+    /* remap: EnterNative@0 shifts everything +1; the ExitBlock inserted after
+     * the island shifts the post-island ops +1 more. */
+    auto remap = [&](size_t p) -> size_t {
+        return p < island_end ? p + 1 : p + 2;
+    };
+    const uint32_t island_start_new = static_cast<uint32_t>(remap(island_begin));
+    const uint32_t exit_resume = static_cast<uint32_t>(remap(island_end));
+
+    /* Emit the container fragment (over the ORIGINAL ops; the rebuild is after).
+     * The whole body is one fragment at offset 0. */
+    Emitter e;
+    e.cache.clear();                       /* no N5 register cache in M3 */
+    std::vector<NativeCode::OpMark> marks;  /* -vdj: op-boundary annotations */
+    e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
+    if (run_has_float(chunk, 0, n))
+        e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
+    for (size_t pc = 0; pc < n; ) {
+        if (g_jit_annotate)
+            marks.push_back({ static_cast<uint32_t>(e.pos()),
+                              static_cast<uint32_t>(remap(pc)) });
+        if (pc == island_begin) {
+            emit_island_call(e, jc->caller_desc, island_start_new);
+            pc = island_end;
+            continue;
+        }
+        if (!emit_op(e, chunk, chunk.code[pc],
+                     static_cast<uint32_t>(remap(pc)), jc)) {
+            return false;                  /* selection miss: chunk pristine */
+        }
+        pc++;
+    }
+    /* The body ends in a native ReturnV (emit_op emitted its `ret`); no
+     * trailing exit_pc needed. */
+
+    /* Finalize: trampolines for out-of-range calls, mmap W^X, patch call
+     * rel32s, flip RX. (Self-contained - does NOT touch the per-run path.) */
+    std::unordered_map<const void *, size_t> tramp;
+    for (const Emitter::CallReloc &r : e.call_relocs) {
+        if (tramp.count(r.fn)) continue;
+        tramp[r.fn] = e.pos();
+        e.movabs(RAX, reinterpret_cast<uint64_t>(r.fn));
+        e.u8(0xFF); e.u8(0xE0);                             /* jmp rax */
+    }
+    const size_t len = e.b.size();
+    void *mem = mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED)
+        return false;                      /* chunk still pristine */
+    std::memcpy(mem, e.b.data(), len);
+    for (const Emitter::CallReloc &r : e.call_relocs) {
+        uint8_t *dst = static_cast<uint8_t *>(mem) + r.off;
+        intptr_t rel = reinterpret_cast<intptr_t>(r.fn)
+                     - reinterpret_cast<intptr_t>(dst + 5);
+        if (rel < INT32_MIN || rel > INT32_MAX)
+            rel = reinterpret_cast<intptr_t>(
+                      static_cast<uint8_t *>(mem) + tramp[r.fn])
+                - reinterpret_cast<intptr_t>(dst + 5);
+        const int32_t r32 = static_cast<int32_t>(rel);
+        for (int i = 0; i < 4; i++)
+            dst[1 + i] = static_cast<uint8_t>(r32 >> (i * 8));
+    }
+    if (mprotect(mem, len, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, len);
+        return false;
+    }
+
+    /* COMMIT: rebuild the code (EnterNative@0 + ExitBlock after the island +
+     * side-table remap), then adopt the native buffer. Only past here does
+     * `chunk` change. */
+    std::vector<Instr> nc;
+    nc.reserve(n + 2);
+    Instr en;
+    en.op = OpCode::EnterNative;
+    { Operand o; o.is_lit = true; o.lit_kind = Operand::LitKind::i; o.lit = 0;
+      en.set_a(o); }
+    nc.push_back(en);
+    for (size_t pc = 0; pc < n; pc++) {
+        nc.push_back(chunk.code[pc]);      /* no branch remap: no branches */
+        if (pc == island_end - 1) {
+            Instr eb;
+            eb.op = OpCode::ExitBlock;
+            Operand o; o.is_lit = true; o.lit_kind = Operand::LitKind::i;
+            o.lit = static_cast<int_type>(exit_resume);
+            eb.set_a(o);
+            nc.push_back(eb);
+        }
+    }
+    chunk.code = std::move(nc);
+    for (auto &l : chunk.locs)
+        l.pc = static_cast<uint32_t>(remap(l.pc));
+    for (auto &ic : chunk.inline_ctxs)
+        ic.pc = static_cast<uint32_t>(remap(ic.pc));
+
+    chunk.native.base = mem;
+    chunk.native.len = len;
+    if (g_jit_annotate)
+        chunk.native.frags.push_back(
+            { 0, static_cast<uint32_t>(len), std::move(marks) });
+    g_jit_frags++;
+    return true;
+}
+
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
     if (!g_jit_enabled || chunk.code.empty())
+        return;
+
+    /* model-flip M3: try the native-container path first (a narrow gate); on a
+     * match it emits the whole-function container and we're done. Otherwise the
+     * chunk is pristine and the per-run path below runs unchanged. */
+    if (jit_try_container(chunk, jc))
         return;
 
     const size_t n = chunk.code.size();
