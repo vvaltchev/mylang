@@ -195,6 +195,28 @@ path; shifts call `bit_shl`/`bit_shr`. Measured: VM-wall geomean -6.3%,
 suite 4.09-4.17x -> **4.45-4.48x vs CPython** (01_while_loop -25%,
 03_int_arith -20%, mandelbrot -19%, bit benches -18%).
 
+**#60 lever 2 - the BOXED-arith int-int fast path (`vm_num_binop`, vm.cpp).**
+The B1/B2 native arith above is for a PROVEN int/float NODE; a DYN/general
+operand - or a comparison used as a VALUE (`x % 3 == 0` as a return value has
+no native typed-VALUE compare, only the branch form `JumpUnlessIntCmp`) - still
+lowers to the BOXED `BinOpV`/`CompoundV`/`CmpV` (plus the compound global/
+capture stores + the dyn inc-dec), which paid `num_bin_op`'s promotion-check
+chain + an INDIRECT PMF call (`&Type::add`...) + TypeInt's own dispatch. The
+~7 sites now route through **`vm_num_binop(a, b, aop)`**: when BOTH runtime
+operands are plain int (the common case), it computes the result inline via a
+switch on the Op ENUM (the VM has it; the PMF hid it) - a comparison yields int
+0/1, which the CmpV caller wraps with `is_true()` exactly as `TypeInt::lt`
+does; any other shape (float/bool/string/mixed) falls back to the EXACT
+`num_bin_op` PMF path, byte-identical incl. div/mod-by-zero + bad-shift/type
+throws (the caller's catch stamps the loc). `ML_NOINLINE` (a single out-of-line
+copy - `num_bin_op` no longer inlines at each site, so `vm_dispatch` doesn't
+grow; a DIRECT call replaces the removed INDIRECT PMF). Measured (callgrind
+whole-program Ir): 34_sort_custom_cmp **-7.4%**, 67_make_dict **-5.6%**,
+35_map_filter **-5.0%** (`num_bin_op`+`TypeInt::eq` 6.8% -> `vm_num_binop`
+2.9%); pure loops NEUTRAL (they use native IntBin; I-count flat, wall-clock
+0.98-1.00). The tree-walker keeps the plain `num_bin_op` PMF path (the
+differential ORACLE - an independent arithmetic impl).
+
 **D1 - `AppendV` (the append/push fast op).** `append(a, x)`/`push(a, x)`
 with one value arg emits `AppendV` (CallBuiltinLV's operand layout: the
 builtin_calls pool idx, arg0's kind+slot, the value's slot) instead of

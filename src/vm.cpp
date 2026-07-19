@@ -855,6 +855,61 @@ static NumBinOp cmp_pmf(Op op)
 }
 
 /*
+ * #60 lever 2: the boxed arith/compare handlers' (BinOpV / CompoundV / CmpV,
+ * plus the compound global/capture stores and the dyn inc-dec) num_bin_op
+ * front end. M8 lowers a PROVEN int/float node to a native IntBin/FloatBin, but
+ * a DYN/general operand - or a comparison used as a VALUE (`x % 3 == 0` as a
+ * return value has no native typed-VALUE compare) - still boxes here and paid
+ * num_bin_op's promotion-check chain + an indirect PMF call + TypeInt's own
+ * dispatch (~7% of 35_map_filter: num_bin_op 4.5% + TypeInt::eq 2.3%).
+ *
+ * For the overwhelmingly common case where BOTH runtime operands are plain int,
+ * compute the result inline via a switch on the Op ENUM (the VM has it; the PMF
+ * hid it), writing the int result (a comparison yields int 0/1, which the CmpV
+ * caller wraps with is_true() exactly as TypeInt::lt + num_bin_op does). Any
+ * other operand shape (float / bool / string / mixed / dyn-non-int) falls back
+ * to the EXACT num_bin_op PMF path - byte-identical, including div/mod-by-zero
+ * (thrown here too) and the bad-shift-count / type errors, whose loc the
+ * caller's catch stamps. ML_NOINLINE: ONE out-of-line copy (num_bin_op no
+ * longer inlines at each of the ~7 call sites) - a DIRECT call, not the removed
+ * indirect PMF, and it keeps vm_dispatch's hot code layout unperturbed (the
+ * loop-body text rule).
+ */
+static ML_NOINLINE void
+vm_num_binop(EvalValue &a, const EvalValue &b, Op aop)
+{
+    if (a.is<int_type>() && b.is<int_type>()) {
+        const int_type y = b.get<int_type>();
+        int_type &x = a.get<int_type>();
+        switch (aop) {
+        case Op::plus:  x += y; return;
+        case Op::minus: x -= y; return;
+        case Op::times: x *= y; return;
+        case Op::div:   if (y == 0) throw DivisionByZeroEx(); x /= y; return;
+        case Op::mod:   if (y == 0) throw DivisionByZeroEx(); x %= y; return;
+        case Op::band:  x &= y; return;
+        case Op::bor:   x |= y; return;
+        case Op::bxor:  x ^= y; return;
+        case Op::shl:   x = bit_shl(x, y);  return;
+        case Op::shr:   x = bit_shr(x, y);  return;
+        case Op::ushr:  x = bit_ushr(x, y); return;
+        case Op::lt:    x = (x <  y); return;
+        case Op::gt:    x = (x >  y); return;
+        case Op::le:    x = (x <= y); return;
+        case Op::ge:    x = (x >= y); return;
+        case Op::eq:    x = (x == y); return;
+        case Op::noteq: x = (x != y); return;
+        default:        break;   /* unreachable: aop is one of the above */
+        }
+    }
+    NumBinOp pmf = binop_pmf(aop);
+    if (!pmf)
+        pmf = cmp_pmf(aop);
+    ML_VM_CHECK(pmf != nullptr);
+    num_bin_op(a, b, pmf);
+}
+
+/*
  * True ONLY while vm_execute is running the (final) program AST. The VM's
  * function-body hook in do_func_call compiles a chunk (raw Construct* node
  * pointers) lazily on first call; that is safe only once the AST is final. A
@@ -2455,8 +2510,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
                 chunk->loc_at(pc, s, en);
                 throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
             }
-            num_bin_op(nv, EvalValue(static_cast<int_type>(1)),
-                       binop_pmf(in->a_lit() ? Op::plus : Op::minus));
+            vm_num_binop(nv, EvalValue(static_cast<int_type>(1)),
+                         in->a_lit() ? Op::plus : Op::minus);
             lv.put(std::move(nv));
             pc++;
         }
@@ -3492,7 +3547,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
                 }
                 EvalValue nv = ctx.frame->at(t).get();
                 try {
-                    num_bin_op(nv, v, binop_pmf(in->aop));
+                    vm_num_binop(nv, v, in->aop);
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
                     throw;
@@ -4376,8 +4431,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
             EvalValue sa, sb;
             EvalValue val = boxed_operand(in->a(), &ctx, sa).clone();
             try {
-                num_bin_op(val, boxed_operand(in->b(), &ctx, sb),
-                           binop_pmf(in->aop));
+                vm_num_binop(val, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {
                 /* Stamp the operand loc (side table) like stamp_operand_loc, so
                  * a div-zero / type error points where the tree-walker does. */
@@ -4396,8 +4450,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
             EvalValue sb;
             EvalValue nv = ctx.frame->at(in->target).get();
             try {
-                num_bin_op(nv, boxed_operand(in->b(), &ctx, sb),
-                           binop_pmf(in->aop));
+                vm_num_binop(nv, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -4413,8 +4466,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
             EvalValue sa, sb;
             EvalValue val = boxed_operand(in->a(), &ctx, sa);
             try {
-                num_bin_op(val, boxed_operand(in->b(), &ctx, sb),
-                           cmp_pmf(in->aop));
+                vm_num_binop(val, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -4532,8 +4584,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in->a(), &ctx, sb),
-                               binop_pmf(in->aop));
+                    vm_num_binop(nv, boxed_operand(in->a(), &ctx, sb), in->aop);
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
                     throw;
@@ -4570,8 +4621,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in->a(), &ctx, sb),
-                               binop_pmf(in->aop));
+                    vm_num_binop(nv, boxed_operand(in->a(), &ctx, sb), in->aop);
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
                     throw;

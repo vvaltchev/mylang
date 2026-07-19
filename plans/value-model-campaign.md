@@ -45,11 +45,20 @@ Total 592.4M Ir. Top:
    is already pinned once) - drive the callee chunk in a leaner loop. Narrow
    (higher-order builtins) but a big % there. LOW-risk, well-scoped.
 
-2. **`num_bin_op` / Type-virtual dispatch for DYN/general operands.** ~4% here,
-   broad across dyn-heavy code. M8 removed it for proven scalars; a dyn operand
-   still pays the PMF. Idea: a fast-path in num_bin_op for the common int/float
-   dynamic pair before the PMF, or cache the resolved op. Broad, MEDIUM-risk
-   (correctness of the promotion rules).
+2. **`num_bin_op` / Type-virtual dispatch for DYN/general operands. DONE
+   2026-07-20 (`vm_num_binop`, vm.cpp).** The ~7 boxed BinOpV/CompoundV/CmpV +
+   compound-store + dyn-inc-dec sites now take an int-int FAST PATH: both
+   operands plain int -> a switch on the Op ENUM (comparison yields int 0/1,
+   CmpV wraps is_true); else the exact num_bin_op PMF fallback (byte-identical,
+   div0/shift/type throws intact). ML_NOINLINE (one copy, no vm_dispatch growth,
+   a direct call replacing the indirect PMF). The map/filter/sort dyn hot spot
+   was actually the boxed COMPARISON-as-a-VALUE (`x%3==0` return), not general
+   dyn arith. Measured (callgrind Ir): 34_sort -7.4%, 67_make_dict -5.6%,
+   35_map_filter -5.0%; pure loops neutral. -rt 1562/1562 + differential
+   1399/1399 (2 new boxed-dyn tests), nested_fuzz 400 all-agree. The tree-walker
+   keeps the plain PMF path (the differential oracle). A native typed-VALUE
+   compare op (bool result, no box) would remove `x%3==0`'s box ENTIRELY - a
+   possible M8 follow-up, separate from this lever.
 
 3. **EvalValue copy/move cost.** ~11% here, EVERYWHERE. The tagged-union copy
    branches trivial vs the type-erased ref ops. Hard to beat without changing
