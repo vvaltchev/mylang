@@ -76,6 +76,18 @@ Total 592.4M Ir. Top:
    35_map_filter -4.0%, 10_recursion_deep -2.9%; pure loops + dict NEUTRAL (no
    arg bind); fib/func_call ~flat (bind is a small fraction there). -rt
    1566/1566 + differential 1403/1403, nested_fuzz 250.
+   **TIER 1 pt 2 - the callback RESULT move.** VmInvoker::invoke did
+   `EvalValue res; ... res = std::move(flow->value)` (default-ctor + move-ASSIGN
+   with its type-change dance) then `return res`. Reordered the ref-release scan
+   ahead of it (it touches only window SLOTS, not flow->value) and
+   `return std::move(flow->value)` - a move-CONSTRUCT into the return. And
+   vm_map_filter's array loop copied the callback result / kept element into the
+   result vector (`const EvalValue r`/`e`); made them non-const and MOVED them
+   in (a per-element retain avoided for general/str/dyn elements). Measured
+   (Ir): 34_sort_custom_cmp -5.2%, 35_map_filter -4.4%, 67_make_dict -3.2%
+   (operator=(&&) GONE from the callback path). Combined Tier 1: map_filter
+   ~-8%, sort ~-12%. -rt 1566/1566 + differential, nested_fuzz; general-array
+   map/filter (str + array<array>) tw==vm verified.
 
 4. **The flat open-addressing dict (H2 v2).** ~40% of the dict benches.
    Container-specific (not the "value model" per se), needs the maintainer's
