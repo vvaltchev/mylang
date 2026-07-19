@@ -64,6 +64,29 @@ Total 592.4M Ir. Top:
    dtor}` (~3% in dict). Reduce copies of reference EvalValues on hot paths
    (borrow-by-ref where a copy is currently made). Case-by-case.
 
+## ===== STATUS: callback re-entry DONE 2026-07-20 (a + b landed) =====
+Both steps landed and measured (callgrind whole-program Ir, scale 1, vs the
+pre-#60 baseline):
+- **(a) reentrant vm_run_chunk fast path** (commit f97186c): skip
+  vm_enter_invocation_fast + the CtxGuard store per element; VmInvoker/
+  vm_try_invoke own g_current_ctx for the loop; arity fields hoisted to the
+  VmInvoker ctor. -> 35_map_filter -2.03%, 34_sort_custom_cmp -1.60%,
+  67_make_dict -1.08%. The per-element EntryGuard DTOR (4.6%) was UNTOUCHED (a
+  runtime gate can't drop a local's dtor call) - exactly the (b) trigger.
+- **(b) vm_dispatch extraction** (this commit): split the dispatch loop into a
+  file-local vm_dispatch(chunk, ctx, act); VmInvoker::invoke / vm_try_invoke
+  call it DIRECTLY (no EntryGuard, no enter_fast, no CtxGuard). -> an ADDITIONAL
+  -8.36% / -7.53% / -5.50%, for TOTAL vs baseline **-10.21% / -9.01% / -6.52%**.
+  The EntryGuard dtor is gone from the callback path. PURE LOOPS NEUTRAL (the
+  key risk - a hot-function split perturbing dispatch layout): I-count flat
+  (+-0.17%), wall-clock min ratios 0.977-1.006 over 21 interleaved reps
+  (01_while/02_for/03_int_arith/43_sieve/09_fib). Verified: -rt 1560/1560 + VM
+  differential 1397/1397; nested_fuzz 400 all-agree; a sort-comparator that
+  divides by zero shows the byte-identical bad()<-main() backtrace (caught +
+  uncaught).
+NEXT lever: #2 num_bin_op dyn fast-path (broad), then #4 flat dict (needs
+sign-off), #3 EvalValue copy (hardest). See the target menu above.
+
 ## ===== EXECUTION GUIDE: callback re-entry (self-contained, compact-safe) =====
 Maintainer's pick 2026-07-20: do (a), MEASURE, then (b), MEASURE. HEAD at write
 time = 3780fcf. Build/test: `make -j TESTS=1 OPT=0 BUILD_DIR=build-dbg` (debug
