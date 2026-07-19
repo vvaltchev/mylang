@@ -64,38 +64,109 @@ Total 592.4M Ir. Top:
    dtor}` (~3% in dict). Reduce copies of reference EvalValues on hot paths
    (borrow-by-ref where a copy is currently made). Case-by-case.
 
-## FIRST TARGET (maintainer's pick 2026-07-20): callback re-entry
+## ===== EXECUTION GUIDE: callback re-entry (self-contained, compact-safe) =====
+Maintainer's pick 2026-07-20: do (a), MEASURE, then (b), MEASURE. HEAD at write
+time = 3780fcf. Build/test: `make -j TESTS=1 OPT=0 BUILD_DIR=build-dbg` (debug
++ASan) -> `./build-dbg/mylang -rt` (expect 1560/1560 + `VM differential ...
+1397/1397`, exit 0); perf binary `make -j OPT=1 ASSERTS=0 BUILD_DIR=build-perf`;
+`python3 tests/nested_fuzz.py --mylang build-dbg/mylang --count 500`.
 
-Concrete approach. `VmInvoker::invoke` re-enters `vm_run_chunk` per element; the
-window is pushed ONCE in the ctor, but each re-entry still pays the per-
-invocation setup: `EntryGuard` (a NON-inlined dtor, 4.56% - an LTO clone),
-`vm_enter_invocation_fast` (a call, though the fast path is cheap), the STEP-1
-`CtxGuard` (save/restore g_current_ctx - REDUNDANT: it is the same invoke_ctx
-every element), and the `pending_key` unique_ptr ctor/dtor (1.86%, always null
-for a callback with no CachedCallV). None of this needs re-doing per element.
+### THE COST (callgrind, 35_map_filter, build-perf)
+`VmInvoker::invoke` re-enters `vm_run_chunk` PER ELEMENT. The window is pushed
+ONCE (VmInvoker ctor), but each re-entry re-pays the per-invocation SETUP:
+- `vm_run_chunk::EntryGuard::~EntryGuard` 4.56% (non-inlined LTO clone; a NO-OP
+  for a re-entry - pushed=false, swapped=false - but the dtor CALL costs).
+- the STEP-1 `CtxGuard` (save/restore `g_current_ctx`) - REDUNDANT: it is the
+  same invoke_ctx (`c_`) every element.
+- `vm_enter_invocation_fast` (a call; fast path is cheap but per-element).
+- `pending_key` `unique_ptr` ctor/dtor 1.86% (always null for a callback with
+  no CachedCallV).
+HONEST SIZING: the reducible OVERHEAD is ~10% of map/filter (EntryGuard 4.6% +
+pending_key 1.9% + CtxGuard + enter_fast, unmeasured ~3-5%). NOT ~30% - that
+figure lumped in the callback BODY work + the param BIND (both inherent). So
+target ~10% on map/filter/sort/find; measure honestly, don't overclaim.
 
-Options (measure each 1-vs-1, per the discipline):
-- (a) A `bool reentrant` param on `vm_run_chunk` (default false). When true
-  (VmInvoker/vm_try_invoke): `act = *g_vm_act` directly (skip
-  vm_enter_invocation_fast + EntryGuard - VmInvoker owns the window/activation),
-  and skip the CtxGuard (VmInvoker sets g_current_ctx = c_ ONCE in its ctor,
-  restores in its dtor). LOW-risk, but a runtime flag may not remove the dtor
-  CALLS (the guards still exist, just conditional) - measure.
-- (b) Extract the dispatch LOOP into a reusable inner driver that VmInvoker
-  calls per element with pre-built state (activation set once, per-element only
-  rebind + pc=0 + run-to-boundary). Removes ALL per-element setup but is an
-  invasive vm_run_chunk refactor (the loop's locals + the exception boundary).
-  Bigger win, higher risk.
-Recommend trying (a) first (contained), measure map/filter + sort + find; escalate
-to (b) only if (a)'s win is small AND the profile still shows the setup.
-Also hoist VmInvoker::invoke's arity check to the ctor (n is loop-fixed) - tiny,
-free. VERIFY: -rt + nested_fuzz (VmInvoker is on the sort/map/filter callback
-path); exceptions from a callback must still surface with the right frame.
+### CODE MAP (vm.cpp, line numbers approx - re-grep)
+- `VmInvoker` ctor ~1839: gates (g_exec_engine==Vm && g_vm_act &&
+  invoke_ctx && !const_eval && obj.func->vm_chunk); `act_=g_vm_act`;
+  `c_=act_->invoke_ctx.get()`; `cck_=desc_->vm_chunk`; `w_=act_->push_window(
+  total, cck_, /*boundary=*/true)`; `saved_caps_=c_->captures; c_->captures=
+  &obj.capture_slots; ready_=true`.
+- `VmInvoker::~VmInvoker` ~1843: `c_->captures=saved_caps_; act_->pop_window()`.
+- `VmInvoker::invoke(argv,n)` ~1851: ARITY check (n vs [min_args,nparams]);
+  bind (fast_bind copy loop OR coerce loop) into `w_->at(i)`; `c_->flow->type=
+  none`; `try { vm_run_chunk(*cck_, *c_); } catch(Exception&e){
+  vm_capture_desc_frame(e,desc_); throw; }`; if `g_vm_exc_pending` capture+
+  rethrow; read `c_->flow->value` iff type==ret; ref-release scan over
+  `cck_->ref_slots`.
+- `vm_try_invoke` ~1738: the SINGLE-SHOT twin (eval_func's gate) - same shape,
+  a `Restore` dtor pops the window. Apply the SAME optimization here.
+- `vm_run_chunk` ENTRY ~2286: `chunk=&chunk0`; `EntryGuard entry_guard`
+  (swapped/pushed); `act=*vm_enter_invocation_fast(chunk, local_act,
+  swapped, pushed)`; `CtxGuard ctx_guard(&ctx)` (sets g_current_ctx=&ctx,
+  restores); `code=chunk->code.data(); pc=0`; `unique_ptr<PureCacheKey>
+  pending_key`; lambdas cur_rec/diter/dyiter; then the P8 exception boundary
+  + the dispatch loop.
+- `vm_enter_invocation_fast` ~1934: `if (a && !a->no_recs() &&
+  a->back_rec().run_chunk==chunk) return a;` else the NOINLINE slow path.
 
-## RECOMMENDATION (smallest high-value first step)
-**#1 (callback re-entry)** - it is the single biggest, most self-contained cost
-in a real bench (map/filter/sort), LOW-risk, and does not touch the value
-model's core invariants. Then #2 (dyn dispatch fast-path) for breadth. #4 (flat
-dict) is the biggest raw win but needs a design + sign-off; #3 (EvalValue copy)
-is the hardest and last. Awaiting the maintainer's pick before implementing (he
-prioritizes on value; each step 1-vs-1 measured per the bench discipline).
+### STEP (a) - the `reentrant` fast path (contained, LOW-risk). Measure first.
+1. `vm_run_chunk(const Chunk&, EvalContext&, bool reentrant=false)` (decl+def).
+   The decl is in a header? -> it's `static`/file-local in vm.cpp (grep - it is
+   only called within vm.cpp: vm_run, vm_try_invoke, VmInvoker::invoke). Add the
+   param with a default so existing calls are unchanged.
+2. When `reentrant`: `VmActivation &act = *g_vm_act;` and DO NOT construct the
+   EntryGuard nor call vm_enter_invocation_fast (VmInvoker owns the window +
+   activation and never swapped g_vm_act). Also DO NOT construct the CtxGuard
+   (g_current_ctx is already `&ctx`, set once by VmInvoker - see step 3).
+   Structure: the guards are LOCALS, so to truly skip them, split -
+   `if (reentrant) { act=&*g_vm_act; } else { <EntryGuard+enter_fast+CtxGuard> }`
+   won't compile (guard scope). CLEANEST: pull the guarded setup into the
+   NON-reentrant branch by making EntryGuard/CtxGuard members of a small struct
+   constructed only in the non-reentrant path, OR (simpler) keep the guards but
+   gate their WORK on `!reentrant` - this removes the enter_fast call + the
+   g_current_ctx store, but NOT the dtor calls. If the measured win is mostly
+   the dtor calls (EntryGuard 4.6%), (a-gate) is insufficient -> go to (b).
+   => So (a) as a runtime GATE is the CHEAP experiment; if it wins enough, done;
+   if the EntryGuard dtor dominates, (b) is required. MEASURE to decide.
+3. VmInvoker owns g_current_ctx for the loop: ctor `saved_gctx_=g_current_ctx;
+   g_current_ctx=c_;` dtor `g_current_ctx=saved_gctx_;` (add a member). Then
+   invoke() calls `vm_run_chunk(*cck_, *c_, /*reentrant=*/true)`. Do the same in
+   vm_try_invoke (set g_current_ctx around its vm_run_chunk, reentrant=true).
+   NB a nested callback (a callback that itself calls a builtin with a callback)
+   still works: the inner VmInvoker saves/restores g_current_ctx around its own
+   loop.
+4. Tiny free win: hoist VmInvoker::invoke's ARITY check to the ctor (n is loop-
+   fixed - store nparams/min_args, check once). Skip the per-element check.
+5. MEASURE (1-vs-1, per the discipline): build-perf callgrind 35_map_filter +
+   34_sort_custom_cmp + 39_find_builtin before/after; also `bench/run.py
+   --filter map,filter,sort,find` (needs the caches fresh - the new --recompute
+   step). VERIFY: -rt 1560/1560 + differential; nested_fuzz 500 (VmInvoker is on
+   the sort/map/filter path); an exception THROWN in a callback still shows the
+   right frame (a `catch` around a sort comparator that throws - check the
+   backtrace). COMMIT if it wins + is green.
+
+### STEP (b) - extract the dispatch loop (the full fix). Do iff (a) is small.
+Split `vm_run_chunk` so the per-element re-entry pays ZERO setup:
+- `vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)` = the
+  ENTIRE current dispatch loop + its locals (code, pc, pending_key, the lambdas,
+  the P8 exception boundary/landing pad). Returns when the invocation's boundary
+  ReturnV/Halt is hit (as today).
+- `vm_run_chunk(chunk, ctx, reentrant=false)` = (non-reentrant) EntryGuard +
+  vm_enter_invocation_fast + CtxGuard, THEN `vm_dispatch(chunk, ctx, act)`.
+- VmInvoker::invoke = per element: bind + `c_->flow->type=none` +
+  `vm_dispatch(*cck_, *c_, *act_)` DIRECTLY (no guards - VmInvoker owns the
+  window + activation + g_current_ctx). vm_try_invoke likewise.
+HAZARDS: (1) clang's indirect-goto rule - the dispatch loop's labels live inside
+one scope with a live non-trivial local (pending_key); keep pending_key INSIDE
+vm_dispatch. (2) The `code`/`chunk`/`pc` loop state resets per call - fine, it is
+local to vm_dispatch. (3) The P8 exception boundary (the try/catch landing pad
+in vm_run_chunk) must move INTO vm_dispatch (a callback can throw/catch). (4)
+The `cur_rec/diter/dyiter` lambdas capture `act` by ref - pass act to
+vm_dispatch. (5) MEASURE: this is a HOT-path refactor - a `-vd` byte-identical
+check does NOT apply (no codegen change), so lean on -rt + differential +
+nested_fuzz + the exception/backtrace tests + a 1-vs-1 bench A/B. This is a big
+diff to a shared hot function - do it carefully, ONE commit, fully tested.
+
+### AFTER: next levers (see the target menu above) - #2 num_bin_op dyn fast-path
+(broad), then #4 flat dict (needs sign-off), #3 EvalValue copy (hardest).
