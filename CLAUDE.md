@@ -217,6 +217,30 @@ whole-program Ir): 34_sort_custom_cmp **-7.4%**, 67_make_dict **-5.6%**,
 0.98-1.00). The tree-walker keeps the plain `num_bin_op` PMF path (the
 differential ORACLE - an independent arithmetic impl).
 
+**#60 native typed-VALUE compare (`CmpIntV`/`CmpFloatV`, vm.cpp/codegen.cpp).**
+M8's native typed compare existed ONLY as a BRANCH (`JumpUnless{Int,Float}Cmp`,
+for a loop/if condition); a comparison used as a VALUE (`x % 3 == 0` returned /
+`(a<b)+(a>b)` / a predicate func / a sort comparator's `a<b`) still boxed via
+`CmpV`. The two new ops read two int/float Operands and write a real BOOL slot
+(`write_bool_slot`) - no box, no `num_bin_op`, no `is_true`. Codegen:
+`try_native_cmp_value` (in `compile_boxed_expr`'s `Cat::cmp` path) reuses
+`compile_int_cond`/`compile_float_cond` to read the operands + the cmp Op from a
+2-operand `TypedScalarExpr` (`kind==i/f`), else falls through to the boxed
+`CmpV` (a dyn/string operand, a >2-operand chain). NEVER THROW (a compare can't
+fault) -> loc- and node-free; the float form uses plain C++ compares (IEEE NaN
+semantics match TypeFloat). Classified like `IntBin` in every codegen table
+(`op_writes_scalar`, `visit_use_def`, the two retarget lists) so the E1 peephole
+can retarget the bool temp into a return/dst slot. **Op bodies are `ML_NOINLINE`
+(`vm_cmp_int_v`/`vm_cmp_float_v`) - the LOOP-BODY TEXT RULE:** inlining the two
+handlers into `vm_dispatch` cost `55_float_sum` +0.6% I-count / ~3% wall via
+code-layout with NO bytecode change (the front-end effect the roadmap A2 notes
+warn about); off-frame helpers restore I-count neutrality. Measured (callgrind
+Ir vs the lever-2 baseline): 34_sort_custom_cmp **-10.5%**, 35_map_filter
+**-11.5%** (the boxed `CmpV`/`num_bin_op`/`is_true` GONE from the profile;
+cumulative -20% / -26% from the pre-#60 baseline). Pure-loop I-count flat; a
+residual `55_float_sum` wall-clock signal (~a few %, I-count-neutral) is the
+unavoidable `vm_dispatch`-growth layout tax any new op pays.
+
 **D1 - `AppendV` (the append/push fast op).** `append(a, x)`/`push(a, x)`
 with one value arg emits `AppendV` (CallBuiltinLV's operand layout: the
 builtin_calls pool idx, arg0's kind+slot, the value's slot) instead of

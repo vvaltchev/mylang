@@ -220,6 +220,7 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::MoveV:       case OpCode::BinOpV:
     case OpCode::CmpV:        case OpCode::LogV:
     case OpCode::IntBin:      case OpCode::FloatBin:
+    case OpCode::CmpIntV:     case OpCode::CmpFloatV:
     case OpCode::SubscriptV:  case OpCode::MemberV:
     case OpCode::SliceV:
     case OpCode::CallV:       case OpCode::CachedCallV:
@@ -1545,6 +1546,11 @@ struct Codegen {
                          : t->cat == TypedScalarExpr::Cat::cmp     ? 'c'
                          : t->cat == TypedScalarExpr::Cat::logical ? 'l'
                                                                    : 0;
+            /* A typed int/float comparison AS A VALUE -> native CmpIntV/
+             * CmpFloatV (bool result, no box); falls through to the boxed CmpV
+             * for a dyn/string operand or a >2-operand chain. */
+            if (k == 'c' && try_native_cmp_value(e, out_slot, ops))
+                return true;
             return k && emit_boxed_chain(t->elems, k, e, out_slot, ops);
         }
         char k = 0;
@@ -4766,6 +4772,56 @@ struct Codegen {
     }
 
     /*
+     * A typed comparison used as a VALUE (`x % 3 == 0` in a return / expression
+     * position) -> a native CmpIntV/CmpFloatV producing a bool, instead of the
+     * boxed CmpV (num_bin_op + is_true). Reuses compile_int_cond/float_cond to
+     * read the two operands + the cmp Op (so a 2-operand int/float compare with
+     * side-effect-free operands lowers; anything else - a chain, a dyn/string
+     * operand - returns false for the boxed path). The op never throws, so it
+     * needs no node/loc. On a failed attempt the partial ops + temps are rolled
+     * back (like compile_boxed_expr's int/float/boxed cascade).
+     */
+    bool try_native_cmp_value(const Construct *node, int &out_slot,
+                              std::vector<CgInstr> &ops)
+    {
+        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(node);
+        if (!t || t->cat != TypedScalarExpr::Cat::cmp || t->elems.size() != 2)
+            return false;
+        Operand a, b;
+        Op cmp;
+        const int save_top = next_temp;
+        const size_t mark = ops.size();
+        if (compile_int_cond(node, ops, a, cmp, b)) {
+            emit_cmp_value(OpCode::CmpIntV, cmp, a, b, out_slot, ops);
+            return true;
+        }
+        ops.resize(mark);
+        next_temp = save_top;
+        if (compile_float_cond(node, ops, a, cmp, b)) {
+            emit_cmp_value(OpCode::CmpFloatV, cmp, a, b, out_slot, ops);
+            return true;
+        }
+        ops.resize(mark);
+        next_temp = save_top;
+        return false;
+    }
+
+    /* Emit `dst = (a <cmp> b)` (a bool) into a fresh temp (CmpIntV/CmpFloatV). */
+    void emit_cmp_value(OpCode opc, Op cmp, const Operand &a, const Operand &b,
+                        int &out_slot, std::vector<CgInstr> &ops)
+    {
+        const int dst = alloc_temp();
+        CgInstr in;
+        in.op = opc;
+        in.target = dst;
+        in.aop = cmp;
+        in.set_a(a);
+        in.set_b(b);
+        ops.push_back(in);
+        out_slot = dst;
+    }
+
+    /*
      * Emit a loop/if condition as native compare-branches that jump to the loop
      * EXIT when the condition is FALSE, recording each branch's index in
      * `exit_jumps` (the caller patches them to the exit label). A single
@@ -6625,6 +6681,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
             break;
         case OpCode::JumpUnlessIntCmp:
         case OpCode::JumpUnlessFloatCmp:
+        case OpCode::CmpIntV:        /* typed compare-to-bool; can't fault */
+        case OpCode::CmpFloatV:
         case OpCode::ForLoopStep:
         case OpCode::LogV:
         case OpCode::MemberV:
@@ -6898,6 +6956,7 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::Reraise: case OpCode::Rethrow: case OpCode::ThrowRuntimeV:
         return true;
     case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
         opnd(in.a()); opnd(in.b()); d(in.target); return true;
     case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
@@ -6991,6 +7050,7 @@ static bool retargetable_dst(OpCode op)
 {
     switch (op) {
     case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::CoerceNumV: case OpCode::MoveV:
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
@@ -7469,6 +7529,7 @@ static bool op_writes_scalar(OpCode op)
 {
     switch (op) {
     case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::IntAddModRI: case OpCode::IntAddStep:
     case OpCode::ForLoopStep: case OpCode::ForStepElemInt:
     case OpCode::StructFieldAddInt: case OpCode::MathFnV:

@@ -3133,6 +3133,31 @@ static const std::vector<test> tests =
         "try { var dyn q = a / z; } catch (DivisionByZeroEx as e)",
         "  { caught = true; }",
         "assert(caught);" } },
+    /* #60 native typed-VALUE compare (CmpIntV/CmpFloatV): a typed int/float
+     * comparison used as a VALUE (not a branch) lowers to a native bool-
+     * producing op instead of the boxed CmpV. The differential pins it == the
+     * tree-walker; the boxed CmpV still handles a >2-operand chain / dyn. */
+    { "typed int comparison as a value -> native bool (CmpIntV)",
+      { "func lt(int a, int b) => a < b;",
+        "func eq(int a, int b) => a == b;",
+        "func ne(int a, int b) => a != b;",
+        "func ge(int a, int b) => a >= b;",
+        "assert(lt(2, 3) == true && lt(3, 2) == false);",
+        "assert(eq(4, 4) && ne(4, 5) && ge(5, 5) && !ge(4, 5));",
+        /* a comparison value feeding int arithmetic (bool -> 0/1) */
+        "func cnt(int a, int b) => (a < b) + (a > b);",
+        "assert(cnt(1, 2) == 1 && cnt(2, 2) == 0);" } },
+    { "typed float comparison as a value -> native bool (CmpFloatV)",
+      { "func lt(float a, float b) => a < b;",
+        "func eq(float a, float b) => a == b;",
+        "assert(lt(1.5, 2.5) && !lt(2.5, 1.5));",
+        "assert(eq(2.0, 2.0) && !eq(2.0, 3.0));",
+        "assert(lt(1, 2) && eq(2, 2.0));" } },   /* int arg promotes */
+    { "a >2-operand comparison chain stays boxed and correct",
+      /* a == b == c is (a==b)==c: ch(1,1,1) = (true)==1 = true;
+       * ch(2,2,0) = (true)==0 = false. */
+      { "func ch(int a, int b, int c) => a == b == c;",
+        "assert(ch(1, 1, 1) == true && ch(2, 2, 0) == false);" } },
     /* A FRESH `var` whose ONLY source is `int + dyn` (= dyn) must be declared
      * `dyn` - the plain `var` cannot silently infer dyn. */
     { "a plain var from int + dyn requires an explicit dyn",
