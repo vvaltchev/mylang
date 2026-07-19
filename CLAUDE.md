@@ -5271,6 +5271,20 @@ omitting it is a compile error.
 
 ## Conventions
 
+- **DON'T pick work by "highest value" — the MAINTAINER prioritizes; YOU pick
+  the SMALLEST step that makes progress in the chosen direction
+  (maintainer-set, 2026-07-19).** When deciding what to do next, do NOT rank
+  candidate tasks by estimated value/impact and choose the biggest win — that is
+  the maintainer's call, made on what is valuable to HIM. Your job, within the
+  direction he has set, is to take the SMALLEST incremental step that makes real
+  progress toward the goal (and keeps the tree green + tested). So when asked
+  "what next," propose the smallest concrete progress step in the CURRENT
+  direction — not a detour to a higher-value-but-different task. (This came up
+  when, asked for the next native-function step, the response drifted into a
+  higher-value value-model profiling detour instead of the smaller native-call
+  foundation step. Wrong: stay in the maintainer's chosen lane and shrink the
+  step.) Surfacing a value observation is fine; re-prioritizing on it is not.
+
 - **NEVER do anything LAZILY unless the maintainer explicitly asked for it.**
   As a decision heuristic, ~95% of the time on THIS project the right call is
   the NON-lazy one — so default to non-lazy / deterministic / upfront, and only
