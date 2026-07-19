@@ -428,13 +428,17 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
         SharedArrayObj::vec_type result;
 
         for (size_type i = 0; i < n; i++) {
-            const EvalValue e = arr_elem_at(arr, i);
-            const EvalValue r = inv.ready() ? inv.invoke(&e, 1)
-                                            : eval_func(ctx, funcObj, e);
+            /* e / r non-const so the kept one is MOVED into the result vector
+             * (avoiding a per-element retain for a general/str/dyn element),
+             * not copied (#60 Tier 1). e is passed to the callback by pointer
+             * FIRST, so it is dead by the time filter moves it. */
+            EvalValue e = arr_elem_at(arr, i);
+            EvalValue r = inv.ready() ? inv.invoke(&e, 1)
+                                      : eval_func(ctx, funcObj, e);
             if (!is_filter)
-                result.emplace_back(r, ctx->const_ctx);
+                result.emplace_back(std::move(r), ctx->const_ctx);
             else if (r.is_true())
-                result.emplace_back(e, ctx->const_ctx);
+                result.emplace_back(std::move(e), ctx->const_ctx);
         }
 
         return SharedArrayObj(std::move(result));

@@ -2075,16 +2075,14 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
         ex->rethrow();
     }
 
-    EvalValue res;
-    if (c_->flow->type == FlowState::ret) {
-        c_->flow->type = FlowState::none;
-        res = std::move(c_->flow->value);
-    }
-
     /* Per-call frame death for REFERENCES (see the class comment).
      * Profile #2: only the chunk's audited ref_slots - this scan runs per
      * CALLBACK ELEMENT (sort's comparator, map/filter/make_dict), where
-     * the old whole-window walk was a measured cost. */
+     * the old whole-window walk was a measured cost. Runs BEFORE the result
+     * extraction below - it touches only the window SLOTS, never flow->value
+     * (a separate FlowState member), so the order is immaterial and this lets
+     * the result be MOVE-CONSTRUCTED into the return (#60 Tier 1) instead of
+     * move-ASSIGNED into a default-constructed local. */
     LValue *win = w_->slots;
     const int_type total = static_cast<int_type>(w_->size);
     for (const int32_t sidx : cck_->ref_slots) {
@@ -2098,7 +2096,11 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
         ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
 #endif
 
-    return res;
+    if (c_->flow->type == FlowState::ret) {
+        c_->flow->type = FlowState::none;
+        return std::move(c_->flow->value);
+    }
+    return EvalValue();
 }
 
 /*
