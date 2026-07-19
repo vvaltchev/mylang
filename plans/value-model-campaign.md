@@ -88,6 +88,22 @@ Total 592.4M Ir. Top:
    (operator=(&&) GONE from the callback path). Combined Tier 1: map_filter
    ~-8%, sort ~-12%. -rt 1566/1566 + differential, nested_fuzz; general-array
    map/filter (str + array<array>) tw==vm verified.
+   **TIER 2a REJECTED (2026-07-21): operator= type-change opt does NOT pay.**
+   The idea: on a type change, `destroy + copy_ctor` (1 type-erased op) instead
+   of `destroy + default_ctor + copy_assign` (2 ops). CORRECT (-rt + diff pass)
+   but a PERF WASH, for an inlining reason that is FUNDAMENTAL: the copy_ctor
+   needs a separate branch, which either (a) BLOATS the inline operator= past
+   the inliner threshold - it stops inlining, and the HOT same-type path becomes
+   an out-of-line call EVERYWHERE (+4.7%/+7.8% on the dyn benches; operator=
+   (const&) went from inlined-away to a 4.5% out-of-line cost), or (b) moves the
+   type-change arm OUT-OF-LINE (ML_NOINLINE helper) - which recovers the same-
+   type-heavy benches (map_filter -2.2%, sort -2.4%, dyn_kv neutral) but
+   REGRESSES type-change-HEAVY code (66_dyn_foreach +3.85%: a dyn accumulator in
+   a dyn foreach hits a move-assign-with-type-change ~every iteration, now a
+   call). The original FULLY-INLINE operator= is already at the sweet spot for
+   the workload mix; the copy_ctor micro-saving (one null intrusive_ptr release)
+   can't be bought without either inline bloat or a call. Maintainer-confirmed
+   revert. Don't re-attempt operator=-level copy/move machinery tweaks.
 
 4. **The flat open-addressing dict (H2 v2).** ~40% of the dict benches.
    Container-specific (not the "value model" per se), needs the maintainer's
