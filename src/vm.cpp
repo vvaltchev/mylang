@@ -1965,11 +1965,11 @@ vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
  * frame WITHOUT capturing a backtrace frame for it - do_func_call's bind
  * ran BEFORE its try, so a bind error never recorded the callee.
  */
-static ML_NOINLINE void
-vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
-              size_t &pc, FuncObject &fo, const Chunk *cck,
-              int_type argbase, size_t nargs, int_type dst,
-              std::unique_ptr<PureCacheKey> ckey)
+static ML_NOINLINE Frame *
+vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
+               size_t ret_pc, FuncObject &fo, const Chunk *cck,
+               int_type argbase, size_t nargs, int_type dst,
+               std::unique_ptr<PureCacheKey> ckey)
 {
     const FuncDescriptor *d = fo.func;
     const size_t nparams = d->params.size();
@@ -1981,8 +1981,8 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
         d->frame_size + static_cast<int_type>(cck->n_temps);
     Frame *w = act.push_window(total, cck, /*boundary=*/false);
     VmCallRec &rec = act.back_rec();
-    rec.ret_chunk = chunk;
-    rec.ret_pc = pc + 1;
+    rec.ret_chunk = ret_chunk;
+    rec.ret_pc = ret_pc + 1;
     rec.dst = dst;
     rec.desc = d;
     rec.caller_captures = ctx.captures;
@@ -2014,6 +2014,23 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
     }
 
     ctx.captures = &fo.capture_slots;
+    return w;
+}
+
+/*
+ * The interpreter's in-VM CALL: the frame-setup core plus the chunk/pc SWITCH
+ * to the callee (the loop then dispatches the callee's ops). The native-call
+ * path (plans/native-aot.md #55) will instead `call` the callee's fragment
+ * after vm_frame_setup, so the switch stays here.
+ */
+static ML_NOINLINE void
+vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+              size_t &pc, FuncObject &fo, const Chunk *cck,
+              int_type argbase, size_t nargs, int_type dst,
+              std::unique_ptr<PureCacheKey> ckey)
+{
+    vm_frame_setup(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst,
+                   std::move(ckey));
     chunk = cck;
     pc = 0;
 }
