@@ -14319,6 +14319,124 @@ static bool jit_native_return()
 #endif
 }
 
+/*
+ * Cross-compile determinism of M8 specialization. A concrete, typed function's
+ * body must specialize to the SAME native/typed bytecode no matter what was
+ * compiled BEFORE it in the same process - in particular, compiling an
+ * untyped-parameter TEMPLATE (which instantiates a `name$N` clone) must not
+ * leak state into the next one-shot compile's infer_types / specialize_types.
+ *
+ * The one-shot infer_types uses a FRESH local Inferencer per call (all_syms /
+ * all_funcs / tmpl_cache / clone_name_counter / id_sym / the type arena are
+ * per-instance) and specialize_types clears its file-scope state (g_fr_pure)
+ * each call, so no compile-time state crosses compiles - this pins that
+ * invariant. It caught nothing at the time it was written (the property already
+ * holds), but a regression that added persistent inferencer/specializer state
+ * would make the typed function come out BOXED (BinOpV) after a template - the
+ * exact shape this asserts against. See MEMORY
+ * [[template-compile-pollutes-next-specialization]].
+ */
+/* Compile+run a whole program in one process under the VM engine. If `fname`
+ * is non-null it must be a CONCRETE function whose compiled chunk + M8 signal
+ * are captured; a null `fname` just compiles+runs (used for the polluter, whose
+ * only interesting function is a template base with no chunk of its own). */
+static bool ccs_compile(const std::vector<const char *> &lines,
+                        const char *fname, std::vector<int> &ops,
+                        int &typed, int &multiop, int &binopv, bool &is_tmpl)
+{
+    std::string src;
+    std::vector<Tok> toks;
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (i) src += '\n';
+        src += lines[i];
+    }
+    lexer(src, 1, toks);
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        Block *b = dynamic_cast<Block *>(root.get());
+        if (fname) {
+            FuncDeclStmt *fd = nullptr;
+            if (b)
+                for (auto &e : b->elems)
+                    if (auto *f = dynamic_cast<FuncDeclStmt *>(e.get()))
+                        if (f->id && f->id->get_str() == fname) { fd = f; break; }
+            if (!fd) { g_exec_engine = saved; return false; }
+            is_tmpl = fd->is_template;
+            /* The M8 signal on the AST (JIT-independent): a fully specialized
+             * body has only TypedScalarExpr arith, no boxed MultiOpConstruct. */
+            std::function<void(Construct *)> walk = [&](Construct *n) {
+                if (!n) return;
+                if (dynamic_cast<TypedScalarExpr *>(n)) typed++;
+                if (dynamic_cast<MultiOpConstruct *>(n)) multiop++;
+                for_each_child_of(n, walk);
+            };
+            if (fd->body) walk(fd->body.get());
+            Chunk ch;
+            if (!codegen_func_body(fd, ch)) { g_exec_engine = saved; return false; }
+            for (const Instr &in : ch.code) {
+                ops.push_back((int)in.op);
+                if (in.op == OpCode::BinOpV) binopv++;
+            }
+        }
+        /* Run it end-to-end (matches the driver: infer -> optimize -> run). */
+        vm_execute(root.get());
+    } catch (...) {
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+static bool cross_compile_specialize_stable()
+{
+    /* B: a concrete, fully-typed function whose four int arith ops must all
+     * specialize (4 TypedScalarExpr, no boxed BinOpV). Used with sort so the
+     * callback path is exercised. */
+    const std::vector<const char *> B = {
+        "func cmp(int a, int b) {",
+        "  var d = a * 3; var e = b * 5; var f = d - e; return f + a;",
+        "}",
+        "var arr = [5, 2, 8, 1, 9, 3, 7, 4, 6, 0];",
+        "sort(arr, cmp);" };
+    /* A: an untyped-parameter TEMPLATE (instantiated as leaf$0), the historic
+     * suspected polluter. */
+    const std::vector<const char *> A = {
+        "func leaf(a, b) { var t = a * b; var u = t + a; return u - b; }",
+        "var acc = 0;",
+        "for (var i = 1; i <= 3; i++) acc = acc + leaf(i, 2);" };
+
+    std::vector<int> ops_iso, ops_after, junk;
+    int t_iso = 0, m_iso = 0, bv_iso = 0;
+    int t_after = 0, m_after = 0, bv_after = 0;
+    int jt = 0, jm = 0, jb = 0;
+    bool tmpl_iso = false, tmpl_after = false, jtm = false;
+
+    /* cmp in isolation, then the template polluter, then cmp again. */
+    if (!ccs_compile(B, "cmp", ops_iso, t_iso, m_iso, bv_iso, tmpl_iso))
+        return false;
+    if (!ccs_compile(A, nullptr, junk, jt, jm, jb, jtm))
+        return false;
+    if (!ccs_compile(B, "cmp", ops_after, t_after, m_after, bv_after,
+                     tmpl_after))
+        return false;
+
+    /* cmp is concrete, never a template; its 4 arith ops all specialize; no
+     * boxed BinOpV - in BOTH compiles. */
+    if (tmpl_iso || tmpl_after) return false;
+    if (t_iso != 4 || t_after != 4) return false;
+    if (m_iso != 0 || m_after != 0) return false;
+    if (bv_iso != 0 || bv_after != 0) return false;
+    /* And byte-identical bytecode: a template compile changed NOTHING. */
+    if (ops_iso != ops_after) return false;
+    return true;
+}
+
 static bool vm_codegen_shapes()
 {
     /* 1) resolved-local int while + if -> native ops (native-first codegen
@@ -15539,6 +15657,8 @@ static const std::vector<extra_check> extra_checks =
       jit_delete_originals },
     { "jit: native ReturnV runs in the fragment (in-VM + boundary paths)",
       jit_native_return },
+    { "vm: cross-compile M8 specialization is deterministic (no template leak)",
+      cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
       vm_codegen_shapes },
     { "builtins: dev-only show() reserved in a script",
