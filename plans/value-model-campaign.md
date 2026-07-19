@@ -104,6 +104,23 @@ Total 592.4M Ir. Top:
    the workload mix; the copy_ctor micro-saving (one null intrusive_ptr release)
    can't be bought without either inline bloat or a call. Maintainer-confirmed
    revert. Don't re-attempt operator=-level copy/move machinery tweaks.
+   **THE 66_dyn_foreach TYPE-CHANGE - IDENTIFIED but fix REJECTED (2026-07-21).**
+   The per-iteration type-change move-assign in 66 is `boxed_operand` boxing a
+   LITERAL immediate into a fresh-`none` scratch: `scratch = EvalValue(o.lit)` is
+   a none->int TYPE-CHANGE move-assign, once per boxed op with a literal operand
+   (66's `d % N`: operator=(&&) = 5.99%, 20M calls). REAL inefficiency, broad-ish
+   (any dyn arith with a constant). Fix: placement-construct the literal into the
+   scratch (`scratch.~EvalValue(); new (&scratch) EvalValue(o.lit)`) - skips the
+   type-change dance. Measured 66_dyn_foreach **-4.92%**. BUT 74_dyn_foreach_kv
+   **+4.68%**: the change to the (inlined) boxed_operand rippled through the
+   inliner and pushed the dict-iterator's operator=(const&) OUT-OF-LINE (a new
+   884M cost) - a pure codegen artifact, roughly cancelling the 66 win. Same
+   codegen-sensitivity wall as Tier 2a. Maintainer-confirmed revert. The
+   finding stands: a native-immediate path in vm_num_binop (pass the int/float
+   literal straight, no scratch boxing) MIGHT capture it without touching
+   boxed_operand's inlining - untried. Value-model micro-opts on hot INLINE
+   functions (operator=, boxed_operand) are codegen-sensitive and rarely a clean
+   win; prefer removing whole ops / whole copies (Tier 1) over machinery tweaks.
 
 4. **The flat open-addressing dict (H2 v2).** ~40% of the dict benches.
    Container-specific (not the "value model" per se), needs the maintainer's
