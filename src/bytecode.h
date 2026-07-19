@@ -154,6 +154,20 @@ enum class OpCode : unsigned char {
     JumpUnlessFloatCmp,
 
     /*
+     * A typed compare producing a BOOL VALUE (not a branch): slot[target] =
+     * (a <aop> b) as a real bool. The native counterpart of the boxed CmpV for
+     * a comparison used as a VALUE (`x % 3 == 0` as a return/expression value -
+     * M8's native typed compare otherwise exists only as the BRANCH form
+     * JumpUnless{Int,Float}Cmp). a/b are int (CmpIntV) or float (CmpFloatV)
+     * Operands, aop a comparison Op (lt/gt/le/ge/eq/noteq). NEVER THROWS (an
+     * int/float compare can't fault) -> loc- and node-free. The float form uses
+     * plain C++ compares (IEEE: a NaN operand yields false for </<=/>/>=/==,
+     * true for !=), matching TypeFloat + the tree-walker.
+     */
+    CmpIntV,
+    CmpFloatV,
+
+    /*
      * Fused counted-loop back-edge (the register-machine superinstruction for a
      * `for`): in ONE dispatch, i += step (or -= for a descending loop), then if
      * (i <aop> bound) pc = target (loop back to the body), else fall through
@@ -1115,7 +1129,8 @@ enum class OpCode : unsigned char {
     X(Jump) X(IntBin) X(IncDecCheckedV) X(IncDecElemCheckedV) \
     X(IncDecMemberCheckedV) X(IncDecChainV) \
     X(StoreLValueChainV) X(JumpUnlessIntCmp) X(FloatBin) \
-    X(JumpUnlessFloatCmp) X(ForLoopStep) X(LoadElemInt) X(LoadElemFloat) \
+    X(JumpUnlessFloatCmp) X(CmpIntV) X(CmpFloatV) \
+    X(ForLoopStep) X(LoadElemInt) X(LoadElemFloat) \
     X(LoadElemBool) X(ArrLen) X(StrLen) X(LoadStrChar) X(LoadElemValue) \
     X(LoadStructFieldInt) X(LoadStructFieldFloat) X(LoadStructElemV) \
     X(DictIterInit) X(DictIterNext) X(ForeachDynInit) X(ForeachDynNext) \

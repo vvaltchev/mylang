@@ -90,6 +90,58 @@ write_float_slot(EvalContext *ctx, int_type slot, float_type v)
         lv.put(EvalValue(v));
 }
 
+/* Write a real BOOL into a slot (the CmpIntV/CmpFloatV result - the value form
+ * of a typed compare). In-place if the slot already holds a bool. */
+static ML_ALWAYS_INLINE void
+write_bool_slot(EvalContext *ctx, int_type slot, bool v)
+{
+    LValue &lv = ctx->frame->at(slot);
+    if (lv.is<bool>())
+        lv.getval<bool>() = v;
+    else
+        lv.put(EvalValue(v));
+}
+
+/* CmpIntV / CmpFloatV bodies (the VALUE form of a typed int/float compare ->
+ * bool). ML_NOINLINE off vm_run_chunk's frame (the loop-body TEXT RULE): the
+ * dispatch core must not grow, or an UNTOUCHED pure loop regresses via code
+ * layout (measured: inlining these cost 55_float_sum ~3% wall / +0.6% I-count
+ * with no bytecode change). One CALL per compare - still far below the boxed
+ * CmpV (num_bin_op + PMF + is_true) it replaces. Never throws. */
+ML_NOINLINE static void
+vm_cmp_int_v(const Instr &in, EvalContext *ctx)
+{
+    const int_type a = read_int_operand(in.a(), ctx);
+    const int_type b = read_int_operand(in.b(), ctx);
+    bool r;
+    switch (in.aop) {
+    case Op::lt: r = a <  b; break;
+    case Op::gt: r = a >  b; break;
+    case Op::le: r = a <= b; break;
+    case Op::ge: r = a >= b; break;
+    case Op::eq: r = a == b; break;
+    default:     r = a != b; break;   /* noteq */
+    }
+    write_bool_slot(ctx, in.target, r);
+}
+
+ML_NOINLINE static void
+vm_cmp_float_v(const Instr &in, EvalContext *ctx)
+{
+    const float_type a = read_float_operand(in.a(), ctx);
+    const float_type b = read_float_operand(in.b(), ctx);
+    bool r;
+    switch (in.aop) {
+    case Op::lt: r = a <  b; break;
+    case Op::gt: r = a >  b; break;
+    case Op::le: r = a <= b; break;
+    case Op::ge: r = a >= b; break;
+    case Op::eq: r = a == b; break;
+    default:     r = a != b; break;   /* noteq */
+    }
+    write_bool_slot(ctx, in.target, r);
+}
+
 /*
  * F1 - MathFnV's out-of-line body (loop-body text rule: the libm call
  * dominates, so the selector switch lives in its own frame, not in
@@ -2706,6 +2758,24 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act)
                 pc = in->target;
         }
         VM_NEXT;
+
+        VM_CASE(CmpIntV):
+            /* dst = (a <cmp> b) as a bool - the VALUE form of a typed int
+             * compare (the native counterpart of the boxed CmpV). Body off the
+             * dispatch frame (loop-body text rule). Never throws -> loc/node-
+             * free. */
+            vm_cmp_int_v(*in, &ctx);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(CmpFloatV):
+            /* Float operands (int/bool promote via read_float_operand); plain
+             * C++ compares give IEEE semantics (a NaN yields false for
+             * </<=/>/>=/==, true for !=), matching TypeFloat + the tree-walker.
+             * Never throws. */
+            vm_cmp_float_v(*in, &ctx);
+            pc++;
+            VM_NEXT;
 
         VM_CASE(FloatBin): {
 

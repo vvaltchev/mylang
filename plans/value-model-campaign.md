@@ -96,6 +96,23 @@ pre-#60 baseline):
 NEXT lever: #2 num_bin_op dyn fast-path (broad), then #4 flat dict (needs
 sign-off), #3 EvalValue copy (hardest). See the target menu above.
 
+## ===== FOLLOW-UP: native typed-VALUE compare DONE 2026-07-20 =====
+The lever-2 profiling found the dyn hot spot was the boxed COMPARISON-as-a-VALUE
+(`x % 3 == 0` returned) - M8's native typed compare only existed as the BRANCH
+form. New `CmpIntV`/`CmpFloatV` ops (bytecode.h/vm.cpp/codegen.cpp) compute a
+2-operand typed int/float compare into a real BOOL slot, no box; the boxed CmpV
+stays for dyn/string operands + >2-operand chains. `try_native_cmp_value`
+(compile_boxed_expr) reuses compile_int_cond/float_cond. Bodies are ML_NOINLINE
+(the loop-body text rule - inlining cost 55_float_sum +0.6% I-count / ~3% wall
+with no bytecode change; off-frame helpers restored I-count neutrality).
+Measured (callgrind Ir vs lever-2): 34_sort -10.5%, 35_map_filter -11.5%
+(the boxed CmpV/num_bin_op/is_true GONE); cumulative from pre-#60: sort -20%,
+map_filter -26%. -rt 1565/1565 + differential 1402/1402 (3 new tests: typed
+int/float compare-value, boxed chain); nested_fuzz 400 all-agree. OPEN: a
+residual 55_float_sum WALL signal (~a few %, I-count-neutral) is the
+vm_dispatch-growth layout tax every new op pays (WSL2 has no PMU to diagnose;
+maintainer's call whether the broad compare-value win justifies it).
+
 ## ===== EXECUTION GUIDE: callback re-entry (self-contained, compact-safe) =====
 Maintainer's pick 2026-07-20: do (a), MEASURE, then (b), MEASURE. HEAD at write
 time = 3780fcf. Build/test: `make -j TESTS=1 OPT=0 BUILD_DIR=build-dbg` (debug

@@ -775,6 +775,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.a(), false) << " " << opsym(in.aop) << " "
                 << RI(in.b(), false);
             break;
+        case OpCode::CmpIntV:
+        case OpCode::CmpFloatV:
+            row << (in.op == OpCode::CmpIntV ? "i.cmp.v      "
+                                             : "f.cmp.v      ")
+                << D(in.target) << " = " << RI(in.a(), false) << " "
+                << opsym(in.aop) << " " << RI(in.b(), false) << "   ; bool";
+            break;
         /* B1/B2 specialized arithmetic: same 3-address render, the operator
          * baked in the opcode (the shape is visible from the operands). */
         case OpCode::IntAddRR: case OpCode::IntAddRI:
