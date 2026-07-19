@@ -130,14 +130,6 @@ if (NOT MSVC)
    target_compile_options(mylang PUBLIC -Wall -Wextra -Wno-unused-parameter)
 endif()
 
-# The codebase intentionally calls `move`/`forward` unqualified (see
-# `using std::move;` in defs.h), which recent clang reports under
-# -Wunqualified-std-cast-call. Silence it for clang only (AFTER -Wall/-Wextra
-# so the -Wno wins).
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-   target_compile_options(mylang PUBLIC -Wno-unqualified-std-cast-call)
-endif()
-
 # WERROR (default ON, EVERY build type + compiler): a warning FAILS the build,
 # so it must be ADDRESSED, not left to accumulate in the log (see CLAUDE.md's
 # warning rule - MSVC in particular emits narrowing/deprecation warnings the

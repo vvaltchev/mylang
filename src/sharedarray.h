@@ -80,7 +80,7 @@ public:
         int stride = 0;
         svec_type() = default;
         svec_type(std::vector<char> &&b, StructTypeDef *d, int s)
-            : buf(move(b)), def(d), stride(s) { }
+            : buf(std::move(b)), def(d), stride(s) { }
     };
 
     /*
@@ -145,22 +145,22 @@ private:
 
         SharedObject() : kind(Storage::general) { new (&vec) vec_type(); }
         SharedObject(vec_type &&a) : kind(Storage::general) {
-            new (&vec) vec_type(move(a));
+            new (&vec) vec_type(std::move(a));
         }
         SharedObject(ivec_type &&a) : kind(Storage::ints) {
-            new (&ivec) ivec_type(move(a));
+            new (&ivec) ivec_type(std::move(a));
         }
         SharedObject(fvec_type &&a) : kind(Storage::floats) {
-            new (&fvec) fvec_type(move(a));
+            new (&fvec) fvec_type(std::move(a));
         }
         SharedObject(bvec_type &&a) : kind(Storage::bools) {
-            new (&bvec) bvec_type(move(a));
+            new (&bvec) bvec_type(std::move(a));
         }
         SharedObject(svec_type &&a) : kind(Storage::structs) {
-            new (&svec) svec_type(move(a));
+            new (&svec) svec_type(std::move(a));
         }
         SharedObject(tvec_type &&a) : kind(Storage::strs) {
-            new (&tvec) tvec_type(move(a));
+            new (&tvec) tvec_type(std::move(a));
         }
 
         ~SharedObject() {
@@ -194,7 +194,7 @@ public:
     SharedArrayObjTempl(const vec_type &arr) = delete;
 
     SharedArrayObjTempl(vec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->vec.size())
         , slice(false)
@@ -202,21 +202,21 @@ public:
 
     /* Flat (unboxed) int/float storage - see plans/typed-arrays.md. */
     SharedArrayObjTempl(ivec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->ivec.size())
         , slice(false)
     { }
 
     SharedArrayObjTempl(fvec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->fvec.size())
         , slice(false)
     { }
 
     SharedArrayObjTempl(bvec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->bvec.size())
         , slice(false)
@@ -225,7 +225,7 @@ public:
     /* Flat POD-struct storage (plans/structs.md phase 7). `len` is the element
      * count (buf bytes / stride). */
     SharedArrayObjTempl(svec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->svec.stride
                   ? static_cast<size_type>(shobj->svec.buf.size() /
@@ -236,7 +236,7 @@ public:
 
     /* Flat STRING storage (top-10 #7). */
     SharedArrayObjTempl(tvec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->tvec.size())
         , slice(false)
@@ -266,7 +266,7 @@ public:
     }
 
     SharedArrayObjTempl(SharedArrayObjTempl &&obj)
-        : shobj(move(obj.shobj))
+        : shobj(std::move(obj.shobj))
         , off(obj.off)
         , len(obj.len)
         , slice(obj.slice)
@@ -305,7 +305,7 @@ public:
         if (slice)                     /* unregister THIS from its old shobj */
             shobj->slices.erase(this);
 
-        shobj = move(obj.shobj);
+        shobj = std::move(obj.shobj);
         off = obj.off;
         len = obj.len;
         slice = obj.slice;

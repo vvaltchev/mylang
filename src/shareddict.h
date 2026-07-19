@@ -52,7 +52,7 @@ public:
 
     DictObjectTempl(const inner_type &) = delete;
     DictObjectTempl(inner_type &&d)
-        : data(move(d))
+        : data(std::move(d))
     { }
 
     inner_type &get_ref() { return data; }

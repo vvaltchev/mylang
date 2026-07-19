@@ -641,7 +641,7 @@ public:
     }
 
     LValue(EvalValue &&val, bool is_const)
-        : val(move(val))
+        : val(std::move(val))
         , container(nullptr)
         , is_const(is_const)
     {

@@ -466,7 +466,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     try {
         infer.check_input(root.get());
     } catch (const Exception &e) {
-        retained.push_back(move(root));   /* keep the AST alive (id_sym refs) */
+        retained.push_back(std::move(root));   /* keep the AST alive (id_sym refs) */
         /* keep any trace lines emitted before the error (the reasoning that
          * led up to it), then the error itself. */
         return out.str() + format_error(e);
@@ -499,19 +499,19 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
                 if (v.is<UndefinedId>())
                     throw UndefinedVariableEx(
                         v.get<UndefinedId>().id, e->start, e->end);
-                last = move(v);
+                last = std::move(v);
                 last_elem = e.get();
             }
         }
     } catch (const Exception &e) {
         std::cout.rdbuf(old_cout);
-        retained.push_back(move(root));   /* keep partial defs alive */
+        retained.push_back(std::move(root));   /* keep partial defs alive */
         out << format_error(e);
         return out.str();
     }
 
     std::cout.rdbuf(old_cout);
-    retained.push_back(move(root));
+    retained.push_back(std::move(root));
 
     /* (Removing a global from the type environment is the `:undef` command's
      * job now - there is no runtime undef() builtin to detect here.) */

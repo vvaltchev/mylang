@@ -19,8 +19,6 @@ using std::cerr;
 using std::ostream;
 using std::endl;
 
-using std::move;
-using std::forward;
 using std::unique_ptr;
 using std::shared_ptr;
 using std::make_pair;

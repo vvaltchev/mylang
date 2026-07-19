@@ -31,16 +31,16 @@ public:
 
     template<typename... Args>
     FlatVal(const T &s, Args&&... args) {
-        new ((void *)data) T(s, forward<Args>(args)...);
+        new ((void *)data) T(s, std::forward<Args>(args)...);
     }
 
     template<typename... Args>
     FlatVal(T &&s, Args&&... args) {
-        new ((void *)data) T(move(s), forward<Args>(args)...);
+        new ((void *)data) T(std::move(s), std::forward<Args>(args)...);
     }
 
     template<typename... Args>
     FlatVal(Args&&... args) {
-        new ((void *)data) T(forward<Args>(args)...);
+        new ((void *)data) T(std::forward<Args>(args)...);
     }
 };

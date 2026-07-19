@@ -41,7 +41,7 @@ void SharedArrayObjTempl<LValueT>::promote_structs_to_general()
     for (size_type i = 0; i < n; i++)
         nv.emplace_back(struct_elem_at(*this, i), false);
 
-    *this = SharedArrayObjTempl(move(nv));
+    *this = SharedArrayObjTempl(std::move(nv));
 }
 
 template <class LValueT>
@@ -57,7 +57,7 @@ void SharedArrayObjTempl<LValueT>::promote_strs_to_general()
     for (size_type i = 0; i < n; i++)
         nv.emplace_back(EvalValue(SharedStr(shobj->tvec[base + i])), false);
 
-    *this = SharedArrayObjTempl(move(nv));
+    *this = SharedArrayObjTempl(std::move(nv));
 }
 
 template <class LValueT>
@@ -81,7 +81,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->ivec.cbegin() + offset(),
                 shobj->ivec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
 
@@ -90,7 +90,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->fvec.cbegin() + offset(),
                 shobj->fvec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
 
@@ -99,7 +99,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->bvec.cbegin() + offset(),
                 shobj->bvec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
 
@@ -110,7 +110,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->svec.buf.cbegin() + (offset() + size()) * stride
             );
             *this = SharedArrayObjTempl(
-                svec_type(move(nb), shobj->svec.def, stride));
+                svec_type(std::move(nb), shobj->svec.def, stride));
             return;
         }
 
@@ -119,7 +119,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->tvec.cbegin() + offset(),
                 shobj->tvec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
 
@@ -132,7 +132,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
         shobj->vec.cbegin() + offset() + size()
     );
 
-    *this = SharedArrayObjTempl(move(new_vec));
+    *this = SharedArrayObjTempl(std::move(new_vec));
 }
 
 template <class LValueT>
@@ -296,7 +296,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
             nv.insert(nv.end(),
                       rv.cbegin() + rhs.offset(),
                       rv.cbegin() + rhs.offset() + rhs.size());
-            lval = SharedArrayObj(move(nv));
+            lval = SharedArrayObj(std::move(nv));
         }
 
         return;
@@ -326,7 +326,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
             nv.insert(nv.end(),
                       rv.cbegin() + rhs.offset(),
                       rv.cbegin() + rhs.offset() + rhs.size());
-            lval = SharedArrayObj(move(nv));
+            lval = SharedArrayObj(std::move(nv));
         }
 
         return;
@@ -356,7 +356,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
             nv.insert(nv.end(),
                       rv.cbegin() + rhs.offset(),
                       rv.cbegin() + rhs.offset() + rhs.size());
-            lval = SharedArrayObj(move(nv));
+            lval = SharedArrayObj(std::move(nv));
         }
 
         return;
@@ -386,7 +386,7 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
             new_arr.emplace_back(arr_elem_at(lval, i), false);
         for (size_type i = 0; i < rn; i++)
             new_arr.emplace_back(arr_elem_at(rhs, i), false);
-        lval = SharedArrayObj(move(new_arr));
+        lval = SharedArrayObj(std::move(new_arr));
     }
 }
 

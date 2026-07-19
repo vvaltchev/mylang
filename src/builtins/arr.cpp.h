@@ -78,7 +78,7 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
         for (int_type i = 0; i < n; i++)
             vec.emplace_back(none, ctx->const_ctx);
 
-        return SharedArrayObj(move(vec));
+        return SharedArrayObj(std::move(vec));
     }
 
     const EvalValue &v = args[1];
@@ -110,7 +110,7 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
     for (int_type i = 0; i < n; i++)
         vec.emplace_back(v, ctx->const_ctx);
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(std::move(vec));
 }
 
 /*
@@ -209,10 +209,10 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
         }
     }
 
-    if (mode == 1) return SharedArrayObj(move(ivec));
-    if (mode == 2) return SharedArrayObj(move(fvec));
-    if (mode == 4) return SharedArrayObj(move(bvec));
-    return SharedArrayObj(move(gvec));
+    if (mode == 1) return SharedArrayObj(std::move(ivec));
+    if (mode == 2) return SharedArrayObj(std::move(fvec));
+    if (mode == 4) return SharedArrayObj(std::move(bvec));
+    return SharedArrayObj(std::move(gvec));
 }
 
 /*
@@ -282,7 +282,7 @@ EvalValue builtin_dynarray(EvalContext *ctx, const ArgLocs *exprList,
     for (size_type i = 0; i < n; i++)
         gvec.emplace_back(arr_elem_at(arr, i), false);
 
-    return SharedArrayObj(move(gvec));
+    return SharedArrayObj(std::move(gvec));
 }
 
 /*
@@ -728,7 +728,7 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
         else
             for (int_type i = start; i > end; i += step)
                 vec.emplace_back(EvalValue(i), false);
-        return SharedArrayObj(move(vec));
+        return SharedArrayObj(std::move(vec));
     }
 
     SharedArrayObj::ivec_type ivec;
@@ -744,7 +744,7 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
             ivec.push_back(i);
     }
 
-    return SharedArrayObj(move(ivec));
+    return SharedArrayObj(std::move(ivec));
 }
 
 EvalValue

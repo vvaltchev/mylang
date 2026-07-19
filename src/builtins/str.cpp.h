@@ -71,7 +71,7 @@ EvalValue builtin_split(EvalContext *ctx, const ArgLocs *exprList,
             vec.emplace_back(shared_str, i, 1);
     }
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(std::move(vec));
 }
 
 EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
@@ -113,7 +113,7 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
             if (i != n - 1)
                 result += delim;
         }
-        return SharedStr(move(result));
+        return SharedStr(std::move(result));
     }
 
     if (arr.skind() == SharedArrayObj::Storage::general) {
@@ -147,7 +147,7 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
                 result += delim;
         }
 
-        return SharedStr(move(result));
+        return SharedStr(std::move(result));
     }
 
     /* A FLAT (int/float/bool/struct) array: read kind-aware (arr_elem_at, no
@@ -166,7 +166,7 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
             result += delim;
     }
 
-    return SharedStr(move(result));
+    return SharedStr(std::move(result));
 }
 
 EvalValue builtin_splitlines(EvalContext *ctx, const ArgLocs *exprList,
@@ -210,7 +210,7 @@ EvalValue builtin_splitlines(EvalContext *ctx, const ArgLocs *exprList,
         vec.emplace_back(shared_str, start, i - start);
     }
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(std::move(vec));
 }
 
 EvalValue builtin_ord(EvalContext *ctx, const ArgLocs *exprList,

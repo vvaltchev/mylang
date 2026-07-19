@@ -481,7 +481,7 @@ build_zero_struct_init(const StructTypeDef *def, Loc loc)
         }
         a->start = loc;
         a->end = loc;
-        args->elems.push_back(move(a));
+        args->elems.push_back(std::move(a));
     }
 
     auto callee = make_unique<Identifier>(def->name->val);
@@ -489,8 +489,8 @@ build_zero_struct_init(const StructTypeDef *def, Loc loc)
     callee->end = loc;
 
     auto call = make_unique<CallExpr>();
-    call->what = move(callee);
-    call->args = move(args);
+    call->what = std::move(callee);
+    call->args = std::move(args);
     call->start = loc;
     call->end = loc;
     return call;
@@ -880,7 +880,7 @@ pList(ParseContext &c,
     if (subexpr) {
 
         is_const = is_const && subexpr->is_const;
-        ret->elems.emplace_back(move(subexpr));
+        ret->elems.emplace_back(std::move(subexpr));
 
         while (*c == Op::comma) {
 
@@ -891,7 +891,7 @@ pList(ParseContext &c,
                 noExprError(c);
 
             is_const = is_const && subexpr->is_const;
-            ret->elems.emplace_back(move(subexpr));
+            ret->elems.emplace_back(std::move(subexpr));
         }
     }
 
@@ -958,7 +958,7 @@ pArgList(ParseContext &c, unsigned fl)
 
             is_const = is_const && e->is_const;
             ret->arg_names.push_back(name);
-            ret->elems.emplace_back(move(e));
+            ret->elems.emplace_back(std::move(e));
 
             if (!pAcceptOp(c, Op::comma))
                 break;
@@ -1021,7 +1021,7 @@ pAcceptCallExpr(ParseContext &c,
 
         ret.reset();
         expr->start = what->start;
-        expr->what = move(what);
+        expr->what = std::move(what);
         expr->args = pArgList(c, fl);
 
         /* A named call can't bind/fold until its labels are mapped to
@@ -1064,7 +1064,7 @@ pAcceptCallExpr(ParseContext &c,
             /* end spans through the closing ')': the caret convention is
              * loc_end = last-char-column + 2, and get_loc() is the ')' here. */
             expr->end = c.get_loc() + 2;
-            ret = move(expr);
+            ret = std::move(expr);
         }
 
         pExpectOp(c, Op::parenR);
@@ -1090,8 +1090,8 @@ pAcceptSubscript(ParseContext &c,
 
             unique_ptr<Slice> s(new Slice);
 
-            s->what = move(what);
-            s->start_idx = move(start);
+            s->what = std::move(what);
+            s->start_idx = std::move(start);
             s->end_idx = pExprTop(c, fl);
 
             if (s->what->is_const) {
@@ -1100,7 +1100,7 @@ pAcceptSubscript(ParseContext &c,
                         s->is_const = true;
             }
 
-            ret = move(s);
+            ret = std::move(s);
             in_slice = true;
 
         } else {
@@ -1110,13 +1110,13 @@ pAcceptSubscript(ParseContext &c,
             if (!start)
                 noExprError(c);
 
-            s->what = move(what);
-            s->index = move(start);
+            s->what = std::move(what);
+            s->index = std::move(start);
 
             if (s->what->is_const && s->index->is_const)
                 s->is_const = true;
 
-            ret = move(s);
+            ret = std::move(s);
         }
 
         /* Set the node's own span (start of the subscripted expr, through ']'),
@@ -1137,7 +1137,7 @@ pAcceptSubscript(ParseContext &c,
                         true,
                         (fl & pFlags::pInConstDecl) != 0))
                 {
-                    ret = move(const_construct);
+                    ret = std::move(const_construct);
                 }
             }
         }
@@ -1208,7 +1208,7 @@ pAcceptMember(ParseContext &c,
     mem->is_const = what->is_const && !opt;
     mem->optional = opt;
     mem->start = what->start;
-    mem->what = move(what);
+    mem->what = std::move(what);
 
     unique_ptr<Construct> tmpId;
 
@@ -1224,7 +1224,7 @@ pAcceptMember(ParseContext &c,
 
     mem->memId = SharedStr(string(id->get_str()));
     mem->memUid = UniqueId::get(id->get_str());
-    ret = move(mem);
+    ret = std::move(mem);
     return true;
 }
 
@@ -1293,7 +1293,7 @@ pExpr01(ParseContext &c, unsigned fl)
            pAcceptSubscript(c, main, otherExpr, fl) ||
            pAcceptMember(c, main, otherExpr, fl))
     {
-        main = move(otherExpr);
+        main = std::move(otherExpr);
     }
 
     /* postfix ++ / -- : binds tighter than any unary/binary operator (it sits
@@ -1309,7 +1309,7 @@ pExpr01(ParseContext &c, unsigned fl)
         id->end = opLoc + 2;       /* span through the ++ / -- */
         id->is_prefix = false;
         id->is_inc = is_inc;
-        id->lvalue = move(main);
+        id->lvalue = std::move(main);
         return id;
     }
 
@@ -1338,7 +1338,7 @@ pExprGeneric(ParseContext &c,
 
         if (!ret) {
             ret.reset(new ExprT);
-            ret->elems.emplace_back(Op::invalid, move(lowerE));
+            ret->elems.emplace_back(Op::invalid, std::move(lowerE));
         }
 
         lowerE = lowerExpr(c, fl);
@@ -1347,7 +1347,7 @@ pExprGeneric(ParseContext &c,
             noExprError(c);
 
         is_const = is_const && lowerE->is_const;
-        ret->elems.emplace_back(op, move(lowerE));
+        ret->elems.emplace_back(op, std::move(lowerE));
     }
 
     if (!ret)
@@ -1381,7 +1381,7 @@ pExpr02(ParseContext &c, unsigned fl)
         id->end = c.get_loc();
         id->is_prefix = true;
         id->is_inc = is_inc;
-        id->lvalue = move(elem);
+        id->lvalue = std::move(elem);
         return id;
     }
 
@@ -1416,7 +1416,7 @@ pExpr02(ParseContext &c, unsigned fl)
     ret->start = start;
     ret->end = c.get_loc();
     ret->is_const = elem->is_const;
-    ret->elems.emplace_back(op, move(elem));
+    ret->elems.emplace_back(op, std::move(elem));
     return ret;
 }
 
@@ -1517,7 +1517,7 @@ pExprCoalesce(ParseContext &c, unsigned fl)
 
     unique_ptr<CoalesceExpr> co(new CoalesceExpr);
     co->start = lhs->start;
-    co->lhs = move(lhs);
+    co->lhs = std::move(lhs);
     co->rhs = pExprCoalesce(c, fl);          /* right-associative */
     if (!co->rhs)
         noExprError(c);
@@ -1525,7 +1525,7 @@ pExprCoalesce(ParseContext &c, unsigned fl)
 
     if (c.const_eval && co->lhs->is_const) {
         const EvalValue &v = co->lhs->eval(c.const_ctx);
-        return v.is<NoneVal>() ? move(co->rhs) : move(co->lhs);
+        return v.is<NoneVal>() ? std::move(co->rhs) : std::move(co->lhs);
     }
 
     return co;
@@ -1547,7 +1547,7 @@ pExpr13(ParseContext &c, unsigned fl)
     const unsigned bfl = fl & ~(pFlags::pInStmt | pFlags::pInDecl);
     unique_ptr<TernaryExpr> t(new TernaryExpr);
     t->start = cond->start;
-    t->condExpr = move(cond);
+    t->condExpr = std::move(cond);
     t->thenExpr = pExpr14(c, bfl);           /* middle: full expr, up to ':' */
     if (!t->thenExpr)
         noExprError(c);
@@ -1559,8 +1559,8 @@ pExpr13(ParseContext &c, unsigned fl)
 
     if (c.const_eval && t->condExpr->is_const) {
         const EvalValue &v = t->condExpr->eval(c.const_ctx);
-        return v.get_type()->is_true(v) ? move(t->thenExpr)
-                                        : move(t->elseExpr);
+        return v.get_type()->is_true(v) ? std::move(t->thenExpr)
+                                        : std::move(t->elseExpr);
     }
 
     return t;
@@ -1702,7 +1702,7 @@ pExpr14(ParseContext &c, unsigned fl)
                     declExprCheckId(c, e.get());
             }
 
-            lside = move(idlist);
+            lside = std::move(idlist);
             in_idlist = true;
         }
     }
@@ -1731,7 +1731,7 @@ pExpr14(ParseContext &c, unsigned fl)
              */
             ret.reset(new Expr14);
             ret->op = Op::assign;
-            ret->lvalue = move(lside);
+            ret->lvalue = std::move(lside);
             /* An `opt` typed decl (nullable) defaults to none; a non-opt typed
              * decl to its type's zero value; a plain `var` to none. */
             ret->rvalue =
@@ -1762,7 +1762,7 @@ pExpr14(ParseContext &c, unsigned fl)
     if (!ret) {
         ret.reset(new Expr14);
         ret->op = op;
-        ret->lvalue = move(lside);
+        ret->lvalue = std::move(lside);
         ret->rvalue = pExpr14(c, fl & ~pFlags::pInDecl);
     }
 
@@ -1834,7 +1834,7 @@ pExpr14(ParseContext &c, unsigned fl)
                 true,
                 (fl & pFlags::pInConstDecl) != 0))
         {
-            ret->rvalue = move(cc);
+            ret->rvalue = std::move(cc);
         }
     }
 
@@ -1912,7 +1912,7 @@ pAcceptReturnStmt(ParseContext &c,
         pExpectOp(c, Op::semicolon);
         stmt->start = start;
         stmt->end = c.get_loc();
-        ret = move(stmt);
+        ret = std::move(stmt);
         return true;
     }
 
@@ -1936,7 +1936,7 @@ pAcceptThrowStmt(ParseContext &c,
 
         t->start = start;
         t->end = c.get_loc();
-        ret = move(t);
+        ret = std::move(t);
         return true;
     }
 
@@ -2062,14 +2062,14 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
             added_elem = false;
 
             if (pAcceptBracedBlock(c, tmp, fl)) {
-                ret->elems.emplace_back(move(tmp));
+                ret->elems.emplace_back(std::move(tmp));
                 added_elem = true;
             }
 
             while ((stmt = pStmt(c, fl))) {
 
                 if (!stmt->is_nop())
-                    ret->elems.emplace_back(move(stmt));
+                    ret->elems.emplace_back(std::move(stmt));
 
                 added_elem = true;
 
@@ -2126,7 +2126,7 @@ static unique_ptr<Construct> pWrapDeclBody(unique_ptr<Construct> stmt)
     auto blk = make_unique<Block>();
     blk->start = stmt->start;
     blk->end = stmt->end;
-    blk->elems.push_back(move(stmt));
+    blk->elems.push_back(std::move(stmt));
     return blk;
 }
 
@@ -2153,7 +2153,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         unique_ptr<Construct> stmt = pStmt(c, fl);
 
         if (stmt && !stmt->is_nop())
-            ifstmt->thenBlock = move(stmt);
+            ifstmt->thenBlock = std::move(stmt);
     }
 
     if (pAcceptKeyword(c, Keyword::kw_else)) {
@@ -2163,7 +2163,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             unique_ptr<Construct> stmt = pStmt(c, fl);
 
             if (stmt && !stmt->is_nop())
-                ifstmt->elseBlock = move(stmt);
+                ifstmt->elseBlock = std::move(stmt);
         }
     }
 
@@ -2184,13 +2184,13 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         }
 
         if (t)
-            ret = move(ifstmt->thenBlock);   /* NOT wrapped: keeps the
+            ret = std::move(ifstmt->thenBlock);   /* NOT wrapped: keeps the
                                               * `if (true) func g()...`
                                               * feature-flag decl leaking to
                                               * the enclosing scope, as it
                                               * always did */
         else
-            ret = move(ifstmt->elseBlock);
+            ret = std::move(ifstmt->elseBlock);
 
         /* The taken branch is empty (a const-false `if` with no `else`, or a
          * const-true `if` with an empty body): the whole statement folds away.
@@ -2203,9 +2203,9 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     } else {
         /* A RUNTIME if: a brace-less func/struct decl branch gets its Block
          * wrapper (the crash fix - see pWrapDeclBody). */
-        ifstmt->thenBlock = pWrapDeclBody(move(ifstmt->thenBlock));
-        ifstmt->elseBlock = pWrapDeclBody(move(ifstmt->elseBlock));
-        ret = move(ifstmt);
+        ifstmt->thenBlock = pWrapDeclBody(std::move(ifstmt->thenBlock));
+        ifstmt->elseBlock = pWrapDeclBody(std::move(ifstmt->elseBlock));
+        ret = std::move(ifstmt);
     }
 
     return true;
@@ -2252,7 +2252,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         }
     }
 
-    ret = move(whileStmt);
+    ret = std::move(whileStmt);
     return true;
 }
 
@@ -2329,12 +2329,12 @@ pAcceptFuncDecl(ParseContext &c,
         auto rs = make_unique<ReturnStmt>();
         rs->start = ex->start;
         rs->end = ex->end;
-        rs->elem = move(ex);
+        rs->elem = std::move(ex);
         auto blk = make_unique<Block>();
         blk->start = rs->start;
         blk->end = rs->end;
-        blk->elems.push_back(move(rs));
-        func->body = move(blk);
+        blk->elems.push_back(std::move(rs));
+        func->body = std::move(blk);
 
     } else if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody)) {
 
@@ -2355,7 +2355,7 @@ pAcceptFuncDecl(ParseContext &c,
     if (c.const_eval && is_pure && func->id)
         func->eval(c.const_ctx);
 
-    ret = move(func);
+    ret = std::move(func);
     return true;
 }
 
@@ -2531,7 +2531,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 throw ExpressionIsNotConstEx(rv->start, rv->end);
 
             EvalValue cv = make_const_clone(RValue(rv->eval(c.const_ctx)));
-            stmt->def->consts.emplace_back(cn, move(cv));
+            stmt->def->consts.emplace_back(cn, std::move(cv));
             pExpectOp(c, Op::semicolon);
             continue;
         }
@@ -2628,7 +2628,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     if (c.const_eval)
         stmt->eval(c.const_ctx);
 
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }
 
@@ -2900,7 +2900,7 @@ cse_materialize(ParseContext &c,
         if (!key.empty())
             c.cse->insert(key, baked);
 
-        out = make_unique<LiteralObj>(move(baked), true);
+        out = make_unique<LiteralObj>(std::move(baked), true);
         return true;
     }
 
@@ -2975,8 +2975,8 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
 
         stmt->catchStmts.emplace_back(
-            AllowedExList{move(exList), move(asId)},
-            move(body)
+            AllowedExList{std::move(exList), std::move(asId)},
+            std::move(body)
         );
     };
 
@@ -2993,7 +2993,7 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         );
     }
 
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }
 
@@ -3062,7 +3062,7 @@ pAcceptForeachStmt(ParseContext &c,
         }
     }
 
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }
 
@@ -3101,6 +3101,6 @@ pAcceptForStmt(ParseContext &c,
         stmt->body = pWrapDeclBody(pStmt(c, fl));
 
     stmt->end = c.get_loc();
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }

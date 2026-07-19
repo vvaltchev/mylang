@@ -437,7 +437,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                 result.emplace_back(e, ctx->const_ctx);
         }
 
-        return SharedArrayObj(move(result));
+        return SharedArrayObj(std::move(result));
 
     } else if (container.is<intrusive_ptr<DictObject>>()) {
 
@@ -458,14 +458,14 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
             for (auto const &e : data)
                 result.emplace_back(call_kv(e.first, e.second.get()),
                                     ctx->const_ctx);
-            return SharedArrayObj(move(result));
+            return SharedArrayObj(std::move(result));
         }
 
         DictObject::inner_type result;
         for (auto const &e : data)
             if (call_kv(e.first, e.second.get()).is_true())
                 result.insert(e);
-        return make_intrusive<DictObject>(move(result));
+        return make_intrusive<DictObject>(std::move(result));
     }
 
     throw TypeErrorEx(is_filter ? "Unsupported container type for filter()"

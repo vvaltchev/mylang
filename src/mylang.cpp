@@ -117,7 +117,7 @@ read_script(const char *filename)
         if (filestream.is_open()) {
 
             while (getline(filestream, line)) {
-                lines.push_back(move(line));
+                lines.push_back(std::move(line));
                 line.clear(); /* Put the string is a known state */
             }
 
@@ -329,7 +329,7 @@ parse_args(int argc, char **argv)
                 make_pair(
                     UniqueId::get("argv"),
                     LValue(
-                        EvalValue(SharedArrayObj(move(vec))),
+                        EvalValue(SharedArrayObj(std::move(vec))),
                         false
                     )
                 )
@@ -340,7 +340,7 @@ parse_args(int argc, char **argv)
     }
 
     if (in_tokens) {
-        lines.emplace_back(move(inline_text));
+        lines.emplace_back(std::move(inline_text));
         lex_all();
     }
 }
