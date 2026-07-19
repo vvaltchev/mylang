@@ -228,15 +228,37 @@ analysis-only). Commit per milestone.
   multi-island init+body or richer island ops) - zero suite impact; a mechanism
   step + the M5 prerequisite (real functions have loops). Test: `jit_container`
   sub-test 3 (a loop container runs + correct); differential + fuzzer.
-- **M4b (next) — widen to REAL loops + the BRANCHED island-exit.** (i) MULTIPLE
-  islands (an init MoveV + a body island is the common real shape) - each a
-  `call jit_exec_block`, the remap generalized per-island. (ii) Richer island op
-  sets (`SubscriptV`/`MemberV`/dict ops...). (iii) The `BRANCHED(pc)` island-exit
-  (#4): an `if`/`while` whose CONDITION is a boxed island that branches OUT to a
-  native block - `vm_exec_block` returns the branch-target pc, the container
-  routes it to that block's label. (iv) A LEANER island executor (the −3.4%
-  ceiling is the `vm_dispatch` re-entry - a bounded/lighter path would raise it).
-  Only then do real mixed functions become containers with a real win.
+- **M4b(i) — MULTIPLE islands. ✅ LANDED** (c7ec040). The gate collects every
+  contiguous island; the remap generalizes (`remap[p] = 1 + p + #islands ending
+  ≤ p`, one ExitBlock per island); the emit/rebuild loop one `call jit_exec_block`
+  per island. Handles the common init-MoveV + body-island shape. Still matched no
+  bench/sample with the narrow op set (the real blocker was the op set, not the
+  count).
+
+- **M4b(ii) — widen the island OP SET. INVESTIGATED + REVERTED (a decisive
+  negative result, 2026-07-21).** Since `vm_exec_block` IS the full VM, an island
+  can run ANY non-native op except (a) control-transfer branches (the BRANCHED
+  exit, not wired) and (b) CALLS (F2 C-stack growth). So `op_islandable` was
+  widened to a blacklist (all data ops - `SubscriptV`/`MemberV`/`MoveV`/generic
+  `IntBin`/... - islandable; calls/branches/handlers excluded). This DID hit real
+  code - `45_gcd` (a `while` loop) containerized - but it **REGRESSED it +17.7%**
+  (callgrind: 1816M vs 1543M vs `-nj`, which == the per-run path since gcd's
+  loop is sub-`MIN_RUN`). ROOT CAUSE: gcd's loop body is a tiny 3-op island
+  (`t=b; b=a%b; a=t`) and the native part is just 2 ops (the condition + back
+  edge); the per-island `vm_dispatch` RE-ENTRY per iteration costs FAR more than
+  the 2 native dispatches it saves. The interpreted path runs all 5 ops in ONE
+  continuous dispatch loop with zero re-entry; the container breaks that and pays
+  re-entry every iteration. **A loop container WINS only when native-ops-per-
+  iteration ≫ the island re-entry** (break-even ~3-4 native ops; the synthetic
+  M4a loop with 3 native ops was only −3.4%). Most real loops have small bodies →
+  a LOSS. So the op-set widening was REVERTED (don't ship the gcd regression).
+  **CONCLUSION: loop containers are marginal-to-negative for real code** - the
+  `vm_dispatch` re-entry per island is a hard floor. The M4 branch + multi-island
+  machinery is a PREREQUISITE for M5 (real functions loop), not a standalone win.
+  The real payoff is **M5 (native calls)** - a caller staying native across
+  calls removes the call dispatch + is not re-entry-bound. Reconsider loop
+  containers only with a genuinely leaner island executor (M4b-iv), and even then
+  small-body loops stay marginal.
 
 - **M5 — native calls to EVERY function.** A container that makes calls, not just
   leaf-callee calls: the checked-return unwind protocol (#5) + (for recursion)
