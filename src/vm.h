@@ -44,8 +44,15 @@ const Chunk *vm_func_chunk(const FuncDescriptor *fdesc, bool jit = true);
 /*
  * Drive a chunk against `ctx` (a function body's args context, or main). Runs
  * until Halt or an in-flight `return`; the caller reads ctx->flow->value.
+ *
+ * `reentrant` (#60): the caller is a builtin CALLBACK loop (VmInvoker /
+ * vm_try_invoke) that has ALREADY set up the activation + boundary window and
+ * announced g_current_ctx. In that case this skips the per-invocation entry
+ * setup (vm_enter_invocation_fast + the CtxGuard store) - the window/activation
+ * are the caller's and g_current_ctx is already `&ctx` - which is pure
+ * per-element overhead the callback loop would otherwise re-pay each element.
  */
-void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
+void vm_run_chunk(const Chunk &chunk, EvalContext &ctx, bool reentrant = false);
 
 /*
  * Allocate / release a callee frame WINDOW on the current activation's
@@ -94,12 +101,19 @@ public:
 
 private:
     bool ready_ = false;
+    bool fast_bind_ = false;
     VmActivation *act_ = nullptr;
     EvalContext *c_ = nullptr;
     const Chunk *cck_ = nullptr;
     const FuncDescriptor *desc_ = nullptr;
     Frame *w_ = nullptr;
     std::vector<LValue> *saved_caps_ = nullptr;
+    /* #60: g_current_ctx is owned for the whole loop (set once in the ctor,
+     * restored in the dtor) so a reentrant invoke() need not re-store it. */
+    EvalContext *saved_gctx_ = nullptr;
+    /* Loop-fixed arity fields (hoisted from desc_ - read once, not per call). */
+    size_t nparams_ = 0;
+    size_t min_args_ = 0;
 };
 void vm_window_pop();
 
