@@ -177,65 +177,131 @@ call is still interpreter-driven; the win is STEP 2). If green, COMMIT.
 
 ## STEP 2 — native `CallV` (caller side; the bigger win)
 
-GATE (all COMPILE-TIME; emit interpreted CallV if any fails — NOT a runtime
-bail): (1) `dc->vm_direct_func && dc->direct_func_slot >= 0`; (2) op is
-`CallV` (not `CachedCallV` in v1); (3) `root->global_slot_reassigned[slot]==0`
+### THE ORDERING PROBLEM (found during STEP-2 analysis, 2026-07-19)
+`jit_compile_chunk` runs INSIDE `codegen_chunk` (codegen.cpp ~7558), and
+`vm_precompile_all` codegens+jits each function body in `collect_funcs` order.
+So a CALLER can be jit-compiled BEFORE a later-declared CALLEE exists. The
+STEP-2 gate (does this call target a `native_leaf`?) is a COMPILE-TIME decision
+made in the caller's `jit_compile_chunk` — it needs the callee's `native_leaf`
+FLAG (and its `FuncDescriptor*`) available THEN. It does NOT need the callee's
+`native.base` at compile time (the caller bakes the callee `FuncDescriptor*` and
+loads `->vm_chunk->native.base + native_entry_off` at RUNTIME — by which point
+every body is compiled). So the fix is: make every callee's `native_leaf` flag
+available before ANY caller is jit'd → **codegen ALL bodies, THEN jit ALL
+bodies.** This is Slice 2.0; the native call itself is Slice 2.1.
+
+### Slice 2.0 — SEPARATE codegen from jit (foundation, NO behavior change)
+1. Add a `jit_chunk_is_native_leaf(const Chunk &)` to jit.h/jit.cpp: TRUE iff
+   `g_jit_enabled` AND the whole `[0,n)` is jit_op_eligible + all
+   `op_fully_native` + last op `ReturnV` (the exact `native_leaf` predicate,
+   from OPS only — no emit). Off-platform / `-nj` → false.
+2. `codegen_chunk` SETS `chunk.native_leaf` via that helper (so the flag is
+   available WITHOUT jitting). `jit_compile_chunk` keeps setting
+   `native_entry_off` (needs the emitted fragment), gated on the flag; it no
+   longer OWNS the flag (remove its `native_leaf=true` write, or make it an
+   `ML_CHECK` the codegen flag matches its run analysis).
+3. Add `bool jit = true` param to `codegen_chunk`/`codegen_func_body`/
+   `codegen_program`. When `jit==false`, skip the `jit_compile_chunk` call (the
+   flag is still set in step 2). DEFAULT true → disasm + all `-rt` sites +
+   `-vd` unchanged (they still get jit'd chunks + native_leaf).
+4. `vm_compile`: codegen main with `jit=false`. `vm_precompile_all`: **Pass A**
+   codegen every body (jit=false) into `g_func_chunks` (+ main); **Pass B** call
+   `jit_compile_chunk` on every chunk (main + all funcs). After Pass A every
+   `native_leaf` flag is set; Pass B's order is irrelevant (a caller bakes the
+   callee descriptor, loads native.base at runtime).
+5. VERIFY: `-vd`/`-vdj` BYTE-IDENTICAL over bench/ + samples/ (same fragments,
+   same native_leaf), `-rt` 1557/1557 + differential green, fuzzer green. This
+   is a pure refactor — no native call yet. COMMIT.
+
+### Slice 2.1 — the native `CallV`
+GATE (all COMPILE-TIME; emit the interpreted CallV if any fails — NOT a runtime
+bail): (1) `dc->vm_direct_func && dc->direct_func_slot >= 0`; (2) op is `CallV`
+(not `CachedCallV` in v1); (3) `root->global_slot_reassigned[slot]==0`
 (write-once); (4) the callee resolves at compile time to a `FuncDescriptor`
-whose `vm_chunk->native_leaf` is true (LEAF: its body makes NO calls — so it
-is C-stack-bounded, F2; check the callee chunk has no CallV/CallValueV/etc.);
-(5) arity fixed+correct (the inferencer already proved it). Need a
-slot→FuncDescriptor map at codegen (build from `collect_funcs` / the global
-slot assignments; the resolver knows `id->sym.slot` per FuncDeclStmt).
+whose chunk `jit_chunk_is_native_leaf` (LEAF: body makes NO calls → C-stack-
+bounded, F2); (5) arity fixed+correct (inference proved it). Need a
+slot→FuncDescriptor map at the caller's jit time (build in `vm_precompile_all`
+from the resolver's global slot assignments: `global_func_slots` /
+`FuncDeclStmt`'s slot, keyed by slot index → the callee's `desc`). Thread it +
+`root->global_slot_reassigned` + the CALLER's own `desc` into `jit_compile_chunk`
+(a new `JitCtx` param carrying them; null for the disasm/test path → no native
+calls there, fine).
 
-The caller fragment reaches the callee via an INDIRECT call: bake the callee
-`FuncDescriptor*` (program-lifetime, stable); at runtime load `desc->vm_chunk`
-→ `->native.base + native_entry_off`, `call rax`.
+**Recursion / C-stack (F2 v1):** only LEAF callees are native-called, so each
+native call adds a BOUNDED C-stack depth (caller frag → jit_call_setup → leaf
+frag → jit_ret). A self/mutual-recursive function is NOT a leaf (it calls) →
+gate fails → interpreted CallV (in-VM call stack, no C recursion). v2 grows a
+native stack for recursion.
 
-`ret_chunk` for the record: the caller fragment BAKES its OWN function's
-`FuncDescriptor*` (known at `codegen_func_body` time) so the setup helper reads
-`caller_desc->vm_chunk`; `ret_pc` = the CallV pc (a baked immediate).
+**N5 cache:** a run containing `CallV` caches NOTHING — `pick_cached_slots` hits
+`default: return {}` on the unclassified CallV, so `e.cache` is empty for that
+run (no flush, no reload complexity). v1 accepts the minor loss (a call-bearing
+run isn't N5-cached).
 
-Helper `jit_call_setup` (vm.cpp, extern "C", noexcept):
-`LValue *jit_call_setup(FuncDescriptor *callee_desc, int_type argbase,
-size_t nargs, int_type dst, FuncDescriptor *caller_desc, size_t callv_pc)` —
-resolve the FuncObject from the callee's global slot (`g_current_ctx->gfuncs`),
-`ML_CHECK` its `->func == callee_desc` (write-once invariant — loud, never a
-silent fallback), call `vm_frame_setup(*g_current_act, *g_current_ctx,
-caller_desc->vm_chunk, callv_pc, *fo, callee_desc->vm_chunk, argbase, nargs,
-dst, nullptr)`, return the window's `slots` ptr; on `StackOverflowEx` (from
-push_window) catch → `g_vm_jit_exc` → return nullptr.
+Baking: the caller fragment bakes the callee `FuncDescriptor*` (stable) and its
+OWN `caller_desc` + the CallV `pc` as immediates. `ret_chunk` = `caller_desc->
+vm_chunk`, `ret_pc` = pc+1 (`vm_frame_setup` does the +1).
 
-Emission (jit.cpp `emit_op` CallV case, only when the gate passes):
+Helper `jit_call_setup` (vm.cpp, `extern "C"` noexcept):
+`LValue *jit_call_setup(const FuncDescriptor *callee_desc, int_type argbase,
+size_t nargs, int_type dst, const FuncDescriptor *caller_desc, size_t
+callv_pc)` — resolve the FuncObject from the callee's global slot
+(`g_current_ctx->gfuncs`; the callee `desc` names the slot — or pass the slot),
+`ML_CHECK fo->func == callee_desc` (the write-once invariant, LOUD), then
+`vm_frame_setup(*g_vm_act, *g_current_ctx, caller_desc->vm_chunk, callv_pc, *fo,
+callee_desc->vm_chunk, argbase, nargs, dst, nullptr)`, return the window slots
+ptr; catch `StackOverflowEx` → `g_vm_jit_exc` → return nullptr. (Reuses STEP-1's
+`g_vm_act`/`g_current_ctx`.)
+
+Emission (jit.cpp `emit_op` CallV case, ONLY when the gate passes; else fall
+through to leave the interpreted CallV — it splits the run as today):
 ```
-e.flush_cache();                     // args + live locals to memory
-emit_call_prologue-like: push rdi (caller window) + cache regs, align
-set System V args: rdi=callee_desc, rsi=argbase, rdx=nargs, rcx=dst,
-                   r8=caller_desc, r9=callv_pc  (all baked immediates/movabs)
-call jit_call_setup                   // -> rax = callee window (or null)
-test rax,rax; jz <exit to g_vm_jit_exc path: exit_pc(callv_pc)>  // StackOverflow
-mov rdi, rax                          // rdi = callee window for the callee frag
-// indirect call the callee fragment:
-movabs rax, callee_desc; mov rax,[rax + off(vm_chunk)]; mov rcx,[rax +
-  off(native.base)]; add rcx, native_entry_off; call rcx
-// callee's native ReturnV already wrote our dst + popped its window + set
-// resume globals; we ignore the sentinel in rax (leaf = throw-free post-setup)
-restore rdi (caller window) + cache regs (pop), re-materialise rsi/r8
-reload the N5 cache (load each cached slot from memory)
-// continue with the next op
+e.flush_cache();                     // no-op (call run isn't cached), harmless
+emit_call_prologue(e)                // push rdi (+ empty cache) + 16-align
+movabs rdi, callee_desc              // SysV args:
+movabs rsi, argbase   (or lea)       //   rsi=argbase
+movabs rdx, nargs                    //   rdx=nargs
+movabs rcx, dst                      //   rcx=dst
+movabs r8,  caller_desc              //   r8=caller_desc
+movabs r9,  callv_pc                 //   r9=callv_pc
+call jit_call_setup                  // -> rax = callee window slots (or null)
+test rax,rax; jnz +over; <emit_call_epilogue THEN exit_pc(callv_pc)>; over:
+                                     // null => StackOverflow: g_vm_jit_exc set,
+                                     // EnterNative re-raises at callv_pc
+mov rdi, rax                         // rdi = callee window for the callee frag
+movabs rax, callee_desc              // load the callee fragment addr at runtime:
+mov rax, [rax + off(vm_chunk)]       //   rax = callee->vm_chunk  (a Chunk*)
+mov rcx, [rax + off(native_base)]    //   rcx = chunk->native.base
+add  rcx, callee->native_entry_off?  //   NO - load off(native_entry_off) too:
+mov  rdx, [rax + off(native_entry)]  //   rdx = chunk->native_entry_off
+add  rcx, rdx                        //   rcx = fragment entry
+call rcx                             // run the callee fragment; its native
+                                     // ReturnV (jit_ret) pops + writes OUR dst
+                                     // + rets a sentinel we IGNORE (leaf never
+                                     // bails post-setup)
+emit_call_epilogue(e)                // pop rdi, re-materialise rsi/r8
+// continue with the next op (rdi = caller window again; dst holds the result)
 ```
-The dst is written by the callee's `jit_ret`. NO checked-return in v1 (leaf =
-throw-free; the only exception is StackOverflow at setup, handled by the
-null-return → g_vm_jit_exc exit BEFORE the call). `CallV` is NOT
-`op_fully_native` (it can exit on StackOverflow), so its run is non-deletable
-(the original CallV survives, dead — like the container stores). Keep it out of
-`op_is_branch`.
+Offsets `off(vm_chunk)`, `off(native_base)`, `off(native_entry)` are probed
+into `JitLayout` (like the array layout) — `FuncDescriptor::vm_chunk` is a
+`void*`, `Chunk::native.base` + `Chunk::native_entry_off` via a co-located
+accessor so they can't silently drift. `CallV` is NOT `op_fully_native` (the
+StackOverflow exit), so its run is non-deletable (the interpreted CallV
+survives, dead) and stays OUT of `op_is_branch`.
 
-COVERAGE (maintainer rule "prove the code ran"): add a counter
-`g_jit_native_calls` bumped in jit_call_setup; a `jit:` test asserts it > 0 on
-a call-in-loop bench; measure same-binary JIT off/on A/B on `08_func_call` /
-`12_higher_order` (`build/mylang -nj` vs default). Backtrace test: an exception
-from a native-called leaf shows byte-identical frames (the record's ret_chunk/
-ret_pc from the baked caller_desc). `-rt` + `nested_fuzz.py` green. COMMIT.
+ALIGNMENT: entry rsp≡8; prologue (1 push rdi, empty cache, pad) → rsp≡0 at
+`call jit_call_setup`; still ≡0 at `call rcx` (no net push between); epilogue
+pops back to ≡8. The callee fragment is self-contained (sets its own rsi/r8),
+so nothing needs materialising before `call rcx`.
+
+COVERAGE (maintainer rule "prove the code ran"): counter `g_jit_native_calls`
+bumped in `jit_call_setup`; a `jit:` test asserts it > 0 for a native-leaf
+called in a loop AND result-correct; `-vdj` shows the caller fragment's
+`call jit_call_setup` + `call rcx`. Backtrace test: an exception RAISED in a
+native-called leaf (a builtin it calls, or a StackOverflow) shows byte-identical
+frames (record ret_chunk/ret_pc from the baked caller_desc). Same-binary JIT
+off/on A/B on `08_func_call`. `-rt` (debug+release) + `nested_fuzz.py` green.
+COMMIT.
 
 ## KEY GOTCHAS
 - A fragment holds NO chunk pointer (loc-less design; the chunk is stack-built
