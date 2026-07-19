@@ -877,13 +877,24 @@ warranted. For ordinary OPTIMIZATION work the default is lean:
   maintainer approved — because a measurement looks neutral. Bring the data and
   let him decide (see the "ask before reverting" convention + the "distrust a
   surprising result" rule below).
-- **CACHE the other-language bench results.** Python (and now C++, later
-  Ruby/Perl/Lua/maybe Java) don't change between MyLang edits, so their bench
-  timings must be cached in a GIT-IGNORED file and re-generated only when the
-  bench scripts themselves change OR on explicit request (a dedicated
-  `run.py`/`bench/cpp/run.py` option). A normal run then re-times ONLY MyLang
-  and reads the cached other-language numbers — this cuts the time to run the
-  whole suite roughly IN HALF. (TODO, agreed 2026-07-19.)
+- **The other-language bench results are CACHED, and a measure run is
+  cache-ONLY (DONE, 2026-07-19).** Python (and now C++, later Ruby/Perl/Lua/…)
+  don't change between MyLang edits, so their timings live in a GIT-IGNORED
+  `bench/.bench_cache/<lang>.json`, keyed by **(scale, sha1 of the comparison
+  SOURCE file)** — NOT a git commit, so a MyLang edit/commit never invalidates
+  them; only a scale change or a real `.py`/`.cpp` (or `bench.h`, for C++)
+  change does. A normal (**measure**) run re-times ONLY MyLang and reads the
+  cache **read-only**: `run.py` checks EVERY selected bench up front and
+  **fails fast** if any comparison entry is stale/missing, naming the
+  `--recompute` command — it NEVER re-times a comparison inline. Re-timing is a
+  **separate, explicit step**: `bench/run.py -cl <lang> --recompute [--filter …]`
+  (re)caches the stale entries — or all, with `--refresh-cache` — then exits
+  without timing MyLang. This is the load-bearing fix for a real asymmetry: a
+  comparison subprocess re-run inline used to interleave with the variance-
+  gated MyLang reps of the *next* bench and perturb them (so a stale Python
+  cache made py-mode abort on variance where a fresh cpp cache did not — the
+  inline re-run is now impossible). MyLang itself is NEVER cached (its time is
+  the whole point). Cuts a normal suite run's wall-time roughly IN HALF.
 
 **THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16; applies to
 DEEP, maintainer-initiated perf sessions — see the 1-vs-1 default above).** Any
