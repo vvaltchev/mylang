@@ -379,7 +379,7 @@ def results_match(a, b):
 #   * a normal (MEASURE) run reads the cache READ-ONLY and FAILS FAST up front
 #     if any selected bench is stale/missing - it never re-times a comparison;
 #   * `--recompute` is the SEPARATE, explicit step that (re)times + re-caches
-#     the comparison (stale only, or all with --refresh-cache), then exits.
+#     the comparison (stale only, or all with --force), then exits.
 # Since the comparison sources rarely change, --recompute is rarely needed.
 # Adding a language = one CompLang entry + a bench/<subdir>/.
 
@@ -491,7 +491,7 @@ def comp_time(lobj, bench, scale, reps, timeout, cache, refresh,
               cache_only=False):
     """Time the comparison language for `bench` at `scale`, via the cache.
     Returns (min_time, output, error_or_None, from_cache). A hit (same scale +
-    same source hash, unless --refresh-cache) skips the run entirely.
+    same source hash, unless --force) skips the run entirely.
 
     cache_only=True (the MEASURE path) NEVER runs a comparison subprocess: a
     miss returns a 'stale' error instead of re-timing. The up-front staleness
@@ -570,12 +570,12 @@ def main():
                     help="SEPARATE STEP: (re)time the comparison language for "
                          "the selected --complang + --filter and update its "
                          "cache, then exit (does NOT time MyLang). Recomputes "
-                         "only STALE entries unless --refresh-cache forces all. "
+                         "only STALE entries unless --force forces all. "
                          "A normal (measure) run is cache-ONLY and fails fast "
                          "if anything is stale, so this is the only place the "
                          "comparison is ever re-timed - the comparison sources "
                          "rarely change, so you rarely need it.")
-    ap.add_argument("--refresh-cache", action="store_true",
+    ap.add_argument("--force", action="store_true",
                     help="with --recompute: force-recompute EVERY selected "
                          "bench (not just stale ones). Ignored otherwise.")
     ap.add_argument("--timeout", type=float, default=120.0,
@@ -638,10 +638,10 @@ def main():
 
     if args.recompute:
         # SEPARATE STEP: (re)time + re-cache the comparison language, then exit.
-        # Only STALE entries by default (a no-op when all fresh); --refresh-cache
+        # Only STALE entries by default (a no-op when all fresh); --force
         # forces all. MyLang is never run here. This is the ONLY place a
         # comparison is timed, so it can never interleave with a measure run.
-        todo = comparable if args.refresh_cache else [
+        todo = comparable if args.force else [
             n for n in comparable
             if not cache_entry_fresh(lobj, n, scales[n], cache)]
         if not todo:
@@ -650,7 +650,7 @@ def main():
             return
         print("%s: recomputing %d of %d selected result(s)%s ..."
               % (lobj.name, len(todo), len(comparable),
-                 " (--refresh-cache: all)" if args.refresh_cache else " (stale)"))
+                 " (--force: all)" if args.force else " (stale)"))
         comp_reps = args.repeat if args.repeat > 0 else COMP_REPS
         failed = []
         for n in todo:
@@ -667,13 +667,13 @@ def main():
         print("done - %d %s comparison result(s) cached." % (len(todo), lobj.name))
         return
 
-    # MEASURE run: the comparison cache is READ-ONLY. --refresh-cache has no
+    # MEASURE run: the comparison cache is READ-ONLY. --force has no
     # inline meaning anymore (a measure run never re-times) - it applies to
     # --recompute only.
-    if args.refresh_cache:
-        sys.exit("--refresh-cache applies to --recompute only (a measure run is "
+    if args.force:
+        sys.exit("--force applies to --recompute only (a measure run is "
                  "cache-only).\n  Run:  bench/run.py -cl %s --recompute "
-                 "--refresh-cache%s" % (lobj.name, filt))
+                 "--force%s" % (lobj.name, filt))
     if not mylang:
         sys.exit("error: mylang binary not found; build it (make -j) or pass "
                  "--mylang")
@@ -707,9 +707,7 @@ def main():
                                   if args.vm else ""))
     comp_desc = args.python if lobj.name == "python" else (
         "%s (%s)" % (lobj.name, args.cxx) if lobj.name == "cpp" else lobj.name)
-    print("compare: %-8s %s%s" % (lobj.name, comp_desc,
-                                  "  [--refresh-cache]" if args.refresh_cache
-                                  else "  (cached)"))
+    print("compare: %-8s %s  (cached)" % (lobj.name, comp_desc))
     scale_note = ("global %d" % global_scale if global_scale is not None
                   else "per-bench from scales.txt")
     reps_note = ("fixed %d" % args.repeat if args.repeat > 0
