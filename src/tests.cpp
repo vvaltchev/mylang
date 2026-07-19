@@ -15334,6 +15334,65 @@ static bool vm_disasm_shape()
     return ok;
 }
 
+/* #55 STEP 2: -vd/-vdj are FAITHFUL to execution's native CALLS. A function->
+ * function call to a native_leaf runs as a native call, so the CALLER's chunk
+ * shows `enter.nat` at the call site (the interpreted call.v is kept, dead).
+ * disassemble_program replicates the precompile's two-pass + JitCtx to produce
+ * exactly that (a per-function codegen+jit with no JitCtx would show a plain
+ * interpreted call.v). runtime() keeps the arg non-const (no const-fold). */
+static bool vm_disasm_native_call()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;   /* JIT off: no native call to show */
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : {
+            "func nl(int a, int b) {",
+            "  var t = a * b; var u = t + a; var v = u - b;",
+            "  var w = v * a; var x = w + b; return x - a;",
+            "}",
+            "func nc(int n) {",
+            "  var acc = 0;",
+            "  for (var i = 1; i <= n; i++) acc = acc + nl(i, n);",
+            "  return acc;",
+            "}",
+            "print(nc(runtime(50)));" }) {
+        if (!src.empty())
+            src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    bool ok = false;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (b) {
+            const std::string d = disassemble_program(b);
+            /* nc's OWN section: the native call shows as enter.nat, and the
+             * interpreted call.v survives (non-deletable). */
+            const size_t p = d.find("; ===== func nc");
+            if (p != std::string::npos) {
+                const size_t e = d.find("; =====", p + 20);
+                const std::string sec = d.substr(
+                    p, e == std::string::npos ? std::string::npos : e - p);
+                ok = sec.find("enter.nat") != std::string::npos
+                    && sec.find("call.v") != std::string::npos;
+            }
+        }
+    } catch (...) {
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 /* -vd (disassemble_program) dumps 100% of the SERIALIZABLE image, not just the
  * code of funcs: the program's custom TYPES (struct defs - name, POD layout,
  * field offsets, folded consts) and each chunk's POOLS (consts, catch_types,
@@ -15754,6 +15813,8 @@ static const std::vector<extra_check> extra_checks =
     { "vm: node_table (pc-keyed) empty for native code, ast_nodes dropped",
       ast_node_pool_minimal },
     { "vm: bytecode disassembly (-vd smart assembly)", vm_disasm_shape },
+    { "vm: -vd shows native calls (enter.nat at the call site)",
+      vm_disasm_native_call },
     { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
     { "vm: disasm closures + halt-drop", vm_disasm_closure_shape },

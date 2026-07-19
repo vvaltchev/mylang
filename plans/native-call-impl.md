@@ -39,12 +39,13 @@ progress step, not the highest-value one (CLAUDE.md).
   exit; load callee->vm_chunk->native.base+entry; call rcx; epilogue);
   FuncDescriptor::vm_chunk / Chunk::native.base / native_entry_off offsets
   probed in vm.cpp.
+  -vd/-vdj are FAITHFUL (fixed 2026-07-20): disassemble_program replicates the
+  precompile's two-pass + JitCtx on throwaway chunks (each desc->vm_chunk points
+  at its local chunk for the gate, save/restored after), so a native call shows
+  as `enter.nat` at the call site and -vdj decodes the full sequence.
   v1 NON-NATIVE cases (always a correct interpreted fallback - NOT bugs):
     * a call FROM MAIN is never native (main has no stable descriptor for the
       record's ret_chunk) - by design in v1.
-    * -vd/-vdj does NOT show native calls (the disasm path builds no JitCtx) -
-      a disasm-fidelity gap, not correctness; coverage is via
-      g_jit_native_calls. TODO: thread a JitCtx into disassemble_program.
     * CachedCallV is excluded, but MOOT (its callee is a cacheable RECURSIVE
       func -> never a native_leaf, so the gate would reject it anyway).
 

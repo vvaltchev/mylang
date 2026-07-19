@@ -680,15 +680,19 @@ only LEAF callees are native-called, so a native call adds one fixed C frame; a
 recursive/non-leaf callee isn't `native_leaf` -> interpreted CallV. Coverage:
 `g_jit_native_calls` (a `jit:` test). Measured ~9% on an all-calls microbench
 (the win is dispatch removal; `vm_frame_setup` is shared with the interpreted
-path). **v1 non-native cases (always a correct interpreted fallback):** a call
-FROM MAIN (main has no stable descriptor for the record's ret_chunk); and
-`-vd`/`-vdj` don't SHOW native calls (the disasm path builds no JitCtx - a
-fidelity gap, not correctness; coverage is via `g_jit_native_calls`).
-`CachedCallV` is excluded too, but that is MOOT (its callee is a cacheable
-RECURSIVE func, which is never a `native_leaf`). A CONST-ARG call is NOT a gap:
-a pure callee folds at compile time (optimal - no call), an impure caller /
-runtime arg still native-calls, and a native_leaf rarely specializes to a clone
-(const-arg propagation on a small int body doesn't shrink it) - all verified.
+path). **`-vd`/`-vdj` are FAITHFUL:** `disassemble_program` (disasm.cpp)
+replicates the precompile's two-pass + `JitCtx` on throwaway chunks (pointing
+each `desc->vm_chunk` at its local chunk for the gate, save/restored after), so
+a native call shows as `enter.nat` at the caller's call site and `-vdj` decodes
+the full sequence (`push rdi` / `call jit_call_setup` / `test`+`jne` / the
+`vm_chunk`->`native.base`+`entry` loads / `call rcx` / epilogue). **v1 non-native
+cases (always a correct interpreted fallback):** a call FROM MAIN (main has no
+stable descriptor for the record's ret_chunk). `CachedCallV` is excluded too,
+but MOOT (its callee is a cacheable RECURSIVE func, never a `native_leaf`). A
+CONST-ARG call is NOT a gap: a pure callee folds at compile time (optimal - no
+call), an impure caller / runtime arg still native-calls, and a native_leaf
+rarely specializes to a clone (const-arg propagation on a small int body doesn't
+shrink it) - all verified.
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
