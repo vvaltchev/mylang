@@ -14281,10 +14281,14 @@ static bool jit_native_return()
 
     /* IN-VM path: a >=4-op TYPED leaf (t=x*y; u=t+x; return u-y) called in a
      * loop. Its whole body is a native_leaf, so each call's ReturnV runs in the
-     * fragment via jit_ret. Both functions are TYPED (not templates) with
-     * DISTINCT names/params: an untyped-template compile poisons a LATER
-     * compile's specialization (a pre-existing cross-compile inferencer state
-     * issue - see [[jit-native-return-cross-compile]]); typed bodies avoid it. */
+     * fragment via jit_ret. Both are concrete TYPED functions (the direct
+     * native-leaf case) with distinct names, kept independent so neither run
+     * skews the other's coverage count. (An earlier version blamed an
+     * "untyped-template poisons the next compile's specialization" bug for
+     * needing typed bodies - that was a MISDIAGNOSIS from a dirty incremental
+     * build; an untyped template works here too. See the
+     * cross_compile_specialize_stable guard below and MEMORY
+     * [[template-compile-pollutes-next-specialization]].) */
     const unsigned long b0 = g_jit_native_returns;
     if (!run({ "func fma(int x, int y) {",
                "  var t = x * y;",
