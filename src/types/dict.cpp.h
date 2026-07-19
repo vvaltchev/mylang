@@ -36,7 +36,7 @@ public:
 
 int_type TypeDict::len(const EvalValue &a)
 {
-    return a.get<intrusive_ptr<DictObject>>().get()->get_ref().size();
+    return a.get_ref<intrusive_ptr<DictObject>>().get()->get_ref().size();
 }
 
 void TypeDict::eq(EvalValue &a, const EvalValue &b)
@@ -50,7 +50,7 @@ void TypeDict::eq(EvalValue &a, const EvalValue &b)
         = a.get<intrusive_ptr<DictObject>>()->get_ref();
 
     const DictObject::inner_type &dataB
-        = b.get<intrusive_ptr<DictObject>>()->get_ref();
+        = b.get_ref<intrusive_ptr<DictObject>>()->get_ref();
 
     a = dataA == dataB;
 }
@@ -66,7 +66,7 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
         = a.get<intrusive_ptr<DictObject>>()->get_ref();
 
     const DictObject::inner_type &dataB
-        = b.get<intrusive_ptr<DictObject>>()->get_ref();
+        = b.get_ref<intrusive_ptr<DictObject>>()->get_ref();
 
     a = dataA != dataB;
 }
@@ -81,7 +81,7 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
 size_t TypeDict::hash(const EvalValue &a)
 {
     const DictObject::inner_type &data
-        = a.get<intrusive_ptr<DictObject>>()->get_ref();
+        = a.get_ref<intrusive_ptr<DictObject>>()->get_ref();
     size_t acc = hash_salt_dict;
 
     for (const auto &[k, v] : data) {
@@ -98,7 +98,13 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
                               bool for_write)
 {
     const EvalValue &what = RValue(what_lval);
-    intrusive_ptr<DictObject> &&flatObj = what.get<intrusive_ptr<DictObject>>();
+    /* Borrow (get_ref), not copy: `what` is const, so get<>() would COPY the
+     * intrusive_ptr (retain+release the DictObject) on EVERY dict index. A dict
+     * doesn't COW - the mutations below (auto-vivify / freeze-insert) go through
+     * the POINTEE, and operator->/get() on a const intrusive_ptr yield a
+     * MUTABLE DictObject*, so the borrow is sound for read AND write. */
+    const intrusive_ptr<DictObject> &flatObj =
+        what.get_ref<intrusive_ptr<DictObject>>();
     DictObject &obj = *flatObj.get();
     DictObject::inner_type &data = obj.get_ref();
 
@@ -155,7 +161,7 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
 
 string TypeDict::to_string(const EvalValue &a)
 {
-    const DictObject &obj = *a.get<intrusive_ptr<DictObject>>().get();
+    const DictObject &obj = *a.get_ref<intrusive_ptr<DictObject>>().get();
     const DictObject::inner_type &data = obj.get_ref();
 
     string res;
@@ -183,7 +189,7 @@ string TypeDict::to_string(const EvalValue &a)
 string TypeDict::pretty(const EvalValue &a, int indent, int width)
 {
     const string flat = to_string_repr(a);
-    const DictObject &obj = *a.get<intrusive_ptr<DictObject>>().get();
+    const DictObject &obj = *a.get_ref<intrusive_ptr<DictObject>>().get();
     const DictObject::inner_type &data = obj.get_ref();
 
     if (data.empty() || indent + static_cast<int>(flat.size()) <= width)
@@ -213,24 +219,24 @@ string TypeDict::pretty(const EvalValue &a, int indent, int width)
 
 bool TypeDict::is_true(const EvalValue &a)
 {
-    return a.get<intrusive_ptr<DictObject>>()->get_ref().size() > 0;
+    return a.get_ref<intrusive_ptr<DictObject>>()->get_ref().size() > 0;
 }
 
 int_type TypeDict::use_count(const EvalValue &a)
 {
-    return a.get<intrusive_ptr<DictObject>>().use_count();
+    return a.get_ref<intrusive_ptr<DictObject>>().use_count();
 }
 
 EvalValue TypeDict::intptr(const EvalValue &a)
 {
     return reinterpret_cast<int_type>(
-        &a.get<intrusive_ptr<DictObject>>().get()->get_ref()
+        &a.get_ref<intrusive_ptr<DictObject>>().get()->get_ref()
     );
 }
 
 EvalValue TypeDict::clone(const EvalValue &a)
 {
-    const auto &wrapper = a.get<intrusive_ptr<DictObject>>();
+    const auto &wrapper = a.get_ref<intrusive_ptr<DictObject>>();
     const DictObject &dict = *wrapper.get();
     auto copy = make_intrusive<DictObject>(dict);
 
