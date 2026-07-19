@@ -1423,6 +1423,17 @@ struct Chunk {
     /* Native-AOT fragments (see NativeCode above). */
     NativeCode native;
 
+    /*
+     * #55 native calls: this chunk's WHOLE body is a single fully-native run
+     * ending in ReturnV, compiled to ONE fragment at `native_entry_off` (a
+     * byte offset from native.base). Such a body is a LEAF - it makes no calls,
+     * so it is C-stack-bounded - and a caller fragment can `call` it directly
+     * (STEP 2). false unless jit_compile_chunk proved it; recomputed on every
+     * (re-)compile, so NOT serialized (like NativeCode itself).
+     */
+    bool native_leaf = false;
+    size_t native_entry_off = 0;
+
     /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
      * ForeachDyn in the chunk. See the ForeachDyn ops. */
     int n_dyn_iters = 0;

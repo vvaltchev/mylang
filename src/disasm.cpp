@@ -673,6 +673,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                       << "\n";
         }
     }
+    if (chunk.native_leaf)
+        s << "; native_leaf: whole body -> one fragment @+"
+          << chunk.native_entry_off << "  (call-able; #55)\n";
     s << "\n";   /* separate the header block from the code */
 
     /* A capture slot as its field name (the anon capture-struct field), else
