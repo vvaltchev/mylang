@@ -47,6 +47,17 @@ extern unsigned long g_jit_frags;
 void jit_compile_chunk(Chunk &chunk);
 
 /*
+ * #55 STEP 2: is this chunk's WHOLE body a single fully-native run ending in
+ * ReturnV (a `native_leaf` a caller fragment can `call` directly)? Computed
+ * from the OPS ALONE - no fragment emit - so codegen_chunk can set the flag
+ * BEFORE jit_compile_chunk, which lets the precompile codegen ALL bodies (flags
+ * set) then jit ALL bodies (a caller's native-call gate sees every callee's
+ * flag). Off-platform / -nj -> false. Matches jit_compile_chunk's native_leaf
+ * exactly (it sets native_entry_off when this holds).
+ */
+bool jit_chunk_is_native_leaf(const Chunk &chunk);
+
+/*
  * Call a compiled fragment (frameless: slots base in, resume pc out).
  * Marked no_sanitize("function") - the JIT fragment has no clang/UBSan
  * CFI type header, so the -fsanitize=function check would read the

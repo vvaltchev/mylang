@@ -1555,6 +1555,25 @@ struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
 
 static constexpr size_t MIN_RUN = 4;
 
+/* #55 STEP 2: the native_leaf predicate (from ops; see jit.h). Matches
+ * jit_compile_chunk's native_leaf condition exactly - the WHOLE body is a
+ * single maximal run (every op jit_op_eligible, so nothing splits it) that is
+ * deletable (every op op_fully_native; single-entry is trivial for [0,n)) and
+ * ends in ReturnV, and it is >= MIN_RUN (else no run forms). */
+bool jit_chunk_is_native_leaf(const Chunk &chunk)
+{
+    if (!g_jit_enabled)
+        return false;
+    const size_t n = chunk.code.size();
+    if (n < MIN_RUN || chunk.code[n - 1].op != OpCode::ReturnV)
+        return false;
+    for (size_t pc = 0; pc < n; pc++)
+        if (!jit_op_eligible(chunk.code[pc])
+                || !op_fully_native(chunk.code[pc].op))
+            return false;
+    return true;
+}
+
 void jit_compile_chunk(Chunk &chunk)
 {
     if (!g_jit_enabled || chunk.code.empty())
@@ -1703,13 +1722,14 @@ void jit_compile_chunk(Chunk &chunk)
         }
     }
 
-    /* #55 native calls: is this chunk's WHOLE body a single fully-native run
-     * ending in ReturnV? Then it is a LEAF a caller can `call` directly - a
-     * native_leaf (STEP 2 consumes it; -vd shows it). Read chunk.code (still
-     * the ORIGINAL - the rebuild is below), so code[n-1] is the last op. */
-    if (runs.size() == 1 && runs[0].begin == 0 && runs[0].end == n
-            && deletable[0] && chunk.code[n - 1].op == OpCode::ReturnV) {
-        chunk.native_leaf = true;
+    /* #55 native calls: native_leaf (the FLAG) is set by codegen_chunk via
+     * jit_chunk_is_native_leaf, so it is available BEFORE any jit (the STEP-2
+     * ordering fix). Here we just record the fragment ENTRY offset for it - a
+     * native_leaf is, by that predicate, exactly a single deletable run over
+     * [0,n), so runs[0] is it. ML_CHECK the run analysis agrees (defense). */
+    if (chunk.native_leaf) {
+        ML_CHECK(runs.size() == 1 && runs[0].begin == 0
+                 && runs[0].end == n && deletable[0]);
         chunk.native_entry_off = frag_off[0];
     }
 
@@ -1815,6 +1835,11 @@ void jit_compile_chunk(Chunk &chunk)
 
 void jit_compile_chunk(Chunk &)
 {
+}
+
+bool jit_chunk_is_native_leaf(const Chunk &)
+{
+    return false;
 }
 
 void jit_type_singletons(const void *&ti, const void *&tf, const void *&ta)

@@ -26,10 +26,17 @@ void collect_funcs(const Construct *c,
  * [slot_count, slot_count + chunk.n_temps)). Used for both the root/main block
  * and a function body (Phase 4). See plans/bytecode-vm.md.
  */
-Chunk codegen_chunk(const Block *block, int slot_count);
+/*
+ * `jit` (default true): run jit_compile_chunk at the end (native-AOT). The VM
+ * precompile passes FALSE so it can codegen ALL bodies first (every
+ * `native_leaf` flag set - it is computed here regardless of `jit`) and jit
+ * them in a SECOND pass, so a caller's native-call gate sees every callee's
+ * flag (#55 STEP 2's ordering fix). Disasm / -rt / the default keep true.
+ */
+Chunk codegen_chunk(const Block *block, int slot_count, bool jit = true);
 
 /* The root/main wrapper: codegen_chunk(root, root->slot_count). */
-Chunk codegen_program(const Block *root);
+Chunk codegen_program(const Block *root, bool jit = true);
 
 /*
  * Compile ONE function's body to a runnable chunk, applying the VM's
@@ -45,4 +52,4 @@ Chunk codegen_program(const Block *root);
  * This is the single source of truth for "which functions have bytecode",
  * shared by the VM's AOT precompile (vm.cpp) and the -vd dump (disasm.cpp).
  */
-bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out);
+bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);

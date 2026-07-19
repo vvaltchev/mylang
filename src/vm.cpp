@@ -1288,12 +1288,20 @@ vm_compile(const Construct *root_c)
     g_func_chunks.clear();
 
     VmProgram prog;
-    prog.root = codegen_program(root);
+    /* #55 STEP 2: codegen main WITHOUT jit - its native_leaf flag is still set;
+     * jit is deferred to below, after Pass A has set every function's flag (a
+     * top-level native call to a function needs the callee's flag). */
+    prog.root = codegen_program(root, /*jit=*/false);
 
     /* AOT: compile every function body upfront (no lazy per-call compile) - the
      * maintainer's no-lazy rule + a `.myv`-serialization prerequisite. After
-     * this, do_func_call reads a precomputed vm_chunk and never compiles. */
+     * this, do_func_call reads a precomputed vm_chunk and never compiles.
+     * Pass A codegens all bodies (flags set), Pass B jits them. */
     vm_precompile_all(root);
+
+    /* Now jit main - every function's native_leaf flag is set (Pass A), so
+     * main's top-level native calls can see them (#55 STEP 2). */
+    jit_compile_chunk(prog.root);
 
     /* Root-context data the run needs, copied OUT of the root Block. */
     prog.root_slot_count = root->slot_count;
@@ -1426,7 +1434,7 @@ vm_ast_teardown(std::unique_ptr<Construct> &root, VmProgram &prog)
  * Block::do_eval with no offsetting win.
  */
 const Chunk *
-vm_func_chunk(const FuncDescriptor *fdesc)
+vm_func_chunk(const FuncDescriptor *fdesc, bool jit)
 {
     /*
      * A chunk may be compiled ONLY while executing the final AST. If we are
@@ -1451,7 +1459,7 @@ vm_func_chunk(const FuncDescriptor *fdesc)
      * the precompile walk didn't reach (there should be none). */
     Chunk ck;
     ML_CHECK_MSG(fdesc->decl, "vm_func_chunk on a descriptor with no decl");
-    if (!codegen_func_body(fdesc->decl, ck))
+    if (!codegen_func_body(fdesc->decl, ck, jit))
         return nullptr;
     return &g_func_chunks.emplace(fdesc, std::move(ck)).first->second;
 }
@@ -1474,9 +1482,13 @@ vm_precompile_all(const Block *root)
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
 
+    /* #55 STEP 2 - Pass A: CODEGEN every body (jit deferred), so every
+     * `native_leaf` flag is set (codegen_chunk sets it from the ops) BEFORE any
+     * jit. A caller's native-call gate needs EVERY callee's flag, and a caller
+     * may be declared before its callee, so all flags must exist first. */
     for (const FuncDeclStmt *fn : funcs) {
         /* compiles + caches (or null); stamped on the DESCRIPTOR */
-        fn->desc->vm_chunk = vm_func_chunk(fn->desc);
+        fn->desc->vm_chunk = vm_func_chunk(fn->desc, /*jit=*/false);
         fn->desc->vm_chunk_tried = true;
         bool fast = true;
         for (const auto &p : fn->desc->params)
@@ -1484,6 +1496,13 @@ vm_precompile_all(const Block *root)
                 fast = false;
         fn->desc->fast_bind = fast;
     }
+
+    /* Pass B: JIT every compiled body. Order-independent (all flags set in
+     * Pass A; a caller bakes the callee DESCRIPTOR and loads its native entry
+     * at RUNTIME, by when every body is compiled). Main is jit'd by vm_compile
+     * after this, for the same reason. */
+    for (auto &kv : g_func_chunks)
+        jit_compile_chunk(kv.second);
 }
 
 /* The in-flight exception's type NAME for catch-matching (a user struct

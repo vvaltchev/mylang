@@ -36,7 +36,10 @@ extern std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * chunk is the only way to run it - the no-fail rule). Filled AOT by
  * vm_precompile_all; this entry point is the never-hit lazy safety net.
  */
-const Chunk *vm_func_chunk(const FuncDescriptor *fdesc);
+/* `jit` (default true): jit-compile the body immediately. The AOT precompile's
+ * codegen pass passes FALSE (it jits every body in a later pass, so a caller's
+ * native-call gate sees every callee's native_leaf flag - #55 STEP 2). */
+const Chunk *vm_func_chunk(const FuncDescriptor *fdesc, bool jit = true);
 
 /*
  * Drive a chunk against `ctx` (a function body's args context, or main). Runs

@@ -7517,7 +7517,7 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
 }
 
 Chunk
-codegen_chunk(const Block *block, int slot_count)
+codegen_chunk(const Block *block, int slot_count, bool jit)
 {
     Codegen cg;
     cg.temp_base = cg.next_temp = cg.max_temp = slot_count;
@@ -7555,19 +7555,27 @@ codegen_chunk(const Block *block, int slot_count)
                                        * a stale IntBin div0 loc entry for a
                                        * specialized (non-throwing) op is
                                        * never queried */
-    jit_compile_chunk(cg.chunk);      /* native-AOT (plans/native-aot.md):
+    /* #55 STEP 2: set the native_leaf FLAG from the (now final, specialized)
+     * ops - BEFORE jit, so the precompile can defer jit and still have every
+     * callee's flag for a caller's native-call gate. jit_compile_chunk reads
+     * this flag and records native_entry_off. */
+    cg.chunk.native_leaf = jit_chunk_is_native_leaf(cg.chunk);
+    if (jit)
+        jit_compile_chunk(cg.chunk);  /* native-AOT (plans/native-aot.md):
                                        * LAST - needs the specialized ops +
                                        * ref_slots; inserts EnterNative
                                        * heads + remaps pcs itself. A
                                        * `.myv` load will call it the same
-                                       * way. No-op off-platform / -nj. */
+                                       * way. No-op off-platform / -nj.
+                                       * Deferred (jit==false) by the VM
+                                       * precompile's codegen pass. */
     return std::move(cg.chunk);
 }
 
 Chunk
-codegen_program(const Block *root)
+codegen_program(const Block *root, bool jit)
 {
-    return codegen_chunk(root, root->slot_count);
+    return codegen_chunk(root, root->slot_count, jit);
 }
 
 void
@@ -7589,7 +7597,7 @@ collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
 }
 
 bool
-codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
+codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
 {
     /* A base template is a monomorphization source, never called → no chunk
      * (the ONLY compiled-set exclusion; do_func_call ML_CHECKs if one is ever
@@ -7616,7 +7624,7 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
     /* EVERY callable body keeps its chunk - even an empty/no-op one (a bare
      * Halt returning none): after the AST teardown the chunk is the only way
      * to run the body, so there is no "not worth it" tier anymore. */
-    out = codegen_chunk(body, fn->desc->frame_size);
+    out = codegen_chunk(body, fn->desc->frame_size, jit);
 
     /* Param slots join ref_slots unless the param is int/float-COERCED
      * (bind_param's coerce guarantees those never hold a reference). The
