@@ -1815,11 +1815,16 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
         VmActivation &a;
         EvalContext &c;
         std::vector<LValue> *caps;
+        EvalContext *gctx;                 /* #60: saved g_current_ctx */
         ~Restore() {
+            g_current_ctx = gctx;
             a.pop_window();
             c.captures = caps;
         }
-    } restore{act, c, c.captures};
+    } restore{act, c, c.captures, g_current_ctx};
+    /* #60: announce the callback ctx once so the reentrant vm_run_chunk skips
+     * the per-invocation CtxGuard store (jit_ret reads g_current_ctx). */
+    g_current_ctx = &c;
 
     /* Bind from the pre-evaluated values (do_func_bind_params' value
      * overloads' exact semantics: non-const, none for omitted trailing opt
@@ -1843,7 +1848,7 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
     c.flow->type = FlowState::none;
 
     try {
-        vm_run_chunk(*cck, c);
+        vm_run_chunk(*cck, c, /*reentrant=*/true);
     } catch (Exception &e) {
         vm_capture_desc_frame(e, d);
         throw;
@@ -1887,11 +1892,18 @@ VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
     c_ = act_->invoke_ctx.get();
     desc_ = obj.func;
     cck_ = static_cast<const Chunk *>(desc_->vm_chunk);
+    fast_bind_ = desc_->fast_bind;
+    nparams_ = desc_->params.size();
+    min_args_ = static_cast<size_t>(desc_->min_args);
     const int_type total =
         desc_->frame_size + static_cast<int_type>(cck_->n_temps);
     w_ = act_->push_window(total, cck_, /*boundary=*/true);
     saved_caps_ = c_->captures;
     c_->captures = &obj.capture_slots;
+    /* #60: own g_current_ctx for the whole loop - each invoke() re-enters
+     * vm_run_chunk reentrant, which then skips the per-element CtxGuard. */
+    saved_gctx_ = g_current_ctx;
+    g_current_ctx = c_;
     ready_ = true;
 }
 
@@ -1899,6 +1911,7 @@ VmInvoker::~VmInvoker()
 {
     if (!ready_)
         return;
+    g_current_ctx = saved_gctx_;
     c_->captures = saved_caps_;
     act_->pop_window();
 }
@@ -1906,11 +1919,11 @@ VmInvoker::~VmInvoker()
 EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
 {
     const FuncDescriptor *d = desc_;
-    const size_t nparams = d->params.size();
-    if (n > nparams || n < static_cast<size_t>(d->min_args))
+    const size_t nparams = nparams_;
+    if (n > nparams || n < min_args_)
         throw InvalidNumberOfArgsEx();
 
-    if (d->fast_bind) {
+    if (fast_bind_) {
         for (size_t i = 0; i < n; i++)
             w_->at(static_cast<int_type>(i)) = LValue(argv[i], false);
         for (size_t i = n; i < nparams; i++)
@@ -1928,7 +1941,7 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
     c_->flow->type = FlowState::none;
 
     try {
-        vm_run_chunk(*cck_, *c_);
+        vm_run_chunk(*cck_, *c_, /*reentrant=*/true);
     } catch (Exception &e) {
         vm_capture_desc_frame(e, d);
         throw;
@@ -2283,7 +2296,7 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 }
 
 void
-vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
+vm_run_chunk(const Chunk &chunk0, EvalContext &ctx, bool reentrant)
 {
     /* The CURRENT chunk - reseatable LOOP STATE (the native call stack: an
      * in-VM call switches it to the callee's chunk; a pop switches it
@@ -2312,18 +2325,29 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
     } entry_guard;
 
-    VmActivation &act = *vm_enter_invocation_fast(chunk, local_act,
-                                                  entry_guard.swapped,
-                                                  entry_guard.pushed);
+    /* #60 reentrant: a builtin CALLBACK loop (VmInvoker / vm_try_invoke)
+     * already owns the activation + boundary window on top of g_vm_act, so
+     * skip the per-element enter setup (entry_guard stays swapped=pushed=
+     * false, a no-op dtor). Otherwise take the normal invocation entry. */
+    VmActivation &act = reentrant
+        ? *g_vm_act
+        : *vm_enter_invocation_fast(chunk, local_act, entry_guard.swapped,
+                                    entry_guard.pushed);
 
     /* #55 native calls: announce THIS invocation's ctx for jit_ret (the native
      * ReturnV helper), restored on every exit incl. a throw. A nested callback
-     * (a builtin re-entering with the invoke ctx) saves/restores the outer. */
+     * (a builtin re-entering with the invoke ctx) saves/restores the outer.
+     * #60: a reentrant caller already set g_current_ctx = &ctx once for the
+     * whole loop, so the guard is inactive (no per-element store/restore). */
     struct CtxGuard {
         EvalContext *prev;
-        CtxGuard(EvalContext *c) : prev(g_current_ctx) { g_current_ctx = c; }
-        ~CtxGuard() { g_current_ctx = prev; }
-    } ctx_guard(&ctx);
+        bool active;
+        CtxGuard(EvalContext *c, bool a) : prev(g_current_ctx), active(a) {
+            if (active)
+                g_current_ctx = c;
+        }
+        ~CtxGuard() { if (active) g_current_ctx = prev; }
+    } ctx_guard(&ctx, !reentrant);
 
     /*
      * The CURRENT chunk's instruction array, cached as loop state: `chunk`
