@@ -80,11 +80,17 @@ Total 592.4M Ir. Top:
    vec through the base LValue* (a ref, no copy). Measured (callgrind Ir):
    62_dict_word_count -2.31%, 47_wordcount -1.85%, 15_array_slice_readonly
    -1.21%, 16_array_slice_write -1.13%; flat arrays + string slices neutral
-   (flat reads use native LoadElem*, string slice is TypeStr::slice). -rt
-   1566/1566 + differential 1403/1403, nested_fuzz. STILL TODO here: the
-   const-RHS string ops (`b.get<SharedStr>().get_view()` in eq/lt/gt/add copies
-   b's handle - ~16M in the dict-key compares), and vm_store_base's dict-store
-   base copy.
+   (flat reads use native LoadElem*, string slice is TypeStr::slice). Then the
+   STRING ops: the read-only TypeStr methods (is_true/len/to_string/hash/
+   use_count/is_slice/intptr/clone + subscript/slice) took a CONST `a` and the
+   comparisons (eq/noteq/lt/gt/le/ge/add) a CONST `b`, so `get<SharedStr>()`
+   COPIED the handle per call - changed to `get_ref<>()` (borrow; `add`'s
+   mutable `a` and the non-const-`a` comparison LHS already return a ref, left
+   as-is). Additional: 62_dict_word_count -2.37% (cumulative ~-4.6% with the
+   array borrow), 29_str_slice_readonly -2.49% (TypeStr::slice, was neutral),
+   47_wordcount -0.90%. -rt 1566/1566 + differential 1403/1403, nested_fuzz.
+   STILL TODO here: vm_store_base's dict-store base copy (~40M in the dict
+   bench, murky - callgrind inlined attribution).
 
 ## ===== STATUS: callback re-entry DONE 2026-07-20 (a + b landed) =====
 Both steps landed and measured (callgrind whole-program Ir, scale 1, vs the
