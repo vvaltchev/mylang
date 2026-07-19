@@ -64,6 +64,18 @@ Total 592.4M Ir. Top:
    branches trivial vs the type-erased ref ops. Hard to beat without changing
    the value model; small wins possible (e.g. the default-ctor zeroing, move
    paths). HIGH-effort/low-margin - probably last.
+   **TIER 1 IN PROGRESS (2026-07-20): reduce copy COUNT.** Every VM arg/param
+   bind did `slot = LValue(v, false)` - a copy-CONSTRUCT of v into a temp LValue
+   then a MOVE-ASSIGN of the temp into the slot (the move-assign was a per-call
+   hot spot, operator=(&&) ~6% of map_filter). New `LValue::rebind(v)`
+   (evalvalue.h) does the fresh bind in ONE EvalValue assignment (releases the
+   old ref, resets container/is_const - the callee windows are REUSED so a slot
+   can carry a prior frame's is_const). Applied at the 3 bind loops: the in-VM
+   call (vm_frame_setup - every VM->VM call), VmInvoker::invoke + vm_try_invoke
+   (the callback loops). Measured (callgrind Ir): 34_sort_custom_cmp -7.5%,
+   35_map_filter -4.0%, 10_recursion_deep -2.9%; pure loops + dict NEUTRAL (no
+   arg bind); fib/func_call ~flat (bind is a small fraction there). -rt
+   1566/1566 + differential 1403/1403, nested_fuzz 250.
 
 4. **The flat open-addressing dict (H2 v2).** ~40% of the dict benches.
    Container-specific (not the "value model" per se), needs the maintainer's
