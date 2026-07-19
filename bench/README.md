@@ -69,7 +69,22 @@ python3 bench/run.py --filter fib,sort  # several (comma-separated)
 python3 bench/run.py --repeat 5 --csv bench/results.csv
 python3 bench/run.py --baseline OLD   # before/after: also time a 2nd mylang
                                       # binary, report cur/base (speedup)
+python3 bench/run.py -cl cpp          # compare vs C++ instead of Python
+python3 bench/run.py -cl py --recompute  # (re)populate the Python cache
 ```
+
+**The comparison language is cached; a measure run is cache-only.** MyLang is
+timed on every run, but the comparison language (`-cl python` by default, or
+`cpp`/…) is timed **once** and cached in a git-ignored
+`bench/.bench_cache/<lang>.json`, keyed by *(scale, sha1 of the comparison
+source)* — so a MyLang edit never re-times it; only a scale change or a real
+`.py`/`.cpp` change does. A normal run reads that cache **read-only** and
+**fails fast** if any selected bench's comparison is stale/missing (it never
+re-times a comparison mid-measurement — that would perturb MyLang's timing).
+Re-timing is the separate `--recompute` step:
+`bench/run.py -cl <lang> --recompute [--filter …]` re-caches the stale entries
+(or all, with `--refresh-cache`) and exits. You rarely need it — the comparison
+sources almost never change.
 
 `--baseline` is the way to measure whether a change actually helped: build the
 *old* binary (e.g. in a `git worktree` at the parent commit), then run with

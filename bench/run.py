@@ -28,7 +28,9 @@
 #                                        # (comma-separated for several)
 #   python3 bench/run.py --mylang ./build/mylang
 #   python3 bench/run.py -cl cpp         # compare vs C++ (cached) instead of py
-#   python3 bench/run.py -cl cpp --refresh-cache   # re-time the C++ (recompile)
+#   python3 bench/run.py -cl py --recompute        # (re)populate the py cache -
+#                                        # a SEPARATE step; a measure run is
+#                                        # cache-ONLY and fails fast if stale
 #   python3 bench/run.py --baseline OLD  # also time a 2nd mylang binary and
 #                                        # report cur/base speedup (before/after)
 #   python3 bench/run.py --csv out.csv   # also write the table as CSV
@@ -363,13 +365,23 @@ def results_match(a, b):
 
 # ------------------------- comparison languages ---------------------------
 #
-# MyLang is timed on every run; the COMPARISON language (python by default,
-# selectable with --complang) is timed ONCE and CACHED - it doesn't change
-# between MyLang edits, so re-timing it every run is wasted work (and doubles
-# the suite cost). The cache (bench/.bench_cache/<lang>.json, git-ignored) keys
-# each bench by its scale + a content hash of its source(s); a stale/missing
-# entry (source changed, scale changed, or --refresh-cache) is re-timed and
-# re-cached. Adding a language = one CompLang entry + a bench/<subdir>/.
+# MyLang is timed on EVERY run (never cached - its result is the whole point).
+# The COMPARISON language (python by default, selectable with --complang) is
+# timed ONCE and CACHED - it doesn't change between MyLang edits, so re-timing
+# it every run is wasted work (and doubles the suite cost). The cache
+# (bench/.bench_cache/<lang>.json, git-ignored) keys each bench by its scale + a
+# sha1 of its comparison SOURCE(s) (the .py/.cpp, + bench.h for C++) - NOT a git
+# commit, so a MyLang edit/commit never invalidates it; ONLY a scale change or a
+# real comparison-source change does.
+#
+# The two are STRICTLY SEPARATED (so a comparison run can never interleave with
+# the variance-gated MyLang timing and perturb it):
+#   * a normal (MEASURE) run reads the cache READ-ONLY and FAILS FAST up front
+#     if any selected bench is stale/missing - it never re-times a comparison;
+#   * `--recompute` is the SEPARATE, explicit step that (re)times + re-caches
+#     the comparison (stale only, or all with --refresh-cache), then exits.
+# Since the comparison sources rarely change, --recompute is rarely needed.
+# Adding a language = one CompLang entry + a bench/<subdir>/.
 
 class CompLang:
     """An interpreted comparison language: bench/<subdir>/<name><ext>, run as
@@ -462,10 +474,30 @@ def save_cache(lang, cache):
         pass
 
 
-def comp_time(lobj, bench, scale, reps, timeout, cache, refresh):
+def cache_entry_fresh(lobj, bench, scale, cache):
+    """True iff `bench`'s comparison cache entry is a genuine HIT: present AND
+    for the current scale AND matching the current SOURCE-FILE hash. The `hash`
+    is a sha1 of the comparison SOURCE (the .py/.cpp, + bench.h for C++) - NOT a
+    git commit - so it invalidates ONLY when that source actually changes, never
+    on a MyLang edit / commit. A bench with no comparison source is handled
+    separately by the caller (it is never "stale"). This is the exact key
+    comp_time uses, factored out for the up-front staleness gate."""
+    ent = cache.get(bench)
+    return bool(ent and ent.get("scale") == scale
+                and ent.get("hash") == lobj.content_hash(bench))
+
+
+def comp_time(lobj, bench, scale, reps, timeout, cache, refresh,
+              cache_only=False):
     """Time the comparison language for `bench` at `scale`, via the cache.
     Returns (min_time, output, error_or_None, from_cache). A hit (same scale +
-    same source hash, unless --refresh-cache) skips the run entirely."""
+    same source hash, unless --refresh-cache) skips the run entirely.
+
+    cache_only=True (the MEASURE path) NEVER runs a comparison subprocess: a
+    miss returns a 'stale' error instead of re-timing. The up-front staleness
+    gate guarantees every measured bench is a hit, so this is a hard backstop
+    that keeps a comparison run from EVER interleaving with the variance-gated
+    MyLang timing (the perturbation that made py- vs cpp-mode asymmetric)."""
     if not lobj.has(bench):
         return (None, None, "no-" + lobj.name, False)
     h = lobj.content_hash(bench)
@@ -473,6 +505,8 @@ def comp_time(lobj, bench, scale, reps, timeout, cache, refresh):
     if (not refresh and ent and ent.get("scale") == scale
             and ent.get("hash") == h):
         return (ent["time"], ent["out"], None, True)
+    if cache_only:
+        return (None, None, "stale", False)
     prefix, err = lobj.prepare(bench)
     if err:
         return (None, None, err, False)
@@ -527,13 +561,23 @@ def main():
                     metavar="LANG",
                     help="comparison language: python (default), cpp, ruby, "
                          "perl, lua. Its results are CACHED (bench/.bench_cache/"
-                         "<lang>.json, git-ignored) - re-timed only when a bench "
-                         "source or its scale changes, or with --refresh-cache.")
+                         "<lang>.json, git-ignored); a measure run reads them "
+                         "cache-only and fails fast if stale - re-time via the "
+                         "separate --recompute step.")
     ap.add_argument("--cxx", default="g++",
                     help="C++ compiler for --complang cpp (default g++)")
+    ap.add_argument("--recompute", action="store_true",
+                    help="SEPARATE STEP: (re)time the comparison language for "
+                         "the selected --complang + --filter and update its "
+                         "cache, then exit (does NOT time MyLang). Recomputes "
+                         "only STALE entries unless --refresh-cache forces all. "
+                         "A normal (measure) run is cache-ONLY and fails fast "
+                         "if anything is stale, so this is the only place the "
+                         "comparison is ever re-timed - the comparison sources "
+                         "rarely change, so you rarely need it.")
     ap.add_argument("--refresh-cache", action="store_true",
-                    help="ignore the comparison-language cache and re-time it "
-                         "(then re-cache)")
+                    help="with --recompute: force-recompute EVERY selected "
+                         "bench (not just stale ones). Ignored otherwise.")
     ap.add_argument("--timeout", type=float, default=120.0,
                     help="per-run timeout in seconds (default 120)")
     ap.add_argument("--csv", default="",
@@ -544,9 +588,7 @@ def main():
                          "last)")
     args = ap.parse_args()
 
-    mylang = find_mylang(args.mylang)
-    if not mylang:
-        sys.exit("error: mylang binary not found; build it (make -j) or pass --mylang")
+    mylang = find_mylang(args.mylang)   # required only for a MEASURE run below
 
     complangs = build_complangs(args.python, args.cxx)
     if args.complang not in complangs:
@@ -585,6 +627,75 @@ def main():
                 global_scale = int(spec)
             except ValueError:
                 sys.exit("error: bad --scale %r (want an int or <key>:<int>)" % spec)
+
+    # The per-bench scale, resolved ONCE (used by both the recompute step and
+    # the measure run's up-front staleness gate + loop). `comparable` = the
+    # benches that HAVE a comparison source (the rest are MyLang-only).
+    scales = {n: resolve_scale(n, table, overrides, global_scale) for n in names}
+    comparable = [n for n in names if lobj.has(n)]
+
+    filt = " --filter %s" % args.filter if args.filter else ""
+
+    if args.recompute:
+        # SEPARATE STEP: (re)time + re-cache the comparison language, then exit.
+        # Only STALE entries by default (a no-op when all fresh); --refresh-cache
+        # forces all. MyLang is never run here. This is the ONLY place a
+        # comparison is timed, so it can never interleave with a measure run.
+        todo = comparable if args.refresh_cache else [
+            n for n in comparable
+            if not cache_entry_fresh(lobj, n, scales[n], cache)]
+        if not todo:
+            print("%s: all %d selected result(s) already fresh - nothing to "
+                  "recompute." % (lobj.name, len(comparable)))
+            return
+        print("%s: recomputing %d of %d selected result(s)%s ..."
+              % (lobj.name, len(todo), len(comparable),
+                 " (--refresh-cache: all)" if args.refresh_cache else " (stale)"))
+        comp_reps = args.repeat if args.repeat > 0 else COMP_REPS
+        failed = []
+        for n in todo:
+            t, _out, err, _fc = comp_time(lobj, n, scales[n], comp_reps,
+                                          args.timeout, cache, refresh=True)
+            if err:
+                failed.append(n)
+                print("  %-24s FAILED: %s" % (n, err))
+            else:
+                print("  %-24s %.3fs  (scale %d)" % (n, t, scales[n]))
+            save_cache(lobj.name, cache)     # persist incrementally
+        if failed:
+            sys.exit("recompute: %d bench(es) failed to time" % len(failed))
+        print("done - %d %s comparison result(s) cached." % (len(todo), lobj.name))
+        return
+
+    # MEASURE run: the comparison cache is READ-ONLY. --refresh-cache has no
+    # inline meaning anymore (a measure run never re-times) - it applies to
+    # --recompute only.
+    if args.refresh_cache:
+        sys.exit("--refresh-cache applies to --recompute only (a measure run is "
+                 "cache-only).\n  Run:  bench/run.py -cl %s --recompute "
+                 "--refresh-cache%s" % (lobj.name, filt))
+    if not mylang:
+        sys.exit("error: mylang binary not found; build it (make -j) or pass "
+                 "--mylang")
+
+    # UP-FRONT staleness gate: verify EVERY selected comparison is cached +
+    # fresh BEFORE timing anything. A stale/missing entry fails FAST with the
+    # recompute command, so a comparison subprocess never runs mid-measurement
+    # (its interference with the variance-gated MyLang reps is what made py-
+    # vs cpp-mode behave differently). MyLang-only benches (no comparison
+    # source) are fine - they just show "-".
+    stale = [n for n in comparable
+             if not cache_entry_fresh(lobj, n, scales[n], cache)]
+    if stale:
+        shown = ", ".join(stale[:12]) + (
+            ", ..." if len(stale) > 12 else "")
+        sys.exit("error: %d of %d selected %s comparison result(s) are STALE or "
+                 "MISSING\n  (a bench's scale or its %s source changed): %s\n"
+                 "Recompute them first (a separate, explicit step - the "
+                 "comparison\nlanguages are cached and are never re-timed during "
+                 "a measure run):\n  bench/run.py -cl %s --recompute%s"
+                 % (len(stale), len(comparable), lobj.name, lobj.name, shown,
+                    lobj.name, filt))
 
     print("mylang : %s%s" % (mylang,
                              "  (engine: -vm bytecode VM)" if args.vm
@@ -639,7 +750,7 @@ def main():
         # runs -tw, so `--vm --baseline <same binary>` still gates the VM
         # against the tree-walker exactly as before the flip.
         eng = ["-vm"] if args.vm else (["-tw"] if args.tw else [])
-        scale = resolve_scale(name, table, overrides, global_scale)
+        scale = scales[name]
         scale_arg = str(scale)
         my_cmd = [mylang] + eng + [my_path, scale_arg]
 
@@ -655,7 +766,6 @@ def main():
             my_t, my_out, my_err, n_reps, my_v = measure_adaptive(
                 my_cmd, args.var_threshold, args.timeout)
         if my_err and my_err.startswith("variance"):
-            save_cache(lobj.name, cache)     # keep comp-times computed so far
             print()
             sys.exit("ABORTED at %s: %s\n  -> raise its scale in "
                      "bench/scales.txt (run bench/tune_scales.py), then re-run."
@@ -671,15 +781,17 @@ def main():
                 n_reps, args.timeout)
             base_t = min(bt) if bt else None
 
-        # Comparison language (python by default): CACHED - re-timed only on a
-        # miss (source/scale changed, or --refresh-cache). Python's interp adds
-        # -B (no __pycache__) so it re-parses every run like MyLang - see the
-        # `[python, "-B"]` prefix in build_complangs. The compare runs at the
-        # SAME per-bench scale as MyLang, so the ratio is valid.
+        # Comparison language (python by default): CACHE-ONLY here. The up-front
+        # staleness gate already proved every selected bench is a fresh hit, so
+        # this returns the cached time WITHOUT running any subprocess - a
+        # comparison run can never interleave with the variance-gated MyLang
+        # reps above. (Stale/missing was rejected before the loop; recompute is
+        # the separate --recompute step.) The cached compare was timed at this
+        # SAME per-bench scale, so the ratio is valid.
         comp_reps = args.repeat if args.repeat > 0 else COMP_REPS
         py_t, py_out, py_err, from_cache = comp_time(
             lobj, name, scale, comp_reps, args.timeout, cache,
-            args.refresh_cache)
+            refresh=False, cache_only=True)
 
         if my_err:
             status = "MY " + my_err
@@ -722,7 +834,8 @@ def main():
         print(render_row(row, has_base))
         rows.append(row)
 
-    save_cache(lobj.name, cache)          # persist any (re)timed comp results
+    # (No cache write: a measure run is cache-ONLY - the comparison cache is
+    # populated only by the separate --recompute step.)
 
     if ratios:
         gm_v = geomean(ratios)
