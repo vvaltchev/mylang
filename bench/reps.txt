@@ -15,3 +15,37 @@
 # the 2-fastest gap is jittery at 3 reps; 8 reps settles it reliably (measured
 # 15/15 draws < 5%, floor ~4.5%), while more reps than 8 don't help further.
 52_cse_dedup             8
+
+# 23_dict_insert is malloc-bound (a std::unordered_map node alloc per insert +
+# rehashing) - the value-model bottleneck, not the workload size. Raising scale
+# doesn't tame the per-insert alloc jitter (scale 4 even HARD-ABORTED a run),
+# but reps do: at scale 8, base 8 gives 0 aborts and settles at 8 reliably
+# (base 3 was 2 warns + an abort). It stays the alloc-jitter class, so a rare
+# escalation past 8 can still occur, but never an abort.
+23_dict_insert           8
+
+# 37_range_builtin is dominated by ONE big range() array allocation (N=1M*scale
+# ints); its page-fault cost varies run-to-run and grows with scale (higher
+# scale is WORSE, not better - the allocation, not compute, is the jitter). So
+# scale can't settle it (it tripped 3/3 full-suite runs at scale 12); base 8
+# does (measured 15/15 at 8 reps). Same alloc-jitter class as 23_dict_insert.
+37_range_builtin         8
+
+# 09_fib_recursive is SCALE-IMMUNE: the optimizer const-folds fib(29) to a
+# literal and hoists it out of the `for k` loop, so mylang runs in ~4ms at ANY
+# scale (256/512/1024 all ~0.004s - and scaling it would only blow up naive
+# CPython fib). At ~4ms it's very jittery; base 16 settles it (measured 15/15;
+# base 12 still aborted). The high count is cheap here (16 x 4ms = 64ms).
+09_fib_recursive         16
+
+# 28_str_concat: mylang builds the string in O(N) (~5ms) but CPython is O(N^2),
+# so its scale is capped at 4 (scale 8 already makes the cached CPython run ~80s
+# - re: the cache recompute) - too short for 3 reps alone. scale 4 + base 8
+# settles it (measured 15/15).
+28_str_concat            8
+
+# 50_autoconst_dce is const-folded to a trivial ~3ms accumulate loop (the DEBUG
+# branch is dead-code-eliminated) that scale can't grow within CPython's budget
+# (CPython, having no DCE, is ~0.96s PER scale-unit). base 8 settles the ~3ms
+# run reliably (measured 15/15). scale stays 1 (no CPython-recompute blowup).
+50_autoconst_dce         8
