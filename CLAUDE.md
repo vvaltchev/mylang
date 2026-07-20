@@ -5123,7 +5123,7 @@ next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
 `plans/model-flip.md`.
 
 **THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
-(`plans/model-flip.md`, M1-M3 landed).** The endgame inversion of the JIT: flip
+(`plans/model-flip.md`, M1-M4a landed).** The endgame inversion of the JIT: flip
 "BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
 `EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
 ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
@@ -5152,9 +5152,21 @@ scalar ops (`op_is_simple_island`) ending in `ReturnV` into a container — ONE
 inserted `ExitBlock` + pc/side-table remap. A straight-line container is a
 MECHANISM PROOF, not a win (the island runs interpreted either way — the win is
 M4's native loop around an island), so it is gated OFF for small bodies
-(`MIN_CONTAINER_ISLAND`), which matches NO bench/sample (zero suite regression).
-Proven by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
-throw-from-island propagating) + differential + fuzzer + `-vdj`. Builds on
+(`MIN_CONTAINER_ISLAND`). **M4a:** `jit_try_container` now admits NATIVE
+BRANCHES (the loop control — `emit_branch` + `label[]`/`fixups`, whole body so
+every target is fragment-local; a back edge may target the island START but not
+an interior), so a native LOOP iterates in machine code around a straight-line
+boxed island (only the island calls the interpreter). A loop container forms
+regardless of island size (the win); a straight-line one keeps the MIN gate.
+MEASURED −3.4% instructions on a synthetic loop (container vs `-nj`) — a real but
+MODEST win, LIMITED by the per-island `vm_dispatch` RE-ENTRY overhead. Still one
+island of simple boxed ops + no calls, so M1-M4a match NO bench/sample (real
+loops have a multi-island init+body / richer ops) — ZERO suite impact; M4a is a
+mechanism step + the M5 prerequisite. **M4b (next):** multiple islands + richer
+island ops + the BRANCHED island-exit (boxed conditions) + a leaner island
+executor — only then do real mixed functions become winning containers. Proven
+by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
+throw-from-island + a loop container) + differential + fuzzer + `-vdj`. Builds on
 `plans/native-call-impl.md` (v1 native calls) and `plans/native-aot.md`
 (approach A, the fragment ABI).
 

@@ -1775,24 +1775,29 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     if (n < 2 || chunk.code[n - 1].op != OpCode::ReturnV)
         return false;
 
-    /* Gate: exactly ONE contiguous island of simple boxed ops; every other op
-     * a native, non-branch, run-eligible op; no calls; ReturnV only last. */
+    /* Gate: exactly ONE contiguous island of simple boxed ops; every other op a
+     * native RUN-eligible op (M4: incl. NATIVE branches - the loop control -
+     * handled by emit_branch); no calls; a boxed condition (JumpUnlessTrueV etc.
+     * - not run-eligible) declines to the per-run path (M4b: the BRANCHED
+     * island-exit); ReturnV only last. */
     size_t island_begin = n, island_end = 0;
-    bool in_island = false, island_seen = false;
+    bool in_island = false, island_seen = false, has_branch = false;
     for (size_t p = 0; p < n; p++) {
         const OpCode op = chunk.code[p].op;
         if (op == OpCode::CallV || op == OpCode::CachedCallV)
             return false;                  /* M5 territory */
         if (op_is_simple_island(op)) {
             if (!in_island) {
-                if (island_seen) return false;   /* a 2nd island */
+                if (island_seen) return false;   /* a 2nd island (M4b) */
                 island_seen = true; in_island = true; island_begin = p;
             }
             island_end = p + 1;
         } else {
             in_island = false;
-            if (op_is_branch(op) || !op_run_eligible(chunk.code[p], jc))
-                return false;              /* branch / non-native -> decline */
+            if (!op_run_eligible(chunk.code[p], jc))
+                return false;              /* non-native (boxed branch) -> decline*/
+            if (op_is_branch(op))
+                has_branch = true;         /* M4: a native loop/if */
             if (op == OpCode::ReturnV && p != n - 1)
                 return false;
         }
@@ -1800,49 +1805,74 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     if (!island_seen)
         return false;                      /* fully native -> the normal path */
 
-    /* A STRAIGHT-LINE container is a mechanism proof, not a win: the island
-     * runs interpreted either way, so the container only ADDS the EnterNative +
-     * jit_exec_block overhead (its win arrives in M4, when a native LOOP segment
-     * iterates in machine code around the island). So gate M3 OFF for small
-     * bodies - this keeps it from REGRESSING tiny hot functions (e.g. a 2-op
-     * callback like `sq(x)=>x*x`) and, verified, matches NO bench/sample. The
-     * threshold is a "don't regress" guard, not a cost model (M4 brings that). */
-    if (island_end - island_begin < MIN_CONTAINER_ISLAND)
+    /* A native branch may target the island START (the `call jit_exec_block`, a
+     * valid fragment label) but NOT an island INTERIOR (no fragment code there -
+     * the island runs inside vm_exec_block); and it must stay in-body (a target
+     * == n would exit the fragment mid-run). Well-formed loops target a block
+     * leader in range, so this only ever declines a pathological shape. */
+    for (size_t p = 0; p < n; p++) {
+        const int t = branch_pc_target(chunk.code[p]);
+        if (t < 0)
+            continue;
+        if (t >= static_cast<int>(n))
+            return false;
+        if (t > static_cast<int>(island_begin) && t < static_cast<int>(island_end))
+            return false;
+    }
+
+    /* A container WITH a native loop (branches) is the M4 WIN: the loop control
+     * (test + step + back edge) iterates in machine code around the island. A
+     * STRAIGHT-LINE container (no branch) is only a mechanism proof - the island
+     * runs interpreted either way, so the container merely ADDS overhead; gate it
+     * OFF for small bodies (matches NO bench/sample, zero suite regression). */
+    if (!has_branch && island_end - island_begin < MIN_CONTAINER_ISLAND)
         return false;
 
     /* remap: EnterNative@0 shifts everything +1; the ExitBlock inserted after
-     * the island shifts the post-island ops +1 more. */
-    auto remap = [&](size_t p) -> size_t {
-        return p < island_end ? p + 1 : p + 2;
-    };
-    const uint32_t island_start_new = static_cast<uint32_t>(remap(island_begin));
-    const uint32_t exit_resume = static_cast<uint32_t>(remap(island_end));
+     * the island shifts the post-island ops +1 more. A VECTOR (not a lambda) -
+     * emit_branch consumes it for out-of-run exits (none here, begin=0/end=n). */
+    std::vector<int> remap(n + 1);
+    for (size_t p = 0; p <= n; p++)
+        remap[p] = static_cast<int>(p < island_end ? p + 1 : p + 2);
+    const uint32_t island_start_new = static_cast<uint32_t>(remap[island_begin]);
+    const uint32_t exit_resume = static_cast<uint32_t>(remap[island_end]);
 
     /* Emit the container fragment (over the ORIGINAL ops; the rebuild is after).
      * The whole body is one fragment at offset 0. */
     Emitter e;
-    e.cache.clear();                       /* no N5 register cache in M3 */
+    e.cache.clear();                       /* no N5 register cache in a container*/
     std::vector<NativeCode::OpMark> marks;  /* -vdj: op-boundary annotations */
+    std::vector<size_t> label(n, 0);        /* fragment offset of each body pc */
+    std::vector<Fixup> fixups;              /* fragment-local branch fixups */
     e.movabs(RSI, reinterpret_cast<uint64_t>(jit_layout().t_int));
     if (run_has_float(chunk, 0, n))
         e.movabs_r8(reinterpret_cast<uint64_t>(jit_layout().t_float));
     for (size_t pc = 0; pc < n; ) {
         if (g_jit_annotate)
             marks.push_back({ static_cast<uint32_t>(e.pos()),
-                              static_cast<uint32_t>(remap(pc)) });
+                              static_cast<uint32_t>(remap[pc]) });
         if (pc == island_begin) {
+            label[pc] = e.pos();           /* a back edge may target this call */
             emit_island_call(e, jc->caller_desc, island_start_new);
+            for (size_t p = island_begin + 1; p < island_end; p++)
+                label[p] = e.pos();        /* interiors (defensive; never a tgt) */
             pc = island_end;
             continue;
         }
-        if (!emit_op(e, chunk, chunk.code[pc],
-                     static_cast<uint32_t>(remap(pc)), jc)) {
+        label[pc] = e.pos();
+        if (op_is_branch(chunk.code[pc].op))
+            emit_branch(e, chunk, chunk.code[pc],
+                        static_cast<uint32_t>(remap[pc]), 0, n, remap, fixups);
+        else if (!emit_op(e, chunk, chunk.code[pc],
+                          static_cast<uint32_t>(remap[pc]), jc))
             return false;                  /* selection miss: chunk pristine */
-        }
         pc++;
     }
-    /* The body ends in a native ReturnV (emit_op emitted its `ret`); no
-     * trailing exit_pc needed. */
+    for (const Fixup &f : fixups)          /* patch each fragment-local branch */
+        e.patch32(f.site,
+                  static_cast<uint32_t>(label[f.target_pc] - (f.site + 4)));
+    /* The body ends in a native ReturnV (emit_op emitted its `ret`); every
+     * other exit is a branch to an in-body label, so no trailing exit_pc. */
 
     /* Finalize: trampolines for out-of-range calls, mmap W^X, patch call
      * rel32s, flip RX. (Self-contained - does NOT touch the per-run path.) */
@@ -1887,7 +1917,15 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
       en.set_a(o); }
     nc.push_back(en);
     for (size_t pc = 0; pc < n; pc++) {
-        nc.push_back(chunk.code[pc]);      /* no branch remap: no branches */
+        Instr in = chunk.code[pc];
+        /* M4: remap a NATIVE branch's target (in.target) - the interpreted
+         * originals are kept, so a bail/resume in a non-deletable case still
+         * dispatches correctly. Same audited branch-op list as the per-run
+         * rebuild. */
+        if (branch_pc_target(in) >= 0 && in.target >= 0
+                && static_cast<size_t>(in.target) <= n)
+            in.target = remap[in.target];
+        nc.push_back(in);
         if (pc == island_end - 1) {
             Instr eb;
             eb.op = OpCode::ExitBlock;
@@ -1899,9 +1937,9 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     }
     chunk.code = std::move(nc);
     for (auto &l : chunk.locs)
-        l.pc = static_cast<uint32_t>(remap(l.pc));
+        l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &ic : chunk.inline_ctxs)
-        ic.pc = static_cast<uint32_t>(remap(ic.pc));
+        ic.pc = static_cast<uint32_t>(remap[ic.pc]);
 
     chunk.native.base = mem;
     chunk.native.len = len;
