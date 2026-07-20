@@ -1813,6 +1813,14 @@ extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native MoveV body - the interpreter's exact
+ * `frame->at(dst).put(frame->at(src).get())` (an alias-copy, ref-aware; never
+ * throws). `slots` is the frame slot base (rdi). */
+extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
+{
+    slots[dst].put(slots[src].get());
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off

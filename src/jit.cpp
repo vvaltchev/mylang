@@ -622,6 +622,11 @@ static bool jit_op_eligible(const Instr &in)
      * Measured ~6.5% wall / 12% fewer instrs on 23_dict_insert. */
     case OpCode::DictStore:
         return in.target == 0;
+    /* model-flip (nativize-ops): a boxed slot copy `dst = src.get()`. Calls
+     * jit_move (the interpreter's exact MoveV, ref-aware, never throws) so a
+     * run no longer splits at a MoveV - one island op fewer, bigger fragments.*/
+    case OpCode::MoveV:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -899,6 +904,13 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * must hold CURRENT EvalValues - a cached int key (a counter used
              * as d[i]) would leave its slot stale. Disqualify all three. */
             bad(in.target2); bad(in.a_slot()); bad(in.b_slot());
+            break;
+        case OpCode::MoveV:
+            /* jit_move reads/writes slots[src]/slots[dst] from MEMORY, so both
+             * must be current (not pinned in a register). Disqualify them; the
+             * rest of the run can still cache (the call saves/restores r10/r11).
+             * A MoveV also copies any type - never an int-scalar cache anyway. */
+            bad(in.target); bad(in.target2);
             break;
         case OpCode::Jump:
             break;                       /* no slots */
@@ -1365,6 +1377,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_dict_store(e, in, pc);
         return true;
 
+    case OpCode::MoveV:
+        /* model-flip (nativize-ops): dst = src.get() via jit_move (rdi=slots
+         * base - already correct after the prologue's push, rsi=dst, rdx=src).
+         * Never throws, so no eax check. The prologue/epilogue save+restore rdi
+         * and the N5 cache regs (the copy clobbers caller-saved). */
+        emit_call_prologue(e);
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_move) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::ReturnV:
         /* #55: flush the cache (jit_ret reads the result slot from MEMORY),
          * then call jit_ret(res_slot) and RET its resume sentinel. rdi (the
@@ -1582,6 +1608,12 @@ static bool op_fully_native(OpCode op)
      * SENTINEL, not a re-interpret pc), so the interpreted original can be
      * dropped from a deletable run - exactly the fully-native contract. */
     case OpCode::ReturnV:
+    /* model-flip (nativize-ops): MoveV runs entirely in the fragment (the
+     * jit_move helper never throws / never bails), so it never returns an
+     * interior pc - deletable. Without this a MoveV adjacent to a fully-native
+     * loop (e.g. the print-arg move after the loop) would extend the run and
+     * make the LOOP non-deletable (its int originals kept). */
+    case OpCode::MoveV:
         return true;
     default:
         return false;
