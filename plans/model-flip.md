@@ -296,6 +296,38 @@ analysis-only). Commit per milestone.
   the container). Confirm the `.myv` image still holds only serializable data
   (bytecode + pools; machine code is never serialized — re-JIT on load).
 
+## NATIVIZE OPS — shrink the islands (the incremental path to full-native)
+
+The maintainer's chosen direction (2026-07-21) after M4b showed loop containers
+are marginal: **teach the JIT to emit more ops natively, one at a time, shrinking
+the island set toward zero** — the AST→VM-style fallback removal. Each op moved
+from "island" to "native" removes an island-op TYPE and grows the fragments; in
+the limit the islands vanish (full-native AOT). Independent of the re-entry
+ceiling (it applies whether or not containers form). The pattern (approach A):
+add the op to `jit_op_eligible` + an `emit_op` case that `call`s a `jit_*` helper
+(vm.cpp) running the interpreter's EXACT body; a throwing op catches loc-less
+into `g_vm_jit_exc` + returns non-0 (the fragment exits, EnterNative re-raises
+with the caret from the loc side table); `pick_cached_slots` disqualifies the
+op's memory-accessed slots; a NON-throwing op is also `op_fully_native`
+(deletable). **Per-op perf is ~NEUTRAL** (a helper `call` ≈ a dispatch) - the win
+is STRUCTURAL + cumulative (see the milestone framing above); measure each
+same-binary-A/B to confirm neutral-not-regression, don't expect a delta.
+
+**Done (island-op occurrences across bench/ → 0):** MoveV (168, `jit_move`),
+SubscriptV (87, `jit_subscript`, throwing-read), LoadBuiltinV (154,
+`jit_load_builtin`).
+
+**Remaining top blockers (bench tally):** CallBuiltinV (292 - the big one, but
+CALLS: builtin call, some with callbacks that re-enter vm_dispatch → careful),
+LoadConstV (112 - needs the const-pool value; bake `&chunk.consts[idx]`, the
+vector BUFFER is stable across the chunk's std::move even though `&chunk`
+dangles - or a trivial-only fast path), Halt (83 - a void-function end; the
+container/return-none path), MemberV (needs the pooled member-key + carets, same
+buffer-baking), MakeClosureV (35), StoreGlobalV (32), LoadLiteralObjV (27),
+DictLoadInt (17)... GOTCHA: an op needing a CHUNK pool (LoadConstV/MemberV) can't
+bake `&chunk` (it dangles - the chunk is stack-built then moved), but CAN bake
+the pool's heap BUFFER address (`vec.data()+idx`), which a vector move preserves.
+
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);
   the `-nj`/`MYLANG_JIT=0` kill switch = a same-binary A/B lever AND the safety
