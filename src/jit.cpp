@@ -648,6 +648,11 @@ static bool jit_op_eligible(const Instr &in)
      * throws). */
     case OpCode::LoadConstV:
         return true;
+    /* model-flip (nativize-ops): a PLAIN global store `g = expr` (aop invalid)
+     * via jit_store_global (never throws). A COMPOUND `g OP=`/`g++` throws on
+     * an undefined slot + runs num_bin_op -> stays interpreted. */
+    case OpCode::StoreGlobalV:
+        return in.aop == Op::invalid;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -940,6 +945,10 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::MemberV:
             /* leas &slot for base/dst (the member key is baked, not a slot). */
             bad(in.target2); bad(in.target);
+            break;
+        case OpCode::StoreGlobalV:
+            /* reads the rhs slot from memory (target is a GLOBAL slot). */
+            bad(in.a_slot());
             break;
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
@@ -1452,6 +1461,25 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::StoreGlobalV: {
+        /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd
+         * from the slots base FIRST), then rdi = gslot (target) - which
+         * overwrites the slots base, so it must come after the lea. Never
+         * throws (the plain-only gate). */
+        const auto off = [](int slot) {
+            return static_cast<int32_t>(static_cast<long>(slot)
+                                        * static_cast<long>(sizeof(LValue)));
+        };
+        emit_call_prologue(e);
+        e.lea(RSI, off(in.a_slot()));       /* rsi = &slot[src] (uses rdi) */
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_store_global) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+    }
+
     case OpCode::SubscriptV: {
         /* dst = base[idx] via jit_subscript(base_lv, idx*, dst*) - SysV rdi=
          * base_lv, rsi=idx, rdx=dst. leas from rdi (slots base); rdi is set LAST
@@ -1721,10 +1749,12 @@ static bool op_fully_native(OpCode op)
      * interior pc - deletable. Without this a MoveV adjacent to a fully-native
      * loop (e.g. the print-arg move after the loop) would extend the run and
      * make the LOOP non-deletable (its int originals kept). LoadBuiltinV /
-     * LoadConstV are the same (a trivial / value-copy non-throwing load). */
+     * LoadConstV are the same (a trivial / value-copy non-throwing load); a
+     * PLAIN StoreGlobalV (the only eligible form) never throws either. */
     case OpCode::MoveV:
     case OpCode::LoadBuiltinV:
     case OpCode::LoadConstV:
+    case OpCode::StoreGlobalV:
         return true;
     default:
         return false;
