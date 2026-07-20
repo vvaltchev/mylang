@@ -1724,6 +1724,12 @@ static size_t g_vm_resume_pc = 0;
 static const size_t VM_BLOCK_NONE = static_cast<size_t>(-1);
 static size_t g_vm_block_resume = VM_BLOCK_NONE;
 
+/* model-flip M3: jit_exec_block returns this (high bit set, so a container
+ * fragment's `test rax; jns` distinguishes it from a small fall-through resume
+ * pc) when an island RAISED - the pending exception is bridged into
+ * g_vm_jit_exc and the fragment exits so EnterNative re-raises. */
+static const size_t JIT_BLOCK_RAISED = static_cast<size_t>(-3);
+
 /* #55 native calls: the EvalContext of the CURRENTLY EXECUTING vm_run_chunk
  * (set + restored at each entry - a builtin callback re-enters with the invoke
  * ctx), so the native ReturnV helper (jit_ret) reaches the right frame / flow /
@@ -2299,6 +2305,11 @@ extern "C" size_t jit_ret(int_type res_slot) noexcept
 
 /* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
 unsigned long g_jit_native_calls = 0;
+
+/* model-flip M3: native-container island calls set up process-wide (coverage -
+ * proves a container's jit_exec_block path actually ran; a `jit:` test asserts
+ * it > 0, per the "prove the code ran" rule). */
+unsigned long g_jit_container_calls = 0;
 
 /* #55 STEP 2.1: member offsets the native-call emitter bakes. Measured via a
  * probe object (no offsetof-on-non-standard-layout warning); both types are
@@ -5078,6 +5089,39 @@ vm_exec_block(EvalContext &ctx, VmActivation &act, const Chunk &chunk,
     if (g_vm_exc_pending)
         return BlockStatus::Raised;
     return BlockStatus::Returned;        /* ReturnV set flow.ret; Halt -> none */
+}
+
+/*
+ * model-flip M3 (plans/model-flip.md): a native CONTAINER fragment, at an
+ * island, `call`s this - baking its OWN FuncDescriptor + the island's start pc.
+ * It runs the interpreted island via vm_exec_block in the container's frame
+ * (reached through g_current_ctx / g_vm_act, exactly like jit_ret) and returns
+ * the fall-through resume pc; on an UNCAUGHT island exception it bridges the
+ * pending signal into g_vm_jit_exc and returns the RAISED sentinel, so the
+ * caller fragment exits to the island pc and the EnterNative handler re-raises
+ * (byte-identical caret + backtrace). extern "C" + noexcept: vm_exec_block
+ * catches into the signal, so this never C++-throws out of native code.
+ */
+extern "C" size_t jit_exec_block(const FuncDescriptor *desc,
+                                 size_t from_pc) noexcept
+{
+    g_jit_container_calls++;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const Chunk *ck = static_cast<const Chunk *>(desc->vm_chunk);
+    size_t resume = 0;
+    const BlockStatus st = vm_exec_block(ctx, act, *ck, from_pc, &resume);
+    if (st == BlockStatus::FellThrough)
+        return resume;                    /* a small pc; the fragment continues*/
+    if (st == BlockStatus::Raised) {
+        g_vm_jit_exc = std::move(g_vm_exc_pending);   /* EnterNative re-raises */
+        return JIT_BLOCK_RAISED;
+    }
+    /* Returned: an island ReturnV - the M3 container gate excludes it (ReturnV
+     * is native/terminal, never inside an island). A loud abort if a future
+     * gate ever admits one. */
+    ML_CHECK_MSG(false, "island ReturnV - excluded by the M3 container gate");
+    return JIT_BLOCK_RAISED;
 }
 
 #ifdef TESTS

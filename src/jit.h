@@ -121,6 +121,10 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
  * proves the native call path actually ran). */
 extern unsigned long g_jit_native_calls;
 
+/* model-flip M3: native-container island calls (jit_exec_block) run process-wide
+ * - a coverage counter proving the container path executed. */
+extern unsigned long g_jit_container_calls;
+
 /*
  * #55 STEP 2: is this chunk's WHOLE body a single fully-native run ending in
  * ReturnV (a `native_leaf` a caller fragment can `call` directly)? Computed
@@ -180,6 +184,17 @@ extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
  * baked as a call target by the emitter. noexcept: a fully-native leaf body is
  * throw-free, so the pop/leave here cannot throw. */
 extern "C" size_t jit_ret(int_type res_slot) noexcept;
+
+/*
+ * model-flip M3 (plans/model-flip.md): the native CONTAINER's ISLAND call. A
+ * container fragment, at an interpreted island, `call`s this with its OWN
+ * FuncDescriptor (so vm_exec_block can reach the container's chunk via
+ * desc->vm_chunk) and the island's start pc. Runs the island via vm_exec_block
+ * in the container frame; returns the fall-through resume pc, or a high-bit-set
+ * RAISED sentinel (bridging the pending exception into g_vm_jit_exc) so the
+ * caller fragment can `test rax; jns` and exit to re-raise. noexcept. */
+extern "C" size_t jit_exec_block(const FuncDescriptor *desc,
+                                 size_t from_pc) noexcept;
 
 /* #55: native ReturnVs executed process-wide (a `jit:` coverage counter that
  * PROVES the native return path actually ran, not the interpreter). */
