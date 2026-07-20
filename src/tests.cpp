@@ -14676,6 +14676,52 @@ static bool jit_container()
 #endif
 }
 
+/* model-flip (nativize-ops): PROVE the nativized-op helpers actually RUN (not
+ * merely that the op is jit_op_eligible / native in the hypothetical container
+ * view - the "prove the code ran" rule). A general subscript `a[i]` on a dyn
+ * base is a SubscriptV; in a loop it lands in a fragment and calls jit_subscript
+ * per iteration, so g_jit_op_calls must bump. */
+static bool jit_op_nativized()
+{
+#if defined(__x86_64__) && !defined(_WIN32)
+    if (!g_jit_enabled)
+        return true;
+    const unsigned long b0 = g_jit_op_calls;
+    std::string src;
+    std::vector<Tok> toks;
+    for (const char *l : {
+            "func f(dyn a, int n) {",
+            "  var dyn s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + a[i];",
+            "  return s;",
+            "}",
+            "assert(f(runtime([10, 20, 30, 40, 50]), 5) == 150);" }) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    lexer(src, 1, toks);
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) {
+        ok = false;
+    }
+    g_exec_engine = saved;
+    if (!ok)
+        return false;
+    return g_jit_op_calls > b0;   /* jit_subscript actually ran natively */
+#else
+    return true;
+#endif
+}
+
 static bool vm_codegen_shapes()
 {
     /* 1) resolved-local int while + if -> native ops (native-first codegen
@@ -16024,6 +16070,8 @@ static const std::vector<extra_check> extra_checks =
       jit_native_call },
     { "jit: native container + bytecode island (model-flip M3)",
       jit_container },
+    { "jit: nativized ops actually run natively (g_jit_op_calls bumps)",
+      jit_op_nativized },
     { "vm: cross-compile M8 specialization is deterministic (no template leak)",
       cross_compile_specialize_stable },
     { "vm: codegen shapes (native int loop + flatten)",
