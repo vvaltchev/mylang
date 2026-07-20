@@ -313,13 +313,28 @@ op's memory-accessed slots; a NON-throwing op is also `op_fully_native`
 is STRUCTURAL + cumulative (see the milestone framing above); measure each
 same-binary-A/B to confirm neutral-not-regression, don't expect a delta.
 
-**Done (6 ops, island-op occurrences across bench/ → 0; all perf-neutral +
-green + ASan/clang-clean):** MoveV (168, `jit_move`), SubscriptV (87,
-`jit_subscript`, throwing-read), LoadBuiltinV (154, `jit_load_builtin`),
+**⛔ VERIFY NATIVE EXECUTION WITH HARD EVIDENCE (the bold rule near the top of
+the CLAUDE.md model-flip section).** A nativized op is NOT done until a PER-OP
+runtime counter proves the native code RAN. "island-op occurrences → 0" is the
+M1 container-plan ELIGIBILITY view (hypothetical) - NOT execution. The
+verification here (`g_jit_op_run[op]` bumped in each helper + the
+`jit_op_nativized` `jit:` test) caught 2 bugs: (1) **the container gate emitted
+MoveV/LoadConstV as ISLANDS** - they're in the stale `op_is_simple_island`
+whitelist AND now `op_run_eligible`, and the gate checked island-membership
+FIRST, so in a container their helpers were NEVER called - FIXED by checking
+`op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
+call away - FIXED with `runtime()` args.
+
+**Done (6 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via `g_jit_op_run`
+- real-bench evidence: 62_dict_word_count Subscript=2,000,001, 46_matrix_mult
+MoveV=217, 47_wordcount Const=200,000):** MoveV (168, `jit_move`), SubscriptV
+(87, `jit_subscript`, throwing-read), LoadBuiltinV (154, `jit_load_builtin`),
 LoadConstV (112, `jit_load_const` - bakes the const-pool buffer addr),
 MemberV (`jit_member`, throwing-read, bakes the member-key buffer addr - a
 missing-member caret is byte-identical), StoreGlobalV-plain (35,
-`jit_store_global`; the compound `g OP=`/`g++` stays interpreted).
+`jit_store_global`; the compound `g OP=`/`g++` stays interpreted). Per-op perf
+~neutral (helper ≈ dispatch) but CUMULATIVELY a real win where they're hot:
+62_dict_word_count −5.2% (all 6 on vs off).
 
 **Remaining top blockers (bench tally):** CallBuiltinV (~294 - the big one, but
 CALLS: a builtin call, some with callbacks that re-enter vm_dispatch → careful),
