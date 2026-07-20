@@ -222,6 +222,14 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
  * (it throws on an undefined slot + runs num_bin_op). */
 extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
 
+/* model-flip (nativize-ops): LoadLiteralObjV natively - materialize a baked
+ * const array/dict/struct literal via the shared eval_literal_obj (immutable
+ * share vs a fresh mutable clone; never throws). `lo` is a baked
+ * `&chunk.literal_objs[idx]` - the literal-objs pool BUFFER address (void* since
+ * Chunk::LiteralObjEntry is nested), stable across the chunk's std::move. */
+extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
+                                     const void *lo) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is
