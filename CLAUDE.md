@@ -5130,7 +5130,18 @@ ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
 un-nativizable regions become islands reached via `call vm_exec_block(from)`;
 the native code DRIVES, the interpreter is called only per-island (block-level
 dispatch, not per-op). This universalizes native `call <offset>` (not just leaf
-callees) and is the platform for the N7 unboxing arc. Milestones **M1**
+callees) and is the platform for the N7 unboxing arc. **The flip is a MILESTONE
+toward FULL-NATIVE AOT compilation, not primarily a short-term perf play**
+(maintainer, 2026-07-21): every function becomes a `call`-able native blob whose
+un-nativized regions are bytecode ISLANDS, and those islands become
+progressively RARER as we teach the JIT to emit more ops natively — EXACTLY like
+the AST→VM conversion removed its fallbacks (`EvalStmt`…) one op at a time until
+the codegen was no-fail. `vm_exec_block` is the general escape hatch that lets us
+ship the framework now and nativize ops incrementally; in the limit the islands
+vanish and the program is 100% native. So judge the arc by "are islands
+shrinking / is the call graph going native," not only by a single milestone's
+benchmark delta (loop containers measured marginal — see M4b — yet the framework
+is the point). Milestones **M1**
 (container-plan analysis + `-vd`, no runtime change — LANDED) → **M2**
 (`vm_exec_block` island executor — LANDED) → **M3** (whole-function container,
 simplest mixed shape — LANDED) → M4 (island-exit dispatch + branches/loops) → M5
