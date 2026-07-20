@@ -1847,6 +1847,15 @@ extern "C" void jit_load_builtin(LValue *slots, int_type dst,
     slots[dst].put(builtin_slot(static_cast<int>(idx)).get());
 }
 
+/* model-flip (nativize-ops): the native LoadConstV body - the interpreter's
+ * exact `slots[dst] = chunk->consts[idx]` (a value copy; never throws). `src`
+ * points into the const-pool buffer (baked by the emitter). */
+extern "C" void jit_load_const(LValue *slots, int_type dst,
+                               const EvalValue *src) noexcept
+{
+    slots[dst].put(*src);
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
