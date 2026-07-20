@@ -1888,6 +1888,16 @@ extern "C" void jit_store_global(int_type gslot,
     g->defined[gslot] = 1;
 }
 
+/* model-flip (nativize-ops): the native ArrLen body - the interpreter's exact
+ * `frame[dst] = size(frame[base])`. `base` is a proven flat array, so size()
+ * never throws (op_fully_native). */
+extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
+{
+    ML_JIT_OP_RAN(ArrLen);
+    slots[dst].put(EvalValue(static_cast<int_type>(
+        slots[base].get().get_ref<SharedArrayObj>().size())));
+}
+
 /* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
  * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
  * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws

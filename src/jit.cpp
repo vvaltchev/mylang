@@ -658,6 +658,10 @@ static bool jit_op_eligible(const Instr &in)
      * never throws). */
     case OpCode::LoadLiteralObjV:
         return true;
+    /* model-flip (nativize-ops): the foreach snapshot bound n = size(array)
+     * via jit_arr_len - a proven flat array, never throws. */
+    case OpCode::ArrLen:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -950,6 +954,11 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::MemberV:
             /* leas &slot for base/dst (the member key is baked, not a slot). */
             bad(in.target2); bad(in.target);
+            break;
+        case OpCode::ArrLen:
+            /* dst written from memory; base (target2) holds an array reference,
+             * never an int - both must stay in memory. */
+            bad(in.target); bad(in.target2);
             break;
         case OpCode::StoreGlobalV:
             /* reads the rhs slot from memory (target is a GLOBAL slot). */
@@ -1481,6 +1490,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::ArrLen:
+        /* n = size(frame[base]) via jit_arr_len (rdi=slots, rsi=dst=target,
+         * rdx=base=target2). Base is a proven flat array -> never throws. */
+        emit_call_prologue(e);
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_arr_len) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::StoreGlobalV: {
         /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd
          * from the slots base FIRST), then rdi = gslot (target) - which
@@ -1776,6 +1797,7 @@ static bool op_fully_native(OpCode op)
     case OpCode::LoadConstV:
     case OpCode::StoreGlobalV:
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
+    case OpCode::ArrLen:            /* size() of a proven array, never throws */
         return true;
     default:
         return false;

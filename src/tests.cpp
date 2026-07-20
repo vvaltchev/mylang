@@ -14769,6 +14769,15 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(5)) == 5);" } },
+        /* ArrLen: the foreach snapshot bound over a proven array<int>. */
+        { OpCode::ArrLen, {
+            "func f(int n) {",
+            "  var a = range(n);",
+            "  var s = 0;",
+            "  foreach (var x in a) s = s + x;",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 10);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
