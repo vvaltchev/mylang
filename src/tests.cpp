@@ -14657,6 +14657,19 @@ static bool jit_container()
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
+    /* (4) model-flip M4b: MULTIPLE islands - an init MoveV (`var dyn s = x`)
+     * and a body BinOpV, each its own `call jit_exec_block`. */
+    if (!run({ "func lc2(dyn x, int n) {",
+               "  var dyn s = x;",
+               "  for (var i = 0; i < n; i++) {",
+               "    var a = i * 2;",
+               "    var b = a + 3;",
+               "    s = s + b;",
+               "  }",
+               "  return s;",
+               "}",
+               "assert(lc2(runtime(0), 5) == 35);" }))
+        return false;
     return true;
 #else
     return true;
