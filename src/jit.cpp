@@ -627,6 +627,13 @@ static bool jit_op_eligible(const Instr &in)
      * run no longer splits at a MoveV - one island op fewer, bigger fragments.*/
     case OpCode::MoveV:
         return true;
+    /* model-flip (nativize-ops): a general subscript READ base[idx] via
+     * jit_subscript (the interpreter's exact Type::subscript; throws -> exit ->
+     * EnterNative re-raises). base/idx/dst are frame slots. Not op_fully_native
+     * (it can bail on a throw), so a run holding it keeps its interpreted
+     * originals - like the store ops. */
+    case OpCode::SubscriptV:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -911,6 +918,10 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * rest of the run can still cache (the call saves/restores r10/r11).
              * A MoveV also copies any type - never an int-scalar cache anyway. */
             bad(in.target); bad(in.target2);
+            break;
+        case OpCode::SubscriptV:
+            /* the fragment leas &slot for base/idx/dst - all must be current. */
+            bad(in.target2); bad(in.a_slot()); bad(in.target);
             break;
         case OpCode::Jump:
             break;                       /* no slots */
@@ -1390,6 +1401,30 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         return true;
+
+    case OpCode::SubscriptV: {
+        /* dst = base[idx] via jit_subscript(base_lv, idx*, dst*) - SysV rdi=
+         * base_lv, rsi=idx, rdx=dst. leas from rdi (slots base); rdi is set LAST
+         * (it overwrites the base ptr). A non-0 return = threw -> exit to pc so
+         * EnterNative re-raises g_vm_jit_exc. */
+        const auto off = [](int slot) {
+            return static_cast<int32_t>(static_cast<long>(slot)
+                                        * static_cast<long>(sizeof(LValue)));
+        };
+        emit_call_prologue(e);
+        e.lea(RSI, off(in.a_slot()));       /* rsi = &slot[idx] */
+        e.lea(RDX, off(in.target));         /* rdx = &slot[dst] */
+        e.lea_rdi(off(in.target2));         /* rdi = &slot[base] (LAST) */
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_subscript) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+        const size_t j_ok = e.j8(0x74);     /* jz ok (0 = no throw) */
+        e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
+        e.patch8(j_ok, e.pos());
+        return true;
+    }
 
     case OpCode::ReturnV:
         /* #55: flush the cache (jit_ret reads the result slot from MEMORY),

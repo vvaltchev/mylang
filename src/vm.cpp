@@ -1821,6 +1821,23 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
     slots[dst].put(slots[src].get());
 }
 
+/* model-flip (nativize-ops): the native SubscriptV body - the interpreter's
+ * exact `dst = RValue(base.subscript(idx, for_write=false))`. base_lv is passed
+ * as an LValue* (like Subscript::do_eval, for COW identity). Throws -> caught
+ * loc-less; EnterNative re-raises (loc from the side table). */
+extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
+                             LValue *dst) noexcept
+{
+    try {
+        Type *t = base_lv->get().get_type();
+        dst->put(RValue(t->subscript(EvalValue(base_lv), *idx, false)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
