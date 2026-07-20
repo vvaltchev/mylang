@@ -53,6 +53,15 @@ const Chunk *vm_func_chunk(const FuncDescriptor *fdesc, bool jit = true);
 void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
 
 /*
+ * model-flip M2 (plans/model-flip.md): headless self-test for vm_exec_block -
+ * the interpreted-ISLAND executor the native container will call. Hand-builds
+ * tiny islands (fall-through, an internal boxed branch, a return, an uncaught
+ * throw) and asserts the returned status + resulting state. Defined only under
+ * TESTS; returns true on success. Called from the -rt table.
+ */
+bool vm_exec_block_selftest();
+
+/*
  * Allocate / release a callee frame WINDOW on the current activation's
  * segmented slot stack (plans/vm-native-call-stack.md): do_func_call binds a
  * chunked body's params into the returned view Frame instead of constructing

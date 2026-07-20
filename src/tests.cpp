@@ -15941,6 +15941,8 @@ static const std::vector<extra_check> extra_checks =
     { "vm: -vd full serializable image (types + pools)", vm_disasm_full_image },
     { "vm: -vd container plan (model-flip M1 analysis)",
       vm_disasm_container_plan },
+    { "vm: vm_exec_block island executor (model-flip M2)",
+      vm_exec_block_selftest },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
     { "vm: disasm closures + halt-drop", vm_disasm_closure_shape },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },

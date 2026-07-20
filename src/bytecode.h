@@ -1108,6 +1108,18 @@ enum class OpCode : unsigned char {
     EnterNative,
 
     /*
+     * model-flip M2 (plans/model-flip.md): the ISLAND fall-through terminator.
+     * In the "native containers with bytecode islands" model, a native
+     * container `call`s vm_exec_block(from_pc) to run an interpreted island;
+     * the island ends with an ExitBlock, whose handler hands control back to
+     * the container (returns from vm_dispatch) with the resume pc in `a_lit`
+     * (where the container continues - the next block). ONLY reached via
+     * vm_exec_block; not emitted by codegen yet (M3 wires the emitter). Its
+     * `a_lit` IS a pc field (add to visit_pc_fields when M3 emits it).
+     */
+    ExitBlock,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1156,7 +1168,8 @@ enum class OpCode : unsigned char {
     X(IntShrRI) X(IntModRI) X(FloatAddRR) X(FloatAddRI) X(FloatSubRR) \
     X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV) \
     X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt) \
-    X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative)
+    X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
+    X(ExitBlock)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin
