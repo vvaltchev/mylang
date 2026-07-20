@@ -634,6 +634,10 @@ static bool jit_op_eligible(const Instr &in)
      * originals - like the store ops. */
     case OpCode::SubscriptV:
         return true;
+    /* model-flip (nativize-ops): load a builtin value into a slot via
+     * jit_load_builtin (a trivial value, never throws -> op_fully_native). */
+    case OpCode::LoadBuiltinV:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -922,6 +926,11 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::SubscriptV:
             /* the fragment leas &slot for base/idx/dst - all must be current. */
             bad(in.target2); bad(in.a_slot()); bad(in.target);
+            break;
+        case OpCode::LoadBuiltinV:
+            /* writes dst from memory (a builtin, not an int); target2 is a
+             * compile-time index, not a slot. */
+            bad(in.target);
             break;
         case OpCode::Jump:
             break;                       /* no slots */
@@ -1402,6 +1411,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::LoadBuiltinV:
+        /* dst = builtin_slot[idx] via jit_load_builtin (rdi=slots, rsi=dst,
+         * rdx=idx). idx (target2) is a compile-time index, never throws. */
+        emit_call_prologue(e);
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_load_builtin) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::SubscriptV: {
         /* dst = base[idx] via jit_subscript(base_lv, idx*, dst*) - SysV rdi=
          * base_lv, rsi=idx, rdx=dst. leas from rdi (slots base); rdi is set LAST
@@ -1647,8 +1668,10 @@ static bool op_fully_native(OpCode op)
      * jit_move helper never throws / never bails), so it never returns an
      * interior pc - deletable. Without this a MoveV adjacent to a fully-native
      * loop (e.g. the print-arg move after the loop) would extend the run and
-     * make the LOOP non-deletable (its int originals kept). */
+     * make the LOOP non-deletable (its int originals kept). LoadBuiltinV is the
+     * same (a trivial non-throwing load). */
     case OpCode::MoveV:
+    case OpCode::LoadBuiltinV:
         return true;
     default:
         return false;

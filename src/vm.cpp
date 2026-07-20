@@ -1838,6 +1838,15 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native LoadBuiltinV body - the interpreter's
+ * exact `slots[dst] = builtin_slot[idx].get()`. A builtin is a trivial value
+ * (< t_str), never throws. */
+extern "C" void jit_load_builtin(LValue *slots, int_type dst,
+                                 int_type idx) noexcept
+{
+    slots[dst].put(builtin_slot(static_cast<int>(idx)).get());
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
