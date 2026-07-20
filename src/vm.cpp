@@ -2028,6 +2028,44 @@ extern "C" int jit_boxed_compound(const void *bop) noexcept
     return 0;
 }
 
+/* model-flip (nativize-ops): the native LogV body - EAGER logical `a && b` /
+ * `a || b` (MyLang's don't short-circuit at runtime; both operands are already
+ * computed). is_true() never throws, so LogV is op_fully_native (no eax check).
+ * `bop` is a `&chunk.boxed_ops[idx]` (the same pool as the arith ops). */
+extern "C" void jit_boxed_log(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(LogV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue sa, sb;
+    const bool a = boxed_operand(bo->a, ctx, sa).is_true();
+    const bool b = boxed_operand(bo->b, ctx, sb).is_true();
+    ctx->frame->at(bo->target).put(
+        EvalValue(bo->aop == Op::land ? (a && b) : (a || b)));
+}
+
+/* model-flip (nativize-ops): the native CoerceNumV body - the typed-store
+ * numeric coerce (the coerces_dyn accumulator's plain assign): widen
+ * float<-int/bool, int<-bool, pass none, THROW TypeError on a non-fitting dyn
+ * value. `src_slot` holds the dyn value, `dst` the typed int/float slot,
+ * `is_float` the target kind. A throw catches LOC-LESS into g_vm_jit_exc +
+ * returns 1 -> EnterNative re-raises with the Expr14 caret from the loc side
+ * table (extract_locs records it), byte-identical to the interpreted stamp. */
+extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
+                              int is_float) noexcept
+{
+    ML_JIT_OP_RAN(CoerceNumV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        ctx->frame->at(dst).put(vm_coerce_decl_num(
+            ctx->frame->at(src_slot).get(), is_float != 0));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off

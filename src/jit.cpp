@@ -682,6 +682,15 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::CmpV:
     case OpCode::CompoundV:
         return in.target2 >= 0;
+    /* LogV (eager && / ||): is_true() never throws -> op_fully_native. Same
+     * boxed_ops pool (target2 = the index). */
+    case OpCode::LogV:
+        return in.target2 >= 0;
+    /* CoerceNumV: the typed numeric coerce of a dyn value. Register-passed
+     * (target2 is the int/float FLAG, not free for a pool index). CAN throw
+     * (bad narrow) -> NOT op_fully_native. */
+    case OpCode::CoerceNumV:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -999,6 +1008,7 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             return {};
         case OpCode::BinOpV:
         case OpCode::CmpV:
+        case OpCode::LogV:
             /* boxed operands/dst read/written from memory (dyn/string - not an
              * int-scalar cache candidate anyway, but disqualify defensively). */
             if (!in.a_is_lit()) bad(in.a_slot());
@@ -1008,6 +1018,13 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::CompoundV:
             bad(in.target);              /* read + written from memory */
             if (!in.b_is_lit()) bad(in.b_slot());
+            break;
+        case OpCode::CoerceNumV:
+            /* dst (a typed int/float coerces_dyn accumulator - COULD be a hot
+             * int slot) is written from memory by the helper; an N5-cached dst
+             * would be overwritten stale by the flush. src (a_slot) holds a dyn
+             * value (never int-cached). Disqualify both. */
+            bad(in.target); bad(in.a_slot());
             break;
         case OpCode::StoreGlobalV:
             /* reads the rhs slot from memory (target is a GLOBAL slot). */
@@ -1619,6 +1636,37 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::LogV:
+        /* jit_boxed_log(&ck.boxed_ops[target2]). is_true() never throws -> no
+         * eax check (op_fully_native). */
+        emit_call_prologue(e);
+        e.movabs(RDI,
+                 reinterpret_cast<uint64_t>(&ck.boxed_ops[in.target2]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_boxed_log) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
+    case OpCode::CoerceNumV: {
+        /* jit_coerce_num(dst, src_slot, is_float) - rdi=dst=target,
+         * rsi=src=a_slot, rdx=is_float=(target2!=0). Uses g_current_ctx->frame,
+         * not the slots arg. CAN throw -> test eax + exit_pc. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.a_slot())));
+        e.movabs(RDX, in.target2 != 0 ? 1u : 0u);
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_coerce_num) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok_cn = e.j8(0x74);
+        e.exit_pc(pc);
+        e.patch8(j_ok_cn, e.pos());
+        return true;
+    }
+
     case OpCode::StoreGlobalV: {
         /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd
          * from the slots base FIRST), then rdi = gslot (target) - which
@@ -1916,6 +1964,7 @@ static bool op_fully_native(OpCode op)
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
     case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
+    case OpCode::LogV:              /* eager && / || (is_true), never throws */
         return true;
     default:
         return false;
