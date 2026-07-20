@@ -14778,6 +14778,15 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(5)) == 10);" } },
+        /* DictLoadInt: a typed dict scalar read (member key, const pool). */
+        { OpCode::DictLoadInt, {
+            "func f(int n) {",
+            "  var d = {\"a\": 10, \"b\": 20};",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + d.a;",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 50);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
