@@ -1583,6 +1583,28 @@ struct Chunk {
     std::vector<MemberKey> member_keys;
 
     /*
+     * BOXED-ARITH OP POOL (BinOpV / CmpV / CompoundV) - the model-flip
+     * nativize-ops path. A boxed op's operand data (target + two Operands +
+     * the arith/compare Op) can't fit in the SysV registers a JIT helper call
+     * gets, and baking `&code[pc]` is unsafe (jit_compile_chunk rewrites the
+     * code vector). So `build_boxed_ops` (codegen) copies the FINAL Instr data
+     * (post-peephole) into this pool and stores the index in the op's OTHERWISE
+     * UNUSED `target2`; the JIT bakes `&boxed_ops[target2]` (a pool buffer
+     * address, stable across the chunk's std::move) and jit_boxed_* reads it.
+     * The interpreter ignores `target2` for these ops (it reads target/a/b/aop
+     * directly), so populating it is invisible to the tree-walker path.
+     * Serializable (plain values + Operands), so `.myv`-ready.
+     */
+    struct BoxedOp {
+        int target;               /* dst frame slot */
+        Op aop;                   /* the arith op (BinOpV/CompoundV) or the
+                                   * compare op (CmpV) */
+        Operand a;                /* left operand (unused by CompoundV) */
+        Operand b;                /* right operand */
+    };
+    std::vector<BoxedOp> boxed_ops;
+
+    /*
      * CHECKED-INC-DEC SITE POOL (IncDecElemCheckedV / IncDecMemberCheckedV).
      * The dual error carets a one-loc-per-pc side table can't hold: `lstart/
      * lend` = the SUBSCRIPT/MEMBER child's caret (a subscript-internal
