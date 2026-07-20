@@ -638,6 +638,11 @@ static bool jit_op_eligible(const Instr &in)
      * jit_load_builtin (a trivial value, never throws -> op_fully_native). */
     case OpCode::LoadBuiltinV:
         return true;
+    /* model-flip (nativize-ops): copy a const-pool value into a slot via
+     * jit_load_const (the emitter bakes the pool BUFFER address; never
+     * throws). */
+    case OpCode::LoadConstV:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -928,8 +933,9 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target2); bad(in.a_slot()); bad(in.target);
             break;
         case OpCode::LoadBuiltinV:
-            /* writes dst from memory (a builtin, not an int); target2 is a
-             * compile-time index, not a slot. */
+        case OpCode::LoadConstV:
+            /* writes dst from memory (a builtin / a const value, not an int);
+             * target2 is a compile-time index, not a slot. */
             bad(in.target);
             break;
         case OpCode::Jump:
@@ -1423,6 +1429,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::LoadConstV:
+        /* dst = consts[idx] via jit_load_const (rdi=slots, rsi=dst, rdx=src).
+         * src = &ck.consts[idx] - the const-pool BUFFER address, stable across
+         * the chunk's std::move (a vector move preserves data()); baking
+         * `&ck` would dangle. Never throws. */
+        emit_call_prologue(e);
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&ck.consts[in.target2]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_load_const) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::SubscriptV: {
         /* dst = base[idx] via jit_subscript(base_lv, idx*, dst*) - SysV rdi=
          * base_lv, rsi=idx, rdx=dst. leas from rdi (slots base); rdi is set LAST
@@ -1668,10 +1688,11 @@ static bool op_fully_native(OpCode op)
      * jit_move helper never throws / never bails), so it never returns an
      * interior pc - deletable. Without this a MoveV adjacent to a fully-native
      * loop (e.g. the print-arg move after the loop) would extend the run and
-     * make the LOOP non-deletable (its int originals kept). LoadBuiltinV is the
-     * same (a trivial non-throwing load). */
+     * make the LOOP non-deletable (its int originals kept). LoadBuiltinV /
+     * LoadConstV are the same (a trivial / value-copy non-throwing load). */
     case OpCode::MoveV:
     case OpCode::LoadBuiltinV:
+    case OpCode::LoadConstV:
         return true;
     default:
         return false;

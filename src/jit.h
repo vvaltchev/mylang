@@ -197,6 +197,13 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
 extern "C" void jit_load_builtin(LValue *slots, int_type dst,
                                  int_type idx) noexcept;
 
+/* model-flip (nativize-ops): LoadConstV natively - `slots[dst] = *src`, a copy
+ * of a baked const-pool EvalValue (never throws; ref-aware for a non-trivial
+ * const). `src` is `&chunk.consts[idx]` - the const-pool vector's heap BUFFER
+ * address, which survives the chunk's std::move (unlike `&chunk` itself). */
+extern "C" void jit_load_const(LValue *slots, int_type dst,
+                               const EvalValue *src) noexcept;
+
 /*
  * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
  * ReturnV runs IN the fragment. The fragment flushes its register cache and
