@@ -1856,6 +1856,24 @@ extern "C" void jit_load_const(LValue *slots, int_type dst,
     slots[dst].put(*src);
 }
 
+/* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
+ * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
+ * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws
+ * WITH the member caret already set, so EnterNative's re-raise preserves it. */
+extern "C" int jit_member(const EvalValue *base, LValue *dst,
+                          const void *mkv) noexcept
+{
+    const Chunk::MemberKey *mk = static_cast<const Chunk::MemberKey *>(mkv);
+    try {
+        dst->put(member_read_core(*base, mk->memId, mk->memUid, mk->optional,
+                                  mk->mstart, mk->mend, mk->bstart, mk->bend));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
