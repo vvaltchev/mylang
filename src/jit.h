@@ -181,6 +181,17 @@ extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
 extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept;
 
 /*
+ * model-flip (nativize-ops): SubscriptV natively - `dst = base[idx]` via the
+ * runtime Type::subscript (any base: array/dict/string), the interpreter's
+ * EXACT read. base_lv/dst are frame-slot LValue*s, idx the index slot's
+ * EvalValue*. CAN throw (OOB / KeyNotFound / type) -> caught LOC-LESS into
+ * g_vm_jit_exc, reported by a non-0 return; the fragment exits and EnterNative
+ * re-raises (caret from the loc side table at the op's pc). Keeps a
+ * subscript-in-a-loop native instead of splitting the run. */
+extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
+                             LValue *dst) noexcept;
+
+/*
  * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
  * ReturnV runs IN the fragment. The fragment flushes its register cache and
  * calls this with the result value's frame slot; jit_ret reads that slot from
