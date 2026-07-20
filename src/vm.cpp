@@ -1813,17 +1813,16 @@ extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
     return 0;
 }
 
-/* model-flip (nativize-ops): runtime coverage - proves the nativized op
- * helpers actually RUN (not just that the op is jit_op_eligible), the "prove
- * the code ran" rule. A `jit:` test asserts it bumps for a nativized-op loop. */
-unsigned long g_jit_op_calls = 0;
+/* model-flip (nativize-ops): PER-OP runtime coverage (see jit.h). Sized by
+ * the opcode count; g_jit_op_run[op] proves that op's native helper RAN. */
+unsigned long g_jit_op_run[static_cast<size_t>(OpCode::OpCount_)] = {0};
 
 /* model-flip (nativize-ops): the native MoveV body - the interpreter's exact
  * `frame->at(dst).put(frame->at(src).get())` (an alias-copy, ref-aware; never
  * throws). `slots` is the frame slot base (rdi). */
 extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
 {
-    g_jit_op_calls++;
+    ML_JIT_OP_RAN(MoveV);
     slots[dst].put(slots[src].get());
 }
 
@@ -1834,7 +1833,7 @@ extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
 extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
                              LValue *dst) noexcept
 {
-    g_jit_op_calls++;
+    ML_JIT_OP_RAN(SubscriptV);
     try {
         Type *t = base_lv->get().get_type();
         dst->put(RValue(t->subscript(EvalValue(base_lv), *idx, false)));
@@ -1851,7 +1850,7 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
 extern "C" void jit_load_builtin(LValue *slots, int_type dst,
                                  int_type idx) noexcept
 {
-    g_jit_op_calls++;
+    ML_JIT_OP_RAN(LoadBuiltinV);
     slots[dst].put(builtin_slot(static_cast<int>(idx)).get());
 }
 
@@ -1861,7 +1860,7 @@ extern "C" void jit_load_builtin(LValue *slots, int_type dst,
 extern "C" void jit_load_const(LValue *slots, int_type dst,
                                const EvalValue *src) noexcept
 {
-    g_jit_op_calls++;
+    ML_JIT_OP_RAN(LoadConstV);
     slots[dst].put(*src);
 }
 
@@ -1872,7 +1871,7 @@ extern "C" void jit_load_const(LValue *slots, int_type dst,
 extern "C" void jit_store_global(int_type gslot,
                                  const EvalValue *src) noexcept
 {
-    g_jit_op_calls++;
+    ML_JIT_OP_RAN(StoreGlobalV);
     GlobalFuncTable *g = g_current_ctx->gfuncs;
     g->slots[gslot].put(RValue(*src));
     g->defined[gslot] = 1;
@@ -1882,7 +1881,7 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
                           const void *mkv) noexcept
 {
     const Chunk::MemberKey *mk = static_cast<const Chunk::MemberKey *>(mkv);
-    g_jit_op_calls++;
+    ML_JIT_OP_RAN(MemberV);
     try {
         dst->put(member_read_core(*base, mk->memId, mk->memUid, mk->optional,
                                   mk->mstart, mk->mend, mk->bstart, mk->bend));

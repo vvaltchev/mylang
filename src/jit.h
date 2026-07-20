@@ -222,11 +222,18 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
  * (it throws on an undefined slot + runs num_bin_op). */
 extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
 
-/* model-flip (nativize-ops): runtime coverage - bumped by every nativized-op
- * helper (jit_move/jit_subscript/...), proving native code for those ops
- * actually RAN (not merely that the op is jit_op_eligible / classified native
- * in the hypothetical container view). Read by a `jit:` test. */
-extern unsigned long g_jit_op_calls;
+/* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
+ * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
+ * the native code for each op actually RAN (not merely that the op is
+ * jit_op_eligible / classified native in the hypothetical container view - the
+ * "prove the code ran" rule). Read per-op by a `jit:` test. Bumps are gated to
+ * TESTS via ML_JIT_OP_RAN so a release build pays nothing. */
+extern unsigned long g_jit_op_run[];
+#ifdef TESTS
+#  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
+#else
+#  define ML_JIT_OP_RAN(op) ((void)0)
+#endif
 
 /*
  * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
