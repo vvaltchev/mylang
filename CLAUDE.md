@@ -5502,6 +5502,25 @@ omitting it is a compile error.
 
 ## Conventions
 
+- **MyLang is a NEW, actively-evolving language — nothing is written in stone;
+  FIX the design, don't work around it (maintainer-set, 2026-07-22).** The
+  language is not perfectly designed and is changing right now. When you hit a
+  problem whose real root cause is a language/design wart, do NOT silently code
+  around it — **PROPOSE the design change GENTLY to the maintainer (never do it
+  ALONE / unilaterally)**, ideally with a "for now" fix plus a note to reconsider
+  the interface later. Concrete example that set this rule: nativizing
+  `CallBuiltinV` in the JIT tripped over `InvalidNumberOfArgsEx` /
+  `InvalidArgumentEx` being **non-runtime** (non-script-catchable, `DECL_SIMPLE_EX`)
+  exceptions that the native code's `RuntimeException`-shaped conveyance could not
+  carry (→ `std::terminate`). The RIGHT fix was not to widen the native code to
+  support non-runtime exceptions, but to **make those two exceptions inherit from
+  `RuntimeException`** (`InvalidArgumentEx` is inherently DYNAMIC so it belongs
+  there permanently; `InvalidNumberOfArgsEx` is a *for-now* move — the deeper fix
+  is to give builtins FIXED arities, e.g. split `write(str[, file])` into
+  `write(str)` + `fwrite(str, file)`, so arity becomes a COMPILE-time check and
+  the runtime throw disappears). The bar: surface the language-level option,
+  recommend, and let the maintainer decide — same as any design fork.
+
 - **DON'T pick work by "highest value" — the MAINTAINER prioritizes; YOU pick
   the SMALLEST step that makes progress in the chosen direction
   (maintainer-set, 2026-07-19).** When deciding what to do next, do NOT rank

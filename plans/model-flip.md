@@ -416,6 +416,51 @@ adjacent fully-native loop non-deletable. A partially-nativizable op
 (StoreGlobalV) gates on the instruction (`in.aop == Op::invalid`), not just the
 opcode.
 
+## Deferred nativization backlog (toward "almost everything native")
+
+The running TODO of things that would shrink islands / extend native coverage,
+to do LATER, separately (don't forget these):
+
+- **CallBuiltinV** (~294, the big island source) — IN PROGRESS; design decided,
+  see `plans/callbuiltinv-nativization.md` (#1 exception model change, #2
+  op_fully_native, #3 root-caused-orthogonal).
+- **`IntSubIR` (imm − reg) shape in `specialize_arith_ops`** — a lit-first
+  NON-commutative int op like `0 - i` / `k - i` stays a GENERIC `IntBin`
+  (`codegen.cpp` ~6775 `continue`s the lit-first non-commutative case; there's
+  no imm-reg shape, and subtraction can't swap to RI). Generic IntBin is not
+  jit_op_eligible, so such an op SPLITS a loop run below MIN_RUN and the loop
+  doesn't fragment (root-caused via the `abs(0-i)` case, see callbuiltinv #3).
+  Add an `IntSubIR` (+ `IntShl/ShrIR` if wanted) so these specialize → become
+  JIT-eligible. Targeted; helps reverse-iteration / `k - i` loops.
+- **Make a NON-div/mod/non-shift generic `IntBin` JIT-eligible** — the broader
+  version of the above: an emit case that reads `aop` and emits the matching
+  x86-64 instruction (add/sub/mul/and/or/xor/shl/shr with an imm-count),
+  GATING OUT the throwing arms (div/mod-by-reg throw on 0; a reg/negative shift
+  count needs the bail). Covers every non-throwing generic-IntBin corner at once
+  (not just `imm - reg`).
+- **The re-raise-op DELETABILITY refinement** (see callbuiltinv #2 "bigger
+  opportunity") — make SubscriptV / DictLoad / boxed-arith / CoerceNumV
+  op_fully_native (they re-raise, never re-execute) so loops with subscripts /
+  dict-reads / boxed-arith delete their originals. Blocked on the loc side table
+  collapsing multiple throwing ops' carets onto the EnterNative pc when a run is
+  deleted; needs per-op independent loc conveyance (or a one-side-table-throwing-
+  op-per-run cap).
+- **Builtin FIXED arities** (see callbuiltinv #1 follow-up) — split
+  `write(str[, file])` into `write(str)` + `fwrite(file_or_handle, str)` (file
+  first), so the inferencer can arity-check builtin calls at COMPILE time and the
+  runtime `InvalidNumberOfArgsEx` throw disappears (it could then go back to a
+  hard `DECL_SIMPLE_EX`). A language/interface change — propose to the maintainer.
+- **CallBuiltinLV / LVElem / LVMember** (the LVALUE-ABI builtins:
+  append/pop/insert/erase/sort/reverse/intptr) — the mutating-builtin analogue of
+  CallBuiltinV; when nativized, `CannotChangeConstEx` (const mutation) becomes
+  reachable → apply the SAME "make it a RuntimeException" fix as
+  InvalidArgumentEx/InvalidNumberOfArgsEx.
+- **Halt** (83) — a void-function end; needs the return-none path, and the
+  native_leaf predicate wants a trailing ReturnV, so a Halt-ending body needs
+  thought.
+- **SliceV / LoadGlobalV / the remaining container stores** — the other boxed
+  ops still splitting runs.
+
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);
   the `-nj`/`MYLANG_JIT=0` kill switch = a same-binary A/B lever AND the safety
