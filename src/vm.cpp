@@ -2110,6 +2110,55 @@ extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native CallBuiltinV body - a value-ABI
+ * read-only builtin call. `bcv` is a baked `&chunk.builtin_calls[idx]` (the pool
+ * entry: the func_v pointer, the args-list caret start/end, per-arg carets,
+ * arr_hint). The ArgLocs is built from it (no chunk needed - exactly
+ * arglocs_at's fields). Args are copied from frame slots [base, base+n) into a
+ * stack buffer (n<=8) or a heap one, then func_v runs the interpreter's EXACT
+ * body - a builtin with a callback (make_array/make_dict/find) re-enters
+ * vm_dispatch, which saves/restores g_current_ctx, so `ctx` is valid for the dst
+ * write after. Every REACHABLE builtin throw is now a RuntimeException (arity +
+ * bad-argument are DECL_RUNTIME_EX; the only DECL_SIMPLE one, InternalErrorEx in
+ * str() on snprintf<0, is a can't-happen defensive check) - caught, the loc
+ * stamped from the pool (bc->start/end, exactly the interpreter's stamp), cloned
+ * into g_vm_jit_exc + return 1 -> EnterNative re-raises with that (already-set)
+ * loc. */
+extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
+                                const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinV);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    ArgLocs al;
+    al.start = bc->start;
+    al.end = bc->end;
+    al.args = bc->args.data();
+    al.nargs = bc->args.size();
+    al.arr_hint = bc->arr_hint;
+    try {
+        EvalValue r;
+        if (n <= 8) {
+            EvalValue stackbuf[8];
+            for (int_type i = 0; i < n; i++)
+                stackbuf[i] = ctx->frame->at(base + i).get();
+            r = bc->builtin.func_v(ctx, &al, stackbuf, n);
+        } else {
+            std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
+            for (int_type i = 0; i < n; i++)
+                heapbuf[i] = ctx->frame->at(base + i).get();
+            r = bc->builtin.func_v(ctx, &al, heapbuf.data(), n);
+        }
+        ctx->frame->at(dst).put(std::move(r));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) { e.loc_start = bc->start; e.loc_end = bc->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off

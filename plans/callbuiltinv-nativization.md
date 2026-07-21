@@ -143,10 +143,13 @@ form to `specialize_arith_ops` (an `IntSubIR`), or by making a NON-div/mod
 generic `IntBin` `jit_op_eligible` (div/mod throw on 0, so gate them out). Small
 win for `0 - i` / `k - i` loop shapes; not needed here.
 
-## #4 — is CallBuiltinV worth it? (small per-call dispatch win vs. shrinking
-islands for the model flip) — TBD
+## #4 — is CallBuiltinV worth it?
 
-(placeholder)
+The per-call dispatch removal is SMALL (the builtin's own C++ work dominates -
+like the dict-store tier). The value is STRUCTURAL: CallBuiltinV is the biggest
+single island source (~294), and the whole model-flip point is shrinking islands
+toward full-native. So it's a milestone step, not a perf play. LANDED on that
+basis.
 
 ---
 
@@ -164,8 +167,17 @@ islands for the model flip) — TBD
    NOTE the counter caveat: main's own `runtime()`/`print()` are CallBuiltinV, so
    a bench/loop verification must attribute the count to the loop, not main.
 
+## STATUS: IMPLEMENTED (2026-07-22)
 
-## #4 — is CallBuiltinV worth it? (small per-call dispatch win vs. shrinking
-islands for the model flip) — TBD
-
-(placeholder)
+- #1 exception change: `errors: make InvalidArgumentEx + InvalidNumberOfArgsEx
+  runtime (catchable)` (fa90955). README updated.
+- CallBuiltinV op + #2 (op_fully_native): helper + emit + pool-bake `bc`;
+  `catch (RuntimeException)` now sufficient; jit_op_eligible + op_fully_native +
+  pick_cached_slots `{}`.
+- VERIFIED: -rt 1570/1570, differential 1403/1403. The LOOP's builtin runs
+  natively (CallBuiltinV=52 for a 50-iter `len` loop = 50 loop + 2 main). #2
+  works (pure loop + `print` deletes its int ops JIT-on: 0 vs 5). Throwing paths
+  byte-identical vs -tw: InvalidNumberOfArgsEx (write 3 args) caret + catchable
+  in a fragment; a runtime callback throw (make_array's gen div0) caught in a
+  fragment (vm==tw==nj). InternalErrorEx (str snprintf<0) is the one unreachable
+  non-RuntimeException - documented, left.

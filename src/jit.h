@@ -273,6 +273,13 @@ extern "C" int jit_unary(const void *bop) noexcept;
 extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
                               int is_float) noexcept;
 
+/* model-flip (nativize-ops): CallBuiltinV - a value-ABI read-only builtin call.
+ * `bc` is a baked `&chunk.builtin_calls[idx]` (func_v ptr + arg carets). Args
+ * are copied from frame slots [base, base+n); a throw catches into g_vm_jit_exc
+ * (loc from the pool) + returns 1. A callback builtin re-enters vm_dispatch. */
+extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
+                                const void *bc) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is
