@@ -441,12 +441,19 @@ to do LATER, separately (don't forget these):
   doesn't fragment (root-caused via the `abs(0-i)` case, see callbuiltinv #3).
   Add an `IntSubIR` (+ `IntShl/ShrIR` if wanted) so these specialize → become
   JIT-eligible. Targeted; helps reverse-iteration / `k - i` loops.
-- **Make a NON-div/mod/non-shift generic `IntBin` JIT-eligible** — the broader
-  version of the above: an emit case that reads `aop` and emits the matching
-  x86-64 instruction (add/sub/mul/and/or/xor/shl/shr with an imm-count),
-  GATING OUT the throwing arms (div/mod-by-reg throw on 0; a reg/negative shift
-  count needs the bail). Covers every non-throwing generic-IntBin corner at once
-  (not just `imm - reg`).
+- **Make a NON-div/mod/non-shift generic `IntBin` JIT-eligible** — DONE
+  (2026-07-22). `jit_op_eligible(IntBin)` now gates on `aop`
+  (plus/minus/times/band/bor/bxor → true; div/mod/shl/shr/ushr → false, they
+  throw / need the bail), the `emit_op` case reads `in.aop` and `op_rr` emits the
+  matching x86-64 instruction (load_operand on BOTH operands — unlike RR/RI which
+  read a as a slot — since a generic IntBin's `a` may be the imm, e.g. `0 - i`),
+  and `IntBin` is `op_fully_native` (only the non-throwing arms reach a run via
+  the gate). So `abs(0 - i)` and any non-throwing generic-IntBin corner now
+  fragments + deletes native. Verified: the `neg` case in `jit_delete_originals`
+  (`0 - i` / `50 - s` loop deletes its int ops JIT-on) + a manual `-vd` (f's whole
+  body collapses to `enter.nat`, the `i.bin` original gone). This SUBSUMES the
+  `IntSubIR` shape's JIT benefit (the interpreter still uses the generic switch
+  for `imm - reg` — IntSubIR would specialize that, an interpreter-only win).
 - **The re-raise-op DELETABILITY refinement** (see callbuiltinv #2 "bigger
   opportunity") — make SubscriptV / DictLoad / boxed-arith / CoerceNumV
   op_fully_native (they re-raise, never re-execute) so loops with subscripts /

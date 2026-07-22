@@ -698,6 +698,21 @@ static bool jit_op_eligible(const Instr &in)
      * RuntimeException now, conveyed via g_vm_jit_exc. */
     case OpCode::CallBuiltinV:
         return true;
+    /* GENERIC IntBin (the residual after specialize_arith_ops - a lit-first
+     * NON-commutative op like `0 - i` that has no imm-reg specialized shape, or
+     * any op the specializer doesn't cover): JIT-eligible ONLY for the
+     * NON-THROWING arms (plus/minus/times/band/bor/bxor). div/mod (div0) and the
+     * shift arms (a reg/negative count throws) stay interpreted. Unlike the
+     * RR/RI forms, both operands may be slot OR imm (that's why `0 - i` is
+     * generic - operand a is the imm), so the emit uses load_operand on both. */
+    case OpCode::IntBin:
+        switch (in.aop) {
+        case Op::plus: case Op::minus: case Op::times:
+        case Op::band: case Op::bor:  case Op::bxor:
+            return true;
+        default:                       /* div/mod/shl/shr/ushr can throw */
+            return false;
+        }
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -1334,6 +1349,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
+
+    case OpCode::IntBin:
+        /* generic NON-THROWING IntBin (the aop was gated to plus/minus/times/
+         * band/bor/bxor by jit_op_eligible). UNLIKE the RR/RI forms above, BOTH
+         * operands may be slot OR imm (that's exactly why `0 - i` stays generic
+         * - operand a is the imm), so load_operand on both (cache-aware for a
+         * slot). op_rr emits `rax OP= rcx`. Never throws -> op_fully_native. */
+        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        load_operand(e, RCX, in.b_is_lit(), in.b_lit(), in.b_slot());
+        op_rr(e, in.aop);
+        write_slot(e, ck, RAX, in.target, pc);
+        return true;
 
     case OpCode::IntShlRR: case OpCode::IntShrRR:
     case OpCode::IntShlRI: case OpCode::IntShrRI: {
@@ -1986,6 +2013,11 @@ static bool op_fully_native(OpCode op)
     case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
     case OpCode::IntShlRI: case OpCode::IntShrRI:
     case OpCode::IntModRI: case OpCode::IntAddModRI:
+    /* generic IntBin: only the NON-THROWING arms are jit_op_eligible (the gate
+     * gates div/mod/shifts out of runs), so an IntBin reaching a run never
+     * throws -> never returns an interior pc -> deletable. op_fully_native takes
+     * only the opcode, but the eligibility gate is what makes this sound. */
+    case OpCode::IntBin:
     case OpCode::LoadImmInt: case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp: case OpCode::ForLoopStep:
     case OpCode::IntAddStep:
