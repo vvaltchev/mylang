@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (16 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (17 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -340,9 +340,18 @@ foreach snapshot bound, non-throwing), **DictLoadInt/Float** (17,
 `jit_dict_load` - typed dict scalar read; throwing, the emitter bakes the KEY
 ptr: a member's `&consts[idx]`, a subscript's lea'd `&slot[k]`; the throw-path
 caret comes from the loc side table), **MakeClosureV** (35, `jit_make_closure` -
-closure create, bakes the program-lifetime FuncDescriptor* value). Per-op perf
-~neutral (helper ≈ dispatch) but CUMULATIVELY a real win where they're hot:
-62_dict_word_count −5.2% (the first 6 on vs off).
+closure create, bakes the program-lifetime FuncDescriptor* value). Then the
+boxed-arith pool (BinOpV/CmpV/CompoundV), LogV, CoerceNumV, UnaryV (steps 11-14).
+And **CallBuiltinV** (the biggest island source, ~294; `jit_call_builtin` - bakes
+the builtin_calls pool entry, builds ArgLocs from it, a CALLBACK builtin
+re-enters vm_dispatch) - rests on the exception-model change (make
+InvalidArgumentEx/InvalidNumberOfArgsEx `DECL_RUNTIME_EX` so `catch
+(RuntimeException)` conveys them, no `std::terminate`), and is op_fully_native
+(re-raises + carries its own pool caret, so a deleted CallBuiltinV is caret-
+correct → no delete-originals regression). See
+`plans/callbuiltinv-nativization.md`. Per-op perf ~neutral (helper ≈ dispatch)
+but CUMULATIVELY a real win where they're hot: 62_dict_word_count −5.2% (the
+first 6 on vs off).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -398,12 +407,12 @@ container commits but is dead) - `assert(lc("hi",5)==...)` folded to
 `assert(true)`, CC stayed 0. The vm_exec_block MECHANISM is also independently
 unit-tested (vm_exec_block_selftest).
 
-**Remaining top blockers (bench tally):** CallBuiltinV (~294 - the big one, but
-CALLS: a builtin call, some with callbacks that re-enter vm_dispatch → careful),
-Halt (83 - a void-function end; needs the return-none path, and the native_leaf
-predicate wants a trailing ReturnV so a Halt-ending body needs thought). The
-simple scalar islands are EXHAUSTED - SliceV / LoadGlobalV / the container
-stores / calls are the remaining boxed ops, each a bigger step. GOTCHA: an op needing a CHUNK pool
+**Remaining top blockers (bench tally):** CallBuiltinV (~294) is now DONE (see
+above + the deferred backlog). Next: Halt (83 - a void-function end; needs the
+return-none path, and the native_leaf predicate wants a trailing ReturnV so a
+Halt-ending body needs thought). The simple scalar islands are EXHAUSTED -
+SliceV / LoadGlobalV / the container stores / the LVALUE builtins (CallBuiltinLV)
+are the remaining boxed ops, each a bigger step. GOTCHA: an op needing a CHUNK pool
 (LoadConstV/MemberV/LoadLiteralObjV/DictLoad-key/boxed-arith) can't bake
 `&chunk` (it dangles - the chunk is stack-built then moved) but CAN bake the
 pool's heap BUFFER address (`&vec[idx]`), which a vector move preserves
@@ -421,9 +430,9 @@ opcode.
 The running TODO of things that would shrink islands / extend native coverage,
 to do LATER, separately (don't forget these):
 
-- **CallBuiltinV** (~294, the big island source) — IN PROGRESS; design decided,
-  see `plans/callbuiltinv-nativization.md` (#1 exception model change, #2
-  op_fully_native, #3 root-caused-orthogonal).
+- **CallBuiltinV** (~294, the big island source) — DONE (2026-07-22, c606b61 +
+  the exception change fa90955); see `plans/callbuiltinv-nativization.md` (#1
+  exception model change, #2 op_fully_native, #3 root-caused-orthogonal).
 - **`IntSubIR` (imm − reg) shape in `specialize_arith_ops`** — a lit-first
   NON-commutative int op like `0 - i` / `k - i` stays a GENERIC `IntBin`
   (`codegen.cpp` ~6775 `continue`s the lit-first non-commutative case; there's
