@@ -3760,6 +3760,29 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* REGRESSION (dead-dst peephole + E1 retarget): a closure-VALUE call
+         * (CallValueV) whose result feeds a builtin/comparison arg through a
+         * MoveV that E1 eliminates had its result WRONGLY DISCARDED - the
+         * dead-dst rule used the STALE liveness from before E1 retargeted the
+         * call's dst (temp -> the move's dst), so it saw the NEW dst as dead and
+         * set dst=-1. The caller then read a stale slot (got the FIRST
+         * accumulation step, e.g. 7, not the total 35). The differential
+         * (tw==vm) pins it: on the VM `f(..) == 35` was `7 == 35`. */
+        "dead-dst: closure value-call result feeds a comparison arg",
+        {
+            "func mk(int base) {",
+            "  return func [base] (int n) {",
+            "    var s = 0;",
+            "    for (var i = 0; i < n; i++) s = s + base;",
+            "    return s;",
+            "  };",
+            "}",
+            "var f = mk(runtime(7));",
+            "assert(f(runtime(5)) == 35);",     /* was 7 on the VM */
+            "assert(f(runtime(100)) == 700);",
+        },
+    },
+    {
         /* A capture shadows a same-named global inside the closure body. */
         "capture slotting: a capture shadows a global",
         {
