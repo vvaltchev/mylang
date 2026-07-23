@@ -197,6 +197,11 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
 extern "C" void jit_load_builtin(LValue *slots, int_type dst,
                                  int_type idx) noexcept;
 
+/* model-flip (nativize-ops): LoadCaptureV natively - `frame[dst] =
+ * (*ctx->captures)[idx]`, a copy of a snapshot capture value (always defined ->
+ * never throws). Uses g_current_ctx (captures + frame). */
+extern "C" void jit_load_capture(int_type dst, int_type idx) noexcept;
+
 /* model-flip (nativize-ops): LoadConstV natively - `slots[dst] = *src`, a copy
  * of a baked const-pool EvalValue (never throws; ref-aware for a non-trivial
  * const). `src` is `&chunk.consts[idx]` - the const-pool vector's heap BUFFER

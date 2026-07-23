@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (17 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (18 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -351,7 +351,17 @@ InvalidArgumentEx/InvalidNumberOfArgsEx `DECL_RUNTIME_EX` so `catch
 correct → no delete-originals regression). See
 `plans/callbuiltinv-nativization.md`. Per-op perf ~neutral (helper ≈ dispatch)
 but CUMULATIVELY a real win where they're hot: 62_dict_word_count −5.2% (the
-first 6 on vs off).
+first 6 on vs off). And **LoadCaptureV** (`jit_load_capture` - a capture read
+`(*ctx->captures)[idx]`, always defined so non-throwing + op_fully_native;
+mirrors LoadBuiltinV, uses g_current_ctx like MakeClosureV). Completes the load
+family (Builtin/Const/Capture). Its per-op test SURFACED a pre-existing wrong-
+result codegen bug (`print(closure(x))` discarded the call result via the
+dead-dst peephole rule using STALE liveness after E1 retargeted the call's dst -
+fixed in codegen.cpp, its own commit + regression test) - the standing "verify
+native EXECUTION with hard evidence" rule paying off: the differential missed it
+(the harness JIT-fragmented the shape correctly while the interpreter path was
+buggy), only the per-op nativized test (which runs the CLI-equivalent path)
+exposed it.
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture

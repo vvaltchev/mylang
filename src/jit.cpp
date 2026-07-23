@@ -648,6 +648,11 @@ static bool jit_op_eligible(const Instr &in)
      * throws). */
     case OpCode::LoadConstV:
         return true;
+    /* model-flip (nativize-ops): read a captured value into a slot via
+     * jit_load_capture ((*ctx->captures)[idx].get() - a capture is snapshot at
+     * closure creation, always defined, so never throws -> op_fully_native). */
+    case OpCode::LoadCaptureV:
+        return true;
     /* model-flip (nativize-ops): a PLAIN global store `g = expr` (aop invalid)
      * via jit_store_global (never throws). A COMPOUND `g OP=`/`g++` throws on
      * an undefined slot + runs num_bin_op -> stays interpreted. */
@@ -1065,8 +1070,9 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
         case OpCode::LoadLiteralObjV:
-            /* writes dst from memory (a builtin / const / literal value, not an
-             * int); target2 is a compile-time index, not a slot. */
+        case OpCode::LoadCaptureV:
+            /* writes dst from memory (a builtin / const / literal / capture
+             * value, not an int); target2 is a compile-time index, not a slot. */
             bad(in.target);
             break;
         case OpCode::Jump:
@@ -1572,6 +1578,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::LoadCaptureV:
+        /* dst = (*ctx->captures)[idx] via jit_load_capture (rdi=dst=target,
+         * rsi=idx=target2). The helper uses g_current_ctx->captures/frame (not
+         * the slots arg) - a capture is snapshot at closure creation, always
+         * defined, never throws. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_load_capture) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::LoadConstV:
         /* dst = consts[idx] via jit_load_const (rdi=slots, rsi=dst, rdx=src).
          * src = &ck.consts[idx] - the const-pool BUFFER address, stable across
@@ -2035,6 +2055,7 @@ static bool op_fully_native(OpCode op)
     case OpCode::MoveV:
     case OpCode::LoadBuiltinV:
     case OpCode::LoadConstV:
+    case OpCode::LoadCaptureV:      /* capture read (always defined), never throws */
     case OpCode::StoreGlobalV:
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
