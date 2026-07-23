@@ -1900,6 +1900,29 @@ extern "C" void jit_store_global(int_type gslot,
     g->defined[gslot] = 1;
 }
 
+/*
+ * model-flip (nativize-ops): the native LoadGlobalV body - `frame[dst] =
+ * gfuncs->slots[gslot]`. The COMMON case (the global is defined) runs native.
+ * The RARE undefined case (a use-before-def read of a global) BAILS - returns 1
+ * WITHOUT writing dst, and the emit exits to the op's pc so the INTERPRETER
+ * re-runs LoadGlobalV, which throws UndefinedVariableEx (a plain Exception, NOT
+ * a RuntimeException, so it can't ride g_vm_jit_exc; the interpreted re-run
+ * throws it at the boundary with the global's NAME + the caret from the loc side
+ * table - byte-identical to a non-JIT run, and semantics-preserving: undefined-
+ * variable stays a non-catchable hard error). The N4 array-read bail pattern.
+ * Because it bails-to-reinterpret, the interpreted original is KEPT (LoadGlobalV
+ * is NOT op_fully_native). noexcept: the write can't throw (a defined slot).
+ */
+extern "C" int jit_load_global(int_type dst, int_type gslot) noexcept
+{
+    ML_JIT_OP_RAN(LoadGlobalV);
+    GlobalFuncTable *g = g_current_ctx->gfuncs;
+    if (!g->defined[gslot])
+        return 1;                            /* bail -> interpreter re-throws */
+    g_current_ctx->frame->at(dst).put(g->slots[gslot].get());
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native ArrLen body - the interpreter's exact
  * `frame[dst] = size(frame[base])`. `base` is a proven flat array, so size()
  * never throws (op_fully_native). */

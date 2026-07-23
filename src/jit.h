@@ -227,6 +227,14 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
  * (it throws on an undefined slot + runs num_bin_op). */
 extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
 
+/* model-flip (nativize-ops): the native LoadGlobalV read `frame[dst] =
+ * gfuncs->slots[gslot]`. Returns 0 on success; 1 to BAIL (the global is
+ * undefined - a use-before-def) so the emit exits to the op's pc and the
+ * interpreter re-runs LoadGlobalV + throws UndefinedVariableEx (a plain
+ * Exception, not conveyable via g_vm_jit_exc). NOT op_fully_native (the
+ * original is kept for the bail). gfuncs/frame via g_current_ctx. */
+extern "C" int jit_load_global(int_type dst, int_type gslot) noexcept;
+
 /* model-flip (nativize-ops): LoadLiteralObjV natively - materialize a baked
  * const array/dict/struct literal via the shared eval_literal_obj (immutable
  * share vs a fresh mutable clone; never throws). `lo` is a baked
