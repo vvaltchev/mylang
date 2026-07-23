@@ -14936,6 +14936,16 @@ static bool jit_op_nativized()
             "}",
             "var f = mk(runtime(7));",
             "assert(f(runtime(5)) == 35);" } },
+        /* Halt: a VOID function's implicit `return none` runs in the fragment
+         * (jit_halt). f's whole body is a fully-native loop ending in Halt (no
+         * `return`), so JIT-on it collapses to a single enter.nat - the Halt's
+         * interpreted original is deleted, so jit_halt is the only code and must
+         * have run. It returns none to the caller (the IN-VM path); main's own
+         * trailing Halt also runs (the boundary path) - both bump the counter. */
+        { OpCode::Halt, {
+            "func f(int n) { var s = 0; for (var i = 0; i < n; i++) s = s + i; }",
+            "var r = f(runtime(5));",
+            "assert(r == none);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

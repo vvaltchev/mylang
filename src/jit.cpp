@@ -588,6 +588,11 @@ static bool jit_op_eligible(const Instr &in)
      * sentinel EnterNative applies). A run TERMINATOR, never a branch. */
     case OpCode::ReturnV:
         return true;
+    /* model-flip (nativize-ops): a native Halt - a fall-through body's implicit
+     * `return none` runs in the fragment (calls jit_halt: like jit_ret with a
+     * none result). A run TERMINATOR, never a branch. Never throws. */
+    case OpCode::Halt:
+        return true;
     /* N3: the SSE float tier. add/sub/mul only (div/mod THROW on 0 /
      * are a libm call -> interpreted); a float READ handles an int-in-a-
      * float-slot via cvtsi2sd (matching read_float_slot) and BAILS on
@@ -1076,6 +1081,7 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target);
             break;
         case OpCode::Jump:
+        case OpCode::Halt:               /* returns none - reads/writes no slot */
             break;                       /* no slots */
         default:
             return {};                   /* an unclassified op - be SAFE and
@@ -1842,6 +1848,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xC3);                                        /* ret (rax=sentinel)*/
         return true;
 
+    case OpCode::Halt:
+        /* model-flip (nativize-ops): the native `return none`. flush_cache so a
+         * later-bail path (there is none past a terminator, but stay uniform
+         * with ReturnV) has memory consistent, then call jit_halt() (no arg -
+         * the result is none) and RET its resume sentinel. Same stack discipline
+         * as ReturnV: sub 8 to 16-align, restore, ret. */
+        e.flush_cache();
+        e.u8(0x48); e.u8(0x83); e.u8(0xEC); e.u8(0x08);   /* sub rsp, 8 */
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_halt) });
+        e.u8(0xE8); e.u32(0);                             /* call jit_halt */
+        e.u8(0x48); e.u8(0x83); e.u8(0xC4); e.u8(0x08);   /* add rsp, 8 */
+        e.u8(0xC3);                                        /* ret (rax=sentinel)*/
+        return true;
+
     case OpCode::CallV: {
         /* #55 STEP 2.1: a NATIVE direct call (the run builder included it only
          * when callv_native_ok). Push the callee frame via jit_call_setup, then
@@ -2041,6 +2062,9 @@ static bool op_fully_native(OpCode op)
     case OpCode::LoadImmInt: case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp: case OpCode::ForLoopStep:
     case OpCode::IntAddStep:
+    /* model-flip (nativize-ops): a native Halt rets a resume SENTINEL (never an
+     * interior pc), like ReturnV - its interpreted original is deletable. */
+    case OpCode::Halt:
     /* #55: a native ReturnV never returns an interior pc (it rets a resume
      * SENTINEL, not a re-interpret pc), so the interpreted original can be
      * dropped from a deletable run - exactly the fully-native contract. */
