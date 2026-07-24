@@ -14677,19 +14677,21 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a straight-line boxed-island container; correct result. Six slices of
-     * a dyn string = six 1-op SliceV islands (total 6 >= MIN_CONTAINER_ISLAND).
-     * Returns a[0:1] = the first char. runtime() keeps the arg non-const so the
-     * pure call isn't folded away (else cleaf never runs -> no container). */
+    /* (1) a straight-line boxed-island container; correct result. Six array
+     * literals `[a]` of a dyn value = six MakeArrayV islands (total >=
+     * MIN_CONTAINER_ISLAND). Returns [a], whose [0] is a. runtime() keeps the arg
+     * non-const so the pure call isn't folded away (else cleaf never runs -> no
+     * container). MakeArrayV is the container gate's island source now that the
+     * simple scalar ops AND SliceV are all nativized (op_run_eligible). */
     if (!run({ "func cleaf(dyn a) {",
-               "  var dyn t = a[0:2];",
-               "  var dyn u = a[0:2];",
-               "  var dyn v = a[0:2];",
-               "  var dyn w = a[0:2];",
-               "  var dyn x = a[0:2];",
-               "  return a[0:1];",
+               "  var dyn t = [a];",
+               "  var dyn u = [a];",
+               "  var dyn v = [a];",
+               "  var dyn w = [a];",
+               "  var dyn x = [a];",
+               "  return [a];",
                "}",
-               "assert(cleaf(runtime(\"hello\")) == \"h\");" }))
+               "assert(cleaf(runtime(\"hello\"))[0] == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b0)
         return false;   /* the container's island call did NOT run */
@@ -14707,32 +14709,32 @@ static bool jit_container()
         return false;
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
-     * island `a[0:2]` (SliceV) calls jit_exec_block; `var j = i + 1` is native.
-     * last = a[0:2] each iteration -> "he". */
+     * island `[a]` (MakeArrayV) calls jit_exec_block; `var j = i + 1` is native.
+     * last = [a] each iteration -> [a], whose [0] is a. */
     const unsigned long b1 = g_jit_container_calls;
     if (!run({ "func lc(dyn a, int n) {",
-               "  var dyn last = a;",
+               "  var dyn last = [a];",
                "  for (var i = 0; i < n; i++) {",
-               "    last = a[0:2];",
+               "    last = [a];",
                "    var j = i + 1;",
                "  }",
                "  return last;",
                "}",
-               "assert(lc(runtime(\"hello\"), 5) == \"he\");" }))
+               "assert(lc(runtime(\"hello\"), 5)[0] == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
-    /* (4) model-flip M4b: MULTIPLE islands - an init slice `a[0:1]` and a body
-     * slice `a[0:2]` (SliceV), each its own `call jit_exec_block`. */
+    /* (4) model-flip M4b: MULTIPLE islands - an init `[a]` and a body `[a]`
+     * (MakeArrayV), each its own `call jit_exec_block`. */
     if (!run({ "func lc2(dyn a, int n) {",
-               "  var dyn s = a[0:1];",
+               "  var dyn s = [a];",
                "  for (var i = 0; i < n; i++) {",
-               "    s = a[0:2];",
+               "    s = [a];",
                "    var j = i + 1;",
                "  }",
                "  return s;",
                "}",
-               "assert(lc2(runtime(\"hello\"), 5) == \"he\");" }))
+               "assert(lc2(runtime(\"hello\"), 5)[0] == \"hello\");" }))
         return false;
     return true;
 #else
@@ -14974,6 +14976,17 @@ static bool jit_op_nativized()
             "func f(int n) { var s = 0; for (var i = 0; i < n; i++) s = s + g;",
             "                return s; }",
             "assert(f(runtime(5)) == 35);" } },
+        /* SliceV: a slice `a[0:2]` of a dyn string each loop iteration runs
+         * native (jit_slice - the runtime Type::slice). The loop fragments (the
+         * slice's original is kept - it re-raises, not op_fully_native - but the
+         * fragment runs jit_slice). */
+        { OpCode::SliceV, {
+            "func f(dyn a, int n) {",
+            "  var dyn last = a;",
+            "  for (var i = 0; i < n; i++) last = a[0:2];",
+            "  return last;",
+            "}",
+            "assert(f(runtime(\"hello\"), 5) == \"he\");" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

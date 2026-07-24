@@ -644,6 +644,13 @@ static bool jit_op_eligible(const Instr &in)
      * op_fully_native (it can bail on a throw). */
     case OpCode::MemberV:
         return true;
+    /* model-flip (nativize-ops): a slice READ base[start:end] via jit_slice (the
+     * runtime Type::slice; a non-int bound / non-sliceable base throws
+     * TypeErrorEx -> exit -> EnterNative re-raises). base/start/end/dst are frame
+     * slots. Not op_fully_native (it can bail on a throw; caret in the loc side
+     * table). */
+    case OpCode::SliceV:
+        return true;
     /* model-flip (nativize-ops): load a builtin value into a slot via
      * jit_load_builtin (a trivial value, never throws -> op_fully_native). */
     case OpCode::LoadBuiltinV:
@@ -1017,6 +1024,14 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::SubscriptV:
             /* the fragment leas &slot for base/idx/dst - all must be current. */
             bad(in.target2); bad(in.a_slot()); bad(in.target);
+            break;
+        case OpCode::SliceV:
+            /* jit_slice reads base/start/end + writes dst from MEMORY (via
+             * g_current_ctx->frame); start/end are int bounds that COULD be
+             * int-cached (a loop counter as a[i:j]), so disqualify them. */
+            bad(in.target2); bad(in.target);
+            if (in.a_slot() >= 0) bad(static_cast<int>(in.a_slot()));
+            if (in.b_slot() >= 0) bad(static_cast<int>(in.b_slot()));
             break;
         case OpCode::MemberV:
             /* leas &slot for base/dst (the member key is baked, not a slot). */
@@ -1623,6 +1638,29 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
             e.exit_pc(pc);                    /* bail: interpreter re-throws */
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::SliceV:
+        /* dst = base[start:end] via jit_slice (rdi=base_slot=target2,
+         * rsi=start_slot=a_slot, rdx=end_slot=b_slot, rcx=dst_slot=target). The
+         * helper reads the 4 frame slots via g_current_ctx (start/end == -1 ->
+         * none). Throws TypeErrorEx -> g_vm_jit_exc + return 1 -> exit_pc so
+         * EnterNative re-raises (caret from the loc side table). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.a_slot())));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.b_slot())));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_slice) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = no raise) */
+            e.exit_pc(pc);                    /* raised: EnterNative re-raises */
             e.patch8(j_ok, e.pos());
         }
         return true;
@@ -2270,16 +2308,19 @@ static constexpr size_t MIN_CONTAINER_ISLAND = 5;
 static bool op_is_simple_island(OpCode op)
 {
     switch (op) {
-    /* The simple boxed SCALAR ops are ALL op_run_eligible now (the nativize-ops
-     * path), so op_run_eligible (checked FIRST in the gate) wins - they never
-     * reach here as islands. They stay listed for documentation / a `-nj` build
-     * (where op_run_eligible is false). The one op here that is STILL boxed (not
-     * jit_op_eligible) is SliceV - the container gate's remaining island source,
-     * so the jit_exec_block mechanism (M2-M4) stays exercised. */
+    /* The simple boxed SCALAR ops (and SliceV) are ALL op_run_eligible now (the
+     * nativize-ops path), so op_run_eligible (checked FIRST in the gate) wins -
+     * they never reach here as islands. They stay listed for documentation / a
+     * `-nj` build (where op_run_eligible is false). The one op here that is STILL
+     * boxed (not jit_op_eligible) is MakeArrayV (an array literal `[a, b]`, a
+     * container build - not on the nativize-ops path) - the container gate's
+     * remaining island source, so the jit_exec_block mechanism (M2-M4) stays
+     * exercised. (SliceV was that source until it was nativized.) */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
     case OpCode::LoadConstV: case OpCode::CoerceNumV:
     case OpCode::SliceV:
+    case OpCode::MakeArrayV:
         return true;
     default:
         return false;

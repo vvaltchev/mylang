@@ -1844,6 +1844,37 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
     return 0;
 }
 
+/*
+ * model-flip (nativize-ops): the native SliceV body - the interpreter's exact
+ * `dst = base.slice(start, end)` (the runtime Type::slice: the COW-registered
+ * sub-view, absent bounds passed as none). base/start/end/dst are frame slots
+ * (start/end == -1 -> none, a[:j] / a[i:]); read via g_current_ctx->frame. The
+ * RHS (slice) is evaluated fully before dst is written, so `dst == base` (a
+ * self-slice a=a[i:j]) reads the old base first - matching the tree-walker. Only
+ * TypeErrorEx (a non-int bound / non-sliceable base) is thrown (slices CLAMP
+ * out-of-range indices, no OOB), and it is a RuntimeException -> caught loc-less
+ * into g_vm_jit_exc + return 1, so EnterNative re-raises with the caret from the
+ * loc side table. NOT op_fully_native (its caret rides the pc-keyed side table).
+ */
+extern "C" int jit_slice(int_type base_slot, int_type start_slot,
+                         int_type end_slot, int_type dst_slot) noexcept
+{
+    ML_JIT_OP_RAN(SliceV);
+    EvalContext *ctx = g_current_ctx;
+    const EvalValue &base = ctx->frame->at(base_slot).get();
+    const EvalValue start = start_slot >= 0
+        ? ctx->frame->at(start_slot).get() : EvalValue();
+    const EvalValue end = end_slot >= 0
+        ? ctx->frame->at(end_slot).get() : EvalValue();
+    try {
+        ctx->frame->at(dst_slot).put(base.get_type()->slice(base, start, end));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native LoadBuiltinV body - the interpreter's
  * exact `slots[dst] = builtin_slot[idx].get()`. A builtin is a trivial value
  * (< t_str), never throws. */
