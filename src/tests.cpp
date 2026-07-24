@@ -15013,6 +15013,16 @@ static bool jit_op_nativized()
             "  return a[3];",
             "}",
             "assert(f(runtime([0, 0, 0, 0, 0]), 5) == 6);" } },
+        /* StoreMemberV: a struct field store `p.x = v` on a PROVEN struct base
+         * each loop iteration runs native (jit_store_member -> vm_member_store;
+         * the member key + carets from the baked member_keys pool). */
+        { OpCode::StoreMemberV, {
+            "struct P { int x; int y; }",
+            "func f(P p, int n) {",
+            "  for (var i = 0; i < n; i++) p.x = i * 2;",
+            "  return p.x;",
+            "}",
+            "assert(f(P(0, 0), 5) == 8);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

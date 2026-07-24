@@ -182,6 +182,14 @@ extern "C" int jit_store_elem_value(int_type kind, int_type base_slot,
                                     int_type idx_slot, int_type val_slot,
                                     int_type aop) noexcept;
 
+/* A struct field store s.f = v / s.f OP= v. Like jit_store_elem_value but the
+ * key is a MEMBER: `mk` = &chunk.member_keys[idx] (baked pool addr; memUid + the
+ * carets). Same return convention (0 ok / 1 exit: undefined-global bail or a
+ * vm_member_store RuntimeException in g_vm_jit_exc). */
+extern "C" int jit_store_member(int_type kind, int_type base_slot,
+                                int_type val_slot, int_type aop,
+                                const void *mk) noexcept;
+
 /*
  * model-flip (nativize-ops): MoveV natively - `slots[dst] = slots[src].get()`,
  * the interpreter's EXACT MoveV (an alias-copy, ref-aware via LValue::put; never

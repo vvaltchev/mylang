@@ -1853,6 +1853,48 @@ extern "C" int jit_store_elem_value(int_type kind, int_type base_slot,
     return 0;
 }
 
+/*
+ * model-flip (nativize-ops): the native StoreMemberV - a struct field store
+ * `s.f = v` / `s.f OP= v` (a dict member store uses DictStore), the
+ * interpreter's exact vm_member_store (POD byte / boxed-field store). Like
+ * jit_store_elem_value but the "key" is a MEMBER: the emit bakes
+ * `&chunk.member_keys[idx]` (the pool BUFFER addr, stable across the chunk move)
+ * and the helper reads memUid + the 4 carets from it. The base may be a
+ * GLOBAL/CAPTURE struct (`kind`). Throws: an UNDEFINED GLOBAL base BAILS (return
+ * 1, no exc -> interpreter re-runs + throws UndefinedVariableEx); vm_member_store
+ * throws only RuntimeExceptions (a non-struct base / a bad POD field type ->
+ * TypeErrorEx already carrying its caret; a readonly instance -> NotLValueEx
+ * (mstart); a compound `s.f += v` div/mod -> a LOC-LESS DivisionByZeroEx, stamped
+ * with the MEMBER caret here exactly as the interpreted StoreMemberV catch does)
+ * -> g_vm_jit_exc -> EnterNative re-raises. NOT op_fully_native.
+ */
+extern "C" int jit_store_member(int_type kind, int_type base_slot,
+                                int_type val_slot, int_type aop,
+                                const void *mkv) noexcept
+{
+    ML_JIT_OP_RAN(StoreMemberV);
+    const Chunk::MemberKey *mk = static_cast<const Chunk::MemberKey *>(mkv);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *blv = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                : kind == 2 ? &(*ctx->captures)[base_slot]
+                            : &ctx->frame->at(base_slot);
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_member_store(blv, mk->memUid, static_cast<Op>(aop), val,
+                        mk->mstart, mk->mend, mk->bstart, mk->bend);
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) {                  /* a compound div/mod is loc-less */
+            e.loc_start = mk->mstart;
+            e.loc_end = mk->mend;
+        }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): PER-OP runtime coverage (see jit.h). Sized by
  * the opcode count; g_jit_op_run[op] proves that op's native helper RAN. */
 unsigned long g_jit_op_run[static_cast<size_t>(OpCode::OpCount_)] = {0};
