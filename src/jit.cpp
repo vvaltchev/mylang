@@ -627,6 +627,14 @@ static bool jit_op_eligible(const Instr &in)
      * Measured ~6.5% wall / 12% fewer instrs on 23_dict_insert. */
     case OpCode::DictStore:
         return in.target == 0;
+    /* model-flip (nativize-ops): the UNIVERSAL subscript store a[i] = v /
+     * a[i] OP= v via jit_store_elem_value (the interpreter's exact
+     * vm_subscript_store; ANY base type). Unlike StoreElemInt/DictStore, it
+     * handles a GLOBAL/CAPTURE base too (kind = target passed to the helper). An
+     * undefined-global base bails; a subscript throw (OOB/KeyNotFound/type/
+     * NotLValue) re-raises. Not op_fully_native (throws / bails). */
+    case OpCode::StoreElemValue:
+        return true;
     /* model-flip (nativize-ops): a boxed slot copy `dst = src.get()`. Calls
      * jit_move (the interpreter's exact MoveV, ref-aware, never throws) so a
      * run no longer splits at a MoveV - one island op fewer, bigger fragments.*/
@@ -1013,6 +1021,14 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * must hold CURRENT EvalValues - a cached int key (a counter used
              * as d[i]) would leave its slot stale. Disqualify all three. */
             bad(in.target2); bad(in.a_slot()); bad(in.b_slot());
+            break;
+        case OpCode::StoreElemValue:
+            /* jit_store_elem_value reads idx (a_slot) + val (b_slot) - and a
+             * LOCAL base (target2) - from MEMORY via g_current_ctx; a cached int
+             * index (a counter used as a[i]) would be stale. The base is a frame
+             * slot only for a LOCAL base (kind == target == 0). */
+            if (in.target == 0) bad(in.target2);
+            bad(in.a_slot()); bad(in.b_slot());
             break;
         case OpCode::MoveV:
             /* jit_move reads/writes slots[src]/slots[dst] from MEMORY, so both
@@ -1579,6 +1595,32 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     case OpCode::DictStore:
         emit_dict_store(e, in, pc);
+        return true;
+
+    case OpCode::StoreElemValue:
+        /* the UNIVERSAL store a[i] = v via jit_store_elem_value(kind=target,
+         * base_slot=target2, idx_slot=a_slot, val_slot=b_slot, aop). The helper
+         * forms the base (local/global/capture) from kind+slot + reads idx/val
+         * from frame slots via g_current_ctx. Non-0 return -> exit_pc (an
+         * undefined-global bail resumes interpreted; a subscript throw re-raises
+         * via g_vm_jit_exc). aop -> r8 (re-materialised to t_float by the
+         * epilogue AFTER the call). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.a_slot())));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.b_slot())));
+        e.movabs_r8(static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_store_elem_value) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
+            e.exit_pc(pc);                    /* raise (exc set) or bail (unset) */
+            e.patch8(j_ok, e.pos());
+        }
         return true;
 
     case OpCode::MoveV:

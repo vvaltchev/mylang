@@ -1813,6 +1813,46 @@ extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
     return 0;
 }
 
+/*
+ * model-flip (nativize-ops): the native StoreElemValue - the UNIVERSAL subscript
+ * store `a[i] = v` / `a[i] OP= v` for ANY base (flat / general / dict), the
+ * interpreter's exact vm_subscript_store (bounds + COW + slot_rmw, type-
+ * dispatched). Unlike jit_dict_store (a frame-slot base lea'd in the emit), the
+ * base may be a GLOBAL or CAPTURE container, so the emit passes `kind` (0 local
+ * / 1 global / 2 capture) + the base SLOT and the helper forms the LValue* (like
+ * vm_store_base). `idx`/`val` are frame slots (the computed index + value);
+ * `aop` is the Expr14 op (assign / addeq / ...). TWO throw sources: (1) an
+ * UNDEFINED GLOBAL base (kind==1, use-before-def) - BAILS (return 1 with NO
+ * g_vm_jit_exc set, so EnterNative resumes the INTERPRETER, which re-runs
+ * StoreElemValue + throws UndefinedVariableEx, a plain Exception; the N4 pattern,
+ * like LoadGlobalV); (2) vm_subscript_store's OOB/KeyNotFound/TypeError/NotLValue
+ * (all RuntimeException) -> caught loc-less into g_vm_jit_exc + return 1, so
+ * EnterNative re-raises (caret from the loc side table). Both exits are `return
+ * 1`; EnterNative distinguishes by whether g_vm_jit_exc is set. NOT
+ * op_fully_native (side-table caret / the bail keeps the original).
+ */
+extern "C" int jit_store_elem_value(int_type kind, int_type base_slot,
+                                    int_type idx_slot, int_type val_slot,
+                                    int_type aop) noexcept
+{
+    ML_JIT_OP_RAN(StoreElemValue);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *alv = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                : kind == 2 ? &(*ctx->captures)[base_slot]
+                            : &ctx->frame->at(base_slot);
+    const EvalValue &idx = ctx->frame->at(idx_slot).get();
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_subscript_store(alv, idx, val, static_cast<Op>(aop), Loc(), Loc());
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): PER-OP runtime coverage (see jit.h). Sized by
  * the opcode count; g_jit_op_run[op] proves that op's native helper RAN. */
 unsigned long g_jit_op_run[static_cast<size_t>(OpCode::OpCount_)] = {0};

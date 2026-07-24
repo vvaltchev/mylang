@@ -172,6 +172,16 @@ class EvalValue;
 extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
                               const EvalValue *val, int op) noexcept;
 
+/* The UNIVERSAL subscript store a[i] = v / a[i] OP= v (flat/general/dict). The
+ * base may be a global/capture container, so `kind` (0 local/1 global/2 capture)
+ * + base_slot form it (not an lea'd frame slot); idx/val are frame slots, aop
+ * the Expr14 op. Returns 0 (ok), or 1 to exit (an undefined-global base bails to
+ * the interpreter with NO g_vm_jit_exc; a vm_subscript_store RuntimeException
+ * sets g_vm_jit_exc for EnterNative to re-raise). */
+extern "C" int jit_store_elem_value(int_type kind, int_type base_slot,
+                                    int_type idx_slot, int_type val_slot,
+                                    int_type aop) noexcept;
+
 /*
  * model-flip (nativize-ops): MoveV natively - `slots[dst] = slots[src].get()`,
  * the interpreter's EXACT MoveV (an alias-copy, ref-aware via LValue::put; never
