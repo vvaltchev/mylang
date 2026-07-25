@@ -352,6 +352,14 @@ extern "C" int jit_make_struct_array(const void *def, int_type base,
  * base kind proven) -> void + op_fully_native, except jit_load_elem_value, which
  * bounds-checks: an OOB sets g_vm_jit_exc LOC-LESS (EnterNative stamps from the
  * loc side table) and a non-general/non-str base BAILS to the interpreter. */
+/* model-flip (nativize-ops): the JumpUnlessTrueV CONDITION - the boxed
+ * truthiness test. Returns 1 = true, 0 = false, -1 = THREW (is_true's base Type
+ * op throws for a value with no bool conversion; the exception rides
+ * g_vm_jit_exc LOC-LESS and EnterNative stamps the condition's caret from the
+ * loc side table). The JUMP itself is emitted by the fragment, so a loop with a
+ * boxed condition no longer splits the run at the branch. */
+extern "C" int jit_is_true(int_type cond_slot) noexcept;
+
 extern "C" void jit_load_elem_bool(int_type dst, int_type base,
                                    int_type idx) noexcept;
 extern "C" void jit_str_len(int_type dst, int_type base) noexcept;
@@ -380,7 +388,7 @@ extern "C" int jit_boxed_compound(const void *bop) noexcept;
 extern "C" int jit_store_global_compound(const void *bop) noexcept;
 extern "C" int jit_store_capture_compound(const void *bop) noexcept;
 /* LogV (eager && / ||): is_true() never throws -> void (op_fully_native). */
-extern "C" void jit_boxed_log(const void *bop) noexcept;
+extern "C" int jit_boxed_log(const void *bop) noexcept;
 
 /* UnaryV (boxed unary -/~/!/+ over a dyn): reuses the boxed_ops pool. `-str`/
  * `~str` throw -> g_vm_jit_exc + returns 1 (re-raise); 0 otherwise. */

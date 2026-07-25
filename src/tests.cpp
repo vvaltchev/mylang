@@ -3112,6 +3112,32 @@ static const std::vector<test> tests =
      * pool under -vm, the node in the tree-walker — must be byte-identical):
      * a subscript-INTERNAL throw (missing key) marks the SUBSCRIPT `dd["z"]`,
      * the inc-dec's OWN throw (non-numeric value) the WHOLE `dd["a"]++`. */
+    /* A condition with NO bool conversion (a builtin value laundered through
+     * `dyn`) throws from is_true's BASE Type op. The caret must mark the whole
+     * `if` - which is what the tree-walker stamps (the exception escapes the
+     * condition's eval loc-less and IfStmt's Construct::eval wrapper stamps it),
+     * so the codegen records the ENCLOSING statement, not the condition. The VM
+     * used to record NO loc for JumpUnlessTrueV (extract_locs dropped its node)
+     * and reported the error with no caret at all. Same bug class as the
+     * unhashable dict-literal key above: a "never throws" assumption on an op
+     * whose virtual Type op CAN throw - and the LogV form of it was a JIT
+     * std::terminate (the noexcept helper had no catch). */
+    { "err loc: a condition with no bool conversion marks the if",
+      { "func f(dyn x) { if (x) { return 1; } return 0; }",
+        "f(runtime(print));" },
+      &typeid(TypeErrorEx), 17, 1, 38, 1 },
+    /* The `&&` (LogV) form of the same throw. This one was a JIT **CRASH**:
+     * jit_boxed_log is noexcept and called is_true() with no catch, so the
+     * escaping TypeErrorEx hit std::terminate (the op had been nativized as
+     * op_fully_native under the "is_true never throws" assumption). It now
+     * re-raises instead. Only the TYPE is pinned: the VM carets the whole
+     * &&-expression while the tree-walker carets the offending OPERAND (both
+     * engines run this same entry), the documented residual VM-vs-tw caret
+     * difference the boxed UnaryV already has. */
+    { "err: a && operand with no bool conversion (LogV) throws, not crashes",
+      { "func f(dyn x, int n) { if (n > 0 && x) { return 1; } return 0; }",
+        "f(runtime(print), 1);" },
+      &typeid(TypeErrorEx) },
     /* An UNHASHABLE dict-literal key (a function laundered through `dyn`) throws
      * from the key freeze/hash in build_dict_from_pairs. The caret must mark the
      * `{...}` LITERAL - the VM's MakeDictV used to assume "never throws", so it
@@ -15197,6 +15223,18 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(\"z\"), 10) == 45);" } },
+        /* JumpUnlessTrueV: the BOXED condition branch. jit_is_true evaluates
+         * the condition and the FRAGMENT jumps, so a loop body holding one no
+         * longer splits the run - which is what lets the loads below run on
+         * EVERY iteration instead of only the loop-entry copy (the same loop
+         * bumped LoadElemBool once for a 100-element array before this op). */
+        { OpCode::JumpUnlessTrueV, {
+            "func f(array<bool> a) {",
+            "  var n = 0;",
+            "  foreach (var b in a) { if (b == true) n += 1; }",
+            "  return n;",
+            "}",
+            "assert(f(runtime([true, false, true, true])) == 3);" } },
         /* The FOREACH element/field loads. Each runs its loop natively with the
          * index materialized cache-aware into a register before the helper.
          * SHAPE NOTES (each verified with a per-op counter, since these ops are
