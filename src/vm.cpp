@@ -2586,6 +2586,120 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
 }
 
 /*
+ * model-flip (nativize-ops): the native CallBuiltinLVElem - a mutating lvalue
+ * builtin whose arg0 is a SUBSCRIPT target `append(a[i], x)`/`pop(a[i])`. Forms
+ * the base's LValue* (by kind), then the ELEMENT's LValue* via the runtime
+ * Type::subscript (the SAME COW path Subscript::do_eval uses given the identical
+ * base LValue*); a non-lvalue element (flat scalar / read-only / missing key ->
+ * a throw) gives a null target -> NotLValueEx, like the tree-walker. The run at
+ * `run_base` holds the index (run[0]) then the value args (run[1..]). The
+ * interpreter's exact CallBuiltinLVElem; every throw is a RuntimeException ->
+ * g_vm_jit_exc (arg0's caret if loc-less) + re-raise. NOT op_fully_native.
+ */
+extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
+                                        int_type dst_slot, int_type run_base,
+                                        const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinLVElem);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *base;
+    switch (kind) {
+    case 0:  base = &ctx->frame->at(base_slot); break;
+    case 1:  base = ctx->gfuncs->defined[base_slot]
+                        ? &ctx->gfuncs->slots[base_slot] : nullptr; break;
+    default: base = &(*ctx->captures)[base_slot]; break;
+    }
+    const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
+    try {
+        EvalValue holder;   /* keeps the subscript result alive */
+        LValue *elem = nullptr;
+        if (base) {
+            const EvalValue &idx = ctx->frame->at(run_base).get();
+            holder = base->get().get_type()->subscript(
+                EvalValue(base), idx, /*for_write=*/false);
+            if (holder.is<LValue *>())
+                elem = holder.get<LValue *>();
+        }
+        EvalValue restbuf[8];   /* n_rest small (append 1, pop 0) */
+        for (int_type i = 0; i < n_rest; i++)
+            restbuf[i] = ctx->frame->at(run_base + 1 + i).get();
+        ArgLocs al;
+        al.start = bc->start;
+        al.end = bc->end;
+        al.args = bc->args.data();
+        al.nargs = bc->args.size();
+        al.arr_hint = bc->arr_hint;
+        ctx->frame->at(dst_slot).put(
+            bc->builtin.func_lv(ctx, &al, elem, n_rest ? restbuf : nullptr,
+                                static_cast<size_t>(n_rest)));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) {                /* the subscript's caret = arg0. */
+            e.loc_start = bc->args[0].start;
+            e.loc_end = bc->args[0].end;
+        }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native CallBuiltinLVMember - a mutating lvalue
+ * builtin whose arg0 is a struct-MEMBER target `append(s.f, x)`. Forms the base's
+ * LValue* (by kind), the boxed FIELD LValue* via vm_member_lvalue (the SAME check
+ * MemberExpr does; a POD/readonly/missing field throws), then func_lv. The run at
+ * `run_base` holds ONLY the value args (NO index, unlike LVElem). The
+ * interpreter's exact CallBuiltinLVMember; every throw is a RuntimeException ->
+ * g_vm_jit_exc (arg0's caret if loc-less) + re-raise. NOT op_fully_native.
+ */
+extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
+                                          int_type dst_slot, int_type run_base,
+                                          const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinLVMember);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *base;
+    switch (kind) {
+    case 0:  base = &ctx->frame->at(base_slot); break;
+    case 1:  base = ctx->gfuncs->defined[base_slot]
+                        ? &ctx->gfuncs->slots[base_slot] : nullptr; break;
+    default: base = &(*ctx->captures)[base_slot]; break;
+    }
+    const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
+    try {
+        LValue *field = nullptr;
+        if (base)
+            field = vm_member_lvalue(base, bc->member,
+                                     bc->args[0].start, bc->args[0].end,
+                                     bc->args[0].start, bc->args[0].end);
+        EvalValue restbuf[8];   /* append/push 1 value arg */
+        for (int_type i = 0; i < n_rest; i++)
+            restbuf[i] = ctx->frame->at(run_base + i).get();
+        ArgLocs al;
+        al.start = bc->start;
+        al.end = bc->end;
+        al.args = bc->args.data();
+        al.nargs = bc->args.size();
+        al.arr_hint = bc->arr_hint;
+        ctx->frame->at(dst_slot).put(
+            bc->builtin.func_lv(ctx, &al, field, n_rest ? restbuf : nullptr,
+                                static_cast<size_t>(n_rest)));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) {
+            e.loc_start = bc->args[0].start;
+            e.loc_end = bc->args[0].end;
+        }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
  * inline_origin_emitted - as the tree-walker's Construct::eval does). Called at
