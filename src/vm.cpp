@@ -2298,6 +2298,61 @@ extern "C" int jit_boxed_compound(const void *bop) noexcept
     return 0;
 }
 
+/*
+ * model-flip (nativize-ops): the native COMPOUND global store `g OP= rhs` /
+ * `g++` - the interpreter's compound StoreGlobalV branch. Reuses the boxed_ops
+ * pool (bo->target = the GLOBAL slot, bo->a = the rhs operand, bo->aop = the
+ * op). An UNDEFINED global BAILS (return 1, no g_vm_jit_exc -> the interpreter
+ * re-runs + throws UndefinedVariableEx, like jit_load_global). A num_bin_op
+ * throw (div0/type, loc-less) -> g_vm_jit_exc + return 1, so EnterNative
+ * re-raises with the caret from the loc side table (like the interpreted
+ * vm_stamp_loc). Both exits return 1; EnterNative distinguishes by whether
+ * g_vm_jit_exc is set. NOT op_fully_native.
+ */
+extern "C" int jit_store_global_compound(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(StoreGlobalV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    GlobalFuncTable *g = ctx->gfuncs;
+    if (!g->defined[bo->target])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue &lv = g->slots[bo->target];
+    EvalValue sb;
+    EvalValue nv = lv.get();
+    try {
+        vm_num_binop(nv, boxed_operand(bo->a, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    lv.put(std::move(nv));
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native COMPOUND capture store `cap OP= rhs` /
+ * `cap++` - the interpreter's compound StoreCaptureV branch. Like
+ * jit_store_global_compound but the slot is a CAPTURE (bo->target) - a capture
+ * is always defined, so NO bail (only the num_bin_op re-raise). NOT
+ * op_fully_native. */
+extern "C" int jit_store_capture_compound(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    LValue &lv = (*ctx->captures)[bo->target];
+    EvalValue sb;
+    EvalValue nv = lv.get();
+    try {
+        vm_num_binop(nv, boxed_operand(bo->a, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    lv.put(std::move(nv));
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native LogV body - EAGER logical `a && b` /
  * `a || b` (MyLang's don't short-circuit at runtime; both operands are already
  * computed). is_true() never throws, so LogV is op_fully_native (no eax check).

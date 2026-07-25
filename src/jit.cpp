@@ -690,17 +690,19 @@ static bool jit_op_eligible(const Instr &in)
      * closure creation, always defined, so never throws -> op_fully_native). */
     case OpCode::LoadCaptureV:
         return true;
-    /* model-flip (nativize-ops): a PLAIN global store `g = expr` (aop invalid)
-     * via jit_store_global (never throws). A COMPOUND `g OP=`/`g++` throws on
-     * an undefined slot + runs num_bin_op -> stays interpreted. */
+    /* model-flip (nativize-ops): a global store `g = expr` (PLAIN, aop invalid,
+     * via jit_store_global - never throws) OR `g OP=`/`g++` (COMPOUND, via
+     * jit_store_global_compound - reads the rhs from the boxed_ops pool, runs
+     * num_bin_op; an undefined slot BAILS, a num_bin_op throw re-raises). Both
+     * eligible; op_fully_native gates deletability on aop. */
     case OpCode::StoreGlobalV:
-        return in.aop == Op::invalid;
-    /* model-flip (nativize-ops): a PLAIN capture store `cap = expr` (aop
-     * invalid) via jit_store_capture (a capture is always defined -> never
-     * throws -> op_fully_native). A COMPOUND `cap OP=`/`cap++` runs num_bin_op
-     * -> stays interpreted (like StoreGlobalV). */
+        return true;
+    /* model-flip (nativize-ops): a capture store `cap = expr` (PLAIN, via
+     * jit_store_capture - always defined, never throws) OR `cap OP=`/`cap++`
+     * (COMPOUND, via jit_store_capture_compound - num_bin_op; re-raises, no bail
+     * since captures are always defined). Both eligible. */
     case OpCode::StoreCaptureV:
-        return in.aop == Op::invalid;
+        return true;
     /* model-flip (nativize-ops): a global READ `dst = g` via jit_load_global.
      * The common (defined) case runs native; an undefined global BAILS (the
      * interpreter re-runs + throws UndefinedVariableEx). NOT op_fully_native
@@ -1144,9 +1146,10 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             break;
         case OpCode::StoreGlobalV:
         case OpCode::StoreCaptureV:
-            /* reads the rhs slot from memory (target is a GLOBAL/CAPTURE slot,
-             * not a frame slot). */
-            bad(in.a_slot());
+            /* reads the rhs operand from memory (target is a GLOBAL/CAPTURE slot,
+             * not a frame slot). PLAIN: `a` is the src slot; COMPOUND: `a` is the
+             * rhs (a slot OR a lit - skip a lit). */
+            if (!in.a_is_lit()) bad(in.a_slot());
             break;
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
@@ -2008,30 +2011,33 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
-    case OpCode::StoreGlobalV: {
-        /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd
-         * from the slots base FIRST), then rdi = gslot (target) - which
-         * overwrites the slots base, so it must come after the lea. Never
-         * throws (the plain-only gate). */
-        const auto off = [](int slot) {
-            return static_cast<int32_t>(static_cast<long>(slot)
-                                        * static_cast<long>(sizeof(LValue)));
-        };
-        emit_call_prologue(e);
-        e.lea(RSI, off(in.a_slot()));       /* rsi = &slot[src] (uses rdi) */
-        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(jit_store_global) });
-        e.u8(0xE8); e.u32(0);
-        emit_call_epilogue(e);
-        return true;
-    }
-
+    case OpCode::StoreGlobalV:
     case OpCode::StoreCaptureV: {
-        /* cap = <expr> via jit_store_capture(cap_slot, src). Same shape as
-         * StoreGlobalV: rsi = &slot[src] (lea'd from the slots base FIRST), then
-         * rdi = cap_slot (target, overwrites the slots base). PLAIN-only gate ->
-         * never throws. */
+        const bool is_cap = in.op == OpCode::StoreCaptureV;
+        if (in.aop != Op::invalid) {
+            /* COMPOUND `g OP=`/`cap OP=` via jit_store_*_compound(&boxed_ops[
+             * target2]) - the rhs operand + slot ride the pool (like CompoundV).
+             * Non-0 -> exit_pc (an undefined-global bail / a num_bin_op
+             * re-raise). rdi = the pool entry. */
+            emit_call_prologue(e);
+            e.movabs(RDI,
+                     reinterpret_cast<uint64_t>(&ck.boxed_ops[in.target2]));
+            e.call_relocs.push_back(
+                { e.pos(), reinterpret_cast<const void *>(
+                    is_cap ? jit_store_capture_compound
+                           : jit_store_global_compound) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+            return true;
+        }
+        /* PLAIN `g = <expr>`/`cap = <expr>` via jit_store_global/jit_store_capture
+         * (slot, src). rsi = &slot[src] (LEA'd from the slots base FIRST), then
+         * rdi = the slot (overwrites the slots base, so after the lea). Never
+         * throws (op_fully_native). */
         const auto off = [](int slot) {
             return static_cast<int32_t>(static_cast<long>(slot)
                                         * static_cast<long>(sizeof(LValue)));
@@ -2040,7 +2046,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.lea(RSI, off(in.a_slot()));       /* rsi = &slot[src] (uses rdi) */
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(jit_store_capture) });
+            { e.pos(), reinterpret_cast<const void *>(
+                is_cap ? jit_store_capture : jit_store_global) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         return true;
@@ -2309,9 +2316,9 @@ static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
  * originals must stay): reg-shift (negative-count raise), LoadElem (slice/
  * kind re-interpret + OOB raise), every float op (float_load's bool/other
  * safety-net bail), generic IntBin (div/mod can throw). */
-static bool op_fully_native(OpCode op)
+static bool op_fully_native(const Instr &in)
 {
-    switch (op) {
+    switch (in.op) {
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
     case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
@@ -2344,8 +2351,6 @@ static bool op_fully_native(OpCode op)
     case OpCode::LoadBuiltinV:
     case OpCode::LoadConstV:
     case OpCode::LoadCaptureV:      /* capture read (always defined), never throws */
-    case OpCode::StoreCaptureV:     /* PLAIN capture write (eligible-gated), never throws */
-    case OpCode::StoreGlobalV:
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
     case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
@@ -2359,6 +2364,12 @@ static bool op_fully_native(OpCode op)
      * See plans/callbuiltinv-nativization.md #2. */
     case OpCode::CallBuiltinV:
         return true;
+    /* A PLAIN global/capture store (aop invalid) never throws -> deletable; a
+     * COMPOUND one (`g OP=`/`cap OP=`) throws (num_bin_op) OR bails (undefined
+     * global), so its interpreted original must be KEPT (the bail/re-raise). */
+    case OpCode::StoreGlobalV:
+    case OpCode::StoreCaptureV:
+        return in.aop == Op::invalid;
     default:
         return false;
     }
@@ -2446,7 +2457,7 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk)
         return false;
     for (size_t pc = 0; pc < n; pc++)
         if (!jit_op_eligible(chunk.code[pc])
-                || !op_fully_native(chunk.code[pc].op))
+                || !op_fully_native(chunk.code[pc]))
             return false;
     return true;
 }
@@ -2803,7 +2814,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         const size_t b = runs[r].begin, en = runs[r].end;
         bool ok = true;
         for (size_t p = b; p < en && ok; p++)
-            if (!op_fully_native(chunk.code[p].op))
+            if (!op_fully_native(chunk.code[p]))
                 ok = false;
         for (size_t p = 0; p < n && ok; p++) {   /* single-entry */
             const int t = branch_pc_target(chunk.code[p]);

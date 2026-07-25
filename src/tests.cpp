@@ -1222,6 +1222,20 @@ static const std::vector<test> tests =
     },
 
     {
+        /* use-before-def of a global in a COMPOUND store loop: the native
+         * jit_store_global_compound finds the slot undefined -> BAILS (return 1,
+         * no g_vm_jit_exc) -> the interpreter re-runs the store + throws
+         * UndefinedVariableEx (byte-identical vm/nj). */
+        "use-before-def global compound store (StoreGlobalV bail)",
+        {
+            "func f() { for (var i = 0; i < 20; i++) g += i; }",
+            "f();",
+            "var g = 0;",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
         "defined() builtin",
         {
             "assert(defined(a) == 0);",
@@ -15061,6 +15075,24 @@ static bool jit_op_nativized()
             "}",
             "var f = mk(runtime(0));",
             "assert(f(runtime(5)) == 8);" } },
+        /* StoreGlobalV COMPOUND `g += i`: the rhs + slot ride the boxed_ops pool,
+         * jit_store_global_compound runs num_bin_op each iter. Counter (shared
+         * with the plain form) bumps from the compound helper. */
+        { OpCode::StoreGlobalV, {
+            "var g = 0;",
+            "func f(int n) { for (var i = 0; i < n; i++) g += i; return g; }",
+            "assert(f(runtime(5)) == 10);" } },
+        /* StoreCaptureV COMPOUND `c += i`: jit_store_capture_compound (no bail -
+         * a capture is always defined). */
+        { OpCode::StoreCaptureV, {
+            "func mk(dyn c) {",
+            "  return func [c] (int n) {",
+            "    for (var i = 0; i < n; i++) c += i;",
+            "    return c;",
+            "  };",
+            "}",
+            "var f = mk(runtime(0));",
+            "assert(f(runtime(5)) == 10);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
