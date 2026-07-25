@@ -674,9 +674,31 @@ The order:
    11_closure_counter **0.971x**, 63_closures 0.985x; controls 1.0000.
    The residual jit_put_int/float/bool releases stay (a reference dst's
    release genuinely needs C++ - nothing left to inline there).
-7. **The exception family** (~15: PushHandler/PopHandler/CatchTest/Throw/
-   Reraise/SetPend/EndFinally) - a design step (handler-stack ops touch
-   the record state).
+7. **The exception family** (~14) - **ATTEMPTED 2026-07-25, REVERTED
+   with a measured verdict + the fix design.** The helper-call form of
+   PushHandler/PopHandler/SetPend (jit_push_handler / jit_pop_handler /
+   jit_set_pend over g_vm_act; the pushed catch_pc = remap[target],
+   routed via emit_branch for remap access) was implemented, green
+   everywhere, execution-proven - and MEASURED 71_exc_no_throw **+8.0%**,
+   42_exceptions +2.7%: the per-op call protocol (~12+ insns x2 per try
+   for prologue/pushes/re-mats) costs MORE than the two dispatches it
+   replaces for a 4-byte vector push/pop. Slower = unfinished -> reverted.
+   **The fix design (do this instead):** INLINE the push/pop fast paths -
+   probe &g_vm_act + VmActivation::handlers + libstdc++ vector internals
+   (_M_start +0 / _M_finish +8 / _M_end_of_storage +16, the layout the
+   flat-array reads already rely on): push = cmp finish vs end_of_storage
+   -> grow-HELPER on full, else `mov dword [finish], catch_pc; add
+   finish, 4`; pop = `sub finish, 4` (2 insns - never empty at a
+   PopHandler by codegen construction); SetPend = a byte store into
+   records[rec_n-1].pend (probe VmCallRec::pend + records data + rec_n).
+   THEN the raise-side ops (Throw/CatchTest/Reraise/EndFinally) need the
+   DYNAMIC-RESUME design: a helper running vm_raise and returning the
+   resume pc (or the jit_ret sentinels - IN-VM switches chunk via the
+   resume globals, BOUNDARY returns), with the fragment doing
+   `flush_cache; mov eax, <returned>; ret`; the helper needs the RUNNING
+   chunk - bake the DESCRIPTOR (desc->vm_chunk, the jit_exec_block
+   pattern; main has no descriptor -> main's throws stay interpreted or
+   get a chunk-registry answer first).
 8. **Calls - M5** (CallV/CachedCallV/CallValueV, 29 combined, the largest
    class): native calls to EVERY function (checked-return unwind +
    growable native stack; today only native_leaf callees from function
