@@ -321,6 +321,14 @@ extern "C" void jit_make_closure(int_type dst, const void *def) noexcept;
 extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
                                int_type hint) noexcept;
 
+/* model-flip (nativize-ops): MakeDictV natively - build a dict LITERAL from the
+ * interleaved key/value run [base, base + 2*npairs) via the shared
+ * build_dict_from_pairs (freezing each key). An UNHASHABLE key (a dyn-laundered
+ * function) throws TypeErrorEx -> g_vm_jit_exc + return 1 (EnterNative re-raises
+ * with the literal's caret from the loc side table); 0 otherwise. */
+extern "C" int jit_make_dict(int_type dst, int_type base,
+                             int_type npairs) noexcept;
+
 /* model-flip (nativize-ops): the BOXED-ARITH ops BinOpV / CmpV / CompoundV -
  * the interpreter's exact boxed_operand + vm_num_binop bodies. `bop` is a baked
  * `&chunk.boxed_ops[idx]` (the op's operand data - target/a/b/aop - copied into

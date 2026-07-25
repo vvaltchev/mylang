@@ -1281,6 +1281,13 @@ struct Codegen {
             in.target = dst;
             in.set_a(int_lit(base));
             in.set_b(int_lit(npairs));
+            /* The build FREEZES + HASHES each key, so an UNHASHABLE key (a
+             * function value laundered through `dyn`) throws TypeErrorEx from
+             * build_dict_from_pairs. Record the literal's span so extract_locs
+             * puts it in the loc side table and the throw carets the `{...}` -
+             * matching the tree-walker (LiteralDict::do_eval's Construct::eval
+             * stamp). Without this the VM reported the error with NO caret. */
+            in.node_idx = add_ast_node(ld);
             ops.push_back(in);
             out_slot = dst;
             return true;
@@ -6640,6 +6647,9 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::IncDecCheckedV:  /* node = the inc-dec (TypeError caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::MakeStructArrayV: /* node = a ctor (defensive coerce loc) */
+        case OpCode::MakeDictV:      /* node = the {..} literal: an UNHASHABLE
+                                      * key (a dyn-laundered func) throws from
+                                      * build_dict_from_pairs' key freeze/hash */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
         case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
         case OpCode::JumpUnlessElemInt:  /* E4 fusion - keeps the load's
