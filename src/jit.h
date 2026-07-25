@@ -386,6 +386,13 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
  *    g_vm_jit_exc + return 1 (loc side table), else 0.
  *  - jit_foreach_dyn_next: 1 = bound, 0 = end, -1 = THREW (the strict N-var
  *    unpack's TypeErrorEx via g_vm_jit_exc, loc side table). */
+/* model-flip (nativize-ops): DeclConstV (bind a const decl's slot, local or
+ * global; never throws) and DefinedGlobalV (`defined(g)` = the slot's
+ * defined-flag as a bool; never throws). */
+extern "C" void jit_decl_const(int_type dst, int_type is_global,
+                               int_type src) noexcept;
+extern "C" void jit_defined_global(int_type dst, int_type gslot) noexcept;
+
 /* model-flip (nativize-ops): the StructFieldAddInt READ half (the #9 fusion
  * `dst = other + a[i].f`) - vm_struct_field_int, proven no-fault; the add +
  * dst write run in the fragment. And the EmplaceStruct body -

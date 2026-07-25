@@ -589,11 +589,24 @@ The order:
    claimed by IntAddStep. MEASURED: 65_struct_field_sum **0.604x**,
    58_structs **0.896x**, 68_nested 0.997; 18_foreach_array/43_sieve/
    01_while_loop 1.0000.
-5. **Tail singles**: UnpackElemInt/Float/Value/Targets + MultiUnpackV (the
+5. **Tail singles** - first batch **DONE (2026-07-25)**: JumpIfNotNoneV
+   (inline none-tag compare vs the NEW JitLayout t_none; op_fully_native -
+   a whole coalesce loop deletes to one enter.nat), CmpFloatV (inline
+   swapped ucomisd + setcc, the CmpIntV shape; ordering compares only,
+   setcc opcode = near_op ^ 1 + 0x10), DeclConstV + DefinedGlobalV
+   (trivial never-throwing helpers, op_fully_native), ThrowRuntimeV (an
+   unconditional native EXIT - its exception mix includes NON-Runtime
+   ones that can't ride g_vm_jit_exc, so the interpreter re-runs the
+   side-effect-free throw op; the value is run-shape, ops before it stay
+   fused). The container test's island source HOPPED AGAIN: DeclConstV ->
+   CheckFuncV/MapFilterV (discarded `map(...)` statements); probe over
+   bench+samples = ZERO containers (exit.block grep). Cross-binary
+   controls showed +0.8-1.4% on UNTOUCHED paths incl. `-nr` parse-only -
+   byte-identical bytecode, so it is LTO/inlining drift (the documented
+   cross-binary noise class), not a change cost.
+   Remaining tail: UnpackElemInt/Float/Value/Targets + MultiUnpackV (the
    ForeachDyn bodies are 90% of the work), IncDecCheckedV/ElemChecked/
-   MemberChecked/ChainV, DeclConstV (also the container test's current
-   island - it will hop again), DefinedGlobalV, ThrowRuntimeV, CmpFloatV,
-   JumpIfNotNoneV (trivial branch; 0 bench occurrences).
+   MemberChecked/ChainV.
 6. **DE-HELPERIZE the trivial-value ops** (perf-parity today, but the road
    to REMOVING ALL HELPERS): MoveV / LoadConstV / LoadCaptureV /
    LoadBuiltinV / plain StoreGlobalV / StoreCaptureV currently CALL a

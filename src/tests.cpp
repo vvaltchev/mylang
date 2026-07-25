@@ -14812,20 +14812,18 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a straight-line boxed-island container; correct result. Six `const`
-     * ARRAY decls (a const arr is kept as a runtime symbol -> DeclConstV) = six
-     * islands (total >= MIN_CONTAINER_ISLAND). Returns the arg. runtime() keeps
-     * it non-const so the pure call isn't folded away (else cleaf never runs ->
-     * no container). DeclConstV is the container gate's island source now that
-     * the simple scalar ops, SliceV, MakeArrayV, MakeDictV and the struct builds
-     * are all nativized. */
+    /* (1) a boxed-island container; correct result. Discarded `map(...)`
+     * statements are the island source (CheckFuncV + MapFilterV, the last
+     * still-boxed simple ops now that the scalar ops, SliceV, the container/
+     * struct builds AND DeclConstV are all nativized); their closure/array
+     * args compile to ELIGIBLE ops, so the islands are the check+map pairs.
+     * Returns the arg. runtime() keeps the call non-const so the pure call
+     * isn't folded away (else cleaf never runs -> no container). */
     if (!run({ "func cleaf(dyn a) {",
-               "  const t = [1, 2];",
-               "  const u = [3, 4];",
-               "  const v = [5, 6];",
-               "  const w = [7, 8];",
-               "  const x = [9, 10];",
-               "  const y = [11, 12];",
+               "  map(func (e) => e, [1, 2]);",
+               "  map(func (e) => e, [3, 4]);",
+               "  map(func (e) => e, [5, 6]);",
+               "  map(func (e) => e, [7, 8]);",
                "  return a;",
                "}",
                "assert(cleaf(runtime(\"hello\")) == \"hello\");" }))
@@ -14846,13 +14844,15 @@ static bool jit_container()
         return false;
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
-     * island `const c = [..]` (DeclConstV) calls jit_exec_block; `var j = i + 1`
-     * is native. The const is re-declared each iteration; the arg is returned. */
+     * island `map(...)` (CheckFuncV/MapFilterV, the still-boxed pair) calls
+     * jit_exec_block; `var j = i + 1` is native. The arg is returned.
+     * (The island was `const c = [..]` / DeclConstV until that op went
+     * native - the recurring island-source hop.) */
     const unsigned long b1 = g_jit_container_calls;
     if (!run({ "func lc(dyn a, int n) {",
                "  var dyn last = a;",
                "  for (var i = 0; i < n; i++) {",
-               "    const c = [1, 2];",
+               "    map(func (e) => e, [1, 2]);",
                "    var j = i + 1;",
                "  }",
                "  return last;",
@@ -15529,6 +15529,53 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(5)) == 20);" } },
+        /* JumpIfNotNoneV: the `??` short-circuit branch (an inline none-tag
+         * compare) - both the none and the non-none paths. */
+        { OpCode::JumpIfNotNoneV, {
+            "func co(opt dyn v, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn r = v ?? 7; s += int(r); }",
+            "  return s;",
+            "}",
+            "assert(co(runtime(none), 3) == 21);",
+            "assert(co(runtime(2), 3) == 6);" } },
+        /* CmpFloatV: the typed float compare-to-bool VALUE (a float sort
+         * comparator's body) - inline swapped ucomisd + setcc. */
+        { OpCode::CmpFloatV, {
+            "func f(float a, float b, int n) {",
+            "  var c = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var t = a < b;",
+            "    if (t) c += 1;",
+            "  }",
+            "  return c;",
+            "}",
+            "assert(f(runtime(1.5), runtime(2.5), 4) == 4);",
+            "assert(f(runtime(2.5), runtime(1.5), 4) == 0);" } },
+        /* DeclConstV: a const container decl in a loop body (re-bound each
+         * iteration as a CONST LValue; reads of it fold, the bind op stays). */
+        { OpCode::DeclConstV, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    const c = [1, 2];",
+            "    s += c[0];",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 5);" } },
+        /* DefinedGlobalV: defined(g) of a GLOBAL reads the slot's
+         * defined-flag. */
+        { OpCode::DefinedGlobalV, {
+            "var g = 1;",
+            "func rd() { return g; }",
+            "func f(int n) {",
+            "  var c = 0;",
+            "  for (var i = 0; i < n; i++) { if (defined(g)) c += 1; }",
+            "  return c;",
+            "}",
+            "assert(f(runtime(4)) == 4);",
+            "assert(rd() == 1);" } },
         /* The iterator THROW paths, script-caught: a non-container init and a
          * strict-unpack next each ride g_vm_jit_exc out of the fragment and
          * dispatch to the same-frame handler. */
@@ -15559,6 +15606,31 @@ static bool jit_op_nativized()
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
             return false;   /* the op's NATIVE code did NOT run - a real gap */
+        }
+    }
+    /* ThrowRuntimeV: an always-throwing op is an unconditional native EXIT
+     * (its exception mix includes non-Runtime ones the JIT cannot convey);
+     * the interpreter re-runs the side-effect-free op and throws. The run
+     * FAILS by design (UndefinedVariableEx is not script-catchable) - the
+     * counter is the execution proof that the fragment reached the op. */
+    {
+        const unsigned long b =
+            g_jit_op_run[static_cast<size_t>(OpCode::ThrowRuntimeV)];
+        if (run({ "func f(int n) {",
+                  "  var s = 0;",
+                  "  for (var i = 0; i < n; i++) s += i;",
+                  "  s += undefined_name;",
+                  "  return s;",
+                  "}",
+                  "f(runtime(3));" })) {
+            fprintf(stderr, "jit_op_nativized: ThrowRuntimeV case did not "
+                            "throw\n");
+            return false;
+        }
+        if (g_jit_op_run[static_cast<size_t>(OpCode::ThrowRuntimeV)] <= b) {
+            fprintf(stderr,
+                    "jit_op_nativized: ThrowRuntimeV DID NOT RUN\n");
+            return false;
         }
     }
     return true;
