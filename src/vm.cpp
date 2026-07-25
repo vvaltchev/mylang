@@ -1860,6 +1860,14 @@ extern "C" void jit_load_const(LValue *slots, int_type dst,
  * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
  * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws
  * WITH the member caret already set, so EnterNative's re-raise preserves it. */
+extern "C" void jit_store_global(int_type gslot,
+                                 const EvalValue *src) noexcept
+{
+    GlobalFuncTable *g = g_current_ctx->gfuncs;
+    g->slots[gslot].put(RValue(*src));
+    g->defined[gslot] = 1;
+}
+
 extern "C" int jit_member(const EvalValue *base, LValue *dst,
                           const void *mkv) noexcept
 {

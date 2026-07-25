@@ -215,6 +215,13 @@ extern "C" void jit_load_const(LValue *slots, int_type dst,
 extern "C" int jit_member(const EvalValue *base, LValue *dst,
                           const void *mk) noexcept;
 
+/* model-flip (nativize-ops): a PLAIN global store `g = <expr>` (aop invalid) -
+ * `gfuncs->slots[gslot] = RValue(*src); defined[gslot]=1` (the interpreter's
+ * exact decl/reassign; never throws). gfuncs via g_current_ctx. `src` is the
+ * rhs value slot's EvalValue*. The COMPOUND case (g OP= / g++) stays interpreted
+ * (it throws on an undefined slot + runs num_bin_op). */
+extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
+
 /*
  * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
  * ReturnV runs IN the fragment. The fragment flushes its register cache and
