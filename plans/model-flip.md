@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (28 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (29 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -380,7 +380,13 @@ baked member_keys pool - see its backlog entry). And the **nested-chain stores**
 `cap=v`, the capture twin of StoreGlobalV) - see their backlog entries. And
 **AppendV** (`jit_append` - `append(a,x)`/`push(a,x)`, the never-throwing
 arr_append_fast fast path + the vm_call_builtin_lv_rest fallback; needed the
-CannotChangeConstEx -> RuntimeException change - see its backlog entry).
+CannotChangeConstEx -> RuntimeException change - see its backlog entry). And
+**CallBuiltinLV** (`jit_call_builtin_lv` - the OTHER mutating lvalue-ABI
+builtins: pop/insert/erase/sort/reverse/intptr. Forms arg0 from kind+slot,
+calls vm_call_builtin_lv_rest (rest_base >= 0) or func_lv with an empty rest
+(rest_base == -1); every throw is a RuntimeException -> g_vm_jit_exc; NOT
+op_fully_native, NOT cached. Completes the lvalue-builtin family for a slotted
+arg0 - LVElem/LVMember (subscript/member arg0) remain).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -509,11 +515,27 @@ to do LATER, separately (don't forget these):
   README + a test updated). An undefined-global arg0 -> null target ->
   NotLValueEx (no bail needed). NOT op_fully_native. VERIFIED: append loop native
   + correct, flat-mismatch TypeError byte-identical, const-append now catchable.
-- **CallBuiltinLV / LVElem / LVMember** (the OTHER lvalue builtins:
-  pop/insert/erase/sort/reverse/intptr) — the mutating-builtin analogue of
-  CallBuiltinV; CannotChangeConstEx is ALREADY a RuntimeException now (done for
-  AppendV), so they just need the op emit + fallback (reuse
-  vm_call_builtin_lv_rest which now takes the pool entry).
+- **CallBuiltinLV** (pop/insert/erase/sort/reverse/intptr) — DONE (2026-07-24)
+  via `jit_call_builtin_lv`. Forms arg0's LValue* from kind (0 local/1 global/2
+  capture) + arg0_slot; `rest_base >= 0` -> a rest-native op
+  (vm_call_builtin_lv_rest with the value-arg run), `rest_base == -1` -> a
+  no-value-arg op (func_lv with an empty rest). The ArgLocs it builds inline
+  matches Chunk::arglocs_at; `bc` = the baked &builtin_calls[idx] buffer ptr.
+  Every reachable throw is a RuntimeException now (CannotChangeConstEx was made
+  one for AppendV) -> g_vm_jit_exc + re-raise (loc from the pool if loc-less).
+  An undefined-global arg0 -> null target -> NotLValueEx (no bail). NOT
+  op_fully_native, NOT cached (rest-run layout unknown at classify time). Encodes
+  has_rest into rest_base (-1 sentinel) to fit 5 register args. VERIFIED: -vdj
+  fragment covers the call.blt.lv ops with a native call; jit_op_nativized
+  CallBuiltinLV case (insert+pop loop) proves the counter bumps; insert-OOB /
+  const-mutation (catchable) / undefined-global-target byte-identical vm/nj/tw;
+  discarded `pop(a);` writes a temp (interpreter doesn't discard LV dst) - OK
+  under hardening.
+- **CallBuiltinLVElem / CallBuiltinLVMember** (the subscript/member arg0 variants:
+  `append(a[i], x)`, `append(s.f, x)`) — REMAIN. They form arg0 via the runtime
+  Type::subscript (elem) / a boxed field LValue (member) rather than a slot, so
+  they need the arg0-derivation logic in the helper (like the interpreter's
+  handlers) + the emit. CannotChangeConstEx is already a RuntimeException.
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
