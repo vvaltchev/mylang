@@ -32,6 +32,7 @@
 #include "bytecode.h"
 #include "evalvalue.h"
 #include "funcdesc.h"   /* FuncDescriptor::vm_chunk (native-call gate, STEP 2.1) */
+#include "eval.h"       /* builtin_slot (the LoadBuiltinV emit-time bytes) */
 
 #include <algorithm>
 #include <unordered_map>
@@ -1102,6 +1103,21 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off)
     e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
     e.u32(static_cast<uint32_t>(L.t_str_val));
     return e.j8(0x72);                         /* jb -> fast (trivial value) */
+}
+
+/* The INVERTED form for the de-helperize inline paths: jump NEAR to the
+ * HELPER fallback when the value at `type_off` is a REFERENCE (type->t >=
+ * t_str); fall through for a trivial value. Returns the jae rel32 site to
+ * patch to the helper label. Clobbers rcx. */
+static size_t emit_ref_check_jae(Emitter &e, int32_t type_off)
+{
+    const JitLayout &L = jit_layout();
+    e.load(RCX, type_off);
+    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
+    e.u32(static_cast<uint32_t>(L.type_t_off));
+    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
+    e.u32(static_cast<uint32_t>(L.t_str_val));
+    return e.j32(0x73);                        /* jae -> the helper (a ref) */
 }
 
 /* Approach-A slow-path helpers: release the slot's current value and store
@@ -2474,11 +2490,29 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         return true;
 
-    case OpCode::MoveV:
-        /* model-flip (nativize-ops): dst = src.get() via jit_move (rdi=slots
-         * base - already correct after the prologue's push, rsi=dst, rdx=src).
-         * Never throws, so no eax check. The prologue/epilogue save+restore rdi
-         * and the N5 cache regs (the copy clobbers caller-saved). */
+    case OpCode::MoveV: {
+        /* De-helperize (roadmap step 6): dst = src.get() INLINE for the
+         * trivial-x-trivial case - a TRIVIAL source (type->t < t_str) copied
+         * over a TRIVIAL current dst is a bitwise 24-byte-payload + Type*
+         * copy, no refcounts. A REFERENCE source (retain) or - when dst is
+         * ref-listed - a reference current dst (release) falls to the
+         * original jit_move helper. */
+        const SlotAddr src = slot_addr(in.target2);
+        const SlotAddr dst = slot_addr(in.target);
+        e.bump_op(OpCode::MoveV);
+        std::vector<size_t> jhelp;
+        jhelp.push_back(emit_ref_check_jae(e, src.type));
+        if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                               static_cast<int32_t>(in.target)))
+            jhelp.push_back(emit_ref_check_jae(e, dst.type));
+        e.load(RAX, src.type);
+        e.load(RCX, src.payload);      e.store(RCX, dst.payload);
+        e.load(RCX, src.payload + 8);  e.store(RCX, dst.payload + 8);
+        e.load(RCX, src.payload + 16); e.store(RCX, dst.payload + 16);
+        e.store(RAX, dst.type);
+        const size_t j_done = e.j32(0xEB);
+        for (const size_t s : jhelp)
+            e.patch32_here(s);
         emit_call_prologue(e);
         e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
@@ -2486,11 +2520,54 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_move) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+        e.patch32_here(j_done);
         return true;
+    }
 
-    case OpCode::LoadBuiltinV:
-        /* dst = builtin_slot[idx] via jit_load_builtin (rdi=slots, rsi=dst,
-         * rdx=idx). idx (target2) is a compile-time index, never throws. */
+    case OpCode::LoadBuiltinV: {
+        /* De-helperize (roadmap step 6): a TRIVIAL builtin-table value (a
+         * real `Builtin`, t_builtin < t_str - the immutable singleton table
+         * is built before any codegen) has emit-time-constant bytes, exactly
+         * the trivial LoadConstV shape (immediate stores; a ref-listed dst
+         * checks its current value and falls to the helper for the release).
+         * ⛔ NOT every builtin-table value is trivial: `argv` is an ARRAY in
+         * that table - bitwise-copying it skipped the retain and the next
+         * release FREED it under the static table (an ASan UAF at exit the
+         * differential caught). A reference value keeps the helper. */
+        const EvalValue &bv = builtin_slot(static_cast<int>(in.target2)).get();
+        if (bv.get_type()->t < Type::t_str) {
+            const SlotAddr dst = slot_addr(in.target);
+            e.bump_op(OpCode::LoadBuiltinV);
+            size_t j_help = 0;
+            const bool reflisted = std::binary_search(
+                ck.ref_slots.begin(), ck.ref_slots.end(),
+                static_cast<int32_t>(in.target));
+            if (reflisted)
+                j_help = emit_ref_check_jae(e, dst.type);
+            uint64_t q[3];
+            std::memcpy(q, reinterpret_cast<const char *>(&bv)
+                               + EvalValue::jit_payload_off(), sizeof q);
+            e.movabs(RCX, q[0]); e.store(RCX, dst.payload);
+            e.movabs(RCX, q[1]); e.store(RCX, dst.payload + 8);
+            e.movabs(RCX, q[2]); e.store(RCX, dst.payload + 16);
+            e.movabs(RAX, reinterpret_cast<uint64_t>(bv.get_type()));
+            e.store(RAX, dst.type);
+            if (!reflisted)
+                return true;
+            const size_t j_done = e.j32(0xEB);
+            e.patch32_here(j_help);
+            emit_call_prologue(e);
+            e.movabs(RSI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target)));
+            e.movabs(RDX, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target2)));
+            e.call_relocs.push_back(
+                { e.pos(), reinterpret_cast<const void *>(jit_load_builtin) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.patch32_here(j_done);
+            return true;
+        }
         emit_call_prologue(e);
         e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
@@ -2499,6 +2576,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         return true;
+    }
 
     case OpCode::LoadCaptureV:
         /* dst = (*ctx->captures)[idx] via jit_load_capture (rdi=dst=target,
@@ -2558,11 +2636,46 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         return true;
 
-    case OpCode::LoadConstV:
-        /* dst = consts[idx] via jit_load_const (rdi=slots, rsi=dst, rdx=src).
-         * src = &ck.consts[idx] - the const-pool BUFFER address, stable across
-         * the chunk's std::move (a vector move preserves data()); baking
-         * `&ck` would dangle. Never throws. */
+    case OpCode::LoadConstV: {
+        /* De-helperize (roadmap step 6): a TRIVIAL const's BYTES are known at
+         * EMIT time - store them as immediates (3 payload quads + the Type*),
+         * zero loads, zero calls. Only a ref-listed dst needs the runtime
+         * current-value check (a reference dst's release needs C++ -> the
+         * helper). A REFERENCE const (a string - needs a retain) keeps the
+         * helper call unconditionally. */
+        const EvalValue &v = ck.consts[in.target2];
+        if (v.get_type()->t < Type::t_str) {
+            const SlotAddr dst = slot_addr(in.target);
+            e.bump_op(OpCode::LoadConstV);
+            size_t j_help = 0;
+            const bool reflisted = std::binary_search(
+                ck.ref_slots.begin(), ck.ref_slots.end(),
+                static_cast<int32_t>(in.target));
+            if (reflisted)
+                j_help = emit_ref_check_jae(e, dst.type);
+            uint64_t q[3];
+            std::memcpy(q, reinterpret_cast<const char *>(&v)
+                               + EvalValue::jit_payload_off(), sizeof q);
+            e.movabs(RCX, q[0]); e.store(RCX, dst.payload);
+            e.movabs(RCX, q[1]); e.store(RCX, dst.payload + 8);
+            e.movabs(RCX, q[2]); e.store(RCX, dst.payload + 16);
+            e.movabs(RAX, reinterpret_cast<uint64_t>(v.get_type()));
+            e.store(RAX, dst.type);
+            if (!reflisted)
+                return true;
+            const size_t j_done = e.j32(0xEB);
+            e.patch32_here(j_help);
+            emit_call_prologue(e);
+            e.movabs(RSI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target)));
+            e.movabs(RDX, reinterpret_cast<uint64_t>(&ck.consts[in.target2]));
+            e.call_relocs.push_back(
+                { e.pos(), reinterpret_cast<const void *>(jit_load_const) });
+            e.u8(0xE8); e.u32(0);
+            emit_call_epilogue(e);
+            e.patch32_here(j_done);
+            return true;
+        }
         emit_call_prologue(e);
         e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RDX, reinterpret_cast<uint64_t>(&ck.consts[in.target2]));
@@ -2571,6 +2684,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         return true;
+    }
 
     case OpCode::LoadLiteralObjV:
         /* dst = eval_literal_obj(literal_objs[idx]) via jit_load_literal_obj
