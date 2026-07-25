@@ -812,6 +812,15 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::UnpackElemTargets:
     case OpCode::MultiUnpackV:
         return true;
+    /* model-flip (nativize-ops): the CHECKED INC-DEC ops via jit_incdec_*
+     * (the shared bodies / pooled-caret runtime cores; an undefined-GLOBAL
+     * base BAILS - UndefinedVariableEx is not conveyable). NOT
+     * op_fully_native (bail + throws). */
+    case OpCode::IncDecCheckedV:
+    case OpCode::IncDecElemCheckedV:
+    case OpCode::IncDecMemberCheckedV:
+    case OpCode::IncDecChainV:
+        return true;
     /* model-flip (nativize-ops): an ALWAYS-THROWING construct. Its exception
      * mix includes NON-Runtime ones (UndefinedVariableEx/CannotRebindBuiltin)
      * that cannot ride g_vm_jit_exc, so the native form is simply an
@@ -1649,6 +1658,25 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::MultiUnpackV:
             /* the target slots live in the unpack_targets pool - not
              * enumerable here (no chunk). BRACKET (neither is a branch). */
+            mark_barrier(pc);
+            break;
+        case OpCode::IncDecCheckedV:
+            /* the helper RMWs the slot in memory; a LOCAL (kind target2==0)
+             * must not be register-pinned. */
+            if (in.target2 == 0) bad(in.target);
+            break;
+        case OpCode::IncDecElemCheckedV:
+            /* base (target2, when a LOCAL - kind is in target) + the key
+             * temp (a) are read from memory by the helper. */
+            if (in.target == 0) bad(in.target2);
+            bad(in.a_slot());
+            break;
+        case OpCode::IncDecMemberCheckedV:
+            if (in.target == 0) bad(in.target2);
+            break;
+        case OpCode::IncDecChainV:
+            /* the chain's key temps live in the incdec_chains pool - not
+             * enumerable here. BRACKET (not a branch). */
             mark_barrier(pc);
             break;
         case OpCode::Jump:
@@ -2866,6 +2894,100 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.patch8(j_ok, e.pos());
         }
         return true;
+
+    case OpCode::IncDecCheckedV:
+        /* jit_incdec_checked(slot, kind, is_inc) - layout: target = slot,
+         * target2 = kind, a_lit = is_inc. Bail or throw -> test + exit. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(in.a_lit()));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_incdec_checked) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::IncDecElemCheckedV:
+        /* jit_incdec_elem(kind, base_slot, key_slot, is_inc, &site) -
+         * layout: target = kind, target2 = base slot, a = the key temp,
+         * aop = +/-, b = the incdec_sites index. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.movabs(RCX, static_cast<uint64_t>(in.aop == Op::plus ? 1 : 0));
+        e.movabs_r8(reinterpret_cast<uint64_t>(&ck.incdec_sites[in.b_lit()]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_incdec_elem) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::IncDecMemberCheckedV:
+        /* jit_incdec_member(kind, base_slot, is_inc, &site) - same layout
+         * minus the key temp (the member key rides the site). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(in.aop == Op::plus ? 1 : 0));
+        e.movabs(RCX, reinterpret_cast<uint64_t>(
+                          &ck.incdec_sites[in.b_lit()]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_incdec_member) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::IncDecChainV: {
+        /* jit_incdec_chain(root_kind, root_slot, dst, is_inc, &chain,
+         * member_keys buffer) - layout: a_lit = root kind (3 = rvalue),
+         * target2 = root slot, target = dst (-1 = statement), aop = +/-,
+         * b = the incdec_chains index. r9 carries the 6th arg (not a
+         * persistent tag reg, the nested-chain-store precedent). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RCX, static_cast<uint64_t>(in.aop == Op::plus ? 1 : 0));
+        e.movabs_r8(reinterpret_cast<uint64_t>(
+                        &ck.incdec_chains[in.b_lit()]));
+        e.movabs_r9(reinterpret_cast<uint64_t>(ck.member_keys.data()));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_incdec_chain) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+    }
 
     case OpCode::DeclConstV:
         /* const decl bind via jit_decl_const(dst, is_global, src). */
@@ -4321,8 +4443,21 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
              * spill-around-a-call). Never a branch op, so the reload always
              * executes. */
             const bool brk = cache_barrier[pc - begin] && !e.cache.empty();
-            if (brk)
+            std::vector<Emitter::CacheEnt> saved_cache;
+            if (brk) {
                 e.flush_cache();
+                /* EMPTY the cache across the op's emission: a barrier'd op
+                 * that THROWS exits via exit_pc BEFORE the reload, and
+                 * exit_pc's flush would write the PRE-CALL register values
+                 * over slots the helper already modified (a cached slot among
+                 * a throwing MultiUnpackV/CallBuiltinV's written targets
+                 * would be clobbered back - the interpreter keeps the partial
+                 * write). With no cache entries, the op's exits flush nothing
+                 * and memory keeps the helper's writes; any in-op operand
+                 * read falls back to (current) memory. */
+                saved_cache = std::move(e.cache);
+                e.cache.clear();
+            }
             if (op_is_branch(in.op)) {
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
                             begin, end, remap, fixups);
@@ -4331,8 +4466,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.b.clear();
                 return;                    /* selection bug: give up */
             }
-            if (brk)
+            if (brk) {
+                e.cache = std::move(saved_cache);
                 e.reload_cache();
+            }
         }
         e.exit_pc(static_cast<uint32_t>(remap[end]));   /* fall-through */
 

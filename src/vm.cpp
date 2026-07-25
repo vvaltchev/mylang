@@ -725,13 +725,48 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
  * rvalue-ness); the result (old for postfix / new for prefix) lands in `dst`
  * (-1 = statement, discarded). ML_NOINLINE: off vm_run_chunk's recursive
  * frame (the recursion-stack hygiene rule). */
+/* The chain walk + final step over an already-formed root - the SHARED core
+ * for the interpreter op below AND jit_incdec_chain (the root forming
+ * differs: the interpreter throws UndefinedVariableEx for an undefined
+ * global root, the JIT helper BAILS). `mkeys` is the member_keys BUFFER. */
+static void
+vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
+                     const Chunk::MemberKey *mkeys, EvalValue cur,
+                     int_type dst, bool is_inc)
+{
+    const std::vector<Chunk::ChainStep> &steps = site.steps;
+    const size_t n = steps.size();
+
+    vm_chain_walk(ctx, mkeys, cur, steps, n - 1);
+
+    const Chunk::ChainStep &last = steps[n - 1];
+    EvalValue memId;
+    const UniqueId *memUid = nullptr;
+    EvalValue key;
+    if (last.is_member) {
+        const Chunk::MemberKey &mk = mkeys[last.operand];
+        memId = mk.memId;
+        memUid = mk.memUid;
+    } else {
+        key = ctx.frame->at(last.operand).get();
+    }
+
+    EvalValue r = vm_incdec_final(cur, last.is_member, memId, memUid, key,
+                                  site.tier2, is_inc,
+                                  site.is_prefix,
+                                  site.allow_flat, site.allow_pod,
+                                  last.lstart, last.lend,
+                                  site.kstart, site.kend,
+                                  site.id_start, site.id_end);
+    if (dst >= 0)
+        ctx.frame->at(dst).put(std::move(r));
+}
+
 static ML_NOINLINE void
 vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
                    size_t pc)
 {
     const Chunk::IncDecChain &site = chunk.incdec_chains[in.b_lit()];
-    const std::vector<Chunk::ChainStep> &steps = site.steps;
-    const size_t n = steps.size();
 
     EvalValue cur;
     if (in.a_lit() == 3)
@@ -740,29 +775,8 @@ vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
         cur = EvalValue(
             vm_store_base(ctx, in.a_lit(), in.target2, chunk, pc, nullptr));
 
-    vm_chain_walk(ctx, chunk.member_keys.data(), cur, steps, n - 1);
-
-    const Chunk::ChainStep &last = steps[n - 1];
-    EvalValue memId;
-    const UniqueId *memUid = nullptr;
-    EvalValue key;
-    if (last.is_member) {
-        const Chunk::MemberKey &mk = chunk.member_keys[last.operand];
-        memId = mk.memId;
-        memUid = mk.memUid;
-    } else {
-        key = ctx.frame->at(last.operand).get();
-    }
-
-    EvalValue r = vm_incdec_final(cur, last.is_member, memId, memUid, key,
-                                  site.tier2, in.aop == Op::plus,
-                                  site.is_prefix,
-                                  site.allow_flat, site.allow_pod,
-                                  last.lstart, last.lend,
-                                  site.kstart, site.kend,
-                                  site.id_start, site.id_end);
-    if (in.target >= 0)
-        ctx.frame->at(in.target).put(std::move(r));
+    vm_incdec_chain_core(ctx, site, chunk.member_keys.data(), std::move(cur),
+                         in.target, in.aop == Op::plus);
 }
 
 /* Build a FLAT array<PodStruct> literal from the N structs' interleaved
@@ -2847,6 +2861,144 @@ extern "C" int jit_multi_unpack(int_type rval_slot, const void *targets,
     return 0;
 }
 
+/* The SHARED IncDecCheckedV body (the dyn scalar ++/--): int/float-only
+ * (a TypeErrorEx otherwise - loc-less when `chunk` is null, the JIT; the
+ * re-raise stamps the same side-table caret), then +-1 in place. ONE
+ * implementation for the interpreter handler AND jit_incdec_checked. */
+static void
+vm_incdec_scalar_body(LValue &lv, bool is_inc, const Chunk *chunk, size_t pc)
+{
+    EvalValue nv = lv.get();
+    if (!nv.is<int_type>() && !nv.is<float_type>()) {
+        Loc s, en;
+        if (chunk)
+            chunk->loc_at(pc, s, en);
+        throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
+    }
+    vm_num_binop(nv, EvalValue(static_cast<int_type>(1)),
+                 is_inc ? Op::plus : Op::minus);
+    lv.put(std::move(nv));
+}
+
+/* model-flip (nativize-ops): the native CHECKED INC-DEC bodies. Each forms
+ * its base/root like the interpreter, EXCEPT an undefined GLOBAL, which
+ * BAILS (return 1 with NO exception set - UndefinedVariableEx is not
+ * conveyable via g_vm_jit_exc; the interpreter re-runs the op and throws
+ * with the side-table caret, the LoadGlobalV pattern). Every other throw is
+ * a RuntimeException -> g_vm_jit_exc + return 1; the Elem/Member/Chain
+ * throws carry their POOLED carets (which survive the re-raise), the scalar
+ * TypeErrorEx is loc-less -> the side-table caret. */
+extern "C" int jit_incdec_checked(int_type slot, int_type kind,
+                                  int_type is_inc) noexcept
+{
+    ML_JIT_OP_RAN(IncDecCheckedV);
+    EvalContext *ctx = g_current_ctx;
+    LValue *lvp;
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[slot])
+            return 1;                       /* bail: interpreter re-runs */
+        lvp = &ctx->gfuncs->slots[slot];
+    } else if (kind == 2) {
+        lvp = &(*ctx->captures)[slot];
+    } else {
+        lvp = &ctx->frame->at(slot);
+    }
+    try {
+        vm_incdec_scalar_body(*lvp, is_inc != 0, nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_incdec_elem(int_type kind, int_type base_slot,
+                               int_type key_slot, int_type is_inc,
+                               const void *sitev) noexcept
+{
+    ML_JIT_OP_RAN(IncDecElemCheckedV);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::IncDecSite &site =
+        *static_cast<const Chunk::IncDecSite *>(sitev);
+    LValue *blv;
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[base_slot])
+            return 1;                       /* bail */
+        blv = &ctx->gfuncs->slots[base_slot];
+    } else if (kind == 2) {
+        blv = &(*ctx->captures)[base_slot];
+    } else {
+        blv = &ctx->frame->at(base_slot);
+    }
+    try {
+        vm_incdec_elem(blv, ctx->frame->at(key_slot).get(), is_inc != 0,
+                       site.lstart, site.lend, site.istart, site.iend);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_incdec_member(int_type kind, int_type base_slot,
+                                 int_type is_inc, const void *sitev) noexcept
+{
+    ML_JIT_OP_RAN(IncDecMemberCheckedV);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::IncDecSite &site =
+        *static_cast<const Chunk::IncDecSite *>(sitev);
+    LValue *blv;
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[base_slot])
+            return 1;                       /* bail */
+        blv = &ctx->gfuncs->slots[base_slot];
+    } else if (kind == 2) {
+        blv = &(*ctx->captures)[base_slot];
+    } else {
+        blv = &ctx->frame->at(base_slot);
+    }
+    try {
+        vm_incdec_member(blv, site.memId, site.memUid, is_inc != 0,
+                         site.lstart, site.lend, site.istart, site.iend);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_incdec_chain(int_type root_kind, int_type root_slot,
+                                int_type dst, int_type is_inc,
+                                const void *chainv,
+                                const void *mkeys) noexcept
+{
+    ML_JIT_OP_RAN(IncDecChainV);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::IncDecChain &site =
+        *static_cast<const Chunk::IncDecChain *>(chainv);
+    EvalValue cur;
+    if (root_kind == 3) {
+        cur = ctx->frame->at(root_slot).get();   /* rvalue root: a VALUE */
+    } else if (root_kind == 1) {
+        if (!ctx->gfuncs->defined[root_slot])
+            return 1;                       /* bail */
+        cur = EvalValue(&ctx->gfuncs->slots[root_slot]);
+    } else if (root_kind == 2) {
+        cur = EvalValue(&(*ctx->captures)[root_slot]);
+    } else {
+        cur = EvalValue(&ctx->frame->at(root_slot));
+    }
+    try {
+        vm_incdec_chain_core(*ctx, site,
+                             static_cast<const Chunk::MemberKey *>(mkeys),
+                             std::move(cur), dst, is_inc != 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* The SHARED LoadMemberInt/Float body (H1 - the typed standalone struct-member
  * read `p.x`, th==i/f): the POD fast path reads the scalar straight from the
  * instance's bytes; anything else (boxed struct / dict / const member / a dyn
@@ -4254,9 +4406,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
 
         VM_CASE(IncDecCheckedV): {
-            /* A dyn/general scalar `--d`/`d++`: throw if not int/float
-             * (inc-dec is int/float-ONLY), else apply +-1 in place. Slot kind:
-             * 0 local / 1 global (defined-guarded) / 2 capture. */
+            /* A dyn/general scalar `--d`/`d++` - the shared body (also
+             * jit_incdec_checked's). Slot kind: 0 local / 1 global
+             * (defined-guarded) / 2 capture. */
             LValue *lvp;
             if (in->target2 == 1) {
                 if (!ctx.gfuncs->defined[in->target]) {
@@ -4271,16 +4423,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             } else {
                 lvp = &ctx.frame->at(in->target);
             }
-            LValue &lv = *lvp;
-            EvalValue nv = lv.get();
-            if (!nv.is<int_type>() && !nv.is<float_type>()) {
-                Loc s, en;
-                chunk->loc_at(pc, s, en);
-                throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
-            }
-            vm_num_binop(nv, EvalValue(static_cast<int_type>(1)),
-                         in->a_lit() ? Op::plus : Op::minus);
-            lv.put(std::move(nv));
+            vm_incdec_scalar_body(*lvp, in->a_lit() != 0, chunk, pc);
             pc++;
         }
         VM_NEXT;

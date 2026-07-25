@@ -621,11 +621,28 @@ The order:
    the family strongly positive. Test-shape note: `var a, b = <dyn>` is
    a compile DynRequiredEx - the MultiUnpackV cases use typed int
    targets (which also exercises the unpack_coerce path).
-   Remaining tail: IncDecCheckedV/ElemChecked/MemberChecked (helpers;
-   the undefined-global cases BAIL like LoadGlobalV since
-   UndefinedVariableEx is not conveyable) + IncDecChainV
-   (vm_incdec_chain_op takes (chunk, Instr) - needs the pool-entry
-   refactor the nested-chain stores got).
+   Third batch **DONE (2026-07-25)** - the CHECKED INC-DEC family:
+   IncDecCheckedV (shared vm_incdec_scalar_body), IncDecElemCheckedV /
+   IncDecMemberCheckedV (helpers over vm_incdec_elem/member with baked
+   &incdec_sites[idx] - the POOLED dual carets survive the re-raise),
+   IncDecChainV (vm_incdec_chain_op SPLIT into root-forming +
+   vm_incdec_chain_core, the core shared with jit_incdec_chain; bakes
+   &incdec_chains[idx] + the member_keys BUFFER, r9 = the 6th arg). An
+   undefined-GLOBAL base/root BAILS in every helper (return 1, no exc -
+   UndefinedVariableEx is not conveyable; the interpreter re-runs and
+   throws, the LoadGlobalV pattern).
+   **PLUS a pre-existing BARRIER-EXIT hazard fixed in the emit loop:** a
+   barrier'd op that THROWS exits via exit_pc BEFORE the loop's reload,
+   and exit_pc's flush wrote the PRE-CALL register values over slots the
+   helper had already modified (reachable for a throwing CallBuiltinV
+   callback / MultiUnpackV compound whose written target was N5-cached -
+   the interpreter keeps the partial write, the JIT clobbered it back).
+   Fix: the cache is EMPTIED across a barrier'd op's emission (flush
+   first, so memory is current; the op's exits then flush nothing) and
+   restored + reloaded after.
+   MEASURED: the only 2 bench IncDec islands (11_closure_counter /
+   63_closures, a capture `start++`) - 1.0000x (see the note below);
+   42_exceptions / 01_while_loop 1.0000.
 6. **DE-HELPERIZE the trivial-value ops** (perf-parity today, but the road
    to REMOVING ALL HELPERS): MoveV / LoadConstV / LoadCaptureV /
    LoadBuiltinV / plain StoreGlobalV / StoreCaptureV currently CALL a

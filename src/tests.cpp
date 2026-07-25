@@ -15632,6 +15632,42 @@ static bool jit_op_nativized()
             "  return r;",
             "}",
             "assert(f(runtime([1, 2, 3])) == 42);" } },
+        /* The CHECKED INC-DEC family: a dyn scalar, a dyn element, a dyn
+         * member, and the impure-lvalue chain VALUE form. */
+        { OpCode::IncDecCheckedV, {
+            "func f(dyn d, int n) {",
+            "  for (var i = 0; i < n; i++) d++;",
+            "  return d;",
+            "}",
+            "assert(f(runtime(10), 5) == 15);" } },
+        { OpCode::IncDecElemCheckedV, {
+            "func f(dyn c, int n) {",
+            "  for (var i = 0; i < n; i++) c[\"k\"]++;",
+            "  return c[\"k\"];",
+            "}",
+            "assert(f(runtime({\"k\": 3}), 4) == 7);" } },
+        { OpCode::IncDecMemberCheckedV, {
+            "func f(dyn c, int n) {",
+            "  for (var i = 0; i < n; i++) c.k--;",
+            "  return c.k;",
+            "}",
+            "assert(f(runtime({\"k\": 9}), 4) == 5);" } },
+        { OpCode::IncDecChainV, {
+            "func k(int i) => 0;",
+            "func f(array<int> a, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s += a[k(i)]++;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([10, 20]), 3) == 33);" } },
+        /* the scalar checked throw path, script-caught (a string ++). */
+        { OpCode::IncDecCheckedV, {
+            "func f(dyn d) {",
+            "  var r = 0;",
+            "  try { d++; r = 1; } catch (TypeErrorEx) { r = 8; }",
+            "  return r;",
+            "}",
+            "assert(f(runtime(\"nope\")) == 8);" } },
         /* The iterator THROW paths, script-caught: a non-container init and a
          * strict-unpack next each ride g_vm_jit_exc out of the fragment and
          * dispatch to the same-frame handler. */
