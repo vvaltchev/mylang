@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (31 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (32 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -393,7 +393,12 @@ element LValue* via the runtime Type::subscript / the boxed field LValue* via
 vm_member_lvalue, then func_lv rest-native. The `run_base` holds the value args
 (elem: run[0] index + run[1..] values; member: run[0..] values). Every throw a
 RuntimeException -> g_vm_jit_exc (arg0's caret if loc-less); NOT op_fully_native,
-NOT cached. Completes the WHOLE lvalue-builtin family).
+NOT cached. Completes the WHOLE lvalue-builtin family). And **MakeArrayV**
+(`jit_make_array` - an array LITERAL `[a, b, ...]` via the shared
+build_array_from_values over the element run, per the ArrHint in `target2`; the
+build has NO error path (a mixed literal just goes general), so it never throws
+-> **op_fully_native** - a per-iteration-array loop now DELETES its originals to
+ONE `enter.nat` and becomes a `native_leaf` - see its backlog entry).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -556,6 +561,32 @@ to do LATER, separately (don't forget these):
   (dyn `append(rows[k],i)` loop; `Bag b` `append(b.items,i)` loop) prove the
   counters bump; OOB-subscript / flat-scalar-NotLValue / const-struct-field
   (read-only -> NotLValue) errors byte-identical vm/tw.
+- **MakeArrayV** (the first CONTAINER BUILD) — DONE (2026-07-24) via
+  `jit_make_array` (rdi=dst, rsi=run base, rdx=n, rcx=the ArrHint from
+  `target2`). It calls the file-local `vm_make_array`, i.e. the interpreter's
+  exact path into the shared `build_array_from_values` - so every storage kind
+  (flat int/float/bool, flat POD-struct, general, and the empty-with-hint forms)
+  builds byte-identically. **It NEVER THROWS** (the build has no error path - a
+  mixed literal just goes general), so the helper returns void and the op is
+  **op_fully_native**: a loop that builds a per-iteration array literal now
+  DELETES its interpreted originals down to ONE `enter.nat` and the body becomes
+  a **`native_leaf`** (call-able by a caller fragment, #55) - the first container
+  build to reach that state. The element buffer stays in `vm_make_array`'s frame
+  (NEVER inline it - vm_run_chunk's frame is multiplied by VM recursion depth;
+  see that helper's comment). N5: the element run IS enumerable from the
+  instruction (base + n), so `pick_cached_slots` disqualifies `[a_lit,
+  a_lit+b_lit)` + dst precisely rather than turning caching off for the run - an
+  element can be a cached int counter (`[i, i*2]`). **The jit_container test's
+  island moved MakeArrayV -> MakeDictV** (the next still-boxed simple op; the
+  same hop SliceV -> MakeArrayV made). Verified perf-safe by the SliceV/MakeArrayV
+  precedent: a temporary `g_jit_container_calls` probe over ALL of bench/ and
+  samples/ found **ZERO** containers formed (and the probe was itself validated -
+  it reported 6 island calls on the known dict-literal container shape, per the
+  "prove the code ran" rule). VERIFIED: -vdj fragment covers the make.arr op with
+  a native call; a jit_op_nativized MakeArrayV case proves the counter bumps; all
+  storage kinds + the >16-element heap path + empty/struct-hint literals agree
+  vm/nj/tw; bench + samples vm-vs-tw output identical (the two "diffs" are
+  rand_sort's rand() and shopping's timeout-truncated interactive loop).
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
