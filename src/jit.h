@@ -230,6 +230,12 @@ extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
 extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
                                      const void *lo) noexcept;
 
+/* model-flip (nativize-ops): ArrLen natively - the foreach snapshot bound
+ * `n = size(frame[base])`. `base` is a proven flat array (ForeachStmt::elem_th),
+ * so size() never throws. */
+extern "C" void jit_arr_len(LValue *slots, int_type dst,
+                            int_type base) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is
