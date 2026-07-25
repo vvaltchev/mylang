@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (26 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (27 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -375,7 +375,9 @@ island moved to MakeArrayV - see its backlog entry). And **StoreElemValue**
 global/capture via a `kind` arg; an undefined-global base bails, a subscript
 throw re-raises - see its backlog entry). And **StoreMemberV** (`jit_store_member`
 - a struct field store `s.f=v` via vm_member_store, member key + carets from the
-baked member_keys pool - see its backlog entry).
+baked member_keys pool - see its backlog entry). And the **nested-chain stores**
+(StoreElem2V/StoreElemChainV/StoreLValueChainV) + **StoreCaptureV** (plain
+`cap=v`, the capture twin of StoreGlobalV) - see their backlog entries.
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -574,8 +576,15 @@ to do LATER, separately (don't forget these):
   carets stamped by the vm functions) + an undefined-global base bails (the two
   kind'd ones). 6 args each (r9 = the 6th; r9 isn't a persistent singleton, unlike
   rsi/r8). VERIFIED: all 3 native + correct, throw carets byte-identical vm/nj/tw.
-- **StoreCaptureV** `cap=v` (a slot write like StoreGlobalV, 0x in benches) still
-  remains - low value.
+- **StoreCaptureV** — DONE (2026-07-23). A PLAIN capture store `cap = v`
+  (jit_store_capture - the capture-slot twin of jit_store_global:
+  `(*ctx->captures)[cap_slot] = RValue(*src)`; a capture is always defined so NO
+  defined check + never throws -> op_fully_native). PLAIN-only gate like
+  StoreGlobalV (a compound `cap OP= v` runs num_bin_op -> stays interpreted).
+  Same emit shape as StoreGlobalV (lea &slot[src] -> rsi, cap_slot -> rdi).
+  VERIFIED: a closure reassigning its capture in a native loop (jit_op_nativized
+  StoreCaptureV case). With this, EVERY container/slot store is native (plain
+  forms); only the COMPOUND global/capture stores stay interpreted.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);

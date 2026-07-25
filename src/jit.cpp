@@ -695,6 +695,12 @@ static bool jit_op_eligible(const Instr &in)
      * an undefined slot + runs num_bin_op -> stays interpreted. */
     case OpCode::StoreGlobalV:
         return in.aop == Op::invalid;
+    /* model-flip (nativize-ops): a PLAIN capture store `cap = expr` (aop
+     * invalid) via jit_store_capture (a capture is always defined -> never
+     * throws -> op_fully_native). A COMPOUND `cap OP=`/`cap++` runs num_bin_op
+     * -> stays interpreted (like StoreGlobalV). */
+    case OpCode::StoreCaptureV:
+        return in.aop == Op::invalid;
     /* model-flip (nativize-ops): a global READ `dst = g` via jit_load_global.
      * The common (defined) case runs native; an undefined global BAILS (the
      * interpreter re-runs + throws UndefinedVariableEx). NOT op_fully_native
@@ -1137,7 +1143,9 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target); bad(in.a_slot());
             break;
         case OpCode::StoreGlobalV:
-            /* reads the rhs slot from memory (target is a GLOBAL slot). */
+        case OpCode::StoreCaptureV:
+            /* reads the rhs slot from memory (target is a GLOBAL/CAPTURE slot,
+             * not a frame slot). */
             bad(in.a_slot());
             break;
         case OpCode::LoadBuiltinV:
@@ -2019,6 +2027,25 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::StoreCaptureV: {
+        /* cap = <expr> via jit_store_capture(cap_slot, src). Same shape as
+         * StoreGlobalV: rsi = &slot[src] (lea'd from the slots base FIRST), then
+         * rdi = cap_slot (target, overwrites the slots base). PLAIN-only gate ->
+         * never throws. */
+        const auto off = [](int slot) {
+            return static_cast<int32_t>(static_cast<long>(slot)
+                                        * static_cast<long>(sizeof(LValue)));
+        };
+        emit_call_prologue(e);
+        e.lea(RSI, off(in.a_slot()));       /* rsi = &slot[src] (uses rdi) */
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_store_capture) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+    }
+
     case OpCode::SubscriptV: {
         /* dst = base[idx] via jit_subscript(base_lv, idx*, dst*) - SysV rdi=
          * base_lv, rsi=idx, rdx=dst. leas from rdi (slots base); rdi is set LAST
@@ -2317,6 +2344,7 @@ static bool op_fully_native(OpCode op)
     case OpCode::LoadBuiltinV:
     case OpCode::LoadConstV:
     case OpCode::LoadCaptureV:      /* capture read (always defined), never throws */
+    case OpCode::StoreCaptureV:     /* PLAIN capture write (eligible-gated), never throws */
     case OpCode::StoreGlobalV:
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
     case OpCode::ArrLen:            /* size() of a proven array, never throws */

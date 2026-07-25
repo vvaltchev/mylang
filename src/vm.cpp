@@ -2121,6 +2121,20 @@ extern "C" void jit_store_global(int_type gslot,
     g->defined[gslot] = 1;
 }
 
+/* model-flip (nativize-ops): the native StoreCaptureV PLAIN `cap = <expr>` - the
+ * capture-slot twin of jit_store_global. Writes the running closure's
+ * per-instance capture slot `(*ctx->captures)[cap_slot] = RValue(*src)`; a
+ * capture is ALWAYS defined (snapshot at closure creation), so - unlike a global
+ * - there is no defined check and no throw (op_fully_native). Only the PLAIN
+ * case is JIT-eligible (like StoreGlobalV); a COMPOUND `cap OP= v` runs
+ * num_bin_op and stays interpreted. */
+extern "C" void jit_store_capture(int_type cap_slot,
+                                  const EvalValue *src) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureV);
+    (*g_current_ctx->captures)[cap_slot].put(RValue(*src));
+}
+
 /*
  * model-flip (nativize-ops): the native LoadGlobalV body - `frame[dst] =
  * gfuncs->slots[gslot]`. The COMMON case (the global is defined) runs native.

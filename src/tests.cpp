@@ -15049,6 +15049,18 @@ static bool jit_op_nativized()
             "  return a[2].x;",
             "}",
             "assert(f(runtime([B(0), B(0), B(0)]), 3) == 4);" } },
+        /* StoreCaptureV: a closure reassigns its captured value (PLAIN `c = v`)
+         * each loop iteration - runs native (jit_store_capture; a capture is
+         * always defined, never throws). */
+        { OpCode::StoreCaptureV, {
+            "func mk(dyn c) {",
+            "  return func [c] (int n) {",
+            "    for (var i = 0; i < n; i++) c = i * 2;",
+            "    return c;",
+            "  };",
+            "}",
+            "var f = mk(runtime(0));",
+            "assert(f(runtime(5)) == 8);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
