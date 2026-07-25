@@ -329,6 +329,22 @@ extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
 extern "C" int jit_make_dict(int_type dst, int_type base,
                              int_type npairs) noexcept;
 
+/* model-flip (nativize-ops): the STRUCT BUILDS. `def` is the program-lifetime
+ * StructTypeDef* from the struct_defs pool (baked as a VALUE); `bc` is a baked
+ * `&chunk.boxed_ctors[idx]` (def + per-arg carets). All three re-raise a
+ * TypeErrorEx via g_vm_jit_exc + return 1:
+ *  - jit_struct_ctor: a POD `P(x, y)` from its field run (H1 dst-slot reuse);
+ *  - jit_struct_ctor_boxed: a non-POD `B(a, x)` - the throw carries the
+ *    offending arg's POOLED caret, which vm_raise's empty-loc-only stamp keeps;
+ *  - jit_make_struct_array: the fused flat array<PodStruct> literal (`n` is the
+ *    ELEMENT count; the run holds n * nfields values). */
+extern "C" int jit_struct_ctor(const void *def, int_type base, int_type nf,
+                               int_type dst) noexcept;
+extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
+                                     const void *bc) noexcept;
+extern "C" int jit_make_struct_array(const void *def, int_type base,
+                                     int_type n, int_type dst) noexcept;
+
 /* model-flip (nativize-ops): the BOXED-ARITH ops BinOpV / CmpV / CompoundV -
  * the interpreter's exact boxed_operand + vm_num_binop bodies. `bop` is a baked
  * `&chunk.boxed_ops[idx]` (the op's operand data - target/a/b/aop - copied into

@@ -2241,6 +2241,84 @@ extern "C" int jit_make_dict(int_type dst, int_type base,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native StructCtorV body - a standalone POD
+ * struct construction `P(x, y)` from its field-arg run, via vm_struct_ctor (the
+ * interpreter's exact call, incl. the H1 DST-SLOT REUSE that overwrites last
+ * iteration's same-def instance in place). `defv` is the program-lifetime
+ * StructTypeDef* from the struct_defs pool, baked by the emitter as a VALUE
+ * (like MakeClosureV's FuncDescriptor*). The codegen's typed-scalar arg gate
+ * means coerce_struct_field cannot throw here, but the field buffer is coerced
+ * DEFENSIVELY, so a throw is caught LOC-LESS -> g_vm_jit_exc and EnterNative
+ * re-raises stamping the construction's caret from the loc side table (vm_raise
+ * stamps only when the exception has no loc). Every reachable throw is a
+ * TypeErrorEx (a RuntimeException). NOT op_fully_native (side-table caret). */
+extern "C" int jit_struct_ctor(const void *defv, int_type base, int_type nf,
+                               int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(StructCtorV);
+    StructTypeDef *def =
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv));
+    try {
+        vm_struct_ctor(*g_current_ctx, def, base, nf, dst);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native StructCtorBoxedV body - a BOXED (non-POD)
+ * struct construction `B(a, x)` with runtime args, via vm_struct_ctor_boxed (it
+ * also doubles as the CHECKED POD ctor). `bcv` is a baked
+ * `&chunk.boxed_ctors[idx]` (the pool BUFFER address, stable across the chunk's
+ * std::move) holding the def + the PER-ARG carets. Here a field coerce genuinely
+ * CAN throw (a dyn-laundered wrong value), and the exception already carries the
+ * offending arg's caret from the pool - vm_raise's stamp is conditional on an
+ * EMPTY loc, so that pooled caret survives the re-raise untouched (byte-identical
+ * to the tree-walker's construct_struct). NOT op_fully_native. */
+extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
+                                     const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(StructCtorBoxedV);
+    const Chunk::BoxedCtor *bc = static_cast<const Chunk::BoxedCtor *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    StructTypeDef *def = const_cast<StructTypeDef *>(bc->def);
+    try {
+        EvalValue v = vm_struct_ctor_boxed(
+            *ctx, def, base, static_cast<int_type>(bc->arg_locs.size()),
+            bc->arg_locs.data());
+        ctx->frame->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native MakeStructArrayV body - the FUSED flat
+ * `array<PodStruct>` literal `[P(..), P(..)]`, via vm_make_struct_array_op (which
+ * coerces the interleaved field values STRAIGHT into a contiguous byte buffer -
+ * no per-element StructObject - and reuses the dst slot's same-def, same-count
+ * buffer when it owns it). `defv` is the baked program-lifetime StructTypeDef*;
+ * `n` is the ELEMENT count (the run holds n * nfields values). The all-scalar
+ * field gate means the coerce can't throw; a defensive throw is caught LOC-LESS
+ * -> g_vm_jit_exc, EnterNative stamps from the loc side table. NOT
+ * op_fully_native. */
+extern "C" int jit_make_struct_array(const void *defv, int_type base,
+                                     int_type n, int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(MakeStructArrayV);
+    StructTypeDef *def =
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv));
+    try {
+        vm_make_struct_array_op(*g_current_ctx, def, base, n, dst);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int jit_dict_load(int_type dst, int_type base_slot,
                              const EvalValue *key, int is_int) noexcept
 {
