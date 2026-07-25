@@ -15416,6 +15416,34 @@ static bool jit_op_nativized()
             "  return r;",
             "}",
             "assert(f(9, runtime(0)) == 77);" } },
+        /* LoadMemberInt/Float: the H1 typed STANDALONE struct-member read
+         * (a local `p`, not a foreach-array element - that is
+         * LoadStructFieldInt's shape). The body avoids `s += p.x` (the
+         * StructFieldAddInt fusion) via a non-accumulator use. */
+        { OpCode::LoadMemberInt, {
+            "struct M { int x; float y; }",
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var p = M(i, 1.5);",
+            "    var t = p.x * 2;",
+            "    s += t;",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 20);" } },
+        { OpCode::LoadMemberFloat, {
+            "struct M2 { int x; float y; }",
+            "func f(int n) {",
+            "  var s = 0.0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var p = M2(i, 1.5);",
+            "    var t = p.y * 2.0;",
+            "    s += t;",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(4)) == 12.0);" } },
         /* FloatBin div: inline divsd behind the sign-stripped divisor bits
          * test (+-0.0 raises DivisionByZeroEx, NaN/inf divide). Only the div
          * arm bumps the counter. */

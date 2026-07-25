@@ -751,6 +751,13 @@ static bool jit_op_eligible(const Instr &in)
      * op_fully_native (it can bail on a throw). */
     case OpCode::MemberV:
         return true;
+    /* model-flip (nativize-ops): the H1 typed standalone struct-member read
+     * `p.x` (th==i/f) via jit_load_member - the shared vm_load_member_scalar
+     * body (POD byte fast path + the member_read_core fallback, which can
+     * throw with the member caret -> re-raise). NOT op_fully_native. */
+    case OpCode::LoadMemberInt:
+    case OpCode::LoadMemberFloat:
+        return true;
     /* model-flip (nativize-ops): a slice READ base[start:end] via jit_slice (the
      * runtime Type::slice; a non-int bound / non-sliceable base throws
      * TypeErrorEx -> exit -> EnterNative re-raises). base/start/end/dst are frame
@@ -1317,7 +1324,10 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             if (in.b_slot() >= 0) bad(static_cast<int>(in.b_slot()));
             break;
         case OpCode::MemberV:
-            /* leas &slot for base/dst (the member key is baked, not a slot). */
+        case OpCode::LoadMemberInt:
+        case OpCode::LoadMemberFloat:
+            /* base read + dst written from memory by the helper (the member
+             * key is a baked pool entry, not a slot). */
             bad(in.target2); bad(in.target);
             break;
         case OpCode::ArrLen:
@@ -2872,6 +2882,31 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.patch8(j_ok, e.pos());
         return true;
     }
+
+    case OpCode::LoadMemberInt:
+    case OpCode::LoadMemberFloat:
+        /* the H1 typed member read `p.x` via jit_load_member(dst, base_slot,
+         * mk, is_int) - the POD byte fast path + the member_read_core
+         * fallback (which can throw -> test eax + exit_pc re-raise; the
+         * throw carries the member caret from the pool). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&ck.member_keys[in.a_lit()]));
+        e.movabs(RCX, static_cast<uint64_t>(
+                          in.op == OpCode::LoadMemberInt ? 1 : 0));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_load_member) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
 
     case OpCode::MemberV: {
         /* dst = base.member via jit_member(base*, dst*, mk) - SysV rdi=base,

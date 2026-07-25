@@ -2692,6 +2692,88 @@ extern "C" int jit_dict_load(int_type dst, int_type base_slot,
     return 0;
 }
 
+/* The SHARED LoadMemberInt/Float body (H1 - the typed standalone struct-member
+ * read `p.x`, th==i/f): the POD fast path reads the scalar straight from the
+ * instance's bytes; anything else (boxed struct / dict / const member / a dyn
+ * base) falls to member_read_core + write_scalar_slot, whose loc-less get<>
+ * throw is stamped with the member's caret. ONE implementation for the
+ * interpreter handlers AND jit_load_member, so they cannot drift. */
+static void
+vm_load_member_scalar(EvalContext &ctx, const Chunk::MemberKey &mk,
+                      int_type base_slot, int_type dst, bool is_int)
+{
+    const EvalValue &b = ctx.frame->at(base_slot).get();
+    if (b.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *b.get<intrusive_ptr<StructObject>>().get();
+        const int fs = o.def->slot_of(mk.memUid);
+        if (fs >= 0 && o.is_pod()) {
+            const FieldDef &f = o.def->fields[fs];
+            const char *p = o.bytes.data() + f.offset;
+            if (is_int) {
+                if (f.kind == FieldKind::f_int) {
+                    int_type v;
+                    std::memcpy(&v, p, sizeof v);
+                    write_int_slot(&ctx, dst, v);
+                    return;
+                }
+                if (f.kind == FieldKind::f_bool) {
+                    write_int_slot(&ctx, dst,
+                        static_cast<unsigned char>(*p) != 0 ? 1 : 0);
+                    return;
+                }
+            } else {
+                if (f.kind == FieldKind::f_float) {
+                    float_type v;
+                    std::memcpy(&v, p, sizeof v);
+                    write_float_slot(&ctx, dst, v);
+                    return;
+                }
+                if (f.kind == FieldKind::f_int) {
+                    int_type v;
+                    std::memcpy(&v, p, sizeof v);
+                    write_float_slot(&ctx, dst, static_cast<float_type>(v));
+                    return;
+                }
+            }
+        }
+    }
+    try {
+        write_scalar_slot(&ctx, dst, is_int,
+            member_read_core(b, mk.memId, mk.memUid, mk.optional,
+                             mk.mstart, mk.mend, mk.bstart, mk.bend));
+    } catch (Exception &e) {
+        /* write_scalar_slot's get<> throw is loc-less - give it the member's
+         * caret (member_read_core's own throws carry it) */
+        if (!e.loc_start) {
+            e.loc_start = mk.mstart;
+            e.loc_end = mk.mend;
+        }
+        throw;
+    }
+}
+
+/* model-flip (nativize-ops): the native LoadMemberInt/Float body - the shared
+ * H1 typed member read above. `mkv` is a baked `&chunk.member_keys[idx]`. The
+ * fallback path throws WITH the member caret -> g_vm_jit_exc + return 1
+ * (vm_raise's empty-loc-only stamp keeps it); 0 on success. */
+extern "C" int jit_load_member(int_type dst, int_type base_slot,
+                               const void *mkv, int is_int) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(
+        is_int ? OpCode::LoadMemberInt : OpCode::LoadMemberFloat)]++;
+#endif
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::MemberKey *mk = static_cast<const Chunk::MemberKey *>(mkv);
+    try {
+        vm_load_member_scalar(*ctx, *mk, base_slot, dst, is_int != 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
  * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
  * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws
@@ -6087,91 +6169,20 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_NEXT;
 
         VM_CASE(LoadMemberInt): {
-            /* H1: typed standalone struct-member read `p.x` (th==i). The POD
-             * fast path reads the scalar straight from the instance's bytes -
-             * the VM analog of MemberExpr::eval_int; anything else falls to
-             * the shared member_read_core + write_scalar_slot (its int
-             * type-check/promotion == the tree-walker's boxed fallback). */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
-            const EvalValue &b = ctx.frame->at(in->target2).get();
-            if (b.is<intrusive_ptr<StructObject>>()) {
-                const StructObject &o =
-                    *b.get<intrusive_ptr<StructObject>>().get();
-                const int fs = o.def->slot_of(mk.memUid);
-                if (fs >= 0 && o.is_pod()) {
-                    const FieldDef &f = o.def->fields[fs];
-                    const char *p = o.bytes.data() + f.offset;
-                    if (f.kind == FieldKind::f_int) {
-                        int_type v;
-                        std::memcpy(&v, p, sizeof v);
-                        write_int_slot(&ctx, in->target, v);
-                        pc++;
-                        VM_NEXT;
-                    }
-                    if (f.kind == FieldKind::f_bool) {
-                        write_int_slot(&ctx, in->target,
-                            static_cast<unsigned char>(*p) != 0 ? 1 : 0);
-                        pc++;
-                        VM_NEXT;
-                    }
-                }
-            }
-            try {
-                write_scalar_slot(&ctx, in->target, /*is_int=*/true,
-                    member_read_core(b, mk.memId, mk.memUid, mk.optional,
-                                     mk.mstart, mk.mend, mk.bstart, mk.bend));
-            } catch (Exception &e) {
-                /* write_scalar_slot's get<> throw is loc-less - give it the
-                 * member's caret (member_read_core's own throws carry it) */
-                if (!e.loc_start) {
-                    e.loc_start = mk.mstart;
-                    e.loc_end = mk.mend;
-                }
-                throw;
-            }
+            /* H1: typed standalone struct-member read `p.x` (th==i) - the
+             * shared body (also jit_load_member's): the POD fast path reads
+             * the scalar straight from the instance's bytes, anything else
+             * falls to member_read_core + write_scalar_slot. */
+            vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
+                                  in->target2, in->target, /*is_int=*/true);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(LoadMemberFloat): {
-            /* the eval_float twin (th==f) */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
-            const EvalValue &b = ctx.frame->at(in->target2).get();
-            if (b.is<intrusive_ptr<StructObject>>()) {
-                const StructObject &o =
-                    *b.get<intrusive_ptr<StructObject>>().get();
-                const int fs = o.def->slot_of(mk.memUid);
-                if (fs >= 0 && o.is_pod()) {
-                    const FieldDef &f = o.def->fields[fs];
-                    const char *p = o.bytes.data() + f.offset;
-                    if (f.kind == FieldKind::f_float) {
-                        float_type v;
-                        std::memcpy(&v, p, sizeof v);
-                        write_float_slot(&ctx, in->target, v);
-                        pc++;
-                        VM_NEXT;
-                    }
-                    if (f.kind == FieldKind::f_int) {
-                        int_type v;
-                        std::memcpy(&v, p, sizeof v);
-                        write_float_slot(&ctx, in->target,
-                                         static_cast<float_type>(v));
-                        pc++;
-                        VM_NEXT;
-                    }
-                }
-            }
-            try {
-                write_scalar_slot(&ctx, in->target, /*is_int=*/false,
-                    member_read_core(b, mk.memId, mk.memUid, mk.optional,
-                                     mk.mstart, mk.mend, mk.bstart, mk.bend));
-            } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = mk.mstart;
-                    e.loc_end = mk.mend;
-                }
-                throw;
-            }
+            /* the eval_float twin (th==f) - the shared body */
+            vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
+                                  in->target2, in->target, /*is_int=*/false);
             pc++;
         }
         VM_NEXT;
