@@ -14684,11 +14684,13 @@ static bool jit_native_call()
  * calls bumps, the "prove the code ran" rule) with a correct result, AND that a
  * throw propagates + is catchable. dyn params keep the body boxed; the block
  * body keeps it above the inline threshold (so it stays a real call, not inlined
- * away). The ISLAND op is a SLICE `a[i:j]` (SliceV) - as the nativize-ops path
- * made BinOpV/CmpV/CompoundV/MoveV/LogV/UnaryV/CoerceNumV all NATIVE, SliceV is
- * the container gate's remaining still-boxed island source. A straight-line
- * container needs total island ops >= MIN_CONTAINER_ISLAND, so subtest (1)
- * chains 6 slices (each its own 1-op island; total 6 >= 5). */
+ * away). The ISLAND op is a DICT LITERAL `{"k": a}` (MakeDictV) - as the
+ * nativize-ops path made BinOpV/CmpV/CompoundV/MoveV/LogV/UnaryV/CoerceNumV,
+ * SliceV and MakeArrayV all NATIVE, MakeDictV is the container gate's remaining
+ * still-boxed island source (the source hops to the next still-boxed simple op
+ * each time one is nativized). A straight-line container needs total island ops
+ * >= MIN_CONTAINER_ISLAND, so subtest (1) chains 6 dict literals (each its own
+ * 1-op island; total 6 >= 5). */
 static bool jit_container()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -14720,21 +14722,21 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a straight-line boxed-island container; correct result. Six array
-     * literals `[a]` of a dyn value = six MakeArrayV islands (total >=
-     * MIN_CONTAINER_ISLAND). Returns [a], whose [0] is a. runtime() keeps the arg
-     * non-const so the pure call isn't folded away (else cleaf never runs -> no
-     * container). MakeArrayV is the container gate's island source now that the
-     * simple scalar ops AND SliceV are all nativized (op_run_eligible). */
+    /* (1) a straight-line boxed-island container; correct result. Six dict
+     * literals `{"k": a}` of a dyn value = six MakeDictV islands (total >=
+     * MIN_CONTAINER_ISLAND). Returns {"k": a}, whose ["k"] is a. runtime() keeps
+     * the arg non-const so the pure call isn't folded away (else cleaf never runs
+     * -> no container). MakeDictV is the container gate's island source now that
+     * the simple scalar ops, SliceV AND MakeArrayV are all nativized. */
     if (!run({ "func cleaf(dyn a) {",
-               "  var dyn t = [a];",
-               "  var dyn u = [a];",
-               "  var dyn v = [a];",
-               "  var dyn w = [a];",
-               "  var dyn x = [a];",
-               "  return [a];",
+               "  var dyn t = {\"k\": a};",
+               "  var dyn u = {\"k\": a};",
+               "  var dyn v = {\"k\": a};",
+               "  var dyn w = {\"k\": a};",
+               "  var dyn x = {\"k\": a};",
+               "  return {\"k\": a};",
                "}",
-               "assert(cleaf(runtime(\"hello\"))[0] == \"hello\");" }))
+               "assert(cleaf(runtime(\"hello\"))[\"k\"] == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b0)
         return false;   /* the container's island call did NOT run */
@@ -14752,18 +14754,18 @@ static bool jit_container()
         return false;
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
-     * island `[a]` (MakeArrayV) calls jit_exec_block; `var j = i + 1` is native.
-     * last = [a] each iteration -> [a], whose [0] is a. */
+     * island `{"k": a}` (MakeDictV) calls jit_exec_block; `var j = i + 1` is
+     * native. last = {"k": a} each iteration, whose ["k"] is a. */
     const unsigned long b1 = g_jit_container_calls;
     if (!run({ "func lc(dyn a, int n) {",
-               "  var dyn last = [a];",
+               "  var dyn last = {\"k\": a};",
                "  for (var i = 0; i < n; i++) {",
-               "    last = [a];",
+               "    last = {\"k\": a};",
                "    var j = i + 1;",
                "  }",
                "  return last;",
                "}",
-               "assert(lc(runtime(\"hello\"), 5)[0] == \"hello\");" }))
+               "assert(lc(runtime(\"hello\"), 5)[\"k\"] == \"hello\");" }))
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
@@ -15145,6 +15147,15 @@ static bool jit_op_nativized()
             "  return len(b.items);",
             "}",
             "assert(f(Bag([], 0), 25) == 25);" } },
+        /* MakeArrayV: a per-iteration array LITERAL `[i, i * 2]` builds natively
+         * (jit_make_array -> build_array_from_values, flat int storage here). */
+        { OpCode::MakeArrayV, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) { var p = [i, i * 2]; s += p[1]; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(10)) == 90);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
