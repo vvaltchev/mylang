@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (36 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (43 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -410,7 +410,14 @@ non-POD `B(a,x)`, whose field-coerce throw carries the offending arg's POOLED
 caret that vm_raise's empty-loc-only stamp preserves) and `MakeStructArrayV`
 (`jit_make_struct_array` - the fused flat `array<PodStruct>` literal). All three
 throw only TypeErrorEx (a RuntimeException) from `coerce_struct_field`, so no
-exception-model change; none is op_fully_native - see their backlog entry.
+exception-model change; none is op_fully_native - see their backlog entry. And
+the **FOREACH ELEMENT/FIELD LOADS** - `LoadElemValue`, `LoadElemBool`, `StrLen`,
+`LoadStrChar`, `LoadStructFieldInt`, `LoadStructFieldFloat`, `LoadStructElemV`:
+each the interpreter's body, with the INDEX materialized cache-aware into a
+register BEFORE the call (so an N5-pinned foreach counter is read from its
+REGISTER, and the counter stays cacheable). All op_fully_native except
+LoadElemValue (it bounds-checks) - so a whole foreach body now DELETES its
+originals to one `enter.nat`. See their backlog entry for the shape traps.
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -665,6 +672,35 @@ to do LATER, separately (don't forget these):
   bump; the boxed ctor's PER-ARG caret (pointing at the offending arg, not the
   call) is byte-identical vm/nj/tw and catchable from inside a fragment, as is
   the checked-POD path.
+- **The FOREACH element/field LOADS** (LoadElemValue / LoadElemBool / StrLen /
+  LoadStrChar / LoadStructFieldInt / LoadStructFieldFloat / LoadStructElemV) —
+  DONE (2026-07-24). Six helpers (the struct-field pair shares one with an
+  `is_float` selector), each the interpreter's exact body. **The INDEX is passed
+  as a VALUE:** the emitter materializes the op's slot-or-literal `a` operand
+  with the cache-aware `load_operand` into rax BEFORE `emit_call_prologue` (which
+  pushes rdi + the cache regs but does not clobber rax), then movs it into the
+  arg register. That is what keeps the FOREACH COUNTER - the slot N5 most wants
+  to pin - a countable, cacheable int use instead of a disqualified one; the dst
+  and base are disqualified (the helper reads/writes them in memory). All are
+  op_fully_native EXCEPT **LoadElemValue**, which bounds-checks (it also serves
+  2-D `a[i][k]` reads whose index is not the loop counter): an OOB sets
+  g_vm_jit_exc LOC-LESS so EnterNative stamps the side-table caret
+  (byte-identical vm/nj/tw), and a non-general/non-str base BAILS so the
+  interpreter re-raises its InternalErrorEx identically.
+  **⛔ THREE SHAPE TRAPS these ops teach (all found by the per-op counter, none
+  visible to the differential):** since they are op_fully_native their
+  interpreted originals are DELETED, so `-vd`/`-vdj` show only the `enter.nat` -
+  **the runtime counter is the ONLY evidence**, exactly the standing rule. (1) The
+  struct ops need a PROVEN `array<S>` container; a `dyn` one routes to
+  ForeachDynInit/Next and never reaches them (my first test shapes used `dyn` and
+  the counters stayed 0). (2) `s += p.x` FUSES into StructFieldAddInt (#9), so a
+  field-read test must use a NON-accumulator body. (3) A body containing a BOXED
+  branch (`if (b == true)` -> JumpUnlessTrueV, still un-nativized) SPLITS the run
+  at the branch, leaving the loop's back edge outside the fragment - so only the
+  loop-ENTRY copy runs native and **the counter stops scaling with iterations**
+  (LoadElemBool bumped 1 for a 100-element array). With a branch-free body the
+  same loop bumps 50/50 and 26/26. That makes **JumpUnlessTrueV the next real
+  blocker for foreach loops** - it is worth more than any remaining load.
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
