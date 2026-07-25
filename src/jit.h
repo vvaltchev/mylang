@@ -245,6 +245,11 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst,
 extern "C" int jit_dict_load(int_type dst, int_type base_slot,
                              const EvalValue *key, int is_int) noexcept;
 
+/* model-flip (nativize-ops): MakeClosureV natively - create a closure +
+ * snapshot captures from the running ctx. `def` is the closure's
+ * program-lifetime FuncDescriptor* (baked as a value). Never throws. */
+extern "C" void jit_make_closure(int_type dst, const void *def) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is

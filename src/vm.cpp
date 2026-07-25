@@ -1908,6 +1908,20 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
  * into g_vm_jit_exc + return 1, so EnterNative re-raises stamping DictLoad's
  * caret from the loc side table (recorded by extract_locs). `is_int` selects
  * DictLoadInt vs Float; g_current_ctx->frame is the running callee frame. */
+/* model-flip (nativize-ops): the native MakeClosureV body - the interpreter's
+ * exact `frame[dst] = FuncObject(def, ctx)` (create the closure + snapshot the
+ * captures from the running ctx), byte-identical to FuncDeclStmt::do_eval for a
+ * lambda. `defv` is the closure's program-lifetime FuncDescriptor* (baked by the
+ * emitter as a value - the descriptor address is stable, like CallV's callee).
+ * A resolved closure's captures are defined, so the ctor never throws. */
+extern "C" void jit_make_closure(int_type dst, const void *defv) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    g_current_ctx->frame->at(dst).put(EvalValue(intrusive_ptr<FuncObject>(
+        make_intrusive<FuncObject>(def, g_current_ctx))));
+}
+
 extern "C" int jit_dict_load(int_type dst, int_type base_slot,
                              const EvalValue *key, int is_int) noexcept
 {

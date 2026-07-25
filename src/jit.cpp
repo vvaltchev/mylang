@@ -668,6 +668,11 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::DictLoadInt:
     case OpCode::DictLoadFloat:
         return true;
+    /* model-flip (nativize-ops): closure create via jit_make_closure (bakes the
+     * program-lifetime FuncDescriptor* value; snapshots captures). Never
+     * throws. */
+    case OpCode::MakeClosureV:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -974,6 +979,15 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target); bad(in.target2);
             if (!in.a_is_lit()) bad(in.a_slot());
             break;
+        case OpCode::MakeClosureV:
+            /* A closure SNAPSHOTS its capture sources from frame MEMORY, but
+             * the captured slots are the closure's (runtime) capture list - the
+             * emitter can't enumerate them to disqualify individually. An N5
+             * register-cached capture source (e.g. a hot loop accumulator the
+             * closure captures) would be STALE in memory when jit_make_closure
+             * reads it. So disable caching for the WHOLE run - a closure-create
+             * loop is not a hot int-arith loop where N5 matters. */
+            return {};
         case OpCode::StoreGlobalV:
             /* reads the rhs slot from memory (target is a GLOBAL slot). */
             bad(in.a_slot());
@@ -1544,6 +1558,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::MakeClosureV:
+        /* dst = FuncObject(def, ctx) via jit_make_closure (rdi=dst, rsi=def).
+         * def = the closure_defs[idx] FuncDescriptor* baked as a VALUE (a
+         * stable program-lifetime address, like CallV's callee). The helper
+         * uses g_current_ctx->frame, not the slots arg. Never throws. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI,
+                 reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_make_closure) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::StoreGlobalV: {
         /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd
          * from the slots base FIRST), then rdi = gslot (target) - which
@@ -1840,6 +1869,7 @@ static bool op_fully_native(OpCode op)
     case OpCode::StoreGlobalV:
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
+    case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
         return true;
     default:
         return false;

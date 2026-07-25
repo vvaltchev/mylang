@@ -14787,6 +14787,23 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(5)) == 50);" } },
+        /* MakeClosureV: a per-iteration closure that CAPTURES the hot loop
+         * accumulator `s`. Pins the N5 stale-cache bug: the capture snapshot
+         * must read `s` from memory AFTER any register-cached value is flushed
+         * (the fix disables caching for a run containing a MakeClosureV). g is
+         * live after the loop (g()), so the reassignment isn't DCE'd. */
+        { OpCode::MakeClosureV, {
+            "func f(int n) {",
+            "  var g = func() => 7;",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    g = func[s]() => s;",
+            "    s = s + i;",
+            "    s = s + i;",
+            "  }",
+            "  return s + g();",
+            "}",
+            "assert(f(runtime(4)) == 18);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
