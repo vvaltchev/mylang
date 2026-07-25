@@ -236,6 +236,15 @@ extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
 extern "C" void jit_arr_len(LValue *slots, int_type dst,
                             int_type base) noexcept;
 
+/* model-flip (nativize-ops): DictLoadInt/Float natively - the typed scalar dict
+ * read. `key` is a baked const-pool value (member `d.k`) or a lea'd key-temp
+ * slot (subscript `d[k]`). A missing key / non-dict base runs the shared
+ * Type::subscript LOC-LESS and, on throw, catches into g_vm_jit_exc + returns 1
+ * (EnterNative re-raises with the loc from the side table); returns 0 on the
+ * hot present-key path. `is_int` selects the DictLoadInt vs Float result. */
+extern "C" int jit_dict_load(int_type dst, int_type base_slot,
+                             const EvalValue *key, int is_int) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is

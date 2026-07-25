@@ -662,6 +662,12 @@ static bool jit_op_eligible(const Instr &in)
      * via jit_arr_len - a proven flat array, never throws. */
     case OpCode::ArrLen:
         return true;
+    /* model-flip (nativize-ops): typed dict scalar read d.k / d[k] via
+     * jit_dict_load. A missing key CAN throw (catch -> g_vm_jit_exc, exit_pc),
+     * so it is NOT op_fully_native. */
+    case OpCode::DictLoadInt:
+    case OpCode::DictLoadFloat:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -959,6 +965,14 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             /* dst written from memory; base (target2) holds an array reference,
              * never an int - both must stay in memory. */
             bad(in.target); bad(in.target2);
+            break;
+        case OpCode::DictLoadInt:
+        case OpCode::DictLoadFloat:
+            /* dst written from memory; base (target2) holds a dict reference;
+             * a subscript key temp (a_slot when !a_is_lit) is lea'd, so it must
+             * be current. A member key (a_is_lit) is a baked const, no slot. */
+            bad(in.target); bad(in.target2);
+            if (!in.a_is_lit()) bad(in.a_slot());
             break;
         case OpCode::StoreGlobalV:
             /* reads the rhs slot from memory (target is a GLOBAL slot). */
@@ -1501,6 +1515,34 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         return true;
+
+    case OpCode::DictLoadInt:
+    case OpCode::DictLoadFloat: {
+        /* d.k / d[k] via jit_dict_load(dst, base_slot, key, is_int). The key
+         * ptr (rdx) is computed FIRST while rdi still = slots: a member bakes
+         * &ck.consts[idx] (a_is_lit), a subscript leas &slot[a_slot]. Then rdi
+         * = dst (overwrites slots - OK now), rsi = base_slot, rcx = is_int.
+         * Throws -> test eax + exit_pc so EnterNative re-raises with the loc. */
+        emit_call_prologue(e);
+        if (in.a_is_lit())
+            e.movabs(RDX,
+                     reinterpret_cast<uint64_t>(&ck.consts[in.a_lit()]));
+        else
+            e.lea(RDX, static_cast<int32_t>(static_cast<long>(in.a_slot())
+                                            * static_cast<long>(sizeof(LValue))));
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RCX, in.op == OpCode::DictLoadInt ? 1u : 0u);
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_dict_load) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
+        e.exit_pc(pc);                        /* raised: EnterNative re-raises */
+        e.patch8(j_ok, e.pos());
+        return true;
+    }
 
     case OpCode::StoreGlobalV: {
         /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd

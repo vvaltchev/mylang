@@ -1898,6 +1898,43 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
         slots[base].get().get_ref<SharedArrayObj>().size())));
 }
 
+/* model-flip (nativize-ops): the native DictLoadInt/Float body - the typed
+ * scalar dict read d.k / d[k]. The KEY is baked by the emitter: a member's key
+ * is `&chunk.consts[idx]` (a const-pool value), a subscript's is `&slot[k]`
+ * (the key temp - EvalValue is the first LValue member), passed either way as
+ * `key`. A PRESENT key reads via dict_present_value (hot); a MISSING key /
+ * non-dict base runs the shared Type::subscript (the tree-walker's exact
+ * default-dict insert / KeyNotFoundEx / not-subscriptable) LOC-LESS -> caught
+ * into g_vm_jit_exc + return 1, so EnterNative re-raises stamping DictLoad's
+ * caret from the loc side table (recorded by extract_locs). `is_int` selects
+ * DictLoadInt vs Float; g_current_ctx->frame is the running callee frame. */
+extern "C" int jit_dict_load(int_type dst, int_type base_slot,
+                             const EvalValue *key, int is_int) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(
+        is_int ? OpCode::DictLoadInt : OpCode::DictLoadFloat)]++;
+#endif
+    EvalContext *ctx = g_current_ctx;
+    const EvalValue &base = ctx->frame->at(base_slot).get();
+    if (base.is<intrusive_ptr<DictObject>>())
+        if (const EvalValue *v = dict_present_value(
+                base.get_ref<intrusive_ptr<DictObject>>(), *key)) {
+            write_scalar_slot(ctx, dst, is_int != 0, *v);
+            return 0;
+        }
+    LValue &dlv = ctx->frame->at(base_slot);
+    try {
+        EvalValue r = base.get_type()->subscript(EvalValue(&dlv), *key, false);
+        write_scalar_slot(ctx, dst, is_int != 0,
+                          r.is<LValue *>() ? r.get<LValue *>()->get() : r);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
  * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
  * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws
