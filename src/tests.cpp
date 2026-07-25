@@ -15386,6 +15386,36 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime({\"a\": 5, \"b\": 6})) == 11);" } },
+        /* The THROWING generic-IntBin arms (div/mod/reg-shifts) - emitted
+         * INLINE (cqo+idiv / the shared reg-shift core); only these arms bump
+         * the IntBin counter (the non-throwing arms don't), so the counter
+         * attributes precisely. Division/mod stay generic IntBin (no
+         * specialized shape); `1 << i` is the lit-first generic shl; `>>>`
+         * has no specialized shape at all. */
+        { OpCode::IntBin, {
+            "func f(int n, int c) {",
+            "  var s = 0;",
+            "  for (var i = 1; i <= n; i++) s = s + i / c + i % c;",
+            "  return s;",
+            "}",
+            "assert(f(runtime(10), 3) == 25);" } },
+        { OpCode::IntBin, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + (1 << i) + (s >>> i);",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 31);" } },
+        /* the div0 RAISE path (JR_DIV0), script-caught: the fragment stores
+         * the kind + exits, EnterNative raises DivisionByZeroEx (caret from
+         * the loc side table) and the same-frame handler catches it. */
+        { OpCode::IntBin, {
+            "func f(int a, int c) {",
+            "  var r = 0;",
+            "  try { r = a / c; } catch (DivisionByZeroEx) { r = 77; }",
+            "  return r;",
+            "}",
+            "assert(f(9, runtime(0)) == 77);" } },
         /* The iterator THROW paths, script-caught: a non-container init and a
          * strict-unpack next each ride g_vm_jit_exc out of the fragment and
          * dispatch to the same-frame handler. */

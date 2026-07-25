@@ -4442,6 +4442,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                         kind == JR_OOB
                           ? std::unique_ptr<RuntimeException>(
                                 new OutOfBoundsEx())
+                          : kind == JR_DIV0
+                          ? std::unique_ptr<RuntimeException>(
+                                new DivisionByZeroEx())
                           : std::unique_ptr<RuntimeException>(
                                 new InvalidValueEx("negative shift count"))))
                     return;                    /* boundary: signal set */

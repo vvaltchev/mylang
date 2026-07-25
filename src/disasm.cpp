@@ -545,10 +545,17 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     case 0xF7: { modrm(regf, rm);
         o << ((regf & 7) == 7 ? "idiv " : "f7/? ") << rm; break; }
     case 0xC1: { modrm(regf, rm); const uint8_t imm = c[p++];
-        o << ((regf & 7) == 4 ? "shl " : "sar ") << rm << ", " << int(imm);
+        o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
+          << rm << ", " << int(imm);
         break; }
+    case 0xC7: { modrm(regf, rm);   /* /0: mov r/m, imm32 (emit_raise's
+                                     * kind store `mov dword [rax], kind`) */
+        uint32_t imm = 0;
+        for (int i = 0; i < 4; i++) imm |= uint32_t(c[p++]) << (8 * i);
+        o << "mov " << rm << ", " << int(imm); break; }
     case 0xD3: { modrm(regf, rm);
-        o << ((regf & 7) == 4 ? "shl " : "sar ") << rm << ", cl"; break; }
+        o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
+          << rm << ", cl"; break; }
     case 0xFF: { modrm(regf, rm);   /* group 5: /0 inc /1 dec /2 call
                                      * /4 jmp /6 push (the reg field is the
                                      * opcode extension, NOT a register) */

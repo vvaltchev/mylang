@@ -150,7 +150,7 @@ size_t jit_enter(const void *frag, void *slots);
  * op - it stores a raise KIND here and returns the op's pc; the EnterNative
  * handler then raises the matching exception via vm_raise (exact caret from
  * the loc table, no re-run). JR_NONE (0) on a normal fragment exit. */
-enum JitRaiseKind { JR_NONE = 0, JR_OOB = 1, JR_NEG_SHIFT = 2 };
+enum JitRaiseKind { JR_NONE = 0, JR_OOB = 1, JR_NEG_SHIFT = 2, JR_DIV0 = 3 };
 extern int g_vm_jit_raise;
 
 /* Approach A (container-store helper ops, plans/native-aot.md): a native
