@@ -634,6 +634,11 @@ static bool jit_op_eligible(const Instr &in)
      * originals - like the store ops. */
     case OpCode::SubscriptV:
         return true;
+    /* model-flip (nativize-ops): a member READ base.member via jit_member (the
+     * shared member_read_core; throws -> exit -> EnterNative re-raises). Not
+     * op_fully_native (it can bail on a throw). */
+    case OpCode::MemberV:
+        return true;
     /* model-flip (nativize-ops): load a builtin value into a slot via
      * jit_load_builtin (a trivial value, never throws -> op_fully_native). */
     case OpCode::LoadBuiltinV:
@@ -931,6 +936,10 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::SubscriptV:
             /* the fragment leas &slot for base/idx/dst - all must be current. */
             bad(in.target2); bad(in.a_slot()); bad(in.target);
+            break;
+        case OpCode::MemberV:
+            /* leas &slot for base/dst (the member key is baked, not a slot). */
+            bad(in.target2); bad(in.target);
             break;
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
@@ -1462,6 +1471,29 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
         const size_t j_ok = e.j8(0x74);     /* jz ok (0 = no throw) */
+        e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
+        e.patch8(j_ok, e.pos());
+        return true;
+    }
+
+    case OpCode::MemberV: {
+        /* dst = base.member via jit_member(base*, dst*, mk) - SysV rdi=base,
+         * rsi=dst, rdx=mk. mk = &ck.member_keys[a_lit] (the pool BUFFER addr,
+         * stable across the chunk move). rdi (base) set LAST. */
+        const auto off = [](int slot) {
+            return static_cast<int32_t>(static_cast<long>(slot)
+                                        * static_cast<long>(sizeof(LValue)));
+        };
+        emit_call_prologue(e);
+        e.lea(RSI, off(in.target));         /* rsi = &slot[dst] */
+        e.movabs(RDX, reinterpret_cast<uint64_t>(&ck.member_keys[in.a_lit()]));
+        e.lea_rdi(off(in.target2));         /* rdi = &slot[base] (LAST) */
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_member) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);             /* test eax, eax */
+        const size_t j_ok = e.j8(0x74);
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
         e.patch8(j_ok, e.pos());
         return true;

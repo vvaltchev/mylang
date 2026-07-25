@@ -204,6 +204,17 @@ extern "C" void jit_load_builtin(LValue *slots, int_type dst,
 extern "C" void jit_load_const(LValue *slots, int_type dst,
                                const EvalValue *src) noexcept;
 
+/* model-flip (nativize-ops): MemberV natively - `dst = base.member` via the
+ * shared member_read_core (struct field / const / dict key / optional). `base`
+ * is the base slot's EvalValue*, `dst` the dst slot LValue*, `mk` a baked
+ * `&chunk.member_keys[idx]` (the member-key pool BUFFER address, void* since
+ * Chunk::MemberKey is a nested type). CAN throw (missing field/key) -> caught
+ * loc-less (the caret is already on the exception, from the member key's
+ * carets) into g_vm_jit_exc, reported by a non-0 return; EnterNative re-raises
+ * (the existing loc is preserved). */
+extern "C" int jit_member(const EvalValue *base, LValue *dst,
+                          const void *mk) noexcept;
+
 /*
  * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
  * ReturnV runs IN the fragment. The fragment flushes its register cache and
