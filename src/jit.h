@@ -222,6 +222,12 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
  * (it throws on an undefined slot + runs num_bin_op). */
 extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
 
+/* model-flip (nativize-ops): runtime coverage - bumped by every nativized-op
+ * helper (jit_move/jit_subscript/...), proving native code for those ops
+ * actually RAN (not merely that the op is jit_op_eligible / classified native
+ * in the hypothetical container view). Read by a `jit:` test. */
+extern unsigned long g_jit_op_calls;
+
 /*
  * #55 native calls (plans/native-call-impl.md): a fully-native LEAF body's
  * ReturnV runs IN the fragment. The fragment flushes its register cache and
