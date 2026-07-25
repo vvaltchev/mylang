@@ -14676,47 +14676,100 @@ static bool jit_container()
 #endif
 }
 
-/* model-flip (nativize-ops): PROVE the nativized-op helpers actually RUN (not
- * merely that the op is jit_op_eligible / native in the hypothetical container
- * view - the "prove the code ran" rule). A general subscript `a[i]` on a dyn
- * base is a SubscriptV; in a loop it lands in a fragment and calls jit_subscript
- * per iteration, so g_jit_op_calls must bump. */
+/* model-flip (nativize-ops): PROVE EACH nativized op's native code actually
+ * RUNS (the "prove the code ran" rule per-op - a differential pass only proves
+ * the RESULT is right, which the interpreter could produce; this proves the
+ * NATIVE path executed). Per op: run a loop that exercises it, assert the
+ * result (an `assert` in the program) AND that its per-op counter g_jit_op_run[
+ * op] bumped (so the op landed in a fragment and its jit_* helper was called).
+ * If a counter fails to bump, the op is nativized but NOT actually emitted/run
+ * in that shape - a real gap this test surfaces. */
 static bool jit_op_nativized()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
     if (!g_jit_enabled)
         return true;
-    const unsigned long b0 = g_jit_op_calls;
-    std::string src;
-    std::vector<Tok> toks;
-    for (const char *l : {
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    struct Case { OpCode op; std::vector<const char *> src; };
+    const std::vector<Case> cases = {
+        /* MoveV: two dyn slot copies in the loop body. */
+        { OpCode::MoveV, {
+            "func f(dyn a, int n) {",
+            "  var dyn s = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn t = a; s = t; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(42), 5) == 42);" } },
+        /* SubscriptV: a general (dyn-base) subscript per iteration. */
+        { OpCode::SubscriptV, {
             "func f(dyn a, int n) {",
             "  var dyn s = 0;",
             "  for (var i = 0; i < n; i++) s = s + a[i];",
             "  return s;",
             "}",
-            "assert(f(runtime([10, 20, 30, 40, 50]), 5) == 150);" }) {
-        if (!src.empty()) src += '\n';
-        src += l;
+            "assert(f(runtime([10, 20, 30, 40, 50]), 5) == 150);" } },
+        /* MemberV: a general (dyn-base) member read per iteration. */
+        { OpCode::MemberV, {
+            "struct P { int x; }",
+            "func f(dyn p, int n) {",
+            "  var dyn s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + p.x;",
+            "  return s;",
+            "}",
+            "assert(f(runtime(P(7)), 5) == 35);" } },
+        /* LoadConstV: a const-pool value materialized per iteration. */
+        { OpCode::LoadConstV, {
+            "func f(int n) {",
+            "  var dyn s = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn c = \"ab\"; s = c; }",
+            "  return len(s);",
+            "}",
+            "assert(f(runtime(5)) == 2);" } },
+        /* LoadBuiltinV: a builtin loaded as a value per iteration. */
+        { OpCode::LoadBuiltinV, {
+            "func f(dyn a, int n) {",
+            "  var dyn r = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn g = len; r = g(a); }",
+            "  return r;",
+            "}",
+            "assert(f(runtime([1, 2, 3]), 5) == 3);" } },
+        /* StoreGlobalV: a plain global store per iteration. */
+        { OpCode::StoreGlobalV, {
+            "var gg = 0;",
+            "func f(int n) { for (var i = 0; i < n; i++) gg = i * i; return gg; }",
+            "assert(f(8) == 49);" } },
+    };
+    for (const Case &c : cases) {
+        const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
+        if (!run(c.src))
+            return false;   /* wrong result (the program's assert threw) */
+        if (g_jit_op_run[static_cast<size_t>(c.op)] <= b)
+            return false;   /* the op's NATIVE code did NOT run - a real gap */
     }
-    lexer(src, 1, toks);
-    const ExecEngine saved = g_exec_engine;
-    g_exec_engine = ExecEngine::Vm;
-    bool ok = true;
-    try {
-        ParseContext pc(TokenStream(toks), true);
-        unique_ptr<Construct> root = pBlock(pc);
-        mark_implicit_globals(root.get(), {});
-        infer_types(root.get(), true);
-        run_optimizers(root.get());
-        vm_execute(root.get());
-    } catch (...) {
-        ok = false;
-    }
-    g_exec_engine = saved;
-    if (!ok)
-        return false;
-    return g_jit_op_calls > b0;   /* jit_subscript actually ran natively */
+    return true;
 #else
     return true;
 #endif

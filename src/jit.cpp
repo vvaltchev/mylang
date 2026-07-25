@@ -1960,17 +1960,23 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         const OpCode op = chunk.code[p].op;
         if (op == OpCode::CallV || op == OpCode::CachedCallV)
             return false;                  /* M5 territory */
-        if (op_is_simple_island(op)) {
-            if (!in_island) { islands.push_back({ p, p + 1 }); in_island = true; }
-            else islands.back().second = p + 1;
-        } else {
+        /* op_run_eligible FIRST (native) - an op that the JIT can emit is NATIVE
+         * in the container, NOT an island. This ORDER is load-bearing: a
+         * newly-nativized op (MoveV/LoadConstV/...) is ALSO in the stale
+         * op_is_simple_island whitelist, and checking that first would classify
+         * it an island (run interpreted via vm_exec_block, its jit_* helper
+         * NEVER called) - a verified bug the g_jit_op_run counter caught. */
+        if (op_run_eligible(chunk.code[p], jc)) {
             in_island = false;
-            if (!op_run_eligible(chunk.code[p], jc))
-                return false;              /* non-native (boxed branch) -> decline*/
             if (op_is_branch(op))
                 has_branch = true;         /* M4: a native loop/if */
             if (op == OpCode::ReturnV && p != n - 1)
                 return false;
+        } else if (op_is_simple_island(op)) {   /* a boxed op -> vm_exec_block */
+            if (!in_island) { islands.push_back({ p, p + 1 }); in_island = true; }
+            else islands.back().second = p + 1;
+        } else {
+            return false;                  /* boxed branch / handler -> decline */
         }
     }
     if (islands.empty())

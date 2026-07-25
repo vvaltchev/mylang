@@ -5122,6 +5122,33 @@ island's pc span + its distinct un-nativizable opcodes (the "what to nativize
 next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
 `plans/model-flip.md`.
 
+> **⛔ VERIFY NATIVE EMISSION AND EXECUTION WITH HARD EVIDENCE — DON'T ASSUME
+> "IT WORKS" (maintainer, 2026-07-21). ⛔** When you nativize a VM op (add it to
+> `jit_op_eligible` + an `emit_op` case) or emit ANY new machine code, you have
+> NOT finished until you have PROVEN, with hard evidence, that (1) the native
+> instructions you expect are actually EMITTED, and (2) they are actually
+> EXECUTED at runtime. **Be pessimistic: assume it does NOT work until the
+> evidence says otherwise beyond any doubt — VERY OFTEN it doesn't.** A passing
+> differential (`-tw` == `-vm`) proves only the RESULT is right, which the
+> INTERPRETER can produce — it does NOT prove your native code ran. The trap
+> that motivated this rule: six ops were "nativized" and claimed to "shrink
+> islands to 0", but a per-op runtime counter revealed FOUR of the six never
+> executed in common loop shapes (an op isolated by a boxed neighbour is
+> sub-`MIN_RUN` → no fragment → interpreted; the container gate's stale
+> `op_is_simple_island` whitelist classifies `MoveV`/`LoadConstV` as ISLANDS, so
+> their `jit_*` helpers are never called; and a `SubscriptV` container was
+> byte-identical to a `MemberV` one that ran, yet `SubscriptV` executed 0 times —
+> an unresolved discrepancy). The "island-op occurrences → 0" claim was the M1
+> container-plan (ELIGIBILITY) view — hypothetical, since the model isn't
+> flipped — NOT execution. **How to get the evidence, every time:** a PER-OP
+> runtime coverage counter (`g_jit_op_run[op]`, bumped inside the helper) + a
+> `jit:` TEST that runs a loop exercising the op and asserts BOTH the result AND
+> that the counter bumped; `-vdj` to read the actual emitted machine code;
+> `MYLANG_JITOPS`-style instrumentation to see per-op call counts on real
+> benches. If the counter doesn't bump, the op is nativized-but-dead — a real
+> gap, not a nitpick. This is the per-op form of the "prove the code ran" HARD
+> RULE (see *Benchmarks*); apply it to EVERY native-codegen change.
+
 **THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
 (`plans/model-flip.md`, M1-M4a landed).** The endgame inversion of the JIT: flip
 "BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
