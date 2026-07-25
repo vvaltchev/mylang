@@ -632,15 +632,17 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
  * failing NotLValue at the FINAL step. A throw AT a step (OOB / KeyNotFound /
  * TypeError) carries THAT step's node loc - byte-identical to the
  * tree-walker's per-node stamp (an internal throw is loc-less). */
+/* `mkeys` = chunk.member_keys.data() (the buffer, not the whole chunk) - so the
+ * JIT can bake it (a stable pool address) instead of a &chunk that dangles. */
 static void
-vm_chain_walk(EvalContext &ctx, const Chunk &chunk, EvalValue &cur,
+vm_chain_walk(EvalContext &ctx, const Chunk::MemberKey *mkeys, EvalValue &cur,
               const std::vector<Chunk::ChainStep> &steps, size_t upto)
 {
     for (size_t i = 0; i < upto; i++) {
         const Chunk::ChainStep &step = steps[i];
         try {
             if (step.is_member) {
-                const Chunk::MemberKey &mk = chunk.member_keys[step.operand];
+                const Chunk::MemberKey &mk = mkeys[step.operand];
                 const EvalValue cval =
                     cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
                 /* for_write=false: an intermediate member is READ to walk into.
@@ -669,14 +671,17 @@ vm_chain_walk(EvalContext &ctx, const Chunk &chunk, EvalValue &cur,
     }
 }
 
+/* Takes the steps vector + the member_keys buffer directly (not chunk +
+ * steps_idx), so the JIT can bake both pool addresses (a &chunk would dangle). */
 static ML_NOINLINE void
-vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
-                         int_type steps_idx, const EvalValue &value, Op op)
+vm_chain_lvalue_store_op(EvalContext &ctx,
+                         const std::vector<Chunk::ChainStep> &steps,
+                         const Chunk::MemberKey *mkeys, LValue *base,
+                         const EvalValue &value, Op op)
 {
-    const std::vector<Chunk::ChainStep> &steps = chunk.chain_steps[steps_idx];
     const size_t n = steps.size();
     EvalValue cur = EvalValue(base);
-    vm_chain_walk(ctx, chunk, cur, steps, n - 1);
+    vm_chain_walk(ctx, mkeys, cur, steps, n - 1);
 
     const Chunk::ChainStep &last = steps[n - 1];   /* node = the whole lvalue */
     try {
@@ -687,7 +692,7 @@ vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
             throw NotLValueEx(last.lstart, last.lend);
         LValue *curlv = cur.get<LValue *>();
         if (last.is_member) {
-            const Chunk::MemberKey &mk = chunk.member_keys[last.operand];
+            const Chunk::MemberKey &mk = mkeys[last.operand];
             /* A DICT member store `d.f = v` IS `d["f"] = v` (auto-vivify on a
              * plain assign; KeyNotFound on a compound of a missing key) - route
              * it through vm_subscript_store with the member name as the key, as
@@ -730,7 +735,7 @@ vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
         cur = EvalValue(
             vm_store_base(ctx, in.a_lit(), in.target2, chunk, pc, nullptr));
 
-    vm_chain_walk(ctx, chunk, cur, steps, n - 1);
+    vm_chain_walk(ctx, chunk.member_keys.data(), cur, steps, n - 1);
 
     const Chunk::ChainStep &last = steps[n - 1];
     EvalValue memId;
@@ -1889,6 +1894,109 @@ extern "C" int jit_store_member(int_type kind, int_type base_slot,
             e.loc_start = mk->mstart;
             e.loc_end = mk->mend;
         }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreElem2V - a 2-level nested store
+ * `a[i][j] = v` / `a[i][j] OP= v` (read a[i] as a ref, store [j] into it), the
+ * interpreter's exact vm_nested_subscript_store. The base `a` is a LOCAL frame
+ * slot (no kind); k1/k2/val are frame slots; `locs` = chunk.chain_locs[idx].data()
+ * (the per-step carets, baked - so an intermediate a[i] OOB and the final store
+ * carry their OWN subscript loc). vm_nested_subscript_store throws only
+ * RuntimeExceptions (OOB/KeyNotFound/TypeError/NotLValue), already carrying their
+ * per-step caret -> caught into g_vm_jit_exc + re-raised. NOT op_fully_native.
+ */
+extern "C" int jit_store_elem2(int_type base_slot, int_type k1_slot,
+                               int_type k2_slot, int_type val_slot,
+                               int_type aop, const void *locsv) noexcept
+{
+    ML_JIT_OP_RAN(StoreElem2V);
+    const std::pair<Loc, Loc> *locs =
+        static_cast<const std::pair<Loc, Loc> *>(locsv);
+    EvalContext *ctx = g_current_ctx;
+    LValue &alv = ctx->frame->at(base_slot);
+    const EvalValue &k1 = ctx->frame->at(k1_slot).get();
+    const EvalValue &k2 = ctx->frame->at(k2_slot).get();
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_nested_subscript_store(&alv, k1, k2, val, static_cast<Op>(aop), locs);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreElemChainV - a GENERIC N-level
+ * nested store `a[k0][k1]...[kn] = v`, the interpreter's exact vm_chain_store_op
+ * (walk the `nkeys` key values from the run [kbase, +nkeys) + store). The base
+ * may be GLOBAL/CAPTURE (`kind`); `cl` = &chunk.chain_locs[idx] (baked - the
+ * helper reads cl->data()/size() = the per-step carets + nkeys). An undefined-
+ * global base BAILS; vm_chain_store_op throws only RuntimeExceptions (each
+ * carrying its per-step caret) -> g_vm_jit_exc -> re-raise. NOT op_fully_native.
+ */
+extern "C" int jit_store_elem_chain(int_type kind, int_type base_slot,
+                                    int_type kbase, int_type val_slot,
+                                    int_type aop, const void *clv) noexcept
+{
+    ML_JIT_OP_RAN(StoreElemChainV);
+    const std::vector<std::pair<Loc, Loc>> *cl =
+        static_cast<const std::vector<std::pair<Loc, Loc>> *>(clv);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *base = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                 : kind == 2 ? &(*ctx->captures)[base_slot]
+                             : &ctx->frame->at(base_slot);
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_chain_store_op(*ctx, base, kbase, cl->data(), cl->size(), val,
+                          static_cast<Op>(aop));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreLValueChainV - a GENERAL nested
+ * lvalue-chain store `base.step1.step2... = v` mixing MEMBER + SUBSCRIPT steps,
+ * the interpreter's exact vm_chain_lvalue_store_op (walk the steps as lvalue
+ * refs, store the final). The base may be GLOBAL/CAPTURE (`kind`); `steps` =
+ * &chunk.chain_steps[idx] and `mkeys` = chunk.member_keys.data() are baked (the
+ * refactored vm_chain_lvalue_store_op takes both pool pointers, not the &chunk
+ * that would dangle). An undefined-global base BAILS; the chain walk throws only
+ * RuntimeExceptions (each step stamps its own caret; a still-loc-less throw is
+ * re-stamped by EnterNative from the loc side table, matching the interpreted
+ * outer catch) -> g_vm_jit_exc -> re-raise. NOT op_fully_native.
+ */
+extern "C" int jit_store_lvalue_chain(int_type kind, int_type base_slot,
+                                      int_type val_slot, int_type aop,
+                                      const void *stepsv,
+                                      const void *mkeysv) noexcept
+{
+    ML_JIT_OP_RAN(StoreLValueChainV);
+    const std::vector<Chunk::ChainStep> *steps =
+        static_cast<const std::vector<Chunk::ChainStep> *>(stepsv);
+    const Chunk::MemberKey *mkeys =
+        static_cast<const Chunk::MemberKey *>(mkeysv);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *base = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                 : kind == 2 ? &(*ctx->captures)[base_slot]
+                             : &ctx->frame->at(base_slot);
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_chain_lvalue_store_op(*ctx, *steps, mkeys, base, val,
+                                 static_cast<Op>(aop));
+    } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -4104,7 +4212,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                          *chunk, pc, nullptr);
             const EvalValue &val = ctx.frame->at(in->target).get();
             try {
-                vm_chain_lvalue_store_op(ctx, *chunk, base, in->a_dual_lo(), val,
+                vm_chain_lvalue_store_op(ctx, chunk->chain_steps[in->a_dual_lo()],
+                                         chunk->member_keys.data(), base, val,
                                          in->aop);
             } catch (Exception &e) {
                 if (!e.loc_start)

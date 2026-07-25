@@ -190,6 +190,24 @@ extern "C" int jit_store_member(int_type kind, int_type base_slot,
                                 int_type val_slot, int_type aop,
                                 const void *mk) noexcept;
 
+/* The nested-chain stores. StoreElem2V a[i][j]=v: LOCAL base + k1/k2/val slots +
+ * `locs` = chunk.chain_locs[idx].data() (the per-step carets). StoreElemChainV
+ * a[k0..kn]=v: `kind` base + kbase (key run) + `cl` = &chunk.chain_locs[idx].
+ * StoreLValueChainV base.step..=v (mixed member/subscript): `kind` base +
+ * `steps` = &chunk.chain_steps[idx] + `mkeys` = chunk.member_keys.data(). Same
+ * return convention (0 ok / 1 exit: an undefined-global base bails, a store
+ * RuntimeException in g_vm_jit_exc). */
+extern "C" int jit_store_elem2(int_type base_slot, int_type k1_slot,
+                               int_type k2_slot, int_type val_slot,
+                               int_type aop, const void *locs) noexcept;
+extern "C" int jit_store_elem_chain(int_type kind, int_type base_slot,
+                                    int_type kbase, int_type val_slot,
+                                    int_type aop, const void *cl) noexcept;
+extern "C" int jit_store_lvalue_chain(int_type kind, int_type base_slot,
+                                      int_type val_slot, int_type aop,
+                                      const void *steps,
+                                      const void *mkeys) noexcept;
+
 /*
  * model-flip (nativize-ops): MoveV natively - `slots[dst] = slots[src].get()`,
  * the interpreter's EXACT MoveV (an alias-copy, ref-aware via LValue::put; never

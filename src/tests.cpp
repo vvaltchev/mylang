@@ -15023,6 +15023,32 @@ static bool jit_op_nativized()
             "  return p.x;",
             "}",
             "assert(f(P(0, 0), 5) == 8);" } },
+        /* StoreElem2V: a 2-level nested store `a[i][j] = v` each iteration runs
+         * native (jit_store_elem2 -> vm_nested_subscript_store). */
+        { OpCode::StoreElem2V, {
+            "func f(dyn a, int n) {",
+            "  for (var i = 0; i < n; i++) a[i][0] = i * 2;",
+            "  return a[2][0];",
+            "}",
+            "assert(f(runtime([[0], [0], [0]]), 3) == 4);" } },
+        /* StoreElemChainV: a GENERIC N-level nested store `a[i][0][0] = v`
+         * (3 levels) runs native (jit_store_elem_chain -> vm_chain_store_op). */
+        { OpCode::StoreElemChainV, {
+            "func f(dyn a, int n) {",
+            "  for (var i = 0; i < n; i++) a[i][0][0] = i * 2;",
+            "  return a[2][0][0];",
+            "}",
+            "assert(f(runtime([[[0]], [[0]], [[0]]]), 3) == 4);" } },
+        /* StoreLValueChainV: a mixed subscript+member store `a[i].x = v` on a
+         * BOXED struct runs native (jit_store_lvalue_chain -> the refactored
+         * vm_chain_lvalue_store_op with the baked chain_steps + member_keys). */
+        { OpCode::StoreLValueChainV, {
+            "struct B { dyn x; }",
+            "func f(dyn a, int n) {",
+            "  for (var i = 0; i < n; i++) a[i].x = i * 2;",
+            "  return a[2].x;",
+            "}",
+            "assert(f(runtime([B(0), B(0), B(0)]), 3) == 4);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
