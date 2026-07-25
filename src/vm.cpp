@@ -2044,6 +2044,50 @@ extern "C" void jit_boxed_log(const void *bop) noexcept
         EvalValue(bo->aop == Op::land ? (a && b) : (a || b)));
 }
 
+/* model-flip (nativize-ops): the native UnaryV body - boxed unary over a
+ * dyn/general operand (Expr02::do_eval: clone the operand, apply). `-str`/`~str`
+ * throw a type error via the Type vtable -> caught into g_vm_jit_exc + return 1
+ * (EnterNative re-raises with the operand caret from the loc side table).
+ * Reuses the boxed_ops pool (1-operand: target/a/aop, b unused). */
+extern "C" int jit_unary(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(UnaryV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue s;
+    EvalValue v = boxed_operand(bo->a, ctx, s).clone();
+    try {
+        switch (bo->aop) {
+        case Op::plus:
+            if (v.is<bool>())
+                v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+            break;
+        case Op::minus:
+            if (v.is<bool>())
+                v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+            v.get_type()->opneg(v);
+            break;
+        case Op::lnot:
+            v = EvalValue(!v.is_true());
+            break;
+        case Op::bnot:
+            if (v.is<bool>())
+                v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+            v.get_type()->bnot(v);
+            break;
+        default:
+            break;                     /* unreachable: codegen emits a valid
+                                        * unary aop only (the interpreter's
+                                        * InternalErrorEx default is dead) */
+        }
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(std::move(v));
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native CoerceNumV body - the typed-store
  * numeric coerce (the coerces_dyn accumulator's plain assign): widen
  * float<-int/bool, int<-bool, pass none, THROW TypeError on a non-fitting dyn

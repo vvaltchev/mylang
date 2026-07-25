@@ -681,6 +681,8 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::BinOpV:
     case OpCode::CmpV:
     case OpCode::CompoundV:
+    /* UnaryV: boxed unary (`-str`/`~str` throw). Same boxed_ops pool. */
+    case OpCode::UnaryV:
         return in.target2 >= 0;
     /* LogV (eager && / ||): is_true() never throws -> op_fully_native. Same
      * boxed_ops pool (target2 = the index). */
@@ -1013,6 +1015,10 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * int-scalar cache candidate anyway, but disqualify defensively). */
             if (!in.a_is_lit()) bad(in.a_slot());
             if (!in.b_is_lit()) bad(in.b_slot());
+            bad(in.target);
+            break;
+        case OpCode::UnaryV:         /* 1-operand boxed: a_slot + dst */
+            if (!in.a_is_lit()) bad(in.a_slot());
             bad(in.target);
             break;
         case OpCode::CompoundV:
@@ -1613,15 +1619,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::BinOpV:
     case OpCode::CmpV:
-    case OpCode::CompoundV: {
-        /* jit_boxed_*(bop) where bop = &ck.boxed_ops[in.target2] (a stable
-         * pool-buffer address; build_boxed_ops stored the index in target2).
-         * rdi = bop. vm_num_binop can throw -> test eax + exit_pc so
-         * EnterNative re-raises with the op's caret from the loc side table. */
+    case OpCode::CompoundV:
+    case OpCode::UnaryV: {
+        /* jit_boxed_* / jit_unary (bop) where bop = &ck.boxed_ops[in.target2]
+         * (a stable pool-buffer address; build_boxed_ops stored the index in
+         * target2). rdi = bop. Can throw -> test eax + exit_pc so EnterNative
+         * re-raises with the op's caret from the loc side table. */
         const void *fn = in.op == OpCode::BinOpV
             ? reinterpret_cast<const void *>(jit_boxed_binop)
             : in.op == OpCode::CmpV
                 ? reinterpret_cast<const void *>(jit_boxed_cmp)
+            : in.op == OpCode::UnaryV
+                ? reinterpret_cast<const void *>(jit_unary)
                 : reinterpret_cast<const void *>(jit_boxed_compound);
         emit_call_prologue(e);
         e.movabs(RDI,
@@ -2113,9 +2122,16 @@ static constexpr size_t MIN_CONTAINER_ISLAND = 5;
 static bool op_is_simple_island(OpCode op)
 {
     switch (op) {
+    /* The simple boxed SCALAR ops are ALL op_run_eligible now (the nativize-ops
+     * path), so op_run_eligible (checked FIRST in the gate) wins - they never
+     * reach here as islands. They stay listed for documentation / a `-nj` build
+     * (where op_run_eligible is false). The one op here that is STILL boxed (not
+     * jit_op_eligible) is SliceV - the container gate's remaining island source,
+     * so the jit_exec_block mechanism (M2-M4) stays exercised. */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
     case OpCode::LoadConstV: case OpCode::CoerceNumV:
+    case OpCode::SliceV:
         return true;
     default:
         return false;

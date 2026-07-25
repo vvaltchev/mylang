@@ -262,6 +262,10 @@ extern "C" int jit_boxed_compound(const void *bop) noexcept;
 /* LogV (eager && / ||): is_true() never throws -> void (op_fully_native). */
 extern "C" void jit_boxed_log(const void *bop) noexcept;
 
+/* UnaryV (boxed unary -/~/!/+ over a dyn): reuses the boxed_ops pool. `-str`/
+ * `~str` throw -> g_vm_jit_exc + returns 1 (re-raise); 0 otherwise. */
+extern "C" int jit_unary(const void *bop) noexcept;
+
 /* model-flip (nativize-ops): CoerceNumV - the typed-store numeric coerce of a
  * dyn value (widen / pass-none / TypeError-throw). Fits in registers (dst +
  * src_slot + is_float flag), no pool. A throw catches into g_vm_jit_exc +

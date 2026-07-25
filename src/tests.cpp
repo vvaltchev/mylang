@@ -14585,11 +14585,11 @@ static bool jit_native_call()
  * calls bumps, the "prove the code ran" rule) with a correct result, AND that a
  * throw propagates + is catchable. dyn params keep the body boxed; the block
  * body keeps it above the inline threshold (so it stays a real call, not inlined
- * away); runtime() keeps the args non-const. The ISLAND op is `~dyn` (UnaryV) -
- * BinOpV/CmpV/CompoundV/MoveV are now NATIVE (the nativize-ops path), so the
- * boxed islands here use an op that is STILL boxed (UnaryV; unary `~` is never
- * M8-specialized). Straight-line containers need an island >= MIN_CONTAINER_
- * ISLAND, so subtest (1) chains 6 `~` (an even count -> identity for int). */
+ * away). The ISLAND op is a SLICE `a[i:j]` (SliceV) - as the nativize-ops path
+ * made BinOpV/CmpV/CompoundV/MoveV/LogV/UnaryV/CoerceNumV all NATIVE, SliceV is
+ * the container gate's remaining still-boxed island source. A straight-line
+ * container needs total island ops >= MIN_CONTAINER_ISLAND, so subtest (1)
+ * chains 6 slices (each its own 1-op island; total 6 >= 5). */
 static bool jit_container()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -14621,18 +14621,19 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a straight-line boxed-island container; correct result. Six `~` on a
-     * dyn = a 6-op UnaryV island (>= MIN_CONTAINER_ISLAND); ~~ is identity for
-     * an int, so an even count returns `a`. */
-    if (!run({ "func cleaf(dyn a, dyn b) {",
-               "  var dyn t = ~a;",
-               "  var dyn u = ~t;",
-               "  var dyn v = ~u;",
-               "  var dyn w = ~v;",
-               "  var dyn x = ~w;",
-               "  return ~x;",
+    /* (1) a straight-line boxed-island container; correct result. Six slices of
+     * a dyn string = six 1-op SliceV islands (total 6 >= MIN_CONTAINER_ISLAND).
+     * Returns a[0:1] = the first char. runtime() keeps the arg non-const so the
+     * pure call isn't folded away (else cleaf never runs -> no container). */
+    if (!run({ "func cleaf(dyn a) {",
+               "  var dyn t = a[0:2];",
+               "  var dyn u = a[0:2];",
+               "  var dyn v = a[0:2];",
+               "  var dyn w = a[0:2];",
+               "  var dyn x = a[0:2];",
+               "  return a[0:1];",
                "}",
-               "assert(cleaf(runtime(50), 50) == 50);" }))
+               "assert(cleaf(runtime(\"hello\")) == \"h\");" }))
         return false;
     if (g_jit_container_calls <= b0)
         return false;   /* the container's island call did NOT run */
@@ -14650,33 +14651,32 @@ static bool jit_container()
         return false;
     /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
      * (native ops + the for.step back edge) iterates in machine code, only the
-     * island `~a` (UnaryV) calls jit_exec_block; `s = s - b` is a native
-     * CompoundV. ~a = -a-1, so s -= ~a == s += a+1. Correct result. */
+     * island `a[0:2]` (SliceV) calls jit_exec_block; `var j = i + 1` is native.
+     * last = a[0:2] each iteration -> "he". */
     const unsigned long b1 = g_jit_container_calls;
-    if (!run({ "func lc(dyn s, int n) {",
+    if (!run({ "func lc(dyn a, int n) {",
+               "  var dyn last = a;",
                "  for (var i = 0; i < n; i++) {",
-               "    var a = i * 2;",
-               "    var dyn b = ~a;",
-               "    s = s - b;",
+               "    last = a[0:2];",
+               "    var j = i + 1;",
                "  }",
-               "  return s;",
+               "  return last;",
                "}",
-               "assert(lc(runtime(0), 5) == 25);" }))
+               "assert(lc(runtime(\"hello\"), 5) == \"he\");" }))
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
-    /* (4) model-flip M4b: MULTIPLE islands - an init `~x` (UnaryV) and a body
-     * `~a` (UnaryV), each its own `call jit_exec_block`. */
-    if (!run({ "func lc2(dyn x, int n) {",
-               "  var dyn s = ~x;",
+    /* (4) model-flip M4b: MULTIPLE islands - an init slice `a[0:1]` and a body
+     * slice `a[0:2]` (SliceV), each its own `call jit_exec_block`. */
+    if (!run({ "func lc2(dyn a, int n) {",
+               "  var dyn s = a[0:1];",
                "  for (var i = 0; i < n; i++) {",
-               "    var a = i * 2;",
-               "    var dyn b = ~a;",
-               "    s = s - b;",
+               "    s = a[0:2];",
+               "    var j = i + 1;",
                "  }",
                "  return s;",
                "}",
-               "assert(lc2(runtime(0), 5) == 24);" }))
+               "assert(lc2(runtime(\"hello\"), 5) == \"he\");" }))
         return false;
     return true;
 #else
@@ -14859,6 +14859,16 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(5)) == 15);" } },
+        /* UnaryV: a boxed (dyn) unary `~a` (unary ~ is never M8-specialized).
+         * ~5 = -6, accumulated 5x = -30. */
+        { OpCode::UnaryV, {
+            "func f(int n) {",
+            "  var dyn a = runtime(5);",
+            "  var dyn acc = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn r = ~a; acc += r; }",
+            "  return int(acc);",
+            "}",
+            "assert(f(runtime(5)) == -30);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

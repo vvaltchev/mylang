@@ -7589,7 +7589,8 @@ static void build_boxed_ops(Chunk &chunk)
 {
     for (Instr &in : chunk.code)
         if (in.op == OpCode::BinOpV || in.op == OpCode::CmpV
-                || in.op == OpCode::CompoundV || in.op == OpCode::LogV) {
+                || in.op == OpCode::CompoundV || in.op == OpCode::LogV
+                || in.op == OpCode::UnaryV) {
             in.target2 = static_cast<int>(chunk.boxed_ops.size());
             chunk.boxed_ops.push_back({ in.target, in.aop, in.a(), in.b() });
         }

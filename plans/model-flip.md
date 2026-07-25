@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (13 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (16 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -378,13 +378,32 @@ BinOpV/CmpV/CompoundV/MoveV are now NATIVE, so the jit_container test (which use
 them as boxed islands) had to switch to an op that is STILL boxed - the model
 flip working as intended (islands shrink; UnaryV/LogV/CoerceNumV remain).
 
+**Steps 12-14 - the LAST simple islands (LogV / CoerceNumV / UnaryV, DONE).**
+LogV (eager `&&`/`||`) + UnaryV (`-`/`~`/`!`/`+` on a dyn) reuse the boxed_ops
+pool (build_boxed_ops recognizes them; LogV is 2-operand, UnaryV 1-operand with
+b unused); LogV never throws (op_fully_native), UnaryV throws on `-str`/`~str`
+(caret from the loc side table - a PRE-EXISTING VM-vs-tw col difference, the JIT
+matches the VM interpreter). CoerceNumV (typed numeric coerce of a dyn) fits in
+registers (dst + src_slot + is_float flag; target2 is the flag, not free for a
+pool index) - throws on a bad narrow. With these, EVERY op in
+`op_is_simple_island` (BinOpV/CmpV/LogV/UnaryV/MoveV/CompoundV/LoadConstV/
+CoerceNumV) is now op_run_eligible - the container gate's simple-scalar niche is
+FULLY nativized. **The jit_container test's island shifted to a SLICE `a[i:j]`
+(SliceV)** - the only simple boxed op left that is NOT jit_op_eligible; added to
+`op_is_simple_island` (verified perf-safe: NO bench/sample forms a SliceV
+container - real slice code is inline in main, not a called leaf). LESSON
+RE-LEARNED (cost ~an hour): a container-test fn's call MUST use `runtime()` args
+or the auto-pure call is FOLDED at compile time and the fn never runs (its
+container commits but is dead) - `assert(lc("hi",5)==...)` folded to
+`assert(true)`, CC stayed 0. The vm_exec_block MECHANISM is also independently
+unit-tested (vm_exec_block_selftest).
+
 **Remaining top blockers (bench tally):** CallBuiltinV (~294 - the big one, but
 CALLS: a builtin call, some with callbacks that re-enter vm_dispatch → careful),
 Halt (83 - a void-function end; needs the return-none path, and the native_leaf
-predicate wants a trailing ReturnV so a Halt-ending body needs thought), the
-still-boxed unary/logical islands UnaryV / LogV / CoerceNumV (each could reuse
-the boxed_ops-pool pattern OR pass in registers - UnaryV is 1-operand, so it
-FITS in registers, no pool needed). GOTCHA: an op needing a CHUNK pool
+predicate wants a trailing ReturnV so a Halt-ending body needs thought). The
+simple scalar islands are EXHAUSTED - SliceV / LoadGlobalV / the container
+stores / calls are the remaining boxed ops, each a bigger step. GOTCHA: an op needing a CHUNK pool
 (LoadConstV/MemberV/LoadLiteralObjV/DictLoad-key/boxed-arith) can't bake
 `&chunk` (it dangles - the chunk is stack-built then moved) but CAN bake the
 pool's heap BUFFER address (`&vec[idx]`), which a vector move preserves
