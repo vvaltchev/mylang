@@ -14840,6 +14840,25 @@ static bool jit_op_nativized()
             "  return int(s);",
             "}",
             "assert(f(runtime(5)) == 15);" } },
+        /* LogV: a boxed (dyn) eager logical `a && b` used as a value. */
+        { OpCode::LogV, {
+            "func f(int n) {",
+            "  var dyn a = runtime(1); var dyn b = runtime(1);",
+            "  var dyn cnt = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn c = a && b; cnt += c; }",
+            "  return int(cnt);",
+            "}",
+            "assert(f(runtime(5)) == 5);" } },
+        /* CoerceNumV: the coerces_dyn accumulator - `s` is int, `s + d` is dyn
+         * (int OP dyn), coerced back into the int slot each iteration. */
+        { OpCode::CoerceNumV, {
+            "func f(int n) {",
+            "  var dyn d = runtime(3);",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + d;",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 15);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

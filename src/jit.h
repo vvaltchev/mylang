@@ -259,6 +259,15 @@ extern "C" void jit_make_closure(int_type dst, const void *def) noexcept;
 extern "C" int jit_boxed_binop(const void *bop) noexcept;
 extern "C" int jit_boxed_cmp(const void *bop) noexcept;
 extern "C" int jit_boxed_compound(const void *bop) noexcept;
+/* LogV (eager && / ||): is_true() never throws -> void (op_fully_native). */
+extern "C" void jit_boxed_log(const void *bop) noexcept;
+
+/* model-flip (nativize-ops): CoerceNumV - the typed-store numeric coerce of a
+ * dyn value (widen / pass-none / TypeError-throw). Fits in registers (dst +
+ * src_slot + is_float flag), no pool. A throw catches into g_vm_jit_exc +
+ * returns 1 (EnterNative re-raises with the Expr14 caret); 0 otherwise. */
+extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
+                              int is_float) noexcept;
 
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
