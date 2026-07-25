@@ -674,7 +674,30 @@ The order:
    11_closure_counter **0.971x**, 63_closures 0.985x; controls 1.0000.
    The residual jit_put_int/float/bool releases stay (a reference dst's
    release genuinely needs C++ - nothing left to inline there).
-7. **The exception family** (~14) - **ATTEMPTED 2026-07-25, REVERTED
+7. **The exception family** - **DONE (2026-07-25) as the INLINE forms**
+   per the recorded design below (the first, helper-call attempt is kept
+   for the record). PushHandler = inline capacity-check + `mov dword
+   [finish], remap[target]; add finish, 4` (cold grow ->
+   jit_push_handler_grow); PopHandler = `finish -= 4` (a trivial 4-byte
+   VmHandler - pop_back IS the decrement); SetPend / EndFinally = a byte
+   store / compare on records[rec_n-1].pend via the probed activation
+   layout (jit_addr_vm_act + handlers/records/rec_n offsets +
+   sizeof(VmCallRec) + ::pend; vector internals +0/+8/+16). EndFinally's
+   NORMAL path falls through inline, RERAISE bails. The COLD catch-region
+   ops (CatchTest/Reraise/Throw) are eligible as UNCONDITIONAL EXITS (the
+   ThrowRuntimeV pattern - they are only ever entered via vm_raise's
+   dispatch, already interpreted): their eligibility is what mattered,
+   they were the run SPLITTERS leaving a try loop's back edge crossing
+   fragments. MEASURED vs the clean base: 71_exc_no_throw **0.326x**,
+   72_exc_finally **0.287x**, 69_exc_crossframe 0.985; **the
+   throw-EVERY-iteration shapes REGRESS (70_exc_runtime_error +9.6%,
+   42_exceptions +2.7%)** - after each throw the interpreter resumes at
+   an INTERIOR pc of the merged run and cannot re-enter the fragment
+   until the loop head (the interior-entry limitation; the eventual fix
+   is per-pc fragment ENTRY POINTS). The trade: exceptional control flow
+   as the NORMAL path pays ~3-10%, the no-throw/finally paths gain
+   3-3.5x. Decoder: cmp r64,r/m64 (3B) + imul r,r/m,imm32 (69).
+   (The historical helper-call attempt record:) **ATTEMPTED 2026-07-25, REVERTED
    with a measured verdict + the fix design.** The helper-call form of
    PushHandler/PopHandler/SetPend (jit_push_handler / jit_pop_handler /
    jit_set_pend over g_vm_act; the pushed catch_pc = remap[target],

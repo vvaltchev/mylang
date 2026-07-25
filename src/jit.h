@@ -100,6 +100,17 @@ ptrdiff_t jit_off_desc_vm_chunk();      /* FuncDescriptor::vm_chunk */
 ptrdiff_t jit_off_chunk_native_base();  /* Chunk::native.base */
 ptrdiff_t jit_off_chunk_native_entry(); /* Chunk::native_entry_off */
 
+/* Step 7a (the INLINE exception ops): the activation-side layout (probed in
+ * vm.cpp) + the cold grow path of the inline PushHandler. */
+struct VmActivation;
+VmActivation **jit_addr_vm_act();       /* &g_vm_act (file-static) */
+ptrdiff_t jit_off_act_handlers();       /* VmActivation::handlers */
+ptrdiff_t jit_off_act_records();        /* VmActivation::records */
+ptrdiff_t jit_off_act_rec_n();          /* VmActivation::rec_n */
+ptrdiff_t jit_sizeof_vm_rec();          /* sizeof(VmCallRec) */
+ptrdiff_t jit_off_rec_pend();           /* VmCallRec::pend */
+extern "C" void jit_push_handler_grow(int_type catch_pc) noexcept;
+
 /* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
 class EvalContext;
 EvalContext **jit_addr_current_ctx();   /* &g_current_ctx (file-static) */

@@ -120,6 +120,13 @@ struct JitLayout {
     int ctx_gfuncs;       /* EvalContext::gfuncs (a GlobalFuncTable*) */
     int gft_slots;        /* GlobalFuncTable::slots (vector; data at +0) */
     int gft_defined;      /* GlobalFuncTable::defined (vector<char>) */
+    /* Step 7a (inline exception ops): the activation-side layout */
+    const void *addr_act; /* &g_vm_act */
+    int act_handlers;     /* VmActivation::handlers (vector<VmHandler>) */
+    int act_records;      /* VmActivation::records (vector<VmCallRec>) */
+    int act_rec_n;        /* VmActivation::rec_n (size_t) */
+    int rec_size;         /* sizeof(VmCallRec) */
+    int rec_pend;         /* VmCallRec::pend (a byte enum) */
     /* #55 STEP 2.1 native-call member offsets (via the vm.cpp probes) */
     int desc_vm_chunk;    /* FuncDescriptor::vm_chunk */
     int chunk_native_base;/* Chunk::native.base */
@@ -188,6 +195,12 @@ static const JitLayout &jit_layout()
         l.ctx_gfuncs = static_cast<int>(jit_off_ctx_gfuncs());
         l.gft_slots = static_cast<int>(jit_off_gft_slots());
         l.gft_defined = static_cast<int>(jit_off_gft_defined());
+        l.addr_act = jit_addr_vm_act();
+        l.act_handlers = static_cast<int>(jit_off_act_handlers());
+        l.act_records = static_cast<int>(jit_off_act_records());
+        l.act_rec_n = static_cast<int>(jit_off_act_rec_n());
+        l.rec_size = static_cast<int>(jit_sizeof_vm_rec());
+        l.rec_pend = static_cast<int>(jit_off_rec_pend());
         l.desc_vm_chunk = static_cast<int>(jit_off_desc_vm_chunk());
         l.chunk_native_base = static_cast<int>(jit_off_chunk_native_base());
         l.chunk_native_entry = static_cast<int>(jit_off_chunk_native_entry());
@@ -843,6 +856,43 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::IncDecElemCheckedV:
     case OpCode::IncDecMemberCheckedV:
     case OpCode::IncDecChainV:
+        return true;
+    /* Step 7a: the SIMPLE exception ops, INLINE (the helper-call form was
+     * measured +8% on the no-throw try path and reverted - the call
+     * protocol exceeded the dispatch it replaced for a 4-byte vector
+     * push/pop). PushHandler = a capacity check + store + bump (the cold
+     * grow falls to jit_push_handler_grow); PopHandler = `finish -= 4`;
+     * SetPend = a byte store into records[rec_n-1].pend. None can throw ->
+     * op_fully_native. PushHandler routes through emit_branch (its pushed
+     * catch_pc is a PC needing remap[]). The raise-side ops (Throw/
+     * CatchTest/Reraise/EndFinally) need the dynamic-resume design and
+     * stay interpreted. */
+    case OpCode::PushHandler:
+    case OpCode::PopHandler:
+    case OpCode::SetPend:
+        return true;
+    /* Step 7a: EndFinally - the hot NORMAL path is a byte compare + fall
+     * through; the cold RERAISE path BAILS to the interpreter (the raise
+     * needs vm_raise's dynamic resume). Eligibility matters beyond its own
+     * dispatch: EndFinally was the run SPLITTER that left a try-loop's back
+     * edge landing on an INTERIOR pc (interpreted body every iteration -
+     * the fragment-head defect class); with it eligible the whole loop is
+     * one run and the back edge is a fragment-local jump. NOT
+     * op_fully_native (the bail re-runs the op). */
+    case OpCode::EndFinally:
+        return true;
+    /* Step 7a: the COLD catch-region ops. CatchTest/Reraise are only ever
+     * ENTERED via vm_raise's handler dispatch (the interpreter is already
+     * driving there), and Throw always raises - so their native form is an
+     * unconditional EXIT at the op (the ThrowRuntimeV pattern; the kept
+     * originals run interpreted). Eligibility is the point: they were the
+     * run SPLITTERS that left a try/catch loop's back edge crossing
+     * fragments (the interior-entry defect class); merged, the whole loop
+     * is one run and the back edge is a fragment-local jump. NOT
+     * op_fully_native. */
+    case OpCode::CatchTest:
+    case OpCode::Reraise:
+    case OpCode::Throw:
         return true;
     /* model-flip (nativize-ops): an ALWAYS-THROWING construct. Its exception
      * mix includes NON-Runtime ones (UndefinedVariableEx/CannotRebindBuiltin)
@@ -1734,6 +1784,15 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             break;
         case OpCode::ThrowRuntimeV:
             break;                       /* no slots - it only exits */
+        case OpCode::PushHandler:
+        case OpCode::PopHandler:
+        case OpCode::SetPend:
+        case OpCode::EndFinally:
+            break;                       /* pure activation state - no slots */
+        case OpCode::CatchTest:
+        case OpCode::Reraise:
+        case OpCode::Throw:
+            break;                       /* unconditional exits - no slots */
         case OpCode::UnpackElemInt:
         case OpCode::UnpackElemFloat:
         case OpCode::UnpackElemValue:
@@ -3202,6 +3261,79 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::PopHandler: {
+        /* INLINE handler pop (step 7a): `finish -= 4` - a VmHandler is a
+         * trivial 4-byte struct, so vector pop_back is exactly the finish
+         * decrement (never empty at a PopHandler by codegen construction).
+         * Never throws. */
+        const JitLayout &L = jit_layout();
+        e.bump_op(OpCode::PopHandler);
+        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
+        e.u8(0x48); e.u8(0x83); e.u8(0xE9); e.u8(4);   /* sub rcx, 4 */
+        e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
+        return true;
+    }
+
+    case OpCode::SetPend: {
+        /* INLINE finally-pend store (step 7a): a byte store into
+         * records[rec_n - 1].pend (target = the Pend ENUM value, not a
+         * pc). Never throws. */
+        const JitLayout &L = jit_layout();
+        e.bump_op(OpCode::SetPend);
+        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+recs+0] */
+        e.u32(static_cast<uint32_t>(L.act_records));   /* _M_start */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x90);        /* mov rdx, [rax+rec_n] */
+        e.u32(static_cast<uint32_t>(L.act_rec_n));
+        e.u8(0x48); e.u8(0xFF); e.u8(0xCA);        /* dec rdx */
+        e.u8(0x48); e.u8(0x69); e.u8(0xD2);        /* imul rdx, rdx, size */
+        e.u32(static_cast<uint32_t>(L.rec_size));
+        e.u8(0x48); e.u8(0x01); e.u8(0xD1);        /* add rcx, rdx */
+        e.u8(0xC6); e.u8(0x81);                    /* mov byte [rcx+pend], v */
+        e.u32(static_cast<uint32_t>(L.rec_pend));
+        e.u8(static_cast<uint8_t>(in.target));
+        return true;
+    }
+
+    case OpCode::EndFinally: {
+        /* INLINE the NORMAL path: records[rec_n-1].pend == normal (0) ->
+         * fall through to Lend; RERAISE -> bail (the interpreter re-runs
+         * EndFinally and raises via vm_raise). */
+        const JitLayout &L = jit_layout();
+        e.bump_op(OpCode::EndFinally);
+        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+recs+0] */
+        e.u32(static_cast<uint32_t>(L.act_records));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x90);        /* mov rdx, [rax+rec_n] */
+        e.u32(static_cast<uint32_t>(L.act_rec_n));
+        e.u8(0x48); e.u8(0xFF); e.u8(0xCA);        /* dec rdx */
+        e.u8(0x48); e.u8(0x69); e.u8(0xD2);        /* imul rdx, rdx, size */
+        e.u32(static_cast<uint32_t>(L.rec_size));
+        e.u8(0x48); e.u8(0x01); e.u8(0xD1);        /* add rcx, rdx */
+        e.u8(0x80); e.u8(0xB9);                    /* cmp byte [rcx+pend], 0 */
+        e.u32(static_cast<uint32_t>(L.rec_pend));
+        e.u8(0);
+        e.bail_unless(0x74, pc);      /* je (normal) else BAIL (reraise) */
+        return true;
+    }
+
+    case OpCode::CatchTest:
+    case OpCode::Reraise:
+    case OpCode::Throw:
+        /* cold catch-region / raise ops: an unconditional exit - the
+         * interpreter re-runs the kept original (dispatch/raise machinery).
+         * Reached natively only via a fall-through that in practice is the
+         * handler-dispatch entry, already interpreted. */
+        e.bump_op(in.op);
+        e.exit_pc(pc);
+        return true;
+
     case OpCode::DeclConstV:
         /* const decl bind via jit_decl_const(dst, is_global, src). */
         emit_call_prologue(e);
@@ -3882,6 +4014,39 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::PushHandler: {
+        /* INLINE try-handler push (step 7a): load the handlers vector's
+         * finish; at capacity -> the cold jit_push_handler_grow; else store
+         * the REMAPPED catch-dispatch pc (a 4-byte VmHandler) and bump
+         * finish. Never throws. */
+        const JitLayout &L = jit_layout();
+        const uint32_t tgt = static_cast<uint32_t>(remap[in.target]);
+        e.bump_op(OpCode::PushHandler);
+        e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_act));
+        e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (act) */
+        e.u8(0x48); e.u8(0x8B); e.u8(0x88);        /* mov rcx, [rax+h+8] */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 8));    /* finish */
+        e.u8(0x48); e.u8(0x3B); e.u8(0x88);        /* cmp rcx, [rax+h+16] */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 16));   /* end cap */
+        const size_t j_grow = e.j32(0x74);         /* je -> the cold grow */
+        e.u8(0xC7); e.u8(0x01);                    /* mov dword [rcx], tgt */
+        e.u32(tgt);
+        e.u8(0x48); e.u8(0x83); e.u8(0xC1); e.u8(4);   /* add rcx, 4 */
+        e.u8(0x48); e.u8(0x89); e.u8(0x88);        /* mov [rax+h+8], rcx */
+        e.u32(static_cast<uint32_t>(L.act_handlers + 8));
+        const size_t j_done = e.j32(0xEB);
+        e.patch32_here(j_grow);
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(tgt)));
+        e.call_relocs.push_back(
+            { e.pos(),
+              reinterpret_cast<const void *>(jit_push_handler_grow) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.patch32_here(j_done);
+        return;
+    }
+
     case OpCode::JumpIfNotNoneV: {
         /* `a ?? b`: jump to target when the lhs slot is NOT none - one
          * type-tag compare against the none singleton. Never throws. */
@@ -4040,7 +4205,10 @@ static bool op_is_branch(OpCode op)
          * to the loop target when the loop continues. */
         || op == OpCode::ForStepElemInt
         /* the `??` short-circuit: jump when the lhs is NOT none. */
-        || op == OpCode::JumpIfNotNoneV;
+        || op == OpCode::JumpIfNotNoneV
+        /* NOT a real branch - routed here because its pushed catch_pc is a
+         * PC needing remap[] (emit_op has no remap). */
+        || op == OpCode::PushHandler;
 }
 
 static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
@@ -4143,6 +4311,11 @@ static bool op_fully_native(const Instr &in)
     case OpCode::JumpIfNotNoneV:
     case OpCode::DeclConstV:
     case OpCode::DefinedGlobalV:
+    /* the inline exception ops: pure activation state, never throw (the
+     * PushHandler's pushed catch_pc is remapped at emit). */
+    case OpCode::PushHandler:
+    case OpCode::PopHandler:
+    case OpCode::SetPend:
     /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
      * its interpreted original - so deleting the original is sound. And unlike
      * the side-table throwing ops (Subscript/DictLoad), it conveys its OWN loc

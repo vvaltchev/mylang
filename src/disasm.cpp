@@ -548,6 +548,13 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
           << rm << ", " << int(imm);
         break; }
+    case 0x3B: { modrm(regf, rm);   /* cmp r64, r/m64 (the PushHandler
+                                     * capacity check) */
+        o << "cmp " << gp64(regf) << ", " << rm; break; }
+    case 0x69: { modrm(regf, rm);   /* imul r64, r/m64, imm32 (the
+                                     * SetPend record-stride multiply) */
+        const int32_t imm = rd32();
+        o << "imul " << gp64(regf) << ", " << rm << ", " << imm; break; }
     case 0xC6: { modrm(regf, rm);   /* /0: mov BYTE [rm], imm8 (the
                                      * defined[gslot]=1 store) */
         o << "mov byte " << rm << ", " << int(c[p++]); break; }
