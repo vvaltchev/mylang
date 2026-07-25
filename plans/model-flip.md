@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (33 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (36 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -403,7 +403,14 @@ ONE `enter.nat` and becomes a `native_leaf` - see its backlog entry). And
 build_dict_from_pairs over the interleaved key/value run; unlike MakeArrayV it
 CAN throw - the key freeze HASHES each key, so a dyn-laundered FUNC key raises
 TypeErrorEx - so it re-raises and is NOT op_fully_native. Nativizing it exposed
-and FIXED a pre-existing VM caret bug - see its backlog entry).
+and FIXED a pre-existing VM caret bug - see its backlog entry). And the **STRUCT
+BUILDS** - `StructCtorV` (`jit_struct_ctor` - a POD `P(x,y)` from its field run,
+incl. the H1 dst-slot reuse), `StructCtorBoxedV` (`jit_struct_ctor_boxed` - a
+non-POD `B(a,x)`, whose field-coerce throw carries the offending arg's POOLED
+caret that vm_raise's empty-loc-only stamp preserves) and `MakeStructArrayV`
+(`jit_make_struct_array` - the fused flat `array<PodStruct>` literal). All three
+throw only TypeErrorEx (a RuntimeException) from `coerce_struct_field`, so no
+exception-model change; none is op_fully_native - see their backlog entry.
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -622,6 +629,42 @@ to do LATER, separately (don't forget these):
   jit_op_nativized MakeDictV case proves the counter bumps; the unhashable-key
   throw is byte-identical vm/nj/tw AND catchable from inside a fragment;
   multi-pair / nested / mixed-key / >8-pair-heap literals all agree.
+- **The STRUCT BUILDS (StructCtorV / StructCtorBoxedV / MakeStructArrayV)** —
+  DONE (2026-07-24). Three helpers, each the interpreter's exact call:
+  `jit_struct_ctor(def, base, nf, dst)` (POD `P(x,y)` -> `vm_struct_ctor`, incl.
+  the **H1 DST-SLOT REUSE** - VERIFIED still firing under the JIT: an
+  intptr-identity loop counts 999/999 reuses JIT-on vs JIT-off),
+  `jit_struct_ctor_boxed(dst, base, &boxed_ctors[idx])` (non-POD `B(a,x)` ->
+  `vm_struct_ctor_boxed`; also the CHECKED POD ctor), and
+  `jit_make_struct_array(def, base, n, dst)` (the fused flat `array<PodStruct>`
+  literal -> `vm_make_struct_array_op`; `n` is the ELEMENT count, the run holds
+  n * nfields values). The `StructTypeDef*` from the struct_defs pool is baked as
+  a VALUE (program-lifetime, like MakeClosureV's descriptor); the boxed ctor
+  bakes `&boxed_ctors[idx]` (pool buffer address).
+  **Exceptions:** every reachable throw is a `TypeErrorEx` from
+  `coerce_struct_field` / `coerce_to_decl_type` - a RuntimeException - so
+  `catch (RuntimeException)` suffices and NO exception-model change was needed
+  (checked explicitly: no arity/DECL-style exception can escape, the codegen and
+  inferencer fix arity at compile time). The POD ctor + struct-array literal
+  throw LOC-LESS (their gates make it defensive-only) and get the side-table
+  caret at the EnterNative re-raise; the BOXED ctor's throw already carries the
+  offending arg's POOLED per-arg caret, which survives because **`vm_raise`
+  stamps only an EMPTY loc**. None is op_fully_native.
+  **N5:** StructCtorV's field run IS enumerable ([a_lit, a_lit+b_lit)) so it is
+  disqualified precisely (plus dst - the H1 reuse READS the current dst value);
+  StructCtorBoxedV and MakeStructArrayV return `{}` (no caching for the run) -
+  their run LENGTH needs the boxed_ctors pool / the def's field count, and
+  pick_cached_slots has no chunk, i.e. the MakeClosureV "can't enumerate ->
+  disable" rule. **The jit_container test's island moved StructCtorBoxedV ->
+  DeclConstV** (a `const` array/dict decl inside a function body - a
+  non-branching data op that is rare in real code); perf-safety re-checked with
+  the container probe over ALL bench/ + samples/ = ZERO containers formed, probe
+  self-validated (6 island calls on the known shape). VERIFIED: one loop body
+  carrying all three shows `struct.ctor` / `struct.ctor.b` / `make.structarr` all
+  inside ONE fragment (`-vdj`); three jit_op_nativized cases prove the counters
+  bump; the boxed ctor's PER-ARG caret (pointing at the offending arg, not the
+  call) is byte-identical vm/nj/tw and catchable from inside a fragment, as is
+  the checked-POD path.
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
