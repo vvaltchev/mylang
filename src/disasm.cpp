@@ -553,6 +553,9 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         uint32_t imm = 0;
         for (int i = 0; i < 4; i++) imm |= uint32_t(c[p++]) << (8 * i);
         o << "mov " << rm << ", " << int(imm); break; }
+    case 0xD1: { modrm(regf, rm);   /* group-2 shift by 1 */
+        o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
+          << rm << ", 1"; break; }
     case 0xD3: { modrm(regf, rm);
         o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
           << rm << ", cl"; break; }
@@ -607,14 +610,22 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         else if (o2 == 0x51) { modrm(regf, rm);   /* sqrtsd (N6a) */
             o << "sqrtsd xmm" << regf << ", " << rm; }
         else if (o2 == 0x58 || o2 == 0x59 || o2 == 0x5C || o2 == 0x5E) {
+            /* reg-reg form: the rm REGISTER is an XMM, not a GP (the generic
+             * modrm would print `rcx` for xmm1) */
+            const bool reg_form = (c[p] & 0xC0) == 0xC0;
+            const int rm_xmm = c[p] & 7;
             modrm(regf, rm);
             const char *m = o2==0x58?"addsd":o2==0x59?"mulsd":
                             o2==0x5C?"subsd":"divsd";
-            o << m << " xmm" << regf << ", " << rm; }
+            o << m << " xmm" << regf << ", ";
+            if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
         else if (o2 == 0x2A) { modrm(regf, rm);
             o << "cvtsi2sd xmm" << regf << ", " << rm; }
         else if (o2 == 0x6E) { modrm(regf, rm);
             o << "movq xmm" << regf << ", " << rm; }
+        else if (o2 == 0x7E) { modrm(regf, rm);   /* 66 REX.W 0F 7E:
+                                                   * movq r/m64, xmm */
+            o << "movq " << rm << ", xmm" << regf; }
         else if (o2 == 0x2E) { modrm(regf, rm);
             o << "ucomisd xmm" << regf << ", " << rm; }
         else if (o2 >= 0x90 && o2 <= 0x9F) {   /* setcc r/m8 (CmpIntV) */

@@ -545,7 +545,17 @@ The order:
    44_primes_sqrt 0.297x, 03_int_arith 0.310x, 60_bit_sieve 0.498x,
    45_gcd 0.631x; controls 1.0000. (collatz's plan: "NOT ready - 1
    island: IntBin" -> "READY - whole body native".)
-2. **FloatBin div** (5) - float div-by-zero throws; same raise pattern.
+2. **FloatBin div** (5) - **DONE (2026-07-25).** Inline divsd behind a
+   sign-stripped divisor BITS test (`movq rax, xmm1; shl rax, 1; jnz` -
+   zero iff +-0.0, exactly TypeFloat::div's fpclassify FP_ZERO; NaN/inf/
+   denormals divide; a ucomisd test was rejected - unordered sets ZF, a
+   bare `je` would wrongly raise on NaN) -> JR_DIV0 raise. Float MOD
+   stays interpreted (fmod libm call, 0 bench occurrences - do when it
+   shows up). Decoder gained movq r64,xmm / shift-by-1 / xmm rm-operand
+   rendering for the SSE reg-reg forms. MEASURED: 04_float_arith
+   **0.274x**, 55_float_sum **0.389x** (the div island split those whole
+   loops), 54_mandelbrot 0.977 (its divs are per-pixel setup; the inner
+   loop was already native); controls 1.0000.
 3. **LoadMemberInt/Float** (3) - typed POD member reads, the same inline
    shape as the done LoadStructFieldInt/Float pair.
 4. **The 65_struct_field_sum trio** - StructFieldAddInt + ForStepElemInt

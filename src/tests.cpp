@@ -15416,6 +15416,25 @@ static bool jit_op_nativized()
             "  return r;",
             "}",
             "assert(f(9, runtime(0)) == 77);" } },
+        /* FloatBin div: inline divsd behind the sign-stripped divisor bits
+         * test (+-0.0 raises DivisionByZeroEx, NaN/inf divide). Only the div
+         * arm bumps the counter. */
+        { OpCode::FloatBin, {
+            "func f(float n) {",
+            "  var s = 0.0;",
+            "  for (var x = 1.0; x <= n; x += 1.0) s = s + 1.0 / x;",
+            "  return s;",
+            "}",
+            "assert(f(runtime(2.0)) == 1.5);" } },
+        { OpCode::FloatBin, {
+            "func f(float a, float c) {",
+            "  var r = 0.0;",
+            "  try { r = a / c; } catch (DivisionByZeroEx) { r = 77.0; }",
+            "  return r;",
+            "}",
+            "assert(f(9.0, runtime(0.0)) == 77.0);",
+            "assert(f(9.0, runtime(-0.0)) == 77.0);",
+            "assert(f(9.0, runtime(4.5)) == 2.0);" } },
         /* The iterator THROW paths, script-caught: a non-container init and a
          * strict-unpack next each ride g_vm_jit_exc out of the fragment and
          * dispatch to the same-frame handler. */
