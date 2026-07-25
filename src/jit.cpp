@@ -851,6 +851,11 @@ static bool jit_op_eligible(const Instr &in)
      * is op_fully_native. It was islanding real loops (57_bool_reduce). */
     case OpCode::CmpIntV:
         return true;
+    /* model-flip (nativize-ops): the E4 `if (arr[i])` fusion - the hot island
+     * in the sieve/bool-reduce loops. Emitted inline as the shared element
+     * read + a test/jcc (see emit_branch). */
+    case OpCode::JumpUnlessElemInt:
+        return true;
     /* model-flip (nativize-ops): the BOXED condition BRANCH (`if (dynvalue)`,
      * `while (flag)`, a &&/|| conjunct, the boxed ternary) - jit_is_true
      * evaluates it and the FRAGMENT jumps (emit_branch). This was the top
@@ -1433,6 +1438,13 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * global slot for LoadGlobalV), not a frame slot. */
             bad(in.target);
             break;
+        case OpCode::JumpUnlessElemInt:
+            /* reads the base (an array ref) from memory; the INDEX goes through
+             * the cache-aware load_index_r9, so it stays a countable int use -
+             * it is the loop counter. Nothing is written. */
+            bad(in.target2);
+            if (!in.a_is_lit()) usei(in.a_slot());
+            break;
         case OpCode::CmpIntV:
             /* both operands are plain int reads (cache-aware load_operand), so
              * they stay countable int uses; the dst holds a BOOL, written to
@@ -1652,6 +1664,54 @@ static void load_index_r9(Emitter &e, const Instr &in)
         e.mov_rr(9 /* r9 */, static_cast<uint8_t>(cr));
     else
         e.mov_r9_slot(slot_addr(in.a_slot()).payload);
+}
+
+/*
+ * Emit the INT-semantics element read `arr[idx]` -> RAX, shared by LoadElemInt
+ * and the JumpUnlessElemInt fusion (`if (arr[i])`). Navigates slot -> shobj ->
+ * kind + data, unsigned bounds-checks, and reads the element - accepting BOTH
+ * flat `ints` (8-byte) and flat `bools` (1-byte, 0/1), exactly what the
+ * interpreter accepts for these ops. A non-array / SLICE / other-kind base
+ * BAILS (the interpreter re-runs the op); an out-of-range index RAISES
+ * OutOfBounds with the op's caret (approach A - no re-interpret).
+ * Clobbers rax/rcx/rdx/r9.
+ */
+static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc)
+{
+    const JitLayout &L = jit_layout();
+    const SlotAddr base = slot_addr(in.target2);
+    e.load(RAX, base.type);                  /* base an array? */
+    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rax_r9();
+    e.bail_unless(0x74, pc);                 /* je (== t_arr) */
+    e.cmp_byte_rdi(base.payload + L.slice_off, 0);   /* not a slice? */
+    e.bail_unless(0x74, pc);                 /* je (slice==0) */
+    e.load(RAX, base.payload);               /* rax = shobj ptr */
+    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    const size_t j_ints = e.j32(0x74);       /* je -> the 8-byte path */
+    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    e.bail_unless(0x74, pc);                 /* je (bools) else BAIL */
+    /* flat bools: 1-byte elements, so the count is the raw pointer difference
+     * (no sar) and the load is a movzx. */
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();
+    load_index_r9(e, in);
+    e.cmp_r9_rdx();
+    raise_unless(e, 0x72, JR_OOB, pc);
+    e.load_elem_byte();                      /* movzx eax,[rcx+r9] */
+    const size_t j_done = e.j32(0xEB);
+    /* flat ints */
+    e.patch32_here(j_ints);
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();
+    e.sar_rdx_3();
+    load_index_r9(e, in);
+    e.cmp_r9_rdx();
+    raise_unless(e, 0x72, JR_OOB, pc);
+    e.load_elem_int();                       /* mov rax,[rcx+r9*8] */
+    e.patch32_here(j_done);
 }
 
 static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
@@ -1922,38 +1982,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_float_store(e, ck, X0, in.target, pc);
             return true;
         }
-        /* An int-typed element read accepts BOTH flat `ints` (8-byte) and flat
-         * `bools` (1-byte, 0/1) storage - exactly what the interpreter's
-         * LoadElemInt does. Handling only `ints` made `if (bool_arr[i])` BAIL
-         * every iteration, and since a run is only ever entered at its HEAD,
-         * that bail dropped the whole REST of the run to the interpreter
-         * (measured: it cost 56_sieve_bool its natively-executing inner loop
-         * once runs began merging). */
-        e.cmp_byte_rax(L.kind_off, L.kind_ints);
-        const size_t j_ints = e.j32(0x74);       /* je -> the 8-byte path */
-        e.cmp_byte_rax(L.kind_off, L.kind_bools);
-        e.bail_unless(0x74, pc);                 /* je (bools) else BAIL */
-        /* --- flat bools: 1-byte elements, so the count is the raw pointer
-         * difference (no sar) and the load is a movzx --- */
-        e.mov_rcx_rax(L.data_off);
-        e.mov_rdx_rax(L.data_off + 8);
-        e.sub_rdx_rcx();
-        load_index_r9(e, in);
-        e.cmp_r9_rdx();
-        raise_unless(e, 0x72, JR_OOB, pc);
-        e.load_elem_byte();                      /* movzx eax,[rcx+r9] */
-        const size_t j_done = e.j32(0xEB);       /* jmp -> store */
-        /* --- flat ints --- */
-        e.patch32_here(j_ints);
-        e.mov_rcx_rax(L.data_off);
-        e.mov_rdx_rax(L.data_off + 8);
-        e.sub_rdx_rcx();
-        e.sar_rdx_3();
-        load_index_r9(e, in);
-        e.cmp_r9_rdx();
-        raise_unless(e, 0x72, JR_OOB, pc);
-        e.load_elem_int();                       /* mov rax,[rcx+r9*8] */
-        e.patch32_here(j_done);
+        /* The int-semantics read (ints + bools storage) is shared with the
+         * JumpUnlessElemInt fusion - see emit_elem_int_read. */
+        emit_elem_int_read(e, in, pc);
         write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
@@ -2927,6 +2958,19 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::JumpUnlessElemInt: {
+        /* E4 fusion `if (arr[i])`: read the element with the shared
+         * int-semantics path (flat ints or bools; a bail re-runs the op, an
+         * OOB raises with its caret) and jump to target when it is FALSE.
+         * Nothing is written - the fused temp was proven dead on both paths. */
+        emit_elem_int_read(e, in, pc);
+        e.test_rax_rax();
+        emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+        return;
+    }
+
     case OpCode::JumpUnlessFloatCmp: {
         /* jump to target when (a cmp b) is FALSE (the ordering compares;
          * the swap trick makes NaN correctly jump - see float_cmp). */
@@ -2954,7 +2998,10 @@ static bool op_is_branch(OpCode op)
         /* the BOXED condition branch: the helper evaluates is_true, the
          * fragment does the jump - so a loop body holding one no longer
          * splits the run and leaves the back edge interpreted. */
-        || op == OpCode::JumpUnlessTrueV;
+        || op == OpCode::JumpUnlessTrueV
+        /* the E4 `if (arr[i])` fusion: the element read is emitted inline and
+         * the fragment jumps when it is FALSE. */
+        || op == OpCode::JumpUnlessElemInt;
 }
 
 static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
