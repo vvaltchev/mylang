@@ -4163,6 +4163,42 @@ unsigned long g_jit_container_calls = 0;
  * probe object (no offsetof-on-non-standard-layout warning); both types are
  * default-constructible and cheap (a Chunk's NativeCode dtor is a no-op when
  * base is null, which it is here). */
+/* De-helperize 6b (roadmap step 6): the ctx-indirect address chain the
+ * LoadCaptureV / StoreCaptureV / StoreGlobalV inlines walk at runtime -
+ * &g_current_ctx (the file-static the helpers already use), the
+ * EvalContext::captures / ::gfuncs member offsets, and GlobalFuncTable's
+ * slots / defined vector offsets (their _M_start lives at +0, the layout
+ * fact the flat-array reads already rely on). Probed from real objects so
+ * they cannot drift. */
+EvalContext **jit_addr_current_ctx()
+{
+    return &g_current_ctx;
+}
+ptrdiff_t jit_off_ctx_captures()
+{
+    EvalContext c(nullptr, true);
+    return reinterpret_cast<const char *>(&c.captures)
+         - reinterpret_cast<const char *>(&c);
+}
+ptrdiff_t jit_off_ctx_gfuncs()
+{
+    EvalContext c(nullptr, true);
+    return reinterpret_cast<const char *>(&c.gfuncs)
+         - reinterpret_cast<const char *>(&c);
+}
+ptrdiff_t jit_off_gft_slots()
+{
+    GlobalFuncTable g;
+    return reinterpret_cast<const char *>(&g.slots)
+         - reinterpret_cast<const char *>(&g);
+}
+ptrdiff_t jit_off_gft_defined()
+{
+    GlobalFuncTable g;
+    return reinterpret_cast<const char *>(&g.defined)
+         - reinterpret_cast<const char *>(&g);
+}
+
 ptrdiff_t jit_off_desc_vm_chunk()
 {
     FuncDescriptor fd;

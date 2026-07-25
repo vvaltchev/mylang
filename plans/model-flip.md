@@ -659,10 +659,21 @@ The order:
    47_wordcount 0.990x (its hot const is a string, helper by design);
    fib/while +0.8-1.5% = the documented cross-binary LTO drift
    (byte-identical images; parse-only alone shifts +0.8%).
-   **Remaining 6b**: LoadCaptureV / plain StoreGlobalV / StoreCaptureV
-   (need probed EvalContext::captures / ::gfuncs + vector-data offsets
-   for the runtime address chain; stores also need the src ref check
-   for the retain) + CmpIntV's ref-listed bool store (jit_put_bool).
+   Step 6b **DONE (2026-07-25)**: LoadCaptureV + plain StoreGlobalV /
+   StoreCaptureV inline via the probed ctx chain (jit_addr_current_ctx +
+   EvalContext::captures/::gfuncs + GlobalFuncTable::slots/::defined;
+   walked into r9 by emit_ctx_chain_r9, r9-base loads/stores via the new
+   load_r9b/store_r9b - rm=001 + REX.B, no SIB). The STORES' src gate is
+   the 3..t_str-1 RANGE (emit_store_src_gate): their helper runs
+   RValue(*src), so the pseudo types t_lval/t_undefid AND rare t_none go
+   to the helper; the dst current value is ALWAYS ref-checked (globals/
+   captures hold anything); the global store writes defined[gslot]=1
+   inline (byte store off the table kept in rdx). Decoder: honor REX.B
+   in modrm base naming ([r9+d] chains rendered as rcx before - reading
+   the disassembly caught it) + C6 /0 byte stores. MEASURED:
+   11_closure_counter **0.971x**, 63_closures 0.985x; controls 1.0000.
+   The residual jit_put_int/float/bool releases stay (a reference dst's
+   release genuinely needs C++ - nothing left to inline there).
 7. **The exception family** (~15: PushHandler/PopHandler/CatchTest/Throw/
    Reraise/SetPend/EndFinally) - a design step (handler-stack ops touch
    the record state).

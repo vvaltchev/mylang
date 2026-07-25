@@ -100,6 +100,14 @@ ptrdiff_t jit_off_desc_vm_chunk();      /* FuncDescriptor::vm_chunk */
 ptrdiff_t jit_off_chunk_native_base();  /* Chunk::native.base */
 ptrdiff_t jit_off_chunk_native_entry(); /* Chunk::native_entry_off */
 
+/* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
+class EvalContext;
+EvalContext **jit_addr_current_ctx();   /* &g_current_ctx (file-static) */
+ptrdiff_t jit_off_ctx_captures();       /* EvalContext::captures */
+ptrdiff_t jit_off_ctx_gfuncs();         /* EvalContext::gfuncs */
+ptrdiff_t jit_off_gft_slots();          /* GlobalFuncTable::slots */
+ptrdiff_t jit_off_gft_defined();        /* GlobalFuncTable::defined */
+
 /*
  * #55 STEP 2.1: the native CallV setup helper (vm.cpp, extern "C" noexcept,
  * baked as a call target). A caller fragment, at a native CallV, calls this to

@@ -114,6 +114,12 @@ struct JitLayout {
     unsigned char kind_ints, kind_floats, kind_bools;  /* Storage values */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
+    /* De-helperize 6b: the ctx-indirect chain (via the vm.cpp probes) */
+    const void *addr_ctx; /* &g_current_ctx */
+    int ctx_captures;     /* EvalContext::captures (a vector<LValue>*) */
+    int ctx_gfuncs;       /* EvalContext::gfuncs (a GlobalFuncTable*) */
+    int gft_slots;        /* GlobalFuncTable::slots (vector; data at +0) */
+    int gft_defined;      /* GlobalFuncTable::defined (vector<char>) */
     /* #55 STEP 2.1 native-call member offsets (via the vm.cpp probes) */
     int desc_vm_chunk;    /* FuncDescriptor::vm_chunk */
     int chunk_native_base;/* Chunk::native.base */
@@ -177,6 +183,11 @@ static const JitLayout &jit_layout()
             - reinterpret_cast<const char *>(l.t_int));
         l.t_str_val = static_cast<int>(Type::t_str);
         /* #55 STEP 2.1: native-call member offsets (vm.cpp probes) */
+        l.addr_ctx = jit_addr_current_ctx();
+        l.ctx_captures = static_cast<int>(jit_off_ctx_captures());
+        l.ctx_gfuncs = static_cast<int>(jit_off_ctx_gfuncs());
+        l.gft_slots = static_cast<int>(jit_off_gft_slots());
+        l.gft_defined = static_cast<int>(jit_off_gft_defined());
         l.desc_vm_chunk = static_cast<int>(jit_off_desc_vm_chunk());
         l.chunk_native_base = static_cast<int>(jit_off_chunk_native_base());
         l.chunk_native_entry = static_cast<int>(jit_off_chunk_native_entry());
@@ -255,6 +266,17 @@ struct Emitter {
         u32(static_cast<uint32_t>(disp));
     }
     /* mov [rdi + disp32], <reg64>  (reg 0-15) */
+    /* mov reg, [r9 + d] / mov [r9 + d], reg (de-helperize 6b: the
+     * ctx-indirect chains walk through r9 as the scratch base; rm=001 with
+     * REX.B is r9, no SIB needed). */
+    void load_r9b(uint8_t reg, int32_t d)
+    { u8(reg >= 8 ? 0x4D : 0x49); u8(0x8B);
+      u8(static_cast<uint8_t>(0x81 | ((reg & 7) << 3))); u32(
+          static_cast<uint32_t>(d)); }
+    void store_r9b(uint8_t reg, int32_t d)
+    { u8(reg >= 8 ? 0x4D : 0x49); u8(0x89);
+      u8(static_cast<uint8_t>(0x81 | ((reg & 7) << 3))); u32(
+          static_cast<uint32_t>(d)); }
     void store(uint8_t reg, int32_t disp)
     {
         u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
@@ -1103,6 +1125,60 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off)
     e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
     e.u32(static_cast<uint32_t>(L.t_str_val));
     return e.j8(0x72);                         /* jb -> fast (trivial value) */
+}
+
+/* The r9-based sibling (the value lives at [r9 + ...], a capture/global
+ * slot): jump NEAR to the helper when it is a REFERENCE. Clobbers rcx. */
+static size_t emit_ref_check_jae_r9(Emitter &e, int32_t type_off)
+{
+    const JitLayout &L = jit_layout();
+    e.load_r9b(RCX, type_off);
+    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
+    e.u32(static_cast<uint32_t>(L.type_t_off));
+    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
+    e.u32(static_cast<uint32_t>(L.t_str_val));
+    return e.j32(0x73);                        /* jae -> the helper (a ref) */
+}
+
+/* The STORE-source gate (StoreGlobalV/StoreCaptureV): their helper runs
+ * RValue(*src), so besides a reference (>= t_str) the PSEUDO types t_lval/
+ * t_undefid (1, 2 - collapse/throw) and the rare t_none (0) also take the
+ * helper; the inline handles the 3..t_str-1 range (int/builtin/float/bool/
+ * structtype). Returns the TWO jump sites to patch to the helper. */
+static std::pair<size_t, size_t>
+emit_store_src_gate(Emitter &e, int32_t type_off)
+{
+    const JitLayout &L = jit_layout();
+    e.load(RCX, type_off);
+    e.u8(0x8B); e.u8(0x89);                    /* mov ecx, [rcx + type_t_off] */
+    e.u32(static_cast<uint32_t>(L.type_t_off));
+    e.u8(0x83); e.u8(0xF9); e.u8(3);           /* cmp ecx, 3 (t_int) */
+    const size_t j_lo = e.j32(0x72);           /* jb -> helper (none/pseudo) */
+    e.u8(0x81); e.u8(0xF9);                    /* cmp ecx, t_str_val */
+    e.u32(static_cast<uint32_t>(L.t_str_val));
+    const size_t j_hi = e.j32(0x73);           /* jae -> helper (a ref) */
+    return { j_lo, j_hi };
+}
+
+/* Walk `r9 = ctx->captures->data()` (cap=true) or, with the GlobalFuncTable
+ * kept in RDX for the caller's `defined` write, `r9 = gfuncs->slots.data()`
+ * (cap=false). Clobbers rax (and rdx for the global chain). */
+static void emit_ctx_chain_r9(Emitter &e, bool cap)
+{
+    const JitLayout &L = jit_layout();
+    e.movabs(RAX, reinterpret_cast<uint64_t>(L.addr_ctx));
+    e.u8(0x48); e.u8(0x8B); e.u8(0x00);        /* mov rax, [rax] (the ctx) */
+    if (cap) {
+        e.u8(0x48); e.u8(0x8B); e.u8(0x80);    /* mov rax,[rax+captures] */
+        e.u32(static_cast<uint32_t>(L.ctx_captures));
+        e.u8(0x4C); e.u8(0x8B); e.u8(0x88);    /* mov r9,[rax+0] (data) */
+        e.u32(0);
+    } else {
+        e.u8(0x48); e.u8(0x8B); e.u8(0x90);    /* mov rdx,[rax+gfuncs] */
+        e.u32(static_cast<uint32_t>(L.ctx_gfuncs));
+        e.u8(0x4C); e.u8(0x8B); e.u8(0x8A);    /* mov r9,[rdx+slots+0] */
+        e.u32(static_cast<uint32_t>(L.gft_slots));
+    }
 }
 
 /* The INVERTED form for the de-helperize inline paths: jump NEAR to the
@@ -2578,11 +2654,32 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
-    case OpCode::LoadCaptureV:
-        /* dst = (*ctx->captures)[idx] via jit_load_capture (rdi=dst=target,
-         * rsi=idx=target2). The helper uses g_current_ctx->captures/frame (not
-         * the slots arg) - a capture is snapshot at closure creation, always
-         * defined, never throws. */
+    case OpCode::LoadCaptureV: {
+        /* De-helperize 6b: dst = (*ctx->captures)[idx] INLINE for a TRIVIAL
+         * capture over a trivial dst - walk the ctx chain to the captures
+         * data (r9), then the MoveV copy shape (src runtime ref check on
+         * [r9+...]; dst current-value check only when ref-listed; the
+         * 24-byte-payload + Type* copy). A reference either side falls to
+         * the original jit_load_capture. */
+        const SlotAddr dst = slot_addr(in.target);
+        const int32_t coff = static_cast<int32_t>(
+            in.target2 * static_cast<int_type>(sizeof(LValue)));
+        const int32_t pv0 = slot_addr(0).payload, ty0 = slot_addr(0).type;
+        e.bump_op(OpCode::LoadCaptureV);
+        emit_ctx_chain_r9(e, /*cap=*/true);
+        std::vector<size_t> jhelp;
+        jhelp.push_back(emit_ref_check_jae_r9(e, coff + ty0));
+        if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                               static_cast<int32_t>(in.target)))
+            jhelp.push_back(emit_ref_check_jae(e, dst.type));
+        e.load_r9b(RAX, coff + ty0);
+        e.load_r9b(RCX, coff + pv0);      e.store(RCX, dst.payload);
+        e.load_r9b(RCX, coff + pv0 + 8);  e.store(RCX, dst.payload + 8);
+        e.load_r9b(RCX, coff + pv0 + 16); e.store(RCX, dst.payload + 16);
+        e.store(RAX, dst.type);
+        const size_t j_done = e.j32(0xEB);
+        for (const size_t sj : jhelp)
+            e.patch32_here(sj);
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
@@ -2590,7 +2687,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_load_capture) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+        e.patch32_here(j_done);
         return true;
+    }
 
     case OpCode::LoadGlobalV:
         /* dst = gfuncs->slots[gslot] via jit_load_global (rdi=dst=target,
@@ -3448,10 +3547,40 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.patch8(j_ok, e.pos());
             return true;
         }
-        /* PLAIN `g = <expr>`/`cap = <expr>` via jit_store_global/jit_store_capture
-         * (slot, src). rsi = &slot[src] (LEA'd from the slots base FIRST), then
-         * rdi = the slot (overwrites the slots base, so after the lea). Never
-         * throws (op_fully_native). */
+        /* De-helperize 6b: the PLAIN `g = <expr>`/`cap = <expr>` INLINE for
+         * the trivial-x-trivial case. The helper runs RValue(*src), so the
+         * SRC gate excludes the pseudo types AND t_none besides references
+         * (emit_store_src_gate, the 3..t_str-1 range); the dst slot lives
+         * behind the ctx chain (r9 = the slots data; the GLOBAL chain keeps
+         * the table in RDX for the `defined` byte) and its CURRENT value is
+         * always ref-checked (globals/captures can hold anything). Any gate
+         * failing falls to the original helper. */
+        const SlotAddr src = slot_addr(in.a_slot());
+        const int32_t soff = static_cast<int32_t>(
+            in.target * static_cast<int_type>(sizeof(LValue)));
+        const int32_t pv0 = slot_addr(0).payload, ty0 = slot_addr(0).type;
+        e.bump_op(in.op);
+        const auto g = emit_store_src_gate(e, src.type);
+        emit_ctx_chain_r9(e, is_cap);
+        const size_t j_dref = emit_ref_check_jae_r9(e, soff + ty0);
+        e.load(RAX, src.type);
+        e.load(RCX, src.payload);      e.store_r9b(RCX, soff + pv0);
+        e.load(RCX, src.payload + 8);  e.store_r9b(RCX, soff + pv0 + 8);
+        e.load(RCX, src.payload + 16); e.store_r9b(RCX, soff + pv0 + 16);
+        e.store_r9b(RAX, soff + ty0);
+        if (!is_cap) {
+            /* defined[gslot] = 1: rcx = defined.data() (the table is still
+             * in rdx), then the byte store. */
+            e.u8(0x48); e.u8(0x8B); e.u8(0x8A);    /* mov rcx,[rdx+defined] */
+            e.u32(static_cast<uint32_t>(jit_layout().gft_defined));
+            e.u8(0xC6); e.u8(0x81);                /* mov byte [rcx+d], 1 */
+            e.u32(static_cast<uint32_t>(in.target));
+            e.u8(0x01);
+        }
+        const size_t j_done = e.j32(0xEB);
+        e.patch32_here(g.first);
+        e.patch32_here(g.second);
+        e.patch32_here(j_dref);
         const auto off = [](int slot) {
             return static_cast<int32_t>(static_cast<long>(slot)
                                         * static_cast<long>(sizeof(LValue)));
@@ -3464,6 +3593,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 is_cap ? jit_store_capture : jit_store_global) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+        e.patch32_here(j_done);
         return true;
     }
 
