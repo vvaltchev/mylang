@@ -1864,10 +1864,21 @@ extern "C" void jit_load_const(LValue *slots, int_type dst,
     slots[dst].put(*src);
 }
 
-/* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
- * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
- * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws
- * WITH the member caret already set, so EnterNative's re-raise preserves it. */
+/* model-flip (nativize-ops): the native LoadLiteralObjV body - the exact
+ * `slots[dst] = eval_literal_obj(...)` (immutable share vs a fresh mutable
+ * clone; never throws). `lov` is a baked `&chunk.literal_objs[idx]` (void*
+ * because Chunk::LiteralObjEntry is nested; the pool buffer addr is stable
+ * across the chunk's std::move). */
+extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
+                                     const void *lov) noexcept
+{
+    ML_JIT_OP_RAN(LoadLiteralObjV);
+    const Chunk::LiteralObjEntry *lo =
+        static_cast<const Chunk::LiteralObjEntry *>(lov);
+    slots[dst].put(eval_literal_obj(lo->value, lo->immutable, lo->arr_hint,
+                                    lo->arr_hint_struct));
+}
+
 extern "C" void jit_store_global(int_type gslot,
                                  const EvalValue *src) noexcept
 {
@@ -1877,6 +1888,10 @@ extern "C" void jit_store_global(int_type gslot,
     g->defined[gslot] = 1;
 }
 
+/* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
+ * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
+ * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws
+ * WITH the member caret already set, so EnterNative's re-raise preserves it. */
 extern "C" int jit_member(const EvalValue *base, LValue *dst,
                           const void *mkv) noexcept
 {

@@ -14761,6 +14761,14 @@ static bool jit_op_nativized()
             "var gg = 0;",
             "func f(int n) { for (var i = 0; i < n; i++) gg = i * i; return gg; }",
             "assert(f(8) == 49);" } },
+        /* LoadLiteralObjV: a baked const literal materialized per iteration. */
+        { OpCode::LoadLiteralObjV, {
+            "func f(int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) { var a = [1, 2, 3]; s = s + a[0]; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 5);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
