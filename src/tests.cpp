@@ -14297,7 +14297,11 @@ static bool codegen_func_counts(const std::vector<const char *> &lines,
         const Block *body = static_cast<const Block *>(fn->body.get());
         if (!body->scope_free)
             return false;
-        const Chunk chunk = codegen_chunk(body, fn->desc->frame_size);
+        /* jit=false: count the PRE-JIT chunk, like codegen_counts - with the
+         * JIT on, approach A DELETES a fully-native run's ops (with no MIN_RUN
+         * even a 2-op `=> x + 1` body becomes a native_leaf and empties). */
+        const Chunk chunk = codegen_chunk(body, fn->desc->frame_size,
+                                          /*jit=*/false);
         c.n_temps = chunk.n_temps;
         count_chunk_ops(chunk, c);
     } catch (...) {
@@ -16212,8 +16216,10 @@ static bool vm_disasm_native_call()
  * container. A chunk with a still-boxed op is MIXED -> "NOT ready" + the
  * blocking island(s) (here `main`, whose island is a CallV - calls are M5
  * territory, off the nativize-ops path, so this case stays stable); a body whose
- * every op is native-ELIGIBLE -> "READY" (the flip would nativize it), which now
- * covers both the tiny arith `add` AND the whole dict-building foreach `wc`.
+ * every op is native-ELIGIBLE -> "READY" (the flip would nativize it), which
+ * covers the dict-building foreach `wc`. The tiny arith `add` graduated past
+ * READY entirely: with MIN_RUN removed its 2-op body is a NATIVE_LEAF (one
+ * call-able fragment, interpreted ops deleted), asserted below.
  * DUMP-ONLY; no emission consumes it yet. */
 static bool vm_disasm_container_plan()
 {
@@ -16264,11 +16270,17 @@ static bool vm_disasm_container_plan()
             const bool mixed_ok =
                 mn.find("container plan: NOT ready") != std::string::npos
                 && mn.find("island [pc") != std::string::npos;
-            /* add: 2 ops (< MIN_RUN) so not a native_leaf, but fully
-             * native-eligible -> the READY line. */
+            /* add: with MIN_RUN removed (2026-07-25) its 2-op body forms a
+             * run, becomes a NATIVE_LEAF (whole body -> one call-able
+             * fragment, #55) and its interpreted ops are DELETED - so the
+             * section shows the native_leaf line + a single enter.nat
+             * instead of a container-plan READY line. (Before, it was
+             * "READY but no fragment" - fully native-eligible yet below
+             * the run floor, so the native code never ran.) */
             const std::string add = section(d, "; ===== func add");
             const bool add_ok =
-                add.find("container plan: READY") != std::string::npos;
+                add.find("native_leaf: whole body") != std::string::npos
+                && add.find("enter.nat") != std::string::npos;
             /* wc: the dict-building foreach body is fully native-eligible now. */
             const std::string wc = section(d, "; ===== func wc");
             const bool wc_ok =
@@ -16390,8 +16402,15 @@ static bool vm_disasm_closure_shape()
         if (!b)
             return false;
 
-        /* (a) the returned lambda is disassembled with its capture struct. */
+        /* (a) the returned lambda is disassembled with its capture struct.
+         * JIT off for the dump: with it on, the 2-op closure body is a
+         * native_leaf whose interpreted ops are deleted (no MIN_RUN), so the
+         * named `load.capture` op would not be visible - this test asserts
+         * the DISASSEMBLER's closure rendering, not the JIT. */
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = false;
         const std::string d = disassemble_program(b);
+        g_jit_enabled = jit_was;
         const bool closure_shown =
             d.find("closure#") != std::string::npos
             && d.find("captures (anon struct): { n }") != std::string::npos
@@ -16408,9 +16427,13 @@ static bool vm_disasm_closure_shape()
                 }
         bool halt_dropped = false;
         if (f && f->body && f->body->is_block()) {
+            /* jit=false: this asserts the CODEGEN shape (the dead Halt is
+             * dropped) - with the JIT on, the 2-op body is a native_leaf
+             * whose interpreted ops are deleted (no MIN_RUN), so code.back()
+             * would be the EnterNative, not the ReturnV. */
             Chunk ch = codegen_chunk(
                 static_cast<const Block *>(f->body.get()),
-                f->desc->frame_size);
+                f->desc->frame_size, /*jit=*/false);
             halt_dropped = !ch.code.empty()
                         && ch.code.back().op == OpCode::ReturnV;
         }

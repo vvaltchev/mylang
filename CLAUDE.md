@@ -501,8 +501,14 @@ benches affected - roadmap E3 records it).
 **NATIVE x86-64 AOT — N0/N1 (plans/native-aot.md; `jit.{h,cpp}`).** The
 incremental baseline tier: `jit_compile_chunk` runs LAST in
 `codegen_chunk` (after specialize_arith_ops; a `.myv` load will call it
-the same way), finds maximal STRAIGHT-LINE runs (>= 4 ops; any branch or
-branch TARGET splits) of the never-throwing int tier (the B1/B2
+the same way), finds maximal STRAIGHT-LINE runs (EVERY run compiles — the
+old `MIN_RUN` >= 4 floor was REMOVED 2026-07-25: with most ops nativized,
+the short runs it excluded were mostly whole TINY bodies — a 2-op
+comparator `func(a,b) => a < b` — which become `native_leaf` and get
+CALLED directly by a caller fragment, paying no `EnterNative` at all;
+measured callgrind Ir: sort_custom_cmp 0.93x, map_filter 0.95x,
+bool_reduce 0.97x, loop/recursion benches neutral; any branch or
+branch TARGET splits a run) of the never-throwing int tier (the B1/B2
 specialized arithmetic, IntModRI/IntAddModRI with the imm 0/-1 idiv-trap
 exclusions, imm shifts with negative counts left interpreted,
 LoadImmInt), hand-emits each into a per-chunk mmap'd W^X buffer
@@ -719,9 +725,10 @@ flag is the only compile-time need). **2.1 (the call):** a `JitCtx` (slot->desc
 map, `global_slot_reassigned`, the chunk's own `caller_desc`) is threaded into
 `jit_compile_chunk`; `callv_native_ok` is the COMPILE-TIME gate (a plain CallV,
 write-once global slot, callee `native_leaf`, function caller); `op_run_eligible`
-folds it into run-building, and a run holding a native call forms regardless of
-`MIN_RUN` (the boxed arg-setup MoveVs split a call loop into short runs, but the
-call's dispatch-removal is the point). The emit: `push rdi`; call **`jit_call_setup`**
+folds it into run-building (since the MIN_RUN removal EVERY run forms, so the
+old call-bearing-run exemption — `run_has_native_call` — is gone; the boxed
+arg-setup MoveVs still split a call loop into short runs, each now a
+fragment). The emit: `push rdi`; call **`jit_call_setup`**
 (vm.cpp - resolves the callee FuncObject from its global slot, `vm_frame_setup`
 with `ret_chunk = caller_desc->vm_chunk`, `ret_pc = pc+1`; catches
 StackOverflow/bind throw -> `g_vm_jit_exc` + null return); `test/jnz` (null ->
@@ -5118,8 +5125,9 @@ non-empty `node_table` is the ONE remaining section that says the AST can't yet
 be dropped for that chunk. Each chunk's header also shows its **CONTAINER PLAN**
 (model-flip M1, `jit_container_plan`, `jit.cpp`): how the body partitions into
 NATIVE vs ISLAND segments and whether it could be ONE native container —
-`READY` (every op native-ELIGIBLE, a looser bar than `native_leaf`: it counts a
-sub-`MIN_RUN` run the flip WOULD nativize) or `NOT ready` with each blocking
+`READY` (every op native-ELIGIBLE, a looser bar than `native_leaf`: an op can
+be run-eligible yet sit in a run whose compilation declined) or `NOT ready`
+with each blocking
 island's pc span + its distinct un-nativizable opcodes (the "what to nativize
 next" surface). DUMP-ONLY today; see **THE MODEL FLIP** below and
 `plans/model-flip.md`.

@@ -169,8 +169,9 @@ dispatch-bound tier.
 2. Find maximal runs of v1-compilable ops. v1 constraint: NO external
    branch targets an interior pc (single entry at the head); intra-run
    branches become fragment-local labels — a run containing its own
-   back edge iterates natively. Runs shorter than `MIN_RUN` (~4,
-   tunable by measurement) are skipped.
+   back edge iterates natively. (Runs shorter than `MIN_RUN` (~4) were
+   originally skipped; the floor was removed 2026-07-25 — every run
+   compiles, see plans/min-run-removal.md.)
 3. For each run: emit the fragment (two passes for label fixups —
    emit with rel32 placeholders, patch); every exit and every bail
    site is `mov eax, <resume pc>; ret`.

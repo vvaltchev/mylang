@@ -1,13 +1,40 @@
 # Removing MIN_RUN from the JIT (+ fixing the two tests it breaks)
 
-Status: **MEASURED and APPROVED in principle, NOT LANDED.** The maintainer
-(2026-07-25) is in favour of removing MIN_RUN entirely unless there is a good
-reason to keep it; the measurement below says there is not. The change was
-implemented, measured, and then REVERTED only because it fails two
-expectation tests that need a proper fix (see part 3) and the session was out
-of context budget. This file is the complete recipe to finish it.
+Status: **LANDED (2026-07-25).** MIN_RUN and `run_has_native_call` are gone;
+every eligible run compiles, and a whole tiny body (a 2-op comparator) becomes
+a `native_leaf`. Re-measured on the final build (callgrind Ir, matched plain
+releases): 34_sort_custom_cmp **0.929x**, 35_map_filter **0.948x**,
+57_bool_reduce **0.973x**; 01_while_loop / 09_fib_recursive / 43_sieve
+1.0000-1.0008x (the residual is the one-time extra fragment-compile cost —
+at scale it vanishes: 01_while_loop scale-10 = 1.0033x).
 
-Everything here is self-contained — no conversation context required.
+**Post-landing corrections to part 3** (the recorded diagnosis was partly
+wrong — kept below for history, corrected here):
+
+* **3b's real root cause:** `codegen_counts` did NOT throw (the earlier
+  "an earlier guard fires" inference was itself an artifact of the botched
+  instrumentation). Per-flag instrumentation showed exactly two flags failing
+  — `break_finally_native_ok` and `expr_body_chunk_ok` — and BOTH use
+  **`codegen_func_counts`**, the sibling helper, which (unlike
+  `codegen_counts`) did not disable the JIT: it called
+  `codegen_chunk(body, fsize)` with the default `jit=true`. With no MIN_RUN,
+  the 2-op `func inc1(int x) => x + 1` body becomes a native_leaf whose
+  interpreted ops are DELETED (retv 1 -> 0), and the finally-test's short
+  IntBin runs get deleted too (intbin < 3). Fix: pass `/*jit=*/false` —
+  count the PRE-JIT chunk, exactly what `codegen_counts`' comment already
+  prescribed for itself.
+* **A THIRD test failed** (the plan predicted two): `vm: disasm closures +
+  halt-drop`. Same class twice over — its part (b) called `codegen_chunk`
+  with `jit=true` (the `{ return x + 1; }` body's ReturnV got deleted), and
+  its part (a) greps `disassemble_program` for `load.capture`, which vanished
+  because the 2-op closure body is now itself a native_leaf with deleted
+  ops. Fix: `jit=false` for (b), and `g_jit_enabled=false` around the dump
+  for (a) — both assert disassembler/codegen behavior, not JIT behavior.
+* 3a was as predicted, except the disasm prints a `; native_leaf: whole
+  body -> one fragment` line INSTEAD of a container-plan line for a
+  native_leaf chunk — the test now asserts that line + the `enter.nat`.
+
+Everything below is the pre-landing recipe, kept for reference.
 
 
 ## 1. What MIN_RUN is and why it should go
