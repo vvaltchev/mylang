@@ -567,9 +567,28 @@ The order:
    use (`s += p.x` fuses into StructFieldAddInt). MEASURED:
    64_struct_create **0.966x** (its 3 islands gone); 65_struct_field_sum
    unchanged (its islands are step 4's); controls 1.0000.
-4. **The 65_struct_field_sum trio** - StructFieldAddInt + ForStepElemInt
-   (inline fusion emits, the IntAddStep precedent) + EmplaceStruct (a
-   helper, the AppendV precedent). That bench's whole hot loop goes native.
+4. **The 65_struct_field_sum trio** - **DONE (2026-07-25).**
+   StructFieldAddInt: the field read via jit_struct_field_add_int
+   (vm_struct_field_int, never throws -> op_fully_native); the ADD + dst
+   write stay IN the fragment so the accumulator remains N5-cacheable.
+   ForStepElemInt (a branch): the base GATE runs BEFORE the counter step
+   (a bail re-runs the WHOLE op - a post-step bail would DOUBLE-STEP),
+   then step/test/the shared flat tails/jump. EmplaceStruct: helper +
+   baked &emplace_sites[idx] (kind-formed arg0 like the interpreter;
+   N5 = mark_barrier, run length lives in the pool).
+   **PLUS a REAL pre-existing JIT bug found+fixed: a NEGATIVE index in
+   the native element reads (LoadElemInt/Float, JumpUnlessElemInt)
+   RAISED OOB where both interpreters WRAP (`a[-1]`)** - fixed in the
+   shared emit_elem_bounds_or_wrap with the wrap on the COLD side (the
+   first hot-path version cost 18_foreach_array +3.3%; the final hot
+   path is the ORIGINAL single unsigned compare, 1.0000x). Pinned by
+   the "negative array index wraps" test. SHAPE TRAPS (counter-caught):
+   StructFieldAddInt fires on the FOREACH struct chain `s = (s + p.x +
+   p.y) % k`, not `for i: s = s + a[i].x` (boxed); ForStepElemInt needs
+   an IntAddModRI body (`s = (s + x) % k`) - a plain `s += a[i]` is
+   claimed by IntAddStep. MEASURED: 65_struct_field_sum **0.604x**,
+   58_structs **0.896x**, 68_nested 0.997; 18_foreach_array/43_sieve/
+   01_while_loop 1.0000.
 5. **Tail singles**: UnpackElemInt/Float/Value/Targets + MultiUnpackV (the
    ForeachDyn bodies are 90% of the work), IncDecCheckedV/ElemChecked/
    MemberChecked/ChainV, DeclConstV (also the container test's current

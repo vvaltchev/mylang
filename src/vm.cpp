@@ -2774,6 +2774,52 @@ extern "C" int jit_load_member(int_type dst, int_type base_slot,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native StructFieldAddInt READ half - the #9
+ * fusion `dst = other + a[i].f`'s proven no-fault field read (the exact
+ * vm_struct_field_int the interpreter calls). The ADD and the dst write run
+ * in the FRAGMENT (cache-aware - the dst is the reduction's hot accumulator,
+ * which must stay N5-pinnable), so the helper only reads. Never throws. */
+extern "C" int_type jit_struct_field_add_int(int_type base_slot, int_type idx,
+                                             int_type fidx) noexcept
+{
+    ML_JIT_OP_RAN(StructFieldAddInt);
+    Frame *f = g_current_ctx->frame;
+    return vm_struct_field_int(f->at(base_slot).get(), idx, fidx);
+}
+
+/* model-flip (nativize-ops): the native EmplaceStruct body - append(struct_arr,
+ * Ctor(args)) with the ctor's field VALUES in the run at run_base. Forms
+ * arg0's LValue* by kind EXACTLY like the interpreter handler (an undefined
+ * GLOBAL passes nullptr - vm_do_emplace's own error), runs the shared
+ * vm_do_emplace, writes dst. A throw (coerce / const / non-lvalue) rides
+ * g_vm_jit_exc; a LOC-LESS one gets this pc's side-table caret at the
+ * re-raise == the interpreted handler's vm_stamp_loc; one carrying a pooled
+ * per-field caret keeps it (vm_raise stamps only empty locs). `sitev` = a
+ * baked &chunk.emplace_sites[idx]. */
+extern "C" int jit_emplace_struct(int_type dst, int_type base_slot,
+                                  int_type kind, const void *sitev,
+                                  int_type run_base) noexcept
+{
+    ML_JIT_OP_RAN(EmplaceStruct);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::EmplaceSite &site =
+        *static_cast<const Chunk::EmplaceSite *>(sitev);
+    LValue *target;
+    switch (kind) {
+    case 0:  target = &ctx->frame->at(base_slot); break;
+    case 1:  target = ctx->gfuncs->defined[base_slot]
+                 ? &ctx->gfuncs->slots[base_slot] : nullptr; break;
+    default: target = &(*ctx->captures)[base_slot]; break;
+    }
+    try {
+        ctx->frame->at(dst).put(vm_do_emplace(*ctx, site, target, run_base));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
  * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
  * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws

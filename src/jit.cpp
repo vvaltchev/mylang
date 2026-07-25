@@ -758,6 +758,26 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::LoadMemberInt:
     case OpCode::LoadMemberFloat:
         return true;
+    /* model-flip (nativize-ops): the #9 fusion `dst = other + a[i].f` - the
+     * proven no-fault field read via jit_struct_field_add_int, the add + the
+     * dst write in the FRAGMENT (the dst is the reduction's hot accumulator,
+     * kept cache-aware). Never throws -> op_fully_native. */
+    case OpCode::StructFieldAddInt:
+        return true;
+    /* model-flip (nativize-ops): the #9 back-edge fusion `for i: ... a[i]` -
+     * step + test + the element load, emitted inline (emit_branch). The
+     * BASE GATE (array/non-slice/ints-or-bools) runs BEFORE the counter
+     * step, because a bail re-runs the WHOLE op and a post-step bail would
+     * double-step; an OOB RAISES (JR_OOB, this pc's caret). NOT
+     * op_fully_native (gate bail + raise). */
+    case OpCode::ForStepElemInt:
+        return true;
+    /* model-flip (nativize-ops): append(struct_arr, Ctor(args)) via
+     * jit_emplace_struct (the shared vm_do_emplace over the field-value run;
+     * bakes &emplace_sites[idx]). A coerce/const throw re-raises. NOT
+     * op_fully_native. */
+    case OpCode::EmplaceStruct:
+        return true;
     /* model-flip (nativize-ops): a slice READ base[start:end] via jit_slice (the
      * runtime Type::slice; a non-int bound / non-sliceable base throws
      * TypeErrorEx -> exit -> EnterNative re-raises). base/start/end/dst are frame
@@ -1494,6 +1514,34 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * (dyn/bool/string), never an int-scalar cache candidate anyway. */
             bad(in.target2);
             break;
+        case OpCode::StructFieldAddInt:
+            /* idx (a) is materialized cache-aware pre-call; `other`
+             * (b_dual_hi) and the dst are read/written via the cache-aware
+             * read_slot/write_slot in the FRAGMENT - all stay countable int
+             * uses (the dst is the reduction's hot accumulator). Only the
+             * base array slot must stay in memory. */
+            bad(in.target2);
+            if (!in.a_is_lit()) usei(in.a_slot());
+            usei(static_cast<int>(in.b_dual_hi()));
+            usei(in.target);
+            break;
+        case OpCode::ForStepElemInt:
+            /* counter (target2) stepped + used as the index cache-aware;
+             * bound (a) cache-aware; the elem dst (b_dual_hi) written via
+             * write_slot. The base array slot stays in memory. */
+            bad(static_cast<int>(in.b_dual_lo()));
+            usei(in.target2);
+            if (!in.a_is_lit()) usei(in.a_slot());
+            usei(static_cast<int>(in.b_dual_hi()));
+            break;
+        case OpCode::EmplaceStruct:
+            /* the field-value RUN length lives in the emplace_sites pool
+             * (nfields), not in the instruction - the emitter cannot
+             * enumerate the slots the helper reads. BRACKET it (the
+             * StructCtorBoxedV rule; not a branch, so the reload always
+             * runs). */
+            mark_barrier(pc);
+            break;
         case OpCode::DictIterInit:
             /* reads the dict slot (target2) from memory; target is the iter_id,
              * not a slot. The iterator state itself is activation-side. */
@@ -1746,17 +1794,76 @@ static void emit_reg_shift(Emitter &e, Op aop, uint32_t pc)
  * memory would force the index to be disqualified from pinning for the whole
  * fragment - which is exactly how a hot loop counter lost its register once
  * runs began merging (mov_rr encodes r9 as a destination directly). */
+/* Load a SLOT's int payload into r9, cache-aware. */
+static void load_slot_r9(Emitter &e, int slot)
+{
+    const int cr = e.creg(slot);
+    if (cr >= 0)
+        e.mov_rr(9 /* r9 */, static_cast<uint8_t>(cr));
+    else
+        e.mov_r9_slot(slot_addr(slot).payload);
+}
+
 static void load_index_r9(Emitter &e, const Instr &in)
 {
     if (in.a_is_lit()) {
         e.movabs_r9(static_cast<uint64_t>(in.a_lit()));
         return;
     }
-    const int cr = e.creg(in.a_slot());
-    if (cr >= 0)
-        e.mov_rr(9 /* r9 */, static_cast<uint8_t>(cr));
+    load_slot_r9(e, in.a_slot());
+}
+
+/* The index bounds check with the NEGATIVE-index WRAP on the COLD side
+ * (r9 = idx, rdx = count): the HOT path is the ORIGINAL single unsigned
+ * compare (a non-negative in-range index falls straight through to the load
+ * - zero added cost; the first wrap version put a sign test on the hot path
+ * and cost 18_foreach_array +3.3% Ir). The unsigned-out-of-range COLD side
+ * distinguishes: negative -> `idx += size` (EXACTLY the interpreter - the
+ * jit used to raise OOB for a[-1] where both interpreters returned the
+ * wrapped element, a REAL pre-existing divergence) + a re-check; a
+ * non-negative or still-negative-after-wrap index RAISES OutOfBounds (this
+ * pc's caret), matching the interpreter's `idx < 0 ||` check. */
+static void emit_elem_bounds_or_wrap(Emitter &e, uint32_t pc)
+{
+    e.cmp_r9_rdx();
+    const size_t j_load = e.j32(0x72);       /* jb: in range -> the load */
+    /* cold: unsigned out-of-range - negative (wrap) or genuine OOB */
+    e.u8(0x4D); e.u8(0x85); e.u8(0xC9);      /* test r9, r9 */
+    {
+        const size_t j_wrap = e.j8(0x78);    /* js -> the wrap */
+        emit_raise(e, JR_OOB, pc);           /* non-negative OOB */
+        e.patch8(j_wrap, e.pos());
+    }
+    e.u8(0x49); e.u8(0x01); e.u8(0xD1);      /* add r9, rdx (idx += size) */
+    e.cmp_r9_rdx();
+    raise_unless(e, 0x72, JR_OOB, pc);       /* doubly-negative -> OOB */
+    e.patch32_here(j_load);
+}
+
+/* The per-kind FLAT element read tail (rax = the shobj): data -> rcx,
+ * count -> rdx, the index -> r9 (from the op's a-operand when `idx_in`, else
+ * cache-aware from `idx_slot`), then emit_elem_bounds_or_wrap (hot unsigned
+ * check; cold negative wrap / OOB raise), else the element lands in RAX.
+ * Shared by every flat int/bool element reader so the semantics cannot
+ * drift. */
+static void emit_flat_int_tail(Emitter &e, uint32_t pc, bool bools,
+                               const Instr *idx_in, int idx_slot)
+{
+    const JitLayout &L = jit_layout();
+    e.mov_rcx_rax(L.data_off);
+    e.mov_rdx_rax(L.data_off + 8);
+    e.sub_rdx_rcx();
+    if (!bools)
+        e.sar_rdx_3();
+    if (idx_in)
+        load_index_r9(e, *idx_in);
     else
-        e.mov_r9_slot(slot_addr(in.a_slot()).payload);
+        load_slot_r9(e, idx_slot);
+    emit_elem_bounds_or_wrap(e, pc);
+    if (bools)
+        e.load_elem_byte();                  /* movzx eax,[rcx+r9] */
+    else
+        e.load_elem_int();                   /* mov rax,[rcx+r9*8] */
 }
 
 /*
@@ -1764,10 +1871,10 @@ static void load_index_r9(Emitter &e, const Instr &in)
  * and the JumpUnlessElemInt fusion (`if (arr[i])`). Navigates slot -> shobj ->
  * kind + data, unsigned bounds-checks, and reads the element - accepting BOTH
  * flat `ints` (8-byte) and flat `bools` (1-byte, 0/1), exactly what the
- * interpreter accepts for these ops. A non-array / SLICE / other-kind base
- * BAILS (the interpreter re-runs the op); an out-of-range index RAISES
- * OutOfBounds with the op's caret (approach A - no re-interpret).
- * Clobbers rax/rcx/rdx/r9.
+ * interpreter accepts for these ops. A non-array / SLICE / other-kind base or
+ * a NEGATIVE index BAILS (the interpreter re-runs the op - and wraps the
+ * negative); an out-of-range index RAISES OutOfBounds with the op's caret
+ * (approach A - no re-interpret). Clobbers rax/rcx/rdx/r9.
  */
 static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc)
 {
@@ -1786,25 +1893,34 @@ static void emit_elem_int_read(Emitter &e, const Instr &in, uint32_t pc)
     e.bail_unless(0x74, pc);                 /* je (bools) else BAIL */
     /* flat bools: 1-byte elements, so the count is the raw pointer difference
      * (no sar) and the load is a movzx. */
-    e.mov_rcx_rax(L.data_off);
-    e.mov_rdx_rax(L.data_off + 8);
-    e.sub_rdx_rcx();
-    load_index_r9(e, in);
-    e.cmp_r9_rdx();
-    raise_unless(e, 0x72, JR_OOB, pc);
-    e.load_elem_byte();                      /* movzx eax,[rcx+r9] */
+    emit_flat_int_tail(e, pc, /*bools=*/true, &in, -1);
     const size_t j_done = e.j32(0xEB);
     /* flat ints */
     e.patch32_here(j_ints);
-    e.mov_rcx_rax(L.data_off);
-    e.mov_rdx_rax(L.data_off + 8);
-    e.sub_rdx_rcx();
-    e.sar_rdx_3();
-    load_index_r9(e, in);
-    e.cmp_r9_rdx();
-    raise_unless(e, 0x72, JR_OOB, pc);
-    e.load_elem_int();                       /* mov rax,[rcx+r9*8] */
+    emit_flat_int_tail(e, pc, /*bools=*/false, &in, -1);
     e.patch32_here(j_done);
+}
+
+/* The BASE GATE alone (no read): bail unless the slot holds a NON-slice flat
+ * int/bool array. ForStepElemInt must run every bail-able check BEFORE it
+ * steps the counter - a bail re-runs the WHOLE op, and a post-step bail would
+ * DOUBLE-STEP. Clobbers rax/r9. */
+static void emit_elem_base_gate(Emitter &e, int base_slot, uint32_t pc)
+{
+    const JitLayout &L = jit_layout();
+    const SlotAddr base = slot_addr(base_slot);
+    e.load(RAX, base.type);
+    e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+    e.cmp_rax_r9();
+    e.bail_unless(0x74, pc);
+    e.cmp_byte_rdi(base.payload + L.slice_off, 0);
+    e.bail_unless(0x74, pc);
+    e.load(RAX, base.payload);
+    e.cmp_byte_rax(L.kind_off, L.kind_ints);
+    const size_t j_ok = e.j8(0x74);
+    e.cmp_byte_rax(L.kind_off, L.kind_bools);
+    e.bail_unless(0x74, pc);
+    e.patch8(j_ok, e.pos());
 }
 
 static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
@@ -2098,9 +2214,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.sub_rdx_rcx();
             e.sar_rdx_3();                        /* rdx = element count */
             load_index_r9(e, in);                 /* cache-aware index */
-            e.cmp_r9_rdx();
-            raise_unless(e, 0x72, JR_OOB, pc);   /* jb (idx < count) else
-                                                  * RAISE OutOfBounds */
+            /* hot unsigned bounds check; cold negative wrap / OOB raise
+             * (raising OOB for a[-1] was the same pre-existing divergence) */
+            emit_elem_bounds_or_wrap(e, pc);
             e.load_elem_float();                 /* movsd xmm0,[rcx+r9*8] */
             emit_float_store(e, ck, X0, in.target, pc);
             return true;
@@ -2478,6 +2594,56 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           &ck.unpack_targets[in.b_lit()]));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_foreach_dyn_init) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::StructFieldAddInt: {
+        /* dst = other + a[i].f: the field read via the never-throwing
+         * jit_struct_field_add_int (rdi=base slot, rsi=idx VALUE - loaded
+         * cache-aware BEFORE the prologue, rdx=field idx), then the ADD and
+         * the dst write IN the fragment (rax survives the epilogue), so the
+         * reduction's accumulator dst stays cache-aware. */
+        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.mov_rr(RSI, RAX);
+        e.movabs(RDX, static_cast<uint64_t>(
+                          static_cast<int_type>(in.b_dual_lo())));
+        e.call_relocs.push_back(
+            { e.pos(),
+              reinterpret_cast<const void *>(jit_struct_field_add_int) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        read_slot(e, RCX, in.b_dual_hi());        /* other */
+        op_rr(e, Op::plus);                        /* rax += rcx */
+        write_slot(e, ck, RAX, in.target, pc);
+        return true;
+    }
+
+    case OpCode::EmplaceStruct:
+        /* append(struct_arr, Ctor(args)) via jit_emplace_struct(dst,
+         * base_slot, kind, &emplace_sites[idx], run base) - `a` packs
+         * kind | idx << 2 (the interpreter's layout); r8 carries the 5th
+         * arg (the epilogue re-materializes r8 = t_float after the call).
+         * A throw -> test eax + exit_pc re-raise. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(in.a_lit() & 3));
+        e.movabs(RCX, reinterpret_cast<uint64_t>(
+                          &ck.emplace_sites[in.a_lit() >> 2]));
+        e.movabs_r8(static_cast<uint64_t>(in.b_lit()));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_emplace_struct) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
@@ -3144,6 +3310,51 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::ForStepElemInt: {
+        /* #9 back-edge fusion: step + test + the a[i] element load in one op.
+         * ORDER MATTERS: the base GATE (array / non-slice / ints-or-bools,
+         * every check that can BAIL) runs FIRST - a bail re-runs the WHOLE
+         * op, so a post-step bail would DOUBLE-STEP the counter. Then step
+         * (cache-aware), test vs the bound; NOT-go falls through with no
+         * load (the counter is out of range there, matching the
+         * interpreter); GO reads a[counter] via the shared flat tails
+         * (negative wraps, OOB raises with this pc's caret) into the elem
+         * slot and jumps to target. */
+        const JitLayout &L = jit_layout();
+        const bool up = in.aop == Op::lt || in.aop == Op::le;
+        const SlotAddr base = slot_addr(in.b_dual_lo());
+        e.bump_op(OpCode::ForStepElemInt);   /* before any loads (rax!) */
+        emit_elem_base_gate(e, in.b_dual_lo(), pc);
+        read_slot(e, RAX, in.target2);
+        e.u8(0x48); e.u8(0xFF); e.u8(up ? 0xC0 : 0xC8);   /* inc/dec rax */
+        write_slot(e, ck, RAX, in.target2, pc);
+        load_operand(e, RCX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        e.u8(0x48); e.u8(0x39); e.u8(0xC8);               /* cmp rax, rcx */
+        const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
+        /* the trusted read: the gate proved kind is ints or bools */
+        e.load(RAX, base.payload);            /* rax = shobj */
+        e.cmp_byte_rax(L.kind_off, L.kind_bools);
+        const size_t j_bools = e.j32(0x74);
+        emit_flat_int_tail(e, pc, /*bools=*/false, nullptr, in.target2);
+        const size_t j_done = e.j32(0xEB);
+        e.patch32_here(j_bools);
+        emit_flat_int_tail(e, pc, /*bools=*/true, nullptr, in.target2);
+        e.patch32_here(j_done);
+        write_slot(e, ck, RAX, in.b_dual_hi(), pc);
+        {
+            const size_t tgt = static_cast<size_t>(in.target);
+            if (tgt >= begin && tgt < end) {
+                e.u8(0xE9);
+                fixups.push_back({ e.pos(), tgt });
+                e.u32(0);
+            } else {
+                e.exit_pc(static_cast<uint32_t>(remap[in.target]));
+            }
+        }
+        e.patch32_here(j_fall);
+        return;
+    }
+
     case OpCode::DictIterNext: {
         /* dict foreach advance: jit_dict_iter_next (rdi=iter_id, rsi=k slot,
          * rdx=v slot; -1 == unbound) binds + advances and returns 1, or 0 on
@@ -3238,7 +3449,10 @@ static bool op_is_branch(OpCode op)
         /* the iterator advance ops: the helper binds + advances and returns
          * the verdict; the fragment jumps to end_pc on exhaustion. */
         || op == OpCode::DictIterNext
-        || op == OpCode::ForeachDynNext;
+        || op == OpCode::ForeachDynNext
+        /* the #9 back-edge fusion: step + test + the element load, jumping
+         * to the loop target when the loop continues. */
+        || op == OpCode::ForStepElemInt;
 }
 
 static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
