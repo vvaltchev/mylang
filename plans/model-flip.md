@@ -313,20 +313,28 @@ op's memory-accessed slots; a NON-throwing op is also `op_fully_native`
 is STRUCTURAL + cumulative (see the milestone framing above); measure each
 same-binary-A/B to confirm neutral-not-regression, don't expect a delta.
 
-**Done (island-op occurrences across bench/ → 0):** MoveV (168, `jit_move`),
-SubscriptV (87, `jit_subscript`, throwing-read), LoadBuiltinV (154,
-`jit_load_builtin`).
+**Done (6 ops, island-op occurrences across bench/ → 0; all perf-neutral +
+green + ASan/clang-clean):** MoveV (168, `jit_move`), SubscriptV (87,
+`jit_subscript`, throwing-read), LoadBuiltinV (154, `jit_load_builtin`),
+LoadConstV (112, `jit_load_const` - bakes the const-pool buffer addr),
+MemberV (`jit_member`, throwing-read, bakes the member-key buffer addr - a
+missing-member caret is byte-identical), StoreGlobalV-plain (35,
+`jit_store_global`; the compound `g OP=`/`g++` stays interpreted).
 
-**Remaining top blockers (bench tally):** CallBuiltinV (292 - the big one, but
-CALLS: builtin call, some with callbacks that re-enter vm_dispatch → careful),
-LoadConstV (112 - needs the const-pool value; bake `&chunk.consts[idx]`, the
-vector BUFFER is stable across the chunk's std::move even though `&chunk`
-dangles - or a trivial-only fast path), Halt (83 - a void-function end; the
-container/return-none path), MemberV (needs the pooled member-key + carets, same
-buffer-baking), MakeClosureV (35), StoreGlobalV (32), LoadLiteralObjV (27),
-DictLoadInt (17)... GOTCHA: an op needing a CHUNK pool (LoadConstV/MemberV) can't
-bake `&chunk` (it dangles - the chunk is stack-built then moved), but CAN bake
-the pool's heap BUFFER address (`vec.data()+idx`), which a vector move preserves.
+**Remaining top blockers (bench tally):** CallBuiltinV (~294 - the big one, but
+CALLS: a builtin call, some with callbacks that re-enter vm_dispatch → careful),
+Halt (83 - a void-function end; needs the return-none path, and the native_leaf
+predicate wants a trailing ReturnV so a Halt-ending body needs thought),
+MakeClosureV (35 - closure create: bake the FuncDescriptor* + snapshot captures
+from g_current_ctx), LoadLiteralObjV (27 - materialize a baked literal via
+eval_literal_obj, buffer-baking), DictLoadInt/Float (17 - typed dict read),
+CompoundV (11), ArrLen (10)... GOTCHA: an op needing a CHUNK pool
+(LoadConstV/MemberV/LoadLiteralObjV) can't bake `&chunk` (it dangles - the chunk
+is stack-built then moved) but CAN bake the pool's heap BUFFER address
+(`&vec[idx]`), which a vector move preserves (VERIFIED sound under ASan). A
+NON-throwing op must be op_fully_native too, else it makes an adjacent
+fully-native loop non-deletable. A partially-nativizable op (StoreGlobalV) gates
+on the instruction (`in.aop == Op::invalid`), not just the opcode.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);
