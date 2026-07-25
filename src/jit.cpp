@@ -802,6 +802,16 @@ static bool jit_op_eligible(const Instr &in)
      * slot's defined-flag; never throws -> op_fully_native). */
     case OpCode::DefinedGlobalV:
         return true;
+    /* model-flip (nativize-ops): the STRICT-unpack ops via jit_unpack_elem /
+     * jit_multi_unpack (the shared bodies; pool-baked target/coerce lists).
+     * The strict-length/non-array throws re-raise with side-table carets ->
+     * NOT op_fully_native. */
+    case OpCode::UnpackElemInt:
+    case OpCode::UnpackElemFloat:
+    case OpCode::UnpackElemValue:
+    case OpCode::UnpackElemTargets:
+    case OpCode::MultiUnpackV:
+        return true;
     /* model-flip (nativize-ops): an ALWAYS-THROWING construct. Its exception
      * mix includes NON-Runtime ones (UndefinedVariableEx/CannotRebindBuiltin)
      * that cannot ride g_vm_jit_exc, so the native form is simply an
@@ -1623,6 +1633,24 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             break;
         case OpCode::ThrowRuntimeV:
             break;                       /* no slots - it only exits */
+        case OpCode::UnpackElemInt:
+        case OpCode::UnpackElemFloat:
+        case OpCode::UnpackElemValue:
+            /* the helper writes the CONSECUTIVE dst run [target, target+N)
+             * (N = b_lit, enumerable) and reads the base from memory; the
+             * index is materialized cache-aware pre-call (the foreach
+             * counter stays a countable int use). */
+            bad(in.target2);
+            for (int_type k = 0; k < in.b_lit(); k++)
+                bad(in.target + static_cast<int>(k));
+            if (!in.a_is_lit()) usei(in.a_slot());
+            break;
+        case OpCode::UnpackElemTargets:
+        case OpCode::MultiUnpackV:
+            /* the target slots live in the unpack_targets pool - not
+             * enumerable here (no chunk). BRACKET (neither is a branch). */
+            mark_barrier(pc);
+            break;
         case OpCode::Jump:
         case OpCode::Halt:               /* returns none - reads/writes no slot */
             break;                       /* no slots */
@@ -2774,6 +2802,70 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         store_dst_bool(e, ck, RAX, in.target);
         return true;
     }
+
+    case OpCode::UnpackElemInt:
+    case OpCode::UnpackElemFloat:
+    case OpCode::UnpackElemValue:
+    case OpCode::UnpackElemTargets: {
+        /* jit_unpack_elem(dst_base, base_slot, idx, N|kind<<8, targets):
+         * the index is materialized cache-aware BEFORE the prologue (the
+         * foreach counter - rax survives the pushes); targets = the baked
+         * pool entry for the Targets variant (whose `target` is the POOL
+         * index, dst_base unused = -1), else null with the consecutive run
+         * base in `target`. A strict-unpack throw -> test eax + exit_pc. */
+        const int kind = in.op == OpCode::UnpackElemInt ? 0
+                       : in.op == OpCode::UnpackElemFloat ? 1 : 2;
+        const bool tg = in.op == OpCode::UnpackElemTargets;
+        load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(tg ? -1 : in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.mov_rr(RDX, RAX);                    /* the index value */
+        e.movabs(RCX, static_cast<uint64_t>(
+                          in.b_lit() | (static_cast<int_type>(kind) << 8)));
+        e.movabs_r8(tg ? reinterpret_cast<uint64_t>(
+                             &ck.unpack_targets[in.target])
+                       : 0);
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_unpack_elem) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+    }
+
+    case OpCode::MultiUnpackV:
+        /* jit_multi_unpack(rval_slot, targets, coerce, aop) - pool-baked
+         * target/coerce lists; a strict-length / coerce / compound throw ->
+         * test eax + exit_pc re-raise. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.movabs(RSI, reinterpret_cast<uint64_t>(
+                          &ck.unpack_targets[in.target]));
+        e.movabs(RDX, in.b_is_lit()
+                          ? reinterpret_cast<uint64_t>(
+                                &ck.unpack_coerce[in.b_lit()])
+                          : 0);
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_multi_unpack) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
 
     case OpCode::DeclConstV:
         /* const decl bind via jit_decl_const(dst, is_global, src). */
