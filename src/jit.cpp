@@ -673,6 +673,15 @@ static bool jit_op_eligible(const Instr &in)
      * throws. */
     case OpCode::MakeClosureV:
         return true;
+    /* model-flip (nativize-ops): the boxed-arith ops (dyn/string operands) via
+     * jit_boxed_* + the boxed_ops pool (target2 = the pool index, set by
+     * build_boxed_ops). vm_num_binop CAN throw (div0/type) -> NOT
+     * op_fully_native. Guard target2 (a valid pool index must exist - it always
+     * does post-build_boxed_ops, but be defensive against an un-pooled op). */
+    case OpCode::BinOpV:
+    case OpCode::CmpV:
+    case OpCode::CompoundV:
+        return in.target2 >= 0;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -988,6 +997,18 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * reads it. So disable caching for the WHOLE run - a closure-create
              * loop is not a hot int-arith loop where N5 matters. */
             return {};
+        case OpCode::BinOpV:
+        case OpCode::CmpV:
+            /* boxed operands/dst read/written from memory (dyn/string - not an
+             * int-scalar cache candidate anyway, but disqualify defensively). */
+            if (!in.a_is_lit()) bad(in.a_slot());
+            if (!in.b_is_lit()) bad(in.b_slot());
+            bad(in.target);
+            break;
+        case OpCode::CompoundV:
+            bad(in.target);              /* read + written from memory */
+            if (!in.b_is_lit()) bad(in.b_slot());
+            break;
         case OpCode::StoreGlobalV:
             /* reads the rhs slot from memory (target is a GLOBAL slot). */
             bad(in.a_slot());
@@ -1572,6 +1593,31 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         return true;
+
+    case OpCode::BinOpV:
+    case OpCode::CmpV:
+    case OpCode::CompoundV: {
+        /* jit_boxed_*(bop) where bop = &ck.boxed_ops[in.target2] (a stable
+         * pool-buffer address; build_boxed_ops stored the index in target2).
+         * rdi = bop. vm_num_binop can throw -> test eax + exit_pc so
+         * EnterNative re-raises with the op's caret from the loc side table. */
+        const void *fn = in.op == OpCode::BinOpV
+            ? reinterpret_cast<const void *>(jit_boxed_binop)
+            : in.op == OpCode::CmpV
+                ? reinterpret_cast<const void *>(jit_boxed_cmp)
+                : reinterpret_cast<const void *>(jit_boxed_compound);
+        emit_call_prologue(e);
+        e.movabs(RDI,
+                 reinterpret_cast<uint64_t>(&ck.boxed_ops[in.target2]));
+        e.call_relocs.push_back({ e.pos(), fn });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok = e.j8(0x74);       /* jz -> continue (0 = no raise) */
+        e.exit_pc(pc);                        /* raised: EnterNative re-raises */
+        e.patch8(j_ok, e.pos());
+        return true;
+    }
 
     case OpCode::StoreGlobalV: {
         /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd

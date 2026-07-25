@@ -244,6 +244,18 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
               << mk.memId.get_type()->to_string(mk.memId) << "\n";
         }
     }
+    if (!ch.boxed_ops.empty()) {
+        /* model-flip nativize-ops: the JIT-bakeable operand data for
+         * BinOpV/CmpV/CompoundV (the op stores this index in its target2).
+         * DERIVED from the code (build_boxed_ops) - a .myv load rebuilds it. */
+        s << "; -- boxed_ops (" << ch.boxed_ops.size()
+          << ", derived) --\n";
+        for (size_t i = 0; i < ch.boxed_ops.size(); i++) {
+            const auto &bo = ch.boxed_ops[i];
+            s << ";   [" << i << "]  slot" << bo.target << " "
+              << opsym(bo.aop) << "\n";
+        }
+    }
     if (!ch.catch_types.empty()) {
         s << "; -- catch_types (" << ch.catch_types.size() << ") --\n";
         for (size_t i = 0; i < ch.catch_types.size(); i++) {

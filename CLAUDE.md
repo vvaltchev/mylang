@@ -5104,7 +5104,9 @@ still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
-`member_keys`, `incdec_sites`, `incdec_chains`, `emplace_sites`,
+`member_keys`, `boxed_ops` (labelled *derived* - the model-flip nativize-ops
+JIT-bakeable operand data for BinOpV/CmpV/CompoundV; rebuilt on a `.myv` load,
+not primary), `incdec_sites`, `incdec_chains`, `emplace_sites`,
 `call_sites`, `catch_types`,
 `literal_objs`, `closure_defs`, `struct_defs`,
 `unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT

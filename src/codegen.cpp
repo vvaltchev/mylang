@@ -7577,6 +7577,24 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
             chunk.ref_slots.push_back(i);
 }
 
+/* model-flip nativize-ops: copy each BinOpV/CmpV/CompoundV's FINAL operand data
+ * (target + two Operands + the arith/compare Op) into Chunk::boxed_ops and store
+ * the pool index in the op's OTHERWISE-UNUSED target2, so the JIT can bake a
+ * STABLE pool-buffer address for these boxed ops (baking &code[pc] is unsafe -
+ * jit_compile_chunk rewrites the code vector). Runs on the final runtime code
+ * (post-peephole/specialize) UNCONDITIONALLY: the interpreter ignores target2
+ * for these ops, and the VM precompile jits in a LATER pass that needs the pool
+ * already built. */
+static void build_boxed_ops(Chunk &chunk)
+{
+    for (Instr &in : chunk.code)
+        if (in.op == OpCode::BinOpV || in.op == OpCode::CmpV
+                || in.op == OpCode::CompoundV) {
+            in.target2 = static_cast<int>(chunk.boxed_ops.size());
+            chunk.boxed_ops.push_back({ in.target, in.aop, in.a(), in.b() });
+        }
+}
+
 Chunk
 codegen_chunk(const Block *block, int slot_count, bool jit)
 {
@@ -7616,6 +7634,9 @@ codegen_chunk(const Block *block, int slot_count, bool jit)
                                        * a stale IntBin div0 loc entry for a
                                        * specialized (non-throwing) op is
                                        * never queried */
+    build_boxed_ops(cg.chunk);        /* model-flip: BinOpV/CmpV/CompoundV pool
+                                       * (stable JIT-bakeable operand data;
+                                       * stores the pool index in target2) */
     /* #55 STEP 2: set the native_leaf FLAG from the (now final, specialized)
      * ops - BEFORE jit, so the precompile can defer jit and still have every
      * callee's flag for a caller's native-call gate. jit_compile_chunk reads

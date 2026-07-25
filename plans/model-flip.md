@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (10 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (13 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -358,22 +358,44 @@ emit site can't name to `bad()`-disqualify, DISABLE caching for the run. Every
 other done op reads only KNOWN slots (target/target2/a_slot), each explicitly
 `bad()`.
 
+**Step 11 - the BOXED-ARITH pool (BinOpV / CmpV / CompoundV, DONE).** These
+boxed ops' multi-operand data (target + two Operands + aop) can't fit in the
+SysV registers a JIT helper call gets, and baking `&code[pc]` is UNSAFE
+(jit_compile_chunk REWRITES the code vector - EnterNative insert / drop
+originals). The fix is a serializable per-op pool **`Chunk::boxed_ops`**
+(bytecode.h): `build_boxed_ops` (codegen.cpp, run post-peephole/specialize,
+UNCONDITIONALLY - the interpreter ignores it) copies each op's FINAL operand
+data into the pool and stores the index in the op's OTHERWISE-UNUSED `target2`
+(verified unused for these ops in the interpreter, visit_use_def, and the
+retarget whitelist); the JIT bakes `&ck.boxed_ops[in.target2]` (a stable pool-
+buffer address) and `jit_boxed_binop`/`_cmp`/`_compound` (vm.cpp) run the
+interpreter's EXACT boxed_operand + vm_num_binop bodies. Throwing (div0/type) ->
+g_vm_jit_exc + exit_pc, caret from the loc side table (byte-identical, VERIFIED
+vs -tw). `-vd` dumps boxed_ops (labelled `derived` - rebuilt on a .myv load, not
+primary data). EXECUTION-PROVEN (jit_op_nativized cases: BinOpV=5/CmpV=5/
+CompoundV=5). **The container test's islands SHIFTED to `~dyn` (UnaryV):**
+BinOpV/CmpV/CompoundV/MoveV are now NATIVE, so the jit_container test (which used
+them as boxed islands) had to switch to an op that is STILL boxed - the model
+flip working as intended (islands shrink; UnaryV/LogV/CoerceNumV remain).
+
 **Remaining top blockers (bench tally):** CallBuiltinV (~294 - the big one, but
 CALLS: a builtin call, some with callbacks that re-enter vm_dispatch → careful),
 Halt (83 - a void-function end; needs the return-none path, and the native_leaf
 predicate wants a trailing ReturnV so a Halt-ending body needs thought), the
-BOXED-ARITH islands CompoundV (11) / BinOpV (15) / CmpV / LogV / UnaryV (their
-multi-operand data can't fit in registers, and baking `&ck.code[pc]` is UNSAFE -
-jit_compile_chunk REWRITES the code vector when it inserts EnterNative / drops
-originals; they need a serializable per-op pool, like builtin_calls). GOTCHA: an
-op needing a CHUNK pool (LoadConstV/MemberV/LoadLiteralObjV/DictLoad-key) can't
-bake `&chunk` (it dangles - the chunk is stack-built then moved) but CAN bake
-the pool's heap BUFFER address (`&vec[idx]`), which a vector move preserves
-(VERIFIED sound under ASan); a program-lifetime object POINTER
-(FuncDescriptor*) is bakeable as a VALUE directly (MakeClosureV/CallV). A
-NON-throwing op must be op_fully_native too, else it makes an adjacent
-fully-native loop non-deletable. A partially-nativizable op (StoreGlobalV) gates
-on the instruction (`in.aop == Op::invalid`), not just the opcode.
+still-boxed unary/logical islands UnaryV / LogV / CoerceNumV (each could reuse
+the boxed_ops-pool pattern OR pass in registers - UnaryV is 1-operand, so it
+FITS in registers, no pool needed). GOTCHA: an op needing a CHUNK pool
+(LoadConstV/MemberV/LoadLiteralObjV/DictLoad-key/boxed-arith) can't bake
+`&chunk` (it dangles - the chunk is stack-built then moved) but CAN bake the
+pool's heap BUFFER address (`&vec[idx]`), which a vector move preserves
+(VERIFIED sound under ASan); a program-lifetime object POINTER (FuncDescriptor*)
+is bakeable as a VALUE directly (MakeClosureV/CallV); a MULTI-operand op whose
+data can't fit in registers AND can't bake &code[pc] (rewritten by jit) needs a
+serializable per-op pool + a spare Instr field for the index (target2 for the
+boxed-arith ops). A NON-throwing op must be op_fully_native too, else it makes an
+adjacent fully-native loop non-deletable. A partially-nativizable op
+(StoreGlobalV) gates on the instruction (`in.aop == Op::invalid`), not just the
+opcode.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);

@@ -250,6 +250,16 @@ extern "C" int jit_dict_load(int_type dst, int_type base_slot,
  * program-lifetime FuncDescriptor* (baked as a value). Never throws. */
 extern "C" void jit_make_closure(int_type dst, const void *def) noexcept;
 
+/* model-flip (nativize-ops): the BOXED-ARITH ops BinOpV / CmpV / CompoundV -
+ * the interpreter's exact boxed_operand + vm_num_binop bodies. `bop` is a baked
+ * `&chunk.boxed_ops[idx]` (the op's operand data - target/a/b/aop - copied into
+ * a stable serializable pool, since baking &code[pc] is unsafe). A num_bin_op
+ * throw (div0 / type) catches into g_vm_jit_exc + returns 1 (EnterNative
+ * re-raises with the loc from the side table); returns 0 otherwise. */
+extern "C" int jit_boxed_binop(const void *bop) noexcept;
+extern "C" int jit_boxed_cmp(const void *bop) noexcept;
+extern "C" int jit_boxed_compound(const void *bop) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is

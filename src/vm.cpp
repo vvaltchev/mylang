@@ -1968,6 +1968,66 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native BOXED-ARITH bodies (BinOpV / CmpV /
+ * CompoundV) - the interpreter's EXACT bodies (boxed_operand + vm_num_binop,
+ * int/float promotion, string `+`, bitwise). `bop` is a `&chunk.boxed_ops[idx]`
+ * (baked pool-buffer address, stable across the chunk move); it holds the FINAL
+ * operand data (target/a/b/aop) so the JIT never bakes an unstable &code[pc].
+ * g_current_ctx->frame is the running callee frame. A num_bin_op throw (div0 /
+ * type) is caught LOC-LESS into g_vm_jit_exc + returns 1, so EnterNative
+ * re-raises stamping the op's caret from the loc side table (extract_locs
+ * records these ops) - byte-identical to the interpreted stamp_operand_loc. */
+extern "C" int jit_boxed_binop(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(BinOpV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue sa, sb;
+    EvalValue val = boxed_operand(bo->a, ctx, sa).clone();
+    try {
+        vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(std::move(val));
+    return 0;
+}
+
+extern "C" int jit_boxed_cmp(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(CmpV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue sa, sb;
+    EvalValue val = boxed_operand(bo->a, ctx, sa);
+    try {
+        vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(EvalValue(val.is_true()));
+    return 0;
+}
+
+extern "C" int jit_boxed_compound(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(CompoundV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue sb;
+    EvalValue nv = ctx->frame->at(bo->target).get();
+    try {
+        vm_num_binop(nv, boxed_operand(bo->b, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(std::move(nv));
+    return 0;
+}
+
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off

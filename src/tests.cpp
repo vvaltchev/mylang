@@ -14583,9 +14583,13 @@ static bool jit_native_call()
  * native CONTAINER - one EnterNative drives the body, the boxed ISLAND is a
  * `call jit_exec_block`, the ReturnV is native. PROVE it ran (g_jit_container_
  * calls bumps, the "prove the code ran" rule) with a correct result, AND that a
- * throw from the island propagates + is catchable. dyn params keep the body
- * boxed (an island); the block body keeps it above the inline threshold (so it
- * stays a real call, not inlined away); runtime() keeps the args non-const. */
+ * throw propagates + is catchable. dyn params keep the body boxed; the block
+ * body keeps it above the inline threshold (so it stays a real call, not inlined
+ * away); runtime() keeps the args non-const. The ISLAND op is `~dyn` (UnaryV) -
+ * BinOpV/CmpV/CompoundV/MoveV are now NATIVE (the nativize-ops path), so the
+ * boxed islands here use an op that is STILL boxed (UnaryV; unary `~` is never
+ * M8-specialized). Straight-line containers need an island >= MIN_CONTAINER_
+ * ISLAND, so subtest (1) chains 6 `~` (an even count -> identity for int). */
 static bool jit_container()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -14617,20 +14621,23 @@ static bool jit_container()
     };
 
     const unsigned long b0 = g_jit_container_calls;
-    /* (1) a boxed-island container, run in a loop; correct result. */
+    /* (1) a straight-line boxed-island container; correct result. Six `~` on a
+     * dyn = a 6-op UnaryV island (>= MIN_CONTAINER_ISLAND); ~~ is identity for
+     * an int, so an even count returns `a`. */
     if (!run({ "func cleaf(dyn a, dyn b) {",
-               "  var dyn t = a * b;",
-               "  var dyn u = t + a;",
-               "  var dyn v = u - b;",
-               "  var dyn w = v * a;",
-               "  var dyn x = w + b;",
-               "  return x - a;",
+               "  var dyn t = ~a;",
+               "  var dyn u = ~t;",
+               "  var dyn v = ~u;",
+               "  var dyn w = ~v;",
+               "  var dyn x = ~w;",
+               "  return ~x;",
                "}",
-               "assert(cleaf(runtime(50), 50) == 125000);" }))
+               "assert(cleaf(runtime(50), 50) == 50);" }))
         return false;
     if (g_jit_container_calls <= b0)
         return false;   /* the container's island call did NOT run */
-    /* (2) a throw from the island propagates out of the container + catchable. */
+    /* (2) a JIT-thrown div-by-zero (native BinOpV `x / b` -> jit_boxed_binop
+     * catches div0 -> g_vm_jit_exc -> EnterNative re-raises) is catchable. */
     if (!run({ "func cx(dyn a, dyn b) {",
                "  var dyn t = a + b; var dyn u = t + a; var dyn v = u + b;",
                "  var dyn w = v + a; var dyn x = w + b;",
@@ -14641,34 +14648,35 @@ static bool jit_container()
                "catch (DivisionByZeroEx) { caught = true; }",
                "assert(caught);" }))
         return false;
-    /* (3) model-flip M4: a native LOOP around a boxed island - the loop
-     * control (native ops + the for.step back edge) iterates in machine code,
-     * only the island `s = s + b` calls jit_exec_block. Correct result. */
+    /* (3) model-flip M4: a native LOOP around a boxed island - the loop control
+     * (native ops + the for.step back edge) iterates in machine code, only the
+     * island `~a` (UnaryV) calls jit_exec_block; `s = s - b` is a native
+     * CompoundV. ~a = -a-1, so s -= ~a == s += a+1. Correct result. */
     const unsigned long b1 = g_jit_container_calls;
     if (!run({ "func lc(dyn s, int n) {",
                "  for (var i = 0; i < n; i++) {",
                "    var a = i * 2;",
-               "    var b = a + 3;",
-               "    s = s + b;",
+               "    var dyn b = ~a;",
+               "    s = s - b;",
                "  }",
                "  return s;",
                "}",
-               "assert(lc(runtime(0), 5) == 35);" }))
+               "assert(lc(runtime(0), 5) == 25);" }))
         return false;
     if (g_jit_container_calls <= b1)     /* the loop container did NOT run */
         return false;
-    /* (4) model-flip M4b: MULTIPLE islands - an init MoveV (`var dyn s = x`)
-     * and a body BinOpV, each its own `call jit_exec_block`. */
+    /* (4) model-flip M4b: MULTIPLE islands - an init `~x` (UnaryV) and a body
+     * `~a` (UnaryV), each its own `call jit_exec_block`. */
     if (!run({ "func lc2(dyn x, int n) {",
-               "  var dyn s = x;",
+               "  var dyn s = ~x;",
                "  for (var i = 0; i < n; i++) {",
                "    var a = i * 2;",
-               "    var b = a + 3;",
-               "    s = s + b;",
+               "    var dyn b = ~a;",
+               "    s = s - b;",
                "  }",
                "  return s;",
                "}",
-               "assert(lc2(runtime(0), 5) == 35);" }))
+               "assert(lc2(runtime(0), 5) == 24);" }))
         return false;
     return true;
 #else
@@ -14804,6 +14812,34 @@ static bool jit_op_nativized()
             "  return s + g();",
             "}",
             "assert(f(runtime(4)) == 18);" } },
+        /* BinOpV: a boxed (dyn) binary op `a + b` per iteration (the boxed_ops
+         * pool path). */
+        { OpCode::BinOpV, {
+            "func f(int n) {",
+            "  var dyn a = runtime(3); var dyn b = runtime(4);",
+            "  var dyn acc = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn r = a + b; acc += r; }",
+            "  return int(acc);",
+            "}",
+            "assert(f(runtime(5)) == 35);" } },
+        /* CmpV: a boxed (dyn) comparison used as a VALUE `a < b`. */
+        { OpCode::CmpV, {
+            "func f(int n) {",
+            "  var dyn a = runtime(3); var dyn b = runtime(4);",
+            "  var dyn cnt = 0;",
+            "  for (var i = 0; i < n; i++) { var dyn c = a < b; cnt += c; }",
+            "  return int(cnt);",
+            "}",
+            "assert(f(runtime(5)) == 5);" } },
+        /* CompoundV: a boxed (dyn) compound assign `s += a`. */
+        { OpCode::CompoundV, {
+            "func f(int n) {",
+            "  var dyn a = runtime(3);",
+            "  var dyn s = 0;",
+            "  for (var i = 0; i < n; i++) { s += a; var j = i + 1; }",
+            "  return int(s);",
+            "}",
+            "assert(f(runtime(5)) == 15);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
