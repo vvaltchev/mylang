@@ -372,6 +372,29 @@ extern "C" void jit_load_struct_elem(int_type dst, int_type base,
 extern "C" int jit_load_elem_value(int_type dst, int_type base,
                                    int_type idx) noexcept;
 
+/* model-flip (nativize-ops): the ITERATOR ops. The per-loop state lives on the
+ * activation (a watermarked slice indexed by the current record's base +
+ * iter_id), reached via g_vm_act; each helper runs the SHARED body its
+ * interpreter handler runs. The Next pair BRANCHES: the helper returns the
+ * verdict and the FRAGMENT jumps (like JumpUnlessTrueV), so a dict/dyn foreach
+ * loop's back edge stays inside the fragment.
+ *  - jit_dict_iter_init: pin the proven dict + iterator=begin(); never throws.
+ *  - jit_dict_iter_next: 1 = bound (fall through), 0 = end (jump to end_pc);
+ *    never throws.
+ *  - jit_foreach_dyn_init: dispatch the dyn container once (`targets` = the
+ *    baked &chunk.unpack_targets[idx]); a non-container -> TypeErrorEx via
+ *    g_vm_jit_exc + return 1 (loc side table), else 0.
+ *  - jit_foreach_dyn_next: 1 = bound, 0 = end, -1 = THREW (the strict N-var
+ *    unpack's TypeErrorEx via g_vm_jit_exc, loc side table). */
+extern "C" void jit_dict_iter_init(int_type iter_id,
+                                   int_type dict_slot) noexcept;
+extern "C" int jit_dict_iter_next(int_type iter_id, int_type k_slot,
+                                  int_type v_slot) noexcept;
+extern "C" int jit_foreach_dyn_init(int_type iter_id, int_type cont_slot,
+                                    int_type shape,
+                                    const void *targets) noexcept;
+extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept;
+
 /* model-flip (nativize-ops): the BOXED-ARITH ops BinOpV / CmpV / CompoundV -
  * the interpreter's exact boxed_operand + vm_num_binop bodies. `bop` is a baked
  * `&chunk.boxed_ops[idx]` (the op's operand data - target/a/b/aop - copied into

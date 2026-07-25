@@ -275,22 +275,26 @@ static inline Op vm_base_to_expr14_op(Op base)
 
 /* The two STRICT foreach-unpack errors (UnpackElem*), matching do_iter's
  * messages + loc (the container's, from the loc side table) BYTE-for-byte, so
- * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. */
+ * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. A NULL
+ * chunk (the JIT helpers, which have no chunk) throws LOC-LESS - EnterNative's
+ * re-raise stamps the same side-table caret at the op's pc. */
 [[noreturn]] static ML_COLD void
-vm_throw_unpack_nonarray(const Chunk &chunk, size_t pc, int_type nvars)
+vm_throw_unpack_nonarray(const Chunk *chunk, size_t pc, int_type nvars)
 {
     Loc s, en;
-    chunk.loc_at(pc, s, en);
+    if (chunk)
+        chunk->loc_at(pc, s, en);
     throw TypeErrorEx(intern_msg("foreach: cannot unpack a non-array element "
                                  "into " + std::to_string(nvars) +
                                  " variables"), s, en);
 }
 
 [[noreturn]] static ML_COLD void
-vm_throw_unpack_len(const Chunk &chunk, size_t pc, size_type m, int_type nvars)
+vm_throw_unpack_len(const Chunk *chunk, size_t pc, size_type m, int_type nvars)
 {
     Loc s, en;
-    chunk.loc_at(pc, s, en);
+    if (chunk)
+        chunk->loc_at(pc, s, en);
     throw TypeErrorEx(intern_msg("foreach: cannot unpack an array of length " +
                                  std::to_string(m) + " into " +
                                  std::to_string(nvars) + " variables"), s, en);
@@ -1091,6 +1095,130 @@ struct DynIterState {
     int_type counter = 0;                      /* dict `indexed` counter */
     DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
 };
+
+/* The SHARED iterator-op bodies (model-flip nativize-ops): ONE implementation
+ * each for the interpreter handler AND its jit_* twin, so the two cannot
+ * drift (the emit_elem_int_read lesson). A NULL `chunk` (the JIT helpers)
+ * makes a throw LOC-LESS - EnterNative's re-raise stamps the caret from the
+ * loc side table at the op's pc, byte-identical to the interpreted throw. */
+
+/* DictIterInit: pin the dict + set the live iterator to begin(). The
+ * inferencer proved a Dict static type; the ML_VM_CHECK is the hardening
+ * net (shared by both engines). Never throws. */
+static ML_ALWAYS_INLINE void
+vm_dict_iter_init_body(DictIterState &st, const EvalValue &base)
+{
+    ML_VM_CHECK(base.is<intrusive_ptr<DictObject>>());
+    st.dict = base.get<intrusive_ptr<DictObject>>();
+    st.it = st.dict->get_ref().begin();
+}
+
+/* DictIterNext: false on exhaustion; else bind the key (and value) box-free -
+ * a plain EvalValue copy, matching the tree-walker's `{p.first,
+ * p.second.get()}` - and advance. A slot of -1 is a `_` placeholder / the
+ * keys-only 1-var form. Never throws (frame-slot puts have no COW path). */
+static ML_ALWAYS_INLINE bool
+vm_dict_iter_next_body(DictIterState &st, Frame &frame,
+                       int_type k_slot, int_type v_slot)
+{
+    if (st.it == st.dict->get_ref().end())
+        return false;
+    if (k_slot >= 0)
+        frame.at(k_slot).put(st.it->first);
+    if (v_slot >= 0)
+        frame.at(v_slot).put(st.it->second.get());
+    ++st.it;
+    return true;
+}
+
+/* ForeachDynInit: dispatch the DYN container once - pin it, record the loop
+ * shape (`shape` = nvars | indexed << 8, `targets` = the unpack_targets pool
+ * entry), and set up an array or dict cursor. An unsupported runtime value
+ * throws TypeErrorEx (loc from `chunk`, or loc-less when null). */
+static void
+vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
+                         int_type shape, const std::vector<int32_t> *targets,
+                         const Chunk *chunk, size_t pc)
+{
+    st.container = cont;
+    st.nvars = static_cast<int>(shape & 0xff);
+    st.indexed = (shape >> 8) != 0;
+    st.targets = targets;
+    st.counter = 0;
+    if (st.container.is<SharedArrayObj>()) {
+        st.is_dict = false;
+        st.idx = 0;
+        st.size = st.container.get<SharedArrayObj>().size();
+    } else if (st.container.is<intrusive_ptr<DictObject>>()) {
+        st.is_dict = true;
+        st.it = st.container.get<intrusive_ptr<DictObject>>()
+                    ->get_ref().begin();
+    } else {
+        Loc s, en;
+        if (chunk)
+            chunk->loc_at(pc, s, en);
+        throw TypeErrorEx("foreach: expected an array or dict", s, en);
+    }
+}
+
+/* ForeachDynNext: false on exhaustion; else bind the loop vars from the state
+ * (target slots, -1 == `_` skipped) exactly as do_iter - `indexed` binds
+ * targets[0] = the counter; an ARRAY element binds the single remaining var
+ * box-free (vm_arr_elem) or STRICT-unpacks an array element into the N
+ * remaining vars (the two TypeErrorEx throws; loc-less when `chunk` null); a
+ * DICT binds key [, value [, none...]] (do_iter's count=2 padding). Then
+ * advance. */
+static bool
+vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
+                         const Chunk *chunk, size_t pc)
+{
+    const std::vector<int32_t> &tg = *st.targets;
+    const size_t tb = st.indexed ? 1 : 0;    /* first value var */
+    const size_t nv = static_cast<size_t>(st.nvars) - tb;
+    const auto bind = [&](size_t i, const EvalValue &v) {
+        if (tg[i] >= 0)
+            frame.at(tg[i]).put(v);
+    };
+    if (!st.is_dict) {
+        if (st.idx >= st.size)
+            return false;
+        if (st.indexed)
+            bind(0, EvalValue(static_cast<int_type>(st.idx)));
+        if (nv == 1) {
+            bind(tb, vm_arr_elem(st.container, st.idx));
+        } else if (nv >= 2) {
+            /* N-var over an ARRAY: the element must be an array of EXACTLY
+             * nv, unpacked into the vars - do_iter's STRICT destructure. */
+            const EvalValue elem = vm_arr_elem(st.container, st.idx);
+            if (!elem.is<SharedArrayObj>())
+                vm_throw_unpack_nonarray(chunk, pc, static_cast<int>(nv));
+            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
+            if (sub.size() != static_cast<size_type>(nv))
+                vm_throw_unpack_len(chunk, pc, sub.size(),
+                                    static_cast<int>(nv));
+            for (size_t i = 0; i < nv; i++)
+                bind(tb + i, vm_arr_elem(elem, static_cast<size_type>(i)));
+        }
+        st.idx++;
+    } else {
+        DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
+        if (st.it == d.get_ref().end())
+            return false;
+        if (st.indexed)
+            bind(0, EvalValue(st.counter++));
+        /* do_iter's count==2 else-branch: key, value, then `none` for any
+         * further vars. */
+        if (nv >= 1)
+            bind(tb, st.it->first);
+        if (nv >= 2)
+            bind(tb + 1, st.it->second.get());
+        for (size_t i = 2; i < nv; i++)
+            bind(tb + i, none);
+        ++st.it;
+    }
+    return true;
+}
+
 /* P8 Inc 0: an active `try` region on the VM handler stack. `catch_pc` is where
  * the boundary jumps on a caught exception (the CatchTest chain). */
 struct VmHandler {
@@ -2239,6 +2367,86 @@ extern "C" int jit_make_dict(int_type dst, int_type base,
         return 1;
     }
     return 0;
+}
+
+/* model-flip (nativize-ops): the native ITERATOR ops. The per-loop state lives
+ * on the ACTIVATION as a watermarked slice (act.dict_iters / act.dyn_iters,
+ * indexed by the current record's diter_base/dyiter_base + the codegen-assigned
+ * iter_id) - the helpers reach it via g_vm_act exactly like jit_ret reaches the
+ * frame, computing the address FRESH per call (the vectors can realloc when a
+ * nested call pushes more iterator slices). Each runs the SHARED body its
+ * interpreter handler runs, so the two cannot drift. */
+static ML_ALWAYS_INLINE DictIterState &jit_diter(int_type i)
+{
+    VmActivation &act = *g_vm_act;
+    ML_VM_CHECK(i >= 0 && act.back_rec().diter_base + static_cast<size_t>(i)
+                              < act.dict_iters.size());
+    return act.dict_iters[act.back_rec().diter_base + i];
+}
+static ML_ALWAYS_INLINE DynIterState &jit_dyiter(int_type i)
+{
+    VmActivation &act = *g_vm_act;
+    ML_VM_CHECK(i >= 0 && act.back_rec().dyiter_base + static_cast<size_t>(i)
+                              < act.dyn_iters.size());
+    return act.dyn_iters[act.back_rec().dyiter_base + i];
+}
+
+/* DictIterInit: pin the dict + iterator = begin(). The dict is PROVEN (a Dict
+ * static type), so it never throws -> void + op_fully_native. */
+extern "C" void jit_dict_iter_init(int_type iter_id,
+                                   int_type dict_slot) noexcept
+{
+    ML_JIT_OP_RAN(DictIterInit);
+    vm_dict_iter_init_body(jit_diter(iter_id),
+                           g_current_ctx->frame->at(dict_slot).get());
+}
+
+/* DictIterNext: 1 = bound (fall through into the body), 0 = exhausted (the
+ * fragment jumps to end_pc). Never throws -> op_fully_native. */
+extern "C" int jit_dict_iter_next(int_type iter_id, int_type k_slot,
+                                  int_type v_slot) noexcept
+{
+    ML_JIT_OP_RAN(DictIterNext);
+    return vm_dict_iter_next_body(jit_diter(iter_id), *g_current_ctx->frame,
+                                  k_slot, v_slot) ? 1 : 0;
+}
+
+/* ForeachDynInit: dispatch the dyn container once. `targets` is the baked
+ * `&chunk.unpack_targets[idx]` (a pool-element address, stable across the
+ * chunk's std::move). A non-container throws TypeErrorEx LOC-LESS ->
+ * g_vm_jit_exc + return 1 (EnterNative re-raises with the container's caret
+ * from the loc side table); 0 otherwise. */
+extern "C" int jit_foreach_dyn_init(int_type iter_id, int_type cont_slot,
+                                    int_type shape,
+                                    const void *targets) noexcept
+{
+    ML_JIT_OP_RAN(ForeachDynInit);
+    try {
+        vm_foreach_dyn_init_body(
+            jit_dyiter(iter_id), g_current_ctx->frame->at(cont_slot).get(),
+            shape, static_cast<const std::vector<int32_t> *>(targets),
+            nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* ForeachDynNext: 1 = bound, 0 = exhausted (jump to end_pc), -1 = THREW (the
+ * strict N-var unpack's TypeErrorEx rides g_vm_jit_exc LOC-LESS; EnterNative
+ * stamps the container's caret from the loc side table). */
+extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept
+{
+    ML_JIT_OP_RAN(ForeachDynNext);
+    try {
+        return vm_foreach_dyn_next_body(jit_dyiter(iter_id),
+                                        *g_current_ctx->frame,
+                                        nullptr, 0) ? 1 : 0;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return -1;
+    }
 }
 
 /* model-flip (nativize-ops): the native StructCtorV body - a standalone POD
@@ -4396,15 +4604,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
             /* Pin the dict (an intrusive_ptr copy keeps it alive for the loop,
              * matching the tree-walker's lifetime-extended `cval`) and set the
-             * live iterator to begin(). The inferencer proved a Dict static
-             * type; the ML_VM_CHECKs are the hardening net. */
+             * live iterator to begin() - the shared body (also jit_dict_iter_
+             * init's). The ML_VM_CHECKs are the hardening net. */
             ML_VM_CHECK(in->target >= 0
                 && in->target < static_cast<int_type>(chunk->n_dict_iters));
-            const EvalValue &base = ctx.frame->at(in->target2).get();
-            ML_VM_CHECK(base.is<intrusive_ptr<DictObject>>());
-            DictIterState &st = diter(in->target);
-            st.dict = base.get<intrusive_ptr<DictObject>>();
-            st.it = st.dict->get_ref().begin();
+            vm_dict_iter_init_body(diter(in->target),
+                                   ctx.frame->at(in->target2).get());
             pc++;
         }
         VM_NEXT;
@@ -4412,22 +4617,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(DictIterNext): {
 
             /* Test the live iterator: on end jump to end_pc; else bind the key
-             * (and value) box-free - a plain EvalValue copy (LoadElemValue),
-             * matching the tree-walker's `elems = {p.first, p.second.get()}` -
-             * then advance. A slot of -1 is a `_` placeholder / the keys-only
-             * 1-var form (bind nothing). */
+             * (and value) box-free + advance - the shared body (also
+             * jit_dict_iter_next's). A slot of -1 is a `_` placeholder / the
+             * keys-only 1-var form (bind nothing). */
             ML_VM_CHECK(in->target2 >= 0
                 && in->target2 < static_cast<int_type>(chunk->n_dict_iters));
-            DictIterState &st = diter(in->target2);
-            if (st.it == st.dict->get_ref().end()) {
+            if (!vm_dict_iter_next_body(diter(in->target2), *ctx.frame,
+                                        in->a_slot(), in->b_slot())) {
                 pc = static_cast<size_t>(in->target);
                 VM_NEXT;
             }
-            if (in->a_slot() >= 0)
-                ctx.frame->at(in->a_slot()).put(st.it->first);
-            if (in->b_slot() >= 0)
-                ctx.frame->at(in->b_slot()).put(st.it->second.get());
-            ++st.it;
             pc++;
         }
         VM_NEXT;
@@ -4435,98 +4634,33 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(ForeachDynInit): {
             /* Dispatch the DYN container once: pin it, record the loop shape
              * (nvars | indexed, the per-var target slots from the
-             * unpack_targets pool), and set up an array or dict cursor. An
-             * unsupported runtime value throws (loc side table). */
+             * unpack_targets pool), and set up an array or dict cursor - the
+             * shared body (also jit_foreach_dyn_init's). An unsupported
+             * runtime value throws (loc side table). */
             ML_VM_CHECK(in->target >= 0
                 && in->target < static_cast<int_type>(chunk->n_dyn_iters));
-            DynIterState &st = dyiter(in->target);
-            st.container = ctx.frame->at(in->target2).get();
-            st.nvars = static_cast<int>(in->a_lit() & 0xff);
-            st.indexed = (in->a_lit() >> 8) != 0;
-            st.targets = &chunk->unpack_targets[in->b_lit()];
-            st.counter = 0;
-            if (st.container.is<SharedArrayObj>()) {
-                st.is_dict = false;
-                st.idx = 0;
-                st.size = st.container.get<SharedArrayObj>().size();
-            } else if (st.container.is<intrusive_ptr<DictObject>>()) {
-                st.is_dict = true;
-                st.it = st.container.get<intrusive_ptr<DictObject>>()
-                            ->get_ref().begin();
-            } else {
-                Loc s, en;
-                chunk->loc_at(pc, s, en);
-                throw TypeErrorEx(
-                    "foreach: expected an array or dict", s, en);
-            }
+            vm_foreach_dyn_init_body(dyiter(in->target),
+                                     ctx.frame->at(in->target2).get(),
+                                     in->a_lit(),
+                                     &chunk->unpack_targets[in->b_lit()],
+                                     chunk, pc);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(ForeachDynNext): {
             /* On exhaustion jump to end_pc; else bind the loop vars from the
-             * state (targets slots, -1 == `_` skipped) exactly as do_iter:
+             * state + advance - the shared body (also jit_foreach_dyn_next's):
              * `indexed` binds targets[0] = the counter; an ARRAY element binds
              * the single remaining var BOX-FREE (vm_arr_elem) or STRICT-
              * unpacks an array element into the N remaining vars; a DICT
-             * binds key [, value [, none...]] (do_iter's count=2 padding).
-             * Then advance. */
+             * binds key [, value [, none...]] (do_iter's count=2 padding). */
             ML_VM_CHECK(in->target2 >= 0
                 && in->target2 < static_cast<int_type>(chunk->n_dyn_iters));
-            DynIterState &st = dyiter(in->target2);
-            const std::vector<int32_t> &tg = *st.targets;
-            const size_t tb = st.indexed ? 1 : 0;    /* first value var */
-            const size_t nv = static_cast<size_t>(st.nvars) - tb;
-            auto bind = [&](size_t i, const EvalValue &v) {
-                if (tg[i] >= 0)
-                    ctx.frame->at(tg[i]).put(v);
-            };
-            if (!st.is_dict) {
-                if (st.idx >= st.size) {
-                    pc = static_cast<size_t>(in->target);
-                    VM_NEXT;
-                }
-                if (st.indexed)
-                    bind(0, EvalValue(
-                        static_cast<int_type>(st.idx)));
-                if (nv == 1) {
-                    bind(tb, vm_arr_elem(st.container, st.idx));
-                } else if (nv >= 2) {
-                    /* N-var over an ARRAY: the element must be an array of
-                     * EXACTLY nv, unpacked into the vars - do_iter's STRICT
-                     * destructure (same messages/loc via the side table). */
-                    const EvalValue elem = vm_arr_elem(st.container, st.idx);
-                    if (!elem.is<SharedArrayObj>())
-                        vm_throw_unpack_nonarray(*chunk, pc,
-                                                 static_cast<int>(nv));
-                    const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-                    if (sub.size() != static_cast<size_type>(nv))
-                        vm_throw_unpack_len(*chunk, pc, sub.size(),
-                                            static_cast<int>(nv));
-                    for (size_t i = 0; i < nv; i++) {
-                        bind(tb + i, vm_arr_elem(elem,
-                                                 static_cast<size_type>(i)));
-                }
-                }
-                st.idx++;
-            } else {
-                DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
-                if (st.it == d.get_ref().end()) {
-                    pc = static_cast<size_t>(in->target);
-                    VM_NEXT;
-                }
-                if (st.indexed)
-                    bind(0, EvalValue(st.counter++));
-                /* do_iter's count==2 else-branch: key, value, then `none`
-                 * for any further vars. */
-                if (nv >= 1)
-                    bind(tb, st.it->first);
-                if (nv >= 2)
-                    bind(tb + 1, st.it->second.get());
-                for (size_t i = 2; i < nv; i++) {
-                    bind(tb + i, none);
-                }
-                ++st.it;
+            if (!vm_foreach_dyn_next_body(dyiter(in->target2), *ctx.frame,
+                                          chunk, pc)) {
+                pc = static_cast<size_t>(in->target);
+                VM_NEXT;
             }
             pc++;
         }
@@ -4552,10 +4686,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 outer.get_vec()[outer.offset() + idx].get();
             const int_type N = in->b_lit();
             if (!elem.is<SharedArrayObj>())
-                vm_throw_unpack_nonarray(*chunk, pc, N);
+                vm_throw_unpack_nonarray(chunk, pc, N);
             const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
             if (sub.size() != static_cast<size_type>(N))
-                vm_throw_unpack_len(*chunk, pc, sub.size(), N);
+                vm_throw_unpack_len(chunk, pc, sub.size(), N);
             const size_type off = sub.offset();
             const auto sk = sub.skind();
             if (is_int && sk == SharedArrayObj::Storage::ints) {
@@ -4599,10 +4733,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 outer.get_vec()[outer.offset() + idx].get();
             const int_type N = in->b_lit();
             if (!elem.is<SharedArrayObj>())
-                vm_throw_unpack_nonarray(*chunk, pc, N);
+                vm_throw_unpack_nonarray(chunk, pc, N);
             const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
             if (sub.size() != static_cast<size_type>(N))
-                vm_throw_unpack_len(*chunk, pc, sub.size(), N);
+                vm_throw_unpack_len(chunk, pc, sub.size(), N);
             const std::vector<int32_t> &targets =
                 chunk->unpack_targets[in->target];
             for (int_type k = 0; k < N; k++) {

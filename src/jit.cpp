@@ -856,6 +856,20 @@ static bool jit_op_eligible(const Instr &in)
      * read + a test/jcc (see emit_branch). */
     case OpCode::JumpUnlessElemInt:
         return true;
+    /* model-flip (nativize-ops): the ITERATOR ops - a dict foreach's live
+     * iterator (DictIter*) and the dyn foreach's runtime-dispatching one
+     * (ForeachDyn*). The Init pair are plain helper calls; the Next pair
+     * BRANCH (the helper binds + advances and returns the verdict, the
+     * fragment jumps to end_pc on exhaustion - the JumpUnlessTrueV shape), so
+     * a dict/dyn foreach loop's back edge stays inside the fragment. DictIter*
+     * never throw (the dict is proven) -> op_fully_native; ForeachDyn* throw
+     * (a non-container init / the strict N-var unpack) -> re-raise, NOT
+     * op_fully_native (side-table carets). */
+    case OpCode::DictIterInit:
+    case OpCode::DictIterNext:
+    case OpCode::ForeachDynInit:
+    case OpCode::ForeachDynNext:
+        return true;
     /* model-flip (nativize-ops): the BOXED condition BRANCH (`if (dynvalue)`,
      * `while (flag)`, a &&/|| conjunct, the boxed ternary) - jit_is_true
      * evaluates it and the FRAGMENT jumps (emit_branch). This was the top
@@ -1460,6 +1474,30 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * (dyn/bool/string), never an int-scalar cache candidate anyway. */
             bad(in.target2);
             break;
+        case OpCode::DictIterInit:
+            /* reads the dict slot (target2) from memory; target is the iter_id,
+             * not a slot. The iterator state itself is activation-side. */
+            bad(in.target2);
+            break;
+        case OpCode::DictIterNext:
+            /* the helper WRITES the key/value slots (a/b; -1 == unbound) from
+             * memory - a cached int value slot (a dict<str,int> loop's v used
+             * in int arith) would be stale. target/target2 are end_pc/iter_id,
+             * not slots. */
+            bad(in.a_slot()); bad(in.b_slot());
+            break;
+        case OpCode::ForeachDynInit:
+            /* reads the container slot (target2) from memory; a/b are lits
+             * (the shape + the unpack_targets pool index). */
+            bad(in.target2);
+            break;
+        case OpCode::ForeachDynNext:
+            /* the helper writes the POOL-listed target slots - which the
+             * emitter cannot enumerate (the slot list lives in unpack_targets,
+             * and pick_cached_slots has no chunk). A barrier is not an option
+             * either: this is a BRANCH (a taken end_pc would skip the reload).
+             * Per the MakeClosureV can't-enumerate rule, cache nothing. */
+            return {};
         case OpCode::Jump:
         case OpCode::Halt:               /* returns none - reads/writes no slot */
             break;                       /* no slots */
@@ -2327,6 +2365,44 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         return true;
 
+    case OpCode::DictIterInit:
+        /* pin the dict + iterator=begin() via jit_dict_iter_init (rdi=iter_id,
+         * rsi=dict slot). The dict is proven -> never throws. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_dict_iter_init) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
+    case OpCode::ForeachDynInit:
+        /* dispatch the dyn container once via jit_foreach_dyn_init
+         * (rdi=iter_id, rsi=container slot, rdx=shape, rcx=&unpack_targets[i]
+         * - a pool-element address, stable across the chunk's std::move). A
+         * non-container throws -> test eax + exit_pc so EnterNative re-raises
+         * with the container's caret from the loc side table. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RCX, reinterpret_cast<uint64_t>(
+                          &ck.unpack_targets[in.b_lit()]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_foreach_dyn_init) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
     case OpCode::StructCtorV:
     case OpCode::MakeStructArrayV:
         /* jit_struct_ctor / jit_make_struct_array(def, run base, n, dst):
@@ -2958,6 +3034,53 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::DictIterNext: {
+        /* dict foreach advance: jit_dict_iter_next (rdi=iter_id, rsi=k slot,
+         * rdx=v slot; -1 == unbound) binds + advances and returns 1, or 0 on
+         * exhaustion - jump to end_pc (target) when ZERO. Never throws. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.movabs(RDX, static_cast<uint64_t>(
+                          static_cast<int_type>(in.b_slot())));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_dict_iter_next) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+        return;
+    }
+
+    case OpCode::ForeachDynNext: {
+        /* dyn foreach advance: jit_foreach_dyn_next (rdi=iter_id) binds from
+         * the recorded state and returns 1, 0 on exhaustion (jump to end_pc),
+         * or -1 = THREW (the strict N-var unpack) - exit so EnterNative
+         * re-raises with the container's caret from the loc side table. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_foreach_dyn_next) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax (32-bit:
+                                                  * -1 is negative here) */
+        {
+            const size_t j_ok = e.j8(0x79);      /* jns -> did not throw */
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+        return;
+    }
+
     case OpCode::JumpUnlessElemInt: {
         /* E4 fusion `if (arr[i])`: read the element with the shared
          * int-semantics path (flat ints or bools; a bail re-runs the op, an
@@ -3001,7 +3124,11 @@ static bool op_is_branch(OpCode op)
         || op == OpCode::JumpUnlessTrueV
         /* the E4 `if (arr[i])` fusion: the element read is emitted inline and
          * the fragment jumps when it is FALSE. */
-        || op == OpCode::JumpUnlessElemInt;
+        || op == OpCode::JumpUnlessElemInt
+        /* the iterator advance ops: the helper binds + advances and returns
+         * the verdict; the fragment jumps to end_pc on exhaustion. */
+        || op == OpCode::DictIterNext
+        || op == OpCode::ForeachDynNext;
 }
 
 static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
@@ -3082,6 +3209,13 @@ static bool op_fully_native(const Instr &in)
     case OpCode::LoadStructFieldInt:
     case OpCode::LoadStructFieldFloat:
     case OpCode::LoadStructElemV:
+    /* the dict foreach iterator pair: the dict is PROVEN, the frame-slot binds
+     * have no COW path - neither op can throw or bail, so both are deletable
+     * (the Next's end_pc branch exits via the remapped exit_pc like any
+     * fully-native branch). The ForeachDyn pair are NOT here (they throw with
+     * side-table carets). */
+    case OpCode::DictIterInit:
+    case OpCode::DictIterNext:
     /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
      * its interpreted original - so deleting the original is sound. And unlike
      * the side-table throwing ops (Subscript/DictLoad), it conveys its OWN loc

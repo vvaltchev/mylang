@@ -426,6 +426,33 @@ top blocker - an un-nativized branch SPLIT the run, so a loop body holding one
 left its back edge interpreted; nativizing it made the previous batch's loads run
 on EVERY iteration (LoadElemBool 1 -> 100 for a 100-element array). It also
 exposed and FIXED a **JIT std::terminate in LogV** - see its backlog entry.
+And the **ITERATOR ops (DictIterInit/DictIterNext + ForeachDynInit/
+ForeachDynNext, 2026-07-25)** - a dict foreach's live iterator and the dyn
+foreach's runtime-dispatching one. The interpreter handlers were REFACTORED
+into shared bodies (`vm_dict_iter_init/next_body`,
+`vm_foreach_dyn_init/next_body`, vm.cpp) that the jit_* twins also run, so the
+engines cannot drift; the per-loop STATE lives on the ACTIVATION as watermarked
+slices (act.dict_iters/dyn_iters, record diter_base/dyiter_base + iter_id) and
+the helpers reach it via `g_vm_act` like jit_ret, computing the address FRESH
+per call (the vectors realloc when a nested call pushes more slices). The Next
+pair joined `op_is_branch`/`emit_branch` (the JumpUnlessTrueV shape):
+DictIterNext returns 1/0 (never throws - jump to end_pc on 0), ForeachDynNext
+is the tri-state 1/0/-1 (the strict N-var unpack throws). ForeachDynInit bakes
+`&chunk.unpack_targets[idx]` (a pool-element address) and throws on a
+non-container; its + Next's throws go LOC-LESS through the nullable-chunk
+`vm_throw_unpack_*` -> the side-table caret (err-loc tests pin vm == nj == tw).
+**DictIter* are op_fully_native** (proven dict, frame-slot binds - never
+throw), so a dict foreach with an int body DELETES to ONE `enter.nat` with the
+accumulator N5-pinned across the whole loop (verified in -vdj: init call, next
+at the loop head, `r10 += slot` body, native back edge). N5: DictIterNext's
+k/v slots bad()'d; ForeachDynNext writes POOL-listed slots the emitter can't
+enumerate AND is a branch (no barrier possible) -> cache nothing for the run.
+SHAPE TRAP (the per-op counter caught it): `f(runtime({..}))` makes the
+container DYN -> ForeachDyn, so the DictIter test must pass a PROVEN dict
+(runtime() wrapping a VALUE inside the literal). Measured (callgrind Ir):
+26_dict_iterate **0.952x**, 74_dyn_foreach_kv **0.951x**, 66_dyn_foreach
+0.983x; controls neutral (62_dict_word_count's hot loop is an array-foreach +
+dict store, not a dict iteration - hence 1.0000).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
