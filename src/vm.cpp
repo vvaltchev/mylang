@@ -830,13 +830,19 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
  * func_lv with `target` + `rest`, zero node->eval. ML_NOINLINE keeps the (cold)
  * CallBuiltinLV case out of vm_run_chunk's hot body. n_rest is small for a valid
  * call (insert 2, erase 1); >8 (a wrong-arity call) heaps. */
+/* Takes the BuiltinCall pool ENTRY directly (not chunk + idx), so the JIT can
+ * bake `&chunk.builtin_calls[idx]` (a stable pool address) - a &chunk dangles. */
 static ML_COLD EvalValue
-vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk &chunk, int bc_idx,
+vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk::BuiltinCall &bc,
                         LValue *target, int_type base)
 {
-    const Chunk::BuiltinCall &bc = chunk.builtin_calls[bc_idx];
     const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
-    ArgLocs al = chunk.arglocs_at(bc_idx);
+    ArgLocs al;
+    al.start = bc.start;
+    al.end = bc.end;
+    al.args = bc.args.data();
+    al.nargs = bc.args.size();
+    al.arr_hint = bc.arr_hint;
     if (n_rest <= 8) {
         EvalValue stackbuf[8];
         for (int_type i = 0; i < n_rest; i++)
@@ -2478,6 +2484,51 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
         ctx->frame->at(dst).put(std::move(r));
     } catch (RuntimeException &e) {
         if (!e.loc_start) { e.loc_start = bc->start; e.loc_end = bc->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native AppendV `append(a, x)` / `push(a, x)` -
+ * the interpreter's D1 fast op. Forms arg0's LValue* from `kind` (0 local / 1
+ * global / 2 capture) + `arg0_slot` (an undefined global -> null target, handled
+ * by the fallback's NotLValueEx), then runs arr_append_fast (the shared
+ * NEVER-THROWING append core - flat/general, hash upkeep) inline. Any decline
+ * (const/readonly/non-array/slice/flat-mismatch/null) falls back to the FULL
+ * vm_call_builtin_lv_rest (builtin_append), which CAN throw - all
+ * RuntimeExceptions now (NotLValueEx / TypeErrorEx / CannotChangeConstEx, the
+ * last just made a RuntimeException) already carrying the arg caret -> caught
+ * into g_vm_jit_exc + re-raised, byte-identical to the interpreted AppendV.
+ * `dst_slot` = the result dst (-1 = a discarded `append(a,x);` statement).
+ * `bc` = &chunk.builtin_calls[idx] (the pool entry, baked). NOT op_fully_native.
+ */
+extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
+                          int_type dst_slot, const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(AppendV);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *target;
+    switch (kind) {
+    case 0:  target = &ctx->frame->at(arg0_slot); break;
+    case 1:  target = ctx->gfuncs->defined[arg0_slot]
+                          ? &ctx->gfuncs->slots[arg0_slot] : nullptr; break;
+    default: target = &(*ctx->captures)[arg0_slot]; break;
+    }
+    const EvalValue &elem = ctx->frame->at(val_slot).get();
+    if (target && arr_append_fast(target, elem, false)) {
+        if (dst_slot >= 0)
+            ctx->frame->at(dst_slot).put(target->get());
+        return 0;
+    }
+    try {
+        EvalValue res = vm_call_builtin_lv_rest(*ctx, *bc, target, val_slot);
+        if (dst_slot >= 0)
+            ctx->frame->at(dst_slot).put(std::move(res));
+    } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -4595,8 +4646,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             }
             try {
                 EvalValue res =
-                    vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(),
-                                            target, in->b_lit());
+                    vm_call_builtin_lv_rest(
+                        ctx, chunk->builtin_calls[in->a_dual_lo()],
+                        target, in->b_lit());
                 if (in->target >= 0)
                     ctx.frame->at(in->target).put(std::move(res));
             } catch (Exception &e) {
@@ -4634,8 +4686,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             try {
                 if (in->b_is_lit()) {
                     ctx.frame->at(in->target).put(
-                        vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(), target,
-                                                in->b_lit()));
+                        vm_call_builtin_lv_rest(
+                            ctx, chunk->builtin_calls[in->a_dual_lo()], target,
+                            in->b_lit()));
                 } else {
                     ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                     ctx.frame->at(in->target).put(

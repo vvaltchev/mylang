@@ -2072,6 +2072,20 @@ static const std::vector<test> tests =
     },
 
     {
+        /* CannotChangeConstEx is now a RuntimeException (script-catchable) - the
+         * exception-model change the AppendV/lvalue-builtin nativization needs
+         * (the JIT conveys only RuntimeExceptions). A const-array append is
+         * CATCHABLE; the assert holds only if the catch fired (both engines). */
+        "Const mutation (append) is now catchable",
+        {
+            "const c = [1, 2, 3];",
+            "var caught = false;",
+            "try { append(c, 4); } catch (CannotChangeConstEx) { caught = true; }",
+            "assert(caught);",
+        },
+    },
+
+    {
         "Const array: nested element write through a param is rejected",
         {
             "func g(p) { p[0][0] = 9; }",
@@ -15093,6 +15107,14 @@ static bool jit_op_nativized()
             "}",
             "var f = mk(runtime(0));",
             "assert(f(runtime(5)) == 10);" } },
+        /* AppendV: `append(a, x)` each loop iteration runs native (jit_append ->
+         * the never-throwing arr_append_fast fast path). */
+        { OpCode::AppendV, {
+            "func f(dyn a, int n) {",
+            "  for (var i = 0; i < n; i++) append(a, i * 2);",
+            "  return a[3];",
+            "}",
+            "assert(f(runtime([]), 5) == 6);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];

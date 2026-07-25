@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (27 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (28 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -377,7 +377,10 @@ throw re-raises - see its backlog entry). And **StoreMemberV** (`jit_store_membe
 - a struct field store `s.f=v` via vm_member_store, member key + carets from the
 baked member_keys pool - see its backlog entry). And the **nested-chain stores**
 (StoreElem2V/StoreElemChainV/StoreLValueChainV) + **StoreCaptureV** (plain
-`cap=v`, the capture twin of StoreGlobalV) - see their backlog entries.
+`cap=v`, the capture twin of StoreGlobalV) - see their backlog entries. And
+**AppendV** (`jit_append` - `append(a,x)`/`push(a,x)`, the never-throwing
+arr_append_fast fast path + the vm_call_builtin_lv_rest fallback; needed the
+CannotChangeConstEx -> RuntimeException change - see its backlog entry).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -494,11 +497,23 @@ to do LATER, separately (don't forget these):
   first), so the inferencer can arity-check builtin calls at COMPILE time and the
   runtime `InvalidNumberOfArgsEx` throw disappears (it could then go back to a
   hard `DECL_SIMPLE_EX`). A language/interface change — propose to the maintainer.
-- **CallBuiltinLV / LVElem / LVMember** (the LVALUE-ABI builtins:
-  append/pop/insert/erase/sort/reverse/intptr) — the mutating-builtin analogue of
-  CallBuiltinV; when nativized, `CannotChangeConstEx` (const mutation) becomes
-  reachable → apply the SAME "make it a RuntimeException" fix as
-  InvalidArgumentEx/InvalidNumberOfArgsEx.
+- **AppendV** — DONE (2026-07-23). `append(a, x)`/`push(a, x)` via jit_append -
+  forms arg0's LValue* from kind (0 loc/1 gbl/2 cap) + arg0_slot, runs the
+  never-throwing arr_append_fast; a decline falls back to vm_call_builtin_lv_rest
+  (builtin_append), which was REFACTORED to take the BuiltinCall pool ENTRY (not
+  chunk+idx, so the JIT bakes `&builtin_calls[idx]`; the interpreter's AppendV/
+  CallBuiltinLV pass chunk->builtin_calls[idx]). Every reachable append throw is a
+  RuntimeException now (NotLValueEx / TypeErrorEx / **CannotChangeConstEx made a
+  RuntimeException** - the maintainer-pre-approved lvalue-builtin exception fix,
+  now inherently-dynamic + permanent like InvalidArgumentEx; script-CATCHABLE,
+  README + a test updated). An undefined-global arg0 -> null target ->
+  NotLValueEx (no bail needed). NOT op_fully_native. VERIFIED: append loop native
+  + correct, flat-mismatch TypeError byte-identical, const-append now catchable.
+- **CallBuiltinLV / LVElem / LVMember** (the OTHER lvalue builtins:
+  pop/insert/erase/sort/reverse/intptr) — the mutating-builtin analogue of
+  CallBuiltinV; CannotChangeConstEx is ALREADY a RuntimeException now (done for
+  AppendV), so they just need the op emit + fallback (reuse
+  vm_call_builtin_lv_rest which now takes the pool entry).
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
