@@ -643,15 +643,26 @@ The order:
    MEASURED: the only 2 bench IncDec islands (11_closure_counter /
    63_closures, a capture `start++`) - 1.0000x (see the note below);
    42_exceptions / 01_while_loop 1.0000.
-6. **DE-HELPERIZE the trivial-value ops** (perf-parity today, but the road
-   to REMOVING ALL HELPERS): MoveV / LoadConstV / LoadCaptureV /
-   LoadBuiltinV / plain StoreGlobalV / StoreCaptureV currently CALL a
-   helper per execution (LoadConstV runs 200k/hot in 47_wordcount). Inline
-   the TRIVIAL-type path (type < t_str: the two-store, exactly the
-   LoadElemBool/store_dst pattern) and keep the helper only for a
-   REFERENCE value (release/retain needs C++) - decided per-slot at
-   compile time via ref_slots where possible, else a runtime type-tag
-   branch. Also CmpIntV's ref-listed bool store (jit_put_bool) fits here.
+6. **DE-HELPERIZE the trivial-value ops** - step 6a **DONE (2026-07-25,
+   efa1368)**: MoveV (inline 24-byte payload + Type* copy behind two
+   `jae` ref checks - src's runtime type, and dst's current value only
+   when ref-listed; either reference -> the original helper), LoadConstV
+   (a TRIVIAL const's bytes are EMIT-TIME constants - 3 movabs+store
+   pairs + the type, ZERO loads/calls; string consts keep the helper),
+   LoadBuiltinV (same emit-time shape). New primitive:
+   emit_ref_check_jae. ⛔ THE DIFFERENTIAL CAUGHT A REAL BUG in v1:
+   **not every builtins-table value is a trivial Builtin - `argv` is an
+   ARRAY in that table**; bitwise-copying it skipped the retain and the
+   next release freed it under the static table (ASan UAF at exit on
+   every argv-reading bench). A reference table value keeps the helper.
+   MEASURED: 22_multi_assign **0.570x** (scalar-spread MoveVs);
+   47_wordcount 0.990x (its hot const is a string, helper by design);
+   fib/while +0.8-1.5% = the documented cross-binary LTO drift
+   (byte-identical images; parse-only alone shifts +0.8%).
+   **Remaining 6b**: LoadCaptureV / plain StoreGlobalV / StoreCaptureV
+   (need probed EvalContext::captures / ::gfuncs + vector-data offsets
+   for the runtime address chain; stores also need the src ref check
+   for the retain) + CmpIntV's ref-listed bool store (jit_put_bool).
 7. **The exception family** (~15: PushHandler/PopHandler/CatchTest/Throw/
    Reraise/SetPend/EndFinally) - a design step (handler-stack ops touch
    the record state).
