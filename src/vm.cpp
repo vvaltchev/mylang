@@ -2536,6 +2536,56 @@ extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
 }
 
 /*
+ * model-flip (nativize-ops): the native CallBuiltinLV - a mutating (lvalue-ABI)
+ * builtin call `pop(a)`/`insert(a,i,v)`/`erase(a,i)`/`sort(a[,cmp])`/`reverse(a)`
+ * /`intptr(a)`, the interpreter's exact CallBuiltinLV. Forms arg0's LValue* from
+ * `kind` (0 local / 1 global / 2 capture) + arg0_slot (an undefined global ->
+ * null target -> the builtin's NotLValueEx). `rest_base` >= 0 -> a REST-NATIVE
+ * op (its value args are the register run [rest_base, +n_rest); via
+ * vm_call_builtin_lv_rest); `rest_base` == -1 -> a NO-value-arg op (pop/intptr/
+ * sort-no-cmp -> func_lv with an empty rest). Every reachable throw is a
+ * RuntimeException now (NotLValueEx/TypeErrorEx/OutOfBoundsEx/CannotChangeConstEx
+ * /InvalidArgument/InvalidNumberOfArgs/InvalidValue) -> caught into g_vm_jit_exc
+ * (loc from the builtin_calls pool) + re-raised. NOT op_fully_native.
+ */
+extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
+                                   int_type dst_slot, int_type rest_base,
+                                   const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinLV);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *target;
+    switch (kind) {
+    case 0:  target = &ctx->frame->at(arg0_slot); break;
+    case 1:  target = ctx->gfuncs->defined[arg0_slot]
+                          ? &ctx->gfuncs->slots[arg0_slot] : nullptr; break;
+    default: target = &(*ctx->captures)[arg0_slot]; break;
+    }
+    try {
+        EvalValue res;
+        if (rest_base >= 0) {
+            res = vm_call_builtin_lv_rest(*ctx, *bc, target, rest_base);
+        } else {
+            ArgLocs al;
+            al.start = bc->start;
+            al.end = bc->end;
+            al.args = bc->args.data();
+            al.nargs = bc->args.size();
+            al.arr_hint = bc->arr_hint;
+            res = bc->builtin.func_lv(ctx, &al, target, nullptr, 0);
+        }
+        ctx->frame->at(dst_slot).put(std::move(res));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) { e.loc_start = bc->start; e.loc_end = bc->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
  * virtual "inlined-at" frames into the exception's backtrace (once, keyed off
  * inline_origin_emitted - as the tree-walker's Construct::eval does). Called at

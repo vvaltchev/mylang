@@ -760,6 +760,12 @@ static bool jit_op_eligible(const Instr &in)
      * append-in-a-loop native. NOT op_fully_native (the fallback can throw). */
     case OpCode::AppendV:
         return true;
+    /* CallBuiltinLV: a mutating lvalue-ABI builtin (pop/insert/erase/sort/
+     * reverse/intptr) via jit_call_builtin_lv - forms arg0 from kind+slot, calls
+     * vm_call_builtin_lv_rest (rest-native) or func_lv (no value args). Every
+     * throw is a RuntimeException now -> g_vm_jit_exc. NOT op_fully_native. */
+    case OpCode::CallBuiltinLV:
+        return true;
     /* GENERIC IntBin (the residual after specialize_arith_ops - a lit-first
      * NON-commutative op like `0 - i` that has no imm-reg specialized shape, or
      * any op the specializer doesn't cover): JIT-eligible ONLY for the
@@ -2039,6 +2045,32 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             reinterpret_cast<uint64_t>(&ck.builtin_calls[in.a_dual_lo()]));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_append) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::CallBuiltinLV:
+        /* jit_call_builtin_lv(kind=a_dual_hi, arg0_slot=target2, dst_slot=target,
+         * rest_base=(b_is_lit ? b_lit : -1), bc=&ck.builtin_calls[a_dual_lo]).
+         * rest_base -1 = a no-value-arg op. r8 = the pool entry. Throws ->
+         * test eax + exit_pc (re-raise). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_dual_hi())));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(
+                          in.b_is_lit() ? in.b_lit() : -1)));
+        e.movabs_r8(
+            reinterpret_cast<uint64_t>(&ck.builtin_calls[in.a_dual_lo()]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_call_builtin_lv) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
