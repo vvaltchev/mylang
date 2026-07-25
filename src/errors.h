@@ -216,8 +216,17 @@ DECL_SIMPLE_EX(CannotRebindConstEx, "Cannot rebind const")
 DECL_SIMPLE_EX(CannotRebindBuiltinEx, "Cannot rebind builtin")
 DECL_SIMPLE_EX(ExpressionIsNotConstEx, "The expression is not const")
 DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
-DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
-DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
+/* Both are RUNTIME (script-catchable) exceptions - builtins throw them at
+ * runtime (the inferencer does NOT arity-check builtin calls), and the JIT's
+ * exception conveyance (g_vm_jit_exc) is RuntimeException-shaped, so a native
+ * builtin call (CallBuiltinV) that throws one must carry it without a
+ * std::terminate. InvalidArgumentEx is inherently DYNAMIC (a bad VALUE into
+ * max/min/round), so it belongs here permanently. InvalidNumberOfArgsEx is here
+ * FOR NOW; the deeper fix is FIXED builtin arities (e.g. write(str) +
+ * fwrite(file_or_handle, str)) so arity becomes a COMPILE-time check and the
+ * runtime throw disappears - see plans/callbuiltinv-nativization.md #1. */
+DECL_RUNTIME_EX(InvalidArgumentEx, "Invalid argument error")
+DECL_RUNTIME_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
 DECL_SIMPLE_EX(CannotChangeConstEx, "Cannot change constant")
 
 /*

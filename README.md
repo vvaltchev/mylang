@@ -1597,6 +1597,10 @@ exceptions that can be caught with `try-catch` blocks is:
   * KeyNotFoundEx
   * CannotOpenFileEx
   * StackOverflowEx
+  * InvalidArgumentEx (a builtin got a bad argument *value*, e.g. `max` of an
+    empty array)
+  * InvalidNumberOfArgsEx (a builtin call with the wrong number of arguments —
+    builtins validate arity at *runtime*)
 
 Other exceptions like `SyntaxErrorEx` cannot be caught, instead.
 
