@@ -1071,9 +1071,18 @@ static bool jit_op_eligible(const Instr &in)
      * loc-less TypeErrorEx (re-raise stamps the side-table caret at the op
      * pc -> NOT op_fully_native), the map/filter runs the shared
      * vm_map_filter (callbacks re-enter vm_dispatch; a plain callback throw
-     * rides g_vm_jit_eptr). The last non-call island pair. */
+     * rides g_vm_jit_eptr). */
     case OpCode::CheckFuncV:
     case OpCode::MapFilterV:
+        return true;
+    /* The dyn-callee generic call pair - the LAST formerly-boxed sequential
+     * ops. CheckCallableV conveys a loc-less NotCallableEx (exc-stamped
+     * with the callee caret -> deletable); CallValueGenericV runs the full
+     * by-Kind dispatch over the baked CallSite pool (a FuncObject callee
+     * via the lean sync core) - it can BAIL (depth cap / chunkless callee /
+     * undefined-global arg0 base), so NOT op_fully_native. */
+    case OpCode::CheckCallableV:
+    case OpCode::CallValueGenericV:
         return true;
     /* CallBuiltinLV: a mutating lvalue-ABI builtin (pop/insert/erase/sort/
      * reverse/intptr) via jit_call_builtin_lv - forms arg0 from kind+slot, calls
@@ -1695,6 +1704,7 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.a_slot()); bad(in.b_slot()); bad(in.target);
             break;
         case OpCode::CheckFuncV:
+        case OpCode::CheckCallableV:
             bad(in.a_slot());            /* a func-value slot - never int */
             break;
         case OpCode::BinOpV:
@@ -3767,6 +3777,60 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::CheckCallableV: {
+        /* jit_check_callable(slot) - rdi = a_slot. A non-callable conveys a
+         * loc-less NotCallableEx -> exc-stamp (the callee caret) + exit. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_check_callable) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok_cc = e.j8(0x74);
+        emit_exc_stamp(e, ck, old_pc);        /* cold: the callee caret */
+        e.exit_pc(pc);
+        e.patch8(j_ok_cc, e.pos());
+        return true;
+    }
+
+    case OpCode::CallValueGenericV: {
+        /* jit_call_value_generic(dst|callee<<32, argbase, nargs, cs, mkeys,
+         * site) - rdi=packed dst/callee, rsi=a_lit, rdx=nargs (b_lit's low
+         * 12 bits), rcx=&ck.call_sites[b_lit>>12], r8=member_keys.data()
+         * (an elem/member arg0 descriptor), r9=the baked call-site loc (a
+         * FuncObject callee's backtrace frame). The helper self-stamps its
+         * throws from the pool's args caret; a bail re-runs the interpreted
+         * op (all pre-call work idempotent). */
+        Loc ls, le;
+        ck.loc_at(old_pc, ls, le);
+        const uint64_t site =
+            (static_cast<uint64_t>(static_cast<uint32_t>(ls.line)) << 32)
+            | static_cast<uint32_t>(ls.col);
+        const int site_i = static_cast<int>(in.b_lit() >> 12);
+        emit_call_prologue(e);
+        e.movabs(RDI,
+                 (static_cast<uint64_t>(
+                      static_cast<uint32_t>(in.target2)) << 32)
+                 | static_cast<uint32_t>(in.target));
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit() & 0xfff));
+        e.movabs(RCX, reinterpret_cast<uint64_t>(&ck.call_sites[site_i]));
+        e.movabs_r8(reinterpret_cast<uint64_t>(ck.member_keys.data()));
+        e.movabs_r9(site);
+        e.call_relocs.push_back(
+            { e.pos(),
+              reinterpret_cast<const void *>(jit_call_value_generic) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok_cvg = e.j8(0x74);
+        e.exit_pc(pc);
+        e.patch8(j_ok_cvg, e.pos());
+        return true;
+    }
+
     case OpCode::AppendV:
         /* jit_append(kind=a_dual_hi, arg0_slot=target2, val_slot=b_lit,
          * dst_slot=target, bc=&ck.builtin_calls[a_dual_lo]). r8 = the pool entry
@@ -4598,6 +4662,7 @@ static bool op_fully_native(const Instr &in)
     case OpCode::CoerceNumV:
     case OpCode::MemberV:
     case OpCode::LoadGlobalV:
+    case OpCode::CheckCallableV:    /* convey-only guard, exc-stamped caret */
         return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side lep caret.
@@ -4808,13 +4873,13 @@ static bool op_is_simple_island(OpCode op)
      * nativize-ops path), so op_run_eligible (checked FIRST in the gate)
      * wins - they never reach here as islands. They stay listed for
      * documentation / a `-nj` build (where op_run_eligible is false). The
-     * ONLY still-boxed sequential ops are the dyn-callee generic call pair
-     * below (CheckCallableV + CallValueGenericV - fully AST-FREE since F1
-     * step 2, reading the serializable call_sites pool; simply not yet
-     * given an emit case, as its by-Kind dispatch is the most involved
-     * remaining one) - the container gate's island source, so the
-     * jit_exec_block mechanism (M2-M4) stays exercised on real dyn-dispatch
-     * code. (The island-source hop chain: SliceV -> MakeArrayV -> MakeDictV
+     * dyn-callee generic call pair (CheckCallableV + CallValueGenericV) is
+     * op_run_eligible too now (2026-07-25) - the island-source hop chain is
+     * EXHAUSTED: no sequential op remains that this list admits but
+     * op_run_eligible rejects, so jit_try_container forms no containers on
+     * real code and the jit_exec_block mechanism is covered by the
+     * synthetic vm_exec_block_selftest (kept for future un-nativizable
+     * ops). (The island-source hop chain: SliceV -> MakeArrayV -> MakeDictV
      * -> StructCtorBoxedV -> DeclConstV -> CheckFuncV/MapFilterV -> this
      * pair, each hop perf-checked by probing bench/ + samples/ for
      * containers formed.) */

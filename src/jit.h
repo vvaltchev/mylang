@@ -547,6 +547,17 @@ extern "C" int jit_check_func(int_type slot) noexcept;
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
                               int_type dst, int_type is_map) noexcept;
 
+/* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
+ * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with
+ * the callee caret) and CallValueGenericV (the full by-Kind dispatch over
+ * the baked CallSite pool; a FuncObject callee runs via the lean sync core;
+ * dst_callee packs dst lo32 | callee-temp hi32). */
+extern "C" int jit_check_callable(int_type slot) noexcept;
+extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
+                                      int_type nargs, const void *cs,
+                                      const void *mkeys,
+                                      int_type site_packed) noexcept;
+
 /* model-flip (nativize-ops): AppendV - `append(a, x)`/`push(a, x)`. Forms arg0's
  * LValue* from kind (0 loc/1 gbl/2 cap) + arg0_slot, runs the never-throwing
  * arr_append_fast; a decline falls back to vm_call_builtin_lv_rest (builtin_

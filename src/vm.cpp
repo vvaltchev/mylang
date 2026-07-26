@@ -3553,6 +3553,23 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native CheckCallableV - an indirect
+ * call's callable guard (FuncObject / Builtin / struct type descriptor),
+ * run BEFORE the arg run evaluates (the tree-walker's dispatch order). A
+ * non-callable conveys a LOC-LESS NotCallableEx; the emit's cold-side
+ * exc-stamp gives it the callee caret -> op_fully_native (deletable). */
+extern "C" int jit_check_callable(int_type slot) noexcept
+{
+    ML_JIT_OP_RAN(CheckCallableV);
+    const EvalValue &cv = g_current_ctx->frame->at(slot).get();
+    if (cv.is<intrusive_ptr<FuncObject>>() || cv.is<Builtin>()
+            || cv.is<StructTypeDef *>())
+        return 0;
+    g_vm_jit_exc = std::make_unique<NotCallableEx>();
+    return 1;
+}
+
+
 /* model-flip (nativize-ops): the native CheckFuncV - map/filter's arg0
  * guard. A non-function conveys a LOC-LESS TypeErrorEx; EnterNative's
  * re-raise (vm_raise) stamps arg0's caret from the loc table at the op's
@@ -4637,6 +4654,214 @@ extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
     return jit_call_sync_core(*cv.get<intrusive_ptr<FuncObject>>().get(),
                               argbase, nargs, dst, site_packed,
                               /*cached=*/false);
+}
+
+/*
+ * model-flip (nativize-ops): the native CallValueGenericV - the generic
+ * indirect call of a DYN callee, the interpreter's exact dispatch over the
+ * serializable CallSite pool (the op has been AST-free since F1 step 2;
+ * only its emit case was missing). `cs` = &chunk.call_sites[i] and `mkeys`
+ * = chunk.member_keys.data() are baked pool-buffer addresses; `dst_callee`
+ * packs the dst slot (lo32, sign-preserved) with the callee temp (hi32);
+ * `site_packed` = the call-site loc (line << 32 | col) for a FuncObject
+ * callee's backtrace frame.
+ *
+ * Dispatch by the RUNTIME callee (CheckCallableV already threw for a
+ * non-callable BEFORE the args evaluated):
+ *  - FuncObject: fill run[0] with arg0's RValue (an UndefinedId throws
+ *    here, stamped with the args caret - the interpreted order), then run
+ *    the callee via the LEAN SYNC core: the caller fragment stays native
+ *    across the call. A depth-cap / chunkless bail (1) is SOUND - all
+ *    pre-call work is idempotent, the interpreted op re-runs identically.
+ *  - Builtin: dispatch_builtin_values by Kind; a func_lv (mutating)
+ *    builtin re-derives arg0's true LValue* from the descriptor (slot /
+ *    elem via Type::subscript / member via vm_member_lvalue_ref - the
+ *    same idempotent re-derive the interpreted op does). An elem/member
+ *    arg0 whose GLOBAL base is undefined BAILS (the interpreted re-run
+ *    throws the exact UndefinedVariableEx with its table caret).
+ *  - struct descriptor: construct_struct_v (runtime arity + per-field
+ *    coercion with the pooled carets).
+ * A loc-less throw is stamped with the ARGS caret from the pool (the
+ * interpreted catch's exact rule) - self-loc'd, no emit-side stamp; a
+ * plain Exception (an UndefinedId's RValue) rides g_vm_jit_eptr. Returns
+ * 0 done (dst written) / 1 bail / 2 threw. NOT op_fully_native (bails).
+ */
+extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
+                                      int_type nargs, const void *csv,
+                                      const void *mkeysv,
+                                      int_type site_packed) noexcept
+{
+    ML_JIT_OP_RAN(CallValueGenericV);
+    const Chunk::CallSite &cs = *static_cast<const Chunk::CallSite *>(csv);
+    const Chunk::MemberKey *mkeys =
+        static_cast<const Chunk::MemberKey *>(mkeysv);
+    EvalContext &ctx = *g_current_ctx;
+    const int_type callee_slot = static_cast<int_type>(
+        static_cast<uint64_t>(dst_callee) >> 32);
+    const int_type dst = static_cast<int_type>(
+        static_cast<int32_t>(dst_callee & 0xffffffff));
+    const size_t n = static_cast<size_t>(nargs);
+
+    ArgLocs al;
+    al.start = cs.start;
+    al.end = cs.end;
+    al.args = cs.args.data();
+    al.nargs = cs.args.size();
+    al.arr_hint = cs.arr_hint;
+
+    const EvalValue &callee = ctx.frame->at(callee_slot).get();
+
+    auto a0_value = [&]() -> EvalValue {
+        switch (cs.a0_form) {
+        case Chunk::CallSite::A0::slot:
+            switch (cs.a0_kind) {
+            case 0:  return ctx.frame->at(cs.a0_slot).get();
+            case 1:
+                if (ctx.gfuncs->defined[cs.a0_slot])
+                    return ctx.gfuncs->slots[cs.a0_slot].get();
+                return EvalValue(
+                    UndefinedId{ctx.gfuncs->names[cs.a0_slot]->val});
+            case 2:  return (*ctx.captures)[cs.a0_slot].get();
+            default: return builtin_slot(cs.a0_slot).get();
+            }
+        case Chunk::CallSite::A0::undef:
+            return EvalValue(UndefinedId{cs.a0_name->val});
+        default:
+            return ctx.frame->at(argbase).get();
+        }
+    };
+
+    if (callee.is<intrusive_ptr<FuncObject>>()) {
+        if (g_jit_sync_depth >= JIT_SYNC_DEPTH_CAP)
+            return 1;                       /* deep tail -> interpreted */
+        if (n) {
+            try {
+                ctx.frame->at(argbase).put(RValue(a0_value()));
+            } catch (Exception &e) {
+                if (!e.loc_start) {
+                    e.loc_start = al.start;
+                    e.loc_end = al.end;
+                }
+                if (auto *re = dynamic_cast<RuntimeException *>(&e))
+                    g_vm_jit_exc.reset(re->clone());
+                else
+                    g_vm_jit_eptr = std::current_exception();
+                return 2;
+            } catch (...) {
+                g_vm_jit_eptr = std::current_exception();
+                return 2;
+            }
+        }
+        return jit_call_sync_core(
+            *callee.get<intrusive_ptr<FuncObject>>().get(), argbase, nargs,
+            dst, site_packed, /*cached=*/false);
+    }
+
+    bool bail = false;
+    EvalValue holder;                       /* keeps an elem arg0 alive */
+    auto a0_base = [&]() -> LValue * {
+        if (cs.a0_kind == 1) {
+            if (!ctx.gfuncs->defined[cs.a0_slot]) {
+                bail = true;                /* undefined global base: the
+                                             * interpreted re-run throws
+                                             * with its table caret */
+                return nullptr;
+            }
+            return &ctx.gfuncs->slots[cs.a0_slot];
+        }
+        if (cs.a0_kind == 2)
+            return &(*ctx.captures)[cs.a0_slot];
+        return &ctx.frame->at(cs.a0_slot);
+    };
+    auto a0_lvalue = [&]() -> LValue * {
+        switch (cs.a0_form) {
+        case Chunk::CallSite::A0::slot:
+            switch (cs.a0_kind) {
+            case 0:  return &ctx.frame->at(cs.a0_slot);
+            case 1:  return ctx.gfuncs->defined[cs.a0_slot]
+                         ? &ctx.gfuncs->slots[cs.a0_slot] : nullptr;
+            case 2:  return &(*ctx.captures)[cs.a0_slot];
+            default: return &builtin_slot(cs.a0_slot);
+            }
+        case Chunk::CallSite::A0::elem: {
+            LValue *base = a0_base();
+            if (!base)
+                return nullptr;
+            const EvalValue &key = ctx.frame->at(cs.a0_operand).get();
+            holder = base->get().get_type()->subscript(
+                EvalValue(base), key, /*for_write=*/false);
+            return holder.is<LValue *>() ? holder.get<LValue *>() : nullptr;
+        }
+        case Chunk::CallSite::A0::member: {
+            LValue *base = a0_base();
+            if (!base)
+                return nullptr;
+            const Chunk::MemberKey &mk = mkeys[cs.a0_operand];
+            return vm_member_lvalue_ref(base->get(), mk.memId, mk.memUid,
+                                        /*for_write=*/false,
+                                        mk.mstart, mk.mend);
+        }
+        default:
+            return nullptr;
+        }
+    };
+
+    try {
+        EvalValue stackbuf[8];
+        std::vector<EvalValue> heapbuf;
+        EvalValue *buf = stackbuf;
+        if (n > 8) {
+            heapbuf.resize(n);
+            buf = heapbuf.data();
+        }
+        if (n)
+            buf[0] = a0_value();
+        for (size_t i = 1; i < n; i++)
+            buf[i] = ctx.frame->at(argbase + static_cast<int_type>(i)).get();
+
+        EvalValue res;
+        if (callee.is<Builtin>()) {
+            const Builtin &b = callee.get<Builtin>();
+            if (b.kind == Builtin::Kind::lvalue) {
+                LValue *target = n ? a0_lvalue() : nullptr;
+                if (bail)
+                    return 1;
+                EvalValue rest[8];
+                std::vector<EvalValue> resth;
+                EvalValue *rp = rest;
+                const size_t nr = n ? n - 1 : 0;
+                if (nr > 8) {
+                    resth.resize(nr);
+                    rp = resth.data();
+                }
+                for (size_t i = 0; i < nr; i++)
+                    rp[i] = RValue(buf[i + 1]);
+                res = b.func_lv(&ctx, &al, target, nr ? rp : nullptr, nr);
+            } else {
+                res = dispatch_builtin_values(&ctx, b, &al, buf, n);
+            }
+        } else if (callee.is<StructTypeDef *>()) {
+            res = construct_struct_v(callee.get<StructTypeDef *>(), &al,
+                                     buf, n);
+        } else {
+            throw NotCallableEx();          /* net: CheckCallableV ran */
+        }
+        ctx.frame->at(dst).put(std::move(res));
+    } catch (Exception &e) {
+        if (!e.loc_start) {
+            e.loc_start = al.start;
+            e.loc_end = al.end;
+        }
+        if (auto *re = dynamic_cast<RuntimeException *>(&e))
+            g_vm_jit_exc.reset(re->clone());
+        else
+            g_vm_jit_eptr = std::current_exception();
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    return 0;
 }
 
 /* Step 7a (the INLINE exception ops): the activation-side layout the
