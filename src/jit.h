@@ -271,6 +271,13 @@ extern "C" int jit_member(const EvalValue *base, LValue *dst,
  * (it throws on an undefined slot + runs num_bin_op). */
 extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
 
+/* model-flip (nativize-ops): the native StoreCaptureV PLAIN `cap = <expr>` -
+ * `(*ctx->captures)[cap_slot] = RValue(*src)`. A capture is always defined ->
+ * never throws (op_fully_native). PLAIN only (like StoreGlobalV; a compound
+ * `cap OP= v` runs num_bin_op, stays interpreted). */
+extern "C" void jit_store_capture(int_type cap_slot,
+                                  const EvalValue *src) noexcept;
+
 /* model-flip (nativize-ops): the native LoadGlobalV read `frame[dst] =
  * gfuncs->slots[gslot]`. Returns 0 on success; 1 to BAIL (the global is
  * undefined - a use-before-def) so the emit exits to the op's pc and the
