@@ -2774,6 +2774,33 @@ extern "C" int jit_load_member(int_type dst, int_type base_slot,
     return 0;
 }
 
+/* model-flip (nativize-ops): the native DeclConstV body - bind a const
+ * arr/dict/func decl's slot as a CONST LValue (so a later rebind still
+ * throws), local or global. The rvalue is already materialized in `src`.
+ * Never throws. */
+extern "C" void jit_decl_const(int_type dst, int_type is_global,
+                               int_type src) noexcept
+{
+    ML_JIT_OP_RAN(DeclConstV);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue v = ctx->frame->at(src).get();
+    if (!is_global) {
+        ctx->frame->at(dst) = LValue(std::move(v), true);
+    } else {
+        ctx->gfuncs->slots[dst] = LValue(std::move(v), true);
+        ctx->gfuncs->defined[dst] = 1;
+    }
+}
+
+/* model-flip (nativize-ops): the native DefinedGlobalV body - `defined(g)`
+ * is the global slot's defined-flag as a bool. Never throws. */
+extern "C" void jit_defined_global(int_type dst, int_type gslot) noexcept
+{
+    ML_JIT_OP_RAN(DefinedGlobalV);
+    EvalContext *ctx = g_current_ctx;
+    ctx->frame->at(dst).put(EvalValue(ctx->gfuncs->defined[gslot] != 0));
+}
+
 /* model-flip (nativize-ops): the native StructFieldAddInt READ half - the #9
  * fusion `dst = other + a[i].f`'s proven no-fault field read (the exact
  * vm_struct_field_int the interpreter calls). The ADD and the dst write run

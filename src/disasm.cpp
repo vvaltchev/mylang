@@ -626,8 +626,12 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         else if (o2 == 0x7E) { modrm(regf, rm);   /* 66 REX.W 0F 7E:
                                                    * movq r/m64, xmm */
             o << "movq " << rm << ", xmm" << regf; }
-        else if (o2 == 0x2E) { modrm(regf, rm);
-            o << "ucomisd xmm" << regf << ", " << rm; }
+        else if (o2 == 0x2E) {
+            const bool reg_form = (c[p] & 0xC0) == 0xC0;
+            const int rm_xmm = c[p] & 7;
+            modrm(regf, rm);
+            o << "ucomisd xmm" << regf << ", ";
+            if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
         else if (o2 >= 0x90 && o2 <= 0x9F) {   /* setcc r/m8 (CmpIntV) */
             modrm(regf, rm);
             static const char *sc[16] = {"seto","setno","setb","setae",

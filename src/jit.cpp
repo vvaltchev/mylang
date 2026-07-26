@@ -104,6 +104,7 @@ struct JitLayout {
     const void *t_float;  /* the float Type singleton (N3) */
     const void *t_bool;   /* the bool Type singleton (inline is_true / bool
                            * element loads) */
+    const void *t_none;   /* the none Type singleton (JumpIfNotNoneV) */
     const void *t_arr;    /* the array Type singleton (N4) */
     int slice_off;        /* SharedArrayObj: offset of `slice` (from payload) */
     int kind_off;         /* SharedObject: &kind - shobj */
@@ -139,6 +140,8 @@ static const JitLayout &jit_layout()
         l.t_float = fprobe.get().get_type();
         LValue bprobe(EvalValue(true), false);
         l.t_bool = bprobe.get().get_type();
+        l.t_none = none.get_type();   /* the global none singleton value
+                                       * (JumpIfNotNoneV's `??` test) */
 
         /* N4: the flat-array layout, via the co-located jit_probe (which
          * reads real members, so it can't drift). Non-slice, flat-int/
@@ -777,6 +780,36 @@ static bool jit_op_eligible(const Instr &in)
      * bakes &emplace_sites[idx]). A coerce/const throw re-raises. NOT
      * op_fully_native. */
     case OpCode::EmplaceStruct:
+        return true;
+    /* model-flip (nativize-ops): the `??` short-circuit branch - an inline
+     * type-tag compare against the none singleton (never throws ->
+     * op_fully_native; see emit_branch). */
+    case OpCode::JumpIfNotNoneV:
+        return true;
+    /* model-flip (nativize-ops): the typed float compare-to-BOOL VALUE -
+     * inline (swapped) ucomisd + setcc + the bool store, the CmpIntV shape
+     * with JumpUnlessFloatCmp's NaN-correct swap trick. The ordering
+     * compares only (eq/noteq have the unordered-ZF pitfall and stay
+     * interpreted, like the branch form). A float operand read can BAIL
+     * (bool/other tag) -> NOT op_fully_native. */
+    case OpCode::CmpFloatV:
+        return float_cmp_eligible(in.aop);
+    /* model-flip (nativize-ops): a const arr/dict/func decl bind via
+     * jit_decl_const (local or global; never throws -> op_fully_native). */
+    case OpCode::DeclConstV:
+        return true;
+    /* model-flip (nativize-ops): `defined(g)` via jit_defined_global (the
+     * slot's defined-flag; never throws -> op_fully_native). */
+    case OpCode::DefinedGlobalV:
+        return true;
+    /* model-flip (nativize-ops): an ALWAYS-THROWING construct. Its exception
+     * mix includes NON-Runtime ones (UndefinedVariableEx/CannotRebindBuiltin)
+     * that cannot ride g_vm_jit_exc, so the native form is simply an
+     * unconditional exit at the op - the interpreter re-runs the
+     * side-effect-free throw op and raises with exact semantics for every
+     * kind. The value is run-shape: the ops BEFORE it fragment together
+     * instead of splitting at the throw. NOT op_fully_native. */
+    case OpCode::ThrowRuntimeV:
         return true;
     /* model-flip (nativize-ops): a slice READ base[start:end] via jit_slice (the
      * runtime Type::slice; a non-int bound / non-sliceable base throws
@@ -1566,6 +1599,30 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * either: this is a BRANCH (a taken end_pc would skip the reload).
              * Per the MakeClosureV can't-enumerate rule, cache nothing. */
             return {};
+        case OpCode::CmpFloatV:
+            /* float operands + a bool dst - none is an int-cache candidate;
+             * all read/written from memory. */
+            if (!in.a_is_lit()) bad(in.a_slot());
+            if (!in.b_is_lit()) bad(in.b_slot());
+            bad(in.target);
+            break;
+        case OpCode::JumpIfNotNoneV:
+            /* reads the lhs slot's type tag from memory (a boxed value). */
+            bad(in.a_slot());
+            break;
+        case OpCode::DeclConstV:
+            /* the helper reads src (a) + writes the dst LValue from memory;
+             * for a GLOBAL dst (target2==1) `target` is a global slot, not a
+             * frame slot. */
+            bad(in.a_slot());
+            if (in.target2 == 0) bad(in.target);
+            break;
+        case OpCode::DefinedGlobalV:
+            /* writes the bool dst from memory (target2 is the global slot). */
+            bad(in.target);
+            break;
+        case OpCode::ThrowRuntimeV:
+            break;                       /* no slots - it only exits */
         case OpCode::Jump:
         case OpCode::Halt:               /* returns none - reads/writes no slot */
             break;                       /* no slots */
@@ -2698,6 +2755,63 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::CmpFloatV: {
+        /* dst = (a <cmp> b) over FLOATS as a REAL bool: the CmpIntV shape
+         * with the ucomisd operand-SWAP trick (see float_cmp), so an
+         * unordered (NaN) compare correctly yields FALSE for the ordering
+         * compares. setcc condition = the INVERSE of the branch-if-false
+         * near op (near_op ^ 1), + 0x10 for the setcc encoding. A float
+         * operand read can BAIL -> not op_fully_native. */
+        const FCmp fc = float_cmp(in.aop);
+        e.bump_op(OpCode::CmpFloatV);        /* before loads (rax) */
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
+        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
+        e.u8(0x0F);
+        e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
+        e.u8(0xC0);                               /* setcc al */
+        e.u8(0x0F); e.u8(0xB6); e.u8(0xC0);       /* movzx eax, al */
+        store_dst_bool(e, ck, RAX, in.target);
+        return true;
+    }
+
+    case OpCode::DeclConstV:
+        /* const decl bind via jit_decl_const(dst, is_global, src). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_decl_const) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
+    case OpCode::DefinedGlobalV:
+        /* defined(g) via jit_defined_global(dst, gslot). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_defined_global) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
+    case OpCode::ThrowRuntimeV:
+        /* An always-throwing construct whose exception mix includes
+         * NON-Runtime ones (UndefinedVariableEx) that cannot ride
+         * g_vm_jit_exc: exit unconditionally at the op - the interpreter
+         * re-runs the side-effect-free throw op with exact semantics for
+         * every kind. The point is run-shape: the ops before it fragment
+         * together instead of splitting at the throw. */
+        e.bump_op(OpCode::ThrowRuntimeV);
+        e.exit_pc(pc);
+        return true;
+
     case OpCode::LoadElemBool:
         /* INLINE (no helper call): the N4 flat-array navigation with a BYTE
          * element - slot -> shobj -> kind + data, unsigned bounds check, movzx
@@ -3310,6 +3424,20 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::JumpIfNotNoneV: {
+        /* `a ?? b`: jump to target when the lhs slot is NOT none - one
+         * type-tag compare against the none singleton. Never throws. */
+        const SlotAddr a = slot_addr(in.a_slot());
+        e.bump_op(OpCode::JumpIfNotNoneV);
+        e.load(RAX, a.type);
+        e.movabs(RCX, reinterpret_cast<uint64_t>(jit_layout().t_none));
+        e.cmp_rax_rcx();
+        emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+        return;
+    }
+
     case OpCode::ForStepElemInt: {
         /* #9 back-edge fusion: step + test + the a[i] element load in one op.
          * ORDER MATTERS: the base GATE (array / non-slice / ints-or-bools,
@@ -3452,7 +3580,9 @@ static bool op_is_branch(OpCode op)
         || op == OpCode::ForeachDynNext
         /* the #9 back-edge fusion: step + test + the element load, jumping
          * to the loop target when the loop continues. */
-        || op == OpCode::ForStepElemInt;
+        || op == OpCode::ForStepElemInt
+        /* the `??` short-circuit: jump when the lhs is NOT none. */
+        || op == OpCode::JumpIfNotNoneV;
 }
 
 static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
@@ -3550,6 +3680,11 @@ static bool op_fully_native(const Instr &in)
      * side-table carets). */
     case OpCode::DictIterInit:
     case OpCode::DictIterNext:
+    /* the `??` branch (an inline none-tag compare), the const-decl bind and
+     * defined(g) (trivial helpers) - none can throw or bail. */
+    case OpCode::JumpIfNotNoneV:
+    case OpCode::DeclConstV:
+    case OpCode::DefinedGlobalV:
     /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
      * its interpreted original - so deleting the original is sound. And unlike
      * the side-table throwing ops (Subscript/DictLoad), it conveys its OWN loc
@@ -3696,18 +3831,20 @@ static constexpr size_t MIN_CONTAINER_ISLAND = 5;
 static bool op_is_simple_island(OpCode op)
 {
     switch (op) {
-    /* The simple boxed SCALAR ops, SliceV, and the CONTAINER/STRUCT BUILDS
-     * (MakeArrayV/MakeDictV/StructCtorBoxedV) are ALL op_run_eligible now (the
-     * nativize-ops path), so op_run_eligible (checked FIRST in the gate) wins -
-     * they never reach here as islands. They stay listed for documentation / a
-     * `-nj` build (where op_run_eligible is false). The one op here that is
-     * STILL boxed (not jit_op_eligible) is DeclConstV (a `const` array/dict
-     * decl inside a function body - a non-branching data op that is rare in
-     * real code) - the container gate's island source, so the jit_exec_block
-     * mechanism (M2-M4) stays exercised. (The source was SliceV, then
-     * MakeArrayV, then MakeDictV, then StructCtorBoxedV, before each was
-     * nativized - it hops to the next still-boxed simple op each time, and each
-     * hop is perf-checked by probing bench/ + samples/ for containers formed.) */
+    /* The simple boxed SCALAR ops, SliceV, the CONTAINER/STRUCT BUILDS
+     * (MakeArrayV/MakeDictV/StructCtorBoxedV) and DeclConstV are ALL
+     * op_run_eligible now (the nativize-ops path), so op_run_eligible
+     * (checked FIRST in the gate) wins - they never reach here as islands.
+     * They stay listed for documentation / a `-nj` build (where
+     * op_run_eligible is false). The ops here that are STILL boxed (not
+     * jit_op_eligible) are CheckFuncV + MapFilterV (a map/filter call - its
+     * validate-arg0-before-arg1 order + the callback re-entry keep it a
+     * helper-pair for now) - the container gate's island source, so the
+     * jit_exec_block mechanism (M2-M4) stays exercised. (The source was
+     * SliceV -> MakeArrayV -> MakeDictV -> StructCtorBoxedV -> DeclConstV
+     * before each was nativized - it hops to the next still-boxed simple op
+     * each time, and each hop is perf-checked by probing bench/ + samples/
+     * for containers formed.) */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
     case OpCode::LoadConstV: case OpCode::CoerceNumV:
@@ -3716,6 +3853,8 @@ static bool op_is_simple_island(OpCode op)
     case OpCode::MakeDictV:
     case OpCode::StructCtorBoxedV:
     case OpCode::DeclConstV:
+    case OpCode::CheckFuncV:
+    case OpCode::MapFilterV:
         return true;
     default:
         return false;
