@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (19 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (20 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -365,7 +365,9 @@ exposed it. And **Halt** (`jit_halt` - a fall-through body's implicit `return
 none`, = ReturnV's jit_ret with a none result; op_fully_native; the biggest
 single blocker at 83 island occurrences) - see its backlog entry for the
 in-VM/boundary paths + why "native_leaf needs a trailing ReturnV" was a
-non-issue.
+non-issue. And **LoadGlobalV** (`jit_load_global` - a global read; the common
+defined case native, the rare undefined case BAILS to the interpreter, N4-style,
+so NO exception-model change - see its backlog entry).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -500,10 +502,22 @@ to do LATER, separately (don't forget these):
   (jit_op_nativized Halt case - a void func's whole body deletes to one
   enter.nat; both paths exercised: f's Halt boundary=0 IN-VM returns none to the
   caller, main's Halt boundary=1 ends the program).
-- **SliceV / LoadGlobalV / the remaining container stores** — the other boxed
-  ops still splitting runs. (LoadGlobalV needs UndefinedVariableEx ->
-  RuntimeException - a language decision like the CallBuiltinV #1 exceptions -
-  AND is 0x in benches, so low priority.)
+- **LoadGlobalV** — DONE (2026-07-23) WITHOUT the language change. Its undefined-
+  global throw is UndefinedVariableEx (a plain Exception, not conveyable via
+  g_vm_jit_exc), but rather than making it a RuntimeException (the CallBuiltinV #1
+  precedent - a semantic change: undefined-var would become catchable), it uses
+  the **N4 bail-to-reinterpret** pattern: the COMMON case (defined global) runs
+  native via jit_load_global; the RARE use-before-def BAILS (helper returns 1, no
+  g_vm_jit_exc/raise set), and the emit's exit_pc resumes the INTERPRETER at the
+  op's pc so it re-runs LoadGlobalV + throws - semantics-PRESERVING (undefined-var
+  stays a non-catchable hard error) and byte-identical to a non-JIT run (VERIFIED:
+  vm-bail caret == nj-interpreted caret; the vm-vs-tw caret diff is PRE-EXISTING,
+  differential-invisible). NOT op_fully_native (the original is kept for the bail).
+  EXECUTION-PROVEN: jit_op_nativized LoadGlobalV case (hot loop reading a defined
+  global, counter bumps) + a use-before-def-global `tests` entry (the bail throws
+  UndefinedVariableEx on both engines).
+- **SliceV / the remaining container stores** — the other boxed ops still
+  splitting runs.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);

@@ -663,6 +663,12 @@ static bool jit_op_eligible(const Instr &in)
      * an undefined slot + runs num_bin_op -> stays interpreted. */
     case OpCode::StoreGlobalV:
         return in.aop == Op::invalid;
+    /* model-flip (nativize-ops): a global READ `dst = g` via jit_load_global.
+     * The common (defined) case runs native; an undefined global BAILS (the
+     * interpreter re-runs + throws UndefinedVariableEx). NOT op_fully_native
+     * (the original is kept for the bail-to-reinterpret). */
+    case OpCode::LoadGlobalV:
+        return true;
     /* model-flip (nativize-ops): materialize a baked literal via
      * jit_load_literal_obj (bakes the literal-objs pool BUFFER addr; a clone,
      * never throws). */
@@ -1076,8 +1082,10 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
         case OpCode::LoadConstV:
         case OpCode::LoadLiteralObjV:
         case OpCode::LoadCaptureV:
-            /* writes dst from memory (a builtin / const / literal / capture
-             * value, not an int); target2 is a compile-time index, not a slot. */
+        case OpCode::LoadGlobalV:
+            /* writes dst from memory (a builtin / const / literal / capture /
+             * global value, not an int); target2 is a compile-time index (the
+             * global slot for LoadGlobalV), not a frame slot. */
             bad(in.target);
             break;
         case OpCode::Jump:
@@ -1596,6 +1604,27 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_load_capture) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+        return true;
+
+    case OpCode::LoadGlobalV:
+        /* dst = gfuncs->slots[gslot] via jit_load_global (rdi=dst=target,
+         * rsi=gslot=target2). Returns 0 = ok, 1 = BAIL (undefined global):
+         * exit_pc so the interpreter re-runs LoadGlobalV + throws
+         * UndefinedVariableEx (the N4 bail-to-reinterpret; NOT a raise -
+         * nothing set g_vm_jit_exc/raise, so EnterNative resumes interpreted). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_load_global) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
+            e.exit_pc(pc);                    /* bail: interpreter re-throws */
+            e.patch8(j_ok, e.pos());
+        }
         return true;
 
     case OpCode::LoadConstV:

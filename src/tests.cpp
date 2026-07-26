@@ -1189,6 +1189,24 @@ static const std::vector<test> tests =
     },
 
     {
+        /* use-before-def of a global read in a LOOP: exercises LoadGlobalV's
+         * JIT bail (the fragment reads g, finds it undefined, bails; the
+         * interpreter re-runs the op + throws) AND the interpreted path - both
+         * must throw UndefinedVariableEx (non-catchable, byte-identical caret in
+         * vm/nj). f is called before `var g` runs, so g's global slot is
+         * undefined at the read. */
+        "use-before-def global read (LoadGlobalV bail)",
+        {
+            "func f() { var s = 0;",
+            "           for (var i = 0; i < 20; i++) s = s + g;",
+            "           return s; }",
+            "var r = f();",
+            "var g = 7;",
+        },
+        &typeid(UndefinedVariableEx),
+    },
+
+    {
         "defined() builtin",
         {
             "assert(defined(a) == 0);",
@@ -14946,6 +14964,16 @@ static bool jit_op_nativized()
             "func f(int n) { var s = 0; for (var i = 0; i < n; i++) s = s + i; }",
             "var r = f(runtime(5));",
             "assert(r == none);" } },
+        /* LoadGlobalV: a function reads a (defined) global each loop iteration.
+         * `s + g` loads g (LoadGlobalV) then adds it, so the loop fragments and
+         * the global read runs native (the common defined-global path; the rare
+         * undefined path bails to the interpreter - see the "use-before-def
+         * global" tests entry). */
+        { OpCode::LoadGlobalV, {
+            "var g = 7;",
+            "func f(int n) { var s = 0; for (var i = 0; i < n; i++) s = s + g;",
+            "                return s; }",
+            "assert(f(runtime(5)) == 35);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
