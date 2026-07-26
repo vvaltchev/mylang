@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (23 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (26 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -558,12 +558,24 @@ to do LATER, separately (don't forget these):
   -> loc-less, stamped with the MEMBER caret here exactly as the interpreted
   catch does) -> re-raise; an undefined-global base bails. VERIFIED: POD +
   boxed field native, readonly-store NotLValueEx byte-identical vm/nj/tw.
-- **The remaining container stores** (StoreElem2V/StoreElemChainV/
-  StoreLValueChainV nested CHAINS, StoreCaptureV `cap=v`) — 0x in benches, more
-  complex (the chains have per-step key RUNS + per-step carets in the chain_locs/
-  chain_steps pools; StoreCaptureV is a slot write like StoreGlobalV). Deferred
-  as low-value (island-shrinkage only, no perf) - do them for completeness or a
-  future full-native pass.
+- **The nested-chain stores** — DONE (2026-07-23, for completeness). All 3 run
+  native, each the interpreter's exact function: **StoreElem2V** `a[i][j]=v`
+  (jit_store_elem2 -> vm_nested_subscript_store; LOCAL base, no kind); **Store
+  ElemChainV** `a[k0..kn]=v` (jit_store_elem_chain -> vm_chain_store_op; `kind`
+  base, key RUN [kbase,+nkeys)); **StoreLValueChainV** `base.step..=v` mixed
+  member/subscript (jit_store_lvalue_chain -> vm_chain_lvalue_store_op; `kind`
+  base). Pool data is baked (can't bake &chunk - it dangles): StoreElem2V bakes
+  chain_locs[idx].data() (r9), StoreElemChainV bakes &chain_locs[idx] (r9,
+  data()/size() in the helper), StoreLValueChainV bakes &chain_steps[idx] (r8) +
+  member_keys.data() (r9). REFACTOR: vm_chain_walk + vm_chain_lvalue_store_op now
+  take the member_keys buffer + the chain_steps entry (not &chunk + steps_idx) so
+  the JIT can bake them; the interpreter + IncDecChainV pass chunk.member_keys.
+  data() / chunk.chain_steps[idx]. All throw only RuntimeExceptions (per-step
+  carets stamped by the vm functions) + an undefined-global base bails (the two
+  kind'd ones). 6 args each (r9 = the 6th; r9 isn't a persistent singleton, unlike
+  rsi/r8). VERIFIED: all 3 native + correct, throw carets byte-identical vm/nj/tw.
+- **StoreCaptureV** `cap=v` (a slot write like StoreGlobalV, 0x in benches) still
+  remains - low value.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);

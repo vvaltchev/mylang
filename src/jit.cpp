@@ -642,6 +642,16 @@ static bool jit_op_eligible(const Instr &in)
      * op_fully_native. */
     case OpCode::StoreMemberV:
         return true;
+    /* model-flip (nativize-ops): the NESTED-CHAIN stores via jit_store_elem2 /
+     * jit_store_elem_chain / jit_store_lvalue_chain (the interpreter's exact
+     * vm_nested_subscript_store / vm_chain_store_op / vm_chain_lvalue_store_op;
+     * per-step carets from the baked chain_locs/chain_steps + member_keys pools).
+     * StoreElem2V's base is LOCAL; the other two take a kind (global/capture ->
+     * undefined bail). A store throw re-raises. Not op_fully_native. */
+    case OpCode::StoreElem2V:
+    case OpCode::StoreElemChainV:
+    case OpCode::StoreLValueChainV:
+        return true;
     /* model-flip (nativize-ops): a boxed slot copy `dst = src.get()`. Calls
      * jit_move (the interpreter's exact MoveV, ref-aware, never throws) so a
      * run no longer splits at a MoveV - one island op fewer, bigger fragments.*/
@@ -1042,6 +1052,14 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * from MEMORY; the member key is a_lit (a pool index, not a slot). */
             if (in.target == 0) bad(in.target2);
             bad(in.b_slot());
+            break;
+        case OpCode::StoreElem2V:
+            /* jit_store_elem2 reads base (target2, always LOCAL), k1 (a_dual_lo),
+             * k2 (b_slot), val (target) from MEMORY. (StoreElemChainV /
+             * StoreLValueChainV read a key RUN of unknown-here size, so they hit
+             * the default -> no caching for the run, which is safe.) */
+            bad(in.target2); bad(static_cast<int>(in.a_dual_lo()));
+            bad(in.b_slot()); bad(in.target);
             break;
         case OpCode::MoveV:
             /* jit_move reads/writes slots[src]/slots[dst] from MEMORY, so both
@@ -1655,6 +1673,80 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
             e.exit_pc(pc);                    /* raise (exc set) or bail (unset) */
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::StoreElem2V:
+        /* a[i][j] = v via jit_store_elem2(base_slot=target2, k1=a_dual_lo,
+         * k2=b_slot, val=target, aop, locs=chain_locs[a_dual_hi].data()). LOCAL
+         * base (no kind). r8=aop, r9=the per-step caret buffer (baked). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_dual_lo())));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.b_slot())));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs_r8(static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.movabs_r9(reinterpret_cast<uint64_t>(
+                        ck.chain_locs[in.a_dual_hi()].data()));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_store_elem2) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::StoreElemChainV:
+        /* a[k0..kn] = v via jit_store_elem_chain(kind=a_dual_hi, base=target2,
+         * kbase=b_lit, val=target, aop, cl=&chain_locs[a_dual_lo]). r8=aop,
+         * r9=the chain_locs entry (baked - data()/size() in the helper). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_dual_hi())));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.b_lit())));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs_r8(static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.movabs_r9(reinterpret_cast<uint64_t>(&ck.chain_locs[in.a_dual_lo()]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_store_elem_chain) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+
+    case OpCode::StoreLValueChainV:
+        /* base.step.. = v via jit_store_lvalue_chain(kind=a_dual_hi,
+         * base=target2, val=target, aop, steps=&chain_steps[a_dual_lo],
+         * mkeys=member_keys.data()). r8=steps entry, r9=member_keys buffer
+         * (both baked). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_dual_hi())));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.movabs_r8(reinterpret_cast<uint64_t>(&ck.chain_steps[in.a_dual_lo()]));
+        e.movabs_r9(reinterpret_cast<uint64_t>(ck.member_keys.data()));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_store_lvalue_chain) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
         return true;
