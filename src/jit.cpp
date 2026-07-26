@@ -2590,8 +2590,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.bump_op(OpCode::FloatBin);   /* execution proof for the div/mod
                                             * arms (BEFORE any load - bump_op
                                             * clobbers rax) */
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
-        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+                        /*no_bail=*/true);
+        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+                        /*no_bail=*/true);
         if (fop == 0x5E || is_mod) {
             /* float DIV and MOD throw DivisionByZeroEx on a +-0.0 divisor
              * (TypeFloat::div/mod: fpclassify(rhs) == FP_ZERO). Test the
@@ -2603,7 +2605,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.u8(0x66); e.u8(0x48); e.u8(0x0F); e.u8(0x7E);
             e.u8(0xC8);                            /* movq rax, xmm1 */
             e.u8(0x48); e.u8(0xD1); e.u8(0xE0);    /* shl rax, 1 */
-            raise_unless(e, 0x75 /* jnz */, JR_DIV0, pc);
+            raise_convey_unless(e, ck, 0x75 /* jnz */, JR_DIV0, pc, old_pc);
         }
         if (is_mod)
             /* the exact libm call TypeFloat::mod makes - x in xmm0, y in
@@ -2629,15 +2631,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * THEN the call sequence. pow is the only 2-arg selector:
              * x in xmm0, y in xmm1 - the SysV order. */
             emit_float_load(e, X0, in.a_is_lit(), in.a_flit(),
-                            in.a_slot(), pc);
+                            in.a_slot(), pc, /*no_bail=*/true);
             if (fn == MathFn::pow_)
                 emit_float_load(e, X1, in.b_is_lit(), in.b_flit(),
-                                in.b_slot(), pc);
+                                in.b_slot(), pc, /*no_bail=*/true);
             emit_libm_call(e, jit_math_fn_ptr(fn));
             emit_float_store(e, ck, X0, in.target, pc);
             return true;
         }
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+                        /*no_bail=*/true);
         switch (fn) {
         case MathFn::sqrt_:    e.sqrtsd(X0, X0); break;
         case MathFn::tofloat_: break;   /* float(x): the read already widened */
@@ -3296,11 +3299,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * unordered (NaN) compare correctly yields FALSE for the ordering
          * compares. setcc condition = the INVERSE of the branch-if-false
          * near op (near_op ^ 1), + 0x10 for the setcc encoding. A float
-         * operand read can BAIL -> not op_fully_native. */
+         * operand reads are no_bail (int/bool promote like read_float_slot),
+         * so the op has NO exit - never-exits, leaf-safe. */
         const FCmp fc = float_cmp(in.aop);
         e.bump_op(OpCode::CmpFloatV);        /* before loads (rax) */
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
-        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+                        /*no_bail=*/true);
+        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+                        /*no_bail=*/true);
         if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
         e.u8(0x0F);
         e.u8(static_cast<uint8_t>((fc.near_op ^ 1) + 0x10));
@@ -4527,8 +4533,10 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         /* jump to target when (a cmp b) is FALSE (the ordering compares;
          * the swap trick makes NaN correctly jump - see float_cmp). */
         const FCmp fc = float_cmp(in.aop);
-        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc);
-        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc);
+        emit_float_load(e, X0, in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
+                        /*no_bail=*/true);
+        emit_float_load(e, X1, in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
+                        /*no_bail=*/true);
         if (fc.swap) e.ucomisd(X1, X0); else e.ucomisd(X0, X1);
         emit_cond_jump_raw(e, fc.near_op, fc.short_neg_op,
                            static_cast<size_t>(in.target), begin, end,
@@ -4627,6 +4635,18 @@ static bool op_never_exits(const Instr &in)
         default:                       /* div/mod/shl/shr/ushr raise */
             return false;
         }
+    /* FLOAT arith (the no_bail tier, 2026-07-25): the operand reads
+     * promote int/bool exactly like read_float_slot (the 2-way no_bail
+     * form), so add/sub/mul cannot exit at all - never-exits, leaf-safe.
+     * div/mod CONVEY a zero-divisor DivisionByZeroEx (raise_convey_unless)
+     * - deletable (op_fully_native) but never leaf-safe. */
+    case OpCode::FloatBin:
+        switch (in.aop) {
+        case Op::plus: case Op::minus: case Op::times:
+            return true;
+        default:                       /* div/mod convey */
+            return false;
+        }
     case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
     case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
     case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
@@ -4636,6 +4656,15 @@ static bool op_never_exits(const Instr &in)
     case OpCode::LoadImmInt: case OpCode::Jump:
     case OpCode::JumpUnlessIntCmp: case OpCode::ForLoopStep:
     case OpCode::IntAddStep:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+    case OpCode::LoadImmFloat:
+    case OpCode::JumpUnlessFloatCmp:
+    case OpCode::CmpFloatV:            /* float compare -> bool; no_bail
+                                        * reads, ucomisd cannot fault */
+    case OpCode::MathFnV:              /* sqrtsd / a libm call - no exit
+                                        * (arity/type compile-excluded) */
     /* model-flip (nativize-ops): a native Halt rets a resume SENTINEL (never an
      * interior pc), like ReturnV - its interpreted original is deletable. */
     case OpCode::Halt:
@@ -4771,6 +4800,9 @@ static bool op_fully_native(const Instr &in)
     case OpCode::IntBin:
     case OpCode::IntShlRR:
     case OpCode::IntShrRR:
+    /* FloatBin div/mod convey their zero-divisor throw (the add/sub/mul
+     * arms are already never-exits) - every FloatBin arm is deletable. */
+    case OpCode::FloatBin:
         return true;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side caret.
