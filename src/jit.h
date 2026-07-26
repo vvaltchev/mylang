@@ -553,6 +553,11 @@ extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
  * the baked CallSite pool; a FuncObject callee runs via the lean sync core;
  * dst_callee packs dst lo32 | callee-temp hi32). */
 extern "C" int jit_check_callable(int_type slot) noexcept;
+
+/* Re-raise deletability: builds the JR_DIV0 / JR_NEG_SHIFT exception
+ * loc-less into g_vm_jit_exc (the emit's exc-stamp adds the caret), so the
+ * int div/mod/shift arms convey instead of signalling g_vm_jit_raise. */
+extern "C" void jit_raise_kind_exc(int kind) noexcept;
 extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
                                       int_type nargs, const void *cs,
                                       const void *mkeys,
