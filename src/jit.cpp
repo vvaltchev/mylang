@@ -693,6 +693,11 @@ static bool jit_op_eligible(const Instr &in)
      * (bad narrow) -> NOT op_fully_native. */
     case OpCode::CoerceNumV:
         return true;
+    /* CallBuiltinV: a value-ABI read-only builtin call via jit_call_builtin
+     * (bakes the builtin_calls pool entry). Every reachable builtin throw is a
+     * RuntimeException now, conveyed via g_vm_jit_exc. */
+    case OpCode::CallBuiltinV:
+        return true;
     case OpCode::IntShlRI: case OpCode::IntShrRI:
         /* a negative imm count THROWS - leave the op interpreted */
         return imm_shift_ok(in.b_lit());
@@ -1007,6 +1012,12 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * closure captures) would be STALE in memory when jit_make_closure
              * reads it. So disable caching for the WHOLE run - a closure-create
              * loop is not a hot int-arith loop where N5 matters. */
+            return {};
+        case OpCode::CallBuiltinV:
+            /* A callback builtin (make_array/make_dict/find) re-enters
+             * vm_dispatch and can mutate ARBITRARY slots (globals, captures,
+             * the accumulator) - the emitter can't enumerate them. An N5-cached
+             * slot would be stale. Disable caching for the WHOLE run. */
             return {};
         case OpCode::BinOpV:
         case OpCode::CmpV:
@@ -1676,6 +1687,29 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::CallBuiltinV: {
+        /* jit_call_builtin(dst, base, n, bc) - rdi=dst=target, rsi=base=a_lit,
+         * rdx=n=b_lit, rcx=bc=&ck.builtin_calls[target2] (a stable pool-buffer
+         * addr). Uses g_current_ctx->frame. The builtin CAN throw -> test eax +
+         * exit_pc so EnterNative re-raises (the helper already stamped the loc
+         * from the pool). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(RCX,
+                 reinterpret_cast<uint64_t>(&ck.builtin_calls[in.target2]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_call_builtin) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        const size_t j_ok_cb = e.j8(0x74);
+        e.exit_pc(pc);
+        e.patch8(j_ok_cb, e.pos());
+        return true;
+    }
+
     case OpCode::StoreGlobalV: {
         /* g = <expr> via jit_store_global(gslot, src). rsi = &slot[src] (LEA'd
          * from the slots base FIRST), then rdi = gslot (target) - which
@@ -1974,6 +2008,14 @@ static bool op_fully_native(OpCode op)
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
     case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
     case OpCode::LogV:              /* eager && / || (is_true), never throws */
+    /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
+     * its interpreted original - so deleting the original is sound. And unlike
+     * the side-table throwing ops (Subscript/DictLoad), it conveys its OWN loc
+     * from the builtin_calls pool (stamped in jit_call_builtin before stashing),
+     * so a deleted CallBuiltinV's caret is byte-correct regardless of the
+     * pc-keyed loc table collapsing onto the EnterNative pc. Hence deletable.
+     * See plans/callbuiltinv-nativization.md #2. */
+    case OpCode::CallBuiltinV:
         return true;
     default:
         return false;

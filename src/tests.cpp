@@ -14869,6 +14869,22 @@ static bool jit_op_nativized()
             "  return int(acc);",
             "}",
             "assert(f(runtime(5)) == -30);" } },
+        /* CallBuiltinV: a value-ABI builtin call `len(a)` per loop iteration.
+         * The loop fragments (verified: the loop's builtin runs natively - a
+         * count of 50 loop + 2 main's runtime/print for f(runtime(50))). NOTE:
+         * main's own runtime()/print() are ALSO CallBuiltinV, so the counter
+         * bumps regardless; the loop body (2 extra int ops) is there to keep the
+         * body above MIN_RUN so it fragments and the LOOP builtin runs native. */
+        { OpCode::CallBuiltinV, {
+            "func f(int n) {",
+            "  var dyn a = runtime(\"hello\");",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var j = i + 1; var k = j + 1; s = s + len(a);",
+            "  }",
+            "  return s;",
+            "}",
+            "assert(f(runtime(5)) == 25);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
