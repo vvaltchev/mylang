@@ -7600,13 +7600,24 @@ static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
  * already built. */
 static void build_boxed_ops(Chunk &chunk)
 {
-    for (Instr &in : chunk.code)
-        if (in.op == OpCode::BinOpV || in.op == OpCode::CmpV
-                || in.op == OpCode::CompoundV || in.op == OpCode::LogV
-                || in.op == OpCode::UnaryV) {
+    for (Instr &in : chunk.code) {
+        const bool boxed_arith =
+            in.op == OpCode::BinOpV || in.op == OpCode::CmpV
+            || in.op == OpCode::CompoundV || in.op == OpCode::LogV
+            || in.op == OpCode::UnaryV;
+        /* A COMPOUND global/capture store `g OP=`/`cap OP=` reads its rhs via
+         * boxed_operand + runs num_bin_op (like CompoundV), so it needs the pool
+         * for the rhs operand too; the slot (global/capture) rides target, the
+         * rhs is `a`. The PLAIN case (aop invalid) needs no pool (jit_store_*
+         * lea's the src slot directly). target2 is otherwise unused for these. */
+        const bool compound_store =
+            (in.op == OpCode::StoreGlobalV || in.op == OpCode::StoreCaptureV)
+            && in.aop != Op::invalid;
+        if (boxed_arith || compound_store) {
             in.target2 = static_cast<int>(chunk.boxed_ops.size());
             chunk.boxed_ops.push_back({ in.target, in.aop, in.a(), in.b() });
         }
+    }
 }
 
 Chunk

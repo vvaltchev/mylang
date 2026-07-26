@@ -323,6 +323,12 @@ extern "C" void jit_make_closure(int_type dst, const void *def) noexcept;
 extern "C" int jit_boxed_binop(const void *bop) noexcept;
 extern "C" int jit_boxed_cmp(const void *bop) noexcept;
 extern "C" int jit_boxed_compound(const void *bop) noexcept;
+/* Compound global/capture stores `g OP=`/`cap OP=` - reuse the boxed_ops pool
+ * (bo->target = the GLOBAL/CAPTURE slot, bo->a = the rhs, bo->aop). Return 1 to
+ * exit: an undefined-global BAIL (global only, no g_vm_jit_exc) or a num_bin_op
+ * RuntimeException (g_vm_jit_exc, re-raised). */
+extern "C" int jit_store_global_compound(const void *bop) noexcept;
+extern "C" int jit_store_capture_compound(const void *bop) noexcept;
 /* LogV (eager && / ||): is_true() never throws -> void (op_fully_native). */
 extern "C" void jit_boxed_log(const void *bop) noexcept;
 

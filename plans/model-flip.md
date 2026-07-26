@@ -579,12 +579,21 @@ to do LATER, separately (don't forget these):
 - **StoreCaptureV** — DONE (2026-07-23). A PLAIN capture store `cap = v`
   (jit_store_capture - the capture-slot twin of jit_store_global:
   `(*ctx->captures)[cap_slot] = RValue(*src)`; a capture is always defined so NO
-  defined check + never throws -> op_fully_native). PLAIN-only gate like
-  StoreGlobalV (a compound `cap OP= v` runs num_bin_op -> stays interpreted).
-  Same emit shape as StoreGlobalV (lea &slot[src] -> rsi, cap_slot -> rdi).
-  VERIFIED: a closure reassigning its capture in a native loop (jit_op_nativized
-  StoreCaptureV case). With this, EVERY container/slot store is native (plain
-  forms); only the COMPOUND global/capture stores stay interpreted.
+  defined check + never throws -> op_fully_native). Same emit shape as
+  StoreGlobalV.
+- **The COMPOUND global/capture stores** (`g OP=`/`g++`, `cap OP=`/`cap++`) —
+  DONE (2026-07-23). Extend StoreGlobalV/StoreCaptureV to their compound forms
+  via jit_store_global_compound / jit_store_capture_compound - like CompoundV but
+  on a GLOBAL/CAPTURE slot: they REUSE the boxed_ops pool (build_boxed_ops now
+  also processes an aop!=invalid StoreGlobalV/StoreCaptureV; bo->target = the
+  slot, bo->a = the rhs, bo->aop) so the rhs operand + slot ride the pool (1 arg,
+  &boxed_ops[target2]). An undefined-GLOBAL base BAILS (like LoadGlobalV; captures
+  never bail); a num_bin_op div0/type throw re-raises (loc from the loc side
+  table). **op_fully_native now takes the Instr** (not just OpCode) so it gates
+  StoreGlobalV/StoreCaptureV on aop==invalid: PLAIN = deletable, COMPOUND = kept
+  (the bail/re-raise needs the original). VERIFIED: `g += i`/`c += i` native +
+  correct, div0 byte-identical, undefined-global compound bail vm==nj. With this
+  EVERY container/slot store - plain AND compound - is native.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);
