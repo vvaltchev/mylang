@@ -556,8 +556,17 @@ The order:
    **0.274x**, 55_float_sum **0.389x** (the div island split those whole
    loops), 54_mandelbrot 0.977 (its divs are per-pixel setup; the inner
    loop was already native); controls 1.0000.
-3. **LoadMemberInt/Float** (3) - typed POD member reads, the same inline
-   shape as the done LoadStructFieldInt/Float pair.
+3. **LoadMemberInt/Float** (3) - **DONE (2026-07-25).** The H1 typed
+   standalone member read `p.x` via jit_load_member; the interpreter's
+   two handlers were REFACTORED into the shared `vm_load_member_scalar`
+   (POD byte fast path + member_read_core fallback, whose loc-less get<>
+   throw gets the member caret) that the helper also runs - no drift.
+   Bakes &chunk.member_keys[idx]; NOT op_fully_native (the fallback
+   throws). Test-shape note: a standalone LOCAL `p` (a foreach-array
+   element is LoadStructFieldInt instead) with a NON-accumulator field
+   use (`s += p.x` fuses into StructFieldAddInt). MEASURED:
+   64_struct_create **0.966x** (its 3 islands gone); 65_struct_field_sum
+   unchanged (its islands are step 4's); controls 1.0000.
 4. **The 65_struct_field_sum trio** - StructFieldAddInt + ForStepElemInt
    (inline fusion emits, the IntAddStep precedent) + EmplaceStruct (a
    helper, the AppendV precedent). That bench's whole hot loop goes native.

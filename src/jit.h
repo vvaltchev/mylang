@@ -386,6 +386,13 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
  *    g_vm_jit_exc + return 1 (loc side table), else 0.
  *  - jit_foreach_dyn_next: 1 = bound, 0 = end, -1 = THREW (the strict N-var
  *    unpack's TypeErrorEx via g_vm_jit_exc, loc side table). */
+/* model-flip (nativize-ops): LoadMemberInt/Float natively - the H1 typed
+ * standalone struct-member read `p.x` (POD byte fast path; boxed/dict/const
+ * fallback via member_read_core). `mk` = a baked &chunk.member_keys[idx]; a
+ * fallback throw carries the member caret -> g_vm_jit_exc + return 1. */
+extern "C" int jit_load_member(int_type dst, int_type base_slot,
+                               const void *mk, int is_int) noexcept;
+
 extern "C" void jit_dict_iter_init(int_type iter_id,
                                    int_type dict_slot) noexcept;
 extern "C" int jit_dict_iter_next(int_type iter_id, int_type k_slot,
