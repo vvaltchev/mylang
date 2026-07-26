@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (22 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (23 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -373,7 +373,9 @@ TypeErrorEx is thrown, a RuntimeException -> re-raise; the jit_container test's
 island moved to MakeArrayV - see its backlog entry). And **StoreElemValue**
 (`jit_store_elem_value` - the UNIVERSAL subscript store `a[i]=v`, ANY base incl.
 global/capture via a `kind` arg; an undefined-global base bails, a subscript
-throw re-raises - see its backlog entry).
+throw re-raises - see its backlog entry). And **StoreMemberV** (`jit_store_member`
+- a struct field store `s.f=v` via vm_member_store, member key + carets from the
+baked member_keys pool - see its backlog entry).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -546,12 +548,22 @@ to do LATER, separately (don't forget these):
   StoreElemValue case (general-array store loop) + verified all 4 paths
   (general/global native, OOB re-raise byte-identical, undefined-global bail
   vm==nj) + a use-before-def-global-store `tests` entry.
-- **The remaining container stores** (StoreMemberV `s.f=v`, StoreCaptureV
-  `cap=v`, StoreElem2V/StoreElemChainV/StoreLValueChainV nested chains) — 0x in
-  benches, less common; the same shape (vm_member_store / the chain walks; watch
-  CannotChangeConstEx - a plain Exception, but a const-container store throws
-  NotLValueEx not CannotChangeConstEx, and the undefined-global bail covers the
-  base).
+- **StoreMemberV** — DONE (2026-07-23). A struct field store `s.f = v` /
+  `s.f OP= v` (a dict member store uses DictStore) via jit_store_member -> the
+  interpreter's exact vm_member_store. Like jit_store_elem_value but the key is a
+  MEMBER: the emit bakes `&chunk.member_keys[idx]` (pool buffer addr, r8) and the
+  helper reads memUid + the 4 carets. GLOBAL/CAPTURE struct base too. vm_member_
+  store throws only RuntimeExceptions (non-struct/bad-POD-type -> TypeErrorEx
+  already carrying its caret; readonly -> NotLValueEx(mstart); a compound div/mod
+  -> loc-less, stamped with the MEMBER caret here exactly as the interpreted
+  catch does) -> re-raise; an undefined-global base bails. VERIFIED: POD +
+  boxed field native, readonly-store NotLValueEx byte-identical vm/nj/tw.
+- **The remaining container stores** (StoreElem2V/StoreElemChainV/
+  StoreLValueChainV nested CHAINS, StoreCaptureV `cap=v`) — 0x in benches, more
+  complex (the chains have per-step key RUNS + per-step carets in the chain_locs/
+  chain_steps pools; StoreCaptureV is a slot write like StoreGlobalV). Deferred
+  as low-value (island-shrinkage only, no perf) - do them for completeness or a
+  future full-native pass.
 
 ## Correctness pillars (unchanged from the JIT arc)
 - The `-tw` tree-walker differential ORACLE; `nested_fuzz.py` (tw==vm==cpython);
