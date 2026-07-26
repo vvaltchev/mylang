@@ -943,11 +943,18 @@ wrongly called it un-nativized) - became DELETABLE via the cold-side
 exc-stamp, so `while (dyn_flag)` bodies delete to a bare enter.nat
 (caret err-loc pinned, multi-line span).
 
-NEXT INCREMENTS: the IncDec family (their pools already carry dual
-carets), ThrowRuntimeV (build the pooled exception natively), the
-raise-kind ops (IntBin div/mod + shifts via an exc-build-with-loc cold
-helper), LoadElemValue (bounds-check bail -> convey), StoreElemFloat
-(remove the value-load bail).
+**INCREMENT 4 LANDED (the IncDec family, 2026-07-25):** all four checked
+inc-dec ops deletable for non-global kinds (elem/member/chain were
+already pool-loc'd - pure gating; the scalar's loc-less TypeError gets
+the cold-side exc-stamp, safe on the shared bail branch because the
+848e06e stamp is null-checked - no per-site gating needed, the first
+increment to benefit from the structural fix). A dyn `d++` loop body
+deletes to a bare enter.nat, caret pinned.
+
+NEXT INCREMENTS: ThrowRuntimeV (build the pooled exception natively),
+the raise-kind ops (IntBin div/mod + shifts via an exc-build-with-loc
+cold helper), LoadElemValue (bounds-check bail -> convey),
+StoreElemFloat (remove the value-load bail).
 
 (Historical note - the older tally below predates the iterator ops.)
 CallBuiltinV (~294) is DONE (see
