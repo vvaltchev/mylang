@@ -276,6 +276,21 @@ struct Emitter {
             store(c.reg, c.payload);
         }
     }
+    /* The inverse: re-load every pinned slot's payload from memory. Used with
+     * flush_cache to BRACKET an op that reads or writes frame slots the emitter
+     * cannot enumerate (a builtin call that can re-enter the VM, a closure
+     * capture snapshot, a pooled-length arg run). Flushing first makes the
+     * memory copy current for the op to read; reloading after picks up anything
+     * the op wrote. This is the ordinary compiler treatment of a call - spill
+     * the live registers around it - and it replaces the old all-or-nothing
+     * rule, which disabled pinning for the WHOLE fragment when any such op
+     * appeared (so a hot loop merged into a fragment containing one builtin
+     * call silently lost its pinned counters). */
+    void reload_cache()
+    {
+        for (const CacheEnt &c : cache)
+            load(c.reg, c.payload);
+    }
     /* movabs <reg64>, imm64 */
     void movabs(uint8_t reg, uint64_t imm)
     {
@@ -428,8 +443,31 @@ struct Emitter {
     size_t j8(uint8_t op) { u8(op); const size_t at = pos(); u8(0); return at; }
     void patch8(size_t at, size_t target)
     {
-        b[at] = static_cast<uint8_t>(target - (at + 1));
+        /* A rel8 displacement is a SIGNED BYTE. Truncating an over-127 jump
+         * silently lands in the middle of an instruction - it shows up only as
+         * a SEGV in generated code, with no hint where it came from. Assert
+         * instead, and use j32 for any span that can grow (an exit_pc carries
+         * an N5 flush, a helper call its whole prologue/epilogue). */
+        const long d = static_cast<long>(target) - static_cast<long>(at + 1);
+        ML_CHECK(d >= -128 && d <= 127);
+        b[at] = static_cast<uint8_t>(d);
     }
+    /* A NEAR (rel32) jmp/jcc, patched to here later. `short_op` is the SHORT
+     * opcode (0xEB jmp, 0x7x jcc); the near forms are 0xE9 and 0x0F 0x8x. */
+    size_t j32(uint8_t short_op)
+    {
+        if (short_op == 0xEB) {
+            u8(0xE9);
+        } else {
+            u8(0x0F);
+            u8(static_cast<uint8_t>(short_op + 0x10));
+        }
+        const size_t at = pos();
+        u32(0);
+        return at;
+    }
+    void patch32_here(size_t at)
+    { patch32(at, static_cast<uint32_t>(pos() - (at + 4))); }
 };
 
 enum XReg : uint8_t { X0 = 0, X1 = 1 };   /* GP r8 = t_float (float
@@ -1066,8 +1104,18 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
  * type, so it is safely owned. */
 static std::vector<int>
 pick_cached_slots(const std::vector<Instr> &code, size_t begin,
-                  size_t end, int slot_count)
+                  size_t end, int slot_count,
+                  std::vector<char> *barrier = nullptr)
 {
+    /* `barrier[pc-begin] = 1` marks an op that touches frame slots the emitter
+     * cannot enumerate. Such an op is BRACKETED by flush_cache/reload_cache
+     * (the compiler's spill-around-a-call) instead of disabling pinning for the
+     * whole fragment - only ops that are NOT branches may be bracketed, since a
+     * taken branch would skip the reload. */
+    const auto mark_barrier = [&](size_t pc) {
+        if (barrier)
+            (*barrier)[pc - begin] = 1;
+    };
     std::unordered_map<int, int> use;    /* slot -> int-scalar use count */
     std::unordered_set<int> disq;
     const auto usei = [&](int s) { if (s >= 0) use[s]++; };
@@ -1136,7 +1184,11 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target);
             break;
         case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
-            bad(in.target2); bad(in.a_slot()); bad(in.target);
+            /* the INDEX is read cache-aware (load_index_r9), so it stays a
+             * countable int use - it is the loop counter, the slot most worth
+             * pinning. dst/base are written/read in memory. */
+            bad(in.target2); bad(in.target);
+            if (!in.a_is_lit()) usei(in.a_slot());
             break;
         case OpCode::StoreElemInt:
             bad(in.target2);             /* base slot holds an array */
@@ -1218,15 +1270,21 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * emitter can't enumerate them to disqualify individually. An N5
              * register-cached capture source (e.g. a hot loop accumulator the
              * closure captures) would be STALE in memory when jit_make_closure
-             * reads it. So disable caching for the WHOLE run - a closure-create
-             * loop is not a hot int-arith loop where N5 matters. */
-            return {};
+             * reads it. BRACKET it (flush before / reload after) so the rest of
+             * the fragment keeps its pinned registers. */
+            mark_barrier(pc);
+            break;
         case OpCode::CallBuiltinV:
             /* A callback builtin (make_array/make_dict/find) re-enters
              * vm_dispatch and can mutate ARBITRARY slots (globals, captures,
-             * the accumulator) - the emitter can't enumerate them. An N5-cached
-             * slot would be stale. Disable caching for the WHOLE run. */
-            return {};
+             * the accumulator) - the emitter can't enumerate them. BRACKET it:
+             * flush the pinned registers to memory before (so the builtin and
+             * any callback see current values) and reload after (so a callback
+             * write is picked up). Disabling pinning for the whole fragment
+             * instead - the old rule - cost a hot loop its registers whenever it
+             * merged into a fragment containing ANY builtin call. */
+            mark_barrier(pc);
+            break;
         case OpCode::BinOpV:
         case OpCode::CmpV:
         case OpCode::LogV:
@@ -1293,11 +1351,11 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target);
             break;
         case OpCode::LoadElemBool:
-            /* INLINED (no helper): like LoadElemInt it reads the index from
-             * MEMORY (mov_r9_slot), so the index must NOT be pinned - same
-             * treatment as the int/float element loads. */
+            /* INLINED (no helper); the index is read cache-aware
+             * (load_index_r9), so it stays a countable int use like
+             * LoadElemInt's. */
             bad(in.target); bad(in.target2);
-            if (!in.a_is_lit()) bad(in.a_slot());
+            if (!in.a_is_lit()) usei(in.a_slot());
             break;
         case OpCode::StrLen:
         case OpCode::LoadStrChar:
@@ -1322,8 +1380,9 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * struct-array literal's run is n * nfields (the field count is in
              * the DEF) - and pick_cached_slots has no chunk to resolve either.
              * Per the MakeClosureV rule (a helper reading slots the emit site
-             * cannot name), disable caching for the WHOLE run. */
-            return {};
+             * cannot name), BRACKET them with flush/reload. */
+            mark_barrier(pc);
+            break;
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
         case OpCode::LoadLiteralObjV:
@@ -1528,6 +1587,24 @@ static void raise_unless(Emitter &e, uint8_t pass_cond, int kind, uint32_t pc)
  * a LOC-LESS raise in g_vm_jit_exc) the fragment exits to the op's pc and
  * EnterNative raises it, stamping the caret from the live chunk - no chunk/pc
  * is passed (the fragment can't hold the stack-built, moved-out chunk). */
+/* Load an op's int INDEX operand into r9, CACHE-AWARE: if the slot is pinned in
+ * an N5 register, move it from there rather than re-reading memory. Reading
+ * memory would force the index to be disqualified from pinning for the whole
+ * fragment - which is exactly how a hot loop counter lost its register once
+ * runs began merging (mov_rr encodes r9 as a destination directly). */
+static void load_index_r9(Emitter &e, const Instr &in)
+{
+    if (in.a_is_lit()) {
+        e.movabs_r9(static_cast<uint64_t>(in.a_lit()));
+        return;
+    }
+    const int cr = e.creg(in.a_slot());
+    if (cr >= 0)
+        e.mov_rr(9 /* r9 */, static_cast<uint8_t>(cr));
+    else
+        e.mov_r9_slot(slot_addr(in.a_slot()).payload);
+}
+
 static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
                             uint32_t pc, bool is_float)
 {
@@ -1781,30 +1858,54 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.cmp_byte_rdi(base.payload + L.slice_off, 0);   /* not a slice? */
         e.bail_unless(0x74, pc);                 /* je (slice==0) */
         e.load(RAX, base.payload);               /* rax = shobj ptr */
-        e.cmp_byte_rax(L.kind_off,               /* right flat kind? */
-                       is_float ? L.kind_floats : L.kind_ints);
-        e.bail_unless(0x74, pc);                 /* je (kind matches) */
-        e.mov_rcx_rax(L.data_off);               /* rcx = _M_start */
-        e.mov_rdx_rax(L.data_off + 8);           /* rdx = _M_finish */
-        e.sub_rdx_rcx();
-        e.sar_rdx_3();                            /* rdx = element count */
-        if (in.a_is_lit())                        /* idx (unsigned bounds:
-                                                   * a negative index is
-                                                   * huge -> bails) */
-            e.movabs_r9(static_cast<uint64_t>(in.a_lit()));
-        else
-            e.mov_r9_slot(slot_addr(in.a_slot()).payload);
-        e.cmp_r9_rdx();
-        raise_unless(e, 0x72, JR_OOB, pc);       /* jb (idx < count) else
-                                                  * RAISE OutOfBounds (approach
-                                                  * A: no re-interpret) */
         if (is_float) {
+            e.cmp_byte_rax(L.kind_off, L.kind_floats);
+            e.bail_unless(0x74, pc);             /* je (kind matches) */
+            e.mov_rcx_rax(L.data_off);           /* rcx = _M_start */
+            e.mov_rdx_rax(L.data_off + 8);       /* rdx = _M_finish */
+            e.sub_rdx_rcx();
+            e.sar_rdx_3();                        /* rdx = element count */
+            load_index_r9(e, in);                 /* cache-aware index */
+            e.cmp_r9_rdx();
+            raise_unless(e, 0x72, JR_OOB, pc);   /* jb (idx < count) else
+                                                  * RAISE OutOfBounds */
             e.load_elem_float();                 /* movsd xmm0,[rcx+r9*8] */
             emit_float_store(e, ck, X0, in.target, pc);
-        } else {
-            e.load_elem_int();                   /* mov rax,[rcx+r9*8] */
-            write_slot(e, ck, RAX, in.target, pc);
+            return true;
         }
+        /* An int-typed element read accepts BOTH flat `ints` (8-byte) and flat
+         * `bools` (1-byte, 0/1) storage - exactly what the interpreter's
+         * LoadElemInt does. Handling only `ints` made `if (bool_arr[i])` BAIL
+         * every iteration, and since a run is only ever entered at its HEAD,
+         * that bail dropped the whole REST of the run to the interpreter
+         * (measured: it cost 56_sieve_bool its natively-executing inner loop
+         * once runs began merging). */
+        e.cmp_byte_rax(L.kind_off, L.kind_ints);
+        const size_t j_ints = e.j32(0x74);       /* je -> the 8-byte path */
+        e.cmp_byte_rax(L.kind_off, L.kind_bools);
+        e.bail_unless(0x74, pc);                 /* je (bools) else BAIL */
+        /* --- flat bools: 1-byte elements, so the count is the raw pointer
+         * difference (no sar) and the load is a movzx --- */
+        e.mov_rcx_rax(L.data_off);
+        e.mov_rdx_rax(L.data_off + 8);
+        e.sub_rdx_rcx();
+        load_index_r9(e, in);
+        e.cmp_r9_rdx();
+        raise_unless(e, 0x72, JR_OOB, pc);
+        e.load_elem_byte();                      /* movzx eax,[rcx+r9] */
+        const size_t j_done = e.j32(0xEB);       /* jmp -> store */
+        /* --- flat ints --- */
+        e.patch32_here(j_ints);
+        e.mov_rcx_rax(L.data_off);
+        e.mov_rdx_rax(L.data_off + 8);
+        e.sub_rdx_rcx();
+        e.sar_rdx_3();
+        load_index_r9(e, in);
+        e.cmp_r9_rdx();
+        raise_unless(e, 0x72, JR_OOB, pc);
+        e.load_elem_int();                       /* mov rax,[rcx+r9*8] */
+        e.patch32_here(j_done);
+        write_slot(e, ck, RAX, in.target, pc);
         return true;
     }
 
@@ -2203,10 +2304,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.sub_rdx_rcx();                         /* rdx = count (1B elems,
                                                       * so NO sar - unlike the
                                                       * 8-byte int/float path) */
-            if (in.a_is_lit())
-                e.movabs_r9(static_cast<uint64_t>(in.a_lit()));
-            else
-                e.mov_r9_slot(slot_addr(in.a_slot()).payload);
+            load_index_r9(e, in);                    /* cache-aware index */
             e.cmp_r9_rdx();
             e.bail_unless(0x72, pc);                 /* jb: unsigned in-range */
             e.load_elem_byte();                      /* movzx eax,[rcx+r9] */
@@ -2728,10 +2826,10 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                                                   * fast path calls no helper) */
         e.load(RAX, cond.type);                  /* rax = the value's Type* */
         e.u8(0x48); e.u8(0x39); e.u8(0xF0);      /* cmp rax, rsi (t_int) */
-        const size_t j_fast_int = e.j8(0x74);    /* je -> fast */
+        const size_t j_fast_int = e.j32(0x74);   /* je -> fast */
         e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_bool));
         e.cmp_rax_rcx();
-        const size_t j_fast_bool = e.j8(0x74);   /* je -> fast */
+        const size_t j_fast_bool = e.j32(0x74);  /* je -> fast */
         /* --- slow path: any other type (may throw) --- */
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
@@ -2748,13 +2846,13 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
-        const size_t j_join = e.j8(0xEB);        /* jmp -> join (rax = 0/1) */
+        const size_t j_join = e.j32(0xEB);       /* jmp -> join (rax = 0/1) */
         /* --- fast path: rax = the raw payload --- */
-        e.patch8(j_fast_int, e.pos());
-        e.patch8(j_fast_bool, e.pos());
+        e.patch32_here(j_fast_int);
+        e.patch32_here(j_fast_bool);
         e.load(RAX, cond.payload);
         /* --- join: jump to target when the value is FALSE --- */
-        e.patch8(j_join, e.pos());
+        e.patch32_here(j_join);
         e.test_rax_rax();                        /* 64-bit: a big int whose low
                                                   * 32 bits are 0 is still true */
         emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
@@ -3393,10 +3491,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
          * each ONCE here (the back edge jumps to the first op below, so
          * the loop keeps them in registers; every exit flushes them). */
         e.cache.clear();
+        std::vector<char> cache_barrier(end - begin, 0);
         {
             static const uint8_t cregs[2] = { 10, 11 };
             const std::vector<int> hot =
-                pick_cached_slots(chunk.code, begin, end, chunk.slot_count);
+                pick_cached_slots(chunk.code, begin, end, chunk.slot_count,
+                                  &cache_barrier);
             for (size_t h = 0; h < hot.size(); h++) {
                 const SlotAddr a = slot_addr(hot[h]);
                 e.cache.push_back({ hot[h], a.payload, a.type, cregs[h] });
@@ -3413,6 +3513,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 marks.push_back({ static_cast<uint32_t>(e.pos() - frag_off[r]),
                                   static_cast<uint32_t>(remap[pc]) });
             const Instr &in = chunk.code[pc];
+            /* An op that touches slots the emitter cannot enumerate is
+             * BRACKETED: flush the pinned registers so it reads current values,
+             * reload after so anything it wrote is picked up (the ordinary
+             * spill-around-a-call). Never a branch op, so the reload always
+             * executes. */
+            const bool brk = cache_barrier[pc - begin] && !e.cache.empty();
+            if (brk)
+                e.flush_cache();
             if (op_is_branch(in.op)) {
                 emit_branch(e, chunk, in, static_cast<uint32_t>(remap[pc]),
                             begin, end, remap, fixups);
@@ -3421,6 +3529,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 e.b.clear();
                 return;                    /* selection bug: give up */
             }
+            if (brk)
+                e.reload_cache();
         }
         e.exit_pc(static_cast<uint32_t>(remap[end]));   /* fall-through */
 
