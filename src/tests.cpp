@@ -6619,6 +6619,28 @@ static const std::vector<test> tests =
         { "rethrow;" },
         &typeid(SyntaxErrorEx), 1, 0, 0, 0,
     },
+    {
+        /* the dyn-foreach non-container throw carets the CONTAINER (both
+         * engines; under the VM the JIT's loc-less re-raise stamps the same
+         * side-table caret - jit_foreach_dyn_init). */
+        "err loc: dyn foreach over a non-container marks the container",
+        {
+            "func f(dyn c) { foreach (x in c) { } }",
+            "f(runtime(5));",
+        },
+        &typeid(TypeErrorEx), 31, 1, 33, 1,
+    },
+    {
+        /* the dyn-foreach strict N-var unpack error carets the CONTAINER
+         * (jit_foreach_dyn_next's loc-less throw -> the same side-table
+         * caret). */
+        "err loc: dyn foreach strict unpack marks the container",
+        {
+            "func f(dyn c) { foreach (a, b in c) { } }",
+            "f(runtime([[1, 2, 3]]));",
+        },
+        &typeid(TypeErrorEx), 34, 1, 36, 1,
+    },
 
     {
         "Exceptions, catch multiple exceptions, ex: TypeErrorEx",
@@ -15325,13 +15347,76 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(10)) == 145);" } },
+        /* The ITERATOR ops. DictIter*: a foreach over a PROVEN dict (the
+         * template instance pins the Dict type - the SHAPE TRAP again: a
+         * `runtime({..})` arg is DYN and routes to ForeachDyn instead, so the
+         * runtime() must wrap a VALUE, keeping the dict type proven); the
+         * whole loop - init, the per-iteration next + the int body - runs in
+         * one fragment (both ops are op_fully_native, so the body DELETES to
+         * one enter.nat and the counter is the only evidence). */
+        { OpCode::DictIterInit, {
+            "func f(d) {",
+            "  var s = 0;",
+            "  foreach (k, v in d) s = s + v;",
+            "  return s;",
+            "}",
+            "var d = {\"a\": runtime(1), \"b\": 2, \"c\": 3};",
+            "assert(f(d) == 6);" } },
+        { OpCode::DictIterNext, {
+            "func f(d) {",
+            "  var s = 0;",
+            "  foreach (k, v in d) s = s + v;",
+            "  return s;",
+            "}",
+            "var d = {\"x\": runtime(10), \"y\": 20};",
+            "assert(f(d) == 30);" } },
+        /* ForeachDyn*: a foreach over a DYN container (runtime array-vs-dict
+         * dispatch). The same body handles both - run it over each. */
+        { OpCode::ForeachDynInit, {
+            "func f(dyn c) {",
+            "  var s = 0;",
+            "  foreach (x in c) s = s + x;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([10, 20, 30])) == 60);" } },
+        { OpCode::ForeachDynNext, {
+            "func f(dyn c) {",
+            "  var s = 0;",
+            "  foreach (k, v in c) s = s + v;",
+            "  return s;",
+            "}",
+            "assert(f(runtime({\"a\": 5, \"b\": 6})) == 11);" } },
+        /* The iterator THROW paths, script-caught: a non-container init and a
+         * strict-unpack next each ride g_vm_jit_exc out of the fragment and
+         * dispatch to the same-frame handler. */
+        { OpCode::ForeachDynInit, {
+            "func f(dyn c) {",
+            "  var r = 0;",
+            "  try { foreach (x in c) r = 1; } catch (TypeErrorEx) { r = 2; }",
+            "  return r;",
+            "}",
+            "assert(f(runtime(5)) == 2);" } },
+        { OpCode::ForeachDynNext, {
+            "func f(dyn c) {",
+            "  var r = 0;",
+            "  try { foreach (a, b in c) r = 1; }",
+            "  catch (TypeErrorEx) { r = 9; }",
+            "  return r;",
+            "}",
+            "assert(f(runtime([[1, 2, 3]])) == 9);" } },
     };
     for (const Case &c : cases) {
         const unsigned long b = g_jit_op_run[static_cast<size_t>(c.op)];
-        if (!run(c.src))
+        if (!run(c.src)) {
+            fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
+                    (int)c.op);
             return false;   /* wrong result (the program's assert threw) */
-        if (g_jit_op_run[static_cast<size_t>(c.op)] <= b)
+        }
+        if (g_jit_op_run[static_cast<size_t>(c.op)] <= b) {
+            fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
+                    (int)c.op);
             return false;   /* the op's NATIVE code did NOT run - a real gap */
+        }
     }
     return true;
 #else
