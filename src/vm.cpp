@@ -3333,14 +3333,24 @@ extern "C" int jit_store_global_compound(const void *bop) noexcept
     const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
     EvalContext *ctx = g_current_ctx;
     GlobalFuncTable *g = ctx->gfuncs;
-    if (!g->defined[bo->target])
-        return 1;                            /* bail (no exc): re-run -> throw */
+    if (!g->defined[bo->target]) {
+        /* re-raise deletability: CONVEY the exact interpreted throw (the
+         * eptr channel - UndefinedVariableEx has no clone()) with the
+         * name + the op's own pool caret, instead of the old bail-to-
+         * re-run; the pool entry is already loaded, so this costs nothing
+         * on the defined path. */
+        g_vm_jit_eptr = std::make_exception_ptr(UndefinedVariableEx(
+            g->names[bo->target]->val, bo->start, bo->end));
+        return 1;
+    }
     LValue &lv = g->slots[bo->target];
     EvalValue sb;
     EvalValue nv = lv.get();
     try {
         vm_num_binop(nv, boxed_operand(bo->a, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -3364,6 +3374,8 @@ extern "C" int jit_store_capture_compound(const void *bop) noexcept
     try {
         vm_num_binop(nv, boxed_operand(bo->a, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
