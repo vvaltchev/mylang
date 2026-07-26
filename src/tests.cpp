@@ -15197,6 +15197,79 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime(\"z\"), 10) == 45);" } },
+        /* The FOREACH element/field loads. Each runs its loop natively with the
+         * index materialized cache-aware into a register before the helper.
+         * SHAPE NOTES (each verified with a per-op counter, since these ops are
+         * op_fully_native and their originals are DELETED - `-vd`/`-vdj` show
+         * only the enter.nat, so the counter is the ONLY evidence):
+         *  - the struct ops need a PROVEN `array<S>` container; a `dyn` one
+         *    routes to ForeachDynInit/Next instead and never reaches them;
+         *  - `s += p.x` FUSES into StructFieldAddInt (#9), so the field-read
+         *    test uses a non-accumulator body;
+         *  - a body with a BOXED branch (`if (b == true)` -> JumpUnlessTrueV,
+         *    still un-nativized) splits the run so only the loop-ENTRY copy is
+         *    native and the counter stops scaling with iterations - the bodies
+         *    below are branch-free so the whole loop runs native. */
+        /* LoadElemValue: a general-array element bound into the loop var. */
+        { OpCode::LoadElemValue, {
+            "func f(array<array<int>> a) {",
+            "  var dyn last = 0;",
+            "  foreach (var e in a) last = e;",
+            "  return last[0];",
+            "}",
+            "assert(f(runtime([[1], [2], [3]])) == 3);" } },
+        /* LoadElemBool: a flat array<bool> element binds as a REAL bool. */
+        { OpCode::LoadElemBool, {
+            "func f(array<bool> a) {",
+            "  var n = 0;",
+            "  foreach (var b in a) n += int(b);",
+            "  return n;",
+            "}",
+            "assert(f(runtime([true, false, true, true])) == 3);" } },
+        /* StrLen + LoadStrChar: a foreach over a proven string (StrLen is the
+         * once-evaluated bound, LoadStrChar binds each 1-char string). */
+        { OpCode::StrLen, {
+            "func f(str s) {",
+            "  var n = 0;",
+            "  foreach (var c in s) n += len(c);",
+            "  return n;",
+            "}",
+            "assert(f(runtime(\"banana\")) == 6);" } },
+        { OpCode::LoadStrChar, {
+            "func f(str s) {",
+            "  var n = 0;",
+            "  foreach (var c in s) n += len(c);",
+            "  return n;",
+            "}",
+            "assert(f(runtime(\"bob\")) == 3);" } },
+        /* LoadStructFieldInt/Float: a flat array<PodStruct> foreach whose body
+         * reads ONLY scalar fields - the direct byte read, no StructObject. */
+        { OpCode::LoadStructFieldInt, {
+            "struct S { int x; float y; }",
+            "func f(array<S> a) {",
+            "  var s = 0;",
+            "  foreach (var p in a) { if (p.x > 1) s += 1; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime([S(1, 1.5), S(2, 2.5), S(3, 3.5)])) == 2);" } },
+        { OpCode::LoadStructFieldFloat, {
+            "struct S2 { int x; float y; }",
+            "func f(array<S2> a) {",
+            "  var s = 0.0;",
+            "  foreach (var p in a) { var d = p.y * 2.0; s += d; }",
+            "  return s;",
+            "}",
+            "assert(f(runtime([S2(1, 1.5), S2(2, 2.5)])) == 8.0);" } },
+        /* LoadStructElemV: the WHOLE-`p` foreach bind (p used as a value, not
+         * only as scalar fields) - a fresh StructObject per iteration. */
+        { OpCode::LoadStructElemV, {
+            "struct S3 { int x; int y; }",
+            "func f(array<S3> a) {",
+            "  var dyn last = 0;",
+            "  foreach (var p in a) last = p;",
+            "  return last.x;",
+            "}",
+            "assert(f(runtime([S3(1, 2), S3(7, 8)])) == 7);" } },
         /* MakeStructArrayV: the FUSED flat array<PodStruct> literal - two
          * same-def POD ctors with all-scalar args -> jit_make_struct_array. */
         { OpCode::MakeStructArrayV, {
@@ -16098,10 +16171,12 @@ static bool vm_disasm_native_call()
 
 /* plans/model-flip.md M1: -vd surfaces the CONTAINER PLAN - how a body
  * partitions into native/island segments and whether it could be ONE native
- * container. A dict-building body is MIXED (interpreted islands) -> "NOT ready"
- * + the blocking island(s); a tiny all-arith body is fully native-ELIGIBLE but
- * below MIN_RUN so it is not a native_leaf today -> "READY" (the flip would
- * nativize it). DUMP-ONLY; no emission consumes it yet. */
+ * container. A chunk with a still-boxed op is MIXED -> "NOT ready" + the
+ * blocking island(s) (here `main`, whose island is a CallV - calls are M5
+ * territory, off the nativize-ops path, so this case stays stable); a body whose
+ * every op is native-ELIGIBLE -> "READY" (the flip would nativize it), which now
+ * covers both the tiny arith `add` AND the whole dict-building foreach `wc`.
+ * DUMP-ONLY; no emission consumes it yet. */
 static bool vm_disasm_container_plan()
 {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -16140,17 +16215,27 @@ static bool vm_disasm_container_plan()
         const Block *b = dynamic_cast<const Block *>(root.get());
         if (b) {
             const std::string d = disassemble_program(b);
-            /* wc: a MIXED body -> NOT ready + at least one island line. */
-            const std::string wc = section(d, "; ===== func wc");
-            const bool wc_ok =
-                wc.find("container plan: NOT ready") != std::string::npos
-                && wc.find("island [pc") != std::string::npos;
+            /* main: a MIXED chunk -> NOT ready + at least one island line. Its
+             * island is the CallV (calls are M5 territory, deliberately not on
+             * the nativize-ops path), so this stays a stable mixed case.
+             * (The `wc` body was the mixed case originally; the nativize-ops
+             * path made the whole dict-building foreach - LoadElemValue,
+             * MakeDictV, the stores - native, so it now reports READY. That
+             * migration IS the arc working, and is asserted below.) */
+            const std::string mn = section(d, "; ===== main");
+            const bool mixed_ok =
+                mn.find("container plan: NOT ready") != std::string::npos
+                && mn.find("island [pc") != std::string::npos;
             /* add: 2 ops (< MIN_RUN) so not a native_leaf, but fully
              * native-eligible -> the READY line. */
             const std::string add = section(d, "; ===== func add");
             const bool add_ok =
                 add.find("container plan: READY") != std::string::npos;
-            ok = wc_ok && add_ok;
+            /* wc: the dict-building foreach body is fully native-eligible now. */
+            const std::string wc = section(d, "; ===== func wc");
+            const bool wc_ok =
+                wc.find("container plan: READY") != std::string::npos;
+            ok = mixed_ok && add_ok && wc_ok;
         }
     } catch (...) {
         ok = false;

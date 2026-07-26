@@ -751,6 +751,21 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::StructCtorBoxedV:
     case OpCode::MakeStructArrayV:
         return true;
+    /* model-flip (nativize-ops): the FOREACH element/field LOADS. The index is
+     * materialized cache-aware into a register before the call, so an N5-pinned
+     * loop counter stays usable. All non-throwing (the index is loop-bounded by
+     * the ArrLen/StrLen that produced it, the base kind is proven) EXCEPT
+     * LoadElemValue, which bounds-checks (it also serves 2-D `a[i][k]`): it
+     * re-raises an OOB / bails on an unproven base, so only IT is excluded from
+     * op_fully_native. */
+    case OpCode::LoadElemBool:
+    case OpCode::StrLen:
+    case OpCode::LoadStrChar:
+    case OpCode::LoadStructFieldInt:
+    case OpCode::LoadStructFieldFloat:
+    case OpCode::LoadStructElemV:
+    case OpCode::LoadElemValue:
+        return true;
     /* model-flip (nativize-ops): the boxed-arith ops (dyn/string operands) via
      * jit_boxed_* + the boxed_ops pool (target2 = the pool index, set by
      * build_boxed_ops). vm_num_binop CAN throw (div0/type) -> NOT
@@ -1225,6 +1240,23 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             for (int_type i = 0; i < in.b_lit(); i++)
                 bad(static_cast<int>(in.a_lit() + i));
             bad(in.target);
+            break;
+        case OpCode::LoadElemBool:
+        case OpCode::StrLen:
+        case OpCode::LoadStrChar:
+        case OpCode::LoadStructFieldInt:
+        case OpCode::LoadStructFieldFloat:
+        case OpCode::LoadStructElemV:
+        case OpCode::LoadElemValue:
+            /* The helper WRITES dst and READS the base from MEMORY, so both
+             * must stay in memory. The INDEX is different: the emitter
+             * materializes it with the cache-aware load_operand BEFORE the
+             * call, so it is read from its register when pinned - it stays a
+             * countable int use (this is the foreach COUNTER, the slot N5 most
+             * wants to cache; disqualifying it would lose the loop's caching). */
+            bad(in.target); bad(in.target2);
+            if (in.op != OpCode::StrLen && !in.a_is_lit())
+                usei(in.a_slot());
             break;
         case OpCode::StructCtorBoxedV:
         case OpCode::MakeStructArrayV:
@@ -2078,6 +2110,58 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         return true;
 
+    case OpCode::LoadElemBool:
+    case OpCode::StrLen:
+    case OpCode::LoadStrChar:
+    case OpCode::LoadStructFieldInt:
+    case OpCode::LoadStructFieldFloat:
+    case OpCode::LoadStructElemV:
+    case OpCode::LoadElemValue: {
+        /* The foreach element/field loads: rdi = dst, rsi = the base slot,
+         * rdx = the INDEX VALUE (materialized cache-aware from the op's
+         * slot-or-literal `a` operand BEFORE the prologue - rax survives the
+         * pushes - so an N5-pinned loop counter is read from its REGISTER),
+         * rcx/r8 = the field index + int/float selector for the struct-field
+         * pair. StrLen has no index. Only LoadElemValue returns a status
+         * (OOB re-raise / unproven-base bail). */
+        const bool has_idx = in.op != OpCode::StrLen;
+        const bool is_field = in.op == OpCode::LoadStructFieldInt
+                           || in.op == OpCode::LoadStructFieldFloat;
+        if (has_idx)
+            load_operand(e, RAX, in.a_is_lit(), in.a_lit(), in.a_slot());
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        if (has_idx)
+            e.mov_rr(RDX, RAX);               /* the index value */
+        if (is_field) {
+            e.movabs(RCX, static_cast<uint64_t>(in.b_lit()));
+            e.movabs_r8(in.op == OpCode::LoadStructFieldFloat ? 1u : 0u);
+        }
+        const void *fn =
+            in.op == OpCode::LoadElemBool
+                ? reinterpret_cast<const void *>(jit_load_elem_bool)
+          : in.op == OpCode::StrLen
+                ? reinterpret_cast<const void *>(jit_str_len)
+          : in.op == OpCode::LoadStrChar
+                ? reinterpret_cast<const void *>(jit_load_str_char)
+          : is_field
+                ? reinterpret_cast<const void *>(jit_load_struct_field)
+          : in.op == OpCode::LoadStructElemV
+                ? reinterpret_cast<const void *>(jit_load_struct_elem)
+                : reinterpret_cast<const void *>(jit_load_elem_value);
+        e.call_relocs.push_back({ e.pos(), fn });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        if (in.op == OpCode::LoadElemValue) {
+            e.u8(0x85); e.u8(0xC0);           /* test eax, eax */
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
+    }
+
     case OpCode::StructCtorBoxedV:
         /* jit_struct_ctor_boxed(dst, run base, &ck.boxed_ctors[target2]) - the
          * pool entry (def + the per-arg carets) is baked as a stable buffer
@@ -2605,6 +2689,15 @@ static bool op_fully_native(const Instr &in)
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
     case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
     case OpCode::MakeArrayV:        /* array literal build, no error path */
+    /* the foreach loads: the index is loop-bounded by the ArrLen/StrLen that
+     * produced it and the base kind is proven, so none of these can throw or
+     * bail (LoadElemValue, which bounds-checks, is deliberately NOT here). */
+    case OpCode::LoadElemBool:
+    case OpCode::StrLen:
+    case OpCode::LoadStrChar:
+    case OpCode::LoadStructFieldInt:
+    case OpCode::LoadStructFieldFloat:
+    case OpCode::LoadStructElemV:
     case OpCode::LogV:              /* eager && / || (is_true), never throws */
     /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
      * its interpreted original - so deleting the original is sound. And unlike

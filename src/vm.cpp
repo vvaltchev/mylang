@@ -2319,6 +2319,116 @@ extern "C" int jit_make_struct_array(const void *defv, int_type base,
     return 0;
 }
 
+/*
+ * model-flip (nativize-ops): THE FOREACH ELEMENT/FIELD LOADS. Each is the
+ * interpreter's exact handler body; the INDEX arrives as a VALUE (the emitter
+ * materializes the op's slot-or-literal operand with the cache-aware
+ * load_operand BEFORE the call prologue), so a foreach counter pinned in an N5
+ * register is read from the REGISTER, not from a stale memory slot.
+ *
+ * All of these are NON-THROWING (the index is loop-bounded by the ArrLen/StrLen
+ * that produced it, and the base kind is proven by the inferencer), hence void
+ * + op_fully_native - EXCEPT jit_load_elem_value, whose interpreter body does
+ * bounds-check (it also serves 2-D `a[i][k]` reads where the index is NOT the
+ * loop counter) and can raise OutOfBoundsEx.
+ */
+
+/* LoadElemBool: bind a[i] of a flat array<bool> as a REAL bool (not 0/1). */
+extern "C" void jit_load_elem_bool(int_type dst, int_type base,
+                                   int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemBool);
+    Frame *f = g_current_ctx->frame;
+    const SharedArrayObj &arr = f->at(base).get().get_ref<SharedArrayObj>();
+    const bool b = arr.skind() == SharedArrayObj::Storage::bools
+                       ? arr.flat_bools()[arr.offset() + idx] != 0
+                       : arr.get_view()[idx].get().get<bool>();
+    f->at(dst).put(EvalValue(b));
+}
+
+/* StrLen: the foreach bound n = the string's char count (get_view accounts for
+ * a slice's offset). */
+extern "C" void jit_str_len(int_type dst, int_type base) noexcept
+{
+    ML_JIT_OP_RAN(StrLen);
+    Frame *f = g_current_ctx->frame;
+    f->at(dst).put(EvalValue(static_cast<int_type>(
+        f->at(base).get().get_ref<SharedStr>().get_view().size())));
+}
+
+/* LoadStrChar: bind a FRESH 1-char string for the container's i-th char -
+ * matches the tree-walker's SharedStr(string(&view[i], 1)). */
+extern "C" void jit_load_str_char(int_type dst, int_type base,
+                                  int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadStrChar);
+    Frame *f = g_current_ctx->frame;
+    const std::string_view view =
+        f->at(base).get().get_ref<SharedStr>().get_view();
+    f->at(dst).put(EvalValue(SharedStr(std::string(&view[idx], 1))));
+}
+
+/* LoadStructFieldInt/Float: `pts[i].f` read STRAIGHT from the flat struct-array
+ * bytes into a scalar slot (no StructObject) - `is_float` picks the pair. */
+extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
+                                      int_type fidx, int is_float) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(is_float ? OpCode::LoadStructFieldFloat
+                                              : OpCode::LoadStructFieldInt)]++;
+#endif
+    EvalContext *ctx = g_current_ctx;
+    const EvalValue &arrv = ctx->frame->at(base).get();
+    if (is_float)
+        write_float_slot(ctx, dst, vm_struct_field_float(arrv, idx, fidx));
+    else
+        write_int_slot(ctx, dst, vm_struct_field_int(arrv, idx, fidx));
+}
+
+/* LoadStructElemV: the whole-`p` foreach bind - materialize a fresh
+ * StructObject from the flat struct-array element into the loop var. */
+extern "C" void jit_load_struct_elem(int_type dst, int_type base,
+                                     int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadStructElemV);
+    Frame *f = g_current_ctx->frame;
+    f->at(dst).put(vm_struct_elem(f->at(base).get(), idx));
+}
+
+/* LoadElemValue: a GENERAL (or flat-str) array element into a slot, box-free.
+ * Unlike its siblings this BOUNDS-CHECKS (it also serves a 2-D `a[i][k]` read,
+ * whose index is not the loop counter) - an OOB raises OutOfBoundsEx LOC-LESS
+ * -> g_vm_jit_exc, and EnterNative re-raises with the loc side table's caret.
+ * The interpreter's unreachable non-general tail is an InternalErrorEx there;
+ * here it BAILS (return 1 with no exception set) so the interpreter re-runs the
+ * op and raises it identically. */
+extern "C" int jit_load_elem_value(int_type dst, int_type base,
+                                   int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemValue);
+    Frame *f = g_current_ctx->frame;
+    const EvalValue &basev = f->at(base).get();
+    if (!basev.is<SharedArrayObj>())
+        return 1;                          /* bail: interpreter re-raises */
+    const SharedArrayObj &arr = basev.get_ref<SharedArrayObj>();
+    const SharedArrayObj::Storage k = arr.skind();
+    if (k != SharedArrayObj::Storage::general
+            && k != SharedArrayObj::Storage::strs)
+        return 1;                          /* bail: interpreter re-raises */
+    int_type i = idx;
+    if (i < 0)
+        i += arr.size();
+    if (i < 0 || static_cast<size_t>(i) >= arr.size()) {
+        g_vm_jit_exc.reset(new OutOfBoundsEx());   /* loc-less: side table */
+        return 1;
+    }
+    if (k == SharedArrayObj::Storage::general)
+        f->at(dst).put(arr.get_vec()[arr.offset() + i].get());
+    else
+        f->at(dst).put(EvalValue(SharedStr(arr.flat_strs()[arr.offset() + i])));
+    return 0;
+}
+
 extern "C" int jit_dict_load(int_type dst, int_type base_slot,
                              const EvalValue *key, int is_int) noexcept
 {

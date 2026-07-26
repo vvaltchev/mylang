@@ -345,6 +345,25 @@ extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
 extern "C" int jit_make_struct_array(const void *def, int_type base,
                                      int_type n, int_type dst) noexcept;
 
+/* model-flip (nativize-ops): the FOREACH element/field LOADS. The `idx` arrives
+ * as a VALUE (the emitter materializes the op's slot-or-literal operand with the
+ * cache-aware load_operand before the call), so an N5-pinned foreach counter is
+ * read from the register, not a stale slot. All non-throwing (index loop-bounded,
+ * base kind proven) -> void + op_fully_native, except jit_load_elem_value, which
+ * bounds-checks: an OOB sets g_vm_jit_exc LOC-LESS (EnterNative stamps from the
+ * loc side table) and a non-general/non-str base BAILS to the interpreter. */
+extern "C" void jit_load_elem_bool(int_type dst, int_type base,
+                                   int_type idx) noexcept;
+extern "C" void jit_str_len(int_type dst, int_type base) noexcept;
+extern "C" void jit_load_str_char(int_type dst, int_type base,
+                                  int_type idx) noexcept;
+extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
+                                      int_type fidx, int is_float) noexcept;
+extern "C" void jit_load_struct_elem(int_type dst, int_type base,
+                                     int_type idx) noexcept;
+extern "C" int jit_load_elem_value(int_type dst, int_type base,
+                                   int_type idx) noexcept;
+
 /* model-flip (nativize-ops): the BOXED-ARITH ops BinOpV / CmpV / CompoundV -
  * the interpreter's exact boxed_operand + vm_num_binop bodies. `bop` is a baked
  * `&chunk.boxed_ops[idx]` (the op's operand data - target/a/b/aop - copied into
