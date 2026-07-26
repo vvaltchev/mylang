@@ -63,6 +63,29 @@ those classes in impact order.
    builtin calls in loops); kills most of 75's residue and helps every
    len()-bounded loop.
 
+4c. **Struct baked-layout nativization** (from the 64_struct_create
+   audit, 2026-07-26; C++ twin verified fair - stores + reloads through
+   memory every iteration, 24 instr/iter vs OUR ~2,180). Two mechanisms,
+   both compile-time-known facts resolved at RUNTIME today:
+   - MEMBER READS (~79 Ir each vs 1 load): LoadMemberInt/Float ->
+     jit_load_member -> vm_load_member_scalar does a LINEAR FIELD SCAN
+     (`StructTypeDef::slot_of(memUid)` compares interned names over the
+     fields vector) on EVERY read, then kind-dispatches - despite the
+     inferencer having proven base_struct at compile time. Bake the
+     field OFFSET + kind into the op (the LoadStructFieldInt treatment,
+     which already byte-reads for the foreach path) and JIT-emit
+     `mov rax, [bytes + off]` behind a def-identity check; the
+     interpreted op should carry the pre-resolved slot too.
+   - CONSTRUCTION (~390 Ir per ctor vs 2-3 stores): vm_struct_ctor walks
+     the FieldDef vector generically, CALLS coerce_struct_field per
+     field (validation the StructCtorV gate already proved at compile
+     time), marshals a stack EvalValue buffer, then memcpys - plus the
+     H1 use_count probe + StructObject refcount churn (~85 Ir/iter).
+     Bake a per-field plan (offset, kind, src slot) and emit direct
+     stores into the reused instance's bytes - the C++ shape.
+   Expected: 64_struct_create 41.6x -> single digits; also lifts 58/65/
+   77 and every struct-touching loop.
+
 5. **Escape-analysis allocation elimination (the N7 arc proper /
    task #60).** Closures created in loops (63), struct temporaries
    (64_struct_create 56x, 77_struct_array_lit 18x), boxed values in dyn
