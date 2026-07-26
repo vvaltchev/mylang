@@ -102,12 +102,14 @@ struct JitLayout {
     long off_type;      /* &slot.val.type    - &slot */
     const void *t_int;    /* the int Type singleton */
     const void *t_float;  /* the float Type singleton (N3) */
+    const void *t_bool;   /* the bool Type singleton (inline is_true / bool
+                           * element loads) */
     const void *t_arr;    /* the array Type singleton (N4) */
     int slice_off;        /* SharedArrayObj: offset of `slice` (from payload) */
     int kind_off;         /* SharedObject: &kind - shobj */
     int data_off;         /* SharedObject: &elem_vec - shobj (the vector's
                            * _M_start is at +0, _M_finish at +8) */
-    unsigned char kind_ints, kind_floats;   /* Storage enum values */
+    unsigned char kind_ints, kind_floats, kind_bools;  /* Storage values */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
     int t_str_val;        /* Type::t_str: types >= this hold a REFERENCE */
     /* #55 STEP 2.1 native-call member offsets (via the vm.cpp probes) */
@@ -135,6 +137,8 @@ static const JitLayout &jit_layout()
         l.t_int = probe.get().get_type();
         LValue fprobe(EvalValue(static_cast<float_type>(1.0)), false);
         l.t_float = fprobe.get().get_type();
+        LValue bprobe(EvalValue(true), false);
+        l.t_bool = bprobe.get().get_type();
 
         /* N4: the flat-array layout, via the co-located jit_probe (which
          * reads real members, so it can't drift). Non-slice, flat-int/
@@ -158,6 +162,8 @@ static const JitLayout &jit_layout()
             SharedArrayObj::Storage::ints);
         l.kind_floats = static_cast<unsigned char>(
             SharedArrayObj::Storage::floats);
+        l.kind_bools = static_cast<unsigned char>(
+            SharedArrayObj::Storage::bools);
         /* Type::t offset + the t_str boundary: a slot whose current type has
          * t >= t_str holds a REFERENCE (needs a C++ release before overwrite);
          * < t_str is a trivial value (overwrite in place). */
@@ -375,6 +381,41 @@ struct Emitter {
     /* movsd xmm0, [rcx + r9*8]  (float element) */
     void load_elem_float()
     { u8(0xF2); u8(0x4A); u8(0x0F); u8(0x10); u8(0x04); u8(0xC9); }
+    /*
+     * The per-op EXECUTION counter for an INLINED op (model-flip verify rule).
+     * An op emitted inline never calls its jit_* helper, so it would never bump
+     * g_jit_op_run and the `jit_op_nativized` test could no longer prove it ran
+     * - losing exactly the evidence the standing rule demands. Emit the bump in
+     * the fragment instead: `movabs rax, &g_jit_op_run[op]; inc qword [rax]`.
+     * TESTS-only (the counter itself is TESTS-only), so a release fragment is
+     * byte-identical to one with no instrumentation. Call it FIRST in an op's
+     * emit, while rax is still dead.
+     */
+    void bump_op(OpCode op)
+    {
+#ifdef TESTS
+        movabs(0 /* rax; the Reg enum is declared below */,
+               reinterpret_cast<uint64_t>(
+                   &g_jit_op_run[static_cast<size_t>(op)]));
+        u8(0x48); u8(0xFF); u8(0x00);          /* inc qword [rax] */
+#else
+        (void)op;
+#endif
+    }
+    /* movzx eax, byte [rcx + r9]  (a flat BOOL element - 1 byte, scale 1;
+     * writing eax zeroes rax's high half, so rax is a clean 0/1). */
+    void load_elem_byte()
+    { u8(0x42); u8(0x0F); u8(0xB6); u8(0x04); u8(0x09); }
+    /* cmp rax, rcx / test rax, rax */
+    void cmp_rax_rcx() { u8(0x48); u8(0x39); u8(0xC8); }
+    void test_rax_rax() { u8(0x48); u8(0x85); u8(0xC0); }
+    /* mov [rdi+disp], rax  (a raw payload store - the type word is written
+     * separately, as the two-store write_slot does). */
+    void store_rax_slot(int32_t d)
+    { u8(0x48); u8(0x89); u8(0x87); u32(uint32_t(d)); }
+    /* mov [rdi+disp], rcx  (the Type* word of a slot) */
+    void store_rcx_slot(int32_t d)
+    { u8(0x48); u8(0x89); u8(0x8F); u32(uint32_t(d)); }
     /* `<short jcc> +6; exit_pc(pc)` - bail unless the PASS condition. */
     void bail_unless(uint8_t short_pass, uint32_t pc)
     {
@@ -1252,6 +1293,12 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target);
             break;
         case OpCode::LoadElemBool:
+            /* INLINED (no helper): like LoadElemInt it reads the index from
+             * MEMORY (mov_r9_slot), so the index must NOT be pinned - same
+             * treatment as the int/float element loads. */
+            bad(in.target); bad(in.target2);
+            if (!in.a_is_lit()) bad(in.a_slot());
+            break;
         case OpCode::StrLen:
         case OpCode::LoadStrChar:
         case OpCode::LoadStructFieldInt:
@@ -2127,12 +2174,55 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::LoadElemBool:
+        /* INLINE (no helper call): the N4 flat-array navigation with a BYTE
+         * element - slot -> shobj -> kind + data, unsigned bounds check, movzx
+         * the byte, then the two-store with the t_bool singleton. A helper CALL
+         * here cost more than the interpreter dispatch it replaced (measured:
+         * +55% instructions on 56_sieve_bool, whose hot loop is exactly
+         * `if (sieve[i])`), which is the whole reason this op is emitted inline.
+         * Any failing precondition BAILS and the interpreter re-runs the op.
+         * Falls back to the helper only when the dst is REF-LISTED (it may hold
+         * a reference whose release needs C++) - rare for a bool loop var. */
+        if (!std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                                static_cast<int32_t>(in.target))) {
+            const JitLayout &L = jit_layout();
+            const SlotAddr base = slot_addr(in.target2);
+            const SlotAddr dst = slot_addr(in.target);
+            e.bump_op(OpCode::LoadElemBool);         /* execution proof */
+            e.load(RAX, base.type);                  /* base an array? */
+            e.movabs_r9(reinterpret_cast<uint64_t>(L.t_arr));
+            e.cmp_rax_r9();
+            e.bail_unless(0x74, pc);
+            e.cmp_byte_rdi(base.payload + L.slice_off, 0);   /* not a slice? */
+            e.bail_unless(0x74, pc);
+            e.load(RAX, base.payload);               /* rax = shobj */
+            e.cmp_byte_rax(L.kind_off, L.kind_bools);/* flat bools? */
+            e.bail_unless(0x74, pc);
+            e.mov_rcx_rax(L.data_off);               /* rcx = _M_start */
+            e.mov_rdx_rax(L.data_off + 8);           /* rdx = _M_finish */
+            e.sub_rdx_rcx();                         /* rdx = count (1B elems,
+                                                      * so NO sar - unlike the
+                                                      * 8-byte int/float path) */
+            if (in.a_is_lit())
+                e.movabs_r9(static_cast<uint64_t>(in.a_lit()));
+            else
+                e.mov_r9_slot(slot_addr(in.a_slot()).payload);
+            e.cmp_r9_rdx();
+            e.bail_unless(0x72, pc);                 /* jb: unsigned in-range */
+            e.load_elem_byte();                      /* movzx eax,[rcx+r9] */
+            e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_bool));
+            e.store_rcx_slot(dst.type);              /* a REAL bool, not 0/1 */
+            e.store_rax_slot(dst.payload);
+            return true;
+        }
+        goto foreach_load_helper;
     case OpCode::StrLen:
     case OpCode::LoadStrChar:
     case OpCode::LoadStructFieldInt:
     case OpCode::LoadStructFieldFloat:
     case OpCode::LoadStructElemV:
-    case OpCode::LoadElemValue: {
+    case OpCode::LoadElemValue:
+    foreach_load_helper: {
         /* The foreach element/field loads: rdi = dst, rsi = the base slot,
          * rdx = the INDEX VALUE (materialized cache-aware from the op's
          * slot-or-literal `a` operand BEFORE the prologue - rax survives the
@@ -2622,24 +2712,51 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::JumpUnlessTrueV: {
-        /* The BOXED condition: call jit_is_true(cond slot) -> 1 true / 0 false
-         * / -1 threw. A throw exits to THIS pc so EnterNative re-raises with the
-         * condition's caret from the loc side table; otherwise jump to target
-         * when the value is FALSE (eax == 0), else fall through. Two flag tests,
-         * because the tri-state cannot be folded into one jcc. */
+        /* The BOXED condition. INLINE FAST PATH: for an int or bool value
+         * `is_true` is exactly `payload != 0` (TypeInt::is_true is `v != 0`, and
+         * a bool payload is fully zeroed except the low byte), so the common
+         * loop/if condition is a type-tag compare + a test - NO call. A helper
+         * CALL on this op cost more than the interpreter dispatch it replaced
+         * (measured: +55% instructions on 56_sieve_bool), which is why it is
+         * inlined. Any other type (string/array/dict/none/...) takes the
+         * jit_is_true call, whose tri-state also carries the THROW case
+         * (is_true's base Type op throws for a value with no bool conversion).
+         * Both paths leave rax = the truth value, then one shared test+jcc. */
+        const JitLayout &L = jit_layout();
+        const SlotAddr cond = slot_addr(in.target2);
+        e.bump_op(OpCode::JumpUnlessTrueV);      /* execution proof (the inline
+                                                  * fast path calls no helper) */
+        e.load(RAX, cond.type);                  /* rax = the value's Type* */
+        e.u8(0x48); e.u8(0x39); e.u8(0xF0);      /* cmp rax, rsi (t_int) */
+        const size_t j_fast_int = e.j8(0x74);    /* je -> fast */
+        e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_bool));
+        e.cmp_rax_rcx();
+        const size_t j_fast_bool = e.j8(0x74);   /* je -> fast */
+        /* --- slow path: any other type (may throw) --- */
         emit_call_prologue(e);
         e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
         e.call_relocs.push_back(
             { e.pos(), reinterpret_cast<const void *>(jit_is_true) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax (32-bit: -1
+                                                  * is negative here, while the
+                                                  * 64-bit rax is zero-extended
+                                                  * 0/1 on the success paths) */
         {
             const size_t j_ok = e.j8(0x79);      /* jns -> did not throw */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
-        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        const size_t j_join = e.j8(0xEB);        /* jmp -> join (rax = 0/1) */
+        /* --- fast path: rax = the raw payload --- */
+        e.patch8(j_fast_int, e.pos());
+        e.patch8(j_fast_bool, e.pos());
+        e.load(RAX, cond.payload);
+        /* --- join: jump to target when the value is FALSE --- */
+        e.patch8(j_join, e.pos());
+        e.test_rax_rax();                        /* 64-bit: a big int whose low
+                                                  * 32 bits are 0 is still true */
         emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);

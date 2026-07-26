@@ -2350,7 +2350,9 @@ extern "C" int jit_make_struct_array(const void *defv, int_type base,
  * from the loc side table. */
 extern "C" int jit_is_true(int_type cond_slot) noexcept
 {
-    ML_JIT_OP_RAN(JumpUnlessTrueV);
+    /* NO ML_JIT_OP_RAN here: the EMITTER bumps the counter for both paths (the
+     * inline int/bool fast path calls no helper), so bumping again would
+     * double-count the slow path. */
     try {
         return g_current_ctx->frame->at(cond_slot).get().is_true() ? 1 : 0;
     } catch (RuntimeException &e) {
