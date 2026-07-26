@@ -211,9 +211,16 @@ and every callee resolve uses get_ref, not get<> (the H1
 refcount-churn trap - the by-value FuncObject handle was ~28
 Ir/call of retain/release, and the dead-at-semicolon temporary
 never protected the callee anyway): a further 10 -4.7% / 11 -3.6%
-/ 63 -4.6% / 76 -2.4% Ir, fib recovered. Next lever-1 steps: the
-leave's LValue::put + ref-scan trims, then the record-push inline
-in the fragment (the true native call).
+/ 63 -4.6% / 76 -2.4% Ir, fib recovered. Step 4 (same day): back_rec's
+records[rec_n-1] IMUL (136-byte stride, ~23 sites) -> a cached
+`top_rec` pointer (native code reads rec_n, never writes - can't
+stale it); records.size()/dict_iters/dyn_iters sizes -> plain
+mirror counters (those vectors mutate only inside push/pop_window;
+`handlers` is NOT mirrored - fragments push/pop it natively);
+ML_VM_CHECK re-verifies every mirror. 10 -7.5% Ir (cum -20.3%
+pre-lever, wall -4%), 11 -8.2%, fib -1.0%. The C++ side of lever 1
+is ~exhausted; the next multiplier is the fragment-inline record
+push + per-pc fragment entry points (post-call native resume).
 **`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
 slots that can EVER hold a >= t_str value (non-coerced params + every dst
 of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists

@@ -1388,7 +1388,26 @@ struct VmActivation {
      * pop_window frees any the exceptional/cache path left set). */
     std::vector<VmCallRec> records;
     size_t rec_n = 0;                 /* live records; records[rec_n..] reused */
-    ML_ALWAYS_INLINE VmCallRec &back_rec() { return records[rec_n - 1]; }
+    /* Lever 1 push/pop micro (the callgrind vector-size split): back_rec's
+     * records[rec_n - 1] is an IMUL by the 136-byte stride at EVERY use
+     * (~23 sites, several per call) - cache the top record's address,
+     * updated at push/pop (records only reallocates in push_window's grow
+     * branch; NATIVE code reads rec_n but never writes it, so the pointer
+     * cannot go stale under a fragment). recs_high mirrors records.size()
+     * (another per-push IMUL); diters_n/dyiters_n mirror the two iter
+     * stacks' sizes (dyn's 72-byte stride divided per push AND pop) -
+     * both vectors are mutated ONLY in push/pop below. handlers is NOT
+     * mirrored: fragments push/pop it natively (inline PushHandler), and
+     * its 4-byte stride is a plain shift anyway. ML_VM_CHECK re-verifies
+     * every mirror (the CI-release hardening net). */
+    VmCallRec *top_rec = nullptr;
+    uint32_t recs_high = 0;           /* == records.size() */
+    uint32_t diters_n = 0;            /* == dict_iters.size() */
+    uint32_t dyiters_n = 0;           /* == dyn_iters.size() */
+    ML_ALWAYS_INLINE VmCallRec &back_rec() {
+        ML_VM_CHECK(top_rec == &records[rec_n - 1]);
+        return *top_rec;
+    }
     ML_ALWAYS_INLINE bool no_recs() const { return rec_n == 0; }
     /*
      * The REUSABLE context for builtin->callback invocations (vm_invoke,
@@ -1456,9 +1475,13 @@ struct VmActivation {
         }
 
         /* REUSE the constructed record at rec_n; grow only at a new peak. */
-        if (rec_n == records.size())
+        ML_VM_CHECK(recs_high == records.size());
+        if (rec_n == recs_high) {
             records.emplace_back();      /* one-time construct at high-water */
+            recs_high++;
+        }
         VmCallRec &rec = records[rec_n++];   /* fill IN PLACE - no move */
+        top_rec = &rec;                  /* stays valid: grow is above */
         rec.window = sg->slots.data() + sg->top;
         rec.nslots = n;
         rec.seg = cur_seg;
@@ -1468,8 +1491,10 @@ struct VmActivation {
                                           * stale lean-sync stop mark */
         rec.run_chunk = ck;
         rec.handler_base = static_cast<uint32_t>(handlers.size());
-        rec.diter_base = static_cast<uint32_t>(dict_iters.size());
-        rec.dyiter_base = static_cast<uint32_t>(dyn_iters.size());
+        ML_VM_CHECK(diters_n == dict_iters.size());
+        ML_VM_CHECK(dyiters_n == dyn_iters.size());
+        rec.diter_base = diters_n;
+        rec.dyiter_base = dyiters_n;
         /* An IN-VM push (boundary=false) is followed by vm_enter_call setting
          * every resume field; a BOUNDARY push has no such follow-up, so on a
          * REUSED record its resume fields would be stale - clear them (they
@@ -1483,10 +1508,14 @@ struct VmActivation {
             rec.desc = nullptr;
             rec.caller_captures = nullptr;
         }
-        if (ck->n_dict_iters)
-            dict_iters.resize(dict_iters.size() + ck->n_dict_iters);
-        if (ck->n_dyn_iters)
-            dyn_iters.resize(dyn_iters.size() + ck->n_dyn_iters);
+        if (ck->n_dict_iters) {
+            diters_n += static_cast<uint32_t>(ck->n_dict_iters);
+            dict_iters.resize(diters_n);
+        }
+        if (ck->n_dyn_iters) {
+            dyiters_n += static_cast<uint32_t>(ck->n_dyn_iters);
+            dyn_iters.resize(dyiters_n);
+        }
         sg->top += n;
         used += n;
         /* Stash the CALLER's pure cache; the callee's frame starts with
@@ -1545,10 +1574,14 @@ struct VmActivation {
          * exceptional walk truncates whatever is left. */
         if (handlers.size() != rec.handler_base)
             handlers.resize(rec.handler_base);
-        if (dict_iters.size() != rec.diter_base)
+        if (diters_n != rec.diter_base) {
             dict_iters.resize(rec.diter_base);
-        if (dyn_iters.size() != rec.dyiter_base)
+            diters_n = rec.diter_base;
+        }
+        if (dyiters_n != rec.dyiter_base) {
             dyn_iters.resize(rec.dyiter_base);
+            dyiters_n = rec.dyiter_base;
+        }
 
         segs[rec.seg]->top = rec.seg_top_before;
         used -= rec.nslots;
@@ -1572,9 +1605,12 @@ struct VmActivation {
         rec_n--;
 
         if (rec_n) {
-            const VmCallRec &tp = back_rec();
+            const VmCallRec &tp = records[rec_n - 1];
+            top_rec = &records[rec_n - 1];
             view_frame.point_at(tp.window, static_cast<int>(tp.nslots));
             cur_seg = tp.seg;
+        } else {
+            top_rec = nullptr;
         }
     }
 };
