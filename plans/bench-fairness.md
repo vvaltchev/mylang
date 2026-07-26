@@ -175,9 +175,19 @@ Class D (fat-variant twins, bench_value.h):
 - 66_dyn_foreach   10.5x -> 5.7x  (Value array + dyn accumulator +
   per-entry shape dispatch)
 - 74_dyn_foreach_kv 19.0x -> 7.4x (Value-keyed dict, Value k/v arith)
-- 75_indexed_unpack RECLASSIFIED to class F: its rows are STATICALLY
-  typed in the .my (array<array<str>>) - the 88.9x is a MyLang-side
-  pathology (roadmap 4 says profile it first).
+- 75_indexed_unpack: RE-AUDITED after the 88.9x was challenged. The C++
+  loop was structurally honest (asm: 8 scalar instr/row, re-run every
+  rep, no SIMD/hoisting) but `const auto &row` binds by REFERENCE -
+  which MyLang's unpack semantics cannot do. Class-E fix: per-row
+  refcounted HANDLE binds for name/val (volatile refcnt so the balanced
+  ++/-- pair isn't folded - MyLang's are real RMWs; 30 refcnt load/store
+  sites verified in main) + the STRICT arity check. 88.9x -> 36.0x
+  (the C++ 0.003 -> 0.007s - the managed-bind semantics were ~half the
+  story). The remaining 36x is OURS: per row, an unpack helper call +
+  boxed binds + TWO len() calls running as full CallBuiltinV builtin
+  calls where C++ reads .size() inline - a `LenV` native op (inline
+  length read for a proven str/array) is the obvious lever, added to
+  the roadmap.
 
 Class E (managed-slice twins; DEVIATION from the plan: embedding the
 runtime was rejected after scoping - types.cpp's extern graph drags the
@@ -191,6 +201,7 @@ strings):
   strings are SSO-cheap in C++; MyLang's SharedStr-per-char is the real
   cost - a language-side item, pairs with the 30 residual)
 
-NEW HONEST WORST LIST (the roadmap's targets): 75 88.9x (profile!),
+NEW HONEST WORST LIST (the roadmap's targets): 75 36.0x (len()-as-
+builtin-call + unpack helper; see its entry),
 64 41.6x, 46 33.3x, 63 30.3x, 11 30.6x, 30 28.7x, 10 25.5x, 76 24.7x,
 77 17.2x, 73 9.9x, 68 7.8x, 60 7.5x, 74 7.4x.

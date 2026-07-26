@@ -54,9 +54,14 @@ those classes in impact order.
    shape and does boxed binds (66_dyn_foreach 10.5x, 74_dyn_foreach_kv
    19x). Specialize the Next per shape at Init time (two op variants or
    a stored function pointer) with unboxed binds where the element is
-   scalar. 75_indexed_unpack (89x!) needs its OWN PROFILE first - that
-   magnitude smells pathological (the unpack-targets pool walk + boxed
-   binds per element), not architectural.
+   scalar. 75_indexed_unpack RESOLVED (2026-07-26): the 89x was half
+   bench-unfairness (reference binds vs MyLang's refcounted handle
+   binds - fixed, now 36x) and half real: per row it pays the unpack
+   helper + boxed binds + TWO len() calls as full CallBuiltinV builtin
+   calls. NEW LEVER 4b: a `LenV` native op - len() of a proven
+   str/array as an inline length read (it is among the most common
+   builtin calls in loops); kills most of 75's residue and helps every
+   len()-bounded loop.
 
 5. **Escape-analysis allocation elimination (the N7 arc proper /
    task #60).** Closures created in loops (63), struct temporaries
