@@ -766,6 +766,15 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::LoadStructElemV:
     case OpCode::LoadElemValue:
         return true;
+    /* model-flip (nativize-ops): the BOXED condition BRANCH (`if (dynvalue)`,
+     * `while (flag)`, a &&/|| conjunct, the boxed ternary) - jit_is_true
+     * evaluates it and the FRAGMENT jumps (emit_branch). This was the top
+     * blocker for foreach/if bodies: an un-nativized branch SPLIT the run, so
+     * the loop's back edge fell outside the fragment and every iteration after
+     * the first ran interpreted. is_true CAN throw -> re-raise, so NOT
+     * op_fully_native (the caret comes from the pc-keyed loc side table). */
+    case OpCode::JumpUnlessTrueV:
+        return true;
     /* model-flip (nativize-ops): the boxed-arith ops (dyn/string operands) via
      * jit_boxed_* + the boxed_ops pool (target2 = the pool index, set by
      * build_boxed_ops). vm_num_binop CAN throw (div0/type) -> NOT
@@ -777,8 +786,9 @@ static bool jit_op_eligible(const Instr &in)
     /* UnaryV: boxed unary (`-str`/`~str` throw). Same boxed_ops pool. */
     case OpCode::UnaryV:
         return in.target2 >= 0;
-    /* LogV (eager && / ||): is_true() never throws -> op_fully_native. Same
-     * boxed_ops pool (target2 = the index). */
+    /* LogV (eager && / ||): is_true's BASE Type op CAN throw (an operand with
+     * no bool conversion), so it re-raises like the rest - NOT op_fully_native.
+     * Same boxed_ops pool (target2 = the index). */
     case OpCode::LogV:
         return in.target2 >= 0;
     /* CoerceNumV: the typed numeric coerce of a dyn value. Register-passed
@@ -1276,6 +1286,12 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * global value, not an int); target2 is a compile-time index (the
              * global slot for LoadGlobalV), not a frame slot. */
             bad(in.target);
+            break;
+        case OpCode::JumpUnlessTrueV:
+            /* jit_is_true reads the CONDITION slot (target2) from MEMORY via
+             * g_current_ctx, so it must be current - and it holds a boxed value
+             * (dyn/bool/string), never an int-scalar cache candidate anyway. */
+            bad(in.target2);
             break;
         case OpCode::Jump:
         case OpCode::Halt:               /* returns none - reads/writes no slot */
@@ -2213,8 +2229,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::LogV:
-        /* jit_boxed_log(&ck.boxed_ops[target2]). is_true() never throws -> no
-         * eax check (op_fully_native). */
+        /* jit_boxed_log(&ck.boxed_ops[target2]). is_true() CAN throw (its base
+         * Type op, for an operand with no bool conversion) -> test eax +
+         * exit_pc so EnterNative re-raises with the loc side table's caret.
+         * This op was originally emitted with NO status check under a "never
+         * throws" assumption, which made a throwing operand escape the noexcept
+         * helper and std::terminate. */
         emit_call_prologue(e);
         e.movabs(RDI,
                  reinterpret_cast<uint64_t>(&ck.boxed_ops[in.target2]));
@@ -2222,6 +2242,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             { e.pos(), reinterpret_cast<const void *>(jit_boxed_log) });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
         return true;
 
     case OpCode::CoerceNumV: {
@@ -2595,6 +2621,31 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::JumpUnlessTrueV: {
+        /* The BOXED condition: call jit_is_true(cond slot) -> 1 true / 0 false
+         * / -1 threw. A throw exits to THIS pc so EnterNative re-raises with the
+         * condition's caret from the loc side table; otherwise jump to target
+         * when the value is FALSE (eax == 0), else fall through. Two flag tests,
+         * because the tri-state cannot be folded into one jcc. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_is_true) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x79);      /* jns -> did not throw */
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        e.u8(0x85); e.u8(0xC0);                  /* test eax, eax */
+        emit_cond_jump_raw(e, 0x84 /* jz near */, 0x75 /* jnz short */,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+        return;
+    }
+
     case OpCode::JumpUnlessFloatCmp: {
         /* jump to target when (a cmp b) is FALSE (the ordering compares;
          * the swap trick makes NaN correctly jump - see float_cmp). */
@@ -2618,7 +2669,11 @@ static bool op_is_branch(OpCode op)
 {
     return op == OpCode::Jump || op == OpCode::JumpUnlessIntCmp
         || op == OpCode::ForLoopStep || op == OpCode::IntAddStep
-        || op == OpCode::JumpUnlessFloatCmp;
+        || op == OpCode::JumpUnlessFloatCmp
+        /* the BOXED condition branch: the helper evaluates is_true, the
+         * fragment does the jump - so a loop body holding one no longer
+         * splits the run and leaves the back edge interpreted. */
+        || op == OpCode::JumpUnlessTrueV;
 }
 
 static bool run_has_float(const Chunk &ck, size_t begin, size_t end)
@@ -2698,7 +2753,6 @@ static bool op_fully_native(const Instr &in)
     case OpCode::LoadStructFieldInt:
     case OpCode::LoadStructFieldFloat:
     case OpCode::LoadStructElemV:
-    case OpCode::LogV:              /* eager && / || (is_true), never throws */
     /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
      * its interpreted original - so deleting the original is sound. And unlike
      * the side-table throwing ops (Subscript/DictLoad), it conveys its OWN loc

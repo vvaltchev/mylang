@@ -2333,6 +2333,32 @@ extern "C" int jit_make_struct_array(const void *defv, int_type base,
  * loop counter) and can raise OutOfBoundsEx.
  */
 
+/* model-flip (nativize-ops): the native JumpUnlessTrueV CONDITION - the BOXED
+ * truthiness test behind `if (dynvalue)`, `while (flag)`, a `&&`/`||` conjunct
+ * and the boxed ternary. Unlike every other nativized op this is a BRANCH: the
+ * helper only evaluates the condition and the FRAGMENT does the jump (a
+ * fragment-local jcc for an in-run target, an exit_pc otherwise) - which is what
+ * lets a loop whose body holds a boxed condition iterate entirely in machine
+ * code instead of splitting the run at the branch and leaving the back edge
+ * interpreted.
+ *
+ * Returns 1 = true, 0 = false, -1 = THREW. `is_true` is a virtual Type op whose
+ * BASE implementation throws TypeErrorEx ("does NOT support conversion to
+ * bool") - reachable from a script with a builtin value as a condition
+ * (`var dyn f = print; if (f)`), so the status is a tri-state, not a bool. The
+ * throw rides g_vm_jit_exc LOC-LESS and EnterNative stamps the CONDITION's caret
+ * from the loc side table. */
+extern "C" int jit_is_true(int_type cond_slot) noexcept
+{
+    ML_JIT_OP_RAN(JumpUnlessTrueV);
+    try {
+        return g_current_ctx->frame->at(cond_slot).get().is_true() ? 1 : 0;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return -1;
+    }
+}
+
 /* LoadElemBool: bind a[i] of a flat array<bool> as a REAL bool (not 0/1). */
 extern "C" void jit_load_elem_bool(int_type dst, int_type base,
                                    int_type idx) noexcept
@@ -2594,16 +2620,27 @@ extern "C" int jit_store_capture_compound(const void *bop) noexcept
  * `a || b` (MyLang's don't short-circuit at runtime; both operands are already
  * computed). is_true() never throws, so LogV is op_fully_native (no eax check).
  * `bop` is a `&chunk.boxed_ops[idx]` (the same pool as the arith ops). */
-extern "C" void jit_boxed_log(const void *bop) noexcept
+extern "C" int jit_boxed_log(const void *bop) noexcept
 {
     ML_JIT_OP_RAN(LogV);
     const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
     EvalContext *ctx = g_current_ctx;
-    EvalValue sa, sb;
-    const bool a = boxed_operand(bo->a, ctx, sa).is_true();
-    const bool b = boxed_operand(bo->b, ctx, sb).is_true();
-    ctx->frame->at(bo->target).put(
-        EvalValue(bo->aop == Op::land ? (a && b) : (a || b)));
+    try {
+        EvalValue sa, sb;
+        const bool a = boxed_operand(bo->a, ctx, sa).is_true();
+        const bool b = boxed_operand(bo->b, ctx, sb).is_true();
+        ctx->frame->at(bo->target).put(
+            EvalValue(bo->aop == Op::land ? (a && b) : (a || b)));
+    } catch (RuntimeException &e) {
+        /* is_true's BASE Type op throws for an operand with no bool conversion
+         * (a builtin value laundered through `dyn`). This helper is noexcept, so
+         * before this catch existed the exception ESCAPED -> std::terminate: a
+         * real JIT crash, from the "is_true never throws" assumption LogV was
+         * nativized under. Re-raise like every other throwing op. */
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
 }
 
 /* model-flip (nativize-ops): the native UnaryV body - boxed unary over a
@@ -5719,12 +5756,19 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(LogV): {
             /* Eager (MyLang &&/|| don't short-circuit at runtime) - both
              * operands are already computed (a slot or an immediate); combine
-             * truthiness. */
-            EvalValue sa, sb;
-            const bool a = boxed_operand(in->a(), &ctx, sa).is_true();
-            const bool b = boxed_operand(in->b(), &ctx, sb).is_true();
-            ctx.frame->at(in->target).put(
-                EvalValue(in->aop == Op::land ? (a && b) : (a || b)));
+             * truthiness. `is_true` is a virtual Type op whose BASE throws for a
+             * value with no bool conversion, so stamp the expression's caret
+             * from the loc side table (the VM used to report it with none). */
+            try {
+                EvalValue sa, sb;
+                const bool a = boxed_operand(in->a(), &ctx, sa).is_true();
+                const bool b = boxed_operand(in->b(), &ctx, sb).is_true();
+                ctx.frame->at(in->target).put(
+                    EvalValue(in->aop == Op::land ? (a && b) : (a || b)));
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -6014,12 +6058,26 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         }
         VM_NEXT;
 
-        VM_CASE(JumpUnlessTrueV):
-            if (!ctx.frame->at(in->target2).get().is_true())
+        VM_CASE(JumpUnlessTrueV): {
+            /* The BOXED truthiness test (`if (dynvalue)`, `while (flag)`, a
+             * &&/|| conjunct, the boxed ternary). `is_true` is a virtual Type op
+             * whose BASE throws TypeErrorEx - reachable from a script with e.g.
+             * a builtin value as the condition - so stamp the CONDITION's caret
+             * from the loc side table, matching the tree-walker's
+             * Construct::eval stamp (the VM used to report it with NO caret). */
+            bool t;
+            try {
+                t = ctx.frame->at(in->target2).get().is_true();
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
+            if (!t)
                 pc = in->target;
             else
                 pc++;
-            VM_NEXT;
+        }
+        VM_NEXT;
 
         VM_CASE(JumpIfNotNoneV):
             /* `a ?? b` short-circuit: a non-none lhs skips the rhs. */

@@ -1412,6 +1412,10 @@ struct Codegen {
             }
             CgInstr jf;
             jf.op = OpCode::JumpUnlessTrueV;
+            /* is_true CAN throw (a builtin/other value with no bool
+             * conversion), so record the CONDITION's caret - the if/loop sites
+             * already do; without it the throw had no caret at all. */
+            jf.node_idx = add_ast_node(t);   /* the whole ternary */
             jf.target2 = cslot;
             const size_t jf_i = ops.size();
             ops.push_back(jf);
@@ -3537,6 +3541,7 @@ struct Codegen {
             }
             CgInstr in;
             in.op = OpCode::JumpUnlessTrueV;
+            in.node_idx = add_ast_node(t);   /* the whole ternary */
             in.target2 = cslot;
             cj = ops.size();
             ops.push_back(in);
@@ -4842,8 +4847,15 @@ struct Codegen {
      * a false return. This is what makes `while (it < MAXIT && zr*zr+zi*zi <=
      * 4.0)` (mandelbrot) go native instead of falling back whole.
      */
+    /* `loc_node` is the ENCLOSING statement (the while/for), used as the caret
+     * for a boxed condition whose is_true throws: the tree-walker stamps the
+     * whole statement there (the exception escapes the condition's eval with no
+     * loc and IfStmt/WhileStmt::do_eval's Construct::eval wrapper stamps it), so
+     * recording the condition alone would DIVERGE from the oracle. Threaded
+     * through the &&-conjunct recursion for the same reason. */
     bool emit_cond_jumps(const Construct *cond,
-                         std::vector<size_t> &exit_jumps)
+                         std::vector<size_t> &exit_jumps,
+                         const Construct *loc_node = nullptr)
     {
         const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
 
@@ -4884,7 +4896,7 @@ struct Codegen {
                 const size_t nexit = exit_jumps.size();
                 bool ok = true;
                 for (const auto &pr : t->elems)
-                    if (!emit_cond_jumps(pr.second.get(), exit_jumps)) {
+                    if (!emit_cond_jumps(pr.second.get(), exit_jumps, loc_node)) {
                         ok = false;
                         break;
                     }
@@ -4907,7 +4919,7 @@ struct Codegen {
         if (compile_boxed_expr(cond, cslot, code)) {
             CgInstr in;
             in.op = OpCode::JumpUnlessTrueV;
-            in.node_idx = add_ast_node(cond);
+            in.node_idx = add_ast_node(loc_node ? loc_node : cond);
             in.target2 = cslot;
             exit_jumps.push_back(code.size());
             code.push_back(in);
@@ -5275,7 +5287,8 @@ struct Codegen {
                 if (compile_boxed_expr(f->condExpr.get(), cslot, code)) {
                     CgInstr in;
                     in.op = OpCode::JumpUnlessTrueV;
-                    in.node_idx = add_ast_node(f->condExpr.get());
+                    in.node_idx = add_ast_node(f);   /* the IfStmt: the caret
+                                                      * the tree-walker stamps */
                     in.target2 = cslot;
                     jf = code.size();
                     code.push_back(in);
@@ -5467,7 +5480,7 @@ struct Codegen {
         /* The condition -> native compare-branch(es) to the exit; a compound
          * `A && B` becomes one branch per conjunct (see emit_cond_jumps). */
         std::vector<size_t> exit_jumps;
-        if (!emit_cond_jumps(w->condExpr.get(), exit_jumps)) {
+        if (!emit_cond_jumps(w->condExpr.get(), exit_jumps, w)) {
             code.resize(start);
             return false;
         }
@@ -5620,7 +5633,7 @@ struct Codegen {
          * break / return / throw in the body (or genuinely runs forever),
          * exactly like the tree-walker's missing-cond ForStmt. */
         std::vector<size_t> exit_jumps;
-        if (f->cond && !emit_cond_jumps(f->cond.get(), exit_jumps)) {
+        if (f->cond && !emit_cond_jumps(f->cond.get(), exit_jumps, f)) {
             code.resize(start);
             return false;
         }
@@ -6650,6 +6663,12 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::MakeDictV:      /* node = the {..} literal: an UNHASHABLE
                                       * key (a dyn-laundered func) throws from
                                       * build_dict_from_pairs' key freeze/hash */
+        case OpCode::JumpUnlessTrueV: /* node = the enclosing if/while/ternary:
+                                       * is_true's base Type op throws for a
+                                       * value with no bool conversion */
+        case OpCode::LogV:           /* node = the &&/|| expr: same is_true
+                                      * throw (it used to be assumed no-throw,
+                                      * which made the JIT std::terminate) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
         case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
         case OpCode::JumpUnlessElemInt:  /* E4 fusion - keeps the load's
@@ -6694,13 +6713,12 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::CmpIntV:        /* typed compare-to-bool; can't fault */
         case OpCode::CmpFloatV:
         case OpCode::ForLoopStep:
-        case OpCode::LogV:
         case OpCode::MemberV:
         case OpCode::ArrLen:         /* never throws (just reads the size) */
         case OpCode::DictIterInit:   /* pins a proven dict; no node-based throw */
-            /* node not needed for a caret: LogV never throws; MemberV's carets
-             * (and name/uid/optional) live in the member-key pool; ArrLen /
-             * DictIterInit never throw with a node loc. Drop it. */
+            /* node not needed for a caret: MemberV's carets (and name/uid/
+             * optional) live in the member-key pool; ArrLen / DictIterInit
+             * never throw with a node loc. Drop it. */
             in.node_idx = -1;
             break;
         case OpCode::CallV:
