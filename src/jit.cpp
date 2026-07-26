@@ -3339,6 +3339,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
+                                              * undefined-global BAIL path is
+                                              * safe; a pool-loc'd throw keeps
+                                              * its own caret (stamp-if-empty) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -3363,6 +3367,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
+                                              * undefined-global BAIL path is
+                                              * safe; a pool-loc'd throw keeps
+                                              * its own caret (stamp-if-empty) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -3385,6 +3393,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
+                                              * undefined-global BAIL path is
+                                              * safe; a pool-loc'd throw keeps
+                                              * its own caret (stamp-if-empty) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -3412,6 +3424,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.u8(0x85); e.u8(0xC0);
         {
             const size_t j_ok = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);   /* cold; null-checked, so the
+                                              * undefined-global BAIL path is
+                                              * safe; a pool-loc'd throw keeps
+                                              * its own caret (stamp-if-empty) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -4670,6 +4686,20 @@ static bool op_fully_native(const Instr &in)
     case OpCode::JumpUnlessTrueV:   /* inline int/bool test; the is_true slow
                                      * path conveys, exc-stamped - no bail */
         return true;
+    /* The IncDec family: elem/member/chain throws already carry their
+     * POOLED dual carets (incdec_sites/incdec_chains), the scalar's
+     * loc-less TypeError gets the cold-side exc-stamp - all
+     * pc-independent. Only an undefined-GLOBAL base/root BAILS, so the
+     * global kind stays non-deletable (kind rides target2 for the scalar,
+     * target for elem/member, a_lit for the chain; chain kind 3 is an
+     * RVALUE root - no bail). */
+    case OpCode::IncDecCheckedV:
+        return in.target2 != 1;
+    case OpCode::IncDecElemCheckedV:
+    case OpCode::IncDecMemberCheckedV:
+        return in.target != 1;
+    case OpCode::IncDecChainV:
+        return in.a_lit() != 1;
     /* The STORE family (increment 2). StoreElemInt (local-only eligible) /
      * DictStore / StoreElem2V: convey-only helpers, cold-side lep caret.
      * StoreElemFloat is EXCLUDED: its emitted VALUE load (emit_float_load)
