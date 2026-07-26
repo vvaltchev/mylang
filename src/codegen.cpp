@@ -7149,6 +7149,16 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 if (h >= 0 && static_cast<size_t>(h) < n)
                     hlive |= live_in[h];
 
+            /* Producers the MoveV elimination RETARGETS this round: their dst
+             * changes (to the eliminated move's dst), so the `live_in` computed
+             * above is STALE for them - the dead-dst rule below MUST NOT use it
+             * (it would see the NEW dst as dead where the OLD one was, wrongly
+             * -1'ing a live call result). Skip them; the next round recomputes
+             * fresh liveness. (The fusion rules only OVERSTATE liveness after a
+             * mutation, which is safe; the dead-dst rule UNDERSTATES, which is
+             * not - hence this guard.) */
+            std::vector<char> retargeted(n, 0);
+
             for (size_t q = 0; q < n; q++) {
                 CgInstr &m = code[q];
                 if (m.op != OpCode::MoveV || m.target == m.target2)
@@ -7206,8 +7216,10 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 }
                 if (prods.empty())
                     continue;
-                for (size_t p : prods)   /* produce straight into d */
+                for (size_t p : prods) { /* produce straight into d */
                     code[p].target = m.target;
+                    retargeted[p] = 1;   /* live_in now stale for this pc */
+                }
                 m.op = OpCode::Jump;     /* neutralize: jump-to-next... */
                 m.target = static_cast<int>(q) + 1;  /* ...deleted below */
                 changed = true;
@@ -7363,7 +7375,8 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 if ((op1.op == OpCode::AppendV || op1.op == OpCode::CallV
                      || op1.op == OpCode::CallValueV)
                     && op1.target >= 0
-                    && bit(op1.target)) {
+                    && bit(op1.target)
+                    && !retargeted[p]) {   /* stale liveness - see above */
                     const uint64_t aout =
                         (p + 1 < n ? live_in[p + 1] : 0) | hlive;
                     if (!(aout & bit(op1.target))) {
