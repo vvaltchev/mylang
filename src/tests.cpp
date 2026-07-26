@@ -15496,6 +15496,23 @@ static bool jit_op_nativized()
             "assert(f(9.0, runtime(0.0)) == 77.0);",
             "assert(f(9.0, runtime(-0.0)) == 77.0);",
             "assert(f(9.0, runtime(4.5)) == 2.0);" } },
+        /* FloatBin mod: the same +-0.0 divisor test, then the exact fmod
+         * LIBM call TypeFloat::mod makes (byte-identical NaN/inf results);
+         * a 0.0 divisor raises DivisionByZeroEx like div. */
+        { OpCode::FloatBin, {
+            "func f(int n) {",
+            "  var s = 0.0;",
+            "  for (var i = 0; i < n; i++) s += (i * 1.5) % (0.7 + i);",
+            "  return s;",
+            "}",
+            "assert(f(runtime(3)) < 1.80001 && f(runtime(3)) > 1.79999);",
+            "func g(float a, float c) {",
+            "  var r = 0.0;",
+            "  try { r = a % c; } catch (DivisionByZeroEx) { r = 88.0; }",
+            "  return r;",
+            "}",
+            "assert(g(9.5, runtime(0.0)) == 88.0);",
+            "assert(g(9.5, runtime(4.0)) == 1.5);" } },
         /* StructFieldAddInt: the #9 struct-reduction fusion - fires on the
          * FOREACH-over-flat-struct-array chain `s = (s + p.x + p.y) % k`
          * (the fused base/index are the foreach snapshot + counter; a
