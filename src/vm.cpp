@@ -4560,7 +4560,8 @@ extern "C" size_t jit_ret(int_type res_slot) noexcept
     VmActivation &act = *g_vm_act;
     ML_CHECK(res_slot >= 0
              && res_slot < static_cast<int_type>(ctx.frame->size));
-    EvalValue res = ctx.frame->at(res_slot).get();
+    /* the callee window dies right after - MOVE the result out (lever 1) */
+    EvalValue res = ctx.frame->at(res_slot).steal_value();
     if (act.back_rec().boundary) {
         ctx.flow->value = std::move(res);
         ctx.flow->type = FlowState::ret;
@@ -4877,7 +4878,7 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type argbase,
     const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
     if (!cv.is<intrusive_ptr<FuncObject>>())
         return 1;                          /* not callable -> interpreted */
-    return jit_call_sync_core(*cv.get<intrusive_ptr<FuncObject>>().get(),
+    return jit_call_sync_core(*cv.get_ref<intrusive_ptr<FuncObject>>().get(),
                               argbase, nargs, dst, site_packed,
                               /*cached=*/false);
 }
@@ -4895,7 +4896,7 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
     const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
     if (!cv.is<intrusive_ptr<FuncObject>>())
         return 1;
-    return jit_call_sync_core(*cv.get<intrusive_ptr<FuncObject>>().get(),
+    return jit_call_sync_core(*cv.get_ref<intrusive_ptr<FuncObject>>().get(),
                               argbase, nargs, dst, site_packed,
                               /*cached=*/true);
 }
@@ -4914,7 +4915,7 @@ extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
     const EvalValue &cv = ctx->frame->at(callee_temp).get();
     if (!cv.is<intrusive_ptr<FuncObject>>())
         return 1;
-    return jit_call_sync_core(*cv.get<intrusive_ptr<FuncObject>>().get(),
+    return jit_call_sync_core(*cv.get_ref<intrusive_ptr<FuncObject>>().get(),
                               argbase, nargs, dst, site_packed,
                               /*cached=*/false);
 }
@@ -5016,7 +5017,7 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
             }
         }
         return jit_call_sync_core(
-            *callee.get<intrusive_ptr<FuncObject>>().get(), argbase, nargs,
+            *callee.get_ref<intrusive_ptr<FuncObject>>().get(), argbase, nargs,
             dst, site_packed, /*cached=*/false);
     }
 
@@ -5211,7 +5212,7 @@ extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
     EvalContext &ctx = *g_current_ctx;
     VmActivation &act = *g_vm_act;
     FuncObject &fo = *ctx.gfuncs->slots[callee_slot].get()
-                          .get<intrusive_ptr<FuncObject>>().get();
+                          .get_ref<intrusive_ptr<FuncObject>>().get();
     try {
         Frame *w = vm_frame_setup(
             act, ctx, static_cast<const Chunk *>(caller_desc->vm_chunk),
@@ -6817,7 +6818,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 chunk->loc_at(pc, s, en);
                 throw NotCallableEx(s, en);
             }
-            FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+            FuncObject &fo = *callee.get_ref<intrusive_ptr<FuncObject>>().get();
 
             if (!fo.func->vm_chunk_tried) {       /* AOT net, as before */
                 fo.func->vm_chunk = vm_func_chunk(fo.func);
@@ -6893,7 +6894,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 chunk->loc_at(pc, s, en);
                 throw NotCallableEx(s, en);
             }
-            FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+            FuncObject &fo = *callee.get_ref<intrusive_ptr<FuncObject>>().get();
 
             if (!fo.func->vm_chunk_tried) {       /* AOT net, as before */
                 fo.func->vm_chunk = vm_func_chunk(fo.func);
@@ -7024,7 +7025,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                         ctx.frame->at(argbase).put(RValue(a0_value()));
                     res = vm_call_func(
                         &ctx,
-                        *callee.get<intrusive_ptr<FuncObject>>().get(),
+                        *callee.get_ref<intrusive_ptr<FuncObject>>().get(),
                         &ctx.frame->at(argbase), nargs, chunk, pc);
                 } else {
                     /* Builtin / struct: the raw values (arg0 from the
@@ -7139,12 +7140,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * slot, resume after the call op. The BOUNDARY frame keeps the
              * do_func_call contract: set flow, stop the invocation. */
             if (cur_rec().boundary) {
-                ctx.flow->value = ctx.frame->at(in->a_slot()).get();
+                /* the frame dies with the invocation - move the result out */
+                ctx.flow->value = ctx.frame->at(in->a_slot()).steal_value();
                 ctx.flow->type = FlowState::ret;
                 return;
             }
             vm_leave_call(act, ctx, chunk, pc,
-                          ctx.frame->at(in->a_slot()).get());
+                          ctx.frame->at(in->a_slot()).steal_value());
             code = chunk->code.data();
             VM_NEXT;
         }

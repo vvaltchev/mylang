@@ -204,9 +204,16 @@ on rec.cache_key. Measured (callgrind Ir / wall best-of-7):
 10_recursion_deep -9.5% / -15%, 11_closure_counter -2.9% / -4.2%,
 63_closures -1.5%; fib +0.9% Ir (the cached return pays one extra
 call layer - wall-neutral), 76 +0.5% Ir (typed params aren't
-fast_bind, the gate branch buys nothing there). Next lever-1 steps:
-the leave's LValue::put + ref-scan trims, then the record-push
-inline in the fragment (the true native call).
+fast_bind, the gate branch buys nothing there). Step 3 (same day):
+the return RESULT is MOVED out of the dying callee window
+(`LValue::steal_value` - jit_ret + both interpreted ReturnV paths)
+and every callee resolve uses get_ref, not get<> (the H1
+refcount-churn trap - the by-value FuncObject handle was ~28
+Ir/call of retain/release, and the dead-at-semicolon temporary
+never protected the callee anyway): a further 10 -4.7% / 11 -3.6%
+/ 63 -4.6% / 76 -2.4% Ir, fib recovered. Next lever-1 steps: the
+leave's LValue::put + ref-scan trims, then the record-push inline
+in the fragment (the true native call).
 **`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
 slots that can EVER hold a >= t_str value (non-coerced params + every dst
 of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists
