@@ -325,7 +325,7 @@ FIRST, so in a container their helpers were NEVER called - FIXED by checking
 `op_run_eligible` FIRST; (2) test cases with const args const-folded the pure
 call away - FIXED with `runtime()` args.
 
-**Done (32 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
+**Done (33 ops, all green + ASan/clang-clean + EXECUTION-PROVEN via
 `g_jit_op_run` + the `jit_op_nativized` test - real-bench evidence:
 62_dict_word_count Subscript=2,000,001, 46_matrix_mult MoveV=217, 47_wordcount
 Const=200,000):** MoveV (168, `jit_move`), SubscriptV (87, `jit_subscript`,
@@ -398,7 +398,12 @@ NOT cached. Completes the WHOLE lvalue-builtin family). And **MakeArrayV**
 build_array_from_values over the element run, per the ArrHint in `target2`; the
 build has NO error path (a mixed literal just goes general), so it never throws
 -> **op_fully_native** - a per-iteration-array loop now DELETES its originals to
-ONE `enter.nat` and becomes a `native_leaf` - see its backlog entry).
+ONE `enter.nat` and becomes a `native_leaf` - see its backlog entry). And
+**MakeDictV** (`jit_make_dict` - a dict LITERAL via the shared
+build_dict_from_pairs over the interleaved key/value run; unlike MakeArrayV it
+CAN throw - the key freeze HASHES each key, so a dyn-laundered FUNC key raises
+TypeErrorEx - so it re-raises and is NOT op_fully_native. Nativizing it exposed
+and FIXED a pre-existing VM caret bug - see its backlog entry).
 
 **GOTCHA - N5 STALE-CAPTURE (MakeClosureV, the subtle one).** An op that reads
 frame slots the EMITTER CANNOT ENUMERATE - MakeClosureV snapshots its capture
@@ -587,6 +592,36 @@ to do LATER, separately (don't forget these):
   storage kinds + the >16-element heap path + empty/struct-hint literals agree
   vm/nj/tw; bench + samples vm-vs-tw output identical (the two "diffs" are
   rand_sort's rand() and shopping's timeout-truncated interactive loop).
+- **MakeDictV** — DONE (2026-07-24) via `jit_make_dict` (rdi=dst, rsi=run base,
+  rdx=npairs) -> the file-local `vm_make_dict` -> the shared
+  `build_dict_from_pairs` over the INTERLEAVED key/value run, so the VM, the JIT
+  and the tree-walker share one builder (incl. the `make_const_clone` key
+  FREEZE). Pair buffer stays in vm_make_dict's frame (the recursion-depth rule).
+  **Unlike MakeArrayV it CAN THROW:** freezing/inserting a key HASHES it, and the
+  base `Type::hash` throws `TypeErrorEx` for an unhashable value - reachable with
+  a FUNCTION key laundered through `dyn` (`var dyn d = {k: 1}`). So the helper
+  returns a status, re-raises via g_vm_jit_exc, and the op is **NOT
+  op_fully_native** (its caret comes from the pc-keyed loc side table).
+  **⛔ PRE-EXISTING BUG FOUND + FIXED:** the interpreter's MakeDictV handler was
+  commented "never throws (all values hashable)" and had NO loc recorded, so that
+  TypeErrorEx surfaced under `-vm` with **no caret at all** ("at line 0", no
+  source line) while the tree-walker pointed at the `{...}` literal. Fixed in the
+  same change: the codegen records the LiteralDict node, `extract_locs` puts its
+  span in the loc side table, and the handler stamps it via `vm_stamp_loc` - the
+  two engines are now byte-identical (pinned by an `err loc:` test). This is the
+  general lesson for a "never throws" comment: VERIFY it against the type
+  system's error paths before trusting it (a container build that HASHES can
+  throw; one that only stores cannot - MakeArrayV genuinely never throws).
+  N5: the interleaved run [a_lit, a_lit + 2*b_lit) + dst are disqualified (a key
+  or value can be a cached int counter - `{i: i * 2}`). **The jit_container
+  test's island moved MakeDictV -> StructCtorBoxedV** (a NON-POD struct
+  construction with runtime args - the rarest remaining boxed build); perf-safety
+  re-checked with the `g_jit_container_calls` probe over ALL bench/ + samples/ =
+  ZERO containers formed, the probe itself validated (6 island calls on the known
+  shape). VERIFIED: -vdj covers the make.dict op with a native call; a
+  jit_op_nativized MakeDictV case proves the counter bumps; the unhashable-key
+  throw is byte-identical vm/nj/tw AND catchable from inside a fragment;
+  multi-pair / nested / mixed-key / >8-pair-heap literals all agree.
 - **Halt** (83, the biggest blocker) — DONE (2026-07-23). A fall-through body's
   implicit `return none` runs in the fragment via `jit_halt` - EXACTLY ReturnV's
   jit_ret with the result hard-wired to none (no slot): IN-VM frame ->
