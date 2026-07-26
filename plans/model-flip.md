@@ -11,7 +11,8 @@ each-step-lands-green execution guide, written to survive a context compact.
 ## The inversion (what "model flip" means)
 
 **Today = BYTECODE with native ISLANDS.** A function body is a bytecode `Chunk`.
-`jit_compile_chunk` finds maximal runs of `jit_op_eligible` ops (MIN_RUN=4),
+`jit_compile_chunk` finds maximal runs of `jit_op_eligible` ops (every run —
+the MIN_RUN=4 floor was removed 2026-07-25, see plans/min-run-removal.md),
 replaces each with an `EnterNative` op pointing at a machine-code fragment, and
 (for a fully-native single-entry run) deletes the interpreted originals. The
 **interpreter (`vm_dispatch`) is the DRIVER**: it dispatches op-by-op and, when

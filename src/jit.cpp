@@ -3134,20 +3134,6 @@ static bool op_run_eligible(const Instr &in, const JitCtx *jc)
     return jit_op_eligible(in) || callv_native_ok(in, jc);
 }
 
-/* Does the run [begin,end) contain a native CallV? Such a run is worth a
- * fragment even below MIN_RUN: the boxed arg-setup MoveVs split a call loop
- * into short eligible runs, and the call's dispatch-removal is the whole point
- * (MIN_RUN exists to avoid EnterNative overhead for a tiny ARITH run, not a
- * call). */
-static bool run_has_native_call(const std::vector<Instr> &code, size_t begin,
-                                size_t end, const JitCtx *jc)
-{
-    for (size_t pc = begin; pc < end; pc++)
-        if (callv_native_ok(code[pc], jc))
-            return true;
-    return false;
-}
-
 /* The pc TARGET of a branch-family op (the audited list that the nc rebuild
  * remaps), or -1. Used by the single-entry check. */
 static int branch_pc_target(const Instr &in)
@@ -3168,19 +3154,17 @@ static int branch_pc_target(const Instr &in)
 
 struct Run { size_t begin, end; };   /* [begin, end) in OLD pc space */
 
-static constexpr size_t MIN_RUN = 4;
-
 /* #55 STEP 2: the native_leaf predicate (from ops; see jit.h). Matches
  * jit_compile_chunk's native_leaf condition exactly - the WHOLE body is a
  * single maximal run (every op jit_op_eligible, so nothing splits it) that is
  * deletable (every op op_fully_native; single-entry is trivial for [0,n)) and
- * ends in ReturnV, and it is >= MIN_RUN (else no run forms). */
+ * ends in ReturnV. */
 bool jit_chunk_is_native_leaf(const Chunk &chunk)
 {
     if (!g_jit_enabled)
         return false;
     const size_t n = chunk.code.size();
-    if (n < MIN_RUN || chunk.code[n - 1].op != OpCode::ReturnV)
+    if (n < 1 || chunk.code[n - 1].op != OpCode::ReturnV)
         return false;
     for (size_t pc = 0; pc < n; pc++)
         if (!jit_op_eligible(chunk.code[pc])
@@ -3191,9 +3175,9 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk)
 
 /* plans/model-flip.md M1: partition the chunk into maximal NATIVE / ISLAND
  * segments. An op is NATIVE iff it is an inserted EnterNative (a compiled run)
- * or it is op_run_eligible (an op the container WOULD nativize - note this is a
- * looser bar than "has a fragment today": a run below MIN_RUN gets no
- * EnterNative but IS container-eligible, since a whole-function container pays
+ * or it is op_run_eligible (an op the container WOULD nativize - note this is
+ * a looser bar than "has a fragment today": an op can be run-eligible yet sit
+ * in a run whose compilation declined, while a whole-function container pays
  * no per-run EnterNative overhead). container_ready == every op native, i.e.
  * the whole body could be a single native container. DUMP-ONLY today. */
 ContainerPlan jit_container_plan(const Chunk &chunk, const JitCtx *jc)
@@ -3529,9 +3513,14 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         size_t j = i + 1;
         while (j < n && op_run_eligible(chunk.code[j], jc))
             j++;
-        if (j - i >= MIN_RUN
-                || run_has_native_call(chunk.code, i, j, jc))
-            runs.push_back({i, j});
+        /* No minimum run length (MIN_RUN removed 2026-07-25): with most ops
+         * nativized, the short runs a floor excluded were mostly whole TINY
+         * bodies - a 2-op comparator `func(a,b) => a < b` - which become
+         * native_leaf and get CALLED directly by a caller fragment, paying
+         * no EnterNative at all. Measured (callgrind Ir, floor 4 -> none):
+         * 34_sort_custom_cmp 0.929x, 35_map_filter 0.948x, 57_bool_reduce
+         * 0.973x; loop/recursion benches neutral. */
+        runs.push_back({i, j});
         i = j;
     }
     if (runs.empty())
