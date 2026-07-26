@@ -3453,6 +3453,22 @@ static const std::vector<test> tests =
       { "var a; a = 3; a = \"x\";" }, &typeid(TypeMismatchEx) },
 
     /* ---- ternary ?: and null-coalescing ?? ---- */
+    /* A boxed ternary as a CALL ARGUMENT: compile_to_run_slot's
+     * retarget-last-op rewrote ONLY the else arm's join MoveV (MoveV was
+     * in op_writes_pure_target, but a join temp has TWO producers), so
+     * the then branch's value never reached the run slot - a silent
+     * WRONG-CODE miscompile (pre-existing; exposed by the step-5 sync
+     * test's dyn-arg shape, then reduced to this always-reachable str
+     * form). Both branches + a loop so each arm executes. */
+    { "ternary: boxed ternary as a call argument (join-move retarget)",
+      { "func lf(str x) { return len(x); }",
+        "func drive(int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++)",
+        "    s += lf(i % 2 == 0 ? \"ab\" : \"c\");",
+        "  return s;",
+        "}",
+        "assert(drive(runtime(4)) == 6);" } },
     { "ternary: basic true / false branches",
       { "assert((1 > 0 ? 10 : 20) == 10);",
         "assert((1 < 0 ? 10 : 20) == 20);" } },
