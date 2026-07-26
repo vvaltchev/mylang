@@ -1549,10 +1549,11 @@ static void write_slot(Emitter &e, const Chunk &ck, uint8_t src, int slot,
  * identity and (being counted here only via proven-int ops) a stable int
  * type, so it is safely owned. */
 static std::vector<int>
-pick_cached_slots(const std::vector<Instr> &code, size_t begin,
+pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
                   std::vector<char> *barrier = nullptr)
 {
+    const std::vector<Instr> &code = ck.code;
     /* `barrier[pc-begin] = 1` marks an op that touches frame slots the emitter
      * cannot enumerate. Such an op is BRACKETED by flush_cache/reload_cache
      * (the compiler's spill-around-a-call) instead of disabling pinning for the
@@ -1803,12 +1804,24 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             bad(in.target);
             break;
         case OpCode::StructCtorV:
-            /* jit_struct_ctor reads the FIELD run [a_lit, a_lit+nf) from
-             * MEMORY (a field arg can be a cached int counter - `P(i, i*2)`)
-             * and reads+writes dst (the H1 reuse inspects the current value).
-             * b is DUAL: lo = nfields, hi = the ctor plan idx. */
-            for (int i = 0; i < in.b_dual_lo(); i++)
-                bad(static_cast<int>(in.a_lit()) + i);
+            /* PLANNED (b_dual_hi >= 0): an act-0 (int) plan src is read
+             * CACHE-AWARE by the emit (a direct-local src can be the loop
+             * counter - `P(i, ..)`), so it stays a countable int use; an
+             * act-1/2 src reads memory (emit_float_load / byte load) ->
+             * bad. dst: the H1 guards read/write it from memory -> bad.
+             * UNPLANNED: the whole run is read from memory by the helper. */
+            if (in.b_dual_hi() >= 0) {
+                for (const Chunk::CtorPlanField &pf :
+                         ck.ctor_plans[in.b_dual_hi()].f) {
+                    if (pf.act == 0)
+                        usei(pf.src);
+                    else
+                        bad(pf.src);
+                }
+            } else {
+                for (int i = 0; i < in.b_dual_lo(); i++)
+                    bad(static_cast<int>(in.a_lit()) + i);
+            }
             bad(in.target);
             break;
         case OpCode::LoadElemBool:
@@ -3332,18 +3345,23 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.u32(static_cast<uint32_t>(L.sobj_bytes));
                 for (size_t fi = 0; fi < cp.f.size(); fi++) {
                     const Chunk::CtorPlanField &pf = cp.f[fi];
-                    const int slot = static_cast<int>(in.a_lit())
-                                     + static_cast<int>(fi);
-                    const SlotAddr s = slot_addr(slot);
+                    const SlotAddr s = slot_addr(pf.src);
                     switch (pf.act) {
-                    case 0:                        /* raw int (bool = 0/1) */
-                        e.load(RAX, s.payload);
+                    case 0: {                      /* raw int (bool = 0/1) */
+                        /* cache-aware: a direct-local src can be the
+                         * N5-pinned loop counter */
+                        const int cr = e.creg(pf.src);
+                        if (cr >= 0)
+                            e.mov_rr(RAX, static_cast<uint8_t>(cr));
+                        else
+                            e.load(RAX, s.payload);
                         /* mov [r9 + off], rax */
                         e.u8(0x49); e.u8(0x89); e.u8(0x81);
                         e.u32(static_cast<uint32_t>(pf.off));
                         break;
+                    }
                     case 1:               /* float (int/bool promote, r8) */
-                        emit_float_load(e, X0, false, 0, slot, pc,
+                        emit_float_load(e, X0, false, 0, pf.src, pc,
                                         /*no_bail=*/true);
                         /* movsd [r9 + off], xmm0 */
                         e.u8(0xF2); e.u8(0x41); e.u8(0x0F); e.u8(0x11);
@@ -3365,15 +3383,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.patch32_here(js3);
                 e.patch32_here(js4);
             }
-            /* slow: jit_struct_ctor_planned(def, plan, base, dst) - the
-             * interpreter's planned body (fresh alloc / aliased dst).
-             * NEVER throws -> no test/exit. */
+            /* slow: jit_struct_ctor_planned(def, plan, dst) - the
+             * interpreter's planned body (fresh alloc / aliased dst),
+             * which reads the plan srcs from MEMORY - flush the cache
+             * first (an act-0 src may be register-pinned). NEVER throws
+             * -> no test/exit; dst is never cached (bad) -> no reload. */
+            e.flush_cache();
             emit_call_prologue(e);
             e.movabs(RDI,
                      reinterpret_cast<uint64_t>(ck.struct_defs[in.target2]));
             e.movabs(RSI, reinterpret_cast<uint64_t>(&ck.ctor_plans[plan]));
-            e.movabs(RDX, static_cast<uint64_t>(in.a_lit()));
-            e.movabs(RCX,
+            e.movabs(RDX,
                      static_cast<uint64_t>(static_cast<int_type>(in.target)));
             e.call_relocs.push_back(
                 { e.pos(), reinterpret_cast<const void *>(
@@ -5640,7 +5660,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         {
             static const uint8_t cregs[2] = { 10, 11 };
             const std::vector<int> hot =
-                pick_cached_slots(chunk.code, begin, end, chunk.slot_count,
+                pick_cached_slots(chunk, begin, end, chunk.slot_count,
                                   &cache_barrier);
             for (size_t h = 0; h < hot.size(); h++) {
                 const SlotAddr a = slot_addr(hot[h]);

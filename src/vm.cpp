@@ -588,7 +588,7 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
  * bad_alloc is terminal anyway), so the op needs no defensive catch. */
 static ML_NOINLINE void
 vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
-                       const Chunk::CtorPlan &cp, int_type base, int_type dst)
+                       const Chunk::CtorPlan &cp, int_type dst)
 {
     LValue &d = ctx.frame->at(dst);
     StructObject *o = nullptr;
@@ -607,23 +607,22 @@ vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
     char *bytes = o->bytes.data();
     for (size_t i = 0; i < cp.f.size(); i++) {
         const Chunk::CtorPlanField &pf = cp.f[i];
-        const LValue &s = ctx.frame->at(base + static_cast<int_type>(i));
         switch (pf.act) {
         case 0: {                                   /* int (or bool) -> int */
-            const EvalValue &v = s.get();
+            const EvalValue &v = ctx.frame->at(pf.src).get();
             const int_type iv = v.is<bool>() ? (v.get<bool>() ? 1 : 0)
                                              : v.get<int_type>();
             std::memcpy(bytes + pf.off, &iv, sizeof iv);
             break;
         }
         case 1: {                              /* float (int/bool promote) */
-            const float_type fv =
-                read_float_slot(&ctx, base + static_cast<int_type>(i));
+            const float_type fv = read_float_slot(&ctx, pf.src);
             std::memcpy(bytes + pf.off, &fv, sizeof fv);
             break;
         }
         default:                                            /* bool byte */
-            bytes[pf.off] = s.get().get<bool>() ? 1 : 0;
+            bytes[pf.off] =
+                ctx.frame->at(pf.src).get().get<bool>() ? 1 : 0;
             break;
         }
     }
@@ -2628,13 +2627,13 @@ extern "C" int jit_struct_ctor(const void *defv, int_type base, int_type nf,
  * reads + direct byte stores, NEVER throws, so the fragment emits no
  * status test. The FAST inline path bumps g_jit_ctor_fast instead. */
 extern "C" void jit_struct_ctor_planned(const void *defv, const void *planv,
-                                        int_type base, int_type dst) noexcept
+                                        int_type dst) noexcept
 {
     ML_JIT_OP_RAN(StructCtorV);
     vm_struct_ctor_planned(
         *g_current_ctx,
         const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv)),
-        *static_cast<const Chunk::CtorPlan *>(planv), base, dst);
+        *static_cast<const Chunk::CtorPlan *>(planv), dst);
 }
 
 /* model-flip (nativize-ops): the native StructCtorBoxedV body - a BOXED (non-POD)
@@ -6390,14 +6389,15 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 const_cast<StructTypeDef *>(chunk->struct_defs[in->target2]);
             const int32_t plan = in->b_dual_hi();
             if (plan >= 0) {
-                /* the baked plan: raw reads + direct byte stores, no
-                 * coerce calls, never throws */
+                /* the baked plan: raw reads (from each field's src slot -
+                 * a computed-run temp or a direct local), direct byte
+                 * stores, no coerce calls, never throws */
                 vm_struct_ctor_planned(ctx, def, chunk->ctor_plans[plan],
-                                       in->a_lit(), in->target);
+                                       in->target);
             } else {
                 try {
                     vm_struct_ctor(ctx, def, in->a_lit(), in->b_dual_lo(),
-                                   in->target);
+                                   in->target);   /* unplanned: a = run base */
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
                     throw;

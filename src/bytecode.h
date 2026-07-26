@@ -1629,7 +1629,13 @@ struct Chunk {
      * nested-struct field arg gets NO plan (b_dual_hi == -1 -> the generic
      * path). The def rides target2 (struct_defs) - serializable.
      */
-    struct CtorPlanField { int32_t off; uint8_t act; };
+    /* `src` = the ABSOLUTE frame slot the field value is read from: a
+     * computed arg's run temp, or - the src_slot extension - a bare
+     * resolved-LOCAL id arg's own slot (no staging MoveV). Direct-local
+     * srcs are used only when EVERY arg is side-effect-free (a later
+     * arg's `x++` would otherwise mutate the local before the ctor's
+     * deferred read; the tree-walker snapshots at arg position). */
+    struct CtorPlanField { int32_t off; int32_t src; uint8_t act; };
     struct CtorPlan { std::vector<CtorPlanField> f; };
     std::vector<CtorPlan> ctor_plans;
 

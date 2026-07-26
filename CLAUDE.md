@@ -447,11 +447,24 @@ LoadMemberInt/Float (b DUAL: lo = offset or -1, hi = struct_defs idx
 runs `vm_load_member_baked` (type-tag + def check + one byte read), the
 JIT emits it FULLY INLINE (guards + `mov rax,[bytes+off]`; guard miss ->
 the old helper). (3) `Chunk::ctor_plans` (serializable pool): a
-StructCtorV whose fields are all scalar gets a per-field {offset, act}
-plan (act 0 raw int - a bool arg's payload is already 0/1; 1 float via
-read_float_slot's promote; 2 bool byte); the interpreted
-`vm_struct_ctor_planned` does raw slot reads + direct byte stores (NO
-coerce_struct_field, NO EvalValue marshal buffer, H1 dst-reuse kept),
+StructCtorV whose fields are all scalar gets a per-field {offset, src
+slot, act} plan (act 0 raw int - a bool arg's payload is already 0/1;
+1 float via read_float_slot's promote; 2 bool byte). THE src_slot RULE:
+a bare resolved-LOCAL id arg is read straight from ITS OWN slot at ctor
+time (no staging MoveV into a run) - sound ONLY when EVERY arg is
+side-effect-free (construct_no_side_effects; else a later arg's `x++`
+would mutate the local before the deferred read - with any impure arg
+ALL args stage in source order, the old run semantics; pinned by the
+"ctor arg snapshot order" test). Computed args go to a contiguous temp
+mini-run recorded in `a` (DUAL: lo = base or -1, hi = count - what
+visit_use_def enumerates; direct-LOCAL srcs are < slot_count, invisible
+to temp liveness by design). pick_cached_slots takes the CHUNK now (an
+act-0 plan src is a countable int USE read cache-aware by the emit - a
+pinned loop counter feeds `P(i, ..)` from its register; act-1/2 srcs
+and dst are bad; the slow branch flush_cache()s first). The interpreted
+`vm_struct_ctor_planned` does raw src-slot reads + direct byte stores
+(NO coerce_struct_field, NO EvalValue marshal buffer, H1 dst-reuse
+kept),
 and the JIT emits the H1 guards (type/def/refcount==1/!readonly) +
 direct stores inline, slow branch -> the NEVER-THROWING
 jit_struct_ctor_planned - so a PLANNED StructCtorV is op_never_exits
@@ -465,9 +478,10 @@ counters bumped by the EMITTED code, asserted by the `jit:` test
 jit_struct_baked (the helpers bump g_jit_op_run, so the old
 LoadMemberInt/Float counter cases were repointed at a BOXED struct,
 which stays helper-served). Measured (callgrind Ir, 64_struct_create):
-JIT-on 1.09B -> 146M (-86.6%; ~265 Ir/iter, 90.6% inside the fragment),
-interpreter-only 1.388B -> 683M (-50.8%); my/cpp 41.6x -> ~12x
-(scale-40 best-of-5). 58/65/77 neutral (they use the flat-ARRAY paths).
+JIT-on 1.09B -> 146M -> 137.8M with src_slot (-87.4% total; the staging
+`move r5 = i` gone), interpreter-only 1.388B -> 679M (-51.1%); my/cpp
+41.6x -> ~12x (scale-40 best-of-5). 58/65/77 neutral (flat-ARRAY
+paths).
 The residual vs C++ (~24 Ir/iter) is type-tag two-stores + ref-checks
 per dst + float type-guard loads - the N7 unboxing arc, not struct-
 specific.

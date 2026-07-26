@@ -3048,6 +3048,20 @@ static const std::vector<test> tests =
       { "struct P { int x; int y; }",
         "var p = P(1, 2); var o = p.x++; assert(o == 1 && p.x == 2);",
         "--p.y; assert(p.y == 1);" } },
+    /* The ctor-plan src_slot rule: a bare-local arg is read at CTOR time
+     * (no staging move) ONLY when every arg is side-effect-free; with a
+     * mutating later arg (x++) all args must stage in source order, so
+     * arg0 snapshots x BEFORE the increment - tree-walker semantics. */
+    { "struct: ctor arg snapshot order with a mutating later arg",
+      { "struct P { int x; int y; }",
+        "var x = 1; var p = P(x, x++);",
+        "assert(p.x == 1); assert(p.y == 1); assert(x == 2);" } },
+    { "struct: ctor direct-local args track loop mutation",
+      { "struct P { int x; int y; }",
+        "var a = 5; var s = 0;",
+        "for (var i = 0; i < 3; i++)",
+        "  { var p = P(a, a * 3); s += p.x + p.y; a += 1; }",
+        "assert(s == 72 && a == 8);" } },
     /* inc-dec STATEMENT on a proven int/float MEMBER or a NESTED subscript is
      * native on the VM (== `lvalue += 1`, via the compound-store path); a
      * dyn/general lvalue falls back (inc-dec is int/float-only, so it must

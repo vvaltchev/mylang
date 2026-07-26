@@ -257,7 +257,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             for (const auto &pf : ch.ctor_plans[i].f)
                 s << " {+" << pf.off << " "
                   << (pf.act == 0 ? "int" : pf.act == 1 ? "float" : "bool")
-                  << "}";
+                  << " <- slot" << pf.src << "}";
             s << "\n";
         }
     }
@@ -1364,10 +1364,18 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::StructCtorV:
             row << "struct.ctor  " << D(in.target) << " = struct_defs["
-                << in.target2 << "]("
-                << arglist(chunk, in.a_lit(), in.b_dual_lo()) << ")";
-            if (in.b_dual_hi() >= 0)
-                row << " plan[" << in.b_dual_hi() << "]";
+                << in.target2 << "](";
+            if (in.b_dual_hi() >= 0) {
+                /* planned: print each field's SRC slot (a direct local or
+                 * a computed-run temp; a is the computed mini-run dual) */
+                const Chunk::CtorPlan &cp =
+                    chunk.ctor_plans[in.b_dual_hi()];
+                for (size_t k = 0; k < cp.f.size(); k++)
+                    row << (k ? ", " : "") << D(cp.f[k].src);
+                row << ") plan[" << in.b_dual_hi() << "]";
+            } else {
+                row << arglist(chunk, in.a_lit(), in.b_dual_lo()) << ")";
+            }
             break;
         case OpCode::StructCtorBoxedV: {
             const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in.target2];
