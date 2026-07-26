@@ -2198,6 +2198,23 @@ extern "C" void jit_make_closure(int_type dst, const void *defv) noexcept
         make_intrusive<FuncObject>(def, g_current_ctx))));
 }
 
+/* model-flip (nativize-ops): the native MakeArrayV body - the interpreter's
+ * exact `frame[dst] = vm_make_array(ctx, base, n, hint)`: build an array LITERAL
+ * from the element run [base, base+n) via the shared build_array_from_values
+ * (flat int/float/bool/struct or general per the ArrHint). It NEVER THROWS (the
+ * build has no error path - a mixed literal just goes general), so the helper
+ * returns void and MakeArrayV is op_fully_native (deletable). The element buffer
+ * lives in vm_make_array's frame ON PURPOSE (see that helper) - never inline it
+ * into a fragment or vm_run_chunk's recursion-multiplied frame. */
+extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
+                               int_type hint) noexcept
+{
+    ML_JIT_OP_RAN(MakeArrayV);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue v = vm_make_array(*ctx, base, n, static_cast<ArrHint>(hint));
+    ctx->frame->at(dst).put(std::move(v));
+}
+
 extern "C" int jit_dict_load(int_type dst, int_type base_slot,
                              const EvalValue *key, int is_int) noexcept
 {

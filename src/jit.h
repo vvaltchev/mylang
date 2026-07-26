@@ -314,6 +314,13 @@ extern "C" int jit_dict_load(int_type dst, int_type base_slot,
  * program-lifetime FuncDescriptor* (baked as a value). Never throws. */
 extern "C" void jit_make_closure(int_type dst, const void *def) noexcept;
 
+/* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
+ * the element run [base, base+n) via the shared build_array_from_values, honoring
+ * `hint` (an ArrHint: flat int/float/bool/struct or general). Never throws
+ * (op_fully_native). */
+extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
+                               int_type hint) noexcept;
+
 /* model-flip (nativize-ops): the BOXED-ARITH ops BinOpV / CmpV / CompoundV -
  * the interpreter's exact boxed_operand + vm_num_binop bodies. `bop` is a baked
  * `&chunk.boxed_ops[idx]` (the op's operand data - target/a/b/aop - copied into

@@ -729,6 +729,12 @@ static bool jit_op_eligible(const Instr &in)
      * throws. */
     case OpCode::MakeClosureV:
         return true;
+    /* model-flip (nativize-ops): an array LITERAL `[a, b, ...]` via jit_make_array
+     * (build_array_from_values over the element run, per the ArrHint in target2).
+     * The build has NO error path (a mixed literal just goes general), so it
+     * never throws -> op_fully_native. */
+    case OpCode::MakeArrayV:
+        return true;
     /* model-flip (nativize-ops): the boxed-arith ops (dyn/string operands) via
      * jit_boxed_* + the boxed_ops pool (target2 = the pool index, set by
      * build_boxed_ops). vm_num_binop CAN throw (div0/type) -> NOT
@@ -1177,6 +1183,16 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
             if (in.a_dual_hi() == 0) bad(in.target2);
             bad(static_cast<int>(in.b_lit()));
             if (in.target >= 0) bad(in.target);
+            break;
+        case OpCode::MakeArrayV:
+            /* jit_make_array reads the whole ELEMENT run [a_lit, a_lit+b_lit)
+             * from MEMORY (an element can be a cached int counter - `[i, i*2]`
+             * in a loop), and writes dst. The run IS enumerable here (base + n
+             * are both in the instruction), so disqualify it precisely instead
+             * of turning caching off for the whole run. */
+            for (int_type i = 0; i < in.b_lit(); i++)
+                bad(static_cast<int>(in.a_lit() + i));
+            bad(in.target);
             break;
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
@@ -1956,6 +1972,23 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::MakeArrayV:
+        /* dst = build_array_from_values(run[a_lit .. +b_lit), hint=target2) via
+         * jit_make_array (rdi=dst, rsi=run base, rdx=n, rcx=hint). The helper
+         * reads the element run from MEMORY via g_current_ctx->frame (so those
+         * slots are N5-disqualified). Never throws -> no status check. */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs(RSI, static_cast<uint64_t>(in.a_lit()));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(RCX, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_make_array) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::BinOpV:
     case OpCode::CmpV:
     case OpCode::CompoundV:
@@ -2460,6 +2493,7 @@ static bool op_fully_native(const Instr &in)
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
     case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
+    case OpCode::MakeArrayV:        /* array literal build, no error path */
     case OpCode::LogV:              /* eager && / || (is_true), never throws */
     /* CallBuiltinV THROWS, but it RE-RAISES (g_vm_jit_exc), never re-executing
      * its interpreted original - so deleting the original is sound. And unlike
@@ -2623,19 +2657,22 @@ static constexpr size_t MIN_CONTAINER_ISLAND = 5;
 static bool op_is_simple_island(OpCode op)
 {
     switch (op) {
-    /* The simple boxed SCALAR ops (and SliceV) are ALL op_run_eligible now (the
-     * nativize-ops path), so op_run_eligible (checked FIRST in the gate) wins -
-     * they never reach here as islands. They stay listed for documentation / a
-     * `-nj` build (where op_run_eligible is false). The one op here that is STILL
-     * boxed (not jit_op_eligible) is MakeArrayV (an array literal `[a, b]`, a
-     * container build - not on the nativize-ops path) - the container gate's
-     * remaining island source, so the jit_exec_block mechanism (M2-M4) stays
-     * exercised. (SliceV was that source until it was nativized.) */
+    /* The simple boxed SCALAR ops (and SliceV, MakeArrayV) are ALL
+     * op_run_eligible now (the nativize-ops path), so op_run_eligible (checked
+     * FIRST in the gate) wins - they never reach here as islands. They stay
+     * listed for documentation / a `-nj` build (where op_run_eligible is false).
+     * The one op here that is STILL boxed (not jit_op_eligible) is MakeDictV (a
+     * dict literal `{k: v}`, a container build - not yet on the nativize-ops
+     * path) - the container gate's remaining island source, so the
+     * jit_exec_block mechanism (M2-M4) stays exercised. (The source was SliceV,
+     * then MakeArrayV, before each was nativized - it hops to the next
+     * still-boxed simple op each time.) */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::MoveV: case OpCode::CompoundV:
     case OpCode::LoadConstV: case OpCode::CoerceNumV:
     case OpCode::SliceV:
     case OpCode::MakeArrayV:
+    case OpCode::MakeDictV:
         return true;
     default:
         return false;
