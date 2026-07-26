@@ -632,6 +632,7 @@ extern unsigned long g_jit_op_run[];
  * prove the inline path ran, not just the slow helper. */
 extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
 extern "C" unsigned long g_jit_sync_inline;
+extern "C" unsigned long g_jit_entry_resume;
 #endif
 #ifdef TESTS
 #  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
