@@ -350,6 +350,14 @@ extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
 extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
                                 const void *bc) noexcept;
 
+/* model-flip (nativize-ops): AppendV - `append(a, x)`/`push(a, x)`. Forms arg0's
+ * LValue* from kind (0 loc/1 gbl/2 cap) + arg0_slot, runs the never-throwing
+ * arr_append_fast; a decline falls back to vm_call_builtin_lv_rest (builtin_
+ * append, all RuntimeException throws now) -> g_vm_jit_exc + return 1. dst_slot
+ * = the result dst (-1 = discarded). `bc` = &chunk.builtin_calls[idx]. */
+extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
+                          int_type dst_slot, const void *bc) noexcept;
+
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
  * the native code for each op actually RAN (not merely that the op is

@@ -1601,6 +1601,9 @@ exceptions that can be caught with `try-catch` blocks is:
     empty array)
   * InvalidNumberOfArgsEx (a builtin call with the wrong number of arguments —
     builtins validate arity at *runtime*)
+  * CannotChangeConstEx (a `const`/read-only container mutated through a
+    mutating builtin — `append`/`push`/`insert`/`erase`/`sort`; the const-ness
+    is a *runtime* property, e.g. an aliased const passed as a parameter)
 
 Other exceptions like `SyntaxErrorEx` cannot be caught, instead.
 

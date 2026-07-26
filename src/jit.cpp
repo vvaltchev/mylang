@@ -754,6 +754,12 @@ static bool jit_op_eligible(const Instr &in)
      * RuntimeException now, conveyed via g_vm_jit_exc. */
     case OpCode::CallBuiltinV:
         return true;
+    /* AppendV: `append(a, x)`/`push(a, x)` via jit_append (the never-throwing
+     * arr_append_fast fast path + the vm_call_builtin_lv_rest fallback; every
+     * fallback throw is a RuntimeException now -> g_vm_jit_exc). Keeps an
+     * append-in-a-loop native. NOT op_fully_native (the fallback can throw). */
+    case OpCode::AppendV:
+        return true;
     /* GENERIC IntBin (the residual after specialize_arith_ops - a lit-first
      * NON-commutative op like `0 - i` that has no imm-reg specialized shape, or
      * any op the specializer doesn't cover): JIT-eligible ONLY for the
@@ -1150,6 +1156,14 @@ pick_cached_slots(const std::vector<Instr> &code, size_t begin,
              * not a frame slot). PLAIN: `a` is the src slot; COMPOUND: `a` is the
              * rhs (a slot OR a lit - skip a lit). */
             if (!in.a_is_lit()) bad(in.a_slot());
+            break;
+        case OpCode::AppendV:
+            /* jit_append reads the VALUE (b_lit, a frame slot - could be a cached
+             * int counter `append(a, i)`) and a LOCAL arg0 array (target2 when
+             * kind == a_dual_hi() == 0) from MEMORY; the dst is written. */
+            if (in.a_dual_hi() == 0) bad(in.target2);
+            bad(static_cast<int>(in.b_lit()));
+            if (in.target >= 0) bad(in.target);
             break;
         case OpCode::LoadBuiltinV:
         case OpCode::LoadConstV:
@@ -2010,6 +2024,30 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.patch8(j_ok_cb, e.pos());
         return true;
     }
+
+    case OpCode::AppendV:
+        /* jit_append(kind=a_dual_hi, arg0_slot=target2, val_slot=b_lit,
+         * dst_slot=target, bc=&ck.builtin_calls[a_dual_lo]). r8 = the pool entry
+         * (baked). The fallback CAN throw -> test eax + exit_pc (re-raise). */
+        emit_call_prologue(e);
+        e.movabs(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_dual_hi())));
+        e.movabs(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.movabs(RDX, static_cast<uint64_t>(in.b_lit()));
+        e.movabs(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.movabs_r8(
+            reinterpret_cast<uint64_t>(&ck.builtin_calls[in.a_dual_lo()]));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_append) });
+        e.u8(0xE8); e.u32(0);
+        emit_call_epilogue(e);
+        e.u8(0x85); e.u8(0xC0);               /* test eax, eax */
+        {
+            const size_t j_ok = e.j8(0x74);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
+        return true;
 
     case OpCode::StoreGlobalV:
     case OpCode::StoreCaptureV: {
